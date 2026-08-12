@@ -814,11 +814,19 @@ pub fn main() u8 {
     // 5. nested split (vertical on the new pane), then close it —
     // exercises the tree model's deep split + collapse paths under
     // SKETERM_VERIFY_TREE.
-    const split2 = roundtrip(allocator, sock_path, "{\"cmd\":\"split\",\"pane\":2,\"direction\":\"v\"}\n") orelse return fail("split2 roundtrip");
+    const new_pane = otherPaneInSelectedTab(list2, 1);
+    if (new_pane == 0) return fail("the split's new pane is not in the selected tab");
+    var split_buf: [96]u8 = undefined;
+    const split2_cmd = std.fmt.bufPrint(&split_buf, "{{\"cmd\":\"split\",\"pane\":{d},\"direction\":\"v\"}}\n", .{new_pane}) catch
+        return fail("building the split2 command");
+    const split2 = roundtrip(allocator, sock_path, split2_cmd) orelse return fail("split2 roundtrip");
     defer allocator.free(split2);
     if (std.mem.indexOf(u8, split2, "\"ok\":true") == null) return fail("split2 not ok");
     _ = c.usleep(500_000);
-    const close2 = roundtrip(allocator, sock_path, "{\"cmd\":\"close-pane\",\"pane\":2}\n") orelse return fail("close-pane roundtrip");
+    var close_buf: [96]u8 = undefined;
+    const close2_cmd = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{new_pane}) catch
+        return fail("building the close-pane command");
+    const close2 = roundtrip(allocator, sock_path, close2_cmd) orelse return fail("close-pane roundtrip");
     defer allocator.free(close2);
     if (std.mem.indexOf(u8, close2, "\"ok\":true") == null) return fail("close-pane not ok");
     // Relative invariant (the instance may have restored a saved
@@ -843,10 +851,24 @@ pub fn main() u8 {
         }
         return fail("browser split not ok");
     }
-    const browser_here = roundtrip(allocator, sock_path, "{\"cmd\":\"browser-here\",\"pane\":4,\"data\":\"/\"}\n") orelse return fail("browser-here roundtrip");
+    // Same rule as split2: ASK which pane the split made rather than
+    // assuming an id.
+    const bpane = blk: {
+        const l = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return fail("list before browser-here");
+        defer allocator.free(l);
+        break :blk otherPaneInSelectedTab(l, 1);
+    };
+    if (bpane == 0) return fail("the browser split's new pane is not in the selected tab");
+    var bh_buf: [128]u8 = undefined;
+    const bh_cmd = std.fmt.bufPrint(&bh_buf, "{{\"cmd\":\"browser-here\",\"pane\":{d},\"data\":\"/\"}}\n", .{bpane}) catch
+        return fail("building the browser-here command");
+    const browser_here = roundtrip(allocator, sock_path, bh_cmd) orelse return fail("browser-here roundtrip");
     defer allocator.free(browser_here);
     if (std.mem.indexOf(u8, browser_here, "\"ok\":true") == null) return fail("browser-here not ok");
-    const close_browser = roundtrip(allocator, sock_path, "{\"cmd\":\"close-pane\",\"pane\":4}\n") orelse return fail("browser close roundtrip");
+    var bc_buf: [96]u8 = undefined;
+    const bc_cmd = std.fmt.bufPrint(&bc_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{bpane}) catch
+        return fail("building the browser close command");
+    const close_browser = roundtrip(allocator, sock_path, bc_cmd) orelse return fail("browser close roundtrip");
     defer allocator.free(close_browser);
     if (std.mem.indexOf(u8, close_browser, "\"ok\":true") == null) return fail("browser close not ok");
     // The browser face tears down asynchronously (mux watch stop, model
@@ -6445,6 +6467,54 @@ fn kittyKbdStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
 /// The word motions are what make this worth a live stage: `w` and
 /// `e` have to agree about where a word begins and ends, and only the
 /// round trip proves the selection they produced was the right one.
+/// A pane id in the SELECTED tab other than `not` — i.e. the pane a
+/// split just created. Pane ids are monotonic and every earlier stage
+/// that opened a tab consumes some, so the rig must never assume the
+/// new pane is id 2; it was, until a stage was inserted ahead of this
+/// one, and the assumption then failed a dozen stages downstream.
+fn otherPaneInSelectedTab(resp: []const u8, not: u32) u32 {
+    const at = std.mem.indexOf(u8, resp, "\"selected\":true") orelse return 0;
+    const panes_at = std.mem.indexOfPos(u8, resp, at, "\"panes\":[") orelse return 0;
+    const end = std.mem.indexOfScalarPos(u8, resp, panes_at, ']') orelse return 0;
+    var from = panes_at;
+    while (std.mem.indexOfPos(u8, resp, from, "\"id\":")) |idat| {
+        if (idat >= end) break;
+        from = idat + 5;
+        const rest = resp[from..end];
+        const stop = std.mem.indexOfAny(u8, rest, ",}") orelse break;
+        const id = std.fmt.parseInt(u32, rest[0..stop], 10) catch continue;
+        if (id != not) return id;
+    }
+    return 0;
+}
+
+/// Screen row of the LAST line containing `needle`, from a `get-text`
+/// reply. `extractScreen` emits exactly one line per screen row, so
+/// counting the escaped newlines before the hit gives the row.
+fn screenRowOfLast(resp: []const u8, needle: []const u8) ?usize {
+    const text_at = std.mem.indexOf(u8, resp, "\"text\":\"") orelse return null;
+    const body = resp[text_at + 8 ..];
+    const hit = std.mem.lastIndexOf(u8, body, needle) orelse return null;
+    var row: usize = 0;
+    var i: usize = 0;
+    while (i + 1 < hit) : (i += 1) {
+        if (body[i] == '\\' and body[i + 1] == 'n') {
+            row += 1;
+            i += 1;
+        }
+    }
+    return row;
+}
+
+fn cursorRow(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?usize {
+    const resp = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse return null;
+    defer allocator.free(resp);
+    const at = std.mem.indexOf(u8, resp, "\"cursor_row\":") orelse return null;
+    const rest = resp[at + 13 ..];
+    const end = std.mem.indexOfAny(u8, rest, ",}") orelse return null;
+    return std.fmt.parseInt(usize, rest[0..end], 10) catch null;
+}
+
 fn copyModeStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
     // Three words sharing a prefix, so a motion that stops one word
     // early or late yanks something visibly different.
@@ -6454,11 +6524,36 @@ fn copyModeStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
         return "the sample line never reached the shell";
     _ = app.waitIdle(300, 5_000);
 
+    // WHERE the output line sits relative to the cursor is the user's
+    // shell's business, not ours: a two-line prompt (and a prompt that
+    // swaps itself for a taller one once the shell finishes starting,
+    // which powerlevel10k-style themes do) puts it several rows up.
+    // A fixed "k" once landed on the prompt and yanked from it, so the
+    // row is measured instead of assumed.
+    const out_row = blk: {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n") orelse
+            return "get-text roundtrip failed before copy mode";
+        defer allocator.free(r);
+        break :blk screenRowOfLast(r, "ZQalpha") orelse
+            return "the sample line is not on screen";
+    };
+    const cur_row = cursorRow(allocator, sock_path) orelse
+        return "screen-info reported no cursor row";
+
     app.pressKey(null, "ctrl+shift+x") catch return "entering copy mode failed";
     _ = app.waitIdle(300, 5_000);
-    // Up onto the output line, to its start, then select the MIDDLE
-    // word: w to its first character, e to its last.
-    const motions = [_][]const u8{ "k", "0", "w", "v", "e", "y" };
+    // Onto the output line, to its start, then select the MIDDLE word:
+    // w to its first character, e to its last.
+    var steps: usize = 0;
+    while (steps < 64 and cur_row > out_row + steps) : (steps += 1) {
+        app.pressKey(null, "k") catch return "injecting a copy-mode motion failed";
+        _ = app.waitIdle(120, 2_000);
+    }
+    while (steps < 64 and out_row > cur_row + steps) : (steps += 1) {
+        app.pressKey(null, "j") catch return "injecting a copy-mode motion failed";
+        _ = app.waitIdle(120, 2_000);
+    }
+    const motions = [_][]const u8{ "0", "w", "v", "e", "y" };
     for (motions) |key| {
         app.pressKey(null, key) catch return "injecting a copy-mode motion failed";
         _ = app.waitIdle(120, 2_000);
@@ -7067,8 +7162,14 @@ fn cursorTrailStage(
     if (idle_on > idle_off + 60)
         return "the pane kept burning CPU after the cursor trail settled (a redraw timer was left armed)";
 
-    // Restore the defaults for the stages that follow.
-    _ = c.unlink(cfg_path.ptr);
+    // Restore the defaults for the stages that follow. DELETING
+    // config.conf would not do it: a vanished file deliberately keeps
+    // the running config (configReloadStage step 7 asserts exactly
+    // that), so the way back is an EMPTY file — every key absent means
+    // every key default. This stage never ran while copy mode was red,
+    // which is how an unlink survived here.
+    if (!writeFile(cfg_path, "# smoke: back to defaults\n"))
+        return "could not write the defaults config";
     const rl = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"reload_config\"}\n") orelse
         return "reload_config roundtrip";
     allocator.free(rl);
