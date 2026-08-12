@@ -3521,7 +3521,11 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
     if (blocked) {
         const hits_at_block = srv.ad_hits.load(.acquire);
         if (srv.ok_hits.load(.acquire) == 0) {
-            fail("stage 35b: the control resource never arrived either — the page, not uBO, failed");
+            // Probe mode is REPORT-ONLY for a THIRD-PARTY extension, so
+            // it diagnoses rather than aborting the whole smoke run.
+            if (probe != null) {
+                std.debug.print("stage 35b PROBE \"{s}\": the control resource never arrived either\n", .{ext_id});
+            } else fail("stage 35b: the control resource never arrived either — the page, not uBO, failed");
         }
         // The claim this stage exists to make. Without it the stage
         // passes whenever the page's fetch merely REJECTS — a cancel
@@ -3534,7 +3538,9 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
                 "stage 35b: the blocking attempt still hit the network ({d} -> {d})\n",
                 .{ ad_before, hits_at_block },
             );
-            fail("stage 35b: uBO reported a block but the request reached the server");
+            if (probe != null) {
+                std.debug.print("stage 35b PROBE \"{s}\": blocked but the request still hit the network\n", .{ext_id});
+            } else fail("stage 35b: uBO reported a block but the request reached the server");
         }
         std.debug.print(
             "stage 35b: blocked on attempt {d} (ad reached the network {d} time(s) while uBO was still loading)\n",
