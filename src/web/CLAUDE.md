@@ -357,7 +357,9 @@ What the numbers say, plainly:
   real fix is a message pump that can be woken by the renderer's reply
   rather than polled. `external_message_pump` is the CEF-supported shape
   for that and is the next thing to try. Spinning (`WREQ_SPIN=1`) buys
-  0.75ms for a whole core and is therefore a measurement knob, not a
+  0.75ms of MEDIAN for a whole core, and a repeat run put its p95 at
+  13.2ms against C's 12.5ms — it trades TAIL latency for median, because
+  it competes with the engine for CPU. A measurement knob, not a
   default.
 
 1.3ms per blocked subresource is acceptable for a filter list that
