@@ -285,6 +285,29 @@ const attack_page =
 const blocked_img_page =
     "data:text/html,<body><img%20src=%22https://doubleclick.net/ad.gif%22></body>";
 
+// Stage 28: one element a cosmetic rule hides, one it must not touch.
+const cosmetic_page =
+    "data:text/html,<body><div%20class=%22smoke-ad%22>AD</div><div%20id=%22keep%22>KEEP</div></body>";
+
+// Stages 29/30: two distinct pages so a userstyle can prove it
+// survives a navigation.
+const usc_page_a = "data:text/html,<body%20id=%22pa%22><p>alpha</p></body>";
+const usc_page_b = "data:text/html,<body%20id=%22pb%22><p>beta</p></body>";
+
+// A document-end userscript that mutates the DOM. `@include data:*`
+// because MV2 match patterns require an authority and data: urls have
+// none — the include glob is the covered path here.
+const usc_source =
+    "// ==UserScript==\n" ++
+    "// @name Smoke DOM\n" ++
+    "// @include data:*\n" ++
+    "// @run-at document-end\n" ++
+    "// @grant none\n" ++
+    "// ==/UserScript==\n" ++
+    "document.title='us-end-ok';" ++
+    "var el=document.createElement('div');el.id='usmark';" ++
+    "el.textContent='FROM-USERSCRIPT';document.body.appendChild(el);";
+
 // Cleanup state: `fail` may fire from anywhere, and the helper must
 // never be left running nor the temp dir behind. Killed by EXACT pid.
 var g_pid: c.pid_t = -1;
@@ -627,6 +650,7 @@ const Client = struct {
     eval_seq: u32 = 0,
 
     ack_intercept: bool = false,
+    ack_userscripts: bool = false,
     // Interception: last coalesced status counters, and the last log
     // pull rendered to JSON.
     int_enabled: u8 = 1,
@@ -850,6 +874,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.ack_downloads = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.ack_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.ack_contexts = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.ack_userscripts = true;
                 }
             },
             .ev_a11y_tree => {
@@ -2548,6 +2573,144 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         cl.send(proto.InterceptSet{ .view = view_id, .enabled = 1 });
     }
     pass("stage 22d request interception (seeded filter blocks, log reports, toggle honoured)");
+
+    // ── Stage 28: cosmetic filtering ───────────────────────────────
+    //
+    // A `##.smoke-ad` rule loaded through `intercept_lists` must hide
+    // the matching element (display:none via the injected sheet) and
+    // leave its sibling alone; the per-view shield toggle must gate
+    // the hiding exactly like the network verdicts, and re-enabling
+    // must bring it back on the next navigation.
+    {
+        if (!writeFile(dir, "cos.txt", "! smoke cosmetic list\n##.smoke-ad\n"))
+            fail("stage 28: could not write the cosmetic list");
+        var list_buf: [96]u8 = undefined;
+        const list_path = std.fmt.bufPrint(&list_buf, "{s}/cos.txt", .{dir}) catch
+            fail("stage 28: list path");
+        const paths = [_][]const u8{list_path};
+        cl.send(proto.InterceptLists{ .paths = &paths });
+
+        cl.navigate(cosmetic_page);
+        const hidden = cl.evalWait(
+            "getComputedStyle(document.querySelector('.smoke-ad')).display",
+            false,
+            20_000,
+        );
+        if (std.mem.indexOf(u8, hidden, "\"value\":\"none\"") == null) {
+            std.debug.print("smoke-web: eval said {s}\n", .{hidden});
+            fail("stage 28: the cosmetic rule did not hide the matching element");
+        }
+        const kept = cl.evalWait(
+            "getComputedStyle(document.getElementById('keep')).display",
+            false,
+            20_000,
+        );
+        if (std.mem.indexOf(u8, kept, "\"value\":\"block\"") == null) {
+            std.debug.print("smoke-web: eval said {s}\n", .{kept});
+            fail("stage 28: an unmatched element was hidden too");
+        }
+
+        // Shield off for the view = no cosmetic hiding either.
+        cl.send(proto.InterceptSet{ .view = view_id, .enabled = 0 });
+        cl.navigate(cosmetic_page);
+        const shown = cl.evalWait(
+            "getComputedStyle(document.querySelector('.smoke-ad')).display",
+            false,
+            20_000,
+        );
+        if (std.mem.indexOf(u8, shown, "\"value\":\"block\"") == null) {
+            std.debug.print("smoke-web: eval said {s}\n", .{shown});
+            fail("stage 28: the shield toggle did not disable cosmetic hiding");
+        }
+        cl.send(proto.InterceptSet{ .view = view_id, .enabled = 1 });
+        cl.navigate(cosmetic_page);
+        const rehidden = cl.evalWait(
+            "getComputedStyle(document.querySelector('.smoke-ad')).display",
+            false,
+            20_000,
+        );
+        if (std.mem.indexOf(u8, rehidden, "\"value\":\"none\"") == null)
+            fail("stage 28: re-enabling the shield did not restore cosmetic hiding");
+    }
+    pass("stage 28 cosmetic filtering (rule hides, sibling kept, shield gates)");
+
+    // ── Stage 29: userscripts ──────────────────────────────────────
+    //
+    // A document-end userscript pushed via `us_script_set` must run on
+    // a matching page and mutate the DOM; an empty replace-all set
+    // must clear it so the next navigation runs nothing.
+    {
+        if (!cl.ack_userscripts) fail("stage 29: hello_ack lacks the userscripts capability");
+        const scripts = [_]proto.UsScript{.{ .id = 1, .source = .{ .s = usc_source } }};
+        cl.send(proto.UsScriptSet{ .scripts = &scripts });
+        cl.navigate(usc_page_a);
+        const marked = cl.evalWait(
+            "(document.getElementById('usmark')||{}).textContent+'/'+document.title",
+            false,
+            20_000,
+        );
+        if (std.mem.indexOf(u8, marked, "FROM-USERSCRIPT/us-end-ok") == null) {
+            std.debug.print("smoke-web: eval said {s}\n", .{marked});
+            fail("stage 29: the document-end userscript did not mutate the DOM");
+        }
+
+        cl.send(proto.UsScriptSet{ .scripts = &.{} });
+        cl.navigate(usc_page_a);
+        const cleared = cl.evalWait("!!document.getElementById('usmark')", false, 20_000);
+        if (std.mem.indexOf(u8, cleared, "\"value\":false") == null) {
+            std.debug.print("smoke-web: eval said {s}\n", .{cleared});
+            fail("stage 29: an empty replace-all set did not clear the userscript");
+        }
+    }
+    pass("stage 29 userscripts (document-end DOM mutation, replace-all clears)");
+
+    // ── Stage 30: userstyles ───────────────────────────────────────
+    //
+    // A pushed userstyle must apply INSTANTLY to the live page (no
+    // reload), still be there after a navigation, and disappear from
+    // the live page when the set is cleared.
+    {
+        const styles = [_]proto.UsStyle{.{
+            .id = 1,
+            .host = "",
+            .css = .{ .s = "body{background-color:rgb(1,2,3) !important}" },
+        }};
+        cl.send(proto.UsStyleSet{ .styles = &styles });
+        // No navigation between push and check: this asserts the
+        // instant-apply path.
+        const live = cl.evalWait(
+            "getComputedStyle(document.body).backgroundColor",
+            false,
+            20_000,
+        );
+        if (std.mem.indexOf(u8, live, "rgb(1, 2, 3)") == null) {
+            std.debug.print("smoke-web: eval said {s}\n", .{live});
+            fail("stage 30: the userstyle did not apply to the live page");
+        }
+
+        cl.navigate(usc_page_b);
+        const after_nav = cl.evalWait(
+            "getComputedStyle(document.body).backgroundColor",
+            false,
+            20_000,
+        );
+        if (std.mem.indexOf(u8, after_nav, "rgb(1, 2, 3)") == null) {
+            std.debug.print("smoke-web: eval said {s}\n", .{after_nav});
+            fail("stage 30: the userstyle did not survive a navigation");
+        }
+
+        cl.send(proto.UsStyleSet{ .styles = &.{} });
+        const gone = cl.evalWait(
+            "getComputedStyle(document.body).backgroundColor",
+            false,
+            20_000,
+        );
+        if (std.mem.indexOf(u8, gone, "rgb(1, 2, 3)") != null) {
+            std.debug.print("smoke-web: eval said {s}\n", .{gone});
+            fail("stage 30: clearing the set did not remove the live style");
+        }
+    }
+    pass("stage 30 userstyles (instant apply, survives navigation, clear removes)");
     // ── Stage 22e: discard destroys the browser, show brings it back ─
     //
     // `view_hide` only pauses the painting; `view_discard` (capability
