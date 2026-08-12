@@ -81,6 +81,13 @@ pub const CAP_DOWNLOADS = "downloads";
 /// streamed for a view that never asked: engine-side accessibility is
 /// not free, and an unsolicited stream would break the backlog rule.
 pub const CAP_A11Y = "a11y";
+/// The helper additionally streams `ev_a11y_caret` for an a11y-enabled
+/// view: the document's caret and selection endpoints, which the
+/// read-only tree cannot express. A client without it projects no
+/// `org.a11y.atspi.Text` caret and a braille display cannot follow the
+/// cursor; nothing else degrades. Rides the same `a11y_enable` gate —
+/// there is no separate enable, so an old CLIENT simply skips the tag.
+pub const CAP_A11Y_CARET = "a11y-caret";
 /// The helper accepts the 0xC0 user-content frames: `us_script_set`
 /// (userscripts, raw source with a `==UserScript==` block, injected
 /// per navigation by run-at) and `us_style_set` (per-site user CSS,
@@ -192,6 +199,7 @@ pub const Tag = enum(u8) {
     ev_a11y_tree = 0x71,
     ev_a11y_loc = 0x72,
     ev_a11y_event = 0x73,
+    ev_a11y_caret = 0x76,
     ev_download_offer = 0x78,
     download_decide = 0x79,
     ev_download_progress = 0x7A,
@@ -1139,6 +1147,41 @@ pub const EvA11yEvent = struct {
     view: u32,
     id: u32,
     event: []const u8,
+};
+
+/// The document's caret and selection, which the node tree cannot
+/// express: a selection is a pair of (node, character offset) endpoints
+/// that may straddle nodes, not a property of any one node.
+///
+/// `anchor_*` is where the selection STARTED and `focus_*` is where the
+/// caret now is, matching the DOM's own vocabulary — so a collapsed
+/// caret is `anchor == focus` and the caret offset a braille display
+/// follows is always `focus_offset`. A backward selection (dragged
+/// right-to-left) is therefore anchor > focus and NOT an error; a
+/// consumer wanting an ordered range must sort the two. `focus_id == 0`
+/// means the document has no caret at all (nothing focused, or focus is
+/// on a node with no text).
+///
+/// Offsets are UTF-16 CODE UNITS into the node's text. That is not an
+/// engine detail leaking: UTF-16 is the unit the DOM itself defines
+/// text offsets in (`Selection`, `Range`, `textContent.length`), so
+/// every engine produces it already and none has to be asked to
+/// convert. Translating to the CHARACTER offsets a platform
+/// accessibility API wants happens in the consumer that mirrors the
+/// node TEXT, because that is the only place both numbers are known —
+/// a producer would have to ship the text a second time just to count
+/// it.
+///
+/// Consequence worth knowing: a caret may name a node whose text the
+/// consumer has not received yet, so an offset is clamped and
+/// converted at READ time and never trusted as an index.
+pub const EvA11yCaret = struct {
+    pub const tag: Tag = .ev_a11y_caret;
+    view: u32,
+    anchor_id: u32,
+    anchor_offset: i32,
+    focus_id: u32,
+    focus_offset: i32,
 };
 
 /// `A11yNode.state` bits — OUR numbering, engine enums never cross the
@@ -2643,6 +2686,22 @@ test "round-trip: a11y frames" {
     });
     try roundTrip(EvA11yLoc, .{ .view = 7, .locs = .{ .s = "" } });
     try roundTrip(EvA11yEvent, .{ .view = 7, .id = 4, .event = "focus" });
+    try roundTrip(EvA11yCaret, .{
+        .view = 7,
+        .anchor_id = 4,
+        .anchor_offset = 2,
+        .focus_id = 4,
+        .focus_offset = 9,
+    });
+    // A BACKWARD selection: anchor past focus is legal, not an error,
+    // so the signed fields must survive rather than clamp.
+    try roundTrip(EvA11yCaret, .{
+        .view = 7,
+        .anchor_id = 9,
+        .anchor_offset = 12,
+        .focus_id = 4,
+        .focus_offset = 0,
+    });
 }
 
 test "a11y node list round-trips through writer and iterator" {

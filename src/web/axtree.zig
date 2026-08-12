@@ -49,6 +49,24 @@ pub const Node = struct {
         }
         return null;
     }
+
+    /// The node's TEXT as a text-interface consumer reads it. A form
+    /// field carries what the user typed in `value` while `name` holds
+    /// its label, so preferring `value` is what stops a caret being
+    /// reported against the label instead of the content; a static run
+    /// has only `name`. Borrowed from the node.
+    pub fn text(self: *const Node) []const u8 {
+        if (self.value.len != 0) return self.value;
+        return self.name;
+    }
+
+    /// Whether a text-interface projection should be offered at all.
+    /// An editable field always qualifies even while empty — that is
+    /// precisely where a caret sits with nothing to read.
+    pub fn hasText(self: *const Node) bool {
+        if (self.state & proto.ax_editable != 0) return true;
+        return self.text().len != 0;
+    }
 };
 
 pub const Tree = struct {
@@ -56,6 +74,14 @@ pub const Tree = struct {
     nodes: std.AutoHashMapUnmanaged(u32, Node) = .empty,
     root_id: u32 = 0,
     focus_id: u32 = 0,
+    /// Caret / selection endpoints from `ev_a11y_caret`, in the
+    /// vocabulary `proto.EvA11yCaret` documents: anchor = where the
+    /// selection started, focus = where the caret is. `caret_focus_id`
+    /// 0 means the document has no caret.
+    caret_anchor_id: u32 = 0,
+    caret_anchor_offset: i32 = 0,
+    caret_focus_id: u32 = 0,
+    caret_focus_offset: i32 = 0,
     /// Bumped on every applied frame; a projection republishing to a
     /// platform API can use it as a cheap "anything changed" probe.
     generation: u32 = 0,
@@ -142,6 +168,65 @@ pub const Tree = struct {
             n.offset_container = l.offset_container;
         }
         self.generation +%= 1;
+    }
+
+    /// Apply one `ev_a11y_caret` frame. Endpoints are stored raw; the
+    /// clamping to a node's actual text happens at READ time, because
+    /// the frame can legitimately arrive before the node it names.
+    pub fn applyCaret(self: *Tree, ev: proto.EvA11yCaret) void {
+        self.caret_anchor_id = ev.anchor_id;
+        self.caret_anchor_offset = ev.anchor_offset;
+        self.caret_focus_id = ev.focus_id;
+        self.caret_focus_offset = ev.focus_offset;
+        self.generation +%= 1;
+    }
+
+    /// Caret offset within node `id` as a CHARACTER offset, or null
+    /// when the caret is not on that node. The wire carries UTF-16
+    /// code units (see `proto.EvA11yCaret`); this is the layer that
+    /// mirrors the text, so it is where they become characters.
+    pub fn caretOffsetFor(self: *const Tree, id: u32) ?i32 {
+        if (id == 0 or self.caret_focus_id != id) return null;
+        const n = self.get(id) orelse return null;
+        return charForUtf16(n.text(), self.caret_focus_offset);
+    }
+
+    /// The selected range within node `id` as ordered [start, end), or
+    /// null when there is no selection or it is collapsed to a caret.
+    /// A selection whose two endpoints sit on DIFFERENT nodes is not
+    /// reported here: `org.a11y.atspi.Text` is a per-object interface
+    /// and has no way to express a range that leaves the object, so
+    /// claiming one would be a lie a reader would then read out.
+    pub fn selectionFor(self: *const Tree, id: u32) ?[2]i32 {
+        if (id == 0) return null;
+        if (self.caret_focus_id != id or self.caret_anchor_id != id) return null;
+        const n = self.get(id) orelse return null;
+        const txt = n.text();
+        const a = charForUtf16(txt, self.caret_anchor_offset);
+        const b = charForUtf16(txt, self.caret_focus_offset);
+        if (a == b) return null; // collapsed: a caret, not a selection
+        return if (a < b) .{ a, b } else .{ b, a };
+    }
+
+    /// UTF-16 code-unit offset -> CHARACTER offset in `s`, clamped to
+    /// its length. Astral codepoints cost two UTF-16 units but one
+    /// character, which is exactly why this cannot be a subtraction:
+    /// an emoji before the caret would put it a character too far.
+    fn charForUtf16(s: []const u8, off16: i32) i32 {
+        if (off16 <= 0) return 0;
+        const want: u32 = @intCast(off16);
+        var units: u32 = 0;
+        var chars: i32 = 0;
+        var i: usize = 0;
+        while (i < s.len) {
+            if (units >= want) break;
+            const l = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+            if (i + l > s.len) break;
+            units += if (l == 4) 2 else 1; // a surrogate pair is 2 units
+            chars += 1;
+            i += l;
+        }
+        return chars;
     }
 
     /// Remove everything below `id` (not `id` itself).
@@ -283,6 +368,97 @@ test "location deltas move geometry without touching structure" {
     try t.expectEqual(@as(i32, 300), tree.get(2).?.y);
     try t.expectEqualStrings("Go", tree.get(2).?.name);
     try t.expectEqual(@as(usize, 2), tree.count());
+}
+
+test "caret and selection resolve per node, clamped to its text" {
+    const gpa = t.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encodeNodes(gpa, &buf, &.{
+        .{ .id = 1, .role = "document", .children = &.{ 2, 3 } },
+        // A field: `value` is the content, `name` the label. The caret
+        // must be reported against the content.
+        .{ .id = 2, .role = "textbox", .name = "Search", .value = "hello", .state = proto.ax_editable },
+        .{ .id = 3, .role = "text", .name = "static" },
+    });
+    try tree.applyTree(.{ .view = 1, .root_id = 1, .node_id_to_clear = 0, .focus_id = 2, .nodes = .{ .s = buf.items } });
+
+    try t.expectEqualStrings("hello", tree.get(2).?.text());
+    try t.expectEqualStrings("static", tree.get(3).?.text());
+
+    // Collapsed caret at offset 3 of node 2.
+    tree.applyCaret(.{ .view = 1, .anchor_id = 2, .anchor_offset = 3, .focus_id = 2, .focus_offset = 3 });
+    try t.expectEqual(@as(?i32, 3), tree.caretOffsetFor(2));
+    try t.expectEqual(@as(?i32, null), tree.caretOffsetFor(3));
+    try t.expectEqual(@as(?[2]i32, null), tree.selectionFor(2));
+
+    // A real selection, dragged BACKWARD: reported ordered.
+    tree.applyCaret(.{ .view = 1, .anchor_id = 2, .anchor_offset = 4, .focus_id = 2, .focus_offset = 1 });
+    try t.expectEqual(@as(?[2]i32, .{ 1, 4 }), tree.selectionFor(2));
+    try t.expectEqual(@as(?i32, 1), tree.caretOffsetFor(2));
+
+    // An offset past the end of the text is clamped, never trusted.
+    tree.applyCaret(.{ .view = 1, .anchor_id = 2, .anchor_offset = 99, .focus_id = 2, .focus_offset = 99 });
+    try t.expectEqual(@as(?i32, 5), tree.caretOffsetFor(2));
+
+    // A negative offset is not an index into anything.
+    tree.applyCaret(.{ .view = 1, .anchor_id = 2, .anchor_offset = -3, .focus_id = 2, .focus_offset = -3 });
+    try t.expectEqual(@as(?i32, 0), tree.caretOffsetFor(2));
+
+    // A selection straddling two nodes is NOT claimed by either.
+    tree.applyCaret(.{ .view = 1, .anchor_id = 2, .anchor_offset = 1, .focus_id = 3, .focus_offset = 2 });
+    try t.expectEqual(@as(?[2]i32, null), tree.selectionFor(2));
+    try t.expectEqual(@as(?[2]i32, null), tree.selectionFor(3));
+    try t.expectEqual(@as(?i32, 2), tree.caretOffsetFor(3));
+
+    // A caret naming a node that has not arrived degrades to null
+    // rather than reporting an offset into nothing.
+    tree.applyCaret(.{ .view = 1, .anchor_id = 77, .anchor_offset = 0, .focus_id = 77, .focus_offset = 4 });
+    try t.expectEqual(@as(?i32, null), tree.caretOffsetFor(77));
+}
+
+test "a UTF-16 caret offset lands on the right character past an emoji" {
+    const gpa = t.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    // "a<PILE OF POO>b": 3 characters, but 4 UTF-16 code units — the
+    // emoji is a surrogate PAIR. An engine offset of 3 is therefore
+    // the 'b', i.e. character 2.
+    try encodeNodes(gpa, &buf, &.{
+        .{ .id = 1, .role = "document", .children = &.{2} },
+        .{ .id = 2, .role = "text", .name = "a\u{1F4A9}b" },
+    });
+    try tree.applyTree(.{ .view = 1, .root_id = 1, .node_id_to_clear = 0, .focus_id = 2, .nodes = .{ .s = buf.items } });
+
+    tree.applyCaret(.{ .view = 1, .anchor_id = 2, .anchor_offset = 3, .focus_id = 2, .focus_offset = 3 });
+    try t.expectEqual(@as(?i32, 2), tree.caretOffsetFor(2));
+    // Offset 1 is still just after the 'a'; a naive byte or unit count
+    // would disagree with one of these two.
+    tree.applyCaret(.{ .view = 1, .anchor_id = 2, .anchor_offset = 1, .focus_id = 2, .focus_offset = 1 });
+    try t.expectEqual(@as(?i32, 1), tree.caretOffsetFor(2));
+    // Selecting across the emoji: units 1..4 are characters 1..3.
+    tree.applyCaret(.{ .view = 1, .anchor_id = 2, .anchor_offset = 1, .focus_id = 2, .focus_offset = 4 });
+    try t.expectEqual(@as(?[2]i32, .{ 1, 3 }), tree.selectionFor(2));
+}
+
+test "an empty editable still offers text; an empty static does not" {
+    const gpa = t.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encodeNodes(gpa, &buf, &.{
+        .{ .id = 1, .role = "document", .children = &.{ 2, 3 } },
+        .{ .id = 2, .role = "textbox", .state = proto.ax_editable },
+        .{ .id = 3, .role = "generic" },
+    });
+    try tree.applyTree(.{ .view = 1, .root_id = 1, .node_id_to_clear = 0, .focus_id = 0, .nodes = .{ .s = buf.items } });
+    try t.expect(tree.get(2).?.hasText());
+    try t.expect(!tree.get(3).?.hasText());
 }
 
 test "a truncated node payload leaves the store consistent" {
