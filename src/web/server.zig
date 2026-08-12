@@ -73,6 +73,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_PRINT_PDF,
     proto.CAP_DOWNLOADS,
     proto.CAP_A11Y,
+    proto.CAP_A11Y_CARET,
     proto.CAP_CONTEXTS,
     proto.CAP_USERSCRIPTS,
     proto.CAP_SITEDATA,

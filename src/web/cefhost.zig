@@ -456,6 +456,11 @@ pub const View = struct {
     /// browser pointer — only this token — so it is the join key; see
     /// `axResolveView` for how it gets (re)bound.
     ax_tree: []u8 = &.{},
+    /// Last caret/selection sent, so a repeated tree_data does not
+    /// re-post an unchanged caret. `ax_caret_sent` distinguishes
+    /// "never sent" from "sent an all-zero caret".
+    ax_caret: proto.EvA11yCaret = .{ .view = 0, .anchor_id = 0, .anchor_offset = 0, .focus_id = 0, .focus_offset = 0 },
+    ax_caret_sent: bool = false,
 
     /// The engine's callback for a certificate error whose request is
     /// HELD, waiting for a `cert_decision`. At most one per view: a
@@ -1498,6 +1503,10 @@ pub const Host = struct {
             self.gpa.free(v.ax_tree);
             v.ax_tree = &.{};
         }
+        // Same reasoning for the caret: its node ids died with the
+        // document, so the next one must be sent even if it looks
+        // identical to the last.
+        v.ax_caret_sent = false;
     }
 
     fn freeView(self: *Host, v: *View) void {
@@ -2315,9 +2324,14 @@ pub const Host = struct {
         const want = req.enabled != 0;
         if (v.a11y == want) return;
         v.a11y = want;
-        if (!want and v.ax_tree.len != 0) {
-            self.gpa.free(v.ax_tree);
-            v.ax_tree = &.{};
+        if (!want) {
+            if (v.ax_tree.len != 0) {
+                self.gpa.free(v.ax_tree);
+                v.ax_tree = &.{};
+            }
+            // A re-enable must restate the caret: the client dropped
+            // its mirror when the stream stopped.
+            v.ax_caret_sent = false;
         }
         applyA11yState(v);
     }
@@ -6381,9 +6395,30 @@ fn axEmitUpdate(
     alloc: std.mem.Allocator,
 ) void {
     var focus_id: u32 = 0;
+    var caret: ?proto.EvA11yCaret = null;
     if (dDict(upd, "tree_data")) |td| {
         defer release(@ptrCast(&td.base));
         if (dInt(td, "focus_id")) |f| focus_id = @bitCast(f);
+        // The caret/selection lives in tree_data, NOT on any node: it
+        // is a pair of (node, offset) endpoints that may straddle
+        // nodes. Absent keys mean this engine build does not report
+        // it, which degrades to "no caret" rather than to a wrong one.
+        if (dInt(td, "sel_focus_object_id")) |fo| {
+            const fid: u32 = @bitCast(fo);
+            if (fid != 0) {
+                const aid: u32 = if (dInt(td, "sel_anchor_object_id")) |ao|
+                    @bitCast(ao)
+                else
+                    fid;
+                caret = .{
+                    .view = v.id,
+                    .anchor_id = aid,
+                    .anchor_offset = @intCast(dInt(td, "sel_anchor_offset") orelse 0),
+                    .focus_id = fid,
+                    .focus_offset = @intCast(dInt(td, "sel_focus_offset") orelse 0),
+                };
+            }
+        }
     }
 
     var nodes_buf: std.ArrayList(u8) = .empty;
@@ -6408,6 +6443,24 @@ fn axEmitUpdate(
         .focus_id = focus_id,
         .nodes = .{ .s = nodes_buf.items },
     });
+    // AFTER the tree: the caret names a node, and a client that has
+    // not seen that node yet can only clamp the offset to nothing.
+    if (caret) |cr| {
+        if (!v.ax_caret_sent or !axCaretEql(v.ax_caret, cr)) {
+            v.ax_caret = cr;
+            v.ax_caret_sent = true;
+            host.post(cr);
+        }
+    }
+}
+
+/// Two caret frames describing the same state. Coalescing matters:
+/// Chromium repeats tree_data on every update, so an uncoalesced
+/// caret would post a frame per keystroke-sized tree change even when
+/// the caret never moved.
+fn axCaretEql(a: proto.EvA11yCaret, b: proto.EvA11yCaret) bool {
+    return a.anchor_id == b.anchor_id and a.anchor_offset == b.anchor_offset and
+        a.focus_id == b.focus_id and a.focus_offset == b.focus_offset;
 }
 
 /// Translate one engine node dict into a wire record. Inline text
