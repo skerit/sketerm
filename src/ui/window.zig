@@ -1422,6 +1422,11 @@ pub const Window = struct {
     /// Web tab opening `url`; null = an empty address bar. Also the
     /// landing point for a page's popup request (target=_blank).
     pub fn newWebTabAt(self: *Window, url: ?[]const u8) !void {
+        // "Always open this site in X" applies to a fresh tab too — a
+        // popup or an external link to an assigned site must land in its
+        // identity, not in the default jar.
+        const assigned = @import("webface.zig").containerForUrl(url, 0);
+        if (assigned != 0) return self.newWebTabInContainer(assigned, url);
         // Same appended-pane rule as newBrowserTabFromReveal: focus
         // does not reliably sit on the fresh pane.
         const before = self.panes.items.len;

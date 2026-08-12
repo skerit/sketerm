@@ -1728,6 +1728,66 @@ pub fn containersLoaded() bool {
     return g_containers_loaded;
 }
 
+/// Host of an http(s) url, or null when there is nothing to key a rule
+/// on (a blank tab, a data: url, a search term the omnibox has not
+/// resolved yet).
+pub fn hostOfUrl(url: []const u8) ?[]const u8 {
+    const sep = "://";
+    const i = std.mem.indexOf(u8, url, sep) orelse return null;
+    var rest = url[i + sep.len ..];
+    if (std.mem.indexOfAny(u8, rest, "/?#")) |end| rest = rest[0..end];
+    // Strip userinfo and port; neither is part of the rule key.
+    if (std.mem.lastIndexOfScalar(u8, rest, '@')) |at| rest = rest[at + 1 ..];
+    if (std.mem.lastIndexOfScalar(u8, rest, ':')) |colon| {
+        // Leave a bare IPv6 literal alone.
+        if (std.mem.indexOfScalar(u8, rest, ']') == null) rest = rest[0..colon];
+    }
+    return if (rest.len == 0) null else rest;
+}
+
+test "hostOfUrl keys a site rule on the host alone" {
+    const t = std.testing;
+    try t.expectEqualStrings("example.com", hostOfUrl("https://example.com/a/b?c#d").?);
+    try t.expectEqualStrings("example.com", hostOfUrl("http://example.com").?);
+    // Port and userinfo are not part of the identity of a site.
+    try t.expectEqualStrings("example.com", hostOfUrl("https://example.com:8443/x").?);
+    try t.expectEqualStrings("example.com", hostOfUrl("https://user@example.com/x").?);
+    try t.expectEqualStrings("127.0.0.1", hostOfUrl("http://127.0.0.1:9/?set").?);
+    // Nothing to key a rule on: no scheme, or no host at all.
+    try t.expect(hostOfUrl("") == null);
+    try t.expect(hostOfUrl("about:blank") == null);
+    try t.expect(hostOfUrl("data:text/html,<p>x") == null);
+    try t.expect(hostOfUrl("https://") == null);
+}
+
+test "containerForUrl falls back when no rule names the host" {
+    const t = std.testing;
+    // With an empty rule table every url keeps the inherited container,
+    // so a link followed inside a container stays in it.
+    try t.expectEqual(@as(u32, 4), containerForUrl("https://example.com/", 4));
+    try t.expectEqual(@as(u32, 0), containerForUrl(null, 0));
+    try t.expectEqual(@as(u32, 9), containerForUrl("about:blank", 9));
+}
+
+/// Container a url should open in. An explicit per-site rule BEATS the
+/// container that would otherwise be inherited — that is what "always
+/// open this site in Work" means, including when the link was followed
+/// from somewhere else.
+///
+/// This decides where a NEW page or tab is created. A navigation inside
+/// a page that is already open is deliberately not re-homed: a view's
+/// request context is fixed at `view_create`, so moving it would mean
+/// tearing the page down and reloading it under the user, losing form
+/// state and history. Firefox re-opens in a new tab for the same
+/// reason; doing that automatically on every in-page navigation is a
+/// bigger behavioural claim than this makes.
+pub fn containerForUrl(url: ?[]const u8, fallback: u32) u32 {
+    const u = url orelse return fallback;
+    const host = hostOfUrl(u) orelse return fallback;
+    const assigned = containerForHost(host);
+    return if (assigned != 0) assigned else fallback;
+}
+
 /// Container a per-site rule assigns `host` to, or 0 for none.
 pub fn containerForHost(host: []const u8) u32 {
     for (g_container_sites.items) |rule| {
@@ -2524,7 +2584,10 @@ pub const WebFace = struct {
         url: ?[]const u8,
         opener: ?*WebFace,
     ) !*WebFace {
-        return attachPageIn(allocator, g, url, opener, inheritedContainer(g, opener));
+        // A per-site rule outranks the opener's container: following a
+        // link to a site assigned elsewhere lands in the assigned
+        // identity, not the one the link happened to be clicked in.
+        return attachPageIn(allocator, g, url, opener, containerForUrl(url, inheritedContainer(g, opener)));
     }
 
     /// A new page inherits the container of the page it was opened
@@ -6103,6 +6166,26 @@ pub const WebFace = struct {
             }
         }
         tabs.itemIcon("Containersâ¦", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
+        // "Always open this site in X" for the page in front of the
+        // user. The rule is keyed on the HOST, re-derived at click time
+        // from the face's current address, so the row owns no string.
+        if (self.url != null and containers().len != 0) {
+            const asg = tabs.submenu("Always Open This Site In");
+            const none_rc = self.allocator.create(ContainerRowCtx) catch null;
+            if (none_rc) |rc| {
+                rc.* = .{ .allocator = self.allocator, .face = self, .container = 0 };
+                root.own(freeContainerRowCtx, rc);
+                asg.item("No container", &onMenuAssignSite, rc);
+            }
+            for (containers()) |*ctn| {
+                if (ctn.ephemeral) continue;
+                const rc = self.allocator.create(ContainerRowCtx) catch continue;
+                rc.* = .{ .allocator = self.allocator, .face = self, .container = ctn.id };
+                root.own(freeContainerRowCtx, rc);
+                var abuf: [128]u8 = undefined;
+                asg.item(classicmenu.escapeLabel(ctn.name, &abuf), &onMenuAssignSite, rc);
+            }
+        }
 
         const x: f64 = @floatFromInt(ev.x + @as(i32, self.snap_dx));
         const y: f64 = @floatFromInt(ev.y + @as(i32, self.snap_dy));
@@ -6128,6 +6211,16 @@ pub const WebFace = struct {
     fn onMenuContainers(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(MenuCtx, user).face.ownerWindow() orelse return;
         @import("webcontainers.zig").openManager(win);
+    }
+
+    /// Bind (or with container 0, unbind) this page's HOST to a
+    /// container. Existing tabs are left where they are; the rule
+    /// governs what opens next — see `containerForUrl`.
+    fn onMenuAssignSite(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const rc = cast.userData(ContainerRowCtx, user);
+        const u = rc.face.url orelse return;
+        const host = hostOfUrl(u) orelse return;
+        setSiteContainer(rc.face.allocator, host, rc.container);
     }
 
     fn onMenuExtensions(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -6335,6 +6428,26 @@ pub const WebFace = struct {
             }
         }
         tabs.itemIcon("Containersâ¦", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
+        // "Always open this site in X" for the page in front of the
+        // user. The rule is keyed on the HOST, re-derived at click time
+        // from the face's current address, so the row owns no string.
+        if (self.url != null and containers().len != 0) {
+            const asg = tabs.submenu("Always Open This Site In");
+            const none_rc = self.allocator.create(ContainerRowCtx) catch null;
+            if (none_rc) |rc| {
+                rc.* = .{ .allocator = self.allocator, .face = self, .container = 0 };
+                root.own(freeContainerRowCtx, rc);
+                asg.item("No container", &onMenuAssignSite, rc);
+            }
+            for (containers()) |*ctn| {
+                if (ctn.ephemeral) continue;
+                const rc = self.allocator.create(ContainerRowCtx) catch continue;
+                rc.* = .{ .allocator = self.allocator, .face = self, .container = ctn.id };
+                root.own(freeContainerRowCtx, rc);
+                var abuf: [128]u8 = undefined;
+                asg.item(classicmenu.escapeLabel(ctn.name, &abuf), &onMenuAssignSite, rc);
+            }
+        }
         tabs.itemIconEnabled(
             "Show This Pane's Shell",
             .{ .name = "sketerm-terminal-symbolic" },
