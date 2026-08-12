@@ -461,10 +461,13 @@ pub fn collectLayout(self: *Window, arena: std.mem.Allocator) !layout_mod.Layout
         verifyTreeModel(self, page.?, root.?);
         // Model-based serialization (correct even while zoomed);
         // widget walk only as fallback for a missing model.
+        // A tab whose every pane is transient (a DevTools view and
+        // nothing else) serializes to nothing and is skipped, the same
+        // way a tab with no root widget is.
         const tree = if (Window.tabTreeOf(page.?)) |t|
-            modelTreeToLayout(self, arena, t.root) catch continue
+            (modelTreeToLayout(self, arena, t.root) catch continue) orelse continue
         else
-            collectTree(self, arena, root.?) catch continue;
+            (collectTree(self, arena, root.?) catch continue) orelse continue;
         try tabs.append(arena, .{
             .title = try arena.dupe(u8, title),
             .tree = tree,
@@ -488,7 +491,23 @@ pub fn collectLayout(self: *Window, arena: std.mem.Allocator) !layout_mod.Layout
     return .{ .version = 2, .tabs = try tabs.toOwnedSlice(arena) };
 }
 
-pub fn collectTree(self: *Window, arena: std.mem.Allocator, w: *c.GtkWidget) !layout_mod.Tree {
+/// A pane that PRESENTS a view it did not create — today only a
+/// DevTools inspector, minted by the helper's `devtools_show` — has no
+/// restorable state at all: `WebFace.paneState` would answer with an
+/// empty address (the face has no url of its own), so the pane would
+/// come back as a blank web pane. The inspector's own page is already
+/// serialized by the pane that owns it, and a next-launch helper knows
+/// nothing about the old view id, so the honest snapshot omits the
+/// pane entirely and lets its split collapse onto the sibling.
+fn isTransientFace(p: *Pane) bool {
+    const wf = @import("webface.zig").WebFace.fromPane(p) orelse return false;
+    return wf.attached;
+}
+
+/// Null when the subtree holds nothing worth restoring (see
+/// `isTransientFace`); a split with one surviving child collapses to
+/// that child.
+pub fn collectTree(self: *Window, arena: std.mem.Allocator, w: *c.GtkWidget) !?layout_mod.Tree {
     const is_paned = c.g_type_check_instance_is_a(
         @ptrCast(@alignCast(w)),
         c.gtk_paned_get_type(),
@@ -506,9 +525,13 @@ pub fn collectTree(self: *Window, arena: std.mem.Allocator, w: *c.GtkWidget) !la
             @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total))
         else
             0.5;
+        const first = try collectTree(self, arena, start);
+        const second = try collectTree(self, arena, end);
+        const a = first orelse return second;
+        const b = second orelse return a;
         const children = try arena.alloc(layout_mod.Tree, 2);
-        children[0] = try collectTree(self, arena, start);
-        children[1] = try collectTree(self, arena, end);
+        children[0] = a;
+        children[1] = b;
         return .{ .split = .{
             .orientation = if (orientation == c.GTK_ORIENTATION_HORIZONTAL) .horizontal else .vertical,
             .ratio = ratio,
@@ -519,6 +542,7 @@ pub fn collectTree(self: *Window, arena: std.mem.Allocator, w: *c.GtkWidget) !la
     // Leaf — find the Pane that owns this widget.
     for (self.panes.items) |p| {
         if (@intFromPtr(p.widget()) == @intFromPtr(w)) {
+            if (isTransientFace(p)) return null;
             return .{ .pane = try paneSpec(self, arena, p) };
         }
     }
@@ -638,10 +662,15 @@ pub fn paneSpec(self: *Window, arena: std.mem.Allocator, p: *Pane) !layout_mod.P
 }
 
 /// Serialize a model node to a layout tree. Split ratios are
-/// read live from the view handle (the GtkPaned) at save time.
-pub fn modelTreeToLayout(self: *Window, arena: std.mem.Allocator, node: PaneTree.Node) !layout_mod.Tree {
+/// read live from the view handle (the GtkPaned) at save time. Null
+/// when the subtree holds nothing worth restoring — see
+/// `isTransientFace`.
+pub fn modelTreeToLayout(self: *Window, arena: std.mem.Allocator, node: PaneTree.Node) !?layout_mod.Tree {
     switch (node) {
-        .leaf => |p| return .{ .pane = try paneSpec(self, arena, p) },
+        .leaf => |p| {
+            if (isTransientFace(p)) return null;
+            return .{ .pane = try paneSpec(self, arena, p) };
+        },
         .split => |sp| {
             var ratio: f32 = if (sp.ratio > 0 and sp.ratio < 1) sp.ratio else 0.5;
             if (sp.view) |v| {
@@ -653,9 +682,13 @@ pub fn modelTreeToLayout(self: *Window, arena: std.mem.Allocator, node: PaneTree
                 const pos = c.gtk_paned_get_position(@ptrCast(paned));
                 if (total > 0) ratio = @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total));
             }
+            const first = try modelTreeToLayout(self, arena, sp.children[0]);
+            const second = try modelTreeToLayout(self, arena, sp.children[1]);
+            const a = first orelse return second;
+            const b = second orelse return a;
             const children = try arena.alloc(layout_mod.Tree, 2);
-            children[0] = try modelTreeToLayout(self, arena, sp.children[0]);
-            children[1] = try modelTreeToLayout(self, arena, sp.children[1]);
+            children[0] = a;
+            children[1] = b;
             return .{ .split = .{
                 .orientation = if (sp.orientation == .horizontal) .horizontal else .vertical,
                 .ratio = ratio,
@@ -845,11 +878,19 @@ pub fn duplicateCurrentTab(self: *Window) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const tree = (if (Window.tabTreeOf(sel)) |t|
+    const tree_opt = (if (Window.tabTreeOf(sel)) |t|
         modelTreeToLayout(self, arena, t.root)
     else
         collectTree(self, arena, root.?)) catch |err| {
         std.debug.print("sketerm: duplicate split tree failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    // Everything in the tab was transient (a lone DevTools pane): fall
+    // back to a plain shell tab rather than duplicating nothing.
+    const tree = tree_opt orelse {
+        self.newShellTabWithProfile(null, pane.active_profile) catch |err| {
+            std.debug.print("sketerm: duplicate tab failed: {s}\n", .{@errorName(err)});
+        };
         return;
     };
 
