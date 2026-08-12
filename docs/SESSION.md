@@ -17253,3 +17253,52 @@ a layout written before pages existed.
 
 Unchanged and still red: `copyModeStage` in the same rig, which fails at
 the pre-work baseline for unrelated reasons.
+
+## 2026-08-12: the plan audit, and the half of smoke-e2e that never ran
+
+An audit of `docs/proposal-browser.md` section by section against the
+code (six parallel readers, claims re-verified by hand) turned up two
+things that were WRONG rather than missing, plus a list of genuinely
+unbuilt items. The two defects, and a third the fixes uncovered:
+
+**Tree-tab nesting did not survive a restore.** `tree_parent` was
+written as the parent's live AdwTabView POSITION and read as an index
+into the saved `tabs` array. `collectLayout` skips tabs — one with no
+root widget, or a tab whose every pane is transient — and every skip
+shifts the two index spaces apart, so a layout containing one restored
+children under the wrong parent, or flat. The mapping is now
+`Forest.parentIndices`, unit-tested on plain integers in both roots,
+and `webgroup.zig` uses it too rather than its own copy of the loop.
+`ui/tabforest.zig` is now in the core test root, where a GTK-free
+model belonged all along.
+
+**The tree actions acted on a tree the user could not see.**
+`tab_collapse`/`tab_expand`/`tab_tree_next`/`tab_tree_prev` always
+walked the WINDOW's tab forest, so with the sidebar listing a browser's
+pages they folded something invisible. They now follow whatever the
+sidebar is showing, and smoke-e2e asserts it: stepping moves the PAGE
+while the window's tab selection stays put, collapsing puts a child out
+of a step's reach, expanding brings it back.
+
+**`copyModeStage` was red, and had been for long enough that the ~30
+stages behind it were dead code.** It was not a product bug: the stage
+assumed the shell's output line sat exactly one `k` above the cursor,
+which a two-line prompt — or one that swaps itself for a taller one
+once the shell finishes starting — makes false, so the motions yanked
+from the prompt instead. The row is measured now (`get-text` +
+`screen-info`). Unblocking it immediately exposed two more rig bugs
+that had never had a chance to run: hardcoded pane ids ("the pane the
+split just made is id 2"), which any earlier stage that opens a tab
+shifts, and a restore step that DELETED config.conf — which
+deliberately keeps the running config, so the defaults never came back.
+A dead test is worse than an absent one: it reads as coverage.
+
+Also from the audit list: `web_snapshot`'s `detail` is now a real
+session default (the plan asked for per-request AND session default;
+only the per-request half existed, hardcoded on every call), and the
+history store's daemon is choosable. That last one was a false claim in
+our own docs — "daemon-side so it follows you across machines" while
+the client always dialled the per-user local daemon. `web_store_socket`
+then `$SKETERM_MUX_SOCKET` then the default: a forwarded socket now
+gives every machine ONE history, and an isolated instance stops writing
+into the user's real store.
