@@ -315,7 +315,7 @@ pub const Host = struct {
 
         if (std.mem.eql(u8, method, "removeListener")) {
             if (args.len < 1 or args[0] != .integer) return self.errResult("bad listener id");
-            const lid: u32 = @intCast(@max(args[0].integer, 0));
+            const lid: u32 = tabs.u32Of(args[0]) orelse return self.errResult("bad listener id");
             const r = e.wreq orelse return self.gpa.dupe(u8, "{\"result\":null}") catch self.errResult("oom");
             webrequest.acquire();
             r.remove(self.gpa, lid);
@@ -330,7 +330,7 @@ pub const Host = struct {
         if (args.len < 2 or args[0] != .string or args[1] != .integer) return self.errResult("bad args");
         const event = webrequest.Event.fromStr(args[0].string) orelse
             return self.errResult("unsupported webRequest event");
-        const lid: u32 = @intCast(@max(args[1].integer, 0));
+        const lid: u32 = tabs.u32Of(args[1]) orelse return self.errResult("bad listener id");
 
         var urls: std.ArrayList([]const u8) = .empty;
         defer urls.deinit(self.gpa);
@@ -553,7 +553,8 @@ pub const Host = struct {
         }
         if (std.mem.eql(u8, method, "get")) {
             if (args.len == 0 or args[0] != .integer) return self.errResult("bad tab id");
-            const tb = self.tabs.find(@intCast(@max(args[0].integer, 0))) orelse
+            const want_id = tabs.u32Of(args[0]) orelse return self.errResult("no such tab");
+            const tb = self.tabs.find(want_id) orelse
                 return self.errResult("no such tab");
             var aw: std.Io.Writer.Allocating = .init(self.gpa);
             defer aw.deinit();

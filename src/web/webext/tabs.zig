@@ -20,6 +20,20 @@
 const std = @import("std");
 const match = @import("match.zig");
 
+/// A JSON integer narrowed to u32, or null when it is negative or does
+/// not fit.
+///
+/// Extension-supplied values are untrusted and this tree builds
+/// ReleaseFast, where an out-of-range `@intCast` TRUNCATES silently
+/// rather than trapping — so `@intCast(@max(v, 0))` turned a large id
+/// into a small valid one instead of rejecting it. Callers decide what
+/// out-of-range means; none of them may narrow it themselves.
+pub fn u32Of(v: std.json.Value) ?u32 {
+    if (v != .integer) return null;
+    if (v.integer < 0 or v.integer > std.math.maxInt(u32)) return null;
+    return @intCast(v.integer);
+}
+
 /// One tab as the client describes it. Slices are borrowed for the
 /// duration of a `replace` call; the table copies what it keeps.
 pub const Incoming = struct {
@@ -216,10 +230,19 @@ pub const Table = struct {
             if (t_.focused_window != want) return false;
         }
         if (o.get("windowId")) |v| {
-            if (v == .integer and t_.window_id != @as(u32, @intCast(@max(v.integer, 0)))) return false;
+            if (v == .integer) {
+                // Out of range matches NOTHING. Narrowing it instead
+                // wrapped: `windowId: 2**32 + 1` answered with window
+                // 1's tabs — a window the extension never named.
+                const want = u32Of(v) orelse return false;
+                if (t_.window_id != want) return false;
+            }
         }
         if (o.get("index")) |v| {
-            if (v == .integer and t_.index != @as(u32, @intCast(@max(v.integer, 0)))) return false;
+            if (v == .integer) {
+                const want = u32Of(v) orelse return false;
+                if (t_.index != want) return false;
+            }
         }
         if (o.get("status")) |v| {
             if (v == .string) {
