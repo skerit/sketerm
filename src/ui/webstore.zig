@@ -1,7 +1,26 @@
 //! Async GUI client for the daemon-side web store (web_op/web_reply).
 //!
-//! One process-wide connection to the LOCAL daemon (the webface Client
-//! singleton shape), lazily opened and watched with g_unix_fd_add —
+//! ## Which daemon owns your browsing data
+//!
+//! History and bookmarks live on a DAEMON, not in the GUI's config, so
+//! that they follow the user rather than the machine. Which daemon is
+//! resolved once, in `storeSocket`, in this order:
+//!
+//! 1. `web_store_socket` in config.conf — an explicit daemon socket.
+//!    Point it at a forwarded socket (`ssh -L`, or a bind-mount) and
+//!    every sketerm you run reads and writes ONE history.
+//! 2. `$SKETERM_MUX_SOCKET` — the daemon this environment belongs to.
+//!    A GUI launched from inside a pane inherits it, which is also what
+//!    keeps an isolated test instance off the user's real store.
+//! 3. The per-user local daemon (autostarted), the historical default.
+//!
+//! What this deliberately does NOT do is dial a remote host itself: the
+//! socket must be reachable as a PATH. A transport of its own would
+//! duplicate the session transports for a store that is a few hundred
+//! kB of JSONL, and a forwarded socket already covers the case.
+//!
+//! One process-wide connection (the webface Client singleton shape),
+//! lazily opened and watched with g_unix_fd_add —
 //! the GLib loop is never blocked on the socket. Requests are nonce-
 //! correlated; replies hand the raw JSON payload to the caller's
 //! callback. Liveness follows the disconnect-at-teardown rule: an
@@ -60,9 +79,10 @@ fn ensure(gpa: std.mem.Allocator) bool {
         .idle => {},
     }
     s.gpa = gpa;
-    // Local autostart connect is synchronous but fast — the existing
-    // GUI behavior for local panes and the local file browser.
-    s.conn = muxclient.Conn.connectLocalAutostart(gpa) catch {
+    // Autostart connect is synchronous but fast — the existing GUI
+    // behavior for local panes and the local file browser.
+    var sock_buf: [4096]u8 = undefined;
+    s.conn = muxclient.Conn.connectLocalAutostartAt(gpa, storeSocket(&sock_buf)) catch {
         markDeadNoConn();
         return false;
     };
@@ -77,6 +97,59 @@ fn ensure(gpa: std.mem.Allocator) bool {
     s.watch_id = c.g_unix_fd_add(s.conn.fd, c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR, &onReadable, null);
     s.state = .ready;
     return true;
+}
+
+/// The daemon socket the store lives on, or null for the per-user
+/// default. See the header for the order and why there is no remote
+/// transport here. `buf` holds the returned slice.
+fn storeSocket(buf: []u8) ?[]const u8 {
+    if (g_store_socket) |p| {
+        if (p.len > 0 and p.len < buf.len) {
+            @memcpy(buf[0..p.len], p);
+            return buf[0..p.len];
+        }
+    }
+    if (c.getenv("SKETERM_MUX_SOCKET")) |env| {
+        const p = std.mem.span(env);
+        if (p.len > 0 and p.len < buf.len) {
+            @memcpy(buf[0..p.len], p);
+            return buf[0..p.len];
+        }
+    }
+    return null;
+}
+
+/// Config's `web_store_socket`, pointed at the live config arena by the
+/// Window on startup and on every `applyConfigChange` (config-arena
+/// slices are re-pointed there, never retained across a reload).
+var g_store_socket: ?[]const u8 = null;
+
+/// Called by the Window whenever the config is (re)applied. A change
+/// only takes effect on the next connection, so an already-open store
+/// is dropped when the target moves.
+pub fn setStoreSocket(path: []const u8) void {
+    const now: ?[]const u8 = if (path.len > 0) path else null;
+    const same = blk: {
+        if (g_store_socket == null and now == null) break :blk true;
+        if (g_store_socket) |a| {
+            if (now) |b| break :blk std.mem.eql(u8, a, b);
+        }
+        break :blk false;
+    };
+    g_store_socket = now;
+    if (!same) reconnect();
+}
+
+/// Drop any open connection so the next request re-resolves the target.
+/// `markDead` is the shared teardown (it owns both watch sources); the
+/// state is then forced back to `idle` so the next request reconnects
+/// at once instead of sitting out the backoff.
+fn reconnect() void {
+    const s = &g_store;
+    if (s.state == .idle) return;
+    markDead();
+    s.state = .idle;
+    s.retry_at_ms = 0;
 }
 
 fn markDeadNoConn() void {

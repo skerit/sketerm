@@ -959,6 +959,9 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     self.refreshOpaqueRegion();
     self.refreshBindings();
     c.gtk_widget_set_visible(self.tab_bar, if (self.config.show_tab_bar) 1 else 0);
+    // The web store's daemon can move at reload; the client drops any
+    // open connection when it does (src/ui/webstore.zig).
+    @import("webstore.zig").setStoreSocket(self.config.web_store_socket);
     // The tree sidebar follows its config keys live too — it used to
     // need a restart, which made `reload_config` look broken for it.
     // Width first: showing the sidebar re-asserts the paned position,

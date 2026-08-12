@@ -1292,6 +1292,11 @@ pub const Config = struct {
     /// Show the vertical tree-style tab sidebar at startup. Off by
     /// default; toggleable at runtime via toggle_tab_sidebar.
     show_tab_sidebar: bool = false,
+    /// Daemon socket holding the browsing history and bookmarks. Empty
+    /// resolves at connect time: $SKETERM_MUX_SOCKET, else the per-user
+    /// daemon. Point it at a forwarded socket to share ONE history
+    /// across machines (src/ui/webstore.zig documents the order).
+    web_store_socket: []const u8 = "",
     /// Width of that sidebar in logical px. Written back when the user
     /// drags the divider, so the key exists mainly to persist it.
     tab_sidebar_width: u16 = 240,
@@ -1350,6 +1355,7 @@ pub const Config = struct {
         out.hint_editor = try arena.dupe(u8, self.hint_editor);
         out.quake_monitor = try arena.dupe(u8, self.quake_monitor);
         out.hint_alphabet = try arena.dupe(u8, self.hint_alphabet);
+        out.web_store_socket = try arena.dupe(u8, self.web_store_socket);
         out.hint_rules = .empty;
         try out.hint_rules.ensureTotalCapacity(arena, self.hint_rules.items.len);
         for (self.hint_rules.items) |hr| {
@@ -1982,6 +1988,8 @@ pub const Config = struct {
         if (self.show_tab_sidebar) try w.writeAll("show_tab_sidebar = true\n");
         if (self.tab_sidebar_width != 240)
             try w.print("tab_sidebar_width = {d}\n", .{self.tab_sidebar_width});
+        if (self.web_store_socket.len > 0)
+            try w.print("web_store_socket = {s}\n", .{self.web_store_socket});
         if (self.tab_close_parent != .promote) try w.writeAll("tab_close_parent = close-subtree\n");
         if (self.tab_child_insert != .last) try w.writeAll("tab_child_insert = first\n");
         const default_taf: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
@@ -3167,6 +3175,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.show_tab_bar = try parseBool(value);
     } else if (std.mem.eql(u8, key, "show_tab_sidebar")) {
         cfg.show_tab_sidebar = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "web_store_socket")) {
+        cfg.web_store_socket = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "tab_sidebar_width")) {
         const w = try parseU16(value);
         if (w < 120 or w > 800) return error.BadTabSidebarWidth;

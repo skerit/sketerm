@@ -720,6 +720,10 @@ pub const Window = struct {
         // toggle_tab_bar action at runtime.
         if (!self.config.show_tab_bar) c.gtk_widget_set_visible(self.tab_bar, 0);
 
+        // Which daemon holds history/bookmarks (empty = resolve at
+        // connect time). Set before any face can issue a store request.
+        @import("webstore.zig").setStoreSocket(self.config.web_store_socket);
+
         // Tree-style tabs: the strip hides pages inside a collapsed
         // subtree; the vertical sidebar renders the tree itself.
         self.tabbar.hidden_ctx = @ptrCast(self);
