@@ -6841,6 +6841,15 @@ fn extSchemeCreate(
     // semantic.js.
     const rtype_raw = if (req.get_resource_type) |grt| grt(req) else cef.RT_SUB_RESOURCE;
     const is_navigation = rtype_raw == cef.RT_MAIN_FRAME or rtype_raw == cef.RT_SUB_FRAME;
+    // Measured 2026-08-12 with this print: the generated background
+    // document and an author's own `background.html` both arrive as
+    // rtype 0 (RT_MAIN_FRAME) with a frame, and the bootstrap arrives
+    // as rtype 3 (RT_SCRIPT) with the frame already at the extension
+    // origin. That is what makes the split below safe.
+    if (dbg) std.debug.print(
+        "sketerm-web: ext gate path={s} rtype={d} frame={d}\n",
+        .{ path, rtype_raw, @intFromBool(frame != null) },
+    );
 
     // `strict` = the initiating document really IS this extension.
     // Tracked apart from `same_origin` because the relaxations below are
@@ -6864,6 +6873,7 @@ fn extSchemeCreate(
     if (!same_origin) {
         var pats: [32][]const u8 = undefined;
         if (!extassets.webAccessible(slot.warPatterns(&pats), path)) {
+            if (dbg) std.debug.print("sketerm-web: WAR 403 {s} (rtype={d})\n", .{ path, rtype_raw });
             return extResourceFor(&.{}, "text/plain", 403);
         }
     }
@@ -6878,7 +6888,14 @@ fn extSchemeCreate(
         // document, where the frame reports the extension origin. A
         // manifest publishing `"/*"` must not put it in reach either,
         // which is why this is checked AFTER the WAR gate.
-        if (!strict) return extResourceFor(&.{}, "text/plain", 403);
+        if (!strict) {
+            // UNCONDITIONAL: this should never fire for a legitimate
+            // load, and when it does the extension silently has no
+            // `browser` at all — which reads as "the background page
+            // never registered its listener" three layers away.
+            std.debug.print("sketerm-web: REFUSED bootstrap for {s} (rtype={d} frame={d})\n", .{ host, rtype_raw, @intFromBool(frame != null) });
+            return extResourceFor(&.{}, "text/plain", 403);
+        }
         const js = buildExtBootstrap(&slot, host) orelse
             return extResourceFor("", "text/javascript", 500);
         return extResourceOwned(js, "text/javascript", 200);
@@ -6887,7 +6904,10 @@ fn extSchemeCreate(
         // The background DOCUMENT is fetched by a navigation, so it
         // cannot require `strict`; it must still never be a subresource
         // another origin can read.
-        if (!strict and !is_navigation) return extResourceFor(&.{}, "text/plain", 403);
+        if (!strict and !is_navigation) {
+            std.debug.print("sketerm-web: REFUSED generated bg for {s} (rtype={d} frame={d})\n", .{ host, rtype_raw, @intFromBool(frame != null) });
+            return extResourceFor(&.{}, "text/plain", 403);
+        }
         const doc = buildGeneratedBackground(&slot) orelse
             return extResourceFor("", "text/html", 500);
         return extResourceOwned(doc, "text/html", 200);
