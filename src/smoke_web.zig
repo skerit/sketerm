@@ -61,6 +61,13 @@ const url_view_id: u32 = 2;
 const bare_view_id: u32 = 3;
 /// The stage-22d view: discarded and revived.
 const discard_view_id: u32 = 4;
+/// The stage-28 view. Cookies need a REAL origin: a data: URL has an
+/// opaque one and `document.cookie` there stores nothing at all, so
+/// this view is the only one in the rig pointed at a loopback server.
+const sitedata_view_id: u32 = 8;
+/// The cookie stage 31's page sets from its own script.
+const cookie_probe = "sk_probe";
+const cookie_probe_value = "abcd1234";
 /// Stage-26/27 views, each in its own identity context.
 const egress_view_a: u32 = 5;
 const egress_view_b: u32 = 6;
@@ -521,6 +528,98 @@ const ProxyProbe = struct {
     }
 };
 
+/// A one-page HTTP server on loopback: the only real ORIGIN this rig
+/// serves, and the reason stage 28 can exist at all — a `data:` URL's
+/// origin is opaque, so `document.cookie` on one stores nothing and
+/// there would be no cookie to enumerate or clear.
+///
+/// Every request gets the same document, favicon probes included, which
+/// keeps the server to one branch. It answers on its own thread and is
+/// stopped by `shutdown`.
+const HttpProbe = struct {
+    fd: c_int = -1,
+    port: u16 = 0,
+    thread: ?std.Thread = null,
+    stop: std.atomic.Value(bool) = .init(false),
+    /// Requests answered, so a stage can tell "the engine never asked"
+    /// apart from "the engine asked and the cookie did not stick".
+    served: std.atomic.Value(u32) = .init(0),
+
+    /// Sets the probe cookie from SCRIPT (not from a Set-Cookie
+    /// header): what a site's own JavaScript stores is exactly what a
+    /// site-data panel has to be able to show and delete.
+    const page =
+        "<html><head><title>cookie-page</title></head><body>cookies" ++
+        "<script>document.cookie=\"" ++ cookie_probe ++ "=" ++ cookie_probe_value ++
+        "; path=/; max-age=3600; SameSite=Lax\";" ++
+        "document.title=\"cookie:\"+document.cookie;</script></body></html>";
+
+    fn start(self: *HttpProbe) bool {
+        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        if (lfd < 0) return false;
+        var one: c_int = 1;
+        _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
+        var sa = std.mem.zeroes(c.struct_sockaddr_in);
+        sa.sin_family = c.AF_INET;
+        sa.sin_port = std.mem.nativeToBig(u16, 0);
+        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
+        if (c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or c.listen(lfd, 16) != 0) {
+            _ = c.close(lfd);
+            return false;
+        }
+        var got = std.mem.zeroes(c.struct_sockaddr_in);
+        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+        if (c.getsockname(lfd, @ptrCast(&got), &glen) != 0) {
+            _ = c.close(lfd);
+            return false;
+        }
+        self.fd = lfd;
+        self.port = std.mem.bigToNative(u16, got.sin_port);
+        self.thread = std.Thread.spawn(.{}, HttpProbe.serve, .{self}) catch {
+            _ = c.close(lfd);
+            self.fd = -1;
+            return false;
+        };
+        return true;
+    }
+
+    fn serve(self: *HttpProbe) void {
+        while (!self.stop.load(.acquire)) {
+            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(@ptrCast(&pfd), 1, 200) <= 0) continue;
+            const afd = c.accept(self.fd, null, null);
+            if (afd < 0) continue;
+            self.handle(afd);
+            _ = c.close(afd);
+        }
+    }
+
+    fn handle(self: *HttpProbe, afd: c_int) void {
+        // Read whatever the request is and ignore it: one document
+        // answers every path, which is all a cookie origin needs.
+        var buf: [4096]u8 = undefined;
+        var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(@ptrCast(&pfd), 1, 2000) > 0) _ = c.read(afd, &buf, buf.len);
+        var head: [256]u8 = undefined;
+        const hdr = std.fmt.bufPrint(
+            &head,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            .{page.len},
+        ) catch return;
+        _ = c.write(afd, hdr.ptr, hdr.len);
+        _ = c.write(afd, page.ptr, page.len);
+        _ = self.served.fetchAdd(1, .release);
+    }
+
+    fn shutdown(self: *HttpProbe) void {
+        self.stop.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.fd = -1;
+    }
+};
+
 /// The client half of the v1 protocol: framing over a unix socket plus
 /// the last-seen value of every event the stages assert on.
 const Client = struct {
@@ -697,6 +796,28 @@ const Client = struct {
     dl_done: u8 = 0,
     dl_failed: u8 = 0,
     ack_a11y: bool = false,
+    ack_sitedata: bool = false,
+    /// Cookies + site data. `cookie_names` is the last enumeration
+    /// rendered one name per line, so an assertion can grep it; the
+    /// counters are the last frame's.
+    cookie_seq: u32 = 0,
+    cookie_req: u32 = 0,
+    cookie_ok: u8 = 0,
+    cookie_total: u32 = 0,
+    cookie_shown: u32 = 0,
+    cookie_names: [4096]u8 = @splat(0),
+    cookie_names_len: usize = 0,
+    /// Cookie flags/scope of the LAST entry carrying `cookie_probe`, so
+    /// the stage can assert metadata without a second enumeration.
+    cookie_flags: u8 = 0,
+    cookie_value_len: u32 = 0,
+    site_done_seq: u32 = 0,
+    site_done_req: u32 = 0,
+    site_done_ok: u8 = 0,
+    site_done_kind: u8 = 0,
+    site_removed: u32 = 0,
+    site_detail: [128]u8 = @splat(0),
+    site_detail_len: usize = 0,
     /// Accessibility stream: every `ev_a11y_tree` node rendered as one
     /// `[id] role "name"` line, so assertions can grep roles + names.
     ax_log: [64 * 1024]u8 = @splat(0),
@@ -875,6 +996,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.ack_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.ack_contexts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.ack_userscripts = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.ack_sitedata = true;
                 }
             },
             .ev_a11y_tree => {
@@ -889,6 +1011,38 @@ const Client = struct {
                     @memcpy(self.ax_log[self.ax_log_len..][0..take], s[0..take]);
                     self.ax_log_len += take;
                 }
+            },
+            .ev_cookies => {
+                const ev = proto.EvCookies.decodeAlloc(frame.payload, self.gpa) catch fail("ev_cookies decode");
+                defer self.gpa.free(ev.entries);
+                self.cookie_seq += 1;
+                self.cookie_req = ev.req;
+                self.cookie_ok = ev.ok;
+                self.cookie_total = ev.total;
+                self.cookie_shown = @intCast(ev.entries.len);
+                self.cookie_names_len = 0;
+                for (ev.entries) |e| {
+                    var line: [512]u8 = undefined;
+                    const s = std.fmt.bufPrint(&line, "{s}\n", .{e.name}) catch continue;
+                    const room = self.cookie_names.len - self.cookie_names_len;
+                    const take = @min(room, s.len);
+                    @memcpy(self.cookie_names[self.cookie_names_len..][0..take], s[0..take]);
+                    self.cookie_names_len += take;
+                    if (std.mem.eql(u8, e.name, cookie_probe)) {
+                        self.cookie_flags = e.flags;
+                        self.cookie_value_len = e.value_len;
+                    }
+                }
+            },
+            .ev_sitedata_done => {
+                const ev = proto.decode(proto.EvSitedataDone, frame.payload) catch fail("ev_sitedata_done decode");
+                self.site_done_seq += 1;
+                self.site_done_req = ev.req;
+                self.site_done_ok = ev.ok;
+                self.site_done_kind = ev.kind;
+                self.site_removed = ev.removed;
+                self.site_detail_len = @min(ev.detail.len, self.site_detail.len);
+                @memcpy(self.site_detail[0..self.site_detail_len], ev.detail[0..self.site_detail_len]);
             },
             .ev_a11y_loc => {
                 _ = proto.decode(proto.EvA11yLoc, frame.payload) catch fail("ev_a11y_loc decode");
@@ -3061,6 +3215,107 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (cl.ax_seq != seq_after_off)
             fail("stage 22k a11y: tree events kept streaming after disable");
         pass("stage 22k a11y (enable-gated tree, roles+names, disable silences)");
+    }
+
+    // ── Stage 28: cookies + site data ─────────────────────────────
+    //
+    // The whole 0xC8 block against a REAL origin on loopback: a page
+    // whose own script stores a cookie, an enumeration that finds it
+    // with its scope and flags (and its value's LENGTH, never the
+    // value), a clear that removes it, and an enumeration that then
+    // finds nothing. The `sitedata` capability gates all of it.
+    {
+        if (!cl.ack_sitedata) fail("stage 31 site data: hello_ack lacks the sitedata capability");
+        var http = HttpProbe{};
+        if (!http.start()) fail("stage 31 site data: could not start the loopback http probe");
+        defer http.shutdown();
+        var url_buf: [64]u8 = undefined;
+        const site_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+
+        cl.send(proto.ViewCreate{
+            .view = sitedata_view_id,
+            .w = 320,
+            .h = 240,
+            .scale_x1000 = 1000,
+            .context = 0,
+        });
+        cl.send(proto.Navigate{ .view = sitedata_view_id, .url = site_url });
+        // The page's own script writes the cookie and then puts
+        // `document.cookie` in the TITLE, so the title is both the
+        // settle and the proof the write took: waiting on the shared
+        // load counter would be satisfied by another view's load.
+        if (!cl.waitTitle("cookie:", 20_000)) {
+            std.debug.print(
+                "smoke-web: served {d} http requests, last title was \"{s}\"\n",
+                .{ http.served.load(.acquire), cl.titleSlice() },
+            );
+            fail("stage 31 site data: the loopback page never ran its cookie script");
+        }
+        if (std.mem.indexOf(u8, cl.titleSlice(), cookie_probe) == null) {
+            std.debug.print("smoke-web: title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 31 site data: the page could not store its own cookie");
+        }
+
+        // -- enumerate ------------------------------------------------
+        const req_list: u32 = 901;
+        const list0 = cl.cookie_seq;
+        cl.send(proto.CookiesReq{ .view = sitedata_view_id, .req = req_list, .url = site_url });
+        if (!cl.waitSeq(&cl.cookie_seq, list0, 10_000))
+            fail("stage 31 site data: no ev_cookies answered the enumeration");
+        if (cl.cookie_req != req_list) fail("stage 31 site data: ev_cookies echoed the wrong request id");
+        if (cl.cookie_ok == 0) fail("stage 31 site data: the cookie store could not be read");
+        const names = cl.cookie_names[0..cl.cookie_names_len];
+        if (std.mem.indexOf(u8, names, cookie_probe) == null) {
+            std.debug.print("smoke-web: cookies were:\n{s}\n", .{names});
+            fail("stage 31 site data: the page's own cookie was not enumerated");
+        }
+        if (cl.cookie_total == 0) fail("stage 31 site data: a cookie was listed but the total says zero");
+        // Metadata, and the value's length INSTEAD of the value.
+        if (cl.cookie_value_len != cookie_probe_value.len)
+            fail("stage 31 site data: the probe cookie's value length is wrong");
+        if (cl.cookie_flags & proto.cookie_session != 0)
+            fail("stage 31 site data: a max-age cookie was reported as a session cookie");
+        if (cl.cookie_flags & proto.cookie_secure != 0)
+            fail("stage 31 site data: a cookie set over http was reported as secure");
+        // The VALUE must never appear anywhere in what crossed the wire.
+        if (std.mem.indexOf(u8, names, cookie_probe_value) != null)
+            fail("stage 31 site data: a cookie VALUE reached the client");
+
+        // -- clear ----------------------------------------------------
+        const req_clear: u32 = 902;
+        const done_before = cl.site_done_seq;
+        cl.send(proto.CookiesClear{ .view = sitedata_view_id, .req = req_clear, .url = site_url });
+        if (!cl.waitSeq(&cl.site_done_seq, done_before, 10_000))
+            fail("stage 31 site data: no ev_sitedata_done answered the clear");
+        if (cl.site_done_req != req_clear) fail("stage 31 site data: ev_sitedata_done echoed the wrong request id");
+        if (cl.site_done_ok == 0) fail("stage 31 site data: the clear reported failure");
+        if (cl.site_done_kind != @intFromEnum(proto.SitedataKind.cookies_clear))
+            fail("stage 31 site data: the clear was answered under the wrong kind");
+        if (cl.site_removed == 0) fail("stage 31 site data: the clear removed nothing");
+
+        // -- enumerate again ------------------------------------------
+        const req_after: u32 = 903;
+        const list_before = cl.cookie_seq;
+        cl.send(proto.CookiesReq{ .view = sitedata_view_id, .req = req_after, .url = site_url });
+        if (!cl.waitSeq(&cl.cookie_seq, list_before, 10_000))
+            fail("stage 31 site data: no ev_cookies answered the second enumeration");
+        if (cl.cookie_ok == 0) fail("stage 31 site data: the cookie store went unreadable after the clear");
+        if (cl.cookie_total != 0 or cl.cookie_shown != 0) {
+            std.debug.print("smoke-web: cookies left:\n{s}\n", .{cl.cookie_names[0..cl.cookie_names_len]});
+            fail("stage 31 site data: cookies survived the clear");
+        }
+
+        // A view id nobody created is answered, not ignored: a client
+        // waiting on a reply must never wait forever.
+        const orphan_before = cl.cookie_seq;
+        cl.send(proto.CookiesReq{ .view = 4242, .req = 904, .url = site_url });
+        if (!cl.waitSeq(&cl.cookie_seq, orphan_before, 5_000))
+            fail("stage 31 site data: a request for an unknown view was never answered");
+        if (cl.cookie_ok != 0) fail("stage 31 site data: an unknown view reported a readable cookie store");
+
+        cl.send(proto.ViewDestroy{ .view = sitedata_view_id });
+        cl.pump(300);
+        pass("stage 31 site data (script-set cookie enumerated with metadata, cleared, gone)");
     }
 
     // ── Stage 23: teardown ────────────────────────────────────────

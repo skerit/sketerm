@@ -192,6 +192,48 @@ offset destroys 1px detail into uniform gray on its own.
 - `zig build measure-web` is the latency/sharpness rig; it reproduces a
   fractional 1.5x desktop through sketerm's own compositor.
 
+## Cookies and site data: what the engine will and will not do
+
+The 0xC8 block (capability `sitedata`) is served from CEF's cookie
+manager plus one request-context verb, and TWO of the four things a
+site-data panel wants have no browser-process API at all. Both are
+reported to the client in `EvSitedataDone.detail` rather than papered
+over, and both are measured, not assumed:
+
+- **There is no per-origin cache clear.** `cef_request_context_t` has
+  exactly one cache verb, `clear_http_cache`, and it drops the WHOLE
+  context. A view in a container therefore loses only that container's
+  cache; a view on the shared jar loses every site's. Reported as
+  `cache-whole-context`.
+- **localStorage / sessionStorage / IndexedDB / Cache Storage have no
+  C API.** Chromium clears them through `BrowsingDataRemover`, which
+  CEF does not expose, so `Host.clearPageStorage` runs script IN the
+  document instead. That only works while the view is still ON the
+  origin being cleared; a request for any other origin is reported as
+  `storage-skipped-origin` and nothing is claimed. Do not "fix" this by
+  navigating the view to the origin first — that would load a page the
+  user did not ask for.
+- **Deletion goes through the VISITOR, never `delete_cookies(url,…)`.**
+  The url-only form of `delete_cookies` is documented to delete host
+  cookies and spare DOMAIN cookies, so "clear this site's cookies"
+  would silently leave the `.example.com` ones behind. Visiting with
+  `deleteCookie = 1` deletes both and yields an exact removed count.
+- **`CookieJob` is the only REALLY refcounted client-side struct in
+  `cefhost.zig`** (everything else is a process-lifetime static with a
+  no-op refcount). `visit_url_cookies` TAKES ownership of the visitor
+  reference — CEF's CToCpp wrappers transfer, they never add — and may
+  drop it before the call even returns when the manager refuses. The
+  job is therefore created with two references and one is released
+  after the call, so the return value is still readable when the answer
+  is composed. The final release is both the "visiting finished" signal
+  and the free, which is why the reply is posted from there and from
+  nowhere else.
+
+Cookie VALUES never cross the wire: `ev_cookies` carries names, scopes,
+flags and the value's LENGTH. smoke-web stage 28 asserts the value byte
+string is absent from the frame, so a future "just add the value, it is
+convenient" change fails there.
+
 ## Build and packaging
 
 `zig build web` needs CEF: either `zig build fetch-cef` (the pinned
