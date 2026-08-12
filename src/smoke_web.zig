@@ -76,6 +76,23 @@ const egress_view_a: u32 = 5;
 const egress_view_b: u32 = 6;
 const egress_view_c: u32 = 7;
 
+/// Stage-37 views. Both are pointed at the SAME loopback origin in two
+/// different containers: origin separation would explain a cookie not
+/// crossing, so only one origin can prove the JAR is what separates them.
+const jar_view_a: u32 = 9;
+const jar_view_b: u32 = 10;
+const jar_cookie = "sk_jar37";
+const jar_cookie_value = "only-in-a";
+/// One document for both containers; the QUERY STRING decides whether it
+/// writes the cookie, and the title prefix says which side reported, so
+/// the two settles cannot be confused for one another.
+const jar_page =
+    "<html><head><title>jar</title></head><body>jar" ++
+    "<script>var s=location.search.indexOf('set')>=0;" ++
+    "if(s)document.cookie=\"" ++ jar_cookie ++ "=" ++ jar_cookie_value ++
+    "; path=/; max-age=3600; SameSite=Lax\";" ++
+    "document.title=(s?\"jarA:\":\"jarB:\")+document.cookie;</script></body></html>";
+
 /// Pages under test. `#` MUST be percent-encoded inside a data: URL —
 /// a raw one starts the fragment and truncates the document.
 const red_page = "data:text/html,<body%20style=%22margin:0;background:%23ff0000%22></body>";
@@ -4725,6 +4742,131 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // (the whole feature was just proven above). What still MUST hold
         // is that the process terminates rather than hangs.
         reapHelperTolerant(eg_pid, "stages 26/27 egress", 30_000);
+    }
+
+    // ── Stage 37: cookie JAR isolation between containers ─────
+    //
+    // Stages 26/27 prove two containers EGRESS independently. They say
+    // nothing about storage, which is the other half of what an identity
+    // context is for and the half a user actually notices: staying
+    // logged into two accounts on one site at once.
+    //
+    // Both views load the SAME loopback origin, so same-origin policy
+    // cannot be the thing keeping the cookie apart -- only the request
+    // context can. The query string decides which side writes it.
+    //
+    // Own helper, after the main teardown, for the same reason the
+    // egress stages have one: a rig that has created extra request
+    // contexts makes cef_shutdown slower and noisier than stage 23's
+    // budget allows.
+    {
+        var sock5_buf: [96]u8 = undefined;
+        const sock5 = std.fmt.bufPrintZ(&sock5_buf, "{s}/j.sock", .{dir}) catch fail("socket path");
+        var cache5_buf: [128]u8 = undefined;
+        const cache5 = std.fmt.bufPrintZ(&cache5_buf, "{s}/cache-jar", .{dir}) catch fail("cache path");
+        const jar_pid = spawnHelper(exe, sock5.ptr, cache5.ptr, "--ozone-platform=headless", false);
+        g_pid = jar_pid;
+        var jc = Client{ .gpa = gpa, .fd = connectWithRetry(sock5.ptr, sock5.len) };
+        jc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-jar" });
+        {
+            const deadline = nowMs() + 20_000;
+            while (jc.ack_proto == 0 and nowMs() < deadline) jc.pump(100);
+        }
+        if (jc.ack_proto != proto.PROTO_VERSION) fail("stage 37 jars: no hello_ack from the jar helper");
+        if (!jc.ack_contexts) fail("stage 37 jars: hello_ack lacks the contexts capability");
+        if (!jc.ack_sitedata) fail("stage 37 jars: hello_ack lacks the sitedata capability");
+
+        var http = HttpProbe{ .body = jar_page };
+        if (!http.start()) fail("stage 37 jars: could not start the loopback http probe");
+        defer http.shutdown();
+        var base_buf: [64]u8 = undefined;
+        const base_url = std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+        var set_buf: [72]u8 = undefined;
+        const set_url = std.fmt.bufPrint(&set_buf, "http://127.0.0.1:{d}/?set", .{http.port}) catch unreachable;
+        var plain_buf: [72]u8 = undefined;
+        const plain_url = std.fmt.bufPrint(&plain_buf, "http://127.0.0.1:{d}/?plain", .{http.port}) catch unreachable;
+
+        jc.send(proto.ContextCreate{ .id = 20, .ephemeral = 1, .name = "jar-a", .proxy = "" });
+        jc.send(proto.ContextCreate{ .id = 21, .ephemeral = 1, .name = "jar-b", .proxy = "" });
+
+        // -- container A writes the cookie ---------------------------
+        jc.send(proto.ViewCreate{ .view = jar_view_a, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 20 });
+        jc.send(proto.Navigate{ .view = jar_view_a, .url = set_url });
+        if (!jc.waitTitle("jarA:", 20_000)) {
+            std.debug.print(
+                "smoke-web: served {d} http requests, last title was \"{s}\"\n",
+                .{ http.served.load(.acquire), jc.titleSlice() },
+            );
+            fail("stage 37 jars: container A never ran the cookie script");
+        }
+        if (std.mem.indexOf(u8, jc.titleSlice(), jar_cookie) == null)
+            fail("stage 37 jars: container A could not store its own cookie");
+
+        // Snapshot A's enumeration before asking about B: the client's
+        // cookie fields are one slot and the second reply overwrites it.
+        const req_a: u32 = 971;
+        const seq_a = jc.cookie_seq;
+        jc.send(proto.CookiesReq{ .view = jar_view_a, .req = req_a, .url = base_url });
+        if (!jc.waitSeq(&jc.cookie_seq, seq_a, 10_000))
+            fail("stage 37 jars: no ev_cookies answered container A");
+        if (jc.cookie_ok == 0) fail("stage 37 jars: container A's cookie store could not be read");
+        var names_a_buf: [4096]u8 = undefined;
+        const na = @min(jc.cookie_names_len, names_a_buf.len);
+        @memcpy(names_a_buf[0..na], jc.cookie_names[0..na]);
+        const names_a = names_a_buf[0..na];
+        if (std.mem.indexOf(u8, names_a, jar_cookie) == null) {
+            std.debug.print("smoke-web: container A cookies were:\n{s}\n", .{names_a});
+            fail("stage 37 jars: container A's own cookie was not enumerated");
+        }
+
+        // -- container B, same origin, must see none of it ------------
+        jc.send(proto.ViewCreate{ .view = jar_view_b, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 21 });
+        jc.send(proto.Navigate{ .view = jar_view_b, .url = plain_url });
+        if (!jc.waitTitle("jarB:", 20_000)) {
+            std.debug.print(
+                "smoke-web: served {d} http requests, last title was \"{s}\"\n",
+                .{ http.served.load(.acquire), jc.titleSlice() },
+            );
+            fail("stage 37 jars: container B never loaded the shared origin");
+        }
+        // The DOM's own view: the page running IN container B, on the
+        // very origin container A wrote to, cannot read that cookie.
+        if (std.mem.indexOf(u8, jc.titleSlice(), jar_cookie) != null) {
+            std.debug.print("smoke-web: container B title was \"{s}\"\n", .{jc.titleSlice()});
+            fail("stage 37 jars: container B's document.cookie exposed container A's cookie");
+        }
+
+        const req_b: u32 = 972;
+        const seq_b = jc.cookie_seq;
+        jc.send(proto.CookiesReq{ .view = jar_view_b, .req = req_b, .url = base_url });
+        if (!jc.waitSeq(&jc.cookie_seq, seq_b, 10_000))
+            fail("stage 37 jars: no ev_cookies answered container B");
+        if (jc.cookie_ok == 0) fail("stage 37 jars: container B's cookie store could not be read");
+        const names_b = jc.cookie_names[0..jc.cookie_names_len];
+        if (std.mem.indexOf(u8, names_b, jar_cookie) != null) {
+            std.debug.print(
+                "smoke-web: container A saw:\n{s}\ncontainer B saw:\n{s}\n",
+                .{ names_a, names_b },
+            );
+            fail("stage 37 jars: container A's cookie was enumerated in container B (jars not isolated)");
+        }
+
+        jc.send(proto.ViewDestroy{ .view = jar_view_a });
+        jc.send(proto.ViewDestroy{ .view = jar_view_b });
+        jc.have_view = false;
+        {
+            const d = nowMs() + 3000;
+            while (nowMs() < d) jc.pump(50);
+        }
+        jc.send(proto.ContextDestroy{ .id = 20 });
+        jc.send(proto.ContextDestroy{ .id = 21 });
+        {
+            const d = nowMs() + 2000;
+            while (nowMs() < d) jc.pump(50);
+        }
+        jc.deinit();
+        reapHelperTolerant(jar_pid, "stage 37 jars", 30_000);
+        pass("stage 37 jars (same origin in two containers, cookie confined to the one that wrote it)");
     }
 
     // ── Stage 28: remote helper — inline frames over a mux channel ──
