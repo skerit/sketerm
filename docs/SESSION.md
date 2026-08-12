@@ -17173,3 +17173,83 @@ smoke-web passes all 52 stages. What the merges themselves taught:
   site-data, 32 remote frames-inline (32a/32b/32c + teardown), 33 webext.
   Grep `pass("stage` before naming, and remember a rename also has to
   reach `src/web/CLAUDE.md` and this file.
+
+## 2026-08-12: tree-style tabs are the BROWSER's tab surface
+
+The tree sidebar shipped as a mirror of the window's tab strip, which is
+not what tree-style tabs are for. It now has two sources, and in a
+browser it lists the pages open INSIDE that browser — the window tab is
+"the browser", exactly as the editor face owns its own document tabs.
+
+**A pane holds several browser pages (`src/ui/webgroup.zig`).** The new
+`WebGroup` owns N whole `WebFace`s in a `TabHost` notebook plus a
+`Forest(*WebFace)` for opener nesting, and it — not a face — is what
+`Pane.web_ctx` points at. `WebFace.fromPane` answers with the ACTIVE
+page, so the ~100 existing pane-scoped callers (navigate, zoom, find,
+screenshot, every `web_*` MCP tool) kept working untouched.
+
+Why N faces rather than one face owning N views, which is what a reading
+of `webface.zig` first suggests: everything that binds a view to its
+widgets is already per-face and already correct — the refcounted frame
+mapping, the dmabuf import cache, the pacer and its frame-clock tick,
+the discard countdown, held cert/permission decisions, hints, the a11y
+mirror, and the `signal_objs` array whose overflow silently drops a
+disconnect. A `GtkNotebook` UNMAPS the pages it is not showing, and
+`WebFace.setOnScreen` already turns `view_area` map/unmap into
+`view_show`/`view_hide` plus the discard timer. So a background page
+stops painting, stops costing the engine anything and eventually
+discards itself with **no new code and no new state machine**, and a
+page is resized when it is shown rather than N times per pane resize.
+The alternative would have re-implemented all of that and re-derived
+every invariant it encodes.
+
+**The sidebar's visibility is also its mode switch.** While it is open
+it is the browser's tab surface: `new_tab`, popups, `target=_blank`,
+open-link-in-new-tab and the hint new-tab modifier all become PAGES,
+nested under the page that opened them (`WebFace.openInNewTab` is the
+one place that decides). While it is closed they are window tabs as
+before, and the group falls back to drawing its own in-pane strip so
+pages opened earlier are never stranded.
+
+**Rows.** The indent moves the whole ROW (18px per level), so a child's
+chip visibly steps in; indenting only the row's content left every chip
+the same width and the nesting read as ragged text. The twisty is a
+16px column reserved on EVERY row — invisible and untargetable when a
+tab has no children — because a title that shifts sideways when a tab
+gains a child is what made the old rows unreadable. Rows are our own
+chips, not `navigation-sidebar` list rows: that class paints inactive
+rows in the background colour, so the list read as a flat wall of text.
+
+**The sidebar is resizable.** The window content box became a
+`GtkPaned`; the divider writes `tab_sidebar_width` back, debounced 400ms
+(a drag emits notify::position per pixel). Two traps the file browser's
+places sidebar had already found: a position set while the start child
+is hidden is forgotten, so it is re-asserted on reveal; and the window
+paints every `paned > separator` as a solid pane-gap bar, so this one
+needs a higher-specificity rule to look like a control. `show_tab_sidebar`
+and the width now also apply on `reload_config` — they previously needed
+a restart, which made the reload look broken for them.
+
+**Lifetime notes worth keeping.** `Group.adopt` runs every fallible step
+BEFORE the widget gets a parent, so a failure leaves `root_box` floating
+and the caller's ref_sink/unref is correct — rolling the notebook page
+back instead would destroy the box and turn that disposal into a double
+free. The sidebar's `group` field is a CHANGE MARKER, never a handle: a
+group dies with its pane's web face, so every use re-resolves through
+`Window.sidebarGroup()` and the stale pointer is only ever compared.
+Closing the last page detaches the whole face, which FREES the group, so
+the window is resolved before the call and nothing touches `self` after.
+
+**Verified**, not just compiled: smoke-e2e gained a stage that drives the
+real GUI on a display session — it opens a browser tab, asserts that with
+the sidebar CLOSED `new_tab` adds a window tab and no page, that with it
+OPEN the same action adds a second page to the same pane and no window
+tab, then measures the sidebar's width from the selected row's own pixels,
+drags the divider, and asserts both the widening and that
+`tab_sidebar_width` reached config.conf. `web-list` now reports one row
+per page rather than per pane. Layout persistence carries every page and
+its parent index (`web/model.zig`), falling back to the single `url` for
+a layout written before pages existed.
+
+Unchanged and still red: `copyModeStage` in the same rig, which fails at
+the pre-work baseline for unrelated reasons.
