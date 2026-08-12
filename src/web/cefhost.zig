@@ -45,6 +45,7 @@ const zpool = @import("zpool");
 const keymap = @import("keymap.zig");
 const semantic = @import("semantic.zig");
 const filter = @import("filter.zig");
+const filtersub = @import("filtersub.zig");
 const userscript = @import("userscript.zig");
 const webexthost = @import("webext/host.zig");
 const extmatch = @import("webext/match.zig");
@@ -1889,6 +1890,19 @@ pub const Host = struct {
     /// dir, and any extra paths named. No network fetching.
     pub fn interceptLists(self: *Host, req: proto.InterceptLists) void {
         interceptReload(self.gpa, req.paths);
+    }
+
+    /// The client's filter-list subscriptions (REPLACE-ALL).
+    ///
+    /// Reconciles the cache directory against exactly this set: stale
+    /// or missing lists are fetched, and the cache files of
+    /// subscriptions that went away are removed. Fetching is the one
+    /// thing only this process can do — the daemon links libc and has
+    /// no TLS — and it happens nowhere unless the user configured a
+    /// url, so the default remains "filtering never touches the
+    /// network".
+    pub fn interceptSubscribe(self: *Host, req: proto.InterceptSubscribe) void {
+        filterSubApply(self.gpa, req.update_hours, req.urls);
     }
 
     pub fn interceptStatus(self: *Host, req: proto.InterceptStatusReq) void {
@@ -5145,6 +5159,283 @@ fn sameSiteOf(v: cef.cef_cookie_same_site_t) u8 {
     if (v == @as(T, @intCast(cef.CEF_COOKIE_SAME_SITE_LAX_MODE))) return @intFromEnum(proto.SameSite.lax);
     if (v == @as(T, @intCast(cef.CEF_COOKIE_SAME_SITE_STRICT_MODE))) return @intFromEnum(proto.SameSite.strict);
     return @intFromEnum(proto.SameSite.unspecified);
+}
+
+// ── filter-list subscription ────────────────────────────────────
+//
+// The helper is the only process here with an HTTPS stack, so keeping a
+// subscribed EasyList current happens in this file. A `cef_urlrequest`
+// rather than a view: navigating a view to a `.txt` RENDERS it, and
+// scraping a rendered document back out is neither exact nor bounded.
+//
+// The refcount rule is `CookieJob`'s and is not optional: CEF's CToCpp
+// wrappers TRANSFER the client reference and may drop it before the
+// create call even returns, so the fetch is born with TWO references
+// and gives one back straight after the call.
+
+/// A subscription fetch in flight. One per url; there is no queue,
+/// because the set is small and CEF runs them concurrently anyway.
+const FilterFetch = struct {
+    client: cef.cef_urlrequest_client_t,
+    refs: u32 = 1,
+    gpa: std.mem.Allocator,
+    body: std.ArrayList(u8) = .empty,
+    /// Final destination, and the `.part` staged alongside it.
+    dest: []u8,
+    url: []u8,
+    /// Set when an append failed: a truncated list must never be
+    /// written, because half a filter list is a working filter list
+    /// that silently stops blocking half of what it used to.
+    lost: bool = false,
+
+    fn finish(self: *FilterFetch) void {
+        defer self.destroyOwned();
+        if (self.lost) {
+            warnSub("dropped (out of memory mid-download)", self.url);
+            return;
+        }
+        if (!filtersub.looksLikeFilterList(self.body.items)) {
+            // A captive portal and an HTML error page both arrive as a
+            // perfectly successful fetch. Keeping the old file is the
+            // safe failure: stale rules still block.
+            warnSub("does not look like a filter list; keeping the previous copy", self.url);
+            return;
+        }
+        writeAtomic(self.dest, self.body.items) catch {
+            warnSub("could not be written", self.url);
+            return;
+        };
+        // Cheap enough to rebuild once per landed list, and it is what
+        // makes an update take effect without a restart.
+        interceptReload(self.gpa, &.{});
+    }
+
+    fn destroyOwned(self: *FilterFetch) void {
+        self.body.deinit(self.gpa);
+        self.gpa.free(self.dest);
+        self.gpa.free(self.url);
+        self.gpa.destroy(self);
+    }
+};
+
+fn warnSub(what: []const u8, url: []const u8) void {
+    std.debug.print("sketerm-web: filter list {s}: {s}\n", .{ url, what });
+}
+
+/// Write via a sibling `.part` + rename, so a reader either sees the
+/// old list or the new one and never a half-written file.
+fn writeAtomic(dest: []const u8, bytes: []const u8) !void {
+    var tmp_buf: [4608]u8 = undefined;
+    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.part", .{dest}) catch return error.NameTooLong;
+    var dst_buf: [4608]u8 = undefined;
+    const dst = std.fmt.bufPrintZ(&dst_buf, "{s}", .{dest}) catch return error.NameTooLong;
+    const fd = c.open(tmp.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o644));
+    if (fd < 0) return error.OpenFailed;
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
+        if (n <= 0) {
+            _ = c.close(fd);
+            _ = c.unlink(tmp.ptr);
+            return error.WriteFailed;
+        }
+        off += @intCast(n);
+    }
+    _ = c.close(fd);
+    if (c.rename(tmp.ptr, dst.ptr) != 0) {
+        _ = c.unlink(tmp.ptr);
+        return error.RenameFailed;
+    }
+}
+
+fn subOf(base: [*c]cef.cef_base_ref_counted_t) *FilterFetch {
+    const v: *cef.cef_urlrequest_client_t = @ptrCast(@alignCast(base));
+    return @fieldParentPtr("client", v);
+}
+
+fn subAddRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) void {
+    subOf(base).refs += 1;
+}
+
+fn subRelease(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+    const f = subOf(base);
+    f.refs -= 1;
+    if (f.refs > 0) return 0;
+    f.finish();
+    return 1;
+}
+
+fn subHasOneRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+    return if (subOf(base).refs == 1) 1 else 0;
+}
+
+fn subHasAtLeastOneRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+    return if (subOf(base).refs >= 1) 1 else 0;
+}
+
+fn subOnDownloadData(
+    self_: [*c]cef.cef_urlrequest_client_t,
+    _: [*c]cef.cef_urlrequest_t,
+    data: ?*const anyopaque,
+    len: usize,
+) callconv(.c) void {
+    const f: *FilterFetch = subOf(@ptrCast(self_));
+    if (f.lost or len == 0) return;
+    // A list that grows past this is not a list we want to load either;
+    // `interceptReload` reads at most 16MB back off disk.
+    if (f.body.items.len + len > 16 * 1024 * 1024) {
+        f.lost = true;
+        return;
+    }
+    const bytes: [*]const u8 = @ptrCast(data orelse return);
+    f.body.appendSlice(f.gpa, bytes[0..len]) catch {
+        f.lost = true;
+    };
+}
+
+fn subOnComplete(
+    self_: [*c]cef.cef_urlrequest_client_t,
+    request: [*c]cef.cef_urlrequest_t,
+) callconv(.c) void {
+    const f: *FilterFetch = subOf(@ptrCast(self_));
+    if (request) |r| {
+        const st = if (r.*.get_request_status) |g| g(r) else @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_FAILED));
+        if (st != @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_SUCCESS))) f.lost = true;
+        if (r.*.get_response) |gr| {
+            if (gr(r)) |resp| {
+                defer release(&resp.*.base);
+                const code = if (resp.*.get_status) |gs| gs(resp) else 0;
+                // A 404 body is a page, not a list; refuse it here as
+                // well as in `looksLikeFilterList` so the reason is the
+                // accurate one.
+                if (code != 0 and (code < 200 or code >= 300)) f.lost = true;
+            }
+        }
+    }
+    // The engine is done with us; the LAST release runs `finish`.
+}
+
+fn subOnUploadProgress(_: [*c]cef.cef_urlrequest_client_t, _: [*c]cef.cef_urlrequest_t, _: i64, _: i64) callconv(.c) void {}
+fn subOnDownloadProgress(_: [*c]cef.cef_urlrequest_client_t, _: [*c]cef.cef_urlrequest_t, _: i64, _: i64) callconv(.c) void {}
+fn subGetAuthCredentials(
+    _: [*c]cef.cef_urlrequest_client_t,
+    _: c_int,
+    _: [*c]const cef.cef_string_t,
+    _: c_int,
+    _: [*c]const cef.cef_string_t,
+    _: [*c]const cef.cef_string_t,
+    _: [*c]cef.cef_auth_callback_t,
+) callconv(.c) c_int {
+    // Never authenticate to a filter-list host: a subscription is a
+    // public url, and a prompt here has no user to answer it.
+    return 0;
+}
+
+/// Start one fetch. Returns false when nothing was started.
+fn filterSubFetch(gpa: std.mem.Allocator, url: []const u8, dest: []const u8) bool {
+    // `cef_request_create` is a plain extern fn here, not an optional
+    // function pointer like the struct members are.
+    const req = cef.cef_request_create() orelse return false;
+    defer release(&req.*.base);
+
+    var u = std.mem.zeroes(cef.cef_string_t);
+    setStr(url, &u);
+    defer cef.cef_string_utf16_clear(&u);
+    if (req.*.set_url) |set| set(req, &u);
+    var method = std.mem.zeroes(cef.cef_string_t);
+    setStr("GET", &method);
+    defer cef.cef_string_utf16_clear(&method);
+    if (req.*.set_method) |set| set(req, &method);
+
+    const f = gpa.create(FilterFetch) catch return false;
+    const dest_owned = gpa.dupe(u8, dest) catch {
+        gpa.destroy(f);
+        return false;
+    };
+    const url_owned = gpa.dupe(u8, url) catch {
+        gpa.free(dest_owned);
+        gpa.destroy(f);
+        return false;
+    };
+    f.* = .{
+        .client = .{
+            .base = .{
+                .size = @sizeOf(cef.cef_urlrequest_client_t),
+                .add_ref = subAddRef,
+                .release = subRelease,
+                .has_one_ref = subHasOneRef,
+                .has_at_least_one_ref = subHasAtLeastOneRef,
+            },
+            .on_request_complete = subOnComplete,
+            .on_upload_progress = subOnUploadProgress,
+            .on_download_progress = subOnDownloadProgress,
+            .on_download_data = subOnDownloadData,
+            .get_auth_credentials = subGetAuthCredentials,
+        },
+        .gpa = gpa,
+        .dest = dest_owned,
+        .url = url_owned,
+    };
+
+    // TWO references across the call, exactly as `CookieJob` documents:
+    // the create CONSUMES one and may drop it before returning.
+    f.refs = 2;
+    const handle = cef.cef_urlrequest_create(req, &f.client, null);
+    if (handle) |h| release(&h.*.base);
+    _ = subRelease(&f.client.base);
+    return handle != null;
+}
+
+/// Module state: the last subscription set the client published.
+var g_sub_hours: u32 = 0;
+
+/// Reconcile the cache directory against `urls` and fetch what is due.
+fn filterSubApply(gpa: std.mem.Allocator, hours: u32, urls: []const []const u8) void {
+    g_sub_hours = hours;
+    var dir_buf: [4096]u8 = undefined;
+    const dir = filtersDir(&dir_buf) orelse return;
+    // Create it only when there is actually something to put there: a
+    // user with no subscriptions must not get a directory they never
+    // asked for. `opendir` on a missing dir just returns null below.
+    if (urls.len != 0) _ = c.mkdir(dir.ptr, 0o700);
+
+    // Drop the caches of subscriptions that went away. Only ever OUR
+    // files (the `sub-` prefix), never a list dropped in by hand.
+    if (c.opendir(dir.ptr)) |dp| {
+        defer _ = c.closedir(dp);
+        while (c.readdir(dp)) |entp| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entp.*.d_name)));
+            if (!filtersub.isCacheName(name)) continue;
+            var wanted = false;
+            for (urls) |u| {
+                var nb: [filtersub.MAX_NAME]u8 = undefined;
+                const want = filtersub.cacheName(u, &nb) catch continue;
+                if (std.mem.eql(u8, want, name)) {
+                    wanted = true;
+                    break;
+                }
+            }
+            if (wanted) continue;
+            var p_buf: [4352:0]u8 = undefined;
+            const p = std.fmt.bufPrintZ(&p_buf, "{s}/{s}", .{ dir, name }) catch continue;
+            _ = c.unlink(p.ptr);
+        }
+    }
+
+    const now: i64 = @intCast(c.time(null));
+    for (urls) |u| {
+        var nb: [filtersub.MAX_NAME]u8 = undefined;
+        const name = filtersub.cacheName(u, &nb) catch continue;
+        var p_buf: [4352:0]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&p_buf, "{s}/{s}", .{ dir, name }) catch continue;
+        var st: c.struct_stat = undefined;
+        const mtime: i64 = if (c.stat(path.ptr, &st) == 0) @intCast(st.st_mtim.tv_sec) else 0;
+        // A missing file is always due, whatever the interval says --
+        // otherwise `filter_update_hours = 0` would mean "subscribe to
+        // this and never actually get it".
+        if (mtime != 0 and !filtersub.isStale(now, mtime, hours)) continue;
+        _ = filterSubFetch(gpa, u, path);
+    }
 }
 
 fn jobOf(base: [*c]cef.cef_base_ref_counted_t) *CookieJob {

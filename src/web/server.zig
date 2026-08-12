@@ -81,6 +81,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_FRAMES_INLINE,
     proto.CAP_WEBEXT,
     proto.CAP_WEBEXT_TABS,
+    proto.CAP_FILTER_SUBSCRIBE,
 };
 
 /// Bounded builder for the `hello_ack` capability set. Its capacity is
@@ -408,6 +409,11 @@ pub const Server = struct {
                 const req = try proto.InterceptLists.decodeAlloc(frame.payload, self.gpa);
                 defer self.gpa.free(req.paths);
                 self.host.interceptLists(req);
+            },
+            .intercept_subscribe => {
+                const req = try proto.InterceptSubscribe.decodeAlloc(frame.payload, self.gpa);
+                defer self.gpa.free(req.urls);
+                self.host.interceptSubscribe(req);
             },
             .intercept_status_req => self.host.interceptStatus(try proto.decode(proto.InterceptStatusReq, frame.payload)),
             .intercept_log_req => self.host.interceptLog(try proto.decode(proto.InterceptLogReq, frame.payload)),

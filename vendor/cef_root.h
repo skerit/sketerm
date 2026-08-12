@@ -39,4 +39,10 @@
 // handler serves.
 #include "include/capi/cef_scheme_capi.h"
 #include "include/capi/cef_resource_handler_capi.h"
+// Filter-list subscription: the helper is the only process in this
+// project with an HTTPS stack (the daemon links libc only), so keeping
+// an EasyList subscription current has to happen here. A urlrequest
+// rather than a view, because a `.txt` navigated to is RENDERED, not
+// downloaded.
+#include "include/capi/cef_urlrequest_capi.h"
 #include "include/cef_version.h"

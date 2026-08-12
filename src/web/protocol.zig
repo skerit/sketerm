@@ -121,6 +121,8 @@ pub const CAP_SITEDATA = "sitedata";
 /// The helper reports `ev_scroll` and accepts `scroll_to` (0xC2 block),
 /// which is what lets session restore put a page back where it was.
 pub const CAP_SCROLL = "scroll";
+/// The helper fetches subscribed filter lists itself (0xC4).
+pub const CAP_FILTER_SUBSCRIBE = "filter-subscribe";
 
 /// The helper accepts `frame_mode` and, in inline mode, delivers frames
 /// as `frame_inline` pixel payloads ON the protocol socket itself — no
@@ -253,6 +255,7 @@ pub const Tag = enum(u8) {
     us_style_set = 0xC1,
     ev_scroll = 0xC2,
     scroll_to = 0xC3,
+    intercept_subscribe = 0xC4,
     cookies_req = 0xC8,
     ev_cookies = 0xC9,
     cookie_delete = 0xCA,
@@ -1551,6 +1554,43 @@ pub const InterceptLists = struct {
         errdefer gpa.free(paths);
         for (paths) |*p| p.* = try cur.readStr();
         return .{ .paths = paths };
+    }
+};
+
+/// Filter lists the client wants kept up to date.
+///
+/// REPLACE-ALL, like `us_script_set`: the helper reconciles its cache
+/// directory against exactly this set, so dropping a subscription
+/// removes its cached file too and no incremental protocol can
+/// desynchronise. An empty list therefore means "subscribe to nothing",
+/// and the helper makes no network request at all.
+pub const InterceptSubscribe = struct {
+    pub const tag: Tag = .intercept_subscribe;
+    /// Refetch interval in hours; 0 keeps whatever is on disk forever.
+    update_hours: u32,
+    urls: []const []const u8,
+
+    /// At most 65535 urls travel; a config with more is CLAMPED rather
+    /// than wrapped. `@intCast` on an oversized length is silent
+    /// truncation in ReleaseFast, which would send a short count and
+    /// then a payload the reader walks off the end of.
+    pub fn encodeTo(self: InterceptSubscribe, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        const n: u16 = @intCast(@min(self.urls.len, std.math.maxInt(u16)));
+        try putU32(gpa, out, self.update_hours);
+        try putU16(gpa, out, n);
+        for (self.urls[0..n]) |u| try putStr(gpa, out, u);
+    }
+
+    /// Caller owns the returned `urls` slice (strings borrow from
+    /// `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !InterceptSubscribe {
+        var cur = Cur{ .buf = payload };
+        const hours = try cur.readU32();
+        const n = try cur.readU16();
+        const urls = try gpa.alloc([]const u8, n);
+        errdefer gpa.free(urls);
+        for (urls) |*u| u.* = try cur.readStr();
+        return .{ .update_hours = hours, .urls = urls };
     }
 };
 
@@ -2879,6 +2919,37 @@ test "round-trip: intercept_lists path list" {
     defer gpa.free(got.paths);
     try std.testing.expectEqual(@as(usize, 2), got.paths.len);
     try std.testing.expectEqualStrings(paths[1], got.paths[1]);
+}
+
+test "round-trip: intercept_subscribe url list" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const urls = [_][]const u8{
+        "https://easylist.to/easylist/easylist.txt",
+        "https://secure.fanboy.co.nz/fanboy-annoyance.txt",
+    };
+    try encode(gpa, &buf, InterceptSubscribe{ .update_hours = 6, .urls = &urls });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.intercept_subscribe, frame.tag);
+    const got = try InterceptSubscribe.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.urls);
+    try std.testing.expectEqual(@as(u32, 6), got.update_hours);
+    try std.testing.expectEqual(@as(usize, 2), got.urls.len);
+    try std.testing.expectEqualStrings(urls[0], got.urls[0]);
+    try std.testing.expectEqualStrings(urls[1], got.urls[1]);
+
+    // Subscribing to nothing is a legal, meaningful frame: it is how a
+    // client says "stop, and drop the caches".
+    var b2: std.ArrayList(u8) = .empty;
+    defer b2.deinit(gpa);
+    try encode(gpa, &b2, InterceptSubscribe{ .update_hours = 0, .urls = &.{} });
+    var r2 = Reader.init(b2.items);
+    const f2 = (try r2.next()).?;
+    const none = try InterceptSubscribe.decodeAlloc(f2.payload, gpa);
+    defer gpa.free(none.urls);
+    try std.testing.expectEqual(@as(usize, 0), none.urls.len);
 }
 
 test "round-trip: user content sets (0xC0 block)" {

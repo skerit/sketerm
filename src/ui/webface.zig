@@ -650,6 +650,8 @@ pub const Client = struct {
     /// `sender.tab` can be made real. Without it every extension sees
     /// `tabId = -1`.
     cap_webext_tabs: bool = false,
+    /// The helper fetches subscribed filter lists itself (0xC4).
+    cap_filter_subscribe: bool = false,
 
     fn hostSlice(self: *const Client) []const u8 {
         return self.host[0..self.host_len];
@@ -1164,6 +1166,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.cap_frames_inline = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.cap_webext = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.cap_webext_tabs = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.cap_filter_subscribe = true;
                 }
                 // A remote helper without inline frames would keep
                 // posting memfd frames whose descriptors the bridge
@@ -1800,6 +1803,41 @@ fn publishTabs(cl: *Client) void {
     defer aw.deinit();
     std.json.Stringify.value(rows.items, .{}, &aw.writer) catch return;
     cl.post(proto.WebextTabs{ .tabs_json = aw.written() });
+}
+
+// ── filter-list subscriptions ───────────────────────────────────
+//
+// The GUI owns the CONFIG; the helper owns the fetching, because it is
+// the only process here with an HTTPS stack. Copies are ours: a Config
+// arena is per-window and freed under `applyConfigChange`.
+
+var g_sub_urls: std.ArrayList([]u8) = .empty;
+var g_sub_hours: u32 = 24;
+
+/// Publish the configured subscription set. REPLACE-ALL, so this is
+/// also how "I removed my last subscription" reaches the helper and
+/// gets the cache files swept.
+pub fn setFilterSubscriptions(gpa: std.mem.Allocator, urls: []const []const u8, hours: u32) void {
+    for (g_sub_urls.items) |u| gpa.free(u);
+    g_sub_urls.clearRetainingCapacity();
+    for (urls) |u| {
+        const d = gpa.dupe(u8, u) catch continue;
+        g_sub_urls.append(gpa, d) catch gpa.free(d);
+    }
+    g_sub_hours = hours;
+    publishFilterSubs(&g_client);
+    for (g_remote_clients.items) |cl| publishFilterSubs(cl);
+}
+
+fn publishFilterSubs(cl: *Client) void {
+    if (!cl.cap_filter_subscribe or cl.state != .ready) return;
+    // Nothing configured and nothing to sweep: stay off the network and
+    // off the disk entirely.
+    if (g_sub_urls.items.len == 0) return;
+    var view: std.ArrayList([]const u8) = .empty;
+    defer view.deinit(cl.gpa);
+    for (g_sub_urls.items) |u| view.append(cl.gpa, u) catch return;
+    cl.post(proto.InterceptSubscribe{ .update_hours = g_sub_hours, .urls = view.items });
 }
 
 /// The tab set changed somewhere. Coalesced onto an idle so a burst of

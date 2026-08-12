@@ -724,6 +724,12 @@ pub const Window = struct {
         // connect time). Set before any face can issue a store request.
         @import("webstore.zig").setStoreSocket(self.config.web_store_socket);
 
+        // Filter-list subscriptions. Published to each helper as it
+        // becomes ready (see webface.publishFilterSubs); the helper
+        // fetches, because the daemon has no TLS and the GUI must not
+        // block its main loop on a download.
+        @import("webface.zig").setFilterSubscriptions(allocator, self.config.filter_lists.items, self.config.filter_update_hours);
+
         // Pull the stored browser containers in before anything can
         // restore a web pane: a face bound to a container holds its view
         // back until the registry has landed. Idempotent.

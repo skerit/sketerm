@@ -818,6 +818,29 @@ H.264/AAC) while the distro build enables them.
   never can be, so page content is untrusted input to every consumer.
 - `--keep` must return immediately: a daemon spawning `/proc/self/exe`
   as a display keeper must never get a browser helper instead.
+- **Filter-list subscription (0xC4, capability "filter-subscribe")** is
+  REPLACE-ALL like the userscript set: the client posts the whole url
+  list plus the refresh interval, and the helper reconciles a cache
+  directory against it. The HELPER fetches because it is the only
+  process here with an HTTPS stack (the daemon is libc-only). Four
+  rules, each learned from how a filter list actually breaks:
+  a fetched body is written ATOMICALLY and only after
+  `filtersub.looksLikeFilterList` accepts it — a captive portal and an
+  HTML 404 are both a perfectly successful fetch, and writing one over
+  a working list disables blocking with no error anywhere; any failure
+  KEEPS the previous copy, because stale rules still block; the
+  reconcile deletes only `sub-`-prefixed files, never a list the user
+  dropped in by hand; and the decision half (`src/web/filtersub.zig`)
+  is PURE and unit-tested in both roots, because these are the choices
+  that can overwrite a working file and they should be provable without
+  a network. The `cef_urlrequest_client_t` follows `CookieJob`'s
+  two-reference rule exactly — CEF's CToCpp wrappers transfer a
+  reference rather than adding one.
+  **Not yet proven end to end**: there is no smoke stage that fetches a
+  list from the rig's loopback server and asserts a rule from it blocks.
+  The feature is inert until `filter_list` is configured, so an
+  unconfigured user runs none of it, but do not cite it as working
+  until that stage exists.
 - **User content (0xC0 block, capability "userscripts")** is REPLACE-ALL:
   `us_script_set` carries raw `==UserScript==` sources (the helper
   parses metadata via `userscript.zig`), `us_style_set` per-host CSS
