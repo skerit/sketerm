@@ -1297,6 +1297,16 @@ pub const Config = struct {
     /// daemon. Point it at a forwarded socket to share ONE history
     /// across machines (src/ui/webstore.zig documents the order).
     web_store_socket: []const u8 = "",
+    /// Filter lists to keep up to date, one `filter_list = <url>` line
+    /// each. Fetched by the BROWSER HELPER (the only process here with
+    /// an HTTPS stack -- the daemon is libc-only) into
+    /// `$XDG_CONFIG_HOME/sketerm/filters/`, where the ordinary
+    /// directory scan already picks them up. Empty means no network
+    /// request is ever made on behalf of filtering.
+    filter_lists: std.ArrayList([]const u8) = .empty,
+    /// How often a subscribed list is refetched, in hours. 0 disables
+    /// updating; lists already on disk keep working.
+    filter_update_hours: u32 = 24,
     /// Width of that sidebar in logical px. Written back when the user
     /// drags the divider, so the key exists mainly to persist it.
     tab_sidebar_width: u16 = 240,
@@ -1356,6 +1366,9 @@ pub const Config = struct {
         out.quake_monitor = try arena.dupe(u8, self.quake_monitor);
         out.hint_alphabet = try arena.dupe(u8, self.hint_alphabet);
         out.web_store_socket = try arena.dupe(u8, self.web_store_socket);
+        out.filter_lists = .empty;
+        try out.filter_lists.ensureTotalCapacity(arena, self.filter_lists.items.len);
+        for (self.filter_lists.items) |u| out.filter_lists.appendAssumeCapacity(try arena.dupe(u8, u));
         out.hint_rules = .empty;
         try out.hint_rules.ensureTotalCapacity(arena, self.hint_rules.items.len);
         for (self.hint_rules.items) |hr| {
@@ -1990,6 +2003,9 @@ pub const Config = struct {
             try w.print("tab_sidebar_width = {d}\n", .{self.tab_sidebar_width});
         if (self.web_store_socket.len > 0)
             try w.print("web_store_socket = {s}\n", .{self.web_store_socket});
+        for (self.filter_lists.items) |u| try w.print("filter_list = {s}\n", .{u});
+        if (self.filter_update_hours != 24)
+            try w.print("filter_update_hours = {d}\n", .{self.filter_update_hours});
         if (self.tab_close_parent != .promote) try w.writeAll("tab_close_parent = close-subtree\n");
         if (self.tab_child_insert != .last) try w.writeAll("tab_child_insert = first\n");
         const default_taf: [4]f32 = .{ 1.0, 1.0, 1.0, 1.0 };
@@ -3177,6 +3193,11 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.show_tab_sidebar = try parseBool(value);
     } else if (std.mem.eql(u8, key, "web_store_socket")) {
         cfg.web_store_socket = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "filter_list")) {
+        // Repeated key: every line adds one subscription, in file order.
+        if (value.len > 0) try cfg.filter_lists.append(arena, try arena.dupe(u8, value));
+    } else if (std.mem.eql(u8, key, "filter_update_hours")) {
+        cfg.filter_update_hours = try parseU32(value);
     } else if (std.mem.eql(u8, key, "tab_sidebar_width")) {
         const w = try parseU16(value);
         if (w < 120 or w > 800) return error.BadTabSidebarWidth;
@@ -5125,4 +5146,56 @@ test "config: web_search_engine parses, validates, round-trips and clones" {
     var w2 = std.Io.Writer.fixed(&saved);
     try dflt.serialise(&w2);
     try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "web_search_engine") == null);
+}
+
+test "config: filter subscriptions round-trip, repeat and clone" {
+    // Defaults: no subscriptions at all, so nothing is ever fetched.
+    try std.testing.expectEqual(@as(usize, 0), (Config{}).filter_lists.items.len);
+    try std.testing.expectEqual(@as(u32, 24), (Config{}).filter_update_hours);
+
+    const src =
+        \\filter_list = https://easylist.to/easylist/easylist.txt
+        \\filter_list = https://example.com/other/easylist.txt
+        \\filter_update_hours = 6
+        \\
+    ;
+    var parsed = try Config.loadFromBytes(std.testing.allocator, src);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.filter_lists.items.len);
+    // Repeated keys keep FILE ORDER: a later list may whitelist what an
+    // earlier one blocked, so the order is meaningful.
+    try std.testing.expectEqualStrings(
+        "https://easylist.to/easylist/easylist.txt",
+        parsed.filter_lists.items[0],
+    );
+    try std.testing.expectEqualStrings(
+        "https://example.com/other/easylist.txt",
+        parsed.filter_lists.items[1],
+    );
+    try std.testing.expectEqual(@as(u32, 6), parsed.filter_update_hours);
+
+    var buf: [2048]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try parsed.serialise(&w);
+    var again = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer again.deinit();
+    try std.testing.expectEqual(@as(usize, 2), again.filter_lists.items.len);
+    try std.testing.expectEqual(@as(u32, 6), again.filter_update_hours);
+
+    // The clone every apply path goes through must carry both, with its
+    // OWN copies: the old arena is freed under applyConfigChange.
+    var cloned = try again.clone(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cloned.filter_lists.items.len);
+    try std.testing.expectEqualStrings(again.filter_lists.items[0], cloned.filter_lists.items[0]);
+    try std.testing.expect(again.filter_lists.items[0].ptr != cloned.filter_lists.items[0].ptr);
+    try std.testing.expectEqual(@as(u32, 6), cloned.filter_update_hours);
+
+    // The default interval writes no line (the serialiser is minimal).
+    var d = Config{};
+    var b2: [512]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&b2);
+    try d.serialise(&w2);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "filter_update_hours") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "filter_list") == null);
 }
