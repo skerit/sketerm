@@ -15,8 +15,15 @@
 //!     xhr, ping, other, ~negations), `third-party`/`3p`/`1p`,
 //!     `domain=a|~b`, `match-case` (accepted, ignored — matching is
 //!     case-folded), `important` (accepted, no distinct precedence)
-//!   - comments (`!`, `[Adblock...`) and cosmetic rules (`##`, `#@#`,
-//!     `#?#`, `#$#`) are skipped
+//!   - element hiding (cosmetic) rules: generic `##selector`,
+//!     domain-scoped `a.com,~b.a.com##selector`, exceptions `#@#`.
+//!     `cosmeticFor` compiles the set applicable to one host into a
+//!     `display:none !important` stylesheet, ONE rule per selector so
+//!     a selector the engine cannot parse invalidates only itself.
+//!     Procedural/style cosmetics (`#?#`, `#$#`) are dropped and
+//!     counted in `cos_dropped` — half-applying `:has()` chains or
+//!     style injection would be wrong more often than useful.
+//!   - comments (`!`, `[Adblock...`)
 //! A rule carrying an UNSUPPORTED option is dropped whole: silently
 //! ignoring the option would over-block (`$popup`, redirects, csp).
 //!
@@ -71,6 +78,18 @@ pub const Request = struct {
 
 const Party = enum(u2) { any, third, first };
 
+/// One element-hiding rule. Selectors are stored VERBATIM (selector
+/// text is case-sensitive), only the domain scope is folded.
+const CosRule = struct {
+    selector: []const u8,
+    /// `#@#`: unhide `selector` on the scoped domains.
+    exception: bool = false,
+    /// Hosts (or their subdomains) the rule is limited to / excluded
+    /// from. Both empty = generic (applies everywhere).
+    dom_include: []const []const u8 = &.{},
+    dom_exclude: []const []const u8 = &.{},
+};
+
 const Rule = struct {
     /// For host-anchored rules: the `||` host. Empty otherwise.
     anchor_host: []const u8 = "",
@@ -103,6 +122,15 @@ pub const Engine = struct {
     /// Lines that looked like network rules but were dropped
     /// (unsupported option, empty pattern).
     dropped: u32 = 0,
+    /// Element-hiding rules, scanned linearly per `cosmeticFor` call
+    /// (once per navigation — EasyList-scale sets cost well under a
+    /// millisecond, measured in the unit tests' worst case).
+    cos_rules: std.ArrayList(CosRule) = .empty,
+    /// Kept cosmetic rules (block + exception).
+    cos_count: u32 = 0,
+    /// Cosmetic lines this engine refuses: procedural (`#?#`) and
+    /// style (`#$#`) rules, and empty selectors.
+    cos_dropped: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Engine {
         return .{ .arena_state = std.heap.ArenaAllocator.init(gpa), .gpa = gpa };
@@ -114,6 +142,7 @@ pub const Engine = struct {
         self.by_host.deinit(self.gpa);
         self.generic.deinit(self.gpa);
         self.rules.deinit(self.gpa);
+        self.cos_rules.deinit(self.gpa);
         self.arena_state.deinit();
     }
 
@@ -131,11 +160,16 @@ pub const Engine = struct {
 
     fn addLine(self: *Engine, line: []const u8) !void {
         if (line[0] == '!' or line[0] == '[') return; // comment / header
-        // Cosmetic / scriptlet rules are a different subsystem.
-        if (std.mem.indexOf(u8, line, "##") != null) return;
-        if (std.mem.indexOf(u8, line, "#@#") != null) return;
-        if (std.mem.indexOf(u8, line, "#?#") != null) return;
-        if (std.mem.indexOf(u8, line, "#$#") != null) return;
+        // Cosmetic rules: `[domains]##sel` / `[domains]#@#sel`; the
+        // procedural (`#?#`) and style (`#$#`) dialects are refused.
+        if (findCosMarker(line)) |m| {
+            switch (m.kind) {
+                .block => try self.addCosmetic(line[0..m.at], line[m.at + 2 ..], false),
+                .exception => try self.addCosmetic(line[0..m.at], line[m.at + 3 ..], true),
+                .unsupported => self.cos_dropped += 1,
+            }
+            return;
+        }
 
         var rule = Rule{};
         var body = line;
@@ -267,6 +301,79 @@ pub const Engine = struct {
         return true;
     }
 
+    /// One cosmetic rule: `domains` is the comma-separated scope
+    /// before the marker (may be empty = generic), `sel` the selector.
+    fn addCosmetic(self: *Engine, domains: []const u8, sel: []const u8, exception: bool) !void {
+        const selector = std.mem.trim(u8, sel, " \t");
+        if (selector.len == 0) {
+            self.cos_dropped += 1;
+            return;
+        }
+        var rule = CosRule{
+            .selector = try self.arena_state.allocator().dupe(u8, selector),
+            .exception = exception,
+        };
+        if (domains.len > 0) {
+            var inc: std.ArrayList([]const u8) = .empty;
+            var exc: std.ArrayList([]const u8) = .empty;
+            defer inc.deinit(self.gpa);
+            defer exc.deinit(self.gpa);
+            var it = std.mem.splitScalar(u8, domains, ',');
+            while (it.next()) |raw| {
+                const d = std.mem.trim(u8, raw, " \t");
+                if (d.len == 0) continue;
+                if (d[0] == '~') {
+                    if (d.len > 1) try exc.append(self.gpa, try self.lowerDup(d[1..]));
+                } else {
+                    try inc.append(self.gpa, try self.lowerDup(d));
+                }
+            }
+            const arena = self.arena_state.allocator();
+            rule.dom_include = try arena.dupe([]const u8, inc.items);
+            rule.dom_exclude = try arena.dupe([]const u8, exc.items);
+        }
+        try self.cos_rules.append(self.gpa, rule);
+        self.cos_count += 1;
+    }
+
+    /// Does a cosmetic rule's domain scope cover `host`? A generic
+    /// rule (no includes) covers every host, including the empty host
+    /// of an authority-less url; excludes always win.
+    fn cosApplies(r: *const CosRule, host: []const u8) bool {
+        for (r.dom_exclude) |d| {
+            if (hostWithin(host, d)) return false;
+        }
+        if (r.dom_include.len == 0) return true;
+        for (r.dom_include) |d| {
+            if (hostWithin(host, d)) return true;
+        }
+        return false;
+    }
+
+    /// Compile the element-hiding stylesheet for one (folded) host:
+    /// every applicable selector minus those a matching `#@#` rule
+    /// excepts, ONE `{display:none !important}` rule per selector so
+    /// an invalid selector cannot take healthy siblings down with it.
+    /// Empty result = nothing to hide. Caller frees. Main thread only
+    /// (walks engine state the IO thread never touches).
+    pub fn cosmeticFor(self: *const Engine, gpa: std.mem.Allocator, host: []const u8) ![]u8 {
+        var excepted: std.StringHashMapUnmanaged(void) = .empty;
+        defer excepted.deinit(gpa);
+        for (self.cos_rules.items) |*r| {
+            if (r.exception and cosApplies(r, host))
+                try excepted.put(gpa, r.selector, {});
+        }
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        for (self.cos_rules.items) |*r| {
+            if (r.exception or !cosApplies(r, host)) continue;
+            if (excepted.contains(r.selector)) continue;
+            try out.appendSlice(gpa, r.selector);
+            try out.appendSlice(gpa, "{display:none !important}\n");
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
     fn parseDomains(self: *Engine, rule: *Rule, spec: []const u8) !void {
         var inc: std.ArrayList([]const u8) = .empty;
         var exc: std.ArrayList([]const u8) = .empty;
@@ -358,6 +465,37 @@ pub const Engine = struct {
         return false;
     }
 };
+
+const CosMarker = struct {
+    at: usize,
+    kind: enum { block, exception, unsupported },
+};
+
+/// Locate a cosmetic separator (`##`, `#@#`, `#?#`, `#$#`) whose
+/// PREFIX is a plausible domain list — a bare `#` inside a network
+/// rule's URL pattern must not reclassify the line.
+fn findCosMarker(line: []const u8) ?CosMarker {
+    var i: usize = 0;
+    while (i + 1 < line.len) : (i += 1) {
+        if (line[i] != '#') continue;
+        const kind: @FieldType(CosMarker, "kind") = switch (line[i + 1]) {
+            '#' => .block,
+            '@', '?', '$' => blk: {
+                if (i + 2 >= line.len or line[i + 2] != '#') continue;
+                break :blk if (line[i + 1] == '@') .exception else .unsupported;
+            },
+            else => continue,
+        };
+        for (line[0..i]) |ch| {
+            switch (ch) {
+                'a'...'z', 'A'...'Z', '0'...'9', '.', '-', ',', '~', '*', '_', ' ', '\t' => {},
+                else => return null, // URL-ish prefix: a network rule
+            }
+        }
+        return .{ .at = i, .kind = kind };
+    }
+    return null;
+}
 
 fn typeOf(opt: []const u8) ?RType {
     const eql = std.ascii.eqlIgnoreCase;
@@ -541,7 +679,7 @@ fn testReq(url: []const u8, doc_host: []const u8, rtype: RType) Request {
     return .{ .url = url, .host = hostOf(url), .doc_host = doc_host, .rtype = rtype };
 }
 
-test "comments, headers and cosmetic lines parse to zero rules" {
+test "comments, headers and cosmetic lines parse to zero NETWORK rules" {
     var e = try testEngine(
         \\[Adblock Plus 2.0]
         \\! a comment
@@ -552,6 +690,106 @@ test "comments, headers and cosmetic lines parse to zero rules" {
     );
     defer e.deinit();
     try std.testing.expectEqual(@as(u32, 0), e.count);
+    // The `##`/`#@#` lines land in the cosmetic set instead.
+    try std.testing.expectEqual(@as(u32, 2), e.cos_count);
+    try std.testing.expectEqual(@as(u32, 1), e.cos_dropped);
+}
+
+test "cosmetic: generic and domain-scoped rules compile per host" {
+    const t = std.testing;
+    var e = try testEngine(
+        \\##.ad-generic
+        \\example.com##.site-ad
+        \\example.com,other.net##.pair-ad
+        \\~quiet.example##.loud
+    );
+    defer e.deinit();
+    try t.expectEqual(@as(u32, 4), e.cos_count);
+
+    const ex = try e.cosmeticFor(t.allocator, "www.example.com");
+    defer t.allocator.free(ex);
+    try t.expect(std.mem.indexOf(u8, ex, ".ad-generic{display:none !important}") != null);
+    try t.expect(std.mem.indexOf(u8, ex, ".site-ad{display:none !important}") != null);
+    try t.expect(std.mem.indexOf(u8, ex, ".pair-ad{") != null);
+    try t.expect(std.mem.indexOf(u8, ex, ".loud{") != null);
+
+    const oth = try e.cosmeticFor(t.allocator, "unrelated.test");
+    defer t.allocator.free(oth);
+    try t.expect(std.mem.indexOf(u8, oth, ".ad-generic{") != null);
+    try t.expect(std.mem.indexOf(u8, oth, ".site-ad") == null);
+    try t.expect(std.mem.indexOf(u8, oth, ".pair-ad") == null);
+
+    // `~domain##sel` is generic MINUS the excluded domain.
+    const quiet = try e.cosmeticFor(t.allocator, "sub.quiet.example");
+    defer t.allocator.free(quiet);
+    try t.expect(std.mem.indexOf(u8, quiet, ".loud") == null);
+
+    // A host-less document (data: url) still gets the generic set.
+    const bare = try e.cosmeticFor(t.allocator, "");
+    defer t.allocator.free(bare);
+    try t.expect(std.mem.indexOf(u8, bare, ".ad-generic{") != null);
+    try t.expect(std.mem.indexOf(u8, bare, ".site-ad") == null);
+}
+
+test "cosmetic: #@# exceptions unhide per domain" {
+    const t = std.testing;
+    var e = try testEngine(
+        \\##.promo
+        \\news.example##.banner
+        \\news.example#@#.promo
+        \\#@#.everywhere-ok
+        \\##.everywhere-ok
+    );
+    defer e.deinit();
+
+    // On news.example the generic .promo is excepted, .banner applies.
+    const news = try e.cosmeticFor(t.allocator, "news.example");
+    defer t.allocator.free(news);
+    try t.expect(std.mem.indexOf(u8, news, ".promo") == null);
+    try t.expect(std.mem.indexOf(u8, news, ".banner{") != null);
+    // A GENERIC exception blanks the selector everywhere.
+    try t.expect(std.mem.indexOf(u8, news, ".everywhere-ok") == null);
+
+    // Elsewhere .promo hides as usual.
+    const oth = try e.cosmeticFor(t.allocator, "other.test");
+    defer t.allocator.free(oth);
+    try t.expect(std.mem.indexOf(u8, oth, ".promo{") != null);
+    try t.expect(std.mem.indexOf(u8, oth, ".banner") == null);
+}
+
+test "cosmetic: procedural and style dialects are refused, counted" {
+    const t = std.testing;
+    var e = try testEngine(
+        \\example.com#?#div:has(> .ad)
+        \\example.com#$#body { background: none }
+        \\example.com##
+        \\##[href^="https://tracker."]
+    );
+    defer e.deinit();
+    // #?# + #$# + empty selector = 3 refusals; the attribute selector
+    // (URL-ish characters AFTER the marker) is kept.
+    try t.expectEqual(@as(u32, 3), e.cos_dropped);
+    try t.expectEqual(@as(u32, 1), e.cos_count);
+    const css = try e.cosmeticFor(t.allocator, "example.com");
+    defer t.allocator.free(css);
+    try t.expect(std.mem.indexOf(u8, css, "[href^=\"https://tracker.\"]{display:none !important}") != null);
+}
+
+test "cosmetic: a network rule with a # in its pattern stays a network rule" {
+    const t = std.testing;
+    var e = try testEngine("/path##frag\n");
+    defer e.deinit();
+    // '/' before the marker is not a domain-list character.
+    try t.expectEqual(@as(u32, 1), e.count);
+    try t.expectEqual(@as(u32, 0), e.cos_count);
+}
+
+test "cosmetic: an empty engine hides nothing" {
+    var e = Engine.init(std.testing.allocator);
+    defer e.deinit();
+    const css = try e.cosmeticFor(std.testing.allocator, "any.test");
+    defer std.testing.allocator.free(css);
+    try std.testing.expectEqual(@as(usize, 0), css.len);
 }
 
 test "host-anchored rule blocks the host and its subdomains only" {
