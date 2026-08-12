@@ -1247,8 +1247,17 @@ pub const WebStore = struct {
         }) orelse return error.OutOfMemory;
         errdefer self.freeContainer(rec);
         try self.containers.append(self.allocator, rec);
+        // The append TRANSFERRED ownership, so the errdefer above is no
+        // longer allowed to fire while the list still holds `rec`: a
+        // failing write (read-only or full state dir) would free the
+        // strings the list keeps serving, so the next container_list
+        // stringified freed memory onto the wire and `deinit` freed it a
+        // second time. Undo the append first, then let the errdefer run.
+        self.saveContainers() catch |err| {
+            _ = self.containers.pop();
+            return err;
+        };
         self.next_container_id = rec.id + 1;
-        try self.saveContainers();
         return rec.id;
     }
 
@@ -1329,7 +1338,12 @@ pub const WebStore = struct {
         const h = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(h);
         try self.container_sites.append(self.allocator, .{ .host = h, .container = container });
-        try self.saveContainers();
+        // Same ownership handover as `containerAdd`: undo the append
+        // before the errdefer is allowed to free `h`.
+        self.saveContainers() catch |err| {
+            _ = self.container_sites.pop();
+            return err;
+        };
     }
 
     /// Container assigned to exactly this host, or null. Matching is
