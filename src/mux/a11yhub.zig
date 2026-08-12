@@ -450,6 +450,109 @@ pub const Hub = struct {
         return .{ a, b };
     }
 
+    /// Listen for AT-SPI object events on the a11y bus. This is the
+    /// only way to prove a provider EMITTED something rather than
+    /// merely being willing to answer a poll, which is the whole
+    /// difference between a reader being told and a reader re-walking.
+    /// Caller deinits.
+    pub fn watchEvents(self: *Hub, allocator: std.mem.Allocator) ?EventWatch {
+        var bus = self.openA11yBus(allocator) orelse return null;
+        errdefer bus.deinit();
+        var bw = dbus.Writer.init(allocator);
+        defer bw.deinit();
+        bw.putString("type='signal',interface='org.a11y.atspi.Event.Object'") catch return null;
+        const r = bus.call(.{
+            .mtype = .method_call,
+            .path = "/org/freedesktop/DBus",
+            .interface = "org.freedesktop.DBus",
+            .member = "AddMatch",
+            .destination = "org.freedesktop.DBus",
+            .signature = "s",
+            .body = bw.buf.items,
+        }) catch return null;
+        allocator.free(r.body);
+        return .{ .conn = bus, .allocator = allocator };
+    }
+
+    pub const EventWatch = struct {
+        conn: Conn,
+        allocator: std.mem.Allocator,
+
+        /// One received signal, copied into fixed buffers so the
+        /// caller never holds a slice into the read buffer.
+        pub const Event = struct {
+            member_buf: [64]u8 = @splat(0),
+            member_len: usize = 0,
+            detail_buf: [64]u8 = @splat(0),
+            detail_len: usize = 0,
+            path_buf: [128]u8 = @splat(0),
+            path_len: usize = 0,
+            detail1: i32 = 0,
+            detail2: i32 = 0,
+
+            pub fn member(self: *const Event) []const u8 {
+                return self.member_buf[0..self.member_len];
+            }
+            pub fn detail(self: *const Event) []const u8 {
+                return self.detail_buf[0..self.detail_len];
+            }
+            pub fn path(self: *const Event) []const u8 {
+                return self.path_buf[0..self.path_len];
+            }
+        };
+
+        pub fn deinit(self: *EventWatch) void {
+            self.conn.deinit();
+        }
+
+        /// Next object event, or null on timeout. Non-signal traffic
+        /// is discarded.
+        pub fn next(self: *EventWatch, timeout_ms: i64) ?Event {
+            const deadline = nowMs() + timeout_ms;
+            while (true) {
+                while (dbus.unmarshal(self.conn.rbuf.items) catch return null) |got| {
+                    const m = got.msg;
+                    var ev: ?Event = null;
+                    if (m.mtype == .signal) ev = decodeEvent(m);
+                    self.conn.rbuf.replaceRange(self.allocator, 0, got.consumed, &.{}) catch return null;
+                    if (ev) |e| return e;
+                }
+                self.conn.waitFd(c.POLLIN, deadline) catch return null;
+                var tmp: [8192]u8 = undefined;
+                const n = c.read(self.conn.fd, &tmp, tmp.len);
+                if (n > 0) {
+                    self.conn.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch return null;
+                    continue;
+                }
+                if (n == 0) return null;
+                const e = std.posix.errno(n);
+                if (e == .INTR or e == .AGAIN) continue;
+                return null;
+            }
+        }
+
+        fn decodeEvent(m: dbus.Message) ?Event {
+            var ev = Event{};
+            const mem = m.member orelse return null;
+            const p = m.path orelse "";
+            if (mem.len > ev.member_buf.len or p.len > ev.path_buf.len) return null;
+            @memcpy(ev.member_buf[0..mem.len], mem);
+            ev.member_len = mem.len;
+            @memcpy(ev.path_buf[0..p.len], p);
+            ev.path_len = p.len;
+            // Body is siiv a{sv}; only the first three are needed here.
+            var rd = dbus.Reader.init(m.body);
+            const d = rd.string() catch return ev;
+            if (d.len <= ev.detail_buf.len) {
+                @memcpy(ev.detail_buf[0..d.len], d);
+                ev.detail_len = d.len;
+            }
+            ev.detail1 = rd.i32v() catch return ev;
+            ev.detail2 = rd.i32v() catch return ev;
+            return ev;
+        }
+    };
+
     /// Set org.a11y.atspi.Value.CurrentValue (sliders, spinners,
     /// scrollbars) on node `id`. False on failure.
     pub fn setCurrentValue(self: *Hub, allocator: std.mem.Allocator, id: []const u8, value: f64) bool {

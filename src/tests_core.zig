@@ -126,6 +126,7 @@ comptime {
     _ = @import("editor_app.zig");
     _ = @import("web_app.zig");
     _ = @import("a11y/docview.zig");
+    _ = @import("a11y/webproj.zig");
     _ = @import("mux/a11yhub.zig");
     _ = @import("mux/cast.zig");
     _ = @import("mux/cast_play.zig");
