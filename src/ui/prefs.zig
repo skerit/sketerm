@@ -1883,6 +1883,21 @@ fn windowPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     // libadwaita gains a property for it.
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(tabs_group)));
 
+    // Tree-style tabs. Config-file-only until now, which made the
+    // sidebar undiscoverable: it is off by default and its five actions
+    // ship unbound, so nothing in the UI led to it.
+    const tree_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(tree_group)), "Tree-style tabs");
+    c.adw_preferences_group_set_description(
+        @ptrCast(@alignCast(tree_group)),
+        "A vertical sidebar showing tabs as a tree. While it is open it is also the tab surface for BROWSERS: it lists the pages open inside the focused browser, and a new tab opens a page there.",
+    );
+    addSwitchRow(@ptrCast(@alignCast(tree_group)), ctx, "Show the sidebar", "Also toggled at runtime by the Tab menu, the window menu and the command palette.", &ctx.cfg.show_tab_sidebar, applyOnly);
+    addSpinRowU16(@ptrCast(@alignCast(tree_group)), ctx, "Sidebar width", "Logical pixels. Dragging the divider writes this back.", 120, 800, &ctx.cfg.tab_sidebar_width, applyOnly);
+    addTabCloseParentRow(@ptrCast(@alignCast(tree_group)), ctx);
+    addTabChildInsertRow(@ptrCast(@alignCast(tree_group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(tree_group)));
+
     // Title templates. App-level (see Config.tab_title_template): a
     // tab strip mixing two title FORMATS reads as a bug.
     const title_group = c.adw_preferences_group_new();
@@ -2039,6 +2054,50 @@ fn addTabPositionRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
 
 fn tabPositionSelected(ctx: *Ctx, idx: c_uint) void {
     ctx.cfg.tab_position = if (idx == 1) .bottom else .top;
+    ctx.ev();
+}
+
+fn addTabCloseParentRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Promote the children", "Close the whole subtree" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Closing a tab with children");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Promoting lifts them one level, the way Tree Style Tab does. Applies to browser pages too.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), switch (ctx.cfg.tab_close_parent) {
+        .promote => 0,
+        .close_subtree => 1,
+    });
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = tabCloseParentSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn tabCloseParentSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.tab_close_parent = if (idx == 1) .close_subtree else .promote;
+    ctx.ev();
+}
+
+fn addTabChildInsertRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "After its siblings", "Before its siblings" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Where a child tab lands");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "A tab opened from another one nests under it; this is where among its siblings.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), switch (ctx.cfg.tab_child_insert) {
+        .last => 0,
+        .first => 1,
+    });
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = tabChildInsertSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn tabChildInsertSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.tab_child_insert = if (idx == 1) .first else .last;
     ctx.ev();
 }
 

@@ -1259,22 +1259,59 @@ fn dumpLeftStrip(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32) 
 /// Chrome-coloured pixels in the 200px strip the outline panel claims.
 /// The editor canvas there is the dark theme background, so a jump in
 /// this count IS the panel.
-fn lightPixelsRight(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32) usize {
-    const shot = app.snapshotRgba(win_id, null) catch return 0;
+/// The right-hand CANVAS band, copied out for a before/after compare.
+/// Deliberately not a "count the light pixels" heuristic: that assumed a
+/// LIGHT outline panel against a dark canvas, and under the dark theme
+/// this rig actually runs the panel is dark too — it opened correctly
+/// and the assertion still failed (0 -> 278 px against a +20000 bar).
+/// What "the panel took a column" really means is that the band STOPPED
+/// LOOKING LIKE THE CANVAS, which a diff states without knowing either
+/// theme's colours. The window chrome above and the project panel below
+/// are excluded because they change for their own reasons.
+const Band = struct {
+    px: []u8,
+    w: u32,
+    h: u32,
+    fn deinit(self: Band, allocator: std.mem.Allocator) void {
+        allocator.free(self.px);
+    }
+};
+
+fn captureRightBand(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32) ?Band {
+    const shot = app.snapshotRgba(win_id, null) catch return null;
     defer allocator.free(shot.px);
-    if (shot.w < 260) return 0;
-    var n: usize = 0;
-    // Only the CANVAS band: the window chrome above and the project
-    // panel below are light whatever the outline does.
-    if (shot.h < 500) return 0;
-    var y: u32 = 220;
-    while (y < shot.h - 230) : (y += 1) {
-        var x: u32 = shot.w - 240;
-        while (x < shot.w - 30) : (x += 1) {
-            const i = (y * shot.w + x) * 4;
-            if (i + 2 >= shot.px.len) break;
-            if (shot.px[i] > 180 and shot.px[i + 1] > 180 and shot.px[i + 2] > 180) n += 1;
+    if (shot.w < 260 or shot.h < 500) return null;
+    const x0 = shot.w - 240;
+    const x1 = shot.w - 30;
+    const y0: u32 = 220;
+    const y1: u32 = shot.h - 230;
+    if (y1 <= y0) return null;
+    const bw = x1 - x0;
+    const bh = y1 - y0;
+    const out = allocator.alloc(u8, @as(usize, bw) * bh * 4) catch return null;
+    var y: u32 = 0;
+    while (y < bh) : (y += 1) {
+        const src = ((y0 + y) * shot.w + x0) * 4;
+        const dst = @as(usize, y) * bw * 4;
+        if (src + bw * 4 > shot.px.len) {
+            allocator.free(out);
+            return null;
         }
+        @memcpy(out[dst..][0 .. bw * 4], shot.px[src..][0 .. bw * 4]);
+    }
+    return .{ .px = out, .w = bw, .h = bh };
+}
+
+/// Pixels of `b` that differ from `a` beyond a small tolerance.
+fn bandChanged(a: Band, b: Band) usize {
+    if (a.w != b.w or a.h != b.h or a.px.len != b.px.len) return 0;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i + 3 < a.px.len) : (i += 4) {
+        const dr = @abs(@as(i32, a.px[i]) - @as(i32, b.px[i]));
+        const dg = @abs(@as(i32, a.px[i + 1]) - @as(i32, b.px[i + 1]));
+        const db = @abs(@as(i32, a.px[i + 2]) - @as(i32, b.px[i + 2]));
+        if (dr + dg + db > 24) n += 1;
     }
     return n;
 }
@@ -1466,7 +1503,9 @@ fn projectStage(
     // ── the outline panel ─────────────────────────────────────────
     if (maybe_app) |app| {
         const win_id = app.windows.items[0].id;
-        const light_before = lightPixelsRight(allocator, app, win_id);
+        const band_before = captureRightBand(allocator, app, win_id) orelse
+            return "could not sample the editor canvas band";
+        defer band_before.deinit(allocator);
         // Focus is in the search panel after activating a hit; the
         // outline chord belongs to the editor canvas.
         const freq2 = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{ppane}) catch return "fmt";
@@ -1487,9 +1526,15 @@ fn projectStage(
         // occupies must stop being the editor's dark background. The
         // baseline is not zero (the scrollbar and the window edge live
         // there), so the assertion is relative.
-        const light_after = lightPixelsRight(allocator, app, win_id);
-        _ = c.fprintf(platform.stderr(), "smoke-e2e: outline column chrome %zu -> %zu px\n", light_before, light_after);
-        if (light_after < light_before + 20_000)
+        const band_after = captureRightBand(allocator, app, win_id) orelse
+            return "could not sample the editor canvas band after the outline opened";
+        defer band_after.deinit(allocator);
+        const changed = bandChanged(band_before, band_after);
+        const band_total = @as(usize, band_before.w) * band_before.h;
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: outline column changed %zu of %zu px\n", changed, band_total);
+        // A panel that took the column repaints most of the band; a
+        // caret blink or a scrollbar nudge cannot reach a third of it.
+        if (changed * 3 < band_total)
             return "the outline panel did not take a column from the canvas";
         // Closing it again must restore the canvas width.
         var ref2 = app.frameRef(win_id, true) orelse return "no open-outline frame";
@@ -1713,6 +1758,14 @@ fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pa
 
     const before = tabCount(allocator, sock_path) orelse
         return "list roundtrip failed before the command-palette stage";
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed before the command-palette stage";
+        defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
+    }
 
     // Open it through the same action the keybind dispatches.
     var ref = app.frameRef(win_id, true) orelse return "no baseline frame for the command palette";
@@ -1781,16 +1834,13 @@ fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pa
     // Put the window back the way the later stages expect it. The
     // count is re-read BEFORE each close, never after one is assumed to
     // have landed, or a slow close closes a tab the next stage wanted.
-    var closes: u32 = 0;
-    while (closes < 10) : (closes += 1) {
-        const n = tabCount(allocator, sock_path) orelse break;
-        if (n <= before) break;
-        if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"close_tab\"}\n")) |r|
-            allocator.free(r)
-        else
-            break;
-        _ = app.waitIdle(300, 5_000);
-    }
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    // ...and focused where they expect it. Closing a tab lands the
+    // selection wherever libadwaita chooses, which is not necessarily
+    // the tab holding pane 1 — and every later stage that types into
+    // "the shell" then asserts on pane 1.
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(300, 5_000);
     return null;
 }
 
@@ -1805,10 +1855,13 @@ fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pa
 fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
     _ = app.drainLive(1_000);
 
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
     const tabs_before = blk: {
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
             return "list roundtrip failed before the tree-sidebar stage";
         defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
         break :blk countTabs(r);
     };
 
@@ -2052,15 +2105,12 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     else
         return "toggle_tab_sidebar (off) roundtrip failed";
     _ = app.waitIdle(300, 5_000);
-    var closes: usize = 0;
-    while (closes < 8) : (closes += 1) {
-        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse break;
-        const n = countTabs(r);
-        allocator.free(r);
-        if (n <= tabs_before) break;
-        if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"close_tab\"}\n")) |cr| allocator.free(cr);
-        _ = app.waitIdle(200, 4_000);
-    }
+    _ = tabs_before;
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    // Same contract as the palette stage: hand the window back focused
+    // on pane 1, which is what the stages after this one assume.
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
     return null;
 }
 
@@ -6582,6 +6632,62 @@ fn kittyKbdStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
 /// The word motions are what make this worth a live stage: `w` and
 /// `e` have to agree about where a word begins and ends, and only the
 /// round trip proves the selection they produced was the right one.
+/// Every pane id in a `list` reply, in order. Cleanup that closes "the
+/// current tab" is not safe: after a few closes the selection can land
+/// on the tab the rig started with, and closing THAT takes pane 1 with
+/// it — every later stage then asserts against a pane that no longer
+/// exists. Stages therefore record the ids they started with and close
+/// only what they added.
+fn listPaneIds(resp: []const u8, out: []u32) usize {
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, resp, from, "\"id\":")) |at| {
+        from = at + 5;
+        // A tab object also carries "id"; only pane objects are
+        // followed by "title" then "cwd".
+        const rest = resp[from..];
+        const stop = std.mem.indexOfAny(u8, rest, ",}") orelse break;
+        const id = std.fmt.parseInt(u32, rest[0..stop], 10) catch continue;
+        const tail = rest[stop..];
+        if (!std.mem.startsWith(u8, tail, ",\"title\"")) continue;
+        if (std.mem.indexOf(u8, tail[0..@min(tail.len, 80)], "\"cwd\"") == null) continue;
+        if (n < out.len) {
+            out[n] = id;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn contains(ids: []const u32, id: u32) bool {
+    for (ids) |x| {
+        if (x == id) return true;
+    }
+    return false;
+}
+
+/// Close every pane the stage added, leaving the ones it found alone.
+fn closeAddedPanes(allocator: std.mem.Allocator, sock_path: [:0]const u8, app: *appdrive.App, keep: []const u32) void {
+    var round: u32 = 0;
+    while (round < 12) : (round += 1) {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return;
+        defer allocator.free(r);
+        var now: [64]u32 = undefined;
+        const n = listPaneIds(r, &now);
+        var closed_any = false;
+        for (now[0..n]) |id| {
+            if (contains(keep, id)) continue;
+            var buf: [64]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{id}) catch continue;
+            if (roundtrip(allocator, sock_path, cmd)) |cr| allocator.free(cr);
+            closed_any = true;
+            _ = app.waitIdle(200, 4_000);
+            break;
+        }
+        if (!closed_any) return;
+    }
+}
+
 /// A pane id in the SELECTED tab other than `not` — i.e. the pane a
 /// split just created. Pane ids are monotonic and every earlier stage
 /// that opened a tab consumes some, so the rig must never assume the
@@ -6635,8 +6741,20 @@ fn copyModeStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     // early or late yanks something visibly different.
     app.typeText(null, "echo ZQalpha ZQbeta ZQgamma\n") catch return "injecting the sample line failed";
     // Twice: the echoed command line, and its output.
-    if (!waitMarkerCount(allocator, sock_path, "ZQbeta", 2, 15_000))
+    if (!waitMarkerCount(allocator, sock_path, "ZQbeta", 2, 15_000)) {
+        // Say WHICH way it went wrong: a pane that no longer exists, a
+        // pane that is not focused, and a shell that is busy all look
+        // identical from the marker count alone.
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n")) |l| {
+            defer allocator.free(l);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: tabs at copy-mode entry: %.*s\n", @as(c_int, @intCast(@min(l.len, 1200))), l.ptr);
+        }
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"get-text\",\"pane\":1}\n")) |t| {
+            defer allocator.free(t);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: pane 1 text: %.*s\n", @as(c_int, @intCast(@min(t.len, 1200))), t.ptr);
+        }
         return "the sample line never reached the shell";
+    }
     _ = app.waitIdle(300, 5_000);
 
     // WHERE the output line sits relative to the cursor is the user's
