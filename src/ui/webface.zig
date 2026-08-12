@@ -226,6 +226,7 @@ const urlhost = @import("../web/urlhost.zig");
 const omnibox = @import("omnibox.zig");
 const axtree = @import("../web/axtree.zig");
 const webproj = @import("../a11y/webproj.zig");
+const a11ydetect = @import("../a11y/detect.zig");
 const webremote = @import("webremote.zig");
 const webgroup = @import("webgroup.zig");
 const zpool = @import("../wlhost/zpool.zig");
@@ -615,6 +616,9 @@ pub const Client = struct {
     /// older helper simply skips the unknown frame, so this flag only
     /// records what the face may expect back.
     cap_a11y: bool = false,
+    /// The helper streams `ev_a11y_caret`. Without it the projection
+    /// still serves Text, but with no caret for a braille display.
+    cap_a11y_caret: bool = false,
     /// The helper accepts `context_create`/`context_destroy` (per-tab
     /// identity contexts). An older helper ignores the frames and every
     /// view shares one cookie jar — silent, correct degradation.
@@ -1124,6 +1128,7 @@ pub const Client = struct {
                 self.cap_print_pdf = false;
                 self.cap_downloads = false;
                 self.cap_a11y = false;
+                self.cap_a11y_caret = false;
                 self.cap_contexts = false;
                 self.cap_userscripts = false;
                 self.cap_sitedata = false;
@@ -1136,6 +1141,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.cap_print_pdf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.cap_a11y_caret = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.cap_userscripts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.cap_sitedata = true;
@@ -1239,6 +1245,14 @@ pub const Client = struct {
             .ev_a11y_loc => {
                 const ev = proto.decode(proto.EvA11yLoc, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onAxLoc(ev);
+            },
+            .ev_a11y_caret => {
+                const ev = proto.decode(proto.EvA11yCaret, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onAxCaret(ev);
+            },
+            .ev_a11y_event => {
+                const ev = proto.decode(proto.EvA11yEvent, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onAxEvent(ev);
             },
             .sem_snapshot => {
                 const ev = proto.decode(proto.SemSnapshot, frame.payload) catch return;
@@ -3842,26 +3856,43 @@ pub const WebFace = struct {
 
     // ---- accessibility (capability "a11y") --------------------------
     //
-    // Read-only projection, gated by SKETERM_WEB_A11Y=1: the helper
-    // streams the page's AX tree only after `a11y_enable` (engine-side
-    // accessibility costs real CPU), a mirrored tree (web/axtree.zig)
-    // lives on this face, and a11y/webproj.zig registers it on the
-    // session's accessibility bus as its own accessible application.
-    // The env flag IS the "a client asked" signal for now; screen-
-    // reader auto-detection (org.a11y.Status) and focus/action/caret
-    // projection are the documented follow-ups.
+    // The helper streams the page's AX tree only after `a11y_enable`
+    // (engine-side accessibility costs real CPU), a mirrored tree
+    // (web/axtree.zig) lives on this face, and a11y/webproj.zig
+    // registers it on the session's accessibility bus as its own
+    // accessible application, emitting focus/caret/object events and
+    // serving Action and Text.
     //
-    // The bus connect (SASL auth + GetAddress + Socket.Embed) is
-    // blocking IO, so it runs on a short-lived DETACHED worker that
-    // touches no GTK/face state and hands back through g_idle_add;
-    // only the handback frees the job, and it resolves the face
-    // through the client's faces list (pointer identity, deref only
-    // after match) so a face that died mid-connect just costs the
-    // worker its work.
+    // WHETHER TO RUN AT ALL is decided by a11y/detect.zig, which asks
+    // the desktop (org.a11y.Status) whether a screen reader is there;
+    // SKETERM_WEB_A11Y overrides it in both directions. Never infer it
+    // from "an a11y bus exists" — letting the ENGINE make that call is
+    // exactly what made every page serialize its tree (669f208), which
+    // is why the helper sets the CEF state explicitly on both edges.
+    //
+    // The detection probe AND the bus connect (SASL auth + GetAddress
+    // + Socket.Embed) are blocking IO, so both run on a short-lived
+    // DETACHED worker that touches no GTK/face state and hands back
+    // through g_idle_add; only the handback frees the job, and it
+    // resolves the face through the client's faces list (pointer
+    // identity, deref only after match) so a face that died
+    // mid-connect just costs the worker its work.
+    //
+    // A "no reader" answer is remembered for `ax_reprobe_ms` so that
+    // minting views does not spawn a probe thread each time, but it is
+    // NOT cached forever: a user who starts Orca while sketerm is
+    // running gets the projection at the next view mint after that
+    // window, with no restart.
 
-    fn a11yWanted() bool {
-        const v = c.getenv("SKETERM_WEB_A11Y") orelse return false;
-        return v[0] != 0 and v[0] != '0';
+    /// Main-thread only (written from the g_idle handback, read from
+    /// `ensureA11y`), so no atomics are needed.
+    var g_ax_off_until_ms: i64 = 0;
+    const ax_reprobe_ms: i64 = 30_000;
+
+    fn axNowMs() i64 {
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+        return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
     }
 
     const AxJob = struct {
@@ -3873,6 +3904,7 @@ pub const WebFace = struct {
         tree: *axtree.Tree,
         proj: *webproj.Proj,
         ok: bool = false,
+        reason: a11ydetect.Reason = .unavailable,
 
         fn discard(self: *AxJob) void {
             self.proj.deinit();
@@ -3886,7 +3918,11 @@ pub const WebFace = struct {
     /// stream. Safe against an old helper: an unknown `a11y_enable`
     /// frame is skipped by the reader, so nothing ever answers.
     fn ensureA11y(self: *WebFace) void {
-        if (!a11yWanted() or self.attached or self.widgets_dead) return;
+        if (self.attached or self.widgets_dead) return;
+        // A forced-off override needs no probe and no worker at all.
+        if (a11ydetect.override()) |o| {
+            if (!o.enabled()) return;
+        } else if (axNowMs() < g_ax_off_until_ms) return;
         if (self.ax_proj != null) {
             // A fresh helper connection knows nothing of the earlier
             // enable; the projection itself survives helper restarts.
@@ -3926,8 +3962,12 @@ pub const WebFace = struct {
     }
 
     /// WORKER THREAD: blocking bus IO only; no GTK, no face state.
+    /// Detection runs HERE rather than in `ensureA11y` because it is a
+    /// D-Bus round trip, and the main loop must never wait on one.
     fn axConnectWorker(job: *AxJob) void {
-        job.ok = if (job.proj.connect(null)) |_| true else |_| false;
+        job.reason = a11ydetect.detect(job.gpa);
+        job.ok = job.reason.enabled() and
+            if (job.proj.connect(null)) |_| true else |_| false;
         _ = c.g_idle_add(@ptrCast(&axConnectDone), job);
     }
 
@@ -3948,6 +3988,10 @@ pub const WebFace = struct {
         };
         face.ax_connecting = false;
         if (!job.ok) {
+            // No reader (or the bus refused us): back off so minting
+            // views does not spawn a probe thread apiece, but let the
+            // window expire so a reader started later is still found.
+            if (!job.reason.enabled()) g_ax_off_until_ms = axNowMs() + ax_reprobe_ms;
             job.discard();
             return 0;
         }
@@ -3960,8 +4004,40 @@ pub const WebFace = struct {
             face,
         );
         if (face.title) |t| job.proj.setAppName(t);
+        // The projection cannot reach the engine; this is its route.
+        job.proj.setActionHook(face, axDoAction);
         face.cl.post(proto.A11yEnable{ .view = face.view, .enabled = 1 });
         return 0;
+    }
+
+    /// A screen reader pressed a projected node. Runs on the MAIN
+    /// thread (from `proj.step` under the fd watch), so `ctx` is the
+    /// live face that owns the watch.
+    ///
+    /// The press becomes a real pointer event at the node's centre —
+    /// the same `input_pointer` frames a human click posts, landing on
+    /// the same `send_mouse_click_event` in the helper. It is
+    /// deliberately NOT a DOM `click()`: a synthetic DOM event is not
+    /// user-activated, so it cannot open a popup, start media, or
+    /// enter fullscreen, and pages routinely reject it.
+    fn axDoAction(ctx: ?*anyopaque, req: webproj.ActionReq) bool {
+        const self = cast.userData(WebFace, ctx);
+        if (!self.view_live or self.widgets_dead) return false;
+        // Page-space CSS pixels already; `sendPointer` would subtract
+        // the pixel-grid nudge a second time, so post directly.
+        for ([_]proto.PointerKind{ .move, .down, .up }) |kind| {
+            self.cl.post(proto.InputPointer{
+                .view = self.view,
+                .kind = @intFromEnum(kind),
+                .x = req.x,
+                .y = req.y,
+                .button = 0,
+                .clicks = 1,
+                .mods = 0,
+            });
+        }
+        self.promote();
+        return true;
     }
 
     fn onAxBusReadable(_: c_int, cond: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -3999,14 +4075,38 @@ pub const WebFace = struct {
         }
     }
 
+    // Every apply is followed by `publish`, which diffs against what
+    // the bus was last told and emits only real changes — that is what
+    // turns the projection from "re-walk to notice" into "the reader
+    // is told".
+
     pub fn onAxTree(self: *WebFace, ev: proto.EvA11yTree) void {
         const t = self.ax_tree orelse return;
         t.applyTree(ev) catch {};
+        if (self.ax_proj) |p| p.publish();
     }
 
     pub fn onAxLoc(self: *WebFace, ev: proto.EvA11yLoc) void {
         const t = self.ax_tree orelse return;
         t.applyLoc(ev) catch {};
+        // Geometry only: no structural or focus change to announce, and
+        // scrolling produces these at frame rate.
+    }
+
+    pub fn onAxCaret(self: *WebFace, ev: proto.EvA11yCaret) void {
+        const t = self.ax_tree orelse return;
+        t.applyCaret(ev);
+        if (self.ax_proj) |p| p.publish();
+    }
+
+    /// A discrete engine event. The tree frame that accompanies a focus
+    /// move already carries `focus_id`, so this is the path that
+    /// catches a focus change the engine reports WITHOUT a tree
+    /// update; `publish` deduplicates either way.
+    pub fn onAxEvent(self: *WebFace, ev: proto.EvA11yEvent) void {
+        const t = self.ax_tree orelse return;
+        if (std.mem.eql(u8, ev.event, "focus") and ev.id != 0) t.focus_id = ev.id;
+        if (self.ax_proj) |p| p.publish();
     }
 
     fn setStatus(self: *WebFace, text: []const u8, retryable: bool) void {
