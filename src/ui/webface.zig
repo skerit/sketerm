@@ -6102,6 +6102,7 @@ pub const WebFace = struct {
                 cont.item(classicmenu.escapeLabel(ctn.name, &lbuf), &onMenuOpenInContainer, rc);
             }
         }
+        tabs.itemIcon("Containersâ¦", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
 
         const x: f64 = @floatFromInt(ev.x + @as(i32, self.snap_dx));
         const y: f64 = @floatFromInt(ev.y + @as(i32, self.snap_dy));
@@ -6122,6 +6123,11 @@ pub const WebFace = struct {
     fn onMenuIncognito(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const win = cast.userData(MenuCtx, user).face.ownerWindow() orelse return;
         win.newIncognitoWebTab() catch {};
+    }
+
+    fn onMenuContainers(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(MenuCtx, user).face.ownerWindow() orelse return;
+        @import("webcontainers.zig").openManager(win);
     }
 
     fn onMenuExtensions(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -6328,6 +6334,7 @@ pub const WebFace = struct {
                 cont.item(classicmenu.escapeLabel(ctn.name, &lbuf), &onMenuOpenInContainer, rc);
             }
         }
+        tabs.itemIcon("Containersâ¦", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
         tabs.itemIconEnabled(
             "Show This Pane's Shell",
             .{ .name = "sketerm-terminal-symbolic" },
