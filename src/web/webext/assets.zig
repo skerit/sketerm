@@ -1,18 +1,28 @@
 //! Serving one extension's unpacked directory over
-//! `chrome-extension://<host>/…`: url -> on-disk path, the escape
-//! rejection that makes that safe, MIME typing, and the
-//! `web_accessible_resources` gate.
+//! `sketerm-extension://<host>/…` (Chromium owns the
+//! `chrome-extension` name and refuses to register it — see
+//! src/web/CLAUDE.md): url -> on-disk path, the escape rejection that
+//! makes that safe, MIME typing, and the `web_accessible_resources`
+//! gate.
 //!
 //! Pure std, no CEF, no GTK, no allocator: compiled into the helper AND
 //! both test roots. It is deliberately allocation-free because the
 //! scheme handler's factory runs on CEF's IO THREAD, where the rest of
 //! this subsystem also refuses to allocate.
 //!
-//! The escape rejection is the security property. A page can name any
-//! path it likes in a `chrome-extension://` url, so `resolve` walks the
-//! percent-decoded segments and REJECTS on the first `..` rather than
-//! normalising it away — a normalising resolver has to be right about
-//! symlinks too, and refusing is right about both.
+//! The escape rejection is the security property, and ANY web page can
+//! name a path here, so treat it as hostile input. `resolve` splits on
+//! the raw '/', decodes each segment, and refuses a segment that is
+//! `..` OR that still contains a separator after decoding — rather
+//! than normalising anything away, since a normalising resolver has to
+//! be right about symlinks too and refusing is right about both.
+//!
+//! Both halves are load-bearing. Rejecting only whole-segment `..` let
+//! `%2e%2e%2f%2e%2e%2fetc%2fpasswd` — one raw segment — decode straight
+//! into the joined path, and the reply carries
+//! `Access-Control-Allow-Origin: *`, so that was an arbitrary local
+//! file read triggerable by any page on any site once one extension was
+//! installed. Do not drop the separator check.
 
 const std = @import("std");
 
@@ -63,6 +73,19 @@ pub fn resolve(dir: []const u8, url_path: []const u8, out: []u8) ResolveError![]
         var seg_buf: [MAX_PATH]u8 = undefined;
         const seg = percentDecode(raw, &seg_buf) catch return error.TooLong;
         if (seg.len == 0) continue;
+        // A SEPARATOR THAT SURVIVED DECODING IS AN ESCAPE ATTEMPT.
+        //
+        // The split above is on the RAW path, so a segment spelled
+        // `%2e%2e%2f%2e%2e%2fetc%2fpasswd` arrives here as ONE segment
+        // and decodes to `../../etc/passwd` — which equals neither "."
+        // nor "..", so the two checks below would wave it through and
+        // the whole string would be memcpy'd into the on-disk path.
+        // Chromium keeps %2F escaped in a standard scheme's path, so
+        // this reaches us verbatim from any page that can name the url.
+        // Rejecting a decoded '/' outright is what makes the per-segment
+        // `..` test mean what the header claims it means; decoding a
+        // separator into a separator is also what no browser does.
+        if (std.mem.indexOfScalar(u8, seg, '/') != null) return error.Escapes;
         if (std.mem.eql(u8, seg, ".")) continue;
         if (std.mem.eql(u8, seg, "..")) return error.Escapes;
         if (std.mem.indexOfScalar(u8, seg, 0) != null) return error.Escapes;
@@ -74,7 +97,16 @@ pub fn resolve(dir: []const u8, url_path: []const u8, out: []u8) ResolveError![]
         any = true;
     }
     if (!any) return error.Empty;
-    return out[0..n];
+    // Backstop, deliberately an explicit branch rather than an assert:
+    // this tree builds ReleaseFast only, where `std.debug.assert`
+    // compiles away. The per-segment checks above already make this
+    // unreachable; it stays so that a future edit to them fails CLOSED
+    // instead of quietly reopening a file read.
+    const joined = out[0..n];
+    if (!std.mem.startsWith(u8, joined, dir)) return error.Escapes;
+    if (std.mem.indexOf(u8, joined[dir.len..], "/../") != null) return error.Escapes;
+    if (std.mem.endsWith(u8, joined, "/..")) return error.Escapes;
+    return joined;
 }
 
 fn percentDecode(s: []const u8, out: []u8) error{TooLong}![]const u8 {
@@ -219,6 +251,41 @@ test "resolve REFUSES every escape, however spelled" {
     try t.expectError(error.Escapes, resolve("/ext", "/a%00b/../x", &buf));
     try t.expectError(error.Empty, resolve("/ext", "/", &buf));
     try t.expectError(error.Empty, resolve("/ext", "", &buf));
+
+    // ENCODED SEPARATORS. The split runs on the RAW path, so each of
+    // these is ONE segment that only becomes an escape after decoding.
+    // Every spelling below reached open() before 2026-08-12, with the
+    // reply carrying `Access-Control-Allow-Origin: *`; the test above
+    // passed the whole time because it spells every escape with a
+    // literal '/'. Chromium does not unescape %2F in a standard
+    // scheme's path, so these arrive here exactly as written.
+    try t.expectError(error.Escapes, resolve("/ext", "/%2e%2e%2f%2e%2e%2fetc%2fpasswd", &buf));
+    try t.expectError(error.Escapes, resolve("/ext", "/%2E%2E%2F%2E%2E%2Fetc", &buf));
+    try t.expectError(error.Escapes, resolve("/ext", "/war/..%2f..%2f..%2fetc%2fpasswd", &buf));
+    // A leading `.` makes every intermediate component exist, so this
+    // spelling resolves even when the attacker knows no subdirectory.
+    try t.expectError(error.Escapes, resolve("/ext", "/%2e%2f%2e%2e%2f%2e%2e%2fhome", &buf));
+    // A bare encoded separator with no dots is still not ours to join.
+    try t.expectError(error.Escapes, resolve("/ext", "/a%2fb", &buf));
+}
+
+test "resolve never returns a path outside the package directory" {
+    // Property check over the shapes an attacker controls, rather than
+    // a list of spellings someone remembered: whatever comes back must
+    // live under `dir`.
+    var buf: [512]u8 = undefined;
+    const dir = "/ext";
+    const paths = [_][]const u8{
+        "/js/start.js",      "/a%20b.js",                    "/./x",
+        "/%2e%2e%2fetc",     "/..%2f..%2fetc",               "/%2e%2e/etc",
+        "/a/%2E%2E/%2E%2E/x", "/war/%2e%2f%2e%2e%2f%2e%2e%2fetc", "/a%2fb",
+        "//x//y",            "/%00",                         "/....//x",
+    };
+    for (paths) |p| {
+        const got = resolve(dir, p, &buf) catch continue;
+        try t.expect(std.mem.startsWith(u8, got, dir ++ "/"));
+        try t.expect(std.mem.indexOf(u8, got, "/../") == null);
+    }
 }
 
 test "resolve refuses an embedded NUL" {
