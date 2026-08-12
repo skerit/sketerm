@@ -3871,6 +3871,9 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .rename_tab => self.renameCurrentTab(),
         .color_tab => self.chooseTabColor(),
         .pin_tab => self.togglePinCurrentTab(),
+        .toggle_tab_sidebar => self.toggleTabSidebarVisibility(),
+        .tab_collapse => self.collapseCurrentTab(true),
+        .tab_expand => self.collapseCurrentTab(false),
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("split_h", err),
         .split_v => self.splitFocused(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch |err| logActionError("split_v", err),
         .files_browse_here => if (self.focusedPane()) |p| self.openBrowserHere(p, null) catch |err|

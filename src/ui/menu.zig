@@ -32,6 +32,12 @@ pub const Action = enum {
     rename_tab,
     color_tab,
     pin_tab,
+    /// Tree-style tabs: the sidebar itself, and folding the selected
+    /// tab's children away. Bindable from the palette too, but a
+    /// feature nobody can find is a feature nobody has.
+    toggle_tab_sidebar,
+    tab_collapse,
+    tab_expand,
     split_h,
     split_v,
     files_browse_here,
@@ -164,6 +170,9 @@ const MENU = [_]Item{
         .{ .name = "rename-tab", .label = "Rename Tab…", .detailed = "term.rename-tab", .icon = "document-edit-symbolic", .action = .rename_tab },
         .{ .name = "color-tab", .label = "Tab Colour…", .detailed = "term.color-tab", .icon = "color-select-symbolic", .action = .color_tab },
         .{ .name = "pin-tab", .label = "Pin / Unpin Tab", .detailed = "term.pin-tab", .icon = "view-pin-symbolic", .action = .pin_tab },
+        .{ .name = "toggle-tab-sidebar", .label = "Tab Tree Sidebar", .detailed = "term.toggle-tab-sidebar", .icon = "sidebar-show-symbolic", .action = .toggle_tab_sidebar },
+        .{ .name = "tab-collapse", .label = "Collapse Tab Subtree", .detailed = "term.tab-collapse", .icon = "pan-end-symbolic", .action = .tab_collapse },
+        .{ .name = "tab-expand", .label = "Expand Tab Subtree", .detailed = "term.tab-expand", .icon = "pan-down-symbolic", .action = .tab_expand },
         .{ .name = "close-tab", .label = "Close Tab", .detailed = "term.close-tab", .icon = "window-close-symbolic", .action = .close_tab },
     } } },
     .separator,

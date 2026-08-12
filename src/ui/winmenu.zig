@@ -69,6 +69,12 @@ pub fn show(win: *Window, anchor: *c.GtkWidget) void {
     row(tabs, win, .duplicate_tab, has_pane);
     row(tabs, win, .rename_tab, has_pane);
     row(tabs, win, .close_tab, has_pane);
+    // Tree-style tabs. The sidebar toggle works with no pane at all;
+    // collapse/expand act on the selected tab, so they follow it.
+    const tree = m.section();
+    row(tree, win, .toggle_tab_sidebar, true);
+    row(tree, win, .tab_collapse, has_pane);
+    row(tree, win, .tab_expand, has_pane);
 
     const panes = m.section();
     row(panes, win, .split_h, has_pane);
