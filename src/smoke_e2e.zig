@@ -763,6 +763,13 @@ pub fn main() u8 {
 
         if (kittyKbdStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("kitty keyboard protocol encodes real key events correctly");
+
+        // The tree-style tab sidebar is the BROWSER's tab surface while
+        // it is open: new tabs become pages of the browser, not window
+        // tabs. Runs before copy mode so a failure there (a known,
+        // unrelated red stage) does not hide this one.
+        if (treeSidebarStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("tree sidebar: open, new_tab made a browser PAGE; closed, new_tab made a window tab");
         if (copyModeStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("copy mode selected a word with vi motions and yanked it to the clipboard");
         if (hintsStage(allocator, app, sock_path)) |why| return failMsg(why);
@@ -1542,6 +1549,250 @@ fn writePng(path: [*:0]const u8, bytes: []const u8) void {
     const f = c.fopen(path, "wb") orelse return;
     _ = c.fwrite(bytes.ptr, 1, bytes.len, f);
     _ = c.fclose(f);
+}
+
+/// Right edge, in window pixels, of the widest accent-coloured run in
+/// the window's left third — i.e. the SELECTED tree-sidebar row's chip,
+/// which spans the sidebar's width. 0 when nothing accent-like is
+/// there, which is itself a failure worth reporting.
+///
+/// Pixels arrive as Wayland ARGB/XRGB8888, little-endian, so the bytes
+/// are B,G,R,A. libadwaita's selection blue is far more blue than red;
+/// the terminal's own colours in this rig are not.
+fn sidebarChipRight(app: *appdrive.App, win_id: u32) usize {
+    for (app.windows.items) |w| {
+        if (w.id != win_id) continue;
+        if (w.w <= 0 or w.h <= 0) return 0;
+        const width: usize = @intCast(w.w);
+        const height: usize = @intCast(w.h);
+        const px = w.pixels.items;
+        if (px.len < width * height * 4) return 0;
+        const limit = width / 3;
+        var best: usize = 0;
+        var y: usize = 0;
+        while (y < height) : (y += 1) {
+            const row = y * width * 4;
+            var x: usize = 0;
+            while (x < limit) : (x += 1) {
+                const i = row + x * 4;
+                const b: i32 = px[i];
+                const g: i32 = px[i + 1];
+                const r: i32 = px[i + 2];
+                if (b > 150 and b - r > 70 and g < b) {
+                    if (x > best) best = x;
+                }
+            }
+        }
+        return best;
+    }
+    return 0;
+}
+
+/// Count `"pane":N` occurrences in a `web-list` reply: how many browser
+/// PAGES live on that pane. One row per page is the contract.
+fn webViewsOnPane(resp: []const u8, pane: u32) usize {
+    var needle_buf: [32]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"pane\":{d},", .{pane}) catch return 0;
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, resp, from, needle)) |at| : (from = at + needle.len) n += 1;
+    return n;
+}
+
+fn countTabs(resp: []const u8) usize {
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, resp, from, "\"panes\":[")) |at| : (from = at + 9) n += 1;
+    return n;
+}
+
+/// Tree-style tabs, browser scope: while the sidebar is open it is the
+/// browser's OWN tab surface, so "new tab" inside a browser opens a
+/// PAGE in that browser rather than another window tab; with the
+/// sidebar closed the same action opens a window tab as it always did.
+///
+/// The browser helper is deliberately not needed: a web face exists (and
+/// groups) whether or not CEF ever connects, so this rig — which links
+/// no CEF — still covers the whole grouping and routing path.
+fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    _ = app.drainLive(1_000);
+
+    const tabs_before = blk: {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed before the tree-sidebar stage";
+        defer allocator.free(r);
+        break :blk countTabs(r);
+    };
+
+    // A browser tab, then find the pane its web face landed on.
+    const open = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"new_web_tab\"}\n") orelse
+        return "new_web_tab action roundtrip failed";
+    allocator.free(open);
+    _ = app.waitIdle(300, 5_000);
+
+    var web_pane: u32 = 0;
+    var tries: u32 = 0;
+    while (tries < 50) : (tries += 1) {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse continue;
+        defer allocator.free(r);
+        if (std.mem.indexOf(u8, r, "\"pane\":")) |at| {
+            const rest = r[at + 7 ..];
+            const end = std.mem.indexOfScalar(u8, rest, ',') orelse continue;
+            web_pane = std.fmt.parseInt(u32, rest[0..end], 10) catch continue;
+            break;
+        }
+        _ = app.pumpOnce(100);
+    } else return "no web view appeared after new_web_tab";
+    if (web_pane == 0) return "web-list reported no pane id for the new browser";
+
+    // ── sidebar CLOSED: new_tab is a WINDOW tab ────────────────
+    const before_closed = blk: {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed";
+        defer allocator.free(r);
+        break :blk countTabs(r);
+    };
+    const nt1 = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"new_tab\"}\n") orelse
+        return "new_tab action roundtrip failed";
+    allocator.free(nt1);
+    _ = app.waitIdle(300, 5_000);
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed after new_tab";
+        defer allocator.free(r);
+        if (countTabs(r) != before_closed + 1)
+            return "with the tree sidebar closed, new_tab did not open a window tab";
+    }
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
+            return "web-list roundtrip failed";
+        defer allocator.free(r);
+        if (webViewsOnPane(r, web_pane) != 1)
+            return "with the tree sidebar closed, new_tab added a page to the browser";
+    }
+
+    // ── sidebar OPEN: new_tab is a PAGE of the browser ─────────
+    // Focus has to be back on the browser pane: the sidebar lists the
+    // FOCUSED pane's browser, and the window tab opened above stole it.
+    var fbuf: [96]u8 = undefined;
+    const focus_cmd = std.fmt.bufPrint(&fbuf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{web_pane}) catch
+        return "building the focus command failed";
+    if (roundtrip(allocator, sock_path, focus_cmd)) |r| allocator.free(r) else return "focus roundtrip failed";
+    _ = app.waitIdle(300, 5_000);
+
+    const toggle = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"toggle_tab_sidebar\"}\n") orelse
+        return "toggle_tab_sidebar roundtrip failed";
+    allocator.free(toggle);
+    _ = app.waitIdle(400, 5_000);
+
+    const tabs_with_sidebar = blk: {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed with the sidebar open";
+        defer allocator.free(r);
+        break :blk countTabs(r);
+    };
+
+    const nt2 = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"new_tab\"}\n") orelse
+        return "new_tab action roundtrip failed with the sidebar open";
+    allocator.free(nt2);
+    _ = app.waitIdle(400, 8_000);
+
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
+            return "web-list roundtrip failed with the sidebar open";
+        defer allocator.free(r);
+        const n = webViewsOnPane(r, web_pane);
+        if (n != 2) {
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: web-list was: %.*s\n", @as(c_int, @intCast(@min(r.len, 1500))), r.ptr);
+            return "with the tree sidebar open, new_tab did not open a second PAGE in the browser";
+        }
+    }
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed after the in-browser new tab";
+        defer allocator.free(r);
+        if (countTabs(r) != tabs_with_sidebar)
+            return "with the tree sidebar open, new_tab ALSO opened a window tab";
+    }
+
+    // A PNG of the window with the sidebar showing its rows — the
+    // artefact a human reviews for the styling and the indent.
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = app.windows.items[0].id;
+    _ = app.waitVisualSettle(win_id, 300, 5_000, 0.002, null);
+    if (app.screenshotPng(win_id, 1400, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("/tmp/sketerm-e2e-tab-sidebar.png", shot.png);
+    } else |_| {}
+
+    // ── the divider resizes, and the width is remembered ───────
+    // The sidebar is measured from its selected row's chip rather than
+    // guessed at, so the drag starts on the divider by construction.
+    const width_before = sidebarChipRight(app, win_id);
+    if (width_before == 0) return "no selected sidebar row was visible to measure";
+    const had_config = blk: {
+        var pbuf: [512:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break :blk true;
+        break :blk c.access(p.ptr, c.F_OK) == 0;
+    };
+    const grab_x = @as(f64, @floatFromInt(width_before + 8));
+    const mid_y = @as(f64, @floatFromInt(app.windows.items[0].h)) * 0.6;
+    app.drag(win_id, grab_x, mid_y, grab_x + 90, mid_y, 1) catch
+        return "dragging the sidebar divider failed";
+    _ = app.waitIdle(300, 5_000);
+
+    var width_after: usize = 0;
+    var wtries: u32 = 0;
+    while (wtries < 40) : (wtries += 1) {
+        width_after = sidebarChipRight(app, win_id);
+        if (width_after >= width_before + 60) break;
+        _ = app.pumpOnce(100);
+    }
+    if (width_after < width_before + 60) {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: sidebar chip right %zu -> %zu\n", width_before, width_after);
+        return "dragging the divider did not widen the tree sidebar";
+    }
+
+    // The drag is debounced into ONE config write; the key must land.
+    var saw_width = false;
+    var ctries: u32 = 0;
+    while (ctries < 60) : (ctries += 1) {
+        _ = app.pumpOnce(100);
+        var pbuf: [512:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break;
+        if (readFileAlloc(allocator, p)) |body| {
+            defer allocator.free(body);
+            if (std.mem.indexOf(u8, body, "tab_sidebar_width = ") != null) {
+                saw_width = true;
+                break;
+            }
+        }
+    }
+    if (!saw_width) return "the dragged sidebar width was never written to config.conf";
+    // Put the config directory back the way the later config stages
+    // expect it (step 1 of configReloadStage is the CREATE path).
+    if (!had_config) {
+        var pbuf: [512:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch null) |p|
+            _ = c.unlink(p.ptr);
+    }
+
+    // Put the window back the way the later stages expect it.
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"toggle_tab_sidebar\"}\n")) |r|
+        allocator.free(r)
+    else
+        return "toggle_tab_sidebar (off) roundtrip failed";
+    _ = app.waitIdle(300, 5_000);
+    var closes: usize = 0;
+    while (closes < 8) : (closes += 1) {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse break;
+        const n = countTabs(r);
+        allocator.free(r);
+        if (n <= tabs_before) break;
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"close_tab\"}\n")) |cr| allocator.free(cr);
+        _ = app.waitIdle(200, 4_000);
+    }
+    return null;
 }
 
 /// The project layer on a document served over `ssh localhost` — the
@@ -6724,6 +6975,23 @@ fn writeFile(path: [:0]const u8, body: []const u8) bool {
     const fp = c.fopen(path.ptr, "wb") orelse return false;
     defer _ = c.fclose(fp);
     return c.fwrite(body.ptr, 1, body.len, fp) == body.len;
+}
+
+/// Whole small file, or null when it does not exist / cannot be read.
+fn readFileAlloc(allocator: std.mem.Allocator, path: [:0]const u8) ?[]u8 {
+    const fp = c.fopen(path.ptr, "rb") orelse return null;
+    defer _ = c.fclose(fp);
+    var out: std.ArrayList(u8) = .empty;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, fp);
+        if (n == 0) break;
+        out.appendSlice(allocator, buf[0..n]) catch {
+            out.deinit(allocator);
+            return null;
+        };
+    }
+    return out.toOwnedSlice(allocator) catch null;
 }
 
 fn waitPaneText(
