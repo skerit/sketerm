@@ -73,6 +73,29 @@ pub const Store = struct {
         return aw.toOwnedSlice();
     }
 
+    /// Answer a `get` whose argument was an OBJECT: its keys are the
+    /// wanted keys and its values are DEFAULTS for the ones not stored.
+    ///
+    /// This is the form every real extension uses on first run — uBO's
+    /// whole settings bootstrap is one `get(µb.userSettings)` — and
+    /// treating it as a bare key list (returning only stored keys) hands
+    /// back `{}` on a fresh profile, so every default silently becomes
+    /// `undefined` instead of the author's value.
+    pub fn getWithDefaults(self: *Store, gpa: std.mem.Allocator, defaults: std.json.ObjectMap) ![]u8 {
+        var aw: std.Io.Writer.Allocating = .init(gpa);
+        errdefer aw.deinit();
+        try aw.writer.writeByte('{');
+        var first = true;
+        var it = defaults.iterator();
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            const value = self.obj.get(key) orelse e.value_ptr.*;
+            try writePair(&aw.writer, &first, key, value);
+        }
+        try aw.writer.writeByte('}');
+        return aw.toOwnedSlice();
+    }
+
     /// Apply a `set`: merge every key/value of the JSON object `patch`
     /// into the store. Returns a `changes` object describing what moved
     /// (`{key:{oldValue,newValue}}`), the payload `storage.onChanged`
@@ -317,4 +340,45 @@ test "load tolerates corrupt bytes" {
     const got = try s.get(gpa, &.{});
     defer gpa.free(got);
     try t.expectEqualStrings("{}", got);
+}
+
+test "getWithDefaults returns the author's defaults on a fresh store" {
+    const gpa = t.allocator;
+    var s = Store.load(gpa, "");
+    defer s.deinit();
+    var defaults = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"advancedUserEnabled":false,"blockingProfiles":"11-17 11-3 11-1","maxLogged":25}
+    , .{});
+    defer defaults.deinit();
+
+    // THE first-run bug: read as a bare key list, this answers `{}`.
+    const bare = try s.get(gpa, &.{ "advancedUserEnabled", "maxLogged" });
+    defer gpa.free(bare);
+    try t.expectEqualStrings("{}", bare);
+
+    const got = try s.getWithDefaults(gpa, defaults.value.object);
+    defer gpa.free(got);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, got, .{});
+    defer parsed.deinit();
+    try t.expectEqual(false, parsed.value.object.get("advancedUserEnabled").?.bool);
+    try t.expectEqual(@as(i64, 25), parsed.value.object.get("maxLogged").?.integer);
+    try t.expectEqualStrings("11-17 11-3 11-1", parsed.value.object.get("blockingProfiles").?.string);
+}
+
+test "getWithDefaults prefers a stored value over the default" {
+    const gpa = t.allocator;
+    var s = Store.load(gpa, "{\"maxLogged\":9,\"extra\":1}");
+    defer s.deinit();
+    var defaults = try std.json.parseFromSlice(std.json.Value, gpa,
+        \\{"maxLogged":25,"unset":"fallback"}
+    , .{});
+    defer defaults.deinit();
+    const got = try s.getWithDefaults(gpa, defaults.value.object);
+    defer gpa.free(got);
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, got, .{});
+    defer parsed.deinit();
+    try t.expectEqual(@as(i64, 9), parsed.value.object.get("maxLogged").?.integer);
+    try t.expectEqualStrings("fallback", parsed.value.object.get("unset").?.string);
+    // A key not asked for stays out of the answer.
+    try t.expect(parsed.value.object.get("extra") == null);
 }

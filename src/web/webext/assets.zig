@@ -1,0 +1,230 @@
+//! Serving one extension's unpacked directory over
+//! `chrome-extension://<host>/…`: url -> on-disk path, the escape
+//! rejection that makes that safe, MIME typing, and the
+//! `web_accessible_resources` gate.
+//!
+//! Pure std, no CEF, no GTK, no allocator: compiled into the helper AND
+//! both test roots. It is deliberately allocation-free because the
+//! scheme handler's factory runs on CEF's IO THREAD, where the rest of
+//! this subsystem also refuses to allocate.
+//!
+//! The escape rejection is the security property. A page can name any
+//! path it likes in a `chrome-extension://` url, so `resolve` walks the
+//! percent-decoded segments and REJECTS on the first `..` rather than
+//! normalising it away — a normalising resolver has to be right about
+//! symlinks too, and refusing is right about both.
+
+const std = @import("std");
+
+/// Longest url path we will resolve; anything longer is refused rather
+/// than truncated (a truncated path could name a DIFFERENT file).
+pub const MAX_PATH = 1024;
+
+/// Strip a url down to its path component: scheme and host off the
+/// front, `?query` and `#fragment` off the back. Returns a slice of
+/// `url`, always starting at the first byte after the host.
+pub fn urlPath(url: []const u8) []const u8 {
+    var rest = url;
+    if (std.mem.indexOf(u8, rest, "://")) |i| {
+        rest = rest[i + 3 ..];
+        // Host runs to the next '/', '?' or '#'.
+        const slash = std.mem.indexOfAny(u8, rest, "/?#") orelse return "";
+        rest = rest[slash..];
+    }
+    if (std.mem.indexOfAny(u8, rest, "?#")) |i| rest = rest[0..i];
+    return rest;
+}
+
+/// The host component of `url`, empty when there is none.
+pub fn urlHost(url: []const u8) []const u8 {
+    const i = std.mem.indexOf(u8, url, "://") orelse return "";
+    const rest = url[i + 3 ..];
+    const end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    return rest[0..end];
+}
+
+pub const ResolveError = error{ TooLong, Escapes, Empty };
+
+/// Join `dir` and a url path into an absolute on-disk path in `out`.
+///
+/// Percent-decodes, collapses `//`, drops `.` segments and REFUSES any
+/// `..` segment or embedded NUL. Returns the slice used.
+pub fn resolve(dir: []const u8, url_path: []const u8, out: []u8) ResolveError![]const u8 {
+    if (url_path.len > MAX_PATH) return error.TooLong;
+    if (dir.len + url_path.len + 2 > out.len) return error.TooLong;
+    @memcpy(out[0..dir.len], dir);
+    var n = dir.len;
+    // Trailing slash on the dir would double up with the leading one.
+    while (n > 1 and out[n - 1] == '/') n -= 1;
+
+    var it = std.mem.splitScalar(u8, url_path, '/');
+    var any = false;
+    while (it.next()) |raw| {
+        var seg_buf: [MAX_PATH]u8 = undefined;
+        const seg = percentDecode(raw, &seg_buf) catch return error.TooLong;
+        if (seg.len == 0) continue;
+        if (std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) return error.Escapes;
+        if (std.mem.indexOfScalar(u8, seg, 0) != null) return error.Escapes;
+        if (n + 1 + seg.len > out.len) return error.TooLong;
+        out[n] = '/';
+        n += 1;
+        @memcpy(out[n..][0..seg.len], seg);
+        n += seg.len;
+        any = true;
+    }
+    if (!any) return error.Empty;
+    return out[0..n];
+}
+
+fn percentDecode(s: []const u8, out: []u8) error{TooLong}![]const u8 {
+    if (s.len > out.len) return error.TooLong;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '%' and i + 2 < s.len) {
+            const hi = std.fmt.charToDigit(s[i + 1], 16) catch {
+                out[n] = s[i];
+                n += 1;
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(s[i + 2], 16) catch {
+                out[n] = s[i];
+                n += 1;
+                i += 1;
+                continue;
+            };
+            out[n] = @as(u8, hi) << 4 | lo;
+            n += 1;
+            i += 3;
+            continue;
+        }
+        out[n] = s[i];
+        n += 1;
+        i += 1;
+    }
+    return out[0..n];
+}
+
+/// MIME type for an extension asset. Getting `text/javascript` right is
+/// load-bearing rather than cosmetic: Chromium REFUSES to evaluate a
+/// `<script type="module">` served with any other type, so a wrong
+/// answer here silently kills every ES-module background page.
+pub fn mimeFor(path: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.') orelse return "application/octet-stream";
+    const ext = path[dot + 1 ..];
+    const map = .{
+        .{ "html", "text/html" },
+        .{ "htm", "text/html" },
+        .{ "js", "text/javascript" },
+        .{ "mjs", "text/javascript" },
+        .{ "json", "application/json" },
+        .{ "css", "text/css" },
+        .{ "svg", "image/svg+xml" },
+        .{ "png", "image/png" },
+        .{ "jpg", "image/jpeg" },
+        .{ "jpeg", "image/jpeg" },
+        .{ "gif", "image/gif" },
+        .{ "webp", "image/webp" },
+        .{ "ico", "image/x-icon" },
+        .{ "woff", "font/woff" },
+        .{ "woff2", "font/woff2" },
+        .{ "ttf", "font/ttf" },
+        .{ "otf", "font/otf" },
+        .{ "wasm", "application/wasm" },
+        .{ "txt", "text/plain" },
+        .{ "xml", "text/xml" },
+        .{ "webmanifest", "application/manifest+json" },
+    };
+    inline for (map) |pair| {
+        if (std.ascii.eqlIgnoreCase(ext, pair[0])) return pair[1];
+    }
+    return "application/octet-stream";
+}
+
+/// Whether a path is listed in `web_accessible_resources`. Only consulted
+/// for a load whose INITIATOR is not the extension itself; the extension's
+/// own pages may read anything in their own package.
+pub fn webAccessible(patterns: []const []const u8, path: []const u8) bool {
+    const clean = std.mem.trimStart(u8, path, "/");
+    for (patterns) |pat| {
+        if (globMatch(std.mem.trimStart(u8, pat, "/"), clean)) return true;
+    }
+    return false;
+}
+
+/// `*` matches any run of characters INCLUDING `/` — MV2's
+/// `web_accessible_resources` globs are path globs, not shell globs.
+fn globMatch(pat: []const u8, s: []const u8) bool {
+    if (pat.len == 0) return s.len == 0;
+    const star = std.mem.indexOfScalar(u8, pat, '*') orelse return std.mem.eql(u8, pat, s);
+    const head = pat[0..star];
+    const tail = pat[star + 1 ..];
+    if (!std.mem.startsWith(u8, s, head)) return false;
+    const rest = s[head.len..];
+    if (tail.len == 0) return true;
+    var i: usize = 0;
+    while (i <= rest.len) : (i += 1) {
+        if (globMatch(tail, rest[i..])) return true;
+    }
+    return false;
+}
+
+// ─── tests ──────────────────────────────────────────────────────────
+
+const t = std.testing;
+
+test "urlPath / urlHost split a chrome-extension url" {
+    try t.expectEqualStrings("/js/start.js", urlPath("chrome-extension://abc123/js/start.js"));
+    try t.expectEqualStrings("abc123", urlHost("chrome-extension://abc123/js/start.js"));
+    try t.expectEqualStrings("/a", urlPath("chrome-extension://h/a?x=1#y"));
+    try t.expectEqualStrings("", urlPath("chrome-extension://h"));
+    try t.expectEqualStrings("h", urlHost("chrome-extension://h"));
+    try t.expectEqualStrings("/plain/path", urlPath("/plain/path"));
+}
+
+test "resolve joins, decodes and collapses" {
+    var buf: [512]u8 = undefined;
+    try t.expectEqualStrings("/ext/js/start.js", try resolve("/ext", "/js/start.js", &buf));
+    try t.expectEqualStrings("/ext/js/start.js", try resolve("/ext/", "//js//start.js", &buf));
+    try t.expectEqualStrings("/ext/a b.js", try resolve("/ext", "/a%20b.js", &buf));
+    try t.expectEqualStrings("/ext/js/start.js", try resolve("/ext", "/./js/./start.js", &buf));
+}
+
+test "resolve REFUSES every escape, however spelled" {
+    var buf: [512]u8 = undefined;
+    try t.expectError(error.Escapes, resolve("/ext", "/../etc/passwd", &buf));
+    try t.expectError(error.Escapes, resolve("/ext", "/js/../../etc/passwd", &buf));
+    // Percent-encoded `..` is decoded FIRST, so it is caught too — this
+    // is the bypass a normalise-then-check resolver would miss.
+    try t.expectError(error.Escapes, resolve("/ext", "/%2e%2e/etc/passwd", &buf));
+    try t.expectError(error.Escapes, resolve("/ext", "/a/%2E%2E/%2E%2E/etc", &buf));
+    try t.expectError(error.Escapes, resolve("/ext", "/a%00b/../x", &buf));
+    try t.expectError(error.Empty, resolve("/ext", "/", &buf));
+    try t.expectError(error.Empty, resolve("/ext", "", &buf));
+}
+
+test "resolve refuses an embedded NUL" {
+    var buf: [512]u8 = undefined;
+    try t.expectError(error.Escapes, resolve("/ext", "/a%00.js", &buf));
+}
+
+test "mimeFor: modules need text/javascript or Chromium refuses them" {
+    try t.expectEqualStrings("text/javascript", mimeFor("/js/start.js"));
+    try t.expectEqualStrings("text/javascript", mimeFor("/js/start.mjs"));
+    try t.expectEqualStrings("text/html", mimeFor("/background.html"));
+    try t.expectEqualStrings("application/json", mimeFor("/manifest.json"));
+    try t.expectEqualStrings("text/css", mimeFor("/a.CSS"));
+    try t.expectEqualStrings("application/octet-stream", mimeFor("/noext"));
+    try t.expectEqualStrings("application/octet-stream", mimeFor("/a.unknownthing"));
+}
+
+test "webAccessible globs cross directory separators" {
+    const pats = [_][]const u8{"/web_accessible_resources/*"};
+    try t.expect(webAccessible(&pats, "/web_accessible_resources/noop.js"));
+    try t.expect(webAccessible(&pats, "/web_accessible_resources/deep/noop.js"));
+    try t.expect(!webAccessible(&pats, "/js/start.js"));
+    const none = [_][]const u8{};
+    try t.expect(!webAccessible(&none, "/anything"));
+}

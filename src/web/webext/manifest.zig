@@ -65,6 +65,14 @@ pub const Manifest = struct {
     content_scripts: []ContentScript = &.{},
     background: ?Background = null,
     browser_action: ?BrowserAction = null,
+    /// `browser_specific_settings.gecko.id` (or the older
+    /// `applications.gecko.id`) — the author's own stable identity,
+    /// which is what an id should be derived from: it does not move
+    /// when the version does. Null for packages that declare none.
+    gecko_id: ?[]const u8 = null,
+    /// `web_accessible_resources` patterns, relative paths that a PAGE
+    /// (not just the extension) may load over `chrome-extension://`.
+    web_accessible_resources: [][]const u8 = &.{},
 
     pub fn deinit(self: *Manifest) void {
         self.arena.deinit();
@@ -152,6 +160,19 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) ParseError!Manifest {
         }
     }
 
+    // `browser_specific_settings` is the current spelling, `applications`
+    // the deprecated one; both carry the same `gecko.id`.
+    if (root.get("browser_specific_settings") orelse root.get("applications")) |bss| {
+        if (bss == .object) {
+            if (bss.object.get("gecko")) |g| {
+                if (g == .object) m.gecko_id = dupStr(a, g.object.get("id"));
+            }
+        }
+    }
+
+    // MV2 spells this as a bare array of path patterns.
+    m.web_accessible_resources = try dupStrArray(a, root.get("web_accessible_resources"));
+
     if (root.get("browser_action") orelse root.get("page_action")) |ba| {
         if (ba == .object) {
             const o = ba.object;
@@ -189,21 +210,71 @@ fn dupStrArray(a: std.mem.Allocator, val: ?std.json.Value) ParseError![][]const 
     return list.toOwnedSlice(a) catch return error.OutOfMemory;
 }
 
-/// A short, filesystem-safe id derived from the manifest when the
-/// package carries none (unpacked dirs frequently do not). Deterministic
-/// so re-loading the same extension keeps its storage. `out` must hold
-/// at least 16 bytes; returns the slice used.
-pub fn deriveId(name: []const u8, version: []const u8, out: []u8) []const u8 {
+/// Longest id we will mint or accept. Pinned to `webrequest.MAX_ID`,
+/// the fixed slot width the engine's IO thread reads ids out of.
+pub const MAX_ID_LEN = 64;
+
+/// The stable identity of an extension. **Never version-dependent**: a
+/// v1 and a v2 of the same package must land on the SAME id, or an
+/// upgrade mints a second registry entry, leaves the old copy enabled
+/// and injecting, and orphans `storage.local`.
+///
+/// Prefers the author's own `browser_specific_settings.gecko.id`; falls
+/// back to a hash of the NAME alone. `out` must hold `MAX_ID_LEN` bytes.
+pub fn extensionId(m: *const Manifest, out: []u8) []const u8 {
+    std.debug.assert(out.len >= MAX_ID_LEN);
+    if (m.gecko_id) |g| {
+        if (idUsable(g)) {
+            @memcpy(out[0..g.len], g);
+            return out[0..g.len];
+        }
+    }
+    return deriveId(m.name, out);
+}
+
+/// Whether a manifest-declared id can be used verbatim. It becomes a
+/// path component under the data dir and a key in a fixed-width slot
+/// table, so a separator or a control byte disqualifies it; everything
+/// else Gecko allows (`user@host`, `{uuid}`) is fine on both counts.
+fn idUsable(g: []const u8) bool {
+    if (g.len == 0 or g.len > MAX_ID_LEN) return false;
+    for (g) |ch| {
+        if (ch == '/' or ch == '\\' or ch < 0x21 or ch == 0x7f) return false;
+    }
+    // A leading dot would hide the directory and `..` would escape it.
+    if (g[0] == '.') return false;
+    return true;
+}
+
+/// A short, filesystem-safe id for a package that declares none.
+/// Deterministic AND version-independent, so re-loading or upgrading the
+/// same extension keeps its storage. `out` must hold >= 16 bytes.
+pub fn deriveId(name: []const u8, out: []u8) []const u8 {
     std.debug.assert(out.len >= 16);
-    var h = std.hash.Wyhash.init(0xE87E11D);
-    h.update(name);
-    h.update("@");
-    h.update(version);
+    return hex16(0xE87E11D, name, out);
+}
+
+/// The HOST half of this extension's `chrome-extension://<host>/` origin.
+///
+/// It is NOT the id: a Gecko id is `uBlock0@raymondhill.net` or
+/// `{7a7a4a92-…}`, and neither `@` nor `{}` may appear in a URL host —
+/// the first would parse as userinfo and the second is simply invalid.
+/// Firefox has exactly this split (a per-install UUID in the url, the
+/// author's id in `runtime.id`), so extensions already expect the two to
+/// differ. 16 lowercase hex digits, stable for a given id.
+pub fn originHost(id: []const u8, out: []u8) []const u8 {
+    std.debug.assert(out.len >= 16);
+    return hex16(0x0B18E17, id, out);
+}
+
+fn hex16(seed: u64, bytes: []const u8, out: []u8) []const u8 {
+    var h = std.hash.Wyhash.init(seed);
+    h.update(bytes);
     const digest = h.final();
-    const hex = "0123456789abcdef";
+    const hexd = "0123456789abcdef";
     var i: usize = 0;
     while (i < 16) : (i += 1) {
-        out[i] = hex[(digest >> @intCast((15 - i) * 4)) & 0xf];
+        out[i] = hexd[(digest >> @intCast((15 - i) * 4)) & 0xf];
     }
     return out[0..16];
 }
@@ -280,13 +351,84 @@ test "parse: rejects MV3 and missing fields" {
     try t.expectError(error.BadJson, parse(gpa, "not json"));
 }
 
-test "deriveId is stable and hex" {
+test "deriveId is stable, hex and version-independent" {
+    var a: [MAX_ID_LEN]u8 = undefined;
+    var b: [MAX_ID_LEN]u8 = undefined;
+    const id1 = deriveId("My Ext", &a);
+    const id2 = deriveId("My Ext", &b);
+    try t.expectEqualStrings(id1, id2);
+    try t.expect(!std.mem.eql(u8, id1, deriveId("Other Ext", &b)));
+    for (id1) |ch| try t.expect(std.ascii.isHex(ch));
+}
+
+test "extensionId prefers gecko.id and never moves with the version" {
+    const gpa = t.allocator;
+    var v1 = try parse(gpa,
+        \\{"manifest_version":2,"name":"uBlock Origin","version":"1.73.0",
+        \\ "browser_specific_settings":{"gecko":{"id":"uBlock0@raymondhill.net"}}}
+    );
+    defer v1.deinit();
+    var v2 = try parse(gpa,
+        \\{"manifest_version":2,"name":"uBlock Origin","version":"1.74.0",
+        \\ "browser_specific_settings":{"gecko":{"id":"uBlock0@raymondhill.net"}}}
+    );
+    defer v2.deinit();
+    var a: [MAX_ID_LEN]u8 = undefined;
+    var b: [MAX_ID_LEN]u8 = undefined;
+    try t.expectEqualStrings("uBlock0@raymondhill.net", extensionId(&v1, &a));
+    // THE upgrade defect: two versions must land on one id.
+    try t.expectEqualStrings(extensionId(&v1, &a), extensionId(&v2, &b));
+
+    // The deprecated `applications` spelling is honoured too.
+    var old = try parse(gpa,
+        \\{"manifest_version":2,"name":"X","version":"1",
+        \\ "applications":{"gecko":{"id":"{7a7a4a92-a2a0-41d1-9fd7-1e92480d612d}"}}}
+    );
+    defer old.deinit();
+    try t.expectEqualStrings("{7a7a4a92-a2a0-41d1-9fd7-1e92480d612d}", extensionId(&old, &a));
+
+    // No gecko id: a version-independent hash of the name.
+    var bare1 = try parse(gpa,
+        \\{"manifest_version":2,"name":"Bare","version":"1.0"}
+    );
+    defer bare1.deinit();
+    var bare2 = try parse(gpa,
+        \\{"manifest_version":2,"name":"Bare","version":"9.9"}
+    );
+    defer bare2.deinit();
+    try t.expectEqualStrings(extensionId(&bare1, &a), extensionId(&bare2, &b));
+}
+
+test "extensionId refuses an id that would escape its directory" {
+    const gpa = t.allocator;
+    var m = try parse(gpa,
+        \\{"manifest_version":2,"name":"Evil","version":"1",
+        \\ "browser_specific_settings":{"gecko":{"id":"../../etc/passwd"}}}
+    );
+    defer m.deinit();
+    var a: [MAX_ID_LEN]u8 = undefined;
+    const id = extensionId(&m, &a);
+    try t.expect(std.mem.indexOf(u8, id, "/") == null);
+    try t.expectEqualStrings(deriveId("Evil", &a), id);
+}
+
+test "originHost is a valid url host and differs from the id" {
     var a: [16]u8 = undefined;
     var b: [16]u8 = undefined;
-    const id1 = deriveId("My Ext", "1.0", &a);
-    const id2 = deriveId("My Ext", "1.0", &b);
-    try t.expectEqualStrings(id1, id2);
-    const c = deriveId("My Ext", "1.1", &b);
-    try t.expect(!std.mem.eql(u8, id1, c));
-    for (id1) |ch| try t.expect(std.ascii.isHex(ch));
+    const h = originHost("uBlock0@raymondhill.net", &a);
+    try t.expectEqual(@as(usize, 16), h.len);
+    for (h) |ch| try t.expect(std.ascii.isHex(ch));
+    try t.expect(!std.mem.eql(u8, h, originHost("addon@darkreader.org", &b)));
+    try t.expectEqualStrings(h, originHost("uBlock0@raymondhill.net", &b));
+}
+
+test "parse: web_accessible_resources" {
+    const gpa = t.allocator;
+    var m = try parse(gpa,
+        \\{"manifest_version":2,"name":"x","version":"1",
+        \\ "web_accessible_resources":["/web_accessible_resources/*"]}
+    );
+    defer m.deinit();
+    try t.expectEqual(@as(usize, 1), m.web_accessible_resources.len);
+    try t.expectEqualStrings("/web_accessible_resources/*", m.web_accessible_resources[0]);
 }
