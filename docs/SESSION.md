@@ -17589,3 +17589,79 @@ scrub its on-disk jar (the daemon does not own the helper's profile
 dir, which may be on another host). A container's routing change only
 affects views created afterwards, which the manager says in as many
 words.
+
+## 2026-08-12 — real MV2 extensions: uBlock Origin blocks
+
+Stage 3 of the WebExtensions plan set the bar at a curated tier-1 list
+with uBO as the benchmark. Before this, **none of the four ran** — the
+host loaded them, reported them enabled and `ok`, and they did nothing.
+uBlock Origin 1.73.0 now runs and blocks; smoke-web stage 35b asserts it
+against the real signed XPI.
+
+**An extension needs an ORIGIN, not just a way to run scripts.** That is
+the change everything else hangs off. `chrome-extension` turned out to be
+unusable — MEASURED: `add_custom_scheme("chrome-extension")` returns 0
+(Chromium owns the name, and CEF's alloy runtime serves nothing for it)
+while `cef_register_scheme_handler_factory` still answers 1, so the
+registration looks fine and every load fails `ERR_BLOCKED_BY_CLIENT` with
+the factory never consulted. The origin is therefore
+`sketerm-extension://<16 hex>/`, served from the unpacked directory by a
+resource handler on CEF's IO thread, with the host derived by hashing the
+id (a Gecko id like `uBlock0@raymondhill.net` cannot be a url host).
+Firefox splits these the same way.
+
+**Six silent failures, in the order they had to be found.** Each one left
+the extension enabled and inert, with nothing in any log:
+our own request handler cancelling the extension origin; the
+`web_accessible_resources` gate 403ing uBO's serializer WEB WORKER (a
+load with no frame) so `serializeAsync` never settled; `browserAction`
+being undefined, whose TypeError aborted uBO's own boot; every registered
+listener running on every request, so uBO's WAR guard cancelled every
+page; a hard-coded `tabId:-1`, which sends uBO down its behind-the-scene
+path and made it cancel top-level navigations; and `runtime.reload()`
+being a no-op, so uBO's first-run `vAPI.app.restart()` never came back.
+The last two are the ones worth remembering: **`tabId` is load-bearing**,
+and **an extension that asks to restart and is not restarted just stops**.
+
+**Diagnostics were the actual bottleneck**, so they are now permanent:
+a background page's load failures reach the client as console frames
+(they previously went nowhere), the API bootstrap reports its own failure
+instead of swallowing it, and `SKETERM_WEB_SCHEME_DEBUG`,
+`SKETERM_WEB_WREQ_DEBUG` and `SKETERM_WEB_EXT_DEBUG` print the scheme
+registration, every blocking decision with its url, and every `browser.*`
+call/reply pairing. `SKETERM_SMOKE_WEB_CONSOLE=1` echoes page console
+output in the rig, and `SKETERM_SMOKE_UBO_TRACE=1` un-silences uBO's own
+boot log, which is what finally located the stall.
+
+**Where each tier-1 extension stands, measured not assumed:**
+
+- **uBlock Origin 1.73.0 — runs and blocks.** Filter lists parse ~2.4s
+  after launch; a request named by `ublock-filters` is cancelled before
+  it reaches the network. Not working: scriptlet injection (it needs
+  `webRequest.onResponseStarted`, a notification-only event here),
+  cosmetic filtering beyond the shared-world ceiling, `filterResponseData`
+  (no CEF equivalent), and `onHeadersReceived` decisions (counted and
+  dropped, the previously measured `on_resource_response` ceiling).
+- **Violentmonkey 2.47.0 — does not run.** Its background boot throws a
+  TypeError reading `getURL` on an undefined object, and it registers no
+  webRequest listener. Its content scripts additionally read
+  `window.browser` rather than the injected closure parameter — that half
+  is the isolated-world CEILING, since publishing that global in the
+  shared main world would hand any page the extension's `storage.local`.
+- **Dark Reader 4.9.129 and Stylus 2.4.10 — not claimed to work.** Both
+  load and parse; neither was driven to a user-visible result.
+
+`browser.tabs` became real in the process: the GUI owns the tab set and
+posts the whole list as `webext_tabs` (0xB6, capability `webext-tabs`),
+which the helper DIFFS to synthesise MV2's `onCreated`/`onUpdated`/
+`onRemoved`/`onActivated`. Replace-all, like `us_script_set`, so a
+dropped frame cannot desynchronise anything. `runtime.connect` Ports,
+`tabs.sendMessage` into content frames, a real `sender` (`tab`, `url`,
+`frameId`), per-frame `all_frames` injection, object storage defaults and
+i18n placeholder substitution all landed alongside.
+
+Two install defects went with it: the extension id no longer moves with
+the version (it prefers `browser_specific_settings.gecko.id`), so
+installing v2 REPLACES v1 instead of minting a second enabled copy with
+empty storage and orphaned files; and a failed install says why, rather
+than `catch {}` leaving a picked MV3 XPI to do nothing at all.

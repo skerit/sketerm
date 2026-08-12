@@ -263,6 +263,50 @@ dispatch, and the blocking half is documented in its own section below).
   `execute_java_script` (the same `sendScript` path) and receives calls
   over the same nonce-authenticated process message. Do not add a
   separate V8 extension or secret for webext.
+- **An extension gets a real ORIGIN, and its scheme is
+  `sketerm-extension://`, NOT `chrome-extension://`.** MEASURED on CEF
+  151.3.16 (2026-08-12): `add_custom_scheme("chrome-extension")` returns
+  **0** — Chromium owns the name and refuses client registration, and
+  CEF's alloy runtime has the extensions component removed, so nothing
+  else serves it. `cef_register_scheme_handler_factory` still answers 1
+  for it, which is the trap: registration LOOKS fine and every load then
+  fails `ERR_BLOCKED_BY_CLIENT` with the factory never once consulted.
+  `SKETERM_WEB_SCHEME_DEBUG=1` prints both return values. Firefox has
+  its own name too (`moz-extension://`), so extensions cope — they build
+  urls with `runtime.getURL`. One that hard-codes the literal
+  `chrome-extension:` does not, and that is a real limitation.
+  - The HOST is not the id: `uBlock0@raymondhill.net` and
+    `{7a7a4a92-…}` are both illegal in a url host, so
+    `manifest.originHost` hashes the id to 16 hex digits. Firefox splits
+    these the same way (a per-install UUID in the url, the author's id
+    in `runtime.id`).
+  - The origin table (`webext/origins.zig`) is read from CEF's **IO
+    thread**, same shape and same reasoning as `webrequest.slots`, but
+    storing the directory BY VALUE so the IO thread never dereferences
+    main-thread memory. The negotiated locale is published with it
+    because that thread must not scan a directory per request.
+  - **An extension's own origin is never filtered.** `filter.zig` and
+    the webRequest path both skip it (`onBeforeResourceLoad` returns
+    early). It is not web traffic, Firefox draws the same line, and a
+    filter list that could block a background page would disable
+    extensions at random.
+  - **A load with NO frame is the extension's own.** A Web Worker's
+    script, a `cef_urlrequest`, a fetch from a worker: `create` gets a
+    null frame and cannot attribute the load. Refusing it 403s uBO's
+    serializer worker, and `serializeAsync` then stays pending FOREVER —
+    uBO's boot stopped mid-sequence with no error anywhere and simply
+    never filtered. `web_accessible_resources` gates only loads that DO
+    have a frame on another origin.
+- **`browser`/`chrome` are published as globals only for a PRIVILEGED
+  `ext-inject`** — one carrying the process nonce, which only the
+  browser process (which generated the served document) can produce.
+  Extension pages need the globals before their first statement;
+  content scripts must NOT have them, because this is the shared main
+  world and a page could then reach an extension's `storage.local`.
+  A consequence, measured against Violentmonkey: a content script that
+  reads `window.browser` rather than its injected closure parameter
+  fails. That is the isolated-world ceiling showing through, not a bug
+  with a fix short of an isolated world.
 - **This is NOT a true isolated world.** CEF's OSR/capi exposes no way
   to create a content-script world, so each extension runs in its own
   JS CLOSURE in the MAIN world (its own `browser`/`chrome`, its content
@@ -273,9 +317,32 @@ dispatch, and the blocking half is documented in its own section below).
   until then this is the ceiling, pinned by smoke-web stage 33.
 - **Background pages are hidden 1x1 windowless browsers** (`View.webext_bg`):
   no frame buffer, never announced to the client, marked `was_hidden`.
-  `injectBackground` runs their scripts at load end. `runtime.sendMessage`
-  from a content frame is routed content->browser-process->background and
-  the reply back, correlated by a process-global gid (`webext_routes`).
+  They are navigated TO THE EXTENSION'S OWN ORIGIN — the author's
+  `background.page` document, or a generated one listing
+  `background.scripts` — so the ENGINE loads the scripts in document
+  order, ES modules and all. `injectBackground` is then a no-op and
+  exists only as the fallback for a helper whose scheme registration
+  failed (that path cannot run a module, and says so).
+  `runtime.sendMessage` from a content frame is routed
+  content->browser-process->background and the reply back, correlated by
+  a process-global gid (`webext_routes`); `tabs.sendMessage` is the same
+  table with the roles swapped.
+  - The API bootstrap is a CLASSIC `<script src>` at a reserved path
+    (`origins.BOOTSTRAP_PATH`), spliced into every extension HTML
+    document ahead of every author script. It is not inline because it
+    carries the manifest and the message catalogue — uBO's catalogue
+    alone is 47KB, far too much to copy out of a slot under a spinlock,
+    and reading `Host.exts` from the IO thread is exactly what the
+    origin table exists to avoid. A classic script still blocks the
+    parser, so ordering is the same either way.
+  - **`runtime.reload()` is REAL and must stay real.** uBO's first run
+    ends with `vAPI.app.restart()` and a bare `return`: on a
+    Chromium-flavoured browser with no stored version it deliberately
+    abandons the rest of its boot and waits to be restarted. With
+    `reload` stubbed to a no-op it sat forever half-initialised —
+    enabled, listening, filtering NOTHING, no error anywhere. It is
+    performed on the next poll turn (`Host.webextPump`), never inside
+    the call, because it destroys the page whose script is mid-call.
 - **A browser process that hosted a background page must `_exit`, not
   return through libc.** MEASURED: after `cef_shutdown` returns cleanly
   (openBrowsers == 0), the normal return-through-`main` exit HANGS
@@ -286,9 +353,49 @@ dispatch, and the blocking half is documented in its own section below).
   plain `return`.
 - `getManifest`/`getURL`/`i18n.getMessage` resolve SYNCHRONOUSLY in JS
   from constants inlined into the `ext-inject` command (manifest bytes +
-  the `_locales/<default_locale>/messages.json` object); storage / tabs /
-  sendMessage are async (Promises), matching the Firefox `browser.*`
-  shape. `browser.tabs` is a stub (empty query) in this foundation.
+  the NEGOTIATED `_locales/<locale>/messages.json` object); storage /
+  tabs / sendMessage are async (Promises), matching the Firefox
+  `browser.*` shape. `getMessage` expands `$1`/`$name$` placeholders on
+  both sides — the JS copy exists because the API is synchronous and a
+  Promise would break every caller.
+- **`browser.tabs` is real, and the GUI owns it.** The client posts its
+  WHOLE tab list as `webext_tabs` (0xB6, capability `webext-tabs`);
+  `webext/tabs.zig` DIFFS it against what it held and synthesises MV2's
+  `onCreated`/`onUpdated`/`onRemoved`/`onActivated`. Replace-all, like
+  `us_script_set`: one frame, no incremental protocol to desynchronise,
+  and the events are a function of two consecutive tables rather than of
+  a sequence a dropped frame could break. The payload is a JSON array
+  because this wire has no repeated-field encoding and a tab list
+  changes a few times a minute.
+  - **`tabId` is load-bearing, not decoration.** MV2 defines -1 as "not
+    associated with a tab", and uBO's `onBeforeRequest` reads exactly
+    that: `if (tabId < 0)` it takes its behind-the-scene path. With the
+    old hard-coded -1 it CANCELLED the top-level navigation of every
+    page. `view` in the tab record is what maps a helper view back to a
+    tab, and it is also how `sender.tab` is answered.
+  - **`documentUrl`/`originUrl` are OMITTED for a main-frame request**,
+    as MV2 does. Sending the view's previous url there (`about:blank` on
+    a fresh view) makes a page third-party to ITSELF and uBO
+    strict-blocks the navigation.
+- **A `RequestFilter` belongs to ONE listener.** `needFor` returns the
+  ids of the listeners whose own filter matched and the frame runs only
+  those. This is not a refinement: uBO registers a guard on
+  `onBeforeRequest` filtered to its own `web_accessible_resources/*`
+  that cancels anything arriving without a secret, so "some listener
+  matched, run them all" cancels every page on the web.
+- Namespaces an extension calls UNCONDITIONALLY are present as benign
+  stubs (`browserAction`, `menus`, `windows`, `webNavigation`,
+  `notifications`, `commands`, `permissions`, `extension`, and the
+  notification-only `webRequest` events). They exist because their
+  ABSENCE is fatal — uBO's first act after its module graph loads is
+  `browserAction.setIcon`, and a TypeError there aborts the rest of its
+  startup from inside its own boot. `alarms` and `storage.session` are
+  REAL (a timer and an in-memory map cost nothing). Anything an
+  extension feature-detects — `privacy`, `dns`, `contentScripts`,
+  `storage.sync`/`managed`, `filterResponseData` — is deliberately LEFT
+  ABSENT, because degrading gracefully is what that detection is for.
+  The cost is named: `webRequest.onResponseStarted` never fires, and
+  that is where uBO injects its scriptlets.
 - Smoke-web stage 33 is the end-to-end proof (a committed fixture under
   `webext/testdata/fixture`): content script injected at document_end
   mutates the DOM + messages the background + `getMessage`; storage.local
@@ -469,82 +576,74 @@ nested: `webrequest.lock` is taken and released before `g_wreq.lock`
 thread; url, method and header JSON go into fixed buffers in the hold
 slot, exactly as the intercept log does.
 
-### uBlock Origin compatibility, measured 2026-08-12 against uBO 1.73.0
+### Tier-1 extension compatibility, measured 2026-08-12
 
-The real Firefox MV2 build
-(`uBlock0_1.73.0.firefox.signed.xpi`, sha256 `bccc51a7…4786a`), unpacked
-and read — not recalled. **uBO does not run today, and blocking
-webRequest is not what stops it.** It fails before any of its own code
-executes:
+Against the real signed Firefox MV2 builds, unpacked and RUN — not
+recalled. `zig build fetch-webext-fixtures` downloads the pinned
+uBlock Origin XPI (1.73.0, sha256 `bccc51a7…4786a`) that smoke-web
+stage 35b measures; the stage reports itself SKIPPED when it is absent,
+because a smoke run must not touch the network.
 
-- Its manifest parses fine with our parser (`ok = true`, enabled), and
-  `hasPermission(webRequest)`/`webRequestBlocking`/`<all_urls>` are all
-  true.
-- But its background is **`"background": {"page": "background.html"}`**,
-  and `injectBackground` iterates `background.scripts` only. The hidden
-  browser is spawned, is handed an empty script list, and uBO's
-  `lib/lz4`, `js/vapi.js` and `js/start.js` are never loaded. Silently:
-  the extension reads as installed and enabled.
-- Past that, `js/start.js` is `type="module"` with 20+ static `import`s.
-  `semantic.js` runs background scripts as `new Function(...)`, where a
-  static import is a SyntaxError — and the imports are real fetches
-  against a `chrome-extension://` origin that **no scheme handler
-  serves**. `runtime.getURL` returns such a url and nothing answers it.
-- Its content scripts fail independently and quietly:
-  `js/vapi-client.js` opens with `browser.runtime.connect(...)`, and we
-  have no Port API, so the catch path calls `vAPI.shutdown.exec()` — uBO's
-  content script deliberately tears itself down.
+**uBlock Origin 1.73.0 RUNS and BLOCKS.** Stage 35b asserts it: its
+module background page loads at its own origin, its filter lists parse
+(~2.4s from launch), and a request the `ublock-filters` list names is
+CANCELLED before it reaches the network — the loopback server counts
+zero hits on the blocked path for the attempt that blocked, while the
+control resource still arrives. The stage seeds uBO's own
+`selectedFilterLists` through `storage.local` so it measures ONE named
+list rather than whatever EasyList happens to ship this month.
 
-The webRequest surface it needs, against what now exists: it registers
-nine listeners, and the two that matter are
-`onBeforeRequest` `{urls:['http://*/*','https://*/*','ws://*/*','wss://*/*']}`
-`['blocking']` (`js/vapi-background.js:1231`) and `onHeadersReceived`
-`['blocking','responseHeaders']` (`js/traffic.js:1355`). The first is
-fully supported; the second runs but cannot apply its decision (above).
-It also reads `browser.webRequest.ResourceType.WEBSOCKET` at construction
-time (`vapi-background.js:34`) — hence that object is a real value in the
-bridge, not a stub. `onBeforeSendHeaders` it never registers in 1.73;
-`filterResponseData` it feature-detects and degrades without (there is no
-CEF equivalent, so HTML filtering stays off permanently).
+Getting there took six distinct fixes, and every one of them was a
+SILENT failure — the extension read as installed, enabled and `ok`
+while doing nothing:
 
-The rest of the gap, in the order that would move it furthest:
+1. `background.page` was never executed at all (only `background.scripts`
+   was), and its entry point is a `type="module"` with 20+ static
+   imports that `new Function` cannot even parse. Fixed by giving the
+   extension a real origin and letting the engine load the document.
+2. Our own `on_before_resource_load` cancelled the extension origin:
+   `ERR_BLOCKED_BY_CLIENT` on the background page itself.
+3. The `web_accessible_resources` gate 403'd uBO's serializer WEB
+   WORKER (a load with no frame), and `serializeAsync` then never
+   settled — the boot stopped mid-sequence.
+4. `browserAction.setIcon` was undefined; the TypeError aborted the rest
+   of uBO's own startup.
+5. Every registered listener ran on every dispatched request, so uBO's
+   `web_accessible_resources` guard cancelled every page load.
+6. `runtime.reload()` was a no-op, so uBO's first-run
+   `vAPI.app.restart()` never came back.
 
-1. Execute `background.page` (fetch the HTML, run its `<script src>` in
-   order). Without this nothing else matters.
-2. A `chrome-extension://<id>/` scheme handler over the unpacked dir, and
-   load the background page AT that origin. Unblocks ES modules, `fetch`,
-   `getURL`, `web_accessible_resources`, popup and options pages at once.
-3. `runtime.connect` Ports — every content script self-destructs without
-   them, so cosmetic filtering and scriptlets are dead regardless.
-4. Per-frame content-script injection: `sendScript` targets
-   `get_main_frame` only, so `all_frames: true` is parsed and not
-   honoured. Ad iframes are the point.
-5. Real `tabs.query`/`get` + `onUpdated`/`onRemoved`/`onActivated` and
-   `webNavigation.getFrame`/`getAllFrames`. uBO's `PageStore` is keyed on
-   tab ids; with `query -> []` its per-site state and logger stay empty
-   even when blocking works.
-6. `storage.local.get` honouring OBJECT defaults (we return only stored
-   keys, so uBO's first-run defaults come back `{}`), `alarms`, `menus`,
-   `browserAction`, `windows`.
+What still does NOT work for uBO, and why:
 
-Also absent and used by uBO, all of which it feature-detects and degrades
-without: `storage.session`/`managed`/`sync`, `privacy`, `dns`,
-`contentScripts.register`, `commands`. Its `i18n.getMessage` works but
-does no placeholder substitution, so `$1`-bearing strings render wrong.
+- **Scriptlets do not inject.** `webRequest.onResponseStarted` is a
+  notification-only event here and that is where uBO injects them.
+- **Cosmetic filtering is limited** by the shared-world ceiling
+  (below): uBO's content scripts run in the page's main world, so its
+  scriptlets and page scripts share intrinsics.
+- **`filterResponseData` is permanently absent** — no CEF equivalent.
+- `onHeadersReceived` decisions are counted and dropped (the measured
+  `on_resource_response` ceiling, still true).
+- `storage.sync`/`managed`, `privacy`, `dns`, `contentScripts.register`
+  and `commands` remain absent; uBO feature-detects all of them.
 
-Two items on that list are CEILINGS rather than TODOs: the shared-world
-injection (the CEF OSR limit already documented above) means uBO's
-scriptlets and page scripts share intrinsics, and `filterResponseData`
-has no CEF equivalent.
+**Dark Reader, Stylus and Violentmonkey are NOT claimed to work.** They
+load and their manifests parse; what was measured of each is recorded in
+`docs/SESSION.md`. Violentmonkey specifically fails on the ceiling
+above: its content scripts read `window.browser` rather than the
+injected closure parameter, and publishing that global for a content
+script would hand any page the extension's `storage.local`.
 
-What this stage's own fixture verifies instead, since uBO cannot load:
-smoke-web stage 34 exercises the same API surface uBO relies on —
-`onBeforeRequest` blocking with cancel and redirect, `onBeforeSendHeaders`
-with `requestHeaders` rewriting, `onHeadersReceived` with
-`responseHeaders`, `<all_urls>` filters, and a listener returning a
-Promise. What remains unverified against real uBO is everything above:
-its module graph, its Port traffic, its per-tab bookkeeping, and the
-interaction of its filter engine with ours.
+Two items here are CEILINGS rather than TODOs: the shared-world
+injection (the CEF OSR limit documented above) and `filterResponseData`.
+
+Stage 34 remains the fixture-based proof of the blocking-webRequest
+surface itself (cancel, redirect, header rewriting, `<all_urls>`,
+Promise-returning listeners, fail-open); stage 35a proves the LOADING
+SHAPE of a real extension with no third-party download (module
+background page at its own origin, a real static import, a package
+`fetch`, Ports from two frames, object storage defaults, i18n
+placeholders); stage 35b is the only one that can answer "does uBlock
+Origin block a request", and it does.
 
 ## Presentation belongs to GTK, not to us
 
