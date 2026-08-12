@@ -3445,9 +3445,15 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
     var blocked = false;
     const budget = nowMs() + 120_000;
     var attempts: u32 = 0;
+    // Baseline for THIS attempt. The assertion below is per-attempt, not
+    // cumulative: earlier attempts legitimately reach the network while
+    // uBO is still parsing its lists, so only the attempt that reports a
+    // block has to show zero new hits.
+    var ad_before = srv.ad_hits.load(.acquire);
     while (nowMs() < budget and !blocked) {
         attempts += 1;
         cl.resetTitle();
+        ad_before = srv.ad_hits.load(.acquire);
         cl.send(proto.Navigate{ .view = view_id, .url = page_url });
         if (!cl.waitTitle("ubo:", 30_000)) {
             std.debug.print("stage 35b: attempt {d}: title was \"{s}\"\n", .{ attempts, cl.titleSlice() });
@@ -3504,17 +3510,37 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
     // LAST attempt is the one that blocked; earlier attempts may have
     // let it through while uBO was still parsing, so what is asserted
     // is that the blocking attempt added no hit.
-    const hits_at_block = srv.ad_hits.load(.acquire);
-    if (srv.ok_hits.load(.acquire) == 0) {
-        fail("stage 35b: the control resource never arrived either — the page, not uBO, failed");
+    // GUARDED on `blocked`. Probe mode is report-only and returns here
+    // with blocked == false, so falling through printed "no block after
+    // N attempts" and then "blocked on attempt N" for the same run, and
+    // could abort the whole smoke from a mode documented not to. The
+    // teardown below is shared by both exits and must still run.
+    if (blocked) {
+        const hits_at_block = srv.ad_hits.load(.acquire);
+        if (srv.ok_hits.load(.acquire) == 0) {
+            fail("stage 35b: the control resource never arrived either — the page, not uBO, failed");
+        }
+        // The claim this stage exists to make. Without it the stage
+        // passes whenever the page's fetch merely REJECTS — a cancel
+        // landing after dispatch, a redirect-to-abort, or an unrelated
+        // socket reset all look identical from the page — while the
+        // request did reach the network. src/web/CLAUDE.md cites this
+        // stage as proof that it did not, so the proof has to be here.
+        if (hits_at_block != ad_before) {
+            std.debug.print(
+                "stage 35b: the blocking attempt still hit the network ({d} -> {d})\n",
+                .{ ad_before, hits_at_block },
+            );
+            fail("stage 35b: uBO reported a block but the request reached the server");
+        }
+        std.debug.print(
+            "stage 35b: blocked on attempt {d} (ad reached the network {d} time(s) while uBO was still loading)\n",
+            .{ attempts, hits_at_block },
+        );
+        if (probe != null) {
+            std.debug.print("stage 35b PROBE \"{s}\": blocked on attempt {d}\n", .{ ext_id, attempts });
+        } else pass("stage 35b REAL uBlock Origin 1.73.0 blocks a request on a loopback page");
     }
-    std.debug.print(
-        "stage 35b: blocked on attempt {d} (ad reached the network {d} time(s) while uBO was still loading)\n",
-        .{ attempts, hits_at_block },
-    );
-    if (probe != null) {
-        std.debug.print("stage 35b PROBE \"{s}\": blocked on attempt {d}\n", .{ ext_id, attempts });
-    } else pass("stage 35b REAL uBlock Origin 1.73.0 blocks a request on a loopback page");
 
     cl.send(proto.WebextRemove{ .id = ext_id });
     cl.send(proto.ViewDestroy{ .view = view_id });
