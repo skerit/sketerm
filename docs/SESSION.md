@@ -17508,3 +17508,84 @@ container chain, so a routing that clicked the wrong element fails), and
 Text answering the field's CONTENT rather than its label. smoke-web
 stage 36 is the engine half: it takes the button's rect from the streamed
 tree, clicks its centre, and requires the page's own handler to have run.
+
+## 2026-08-12: containers become a product — persistence, a manager, per-site rules
+
+The container ENGINE was already real (a `cef_request_context_t` each,
+per-context proxy egress, stages 26/27). The product half was missing:
+no way for a user to make a container, and the registry died with the
+process — so a "Work" tab came back after a restart looking right (the
+tab accent is saved with the tab) while actually browsing in the shared
+jar. That is a correctness bug, not a convenience one: the user believes
+they are in an identity they are not.
+
+- `src/mux/webstore.zig` (both test roots): `containers.json` —
+  `{next_id, containers[], sites[]}`, the whole-file JSON + atomic write
+  shape `bookmarks.json` uses. `containerAdd/Update/Remove/Find`,
+  `containerSiteSet/SiteFor`. Two keys are deliberately separate: the
+  **id** is persisted because the engine derives its on-disk jar path
+  from it (`contexts/{jar}-{id}`), and an immutable **jar key** is split
+  from the display name so a RENAME keeps the cookies. Ephemeral
+  (incognito) containers are never stored — persisting one would
+  resurrect a throwaway as a named identity. Egress and remote host are
+  refused as a pair on both add and update.
+- `src/mux/daemon_serve.zig`: `container_list/add/update/remove` and
+  `container_site_set` as `web_op` sub-verbs (append-only; no new mux
+  frame number, so nothing collides with other work in flight).
+  `sketerm-mux` stays libc-only.
+- `src/ui/webstore.zig`: the client half plus `parseContainers` /
+  `parseContainerId`, with parse tests.
+- `src/ui/webface.zig`: `Container` gains `jar`; `createContainerAt`
+  ADOPTS a stored id instead of re-minting per process;
+  `createStoredContainer` (the store mints the id, since it is the jar
+  key), `renameContainer`, `recolorContainer`, `destroyContainer` (the
+  first code to ever send `context_destroy`). `loadContainers` merges
+  the store in at `Window.initWithConfig`. Three races closed and
+  commented: a container-bound face **holds its view back** until the
+  registry lands (an unknown context id silently resolves to the shared
+  jar); incognito ids come from a disjoint high range so they cannot
+  collide with stored ones; and the helper is published the jar key, not
+  the display name.
+- Restore: `src/web/model.zig` `PageState.container` + a pane-level copy
+  (the `url` duplication rationale), written by `webgroup.paneState`,
+  rebuilt by `restorePages` via the new `newPageIn` (the SAVED container,
+  not the opener's — a restored tree may mix identities), and
+  `winlayout.zig` now uses `attachContainer` for page 0.
+- `src/ui/webcontainers.zig` (new): the manager — create / rename /
+  recolour / delete, and routing as ONE dropdown (direct / via server /
+  browser runs on), which makes the mutually exclusive pair
+  unexpressible rather than merely rejected. Reached from "Containers…"
+  in the page and burger menus. Rows are built from the live registry,
+  so a row can never show an identity the helper lacks.
+- Per-site rules: "Always Open This Site In" in both menus;
+  `containerForUrl` lets a rule outrank the inherited container, applied
+  when a page or tab is CREATED (`attachPage`, `newWebTabAt`).
+- `src/ui/tabsidebar.zig`: a container dot on browser PAGE rows — the
+  window tab's accent says nothing about which page in a pane is where.
+- `src/smoke_web.zig`: **stage 37**. Stages 26/27 assert egress
+  isolation and say nothing about STORAGE, which is the half a user
+  notices. Both views load the SAME loopback origin in two containers
+  (so same-origin policy cannot be what separates them) and the query
+  string decides which writes the cookie: it is present in A's
+  enumeration and absent from B's, and B's own `document.cookie` cannot
+  see it either.
+
+The egress/remote-host exclusion was re-examined and KEPT, with the
+reason now in a docblock: an egress proxy is `socks5://127.0.0.1:<port>`
+in the GUI process, so on a helper running on another host that url
+names the wrong machine's loopback. Lifting it needs the bridge
+reachable from the helper's host (a reverse tunnel), which is a
+transport feature, not a flag.
+
+Verification: `zig build`, `zig build web`, `zig build test`,
+`zig build test-core`, `zig build mux-portable` + `ldd` (libc only),
+`zig build smoke-web` with stage 37 passing.
+
+Known limits, deliberate: a navigation INSIDE an open page is not
+re-homed into an assigned container — a view's request context is fixed
+at `view_create`, so moving it would mean reloading the page under the
+user; the rule governs what opens next. Deleting a container does not
+scrub its on-disk jar (the daemon does not own the helper's profile
+dir, which may be on another host). A container's routing change only
+affects views created afterwards, which the manager says in as many
+words.
