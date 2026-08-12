@@ -459,7 +459,10 @@ pub const Proj = struct {
             // reader re-walks on this and per-node signals would be
             // the same information at a thousand times the cost.
             try self.reprime();
-            self.emitObj(ROOT_PATH, "ChildrenChanged", "add", 0, 0, .{ .node = self.tree.root_id });
+            // Only when there IS a root: naming node 0 would hand the
+            // reader a reference to an object that does not exist.
+            if (self.tree.root_id != 0)
+                self.emitObj(ROOT_PATH, "ChildrenChanged", "add", 0, 0, .{ .node = self.tree.root_id });
             self.emitFocusCaret();
             return;
         }
