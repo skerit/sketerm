@@ -406,6 +406,13 @@ pub fn main() u8 {
         return 1;
     }
 
+    // ── 5b. the headerbar hamburger ─────────────────────────────────
+    if (hamburgerStage(allocator)) |msg| {
+        _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
+        teardown();
+        return 1;
+    }
+
     // ── 6. the shared per-tab menu on the editor's document tabs ────
     if (tabMenuStage(allocator, rt, sock_path)) |msg| {
         _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
@@ -653,6 +660,51 @@ fn contextMenuStage(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?[]co
         }
         _ = c.usleep(200_000);
     } else return "the pane split off by the menu never closed again";
+    return null;
+}
+
+/// The window's headerbar hamburger, asserted through AT-SPI.
+///
+/// It is activated through the bridge rather than clicked at a guessed
+/// pixel: the a11y tree reports every rect at 0,0 on Wayland, so there
+/// is no honest coordinate for a headerbar button. The rows are then
+/// real accessible objects, which is what turns "a popup appeared"
+/// into "the menu lists the verbs it promises" — including the About
+/// and Keyboard Shortcuts rows every identity's hamburger carries.
+fn hamburgerStage(allocator: std.mem.Allocator) ?[]const u8 {
+    const app = drive orelse return "the display session has no driver";
+    _ = app.drainLive(2_000);
+    const burger = findNamedNode(allocator, "Main Menu", ROLE_PUSH_BUTTON, 15_000) orelse
+        return "the headerbar hamburger is not in the AT-SPI tree";
+    defer allocator.free(burger.id);
+    if (!hub.?.doAction(allocator, burger.id, 0))
+        return "activating the headerbar hamburger over AT-SPI failed";
+    // Rows the window menu promises: the spec-sourced verbs and the
+    // shared Help tail.
+    for ([_][]const u8{
+        "New Tab",
+        "Split Left / Right",
+        "Split Top / Bottom",
+        "Preferences\u{2026}",
+        "Keyboard Shortcuts",
+        "About Sketerm",
+    }) |label| {
+        if (findMenuRow(allocator, label, 5_000)) |n| {
+            allocator.free(n.id);
+        } else {
+            _ = c.fprintf(platform.stderr(), "smoke-atspi: hamburger has no '%.*s' row\n", @as(c_int, @intCast(label.len)), label.ptr);
+            return "the window hamburger is missing a row";
+        }
+    }
+    // The Session submenu's own rows live in a child popover that is
+    // only realized on hover, so the parent row is what the tree can
+    // see here; its contents are the pane menu's, already asserted.
+    if (findMenuRow(allocator, "Session", 5_000)) |n| {
+        allocator.free(n.id);
+    } else return "the window hamburger has no Session submenu row";
+    dismissPopup(app);
+    _ = waitTabPopup(app, false, 5_000);
+    say("window hamburger: opened over AT-SPI, every spec row and the shared Help tail present");
     return null;
 }
 
