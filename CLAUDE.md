@@ -124,6 +124,10 @@ it is loaded, because breaking one is how each was learned:
     input latency and must not become the default again.
   - Frames are `GdkTexture`s in GTK's scene graph, never a `GtkGLArea`
     (its integer scale factor double-resamples on fractional displays).
+  - A blocking-webRequest decision is answered by the extension's
+    background page INSIDE the helper — never routed to the GUI, never
+    over the mux wire. Every held request is answered on every exit, and
+    the deadline fails OPEN.
 
 - **`src/ui/browser/CLAUDE.md`** (+ pointer in `src/filebrowser/`) — the file
   browser.

@@ -17076,6 +17076,50 @@ tier-1 list (uBO etc.) without restructuring.
   across the restart. Unit tests for match patterns, manifest parse,
   storage JSON and the zip reader in both roots.
 
+## WebExtensions: MV2 blocking webRequest
+
+- `browser.webRequest.onBeforeRequest` / `onBeforeSendHeaders` /
+  `onHeadersReceived` with the MV2 `["blocking"]` opt — the API MV3
+  removed, which is the whole reason the host targets the Firefox
+  surface. `{cancel:true}`, `{redirectUrl}` and `requestHeaders`
+  rewriting all take effect; a listener may return a Promise.
+- The decision round trip is IN-HELPER and never touches the GUI or the
+  mux wire: CEF's IO thread holds the request (`RV_CONTINUE_ASYNC`),
+  the main loop dispatches into the extension's hidden background
+  browser, its renderer runs the listener, and the answer comes back
+  over the same nonce-authenticated bridge. 0xB4/0xB5 carry
+  OBSERVABILITY ONLY (`webext_wreq_stats_req` / `ev_webext_wreq_stats`)
+  — there is deliberately no GUI-side decision frame, and the reserved
+  range's original note now says why.
+- Precedence: the native `filter.zig` verdict runs first and its cancel
+  is final; extensions see only what it let through; the per-view
+  shield gates both. First cancel wins among extensions.
+- EVERY held request is answered on every exit (decision, deadline,
+  extension disabled/removed/reparsed, background page or view
+  destroyed, helper shutdown). The 500ms deadline CONTINUES the
+  request — a broken extension costs filtering, never page loads.
+- Two short-circuits keep the fast path fast, both proven by
+  `zig build bench-webreq`: an extension whose RequestFilter does not
+  match costs +0us (one relaxed atomic load), and a non-blocking
+  listener never holds (0.2ms, a fire-and-forget mailbox drop).
+  A blocking decision costs ~1.3ms, dominated by the helper's own
+  poll/pump granularity, not by IPC or by the listener's work — a
+  uBO-shaped listener measures the same as one returning `{}`, and
+  spinning the poll cuts the helper-side trip 1307us -> 552us. Numbers,
+  config and date are committed in `src/web/CLAUDE.md`.
+- MEASURED ceiling: `on_resource_response` has no async callback in CEF,
+  so a blocking `onHeadersReceived` RUNS and sees real headers but its
+  `responseHeaders` cannot be applied; the drop is counted on the wire
+  and pinned by smoke-web stage 34d.
+- uBlock Origin 1.73.0 (real Firefox MV2 build) was loaded and does NOT
+  run — and blocking webRequest is not what stops it: its background is
+  a `page:` ES-module graph we never execute, and there is no
+  `chrome-extension://` scheme handler. Full honest gap list in
+  `src/web/CLAUDE.md`.
+- Proof: smoke-web stage 34a-34d (cancel never reaches the network,
+  redirect lands, modified header arrives, held request released by a
+  mid-flight `webext_remove`, never-answering listener times out and
+  fails open), plus `webext/webrequest.zig` unit tests in both roots.
 ## 2026-08-12: browser roadmap wave 3 integration notes
 
 Six parallel branches (userscripts/userstyles/cosmetic filtering, per-site

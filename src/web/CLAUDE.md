@@ -208,9 +208,8 @@ unpacked dir in place, or unpack an XPI under
 `registry.json`); the helper LOADS them and reports state. `webext_host`
 (`webext/host.zig`) owns the registry, `storage.local` persistence and
 the **`browser.*` dispatch seam** (`dispatchApi`, keyed on namespace —
-blocking webRequest is a later arm there, and the 0xB4-0xBF frame range
-is reserved for its held-request protocol; do NOT restructure the
-dispatch to add it).
+`webRequest` is now one of its arms, added WITHOUT restructuring the
+dispatch, and the blocking half is documented in its own section below).
 
 - **Content scripts and the `browser.*` bridge reuse the semantic
   channel, they are NOT a second transport.** `semantic.js` gained an
@@ -249,6 +248,255 @@ dispatch to add it).
   mutates the DOM + messages the background + `getMessage`; storage.local
   survives a helper restart. It serves the page from a loopback HTTP
   server because content scripts match `http://…`, never a `data:` url.
+
+## Blocking webRequest (MV2) — where the decision goes, and what it costs
+
+`browser.webRequest.onBeforeRequest` / `onBeforeSendHeaders` /
+`onHeadersReceived` with the MV2 `["blocking"]` opt. This is the API MV3
+removed, and supporting it is the whole reason the extension host targets
+the Firefox surface at all.
+
+**The round trip never leaves the helper.** An extension's background
+page is a hidden windowless browser THIS process owns, so a decision goes
+
+```
+CEF IO thread (on_before_resource_load, holds the request)
+  -> hold slot + a byte down the wake pipe
+helper main thread (next poll turn)
+  -> execute_java_script into the background page
+that page's RENDERER process
+  -> the MV2 listener runs, returns a BlockingResponse
+  -> back over the nonce-authenticated bridge
+helper main thread
+  -> apply to the cef_request_t, then cont() or cancel()
+```
+
+The GUI is not involved and nothing crosses the mux wire. **There is
+deliberately no `webext_request` / `webext_request_decision` frame pair**,
+despite what the 0xB4-0xBF reservation originally anticipated: routing the
+decision out to the client would add a socket hop, a GUI main-loop turn
+and a whole "the client died mid-decision" failure mode to the most
+latency-sensitive path in the browser. What 0xB4/0xB5 carry instead is
+observability only — `webext_wreq_stats_req` and `ev_webext_wreq_stats`
+(matched / held / cancelled / redirected / headers_modified /
+headers_received_dropped / timed_out / failed_open, plus the helper's own
+hold->answer p50/p95/max in microseconds).
+
+### Precedence with the native blocker
+
+1. `filter.zig` runs FIRST and its CANCEL is FINAL. An extension is never
+   asked about a request the built-in engine already refused — MV2 has no
+   "uncancel", and asking would put a JS round trip on requests decided in
+   nanoseconds.
+2. Extensions see everything the native engine let through.
+3. Among extensions, first cancel wins and a cancel beats a redirect
+   (Firefox's own resolution). v1 asks ONE extension per request, the
+   first whose filters match: chaining several would multiply the round
+   trip by the extension count, and the measured round trip is already the
+   dominant term. Documented, not hidden.
+4. The per-view shield (`intercept_enable`) gates BOTH. "Blocking off for
+   this site" has to mean off.
+
+### Every held request is answered, on every path
+
+A request held forever is a page that never finishes loading, with no
+error and no way out — the same iron rule the cert and permission
+decisions follow. The exits are enumerated at `Host.wreqFailOpen` and
+they are: a decision arrived; the deadline passed; the listener became
+unreachable between hold and dispatch; the extension was disabled,
+removed or reparsed (`wreqAbandonExt`); its background page or the
+requesting view was destroyed (`wreqAbandonView`); the helper is shutting
+down (`webrequestDeinit`). The hold table is 32 deep and a burst past it
+fails open rather than queueing.
+
+**The deadline is 500ms and it CONTINUES the request, never cancels it.**
+A broken, wedged or slow extension must cost the user filtering, never
+the ability to load a page. `SKETERM_WEB_WREQ_TIMEOUT_MS` overrides it;
+smoke-web stage 34c is the canary for both halves (it fires, and it
+fails open).
+
+### Measured latency, 2026-08-12
+
+`zig build bench-webreq`. 400 SEQUENTIAL same-origin `fetch()`es per
+scenario against a loopback HTTP server, a fresh helper each time,
+`--ozone-platform=headless`. Arch Linux, Zig 0.16 ReleaseFast, CEF
+151.3.16 (distro `cef`), x86_64. Per-request wall time from the page's
+own `performance.now()`; the helper-side number is its own hold->answer
+clock.
+
+| scenario | p50 | p95 | delta p50 | helper hold->answer p50/p95 |
+|---|---|---|---|---|
+| A no extension | 10.3ms | 11.3ms | — | — |
+| B0 blocking listener, RequestFilter matches nothing | 10.3ms | 11.2ms | **+0us** | never dispatched |
+| B non-blocking listener matching everything | 10.5ms | 11.5ms | +0.2ms | held=0 |
+| C blocking, returns `{}` immediately | 11.7ms | 12.5ms | +1.4ms | 1307us / 1558us |
+| D blocking, uBO-shaped work | 11.6ms | 12.8ms | +1.3ms | 1298us / 1562us |
+| E = C with `SKETERM_WEB_WREQ_SPIN=1` | 10.9ms | 11.8ms | +0.6ms | 552us / 733us |
+
+What the numbers say, plainly:
+
+- **The short-circuit is real.** B0 registers a blocking listener that
+  would cancel everything, but its `RequestFilter` names a host the page
+  never touches: +0us, and the helper reports it was never dispatched.
+  A request no filter matches costs one relaxed atomic load
+  (`webrequest.any_listeners`) and a branch.
+- **A non-blocking listener does not hold.** B reports `held=0` and costs
+  0.2ms — the notification itself, delivered as a fire-and-forget mailbox
+  drop whose slot is retired the moment the command is sent, not a hold.
+- **A blocking decision costs ~1.3ms, and it is OUR loop, not IPC.** D
+  does real uBO-shaped work (hostname map over 2000 rules, token scan,
+  12 regexes) and is indistinguishable from C, which returns `{}`: the
+  listener's own work is free relative to the trip. E is the proof of
+  where the time goes — dropping the poll timeout from 1ms to 0 while a
+  decision is outstanding cuts the helper-side trip from 1307us to 552us.
+  The floor is the helper's poll/pump granularity, because the renderer's
+  answer is only delivered inside `cef_do_message_loop_work`.
+- **What would fix it**, in order of how much is left on the table: the
+  remaining ~550us is two pump turns plus mojo; a dedicated CEF UI task
+  (`cef_post_task`) would not help while WE own the message loop, so the
+  real fix is a message pump that can be woken by the renderer's reply
+  rather than polled. `external_message_pump` is the CEF-supported shape
+  for that and is the next thing to try. Spinning (`WREQ_SPIN=1`) buys
+  0.75ms for a whole core and is therefore a measurement knob, not a
+  default.
+
+1.3ms per blocked subresource is acceptable for a filter list that
+cancels a minority of requests and irrelevant for the ones it does not
+match (they never reach JS). It would NOT be acceptable if every request
+on a page paid it, which is exactly why the short-circuit is a
+correctness requirement and not an optimisation.
+
+### The onHeadersReceived ceiling (measured)
+
+`cef_resource_request_handler_t::on_resource_response` takes NO
+`cef_callback_t` and returns an int — there is no `RV_CONTINUE_ASYNC`
+equivalent anywhere on the response path, so a request CANNOT be paused
+while a listener in another process answers. Consequences, all of them
+deliberate:
+
+- The `onHeadersReceived` listener DOES run and DOES see the real
+  response headers (stage 34d asserts it, via an `X-Stage` header the rig
+  serves).
+- A `responseHeaders` array it returns is COUNTED
+  (`headers_received_dropped`) and dropped, not applied. Nothing pretends
+  otherwise, and the counter is on the wire so a client can say so.
+- The path that would fix it is taking the whole load over with our own
+  `cef_resource_handler_t` and re-issuing it through `cef_urlrequest`.
+  That puts credentials, cookies, ranges, streaming and redirects back in
+  our hands — a far larger correctness surface than the feature buys, and
+  a dead end if a future CEF grows an async response hook. Not done on
+  purpose.
+
+`onBeforeRequest` and `onBeforeSendHeaders` have no such caveat: CEF
+gives ONE pre-flight callback for both, so a request needing both is
+dispatched twice in sequence from the same hold, which is also MV2's
+documented ordering. A redirect from the first phase skips the second,
+because a redirect restarts the request and its own
+`onBeforeSendHeaders` fires on the new load.
+
+### Permissions, and where they are enforced
+
+`webRequest` is required to register any listener and `webRequestBlocking`
+to ask for `["blocking"]` — both refused at registration in
+`webext/webrequest.zig` (unit-tested in both test roots), so a manifest
+that did not ask cannot listen. Per REQUEST, a url must satisfy the
+extension's HOST permissions as well as the listener's own
+`RequestFilter`, which is why `Registry.hosts` compiles
+`permissions` + `host_permissions` once. And a CONTENT SCRIPT may not
+register at all — that gate lives in `cefhost.extApiCall`, because only
+the engine side knows which frame a call arrived on, and a content script
+runs in a page's main world where the page could reach it.
+
+### Concurrency
+
+`webrequest.slots` is the ONE piece of shared state in the extension
+host: the main thread publishes a stable `*Registry` per extension and
+CEF's IO thread reads it under `webrequest.lock` (the repo's spinlock;
+`src/ui/panel/events.zig` documents why not a condvar). The registry
+pointer is heap-allocated precisely because `Host.exts` is an ArrayList
+that reallocates. A slot leaves the table BEFORE its registry is freed —
+that ordering is the safety property. Lock order is fixed and never
+nested: `webrequest.lock` is taken and released before `g_wreq.lock`
+(the hold table), in that direction only. Nothing allocates on the IO
+thread; url, method and header JSON go into fixed buffers in the hold
+slot, exactly as the intercept log does.
+
+### uBlock Origin compatibility, measured 2026-08-12 against uBO 1.73.0
+
+The real Firefox MV2 build
+(`uBlock0_1.73.0.firefox.signed.xpi`, sha256 `bccc51a7…4786a`), unpacked
+and read — not recalled. **uBO does not run today, and blocking
+webRequest is not what stops it.** It fails before any of its own code
+executes:
+
+- Its manifest parses fine with our parser (`ok = true`, enabled), and
+  `hasPermission(webRequest)`/`webRequestBlocking`/`<all_urls>` are all
+  true.
+- But its background is **`"background": {"page": "background.html"}`**,
+  and `injectBackground` iterates `background.scripts` only. The hidden
+  browser is spawned, is handed an empty script list, and uBO's
+  `lib/lz4`, `js/vapi.js` and `js/start.js` are never loaded. Silently:
+  the extension reads as installed and enabled.
+- Past that, `js/start.js` is `type="module"` with 20+ static `import`s.
+  `semantic.js` runs background scripts as `new Function(...)`, where a
+  static import is a SyntaxError — and the imports are real fetches
+  against a `chrome-extension://` origin that **no scheme handler
+  serves**. `runtime.getURL` returns such a url and nothing answers it.
+- Its content scripts fail independently and quietly:
+  `js/vapi-client.js` opens with `browser.runtime.connect(...)`, and we
+  have no Port API, so the catch path calls `vAPI.shutdown.exec()` — uBO's
+  content script deliberately tears itself down.
+
+The webRequest surface it needs, against what now exists: it registers
+nine listeners, and the two that matter are
+`onBeforeRequest` `{urls:['http://*/*','https://*/*','ws://*/*','wss://*/*']}`
+`['blocking']` (`js/vapi-background.js:1231`) and `onHeadersReceived`
+`['blocking','responseHeaders']` (`js/traffic.js:1355`). The first is
+fully supported; the second runs but cannot apply its decision (above).
+It also reads `browser.webRequest.ResourceType.WEBSOCKET` at construction
+time (`vapi-background.js:34`) — hence that object is a real value in the
+bridge, not a stub. `onBeforeSendHeaders` it never registers in 1.73;
+`filterResponseData` it feature-detects and degrades without (there is no
+CEF equivalent, so HTML filtering stays off permanently).
+
+The rest of the gap, in the order that would move it furthest:
+
+1. Execute `background.page` (fetch the HTML, run its `<script src>` in
+   order). Without this nothing else matters.
+2. A `chrome-extension://<id>/` scheme handler over the unpacked dir, and
+   load the background page AT that origin. Unblocks ES modules, `fetch`,
+   `getURL`, `web_accessible_resources`, popup and options pages at once.
+3. `runtime.connect` Ports — every content script self-destructs without
+   them, so cosmetic filtering and scriptlets are dead regardless.
+4. Per-frame content-script injection: `sendScript` targets
+   `get_main_frame` only, so `all_frames: true` is parsed and not
+   honoured. Ad iframes are the point.
+5. Real `tabs.query`/`get` + `onUpdated`/`onRemoved`/`onActivated` and
+   `webNavigation.getFrame`/`getAllFrames`. uBO's `PageStore` is keyed on
+   tab ids; with `query -> []` its per-site state and logger stay empty
+   even when blocking works.
+6. `storage.local.get` honouring OBJECT defaults (we return only stored
+   keys, so uBO's first-run defaults come back `{}`), `alarms`, `menus`,
+   `browserAction`, `windows`.
+
+Also absent and used by uBO, all of which it feature-detects and degrades
+without: `storage.session`/`managed`/`sync`, `privacy`, `dns`,
+`contentScripts.register`, `commands`. Its `i18n.getMessage` works but
+does no placeholder substitution, so `$1`-bearing strings render wrong.
+
+Two items on that list are CEILINGS rather than TODOs: the shared-world
+injection (the CEF OSR limit already documented above) means uBO's
+scriptlets and page scripts share intrinsics, and `filterResponseData`
+has no CEF equivalent.
+
+What this stage's own fixture verifies instead, since uBO cannot load:
+smoke-web stage 34 exercises the same API surface uBO relies on —
+`onBeforeRequest` blocking with cancel and redirect, `onBeforeSendHeaders`
+with `requestHeaders` rewriting, `onHeadersReceived` with
+`responseHeaders`, `<all_urls>` filters, and a listener returning a
+Promise. What remains unverified against real uBO is everything above:
+its module graph, its Port traffic, its per-tab bookkeeping, and the
+interaction of its filter engine with ours.
 
 ## Presentation belongs to GTK, not to us
 
