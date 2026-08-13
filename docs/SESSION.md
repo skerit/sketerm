@@ -18172,3 +18172,26 @@ implementation called by PKGBUILD, dpkg and plain installs, so those lists
 cannot drift independently again. The test also runs the current
 `PKGBUILD.build()`/`package()` against throwaway outputs. It uses only
 temporary directories and performs no real package or root operation.
+
+Final packaging review found two release blockers after that audit. Debian
+dependency aggregation used `paste -sd', '`, whose delimiters CYCLE one byte
+at a time, yielding `a,b c,d`; it now joins with commas first and inserts a
+space after every comma. The rootless fixture maps three staged binaries to
+five distinct runtime packages, asserts the exact `Depends: a, b, c, d, e`
+line, and has the host's real `dpkg-deb --info` parse the resulting package.
+
+`zig build mux` was libc-only at LINK time but still probed every GUI package
+while `build()` constructed unreachable GUI modules: `buildCBindings`,
+`configureSysDeps`, and `addPkgConfig` all ran `b.run(pkg-config ...)`
+eagerly. Package resolution now lives on reachable Compile/TranslateC steps
+through `.use_pkg_config = .force`, preserving GUI/test dependencies while a
+mux-only invocation sees only core packages. `dist/test-mux-build.sh` injects
+a pkg-config that rejects GTK/GLib/render packages and runs the real `mux`
+and `mux-portable` builds.
+
+The toolchain requirement is consistently Zig 0.16.x now:
+`build.zig.zon.minimum_zig_version = 0.16.0`, Arch declares
+`zig>=0.16.0` plus `zig<0.17.0`, and the installer rejects missing, older, or
+newer Zig before starting a build. dpkg `--deps` deliberately does not invent
+a distro Zig dependency that supported Debian/Ubuntu releases may not offer;
+its help text says to install Zig 0.16.x separately.
