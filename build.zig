@@ -47,7 +47,8 @@ pub fn build(b: *std.Build) void {
     // (SEGV inside Aro), but the same input through a standalone
     // `zig translate-c` subprocess succeeds. Out-of-process step it
     // is. See `vendor/cimport_root.h` for the headers + workaround
-    // defines.
+    // defines. pkg-config resolution is attached to this TranslateC
+    // step, not run here, so `zig build mux` never probes GUI packages.
     const cbindings_mod = buildCBindings(b, target, optimize);
 
     // Lean translation of `vendor/cimport_core.h` for the GTK-free
@@ -1348,13 +1349,7 @@ fn buildCBindings(
         "fontconfig",
     };
     for (pkgs) |p| {
-        const cflags = b.run(&.{ "pkg-config", "--cflags-only-I", p });
-        var it_inc = std.mem.tokenizeAny(u8, cflags, " \r\n\t");
-        while (it_inc.next()) |tok| {
-            if (std.mem.startsWith(u8, tok, "-I")) {
-                tc.addIncludePath(.{ .cwd_relative = b.dupe(tok[2..]) });
-            }
-        }
+        tc.linkSystemLibrary(p, .{ .use_pkg_config = .force });
     }
     tc.addIncludePath(b.path("vendor"));
 
@@ -1431,12 +1426,6 @@ fn buildCoreCBindings(
 /// on a module. Also wires the pre-translated C bindings module as
 /// `@import("cbindings")` so `src/c.zig` can re-export it.
 ///
-/// pkg-config is invoked here directly (rather than via `linkSystemLibrary`)
-/// so we control include-path order: `vendor/aro_shims/` must come
-/// FIRST so the patched `gdk/version/gdkversionmacros.h` shadows the
-/// system one. (Aro reads gdkversionmacros.h's `#error` guard at line
-/// 18 every re-include — its `#pragma once` lives at line 22, too
-/// late to stop re-processing.)
 /// Lean dependency set for GTK-free binaries built on the terminal
 /// core (sketerm-mux): cbindings decls, fribidi (grid/bidi.zig),
 /// vendored stb_image (kitty/iterm image decode), libc. Keep this
@@ -1684,33 +1673,10 @@ fn configureSysDeps(
     mod.addIncludePath(b.path("vendor"));
 }
 
-/// Resolve a pkg-config package and split its output into include
-/// paths (added via `addIncludePath` AFTER any earlier shim paths) and
-/// library names (added via `linkSystemLibrary` with `use_pkg_config =
-/// .no` so the Zig build system doesn't reinvoke pkg-config).
+/// Resolve a pkg-config package only when a reachable compile step needs it.
 fn addPkgConfig(b: *std.Build, mod: *std.Build.Module, pkg: []const u8) void {
-    addPkgConfigIncludes(b, mod, pkg);
-
-    // Library search paths (`-L`). Zig resolves dynamic system libs
-    // itself at the build-exe stage (`paths_first`) and only searches
-    // the SDK plus explicit `-L` dirs — it ignores `LIBRARY_PATH`. On a
-    // Homebrew (non-/usr/lib) prefix the dylibs are invisible without
-    // these, so feed pkg-config's `-L` output before the `-l` names.
-    const libdirs = b.run(&.{ "pkg-config", "--libs-only-L", pkg });
-    var it_dir = std.mem.tokenizeAny(u8, libdirs, " \r\n\t");
-    while (it_dir.next()) |tok| {
-        if (std.mem.startsWith(u8, tok, "-L")) {
-            mod.addLibraryPath(.{ .cwd_relative = b.dupe(tok[2..]) });
-        }
-    }
-
-    const libs = b.run(&.{ "pkg-config", "--libs-only-l", pkg });
-    var it_lib = std.mem.tokenizeAny(u8, libs, " \r\n\t");
-    while (it_lib.next()) |tok| {
-        if (std.mem.startsWith(u8, tok, "-l")) {
-            mod.linkSystemLibrary(tok[2..], .{ .use_pkg_config = .no });
-        }
-    }
+    _ = b;
+    mod.linkSystemLibrary(pkg, .{ .use_pkg_config = .force });
 }
 
 /// Capture a command's trimmed stdout, or null when the command is

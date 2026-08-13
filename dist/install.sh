@@ -37,6 +37,8 @@ source "$here/stage.sh"
 GTK_MIN=4.14
 ADW_MIN=1.4
 GLIB_MIN=2.74
+ZIG_MIN=0.16.0
+ZIG_MAX=0.17.0
 CEF_INCLUDE=${CEF_INCLUDE:-/usr/include/cef}
 CEF_LIB=${CEF_LIB:-/usr/lib/cef}
 
@@ -83,6 +85,7 @@ Long-option abbreviations, positional/environment arguments, sourced --config,
 -D/--dir, and -p are rejected. The installer always selects dist/PKGBUILD.
 --no-install still uses makepkg -s, which may install missing dependencies.
 On Arch-compatible hosts --deps is redundant because makepkg always receives -s.
+On dpkg hosts --deps does not install Zig; install Zig 0.16.x separately.
 EOF
             exit 0 ;;
         --)            shift; makepkg_args+=("$@"); break ;;
@@ -130,6 +133,16 @@ as_root() {
 # Sort-based ">=" so 4.9 does not compare above 4.14.
 version_ge() {
     [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
+}
+
+check_zig() {
+    local have
+    command -v zig >/dev/null 2>&1 \
+        || die "zig is not installed; install Zig 0.16.x before building"
+    have=$(zig version) || die "could not determine the installed Zig version"
+    if ! version_ge "$have" "$ZIG_MIN" || version_ge "$have" "$ZIG_MAX"; then
+        die "Zig $have is unsupported; this checkout requires Zig 0.16.x"
+    fi
 }
 
 # ---------------------------------------------------------------- version
@@ -185,6 +198,9 @@ DEB_BUILD_DEPS=(
     libgtk-4-dev libadwaita-1-dev libglib2.0-dev libfreetype6-dev libharfbuzz-dev
     libepoxy-dev libfribidi-dev libfontconfig1-dev libvpx-dev libpulse-dev
 )
+# Debian releases do not consistently provide the pinned Zig toolchain, so
+# --deps installs only distro-provided prerequisites. check_zig() gives the
+# exact requirement instead of asking apt for an unavailable package/version.
 # The daemon links libc only, so a mux-only build needs no -dev packages
 # beyond a compiler driver and tic for the terminfo entry.
 DEB_BUILD_DEPS_MUX=(build-essential ncurses-bin)
@@ -209,7 +225,7 @@ install_deb_deps() {
 # ------------------------------------------------------------------ build
 
 build_all() {
-    command -v zig >/dev/null 2>&1 || die "zig is not installed (this project pins Zig 0.16)"
+    check_zig
     cd "$root"
     if [ "$1" = gui ]; then
         # Normal builds runtime-load Opus automatically.
@@ -269,7 +285,7 @@ deb_depends_of() {
                 pkg=$(dpkg -S "$(readlink -f "$lib")" 2>/dev/null | head -1 | cut -d: -f1) || true
             fi
             [ -n "$pkg" ] && printf '%s\n' "$pkg"
-        done | sort -u | paste -sd', ' -
+        done | sort -u | paste -sd, - | sed 's/,/, /g'
 }
 
 do_debian() {
@@ -293,9 +309,11 @@ do_debian() {
             deps="$deps, $(deb_depends_of "$stagedir/usr/bin/sketerm-webengine")"
         fi
     fi
-    # Collapse duplicates introduced by concatenating the two lists.
+    # Collapse duplicates introduced by concatenating the lists. paste's
+    # delimiter cycles one CHARACTER at a time, so join explicitly to keep
+    # every dependency separated by the Debian-required comma + space.
     deps=$(printf '%s' "$deps" | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
-           | grep -v '^$' | sort -u | paste -sd', ' -)
+           | grep -v '^$' | sort -u | paste -sd, - | sed 's/,/, /g')
 
     install -d "$stagedir/DEBIAN"
     {
@@ -371,6 +389,7 @@ do_plain() {
 if command -v makepkg >/dev/null 2>&1 && command -v pacman >/dev/null 2>&1 \
         && [ "$mode" != mux ]; then
     [ "$want_prefix" -eq 0 ] || die "--prefix applies only to plain installs without a package manager"
+    check_zig
     say "Arch-compatible makepkg/pacman host detected, delegating to makepkg"
     cd "$here"
     if [ "$do_install" -eq 1 ]; then
@@ -408,6 +427,7 @@ select_kind() {
 if command -v dpkg-deb >/dev/null 2>&1; then
     [ "$want_prefix" -eq 0 ] || die "--prefix applies only to plain installs without a package manager"
     if [ "$want_deps" -eq 1 ]; then
+        check_zig
         if [ "$mode" = mux ]; then
             install_deb_deps DEB_BUILD_DEPS_MUX
         else

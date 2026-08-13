@@ -9,6 +9,7 @@ trap 'rm -rf "$work"' EXIT
 
 fakebin="$work/bin"
 mkdir -p "$fakebin"
+real_dpkg_deb=$(command -v dpkg-deb || true)
 
 cat > "$fakebin/pkg-config" <<'EOF'
 #!/usr/bin/env bash
@@ -41,7 +42,14 @@ cat > "$fakebin/pacman" <<'EOF'
 exit 0
 EOF
 
-chmod +x "$fakebin/pkg-config" "$fakebin/makepkg" "$fakebin/tic" "$fakebin/pacman"
+cat > "$fakebin/zig" <<'EOF'
+#!/usr/bin/env bash
+[ "${1:-}" = version ] || exit 89
+printf '%s\n' "${INSTALL_TEST_ZIG_VERSION:-0.16.0}"
+EOF
+
+chmod +x "$fakebin/pkg-config" "$fakebin/makepkg" "$fakebin/tic" \
+    "$fakebin/pacman" "$fakebin/zig"
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -86,6 +94,14 @@ assert_argv -sf -A --nocheck --key=/tmp/installer-dir-pfile
 
 INSTALL_TEST_PKG_CONFIG_FAIL=1 run_installer "$work/missing-deps.out" --deps
 assert_argv -sif
+
+set +e
+INSTALL_TEST_ZIG_VERSION=0.15.2 run_installer "$work/arch-bad-zig.out" --no-install
+status=$?
+set -e
+[ "$status" -eq 1 ] || fail "Arch path accepted Zig 0.15.2"
+[[ "$(<"$work/arch-bad-zig.out")" == *"requires Zig 0.16.x"* ]] \
+    || fail "Arch path gave no Zig 0.16.x guidance"
 
 for rejected in -i -cif --install --inst --insta --instal --needed --asdeps \
                 -D -D/tmp/installer-dir -cD/tmp/installer-dir -p -pfile \
@@ -163,12 +179,19 @@ ln -s "$root/data" "$fixture/data"
 ln -s "$root/terminfo" "$fixture/terminfo"
 ln -s "$root/LICENSE" "$fixture/LICENSE"
 ln -s "$root/build.zig.zon" "$fixture/build.zig.zon"
+[ "$(grep -m1 minimum_zig_version "$root/build.zig.zon")" = \
+    '    .minimum_zig_version = "0.16.0",' ] \
+    || fail "build.zig.zon does not require Zig 0.16.0"
 for binary in sketerm sketerm-mux sketerm-mux-portable sketerm-webengine; do
     cp /bin/true "$fixture/zig-out/bin/$binary"
 done
 
 cat > "$fakebin/zig" <<'EOF'
 #!/usr/bin/env bash
+if [ "${1:-}" = version ]; then
+    printf '%s\n' "${INSTALL_TEST_ZIG_VERSION:-0.16.0}"
+    exit 0
+fi
 printf '<call>' >> "$INSTALL_TEST_ZIG_LOG"
 printf ' <%s>' "$@" >> "$INSTALL_TEST_ZIG_LOG"
 printf '\n' >> "$INSTALL_TEST_ZIG_LOG"
@@ -187,14 +210,35 @@ cat > "$fakebin/dpkg" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
     --print-architecture) printf 'amd64\n' ;;
-    -S) printf 'libc6:%s\n' "$2" ;;
+    -S)
+        case "$2" in
+            */libalpha.so) printf 'alpha-runtime:%s\n' "$2" ;;
+            */libbeta.so) printf 'beta-runtime:%s\n' "$2" ;;
+            */libdelta.so) printf 'delta-runtime:%s\n' "$2" ;;
+            */libepsilon.so) printf 'epsilon-runtime:%s\n' "$2" ;;
+            */libgamma.so) printf 'gamma-runtime:%s\n' "$2" ;;
+            *) exit 1 ;;
+        esac ;;
     *) printf 'forbidden dpkg invocation: %s\n' "$*" >> "$INSTALL_TEST_FORBIDDEN"; exit 91 ;;
 esac
 EOF
 
 cat > "$fakebin/ldd" <<'EOF'
 #!/usr/bin/env bash
-printf 'libc.so.6 => /lib/libc.so.6 (0x0)\n'
+case "${1##*/}" in
+    sketerm-mux)
+        printf 'libalpha.so => /lib/libalpha.so (0x0)\n'
+        printf 'libbeta.so => /lib/libbeta.so (0x0)\n'
+        printf 'libgamma.so => /lib/libgamma.so (0x0)\n'
+        printf 'libdelta.so => /lib/libdelta.so (0x0)\n'
+        printf 'libepsilon.so => /lib/libepsilon.so (0x0)\n' ;;
+    sketerm)
+        printf 'libgamma.so => /lib/libgamma.so (0x0)\n'
+        printf 'libdelta.so => /lib/libdelta.so (0x0)\n' ;;
+    sketerm-webengine)
+        printf 'libepsilon.so => /lib/libepsilon.so (0x0)\n'
+        printf 'libalpha.so => /lib/libalpha.so (0x0)\n' ;;
+esac
 EOF
 
 cat > "$fakebin/dpkg-deb" <<'EOF'
@@ -207,7 +251,11 @@ if [ -x "$stagedir/usr/bin/sketerm" ]; then
     [ -x "$stagedir/usr/bin/sketerm-webengine" ] || exit 96
     [ -f "$stagedir/usr/share/xdg-desktop-portal/portals/sketerm.portal" ] || exit 97
 fi
+cp "$stagedir/DEBIAN/control" "$INSTALL_TEST_CONTROL_LOG"
 printf '%s\n' "$debfile" > "$INSTALL_TEST_DEB_LOG"
+if [ -n "${INSTALL_TEST_REAL_DPKG_DEB:-}" ]; then
+    exec "$INSTALL_TEST_REAL_DPKG_DEB" "$@"
+fi
 printf 'fake deb\n' > "$debfile"
 EOF
 
@@ -292,6 +340,7 @@ INSTALL_TEST_DEB_LOG="$work/deb.log"
 INSTALL_TEST_FORBIDDEN="$work/forbidden.log"
 INSTALL_TEST_APT_LOG="$work/apt.log"
 INSTALL_TEST_DEPS_READY="$work/deps-ready"
+INSTALL_TEST_CONTROL_LOG="$work/control"
 BASH_ENV="$work/no-makepkg.bash" \
     PATH="$fakebin:$PATH" \
     SKETERM_TIC="$fakebin/tic" \
@@ -304,6 +353,8 @@ BASH_ENV="$work/no-makepkg.bash" \
     INSTALL_TEST_ALLOW_SUDO=1 \
     INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
     INSTALL_TEST_DEB_LOG="$INSTALL_TEST_DEB_LOG" \
+    INSTALL_TEST_CONTROL_LOG="$INSTALL_TEST_CONTROL_LOG" \
+    INSTALL_TEST_REAL_DPKG_DEB="$real_dpkg_deb" \
     INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
     "$fixture/dist/install.sh" --gui-only --deps --no-install \
     > "$work/debian.out" 2>&1
@@ -322,6 +373,14 @@ BASH_ENV="$work/no-makepkg.bash" \
     || fail "--gui-only --deps did not install GUI dependencies before probing"
 [[ "$(<"$work/debian.out")" == *"staged only, not installed"* ]] \
     || fail "non-Arch --no-install result was not reported"
+expected_depends='Depends: alpha-runtime, beta-runtime, delta-runtime, epsilon-runtime, gamma-runtime'
+[ "$(grep '^Depends:' "$INSTALL_TEST_CONTROL_LOG")" = "$expected_depends" ] \
+    || fail "Debian Depends line was not comma-space separated"
+if [ -n "$real_dpkg_deb" ]; then
+    "$real_dpkg_deb" --info "$(<"$INSTALL_TEST_DEB_LOG")" > "$work/deb-info"
+    [[ "$(<"$work/deb-info")" == *"$expected_depends"* ]] \
+        || fail "dpkg-deb --info did not parse the expected Depends line"
+fi
 
 rm -f "$INSTALL_TEST_DEPS_READY"
 : > "$INSTALL_TEST_ZIG_LOG"
@@ -337,6 +396,8 @@ BASH_ENV="$work/no-makepkg.bash" \
     INSTALL_TEST_ALLOW_SUDO=1 \
     INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
     INSTALL_TEST_DEB_LOG="$INSTALL_TEST_DEB_LOG" \
+    INSTALL_TEST_CONTROL_LOG="$INSTALL_TEST_CONTROL_LOG" \
+    INSTALL_TEST_REAL_DPKG_DEB="$real_dpkg_deb" \
     INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
     "$fixture/dist/install.sh" --deps --no-install \
     > "$work/debian-auto.out" 2>&1
@@ -368,6 +429,8 @@ BASH_ENV="$work/no-makepkg.bash" \
     SKETERM_TIC="$fakebin/tic" \
     INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
     INSTALL_TEST_DEB_LOG="$INSTALL_TEST_DEB_LOG" \
+    INSTALL_TEST_CONTROL_LOG="$INSTALL_TEST_CONTROL_LOG" \
+    INSTALL_TEST_REAL_DPKG_DEB="$real_dpkg_deb" \
     INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
     "$fixture/dist/install.sh" --no-install \
     > "$work/debian-auto-no-deps.out" 2>&1
@@ -375,6 +438,38 @@ BASH_ENV="$work/no-makepkg.bash" \
     || fail "auto mode without --deps did not degrade to mux"
 [[ "$(<"$work/debian-auto-no-deps.out")" == *"building the sketerm-mux daemon only"* ]] \
     || fail "auto mode without --deps did not explain its mux fallback"
+
+for bad_zig in 0.15.2 0.17.0; do
+    rm -f "$INSTALL_TEST_ZIG_LOG"
+    set +e
+    BASH_ENV="$work/no-packager.bash" \
+        PATH="$fakebin:$PATH" \
+        SKETERM_TIC="$fakebin/tic" \
+        INSTALL_TEST_ZIG_VERSION="$bad_zig" \
+        INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+        "$fixture/dist/install.sh" --mux-only --no-install \
+        > "$work/bad-zig.out" 2>&1
+    status=$?
+    set -e
+    [ "$status" -eq 1 ] || fail "unsupported Zig $bad_zig was accepted"
+    [[ "$(<"$work/bad-zig.out")" == *"requires Zig 0.16.x"* ]] \
+        || fail "unsupported Zig $bad_zig did not produce clear guidance"
+    [ ! -e "$INSTALL_TEST_ZIG_LOG" ] || fail "unsupported Zig $bad_zig started a build"
+done
+
+: > "$INSTALL_TEST_APT_LOG"
+set +e
+BASH_ENV="$work/no-makepkg.bash" \
+    PATH="$fakebin:$PATH" \
+    INSTALL_TEST_ZIG_VERSION=0.15.2 \
+    INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+    INSTALL_TEST_APT_LOG="$INSTALL_TEST_APT_LOG" \
+    "$fixture/dist/install.sh" --mux-only --deps --no-install \
+    > "$work/debian-bad-zig.out" 2>&1
+status=$?
+set -e
+[ "$status" -eq 1 ] || fail "dpkg --deps accepted Zig 0.15.2"
+[ ! -s "$INSTALL_TEST_APT_LOG" ] || fail "dpkg --deps ran apt before rejecting Zig"
 
 mkdir -p "$work/plain-tmp" "$work/plain-prefix"
 BASH_ENV="$work/no-packager.bash" \
@@ -446,6 +541,8 @@ BASH_ENV="$work/no-packager.bash" \
     [[ " ${depends[*]} " == *" gtk4>=4.14 "* ]] || fail "PKGBUILD lacks GTK minimum"
     [[ " ${depends[*]} " == *" libadwaita>=1.4 "* ]] || fail "PKGBUILD lacks libadwaita minimum"
     [[ " ${depends[*]} " == *" glib2>=2.74 "* ]] || fail "PKGBUILD lacks GLib minimum"
+    [[ " ${makedepends[*]} " == *" zig>=0.16.0 "* ]] || fail "PKGBUILD lacks Zig minimum"
+    [[ " ${makedepends[*]} " == *" zig<0.17.0 "* ]] || fail "PKGBUILD lacks Zig upper bound"
     PATH="$fakebin:$PATH" build
     PATH="$fakebin:$PATH" package
 )

@@ -57,7 +57,8 @@ optdepends=(
     'xwayland-satellite>=0.8.1: rootless X window management in external displays'
 )
 makedepends=(
-    'zig'
+    'zig>=0.16.0'
+    'zig<0.17.0'
     'ncurses'  # provides tic, the terminfo compiler
 )
 provides=("$_pkgname")

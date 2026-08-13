@@ -47,6 +47,8 @@ Tests are discovered via `src/tests.zig`, which `_ = @import(...)`s every module
 
 `src/tests_core.zig` is the GTK-free subset behind `zig build test-core`, built with the same lean `configureCoreDeps` set as `sketerm-mux`. It exists because `zig build test` compiles the GUI, so on a host whose GTK predates what the GUI calls into (Ubuntu 22.04 ships 4.6 vs the 4.14 required) the whole suite — daemon logic included — is unrunnable. **A new core-side test file belongs in BOTH roots**; anything reaching `ui/`/`render/` belongs only in `tests.zig`, and putting it in `tests_core.zig` breaks the build for `mux-portable` users.
 
+System package resolution is attached to reachable compile/TranslateC steps, never performed eagerly while constructing the graph. `dist/test-mux-build.sh` injects a pkg-config that rejects every GUI package and runs real `mux`/`mux-portable` builds; keep it passing when changing build dependencies.
+
 There's no `--test-filter` wired through `build.zig`; to run a single test, either invoke `zig test src/path/to/file.zig` directly with the same `linkSystemLibrary` flags, or add a temporary `b.option(...)` filter to the `tests` step.
 
 ### The `glib` build option
@@ -196,6 +198,8 @@ Design documents are never committed — proposals stay untracked in the working
 `dist/PKGBUILD` builds the locally-checked-out repo (no remote source) and packages `sketerm`, `sketerm-mux`, and `sketerm-webengine`. On an Arch-compatible makepkg/pacman host, run `cd dist && ./install.sh` (= `makepkg -sif`), or add `--no-install` to build with `makepkg -sf` without installing the resulting package. Because `-s` remains enabled, `--no-install` may still ask pacman to install missing build/runtime dependencies. **Plain `makepkg -si` is a trap**: `pkgver()` derives from HEAD and uncommitted changes do not move it, so rebuilding the same commit hits "A package has already been built", exits 13, and installs NOTHING while leaving the old binary in place. There is no `check()`: installing is not the time to run the suite. makepkg rewrites the `pkgver=` line on every build; a **clean filter keeps that out of git** so it no longer shows as a permanent local edit (which made `git pull` complain). `.gitattributes` marks `dist/PKGBUILD filter=pkgver`, and the driver lives in local git config — **a fresh clone must set it up or the dirt comes back**:
 
 Run `dist/test-install.sh` for the rootless installer regression test. It uses fake package-manager probes and runs `PKGBUILD.build()`/`package()` against temporary outputs; it never installs a package.
+
+Zig 0.16.x is required by `build.zig.zon`, the installer, and `dist/PKGBUILD`. The dpkg `--deps` path intentionally does not request a `zig` package because supported Debian/Ubuntu releases do not consistently provide that pinned toolchain; install Zig 0.16.x separately, and the installer rejects any other version before building.
 
 Installer makepkg passthrough is deliberately an allowlist, not makepkg's full CLI: exact non-relocating options listed by `dist/install.sh --help` are preserved byte-for-byte, while long abbreviations, positional/environment arguments, `--config` (makepkg sources it as shell), `-D`/`--dir`, `-p`, install-enabling options, and modes that skip the requested package build are rejected. This keeps the installer anchored to `dist/PKGBUILD` and makes `--no-install` authoritative. It still passes `-s`, so dependency installation is possible even in no-install mode.
 

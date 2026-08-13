@@ -36,7 +36,7 @@ Linux terminal depends on:
 build session. See `git log --oneline` for what's landed.
 
 ### What works
-- **M0** — `zig build` (Zig 0.15.2; ReleaseSafe default to dodge
+- **M0** — `zig build` (Zig 0.16.x; ReleaseFast default to dodge
   gcc 15's `.sframe` linker incompatibility); GTK4/libadwaita
   window opens.
 - **M0.5** — GL spike: `GtkGLArea` + `set_use_es(TRUE)` + share
