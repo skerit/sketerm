@@ -53,6 +53,8 @@ pub const BrowserAction = struct {
     default_popup: ?[]const u8 = null,
 };
 
+pub const ActionKind = enum { browser, page };
+
 pub const Manifest = struct {
     arena: std.heap.ArenaAllocator,
     manifest_version: u32 = 2,
@@ -65,6 +67,7 @@ pub const Manifest = struct {
     content_scripts: []ContentScript = &.{},
     background: ?Background = null,
     browser_action: ?BrowserAction = null,
+    page_action: ?BrowserAction = null,
     /// `browser_specific_settings.gecko.id` (or the older
     /// `applications.gecko.id`) — the author's own stable identity,
     /// which is what an id should be derived from: it does not move
@@ -96,6 +99,7 @@ pub const ParseError = error{
     MissingName,
     MissingVersion,
     UnsupportedManifestVersion,
+    ConflictingActions,
 };
 
 /// Parse `json` (a manifest.json body) into an owned `Manifest`. The
@@ -173,40 +177,45 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) ParseError!Manifest {
     // MV2 spells this as a bare array of path patterns.
     m.web_accessible_resources = try dupStrArray(a, root.get("web_accessible_resources"));
 
-    if (root.get("browser_action") orelse root.get("page_action")) |ba| {
-        if (ba == .object) {
-            const o = ba.object;
-            var act = BrowserAction{};
-            act.default_title = dupStr(a, o.get("default_title"));
-            act.default_popup = dupStr(a, o.get("default_popup"));
-            // default_icon may be a string or an object keyed by size.
-            // Prefer the largest toolbar-sized entry, then any entry.
-            if (o.get("default_icon")) |di| {
-                if (di == .string) {
-                    act.default_icon = a.dupe(u8, di.string) catch return error.OutOfMemory;
-                } else if (di == .object) {
-                    var best: ?[]const u8 = null;
-                    var best_size: u32 = 0;
-                    var best_fits = false;
-                    var it = di.object.iterator();
-                    while (it.next()) |entry| {
-                        if (entry.value_ptr.* != .string) continue;
-                        const size = std.fmt.parseInt(u32, entry.key_ptr.*, 10) catch 0;
-                        const fits = size <= 64;
-                        if (best == null or (fits and (!best_fits or size > best_size))) {
-                            best = entry.value_ptr.string;
-                            best_size = size;
-                            best_fits = fits;
-                        }
-                    }
-                    if (best) |path| act.default_icon = a.dupe(u8, path) catch return error.OutOfMemory;
-                }
-            }
-            m.browser_action = act;
-        }
-    }
+    const browser_action = root.get("browser_action");
+    const page_action = root.get("page_action");
+    if (browser_action != null and page_action != null) return error.ConflictingActions;
+    if (browser_action) |ba| m.browser_action = try parseAction(a, ba);
+    if (page_action) |pa| m.page_action = try parseAction(a, pa);
 
     return m;
+}
+
+fn parseAction(a: std.mem.Allocator, value: std.json.Value) ParseError!?BrowserAction {
+    if (value != .object) return null;
+    const o = value.object;
+    var act = BrowserAction{};
+    act.default_title = dupStr(a, o.get("default_title"));
+    act.default_popup = dupStr(a, o.get("default_popup"));
+    // default_icon may be a string or an object keyed by size.
+    // Prefer the largest toolbar-sized entry, then any entry.
+    if (o.get("default_icon")) |di| {
+        if (di == .string) {
+            act.default_icon = a.dupe(u8, di.string) catch return error.OutOfMemory;
+        } else if (di == .object) {
+            var best: ?[]const u8 = null;
+            var best_size: u32 = 0;
+            var best_fits = false;
+            var it = di.object.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* != .string) continue;
+                const size = std.fmt.parseInt(u32, entry.key_ptr.*, 10) catch 0;
+                const fits = size <= 64;
+                if (best == null or (fits and (!best_fits or size > best_size))) {
+                    best = entry.value_ptr.string;
+                    best_size = size;
+                    best_fits = fits;
+                }
+            }
+            if (best) |path| act.default_icon = a.dupe(u8, path) catch return error.OutOfMemory;
+        }
+    }
+    return act;
 }
 
 fn dupStr(a: std.mem.Allocator, val: ?std.json.Value) ?[]const u8 {
@@ -242,7 +251,7 @@ pub const MAX_ID_LEN = 64;
 pub fn extensionId(m: *const Manifest, out: []u8) []const u8 {
     std.debug.assert(out.len >= MAX_ID_LEN);
     if (m.gecko_id) |g| {
-        if (idUsable(g)) {
+        if (idValid(g)) {
             @memcpy(out[0..g.len], g);
             return out[0..g.len];
         }
@@ -254,7 +263,7 @@ pub fn extensionId(m: *const Manifest, out: []u8) []const u8 {
 /// path component under the data dir and a key in a fixed-width slot
 /// table, so a separator or a control byte disqualifies it; everything
 /// else Gecko allows (`user@host`, `{uuid}`) is fine on both counts.
-fn idUsable(g: []const u8) bool {
+pub fn idValid(g: []const u8) bool {
     if (g.len == 0 or g.len > MAX_ID_LEN) return false;
     for (g) |ch| {
         if (ch == '/' or ch == '\\' or ch < 0x21 or ch == 0x7f) return false;
@@ -377,6 +386,36 @@ test "parse: browser action chooses a toolbar-sized icon" {
     );
     defer m.deinit();
     try t.expectEqualStrings("i32.png", m.browser_action.?.default_icon.?);
+}
+
+test "parse: page action remains distinct from browser action" {
+    const gpa = t.allocator;
+    var m = try parse(gpa,
+        \\{"manifest_version":2,"name":"Page","version":"1",
+        \\ "page_action":{"default_title":"Only here","default_popup":"page.html"}}
+    );
+    defer m.deinit();
+    try t.expect(m.browser_action == null);
+    try t.expectEqualStrings("Only here", m.page_action.?.default_title.?);
+}
+
+test "parse: browser and page actions are mutually exclusive" {
+    const gpa = t.allocator;
+    try t.expectError(error.ConflictingActions, parse(gpa,
+        \\{"manifest_version":2,"name":"Both","version":"1",
+        \\ "browser_action":{},"page_action":{}}
+    ));
+}
+
+test "idValid rejects malformed and overlong ids" {
+    try t.expect(idValid("uBlock0@raymondhill.net"));
+    try t.expect(idValid("{7a7a4a92-a2a0-41d1-9fd7-1e92480d612d}"));
+    try t.expect(!idValid(""));
+    try t.expect(!idValid(".hidden"));
+    try t.expect(!idValid("../escape"));
+    try t.expect(!idValid("bad\\path"));
+    try t.expect(!idValid("bad\x00id"));
+    try t.expect(!idValid("x" ** (MAX_ID_LEN + 1)));
 }
 
 test "deriveId is stable, hex and version-independent" {

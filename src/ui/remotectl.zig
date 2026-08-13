@@ -732,9 +732,14 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             const win = ownerWindow(self, pane);
             if (winmod.tabPageForPane(win, pane)) |page| c.adw_tab_view_set_selected_page(win.tab_view, page);
             c.gtk_window_present(@ptrCast(win.app_window));
-            // Focusing an editor-visible pane must land on the document
-            // canvas, not on the hidden shell's GLArea.
-            if (pane.editorFaceVisible()) {
+            // A visible face owns focus; targeting the hidden shell's
+            // GLArea leaves browser-sidebar actions talking to the
+            // previously focused pane.
+            if (pane.webFaceVisible()) {
+                if (@import("webface.zig").WebFace.fromPane(pane)) |face| {
+                    face.focusFace();
+                } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
+            } else if (pane.editorFaceVisible()) {
                 if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| {
                     ev.focusFace();
                 } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));

@@ -142,6 +142,7 @@ pub const Host = struct {
     /// `dir/manifest.json` every call so a re-enable picks up edits.
     /// Never fails hard: a bad manifest records `ok = false` + `err`.
     pub fn set(self: *Host, id: []const u8, dir: []const u8, enabled: bool) !*Extension {
+        if (!manifest.idValid(id)) return error.InvalidExtensionId;
         var e = self.find(id) orelse blk: {
             try self.exts.append(self.gpa, .{
                 .id = try self.gpa.dupe(u8, id),
@@ -208,7 +209,9 @@ pub const Host = struct {
             e.err = std.fmt.allocPrint(self.gpa, "manifest parse: {s}", .{@errorName(err)}) catch &.{};
             return;
         };
-        const action_state = action.State.init(self.gpa, m.browser_action) catch {
+        const action_kind: manifest.ActionKind = if (m.browser_action != null) .browser else .page;
+        const action_manifest = m.browser_action orelse m.page_action;
+        const action_state = action.State.init(self.gpa, action_kind, action_manifest) catch {
             m.deinit();
             e.err = self.gpa.dupe(u8, "browser action: out of memory") catch &.{};
             return;
@@ -219,6 +222,7 @@ pub const Host = struct {
     }
 
     pub fn remove(self: *Host, id: []const u8) void {
+        if (!manifest.idValid(id)) return;
         for (self.exts.items, 0..) |*e, i| {
             if (std.mem.eql(u8, e.id, id)) {
                 self.freeExt(e);
@@ -296,8 +300,14 @@ pub const Host = struct {
         if (std.mem.eql(u8, ns, "i18n")) return self.dispatchI18n(e, method, args_json);
         if (std.mem.eql(u8, ns, "tabs")) return self.dispatchTabs(e, method, args_json);
         if (std.mem.eql(u8, ns, "webRequest")) return self.dispatchWebRequest(e, method, args_json);
-        if (std.mem.eql(u8, ns, "browserAction") or std.mem.eql(u8, ns, "pageAction") or
-            std.mem.eql(u8, ns, "action")) return e.action.dispatch(self.gpa, method, args_json);
+        if (std.mem.eql(u8, ns, "browserAction") or std.mem.eql(u8, ns, "action")) {
+            if (e.action.kind != .browser) return self.errResult("extension has no browserAction");
+            return e.action.dispatch(self.gpa, method, args_json);
+        }
+        if (std.mem.eql(u8, ns, "pageAction")) {
+            if (e.action.kind != .page) return self.errResult("extension has no pageAction");
+            return e.action.dispatch(self.gpa, method, args_json);
+        }
         return self.errResult("unknown namespace");
     }
 

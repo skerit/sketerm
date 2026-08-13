@@ -391,24 +391,36 @@ dispatch, and the blocking half is documented in its own section below).
   `onBeforeRequest` filtered to its own `web_accessible_resources/*`
   that cancels anything arriving without a secret, so "some listener
   matched, run them all" cancels every page on the web.
-- `browserAction` / `pageAction` is REAL: manifest defaults, global and
-  per-tab title/icon/popup/badge/enabled overrides, trusted `onClicked`,
-  and declared popup pages. The GUI renders enabled actions in each active
-  page's toolbar and the helper validates the mirrored active tab before
-  accepting an activation. Popup pages are real extension-origin CEF
-  browsers, not scraped HTML: they receive the same privileged bootstrap
-  as background/options pages and paint through the ordinary shm/inline
-  frame paths into a GTK popover. The popup id range starts at
+- `browserAction` / `pageAction` is REAL and DISTINCT: manifest defaults,
+  shared title/icon/popup state, browser-action badge/color/enabled state,
+  per-tab overrides, trusted `onClicked`, `pageAction.show`/`hide`, programmatic
+  `browserAction.openPopup`, and declared popup pages. A browser action is
+  visible by default; a page action is hidden until shown for that tab. The
+  GUI renders enabled visible actions in each active page's toolbar and the
+  helper validates the mirrored active tab before accepting an activation.
+  Popup pages are real extension-origin CEF browsers, not scraped HTML: they
+  receive the same privileged bootstrap as background/options pages and
+  paint through the ordinary shm/inline frame paths into a GTK popover.
+  The popup id range starts at
   `WEBEXT_POPUP_VIEW_BASE` (0x60000000), disjoint from client views,
   DevTools and hidden background pages. Closing the popover posts
   `view_destroy`; destroying its owner or disabling/removing the extension
   closes it from the helper side. Action snapshots are replace-all, but the
   GTK side updates buttons in place when their ids are unchanged so a
-  popup does not destroy its own anchor when it updates a badge. Popup
-  input uses the owning face's `Client`, which is load-bearing for a remote
-  browser face. `setBadgeBackgroundColor` / `setBadgeTextColor` and
-  `openPopup` currently resolve without changing presentation; `setIcon`
-  accepts package paths, not `ImageData`.
+  popup does not destroy its own anchor when it updates a badge.
+  MV2 makes the two manifest keys mutually exclusive; a package declaring
+  both is rejected instead of exposing two namespaces backed by one state.
+  JavaScript exposes only the declared MV2 namespace: there is no MV3
+  `action` alias, and page actions do not inherit browser-action-only badge
+  or enablement methods.
+  `openPopup` from a privileged extension page resolves the active tab in
+  the focused window and asks that page's native toolbar to run the same
+  activation path; content scripts and popup-less/hidden/disabled actions
+  reject. **WebExtensions are local-browser only.** Installed-package paths
+  belong to the GUI host and there is no package-transfer/remote-registry
+  protocol, so remote clients suppress `webext`, `webext-tabs` and
+  `webext-action` and receive no extension state. `setIcon` accepts package
+  paths, not `ImageData`; popup size remains a fixed 420x520 logical pixels.
 - Other namespaces an extension calls UNCONDITIONALLY are present as
   benign stubs (`menus`, `windows`, `webNavigation`, `notifications`,
   `commands`, `permissions`, `extension`, and the notification-only
@@ -425,16 +437,17 @@ dispatch, and the blocking half is documented in its own section below).
   mutates the DOM + messages the background + `getMessage`; storage.local
   survives a helper restart. It serves the page from a loopback HTTP
   server because content scripts match `http://…`, never a `data:` url.
-- Smoke-web stage 40 is the browser-action proof: a trusted activation
-  opens and paints a real extension-origin popup whose first script can
-  call `runtime.getManifest`; an action without a popup fires `onClicked`
-  for the active tab; a missing popup asset reports an error without a
-  view; ordinary, `about:blank`, `data:` and foreign-extension origins
-  cannot read the privileged bootstrap; owner destruction and extension
-  removal both close the popup. The exact-host
+- Smoke-web stage 40 is the action proof: declared browser/page namespaces
+  stay distinct, a hidden page action can be shown and clicked, and a trusted
+  browser-action activation opens and paints a real extension-origin popup
+  whose first script can call `runtime.getManifest`. It also proves
+  `browserAction.openPopup`, popup-less clicks, malformed-id rejection, a
+  missing popup asset failing without a view, and both teardown directions.
+  Ordinary, `about:blank`, `data:`, exact-host HTTP/HTTPS and foreign-extension
+  origins cannot read the privileged bootstrap. The exact-origin
   `get_first_party_for_cookies` fallback in `extSchemeCreate` is required
   because CEF can expose the previous frame URL while a parser-blocking
-  extension script loads. It must stay exact-host: broadening it would
+  extension script loads. It must stay exact-origin: broadening it would
   reopen the bootstrap nonce to another origin.
 
 ## Blocking webRequest (MV2) — where the decision goes, and what it costs

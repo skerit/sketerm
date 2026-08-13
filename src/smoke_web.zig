@@ -866,8 +866,13 @@ const Client = struct {
     ext_popup_fb_fd: c_int = -1,
     ext_popup_fb_seq: u32 = 0,
     ext_popup_dmg_seq: u32 = 0,
+    open_popup_seq: u32 = 0,
+    open_popup_view: u32 = 0,
+    open_popup_id: [64]u8 = @splat(0),
+    open_popup_id_len: usize = 0,
 
     /// Last `ev_webext_state` observed (one extension in the stage).
+    we_seq: u32 = 0,
     we_ok: u8 = 0xff,
     we_enabled: u8 = 0xff,
     we_name: [128]u8 = @splat(0),
@@ -1577,6 +1582,7 @@ const Client = struct {
                 @memcpy(self.we_name[0..self.we_name_len], st.name[0..self.we_name_len]);
                 self.we_err_len = @min(st.err.len, self.we_err.len);
                 @memcpy(self.we_err[0..self.we_err_len], st.err[0..self.we_err_len]);
+                self.we_seq += 1;
             },
             .ev_webext_actions => {
                 const ev = proto.decode(proto.EvWebextActions, frame.payload) catch fail("ev_webext_actions decode");
@@ -1593,6 +1599,13 @@ const Client = struct {
                 self.ext_popup_detail_len = @min(ev.detail.len, self.ext_popup_detail.len);
                 @memcpy(self.ext_popup_detail[0..self.ext_popup_detail_len], ev.detail[0..self.ext_popup_detail_len]);
                 self.ext_popup_seq += 1;
+            },
+            .ev_webext_open_popup => {
+                const ev = proto.decode(proto.EvWebextOpenPopup, frame.payload) catch fail("ev_webext_open_popup decode");
+                self.open_popup_view = ev.view;
+                self.open_popup_id_len = @min(ev.id.len, self.open_popup_id.len);
+                @memcpy(self.open_popup_id[0..self.open_popup_id_len], ev.id[0..self.open_popup_id_len]);
+                self.open_popup_seq += 1;
             },
             .ev_webext_wreq_stats => {
                 const st = proto.decode(proto.EvWebextWreqStats, frame.payload) catch fail("ev_webext_wreq_stats decode");
@@ -2112,19 +2125,21 @@ fn spawnHelper(
     sock: [*:0]const u8,
     cache: [*:0]const u8,
     extra: ?[*:0]const u8,
+    extra2: ?[*:0]const u8,
     no_gpu: bool,
 ) c.pid_t {
     const pid = c.fork();
     if (pid < 0) fail("fork");
     if (pid != 0) return pid;
     if (no_gpu) _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
-    var vec: [7:null]?[*:0]const u8 = @splat(null);
+    var vec: [8:null]?[*:0]const u8 = @splat(null);
     vec[0] = exe;
     vec[1] = "--socket";
     vec[2] = sock;
     vec[3] = "--cache-dir";
     vec[4] = cache;
     if (extra) |e| vec[5] = e;
+    if (extra2) |e| vec[6] = e;
     _ = c.execv(exe, @ptrCast(@constCast(&vec)));
     c._exit(127);
     unreachable;
@@ -2930,7 +2945,7 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
         _ = c.setenv("SKETERM_WEB_WREQ_TIMEOUT_MS", "20000", 1);
         var sock_buf: [96]u8 = undefined;
         const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/wq1.sock", .{dir}) catch fail("stage 34 sock");
-        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
         {
@@ -3036,7 +3051,7 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
         _ = c.setenv("SKETERM_WEB_WREQ_TIMEOUT_MS", "400", 1);
         var sock_buf: [96]u8 = undefined;
         const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/wq2.sock", .{dir}) catch fail("stage 34 sock2");
-        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
         {
@@ -3124,7 +3139,7 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     {
         var sock_buf: [96]u8 = undefined;
         const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/we1.sock", .{dir}) catch fail("webext sock");
-        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
         {
@@ -3185,7 +3200,7 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     {
         var sock_buf: [96]u8 = undefined;
         const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/we2.sock", .{dir}) catch fail("webext sock2");
-        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
         var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
         cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
         {
@@ -3237,6 +3252,13 @@ const action_manifest =
 ;
 
 const action_bg =
+    \\if (typeof browser.pageAction !== "undefined" || typeof browser.action !== "undefined") throw new Error("wrong browser action namespace");
+    \\browser.browserAction.setBadgeText({ text: "界界界界界界界界界界界界" });
+    \\browser.browserAction.setBadgeTextColor({ color: [1,2,3,255] });
+    \\browser.browserAction.setBadgeBackgroundColor({ color: "#aabbccdd" });
+    \\browser.tabs.onActivated.addListener(function () {
+    \\  browser.browserAction.openPopup();
+    \\});
     \\browser.browserAction.onClicked.addListener(function (tab) {
     \\  browser.browserAction.setBadgeText({ tabId: tab.id, text: "C" });
     \\});
@@ -3246,7 +3268,14 @@ const action_popup =
     \\<!doctype html><html><head><title>action popup</title></head><body>
     \\<script>
     \\document.body.textContent = "popup:" + browser.runtime.getManifest().name;
+    \\if (location.search === "?open") browser.browserAction.openPopup();
     \\</script></body></html>
+;
+
+const hostile_origin_page =
+    \\<!doctype html><title>origin probe</title>
+    \\<script src="sketerm-extension://__ORIGIN_HOST__/__sketerm-extapi.js"></script>
+    \\<script>document.title = [typeof browser, typeof(globalThis.chrome&&chrome.runtime), typeof(globalThis.chrome&&chrome.browserAction)].join(":")</script>
 ;
 
 const no_popup_manifest =
@@ -3266,6 +3295,26 @@ const missing_popup_manifest =
     \\{"manifest_version":2,"name":"sketerm missing popup fixture","version":"1",
     \\ "browser_specific_settings":{"gecko":{"id":"missing@sketerm.test"}},
     \\ "browser_action":{"default_title":"Missing Popup","default_popup":"gone.html"}}
+;
+
+const page_action_manifest =
+    \\{"manifest_version":2,"name":"sketerm page action fixture","version":"1",
+    \\ "browser_specific_settings":{"gecko":{"id":"page@sketerm.test"}},
+    \\ "background":{"scripts":["bg.js"],"persistent":true},
+    \\ "page_action":{"default_title":"Page Only"}}
+;
+
+const page_action_bg =
+    \\if (typeof browser.browserAction !== "undefined" || typeof browser.action !== "undefined" ||
+    \\    typeof browser.pageAction.setBadgeText !== "undefined" || typeof browser.pageAction.enable !== "undefined") {
+    \\  throw new Error("wrong page action namespace");
+    \\}
+    \\browser.tabs.query({active:true}).then(function(tabs){
+    \\  if (tabs[0]) return browser.pageAction.show(tabs[0].id);
+    \\});
+    \\browser.pageAction.onClicked.addListener(function(tab){
+    \\  browser.pageAction.setTitle({tabId:tab.id,title:"Page Clicked"});
+    \\});
 ;
 
 fn writeActionFixture(dir: []const u8, manifest_json: []const u8, background: []const u8, popup: ?[]const u8) bool {
@@ -3293,6 +3342,22 @@ fn actionListHas(cl: *Client, id: []const u8, title: []const u8, popup: bool, ba
             got_badge == .string and std.mem.eql(u8, got_badge.string, badge);
     }
     return false;
+}
+
+fn actionColorsAre(cl: *Client, id: []const u8, fg: []const u8, bg: []const u8) bool {
+    const json = cl.action_json[0..cl.action_json_len];
+    const at = std.mem.indexOf(u8, json, id) orelse return false;
+    const end = std.mem.indexOfScalarPos(u8, json, at, '}') orelse json.len;
+    return std.mem.indexOf(u8, json[at..end], fg) != null and std.mem.indexOf(u8, json[at..end], bg) != null;
+}
+
+fn waitActionColors(cl: *Client, id: []const u8, fg: []const u8, bg: []const u8, timeout_ms: i64) bool {
+    const deadline = nowMs() + timeout_ms;
+    while (true) {
+        if (actionColorsAre(cl, id, fg, bg)) return true;
+        if (nowMs() > deadline) return false;
+        cl.pump(50);
+    }
 }
 
 fn waitAction(cl: *Client, id: []const u8, title: []const u8, popup: bool, badge: []const u8, timeout_ms: i64) bool {
@@ -3329,22 +3394,37 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     var popup_dir_buf: [4096]u8 = undefined;
     var click_dir_buf: [4096]u8 = undefined;
     var missing_dir_buf: [4096]u8 = undefined;
+    var page_action_dir_buf: [4096]u8 = undefined;
     const popup_dir = std.fmt.bufPrint(&popup_dir_buf, "{s}/acpopup", .{dir}) catch fail("stage 40 popup fixture path");
     const click_dir = std.fmt.bufPrint(&click_dir_buf, "{s}/acclick", .{dir}) catch fail("stage 40 click fixture path");
     const missing_dir = std.fmt.bufPrint(&missing_dir_buf, "{s}/acmissing", .{dir}) catch fail("stage 40 missing fixture path");
+    const page_action_dir = std.fmt.bufPrint(&page_action_dir_buf, "{s}/acpage", .{dir}) catch fail("stage 40 page fixture path");
     if (!writeActionFixture(popup_dir, action_manifest, action_bg, action_popup)) fail("stage 40: could not write popup fixture");
     if (!writeActionFixture(click_dir, no_popup_manifest, no_popup_bg, action_popup)) fail("stage 40: could not write click fixture");
     if (!writeActionFixture(missing_dir, missing_popup_manifest, "", null)) fail("stage 40: could not write missing fixture");
+    if (!writeActionFixture(page_action_dir, page_action_manifest, page_action_bg, action_popup)) fail("stage 40: could not write page action fixture");
+
+    var host_buf: [16]u8 = undefined;
+    const origin_host = extmanifest.originHost("action@sketerm.test", &host_buf);
+    const hostile_page = std.mem.replaceOwned(u8, gpa, hostile_origin_page, "__ORIGIN_HOST__", origin_host) catch
+        fail("stage 40: could not build hostile origin fixture");
+    defer gpa.free(hostile_page);
+    if (!writeFile(dir, "origin.html", hostile_page)) fail("stage 40: could not write hostile origin fixture");
 
     var srv = HttpProbe{ .body = "<!doctype html><title>action page</title><body>ordinary page</body>" };
     if (!srv.start()) fail("stage 40: loopback HTTP server would not start");
     defer srv.shutdown();
+    var hostile_srv = HttpProbe{ .body = hostile_page };
+    if (!hostile_srv.start()) fail("stage 40: hostile-origin HTTP server would not start");
+    defer hostile_srv.shutdown();
     var page_buf: [96]u8 = undefined;
     const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/p", .{srv.port}) catch fail("stage 40 page url");
 
     var sock_buf: [96]u8 = undefined;
     const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ac.sock", .{dir}) catch fail("stage 40 socket path");
-    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+    var resolver_buf: [128:0]u8 = undefined;
+    const resolver = std.fmt.bufPrintZ(&resolver_buf, "--host-resolver-rules=MAP * 127.0.0.1", .{}) catch fail("stage 40 resolver rule");
+    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", resolver.ptr, false);
     g_pid = pid;
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
@@ -3354,23 +3434,78 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     }
     if (!cl.ack_webext_action) fail("stage 40: hello_ack lacks the webext-action capability");
 
+    const bad_set_before = cl.we_seq;
+    cl.send(proto.WebextSet{ .id = "../bad", .dir = popup_dir, .enabled = 1 });
+    {
+        const deadline = nowMs() + 5000;
+        while (cl.we_seq == bad_set_before and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.we_seq == bad_set_before or cl.we_ok != 0 or
+        std.mem.indexOf(u8, cl.we_err[0..cl.we_err_len], "invalid extension id") == null)
+        fail("stage 40: malformed wire extension id was not rejected");
+    const long_set_before = cl.we_seq;
+    cl.send(proto.WebextSet{ .id = "x" ** (extmanifest.MAX_ID_LEN + 1), .dir = popup_dir, .enabled = 1 });
+    {
+        const deadline = nowMs() + 5000;
+        while (cl.we_seq == long_set_before and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.we_seq == long_set_before or cl.we_ok != 0 or
+        std.mem.indexOf(u8, cl.we_err[0..cl.we_err_len], "invalid extension id") == null)
+        fail("stage 40: overlong wire extension id was not rejected");
+
     cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
     cl.have_view = true;
     if (!cl.waitBufferAfter(0, 20_000)) fail("stage 40: no frame_buffer for the page view");
     cl.send(proto.Navigate{ .view = view_id, .url = page_url });
     cl.sendTabs(&.{.{ .id = 40, .view = view_id, .active = true, .url = page_url, .title = "action" }});
 
+    const bad_popup_seq = cl.ext_popup_seq;
+    const bad_popup_view = proto.WEBEXT_POPUP_VIEW_BASE + 30;
+    cl.send(proto.WebextActionActivate{
+        .view = view_id,
+        .id = "x" ** (extmanifest.MAX_ID_LEN + 1),
+        .popup_view = bad_popup_view,
+        .w = 360,
+        .h = 420,
+        .scale_x1000 = 1000,
+    });
+    {
+        const deadline = nowMs() + 5000;
+        while (cl.ext_popup_seq == bad_popup_seq and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.ext_popup_seq == bad_popup_seq or cl.ext_popup_view != bad_popup_view or
+        cl.ext_popup_state != proto.webext_popup_error or
+        std.mem.indexOf(u8, cl.ext_popup_detail[0..cl.ext_popup_detail_len], "invalid extension id") == null)
+        fail("stage 40: overlong wire action id was not rejected");
+    pass("stage 40h malformed and overlong wire extension ids are rejected before registry or popup use");
+
     cl.send(proto.WebextSet{ .id = "action@sketerm.test", .dir = popup_dir, .enabled = 1 });
     cl.send(proto.WebextSet{ .id = "click@sketerm.test", .dir = click_dir, .enabled = 1 });
     cl.send(proto.WebextSet{ .id = "missing@sketerm.test", .dir = missing_dir, .enabled = 1 });
-    if (!waitAction(&cl, "action@sketerm.test", "Action Default", true, "", 15_000))
+    cl.send(proto.WebextSet{ .id = "page@sketerm.test", .dir = page_action_dir, .enabled = 1 });
+    if (!waitAction(&cl, "action@sketerm.test", "Action Default", true, "界界界界界界界界界界界界", 15_000))
         fail("stage 40: popup action was not reported for the active page");
+    if (!waitActionColors(&cl, "action@sketerm.test", "\"badgeTextColor\":[1,2,3,255]", "\"badgeBackgroundColor\":[170,187,204,221]", 10_000))
+        fail("stage 40: badge colors were not published to the toolbar");
     if (!waitAction(&cl, "click@sketerm.test", "Click Action", false, "", 15_000))
         fail("stage 40: no-popup action was not reported for the active page");
     {
         const deadline = nowMs() + 1200;
         while (nowMs() < deadline) cl.pump(50);
     }
+    if (!waitAction(&cl, "page@sketerm.test", "Page Only", false, "", 10_000))
+        fail("stage 40: pageAction.show did not reveal the action for its tab");
+
+    cl.send(proto.WebextActionActivate{
+        .view = view_id,
+        .id = "page@sketerm.test",
+        .popup_view = 0,
+        .w = 0,
+        .h = 0,
+        .scale_x1000 = 1000,
+    });
+    if (!waitAction(&cl, "page@sketerm.test", "Page Clicked", false, "", 10_000))
+        fail("stage 40: no-popup activation did not fire pageAction.onClicked");
 
     // A stale/background page cannot activate an action for the mirrored
     // tab, and a requested popup always receives a lifecycle answer.
@@ -3431,6 +3566,19 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     if (!waitExtPopupState(&cl, popup_view, proto.webext_popup_closed, 10_000))
         fail("stage 40: client popup close did not produce a lifecycle close");
 
+    // Re-activate the mirrored tab so the BACKGROUND page's onActivated
+    // listener calls openPopup. The helper must identify the active page
+    // rather than trying to map the hidden background view to a tab.
+    const open_before = cl.open_popup_seq;
+    cl.sendTabs(&.{.{ .id = 40, .view = view_id, .active = false, .url = page_url, .title = "action" }});
+    cl.sendTabs(&.{.{ .id = 40, .view = view_id, .active = true, .url = page_url, .title = "action" }});
+    const open_deadline = nowMs() + 10_000;
+    while (cl.open_popup_seq == open_before and nowMs() < open_deadline) cl.pump(50);
+    if (cl.open_popup_seq == open_before or cl.open_popup_view != view_id or
+        !std.mem.eql(u8, cl.open_popup_id[0..cl.open_popup_id_len], "action@sketerm.test"))
+        fail("stage 40: background browserAction.openPopup produced no helper-to-GUI request");
+    pass("stage 40g background browserAction.openPopup requests the active page's native toolbar popover");
+
     cl.send(proto.WebextActionActivate{
         .view = view_id,
         .id = "click@sketerm.test",
@@ -3456,10 +3604,14 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         fail("stage 40: missing popup asset produced no error lifecycle");
     if (std.mem.indexOf(u8, cl.ext_popup_detail[0..cl.ext_popup_detail_len], "not found") == null)
         fail("stage 40: missing popup error did not explain the missing asset");
+    const missing_fb = cl.ext_popup_fb_seq;
+    const missing_dmg = cl.ext_popup_dmg_seq;
+    const quiet_deadline = nowMs() + 1000;
+    while (nowMs() < quiet_deadline) cl.pump(50);
+    if (cl.ext_popup_fb_seq != missing_fb or cl.ext_popup_dmg_seq != missing_dmg)
+        fail("stage 40: missing popup created a helper view/frame");
     pass("stage 40c missing popup asset fails visibly without creating a view");
 
-    var host_buf: [16]u8 = undefined;
-    const origin_host = extmanifest.originHost("action@sketerm.test", &host_buf);
     var fetch_buf: [512]u8 = undefined;
     const fetch_probe = std.fmt.bufPrint(&fetch_buf,
         "(async()=>{{try{{let r=await fetch('sketerm-extension://{s}/__sketerm-extapi.js');return [r.status,await r.text()]}}catch(e){{return [0,String(e)]}}}})()",
@@ -3504,6 +3656,61 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     if (std.mem.indexOf(u8, data_globals, "\"value\":[\"undefined\",\"undefined\",\"undefined\"]") == null)
         fail("stage 40: a data URL received extension globals");
     cl.send(proto.ViewDestroy{ .view = blank_view });
+
+    // A direct same-host HTTP fixture proves the privileged check keys on
+    // BOTH scheme and host. Loading the bootstrap as a classic script is
+    // load-bearing: a fetch can be hidden by CORS even if the scheme
+    // handler served the nonce-bearing body.
+    var same_http_buf: [2048]u8 = undefined;
+    const same_http = std.fmt.bufPrint(&same_http_buf,
+        "http://{s}:{d}/p", .{ origin_host, hostile_srv.port }) catch fail("stage 40 same-host HTTP URL");
+    const scheme_view: u32 = 44;
+    load_before = cl.load_seq;
+    cl.send(proto.ViewCreateUrl{ .view = scheme_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0, .url = same_http });
+    {
+        const deadline = nowMs() + 20_000;
+        while (cl.load_seq == load_before and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.load_seq == load_before) fail("stage 40: same-host HTTP fixture never loaded");
+    const http_globals = cl.evalWaitView(scheme_view, globals_probe, false, 10_000);
+    if (std.mem.indexOf(u8, http_globals, "\"value\":[\"undefined\",\"undefined\",\"undefined\"]") == null)
+        fail("stage 40: http://same-extension-host received extension globals");
+    cl.send(proto.ViewDestroy{ .view = scheme_view });
+
+    // Repeat with HTTPS against the rig's self-signed loopback server.
+    // The document uses the extension HOST itself; accepting its cert for
+    // this request must not grant the extension origin's privileges.
+    if (startBadCertServer(dir)) |server| {
+        defer {
+            _ = c.kill(server.pid, c.SIGKILL);
+            var status: c_int = 0;
+            _ = c.waitpid(server.pid, &status, 0);
+        }
+        var same_https_buf: [256]u8 = undefined;
+        const same_https = std.fmt.bufPrint(&same_https_buf, "https://{s}:{d}/origin.html", .{ origin_host, server.port }) catch
+            fail("stage 40 same-host HTTPS URL");
+        const https_view: u32 = 45;
+        const cert_before = cl.cert_seq;
+        load_before = cl.load_seq;
+        cl.send(proto.ViewCreateUrl{ .view = https_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0, .url = same_https });
+        const cert_deadline = nowMs() + 20_000;
+        while (cl.cert_seq == cert_before and nowMs() < cert_deadline) cl.pump(50);
+        if (cl.cert_seq == cert_before or cl.cert_view != https_view)
+            fail("stage 40: same-host HTTPS fixture produced no certificate decision");
+        cl.send(proto.CertDecision{ .view = https_view, .proceed = 1 });
+        const load_deadline = nowMs() + 20_000;
+        while (cl.load_seq == load_before and nowMs() < load_deadline) cl.pump(50);
+        if (cl.load_seq == load_before) fail("stage 40: same-host HTTPS fixture never loaded");
+        const https_globals = cl.evalWaitView(https_view, globals_probe, false, 10_000);
+        if (std.mem.indexOf(u8, https_globals, "\"value\":[\"undefined\",\"undefined\",\"undefined\"]") == null) {
+            std.debug.print("stage 40: same-host HTTPS globals were {s}\n", .{https_globals});
+            fail("stage 40: https://same-extension-host received extension globals");
+        }
+        cl.send(proto.ViewDestroy{ .view = https_view });
+    } else {
+        fail("stage 40: no usable openssl s_server for the required same-host HTTPS origin proof");
+    }
+
     var click_host_buf: [16]u8 = undefined;
     const click_host = extmanifest.originHost("click@sketerm.test", &click_host_buf);
     var foreign_url_buf: [128]u8 = undefined;
@@ -3530,7 +3737,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         std.mem.indexOf(u8, foreign_fetch, "tok") != null)
         fail("stage 40: one extension fetched another extension's bootstrap");
     cl.send(proto.ViewDestroy{ .view = foreign_view });
-    pass("stage 40d ordinary, about:blank, data and foreign-extension origins cannot read the privileged bootstrap");
+    pass("stage 40d ordinary, blank, data, same-host HTTP/HTTPS and foreign-extension origins cannot read the privileged bootstrap");
 
     const owner_view: u32 = 43;
     cl.send(proto.ViewCreate{ .view = owner_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
@@ -3538,7 +3745,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         .{ .id = 40, .view = view_id, .active = false, .url = page_url, .title = "action" },
         .{ .id = 43, .view = owner_view, .active = true, .url = page_url, .title = "owner" },
     });
-    if (!waitActionView(&cl, owner_view, "action@sketerm.test", "Action Default", true, "", 10_000))
+    if (!waitActionView(&cl, owner_view, "action@sketerm.test", "Action Default", true, "界界界界界界界界界界界界", 10_000))
         fail("stage 40: action snapshot did not follow the active owner view");
     const owner_popup = proto.WEBEXT_POPUP_VIEW_BASE + 4;
     cl.send(proto.WebextActionActivate{
@@ -3557,7 +3764,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     pass("stage 40e destroying a page closes every popup it owns");
 
     cl.sendTabs(&.{.{ .id = 40, .view = view_id, .active = true, .url = page_url, .title = "action" }});
-    if (!waitAction(&cl, "action@sketerm.test", "Action Default", true, "", 10_000))
+    if (!waitAction(&cl, "action@sketerm.test", "Action Default", true, "界界界界界界界界界界界界", 10_000))
         fail("stage 40: action snapshot did not return to the original page");
 
     const popup_view_2 = proto.WEBEXT_POPUP_VIEW_BASE + 5;
@@ -3578,6 +3785,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
 
     cl.send(proto.WebextRemove{ .id = "click@sketerm.test" });
     cl.send(proto.WebextRemove{ .id = "missing@sketerm.test" });
+    cl.send(proto.WebextRemove{ .id = "page@sketerm.test" });
     cl.send(proto.ViewDestroy{ .view = view_id });
     cl.have_view = false;
     {
@@ -3585,7 +3793,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         while (nowMs() < deadline) cl.pump(50);
     }
     cl.deinit();
-    reapHelperTolerant(pid, "stage 40", 30_000);
+    reapHelperTimeout(pid, "stage 40", 30_000);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -3920,7 +4128,7 @@ fn runShapeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) vo
 
     var sock_buf: [96]u8 = undefined;
     const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sh.sock", .{dir}) catch fail("stage 35a sock");
-    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
     {
@@ -4070,7 +4278,7 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
 
     var sock_buf: [96]u8 = undefined;
     const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ub.sock", .{dir}) catch fail("stage 35b sock");
-    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
     {
@@ -4541,7 +4749,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Pinned to headless software rendering: 22 of the stages below
     // assert on pixels in the memfd, and the GPU path delivers dma-buf
     // planes instead. The GPU path gets its own helper in stage 24.
-    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", false);
+    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
     g_pid = pid;
 
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
@@ -6383,7 +6591,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     {
         var sock2_buf: [96]u8 = undefined;
         const sock2 = std.fmt.bufPrintZ(&sock2_buf, "{s}/g.sock", .{dir}) catch fail("socket path");
-        const gpu_pid = spawnHelper(exe, sock2.ptr, cache.ptr, null, false);
+        const gpu_pid = spawnHelper(exe, sock2.ptr, cache.ptr, null, null, false);
         g_pid = gpu_pid;
         var gc = Client{ .gpa = gpa, .fd = connectWithRetry(sock2.ptr, sock2.len) };
         gc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-gpu" });
@@ -6447,7 +6655,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     {
         var sock3_buf: [96]u8 = undefined;
         const sock3 = std.fmt.bufPrintZ(&sock3_buf, "{s}/s.sock", .{dir}) catch fail("socket path");
-        const sw_pid = spawnHelper(exe, sock3.ptr, cache.ptr, null, true);
+        const sw_pid = spawnHelper(exe, sock3.ptr, cache.ptr, null, null, true);
         g_pid = sw_pid;
         var sc = Client{ .gpa = gpa, .fd = connectWithRetry(sock3.ptr, sock3.len) };
         sc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-sw" });
@@ -6482,7 +6690,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const sock4 = std.fmt.bufPrintZ(&sock4_buf, "{s}/x.sock", .{dir}) catch fail("socket path");
         var cache4_buf: [128]u8 = undefined;
         const cache4 = std.fmt.bufPrintZ(&cache4_buf, "{s}/cache-egress", .{dir}) catch fail("cache path");
-        const eg_pid = spawnHelper(exe, sock4.ptr, cache4.ptr, "--ozone-platform=headless", false);
+        const eg_pid = spawnHelper(exe, sock4.ptr, cache4.ptr, "--ozone-platform=headless", null, false);
         g_pid = eg_pid;
         var ec = Client{ .gpa = gpa, .fd = connectWithRetry(sock4.ptr, sock4.len) };
         ec.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-egress" });
@@ -6604,7 +6812,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const sock5 = std.fmt.bufPrintZ(&sock5_buf, "{s}/j.sock", .{dir}) catch fail("socket path");
         var cache5_buf: [128]u8 = undefined;
         const cache5 = std.fmt.bufPrintZ(&cache5_buf, "{s}/cache-jar", .{dir}) catch fail("cache path");
-        const jar_pid = spawnHelper(exe, sock5.ptr, cache5.ptr, "--ozone-platform=headless", false);
+        const jar_pid = spawnHelper(exe, sock5.ptr, cache5.ptr, "--ozone-platform=headless", null, false);
         g_pid = jar_pid;
         var jc = Client{ .gpa = gpa, .fd = connectWithRetry(sock5.ptr, sock5.len) };
         jc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-jar" });

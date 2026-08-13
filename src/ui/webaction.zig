@@ -27,6 +27,8 @@ const Incoming = struct {
     title: []const u8 = "",
     icon: []const u8 = "",
     badge: []const u8 = "",
+    badgeTextColor: [4]u8 = .{ 255, 255, 255, 255 },
+    badgeBackgroundColor: [4]u8 = .{ 204, 34, 51, 255 },
     enabled: bool = true,
     popup: bool = false,
 };
@@ -58,7 +60,7 @@ pub const Toolbar = struct {
         var count: usize = 0;
         var same_actions = true;
         for (parsed.value) |in| {
-            if (in.id.len == 0) continue;
+            if (!validId(in.id)) continue;
             if (count >= self.actions.items.len or !std.mem.eql(u8, self.actions.items[count].id, in.id))
                 same_actions = false;
             count += 1;
@@ -67,7 +69,7 @@ pub const Toolbar = struct {
         if (same_actions) {
             var idx: usize = 0;
             for (parsed.value) |in| {
-                if (in.id.len == 0) continue;
+                if (!validId(in.id)) continue;
                 const a = &self.actions.items[idx];
                 if (self.popup) |p| {
                     if (c.gtk_widget_get_parent(p.widget) == a.button and (!in.enabled or !in.popup)) p.destroy(true);
@@ -81,7 +83,7 @@ pub const Toolbar = struct {
         if (self.popup) |p| p.destroy(true);
         self.clearActions(true);
         for (parsed.value) |in| {
-            if (in.id.len == 0) continue;
+            if (!validId(in.id)) continue;
             const id = self.allocator.dupe(u8, in.id) catch continue;
             const btn = c.gtk_button_new().?;
             const idx = self.actions.items.len;
@@ -108,21 +110,41 @@ pub const Toolbar = struct {
         c.gtk_box_append(@ptrCast(row), self.actionIcon(in.id, in.icon));
         if (in.badge.len != 0) {
             var bbuf: [32:0]u8 = @splat(0);
-            const n = @min(in.badge.len, bbuf.len - 1);
+            const n = utf8Prefix(in.badge, bbuf.len - 1);
             @memcpy(bbuf[0..n], in.badge[0..n]);
             const badge = c.gtk_label_new(&bbuf).?;
             c.gtk_widget_add_css_class(badge, "caption");
+            c.gtk_widget_add_css_class(badge, "sketerm-webext-badge");
+            self.styleBadge(a, badge, in.badgeTextColor, in.badgeBackgroundColor);
             c.gtk_box_append(@ptrCast(row), badge);
         }
         c.gtk_button_set_child(@ptrCast(a.button), row);
         var tip: [256:0]u8 = @splat(0);
-        const tn = @min(in.title.len, tip.len - 1);
+        const tn = utf8Prefix(in.title, tip.len - 1);
         @memcpy(tip[0..tn], in.title[0..tn]);
         c.gtk_widget_set_tooltip_text(a.button, &tip);
         c.gtk_widget_set_sensitive(a.button, @intFromBool(in.enabled));
         c.gtk_widget_add_css_class(a.button, "flat");
         a.enabled = in.enabled;
         a.popup = in.popup;
+    }
+
+    fn styleBadge(self: *Toolbar, a: *Action, badge: *c.GtkWidget, fg: [4]u8, bg: [4]u8) void {
+        _ = self;
+        _ = a;
+        const provider = c.gtk_css_provider_new() orelse return;
+        var css: [256:0]u8 = @splat(0);
+        const text = std.fmt.bufPrintZ(&css,
+            \\.sketerm-webext-badge {{ color: rgba({d},{d},{d},{d:.3}); background: rgba({d},{d},{d},{d:.3}); border-radius: 7px; padding: 0 4px; }}
+        , .{ fg[0], fg[1], fg[2], @as(f64, @floatFromInt(fg[3])) / 255.0, bg[0], bg[1], bg[2], @as(f64, @floatFromInt(bg[3])) / 255.0 }) catch {
+            c.g_object_unref(provider);
+            return;
+        };
+        c.gtk_css_provider_load_from_string(provider, text.ptr);
+        c.gtk_style_context_add_provider(
+            c.gtk_widget_get_style_context(badge), @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+        c.g_object_unref(provider);
     }
 
     pub fn onPopup(self: *Toolbar, ev: proto.EvWebextPopup) void {
@@ -132,6 +154,15 @@ pub const Toolbar = struct {
             p.showError(ev.detail);
         } else if (ev.state == proto.webext_popup_closed) {
             p.closeFromHelper();
+        }
+    }
+
+    pub fn openPopup(self: *Toolbar, id: []const u8) void {
+        if (self.severed) return;
+        for (self.actions.items) |*a| {
+            if (!std.mem.eql(u8, a.id, id) or !a.enabled or !a.popup) continue;
+            self.activate(a);
+            return;
         }
     }
 
@@ -210,16 +241,21 @@ pub const Toolbar = struct {
 
     fn onClicked(btn: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(Toolbar, user);
-        const cl = self.cl orelse return;
+        _ = self.cl orelse return;
         if (self.severed) return;
         const raw = c.g_object_get_data(@ptrCast(btn), "sketerm-webaction-index") orelse return;
         const idx = @intFromPtr(raw) - 1;
         if (idx >= self.actions.items.len) return;
         const a = &self.actions.items[idx];
         if (!a.enabled) return;
+        self.activate(a);
+    }
+
+    fn activate(self: *Toolbar, a: *Action) void {
+        const cl = self.cl orelse return;
         if (self.popup) |old| old.destroy(true);
         self.popup = null;
-        const popup = if (a.popup) Popup.create(self, btn) else null;
+        const popup = if (a.popup) Popup.create(self, a.button) else null;
         if (a.popup and popup == null) return;
         self.popup = popup;
         const popup_view = if (popup) |p| p.view else 0;
@@ -239,6 +275,24 @@ pub const Toolbar = struct {
         cl.post(value);
     }
 };
+
+fn validId(id: []const u8) bool {
+    const manifest = @import("../web/webext/manifest.zig");
+    return manifest.idValid(id);
+}
+
+fn utf8Prefix(text: []const u8, max: usize) usize {
+    if (text.len <= max and std.unicode.utf8ValidateSlice(text)) return text.len;
+    var end = @min(text.len, max);
+    while (end > 0 and !std.unicode.utf8ValidateSlice(text[0..end])) end -= 1;
+    return end;
+}
+
+test "utf8Prefix never splits a codepoint" {
+    try std.testing.expectEqual(@as(usize, 4), utf8Prefix("A€B", 4));
+    try std.testing.expectEqual(@as(usize, 1), utf8Prefix("A€B", 3));
+    try std.testing.expect(std.unicode.utf8ValidateSlice("A€B"[0..utf8Prefix("A€B", 3)]));
+}
 
 const Popup = struct {
     owner: *Toolbar,

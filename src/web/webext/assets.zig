@@ -53,6 +53,17 @@ pub fn urlHost(url: []const u8) []const u8 {
     return rest[0..end];
 }
 
+/// The scheme component without its trailing colon, empty when absent.
+pub fn urlScheme(url: []const u8) []const u8 {
+    const i = std.mem.indexOf(u8, url, "://") orelse return "";
+    return url[0..i];
+}
+
+/// Whether `url` names exactly `scheme://host`, not merely the same host.
+pub fn sameOrigin(url: []const u8, scheme: []const u8, host: []const u8) bool {
+    return std.mem.eql(u8, urlScheme(url), scheme) and std.mem.eql(u8, urlHost(url), host);
+}
+
 pub const ResolveError = error{ TooLong, Escapes, Empty };
 
 /// Join `dir` and a url path into an absolute on-disk path in `out`.
@@ -230,6 +241,11 @@ test "urlPath / urlHost split a chrome-extension url" {
     try t.expectEqualStrings("", urlPath("chrome-extension://h"));
     try t.expectEqualStrings("h", urlHost("chrome-extension://h"));
     try t.expectEqualStrings("/plain/path", urlPath("/plain/path"));
+    try t.expectEqualStrings("chrome-extension", urlScheme("chrome-extension://abc123/js/start.js"));
+    try t.expect(sameOrigin("sketerm-extension://abc123/a", "sketerm-extension", "abc123"));
+    try t.expect(!sameOrigin("https://abc123/a", "sketerm-extension", "abc123"));
+    try t.expect(!sameOrigin("http://abc123/a", "sketerm-extension", "abc123"));
+    try t.expect(!sameOrigin("sketerm-extension://other/a", "sketerm-extension", "abc123"));
 }
 
 test "resolve joins, decodes and collapses" {

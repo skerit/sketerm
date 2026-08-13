@@ -1488,7 +1488,7 @@
         onCreated: extEvent()
       }
     };
-    addExtStubs(api, extId, ctx);
+    addExtStubs(api, extId, ctx, manifestObj || {});
     ctx.tabs = api.tabs;
     extApiOf[extId] = api;
     return api;
@@ -1505,8 +1505,9 @@
   // there is a TypeError that takes the whole background page down —
   // an extension that is "enabled" and does nothing at all.
   //
-  // browserAction is real: state crosses the bridge and trusted clicks
-  // come back from GTK. The remaining namespaces below are benign stubs
+  // Manifest-declared actions are real: state crosses the bridge and
+  // trusted clicks come back from GTK. The remaining namespaces below
+  // are benign stubs.
   // and are meant to read as stubs. What they buy is that an extension
   // RUNS instead of dying on line one. Anything an extension feature-
   // detects (`privacy`, `dns`, `contentScripts`, `storage.sync`/`managed`,
@@ -1521,26 +1522,31 @@
     };
   }
 
-  function addExtStubs(api, extId, ctx) {
+  function addExtStubs(api, extId, ctx, manifestObj) {
+    var actionNs = manifestObj.page_action ? "pageAction" : "browserAction";
     var action = {
-      setIcon: function (d) { return extApiCall(extId, "browserAction", "setIcon", [d || {}]); },
-      setTitle: function (d) { return extApiCall(extId, "browserAction", "setTitle", [d || {}]); },
-      setBadgeText: function (d) { return extApiCall(extId, "browserAction", "setBadgeText", [d || {}]); },
-      setBadgeTextColor: function (d) { return extApiCall(extId, "browserAction", "setBadgeTextColor", [d || {}]); },
-      setBadgeBackgroundColor: function (d) { return extApiCall(extId, "browserAction", "setBadgeBackgroundColor", [d || {}]); },
-      setPopup: function (d) { return extApiCall(extId, "browserAction", "setPopup", [d || {}]); },
-      getPopup: function (d) { return extApiCall(extId, "browserAction", "getPopup", [d || {}]); },
-      getBadgeText: function (d) { return extApiCall(extId, "browserAction", "getBadgeText", [d || {}]); },
-      getTitle: function (d) { return extApiCall(extId, "browserAction", "getTitle", [d || {}]); },
-      enable: function (tabId) { return extApiCall(extId, "browserAction", "enable", tabId === undefined ? [] : [tabId]); },
-      disable: function (tabId) { return extApiCall(extId, "browserAction", "disable", tabId === undefined ? [] : [tabId]); },
-      isEnabled: function (d) { return extApiCall(extId, "browserAction", "isEnabled", d && d.tabId !== undefined ? [d.tabId] : []); },
-      openPopup: noopAsync,
+      setIcon: function (d) { return extApiCall(extId, actionNs, "setIcon", [d || {}]); },
+      setTitle: function (d) { return extApiCall(extId, actionNs, "setTitle", [d || {}]); },
+      setPopup: function (d) { return extApiCall(extId, actionNs, "setPopup", [d || {}]); },
+      getPopup: function (d) { return extApiCall(extId, actionNs, "getPopup", [d || {}]); },
+      getTitle: function (d) { return extApiCall(extId, actionNs, "getTitle", [d || {}]); },
       onClicked: extEvent()
     };
-    api.browserAction = action;
-    api.pageAction = action;
-    api.action = action;
+    if (manifestObj.browser_action) {
+      action.setBadgeText = function (d) { return extApiCall(extId, actionNs, "setBadgeText", [d || {}]); };
+      action.setBadgeTextColor = function (d) { return extApiCall(extId, actionNs, "setBadgeTextColor", [d || {}]); };
+      action.setBadgeBackgroundColor = function (d) { return extApiCall(extId, actionNs, "setBadgeBackgroundColor", [d || {}]); };
+      action.getBadgeText = function (d) { return extApiCall(extId, actionNs, "getBadgeText", [d || {}]); };
+      action.enable = function (tabId) { return extApiCall(extId, actionNs, "enable", tabId === undefined ? [] : [tabId]); };
+      action.disable = function (tabId) { return extApiCall(extId, actionNs, "disable", tabId === undefined ? [] : [tabId]); };
+      action.isEnabled = function (d) { return extApiCall(extId, actionNs, "isEnabled", d && d.tabId !== undefined ? [d.tabId] : []); };
+      action.openPopup = function () { return extApiCall(extId, actionNs, "openPopup", []); };
+      api.browserAction = action;
+    } else if (manifestObj.page_action) {
+      action.show = function (tabId) { return extApiCall(extId, "pageAction", "show", [tabId]); };
+      action.hide = function (tabId) { return extApiCall(extId, "pageAction", "hide", [tabId]); };
+      api.pageAction = action;
+    }
 
     var menus = {
       create: function () {
@@ -1871,8 +1877,10 @@
 
   function extActionClicked(m) {
     var api = extApiOf[m.ext];
-    if (!api || !api.browserAction) return;
-    fireAll(api.browserAction.onClicked, [m.tab || {}]);
+    if (!api) return;
+    var action = api.browserAction || api.pageAction;
+    if (!action) return;
+    fireAll(action.onClicked, [m.tab || {}]);
   }
 
   // An `ext-inject` carrying the process NONCE is PRIVILEGED: it may
@@ -1896,7 +1904,14 @@
   }
 
   function extPrivileged(m) {
-    return m.priv === true && extAuthentic(m);
+    if (m.priv !== true || !extAuthentic(m)) return false;
+    try {
+      var u = new URL(m.base || "");
+      return location.protocol === "sketerm-extension:" &&
+        u.protocol === "sketerm-extension:" && location.host === u.host;
+    } catch (e) {
+      return false;
+    }
   }
 
   function extInject(m) {

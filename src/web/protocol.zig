@@ -266,7 +266,8 @@ pub const Tag = enum(u8) {
     ev_webext_actions = 0xB7,
     webext_action_activate = 0xB8,
     ev_webext_popup = 0xB9,
-    // 0xBA-0xBF stay reserved for the WebExtensions block.
+    ev_webext_open_popup = 0xBA,
+    // 0xBB-0xBF stay reserved for the WebExtensions block.
     //
     // NOTE for anyone reading the 0xB4-0xBF reservation as originally
     // written: there is deliberately NO `webext_request` /
@@ -2424,6 +2425,17 @@ pub const EvWebextPopup = struct {
     detail: []const u8,
 };
 
+/// An extension page called `browserAction.openPopup()`. The GUI owns
+/// the native toolbar/popover and performs the same activation path as
+/// a trusted toolbar click. `req` is diagnostic correlation only; the
+/// extension call is answered by the helper when this event is posted.
+pub const EvWebextOpenPopup = struct {
+    pub const tag: Tag = .ev_webext_open_popup;
+    view: u32,
+    id: []const u8,
+    req: u32,
+};
+
 pub const webext_popup_opened: u8 = 1;
 pub const webext_popup_closed: u8 = 2;
 pub const webext_popup_error: u8 = 3;
@@ -2941,6 +2953,7 @@ test "round-trip: webext frames" {
         .state = webext_popup_opened,
         .detail = "sketerm-extension://0123456789abcdef/popup.html",
     });
+    try roundTrip(EvWebextOpenPopup, .{ .view = 7, .id = "action@example", .req = 19 });
     try roundTrip(WebextWreqStatsReq, .{});
     try roundTrip(EvWebextWreqStats, .{
         .id = "abc123",

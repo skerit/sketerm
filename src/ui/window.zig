@@ -2630,6 +2630,21 @@ pub const Window = struct {
         // also covers the AdwTabView "X" button path.
     }
 
+    fn closeCurrentTreeItem(self: *Window) void {
+        if (self.browserPagesInSidebar()) {
+            if (self.sidebarGroup()) |g| {
+                if (g.active()) |face| {
+                    g.closePage(face, switch (self.config.tab_close_parent) {
+                        .promote => .promote,
+                        .close_subtree => .close_subtree,
+                    });
+                    return;
+                }
+            }
+        }
+        self.closeCurrentTab();
+    }
+
     pub fn nextTab(self: *Window) void {
         _ = c.adw_tab_view_select_next_page(self.tab_view);
     }
@@ -3932,7 +3947,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         // A browser owning the sidebar takes "new tab" for itself.
         .new_tab => if (!self.newTabInBrowser())
             self.newShellTab(null) catch |err| logActionError("new_tab", err),
-        .close_tab => self.closeCurrentTab(),
+        .close_tab => self.closeCurrentTreeItem(),
         .next_tab => self.nextTab(),
         .prev_tab => self.prevTab(),
         .split_h => self.splitFocused(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("split_h", err),
@@ -4074,7 +4089,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
             if (!@import("shader_dialog.zig").open(self)) self.pickPaneShader();
         },
         .shader_clear => self.clearPaneShader(),
-        .close_tab => self.closeCurrentTab(),
+        .close_tab => self.closeCurrentTreeItem(),
         .rename_tab => self.renameCurrentTab(),
         .color_tab => self.chooseTabColor(),
         .pin_tab => self.togglePinCurrentTab(),

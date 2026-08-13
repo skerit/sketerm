@@ -2749,6 +2749,17 @@ pub const Host = struct {
 
     /// Load-or-toggle an extension (`webext_set`) and report its state.
     pub fn webextSet(self: *Host, req: proto.WebextSet) void {
+        if (!extmanifest.idValid(req.id)) {
+            self.post(proto.EvWebextState{
+                .id = "",
+                .name = "",
+                .version = "",
+                .enabled = 0,
+                .ok = 0,
+                .err = "invalid extension id",
+            });
+            return;
+        }
         const e = self.webext.set(req.id, req.dir, req.enabled != 0) catch {
             self.post(proto.EvWebextState{
                 .id = req.id,
@@ -2796,6 +2807,7 @@ pub const Host = struct {
     }
 
     pub fn webextRemove(self: *Host, id: []const u8) void {
+        if (!extmanifest.idValid(id)) return;
         // An enumerated exit: every request this extension was holding
         // is continued before its registry goes away.
         wreqAbandonExt(id);
@@ -2901,6 +2913,7 @@ pub const Host = struct {
         for (self.webext.exts.items) |*e| {
             if (!e.enabled or !e.ok or !e.action.present) continue;
             const a = e.action.effective(tab);
+            if (!a.visible) continue;
             if (!first) w.writeByte(',') catch return null;
             first = false;
             w.writeAll("{\"id\":") catch return null;
@@ -2911,7 +2924,9 @@ pub const Host = struct {
             jsonStr(w, a.icon) catch return null;
             w.writeAll(",\"badge\":") catch return null;
             jsonStr(w, a.badge) catch return null;
-            w.print(",\"enabled\":{s},\"popup\":{s}}}", .{
+            w.print(",\"badgeTextColor\":[{d},{d},{d},{d}],\"badgeBackgroundColor\":[{d},{d},{d},{d}],\"enabled\":{s},\"popup\":{s}}}", .{
+                a.badge_text_color.r, a.badge_text_color.g, a.badge_text_color.b, a.badge_text_color.a,
+                a.badge_background_color.r, a.badge_background_color.g, a.badge_background_color.b, a.badge_background_color.a,
                 if (a.enabled) "true" else "false",
                 if (a.popup.len != 0) "true" else "false",
             }) catch return null;
@@ -2923,6 +2938,10 @@ pub const Host = struct {
     /// A trusted browser-toolbar activation. The active mirrored tab is
     /// the authority: a stale/background GUI face cannot activate one.
     pub fn webextActionActivate(self: *Host, req: proto.WebextActionActivate) void {
+        if (!extmanifest.idValid(req.id)) {
+            self.popupError(req, "invalid extension id");
+            return;
+        }
         const tb = self.webext.tabs.findByView(req.view) orelse {
             self.popupError(req, "action is not available for this tab");
             return;
@@ -2944,7 +2963,7 @@ pub const Host = struct {
             return;
         }
         const a = e.action.effective(tb.id);
-        if (!a.enabled) {
+        if (!a.visible or !a.enabled) {
             self.popupError(req, "extension action is disabled");
             return;
         }
@@ -3006,6 +3025,12 @@ pub const Host = struct {
             .popup_owner = req.view,
             .sem = semantic.View.init(self.gpa),
         };
+        if (e.id.len > v.popup_ext.len) {
+            v.sem.deinit();
+            self.gpa.destroy(v);
+            self.popupError(req, "invalid extension id");
+            return;
+        }
         @memcpy(v.popup_ext[0..e.id.len], e.id);
         v.popup_ext_len = e.id.len;
         self.views.append(self.gpa, v) catch {
@@ -3593,6 +3618,12 @@ pub const Host = struct {
             self.extTabsNavigate(v, r.req, r.method, r.args);
             return;
         }
+        if ((std.mem.eql(u8, r.ns, "browserAction") or std.mem.eql(u8, r.ns, "action")) and
+            std.mem.eql(u8, r.method, "openPopup"))
+        {
+            self.extOpenPopup(v, e, r.req);
+            return;
+        }
         // Re-serialize args as a JSON array string for the host.
         var args_buf: std.Io.Writer.Allocating = .init(self.gpa);
         defer args_buf.deinit();
@@ -3639,6 +3670,27 @@ pub const Host = struct {
         var buf: [96]u8 = undefined;
         const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"ext-result\",\"req\":{d},\"ok\":false,\"result\":null}}", .{req}) catch return;
         self.sendScript(v, cmd);
+    }
+
+    /// Route `browserAction.openPopup()` to the GUI that owns the native toolbar.
+    fn extOpenPopup(self: *Host, caller: *View, e: *webexthost.Extension, req: u32) void {
+        if (e.action.kind != .browser or !(caller.webext_bg or caller.webext_popup or caller.webext_origin)) {
+            self.extReplyErr(caller, req);
+            return;
+        }
+        const tb = self.webext.tabs.active() orelse {
+            self.extReplyErr(caller, req);
+            return;
+        };
+        const action = e.action.effective(tb.id);
+        if (!action.visible or !action.enabled or action.popup.len == 0) {
+            self.extReplyErr(caller, req);
+            return;
+        }
+        self.post(proto.EvWebextOpenPopup{ .view = tb.view, .id = e.id, .req = req });
+        var buf: [96]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"ext-result\",\"req\":{d},\"ok\":true,\"result\":null}}", .{req}) catch return;
+        self.sendScript(caller, cmd);
     }
 
     /// A content frame's `runtime.sendMessage`: route it to the
@@ -8083,6 +8135,7 @@ fn extSchemeCreate(
     if (url.len == 0) return null;
 
     const host = extassets.urlHost(url);
+    if (!extassets.sameOrigin(url, ext_scheme, host)) return null;
     const dbg = c.getenv("SKETERM_WEB_SCHEME_DEBUG") != null;
     const slot = extorigins.lookup(host) orelse {
         if (dbg) std.debug.print("sketerm-web: scheme create: no origin for host \"{s}\" ({s})\n", .{ host, url });
@@ -8139,7 +8192,7 @@ fn extSchemeCreate(
         if (f.*.get_url) |fu| {
             var fbuf: [2048]u8 = undefined;
             const furl = userfreeInto(fu(f), &fbuf);
-            strict = std.mem.eql(u8, extassets.urlHost(furl), host);
+            strict = extassets.sameOrigin(furl, ext_scheme, host);
             same_origin = strict;
             // A top-level navigation TO the extension page reports the
             // frame's previous url, so allow the document itself: this
@@ -8154,7 +8207,7 @@ fn extSchemeCreate(
     // url already names the committed top-level extension document, and
     // matching the exact target host keeps this strict: ordinary, blank,
     // data and another extension's origin still fail.
-    if (!strict and std.mem.eql(u8, extassets.urlHost(first_party), host)) {
+    if (!strict and extassets.sameOrigin(first_party, ext_scheme, host)) {
         strict = true;
         same_origin = true;
     }

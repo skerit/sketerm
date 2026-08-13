@@ -17973,27 +17973,37 @@ continued past its known request-context CEF shutdown SIGSEGV and failed stage
 34c. The full rig is therefore not claimed as a clean pass here.
 ## 2026-08-13: WebExtension browser actions and real popup pages
 
-Installed MV2 extensions now put their declared `browser_action` or
-`page_action` in the active browser page's GTK toolbar. The button carries
-the extension icon, title, badge and enabled state. Runtime calls update
-global or per-tab title/icon/popup/badge/enabled overrides, and a toolbar
-click either fires `browserAction.onClicked` with the active tab or opens the
-declared popup. Popup controls receive pointer, scroll, key and focus input;
-Escape and clicking away close the popover.
+Installed MV2 extensions now put their declared `browser_action` or visible
+`page_action` in the active browser page's GTK toolbar. The two manifest keys
+stay distinct: browser actions start visible, while page actions start hidden
+and `pageAction.show`/`hide` changes one tab. The button carries the extension
+icon, title, UTF-8-safe badge, badge colors and enabled state. Runtime calls
+update global or per-tab action state, and a toolbar click either fires the
+declared action namespace's `onClicked` with the active tab or opens the
+declared popup. JavaScript exposes only the declared MV2 namespace: page
+actions do not inherit browser-action badge/enablement methods, and neither
+kind receives the MV3 `action` alias. `browserAction.openPopup()` from a privileged
+extension page opens the active focused tab's native toolbar popup; content
+scripts and hidden, disabled or popup-less actions reject. Popup controls
+receive pointer, scroll, key and focus input; Escape and clicking away close
+the popover.
 
 The responsibility split is explicit. `web/webext/action.zig` owns pure
 manifest-default and tab-override state. The helper validates that an
 activation names a live enabled extension and the active mirrored tab, then
 either dispatches the click into its background page or creates a real
 extension-origin CEF browser. `ui/webaction.zig` owns only GTK presentation,
-frame import and trusted input. Popup input rides the owning face's
-`webface.Client`, not the process-local singleton, so actions work for remote
-browser helpers too. Action snapshots update existing buttons in place when
-the extension ids are unchanged; rebuilding the anchor on every badge update
-would close a popup from inside its own startup.
+frame import and trusted input. Action snapshots update existing buttons in
+place when the extension ids are unchanged; rebuilding the anchor on every
+badge update would close a popup from inside its own startup. WebExtensions
+are deliberately local-browser only: installed-package paths belong to the
+GUI host, and no package-transfer/remote-registry protocol exists. Remote
+clients therefore suppress the three WebExtension capabilities and the menu
+says `Extensions (local browsers only)` rather than sending unusable paths.
 
 The append-only wire additions are capability `webext-action` and frames
-0xB7 action snapshot, 0xB8 trusted activation and 0xB9 popup lifecycle.
+0xB7 action snapshot, 0xB8 trusted activation, 0xB9 popup lifecycle and 0xBA
+programmatic popup request.
 Client-minted popup views start at `0x60000000`, separate from ordinary
 client views, DevTools and the helper's hidden background range. Popup CEF
 browsers force software frames: local clients receive memfd damage and remote
@@ -18005,39 +18015,56 @@ The security boundary was tested rather than inferred. Popup HTML receives
 the extension bootstrap before its first author script, including
 `runtime.getManifest()`. CEF can still report the previous frame URL while
 that parser-blocking bootstrap is fetched, so the scheme handler accepts an
-exact target-host match from `get_first_party_for_cookies`. The fallback is
-strictly host-equal. Smoke stage 40 proves ordinary pages, `about:blank`,
-`data:` and another extension's origin cannot fetch the privileged bootstrap
-or obtain extension globals.
+exact target-scheme AND target-host match from
+`get_first_party_for_cookies`. Smoke stage 40 proves ordinary pages,
+`about:blank`, `data:`, same-host HTTP, same-host self-signed HTTPS and another
+extension's origin cannot fetch the privileged bootstrap or obtain extension
+globals. Extension ids are validated at every persisted, GUI and helper wire
+boundary before they can reach fixed buffers, registry slots or paths.
 
-Files affected: `src/web/webext/action.zig`, manifest/host dispatch,
-`src/web/cefhost.zig`, `src/web/protocol.zig`, `src/web/server.zig`,
-`src/web/semantic.js`, `src/ui/webaction.zig`, `src/ui/webface.zig`,
-`src/ui/webext.zig`, both test roots and `src/smoke_web.zig`.
+Files affected: the action, manifest, host, asset, origin, tab and webRequest
+modules under `src/web/webext/`; `src/web/cefhost.zig`, protocol and semantic
+bridge; the web action/face/group/registry UI plus sidebar, remote-control and
+window routing; `src/smoke_web.zig`, `src/smoke_e2e.zig` and subsystem/session
+documentation.
 
-Tests added: pure action-state coverage for global/per-tab separation, sized
-icons, popup clearing, tab cleanup and invalid tab ids; manifest sized-icon
-selection; protocol round trips; smoke-web stage 40 for popup paint/runtime
-APIs, no-popup clicks, missing assets, origin isolation and both teardown
-directions.
+Tests added: pure action-state coverage for global/per-tab separation,
+page-action visibility, badge colors, sized icons, popup clearing, tab cleanup
+and invalid tab ids; manifest action separation and sized-icon selection;
+protocol round trips; smoke-web stage 40 for popup paint/runtime APIs,
+declared namespace shapes, page-action visibility/clicks, background
+`openPopup`, no-popup clicks, missing assets without frames, malformed wire
+ids, exact-origin isolation and both teardown directions. The
+GTK E2E installs an isolated extension before launch, checks per-tab blue and
+orange icons across WebGroup switches, opens and drives the native popup with
+trusted input, closes it with Escape and owner teardown, and requires the
+exact helper pid to exit with the GUI. It runs when `sketerm-webengine` is
+built and reports a clear skip otherwise.
 
-Verification: Zig AST checks for every changed Zig module,
-`node --check src/web/semantic.js`, `zig build`, `zig build web`, `zig build
-test` (2452 passed, 5 skipped), `zig build test-core` (2032 passed, 6 skipped),
-and a complete `zig build smoke-web` with all six stage 40 assertions and real
-uBlock Origin stage 35b passing. The first full smoke run stopped earlier in
-the unchanged stage 27 isolation probe after proxy B observed
-`www.google.com`; the immediate complete rerun passed stage 27 and the whole
-rig.
+Final verification: `node --check src/web/semantic.js`, `git diff --check`,
+`zig build --summary all` (59/59), `zig build web --summary all` (7/7),
+`zig build test` (2462 passed, 5 skipped) and `zig build test-core` (2041
+passed, 6 skipped). `SKETERM_WEB_GPU=0 zig build smoke-web --summary all`
+passed 10/10, including every stage 40 assertion and real uBlock Origin stage
+35b. `SKETERM_WEB_GPU=0 zig build smoke-e2e --summary all` passed 61/61,
+including the required native browser-action toolbar/popup stage.
 
-The GTK half was also driven in an isolated headless Wayland session with the
-built binaries and a temporary unpacked extension. Its toolbar button appeared
-in AT-SPI, activating it opened a 444x556 native popover whose frame rendered
-"GUI POPUP WORKS", Escape closed the popup, and the GUI exited 0. Two
-`gtk_widget_get_visible` criticals on whole-window shutdown reproduce without
-any extension installed and are not introduced by this path.
+The native-GPU smoke path was also attempted twice. Stage 24 advertised
+`frames-dmabuf`, but CEF logged `Unable to allocate frame for first frame
+capture: OOM?` and delivered no dma-buf frame. This is a host GPU allocation
+failure outside the action path; the complete forced-software helper and GTK
+matrices pass. A native GTK run independently completed the browser-action
+stage before a later unrelated palette assertion failed.
 
-Known limits: badge foreground/background color setters and `openPopup`
-currently resolve without changing GTK presentation; `setIcon` accepts
-extension package paths but not `ImageData`; popup size is a fixed 420x520
-logical pixels rather than manifest/content negotiated.
+The GTK correction pass also exposed an existing tree-sidebar lifetime bug:
+rows borrowed an `AdwTabPage` past finalization and later disconnected its
+title handler. Window-tab rows now retain the page until their handler is
+disconnected. Remote-control focus now targets a visible web face instead of
+its hidden shell, and `close_tab` follows the visible browser-page sidebar the
+same way new/step/collapse already do, so popup-owner teardown is deterministic
+and the action surface stays internally consistent.
+
+Known limits: `setIcon` accepts extension package paths but not `ImageData`;
+popup size is a fixed 420x520 logical pixels rather than manifest/content
+negotiated. WebExtensions remain unavailable for remote browser helpers until
+package transfer and a remote registry exist.

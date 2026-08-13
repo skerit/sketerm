@@ -652,8 +652,9 @@ pub const Client = struct {
     /// silently eat every frame descriptor and the pane would stay
     /// black, so its absence is a described failure, never a hang.
     cap_frames_inline: bool = false,
-    /// The helper hosts MV2-flavor WebExtensions (the 0xB0 frame block).
-    /// Absent, the GUI loads no extension and the helper hosts none.
+    /// The local helper hosts MV2-flavor WebExtensions (the 0xB0 frame
+    /// block). Remote clients suppress it because extension package paths
+    /// belong to the GUI host and are not transferred.
     cap_webext: bool = false,
     /// The helper accepts `webext_tabs` (0xB6), i.e. `browser.tabs` and
     /// `sender.tab` can be made real. Without it every extension sees
@@ -823,6 +824,8 @@ pub const Client = struct {
         self.cap_filter_subscribe = false;
         self.cap_reader_ids = false;
         self.cap_semantic_request_ids = false;
+        self.cap_webext = false;
+        self.cap_webext_tabs = false;
         self.cap_webext_action = false;
         if (self.bridge) |br| {
             self.bridge = null;
@@ -912,10 +915,10 @@ pub const Client = struct {
         // (before hello_ack, like view_create) — an old helper skips the
         // unknown frames and every view shares the default jar.
         publishContexts(self);
-        // Extensions the user installed are pushed to the fresh helper
-        // the same way, before any view exists.
+        // Extension package paths belong to this host. Remote helpers
+        // intentionally receive no WebExtensions until package bytes
+        // have a host-side registry/transfer protocol of their own.
         webext.ensureLoaded(self.gpa);
-        webext.publish(self);
         // A fresh helper holds no tab table; the extensions published
         // above will ask for one on their first request.
         tabsChanged();
@@ -1172,6 +1175,9 @@ pub const Client = struct {
                 self.cap_filter_subscribe = false;
                 self.cap_reader_ids = false;
                 self.cap_semantic_request_ids = false;
+                self.cap_webext = false;
+                self.cap_webext_tabs = false;
+                self.cap_webext_action = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -1200,6 +1206,14 @@ pub const Client = struct {
                     self.fail("The browser helper on the remote host is too old for remote browsing (no frames-inline capability).");
                     return;
                 }
+                if (self.isRemote()) {
+                    self.cap_webext = false;
+                    self.cap_webext_tabs = false;
+                    self.cap_webext_action = false;
+                } else if (self.cap_webext) {
+                    webext.publish(self);
+                    tabsChanged();
+                }
                 // Seed the helper with the stored user content before
                 // the faces' first navigations get far.
                 self.refreshUserContent();
@@ -1218,6 +1232,13 @@ pub const Client = struct {
             .ev_webext_popup => {
                 const ev = proto.decode(proto.EvWebextPopup, frame.payload) catch return;
                 if (self.findFace(ev.owner_view)) |face| face.onWebextPopup(ev);
+            },
+            .ev_webext_open_popup => {
+                if (self.isRemote()) return;
+                const ev = proto.decode(proto.EvWebextOpenPopup, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| {
+                    face.openWebextPopup(ev.id);
+                }
             },
             .frame_buffer => {
                 const fb = proto.decode(proto.FrameBuffer, frame.payload) catch return;
@@ -6214,6 +6235,11 @@ pub const WebFace = struct {
         if (self.actions) |a| a.refresh(json);
     }
 
+    pub fn openWebextPopup(self: *WebFace, id: []const u8) void {
+        if (!self.isActivePage()) return;
+        if (self.actions) |a| a.openPopup(id);
+    }
+
     pub fn onWebextPopup(self: *WebFace, ev: proto.EvWebextPopup) void {
         if (self.actions) |a| a.onPopup(ev);
     }
@@ -6691,9 +6717,9 @@ pub const WebFace = struct {
         const tabs = m.section();
         tabs.itemIcon("New Incognito Web Tab", .{ .name = "view-private-symbolic" }, &onMenuIncognito, ctx);
         tabs.itemIconEnabled(
-            "Extensions…",
+            if (cl.isRemote()) "Extensions (local browsers only)" else "Extensions...",
             .{ .name = "application-x-addon-symbolic" },
-            client().cap_webext,
+            cl.cap_webext and !cl.isRemote(),
             &onMenuExtensions,
             ctx,
         );

@@ -127,6 +127,18 @@ pub const Table = struct {
         return null;
     }
 
+    /// The active tab in the focused window, falling back to any active
+    /// tab when the client cannot report window focus.
+    pub fn active(self: *Table) ?*Tab {
+        var fallback: ?*Tab = null;
+        for (self.tabs.items) |*t_| {
+            if (!t_.active) continue;
+            if (t_.focused_window) return t_;
+            if (fallback == null) fallback = t_;
+        }
+        return fallback;
+    }
+
     /// Replace the whole table and report what changed. The returned
     /// diff owns its slices.
     pub fn replace(self: *Table, gpa: std.mem.Allocator, incoming: []const Incoming) !Diff {
@@ -360,6 +372,17 @@ test "findByView is how a content frame learns its sender.tab" {
     try t.expectEqual(@as(u32, 7), tb.findByView(70).?.id);
     try t.expect(tb.findByView(0) == null);
     try t.expect(tb.findByView(999) == null);
+}
+
+test "active prefers the focused window" {
+    const gpa = t.allocator;
+    var tb = Table{};
+    defer tb.deinit(gpa);
+    var first = tab(1, "https://a.test/", true);
+    first.focused_window = false;
+    var d = try tb.replace(gpa, &[_]Incoming{ first, tab(2, "https://b.test/", true) });
+    d.deinit(gpa);
+    try t.expectEqual(@as(u32, 2), tb.active().?.id);
 }
 
 test "query filters on active, window and url patterns" {

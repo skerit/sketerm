@@ -97,6 +97,8 @@ pub const Sidebar = struct {
 
     pub const Row = struct {
         sidebar: *Sidebar,
+        /// Window-tab rows own this AdwTabPage reference for exactly as
+        /// long as their notify::title handler can fire.
         item: Item,
         row: *c.GtkWidget,
         label: *c.GtkWidget,
@@ -104,6 +106,19 @@ pub const Sidebar = struct {
         /// title arrives through `Sidebar.noteWebTitle`).
         title_handler: c.gulong = 0,
     };
+
+    fn freeRow(self: *Sidebar, r: *Row, remove_widget: bool) void {
+        switch (r.item) {
+            .tab => |page| {
+                if (r.title_handler != 0)
+                    c.g_signal_handler_disconnect(@ptrCast(page), r.title_handler);
+                c.g_object_unref(@ptrCast(page));
+            },
+            .page => {},
+        }
+        if (remove_widget) c.gtk_list_box_remove(@ptrCast(self.list), r.row);
+        self.allocator.destroy(r);
+    }
 
     pub fn create(allocator: std.mem.Allocator, win: *Window) !*Sidebar {
         const self = try allocator.create(Sidebar);
@@ -171,9 +186,10 @@ pub const Sidebar = struct {
             self.sel_handler = 0;
         }
         if (!view_alive) {
-            // Widgets (and the per-page title handlers' pages) are
-            // gone with the view; free only our own bookkeeping.
-            for (self.rows.items) |r| self.allocator.destroy(r);
+            // The list widgets are gone with the view. Window-tab rows
+            // still own their page references, so release those without
+            // touching the dead list box.
+            for (self.rows.items) |r| self.freeRow(r, false);
             self.rows.deinit(self.allocator);
             self.allocator.destroy(self);
             return;
@@ -184,16 +200,7 @@ pub const Sidebar = struct {
     }
 
     fn clearRows(self: *Sidebar) void {
-        for (self.rows.items) |r| {
-            if (r.title_handler != 0) {
-                switch (r.item) {
-                    .tab => |p| c.g_signal_handler_disconnect(@ptrCast(p), r.title_handler),
-                    .page => {},
-                }
-            }
-            c.gtk_list_box_remove(@ptrCast(self.list), r.row);
-            self.allocator.destroy(r);
-        }
+        for (self.rows.items) |r| self.freeRow(r, true);
         self.rows.clearRetainingCapacity();
     }
 
@@ -292,6 +299,10 @@ pub const Sidebar = struct {
             .row = row,
             .label = label,
         };
+        switch (item) {
+            .tab => |page| _ = c.g_object_ref(@ptrCast(page)),
+            .page => {},
+        }
         setLabel(r);
         switch (item) {
             .tab => |page| r.title_handler = c.g_signal_connect_data(@ptrCast(page), "notify::title", @ptrCast(&onTitle), @ptrCast(r), null, c.G_CONNECT_DEFAULT),
@@ -319,14 +330,7 @@ pub const Sidebar = struct {
         c.gtk_widget_add_controller(row, @ptrCast(@alignCast(drop)));
 
         self.rows.append(self.allocator, r) catch {
-            if (r.title_handler != 0) {
-                switch (r.item) {
-                    .tab => |p| c.g_signal_handler_disconnect(@ptrCast(p), r.title_handler),
-                    .page => {},
-                }
-            }
-            c.gtk_list_box_remove(@ptrCast(self.list), row);
-            self.allocator.destroy(r);
+            self.freeRow(r, true);
         };
     }
 

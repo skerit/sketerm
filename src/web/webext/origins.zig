@@ -107,7 +107,7 @@ pub fn publish(
     locale: []const u8,
 ) bool {
     if (host.len != HOST_LEN) return false;
-    if (id.len > manifest.MAX_ID_LEN) return false;
+    if (!manifest.idValid(id)) return false;
     if (dir.len > MAX_DIR or dir.len == 0) return false;
     acquire();
     defer release();
@@ -265,6 +265,13 @@ test "a wrong-length host never matches" {
     try t.expect(lookup("bbbbbbbbbbbbbbb") == null);
     try t.expect(lookup("bbbbbbbbbbbbbbbbb") == null);
     try t.expect(lookup("bbbbbbbbbbbbbbbb") != null);
+}
+
+test "publish rejects malformed extension ids" {
+    clear();
+    defer clear();
+    try t.expect(!publish("bbbbbbbbbbbbbbbb", "../bad", "/one", &.{}, "en"));
+    try t.expect(!publish("bbbbbbbbbbbbbbbb", "x" ** (manifest.MAX_ID_LEN + 1), "/one", &.{}, "en"));
 }
 
 test "the table fills rather than overruns" {

@@ -110,6 +110,7 @@ pub fn ensureLoaded(gpa: std.mem.Allocator) void {
         if (item != .object) continue;
         const o = item.object;
         const id = strField(o, "id") orelse continue;
+        if (!manifest.idValid(id) or find(id) != null) continue;
         const edir = strField(o, "dir") orelse continue;
         const enabled = if (o.get("enabled")) |v| (v == .bool and v.bool) else false;
         const owned = if (o.get("owned")) |v| (v == .bool and v.bool) else false;
@@ -169,7 +170,7 @@ fn save() void {
 /// Push every installed extension to a (possibly fresh) helper on
 /// connect, then ask it to report state back.
 pub fn publish(cl: *webface.Client) void {
-    if (cl.state != .ready) return;
+    if (cl.state != .ready or cl.isRemote() or !cl.cap_webext) return;
     for (g_exts.items) |*e| {
         cl.post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (e.enabled) 1 else 0 });
     }
@@ -179,6 +180,7 @@ pub fn publish(cl: *webface.Client) void {
 /// Fold one `ev_webext_state` into the registry (name/version/ok/err).
 pub fn onState(st: proto.EvWebextState) void {
     const gpa = g_gpa orelse return;
+    if (!manifest.idValid(st.id)) return;
     const e = find(st.id) orelse return;
     if (st.name.len != 0) {
         gpa.free(e.name);
@@ -332,6 +334,7 @@ fn register(gpa: std.mem.Allocator, dir: []const u8, man: *manifest.Manifest, ow
 }
 
 pub fn setEnabled(id: []const u8, on: bool) void {
+    if (!manifest.idValid(id)) return;
     const e = find(id) orelse return;
     e.enabled = on;
     save();
@@ -340,6 +343,7 @@ pub fn setEnabled(id: []const u8, on: bool) void {
 }
 
 pub fn remove(id: []const u8) void {
+    if (!manifest.idValid(id)) return;
     const gpa = g_gpa orelse return;
     for (g_exts.items, 0..) |*e, i| {
         if (!std.mem.eql(u8, e.id, id)) continue;
@@ -488,7 +492,8 @@ const RowCtx = struct { gpa: std.mem.Allocator, id: [64]u8, id_len: usize };
 
 fn rowCtx(m: *Manager, id: []const u8) *RowCtx {
     const rc = m.gpa.create(RowCtx) catch unreachable;
-    rc.* = .{ .gpa = m.gpa, .id = undefined, .id_len = @min(id.len, 64) };
+    if (!manifest.idValid(id)) unreachable;
+    rc.* = .{ .gpa = m.gpa, .id = undefined, .id_len = id.len };
     @memcpy(rc.id[0..rc.id_len], id[0..rc.id_len]);
     return rc;
 }

@@ -22,8 +22,8 @@
 //! point of targeting the Firefox surface.
 
 const std = @import("std");
-const match = @import("match.zig");
 const manifest = @import("manifest.zig");
+const match = @import("match.zig");
 
 /// The three blocking-capable events. MV2 has more (onCompleted,
 /// onErrorOccurred, …) but only these three can change a request, and
@@ -319,7 +319,7 @@ fn findSlotLocked(id: []const u8) ?*Slot {
 /// Returns false when the table is full — the extension then simply
 /// never sees a request, which is a degradation, never a hang.
 pub fn publish(id: []const u8, reg: *Registry) bool {
-    if (id.len > MAX_ID) return false;
+    if (!manifest.idValid(id)) return false;
     acquire();
     defer release();
     if (findSlotLocked(id)) |s| {
@@ -711,4 +711,9 @@ test "clear drops every listener and the summary with it" {
     reg.clear(gpa);
     try t.expect(reg.summary.empty());
     try t.expect(needFor(&reg, .before_request, "https://x.test/a", .script).isNone());
+}
+test "published registry rejects malformed and overlong extension ids" {
+    var reg = Registry{};
+    try t.expect(!publish("../bad", &reg));
+    try t.expect(!publish("x" ** (MAX_ID + 1), &reg));
 }

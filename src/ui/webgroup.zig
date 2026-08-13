@@ -438,6 +438,10 @@ pub const Group = struct {
         // The pane titlebar and the window tab wear the ACTIVE page's
         // title; the page coming forward re-asserts both.
         face.onRaised();
+        // The helper publishes action snapshots only for the active
+        // mirrored page. A notebook switch changes that active bit even
+        // though no face was created or destroyed.
+        webface.tabsChanged();
         if (self.ownerWindow()) |win| win.sidebarRefreshSelection();
     }
 

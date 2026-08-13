@@ -90,6 +90,9 @@ var dk_drive: ?*appdrive.App = null;
 var dk_ready = false;
 var g_alloc: std.mem.Allocator = undefined;
 var g_mux_sock: []const u8 = "";
+/// Exact browser-helper pid captured by the action E2E and checked after
+/// the GUI's graceful shutdown.
+var web_helper_pid: c.pid_t = -1;
 /// This run's isolated `XDG_RUNTIME_DIR`, in a global buffer so the
 /// signal handlers and the final sweep can still name it. Empty until
 /// `main` has built it.
@@ -508,8 +511,13 @@ pub fn main() u8 {
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_CACHE_HOME", rt.ptr, 1);
+    _ = c.setenv("XDG_DATA_HOME", rt.ptr, 1);
     _ = c.unsetenv("SKETERM_SOCKET");
     defer @import("mux/daemon.zig").removeTreeBestEffort(rt);
+
+    const have_web_action = c.access("zig-out/bin/sketerm-webengine", c.X_OK) == 0;
+    if (have_web_action and !prepareWebActionFixture(allocator, rt))
+        return fail("could not prepare the browser-action GUI fixture");
 
     // A fresh XDG_CONFIG_HOME changes fontconfig's cache key, so every
     // isolated GUI launch below would otherwise rebuild the font caches
@@ -777,6 +785,13 @@ pub fn main() u8 {
         // unrelated red stage) does not hide this one.
         if (treeSidebarStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("tree sidebar: open, new_tab made a browser PAGE; closed, new_tab made a window tab");
+
+        if (have_web_action) {
+            if (webActionGuiStage(allocator, app, sock_path)) |why| return failMsg(why);
+            say("browser action: WebGroup switching refreshed per-tab icons; a trusted click opened, drove, closed and tore down a real extension popup");
+        } else {
+            say("SKIP browser-action GUI stage (sketerm-webengine is not built; run `zig build web` first)");
+        }
 
         // The palette RANKS rather than filters. Also before copy mode,
         // for the same reason the sidebar stage is.
@@ -1191,6 +1206,13 @@ pub fn main() u8 {
     child_pid = 0;
     if (!gui_ok) return fail("GUI exited abnormally during final teardown");
     if (c.access(sock_path.ptr, c.F_OK) == 0) return fail("socket not unlinked on shutdown");
+    if (web_helper_pid > 0) {
+        var helper_wait: u32 = 0;
+        while (!pidGone(web_helper_pid) and helper_wait < 10_000) : (helper_wait += 50)
+            _ = c.usleep(50_000);
+        if (!pidGone(web_helper_pid)) return fail("browser helper outlived the GUI's graceful shutdown");
+        web_helper_pid = -1;
+    }
 
     // Viewer, display session, daemon — by exact pid and by name.
     teardown();
@@ -2121,6 +2143,248 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     // on pane 1, which is what the stages after this one assume.
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);
+    return null;
+}
+
+const web_action_id = "gui-action@sketerm.test";
+
+const web_action_manifest =
+    \\{"manifest_version":2,"name":"GUI action fixture","version":"1",
+    \\ "browser_specific_settings":{"gecko":{"id":"gui-action@sketerm.test"}},
+    \\ "permissions":["tabs"],"background":{"scripts":["bg.js"],"persistent":true},
+    \\ "browser_action":{"default_title":"GUI Action","default_icon":"blue.png","default_popup":"popup.html"}}
+;
+
+const web_action_bg =
+    \\browser.tabs.onCreated.addListener(function(tab){
+    \\  browser.browserAction.setIcon({tabId:tab.id,path:tab.url.includes("action-two")?"orange.png":"blue.png"});
+    \\});
+    \\browser.tabs.onUpdated.addListener(function(id,change,tab){
+    \\  browser.browserAction.setIcon({tabId:id,path:tab.url.includes("action-two")?"orange.png":"blue.png"});
+    \\});
+;
+
+const web_action_popup =
+    \\<!doctype html><style>html,body{margin:0;width:100%;height:100%;background:#004400;color:white}button{margin:80px;width:220px;height:100px}</style>
+    \\<button id=b>popup:loading</button><script>
+    \\b.textContent="popup:"+browser.runtime.getManifest().name;
+    \\if(b.textContent==="popup:GUI action fixture")document.body.style.background="#00aa00";
+    \\b.onclick=()=>{document.body.style.background="#ff8800";b.textContent="clicked"};
+    \\</script>
+;
+
+fn prepareWebActionFixture(allocator: std.mem.Allocator, rt: [:0]const u8) bool {
+    var base_buf: [512:0]u8 = undefined;
+    const base = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm/webext", .{rt}) catch return false;
+    mkdirAllPath(base);
+    var ext_buf: [640:0]u8 = undefined;
+    const ext = std.fmt.bufPrintZ(&ext_buf, "{s}/fixture", .{base}) catch return false;
+    mkdirAllPath(ext);
+    var path_buf: [768:0]u8 = undefined;
+    const manifest_path = std.fmt.bufPrintZ(&path_buf, "{s}/manifest.json", .{ext}) catch return false;
+    if (!writeFile(manifest_path, web_action_manifest)) return false;
+    const bg_path = std.fmt.bufPrintZ(&path_buf, "{s}/bg.js", .{ext}) catch return false;
+    if (!writeFile(bg_path, web_action_bg)) return false;
+    const popup_path = std.fmt.bufPrintZ(&path_buf, "{s}/popup.html", .{ext}) catch return false;
+    if (!writeFile(popup_path, web_action_popup)) return false;
+    const blue_path = std.fmt.bufPrintZ(&path_buf, "{s}/blue.png", .{ext}) catch return false;
+    if (!writeSolidPng(allocator, blue_path.ptr, 0x20, 0x60, 0xff)) return false;
+    const orange_path = std.fmt.bufPrintZ(&path_buf, "{s}/orange.png", .{ext}) catch return false;
+    if (!writeSolidPng(allocator, orange_path.ptr, 0xff, 0x70, 0x10)) return false;
+    const registry_path = std.fmt.bufPrintZ(&path_buf, "{s}/registry.json", .{base}) catch return false;
+    var registry_buf: [1024]u8 = undefined;
+    const registry = std.fmt.bufPrint(&registry_buf,
+        "[{{\"id\":\"{s}\",\"dir\":\"{s}\",\"enabled\":true,\"owned\":false}}]",
+        .{ web_action_id, ext }) catch return false;
+    return writeFile(registry_path, registry);
+}
+
+fn mkdirAllPath(path: [:0]const u8) void {
+    var copy: [768:0]u8 = @splat(0);
+    if (path.len >= copy.len) return;
+    @memcpy(copy[0..path.len], path);
+    var i: usize = 1;
+    while (i <= path.len) : (i += 1) {
+        if (i != path.len and copy[i] != '/') continue;
+        const saved = copy[i];
+        copy[i] = 0;
+        _ = c.mkdir(&copy, 0o700);
+        copy[i] = saved;
+    }
+}
+
+fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8) ?[]const u8 {
+    _ = app.drainLive(1_000);
+    if (app.windows.items.len == 0) return "the display session lost its window before the browser-action stage";
+    const win_id = app.windows.items[0].id;
+    if (openPopup(app) != null) return "a popup was already open before the browser-action stage";
+    var keep_ids: [64]u32 = undefined;
+    const keep_n = blk: {
+        const before = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse return "listing panes before the browser-action stage failed";
+        defer allocator.free(before);
+        break :blk listPaneIds(before, &keep_ids);
+    };
+
+    const open = roundtrip(allocator, sock,
+        "{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"data:text/html,<title>action-one</title><body style='margin:0;background:%23eee'>one</body>\"}\n") orelse
+        return "opening the browser-action page failed";
+    defer allocator.free(open);
+    if (std.mem.indexOf(u8, open, "\"ok\":true") == null) return "the browser-action page was rejected";
+    const pane = parseNumAfter(open, "\"pane\":") orelse return "the browser-action page reply had no pane";
+
+    var views: [4]u32 = undefined;
+    var first_view: u32 = 0;
+    var tries: u32 = 0;
+    while (tries < 150) : (tries += 1) {
+        const list = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse continue;
+        defer allocator.free(list);
+        if (std.mem.indexOf(u8, list, "\"helper\":\"ready\"") != null and webViewIds(list, pane, &views) >= 1) {
+            first_view = views[0];
+            if (findToolbarColor(app, win_id, .blue) != null) break;
+        }
+        _ = app.pumpOnce(100);
+    } else return "the browser action never appeared in the real GTK toolbar";
+
+    web_helper_pid = helperPidOf(child_pid) orelse return "the browser helper pid could not be identified exactly";
+    const blue = findToolbarColor(app, win_id, .blue) orelse return "the first page did not show its blue per-tab action icon";
+
+    // Open another PAGE in the same WebGroup, then navigate it to the
+    // URL that gives it the orange per-tab override.
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"toggle_tab_sidebar\"}\n")) |r| allocator.free(r) else
+        return "opening the tree sidebar for the browser-action stage failed";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"new_tab\"}\n")) |r| allocator.free(r) else
+        return "opening the second WebGroup page failed";
+    var nav_buf: [512]u8 = undefined;
+    const nav = std.fmt.bufPrint(&nav_buf,
+        "{{\"cmd\":\"web-navigate\",\"pane\":{d},\"data\":\"data:text/html,<title>action-two</title><body style='margin:0;background:%23ddd'>two</body>\"}}\n",
+        .{pane}) catch return "building the second-page navigation failed";
+    if (roundtrip(allocator, sock, nav)) |r| allocator.free(r) else return "navigating the second WebGroup page failed";
+    _ = app.waitIdle(300, 8_000);
+    var second_view: u32 = 0;
+    tries = 0;
+    while (tries < 100) : (tries += 1) {
+        const list = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse continue;
+        defer allocator.free(list);
+        if (webViewIds(list, pane, &views) >= 2) {
+            second_view = activeWebView(list, pane);
+            if (second_view != 0 and second_view != first_view and findToolbarColor(app, win_id, .orange) != null) break;
+        }
+        _ = app.pumpOnce(100);
+    } else return "switching the WebGroup to its second page did not refresh the orange per-tab action icon";
+
+    // Switch back and require the blue icon to return before clicking it.
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"tab_tree_prev\"}\n")) |r| allocator.free(r) else
+        return "switching back to the first WebGroup page failed";
+    tries = 0;
+    var action = blue;
+    while (tries < 100) : (tries += 1) {
+        const list = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse continue;
+        defer allocator.free(list);
+        if (activeWebView(list, pane) == first_view) {
+            if (findToolbarColor(app, win_id, .blue)) |p| {
+                action = p;
+                break;
+            }
+        }
+        _ = app.pumpOnce(100);
+    } else return "switching back did not restore the first page's blue action icon";
+
+    app.clickEx(win_id, action.x, action.y, 1, 100, 1) catch return "the trusted action-button click could not be injected";
+    const popup = waitPopup(app, true, 20_000) orelse return "the trusted GTK action click opened no native popup surface";
+    if (waitPopupColor(app, popup, .green, 20_000) == null)
+        return "the extension popup never painted the runtime.getManifest success state";
+    app.clickEx(popup, 190, 130, 1, 100, 1) catch
+        return "clicking inside the extension popup failed";
+    if (waitPopupColor(app, popup, .orange, 10_000) == null)
+        return "trusted popup input did not repaint the extension document";
+    if (app.screenshotPng(popup, 1024, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("/tmp/sketerm-e2e-webaction-popup.png", shot.png);
+    } else |_| return "screenshotting the extension popup failed";
+    app.pressKey(popup, "Escape") catch return "injecting Escape into the extension popup failed";
+    if (waitPopup(app, false, 10_000) == null) return "the extension popup did not close on Escape";
+
+    // Reopen, then close the OWNER page. The popup must disappear and
+    // the surviving second page must remain driveable.
+    app.clickEx(win_id, action.x, action.y, 1, 100, 1) catch return "reopening the extension popup failed";
+    _ = waitPopup(app, true, 20_000) orelse return "the extension popup did not reopen";
+    // The popup owns the Wayland keyboard grab, so a seat chord would
+    // correctly reach its document rather than the toplevel shortcut.
+    // Dispatch the same close_tab action directly to exercise owner
+    // teardown deterministically.
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"close_tab\"}\n")) |r| {
+        defer allocator.free(r);
+        if (std.mem.indexOf(u8, r, "\"ok\":true") == null)
+            return "closing the popup owner page was rejected";
+    } else return "closing the popup owner page failed";
+    if (waitPopup(app, false, 15_000) == null) return "closing the owner page did not close its extension popup";
+    const alive = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "the GUI stopped serving after popup-owner teardown";
+    defer allocator.free(alive);
+    if (std.mem.indexOf(u8, alive, "\"ok\":true") == null or std.mem.indexOf(u8, alive, "\"helper\":\"ready\"") == null)
+        return "the GUI/helper was unhealthy after popup-owner teardown";
+
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"toggle_tab_sidebar\"}\n")) |r| allocator.free(r);
+    closeAddedPanes(allocator, sock, app, keep_ids[0..keep_n]);
+    return null;
+}
+
+const ToolbarColor = enum { blue, orange, green };
+const Point = struct { x: f64, y: f64 };
+
+fn findToolbarColor(app: *appdrive.App, win_id: u32, color: ToolbarColor) ?Point {
+    const win = app.winById(win_id) orelse return null;
+    if (win.w <= 0 or win.h <= 0) return null;
+    const w: usize = @intCast(win.w);
+    const h: usize = @intCast(win.h);
+    const limit_y = @min(h, 180);
+    var y: usize = 0;
+    while (y < limit_y) : (y += 1) {
+        var x: usize = w / 2;
+        while (x < w) : (x += 1) {
+            const i = (y * w + x) * 4;
+            if (i + 3 >= win.pixels.items.len) return null;
+            const b = win.pixels.items[i];
+            const g = win.pixels.items[i + 1];
+            const r = win.pixels.items[i + 2];
+            const match = switch (color) {
+                .blue => b > 180 and b > r +| 80 and b > g +| 40,
+                .orange => r > 180 and g > 50 and g < 170 and b < 80,
+                .green => g > 120 and g > r +| 70 and g > b +| 70,
+            };
+            if (match) return .{ .x = @floatFromInt(x), .y = @floatFromInt(y) };
+        }
+    }
+    return null;
+}
+
+fn waitPopupColor(app: *appdrive.App, popup: u32, color: ToolbarColor, timeout_ms: u32) ?Point {
+    var waited: u32 = 0;
+    while (waited < timeout_ms) : (waited += 100) {
+        if (findToolbarColor(app, popup, color)) |p| return p;
+        _ = app.pumpOnce(100);
+    }
+    return null;
+}
+
+fn helperPidOf(gui_pid: c.pid_t) ?c.pid_t {
+    if (builtin.os.tag != .linux) return null;
+    const d = c.opendir("/proc") orelse return null;
+    defer _ = c.closedir(d);
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        const pid = std.fmt.parseInt(c.pid_t, name, 10) catch continue;
+        var path_buf: [96:0]u8 = undefined;
+        const status_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/status", .{pid}) catch continue;
+        const status = readFileAlloc(g_alloc, status_path) orelse continue;
+        defer g_alloc.free(status);
+        var needle_buf: [32]u8 = undefined;
+        const needle = std.fmt.bufPrint(&needle_buf, "PPid:\t{d}\n", .{gui_pid}) catch continue;
+        if (std.mem.indexOf(u8, status, needle) == null) continue;
+        const cmd_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/cmdline", .{pid}) catch continue;
+        const cmd = readFileAlloc(g_alloc, cmd_path) orelse continue;
+        defer g_alloc.free(cmd);
+        if (std.mem.indexOf(u8, cmd, "sketerm-webengine") != null) return pid;
+    }
     return null;
 }
 
