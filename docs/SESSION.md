@@ -17971,3 +17971,73 @@ passes end to end. The latest full modified run continued through stage 37,
 then failed the independent stage 34a; an untouched `5b84a00` worktree likewise
 continued past its known request-context CEF shutdown SIGSEGV and failed stage
 34c. The full rig is therefore not claimed as a clean pass here.
+## 2026-08-13: WebExtension browser actions and real popup pages
+
+Installed MV2 extensions now put their declared `browser_action` or
+`page_action` in the active browser page's GTK toolbar. The button carries
+the extension icon, title, badge and enabled state. Runtime calls update
+global or per-tab title/icon/popup/badge/enabled overrides, and a toolbar
+click either fires `browserAction.onClicked` with the active tab or opens the
+declared popup. Popup controls receive pointer, scroll, key and focus input;
+Escape and clicking away close the popover.
+
+The responsibility split is explicit. `web/webext/action.zig` owns pure
+manifest-default and tab-override state. The helper validates that an
+activation names a live enabled extension and the active mirrored tab, then
+either dispatches the click into its background page or creates a real
+extension-origin CEF browser. `ui/webaction.zig` owns only GTK presentation,
+frame import and trusted input. Popup input rides the owning face's
+`webface.Client`, not the process-local singleton, so actions work for remote
+browser helpers too. Action snapshots update existing buttons in place when
+the extension ids are unchanged; rebuilding the anchor on every badge update
+would close a popup from inside its own startup.
+
+The append-only wire additions are capability `webext-action` and frames
+0xB7 action snapshot, 0xB8 trusted activation and 0xB9 popup lifecycle.
+Client-minted popup views start at `0x60000000`, separate from ordinary
+client views, DevTools and the helper's hidden background range. Popup CEF
+browsers force software frames: local clients receive memfd damage and remote
+clients receive the existing inline-frame family. Closing the GTK popover
+destroys the helper view; owner-page teardown and extension disable/removal
+close it in the other direction.
+
+The security boundary was tested rather than inferred. Popup HTML receives
+the extension bootstrap before its first author script, including
+`runtime.getManifest()`. CEF can still report the previous frame URL while
+that parser-blocking bootstrap is fetched, so the scheme handler accepts an
+exact target-host match from `get_first_party_for_cookies`. The fallback is
+strictly host-equal. Smoke stage 40 proves ordinary pages, `about:blank`,
+`data:` and another extension's origin cannot fetch the privileged bootstrap
+or obtain extension globals.
+
+Files affected: `src/web/webext/action.zig`, manifest/host dispatch,
+`src/web/cefhost.zig`, `src/web/protocol.zig`, `src/web/server.zig`,
+`src/web/semantic.js`, `src/ui/webaction.zig`, `src/ui/webface.zig`,
+`src/ui/webext.zig`, both test roots and `src/smoke_web.zig`.
+
+Tests added: pure action-state coverage for global/per-tab separation, sized
+icons, popup clearing, tab cleanup and invalid tab ids; manifest sized-icon
+selection; protocol round trips; smoke-web stage 40 for popup paint/runtime
+APIs, no-popup clicks, missing assets, origin isolation and both teardown
+directions.
+
+Verification: Zig AST checks for every changed Zig module,
+`node --check src/web/semantic.js`, `zig build`, `zig build web`, `zig build
+test` (2452 passed, 5 skipped), `zig build test-core` (2032 passed, 6 skipped),
+and a complete `zig build smoke-web` with all six stage 40 assertions and real
+uBlock Origin stage 35b passing. The first full smoke run stopped earlier in
+the unchanged stage 27 isolation probe after proxy B observed
+`www.google.com`; the immediate complete rerun passed stage 27 and the whole
+rig.
+
+The GTK half was also driven in an isolated headless Wayland session with the
+built binaries and a temporary unpacked extension. Its toolbar button appeared
+in AT-SPI, activating it opened a 444x556 native popover whose frame rendered
+"GUI POPUP WORKS", Escape closed the popup, and the GUI exited 0. Two
+`gtk_widget_get_visible` criticals on whole-window shutdown reproduce without
+any extension installed and are not introduced by this path.
+
+Known limits: badge foreground/background color setters and `openPopup`
+currently resolve without changing GTK presentation; `setIcon` accepts
+extension package paths but not `ImageData`; popup size is a fixed 420x520
+logical pixels rather than manifest/content negotiated.
