@@ -366,6 +366,22 @@ dispatch, and the blocking half is documented in its own section below).
   `browser.*` shape. `getMessage` expands `$1`/`$name$` placeholders on
   both sides — the JS copy exists because the API is synchronous and a
   Promise would break every caller.
+- **An extension id is a label, not authority.** Each enabled extension
+  instance has a random 128-bit capability. The privileged bootstrap,
+  API calls and results, routed messages and replies, Ports, webRequest
+  holds, events and action clicks all carry it; the helper authorises the
+  capability first and then verifies the claimed id. Reinstall, toggle,
+  `runtime.reload`, removal and helper restart revoke the old instance and
+  mint another capability. `ext-revoke` invalidates the old JavaScript API
+  object, disconnects its Ports and rejects pending and future calls, so a
+  stale page cannot keep using browser authority after its extension dies.
+  Keep the capability in `webext/origins.zig`'s IO-thread-owned slot rather
+  than reading `Host.exts` from the IO thread.
+- **Unsupported asynchronous APIs reject their Promise.** A resolved no-op
+  lies to feature detection and lets an extension continue under false
+  assumptions. `runtime.getPlatformInfo` and `getBrowserInfo` are real
+  resolved values; explicitly unsupported tabs/windows/menus/navigation/
+  notification/command/permission methods reject with their API name.
 - **`browser.tabs` is real, and the GUI owns it.** The client posts its
   WHOLE tab list as `webext_tabs` (0xB6, capability `webext-tabs`);
   `webext/tabs.zig` DIFFS it against what it held and synthesises MV2's
@@ -396,8 +412,13 @@ dispatch, and the blocking half is documented in its own section below).
   per-tab overrides, trusted `onClicked`, `pageAction.show`/`hide`, programmatic
   `browserAction.openPopup`, and declared popup pages. A browser action is
   visible by default; a page action is hidden until shown for that tab. The
-  GUI renders enabled visible actions in each active page's toolbar and the
-  helper validates the mirrored active tab before accepting an activation.
+  GUI renders enabled visible actions in the focused window's focused pane
+  and active page, and the helper validates the mirrored active tab before
+  accepting an activation. Real process-wide `Window.id` values and
+  per-window indices are published. Action state remains cached per active
+  tab, but GTK presentation is a separate local gate: focus changes hide or
+  restore the cached toolbar without waiting for a helper round trip, and an
+  inactive split/window cannot present or activate a late snapshot.
   Popup pages are real extension-origin CEF browsers, not scraped HTML: they
   receive the same privileged bootstrap as background/options pages and
   paint through the ordinary shm/inline frame paths into a GTK popover.
@@ -415,14 +436,16 @@ dispatch, and the blocking half is documented in its own section below).
   or enablement methods.
   `openPopup` from a privileged extension page resolves the active tab in
   the focused window and asks that page's native toolbar to run the same
-  activation path; content scripts and popup-less/hidden/disabled actions
-  reject. **WebExtensions are local-browser only.** Installed-package paths
+  activation path. It remains pending until the GUI returns the correlated
+  append-only `webext_open_popup_result` (0xBB); failure text is UTF-8-safe.
+  Content scripts and popup-less/hidden/disabled actions reject.
+  **WebExtensions are local-browser only.** Installed-package paths
   belong to the GUI host and there is no package-transfer/remote-registry
   protocol, so remote clients suppress `webext`, `webext-tabs` and
   `webext-action` and receive no extension state. `setIcon` accepts package
   paths, not `ImageData`; popup size remains a fixed 420x520 logical pixels.
 - Other namespaces an extension calls UNCONDITIONALLY are present as
-  benign stubs (`menus`, `windows`, `webNavigation`, `notifications`,
+  explicit rejecting stubs (`menus`, `windows`, `webNavigation`, `notifications`,
   `commands`, `permissions`, `extension`, and the notification-only
   `webRequest` events). They exist because their ABSENCE is fatal.
   `alarms` and `storage.session` are REAL (a timer and an in-memory map
@@ -442,13 +465,19 @@ dispatch, and the blocking half is documented in its own section below).
   browser-action activation opens and paints a real extension-origin popup
   whose first script can call `runtime.getManifest`. It also proves
   `browserAction.openPopup`, popup-less clicks, malformed-id rejection, a
-  missing popup asset failing without a view, and both teardown directions.
+  missing popup asset failing without a view, correlated popup success/failure
+  acknowledgement, capability impersonation/revocation/rotation, stale API
+  rejection, unsupported Promise rejection, and both teardown directions.
   Ordinary, `about:blank`, `data:`, exact-host HTTP/HTTPS and foreign-extension
   origins cannot read the privileged bootstrap. The exact-origin
   `get_first_party_for_cookies` fallback in `extSchemeCreate` is required
   because CEF can expose the previous frame URL while a parser-blocking
   extension script loads. It must stay exact-origin: broadening it would
   reopen the bootstrap nonce to another origin.
+  Smoke-e2e drives two real split panes and two real GTK toplevels: focus
+  moves the sole presented action, inactive toolbars clear, the second
+  window's trusted action opens its popup there, and closing it restores the
+  first window's cached action.
 
 ## Blocking webRequest (MV2) — where the decision goes, and what it costs
 

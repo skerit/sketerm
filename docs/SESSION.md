@@ -18068,3 +18068,73 @@ Known limits: `setIcon` accepts extension package paths but not `ImageData`;
 popup size is a fixed 420x520 logical pixels rather than manifest/content
 negotiated. WebExtensions remain unavailable for remote browser helpers until
 package transfer and a remote registry exist.
+
+## 2026-08-13: WebExtension capability and focus hardening
+
+Every enabled extension instance now receives a random 128-bit capability.
+The privileged bootstrap, API calls/results, routed messages/replies, Ports,
+webRequest holds, events and action clicks carry it; the helper authorises the
+capability before accepting the claimed extension id. Reinstall, enable/disable,
+`runtime.reload`, removal and helper restart rotate or revoke the capability.
+The bridge sends `ext-revoke` before destroying an instance, which disconnects
+old Ports and rejects pending and future calls made through stale API objects.
+An extension can no longer impersonate another by replacing only the `ext`
+field, and stale pages cannot retain browser authority after lifecycle changes.
+
+Helper failures now reject JavaScript Promises with their error text instead of
+resolving `undefined`. APIs that are present for compatibility but not
+implemented also reject explicitly; `runtime.getPlatformInfo()` and
+`runtime.getBrowserInfo()` remain real resolved calls. Routed messages record
+both endpoint views and their owning extension, and view/extension teardown
+retires routes, Ports, webRequest holds, popups and origin slots without leaving
+a Promise waiting on a dead recipient. The CEF extension resource handler's
+`has_at_least_one_ref` callback now tests `refs >= 1` rather than reusing the
+exactly-one predicate.
+
+`browserAction.openPopup()` no longer resolves when the helper merely posts a
+request. Append-only frame 0xBB (`webext_open_popup_result`) correlates the GUI
+attempt, and the Promise resolves or rejects only after the focused native
+toolbar reports whether it created the popover. Failure details and GTK badge,
+tooltip and popup error truncation preserve complete UTF-8 codepoints.
+
+The GUI tab mirror now publishes real process-wide window ids, per-window tab
+indices, the GTK-selected tab, focused split pane, active WebGroup page and the
+application's active toplevel. Per-tab action state stays cached, while native
+presentation is gated locally: only the active window's focused pane presents
+its toolbar, focus changes hide or restore cached state without a helper round
+trip, and a late replace-all snapshot cannot make an inactive split or window
+clickable. Programmatic popup authorization uses the same focus rule.
+
+Files affected: `src/web/semantic.js`, `src/web/cefhost.zig`,
+`src/web/protocol.zig`, `src/web/server.zig`, `src/web/webext/host.zig`,
+`src/web/webext/origins.zig`, the WebExtension fixture scripts,
+`src/ui/webaction.zig`, `src/ui/webface.zig`, `src/ui/window.zig`,
+`src/ui/tabchrome.zig`, `src/ui/termsinks.zig`, both test roots and the two
+smoke rigs.
+
+Tests added or expanded: core host tests prove capabilities are extension-bound,
+rotate and expose no MV3 `action` alias. Smoke-web proves two-extension
+impersonation rejection; helper and local unsupported-API Promise rejection;
+rotation across reinstall, toggle, reload, removal and helper restart; stale API
+rejection; positive, negative, mismatched and UTF-8 popup acknowledgement; and
+same-host HTTP/HTTPS plus inherited-origin isolation. Smoke-e2e drives real
+split panes and real GTK toplevels, checks stale toolbar clearing in both, opens
+a popup from the focused second window and verifies the primary window's cached
+action returns when focus does.
+
+Verification: changed Zig files passed `zig ast-check`, `node --check
+src/web/semantic.js` passed, `git diff --check` passed, `zig build test-core
+--summary all` passed 2042 tests and `zig build web --summary all` passed.
+`SKETERM_WEB_GPU=0 LIBGL_ALWAYS_SOFTWARE=1 zig build smoke-web --summary all`
+passed all 40 stages and real uBlock Origin. The native GPU run reached stage 24
+then hit the existing CEF `Unable to allocate frame for first frame capture:
+OOM?` path with no dma-buf frame. The software GTK smoke repeatedly passed the
+new browser-action stage, including split/window focus and popup teardown, then
+failed in the unrelated terminal scrollbar mouse-reporting stage. A detached
+run of the pre-hardening commit also failed in terminal protocol input, earlier
+than that stage, so this host cannot supply a green full smoke-e2e verdict for
+either revision.
+
+Known limits remain unchanged: popup size is fixed at 420x520 logical pixels,
+`setIcon` does not accept `ImageData`, and WebExtensions remain local-browser
+only.

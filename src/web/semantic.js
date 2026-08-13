@@ -1142,7 +1142,7 @@
   // see src/web/CLAUDE.md): the closure isolates the API surface, not
   // the intrinsics, so page and content script still share globals.
   var extReqSeq = 1;
-  var extPending = {}; // req -> resolve fn
+  var extPending = {}; // req -> {resolve,reject,ext,cap}
   var extCtx = {}; // ext id -> { listeners:[], changed:[] }
   var extApiOf = {}; // ext id -> the `browser` object built for it
 
@@ -1151,7 +1151,8 @@
   // bridge never settled, and the pairing is invisible without this.
   var extDebug = false;
 
-  function extApiCall(extId, ns, method, args) {
+  function extApiCall(extId, capability, ns, method, args) {
+    if (!capability) return Promise.reject(new Error("extension context is unavailable"));
     var req = extReqSeq++;
     if (extDebug) {
       try {
@@ -1159,17 +1160,18 @@
           JSON.stringify(args).slice(0, 200));
       } catch (e) {}
     }
-    return new Promise(function (resolve) {
-      extPending[req] = resolve;
-      send({ op: "ext-call", ext: extId, ns: ns, method: method, args: args, req: req });
+    return new Promise(function (resolve, reject) {
+      extPending[req] = { resolve: resolve, reject: reject, ext: extId, cap: capability };
+      send({ op: "ext-call", ext: extId, cap: capability, ns: ns, method: method, args: args, req: req });
     });
   }
 
-  function extSendMessage(extId, msg) {
+  function extSendMessage(extId, capability, msg) {
+    if (!capability) return Promise.reject(new Error("extension context is unavailable"));
     var req = extReqSeq++;
-    return new Promise(function (resolve) {
-      extPending[req] = resolve;
-      send({ op: "ext-send", ext: extId, req: req, msg: msg });
+    return new Promise(function (resolve, reject) {
+      extPending[req] = { resolve: resolve, reject: reject, ext: extId, cap: capability };
+      send({ op: "ext-send", ext: extId, cap: capability, req: req, msg: msg });
     });
   }
 
@@ -1217,7 +1219,7 @@
           id: id,
           blocking: spec.indexOf("blocking") >= 0
         });
-        extApiCall(extId, "webRequest", "addListener", [
+        extApiCall(extId, ctx.cap, "webRequest", "addListener", [
           eventName, id, filter || {}, spec
         ]);
       },
@@ -1226,7 +1228,7 @@
           if (entries[i].fn !== fn) continue;
           var id = entries[i].id;
           entries.splice(i, 1);
-          extApiCall(extId, "webRequest", "removeListener", [id]);
+          extApiCall(extId, ctx.cap, "webRequest", "removeListener", [id]);
           return;
         }
       },
@@ -1295,7 +1297,7 @@
       onErrorOccurred: inertEvent(),
       onAuthRequired: inertEvent(),
       handlerBehaviorChanged: function () {
-        return extApiCall(extId, "webRequest", "handlerBehaviorChanged", []);
+        return extApiCall(extId, ctx.cap, "webRequest", "handlerBehaviorChanged", []);
       }
     };
   }
@@ -1307,6 +1309,7 @@
   // request open on a timeout anyway, and answering promptly is better.
   function extWebRequest(m) {
     var answered = false;
+    var ctx = extCtx[m.ext];
     // An "obs" notification is a mailbox drop: the browser process has
     // already continued the request and retired its slot, so answering
     // would name a hold that no longer exists.
@@ -1316,11 +1319,11 @@
       answered = true;
       if (!wantAnswer) return;
       try {
-        send({ op: "ext-wreq-decision", hid: m.hid, d: d || {} });
+        if (!ctx || ctx.cap !== m.cap) return;
+        send({ op: "ext-wreq-decision", ext: m.ext, cap: ctx.cap, hid: m.hid, d: d || {} });
       } catch (e) {}
     }
-    var ctx = extCtx[m.ext];
-    if (!ctx || !ctx.wreq) {
+    if (!ctx || ctx.cap !== m.cap || !ctx.wreq) {
       answer(null);
       return;
     }
@@ -1388,8 +1391,10 @@
     answer(merged);
   }
 
-  function makeBrowser(extId, baseUrl, manifestObj, messages) {
+  function makeBrowser(extId, capability, baseUrl, manifestObj, messages) {
+    invalidateExtContext(extId, null, "extension context was replaced");
     var ctx = {
+      cap: capability,
       listeners: extEvent(),
       changed: extEvent(),
       wreq: {},
@@ -1400,16 +1405,16 @@
     extCtx[extId] = ctx;
     var storageLocal = {
       get: function (keys) {
-        return extApiCall(extId, "storage", "get", [keys === undefined ? null : keys]);
+        return extApiCall(extId, ctx.cap, "storage", "get", [keys === undefined ? null : keys]);
       },
       set: function (obj) {
-        return extApiCall(extId, "storage", "set", [obj]);
+        return extApiCall(extId, ctx.cap, "storage", "set", [obj]);
       },
       remove: function (keys) {
-        return extApiCall(extId, "storage", "remove", [keys]);
+        return extApiCall(extId, ctx.cap, "storage", "remove", [keys]);
       },
       clear: function () {
-        return extApiCall(extId, "storage", "clear", []);
+        return extApiCall(extId, ctx.cap, "storage", "clear", []);
       },
       onChanged: ctx.changed
     };
@@ -1427,7 +1432,7 @@
           // The 1-arg form; an extension id / options arg is tolerated
           // by ignoring everything but the last message-shaped arg.
           var m = arguments.length > 1 ? arguments[arguments.length - 1] : msg;
-          return extSendMessage(extId, m);
+          return extSendMessage(extId, ctx.cap, m);
         },
         connect: function (a, b) {
           // MV2: connect(connectInfo) or connect(extensionId, connectInfo).
@@ -1456,32 +1461,32 @@
       },
       tabs: {
         query: function (q) {
-          return extApiCall(extId, "tabs", "query", [q || {}]);
+          return extApiCall(extId, ctx.cap, "tabs", "query", [q || {}]);
         },
         get: function (id) {
-          return extApiCall(extId, "tabs", "get", [id]);
+          return extApiCall(extId, ctx.cap, "tabs", "get", [id]);
         },
         sendMessage: function (id, msg) {
-          return extApiCall(extId, "tabs", "sendMessage", [id, msg]);
+          return extApiCall(extId, ctx.cap, "tabs", "sendMessage", [id, msg]);
         },
         update: function (a, b) {
           // update(props) or update(tabId, props).
           var id = typeof a === "number" ? a : -1;
           var props = (typeof a === "object" ? a : b) || {};
-          return extApiCall(extId, "tabs", "update", [id, props]);
+          return extApiCall(extId, ctx.cap, "tabs", "update", [id, props]);
         },
         create: function (props) {
-          return extApiCall(extId, "tabs", "create", [props || {}]);
+          return extApiCall(extId, ctx.cap, "tabs", "create", [props || {}]);
         },
         reload: function (id) {
-          return extApiCall(extId, "tabs", "reload", [typeof id === "number" ? id : -1]);
+          return extApiCall(extId, ctx.cap, "tabs", "reload", [typeof id === "number" ? id : -1]);
         },
-        remove: noopAsync,
-        insertCSS: noopAsync,
-        removeCSS: noopAsync,
-        executeScript: noopAsyncValue([]),
-        getZoom: noopAsyncValue(1),
-        setZoom: noopAsync,
+        remove: unsupportedAsync("tabs.remove"),
+        insertCSS: unsupportedAsync("tabs.insertCSS"),
+        removeCSS: unsupportedAsync("tabs.removeCSS"),
+        executeScript: unsupportedAsync("tabs.executeScript"),
+        getZoom: unsupportedAsync("tabs.getZoom"),
+        setZoom: unsupportedAsync("tabs.setZoom"),
         onUpdated: extEvent(),
         onRemoved: extEvent(),
         onActivated: extEvent(),
@@ -1492,6 +1497,33 @@
     ctx.tabs = api.tabs;
     extApiOf[extId] = api;
     return api;
+  }
+
+  function invalidateExtContext(extId, capability, reason) {
+    var ctx = extCtx[extId];
+    if (!ctx || (capability && ctx.cap !== capability)) return;
+    var oldCap = ctx.cap;
+    ctx.cap = "";
+    for (var gid in ctx.ports) {
+      var port = ctx.ports[gid];
+      if (!port || port.dead) continue;
+      port.dead = true;
+      fireAll(port.onDisconnect, [port]);
+    }
+    for (var lid in ctx.pending_ports) {
+      var pendingPort = ctx.pending_ports[lid];
+      if (!pendingPort || pendingPort.dead) continue;
+      pendingPort.dead = true;
+      fireAll(pendingPort.onDisconnect, [pendingPort]);
+    }
+    for (var req in extPending) {
+      var pending = extPending[req];
+      if (!pending || pending.ext !== extId || pending.cap !== oldCap) continue;
+      delete extPending[req];
+      pending.reject(new Error(reason || "extension context is unavailable"));
+    }
+    delete extCtx[extId];
+    delete extApiOf[extId];
   }
 
   // The UI language, filled in by the first ext-inject that carries one.
@@ -1513,38 +1545,35 @@
   // detects (`privacy`, `dns`, `contentScripts`, `storage.sync`/`managed`,
   // `filterResponseData`) is deliberately LEFT ABSENT, because degrading
   // gracefully is what that detection is for and a stub would defeat it.
-  function noopAsync() {
-    return Promise.resolve();
-  }
-  function noopAsyncValue(v) {
+  function unsupportedAsync(name) {
     return function () {
-      return Promise.resolve(v);
+      return Promise.reject(new Error(name + " is not supported"));
     };
   }
 
   function addExtStubs(api, extId, ctx, manifestObj) {
     var actionNs = manifestObj.page_action ? "pageAction" : "browserAction";
     var action = {
-      setIcon: function (d) { return extApiCall(extId, actionNs, "setIcon", [d || {}]); },
-      setTitle: function (d) { return extApiCall(extId, actionNs, "setTitle", [d || {}]); },
-      setPopup: function (d) { return extApiCall(extId, actionNs, "setPopup", [d || {}]); },
-      getPopup: function (d) { return extApiCall(extId, actionNs, "getPopup", [d || {}]); },
-      getTitle: function (d) { return extApiCall(extId, actionNs, "getTitle", [d || {}]); },
+      setIcon: function (d) { return extApiCall(extId, ctx.cap, actionNs, "setIcon", [d || {}]); },
+      setTitle: function (d) { return extApiCall(extId, ctx.cap, actionNs, "setTitle", [d || {}]); },
+      setPopup: function (d) { return extApiCall(extId, ctx.cap, actionNs, "setPopup", [d || {}]); },
+      getPopup: function (d) { return extApiCall(extId, ctx.cap, actionNs, "getPopup", [d || {}]); },
+      getTitle: function (d) { return extApiCall(extId, ctx.cap, actionNs, "getTitle", [d || {}]); },
       onClicked: extEvent()
     };
     if (manifestObj.browser_action) {
-      action.setBadgeText = function (d) { return extApiCall(extId, actionNs, "setBadgeText", [d || {}]); };
-      action.setBadgeTextColor = function (d) { return extApiCall(extId, actionNs, "setBadgeTextColor", [d || {}]); };
-      action.setBadgeBackgroundColor = function (d) { return extApiCall(extId, actionNs, "setBadgeBackgroundColor", [d || {}]); };
-      action.getBadgeText = function (d) { return extApiCall(extId, actionNs, "getBadgeText", [d || {}]); };
-      action.enable = function (tabId) { return extApiCall(extId, actionNs, "enable", tabId === undefined ? [] : [tabId]); };
-      action.disable = function (tabId) { return extApiCall(extId, actionNs, "disable", tabId === undefined ? [] : [tabId]); };
-      action.isEnabled = function (d) { return extApiCall(extId, actionNs, "isEnabled", d && d.tabId !== undefined ? [d.tabId] : []); };
-      action.openPopup = function () { return extApiCall(extId, actionNs, "openPopup", []); };
+      action.setBadgeText = function (d) { return extApiCall(extId, ctx.cap, actionNs, "setBadgeText", [d || {}]); };
+      action.setBadgeTextColor = function (d) { return extApiCall(extId, ctx.cap, actionNs, "setBadgeTextColor", [d || {}]); };
+      action.setBadgeBackgroundColor = function (d) { return extApiCall(extId, ctx.cap, actionNs, "setBadgeBackgroundColor", [d || {}]); };
+      action.getBadgeText = function (d) { return extApiCall(extId, ctx.cap, actionNs, "getBadgeText", [d || {}]); };
+      action.enable = function (tabId) { return extApiCall(extId, ctx.cap, actionNs, "enable", tabId === undefined ? [] : [tabId]); };
+      action.disable = function (tabId) { return extApiCall(extId, ctx.cap, actionNs, "disable", tabId === undefined ? [] : [tabId]); };
+      action.isEnabled = function (d) { return extApiCall(extId, ctx.cap, actionNs, "isEnabled", d && d.tabId !== undefined ? [d.tabId] : []); };
+      action.openPopup = function () { return extApiCall(extId, ctx.cap, actionNs, "openPopup", []); };
       api.browserAction = action;
     } else if (manifestObj.page_action) {
-      action.show = function (tabId) { return extApiCall(extId, "pageAction", "show", [tabId]); };
-      action.hide = function (tabId) { return extApiCall(extId, "pageAction", "hide", [tabId]); };
+      action.show = function (tabId) { return extApiCall(extId, ctx.cap, "pageAction", "show", [tabId]); };
+      action.hide = function (tabId) { return extApiCall(extId, ctx.cap, "pageAction", "hide", [tabId]); };
       api.pageAction = action;
     }
 
@@ -1552,10 +1581,10 @@
       create: function () {
         return 0;
       },
-      update: noopAsync,
-      remove: noopAsync,
-      removeAll: noopAsync,
-      refresh: noopAsync,
+      update: unsupportedAsync("menus.update"),
+      remove: unsupportedAsync("menus.remove"),
+      removeAll: unsupportedAsync("menus.removeAll"),
+      refresh: unsupportedAsync("menus.refresh"),
       onClicked: extEvent(),
       onShown: extEvent(),
       onHidden: extEvent(),
@@ -1595,21 +1624,21 @@
         alarms = {};
         return Promise.resolve(true);
       },
-      get: noopAsyncValue(undefined),
-      getAll: noopAsyncValue([]),
+      get: unsupportedAsync("alarms.get"),
+      getAll: unsupportedAsync("alarms.getAll"),
       onAlarm: extEvent()
     };
 
     api.windows = {
       WINDOW_ID_NONE: -1,
       WINDOW_ID_CURRENT: -2,
-      get: noopAsyncValue(null),
-      getCurrent: noopAsyncValue({ id: 0, focused: true, type: "normal" }),
-      getLastFocused: noopAsyncValue({ id: 0, focused: true, type: "normal" }),
-      getAll: noopAsyncValue([{ id: 0, focused: true, type: "normal" }]),
-      create: noopAsyncValue(null),
-      update: noopAsync,
-      remove: noopAsync,
+      get: unsupportedAsync("windows.get"),
+      getCurrent: unsupportedAsync("windows.getCurrent"),
+      getLastFocused: unsupportedAsync("windows.getLastFocused"),
+      getAll: unsupportedAsync("windows.getAll"),
+      create: unsupportedAsync("windows.create"),
+      update: unsupportedAsync("windows.update"),
+      remove: unsupportedAsync("windows.remove"),
       onCreated: extEvent(),
       onRemoved: extEvent(),
       onFocusChanged: extEvent()
@@ -1619,8 +1648,8 @@
     // without throwing; nothing fires them yet, which is why an
     // extension relying on them for per-frame bookkeeping stays empty.
     api.webNavigation = {
-      getFrame: noopAsyncValue(null),
-      getAllFrames: noopAsyncValue([]),
+      getFrame: unsupportedAsync("webNavigation.getFrame"),
+      getAllFrames: unsupportedAsync("webNavigation.getAllFrames"),
       onBeforeNavigate: extEvent(),
       onCommitted: extEvent(),
       onDOMContentLoaded: extEvent(),
@@ -1632,24 +1661,24 @@
     };
 
     api.notifications = {
-      create: noopAsyncValue("0"),
-      clear: noopAsyncValue(true),
-      getAll: noopAsyncValue({}),
+      create: unsupportedAsync("notifications.create"),
+      clear: unsupportedAsync("notifications.clear"),
+      getAll: unsupportedAsync("notifications.getAll"),
       onClicked: extEvent(),
       onClosed: extEvent(),
       onButtonClicked: extEvent()
     };
 
     api.commands = {
-      getAll: noopAsyncValue([]),
+      getAll: unsupportedAsync("commands.getAll"),
       onCommand: extEvent()
     };
 
     api.permissions = {
-      contains: noopAsyncValue(true),
-      getAll: noopAsyncValue({ permissions: [], origins: [] }),
-      request: noopAsyncValue(false),
-      remove: noopAsyncValue(false),
+      contains: unsupportedAsync("permissions.contains"),
+      getAll: unsupportedAsync("permissions.getAll"),
+      request: unsupportedAsync("permissions.request"),
+      remove: unsupportedAsync("permissions.remove"),
       onAdded: extEvent(),
       onRemoved: extEvent()
     };
@@ -1659,7 +1688,7 @@
       getViews: function () {
         return [];
       },
-      isAllowedFileSchemeAccess: noopAsyncValue(false),
+      isAllowedFileSchemeAccess: unsupportedAsync("extension.isAllowedFileSchemeAccess"),
       inIncognitoContext: false
     };
 
@@ -1701,16 +1730,16 @@
       onChanged: extEvent()
     };
 
-    api.runtime.getPlatformInfo = noopAsyncValue({ os: "linux", arch: "x86-64" });
-    api.runtime.getBrowserInfo = noopAsyncValue({
+    api.runtime.getPlatformInfo = function () { return Promise.resolve({ os: "linux", arch: "x86-64" }); };
+    api.runtime.getBrowserInfo = function () { return Promise.resolve({
       name: "sketerm", vendor: "sketerm", version: "1.0", buildID: "0"
-    });
-    api.runtime.setUninstallURL = noopAsync;
-    api.runtime.openOptionsPage = noopAsync;
+    }); };
+    api.runtime.setUninstallURL = unsupportedAsync("runtime.setUninstallURL");
+    api.runtime.openOptionsPage = unsupportedAsync("runtime.openOptionsPage");
     // REAL, not a stub: an extension that asks to restart and is not
     // restarted simply stops. uBO's first run ends on this call.
     api.runtime.reload = function () {
-        return extApiCall(extId, "runtime", "reload", []);
+        return extApiCall(extId, ctx.cap, "runtime", "reload", []);
     };
     api.runtime.onInstalled = extEvent();
     api.runtime.onStartup = extEvent();
@@ -1779,14 +1808,14 @@
           port.pre.push(msg);
           return;
         }
-        send({ op: "ext-port-msg", gid: port.gid, msg: msg === undefined ? null : msg });
+        send({ op: "ext-port-msg", ext: extId, cap: ctx.cap, gid: port.gid, msg: msg === undefined ? null : msg });
       },
       disconnect: function () {
         if (port.dead) return;
         port.dead = true;
         if (port.gid) {
           delete ctx.ports[port.gid];
-          send({ op: "ext-port-close", gid: port.gid });
+          send({ op: "ext-port-close", ext: extId, cap: ctx.cap, gid: port.gid });
         }
       }
     };
@@ -1797,7 +1826,7 @@
     var lid = extPortSeq++;
     var port = makePort(extId, ctx, name, null);
     ctx.pending_ports[lid] = port;
-    send({ op: "ext-connect", ext: extId, lid: lid, name: name || "" });
+    send({ op: "ext-connect", ext: extId, cap: ctx.cap, lid: lid, name: name || "" });
     return port;
   }
 
@@ -1805,7 +1834,7 @@
   /// caller already posted, in order.
   function extPortOpen(m) {
     var ctx = extCtx[m.ext];
-    if (!ctx) return;
+    if (!ctx || ctx.cap !== m.cap) return;
     var port = ctx.pending_ports[m.lid];
     if (!port) return;
     delete ctx.pending_ports[m.lid];
@@ -1821,7 +1850,7 @@
     var queued = port.pre;
     port.pre = [];
     for (var i = 0; i < queued.length; i++) {
-      send({ op: "ext-port-msg", gid: m.gid, msg: queued[i] === undefined ? null : queued[i] });
+      send({ op: "ext-port-msg", ext: m.ext, cap: ctx.cap, gid: m.gid, msg: queued[i] === undefined ? null : queued[i] });
     }
   }
 
@@ -1829,8 +1858,7 @@
   /// it to `runtime.onConnect`.
   function extPortIncoming(m) {
     var ctx = extCtx[m.ext];
-    if (!ctx) {
-      send({ op: "ext-port-close", gid: m.gid });
+    if (!ctx || ctx.cap !== m.cap) {
       return;
     }
     var port = makePort(m.ext, ctx, m.name || "", m.sender || null);
@@ -1841,7 +1869,7 @@
 
   function extPortRecv(m) {
     var ctx = extCtx[m.ext];
-    if (!ctx) return;
+    if (!ctx || ctx.cap !== m.cap) return;
     var port = ctx.ports[m.gid];
     if (!port) return;
     fireAll(port.onMessage, [m.msg, port]);
@@ -1849,7 +1877,7 @@
 
   function extPortClosed(m) {
     var ctx = extCtx[m.ext];
-    if (!ctx) return;
+    if (!ctx || ctx.cap !== m.cap) return;
     var port = ctx.ports[m.gid];
     if (!port) return;
     delete ctx.ports[m.gid];
@@ -1869,13 +1897,15 @@
   /// A `tabs.on*` event pushed from the browser process.
   function extTabEvent(m) {
     var ctx = extCtx[m.ext];
-    if (!ctx || !ctx.tabs) return;
+    if (!ctx || ctx.cap !== m.cap || !ctx.tabs) return;
     var ev = ctx.tabs[m.ev];
     if (!ev) return;
     fireAll(ev, m.args || []);
   }
 
   function extActionClicked(m) {
+    var ctx = extCtx[m.ext];
+    if (!ctx || ctx.cap !== m.cap) return;
     var api = extApiOf[m.ext];
     if (!api) return;
     var action = api.browserAction || api.pageAction;
@@ -1927,6 +1957,7 @@
     // knows the nonce, and it is on all three legitimate producers.
     if (!extAuthentic(m)) return;
     var extId = m.ext;
+    if (typeof m.cap !== "string" || m.cap.length !== 32) return;
     if (m.dbg) extDebug = true;
     if (typeof m.uilang === "string" && m.uilang) extUiLanguage = m.uilang;
     if (m.css) {
@@ -1942,15 +1973,15 @@
     if (!m.scripts || !m.scripts.length) {
       // A background page with no scripts to run here, or css-only
       // content: still register the ctx so messages can be delivered.
-      var api0 = extCtx[extId]
+      var api0 = extCtx[extId] && extCtx[extId].cap === m.cap
         ? extApiOf[extId]
-        : makeBrowser(extId, m.base || "", m.manifest || {}, m.messages || null);
+        : makeBrowser(extId, m.cap, m.base || "", m.manifest || {}, m.messages || null);
       if (privileged) publishGlobals(api0);
       return;
     }
-    var api = extCtx[extId]
+    var api = extCtx[extId] && extCtx[extId].cap === m.cap
       ? extApiOf[extId]
-      : makeBrowser(extId, m.base || "", m.manifest || {}, m.messages || null);
+      : makeBrowser(extId, m.cap, m.base || "", m.manifest || {}, m.messages || null);
     if (privileged) publishGlobals(api);
     for (var j = 0; j < m.scripts.length; j++) {
       try {
@@ -1958,10 +1989,15 @@
         fn(api, api, api);
       } catch (e2) {
         try {
-          send({ op: "ext-error", ext: extId, msg: String(e2 && e2.message || e2) });
+          send({ op: "ext-error", ext: extId, cap: m.cap, msg: String(e2 && e2.message || e2) });
         } catch (e3) {}
       }
     }
+  }
+
+  function extRevoke(m) {
+    if (!extAuthentic(m) || typeof m.cap !== "string") return;
+    invalidateExtContext(m.ext, m.cap, m.reason || "extension context was revoked");
   }
 
   // `browser` and `chrome` as real globals, for a document that IS the
@@ -1983,8 +2019,7 @@
   // first defined response wins and is posted back under `gid`.
   function extDeliver(m) {
     var ctx = extCtx[m.ext];
-    if (!ctx) {
-      send({ op: "ext-reply", gid: m.gid, resp: null });
+    if (!ctx || ctx.cap !== m.cap) {
       return;
     }
     var fns = ctx.listeners._fns.slice();
@@ -1992,7 +2027,7 @@
     function respond(resp) {
       if (answered) return;
       answered = true;
-      send({ op: "ext-reply", gid: m.gid, resp: resp === undefined ? null : resp });
+      send({ op: "ext-reply", ext: m.ext, cap: ctx.cap, gid: m.gid, resp: resp === undefined ? null : resp });
     }
     var sender = m.sender || {};
     for (var i = 0; i < fns.length; i++) {
@@ -2020,21 +2055,26 @@
   }
 
   function extResult(m) {
-    var fn = extPending[m.req];
+    var pending = extPending[m.req];
     if (extDebug) {
       try {
-        console.log("SKEXT result#" + m.req + " ok=" + m.ok + " pending=" + !!fn +
+        console.log("SKEXT result#" + m.req + " ok=" + m.ok + " pending=" + !!pending +
           " " + JSON.stringify(m.result).slice(0, 160));
       } catch (e) {}
     }
-    if (!fn) return;
+    if (!pending || pending.ext !== m.ext || pending.cap !== m.cap) return;
     delete extPending[m.req];
-    fn(m.ok === false ? undefined : m.result);
+    if (m.ok === false) {
+      var message = typeof m.result === "string" && m.result ? m.result : "extension API call failed";
+      pending.reject(new Error(message));
+    } else {
+      pending.resolve(m.result);
+    }
   }
 
   function extChanged(m) {
     var ctx = extCtx[m.ext];
-    if (!ctx) return;
+    if (!ctx || ctx.cap !== m.cap) return;
     var fns = ctx.changed._fns.slice();
     for (var i = 0; i < fns.length; i++) {
       try {
@@ -2090,6 +2130,9 @@
         break;
       case "ext-inject":
         extInject(m);
+        break;
+      case "ext-revoke":
+        extRevoke(m);
         break;
       case "ext-message":
         extDeliver(m);

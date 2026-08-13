@@ -1,8 +1,16 @@
 // Background script for the smoke fixture. Hosted in the hidden
 // off-screen page. Replies to the content script's runtime.sendMessage.
-browser.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
+var capabilityReady = (async function () {
+  var source = await (await fetch(browser.runtime.getURL("__sketerm-extapi.js"))).text();
+  var found = source.match(/,cap:"([0-9a-f]{32})"/);
+  if (!found) throw new Error("extension capability missing from bootstrap");
+  var previous = await browser.storage.local.get("lastCapability");
+  await browser.storage.local.set({ lastCapability: found[1] });
+  return !previous.lastCapability || previous.lastCapability !== found[1];
+})();
+
+browser.runtime.onMessage.addListener(async function (msg, sender) {
   if (msg && msg.q === "ping") {
-    sendResponse({ n: 42, pong: true, from: sender && sender.id });
-    return true; // response already delivered synchronously
+    return { n: 42, pong: true, from: sender && sender.id, rotated: await capabilityReady };
   }
 });

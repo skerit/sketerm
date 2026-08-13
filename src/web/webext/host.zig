@@ -73,6 +73,11 @@ pub const Extension = struct {
     wreq: ?*webrequest.Registry = null,
     /// Browser-toolbar state: manifest defaults plus runtime overrides.
     action: action.State = .{},
+    /// Rotating, extension-bound authority handed only to this
+    /// extension's injected bridge. An id without this token has no
+    /// access to browser state.
+    capability: [origins.CAP_LEN]u8 = @splat(0),
+    capability_ok: bool = false,
 
     fn name(self: *const Extension) []const u8 {
         return if (self.man) |*m| m.name else "";
@@ -155,9 +160,51 @@ pub const Host = struct {
             self.gpa.free(e.dir);
             e.dir = try self.gpa.dupe(u8, dir);
         }
+        // Every set represents a new extension instance, including a
+        // disable/re-enable and an unpacked package being reinstalled in
+        // place. Invalidate the old authority before doing anything that
+        // can fail, then mint a replacement for this instance.
+        e.capability = @splat(0);
+        e.capability_ok = false;
+        e.enabled = false;
+        try mintCapability(e);
         e.enabled = enabled;
         self.reparse(e);
         return e;
+    }
+
+    /// Resolve an enabled extension only when its rotating capability
+    /// matches, without early-exit comparison.
+    pub fn authorize(self: *Host, id: []const u8, capability: []const u8) ?*Extension {
+        const e = self.authorizeCapability(capability) orelse return null;
+        return if (std.mem.eql(u8, e.id, id)) e else null;
+    }
+
+    /// Resolve the extension instance that owns a capability, without
+    /// trusting the caller-supplied extension id.
+    pub fn authorizeCapability(self: *Host, capability: []const u8) ?*Extension {
+        if (capability.len != origins.CAP_LEN) return null;
+        for (self.exts.items) |*e| {
+            if (!e.enabled or !e.ok or !e.capability_ok) continue;
+            var diff: u8 = 0;
+            for (capability, e.capability) |a, b| diff |= a ^ b;
+            if (diff == 0) return e;
+        }
+        return null;
+    }
+
+    /// Invalidate the old extension instance and mint its replacement
+    /// authority. A failure leaves the extension disabled rather than
+    /// retaining a capability that should have died.
+    pub fn rotateCapability(self: *Host, e: *Extension) bool {
+        _ = self;
+        e.capability = @splat(0);
+        e.capability_ok = false;
+        mintCapability(e) catch {
+            e.enabled = false;
+            return false;
+        };
+        return true;
     }
 
     /// Forget every webRequest listener of `e`. Called whenever the
@@ -300,7 +347,7 @@ pub const Host = struct {
         if (std.mem.eql(u8, ns, "i18n")) return self.dispatchI18n(e, method, args_json);
         if (std.mem.eql(u8, ns, "tabs")) return self.dispatchTabs(e, method, args_json);
         if (std.mem.eql(u8, ns, "webRequest")) return self.dispatchWebRequest(e, method, args_json);
-        if (std.mem.eql(u8, ns, "browserAction") or std.mem.eql(u8, ns, "action")) {
+        if (std.mem.eql(u8, ns, "browserAction")) {
             if (e.action.kind != .browser) return self.errResult("extension has no browserAction");
             return e.action.dispatch(self.gpa, method, args_json);
         }
@@ -631,6 +678,54 @@ pub const Host = struct {
         return std.fmt.allocPrint(self.gpa, "{{\"error\":\"{s}\"}}", .{msg}) catch unreachable;
     }
 };
+
+fn mintCapability(e: *Extension) !void {
+    var raw: [origins.CAP_LEN / 2]u8 = undefined;
+    if (c.getentropy(&raw, raw.len) != 0) return error.RandomFailed;
+    const digits = "0123456789abcdef";
+    for (raw, 0..) |b, i| {
+        e.capability[i * 2] = digits[b >> 4];
+        e.capability[i * 2 + 1] = digits[b & 0x0f];
+    }
+    e.capability_ok = true;
+}
+
+test "extension capabilities authorize only their owning instance and rotate" {
+    const gpa = std.testing.allocator;
+    var host = Host{ .gpa = gpa, .data_dir = try gpa.dupe(u8, "") };
+    defer host.deinit();
+
+    const one_cap: [origins.CAP_LEN]u8 = @splat('1');
+    const two_cap: [origins.CAP_LEN]u8 = @splat('2');
+    try host.exts.append(gpa, .{
+        .id = try gpa.dupe(u8, "one@sketerm.test"),
+        .dir = try gpa.dupe(u8, "/one"),
+        .enabled = true,
+        .ok = true,
+        .capability = one_cap,
+        .capability_ok = true,
+    });
+    try host.exts.append(gpa, .{
+        .id = try gpa.dupe(u8, "two@sketerm.test"),
+        .dir = try gpa.dupe(u8, "/two"),
+        .enabled = true,
+        .ok = true,
+        .capability = two_cap,
+        .capability_ok = true,
+    });
+
+    try std.testing.expect(host.authorize("two@sketerm.test", &one_cap) == null);
+    try std.testing.expectEqualStrings("one@sketerm.test", host.authorizeCapability(&one_cap).?.id);
+    var changed: ?[]u8 = null;
+    const alias = host.dispatchApi(host.find("one@sketerm.test").?, "action", "setTitle", "[]", &changed);
+    defer gpa.free(alias);
+    try std.testing.expect(std.mem.indexOf(u8, alias, "unknown namespace") != null);
+
+    const one = host.find("one@sketerm.test").?;
+    try std.testing.expect(host.rotateCapability(one));
+    try std.testing.expect(host.authorizeCapability(&one_cap) == null);
+    try std.testing.expect(host.authorize("one@sketerm.test", &one.capability) == one);
+}
 
 // -- filesystem (libc) ------------------------------------------------
 

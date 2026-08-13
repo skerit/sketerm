@@ -22,6 +22,7 @@ pub const MAX_DIR = 512;
 /// `web_accessible_resources` patterns, NUL-separated in one buffer.
 pub const MAX_WAR = 512;
 pub const MAX_LOCALE = 32;
+pub const CAP_LEN = 32;
 
 /// The reserved path the extension API bootstrap is served from.
 ///
@@ -57,6 +58,10 @@ pub const Slot = struct {
     /// directory to work it out per request.
     locale: [MAX_LOCALE]u8 = @splat(0),
     locale_len: usize = 0,
+    /// Per-extension authority token, hex-encoded 128 bits. It is
+    /// copied by value for the same reason as the directory: the IO
+    /// thread must never dereference the main-thread extension record.
+    capability: [CAP_LEN]u8 = @splat(0),
 
     pub fn hostSlice(self: *const Slot) []const u8 {
         return self.host[0..];
@@ -105,10 +110,12 @@ pub fn publish(
     dir: []const u8,
     war: []const []const u8,
     locale: []const u8,
+    capability: []const u8,
 ) bool {
     if (host.len != HOST_LEN) return false;
     if (!manifest.idValid(id)) return false;
     if (dir.len > MAX_DIR or dir.len == 0) return false;
+    if (capability.len != CAP_LEN) return false;
     acquire();
     defer release();
     const s = findLocked(host) orelse freeLocked() orelse return false;
@@ -122,6 +129,7 @@ pub fn publish(
         @memcpy(s.locale[0..locale.len], locale);
         s.locale_len = locale.len;
     }
+    @memcpy(&s.capability, capability);
     var n: usize = 0;
     for (war) |pat| {
         if (n + pat.len + 1 > MAX_WAR) break;
@@ -169,6 +177,7 @@ pub const Lookup = struct {
     war_len: usize = 0,
     locale: [MAX_LOCALE]u8 = @splat(0),
     locale_len: usize = 0,
+    capability: [CAP_LEN]u8 = @splat(0),
 
     pub fn idSlice(self: *const Lookup) []const u8 {
         return self.id[0..self.id_len];
@@ -210,6 +219,7 @@ pub fn lookup(host: []const u8) ?Lookup {
     out.war_len = s.war_len;
     @memcpy(out.locale[0..s.locale_len], s.locale[0..s.locale_len]);
     out.locale_len = s.locale_len;
+    @memcpy(&out.capability, &s.capability);
     return out;
 }
 
@@ -230,10 +240,11 @@ test "publish / lookup / unpublish round trip" {
     defer clear();
     try t.expect(lookup("0123456789abcdef") == null);
     const war = [_][]const u8{ "/war/*", "/other.js" };
-    try t.expect(publish("0123456789abcdef", "uBlock0@raymondhill.net", "/tmp/ext", &war, "en"));
+    try t.expect(publish("0123456789abcdef", "uBlock0@raymondhill.net", "/tmp/ext", &war, "en", "0123456789abcdef0123456789abcdef"));
     const got = lookup("0123456789abcdef") orelse return error.Missing;
     try t.expectEqualStrings("uBlock0@raymondhill.net", got.idSlice());
     try t.expectEqualStrings("/tmp/ext", got.dirSlice());
+    try t.expectEqualStrings("0123456789abcdef0123456789abcdef", &got.capability);
     var pats: [8][]const u8 = undefined;
     const list = got.warPatterns(&pats);
     try t.expectEqual(@as(usize, 2), list.len);
@@ -246,8 +257,8 @@ test "publish / lookup / unpublish round trip" {
 test "re-publishing the same host re-points rather than duplicating" {
     clear();
     defer clear();
-    try t.expect(publish("aaaaaaaaaaaaaaaa", "x", "/one", &.{}, "en"));
-    try t.expect(publish("aaaaaaaaaaaaaaaa", "x", "/two", &.{}, "en"));
+    try t.expect(publish("aaaaaaaaaaaaaaaa", "x", "/one", &.{}, "en", "0123456789abcdef0123456789abcdef"));
+    try t.expect(publish("aaaaaaaaaaaaaaaa", "x", "/two", &.{}, "en", "fedcba9876543210fedcba9876543210"));
     var used: usize = 0;
     for (&slots) |*s| {
         if (s.used) used += 1;
@@ -255,13 +266,14 @@ test "re-publishing the same host re-points rather than duplicating" {
     try t.expectEqual(@as(usize, 1), used);
     const got = lookup("aaaaaaaaaaaaaaaa") orelse return error.Missing;
     try t.expectEqualStrings("/two", got.dirSlice());
+    try t.expectEqualStrings("fedcba9876543210fedcba9876543210", &got.capability);
 }
 
 test "a wrong-length host never matches" {
     clear();
     defer clear();
-    try t.expect(!publish("short", "x", "/one", &.{}, "en"));
-    try t.expect(publish("bbbbbbbbbbbbbbbb", "x", "/one", &.{}, "en"));
+    try t.expect(!publish("short", "x", "/one", &.{}, "en", "0123456789abcdef0123456789abcdef"));
+    try t.expect(publish("bbbbbbbbbbbbbbbb", "x", "/one", &.{}, "en", "0123456789abcdef0123456789abcdef"));
     try t.expect(lookup("bbbbbbbbbbbbbbb") == null);
     try t.expect(lookup("bbbbbbbbbbbbbbbbb") == null);
     try t.expect(lookup("bbbbbbbbbbbbbbbb") != null);
@@ -270,8 +282,9 @@ test "a wrong-length host never matches" {
 test "publish rejects malformed extension ids" {
     clear();
     defer clear();
-    try t.expect(!publish("bbbbbbbbbbbbbbbb", "../bad", "/one", &.{}, "en"));
-    try t.expect(!publish("bbbbbbbbbbbbbbbb", "x" ** (manifest.MAX_ID_LEN + 1), "/one", &.{}, "en"));
+    try t.expect(!publish("bbbbbbbbbbbbbbbb", "../bad", "/one", &.{}, "en", "0123456789abcdef0123456789abcdef"));
+    try t.expect(!publish("bbbbbbbbbbbbbbbb", "x" ** (manifest.MAX_ID_LEN + 1), "/one", &.{}, "en", "0123456789abcdef0123456789abcdef"));
+    try t.expect(!publish("bbbbbbbbbbbbbbbb", "x", "/one", &.{}, "en", "short"));
 }
 
 test "the table fills rather than overruns" {
@@ -281,7 +294,7 @@ test "the table fills rather than overruns" {
     while (i < MAX_ORIGINS) : (i += 1) {
         var host: [HOST_LEN]u8 = @splat('0');
         _ = std.fmt.bufPrint(&host, "{x:0>16}", .{i}) catch unreachable;
-        try t.expect(publish(&host, "x", "/d", &.{}, "en"));
+        try t.expect(publish(&host, "x", "/d", &.{}, "en", "0123456789abcdef0123456789abcdef"));
     }
-    try t.expect(!publish("ffffffffffffffff", "x", "/d", &.{}, "en"));
+    try t.expect(!publish("ffffffffffffffff", "x", "/d", &.{}, "en", "0123456789abcdef0123456789abcdef"));
 }

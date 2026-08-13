@@ -791,6 +791,24 @@ pub const Window = struct {
             null,
             c.G_CONNECT_DEFAULT,
         );
+        // The WebExtension mirror models GTK focus, not merely mapped
+        // widgets: one focused window and one focused pane/page in it.
+        _ = c.g_signal_connect_data(
+            app_window,
+            "notify::is-active",
+            @ptrCast(&onWebextFocusChanged),
+            null,
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+        _ = c.g_signal_connect_data(
+            app_window,
+            "notify::focus-widget",
+            @ptrCast(&onWebextFocusChanged),
+            null,
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
 
         // Detachable tabs: dragging a tab out of the tab bar asks for
         // a window to drop it into; we spawn a fresh (secondary)
@@ -4056,6 +4074,10 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         .copy_mode => self.openCopyMode(),
         else => {},
     }
+}
+
+fn onWebextFocusChanged(_: *c.GObject, _: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    @import("webface.zig").tabsChanged();
 }
 
 /// Public entry-point used by the command palette. Tries the

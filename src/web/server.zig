@@ -465,6 +465,7 @@ pub const Server = struct {
             .webext_wreq_stats_req => self.host.webrequestStats(),
             .webext_tabs => self.host.webextTabs((try proto.decode(proto.WebextTabs, frame.payload)).tabs_json),
             .webext_action_activate => self.host.webextActionActivate(try proto.decode(proto.WebextActionActivate, frame.payload)),
+            .webext_open_popup_result => self.host.webextOpenPopupResult(try proto.decode(proto.WebextOpenPopupResult, frame.payload)),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},

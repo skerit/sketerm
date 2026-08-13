@@ -569,6 +569,7 @@ pub fn onTermProgress(ctx: ?*anyopaque, pane: *Pane, state: u8, percent: u8) voi
 /// re-selecting the tab restores it (instead of the first pane).
 pub fn onPaneFocused(ctx: ?*anyopaque, pane: *Pane) void {
     const self = cast.userData(Window, ctx);
+    @import("webface.zig").tabsChanged();
     // The window title follows the FOCUSED pane, so moving focus is
     // itself a fact change. Cheap: a no-op unless the key is set.
     refreshWindowTitleTemplate(self);

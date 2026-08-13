@@ -805,6 +805,8 @@ pub const Host = struct {
     /// Extension ids awaiting a `runtime.reload`, performed on the next
     /// poll turn rather than inside the call that asked for it.
     webext_reload: std.ArrayList([]u8) = .empty,
+    webext_popup_waits: std.ArrayList(PopupWait) = .empty,
+    webext_next_popup_req: u32 = 1,
     /// Root cache directory (the `--cache-dir`), under which a persistent
     /// context's own cache dir is minted. Set by the server before `run`.
     profile_dir: []const u8 = "",
@@ -849,7 +851,21 @@ pub const Host = struct {
     };
     /// One in-flight `runtime.sendMessage` from a content frame awaiting
     /// its background's reply.
-    const MsgRoute = struct { gid: u32, origin_view: u32, origin_req: u32 };
+    const MsgRoute = struct {
+        gid: u32,
+        origin_view: u32,
+        origin_req: u32,
+        reply_view: u32,
+        ext: []u8,
+    };
+
+    const PopupWait = struct {
+        req: u32,
+        caller_req: u32,
+        caller_view: u32,
+        target_view: u32,
+        ext: []u8,
+    };
 
     /// One `runtime.connect` Port, from the browser process's point of
     /// view: two views and the extension they belong to.
@@ -939,11 +955,14 @@ pub const Host = struct {
         self.destroyAll();
         self.views.deinit(self.gpa);
         self.webext.deinit();
+        for (self.webext_routes.items) |r| self.gpa.free(r.ext);
         self.webext_routes.deinit(self.gpa);
         for (self.webext_ports.items) |p| self.gpa.free(p.ext);
         self.webext_ports.deinit(self.gpa);
         for (self.webext_reload.items) |p| self.gpa.free(p);
         self.webext_reload.deinit(self.gpa);
+        for (self.webext_popup_waits.items) |p| self.gpa.free(p.ext);
+        self.webext_popup_waits.deinit(self.gpa);
         extorigins.clear();
         for (self.prints.items) |p| self.gpa.free(p.path);
         self.prints.deinit(self.gpa);
@@ -1151,6 +1170,8 @@ pub const Host = struct {
         // The same rule for Ports: a peer that is gone must produce an
         // onDisconnect, never a Port that stays open forever.
         self.portsAbandonView(id);
+        self.routesAbandonView(id);
+        self.popupWaitsAbandonView(id);
         // A page owns every browser-action popup it opened. Close those
         // first so no floating extension page survives its toolbar.
         while (self.popupForOwner(id)) |popup| self.destroyView(popup.id);
@@ -2760,6 +2781,20 @@ pub const Host = struct {
             });
             return;
         }
+        // `webext_set` reparses/reinstalls the extension. Tear down the
+        // old instance before `Host.set` rotates its capability, so no
+        // background page, port, route or hold retains old authority.
+        if (self.webext.find(req.id)) |old| {
+            self.revokeExtension(old, "extension was reinstalled or toggled");
+            wreqAbandonExt(req.id);
+            self.routesAbandonExt(req.id);
+            self.popupWaitsAbandonExt(req.id);
+            self.portsAbandonExt(req.id);
+            self.webext.clearListeners(old);
+            self.teardownBackground(old);
+            self.teardownPopups(req.id);
+            self.unpublishOrigin(req.id);
+        }
         const e = self.webext.set(req.id, req.dir, req.enabled != 0) catch {
             self.post(proto.EvWebextState{
                 .id = req.id,
@@ -2777,6 +2812,8 @@ pub const Host = struct {
             self.injectContentScriptsAll(e);
         } else {
             wreqAbandonExt(req.id);
+            self.routesAbandonExt(req.id);
+            self.popupWaitsAbandonExt(req.id);
             self.portsAbandonExt(req.id);
             self.webext.clearListeners(e);
             self.teardownBackground(e);
@@ -2797,7 +2834,8 @@ pub const Host = struct {
         var loc_buf: [extorigins.MAX_LOCALE]u8 = undefined;
         const locale = self.webext.resolveLocale(e, &loc_buf) orelse "";
         const war: []const []const u8 = if (e.man) |*m| m.web_accessible_resources else &.{};
-        _ = extorigins.publish(host, e.id, e.dir, war, locale);
+        if (!e.capability_ok) return;
+        _ = extorigins.publish(host, e.id, e.dir, war, locale, &e.capability);
     }
 
     fn unpublishOrigin(self: *Host, id: []const u8) void {
@@ -2806,13 +2844,36 @@ pub const Host = struct {
         extorigins.unpublish(extmanifest.originHost(id, &host_buf));
     }
 
+    fn revokeExtension(self: *Host, e: *const webexthost.Extension, reason: []const u8) void {
+        if (!e.capability_ok) return;
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.writeAll("{\"op\":\"ext-revoke\",\"tok\":\"") catch return;
+        w.writeAll(&sem_secret.nonce) catch return;
+        w.writeAll("\",\"ext\":") catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
+        w.writeAll(",\"reason\":") catch return;
+        jsonStr(w, reason) catch return;
+        w.writeByte('}') catch return;
+        for (self.views.items) |v| {
+            if (v.browser == null or v.discarded) continue;
+            self.sendScriptAllFrames(v, cmd.written());
+        }
+    }
+
     pub fn webextRemove(self: *Host, id: []const u8) void {
         if (!extmanifest.idValid(id)) return;
         // An enumerated exit: every request this extension was holding
         // is continued before its registry goes away.
         wreqAbandonExt(id);
+        self.routesAbandonExt(id);
+        self.popupWaitsAbandonExt(id);
         self.portsAbandonExt(id);
         if (self.webext.find(id)) |e| {
+            self.revokeExtension(e, "extension was removed");
             self.webext.clearListeners(e);
             self.teardownBackground(e);
         }
@@ -2875,7 +2936,6 @@ pub const Host = struct {
 
         var diff = self.webext.tabs.replace(self.gpa, incoming.items) catch return;
         defer diff.deinit(self.gpa);
-        if (diff.empty()) return;
 
         for (diff.created) |id| {
             if (self.webext.tabs.find(id)) |tb| self.postTabEvent("onCreated", tb, null);
@@ -2897,10 +2957,17 @@ pub const Host = struct {
     /// Replace-all toolbar action state for every active page view.
     fn postActionsForActiveViews(self: *Host) void {
         for (self.webext.tabs.tabs.items) |*tb| {
-            if (!tb.active or tb.view == 0 or self.find(tb.view) == null) continue;
-            const json = self.actionSnapshot(tb.id) orelse continue;
-            defer self.gpa.free(json);
-            self.post(proto.EvWebextActions{ .view = tb.view, .actions_json = json });
+            if (tb.view == 0 or self.find(tb.view) == null) continue;
+            if (tb.active) {
+                const json = self.actionSnapshot(tb.id) orelse continue;
+                defer self.gpa.free(json);
+                self.post(proto.EvWebextActions{ .view = tb.view, .actions_json = json });
+            } else {
+                // Replace-all means inactive views must receive the empty
+                // replacement too. Otherwise a split pane that loses focus
+                // keeps a stale, clickable toolbar action forever.
+                self.post(proto.EvWebextActions{ .view = tb.view, .actions_json = "[]" });
+            }
         }
     }
 
@@ -2974,6 +3041,8 @@ pub const Host = struct {
                 defer cmd.deinit();
                 cmd.writer.writeAll("{\"op\":\"ext-action-clicked\",\"ext\":") catch return;
                 jsonStr(&cmd.writer, e.id) catch return;
+                cmd.writer.writeAll(",\"cap\":") catch return;
+                jsonStr(&cmd.writer, &e.capability) catch return;
                 cmd.writer.writeAll(",\"tab\":") catch return;
                 exttabs.Table.writeTab(tb, &cmd.writer) catch return;
                 cmd.writer.writeByte('}') catch return;
@@ -3104,6 +3173,8 @@ pub const Host = struct {
             const w = &cmd.writer;
             w.writeAll("{\"op\":\"ext-tab-event\",\"ext\":") catch continue;
             jsonStr(w, e.id) catch continue;
+            w.writeAll(",\"cap\":") catch continue;
+            jsonStr(w, &e.capability) catch continue;
             w.writeAll(",\"ev\":") catch continue;
             jsonStr(w, ev) catch continue;
             w.writeAll(",\"args\":[") catch continue;
@@ -3149,6 +3220,8 @@ pub const Host = struct {
             const w = &cmd.writer;
             w.writeAll("{\"op\":\"ext-tab-event\",\"ext\":") catch continue;
             jsonStr(w, e.id) catch continue;
+            w.writeAll(",\"cap\":") catch continue;
+            jsonStr(w, &e.capability) catch continue;
             w.print(",\"ev\":\"onRemoved\",\"args\":[{d},{{\"windowId\":0,\"isWindowClosing\":false}}]}}", .{id}) catch continue;
             self.sendScript(bg.?, cmd.written());
         }
@@ -3388,6 +3461,8 @@ pub const Host = struct {
         w.writeAll(&sem_secret.nonce) catch return;
         w.writeAll("\",\"ext\":") catch return;
         jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
         w.writeAll(",\"base\":") catch return;
         var base_buf: [256]u8 = undefined;
         var host_buf: [16]u8 = undefined;
@@ -3472,6 +3547,8 @@ pub const Host = struct {
         if (c.getenv("SKETERM_WEB_EXT_DEBUG") != null) w.writeAll("\"dbg\":true,") catch return;
         w.writeAll("\"ext\":") catch return;
         jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
         w.writeAll(",\"base\":") catch return;
         var base_buf: [256]u8 = undefined;
         var host_buf: [16]u8 = undefined;
@@ -3547,9 +3624,9 @@ pub const Host = struct {
         } else if (std.mem.eql(u8, op, "ext-send")) {
             self.extRouteSend(v, json);
         } else if (std.mem.eql(u8, op, "ext-wreq-decision")) {
-            self.wreqDecision(json);
+            self.wreqDecision(v, json);
         } else if (std.mem.eql(u8, op, "ext-reply")) {
-            self.extRouteReply(json);
+            self.extRouteReply(v, json);
         } else if (std.mem.eql(u8, op, "ext-connect")) {
             self.extPortConnect(v, json);
         } else if (std.mem.eql(u8, op, "ext-port-msg")) {
@@ -3557,9 +3634,10 @@ pub const Host = struct {
         } else if (std.mem.eql(u8, op, "ext-port-close")) {
             self.extPortClose(v, json);
         } else if (std.mem.eql(u8, op, "ext-error")) {
-            const E = struct { ext: []const u8 = "", msg: []const u8 = "" };
+            const E = struct { ext: []const u8 = "", cap: []const u8 = "", msg: []const u8 = "" };
             const e = std.json.parseFromSlice(E, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
             defer e.deinit();
+            if (self.webext.authorize(e.value.ext, e.value.cap) == null) return;
             // Surfaced as a console frame so it reaches the client log.
             var buf: [512]u8 = undefined;
             const line = std.fmt.bufPrint(&buf, "[webext {s}] {s}", .{ e.value.ext, e.value.msg }) catch return;
@@ -3573,6 +3651,7 @@ pub const Host = struct {
     fn extApiCall(self: *Host, v: *View, json: []const u8) void {
         const R = struct {
             ext: []const u8 = "",
+            cap: []const u8 = "",
             ns: []const u8 = "",
             method: []const u8 = "",
             args: std.json.Value = .null,
@@ -3581,17 +3660,18 @@ pub const Host = struct {
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
         const r = parsed.value;
-        const e = self.webext.find(r.ext) orelse {
-            self.extReplyErr(v, r.req);
+        const e = self.webext.authorizeCapability(r.cap) orelse return;
+        if (!std.mem.eql(u8, e.id, r.ext)) {
+            self.extReplyErr(v, r.req, r.ext, r.cap, "extension capability does not authorize the requested id");
             return;
-        };
+        }
         // A CONTENT SCRIPT has no business registering a network
         // filter: it runs in a page's renderer, in the main world, and
         // a page could reach it. Only the extension's own background
         // page may. This is the one gate `dispatchApi` cannot make on
         // its own — it has no idea which frame called.
         if (std.mem.eql(u8, r.ns, "webRequest") and !v.webext_bg) {
-            self.extReplyErr(v, r.req);
+            self.extReplyErr(v, r.req, e.id, &e.capability, "webRequest listeners require an extension page");
             return;
         }
         // `tabs.sendMessage` has to reach a FRAME, which the engine-free
@@ -3599,13 +3679,11 @@ pub const Host = struct {
         // `dispatchApi`.
         if (std.mem.eql(u8, r.ns, "runtime") and std.mem.eql(u8, r.method, "reload")) {
             self.extRequestReload(r.ext);
-            var buf: [96]u8 = undefined;
-            const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"ext-result\",\"req\":{d},\"ok\":true,\"result\":null}}", .{r.req}) catch return;
-            self.sendScript(v, cmd);
+            self.extReplyOk(v, e, r.req, "null");
             return;
         }
         if (std.mem.eql(u8, r.ns, "tabs") and std.mem.eql(u8, r.method, "sendMessage")) {
-            self.extTabsSendMessage(v, r.ext, r.req, r.args);
+            self.extTabsSendMessage(v, e, r.req, r.args);
             return;
         }
         // `tabs.update`/`reload` navigate a VIEW, which again only the
@@ -3615,10 +3693,10 @@ pub const Host = struct {
         if (std.mem.eql(u8, r.ns, "tabs") and
             (std.mem.eql(u8, r.method, "update") or std.mem.eql(u8, r.method, "reload")))
         {
-            self.extTabsNavigate(v, r.req, r.method, r.args);
+            self.extTabsNavigate(v, e, r.req, r.method, r.args);
             return;
         }
-        if ((std.mem.eql(u8, r.ns, "browserAction") or std.mem.eql(u8, r.ns, "action")) and
+        if (std.mem.eql(u8, r.ns, "browserAction") and
             std.mem.eql(u8, r.method, "openPopup"))
         {
             self.extOpenPopup(v, e, r.req);
@@ -3628,7 +3706,7 @@ pub const Host = struct {
         var args_buf: std.Io.Writer.Allocating = .init(self.gpa);
         defer args_buf.deinit();
         std.json.Stringify.value(r.args, .{}, &args_buf.writer) catch {
-            self.extReplyErr(v, r.req);
+            self.extReplyErr(v, r.req, e.id, &e.capability, "arguments could not be encoded");
             return;
         };
         var changed: ?[]u8 = null;
@@ -3640,24 +3718,28 @@ pub const Host = struct {
         // the only placement that cannot be stale.
         if (std.mem.eql(u8, r.ns, "webRequest")) webrequest.setBgView(e.id, v.id);
         defer self.gpa.free(result);
-        if (std.mem.eql(u8, r.ns, "browserAction") or std.mem.eql(u8, r.ns, "pageAction") or
-            std.mem.eql(u8, r.ns, "action")) self.postActionsForActiveViews();
+        if (std.mem.eql(u8, r.ns, "browserAction") or std.mem.eql(u8, r.ns, "pageAction"))
+            self.postActionsForActiveViews();
         // result is `{"result":..}` or `{"error":..}`; forward the inner
         // value/ok to the frame.
-        self.sendExtResult(v, r.req, result);
+        self.sendExtResult(v, e, r.req, result);
         if (changed) |ch| {
             defer self.gpa.free(ch);
             self.broadcastChanged(e, ch);
         }
     }
 
-    fn sendExtResult(self: *Host, v: *View, req: u32, host_result: []const u8) void {
+    fn sendExtResult(self: *Host, v: *View, e: *const webexthost.Extension, req: u32, host_result: []const u8) void {
         // host_result is a full JSON object; embed it and mark ok.
         const is_err = std.mem.indexOf(u8, host_result, "\"error\"") != null;
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
-        w.print("{{\"op\":\"ext-result\",\"req\":{d},\"ok\":{s},", .{ req, if (is_err) "false" else "true" }) catch return;
+        w.writeAll("{\"op\":\"ext-result\",\"ext\":") catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
+        w.print(",\"req\":{d},\"ok\":{s},", .{ req, if (is_err) "false" else "true" }) catch return;
         // Pull the inner value out of {"result":X} / {"error":X}.
         w.writeAll("\"result\":") catch return;
         const inner = innerJson(host_result);
@@ -3666,66 +3748,174 @@ pub const Host = struct {
         self.sendScript(v, cmd.written());
     }
 
-    fn extReplyErr(self: *Host, v: *View, req: u32) void {
-        var buf: [96]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"ext-result\",\"req\":{d},\"ok\":false,\"result\":null}}", .{req}) catch return;
-        self.sendScript(v, cmd);
+    fn extReplyErr(self: *Host, v: *View, req: u32, ext: []const u8, capability: []const u8, message: []const u8) void {
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.writeAll("{\"op\":\"ext-result\",\"ext\":") catch return;
+        jsonStr(w, ext) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, capability) catch return;
+        w.print(",\"req\":{d},\"ok\":false,\"result\":", .{req}) catch return;
+        jsonStr(w, message) catch return;
+        w.writeByte('}') catch return;
+        self.sendScript(v, cmd.written());
+    }
+
+    fn extReplyOk(self: *Host, v: *View, e: *const webexthost.Extension, req: u32, result_json: []const u8) void {
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        const w = &cmd.writer;
+        w.writeAll("{\"op\":\"ext-result\",\"ext\":") catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
+        w.print(",\"req\":{d},\"ok\":true,\"result\":", .{req}) catch return;
+        w.writeAll(result_json) catch return;
+        w.writeByte('}') catch return;
+        self.sendScript(v, cmd.written());
     }
 
     /// Route `browserAction.openPopup()` to the GUI that owns the native toolbar.
     fn extOpenPopup(self: *Host, caller: *View, e: *webexthost.Extension, req: u32) void {
         if (e.action.kind != .browser or !(caller.webext_bg or caller.webext_popup or caller.webext_origin)) {
-            self.extReplyErr(caller, req);
+            self.extReplyErr(caller, req, e.id, &e.capability, "openPopup requires an extension page");
             return;
         }
         const tb = self.webext.tabs.active() orelse {
-            self.extReplyErr(caller, req);
+            self.extReplyErr(caller, req, e.id, &e.capability, "no active tab in the focused window");
             return;
         };
         const action = e.action.effective(tb.id);
         if (!action.visible or !action.enabled or action.popup.len == 0) {
-            self.extReplyErr(caller, req);
+            self.extReplyErr(caller, req, e.id, &e.capability, "extension action has no enabled visible popup");
             return;
         }
-        self.post(proto.EvWebextOpenPopup{ .view = tb.view, .id = e.id, .req = req });
-        var buf: [96]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"ext-result\",\"req\":{d},\"ok\":true,\"result\":null}}", .{req}) catch return;
-        self.sendScript(caller, cmd);
+        const ext_copy = self.gpa.dupe(u8, e.id) catch {
+            self.extReplyErr(caller, req, e.id, &e.capability, "out of memory");
+            return;
+        };
+        const wire_req = self.webext_next_popup_req;
+        self.webext_next_popup_req +%= 1;
+        if (self.webext_next_popup_req == 0) self.webext_next_popup_req = 1;
+        self.webext_popup_waits.append(self.gpa, .{
+            .req = wire_req,
+            .caller_req = req,
+            .caller_view = caller.id,
+            .target_view = tb.view,
+            .ext = ext_copy,
+        }) catch {
+            self.gpa.free(ext_copy);
+            self.extReplyErr(caller, req, e.id, &e.capability, "out of memory");
+            return;
+        };
+        self.post(proto.EvWebextOpenPopup{ .view = tb.view, .id = e.id, .req = wire_req });
+        // The Promise remains pending until the GUI acknowledges that
+        // it created the native popup (or reports why it could not).
+    }
+
+    pub fn webextOpenPopupResult(self: *Host, result: proto.WebextOpenPopupResult) void {
+        var idx: ?usize = null;
+        for (self.webext_popup_waits.items, 0..) |wait, i| {
+            if (wait.req == result.req and wait.target_view == result.view and
+                std.mem.eql(u8, wait.ext, result.id))
+            {
+                idx = i;
+                break;
+            }
+        }
+        const i = idx orelse return;
+        const wait = self.webext_popup_waits.orderedRemove(i);
+        defer self.gpa.free(wait.ext);
+        const caller = self.find(wait.caller_view) orelse return;
+        const e = self.webext.find(wait.ext) orelse return;
+        if (result.ok != 0) {
+            self.extReplyOk(caller, e, wait.caller_req, "null");
+        } else {
+            const detail = if (result.detail.len != 0) result.detail else "native popup was not created";
+            self.extReplyErr(caller, wait.caller_req, e.id, &e.capability, detail);
+        }
+    }
+
+    fn popupWaitsAbandonView(self: *Host, view: u32) void {
+        var i: usize = 0;
+        while (i < self.webext_popup_waits.items.len) {
+            const wait = self.webext_popup_waits.items[i];
+            if (wait.caller_view != view and wait.target_view != view) {
+                i += 1;
+                continue;
+            }
+            const rec = self.webext_popup_waits.orderedRemove(i);
+            if (rec.caller_view != view) {
+                if (self.find(rec.caller_view)) |caller| if (self.webext.find(rec.ext)) |e|
+                    self.extReplyErr(caller, rec.caller_req, e.id, &e.capability, "popup target is gone");
+            }
+            self.gpa.free(rec.ext);
+        }
+    }
+
+    fn popupWaitsAbandonExt(self: *Host, id: []const u8) void {
+        var i: usize = 0;
+        while (i < self.webext_popup_waits.items.len) {
+            if (!std.mem.eql(u8, self.webext_popup_waits.items[i].ext, id)) {
+                i += 1;
+                continue;
+            }
+            const rec = self.webext_popup_waits.orderedRemove(i);
+            self.gpa.free(rec.ext);
+        }
     }
 
     /// A content frame's `runtime.sendMessage`: route it to the
     /// extension's background page, remembering where to send the reply.
     fn extRouteSend(self: *Host, v: *View, json: []const u8) void {
-        const R = struct { ext: []const u8 = "", req: u32 = 0, msg: std.json.Value = .null };
+        const R = struct { ext: []const u8 = "", cap: []const u8 = "", req: u32 = 0, msg: std.json.Value = .null };
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
         const r = parsed.value;
-        const e = self.webext.find(r.ext) orelse {
-            self.extReplyErr(v, r.req);
+        const e = self.webext.authorizeCapability(r.cap) orelse return;
+        if (!std.mem.eql(u8, e.id, r.ext)) {
+            self.extReplyErr(v, r.req, r.ext, r.cap, "extension capability does not authorize the requested id");
             return;
-        };
+        }
         const bg = if (e.bg_view != 0) self.find(e.bg_view) else null;
         if (bg == null) {
             // No background listening: resolve to undefined, as the web
             // API does when nothing answers.
-            self.extReplyErr(v, r.req);
+            self.extReplyErr(v, r.req, e.id, &e.capability, "extension has no background listener");
             return;
         }
         const gid = self.webext_next_gid;
         self.webext_next_gid +%= 1;
         if (self.webext_next_gid == 0) self.webext_next_gid = 1;
-        if (self.webext_routes.items.len >= 256) _ = self.webext_routes.orderedRemove(0);
-        self.webext_routes.append(self.gpa, .{ .gid = gid, .origin_view = v.id, .origin_req = r.req }) catch {
-            self.extReplyErr(v, r.req);
+        if (self.webext_routes.items.len >= 256) {
+            const old = self.webext_routes.orderedRemove(0);
+            self.gpa.free(old.ext);
+        }
+        const ext_copy = self.gpa.dupe(u8, e.id) catch {
+            self.extReplyErr(v, r.req, e.id, &e.capability, "out of memory");
+            return;
+        };
+        self.webext_routes.append(self.gpa, .{
+            .gid = gid,
+            .origin_view = v.id,
+            .origin_req = r.req,
+            .reply_view = bg.?.id,
+            .ext = ext_copy,
+        }) catch {
+            self.gpa.free(ext_copy);
+            self.extReplyErr(v, r.req, e.id, &e.capability, "out of memory");
             return;
         };
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
         w.print("{{\"op\":\"ext-message\",\"ext\":", .{}) catch return;
-        jsonStr(w, r.ext) catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
         w.print(",\"gid\":{d},\"sender\":", .{gid}) catch return;
-        self.writeSender(w, v, r.ext) catch return;
+        self.writeSender(w, v, e.id) catch return;
         w.writeAll(",\"msg\":") catch return;
         std.json.Stringify.value(r.msg, .{}, w) catch return;
         w.writeByte('}') catch return;
@@ -3767,10 +3957,18 @@ pub const Host = struct {
             if (!e.enabled or !e.ok) continue;
             // A full down-and-up: the listeners, the Ports and the
             // background page all belong to the instance going away.
+            self.revokeExtension(e, "extension reloaded");
             wreqAbandonExt(id);
+            self.routesAbandonExt(id);
+            self.popupWaitsAbandonExt(id);
             self.portsAbandonExt(id);
             self.webext.clearListeners(e);
             self.teardownBackground(e);
+            if (!self.webext.rotateCapability(e)) {
+                self.unpublishOrigin(id);
+                self.postWebextState(e);
+                continue;
+            }
             self.publishOrigin(e);
             self.ensureBackground(e);
             self.injectContentScriptsAll(e);
@@ -3779,7 +3977,7 @@ pub const Host = struct {
 
     /// `browser.tabs.update({url})` / `tabs.reload()` — navigate the
     /// view a tab is showing.
-    fn extTabsNavigate(self: *Host, v: *View, req: u32, method: []const u8, args: std.json.Value) void {
+    fn extTabsNavigate(self: *Host, v: *View, e: *webexthost.Extension, req: u32, method: []const u8, args: std.json.Value) void {
         const items = if (args == .array) args.array.items else &[_]std.json.Value{};
         const raw_id: i64 = if (items.len > 0 and items[0] == .integer) items[0].integer else -1;
         // A negative id means "the active tab", MV2's default.
@@ -3789,17 +3987,14 @@ pub const Host = struct {
             // ReleaseFast `@intCast` truncates, so `tabs.update(2**32+1,
             // {url})` navigated tab 1 — a tab the extension never named.
             if (raw_id >= 0) break :blk if (exttabs.u32Of(items[0])) |id| self.webext.tabs.find(id) else null;
-            for (self.webext.tabs.tabs.items) |*t| {
-                if (t.active) break :blk t;
-            }
-            break :blk null;
+            break :blk self.webext.tabs.active();
         } orelse {
-            self.extReplyErr(v, req);
+            self.extReplyErr(v, req, e.id, &e.capability, "no such tab");
             return;
         };
         const target = if (tb.view != 0) self.find(tb.view) else null;
         if (target == null) {
-            self.extReplyErr(v, req);
+            self.extReplyErr(v, req, e.id, &e.capability, "tab has no live browser view");
             return;
         }
         var url: []const u8 = "";
@@ -3818,9 +4013,7 @@ pub const Host = struct {
         } else if (std.mem.eql(u8, method, "reload")) {
             self.navAction(.{ .view = target.?.id, .action = @intFromEnum(proto.NavAct.reload) });
         }
-        var buf: [96]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"ext-result\",\"req\":{d},\"ok\":true,\"result\":null}}", .{req}) catch return;
-        self.sendScript(v, cmd);
+        self.extReplyOk(v, e, req, "null");
     }
 
     /// `browser.tabs.sendMessage(tabId, message)` — the direction that
@@ -3831,45 +4024,57 @@ pub const Host = struct {
     /// frames, which is engine work. It reuses the `webext_routes`
     /// table, just with the roles swapped: the background is the origin
     /// awaiting a reply and the content frame answers with `ext-reply`.
-    fn extTabsSendMessage(self: *Host, v: *View, ext: []const u8, req: u32, args: std.json.Value) void {
+    fn extTabsSendMessage(self: *Host, v: *View, e: *webexthost.Extension, req: u32, args: std.json.Value) void {
         const items = if (args == .array) args.array.items else &[_]std.json.Value{};
         if (items.len < 1 or items[0] != .integer) {
-            self.extReplyErr(v, req);
+            self.extReplyErr(v, req, e.id, &e.capability, "bad tab id");
             return;
         }
         const tab_id: u32 = exttabs.u32Of(items[0]) orelse {
             // Same rule as extTabsNavigate: out of range names no tab.
-            self.extReplyErr(v, req);
+            self.extReplyErr(v, req, e.id, &e.capability, "bad tab id");
             return;
         };
         const tb = self.webext.tabs.find(tab_id) orelse {
-            self.extReplyErr(v, req);
+            self.extReplyErr(v, req, e.id, &e.capability, "no such tab");
             return;
         };
         const target = if (tb.view != 0) self.find(tb.view) else null;
         if (target == null) {
-            self.extReplyErr(v, req);
+            self.extReplyErr(v, req, e.id, &e.capability, "tab has no live browser view");
             return;
         }
         const gid = self.webext_next_gid;
         self.webext_next_gid +%= 1;
         if (self.webext_next_gid == 0) self.webext_next_gid = 1;
-        if (self.webext_routes.items.len >= 256) _ = self.webext_routes.orderedRemove(0);
+        if (self.webext_routes.items.len >= 256) {
+            const old = self.webext_routes.orderedRemove(0);
+            self.gpa.free(old.ext);
+        }
+        const ext_copy = self.gpa.dupe(u8, e.id) catch {
+            self.extReplyErr(v, req, e.id, &e.capability, "out of memory");
+            return;
+        };
         self.webext_routes.append(self.gpa, .{
             .gid = gid,
             .origin_view = v.id,
             .origin_req = req,
+            .reply_view = target.?.id,
+            .ext = ext_copy,
         }) catch {
-            self.extReplyErr(v, req);
+            self.gpa.free(ext_copy);
+            self.extReplyErr(v, req, e.id, &e.capability, "out of memory");
             return;
         };
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
         w.writeAll("{\"op\":\"ext-message\",\"ext\":") catch return;
-        jsonStr(w, ext) catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
         w.print(",\"gid\":{d},\"sender\":{{\"id\":", .{gid}) catch return;
-        jsonStr(w, ext) catch return;
+        jsonStr(w, e.id) catch return;
         w.writeAll("},\"msg\":") catch return;
         const msg = if (items.len > 1) items[1] else std.json.Value.null;
         std.json.Stringify.value(msg, .{}, w) catch return;
@@ -3892,16 +4097,16 @@ pub const Host = struct {
     /// content script that gets neither reply is a content script that
     /// wedged.
     fn extPortConnect(self: *Host, v: *View, json: []const u8) void {
-        const R = struct { ext: []const u8 = "", lid: u32 = 0, name: []const u8 = "" };
+        const R = struct { ext: []const u8 = "", cap: []const u8 = "", lid: u32 = 0, name: []const u8 = "" };
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
         const r = parsed.value;
-        const e = self.webext.find(r.ext);
+        const e = self.webext.authorize(r.ext, r.cap);
         const bg_view = if (e) |ex| ex.bg_view else 0;
         // A background page cannot connect to itself.
         const target = if (bg_view != 0 and bg_view != v.id) self.find(bg_view) else null;
         if (e == null or target == null) {
-            self.sendPortOpen(v, r.ext, r.lid, 0);
+            if (e) |ex| self.sendPortOpen(v, ex, r.lid, 0);
             return;
         }
         const gid = self.webext_next_port;
@@ -3917,7 +4122,7 @@ pub const Host = struct {
             self.gpa.free(old.ext);
         }
         const ext_copy = self.gpa.dupe(u8, r.ext) catch {
-            self.sendPortOpen(v, r.ext, r.lid, 0);
+            self.sendPortOpen(v, e.?, r.lid, 0);
             return;
         };
         self.webext_ports.append(self.gpa, .{
@@ -3927,16 +4132,18 @@ pub const Host = struct {
             .b_view = bg_view,
         }) catch {
             self.gpa.free(ext_copy);
-            self.sendPortOpen(v, r.ext, r.lid, 0);
+            self.sendPortOpen(v, e.?, r.lid, 0);
             return;
         };
-        self.sendPortOpen(v, r.ext, r.lid, gid);
+        self.sendPortOpen(v, e.?, r.lid, gid);
 
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
         w.writeAll("{\"op\":\"ext-port-incoming\",\"ext\":") catch return;
         jsonStr(w, r.ext) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.?.capability) catch return;
         w.print(",\"gid\":{d},\"name\":", .{gid}) catch return;
         jsonStr(w, r.name) catch return;
         w.writeAll(",\"sender\":") catch return;
@@ -3945,12 +4152,14 @@ pub const Host = struct {
         self.sendScript(target.?, cmd.written());
     }
 
-    fn sendPortOpen(self: *Host, v: *View, ext: []const u8, lid: u32, gid: u32) void {
+    fn sendPortOpen(self: *Host, v: *View, e: *const webexthost.Extension, lid: u32, gid: u32) void {
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
         w.writeAll("{\"op\":\"ext-port-open\",\"ext\":") catch return;
-        jsonStr(w, ext) catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
         w.print(",\"lid\":{d},\"gid\":{d}}}", .{ lid, gid }) catch return;
         self.sendScript(v, cmd.written());
     }
@@ -3963,10 +4172,12 @@ pub const Host = struct {
     }
 
     fn extPortMessage(self: *Host, v: *View, json: []const u8) void {
-        const R = struct { gid: u32 = 0, msg: std.json.Value = .null };
+        const R = struct { ext: []const u8 = "", cap: []const u8 = "", gid: u32 = 0, msg: std.json.Value = .null };
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
+        const e = self.webext.authorize(parsed.value.ext, parsed.value.cap) orelse return;
         const p = self.findPort(parsed.value.gid) orelse return;
+        if (!std.mem.eql(u8, p.ext, e.id)) return;
         // "Not a participant" and "the peer is gone" are different
         // answers: `peerOf` returns 0 for both, and treating the first
         // as the second let a non-participant CLOSE any port it named.
@@ -3984,6 +4195,8 @@ pub const Host = struct {
         const w = &cmd.writer;
         w.writeAll("{\"op\":\"ext-port-recv\",\"ext\":") catch return;
         jsonStr(w, p.ext) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
         w.print(",\"gid\":{d},\"msg\":", .{parsed.value.gid}) catch return;
         std.json.Stringify.value(parsed.value.msg, .{}, w) catch return;
         w.writeByte('}') catch return;
@@ -3991,9 +4204,10 @@ pub const Host = struct {
     }
 
     fn extPortClose(self: *Host, v: *View, json: []const u8) void {
-        const R = struct { gid: u32 = 0 };
+        const R = struct { ext: []const u8 = "", cap: []const u8 = "", gid: u32 = 0 };
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
+        const e = self.webext.authorize(parsed.value.ext, parsed.value.cap) orelse return;
         // ONLY a participant may close a port. gids are small and
         // sequential, so ignoring the calling view let anything able to
         // emit `ext-*` walk the space and disconnect ports belonging to
@@ -4001,6 +4215,7 @@ pub const Host = struct {
         // teardown, so uBO and Violentmonkey would go silently dead
         // across every open tab with nothing logged.
         const p = self.findPort(parsed.value.gid) orelse return;
+        if (!std.mem.eql(u8, p.ext, e.id)) return;
         if (p.a_view != v.id and p.b_view != v.id) return;
         self.closePortByGid(parsed.value.gid);
     }
@@ -4021,11 +4236,14 @@ pub const Host = struct {
 
     fn notifyPortClosed(self: *Host, view: u32, ext: []const u8, gid: u32) void {
         const v = self.find(view) orelse return;
+        const e = self.webext.find(ext) orelse return;
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
         w.writeAll("{\"op\":\"ext-port-closed\",\"ext\":") catch return;
         jsonStr(w, ext) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
         w.print(",\"gid\":{d}}}", .{gid}) catch return;
         self.sendScript(v, cmd.written());
     }
@@ -4064,6 +4282,37 @@ pub const Host = struct {
         }
     }
 
+    fn routesAbandonView(self: *Host, view: u32) void {
+        var i: usize = 0;
+        while (i < self.webext_routes.items.len) {
+            const route = self.webext_routes.items[i];
+            if (route.origin_view != view and route.reply_view != view) {
+                i += 1;
+                continue;
+            }
+            const rec = self.webext_routes.orderedRemove(i);
+            if (rec.origin_view != view) {
+                if (self.find(rec.origin_view)) |origin| {
+                    if (self.webext.find(rec.ext)) |e|
+                        self.extReplyErr(origin, rec.origin_req, e.id, &e.capability, "message recipient is gone");
+                }
+            }
+            self.gpa.free(rec.ext);
+        }
+    }
+
+    fn routesAbandonExt(self: *Host, id: []const u8) void {
+        var i: usize = 0;
+        while (i < self.webext_routes.items.len) {
+            if (!std.mem.eql(u8, self.webext_routes.items[i].ext, id)) {
+                i += 1;
+                continue;
+            }
+            const rec = self.webext_routes.orderedRemove(i);
+            self.gpa.free(rec.ext);
+        }
+    }
+
     /// The MV2 `MessageSender`. `{id}` alone was never enough: Dark
     /// Reader keys its per-tab state on `sender.tab.id` and every
     /// extension that answers a content script reads `sender.url`.
@@ -4084,25 +4333,31 @@ pub const Host = struct {
 
     /// The background's reply to a routed message: deliver it to the
     /// original content frame's pending promise.
-    fn extRouteReply(self: *Host, json: []const u8) void {
-        const R = struct { gid: u32 = 0, resp: std.json.Value = .null };
+    fn extRouteReply(self: *Host, v: *View, json: []const u8) void {
+        const R = struct { ext: []const u8 = "", cap: []const u8 = "", gid: u32 = 0, resp: std.json.Value = .null };
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
+        const e = self.webext.authorize(parsed.value.ext, parsed.value.cap) orelse return;
         const gid = parsed.value.gid;
         var idx: ?usize = null;
         for (self.webext_routes.items, 0..) |route, i| {
-            if (route.gid == gid) {
+            if (route.gid == gid and route.reply_view == v.id and std.mem.eql(u8, route.ext, e.id)) {
                 idx = i;
                 break;
             }
         }
         const i = idx orelse return;
         const route = self.webext_routes.orderedRemove(i);
+        defer self.gpa.free(route.ext);
         const origin = self.find(route.origin_view) orelse return;
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
-        w.print("{{\"op\":\"ext-result\",\"req\":{d},\"ok\":true,\"result\":", .{route.origin_req}) catch return;
+        w.writeAll("{\"op\":\"ext-result\",\"ext\":") catch return;
+        jsonStr(w, e.id) catch return;
+        w.writeAll(",\"cap\":") catch return;
+        jsonStr(w, &e.capability) catch return;
+        w.print(",\"req\":{d},\"ok\":true,\"result\":", .{route.origin_req}) catch return;
         std.json.Stringify.value(parsed.value.resp, .{}, w) catch return;
         w.writeByte('}') catch return;
         self.sendScript(origin, cmd.written());
@@ -4204,6 +4459,12 @@ pub const Host = struct {
             const w = &cmd.writer;
             w.writeAll("{\"op\":\"ext-wreq\",\"ext\":") catch continue;
             jsonStr(w, ext_buf[0..ext_len]) catch continue;
+            const e = self.webext.find(ext_buf[0..ext_len]) orelse {
+                self.wreqFailOpen(j.hid);
+                continue;
+            };
+            w.writeAll(",\"cap\":") catch continue;
+            jsonStr(w, &e.capability) catch continue;
             w.print(",\"hid\":{d},\"event\":", .{j.hid}) catch continue;
             jsonStr(w, j.event.toStr()) catch continue;
             w.writeAll(",\"details\":{\"requestId\":") catch continue;
@@ -4357,10 +4618,11 @@ pub const Host = struct {
     /// A background page answered. Applies the decision to the held
     /// request and either continues it, cancels it, or moves it to the
     /// second phase (`onBeforeSendHeaders`).
-    fn wreqDecision(self: *Host, json: []const u8) void {
-        const R = struct { hid: u32 = 0, d: std.json.Value = .null };
+    fn wreqDecision(self: *Host, v: *View, json: []const u8) void {
+        const R = struct { ext: []const u8 = "", cap: []const u8 = "", hid: u32 = 0, d: std.json.Value = .null };
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
+        const e = self.webext.authorize(parsed.value.ext, parsed.value.cap) orelse return;
         const hid = parsed.value.hid;
 
         // Take our OWN reference to the request before dropping the
@@ -4376,6 +4638,8 @@ pub const Host = struct {
             g_wreq.acquire();
             defer g_wreq.release();
             const h = wreqFind(hid) orelse return;
+            const st = wstatIdx(h.ext) orelse return;
+            if (h.bg_view != v.id or !std.mem.eql(u8, st.idSlice(), e.id)) return;
             req = h.req;
             event = h.event;
             want_sh = h.want_send_headers;
@@ -4539,6 +4803,8 @@ pub const Host = struct {
             const w = &cmd.writer;
             w.writeAll("{\"op\":\"ext-changed\",\"ext\":") catch continue;
             jsonStr(w, e.id) catch continue;
+            w.writeAll(",\"cap\":") catch continue;
+            jsonStr(w, &e.capability) catch continue;
             w.writeAll(",\"area\":\"local\",\"changes\":") catch continue;
             w.writeAll(changes_json) catch continue;
             w.writeByte('}') catch continue;
@@ -8117,6 +8383,12 @@ fn extResHasOne(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
     return if (r.refs.load(.acquire) == 1) 1 else 0;
 }
 
+fn extResHasAtLeastOne(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+    const h: *cef.cef_resource_handler_t = @ptrCast(@alignCast(base orelse return 0));
+    const r: *ExtResource = @fieldParentPtr("handler", h);
+    return if (r.refs.load(.acquire) >= 1) 1 else 0;
+}
+
 /// IO THREAD. Resolve one `chrome-extension://` url to bytes.
 /// One refusal is reported per process (see the branches that set it).
 var g_ext_refusal_logged = false;
@@ -8403,6 +8675,8 @@ fn buildExtBootstrap(slot: *const extorigins.Lookup, host: []const u8) ?[]u8 {
     if (c.getenv("SKETERM_WEB_EXT_DEBUG") != null) w.writeAll("dbg:true,") catch return null;
     w.writeAll("ext:") catch return null;
     jsonStr(w, slot.idSlice()) catch return null;
+    w.writeAll(",cap:") catch return null;
+    jsonStr(w, &slot.capability) catch return null;
     w.writeAll(",base:") catch return null;
     var base_buf: [128]u8 = undefined;
     const base = std.fmt.bufPrint(&base_buf, ext_scheme ++ "://{s}/", .{host}) catch return null;
@@ -8443,7 +8717,7 @@ fn extResourceOwned(data: []u8, mime: []const u8, status: c_int) [*c]cef.cef_res
         .add_ref = extResAddRef,
         .release = extResRelease,
         .has_one_ref = extResHasOne,
-        .has_at_least_one_ref = extResHasOne,
+        .has_at_least_one_ref = extResHasAtLeastOne,
     };
     r.handler.open = extResOpen;
     r.handler.get_response_headers = extResHeaders;

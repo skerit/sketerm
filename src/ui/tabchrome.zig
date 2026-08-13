@@ -461,6 +461,7 @@ pub fn onTabBarScroll(
 
 pub fn onSelectedPageChanged(view: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
+    @import("webface.zig").tabsChanged();
     const page = c.adw_tab_view_get_selected_page(view);
     if (page == null) return;
     // Leaving a tab is NOT an acknowledgement (only dwelling on it is — see

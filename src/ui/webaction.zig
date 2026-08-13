@@ -105,6 +105,14 @@ pub const Toolbar = struct {
         c.gtk_widget_set_visible(self.box, @intFromBool(self.actions.items.len != 0));
     }
 
+    pub fn setPresented(self: *Toolbar, presented: bool) void {
+        if (self.severed) return;
+        if (!presented) {
+            if (self.popup) |p| p.destroy(true);
+        }
+        c.gtk_widget_set_visible(self.box, @intFromBool(presented and self.actions.items.len != 0));
+    }
+
     fn configureButton(self: *Toolbar, a: *Action, in: Incoming) void {
         const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 3).?;
         c.gtk_box_append(@ptrCast(row), self.actionIcon(in.id, in.icon));
@@ -157,13 +165,13 @@ pub const Toolbar = struct {
         }
     }
 
-    pub fn openPopup(self: *Toolbar, id: []const u8) void {
-        if (self.severed) return;
+    pub fn openPopup(self: *Toolbar, id: []const u8) bool {
+        if (self.severed) return false;
         for (self.actions.items) |*a| {
             if (!std.mem.eql(u8, a.id, id) or !a.enabled or !a.popup) continue;
-            self.activate(a);
-            return;
+            return self.activate(a);
         }
+        return false;
     }
 
     pub fn adoptBuffer(self: *Toolbar, fb: proto.FrameBuffer, fd: c_int) bool {
@@ -248,15 +256,15 @@ pub const Toolbar = struct {
         if (idx >= self.actions.items.len) return;
         const a = &self.actions.items[idx];
         if (!a.enabled) return;
-        self.activate(a);
+        _ = self.activate(a);
     }
 
-    fn activate(self: *Toolbar, a: *Action) void {
-        const cl = self.cl orelse return;
+    fn activate(self: *Toolbar, a: *Action) bool {
+        const cl = self.cl orelse return false;
         if (self.popup) |old| old.destroy(true);
         self.popup = null;
         const popup = if (a.popup) Popup.create(self, a.button) else null;
-        if (a.popup and popup == null) return;
+        if (a.popup and popup == null) return false;
         self.popup = popup;
         const popup_view = if (popup) |p| p.view else 0;
         const scale = if (webface.faceByViewOn(cl, self.face_view)) |face| face.popupScale() else 1000;
@@ -268,6 +276,7 @@ pub const Toolbar = struct {
             .h = POPUP_H,
             .scale_x1000 = scale,
         });
+        return true;
     }
 
     fn post(self: *Toolbar, value: anytype) void {
@@ -407,7 +416,7 @@ const Popup = struct {
     fn showError(self: *Popup, detail: []const u8) void {
         var buf: [512:0]u8 = @splat(0);
         const text = if (detail.len != 0) detail else "The extension popup could not be opened.";
-        const n = @min(text.len, buf.len - 1);
+        const n = utf8Prefix(text, buf.len - 1);
         @memcpy(buf[0..n], text[0..n]);
         c.gtk_label_set_text(@ptrCast(self.status), &buf);
         c.gtk_widget_set_visible(self.status, 1);

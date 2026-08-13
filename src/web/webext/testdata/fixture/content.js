@@ -10,13 +10,9 @@ document.title = "cs-start";
   marker.textContent = "injected";
   (document.body || document.documentElement).appendChild(marker);
 
-  // If a previous run persisted a value, report it and stop: this is the
-  // post-restart assertion.
+  // If a previous run persisted a value, report it after the background
+  // confirms that the fresh helper minted a different capability.
   var got = await browser.storage.local.get("saved");
-  if (got && got.saved) {
-    document.title = "stored:" + got.saved;
-    return;
-  }
 
   // First run: talk to the background, then persist a value for the next.
   //
@@ -33,6 +29,10 @@ document.title = "cs-start";
   for (var i = 0; i < 40 && !(resp && resp.n); i++) {
     if (i) await new Promise(function (r) { setTimeout(r, 250); });
     resp = await browser.runtime.sendMessage({ q: "ping" });
+  }
+  if (got && got.saved) {
+    document.title = "stored:" + got.saved + ":" + (resp && resp.rotated ? "rotated" : "reused");
+    return;
   }
   await browser.storage.local.set({ saved: "v1" });
   document.title = "reply:" + (resp && resp.n) + ":" + browser.i18n.getMessage("greeting");

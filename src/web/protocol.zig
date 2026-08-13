@@ -267,7 +267,8 @@ pub const Tag = enum(u8) {
     webext_action_activate = 0xB8,
     ev_webext_popup = 0xB9,
     ev_webext_open_popup = 0xBA,
-    // 0xBB-0xBF stay reserved for the WebExtensions block.
+    webext_open_popup_result = 0xBB,
+    // 0xBC-0xBF stay reserved for the WebExtensions block.
     //
     // NOTE for anyone reading the 0xB4-0xBF reservation as originally
     // written: there is deliberately NO `webext_request` /
@@ -2427,13 +2428,25 @@ pub const EvWebextPopup = struct {
 
 /// An extension page called `browserAction.openPopup()`. The GUI owns
 /// the native toolbar/popover and performs the same activation path as
-/// a trusted toolbar click. `req` is diagnostic correlation only; the
-/// extension call is answered by the helper when this event is posted.
+/// a trusted toolbar click. `req` is helper-minted correlation; the
+/// extension call remains pending until `webext_open_popup_result`.
 pub const EvWebextOpenPopup = struct {
     pub const tag: Tag = .ev_webext_open_popup;
     view: u32,
     id: []const u8,
     req: u32,
+};
+
+/// The GUI attempted a programmatic popup request. `ok` means the
+/// native toolbar created its popover and posted the ordinary trusted
+/// activation; otherwise `detail` explains why no popup was created.
+pub const WebextOpenPopupResult = struct {
+    pub const tag: Tag = .webext_open_popup_result;
+    view: u32,
+    id: []const u8,
+    req: u32,
+    ok: u8,
+    detail: []const u8,
 };
 
 pub const webext_popup_opened: u8 = 1;
@@ -2954,6 +2967,7 @@ test "round-trip: webext frames" {
         .detail = "sketerm-extension://0123456789abcdef/popup.html",
     });
     try roundTrip(EvWebextOpenPopup, .{ .view = 7, .id = "action@example", .req = 19 });
+    try roundTrip(WebextOpenPopupResult, .{ .view = 7, .id = "action@example", .req = 19, .ok = 1, .detail = "" });
     try roundTrip(WebextWreqStatsReq, .{});
     try roundTrip(EvWebextWreqStats, .{
         .id = "abc123",

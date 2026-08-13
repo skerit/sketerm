@@ -868,6 +868,7 @@ const Client = struct {
     ext_popup_dmg_seq: u32 = 0,
     open_popup_seq: u32 = 0,
     open_popup_view: u32 = 0,
+    open_popup_req: u32 = 0,
     open_popup_id: [64]u8 = @splat(0),
     open_popup_id_len: usize = 0,
 
@@ -1603,6 +1604,7 @@ const Client = struct {
             .ev_webext_open_popup => {
                 const ev = proto.decode(proto.EvWebextOpenPopup, frame.payload) catch fail("ev_webext_open_popup decode");
                 self.open_popup_view = ev.view;
+                self.open_popup_req = ev.req;
                 self.open_popup_id_len = @min(ev.id.len, self.open_popup_id.len);
                 @memcpy(self.open_popup_id[0..self.open_popup_id_len], ev.id[0..self.open_popup_id_len]);
                 self.open_popup_seq += 1;
@@ -3221,11 +3223,11 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         cl.send(proto.Navigate{ .view = view_id, .url = page_url });
         // "stored:v1" proves the value the FIRST helper wrote to
         // storage.local survived to this SECOND helper process.
-        if (!cl.waitTitle("stored:v1", 25_000)) {
+        if (!cl.waitTitle("stored:v1:rotated", 25_000)) {
             std.debug.print("stage 33: title was \"{s}\"\n", .{cl.titleSlice()});
-            fail("stage 33 webext: storage.local did not persist across the restart");
+            fail("stage 33 webext: storage did not persist or the helper reused an extension capability");
         }
-        pass("stage 33 webext run 2 (storage.local persisted across a helper restart)");
+        pass("stage 33 webext run 2 (storage.local persisted and capability rotated across helper restart)");
 
         cl.send(proto.WebextRemove{ .id = ext_id });
         cl.send(proto.ViewDestroy{ .view = view_id });
@@ -3248,20 +3250,55 @@ const action_manifest =
     \\ "browser_specific_settings":{"gecko":{"id":"action@sketerm.test"}},
     \\ "permissions":["tabs"],
     \\ "background":{"scripts":["bg.js"],"persistent":true},
+    \\ "content_scripts":[{"matches":["http://127.0.0.1/*"],"js":["probe.js"]}],
     \\ "browser_action":{"default_title":"Action Default","default_popup":"popup.html"}}
 ;
 
 const action_bg =
+    \\async function securityChecks() {
+    \\  var helperRejected = false, unsupportedRejected = false, impersonationRejected = false;
+    \\  try { await browser.tabs.get(4294967295); } catch (e) { helperRejected = String(e).includes("no such tab"); }
+    \\  try { await browser.windows.getCurrent(); } catch (e) { unsupportedRejected = String(e).includes("windows.getCurrent is not supported"); }
+    \\  try {
+    \\    var source = await (await fetch(browser.runtime.getURL("__sketerm-extapi.js"))).text();
+    \\    var tok = source.match(/tok:"([0-9a-f]{32})"/);
+    \\    var cap = source.match(/,cap:"([0-9a-f]{32})"/);
+    \\    var slot = source.match(/window\["([0-9a-f]{32})"\]/);
+    \\    if (!tok || !cap || !slot || typeof window[slot[1]] !== "function") throw new Error("bootstrap parse");
+    \\    window.__sketermImpersonation = "pending";
+    \\    var attack = "browser.storage.local.set({stolen:true}).then(function(){window.__sketermImpersonation='resolved'},function(e){window.__sketermImpersonation='rejected:'+String(e)})";
+    \\    window[slot[1]](JSON.stringify({op:"ext-inject",tok:tok[1],ext:"click@sketerm.test",cap:cap[1],base:browser.runtime.getURL(""),manifest:{},scripts:[attack],css:[]}));
+    \\    for (var i=0;i<100 && window.__sketermImpersonation==="pending";i++) await new Promise(function(r){setTimeout(r,25)});
+    \\    impersonationRejected = String(window.__sketermImpersonation).includes("extension capability does not authorize");
+    \\  } catch (e) {}
+    \\  browser.browserAction.setTitle({title:helperRejected && unsupportedRejected && impersonationRejected ? "Security Checks Passed" : "Security Checks Failed"});
+    \\}
     \\if (typeof browser.pageAction !== "undefined" || typeof browser.action !== "undefined") throw new Error("wrong browser action namespace");
     \\browser.browserAction.setBadgeText({ text: "界界界界界界界界界界界界" });
     \\browser.browserAction.setBadgeTextColor({ color: [1,2,3,255] });
     \\browser.browserAction.setBadgeBackgroundColor({ color: "#aabbccdd" });
+    \\var openPopupChecks = 0;
     \\browser.tabs.onActivated.addListener(function () {
-    \\  browser.browserAction.openPopup();
+    \\  if (openPopupChecks++ >= 2) return;
+    \\  browser.browserAction.openPopup().then(function(){
+    \\    browser.browserAction.setBadgeText({text:"OPEN"});
+    \\    browser.browserAction.setTitle({title:"Security Checks Passed"});
+    \\  },function(){
+    \\    browser.browserAction.setBadgeText({text:"DENY"});
+    \\    browser.browserAction.setTitle({title:"Popup Denied: "+String(arguments[0])});
+    \\  });
     \\});
     \\browser.browserAction.onClicked.addListener(function (tab) {
     \\  browser.browserAction.setBadgeText({ tabId: tab.id, text: "C" });
     \\});
+    \\securityChecks();
+;
+
+const action_probe =
+    \\window.__sketermCapProbe = window.__sketermCapProbe || {apis:[],runs:0};
+    \\window.__sketermCapProbe.apis.push(browser);
+    \\window.__sketermCapProbe.current = browser;
+    \\window.__sketermCapProbe.runs++;
 ;
 
 const action_popup =
@@ -3321,6 +3358,7 @@ fn writeActionFixture(dir: []const u8, manifest_json: []const u8, background: []
     mkdirZ(dir);
     return writeFile(dir, "manifest.json", manifest_json) and
         (background.len == 0 or writeFile(dir, "bg.js", background)) and
+        writeFile(dir, "probe.js", action_probe) and
         (popup == null or writeFile(dir, "popup.html", popup.?));
 }
 
@@ -3380,6 +3418,28 @@ fn waitExtPopupState(cl: *Client, popup_view: u32, state: u8, timeout_ms: i64) b
         if (nowMs() > deadline) return false;
         cl.pump(50);
     }
+}
+
+fn waitCapRuns(cl: *Client, runs: u32, timeout_ms: i64) bool {
+    var code_buf: [192]u8 = undefined;
+    const code = std.fmt.bufPrint(&code_buf,
+        "!!window.__sketermCapProbe&&window.__sketermCapProbe.runs>={d}", .{runs}) catch return false;
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        const result = cl.evalWaitView(view_id, code, false, 5000);
+        if (std.mem.indexOf(u8, result, "\"value\":true") != null) return true;
+        cl.pump(50);
+    }
+    return false;
+}
+
+fn staleApiRejects(cl: *Client, api_index: u32, timeout_ms: i64) bool {
+    var code_buf: [512]u8 = undefined;
+    const code = std.fmt.bufPrint(&code_buf,
+        "(async()=>{{try{{await window.__sketermCapProbe.apis[{d}].storage.local.get(null);return 'STALE_RESOLVED'}}catch(e){{return 'STALE_REJECTED:'+String(e)}}}})()",
+        .{api_index}) catch return false;
+    const result = cl.evalWaitView(view_id, code, true, timeout_ms);
+    return std.mem.indexOf(u8, result, "STALE_REJECTED:Error: extension context") != null;
 }
 
 fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
@@ -3483,8 +3543,8 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     cl.send(proto.WebextSet{ .id = "click@sketerm.test", .dir = click_dir, .enabled = 1 });
     cl.send(proto.WebextSet{ .id = "missing@sketerm.test", .dir = missing_dir, .enabled = 1 });
     cl.send(proto.WebextSet{ .id = "page@sketerm.test", .dir = page_action_dir, .enabled = 1 });
-    if (!waitAction(&cl, "action@sketerm.test", "Action Default", true, "界界界界界界界界界界界界", 15_000))
-        fail("stage 40: popup action was not reported for the active page");
+    if (!waitAction(&cl, "action@sketerm.test", "Security Checks Passed", true, "界界界界界界界界界界界界", 15_000))
+        fail("stage 40: helper/local Promise rejection or two-extension impersonation check failed");
     if (!waitActionColors(&cl, "action@sketerm.test", "\"badgeTextColor\":[1,2,3,255]", "\"badgeBackgroundColor\":[170,187,204,221]", 10_000))
         fail("stage 40: badge colors were not published to the toolbar");
     if (!waitAction(&cl, "click@sketerm.test", "Click Action", false, "", 15_000))
@@ -3495,6 +3555,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     }
     if (!waitAction(&cl, "page@sketerm.test", "Page Only", false, "", 10_000))
         fail("stage 40: pageAction.show did not reveal the action for its tab");
+    pass("stage 40i helper errors reject Promises, unsupported APIs reject locally, and one extension cannot impersonate another");
 
     cl.send(proto.WebextActionActivate{
         .view = view_id,
@@ -3506,6 +3567,37 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     });
     if (!waitAction(&cl, "page@sketerm.test", "Page Clicked", false, "", 10_000))
         fail("stage 40: no-popup activation did not fire pageAction.onClicked");
+
+    if (!waitCapRuns(&cl, 1, 10_000)) fail("stage 40: content capability probe never initialized");
+    var state_before = cl.we_seq;
+    cl.send(proto.WebextSet{ .id = "action@sketerm.test", .dir = popup_dir, .enabled = 1 });
+    {
+        const deadline = nowMs() + 5000;
+        while (cl.we_seq == state_before and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.we_seq == state_before) fail("stage 40: reinstall produced no extension state");
+    if (!waitCapRuns(&cl, 2, 15_000) or !staleApiRejects(&cl, 0, 10_000))
+        fail("stage 40: reinstall did not rotate and revoke the old extension capability");
+
+    state_before = cl.we_seq;
+    cl.send(proto.WebextSet{ .id = "action@sketerm.test", .dir = popup_dir, .enabled = 0 });
+    {
+        const deadline = nowMs() + 5000;
+        while (cl.we_seq == state_before and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.we_seq == state_before or !staleApiRejects(&cl, 1, 10_000))
+        fail("stage 40: disabling an extension did not revoke its capability");
+    cl.send(proto.WebextSet{ .id = "action@sketerm.test", .dir = popup_dir, .enabled = 1 });
+    if (!waitCapRuns(&cl, 3, 15_000)) fail("stage 40: re-enabling an extension did not mint a new capability");
+
+    const reload_start = cl.evalWaitView(view_id,
+        "window.__sketermCapProbe.apis[2].runtime.reload().catch(function(){});'reload-started'", false, 10_000);
+    if (std.mem.indexOf(u8, reload_start, "reload-started") == null or !waitCapRuns(&cl, 4, 15_000) or
+        !staleApiRejects(&cl, 2, 10_000))
+        fail("stage 40: runtime.reload did not rotate and revoke the old extension capability");
+    if (!waitAction(&cl, "action@sketerm.test", "Security Checks Passed", true, "界界界界界界界界界界界界", 15_000))
+        fail("stage 40: reloaded action instance did not finish its security checks");
+    pass("stage 40j reinstall, disable/enable and runtime.reload rotate capabilities and reject stale API objects");
 
     // A stale/background page cannot activate an action for the mirrored
     // tab, and a requested popup always receives a lifecycle answer.
@@ -3577,7 +3669,45 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     if (cl.open_popup_seq == open_before or cl.open_popup_view != view_id or
         !std.mem.eql(u8, cl.open_popup_id[0..cl.open_popup_id_len], "action@sketerm.test"))
         fail("stage 40: background browserAction.openPopup produced no helper-to-GUI request");
-    pass("stage 40g background browserAction.openPopup requests the active page's native toolbar popover");
+    cl.send(proto.WebextOpenPopupResult{
+        .view = cl.open_popup_view,
+        .id = cl.open_popup_id[0..cl.open_popup_id_len],
+        .req = cl.open_popup_req +% 1,
+        .ok = 1,
+        .detail = "wrong request",
+    });
+    {
+        const deadline = nowMs() + 500;
+        while (nowMs() < deadline) cl.pump(50);
+    }
+    if (actionListHas(&cl, "action@sketerm.test", "Security Checks Passed", true, "OPEN"))
+        fail("stage 40: a mismatched popup acknowledgement settled openPopup");
+    cl.send(proto.WebextOpenPopupResult{
+        .view = cl.open_popup_view,
+        .id = cl.open_popup_id[0..cl.open_popup_id_len],
+        .req = cl.open_popup_req,
+        .ok = 0,
+        .detail = "native refusal 界",
+    });
+    if (!waitAction(&cl, "action@sketerm.test", "Popup Denied: Error: native refusal 界", true, "DENY", 10_000))
+        fail("stage 40: openPopup did not reject after the GUI refusal acknowledgement");
+
+    const open_again = cl.open_popup_seq;
+    cl.sendTabs(&.{.{ .id = 40, .view = view_id, .active = false, .url = page_url, .title = "action" }});
+    cl.sendTabs(&.{.{ .id = 40, .view = view_id, .active = true, .url = page_url, .title = "action" }});
+    const open_again_deadline = nowMs() + 10_000;
+    while (cl.open_popup_seq == open_again and nowMs() < open_again_deadline) cl.pump(50);
+    if (cl.open_popup_seq == open_again) fail("stage 40: second openPopup request never reached the GUI");
+    cl.send(proto.WebextOpenPopupResult{
+        .view = cl.open_popup_view,
+        .id = cl.open_popup_id[0..cl.open_popup_id_len],
+        .req = cl.open_popup_req,
+        .ok = 1,
+        .detail = "",
+    });
+    if (!waitAction(&cl, "action@sketerm.test", "Security Checks Passed", true, "OPEN", 10_000))
+        fail("stage 40: openPopup did not resolve after the GUI success acknowledgement");
+    pass("stage 40g browserAction.openPopup remains pending until a correlated GUI acknowledgement resolves or rejects it");
 
     cl.send(proto.WebextActionActivate{
         .view = view_id,
@@ -3745,7 +3875,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         .{ .id = 40, .view = view_id, .active = false, .url = page_url, .title = "action" },
         .{ .id = 43, .view = owner_view, .active = true, .url = page_url, .title = "owner" },
     });
-    if (!waitActionView(&cl, owner_view, "action@sketerm.test", "Action Default", true, "界界界界界界界界界界界界", 10_000))
+    if (!waitActionView(&cl, owner_view, "action@sketerm.test", "Security Checks Passed", true, "OPEN", 10_000))
         fail("stage 40: action snapshot did not follow the active owner view");
     const owner_popup = proto.WEBEXT_POPUP_VIEW_BASE + 4;
     cl.send(proto.WebextActionActivate{
@@ -3764,7 +3894,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     pass("stage 40e destroying a page closes every popup it owns");
 
     cl.sendTabs(&.{.{ .id = 40, .view = view_id, .active = true, .url = page_url, .title = "action" }});
-    if (!waitAction(&cl, "action@sketerm.test", "Action Default", true, "界界界界界界界界界界界界", 10_000))
+    if (!waitAction(&cl, "action@sketerm.test", "Security Checks Passed", true, "OPEN", 10_000))
         fail("stage 40: action snapshot did not return to the original page");
 
     const popup_view_2 = proto.WEBEXT_POPUP_VIEW_BASE + 5;
@@ -3781,6 +3911,8 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     cl.send(proto.WebextRemove{ .id = "action@sketerm.test" });
     if (!waitExtPopupState(&cl, popup_view_2, proto.webext_popup_closed, 10_000))
         fail("stage 40: removing an extension did not close its popup");
+    if (!staleApiRejects(&cl, 3, 10_000))
+        fail("stage 40: removing an extension did not revoke its last capability");
     pass("stage 40f extension removal closes its live popup");
 
     cl.send(proto.WebextRemove{ .id = "click@sketerm.test" });

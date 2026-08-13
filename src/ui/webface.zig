@@ -234,6 +234,7 @@ const webremote = @import("webremote.zig");
 const webgroup = @import("webgroup.zig");
 const zpool = @import("../wlhost/zpool.zig");
 const Pane = @import("pane.zig").Pane;
+const Window = @import("window.zig").Window;
 
 /// How long the GUI waits for a freshly spawned helper to bind its
 /// socket. CEF's startup (zygote + GPU process) dominates this.
@@ -1236,9 +1237,15 @@ pub const Client = struct {
             .ev_webext_open_popup => {
                 if (self.isRemote()) return;
                 const ev = proto.decode(proto.EvWebextOpenPopup, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| {
-                    face.openWebextPopup(ev.id);
-                }
+                const face = self.findFace(ev.view);
+                const ok = if (face) |f| f.openWebextPopup(ev.id) else false;
+                self.post(proto.WebextOpenPopupResult{
+                    .view = ev.view,
+                    .id = ev.id,
+                    .req = ev.req,
+                    .ok = @intFromBool(ok),
+                    .detail = if (ok) "" else "active native toolbar could not create the popup",
+                });
             },
             .frame_buffer => {
                 const fb = proto.decode(proto.FrameBuffer, frame.payload) catch return;
@@ -1867,6 +1874,12 @@ const TabJson = struct {
     loading: bool,
 };
 
+fn windowFocused(win: *Window) bool {
+    const app = c.gtk_window_get_application(@ptrCast(win.app_window)) orelse return false;
+    const active = c.gtk_application_get_active_window(app) orelse return false;
+    return @intFromPtr(active) == @intFromPtr(win.app_window);
+}
+
 /// Post this client's whole tab list. Replace-all by design: the helper
 /// diffs two consecutive tables into MV2's onCreated/onUpdated/
 /// onRemoved/onActivated, so nothing can desynchronise the way an
@@ -1879,16 +1892,24 @@ fn publishTabs(cl: *Client) void {
         // A face whose view has not been minted yet has nothing the
         // helper could key on, and a torn-down one must not be listed.
         if (f.view == 0 or f.widgets_dead) continue;
+        const win = f.ownerWindow() orelse continue;
+        var index: u32 = 0;
+        for (rows.items) |row| if (row.windowId == win.id) {
+            index += 1;
+        };
+        const pane = f.pane orelse continue;
+        const active_pane = win.focusedPane() orelse win.selectedTabPane();
+        const active = active_pane == pane and pane.webFaceVisible() and f.isActivePage();
         rows.append(cl.gpa, .{
             // The view id is process-wide unique and stable for the
             // face's whole life, which is exactly what a tab id has to
             // be, so it serves as both.
             .id = f.view,
             .view = f.view,
-            .windowId = 0,
-            .index = @intCast(rows.items.len),
-            .active = f.on_screen,
-            .focusedWindow = true,
+            .windowId = win.id,
+            .index = index,
+            .active = active,
+            .focusedWindow = windowFocused(win),
             .url = if (f.url) |u| u else "",
             .title = if (f.title) |t| t else "",
             .loading = f.loading,
@@ -1959,8 +1980,14 @@ pub fn tabsChanged() void {
     _ = c.g_idle_add(@ptrCast(&flushTabs), null);
 }
 
+fn syncActionPresentation(cl: *Client) void {
+    for (cl.faces.items) |face| face.syncNativeActionPresentation();
+}
+
 fn flushTabs(_: ?*anyopaque) callconv(.c) c.gboolean {
     g_tabs_dirty = false;
+    syncActionPresentation(&g_client);
+    for (g_remote_clients.items) |cl| syncActionPresentation(cl);
     publishTabs(&g_client);
     for (g_remote_clients.items) |cl| publishTabs(cl);
     return 0;
@@ -6232,12 +6259,29 @@ pub const WebFace = struct {
 
     pub fn onWebextActions(self: *WebFace, json: []const u8) void {
         if (!self.isActivePage()) return;
-        if (self.actions) |a| a.refresh(json);
+        if (self.actions) |a| {
+            a.refresh(json);
+            a.setPresented(self.nativeActionActive());
+        }
     }
 
-    pub fn openWebextPopup(self: *WebFace, id: []const u8) void {
-        if (!self.isActivePage()) return;
-        if (self.actions) |a| a.openPopup(id);
+    pub fn openWebextPopup(self: *WebFace, id: []const u8) bool {
+        if (!self.nativeActionActive()) return false;
+        if (self.actions) |a| return a.openPopup(id);
+        return false;
+    }
+
+    fn nativeActionActive(self: *WebFace) bool {
+        if (!self.isActivePage()) return false;
+        const pane = self.pane orelse return false;
+        const win = self.ownerWindow() orelse return false;
+        const active_pane = win.focusedPane() orelse win.selectedTabPane();
+        return active_pane == pane and windowFocused(win);
+    }
+
+    fn syncNativeActionPresentation(self: *WebFace) void {
+        if (self.widgets_dead) return;
+        if (self.actions) |a| a.setPresented(self.nativeActionActive());
     }
 
     pub fn onWebextPopup(self: *WebFace, ev: proto.EvWebextPopup) void {
@@ -8313,6 +8357,7 @@ pub const WebFace = struct {
 
     fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
+        tabsChanged();
         if (!self.view_live) return;
         self.cl.post(proto.InputFocus{ .view = self.view, .focused = 1 });
         self.promote();

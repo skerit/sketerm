@@ -2162,6 +2162,9 @@ const web_action_bg =
     \\browser.tabs.onUpdated.addListener(function(id,change,tab){
     \\  browser.browserAction.setIcon({tabId:id,path:tab.url.includes("action-two")?"orange.png":"blue.png"});
     \\});
+    \\browser.browserAction.onClicked.addListener(function(tab){
+    \\  browser.browserAction.setBadgeText({tabId:tab.id,text:String(tab.id)});
+    \\});
 ;
 
 const web_action_popup =
@@ -2304,27 +2307,96 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
     app.pressKey(popup, "Escape") catch return "injecting Escape into the extension popup failed";
     if (waitPopup(app, false, 10_000) == null) return "the extension popup did not close on Escape";
 
+    // A split has two visible browser toolbars, but only its focused pane
+    // is the active MV2 tab. The inactive face must receive the empty
+    // replace-all snapshot rather than keeping its old clickable action.
+    const split_open = roundtrip(allocator, sock,
+        "{\"cmd\":\"web-open\",\"target\":\"split\",\"data\":\"data:text/html,<title>action-two</title><body style='margin:0;background:%23ddd'>split</body>\"}\n") orelse
+        return "opening the browser-action split failed";
+    defer allocator.free(split_open);
+    const split_pane = parseNumAfter(split_open, "\"pane\":") orelse return "the browser-action split returned no pane";
+    if (waitSplitToolbarExclusive(app, win_id, .orange, false, .blue, 15_000) == null)
+        return "split focus did not move the only live action to the orange pane";
+    var focus_buf: [96]u8 = undefined;
+    const focus_first = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch
+        return "building the first browser-pane focus request failed";
+    if (roundtrip(allocator, sock, focus_first)) |r| allocator.free(r) else return "focusing the first browser pane failed";
+    if (waitSplitToolbarExclusive(app, win_id, .blue, true, .orange, 15_000) == null)
+        return "split focus did not clear the old orange action and restore the blue one";
+
+    // Repeat across real GTK toplevels. The new focused window gets the
+    // action and its trusted click must open a real popup there; returning
+    // focus to the primary clears the secondary's stale action.
+    const window_open = roundtrip(allocator, sock,
+        "{\"cmd\":\"web-open\",\"target\":\"window\",\"data\":\"data:text/html,<title>action-two</title><body style='margin:0;background:%23ddd'>window</body>\"}\n") orelse
+        return "opening the browser-action window failed";
+    defer allocator.free(window_open);
+    const window_pane = parseNumAfter(window_open, "\"pane\":") orelse return "the browser-action window returned no pane";
+    const second_win = blk: {
+        var waited: u32 = 0;
+        while (waited < 20_000) : (waited += 100) {
+            if (hasToplevelOtherThan(app, &.{win_id})) |id| break :blk id;
+            _ = app.pumpOnce(100);
+        }
+        return "the browser-action second window never mapped";
+    };
+    const second_action = waitToolbarExclusive(app, second_win, .orange, .blue, 15_000) orelse
+        return "the focused second window did not own the orange action";
+    if (waitSplitToolbarAbsent(app, win_id, .blue, 15_000) == null)
+        return "the unfocused primary window kept a stale blue action";
+    app.clickEx(second_win, second_action.x, second_action.y, 1, 100, 1) catch
+        return "clicking the second window's action failed";
+    const second_popup = waitPopup(app, true, 20_000) orelse return "the second window action opened no popup";
+    if (waitPopupColor(app, second_popup, .green, 20_000) == null)
+        return "the second window popup never painted its extension state";
+    app.pressKey(second_popup, "Escape") catch return "closing the second window popup failed";
+    if (waitPopup(app, false, 10_000) == null) return "the second window popup did not close";
+    app.closeWindow(second_win) catch return "closing the browser-action second window failed";
+
+    const focus_primary = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch
+        return "building the primary-window focus request failed";
+    if (roundtrip(allocator, sock, focus_primary)) |r| allocator.free(r) else return "returning focus to the primary window failed";
+    const primary_win = app.winById(win_id) orelse return "the primary browser-action window disappeared";
+    app.clickEx(win_id, @floatFromInt(@divTrunc(primary_win.w * 3, 8)), @floatFromInt(@divTrunc(primary_win.h, 2)), 1, 100, 1) catch
+        return "injecting a real focus click into the primary window failed";
+    if (waitSplitToolbarExclusive(app, win_id, .blue, true, .orange, 15_000) == null)
+        return "returning window focus did not restore the primary action";
+    _ = window_pane;
+
     // Reopen, then close the OWNER page. The popup must disappear and
     // the surviving second page must remain driveable.
-    app.clickEx(win_id, action.x, action.y, 1, 100, 1) catch return "reopening the extension popup failed";
+    const restored_action = findToolbarColorRange(app, win_id, .blue, true) orelse
+        return "the restored primary action could not be located";
+    app.clickEx(win_id, restored_action.x, restored_action.y, 1, 100, 1) catch return "reopening the extension popup failed";
     _ = waitPopup(app, true, 20_000) orelse return "the extension popup did not reopen";
     // The popup owns the Wayland keyboard grab, so a seat chord would
     // correctly reach its document rather than the toplevel shortcut.
-    // Dispatch the same close_tab action directly to exercise owner
-    // teardown deterministically.
-    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"close_tab\"}\n")) |r| {
+    // Close the known owner pane directly: with another split alive,
+    // global close_tab focus routing is not the behavior under test.
+    var owner_close_buf: [96]u8 = undefined;
+    const owner_close = std.fmt.bufPrint(&owner_close_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{pane}) catch
+        return "building the popup owner close request failed";
+    if (roundtrip(allocator, sock, owner_close)) |r| {
         defer allocator.free(r);
         if (std.mem.indexOf(u8, r, "\"ok\":true") == null)
-            return "closing the popup owner page was rejected";
-    } else return "closing the popup owner page failed";
-    if (waitPopup(app, false, 15_000) == null) return "closing the owner page did not close its extension popup";
+            return "closing the popup owner pane was rejected";
+    } else return "closing the popup owner pane failed";
+    if (waitPopup(app, false, 15_000) == null) return "closing the owner pane did not close its extension popup";
     const alive = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "the GUI stopped serving after popup-owner teardown";
     defer allocator.free(alive);
     if (std.mem.indexOf(u8, alive, "\"ok\":true") == null or std.mem.indexOf(u8, alive, "\"helper\":\"ready\"") == null)
         return "the GUI/helper was unhealthy after popup-owner teardown";
 
+    var close_split_buf: [96]u8 = undefined;
+    const close_split = std.fmt.bufPrint(&close_split_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{split_pane}) catch
+        return "building the browser-action split close failed";
+    if (roundtrip(allocator, sock, close_split)) |r| allocator.free(r) else return "closing the browser-action split failed";
+
     if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"toggle_tab_sidebar\"}\n")) |r| allocator.free(r);
     closeAddedPanes(allocator, sock, app, keep_ids[0..keep_n]);
+    if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
+        return "restoring terminal focus after the browser-action stage failed";
+    _ = app.waitIdle(200, 4_000);
     return null;
 }
 
@@ -2332,6 +2404,10 @@ const ToolbarColor = enum { blue, orange, green };
 const Point = struct { x: f64, y: f64 };
 
 fn findToolbarColor(app: *appdrive.App, win_id: u32, color: ToolbarColor) ?Point {
+    return findToolbarColorRange(app, win_id, color, false);
+}
+
+fn findToolbarColorRange(app: *appdrive.App, win_id: u32, color: ToolbarColor, left_half: bool) ?Point {
     const win = app.winById(win_id) orelse return null;
     if (win.w <= 0 or win.h <= 0) return null;
     const w: usize = @intCast(win.w);
@@ -2339,28 +2415,76 @@ fn findToolbarColor(app: *appdrive.App, win_id: u32, color: ToolbarColor) ?Point
     const limit_y = @min(h, 180);
     var y: usize = 0;
     while (y < limit_y) : (y += 1) {
-        var x: usize = w / 2;
-        while (x < w) : (x += 1) {
-            const i = (y * w + x) * 4;
-            if (i + 3 >= win.pixels.items.len) return null;
-            const b = win.pixels.items[i];
-            const g = win.pixels.items[i + 1];
-            const r = win.pixels.items[i + 2];
-            const match = switch (color) {
-                .blue => b > 180 and b > r +| 80 and b > g +| 40,
-                .orange => r > 180 and g > 50 and g < 170 and b < 80,
-                .green => g > 120 and g > r +| 70 and g > b +| 70,
-            };
-            if (match) return .{ .x = @floatFromInt(x), .y = @floatFromInt(y) };
+        var x: usize = if (left_half) 0 else w / 2;
+        const limit_x = if (left_half) w / 2 else w;
+        while (x < limit_x) : (x += 1) {
+            if (x + 3 >= limit_x or y + 3 >= limit_y) continue;
+            var solid = true;
+            var by: usize = 0;
+            while (by < 4 and solid) : (by += 1) {
+                var bx: usize = 0;
+                while (bx < 4) : (bx += 1) {
+                    const i = ((y + by) * w + x + bx) * 4;
+                    if (i + 3 >= win.pixels.items.len or !toolbarColorMatches(win.pixels.items[i..][0..4], color)) {
+                        solid = false;
+                        break;
+                    }
+                }
+            }
+            if (solid) return .{ .x = @floatFromInt(x + 2), .y = @floatFromInt(y + 2) };
         }
     }
     return null;
+}
+
+fn toolbarColorMatches(pixel: []const u8, color: ToolbarColor) bool {
+    const b = pixel[0];
+    const g = pixel[1];
+    const r = pixel[2];
+    return switch (color) {
+        .blue => b > 180 and b > r +| 80 and b > g +| 40,
+        .orange => r > 180 and g > 50 and g < 170 and b < 80,
+        .green => g > 120 and g > r +| 70 and g > b +| 70,
+    };
 }
 
 fn waitPopupColor(app: *appdrive.App, popup: u32, color: ToolbarColor, timeout_ms: u32) ?Point {
     var waited: u32 = 0;
     while (waited < timeout_ms) : (waited += 100) {
         if (findToolbarColor(app, popup, color)) |p| return p;
+        _ = app.pumpOnce(100);
+    }
+    return null;
+}
+
+fn waitToolbarExclusive(app: *appdrive.App, win: u32, wanted: ToolbarColor, absent: ToolbarColor, timeout_ms: u32) ?Point {
+    var waited: u32 = 0;
+    while (waited < timeout_ms) : (waited += 100) {
+        if (findToolbarColor(app, win, wanted)) |point| {
+            if (findToolbarColor(app, win, absent) == null) return point;
+        }
+        _ = app.pumpOnce(100);
+    }
+    return null;
+}
+
+fn waitSplitToolbarExclusive(app: *appdrive.App, win: u32, wanted: ToolbarColor, wanted_left: bool, absent: ToolbarColor, timeout_ms: u32) ?Point {
+    var waited: u32 = 0;
+    while (waited < timeout_ms) : (waited += 100) {
+        if (findToolbarColorRange(app, win, wanted, wanted_left)) |point| {
+            if (findToolbarColorRange(app, win, absent, true) == null and
+                findToolbarColorRange(app, win, absent, false) == null) return point;
+        }
+        _ = app.pumpOnce(100);
+    }
+    return null;
+}
+
+fn waitSplitToolbarAbsent(app: *appdrive.App, win: u32, color: ToolbarColor, timeout_ms: u32) ?void {
+    var waited: u32 = 0;
+    while (waited < timeout_ms) : (waited += 100) {
+        if (findToolbarColorRange(app, win, color, true) == null and
+            findToolbarColorRange(app, win, color, false) == null) return {};
         _ = app.pumpOnce(100);
     }
     return null;
