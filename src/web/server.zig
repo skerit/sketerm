@@ -200,9 +200,11 @@ pub const Server = struct {
         // outlives any fixed pump count — so pump until every browser
         // reported `on_before_close`, bounded, then drain the tail.
         self.host.destroyAll();
+        cefhost.filterSubShutdown(&self.host);
         const deadline = cefhost.nowMs() + drain_deadline_ms;
-        while (cefhost.openBrowsers() > 0 and cefhost.nowMs() < deadline) {
+        while ((cefhost.openBrowsers() > 0 or cefhost.filterSubBusy(&self.host)) and cefhost.nowMs() < deadline) {
             cefhost.pump();
+            self.host.watchdog(cefhost.nowMs());
             _ = c.usleep(2_000);
         }
     }

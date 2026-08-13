@@ -12,6 +12,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const lsp_servers = @import("lsp/servers.zig");
+const filtersub = @import("web/filtersub.zig");
 pub const titlefmt = @import("util/titlefmt.zig");
 
 /// Historical tab-label behaviour: the OSC 0/2 title, verbatim.
@@ -3195,7 +3196,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.web_store_socket = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "filter_list")) {
         // Repeated key: every line adds one subscription, in file order.
-        if (value.len > 0) try cfg.filter_lists.append(arena, try arena.dupe(u8, value));
+        if (!filtersub.validUrl(value)) return error.BadFilterListUrl;
+        try cfg.filter_lists.append(arena, try arena.dupe(u8, value));
     } else if (std.mem.eql(u8, key, "filter_update_hours")) {
         cfg.filter_update_hours = try parseU32(value);
     } else if (std.mem.eql(u8, key, "tab_sidebar_width")) {
@@ -5198,4 +5200,9 @@ test "config: filter subscriptions round-trip, repeat and clone" {
     try d.serialise(&w2);
     try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "filter_update_hours") == null);
     try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "filter_list") == null);
+
+    var bad = try Config.loadFromBytes(std.testing.allocator,
+        "filter_list = file:///tmp/local.txt\nfilter_list = https:///missing-host.txt\n");
+    defer bad.deinit();
+    try std.testing.expectEqual(@as(usize, 0), bad.filter_lists.items.len);
 }

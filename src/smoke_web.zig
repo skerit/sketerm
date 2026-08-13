@@ -57,6 +57,7 @@ const webhints = @import("web/hints.zig");
 const axtree = @import("web/axtree.zig");
 const socks5 = @import("ipc/socks5.zig");
 const zip = @import("web/webext/zip.zig");
+const filtersub = @import("web/filtersub.zig");
 
 /// `SKETERM_SMOKE_WEB_CONSOLE=1` echoes every page console message.
 /// Off by default because 30-odd stages would drown in Chromium noise;
@@ -593,6 +594,17 @@ const HttpProbe = struct {
     served: std.atomic.Value(u32) = .init(0),
     /// The document served to every request.
     body: []const u8 = page,
+    /// Stage 39 turns the otherwise one-document probe into a tiny
+    /// filter-list/resource router.
+    filter_router: bool = false,
+    filter_mode: std.atomic.Value(u8) = .init(@intFromEnum(FilterMode.good)),
+    list_hits: std.atomic.Value(u32) = .init(0),
+    blocked_hits: std.atomic.Value(u32) = .init(0),
+    control_hits: std.atomic.Value(u32) = .init(0),
+    slow_hits: std.atomic.Value(u32) = .init(0),
+    workers: std.atomic.Value(u32) = .init(0),
+
+    const FilterMode = enum(u8) { good, http_error, malformed, oversize };
 
     /// Sets the probe cookie from SCRIPT (not from a Set-Cookie
     /// header): what a site's own JavaScript stores is exactly what a
@@ -638,9 +650,25 @@ const HttpProbe = struct {
             if (c.poll(@ptrCast(&pfd), 1, 200) <= 0) continue;
             const afd = c.accept(self.fd, null, null);
             if (afd < 0) continue;
+            if (self.filter_router) {
+                _ = self.workers.fetchAdd(1, .release);
+                const t = std.Thread.spawn(.{}, HttpProbe.handleAndClose, .{ self, afd }) catch {
+                    _ = self.workers.fetchSub(1, .release);
+                    _ = c.close(afd);
+                    continue;
+                };
+                t.detach();
+                continue;
+            }
             self.handle(afd);
             _ = c.close(afd);
         }
+    }
+
+    fn handleAndClose(self: *HttpProbe, afd: c_int) void {
+        defer _ = self.workers.fetchSub(1, .release);
+        self.handle(afd);
+        _ = c.close(afd);
     }
 
     fn handle(self: *HttpProbe, afd: c_int) void {
@@ -648,7 +676,13 @@ const HttpProbe = struct {
         // answers every path, which is all these stages need.
         var buf: [4096]u8 = undefined;
         var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
-        if (c.poll(@ptrCast(&pfd), 1, 2000) > 0) _ = c.read(afd, &buf, buf.len);
+        var n: isize = 0;
+        if (c.poll(@ptrCast(&pfd), 1, 2000) > 0) n = c.read(afd, &buf, buf.len);
+        const raw = if (n > 0) buf[0..@intCast(n)] else "";
+        if (self.filter_router) {
+            self.handleFilter(afd, raw);
+            return;
+        }
         var head: [256]u8 = undefined;
         const hdr = std.fmt.bufPrint(
             &head,
@@ -660,12 +694,112 @@ const HttpProbe = struct {
         _ = self.served.fetchAdd(1, .release);
     }
 
+    fn handleFilter(self: *HttpProbe, afd: c_int, raw: []const u8) void {
+        if (std.mem.indexOf(u8, raw, "GET /list.txt") != null) {
+            _ = self.list_hits.fetchAdd(1, .release);
+            const mode: FilterMode = @enumFromInt(self.filter_mode.load(.acquire));
+            switch (mode) {
+                .good => self.reply(afd, "200 OK", "text/plain", filter_body),
+                .http_error => self.reply(afd, "503 Service Unavailable", "text/plain", filter_body),
+                .malformed => self.reply(afd, "200 OK", "text/html", "<!doctype html><html><body>captive portal</body></html>"),
+                .oversize => self.replyOversize(afd),
+            }
+            return;
+        }
+        if (std.mem.indexOf(u8, raw, "GET /slow.txt") != null) {
+            _ = self.slow_hits.fetchAdd(1, .release);
+            while (!self.stop.load(.acquire)) _ = c.usleep(20_000);
+            _ = self.slow_hits.fetchSub(1, .release);
+            return;
+        }
+        if (std.mem.indexOf(u8, raw, "GET /blocked.js") != null) {
+            _ = self.blocked_hits.fetchAdd(1, .release);
+            self.reply(afd, "200 OK", "text/plain", "blocked-resource");
+            return;
+        }
+        if (std.mem.indexOf(u8, raw, "GET /control.js") != null) {
+            _ = self.control_hits.fetchAdd(1, .release);
+            self.reply(afd, "200 OK", "text/plain", "control-resource");
+            return;
+        }
+        self.reply(afd, "200 OK", "text/html", filter_page);
+    }
+
+    fn reply(_: *HttpProbe, afd: c_int, status: []const u8, ctype: []const u8, body: []const u8) void {
+        var head: [256]u8 = undefined;
+        const hdr = std.fmt.bufPrint(
+            &head,
+            "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            .{ status, ctype, body.len },
+        ) catch return;
+        writeHttp(afd, hdr);
+        writeHttp(afd, body);
+    }
+
+    fn replyOversize(_: *HttpProbe, afd: c_int) void {
+        const total: usize = 16 * 1024 * 1024 + 1;
+        var head: [256]u8 = undefined;
+        const hdr = std.fmt.bufPrint(
+            &head,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+            .{total},
+        ) catch return;
+        writeHttp(afd, hdr);
+        var chunk: [64 * 1024]u8 = @splat('!');
+        @memcpy(chunk[0..filter_body.len], filter_body);
+        var sent: usize = 0;
+        while (sent < total) {
+            const take = @min(chunk.len, total - sent);
+            const n = c.write(afd, &chunk, take);
+            if (n <= 0) return;
+            sent += @intCast(n);
+        }
+    }
+
+    fn setFilterMode(self: *HttpProbe, mode: FilterMode) void {
+        self.filter_mode.store(@intFromEnum(mode), .release);
+    }
+
+    fn writeHttp(fd: c_int, bytes: []const u8) void {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = c.write(fd, bytes.ptr + off, bytes.len - off);
+            if (n < 0 and std.c._errno().* == c.EINTR) continue;
+            if (n <= 0) return;
+            off += @intCast(n);
+        }
+    }
+
+    fn resetResourceHits(self: *HttpProbe) void {
+        self.blocked_hits.store(0, .release);
+        self.control_hits.store(0, .release);
+    }
+
+    const filter_body =
+        "[Adblock Plus 2.0]\n" ++
+        "! Title: smoke-web stage 39\n" ++
+        "blocked.js\n";
+
+    const filter_page =
+        "<!doctype html><html><head><title>fs-start</title></head><body><script>" ++
+        "var q=location.search;Promise.all([" ++
+        "fetch('/control.js'+q).then(function(r){return r.text()}).catch(function(){return 'control-error'})," ++
+        "fetch('/blocked.js'+q).then(function(){return 'hit'},function(){return 'blocked'})" ++
+        "]).then(function(r){document.title='fs'+q+':'+r[0]+':'+r[1]});" ++
+        "</script></body></html>";
+
     fn shutdown(self: *HttpProbe) void {
         self.stop.store(true, .release);
+        if (self.fd >= 0) {
+            _ = c.shutdown(self.fd, c.SHUT_RDWR);
+            _ = c.close(self.fd);
+            self.fd = -1;
+        }
         if (self.thread) |t| t.join();
         self.thread = null;
-        if (self.fd >= 0) _ = c.close(self.fd);
-        self.fd = -1;
+        const deadline = nowMs() + 2_000;
+        while (self.workers.load(.acquire) != 0 and nowMs() < deadline) _ = c.usleep(10_000);
+        if (self.workers.load(.acquire) != 0) fail("HTTP probe workers did not stop");
     }
 };
 
@@ -695,6 +829,7 @@ const Client = struct {
     ack_contexts: bool = false,
     ack_webext: bool = false,
     ack_webext_tabs: bool = false,
+    ack_filter_subscribe: bool = false,
 
     /// Last `ev_webext_state` observed (one extension in the stage).
     we_ok: u8 = 0xff,
@@ -831,6 +966,13 @@ const Client = struct {
     int_log_len: usize = 0,
     int_log_next: u32 = 0,
     int_log_seq: u32 = 0,
+    sub_done_seq: u32 = 0,
+    sub_serial: u32 = 0,
+    sub_active: u16 = 0,
+    sub_fetched: u16 = 0,
+    sub_updated: u16 = 0,
+    sub_failed: u16 = 0,
+    sub_rules: u32 = 0,
     /// The inspector view the helper minted, and everything that
     /// belongs to IT rather than to the page being inspected. Frames
     /// are routed by view id the moment `dev_view` is known — which is
@@ -1128,6 +1270,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.ack_frames_inline = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.ack_webext = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.ack_webext_tabs = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.ack_filter_subscribe = true;
                 }
             },
             .frame_inline => {
@@ -1479,6 +1622,16 @@ const Client = struct {
                 @memcpy(self.int_log[0..self.int_log_len], json[0..self.int_log_len]);
                 self.int_log_seq += 1;
             },
+            .ev_intercept_subscribe_done => {
+                const d = proto.decode(proto.EvInterceptSubscribeDone, frame.payload) catch fail("ev_intercept_subscribe_done decode");
+                self.sub_serial = d.serial;
+                self.sub_active = d.active;
+                self.sub_fetched = d.fetched;
+                self.sub_updated = d.updated;
+                self.sub_failed = d.failed;
+                self.sub_rules = d.rules;
+                self.sub_done_seq += 1;
+            },
             else => {},
         }
     }
@@ -1597,6 +1750,12 @@ const Client = struct {
 
     fn logSlice(self: *Client) []const u8 {
         return self.int_log[0..self.int_log_len];
+    }
+
+    fn subscribeWait(self: *Client, hours: u32, urls: []const []const u8, timeout_ms: i64) bool {
+        const seq = self.sub_done_seq;
+        self.send(proto.InterceptSubscribe{ .update_hours = hours, .urls = urls });
+        return self.waitSeq(&self.sub_done_seq, seq, timeout_ms);
     }
 
     fn sawPopup(self: *Client, needle: []const u8) bool {
@@ -3685,6 +3844,172 @@ fn readWholeFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     return buf;
 }
 
+fn markFileStale(path: []const u8) bool {
+    var pbuf: [4096]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return false;
+    const times: [2]c.struct_timespec = .{
+        .{ .tv_sec = 1, .tv_nsec = 0 },
+        .{ .tv_sec = 1, .tv_nsec = 0 },
+    };
+    return c.utimensat(c.AT_FDCWD, p.ptr, &times, 0) == 0;
+}
+
+fn waitHttpCount(cl: *Client, value: *std.atomic.Value(u32), min: u32, timeout_ms: i64) bool {
+    const deadline = nowMs() + timeout_ms;
+    while (value.load(.acquire) < min) {
+        if (nowMs() > deadline) return false;
+        cl.pump(50);
+    }
+    return true;
+}
+
+/// Stage 39: subscription fetch, atomic replacement, live reload and teardown.
+fn runFilterSubscriptionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var old_config_buf: [4096:0]u8 = undefined;
+    const had_config_home = if (c.getenv("XDG_CONFIG_HOME")) |raw| blk: {
+        const old = std.mem.span(raw);
+        if (old.len >= old_config_buf.len) fail("stage 39 prior config path too long");
+        @memcpy(old_config_buf[0..old.len], old);
+        old_config_buf[old.len] = 0;
+        break :blk true;
+    } else false;
+    defer {
+        if (had_config_home) {
+            _ = c.setenv("XDG_CONFIG_HOME", &old_config_buf, 1);
+        } else {
+            _ = c.unsetenv("XDG_CONFIG_HOME");
+        }
+    }
+
+    var config_buf: [4096]u8 = undefined;
+    const config_home = std.fmt.bufPrintZ(&config_buf, "{s}/filter-config", .{dir}) catch fail("stage 39 config path");
+    mkdirAllZ(config_home);
+    _ = c.setenv("XDG_CONFIG_HOME", config_home.ptr, 1);
+    var cache_buf: [4096]u8 = undefined;
+    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/filter-cache", .{dir}) catch fail("stage 39 cache path");
+    mkdirAllZ(cache);
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/f39.sock", .{dir}) catch fail("stage 39 socket path");
+
+    var http = HttpProbe{ .filter_router = true };
+    if (!http.start()) fail("stage 39: loopback HTTP server would not start");
+    defer http.shutdown();
+
+    var list_buf: [96]u8 = undefined;
+    const list_url = std.fmt.bufPrint(&list_buf, "http://127.0.0.1:{d}/list.txt", .{http.port}) catch fail("stage 39 list url");
+    var page_buf: [96]u8 = undefined;
+    const page_base = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/page", .{http.port}) catch fail("stage 39 page url");
+    var slow_buf: [96]u8 = undefined;
+    const slow_url = std.fmt.bufPrint(&slow_buf, "http://127.0.0.1:{d}/slow.txt", .{http.port}) catch fail("stage 39 slow url");
+
+    var cache_name_buf: [filtersub.MAX_NAME]u8 = undefined;
+    const cache_name = filtersub.cacheName(list_url, &cache_name_buf) catch fail("stage 39 cache name");
+    var cache_path_buf: [4096]u8 = undefined;
+    const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/sketerm/filters/{s}", .{ config_home, cache_name }) catch fail("stage 39 cache file path");
+
+    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", false);
+    g_pid = pid;
+    var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-filter-sub" });
+    {
+        const deadline = nowMs() + 20_000;
+        while (cl.ack_proto == 0 and nowMs() < deadline) cl.pump(100);
+    }
+    if (cl.ack_proto != proto.PROTO_VERSION) fail("stage 39: no hello_ack");
+    if (!cl.ack_filter_subscribe) fail("stage 39: fetching is disabled (no filter-subscribe capability)");
+
+    cl.send(proto.ViewCreate{ .view = view_id, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+    cl.have_view = true;
+    if (!cl.waitBufferAfter(0, 20_000)) fail("stage 39: no page view buffer");
+
+    // The target must reach the server BEFORE subscription. This fails
+    // if an old local file already happens to contain the probe rule.
+    http.resetResourceHits();
+    cl.resetTitle();
+    var baseline_buf: [128]u8 = undefined;
+    const baseline = std.fmt.bufPrint(&baseline_buf, "{s}?baseline", .{page_base}) catch fail("stage 39 baseline url");
+    cl.send(proto.Navigate{ .view = view_id, .url = baseline });
+    if (!cl.waitTitle("fs?baseline:control-resource:hit", 20_000)) {
+        std.debug.print("stage 39 baseline title was \"{s}\"\n", .{cl.titleSlice()});
+        fail("stage 39: target was blocked before the fetched rule existed");
+    }
+    if (http.blocked_hits.load(.acquire) == 0 or http.control_hits.load(.acquire) == 0)
+        fail("stage 39: baseline resources did not both reach the server");
+
+    // Duplicate URLs are reconciled once. Completion is the stateful
+    // boundary: it is posted only after the accepted file was reloaded.
+    const duplicate_urls = [_][]const u8{ list_url, list_url };
+    if (!cl.subscribeWait(1, &duplicate_urls, 30_000)) fail("stage 39: initial subscription never completed");
+    if (cl.sub_active != 1 or cl.sub_fetched != 1 or cl.sub_updated != 1 or cl.sub_failed != 0)
+        fail("stage 39: initial completion counters do not describe one successful fetch");
+    if (http.list_hits.load(.acquire) != 1) fail("stage 39: duplicate subscription fetched more than once");
+    const cached = readWholeFile(gpa, cache_path) orelse fail("stage 39: accepted list was not cached");
+    defer gpa.free(cached);
+    if (!std.mem.eql(u8, cached, HttpProbe.filter_body)) fail("stage 39: cached list bytes differ from the response");
+
+    http.resetResourceHits();
+    cl.resetTitle();
+    var blocked_buf: [128]u8 = undefined;
+    const blocked_page = std.fmt.bufPrint(&blocked_buf, "{s}?fetched", .{page_base}) catch fail("stage 39 blocked url");
+    cl.send(proto.Navigate{ .view = view_id, .url = blocked_page });
+    if (!cl.waitTitle("fs?fetched:control-resource:blocked", 20_000)) fail("stage 39: fetched rule never became active");
+    if (http.blocked_hits.load(.acquire) != 0) fail("stage 39: blocked resource still reached the server");
+    if (http.control_hits.load(.acquire) == 0) fail("stage 39: control request did not reach the server");
+
+    // Empty replace-all removes the cache and reloads immediately.
+    if (!cl.subscribeWait(1, &.{}, 10_000)) fail("stage 39: empty replacement never completed");
+    if (cl.sub_active != 0 or cl.sub_fetched != 0 or cl.sub_updated != 0 or cl.sub_failed != 0)
+        fail("stage 39: empty replacement completion was not empty");
+    if (readWholeFile(gpa, cache_path)) |left| {
+        gpa.free(left);
+        fail("stage 39: removed subscription left its cache file behind");
+    }
+    http.resetResourceHits();
+    cl.resetTitle();
+    var removed_buf: [128]u8 = undefined;
+    const removed_page = std.fmt.bufPrint(&removed_buf, "{s}?removed", .{page_base}) catch fail("stage 39 removed url");
+    cl.send(proto.Navigate{ .view = view_id, .url = removed_page });
+    if (!cl.waitTitle("fs?removed:control-resource:hit", 20_000)) fail("stage 39: removed rule remained live");
+
+    // Re-establish the good cache, then try three replacement failures.
+    const one_url = [_][]const u8{list_url};
+    http.setFilterMode(.good);
+    if (!cl.subscribeWait(1, &one_url, 30_000) or cl.sub_updated != 1 or cl.sub_failed != 0)
+        fail("stage 39: could not re-establish the good cache");
+    const failures = [_]HttpProbe.FilterMode{ .http_error, .malformed, .oversize };
+    for (failures) |mode| {
+        if (!markFileStale(cache_path)) fail("stage 39: could not age the cache for a replacement test");
+        http.setFilterMode(mode);
+        if (!cl.subscribeWait(1, &one_url, 30_000)) fail("stage 39: rejected replacement never completed");
+        if (cl.sub_fetched != 1 or cl.sub_updated != 0 or cl.sub_failed != 1)
+            fail("stage 39: rejected replacement completion counters are wrong");
+        const kept = readWholeFile(gpa, cache_path) orelse fail("stage 39: rejected response deleted the previous cache");
+        const unchanged = std.mem.eql(u8, kept, HttpProbe.filter_body);
+        gpa.free(kept);
+        if (!unchanged) fail("stage 39: rejected response overwrote the previous cache");
+    }
+    http.resetResourceHits();
+    cl.resetTitle();
+    var kept_buf: [128]u8 = undefined;
+    const kept_page = std.fmt.bufPrint(&kept_buf, "{s}?kept", .{page_base}) catch fail("stage 39 kept url");
+    cl.send(proto.Navigate{ .view = view_id, .url = kept_page });
+    if (!cl.waitTitle("fs?kept:control-resource:blocked", 20_000)) fail("stage 39: a rejected response disabled the previous rule");
+    if (http.blocked_hits.load(.acquire) != 0 or http.control_hits.load(.acquire) == 0)
+        fail("stage 39: stale-good failure-open network assertions failed");
+
+    // Disconnect while a URLRequest has no response. The Host cancels
+    // it and drains the transferred CEF reference before shutdown.
+    const slow_urls = [_][]const u8{slow_url};
+    const seq = cl.sub_done_seq;
+    cl.send(proto.InterceptSubscribe{ .update_hours = 1, .urls = &slow_urls });
+    if (!waitHttpCount(&cl, &http.slow_hits, 1, 10_000)) fail("stage 39: slow teardown fetch never started");
+    if (cl.sub_done_seq != seq) fail("stage 39: slow fetch completed before teardown could exercise cancellation");
+    cl.have_view = false;
+    cl.deinit();
+    reapHelperTimeout(pid, "stage 39 filter subscription", 15_000);
+    pass("stage 39 filter subscription (fetch/reload, zero-hit block, rejected replacements, removal, teardown)");
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, c.SIG_IGN);
     const argv = init.args.vector;
@@ -5402,6 +5727,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if ((status >> 8) & 0xff != 0) fail("stage 23 teardown: helper exited nonzero");
         pass("stage 23 teardown (helper exited 0 on disconnect)");
     }
+
+    runFilterSubscriptionStage(gpa, exe, dir);
 
     // ── Stage 24: GPU frames, or the fallback that replaces them ───
     //

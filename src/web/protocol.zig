@@ -256,6 +256,7 @@ pub const Tag = enum(u8) {
     ev_scroll = 0xC2,
     scroll_to = 0xC3,
     intercept_subscribe = 0xC4,
+    ev_intercept_subscribe_done = 0xC5,
     cookies_req = 0xC8,
     ev_cookies = 0xC9,
     cookie_delete = 0xCA,
@@ -1592,6 +1593,19 @@ pub const InterceptSubscribe = struct {
         for (urls) |*u| u.* = try cur.readStr();
         return .{ .update_hours = hours, .urls = urls };
     }
+};
+
+/// Completion of one subscription reconcile batch. A reply is emitted
+/// only after every fetch in that batch has completed and any accepted
+/// files have been reloaded into the live filter engine.
+pub const EvInterceptSubscribeDone = struct {
+    pub const tag: Tag = .ev_intercept_subscribe_done;
+    serial: u32,
+    active: u16,
+    fetched: u16,
+    updated: u16,
+    failed: u16,
+    rules: u32,
 };
 
 pub const InterceptStatusReq = struct {
@@ -2950,6 +2964,16 @@ test "round-trip: intercept_subscribe url list" {
     const none = try InterceptSubscribe.decodeAlloc(f2.payload, gpa);
     defer gpa.free(none.urls);
     try std.testing.expectEqual(@as(usize, 0), none.urls.len);
+    try roundTrip(EvInterceptSubscribeDone, .{
+        .serial = 9,
+        .active = 4,
+        .fetched = 4,
+        .updated = 1,
+        .failed = 3,
+        .rules = 27,
+    });
+    try std.testing.expectEqual(@as(u8, 0xC4), @intFromEnum(Tag.intercept_subscribe));
+    try std.testing.expectEqual(@as(u8, 0xC5), @intFromEnum(Tag.ev_intercept_subscribe_done));
 }
 
 test "round-trip: user content sets (0xC0 block)" {

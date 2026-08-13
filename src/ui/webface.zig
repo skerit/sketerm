@@ -805,6 +805,7 @@ pub const Client = struct {
         // restart may land on a different helper build.
         self.cap_discard = false;
         self.cap_frames_inline = false;
+        self.cap_filter_subscribe = false;
         if (self.bridge) |br| {
             self.bridge = null;
             br.stop();
@@ -1150,6 +1151,7 @@ pub const Client = struct {
                 self.cap_sitedata = false;
                 self.cap_scroll = false;
                 self.cap_frames_inline = false;
+                self.cap_filter_subscribe = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -1178,6 +1180,9 @@ pub const Client = struct {
                 // Seed the helper with the stored user content before
                 // the faces' first navigations get far.
                 self.refreshUserContent();
+                // The capability was unknown until this reply, so this
+                // is the first point the configured set can be sent.
+                publishFilterSubs(self);
             },
             .ev_webext_state => {
                 const st = proto.decode(proto.EvWebextState, frame.payload) catch return;
@@ -1813,17 +1818,31 @@ fn publishTabs(cl: *Client) void {
 
 var g_sub_urls: std.ArrayList([]u8) = .empty;
 var g_sub_hours: u32 = 24;
+var g_sub_gpa: ?std.mem.Allocator = null;
 
 /// Publish the configured subscription set. REPLACE-ALL, so this is
 /// also how "I removed my last subscription" reaches the helper and
 /// gets the cache files swept.
 pub fn setFilterSubscriptions(gpa: std.mem.Allocator, urls: []const []const u8, hours: u32) void {
-    for (g_sub_urls.items) |u| gpa.free(u);
-    g_sub_urls.clearRetainingCapacity();
+    var next: std.ArrayList([]u8) = .empty;
+    var adopted = false;
+    defer if (!adopted) {
+        for (next.items) |u| gpa.free(u);
+        next.deinit(gpa);
+    };
     for (urls) |u| {
-        const d = gpa.dupe(u8, u) catch continue;
-        g_sub_urls.append(gpa, d) catch gpa.free(d);
+        const d = gpa.dupe(u8, u) catch return;
+        next.append(gpa, d) catch {
+            gpa.free(d);
+            return;
+        };
     }
+    const old_gpa = g_sub_gpa orelse gpa;
+    for (g_sub_urls.items) |u| old_gpa.free(u);
+    g_sub_urls.deinit(old_gpa);
+    g_sub_urls = next;
+    adopted = true;
+    g_sub_gpa = gpa;
     g_sub_hours = hours;
     publishFilterSubs(&g_client);
     for (g_remote_clients.items) |cl| publishFilterSubs(cl);
@@ -1831,9 +1850,6 @@ pub fn setFilterSubscriptions(gpa: std.mem.Allocator, urls: []const []const u8, 
 
 fn publishFilterSubs(cl: *Client) void {
     if (!cl.cap_filter_subscribe or cl.state != .ready) return;
-    // Nothing configured and nothing to sweep: stay off the network and
-    // off the disk entirely.
-    if (g_sub_urls.items.len == 0) return;
     var view: std.ArrayList([]const u8) = .empty;
     defer view.deinit(cl.gpa);
     for (g_sub_urls.items) |u| view.append(cl.gpa, u) catch return;

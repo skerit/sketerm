@@ -771,6 +771,22 @@ pub const Host = struct {
     us_style_arena: ?std.heap.ArenaAllocator = null,
     us_styles: std.ArrayList(StyleRec) = .empty,
 
+    /// Host-owned subscription state and URLRequests. CEF owns a
+    /// separate transferred client reference for each live request.
+    filter_sub_urls: std.ArrayList([]u8) = .empty,
+    filter_fetches: std.ArrayList(*FilterFetch) = .empty,
+    filter_sub_hours: u32 = 0,
+    filter_sub_serial: u32 = 0,
+    filter_sub_active: u16 = 0,
+    filter_sub_fetched: u16 = 0,
+    filter_sub_updated: u16 = 0,
+    filter_sub_failed: u16 = 0,
+    filter_sub_pending: u16 = 0,
+    filter_sub_reload: bool = false,
+    filter_sub_batch_open: bool = false,
+    filter_sub_stopping: bool = false,
+    filter_sub_next_ms: i64 = std.math.maxInt(i64),
+
     const ScriptRec = struct {
         id: u32,
         meta: userscript.Meta,
@@ -892,6 +908,10 @@ pub const Host = struct {
         if (self.us_script_arena) |*a| a.deinit();
         self.us_styles.deinit(self.gpa);
         if (self.us_style_arena) |*a| a.deinit();
+        filterSubAbandon(self);
+        for (self.filter_sub_urls.items) |u| self.gpa.free(u);
+        self.filter_sub_urls.deinit(self.gpa);
+        self.filter_fetches.deinit(self.gpa);
         if (g_host == self) g_host = null;
     }
 
@@ -1826,6 +1846,8 @@ pub const Host = struct {
     /// `watchdog_ms`). Called once per poll iteration; a client pacing
     /// at anything above 4Hz never reaches the deadline.
     pub fn watchdog(self: *Host, now_ms: i64) void {
+        filterSubPump(self, now_ms);
+        filterSubTick(self, now_ms);
         // A scroll that STOPPED left its resting position behind the
         // throttle; this is where it gets out.
         self.flushScroll();
@@ -1889,7 +1911,7 @@ pub const Host = struct {
     /// Reload the filter set from the seed list, the config filters
     /// dir, and any extra paths named. No network fetching.
     pub fn interceptLists(self: *Host, req: proto.InterceptLists) void {
-        interceptReload(self.gpa, req.paths);
+        _ = interceptReload(self.gpa, req.paths);
     }
 
     /// The client's filter-list subscriptions (REPLACE-ALL).
@@ -1902,7 +1924,7 @@ pub const Host = struct {
     /// url, so the default remains "filtering never touches the
     /// network".
     pub fn interceptSubscribe(self: *Host, req: proto.InterceptSubscribe) void {
-        filterSubApply(self.gpa, req.update_hours, req.urls);
+        filterSubApply(self, req.update_hours, req.urls);
     }
 
     pub fn interceptStatus(self: *Host, req: proto.InterceptStatusReq) void {
@@ -5169,46 +5191,28 @@ fn sameSiteOf(v: cef.cef_cookie_same_site_t) u8 {
 // scraping a rendered document back out is neither exact nor bounded.
 //
 // The refcount rule is `CookieJob`'s and is not optional: CEF's CToCpp
-// wrappers TRANSFER the client reference and may drop it before the
-// create call even returns, so the fetch is born with TWO references
-// and gives one back straight after the call.
+// wrappers TRANSFER the request and client references and may drop the
+// client before the create call even returns. The fetch is born with a
+// CEF reference plus a Host reference that lasts through retirement.
 
 /// A subscription fetch in flight. One per url; there is no queue,
 /// because the set is small and CEF runs them concurrently anyway.
 const FilterFetch = struct {
     client: cef.cef_urlrequest_client_t,
-    refs: u32 = 1,
+    refs: std.atomic.Value(u32) = .init(1),
     gpa: std.mem.Allocator,
     body: std.ArrayList(u8) = .empty,
-    /// Final destination, and the `.part` staged alongside it.
+    request: ?*cef.cef_urlrequest_t = null,
     dest: []u8,
     url: []u8,
+    serial: u32,
+    status_ok: bool = false,
+    response_ok: bool = false,
+    completed: bool = false,
     /// Set when an append failed: a truncated list must never be
     /// written, because half a filter list is a working filter list
     /// that silently stops blocking half of what it used to.
     lost: bool = false,
-
-    fn finish(self: *FilterFetch) void {
-        defer self.destroyOwned();
-        if (self.lost) {
-            warnSub("dropped (out of memory mid-download)", self.url);
-            return;
-        }
-        if (!filtersub.looksLikeFilterList(self.body.items)) {
-            // A captive portal and an HTML error page both arrive as a
-            // perfectly successful fetch. Keeping the old file is the
-            // safe failure: stale rules still block.
-            warnSub("does not look like a filter list; keeping the previous copy", self.url);
-            return;
-        }
-        writeAtomic(self.dest, self.body.items) catch {
-            warnSub("could not be written", self.url);
-            return;
-        };
-        // Cheap enough to rebuild once per landed list, and it is what
-        // makes an update take effect without a restart.
-        interceptReload(self.gpa, &.{});
-    }
 
     fn destroyOwned(self: *FilterFetch) void {
         self.body.deinit(self.gpa);
@@ -5229,11 +5233,12 @@ fn writeAtomic(dest: []const u8, bytes: []const u8) !void {
     const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.part", .{dest}) catch return error.NameTooLong;
     var dst_buf: [4608]u8 = undefined;
     const dst = std.fmt.bufPrintZ(&dst_buf, "{s}", .{dest}) catch return error.NameTooLong;
-    const fd = c.open(tmp.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o644));
+    const fd = c.open(tmp.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC | c.O_NOFOLLOW, @as(c_uint, 0o600));
     if (fd < 0) return error.OpenFailed;
     var off: usize = 0;
     while (off < bytes.len) {
         const n = c.write(fd, bytes.ptr + off, bytes.len - off);
+        if (n < 0 and std.c._errno().* == c.EINTR) continue;
         if (n <= 0) {
             _ = c.close(fd);
             _ = c.unlink(tmp.ptr);
@@ -5241,7 +5246,12 @@ fn writeAtomic(dest: []const u8, bytes: []const u8) !void {
         }
         off += @intCast(n);
     }
-    _ = c.close(fd);
+    const sync_ok = c.fsync(fd) == 0;
+    const close_ok = c.close(fd) == 0;
+    if (!sync_ok or !close_ok) {
+        _ = c.unlink(tmp.ptr);
+        return error.WriteFailed;
+    }
     if (c.rename(tmp.ptr, dst.ptr) != 0) {
         _ = c.unlink(tmp.ptr);
         return error.RenameFailed;
@@ -5254,28 +5264,28 @@ fn subOf(base: [*c]cef.cef_base_ref_counted_t) *FilterFetch {
 }
 
 fn subAddRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) void {
-    subOf(base).refs += 1;
+    _ = subOf(base).refs.fetchAdd(1, .monotonic);
 }
 
 fn subRelease(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
     const f = subOf(base);
-    f.refs -= 1;
-    if (f.refs > 0) return 0;
-    f.finish();
+    const before = f.refs.fetchSub(1, .acq_rel);
+    if (before > 1) return 0;
+    f.destroyOwned();
     return 1;
 }
 
 fn subHasOneRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    return if (subOf(base).refs == 1) 1 else 0;
+    return if (subOf(base).refs.load(.acquire) == 1) 1 else 0;
 }
 
 fn subHasAtLeastOneRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    return if (subOf(base).refs >= 1) 1 else 0;
+    return if (subOf(base).refs.load(.acquire) >= 1) 1 else 0;
 }
 
 fn subOnDownloadData(
     self_: [*c]cef.cef_urlrequest_client_t,
-    _: [*c]cef.cef_urlrequest_t,
+    request: [*c]cef.cef_urlrequest_t,
     data: ?*const anyopaque,
     len: usize,
 ) callconv(.c) void {
@@ -5283,8 +5293,11 @@ fn subOnDownloadData(
     if (f.lost or len == 0) return;
     // A list that grows past this is not a list we want to load either;
     // `interceptReload` reads at most 16MB back off disk.
-    if (f.body.items.len + len > 16 * 1024 * 1024) {
+    if (len > filter_list_max or f.body.items.len > filter_list_max - len) {
         f.lost = true;
+        if (request) |r| {
+            if (r.*.cancel) |cancel| cancel(r);
+        }
         return;
     }
     const bytes: [*]const u8 = @ptrCast(data orelse return);
@@ -5298,25 +5311,38 @@ fn subOnComplete(
     request: [*c]cef.cef_urlrequest_t,
 ) callconv(.c) void {
     const f: *FilterFetch = subOf(@ptrCast(self_));
+    f.status_ok = false;
+    f.response_ok = false;
     if (request) |r| {
         const st = if (r.*.get_request_status) |g| g(r) else @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_FAILED));
-        if (st != @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_SUCCESS))) f.lost = true;
+        f.status_ok = st == @as(cef.cef_urlrequest_status_t, @intCast(cef.UR_SUCCESS));
         if (r.*.get_response) |gr| {
             if (gr(r)) |resp| {
                 defer release(&resp.*.base);
                 const code = if (resp.*.get_status) |gs| gs(resp) else 0;
-                // A 404 body is a page, not a list; refuse it here as
-                // well as in `looksLikeFilterList` so the reason is the
-                // accurate one.
-                if (code != 0 and (code < 200 or code >= 300)) f.lost = true;
+                f.response_ok = code >= 200 and code < 300;
             }
         }
     }
-    // The engine is done with us; the LAST release runs `finish`.
+    // Host.filterSubPump retires this after the callback returns. The
+    // Host reference keeps it alive if CEF releases immediately.
+    f.completed = true;
 }
 
 fn subOnUploadProgress(_: [*c]cef.cef_urlrequest_client_t, _: [*c]cef.cef_urlrequest_t, _: i64, _: i64) callconv(.c) void {}
-fn subOnDownloadProgress(_: [*c]cef.cef_urlrequest_client_t, _: [*c]cef.cef_urlrequest_t, _: i64, _: i64) callconv(.c) void {}
+fn subOnDownloadProgress(
+    self_: [*c]cef.cef_urlrequest_client_t,
+    request: [*c]cef.cef_urlrequest_t,
+    _: i64,
+    total: i64,
+) callconv(.c) void {
+    if (total <= filter_list_max) return;
+    const f: *FilterFetch = subOf(@ptrCast(self_));
+    f.lost = true;
+    if (request) |r| {
+        if (r.*.cancel) |cancel| cancel(r);
+    }
+}
 fn subGetAuthCredentials(
     _: [*c]cef.cef_urlrequest_client_t,
     _: c_int,
@@ -5332,11 +5358,12 @@ fn subGetAuthCredentials(
 }
 
 /// Start one fetch. Returns false when nothing was started.
-fn filterSubFetch(gpa: std.mem.Allocator, url: []const u8, dest: []const u8) bool {
+fn filterSubFetch(host: *Host, url: []const u8, dest: []const u8, serial: u32) bool {
     // `cef_request_create` is a plain extern fn here, not an optional
     // function pointer like the struct members are.
     const req = cef.cef_request_create() orelse return false;
-    defer release(&req.*.base);
+    var request_transferred = false;
+    defer if (!request_transferred) release(&req.*.base);
 
     var u = std.mem.zeroes(cef.cef_string_t);
     setStr(url, &u);
@@ -5346,15 +5373,17 @@ fn filterSubFetch(gpa: std.mem.Allocator, url: []const u8, dest: []const u8) boo
     setStr("GET", &method);
     defer cef.cef_string_utf16_clear(&method);
     if (req.*.set_method) |set| set(req, &method);
+    if (req.*.set_flags) |set| set(req, cef.UR_FLAG_DISABLE_CACHE | cef.UR_FLAG_NO_RETRY_ON_5XX);
 
-    const f = gpa.create(FilterFetch) catch return false;
-    const dest_owned = gpa.dupe(u8, dest) catch {
-        gpa.destroy(f);
+    host.filter_fetches.ensureUnusedCapacity(host.gpa, 1) catch return false;
+    const f = host.gpa.create(FilterFetch) catch return false;
+    const dest_owned = host.gpa.dupe(u8, dest) catch {
+        host.gpa.destroy(f);
         return false;
     };
-    const url_owned = gpa.dupe(u8, url) catch {
-        gpa.free(dest_owned);
-        gpa.destroy(f);
+    const url_owned = host.gpa.dupe(u8, url) catch {
+        host.gpa.free(dest_owned);
+        host.gpa.destroy(f);
         return false;
     };
     f.* = .{
@@ -5372,58 +5401,145 @@ fn filterSubFetch(gpa: std.mem.Allocator, url: []const u8, dest: []const u8) boo
             .on_download_data = subOnDownloadData,
             .get_auth_credentials = subGetAuthCredentials,
         },
-        .gpa = gpa,
+        .gpa = host.gpa,
         .dest = dest_owned,
         .url = url_owned,
+        .serial = serial,
     };
 
-    // TWO references across the call, exactly as `CookieJob` documents:
-    // the create CONSUMES one and may drop it before returning.
-    f.refs = 2;
+    // CEF consumes one reference and may release it before returning;
+    // the Host owns the other until the next-loop retirement. The
+    // request object is consumed by the same CToCpp wrapper too.
+    f.refs.store(2, .release);
+    request_transferred = true;
     const handle = cef.cef_urlrequest_create(req, &f.client, null);
-    if (handle) |h| release(&h.*.base);
+    if (handle) |h| {
+        f.request = h;
+        host.filter_fetches.appendAssumeCapacity(f);
+        return true;
+    }
     _ = subRelease(&f.client.base);
-    return handle != null;
+    return false;
 }
 
-/// Module state: the last subscription set the client published.
-var g_sub_hours: u32 = 0;
+const filter_list_max: usize = 16 * 1024 * 1024;
 
-/// Reconcile the cache directory against `urls` and fetch what is due.
-fn filterSubApply(gpa: std.mem.Allocator, hours: u32, urls: []const []const u8) void {
-    g_sub_hours = hours;
+fn subRules() u32 {
+    g_int.acquire();
+    defer g_int.release();
+    return g_int.rules;
+}
+
+fn subIntervalMs(hours: u32) i64 {
+    if (hours == 0) return std.math.maxInt(i64);
+    return @as(i64, hours) * 3_600_000;
+}
+
+fn ensureFiltersDir(dir: [:0]const u8) bool {
+    var buf: [4096]u8 = undefined;
+    if (dir.len + 1 > buf.len) return false;
+    @memcpy(buf[0..dir.len], dir);
+    buf[dir.len] = 0;
+    var i: usize = 1;
+    while (i <= dir.len) : (i += 1) {
+        if (i != dir.len and buf[i] != '/') continue;
+        const save = buf[i];
+        buf[i] = 0;
+        if (c.mkdir(@ptrCast(&buf), 0o700) != 0 and std.c._errno().* != c.EEXIST) return false;
+        buf[i] = save;
+    }
+    return true;
+}
+
+fn subUrlWanted(urls: []const []u8, name: []const u8) bool {
+    for (urls) |u| {
+        var nb: [filtersub.MAX_NAME]u8 = undefined;
+        const want = filtersub.cacheName(u, &nb) catch continue;
+        if (std.mem.eql(u8, want, name)) return true;
+    }
+    return false;
+}
+
+fn filterSubApply(self: *Host, hours: u32, urls: []const []const u8) void {
+    var next: std.ArrayList([]u8) = .empty;
+    var adopted = false;
+    defer if (!adopted) {
+        for (next.items) |u| self.gpa.free(u);
+        next.deinit(self.gpa);
+    };
+    var invalid: u16 = 0;
+    for (urls) |u| {
+        if (!filtersub.validUrl(u)) {
+            invalid +|= 1;
+            continue;
+        }
+        var duplicate = false;
+        for (next.items) |have| {
+            if (std.mem.eql(u8, have, u)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        const dup = self.gpa.dupe(u8, u) catch return;
+        next.append(self.gpa, dup) catch {
+            self.gpa.free(dup);
+            return;
+        };
+    }
+
+    filterSubCancel(self);
+    for (self.filter_sub_urls.items) |u| self.gpa.free(u);
+    self.filter_sub_urls.deinit(self.gpa);
+    self.filter_sub_urls = next;
+    adopted = true;
+    self.filter_sub_hours = hours;
+    self.filter_sub_serial +%= 1;
+    if (self.filter_sub_serial == 0) self.filter_sub_serial = 1;
+    self.filter_sub_active = @intCast(self.filter_sub_urls.items.len);
+    self.filter_sub_fetched = 0;
+    self.filter_sub_updated = 0;
+    self.filter_sub_failed = invalid;
+    self.filter_sub_pending = 0;
+    self.filter_sub_reload = false;
+    self.filter_sub_batch_open = true;
+    filterSubReconcile(self);
+}
+
+fn filterSubReconcile(self: *Host) void {
     var dir_buf: [4096]u8 = undefined;
-    const dir = filtersDir(&dir_buf) orelse return;
-    // Create it only when there is actually something to put there: a
-    // user with no subscriptions must not get a directory they never
-    // asked for. `opendir` on a missing dir just returns null below.
-    if (urls.len != 0) _ = c.mkdir(dir.ptr, 0o700);
+    const dir = filtersDir(&dir_buf) orelse {
+        self.filter_sub_failed +|= self.filter_sub_active;
+        filterSubFinish(self, nowMs());
+        return;
+    };
+    if (self.filter_sub_urls.items.len != 0 and !ensureFiltersDir(dir)) {
+        self.filter_sub_failed +|= self.filter_sub_active;
+        filterSubFinish(self, nowMs());
+        return;
+    }
 
     // Drop the caches of subscriptions that went away. Only ever OUR
-    // files (the `sub-` prefix), never a list dropped in by hand.
+    // exact cache/stage names, never a similarly-prefixed user file.
     if (c.opendir(dir.ptr)) |dp| {
         defer _ = c.closedir(dp);
         while (c.readdir(dp)) |entp| {
             const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entp.*.d_name)));
-            if (!filtersub.isCacheName(name)) continue;
-            var wanted = false;
-            for (urls) |u| {
-                var nb: [filtersub.MAX_NAME]u8 = undefined;
-                const want = filtersub.cacheName(u, &nb) catch continue;
-                if (std.mem.eql(u8, want, name)) {
-                    wanted = true;
-                    break;
-                }
-            }
-            if (wanted) continue;
+            const cache_name = if (filtersub.isCacheName(name))
+                name
+            else if (filtersub.isStageName(name))
+                name[0 .. name.len - ".part".len]
+            else
+                continue;
+            if (subUrlWanted(self.filter_sub_urls.items, cache_name) and !filtersub.isStageName(name)) continue;
             var p_buf: [4352:0]u8 = undefined;
             const p = std.fmt.bufPrintZ(&p_buf, "{s}/{s}", .{ dir, name }) catch continue;
-            _ = c.unlink(p.ptr);
+            if (c.unlink(p.ptr) == 0 and filtersub.isCacheName(name)) self.filter_sub_reload = true;
         }
     }
 
     const now: i64 = @intCast(c.time(null));
-    for (urls) |u| {
+    for (self.filter_sub_urls.items) |u| {
         var nb: [filtersub.MAX_NAME]u8 = undefined;
         const name = filtersub.cacheName(u, &nb) catch continue;
         var p_buf: [4352:0]u8 = undefined;
@@ -5433,8 +5549,112 @@ fn filterSubApply(gpa: std.mem.Allocator, hours: u32, urls: []const []const u8) 
         // A missing file is always due, whatever the interval says --
         // otherwise `filter_update_hours = 0` would mean "subscribe to
         // this and never actually get it".
-        if (mtime != 0 and !filtersub.isStale(now, mtime, hours)) continue;
-        _ = filterSubFetch(gpa, u, path);
+        if (mtime != 0 and !filtersub.isStale(now, mtime, self.filter_sub_hours)) continue;
+        self.filter_sub_fetched +|= 1;
+        if (filterSubFetch(self, u, path, self.filter_sub_serial)) {
+            self.filter_sub_pending +|= 1;
+        } else {
+            self.filter_sub_failed +|= 1;
+        }
+    }
+    if (self.filter_sub_pending == 0) filterSubFinish(self, nowMs());
+}
+
+fn filterSubFinish(self: *Host, now_ms: i64) void {
+    if (!self.filter_sub_batch_open) return;
+    if (self.filter_sub_reload and !interceptReload(self.gpa, &.{})) self.filter_sub_failed +|= 1;
+    self.filter_sub_batch_open = false;
+    self.filter_sub_next_ms = if (self.filter_sub_stopping)
+        std.math.maxInt(i64)
+    else
+        now_ms +| subIntervalMs(self.filter_sub_hours);
+    self.post(proto.EvInterceptSubscribeDone{
+        .serial = self.filter_sub_serial,
+        .active = self.filter_sub_active,
+        .fetched = self.filter_sub_fetched,
+        .updated = self.filter_sub_updated,
+        .failed = self.filter_sub_failed,
+        .rules = subRules(),
+    });
+}
+
+fn filterSubPump(self: *Host, now_ms: i64) void {
+    var i: usize = 0;
+    while (i < self.filter_fetches.items.len) {
+        const f = self.filter_fetches.items[i];
+        if (!f.completed) {
+            i += 1;
+            continue;
+        }
+        const current = self.filter_sub_batch_open and f.serial == self.filter_sub_serial;
+        if (current) {
+            if (self.filter_sub_pending > 0) self.filter_sub_pending -= 1;
+            if (!f.lost and f.status_ok and f.response_ok and filtersub.looksLikeFilterList(f.body.items)) {
+                writeAtomic(f.dest, f.body.items) catch {
+                    warnSub("could not be written; keeping the previous copy", f.url);
+                    self.filter_sub_failed +|= 1;
+                    retireFilterFetch(self, i);
+                    continue;
+                };
+                self.filter_sub_updated +|= 1;
+                self.filter_sub_reload = true;
+            } else {
+                warnSub("fetch failed or returned an invalid list; keeping the previous copy", f.url);
+                self.filter_sub_failed +|= 1;
+            }
+        }
+        retireFilterFetch(self, i);
+    }
+    if (self.filter_sub_batch_open and self.filter_sub_pending == 0) filterSubFinish(self, now_ms);
+}
+
+fn retireFilterFetch(self: *Host, i: usize) void {
+    const f = self.filter_fetches.swapRemove(i);
+    if (f.request) |r| release(&r.base);
+    f.request = null;
+    _ = subRelease(&f.client.base);
+}
+
+fn filterSubCancel(self: *Host) void {
+    for (self.filter_fetches.items) |f| {
+        if (f.request) |r| {
+            if (r.cancel) |cancel| cancel(r);
+        }
+    }
+    self.filter_sub_batch_open = false;
+    self.filter_sub_pending = 0;
+}
+
+fn filterSubTick(self: *Host, now_ms: i64) void {
+    if (self.filter_sub_stopping or self.filter_sub_batch_open or self.filter_sub_hours == 0 or now_ms < self.filter_sub_next_ms) return;
+    self.filter_sub_serial +%= 1;
+    if (self.filter_sub_serial == 0) self.filter_sub_serial = 1;
+    self.filter_sub_active = @intCast(self.filter_sub_urls.items.len);
+    self.filter_sub_fetched = 0;
+    self.filter_sub_updated = 0;
+    self.filter_sub_failed = 0;
+    self.filter_sub_pending = 0;
+    self.filter_sub_reload = false;
+    self.filter_sub_batch_open = true;
+    filterSubReconcile(self);
+}
+
+pub fn filterSubShutdown(self: *Host) void {
+    self.filter_sub_stopping = true;
+    filterSubCancel(self);
+}
+
+pub fn filterSubBusy(self: *const Host) bool {
+    return self.filter_fetches.items.len != 0;
+}
+
+fn filterSubAbandon(self: *Host) void {
+    filterSubShutdown(self);
+    while (self.filter_fetches.items.len != 0) {
+        const f = self.filter_fetches.pop().?;
+        if (f.request) |r| release(&r.base);
+        f.request = null;
+        _ = subRelease(&f.client.base);
     }
 }
 
@@ -5647,12 +5867,15 @@ fn readFileBounded(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ?[]u
     var buf: [64 * 1024]u8 = undefined;
     while (true) {
         const n = c.fread(&buf, 1, buf.len, f);
-        if (n == 0) break;
+        if (n == 0) {
+            if (c.ferror(f) != 0) return null;
+            break;
+        }
+        if (n > max -| list.items.len) return null;
         list.appendSlice(gpa, buf[0..n]) catch {
             list.deinit(gpa);
             return null;
         };
-        if (list.items.len > max) break;
     }
     return list.toOwnedSlice(gpa) catch {
         list.deinit(gpa);
@@ -5674,8 +5897,8 @@ fn filtersDir(buf: []u8) ?[:0]const u8 {
 
 /// Build a fresh engine from the seed list, every *.txt in the config
 /// filters dir, and `extra_paths`, then swap it in. Main thread only.
-fn interceptReload(gpa: std.mem.Allocator, extra_paths: []const []const u8) void {
-    const eng = gpa.create(filter.Engine) catch return;
+fn interceptReload(gpa: std.mem.Allocator, extra_paths: []const []const u8) bool {
+    const eng = gpa.create(filter.Engine) catch return false;
     eng.* = filter.Engine.init(gpa);
     var ok = true;
     eng.addList(seed_filter_list) catch {
@@ -5692,8 +5915,12 @@ fn interceptReload(gpa: std.mem.Allocator, extra_paths: []const []const u8) void
                 var path_buf: [4352:0]u8 = undefined;
                 const p = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ dir, name }) catch continue;
                 const text = readFileBounded(gpa, p.ptr, 16 * 1024 * 1024) orelse continue;
-                defer gpa.free(text);
-                eng.addList(text) catch {};
+                eng.addList(text) catch {
+                    gpa.free(text);
+                    ok = false;
+                    break;
+                };
+                gpa.free(text);
             }
         }
     }
@@ -5701,13 +5928,17 @@ fn interceptReload(gpa: std.mem.Allocator, extra_paths: []const []const u8) void
         var path_buf: [4352:0]u8 = undefined;
         const p = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch continue;
         const text = readFileBounded(gpa, p.ptr, 16 * 1024 * 1024) orelse continue;
-        defer gpa.free(text);
-        eng.addList(text) catch {};
+        eng.addList(text) catch {
+            gpa.free(text);
+            ok = false;
+            break;
+        };
+        gpa.free(text);
     }
     if (!ok) {
         eng.deinit();
         gpa.destroy(eng);
-        return;
+        return false;
     }
 
     var old: ?*filter.Engine = null;
@@ -5725,12 +5956,13 @@ fn interceptReload(gpa: std.mem.Allocator, extra_paths: []const []const u8) void
         o.deinit();
         gpa.destroy(o);
     }
+    return true;
 }
 
 /// Load the initial filter set (seed + config dir). Called once at
 /// helper startup, before any view exists.
 pub fn interceptInit(gpa: std.mem.Allocator) void {
-    interceptReload(gpa, &.{});
+    _ = interceptReload(gpa, &.{});
     wreqInitPipe();
     wreqReadTimeoutEnv();
 }

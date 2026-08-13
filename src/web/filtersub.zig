@@ -20,6 +20,18 @@ pub const MAX_NAME = 96;
 /// the user dropped into the directory by hand.
 pub const PREFIX = "sub-";
 
+/// Whether a subscription URL is representable on the wire and safe to
+/// hand to the helper's network stack.
+pub fn validUrl(url: []const u8) bool {
+    if (url.len == 0 or url.len > std.math.maxInt(u16)) return false;
+    for (url) |ch| {
+        if (std.ascii.isControl(ch) or std.ascii.isWhitespace(ch)) return false;
+    }
+    const parsed = std.Uri.parse(url) catch return false;
+    if (!(std.mem.eql(u8, parsed.scheme, "http") or std.mem.eql(u8, parsed.scheme, "https"))) return false;
+    return if (parsed.host) |host| !host.isEmpty() else false;
+}
+
 fn slugInto(url: []const u8, out: []u8) usize {
     // The last path segment, minus any query/fragment and extension.
     var s = url;
@@ -67,7 +79,31 @@ pub fn cacheName(url: []const u8, buf: []u8) error{NoSpace}![]const u8 {
 /// Whether `name` is one of ours (so a reconcile can delete the cache
 /// files of subscriptions the user removed, without touching theirs).
 pub fn isCacheName(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, PREFIX) and std.mem.endsWith(u8, name, ".txt");
+    if (!std.mem.startsWith(u8, name, PREFIX) or !std.mem.endsWith(u8, name, ".txt")) return false;
+    const stem = name[PREFIX.len .. name.len - ".txt".len];
+    const dash = std.mem.lastIndexOfScalar(u8, stem, '-') orelse return false;
+    if (dash == 0 or stem.len - dash - 1 != 16) return false;
+    const slug = stem[0..dash];
+    if (slug.len > 32 or slug[0] == '-' or slug[slug.len - 1] == '-') return false;
+    var prev_dash = false;
+    for (slug) |ch| {
+        if (ch == '-') {
+            if (prev_dash) return false;
+            prev_dash = true;
+        } else {
+            if (!((ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9'))) return false;
+            prev_dash = false;
+        }
+    }
+    for (stem[dash + 1 ..]) |ch| {
+        if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) return false;
+    }
+    return true;
+}
+
+/// Whether `name` is the staging sibling of one of our cache files.
+pub fn isStageName(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".part") and isCacheName(name[0 .. name.len - ".part".len]);
 }
 
 /// Is a cache file due for a refetch?
@@ -151,6 +187,30 @@ test "cacheName copes with a url that has no usable segment" {
     try t.expect(std.mem.startsWith(u8, q, "sub-l-"));
     try t.expect(isCacheName(q));
     try t.expect(!isCacheName("my-own-rules.txt"));
+    try t.expect(!isCacheName("sub-my-own-rules.txt"));
+    try t.expect(!isCacheName("sub--0000000000000000.txt"));
+    try t.expect(!isCacheName("sub-list--0000000000000000.txt"));
+    try t.expect(!isCacheName("sub-abcdefghijklmnopqrstuvwxyz1234567-0000000000000000.txt"));
+    try t.expect(!isCacheName("sub-list-000000000000000g.txt"));
+    try t.expect(!isCacheName("sub-list-000000000000000A.txt"));
+    var part_buf: [MAX_NAME + 5]u8 = undefined;
+    const part = try std.fmt.bufPrint(&part_buf, "{s}.part", .{q});
+    try t.expect(isStageName(part));
+    try t.expect(!isStageName("sub-my-own-rules.txt.part"));
+}
+
+test "validUrl accepts only bounded HTTP subscription URLs with a host" {
+    try t.expect(validUrl("https://easylist.to/easylist/easylist.txt"));
+    try t.expect(validUrl("http://127.0.0.1:8080/list.txt?revision=2"));
+    try t.expect(!validUrl("file:///tmp/list.txt"));
+    try t.expect(!validUrl("HTTPS://example.com/list.txt"));
+    try t.expect(!validUrl("https:///list.txt"));
+    try t.expect(!validUrl("https://example.com:bad/list.txt"));
+    try t.expect(!validUrl("https://example.com:99999/list.txt"));
+    try t.expect(!validUrl("https://[::1/list.txt"));
+    try t.expect(!validUrl("https://example.com/list\nnext"));
+    const oversized = [_]u8{'a'} ** (std.math.maxInt(u16) + 1);
+    try t.expect(!validUrl(&oversized));
 }
 
 test "isStale: disabled, missing, aged and a backwards clock" {

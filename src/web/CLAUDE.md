@@ -710,9 +710,10 @@ over, and both are measured, not assumed:
   cookies and spare DOMAIN cookies, so "clear this site's cookies"
   would silently leave the `.example.com` ones behind. Visiting with
   `deleteCookie = 1` deletes both and yields an exact removed count.
-- **`CookieJob` is the only REALLY refcounted client-side struct in
-  `cefhost.zig`** (everything else is a process-lifetime static with a
-  no-op refcount). `visit_url_cookies` TAKES ownership of the visitor
+- **`CookieJob` and subscription `FilterFetch` are the REALLY refcounted
+  client-side structs in `cefhost.zig`** (everything else is a
+  process-lifetime static with a no-op refcount). `visit_url_cookies`
+  TAKES ownership of the visitor
   reference — CEF's CToCpp wrappers transfer, they never add — and may
   drop it before the call even returns when the manager refuses. The
   job is therefore created with two references and one is released
@@ -834,13 +835,19 @@ H.264/AAC) while the distro build enables them.
   is PURE and unit-tested in both roots, because these are the choices
   that can overwrite a working file and they should be provable without
   a network. The `cef_urlrequest_client_t` follows `CookieJob`'s
-  two-reference rule exactly — CEF's CToCpp wrappers transfer a
-  reference rather than adding one.
-  **Not yet proven end to end**: there is no smoke stage that fetches a
-  list from the rig's loopback server and asserts a rule from it blocks.
+  two-reference rule exactly: CEF's CToCpp wrapper consumes BOTH the
+  `cef_request_t` and client references, while the Host owns the returned
+  URLRequest handle and the second client reference until a later-loop
+  retirement. Releasing the request after create is a double release.
+  `ev_intercept_subscribe_done` (0xC5) is the stateful boundary: it is
+  posted only after every fetch in the reconcile completed and accepted
+  files were reloaded. Empty replace-all therefore has a completion too.
+  smoke-web stage 39 proves loopback fetch/reload, duplicate
+  reconciliation, a zero-hit blocked resource alongside an arriving
+  control request, empty removal, failure-open preservation for HTTP,
+  HTML and oversize responses, and cancellation/drain during teardown.
   The feature is inert until `filter_list` is configured, so an
-  unconfigured user runs none of it, but do not cite it as working
-  until that stage exists.
+  unconfigured user runs none of it.
 - **User content (0xC0 block, capability "userscripts")** is REPLACE-ALL:
   `us_script_set` carries raw `==UserScript==` sources (the helper
   parses metadata via `userscript.zig`), `us_style_set` per-host CSS
