@@ -76,6 +76,9 @@ const Ctx = struct {
     symbol_group: ?*c.GtkWidget = null,
     behavior_page: ?*c.AdwPreferencesPage = null,
     hint_group: ?*c.GtkWidget = null,
+    tab_sidebar_switch: ?*c.GtkWidget = null,
+    tab_sidebar_switch_handler: c.gulong = 0,
+    live_next: ?*Ctx = null,
 
     fn ev(self: *Ctx) void {
         self.apply(self.win, &self.cfg);
@@ -148,7 +151,6 @@ fn openForProfile(
     // sheet: preferences should not pin themselves over (or inside)
     // the main window.
     const dialog = c.adw_preferences_window_new();
-    open_dialogs += 1;
     ctx.dialog = dialog;
     c.gtk_window_set_title(@ptrCast(dialog), "Preferences");
     if (ctx.edit_name.len > 0) {
@@ -166,6 +168,9 @@ fn openForProfile(
         null,
         c.G_CONNECT_DEFAULT,
     );
+    ctx.live_next = first_context;
+    first_context = ctx;
+    open_dialogs += 1;
 
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &profilesPage);
     appendPage(@ptrCast(@alignCast(dialog)), ctx, &appearancePage);
@@ -187,6 +192,14 @@ fn openForProfile(
 fn onClosed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
     if (open_dialogs > 0) open_dialogs -= 1;
+    var link = &first_context;
+    while (link.*) |live| {
+        if (live == ctx) {
+            link.* = live.live_next;
+            break;
+        }
+        link = &live.live_next;
+    }
     ctx.arena.deinit();
     ctx.allocator.destroy(ctx);
 }
@@ -196,9 +209,27 @@ fn onClosed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
 /// one would be undone by the dialog's next row change; the file
 /// watcher checks this and stands down instead.
 var open_dialogs: u32 = 0;
+var first_context: ?*Ctx = null;
 
 pub fn isOpen() bool {
     return open_dialogs > 0;
+}
+
+/// Synchronize runtime changes that originate outside Preferences so a
+/// later edit from an open dialog cannot restore a stale snapshot.
+pub fn noteTabSidebarVisibility(win: *WindowOpaque, show: bool) void {
+    var next = first_context;
+    while (next) |ctx| : (next = ctx.live_next) {
+        if (ctx.win != win) continue;
+        ctx.cfg.show_tab_sidebar = show;
+        if (ctx.tab_sidebar_switch) |row| {
+            if ((c.adw_switch_row_get_active(@ptrCast(@alignCast(row))) != 0) != show) {
+                c.g_signal_handler_block(row, ctx.tab_sidebar_switch_handler);
+                c.adw_switch_row_set_active(@ptrCast(@alignCast(row)), @intFromBool(show));
+                c.g_signal_handler_unblock(row, ctx.tab_sidebar_switch_handler);
+            }
+        }
+    }
 }
 
 const PageBuilder = *const fn (page: *c.AdwPreferencesPage, ctx: *Ctx) void;
@@ -686,7 +717,11 @@ fn addSwitchRow(
     c.adw_switch_row_set_active(@ptrCast(@alignCast(row)), if (field.*) 1 else 0);
     const sctx = ctx.allocator.create(SwitchCtx) catch return;
     sctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .field = field, .on_change = on_change };
-    _ = c.g_signal_connect_data(row, "notify::active", @ptrCast(&switchChanged), @ptrCast(sctx), @ptrCast(cast.destroyCtx(SwitchCtx)), c.G_CONNECT_DEFAULT);
+    const handler = c.g_signal_connect_data(row, "notify::active", @ptrCast(&switchChanged), @ptrCast(sctx), @ptrCast(cast.destroyCtx(SwitchCtx)), c.G_CONNECT_DEFAULT);
+    if (field == &ctx.cfg.show_tab_sidebar) {
+        ctx.tab_sidebar_switch = row;
+        ctx.tab_sidebar_switch_handler = handler;
+    }
     c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
 }
 
@@ -1884,15 +1919,14 @@ fn windowPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(tabs_group)));
 
     // Tree-style tabs. Config-file-only until now, which made the
-    // sidebar undiscoverable: it is off by default and its five actions
-    // ship unbound, so nothing in the UI led to it.
+    // sidebar undiscoverable while it is off by default.
     const tree_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(tree_group)), "Tree-style tabs");
     c.adw_preferences_group_set_description(
         @ptrCast(@alignCast(tree_group)),
         "A vertical sidebar showing tabs as a tree. While it is open it is also the tab surface for BROWSERS: it lists the pages open inside the focused browser, and a new tab opens a page there.",
     );
-    addSwitchRow(@ptrCast(@alignCast(tree_group)), ctx, "Show the sidebar", "Also toggled at runtime by the Tab menu, the window menu and the command palette.", &ctx.cfg.show_tab_sidebar, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(tree_group)), ctx, "Show the sidebar", "Also toggled and persisted by its shortcut, the Tab menu, the window menu and the command palette.", &ctx.cfg.show_tab_sidebar, applyOnly);
     addSpinRowU16(@ptrCast(@alignCast(tree_group)), ctx, "Sidebar width", "Logical pixels. Dragging the divider writes this back.", 120, 800, &ctx.cfg.tab_sidebar_width, applyOnly);
     addTabCloseParentRow(@ptrCast(@alignCast(tree_group)), ctx);
     addTabChildInsertRow(@ptrCast(@alignCast(tree_group)), ctx);

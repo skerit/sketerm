@@ -731,6 +731,23 @@ pub const browser_chords = [_]Chord{
     .{ .keyval = c.GDK_KEY_KP_Enter, .mods = 0, .what = "visual mode: commit" },
 };
 
+/// Return whether the browser's bubble handler must see this chord before global bindings.
+pub fn hasBubbleChord(keyval: c_uint, state: c.GdkModifierType) bool {
+    const lower = c.gdk_keyval_to_lower(keyval);
+    const mods = state & input.SIGNIFICANT_MODS;
+    for (browser_chords) |chord| {
+        if (chord.run != null and chord.keyval == lower and chord.mods == mods) return true;
+    }
+    return false;
+}
+
+/// Return whether this key must reach browser type-ahead before global bindings.
+pub fn isTypeaheadKey(keyval: c_uint, state: c.GdkModifierType) bool {
+    const mods = state & input.SIGNIFICANT_MODS;
+    const uni = c.gdk_keyval_to_unicode(keyval);
+    return (mods == 0 or mods == c.GDK_SHIFT_MASK) and uni >= 0x21 and uni <= 0x7e;
+}
+
 fn chordUndo(self: *BrowserView) bool {
     self.performUndo();
     return true;
@@ -944,7 +961,7 @@ pub fn onBrowserKey(
     // name. Runs BEFORE the binding table only for keys no binding
     // claims, since this handler is bubble-phase and a focused
     // entry has already consumed its own input.
-    if ((mods == 0 or mods == c.GDK_SHIFT_MASK) and self.typeahead(keyval)) return 1;
+    if (isTypeaheadKey(keyval, state) and self.typeahead(keyval)) return 1;
     const pane = self.pane orelse return 0;
     const ictx = pane.input_ctx orelse return 0;
     if (input.fallbackToPaneBindings(ictx, keyval, state)) |handled| return handled;
@@ -1551,13 +1568,13 @@ test "navigation preserves a live statfs request for one late refresh" {
     try t.expectEqual(FreeNavigationState{ .req = 0, .dirty = false }, freeNavigationState(0, true));
 }
 
-test "no browser-face chord shadows a global binding undeclared" {
+fn expectBrowserChordShadowsDeclared(bindings: []const input.Binding) !void {
     // onBrowserKey runs in the bubble phase and returns 1 for every
     // chord it claims, so anything in `browser_chords` is INVISIBLE
     // to the global binding table while a browser face has focus.
     // A shadow is therefore only allowed when the entry declares it.
     for (browser_chords) |chord| {
-        const hit = input.matchBinding(&input.default_bindings, chord.keyval, chord.mods);
+        const hit = input.matchBinding(bindings, chord.keyval, chord.mods);
         if (hit) |action| {
             const declared = chord.shadows orelse {
                 std.debug.print("browser chord ({s}) silently shadows the global action {s}\n", .{
@@ -1582,10 +1599,15 @@ test "no browser-face chord shadows a global binding undeclared" {
     }
 }
 
-test "type-ahead cannot swallow an unmodified global binding" {
+test "no browser-face chord shadows a platform global binding undeclared" {
+    try expectBrowserChordShadowsDeclared(&input.linux_default_bindings);
+    try expectBrowserChordShadowsDeclared(&input.macos_default_bindings);
+}
+
+fn expectTypeaheadDoesNotShadow(bindings: []const input.Binding) !void {
     // Type-ahead claims every printable key with no modifier (or
     // Shift), which would shadow any global bound the same way.
-    for (input.default_bindings) |b| {
+    for (bindings) |b| {
         const mods = b.mods & input.SIGNIFICANT_MODS;
         if (mods != 0 and mods != c.GDK_SHIFT_MASK) continue;
         const uni = c.gdk_keyval_to_unicode(b.keyval);
@@ -1596,4 +1618,18 @@ test "type-ahead cannot swallow an unmodified global binding" {
             return error.TypeaheadShadowsGlobalBinding;
         }
     }
+}
+
+test "type-ahead cannot swallow an unmodified platform global binding" {
+    try expectTypeaheadDoesNotShadow(&input.linux_default_bindings);
+    try expectTypeaheadDoesNotShadow(&input.macos_default_bindings);
+}
+
+test "capture forwarding leaves bubble browser chords to the browser" {
+    try std.testing.expect(hasBubbleChord(c.GDK_KEY_l, c.GDK_CONTROL_MASK));
+    try std.testing.expect(!hasBubbleChord(c.GDK_KEY_Page_Up, c.GDK_CONTROL_MASK | c.GDK_ALT_MASK));
+    try std.testing.expect(!hasBubbleChord(c.GDK_KEY_Up, 0));
+    try std.testing.expect(isTypeaheadKey(c.GDK_KEY_a, 0));
+    try std.testing.expect(isTypeaheadKey(c.GDK_KEY_A, c.GDK_SHIFT_MASK));
+    try std.testing.expect(!isTypeaheadKey(c.GDK_KEY_a, c.GDK_CONTROL_MASK));
 }

@@ -245,9 +245,9 @@ pub const Window = struct {
     /// creation failed; visibility follows Config.show_tab_sidebar +
     /// the toggle_tab_sidebar action.
     tab_sidebar: ?*tabsidebar_mod.Sidebar = null,
-    /// Debounce for writing a dragged sidebar width back to the config
-    /// file: a drag emits notify::position per pixel.
-    sidebar_save_timer: c.guint = 0,
+    /// Debounce for writing sidebar visibility or a dragged width back
+    /// to config: a divider drag emits notify::position per pixel.
+    sidebar_config_save_timer: c.guint = 0,
     /// HBox holding [sidebar | toast_overlay] as the toolbar content.
     content_box: *c.GtkWidget,
     /// Opener page consumed by the NEXT page-attached, so a web popup /
@@ -1114,9 +1114,12 @@ pub const Window = struct {
         if (self.si_zsh_shim) |s| self.allocator.free(s);
         if (self.si_fish_shim) |s| self.allocator.free(s);
         if (self.si_bash_shim) |s| self.allocator.free(s);
-        if (self.sidebar_save_timer != 0) {
-            _ = c.g_source_remove(self.sidebar_save_timer);
-            self.sidebar_save_timer = 0;
+        if (self.sidebar_config_save_timer != 0) {
+            _ = c.g_source_remove(self.sidebar_config_save_timer);
+            self.sidebar_config_save_timer = 0;
+            // Do not lose the final toggle/drag when the window closes
+            // inside the debounce interval.
+            winconfig_mod.persistConfig(self);
         }
         if (self.tab_sidebar) |sb| sb.deinit();
         self.tab_sidebar = null;
@@ -3802,6 +3805,10 @@ pub const Window = struct {
     /// re-ask each browser to redraw its chrome.
     pub fn setTabSidebarVisible(self: *Window, show: bool) void {
         const sb = self.tab_sidebar orelse return;
+        const preference_changed = self.config.show_tab_sidebar != show;
+        self.config.show_tab_sidebar = show;
+        if (preference_changed)
+            @import("prefs.zig").noteTabSidebarVisibility(@ptrCast(self), show);
         c.gtk_widget_set_visible(sb.root, @intFromBool(show));
         if (show) {
             // A GtkPaned forgets a position set while its start child
@@ -3812,6 +3819,16 @@ pub const Window = struct {
             sb.rebuild();
         }
         self.refreshWebGroupChrome();
+        // applyConfigChange has already copied this value into config,
+        // so only a runtime toggle reaches the writer. This keeps reloads
+        // read-only while making menu/palette/key toggles persistent.
+        if (preference_changed) self.scheduleSidebarConfigSave();
+    }
+
+    fn scheduleSidebarConfigSave(self: *Window) void {
+        if (self.sidebar_config_save_timer != 0)
+            _ = c.g_source_remove(self.sidebar_config_save_timer);
+        self.sidebar_config_save_timer = c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self));
     }
 
     /// True while the tree sidebar is the tab surface for browsers:
@@ -5045,13 +5062,12 @@ fn onSidebarPosition(_: *c.GObject, _: ?*anyopaque, user: ?*anyopaque) callconv(
     const w: u16 = @intCast(pos);
     if (w == self.config.tab_sidebar_width) return;
     self.config.tab_sidebar_width = w;
-    if (self.sidebar_save_timer != 0) _ = c.g_source_remove(self.sidebar_save_timer);
-    self.sidebar_save_timer = c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self));
+    self.scheduleSidebarConfigSave();
 }
 
 fn onSidebarSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Window, user);
-    self.sidebar_save_timer = 0;
+    self.sidebar_config_save_timer = 0;
     if (self.destroying) return 0; // G_SOURCE_REMOVE
     @import("winconfig.zig").persistConfig(self);
     return 0; // G_SOURCE_REMOVE

@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const input = @import("../input.zig");
 const places_mod = @import("../../filebrowser/places.zig");
 const registers = @import("../../filebrowser/registers.zig");
 const toolbtn = @import("../toolbtn.zig");
@@ -404,30 +405,54 @@ pub fn onSelectionKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, st
         if (mods == 0 and (keyval == c.GDK_KEY_Right or keyval == c.GDK_KEY_Left))
             return @intFromBool(treeArrowKey(tab, keyval == c.GDK_KEY_Right));
     }
-    const anchor = tab.sel.anchor orelse return 0;
-    if (mods != 0) return 0;
-    const self = tab.view;
-    const count = colview.itemCount(tab);
-    if (count == 0) return 0;
-    const last: c_int = @intCast(count - 1);
-    const cur: c_int = if (colview.focusedItem(tab)) |p| @intCast(p.pos) else anchor;
-    const next: c_int = switch (keyval) {
-        c.GDK_KEY_Up => cur - 1,
-        c.GDK_KEY_Down => cur + 1,
-        c.GDK_KEY_Home => 0,
-        c.GDK_KEY_End => last,
-        c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => {
-            commitVisual(self, tab);
-            return 1;
-        },
-        c.GDK_KEY_Escape => {
-            cancelVisual(self, tab);
-            return 1;
-        },
-        else => return 0,
-    };
-    applyVisualRange(self, tab, @intCast(std.math.clamp(next, 0, last)));
-    return 1;
+    if (tab.sel.anchor) |anchor| {
+        if (mods == 0) {
+            const self = tab.view;
+            const count = colview.itemCount(tab);
+            if (count != 0) {
+                const last: c_int = @intCast(count - 1);
+                const cur: c_int = if (colview.focusedItem(tab)) |p| @intCast(p.pos) else anchor;
+                const next: ?c_int = switch (keyval) {
+                    c.GDK_KEY_Up => cur - 1,
+                    c.GDK_KEY_Down => cur + 1,
+                    c.GDK_KEY_Home => 0,
+                    c.GDK_KEY_End => last,
+                    c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => {
+                        commitVisual(self, tab);
+                        return 1;
+                    },
+                    c.GDK_KEY_Escape => {
+                        cancelVisual(self, tab);
+                        return 1;
+                    },
+                    else => null,
+                };
+                if (next) |pos| {
+                    applyVisualRange(self, tab, @intCast(std.math.clamp(pos, 0, last)));
+                    return 1;
+                }
+            }
+        }
+    }
+    const nav = @import("nav.zig");
+    if (tab.view.currentTab() != tab or nav.hasBubbleChord(keyval, state) or nav.isTypeaheadKey(keyval, state)) return 0;
+    // GtkColumnView consumes PageUp/PageDown before the browser root's
+    // global fallback. Forward only tree actions after every local
+    // capture chord declined; returning true prevents double dispatch.
+    const pane = tab.view.pane;
+    const ictx = if (pane) |p| p.input_ctx else null;
+    if (ictx) |ctx| {
+        const bindings: []const input.Binding = if (ctx.bindings.len > 0) ctx.bindings else &input.default_bindings;
+        const lower = c.gdk_keyval_to_lower(keyval);
+        const action = input.matchBinding(bindings, lower, state) orelse
+            input.matchBinding(bindings, keyval, state);
+        if (action) |a| switch (a) {
+            .toggle_tab_sidebar, .tab_collapse, .tab_expand, .tab_tree_next, .tab_tree_prev =>
+                return input.runAction(ctx, a),
+            else => {},
+        };
+    }
+    return 0;
 }
 
 /// Right/Left tree navigation on the focused row (details view,

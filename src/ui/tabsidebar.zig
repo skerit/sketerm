@@ -28,6 +28,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const cssutil = @import("cssutil.zig");
+const input = @import("input.zig");
 const winmod = @import("window.zig");
 const Window = winmod.Window;
 const webgroup = @import("webgroup.zig");
@@ -146,6 +147,14 @@ pub const Sidebar = struct {
         };
 
         _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onRowActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+
+        // The pane faces normally forward global bindings after their
+        // own key handling. Focused sidebar rows are outside every pane,
+        // so a bubble-phase controller provides the same final fallback
+        // without pre-empting GtkListBox navigation or row activation.
+        const keys = c.gtk_event_controller_key_new();
+        _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onKeyPressed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(list, @ptrCast(keys));
 
         // Selection tracking (highlight follows the tab view; selecting
         // a hidden page auto-expands its collapsed ancestors).
@@ -395,6 +404,25 @@ pub const Sidebar = struct {
                 return;
             }
         }
+    }
+
+    fn onKeyPressed(
+        _: *c.GtkEventControllerKey,
+        keyval: c_uint,
+        _: c_uint,
+        state: c.GdkModifierType,
+        user: ?*anyopaque,
+    ) callconv(.c) c.gboolean {
+        const self = cast.userData(Sidebar, user);
+        const lower = c.gdk_keyval_to_lower(keyval);
+        const bindings: []const input.Binding = if (self.win.bindings.items.len > 0)
+            self.win.bindings.items
+        else
+            &input.default_bindings;
+        const action = input.matchBinding(bindings, lower, state) orelse
+            input.matchBinding(bindings, keyval, state) orelse return 0;
+        winmod.dispatchAction(self.win, action);
+        return 1;
     }
 
     fn onSelectedPage(_: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {

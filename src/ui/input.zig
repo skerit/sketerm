@@ -97,7 +97,9 @@ pub const Binding = struct {
 /// Default bindings table. Mirrors the prior hardcoded
 /// `dispatchShortcut` switch. Config can override / add to these via
 /// `keybind.<action>` entries; missing entries fall through here.
-pub const default_bindings = [_]Binding{
+/// Split around the platform-specific tree chords so the complete
+/// platform tables remain compile-time arrays.
+const bindings_before_tree = [_]Binding{
     // Ctrl+Shift+...
     .{ .keyval = c.GDK_KEY_t, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .new_tab },
     .{ .keyval = c.GDK_KEY_w, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .close_tab },
@@ -137,15 +139,30 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_x, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_mode },
     // Ctrl+Shift+M → zoom ("maximize") the focused pane.
     .{ .keyval = c.GDK_KEY_m, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .zoom_pane },
-    // Tree tabs use punctuation-free mnemonics behind an extra Alt: B
-    // toggles the bar, H hides children, and E expands. Ctrl+Alt plus
-    // PageDown/PageUp extends the conventional tab-navigation pair to
-    // visible tree order without taking an editor's column-selection keys.
+};
+
+/// Linux tree-tab defaults. The extra Alt keeps the letter mnemonics
+/// out of terminal/editor namespaces; PageUp/PageDown do not overlap
+/// the desktop's Ctrl+Alt workspace arrows.
+pub const linux_tree_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .toggle_tab_sidebar },
     .{ .keyval = c.GDK_KEY_h, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_collapse },
     .{ .keyval = c.GDK_KEY_e, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_expand },
     .{ .keyval = c.GDK_KEY_Page_Down, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .action = .tab_tree_next },
     .{ .keyval = c.GDK_KEY_Page_Up, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .action = .tab_tree_prev },
+};
+
+/// macOS uses Command (GDK Meta) instead of Control so none of these
+/// chords enter VoiceOver's reserved Control+Option namespace.
+pub const macos_tree_bindings = [_]Binding{
+    .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .toggle_tab_sidebar },
+    .{ .keyval = c.GDK_KEY_h, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_collapse },
+    .{ .keyval = c.GDK_KEY_e, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_expand },
+    .{ .keyval = c.GDK_KEY_Page_Down, .mods = c.GDK_META_MASK | c.GDK_ALT_MASK, .action = .tab_tree_next },
+    .{ .keyval = c.GDK_KEY_Page_Up, .mods = c.GDK_META_MASK | c.GDK_ALT_MASK, .action = .tab_tree_prev },
+};
+
+const bindings_after_tree = [_]Binding{
     // Alt+1..9 → jump to specific tab. Standard across browsers,
     // gnome-terminal, kitty, etc. Doesn't collide with shell C-x
     // chords or Ctrl+Shift+digit (which terminator uses for splits).
@@ -182,16 +199,30 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_F10, .mods = c.GDK_SHIFT_MASK, .action = .context_menu },
 };
 
+pub const linux_default_bindings = bindings_before_tree ++ linux_tree_bindings ++ bindings_after_tree;
+pub const macos_default_bindings = bindings_before_tree ++ macos_tree_bindings ++ bindings_after_tree;
+
+/// Defaults selected for the build target. Both platform tables remain
+/// public so collision tests can audit them on either host.
+pub const default_bindings = if (builtin.os.tag == .macos)
+    macos_default_bindings
+else
+    linux_default_bindings;
+
+/// Modifier mask the binding matcher cares about. Lock and group bits
+/// are filtered before comparison. Meta is Command on macOS.
+pub const SIGNIFICANT_MODS: c_uint =
+    c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK |
+    c.GDK_SUPER_MASK | c.GDK_META_MASK;
+
 /// Match a (keyval, modifier_state) against the binding table. Returns
 /// the first match, or null. The caller pre-masks `state` to only the
-/// modifier bits we care about (Ctrl/Shift/Alt/Super) — Lock + group
+/// modifier bits we care about (Ctrl/Shift/Alt/Super/Meta) — Lock + group
 /// bits are noise and must be filtered.
 pub fn matchBinding(bindings: []const Binding, keyval: c_uint, mods: c_uint) ?Action {
-    const significant: c_uint =
-        c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK | c.GDK_SUPER_MASK;
-    const m = mods & significant;
+    const m = mods & SIGNIFICANT_MODS;
     for (bindings) |b| {
-        if (b.keyval == keyval and (b.mods & significant) == m) return b.action;
+        if (b.keyval == keyval and (b.mods & SIGNIFICANT_MODS) == m) return b.action;
     }
     return null;
 }
@@ -212,11 +243,6 @@ pub fn fallbackToPaneBindings(ictx: *Ctx, keyval: c_uint, state: c.GdkModifierTy
         matchBinding(bindings, keyval, state) orelse return null;
     return runAction(ictx, action);
 }
-
-/// Modifier mask the binding matcher cares about. Lock and group
-/// bits are filtered before comparison.
-pub const SIGNIFICANT_MODS: c_uint =
-    c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK | c.GDK_SUPER_MASK;
 
 /// Rebuild `list` as `default_bindings` overlaid with config
 /// (action-name, accel) overrides. An override replaces EVERY default

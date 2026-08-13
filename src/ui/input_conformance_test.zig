@@ -15,6 +15,7 @@ const std = @import("std");
 // importing input.zig — these tests then live in the same module
 // and can call the private functions directly.
 const input = @import("input.zig");
+const ecmd = @import("../editor/commands.zig");
 
 // Sanity: modCode covers all 8 modifier combos with the xterm
 // 1+shift+alt*2+ctrl*4 formula.
@@ -410,7 +411,7 @@ test "matchBinding: Ctrl+Tab → next_tab (lone Ctrl, not Ctrl+Shift)" {
     try std.testing.expectEqual(@as(?input.Action, .next_tab), got);
 }
 
-test "matchBinding: tree-tab defaults match their documented chords" {
+test "matchBinding: Linux tree-tab defaults match their documented chords" {
     const cases = [_]struct { keyval: c_uint, mods: c_uint, action: input.Action }{
         .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .toggle_tab_sidebar },
         .{ .keyval = c.GDK_KEY_h, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_collapse },
@@ -421,14 +422,31 @@ test "matchBinding: tree-tab defaults match their documented chords" {
     for (cases) |case| {
         try std.testing.expectEqual(
             @as(?input.Action, case.action),
-            input.matchBinding(&input.default_bindings, case.keyval, case.mods),
+            input.matchBinding(&input.linux_default_bindings, case.keyval, case.mods),
         );
     }
 }
 
-test "default bindings contain no accelerator collisions" {
-    for (input.default_bindings, 0..) |binding, i| {
-        for (input.default_bindings[i + 1 ..]) |other| {
+test "matchBinding: macOS tree-tab defaults stay outside VoiceOver chords" {
+    const cases = [_]struct { keyval: c_uint, mods: c_uint, action: input.Action }{
+        .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .toggle_tab_sidebar },
+        .{ .keyval = c.GDK_KEY_h, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_collapse },
+        .{ .keyval = c.GDK_KEY_e, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_expand },
+        .{ .keyval = c.GDK_KEY_Page_Down, .mods = c.GDK_META_MASK | c.GDK_ALT_MASK, .action = .tab_tree_next },
+        .{ .keyval = c.GDK_KEY_Page_Up, .mods = c.GDK_META_MASK | c.GDK_ALT_MASK, .action = .tab_tree_prev },
+    };
+    for (cases) |case| {
+        try std.testing.expect(case.mods & c.GDK_CONTROL_MASK == 0);
+        try std.testing.expectEqual(
+            @as(?input.Action, case.action),
+            input.matchBinding(&input.macos_default_bindings, case.keyval, case.mods),
+        );
+    }
+}
+
+fn expectNoBindingCollisions(bindings: []const input.Binding) !void {
+    for (bindings, 0..) |binding, i| {
+        for (bindings[i + 1 ..]) |other| {
             const same_key = binding.keyval == other.keyval;
             const same_mods = (binding.mods & input.SIGNIFICANT_MODS) ==
                 (other.mods & input.SIGNIFICANT_MODS);
@@ -438,6 +456,56 @@ test "default bindings contain no accelerator collisions" {
                     input.actionName(other.action),
                 });
                 return error.DefaultBindingCollision;
+            }
+        }
+    }
+}
+
+test "platform default bindings contain no accelerator collisions" {
+    try expectNoBindingCollisions(&input.linux_default_bindings);
+    try expectNoBindingCollisions(&input.macos_default_bindings);
+}
+
+test "tree-tab defaults do not shadow face-local command registries" {
+    for (input.linux_tree_bindings ++ input.macos_tree_bindings) |binding| {
+        for (0..ecmd.COMMAND_COUNT) |i| {
+            const cmd: ecmd.Command = @enumFromInt(i);
+            const parsed = input.parseAccel(ecmd.defaultAccel(cmd)) orelse continue;
+            if (binding.keyval == parsed.keyval and
+                (binding.mods & input.SIGNIFICANT_MODS) == (parsed.mods & input.SIGNIFICANT_MODS))
+            {
+                std.debug.print("tree action {s} shadows editor command {s}\n", .{
+                    input.actionName(binding.action),
+                    ecmd.name(cmd),
+                });
+                return error.TreeBindingShadowsEditorCommand;
+            }
+        }
+    }
+}
+
+test "Linux tree-tab defaults avoid common desktop reservations" {
+    const reserved = [_]struct { keyval: c_uint, mods: c_uint, what: []const u8 }{
+        .{ .keyval = c.GDK_KEY_Tab, .mods = c.GDK_ALT_MASK, .what = "switch applications" },
+        .{ .keyval = c.GDK_KEY_Tab, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .what = "switch panels" },
+        .{ .keyval = c.GDK_KEY_Escape, .mods = c.GDK_ALT_MASK, .what = "cycle windows" },
+        .{ .keyval = c.GDK_KEY_Escape, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .what = "cycle panels" },
+        .{ .keyval = c.GDK_KEY_Up, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .what = "workspace up" },
+        .{ .keyval = c.GDK_KEY_Down, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .what = "workspace down" },
+        .{ .keyval = c.GDK_KEY_Left, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .what = "workspace left" },
+        .{ .keyval = c.GDK_KEY_Right, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .what = "workspace right" },
+        .{ .keyval = c.GDK_KEY_r, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .what = "screen recording" },
+    };
+    for (input.linux_tree_bindings) |binding| {
+        for (reserved) |desktop| {
+            if (binding.keyval == desktop.keyval and
+                (binding.mods & input.SIGNIFICANT_MODS) == (desktop.mods & input.SIGNIFICANT_MODS))
+            {
+                std.debug.print("tree action {s} collides with desktop shortcut {s}\n", .{
+                    input.actionName(binding.action),
+                    desktop.what,
+                });
+                return error.TreeBindingDesktopCollision;
             }
         }
     }
