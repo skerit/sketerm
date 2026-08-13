@@ -17739,6 +17739,11 @@ stronger, so OCR is advisory there.
   green cross-compile is not a working macOS build, so it stays
   unproven rather than claimed.
 
+> **CORRECTED 2026-08-13.** Filter-list subscriptions are now fetched
+> and proven end to end. See "filter-list subscriptions: stateful and
+> failure-open" below; the earlier bullet remains as the record of the
+> previous gap.
+
 ## 2026-08-13: a full audit of the unpushed range — 28 defects, one critical
 
 A ten-dimension adversarial audit of the whole `origin/master..master` range
@@ -17849,3 +17854,52 @@ as `reply:null:hello`: i18n and storage working, only the reply missing. The
 fixture's content script now RETRIES its `sendMessage` until the background
 answers, so the assertion means "the message got through" rather than "it got
 through within a budget".
+
+## 2026-08-13: filter-list subscriptions: stateful and failure-open
+
+Configured `filter_list` URLs now reach the helper after capability
+negotiation, including an empty REPLACE-ALL when the final subscription is
+removed. The GUI owns transactional copies independent of each window's config
+arena; the helper owns the deduplicated subscription set, refresh schedule,
+cache reconciliation and live filter-engine reload. URLs must be bounded
+`http://` or `https://` values with a host before they enter config or the
+helper's network stack.
+
+The wire gained append-only completion event 0xC5. It reports the reconcile
+serial and active/fetched/updated/failed/rule counts only after every fetch has
+retired and accepted files have been reloaded. This replaces timing guesses in
+callers and in smoke-web. Removed subscriptions delete only exact generated
+cache and staging names, then reload immediately; similarly-prefixed user files
+remain untouched.
+
+Fetching is failure-open and bounded. Requests bypass the HTTP cache and do not
+retry 5xx responses; only successful 2xx responses below 16 MiB that look like
+filter syntax reach a sibling `.part` file. That file is opened with
+`O_NOFOLLOW|O_CLOEXEC`, written through EINTR, fsynced, closed and atomically
+renamed. HTTP errors, HTML/captive-portal bodies, oversize responses, allocation
+failures and write failures leave the previous working list in place.
+
+`FilterFetch` is Host-owned and genuinely refcounted. CEF's CToCpp
+`cef_urlrequest_create` wrapper consumes both the request and client references;
+the Host owns the returned URLRequest handle plus a second client reference
+until later-loop retirement. Releasing the request after create caused a CEF
+SIGTRAP on the first successful fetch and was caught by the new stage. A new
+subscription generation cancels older requests and ignores their stale
+completion; disconnect cancels all requests and pumps CEF until their callbacks
+drain, bounded by the existing helper shutdown deadline.
+
+Tests cover URL/cache-name/body/staleness decisions in both unit roots, config
+parse/serialize/clone and protocol round trips. smoke-web stage 39 uses a
+loopback list/resource server to prove one fetch for duplicate URLs, accepted
+bytes on disk, zero network hits for the blocked resource while a control
+request arrives, empty removal, preservation across HTTP 503, HTML and oversize
+replacements, and teardown while a request is still in flight.
+
+Verification: changed-file `zig ast-check`, direct `zig test` for
+`filtersub.zig` (5/5) and `protocol.zig` (32/32), `zig build web`,
+`zig build test-core --summary all` (2028 passed, 6 skipped), and
+`zig build test --summary all` (2448 passed, 5 skipped). smoke-web stage 39
+passes end to end. The latest full modified run continued through stage 37,
+then failed the independent stage 34a; an untouched `5b84a00` worktree likewise
+continued past its known request-context CEF shutdown SIGSEGV and failed stage
+34c. The full rig is therefore not claimed as a clean pass here.
