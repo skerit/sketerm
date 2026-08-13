@@ -793,6 +793,13 @@ pub fn main() u8 {
             say("SKIP browser-action GUI stage (sketerm-webengine is not built; run `zig build web` first)");
         }
 
+        // Run the secondary-window ownership fuse before the known
+        // mouse-reporting stage can abort the rest of the full rig.
+        if (!platform.is_macos) {
+            if (themeSingletonStage(allocator, drive, rt, &wl_z)) |why| return failMsg(why);
+            say("secondary window reused one Preferences child, flushed its pending sidebar toggle on close, and survived later global style flips");
+        }
+
         // The palette RANKS rather than filters. Also before copy mode,
         // for the same reason the sidebar stage is.
         if (commandPaletteStage(allocator, app, sock_path)) |why| return failMsg(why);
@@ -1089,14 +1096,7 @@ pub fn main() u8 {
         say("panel face on a pane: shown and closed three times, and the GUI outlived every deferred widget destroy");
     }
 
-    // 6c-8. The process-global signal targets: a secondary window
-    // freed while the AdwStyleManager singleton keeps emitting.
-    if (!platform.is_macos) {
-        if (themeSingletonStage(allocator, drive, rt, &wl_z)) |why| return failMsg(why);
-        say("secondary window detached and closed while the global style manager kept flipping light/dark");
-    }
-
-    // 6c-9. Cast playback: `sketerm play` end to end, with the
+    // 6c-8. Cast playback: `sketerm play` end to end, with the
     // fixed_grid render path and every transport control on a real
     // seat, cross-checked against the daemon's play_state stream.
     if (drive) |app| {
@@ -1104,12 +1104,12 @@ pub fn main() u8 {
             if (castPlaybackStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
             say("cast playback: rendered, paused, seeked to EOF, restarted and closed (session died with the window)");
 
-            // 6c-10. The same recording INSIDE the Sketerm Viewer, in
+            // 6c-9. The same recording INSIDE the Sketerm Viewer, in
             // a mixed image+cast batch, navigated both directions.
             if (viewerCastStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
             say("viewer cast: played in place, paused, batch navigation killed/rebuilt the ephemeral session without a leak, and the text/hex fallback rendered");
 
-            // 6c-11. Files' Quick Look, which now HOSTS the shared
+            // 6c-10. Files' Quick Look, which now HOSTS the shared
             // Viewer: Space in a real Files window opens a
             // ViewerWindow on the focused entry, arrows step the
             // listing batch, Space closes it again.
@@ -7028,13 +7028,10 @@ fn panePanelLifetimeStage(
 }
 
 /// A secondary window's `Window` struct is freed by
-/// `deferredWindowFree` while the process lives on, so anything still
-/// pointing at it from a PROCESS-GLOBAL object is a use-after-free
-/// waiting for the next emission. The one that bit was the
-/// `AdwStyleManager` singleton's `notify::dark`: connected per window
-/// in `Window.init`, never disconnected, and the singleton outlives
-/// every window. Detach a tab, close that window, then keep flipping
-/// light/dark and keep asking whether the GUI still answers.
+/// `deferredWindowFree` while GTK can still be finalizing its widgets.
+/// Exercise all three owners that have regressed here: one Preferences
+/// child per Window, sidebar callbacks retained by disposing widgets,
+/// and the process-global `AdwStyleManager` singleton.
 ///
 /// Its OWN GUI instance, for two reasons: the flip hook has to be set
 /// in the environment at exec time, and a colour scheme changing every
@@ -7048,6 +7045,22 @@ fn themeSingletonStage(
     wl: [*:0]const u8,
 ) ?[]const u8 {
     const app = maybe_app orelse return null;
+
+    var theme_cfg_buf: [512:0]u8 = undefined;
+    const theme_cfg = std.fmt.bufPrintZ(&theme_cfg_buf, "{s}/theme-config", .{rt}) catch
+        return "allocating the theme config directory failed";
+    if (c.mkdir(theme_cfg.ptr, 0o700) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST)
+        return "creating the theme config directory failed";
+    var theme_cfg_dir_buf: [512:0]u8 = undefined;
+    const theme_cfg_dir = std.fmt.bufPrintZ(&theme_cfg_dir_buf, "{s}/sketerm", .{theme_cfg}) catch
+        return "allocating the theme config parent failed";
+    if (c.mkdir(theme_cfg_dir.ptr, 0o700) != 0 and std.posix.errno(@as(c_int, -1)) != .EXIST)
+        return "creating the theme config parent failed";
+    var cfg_path_buf: [512:0]u8 = undefined;
+    const cfg_path = std.fmt.bufPrintZ(&cfg_path_buf, "{s}/config.conf", .{theme_cfg_dir}) catch
+        return "theme config path";
+    if (!writeFile(cfg_path, "# secondary-window lifetime smoke\nconfirm_close = never\n"))
+        return "writing the theme config failed";
 
     // This GUI's windows are found by app_id below, not by diffing a
     // snapshot: its control socket appears before its toplevel reaches
@@ -7065,6 +7078,7 @@ fn themeSingletonStage(
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
+        _ = c.setenv("XDG_CONFIG_HOME", theme_cfg.ptr, 1);
         // The hook this stage exists for: nothing outside the process
         // can emit notify::dark (libadwaita takes the system preference
         // from the desktop portal only).
@@ -7161,13 +7175,115 @@ fn themeSingletonStage(
     }
     if (secondary == 0) return "detach_tab produced no new window on the display session";
 
-    app.closeWindow(secondary) catch return "closing the detached window failed";
+    // A transferred pane's keyboard sink must target its NEW Window.
+    // This catches stale shortcut_ctx directly: the source primary's
+    // sidebar changing cannot produce a selected chip in `secondary`.
+    app.pressKey(secondary, tree_toggle_key) catch return "injecting the transferred-pane sidebar shortcut failed";
+    var shown_waited: u32 = 0;
+    while (shown_waited < 5_000 and sidebarChipRight(app, secondary) == 0) : (shown_waited += 100)
+        _ = app.pumpOnce(100);
+    if (sidebarChipRight(app, secondary) == 0) return "a transferred pane's shortcut still targeted its source Window";
+    var first_saved = false;
+    var save_waited: u32 = 0;
+    while (save_waited < 5_000) : (save_waited += 100) {
+        _ = app.pumpOnce(100);
+        if (readFileAlloc(allocator, cfg_path)) |body| {
+            defer allocator.free(body);
+            if (std.mem.indexOf(u8, body, "show_tab_sidebar = true") != null) {
+                first_saved = true;
+                break;
+            }
+        }
+    }
+    if (!first_saved) return "the transferred-pane sidebar shortcut was not persisted";
+    app.pressKey(secondary, tree_toggle_key) catch return "hiding the transferred-pane sidebar failed";
+    var hidden_saved = false;
+    var hide_waited: u32 = 0;
+    while (hide_waited < 5_000) : (hide_waited += 100) {
+        _ = app.pumpOnce(100);
+        if (readFileAlloc(allocator, cfg_path)) |body| {
+            defer allocator.free(body);
+            if (std.mem.indexOf(u8, body, "show_tab_sidebar") == null) {
+                hidden_saved = true;
+                break;
+            }
+        }
+    }
+    if (!hidden_saved) return "hiding the transferred-pane sidebar was not persisted";
+
+    // Target by pane so the second request still resolves to the same
+    // Window after its first Preferences child becomes GTK's active
+    // toplevel. Opening twice must present, not duplicate, that child.
+    var prefs_req_buf: [128]u8 = undefined;
+    const prefs_req = std.fmt.bufPrint(&prefs_req_buf, "{{\"cmd\":\"action\",\"pane\":{d},\"data\":\"prefs_open\"}}\n", .{pane}) catch
+        return "preferences request fmt";
+    const prefs_first = roundtrip(allocator, sock, prefs_req) orelse return "opening secondary Preferences failed";
+    defer allocator.free(prefs_first);
+    if (std.mem.indexOf(u8, prefs_first, "\"ok\":true") == null) return "opening secondary Preferences was not ok";
+
+    var prefs_id: u32 = 0;
+    var prefs_waited: u32 = 0;
+    while (prefs_waited < 15_000) : (prefs_waited += 100) {
+        _ = app.pumpOnce(100);
+        var count: u32 = 0;
+        for (app.windows.items) |w| {
+            if (w.popup) continue;
+            const id = w.app_id orelse continue;
+            const title = w.title orelse continue;
+            if (!std.mem.eql(u8, id, theme_app_id) or !std.mem.eql(u8, title, "Preferences")) continue;
+            count += 1;
+            prefs_id = w.id;
+        }
+        if (count == 1) break;
+        if (count > 1) return "opening Preferences once produced more than one window";
+    }
+    if (prefs_id == 0) return "the secondary Preferences window never reached the display session";
+
+    const prefs_second = roundtrip(allocator, sock, prefs_req) orelse return "reopening secondary Preferences failed";
+    defer allocator.free(prefs_second);
+    if (std.mem.indexOf(u8, prefs_second, "\"ok\":true") == null) return "reopening secondary Preferences was not ok";
+    var reuse_waited: u32 = 0;
+    while (reuse_waited < 2_000) : (reuse_waited += 100) {
+        _ = app.pumpOnce(100);
+        var count: u32 = 0;
+        for (app.windows.items) |w| {
+            if (w.popup) continue;
+            const id = w.app_id orelse continue;
+            const title = w.title orelse continue;
+            if (std.mem.eql(u8, id, theme_app_id) and std.mem.eql(u8, title, "Preferences")) count += 1;
+        }
+        if (count != 1) return "reopening Preferences did not reuse exactly one window";
+    }
+
+    // Sequential IPC requests are dispatched on the same GLib main
+    // loop, avoiding any cross-transport ordering ambiguity: the toggle
+    // is applied first and the detach follows immediately, before the
+    // 400 ms debounce can fire. Detaching the secondary's only tab
+    // destroys its now-empty source while Preferences is still open.
+    var toggle_buf: [128]u8 = undefined;
+    const toggle_req = std.fmt.bufPrint(&toggle_buf, "{{\"cmd\":\"action\",\"pane\":{d},\"data\":\"toggle_tab_sidebar\"}}\n", .{pane}) catch
+        return "sidebar toggle request fmt";
+    const toggled = roundtrip(allocator, sock, toggle_req) orelse
+        return "toggling the secondary sidebar over IPC failed";
+    defer allocator.free(toggled);
+    if (std.mem.indexOf(u8, toggled, "\"ok\":true") == null) return "toggling the secondary sidebar over IPC was not ok";
+    var detach_again_buf: [128]u8 = undefined;
+    const detach_again = std.fmt.bufPrint(&detach_again_buf, "{{\"cmd\":\"action\",\"pane\":{d},\"data\":\"detach_tab\"}}\n", .{pane}) catch
+        return "second detach request fmt";
+    const moved = roundtrip(allocator, sock, detach_again) orelse return "detaching from the secondary failed";
+    defer allocator.free(moved);
+    if (std.mem.indexOf(u8, moved, "\"ok\":true") == null) return "detaching from the secondary was not ok";
     var gone: u32 = 0;
     while (gone < 8_000) : (gone += 250) {
         _ = app.pumpOnce(250);
-        if (app.windowGone(secondary)) break;
+        if (app.windowGone(secondary) and app.windowGone(prefs_id)) break;
     }
     if (!app.windowGone(secondary)) return "the detached window never closed";
+    if (!app.windowGone(prefs_id)) return "Preferences outlived its destroyed secondary parent";
+    const saved = readFileAlloc(allocator, cfg_path) orelse return "closing the secondary lost its pending sidebar config write";
+    defer allocator.free(saved);
+    if (std.mem.indexOf(u8, saved, "show_tab_sidebar = true") == null)
+        return "the close-time sidebar config flush did not persist the toggle";
 
     // The fuse. `deferredWindowFree` runs on an idle after the destroy
     // chain unwinds, and the flip timer fires five times a second, so
@@ -7194,6 +7310,20 @@ fn themeSingletonStage(
         if (std.mem.indexOf(u8, alive, "\"ok\":true") == null)
             return "the GUI went unhealthy after a secondary window was closed under a theme flip";
     }
+
+    // This App viewer is shared with the main e2e GUI. Remove the
+    // isolated process's windows and put keyboard focus back before
+    // returning, or the next real-seat stage may target a stale id.
+    themeTeardown();
+    _ = app.drainLive(2_000);
+    for (app.windows.items) |w| {
+        if (w.popup) continue;
+        const id = w.app_id orelse continue;
+        if (!std.mem.eql(u8, id, "dev.sker.sketerm.e2e")) continue;
+        app.pressKey(w.id, "escape") catch return "restoring main GUI keyboard focus failed";
+        _ = app.waitIdle(200, 2_000);
+        break;
+    } else return "the main GUI disappeared during the secondary-window lifetime stage";
     return null;
 }
 
