@@ -60,6 +60,7 @@
   // Per-context token: a fresh document means a fresh script instance,
   // which is exactly how the helper detects a navigation.
   var DOC = ((Math.random() * 0x7ffffffe) | 0) + 1;
+  var NAVGEN = 0;
   var QUIESCE_MS = 120;
   var CLAMP = [40, 160, 4000];
   var MAX_NODES = 4000;
@@ -90,10 +91,26 @@
   var observer = null;
   var quiesce = null;
 
+  // Test-only latency hook used by smoke-web to put a navigation
+  // deterministically between command receipt and reply production.
+  function delayed(kind, req, fn) {
+    if (!window.__sketerm_test_hooks) return false;
+    var attr = document.documentElement && document.documentElement.getAttribute("data-sketerm-delay-" + kind);
+    var ms = attr ? parseInt(attr, 10) : 0;
+    if (ms > 0) {
+      document.documentElement.removeAttribute("data-sketerm-delay-" + kind);
+      setTimeout(fn, Math.min(ms, 5000));
+      return true;
+    }
+    return false;
+  }
+
   // Replies carry the browser's nonce as a bare prefix; concatenation
   // of two primitives is the one step no page patch can intercept.
   function send(obj) {
     try {
+      obj.doc = DOC;
+      obj.gen = NAVGEN;
       post(NONCE + stringify(obj));
     } catch (e) {}
   }
@@ -487,6 +504,7 @@
   }
 
   function snapshot(req) {
+    if (req && delayed("snapshot", req, function () { snapshot(req); })) return;
     send({
       op: "tree",
       req: req,
@@ -934,6 +952,7 @@
   }
 
   function read(req, withIds) {
+    if (req && delayed("read", req, function () { read(req, withIds); })) return;
     var region = mainRegion();
     var out = [];
     var entities = [];
@@ -2009,7 +2028,8 @@
 
   // -- command entry point ---------------------------------------------
 
-  function handle(json) {
+  function handle(json, navgen) {
+    if (typeof navgen === "number" && navgen > 0) NAVGEN = navgen;
     var m;
     try {
       m = parseJson(json);

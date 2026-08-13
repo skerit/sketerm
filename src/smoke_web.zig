@@ -229,6 +229,12 @@ const reader_ids_page =
     "<button id=reader-mutate onclick=\"document.getElementById('reader-go').href='%23changed';" ++
     "document.title='reader:mutated'\">Mutate</button></body></html>";
 
+const reader_nav_page =
+    "data:text/html,<html><head><title>Reader After Navigation</title></head><body>" ++
+    "<article><h1>Reader After Navigation</h1>" ++
+    "<p>NAVIGATION-READ-MARKER enough article text to make reader extraction deterministic.</p>" ++
+    "</article></body></html>";
+
 /// Dropdowns: a native <select> and a hand-rolled ARIA combobox whose
 /// options only exist in the DOM while it is open. The old
 /// browser_choose handled both, so web_act set_value must too.
@@ -2597,7 +2603,6 @@ fn writeFixture(ext_dir: []const u8) bool {
     return true;
 }
 
-
 // ---------------------------------------------------------------------
 // Stage 34: blocking webRequest (MV2)
 // ---------------------------------------------------------------------
@@ -4376,8 +4381,54 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             std.debug.print("stage 41 reader ids: stale act ok={d} msg={s}\n", .{ cl.act_ok, cl.act_msg[0..cl.act_msg_len] });
             fail("stage 41 reader ids: a changed entity was not honestly refused as stale");
         }
+
+        // A legacy read and a rich read sent into a context that then
+        // navigates must be reissued against the new context, not hang
+        // or accept the old page's late reply.
+        cl.navigate(reader_ids_page);
+        _ = cl.evalWait("window.__sketerm_test_hooks=true;document.documentElement.setAttribute('data-sketerm-delay-read','1200');'armed'", false, 20_000);
+        const legacy_nav = cl.md_seq;
+        cl.send(proto.SemRead{ .view = view_id });
+        cl.send(proto.Navigate{ .view = view_id, .url = reader_nav_page });
+        if (!cl.waitSeq(&cl.md_seq, legacy_nav, 20_000)) fail("stage 41 reader ids: legacy read hung across navigation");
+        if (std.mem.indexOf(u8, cl.md[0..cl.md_len], "NAVIGATION-READ-MARKER") == null)
+            fail("stage 41 reader ids: legacy read was not reissued on the new document");
+
+        cl.navigate(reader_ids_page);
+        _ = cl.evalWait("window.__sketerm_test_hooks=true;document.documentElement.setAttribute('data-sketerm-delay-read','1200');'armed'", false, 20_000);
+        const rich_nav = cl.md_seq;
+        cl.send(proto.SemReadIds{ .view = view_id });
+        cl.send(proto.Navigate{ .view = view_id, .url = reader_nav_page });
+        if (!cl.waitSeq(&cl.md_seq, rich_nav, 20_000)) fail("stage 41 reader ids: rich read hung across navigation");
+        if (std.mem.indexOf(u8, cl.md[0..cl.md_len], "NAVIGATION-READ-MARKER") == null)
+            fail("stage 41 reader ids: rich read was not reissued on the new document");
+
+        // Navigation while the guarded action is waiting on its fresh
+        // validation walk must answer stale explicitly and must not
+        // activate a lookalike in the new page.
+        cl.navigate(reader_ids_page);
+        const read3 = cl.md_seq;
+        cl.send(proto.SemReadIds{ .view = view_id });
+        if (!cl.waitSeq(&cl.md_seq, read3, 20_000)) fail("stage 41 reader ids: no rich read for guarded navigation race");
+        _ = cl.evalWait("window.__sketerm_test_hooks=true;document.documentElement.setAttribute('data-sketerm-delay-snapshot','1200');'armed'", false, 20_000);
+        const interrupted = cl.act_seq;
+        cl.send(proto.SemActGuarded{
+            .view = view_id,
+            .doc_gen = cl.rich_doc,
+            .rev = cl.rich_rev,
+            .id = cl.rich_id,
+            .guard = cl.rich_guard,
+            .action = @intFromEnum(proto.SemAct.click),
+            .arg = "",
+        });
+        cl.send(proto.Navigate{ .view = view_id, .url = reader_nav_page });
+        if (!cl.waitSeq(&cl.act_seq, interrupted, 20_000)) fail("stage 41 reader ids: guarded action hung across navigation");
+        if (cl.act_ok != 0 or std.mem.indexOf(u8, cl.act_msg[0..cl.act_msg_len], "stale reader id") == null)
+            fail("stage 41 reader ids: guarded navigation race was not explicitly stale");
+        if (std.mem.indexOf(u8, cl.title[0..cl.title_len], "reader:trusted") != null)
+            fail("stage 41 reader ids: guarded navigation race clicked the old target");
     }
-    pass("stage 41 reader id activates exactly its fresh node and stale target is refused");
+    pass("stage 41 reader ids act fresh, refuse stale, and survive navigation races");
 
     // ── Stage 13: query the shadow tree ────────────────────────────
     // (covered by unit tests too; here it proves the frame round-trips)
@@ -4500,7 +4551,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!press) fail("stage 13c hints: the button is missing");
     }
     pass("stage 13c link hints (fresh rects, urls, viewport clip)");
-
 
     // ── Stage 13b: spontaneous churn coalesces into ONE delta ──────
     // A page that rebuilds identical rows and blinks a popup on a

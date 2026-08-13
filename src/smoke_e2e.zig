@@ -719,6 +719,13 @@ pub fn main() u8 {
     // Give the first pane's shell a moment to start.
     _ = c.usleep(700_000);
 
+    if (c.getenv("SKETERM_SMOKE_E2E_WEB_ONLY") != null) {
+        if (mcpWebReaderStage(allocator, sock_path, rt)) |why| return failMsg(why);
+        say("mcp GUI web adapter: focused reader-ID stage passed");
+        teardown();
+        return 0;
+    }
+
     // 1. list — exactly one tab with at least one pane.
     const list_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return fail("list roundtrip");
     defer allocator.free(list_resp);
@@ -1048,6 +1055,9 @@ pub fn main() u8 {
         // the path an assistant actually takes.
         if (mcpPanelStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("mcp: ui_show rendered a panel, ui_wait_event returned a real click, ui_save read the live document back (another process's panel included), save/load/close/delete held");
+
+        if (mcpWebReaderStage(allocator, sock_path, rt)) |why| return failMsg(why);
+        say("mcp GUI web adapter: web_read IDs acted through the visible browser and a retargeted entity was refused stale");
 
         if (remotePanelAssetStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("remote panel asset: fake-SSH panel images hydrated into the GUI cache, repainted after a same-path rewrite, and kept their logical path through panel-get/save/load");
@@ -4823,6 +4833,91 @@ const McpChild = struct {
         self.rbuf.deinit(self.allocator);
     }
 };
+
+fn readerEntityId(text: []const u8, needle: []const u8) ?u32 {
+    const at = std.mem.lastIndexOf(u8, text, needle) orelse return null;
+    const before = text[0..at];
+    const key = "\\\"id\\\":";
+    const id_at = std.mem.lastIndexOf(u8, before, key) orelse return null;
+    return parseNumAfter(text[id_at..], key);
+}
+
+/// Real MCP GUI adapter: control socket -> WebFace token polling -> helper.
+fn mcpWebReaderStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    if (c.access("zig-out/bin/sketerm-webengine", c.X_OK) != 0)
+        return null; // Optional CEF build; smoke-mcp reports the explicit skip.
+    var web_bin_buf: [4096]u8 = undefined;
+    const web_bin = c.realpath("zig-out/bin/sketerm-webengine", &web_bin_buf) orelse
+        return "could not resolve sketerm-webengine for the GUI MCP reader stage";
+
+    var page_buf: [512]u8 = undefined;
+    const page = std.fmt.bufPrintZ(&page_buf, "{s}/mcp-gui-reader.html", .{rt}) catch
+        return "GUI MCP reader page path did not fit";
+    const f = c.fopen(page.ptr, "wb") orelse return "could not create the GUI MCP reader page";
+    const html =
+        "<html><head><title>GUI Reader</title></head><body><article><h1>GUI Reader Target</h1>" ++
+        "<p>GUI-READER-MARKER enough article text for extraction. " ++
+        "<a id=target href=#fresh onclick=\"document.title='gui:mcp:'+event.isTrusted;return false\">" ++
+        "Activate GUI Reader Target</a></p></article></body></html>";
+    const wrote = c.fwrite(html.ptr, 1, html.len, f) == html.len;
+    _ = c.fclose(f);
+    if (!wrote) return "could not write the GUI MCP reader page";
+
+    _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    var m = McpChild.spawn(allocator, sock_path) orelse return "could not spawn MCP for the GUI reader stage";
+    defer m.close();
+    if (!m.initialize()) return "GUI reader MCP did not answer initialize";
+
+    var args: [1024]u8 = undefined;
+    const open_args = std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"timeout_ms\":30000}}", .{page}) catch
+        return "GUI reader web_open arguments did not fit";
+    const opened = m.call("web_open", open_args, 60_000) orelse return "GUI reader web_open timed out";
+    if (std.mem.indexOf(u8, opened, "isError") != null or std.mem.indexOf(u8, opened, "GUI Reader Target") == null)
+        return "GUI reader web_open did not settle on the real page";
+    const pane = parseNumAfter(opened, "\\\"pane\\\":") orelse return "GUI reader web_open returned no pane handle";
+
+    const read_args = std.fmt.bufPrint(&args, "{{\"pane\":{d},\"timeout_ms\":30000}}", .{pane}) catch
+        return "GUI reader web_read arguments did not fit";
+    const read = m.call("web_read", read_args, 60_000) orelse return "GUI reader web_read timed out";
+    if (std.mem.indexOf(u8, read, "GUI-READER-MARKER") == null or
+        std.mem.indexOf(u8, read, "\\\"entities\\\"") == null)
+        return "GUI reader web_read did not return its rich entity model";
+    const id = readerEntityId(read, "Activate GUI Reader Target") orelse
+        return "GUI reader web_read did not expose the target entity id";
+
+    const act_args = std.fmt.bufPrint(&args, "{{\"pane\":{d},\"id\":{d},\"action\":\"click\"}}", .{ pane, id }) catch
+        return "GUI reader web_act arguments did not fit";
+    const acted = m.call("web_act", act_args, 60_000) orelse return "GUI reader web_act timed out";
+    if (std.mem.indexOf(u8, acted, "\\\"acted\\\":true") == null)
+        return "GUI reader fresh entity id did not act";
+    const title_args = std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"document.title\"}}", .{pane}) catch
+        return "GUI reader title eval arguments did not fit";
+    const title = m.call("web_eval", title_args, 30_000) orelse return "GUI reader title eval timed out";
+    if (std.mem.indexOf(u8, title, "gui:mcp:true") == null)
+        return "GUI reader entity id did not activate its exact trusted link";
+
+    var reread_buf: [128]u8 = undefined;
+    const reread_args = std.fmt.bufPrint(&reread_buf, "{{\"pane\":{d},\"timeout_ms\":30000}}", .{pane}) catch
+        return "second GUI reader web_read arguments did not fit";
+    const guarded_again = m.call("web_read", reread_args, 60_000) orelse
+        return "second GUI reader web_read timed out";
+    const stale_id = readerEntityId(guarded_again, "Activate GUI Reader Target") orelse
+        return "second GUI reader web_read did not restore the action guard";
+
+    const mutate_args = std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"document.getElementById('target').href='#stale';'retargeted'\"}}", .{pane}) catch
+        return "GUI reader mutation eval arguments did not fit";
+    const mutated = m.call("web_eval", mutate_args, 30_000) orelse return "GUI reader mutation eval timed out";
+    if (std.mem.indexOf(u8, mutated, "retargeted") == null)
+        return "GUI reader target could not be retargeted";
+    const stale_args = std.fmt.bufPrint(&args, "{{\"pane\":{d},\"id\":{d},\"action\":\"click\"}}", .{ pane, stale_id }) catch
+        return "GUI stale reader web_act arguments did not fit";
+    const stale = m.call("web_act", stale_args, 60_000) orelse return "GUI stale reader action timed out";
+    if (std.mem.indexOf(u8, stale, "stale reader id") == null or
+        std.mem.indexOf(u8, stale, "isError") == null)
+        return "GUI MCP adapter did not refuse the stale reader entity";
+    return null;
+}
 
 fn muxHasSession(allocator: std.mem.Allocator, sock_path: []const u8, name: []const u8) ?bool {
     var conn = muxclient.Conn.connectProbed(allocator, sock_path) catch return null;

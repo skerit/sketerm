@@ -50,7 +50,7 @@ fn readWreqSpin() void {
 /// `cefhost.openBrowsers() == 0` under this cap.
 const drain_deadline_ms: i64 = 5_000;
 
-/// Capabilities this helper always advertises. `frames-shm` is here
+/// Capabilities this helper normally advertises. `frames-shm` is here
 /// even in GPU mode: the engine drops back to software compositing on
 /// its own when the GPU goes away, and the client must be ready for the
 /// memfd frames that follow. Conditional ones are appended at handshake
@@ -84,6 +84,11 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_FILTER_SUBSCRIBE,
     proto.CAP_READER_IDS,
 };
+
+/// Test-only negotiation seam for exercising an older helper client path.
+fn advertiseReaderIds() bool {
+    return c.getenv("SKETERM_WEB_DISABLE_READER_IDS") == null;
+}
 
 /// Bounded builder for the `hello_ack` capability set. Its capacity is
 /// derived from the protocol's OWN vocabulary — the number of `CAP_*`
@@ -297,6 +302,7 @@ pub const Server = struct {
         // the command reaches the background renderer in the same
         // message-loop turn that will carry its answer back.
         self.host.webrequestPump();
+        self.host.semanticPump(cefhost.nowMs());
         // CEF callbacks queue outbound frames, so pump BEFORE flushing.
         cefhost.pump();
         // A decision may have arrived in that pump; retire timeouts and
@@ -361,7 +367,10 @@ pub const Server = struct {
                 const req = try proto.decode(proto.Hello, frame.payload);
                 if (req.proto != proto.PROTO_VERSION) return error.ProtocolMismatch;
                 var caps: CapList = .{};
-                caps.addAll(&unconditional_caps);
+                for (&unconditional_caps) |cap| {
+                    if (std.mem.eql(u8, cap, proto.CAP_READER_IDS) and !advertiseReaderIds()) continue;
+                    caps.add(cap);
+                }
                 if (cefhost.isAccelerated()) caps.add(proto.CAP_FRAMES_DMABUF);
                 try self.out.post(proto.HelloAck{
                     .proto = proto.PROTO_VERSION,

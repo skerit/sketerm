@@ -6082,6 +6082,8 @@ pub const WebFace = struct {
     pub fn onCrashed(self: *WebFace) void {
         self.crashed = true;
         self.cancelHints();
+        self.auto_ops.clearRetainingCapacity();
+        self.invalidateReaderGuards();
         self.exitReader();
         self.dropMap();
         self.setStatus(CRASH_MSG, true);
@@ -8180,7 +8182,7 @@ pub const WebFace = struct {
         keyval: c.guint,
         keycode: c.guint,
         state: c.GdkModifierType,
-        ) c.gboolean {
+    ) c.gboolean {
         if (!self.view_live) return 0;
         const mods = modsFromState(state);
         // GDK keyvals ARE XKB keysyms; the helper maps them itself.

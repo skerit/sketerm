@@ -217,6 +217,12 @@ pub const Tag = enum(u8) {
     sem_query_result = 0x67,
     sem_read = 0x68,
     sem_read_result = 0x69,
+    // Append-only continuation of the semantic family, capability
+    // "reader-ids". 0x6A was deliberately left free when sem_eval was
+    // placed in the 0xA0 debugging block.
+    sem_read_ids = 0x6A,
+    sem_read_ids_result = 0x6B,
+    sem_act_guarded = 0x6C,
     a11y_enable = 0x70,
     ev_a11y_tree = 0x71,
     ev_a11y_loc = 0x72,
@@ -272,14 +278,10 @@ pub const Tag = enum(u8) {
     cookies_clear = 0xCB,
     sitedata_clear = 0xCC,
     ev_sitedata_done = 0xCD,
-    // 0xD0-0xD1: inline (in-band) frame family, capability
-    // "frames-inline" — the remote-helper block.
+    // 0xD0-0xD7: inline (in-band) frame family, capability
+    // "frames-inline" — the historically reserved remote-helper block.
     frame_mode = 0xD0,
     frame_inline = 0xD1,
-    // 0xD2-0xD4: reader semantic ids, capability "reader-ids".
-    sem_read_ids = 0xD2,
-    sem_read_ids_result = 0xD3,
-    sem_act_guarded = 0xD4,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -3468,12 +3470,17 @@ test "inline frame round-trips rects, encodings and pixel payloads" {
     try std.testing.expectError(error.Truncated, FrameInline.decodeAlloc(frame.payload[0 .. frame.payload.len - 1], gpa));
 }
 
-test "0xD0 reserved tags remain append-only" {
+test "reader ids extend the semantic family and leave 0xD0 reserved" {
+    try std.testing.expectEqual(@as(u8, 0x68), @intFromEnum(Tag.sem_read));
+    try std.testing.expectEqual(@as(u8, 0x69), @intFromEnum(Tag.sem_read_result));
+    try std.testing.expectEqual(@as(u8, 0x6A), @intFromEnum(Tag.sem_read_ids));
+    try std.testing.expectEqual(@as(u8, 0x6B), @intFromEnum(Tag.sem_read_ids_result));
+    try std.testing.expectEqual(@as(u8, 0x6C), @intFromEnum(Tag.sem_act_guarded));
     try std.testing.expectEqual(@as(u8, 0xD0), @intFromEnum(Tag.frame_mode));
     try std.testing.expectEqual(@as(u8, 0xD1), @intFromEnum(Tag.frame_inline));
-    try std.testing.expectEqual(@as(u8, 0xD2), @intFromEnum(Tag.sem_read_ids));
-    try std.testing.expectEqual(@as(u8, 0xD3), @intFromEnum(Tag.sem_read_ids_result));
-    try std.testing.expectEqual(@as(u8, 0xD4), @intFromEnum(Tag.sem_act_guarded));
+    for (0xD2..0xD8) |raw| {
+        try std.testing.expect(!(@as(Tag, @enumFromInt(raw))).known());
+    }
 }
 
 test "a dma-buf frame round-trips its planes" {

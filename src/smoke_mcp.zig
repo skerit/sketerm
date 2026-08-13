@@ -520,6 +520,8 @@ pub fn main() u8 {
     if (c.access(exe, c.X_OK) != 0) fail("zig-out/bin/sketerm missing (build first)");
     _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
     defer _ = c.unsetenv("SKETERM_MUX_BIN");
+    if (c.getenv("SKETERM_SMOKE_MCP_WEB_ONLY") != null)
+        return webOnly(allocator, exe, rt);
 
     // ── Stage 1: ephemeral isolation + headless terminal ──────────
     {
@@ -1927,6 +1929,22 @@ fn nodeIdBefore(hay: []const u8, needle: []const u8) ?u32 {
     return v;
 }
 
+/// Entity id in the rich web_read record whose text contains `needle`.
+fn readerIdBefore(hay: []const u8, needle: []const u8) ?u32 {
+    const at = std.mem.lastIndexOf(u8, hay, needle) orelse return null;
+    const before = hay[0..at];
+    const key = "\\\"id\\\":";
+    const id_at = std.mem.lastIndexOf(u8, before, key) orelse return null;
+    var i = id_at + key.len;
+    var value: u32 = 0;
+    var any = false;
+    while (i < hay.len and std.ascii.isDigit(hay[i])) : (i += 1) {
+        value = value * 10 + hay[i] - '0';
+        any = true;
+    }
+    return if (any) value else null;
+}
+
 /// Isolated `sketerm mcp` (no GUI, no --shared) driving a real page
 /// end to end through the headless web backend.
 fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
@@ -1938,7 +1956,9 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
         const f = c.fopen(page_path.ptr, "wb") orelse fail("cannot write web smoke page");
         const html =
             "<html><head><title>Headless Smoke</title></head><body>" ++
-            "<article><h1>Headless Article</h1><p>HEADLESS-READ-MARKER prose for the reader tool.</p></article>" ++
+            "<article><h1>Headless Article</h1><p>HEADLESS-READ-MARKER prose for the reader tool. " ++
+            "<a id=reader href=#reader onclick=\"document.title='reader:mcp:'+event.isTrusted;return false\">" ++
+            "Activate Reader Target</a></p></article>" ++
             "<button id=b onclick=\"document.getElementById('p').textContent='AFTERCLICK'\">PressMe</button>" ++
             "<p id=p>BEFORECLICK</p></body></html>";
         _ = c.fwrite(html.ptr, 1, html.len, f);
@@ -1998,6 +2018,26 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     const read = m.callTool("web_read", "{}");
     if (std.mem.indexOf(u8, read, "HEADLESS-READ-MARKER") == null)
         fail("web_read did not extract the article text");
+    if (std.mem.indexOf(u8, read, "\\\"entities\\\"") == null)
+        fail("web_read did not return the negotiated reader entity envelope");
+    const reader_id = readerIdBefore(read, "Activate Reader Target") orelse
+        fail("web_read did not make its reader link addressable");
+    const reader_act = m.callTool("web_act", std.fmt.bufPrint(&args_buf, "{{\"id\":{d},\"action\":\"click\"}}", .{reader_id}) catch unreachable);
+    if (std.mem.indexOf(u8, reader_act, "\\\"acted\\\":true") == null)
+        fail("web_act did not accept the fresh reader entity id");
+    const reader_title = m.callTool("web_eval", "{\"code\":\"document.title\"}");
+    if (std.mem.indexOf(u8, reader_title, "reader:mcp:true") == null)
+        fail("the reader entity id did not activate its exact trusted link");
+    const guarded_again = m.callTool("web_read", "{}");
+    const stale_id = readerIdBefore(guarded_again, "Activate Reader Target") orelse
+        fail("the second web_read did not restore the reader action guard");
+    const retarget = m.callTool("web_eval", "{\"code\":\"document.getElementById('reader').href='#changed';'retargeted'\"}");
+    if (std.mem.indexOf(u8, retarget, "retargeted") == null)
+        fail("could not retarget the reader link before the stale-action check");
+    const stale = m.callTool("web_act", std.fmt.bufPrint(&args_buf, "{{\"id\":{d},\"action\":\"click\"}}", .{stale_id}) catch unreachable);
+    if (std.mem.indexOf(u8, stale, "stale reader id") == null or
+        std.mem.indexOf(u8, stale, "isError") == null)
+        fail("headless MCP web_act did not refuse a stale reader entity");
 
     // web_screenshot: a real PNG from the helper's software frame
     // (base64 "iVBOR..." is the PNG magic).
@@ -2069,4 +2109,43 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // Ephemeral teardown must have reaped the helper's instance dir.
     if (fileExists(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}", .{ rt, m.pid }) catch unreachable))
         fail("instance dir (with the web helper's socket) survived teardown");
+
+    // Suppress only the capability advertisement to emulate an older
+    // helper: the MCP adapter must choose sem_read and keep JSON-shaped
+    // page bytes as markdown rather than guessing a rich envelope.
+    _ = c.setenv("SKETERM_WEB_DISABLE_READER_IDS", "1", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_DISABLE_READER_IDS");
+    var legacy = Mcp.spawn(allocator, exe, &.{});
+    legacy.initialize();
+    legacy.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"file://{s}\"}}", .{page_path}) catch unreachable);
+    const legacy_open = legacy.recvLine(60_000);
+    if (std.mem.indexOf(u8, legacy_open, "isError") != null)
+        fail("the capability-suppressed helper could not open the reader page");
+    const legacy_read = legacy.callTool("web_read", "{}");
+    if (std.mem.indexOf(u8, legacy_read, "HEADLESS-READ-MARKER") == null or
+        std.mem.indexOf(u8, legacy_read, "lacks the reader-ids capability") == null)
+        fail("web_read did not report the negotiated old-helper fallback");
+    if (std.mem.indexOf(u8, legacy_read, "\\\"entities\\\"") != null)
+        fail("the old-helper fallback fabricated rich reader entities");
+    legacy.closeStdinWait();
+}
+
+/// Run only the optional browser stage for focused E2E validation.
+fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u8 {
+    var bin_buf: [4096:0]u8 = undefined;
+    const web_bin = c.realpath("zig-out/bin/sketerm-webengine", &bin_buf);
+    if (web_bin == null or c.access("zig-out/bin/sketerm-webengine", c.X_OK) != 0)
+        fail("sketerm-webengine not built for --web-only");
+    _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
+    _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
+    _ = c.setenv("HOME", rt.ptr, 1);
+    _ = c.unsetenv("SKETERM_SOCKET");
+    _ = c.unsetenv("SKETERM_SESSION");
+    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+    _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
+    _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+    defer killDaemonsUnderRt(rt, allocator);
+    webStage(allocator, exe, rt);
+    say("smoke-mcp: focused headless web tools ok");
+    return 0;
 }

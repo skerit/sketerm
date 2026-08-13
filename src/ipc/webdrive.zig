@@ -947,7 +947,22 @@ pub const Engine = struct {
             },
             .ev_crashed => {
                 const ev = proto.decode(proto.EvCrashed, frame.payload) catch return;
-                if (self.findView(ev.view)) |v| self.setOwned(&v.title, "(renderer crashed)");
+                if (self.findView(ev.view)) |v| {
+                    self.setOwned(&v.title, "(renderer crashed)");
+                    v.reader_guards.clearRetainingCapacity();
+                    v.reader_guards_active = false;
+                    for (&v.waiting, 0..) |waiting, ki| {
+                        if (waiting and v.inbox[ki] == null) self.park(
+                            v,
+                            @enumFromInt(ki),
+                            false,
+                            "semantic request canceled because the renderer crashed",
+                            0,
+                            0,
+                            0,
+                        );
+                    }
+                }
             },
             .sem_snapshot => {
                 const ev = proto.decode(proto.SemSnapshot, frame.payload) catch return;

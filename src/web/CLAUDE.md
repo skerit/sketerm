@@ -770,16 +770,16 @@ H.264/AAC) while the distro build enables them.
   connects, before the `hello_ack` that would advertise the capability,
   so it stays on create-then-navigate and the settle in `mcp_web.zig`
   sees past the blank document instead.
-- **Reader semantic ids are the 0xD2-0xD4 block, capability
-  `reader-ids`.** `sem_read_ids` (0xD2) leaves the legacy `sem_read`
-  untouched; `sem_read_ids_result` (0xD3) carries the same useful
+- **Reader semantic ids extend the semantic block at 0x6A-0x6C,
+  capability `reader-ids`.** `sem_read_ids` (0x6A) leaves the legacy
+  `sem_read` untouched; `sem_read_ids_result` (0x6B) carries the same useful
   markdown plus `doc_gen`, `rev`, and structured section/heading/link/
   item records `{id, guard, kind, text, url}`. The ids are allocated by
   `semantic.View`, exactly the space `sem_act` resolves. `guard` is an
   opaque action fingerprint that includes element identity and the exact
   link target; clients must
   round-trip it but never present or interpret it. `sem_act_guarded`
-  (0xD4) solicits a fresh walk, then requires the exact document,
+  (0x6C) solicits a fresh walk, then requires the exact document,
   revision, stable id and guard before delegating to the normal trusted
   action path. Any mismatch answers the existing `sem_act_result` with
   `ok=0` and a stale-reader message, never an action on a lookalike.
@@ -790,6 +790,17 @@ H.264/AAC) while the distro build enables them.
   advertised; otherwise it explicitly uses `sem_read` and reports the
   markdown-only fallback. Never infer a rich envelope from page bytes:
   legacy markdown can itself be valid JSON.
+  The allocation was audited against `Tag` and its full git history:
+  0x6A was explicitly left unused when `sem_eval` moved to the 0xA0
+  debugging block, 0x6B/0x6C were never assigned, and 0xD0-0xD7 stays
+  reserved for the remote-helper inline-frame family.
+  Semantic requests are navigation-generation stamped: snapshots,
+  hints and both read forms are reissued after the fresh main document
+  loads, while actions/eval/expand are explicitly failed. Renderer
+  replies also carry the browser generation and a per-context document
+  token, so a late dying-context reply cannot satisfy the reissued
+  request. Every pending request has a 120s helper deadline and is
+  answered/freed on timeout, renderer crash, browser drop and teardown.
 - **A held security decision must always be answered.** A certificate
   error (`ev_cert_error`) and a permission prompt (`ev_permission`)
   both keep an engine callback alive in `View` until a

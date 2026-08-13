@@ -9,8 +9,8 @@ be passed directly to `web_act` without taking a snapshot first. Labels,
 URLs and markdown remain explicitly page-authored data.
 
 The wire change is append-only and capability-gated: `reader-ids` adds
-`sem_read_ids` 0xD2, `sem_read_ids_result` 0xD3 and
-`sem_act_guarded` 0xD4. The result carries unchanged markdown plus
+`sem_read_ids` 0x6A, `sem_read_ids_result` 0x6B and
+`sem_act_guarded` 0x6C. The result carries unchanged markdown plus
 `doc_gen`, `rev`, and `{id, guard, kind, text, url}` records. A guarded
 action refreshes the semantic walk and requires the exact document,
 revision, stable ID and opaque action fingerprint (including renderer
@@ -29,12 +29,25 @@ acting. No existing frame layout or meaning changed.
 
 Unit coverage in both roots pins rich-result serialization, page data
 escaping, stable-ID rewrite, revision invalidation, action fingerprints,
-the reserved tags, and the old-capability fallback. smoke-web stage 41
-reads an ID without a snapshot, activates exactly its trusted link, then
-changes only that link's href and measures the guarded action refusing it
-as stale. The measured stage passes in the full rig; later unrelated
-stages remain unstable (the download reload and a post-stage-27 helper
-restart have failed on separate runs), outside the reader path.
+the reserved tags, navigation reissue bookkeeping and old-capability
+fallback. Helper requests now carry a navigation generation and renderer
+document token; reads/snapshots/hints are reissued after the new context
+loads, while actions are failed explicitly. Pending owned arguments have
+a 120s deadline and are released on reply, timeout, renderer crash,
+browser close/discard and helper teardown.
+
+Measured E2E coverage now spans all three adapter cases. smoke-web stage
+41 reads an ID without a snapshot, activates exactly its trusted link,
+refuses an href-retargeted entity, reissues legacy and rich reads across
+navigation, and rejects a guarded action interrupted by navigation. The
+focused real headless MCP stage exercises `web_read` -> `web_act` ->
+stale refusal and capability-suppressed markdown fallback. The focused
+external-display GUI stage exercises the same reader-ID flow through the
+real control-socket `web-request`/`web-result` adapter. All focused stages
+pass. The full smoke-web run passed stage 41 and later reached stage 27
+before the command budget expired; the full smoke-e2e run failed earlier
+in the existing Kitty keyboard stage (the shell did not run its protocol
+enable command), before browser coverage.
 
 This file is a record of the autonomous implementation session that
 took the project from "13 markdown plan documents" to a working
