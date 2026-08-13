@@ -1919,6 +1919,45 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     if (web_pane == 0) return "web-list reported no pane id for the new browser";
 
     // ── sidebar CLOSED: new_tab is a WINDOW tab ────────────────
+    // The tree actions follow the visible WINDOW tree too; a focused
+    // browser's hidden page forest must not steal them.
+    const closed_page = blk: {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
+            return "web-list roundtrip failed before the closed-sidebar tree check";
+        defer allocator.free(r);
+        break :blk activeWebView(r, web_pane);
+    };
+    const closed_tab = blk: {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed before the closed-sidebar tree check";
+        defer allocator.free(r);
+        break :blk selectedTabFirstPane(r);
+    };
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_tree_prev\"}\n")) |r|
+        allocator.free(r)
+    else
+        return "tab_tree_prev roundtrip failed with the sidebar closed";
+    _ = app.waitIdle(300, 5_000);
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed after the closed-sidebar tree step";
+        defer allocator.free(r);
+        if (selectedTabFirstPane(r) == closed_tab)
+            return "with the sidebar closed, tab_tree_prev did not step through WINDOW tabs";
+    }
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
+            return "web-list roundtrip failed after the closed-sidebar tree step";
+        defer allocator.free(r);
+        if (activeWebView(r, web_pane) != closed_page)
+            return "with the sidebar closed, tab_tree_prev stepped through hidden browser pages";
+    }
+    var closed_focus_buf: [96]u8 = undefined;
+    const closed_focus = std.fmt.bufPrint(&closed_focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{web_pane}) catch
+        return "building the closed-sidebar focus command failed";
+    if (roundtrip(allocator, sock_path, closed_focus)) |r| allocator.free(r) else return "closed-sidebar focus roundtrip failed";
+    _ = app.waitIdle(300, 5_000);
+
     const before_closed = blk: {
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
             return "list roundtrip failed";

@@ -4134,16 +4134,25 @@ test "config: keybind.<action> entries round-trip" {
         \\keybind.new_tab = <Control><Shift>t
         \\keybind.split_h = <Control><Alt>d
         \\keybind.search_open =
+        \\keybind.toggle_tab_sidebar = <Control><Shift><Alt>b
+        \\keybind.tab_collapse = <Control><Shift><Alt>h
+        \\keybind.tab_expand = <Control><Shift><Alt>e
+        \\keybind.tab_tree_next = <Control><Alt>Page_Down
+        \\keybind.tab_tree_prev = <Control><Alt>Page_Up
         \\
     ;
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
-    try std.testing.expectEqual(@as(usize, 3), cfg.keybinds.items.len);
+    try std.testing.expectEqual(@as(usize, 8), cfg.keybinds.items.len);
     try std.testing.expectEqualStrings("new_tab", cfg.keybinds.items[0].name);
     try std.testing.expectEqualStrings("<Control><Shift>t", cfg.keybinds.items[0].accel);
     try std.testing.expectEqualStrings("split_h", cfg.keybinds.items[1].name);
     try std.testing.expectEqualStrings("search_open", cfg.keybinds.items[2].name);
     try std.testing.expectEqualStrings("", cfg.keybinds.items[2].accel);
+    try std.testing.expectEqualStrings("toggle_tab_sidebar", cfg.keybinds.items[3].name);
+    try std.testing.expectEqualStrings("<Control><Shift><Alt>b", cfg.keybinds.items[3].accel);
+    try std.testing.expectEqualStrings("tab_tree_prev", cfg.keybinds.items[7].name);
+    try std.testing.expectEqualStrings("<Control><Alt>Page_Up", cfg.keybinds.items[7].accel);
 
     // Round-trip via serialise → re-parse.
     var buf: [512]u8 = undefined;
@@ -4152,8 +4161,9 @@ test "config: keybind.<action> entries round-trip" {
     const out = w.buffered();
     var parsed = try Config.loadFromBytes(std.testing.allocator, out);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 3), parsed.keybinds.items.len);
+    try std.testing.expectEqual(@as(usize, 8), parsed.keybinds.items.len);
     try std.testing.expectEqualStrings("<Control><Alt>d", parsed.keybinds.items[1].accel);
+    try std.testing.expectEqualStrings("<Control><Alt>Page_Down", parsed.keybinds.items[6].accel);
 }
 
 test "config: editor_keybind entries and typing toggles round-trip" {

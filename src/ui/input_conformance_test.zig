@@ -410,6 +410,39 @@ test "matchBinding: Ctrl+Tab → next_tab (lone Ctrl, not Ctrl+Shift)" {
     try std.testing.expectEqual(@as(?input.Action, .next_tab), got);
 }
 
+test "matchBinding: tree-tab defaults match their documented chords" {
+    const cases = [_]struct { keyval: c_uint, mods: c_uint, action: input.Action }{
+        .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .toggle_tab_sidebar },
+        .{ .keyval = c.GDK_KEY_h, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_collapse },
+        .{ .keyval = c.GDK_KEY_e, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_expand },
+        .{ .keyval = c.GDK_KEY_Page_Down, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .action = .tab_tree_next },
+        .{ .keyval = c.GDK_KEY_Page_Up, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .action = .tab_tree_prev },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            @as(?input.Action, case.action),
+            input.matchBinding(&input.default_bindings, case.keyval, case.mods),
+        );
+    }
+}
+
+test "default bindings contain no accelerator collisions" {
+    for (input.default_bindings, 0..) |binding, i| {
+        for (input.default_bindings[i + 1 ..]) |other| {
+            const same_key = binding.keyval == other.keyval;
+            const same_mods = (binding.mods & input.SIGNIFICANT_MODS) ==
+                (other.mods & input.SIGNIFICANT_MODS);
+            if (same_key and same_mods) {
+                std.debug.print("default actions {s} and {s} share one accelerator\n", .{
+                    input.actionName(binding.action),
+                    input.actionName(other.action),
+                });
+                return error.DefaultBindingCollision;
+            }
+        }
+    }
+}
+
 test "matchBinding: ignores Lock + Group bits via SIGNIFICANT_MODS filter" {
     // Caps Lock (GDK_LOCK_MASK = 0x02) is NOT in the significant set;
     // a binding for Ctrl+Shift+T should still match when Lock is on.

@@ -3847,7 +3847,7 @@ pub const Window = struct {
     /// the window's own tab tree, as before).
     pub fn sidebarGroup(self: *Window) ?*webgroup.Group {
         if (self.destroying) return null;
-        if (self.tab_sidebar == null) return null;
+        if (!self.browserPagesInSidebar()) return null;
         const pane = self.selectedTabPane() orelse return null;
         if (!pane.webFaceVisible()) return null;
         return webgroup.Group.fromPane(pane);

@@ -137,6 +137,15 @@ pub const default_bindings = [_]Binding{
     .{ .keyval = c.GDK_KEY_x, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .copy_mode },
     // Ctrl+Shift+M → zoom ("maximize") the focused pane.
     .{ .keyval = c.GDK_KEY_m, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .zoom_pane },
+    // Tree tabs use punctuation-free mnemonics behind an extra Alt: B
+    // toggles the bar, H hides children, and E expands. Ctrl+Alt plus
+    // PageDown/PageUp extends the conventional tab-navigation pair to
+    // visible tree order without taking an editor's column-selection keys.
+    .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .toggle_tab_sidebar },
+    .{ .keyval = c.GDK_KEY_h, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_collapse },
+    .{ .keyval = c.GDK_KEY_e, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_ALT_MASK, .action = .tab_expand },
+    .{ .keyval = c.GDK_KEY_Page_Down, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .action = .tab_tree_next },
+    .{ .keyval = c.GDK_KEY_Page_Up, .mods = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK, .action = .tab_tree_prev },
     // Alt+1..9 → jump to specific tab. Standard across browsers,
     // gnome-terminal, kitty, etc. Doesn't collide with shell C-x
     // chords or Ctrl+Shift+digit (which terminator uses for splits).

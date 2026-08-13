@@ -237,6 +237,9 @@ const HELP_TEXT =
     \\  Ctrl+Shift+P          Pin / unpin current tab
     \\  Ctrl+Shift+Up/Down    Jump to prev/next OSC 133 prompt mark
     \\  Ctrl+Shift+Left/Right Cycle focus between panes in the tab
+    \\  Ctrl+Shift+Alt+B      Show / hide the tree-style tab sidebar
+    \\  Ctrl+Shift+Alt+H/E    Collapse / expand the visible tree node
+    \\  Ctrl+Alt+PgDn/PgUp    Next / previous visible tree node
     \\  Ctrl+= / Ctrl+-       Increase / decrease font size
     \\  Ctrl+0                Reset font size
     \\  Ctrl+,                Open Preferences (also: right-click menu)

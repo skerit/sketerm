@@ -638,12 +638,20 @@ copy_mode zoom_pane
 toggle_tab_sidebar tab_collapse tab_expand tab_tree_next tab_tree_prev
 ```
 
-The five tree-style-tab actions ship UNBOUND — bind them yourself, e.g.
-`keybind.toggle_tab_sidebar = <Control><Shift>E`. They are also in the
-Tab menu, the window hamburger and the command palette. `tab_collapse`,
-`tab_expand`, `tab_tree_next` and `tab_tree_prev` act on whichever tree
-the sidebar is showing: the window's tabs normally, or the focused
-browser's pages when it is listing those.
+The tree-style-tab actions use these defaults:
+
+| Action | Default | Meaning |
+| --- | --- | --- |
+| `toggle_tab_sidebar` | `Ctrl+Shift+Alt+B` | Show or hide the tree sidebar. |
+| `tab_collapse` | `Ctrl+Shift+Alt+H` | Hide (collapse) the selected node's children. |
+| `tab_expand` | `Ctrl+Shift+Alt+E` | Expand the selected node. |
+| `tab_tree_next` | `Ctrl+Alt+PageDown` | Select the next visible tree node. |
+| `tab_tree_prev` | `Ctrl+Alt+PageUp` | Select the previous visible tree node. |
+
+They are also in the Tab menu, the window hamburger and the command
+palette. The four navigation actions always follow the visible tree:
+the focused browser's pages while the sidebar lists them, and the
+window's tab tree otherwise, including while the sidebar is hidden.
 
 ### File browser
 
