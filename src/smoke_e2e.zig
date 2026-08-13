@@ -1692,6 +1692,46 @@ fn sidebarChipRight(app: *appdrive.App, win_id: u32) usize {
     return 0;
 }
 
+/// A point on the selected tree-sidebar row's blue chip. Clicking it
+/// gives a real GtkListBoxRow keyboard focus without a test-only IPC
+/// focus hook.
+fn sidebarChipPoint(app: *appdrive.App, win_id: u32) ?struct { x: f64, y: f64 } {
+    for (app.windows.items) |w| {
+        if (w.id != win_id or w.w <= 0 or w.h <= 0) continue;
+        const width: usize = @intCast(w.w);
+        const height: usize = @intCast(w.h);
+        const px = w.pixels.items;
+        if (px.len < width * height * 4) return null;
+        const limit = width / 3;
+        var min_x = limit;
+        var max_x: usize = 0;
+        var min_y = height;
+        var max_y: usize = 0;
+        var y: usize = 0;
+        while (y < height) : (y += 1) {
+            const row = y * width * 4;
+            var x: usize = 0;
+            while (x < limit) : (x += 1) {
+                const i = row + x * 4;
+                const b: i32 = px[i];
+                const g: i32 = px[i + 1];
+                const r: i32 = px[i + 2];
+                if (b <= 150 or b - r <= 70 or g >= b) continue;
+                min_x = @min(min_x, x);
+                max_x = @max(max_x, x);
+                min_y = @min(min_y, y);
+                max_y = @max(max_y, y);
+            }
+        }
+        if (max_x <= min_x or max_y <= min_y) return null;
+        return .{
+            .x = @floatFromInt((min_x + max_x) / 2),
+            .y = @floatFromInt((min_y + max_y) / 2),
+        };
+    }
+    return null;
+}
+
 /// Count `"pane":N` occurrences in a `web-list` reply: how many browser
 /// PAGES live on that pane. One row per page is the contract.
 fn webViewsOnPane(resp: []const u8, pane: u32) usize {
@@ -1765,6 +1805,36 @@ fn tabCount(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?usize {
     const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return null;
     defer allocator.free(r);
     return countTabs(r);
+}
+
+const tree_toggle_key = if (platform.is_macos) "cmd+shift+option+b" else "ctrl+shift+alt+b";
+const tree_collapse_key = if (platform.is_macos) "cmd+shift+option+h" else "ctrl+shift+alt+h";
+const tree_expand_key = if (platform.is_macos) "cmd+shift+option+e" else "ctrl+shift+alt+e";
+const tree_next_key = if (platform.is_macos) "cmd+option+pagedown" else "ctrl+alt+pagedown";
+const tree_prev_key = if (platform.is_macos) "cmd+option+pageup" else "ctrl+alt+pageup";
+
+fn selectedTabPane(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?u32 {
+    const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return null;
+    defer allocator.free(r);
+    return selectedTabFirstPane(r);
+}
+
+fn expectRealTreeStep(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    key: []const u8,
+    context: []const u8,
+) ?[]const u8 {
+    const before = selectedTabPane(allocator, sock_path) orelse return "list failed before a real tree shortcut";
+    app.pressKey(null, key) catch return "injecting a real tree shortcut failed";
+    _ = app.waitIdle(300, 5_000);
+    const after = selectedTabPane(allocator, sock_path) orelse return "list failed after a real tree shortcut";
+    if (before == after) {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: real tree key did not move from %.*s focus\n", @as(c_int, @intCast(context.len)), context.ptr);
+        return "a real tree shortcut did not move the window tab selection";
+    }
+    return null;
 }
 
 /// The command palette RANKS, it does not merely filter.
@@ -1896,6 +1966,106 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         keep_n = listPaneIds(r, &keep_ids);
         break :blk countTabs(r);
     };
+    const had_config = blk: {
+        var pbuf: [512:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break :blk true;
+        break :blk c.access(p.ptr, c.F_OK) == 0;
+    };
+
+    // Real seat events from every face that owns local key handling.
+    // IPC only selects/setup states; the product behavior under test is
+    // the physical chord flowing through GTK's focused widget.
+    const seed_tab = roundtrip(allocator, sock_path, "{\"cmd\":\"new-tab\"}\n") orelse
+        return "creating a second tab for real tree-key coverage failed";
+    allocator.free(seed_tab);
+    _ = app.waitIdle(300, 5_000);
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
+        return "terminal focus failed before real tree-key coverage";
+    _ = app.waitIdle(200, 4_000);
+    if (expectRealTreeStep(allocator, app, sock_path, tree_prev_key, "terminal")) |err| return err;
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+
+    var req_buf: [768]u8 = undefined;
+    const browser_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-browser-tab\",\"pane\":1,\"data\":\"{s}\"}}\n", .{rt}) catch
+        return "building the browser-face setup request failed";
+    const browser_resp = roundtrip(allocator, sock_path, browser_req) orelse return "new-browser-tab setup failed";
+    const browser_pane = parseNumAfter(browser_resp, "\"pane\":") orelse {
+        allocator.free(browser_resp);
+        return "new-browser-tab setup returned no pane";
+    };
+    allocator.free(browser_resp);
+    var browser_focus_buf: [96]u8 = undefined;
+    const browser_focus = std.fmt.bufPrint(&browser_focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{browser_pane}) catch
+        return "building the file-browser focus request failed";
+    if (roundtrip(allocator, sock_path, browser_focus)) |r| allocator.free(r) else
+        return "file-browser focus failed before real tree-key coverage";
+    _ = app.waitIdle(400, 8_000);
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = app.windows.items[0].id;
+    if (expectRealTreeStep(allocator, app, sock_path, tree_prev_key, "file browser")) |err| return err;
+
+    const editor_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"new-editor-tab\",\"pane\":1}\n") orelse
+        return "new-editor-tab setup failed";
+    const editor_pane = parseNumAfter(editor_resp, "\"pane\":") orelse {
+        allocator.free(editor_resp);
+        return "new-editor-tab setup returned no pane";
+    };
+    allocator.free(editor_resp);
+    var focus_buf: [96]u8 = undefined;
+    const editor_focus = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{editor_pane}) catch
+        return "building the editor focus request failed";
+    if (roundtrip(allocator, sock_path, editor_focus)) |r| allocator.free(r) else
+        return "editor focus failed before real tree-key coverage";
+    _ = app.waitIdle(300, 5_000);
+    if (expectRealTreeStep(allocator, app, sock_path, tree_prev_key, "editor")) |err| return err;
+
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(300, 5_000);
+
+    // The terminal shortcut toggles visibility AND persists the same
+    // setting Preferences edits. An unrelated apply can no longer undo
+    // it because Window.config changes immediately.
+    app.pressKey(null, tree_toggle_key) catch return "injecting the sidebar toggle shortcut failed";
+    _ = app.waitIdle(400, 5_000);
+    if (sidebarChipRight(app, win_id) == 0) return "the real sidebar toggle shortcut did not show the sidebar";
+    var saw_visible_config = false;
+    var vtries: u32 = 0;
+    while (vtries < 60) : (vtries += 1) {
+        _ = app.pumpOnce(100);
+        var pbuf: [512:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break;
+        if (readFileAlloc(allocator, p)) |body| {
+            defer allocator.free(body);
+            if (std.mem.indexOf(u8, body, "show_tab_sidebar = true") != null) {
+                saw_visible_config = true;
+                break;
+            }
+        }
+    }
+    if (!saw_visible_config) return "the sidebar toggle was not persisted to config.conf";
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
+        return "terminal focus failed before the sidebar hide shortcut";
+    _ = app.waitIdle(200, 4_000);
+    app.pressKey(null, tree_toggle_key) catch return "injecting the sidebar hide shortcut failed";
+    _ = app.waitIdle(400, 5_000);
+    // A stale replica frame can still carry the old blue row. The
+    // persisted value proves both dispatch and Window.config state.
+    var saw_hidden_config = false;
+    var htries: u32 = 0;
+    while (htries < 60) : (htries += 1) {
+        _ = app.pumpOnce(100);
+        var pbuf: [512:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break;
+        if (readFileAlloc(allocator, p)) |body| {
+            defer allocator.free(body);
+            if (std.mem.indexOf(u8, body, "show_tab_sidebar") == null) {
+                saw_hidden_config = true;
+                break;
+            }
+        }
+    }
+    if (!saw_hidden_config) return "the real sidebar hide shortcut was not persisted";
 
     // A browser tab, then find the pane its web face landed on.
     const open = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"new_web_tab\"}\n") orelse
@@ -1917,6 +2087,17 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         _ = app.pumpOnce(100);
     } else return "no web view appeared after new_web_tab";
     if (web_pane == 0) return "web-list reported no pane id for the new browser";
+    var web_nav_buf: [192]u8 = undefined;
+    const web_nav = std.fmt.bufPrint(&web_nav_buf, "{{\"cmd\":\"web-navigate\",\"pane\":{d},\"data\":\"data:text/html,tree-key-smoke\"}}\n", .{web_pane}) catch
+        return "building the initial web navigation command failed";
+    if (roundtrip(allocator, sock_path, web_nav)) |r| allocator.free(r) else
+        return "initial web navigation roundtrip failed";
+    var initial_web_focus_buf: [96]u8 = undefined;
+    const initial_web_focus = std.fmt.bufPrint(&initial_web_focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{web_pane}) catch
+        return "building the initial web focus command failed";
+    if (roundtrip(allocator, sock_path, initial_web_focus)) |r| allocator.free(r) else
+        return "initial web focus roundtrip failed";
+    _ = app.waitIdle(200, 4_000);
 
     // ── sidebar CLOSED: new_tab is a WINDOW tab ────────────────
     // The tree actions follow the visible WINDOW tree too; a focused
@@ -1933,10 +2114,10 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         defer allocator.free(r);
         break :blk selectedTabFirstPane(r);
     };
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_tree_prev\"}\n")) |r|
-        allocator.free(r)
-    else
-        return "tab_tree_prev roundtrip failed with the sidebar closed";
+    if (roundtrip(allocator, sock_path, initial_web_focus)) |r| allocator.free(r) else
+        return "web focus roundtrip failed before the closed-sidebar tree check";
+    _ = app.waitIdle(200, 4_000);
+    app.pressKey(null, tree_prev_key) catch return "injecting tab_tree_prev failed with the sidebar closed";
     _ = app.waitIdle(300, 5_000);
     {
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
@@ -1991,11 +2172,10 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         return "building the focus command failed";
     if (roundtrip(allocator, sock_path, focus_cmd)) |r| allocator.free(r) else return "focus roundtrip failed";
     _ = app.waitIdle(300, 5_000);
-
-    const toggle = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"toggle_tab_sidebar\"}\n") orelse
-        return "toggle_tab_sidebar roundtrip failed";
-    allocator.free(toggle);
+    app.pressKey(null, tree_toggle_key) catch return "injecting toggle_tab_sidebar failed";
     _ = app.waitIdle(400, 5_000);
+    if (sidebarChipRight(app, win_id) == 0)
+        return "the real web-face sidebar toggle did not show the sidebar";
 
     const tabs_with_sidebar = blk: {
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
@@ -2026,6 +2206,11 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         if (countTabs(r) != tabs_with_sidebar)
             return "with the tree sidebar open, new_tab ALSO opened a window tab";
     }
+    if (roundtrip(allocator, sock_path, web_nav)) |r| allocator.free(r) else
+        return "child web navigation roundtrip failed";
+    if (roundtrip(allocator, sock_path, focus_cmd)) |r| allocator.free(r) else
+        return "child web focus roundtrip failed";
+    _ = app.waitIdle(300, 5_000);
 
     // ── the tree ACTIONS follow the sidebar, not the window ────
     // tab_tree_next/tab_collapse used to walk the window's tab forest
@@ -2051,10 +2236,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     };
 
     // Stepping the tree must move the PAGE...
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_tree_prev\"}\n")) |r|
-        allocator.free(r)
-    else
-        return "tab_tree_prev roundtrip failed";
+    app.pressKey(null, tree_prev_key) catch return "injecting tab_tree_prev failed";
     _ = app.waitIdle(300, 5_000);
     {
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
@@ -2074,15 +2256,9 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
 
     // Collapsing the parent hides its child, so a step can no longer
     // reach it and the active page stays put.
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_collapse\"}\n")) |r|
-        allocator.free(r)
-    else
-        return "tab_collapse roundtrip failed";
+    app.pressKey(null, tree_collapse_key) catch return "injecting tab_collapse failed";
     _ = app.waitIdle(300, 5_000);
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_tree_next\"}\n")) |r|
-        allocator.free(r)
-    else
-        return "tab_tree_next roundtrip failed";
+    app.pressKey(null, tree_next_key) catch return "injecting tab_tree_next failed";
     _ = app.waitIdle(300, 5_000);
     {
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
@@ -2091,15 +2267,13 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         if (activeWebView(r, web_pane) != parent_view)
             return "a collapsed page subtree was still reachable by tab_tree_next";
     }
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_expand\"}\n")) |r|
-        allocator.free(r)
-    else
-        return "tab_expand roundtrip failed";
+    app.pressKey(null, tree_expand_key) catch return "injecting tab_expand failed";
     _ = app.waitIdle(300, 5_000);
     {
-        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"tab_tree_next\"}\n") orelse
-            return "tab_tree_next roundtrip failed after expand";
-        allocator.free(r);
+        const chip = sidebarChipPoint(app, win_id) orelse return "no selected sidebar row was visible to focus";
+        app.click(win_id, chip.x, chip.y, 1) catch return "clicking the selected sidebar row failed";
+        _ = app.waitIdle(200, 4_000);
+        app.pressKey(null, tree_next_key) catch return "injecting tab_tree_next from a focused sidebar row failed";
         _ = app.waitIdle(300, 5_000);
         const r2 = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse
             return "web-list roundtrip failed after expand";
@@ -2111,7 +2285,6 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     // A PNG of the window with the sidebar showing its rows — the
     // artefact a human reviews for the styling and the indent.
     if (app.windows.items.len == 0) return "the display session lost its window";
-    const win_id = app.windows.items[0].id;
     _ = app.waitVisualSettle(win_id, 300, 5_000, 0.002, null);
     if (app.screenshotPng(win_id, 1400, null, 0)) |shot| {
         defer allocator.free(shot.png);
@@ -2123,11 +2296,6 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     // guessed at, so the drag starts on the divider by construction.
     const width_before = sidebarChipRight(app, win_id);
     if (width_before == 0) return "no selected sidebar row was visible to measure";
-    const had_config = blk: {
-        var pbuf: [512:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break :blk true;
-        break :blk c.access(p.ptr, c.F_OK) == 0;
-    };
     const grab_x = @as(f64, @floatFromInt(width_before + 8));
     const mid_y = @as(f64, @floatFromInt(app.windows.items[0].h)) * 0.6;
     app.drag(win_id, grab_x, mid_y, grab_x + 90, mid_y, 1) catch
@@ -2162,20 +2330,21 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         }
     }
     if (!saw_width) return "the dragged sidebar width was never written to config.conf";
+    // Put the window back the way the later stages expect it.
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
+        return "terminal focus failed before the final sidebar hide";
+    _ = app.waitIdle(200, 4_000);
+    app.pressKey(null, tree_toggle_key) catch return "injecting toggle_tab_sidebar (off) failed";
+    _ = app.waitIdle(600, 5_000);
     // Put the config directory back the way the later config stages
-    // expect it (step 1 of configReloadStage is the CREATE path).
+    // expect it (step 1 of configReloadStage is the CREATE path). This
+    // must happen AFTER the persisted hide, or its debounce recreates
+    // the file behind the next stage.
     if (!had_config) {
         var pbuf: [512:0]u8 = undefined;
         if (std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch null) |p|
             _ = c.unlink(p.ptr);
     }
-
-    // Put the window back the way the later stages expect it.
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"toggle_tab_sidebar\"}\n")) |r|
-        allocator.free(r)
-    else
-        return "toggle_tab_sidebar (off) roundtrip failed";
-    _ = app.waitIdle(300, 5_000);
     _ = tabs_before;
     closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
     // Same contract as the palette stage: hand the window back focused
