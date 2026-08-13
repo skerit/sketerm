@@ -437,7 +437,7 @@ They are still accepted and ignored, so old files do not warn; use
 | `tab_position` | enum | `top` | `top`, `bottom` |
 | `close_button_on_tab` | bool | `true` | |
 | `show_tab_bar` | bool | `true` | Start with the AdwTabBar hidden by setting false; the `toggle_tab_bar` action flips it at runtime. |
-| `show_tab_sidebar` | bool | `false` | Start with the vertical tree-style tab sidebar shown. The `toggle_tab_sidebar` action (Tab menu, hamburger, palette) flips it at runtime; `tab_collapse` / `tab_expand` fold a tab's children. While it is shown it is also the tab surface for BROWSERS: it lists the pages open inside the focused browser rather than mirroring the window's tabs, and "new tab" opens a page there. Hide it and a browser goes back to its own in-pane tab strip, with new tabs becoming window tabs again. |
+| `show_tab_sidebar` | bool | `false` | Start with the vertical tree-style tab sidebar shown. The `toggle_tab_sidebar` action (key, Tab menu, hamburger, palette) updates and persists this setting; `tab_collapse` / `tab_expand` fold a tab's children. While it is shown it is also the tab surface for BROWSERS: it lists the pages open inside the focused browser rather than mirroring the window's tabs, and "new tab" opens a page there. Hide it and a browser goes back to its own in-pane tab strip, with new tabs becoming window tabs again. |
 | `tab_sidebar_width` | int | `240` | Width of that sidebar in logical px, 120..800. Dragging its divider writes this back. |
 | `web_store_socket` | path | (empty) | Daemon socket holding browsing history and bookmarks. Empty resolves at connect time: `$SKETERM_MUX_SOCKET`, else the per-user daemon. Point it at a forwarded socket (`ssh -L`) to share ONE history across machines. Not a remote dialer — the socket must be reachable as a path. |
 | `filter_list` | url | (none) | An `http://` or `https://` content-blocking filter list to keep up to date, EasyList syntax. Repeat the key for several lists; file order is meaningful (a later list can whitelist what an earlier one blocked). Fetched by the browser helper into `$XDG_CONFIG_HOME/sketerm/filters/` as `sub-<name>-<hash>.txt`, alongside any list you drop in by hand; those are never touched. With no `filter_list` set, filtering makes no network request at all. |
@@ -638,18 +638,20 @@ copy_mode zoom_pane
 toggle_tab_sidebar tab_collapse tab_expand tab_tree_next tab_tree_prev
 ```
 
-The tree-style-tab actions use these defaults:
+The tree-style-tab actions use platform-specific defaults:
 
-| Action | Default | Meaning |
-| --- | --- | --- |
-| `toggle_tab_sidebar` | `Ctrl+Shift+Alt+B` | Show or hide the tree sidebar. |
-| `tab_collapse` | `Ctrl+Shift+Alt+H` | Hide (collapse) the selected node's children. |
-| `tab_expand` | `Ctrl+Shift+Alt+E` | Expand the selected node. |
-| `tab_tree_next` | `Ctrl+Alt+PageDown` | Select the next visible tree node. |
-| `tab_tree_prev` | `Ctrl+Alt+PageUp` | Select the previous visible tree node. |
+| Action | Linux | macOS | Meaning |
+| --- | --- | --- | --- |
+| `toggle_tab_sidebar` | `Ctrl+Shift+Alt+B` | `Cmd+Shift+Option+B` | Show or hide the tree sidebar. |
+| `tab_collapse` | `Ctrl+Shift+Alt+H` | `Cmd+Shift+Option+H` | Hide (collapse) the selected node's children. |
+| `tab_expand` | `Ctrl+Shift+Alt+E` | `Cmd+Shift+Option+E` | Expand the selected node. |
+| `tab_tree_next` | `Ctrl+Alt+PageDown` | `Cmd+Option+PageDown` | Select the next visible tree node. |
+| `tab_tree_prev` | `Ctrl+Alt+PageUp` | `Cmd+Option+PageUp` | Select the previous visible tree node. |
 
 They are also in the Tab menu, the window hamburger and the command
-palette. The four navigation actions always follow the visible tree:
+palette, and work while a sidebar row has keyboard focus. macOS avoids
+the Control+Option modifier pair reserved by VoiceOver. The four
+navigation actions always follow the visible tree:
 the focused browser's pages while the sidebar lists them, and the
 window's tab tree otherwise, including while the sidebar is hidden.
 

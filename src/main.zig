@@ -65,6 +65,20 @@ const App = struct {
     web_request: ?web_app.Request = null,
 };
 
+const TREE_SHORTCUT_HELP = if (builtin.os.tag == .macos)
+    \\
+    \\  Cmd+Shift+Option+B   Show / hide the tree-style tab sidebar
+    \\  Cmd+Shift+Option+H/E Collapse / expand the visible tree node
+    \\  Cmd+Option+PgDn/PgUp Next / previous visible tree node
+    \\
+else
+    \\
+    \\  Ctrl+Shift+Alt+B      Show / hide the tree-style tab sidebar
+    \\  Ctrl+Shift+Alt+H/E    Collapse / expand the visible tree node
+    \\  Ctrl+Alt+PgDn/PgUp    Next / previous visible tree node
+    \\
+;
+
 const HELP_TEXT =
     \\sketerm — native GTK4 terminal emulator
     \\
@@ -234,12 +248,11 @@ const HELP_TEXT =
     \\                        next start, no --restore needed). Bind
     \\                        via keybind.save_default_layout.
     \\  Ctrl+Shift+Z          Re-open most recently closed tab
-    \\  Ctrl+Shift+P          Pin / unpin current tab
+    \\  Ctrl+Shift+P          Open command palette
+    \\  Ctrl+Shift+I          Pin / unpin current tab
     \\  Ctrl+Shift+Up/Down    Jump to prev/next OSC 133 prompt mark
     \\  Ctrl+Shift+Left/Right Cycle focus between panes in the tab
-    \\  Ctrl+Shift+Alt+B      Show / hide the tree-style tab sidebar
-    \\  Ctrl+Shift+Alt+H/E    Collapse / expand the visible tree node
-    \\  Ctrl+Alt+PgDn/PgUp    Next / previous visible tree node
+    ++ TREE_SHORTCUT_HELP ++
     \\  Ctrl+= / Ctrl+-       Increase / decrease font size
     \\  Ctrl+0                Reset font size
     \\  Ctrl+,                Open Preferences (also: right-click menu)
