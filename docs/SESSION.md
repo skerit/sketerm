@@ -18195,3 +18195,40 @@ The toolchain requirement is consistently Zig 0.16.x now:
 newer Zig before starting a build. dpkg `--deps` deliberately does not invent
 a distro Zig dependency that supported Debian/Ubuntu releases may not offer;
 its help text says to install Zig 0.16.x separately.
+## 2026-08-13: tree shortcuts, teardown ownership and close-time persistence
+
+Tree-tab actions now have platform defaults and work from every focused face,
+including a browser page, editor, file browser and the sidebar rows themselves.
+Linux uses `Ctrl+Shift+Alt+B/H/E` and `Ctrl+Alt+PageDown/PageUp`; macOS uses
+Command instead of Control so the defaults do not collide with VoiceOver's
+Control+Option chords. Browser-local bindings and type-ahead still win before
+the window action fallback.
+
+The lifetime review found that the tree sidebar's Zig `Sidebar` and `Row`
+allocations could be freed while GTK still retained signal user-data during a
+secondary window's deferred disposal. Widget qdata now owns the retained
+sidebar and row contexts, tab title signal closures retain their own context,
+and `Window` severs the nullable back-pointer as soon as its toplevel emits
+`destroy`. Preferences follows the same boundary: each `Window` has at most
+one dialog, the dialog is destroyed with its parent, and teardown clears its
+Window pointer before the Zig state can be freed.
+
+The same real-seat teardown test exposed one more cross-window ownership bug:
+`adoptPane` rewired terminal callbacks after a tab transfer but left keyboard
+and context-menu actions targeting the source `Window`. A shortcut in a
+detached tab could therefore mutate or dereference the wrong window. Adoption
+now repoints both action contexts together with the terminal sinks.
+
+Sidebar visibility and divider-width saves now use one explicit pending-write
+state. The timeout and window teardown both consume that state, so a close
+inside the debounce interval persists the final value exactly once rather than
+losing it or writing twice. Unit tests cover both race orders. `smoke-e2e`
+opens Preferences twice on a detached secondary, asserts one child, toggles
+the sidebar and closes immediately, then proves the child and parent vanish,
+the pending config value landed, and later style-manager emissions do not
+reach freed state.
+
+The real-seat coverage runs on sketerm's private Wayland display on Linux.
+macOS is compile-checked with `mux-portable`, but native Command-key injection
+and AppKit/WindowServer teardown remain unverified without a macOS runner; a
+green cross-compile is not claimed as native runtime proof.
