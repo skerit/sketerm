@@ -41,6 +41,10 @@ const WebFace = @import("webface.zig").WebFace;
 var drag_item: ?Item = null;
 var drag_win: ?*Window = null;
 
+const SIDEBAR_LIST_QDATA = "sketerm-tab-sidebar-list";
+const SIDEBAR_VIEW_QDATA = "sketerm-tab-sidebar-view";
+const ROW_QDATA = "sketerm-tab-sidebar-row";
+
 /// Per-depth indent. TST-scale: enough that three levels are obvious
 /// without eating the title on a narrow sidebar.
 const INDENT_PX: c_int = 18;
@@ -74,14 +78,15 @@ pub const Item = union(enum) {
 
 pub const Sidebar = struct {
     allocator: std.mem.Allocator,
-    win: *Window,
+    refs: usize = 1,
+    win: ?*Window,
     /// Root widget: the paned's start child.
     root: *c.GtkWidget,
-    list: *c.GtkWidget,
+    list: ?*c.GtkWidget,
     rows: std.ArrayList(*Row) = .empty,
     /// Guards the listbox-selection <-> tab-view-selection feedback loop.
     syncing: bool = false,
-    sel_handler: c.gulong = 0,
+    title_contexts: std.ArrayList(*TitleCtx) = .empty,
     /// The browser whose pages were listed at the last rebuild, null
     /// while the window's own tab tree was. It is a CHANGE MARKER, not
     /// a handle: a group is freed when its pane loses its web face, so
@@ -93,33 +98,24 @@ pub const Sidebar = struct {
     /// The browser the sidebar is listing right now, re-resolved from
     /// the window. Null when the rows are window tabs.
     fn liveGroup(self: *Sidebar) ?*webgroup.Group {
-        return self.win.sidebarGroup();
+        const win = self.win orelse return null;
+        return win.sidebarGroup();
     }
 
     pub const Row = struct {
-        sidebar: *Sidebar,
-        /// Window-tab rows own this AdwTabPage reference for exactly as
-        /// long as their notify::title handler can fire.
+        allocator: std.mem.Allocator,
+        sidebar: ?*Sidebar,
+        active: bool = true,
         item: Item,
         row: *c.GtkWidget,
         label: *c.GtkWidget,
-        /// notify::title on an AdwTabPage; 0 for a browser page (whose
-        /// title arrives through `Sidebar.noteWebTitle`).
-        title_handler: c.gulong = 0,
     };
 
-    fn freeRow(self: *Sidebar, r: *Row, remove_widget: bool) void {
-        switch (r.item) {
-            .tab => |page| {
-                if (r.title_handler != 0)
-                    c.g_signal_handler_disconnect(@ptrCast(page), r.title_handler);
-                c.g_object_unref(@ptrCast(page));
-            },
-            .page => {},
-        }
-        if (remove_widget) c.gtk_list_box_remove(@ptrCast(self.list), r.row);
-        self.allocator.destroy(r);
-    }
+    const TitleCtx = struct {
+        allocator: std.mem.Allocator,
+        sidebar: *Sidebar,
+        page: *c.AdwTabPage,
+    };
 
     pub fn create(allocator: std.mem.Allocator, win: *Window) !*Sidebar {
         const self = try allocator.create(Sidebar);
@@ -146,6 +142,14 @@ pub const Sidebar = struct {
             .list = list,
         };
 
+        // Window owns the base reference. The list and tab view each
+        // retain one because their signal closures can outlive either
+        // sibling during GtkWindow disposal.
+        self.retain();
+        c.g_object_set_data_full(@ptrCast(list), SIDEBAR_LIST_QDATA, @ptrCast(self), @ptrCast(&releaseList));
+        self.retain();
+        c.g_object_set_data_full(@ptrCast(@alignCast(win.tab_view)), SIDEBAR_VIEW_QDATA, @ptrCast(self), @ptrCast(&releaseView));
+
         _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onRowActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
         // The pane faces normally forward global bindings after their
@@ -158,7 +162,7 @@ pub const Sidebar = struct {
 
         // Selection tracking (highlight follows the tab view; selecting
         // a hidden page auto-expands its collapsed ancestors).
-        self.sel_handler = c.g_signal_connect_data(
+        _ = c.g_signal_connect_data(
             @ptrCast(win.tab_view),
             "notify::selected-page",
             @ptrCast(&onSelectedPage),
@@ -176,48 +180,35 @@ pub const Sidebar = struct {
         return self;
     }
 
-    /// Disconnect-at-teardown (mechanism 2): deinit is the single
-    /// choke point; the sidebar lives exactly as long as its Window.
-    pub fn deinit(self: *Sidebar) void {
-        // Window.deinit can run after the toplevel's destroy chain has
-        // finalized the tab view (deferred secondary free) — check the
-        // instance is still an AdwTabView before touching it, like
-        // onPageDetachedIdle does.
-        // `destroying` also covers rows holding pages that died after
-        // forestChanged stopped rebuilding (it no-ops once teardown
-        // starts) — those title handlers must not be touched either.
-        const view_alive = !self.win.destroying and c.g_type_check_instance_is_a(
-            @ptrCast(@alignCast(self.win.tab_view)),
-            c.adw_tab_view_get_type(),
-        ) != 0;
-        if (self.sel_handler != 0) {
-            if (view_alive) c.g_signal_handler_disconnect(@ptrCast(self.win.tab_view), self.sel_handler);
-            self.sel_handler = 0;
+    /// Fence callbacks before the owning Window is freed.
+    pub fn sever(self: *Sidebar) void {
+        const win = self.win orelse return;
+        if (drag_win == win) {
+            drag_item = null;
+            drag_win = null;
         }
-        if (!view_alive) {
-            // The list widgets are gone with the view. Window-tab rows
-            // still own their page references, so release those without
-            // touching the dead list box.
-            for (self.rows.items) |r| self.freeRow(r, false);
-            self.rows.deinit(self.allocator);
-            self.allocator.destroy(self);
-            return;
-        }
-        self.clearRows();
-        self.rows.deinit(self.allocator);
-        self.allocator.destroy(self);
+        self.win = null;
+        self.release();
     }
 
     fn clearRows(self: *Sidebar) void {
-        for (self.rows.items) |r| self.freeRow(r, true);
-        self.rows.clearRetainingCapacity();
+        const list = self.list orelse return;
+        while (self.rows.pop()) |r| {
+            r.active = false;
+            if (drag_win == self.win and drag_item != null and drag_item.?.eql(r.item)) {
+                drag_item = null;
+                drag_win = null;
+            }
+            c.gtk_list_box_remove(@ptrCast(list), r.row);
+        }
     }
 
     /// Rebuild every row from the relevant forest (visible refs, tree
     /// order). Cheap at tab-count scale; called on every mutation.
     pub fn rebuild(self: *Sidebar) void {
         self.clearRows();
-        self.group = self.win.sidebarGroup();
+        const win = self.win orelse return;
+        self.group = win.sidebarGroup();
         if (self.group) |g| {
             var flat: std.ArrayList(*WebFace) = .empty;
             defer flat.deinit(self.allocator);
@@ -226,7 +217,7 @@ pub const Sidebar = struct {
         } else {
             var flat: std.ArrayList(*c.AdwTabPage) = .empty;
             defer flat.deinit(self.allocator);
-            const forest = &self.win.tab_forest;
+            const forest = &win.tab_forest;
             forest.flattenVisible(self.allocator, &flat) catch return;
             for (flat.items) |page| self.buildRow(.{ .tab = page }, forest.depth(page), forest.hasChildren(page), forest.isCollapsed(page));
         }
@@ -300,21 +291,25 @@ pub const Sidebar = struct {
         const d: c_int = @intCast(@min(depth, MAX_DEPTH));
         c.gtk_widget_set_margin_start(row, d * INDENT_PX);
         c.gtk_list_box_row_set_child(@ptrCast(row), box);
-        c.gtk_list_box_append(@ptrCast(self.list), row);
 
         r.* = .{
+            .allocator = self.allocator,
             .sidebar = self,
             .item = item,
             .row = row,
             .label = label,
         };
-        switch (item) {
-            .tab => |page| _ = c.g_object_ref(@ptrCast(page)),
-            .page => {},
-        }
+        self.retain();
+        c.g_object_set_data_full(@ptrCast(row), ROW_QDATA, @ptrCast(r), @ptrCast(&freeRow));
+        const list = self.list orelse {
+            r.active = false;
+            c.g_object_unref(@ptrCast(row));
+            return;
+        };
+        c.gtk_list_box_append(@ptrCast(list), row);
         setLabel(r);
         switch (item) {
-            .tab => |page| r.title_handler = c.g_signal_connect_data(@ptrCast(page), "notify::title", @ptrCast(&onTitle), @ptrCast(r), null, c.G_CONNECT_DEFAULT),
+            .tab => |page| self.ensureTitleWatch(page),
             // A page's title arrives through the group, which knows
             // which row to patch (`noteWebTitle`).
             .page => {},
@@ -330,7 +325,7 @@ pub const Sidebar = struct {
         const src = c.gtk_drag_source_new();
         c.gtk_drag_source_set_actions(src, c.GDK_ACTION_MOVE);
         _ = c.g_signal_connect_data(src, "prepare", @ptrCast(&onDragPrepare), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(src, "drag-end", @ptrCast(&onDragEnd), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(src, "drag-end", @ptrCast(&onDragEnd), null, null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(row, @ptrCast(@alignCast(src)));
 
         // Drop ON this row -> become a child of it.
@@ -339,8 +334,21 @@ pub const Sidebar = struct {
         c.gtk_widget_add_controller(row, @ptrCast(@alignCast(drop)));
 
         self.rows.append(self.allocator, r) catch {
-            self.freeRow(r, true);
+            r.active = false;
+            c.gtk_list_box_remove(@ptrCast(list), row);
         };
+    }
+
+    fn ensureTitleWatch(self: *Sidebar, page: *c.AdwTabPage) void {
+        for (self.title_contexts.items) |ctx| if (ctx.page == page) return;
+        const ctx = self.allocator.create(TitleCtx) catch return;
+        ctx.* = .{ .allocator = self.allocator, .sidebar = self, .page = page };
+        self.title_contexts.append(self.allocator, ctx) catch {
+            self.allocator.destroy(ctx);
+            return;
+        };
+        self.retain();
+        _ = c.g_signal_connect_data(@ptrCast(page), "notify::title", @ptrCast(&onTitle), @ptrCast(ctx), @ptrCast(&freeTitleCtx), c.G_CONNECT_DEFAULT);
     }
 
     fn setLabel(r: *Row) void {
@@ -348,8 +356,9 @@ pub const Sidebar = struct {
             .tab => |page| c.gtk_label_set_text(@ptrCast(r.label), c.adw_tab_page_get_title(page)),
             .page => |face| {
                 const title = webgroup.Group.pageTitle(face);
-                const z = r.sidebar.allocator.dupeZ(u8, title) catch return;
-                defer r.sidebar.allocator.free(z);
+                const sidebar = r.sidebar orelse return;
+                const z = sidebar.allocator.dupeZ(u8, title) catch return;
+                defer sidebar.allocator.free(z);
                 c.gtk_label_set_text(@ptrCast(r.label), z.ptr);
             },
         }
@@ -375,7 +384,8 @@ pub const Sidebar = struct {
                 const face = g.active() orelse break :blk null;
                 break :blk Item{ .page = face };
             }
-            const page = c.adw_tab_view_get_selected_page(self.win.tab_view) orelse break :blk null;
+            const win = self.win orelse break :blk null;
+            const page = c.adw_tab_view_get_selected_page(win.tab_view) orelse break :blk null;
             break :blk Item{ .tab = page };
         };
         self.syncing = true;
@@ -383,22 +393,76 @@ pub const Sidebar = struct {
         if (sel) |want| {
             for (self.rows.items) |r| {
                 if (r.item.eql(want)) {
-                    c.gtk_list_box_select_row(@ptrCast(self.list), @ptrCast(r.row));
+                    const list = self.list orelse return;
+                    c.gtk_list_box_select_row(@ptrCast(list), @ptrCast(r.row));
                     return;
                 }
             }
         }
-        c.gtk_list_box_unselect_all(@ptrCast(self.list));
+        const list = self.list orelse return;
+        c.gtk_list_box_unselect_all(@ptrCast(list));
+    }
+
+    fn retain(self: *Sidebar) void {
+        self.refs += 1;
+    }
+
+    fn release(self: *Sidebar) void {
+        self.refs -= 1;
+        if (self.refs != 0) return;
+        self.rows.deinit(self.allocator);
+        self.title_contexts.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    fn releaseList(user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(Sidebar, user);
+        self.list = null;
+        self.release();
+    }
+
+    fn releaseView(user: ?*anyopaque) callconv(.c) void {
+        cast.userData(Sidebar, user).release();
+    }
+
+    fn freeRow(user: ?*anyopaque) callconv(.c) void {
+        const r = cast.userData(Row, user);
+        const sidebar = r.sidebar;
+        r.sidebar = null;
+        if (sidebar) |self| {
+            for (self.rows.items, 0..) |candidate, i| {
+                if (candidate == r) {
+                    _ = self.rows.swapRemove(i);
+                    break;
+                }
+            }
+        }
+        r.allocator.destroy(r);
+        if (sidebar) |s| s.release();
+    }
+
+    fn freeTitleCtx(user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(TitleCtx, user);
+        const self = ctx.sidebar;
+        for (self.title_contexts.items, 0..) |candidate, i| {
+            if (candidate == ctx) {
+                _ = self.title_contexts.swapRemove(i);
+                break;
+            }
+        }
+        ctx.allocator.destroy(ctx);
+        self.release();
     }
 
     fn onRowActivated(_: *c.GtkListBox, row: ?*c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(Sidebar, user);
+        const win = self.win orelse return;
         if (self.syncing) return;
         const rw = row orelse return;
         for (self.rows.items) |r| {
             if (@as(*c.GtkListBoxRow, @ptrCast(r.row)) == rw) {
                 switch (r.item) {
-                    .tab => |page| c.adw_tab_view_set_selected_page(self.win.tab_view, page),
+                    .tab => |page| c.adw_tab_view_set_selected_page(win.tab_view, page),
                     .page => |face| if (self.liveGroup()) |g| g.setActive(face),
                 }
                 return;
@@ -414,23 +478,25 @@ pub const Sidebar = struct {
         user: ?*anyopaque,
     ) callconv(.c) c.gboolean {
         const self = cast.userData(Sidebar, user);
+        const win = self.win orelse return 0;
         const lower = c.gdk_keyval_to_lower(keyval);
-        const bindings: []const input.Binding = if (self.win.bindings.items.len > 0)
-            self.win.bindings.items
+        const bindings: []const input.Binding = if (win.bindings.items.len > 0)
+            win.bindings.items
         else
             &input.default_bindings;
         const action = input.matchBinding(bindings, lower, state) orelse
             input.matchBinding(bindings, keyval, state) orelse return 0;
-        winmod.dispatchAction(self.win, action);
+        winmod.dispatchAction(win, action);
         return 1;
     }
 
     fn onSelectedPage(_: *c.AdwTabView, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(Sidebar, user);
+        const win = self.win orelse return;
         // A different tab may well be a different SOURCE (a browser tab
         // lists its pages, anything else the window tree), so the whole
         // list is re-resolved rather than just the highlight.
-        if (self.win.sidebarGroup() != self.group) {
+        if (win.sidebarGroup() != self.group) {
             self.rebuild();
             return;
         }
@@ -438,31 +504,40 @@ pub const Sidebar = struct {
             self.refreshSelection();
             return;
         }
-        const sel = c.adw_tab_view_get_selected_page(self.win.tab_view) orelse return;
+        const sel = c.adw_tab_view_get_selected_page(win.tab_view) orelse return;
         // Selecting a page inside a collapsed subtree (Ctrl+Tab, goto_tab_N,
         // overview…) expands its ancestors so the selection is never invisible.
-        if (self.win.tab_forest.isHidden(sel)) {
-            var p = self.win.tab_forest.parentOf(sel);
-            while (p) |parent| : (p = self.win.tab_forest.parentOf(parent)) {
-                self.win.tab_forest.setCollapsed(parent, false);
+        if (win.tab_forest.isHidden(sel)) {
+            var p = win.tab_forest.parentOf(sel);
+            while (p) |parent| : (p = win.tab_forest.parentOf(parent)) {
+                win.tab_forest.setCollapsed(parent, false);
             }
-            self.win.forestChanged();
+            win.forestChanged();
             return;
         }
         self.refreshSelection();
     }
 
     fn onTitle(page: *c.AdwTabPage, _: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        const r = cast.userData(Row, user);
-        c.gtk_label_set_text(@ptrCast(r.label), c.adw_tab_page_get_title(page));
+        const ctx = cast.userData(TitleCtx, user);
+        const self = ctx.sidebar;
+        if (self.win == null) return;
+        for (self.rows.items) |r| switch (r.item) {
+            .tab => |candidate| if (candidate == page and r.active) {
+                c.gtk_label_set_text(@ptrCast(r.label), c.adw_tab_page_get_title(page));
+                return;
+            },
+            .page => {},
+        };
     }
 
     fn onExpanderClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const r = cast.userData(Row, user);
-        const self = r.sidebar;
+        if (!r.active) return;
+        const self = r.sidebar orelse return;
+        const win = self.win orelse return;
         switch (r.item) {
             .tab => |page| {
-                const win = self.win;
                 win.setTabCollapsed(page, !win.tab_forest.isCollapsed(page));
             },
             .page => |face| {
@@ -475,23 +550,26 @@ pub const Sidebar = struct {
     }
 
     fn onCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-        closeItem(cast.userData(Row, user));
+        const r = cast.userData(Row, user);
+        if (r.active) closeItem(r);
     }
 
     fn onMiddlePressed(gesture: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
         const r = cast.userData(Row, user);
+        if (!r.active) return;
         _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
         closeItem(r);
     }
 
     fn closeItem(r: *Row) void {
-        const self = r.sidebar;
+        const self = r.sidebar orelse return;
+        const win = self.win orelse return;
         switch (r.item) {
-            .tab => |page| _ = c.adw_tab_view_close_page(self.win.tab_view, page),
+            .tab => |page| _ = c.adw_tab_view_close_page(win.tab_view, page),
             .page => |face| {
                 const g = self.liveGroup() orelse return;
                 if (!g.has(face)) return;
-                g.closePage(face, switch (self.win.config.tab_close_parent) {
+                g.closePage(face, switch (win.config.tab_close_parent) {
                     .promote => .promote,
                     .close_subtree => .close_subtree,
                 });
@@ -501,8 +579,11 @@ pub const Sidebar = struct {
 
     fn onDragPrepare(_: *c.GtkDragSource, _: f64, _: f64, user: ?*anyopaque) callconv(.c) ?*c.GdkContentProvider {
         const r = cast.userData(Row, user);
+        if (!r.active) return null;
+        const self = r.sidebar orelse return null;
+        const win = self.win orelse return null;
         drag_item = r.item;
-        drag_win = r.sidebar.win;
+        drag_win = win;
         var v: c.GValue = std.mem.zeroes(c.GValue);
         _ = c.g_value_init(&v, c.G_TYPE_INT);
         c.g_value_set_int(&v, 1);
@@ -518,18 +599,22 @@ pub const Sidebar = struct {
 
     fn onRowDrop(_: *c.GtkDropTarget, _: *const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
         const r = cast.userData(Row, user);
+        if (!r.active) return 0;
+        const self = r.sidebar orelse return 0;
+        const win = self.win orelse return 0;
         const item = drag_item orelse return 0;
         // Same-window only: the forest holds per-window state, and a
         // cross-window page move must go through AdwTabView transfer.
-        if (drag_win != r.sidebar.win) return 0;
+        if (drag_win != win) return 0;
         if (item.eql(r.item)) return 0;
-        return r.sidebar.reparent(item, r.item);
+        return self.reparent(item, r.item);
     }
 
     fn onListDrop(_: *c.GtkDropTarget, _: *const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(Sidebar, user);
+        const win = self.win orelse return 0;
         const item = drag_item orelse return 0;
-        if (drag_win != self.win) return 0;
+        if (drag_win != win) return 0;
         // Only the empty space below the rows means "make it a root";
         // drops on a row are claimed by the row's own target first.
         return self.reparent(item, null);
@@ -538,13 +623,14 @@ pub const Sidebar = struct {
     /// Reparent within whichever forest both items belong to. A drop
     /// that crosses the two sources is refused rather than guessed at.
     fn reparent(self: *Sidebar, item: Item, onto: ?Item) c.gboolean {
+        const win = self.win orelse return 0;
         switch (item) {
             .tab => |page| {
                 const parent: ?*c.AdwTabPage = if (onto) |o| switch (o) {
                     .tab => |p| p,
                     .page => return 0,
                 } else null;
-                self.win.tabForestReparent(page, parent);
+                win.tabForestReparent(page, parent);
                 return 1;
             },
             .page => |face| {
@@ -555,7 +641,7 @@ pub const Sidebar = struct {
                 } else null;
                 g.forest.reparent(face, parent, g.childInsertPos()) catch |err| {
                     if (err == error.WouldCycle)
-                        winmod.showToast(self.win, "Cannot drop a tab into its own subtree.");
+                        winmod.showToast(win, "Cannot drop a tab into its own subtree.");
                     return 0;
                 };
                 self.rebuild();

@@ -26,6 +26,7 @@ const lsp_proc = @import("../lsp/proc.zig");
 // directly without creating a cycle, so we receive it as anyopaque and
 // cast on the apply boundary.
 const WindowOpaque = anyopaque;
+const PREFS_QDATA = "sketerm-preferences-context";
 
 /// Apply callback: invoked whenever a row mutates. Receives the
 /// Window pointer the dialog was opened against and a snapshot of the
@@ -41,7 +42,7 @@ const Ctx = struct {
     /// chars, …). Reaped when the dialog closes — independent of
     /// Window.config.arena which manages the long-lived strings.
     arena: std.heap.ArenaAllocator,
-    win: *WindowOpaque,
+    win: ?*WindowOpaque,
     apply: ApplyFn,
     /// Working copy. Each row writes here, then we call `apply`.
     cfg: Config,
@@ -81,7 +82,8 @@ const Ctx = struct {
     live_next: ?*Ctx = null,
 
     fn ev(self: *Ctx) void {
-        self.apply(self.win, &self.cfg);
+        const win = self.win orelse return;
+        self.apply(win, &self.cfg);
     }
 
     fn dupe(self: *Ctx, s: []const u8) ![]const u8 {
@@ -100,6 +102,10 @@ pub fn open(
     initial: Config,
     apply: ApplyFn,
 ) !void {
+    if (contextForWindow(win_ptr)) |ctx| {
+        if (ctx.dialog) |dialog| c.gtk_window_present(@ptrCast(dialog));
+        return;
+    }
     return openForProfile(allocator, parent_window, win_ptr, initial, apply, "");
 }
 
@@ -159,7 +165,10 @@ fn openForProfile(
         c.gtk_window_set_title(@ptrCast(dialog), t.ptr);
     }
     c.gtk_window_set_transient_for(@ptrCast(dialog), parent_window);
-    // Free Ctx when the window goes away.
+    c.gtk_window_set_destroy_with_parent(@ptrCast(dialog), 1);
+    // Child-row closures borrow Ctx and are torn down during dialog
+    // disposal, so the dialog's finalization owns the allocation.
+    c.g_object_set_data_full(@ptrCast(dialog), PREFS_QDATA, @ptrCast(ctx), @ptrCast(&freeCtx));
     _ = c.g_signal_connect_data(
         dialog,
         "destroy",
@@ -192,14 +201,13 @@ fn openForProfile(
 fn onClosed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
     if (open_dialogs > 0) open_dialogs -= 1;
-    var link = &first_context;
-    while (link.*) |live| {
-        if (live == ctx) {
-            link.* = live.live_next;
-            break;
-        }
-        link = &live.live_next;
-    }
+    unlinkContext(ctx);
+    ctx.win = null;
+    ctx.dialog = null;
+}
+
+fn freeCtx(user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(Ctx, user);
     ctx.arena.deinit();
     ctx.allocator.destroy(ctx);
 }
@@ -213,6 +221,33 @@ var first_context: ?*Ctx = null;
 
 pub fn isOpen() bool {
     return open_dialogs > 0;
+}
+
+fn contextForWindow(win: *WindowOpaque) ?*Ctx {
+    var next = first_context;
+    while (next) |ctx| : (next = ctx.live_next) {
+        if (ctx.win == win) return ctx;
+    }
+    return null;
+}
+
+fn unlinkContext(ctx: *Ctx) void {
+    var link = &first_context;
+    while (link.*) |live| {
+        if (live == ctx) {
+            link.* = live.live_next;
+            ctx.live_next = null;
+            return;
+        }
+        link = &live.live_next;
+    }
+}
+
+/// Destroy this Window's Preferences before its Zig state is freed.
+pub fn closeForWindow(win: *WindowOpaque) void {
+    const ctx = contextForWindow(win) orelse return;
+    ctx.win = null;
+    if (ctx.dialog) |dialog| c.gtk_window_destroy(@ptrCast(dialog));
 }
 
 /// Synchronize runtime changes that originate outside Preferences so a
@@ -321,7 +356,7 @@ fn editingProfileSelected(ctx: *Ctx, idx: c_uint) void {
 /// with the close — capture everything needed first.
 fn reopenForProfile(ctx: *Ctx, name: []const u8) void {
     const allocator = ctx.allocator;
-    const win = ctx.win;
+    const win = ctx.win orelse return;
     const apply = ctx.apply;
     const parent_window = ctx.parent_window;
     const dialog = ctx.dialog;

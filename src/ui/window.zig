@@ -40,6 +40,7 @@ pub const PaneTree = tree_mod.Tree(*Pane);
 const TAB_TREE_KEY = "sketerm-tree";
 const tabforest_mod = @import("tabforest.zig");
 const tabsidebar_mod = @import("tabsidebar.zig");
+const SidebarSave = @import("sidebar_save.zig").State;
 const webgroup = @import("webgroup.zig");
 
 /// Drag limits for the tree-sidebar divider. Wider than the config
@@ -247,7 +248,7 @@ pub const Window = struct {
     tab_sidebar: ?*tabsidebar_mod.Sidebar = null,
     /// Debounce for writing sidebar visibility or a dragged width back
     /// to config: a divider drag emits notify::position per pixel.
-    sidebar_config_save_timer: c.guint = 0,
+    sidebar_config_save: SidebarSave = .{},
     /// HBox holding [sidebar | toast_overlay] as the toolbar content.
     content_box: *c.GtkWidget,
     /// Opener page consumed by the NEXT page-attached, so a web popup /
@@ -1022,7 +1023,7 @@ pub const Window = struct {
     }
 
     pub fn deinit(self: *Window) void {
-        self.destroying = true;
+        self.beginDestroy();
         self.detachGlobalSignals();
         // Teardown order matters. Steps:
         //
@@ -1114,18 +1115,20 @@ pub const Window = struct {
         if (self.si_zsh_shim) |s| self.allocator.free(s);
         if (self.si_fish_shim) |s| self.allocator.free(s);
         if (self.si_bash_shim) |s| self.allocator.free(s);
-        if (self.sidebar_config_save_timer != 0) {
-            _ = c.g_source_remove(self.sidebar_config_save_timer);
-            self.sidebar_config_save_timer = 0;
-            // Do not lose the final toggle/drag when the window closes
-            // inside the debounce interval.
-            winconfig_mod.persistConfig(self);
-        }
-        if (self.tab_sidebar) |sb| sb.deinit();
-        self.tab_sidebar = null;
         self.tab_forest.deinit();
         self.config.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Fence widget callbacks and flush pending sidebar config before GTK disposal can outlive this Window.
+    fn beginDestroy(self: *Window) void {
+        self.destroying = true;
+        @import("prefs.zig").closeForWindow(@ptrCast(self));
+        if (self.tab_sidebar) |sb| sb.sever();
+        self.tab_sidebar = null;
+        const sidebar_flush = self.sidebar_config_save.teardown();
+        if (sidebar_flush.source != 0) _ = c.g_source_remove(sidebar_flush.source);
+        if (sidebar_flush.persist) winconfig_mod.persistConfig(self);
     }
 
     /// Drop every signal handler this Window installed on an object
@@ -2362,6 +2365,12 @@ pub const Window = struct {
         self.panes.appendAssumeCapacity(pane);
         self.terminals.appendAssumeCapacity(pane.terminal);
         self.wirePaneSinks(pane);
+        if (pane.input_ctx) |ictx| {
+            ictx.shortcut_sink = onShortcut;
+            ictx.shortcut_ctx = @ptrCast(self);
+        }
+        pane.menu_sink = onMenuAction;
+        pane.menu_sink_ctx = @ptrCast(self);
         if (@import("browser.zig").BrowserView.fromPane(pane)) |bv| self.installBrowserHooks(bv);
         // Re-point active_profile off the SOURCE window's config arena
         // (which is freed on its next applyConfigChange / deinit) onto
@@ -3826,9 +3835,10 @@ pub const Window = struct {
     }
 
     fn scheduleSidebarConfigSave(self: *Window) void {
-        if (self.sidebar_config_save_timer != 0)
-            _ = c.g_source_remove(self.sidebar_config_save_timer);
-        self.sidebar_config_save_timer = c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self));
+        if (self.sidebar_config_save.source != 0)
+            _ = c.g_source_remove(self.sidebar_config_save.source);
+        const source = c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self));
+        self.sidebar_config_save.scheduled(source);
     }
 
     /// True while the tree sidebar is the tab surface for browsers:
@@ -4932,7 +4942,7 @@ fn reserveNativeDragDestination(source: *Window, destination: *Window) !void {
 /// unmapped path in onPageDetached.
 fn onWindowDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
-    self.destroying = true;
+    self.beginDestroy();
     if (self.is_primary) {
         const app = c.g_application_get_default();
         if (app != null) c.g_application_quit(@ptrCast(@alignCast(app)));
@@ -5067,9 +5077,7 @@ fn onSidebarPosition(_: *c.GObject, _: ?*anyopaque, user: ?*anyopaque) callconv(
 
 fn onSidebarSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Window, user);
-    self.sidebar_config_save_timer = 0;
-    if (self.destroying) return 0; // G_SOURCE_REMOVE
-    @import("winconfig.zig").persistConfig(self);
+    if (self.sidebar_config_save.fired()) @import("winconfig.zig").persistConfig(self);
     return 0; // G_SOURCE_REMOVE
 }
 
