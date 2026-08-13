@@ -47,6 +47,7 @@ comptime {
     _ = @import("web/webext/bgpage.zig");
     _ = @import("web/webext/i18n.zig");
     _ = @import("web/webext/tabs.zig");
+    _ = @import("web/webext/action.zig");
     _ = @import("util/crashlog.zig");
     _ = @import("util/shellintegration.zig");
     _ = @import("util/png.zig");

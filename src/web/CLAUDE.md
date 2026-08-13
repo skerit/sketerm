@@ -391,24 +391,51 @@ dispatch, and the blocking half is documented in its own section below).
   `onBeforeRequest` filtered to its own `web_accessible_resources/*`
   that cancels anything arriving without a secret, so "some listener
   matched, run them all" cancels every page on the web.
-- Namespaces an extension calls UNCONDITIONALLY are present as benign
-  stubs (`browserAction`, `menus`, `windows`, `webNavigation`,
-  `notifications`, `commands`, `permissions`, `extension`, and the
-  notification-only `webRequest` events). They exist because their
-  ABSENCE is fatal — uBO's first act after its module graph loads is
-  `browserAction.setIcon`, and a TypeError there aborts the rest of its
-  startup from inside its own boot. `alarms` and `storage.session` are
-  REAL (a timer and an in-memory map cost nothing). Anything an
+- `browserAction` / `pageAction` is REAL: manifest defaults, global and
+  per-tab title/icon/popup/badge/enabled overrides, trusted `onClicked`,
+  and declared popup pages. The GUI renders enabled actions in each active
+  page's toolbar and the helper validates the mirrored active tab before
+  accepting an activation. Popup pages are real extension-origin CEF
+  browsers, not scraped HTML: they receive the same privileged bootstrap
+  as background/options pages and paint through the ordinary shm/inline
+  frame paths into a GTK popover. The popup id range starts at
+  `WEBEXT_POPUP_VIEW_BASE` (0x60000000), disjoint from client views,
+  DevTools and hidden background pages. Closing the popover posts
+  `view_destroy`; destroying its owner or disabling/removing the extension
+  closes it from the helper side. Action snapshots are replace-all, but the
+  GTK side updates buttons in place when their ids are unchanged so a
+  popup does not destroy its own anchor when it updates a badge. Popup
+  input uses the owning face's `Client`, which is load-bearing for a remote
+  browser face. `setBadgeBackgroundColor` / `setBadgeTextColor` and
+  `openPopup` currently resolve without changing presentation; `setIcon`
+  accepts package paths, not `ImageData`.
+- Other namespaces an extension calls UNCONDITIONALLY are present as
+  benign stubs (`menus`, `windows`, `webNavigation`, `notifications`,
+  `commands`, `permissions`, `extension`, and the notification-only
+  `webRequest` events). They exist because their ABSENCE is fatal.
+  `alarms` and `storage.session` are REAL (a timer and an in-memory map
+  cost nothing). Anything an
   extension feature-detects — `privacy`, `dns`, `contentScripts`,
   `storage.sync`/`managed`, `filterResponseData` — is deliberately LEFT
   ABSENT, because degrading gracefully is what that detection is for.
   The cost is named: `webRequest.onResponseStarted` never fires, and
   that is where uBO injects its scriptlets.
-- Smoke-web stage 33 is the end-to-end proof (a committed fixture under
+- Smoke-web stage 33 is the content/background end-to-end proof (a committed fixture under
   `webext/testdata/fixture`): content script injected at document_end
   mutates the DOM + messages the background + `getMessage`; storage.local
   survives a helper restart. It serves the page from a loopback HTTP
   server because content scripts match `http://…`, never a `data:` url.
+- Smoke-web stage 40 is the browser-action proof: a trusted activation
+  opens and paints a real extension-origin popup whose first script can
+  call `runtime.getManifest`; an action without a popup fires `onClicked`
+  for the active tab; a missing popup asset reports an error without a
+  view; ordinary, `about:blank`, `data:` and foreign-extension origins
+  cannot read the privileged bootstrap; owner destruction and extension
+  removal both close the popup. The exact-host
+  `get_first_party_for_cookies` fallback in `extSchemeCreate` is required
+  because CEF can expose the previous frame URL while a parser-blocking
+  extension script loads. It must stay exact-host: broadening it would
+  reopen the bootstrap nonce to another origin.
 
 ## Blocking webRequest (MV2) — where the decision goes, and what it costs
 

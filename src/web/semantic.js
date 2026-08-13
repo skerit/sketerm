@@ -1497,7 +1497,7 @@
   // The UI language, filled in by the first ext-inject that carries one.
   var extUiLanguage = "en";
 
-  // -- benign namespaces -------------------------------------------------
+  // -- extension namespaces ----------------------------------------------
   //
   // MV2 surfaces a real extension calls UNCONDITIONALLY, on paths it
   // does not feature-detect. uBlock Origin's very first act after its
@@ -1505,17 +1505,13 @@
   // there is a TypeError that takes the whole background page down —
   // an extension that is "enabled" and does nothing at all.
   //
-  // THESE ARE STUBS AND THEY ARE MEANT TO READ AS STUBS. A toolbar
-  // button, a context-menu item and a notification are all things only
-  // the GUI can draw, and this helper deliberately owns no client
-  // surface; wiring them would be new wire frames and new GUI, not a
-  // few lines here. What they buy is that an extension RUNS instead of
-  // dying on line one, with its filtering — the part that lives
-  // entirely inside this process — fully working. Anything an extension
-  // feature-detects (`privacy`, `dns`, `contentScripts`,
-  // `storage.sync`/`managed`, `filterResponseData`) is deliberately
-  // LEFT ABSENT, because degrading gracefully is what that detection is
-  // for and a stub would defeat it.
+  // browserAction is real: state crosses the bridge and trusted clicks
+  // come back from GTK. The remaining namespaces below are benign stubs
+  // and are meant to read as stubs. What they buy is that an extension
+  // RUNS instead of dying on line one. Anything an extension feature-
+  // detects (`privacy`, `dns`, `contentScripts`, `storage.sync`/`managed`,
+  // `filterResponseData`) is deliberately LEFT ABSENT, because degrading
+  // gracefully is what that detection is for and a stub would defeat it.
   function noopAsync() {
     return Promise.resolve();
   }
@@ -1527,18 +1523,18 @@
 
   function addExtStubs(api, extId, ctx) {
     var action = {
-      setIcon: noopAsync,
-      setTitle: noopAsync,
-      setBadgeText: noopAsync,
-      setBadgeTextColor: noopAsync,
-      setBadgeBackgroundColor: noopAsync,
-      setPopup: noopAsync,
-      getPopup: noopAsyncValue(""),
-      getBadgeText: noopAsyncValue(""),
-      getTitle: noopAsyncValue(""),
-      enable: noopAsync,
-      disable: noopAsync,
-      isEnabled: noopAsyncValue(true),
+      setIcon: function (d) { return extApiCall(extId, "browserAction", "setIcon", [d || {}]); },
+      setTitle: function (d) { return extApiCall(extId, "browserAction", "setTitle", [d || {}]); },
+      setBadgeText: function (d) { return extApiCall(extId, "browserAction", "setBadgeText", [d || {}]); },
+      setBadgeTextColor: function (d) { return extApiCall(extId, "browserAction", "setBadgeTextColor", [d || {}]); },
+      setBadgeBackgroundColor: function (d) { return extApiCall(extId, "browserAction", "setBadgeBackgroundColor", [d || {}]); },
+      setPopup: function (d) { return extApiCall(extId, "browserAction", "setPopup", [d || {}]); },
+      getPopup: function (d) { return extApiCall(extId, "browserAction", "getPopup", [d || {}]); },
+      getBadgeText: function (d) { return extApiCall(extId, "browserAction", "getBadgeText", [d || {}]); },
+      getTitle: function (d) { return extApiCall(extId, "browserAction", "getTitle", [d || {}]); },
+      enable: function (tabId) { return extApiCall(extId, "browserAction", "enable", tabId === undefined ? [] : [tabId]); },
+      disable: function (tabId) { return extApiCall(extId, "browserAction", "disable", tabId === undefined ? [] : [tabId]); },
+      isEnabled: function (d) { return extApiCall(extId, "browserAction", "isEnabled", d && d.tabId !== undefined ? [d.tabId] : []); },
       openPopup: noopAsync,
       onClicked: extEvent()
     };
@@ -1873,6 +1869,12 @@
     fireAll(ev, m.args || []);
   }
 
+  function extActionClicked(m) {
+    var api = extApiOf[m.ext];
+    if (!api || !api.browserAction) return;
+    fireAll(api.browserAction.onClicked, [m.tab || {}]);
+  }
+
   // An `ext-inject` carrying the process NONCE is PRIVILEGED: it may
   // publish `browser`/`chrome` as real globals on this document, which
   // is what an extension page (background, popup, options) needs before
@@ -2100,6 +2102,9 @@
         break;
       case "ext-tab-event":
         extTabEvent(m);
+        break;
+      case "ext-action-clicked":
+        extActionClicked(m);
         break;
       default:
         break;

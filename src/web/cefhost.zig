@@ -542,6 +542,13 @@ pub const View = struct {
     /// posts nothing for it.
     webext_bg: bool = false,
 
+    /// A browser-action popup: real extension document and ordinary
+    /// frame/input path, but no tab/navigation chrome on the client.
+    webext_popup: bool = false,
+    popup_owner: u32 = 0,
+    popup_ext: [extmanifest.MAX_ID_LEN]u8 = @splat(0),
+    popup_ext_len: usize = 0,
+
     /// The background page was spawned AT its `chrome-extension://`
     /// origin, so the engine loads its scripts and nothing is injected.
     ///
@@ -1144,6 +1151,9 @@ pub const Host = struct {
         // The same rule for Ports: a peer that is gone must produce an
         // onDisconnect, never a Port that stays open forever.
         self.portsAbandonView(id);
+        // A page owns every browser-action popup it opened. Close those
+        // first so no floating extension page survives its toolbar.
+        while (self.popupForOwner(id)) |popup| self.destroyView(popup.id);
         for (self.views.items, 0..) |v, i| {
             if (v.id != id) continue;
             _ = self.views.swapRemove(i);
@@ -1155,8 +1165,36 @@ pub const Host = struct {
                 if (self.find(v.devtools_of)) |src| src.devtools_view = 0;
             }
             if (self.adopting == v) self.adopting = null;
+            if (v.webext_popup) self.post(proto.EvWebextPopup{
+                .owner_view = v.popup_owner,
+                .popup_view = v.id,
+                .state = proto.webext_popup_closed,
+                .detail = "",
+            });
             self.freeView(v);
             if (inspector != 0) self.destroyView(inspector);
+            return;
+        }
+    }
+
+    fn popupForOwner(self: *Host, owner: u32) ?*View {
+        for (self.views.items) |v| {
+            if (v.webext_popup and v.popup_owner == owner) return v;
+        }
+        return null;
+    }
+
+    fn popupClosedByEngine(self: *Host, id: u32) void {
+        for (self.views.items, 0..) |v, i| {
+            if (v.id != id or !v.webext_popup) continue;
+            _ = self.views.swapRemove(i);
+            self.post(proto.EvWebextPopup{
+                .owner_view = v.popup_owner,
+                .popup_view = v.id,
+                .state = proto.webext_popup_closed,
+                .detail = "",
+            });
+            self.freeViewOpts(v, false);
             return;
         }
     }
@@ -2732,8 +2770,10 @@ pub const Host = struct {
             self.webext.clearListeners(e);
             self.teardownBackground(e);
             self.unpublishOrigin(e.id);
+            self.teardownPopups(e.id);
         }
         self.postWebextState(e);
+        self.postActionsForActiveViews();
     }
 
     /// Make `chrome-extension://<host>/` resolve to this extension's
@@ -2764,10 +2804,27 @@ pub const Host = struct {
             self.webext.clearListeners(e);
             self.teardownBackground(e);
         }
+        self.teardownPopups(id);
         self.unpublishOrigin(id);
         self.webext.remove(id);
+        self.postActionsForActiveViews();
         // A removal has no dedicated frame; the client already dropped
         // the row. Nothing more to report.
+    }
+
+    fn teardownPopups(self: *Host, id: []const u8) void {
+        while (true) {
+            var found: u32 = 0;
+            for (self.views.items) |v| {
+                if (!v.webext_popup) continue;
+                if (std.mem.eql(u8, v.popup_ext[0..v.popup_ext_len], id)) {
+                    found = v.id;
+                    break;
+                }
+            }
+            if (found == 0) return;
+            self.destroyView(found);
+        }
     }
 
     pub fn webextList(self: *Host) void {
@@ -2818,7 +2875,195 @@ pub const Host = struct {
         if (diff.activated) |id| {
             if (self.webext.tabs.find(id)) |tb| self.postTabEvent("onActivated", tb, null);
         }
-        for (diff.removed) |id| self.postTabRemoved(id);
+        for (diff.removed) |id| {
+            self.postTabRemoved(id);
+            for (self.webext.exts.items) |*e| e.action.removeTab(self.gpa, id);
+        }
+        self.postActionsForActiveViews();
+    }
+
+    /// Replace-all toolbar action state for every active page view.
+    fn postActionsForActiveViews(self: *Host) void {
+        for (self.webext.tabs.tabs.items) |*tb| {
+            if (!tb.active or tb.view == 0 or self.find(tb.view) == null) continue;
+            const json = self.actionSnapshot(tb.id) orelse continue;
+            defer self.gpa.free(json);
+            self.post(proto.EvWebextActions{ .view = tb.view, .actions_json = json });
+        }
+    }
+
+    fn actionSnapshot(self: *Host, tab: u32) ?[]u8 {
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer aw.deinit();
+        const w = &aw.writer;
+        w.writeByte('[') catch return null;
+        var first = true;
+        for (self.webext.exts.items) |*e| {
+            if (!e.enabled or !e.ok or !e.action.present) continue;
+            const a = e.action.effective(tab);
+            if (!first) w.writeByte(',') catch return null;
+            first = false;
+            w.writeAll("{\"id\":") catch return null;
+            jsonStr(w, e.id) catch return null;
+            w.writeAll(",\"title\":") catch return null;
+            jsonStr(w, if (a.title.len != 0) a.title else if (e.man) |*m| m.name else e.id) catch return null;
+            w.writeAll(",\"icon\":") catch return null;
+            jsonStr(w, a.icon) catch return null;
+            w.writeAll(",\"badge\":") catch return null;
+            jsonStr(w, a.badge) catch return null;
+            w.print(",\"enabled\":{s},\"popup\":{s}}}", .{
+                if (a.enabled) "true" else "false",
+                if (a.popup.len != 0) "true" else "false",
+            }) catch return null;
+        }
+        w.writeByte(']') catch return null;
+        return aw.toOwnedSlice() catch null;
+    }
+
+    /// A trusted browser-toolbar activation. The active mirrored tab is
+    /// the authority: a stale/background GUI face cannot activate one.
+    pub fn webextActionActivate(self: *Host, req: proto.WebextActionActivate) void {
+        const tb = self.webext.tabs.findByView(req.view) orelse {
+            self.popupError(req, "action is not available for this tab");
+            return;
+        };
+        if (!tb.active) {
+            self.popupError(req, "action is not available for this tab");
+            return;
+        }
+        const owner = self.find(req.view) orelse {
+            self.popupError(req, "action owner is gone");
+            return;
+        };
+        const e = self.webext.find(req.id) orelse {
+            self.popupError(req, "extension is not available");
+            return;
+        };
+        if (!e.enabled or !e.ok or !e.action.present) {
+            self.popupError(req, "extension action is not available");
+            return;
+        }
+        const a = e.action.effective(tb.id);
+        if (!a.enabled) {
+            self.popupError(req, "extension action is disabled");
+            return;
+        }
+        if (a.popup.len == 0) {
+            const bg = if (e.bg_view != 0) self.find(e.bg_view) else null;
+            if (bg) |v| {
+                var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+                defer cmd.deinit();
+                cmd.writer.writeAll("{\"op\":\"ext-action-clicked\",\"ext\":") catch return;
+                jsonStr(&cmd.writer, e.id) catch return;
+                cmd.writer.writeAll(",\"tab\":") catch return;
+                exttabs.Table.writeTab(tb, &cmd.writer) catch return;
+                cmd.writer.writeByte('}') catch return;
+                self.sendScript(v, cmd.written());
+            }
+            self.popupError(req, "extension action has no popup");
+            return;
+        }
+        if (req.popup_view < proto.WEBEXT_POPUP_VIEW_BASE or self.find(req.popup_view) != null) {
+            self.popupError(req, "invalid popup view id");
+            return;
+        }
+        while (self.popupForOwner(req.view)) |old| self.destroyView(old.id);
+        const clean = std.mem.trimStart(u8, a.popup, "/");
+        const asset_end = std.mem.indexOfAny(u8, clean, "?#") orelse clean.len;
+        const asset = clean[0..asset_end];
+        if (asset.len == 0 or std.mem.indexOf(u8, asset, "..") != null) {
+            self.popupError(req, "invalid popup path");
+            return;
+        }
+        const popup_asset = self.webext.readAsset(e, asset) orelse {
+            self.popupError(req, "popup asset not found");
+            return;
+        };
+        self.gpa.free(popup_asset);
+        var host_buf: [16]u8 = undefined;
+        var url_buf: [2048]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, ext_scheme ++ "://{s}/{s}", .{
+            extmanifest.originHost(e.id, &host_buf), clean,
+        }) catch {
+            self.popupError(req, "popup URL is too long");
+            return;
+        };
+        const v = self.gpa.create(View) catch {
+            self.popupError(req, "out of memory");
+            return;
+        };
+        const scale: u16 = if (req.scale_x1000 == 0) 1000 else req.scale_x1000;
+        v.* = .{
+            .id = req.popup_view,
+            .w = @max(req.w, 1),
+            .h = @max(req.h, 1),
+            .scale_x1000 = scale,
+            .pw = physicalOf(@max(req.w, 1), scale),
+            .ph = physicalOf(@max(req.h, 1), scale),
+            .context = owner.context,
+            .webext_popup = true,
+            .webext_origin = true,
+            .popup_owner = req.view,
+            .sem = semantic.View.init(self.gpa),
+        };
+        @memcpy(v.popup_ext[0..e.id.len], e.id);
+        v.popup_ext_len = e.id.len;
+        self.views.append(self.gpa, v) catch {
+            v.sem.deinit();
+            self.gpa.destroy(v);
+            self.popupError(req, "out of memory");
+            return;
+        };
+        self.spawnPopup(v, url) catch {
+            self.removePopupView(v);
+            self.popupError(req, "popup browser creation failed");
+        };
+    }
+
+    fn popupError(self: *Host, req: proto.WebextActionActivate, detail: []const u8) void {
+        if (req.popup_view == 0) return;
+        self.post(proto.EvWebextPopup{
+            .owner_view = req.view,
+            .popup_view = req.popup_view,
+            .state = proto.webext_popup_error,
+            .detail = detail,
+        });
+    }
+
+    fn removePopupView(self: *Host, popup: *View) void {
+        for (self.views.items, 0..) |v, i| {
+            if (v != popup) continue;
+            _ = self.views.swapRemove(i);
+            self.freeView(v);
+            return;
+        }
+    }
+
+    fn spawnPopup(self: *Host, v: *View, url_utf8: []const u8) !void {
+        var winfo = windowlessInfo(v);
+        // Popups are short-lived and small. Force software frames so the
+        // GTK popover owns one simple mapping, never a dma-buf pool.
+        winfo.shared_texture_enabled = 0;
+        var settings = windowlessSettings(v);
+        var url = std.mem.zeroes(cef.cef_string_t);
+        setStr(url_utf8, &url);
+        defer cef.cef_string_utf16_clear(&url);
+        self.pending = v;
+        defer self.pending = null;
+        const browser = cef.cef_browser_host_create_browser_sync(
+            &winfo, &client, &url, &settings, null, self.lookupContext(v.context),
+        );
+        if (browser == null) return error.BrowserCreateFailed;
+        v.browser = browser;
+        v.cef_id = browserInt(browser, "get_identifier");
+        applyA11yState(v);
+        try self.allocBuffer(v);
+        self.post(proto.EvWebextPopup{
+            .owner_view = v.popup_owner,
+            .popup_view = v.id,
+            .state = proto.webext_popup_opened,
+            .detail = url_utf8,
+        });
     }
 
     /// One `tabs.on*` event, to every enabled extension's background
@@ -3018,7 +3263,7 @@ pub const Host = struct {
     /// while pages are already open.
     fn injectContentScriptsAll(self: *Host, e: *webexthost.Extension) void {
         for (self.views.items) |v| {
-            if (v.webext_bg or v.discarded or v.browser == null) continue;
+            if (v.webext_bg or v.webext_popup or v.webext_origin or v.discarded or v.browser == null) continue;
             if (v.url.len == 0) continue;
             const b = v.browser orelse continue;
             const gf = b.get_main_frame orelse continue;
@@ -3038,7 +3283,7 @@ pub const Host = struct {
         frame: *cef.cef_frame_t,
         only_phase: ?manifestRunAt,
     ) void {
-        if (v.webext_bg) return;
+        if (v.webext_bg or v.webext_popup or v.webext_origin) return;
         // A SUBFRAME's own url decides what matches there — an ad iframe
         // on `ads.example` is not the page's origin, and `all_frames`
         // exists precisely to reach it.
@@ -3364,6 +3609,8 @@ pub const Host = struct {
         // the only placement that cannot be stale.
         if (std.mem.eql(u8, r.ns, "webRequest")) webrequest.setBgView(e.id, v.id);
         defer self.gpa.free(result);
+        if (std.mem.eql(u8, r.ns, "browserAction") or std.mem.eql(u8, r.ns, "pageAction") or
+            std.mem.eql(u8, r.ns, "action")) self.postActionsForActiveViews();
         // result is `{"result":..}` or `{"error":..}`; forward the inner
         // value/ok to the frame.
         self.sendExtResult(v, r.req, result);
@@ -7882,6 +8129,11 @@ fn extSchemeCreate(
     // Tracked apart from `same_origin` because the relaxations below are
     // right for package FILES and wrong for the generated paths.
     var strict = false;
+    var first_party_buf: [2048]u8 = undefined;
+    const first_party = if (req.get_first_party_for_cookies) |get|
+        userfreeInto(get(req), &first_party_buf)
+    else
+        "";
     var same_origin = frame == null;
     if (frame) |f| {
         if (f.*.get_url) |fu| {
@@ -7896,6 +8148,15 @@ fn extSchemeCreate(
             if (!same_origin and is_navigation and
                 (furl.len == 0 or std.mem.startsWith(u8, furl, "about:"))) same_origin = true;
         } else same_origin = true;
+    }
+    // CEF may expose the requesting frame's PREVIOUS url while parser-
+    // blocking extension scripts are fetched. The request's first-party
+    // url already names the committed top-level extension document, and
+    // matching the exact target host keeps this strict: ordinary, blank,
+    // data and another extension's origin still fail.
+    if (!strict and std.mem.eql(u8, extassets.urlHost(first_party), host)) {
+        strict = true;
+        same_origin = true;
     }
     if (!same_origin) {
         var pats: [32][]const u8 = undefined;
@@ -9452,7 +9713,7 @@ fn onAcceleratedPaint(
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     // A hidden background page is never announced to the client.
-    if (v.webext_bg) return;
+    if (v.webext_bg or v.webext_popup) return;
     // `[*c]` field access leaks back into C-pointer land (`&x.*.planes`
     // is a pointer to the whole array), so bind a real Zig pointer once.
     const inf: *const cef.cef_accelerated_paint_info_t = @ptrCast(info orelse return);
@@ -9540,7 +9801,7 @@ fn onAddressChange(
     const v = viewOf(browser) orelse return;
     var s = Utf8.init(url);
     defer s.free();
-    if (v.webext_bg) return;
+    if (v.webext_bg or v.webext_popup) return;
     host.setUrl(v, s.slice());
     host.postNavState(v);
 }
@@ -9554,7 +9815,7 @@ fn onTitleChange(
     const v = viewOf(browser) orelse return;
     var s = Utf8.init(title);
     defer s.free();
-    if (v.webext_bg) return;
+    if (v.webext_bg or v.webext_popup) return;
     host.post(proto.EvTitle{ .view = v.id, .title = s.slice() });
 }
 
@@ -9675,9 +9936,12 @@ pub fn openBrowsers() usize {
 
 fn onBeforeClose(
     _: [*c]cef.cef_life_span_handler_t,
-    _: [*c]cef.cef_browser_t,
+    browser: [*c]cef.cef_browser_t,
 ) callconv(.c) void {
     if (open_browsers > 0) open_browsers -= 1;
+    const host = g_host orelse return;
+    const v = viewOf(browser) orelse return;
+    if (v.webext_popup and v.browser != null) host.popupClosedByEngine(v.id);
 }
 
 fn onAfterCreated(
@@ -9729,6 +9993,10 @@ fn onLoadingStateChange(
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     if (v.webext_bg) return;
+    if (v.webext_popup) {
+        applyZoom(v);
+        return;
+    }
     host.post(proto.EvNavState{
         .view = v.id,
         .can_back = if (can_back != 0) 1 else 0,
@@ -9749,7 +10017,7 @@ fn onLoadStart(
     // A hidden background page never faces the client: no zoom, no load
     // events. Its scripts arrive at load end (or, on the origin path,
     // from the document itself).
-    if (v.webext_bg) return;
+    if (v.webext_bg or v.webext_popup) return;
     const f = frame orelse return;
     const main = isMainFrame(frame);
     // A SUBFRAME reaches this hook too, and only for the extension
@@ -9798,6 +10066,7 @@ fn onLoadEnd(
     host.injectMatchingExtensions(v, f, .document_end);
     host.injectMatchingExtensions(v, f, .document_idle);
     if (!main) return;
+    if (v.webext_popup) return;
     host.post(proto.EvLoad{
         .view = v.id,
         .state = @intFromEnum(proto.LoadState.finished),
@@ -9824,11 +10093,21 @@ fn onLoadError(
     defer url.free();
     var msg = Utf8.init(text);
     defer msg.free();
-    if (v.webext_bg) {
+    if (v.webext_bg or v.webext_popup) {
         // A background page faces no client, so its load failures used
         // to go nowhere at all — and "the extension is enabled but does
         // nothing" is exactly the silent failure this whole area is
         // full of. Surfaced as a console frame, which the client logs.
+        if (v.webext_popup) {
+            host.post(proto.EvWebextPopup{
+                .owner_view = v.popup_owner,
+                .popup_view = v.id,
+                .state = proto.webext_popup_error,
+                .detail = msg.slice(),
+            });
+            host.removePopupView(v);
+            return;
+        }
         var buf: [512]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "[webext] background load failed ({d}) {s}: {s}", .{
             @as(i32, @intCast(code)), url.slice(), msg.slice(),

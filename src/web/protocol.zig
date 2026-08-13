@@ -162,6 +162,10 @@ pub const CAP_READER_IDS = "reader-ids";
 /// request with a client-minted id, and answers with a correlated
 /// `sem_result`. Existing semantic frame layouts remain unchanged.
 pub const CAP_SEMANTIC_REQUEST_IDS = "semantic-request-ids";
+/// The helper reports the enabled browser actions for the active page,
+/// accepts trusted toolbar activations, and presents declared popups as
+/// dedicated extension-page views (0xB7-0xB9).
+pub const CAP_WEBEXT_ACTION = "webext-action";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -259,7 +263,10 @@ pub const Tag = enum(u8) {
     webext_wreq_stats_req = 0xB4,
     ev_webext_wreq_stats = 0xB5,
     webext_tabs = 0xB6,
-    // 0xB7-0xBF stay reserved for the WebExtensions block.
+    ev_webext_actions = 0xB7,
+    webext_action_activate = 0xB8,
+    ev_webext_popup = 0xB9,
+    // 0xBA-0xBF stay reserved for the WebExtensions block.
     //
     // NOTE for anyone reading the 0xB4-0xBF reservation as originally
     // written: there is deliberately NO `webext_request` /
@@ -2387,6 +2394,44 @@ pub const WebextTabs = struct {
     tabs_json: []const u8,
 };
 
+/// Replace-all action list for one active client view. `actions_json` is
+/// an array of `{id,title,icon,badge,enabled,popup}` objects.
+pub const EvWebextActions = struct {
+    pub const tag: Tag = .ev_webext_actions;
+    view: u32,
+    actions_json: []const u8,
+};
+
+/// A trusted GTK toolbar click. The helper validates the extension and
+/// active mirrored tab before opening its popup or firing onClicked.
+pub const WebextActionActivate = struct {
+    pub const tag: Tag = .webext_action_activate;
+    view: u32,
+    id: []const u8,
+    popup_view: u32,
+    w: u16,
+    h: u16,
+    scale_x1000: u16,
+};
+
+/// Popup lifecycle. `state` is `opened`, `closed` or `error`; `detail`
+/// names the extension-page URL on open and the failure on error.
+pub const EvWebextPopup = struct {
+    pub const tag: Tag = .ev_webext_popup;
+    owner_view: u32,
+    popup_view: u32,
+    state: u8,
+    detail: []const u8,
+};
+
+pub const webext_popup_opened: u8 = 1;
+pub const webext_popup_closed: u8 = 2;
+pub const webext_popup_error: u8 = 3;
+
+/// First client-minted extension popup id. Background pages start at
+/// 0x50000000, so this range cannot alias helper-owned hidden views.
+pub const WEBEXT_POPUP_VIEW_BASE: u32 = 0x6000_0000;
+
 // ---------------------------------------------------------------------
 // Primitive writers
 // ---------------------------------------------------------------------
@@ -2880,6 +2925,21 @@ test "round-trip: webext frames" {
         .tabs_json =
         \\[{"id":3,"view":1,"windowId":0,"index":0,"active":true,"focusedWindow":true,"url":"https://a.test/","title":"A","loading":false}]
         ,
+    });
+    try roundTrip(EvWebextActions, .{ .view = 7, .actions_json = "[{\"id\":\"ext\"}]" });
+    try roundTrip(WebextActionActivate, .{
+        .view = 7,
+        .id = "ext",
+        .popup_view = WEBEXT_POPUP_VIEW_BASE + 1,
+        .w = 360,
+        .h = 420,
+        .scale_x1000 = 1500,
+    });
+    try roundTrip(EvWebextPopup, .{
+        .owner_view = 7,
+        .popup_view = WEBEXT_POPUP_VIEW_BASE + 1,
+        .state = webext_popup_opened,
+        .detail = "sketerm-extension://0123456789abcdef/popup.html",
     });
     try roundTrip(WebextWreqStatsReq, .{});
     try roundTrip(EvWebextWreqStats, .{

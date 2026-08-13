@@ -179,10 +179,28 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) ParseError!Manifest {
             var act = BrowserAction{};
             act.default_title = dupStr(a, o.get("default_title"));
             act.default_popup = dupStr(a, o.get("default_popup"));
-            // default_icon may be a string or an object of sizes; take a
-            // string form when present, else leave null.
+            // default_icon may be a string or an object keyed by size.
+            // Prefer the largest toolbar-sized entry, then any entry.
             if (o.get("default_icon")) |di| {
-                if (di == .string) act.default_icon = a.dupe(u8, di.string) catch return error.OutOfMemory;
+                if (di == .string) {
+                    act.default_icon = a.dupe(u8, di.string) catch return error.OutOfMemory;
+                } else if (di == .object) {
+                    var best: ?[]const u8 = null;
+                    var best_size: u32 = 0;
+                    var best_fits = false;
+                    var it = di.object.iterator();
+                    while (it.next()) |entry| {
+                        if (entry.value_ptr.* != .string) continue;
+                        const size = std.fmt.parseInt(u32, entry.key_ptr.*, 10) catch 0;
+                        const fits = size <= 64;
+                        if (best == null or (fits and (!best_fits or size > best_size))) {
+                            best = entry.value_ptr.string;
+                            best_size = size;
+                            best_fits = fits;
+                        }
+                    }
+                    if (best) |path| act.default_icon = a.dupe(u8, path) catch return error.OutOfMemory;
+                }
             }
             m.browser_action = act;
         }
@@ -349,6 +367,16 @@ test "parse: rejects MV3 and missing fields" {
         \\{"manifest_version":2,"name":"x"}
     ));
     try t.expectError(error.BadJson, parse(gpa, "not json"));
+}
+
+test "parse: browser action chooses a toolbar-sized icon" {
+    const gpa = t.allocator;
+    var m = try parse(gpa,
+        \\{"manifest_version":2,"name":"Icons","version":"1",
+        \\ "browser_action":{"default_icon":{"128":"i128.png","16":"i16.png","32":"i32.png"}}}
+    );
+    defer m.deinit();
+    try t.expectEqualStrings("i32.png", m.browser_action.?.default_icon.?);
 }
 
 test "deriveId is stable, hex and version-independent" {

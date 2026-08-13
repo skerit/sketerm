@@ -58,6 +58,7 @@ const axtree = @import("web/axtree.zig");
 const socks5 = @import("ipc/socks5.zig");
 const zip = @import("web/webext/zip.zig");
 const filtersub = @import("web/filtersub.zig");
+const extmanifest = @import("web/webext/manifest.zig");
 
 /// `SKETERM_SMOKE_WEB_CONSOLE=1` echoes every page console message.
 /// Off by default because 30-odd stages would drown in Chromium noise;
@@ -849,6 +850,22 @@ const Client = struct {
     ack_webext: bool = false,
     ack_webext_tabs: bool = false,
     ack_filter_subscribe: bool = false,
+    ack_webext_action: bool = false,
+
+    action_seq: u32 = 0,
+    action_view: u32 = 0,
+    action_json: [4096]u8 = @splat(0),
+    action_json_len: usize = 0,
+    ext_popup_seq: u32 = 0,
+    ext_popup_owner: u32 = 0,
+    ext_popup_view: u32 = 0,
+    ext_popup_state: u8 = 0,
+    ext_popup_detail: [2048]u8 = @splat(0),
+    ext_popup_detail_len: usize = 0,
+    ext_popup_fb: ?proto.FrameBuffer = null,
+    ext_popup_fb_fd: c_int = -1,
+    ext_popup_fb_seq: u32 = 0,
+    ext_popup_dmg_seq: u32 = 0,
 
     /// Last `ev_webext_state` observed (one extension in the stage).
     we_ok: u8 = 0xff,
@@ -1096,6 +1113,10 @@ const Client = struct {
     /// engine actually reported instead of just the last value.
     ax_caret_log: [4 * 1024]u8 = @splat(0),
     ax_caret_log_len: usize = 0,
+    /// Only context teardown enables this: CEF may terminate on a signal
+    /// after the last context-backed browser closes, which the stage's
+    /// tolerant reaper already accepts.
+    teardown_allow_close: bool = false,
 
     fn deinit(self: *Client) void {
         if (self.ax_mirror_live) {
@@ -1106,6 +1127,7 @@ const Client = struct {
         self.unmap();
         if (self.fb_fd >= 0) _ = c.close(self.fb_fd);
         if (self.dev_fb_fd >= 0) _ = c.close(self.dev_fb_fd);
+        if (self.ext_popup_fb_fd >= 0) _ = c.close(self.ext_popup_fb_fd);
         for (self.fds[0..self.nfds]) |fd| _ = c.close(fd);
         self.in.deinit(self.gpa);
         if (self.fd >= 0) _ = c.close(self.fd);
@@ -1144,7 +1166,7 @@ const Client = struct {
     /// Ask the helper for one frame, at most `min_gap_us` after the
     /// previous request.
     fn frameRequest(self: *Client, min_gap_us: i64) void {
-        if (!self.have_view) return;
+        if (!self.have_view or self.fd < 0) return;
         const now = nowUs();
         if (now - self.last_req_us < min_gap_us) return;
         self.last_req_us = now;
@@ -1153,12 +1175,15 @@ const Client = struct {
         // An inspector is an ordinary view: it paints when somebody
         // asks, exactly like the page it inspects.
         if (self.dev_view != 0) self.send(proto.FrameRequest{ .view = self.dev_view, .flags = 0 });
+        if (self.ext_popup_view != 0 and self.ext_popup_state == proto.webext_popup_opened)
+            self.send(proto.FrameRequest{ .view = self.ext_popup_view, .flags = 0 });
     }
 
     /// Wait for helper output while driving frames at ~120Hz — what the
     /// GUI's active tick does, and what every stage below needs in
     /// order to see any paint at all.
     fn pump(self: *Client, timeout_ms: c_int) void {
+        if (self.fd < 0) return;
         const deadline = nowMs() + timeout_ms;
         while (true) {
             self.frameRequest(8_000);
@@ -1231,10 +1256,22 @@ const Client = struct {
         mh.msg_controllen = cbuf.len;
 
         const n = c.recvmsg(self.fd, &mh, 0);
-        if (n == 0) fail("helper closed the socket");
+        if (n == 0) {
+            if (self.teardown_allow_close) {
+                _ = c.close(self.fd);
+                self.fd = -1;
+                return false;
+            }
+            fail("helper closed the socket");
+        }
         if (n < 0) {
             const e = std.c._errno().*;
             if (e == c.EINTR or e == c.EAGAIN) return false;
+            if (self.teardown_allow_close and (e == c.ECONNRESET or e == c.EPIPE)) {
+                _ = c.close(self.fd);
+                self.fd = -1;
+                return false;
+            }
             fail("recvmsg");
         }
         self.harvestFds(&cbuf, @intCast(mh.msg_controllen));
@@ -1312,6 +1349,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.ack_webext = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.ack_webext_tabs = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.ack_filter_subscribe = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_ACTION)) self.ack_webext_action = true;
                 }
             },
             .frame_inline => {
@@ -1447,6 +1485,13 @@ const Client = struct {
                     self.dev_fb_seq += 1;
                     return;
                 }
+                if (fb.view >= proto.WEBEXT_POPUP_VIEW_BASE) {
+                    if (self.ext_popup_fb_fd >= 0) _ = c.close(self.ext_popup_fb_fd);
+                    self.ext_popup_fb_fd = fd;
+                    self.ext_popup_fb = fb;
+                    self.ext_popup_fb_seq += 1;
+                    return;
+                }
                 self.unmap();
                 if (self.fb_fd >= 0) _ = c.close(self.fb_fd);
                 self.fb_fd = fd;
@@ -1481,6 +1526,10 @@ const Client = struct {
                 defer self.gpa.free(d.rects);
                 if (self.dev_view != 0 and d.view == self.dev_view) {
                     self.dev_dmg_seq += 1;
+                    return;
+                }
+                if (self.ext_popup_view != 0 and d.view == self.ext_popup_view) {
+                    self.ext_popup_dmg_seq += 1;
                     return;
                 }
                 self.dmg_buf = d.buf_id;
@@ -1528,6 +1577,22 @@ const Client = struct {
                 @memcpy(self.we_name[0..self.we_name_len], st.name[0..self.we_name_len]);
                 self.we_err_len = @min(st.err.len, self.we_err.len);
                 @memcpy(self.we_err[0..self.we_err_len], st.err[0..self.we_err_len]);
+            },
+            .ev_webext_actions => {
+                const ev = proto.decode(proto.EvWebextActions, frame.payload) catch fail("ev_webext_actions decode");
+                self.action_view = ev.view;
+                self.action_json_len = @min(ev.actions_json.len, self.action_json.len);
+                @memcpy(self.action_json[0..self.action_json_len], ev.actions_json[0..self.action_json_len]);
+                self.action_seq += 1;
+            },
+            .ev_webext_popup => {
+                const ev = proto.decode(proto.EvWebextPopup, frame.payload) catch fail("ev_webext_popup decode");
+                self.ext_popup_owner = ev.owner_view;
+                self.ext_popup_view = ev.popup_view;
+                self.ext_popup_state = ev.state;
+                self.ext_popup_detail_len = @min(ev.detail.len, self.ext_popup_detail.len);
+                @memcpy(self.ext_popup_detail[0..self.ext_popup_detail_len], ev.detail[0..self.ext_popup_detail_len]);
+                self.ext_popup_seq += 1;
             },
             .ev_webext_wreq_stats => {
                 const st = proto.decode(proto.EvWebextWreqStats, frame.payload) catch fail("ev_webext_wreq_stats decode");
@@ -1726,9 +1791,13 @@ const Client = struct {
 
     /// Evaluate `code` and wait for the answer; returns the raw JSON.
     fn evalWait(self: *Client, code: []const u8, want_await: bool, timeout_ms: i64) []const u8 {
+        return self.evalWaitView(view_id, code, want_await, timeout_ms);
+    }
+
+    fn evalWaitView(self: *Client, view: u32, code: []const u8, want_await: bool, timeout_ms: i64) []const u8 {
         const seq = self.eval_seq;
         self.send(proto.SemEval{
-            .view = view_id,
+            .view = view,
             .flags = if (want_await) proto.eval_flag_await else 0,
             .timeout_ms = 5000,
             .code = .{ .s = code },
@@ -3153,6 +3222,370 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         cl.deinit(); // close the socket so the helper disconnects and exits
         reapHelperTolerant(pid, "stage 33 webext run 2", 30_000);
     }
+}
+
+// ---------------------------------------------------------------------
+// Stage 40: browser-action toolbar activations and extension popups
+// ---------------------------------------------------------------------
+
+const action_manifest =
+    \\{"manifest_version":2,"name":"sketerm action fixture","version":"1",
+    \\ "browser_specific_settings":{"gecko":{"id":"action@sketerm.test"}},
+    \\ "permissions":["tabs"],
+    \\ "background":{"scripts":["bg.js"],"persistent":true},
+    \\ "browser_action":{"default_title":"Action Default","default_popup":"popup.html"}}
+;
+
+const action_bg =
+    \\browser.browserAction.onClicked.addListener(function (tab) {
+    \\  browser.browserAction.setBadgeText({ tabId: tab.id, text: "C" });
+    \\});
+;
+
+const action_popup =
+    \\<!doctype html><html><head><title>action popup</title></head><body>
+    \\<script>
+    \\document.body.textContent = "popup:" + browser.runtime.getManifest().name;
+    \\</script></body></html>
+;
+
+const no_popup_manifest =
+    \\{"manifest_version":2,"name":"sketerm click fixture","version":"1",
+    \\ "browser_specific_settings":{"gecko":{"id":"click@sketerm.test"}},
+    \\ "background":{"scripts":["bg.js"],"persistent":true},
+    \\ "browser_action":{"default_title":"Click Action"}}
+;
+
+const no_popup_bg =
+    \\browser.browserAction.onClicked.addListener(function (tab) {
+    \\  browser.browserAction.setBadgeText({ tabId: tab.id, text: "K" });
+    \\});
+;
+
+const missing_popup_manifest =
+    \\{"manifest_version":2,"name":"sketerm missing popup fixture","version":"1",
+    \\ "browser_specific_settings":{"gecko":{"id":"missing@sketerm.test"}},
+    \\ "browser_action":{"default_title":"Missing Popup","default_popup":"gone.html"}}
+;
+
+fn writeActionFixture(dir: []const u8, manifest_json: []const u8, background: []const u8, popup: ?[]const u8) bool {
+    mkdirZ(dir);
+    return writeFile(dir, "manifest.json", manifest_json) and
+        (background.len == 0 or writeFile(dir, "bg.js", background)) and
+        (popup == null or writeFile(dir, "popup.html", popup.?));
+}
+
+fn actionListHas(cl: *Client, id: []const u8, title: []const u8, popup: bool, badge: []const u8) bool {
+    const json = cl.action_json[0..cl.action_json_len];
+    var parsed = std.json.parseFromSlice(std.json.Value, cl.gpa, json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .array) return false;
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        const o = item.object;
+        const got_id = o.get("id") orelse continue;
+        if (got_id != .string or !std.mem.eql(u8, got_id.string, id)) continue;
+        const got_title = o.get("title") orelse return false;
+        const got_popup = o.get("popup") orelse return false;
+        const got_badge = o.get("badge") orelse return false;
+        return got_title == .string and std.mem.eql(u8, got_title.string, title) and
+            got_popup == .bool and got_popup.bool == popup and
+            got_badge == .string and std.mem.eql(u8, got_badge.string, badge);
+    }
+    return false;
+}
+
+fn waitAction(cl: *Client, id: []const u8, title: []const u8, popup: bool, badge: []const u8, timeout_ms: i64) bool {
+    return waitActionView(cl, view_id, id, title, popup, badge, timeout_ms);
+}
+
+fn waitActionView(cl: *Client, view: u32, id: []const u8, title: []const u8, popup: bool, badge: []const u8, timeout_ms: i64) bool {
+    const deadline = nowMs() + timeout_ms;
+    while (true) {
+        if (cl.action_view == view and actionListHas(cl, id, title, popup, badge)) return true;
+        if (nowMs() > deadline) return false;
+        cl.pump(50);
+    }
+}
+
+fn waitExtPopupState(cl: *Client, popup_view: u32, state: u8, timeout_ms: i64) bool {
+    const deadline = nowMs() + timeout_ms;
+    while (true) {
+        if (cl.ext_popup_view == popup_view and cl.ext_popup_state == state) return true;
+        if (nowMs() > deadline) return false;
+        cl.pump(50);
+    }
+}
+
+fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var data_buf: [4096]u8 = undefined;
+    const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/acdata", .{dir}) catch fail("stage 40 data path");
+    mkdirZ(data_dir);
+    _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
+    var cache_buf: [4096]u8 = undefined;
+    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/accache", .{dir}) catch fail("stage 40 cache path");
+    mkdirZ(cache_dir);
+
+    var popup_dir_buf: [4096]u8 = undefined;
+    var click_dir_buf: [4096]u8 = undefined;
+    var missing_dir_buf: [4096]u8 = undefined;
+    const popup_dir = std.fmt.bufPrint(&popup_dir_buf, "{s}/acpopup", .{dir}) catch fail("stage 40 popup fixture path");
+    const click_dir = std.fmt.bufPrint(&click_dir_buf, "{s}/acclick", .{dir}) catch fail("stage 40 click fixture path");
+    const missing_dir = std.fmt.bufPrint(&missing_dir_buf, "{s}/acmissing", .{dir}) catch fail("stage 40 missing fixture path");
+    if (!writeActionFixture(popup_dir, action_manifest, action_bg, action_popup)) fail("stage 40: could not write popup fixture");
+    if (!writeActionFixture(click_dir, no_popup_manifest, no_popup_bg, action_popup)) fail("stage 40: could not write click fixture");
+    if (!writeActionFixture(missing_dir, missing_popup_manifest, "", null)) fail("stage 40: could not write missing fixture");
+
+    var srv = HttpProbe{ .body = "<!doctype html><title>action page</title><body>ordinary page</body>" };
+    if (!srv.start()) fail("stage 40: loopback HTTP server would not start");
+    defer srv.shutdown();
+    var page_buf: [96]u8 = undefined;
+    const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/p", .{srv.port}) catch fail("stage 40 page url");
+
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ac.sock", .{dir}) catch fail("stage 40 socket path");
+    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", false);
+    g_pid = pid;
+    var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+    {
+        const deadline = nowMs() + 15_000;
+        while (cl.ack_proto == 0 and nowMs() < deadline) cl.pump(100);
+    }
+    if (!cl.ack_webext_action) fail("stage 40: hello_ack lacks the webext-action capability");
+
+    cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+    cl.have_view = true;
+    if (!cl.waitBufferAfter(0, 20_000)) fail("stage 40: no frame_buffer for the page view");
+    cl.send(proto.Navigate{ .view = view_id, .url = page_url });
+    cl.sendTabs(&.{.{ .id = 40, .view = view_id, .active = true, .url = page_url, .title = "action" }});
+
+    cl.send(proto.WebextSet{ .id = "action@sketerm.test", .dir = popup_dir, .enabled = 1 });
+    cl.send(proto.WebextSet{ .id = "click@sketerm.test", .dir = click_dir, .enabled = 1 });
+    cl.send(proto.WebextSet{ .id = "missing@sketerm.test", .dir = missing_dir, .enabled = 1 });
+    if (!waitAction(&cl, "action@sketerm.test", "Action Default", true, "", 15_000))
+        fail("stage 40: popup action was not reported for the active page");
+    if (!waitAction(&cl, "click@sketerm.test", "Click Action", false, "", 15_000))
+        fail("stage 40: no-popup action was not reported for the active page");
+    {
+        const deadline = nowMs() + 1200;
+        while (nowMs() < deadline) cl.pump(50);
+    }
+
+    // A stale/background page cannot activate an action for the mirrored
+    // tab, and a requested popup always receives a lifecycle answer.
+    const rejected_view = proto.WEBEXT_POPUP_VIEW_BASE + 1;
+    cl.send(proto.WebextActionActivate{
+        .view = 99,
+        .id = "action@sketerm.test",
+        .popup_view = rejected_view,
+        .w = 360,
+        .h = 420,
+        .scale_x1000 = 1000,
+    });
+    if (!waitExtPopupState(&cl, rejected_view, proto.webext_popup_error, 10_000))
+        fail("stage 40: rejected popup activation produced no lifecycle error");
+    if (cl.ext_popup_fb_seq != 0) fail("stage 40: a stale/background view created a popup buffer");
+
+    const popup_view = proto.WEBEXT_POPUP_VIEW_BASE + 2;
+    cl.send(proto.WebextActionActivate{
+        .view = view_id,
+        .id = "action@sketerm.test",
+        .popup_view = popup_view,
+        .w = 360,
+        .h = 420,
+        .scale_x1000 = 1000,
+    });
+    if (!waitExtPopupState(&cl, popup_view, proto.webext_popup_opened, 20_000))
+        fail("stage 40: trusted toolbar activation did not open the declared popup");
+    if (cl.ext_popup_detail_len == 0 or
+        std.mem.indexOf(u8, cl.ext_popup_detail[0..cl.ext_popup_detail_len], "/popup.html") == null)
+        fail("stage 40: popup lifecycle did not name its extension page");
+    {
+        const deadline = nowMs() + 20_000;
+        while ((cl.ext_popup_fb_seq == 0 or cl.ext_popup_dmg_seq == 0) and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.ext_popup_fb_seq == 0 or cl.ext_popup_dmg_seq == 0)
+        fail("stage 40: the real extension popup never painted");
+    var manifest_ok = false;
+    var manifest_last: []const u8 = "";
+    const manifest_deadline = nowMs() + 15_000;
+    while (!manifest_ok and nowMs() < manifest_deadline) {
+        const manifest_result = cl.evalWaitView(
+            popup_view,
+            "typeof browser==='object' ? browser.runtime.getManifest().name : 'not-ready'",
+            false,
+            5000,
+        );
+        manifest_last = manifest_result;
+        manifest_ok = std.mem.indexOf(u8, manifest_result, "\"value\":\"sketerm action fixture\"") != null;
+        if (!manifest_ok) cl.pump(100);
+    }
+    if (!manifest_ok) {
+        std.debug.print("stage 40: popup manifest eval returned {s}\n", .{manifest_last});
+        fail("stage 40: popup extension origin did not receive runtime.getManifest");
+    }
+    pass("stage 40a trusted browser action opens a painted extension-origin popup with runtime APIs");
+
+    cl.send(proto.ViewDestroy{ .view = popup_view });
+    if (!waitExtPopupState(&cl, popup_view, proto.webext_popup_closed, 10_000))
+        fail("stage 40: client popup close did not produce a lifecycle close");
+
+    cl.send(proto.WebextActionActivate{
+        .view = view_id,
+        .id = "click@sketerm.test",
+        .popup_view = 0,
+        .w = 0,
+        .h = 0,
+        .scale_x1000 = 1000,
+    });
+    if (!waitAction(&cl, "click@sketerm.test", "Click Action", false, "K", 10_000))
+        fail("stage 40: no-popup activation did not fire browserAction.onClicked");
+    pass("stage 40b action without a popup fires onClicked for the active tab");
+
+    const missing_view = proto.WEBEXT_POPUP_VIEW_BASE + 3;
+    cl.send(proto.WebextActionActivate{
+        .view = view_id,
+        .id = "missing@sketerm.test",
+        .popup_view = missing_view,
+        .w = 360,
+        .h = 420,
+        .scale_x1000 = 1000,
+    });
+    if (!waitExtPopupState(&cl, missing_view, proto.webext_popup_error, 10_000))
+        fail("stage 40: missing popup asset produced no error lifecycle");
+    if (std.mem.indexOf(u8, cl.ext_popup_detail[0..cl.ext_popup_detail_len], "not found") == null)
+        fail("stage 40: missing popup error did not explain the missing asset");
+    pass("stage 40c missing popup asset fails visibly without creating a view");
+
+    var host_buf: [16]u8 = undefined;
+    const origin_host = extmanifest.originHost("action@sketerm.test", &host_buf);
+    var fetch_buf: [512]u8 = undefined;
+    const fetch_probe = std.fmt.bufPrint(&fetch_buf,
+        "(async()=>{{try{{let r=await fetch('sketerm-extension://{s}/__sketerm-extapi.js');return [r.status,await r.text()]}}catch(e){{return [0,String(e)]}}}})()",
+        .{origin_host},
+    ) catch fail("stage 40 fetch probe");
+    const ordinary_fetch = cl.evalWaitView(view_id, fetch_probe, true, 10_000);
+    if (std.mem.indexOf(u8, ordinary_fetch, "200") != null or
+        std.mem.indexOf(u8, ordinary_fetch, "ext-inject") != null or
+        std.mem.indexOf(u8, ordinary_fetch, "tok") != null)
+        fail("stage 40: an ordinary page fetched the privileged extension bootstrap");
+    const globals_probe = "[typeof browser,typeof(globalThis.chrome&&chrome.runtime),typeof(globalThis.chrome&&chrome.browserAction)]";
+    const ordinary_globals = cl.evalWaitView(view_id, globals_probe, false, 10_000);
+    if (std.mem.indexOf(u8, ordinary_globals, "\"value\":[\"undefined\",\"undefined\",\"undefined\"]") == null)
+        fail("stage 40: an ordinary page received extension globals");
+
+    const blank_view: u32 = 41;
+    var load_before = cl.load_seq;
+    cl.send(proto.ViewCreate{ .view = blank_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+    {
+        const deadline = nowMs() + 20_000;
+        while (cl.load_seq == load_before and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.load_seq == load_before) fail("stage 40: about:blank view never loaded");
+    const blank_fetch = cl.evalWaitView(blank_view, fetch_probe, true, 10_000);
+    if (std.mem.indexOf(u8, blank_fetch, "200") != null or
+        std.mem.indexOf(u8, blank_fetch, "ext-inject") != null or
+        std.mem.indexOf(u8, blank_fetch, "tok") != null)
+        fail("stage 40: about:blank fetched the privileged extension bootstrap");
+    load_before = cl.load_seq;
+    cl.send(proto.Navigate{ .view = blank_view, .url = "data:text/html,<title>data-probe</title>data" });
+    {
+        const deadline = nowMs() + 20_000;
+        while (cl.load_seq == load_before and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.load_seq == load_before) fail("stage 40: data URL view never loaded");
+    const data_fetch = cl.evalWaitView(blank_view, fetch_probe, true, 10_000);
+    if (std.mem.indexOf(u8, data_fetch, "200") != null or
+        std.mem.indexOf(u8, data_fetch, "ext-inject") != null or
+        std.mem.indexOf(u8, data_fetch, "tok") != null)
+        fail("stage 40: a data URL fetched the privileged extension bootstrap");
+    const data_globals = cl.evalWaitView(blank_view, globals_probe, false, 10_000);
+    if (std.mem.indexOf(u8, data_globals, "\"value\":[\"undefined\",\"undefined\",\"undefined\"]") == null)
+        fail("stage 40: a data URL received extension globals");
+    cl.send(proto.ViewDestroy{ .view = blank_view });
+    var click_host_buf: [16]u8 = undefined;
+    const click_host = extmanifest.originHost("click@sketerm.test", &click_host_buf);
+    var foreign_url_buf: [128]u8 = undefined;
+    const foreign_url = std.fmt.bufPrint(&foreign_url_buf, "sketerm-extension://{s}/popup.html", .{click_host}) catch
+        fail("stage 40 foreign extension url");
+    const foreign_view: u32 = 42;
+    load_before = cl.load_seq;
+    cl.send(proto.ViewCreateUrl{
+        .view = foreign_view,
+        .w = 320,
+        .h = 240,
+        .scale_x1000 = 1000,
+        .context = 0,
+        .url = foreign_url,
+    });
+    {
+        const deadline = nowMs() + 20_000;
+        while (cl.load_seq == load_before and nowMs() < deadline) cl.pump(50);
+    }
+    if (cl.load_seq == load_before) fail("stage 40: foreign extension page never loaded");
+    const foreign_fetch = cl.evalWaitView(foreign_view, fetch_probe, true, 10_000);
+    if (std.mem.indexOf(u8, foreign_fetch, "200") != null or
+        std.mem.indexOf(u8, foreign_fetch, "ext-inject") != null or
+        std.mem.indexOf(u8, foreign_fetch, "tok") != null)
+        fail("stage 40: one extension fetched another extension's bootstrap");
+    cl.send(proto.ViewDestroy{ .view = foreign_view });
+    pass("stage 40d ordinary, about:blank, data and foreign-extension origins cannot read the privileged bootstrap");
+
+    const owner_view: u32 = 43;
+    cl.send(proto.ViewCreate{ .view = owner_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+    cl.sendTabs(&.{
+        .{ .id = 40, .view = view_id, .active = false, .url = page_url, .title = "action" },
+        .{ .id = 43, .view = owner_view, .active = true, .url = page_url, .title = "owner" },
+    });
+    if (!waitActionView(&cl, owner_view, "action@sketerm.test", "Action Default", true, "", 10_000))
+        fail("stage 40: action snapshot did not follow the active owner view");
+    const owner_popup = proto.WEBEXT_POPUP_VIEW_BASE + 4;
+    cl.send(proto.WebextActionActivate{
+        .view = owner_view,
+        .id = "action@sketerm.test",
+        .popup_view = owner_popup,
+        .w = 360,
+        .h = 420,
+        .scale_x1000 = 1000,
+    });
+    if (!waitExtPopupState(&cl, owner_popup, proto.webext_popup_opened, 20_000))
+        fail("stage 40: owner popup did not open");
+    cl.send(proto.ViewDestroy{ .view = owner_view });
+    if (!waitExtPopupState(&cl, owner_popup, proto.webext_popup_closed, 10_000))
+        fail("stage 40: destroying the owner did not close its popup");
+    pass("stage 40e destroying a page closes every popup it owns");
+
+    cl.sendTabs(&.{.{ .id = 40, .view = view_id, .active = true, .url = page_url, .title = "action" }});
+    if (!waitAction(&cl, "action@sketerm.test", "Action Default", true, "", 10_000))
+        fail("stage 40: action snapshot did not return to the original page");
+
+    const popup_view_2 = proto.WEBEXT_POPUP_VIEW_BASE + 5;
+    cl.send(proto.WebextActionActivate{
+        .view = view_id,
+        .id = "action@sketerm.test",
+        .popup_view = popup_view_2,
+        .w = 360,
+        .h = 420,
+        .scale_x1000 = 1000,
+    });
+    if (!waitExtPopupState(&cl, popup_view_2, proto.webext_popup_opened, 20_000))
+        fail("stage 40: second popup did not open before extension teardown");
+    cl.send(proto.WebextRemove{ .id = "action@sketerm.test" });
+    if (!waitExtPopupState(&cl, popup_view_2, proto.webext_popup_closed, 10_000))
+        fail("stage 40: removing an extension did not close its popup");
+    pass("stage 40f extension removal closes its live popup");
+
+    cl.send(proto.WebextRemove{ .id = "click@sketerm.test" });
+    cl.send(proto.WebextRemove{ .id = "missing@sketerm.test" });
+    cl.send(proto.ViewDestroy{ .view = view_id });
+    cl.have_view = false;
+    {
+        const deadline = nowMs() + 2500;
+        while (nowMs() < deadline) cl.pump(50);
+    }
+    cl.deinit();
+    reapHelperTolerant(pid, "stage 40", 30_000);
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -6129,16 +6562,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         ec.send(proto.ViewDestroy{ .view = egress_view_b });
         ec.send(proto.ViewDestroy{ .view = egress_view_c });
         ec.have_view = false;
+        ec.teardown_allow_close = true;
         {
             const d = nowMs() + 4000;
             while (nowMs() < d) ec.pump(50);
         }
-        ec.send(proto.ContextDestroy{ .id = 10 });
-        ec.send(proto.ContextDestroy{ .id = 11 });
-        ec.send(proto.ContextDestroy{ .id = 12 });
-        {
+        if (ec.fd >= 0) {
+            ec.send(proto.ContextDestroy{ .id = 10 });
+            ec.send(proto.ContextDestroy{ .id = 11 });
+            ec.send(proto.ContextDestroy{ .id = 12 });
             const d = nowMs() + 2000;
-            while (nowMs() < d) ec.pump(50);
+            while (nowMs() < d and ec.fd >= 0) ec.pump(50);
         }
         ec.deinit();
         // Reap TOLERANTLY: CEF's cef_shutdown raises a signal whenever
@@ -6260,15 +6694,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         jc.send(proto.ViewDestroy{ .view = jar_view_a });
         jc.send(proto.ViewDestroy{ .view = jar_view_b });
         jc.have_view = false;
+        jc.teardown_allow_close = true;
         {
             const d = nowMs() + 3000;
             while (nowMs() < d) jc.pump(50);
         }
-        jc.send(proto.ContextDestroy{ .id = 20 });
-        jc.send(proto.ContextDestroy{ .id = 21 });
-        {
+        if (jc.fd >= 0) {
+            jc.send(proto.ContextDestroy{ .id = 20 });
+            jc.send(proto.ContextDestroy{ .id = 21 });
             const d = nowMs() + 2000;
-            while (nowMs() < d) jc.pump(50);
+            while (nowMs() < d and jc.fd >= 0) jc.pump(50);
         }
         jc.deinit();
         reapHelperTolerant(jar_pid, "stage 37 jars", 30_000);
@@ -6474,6 +6909,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     // ── Stage 28: WebExtensions foundation ────────────────────────
     runWebextStage(gpa, exe, dir);
+    runActionStage(gpa, exe, dir);
     runWebrequestStage(gpa, exe, dir);
     // ── Stage 35: real MV2 extensions ─────────────────────────────
     runShapeStage(gpa, exe, dir);

@@ -222,6 +222,7 @@ const fpicker = @import("../filebrowser/picker.zig");
 const webstore = @import("webstore.zig");
 const websiteinfo = @import("websiteinfo.zig");
 const webext = @import("webext.zig");
+const webaction = @import("webaction.zig");
 const secrets = @import("secrets.zig");
 const suggest = @import("../util/suggest.zig");
 const urlhost = @import("../web/urlhost.zig");
@@ -451,6 +452,12 @@ pub fn faceByView(view: u32) ?*WebFace {
     return g_client.findFace(view);
 }
 
+/// Resolve a view on its owning client. Auxiliary UI must use this form:
+/// a remote face is not registered on the process-local client.
+pub fn faceByViewOn(cl: *Client, view: u32) ?*WebFace {
+    return cl.findFace(view);
+}
+
 // ---------------------------------------------------------------------
 // App-level popup policy
 // ---------------------------------------------------------------------
@@ -652,6 +659,8 @@ pub const Client = struct {
     /// `sender.tab` can be made real. Without it every extension sees
     /// `tabId = -1`.
     cap_webext_tabs: bool = false,
+    /// The helper exposes browser-action toolbar state and real popups.
+    cap_webext_action: bool = false,
     /// The helper fetches subscribed filter lists itself (0xC4).
     cap_filter_subscribe: bool = false,
     /// Rich reader results and revision-guarded reader actions.
@@ -814,6 +823,7 @@ pub const Client = struct {
         self.cap_filter_subscribe = false;
         self.cap_reader_ids = false;
         self.cap_semantic_request_ids = false;
+        self.cap_webext_action = false;
         if (self.bridge) |br| {
             self.bridge = null;
             br.stop();
@@ -1178,6 +1188,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.cap_frames_inline = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.cap_webext = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.cap_webext_tabs = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_ACTION)) self.cap_webext_action = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.cap_filter_subscribe = true;
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
@@ -1200,10 +1211,21 @@ pub const Client = struct {
                 const st = proto.decode(proto.EvWebextState, frame.payload) catch return;
                 webext.onState(st);
             },
+            .ev_webext_actions => {
+                const ev = proto.decode(proto.EvWebextActions, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onWebextActions(ev.actions_json);
+            },
+            .ev_webext_popup => {
+                const ev = proto.decode(proto.EvWebextPopup, frame.payload) catch return;
+                if (self.findFace(ev.owner_view)) |face| face.onWebextPopup(ev);
+            },
             .frame_buffer => {
                 const fb = proto.decode(proto.FrameBuffer, frame.payload) catch return;
                 const fd = self.takeFd() orelse return;
                 const face = self.findFace(fb.view) orelse {
+                    for (self.faces.items) |candidate| {
+                        if (candidate.adoptWebextPopupBuffer(fb, fd)) return;
+                    }
                     _ = c.close(fd);
                     return;
                 };
@@ -1222,14 +1244,24 @@ pub const Client = struct {
             .frame_damage => {
                 const dmg = proto.FrameDamage.decodeAlloc(frame.payload, self.gpa) catch return;
                 defer self.gpa.free(dmg.rects);
-                const face = self.findFace(dmg.view) orelse return;
-                face.onDamage(dmg);
+                if (self.findFace(dmg.view)) |face| {
+                    face.onDamage(dmg);
+                } else {
+                    for (self.faces.items) |candidate| {
+                        if (candidate.onWebextPopupDamage(dmg)) return;
+                    }
+                }
             },
             .frame_inline => {
                 const fi = proto.FrameInline.decodeAlloc(frame.payload, self.gpa) catch return;
                 defer self.gpa.free(fi.rects);
-                const face = self.findFace(fi.view) orelse return;
-                face.onInline(fi);
+                if (self.findFace(fi.view)) |face| {
+                    face.onInline(fi);
+                } else {
+                    for (self.faces.items) |candidate| {
+                        if (candidate.onWebextPopupInline(fi)) return;
+                    }
+                }
             },
             .ev_title => {
                 const ev = proto.decode(proto.EvTitle, frame.payload) catch return;
@@ -1463,6 +1495,17 @@ fn findFaceGlobal(view: u32) ?*WebFace {
 
 /// Process-wide view-id mint (see `findFaceGlobal`).
 var g_next_view: u32 = 1;
+var g_next_aux_view: u32 = proto.WEBEXT_POPUP_VIEW_BASE;
+
+/// Mint a client-owned auxiliary view id (extension popup). Kept in a
+/// disjoint high range from ordinary views and helper-minted inspectors.
+pub fn nextAuxView() u32 {
+    const id = g_next_aux_view;
+    g_next_aux_view +%= 1;
+    if (g_next_aux_view < proto.WEBEXT_POPUP_VIEW_BASE)
+        g_next_aux_view = proto.WEBEXT_POPUP_VIEW_BASE;
+    return id;
+}
 
 // ---------------------------------------------------------------------
 // Containers — per-tab identity contexts (private cookie jar / cache,
@@ -2828,6 +2871,9 @@ pub const WebFace = struct {
     /// choke point, freed in `deinit`.
     site_btn: *c.GtkWidget = undefined,
     site_info: ?*websiteinfo.SiteInfo = null,
+    /// Extension browser-action buttons for this page and their popup.
+    action_box: *c.GtkWidget = undefined,
+    actions: ?*webaction.Toolbar = null,
     /// The user accepted a certificate interstitial for the CURRENT
     /// origin, so "https" no longer means what the padlock would
     /// otherwise claim. Cleared on every origin change.
@@ -2981,6 +3027,7 @@ pub const WebFace = struct {
         }
         self.view = g_next_view;
         g_next_view += 1;
+        if (self.actions) |a| a.bindView(self.view, self.cl);
         cl.register(self);
         switch (cl.state) {
             .ready => self.onClientReady(),
@@ -3064,6 +3111,7 @@ pub const WebFace = struct {
         // its rows, and so frees the row contexts their GDestroyNotify
         // owns, before anything else lets go.
         if (self.site_info) |si| si.sever(self.widgets_dead);
+        if (self.actions) |a| a.sever(self.widgets_dead);
         // Same mechanism (2: sever at the single choke point) for the
         // pacing sources and the discard countdown, which carry this
         // face as user-data and are not signals, so the disconnect loop
@@ -3152,6 +3200,11 @@ pub const WebFace = struct {
             si.sever(self.widgets_dead);
             si.destroy();
             self.site_info = null;
+        }
+        if (self.actions) |a| {
+            a.sever(self.widgets_dead);
+            a.destroy();
+            self.actions = null;
         }
         self.stopDiscardTimer();
         self.stopDlTimer();
@@ -4385,6 +4438,11 @@ pub const WebFace = struct {
         self.star_btn = toolbtn.barButton(bar, "non-starred-symbolic", "Bookmark", "Bookmark this page", &onStar, self);
         self.track(self.star_btn);
 
+        self.action_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0).?;
+        c.gtk_widget_set_visible(self.action_box, 0);
+        c.gtk_box_append(@ptrCast(bar), self.action_box);
+        self.actions = webaction.Toolbar.create(self.allocator, self.action_box);
+
         // Reader mode. A toggle, because it is a state of the pane and
         // not an action: pressed = the article is showing.
         self.reader_btn = toolbtn.barToggle(
@@ -4971,6 +5029,7 @@ pub const WebFace = struct {
         self.noteRevived();
         self.devtools_pending = false;
         self.dropMap();
+        if (self.actions) |a| a.helperGone();
         self.sent_w = 0;
         self.sent_h = 0;
         // An attached view belonged to the OLD helper process; its id
@@ -4996,6 +5055,7 @@ pub const WebFace = struct {
         self.noteRevived();
         self.devtools_pending = false;
         self.dropMap();
+        if (self.actions) |a| a.helperGone();
         if (self.attached) {
             self.onDevToolsLost();
             return;
@@ -6143,6 +6203,34 @@ pub const WebFace = struct {
         if (self.widgets_dead) return null;
         const root = c.gtk_widget_get_root(self.root_box) orelse return null;
         return @import("remotectl.zig").windowFromGtk(@ptrCast(@alignCast(root)));
+    }
+
+    pub fn popupScale(self: *WebFace) u16 {
+        return self.currentScale();
+    }
+
+    pub fn onWebextActions(self: *WebFace, json: []const u8) void {
+        if (!self.isActivePage()) return;
+        if (self.actions) |a| a.refresh(json);
+    }
+
+    pub fn onWebextPopup(self: *WebFace, ev: proto.EvWebextPopup) void {
+        if (self.actions) |a| a.onPopup(ev);
+    }
+
+    pub fn adoptWebextPopupBuffer(self: *WebFace, fb: proto.FrameBuffer, fd: c_int) bool {
+        const a = self.actions orelse return false;
+        return a.adoptBuffer(fb, fd);
+    }
+
+    pub fn onWebextPopupDamage(self: *WebFace, ev: proto.FrameDamage) bool {
+        const a = self.actions orelse return false;
+        return a.damage(ev);
+    }
+
+    pub fn onWebextPopupInline(self: *WebFace, ev: proto.FrameInline) bool {
+        const a = self.actions orelse return false;
+        return a.inlineFrame(ev);
     }
 
     /// Bring this face's tab and pane to the front — what activating

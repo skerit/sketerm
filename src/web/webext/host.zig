@@ -19,6 +19,7 @@ const webrequest = @import("webrequest.zig");
 const origins = @import("origins.zig");
 const i18n = @import("i18n.zig");
 const tabs = @import("tabs.zig");
+const action = @import("action.zig");
 
 /// The session's language tag, for `i18n` locale negotiation. POSIX
 /// order, and everything after the encoding or modifier is dropped
@@ -70,6 +71,8 @@ pub const Extension = struct {
     /// element's address is not stable. Null until the extension first
     /// registers a listener.
     wreq: ?*webrequest.Registry = null,
+    /// Browser-toolbar state: manifest defaults plus runtime overrides.
+    action: action.State = .{},
 
     fn name(self: *const Extension) []const u8 {
         return if (self.man) |*m| m.name else "";
@@ -116,6 +119,7 @@ pub const Host = struct {
         if (e.err.len != 0) self.gpa.free(e.err);
         if (e.man) |*m| m.deinit();
         if (e.store) |*s| s.deinit();
+        e.action.deinit(self.gpa);
     }
 
     pub fn find(self: *Host, id: []const u8) ?*Extension {
@@ -184,6 +188,7 @@ pub const Host = struct {
             m.deinit();
             e.man = null;
         }
+        e.action.deinit(self.gpa);
         if (e.err.len != 0) {
             self.gpa.free(e.err);
             e.err = &.{};
@@ -199,11 +204,17 @@ pub const Host = struct {
             return;
         };
         defer self.gpa.free(bytes);
-        const m = manifest.parse(self.gpa, bytes) catch |err| {
+        var m = manifest.parse(self.gpa, bytes) catch |err| {
             e.err = std.fmt.allocPrint(self.gpa, "manifest parse: {s}", .{@errorName(err)}) catch &.{};
             return;
         };
+        const action_state = action.State.init(self.gpa, m.browser_action) catch {
+            m.deinit();
+            e.err = self.gpa.dupe(u8, "browser action: out of memory") catch &.{};
+            return;
+        };
         e.man = m;
+        e.action = action_state;
         e.ok = true;
     }
 
@@ -285,6 +296,8 @@ pub const Host = struct {
         if (std.mem.eql(u8, ns, "i18n")) return self.dispatchI18n(e, method, args_json);
         if (std.mem.eql(u8, ns, "tabs")) return self.dispatchTabs(e, method, args_json);
         if (std.mem.eql(u8, ns, "webRequest")) return self.dispatchWebRequest(e, method, args_json);
+        if (std.mem.eql(u8, ns, "browserAction") or std.mem.eql(u8, ns, "pageAction") or
+            std.mem.eql(u8, ns, "action")) return e.action.dispatch(self.gpa, method, args_json);
         return self.errResult("unknown namespace");
     }
 

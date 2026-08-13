@@ -47,6 +47,17 @@ pub fn extensions() []Ext {
     return g_exts.items;
 }
 
+/// Resolve one declared extension asset for GTK. The returned path is
+/// owned; traversal is refused and a disabled/uninstalled id has none.
+pub fn assetPath(gpa: std.mem.Allocator, id: []const u8, rel: []const u8) ?[]u8 {
+    const e = find(id) orelse return null;
+    if (!e.enabled or !e.ok or rel.len == 0) return null;
+    if (std.mem.indexOf(u8, rel, "..") != null or std.mem.indexOfScalar(u8, rel, 0) != null) return null;
+    const clean = std.mem.trimStart(u8, rel, "/");
+    if (clean.len == 0) return null;
+    return std.fmt.allocPrint(gpa, "{s}/{s}", .{ e.dir, clean }) catch null;
+}
+
 fn dupe(s: []const u8) []u8 {
     return (g_gpa orelse unreachable).dupe(u8, s) catch @constCast("");
 }

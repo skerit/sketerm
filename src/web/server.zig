@@ -81,6 +81,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_FRAMES_INLINE,
     proto.CAP_WEBEXT,
     proto.CAP_WEBEXT_TABS,
+    proto.CAP_WEBEXT_ACTION,
     proto.CAP_FILTER_SUBSCRIBE,
     proto.CAP_READER_IDS,
     proto.CAP_SEMANTIC_REQUEST_IDS,
@@ -463,6 +464,7 @@ pub const Server = struct {
             .webext_list_req => self.host.webextList(),
             .webext_wreq_stats_req => self.host.webrequestStats(),
             .webext_tabs => self.host.webextTabs((try proto.decode(proto.WebextTabs, frame.payload)).tabs_json),
+            .webext_action_activate => self.host.webextActionActivate(try proto.decode(proto.WebextActionActivate, frame.payload)),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},
