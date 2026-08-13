@@ -18138,3 +18138,27 @@ either revision.
 Known limits remain unchanged: popup size is fixed at 420x520 logical pixels,
 `setIcon` does not accept `ImageData`, and WebExtensions remain local-browser
 only.
+## 2026-08-13: installer argument routing
+
+`dist/install.sh --no-install` now delegates Arch builds as `makepkg -sf`
+instead of unconditionally adding `-i`; normal installs remain `makepkg
+-sif`. Script flags are consumed, `--` explicitly starts makepkg passthrough,
+and passthrough argv retains spaces, glob characters, and empty arguments.
+Arch delegation now precedes the local GUI dependency probe, allowing
+`makepkg -s` to install the declared build/runtime dependencies on a fresh
+host instead of incorrectly degrading to a plain mux-only build first.
+Combining `--no-install` with makepkg's `-i`/`--install` is rejected rather
+than allowing a passthrough option to defeat the script-level guarantee.
+Arguments intended for makepkg now fail explicitly when the selected
+non-Arch or mux-only path cannot forward them. Missing/empty `--prefix`
+values, use of that plain-install-only flag on a package-manager path, and
+contradictory `--mux-only`/`--gui-only` modes are also rejected. A
+non-installing mux build no longer claims it was installed.
+
+`dist/test-install.sh` drives the real Arch dispatch through PATH-injected
+`pkg-config` and `makepkg` probes, checks both install modes, flag stripping,
+exact passthrough argv, and makepkg failure status propagation. Fake dpkg and
+plain-prefix paths exercise the non-Arch modes without privilege. The test
+also runs the current `PKGBUILD.build()`/`package()` against throwaway build
+outputs and verifies that `usr/bin/sketerm-webengine` is built and staged.
+It uses only temporary directories and performs no package or root operation.
