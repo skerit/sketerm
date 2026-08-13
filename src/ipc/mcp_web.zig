@@ -34,6 +34,7 @@ const mcp = @import("mcp.zig");
 const protocol = @import("protocol.zig");
 const webdrive = @import("webdrive.zig");
 const web_proto = @import("../web/protocol.zig");
+const reader_model = @import("../web/reader.zig");
 const clock = @import("../util/clock.zig");
 
 /// Default budget for one semantic round trip. Clamped to
@@ -184,11 +185,27 @@ const OpReply = struct {
     snapshot_kind: []const u8 = "",
     doc_gen: i64 = 0,
     rev: i64 = 0,
+    /// True only when the negotiated `reader-ids` frame answered this
+    /// read. Never infer it from page-authored markdown bytes.
+    reader_ids: bool = false,
     /// Set when the round trip did not finish inside its budget.
     timed_out: bool = false,
 };
 
 const OpResult = union(enum) { done: OpReply, err: []const u8 };
+
+/// Parse a rich model only when negotiation proved the payload is one.
+fn readerPayload(arena: std.mem.Allocator, payload: []const u8, negotiated: bool) !?std.json.Parsed(reader_model.Result) {
+    return reader_model.parseNegotiated(arena, payload, negotiated);
+}
+
+test "web_read old-capability fallback never interprets page markdown as a rich model" {
+    const json_shaped_markdown = "{\"doc_gen\":9,\"rev\":8,\"markdown\":\"page data\",\"entities\":[]}";
+    try std.testing.expect((try readerPayload(std.testing.allocator, json_shaped_markdown, false)) == null);
+    const rich = (try readerPayload(std.testing.allocator, json_shaped_markdown, true)).?;
+    defer rich.deinit();
+    try std.testing.expectEqualStrings("page data", rich.value.markdown);
+}
 
 /// Where every backend decision lives. Everything below the tool
 /// handlers goes through this, so the formatting is shared and a
@@ -418,6 +435,7 @@ fn runOp(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, timeout_ms:
                 .snapshot_kind = if (out.snap_kind == @intFromEnum(web_proto.SnapKind.delta)) "delta" else "full",
                 .doc_gen = out.doc_gen,
                 .rev = out.rev,
+                .reader_ids = req.kind == .read and e.cap_reader_ids,
                 .timed_out = out.timed_out,
             } };
         },
@@ -466,6 +484,7 @@ fn runOpGui(backend: mcp.Backend, arena: std.mem.Allocator, pane: u32, op: Op, b
                 .snapshot_kind = if (obj.get("snapshot_kind")) |v| (if (v == .string) v.string else "") else "",
                 .doc_gen = if (obj.get("doc_gen")) |v| (if (v == .integer) v.integer else 0) else 0,
                 .rev = if (obj.get("rev")) |v| (if (v == .integer) v.integer else 0) else 0,
+                .reader_ids = if (obj.get("reader_ids")) |v| (v == .bool and v.bool) else false,
             } };
         }
         if (backend.nowMs(backend.ctx) >= deadline) {
@@ -918,7 +937,7 @@ pub fn webTool(
 
     if (eql(u8, name, "web_act")) {
         const id = mcp.argInt(args, "id") orelse
-            return mcp.appErr(arena, "web_act needs 'id' (a node id from web_snapshot)");
+            return mcp.appErr(arena, "web_act needs 'id' (a node id from web_snapshot or web_read)");
         const action = mcp.argStr(args, "action") orelse "click";
         const value = mcp.argStr(args, "value");
         switch (try runOp(drv, arena, view.pane, .{
@@ -1033,7 +1052,36 @@ pub fn webTool(
             .done => |r| {
                 if (r.timed_out) return mcp.appErr(arena, "the page did not answer the reader-mode extraction in time");
                 var out = try Out.init(arena, drv, view);
-                try out.field("markdown", r.payload);
+                // Capability fallback is explicit: a new helper returns
+                // one JSON model carrying markdown + ids; an old helper
+                // still returns the legacy markdown bytes unchanged.
+                const rich = readerPayload(arena, r.payload, r.reader_ids) catch
+                    return mcp.appErr(arena, "the browser helper returned a malformed reader-ids result");
+                if (rich) |parsed| {
+                    defer parsed.deinit();
+                    const model = parsed.value;
+                    if (model.doc_gen == 0 and model.rev == 0 and model.entities.len == 0) {
+                        try out.field("markdown", model.markdown);
+                        try out.field("id_note", "the page has no current semantic entities; call web_snapshot before web_act");
+                        return mcp.toolResult(arena, try out.finish(), false) orelse error.OutOfMemory;
+                    }
+                    if (model.markdown.len == 0 and model.entities.len == 0)
+                        return mcp.appErr(arena, "the browser helper returned a malformed reader-ids result");
+                    try out.field("document", model.doc_gen);
+                    try out.field("revision", model.rev);
+                    try out.field("markdown", model.markdown);
+                    try out.field("entities", model.entities);
+                    try out.field(
+                        "id_note",
+                        "entity ids can be supplied directly to web_act; actions are revision-guarded and fail if this page or entity changed",
+                    );
+                } else {
+                    try out.field("markdown", r.payload);
+                    try out.field(
+                        "id_note",
+                        "this browser helper lacks the reader-ids capability; markdown is available, but call web_snapshot before web_act",
+                    );
+                }
                 return mcp.toolResult(arena, try out.finish(), false) orelse error.OutOfMemory;
             },
         }

@@ -76,6 +76,9 @@ pub const InNode = struct {
     /// identical text keeps the id, and hints/new-tab read the LIVE
     /// tree anyway.
     url: []const u8 = "",
+    /// Bounded renderer-local token changed whenever an anchor's exact
+    /// raw href changes, kept separate from the display URL clamp.
+    guard: []const u8 = "",
 };
 
 /// A whole DOM walk; `doc` is the script's per-V8-context token, which
@@ -102,6 +105,38 @@ pub const Update = struct {
     carried: usize,
 };
 
+/// One page-side reader entity before its engine-local id is rewritten
+/// into this view's stable semantic identity space.
+pub const InReaderEntity = struct {
+    eid: u32,
+    kind: []const u8 = "",
+    text: []const u8 = "",
+    url: []const u8 = "",
+};
+
+pub const InReader = struct {
+    doc: u32,
+    md: []const u8 = "",
+    entities: []const InReaderEntity = &.{},
+};
+
+/// A revision-stamped reader result. Entity strings borrow from the
+/// parsed page reply; only the entity slice is owned by the caller.
+pub const ReaderResult = struct {
+    doc_gen: u32,
+    rev: u32,
+    markdown: []const u8,
+    entities: []ReaderEntity,
+};
+
+pub const ReaderEntity = struct {
+    id: u32,
+    guard: u64,
+    kind: []const u8,
+    text: []const u8,
+    url: []const u8,
+};
+
 /// A node of the live tree.
 const Node = struct {
     sid: u32,
@@ -124,6 +159,7 @@ const Node = struct {
     nchildren: u32,
     /// Resolved link target; empty for everything but anchors.
     url: []u8,
+    guard: []u8,
 };
 
 /// A node as the CLIENT last received it: just enough to diff against
@@ -182,6 +218,7 @@ pub const View = struct {
         self.gpa.free(n.value);
         self.gpa.free(n.states);
         self.gpa.free(n.url);
+        self.gpa.free(n.guard);
     }
 
     fn freeBase(self: *View, b: *BaseNode) void {
@@ -210,6 +247,51 @@ pub const View = struct {
 
     pub fn count(self: *const View) usize {
         return self.nodes.items.len;
+    }
+
+    /// Rewrite a page-side reader reply into stable ids from the live
+    /// shadow tree. A reply from any other document is stale and refused.
+    pub fn readerResult(self: *const View, gpa: std.mem.Allocator, in: InReader) !ReaderResult {
+        if (!self.has_tree or in.doc != self.doc_token) return error.StaleReaderDocument;
+        var entities: std.ArrayList(ReaderEntity) = .empty;
+        defer entities.deinit(gpa);
+        try entities.ensureTotalCapacity(gpa, in.entities.len);
+        for (in.entities) |entity| {
+            const sid = self.sidFor(entity.eid);
+            if (sid == 0) continue;
+            entities.appendAssumeCapacity(.{
+                .id = sid,
+                .guard = self.actionGuard(sid),
+                .kind = entity.kind,
+                .text = entity.text,
+                .url = entity.url,
+            });
+        }
+        return .{
+            .doc_gen = self.doc_gen,
+            .rev = self.rev,
+            .markdown = in.md,
+            .entities = try gpa.dupe(ReaderEntity, entities.items),
+        };
+    }
+
+    pub fn revisionMatches(self: *const View, doc_gen: u32, rev: u32) bool {
+        return self.has_tree and self.doc_gen == doc_gen and self.rev == rev;
+    }
+
+    /// Action-sensitive identity for a stable id. Unlike the ordinary
+    /// semantic fingerprint this includes a link's resolved target, so
+    /// an href swap cannot pass a reader action guard.
+    pub fn actionGuard(self: *const View, sid: u32) u64 {
+        const nd = self.findSid(sid) orelse return 0;
+        var h = std.hash.Wyhash.init(0);
+        h.update(std.mem.asBytes(&nd.eid));
+        h.update(nd.role);
+        h.update(nd.name);
+        h.update(nd.value);
+        h.update(nd.url);
+        h.update(nd.guard);
+        return h.final();
     }
 
     /// Fold one walk into the LIVE tree. Nothing is rendered for the
@@ -572,6 +654,7 @@ pub const View = struct {
                 .fp = fps[i],
                 .nchildren = nkids[i],
                 .url = try self.gpa.dupe(u8, nd.url),
+                .guard = try self.gpa.dupe(u8, nd.guard),
             });
         }
         return out;
@@ -1063,6 +1146,84 @@ test "full snapshot renders the documented text format" {
         \\  [4] textbox "Name" value="abc"
         \\
     , up.text);
+}
+
+test "reader entities use live stable ids and carry an exact revision" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    try v.apply(tree(55, "https://example.test/article", &.{
+        .{ .id = 1, .role = "document", .name = "Article" },
+        .{ .id = 8, .parent = 1, .role = "heading", .name = "Heading" },
+        .{ .id = 9, .parent = 1, .role = "link", .name = "Next", .url = "https://example.test/next" },
+    }));
+    const heading_sid = v.sidFor(8);
+    const link_sid = v.sidFor(9);
+    const result = try v.readerResult(gpa, .{
+        .doc = 55,
+        .md = "# Heading\n\n[Next](https://example.test/next)\n",
+        .entities = &.{
+            .{ .eid = 8, .kind = "heading", .text = "Heading" },
+            .{ .eid = 9, .kind = "link", .text = "Next", .url = "https://example.test/next" },
+            .{ .eid = 99, .kind = "link", .text = "not in the walk" },
+        },
+    });
+    defer gpa.free(result.entities);
+    try std.testing.expect(v.revisionMatches(result.doc_gen, result.rev));
+    try std.testing.expectEqual(@as(usize, 2), result.entities.len);
+    try std.testing.expectEqual(heading_sid, result.entities[0].id);
+    try std.testing.expectEqual(link_sid, result.entities[1].id);
+    try std.testing.expectEqual(v.actionGuard(link_sid), result.entities[1].guard);
+
+    const rev = v.rev;
+    try v.apply(tree(55, "https://example.test/article", &.{
+        .{ .id = 1, .role = "document", .name = "Article" },
+        .{ .id = 8, .parent = 1, .role = "heading", .name = "Changed" },
+        .{ .id = 9, .parent = 1, .role = "link", .name = "Next", .url = "https://example.test/next" },
+    }));
+    try std.testing.expect(v.rev > rev);
+    try std.testing.expect(!v.revisionMatches(result.doc_gen, result.rev));
+    try std.testing.expectError(error.StaleReaderDocument, v.readerResult(gpa, .{ .doc = 99 }));
+}
+
+test "reader action guard notices a retargeted long link" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const shown = "data:text/html,shared-display-url";
+    try v.apply(tree(7, "data:", &.{
+        .{ .id = 1, .role = "document" },
+        .{ .id = 2, .parent = 1, .role = "link", .name = "Go", .url = shown, .guard = "#one" },
+    }));
+    const sid = v.sidFor(2);
+    const before = v.actionGuard(sid);
+    const rev = v.rev;
+    try v.apply(tree(7, "data:", &.{
+        .{ .id = 1, .role = "document" },
+        .{ .id = 2, .parent = 1, .role = "link", .name = "Go", .url = shown, .guard = "#two" },
+    }));
+    try std.testing.expectEqual(rev, v.rev);
+    try std.testing.expect(before != v.actionGuard(sid));
+}
+
+test "reader action guard notices an identical replacement element" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    try v.apply(tree(7, "data:", &.{
+        .{ .id = 1, .role = "document" },
+        .{ .id = 2, .parent = 1, .role = "button", .name = "Go" },
+    }));
+    const sid = v.sidFor(2);
+    const before = v.actionGuard(sid);
+    const rev = v.rev;
+    try v.apply(tree(7, "data:", &.{
+        .{ .id = 1, .role = "document" },
+        .{ .id = 9, .parent = 1, .role = "button", .name = "Go" },
+    }));
+    try std.testing.expectEqual(sid, v.sidFor(9));
+    try std.testing.expectEqual(rev, v.rev);
+    try std.testing.expect(before != v.actionGuard(sid));
 }
 
 test "ids are stable across a delta and a removal never reuses one" {

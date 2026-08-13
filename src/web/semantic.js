@@ -79,7 +79,12 @@
   var ids = new WeakMap();
   // Marker ids, keyed on the CONTAINER element so a re-walk reuses one.
   var moreIds = new WeakMap();
+  // Exact raw href state stays renderer-local. The bounded token changes
+  // whenever the same element's target changes, without putting an
+  // attacker-sized href into every semantic walk.
+  var linkGuards = new WeakMap();
   var nextId = 1;
+  var nextLinkGuard = 1;
   var byId = new Map(); // rebuilt by every walk: stale nodes drop out
   var detail = 1;
   var observer = null;
@@ -370,10 +375,17 @@
       // The resolved link target, for "open this hint in a new tab"
       // (and any consumer that wants the destination without a click).
       // Only anchors carry one; String() flattens SVG's animated href.
-      if (role === "link" && el.href) {
+      if ((role === "link" || el.tagName === "A" || el.tagName === "a") && el.href) {
         try {
           var u = String(el.href);
           if (u) node.url = u.slice(0, 300);
+          var raw = String(el.getAttribute("href") || "");
+          var guard = linkGuards.get(el);
+          if (!guard || guard.href !== raw) {
+            guard = { href: raw, token: nextLinkGuard++ };
+            linkGuards.set(el, guard);
+          }
+          node.guard = String(guard.token);
         } catch (e) {}
       }
       out.push(node);
@@ -848,7 +860,23 @@
     return best || document.body;
   }
 
-  function inline(el) {
+  function readerEntity(el, kind, entities) {
+    if (entities.length >= MAX_NODES) return;
+    var entity = {
+      eid: idOf(el),
+      kind: kind,
+      text: textOf(el).slice(0, 300),
+      url: ""
+    };
+    if (kind === "link") {
+      try {
+        entity.url = String(el.href || el.getAttribute("href") || "").slice(0, 1000);
+      } catch (e) {}
+    }
+    entities.push(entity);
+  }
+
+  function inline(el, entities) {
     var out = "";
     for (var i = 0; i < el.childNodes.length; i++) {
       var n = el.childNodes[i];
@@ -859,55 +887,68 @@
       if (n.nodeType !== 1) continue;
       var t = n.tagName;
       if (SKIP_TAG[t]) continue;
-      if (t === "A" && n.hasAttribute("href")) out += "[" + inline(n).trim() + "](" + n.getAttribute("href") + ")";
-      else if (t === "STRONG" || t === "B") out += "**" + inline(n).trim() + "**";
-      else if (t === "EM" || t === "I") out += "*" + inline(n).trim() + "*";
-      else if (t === "CODE") out += "`" + inline(n).trim() + "`";
+      if (t === "A" && n.hasAttribute("href")) {
+        readerEntity(n, "link", entities);
+        out += "[" + inline(n, entities).trim() + "](" + n.getAttribute("href") + ")";
+      } else if (t === "STRONG" || t === "B") out += "**" + inline(n, entities).trim() + "**";
+      else if (t === "EM" || t === "I") out += "*" + inline(n, entities).trim() + "*";
+      else if (t === "CODE") out += "`" + inline(n, entities).trim() + "`";
       else if (t === "BR") out += "\n";
       else if (t === "IMG") out += "![" + (n.getAttribute("alt") || "") + "](" + (n.getAttribute("src") || "") + ")";
-      else out += inline(n);
+      else out += inline(n, entities);
     }
     return out;
   }
 
-  function markdown(el, depth, out) {
+  function markdown(el, depth, out, entities) {
     if (depth > 24) return;
     for (var i = 0; i < el.children.length; i++) {
       var n = el.children[i];
       var t = n.tagName;
       if (SKIP_TAG[t] || hidden(n)) continue;
       if (/^H[1-6]$/.test(t)) {
-        out.push(new Array(+t[1] + 1).join("#") + " " + inline(n).trim());
+        readerEntity(n, "heading", entities);
+        out.push(new Array(+t[1] + 1).join("#") + " " + inline(n, entities).trim());
       } else if (t === "P") {
-        var p = inline(n).trim();
+        var p = inline(n, entities).trim();
         if (p) out.push(p);
       } else if (t === "PRE") {
         out.push("```\n" + (n.textContent || "").replace(/\s+$/, "") + "\n```");
       } else if (t === "BLOCKQUOTE") {
-        out.push("> " + inline(n).trim());
+        out.push("> " + inline(n, entities).trim());
       } else if (t === "UL" || t === "OL") {
         var items = n.children;
         for (var k = 0; k < items.length; k++) {
           if (items[k].tagName !== "LI") continue;
-          out.push((t === "OL" ? k + 1 + ". " : "- ") + inline(items[k]).trim());
+          readerEntity(items[k], "item", entities);
+          out.push((t === "OL" ? k + 1 + ". " : "- ") + inline(items[k], entities).trim());
         }
       } else if (t === "HR") {
         out.push("---");
       } else if (t === "IMG") {
         out.push("![" + (n.getAttribute("alt") || "") + "](" + (n.getAttribute("src") || "") + ")");
       } else {
-        markdown(n, depth + 1, out);
+        markdown(n, depth + 1, out, entities);
       }
     }
   }
 
-  function read(req) {
+  function read(req, withIds) {
     var region = mainRegion();
     var out = [];
+    var entities = [];
+    var nodes = withIds ? walkTree(document.documentElement || document.body) : null;
     var title = (document.title || "").trim();
     if (title) out.push("# " + title);
-    markdown(region, 0, out);
-    send({ op: "markdown", req: req, url: String(location.href), md: out.join("\n\n") + "\n" });
+    if (withIds && /^(ARTICLE|MAIN|SECTION)$/.test(region.tagName || "")) readerEntity(region, "section", entities);
+    markdown(region, 0, out, entities);
+    var reply = { op: "markdown", req: req, url: String(location.href), md: out.join("\n\n") + "\n" };
+    if (withIds) {
+      reply.doc = DOC;
+      reply.nodes = nodes;
+      reply.entities = entities;
+    }
+    send(reply);
   }
 
   // -- script evaluation ------------------------------------------------
@@ -1999,7 +2040,7 @@
         expand(m.req, m.eid, m.off || 0, m.len || 4096);
         break;
       case "read":
-        read(m.req);
+        read(m.req, !!m.ids);
         break;
       case "pickoption":
         pickOption(m.req, m.arg || "", m.timeout || 4000);

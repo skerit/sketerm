@@ -82,6 +82,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_WEBEXT,
     proto.CAP_WEBEXT_TABS,
     proto.CAP_FILTER_SUBSCRIBE,
+    proto.CAP_READER_IDS,
 };
 
 /// Bounded builder for the `hello_ack` capability set. Its capacity is
@@ -405,6 +406,8 @@ pub const Server = struct {
             .sem_expand => try self.host.semExpand(try proto.decode(proto.SemExpand, frame.payload)),
             .sem_query => try self.host.semQuery(try proto.decode(proto.SemQueryReq, frame.payload)),
             .sem_read => try self.host.semRead(try proto.decode(proto.SemRead, frame.payload)),
+            .sem_read_ids => try self.host.semReadIds(try proto.decode(proto.SemReadIds, frame.payload)),
+            .sem_act_guarded => try self.host.semActGuarded(try proto.decode(proto.SemActGuarded, frame.payload)),
             .sem_eval => try self.host.semEval(try proto.decode(proto.SemEval, frame.payload)),
             .intercept_set => self.host.interceptSet(try proto.decode(proto.InterceptSet, frame.payload)),
             .intercept_lists => {

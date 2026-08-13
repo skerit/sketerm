@@ -203,6 +203,7 @@ const input = @import("input.zig");
 const toolbtn = @import("toolbtn.zig");
 const cssutil = @import("cssutil.zig");
 const proto = @import("../web/protocol.zig");
+const reader_model = @import("../web/reader.zig");
 const webhints = @import("../web/hints.zig");
 const findbin = @import("../web/findbin.zig");
 const pace = @import("../web/pace.zig");
@@ -652,6 +653,8 @@ pub const Client = struct {
     cap_webext_tabs: bool = false,
     /// The helper fetches subscribed filter lists itself (0xC4).
     cap_filter_subscribe: bool = false,
+    /// Rich reader results and revision-guarded reader actions.
+    cap_reader_ids: bool = false,
 
     fn hostSlice(self: *const Client) []const u8 {
         return self.host[0..self.host_len];
@@ -1152,6 +1155,7 @@ pub const Client = struct {
                 self.cap_scroll = false;
                 self.cap_frames_inline = false;
                 self.cap_filter_subscribe = false;
+                self.cap_reader_ids = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -1169,6 +1173,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.cap_webext = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.cap_webext_tabs = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.cap_filter_subscribe = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
                 }
                 // A remote helper without inline frames would keep
                 // posting memfd frames whose descriptors the bridge
@@ -1304,9 +1309,19 @@ pub const Client = struct {
             .sem_read_result => {
                 const ev = proto.decode(proto.SemReadResult, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| {
+                    face.reader_guards.clearRetainingCapacity();
+                    face.reader_guards_active = false;
                     face.completeOp(.read, true, ev.markdown.s, .{});
                     // The GUI reader rides the same request kind as the
                     // `web_read` tool; this is where it collects its own.
+                    face.onReadReply();
+                }
+            },
+            .sem_read_ids_result => {
+                const ev = proto.SemReadIdsResult.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(ev.entities);
+                if (self.findFace(ev.view)) |face| {
+                    face.onReadIds(ev);
                     face.onReadReply();
                 }
             },
@@ -2269,6 +2284,7 @@ pub const AutoMeta = struct {
     doc_gen: u32 = 0,
     rev: u32 = 0,
     snap_kind: u8 = 0,
+    reader_ids: bool = false,
 };
 
 /// A finished round trip, waiting to be collected by `autoTake`. `text`
@@ -2332,6 +2348,8 @@ const HintItem = struct {
     label: []u8,
     widget: *c.GtkWidget,
 };
+
+const ReaderGuard = struct { id: u32, doc_gen: u32, rev: u32, guard: u64 };
 
 /// Hint-label look, installed once via cssutil. Named libadwaita
 /// colors keep it legible in both themes.
@@ -2742,6 +2760,10 @@ pub const WebFace = struct {
     last_snapshot: ?[]u8 = null,
     last_snapshot_meta: AutoMeta = .{},
     last_eval: ?[]u8 = null,
+    /// Guards from the last rich read. A snapshot replaces this source;
+    /// navigation keeps it active so old reader IDs fail stale.
+    reader_guards: std.ArrayList(ReaderGuard) = .empty,
+    reader_guards_active: bool = false,
 
     /// Link-hints mode (`web_hints`). `hints_token` is the automation
     /// token of the in-flight `visible` query (0 when none); once the
@@ -3142,6 +3164,7 @@ pub const WebFace = struct {
         self.autoClear();
         self.auto_ops.deinit(self.allocator);
         self.auto_results.deinit(self.allocator);
+        self.reader_guards.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -3253,7 +3276,19 @@ pub const WebFace = struct {
 
     pub fn autoAct(self: *WebFace, id: u32, action: u8, arg: []const u8) ?u32 {
         const token = self.autoBegin(.act, false) orelse return null;
-        self.cl.post(proto.SemAction{ .view = self.view, .id = id, .action = action, .arg = arg });
+        if (self.readerGuard(id)) |guard| {
+            self.cl.post(proto.SemActGuarded{
+                .view = self.view,
+                .doc_gen = guard.doc_gen,
+                .rev = guard.rev,
+                .id = id,
+                .guard = guard.guard,
+                .action = action,
+                .arg = arg,
+            });
+        } else {
+            self.cl.post(proto.SemAction{ .view = self.view, .id = id, .action = action, .arg = arg });
+        }
         // The helper synthesizes real input for this; the paints it
         // causes still need somebody asking for frames.
         self.promote();
@@ -3274,8 +3309,53 @@ pub const WebFace = struct {
 
     pub fn autoRead(self: *WebFace) ?u32 {
         const token = self.autoBegin(.read, false) orelse return null;
-        self.cl.post(proto.SemRead{ .view = self.view });
+        if (self.cl.cap_reader_ids)
+            self.cl.post(proto.SemReadIds{ .view = self.view })
+        else
+            self.cl.post(proto.SemRead{ .view = self.view });
         return token;
+    }
+
+    fn readerGuard(self: *const WebFace, id: u32) ?ReaderGuard {
+        for (self.reader_guards.items) |guard| {
+            if (guard.id == id) return guard;
+        }
+        return if (self.reader_guards_active) .{ .id = id, .doc_gen = 0, .rev = 0, .guard = 0 } else null;
+    }
+
+    fn invalidateReaderGuards(self: *WebFace) void {
+        for (self.reader_guards.items) |*guard| {
+            guard.doc_gen = 0;
+            guard.rev = 0;
+            guard.guard = 0;
+        }
+    }
+
+    fn onReadIds(self: *WebFace, ev: proto.SemReadIdsResult) void {
+        self.reader_guards.ensureTotalCapacity(self.allocator, ev.entities.len) catch return;
+        self.reader_guards.clearRetainingCapacity();
+        for (ev.entities) |entity| {
+            self.reader_guards.appendAssumeCapacity(.{
+                .id = entity.id,
+                .doc_gen = ev.doc_gen,
+                .rev = ev.rev,
+                .guard = entity.guard,
+            });
+        }
+        self.reader_guards_active = true;
+        const entities = self.allocator.alloc(reader_model.Entity, ev.entities.len) catch return;
+        defer self.allocator.free(entities);
+        for (ev.entities, 0..) |entity, i| {
+            entities[i] = .{ .id = entity.id, .kind = entity.kind, .text = entity.text, .url = entity.url };
+        }
+        const json = reader_model.stringify(self.allocator, .{
+            .doc_gen = ev.doc_gen,
+            .rev = ev.rev,
+            .markdown = ev.markdown.s,
+            .entities = entities,
+        }) catch return;
+        defer self.allocator.free(json);
+        self.completeOp(.read, true, json, .{ .doc_gen = ev.doc_gen, .rev = ev.rev, .reader_ids = true });
     }
 
     pub fn autoEval(self: *WebFace, code: []const u8, want_await: bool, timeout_ms: u32) ?u32 {
@@ -3816,6 +3896,8 @@ pub const WebFace = struct {
     /// delta-buffering is gone. `completeOp`'s want_full guard still
     /// drops a stray delta from a pre-coalescing helper.
     pub fn onSnapshot(self: *WebFace, ev: proto.SemSnapshot) void {
+        self.reader_guards.clearRetainingCapacity();
+        self.reader_guards_active = false;
         const meta: AutoMeta = .{ .doc_gen = ev.doc_gen, .rev = ev.rev, .snap_kind = ev.kind };
         if (self.allocator.dupe(u8, ev.payload.s)) |owned| {
             if (self.last_snapshot) |old| self.allocator.free(old);
@@ -4820,6 +4902,12 @@ pub const WebFace = struct {
         // up: drop the requests so their kinds are usable again.
         self.cancelHints();
         self.auto_ops.clearRetainingCapacity();
+        if (self.cl.cap_reader_ids) {
+            self.invalidateReaderGuards();
+        } else {
+            self.reader_guards.clearRetainingCapacity();
+            self.reader_guards_active = false;
+        }
         // The document the article came from does not exist any more.
         self.exitReader();
         self.crashed = false;
@@ -4852,6 +4940,7 @@ pub const WebFace = struct {
     pub fn onHelperUnavailable(self: *WebFace, reason: []const u8, retryable: bool) void {
         self.cancelHints();
         self.auto_ops.clearRetainingCapacity();
+        self.invalidateReaderGuards();
         self.cert_pending = false;
         self.cert_cancelled = false;
         if (!self.widgets_dead) c.gtk_widget_set_visible(self.cert_box, 0);
@@ -6179,7 +6268,17 @@ pub const WebFace = struct {
             self.syncReaderButton(false);
             return;
         }
-        self.enterReader(res.text);
+        if (self.cl.cap_reader_ids) {
+            const parsed = reader_model.parse(self.allocator, res.text) catch {
+                self.toast("Could not read this page.");
+                self.syncReaderButton(false);
+                return;
+            };
+            defer parsed.deinit();
+            self.enterReader(parsed.value.markdown);
+        } else {
+            self.enterReader(res.text);
+        }
     }
 
     fn enterReader(self: *WebFace, md: []const u8) void {

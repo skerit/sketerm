@@ -1,5 +1,41 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-13: reader-mode semantic IDs
+
+`web_read` now returns reader markdown and a structured `entities` list
+for useful sections, headings, links and list items. Every entity ID is
+from the same per-view stable semantic space as `web_snapshot`, so it can
+be passed directly to `web_act` without taking a snapshot first. Labels,
+URLs and markdown remain explicitly page-authored data.
+
+The wire change is append-only and capability-gated: `reader-ids` adds
+`sem_read_ids` 0xD2, `sem_read_ids_result` 0xD3 and
+`sem_act_guarded` 0xD4. The result carries unchanged markdown plus
+`doc_gen`, `rev`, and `{id, guard, kind, text, url}` records. A guarded
+action refreshes the semantic walk and requires the exact document,
+revision, stable ID and opaque action fingerprint (including renderer
+element identity and exact link href)
+before using the existing trusted pointer/focus/value path. A stale or
+retargeted entity returns `sem_act_result ok=0`; it never falls through
+to a node on the changed page. Clients treat the latest rich read as the
+active ID source until a snapshot replaces it, so an absent old reader
+ID cannot silently fall back to an unguarded action.
+
+Compatibility is explicit in `mcp_web.zig`: a helper without
+`reader-ids` is sent the old `sem_read` and its response is treated only
+as markdown, even if the page made that markdown look like the new JSON
+model. The response tells the caller to use `web_snapshot` before
+acting. No existing frame layout or meaning changed.
+
+Unit coverage in both roots pins rich-result serialization, page data
+escaping, stable-ID rewrite, revision invalidation, action fingerprints,
+the reserved tags, and the old-capability fallback. smoke-web stage 41
+reads an ID without a snapshot, activates exactly its trusted link, then
+changes only that link's href and measures the guarded action refusing it
+as stale. The measured stage passes in the full rig; later unrelated
+stages remain unstable (the download reload and a post-stage-27 helper
+restart have failed on separate runs), outside the reader path.
+
 This file is a record of the autonomous implementation session that
 took the project from "13 markdown plan documents" to a working
 v0.1 binary.

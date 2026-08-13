@@ -218,6 +218,17 @@ const article_page =
     "<p>A second paragraph so the extractor has real text density.</p></article>" ++
     "</body></html>";
 
+/// Rich reader proof: the only actionable node returned by reader mode
+/// changes the title on a trusted click. Its sibling mutation button is
+/// outside <article>, so it never appears as a reader entity.
+const reader_ids_page =
+    "data:text/html,<html><head><title>Reader IDs</title></head><body>" ++
+    "<article><h1>Reader Target</h1><p><a id=reader-go role=button href=%23done " ++
+    "onclick=\"document.title='reader:trusted='+event.isTrusted;return false\">Activate Reader Target</a></p>" ++
+    "<p>Enough article text for useful reader extraction and a stable result.</p></article>" ++
+    "<button id=reader-mutate onclick=\"document.getElementById('reader-go').href='%23changed';" ++
+    "document.title='reader:mutated'\">Mutate</button></body></html>";
+
 /// Dropdowns: a native <select> and a hand-rolled ARIA combobox whose
 /// options only exist in the DOM while it is open. The old
 /// browser_choose handled both, so web_act set_value must too.
@@ -818,6 +829,7 @@ const Client = struct {
     ack_proto: u32 = 0,
     ack_shm: bool = false,
     ack_semantic: bool = false,
+    ack_reader_ids: bool = false,
     ack_dmabuf: bool = false,
     ack_view_url: bool = false,
     ack_discard: bool = false,
@@ -943,6 +955,14 @@ const Client = struct {
     md: [32 * 1024]u8 = @splat(0),
     md_len: usize = 0,
     md_seq: u32 = 0,
+    rich_doc: u32 = 0,
+    rich_rev: u32 = 0,
+    rich_id: u32 = 0,
+    rich_guard: u64 = 0,
+    rich_kind: [32]u8 = @splat(0),
+    rich_kind_len: usize = 0,
+    rich_text: [256]u8 = @splat(0),
+    rich_text_len: usize = 0,
 
     query_out: [16 * 1024]u8 = @splat(0),
     query_len: usize = 0,
@@ -1253,6 +1273,7 @@ const Client = struct {
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.ack_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.ack_semantic = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.ack_reader_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_DMABUF)) self.ack_dmabuf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.ack_view_url = true;
                     if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.ack_intercept = true;
@@ -1564,6 +1585,25 @@ const Client = struct {
                 const r = proto.decode(proto.SemReadResult, frame.payload) catch fail("sem_read_result decode");
                 self.md_len = @min(r.markdown.s.len, self.md.len);
                 @memcpy(self.md[0..self.md_len], r.markdown.s[0..self.md_len]);
+                self.md_seq += 1;
+            },
+            .sem_read_ids_result => {
+                const r = proto.SemReadIdsResult.decodeAlloc(frame.payload, self.gpa) catch fail("sem_read_ids_result decode");
+                defer self.gpa.free(r.entities);
+                self.md_len = @min(r.markdown.s.len, self.md.len);
+                @memcpy(self.md[0..self.md_len], r.markdown.s[0..self.md_len]);
+                self.rich_doc = r.doc_gen;
+                self.rich_rev = r.rev;
+                self.rich_id = 0;
+                for (r.entities) |entity| {
+                    if (!std.mem.eql(u8, entity.text, "Activate Reader Target")) continue;
+                    self.rich_id = entity.id;
+                    self.rich_guard = entity.guard;
+                    self.rich_kind_len = @min(entity.kind.len, self.rich_kind.len);
+                    @memcpy(self.rich_kind[0..self.rich_kind_len], entity.kind[0..self.rich_kind_len]);
+                    self.rich_text_len = @min(entity.text.len, self.rich_text.len);
+                    @memcpy(self.rich_text[0..self.rich_text_len], entity.text[0..self.rich_text_len]);
+                }
                 self.md_seq += 1;
             },
             .ev_load => {
@@ -4059,6 +4099,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (!cl.ack_shm) fail("stage 1 handshake: hello_ack lacks the frames-shm capability");
     if (!cl.ack_tls) fail("stage 1 handshake: hello_ack lacks the tls capability");
     if (!cl.ack_permissions) fail("stage 1 handshake: hello_ack lacks the permissions capability");
+    if (!cl.ack_reader_ids) fail("stage 1 handshake: hello_ack lacks the reader-ids capability");
     pass("stage 1 handshake");
 
     // ── Stage 2: paint into the shared memfd ──────────────────────
@@ -4279,9 +4320,69 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     pass("stage 12 sem_read");
 
+    // ── Stage 41: reader ids activate one exact, fresh entity ──────
+    cl.navigate(reader_ids_page);
+    {
+        const seq = cl.md_seq;
+        cl.send(proto.SemReadIds{ .view = view_id });
+        if (!cl.waitSeq(&cl.md_seq, seq, 20_000)) fail("stage 41 reader ids: no sem_read_ids_result");
+        if (cl.rich_id == 0 or cl.rich_doc == 0 or cl.rich_rev == 0)
+            fail("stage 41 reader ids: the actionable reader link has no stable revision-stamped id");
+        if (!std.mem.eql(u8, cl.rich_kind[0..cl.rich_kind_len], "link"))
+            fail("stage 41 reader ids: the reader entity kind is not link");
+        if (!std.mem.eql(u8, cl.rich_text[0..cl.rich_text_len], "Activate Reader Target"))
+            fail("stage 41 reader ids: the reader entity text names the wrong node");
+        cl.resetTitle();
+        const acted = cl.act_seq;
+        cl.send(proto.SemActGuarded{
+            .view = view_id,
+            .doc_gen = cl.rich_doc,
+            .rev = cl.rich_rev,
+            .id = cl.rich_id,
+            .guard = cl.rich_guard,
+            .action = @intFromEnum(proto.SemAct.click),
+            .arg = "",
+        });
+        if (!cl.waitSeq(&cl.act_seq, acted, 20_000)) fail("stage 41 reader ids: no guarded act result");
+        if (cl.act_ok != 1 or cl.act_id != cl.rich_id) fail("stage 41 reader ids: guarded act failed");
+        if (!cl.waitTitle("reader:trusted=true", 15_000)) {
+            std.debug.print("stage 41 reader ids: title was {s}\n", .{cl.titleSlice()});
+            fail("stage 41 reader ids: reader id did not activate exactly its trusted target");
+        }
+
+        // Re-read, mutate only the target href, then prove the action
+        // fingerprint refuses it even though semantic revisions
+        // deliberately ignore href changes for ordinary snapshot ids.
+        const read2 = cl.md_seq;
+        cl.send(proto.SemReadIds{ .view = view_id });
+        if (!cl.waitSeq(&cl.md_seq, read2, 20_000)) fail("stage 41 reader ids: no second rich read");
+        const doc = cl.rich_doc;
+        const rev = cl.rich_rev;
+        const id = cl.rich_id;
+        const guard = cl.rich_guard;
+        _ = cl.evalWait("document.getElementById('reader-go').href='#changed';'mutated'", false, 20_000);
+        const stale = cl.act_seq;
+        cl.send(proto.SemActGuarded{
+            .view = view_id,
+            .doc_gen = doc,
+            .rev = rev,
+            .id = id,
+            .guard = guard,
+            .action = @intFromEnum(proto.SemAct.click),
+            .arg = "",
+        });
+        if (!cl.waitSeq(&cl.act_seq, stale, 20_000)) fail("stage 41 reader ids: no stale act result");
+        if (cl.act_ok != 0 or std.mem.indexOf(u8, cl.act_msg[0..cl.act_msg_len], "stale reader id") == null) {
+            std.debug.print("stage 41 reader ids: stale act ok={d} msg={s}\n", .{ cl.act_ok, cl.act_msg[0..cl.act_msg_len] });
+            fail("stage 41 reader ids: a changed entity was not honestly refused as stale");
+        }
+    }
+    pass("stage 41 reader id activates exactly its fresh node and stale target is refused");
+
     // ── Stage 13: query the shadow tree ────────────────────────────
     // (covered by unit tests too; here it proves the frame round-trips)
     {
+        cl.navigate(article_page);
         cl.resetSem();
         cl.snapshot(1, 1);
         const seq = cl.query_seq;

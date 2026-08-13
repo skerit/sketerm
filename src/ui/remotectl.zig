@@ -1081,6 +1081,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
                     @as([]const u8, "delta")
                 else
                     @as([]const u8, "full"),
+                .reader_ids = res.meta.reader_ids,
             });
         }
         if (face.autoPending(token))

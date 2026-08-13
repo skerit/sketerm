@@ -150,6 +150,15 @@ pub const CAP_WEBEXT = "webext";
 /// seeing NO tabs is honest where seeing invented ones is not.
 pub const CAP_WEBEXT_TABS = "webext-tabs";
 
+/// The helper accepts `sem_read_ids` and answers with
+/// `sem_read_ids_result`: reader-mode markdown plus structured entities
+/// whose stable ids belong to the same semantic space as `sem_act`.
+/// `sem_act_guarded` additionally requires the document generation and
+/// revision from that result, so stale reader output is refused instead
+/// of being resolved against a later page. A client without this
+/// capability keeps using the legacy `sem_read` / `sem_read_result` pair.
+pub const CAP_READER_IDS = "reader-ids";
+
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
@@ -263,10 +272,14 @@ pub const Tag = enum(u8) {
     cookies_clear = 0xCB,
     sitedata_clear = 0xCC,
     ev_sitedata_done = 0xCD,
-    // 0xD0-0xD7: inline (in-band) frame family, capability
+    // 0xD0-0xD1: inline (in-band) frame family, capability
     // "frames-inline" — the remote-helper block.
     frame_mode = 0xD0,
     frame_inline = 0xD1,
+    // 0xD2-0xD4: reader semantic ids, capability "reader-ids".
+    sem_read_ids = 0xD2,
+    sem_read_ids_result = 0xD3,
+    sem_act_guarded = 0xD4,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -1476,6 +1489,93 @@ pub const SemReadResult = struct {
     pub const tag: Tag = .sem_read_result;
     view: u32,
     markdown: Text,
+};
+
+/// Rich reader request, gated by `CAP_READER_IDS`.
+pub const SemReadIds = struct {
+    pub const tag: Tag = .sem_read_ids;
+    view: u32,
+};
+
+/// One reader entity. `id` is a stable semantic id; `kind` describes
+/// how the entity is represented in the markdown without interpreting
+/// page-authored text as protocol instructions.
+pub const ReaderEntity = struct {
+    id: u32,
+    /// Helper-computed action identity (element/role/name/value/target).
+    /// Clients round-trip it but do not interpret or display it.
+    guard: u64,
+    kind: []const u8,
+    text: []const u8,
+    url: []const u8,
+};
+
+/// Reader markdown plus entities from one exact semantic revision.
+/// The entity strings borrow from the frame payload; only the returned
+/// `entities` slice is allocated by `decodeAlloc`.
+pub const SemReadIdsResult = struct {
+    pub const tag: Tag = .sem_read_ids_result;
+    view: u32,
+    doc_gen: u32,
+    rev: u32,
+    markdown: Text,
+    entities: []const ReaderEntity,
+
+    pub fn encodeTo(self: SemReadIdsResult, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.doc_gen);
+        try putU32(gpa, out, self.rev);
+        try putText(gpa, out, self.markdown);
+        if (self.entities.len > std.math.maxInt(u16)) return error.TooManyEntities;
+        try putU16(gpa, out, @intCast(self.entities.len));
+        for (self.entities) |entity| {
+            try putU32(gpa, out, entity.id);
+            try putU64(gpa, out, entity.guard);
+            try putStr(gpa, out, entity.kind);
+            try putStr(gpa, out, entity.text);
+            try putStr(gpa, out, entity.url);
+        }
+    }
+
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !SemReadIdsResult {
+        var cur = Cur{ .buf = payload };
+        const view = try cur.readU32();
+        const doc_gen = try cur.readU32();
+        const rev = try cur.readU32();
+        const markdown = try cur.readText();
+        const n = try cur.readU16();
+        const entities = try gpa.alloc(ReaderEntity, n);
+        errdefer gpa.free(entities);
+        for (entities) |*entity| {
+            entity.* = .{
+                .id = try cur.readU32(),
+                .guard = try cur.readU64(),
+                .kind = try cur.readStr(),
+                .text = try cur.readStr(),
+                .url = try cur.readStr(),
+            };
+        }
+        return .{
+            .view = view,
+            .doc_gen = doc_gen,
+            .rev = rev,
+            .markdown = markdown,
+            .entities = entities,
+        };
+    }
+};
+
+/// `sem_act` with an exact reader-result revision guard. The result is
+/// the existing `sem_act_result`; a stale guard answers `ok = 0`.
+pub const SemActGuarded = struct {
+    pub const tag: Tag = .sem_act_guarded;
+    view: u32,
+    doc_gen: u32,
+    rev: u32,
+    id: u32,
+    guard: u64,
+    action: u8,
+    arg: []const u8,
 };
 
 // -- script evaluation (0xA0 block, capability "semantic") ------------
@@ -2788,6 +2888,39 @@ test "round-trip: semantic layer frames" {
     try roundTrip(SemQueryResult, .{ .view = 7, .payload = .{ .s = "query subtree [4]\n" } });
     try roundTrip(SemRead, .{ .view = 7 });
     try roundTrip(SemReadResult, .{ .view = 7, .markdown = .{ .s = "# Heading\n\ntext\n" } });
+    try roundTrip(SemReadIds, .{ .view = 7 });
+    const entities = [_]ReaderEntity{
+        .{ .id = 4, .guard = 44, .kind = "heading", .text = "Heading", .url = "" },
+        .{ .id = 9, .guard = 99, .kind = "link", .text = "Next", .url = "https://example.test/next" },
+    };
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try encode(std.testing.allocator, &buf, SemReadIdsResult{
+        .view = 7,
+        .doc_gen = 3,
+        .rev = 12,
+        .markdown = .{ .s = "# Heading\n\n[Next](https://example.test/next)\n" },
+        .entities = &entities,
+    });
+    var reader = Reader.init(buf.items);
+    const rich_frame = (try reader.next()).?;
+    const rich = try SemReadIdsResult.decodeAlloc(rich_frame.payload, std.testing.allocator);
+    defer std.testing.allocator.free(rich.entities);
+    try std.testing.expectEqual(@as(u32, 3), rich.doc_gen);
+    try std.testing.expectEqualStrings("# Heading\n\n[Next](https://example.test/next)\n", rich.markdown.s);
+    try std.testing.expectEqual(@as(usize, 2), rich.entities.len);
+    try std.testing.expectEqual(@as(u32, 9), rich.entities[1].id);
+    try std.testing.expectEqual(@as(u64, 99), rich.entities[1].guard);
+    try std.testing.expectEqualStrings("https://example.test/next", rich.entities[1].url);
+    try roundTrip(SemActGuarded, .{
+        .view = 7,
+        .doc_gen = 3,
+        .rev = 12,
+        .id = 9,
+        .guard = 99,
+        .action = @intFromEnum(SemAct.click),
+        .arg = "",
+    });
     try roundTrip(SemEval, .{
         .view = 7,
         .flags = eval_flag_await,
@@ -3335,9 +3468,12 @@ test "inline frame round-trips rects, encodings and pixel payloads" {
     try std.testing.expectError(error.Truncated, FrameInline.decodeAlloc(frame.payload[0 .. frame.payload.len - 1], gpa));
 }
 
-test "inline frame family tags live in the 0xD0 block" {
+test "0xD0 reserved tags remain append-only" {
     try std.testing.expectEqual(@as(u8, 0xD0), @intFromEnum(Tag.frame_mode));
     try std.testing.expectEqual(@as(u8, 0xD1), @intFromEnum(Tag.frame_inline));
+    try std.testing.expectEqual(@as(u8, 0xD2), @intFromEnum(Tag.sem_read_ids));
+    try std.testing.expectEqual(@as(u8, 0xD3), @intFromEnum(Tag.sem_read_ids_result));
+    try std.testing.expectEqual(@as(u8, 0xD4), @intFromEnum(Tag.sem_act_guarded));
 }
 
 test "a dma-buf frame round-trips its planes" {

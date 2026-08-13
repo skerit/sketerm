@@ -661,6 +661,7 @@ const Pending = struct {
     /// Owned copy of a `sem_act` argument (the text to type).
     arg: []u8 = &.{},
     off: u32 = 0,
+    guard: u64 = 0,
 
     const Kind = enum {
         snapshot,
@@ -676,6 +677,8 @@ const Pending = struct {
         commit,
         expand,
         read,
+        read_ids,
+        guarded_act,
         eval,
         /// A custom dropdown was clicked open; waiting for the option's
         /// rect so the pick itself can be a trusted click too.
@@ -4376,6 +4379,35 @@ pub const Host = struct {
         }
     }
 
+    /// Refresh the live tree before resolving a reader id, then require
+    /// the exact document generation and revision returned by the read.
+    pub fn semActGuarded(self: *Host, req: proto.SemActGuarded) !void {
+        const v = self.find(req.view) orelse return;
+        if (v.discarded) {
+            self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = discarded_msg });
+            return;
+        }
+        const arg = try self.gpa.dupe(u8, req.arg);
+        errdefer self.gpa.free(arg);
+        const rid = try self.pushPending(v, .{
+            .req = nextReq(v),
+            .kind = .guarded_act,
+            .sid = req.id,
+            .mode = req.action,
+            .scope = req.doc_gen,
+            .off = req.rev,
+            .guard = req.guard,
+            .arg = arg,
+        });
+        var buf: [96]u8 = undefined;
+        const cmd = std.fmt.bufPrint(
+            &buf,
+            "{{\"op\":\"snapshot\",\"req\":{d},\"detail\":{d}}}",
+            .{ rid, v.sem_detail },
+        ) catch return;
+        self.sendScript(v, cmd);
+    }
+
     pub fn semExpand(self: *Host, req: proto.SemExpand) !void {
         const v = self.find(req.view) orelse return;
         // A discarded view's shadow tree is empty, so the unknown-id
@@ -4477,6 +4509,28 @@ pub const Host = struct {
         var buf: [64]u8 = undefined;
         const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"read\",\"req\":{d}}}", .{rid}) catch return;
         self.sendScript(v, cmd);
+    }
+
+    pub fn semReadIds(self: *Host, req: proto.SemReadIds) !void {
+        const v = self.find(req.view) orelse return;
+        if (v.discarded) {
+            self.post(proto.SemReadIdsResult{
+                .view = v.id,
+                .doc_gen = 0,
+                .rev = 0,
+                .markdown = .{ .s = discarded_msg },
+                .entities = &.{},
+            });
+            return;
+        }
+        const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .read_ids });
+        var buf: [72]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"read\",\"req\":{d},\"ids\":true}}", .{rid}) catch return;
+        self.sendScript(v, cmd);
+        if (!v.sem_observing) {
+            v.sem_observing = true;
+            self.sendScript(v, "{\"op\":\"observe\",\"on\":true}");
+        }
     }
 
     /// Re-arm a fresh document: a navigation builds a new V8 context,
@@ -4591,6 +4645,26 @@ pub const Host = struct {
                 .off = t.value.off,
                 .text = t.value.text[0..@min(t.value.text.len, max_expand)],
             });
+        } else if (std.mem.eql(u8, op, "markdown") and p.kind == .read_ids) {
+            const tree = semantic.parseTree(self.gpa, json) catch return;
+            defer tree.deinit();
+            v.sem.apply(tree.value) catch return;
+            const parsed = std.json.parseFromSlice(semantic.InReader, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
+            defer parsed.deinit();
+            const result = v.sem.readerResult(self.gpa, parsed.value) catch return;
+            defer self.gpa.free(result.entities);
+            var entities = self.gpa.alloc(proto.ReaderEntity, result.entities.len) catch return;
+            defer self.gpa.free(entities);
+            for (result.entities, 0..) |entity, i| {
+                entities[i] = .{ .id = entity.id, .guard = entity.guard, .kind = entity.kind, .text = entity.text, .url = entity.url };
+            }
+            self.post(proto.SemReadIdsResult{
+                .view = v.id,
+                .doc_gen = result.doc_gen,
+                .rev = result.rev,
+                .markdown = .{ .s = result.markdown },
+                .entities = entities,
+            });
         } else if (std.mem.eql(u8, op, "markdown")) {
             const Md = struct { md: []const u8 = "" };
             const m = std.json.parseFromSlice(Md, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
@@ -4617,6 +4691,25 @@ pub const Host = struct {
         defer parsed.deinit();
         v.sem.apply(parsed.value) catch return;
         const p = pend orelse return;
+
+        if (p.kind == .guarded_act) {
+            if (!v.sem.revisionMatches(p.scope, p.off) or v.sem.actionGuard(p.sid) != p.guard) {
+                self.post(proto.SemActResult{
+                    .view = v.id,
+                    .id = p.sid,
+                    .ok = 0,
+                    .msg = "stale reader id: the page changed since web_read; read the page again",
+                });
+                return;
+            }
+            self.semAct(.{
+                .view = v.id,
+                .id = p.sid,
+                .action = p.mode,
+                .arg = p.arg,
+            }) catch return;
+            return;
+        }
 
         if (p.kind == .hints) {
             // Link hints: the walk just folded, so the live tree's rects

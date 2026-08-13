@@ -28,6 +28,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const proto = @import("../web/protocol.zig");
+const reader_model = @import("../web/reader.zig");
 const findbin = @import("../web/findbin.zig");
 const png = @import("../util/png.zig");
 const clock = @import("../util/clock.zig");
@@ -132,6 +133,10 @@ pub const View = struct {
     /// The full text of the last eval result (what `web_expand [0]`
     /// pages), mirroring the GUI face.
     last_eval: ?[]u8 = null,
+    /// IDs returned by the last rich reader result. A later snapshot
+    /// clears them; navigation keeps them so an old reader ID fails stale.
+    reader_guards: std.ArrayList(ReaderGuard) = .empty,
+    reader_guards_active: bool = false,
 
     // Request interception (capability "intercept"). Counters come from
     // `intercept_status`; the log is PULLED on demand (`intercept_log`),
@@ -151,6 +156,7 @@ pub const View = struct {
         if (self.url) |u| gpa.free(u);
         if (self.title) |t| gpa.free(t);
         if (self.last_eval) |e| gpa.free(e);
+        self.reader_guards.deinit(gpa);
         if (self.net_log) |e| gpa.free(e);
         if (self.buf_fd >= 0) _ = c.close(self.buf_fd);
         for (&self.inbox) |*slot| {
@@ -161,6 +167,8 @@ pub const View = struct {
 };
 
 pub const State = enum { idle, ready, unavailable };
+
+const ReaderGuard = struct { id: u32, doc_gen: u32, rev: u32, guard: u64 };
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -193,6 +201,7 @@ pub const Engine = struct {
     current: u32 = 0,
     cap_shm: bool = false,
     cap_semantic: bool = false,
+    cap_reader_ids: bool = false,
     /// The helper can create a view directly at a url, so a view opened
     /// with one never holds a blank document first.
     cap_view_url: bool = false,
@@ -291,6 +300,11 @@ pub const Engine = struct {
             self.pid = -1;
         }
         self.clearViews();
+        self.cap_shm = false;
+        self.cap_semantic = false;
+        self.cap_reader_ids = false;
+        self.cap_view_url = false;
+        self.cap_intercept = false;
         self.removePresence();
         self.state = .unavailable;
         self.reason = LOST_MSG;
@@ -633,10 +647,24 @@ pub const Engine = struct {
 
         const sent: anyerror!void = switch (req.kind) {
             .snapshot => self.send(proto.SemSnapshotReq{ .view = view_id, .mode = req.mode, .detail = req.detail, .scope = req.scope }),
-            .act => self.send(proto.SemAction{ .view = view_id, .id = req.id, .action = req.action, .arg = req.arg }),
+            .act => if (readerGuard(v, req.id)) |guard|
+                self.send(proto.SemActGuarded{
+                    .view = view_id,
+                    .doc_gen = guard.doc_gen,
+                    .rev = guard.rev,
+                    .id = req.id,
+                    .guard = guard.guard,
+                    .action = req.action,
+                    .arg = req.arg,
+                })
+            else
+                self.send(proto.SemAction{ .view = view_id, .id = req.id, .action = req.action, .arg = req.arg }),
             .expand => self.send(proto.SemExpand{ .view = view_id, .id = req.id, .off = req.off, .len = req.len }),
             .query => self.send(proto.SemQueryReq{ .view = view_id, .kind = req.action, .arg = req.arg }),
-            .read => self.send(proto.SemRead{ .view = view_id }),
+            .read => if (self.cap_reader_ids)
+                self.send(proto.SemReadIds{ .view = view_id })
+            else
+                self.send(proto.SemRead{ .view = view_id }),
             .eval => self.send(proto.SemEval{ .view = view_id, .flags = req.flags, .timeout_ms = req.timeout_ms, .code = .{ .s = req.arg } }),
         };
         sent catch return error.Unavailable;
@@ -660,6 +688,13 @@ pub const Engine = struct {
             if (clock.nowMs() >= deadline) return .{ .timed_out = true };
             self.pumpOnce(40);
         }
+    }
+
+    fn readerGuard(v: *const View, id: u32) ?ReaderGuard {
+        for (v.reader_guards.items) |guard| {
+            if (guard.id == id) return guard;
+        }
+        return if (v.reader_guards_active) .{ .id = id, .doc_gen = 0, .rev = 0, .guard = 0 } else null;
     }
 
     // ---- frames / screenshot ----------------------------------------
@@ -850,6 +885,7 @@ pub const Engine = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.cap_semantic = true;
                     if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.cap_view_url = true;
                     if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.cap_intercept = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
                 }
             },
             .frame_buffer => {
@@ -932,7 +968,40 @@ pub const Engine = struct {
             },
             .sem_read_result => {
                 const ev = proto.decode(proto.SemReadResult, frame.payload) catch return;
-                if (self.findView(ev.view)) |v| self.park(v, .read, true, ev.markdown.s, 0, 0, 0);
+                if (self.findView(ev.view)) |v| {
+                    v.reader_guards.clearRetainingCapacity();
+                    v.reader_guards_active = false;
+                    self.park(v, .read, true, ev.markdown.s, 0, 0, 0);
+                }
+            },
+            .sem_read_ids_result => {
+                const ev = proto.SemReadIdsResult.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(ev.entities);
+                const v = self.findView(ev.view) orelse return;
+                v.reader_guards.ensureTotalCapacity(self.gpa, ev.entities.len) catch return;
+                v.reader_guards.clearRetainingCapacity();
+                for (ev.entities) |entity| {
+                    v.reader_guards.appendAssumeCapacity(.{
+                        .id = entity.id,
+                        .doc_gen = ev.doc_gen,
+                        .rev = ev.rev,
+                        .guard = entity.guard,
+                    });
+                }
+                v.reader_guards_active = true;
+                const entities = self.gpa.alloc(reader_model.Entity, ev.entities.len) catch return;
+                defer self.gpa.free(entities);
+                for (ev.entities, 0..) |entity, i| {
+                    entities[i] = .{ .id = entity.id, .kind = entity.kind, .text = entity.text, .url = entity.url };
+                }
+                const json = reader_model.stringify(self.gpa, .{
+                    .doc_gen = ev.doc_gen,
+                    .rev = ev.rev,
+                    .markdown = ev.markdown.s,
+                    .entities = entities,
+                }) catch return;
+                defer self.gpa.free(json);
+                self.park(v, .read, true, json, ev.doc_gen, ev.rev, 0);
             },
             .sem_eval_result => {
                 const ev = proto.decode(proto.SemEvalResult, frame.payload) catch return;
@@ -974,6 +1043,8 @@ pub const Engine = struct {
         const ki = @intFromEnum(OpKind.snapshot);
         const waiting = v.waiting[ki] and v.inbox[ki] == null;
         if (!waiting or (v.want_full and !full)) return;
+        v.reader_guards.clearRetainingCapacity();
+        v.reader_guards_active = false;
         self.park(v, .snapshot, true, ev.payload.s, ev.doc_gen, ev.rev, ev.kind);
     }
 };
@@ -1003,10 +1074,16 @@ test "a snapshot reply is exactly the helper's coalesced answer; strays are drop
     // concatenation with anything that arrived earlier.
     v.waiting[@intFromEnum(OpKind.snapshot)] = true;
     v.want_full = false;
+    v.reader_guards_active = true;
+    try v.reader_guards.append(gpa, .{ .id = 7, .doc_gen = 1, .rev = 2, .guard = 70 });
+    try std.testing.expectEqual(@as(u64, 70), Engine.readerGuard(v, 7).?.guard);
+    try std.testing.expectEqual(@as(u32, 0), Engine.readerGuard(v, 99).?.doc_gen);
     eng.onSnapshot(v, .{ .view = 1, .doc_gen = 1, .rev = 3, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "delta rev 2->3\n~ [5] more\n" } });
     const parked = v.inbox[@intFromEnum(OpKind.snapshot)].?;
     try std.testing.expectEqualStrings("delta rev 2->3\n~ [5] more\n", parked.text);
     try std.testing.expectEqual(@as(u32, 3), parked.rev);
+    try std.testing.expect(!v.reader_guards_active);
+    try std.testing.expect(Engine.readerGuard(v, 7) == null);
 }
 
 test "a full-mode wait is not satisfied by a spontaneous delta" {
