@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build the checked-out repo and install it, every time.
 #
-# Arch/derivatives go through makepkg + the PKGBUILD next to this file.
+# Arch-compatible hosts with makepkg + pacman use the PKGBUILD next to this file.
 # Debian/Ubuntu and anything else with dpkg get a .deb built here and
 # installed with dpkg -i, so the install is tracked and removable.
 # Everything else falls back to a plain install into a prefix.
@@ -19,16 +19,17 @@
 #   ./install.sh --gui-only      fail rather than silently dropping the GUI
 #   ./install.sh --deps          install package-manager build dependencies
 #   ./install.sh --prefix DIR    plain-install prefix (default /usr/local)
-#   ./install.sh --no-install    build and stage the package, do not install
-#   ./install.sh -- ARGS...      pass all remaining arguments to makepkg
+#   ./install.sh --no-install    build the package, but do not install it
+#   ./install.sh -- ARGS...      pass approved build options to makepkg
 #
-# On the Arch path any unrecognised argument is forwarded to makepkg.
-# Passthrough arguments are rejected if another packaging path is selected.
+# The Arch passthrough accepts exact non-relocating build options only; run
+# --help for the contract. Other backends reject all passthrough arguments.
 
 set -euo pipefail
 
 here=$(dirname "$(readlink -f "$0")")
 root=$(readlink -f "$here/..")
+source "$here/stage.sh"
 
 # The GUI calls into APIs that landed in these releases; below them it
 # does not compile at all (missing symbols, not deprecation warnings).
@@ -36,6 +37,8 @@ root=$(readlink -f "$here/..")
 GTK_MIN=4.14
 ADW_MIN=1.4
 GLIB_MIN=2.74
+CEF_INCLUDE=${CEF_INCLUDE:-/usr/include/cef}
+CEF_LIB=${CEF_LIB:-/usr/lib/cef}
 
 mode=auto          # auto | mux | gui
 prefix=/usr/local
@@ -66,21 +69,59 @@ while [ $# -gt 0 ]; do
             prefix="${1#*=}"
             [ -n "$prefix" ] || die "--prefix requires a non-empty directory argument"
             want_prefix=1 ;;
-        -h|--help)    sed -n '2,/^$/p' "$0"; exit 0 ;;
+        -h|--help)
+            sed -n '2,/^$/p' "$0"
+            cat <<'EOF'
+Arch makepkg passthrough accepts only these exact options:
+  -A -c -C -e -f -L -m (bundles allowed, for example -cLm)
+  --ignorearch --clean --cleanbuild --noextract --force --log --nocolor
+  --check --holdver --nocheck --noprepare --nosign --sign
+  --skipchecksums --skipinteg --skippgpcheck --noconfirm --noprogressbar
+  --key KEY, --key=KEY
+
+Long-option abbreviations, positional/environment arguments, sourced --config,
+-D/--dir, and -p are rejected. The installer always selects dist/PKGBUILD.
+--no-install still uses makepkg -s, which may install missing dependencies.
+On Arch-compatible hosts --deps is redundant because makepkg always receives -s.
+EOF
+            exit 0 ;;
         --)            shift; makepkg_args+=("$@"); break ;;
         *)            makepkg_args+=("$1") ;;
     esac
     shift
 done
 
-if [ "$do_install" -eq 0 ]; then
-    for arg in "${makepkg_args[@]}"; do
+validate_makepkg_args() {
+    local i arg
+    for ((i = 0; i < ${#makepkg_args[@]}; i++)); do
+        arg=${makepkg_args[i]}
+        if [[ "$arg" != --* ]] \
+                && [[ "${arg#-}" == *D* || "${arg#-}" == *p* ]]; then
+            die "source-relocating makepkg options -D/--dir and -p are not supported"
+        fi
         case "$arg" in
-            --install|-i*|-[^-]*i*)
-                die "--no-install cannot be combined with makepkg install option $arg" ;;
+            --d|--d=*|--di|--di=*|--dir|--dir=*)
+                die "source-relocating makepkg options -D/--dir and -p are not supported" ;;
+            --ignorearch|--clean|--cleanbuild|--noextract|--force|--log|--nocolor|\
+            --check|--holdver|--nocheck|--noprepare|--nosign|--sign|\
+            --skipchecksums|--skipinteg|--skippgpcheck|--noconfirm|--noprogressbar)
+                ;;
+            --key)
+                ((i + 1 < ${#makepkg_args[@]})) \
+                    || die "$arg requires an argument"
+                ((i += 1)) ;;
+            --key=*)
+                ;;
+            -*)
+                [[ "$arg" =~ ^-[AcCefLm]+$ ]] \
+                    || die "unsupported makepkg option $arg; use exact options listed by --help" ;;
+            *)
+                die "makepkg positional and environment arguments are not supported: $arg" ;;
         esac
     done
-fi
+}
+
+validate_makepkg_args
 
 as_root() {
     if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
@@ -128,11 +169,20 @@ probe_gui() {
     done
 }
 
+probe_web() {
+    web_ok=0
+    web_why="CEF headers or runtime not found (set CEF_INCLUDE and CEF_LIB for a system CEF install)"
+    [ -f "$CEF_INCLUDE/include/capi/cef_app_capi.h" ] || return 0
+    [ -f "$CEF_LIB/libcef.so" ] || return 0
+    web_ok=1
+    web_why=""
+}
+
 # --------------------------------------------------------------- build deps
 
 DEB_BUILD_DEPS=(
     build-essential pkg-config ncurses-bin
-    libgtk-4-dev libadwaita-1-dev libfreetype6-dev libharfbuzz-dev
+    libgtk-4-dev libadwaita-1-dev libglib2.0-dev libfreetype6-dev libharfbuzz-dev
     libepoxy-dev libfribidi-dev libfontconfig1-dev libvpx-dev libpulse-dev
 )
 # The daemon links libc only, so a mux-only build needs no -dev packages
@@ -165,6 +215,14 @@ build_all() {
         # Normal builds runtime-load Opus automatically.
         say "building GUI + daemon"
         zig build -Doptimize=ReleaseFast
+        if [ "$web_ok" -eq 1 ]; then
+            say "building browser helper"
+            zig build web -Doptimize=ReleaseFast \
+                -Dcef-include="$CEF_INCLUDE" \
+                -Dcef-lib="$CEF_LIB"
+        else
+            warn "$web_why; packaging browser identity without sketerm-webengine"
+        fi
     else
         say "building daemon only"
         zig build mux -Doptimize=ReleaseFast
@@ -176,99 +234,23 @@ build_all() {
 
 # ------------------------------------------------------------------ stage
 #
-# Lays the install tree out under $1 (a fake root). Identical layout to
-# the PKGBUILD's package(), so the two packagings cannot drift apart.
+# Selects the host terminfo compiler, then calls the staging implementation
+# shared with PKGBUILD.package().
 
 stage() {
-    local dest=$1 kind=$2
-    cd "$root"
-
-    install -Dm755 zig-out/bin/sketerm-mux "$dest/usr/bin/sketerm-mux"
-    install -Dm755 zig-out/bin/sketerm-mux-portable \
-        "$dest/usr/lib/sketerm/sketerm-mux-portable"
-
-    if [ "$kind" = gui ]; then
-        # The file manager is the SAME executable under its own name
-        # (argv[0] dispatch): a distinct binary + cmdline is what keeps
-        # Plasma's taskbar from merging the two apps. Hardlinked so the
-        # package does not ship the binary twice.
-        install -Dm755 zig-out/bin/sketerm "$dest/usr/bin/sketerm"
-        ln -f "$dest/usr/bin/sketerm" "$dest/usr/bin/sketerm-files"
-        ln -f "$dest/usr/bin/sketerm" "$dest/usr/bin/sketerm-viewer"
-        ln -f "$dest/usr/bin/sketerm" "$dest/usr/bin/sketerm-editor"
-
-        install -Dm644 data/dev.sker.sketerm.desktop \
-            "$dest/usr/share/applications/dev.sker.sketerm.desktop"
-        install -Dm644 data/dev.sker.sketerm.files.desktop \
-            "$dest/usr/share/applications/dev.sker.sketerm.files.desktop"
-        install -Dm644 data/dev.sker.sketerm.viewer.desktop \
-            "$dest/usr/share/applications/dev.sker.sketerm.viewer.desktop"
-        install -Dm644 data/dev.sker.sketerm.editor.desktop \
-            "$dest/usr/share/applications/dev.sker.sketerm.editor.desktop"
-
-        local i
-        for i in dev.sker.sketerm dev.sker.sketerm.files dev.sker.sketerm.viewer \
-                 dev.sker.sketerm.editor; do
-            install -Dm644 "data/icons/hicolor/scalable/apps/$i.svg" \
-                "$dest/usr/share/icons/hicolor/scalable/apps/$i.svg"
-        done
-        for i in sketerm-terminal-symbolic sketerm-split-left-right-symbolic \
-                 sketerm-split-top-bottom-symbolic sketerm-rendering-symbolic \
-                 sketerm-preview-pane-symbolic; do
-            install -Dm644 "data/icons/hicolor/scalable/actions/$i.svg" \
-                "$dest/usr/share/icons/hicolor/scalable/actions/$i.svg"
-        done
-
-        install -Dm644 data/sample.layout "$dest/usr/share/sketerm/sample.layout"
-
-        # Ready-made CRT shaders (custom_shader / "Pane Shader...").
-        # Per-file licensing (all GPL-3-compatible) -- see the README.
-        for i in crt crt-lottes crt-easymode zfast-crt; do
-            install -Dm644 "data/shaders/$i.glsl" \
-                "$dest/usr/share/sketerm/shaders/$i.glsl"
-        done
-        install -Dm644 data/shaders/README "$dest/usr/share/sketerm/shaders/README"
-    fi
-
-    install -Dm644 LICENSE "$dest/usr/share/licenses/sketerm/LICENSE"
-    install -Dm644 data/sample.conf "$dest/usr/share/sketerm/sample.conf"
-
-    # Shell-integration scripts + auto-injection shims. The daemon owns
-    # every PTY, so these ship with the mux-only install too: zsh/fish
-    # are injected at spawn, bash users source sketerm.bash themselves.
-    install -Dm644 data/shell-integration/sketerm.bash \
-        "$dest/usr/share/sketerm/shell-integration/sketerm.bash"
-    install -Dm644 data/shell-integration/sketerm.zsh \
-        "$dest/usr/share/sketerm/shell-integration/sketerm.zsh"
-    install -Dm644 data/shell-integration/sketerm.fish \
-        "$dest/usr/share/sketerm/shell-integration/sketerm.fish"
-    install -Dm644 data/shell-integration/zsh/.zshenv \
-        "$dest/usr/share/sketerm/shell-integration/zsh/.zshenv"
-    install -Dm644 data/shell-integration/bash/sketerm-rc.bash \
-        "$dest/usr/share/sketerm/shell-integration/bash/sketerm-rc.bash"
-    install -Dm644 data/shell-integration/fish-xdg/fish/vendor_conf.d/sketerm.fish \
-        "$dest/usr/share/sketerm/shell-integration/fish-xdg/fish/vendor_conf.d/sketerm.fish"
-
-    # Compile + install the terminfo entry system-wide so
-    # $TERM=sketerm-256color resolves without per-user setup.
-    #
-    # The SYSTEM tic is required, not merely the first one on PATH: a
-    # conda/homebrew ncurses writes hex-named directories (73/sketerm-*)
-    # and Debian's reader only ever looks in the letter directory (s/),
-    # so a foreign tic produces an entry that silently never resolves.
-    local tic_bin=""
-    if [ -x /usr/bin/tic ]; then
+    local dest=$1 kind=$2 tic_bin=${SKETERM_TIC:-}
+    if [ -n "$tic_bin" ]; then
+        [ -x "$tic_bin" ] || die "SKETERM_TIC is not executable: $tic_bin"
+    elif [ -x /usr/bin/tic ]; then
         tic_bin=/usr/bin/tic
     elif command -v tic >/dev/null 2>&1; then
         tic_bin=$(command -v tic)
         warn "using $tic_bin; if TERM=sketerm-256color does not resolve, install ncurses-bin"
     fi
-    if [ -n "$tic_bin" ]; then
-        install -d "$dest/usr/share/terminfo"
-        "$tic_bin" -x -o "$dest/usr/share/terminfo" terminfo/sketerm-256color.src
-    else
+    if [ -z "$tic_bin" ]; then
         warn "tic not found (install ncurses-bin); skipping terminfo entry"
     fi
+    sketerm_stage "$root" "$dest" "$kind" "$web_ok" "$tic_bin" sketerm
 }
 
 # ------------------------------------------------------------- debian path
@@ -307,6 +289,9 @@ do_debian() {
     deps=$(deb_depends_of "$stagedir/usr/bin/sketerm-mux")
     if [ "$kind" = gui ]; then
         deps="$deps, $(deb_depends_of "$stagedir/usr/bin/sketerm")"
+        if [ -x "$stagedir/usr/bin/sketerm-webengine" ]; then
+            deps="$deps, $(deb_depends_of "$stagedir/usr/bin/sketerm-webengine")"
+        fi
     fi
     # Collapse duplicates introduced by concatenating the two lists.
     deps=$(printf '%s' "$deps" | tr ',' '\n' | sed 's/^ *//; s/ *$//' \
@@ -332,6 +317,9 @@ do_debian() {
             echo "Provides: sketerm-mux"
             echo "Conflicts: sketerm-mux"
             echo "Replaces: sketerm-mux"
+            if [ "$web_ok" -eq 0 ]; then
+                echo "X-Sketerm-Webengine: omitted ($web_why)"
+            fi
             echo "Description: Native GTK4 terminal emulator written in Zig"
             echo " Terminal emulator with a client-server core: every terminal is a"
             echo " session owned by the sketerm-mux daemon, so panes survive a GUI"
@@ -380,9 +368,10 @@ do_plain() {
 
 # ----------------------------------------------------------------- driver
 
-if command -v makepkg >/dev/null 2>&1 && [ "$mode" != mux ]; then
+if command -v makepkg >/dev/null 2>&1 && command -v pacman >/dev/null 2>&1 \
+        && [ "$mode" != mux ]; then
     [ "$want_prefix" -eq 0 ] || die "--prefix applies only to plain installs without a package manager"
-    say "Arch detected, delegating to makepkg"
+    say "Arch-compatible makepkg/pacman host detected, delegating to makepkg"
     cd "$here"
     if [ "$do_install" -eq 1 ]; then
         exec makepkg -sif "${makepkg_args[@]}"
@@ -391,46 +380,48 @@ if command -v makepkg >/dev/null 2>&1 && [ "$mode" != mux ]; then
     fi
 fi
 
-probe_gui
-
-case "$mode" in
-    gui)
-        [ "$gui_ok" -eq 1 ] || die "GUI build not possible here: $gui_why"
-        kind=gui ;;
-    mux)
-        kind=mux ;;
-    auto)
-        if [ "$gui_ok" -eq 1 ]; then
-            kind=gui
-        else
-            kind=mux
-            warn "$gui_why"
-            warn "building the sketerm-mux daemon only; pass --gui-only to make this fatal"
-        fi ;;
-esac
-
 if [ ${#makepkg_args[@]} -gt 0 ]; then
-    die "makepkg passthrough arguments require an Arch GUI package build"
+    die "makepkg passthrough arguments require an Arch-compatible GUI package build"
 fi
+
+select_kind() {
+    case "$mode" in
+        mux)
+            kind=mux ;;
+        gui)
+            probe_gui
+            [ "$gui_ok" -eq 1 ] || die "GUI build not possible here: $gui_why"
+            kind=gui ;;
+        auto)
+            probe_gui
+            if [ "$gui_ok" -eq 1 ]; then
+                kind=gui
+            else
+                kind=mux
+                warn "$gui_why"
+                warn "building the sketerm-mux daemon only; pass --gui-only to make this fatal"
+            fi ;;
+    esac
+    if [ "$kind" = gui ]; then probe_web; else web_ok=0; web_why=""; fi
+}
 
 if command -v dpkg-deb >/dev/null 2>&1; then
     [ "$want_prefix" -eq 0 ] || die "--prefix applies only to plain installs without a package manager"
     if [ "$want_deps" -eq 1 ]; then
-        if [ "$kind" = gui ]; then
-            install_deb_deps DEB_BUILD_DEPS
-        else
+        if [ "$mode" = mux ]; then
             install_deb_deps DEB_BUILD_DEPS_MUX
+        else
+            install_deb_deps DEB_BUILD_DEPS
         fi
-        # Dependencies can turn a mux-only verdict into a GUI one.
-        probe_gui
-        [ "$mode" = auto ] && [ "$gui_ok" -eq 1 ] && kind=gui
     fi
+    select_kind
     build_all "$kind"
     do_debian "$kind"
 else
     [ "$want_deps" -eq 0 ] \
-        || die "--deps requires an Arch GUI package build or a dpkg-based host"
+        || die "--deps requires an Arch-compatible GUI package build or a dpkg-based host"
     warn "no makepkg and no dpkg-deb; falling back to a plain install"
+    select_kind
     build_all "$kind"
     do_plain "$kind"
 fi

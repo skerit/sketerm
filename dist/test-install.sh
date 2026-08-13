@@ -12,8 +12,9 @@ mkdir -p "$fakebin"
 
 cat > "$fakebin/pkg-config" <<'EOF'
 #!/usr/bin/env bash
-if [ "${INSTALL_TEST_PKG_CONFIG_FAIL:-0}" -eq 1 ]; then
-    printf 'pkg-config must not run before makepkg\n' >&2
+if [ "${INSTALL_TEST_PKG_CONFIG_FAIL:-0}" -eq 1 ] \
+        && [ ! -e "${INSTALL_TEST_DEPS_READY:-/no/such/file}" ]; then
+    printf 'missing development package\n' >&2
     exit 88
 fi
 printf '99.0\n'
@@ -35,7 +36,12 @@ cat > "$fakebin/tic" <<'EOF'
 exit 0
 EOF
 
-chmod +x "$fakebin/pkg-config" "$fakebin/makepkg" "$fakebin/tic"
+cat > "$fakebin/pacman" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+chmod +x "$fakebin/pkg-config" "$fakebin/makepkg" "$fakebin/tic" "$fakebin/pacman"
 
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
@@ -69,31 +75,41 @@ run_installer "$work/help.out" --help
 
 run_installer "$work/normal.out" \
     --gui-only --deps \
-    --config "/tmp/config with spaces" '--literal=*' ''
-assert_argv -sif --config "/tmp/config with spaces" '--literal=*' ''
+    -cLm --key "/tmp/installer-dir pfile" '--key=literal*'
+assert_argv -sif -cLm --key "/tmp/installer-dir pfile" '--key=literal*'
 [ "$(<"$INSTALL_TEST_CWD")" = "$here" ] \
     || fail "makepkg did not run from dist"
 
 run_installer "$work/no-install.out" \
-    --gui-only --no-install -- --help "two words" ''
-assert_argv -sf --help "two words" ''
+    --gui-only --no-install -- -A --nocheck --key=/tmp/installer-dir-pfile
+assert_argv -sf -A --nocheck --key=/tmp/installer-dir-pfile
 
 INSTALL_TEST_PKG_CONFIG_FAIL=1 run_installer "$work/missing-deps.out" --deps
 assert_argv -sif
 
-set +e
-run_installer "$work/install-conflict.out" --no-install -- --install
-status=$?
-set -e
-[ "$status" -eq 1 ] || fail "--no-install accepted a makepkg install option"
-[[ "$(<"$work/install-conflict.out")" == *"--no-install cannot be combined"* ]] \
-    || fail "conflicting makepkg install option failure was not explicit"
+for rejected in -i -cif --install --inst --insta --instal --needed --asdeps \
+                -D -D/tmp/installer-dir -cD/tmp/installer-dir -p -pfile \
+                --d=/tmp/build --di=/tmp/build --dir=/tmp/build; do
+    set +e
+    run_installer "$work/rejected.out" --no-install -- "$rejected"
+    status=$?
+    set -e
+    [ "$status" -eq 1 ] || fail "unsafe makepkg option was accepted: $rejected"
+    case "$rejected" in
+        *D*|-p*|--d*)
+            [[ "$(<"$work/rejected.out")" == *"source-relocating makepkg options"* ]] \
+                || fail "relocating option had the wrong failure: $rejected" ;;
+    esac
+done
 
-set +e
-run_installer "$work/short-install-conflict.out" --no-install -i
-status=$?
-set -e
-[ "$status" -eq 1 ] || fail "--no-install accepted makepkg -i"
+for rejected in -o -R -S --packagelist --printsrcinfo --verifysource \
+                --config=/tmp/makepkg.conf 'CFLAGS=-pipe'; do
+    set +e
+    run_installer "$work/rejected.out" -- "$rejected"
+    status=$?
+    set -e
+    [ "$status" -eq 1 ] || fail "non-building makepkg argument was accepted: $rejected"
+done
 
 set +e
 PATH="$fakebin:$PATH" \
@@ -142,6 +158,7 @@ set -e
 fixture="$work/package-source"
 mkdir -p "$fixture/dist" "$fixture/zig-out/bin" "$work/pkg"
 cp "$here/install.sh" "$fixture/dist/install.sh"
+cp "$here/stage.sh" "$fixture/dist/stage.sh"
 ln -s "$root/data" "$fixture/data"
 ln -s "$root/terminfo" "$fixture/terminfo"
 ln -s "$root/LICENSE" "$fixture/LICENSE"
@@ -159,6 +176,10 @@ EOF
 
 cat > "$fakebin/dpkg-query" <<'EOF'
 #!/usr/bin/env bash
+if [ "${INSTALL_TEST_DEPS_MISSING:-0}" -eq 1 ] \
+        && [ ! -e "${INSTALL_TEST_DEPS_READY:-/no/such/file}" ]; then
+    exit 1
+fi
 printf 'install ok installed'
 EOF
 
@@ -181,8 +202,11 @@ cat > "$fakebin/dpkg-deb" <<'EOF'
 [ "$1" = --root-owner-group ] && [ "$2" = --build ] || exit 92
 stagedir=$3
 debfile=$4
-[ -x "$stagedir/usr/bin/sketerm" ] || exit 93
 [ -x "$stagedir/usr/bin/sketerm-mux" ] || exit 94
+if [ -x "$stagedir/usr/bin/sketerm" ]; then
+    [ -x "$stagedir/usr/bin/sketerm-webengine" ] || exit 96
+    [ -f "$stagedir/usr/share/xdg-desktop-portal/portals/sketerm.portal" ] || exit 97
+fi
 printf '%s\n' "$debfile" > "$INSTALL_TEST_DEB_LOG"
 printf 'fake deb\n' > "$debfile"
 EOF
@@ -197,6 +221,16 @@ printf 'forbidden privileged invocation: %s %s\n' "$0" "$*" >> "$INSTALL_TEST_FO
 exit 95
 EOF
 done
+
+cat > "$fakebin/apt-get" <<'EOF'
+#!/usr/bin/env bash
+printf '<apt>' >> "$INSTALL_TEST_APT_LOG"
+printf ' <%s>' "$@" >> "$INSTALL_TEST_APT_LOG"
+printf '\n' >> "$INSTALL_TEST_APT_LOG"
+if [ "${1:-}" = install ]; then
+    : > "$INSTALL_TEST_DEPS_READY"
+fi
+EOF
 
 cat > "$work/no-makepkg.bash" <<'EOF'
 command() {
@@ -222,9 +256,16 @@ chmod +x "$fixture/dist/install.sh" "$fakebin/zig" "$fakebin/dpkg-query" \
     "$fakebin/dpkg" "$fakebin/ldd" "$fakebin/dpkg-deb" \
     "$fakebin/sudo" "$fakebin/apt-get"
 
+cef_include="$work/cef/include-root"
+cef_lib="$work/cef/lib"
+mkdir -p "$cef_include/include/capi" "$cef_lib"
+: > "$cef_include/include/capi/cef_app_capi.h"
+: > "$cef_lib/libcef.so"
+
 set +e
 BASH_ENV="$work/no-makepkg.bash" \
     PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
     INSTALL_TEST_ZIG_LOG="$work/rejected-zig.log" \
     "$fixture/dist/install.sh" --gui-only --prefix "$work/plain-prefix" \
     > "$work/debian-prefix.out" 2>&1
@@ -249,8 +290,18 @@ set -e
 INSTALL_TEST_ZIG_LOG="$work/zig.log"
 INSTALL_TEST_DEB_LOG="$work/deb.log"
 INSTALL_TEST_FORBIDDEN="$work/forbidden.log"
+INSTALL_TEST_APT_LOG="$work/apt.log"
+INSTALL_TEST_DEPS_READY="$work/deps-ready"
 BASH_ENV="$work/no-makepkg.bash" \
     PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    CEF_INCLUDE="$cef_include" \
+    CEF_LIB="$cef_lib" \
+    INSTALL_TEST_PKG_CONFIG_FAIL=1 \
+    INSTALL_TEST_DEPS_MISSING=1 \
+    INSTALL_TEST_DEPS_READY="$INSTALL_TEST_DEPS_READY" \
+    INSTALL_TEST_APT_LOG="$INSTALL_TEST_APT_LOG" \
+    INSTALL_TEST_ALLOW_SUDO=1 \
     INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
     INSTALL_TEST_DEB_LOG="$INSTALL_TEST_DEB_LOG" \
     INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
@@ -265,23 +316,121 @@ BASH_ENV="$work/no-makepkg.bash" \
     || fail "non-Arch GUI build was not invoked"
 [[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast>"* ]] \
     || fail "non-Arch portable daemon build was not invoked"
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <web> <-Doptimize=ReleaseFast> <-Dcef-include=$cef_include> <-Dcef-lib=$cef_lib>"* ]] \
+    || fail "non-Arch browser helper build was not invoked"
+[[ "$(<"$INSTALL_TEST_APT_LOG")" == *"<apt> <install> <-y> <build-essential> <pkg-config>"* ]] \
+    || fail "--gui-only --deps did not install GUI dependencies before probing"
 [[ "$(<"$work/debian.out")" == *"staged only, not installed"* ]] \
     || fail "non-Arch --no-install result was not reported"
+
+rm -f "$INSTALL_TEST_DEPS_READY"
+: > "$INSTALL_TEST_ZIG_LOG"
+BASH_ENV="$work/no-makepkg.bash" \
+    PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    CEF_INCLUDE="$cef_include" \
+    CEF_LIB="$cef_lib" \
+    INSTALL_TEST_PKG_CONFIG_FAIL=1 \
+    INSTALL_TEST_DEPS_MISSING=1 \
+    INSTALL_TEST_DEPS_READY="$INSTALL_TEST_DEPS_READY" \
+    INSTALL_TEST_APT_LOG="$INSTALL_TEST_APT_LOG" \
+    INSTALL_TEST_ALLOW_SUDO=1 \
+    INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+    INSTALL_TEST_DEB_LOG="$INSTALL_TEST_DEB_LOG" \
+    INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
+    "$fixture/dist/install.sh" --deps --no-install \
+    > "$work/debian-auto.out" 2>&1
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <-Doptimize=ReleaseFast>"* ]] \
+    || fail "auto --deps stayed locked to a mux-only build"
+
+rm -f "$INSTALL_TEST_DEPS_READY" "$INSTALL_TEST_ZIG_LOG"
+: > "$INSTALL_TEST_APT_LOG"
+set +e
+BASH_ENV="$work/no-makepkg.bash" \
+    PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    INSTALL_TEST_PKG_CONFIG_FAIL=1 \
+    INSTALL_TEST_DEPS_READY="$INSTALL_TEST_DEPS_READY" \
+    INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+    "$fixture/dist/install.sh" --gui-only --no-install \
+    > "$work/debian-no-deps.out" 2>&1
+status=$?
+set -e
+[ "$status" -eq 1 ] || fail "--gui-only without --deps ignored missing GUI dependencies"
+[ ! -e "$INSTALL_TEST_ZIG_LOG" ] || fail "--gui-only probed dependencies after starting the build"
+[ ! -s "$INSTALL_TEST_APT_LOG" ] || fail "GUI dependencies were installed without --deps"
+
+: > "$INSTALL_TEST_ZIG_LOG"
+BASH_ENV="$work/no-makepkg.bash" \
+    PATH="$fakebin:$PATH" \
+    INSTALL_TEST_PKG_CONFIG_FAIL=1 \
+    INSTALL_TEST_DEPS_READY="$INSTALL_TEST_DEPS_READY" \
+    SKETERM_TIC="$fakebin/tic" \
+    INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+    INSTALL_TEST_DEB_LOG="$INSTALL_TEST_DEB_LOG" \
+    INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
+    "$fixture/dist/install.sh" --no-install \
+    > "$work/debian-auto-no-deps.out" 2>&1
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <mux> <-Doptimize=ReleaseFast>"* ]] \
+    || fail "auto mode without --deps did not degrade to mux"
+[[ "$(<"$work/debian-auto-no-deps.out")" == *"building the sketerm-mux daemon only"* ]] \
+    || fail "auto mode without --deps did not explain its mux fallback"
 
 mkdir -p "$work/plain-tmp" "$work/plain-prefix"
 BASH_ENV="$work/no-packager.bash" \
     TMPDIR="$work/plain-tmp" \
     PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    CEF_INCLUDE="$cef_include" \
+    CEF_LIB="$cef_lib" \
     INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
-    "$fixture/dist/install.sh" --mux-only --no-install \
+    "$fixture/dist/install.sh" --gui-only --no-install \
     > "$work/plain.out" 2>&1
 [[ "$(<"$work/plain.out")" == *"staged in $work/plain-tmp/"* ]] \
     || fail "plain --no-install did not preserve and report its staging tree"
-[[ "$(<"$work/plain.out")" == *"built: sketerm-mux (daemon), not installed"* ]] \
-    || fail "plain --no-install claimed the daemon was installed"
+plain_stage=("$work/plain-tmp"/tmp.*)
+[ ${#plain_stage[@]} -eq 1 ] || fail "plain staging tree was not preserved exactly once"
+for identity in dev.sker.sketerm dev.sker.sketerm.files dev.sker.sketerm.viewer \
+                dev.sker.sketerm.editor dev.sker.sketerm.web; do
+    [ -e "${plain_stage[0]}/usr/share/applications/$identity.desktop" ] \
+        || fail "plain GUI stage omitted $identity.desktop"
+    [ -e "${plain_stage[0]}/usr/share/icons/hicolor/scalable/apps/$identity.svg" ] \
+        || fail "plain GUI stage omitted $identity.svg"
+done
+for path in \
+    usr/bin/sketerm-files usr/bin/sketerm-viewer usr/bin/sketerm-editor \
+    usr/bin/sketerm-web usr/bin/sketerm-webengine \
+    usr/share/icons/hicolor/scalable/actions/sketerm-reader-symbolic.svg \
+    usr/share/xdg-desktop-portal/portals/sketerm.portal \
+    usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service; do
+    [ -e "${plain_stage[0]}/$path" ] || fail "plain GUI stage omitted $path"
+done
+
+mkdir -p "$work/plain-no-cef-tmp"
+set +e
+BASH_ENV="$work/no-packager.bash" \
+    TMPDIR="$work/plain-no-cef-tmp" \
+    PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    CEF_INCLUDE="$work/no-cef-include" \
+    CEF_LIB="$work/no-cef-lib" \
+    INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+    "$fixture/dist/install.sh" --gui-only --no-install \
+    > "$work/plain-no-cef.out" 2>&1
+status=$?
+set -e
+[ "$status" -eq 0 ] || fail "CEF-less plain stage failed: $(<"$work/plain-no-cef.out")"
+plain_no_cef_stage=("$work/plain-no-cef-tmp"/tmp.*)
+[ -e "${plain_no_cef_stage[0]}/usr/bin/sketerm-web" ] \
+    || fail "CEF-less stage omitted browser identity"
+[ ! -e "${plain_no_cef_stage[0]}/usr/bin/sketerm-webengine" ] \
+    || fail "CEF-less stage packaged an unbuilt browser helper"
+[[ "$(<"$work/plain-no-cef.out")" == *"packaging browser identity without sketerm-webengine"* ]] \
+    || fail "CEF-less stage did not report its browser-helper limitation"
 
 BASH_ENV="$work/no-packager.bash" \
     PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
     INSTALL_TEST_ALLOW_SUDO=1 \
     INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
     "$fixture/dist/install.sh" --mux-only --prefix "$work/plain-prefix" \
@@ -294,6 +443,9 @@ BASH_ENV="$work/no-packager.bash" \
     startdir="$fixture/dist"
     pkgdir="$work/pkg"
     source "$here/PKGBUILD"
+    [[ " ${depends[*]} " == *" gtk4>=4.14 "* ]] || fail "PKGBUILD lacks GTK minimum"
+    [[ " ${depends[*]} " == *" libadwaita>=1.4 "* ]] || fail "PKGBUILD lacks libadwaita minimum"
+    [[ " ${depends[*]} " == *" glib2>=2.74 "* ]] || fail "PKGBUILD lacks GLib minimum"
     PATH="$fakebin:$PATH" build
     PATH="$fakebin:$PATH" package
 )
