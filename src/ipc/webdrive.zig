@@ -29,6 +29,7 @@ const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const proto = @import("../web/protocol.zig");
 const reader_model = @import("../web/reader.zig");
+const reader_guards = @import("../web/reader_guards.zig");
 const findbin = @import("../web/findbin.zig");
 const png = @import("../util/png.zig");
 const clock = @import("../util/clock.zig");
@@ -122,21 +123,25 @@ pub const View = struct {
     /// just-acted-on page is photographed after the repaint.
     frame_gen: u32 = 0,
 
-    // Semantic bookkeeping: at most one op of each kind is in flight
-    // (the reply frames carry no request id), and this driver is
-    // called synchronously, so a parked reply per kind suffices.
+    // Semantic bookkeeping. This driver is called synchronously, so a
+    // parked reply per kind suffices; request ids reject late replies
+    // from abandoned calls. Legacy helpers permit one op per kind.
     inbox: [N_KINDS]?Sem = @splat(null),
     waiting: [N_KINDS]bool = @splat(false),
+    waiting_request: [N_KINDS]u32 = @splat(0),
+    /// Legacy replies have no request id. After a client timeout, one
+    /// late reply must be consumed before that kind can be reused.
+    legacy_quarantine: [N_KINDS]bool = @splat(false),
     /// A mode:full snapshot is not satisfied by a delta (a stray push
     /// from a pre-coalescing helper).
     want_full: bool = false,
     /// The full text of the last eval result (what `web_expand [0]`
     /// pages), mirroring the GUI face.
     last_eval: ?[]u8 = null,
-    /// IDs returned by the last rich reader result. A later snapshot
-    /// clears them; navigation keeps them so an old reader ID fails stale.
-    reader_guards: std.ArrayList(ReaderGuard) = .empty,
-    reader_guards_active: bool = false,
+    /// Every ID ever returned by rich reader mode on this helper view.
+    /// New reads refresh matching guards and invalidate absent ones;
+    /// unrelated snapshots never erase the ID's reader provenance.
+    reader_guards: reader_guards.Store = .{},
 
     // Request interception (capability "intercept"). Counters come from
     // `intercept_status`; the log is PULLED on demand (`intercept_log`),
@@ -167,8 +172,6 @@ pub const View = struct {
 };
 
 pub const State = enum { idle, ready, unavailable };
-
-const ReaderGuard = struct { id: u32, doc_gen: u32, rev: u32, guard: u64 };
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -202,11 +205,13 @@ pub const Engine = struct {
     cap_shm: bool = false,
     cap_semantic: bool = false,
     cap_reader_ids: bool = false,
+    cap_semantic_request_ids: bool = false,
     /// The helper can create a view directly at a url, so a view opened
     /// with one never holds a blank document first.
     cap_view_url: bool = false,
     /// The helper runs the in-process content-blocking filter engine.
     cap_intercept: bool = false,
+    next_sem_request: u32 = 1,
 
     pub fn init(gpa: std.mem.Allocator, dir: []const u8, instance: ?[]const u8) !Engine {
         const owned_dir = try gpa.dupe(u8, dir);
@@ -303,6 +308,7 @@ pub const Engine = struct {
         self.cap_shm = false;
         self.cap_semantic = false;
         self.cap_reader_ids = false;
+        self.cap_semantic_request_ids = false;
         self.cap_view_url = false;
         self.cap_intercept = false;
         self.removePresence();
@@ -511,8 +517,9 @@ pub const Engine = struct {
 
     pub fn navAction(self: *Engine, id: u32, action: proto.NavAct) !void {
         if (!self.ensure()) return error.Unavailable;
-        if (self.findView(id) == null) return error.NoView;
+        const v = self.findView(id) orelse return error.NoView;
         self.send(proto.NavAction{ .view = id, .action = @intFromEnum(action) }) catch return error.Unavailable;
+        if (action == .stop) v.reader_guards.invalidate();
     }
 
     /// Wheel scroll through the ordinary input path, at the view
@@ -559,7 +566,7 @@ pub const Engine = struct {
         rules: u32,
     } {
         if (!self.ensure()) return error.Unavailable;
-        const v = self.findView(id) orelse return error.NoView;
+        if (self.findView(id) == null) return error.NoView;
         self.send(proto.InterceptStatusReq{ .view = id }) catch return error.Unavailable;
         const deadline = clock.nowMs() + @max(budget_ms, 100);
         // One short settle so a just-updated count lands; the counters
@@ -569,7 +576,8 @@ pub const Engine = struct {
             self.pumpOnce(40);
             break;
         }
-        return .{ .enabled = v.net_enabled, .blocked = v.net_blocked, .total = v.net_total, .rules = v.net_rules };
+        const current = self.findView(id) orelse return error.NoView;
+        return .{ .enabled = current.net_enabled, .blocked = current.net_blocked, .total = current.net_total, .rules = current.net_rules };
     }
 
     /// Pull recent log entries as one JSON object; caller's arena owns
@@ -627,28 +635,34 @@ pub const Engine = struct {
     pub fn runOp(self: *Engine, arena: std.mem.Allocator, view_id: u32, req: OpReq, budget_ms: i64) !OpOut {
         if (!self.ensure()) return error.Unavailable;
         if (!self.cap_semantic) return error.NoSemantic;
-        const v = self.findView(view_id) orelse return error.NoView;
+        if (self.findView(view_id) == null) return error.NoView;
 
         // `click`/`hover` are synthesized through the real input path,
         // which needs a composited frame to hit-test against.
         if (req.kind == .act) self.awaitFirstPaint(view_id, @min(budget_ms, 5_000));
 
         const ki = @intFromEnum(req.kind);
+        const v = self.findView(view_id) orelse return error.NoView;
+        if (!self.cap_semantic_request_ids and v.legacy_quarantine[ki])
+            return error.LegacySemanticReplyPending;
         // Drop a stale parked reply from an earlier timed-out call of
         // the same kind: it answers an older question.
         if (v.inbox[ki]) |old| {
             self.gpa.free(old.text);
             v.inbox[ki] = null;
         }
+        const request = if (self.cap_semantic_request_ids) self.nextSemanticRequest() else 0;
         v.waiting[ki] = true;
+        v.waiting_request[ki] = request;
         if (req.kind == .snapshot)
             v.want_full = req.mode == @intFromEnum(proto.SnapMode.full) or req.scope != 0;
-        defer v.waiting[ki] = false;
+        var timed_out = false;
+        defer self.finishWait(view_id, ki, request, timed_out);
 
         const sent: anyerror!void = switch (req.kind) {
-            .snapshot => self.send(proto.SemSnapshotReq{ .view = view_id, .mode = req.mode, .detail = req.detail, .scope = req.scope }),
+            .snapshot => self.sendSemantic(request, proto.SemSnapshotReq{ .view = view_id, .mode = req.mode, .detail = req.detail, .scope = req.scope }),
             .act => if (readerGuard(v, req.id)) |guard|
-                self.send(proto.SemActGuarded{
+                self.sendSemantic(request, proto.SemActGuarded{
                     .view = view_id,
                     .doc_gen = guard.doc_gen,
                     .rev = guard.rev,
@@ -658,14 +672,14 @@ pub const Engine = struct {
                     .arg = req.arg,
                 })
             else
-                self.send(proto.SemAction{ .view = view_id, .id = req.id, .action = req.action, .arg = req.arg }),
-            .expand => self.send(proto.SemExpand{ .view = view_id, .id = req.id, .off = req.off, .len = req.len }),
-            .query => self.send(proto.SemQueryReq{ .view = view_id, .kind = req.action, .arg = req.arg }),
+                self.sendSemantic(request, proto.SemAction{ .view = view_id, .id = req.id, .action = req.action, .arg = req.arg }),
+            .expand => self.sendSemantic(request, proto.SemExpand{ .view = view_id, .id = req.id, .off = req.off, .len = req.len }),
+            .query => self.sendSemantic(request, proto.SemQueryReq{ .view = view_id, .kind = req.action, .arg = req.arg }),
             .read => if (self.cap_reader_ids)
-                self.send(proto.SemReadIds{ .view = view_id })
+                self.sendSemantic(request, proto.SemReadIds{ .view = view_id })
             else
-                self.send(proto.SemRead{ .view = view_id }),
-            .eval => self.send(proto.SemEval{ .view = view_id, .flags = req.flags, .timeout_ms = req.timeout_ms, .code = .{ .s = req.arg } }),
+                self.sendSemantic(request, proto.SemRead{ .view = view_id }),
+            .eval => self.sendSemantic(request, proto.SemEval{ .view = view_id, .flags = req.flags, .timeout_ms = req.timeout_ms, .code = .{ .s = req.arg } }),
         };
         sent catch return error.Unavailable;
 
@@ -685,16 +699,31 @@ pub const Engine = struct {
                 }
             } else return error.NoView;
             if (self.state != .ready) return error.Unavailable;
-            if (clock.nowMs() >= deadline) return .{ .timed_out = true };
+            if (clock.nowMs() >= deadline) {
+                timed_out = true;
+                return .{ .timed_out = true };
+            }
             self.pumpOnce(40);
         }
     }
 
-    fn readerGuard(v: *const View, id: u32) ?ReaderGuard {
-        for (v.reader_guards.items) |guard| {
-            if (guard.id == id) return guard;
-        }
-        return if (v.reader_guards_active) .{ .id = id, .doc_gen = 0, .rev = 0, .guard = 0 } else null;
+    fn readerGuard(v: *const View, id: u32) ?reader_guards.Entry {
+        return v.reader_guards.get(id);
+    }
+
+    fn nextSemanticRequest(self: *Engine) u32 {
+        const request = self.next_sem_request;
+        self.next_sem_request +%= 1;
+        if (self.next_sem_request == 0) self.next_sem_request = 1;
+        return request;
+    }
+
+    fn finishWait(self: *Engine, view_id: u32, ki: usize, request: u32, timed_out: bool) void {
+        const v = self.findView(view_id) orelse return;
+        if (!v.waiting[ki] or v.waiting_request[ki] != request) return;
+        v.waiting[ki] = false;
+        v.waiting_request[ki] = 0;
+        if (timed_out and request == 0) v.legacy_quarantine[ki] = true;
     }
 
     // ---- frames / screenshot ----------------------------------------
@@ -762,6 +791,18 @@ pub const Engine = struct {
             var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLOUT, .revents = 0 };
             _ = c.poll(&pfd, 1, 50);
         }
+    }
+
+    fn sendSemantic(self: *Engine, request: u32, value: anytype) !void {
+        if (request == 0) return self.send(value);
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.gpa);
+        try proto.encodePayload(self.gpa, &payload, value);
+        return self.send(proto.SemRequest{
+            .request = request,
+            .kind = @intFromEnum(@TypeOf(value).tag),
+            .payload = .{ .s = payload.items },
+        });
     }
 
     /// Wait up to `slice_ms` for helper bytes and dispatch what
@@ -863,7 +904,17 @@ pub const Engine = struct {
         slot.* = owned;
     }
 
-    fn park(self: *Engine, v: *View, kind: OpKind, ok: bool, text: []const u8, doc_gen: u32, rev: u32, snap_kind: u8) void {
+    fn acceptsSemanticReply(v: *View, kind: OpKind, request: u32) bool {
+        const ki = @intFromEnum(kind);
+        if (request == 0 and v.legacy_quarantine[ki]) {
+            v.legacy_quarantine[ki] = false;
+            return false;
+        }
+        return v.waiting[ki] and v.waiting_request[ki] == request and v.inbox[ki] == null;
+    }
+
+    fn park(self: *Engine, v: *View, kind: OpKind, request: u32, ok: bool, text: []const u8, doc_gen: u32, rev: u32, snap_kind: u8) void {
+        if (!acceptsSemanticReply(v, kind, request)) return;
         const ki = @intFromEnum(kind);
         const owned = self.gpa.dupe(u8, text) catch return;
         if (v.inbox[ki]) |old| self.gpa.free(old.text);
@@ -880,12 +931,19 @@ pub const Engine = struct {
                     self.reason = "the browser helper speaks a different protocol version";
                     return;
                 }
+                self.cap_shm = false;
+                self.cap_semantic = false;
+                self.cap_reader_ids = false;
+                self.cap_semantic_request_ids = false;
+                self.cap_view_url = false;
+                self.cap_intercept = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.cap_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.cap_semantic = true;
                     if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.cap_view_url = true;
                     if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.cap_intercept = true;
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
                 }
             },
             .frame_buffer => {
@@ -935,7 +993,10 @@ pub const Engine = struct {
                 const ev = proto.decode(proto.EvLoad, frame.payload) catch return;
                 if (self.findView(ev.view)) |v| {
                     switch (ev.state) {
-                        @intFromEnum(proto.LoadState.started) => v.loading = true,
+                        @intFromEnum(proto.LoadState.started) => {
+                            v.loading = true;
+                            v.reader_guards.invalidate();
+                        },
                         @intFromEnum(proto.LoadState.finished), @intFromEnum(proto.LoadState.failed) => {
                             v.loading = false;
                             v.load_seq +%= 1;
@@ -949,12 +1010,12 @@ pub const Engine = struct {
                 const ev = proto.decode(proto.EvCrashed, frame.payload) catch return;
                 if (self.findView(ev.view)) |v| {
                     self.setOwned(&v.title, "(renderer crashed)");
-                    v.reader_guards.clearRetainingCapacity();
-                    v.reader_guards_active = false;
+                    v.reader_guards.invalidate();
                     for (&v.waiting, 0..) |waiting, ki| {
                         if (waiting and v.inbox[ki] == null) self.park(
                             v,
                             @enumFromInt(ki),
+                            v.waiting_request[ki],
                             false,
                             "semantic request canceled because the renderer crashed",
                             0,
@@ -964,67 +1025,11 @@ pub const Engine = struct {
                     }
                 }
             },
-            .sem_snapshot => {
-                const ev = proto.decode(proto.SemSnapshot, frame.payload) catch return;
-                const v = self.findView(ev.view) orelse return;
-                self.onSnapshot(v, ev);
+            .sem_result => {
+                const result = proto.decode(proto.SemResult, frame.payload) catch return;
+                self.dispatchSemantic(.{ .tag = @enumFromInt(result.kind), .payload = result.payload.s }, result.request);
             },
-            .sem_act_result => {
-                const ev = proto.decode(proto.SemActResult, frame.payload) catch return;
-                if (self.findView(ev.view)) |v| self.park(v, .act, ev.ok != 0, ev.msg, 0, 0, 0);
-            },
-            .sem_expand_result => {
-                const ev = proto.decode(proto.SemExpandResult, frame.payload) catch return;
-                if (self.findView(ev.view)) |v| self.park(v, .expand, true, ev.text, 0, 0, 0);
-            },
-            .sem_query_result => {
-                const ev = proto.decode(proto.SemQueryResult, frame.payload) catch return;
-                if (self.findView(ev.view)) |v| self.park(v, .query, true, ev.payload.s, 0, 0, 0);
-            },
-            .sem_read_result => {
-                const ev = proto.decode(proto.SemReadResult, frame.payload) catch return;
-                if (self.findView(ev.view)) |v| {
-                    v.reader_guards.clearRetainingCapacity();
-                    v.reader_guards_active = false;
-                    self.park(v, .read, true, ev.markdown.s, 0, 0, 0);
-                }
-            },
-            .sem_read_ids_result => {
-                const ev = proto.SemReadIdsResult.decodeAlloc(frame.payload, self.gpa) catch return;
-                defer self.gpa.free(ev.entities);
-                const v = self.findView(ev.view) orelse return;
-                v.reader_guards.ensureTotalCapacity(self.gpa, ev.entities.len) catch return;
-                v.reader_guards.clearRetainingCapacity();
-                for (ev.entities) |entity| {
-                    v.reader_guards.appendAssumeCapacity(.{
-                        .id = entity.id,
-                        .doc_gen = ev.doc_gen,
-                        .rev = ev.rev,
-                        .guard = entity.guard,
-                    });
-                }
-                v.reader_guards_active = true;
-                const entities = self.gpa.alloc(reader_model.Entity, ev.entities.len) catch return;
-                defer self.gpa.free(entities);
-                for (ev.entities, 0..) |entity, i| {
-                    entities[i] = .{ .id = entity.id, .kind = entity.kind, .text = entity.text, .url = entity.url };
-                }
-                const json = reader_model.stringify(self.gpa, .{
-                    .doc_gen = ev.doc_gen,
-                    .rev = ev.rev,
-                    .markdown = ev.markdown.s,
-                    .entities = entities,
-                }) catch return;
-                defer self.gpa.free(json);
-                self.park(v, .read, true, json, ev.doc_gen, ev.rev, 0);
-            },
-            .sem_eval_result => {
-                const ev = proto.decode(proto.SemEvalResult, frame.payload) catch return;
-                if (self.findView(ev.view)) |v| {
-                    self.setOwned(&v.last_eval, ev.json.s);
-                    self.park(v, .eval, ev.ok != 0, ev.json.s, 0, 0, 0);
-                }
-            },
+            .sem_snapshot, .sem_act_result, .sem_expand_result, .sem_query_result, .sem_read_result, .sem_read_ids_result, .sem_eval_result => self.dispatchSemantic(frame, 0),
             .intercept_status => {
                 const ev = proto.decode(proto.InterceptStatus, frame.payload) catch return;
                 if (self.findView(ev.view)) |v| {
@@ -1048,19 +1053,71 @@ pub const Engine = struct {
         }
     }
 
+    fn dispatchSemantic(self: *Engine, frame: proto.Frame, request: u32) void {
+        switch (frame.tag) {
+            .sem_snapshot => {
+                const ev = proto.decode(proto.SemSnapshot, frame.payload) catch return;
+                const v = self.findView(ev.view) orelse return;
+                self.onSnapshot(v, ev, request);
+            },
+            .sem_act_result => {
+                const ev = proto.decode(proto.SemActResult, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| self.park(v, .act, request, ev.ok != 0, ev.msg, 0, 0, 0);
+            },
+            .sem_expand_result => {
+                const ev = proto.decode(proto.SemExpandResult, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| self.park(v, .expand, request, true, ev.text, 0, 0, 0);
+            },
+            .sem_query_result => {
+                const ev = proto.decode(proto.SemQueryResult, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| self.park(v, .query, request, true, ev.payload.s, 0, 0, 0);
+            },
+            .sem_read_result => {
+                const ev = proto.decode(proto.SemReadResult, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| self.park(v, .read, request, true, ev.markdown.s, 0, 0, 0);
+            },
+            .sem_read_ids_result => {
+                const ev = proto.SemReadIdsResult.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(ev.entities);
+                const v = self.findView(ev.view) orelse return;
+                if (!acceptsSemanticReply(v, .read, request)) return;
+                _ = v.reader_guards.apply(self.gpa, request, ev) catch return;
+                const entities = self.gpa.alloc(reader_model.Entity, ev.entities.len) catch return;
+                defer self.gpa.free(entities);
+                for (ev.entities, 0..) |entity, i| {
+                    entities[i] = .{ .id = entity.id, .kind = entity.kind, .text = entity.text, .url = entity.url };
+                }
+                const json = reader_model.stringify(self.gpa, .{
+                    .doc_gen = ev.doc_gen,
+                    .rev = ev.rev,
+                    .markdown = ev.markdown.s,
+                    .entities = entities,
+                }) catch return;
+                defer self.gpa.free(json);
+                self.park(v, .read, request, true, json, ev.doc_gen, ev.rev, 0);
+            },
+            .sem_eval_result => {
+                const ev = proto.decode(proto.SemEvalResult, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| {
+                    if (!acceptsSemanticReply(v, .eval, request)) return;
+                    self.setOwned(&v.last_eval, ev.json.s);
+                    self.park(v, .eval, request, ev.ok != 0, ev.json.s, 0, 0, 0);
+                }
+            },
+            else => {},
+        }
+    }
+
     /// Mirrors webface.onSnapshot: every `sem_snapshot` frame answers a
     /// request now (the helper coalesces spontaneous mutations into its
     /// shadow tree and pushes nothing for them), so a frame nobody is
     /// waiting on — a stray push from a pre-coalescing helper — is
     /// dropped, never buffered.
-    fn onSnapshot(self: *Engine, v: *View, ev: proto.SemSnapshot) void {
+    fn onSnapshot(self: *Engine, v: *View, ev: proto.SemSnapshot, request: u32) void {
         const full = ev.kind == @intFromEnum(proto.SnapKind.full);
-        const ki = @intFromEnum(OpKind.snapshot);
-        const waiting = v.waiting[ki] and v.inbox[ki] == null;
+        const waiting = acceptsSemanticReply(v, .snapshot, request);
         if (!waiting or (v.want_full and !full)) return;
-        v.reader_guards.clearRetainingCapacity();
-        v.reader_guards_active = false;
-        self.park(v, .snapshot, true, ev.payload.s, ev.doc_gen, ev.rev, ev.kind);
+        self.park(v, .snapshot, request, true, ev.payload.s, ev.doc_gen, ev.rev, ev.kind);
     }
 };
 
@@ -1082,23 +1139,22 @@ test "a snapshot reply is exactly the helper's coalesced answer; strays are drop
     // Nobody waiting: the frame is dropped, never buffered — the helper
     // owns "what changed since the caller last looked" now, so text
     // concatenated client-side could only duplicate or contradict it.
-    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 1, .rev = 2, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "~ [4] changed\n" } });
+    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 1, .rev = 2, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "~ [4] changed\n" } }, 0);
     try std.testing.expect(v.inbox[@intFromEnum(OpKind.snapshot)] == null);
 
     // A waiting caller gets the reply verbatim: ONE delta, not a
     // concatenation with anything that arrived earlier.
     v.waiting[@intFromEnum(OpKind.snapshot)] = true;
+    v.waiting_request[@intFromEnum(OpKind.snapshot)] = 0;
     v.want_full = false;
-    v.reader_guards_active = true;
-    try v.reader_guards.append(gpa, .{ .id = 7, .doc_gen = 1, .rev = 2, .guard = 70 });
+    try v.reader_guards.entries.append(gpa, .{ .id = 7, .doc_gen = 1, .rev = 2, .guard = 70 });
     try std.testing.expectEqual(@as(u64, 70), Engine.readerGuard(v, 7).?.guard);
-    try std.testing.expectEqual(@as(u32, 0), Engine.readerGuard(v, 99).?.doc_gen);
-    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 1, .rev = 3, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "delta rev 2->3\n~ [5] more\n" } });
+    try std.testing.expect(Engine.readerGuard(v, 99) == null);
+    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 1, .rev = 3, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "delta rev 2->3\n~ [5] more\n" } }, 0);
     const parked = v.inbox[@intFromEnum(OpKind.snapshot)].?;
     try std.testing.expectEqualStrings("delta rev 2->3\n~ [5] more\n", parked.text);
     try std.testing.expectEqual(@as(u32, 3), parked.rev);
-    try std.testing.expect(!v.reader_guards_active);
-    try std.testing.expect(Engine.readerGuard(v, 7) == null);
+    try std.testing.expectEqual(@as(u64, 70), Engine.readerGuard(v, 7).?.guard);
 }
 
 test "a full-mode wait is not satisfied by a spontaneous delta" {
@@ -1112,13 +1168,68 @@ test "a full-mode wait is not satisfied by a spontaneous delta" {
     v.* = .{ .id = 1, .w = 100, .h = 100 };
     try eng.views.append(gpa, v);
     v.waiting[@intFromEnum(OpKind.snapshot)] = true;
+    v.waiting_request[@intFromEnum(OpKind.snapshot)] = 0;
     v.want_full = true;
-    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 1, .rev = 2, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "~ [4] x\n" } });
+    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 1, .rev = 2, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "~ [4] x\n" } }, 0);
     try std.testing.expect(v.inbox[@intFromEnum(OpKind.snapshot)] == null);
-    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 2, .rev = 1, .kind = @intFromEnum(proto.SnapKind.full), .payload = .{ .s = "[1] document\n" } });
+    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 2, .rev = 1, .kind = @intFromEnum(proto.SnapKind.full), .payload = .{ .s = "[1] document\n" } }, 0);
     const parked = v.inbox[@intFromEnum(OpKind.snapshot)].?;
     try std.testing.expectEqualStrings("[1] document\n", parked.text);
     try std.testing.expectEqual(@as(u8, @intFromEnum(proto.SnapKind.full)), parked.snap_kind);
+}
+
+test "correlated replies ignore old request ids and preserve reader provenance" {
+    const gpa = std.testing.allocator;
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null);
+    defer {
+        eng.state = .idle;
+        eng.deinit();
+    }
+    const v = try gpa.create(View);
+    v.* = .{ .id = 1, .w = 100, .h = 100 };
+    try eng.views.append(gpa, v);
+
+    const ki = @intFromEnum(OpKind.act);
+    v.waiting[ki] = true;
+    v.waiting_request[ki] = 22;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    try proto.encodePayload(gpa, &payload, proto.SemActResult{ .view = 1, .id = 7, .ok = 1, .msg = "old" });
+    eng.dispatchSemantic(.{ .tag = .sem_act_result, .payload = payload.items }, 21);
+    try std.testing.expect(v.inbox[ki] == null);
+
+    try v.reader_guards.entries.append(gpa, .{ .id = 7, .doc_gen = 3, .rev = 4, .guard = 70 });
+    try std.testing.expectEqual(@as(u64, 70), Engine.readerGuard(v, 7).?.guard);
+    eng.onSnapshot(v, .{ .view = 1, .doc_gen = 3, .rev = 5, .kind = @intFromEnum(proto.SnapKind.delta), .payload = .{ .s = "delta" } }, 99);
+    try std.testing.expectEqual(@as(u64, 70), Engine.readerGuard(v, 7).?.guard);
+}
+
+test "legacy timeout quarantine consumes exactly one late reply" {
+    var v = View{ .id = 1, .w = 100, .h = 100 };
+    const ki = @intFromEnum(OpKind.read);
+    v.legacy_quarantine[ki] = true;
+    try std.testing.expect(!Engine.acceptsSemanticReply(&v, .read, 0));
+    try std.testing.expect(!v.legacy_quarantine[ki]);
+    v.waiting[ki] = true;
+    try std.testing.expect(Engine.acceptsSemanticReply(&v, .read, 0));
+}
+
+test "wait cleanup tolerates a view destroyed while the operation ran" {
+    const gpa = std.testing.allocator;
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null);
+    defer {
+        eng.state = .idle;
+        eng.deinit();
+    }
+    const v = try gpa.create(View);
+    v.* = .{ .id = 1, .w = 100, .h = 100 };
+    try eng.views.append(gpa, v);
+    const ki = @intFromEnum(OpKind.read);
+    v.waiting[ki] = true;
+    v.waiting_request[ki] = 9;
+    eng.closeView(1);
+    eng.finishWait(1, ki, 9, true);
+    try std.testing.expectEqual(@as(usize, 0), eng.views.items.len);
 }
 
 test "the current view is the last one touched, not the oldest" {

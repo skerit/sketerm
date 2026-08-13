@@ -44,6 +44,7 @@ const proto = @import("protocol.zig");
 const zpool = @import("zpool");
 const keymap = @import("keymap.zig");
 const semantic = @import("semantic.zig");
+const semnav = @import("semnav.zig");
 const filter = @import("filter.zig");
 const filtersub = @import("filtersub.zig");
 const userscript = @import("userscript.zig");
@@ -312,7 +313,6 @@ pub fn isAccelerated() bool {
 /// cap; `view_max_fps` now clamps the internal scheduler to the
 /// display's refresh, which is exactly the spacing external requests
 /// used to impose.)
-
 /// How the engine is told what DPR to lay out at.
 ///
 /// The protocol's scale contract (docs/proposal-browser-protocol.md) is
@@ -500,16 +500,13 @@ pub const View = struct {
     /// Detail level of the last request, replayed after a navigation.
     sem_detail: u8 = 1,
     sem_next_req: u32 = 1,
-    /// Main-document navigation generation. Pending script requests are
-    /// stamped with it so a dying context cannot answer a reissued op.
-    sem_nav_gen: u32 = 1,
-    sem_loading: bool = false,
+    /// Main-document generation and load/stop transitions.
+    sem_nav: semnav.State = .{},
     /// Renderer token of the current main-frame V8 context. Every
     /// semantic reply carries it; mismatches are late old-context data.
     sem_context_doc: u32 = 0,
     /// An explicit navigate/back/forward/reload has advanced the
     /// generation before CEF's matching load-start callback arrives.
-    sem_waiting_load_start: bool = false,
     pending: std.ArrayList(Pending) = .empty,
 
     /// The view id of this view's OPEN inspector, 0 when it has none.
@@ -667,6 +664,8 @@ const max_frame_backlog = 8;
 const Pending = struct {
     req: u32,
     kind: Kind,
+    /// Client operation id from `sem_request`; 0 for legacy frames.
+    client_request: u32 = 0,
     nav_gen: u32 = 0,
     deadline_ms: i64 = 0,
     /// Reissue in the fresh context when the navigation settles.
@@ -711,6 +710,20 @@ const Pending = struct {
 const semantic_request_timeout_ms: i64 = 120_000;
 const stale_reader_msg = "stale reader id: the page changed since web_read; read the page again";
 
+fn semanticResult(comptime T: type) bool {
+    return switch (T.tag) {
+        .sem_snapshot,
+        .sem_act_result,
+        .sem_expand_result,
+        .sem_query_result,
+        .sem_read_result,
+        .sem_read_ids_result,
+        .sem_eval_result,
+        => true,
+        else => false,
+    };
+}
+
 // ---------------------------------------------------------------------
 // Host
 // ---------------------------------------------------------------------
@@ -727,6 +740,10 @@ pub const Host = struct {
     /// The view a create_browser_sync call is currently building, for
     /// the callbacks CEF fires BEFORE it returns the browser pointer.
     pending: ?*View = null,
+    /// Correlated semantic request being dispatched or completed. The
+    /// generic `post` wrapper turns only semantic replies into
+    /// `sem_result` while this is non-zero.
+    active_sem_request: u32 = 0,
     /// The view waiting for a browser CEF creates on its own schedule:
     /// `show_dev_tools` returns void and the inspector browser appears
     /// in a later `on_after_created`, so unlike `pending` this cannot
@@ -1661,12 +1678,10 @@ pub const Host = struct {
         v.pending.clearRetainingCapacity();
         // The shadow tree described a document that no longer exists;
         // its ids must not be answerable after this.
-        v.sem.deinit();
-        v.sem = semantic.View.init(self.gpa);
+        v.sem.invalidateDocument();
         v.sem_observing = false;
         v.sem_want_observer = false;
-        v.sem_loading = false;
-        v.sem_waiting_load_start = false;
+        v.sem_nav.rearmed();
         v.sem_context_doc = 0;
         // The AX tree token named a document of the dead browser; a
         // revived one mints fresh ids and rebinds via `axResolveView`.
@@ -2436,7 +2451,7 @@ pub const Host = struct {
         // for, which is the two-document trap `view_create_url` exists
         // to avoid.
         self.semanticNavigationStarted(v);
-        v.sem_waiting_load_start = true;
+        v.sem_nav.waiting_load_start = true;
         if (v.discarded) return self.reviveAt(v, req.url);
         const b = v.browser orelse return;
         const get_frame = b.get_main_frame orelse return;
@@ -2457,23 +2472,32 @@ pub const Host = struct {
         switch (@as(proto.NavAct, @enumFromInt(req.action))) {
             .back => if (browserInt(b, "can_go_back") != 0) {
                 self.semanticNavigationStarted(v);
-                v.sem_waiting_load_start = true;
+                v.sem_nav.waiting_load_start = true;
                 if (b.go_back) |f| f(b);
             },
             .forward => if (browserInt(b, "can_go_forward") != 0) {
                 self.semanticNavigationStarted(v);
-                v.sem_waiting_load_start = true;
+                v.sem_nav.waiting_load_start = true;
                 if (b.go_forward) |f| f(b);
             },
             .reload => {
                 self.semanticNavigationStarted(v);
-                v.sem_waiting_load_start = true;
+                v.sem_nav.waiting_load_start = true;
                 if (b.reload) |f| f(b);
             },
-            .stop => if (b.stop_load) |f| f(b),
+            .stop => {
+                v.sem_nav.requestStop();
+                if (b.stop_load) |f| f(b);
+                // A user stop can produce only ERR_ABORTED. If CEF did
+                // not report it synchronously, clear the semantic load
+                // state here rather than waiting forever for load-end.
+                if (v.sem_nav.takeStopRequest()) {
+                    self.semanticStopped(v);
+                }
+            },
             .reload_no_cache => {
                 self.semanticNavigationStarted(v);
-                v.sem_waiting_load_start = true;
+                v.sem_nav.waiting_load_start = true;
                 if (b.reload_ignore_cache) |f| f(b);
             },
             _ => {},
@@ -4257,7 +4281,7 @@ pub const Host = struct {
         const gf = b.get_main_frame orelse return;
         const frame: *cef.cef_frame_t = gf(b) orelse return;
         defer release(&frame.base);
-        self.sendScriptToFrameGen(frame, json, v.sem_nav_gen);
+        self.sendScriptToFrameGen(frame, json, v.sem_nav.generation);
     }
 
     /// Hand a command to ONE frame, main or not.
@@ -4321,7 +4345,8 @@ pub const Host = struct {
             self.failPending(v, old, "semantic request queue overflowed");
         }
         var stamped = p;
-        stamped.nav_gen = v.sem_nav_gen;
+        if (stamped.client_request == 0) stamped.client_request = self.active_sem_request;
+        stamped.nav_gen = v.sem_nav.generation;
         stamped.deadline_ms = nowMs() + semantic_request_timeout_ms;
         try v.pending.append(self.gpa, stamped);
         return p.req;
@@ -4358,6 +4383,9 @@ pub const Host = struct {
 
     fn failPending(self: *Host, v: *View, p: Pending, msg: []const u8) void {
         defer self.freePending(p);
+        const old_request = self.active_sem_request;
+        self.active_sem_request = p.client_request;
+        defer self.active_sem_request = old_request;
         switch (p.kind) {
             .snapshot => self.post(proto.SemSnapshot{
                 .view = v.id,
@@ -4385,16 +4413,14 @@ pub const Host = struct {
     /// Reads and snapshots are safe to reissue against the new page;
     /// actions are not and are answered explicitly instead of hanging.
     fn semanticNavigationStarted(self: *Host, v: *View) void {
-        v.sem_nav_gen +%= 1;
-        if (v.sem_nav_gen == 0) v.sem_nav_gen = 1;
-        v.sem_loading = true;
+        v.sem_nav.start(false);
         v.sem_context_doc = 0;
         v.sem_observing = false;
         for (v.pending.items) |*p| {
             switch (p.kind) {
                 .snapshot, .hints, .read, .read_ids => {
                     p.rearm = true;
-                    p.nav_gen = v.sem_nav_gen;
+                    p.nav_gen = v.sem_nav.generation;
                     p.req = nextReq(v);
                     p.deadline_ms = nowMs() + semantic_request_timeout_ms;
                 },
@@ -4473,6 +4499,55 @@ pub const Host = struct {
         while (v.pending.pop()) |p| host.freePending(p);
     }
 
+    test "semantic result envelopes keep the client request id" {
+        const gpa = std.testing.allocator;
+        var out = proto.Outbox.init(gpa);
+        defer out.deinit();
+        var host = Host.init(gpa, &out);
+        defer host.webext.deinit();
+        host.active_sem_request = 77;
+        host.post(proto.SemActResult{ .view = 4, .id = 9, .ok = 1, .msg = "ok" });
+        var reader = proto.Reader.init(out.front().?.bytes);
+        const frame = (try reader.next()).?;
+        try std.testing.expectEqual(proto.Tag.sem_result, frame.tag);
+        const result = try proto.decode(proto.SemResult, frame.payload);
+        try std.testing.expectEqual(@as(u32, 77), result.request);
+        try std.testing.expectEqual(@intFromEnum(proto.Tag.sem_act_result), result.kind);
+        const inner = try proto.decode(proto.SemActResult, result.payload.s);
+        try std.testing.expectEqual(@as(u32, 9), inner.id);
+        try std.testing.expectEqualStrings("ok", inner.msg);
+    }
+
+    test "semantic stop exits loading and frees rearmed requests" {
+        const gpa = std.testing.allocator;
+        var out = proto.Outbox.init(gpa);
+        defer out.deinit();
+        var host = Host.init(gpa, &out);
+        defer host.webext.deinit();
+        var v = View{
+            .id = 7,
+            .w = 1,
+            .h = 1,
+            .scale_x1000 = 1000,
+            .pw = 1,
+            .ph = 1,
+            .sem = semantic.View.init(gpa),
+            .sem_nav = .{ .loading = true, .waiting_load_start = true },
+        };
+        defer v.pending.deinit(gpa);
+        defer v.sem.deinit();
+        const arg = try gpa.dupe(u8, "owned");
+        try v.pending.append(gpa, .{ .req = 1, .kind = .read_ids, .client_request = 15, .rearm = true, .arg = arg });
+        host.semanticStopped(&v);
+        try std.testing.expect(!v.sem_nav.loading);
+        try std.testing.expect(!v.sem_nav.waiting_load_start);
+        try std.testing.expectEqual(@as(usize, 0), v.pending.items.len);
+        var reader = proto.Reader.init(out.front().?.bytes);
+        const result = try proto.decode(proto.SemResult, (try reader.next()).?.payload);
+        try std.testing.expectEqual(@as(u32, 15), result.request);
+        try std.testing.expectEqual(@intFromEnum(proto.Tag.sem_read_ids_result), result.kind);
+    }
+
     pub fn semSnapshot(self: *Host, req: proto.SemSnapshotReq) !void {
         const v = self.find(req.view) orelse return;
         if (v.discarded) {
@@ -4496,9 +4571,9 @@ pub const Host = struct {
             .mode = req.mode,
             .detail = req.detail,
             .scope = req.scope,
-            .rearm = v.sem_loading,
+            .rearm = v.sem_nav.loading,
         });
-        if (v.sem_loading) return;
+        if (v.sem_nav.loading) return;
         var buf: [96]u8 = undefined;
         const cmd = std.fmt.bufPrint(
             &buf,
@@ -4512,13 +4587,34 @@ pub const Host = struct {
         }
     }
 
+    /// Dispatch one request-id envelope through the existing semantic
+    /// handlers. The inner payload is byte-for-byte the legacy frame's
+    /// payload; only the outer tags are append-only additions.
+    pub fn semRequest(self: *Host, req: proto.SemRequest) !void {
+        if (req.request == 0) return;
+        const old_request = self.active_sem_request;
+        self.active_sem_request = req.request;
+        defer self.active_sem_request = old_request;
+        switch (@as(proto.Tag, @enumFromInt(req.kind))) {
+            .sem_snapshot_req => try self.semSnapshot(try proto.decode(proto.SemSnapshotReq, req.payload.s)),
+            .sem_act => try self.semAct(try proto.decode(proto.SemAction, req.payload.s)),
+            .sem_expand => try self.semExpand(try proto.decode(proto.SemExpand, req.payload.s)),
+            .sem_query => try self.semQuery(try proto.decode(proto.SemQueryReq, req.payload.s)),
+            .sem_read => try self.semRead(try proto.decode(proto.SemRead, req.payload.s)),
+            .sem_read_ids => try self.semReadIds(try proto.decode(proto.SemReadIds, req.payload.s)),
+            .sem_act_guarded => try self.semActGuarded(try proto.decode(proto.SemActGuarded, req.payload.s)),
+            .sem_eval => try self.semEval(try proto.decode(proto.SemEval, req.payload.s)),
+            else => {},
+        }
+    }
+
     pub fn semAct(self: *Host, req: proto.SemAction) !void {
         const v = self.find(req.view) orelse return;
         if (v.discarded) {
             self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = discarded_msg });
             return;
         }
-        if (v.sem_loading) {
+        if (v.sem_nav.loading) {
             self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = "semantic action unavailable while the page is navigating" });
             return;
         }
@@ -4573,7 +4669,7 @@ pub const Host = struct {
             self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = discarded_msg });
             return;
         }
-        if (v.sem_loading) {
+        if (v.sem_nav.loading) {
             self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = stale_reader_msg });
             return;
         }
@@ -4613,7 +4709,7 @@ pub const Host = struct {
             });
             return;
         }
-        if (v.sem_loading) {
+        if (v.sem_nav.loading) {
             self.post(proto.SemExpandResult{ .view = v.id, .id = req.id, .off = req.off, .text = "semantic expansion unavailable while the page is navigating" });
             return;
         }
@@ -4649,15 +4745,15 @@ pub const Host = struct {
             self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = discarded_msg } });
             return;
         }
-        if (v.sem_loading and req.kind != @intFromEnum(proto.SemQuery.visible)) {
+        if (v.sem_nav.loading and req.kind != @intFromEnum(proto.SemQuery.visible)) {
             self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "semantic query unavailable while the page is navigating" } });
             return;
         }
         if (req.kind == @intFromEnum(proto.SemQuery.visible)) {
             const arg = try self.gpa.dupe(u8, req.arg);
             errdefer self.gpa.free(arg);
-            const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .hints, .rearm = v.sem_loading, .arg = arg });
-            if (v.sem_loading) return;
+            const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .hints, .rearm = v.sem_nav.loading, .arg = arg });
+            if (v.sem_nav.loading) return;
             var buf: [96]u8 = undefined;
             const cmd = std.fmt.bufPrint(
                 &buf,
@@ -4686,7 +4782,7 @@ pub const Host = struct {
             });
             return;
         }
-        if (v.sem_loading) {
+        if (v.sem_nav.loading) {
             self.post(proto.SemEvalResult{ .view = v.id, .ok = 0, .json = .{ .s = "{\"error\":\"semantic evaluation unavailable while the page is navigating\"}" } });
             return;
         }
@@ -4709,8 +4805,8 @@ pub const Host = struct {
             self.post(proto.SemReadResult{ .view = v.id, .markdown = .{ .s = discarded_msg } });
             return;
         }
-        const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .read, .rearm = v.sem_loading });
-        if (v.sem_loading) return;
+        const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .read, .rearm = v.sem_nav.loading });
+        if (v.sem_nav.loading) return;
         var buf: [64]u8 = undefined;
         const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"read\",\"req\":{d}}}", .{rid}) catch return;
         self.sendScript(v, cmd);
@@ -4729,8 +4825,8 @@ pub const Host = struct {
             return;
         }
         v.sem_want_observer = true;
-        const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .read_ids, .rearm = v.sem_loading });
-        if (v.sem_loading) return;
+        const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .read_ids, .rearm = v.sem_nav.loading });
+        if (v.sem_nav.loading) return;
         var buf: [72]u8 = undefined;
         const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"read\",\"req\":{d},\"ids\":true}}", .{rid}) catch return;
         self.sendScript(v, cmd);
@@ -4748,13 +4844,13 @@ pub const Host = struct {
     /// requests are re-issued here with their original ids — without
     /// this, a client that snapshots right after navigating times out.
     fn semRearm(self: *Host, v: *View) void {
-        v.sem_loading = false;
+        v.sem_nav.rearmed();
         v.sem_observing = v.sem_want_observer;
         if (v.sem_observing) self.sendScript(v, "{\"op\":\"observe\",\"on\":true}");
         var buf: [112]u8 = undefined;
         var reissued = false;
         for (v.pending.items) |*p| {
-            if (!p.rearm or p.nav_gen != v.sem_nav_gen) continue;
+            if (!p.rearm or p.nav_gen != v.sem_nav.generation) continue;
             p.rearm = false;
             const cmd = switch (p.kind) {
                 .snapshot, .hints => std.fmt.bufPrint(
@@ -4774,6 +4870,31 @@ pub const Host = struct {
         // (queries, action routing) following the navigation.
         const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"snapshot\",\"req\":0,\"detail\":{d}}}", .{v.sem_detail}) catch return;
         self.sendScript(v, cmd);
+    }
+
+    /// Leave the loading state after an explicit stop. Work queued for
+    /// the aborted document cannot be reissued safely; answer it now and
+    /// solicit a fresh unsolicited walk for later ordinary operations.
+    fn semanticStopped(self: *Host, v: *View) void {
+        v.sem_nav.rearmed();
+        v.sem_context_doc = 0;
+        v.sem.invalidateDocument();
+        var i: usize = 0;
+        while (i < v.pending.items.len) {
+            if (!v.pending.items[i].rearm) {
+                i += 1;
+                continue;
+            }
+            const p = v.pending.orderedRemove(i);
+            self.failPending(v, p, "semantic request canceled because loading was stopped");
+        }
+        if (v.sem_want_observer) {
+            v.sem_observing = true;
+            self.sendScript(v, "{\"op\":\"observe\",\"on\":true}");
+            var buf: [96]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"snapshot\",\"req\":0,\"detail\":{d}}}", .{v.sem_detail}) catch return;
+            self.sendScript(v, cmd);
+        }
     }
 
     /// One reply from the injected script: `<nonce><json>`.
@@ -4801,14 +4922,14 @@ pub const Host = struct {
             self.onExtMessage(v, op, json);
             return;
         }
-        if (head.value.gen != v.sem_nav_gen) return;
+        if (head.value.gen != v.sem_nav.generation) return;
         if (head.value.doc == 0) return;
         if (v.sem_context_doc == 0) {
             v.sem_context_doc = head.value.doc;
         } else if (head.value.doc != v.sem_context_doc) return;
         if (rid != 0) {
             const p = self.pendingFor(v, rid) orelse return;
-            if (p.nav_gen != v.sem_nav_gen) return;
+            if (p.nav_gen != v.sem_nav.generation) return;
         }
         if (std.mem.eql(u8, op, "tree")) {
             self.onTree(v, rid, json);
@@ -4816,6 +4937,9 @@ pub const Host = struct {
         }
         var p = self.takePending(v, rid) orelse return;
         defer self.freePending(p);
+        const old_request = self.active_sem_request;
+        self.active_sem_request = p.client_request;
+        defer self.active_sem_request = old_request;
 
         if (std.mem.eql(u8, op, "rect")) {
             self.onRect(v, &p, json);
@@ -4901,6 +5025,9 @@ pub const Host = struct {
         // unsolicited id 0 may arrive without a pending entry.
         if (rid != 0 and pend == null) return;
         defer if (pend) |p| self.freePending(p);
+        const old_request = self.active_sem_request;
+        self.active_sem_request = if (pend) |p| p.client_request else 0;
+        defer self.active_sem_request = old_request;
         const parsed = semantic.parseTree(self.gpa, json) catch return;
         defer parsed.deinit();
         v.sem.apply(parsed.value) catch return;
@@ -5202,6 +5329,18 @@ pub const Host = struct {
     /// Post an event, dropping it if the outbox is out of memory: a
     /// missed event must never take the helper down.
     fn post(self: *Host, value: anytype) void {
+        const T = @TypeOf(value);
+        if (self.active_sem_request != 0 and semanticResult(T)) {
+            var payload: std.ArrayList(u8) = .empty;
+            defer payload.deinit(self.gpa);
+            proto.encodePayload(self.gpa, &payload, value) catch return;
+            self.out.post(proto.SemResult{
+                .request = self.active_sem_request,
+                .kind = @intFromEnum(T.tag),
+                .payload = .{ .s = payload.items },
+            }, null) catch {};
+            return;
+        }
         self.out.post(value, null) catch {};
     }
 
@@ -6770,7 +6909,6 @@ const HOLD_HDR_MAX = 3072;
 
 /// Latency samples kept per extension for the p50/p95 report.
 const WREQ_SAMPLES = 256;
-
 
 const Hold = struct {
     used: bool = false,
@@ -9619,9 +9757,7 @@ fn onLoadStart(
     // else below is per-DOCUMENT and stays main-frame-only.
     host.injectMatchingExtensions(v, f, .document_start);
     if (!main) return;
-    if (v.sem_waiting_load_start) {
-        v.sem_waiting_load_start = false;
-    } else {
+    if (!v.sem_nav.takeExpectedLoadStart()) {
         host.semanticNavigationStarted(v);
     }
     // Chromium's zoom is per origin and resets across a navigation; in
@@ -9704,7 +9840,12 @@ fn onLoadError(
     // second navigation as ERR_ABORTED. A newer load is still active;
     // rearming here would send current-generation requests into a
     // context that has not finished loading yet.
-    if (code == cef.ERR_ABORTED) return;
+    if (code == cef.ERR_ABORTED) {
+        if (v.sem_nav.takeStopRequest()) {
+            host.semanticStopped(v);
+        }
+        return;
+    }
     host.post(proto.EvLoadError{
         .view = v.id,
         .code = @intCast(code),
@@ -9735,8 +9876,10 @@ fn onRenderProcessTerminated(
         const p = v.pending.orderedRemove(0);
         host.failPending(v, p, "semantic request canceled because the renderer crashed");
     }
-    v.sem_loading = false;
-    v.sem_waiting_load_start = false;
+    // The renderer's DOM and V8 element ids are gone. Keep the stable-id
+    // counters monotonic so a reader id can never alias a post-crash id.
+    v.sem.invalidateDocument();
+    v.sem_nav.rearmed();
     v.sem_observing = false;
     v.sem_context_doc = 0;
     host.post(proto.EvCrashed{ .view = v.id });

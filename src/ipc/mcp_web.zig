@@ -356,6 +356,7 @@ fn headlessErrText(arena: std.mem.Allocator, e: *webdrive.Engine, err: anyerror)
         error.Unavailable => if (e.reason.len > 0) e.reason else "the browser helper is not available",
         error.NoView => "no web view with that id (web_tabs lists them; web_open makes one)",
         error.NoSemantic => "the browser helper does not advertise the semantic capability",
+        error.LegacySemanticReplyPending => "an older browser helper still owes the previous timed-out semantic reply; wait for it or restart the helper before retrying this operation kind",
         error.NoFrame => "the view has not painted a frame yet (a page must load first; try web_wait for:\"load\")",
         else => try std.fmt.allocPrint(arena, "the browser helper failed ({s})", .{@errorName(err)}),
     };

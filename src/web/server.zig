@@ -83,11 +83,16 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_WEBEXT_TABS,
     proto.CAP_FILTER_SUBSCRIBE,
     proto.CAP_READER_IDS,
+    proto.CAP_SEMANTIC_REQUEST_IDS,
 };
 
 /// Test-only negotiation seam for exercising an older helper client path.
 fn advertiseReaderIds() bool {
     return c.getenv("SKETERM_WEB_DISABLE_READER_IDS") == null;
+}
+
+fn advertiseSemanticRequestIds() bool {
+    return c.getenv("SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS") == null;
 }
 
 /// Bounded builder for the `hello_ack` capability set. Its capacity is
@@ -369,6 +374,7 @@ pub const Server = struct {
                 var caps: CapList = .{};
                 for (&unconditional_caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS) and !advertiseReaderIds()) continue;
+                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS) and !advertiseSemanticRequestIds()) continue;
                     caps.add(cap);
                 }
                 if (cefhost.isAccelerated()) caps.add(proto.CAP_FRAMES_DMABUF);
@@ -417,6 +423,7 @@ pub const Server = struct {
             .sem_read => try self.host.semRead(try proto.decode(proto.SemRead, frame.payload)),
             .sem_read_ids => try self.host.semReadIds(try proto.decode(proto.SemReadIds, frame.payload)),
             .sem_act_guarded => try self.host.semActGuarded(try proto.decode(proto.SemActGuarded, frame.payload)),
+            .sem_request => try self.host.semRequest(try proto.decode(proto.SemRequest, frame.payload)),
             .sem_eval => try self.host.semEval(try proto.decode(proto.SemEval, frame.payload)),
             .intercept_set => self.host.interceptSet(try proto.decode(proto.InterceptSet, frame.payload)),
             .intercept_lists => {

@@ -783,9 +783,12 @@ H.264/AAC) while the distro build enables them.
   revision, stable id and guard before delegating to the normal trusted
   action path. Any mismatch answers the existing `sem_act_result` with
   `ok=0` and a stale-reader message, never an action on a lookalike.
-  Clients keep the latest rich read as the active semantic-ID source:
-  an ID absent from it is sent deliberately stale, and a subsequent
-  `sem_snapshot` explicitly replaces that source with ordinary IDs.
+  Clients remember every ID ever exposed by rich reader mode for that
+  helper view. A later rich read refreshes IDs it contains and marks
+  absent reader IDs deliberately stale; snapshots never erase reader
+  provenance, and navigation, stop, discard, crash or helper loss
+  invalidates the remembered guards without allowing an ordinary
+  `sem_act` fallback.
   `mcp_web.zig` chooses this pair only when the capability was
   advertised; otherwise it explicitly uses `sem_read` and reports the
   markdown-only fallback. Never infer a rich envelope from page bytes:
@@ -801,6 +804,11 @@ H.264/AAC) while the distro build enables them.
   token, so a late dying-context reply cannot satisfy the reissued
   request. Every pending request has a 120s helper deadline and is
   answered/freed on timeout, renderer crash, browser drop and teardown.
+  `semantic-request-ids` adds `sem_request`/`sem_result` at 0x6D/0x6E:
+  an append-only envelope around the unchanged legacy payloads, carrying
+  a client operation id end to end. New clients match that id; with an
+  older helper, a timed-out operation kind stays quarantined until its
+  one uncorrelated late reply is consumed or the connection resets.
 - **A held security decision must always be answered.** A certificate
   error (`ev_cert_error`) and a permission prompt (`ev_permission`)
   both keep an engine callback alive in `View` until a

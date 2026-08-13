@@ -2115,6 +2115,8 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // page bytes as markdown rather than guessing a rich envelope.
     _ = c.setenv("SKETERM_WEB_DISABLE_READER_IDS", "1", 1);
     defer _ = c.unsetenv("SKETERM_WEB_DISABLE_READER_IDS");
+    _ = c.setenv("SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS", "1", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS");
     var legacy = Mcp.spawn(allocator, exe, &.{});
     legacy.initialize();
     legacy.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"file://{s}\"}}", .{page_path}) catch unreachable);

@@ -158,6 +158,10 @@ pub const CAP_WEBEXT_TABS = "webext-tabs";
 /// of being resolved against a later page. A client without this
 /// capability keeps using the legacy `sem_read` / `sem_read_result` pair.
 pub const CAP_READER_IDS = "reader-ids";
+/// The helper accepts `sem_request`, which wraps one existing semantic
+/// request with a client-minted id, and answers with a correlated
+/// `sem_result`. Existing semantic frame layouts remain unchanged.
+pub const CAP_SEMANTIC_REQUEST_IDS = "semantic-request-ids";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -223,6 +227,8 @@ pub const Tag = enum(u8) {
     sem_read_ids = 0x6A,
     sem_read_ids_result = 0x6B,
     sem_act_guarded = 0x6C,
+    sem_request = 0x6D,
+    sem_result = 0x6E,
     a11y_enable = 0x70,
     ev_a11y_tree = 0x71,
     ev_a11y_loc = 0x72,
@@ -1580,6 +1586,24 @@ pub const SemActGuarded = struct {
     arg: []const u8,
 };
 
+/// Correlated wrapper around one existing client-to-helper semantic
+/// payload, gated by `CAP_SEMANTIC_REQUEST_IDS`.
+pub const SemRequest = struct {
+    pub const tag: Tag = .sem_request;
+    request: u32,
+    kind: u8,
+    payload: Text,
+};
+
+/// Correlated wrapper around one existing helper-to-client semantic
+/// result payload.
+pub const SemResult = struct {
+    pub const tag: Tag = .sem_result;
+    request: u32,
+    kind: u8,
+    payload: Text,
+};
+
 // -- script evaluation (0xA0 block, capability "semantic") ------------
 
 /// Evaluate `code` in the view's main frame. `flags` bit 0 = resolve a
@@ -2462,6 +2486,16 @@ pub fn encode(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype) !
     const start = out.items.len;
     try out.appendSlice(gpa, &[_]u8{ 0, 0, 0, 0 });
     try putU8(gpa, out, @intFromEnum(T.tag));
+    try encodePayload(gpa, out, value);
+    const len = out.items.len - start - 4;
+    if (len > MAX_FRAME) return error.FrameTooLarge;
+    std.mem.writeInt(u32, out.items[start..][0..4], @intCast(len), .little);
+}
+
+/// Append only a value's payload, for append-only wrapper frames whose
+/// inner tag is carried separately.
+pub fn encodePayload(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype) !void {
+    const T = @TypeOf(value);
     if (@hasDecl(T, "encodeTo")) {
         try value.encodeTo(gpa, out);
     } else {
@@ -2479,9 +2513,6 @@ pub fn encode(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: anytype) !
             }
         }
     }
-    const len = out.items.len - start - 4;
-    if (len > MAX_FRAME) return error.FrameTooLarge;
-    std.mem.writeInt(u32, out.items[start..][0..4], @intCast(len), .little);
 }
 
 /// Decode a payload into `T`. String fields BORROW from `payload`.
@@ -2922,6 +2953,16 @@ test "round-trip: semantic layer frames" {
         .guard = 99,
         .action = @intFromEnum(SemAct.click),
         .arg = "",
+    });
+    try roundTrip(SemRequest, .{
+        .request = 41,
+        .kind = @intFromEnum(Tag.sem_read_ids),
+        .payload = .{ .s = "request bytes" },
+    });
+    try roundTrip(SemResult, .{
+        .request = 41,
+        .kind = @intFromEnum(Tag.sem_read_ids_result),
+        .payload = .{ .s = "result bytes" },
     });
     try roundTrip(SemEval, .{
         .view = 7,
@@ -3476,6 +3517,8 @@ test "reader ids extend the semantic family and leave 0xD0 reserved" {
     try std.testing.expectEqual(@as(u8, 0x6A), @intFromEnum(Tag.sem_read_ids));
     try std.testing.expectEqual(@as(u8, 0x6B), @intFromEnum(Tag.sem_read_ids_result));
     try std.testing.expectEqual(@as(u8, 0x6C), @intFromEnum(Tag.sem_act_guarded));
+    try std.testing.expectEqual(@as(u8, 0x6D), @intFromEnum(Tag.sem_request));
+    try std.testing.expectEqual(@as(u8, 0x6E), @intFromEnum(Tag.sem_result));
     try std.testing.expectEqual(@as(u8, 0xD0), @intFromEnum(Tag.frame_mode));
     try std.testing.expectEqual(@as(u8, 0xD1), @intFromEnum(Tag.frame_inline));
     for (0xD2..0xD8) |raw| {

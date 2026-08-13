@@ -17,9 +17,11 @@ revision, stable ID and opaque action fingerprint (including renderer
 element identity and exact link href)
 before using the existing trusted pointer/focus/value path. A stale or
 retargeted entity returns `sem_act_result ok=0`; it never falls through
-to a node on the changed page. Clients treat the latest rich read as the
-active ID source until a snapshot replaces it, so an absent old reader
-ID cannot silently fall back to an unguarded action.
+to a node on the changed page. Clients retain typed provenance for every
+reader ID they exposed. New reads refresh matching guards and invalidate
+absent ones; snapshots leave provenance intact, while navigation, stop,
+discard, renderer crash and helper replacement make the guards deliberately
+stale.
 
 Compatibility is explicit in `mcp_web.zig`: a helper without
 `reader-ids` is sent the old `sem_read` and its response is treated only
@@ -36,10 +38,27 @@ loads, while actions are failed explicitly. Pending owned arguments have
 a 120s deadline and are released on reply, timeout, renderer crash,
 browser close/discard and helper teardown.
 
+The follow-up correctness pass added capability
+`semantic-request-ids`: `sem_request` 0x6D and `sem_result` 0x6E wrap the
+unchanged semantic request/result payloads with a client operation ID.
+New GUI and headless clients correlate on that ID, so a reply arriving
+after a client timeout cannot satisfy a later same-kind request. Legacy
+helpers remain supported, but a timed-out kind is quarantined until its
+uncorrelated reply arrives or the connection resets. `webdrive.runOp`
+also resolves the view by ID after every pump and its cleanup does the
+same, so helper loss cannot leave a defer writing through a freed view.
+Stop-load and renderer termination now invalidate the helper shadow tree
+without resetting stable-ID/document counters, preventing pre-crash
+reader IDs from aliasing a later document. The GTK/CEF-free navigation
+state machine lives in `web/semnav.zig`; the shared client guard store lives
+in `web/reader_guards.zig`. Both are imported by both test roots.
+
 Measured E2E coverage now spans all three adapter cases. smoke-web stage
 41 reads an ID without a snapshot, activates exactly its trusted link,
-refuses an href-retargeted entity, reissues legacy and rich reads across
-navigation, and rejects a guarded action interrupted by navigation. The
+refuses an href-retargeted entity, correlates two overlapping rich reads
+whose replies arrive in reverse order, reissues legacy and rich reads
+across navigation, rejects a guarded action interrupted by navigation,
+and explicitly answers a rich read canceled by stop-load. The
 focused real headless MCP stage exercises `web_read` -> `web_act` ->
 stale refusal and capability-suppressed markdown fallback. The focused
 external-display GUI stage exercises the same reader-ID flow through the

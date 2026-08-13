@@ -204,6 +204,7 @@ const toolbtn = @import("toolbtn.zig");
 const cssutil = @import("cssutil.zig");
 const proto = @import("../web/protocol.zig");
 const reader_model = @import("../web/reader.zig");
+const reader_guards = @import("../web/reader_guards.zig");
 const webhints = @import("../web/hints.zig");
 const findbin = @import("../web/findbin.zig");
 const pace = @import("../web/pace.zig");
@@ -655,6 +656,8 @@ pub const Client = struct {
     cap_filter_subscribe: bool = false,
     /// Rich reader results and revision-guarded reader actions.
     cap_reader_ids: bool = false,
+    /// Semantic requests/results carry a client-minted operation id.
+    cap_semantic_request_ids: bool = false,
 
     fn hostSlice(self: *const Client) []const u8 {
         return self.host[0..self.host_len];
@@ -809,6 +812,8 @@ pub const Client = struct {
         self.cap_discard = false;
         self.cap_frames_inline = false;
         self.cap_filter_subscribe = false;
+        self.cap_reader_ids = false;
+        self.cap_semantic_request_ids = false;
         if (self.bridge) |br| {
             self.bridge = null;
             br.stop();
@@ -1156,6 +1161,7 @@ pub const Client = struct {
                 self.cap_frames_inline = false;
                 self.cap_filter_subscribe = false;
                 self.cap_reader_ids = false;
+                self.cap_semantic_request_ids = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -1174,6 +1180,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.cap_webext_tabs = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.cap_filter_subscribe = true;
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
                 }
                 // A remote helper without inline frames would keep
                 // posting memfd frames whose descriptors the bridge
@@ -1284,51 +1291,11 @@ pub const Client = struct {
                 const ev = proto.decode(proto.EvA11yEvent, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onAxEvent(ev);
             },
-            .sem_snapshot => {
-                const ev = proto.decode(proto.SemSnapshot, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| face.onSnapshot(ev);
+            .sem_result => {
+                const result = proto.decode(proto.SemResult, frame.payload) catch return;
+                self.dispatchSemantic(.{ .tag = @enumFromInt(result.kind), .payload = result.payload.s }, result.request);
             },
-            .sem_act_result => {
-                const ev = proto.decode(proto.SemActResult, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| face.completeOp(.act, ev.ok != 0, ev.msg, .{});
-            },
-            .sem_expand_result => {
-                const ev = proto.decode(proto.SemExpandResult, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| face.completeOp(.expand, true, ev.text, .{});
-            },
-            .sem_query_result => {
-                const ev = proto.decode(proto.SemQueryResult, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| {
-                    // A hints request rides the query kind; the face
-                    // consumes its own reply before the automation
-                    // bookkeeping can hand it to an MCP caller.
-                    if (!face.onHintsResult(ev.payload.s))
-                        face.completeOp(.query, true, ev.payload.s, .{});
-                }
-            },
-            .sem_read_result => {
-                const ev = proto.decode(proto.SemReadResult, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| {
-                    face.reader_guards.clearRetainingCapacity();
-                    face.reader_guards_active = false;
-                    face.completeOp(.read, true, ev.markdown.s, .{});
-                    // The GUI reader rides the same request kind as the
-                    // `web_read` tool; this is where it collects its own.
-                    face.onReadReply();
-                }
-            },
-            .sem_read_ids_result => {
-                const ev = proto.SemReadIdsResult.decodeAlloc(frame.payload, self.gpa) catch return;
-                defer self.gpa.free(ev.entities);
-                if (self.findFace(ev.view)) |face| {
-                    face.onReadIds(ev);
-                    face.onReadReply();
-                }
-            },
-            .sem_eval_result => {
-                const ev = proto.decode(proto.SemEvalResult, frame.payload) catch return;
-                if (self.findFace(ev.view)) |face| face.onEvalResult(ev);
-            },
+            .sem_snapshot, .sem_act_result, .sem_expand_result, .sem_query_result, .sem_read_result, .sem_read_ids_result, .sem_eval_result => self.dispatchSemantic(frame, 0),
             .intercept_status => {
                 const ev = proto.decode(proto.InterceptStatus, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onInterceptStatus(ev);
@@ -1382,6 +1349,50 @@ pub const Client = struct {
                     face.scroll_x = ev.x;
                     face.scroll_y = ev.y;
                 }
+            },
+            else => {},
+        }
+    }
+
+    fn dispatchSemantic(self: *Client, frame: proto.Frame, request: u32) void {
+        switch (frame.tag) {
+            .sem_snapshot => {
+                const ev = proto.decode(proto.SemSnapshot, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onSnapshot(ev, request);
+            },
+            .sem_act_result => {
+                const ev = proto.decode(proto.SemActResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.completeOp(.act, request, ev.ok != 0, ev.msg, .{});
+            },
+            .sem_expand_result => {
+                const ev = proto.decode(proto.SemExpandResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.completeOp(.expand, request, true, ev.text, .{});
+            },
+            .sem_query_result => {
+                const ev = proto.decode(proto.SemQueryResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| {
+                    if (!face.onHintsResult(request, ev.payload.s))
+                        face.completeOp(.query, request, true, ev.payload.s, .{});
+                }
+            },
+            .sem_read_result => {
+                const ev = proto.decode(proto.SemReadResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| {
+                    face.completeOp(.read, request, true, ev.markdown.s, .{});
+                    face.onReadReply();
+                }
+            },
+            .sem_read_ids_result => {
+                const ev = proto.SemReadIdsResult.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(ev.entities);
+                if (self.findFace(ev.view)) |face| {
+                    face.onReadIds(ev, request);
+                    face.onReadReply();
+                }
+            },
+            .sem_eval_result => {
+                const ev = proto.decode(proto.SemEvalResult, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onEvalResult(ev, request);
             },
             else => {},
         }
@@ -2260,15 +2271,16 @@ fn onContainerAdded(user: ?*anyopaque, ok: bool, payload: []const u8) void {
 // Automation (the `web_*` MCP tools ride this)
 // ---------------------------------------------------------------------
 
-/// One kind of semantic round trip. At most ONE of each kind may be in
-/// flight per view: the reply frames carry no request id (the protocol
-/// correlates by view), so two overlapping evals could not be told
-/// apart — and an awaited promise can settle out of order.
+/// One kind of semantic round trip. Correlated helpers allow overlap;
+/// legacy helpers keep at most one request of each kind in flight.
 pub const AutoKind = enum { snapshot, act, expand, query, read, eval, network };
 
 const AutoOp = struct {
     token: u32,
     kind: AutoKind,
+    /// Client request id on the correlated semantic protocol; 0 for
+    /// legacy semantic frames and non-semantic network pulls.
+    request: u32 = 0,
     /// A `mode:full` snapshot is not satisfied by a spontaneous delta.
     want_full: bool = false,
     started_ms: i64 = 0,
@@ -2348,8 +2360,6 @@ const HintItem = struct {
     label: []u8,
     widget: *c.GtkWidget,
 };
-
-const ReaderGuard = struct { id: u32, doc_gen: u32, rev: u32, guard: u64 };
 
 /// Hint-label look, installed once via cssutil. Named libadwaita
 /// colors keep it legible in both themes.
@@ -2736,6 +2746,9 @@ pub const WebFace = struct {
     auto_ops: std.ArrayList(AutoOp) = .empty,
     auto_results: std.ArrayList(AutoResult) = .empty,
     auto_next: u32 = 1,
+    /// A timed-out legacy operation's next uncorrelated reply is stale
+    /// and must be consumed before the kind is reusable.
+    auto_legacy_quarantine: [7]bool = @splat(false),
 
     /// Reader mode (src/ui/webreader.zig): the extracted article laid
     /// out as text ON TOP of the live page, which keeps running
@@ -2760,10 +2773,10 @@ pub const WebFace = struct {
     last_snapshot: ?[]u8 = null,
     last_snapshot_meta: AutoMeta = .{},
     last_eval: ?[]u8 = null,
-    /// Guards from the last rich read. A snapshot replaces this source;
-    /// navigation keeps it active so old reader IDs fail stale.
-    reader_guards: std.ArrayList(ReaderGuard) = .empty,
-    reader_guards_active: bool = false,
+    /// Every ID ever returned by rich reader mode on this helper view.
+    /// New reads refresh matching guards and invalidate absent ones;
+    /// unrelated snapshots never erase the ID's reader provenance.
+    reader_guards: reader_guards.Store = .{},
 
     /// Link-hints mode (`web_hints`). `hints_token` is the automation
     /// token of the in-flight `visible` query (0 when none); once the
@@ -3181,16 +3194,30 @@ pub const WebFace = struct {
         self.last_eval = null;
     }
 
+    fn abandonAutoOps(self: *WebFace, connection_reset: bool) void {
+        if (connection_reset) {
+            self.auto_legacy_quarantine = @splat(false);
+        } else {
+            for (self.auto_ops.items) |op| {
+                if (op.request == 0) self.auto_legacy_quarantine[@intFromEnum(op.kind)] = true;
+            }
+        }
+        self.auto_ops.clearRetainingCapacity();
+    }
+
     fn autoBusy(self: *WebFace, kind: AutoKind) bool {
         const now = clock.nowMs();
         var i: usize = 0;
         while (i < self.auto_ops.items.len) {
             if (now - self.auto_ops.items[i].started_ms > AUTO_STALE_MS) {
-                _ = self.auto_ops.orderedRemove(i);
+                const stale = self.auto_ops.orderedRemove(i);
+                if (stale.request == 0) self.auto_legacy_quarantine[@intFromEnum(stale.kind)] = true;
                 continue;
             }
             i += 1;
         }
+        if (kind != .network and self.cl.cap_semantic_request_ids) return false;
+        if (self.auto_legacy_quarantine[@intFromEnum(kind)]) return true;
         for (self.auto_ops.items) |op| {
             if (op.kind == kind) return true;
         }
@@ -3215,17 +3242,31 @@ pub const WebFace = struct {
         self.auto_ops.append(self.allocator, .{
             .token = token,
             .kind = kind,
+            .request = if (kind != .network and self.cl.cap_semantic_request_ids) token else 0,
             .want_full = want_full,
             .started_ms = clock.nowMs(),
         }) catch return null;
         return token;
     }
 
-    /// Satisfy the oldest in-flight request of `kind`, if any.
-    fn completeOp(self: *WebFace, kind: AutoKind, ok: bool, text: []const u8, meta: AutoMeta) void {
+    fn acceptsOp(self: *WebFace, kind: AutoKind, request: u32) bool {
+        const ki = @intFromEnum(kind);
+        if (request == 0 and self.auto_legacy_quarantine[ki]) {
+            self.auto_legacy_quarantine[ki] = false;
+            return false;
+        }
+        for (self.auto_ops.items) |op| {
+            if (op.kind == kind and op.request == request) return true;
+        }
+        return false;
+    }
+
+    /// Satisfy the correlated request, or the oldest legacy request.
+    fn completeOp(self: *WebFace, kind: AutoKind, request: u32, ok: bool, text: []const u8, meta: AutoMeta) void {
+        if (!self.acceptsOp(kind, request)) return;
         var idx: ?usize = null;
         for (self.auto_ops.items, 0..) |op, i| {
-            if (op.kind != kind) continue;
+            if (op.kind != kind or op.request != request) continue;
             if (kind == .snapshot and op.want_full and meta.snap_kind != 0) continue;
             idx = i;
             break;
@@ -3265,7 +3306,7 @@ pub const WebFace = struct {
     pub fn autoSnapshot(self: *WebFace, mode: u8, detail: u8, scope: u32) ?u32 {
         const token = self.autoBegin(.snapshot, mode == @intFromEnum(proto.SnapMode.full) or scope != 0) orelse return null;
         self.promote();
-        self.cl.post(proto.SemSnapshotReq{
+        self.postSemantic(token, proto.SemSnapshotReq{
             .view = self.view,
             .mode = mode,
             .detail = detail,
@@ -3277,7 +3318,7 @@ pub const WebFace = struct {
     pub fn autoAct(self: *WebFace, id: u32, action: u8, arg: []const u8) ?u32 {
         const token = self.autoBegin(.act, false) orelse return null;
         if (self.readerGuard(id)) |guard| {
-            self.cl.post(proto.SemActGuarded{
+            self.postSemantic(token, proto.SemActGuarded{
                 .view = self.view,
                 .doc_gen = guard.doc_gen,
                 .rev = guard.rev,
@@ -3287,7 +3328,7 @@ pub const WebFace = struct {
                 .arg = arg,
             });
         } else {
-            self.cl.post(proto.SemAction{ .view = self.view, .id = id, .action = action, .arg = arg });
+            self.postSemantic(token, proto.SemAction{ .view = self.view, .id = id, .action = action, .arg = arg });
         }
         // The helper synthesizes real input for this; the paints it
         // causes still need somebody asking for frames.
@@ -3297,52 +3338,36 @@ pub const WebFace = struct {
 
     pub fn autoExpand(self: *WebFace, id: u32, off: u32, len: u32) ?u32 {
         const token = self.autoBegin(.expand, false) orelse return null;
-        self.cl.post(proto.SemExpand{ .view = self.view, .id = id, .off = off, .len = len });
+        self.postSemantic(token, proto.SemExpand{ .view = self.view, .id = id, .off = off, .len = len });
         return token;
     }
 
     pub fn autoQuery(self: *WebFace, kind: u8, arg: []const u8) ?u32 {
         const token = self.autoBegin(.query, false) orelse return null;
-        self.cl.post(proto.SemQueryReq{ .view = self.view, .kind = kind, .arg = arg });
+        self.postSemantic(token, proto.SemQueryReq{ .view = self.view, .kind = kind, .arg = arg });
         return token;
     }
 
     pub fn autoRead(self: *WebFace) ?u32 {
         const token = self.autoBegin(.read, false) orelse return null;
         if (self.cl.cap_reader_ids)
-            self.cl.post(proto.SemReadIds{ .view = self.view })
+            self.postSemantic(token, proto.SemReadIds{ .view = self.view })
         else
-            self.cl.post(proto.SemRead{ .view = self.view });
+            self.postSemantic(token, proto.SemRead{ .view = self.view });
         return token;
     }
 
-    fn readerGuard(self: *const WebFace, id: u32) ?ReaderGuard {
-        for (self.reader_guards.items) |guard| {
-            if (guard.id == id) return guard;
-        }
-        return if (self.reader_guards_active) .{ .id = id, .doc_gen = 0, .rev = 0, .guard = 0 } else null;
+    fn readerGuard(self: *const WebFace, id: u32) ?reader_guards.Entry {
+        return self.reader_guards.get(id);
     }
 
     fn invalidateReaderGuards(self: *WebFace) void {
-        for (self.reader_guards.items) |*guard| {
-            guard.doc_gen = 0;
-            guard.rev = 0;
-            guard.guard = 0;
-        }
+        self.reader_guards.invalidate();
     }
 
-    fn onReadIds(self: *WebFace, ev: proto.SemReadIdsResult) void {
-        self.reader_guards.ensureTotalCapacity(self.allocator, ev.entities.len) catch return;
-        self.reader_guards.clearRetainingCapacity();
-        for (ev.entities) |entity| {
-            self.reader_guards.appendAssumeCapacity(.{
-                .id = entity.id,
-                .doc_gen = ev.doc_gen,
-                .rev = ev.rev,
-                .guard = entity.guard,
-            });
-        }
-        self.reader_guards_active = true;
+    fn onReadIds(self: *WebFace, ev: proto.SemReadIdsResult, request: u32) void {
+        if (!self.acceptsOp(.read, request)) return;
+        _ = self.reader_guards.apply(self.allocator, request, ev) catch return;
         const entities = self.allocator.alloc(reader_model.Entity, ev.entities.len) catch return;
         defer self.allocator.free(entities);
         for (ev.entities, 0..) |entity, i| {
@@ -3355,18 +3380,33 @@ pub const WebFace = struct {
             .entities = entities,
         }) catch return;
         defer self.allocator.free(json);
-        self.completeOp(.read, true, json, .{ .doc_gen = ev.doc_gen, .rev = ev.rev, .reader_ids = true });
+        self.completeOp(.read, request, true, json, .{ .doc_gen = ev.doc_gen, .rev = ev.rev, .reader_ids = true });
     }
 
     pub fn autoEval(self: *WebFace, code: []const u8, want_await: bool, timeout_ms: u32) ?u32 {
         const token = self.autoBegin(.eval, false) orelse return null;
-        self.cl.post(proto.SemEval{
+        self.postSemantic(token, proto.SemEval{
             .view = self.view,
             .flags = if (want_await) proto.eval_flag_await else 0,
             .timeout_ms = timeout_ms,
             .code = .{ .s = code },
         });
         return token;
+    }
+
+    fn postSemantic(self: *WebFace, token: u32, value: anytype) void {
+        if (!self.cl.cap_semantic_request_ids) {
+            self.cl.post(value);
+            return;
+        }
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        proto.encodePayload(self.allocator, &payload, value) catch return;
+        self.cl.post(proto.SemRequest{
+            .request = token,
+            .kind = @intFromEnum(@TypeOf(value).tag),
+            .payload = .{ .s = payload.items },
+        });
     }
 
     /// Pull recent network-log entries (`intercept_log`), answered
@@ -3404,7 +3444,7 @@ pub const WebFace = struct {
         self.net_next_seq = ev.next_seq;
         const json = proto.netLogJson(self.allocator, ev.next_seq, ev.entries) catch return;
         defer self.allocator.free(json);
-        self.completeOp(.network, true, json, .{});
+        self.completeOp(.network, 0, true, json, .{});
     }
 
     /// The daemon-side per-site store's entry point: called with the
@@ -3656,7 +3696,7 @@ pub const WebFace = struct {
         const vh: i32 = @intFromFloat(@round(@as(f64, @floatFromInt(self.sent_h)) / f));
         var buf: [32]u8 = undefined;
         const arg = std.fmt.bufPrint(&buf, "{d} {d}", .{ vw, vh }) catch return true;
-        self.cl.post(proto.SemQueryReq{
+        self.postSemantic(token, proto.SemQueryReq{
             .view = self.view,
             .kind = @intFromEnum(proto.SemQuery.visible),
             .arg = arg,
@@ -3669,8 +3709,9 @@ pub const WebFace = struct {
 
     /// True when this query reply was a hints reply and is consumed
     /// here; false hands it to the automation bookkeeping untouched.
-    pub fn onHintsResult(self: *WebFace, text: []const u8) bool {
+    pub fn onHintsResult(self: *WebFace, request: u32, text: []const u8) bool {
         if (self.hints_token == 0) return false;
+        if (!self.acceptsOp(.query, request)) return false;
         for (self.auto_ops.items, 0..) |op, i| {
             if (op.token == self.hints_token) {
                 _ = self.auto_ops.orderedRemove(i);
@@ -3746,6 +3787,15 @@ pub const WebFace = struct {
     /// safe with dead widgets, and it also orphans any reply still in
     /// flight (the automation bookkeeping absorbs it).
     fn cancelHints(self: *WebFace) void {
+        if (self.hints_token != 0) {
+            for (self.auto_ops.items, 0..) |op, i| {
+                if (op.token != self.hints_token) continue;
+                const abandoned = self.auto_ops.orderedRemove(i);
+                if (abandoned.request == 0)
+                    self.auto_legacy_quarantine[@intFromEnum(abandoned.kind)] = true;
+                break;
+            }
+        }
         if (self.hints_layer) |layer| {
             if (!self.widgets_dead) c.gtk_overlay_remove_overlay(@ptrCast(self.overlay), layer);
             self.hints_layer = null;
@@ -3895,24 +3945,24 @@ pub const WebFace = struct {
     /// nothing for them (semantic.View.consume), so the old client-side
     /// delta-buffering is gone. `completeOp`'s want_full guard still
     /// drops a stray delta from a pre-coalescing helper.
-    pub fn onSnapshot(self: *WebFace, ev: proto.SemSnapshot) void {
-        self.reader_guards.clearRetainingCapacity();
-        self.reader_guards_active = false;
+    pub fn onSnapshot(self: *WebFace, ev: proto.SemSnapshot, request: u32) void {
+        if (!self.acceptsOp(.snapshot, request)) return;
         const meta: AutoMeta = .{ .doc_gen = ev.doc_gen, .rev = ev.rev, .snap_kind = ev.kind };
         if (self.allocator.dupe(u8, ev.payload.s)) |owned| {
             if (self.last_snapshot) |old| self.allocator.free(old);
             self.last_snapshot = owned;
             self.last_snapshot_meta = meta;
         } else |_| {}
-        self.completeOp(.snapshot, true, ev.payload.s, meta);
+        self.completeOp(.snapshot, request, true, ev.payload.s, meta);
     }
 
-    pub fn onEvalResult(self: *WebFace, ev: proto.SemEvalResult) void {
+    pub fn onEvalResult(self: *WebFace, ev: proto.SemEvalResult, request: u32) void {
+        if (!self.acceptsOp(.eval, request)) return;
         if (self.allocator.dupe(u8, ev.json.s)) |owned| {
             if (self.last_eval) |old| self.allocator.free(old);
             self.last_eval = owned;
         } else |_| {}
-        self.completeOp(.eval, ev.ok != 0, ev.json.s, .{});
+        self.completeOp(.eval, request, ev.ok != 0, ev.json.s, .{});
     }
 
     /// Drop OUR reference to the frame mapping, and every GPU import
@@ -4149,7 +4199,8 @@ pub const WebFace = struct {
         self.stopDiscardTimer();
         cl.post(proto.ViewDiscard{ .view = self.view });
         self.discarded = true;
-        self.auto_ops.clearRetainingCapacity();
+        self.abandonAutoOps(false);
+        self.invalidateReaderGuards();
         self.stopPacing();
         self.dropMap();
         // A fresh helper-side view knows no cap; the revival re-sends.
@@ -4901,13 +4952,8 @@ pub const WebFace = struct {
         // Nothing in flight can be answered by a helper that just came
         // up: drop the requests so their kinds are usable again.
         self.cancelHints();
-        self.auto_ops.clearRetainingCapacity();
-        if (self.cl.cap_reader_ids) {
-            self.invalidateReaderGuards();
-        } else {
-            self.reader_guards.clearRetainingCapacity();
-            self.reader_guards_active = false;
-        }
+        self.abandonAutoOps(true);
+        self.reader_guards.resetEpoch();
         // The document the article came from does not exist any more.
         self.exitReader();
         self.crashed = false;
@@ -4939,8 +4985,8 @@ pub const WebFace = struct {
 
     pub fn onHelperUnavailable(self: *WebFace, reason: []const u8, retryable: bool) void {
         self.cancelHints();
-        self.auto_ops.clearRetainingCapacity();
-        self.invalidateReaderGuards();
+        self.abandonAutoOps(true);
+        self.reader_guards.resetEpoch();
         self.cert_pending = false;
         self.cert_cancelled = false;
         if (!self.widgets_dead) c.gtk_widget_set_visible(self.cert_box, 0);
@@ -5755,6 +5801,7 @@ pub const WebFace = struct {
         self.promote();
         if (ev.state == @intFromEnum(proto.LoadState.started)) {
             self.cancelHints();
+            self.invalidateReaderGuards();
             self.crashed = false;
             self.clearStatus();
             // A navigation the page started itself (a link the reader
@@ -6082,7 +6129,7 @@ pub const WebFace = struct {
     pub fn onCrashed(self: *WebFace) void {
         self.crashed = true;
         self.cancelHints();
-        self.auto_ops.clearRetainingCapacity();
+        self.abandonAutoOps(false);
         self.invalidateReaderGuards();
         self.exitReader();
         self.dropMap();
@@ -6161,6 +6208,7 @@ pub const WebFace = struct {
         // Same as a navigation: `nav_action` revives helper-side.
         self.noteRevived();
         self.cl.post(proto.NavAction{ .view = self.view, .action = @intFromEnum(action) });
+        if (action == .stop) self.invalidateReaderGuards();
         self.promote();
     }
 
@@ -6322,6 +6370,15 @@ pub const WebFace = struct {
     /// no-op (and must NOT steal focus) when no reader is up.
     pub fn exitReader(self: *WebFace) void {
         const was_pending = self.reader_token != null;
+        if (self.reader_token) |token| {
+            for (self.auto_ops.items, 0..) |op, i| {
+                if (op.token != token) continue;
+                const abandoned = self.auto_ops.orderedRemove(i);
+                if (abandoned.request == 0)
+                    self.auto_legacy_quarantine[@intFromEnum(abandoned.kind)] = true;
+                break;
+            }
+        }
         self.reader_token = null;
         if (!self.reader_active) {
             if (was_pending) self.syncReaderButton(false);

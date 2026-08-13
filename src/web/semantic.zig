@@ -212,6 +212,18 @@ pub const View = struct {
         self.url = &.{};
     }
 
+    /// Forget the current document without reusing its stable ids or
+    /// document generation when the browser later produces a new one.
+    pub fn invalidateDocument(self: *View) void {
+        const next_sid = self.next_sid;
+        const doc_gen = self.doc_gen;
+        const gpa = self.gpa;
+        self.deinit();
+        self.* = init(gpa);
+        self.next_sid = next_sid;
+        self.doc_gen = doc_gen;
+    }
+
     fn freeNode(self: *View, n: *Node) void {
         self.gpa.free(n.role);
         self.gpa.free(n.name);
@@ -1061,11 +1073,11 @@ fn childLists(arena: std.mem.Allocator, n: usize, parents: []const usize, none: 
 /// but an explicit role attribute can shadow it).
 fn hintableRole(role: []const u8) bool {
     const roles = [_][]const u8{
-        "link",         "button",       "textbox",          "searchbox",
-        "checkbox",     "radio",        "combobox",         "listbox",
-        "option",       "menuitem",     "menuitemcheckbox", "menuitemradio",
-        "slider",       "spinbutton",   "switch",           "tab",
-        "summary",      "colorpicker",
+        "link",     "button",      "textbox",          "searchbox",
+        "checkbox", "radio",       "combobox",         "listbox",
+        "option",   "menuitem",    "menuitemcheckbox", "menuitemradio",
+        "slider",   "spinbutton",  "switch",           "tab",
+        "summary",  "colorpicker",
     };
     for (roles) |r| {
         if (std.mem.eql(u8, role, r)) return true;
@@ -1184,6 +1196,28 @@ test "reader entities use live stable ids and carry an exact revision" {
     try std.testing.expect(v.rev > rev);
     try std.testing.expect(!v.revisionMatches(result.doc_gen, result.rev));
     try std.testing.expectError(error.StaleReaderDocument, v.readerResult(gpa, .{ .doc = 99 }));
+}
+
+test "invalidating a document preserves id and document monotonicity" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    try v.apply(.{
+        .doc = 1,
+        .url = "https://old.test",
+        .nodes = &.{.{ .id = 1, .parent = 0, .role = "document", .name = "old" }},
+    });
+    const old_sid = v.nodes.items[0].sid;
+    const old_doc = v.doc_gen;
+    v.invalidateDocument();
+    try std.testing.expect(!v.has_tree);
+    try v.apply(.{
+        .doc = 2,
+        .url = "https://new.test",
+        .nodes = &.{.{ .id = 1, .parent = 0, .role = "document", .name = "new" }},
+    });
+    try std.testing.expect(v.nodes.items[0].sid > old_sid);
+    try std.testing.expect(v.doc_gen > old_doc);
 }
 
 test "reader action guard notices a retargeted long link" {

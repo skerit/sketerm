@@ -836,6 +836,7 @@ const Client = struct {
     ack_shm: bool = false,
     ack_semantic: bool = false,
     ack_reader_ids: bool = false,
+    ack_semantic_request_ids: bool = false,
     ack_dmabuf: bool = false,
     ack_view_url: bool = false,
     ack_discard: bool = false,
@@ -969,6 +970,7 @@ const Client = struct {
     rich_kind_len: usize = 0,
     rich_text: [256]u8 = @splat(0),
     rich_text_len: usize = 0,
+    sem_result_request: u32 = 0,
 
     query_out: [16 * 1024]u8 = @splat(0),
     query_len: usize = 0,
@@ -1128,6 +1130,17 @@ const Client = struct {
         }
     }
 
+    fn sendSemantic(self: *Client, request: u32, value: anytype) void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.gpa);
+        proto.encodePayload(self.gpa, &payload, value) catch fail("semantic payload encode");
+        self.send(proto.SemRequest{
+            .request = request,
+            .kind = @intFromEnum(@TypeOf(value).tag),
+            .payload = .{ .s = payload.items },
+        });
+    }
+
     /// Ask the helper for one frame, at most `min_gap_us` after the
     /// previous request.
     fn frameRequest(self: *Client, min_gap_us: i64) void {
@@ -1280,6 +1293,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.ack_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.ack_semantic = true;
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.ack_reader_ids = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.ack_semantic_request_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_DMABUF)) self.ack_dmabuf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.ack_view_url = true;
                     if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.ack_intercept = true;
@@ -1548,6 +1562,11 @@ const Client = struct {
                 self.popup_gesture = p.user_gesture;
                 self.popup_len = @min(p.url.len, self.popup_url.len);
                 @memcpy(self.popup_url[0..self.popup_len], p.url[0..self.popup_len]);
+            },
+            .sem_result => {
+                const result = proto.decode(proto.SemResult, frame.payload) catch fail("sem_result decode");
+                self.sem_result_request = result.request;
+                self.handle(.{ .tag = @enumFromInt(result.kind), .payload = result.payload.s });
             },
             .sem_snapshot => {
                 const s = proto.decode(proto.SemSnapshot, frame.payload) catch fail("sem_snapshot decode");
@@ -2145,8 +2164,8 @@ fn startBadCertServer(dir: []const u8) ?BadCertServer {
     const crt = std.fmt.bufPrintZ(&crt_buf, "{s}/c.pem", .{dir}) catch return null;
     // `-subj` is not optional: without it `req` prompts for a subject.
     if (!runOpenssl(&[_]?[*:0]const u8{
-        "openssl", "req",   "-x509", "-newkey", "rsa:2048",
-        "-keyout", key.ptr, "-out",  crt.ptr,   "-days",
+        "openssl", "req",    "-x509", "-newkey",       "rsa:2048",
+        "-keyout", key.ptr,  "-out",  crt.ptr,         "-days",
         "1",       "-nodes", "-subj", "/CN=localhost",
     })) return null;
 
@@ -3706,9 +3725,9 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
                 "(ad_hits={d}, control_hits={d}; helper: matched={d} held={d} " ++
                 "cancelled={d} redirected={d} timed_out={d} failed_open={d})\n",
             .{
-                attempts,        srv.ad_hits.load(.acquire), srv.ok_hits.load(.acquire),
-                cl.wq_matched,   cl.wq_held,                 cl.wq_cancelled,
-                cl.wq_redirected, cl.wq_timed_out,           cl.wq_failed_open,
+                attempts,         srv.ad_hits.load(.acquire), srv.ok_hits.load(.acquire),
+                cl.wq_matched,    cl.wq_held,                 cl.wq_cancelled,
+                cl.wq_redirected, cl.wq_timed_out,            cl.wq_failed_open,
             },
         );
         fail("stage 35b: real uBlock Origin did not block a request");
@@ -4105,6 +4124,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (!cl.ack_tls) fail("stage 1 handshake: hello_ack lacks the tls capability");
     if (!cl.ack_permissions) fail("stage 1 handshake: hello_ack lacks the permissions capability");
     if (!cl.ack_reader_ids) fail("stage 1 handshake: hello_ack lacks the reader-ids capability");
+    if (!cl.ack_semantic_request_ids) fail("stage 1 handshake: hello_ack lacks semantic request ids");
     pass("stage 1 handshake");
 
     // ── Stage 2: paint into the shared memfd ──────────────────────
@@ -4329,8 +4349,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     cl.navigate(reader_ids_page);
     {
         const seq = cl.md_seq;
-        cl.send(proto.SemReadIds{ .view = view_id });
+        cl.sem_result_request = 0;
+        cl.sendSemantic(4101, proto.SemReadIds{ .view = view_id });
         if (!cl.waitSeq(&cl.md_seq, seq, 20_000)) fail("stage 41 reader ids: no sem_read_ids_result");
+        if (cl.sem_result_request != 4101) fail("stage 41 reader ids: rich read lost its request id");
         if (cl.rich_id == 0 or cl.rich_doc == 0 or cl.rich_rev == 0)
             fail("stage 41 reader ids: the actionable reader link has no stable revision-stamped id");
         if (!std.mem.eql(u8, cl.rich_kind[0..cl.rich_kind_len], "link"))
@@ -4339,7 +4361,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 41 reader ids: the reader entity text names the wrong node");
         cl.resetTitle();
         const acted = cl.act_seq;
-        cl.send(proto.SemActGuarded{
+        cl.sem_result_request = 0;
+        cl.sendSemantic(4102, proto.SemActGuarded{
             .view = view_id,
             .doc_gen = cl.rich_doc,
             .rev = cl.rich_rev,
@@ -4349,11 +4372,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .arg = "",
         });
         if (!cl.waitSeq(&cl.act_seq, acted, 20_000)) fail("stage 41 reader ids: no guarded act result");
+        if (cl.sem_result_request != 4102) fail("stage 41 reader ids: guarded action lost its request id");
         if (cl.act_ok != 1 or cl.act_id != cl.rich_id) fail("stage 41 reader ids: guarded act failed");
         if (!cl.waitTitle("reader:trusted=true", 15_000)) {
             std.debug.print("stage 41 reader ids: title was {s}\n", .{cl.titleSlice()});
             fail("stage 41 reader ids: reader id did not activate exactly its trusted target");
         }
+
+        // Two same-kind operations can overlap on the correlated wire.
+        // Delay the first so the second answers first, then prove both
+        // late callbacks retain their own client request identity.
+        _ = cl.evalWait("window.__sketerm_test_hooks=true;document.documentElement.setAttribute('data-sketerm-delay-read','1200');'armed'", false, 20_000);
+        const concurrent = cl.md_seq;
+        cl.sendSemantic(4103, proto.SemReadIds{ .view = view_id });
+        cl.sendSemantic(4104, proto.SemReadIds{ .view = view_id });
+        if (!cl.waitSeq(&cl.md_seq, concurrent, 20_000)) fail("stage 41 reader ids: concurrent rich read did not answer");
+        if (cl.sem_result_request != 4104) fail("stage 41 reader ids: immediate rich reply matched the older request");
+        if (!cl.waitSeq(&cl.md_seq, concurrent + 1, 20_000)) fail("stage 41 reader ids: delayed rich callback never arrived");
+        if (cl.sem_result_request != 4103) fail("stage 41 reader ids: delayed rich callback lost its request id");
 
         // Re-read, mutate only the target href, then prove the action
         // fingerprint refuses it even though semantic revisions
@@ -4427,8 +4463,29 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 41 reader ids: guarded navigation race was not explicitly stale");
         if (std.mem.indexOf(u8, cl.title[0..cl.title_len], "reader:trusted") != null)
             fail("stage 41 reader ids: guarded navigation race clicked the old target");
+
+        // A queued read behind an in-flight navigation is explicitly
+        // canceled by stop_load. ERR_ABORTED must not leave the semantic
+        // loading bit set or strand the client until its deadline.
+        const stop_page = "data:text/html,<script>var t=Date.now();while(Date.now()-t<3000)</script><article><p>STOPPED</p></article>";
+        const stopped = cl.md_seq;
+        cl.send(proto.Navigate{ .view = view_id, .url = stop_page });
+        cl.sendSemantic(4105, proto.SemReadIds{ .view = view_id });
+        cl.send(proto.NavAction{ .view = view_id, .action = @intFromEnum(proto.NavAct.stop) });
+        if (!cl.waitSeq(&cl.md_seq, stopped, 20_000)) fail("stage 41 reader ids: stopped navigation stranded a rich read");
+        if (cl.sem_result_request != 4105 or std.mem.indexOf(u8, cl.md[0..cl.md_len], "loading was stopped") == null)
+            fail("stage 41 reader ids: stop_load did not correlate the canceled rich read");
     }
-    pass("stage 41 reader ids act fresh, refuse stale, and survive navigation races");
+    pass("stage 41 reader ids correlate overlap, refuse stale, and recover navigation/stop races");
+    if (c.getenv("SKETERM_SMOKE_WEB_READER_ONLY") != null) {
+        cl.have_view = false;
+        cl.send(proto.ViewDestroy{ .view = view_id });
+        cl.deinit();
+        reapHelperTimeout(pid, "reader-only teardown", 15_000);
+        pass("reader-only semantic request correlation");
+        cleanup();
+        return 0;
+    }
 
     // ── Stage 13: query the shadow tree ────────────────────────────
     // (covered by unit tests too; here it proves the frame round-trips)
@@ -5443,7 +5500,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 while (i < size) : (i += 997) {
                     if (bytes[i] != 0) nonzero += 1;
                 }
-                _ = c.munmap(@constCast(@ptrCast(bytes)), size);
+                _ = c.munmap(@ptrCast(@constCast(bytes)), size);
                 if (nonzero == 0) fail("stage 22i devtools: the inspector's frame is entirely blank");
             }
 
