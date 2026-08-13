@@ -3,7 +3,8 @@
 # Builds sketerm from the parent directory of this PKGBUILD (i.e. the
 # checked-out repo). Run as:
 #
-#     cd dist && ./install.sh          # or: makepkg -sif
+#     cd dist && ./install.sh              # or: makepkg -sif
+#     cd dist && ./install.sh --no-install # or: makepkg -sf
 #
 # The -f matters: pkgver() below derives the version from HEAD, so
 # rebuilding the same commit produces a package file that already

@@ -17,11 +17,13 @@
 #   ./install.sh                 build + install everything available
 #   ./install.sh --mux-only      only sketerm-mux (no GTK needed at all)
 #   ./install.sh --gui-only      fail rather than silently dropping the GUI
-#   ./install.sh --deps          print/install the build dependencies
+#   ./install.sh --deps          install package-manager build dependencies
 #   ./install.sh --prefix DIR    plain-install prefix (default /usr/local)
 #   ./install.sh --no-install    build and stage the package, do not install
+#   ./install.sh -- ARGS...      pass all remaining arguments to makepkg
 #
 # On the Arch path any unrecognised argument is forwarded to makepkg.
+# Passthrough arguments are rejected if another packaging path is selected.
 
 set -euo pipefail
 
@@ -37,27 +39,48 @@ GLIB_MIN=2.74
 
 mode=auto          # auto | mux | gui
 prefix=/usr/local
+want_prefix=0
 do_install=1
 want_deps=0
 makepkg_args=()
 
+say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m==> WARNING:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m==> ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+
 while [ $# -gt 0 ]; do
     case "$1" in
-        --mux-only)   mode=mux ;;
-        --gui-only)   mode=gui ;;
+        --mux-only)
+            [ "$mode" != gui ] || die "--mux-only and --gui-only are mutually exclusive"
+            mode=mux ;;
+        --gui-only)
+            [ "$mode" != mux ] || die "--mux-only and --gui-only are mutually exclusive"
+            mode=gui ;;
         --deps)       want_deps=1 ;;
         --no-install) do_install=0 ;;
-        --prefix)     prefix="$2"; shift ;;
-        --prefix=*)   prefix="${1#*=}" ;;
-        -h|--help)    sed -n '2,30p' "$0"; exit 0 ;;
+        --prefix)
+            [ $# -gt 1 ] && [ -n "$2" ] && [[ "$2" != -* ]] \
+                || die "--prefix requires a directory argument"
+            prefix="$2"; want_prefix=1; shift ;;
+        --prefix=*)
+            prefix="${1#*=}"
+            [ -n "$prefix" ] || die "--prefix requires a non-empty directory argument"
+            want_prefix=1 ;;
+        -h|--help)    sed -n '2,/^$/p' "$0"; exit 0 ;;
+        --)            shift; makepkg_args+=("$@"); break ;;
         *)            makepkg_args+=("$1") ;;
     esac
     shift
 done
 
-say()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m==> WARNING:\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m==> ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+if [ "$do_install" -eq 0 ]; then
+    for arg in "${makepkg_args[@]}"; do
+        case "$arg" in
+            --install|-i*|-[^-]*i*)
+                die "--no-install cannot be combined with makepkg install option $arg" ;;
+        esac
+    done
+fi
 
 as_root() {
     if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
@@ -357,6 +380,17 @@ do_plain() {
 
 # ----------------------------------------------------------------- driver
 
+if command -v makepkg >/dev/null 2>&1 && [ "$mode" != mux ]; then
+    [ "$want_prefix" -eq 0 ] || die "--prefix applies only to plain installs without a package manager"
+    say "Arch detected, delegating to makepkg"
+    cd "$here"
+    if [ "$do_install" -eq 1 ]; then
+        exec makepkg -sif "${makepkg_args[@]}"
+    else
+        exec makepkg -sf "${makepkg_args[@]}"
+    fi
+fi
+
 probe_gui
 
 case "$mode" in
@@ -375,13 +409,12 @@ case "$mode" in
         fi ;;
 esac
 
-if command -v makepkg >/dev/null 2>&1 && [ "$mode" != mux ] && [ "$kind" = gui ]; then
-    say "Arch detected, delegating to makepkg"
-    cd "$here"
-    exec makepkg -sif "${makepkg_args[@]}"
+if [ ${#makepkg_args[@]} -gt 0 ]; then
+    die "makepkg passthrough arguments require an Arch GUI package build"
 fi
 
 if command -v dpkg-deb >/dev/null 2>&1; then
+    [ "$want_prefix" -eq 0 ] || die "--prefix applies only to plain installs without a package manager"
     if [ "$want_deps" -eq 1 ]; then
         if [ "$kind" = gui ]; then
             install_deb_deps DEB_BUILD_DEPS
@@ -395,6 +428,8 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     build_all "$kind"
     do_debian "$kind"
 else
+    [ "$want_deps" -eq 0 ] \
+        || die "--deps requires an Arch GUI package build or a dpkg-based host"
     warn "no makepkg and no dpkg-deb; falling back to a plain install"
     build_all "$kind"
     do_plain "$kind"
@@ -402,7 +437,11 @@ fi
 
 say "done"
 if [ "$kind" = mux ]; then
-    say "installed: sketerm-mux (daemon). The GUI was not built."
+    if [ "$do_install" -eq 1 ]; then
+        say "installed: sketerm-mux (daemon). The GUI was not built."
+    else
+        say "built: sketerm-mux (daemon), not installed. The GUI was not built."
+    fi
 fi
 
 # vim:set ts=4 sw=4 et:

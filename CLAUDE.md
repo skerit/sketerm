@@ -193,7 +193,9 @@ Design documents are never committed — proposals stay untracked in the working
 
 ## Packaging
 
-`dist/PKGBUILD` builds the locally-checked-out repo (no remote source) and packages both binaries. Run `cd dist && ./install.sh` (= `makepkg -sif`). **Plain `makepkg -si` is a trap**: `pkgver()` derives from HEAD and uncommitted changes do not move it, so rebuilding the same commit hits "A package has already been built", exits 13, and installs NOTHING while leaving the old binary in place. There is no `check()`: installing is not the time to run the suite. makepkg rewrites the `pkgver=` line on every build; a **clean filter keeps that out of git** so it no longer shows as a permanent local edit (which made `git pull` complain). `.gitattributes` marks `dist/PKGBUILD filter=pkgver`, and the driver lives in local git config — **a fresh clone must set it up or the dirt comes back**:
+`dist/PKGBUILD` builds the locally-checked-out repo (no remote source) and packages `sketerm`, `sketerm-mux`, and `sketerm-webengine`. Run `cd dist && ./install.sh` (= `makepkg -sif`), or add `--no-install` to build with `makepkg -sf` without installing. **Plain `makepkg -si` is a trap**: `pkgver()` derives from HEAD and uncommitted changes do not move it, so rebuilding the same commit hits "A package has already been built", exits 13, and installs NOTHING while leaving the old binary in place. There is no `check()`: installing is not the time to run the suite. makepkg rewrites the `pkgver=` line on every build; a **clean filter keeps that out of git** so it no longer shows as a permanent local edit (which made `git pull` complain). `.gitattributes` marks `dist/PKGBUILD filter=pkgver`, and the driver lives in local git config — **a fresh clone must set it up or the dirt comes back**:
+
+Run `dist/test-install.sh` for the rootless installer regression test. It uses fake package-manager probes and runs `PKGBUILD.build()`/`package()` against temporary outputs; it never installs a package.
 
 ```bash
 git config filter.pkgver.clean  "sed -E 's/^pkgver=.*/pkgver=0.0.0/'"
