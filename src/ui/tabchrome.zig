@@ -11,13 +11,17 @@ const Window = winmod.Window;
 const tab_effects = @import("tab_effects.zig");
 const connectManualPopoverClose = winmod.connectManualPopoverClose;
 
-const TabMenuAction = enum { rename, duplicate, color, pin, close };
+const TabMenuAction = enum { new_tab, rename, duplicate, color, pin, move_new_window, collapse, close_subtree, close };
 const TabMenuToggleKind = enum { show_activity, warn_inactive };
 
 const TabMenuActionCtx = struct {
     allocator: std.mem.Allocator,
     window: *Window,
     popover: *c.GtkWidget,
+    /// The tab the menu was opened on (the right-click also selected
+    /// it; kept for the tree verbs, which act on the page even if the
+    /// selection moved before the click landed).
+    page: *c.AdwTabPage,
     action: TabMenuAction,
 };
 const TabMenuToggleCtx = struct {
@@ -49,10 +53,16 @@ pub fn onTabContextMenu(ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWid
 
     const list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
 
-    addTabMenuAction(self, popover, list, "Rename Tab…", "document-edit-symbolic", .rename);
-    addTabMenuAction(self, popover, list, "Duplicate Tab", "edit-copy-symbolic", .duplicate);
-    addTabMenuAction(self, popover, list, "Tab Colour…", "color-select-symbolic", .color);
-    addTabMenuAction(self, popover, list, "Pin / Unpin Tab", "view-pin-symbolic", .pin);
+    addTabMenuAction(self, popover, list, page, "New Tab", "tab-new-symbolic", .new_tab);
+
+    c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+
+    addTabMenuAction(self, popover, list, page, "Rename Tab…", "document-edit-symbolic", .rename);
+    addTabMenuAction(self, popover, list, page, "Duplicate Tab", "edit-copy-symbolic", .duplicate);
+    addTabMenuAction(self, popover, list, page, "Tab Colour…", "color-select-symbolic", .color);
+    addTabMenuAction(self, popover, list, page, "Pin / Unpin Tab", "view-pin-symbolic", .pin);
+    if (c.adw_tab_view_get_n_pages(self.tab_view) > 1 and c.adw_tab_page_get_pinned(page) == 0)
+        addTabMenuAction(self, popover, list, page, "Move to New Window", "window-new-symbolic", .move_new_window);
 
     c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
 
@@ -60,15 +70,24 @@ pub fn onTabContextMenu(ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWid
     addTabMenuToggle(self, list, page, "Show activity", s.show_activity, .show_activity);
     addTabMenuToggle(self, list, page, "Warn inactivity", s.warn_inactive, .warn_inactive);
 
+    // Tree verbs, only where the tab actually heads a subtree.
+    if (self.tab_forest.hasChildren(page)) {
+        c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+        const collapse_label: [*:0]const u8 =
+            if (self.tab_forest.isCollapsed(page)) "Expand Subtree" else "Collapse Subtree";
+        addTabMenuAction(self, popover, list, page, collapse_label, "view-list-symbolic", .collapse);
+        addTabMenuAction(self, popover, list, page, "Close Subtree", "edit-delete-symbolic", .close_subtree);
+    }
+
     c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
-    addTabMenuAction(self, popover, list, "Close Tab", "window-close-symbolic", .close);
+    addTabMenuAction(self, popover, list, page, "Close Tab", "window-close-symbolic", .close);
 
     c.gtk_popover_set_child(@ptrCast(popover), list);
     c.gtk_popover_popup(@ptrCast(popover));
 }
 
 /// Icon+label button row that runs a window method on the selected tab.
-pub fn addTabMenuAction(self: *Window, popover: *c.GtkWidget, list: *c.GtkWidget, label: [*:0]const u8, icon: [*:0]const u8, action: TabMenuAction) void {
+pub fn addTabMenuAction(self: *Window, popover: *c.GtkWidget, list: *c.GtkWidget, page: *c.AdwTabPage, label: [*:0]const u8, icon: [*:0]const u8, action: TabMenuAction) void {
     const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
     const img = c.gtk_image_new_from_icon_name(icon);
     const lbl = c.gtk_label_new(label);
@@ -81,7 +100,7 @@ pub fn addTabMenuAction(self: *Window, popover: *c.GtkWidget, list: *c.GtkWidget
     c.gtk_button_set_child(@ptrCast(btn), row);
     c.gtk_button_set_has_frame(@ptrCast(btn), 0);
     const actx = self.allocator.create(TabMenuActionCtx) catch return;
-    actx.* = .{ .allocator = self.allocator, .window = self, .popover = popover, .action = action };
+    actx.* = .{ .allocator = self.allocator, .window = self, .popover = popover, .page = page, .action = action };
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onTabMenuActionClicked), @ptrCast(actx), @ptrCast(cast.destroyCtx(TabMenuActionCtx)), c.G_CONNECT_DEFAULT);
     c.gtk_box_append(@ptrCast(list), btn);
 }
@@ -100,10 +119,19 @@ pub fn onTabMenuActionClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) v
     const a = cast.userData(TabMenuActionCtx, user);
     c.gtk_popover_popdown(@ptrCast(a.popover));
     switch (a.action) {
+        .new_tab => if (!a.window.newTabInBrowser()) {
+            a.window.newShellTab(null) catch {};
+        },
         .rename => a.window.renameCurrentTab(),
         .duplicate => a.window.duplicateCurrentTab(),
         .color => chooseTabColor(a.window),
         .pin => a.window.togglePinCurrentTab(),
+        .move_new_window => if (pageStillOpen(a.window, a.page))
+            a.window.moveTabToNewWindow(a.page),
+        .collapse => if (pageStillOpen(a.window, a.page))
+            a.window.setTabCollapsed(a.page, !a.window.tab_forest.isCollapsed(a.page)),
+        .close_subtree => if (pageStillOpen(a.window, a.page))
+            a.window.closeTabSubtree(a.page),
         .close => a.window.closeCurrentTab(),
     }
 }

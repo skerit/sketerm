@@ -44,6 +44,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const classicmenu = @import("browser/classicmenu.zig");
+const clipboard = @import("clipboard.zig");
 const tabhost = @import("tabhost.zig");
 const tabforest = @import("tabforest.zig");
 const Pane = @import("pane.zig").Pane;
@@ -76,6 +78,12 @@ pub const Group = struct {
     /// True while `deinit` is unwinding, so a page closing itself
     /// during teardown does not re-enter the list.
     tearing_down: bool = false,
+    /// The face the notebook is switching to (or settled on). Tracked
+    /// here because GtkNotebook emits "switch-page" BEFORE updating its
+    /// current-page property, so anything reading `active()` from that
+    /// handler (the sidebar's selection refresh) would get the OLD page
+    /// and paint the previously active row as current.
+    current: ?*WebFace = null,
 
     /// The group on `pane`, if it wears a web face at all.
     pub fn fromPane(pane: *Pane) ?*Group {
@@ -104,6 +112,10 @@ pub const Group = struct {
         self.host.on_close = &hostCloseCb;
         self.host.on_new = &hostNewCb;
         self.host.on_reordered = &hostReorderedCb;
+        self.host.tab_menu = .{
+            .extra = &tabMenuExtra,
+            .duplicate = &tabMenuDuplicate,
+        };
         _ = c.g_signal_connect_data(nb, "switch-page", @ptrCast(&onSwitchPage), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         self.host.installStripGestures();
 
@@ -154,6 +166,12 @@ pub const Group = struct {
     /// The page the notebook is showing — what `WebFace.fromPane`
     /// answers with, and what every pane-scoped web verb acts on.
     pub fn active(self: *Group) ?*WebFace {
+        // The switch-page tracker wins while it names a live page: it
+        // is ahead of the notebook's current-page property during the
+        // switch itself (see `current`'s docblock).
+        if (self.current) |face| {
+            if (self.indexOf(face) != null) return face;
+        }
         const cur = self.host.currentPage() orelse {
             // Before the notebook has settled (during the very first
             // adopt) the list order is the honest answer.
@@ -240,6 +258,7 @@ pub const Group = struct {
     /// forest promotes the children, matching the window-level tree.
     fn dropPage(self: *Group, face: *WebFace) void {
         const idx = self.indexOf(face) orelse return;
+        if (self.current == face) self.current = null;
         _ = self.pages.orderedRemove(idx);
         self.forest.remove(face) catch {};
         // Same two-phase order the Pane face contract uses: disconnect
@@ -435,6 +454,7 @@ pub const Group = struct {
         const self = cast.userData(Group, user);
         if (self.widgets_dead) return;
         const face = self.faceForWidget(page) orelse return;
+        self.current = face;
         // The pane titlebar and the window tab wear the ACTIVE page's
         // title; the page coming forward re-asserts both.
         face.onRaised();
@@ -460,5 +480,99 @@ pub const Group = struct {
             .last => .last,
             .first => .first,
         };
+    }
+
+    // ── per-page context menu (shared with the sidebar rows) ─────
+
+    /// Heap context for one popped page-menu row; owned by the menu
+    /// Root, so it dies with the popover.
+    const PageMenuCtx = struct {
+        allocator: std.mem.Allocator,
+        group: *Group,
+        face: *WebFace,
+    };
+
+    fn pageMenuCtx(self: *Group, root: *classicmenu.Root, face: *WebFace) ?*PageMenuCtx {
+        const ctx = self.allocator.create(PageMenuCtx) catch return null;
+        ctx.* = .{ .allocator = self.allocator, .group = self, .face = face };
+        root.own(cast.destroyCtx(PageMenuCtx), @ptrCast(ctx));
+        return ctx;
+    }
+
+    /// The group's domain rows for TabHost's shared per-tab menu.
+    fn tabMenuExtra(ctx: ?*anyopaque, page: *c.GtkWidget, root: *classicmenu.Root, m: classicmenu.Menu) void {
+        const self = cast.userData(Group, ctx);
+        const face = self.faceForWidget(page) orelse return;
+        const cx = self.pageMenuCtx(root, face) orelse return;
+
+        m.itemIcon("New Tab", .{ .name = "tab-new-symbolic" }, &onPageMenuNewTab, @ptrCast(cx));
+
+        const nav = m.section();
+        nav.itemIcon("Reload", .{ .name = "view-refresh-symbolic" }, &onPageMenuReload, @ptrCast(cx));
+        nav.itemIconEnabled(
+            "Copy Page URL",
+            .{ .name = "edit-copy-symbolic" },
+            face.url != null or face.pending_url != null,
+            &onPageMenuCopyUrl,
+            @ptrCast(cx),
+        );
+
+        if (self.forest.hasChildren(face)) {
+            const tree = m.section();
+            const collapse_label: [*:0]const u8 =
+                if (self.forest.isCollapsed(face)) "Expand Subtree" else "Collapse Subtree";
+            tree.itemIcon(collapse_label, .{ .name = "view-list-symbolic" }, &onPageMenuCollapse, @ptrCast(cx));
+            tree.itemIcon("Close Subtree", .{ .name = "edit-delete-symbolic" }, &onPageMenuCloseSubtree, @ptrCast(cx));
+        }
+    }
+
+    /// "Duplicate Tab": same URL, nested under the original (TST's
+    /// duplicate-as-child).
+    fn tabMenuDuplicate(ctx: ?*anyopaque, page: *c.GtkWidget) void {
+        const self = cast.userData(Group, ctx);
+        const face = self.faceForWidget(page) orelse return;
+        const url = face.url orelse face.pending_url;
+        _ = self.newPage(url, face) catch {};
+    }
+
+    fn onPageMenuNewTab(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const cx = cast.userData(PageMenuCtx, user);
+        _ = cx.group.newPage(null, null) catch {};
+    }
+
+    fn onPageMenuReload(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const cx = cast.userData(PageMenuCtx, user);
+        if (!cx.group.has(cx.face)) return;
+        cx.face.navAction(.reload);
+    }
+
+    fn onPageMenuCopyUrl(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const cx = cast.userData(PageMenuCtx, user);
+        if (!cx.group.has(cx.face)) return;
+        const url = cx.face.url orelse cx.face.pending_url orelse return;
+        clipboard.copyText(cx.group.allocator, cx.face.root_box, url);
+    }
+
+    fn onPageMenuCollapse(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const cx = cast.userData(PageMenuCtx, user);
+        const g = cx.group;
+        if (!g.has(cx.face)) return;
+        const collapse = !g.forest.isCollapsed(cx.face);
+        g.forest.setCollapsed(cx.face, collapse);
+        // TST behaviour: a selection hidden by the collapse is pulled
+        // up to the collapsed head, so it never points at an
+        // invisible row.
+        if (collapse) {
+            if (g.active()) |cur| {
+                if (g.forest.isHidden(cur)) g.setActive(cx.face);
+            }
+        }
+        g.notifyWindow();
+    }
+
+    fn onPageMenuCloseSubtree(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const cx = cast.userData(PageMenuCtx, user);
+        if (!cx.group.has(cx.face)) return;
+        cx.group.closePage(cx.face, .close_subtree);
     }
 };

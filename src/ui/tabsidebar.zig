@@ -42,6 +42,8 @@ const input = @import("input.zig");
 const winmod = @import("window.zig");
 const Window = winmod.Window;
 const tabbar = @import("tabbar.zig");
+const tabchrome = @import("tabchrome.zig");
+const classicmenu = @import("browser/classicmenu.zig");
 const webgroup = @import("webgroup.zig");
 const WebFace = @import("webface.zig").WebFace;
 
@@ -66,6 +68,73 @@ const Zone = enum { above, into, below };
 /// the row is torn down, so a rebuild under the pointer cannot leave a
 /// stale pointer behind.
 var drop_hint: ?*Sidebar.Row = null;
+
+/// The row a drag started from, dimmed for the drag's duration so the
+/// gesture reads as moving THE tab rather than a copy of it. Cleared
+/// on row teardown like `drop_hint`.
+var drag_src_row: ?*Sidebar.Row = null;
+
+fn clearDragSrc() void {
+    const r = drag_src_row orelse return;
+    drag_src_row = null;
+    c.gtk_widget_remove_css_class(r.row, "sketerm-tst-dragsrc");
+}
+
+/// TST's dwell-to-expand: hovering a collapsed row mid-drag expands
+/// its subtree after a beat, so a drop INTO a hidden part of the tree
+/// never requires aborting the drag.
+var hover_expand_row: ?*Sidebar.Row = null;
+var hover_expand_source: c.guint = 0;
+
+const HOVER_EXPAND_MS: c.guint = 600;
+
+fn cancelHoverExpand() void {
+    if (hover_expand_source != 0) {
+        _ = c.g_source_remove(hover_expand_source);
+        hover_expand_source = 0;
+    }
+    hover_expand_row = null;
+}
+
+fn armHoverExpand(r: *Sidebar.Row) void {
+    if (hover_expand_row == r) return;
+    cancelHoverExpand();
+    const collapsed = switch (r.item) {
+        .tab => |page| blk: {
+            const self = r.sidebar orelse return;
+            const win = self.win orelse return;
+            break :blk win.tab_forest.hasChildren(page) and win.tab_forest.isCollapsed(page);
+        },
+        .page => |face| blk: {
+            const self = r.sidebar orelse return;
+            const g = self.liveGroup() orelse return;
+            break :blk g.forest.hasChildren(face) and g.forest.isCollapsed(face);
+        },
+    };
+    if (!collapsed) return;
+    hover_expand_row = r;
+    hover_expand_source = c.g_timeout_add(HOVER_EXPAND_MS, @ptrCast(&onHoverExpand), @ptrCast(r));
+}
+
+fn onHoverExpand(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const r = cast.userData(Sidebar.Row, user);
+    hover_expand_source = 0;
+    if (hover_expand_row != r) return 0;
+    hover_expand_row = null;
+    if (!r.active) return 0;
+    const self = r.sidebar orelse return 0;
+    const win = self.win orelse return 0;
+    switch (r.item) {
+        .tab => |page| win.setTabCollapsed(page, false),
+        .page => |face| {
+            const g = self.liveGroup() orelse return 0;
+            if (g.forest.find(face) == null) return 0;
+            g.forest.setCollapsed(face, false);
+            self.rebuild();
+        },
+    }
+    return 0;
+}
 
 const DROP_CLASSES = [_][*:0]const u8{ "tst-drop-above", "tst-drop-into", "tst-drop-below" };
 
@@ -246,6 +315,13 @@ pub const Sidebar = struct {
         _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onListDrop), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(scroller, @ptrCast(@alignCast(drop)));
 
+        // Right-click on the empty space below the rows (bubble phase,
+        // so a row's own claimed menu press never reaches it).
+        const rclick = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
+        _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onEmptyRightClick), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(scroller, @ptrCast(@alignCast(rclick)));
+
         self.rebuild();
         return self;
     }
@@ -263,6 +339,8 @@ pub const Sidebar = struct {
             if (d.view == win.tab_view) tabbar.clearDrag();
         }
         clearDropHint();
+        clearDragSrc();
+        cancelHoverExpand();
         self.win = null;
         self.release();
     }
@@ -421,6 +499,14 @@ pub const Sidebar = struct {
         _ = c.g_signal_connect_data(mclick, "pressed", @ptrCast(&onMiddlePressed), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(row, @ptrCast(@alignCast(mclick)));
 
+        // Right-click: the same context menu the row's tab wears
+        // elsewhere (the strip's window-tab menu, the notebook's
+        // page menu) — the sidebar adds no second implementation.
+        const rclick = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
+        _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRowRightClick), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(row, @ptrCast(@alignCast(rclick)));
+
         // Drag this row: same gesture as a strip tab, so it can reorder,
         // nest, cross windows or drop out into a new window.
         const src = c.gtk_drag_source_new();
@@ -529,6 +615,8 @@ pub const Sidebar = struct {
     fn freeRow(user: ?*anyopaque) callconv(.c) void {
         const r = cast.userData(Row, user);
         if (drop_hint == r) drop_hint = null;
+        if (drag_src_row == r) drag_src_row = null;
+        if (hover_expand_row == r) cancelHoverExpand();
         const sidebar = r.sidebar;
         r.sidebar = null;
         if (sidebar) |self| {
@@ -656,6 +744,135 @@ pub const Sidebar = struct {
         closeItem(r);
     }
 
+    fn onRowRightClick(gesture: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+        const r = cast.userData(Row, user);
+        if (!r.active) return;
+        const self = r.sidebar orelse return;
+        const win = self.win orelse return;
+        // Claim before popping up: an unclaimed release dismisses the
+        // popover the frame it maps (ui/menu.zig documents the race).
+        _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+        switch (r.item) {
+            .tab => |page| {
+                // Anchor on the SCROLLER, not the row, and translate the
+                // coordinates FIRST: selecting the tab below can rebuild
+                // the row list (a browser tab swaps the sidebar to its
+                // pages), and a popover parented to the destroyed row
+                // crashes in gdk_surface_new_popup.
+                var src = c.graphene_point_t{ .x = @floatCast(x), .y = @floatCast(y) };
+                var dst = c.graphene_point_t{ .x = 0, .y = 0 };
+                if (c.gtk_widget_compute_point(r.row, self.root, &src, &dst) == 0)
+                    dst = src;
+                const anchor = self.root;
+                // Strip convention: the right-click selects the tab so
+                // the menu's selection-scoped verbs act on it.
+                c.adw_tab_view_set_selected_page(win.tab_view, page);
+                tabchrome.onTabContextMenu(@ptrCast(win), page, anchor, @floatCast(dst.x), @floatCast(dst.y));
+            },
+            .page => |face| {
+                const g = self.liveGroup() orelse return;
+                if (!g.has(face)) return;
+                _ = g.host.showTabMenu(face.root_box, r.row, x, y);
+            },
+        }
+    }
+
+    /// Right-click on the sidebar's empty space: list-level verbs.
+    fn onEmptyRightClick(gesture: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(Sidebar, user);
+        const win = self.win orelse return;
+        _ = c.gtk_gesture_set_state(@ptrCast(gesture), c.GTK_EVENT_SEQUENCE_CLAIMED);
+
+        const cx = self.allocator.create(EmptyMenuCtx) catch return;
+        cx.* = .{ .allocator = self.allocator, .sidebar = self };
+        const root = classicmenu.Root.create(self.allocator) orelse {
+            self.allocator.destroy(cx);
+            return;
+        };
+        root.own(cast.destroyCtx(EmptyMenuCtx), @ptrCast(cx));
+
+        const m = root.top();
+        m.itemIcon("New Tab", .{ .name = "tab-new-symbolic" }, &onEmptyMenuNewTab, @ptrCast(cx));
+        const tree = m.section();
+        var any_children = false;
+        for (self.rows.items) |r| {
+            const has = switch (r.item) {
+                .tab => |page| win.tab_forest.hasChildren(page),
+                .page => |face| if (self.liveGroup()) |g| g.forest.hasChildren(face) else false,
+            };
+            if (has) {
+                any_children = true;
+                break;
+            }
+        }
+        tree.itemIconEnabled("Collapse All", .{ .name = "view-list-symbolic" }, any_children, &onEmptyMenuCollapseAll, @ptrCast(cx));
+        tree.itemIconEnabled("Expand All", .{ .name = "view-list-symbolic" }, true, &onEmptyMenuExpandAll, @ptrCast(cx));
+        _ = root.popup(self.root, x, y);
+    }
+
+    const EmptyMenuCtx = struct {
+        allocator: std.mem.Allocator,
+        sidebar: *Sidebar,
+    };
+
+    fn onEmptyMenuNewTab(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const cx = cast.userData(EmptyMenuCtx, user);
+        const win = cx.sidebar.win orelse return;
+        if (!win.newTabInBrowser())
+            win.newShellTab(null) catch {};
+    }
+
+    fn onEmptyMenuCollapseAll(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(EmptyMenuCtx, user).sidebar.setAllCollapsed(true);
+    }
+
+    fn onEmptyMenuExpandAll(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(EmptyMenuCtx, user).sidebar.setAllCollapsed(false);
+    }
+
+    /// Collapse or expand every subtree in whichever forest the rows
+    /// show. A selection hidden by "collapse all" is pulled up to its
+    /// nearest visible ancestor first, or the selected-page watcher
+    /// would immediately re-expand its branch.
+    fn setAllCollapsed(self: *Sidebar, collapse: bool) void {
+        const win = self.win orelse return;
+        if (self.liveGroup()) |g| {
+            var all: std.ArrayList(*WebFace) = .empty;
+            defer all.deinit(self.allocator);
+            g.forest.flattenAll(self.allocator, &all) catch return;
+            for (all.items) |f| {
+                if (g.forest.hasChildren(f)) g.forest.setCollapsed(f, collapse);
+            }
+            if (collapse) {
+                if (g.active()) |cur| {
+                    if (g.forest.isHidden(cur)) {
+                        var p: *WebFace = cur;
+                        while (g.forest.isHidden(p)) p = g.forest.parentOf(p) orelse break;
+                        g.setActive(p);
+                    }
+                }
+            }
+            win.webGroupChanged(g);
+            return;
+        }
+        var all: std.ArrayList(*c.AdwTabPage) = .empty;
+        defer all.deinit(self.allocator);
+        win.tab_forest.flattenAll(self.allocator, &all) catch return;
+        for (all.items) |page| {
+            if (win.tab_forest.hasChildren(page)) win.tab_forest.setCollapsed(page, collapse);
+        }
+        if (collapse) {
+            if (c.adw_tab_view_get_selected_page(win.tab_view)) |sel| {
+                if (win.tab_forest.isHidden(sel)) {
+                    var p: *c.AdwTabPage = sel;
+                    while (win.tab_forest.isHidden(p)) p = win.tab_forest.parentOf(p) orelse break;
+                    c.adw_tab_view_set_selected_page(win.tab_view, p);
+                }
+            }
+        }
+        win.forestChanged();
+    }
+
     fn closeItem(r: *Row) void {
         const self = r.sidebar orelse return;
         const win = self.win orelse return;
@@ -704,12 +921,19 @@ pub const Sidebar = struct {
         const paintable = c.gtk_widget_paintable_new(r.row) orelse return;
         defer c.g_object_unref(paintable);
         c.gtk_drag_source_set_icon(src, @ptrCast(paintable), 0, 0);
+        // The source row all but vacates for the duration: the user is
+        // moving THE tab, not minting a copy of it.
+        clearDragSrc();
+        drag_src_row = r;
+        c.gtk_widget_add_css_class(r.row, "sketerm-tst-dragsrc");
     }
 
     /// Dropped on nothing: the strip's drag-out behaviour, which spawns
     /// a window for the page.
     fn onDragCancel(_: *c.GtkDragSource, _: *c.GdkDrag, reason: c_int, _: ?*anyopaque) callconv(.c) c.gboolean {
         clearDropHint();
+        clearDragSrc();
+        cancelHoverExpand();
         drag_item = null;
         drag_win = null;
         // Same refusals the strip makes before it detaches: a window's
@@ -725,6 +949,8 @@ pub const Sidebar = struct {
 
     fn onDragEnd(_: *c.GtkDragSource, _: *c.GdkDrag, _: c.gboolean, _: ?*anyopaque) callconv(.c) void {
         clearDropHint();
+        clearDragSrc();
+        cancelHoverExpand();
         drag_item = null;
         drag_win = null;
         tabbar.clearDrag();
@@ -753,12 +979,14 @@ pub const Sidebar = struct {
             return 0;
         }
         setDropHint(r, zoneAt(r, y));
+        armHoverExpand(r);
         return c.GDK_ACTION_MOVE;
     }
 
     fn onRowLeave(_: *c.GtkDropTarget, user: ?*anyopaque) callconv(.c) void {
         const r = cast.userData(Row, user);
         if (drop_hint == r) clearDropHint();
+        if (hover_expand_row == r) cancelHoverExpand();
     }
 
     fn onRowDrop(_: *c.GtkDropTarget, _: *const c.GValue, _: f64, y: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -861,26 +1089,36 @@ fn installCss(any_widget: *c.GtkWidget) void {
     const css =
         \\.sketerm-tst { background-color: transparent; }
         \\list.sketerm-tst-list { background-color: transparent; padding: 3px 4px; }
-        \\/* The chip. `alpha(currentColor, …)` rather than a named colour
-        \\   so it works out in both light and dark without asking. */
+        \\/* Firefox-TST (proton) row: inactive rows are flat text on
+        \\   the sidebar background; hover gets a faint surface; the
+        \\   ACTIVE tab a stronger neutral surface — the same treatment
+        \\   the window's tab strip gives its current tab, NOT the blue
+        \\   selection colour. `alpha(currentColor, …)` so it works out
+        \\   in both light and dark without asking. */
         \\list.sketerm-tst-list > row.sketerm-tst-row {
         \\  min-height: 0;
         \\  padding: 0;
-        \\  margin: 1px 0;
-        \\  border-radius: 6px;
-        \\  background-color: alpha(currentColor, 0.09);
+        \\  margin: 0;
+        \\  border-radius: 4px;
+        \\  background-color: transparent;
         \\  transition: background-color 120ms ease-out;
         \\}
         \\list.sketerm-tst-list > row.sketerm-tst-row:hover {
-        \\  background-color: alpha(currentColor, 0.17);
+        \\  background-color: alpha(currentColor, 0.08);
         \\}
         \\/* The ACTIVE tab's row. Our own class, not `:selected`: the
         \\   list has no selection, so this stays put while focus is in a
         \\   pane and cannot drift with the keyboard cursor. */
         \\list.sketerm-tst-list > row.sketerm-tst-row.sketerm-tst-active,
         \\list.sketerm-tst-list > row.sketerm-tst-row.sketerm-tst-active:hover {
-        \\  background-color: @theme_selected_bg_color;
-        \\  color: @theme_selected_fg_color;
+        \\  background-color: alpha(currentColor, 0.16);
+        \\}
+        \\/* The row a drag is moving: it has all but left, only a faint
+        \\   placeholder remains until the drop lands. */
+        \\list.sketerm-tst-list > row.sketerm-tst-row.sketerm-tst-dragsrc,
+        \\list.sketerm-tst-list > row.sketerm-tst-row.sketerm-tst-dragsrc:hover {
+        \\  opacity: 0.35;
+        \\  background-color: transparent;
         \\}
         \\/* Where a drop would land: a line between rows, a frame for a
         \\   drop INTO the row (making the dragged tab its child). */
@@ -894,8 +1132,8 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\  outline: 2px solid @theme_selected_bg_color;
         \\  outline-offset: -2px;
         \\}
-        \\.sketerm-tst-body { min-height: 26px; padding: 0 2px 0 0; }
-        \\.sketerm-tst-title { font-size: 0.92em; }
+        \\.sketerm-tst-body { min-height: 28px; padding: 0 2px 0 2px; }
+        \\.sketerm-tst-title { font-size: 1em; }
         \\/* A twisty the size of the glyph, not of a toolbar button. */
         \\button.sketerm-tst-twisty {
         \\  padding: 0; margin: 0; border: none; min-width: 16px; min-height: 16px;

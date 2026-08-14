@@ -3776,6 +3776,32 @@ pub const Window = struct {
         self.forestChanged();
     }
 
+    /// Close a tab and its whole subtree, regardless of the
+    /// `tab_close_parent` setting (the context menu's explicit verb).
+    /// Deepest-first so each close only ever promotes an empty child
+    /// list; every member still gets its own dirty-editor veto.
+    pub fn closeTabSubtree(self: *Window, page: *c.AdwTabPage) void {
+        var subtree: std.ArrayList(*c.AdwTabPage) = .empty;
+        defer subtree.deinit(self.allocator);
+        self.tab_forest.appendSubtree(self.allocator, page, &subtree) catch return;
+        self.closing_subtree = true;
+        defer self.closing_subtree = false;
+        var i = subtree.items.len;
+        while (i > 0) {
+            i -= 1;
+            _ = c.adw_tab_view_close_page(self.tab_view, subtree.items[i]);
+        }
+    }
+
+    /// Move one tab into a fresh window (the strip drag-out, as a
+    /// menu verb). The PaneTree travels with the page as qdata.
+    pub fn moveTabToNewWindow(self: *Window, page: *c.AdwTabPage) void {
+        if (c.adw_tab_view_get_n_pages(self.tab_view) <= 1) return;
+        const win = self.spawnSecondaryWindow() orelse return;
+        if (!win.transferPageFrom(self.tab_view, page, 0))
+            c.gtk_window_destroy(@ptrCast(win.app_window));
+    }
+
     /// Discard the web pages of every pane hidden by collapsing
     /// `page`'s subtree (the descendants, not the collapsed tab
     /// itself). Panes without a web face are untouched; discard keeps
