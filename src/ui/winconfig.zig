@@ -970,6 +970,8 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     if (self.tab_sidebar) |sb| {
         const want_visible = self.config.show_tab_sidebar;
         const visible_now = c.gtk_widget_get_visible(sb.root) != 0;
+        // setTabSidebarVisible is a no-op once this window's sidebar was
+        // toggled by hand, so a reload cannot stomp a per-window choice.
         if (want_visible != visible_now) {
             self.setTabSidebarVisible(want_visible);
         } else if (visible_now) {
@@ -1398,6 +1400,10 @@ pub fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
 
 pub fn prefsApplyCallback(win_ptr: *anyopaque, new_cfg: *const Config) void {
     const win: *Window = @ptrCast(@alignCast(win_ptr));
+    // Flipping the switch in THIS window's Preferences is as deliberate
+    // as its shortcut, so it retakes a sidebar the user had toggled by
+    // hand; other windows still keep their own state.
+    if (new_cfg.show_tab_sidebar != win.config.show_tab_sidebar) win.sidebar_user_set = false;
     win.applyConfigChange(new_cfg);
 }
 

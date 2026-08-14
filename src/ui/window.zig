@@ -40,7 +40,7 @@ pub const PaneTree = tree_mod.Tree(*Pane);
 const TAB_TREE_KEY = "sketerm-tree";
 const tabforest_mod = @import("tabforest.zig");
 const tabsidebar_mod = @import("tabsidebar.zig");
-const SidebarSave = @import("sidebar_save.zig").State;
+const Debounce = @import("debounce.zig").State;
 const webgroup = @import("webgroup.zig");
 
 /// Drag limits for the tree-sidebar divider. Wider than the config
@@ -246,9 +246,15 @@ pub const Window = struct {
     /// creation failed; visibility follows Config.show_tab_sidebar +
     /// the toggle_tab_sidebar action.
     tab_sidebar: ?*tabsidebar_mod.Sidebar = null,
+    /// Set once this window's sidebar visibility was chosen by hand
+    /// (shortcut / menu / palette). Sidebar visibility is PER WINDOW:
+    /// `show_tab_sidebar` is only the default a new window opens with,
+    /// so a config reload must not push one window's choice into every
+    /// other window.
+    sidebar_user_set: bool = false,
     /// Debounce for writing sidebar visibility or a dragged width back
     /// to config: a divider drag emits notify::position per pixel.
-    sidebar_config_save: SidebarSave = .{},
+    sidebar_config_save: Debounce = .{},
     /// HBox holding [sidebar | toast_overlay] as the toolbar content.
     content_box: *c.GtkWidget,
     /// Opener page consumed by the NEXT page-attached, so a web popup /
@@ -2430,7 +2436,7 @@ pub const Window = struct {
     }
 
     /// Reserve ownership before libadwaita reparents the page.
-    fn transferPageFrom(
+    pub fn transferPageFrom(
         self: *Window,
         source: *c.AdwTabView,
         page: *c.AdwTabPage,
@@ -2664,10 +2670,7 @@ pub const Window = struct {
         if (self.browserPagesInSidebar()) {
             if (self.sidebarGroup()) |g| {
                 if (g.active()) |face| {
-                    g.closePage(face, switch (self.config.tab_close_parent) {
-                        .promote => .promote,
-                        .close_subtree => .close_subtree,
-                    });
+                    g.closePage(face, g.closePolicy());
                     return;
                 }
             }
@@ -3027,6 +3030,13 @@ pub const Window = struct {
         next_tab_id += 1;
         self.attachTabTree(page, tree_root);
         self.last_created_page = page;
+        // A tab the user just asked for becomes the current one —
+        // AdwTabView selects nothing on append, so without this the new
+        // tab (and the tree-sidebar row that mirrors it) opened behind
+        // the old one and keyboard focus stayed on the "+" button.
+        // `at_end` marks the bulk paths (layout restore), which pick
+        // their own selection once every tab exists.
+        if (!at_end) c.adw_tab_view_set_selected_page(self.tab_view, page);
         return page;
     }
 
@@ -3799,12 +3809,25 @@ pub const Window = struct {
         self.forestChanged();
     }
 
+    /// Move `page` next to `anchor` among the anchor's siblings — the
+    /// sidebar's drop-between-rows gesture. Only the FOREST order moves;
+    /// the AdwTabView strip keeps its own flat order (see tabforest.zig).
+    pub fn tabForestMoveNextTo(self: *Window, page: *c.AdwTabPage, anchor: *c.AdwTabPage, after: bool) void {
+        self.tab_forest.moveNextTo(page, anchor, after) catch |err| {
+            if (err == error.WouldCycle)
+                showToast(self, "Cannot drop a tab into its own subtree.");
+            return;
+        };
+        self.forestChanged();
+    }
+
     /// Show / hide the vertical tree-style tab sidebar
     /// (toggle_tab_sidebar action; startup state = show_tab_sidebar).
     pub fn toggleTabSidebarVisibility(self: *Window) void {
         const sb = self.tab_sidebar orelse return;
         const visible = c.gtk_widget_get_visible(sb.root) != 0;
-        self.setTabSidebarVisible(!visible);
+        self.sidebar_user_set = true;
+        self.applyTabSidebarVisible(!visible);
     }
 
     /// The sidebar's visibility is also its MODE switch: while it is
@@ -3812,12 +3835,21 @@ pub const Window = struct {
     /// while it is hidden, a browser falls back to its own in-pane tab
     /// strip and new tabs are window tabs. So every show/hide has to
     /// re-ask each browser to redraw its chrome.
+    /// Follow the configured default. A window whose sidebar the user
+    /// set by hand keeps its own state, so editing the preference (or
+    /// any other config write triggering a reload) never overrides a
+    /// deliberate per-window choice.
     pub fn setTabSidebarVisible(self: *Window, show: bool) void {
+        if (self.sidebar_user_set) return;
+        self.applyTabSidebarVisible(show);
+    }
+
+    /// Apply visibility to THIS window only. Never writes
+    /// `show_tab_sidebar` back to config: that key is the new-window
+    /// default, and persisting a runtime toggle into it is what used to
+    /// flip the sidebar in every other window on the next reload.
+    pub fn applyTabSidebarVisible(self: *Window, show: bool) void {
         const sb = self.tab_sidebar orelse return;
-        const preference_changed = self.config.show_tab_sidebar != show;
-        self.config.show_tab_sidebar = show;
-        if (preference_changed)
-            @import("prefs.zig").noteTabSidebarVisibility(@ptrCast(self), show);
         c.gtk_widget_set_visible(sb.root, @intFromBool(show));
         if (show) {
             // A GtkPaned forgets a position set while its start child
@@ -3828,10 +3860,7 @@ pub const Window = struct {
             sb.rebuild();
         }
         self.refreshWebGroupChrome();
-        // applyConfigChange has already copied this value into config,
-        // so only a runtime toggle reaches the writer. This keeps reloads
-        // read-only while making menu/palette/key toggles persistent.
-        if (preference_changed) self.scheduleSidebarConfigSave();
+        @import("prefs.zig").noteTabSidebarVisibility(@ptrCast(self), show);
     }
 
     fn scheduleSidebarConfigSave(self: *Window) void {
