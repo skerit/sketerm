@@ -216,9 +216,14 @@ pub const Omnibox = struct {
 
     fn onChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(Omnibox, user);
+        if (c.getenv("SKETERM_DEBUG_OMNI") != null)
+            std.debug.print("omni: changed severed={} focus={}\n", .{ self.severed, webface.focusWithin(self.entry) });
         if (self.severed) return;
         // Programmatic rewrites only touch an unfocused entry.
-        if (c.gtk_widget_has_focus(self.entry) == 0) return;
+        // (`focusWithin`, not `has_focus`: an entry's focus lives on
+        // its inner GtkText, so `has_focus` on the entry never fires
+        // and the dropdown would never open.)
+        if (!webface.focusWithin(self.entry)) return;
         if (self.debounce_id != 0) _ = c.g_source_remove(self.debounce_id);
         self.debounce_id = c.g_timeout_add(DEBOUNCE_MS, &onDebounce, self);
     }
@@ -529,6 +534,8 @@ pub const Omnibox = struct {
 
     fn onRanked(user: ?*anyopaque) void {
         const self = cast.userData(Omnibox, user);
+        if (c.getenv("SKETERM_DEBUG_OMNI") != null)
+            std.debug.print("omni: ranked severed={} n={}\n", .{ self.severed, self.model.items.items.len });
         if (self.severed) return;
 
         const lb: *c.GtkListBox = @ptrCast(@alignCast(self.listbox));
@@ -571,9 +578,11 @@ pub const Omnibox = struct {
         // what I typed" (the entry's own activate).
         c.gtk_list_box_unselect_all(lb);
 
+        if (c.getenv("SKETERM_DEBUG_OMNI") != null)
+            std.debug.print("omni: show shown={} qlen={} focus={}\n", .{ self.shown.items.len, self.model.query().len, webface.focusWithin(self.entry) });
         if (self.shown.items.len == 0 or
             self.model.query().len == 0 or
-            c.gtk_widget_has_focus(self.entry) == 0)
+            !webface.focusWithin(self.entry))
         {
             self.hide();
             return;
@@ -592,7 +601,7 @@ pub const Omnibox = struct {
             .url => "web-browser-symbolic",
             .search => "system-search-symbolic",
             .history => "document-open-recent-symbolic",
-            .bookmark => "starred-symbolic",
+            .bookmark => "sketerm-starred-symbolic",
             .open_tab => "tab-new-symbolic",
             .command => "utilities-terminal-symbolic",
             .session => "go-jump-symbolic",

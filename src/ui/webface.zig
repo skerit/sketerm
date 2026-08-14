@@ -2022,6 +2022,14 @@ pub fn containersLoaded() bool {
 /// Host of an http(s) url, or null when there is nothing to key a rule
 /// on (a blank tab, a data: url, a search term the omnibox has not
 /// resolved yet).
+/// Is the keyboard focus inside `w`? For a GtkEntry the focus widget
+/// is its inner GtkText, so `gtk_widget_has_focus` on the entry itself
+/// is ALWAYS false — the check that silently kept the omnibox from
+/// ever showing. FOCUS_WITHIN is the containment answer.
+pub fn focusWithin(w: *c.GtkWidget) bool {
+    return (c.gtk_widget_get_state_flags(w) & c.GTK_STATE_FLAG_FOCUS_WITHIN) != 0;
+}
+
 pub fn hostOfUrl(url: []const u8) ?[]const u8 {
     const sep = "://";
     const i = std.mem.indexOf(u8, url, sep) orelse return null;
@@ -4448,7 +4456,7 @@ pub const WebFace = struct {
         // look would have to be driven from an async store reply, and
         // a toggle that flips itself back a moment later reads as a
         // bug. The ICON carries the state instead.
-        self.star_btn = toolbtn.barButton(bar, "non-starred-symbolic", "Bookmark", "Bookmark this page", &onStar, self);
+        self.star_btn = toolbtn.barButton(bar, "sketerm-non-starred-symbolic", "Bookmark", "Bookmark this page", &onStar, self);
         self.track(self.star_btn);
 
         self.action_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0).?;
@@ -5599,7 +5607,7 @@ pub const WebFace = struct {
         const z = self.allocator.dupeZ(u8, shown) catch return;
         defer self.allocator.free(z);
         // Never fight the user's typing: only rewrite an unfocused bar.
-        if (c.gtk_widget_has_focus(self.entry) == 0)
+        if (!focusWithin(self.entry))
             c.gtk_editable_set_text(@ptrCast(self.entry), z.ptr);
     }
 
@@ -5764,7 +5772,7 @@ pub const WebFace = struct {
         toolbtn.setIcon(
             self.star_btn,
             self.bar,
-            if (on) "starred-symbolic" else "non-starred-symbolic",
+            if (on) "sketerm-starred-symbolic" else "sketerm-non-starred-symbolic",
             if (on) "Bookmarked" else "Bookmark",
         );
         c.gtk_widget_set_tooltip_text(
@@ -6552,14 +6560,21 @@ pub const WebFace = struct {
     const MenuCtx = struct {
         allocator: std.mem.Allocator,
         face: *WebFace,
+        /// The root the rows live in, so custom (non-classicmenu)
+        /// widgets can pop the menu down before acting.
+        root: ?*classicmenu.Root = null,
         page: ?[]u8 = null,
         link: ?[]u8 = null,
+        image: ?[]u8 = null,
+        sel: ?[]u8 = null,
     };
 
     fn freeMenuCtx(user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(MenuCtx, user);
         if (ctx.page) |p| ctx.allocator.free(p);
         if (ctx.link) |l| ctx.allocator.free(l);
+        if (ctx.image) |i| ctx.allocator.free(i);
+        if (ctx.sel) |s| ctx.allocator.free(s);
         ctx.allocator.destroy(ctx);
     }
 
@@ -6576,20 +6591,52 @@ pub const WebFace = struct {
             root.destroy();
             return;
         };
-        ctx.* = .{ .allocator = self.allocator, .face = self };
+        ctx.* = .{ .allocator = self.allocator, .face = self, .root = root };
         if (self.url) |u| ctx.page = self.allocator.dupe(u8, u) catch null;
         if (ev.flags & proto.ctx_flag_link != 0 and ev.link_url.len != 0)
             ctx.link = self.allocator.dupe(u8, ev.link_url) catch null;
+        if (ev.flags & proto.ctx_flag_image != 0 and ev.src_url.len != 0)
+            ctx.image = self.allocator.dupe(u8, ev.src_url) catch null;
+        if (ev.flags & proto.ctx_flag_selection != 0 and ev.selection_text.len != 0)
+            ctx.sel = self.allocator.dupe(u8, ev.selection_text) catch null;
         root.own(freeMenuCtx, ctx);
 
         const m = root.top();
-        m.itemIconEnabled("Back", .{ .name = "go-previous-symbolic" }, self.can_back, &onMenuBack, ctx);
-        m.itemIconEnabled("Forward", .{ .name = "go-next-symbolic" }, self.can_fwd, &onMenuForward, ctx);
-        m.itemIcon("Reload", .{ .name = "view-refresh-symbolic" }, &onMenuReload, ctx);
+        const targeted = ctx.link != null or ctx.image != null or ctx.sel != null;
+        if (!targeted) {
+            // Plain page: Firefox's icon-only navigation strip up top.
+            // A targeted menu (link / image / selection) instead LEADS
+            // with what was clicked, exactly like Firefox.
+            m.custom(self.buildNavStrip(ctx));
+        }
         if (ctx.link != null) {
             const links = m.section();
-            links.item("Open Link in New Tab", &onMenuOpenLink, ctx);
-            links.item("Copy Link URL", &onMenuCopyLink, ctx);
+            links.itemIcon("Open Link in New Tab", .{ .name = "tab-new-symbolic" }, &onMenuOpenLink, ctx);
+            links.itemIcon("Copy Link URL", .{ .name = "edit-copy-symbolic" }, &onMenuCopyLink, ctx);
+        }
+        if (ctx.image != null) {
+            const imgs = m.section();
+            imgs.itemIcon("Open Image in New Tab", .{ .name = "image-x-generic-symbolic" }, &onMenuOpenImage, ctx);
+            imgs.itemIcon("Copy Image URL", .{ .name = "edit-copy-symbolic" }, &onMenuCopyImage, ctx);
+        }
+        if (ctx.sel) |sel| {
+            const seln = m.section();
+            seln.itemIcon("Copy", .{ .name = "edit-copy-symbolic" }, &onMenuCopySelection, ctx);
+            // `Search the Web for "…"`, quoting a short prefix of the
+            // selection the way Firefox does.
+            var lbuf: [96]u8 = undefined;
+            var short = sel;
+            if (short.len > 32) {
+                var end: usize = 32;
+                while (end > 0 and (short[end] & 0xC0) == 0x80) end -= 1;
+                short = short[0..end];
+            }
+            const label: [*:0]const u8 = if (std.fmt.bufPrintZ(
+                &lbuf,
+                "Search the Web for \"{s}{s}\"",
+                .{ short, if (short.len < sel.len) "\u{2026}" else "" },
+            )) |l| l.ptr else |_| "Search the Web for Selection";
+            seln.itemIcon(label, .{ .name = "edit-find-symbolic" }, &onMenuSearchSelection, ctx);
         }
         const page = m.section();
         page.check("Reader View", self.reader_active, &onMenuReader, ctx);
@@ -6613,7 +6660,7 @@ pub const WebFace = struct {
 
         const store_section = m.section();
         store_section.itemIcon("History", .{ .name = "document-open-recent-symbolic" }, &onMenuHistory, ctx);
-        store_section.itemIcon("Bookmarks", .{ .name = "starred-symbolic" }, &onMenuBookmarks, ctx);
+        store_section.itemIcon("Bookmarks", .{ .name = "sketerm-starred-symbolic" }, &onMenuBookmarks, ctx);
         store_section.itemIcon("Userscripts…", .{ .name = "application-x-addon-symbolic" }, &onMenuUserscripts, ctx);
         // A style needs a site to be scoped to; about:blank has none.
         store_section.itemIconEnabled(
@@ -6671,7 +6718,7 @@ pub const WebFace = struct {
                 cont.item(classicmenu.escapeLabel(ctn.name, &lbuf), &onMenuOpenInContainer, rc);
             }
         }
-        tabs.itemIcon("Containersâ¦", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
+        tabs.itemIcon("Containers…", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
         // "Always open this site in X" for the page in front of the
         // user. The rule is keyed on the HOST, re-derived at click time
         // from the face's current address, so the row owns no string.
@@ -6744,6 +6791,81 @@ pub const WebFace = struct {
     fn copyText(self: *WebFace, text: []const u8) void {
         if (self.widgets_dead) return;
         clipboard.copyText(self.allocator, self.root_box, text);
+    }
+
+    /// Firefox's icon-only Back / Forward / Reload strip: the plain
+    /// page menu's first row. Custom widget (classicmenu rows are
+    /// label rows), so its buttons pop the menu down themselves.
+    fn buildNavStrip(self: *WebFace, ctx: *MenuCtx) *c.GtkWidget {
+        const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0);
+        c.gtk_box_set_homogeneous(@ptrCast(row), 1);
+        c.gtk_widget_set_margin_top(row, 2);
+        c.gtk_widget_set_margin_bottom(row, 2);
+        const specs = [_]struct {
+            icon: [*:0]const u8,
+            tip: [*:0]const u8,
+            enabled: bool,
+            cb: *const fn (?*c.GtkButton, ?*anyopaque) callconv(.c) void,
+        }{
+            .{ .icon = "go-previous-symbolic", .tip = "Back", .enabled = self.can_back, .cb = &onNavStripBack },
+            .{ .icon = "go-next-symbolic", .tip = "Forward", .enabled = self.can_fwd, .cb = &onNavStripForward },
+            .{ .icon = "view-refresh-symbolic", .tip = "Reload", .enabled = true, .cb = &onNavStripReload },
+        };
+        for (specs) |s| {
+            const btn = c.gtk_button_new_from_icon_name(s.icon);
+            c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+            c.gtk_widget_add_css_class(btn, "flat");
+            c.gtk_widget_set_hexpand(btn, 1);
+            c.gtk_widget_set_tooltip_text(btn, s.tip);
+            c.gtk_widget_set_sensitive(btn, @intFromBool(s.enabled));
+            _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(s.cb), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+            c.gtk_box_append(@ptrCast(row), btn);
+        }
+        return row.?;
+    }
+
+    fn navStripFire(user: ?*anyopaque, action: proto.NavAct) void {
+        const ctx = cast.userData(MenuCtx, user);
+        // Close first, like every classicmenu row does.
+        if (ctx.root) |r| {
+            if (r.pop) |pop| c.gtk_popover_popdown(@ptrCast(pop));
+        }
+        ctx.face.navAction(action);
+    }
+
+    fn onNavStripBack(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        navStripFire(user, .back);
+    }
+
+    fn onNavStripForward(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        navStripFire(user, .forward);
+    }
+
+    fn onNavStripReload(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        navStripFire(user, .reload);
+    }
+
+    fn onMenuOpenImage(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(MenuCtx, user);
+        if (ctx.image) |u| ctx.face.openInNewTab(u);
+    }
+
+    fn onMenuCopyImage(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(MenuCtx, user);
+        if (ctx.image) |u| ctx.face.copyText(u);
+    }
+
+    fn onMenuCopySelection(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(MenuCtx, user);
+        if (ctx.sel) |s| ctx.face.copyText(s);
+    }
+
+    fn onMenuSearchSelection(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(MenuCtx, user);
+        const sel = ctx.sel orelse return;
+        var buf: [2048]u8 = undefined;
+        const url = suggest.searchUrl(&buf, searchTemplate(), sel) orelse return;
+        ctx.face.openInNewTab(url);
     }
 
     fn onMenuBack(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
@@ -6885,7 +7007,7 @@ pub const WebFace = struct {
 
         const store_section = m.section();
         store_section.itemIcon("History", .{ .name = "document-open-recent-symbolic" }, &onMenuHistory, ctx);
-        store_section.itemIcon("Bookmarks", .{ .name = "starred-symbolic" }, &onMenuBookmarks, ctx);
+        store_section.itemIcon("Bookmarks", .{ .name = "sketerm-starred-symbolic" }, &onMenuBookmarks, ctx);
         // The strip shows itself when a download starts; this row is
         // how it comes BACK after being dismissed, so it is dead
         // weight while this face has downloaded nothing.
@@ -6933,7 +7055,7 @@ pub const WebFace = struct {
                 cont.item(classicmenu.escapeLabel(ctn.name, &lbuf), &onMenuOpenInContainer, rc);
             }
         }
-        tabs.itemIcon("Containersâ¦", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
+        tabs.itemIcon("Containers…", .{ .name = "system-users-symbolic" }, &onMenuContainers, ctx);
         // "Always open this site in X" for the page in front of the
         // user. The rule is keyed on the HOST, re-derived at click time
         // from the face's current address, so the row owns no string.
