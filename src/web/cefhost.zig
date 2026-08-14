@@ -9892,12 +9892,47 @@ fn onRunContextMenu(
     if (p.is_editable) |ie| {
         if (ie(p) != 0) flags |= proto.ctx_flag_editable;
     }
+    var src = Utf8{ .s = std.mem.zeroes(cef.cef_string_utf8_t) };
+    defer src.free();
+    if (p.has_image_contents) |hi| {
+        if (hi(p) != 0) {
+            if (p.get_source_url) |gs| {
+                const raw = gs(p);
+                if (raw != null) {
+                    src = Utf8.init(raw);
+                    cef.cef_string_userfree_utf16_free(raw);
+                    if (src.slice().len != 0) flags |= proto.ctx_flag_image;
+                }
+            }
+        }
+    }
+    var sel = Utf8{ .s = std.mem.zeroes(cef.cef_string_utf8_t) };
+    defer sel.free();
+    if (p.get_selection_text) |gt| {
+        const raw = gt(p);
+        if (raw != null) {
+            sel = Utf8.init(raw);
+            cef.cef_string_userfree_utf16_free(raw);
+            if (sel.slice().len != 0) flags |= proto.ctx_flag_selection;
+        }
+    }
+    // A selection is a menu-row payload, not a document transfer: cap
+    // it (on a UTF-8 boundary) so a select-all on a huge page cannot
+    // bloat the event frame.
+    var sel_text = sel.slice();
+    if (sel_text.len > 256) {
+        var end: usize = 256;
+        while (end > 0 and (sel_text[end] & 0xC0) == 0x80) end -= 1;
+        sel_text = sel_text[0..end];
+    }
     host.post(proto.EvContextMenu{
         .view = v.id,
         .x = pt.x,
         .y = pt.y,
         .flags = flags,
         .link_url = link.slice(),
+        .src_url = src.slice(),
+        .selection_text = sel_text,
     });
     return 1;
 }

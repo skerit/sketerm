@@ -991,10 +991,22 @@ pub const EvFindResult = struct {
 pub const ctx_flag_link: u8 = 1;
 /// `ev_context_menu` flags bit: the hit test is an editable field.
 pub const ctx_flag_editable: u8 = 2;
+/// `ev_context_menu` flags bit: the hit test found an image, and
+/// `src_url` carries its source.
+pub const ctx_flag_image: u8 = 4;
+/// `ev_context_menu` flags bit: text is selected, and
+/// `selection_text` carries it.
+pub const ctx_flag_selection: u8 = 8;
 
 /// The page asked for a context menu (the engine's own menu is
 /// suppressed). x/y are LOGICAL view coordinates, same space as
 /// `input_pointer`.
+///
+/// `src_url` and `selection_text` are OPTIONAL TRAILING fields under
+/// the same rule `EvPopupRequest.user_gesture` established: a payload
+/// that ends early reads as "absent" (empty), existing fields are
+/// never widened or reordered, and anything appended later must keep
+/// the rule.
 pub const EvContextMenu = struct {
     pub const tag: Tag = .ev_context_menu;
     view: u32,
@@ -1002,6 +1014,34 @@ pub const EvContextMenu = struct {
     y: i32,
     flags: u8,
     link_url: []const u8,
+    /// Image/media source under the click (`ctx_flag_image`).
+    src_url: []const u8 = "",
+    /// Selected text at menu time (`ctx_flag_selection`), truncated
+    /// by the helper to a sane length for a menu row.
+    selection_text: []const u8 = "",
+
+    pub fn encodeTo(self: EvContextMenu, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putI32(gpa, out, self.x);
+        try putI32(gpa, out, self.y);
+        try putU8(gpa, out, self.flags);
+        try putStr(gpa, out, self.link_url);
+        try putStr(gpa, out, self.src_url);
+        try putStr(gpa, out, self.selection_text);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !EvContextMenu {
+        var cur = Cur{ .buf = payload };
+        return .{
+            .view = try cur.readU32(),
+            .x = try cur.readI32(),
+            .y = try cur.readI32(),
+            .flags = try cur.readU8(),
+            .link_url = try cur.readStr(),
+            .src_url = cur.readStr() catch "",
+            .selection_text = cur.readStr() catch "",
+        };
+    }
 };
 
 // -- TLS interstitials (capability "tls") -----------------------------
@@ -2880,6 +2920,33 @@ test "round-trip: scalar and string frames" {
         .flags = ctx_flag_link,
         .link_url = "https://example.com/a",
     });
+    try roundTrip(EvContextMenu, .{
+        .view = 7,
+        .x = 40,
+        .y = 220,
+        .flags = ctx_flag_link | ctx_flag_image | ctx_flag_selection,
+        .link_url = "https://example.com/a",
+        .src_url = "https://example.com/a.png",
+        .selection_text = "picked words",
+    });
+}
+
+test "EvContextMenu: optional trailing fields absent reads as empty" {
+    // A pre-extension helper's payload ends after link_url; the
+    // decoder must answer "" for both trailing strings, never
+    // error.Truncated (the optional-trailing-field rule).
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try putU32(gpa, &out, 7);
+    try putI32(gpa, &out, 40);
+    try putI32(gpa, &out, 220);
+    try putU8(gpa, &out, ctx_flag_link);
+    try putStr(gpa, &out, "https://example.com/a");
+    const ev = try EvContextMenu.decodeFrom(out.items);
+    try std.testing.expectEqualStrings("https://example.com/a", ev.link_url);
+    try std.testing.expectEqualStrings("", ev.src_url);
+    try std.testing.expectEqualStrings("", ev.selection_text);
 }
 
 test "round-trip: tls and permission frames" {
