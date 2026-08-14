@@ -1128,6 +1128,11 @@ pub fn refreshTitlebarCss(self: *Window) void {
     var buf: [8192]u8 = undefined;
     const css = std.fmt.bufPrintZ(&buf,
         \\.sketerm-titlebar {{ padding: 1px 2px; min-height: 18px; }}
+        \\/* The CSD's application icon (GtkWindowControls draws it when
+        \\   the WM button layout asks for one). GTK gives it no margin
+        \\   at all, so on layouts that put it at the far edge it sits
+        \\   glued to the window border. */
+        \\windowcontrols > image {{ margin-left: 6px; margin-right: 6px; }}
         \\.sketerm-titlebar-active {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
         \\.sketerm-titlebar-inactive {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
         \\.sketerm-titlebar-label {{ font-weight: bold; }}

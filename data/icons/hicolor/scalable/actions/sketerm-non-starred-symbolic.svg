@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Hollow bookmark star ("not bookmarked"). Bundled because
+       Adwaita's non-starred-symbolic lives under symbolic/status/,
+       which non-Adwaita theme chains never reach, and GTK then draws
+       a blank blob in its place. Even-odd fill keeps it a pure filled
+       path, so GTK's symbolic recolouring applies cleanly. -->
+  <path fill="#2e3436" fill-rule="evenodd" d="M 8 1.5 L 9.68 6.29 L 14.75 6.41 L 10.71 9.48 L 12.17 14.34 L 8 11.45 L 3.83 14.34 L 5.29 9.48 L 1.25 6.41 L 6.32 6.29 Z M 8 4.34 L 9.01 7.21 L 12.05 7.28 L 9.63 9.13 L 10.5 12.04 L 8 10.31 L 5.5 12.04 L 6.37 9.13 L 3.95 7.28 L 6.99 7.21 Z"/>
+</svg>

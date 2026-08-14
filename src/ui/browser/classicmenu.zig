@@ -489,7 +489,11 @@ pub const Menu = struct {
 /// menus nothing interprets underscores -- this is now only a
 /// buffer-to-sentinel copy, kept so call sites read the same.)
 pub fn escapeLabel(text: []const u8, buf: []u8) [*:0]const u8 {
-    const n = @min(text.len, buf.len - 1);
+    var n = @min(text.len, buf.len - 1);
+    // Never cut mid-UTF-8-sequence: GTK refuses invalid labels
+    // outright, so a long name truncated on a raw byte boundary would
+    // render as garbage rather than merely short.
+    while (n > 0 and n < text.len and (text[n] & 0xC0) == 0x80) n -= 1;
     @memcpy(buf[0..n], text[0..n]);
     buf[n] = 0;
     return @ptrCast(buf[0..n :0]);
