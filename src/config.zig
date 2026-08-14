@@ -1290,8 +1290,10 @@ pub const Config = struct {
     /// a single tab can set this to false (or rebind toggle_tab_bar)
     /// to reclaim ~32 px of vertical space.
     show_tab_bar: bool = true,
-    /// Show the vertical tree-style tab sidebar at startup. Off by
-    /// default; toggleable at runtime via toggle_tab_sidebar.
+    /// Whether a NEW window opens with the vertical tree-style tab
+    /// sidebar. `toggle_tab_sidebar` is per-window state and does not
+    /// write it back, so a reload cannot push one window's choice into
+    /// the others.
     show_tab_sidebar: bool = false,
     /// Daemon socket holding the browsing history and bookmarks. Empty
     /// resolves at connect time: $SKETERM_MUX_SOCKET, else the per-user

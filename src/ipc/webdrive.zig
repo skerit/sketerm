@@ -32,6 +32,7 @@ const reader_model = @import("../web/reader.zig");
 const reader_guards = @import("../web/reader_guards.zig");
 const findbin = @import("../web/findbin.zig");
 const png = @import("../util/png.zig");
+const quarantine = @import("../web/quarantine.zig");
 const clock = @import("../util/clock.zig");
 
 /// Default logical size a headless view is created at. There is no
@@ -131,7 +132,7 @@ pub const View = struct {
     waiting_request: [N_KINDS]u32 = @splat(0),
     /// Legacy replies have no request id. After a client timeout, one
     /// late reply must be consumed before that kind can be reused.
-    legacy_quarantine: [N_KINDS]bool = @splat(false),
+    legacy_quarantine: quarantine.LegacyQuarantine(N_KINDS) = .{},
     /// A mode:full snapshot is not satisfied by a delta (a stray push
     /// from a pre-coalescing helper).
     want_full: bool = false,
@@ -643,7 +644,7 @@ pub const Engine = struct {
 
         const ki = @intFromEnum(req.kind);
         const v = self.findView(view_id) orelse return error.NoView;
-        if (!self.cap_semantic_request_ids and v.legacy_quarantine[ki])
+        if (!self.cap_semantic_request_ids and v.legacy_quarantine.isHeld(ki))
             return error.LegacySemanticReplyPending;
         // Drop a stale parked reply from an earlier timed-out call of
         // the same kind: it answers an older question.
@@ -661,7 +662,7 @@ pub const Engine = struct {
 
         const sent: anyerror!void = switch (req.kind) {
             .snapshot => self.sendSemantic(request, proto.SemSnapshotReq{ .view = view_id, .mode = req.mode, .detail = req.detail, .scope = req.scope }),
-            .act => if (readerGuard(v, req.id)) |guard|
+            .act => if (if (self.cap_reader_ids) readerGuard(v, req.id) else null) |guard|
                 self.sendSemantic(request, proto.SemActGuarded{
                     .view = view_id,
                     .doc_gen = guard.doc_gen,
@@ -723,7 +724,7 @@ pub const Engine = struct {
         if (!v.waiting[ki] or v.waiting_request[ki] != request) return;
         v.waiting[ki] = false;
         v.waiting_request[ki] = 0;
-        if (timed_out and request == 0) v.legacy_quarantine[ki] = true;
+        if (timed_out and request == 0) v.legacy_quarantine.mark(ki);
     }
 
     // ---- frames / screenshot ----------------------------------------
@@ -748,7 +749,10 @@ pub const Engine = struct {
         }
         const v = self.findView(view_id) orelse return error.NoView;
         if (v.buf_fd < 0) return error.NoFrame;
-        const size: usize = @as(usize, v.buf_stride) * v.buf_h;
+        // A stride below `w * 4` would make the row walk in `shmToRgba`
+        // read past the mapping; `proto.frameSize` is the one place that
+        // rule lives (see its docblock).
+        const size: usize = proto.frameSize(v.buf_w, v.buf_h, v.buf_stride) orelse return error.NoFrame;
         const mapped = c.mmap(null, size, c.PROT_READ, c.MAP_SHARED, v.buf_fd, 0);
         if (mapped == c.MAP_FAILED) return error.NoFrame;
         const pixels: [*]const u8 = @ptrCast(mapped.?);
@@ -797,12 +801,8 @@ pub const Engine = struct {
         if (request == 0) return self.send(value);
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.gpa);
-        try proto.encodePayload(self.gpa, &payload, value);
-        return self.send(proto.SemRequest{
-            .request = request,
-            .kind = @intFromEnum(@TypeOf(value).tag),
-            .payload = .{ .s = payload.items },
-        });
+        const wrapped = try proto.semRequestWrap(self.gpa, &payload, request, value);
+        return self.send(wrapped);
     }
 
     /// Wait up to `slice_ms` for helper bytes and dispatch what
@@ -906,10 +906,7 @@ pub const Engine = struct {
 
     fn acceptsSemanticReply(v: *View, kind: OpKind, request: u32) bool {
         const ki = @intFromEnum(kind);
-        if (request == 0 and v.legacy_quarantine[ki]) {
-            v.legacy_quarantine[ki] = false;
-            return false;
-        }
+        if (!v.legacy_quarantine.consume(ki, request)) return false;
         return v.waiting[ki] and v.waiting_request[ki] == request and v.inbox[ki] == null;
     }
 
@@ -1027,7 +1024,7 @@ pub const Engine = struct {
             },
             .sem_result => {
                 const result = proto.decode(proto.SemResult, frame.payload) catch return;
-                self.dispatchSemantic(.{ .tag = @enumFromInt(result.kind), .payload = result.payload.s }, result.request);
+                self.dispatchSemantic(proto.semResultUnwrap(result), result.request);
             },
             .sem_snapshot, .sem_act_result, .sem_expand_result, .sem_query_result, .sem_read_result, .sem_read_ids_result, .sem_eval_result => self.dispatchSemantic(frame, 0),
             .intercept_status => {
@@ -1082,17 +1079,7 @@ pub const Engine = struct {
                 const v = self.findView(ev.view) orelse return;
                 if (!acceptsSemanticReply(v, .read, request)) return;
                 _ = v.reader_guards.apply(self.gpa, request, ev) catch return;
-                const entities = self.gpa.alloc(reader_model.Entity, ev.entities.len) catch return;
-                defer self.gpa.free(entities);
-                for (ev.entities, 0..) |entity, i| {
-                    entities[i] = .{ .id = entity.id, .kind = entity.kind, .text = entity.text, .url = entity.url };
-                }
-                const json = reader_model.stringify(self.gpa, .{
-                    .doc_gen = ev.doc_gen,
-                    .rev = ev.rev,
-                    .markdown = ev.markdown.s,
-                    .entities = entities,
-                }) catch return;
+                const json = reader_model.stringifyWire(self.gpa, ev) catch return;
                 defer self.gpa.free(json);
                 self.park(v, .read, request, true, json, ev.doc_gen, ev.rev, 0);
             },
@@ -1207,9 +1194,9 @@ test "correlated replies ignore old request ids and preserve reader provenance" 
 test "legacy timeout quarantine consumes exactly one late reply" {
     var v = View{ .id = 1, .w = 100, .h = 100 };
     const ki = @intFromEnum(OpKind.read);
-    v.legacy_quarantine[ki] = true;
+    v.legacy_quarantine.mark(ki);
     try std.testing.expect(!Engine.acceptsSemanticReply(&v, .read, 0));
-    try std.testing.expect(!v.legacy_quarantine[ki]);
+    try std.testing.expect(!v.legacy_quarantine.isHeld(ki));
     v.waiting[ki] = true;
     try std.testing.expect(Engine.acceptsSemanticReply(&v, .read, 0));
 }

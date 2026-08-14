@@ -586,6 +586,24 @@ pub const FrameBuffer = struct {
     stride: u32,
 };
 
+/// Byte length of a frame with this geometry, or null when the helper
+/// described one no consumer may map: a stride narrower than the row
+/// makes any full-height walk read past the end of the mapping.
+pub fn frameSize(w: u16, h: u16, stride: u32) ?usize {
+    if (w == 0 or h == 0) return null;
+    if (stride < @as(u32, w) * 4) return null;
+    const size = @as(usize, stride) * @as(usize, h);
+    if (size == 0) return null;
+    return size;
+}
+
+test "frame geometry refuses a stride narrower than the row" {
+    try std.testing.expectEqual(@as(?usize, 4096), frameSize(64, 16, 256));
+    try std.testing.expect(frameSize(64, 16, 255) == null);
+    try std.testing.expect(frameSize(0, 16, 256) == null);
+    try std.testing.expect(frameSize(64, 0, 256) == null);
+}
+
 pub const FrameDamage = struct {
     pub const tag: Tag = .frame_damage;
     view: u32,
@@ -1612,6 +1630,23 @@ pub const SemResult = struct {
     kind: u8,
     payload: Text,
 };
+
+/// Encode `value` into `payload` and wrap it as a correlated
+/// `sem_request`; the returned frame borrows `payload`'s bytes.
+pub fn semRequestWrap(gpa: std.mem.Allocator, payload: *std.ArrayList(u8), request: u32, value: anytype) !SemRequest {
+    try encodePayload(gpa, payload, value);
+    return .{
+        .request = request,
+        .kind = @intFromEnum(@TypeOf(value).tag),
+        .payload = .{ .s = payload.items },
+    };
+}
+
+/// The wrapped result's inner payload as an ordinary frame (bytes
+/// still borrow from the wrapper).
+pub fn semResultUnwrap(result: SemResult) Frame {
+    return .{ .tag = @enumFromInt(result.kind), .payload = result.payload.s };
+}
 
 // -- script evaluation (0xA0 block, capability "semantic") ------------
 
@@ -3611,6 +3646,19 @@ test "reader ids extend the semantic family and leave 0xD0 reserved" {
     for (0xD2..0xD8) |raw| {
         try std.testing.expect(!(@as(Tag, @enumFromInt(raw))).known());
     }
+}
+
+test "a correlated semantic request wraps and unwraps losslessly" {
+    const gpa = std.testing.allocator;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    const wrapped = try semRequestWrap(gpa, &payload, 42, SemRead{ .view = 7 });
+    try std.testing.expectEqual(@as(u32, 42), wrapped.request);
+    try std.testing.expectEqual(@intFromEnum(Tag.sem_read), wrapped.kind);
+    const frame = semResultUnwrap(.{ .request = 42, .kind = wrapped.kind, .payload = wrapped.payload });
+    try std.testing.expectEqual(Tag.sem_read, frame.tag);
+    const inner = try decode(SemRead, frame.payload);
+    try std.testing.expectEqual(@as(u32, 7), inner.view);
 }
 
 test "a dma-buf frame round-trips its planes" {

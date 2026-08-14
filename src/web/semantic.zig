@@ -241,10 +241,13 @@ pub const View = struct {
     }
 
     /// Engine-local id backing `sid`, for routing an action to the
-    /// script; 0 when the id is not in the live tree.
+    /// script; 0 when the id is not in the live tree. A truncation
+    /// marker (role `more`) answers 0 too: no element exists behind
+    /// it, so acting on one must refuse as "unknown id" rather than
+    /// as a missing box.
     pub fn eidFor(self: *const View, sid: u32) u32 {
         for (self.nodes.items) |n| {
-            if (n.sid == sid) return n.eid;
+            if (n.sid == sid) return if (std.mem.eql(u8, n.role, "more")) 0 else n.eid;
         }
         return 0;
     }
@@ -1309,6 +1312,28 @@ test "ids are stable across a delta and a removal never reuses one" {
     gpa.free(up4.text);
     try std.testing.expect(v.sidFor(9) != para);
     try std.testing.expectEqual(@as(u32, 0), v.eidFor(para));
+}
+
+test "a truncation marker has no engine id to act on" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+
+    const nodes = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "list", .name = "" },
+        .{ .id = 3, .parent = 2, .role = "listitem", .name = "one" },
+        .{ .id = 4, .parent = 2, .role = "more", .name = "\u{2026} and 50 more" },
+    };
+    const up = try applyConsume(&v, tree(7, "http://x/", &nodes), .auto);
+    gpa.free(up.text);
+    const item = v.sidFor(3);
+    const marker = v.sidFor(4);
+    try std.testing.expect(item != 0 and marker != 0);
+    // The real item routes; the marker refuses as unknown, because no
+    // element exists behind it (semantic.js keeps it out of byId too).
+    try std.testing.expectEqual(@as(u32, 3), v.eidFor(item));
+    try std.testing.expectEqual(@as(u32, 0), v.eidFor(marker));
 }
 
 test "a navigation carries ids for an identical subtree" {

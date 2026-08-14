@@ -31,9 +31,12 @@ pub const Store = struct {
             entry.* = .{ .id = entry.id, .doc_gen = 0, .rev = 0, .guard = 0 };
     }
 
-    /// Start a new helper epoch whose client request sequence may restart.
+    /// Forget everything for a new helper epoch: a restarted helper
+    /// restarts sid allocation at 1, so a remembered dead-epoch id
+    /// would collide with a fresh snapshot id and route ordinary
+    /// actions through the guarded path with zero guards forever.
     pub fn resetEpoch(self: *Store) void {
-        self.invalidate();
+        self.entries.clearRetainingCapacity();
         self.latest_request = 0;
     }
 
@@ -154,6 +157,31 @@ test "invalidation retains provenance and helper reset accepts a fresh sequence"
         .entities = &entities,
     }));
     try std.testing.expectEqual(@as(u64, 70), store.get(7).?.guard);
+}
+
+test "helper reset forgets dead-epoch ids so fresh sid reuse stays unguarded" {
+    const allocator = std.testing.allocator;
+    var store: Store = .{};
+    defer store.deinit(allocator);
+
+    const entities = [_]proto.ReaderEntity{
+        .{ .id = 1, .guard = 10, .kind = "link", .text = "one", .url = "#1" },
+        .{ .id = 2, .guard = 20, .kind = "link", .text = "two", .url = "#2" },
+    };
+    try std.testing.expect(try store.apply(allocator, 5, .{
+        .view = 1,
+        .doc_gen = 4,
+        .rev = 6,
+        .markdown = .{ .s = "old helper" },
+        .entities = &entities,
+    }));
+
+    // The helper restarts: sid 1 will be minted again for an unrelated
+    // element, so nothing remembered may survive as a (dead) guard.
+    store.resetEpoch();
+    try std.testing.expectEqual(@as(usize, 0), store.entries.items.len);
+    try std.testing.expect(store.get(1) == null);
+    try std.testing.expect(store.get(2) == null);
 }
 
 test "request ordering crosses the u32 wrap" {
