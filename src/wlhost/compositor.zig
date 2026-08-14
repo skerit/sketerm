@@ -1408,6 +1408,23 @@ pub const Compositor = struct {
                 var b = wire.Builder.init(&buf, self.drag.source, 3); // dnd_drop_performed
                 try self.send(try b.finish());
             }
+            // …and then LEAVE. The drag-and-drop session ends at the
+            // drop even though the OFFER stays valid until the client
+            // finishes reading it, and a toolkit binds its drop object
+            // to that session: without the leave, GTK still holds the
+            // finished drop when the next drag's enter arrives, warns
+            // ("self->drop == crossing->drop"), and silently delivers no
+            // motion to any drop target — the second drag of a session
+            // could never be dropped anywhere. Weston and mutter both
+            // send it; this replica did not.
+            for (self.data_devices.items) |dev| {
+                var buf: [8]u8 = undefined;
+                var b = wire.Builder.init(&buf, dev, 2); // leave
+                try self.send(try b.finish());
+            }
+            self.drag.focus = 0;
+            self.drag.accepted = false;
+            self.drag.action = 0;
             self.drag.active = false;
             self.drag.dropped = true; // receive/finish still route
         } else {
@@ -5721,6 +5738,10 @@ test "within-app dnd: start_drag through drop, transfer, finish" {
     const drop_expect = [_][2]u32{
         .{ 8, 4 }, // drop
         .{ 7, 3 }, // dnd_drop_performed
+        // The session is over even though the offer below still works:
+        // a toolkit that never gets this leave keeps the finished drop
+        // and ignores the NEXT drag entirely.
+        .{ 8, 2 }, // dd leave
     };
     try t.expectEqualSlices([2]u32, &drop_expect, evs.items);
 

@@ -786,6 +786,9 @@ pub fn main() u8 {
         if (treeSidebarStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("tree sidebar: open, new_tab made a browser PAGE; closed, new_tab made a window tab");
 
+        if (sidebarDragStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("tree sidebar drag: a row nested under another, unnested onto the empty list, and reordered above it");
+
         if (have_web_action) {
             if (webActionGuiStage(allocator, app, sock_path)) |why| return failMsg(why);
             say("browser action: WebGroup switching refreshed per-tab icons; a trusted click opened, drove, closed and tore down a real extension popup");
@@ -1655,47 +1658,23 @@ fn writePng(path: [*:0]const u8, bytes: []const u8) void {
     _ = c.fclose(f);
 }
 
-/// Right edge, in window pixels, of the widest accent-coloured run in
-/// the window's left third — i.e. the SELECTED tree-sidebar row's chip,
-/// which spans the sidebar's width. 0 when nothing accent-like is
-/// there, which is itself a failure worth reporting.
+/// Rectangle of the ACTIVE tree-sidebar row's chip, in the window's
+/// left third. Null when the sidebar is not showing one, which is how
+/// the rig reads sidebar visibility.
 ///
 /// Pixels arrive as Wayland ARGB/XRGB8888, little-endian, so the bytes
 /// are B,G,R,A. libadwaita's selection blue is far more blue than red;
 /// the terminal's own colours in this rig are not.
-fn sidebarChipRight(app: *appdrive.App, win_id: u32) usize {
-    for (app.windows.items) |w| {
-        if (w.id != win_id) continue;
-        if (w.w <= 0 or w.h <= 0) return 0;
-        const width: usize = @intCast(w.w);
-        const height: usize = @intCast(w.h);
-        const px = w.pixels.items;
-        if (px.len < width * height * 4) return 0;
-        const limit = width / 3;
-        var best: usize = 0;
-        var y: usize = 0;
-        while (y < height) : (y += 1) {
-            const row = y * width * 4;
-            var x: usize = 0;
-            while (x < limit) : (x += 1) {
-                const i = row + x * 4;
-                const b: i32 = px[i];
-                const g: i32 = px[i + 1];
-                const r: i32 = px[i + 2];
-                if (b > 150 and b - r > 70 and g < b) {
-                    if (x > best) best = x;
-                }
-            }
-        }
-        return best;
-    }
-    return 0;
-}
+///
+/// A BLOCK, not a bounding box: the focused pane's border is drawn in
+/// the same accent colour, so "some accent pixels exist on the left" is
+/// true with the sidebar closed too. A chip is instead a solid run at
+/// least CHIP_MIN_W wide repeated over at least CHIP_MIN_H rows, which
+/// a one-pixel border can never be.
+const CHIP_MIN_W: usize = 60;
+const CHIP_MIN_H: usize = 8;
 
-/// A point on the selected tree-sidebar row's blue chip. Clicking it
-/// gives a real GtkListBoxRow keyboard focus without a test-only IPC
-/// focus hook.
-fn sidebarChipPoint(app: *appdrive.App, win_id: u32) ?struct { x: f64, y: f64 } {
+fn sidebarChipBounds(app: *appdrive.App, win_id: u32) ?struct { min_x: usize, max_x: usize, min_y: usize, max_y: usize } {
     for (app.windows.items) |w| {
         if (w.id != win_id or w.w <= 0 or w.h <= 0) continue;
         const width: usize = @intCast(w.w);
@@ -1705,31 +1684,96 @@ fn sidebarChipPoint(app: *appdrive.App, win_id: u32) ?struct { x: f64, y: f64 } 
         const limit = width / 3;
         var min_x = limit;
         var max_x: usize = 0;
-        var min_y = height;
-        var max_y: usize = 0;
+        var min_y: usize = 0;
+        var run_rows: usize = 0;
         var y: usize = 0;
         while (y < height) : (y += 1) {
             const row = y * width * 4;
+            // Longest accent run on this scanline.
+            var best_start: usize = 0;
+            var best_len: usize = 0;
+            var start: usize = 0;
+            var len: usize = 0;
             var x: usize = 0;
             while (x < limit) : (x += 1) {
                 const i = row + x * 4;
                 const b: i32 = px[i];
                 const g: i32 = px[i + 1];
                 const r: i32 = px[i + 2];
-                if (b <= 150 or b - r <= 70 or g >= b) continue;
-                min_x = @min(min_x, x);
-                max_x = @max(max_x, x);
-                min_y = @min(min_y, y);
-                max_y = @max(max_y, y);
+                if (b > 150 and b - r > 70 and g < b) {
+                    if (len == 0) start = x;
+                    len += 1;
+                    if (len > best_len) {
+                        best_len = len;
+                        best_start = start;
+                    }
+                } else {
+                    len = 0;
+                }
             }
+            if (best_len >= CHIP_MIN_W) {
+                if (run_rows == 0) {
+                    min_y = y;
+                    min_x = best_start;
+                    max_x = best_start + best_len - 1;
+                } else {
+                    min_x = @min(min_x, best_start);
+                    max_x = @max(max_x, best_start + best_len - 1);
+                }
+                run_rows += 1;
+                continue;
+            }
+            if (run_rows >= CHIP_MIN_H) return .{ .min_x = min_x, .max_x = max_x, .min_y = min_y, .max_y = y - 1 };
+            run_rows = 0;
         }
-        if (max_x <= min_x or max_y <= min_y) return null;
-        return .{
-            .x = @floatFromInt((min_x + max_x) / 2),
-            .y = @floatFromInt((min_y + max_y) / 2),
-        };
+        if (run_rows >= CHIP_MIN_H) return .{ .min_x = min_x, .max_x = max_x, .min_y = min_y, .max_y = height - 1 };
+        return null;
     }
     return null;
+}
+
+/// Right edge, in window pixels, of the selected row's chip, which
+/// spans the sidebar's width. 0 when there is no chip.
+fn sidebarChipRight(app: *appdrive.App, win_id: u32) usize {
+    const bounds = sidebarChipBounds(app, win_id) orelse return 0;
+    return bounds.max_x;
+}
+
+/// Wait until `win_id`'s tree sidebar is shown (its active row paints a
+/// chip) or hidden (nothing does). Sidebar visibility is PER WINDOW and
+/// no longer touches config.conf, so this pixel probe — not a file — is
+/// the proof that a toggle reached the window it was aimed at.
+fn waitSidebarVisible(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u32) bool {
+    var waited: u32 = 0;
+    while (true) {
+        if ((sidebarChipRight(app, win_id) != 0) == want) return true;
+        if (waited >= timeout_ms) return false;
+        _ = app.pumpOnce(100);
+        waited += 100;
+    }
+}
+
+/// True when config.conf currently carries a `show_tab_sidebar` line.
+/// A runtime toggle must NEVER write one: that key is the default a new
+/// window opens with, and persisting a toggle into it is what flipped
+/// the sidebar in every other window on the next reload.
+fn configHasSidebarKey(allocator: std.mem.Allocator, rt: []const u8) bool {
+    var pbuf: [512:0]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch return false;
+    const body = readFileAlloc(allocator, p) orelse return false;
+    defer allocator.free(body);
+    return std.mem.indexOf(u8, body, "show_tab_sidebar") != null;
+}
+
+/// A point on the selected tree-sidebar row's blue chip. Clicking it
+/// gives a real GtkListBoxRow keyboard focus without a test-only IPC
+/// focus hook.
+fn sidebarChipPoint(app: *appdrive.App, win_id: u32) ?struct { x: f64, y: f64 } {
+    const bounds = sidebarChipBounds(app, win_id) orelse return null;
+    return .{
+        .x = @floatFromInt((bounds.min_x + bounds.max_x) / 2),
+        .y = @floatFromInt((bounds.min_y + bounds.max_y) / 2),
+    };
 }
 
 /// Count `"pane":N` occurrences in a `web-list` reply: how many browser
@@ -2023,49 +2067,26 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(300, 5_000);
 
-    // The terminal shortcut toggles visibility AND persists the same
-    // setting Preferences edits. An unrelated apply can no longer undo
-    // it because Window.config changes immediately.
+    // The terminal shortcut toggles THIS window's sidebar and leaves
+    // config.conf alone: visibility is per-window state, not a
+    // preference a reload may push into every other window.
     app.pressKey(null, tree_toggle_key) catch return "injecting the sidebar toggle shortcut failed";
     _ = app.waitIdle(400, 5_000);
-    if (sidebarChipRight(app, win_id) == 0) return "the real sidebar toggle shortcut did not show the sidebar";
-    var saw_visible_config = false;
-    var vtries: u32 = 0;
-    while (vtries < 60) : (vtries += 1) {
-        _ = app.pumpOnce(100);
-        var pbuf: [512:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break;
-        if (readFileAlloc(allocator, p)) |body| {
-            defer allocator.free(body);
-            if (std.mem.indexOf(u8, body, "show_tab_sidebar = true") != null) {
-                saw_visible_config = true;
-                break;
-            }
-        }
-    }
-    if (!saw_visible_config) return "the sidebar toggle was not persisted to config.conf";
+    if (!waitSidebarVisible(app, win_id, true, 6_000))
+        return "the real sidebar toggle shortcut did not show the sidebar";
+    if (configHasSidebarKey(allocator, rt))
+        return "showing the sidebar at runtime wrote show_tab_sidebar into config.conf";
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
         return "terminal focus failed before the sidebar hide shortcut";
     _ = app.waitIdle(200, 4_000);
     app.pressKey(null, tree_toggle_key) catch return "injecting the sidebar hide shortcut failed";
     _ = app.waitIdle(400, 5_000);
-    // A stale replica frame can still carry the old blue row. The
-    // persisted value proves both dispatch and Window.config state.
-    var saw_hidden_config = false;
-    var htries: u32 = 0;
-    while (htries < 60) : (htries += 1) {
-        _ = app.pumpOnce(100);
-        var pbuf: [512:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch break;
-        if (readFileAlloc(allocator, p)) |body| {
-            defer allocator.free(body);
-            if (std.mem.indexOf(u8, body, "show_tab_sidebar") == null) {
-                saw_hidden_config = true;
-                break;
-            }
-        }
-    }
-    if (!saw_hidden_config) return "the real sidebar hide shortcut was not persisted";
+    // A stale replica frame can still carry the old blue row, so the
+    // chip has to go AWAY rather than merely be absent from one sample.
+    if (!waitSidebarVisible(app, win_id, false, 6_000))
+        return "the real sidebar hide shortcut did not hide the sidebar";
+    if (configHasSidebarKey(allocator, rt))
+        return "hiding the sidebar at runtime wrote show_tab_sidebar into config.conf";
 
     // A browser tab, then find the pane its web face landed on.
     const open = roundtrip(allocator, sock_path, "{\"cmd\":\"action\",\"data\":\"new_web_tab\"}\n") orelse
@@ -2335,11 +2356,16 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         return "terminal focus failed before the final sidebar hide";
     _ = app.waitIdle(200, 4_000);
     app.pressKey(null, tree_toggle_key) catch return "injecting toggle_tab_sidebar (off) failed";
-    _ = app.waitIdle(600, 5_000);
+    if (!waitSidebarVisible(app, win_id, false, 6_000))
+        return "the final toggle_tab_sidebar did not hide the sidebar";
+    // The hide itself writes nothing now, but the WIDTH drag above went
+    // through a 400ms debounce: let any last scheduled save land before
+    // the unlink, or it recreates config.conf behind the next stage.
+    // (`onSidebarPosition` ignores a hidden sidebar, so the hide cannot
+    // schedule a fresh one.)
+    _ = app.waitIdle(700, 6_000);
     // Put the config directory back the way the later config stages
-    // expect it (step 1 of configReloadStage is the CREATE path). This
-    // must happen AFTER the persisted hide, or its debounce recreates
-    // the file behind the next stage.
+    // expect it (step 1 of configReloadStage is the CREATE path).
     if (!had_config) {
         var pbuf: [512:0]u8 = undefined;
         if (std.fmt.bufPrintZ(&pbuf, "{s}/sketerm/config.conf", .{rt}) catch null) |p|
@@ -2349,6 +2375,141 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
     // Same contract as the palette stage: hand the window back focused
     // on pane 1, which is what the stages after this one assume.
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    return null;
+}
+
+/// Sidebar rows drag like real tabs: onto a row to NEST under it,
+/// between rows to REORDER, and out onto the empty list to unnest.
+///
+/// Everything is read off the one pixel probe the rig already has —
+/// the active row's chip. Its left edge IS the row's indent (a nested
+/// row starts one INDENT_PX in) and its top edge IS the row's slot, and
+/// a dropped tab becomes the active one, so the chip lands on exactly
+/// the row whose new place is under test.
+fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed before the sidebar drag stage";
+        defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
+    }
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = app.windows.items[0].id;
+
+    // Two more tabs: enough for a three-row tree with a stable first row.
+    var extra: [2]u32 = .{ 0, 0 };
+    for (&extra) |*slot| {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"new-tab\"}\n") orelse
+            return "creating a tab for the sidebar drag stage failed";
+        defer allocator.free(r);
+        slot.* = parseNumAfter(r, "\"pane\":") orelse return "a new tab for the drag stage reported no pane";
+    }
+    _ = app.waitIdle(300, 5_000);
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
+        return "terminal focus failed before opening the sidebar for the drag stage";
+    _ = app.waitIdle(200, 4_000);
+    app.pressKey(null, tree_toggle_key) catch return "injecting toggle_tab_sidebar for the drag stage failed";
+    if (!waitSidebarVisible(app, win_id, true, 6_000))
+        return "the sidebar never opened for the drag stage";
+
+    // Learn both rows' rectangles by making each tab current in turn.
+    const first_row = sidebarChipBounds(app, win_id) orelse return "the first tab's sidebar row was not visible";
+    var focus_buf: [96]u8 = undefined;
+    const focus_last = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{extra[1]}) catch
+        return "building the drag-stage focus command failed";
+    if (roundtrip(allocator, sock_path, focus_last)) |r| allocator.free(r) else
+        return "focusing the last tab for the drag stage failed";
+    _ = app.waitIdle(300, 5_000);
+    const last_row = sidebarChipBounds(app, win_id) orelse return "the last tab's sidebar row was not visible";
+    if (last_row.min_x != first_row.min_x) return "two root sidebar rows started at different indents";
+    if (last_row.min_y <= first_row.min_y) return "the last tab's row is not below the first tab's";
+    const mid = struct {
+        fn of(b: anytype) struct { x: f64, y: f64 } {
+            return .{
+                .x = @floatFromInt((b.min_x + b.max_x) / 2),
+                .y = @floatFromInt((b.min_y + b.max_y) / 2),
+            };
+        }
+    };
+    const from = mid.of(last_row);
+    const onto = mid.of(first_row);
+
+    // 1. Drop ON the first row -> the dragged tab becomes its child.
+    app.drag(win_id, from.x, from.y, onto.x, onto.y, 1) catch return "dragging a sidebar row onto another failed";
+    _ = app.waitIdle(300, 6_000);
+    const nested = blk: {
+        var waited: u32 = 0;
+        while (waited < 6_000) : (waited += 100) {
+            if (sidebarChipBounds(app, win_id)) |b| {
+                if (b.min_x > first_row.min_x) break :blk b;
+            }
+            _ = app.pumpOnce(100);
+        }
+        break :blk sidebarChipBounds(app, win_id) orelse
+            return "the dragged sidebar row disappeared";
+    };
+    if (nested.min_x <= first_row.min_x)
+        return "dropping a sidebar row onto another did not nest it under that row";
+    if (nested.min_y <= first_row.min_y)
+        return "a nested sidebar row did not follow its new parent";
+
+    // 2. Drop on the empty list below the rows -> back to the root level.
+    const empty_y = @as(f64, @floatFromInt(app.windows.items[0].h)) * 0.75;
+    app.drag(win_id, mid.of(nested).x, mid.of(nested).y, onto.x, empty_y, 1) catch
+        return "dragging a sidebar row onto the empty list failed";
+    _ = app.waitIdle(300, 6_000);
+    const unnested = blk: {
+        var waited: u32 = 0;
+        while (waited < 6_000) : (waited += 100) {
+            if (sidebarChipBounds(app, win_id)) |b| {
+                if (b.min_x == first_row.min_x) break :blk b;
+            }
+            _ = app.pumpOnce(100);
+        }
+        break :blk sidebarChipBounds(app, win_id) orelse
+            return "the unnested sidebar row disappeared";
+    };
+    if (unnested.min_x != first_row.min_x)
+        return "dropping a sidebar row on the empty list did not return it to the root level";
+
+    // 3. Drop on the TOP of the first row -> reorder above it, still a
+    //    root. This is the gesture the old drag had no notion of: it
+    //    could only ever make the dropped-on row a parent.
+    const above_y = @as(f64, @floatFromInt(first_row.min_y)) + 2.0;
+    app.drag(win_id, mid.of(unnested).x, mid.of(unnested).y, onto.x, above_y, 1) catch
+        return "dragging a sidebar row above another failed";
+    _ = app.waitIdle(300, 6_000);
+    const reordered = blk: {
+        var waited: u32 = 0;
+        while (waited < 6_000) : (waited += 100) {
+            if (sidebarChipBounds(app, win_id)) |b| {
+                if (b.min_y <= first_row.min_y) break :blk b;
+            }
+            _ = app.pumpOnce(100);
+        }
+        break :blk sidebarChipBounds(app, win_id) orelse
+            return "the reordered sidebar row disappeared";
+    };
+    if (reordered.min_y > first_row.min_y) {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: reorder target y %zu, landed at %zu\n", first_row.min_y, reordered.min_y);
+        return "dropping a sidebar row above another did not move it to the top";
+    }
+    if (reordered.min_x != first_row.min_x)
+        return "a row dropped BETWEEN rows was nested instead of reordered";
+
+    if (app.screenshotPng(win_id, 1400, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("/tmp/sketerm-e2e-tab-sidebar-drag.png", shot.png);
+    } else |_| {}
+
+    app.pressKey(null, tree_toggle_key) catch return "hiding the sidebar after the drag stage failed";
+    if (!waitSidebarVisible(app, win_id, false, 6_000))
+        return "the sidebar never closed after the drag stage";
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);
     return null;
@@ -2522,7 +2683,10 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
         "{\"cmd\":\"web-open\",\"target\":\"split\",\"data\":\"data:text/html,<title>action-two</title><body style='margin:0;background:%23ddd'>split</body>\"}\n") orelse
         return "opening the browser-action split failed";
     defer allocator.free(split_open);
-    const split_pane = parseNumAfter(split_open, "\"pane\":") orelse return "the browser-action split returned no pane";
+    const split_pane = parseNumAfter(split_open, "\"pane\":") orelse {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: web-open split reply: %.*s\n", @as(c_int, @intCast(@min(split_open.len, 800))), split_open.ptr);
+        return "the browser-action split returned no pane";
+    };
     if (waitSplitToolbarExclusive(app, win_id, .orange, false, .blue, 15_000) == null)
         return "split focus did not move the only live action to the orange pane";
     var focus_buf: [96]u8 = undefined;
@@ -7179,37 +7343,81 @@ fn themeSingletonStage(
     // This catches stale shortcut_ctx directly: the source primary's
     // sidebar changing cannot produce a selected chip in `secondary`.
     app.pressKey(secondary, tree_toggle_key) catch return "injecting the transferred-pane sidebar shortcut failed";
-    var shown_waited: u32 = 0;
-    while (shown_waited < 5_000 and sidebarChipRight(app, secondary) == 0) : (shown_waited += 100)
-        _ = app.pumpOnce(100);
-    if (sidebarChipRight(app, secondary) == 0) return "a transferred pane's shortcut still targeted its source Window";
-    var first_saved = false;
-    var save_waited: u32 = 0;
-    while (save_waited < 5_000) : (save_waited += 100) {
-        _ = app.pumpOnce(100);
-        if (readFileAlloc(allocator, cfg_path)) |body| {
-            defer allocator.free(body);
-            if (std.mem.indexOf(u8, body, "show_tab_sidebar = true") != null) {
-                first_saved = true;
-                break;
-            }
-        }
+    if (!waitSidebarVisible(app, secondary, true, 6_000))
+        return "a transferred pane's shortcut still targeted its source Window";
+
+    // THE per-window regression. Toggling one window's sidebar used to
+    // write show_tab_sidebar to config.conf, and the reload watcher then
+    // pushed that value into every other window — the user-visible bug.
+    // The primary is a SEPARATE window of the same process, so if that
+    // ever comes back it shows up right here.
+    if (sidebarChipRight(app, primary_id) != 0)
+        return "showing one window's sidebar also opened it in the other window";
+    if (readFileAlloc(allocator, cfg_path)) |body| {
+        defer allocator.free(body);
+        if (std.mem.indexOf(u8, body, "show_tab_sidebar") != null)
+            return "toggling a window's sidebar wrote show_tab_sidebar into config.conf";
     }
-    if (!first_saved) return "the transferred-pane sidebar shortcut was not persisted";
+    // And the other direction: the primary takes its own sidebar, and
+    // hiding the secondary's leaves the primary's alone.
+    app.pressKey(primary_id, tree_toggle_key) catch return "injecting the primary window's sidebar shortcut failed";
+    if (!waitSidebarVisible(app, primary_id, true, 6_000))
+        return "the primary window's own sidebar shortcut did nothing";
     app.pressKey(secondary, tree_toggle_key) catch return "hiding the transferred-pane sidebar failed";
-    var hidden_saved = false;
-    var hide_waited: u32 = 0;
-    while (hide_waited < 5_000) : (hide_waited += 100) {
+    if (!waitSidebarVisible(app, secondary, false, 6_000))
+        return "hiding the transferred-pane sidebar did not hide it";
+    if (sidebarChipRight(app, primary_id) == 0)
+        return "hiding one window's sidebar also closed it in the other window";
+    app.pressKey(primary_id, tree_toggle_key) catch return "hiding the primary window's sidebar failed";
+    if (!waitSidebarVisible(app, primary_id, false, 6_000))
+        return "the primary window's sidebar never went away again";
+
+    // The dragged WIDTH is still a global preference, and a secondary
+    // window must be able to write it. Done here rather than next to
+    // the detach below because a Preferences child of this window is
+    // open by then and the pointer no longer reaches its divider.
+    app.pressKey(secondary, tree_toggle_key) catch return "reopening the transferred pane's sidebar failed";
+    if (!waitSidebarVisible(app, secondary, true, 6_000))
+        return "the transferred pane's sidebar did not reopen";
+    // The divider sits a few pixels right of the row chips; which few
+    // depends on the theme's list padding, so probe outwards rather
+    // than guess.
+    const before_w = sidebarChipRight(app, secondary);
+    const divider_y = blk: {
+        for (app.windows.items) |w| {
+            if (w.id == secondary) break :blk @as(f64, @floatFromInt(w.h)) * 0.6;
+        }
+        break :blk 300.0;
+    };
+    var widened = false;
+    for ([_]usize{ 8, 4, 12, 2, 16 }) |off| {
+        const grab: f64 = @floatFromInt(before_w + off);
+        app.drag(secondary, grab, divider_y, grab + 70, divider_y, 1) catch
+            return "dragging the secondary window's sidebar divider failed";
+        var wtries: u32 = 0;
+        while (wtries < 10) : (wtries += 1) {
+            if (sidebarChipRight(app, secondary) >= before_w + 40) {
+                widened = true;
+                break;
+            }
+            _ = app.pumpOnce(50);
+        }
+        if (widened) break;
+    }
+    if (!widened) return "the secondary window's sidebar divider never moved";
+    var width_saved = false;
+    var width_waited: u32 = 0;
+    while (width_waited < 6_000) : (width_waited += 100) {
         _ = app.pumpOnce(100);
         if (readFileAlloc(allocator, cfg_path)) |body| {
             defer allocator.free(body);
-            if (std.mem.indexOf(u8, body, "show_tab_sidebar") == null) {
-                hidden_saved = true;
+            if (std.mem.indexOf(u8, body, "tab_sidebar_width = ") != null) {
+                width_saved = true;
                 break;
             }
         }
     }
-    if (!hidden_saved) return "hiding the transferred-pane sidebar was not persisted";
+    if (!width_saved) return "a secondary window's dragged sidebar width was never persisted";
 
     // Target by pane so the second request still resolves to the same
     // Window after its first Preferences child becomes GTK's active
@@ -7255,11 +7463,11 @@ fn themeSingletonStage(
         if (count != 1) return "reopening Preferences did not reuse exactly one window";
     }
 
-    // Sequential IPC requests are dispatched on the same GLib main
-    // loop, avoiding any cross-transport ordering ambiguity: the toggle
-    // is applied first and the detach follows immediately, before the
-    // 400 ms debounce can fire. Detaching the secondary's only tab
-    // destroys its now-empty source while Preferences is still open.
+    // The same toggle over IPC, which reaches the window Preferences is
+    // attached to. Sequential IPC requests are dispatched on the same
+    // GLib main loop, so the toggle is applied before the detach that
+    // follows. Detaching the secondary's only tab destroys its
+    // now-empty source while Preferences is still open.
     var toggle_buf: [128]u8 = undefined;
     const toggle_req = std.fmt.bufPrint(&toggle_buf, "{{\"cmd\":\"action\",\"pane\":{d},\"data\":\"toggle_tab_sidebar\"}}\n", .{pane}) catch
         return "sidebar toggle request fmt";
@@ -7267,6 +7475,8 @@ fn themeSingletonStage(
         return "toggling the secondary sidebar over IPC failed";
     defer allocator.free(toggled);
     if (std.mem.indexOf(u8, toggled, "\"ok\":true") == null) return "toggling the secondary sidebar over IPC was not ok";
+    if (!waitSidebarVisible(app, secondary, false, 6_000))
+        return "the IPC sidebar toggle did not hide the secondary's sidebar";
     var detach_again_buf: [128]u8 = undefined;
     const detach_again = std.fmt.bufPrint(&detach_again_buf, "{{\"cmd\":\"action\",\"pane\":{d},\"data\":\"detach_tab\"}}\n", .{pane}) catch
         return "second detach request fmt";
@@ -7274,7 +7484,7 @@ fn themeSingletonStage(
     defer allocator.free(moved);
     if (std.mem.indexOf(u8, moved, "\"ok\":true") == null) return "detaching from the secondary was not ok";
     var gone: u32 = 0;
-    while (gone < 8_000) : (gone += 250) {
+    while (gone < 20_000) : (gone += 250) {
         _ = app.pumpOnce(250);
         if (app.windowGone(secondary) and app.windowGone(prefs_id)) break;
     }
@@ -7282,8 +7492,10 @@ fn themeSingletonStage(
     if (!app.windowGone(prefs_id)) return "Preferences outlived its destroyed secondary parent";
     const saved = readFileAlloc(allocator, cfg_path) orelse return "closing the secondary lost its pending sidebar config write";
     defer allocator.free(saved);
-    if (std.mem.indexOf(u8, saved, "show_tab_sidebar = true") == null)
-        return "the close-time sidebar config flush did not persist the toggle";
+    if (std.mem.indexOf(u8, saved, "tab_sidebar_width = ") == null)
+        return "closing the secondary dropped the sidebar width it had persisted";
+    if (std.mem.indexOf(u8, saved, "show_tab_sidebar") != null)
+        return "the close-time config flush persisted a per-window sidebar toggle";
 
     // The fuse. `deferredWindowFree` runs on an idle after the destroy
     // chain unwinds, and the flip timer fires five times a second, so

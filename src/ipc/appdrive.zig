@@ -1862,16 +1862,26 @@ pub const App = struct {
         wlpipe.appendSeatMotion(&units, a, hit.x, hit.y) catch return Error.OutOfMemory;
         wlpipe.appendSeatButton(&units, a, evdevButton(button), true) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
+        // Real time between the steps, not just a pump. A toolkit
+        // DRAG-AND-DROP (as opposed to a pointer-grab drag like a
+        // paned divider) is a conversation: the source asks the
+        // compositor to start a drag, the destination answers "I accept
+        // this", and only an accepted drag turns a button release into a
+        // drop. Firing press → motions → release inside one millisecond
+        // leaves the client no room to answer, so the release always
+        // cancelled instead.
+        self.pumpFor(40);
         const dist = @max(@abs(x2 - x1), @abs(y2 - y1));
-        const steps: u32 = @intFromFloat(std.math.clamp(dist / 16.0, 4.0, 40.0));
+        const steps: u32 = @intFromFloat(std.math.clamp(dist / 16.0, 8.0, 40.0));
         var i: u32 = 1;
         while (i <= steps) : (i += 1) {
             const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
             units.clearRetainingCapacity();
             wlpipe.appendSeatMotion(&units, a, x1 + (x2 - x1) * t - off_x, y1 + (y2 - y1) * t - off_y) catch return Error.OutOfMemory;
             try self.sendIntents(win.chan, units.items);
-            if (i % 4 == 0) _ = self.pumpOnce(5);
+            self.pumpFor(12);
         }
+        self.pumpFor(150);
         units.clearRetainingCapacity();
         wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);

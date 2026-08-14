@@ -2122,6 +2122,18 @@ fn connectWithRetry(path: [*:0]const u8, path_len: usize) c_int {
 /// Fork+exec one helper. `extra` is a single additional argv entry (the
 /// ozone pin, or "--disable-gpu"), and `no_gpu` sets the environment
 /// switch that makes the helper refuse the GPU path outright.
+///
+/// Stripping the inherited proxy environment is not optional: every
+/// fixture this rig serves is on loopback, and a developer environment
+/// that exports `HTTP_PROXY` / `HTTPS_PROXY` sends them through it.
+/// Chromium's implicit bypass covers a literal `127.0.0.1` url but NOT a
+/// named host mapped there by `--host-resolver-rules`, so the https
+/// fixtures lose their TLS handshake to a CONNECT the proxy cannot
+/// complete and no certificate error ever reaches the client (stage 40).
+/// It is done by environment rather than with `--no-proxy-server`
+/// because that switch also disables the PER-CONTEXT proxy stage 26
+/// configures, and this rig has to test proxying while not being
+/// proxied itself.
 fn spawnHelper(
     exe: [*:0]const u8,
     sock: [*:0]const u8,
@@ -2134,14 +2146,18 @@ fn spawnHelper(
     if (pid < 0) fail("fork");
     if (pid != 0) return pid;
     if (no_gpu) _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
-    var vec: [8:null]?[*:0]const u8 = @splat(null);
-    vec[0] = exe;
-    vec[1] = "--socket";
-    vec[2] = sock;
-    vec[3] = "--cache-dir";
-    vec[4] = cache;
-    if (extra) |e| vec[5] = e;
-    if (extra2) |e| vec[6] = e;
+    for ([_][*:0]const u8{
+        "http_proxy",  "https_proxy",  "all_proxy",  "ftp_proxy",  "no_proxy",
+        "HTTP_PROXY",  "HTTPS_PROXY",  "ALL_PROXY",  "FTP_PROXY",  "NO_PROXY",
+    }) |name| _ = c.unsetenv(name);
+    var vec: [10:null]?[*:0]const u8 = @splat(null);
+    var n: usize = 0;
+    for ([_]?[*:0]const u8{ exe, "--socket", sock, "--cache-dir", cache, extra, extra2 }) |a| {
+        if (a) |arg| {
+            vec[n] = arg;
+            n += 1;
+        }
+    }
     _ = c.execv(exe, @ptrCast(@constCast(&vec)));
     c._exit(127);
     unreachable;
@@ -4744,7 +4760,7 @@ fn runFilterSubscriptionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: [
     var cache_path_buf: [4096]u8 = undefined;
     const cache_path = std.fmt.bufPrint(&cache_path_buf, "{s}/sketerm/filters/{s}", .{ config_home, cache_name }) catch fail("stage 39 cache file path");
 
-    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", false);
+    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
     g_pid = pid;
     var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-filter-sub" });
