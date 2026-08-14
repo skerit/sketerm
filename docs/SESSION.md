@@ -18319,3 +18319,63 @@ The real-seat coverage runs on sketerm's private Wayland display on Linux.
 macOS is compile-checked with `mux-portable`, but native Command-key injection
 and AppKit/WindowServer teardown remain unverified without a macOS runner; a
 green cross-compile is not claimed as native runtime proof.
+## 2026-08-14: browser usability batch — sidebar menus, TST look, omnibox unblocked
+
+The tree sidebar gained real context menus. A window-tab row pops the SAME
+menu the strip's tabs pop (`tabchrome.onTabContextMenu`), extended for both
+surfaces with New Tab, Move to New Window and — when the tab heads a subtree —
+Collapse/Expand Subtree and Close Subtree (`Window.closeTabSubtree`,
+`Window.moveTabToNewWindow`). A browser-page row pops TabHost's shared per-tab
+menu, which `webgroup` now configures (`tab_menu` spec: Duplicate-as-child,
+Reload, Copy Page URL, tree verbs), so the in-pane notebook strip gets the
+same menu for free. The sidebar's empty area answers with New Tab /
+Collapse All / Expand All. One crash fixed along the way: the row menu must be
+anchored on the sidebar SCROLLER with pre-translated coordinates, because
+selecting the clicked tab can swap the sidebar to a browser's page list and
+destroy the row before the popover maps (gdk_surface_new_popup on a dead
+parent = SIGSEGV).
+
+Rows now look like Firefox TST/our own tab strip instead of pills: inactive
+rows are flat text, hover is a faint neutral surface, and the ACTIVE row is a
+stronger neutral surface — not the blue selection colour. The "active row is
+off by one" report was real and lived in `webgroup.Group.active()`:
+GtkNotebook emits `switch-page` BEFORE updating its current page, so the
+sidebar refresh inside that handler read the OLD page. The group now tracks
+the switching-to face itself. Dragging a row dims the source to 35% (the tab
+visibly moves rather than spawning a ghost copy), and hovering a collapsed
+row mid-drag expands it after a 600ms dwell, TST-style.
+
+The omnibox — fully built on the suggestion framework since 2026-08-12 —
+turned out to have NEVER opened for anyone: every gate checked
+`gtk_widget_has_focus(entry)`, which is always false on a GtkEntry because
+focus sits on its inner GtkText. `webface.focusWithin` (FOCUS_WITHIN state
+flag) replaces all three call sites; the dropdown now opens as you type.
+
+The web content menu is context-sensitive like Firefox. The helper's hit test
+now also reports image presence + source URL and the selected text (optional
+trailing `EvContextMenu` fields under the EvPopupRequest rule, flags
+`ctx_flag_image`/`ctx_flag_selection`). Right-clicking a link leads with Open
+Link in New Tab / Copy Link URL; an image adds Open Image in New Tab / Copy
+Image URL; a selection adds Copy and Search the Web for "…" (search-template
+instantiation). Only the plain page menu opens with the Firefox-style
+icon-only Back/Forward/Reload strip (a `classicmenu` custom row).
+
+"Show This Pane's Shell" is no longer a trap: the terminal context menu grows
+a conditional "Return to Browser" row (shown exactly while the pane carries a
+hidden web face), a bindable `toggle_web_face` action joins the palette, and
+flipping the face refreshes the tab sidebar so the page list follows.
+
+Cosmetics: the two "Containers…" labels were literal mojibake (double-encoded
+U+2026) — fixed, and `classicmenu.escapeLabel` no longer truncates mid-UTF-8
+sequence. The bookmark star renders as a bundled `sketerm-(non-)starred-
+symbolic` icon pair instead of Adwaita's status-dir names that non-Adwaita
+theme chains cannot resolve. GtkWindowControls' application icon gets a 6px
+margin so it is not glued to the window border.
+
+Verified on the private Wayland display rig: sidebar menus (rows, page rows,
+empty area), tree verbs, drag-to-nest, active-row correctness, the omnibox
+dropdown, Return to Browser round-trip and the fixed Containers label. NOT
+runtime-verified here: the CEF-dependent context-menu behaviour and page-row
+verbs against a live engine — this dev host has cef 151.3.16-1 built against
+glibc 2.44 on a glibc 2.43 system, so `sketerm-webengine` cannot start until
+the distro packages re-align (partial-upgrade skew, worth knowing about).
