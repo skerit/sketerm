@@ -1,6 +1,90 @@
 # Autonomous build session — 2026-04-25
 
-## 2026-08-13: reader-mode semantic IDs
+## 2026-08-14: tree-style tabs — per-window sidebar, honest active row, real drag
+
+The tree-style tab sidebar was reported as behaving strangely: flaky
+"active" marks, rows that could not be dragged the way real tabs can,
+and a toggle in one window that flipped the sidebar in every window.
+All three were separate defects.
+
+Sidebar visibility is now per-window state. `show_tab_sidebar` is only
+the default a NEW window opens with; `toggle_tab_sidebar` applies to the
+window it was invoked in and no longer writes the key back, which is
+what the config-reload watcher used to broadcast into every other
+window. A window whose sidebar was toggled by hand ignores the reloaded
+default (`Window.sidebar_user_set`), and flipping the switch in that
+window's Preferences hands it back. `tab_sidebar_width` is still global
+and still debounced.
+
+The flaky active mark was `GTK_SELECTION_SINGLE`. A GtkListBox moves its
+selection with the keyboard cursor, so an arrow key inside the sidebar
+silently marked a row whose tab was NOT current, and nothing reconciled
+it until the next rebuild snapped it back. The list is
+`GTK_SELECTION_NONE` now and the active row wears its own
+`sketerm-tst-active` class, so the mark answers "which tab is current"
+rather than "which row has the cursor" and survives focus moving into a
+pane. A second cause was upstream of the sidebar entirely: a new tab
+never became the selected one, because `adw_tab_view_append` selects
+nothing and no caller of `appendOrInsertTab` did either. It does now
+for every interactive path, leaving the bulk layout-restore path to
+pick its own selection.
+
+Sidebar rows now drag like strip tabs because they ARE the same drag: a
+dragged window tab is published to `tabbar`'s shared drag state, so
+every window's strip already accepts it and a drag that finds no target
+detaches into a new window through the callback that behaviour already
+lived in. Within the sidebar, the outer thirds of a row mean "drop
+between rows" (`Forest.moveNextTo`, anchor-relative because a sibling
+index shifts when the moved node is detached first) and the middle
+means "nest under it", each with its own drop-indicator class; the
+empty space below the rows makes the tab a root again. Only browser
+PAGES stay sidebar-private — a page belongs to one pane's group and has
+nowhere to land outside it.
+
+Two rig defects had been hiding all of this. `appdrive.drag` fired
+press, motions and release inside a millisecond, which is enough for a
+pointer-grab drag (the sidebar divider) but never for drag-and-drop,
+where the destination has to answer "I accept" before the release
+becomes a drop; it is paced now. And the replica compositor never sent
+`wl_data_device.leave` after a successful drop, so GTK kept the finished
+drop object and delivered NO motion to any drop target on the next drag
+— the second drag of a session could not be dropped anywhere. Weston
+and mutter both send it.
+
+`smoke-e2e` proves the toggle per-window across two real windows,
+proves visibility from pixels rather than from config.conf (which a
+runtime toggle must no longer touch), and drives three real drags:
+nest, unnest onto the empty list, and reorder above another row.
+
+## 2026-08-13: cross-stream review of the day's parallel work
+
+Several assistants built the day's features in parallel and the result
+was rebased together, so this pass reviewed the combined tree rather
+than any one branch. Wire-tag allocation survived the rebase cleanly:
+the reader IDs (0x6A-0x6E), the WebExtension actions (0xB7-0xBB) and
+the filter subscription (0xC4/0xC5) do not collide and are all
+append-only.
+
+The real defects were at the seams. A tab dragged to another window
+left its `notify::title` watch connected, pinning the source window's
+Sidebar alive after that window closed; `rebuild` now prunes watches
+for pages it no longer rows. `buildRow` resolved the list AFTER
+building the row, so the fallback path unref'd a floating widget; it
+bails first instead. The browser's sidebar debounce DROPPED a pending
+write at teardown where the window's flushed it, losing a width the
+user had just dragged — both now share `ui/debounce.zig`, which is
+where the exactly-once state machine already lived, and the flush
+falls out of the sharing. On the packaging side `deb_depends_of` ended
+its pipeline with a failed test when the last library was
+dpkg-unowned, which under `pipefail` killed the installer silently
+after a successful build; `libcef.so` is exactly such a library.
+
+Duplication was collapsed rather than documented: one `gui_pkgs`
+roster in `build.zig`, one `Group.closePolicy`, one
+`input.matchWithDefaults` (`viewer.zig` had a third copy the first
+pass missed), one `printableAscii`, one chip-bounds scan in the smoke
+rig, and `ui/webframe.zig` for the frame and input primitives that
+`webface.zig` and `webaction.zig` had each written out.
 
 `web_read` now returns reader markdown and a structured `entities` list
 for useful sections, headings, links and list items. Every entity ID is
@@ -20,8 +104,11 @@ retargeted entity returns `sem_act_result ok=0`; it never falls through
 to a node on the changed page. Clients retain typed provenance for every
 reader ID they exposed. New reads refresh matching guards and invalidate
 absent ones; snapshots leave provenance intact, while navigation, stop,
-discard, renderer crash and helper replacement make the guards deliberately
-stale.
+discard and renderer crash make the guards deliberately stale. Helper
+replacement instead FORGETS them outright: a restarted helper mints
+stable IDs from 1 again, so a remembered dead-epoch ID would collide
+with a fresh one and route an ordinary action through the guarded path
+forever.
 
 Compatibility is explicit in `mcp_web.zig`: a helper without
 `reader-ids` is sent the old `sem_read` and its response is treated only

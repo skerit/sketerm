@@ -438,6 +438,13 @@ dispatch, and the blocking half is documented in its own section below).
   the focused window and asks that page's native toolbar to run the same
   activation path. It remains pending until the GUI returns the correlated
   append-only `webext_open_popup_result` (0xBB); failure text is UTF-8-safe.
+  It shares ONE pending-reply table (`Host.webext_replies`) with routed
+  `runtime`/`tabs.sendMessage`, so it inherits their deadline: a GUI that
+  drops the 0xBB reply without the view or the extension dying rejects the
+  Promise on the next expiry pass instead of parking it forever. Every
+  parked extension Promise is answered on every exit — recipient gone,
+  extension revoked, table full, deadline — and that is the same iron rule
+  the held webRequest, cert and permission decisions follow.
   Content scripts and popup-less/hidden/disabled actions reject.
   **WebExtensions are local-browser only.** Installed-package paths
   belong to the GUI host and there is no package-transfer/remote-registry
