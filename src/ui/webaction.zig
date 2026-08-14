@@ -4,8 +4,8 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const proto = @import("../web/protocol.zig");
-const zpool = @import("../wlhost/zpool.zig");
 const webface = @import("webface.zig");
+const webframe = @import("webframe.zig");
 const webext = @import("webext.zig");
 
 const POPUP_W: u16 = 420;
@@ -261,6 +261,11 @@ pub const Toolbar = struct {
 
     fn activate(self: *Toolbar, a: *Action) bool {
         const cl = self.cl orelse return false;
+        // The activation and its popup view only mean anything to a
+        // helper that advertised the capability; a remote client has it
+        // forced off, so this is also what keeps extension actions from
+        // being driven across the mux wire.
+        if (!cl.cap_webext_action or cl.state != .ready) return false;
         if (self.popup) |old| old.destroy(true);
         self.popup = null;
         const popup = if (a.popup) Popup.create(self, a.button) else null;
@@ -309,7 +314,7 @@ const Popup = struct {
     widget: *c.GtkWidget,
     picture: *c.GtkWidget,
     status: *c.GtkWidget,
-    map: ?*Map = null,
+    map: ?*webframe.Map = null,
     buf_id: u32 = 0,
     w: u16 = 0,
     h: u16 = 0,
@@ -347,39 +352,30 @@ const Popup = struct {
         c.gtk_popover_set_position(@ptrCast(pop), c.GTK_POS_BOTTOM);
         c.gtk_widget_set_parent(pop, anchor);
         _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(pop)));
-        const motion = c.gtk_event_controller_motion_new().?;
-        const click = c.gtk_gesture_click_new().?;
-        const scroll = c.gtk_event_controller_scroll_new(c.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES).?;
-        const key = c.gtk_event_controller_key_new().?;
-        const focus = c.gtk_event_controller_focus_new().?;
         self.* = .{
             .owner = owner,
             .view = webface.nextAuxView(),
             .widget = pop,
             .picture = picture,
             .status = status,
-            .motion = motion,
-            .click = @ptrCast(click),
-            .scroll = scroll,
-            .key = key,
-            .focus = focus,
+            .motion = undefined,
+            .click = undefined,
+            .scroll = undefined,
+            .key = undefined,
+            .focus = undefined,
         };
+        const ctrls = webframe.wireInput(InputSink, area, @ptrCast(self)) orelse {
+            c.gtk_widget_unparent(pop);
+            c.g_object_unref(@as(?*anyopaque, @ptrCast(pop)));
+            owner.allocator.destroy(self);
+            return null;
+        };
+        self.motion = ctrls.motion;
+        self.click = ctrls.click;
+        self.scroll = ctrls.scroll;
+        self.key = ctrls.key;
+        self.focus = ctrls.focus;
         _ = c.g_signal_connect_data(pop, "closed", @ptrCast(&onClosed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(motion, "motion", @ptrCast(&onMotion), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(motion, "leave", @ptrCast(&onPointerLeave), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_widget_add_controller(area, motion);
-        c.gtk_gesture_single_set_button(@ptrCast(click), 0);
-        _ = c.g_signal_connect_data(click, "pressed", @ptrCast(&onPressed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(click, "released", @ptrCast(&onReleased), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_widget_add_controller(area, @ptrCast(click));
-        _ = c.g_signal_connect_data(scroll, "scroll", @ptrCast(&onScroll), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_widget_add_controller(area, scroll);
-        _ = c.g_signal_connect_data(key, "key-pressed", @ptrCast(&onKeyPressed), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(key, "key-released", @ptrCast(&onKeyReleased), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_widget_add_controller(area, key);
-        _ = c.g_signal_connect_data(focus, "enter", @ptrCast(&onFocusEnter), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(focus, "leave", @ptrCast(&onFocusLeave), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_widget_add_controller(area, focus);
         c.gtk_popover_popup(@ptrCast(pop));
         _ = c.gtk_widget_grab_focus(area);
         return self;
@@ -424,15 +420,7 @@ const Popup = struct {
 
     fn adoptBuffer(self: *Popup, fb: proto.FrameBuffer, fd: c_int) void {
         defer _ = c.close(fd);
-        const size = @as(usize, fb.stride) * fb.h;
-        if (fb.w == 0 or fb.h == 0 or fb.stride < @as(u32, fb.w) * 4 or size == 0) return;
-        const addr = c.mmap(null, size, c.PROT_READ, c.MAP_SHARED, fd, 0);
-        if (addr == c.MAP_FAILED) return;
-        const m = self.owner.allocator.create(Map) catch {
-            _ = c.munmap(addr, size);
-            return;
-        };
-        m.* = .{ .ptr = @ptrCast(addr), .len = size, .allocator = self.owner.allocator, .mapped = true };
+        const m = webframe.mapFrameFd(self.owner.allocator, fd, fb.w, fb.h, fb.stride) orelse return;
         c.gtk_picture_set_paintable(@ptrCast(self.picture), null);
         if (self.map) |old| old.unref();
         self.map = m;
@@ -446,19 +434,7 @@ const Popup = struct {
     fn damage(self: *Popup, ev: proto.FrameDamage) void {
         if (ev.buf_id != self.buf_id) return;
         const m = self.map orelse return;
-        const builder = c.gdk_memory_texture_builder_new() orelse return;
-        defer c.g_object_unref(@ptrCast(builder));
-        const bytes = c.g_bytes_new_with_free_func(m.ptr, m.len, Map.gbytesDestroy, m.ref()) orelse {
-            m.unref();
-            return;
-        };
-        defer c.g_bytes_unref(bytes);
-        c.gdk_memory_texture_builder_set_bytes(builder, bytes);
-        c.gdk_memory_texture_builder_set_width(builder, self.w);
-        c.gdk_memory_texture_builder_set_height(builder, self.h);
-        c.gdk_memory_texture_builder_set_stride(builder, self.stride);
-        c.gdk_memory_texture_builder_set_format(builder, c.GDK_MEMORY_B8G8R8A8_PREMULTIPLIED);
-        const tex = c.gdk_memory_texture_builder_build(builder) orelse return;
+        const tex = webframe.buildBgraTexture(m, self.w, self.h, self.stride, null, null) orelse return;
         c.gtk_picture_set_paintable(@ptrCast(self.picture), @ptrCast(tex));
         c.g_object_unref(@ptrCast(tex));
         c.gtk_widget_set_visible(self.status, 0);
@@ -470,13 +446,7 @@ const Popup = struct {
         const size = @as(usize, stride) * ev.h;
         const need_new = self.map == null or self.w != ev.w or self.h != ev.h or self.stride != stride;
         if (need_new) {
-            const bytes = self.owner.allocator.alloc(u8, size) catch return;
-            @memset(bytes, 0);
-            const map = self.owner.allocator.create(Map) catch {
-                self.owner.allocator.free(bytes);
-                return;
-            };
-            map.* = .{ .ptr = bytes.ptr, .len = bytes.len, .allocator = self.owner.allocator };
+            const map = webframe.mapAnon(self.owner.allocator, size) orelse return;
             c.gtk_picture_set_paintable(@ptrCast(self.picture), null);
             if (self.map) |old| old.unref();
             self.map = map;
@@ -488,24 +458,7 @@ const Popup = struct {
         }
         const map = self.map orelse return;
         for (ev.rects) |r| {
-            if (@as(u32, r.x) + r.w > ev.w or @as(u32, r.y) + r.h > ev.h) continue;
-            const raw_len = @as(usize, r.w) * r.h * 4;
-            var scratch: ?[]u8 = null;
-            defer if (scratch) |s| self.owner.allocator.free(s);
-            const decoded = switch (r.enc) {
-                proto.inline_enc_raw => if (r.data.len == raw_len) r.data else continue,
-                proto.inline_enc_deflate => blk: {
-                    const s = self.owner.allocator.alloc(u8, raw_len) catch continue;
-                    scratch = s;
-                    break :blk zpool.decompress(r.data, s) catch continue;
-                },
-                else => continue,
-            };
-            const row_bytes = @as(usize, r.w) * 4;
-            for (0..r.h) |row| {
-                const dst = (@as(usize, r.y) + row) * stride + @as(usize, r.x) * 4;
-                @memcpy(map.ptr[dst..][0..row_bytes], decoded[row * row_bytes ..][0..row_bytes]);
-            }
+            _ = webframe.decodeInlineRect(self.owner.allocator, map, stride, ev.w, ev.h, r);
         }
         self.damage(.{ .view = ev.view, .buf_id = self.buf_id, .gen = ev.gen, .rects = &.{} });
     }
@@ -528,141 +481,76 @@ const Popup = struct {
         self.destroy(true);
     }
 
-    fn onMotion(ctrl: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Popup, user);
-        self.last_x = @intFromFloat(@round(x));
-        self.last_y = @intFromFloat(@round(y));
-        self.sendPointer(.move, x, y, 0, 0, modsOf(@ptrCast(ctrl)));
-    }
+    /// `webframe.wireInput` sink: everything a popup does with an event
+    /// is post it, so this is the shared translation plus the one local
+    /// rule that Escape closes the popover.
+    const InputSink = struct {
+        pub fn pointer(
+            user: ?*anyopaque,
+            kind: proto.PointerKind,
+            x: f64,
+            y: f64,
+            button: u8,
+            clicks: u8,
+            mods: u32,
+        ) void {
+            const self = cast.userData(Popup, user);
+            // A leave carries no position of its own; the page is told
+            // the pointer left from where it last was.
+            if (kind == .leave) {
+                self.sendPointer(kind, @floatFromInt(self.last_x), @floatFromInt(self.last_y), button, clicks, mods);
+                return;
+            }
+            if (kind == .move or kind == .down) {
+                self.last_x = @intFromFloat(@round(x));
+                self.last_y = @intFromFloat(@round(y));
+            }
+            self.sendPointer(kind, x, y, button, clicks, mods);
+        }
 
-    fn onPointerLeave(ctrl: *c.GtkEventControllerMotion, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Popup, user);
-        self.sendPointer(.leave, self.last_x, self.last_y, 0, 0, modsOf(@ptrCast(ctrl)));
-    }
-
-    fn onPressed(g: *c.GtkGestureClick, n: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const button = cefButton(c.gtk_gesture_single_get_current_button(@ptrCast(g)));
-        const self = cast.userData(Popup, user);
-        self.last_x = @intFromFloat(@round(x));
-        self.last_y = @intFromFloat(@round(y));
-        self.sendPointer(.down, x, y, button, @intCast(@max(n, 1)), modsOf(@ptrCast(g)));
-    }
-
-    fn onReleased(g: *c.GtkGestureClick, n: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const button = cefButton(c.gtk_gesture_single_get_current_button(@ptrCast(g)));
-        cast.userData(Popup, user).sendPointer(.up, x, y, button, @intCast(@max(n, 1)), modsOf(@ptrCast(g)));
-    }
-
-    fn onScroll(ctrl: *c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(Popup, user);
-        self.owner.post(proto.InputScroll{
-            .view = self.view,
-            .x = self.last_x,
-            .y = self.last_y,
-            .dx = @intFromFloat(@round(dx * 120.0)),
-            .dy = @intFromFloat(@round(dy * 120.0)),
-            .mods = modsOf(@ptrCast(ctrl)),
-        });
-        return 1;
-    }
-
-    fn onKeyPressed(_: *c.GtkEventControllerKey, keyval: c.guint, keycode: c.guint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(Popup, user);
-        if (keyval == c.GDK_KEY_Escape) {
-            c.gtk_popover_popdown(@ptrCast(self.widget));
+        pub fn scroll(user: ?*anyopaque, dx: f64, dy: f64, mods: u32) c.gboolean {
+            const self = cast.userData(Popup, user);
+            self.owner.post(proto.InputScroll{
+                .view = self.view,
+                .x = self.last_x,
+                .y = self.last_y,
+                .dx = webframe.wheelDelta(dx),
+                .dy = webframe.wheelDelta(dy),
+                .mods = mods,
+            });
             return 1;
         }
-        const mods = modsFromState(state);
-        var text_buf: [8]u8 = undefined;
-        var text: []const u8 = &.{};
-        if (mods & (proto.mod_ctrl | proto.mod_alt) == 0) {
-            const cp = c.gdk_keyval_to_unicode(keyval);
-            if (cp >= 0x20 and cp != 0x7f) {
-                const n = std.unicode.utf8Encode(@intCast(cp), &text_buf) catch 0;
-                text = text_buf[0..n];
+
+        pub fn key(
+            user: ?*anyopaque,
+            kind: proto.KeyKind,
+            keyval: c.guint,
+            keycode: c.guint,
+            state: c.GdkModifierType,
+        ) c.gboolean {
+            const self = cast.userData(Popup, user);
+            if (kind == .down and keyval == c.GDK_KEY_Escape) {
+                c.gtk_popover_popdown(@ptrCast(self.widget));
+                return 1;
             }
+            const mods = modsFromState(state);
+            var text_buf: [8]u8 = undefined;
+            self.owner.post(proto.InputKey{
+                .view = self.view,
+                .kind = @intFromEnum(kind),
+                .keyval = keyval,
+                .keycode = keycode,
+                .mods = mods,
+                .text = webframe.keyText(&text_buf, kind, keyval, mods),
+            });
+            return 1;
         }
-        self.owner.post(proto.InputKey{
-            .view = self.view,
-            .kind = @intFromEnum(proto.KeyKind.down),
-            .keyval = keyval,
-            .keycode = keycode,
-            .mods = mods,
-            .text = text,
-        });
-        return 1;
-    }
 
-    fn onKeyReleased(_: *c.GtkEventControllerKey, keyval: c.guint, keycode: c.guint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Popup, user);
-        self.owner.post(proto.InputKey{
-            .view = self.view,
-            .kind = @intFromEnum(proto.KeyKind.up),
-            .keyval = keyval,
-            .keycode = keycode,
-            .mods = modsFromState(state),
-            .text = "",
-        });
-    }
-
-    fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Popup, user);
-        self.owner.post(proto.InputFocus{ .view = self.view, .focused = 1 });
-    }
-
-    fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(Popup, user);
-        self.owner.post(proto.InputFocus{ .view = self.view, .focused = 0 });
-    }
-};
-
-const Map = struct {
-    ptr: [*]u8,
-    len: usize,
-    refs: u32 = 1,
-    allocator: std.mem.Allocator,
-    mapped: bool = false,
-
-    fn ref(self: *Map) *Map {
-        self.refs += 1;
-        return self;
-    }
-
-    fn unref(self: *Map) void {
-        self.refs -= 1;
-        if (self.refs != 0) return;
-        if (self.mapped) {
-            _ = c.munmap(self.ptr, self.len);
-        } else {
-            self.allocator.free(self.ptr[0..self.len]);
+        pub fn focus(user: ?*anyopaque, focused: bool) void {
+            const self = cast.userData(Popup, user);
+            self.owner.post(proto.InputFocus{ .view = self.view, .focused = @intFromBool(focused) });
         }
-        self.allocator.destroy(self);
-    }
-
-    fn gbytesDestroy(user: ?*anyopaque) callconv(.c) void {
-        cast.userData(Map, user).unref();
-    }
-};
-
-fn cefButton(btn: c.guint) u8 {
-    return switch (btn) {
-        2 => 1,
-        3 => 2,
-        else => 0,
     };
-}
+};
 
-fn modsOf(ctrl: *c.GtkEventController) u32 {
-    return modsFromState(c.gtk_event_controller_get_current_event_state(ctrl));
-}
-
-fn modsFromState(state: c.GdkModifierType) u32 {
-    var mods: u32 = 0;
-    const s: c_int = @intCast(state);
-    if (s & c.GDK_SHIFT_MASK != 0) mods |= proto.mod_shift;
-    if (s & c.GDK_CONTROL_MASK != 0) mods |= proto.mod_ctrl;
-    if (s & c.GDK_ALT_MASK != 0) mods |= proto.mod_alt;
-    if (s & c.GDK_SUPER_MASK != 0) mods |= proto.mod_super;
-    if (s & c.GDK_LOCK_MASK != 0) mods |= proto.mod_capslock;
-    return mods;
-}
+const modsFromState = webframe.modsFromState;

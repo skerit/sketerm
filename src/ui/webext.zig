@@ -21,6 +21,7 @@ const webface = @import("webface.zig");
 const proto = @import("../web/protocol.zig");
 const manifest = @import("../web/webext/manifest.zig");
 const zip = @import("../web/webext/zip.zig");
+const pathz = @import("../util/pathz.zig");
 
 /// One installed extension as the GUI tracks it.
 pub const Ext = struct {
@@ -448,21 +449,25 @@ fn rebuildList(m: *Manager) void {
             std.fmt.bufPrintZ(&sbuf, "v{s}", .{e.version}) catch "";
         if (sub.len != 0) c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), sub.ptr);
 
-        // Enabled switch.
-        const sw = c.gtk_switch_new();
-        c.gtk_switch_set_active(@ptrCast(sw), if (e.enabled) 1 else 0);
-        c.gtk_widget_set_valign(sw, c.GTK_ALIGN_CENTER);
-        const rc = rowCtx(m, e.id);
-        _ = c.g_signal_connect_data(sw, "state-set", @ptrCast(&onToggle), @ptrCast(rc), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
-        c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), sw);
+        // Enabled switch. A context that cannot be built (invalid
+        // registry id, OOM) leaves the row without controls rather than
+        // wiring a callback to nothing.
+        if (rowCtx(m, e.id)) |rc| {
+            const sw = c.gtk_switch_new();
+            c.gtk_switch_set_active(@ptrCast(sw), if (e.enabled) 1 else 0);
+            c.gtk_widget_set_valign(sw, c.GTK_ALIGN_CENTER);
+            _ = c.g_signal_connect_data(sw, "state-set", @ptrCast(&onToggle), @ptrCast(rc), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
+            c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), sw);
+        }
 
         // Remove button.
-        const btn = c.gtk_button_new_from_icon_name("user-trash-symbolic");
-        c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
-        c.gtk_widget_add_css_class(btn, "flat");
-        const rc2 = rowCtx(m, e.id);
-        _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onRemoveClicked), @ptrCast(rc2), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
-        c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), btn);
+        if (rowCtx(m, e.id)) |rc2| {
+            const btn = c.gtk_button_new_from_icon_name("user-trash-symbolic");
+            c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
+            c.gtk_widget_add_css_class(btn, "flat");
+            _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onRemoveClicked), @ptrCast(rc2), @ptrCast(&freeRowCtx), c.G_CONNECT_DEFAULT);
+            c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), btn);
+        }
 
         c.adw_preferences_group_add(m.group, @ptrCast(@alignCast(row)));
         trackRow(m.group, @ptrCast(@alignCast(row)));
@@ -488,11 +493,14 @@ fn clearGroupRows(group: *c.AdwPreferencesGroup) void {
     }
 }
 
-const RowCtx = struct { gpa: std.mem.Allocator, id: [64]u8, id_len: usize };
+const RowCtx = struct { gpa: std.mem.Allocator, id: [manifest.MAX_ID_LEN]u8, id_len: usize };
 
-fn rowCtx(m: *Manager, id: []const u8) *RowCtx {
-    const rc = m.gpa.create(RowCtx) catch unreachable;
-    if (!manifest.idValid(id)) unreachable;
+/// Null on OOM or a registry entry whose id would not fit the fixed
+/// buffer — registry.json is on-disk data, so it never gets to abort a
+/// ReleaseFast build.
+fn rowCtx(m: *Manager, id: []const u8) ?*RowCtx {
+    if (!manifest.idValid(id)) return null;
+    const rc = m.gpa.create(RowCtx) catch return null;
     rc.* = .{ .gpa = m.gpa, .id = undefined, .id_len = id.len };
     @memcpy(rc.id[0..rc.id_len], id[0..rc.id_len]);
     return rc;
@@ -627,18 +635,7 @@ fn writeFile(path: []const u8, bytes: []const u8) void {
 }
 
 fn mkdirAll(path: []const u8) void {
-    var buf: [4096]u8 = undefined;
-    if (path.len + 1 > buf.len) return;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    var i: usize = 1;
-    while (i <= path.len) : (i += 1) {
-        if (i != path.len and buf[i] != '/') continue;
-        const save_ch = buf[i];
-        buf[i] = 0;
-        _ = c.mkdir(@ptrCast(&buf), 0o755);
-        buf[i] = save_ch;
-    }
+    pathz.makeDirs(path, 0o755) catch {};
 }
 
 /// Best-effort recursive delete of an owned extension directory.

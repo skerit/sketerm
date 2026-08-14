@@ -445,7 +445,8 @@ pub const Group = struct {
         if (self.ownerWindow()) |win| win.sidebarRefreshSelection();
     }
 
-    fn closePolicy(self: *Group) tabforest.ClosePolicy {
+    /// The window's tab_close_parent setting as a forest ClosePolicy.
+    pub fn closePolicy(self: *Group) tabforest.ClosePolicy {
         const win = self.ownerWindow() orelse return .promote;
         return switch (win.config.tab_close_parent) {
             .promote => .promote,

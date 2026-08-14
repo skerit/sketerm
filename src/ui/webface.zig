@@ -203,6 +203,7 @@ const input = @import("input.zig");
 const toolbtn = @import("toolbtn.zig");
 const cssutil = @import("cssutil.zig");
 const proto = @import("../web/protocol.zig");
+const quarantine = @import("../web/quarantine.zig");
 const reader_model = @import("../web/reader.zig");
 const reader_guards = @import("../web/reader_guards.zig");
 const webhints = @import("../web/hints.zig");
@@ -223,6 +224,7 @@ const webstore = @import("webstore.zig");
 const websiteinfo = @import("websiteinfo.zig");
 const webext = @import("webext.zig");
 const webaction = @import("webaction.zig");
+const webframe = @import("webframe.zig");
 const secrets = @import("secrets.zig");
 const suggest = @import("../util/suggest.zig");
 const urlhost = @import("../web/urlhost.zig");
@@ -232,7 +234,6 @@ const webproj = @import("../a11y/webproj.zig");
 const a11ydetect = @import("../a11y/detect.zig");
 const webremote = @import("webremote.zig");
 const webgroup = @import("webgroup.zig");
-const zpool = @import("../wlhost/zpool.zig");
 const Pane = @import("pane.zig").Pane;
 const Window = @import("window.zig").Window;
 
@@ -1235,7 +1236,10 @@ pub const Client = struct {
                 if (self.findFace(ev.owner_view)) |face| face.onWebextPopup(ev);
             },
             .ev_webext_open_popup => {
-                if (self.isRemote()) return;
+                // Same gate as every other capability-scoped feature:
+                // remote clients have `cap_webext_action` forced off, so
+                // this also keeps the old remote refusal.
+                if (!self.cap_webext_action or self.state != .ready) return;
                 const ev = proto.decode(proto.EvWebextOpenPopup, frame.payload) catch return;
                 const face = self.findFace(ev.view);
                 const ok = if (face) |f| f.openWebextPopup(ev.id) else false;
@@ -1353,7 +1357,7 @@ pub const Client = struct {
             },
             .sem_result => {
                 const result = proto.decode(proto.SemResult, frame.payload) catch return;
-                self.dispatchSemantic(.{ .tag = @enumFromInt(result.kind), .payload = result.payload.s }, result.request);
+                self.dispatchSemantic(proto.semResultUnwrap(result), result.request);
             },
             .sem_snapshot, .sem_act_result, .sem_expand_result, .sem_query_result, .sem_read_result, .sem_read_ids_result, .sem_eval_result => self.dispatchSemantic(frame, 0),
             .intercept_status => {
@@ -1875,9 +1879,7 @@ const TabJson = struct {
 };
 
 fn windowFocused(win: *Window) bool {
-    const app = c.gtk_window_get_application(@ptrCast(win.app_window)) orelse return false;
-    const active = c.gtk_application_get_active_window(app) orelse return false;
-    return @intFromPtr(active) == @intFromPtr(win.app_window);
+    return c.gtk_window_is_active(@ptrCast(win.app_window)) != 0;
 }
 
 /// Post this client's whole tab list. Replace-all by design: the helper
@@ -2475,31 +2477,8 @@ fn freeToastPath(user: ?*anyopaque) callconv(.c) void {
     std.heap.c_allocator.free(std.mem.span(p));
 }
 
-/// Refcounted mmap of a frame memfd. `GBytes` built over it hold a
-/// reference each; the pages stay mapped until the last texture using
-/// them is released.
-const MapRef = struct {
-    ptr: [*]align(std.heap.page_size_min) u8,
-    len: usize,
-    refs: u32,
-    allocator: std.mem.Allocator,
-
-    fn ref(self: *MapRef) *MapRef {
-        self.refs += 1;
-        return self;
-    }
-
-    fn unref(self: *MapRef) void {
-        self.refs -= 1;
-        if (self.refs != 0) return;
-        _ = c.munmap(self.ptr, self.len);
-        self.allocator.destroy(self);
-    }
-
-    fn gbytesDestroy(user: ?*anyopaque) callconv(.c) void {
-        cast.userData(MapRef, user).unref();
-    }
-};
+/// Refcounted mmap of a frame memfd (shared shape; see webframe.zig).
+const MapRef = webframe.Map;
 
 /// One imported dma-buf pool buffer: the pool id and the GdkTexture
 /// wrapping it (owned reference).
@@ -2839,7 +2818,7 @@ pub const WebFace = struct {
     auto_next: u32 = 1,
     /// A timed-out legacy operation's next uncorrelated reply is stale
     /// and must be consumed before the kind is reusable.
-    auto_legacy_quarantine: [7]bool = @splat(false),
+    auto_legacy_quarantine: quarantine.LegacyQuarantine(std.enums.values(AutoKind).len) = .{},
 
     /// Reader mode (src/ui/webreader.zig): the extracted article laid
     /// out as text ON TOP of the live page, which keeps running
@@ -3297,10 +3276,10 @@ pub const WebFace = struct {
 
     fn abandonAutoOps(self: *WebFace, connection_reset: bool) void {
         if (connection_reset) {
-            self.auto_legacy_quarantine = @splat(false);
+            self.auto_legacy_quarantine.reset();
         } else {
             for (self.auto_ops.items) |op| {
-                if (op.request == 0) self.auto_legacy_quarantine[@intFromEnum(op.kind)] = true;
+                if (op.request == 0) self.auto_legacy_quarantine.mark(@intFromEnum(op.kind));
             }
         }
         self.auto_ops.clearRetainingCapacity();
@@ -3312,13 +3291,13 @@ pub const WebFace = struct {
         while (i < self.auto_ops.items.len) {
             if (now - self.auto_ops.items[i].started_ms > AUTO_STALE_MS) {
                 const stale = self.auto_ops.orderedRemove(i);
-                if (stale.request == 0) self.auto_legacy_quarantine[@intFromEnum(stale.kind)] = true;
+                if (stale.request == 0) self.auto_legacy_quarantine.mark(@intFromEnum(stale.kind));
                 continue;
             }
             i += 1;
         }
         if (kind != .network and self.cl.cap_semantic_request_ids) return false;
-        if (self.auto_legacy_quarantine[@intFromEnum(kind)]) return true;
+        if (self.auto_legacy_quarantine.isHeld(@intFromEnum(kind))) return true;
         for (self.auto_ops.items) |op| {
             if (op.kind == kind) return true;
         }
@@ -3351,11 +3330,7 @@ pub const WebFace = struct {
     }
 
     fn acceptsOp(self: *WebFace, kind: AutoKind, request: u32) bool {
-        const ki = @intFromEnum(kind);
-        if (request == 0 and self.auto_legacy_quarantine[ki]) {
-            self.auto_legacy_quarantine[ki] = false;
-            return false;
-        }
+        if (!self.auto_legacy_quarantine.consume(@intFromEnum(kind), request)) return false;
         for (self.auto_ops.items) |op| {
             if (op.kind == kind and op.request == request) return true;
         }
@@ -3418,7 +3393,11 @@ pub const WebFace = struct {
 
     pub fn autoAct(self: *WebFace, id: u32, action: u8, arg: []const u8) ?u32 {
         const token = self.autoBegin(.act, false) orelse return null;
-        if (self.readerGuard(id)) |guard| {
+        // Guard entries only exist while the connection that minted
+        // them lives (resetEpoch clears the store on ready/unavailable),
+        // so store membership already implies the capability; the gate
+        // is the cheap belt against a misbehaving helper.
+        if (if (self.cl.cap_reader_ids) self.readerGuard(id) else null) |guard| {
             self.postSemantic(token, proto.SemActGuarded{
                 .view = self.view,
                 .doc_gen = guard.doc_gen,
@@ -3469,17 +3448,7 @@ pub const WebFace = struct {
     fn onReadIds(self: *WebFace, ev: proto.SemReadIdsResult, request: u32) void {
         if (!self.acceptsOp(.read, request)) return;
         _ = self.reader_guards.apply(self.allocator, request, ev) catch return;
-        const entities = self.allocator.alloc(reader_model.Entity, ev.entities.len) catch return;
-        defer self.allocator.free(entities);
-        for (ev.entities, 0..) |entity, i| {
-            entities[i] = .{ .id = entity.id, .kind = entity.kind, .text = entity.text, .url = entity.url };
-        }
-        const json = reader_model.stringify(self.allocator, .{
-            .doc_gen = ev.doc_gen,
-            .rev = ev.rev,
-            .markdown = ev.markdown.s,
-            .entities = entities,
-        }) catch return;
+        const json = reader_model.stringifyWire(self.allocator, ev) catch return;
         defer self.allocator.free(json);
         self.completeOp(.read, request, true, json, .{ .doc_gen = ev.doc_gen, .rev = ev.rev, .reader_ids = true });
     }
@@ -3502,12 +3471,8 @@ pub const WebFace = struct {
         }
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
-        proto.encodePayload(self.allocator, &payload, value) catch return;
-        self.cl.post(proto.SemRequest{
-            .request = token,
-            .kind = @intFromEnum(@TypeOf(value).tag),
-            .payload = .{ .s = payload.items },
-        });
+        const wrapped = proto.semRequestWrap(self.allocator, &payload, token, value) catch return;
+        self.cl.post(wrapped);
     }
 
     /// Pull recent network-log entries (`intercept_log`), answered
@@ -3893,7 +3858,7 @@ pub const WebFace = struct {
                 if (op.token != self.hints_token) continue;
                 const abandoned = self.auto_ops.orderedRemove(i);
                 if (abandoned.request == 0)
-                    self.auto_legacy_quarantine[@intFromEnum(abandoned.kind)] = true;
+                    self.auto_legacy_quarantine.mark(@intFromEnum(abandoned.kind));
                 break;
             }
         }
@@ -4732,35 +4697,13 @@ pub const WebFace = struct {
     }
 
     fn wireInput(self: *WebFace) void {
-        const motion = c.gtk_event_controller_motion_new();
-        _ = c.g_signal_connect_data(@ptrCast(motion), "motion", @ptrCast(&onMotion), self, null, 0);
-        _ = c.g_signal_connect_data(@ptrCast(motion), "leave", @ptrCast(&onPointerLeave), self, null, 0);
-        c.gtk_widget_add_controller(self.view_area, motion);
-        self.track(motion);
-
-        const click = c.gtk_gesture_click_new();
-        c.gtk_gesture_single_set_button(@ptrCast(click), 0);
-        _ = c.g_signal_connect_data(@ptrCast(click), "pressed", @ptrCast(&onPressed), self, null, 0);
-        _ = c.g_signal_connect_data(@ptrCast(click), "released", @ptrCast(&onReleased), self, null, 0);
-        c.gtk_widget_add_controller(self.view_area, @ptrCast(click));
-        self.track(click);
-
-        const scroll = c.gtk_event_controller_scroll_new(c.GTK_EVENT_CONTROLLER_SCROLL_BOTH_AXES);
-        _ = c.g_signal_connect_data(@ptrCast(scroll), "scroll", @ptrCast(&onScroll), self, null, 0);
-        c.gtk_widget_add_controller(self.view_area, scroll);
-        self.track(scroll);
-
-        const key = c.gtk_event_controller_key_new();
-        _ = c.g_signal_connect_data(@ptrCast(key), "key-pressed", @ptrCast(&onKeyPressed), self, null, 0);
-        _ = c.g_signal_connect_data(@ptrCast(key), "key-released", @ptrCast(&onKeyReleased), self, null, 0);
-        c.gtk_widget_add_controller(self.view_area, key);
-        self.track(key);
-
-        const focus = c.gtk_event_controller_focus_new();
-        _ = c.g_signal_connect_data(@ptrCast(focus), "enter", @ptrCast(&onFocusEnter), self, null, 0);
-        _ = c.g_signal_connect_data(@ptrCast(focus), "leave", @ptrCast(&onFocusLeave), self, null, 0);
-        c.gtk_widget_add_controller(self.view_area, focus);
-        self.track(focus);
+        if (webframe.wireInput(InputSink, self.view_area, self)) |ctrls| {
+            self.track(ctrls.motion);
+            self.track(ctrls.click);
+            self.track(ctrls.scroll);
+            self.track(ctrls.key);
+            self.track(ctrls.focus);
+        }
 
         // File drag & drop -> navigate to the file's URI (a dropped
         // text is treated as an address). Mirrors pane.zig's target.
@@ -5238,16 +5181,7 @@ pub const WebFace = struct {
     /// good frame meanwhile.
     pub fn adoptBuffer(self: *WebFace, fb: proto.FrameBuffer, fd: c_int) void {
         defer _ = c.close(fd);
-        const size: usize = @as(usize, fb.stride) * @as(usize, fb.h);
-        if (size == 0) return;
-        const addr = c.mmap(null, size, c.PROT_READ, c.MAP_SHARED, fd, 0);
-        if (addr == c.MAP_FAILED) return;
-        const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
-        const mref = self.allocator.create(MapRef) catch {
-            _ = c.munmap(bytes, size);
-            return;
-        };
-        mref.* = .{ .ptr = bytes, .len = size, .refs = 1, .allocator = self.allocator };
+        const mref = webframe.mapFrameFd(self.allocator, fd, fb.w, fb.h, fb.stride) orelse return;
         const old_id = self.buf_id;
         self.dropMap();
         self.map = mref;
@@ -5459,14 +5393,7 @@ pub const WebFace = struct {
         const size: usize = @as(usize, stride) * @as(usize, fi.h);
         const need_new = self.map == null or self.buf_w != fi.w or self.buf_h != fi.h;
         if (need_new) {
-            const addr = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
-            if (addr == c.MAP_FAILED) return;
-            const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
-            const mref = self.allocator.create(MapRef) catch {
-                _ = c.munmap(bytes, size);
-                return;
-            };
-            mref.* = .{ .ptr = bytes, .len = size, .refs = 1, .allocator = self.allocator };
+            const mref = webframe.mapAnon(self.allocator, size) orelse return;
             self.dropMap();
             self.map = mref;
             self.buf_w = fi.w;
@@ -5482,32 +5409,7 @@ pub const WebFace = struct {
         var rects_buf: [32]proto.Rect = undefined;
         var n: usize = 0;
         for (fi.rects) |r| {
-            if (r.w == 0 or r.h == 0) continue;
-            // Bounds are the peer's claim; a rect outside the surface is
-            // a desynchronised stream and is dropped, never written.
-            if (@as(u32, r.x) + r.w > fi.w or @as(u32, r.y) + r.h > fi.h) continue;
-            const raw_len: usize = @as(usize, r.w) * @as(usize, r.h) * 4;
-            const row_bytes: usize = @as(usize, r.w) * 4;
-            var decoded: []const u8 = undefined;
-            var scratch: ?[]u8 = null;
-            defer if (scratch) |sc| self.allocator.free(sc);
-            switch (r.enc) {
-                proto.inline_enc_raw => {
-                    if (r.data.len != raw_len) continue;
-                    decoded = r.data;
-                },
-                proto.inline_enc_deflate => {
-                    const sc = self.allocator.alloc(u8, raw_len) catch continue;
-                    scratch = sc;
-                    decoded = zpool.decompress(r.data, sc) catch continue;
-                },
-                else => continue,
-            }
-            var row: usize = 0;
-            while (row < r.h) : (row += 1) {
-                const dst_off = (@as(usize, r.y) + row) * stride + @as(usize, r.x) * 4;
-                @memcpy(m.ptr[dst_off..][0..row_bytes], decoded[row * row_bytes ..][0..row_bytes]);
-            }
+            if (!webframe.decodeInlineRect(self.allocator, m, stride, fi.w, fi.h, r)) continue;
             if (n < rects_buf.len) {
                 rects_buf[n] = .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
                 n += 1;
@@ -5545,21 +5447,10 @@ pub const WebFace = struct {
         const stats = g_stats.enabled();
         const t0 = if (stats) Stats.nowNs() else 0;
 
-        const builder = c.gdk_memory_texture_builder_new() orelse return;
-        defer c.g_object_unref(@ptrCast(builder));
-        const bytes = c.g_bytes_new_with_free_func(m.ptr, m.len, MapRef.gbytesDestroy, m.ref()) orelse {
-            m.unref();
-            return;
-        };
-        defer c.g_bytes_unref(bytes);
-        c.gdk_memory_texture_builder_set_bytes(builder, bytes);
-        c.gdk_memory_texture_builder_set_width(builder, self.buf_w);
-        c.gdk_memory_texture_builder_set_height(builder, self.buf_h);
-        c.gdk_memory_texture_builder_set_stride(builder, self.buf_stride);
-        c.gdk_memory_texture_builder_set_format(builder, c.GDK_MEMORY_B8G8R8A8_PREMULTIPLIED);
         var uploaded: usize = 0;
         var region: ?*c.cairo_region_t = null;
         defer if (region) |r| c.cairo_region_destroy(r);
+        var update_tex: ?*c.GdkTexture = null;
         if (self.tex_prev != null and self.tex_prev_is_shm) {
             region = c.cairo_region_create();
             for (dmg.rects) |r| {
@@ -5572,12 +5463,11 @@ pub const WebFace = struct {
                 _ = c.cairo_region_union_rectangle(region, &cr);
                 uploaded += @as(usize, r.w) * @as(usize, r.h) * 4;
             }
-            c.gdk_memory_texture_builder_set_update_texture(builder, self.tex_prev);
-            c.gdk_memory_texture_builder_set_update_region(builder, region);
+            update_tex = self.tex_prev;
         } else {
             uploaded = m.len;
         }
-        const tex = c.gdk_memory_texture_builder_build(builder) orelse return;
+        const tex = webframe.buildBgraTexture(m, self.buf_w, self.buf_h, self.buf_stride, update_tex, region) orelse return;
         self.presentTexture(tex, logicalOf(self.buf_w, self.sent_scale), logicalOf(self.buf_h, self.sent_scale), true);
 
         // Measurement harness: `SKETERM_WEB_DUMP=<path>` keeps writing
@@ -6258,7 +6148,11 @@ pub const WebFace = struct {
     }
 
     pub fn onWebextActions(self: *WebFace, json: []const u8) void {
-        if (!self.isActivePage()) return;
+        // An empty replace-all is how the helper purges a stale toolbar
+        // on an INACTIVE view (`postActionsForActiveViews`); it only
+        // clears local state, so it must get past the active-page gate.
+        const is_clear = std.mem.eql(u8, std.mem.trim(u8, json, " \t\r\n"), "[]");
+        if (!is_clear and !self.isActivePage()) return;
         if (self.actions) |a| {
             a.refresh(json);
             a.setPresented(self.nativeActionActive());
@@ -6533,7 +6427,7 @@ pub const WebFace = struct {
                 if (op.token != token) continue;
                 const abandoned = self.auto_ops.orderedRemove(i);
                 if (abandoned.request == 0)
-                    self.auto_legacy_quarantine[@intFromEnum(abandoned.kind)] = true;
+                    self.auto_legacy_quarantine.mark(@intFromEnum(abandoned.kind));
                 break;
             }
         }
@@ -8261,113 +8155,96 @@ pub const WebFace = struct {
         self.promote();
     }
 
-    fn onMotion(ctrl: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(WebFace, user);
-        self.sendPointer(.move, x, y, 0, 0, modsOf(@ptrCast(ctrl)));
-    }
-
-    fn onPointerLeave(ctrl: *c.GtkEventControllerMotion, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(WebFace, user);
-        self.sendPointer(.leave, 0, 0, 0, 0, modsOf(@ptrCast(ctrl)));
-    }
-
-    fn onPressed(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(WebFace, user);
-        // A real click while labels are up means the user went back to
-        // the mouse; the click itself still reaches the page.
-        if (self.hints_active) self.cancelHints();
-        _ = c.gtk_widget_grab_focus(self.view_area);
-        const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
-        self.sendPointer(.down, x, y, cefButton(btn), @intCast(@max(1, n_press)), modsOf(@ptrCast(gesture)));
-    }
-
-    fn onReleased(gesture: *c.GtkGestureClick, n_press: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(WebFace, user);
-        const btn = c.gtk_gesture_single_get_current_button(@ptrCast(gesture));
-        self.sendPointer(.up, x, y, cefButton(btn), @intCast(@max(1, n_press)), modsOf(@ptrCast(gesture)));
-    }
-
-    fn onScroll(ctrl: *c.GtkEventControllerScroll, dx: f64, dy: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self = cast.userData(WebFace, user);
-        // Scrolling moves every hint rect; stale labels would lie.
-        if (self.hints_active) self.cancelHints();
-        if (!self.view_live) return 0;
-        // Ctrl+wheel is zoom, not scroll — the page never sees it.
-        if (modsOf(@ptrCast(ctrl)) & proto.mod_ctrl != 0) {
-            if (dy < 0) {
-                self.zoomStep(1);
-            } else if (dy > 0) {
-                self.zoomStep(-1);
+    /// `webframe.wireInput` sink. The GDK-to-protocol translation is
+    /// shared with the extension popup; what stays here is this face's
+    /// policy on top of it — hints mode, Ctrl+wheel zoom, window-level
+    /// chords and pacing promotion.
+    const InputSink = struct {
+        pub fn pointer(
+            user: ?*anyopaque,
+            kind: proto.PointerKind,
+            x: f64,
+            y: f64,
+            button: u8,
+            clicks: u8,
+            mods: u32,
+        ) void {
+            const self = cast.userData(WebFace, user);
+            if (kind == .down) {
+                // A real click while labels are up means the user went
+                // back to the mouse; the click itself still reaches the
+                // page.
+                if (self.hints_active) self.cancelHints();
+                _ = c.gtk_widget_grab_focus(self.view_area);
             }
+            self.sendPointer(kind, x, y, button, clicks, mods);
+        }
+
+        pub fn scroll(user: ?*anyopaque, dx: f64, dy: f64, mods: u32) c.gboolean {
+            const self = cast.userData(WebFace, user);
+            // Scrolling moves every hint rect; stale labels would lie.
+            if (self.hints_active) self.cancelHints();
+            if (!self.view_live) return 0;
+            // Ctrl+wheel is zoom, not scroll — the page never sees it.
+            if (mods & proto.mod_ctrl != 0) {
+                if (dy < 0) {
+                    self.zoomStep(1);
+                } else if (dy > 0) {
+                    self.zoomStep(-1);
+                }
+                return 1;
+            }
+            self.cl.post(proto.InputScroll{
+                .view = self.view,
+                .x = self.last_x,
+                .y = self.last_y,
+                .dx = webframe.wheelDelta(dx),
+                .dy = webframe.wheelDelta(dy),
+                .mods = mods,
+            });
+            self.promote();
             return 1;
         }
-        // GTK reports wheel notches (1.0 per click); Chromium's unit is
-        // 120 per notch.
-        self.cl.post(proto.InputScroll{
-            .view = self.view,
-            .x = self.last_x,
-            .y = self.last_y,
-            .dx = @intFromFloat(@round(dx * 120.0)),
-            .dy = @intFromFloat(@round(dy * 120.0)),
-            .mods = modsOf(@ptrCast(ctrl)),
-        });
-        self.promote();
-        return 1;
-    }
 
-    /// Window-level chords win over the page (editor-face template):
-    /// a browser that swallows every keystroke also swallows
-    /// Ctrl+Shift+W and Alt+1..9, which is how a pane becomes a trap.
-    fn onKeyPressed(
-        ctrl: *c.GtkEventControllerKey,
-        keyval: c.guint,
-        keycode: c.guint,
-        state: c.GdkModifierType,
-        user: ?*anyopaque,
-    ) callconv(.c) c.gboolean {
-        _ = ctrl;
-        const self = cast.userData(WebFace, user);
-        // Hints mode owns the keyboard outright: labels are picked by
-        // typing, and neither the page nor the chord table may see a
-        // key until Escape or an activation ends the mode.
-        if (self.hints_active) return self.hintsKey(keyval, state);
-        if (self.pane) |pane| {
-            if (pane.input_ctx) |ictx| {
-                if (input.fallbackToPaneBindings(ictx, keyval, state)) |handled| return handled;
+        /// Window-level chords win over the page (editor-face template):
+        /// a browser that swallows every keystroke also swallows
+        /// Ctrl+Shift+W and Alt+1..9, which is how a pane becomes a trap.
+        pub fn key(
+            user: ?*anyopaque,
+            kind: proto.KeyKind,
+            keyval: c.guint,
+            keycode: c.guint,
+            state: c.GdkModifierType,
+        ) c.gboolean {
+            const self = cast.userData(WebFace, user);
+            if (kind != .down) {
+                // The matching key-down was swallowed by hints mode;
+                // releasing it into the page would be an unpaired
+                // key-up.
+                if (self.hints_active) return 0;
+                return self.sendKey(.up, keyval, keycode, state);
             }
+            // Hints mode owns the keyboard outright: labels are picked
+            // by typing, and neither the page nor the chord table may
+            // see a key until Escape or an activation ends the mode.
+            if (self.hints_active) return self.hintsKey(keyval, state);
+            if (self.pane) |pane| {
+                if (pane.input_ctx) |ictx| {
+                    if (input.fallbackToPaneBindings(ictx, keyval, state)) |handled| return handled;
+                }
+            }
+            if (self.faceChord(keyval, state)) return 1;
+            return self.sendKey(.down, keyval, keycode, state);
         }
-        if (self.faceChord(keyval, state)) return 1;
-        return self.sendKey(.down, keyval, keycode, state);
-    }
 
-    fn onKeyReleased(
-        ctrl: *c.GtkEventControllerKey,
-        keyval: c.guint,
-        keycode: c.guint,
-        state: c.GdkModifierType,
-        user: ?*anyopaque,
-    ) callconv(.c) void {
-        _ = ctrl;
-        const self = cast.userData(WebFace, user);
-        // The matching key-down was swallowed by hints mode; releasing
-        // it into the page would be an unpaired key-up.
-        if (self.hints_active) return;
-        _ = self.sendKey(.up, keyval, keycode, state);
-    }
-
-    fn onFocusEnter(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(WebFace, user);
-        tabsChanged();
-        if (!self.view_live) return;
-        self.cl.post(proto.InputFocus{ .view = self.view, .focused = 1 });
-        self.promote();
-    }
-
-    fn onFocusLeave(_: *c.GtkEventControllerFocus, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(WebFace, user);
-        if (!self.view_live) return;
-        self.cl.post(proto.InputFocus{ .view = self.view, .focused = 0 });
-    }
+        pub fn focus(user: ?*anyopaque, focused: bool) void {
+            const self = cast.userData(WebFace, user);
+            if (focused) tabsChanged();
+            if (!self.view_live) return;
+            self.cl.post(proto.InputFocus{ .view = self.view, .focused = @intFromBool(focused) });
+            if (focused) self.promote();
+        }
+    };
 
     fn sendPointer(self: *WebFace, kind: proto.PointerKind, x: f64, y: f64, button: u8, clicks: u8, mods: u32) void {
         if (!self.view_live) return;
@@ -8403,14 +8280,7 @@ pub const WebFace = struct {
         const mods = modsFromState(state);
         // GDK keyvals ARE XKB keysyms; the helper maps them itself.
         var text_buf: [8]u8 = undefined;
-        var text: []const u8 = &.{};
-        if (kind == .down and mods & (proto.mod_ctrl | proto.mod_alt) == 0) {
-            const cp = c.gdk_keyval_to_unicode(keyval);
-            if (cp >= 0x20 and cp != 0x7f) {
-                const n = std.unicode.utf8Encode(@intCast(cp), &text_buf) catch 0;
-                text = text_buf[0..n];
-            }
-        }
+        const text = webframe.keyText(&text_buf, kind, keyval, mods);
         self.cl.post(proto.InputKey{
             .view = self.view,
             .kind = @intFromEnum(kind),
@@ -8454,30 +8324,7 @@ fn refreshFps(frame_clock: *c.GdkFrameClock, fallback: u16) u16 {
     return @intCast(std.math.clamp(fps, 1, @as(i64, pace.max_cap_fps)));
 }
 
-/// GDK button number (1 left, 2 middle, 3 right) to the protocol's
-/// CEF-shaped byte.
-fn cefButton(btn: c.guint) u8 {
-    return switch (btn) {
-        2 => 1,
-        3 => 2,
-        else => 0,
-    };
-}
-
-fn modsOf(ctrl: *c.GtkEventController) u32 {
-    return modsFromState(c.gtk_event_controller_get_current_event_state(ctrl));
-}
-
-fn modsFromState(state: c.GdkModifierType) u32 {
-    var mods: u32 = 0;
-    const s: c_int = @intCast(state);
-    if (s & c.GDK_SHIFT_MASK != 0) mods |= proto.mod_shift;
-    if (s & c.GDK_CONTROL_MASK != 0) mods |= proto.mod_ctrl;
-    if (s & c.GDK_ALT_MASK != 0) mods |= proto.mod_alt;
-    if (s & c.GDK_SUPER_MASK != 0) mods |= proto.mod_super;
-    if (s & c.GDK_LOCK_MASK != 0) mods |= proto.mod_capslock;
-    return mods;
-}
+const modsFromState = webframe.modsFromState;
 
 /// What the address bar means: an explicit scheme wins, a token with a
 /// dot and no space is a host, anything else is a web search on the
