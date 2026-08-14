@@ -26,6 +26,9 @@ pub const Ctx = struct {
     /// Swap the pane's editor and terminal faces. @return false when
     /// the pane has no editor face, so the key falls through.
     editor_toggle: ?*const fn (ctx: ?*anyopaque) bool = null,
+    /// Swap the pane's web and terminal faces. @return false when the
+    /// pane has no web face, so the key falls through.
+    web_toggle: ?*const fn (ctx: ?*anyopaque) bool = null,
     /// Start link hints on the pane's VISIBLE web face. @return false
     /// when the pane shows no web page, so `hints_open` falls through
     /// to the terminal quick-select. Installed by WebFace.attach; the
@@ -367,6 +370,7 @@ pub fn actionName(a: Action) []const u8 {
         .new_editor_tab => "new_editor_tab",
         .new_editor_split => "new_editor_split",
         .toggle_editor_face => "toggle_editor_face",
+        .toggle_web_face => "toggle_web_face",
         .panel_open => "panel_open",
         .panel_close => "panel_close",
         .mux_detach => "mux_detach",
@@ -472,6 +476,7 @@ pub fn actionLabel(a: Action) []const u8 {
         .new_editor_tab => "New text editor tab",
         .new_editor_split => "Split into a text editor pane",
         .toggle_editor_face => "Show the text editor / show the shell (this pane)",
+        .toggle_web_face => "Show the web browser / show the shell (this pane)",
         .panel_open => "Open a saved panel (this session's stored documents)…",
         .panel_close => "Close the panel on this pane, its tab, or the window's only one",
         .mux_detach => "Detach mux session (pane drops to a local shell)",
@@ -808,6 +813,10 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
         },
         .toggle_editor_face => {
             const flip = ctx.editor_toggle orelse return 0;
+            return if (flip(ctx.pane_ctx)) 1 else 0;
+        },
+        .toggle_web_face => {
+            const flip = ctx.web_toggle orelse return 0;
             return if (flip(ctx.pane_ctx)) 1 else 0;
         },
         // One hints chord, face decides: a pane wearing the web face

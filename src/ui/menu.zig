@@ -65,6 +65,10 @@ pub const Action = enum {
     launch_remote_app,
     open_link,
     copy_link,
+    /// Bring back a pane's HIDDEN web face ("Show this pane's shell"
+    /// swapped it away, and every affordance to return with it lives
+    /// on the browser toolbar that is now invisible).
+    show_web_face,
     prefs_open,
 };
 
@@ -105,6 +109,11 @@ const Bind = struct {
     /// the session records), 2 = "stop" row (shown only while it
     /// does). The pre-popup hook drives the actions' enabled state.
     rec_row: u8 = 0,
+    /// Row only makes sense while the pane carries a HIDDEN web face
+    /// (the only state with no other way back to the browser). Hidden
+    /// (with its trailing separator) when the pre-popup hook leaves
+    /// "show-web" disabled.
+    web_only: bool = false,
 };
 
 const Submenu = struct {
@@ -128,6 +137,8 @@ const Item = union(enum) {
 /// Top-level menu layout. Submenu children open in a nested popover
 /// on hover (and on click), classic-menu style.
 const MENU = [_]Item{
+    .{ .bind = .{ .name = "show-web", .label = "Return to Browser", .detailed = "term.show-web", .icon = "web-browser-symbolic", .action = .show_web_face, .web_only = true } },
+    .separator,
     .{ .bind = .{ .name = "open-link", .label = "Open Link", .detailed = "term.open-link", .icon = "web-browser-symbolic", .action = .open_link, .link_only = true } },
     .{ .bind = .{ .name = "copy-link", .label = "Copy Link", .detailed = "term.copy-link", .icon = "insert-link-symbolic", .action = .copy_link, .link_only = true } },
     .separator,
@@ -160,7 +171,7 @@ const MENU = [_]Item{
     } } },
     .{ .submenu = .{ .label = "Shader", .icon = "sketerm-rendering-symbolic", .items = &.{
         .{ .name = "shader-pick", .label = "Pane Shader…", .detailed = "term.shader-pick", .icon = "sketerm-rendering-symbolic", .action = .shader_pick },
-        .{ .name = "shader-preset", .label = "Shader Preset…", .detailed = "term.shader-preset", .icon = "starred-symbolic", .action = .shader_preset },
+        .{ .name = "shader-preset", .label = "Shader Preset…", .detailed = "term.shader-preset", .icon = "sketerm-starred-symbolic", .action = .shader_preset },
         .{ .name = "shader-config", .label = "Configure Shader…", .detailed = "term.shader-config", .icon = "preferences-other-symbolic", .action = .shader_config },
         .{ .name = "shader-clear", .label = "Clear Pane Shader", .detailed = "term.shader-clear", .icon = "edit-clear-symbolic", .action = .shader_clear },
     } } },
@@ -247,6 +258,16 @@ const N_LINK_WIDGETS = blk: {
     break :blk n + 1;
 };
 
+/// Web-only conditional widgets: the "Return to Browser" row plus
+/// the separator that trails it.
+const N_WEB_WIDGETS = blk: {
+    var n: usize = 0;
+    for (MENU) |it| {
+        if (it == .bind and it.bind.web_only) n += 1;
+    }
+    break :blk n + 1;
+};
+
 /// Host-only conditional widgets: submenu child rows that only apply
 /// to a session on a remote machine (upload / download).
 const N_HOST_WIDGETS = blk: {
@@ -312,6 +333,9 @@ const ClickCtx = struct {
     /// Link rows + their trailing separator; shown only when the
     /// pre-popup hook found a link under the click.
     link_widgets: [N_LINK_WIDGETS]?*c.GtkWidget = @splat(null),
+    /// "Return to Browser" + its trailing separator; shown only while
+    /// the pane carries a hidden web face.
+    web_widgets: [N_WEB_WIDGETS]?*c.GtkWidget = @splat(null),
     /// Submenu child rows (upload / download) shown only when the
     /// pre-popup hook found a remote-host session.
     host_widgets: [N_HOST_WIDGETS]?*c.GtkWidget = @splat(null),
@@ -399,7 +423,9 @@ pub fn attachWithPrePopup(
     var n_remote: usize = 0;
     var n_link: usize = 0;
     var n_host: usize = 0;
+    var n_web: usize = 0;
     var prev_was_link = false;
+    var prev_was_web = false;
     var prev_sep: ?*c.GtkWidget = null;
     for (MENU) |item| {
         switch (item) {
@@ -411,7 +437,12 @@ pub fn attachWithPrePopup(
                     cctx.link_widgets[n_link] = sep;
                     n_link += 1;
                 }
+                if (prev_was_web) {
+                    cctx.web_widgets[n_web] = sep;
+                    n_web += 1;
+                }
                 prev_was_link = false;
+                prev_was_web = false;
                 prev_sep = sep;
             },
             .bind => |b| {
@@ -423,8 +454,13 @@ pub fn attachWithPrePopup(
                     cctx.link_widgets[n_link] = btn;
                     n_link += 1;
                 }
+                if (b.web_only) {
+                    cctx.web_widgets[n_web] = btn;
+                    n_web += 1;
+                }
                 try addHover(allocator, btn, cctx, null);
                 prev_was_link = b.link_only;
+                prev_was_web = b.web_only;
             },
             .submenu => |s| {
                 const btn = makeRow(s.icon, s.label, true);
@@ -464,6 +500,7 @@ pub fn attachWithPrePopup(
                 }
                 try addHover(allocator, btn, cctx, sub_pop);
                 prev_was_link = false;
+                prev_was_web = false;
             },
         }
         if (item != .separator) prev_sep = null;
@@ -571,16 +608,19 @@ test "menu: conditional-row buckets are sized for the rows that use them" {
     // visible on a session it cannot act on.
     var link: usize = 0;
     var host: usize = 0;
+    var web: usize = 0;
     var rec_start: usize = 0;
     var rec_stop: usize = 0;
     for (BINDS) |b| {
         if (b.link_only) link += 1;
         if (b.host_only) host += 1;
+        if (b.web_only) web += 1;
         if (b.rec_row == 1) rec_start += 1;
         if (b.rec_row == 2) rec_stop += 1;
     }
     // Link bucket also holds the separator trailing the link rows.
     try std.testing.expectEqual(link + 1, N_LINK_WIDGETS);
+    try std.testing.expectEqual(web + 1, N_WEB_WIDGETS);
     try std.testing.expectEqual(host, N_HOST_WIDGETS);
     try std.testing.expectEqual(@as(usize, 1), rec_start);
     try std.testing.expectEqual(@as(usize, 1), rec_stop);
@@ -766,6 +806,7 @@ fn showAtPrepared(ctx: *ClickCtx, x: f64, y: f64) bool {
     //   - File-transfer rows (upload/download) → a remote-host session.
     setGroupVisible(ctx.group, "mux-detach", &ctx.remote_widgets);
     setGroupVisible(ctx.group, "copy-link", &ctx.link_widgets);
+    setGroupVisible(ctx.group, "show-web", &ctx.web_widgets);
     setGroupVisible(ctx.group, "upload-file", &ctx.host_widgets);
     setGroupVisible(ctx.group, "record-session", &ctx.rec_start_widgets);
     setGroupVisible(ctx.group, "record-stop", &ctx.rec_stop_widgets);

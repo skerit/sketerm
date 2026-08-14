@@ -178,6 +178,11 @@ pub const Action = enum {
     /// Flip the focused pane between its editor face and its
     /// terminal face. Dispatched locally like toggle_browser_face.
     toggle_editor_face,
+    /// Flip the focused pane between its WEB face and its terminal
+    /// face — the way back after "Show this pane's shell". Dispatched
+    /// locally like toggle_browser_face; a pane without a web face
+    /// leaves the key to the terminal.
+    toggle_web_face,
     /// Open the saved-panel picker: every declarative panel document
     /// stored for the focused pane's session, opened in a tab of its
     /// own (src/ui/panelpicker.zig). The user's own way back to a

@@ -180,7 +180,7 @@ pub const curated = [_]Row{
        .desc = "What this site is, what it was allowed to do, and what it has stored — with the way to undo each.", .action = .web_site_info },
     .{ .icon = "document-open-recent-symbolic", .title = "History (Web)",
        .desc = "Search the pages this daemon remembers visiting; open, or forget, any of them.", .action = .web_history },
-    .{ .icon = "starred-symbolic", .title = "Bookmarks (Web)",
+    .{ .icon = "sketerm-starred-symbolic", .title = "Bookmarks (Web)",
        .desc = "Open, rename, re-folder and reorder bookmarks; the web toolbar's star adds them.", .action = .web_bookmarks },
     .{ .icon = "window-close-symbolic", .title = "Close Pane",
        .desc = "Close the focused pane and give its space back (un-split).", .action = .close_pane },
@@ -192,6 +192,8 @@ pub const curated = [_]Row{
        .desc = "Add a text editor pane beside this one; the pane's shell stays one click away.", .action = .new_editor_split },
     .{ .icon = "document-edit-symbolic", .title = "Show Editor / Show Shell",
        .desc = "Swap this pane between its text editor and its shell. Both stay alive; neither is closed.", .action = .toggle_editor_face },
+    .{ .icon = "web-browser-symbolic", .title = "Show Browser / Show Shell",
+       .desc = "Swap this pane between its web browser and its shell. Both stay alive; neither is closed.", .action = .toggle_web_face },
     .{ .icon = "view-paged-symbolic", .title = "Open Saved Panel…",
        .desc = "Reopen a declarative UI panel saved for this pane's session. Broken documents are listed with the reason; each row can be deleted.", .action = .panel_open },
     .{ .icon = "window-close-symbolic", .title = "Close Panel",
@@ -210,7 +212,7 @@ pub const curated = [_]Row{
        .desc = "Write the current tabs and panes to last.json.", .action = .save_layout },
     .{ .icon = "document-save-as-symbolic", .title = "Save Layout As…",
        .desc = "Pick a path and save the current layout there.", .action = .save_layout_as },
-    .{ .icon = "starred-symbolic", .title = "Save Default Layout",
+    .{ .icon = "sketerm-starred-symbolic", .title = "Save Default Layout",
        .desc = "Save current tabs and panes as the default for every new launch.", .action = .save_default_layout },
     .{ .icon = "document-open-symbolic", .title = "Load Layout…",
        .desc = "Pick a saved layout file and open its tabs in a new window.", .action = .load_layout },
@@ -224,7 +226,7 @@ pub const curated = [_]Row{
        .desc = "Re-style the focused pane with a profile's font/colors/scrollback.", .action = .apply_profile },
 
     // Shaders
-    .{ .icon = "starred-symbolic", .title = "Shader Preset…",
+    .{ .icon = "sketerm-starred-symbolic", .title = "Shader Preset…",
        .desc = "Apply or delete a saved shader preset on the focused pane.", .action = .shader_preset_pick },
 
     // Misc

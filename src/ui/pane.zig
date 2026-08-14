@@ -460,6 +460,7 @@ pub const Pane = struct {
             ictx.autohide_set = setCursorHiddenSink;
             ictx.browser_toggle = toggleBrowserFaceSink;
             ictx.editor_toggle = toggleEditorFaceSink;
+            ictx.web_toggle = toggleWebFaceSink;
             ictx.context_menu = contextMenuAtCursorSink;
         }
 
@@ -586,6 +587,10 @@ pub const Pane = struct {
                 launchUri(uri);
                 return true;
             },
+            .show_web_face => {
+                if (self.hasWebFace()) self.setWebVisible(true);
+                return true;
+            },
             // These three already exist as keybind actions. Delegating
             // keeps ONE implementation each: a menu row and its chord
             // can never drift apart.
@@ -667,6 +672,15 @@ pub const Pane = struct {
     fn toggleEditorFaceSink(ctx: ?*anyopaque) bool {
         const self = cast.userData(Pane, ctx);
         return self.toggleEditorFace();
+    }
+
+    /// Wired into input.zig's web_toggle: the `toggle_web_face`
+    /// action, dispatched without input.zig importing pane.zig.
+    fn toggleWebFaceSink(ctx: ?*anyopaque) bool {
+        const self = cast.userData(Pane, ctx);
+        if (!self.hasWebFace()) return false;
+        self.setWebVisible(!self.webFaceVisible());
+        return true;
     }
 
     /// Push the current selection to PRIMARY (always, for middle-
@@ -1163,6 +1177,13 @@ pub const Pane = struct {
     pub fn setWebVisible(self: *Pane, show: bool) void {
         const ww = self.web_widget orelse return;
         c.gtk_widget_set_visible(ww, if (show) @as(c_int, 1) else 0);
+        // The tab sidebar lists this pane's browser PAGES only while
+        // the web face is visible; flipping the face flips what the
+        // sidebar should be showing.
+        if (c.gtk_widget_get_root(ww)) |root| {
+            if (@import("remotectl.zig").windowFromGtk(@ptrCast(@alignCast(root)))) |win|
+                win.sidebarRefresh();
+        }
         // Face title follows the raised face; the focus callback
         // re-asserts the web face's page title.
         self.clearFaceTitle();
@@ -2164,6 +2185,14 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
     }
     if (c.g_action_map_lookup_action(@ptrCast(group), "record-stop")) |act| {
         c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(self.terminal.recording));
+    }
+
+    // "Return to Browser": only while the pane carries a web face the
+    // user has swapped away — the browser toolbar with every other way
+    // back is invisible in exactly that state.
+    if (c.g_action_map_lookup_action(@ptrCast(group), "show-web")) |act| {
+        const hidden_web = self.hasWebFace() and !self.webFaceVisible();
+        c.g_simple_action_set_enabled(@ptrCast(@alignCast(act)), @intFromBool(hidden_web));
     }
 
     // Free any URI captured from a previous popup.
