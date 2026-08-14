@@ -47,6 +47,8 @@ const semantic = @import("semantic.zig");
 const semnav = @import("semnav.zig");
 const filter = @import("filter.zig");
 const filtersub = @import("filtersub.zig");
+const pathz = @import("../util/pathz.zig");
+const atomicwrite = @import("../util/atomicwrite.zig");
 const userscript = @import("userscript.zig");
 const webexthost = @import("webext/host.zig");
 const extmatch = @import("webext/match.zig");
@@ -110,17 +112,9 @@ var sem_secret: Secret = .{};
 fn mintSecret() void {
     var raw: [32]u8 = undefined;
     if (c.getentropy(&raw, raw.len) != 0) return;
-    hexInto(raw[0..16], &sem_secret.nonce);
-    hexInto(raw[16..32], &sem_secret.slot);
+    sem_secret.nonce = std.fmt.bytesToHex(raw[0..16].*, .lower);
+    sem_secret.slot = std.fmt.bytesToHex(raw[16..32].*, .lower);
     sem_secret.ok = true;
-}
-
-fn hexInto(raw: []const u8, out: []u8) void {
-    const digits = "0123456789abcdef";
-    for (raw, 0..) |b, i| {
-        out[i * 2] = digits[b >> 4];
-        out[i * 2 + 1] = digits[b & 0xf];
-    }
 }
 
 /// Length-checked compare that does not stop at the first difference.
@@ -715,6 +709,12 @@ const Pending = struct {
 };
 
 const semantic_request_timeout_ms: i64 = 120_000;
+/// How long a routed runtime/tabs.sendMessage may wait for `ext-reply`
+/// before the sender's Promise is settled with an error. Same expiry
+/// tick as the semantic Pending deadlines (`semanticPump`); shorter,
+/// because the common failure is a background page whose bootstrap has
+/// not run yet, and the sender retries.
+const route_reply_timeout_ms: i64 = 30_000;
 const stale_reader_msg = "stale reader id: the page changed since web_read; read the page again";
 
 fn semanticResult(comptime T: type) bool {
@@ -798,15 +798,13 @@ pub const Host = struct {
     /// Cross-frame runtime.sendMessage routing: a content script's
     /// message gets a process-global id here so the background's reply
     /// can find its way home. Bounded — the oldest is dropped.
-    webext_routes: std.ArrayList(MsgRoute) = .empty,
+    webext_replies: std.ArrayList(PendingReply) = .empty,
     webext_next_gid: u32 = 1,
     webext_ports: std.ArrayList(Port) = .empty,
     webext_next_port: u32 = 1,
     /// Extension ids awaiting a `runtime.reload`, performed on the next
     /// poll turn rather than inside the call that asked for it.
     webext_reload: std.ArrayList([]u8) = .empty,
-    webext_popup_waits: std.ArrayList(PopupWait) = .empty,
-    webext_next_popup_req: u32 = 1,
     /// Root cache directory (the `--cache-dir`), under which a persistent
     /// context's own cache dir is minted. Set by the server before `run`.
     profile_dir: []const u8 = "",
@@ -821,6 +819,10 @@ pub const Host = struct {
     us_scripts: std.ArrayList(ScriptRec) = .empty,
     us_style_arena: ?std.heap.ArenaAllocator = null,
     us_styles: std.ArrayList(StyleRec) = .empty,
+
+    /// Client-loaded extra filter-list paths (owned), remembered so a
+    /// subscription reconcile's reload cannot silently drop them.
+    intercept_extra: std.ArrayList([]const u8) = .empty,
 
     /// Host-owned subscription state and URLRequests. CEF owns a
     /// separate transferred client reference for each live request.
@@ -849,22 +851,49 @@ pub const Host = struct {
         host: []const u8,
         css: []const u8,
     };
-    /// One in-flight `runtime.sendMessage` from a content frame awaiting
-    /// its background's reply.
-    const MsgRoute = struct {
+    /// One extension-API Promise parked on somebody else's answer.
+    ///
+    /// The two kinds are the same problem with different recipients — a
+    /// `runtime`/`tabs.sendMessage` waiting for another FRAME's
+    /// `ext-reply`, and a `browserAction.openPopup` waiting for the
+    /// GUI's `webext_open_popup_result` — so they share one table, one
+    /// abandon sweep and one expiry pass. They were separate once, and
+    /// the copy without the deadline could park a Promise forever when
+    /// the correlated reply simply never arrived.
+    const PendingReply = struct {
+        kind: Kind,
+        /// Correlation id minted here: the `gid` in the `ext-message`
+        /// command, or the `req` on the `webext_open_popup` frame.
         gid: u32,
+        /// The view whose JS is waiting, and the request id it waits on.
         origin_view: u32,
         origin_req: u32,
+        /// The view expected to produce the answer.
         reply_view: u32,
         ext: []u8,
-    };
+        deadline_ms: i64,
 
-    const PopupWait = struct {
-        req: u32,
-        caller_req: u32,
-        caller_view: u32,
-        target_view: u32,
-        ext: []u8,
+        const Kind = enum {
+            message,
+            popup,
+
+            /// What the waiting Promise is rejected with when its
+            /// recipient goes away.
+            fn gone(self: Kind) []const u8 {
+                return switch (self) {
+                    .message => "message recipient is gone",
+                    .popup => "popup target is gone",
+                };
+            }
+
+            /// ... and when it simply never answers.
+            fn expired(self: Kind) []const u8 {
+                return switch (self) {
+                    .message => "message recipient did not reply",
+                    .popup => "native popup was never acknowledged",
+                };
+            }
+        };
     };
 
     /// One `runtime.connect` Port, from the browser process's point of
@@ -955,14 +984,12 @@ pub const Host = struct {
         self.destroyAll();
         self.views.deinit(self.gpa);
         self.webext.deinit();
-        for (self.webext_routes.items) |r| self.gpa.free(r.ext);
-        self.webext_routes.deinit(self.gpa);
+        for (self.webext_replies.items) |r| self.gpa.free(r.ext);
+        self.webext_replies.deinit(self.gpa);
         for (self.webext_ports.items) |p| self.gpa.free(p.ext);
         self.webext_ports.deinit(self.gpa);
         for (self.webext_reload.items) |p| self.gpa.free(p);
         self.webext_reload.deinit(self.gpa);
-        for (self.webext_popup_waits.items) |p| self.gpa.free(p.ext);
-        self.webext_popup_waits.deinit(self.gpa);
         extorigins.clear();
         for (self.prints.items) |p| self.gpa.free(p.path);
         self.prints.deinit(self.gpa);
@@ -977,6 +1004,8 @@ pub const Host = struct {
         self.us_styles.deinit(self.gpa);
         if (self.us_style_arena) |*a| a.deinit();
         filterSubAbandon(self);
+        for (self.intercept_extra.items) |p| self.gpa.free(p);
+        self.intercept_extra.deinit(self.gpa);
         for (self.filter_sub_urls.items) |u| self.gpa.free(u);
         self.filter_sub_urls.deinit(self.gpa);
         self.filter_fetches.deinit(self.gpa);
@@ -1162,16 +1191,21 @@ pub const Host = struct {
         };
     }
 
-    pub fn destroyView(self: *Host, id: u32) void {
-        // An enumerated exit for the held-request table: whether this is
-        // a page whose requests are held or a background page that was
-        // going to answer them, nothing can answer once it is gone.
+    /// Enumerated exits for everything that could wait on `id` forever.
+    ///
+    /// Held webRequests (a page whose requests are held, or a background
+    /// page that was going to answer them), runtime.connect Ports (the
+    /// surviving peer must get onDisconnect), routed sendMessage slots
+    /// and openPopup waits all resolve here; EVERY path that removes a
+    /// view from the table must run these sweeps.
+    fn abandonViewWaiters(self: *Host, id: u32) void {
         wreqAbandonView(id);
-        // The same rule for Ports: a peer that is gone must produce an
-        // onDisconnect, never a Port that stays open forever.
         self.portsAbandonView(id);
-        self.routesAbandonView(id);
-        self.popupWaitsAbandonView(id);
+        self.repliesAbandonView(id);
+    }
+
+    pub fn destroyView(self: *Host, id: u32) void {
+        self.abandonViewWaiters(id);
         // A page owns every browser-action popup it opened. Close those
         // first so no floating extension page survives its toolbar.
         while (self.popupForOwner(id)) |popup| self.destroyView(popup.id);
@@ -1208,6 +1242,7 @@ pub const Host = struct {
     fn popupClosedByEngine(self: *Host, id: u32) void {
         for (self.views.items, 0..) |v, i| {
             if (v.id != id or !v.webext_popup) continue;
+            self.abandonViewWaiters(id);
             _ = self.views.swapRemove(i);
             self.post(proto.EvWebextPopup{
                 .owner_view = v.popup_owner,
@@ -1701,9 +1736,9 @@ pub const Host = struct {
     /// Tear down a view's browser and everything that belonged to its
     /// document, leaving the record itself untouched. Shared by
     /// `freeViewOpts` (which then frees the record) and `discardView`
-    /// (which keeps it). `close` is false exactly once — an inspector
-    /// CEF insisted on giving its own OS window, where closing would
-    /// take the user's DevTools away rather than clean up after it.
+    /// (which keeps it). `close` is false only when the engine already
+    /// closed the browser itself (`popupClosedByEngine`), where asking
+    /// it to close again would re-enter a teardown in progress.
     fn dropBrowser(self: *Host, v: *View, close: bool) void {
         // Held requests belong to a browser that is going away:
         // answering them now is what stops the engine waiting on a
@@ -1759,7 +1794,7 @@ pub const Host = struct {
     }
 
     /// `close`: whether the browser goes down with the view — false
-    /// exactly once, for the windowed inspector (see `dropBrowser`).
+    /// only when the engine closed it already (see `dropBrowser`).
     fn freeViewOpts(self: *Host, v: *View, close: bool) void {
         // Frees the browser, the mapping, every pending request's arg
         // and the shadow tree; what is left is the record's own memory.
@@ -2010,9 +2045,28 @@ pub const Host = struct {
     }
 
     /// Reload the filter set from the seed list, the config filters
-    /// dir, and any extra paths named. No network fetching.
+    /// dir, and any extra paths named. The paths are REMEMBERED (this
+    /// frame is replace-all) so a later subscription reconcile's
+    /// reload cannot silently drop them. No network fetching.
     pub fn interceptLists(self: *Host, req: proto.InterceptLists) void {
-        _ = interceptReload(self.gpa, req.paths);
+        var next: std.ArrayList([]const u8) = .empty;
+        var adopted = false;
+        defer if (!adopted) {
+            for (next.items) |p| self.gpa.free(p);
+            next.deinit(self.gpa);
+        };
+        for (req.paths) |p| {
+            const dup = self.gpa.dupe(u8, p) catch return;
+            next.append(self.gpa, dup) catch {
+                self.gpa.free(dup);
+                return;
+            };
+        }
+        for (self.intercept_extra.items) |p| self.gpa.free(p);
+        self.intercept_extra.deinit(self.gpa);
+        self.intercept_extra = next;
+        adopted = true;
+        _ = interceptReload(self.gpa, self.intercept_extra.items);
     }
 
     /// The client's filter-list subscriptions (REPLACE-ALL).
@@ -2787,8 +2841,7 @@ pub const Host = struct {
         if (self.webext.find(req.id)) |old| {
             self.revokeExtension(old, "extension was reinstalled or toggled");
             wreqAbandonExt(req.id);
-            self.routesAbandonExt(req.id);
-            self.popupWaitsAbandonExt(req.id);
+            self.repliesAbandonExt(req.id);
             self.portsAbandonExt(req.id);
             self.webext.clearListeners(old);
             self.teardownBackground(old);
@@ -2812,8 +2865,7 @@ pub const Host = struct {
             self.injectContentScriptsAll(e);
         } else {
             wreqAbandonExt(req.id);
-            self.routesAbandonExt(req.id);
-            self.popupWaitsAbandonExt(req.id);
+            self.repliesAbandonExt(req.id);
             self.portsAbandonExt(req.id);
             self.webext.clearListeners(e);
             self.teardownBackground(e);
@@ -2869,8 +2921,7 @@ pub const Host = struct {
         // An enumerated exit: every request this extension was holding
         // is continued before its registry goes away.
         wreqAbandonExt(id);
-        self.routesAbandonExt(id);
-        self.popupWaitsAbandonExt(id);
+        self.repliesAbandonExt(id);
         self.portsAbandonExt(id);
         if (self.webext.find(id)) |e| {
             self.revokeExtension(e, "extension was removed");
@@ -3729,26 +3780,20 @@ pub const Host = struct {
         }
     }
 
-    fn sendExtResult(self: *Host, v: *View, e: *const webexthost.Extension, req: u32, host_result: []const u8) void {
-        // host_result is a full JSON object; embed it and mark ok.
-        const is_err = std.mem.indexOf(u8, host_result, "\"error\"") != null;
-        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
-        defer cmd.deinit();
-        const w = &cmd.writer;
-        w.writeAll("{\"op\":\"ext-result\",\"ext\":") catch return;
-        jsonStr(w, e.id) catch return;
-        w.writeAll(",\"cap\":") catch return;
-        jsonStr(w, &e.capability) catch return;
-        w.print(",\"req\":{d},\"ok\":{s},", .{ req, if (is_err) "false" else "true" }) catch return;
-        // Pull the inner value out of {"result":X} / {"error":X}.
-        w.writeAll("\"result\":") catch return;
-        const inner = innerJson(host_result);
-        w.writeAll(inner) catch return;
-        w.writeByte('}') catch return;
-        self.sendScript(v, cmd.written());
-    }
-
-    fn extReplyErr(self: *Host, v: *View, req: u32, ext: []const u8, capability: []const u8, message: []const u8) void {
+    /// THE `ext-result` builder. Every answer to an extension API call
+    /// — a host dispatch result, an error, a routed reply — goes out
+    /// through here, so the command shape exists once.
+    /// `result_json` must already BE JSON; an error message is escaped
+    /// by `extReplyErr` before it gets here.
+    fn sendExtReply(
+        self: *Host,
+        v: *View,
+        ext: []const u8,
+        capability: []const u8,
+        req: u32,
+        ok: bool,
+        result_json: []const u8,
+    ) void {
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
@@ -3756,24 +3801,28 @@ pub const Host = struct {
         jsonStr(w, ext) catch return;
         w.writeAll(",\"cap\":") catch return;
         jsonStr(w, capability) catch return;
-        w.print(",\"req\":{d},\"ok\":false,\"result\":", .{req}) catch return;
-        jsonStr(w, message) catch return;
+        w.print(",\"req\":{d},\"ok\":{s},\"result\":", .{ req, if (ok) "true" else "false" }) catch return;
+        w.writeAll(result_json) catch return;
         w.writeByte('}') catch return;
         self.sendScript(v, cmd.written());
     }
 
+    fn sendExtResult(self: *Host, v: *View, e: *const webexthost.Extension, req: u32, host_result: []const u8) void {
+        // host_result is a full `{"result":X}` / `{"error":X}` object;
+        // the frame wants the inner value plus an ok flag.
+        const is_err = std.mem.indexOf(u8, host_result, "\"error\"") != null;
+        self.sendExtReply(v, e.id, &e.capability, req, !is_err, innerJson(host_result));
+    }
+
+    fn extReplyErr(self: *Host, v: *View, req: u32, ext: []const u8, capability: []const u8, message: []const u8) void {
+        var msg: std.Io.Writer.Allocating = .init(self.gpa);
+        defer msg.deinit();
+        jsonStr(&msg.writer, message) catch return;
+        self.sendExtReply(v, ext, capability, req, false, msg.written());
+    }
+
     fn extReplyOk(self: *Host, v: *View, e: *const webexthost.Extension, req: u32, result_json: []const u8) void {
-        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
-        defer cmd.deinit();
-        const w = &cmd.writer;
-        w.writeAll("{\"op\":\"ext-result\",\"ext\":") catch return;
-        jsonStr(w, e.id) catch return;
-        w.writeAll(",\"cap\":") catch return;
-        jsonStr(w, &e.capability) catch return;
-        w.print(",\"req\":{d},\"ok\":true,\"result\":", .{req}) catch return;
-        w.writeAll(result_json) catch return;
-        w.writeByte('}') catch return;
-        self.sendScript(v, cmd.written());
+        self.sendExtReply(v, e.id, &e.capability, req, true, result_json);
     }
 
     /// Route `browserAction.openPopup()` to the GUI that owns the native toolbar.
@@ -3795,74 +3844,110 @@ pub const Host = struct {
             self.extReplyErr(caller, req, e.id, &e.capability, "out of memory");
             return;
         };
-        const wire_req = self.webext_next_popup_req;
-        self.webext_next_popup_req +%= 1;
-        if (self.webext_next_popup_req == 0) self.webext_next_popup_req = 1;
-        self.webext_popup_waits.append(self.gpa, .{
-            .req = wire_req,
-            .caller_req = req,
-            .caller_view = caller.id,
-            .target_view = tb.view,
+        const wire_req = self.webext_next_gid;
+        self.webext_next_gid +%= 1;
+        if (self.webext_next_gid == 0) self.webext_next_gid = 1;
+        if (!self.pushReply(.{
+            .kind = .popup,
+            .gid = wire_req,
+            .origin_req = req,
+            .origin_view = caller.id,
+            .reply_view = tb.view,
             .ext = ext_copy,
-        }) catch {
+            // The GUI answers or it does not; without a deadline a
+            // dropped 0xBB reply parks this Promise for the life of the
+            // page. Same clock as a routed message.
+            .deadline_ms = nowMs() + route_reply_timeout_ms,
+        })) {
             self.gpa.free(ext_copy);
             self.extReplyErr(caller, req, e.id, &e.capability, "out of memory");
             return;
-        };
+        }
         self.post(proto.EvWebextOpenPopup{ .view = tb.view, .id = e.id, .req = wire_req });
         // The Promise remains pending until the GUI acknowledges that
         // it created the native popup (or reports why it could not).
     }
 
     pub fn webextOpenPopupResult(self: *Host, result: proto.WebextOpenPopupResult) void {
-        var idx: ?usize = null;
-        for (self.webext_popup_waits.items, 0..) |wait, i| {
-            if (wait.req == result.req and wait.target_view == result.view and
-                std.mem.eql(u8, wait.ext, result.id))
-            {
-                idx = i;
-                break;
-            }
-        }
-        const i = idx orelse return;
-        const wait = self.webext_popup_waits.orderedRemove(i);
+        const wait = self.takeReply(.popup, result.req, result.view, result.id) orelse return;
         defer self.gpa.free(wait.ext);
-        const caller = self.find(wait.caller_view) orelse return;
+        const caller = self.find(wait.origin_view) orelse return;
         const e = self.webext.find(wait.ext) orelse return;
         if (result.ok != 0) {
-            self.extReplyOk(caller, e, wait.caller_req, "null");
+            self.extReplyOk(caller, e, wait.origin_req, "null");
         } else {
             const detail = if (result.detail.len != 0) result.detail else "native popup was not created";
-            self.extReplyErr(caller, wait.caller_req, e.id, &e.capability, detail);
+            self.extReplyErr(caller, wait.origin_req, e.id, &e.capability, detail);
         }
     }
 
-    fn popupWaitsAbandonView(self: *Host, view: u32) void {
+    /// Park a Promise on an answer from `reply_view`. The table is
+    /// bounded; the oldest entry is REJECTED (never silently dropped)
+    /// to make room.
+    /// @return false when the record could not be stored, in which case
+    /// the caller still owes its own Promise an answer.
+    fn pushReply(self: *Host, rec: PendingReply) bool {
+        while (self.webext_replies.items.len >= 256) {
+            const old = self.webext_replies.orderedRemove(0);
+            self.failReply(old, "too many pending extension replies");
+        }
+        self.webext_replies.append(self.gpa, rec) catch return false;
+        return true;
+    }
+
+    /// Remove the one record matching a recipient's answer. The triple
+    /// is what correlates: the id we minted, the view that answered,
+    /// and the extension it claims to be.
+    fn takeReply(self: *Host, kind: PendingReply.Kind, gid: u32, reply_view: u32, ext: []const u8) ?PendingReply {
+        for (self.webext_replies.items, 0..) |rec, i| {
+            if (rec.kind == kind and rec.gid == gid and rec.reply_view == reply_view and
+                std.mem.eql(u8, rec.ext, ext))
+                return self.webext_replies.orderedRemove(i);
+        }
+        return null;
+    }
+
+    /// Reject a parked Promise and free the record. Silent when the
+    /// waiting view or the extension is already gone — there is then
+    /// nothing left to answer.
+    fn failReply(self: *Host, rec: PendingReply, message: []const u8) void {
+        if (self.find(rec.origin_view)) |origin| {
+            if (self.webext.find(rec.ext)) |e|
+                self.extReplyErr(origin, rec.origin_req, e.id, &e.capability, message);
+        }
+        self.gpa.free(rec.ext);
+    }
+
+    /// A view died: every record naming it on either end leaves, and
+    /// the OTHER end (if it is the one waiting) is told why.
+    fn repliesAbandonView(self: *Host, view: u32) void {
         var i: usize = 0;
-        while (i < self.webext_popup_waits.items.len) {
-            const wait = self.webext_popup_waits.items[i];
-            if (wait.caller_view != view and wait.target_view != view) {
+        while (i < self.webext_replies.items.len) {
+            const rec = self.webext_replies.items[i];
+            if (rec.origin_view != view and rec.reply_view != view) {
                 i += 1;
                 continue;
             }
-            const rec = self.webext_popup_waits.orderedRemove(i);
-            if (rec.caller_view != view) {
-                if (self.find(rec.caller_view)) |caller| if (self.webext.find(rec.ext)) |e|
-                    self.extReplyErr(caller, rec.caller_req, e.id, &e.capability, "popup target is gone");
+            const taken = self.webext_replies.orderedRemove(i);
+            if (taken.origin_view != view) {
+                self.failReply(taken, taken.kind.gone());
+            } else {
+                self.gpa.free(taken.ext);
             }
-            self.gpa.free(rec.ext);
         }
     }
 
-    fn popupWaitsAbandonExt(self: *Host, id: []const u8) void {
+    /// An extension was disabled, removed, reloaded or reparsed: its
+    /// pages are going away with it, so the records are dropped without
+    /// an answer — the JS object waiting for one has just been revoked.
+    fn repliesAbandonExt(self: *Host, id: []const u8) void {
         var i: usize = 0;
-        while (i < self.webext_popup_waits.items.len) {
-            if (!std.mem.eql(u8, self.webext_popup_waits.items[i].ext, id)) {
+        while (i < self.webext_replies.items.len) {
+            if (!std.mem.eql(u8, self.webext_replies.items[i].ext, id)) {
                 i += 1;
                 continue;
             }
-            const rec = self.webext_popup_waits.orderedRemove(i);
-            self.gpa.free(rec.ext);
+            self.gpa.free(self.webext_replies.orderedRemove(i).ext);
         }
     }
 
@@ -3888,25 +3973,23 @@ pub const Host = struct {
         const gid = self.webext_next_gid;
         self.webext_next_gid +%= 1;
         if (self.webext_next_gid == 0) self.webext_next_gid = 1;
-        if (self.webext_routes.items.len >= 256) {
-            const old = self.webext_routes.orderedRemove(0);
-            self.gpa.free(old.ext);
-        }
         const ext_copy = self.gpa.dupe(u8, e.id) catch {
             self.extReplyErr(v, r.req, e.id, &e.capability, "out of memory");
             return;
         };
-        self.webext_routes.append(self.gpa, .{
+        if (!self.pushReply(.{
+            .kind = .message,
             .gid = gid,
             .origin_view = v.id,
             .origin_req = r.req,
             .reply_view = bg.?.id,
             .ext = ext_copy,
-        }) catch {
+            .deadline_ms = nowMs() + route_reply_timeout_ms,
+        })) {
             self.gpa.free(ext_copy);
             self.extReplyErr(v, r.req, e.id, &e.capability, "out of memory");
             return;
-        };
+        }
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
@@ -3959,8 +4042,7 @@ pub const Host = struct {
             // background page all belong to the instance going away.
             self.revokeExtension(e, "extension reloaded");
             wreqAbandonExt(id);
-            self.routesAbandonExt(id);
-            self.popupWaitsAbandonExt(id);
+            self.repliesAbandonExt(id);
             self.portsAbandonExt(id);
             self.webext.clearListeners(e);
             self.teardownBackground(e);
@@ -4021,7 +4103,7 @@ pub const Host = struct {
     ///
     /// It cannot live in `webext/host.zig` with the rest of `tabs`,
     /// because delivering it means finding a view and evaluating in its
-    /// frames, which is engine work. It reuses the `webext_routes`
+    /// frames, which is engine work. It reuses the `webext_replies`
     /// table, just with the roles swapped: the background is the origin
     /// awaiting a reply and the content frame answers with `ext-reply`.
     fn extTabsSendMessage(self: *Host, v: *View, e: *webexthost.Extension, req: u32, args: std.json.Value) void {
@@ -4047,25 +4129,23 @@ pub const Host = struct {
         const gid = self.webext_next_gid;
         self.webext_next_gid +%= 1;
         if (self.webext_next_gid == 0) self.webext_next_gid = 1;
-        if (self.webext_routes.items.len >= 256) {
-            const old = self.webext_routes.orderedRemove(0);
-            self.gpa.free(old.ext);
-        }
         const ext_copy = self.gpa.dupe(u8, e.id) catch {
             self.extReplyErr(v, req, e.id, &e.capability, "out of memory");
             return;
         };
-        self.webext_routes.append(self.gpa, .{
+        if (!self.pushReply(.{
+            .kind = .message,
             .gid = gid,
             .origin_view = v.id,
             .origin_req = req,
             .reply_view = target.?.id,
             .ext = ext_copy,
-        }) catch {
+            .deadline_ms = nowMs() + route_reply_timeout_ms,
+        })) {
             self.gpa.free(ext_copy);
             self.extReplyErr(v, req, e.id, &e.capability, "out of memory");
             return;
-        };
+        }
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         const w = &cmd.writer;
@@ -4113,7 +4193,7 @@ pub const Host = struct {
         self.webext_next_port +%= 1;
         if (self.webext_next_port == 0) self.webext_next_port = 1;
         // A page that opens ports without bound must not grow the table
-        // without bound; the oldest is closed, exactly as `webext_routes`
+        // without bound; the oldest is closed, exactly as `webext_replies`
         // drops its oldest entry.
         if (self.webext_ports.items.len >= 256) {
             const old = self.webext_ports.orderedRemove(0);
@@ -4282,37 +4362,6 @@ pub const Host = struct {
         }
     }
 
-    fn routesAbandonView(self: *Host, view: u32) void {
-        var i: usize = 0;
-        while (i < self.webext_routes.items.len) {
-            const route = self.webext_routes.items[i];
-            if (route.origin_view != view and route.reply_view != view) {
-                i += 1;
-                continue;
-            }
-            const rec = self.webext_routes.orderedRemove(i);
-            if (rec.origin_view != view) {
-                if (self.find(rec.origin_view)) |origin| {
-                    if (self.webext.find(rec.ext)) |e|
-                        self.extReplyErr(origin, rec.origin_req, e.id, &e.capability, "message recipient is gone");
-                }
-            }
-            self.gpa.free(rec.ext);
-        }
-    }
-
-    fn routesAbandonExt(self: *Host, id: []const u8) void {
-        var i: usize = 0;
-        while (i < self.webext_routes.items.len) {
-            if (!std.mem.eql(u8, self.webext_routes.items[i].ext, id)) {
-                i += 1;
-                continue;
-            }
-            const rec = self.webext_routes.orderedRemove(i);
-            self.gpa.free(rec.ext);
-        }
-    }
-
     /// The MV2 `MessageSender`. `{id}` alone was never enough: Dark
     /// Reader keys its per-tab state on `sender.tab.id` and every
     /// extension that answers a content script reads `sender.url`.
@@ -4338,29 +4387,13 @@ pub const Host = struct {
         const parsed = std.json.parseFromSlice(R, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
         const e = self.webext.authorize(parsed.value.ext, parsed.value.cap) orelse return;
-        const gid = parsed.value.gid;
-        var idx: ?usize = null;
-        for (self.webext_routes.items, 0..) |route, i| {
-            if (route.gid == gid and route.reply_view == v.id and std.mem.eql(u8, route.ext, e.id)) {
-                idx = i;
-                break;
-            }
-        }
-        const i = idx orelse return;
-        const route = self.webext_routes.orderedRemove(i);
+        const route = self.takeReply(.message, parsed.value.gid, v.id, e.id) orelse return;
         defer self.gpa.free(route.ext);
         const origin = self.find(route.origin_view) orelse return;
-        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
-        defer cmd.deinit();
-        const w = &cmd.writer;
-        w.writeAll("{\"op\":\"ext-result\",\"ext\":") catch return;
-        jsonStr(w, e.id) catch return;
-        w.writeAll(",\"cap\":") catch return;
-        jsonStr(w, &e.capability) catch return;
-        w.print(",\"req\":{d},\"ok\":true,\"result\":", .{route.origin_req}) catch return;
-        std.json.Stringify.value(parsed.value.resp, .{}, w) catch return;
-        w.writeByte('}') catch return;
-        self.sendScript(origin, cmd.written());
+        var resp: std.Io.Writer.Allocating = .init(self.gpa);
+        defer resp.deinit();
+        std.json.Stringify.value(parsed.value.resp, .{}, &resp.writer) catch return;
+        self.sendExtReply(origin, e.id, &e.capability, route.origin_req, true, resp.written());
     }
 
     // -- blocking webRequest, main-thread half ------------------------
@@ -5016,6 +5049,19 @@ pub const Host = struct {
                 const p = v.pending.orderedRemove(i);
                 self.failPending(v, p, "semantic request expired before the page replied");
             }
+        }
+        // Same rule for every parked extension Promise: a recipient
+        // that never answers (bridge not bootstrapped, listener silent,
+        // a GUI that dropped the popup acknowledgement) must not park
+        // the caller forever.
+        var i: usize = 0;
+        while (i < self.webext_replies.items.len) {
+            if (self.webext_replies.items[i].deadline_ms > now) {
+                i += 1;
+                continue;
+            }
+            const rec = self.webext_replies.orderedRemove(i);
+            self.failReply(rec, rec.kind.expired());
         }
     }
 
@@ -6021,7 +6067,7 @@ const CookieJob = struct {
     /// FIRST FIELD: CEF is handed `&job.visitor` and hands the same
     /// pointer back as `self`.
     visitor: cef.cef_cookie_visitor_t,
-    refs: i32,
+    refs: std.atomic.Value(u32),
     gpa: std.mem.Allocator,
     view: u32,
     req: u32,
@@ -6087,16 +6133,10 @@ const CookieJob = struct {
         };
         job.* = .{
             .visitor = .{
-                .base = .{
-                    .size = @sizeOf(cef.cef_cookie_visitor_t),
-                    .add_ref = jobAddRef,
-                    .release = jobRelease,
-                    .has_one_ref = jobHasOneRef,
-                    .has_at_least_one_ref = jobHasAtLeastOneRef,
-                },
+                .base = JobRef.base(),
                 .visit = jobVisit,
             },
-            .refs = 1,
+            .refs = .init(1),
             .gpa = gpa,
             .view = opts.view,
             .req = opts.req,
@@ -6115,9 +6155,9 @@ const CookieJob = struct {
         // across the call so the return value is still readable when
         // the answer is composed — releasing it here is then what
         // triggers `finish` in the ordinary case.
-        job.refs = 2;
+        job.refs.store(2, .release);
         if (visit(mgr, &u, 1, &job.visitor) == 0) job.accessible = false;
-        _ = jobRelease(&job.visitor.base);
+        _ = JobRef.release(&job.visitor.base);
         return {};
     }
 
@@ -6210,7 +6250,10 @@ const CookieJob = struct {
         return self.strings.items[s.off..][0..s.len];
     }
 
-    fn destroy(self: *CookieJob) void {
+    /// The LAST release is both "the visit is over" and the free, so
+    /// the answer is posted from here and from nowhere else.
+    fn destroyOwned(self: *CookieJob) void {
+        self.finish();
         const gpa = self.gpa;
         self.strings.deinit(gpa);
         self.recs.deinit(gpa);
@@ -6274,62 +6317,7 @@ fn warnSub(what: []const u8, url: []const u8) void {
     std.debug.print("sketerm-web: filter list {s}: {s}\n", .{ url, what });
 }
 
-/// Write via a sibling `.part` + rename, so a reader either sees the
-/// old list or the new one and never a half-written file.
-fn writeAtomic(dest: []const u8, bytes: []const u8) !void {
-    var tmp_buf: [4608]u8 = undefined;
-    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.part", .{dest}) catch return error.NameTooLong;
-    var dst_buf: [4608]u8 = undefined;
-    const dst = std.fmt.bufPrintZ(&dst_buf, "{s}", .{dest}) catch return error.NameTooLong;
-    const fd = c.open(tmp.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC | c.O_NOFOLLOW, @as(c_uint, 0o600));
-    if (fd < 0) return error.OpenFailed;
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n < 0 and std.c._errno().* == c.EINTR) continue;
-        if (n <= 0) {
-            _ = c.close(fd);
-            _ = c.unlink(tmp.ptr);
-            return error.WriteFailed;
-        }
-        off += @intCast(n);
-    }
-    const sync_ok = c.fsync(fd) == 0;
-    const close_ok = c.close(fd) == 0;
-    if (!sync_ok or !close_ok) {
-        _ = c.unlink(tmp.ptr);
-        return error.WriteFailed;
-    }
-    if (c.rename(tmp.ptr, dst.ptr) != 0) {
-        _ = c.unlink(tmp.ptr);
-        return error.RenameFailed;
-    }
-}
-
-fn subOf(base: [*c]cef.cef_base_ref_counted_t) *FilterFetch {
-    const v: *cef.cef_urlrequest_client_t = @ptrCast(@alignCast(base));
-    return @fieldParentPtr("client", v);
-}
-
-fn subAddRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) void {
-    _ = subOf(base).refs.fetchAdd(1, .monotonic);
-}
-
-fn subRelease(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    const f = subOf(base);
-    const before = f.refs.fetchSub(1, .acq_rel);
-    if (before > 1) return 0;
-    f.destroyOwned();
-    return 1;
-}
-
-fn subHasOneRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    return if (subOf(base).refs.load(.acquire) == 1) 1 else 0;
-}
-
-fn subHasAtLeastOneRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    return if (subOf(base).refs.load(.acquire) >= 1) 1 else 0;
-}
+const SubRef = HeapRef(FilterFetch, "client");
 
 fn subOnDownloadData(
     self_: [*c]cef.cef_urlrequest_client_t,
@@ -6337,7 +6325,7 @@ fn subOnDownloadData(
     data: ?*const anyopaque,
     len: usize,
 ) callconv(.c) void {
-    const f: *FilterFetch = subOf(@ptrCast(self_));
+    const f: *FilterFetch = SubRef.owner(@ptrCast(self_));
     if (f.lost or len == 0) return;
     // A list that grows past this is not a list we want to load either;
     // `interceptReload` reads at most 16MB back off disk.
@@ -6358,7 +6346,7 @@ fn subOnComplete(
     self_: [*c]cef.cef_urlrequest_client_t,
     request: [*c]cef.cef_urlrequest_t,
 ) callconv(.c) void {
-    const f: *FilterFetch = subOf(@ptrCast(self_));
+    const f: *FilterFetch = SubRef.owner(@ptrCast(self_));
     f.status_ok = false;
     f.response_ok = false;
     if (request) |r| {
@@ -6385,7 +6373,7 @@ fn subOnDownloadProgress(
     total: i64,
 ) callconv(.c) void {
     if (total <= filter_list_max) return;
-    const f: *FilterFetch = subOf(@ptrCast(self_));
+    const f: *FilterFetch = SubRef.owner(@ptrCast(self_));
     f.lost = true;
     if (request) |r| {
         if (r.*.cancel) |cancel| cancel(r);
@@ -6436,13 +6424,7 @@ fn filterSubFetch(host: *Host, url: []const u8, dest: []const u8, serial: u32) b
     };
     f.* = .{
         .client = .{
-            .base = .{
-                .size = @sizeOf(cef.cef_urlrequest_client_t),
-                .add_ref = subAddRef,
-                .release = subRelease,
-                .has_one_ref = subHasOneRef,
-                .has_at_least_one_ref = subHasAtLeastOneRef,
-            },
+            .base = SubRef.base(),
             .on_request_complete = subOnComplete,
             .on_upload_progress = subOnUploadProgress,
             .on_download_progress = subOnDownloadProgress,
@@ -6466,7 +6448,7 @@ fn filterSubFetch(host: *Host, url: []const u8, dest: []const u8, serial: u32) b
         host.filter_fetches.appendAssumeCapacity(f);
         return true;
     }
-    _ = subRelease(&f.client.base);
+    _ = SubRef.release(&f.client.base);
     return false;
 }
 
@@ -6484,18 +6466,7 @@ fn subIntervalMs(hours: u32) i64 {
 }
 
 fn ensureFiltersDir(dir: [:0]const u8) bool {
-    var buf: [4096]u8 = undefined;
-    if (dir.len + 1 > buf.len) return false;
-    @memcpy(buf[0..dir.len], dir);
-    buf[dir.len] = 0;
-    var i: usize = 1;
-    while (i <= dir.len) : (i += 1) {
-        if (i != dir.len and buf[i] != '/') continue;
-        const save = buf[i];
-        buf[i] = 0;
-        if (c.mkdir(@ptrCast(&buf), 0o700) != 0 and std.c._errno().* != c.EEXIST) return false;
-        buf[i] = save;
-    }
+    pathz.makeDirs(dir, 0o700) catch return false;
     return true;
 }
 
@@ -6529,9 +6500,13 @@ fn filterSubApply(self: *Host, hours: u32, urls: []const []const u8) void {
             }
         }
         if (duplicate) continue;
-        const dup = self.gpa.dupe(u8, u) catch return;
+        const dup = self.gpa.dupe(u8, u) catch {
+            filterSubFailAll(self, urls.len);
+            return;
+        };
         next.append(self.gpa, dup) catch {
             self.gpa.free(dup);
+            filterSubFailAll(self, urls.len);
             return;
         };
     }
@@ -6552,6 +6527,24 @@ fn filterSubApply(self: *Host, hours: u32, urls: []const []const u8) void {
     self.filter_sub_reload = false;
     self.filter_sub_batch_open = true;
     filterSubReconcile(self);
+}
+
+/// Answer a replace-all whose owned url copies could not be allocated:
+/// the previous subscription set and schedule stay live, but the
+/// completion frame is still posted (every request is answered) with
+/// every requested url counted as failed.
+fn filterSubFailAll(self: *Host, requested: usize) void {
+    filterSubCancel(self);
+    self.filter_sub_serial +%= 1;
+    if (self.filter_sub_serial == 0) self.filter_sub_serial = 1;
+    self.filter_sub_active = @intCast(@min(requested, std.math.maxInt(u16)));
+    self.filter_sub_fetched = 0;
+    self.filter_sub_updated = 0;
+    self.filter_sub_failed = self.filter_sub_active;
+    self.filter_sub_pending = 0;
+    self.filter_sub_reload = false;
+    self.filter_sub_batch_open = true;
+    filterSubFinish(self, nowMs());
 }
 
 fn filterSubReconcile(self: *Host) void {
@@ -6610,7 +6603,7 @@ fn filterSubReconcile(self: *Host) void {
 
 fn filterSubFinish(self: *Host, now_ms: i64) void {
     if (!self.filter_sub_batch_open) return;
-    if (self.filter_sub_reload and !interceptReload(self.gpa, &.{})) self.filter_sub_failed +|= 1;
+    if (self.filter_sub_reload and !interceptReload(self.gpa, self.intercept_extra.items)) self.filter_sub_failed +|= 1;
     self.filter_sub_batch_open = false;
     self.filter_sub_next_ms = if (self.filter_sub_stopping)
         std.math.maxInt(i64)
@@ -6638,7 +6631,7 @@ fn filterSubPump(self: *Host, now_ms: i64) void {
         if (current) {
             if (self.filter_sub_pending > 0) self.filter_sub_pending -= 1;
             if (!f.lost and f.status_ok and f.response_ok and filtersub.looksLikeFilterList(f.body.items)) {
-                writeAtomic(f.dest, f.body.items) catch {
+                atomicwrite.writeFile(f.dest, f.body.items, 0o600) catch {
                     warnSub("could not be written; keeping the previous copy", f.url);
                     self.filter_sub_failed +|= 1;
                     retireFilterFetch(self, i);
@@ -6660,7 +6653,7 @@ fn retireFilterFetch(self: *Host, i: usize) void {
     const f = self.filter_fetches.swapRemove(i);
     if (f.request) |r| release(&r.base);
     f.request = null;
-    _ = subRelease(&f.client.base);
+    _ = SubRef.release(&f.client.base);
 }
 
 fn filterSubCancel(self: *Host) void {
@@ -6702,35 +6695,11 @@ fn filterSubAbandon(self: *Host) void {
         const f = self.filter_fetches.pop().?;
         if (f.request) |r| release(&r.base);
         f.request = null;
-        _ = subRelease(&f.client.base);
+        _ = SubRef.release(&f.client.base);
     }
 }
 
-fn jobOf(base: [*c]cef.cef_base_ref_counted_t) *CookieJob {
-    const v: *cef.cef_cookie_visitor_t = @ptrCast(@alignCast(base));
-    return @fieldParentPtr("visitor", v);
-}
-
-fn jobAddRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) void {
-    jobOf(base).refs += 1;
-}
-
-fn jobRelease(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    const job = jobOf(base);
-    job.refs -= 1;
-    if (job.refs > 0) return 0;
-    job.finish();
-    job.destroy();
-    return 1;
-}
-
-fn jobHasOneRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    return if (jobOf(base).refs == 1) 1 else 0;
-}
-
-fn jobHasAtLeastOneRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    return if (jobOf(base).refs >= 1) 1 else 0;
-}
+const JobRef = HeapRef(CookieJob, "visitor");
 
 fn jobVisit(
     self_: [*c]cef.cef_cookie_visitor_t,
@@ -8359,35 +8328,14 @@ const ExtResource = struct {
         const p: *cef.cef_resource_handler_t = @ptrCast(self);
         return @fieldParentPtr("handler", p);
     }
+
+    fn destroyOwned(self: *ExtResource) void {
+        if (self.data.len != 0) std.heap.c_allocator.free(self.data);
+        std.heap.c_allocator.destroy(self);
+    }
 };
 
-fn extResAddRef(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) void {
-    const h: *cef.cef_resource_handler_t = @ptrCast(@alignCast(base orelse return));
-    const r: *ExtResource = @fieldParentPtr("handler", h);
-    _ = r.refs.fetchAdd(1, .monotonic);
-}
-
-fn extResRelease(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    const h: *cef.cef_resource_handler_t = @ptrCast(@alignCast(base orelse return 0));
-    const r: *ExtResource = @fieldParentPtr("handler", h);
-    if (r.refs.fetchSub(1, .release) != 1) return 0;
-    _ = r.refs.load(.acquire);
-    if (r.data.len != 0) std.heap.c_allocator.free(r.data);
-    std.heap.c_allocator.destroy(r);
-    return 1;
-}
-
-fn extResHasOne(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    const h: *cef.cef_resource_handler_t = @ptrCast(@alignCast(base orelse return 0));
-    const r: *ExtResource = @fieldParentPtr("handler", h);
-    return if (r.refs.load(.acquire) == 1) 1 else 0;
-}
-
-fn extResHasAtLeastOne(base: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
-    const h: *cef.cef_resource_handler_t = @ptrCast(@alignCast(base orelse return 0));
-    const r: *ExtResource = @fieldParentPtr("handler", h);
-    return if (r.refs.load(.acquire) >= 1) 1 else 0;
-}
+const ExtResRef = HeapRef(ExtResource, "handler");
 
 /// IO THREAD. Resolve one `chrome-extension://` url to bytes.
 /// One refusal is reported per process (see the branches that set it).
@@ -8712,13 +8660,7 @@ fn extResourceOwned(data: []u8, mime: []const u8, status: c_int) [*c]cef.cef_res
         .status = status,
         .mime = mime,
     };
-    r.handler.base = .{
-        .size = @sizeOf(cef.cef_resource_handler_t),
-        .add_ref = extResAddRef,
-        .release = extResRelease,
-        .has_one_ref = extResHasOne,
-        .has_at_least_one_ref = extResHasAtLeastOne,
-    };
+    r.handler.base = ExtResRef.base();
     r.handler.open = extResOpen;
     r.handler.get_response_headers = extResHeaders;
     r.handler.read = extResRead;
@@ -8885,6 +8827,63 @@ fn baseRelease(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
 }
 fn baseHasOne(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
     return 1;
+}
+
+/// The refcount vtable for a HEAP-owned CEF client struct — the ones
+/// CEF really can outlive us with (`CookieJob`, `FilterFetch`,
+/// `ExtResource`), as opposed to the process-lifetime statics below.
+///
+/// `Owner` must carry `refs: std.atomic.Value(u32)` and a
+/// `destroyOwned` that releases everything and frees itself; `field` is
+/// the CEF struct embedded in it, which must be its FIRST field because
+/// CEF is handed `&owner.<field>` and hands the same pointer back as
+/// the base. `base.size` is the CEF struct's size, not the owner's:
+/// the engine validates the size of the interface it was given.
+fn HeapRef(comptime Owner: type, comptime field: []const u8) type {
+    return struct {
+        const Self = @This();
+        const Struct = @FieldType(Owner, field);
+
+        comptime {
+            std.debug.assert(@offsetOf(Owner, field) == 0);
+        }
+
+        pub fn owner(b: [*c]cef.cef_base_ref_counted_t) *Owner {
+            const p: *Struct = @ptrCast(@alignCast(b));
+            return @fieldParentPtr(field, p);
+        }
+
+        pub fn addRef(b: [*c]cef.cef_base_ref_counted_t) callconv(.c) void {
+            _ = owner(b).refs.fetchAdd(1, .monotonic);
+        }
+
+        pub fn release(b: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+            const o = owner(b);
+            if (o.refs.fetchSub(1, .acq_rel) != 1) return 0;
+            o.destroyOwned();
+            return 1;
+        }
+
+        pub fn hasOneRef(b: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+            return if (owner(b).refs.load(.acquire) == 1) 1 else 0;
+        }
+
+        pub fn hasAtLeastOneRef(b: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+            return if (owner(b).refs.load(.acquire) >= 1) 1 else 0;
+        }
+
+        pub fn base() cef.cef_base_ref_counted_t {
+            return .{
+                .size = @sizeOf(Struct),
+                .add_ref = Self.addRef,
+                // Qualified: this file also has a free `release` helper
+                // for the references CEF hands US.
+                .release = Self.release,
+                .has_one_ref = Self.hasOneRef,
+                .has_at_least_one_ref = Self.hasAtLeastOneRef,
+            };
+        }
+    };
 }
 
 fn staticBase(comptime T: type) cef.cef_base_ref_counted_t {
