@@ -258,12 +258,22 @@ pub const Sidebar = struct {
         // keeps it marked while focus sits in a pane.
         c.gtk_list_box_set_selection_mode(@ptrCast(list), c.GTK_SELECTION_NONE);
         c.gtk_widget_add_css_class(list, "sketerm-tst-list");
-        c.gtk_widget_set_vexpand(list, 1);
         installCss(list);
+
+        // TST's "+" row directly under the last tab.
+        const plus = c.gtk_button_new_from_icon_name("list-add-symbolic") orelse return error.GtkFail;
+        c.gtk_button_set_has_frame(@ptrCast(plus), 0);
+        c.gtk_widget_add_css_class(plus, "flat");
+        c.gtk_widget_add_css_class(plus, "sketerm-tst-plus");
+        c.gtk_widget_set_tooltip_text(plus, "New Tab");
+
+        const column = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0) orelse return error.GtkFail;
+        c.gtk_box_append(@ptrCast(column), list);
+        c.gtk_box_append(@ptrCast(column), plus);
 
         const scroller = c.gtk_scrolled_window_new() orelse return error.GtkFail;
         c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-        c.gtk_scrolled_window_set_child(@ptrCast(scroller), list);
+        c.gtk_scrolled_window_set_child(@ptrCast(scroller), column);
         c.gtk_widget_add_css_class(scroller, "sketerm-tst");
         // The floor the divider can be dragged to; the width itself is
         // the paned position (config `tab_sidebar_width`).
@@ -285,6 +295,10 @@ pub const Sidebar = struct {
         c.g_object_set_data_full(@ptrCast(@alignCast(win.tab_view)), SIDEBAR_VIEW_QDATA, @ptrCast(self), @ptrCast(&releaseView));
 
         _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onRowActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        // The "+" lives and dies with the list (same parent box), and
+        // the list's qdata reference keeps the Sidebar alive for as
+        // long as either widget can still emit — no retain of its own.
+        _ = c.g_signal_connect_data(plus, "clicked", @ptrCast(&onPlusClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
         // The pane faces normally forward global bindings after their
         // own key handling. Focused sidebar rows are outside every pane,
@@ -430,6 +444,25 @@ pub const Sidebar = struct {
         _ = c.g_signal_connect_data(expander, "clicked", @ptrCast(&onExpanderClicked), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(box), expander);
 
+        // The favicon slot, like TST's: every row leads with an icon.
+        // A window tab wears its AdwTabPage icon when one is set (a
+        // remote app's own icon, a progress state); the fallbacks are
+        // the terminal glyph and TST's default-favicon globe.
+        const icon: ?*c.GtkWidget = switch (item) {
+            .tab => |page| blk: {
+                if (c.adw_tab_page_get_icon(page)) |gi|
+                    break :blk c.gtk_image_new_from_gicon(gi);
+                break :blk c.gtk_image_new_from_icon_name("sketerm-terminal-symbolic");
+            },
+            .page => c.gtk_image_new_from_icon_name("web-browser-symbolic"),
+        };
+        if (icon) |ic| {
+            c.gtk_image_set_pixel_size(@ptrCast(ic), 16);
+            c.gtk_widget_set_valign(ic, c.GTK_ALIGN_CENTER);
+            c.gtk_widget_add_css_class(ic, "sketerm-tst-icon");
+            c.gtk_box_append(@ptrCast(box), ic);
+        }
+
         // Container dot. A page's identity has to be visible where the
         // pages are listed — the window tab's accent says nothing about
         // WHICH page in a browser pane is in a container. Markup rather
@@ -468,11 +501,13 @@ pub const Sidebar = struct {
 
         const row = c.gtk_list_box_row_new();
         c.gtk_widget_add_css_class(row, "sketerm-tst-row");
-        // The indent moves the whole ROW, so a child's chip visibly
-        // steps in — indenting only the row's CONTENT left every chip
-        // the same width and the nesting read as ragged text.
+        // TST-photon rows span the full sidebar width whatever their
+        // depth; the CONTENT is what steps in. (The old chip look
+        // indented the row itself — with a twisty + favicon leading
+        // every row, an indented body reads as a tree, not as ragged
+        // text.)
         const d: c_int = @intCast(@min(depth, MAX_DEPTH));
-        c.gtk_widget_set_margin_start(row, d * INDENT_PX);
+        c.gtk_widget_set_margin_start(box, d * INDENT_PX);
         c.gtk_list_box_row_set_child(@ptrCast(row), box);
 
         r.* = .{
@@ -822,6 +857,13 @@ pub const Sidebar = struct {
             win.newShellTab(null) catch {};
     }
 
+    fn onPlusClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(Sidebar, user);
+        const win = self.win orelse return;
+        if (!win.newTabInBrowser())
+            win.newShellTab(null) catch {};
+    }
+
     fn onEmptyMenuCollapseAll(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
         cast.userData(EmptyMenuCtx, user).sidebar.setAllCollapsed(true);
     }
@@ -1088,38 +1130,47 @@ pub const Sidebar = struct {
 fn installCss(any_widget: *c.GtkWidget) void {
     const css =
         \\.sketerm-tst { background-color: transparent; }
-        \\list.sketerm-tst-list { background-color: transparent; padding: 3px 4px; }
-        \\/* Firefox-TST (proton) row: inactive rows are flat text on
-        \\   the sidebar background; hover gets a faint surface; the
-        \\   ACTIVE tab a stronger neutral surface — the same treatment
-        \\   the window's tab strip gives its current tab, NOT the blue
-        \\   selection colour. `alpha(currentColor, …)` so it works out
-        \\   in both light and dark without asking. */
+        \\/* Firefox-TST (photon) rows: full-width, flat, edge to edge,
+        \\   a hairline between rows, and the tab area painted in the
+        \\   content base colour so the empty space below reads as
+        \\   "outside the list" — exactly the TST sidebar. All colours
+        \\   are theme-relative (named colours / currentColor), never a
+        \\   hardcoded light or dark value. */
+        \\list.sketerm-tst-list { background-color: @theme_base_color; padding: 0; }
         \\list.sketerm-tst-list > row.sketerm-tst-row {
         \\  min-height: 0;
         \\  padding: 0;
         \\  margin: 0;
-        \\  border-radius: 4px;
+        \\  border-radius: 0;
         \\  background-color: transparent;
+        \\  border-bottom: 1px solid alpha(currentColor, 0.08);
         \\  transition: background-color 120ms ease-out;
         \\}
         \\list.sketerm-tst-list > row.sketerm-tst-row:hover {
-        \\  background-color: alpha(currentColor, 0.08);
+        \\  background-color: alpha(currentColor, 0.07);
         \\}
-        \\/* The ACTIVE tab's row. Our own class, not `:selected`: the
-        \\   list has no selection, so this stays put while focus is in a
-        \\   pane and cannot drift with the keyboard cursor. */
+        \\/* The ACTIVE tab's row: the selection fill, photon-style,
+        \\   spanning the full width. Our own class, not `:selected`:
+        \\   the list has no selection, so this stays put while focus is
+        \\   in a pane and cannot drift with the keyboard cursor. */
         \\list.sketerm-tst-list > row.sketerm-tst-row.sketerm-tst-active,
         \\list.sketerm-tst-list > row.sketerm-tst-row.sketerm-tst-active:hover {
-        \\  background-color: alpha(currentColor, 0.16);
+        \\  background-color: @theme_selected_bg_color;
+        \\  color: @theme_selected_fg_color;
         \\}
         \\/* The row a drag is moving: it has all but left, only a faint
         \\   placeholder remains until the drop lands. */
         \\list.sketerm-tst-list > row.sketerm-tst-row.sketerm-tst-dragsrc,
         \\list.sketerm-tst-list > row.sketerm-tst-row.sketerm-tst-dragsrc:hover {
         \\  opacity: 0.35;
-        \\  background-color: transparent;
         \\}
+        \\/* TST's "+" row, directly under the last tab. */
+        \\button.sketerm-tst-plus {
+        \\  padding: 2px; margin: 0; border-radius: 0;
+        \\  background-color: @theme_base_color;
+        \\  border-bottom: 1px solid alpha(currentColor, 0.15);
+        \\}
+        \\button.sketerm-tst-plus:hover { background-color: alpha(currentColor, 0.07); }
         \\/* Where a drop would land: a line between rows, a frame for a
         \\   drop INTO the row (making the dragged tab its child). */
         \\list.sketerm-tst-list > row.sketerm-tst-row.tst-drop-above {
@@ -1132,16 +1183,18 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\  outline: 2px solid @theme_selected_bg_color;
         \\  outline-offset: -2px;
         \\}
-        \\.sketerm-tst-body { min-height: 28px; padding: 0 2px 0 2px; }
+        \\.sketerm-tst-body { min-height: 26px; padding: 0 2px 0 2px; }
         \\.sketerm-tst-title { font-size: 1em; }
         \\/* A twisty the size of the glyph, not of a toolbar button. */
         \\button.sketerm-tst-twisty {
         \\  padding: 0; margin: 0; border: none; min-width: 16px; min-height: 16px;
         \\}
         \\button.sketerm-tst-twisty:hover { background: alpha(currentColor, 0.15); }
+        \\/* The close X shows on EVERY row, TST-style — softly, so a
+        \\   wall of rows is not a wall of Xs. */
         \\button.sketerm-tst-close {
         \\  padding: 0; margin: 0; border: none; min-width: 18px; min-height: 18px;
-        \\  opacity: 0;
+        \\  opacity: 0.55;
         \\  transition: opacity 120ms ease-out;
         \\}
         \\row.sketerm-tst-row:hover button.sketerm-tst-close,
