@@ -1190,15 +1190,13 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\  padding: 0; margin: 0; border: none; min-width: 16px; min-height: 16px;
         \\}
         \\button.sketerm-tst-twisty:hover { background: alpha(currentColor, 0.15); }
-        \\/* The close X shows on EVERY row, TST-style — softly, so a
-        \\   wall of rows is not a wall of Xs. */
+        \\/* The close X only appears on the hovered row. */
         \\button.sketerm-tst-close {
         \\  padding: 0; margin: 0; border: none; min-width: 18px; min-height: 18px;
-        \\  opacity: 0.55;
+        \\  opacity: 0;
         \\  transition: opacity 120ms ease-out;
         \\}
-        \\row.sketerm-tst-row:hover button.sketerm-tst-close,
-        \\row.sketerm-tst-row.sketerm-tst-active button.sketerm-tst-close { opacity: 1; }
+        \\row.sketerm-tst-row:hover button.sketerm-tst-close { opacity: 1; }
         \\button.sketerm-tst-close:hover { background: alpha(currentColor, 0.2); }
         \\/* The window paints every `paned > separator` as a solid
         \\   pane-gap bar (winconfig `refreshTitlebarCss`). This divider
