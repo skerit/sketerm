@@ -83,235 +83,17 @@ pub fn nowMs() i64 {
 /// split lives in the platform layer — see `platform.cwdOfPid`.
 pub const cwdOfPid = platform.cwdOfPid;
 
-pub const SpawnReq = struct {
-    name: []const u8 = "",
-    argv: []const []const u8 = &.{},
-    cwd: ?[]const u8 = null,
-    /// Extra child environment, "KEY=VALUE" strings applied after the
-    /// daemon's own exports (so they win).
-    env: []const []const u8 = &.{},
-    rows: u16 = 24,
-    cols: u16 = 80,
-    /// One-shot forwarded GUI app (`sketerm app -u`), not an
-    /// interactive shell — listed differently by clients.
-    app: bool = false,
-    /// Force the window-stream backend for this session (the
-    /// explicit form of SKETERM_WINSTREAM; what `sketerm app`
-    /// toward capture-only remotes will set).
-    winstream: bool = false,
-    /// Run the session under a private XDG_RUNTIME_DIR with the shared
-    /// D-Bus session bus dropped (`sketerm app -i`). Isolates
-    /// single-instance apps so each forwarded copy renders on its own
-    /// client instead of coalescing into the first one.
-    isolated: bool = false,
-    /// GPU rendering for this session (`sketerm app --gpu`): skip the
-    /// LIBGL_ALWAYS_SOFTWARE force and announce linux-dmabuf on the
-    /// session's compositor. LINEAR buffers use mmap; modifier-backed
-    /// buffers use runtime-loaded EGL/GLES when available.
-    gpu: bool = false,
-    /// Skip this session's PulseAudio hub (`launch_app audio:"none"`):
-    /// PULSE_SERVER stays unset, so clients fall back to their own
-    /// null/dummy audio drivers instead of sketerm's sink.
-    no_audio: bool = false,
-    /// Capture the session's audio to WAV on the DAEMON's host
-    /// (`launch_app audio_path`): path base — the first stream lands
-    /// at "<base>.wav", later ones at "<base>-N.wav". The sink still
-    /// paces/forwards normally; this only tees the PCM. "" = off.
-    audio_capture: []const u8 = "",
-    /// GUI pane id + IPC socket to export into the child env as
-    /// SKETERM_PANE_ID / SKETERM_SOCKET so `sketerm cli --pane self` works
-    /// from inside a daemon-backed pane. The GUI passes its own values; they
-    /// reflect the spawning client (may go stale after a cross-GUI reattach —
-    /// acceptable for the common case). 0 / "" = don't export.
-    pane_id: u32 = 0,
-    socket: []const u8 = "",
-    /// Child TERM / COLORTERM. Empty → Pty.spawn defaults. The GUI passes its
-    /// profile's term_env/color_term_env so a daemon-backed local pane gets
-    /// the same environment an in-process pane would.
-    term: []const u8 = "",
-    color_term: []const u8 = "",
-    /// xkb layout for forwarded-app keyboards (wlhost/keymaps.zig
-    /// names; "" = us). Must match whoever drives the seat.
-    kb_layout: []const u8 = "",
-    /// Spawn argv[0] as a login shell (leading `-`).
-    login_shell: bool = false,
-    /// GUI-owned LOCAL session sharing the user's desktop: skip the
-    /// wlhost Wayland hub so child GUI apps talk to the real desktop
-    /// compositor directly (via `host_wayland_display`) instead of
-    /// sketerm's embedded one. Remote/durable sessions leave this
-    /// false and get the forwarding hub (which roams with the
-    /// session). Only the local ephemeral pane factory sets it.
-    local: bool = false,
-    /// The GUI's own $WAYLAND_DISPLAY, applied to the child when
-    /// `local` is set — the daemon's inherited value may be stale
-    /// (it outlives the GUI that started it) or absent. Empty leaves
-    /// the child to inherit the daemon's env (X11 / no Wayland).
-    host_wayland_display: []const u8 = "",
-    /// Auto shell-integration (OSC 7/133 without rc edits). All paths are on
-    /// the daemon host; the GUI only fills this for the LOCAL daemon, where
-    /// the integration scripts exist. null = off.
-    shell_integration: ?SpawnShellIntegration = null,
-    /// External display session (`sketerm-mux display create`): the
-    /// child is a trivial keeper process (this daemon's own binary,
-    /// `--keep`) that just blocks, so the session exists purely to own
-    /// a Wayland/PulseAudio hub some OUTSIDE process renders into. The
-    /// daemon builds the keeper argv itself — a client cannot know the
-    /// daemon host's binary path, and a version mismatch would be a
-    /// silent instant exit. Any argv the client sent is ignored.
-    display: bool = false,
-    /// Rootless X11 compatibility for an external display session.
-    xwayland: bool = false,
-    /// Fail session creation instead of degrading to Wayland-only when the
-    /// optional Xwayland runtime is unavailable or cannot start.
-    require_xwayland: bool = false,
-    /// Virtual Wayland output mode in physical pixels. These are separate
-    /// from the keeper PTY's rows/cols and do not force a window size.
-    output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
-    output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
-    /// Seconds with no attached viewer or external Wayland client after
-    /// which the daemon kills this session. Counted from creation when it
-    /// has never been occupied. 0 = live forever.
-    ttl_secs: u32 = 0,
-    /// Allow `app_debug` to take a backtrace of this session's child:
-    /// the child relaxes Yama's ptrace restriction before exec, because
-    /// the gdb the daemon spawns is the app's SIBLING and Yama's default
-    /// scope only lets ancestors trace. Set by headless automation
-    /// (appdrive/MCP `launch_app`), never by interactive panes.
-    debuggable: bool = false,
-    /// Asciicast playback session: replay this daemon-host file
-    /// (absolute or ~-relative) instead of spawning a child. argv/
-    /// cwd/env are ignored; the session has NO PTY, no child process
-    /// and no Wayland/audio hubs, its size comes from the cast
-    /// header, and client input/resize are rejected. "" = normal
-    /// PTY session.
-    cast_path: []const u8 = "",
-};
-
-pub const SpawnShellIntegration = struct {
-    kind: []const u8 = "", // "zsh" | "fish" | "bash"
-    script: []const u8 = "",
-    shim_dir: []const u8 = "",
-};
-
-pub const AttachReq = struct {
-    name: []const u8 = "",
-    /// Optional lifetime fence: current panel clients send the inherited ID so
-    /// a reused name can never attach them to a replacement session.
-    origin_id: []const u8 = "",
-    /// Client self-identification for the peer roster: "gui", "cli",
-    /// "mcp" (headless assistant driver) or "" (unknown).
-    kind: []const u8 = "",
-    /// Never drive the session's Wayland seat: this viewer stays out of
-    /// the controller lease entirely (it neither acquires a free lease
-    /// nor is eligible for the controller-death handover).
-    read_only: bool = false,
-    /// Force the controller lease on attach, evicting whoever holds it.
-    /// Without this an attach only acquires a FREE lease.
-    control: bool = false,
-    /// Attach for correlated panel RPC only: no snapshot, terminal events,
-    /// native channels, audio, controller lease, or viewer occupancy.
-    panel_only: bool = false,
-    /// Panel presenter/requester capability for this attachment. It is
-    /// clamped to the independently negotiated hello capability.
-    panel_rpc: u8 = 0,
-    /// Request identity metadata before the initial snapshot. Honored only for
-    /// panel-capable GUI attachments, preserving legacy snapshot-first order.
-    identity_first: bool = false,
-};
-
-pub const KillReq = struct {
-    name: []const u8 = "",
-    /// Display CLI safety fence: never let `display destroy` kill a shell
-    /// session that happens to share the requested name.
-    require_display: bool = false,
-    /// Optional identity fence used by display teardown. A name can be
-    /// destroyed and reused between list/create and kill; never kill the
-    /// replacement when either expected value no longer matches.
-    expected_pid: i32 = 0,
-    expected_wl_display: []const u8 = "",
-};
-
-/// `control_req` payload. Unknown ops are ignored (append-only).
-pub const ControlReq = struct {
-    op: []const u8 = "",
-};
-
-/// `log_get` request. Exactly one selector applies, in this order:
-/// `id` (one line, full bytes) > `from_id` (up to 500 lines from that
-/// id) > `tail` (last N lines). `max_chars` bounds each line in the
-/// reply (0 = full stored bytes).
-pub const LogGetReq = struct {
-    tail: u32 = 100,
-    from_id: u64 = 0,
-    id: u64 = 0,
-    max_chars: u32 = 300,
-    /// Echoed in the reply header (when nonzero) so a client can match
-    /// replies to requests — a reply buried behind a frame backlog can
-    /// surface during a LATER request's wait.
-    nonce: u64 = 0,
-};
-
-pub const RenameReq = struct {
-    name: []const u8 = "",
-    new_name: []const u8 = "",
-};
-
-pub const SessionInfo = struct {
-    name: []const u8,
-    /// Immutable spawn-time name retained as display/legacy metadata. It may
-    /// remain an attach alias after `name` changes, but is not persistence
-    /// identity because a later same-name session can reuse it.
-    origin_name: []const u8 = "",
-    /// Lifetime-unique immutable persistence identity. Added compatibly: old
-    /// clients ignore it and old daemons omit it.
-    origin_id: []const u8 = "",
-    rows: u16,
-    cols: u16,
-    clients: u32,
-    exited: bool,
-    title: []const u8 = "",
-    app: bool = false,
-    /// Milliseconds since this session last produced output, computed on the
-    /// daemon's own clock at list time (never a client-vs-daemon timestamp
-    /// diff — a remote daemon's monotonic clock differs from the caller's).
-    idle_ms: i64 = 0,
-    /// Child's current working directory (from /proc, daemon-resolved). Empty
-    /// if unavailable. Lets `list` show it and gives layout-save a cwd source
-    /// for daemon-backed panes (which have no local pid).
-    cwd: []const u8 = "",
-    /// The session child's pid ON THE DAEMON'S HOST (0 = unknown). For a
-    /// string-command spawn this is the wrapping `/bin/sh`, not the app.
-    pid: i32 = 0,
-    /// An uncorked audio stream is playing right now — how a viewer finds
-    /// WHICH session is making sound without attaching to each in turn.
-    audio: bool = false,
-    /// Bounded per-stream identities reported by the session's internal
-    /// PulseAudio server. Empty when an older daemon has only `audio`.
-    audio_streams: []const pulse.AudioInfo = &.{},
-    /// External display session (`display create`) — its child is the
-    /// keeper, so the "terminal" is meaningless; what matters is the
-    /// environment below.
-    display: bool = false,
-    xwayland: bool = false,
-    x_display: []const u8 = "",
-    xauthority: []const u8 = "",
-    gpu: bool = false,
-    output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
-    output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
-    /// Absolute path of the session's Wayland display socket, its
-    /// PULSE_SERVER value and its private runtime dir (empty = none).
-    /// An external renderer needs these and must never guess them.
-    wl_display: []const u8 = "",
-    pulse_server: []const u8 = "",
-    runtime_dir: []const u8 = "",
-    /// No-viewer TTL in seconds (0 = none).
-    ttl_secs: u32 = 0,
-    /// Attached viewers, and a label for the one holding the controller
-    /// lease ("" = nobody). The label is "<kind>#<client id>" — stable
-    /// for the life of the connection, meaningless across daemons.
-    viewers: u32 = 0,
-    controller: []const u8 = "",
-};
+// Control-frame JSON payload schemas moved to wire.zig (the
+// compatibility surface); re-exported here so daemon-side callers and
+// older import paths keep working unchanged.
+pub const SpawnReq = wire.SpawnReq;
+pub const SpawnShellIntegration = wire.SpawnShellIntegration;
+pub const AttachReq = wire.AttachReq;
+pub const KillReq = wire.KillReq;
+pub const ControlReq = wire.ControlReq;
+pub const LogGetReq = wire.LogGetReq;
+pub const RenameReq = wire.RenameReq;
+pub const SessionInfo = wire.SessionInfo;
 
 /// A session answers to its current mutable name and to the immutable name it
 /// was spawned under, so a child that captured `$SKETERM_SESSION` before a
@@ -1908,14 +1690,7 @@ pub const Native = struct {
     }
 };
 
-/// Bind + listen on a fresh Unix socket. Shared with client.zig's
-/// connect for the sockaddr_un fill.
-pub fn fillSockaddrUn(addr: *c.struct_sockaddr_un, path: []const u8) error{BadPath}!void {
-    addr.* = std.mem.zeroes(c.struct_sockaddr_un);
-    addr.sun_family = c.AF_UNIX;
-    if (path.len >= addr.sun_path.len) return error.BadPath;
-    @memcpy(addr.sun_path[0..path.len], path);
-}
+pub const fillSockaddrUn = @import("sockpath.zig").fillSockaddrUn;
 
 /// Absolute (cwd-joined) but otherwise verbatim spelling of a socket path,
 /// length-checked against sockaddr_un; `canonicalSocketPath`'s first step,
@@ -6309,7 +6084,4 @@ pub const EventCollector = struct {
     }
 };
 
-pub fn defaultSocketPath(allocator: std.mem.Allocator) ![]u8 {
-    const rt = @import("../util/platform.zig").runtimeDir();
-    return std.fmt.allocPrint(allocator, "{s}/sketerm/mux.sock", .{rt});
-}
+pub const defaultSocketPath = @import("sockpath.zig").defaultSocketPath;

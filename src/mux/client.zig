@@ -5,7 +5,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const wire = @import("wire.zig");
-const daemon = @import("daemon.zig");
+const sockpath = @import("sockpath.zig");
 const deploy = @import("deploy.zig");
 const rudp = @import("rudp.zig");
 
@@ -196,7 +196,7 @@ pub const AttachIdentity = struct {
     name_len: u8 = 0,
     origin_name_buf: [64]u8 = undefined,
     origin_name_len: u8 = 0,
-    origin_id: daemon.SessionOriginId = undefined,
+    origin_id: wire.SessionOriginId = undefined,
     valid: bool = false,
 
     pub fn name(self: *const AttachIdentity) []const u8 {
@@ -224,7 +224,7 @@ pub const AttachIdentity = struct {
         const meta = parsed.value;
         if (meta.name.len == 0 or meta.name.len > 64 or
             meta.origin_name.len == 0 or meta.origin_name.len > 64 or
-            !daemon.validSessionOriginId(meta.origin_id))
+            !wire.validSessionOriginId(meta.origin_id))
             return error.MalformedAttachIdentity;
         var identity = AttachIdentity{};
         identity.name_len = @intCast(meta.name.len);
@@ -315,7 +315,7 @@ pub const Conn = struct {
     panel_origin_name: [64]u8 = undefined,
     panel_origin_name_len: usize = 0,
     /// Lifetime-unique immutable session incarnation returned by attach.
-    panel_origin_id: daemon.SessionOriginId = undefined,
+    panel_origin_id: wire.SessionOriginId = undefined,
     panel_origin_id_valid: bool = false,
 
     pub fn connect(allocator: std.mem.Allocator, sock_path: []const u8) !Conn {
@@ -323,7 +323,7 @@ pub const Conn = struct {
         if (fd < 0) return error.SocketFailed;
         errdefer _ = c.close(fd);
         var addr: c.struct_sockaddr_un = undefined;
-        try daemon.fillSockaddrUn(&addr, sock_path);
+        try sockpath.fillSockaddrUn(&addr, sock_path);
         if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return error.ConnectFailed;
         return .{ .allocator = allocator, .fd = fd };
     }
@@ -354,7 +354,7 @@ pub const Conn = struct {
         const path = if (sock_path) |p|
             try allocator.dupe(u8, p)
         else
-            try daemon.defaultSocketPath(allocator);
+            try sockpath.defaultSocketPath(allocator);
         defer allocator.free(path);
         if (Conn.connect(allocator, path)) |conn| {
             return probe(allocator, conn);
@@ -1747,7 +1747,7 @@ pub fn connectPanelRequesterUntilExpected(
     if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) != 0)
         return error.NonBlockingFailed;
     var addr: c.struct_sockaddr_un = undefined;
-    try daemon.fillSockaddrUn(&addr, sock_path);
+    try sockpath.fillSockaddrUn(&addr, sock_path);
     if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
     const rc = c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un));
     if (rc != 0) {
@@ -1814,7 +1814,7 @@ pub fn connectPanelRequesterUntilExpected(
     const origin_name = parsed.value.origin_name orelse return error.MalformedPanelAttachMetadata;
     const origin_id = parsed.value.origin_id orelse return error.MalformedPanelAttachMetadata;
     if (!parsed.value.ok or !parsed.value.panel_only or origin_name.len == 0 or
-        origin_name.len > conn.panel_origin_name.len or !daemon.validSessionOriginId(origin_id))
+        origin_name.len > conn.panel_origin_name.len or !wire.validSessionOriginId(origin_id))
         return error.MalformedPanelAttachMetadata;
     if (expected_origin_id.len > 0 and !std.mem.eql(u8, expected_origin_id, origin_id))
         return error.SessionOriginMismatch;
@@ -1885,7 +1885,7 @@ test "panel requester connect, hello, and attach share one absolute deadline" {
     try t.expect(listener >= 0);
     defer _ = c.close(listener);
     var addr: c.struct_sockaddr_un = undefined;
-    try daemon.fillSockaddrUn(&addr, path);
+    try sockpath.fillSockaddrUn(&addr, path);
     try t.expectEqual(@as(c_int, 0), c.bind(listener, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)));
     try t.expectEqual(@as(c_int, 0), c.listen(listener, 1));
 
@@ -1969,7 +1969,7 @@ fn panelAttachListener(path: [:0]const u8) !c_int {
     if (listener < 0) return error.SocketFailed;
     errdefer _ = c.close(listener);
     var addr: c.struct_sockaddr_un = undefined;
-    try daemon.fillSockaddrUn(&addr, path);
+    try sockpath.fillSockaddrUn(&addr, path);
     if (c.bind(listener, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0)
         return error.BindFailed;
     if (c.listen(listener, 1) != 0) return error.ListenFailed;
@@ -2065,7 +2065,7 @@ test "local daemon origin is the exact connected listener, never a default guess
     try t.expect(listener >= 0);
     defer _ = c.close(listener);
     var addr: c.struct_sockaddr_un = undefined;
-    try daemon.fillSockaddrUn(&addr, path);
+    try sockpath.fillSockaddrUn(&addr, path);
     try t.expectEqual(@as(c_int, 0), c.bind(listener, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)));
     try t.expectEqual(@as(c_int, 0), c.listen(listener, 1));
 
@@ -2349,7 +2349,7 @@ test "identity-first GUI attach survives loss before trailing metadata and fence
     });
     const request = try replacement.recvExpectFor(&.{.attach}, 1_000);
     defer request.deinit(a);
-    var parsed = try std.json.parseFromSlice(daemon.AttachReq, a, request.payload, .{});
+    var parsed = try std.json.parseFromSlice(wire.AttachReq, a, request.payload, .{});
     defer parsed.deinit();
     try t.expectEqualStrings(origin_id, parsed.value.origin_id);
     try t.expect(parsed.value.identity_first);

@@ -198,6 +198,42 @@ pub fn build(b: *std.Build) void {
     const mux_step = b.step("mux", "Build the sketerm-mux session daemon");
     mux_step.dependOn(&b.addInstallArtifact(mux_exe, .{}).step);
 
+    // Public mux-client SDK — the supported module for OUT-OF-REPO
+    // daemon clients (agent harnesses, automation). Consumers add
+    // sketerm as a build.zig.zon dependency and import
+    // `dep.module("mux-client")`; the module carries its own core
+    // cbindings + build_options, so a consumer never touches that
+    // plumbing. Same lean dep set as sketerm-mux (libc only, no
+    // GTK/GLib) — `mux-client-check` below is the guard that keeps
+    // the exported graph that way.
+    const mux_client_mod = b.addModule("mux-client", .{
+        .root_source_file = b.path("src/mux_client_root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureCoreDeps(b, mux_client_mod, core_cbindings_mod);
+    mux_client_mod.addImport("build_options", noglib_opts_mod);
+
+    const mux_client_check_mod = b.createModule(.{
+        .root_source_file = b.path("src/mux_client_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .strip = strip,
+    });
+    mux_client_check_mod.addImport("mux-client", mux_client_mod);
+    const mux_client_check_exe = b.addExecutable(.{
+        .name = "mux-client-check",
+        .root_module = mux_client_check_mod,
+        .use_lld = use_lld,
+    });
+    const mux_client_check_step = b.step(
+        "mux-client-check",
+        "Compile the public mux-client SDK module standalone (guards its lean dep graph)",
+    );
+    mux_client_check_step.dependOn(&mux_client_check_exe.step);
+
     // Portable daemon for server deployment — `zig build mux-portable`.
     // The default build targets the NATIVE CPU (ReleaseFast), so a
     // binary built on a Zen 4 laptop SIGILLs on a Zen 2 server (AVX-512

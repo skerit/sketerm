@@ -30,8 +30,10 @@ const vcodec = @import("vcodec.zig");
 const build_options = @import("build_options");
 const native_endian = @import("builtin").cpu.arch.endian();
 
-pub const DEFAULT_OUTPUT_WIDTH: u32 = 1920;
-pub const DEFAULT_OUTPUT_HEIGHT: u32 = 1080;
+// Defined in the mux wire surface (SpawnReq/SessionInfo defaults);
+// re-exported here for compositor-side callers.
+pub const DEFAULT_OUTPUT_WIDTH = @import("../mux/wire.zig").DEFAULT_OUTPUT_WIDTH;
+pub const DEFAULT_OUTPUT_HEIGHT = @import("../mux/wire.zig").DEFAULT_OUTPUT_HEIGHT;
 
 /// Default pc105/us xkb keymap; alternatives in keymaps.zig, chosen
 /// per session via the spawn `kb_layout` option (Compositor.keymap).

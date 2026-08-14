@@ -124,14 +124,9 @@ pub const UnitTag = enum(u8) {
     _,
 };
 
-pub const AudioInfo = struct {
-    application: []const u8 = "",
-    binary: []const u8 = "",
-    media: []const u8 = "",
-    icon: []const u8 = "",
-    pid: u32 = 0,
-    running: bool = false,
-};
+/// Moved to wire.zig (it crosses the wire inside SessionInfo);
+/// re-exported so pulse-side callers keep their spelling.
+pub const AudioInfo = @import("wire.zig").AudioInfo;
 
 const META_VERSION: u8 = 1;
 /// Sizing input for the broker's worker-control buffer — see
