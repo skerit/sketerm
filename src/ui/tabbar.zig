@@ -23,7 +23,12 @@ const TAB_W: c_int = 170;
 /// Window points it at the real one (and in tests).
 var default_config: Config = .{};
 
-const Dragged = struct {
+/// One page in flight. Public because the tree-style sidebar publishes
+/// and consumes the SAME state: a tab dragged out of a sidebar row and
+/// one dragged out of the strip are the same gesture to every drop
+/// target, which is what gives the sidebar strip parity (cross-window
+/// transfer, drag-out-to-new-window) instead of a second half-drag.
+pub const Dragged = struct {
     view: *c.AdwTabView,
     page: *c.AdwTabPage,
     detach_ctx: ?*anyopaque,
@@ -42,6 +47,49 @@ fn releaseDragged(d: Dragged) void {
 fn clearDragged() void {
     if (dragged) |d| releaseDragged(d);
     dragged = null;
+}
+
+/// Start carrying `page`; refs both objects for the drag's lifetime.
+pub fn publishDrag(
+    view: *c.AdwTabView,
+    page: *c.AdwTabPage,
+    detach_ctx: ?*anyopaque,
+    on_detach: ?*const fn (ctx: ?*anyopaque, view: *c.AdwTabView, page: *c.AdwTabPage) void,
+) void {
+    clearDragged();
+    _ = c.g_object_ref(view);
+    _ = c.g_object_ref(page);
+    dragged = .{ .view = view, .page = page, .detach_ctx = detach_ctx, .on_detach = on_detach };
+}
+
+pub fn currentDrag() ?Dragged {
+    return dragged;
+}
+
+/// Take the drag over: the caller becomes responsible for `releaseDrag`.
+pub fn takeDrag() ?Dragged {
+    const d = dragged orelse return null;
+    dragged = null;
+    return d;
+}
+
+pub fn releaseDrag(d: Dragged) void {
+    releaseDragged(d);
+}
+
+pub fn clearDrag() void {
+    clearDragged();
+}
+
+/// A GDK drag carrying a page ended without a drop target: hand the page
+/// to the detach callback (drag-out spawns a window for it). Answers
+/// whether the cancel was consumed.
+pub fn dragCancelled(reason: c_int) bool {
+    const d = dragged orelse return false;
+    defer clearDragged();
+    if (reason != c.GDK_DRAG_CANCEL_NO_TARGET) return false;
+    if (d.on_detach) |f| f(d.detach_ctx, d.view, d.page);
+    return true;
 }
 
 // ── custom widget types ──────────────────────────────────────────────
@@ -956,10 +1004,7 @@ fn beginExternalDrag(self: *TabBar, controller: *c.GtkEventController, tab: *Tab
     const native = c.gtk_widget_get_native(self.box) orelse return;
     const surface = c.gtk_native_get_surface(native) orelse return;
     const device = c.gtk_event_controller_get_current_event_device(controller) orelse return;
-    clearDragged();
-    _ = c.g_object_ref(self.view);
-    _ = c.g_object_ref(tab.page);
-    dragged = .{ .view = self.view, .page = tab.page, .detach_ctx = self.detach_ctx, .on_detach = self.on_detach };
+    publishDrag(self.view, tab.page, self.detach_ctx, self.on_detach);
     const content = c.gdk_content_provider_new_typed(c.G_TYPE_INT, @as(c_int, 1));
     const drag = c.gdk_drag_begin(surface, device, content, c.GDK_ACTION_MOVE, -hot_x, -hot_y) orelse {
         clearDragged();
@@ -976,15 +1021,8 @@ fn beginExternalDrag(self: *TabBar, controller: *c.GtkEventController, tab: *Tab
 
 /// GDK drag ended with no drop target: spawn a new window for the tab
 /// (drag-out), the create-window half of libadwaita's behaviour.
-fn onGdkDragCancel(_: ?*anyopaque, reason: c_int, user: ?*anyopaque) callconv(.c) c.gboolean {
-    _ = user;
-    const d = dragged orelse return 0;
-    defer clearDragged();
-    if (reason == c.GDK_DRAG_CANCEL_NO_TARGET) {
-        if (d.on_detach) |f| f(d.detach_ctx, d.view, d.page);
-        return 1;
-    }
-    return 0;
+fn onGdkDragCancel(_: ?*anyopaque, reason: c_int, _: ?*anyopaque) callconv(.c) c.gboolean {
+    return @intFromBool(dragCancelled(reason));
 }
 
 fn onGdkDragFinished(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {

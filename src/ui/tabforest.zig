@@ -163,6 +163,25 @@ pub fn Forest(comptime Ref: type) type {
             }
         }
 
+        /// Move `ref` (subtree and all) to sit directly before or after
+        /// `anchor_ref`, adopting the anchor's parent — the sidebar's
+        /// drop-between-rows gesture. Anchor-relative rather than
+        /// index-based on purpose: the index of a sibling shifts when
+        /// the moved node is detached from that same list first.
+        pub fn moveNextTo(self: *Self, ref: Ref, anchor_ref: Ref, after: bool) !void {
+            const node = self.find(ref) orelse return error.NotFound;
+            const anchor = self.find(anchor_ref) orelse return error.NotFound;
+            if (node == anchor) return;
+            if (isAncestorOf(node, anchor)) return error.WouldCycle;
+            const sibs = self.siblingsOf(node);
+            const from = indexOf(sibs.items, node) orelse return error.NotFound;
+            _ = sibs.orderedRemove(from);
+            node.parent = anchor.parent;
+            const dest: *std.ArrayList(*Node) = if (anchor.parent) |p| &p.children else &self.roots;
+            const at = (indexOf(dest.items, anchor) orelse dest.items.len) + @intFromBool(after);
+            try dest.insert(self.allocator, at, node);
+        }
+
         pub fn setCollapsed(self: *Self, ref: Ref, v: bool) void {
             if (self.find(ref)) |n| n.collapsed = v;
         }
@@ -365,6 +384,36 @@ test "reparent moves whole subtree and rejects cycles" {
     defer flat.deinit(ta);
     try f.flattenAll(ta, &flat);
     try std.testing.expectEqualSlices(u32, &.{ 3, 4, 1, 2 }, flat.items);
+    try std.testing.expect(f.validate());
+}
+
+test "moveNextTo reorders among siblings and adopts the anchor's parent" {
+    var f = TF.init(ta);
+    defer f.deinit();
+    _ = try f.add(1);
+    _ = try f.add(2);
+    _ = try f.add(3);
+    _ = try f.addChild(4, 1, .last);
+
+    // Reorder among roots: 3 lands before 1. The detach happens first,
+    // so an index computed before it would have been off by one.
+    try f.moveNextTo(3, 1, false);
+    var flat: std.ArrayList(u32) = .empty;
+    defer flat.deinit(ta);
+    try f.flattenAll(ta, &flat);
+    try std.testing.expectEqualSlices(u32, &.{ 3, 1, 4, 2 }, flat.items);
+
+    // Dropping next to a CHILD adopts that child's parent.
+    try f.moveNextTo(3, 4, true);
+    try std.testing.expectEqual(@as(?u32, 1), f.parentOf(3));
+    flat.clearRetainingCapacity();
+    try f.flattenAll(ta, &flat);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 4, 3, 2 }, flat.items);
+
+    // Onto itself is a no-op; into its own subtree is refused.
+    try f.moveNextTo(1, 1, true);
+    try std.testing.expectError(error.WouldCycle, f.moveNextTo(1, 4, false));
+    try std.testing.expectError(error.NotFound, f.moveNextTo(1, 99, false));
     try std.testing.expect(f.validate());
 }
 

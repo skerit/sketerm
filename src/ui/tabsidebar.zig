@@ -16,6 +16,16 @@
 //! `Window.sidebarGroup` resolves which one on every rebuild, so a tab
 //! switch or a pane focus change flips the list without any state here.
 //!
+//! ## Drag
+//!
+//! A row drags like a strip tab because it IS the strip's drag: a
+//! window tab is published to `tabbar`'s shared state, so every
+//! window's strip accepts it and a drop on nothing detaches it into a
+//! new window. Within the sidebar the outer thirds of a row reorder
+//! (before / after it), the middle nests, and the empty space below the
+//! rows makes the tab a root again. A browser PAGE is the exception:
+//! it belongs to one pane's group, so it never leaves this sidebar.
+//!
 //! ## Rebuild cadence
 //!
 //! The Window owns it: forest mutations go through `Window.forestChanged`
@@ -31,6 +41,7 @@ const cssutil = @import("cssutil.zig");
 const input = @import("input.zig");
 const winmod = @import("window.zig");
 const Window = winmod.Window;
+const tabbar = @import("tabbar.zig");
 const webgroup = @import("webgroup.zig");
 const WebFace = @import("webface.zig").WebFace;
 
@@ -38,8 +49,58 @@ const WebFace = @import("webface.zig").WebFace;
 /// payload types don't carry pointers safely, so the payload is a
 /// dummy int and the item + source window live here for the drop
 /// handler to validate against.
+///
+/// A dragged WINDOW TAB is published to `tabbar`'s shared drag state
+/// INSTEAD, so the strip, the other windows' strips and the
+/// drag-out-to-a-new-window path all see the one gesture they already
+/// understand; `drag_item` then only ever carries a browser PAGE, which
+/// belongs to one window's group and cannot leave it.
 var drag_item: ?Item = null;
 var drag_win: ?*Window = null;
+
+/// Where a drop between rows would land, from the pointer's height
+/// inside the hovered row.
+const Zone = enum { above, into, below };
+
+/// The row currently wearing a drop-indicator class. Cleared whenever
+/// the row is torn down, so a rebuild under the pointer cannot leave a
+/// stale pointer behind.
+var drop_hint: ?*Sidebar.Row = null;
+
+const DROP_CLASSES = [_][*:0]const u8{ "tst-drop-above", "tst-drop-into", "tst-drop-below" };
+
+fn clearDropHint() void {
+    const r = drop_hint orelse return;
+    drop_hint = null;
+    for (DROP_CLASSES) |cls| c.gtk_widget_remove_css_class(r.row, cls);
+}
+
+fn setDropHint(r: *Sidebar.Row, zone: Zone) void {
+    if (drop_hint != r) clearDropHint();
+    drop_hint = r;
+    for (DROP_CLASSES, 0..) |cls, i| {
+        if (i == @intFromEnum(zone)) {
+            c.gtk_widget_add_css_class(r.row, cls);
+        } else {
+            c.gtk_widget_remove_css_class(r.row, cls);
+        }
+    }
+}
+
+/// The outer thirds of a row mean "between rows", the middle "into".
+/// A generous middle band on purpose: nesting is the gesture users
+/// reach for most, and a thin one is a lottery on a 26px row.
+fn zoneAt(r: *Sidebar.Row, y: f64) Zone {
+    const h: f64 = @floatFromInt(c.gtk_widget_get_height(r.row));
+    if (h <= 0) return .into;
+    if (y < h * 0.3) return .above;
+    if (y > h * 0.7) return .below;
+    return .into;
+}
+
+/// Painted like a selected row would be, but owned by us: the sidebar
+/// answers "which tab is current", not "which row has the cursor".
+const ACTIVE_CLASS = "sketerm-tst-active";
 
 const SIDEBAR_LIST_QDATA = "sketerm-tab-sidebar-list";
 const SIDEBAR_VIEW_QDATA = "sketerm-tab-sidebar-view";
@@ -84,8 +145,6 @@ pub const Sidebar = struct {
     root: *c.GtkWidget,
     list: ?*c.GtkWidget,
     rows: std.ArrayList(*Row) = .empty,
-    /// Guards the listbox-selection <-> tab-view-selection feedback loop.
-    syncing: bool = false,
     title_contexts: std.ArrayList(*TitleCtx) = .empty,
     /// The browser whose pages were listed at the last rebuild, null
     /// while the window's own tab tree was. It is a CHANGE MARKER, not
@@ -122,7 +181,13 @@ pub const Sidebar = struct {
         errdefer allocator.destroy(self);
 
         const list = c.gtk_list_box_new() orelse return error.GtkFail;
-        c.gtk_list_box_set_selection_mode(@ptrCast(list), c.GTK_SELECTION_SINGLE);
+        // NOT a selectable list. GtkListBox's own selection follows the
+        // keyboard cursor, so in SINGLE mode an arrow key inside the
+        // sidebar moved the highlight to a tab that was NOT current and
+        // nothing ever reconciled it — the flaky "active" row. The
+        // active tab is painted by an explicit class instead, which also
+        // keeps it marked while focus sits in a pane.
+        c.gtk_list_box_set_selection_mode(@ptrCast(list), c.GTK_SELECTION_NONE);
         c.gtk_widget_add_css_class(list, "sketerm-tst-list");
         c.gtk_widget_set_vexpand(list, 1);
         installCss(list);
@@ -171,10 +236,15 @@ pub const Sidebar = struct {
             c.G_CONNECT_DEFAULT,
         );
 
-        // Drop on the list's empty space -> make the dragged item a root.
+        // Drop on the sidebar's empty space -> make the dragged item a
+        // root. On the SCROLLER, not the list: the list is only as tall
+        // as its rows, so the space below them belongs to the scroller —
+        // and a drop the sidebar does not accept is a drop on nothing,
+        // which now detaches the tab into a new window.
         const drop = c.gtk_drop_target_new(c.G_TYPE_INT, c.GDK_ACTION_MOVE);
+        _ = c.g_signal_connect_data(drop, "motion", @ptrCast(&onListMotion), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onListDrop), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_widget_add_controller(list, @ptrCast(@alignCast(drop)));
+        c.gtk_widget_add_controller(scroller, @ptrCast(@alignCast(drop)));
 
         self.rebuild();
         return self;
@@ -187,6 +257,12 @@ pub const Sidebar = struct {
             drag_item = null;
             drag_win = null;
         }
+        // A shared drag started here carries this Window as its detach
+        // context; nothing may hand a dead one back.
+        if (tabbar.currentDrag()) |d| {
+            if (d.view == win.tab_view) tabbar.clearDrag();
+        }
+        clearDropHint();
         self.win = null;
         self.release();
     }
@@ -195,6 +271,7 @@ pub const Sidebar = struct {
         const list = self.list orelse return;
         while (self.rows.pop()) |r| {
             r.active = false;
+            if (drop_hint == r) drop_hint = null;
             if (drag_win == self.win and drag_item != null and drag_item.?.eql(r.item)) {
                 drag_item = null;
                 drag_win = null;
@@ -222,9 +299,37 @@ pub const Sidebar = struct {
             for (flat.items) |page| self.buildRow(.{ .tab = page }, forest.depth(page), forest.hasChildren(page), forest.isCollapsed(page));
         }
         self.refreshSelection();
+        self.pruneTitleWatches();
+    }
+
+    /// Drop title watches for pages no longer rowed here, so a tab
+    /// dragged to another window cannot pin this Sidebar (and its
+    /// arrays) alive until the page finalizes there.
+    fn pruneTitleWatches(self: *Sidebar) void {
+        var i: usize = 0;
+        outer: while (i < self.title_contexts.items.len) {
+            const ctx = self.title_contexts.items[i];
+            for (self.rows.items) |r| {
+                switch (r.item) {
+                    .tab => |page| if (page == ctx.page) {
+                        i += 1;
+                        continue :outer;
+                    },
+                    .page => {},
+                }
+            }
+            // The disconnect destroys the closure, whose GDestroyNotify
+            // (freeTitleCtx) swap-removes this entry and frees it — the
+            // list shrinks in place of advancing.
+            _ = c.g_signal_handlers_disconnect_matched(@ptrCast(ctx.page), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @ptrCast(ctx));
+        }
     }
 
     fn buildRow(self: *Sidebar, item: Item, depth: usize, has_kids: bool, collapsed: bool) void {
+        // Bail before building anything: constructing the row first and
+        // then unreffing it on a null list would finalize a FLOATING
+        // widget (a GLib critical per row).
+        const list = self.list orelse return;
         const r = self.allocator.create(Row) catch return;
 
         const box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
@@ -301,11 +406,6 @@ pub const Sidebar = struct {
         };
         self.retain();
         c.g_object_set_data_full(@ptrCast(row), ROW_QDATA, @ptrCast(r), @ptrCast(&freeRow));
-        const list = self.list orelse {
-            r.active = false;
-            c.g_object_unref(@ptrCast(row));
-            return;
-        };
         c.gtk_list_box_append(@ptrCast(list), row);
         setLabel(r);
         switch (item) {
@@ -321,15 +421,20 @@ pub const Sidebar = struct {
         _ = c.g_signal_connect_data(mclick, "pressed", @ptrCast(&onMiddlePressed), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(row, @ptrCast(@alignCast(mclick)));
 
-        // Drag this row -> reparent its subtree wherever it drops.
+        // Drag this row: same gesture as a strip tab, so it can reorder,
+        // nest, cross windows or drop out into a new window.
         const src = c.gtk_drag_source_new();
         c.gtk_drag_source_set_actions(src, c.GDK_ACTION_MOVE);
         _ = c.g_signal_connect_data(src, "prepare", @ptrCast(&onDragPrepare), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(src, "drag-begin", @ptrCast(&onDragBegin), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(src, "drag-cancel", @ptrCast(&onDragCancel), null, null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(src, "drag-end", @ptrCast(&onDragEnd), null, null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(row, @ptrCast(@alignCast(src)));
 
-        // Drop ON this row -> become a child of it.
+        // Drop on this row -> above it, into it, or below it.
         const drop = c.gtk_drop_target_new(c.G_TYPE_INT, c.GDK_ACTION_MOVE);
+        _ = c.g_signal_connect_data(drop, "motion", @ptrCast(&onRowMotion), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(drop, "leave", @ptrCast(&onRowLeave), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onRowDrop), @ptrCast(r), null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(row, @ptrCast(@alignCast(drop)));
 
@@ -377,7 +482,8 @@ pub const Sidebar = struct {
         }
     }
 
-    /// Move the listbox highlight to whatever the source calls current.
+    /// Mark the row of whatever the source calls current, and unmark
+    /// every other one.
     pub fn refreshSelection(self: *Sidebar) void {
         const sel: ?Item = blk: {
             if (self.liveGroup()) |g| {
@@ -388,19 +494,14 @@ pub const Sidebar = struct {
             const page = c.adw_tab_view_get_selected_page(win.tab_view) orelse break :blk null;
             break :blk Item{ .tab = page };
         };
-        self.syncing = true;
-        defer self.syncing = false;
-        if (sel) |want| {
-            for (self.rows.items) |r| {
-                if (r.item.eql(want)) {
-                    const list = self.list orelse return;
-                    c.gtk_list_box_select_row(@ptrCast(list), @ptrCast(r.row));
-                    return;
-                }
+        for (self.rows.items) |r| {
+            const active = if (sel) |want| r.item.eql(want) else false;
+            if (active) {
+                c.gtk_widget_add_css_class(r.row, ACTIVE_CLASS);
+            } else {
+                c.gtk_widget_remove_css_class(r.row, ACTIVE_CLASS);
             }
         }
-        const list = self.list orelse return;
-        c.gtk_list_box_unselect_all(@ptrCast(list));
     }
 
     fn retain(self: *Sidebar) void {
@@ -427,6 +528,7 @@ pub const Sidebar = struct {
 
     fn freeRow(user: ?*anyopaque) callconv(.c) void {
         const r = cast.userData(Row, user);
+        if (drop_hint == r) drop_hint = null;
         const sidebar = r.sidebar;
         r.sidebar = null;
         if (sidebar) |self| {
@@ -457,7 +559,6 @@ pub const Sidebar = struct {
     fn onRowActivated(_: *c.GtkListBox, row: ?*c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(Sidebar, user);
         const win = self.win orelse return;
-        if (self.syncing) return;
         const rw = row orelse return;
         for (self.rows.items) |r| {
             if (@as(*c.GtkListBoxRow, @ptrCast(r.row)) == rw) {
@@ -479,13 +580,7 @@ pub const Sidebar = struct {
     ) callconv(.c) c.gboolean {
         const self = cast.userData(Sidebar, user);
         const win = self.win orelse return 0;
-        const lower = c.gdk_keyval_to_lower(keyval);
-        const bindings: []const input.Binding = if (win.bindings.items.len > 0)
-            win.bindings.items
-        else
-            &input.default_bindings;
-        const action = input.matchBinding(bindings, lower, state) orelse
-            input.matchBinding(bindings, keyval, state) orelse return 0;
+        const action = input.matchWithDefaults(win.bindings.items, keyval, state) orelse return 0;
         winmod.dispatchAction(win, action);
         return 1;
     }
@@ -569,85 +664,190 @@ pub const Sidebar = struct {
             .page => |face| {
                 const g = self.liveGroup() orelse return;
                 if (!g.has(face)) return;
-                g.closePage(face, switch (win.config.tab_close_parent) {
-                    .promote => .promote,
-                    .close_subtree => .close_subtree,
-                });
+                g.closePage(face, g.closePolicy());
             },
         }
     }
+
+    // ── drag and drop ────────────────────────────────────────────
+    //
+    // A window tab travels as `tabbar`'s shared drag (the strip's own
+    // payload), so the sidebar reaches parity for free: the strips of
+    // every window already accept it, and a drag that finds no target
+    // detaches into a new window through the same callback. Only the
+    // browser-PAGE case stays sidebar-private, because a page belongs
+    // to one pane's group and has nowhere to land outside it.
 
     fn onDragPrepare(_: *c.GtkDragSource, _: f64, _: f64, user: ?*anyopaque) callconv(.c) ?*c.GdkContentProvider {
         const r = cast.userData(Row, user);
         if (!r.active) return null;
         const self = r.sidebar orelse return null;
         const win = self.win orelse return null;
-        drag_item = r.item;
-        drag_win = win;
-        var v: c.GValue = std.mem.zeroes(c.GValue);
-        _ = c.g_value_init(&v, c.G_TYPE_INT);
-        c.g_value_set_int(&v, 1);
-        const provider = c.gdk_content_provider_new_for_value(&v);
-        c.g_value_unset(&v);
-        return provider;
+        tabbar.clearDrag();
+        drag_item = null;
+        drag_win = null;
+        switch (r.item) {
+            .tab => |page| tabbar.publishDrag(win.tab_view, page, win.tabbar.detach_ctx, win.tabbar.on_detach),
+            .page => {
+                drag_item = r.item;
+                drag_win = win;
+            },
+        }
+        return c.gdk_content_provider_new_typed(c.G_TYPE_INT, @as(c_int, 1));
+    }
+
+    /// Carry a live picture of the row, like the strip carries a
+    /// picture of the tab.
+    fn onDragBegin(src: *c.GtkDragSource, _: *c.GdkDrag, user: ?*anyopaque) callconv(.c) void {
+        const r = cast.userData(Row, user);
+        if (!r.active) return;
+        const paintable = c.gtk_widget_paintable_new(r.row) orelse return;
+        defer c.g_object_unref(paintable);
+        c.gtk_drag_source_set_icon(src, @ptrCast(paintable), 0, 0);
+    }
+
+    /// Dropped on nothing: the strip's drag-out behaviour, which spawns
+    /// a window for the page.
+    fn onDragCancel(_: *c.GtkDragSource, _: *c.GdkDrag, reason: c_int, _: ?*anyopaque) callconv(.c) c.gboolean {
+        clearDropHint();
+        drag_item = null;
+        drag_win = null;
+        // Same refusals the strip makes before it detaches: a window's
+        // only tab has nowhere to go, and a pinned tab stays put.
+        if (tabbar.currentDrag()) |d| {
+            if (c.adw_tab_view_get_n_pages(d.view) <= 1 or c.adw_tab_page_get_pinned(d.page) != 0) {
+                tabbar.clearDrag();
+                return 0;
+            }
+        }
+        return @intFromBool(tabbar.dragCancelled(reason));
     }
 
     fn onDragEnd(_: *c.GtkDragSource, _: *c.GdkDrag, _: c.gboolean, _: ?*anyopaque) callconv(.c) void {
+        clearDropHint();
         drag_item = null;
         drag_win = null;
+        tabbar.clearDrag();
     }
 
-    fn onRowDrop(_: *c.GtkDropTarget, _: *const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+    /// Can this row take what is in flight, and where would it land?
+    fn dropTargetFor(r: *Row) ?Item {
+        if (!r.active) return null;
+        const self = r.sidebar orelse return null;
+        const win = self.win orelse return null;
+        if (tabbar.currentDrag() != null) {
+            // A window tab only nests among window tabs, never into a
+            // list of browser pages.
+            return if (r.item == .tab) r.item else null;
+        }
+        const item = drag_item orelse return null;
+        if (drag_win != win) return null;
+        if (item.eql(r.item)) return null;
+        return if (r.item == .page) r.item else null;
+    }
+
+    fn onRowMotion(_: *c.GtkDropTarget, _: f64, y: f64, user: ?*anyopaque) callconv(.c) c.GdkDragAction {
         const r = cast.userData(Row, user);
-        if (!r.active) return 0;
+        if (dropTargetFor(r) == null) {
+            clearDropHint();
+            return 0;
+        }
+        setDropHint(r, zoneAt(r, y));
+        return c.GDK_ACTION_MOVE;
+    }
+
+    fn onRowLeave(_: *c.GtkDropTarget, user: ?*anyopaque) callconv(.c) void {
+        const r = cast.userData(Row, user);
+        if (drop_hint == r) clearDropHint();
+    }
+
+    fn onRowDrop(_: *c.GtkDropTarget, _: *const c.GValue, _: f64, y: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const r = cast.userData(Row, user);
+        clearDropHint();
+        const anchor = dropTargetFor(r) orelse return 0;
         const self = r.sidebar orelse return 0;
         const win = self.win orelse return 0;
-        const item = drag_item orelse return 0;
-        // Same-window only: the forest holds per-window state, and a
-        // cross-window page move must go through AdwTabView transfer.
-        if (drag_win != win) return 0;
-        if (item.eql(r.item)) return 0;
-        return self.reparent(item, r.item);
+        const zone = zoneAt(r, y);
+        if (tabbar.takeDrag()) |d| {
+            defer tabbar.releaseDrag(d);
+            const page = switch (anchor) {
+                .tab => |p| p,
+                .page => return 0,
+            };
+            if (d.view != win.tab_view) {
+                // Another window's tab: hand it over the way the strip
+                // does, then place it in THIS window's forest. The
+                // PaneTree travels with the page as qdata.
+                var pos = c.adw_tab_view_get_page_position(win.tab_view, page);
+                if (zone == .below or zone == .into) pos += 1;
+                if (!win.transferPageFrom(d.view, d.page, pos)) return 0;
+            } else if (d.page == page) {
+                return 0;
+            }
+            switch (zone) {
+                .into => win.tabForestReparent(d.page, page),
+                .above => win.tabForestMoveNextTo(d.page, page, false),
+                .below => win.tabForestMoveNextTo(d.page, page, true),
+            }
+            c.adw_tab_view_set_selected_page(win.tab_view, d.page);
+            return 1;
+        }
+        const face = switch (drag_item orelse return 0) {
+            .page => |f| f,
+            .tab => return 0,
+        };
+        const onto = switch (anchor) {
+            .page => |f| f,
+            .tab => return 0,
+        };
+        const g = self.liveGroup() orelse return 0;
+        const moved = switch (zone) {
+            .into => g.forest.reparent(face, onto, g.childInsertPos()),
+            .above => g.forest.moveNextTo(face, onto, false),
+            .below => g.forest.moveNextTo(face, onto, true),
+        };
+        moved catch |err| {
+            if (err == error.WouldCycle)
+                winmod.showToast(win, "Cannot drop a tab into its own subtree.");
+            return 0;
+        };
+        self.rebuild();
+        return 1;
     }
 
+    fn onListMotion(_: *c.GtkDropTarget, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.GdkDragAction {
+        const self = cast.userData(Sidebar, user);
+        clearDropHint();
+        if (self.win == null) return 0;
+        if (tabbar.currentDrag() != null) return if (self.liveGroup() == null) c.GDK_ACTION_MOVE else 0;
+        if (drag_item != null and drag_win == self.win) return c.GDK_ACTION_MOVE;
+        return 0;
+    }
+
+    /// The empty space below the rows: make the dragged item a root.
     fn onListDrop(_: *c.GtkDropTarget, _: *const c.GValue, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(Sidebar, user);
+        clearDropHint();
         const win = self.win orelse return 0;
-        const item = drag_item orelse return 0;
-        if (drag_win != win) return 0;
-        // Only the empty space below the rows means "make it a root";
-        // drops on a row are claimed by the row's own target first.
-        return self.reparent(item, null);
-    }
-
-    /// Reparent within whichever forest both items belong to. A drop
-    /// that crosses the two sources is refused rather than guessed at.
-    fn reparent(self: *Sidebar, item: Item, onto: ?Item) c.gboolean {
-        const win = self.win orelse return 0;
-        switch (item) {
-            .tab => |page| {
-                const parent: ?*c.AdwTabPage = if (onto) |o| switch (o) {
-                    .tab => |p| p,
-                    .page => return 0,
-                } else null;
-                win.tabForestReparent(page, parent);
-                return 1;
-            },
-            .page => |face| {
-                const g = self.liveGroup() orelse return 0;
-                const parent: ?*WebFace = if (onto) |o| switch (o) {
-                    .page => |f| f,
-                    .tab => return 0,
-                } else null;
-                g.forest.reparent(face, parent, g.childInsertPos()) catch |err| {
-                    if (err == error.WouldCycle)
-                        winmod.showToast(win, "Cannot drop a tab into its own subtree.");
-                    return 0;
-                };
-                self.rebuild();
-                return 1;
-            },
+        if (tabbar.takeDrag()) |d| {
+            defer tabbar.releaseDrag(d);
+            if (self.liveGroup() != null) return 0;
+            if (d.view != win.tab_view and
+                !win.transferPageFrom(d.view, d.page, c.adw_tab_view_get_n_pages(win.tab_view)))
+                return 0;
+            win.tabForestReparent(d.page, null);
+            c.adw_tab_view_set_selected_page(win.tab_view, d.page);
+            return 1;
         }
+        const face = switch (drag_item orelse return 0) {
+            .page => |f| f,
+            .tab => return 0,
+        };
+        if (drag_win != win) return 0;
+        const g = self.liveGroup() orelse return 0;
+        g.forest.reparent(face, null, g.childInsertPos()) catch return 0;
+        self.rebuild();
+        return 1;
     }
 };
 
@@ -674,9 +874,25 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\list.sketerm-tst-list > row.sketerm-tst-row:hover {
         \\  background-color: alpha(currentColor, 0.17);
         \\}
-        \\list.sketerm-tst-list > row.sketerm-tst-row:selected {
+        \\/* The ACTIVE tab's row. Our own class, not `:selected`: the
+        \\   list has no selection, so this stays put while focus is in a
+        \\   pane and cannot drift with the keyboard cursor. */
+        \\list.sketerm-tst-list > row.sketerm-tst-row.sketerm-tst-active,
+        \\list.sketerm-tst-list > row.sketerm-tst-row.sketerm-tst-active:hover {
         \\  background-color: @theme_selected_bg_color;
         \\  color: @theme_selected_fg_color;
+        \\}
+        \\/* Where a drop would land: a line between rows, a frame for a
+        \\   drop INTO the row (making the dragged tab its child). */
+        \\list.sketerm-tst-list > row.sketerm-tst-row.tst-drop-above {
+        \\  box-shadow: inset 0 3px 0 0 @theme_selected_bg_color;
+        \\}
+        \\list.sketerm-tst-list > row.sketerm-tst-row.tst-drop-below {
+        \\  box-shadow: inset 0 -3px 0 0 @theme_selected_bg_color;
+        \\}
+        \\list.sketerm-tst-list > row.sketerm-tst-row.tst-drop-into {
+        \\  outline: 2px solid @theme_selected_bg_color;
+        \\  outline-offset: -2px;
         \\}
         \\.sketerm-tst-body { min-height: 26px; padding: 0 2px 0 0; }
         \\.sketerm-tst-title { font-size: 0.92em; }
@@ -691,7 +907,7 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\  transition: opacity 120ms ease-out;
         \\}
         \\row.sketerm-tst-row:hover button.sketerm-tst-close,
-        \\row.sketerm-tst-row:selected button.sketerm-tst-close { opacity: 1; }
+        \\row.sketerm-tst-row.sketerm-tst-active button.sketerm-tst-close { opacity: 1; }
         \\button.sketerm-tst-close:hover { background: alpha(currentColor, 0.2); }
         \\/* The window paints every `paned > separator` as a solid
         \\   pane-gap bar (winconfig `refreshTitlebarCss`). This divider
