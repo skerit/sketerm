@@ -192,30 +192,35 @@ fn parseAction(a: std.mem.Allocator, value: std.json.Value) ParseError!?BrowserA
     var act = BrowserAction{};
     act.default_title = dupStr(a, o.get("default_title"));
     act.default_popup = dupStr(a, o.get("default_popup"));
-    // default_icon may be a string or an object keyed by size.
-    // Prefer the largest toolbar-sized entry, then any entry.
     if (o.get("default_icon")) |di| {
-        if (di == .string) {
-            act.default_icon = a.dupe(u8, di.string) catch return error.OutOfMemory;
-        } else if (di == .object) {
-            var best: ?[]const u8 = null;
-            var best_size: u32 = 0;
-            var best_fits = false;
-            var it = di.object.iterator();
-            while (it.next()) |entry| {
-                if (entry.value_ptr.* != .string) continue;
-                const size = std.fmt.parseInt(u32, entry.key_ptr.*, 10) catch 0;
-                const fits = size <= 64;
-                if (best == null or (fits and (!best_fits or size > best_size))) {
-                    best = entry.value_ptr.string;
-                    best_size = size;
-                    best_fits = fits;
-                }
-            }
-            if (best) |path| act.default_icon = a.dupe(u8, path) catch return error.OutOfMemory;
-        }
+        if (iconFromValue(di)) |path| act.default_icon = a.dupe(u8, path) catch return error.OutOfMemory;
     }
     return act;
+}
+
+/// Resolve an MV2 icon value — a plain path string, or an object keyed
+/// by pixel size, preferring the largest toolbar-sized (<=64) entry and
+/// falling back to any entry. Shared with `browserAction.setIcon`.
+///
+/// @return a slice borrowing `v`; the caller copies it.
+pub fn iconFromValue(v: std.json.Value) ?[]const u8 {
+    if (v == .string) return v.string;
+    if (v != .object) return null;
+    var best: ?[]const u8 = null;
+    var best_size: u32 = 0;
+    var best_fits = false;
+    var it = v.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        const size = std.fmt.parseInt(u32, entry.key_ptr.*, 10) catch 0;
+        const fits = size <= 64;
+        if (best == null or (fits and (!best_fits or size > best_size))) {
+            best = entry.value_ptr.string;
+            best_size = size;
+            best_fits = fits;
+        }
+    }
+    return best;
 }
 
 fn dupStr(a: std.mem.Allocator, val: ?std.json.Value) ?[]const u8 {
@@ -294,16 +299,13 @@ pub fn originHost(id: []const u8, out: []u8) []const u8 {
     return hex16(0x0B18E17, id, out);
 }
 
+/// The 16-hex-digit rendering of a Wyhash digest, the same one
+/// `filtersub.cacheName` prints — zero-padded, so a small digest still
+/// occupies the full width a caller slices out.
 fn hex16(seed: u64, bytes: []const u8, out: []u8) []const u8 {
     var h = std.hash.Wyhash.init(seed);
     h.update(bytes);
-    const digest = h.final();
-    const hexd = "0123456789abcdef";
-    var i: usize = 0;
-    while (i < 16) : (i += 1) {
-        out[i] = hexd[(digest >> @intCast((15 - i) * 4)) & 0xf];
-    }
-    return out[0..16];
+    return std.fmt.bufPrint(out, "{x:0>16}", .{h.final()}) catch unreachable;
 }
 
 // ─── tests ──────────────────────────────────────────────────────────

@@ -19,6 +19,7 @@ const c = @import("cbindings");
 const build_options = @import("build_options");
 const cefhost = @import("cefhost.zig");
 const server = @import("server.zig");
+const pathz = @import("../util/pathz.zig");
 
 const USAGE =
     \\sketerm-web --socket PATH [--cache-dir PATH]
@@ -341,16 +342,5 @@ fn defaultCacheDir(gpa: std.mem.Allocator) ?[]const u8 {
 /// mkdir -p, ignoring every failure but the one that matters (a
 /// missing cache dir surfaces as a cef_initialize failure).
 fn mkdirAll(path: []const u8) void {
-    var buf: [4096]u8 = undefined;
-    if (path.len + 1 > buf.len) return;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    var i: usize = 1;
-    while (i <= path.len) : (i += 1) {
-        if (i != path.len and buf[i] != '/') continue;
-        const save = buf[i];
-        buf[i] = 0;
-        _ = c.mkdir(@ptrCast(&buf), 0o700);
-        buf[i] = save;
-    }
+    pathz.makeDirs(path, 0o700) catch {};
 }

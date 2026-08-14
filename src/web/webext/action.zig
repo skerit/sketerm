@@ -3,6 +3,7 @@
 const std = @import("std");
 const manifest = @import("manifest.zig");
 const tabs = @import("tabs.zig");
+const envelope = @import("reply.zig");
 
 pub const Values = struct {
     title: []const u8 = "",
@@ -121,8 +122,14 @@ pub const State = struct {
     }
 
     /// Apply one `browserAction` call and return an owned JSON result.
+    ///
+    /// Kind is enforced HERE, not only in the JS surface: a raw ext-call
+    /// can name any method, and a page action must not grow the badge or
+    /// enablement state MV2 reserves for browser actions.
     pub fn dispatch(self: *State, gpa: std.mem.Allocator, method: []const u8, args_json: []const u8) []u8 {
         if (!self.present) return result(gpa, false, "extension has no action");
+        if (self.kind == .page and browserActionOnly(method))
+            return result(gpa, false, "method requires browserAction");
         var parsed = std.json.parseFromSlice(std.json.Value, gpa, args_json, .{}) catch
             return result(gpa, false, "bad args");
         defer parsed.deinit();
@@ -281,45 +288,36 @@ fn colorValue(v: std.json.Value) ?Color {
     return .{ .r = channels[0], .g = channels[1], .b = channels[2], .a = channels[3] };
 }
 
+/// Badge and enablement methods MV2 defines on browserAction only.
+fn browserActionOnly(method: []const u8) bool {
+    const names = [_][]const u8{
+        "enable",             "disable",           "isEnabled",
+        "setBadgeText",       "getBadgeText",      "setBadgeTextColor",
+        "setBadgeBackgroundColor",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, method, n)) return true;
+    }
+    return false;
+}
+
 fn optionalTab(args: []const std.json.Value, index: usize) !?u32 {
     if (args.len <= index) return null;
     return tabs.u32Of(args[index]) orelse error.BadTabId;
 }
 
 fn iconPath(v: std.json.Value) ?[]const u8 {
-    if (v == .string) return v.string;
-    if (v != .object) return null;
-    var best: ?[]const u8 = null;
-    var best_size: u32 = 0;
-    var best_fits = false;
-    var it = v.object.iterator();
-    while (it.next()) |kv| {
-        if (kv.value_ptr.* != .string) continue;
-        const size = std.fmt.parseInt(u32, kv.key_ptr.*, 10) catch 0;
-        const fits = size <= 64;
-        if (best == null or (fits and (!best_fits or size > best_size))) {
-            best = kv.value_ptr.string;
-            best_size = size;
-            best_fits = fits;
-        }
-    }
-    return best;
+    return manifest.iconFromValue(v);
 }
 
+/// `ok` selects the envelope; `value` is raw JSON for a result and a
+/// plain (escaped on the way out) message for an error.
 fn result(gpa: std.mem.Allocator, ok: bool, value: []const u8) []u8 {
-    return if (ok)
-        std.fmt.allocPrint(gpa, "{{\"result\":{s}}}", .{value}) catch unreachable
-    else
-        std.fmt.allocPrint(gpa, "{{\"error\":\"{s}\"}}", .{value}) catch unreachable;
+    return if (ok) envelope.ok(gpa, value) else envelope.err(gpa, value);
 }
 
 fn jsonStringResult(gpa: std.mem.Allocator, value: []const u8) []u8 {
-    var aw: std.Io.Writer.Allocating = .init(gpa);
-    defer aw.deinit();
-    aw.writer.writeAll("{\"result\":") catch return result(gpa, false, "oom");
-    std.json.Stringify.value(value, .{}, &aw.writer) catch return result(gpa, false, "oom");
-    aw.writer.writeByte('}') catch return result(gpa, false, "oom");
-    return aw.toOwnedSlice() catch result(gpa, false, "oom");
+    return envelope.okString(gpa, value);
 }
 
 test "browser action keeps global and tab-specific state separate" {
@@ -385,6 +383,21 @@ test "badge colors keep global and tab values separate" {
     try std.testing.expectEqual(Color{ .r = 1, .g = 2, .b = 3, .a = 4 }, st.effective(8).badge_background_color);
     try std.testing.expectEqual(Color{ .r = 0xaa, .g = 0xbb, .b = 0xcc, .a = 255 }, st.effective(7).badge_text_color);
     try std.testing.expectEqual(Color.white, st.effective(8).badge_text_color);
+}
+
+test "page action rejects browser-action-only methods" {
+    const gpa = std.testing.allocator;
+    var st = try State.init(gpa, .page, .{ .default_title = "Page" });
+    defer st.deinit(gpa);
+    for ([_][]const u8{ "enable", "disable", "isEnabled", "setBadgeText", "getBadgeText", "setBadgeTextColor", "setBadgeBackgroundColor" }) |method| {
+        const reply = st.dispatch(gpa, method, "[{\"text\":\"1\",\"color\":[1,2,3]}]");
+        defer gpa.free(reply);
+        try std.testing.expect(std.mem.indexOf(u8, reply, "requires browserAction") != null);
+    }
+    try std.testing.expect(st.effective(1).enabled);
+    // The shared surface stays available to a page action.
+    gpa.free(st.dispatch(gpa, "setTitle", "[{\"title\":\"Still fine\"}]"));
+    try std.testing.expectEqualStrings("Still fine", st.effective(1).title);
 }
 
 test "unsupported action methods reject instead of succeeding silently" {

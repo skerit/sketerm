@@ -20,6 +20,8 @@ const origins = @import("origins.zig");
 const i18n = @import("i18n.zig");
 const tabs = @import("tabs.zig");
 const action = @import("action.zig");
+const reply = @import("reply.zig");
+const pathz = @import("../../util/pathz.zig");
 
 /// The session's language tag, for `i18n` locale negotiation. POSIX
 /// order, and everything after the encoding or modifier is dropped
@@ -502,14 +504,7 @@ pub const Host = struct {
     }
 
     fn dispatchI18n(self: *Host, e: *Extension, method: []const u8, args_json: []const u8) []u8 {
-        if (std.mem.eql(u8, method, "getUILanguage")) {
-            var aw: std.Io.Writer.Allocating = .init(self.gpa);
-            defer aw.deinit();
-            aw.writer.writeAll("{\"result\":") catch return self.errResult("oom");
-            std.json.Stringify.value(uiLanguage(), .{}, &aw.writer) catch return self.errResult("oom");
-            aw.writer.writeByte('}') catch return self.errResult("oom");
-            return aw.toOwnedSlice() catch self.errResult("oom");
-        }
+        if (std.mem.eql(u8, method, "getUILanguage")) return reply.okString(self.gpa, uiLanguage());
         if (!std.mem.eql(u8, method, "getMessage")) return self.errResult("unknown i18n method");
         var parsed = std.json.parseFromSlice(std.json.Value, self.gpa, args_json, .{}) catch
             return self.errResult("bad args");
@@ -522,12 +517,7 @@ pub const Host = struct {
         const msg = self.lookupMessage(e, args[0].string, subs) orelse
             return self.gpa.dupe(u8, "{\"result\":\"\"}") catch self.errResult("oom");
         defer self.gpa.free(msg);
-        var aw: std.Io.Writer.Allocating = .init(self.gpa);
-        defer aw.deinit();
-        aw.writer.writeAll("{\"result\":") catch return self.errResult("oom");
-        std.json.Stringify.value(msg, .{}, &aw.writer) catch return self.errResult("oom");
-        aw.writer.writeByte('}') catch return self.errResult("oom");
-        return aw.toOwnedSlice() catch self.errResult("oom");
+        return reply.okString(self.gpa, msg);
     }
 
     /// `_locales/<negotiated>/messages.json` -> the `message` of `key`,
@@ -669,24 +659,18 @@ pub const Host = struct {
 
     /// Wrap a raw JSON value string as `{"result":<value>}`.
     fn wrapResult(self: *Host, value_json: []const u8) []u8 {
-        return std.fmt.allocPrint(self.gpa, "{{\"result\":{s}}}", .{value_json}) catch self.errResult("oom");
+        return reply.ok(self.gpa, value_json);
     }
 
-    /// Every dispatch result is heap-owned so the caller frees uniformly;
-    /// a 20-byte print cannot realistically OOM in ReleaseFast.
     fn errResult(self: *Host, msg: []const u8) []u8 {
-        return std.fmt.allocPrint(self.gpa, "{{\"error\":\"{s}\"}}", .{msg}) catch unreachable;
+        return reply.err(self.gpa, msg);
     }
 };
 
 fn mintCapability(e: *Extension) !void {
     var raw: [origins.CAP_LEN / 2]u8 = undefined;
     if (c.getentropy(&raw, raw.len) != 0) return error.RandomFailed;
-    const digits = "0123456789abcdef";
-    for (raw, 0..) |b, i| {
-        e.capability[i * 2] = digits[b >> 4];
-        e.capability[i * 2 + 1] = digits[b & 0x0f];
-    }
+    e.capability = std.fmt.bytesToHex(raw, .lower);
     e.capability_ok = true;
 }
 
@@ -779,18 +763,7 @@ fn writeFileZ(path: [*:0]const u8, bytes: []const u8) void {
 }
 
 fn mkdirAll(path: []const u8) void {
-    var buf: [4096]u8 = undefined;
-    if (path.len + 1 > buf.len) return;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    var i: usize = 1;
-    while (i <= path.len) : (i += 1) {
-        if (i != path.len and buf[i] != '/') continue;
-        const save = buf[i];
-        buf[i] = 0;
-        _ = c.mkdir(@ptrCast(&buf), 0o700);
-        buf[i] = save;
-    }
+    pathz.makeDirs(path, 0o700) catch {};
 }
 
 fn resolveDataDir(gpa: std.mem.Allocator) []u8 {
