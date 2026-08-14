@@ -18382,3 +18382,29 @@ runtime-verified here: the CEF-dependent context-menu behaviour and page-row
 verbs against a live engine — this dev host has cef 151.3.16-1 built against
 glibc 2.44 on a glibc 2.43 system, so `sketerm-webengine` cannot start until
 the distro packages re-align (partial-upgrade skew, worth knowing about).
+
+## Public mux-client SDK + first out-of-repo consumer (2026-08-14)
+
+`build.zig` now exports a `mux-client` module for out-of-repo daemon
+clients: `wire` + `client` + `sockpath` + `snapshot` + `paneldoc`, plus
+the core `c`/`platform` surface (Zig 0.16 consumers need libc anyway).
+The control payload schemas (SpawnReq/AttachReq/KillReq/SessionInfo/…)
+moved from daemon.zig into wire.zig — they ARE the compatibility
+surface — and the socket-path helpers into mux/sockpath.zig, so
+client.zig no longer imports daemon.zig at all; daemon.zig re-exports
+everything so daemon-side callers did not churn. `zig build
+mux-client-check` compiles the exported graph standalone and guards it
+against GUI/GLib creep.
+
+First consumer: `skehive` (separate repo, path dep on this one) — a
+Munder-style coding-agent harness. Sketerm owns terminals (durable mux
+sessions, origin_id-fenced reattach); skehive owns agents (Claude Code
+hook server, idle/working/blocked state machine, queued delivery, A2UI
+dashboard over the panel relay). Verified end to end against a real
+headless GUI on the app-forwarding rig.
+
+Lesson that cost an evening: a panel REQUESTER connection must stay
+alive across shows. Transport loss cancels uncommitted panel work (by
+design), so a connect-show-disconnect client gets `ok` replies while
+its document replaces silently never commit. The MCP layer always held
+a cached requester, which is why it never saw this.
