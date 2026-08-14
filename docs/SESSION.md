@@ -18335,9 +18335,12 @@ selecting the clicked tab can swap the sidebar to a browser's page list and
 destroy the row before the popover maps (gdk_surface_new_popup on a dead
 parent = SIGSEGV).
 
-Rows now look like Firefox TST/our own tab strip instead of pills: inactive
-rows are flat text, hover is a faint neutral surface, and the ACTIVE row is a
-stronger neutral surface — not the blue selection colour. The "active row is
+Rows now match TST's photon design (screenshots in the TST repo are the
+reference): full-width flat rows on the base colour with hairline separators,
+a favicon slot on every row, an always-visible close X, the ACTIVE row the
+selection fill spanning the whole width with only its content indented, and
+TST's "+" row under the last tab — every colour theme-relative, none
+hardcoded. The "active row is
 off by one" report was real and lived in `webgroup.Group.active()`:
 GtkNotebook emits `switch-page` BEFORE updating its current page, so the
 sidebar refresh inside that handler read the OLD page. The group now tracks
