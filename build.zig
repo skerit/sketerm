@@ -1203,8 +1203,12 @@ fn addCef(
     tc.addIncludePath(.{ .cwd_relative = include_root });
     const cef_mod = tc.createModule();
 
+    // Rooted at src/ (see src/webengine.zig): the helper's own code is
+    // all under src/web/, but a module cannot import above its root
+    // directory and the helper legitimately shares libc-only helpers
+    // with the daemon and the GUI.
     const web_mod = b.createModule(.{
-        .root_source_file = b.path("src/web/main.zig"),
+        .root_source_file = b.path("src/webengine.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -1316,6 +1320,19 @@ fn addCef(
     bench_wreq_step.dependOn(&bench_wreq_run.step);
 }
 
+/// The one GUI system-package roster: TranslateC header resolution and
+/// module link flags must agree or a package compiles in one and is
+/// missing from the other.
+const gui_pkgs = [_][]const u8{
+    "gtk4",
+    "libadwaita-1",
+    "freetype2",
+    "harfbuzz",
+    "epoxy",
+    "fribidi",
+    "fontconfig",
+};
+
 /// Set up the out-of-process TranslateC step that turns
 /// `vendor/cimport_root.h` into a Zig module. Returns a module each
 /// binary can import as `@import("cbindings")`.
@@ -1339,16 +1356,7 @@ fn buildCBindings(
     // Same `-I` order as `configureSysDeps`: shim path first so it
     // shadows the system gdkversionmacros.h.
     tc.addIncludePath(b.path("vendor/aro_shims"));
-    const pkgs = [_][]const u8{
-        "gtk4",
-        "libadwaita-1",
-        "freetype2",
-        "harfbuzz",
-        "epoxy",
-        "fribidi",
-        "fontconfig",
-    };
-    for (pkgs) |p| {
+    for (gui_pkgs) |p| {
         tc.linkSystemLibrary(p, .{ .use_pkg_config = .force });
     }
     tc.addIncludePath(b.path("vendor"));
@@ -1638,18 +1646,9 @@ fn configureSysDeps(
     mod: *std.Build.Module,
     cbindings_mod: *std.Build.Module,
 ) void {
-    const sys_libs = [_][]const u8{
-        "gtk4",
-        "libadwaita-1",
-        "freetype2",
-        "harfbuzz",
-        "epoxy",
-        "fribidi",
-        "fontconfig",
-    };
     mod.addImport("cbindings", cbindings_mod);
     mod.addIncludePath(b.path("vendor/aro_shims"));
-    for (sys_libs) |lib| addPkgConfig(b, mod, lib);
+    for (gui_pkgs) |lib| addPkgConfig(b, mod, lib);
     // Per-window WM_CLASS for remote app windows (wlapp.zig calls
     // XChangeProperty directly — GTK links X11 but doesn't re-export
     // it). Linux-only; the macOS GUI has no X11.

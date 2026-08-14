@@ -146,18 +146,11 @@ check_zig() {
 }
 
 # ---------------------------------------------------------------- version
+#
+# Shared with PKGBUILD's pkgver() so the semver has one derivation as well as
+# one source of truth (.version in build.zig.zon).
 
-pkg_version() {
-    local ver
-    ver=$(grep -m1 '\.version' "$root/build.zig.zon" | sed -E 's/.*"([^"]+)".*/\1/')
-    if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        printf '%s.r%s.g%s' "$ver" \
-            "$(git -C "$root" rev-list --count HEAD)" \
-            "$(git -C "$root" rev-parse --short=7 HEAD)"
-    else
-        printf '%s' "$ver"
-    fi
-}
+pkg_version() { sketerm_pkgver "$root"; }
 
 # ------------------------------------------------------------ gui support
 
@@ -223,29 +216,13 @@ install_deb_deps() {
 }
 
 # ------------------------------------------------------------------ build
+#
+# Shared with PKGBUILD's build(); only the CEF paths differ (probed env vars
+# here, distro literals there).
 
 build_all() {
     check_zig
-    cd "$root"
-    if [ "$1" = gui ]; then
-        # Normal builds runtime-load Opus automatically.
-        say "building GUI + daemon"
-        zig build -Doptimize=ReleaseFast
-        if [ "$web_ok" -eq 1 ]; then
-            say "building browser helper"
-            zig build web -Doptimize=ReleaseFast \
-                -Dcef-include="$CEF_INCLUDE" \
-                -Dcef-lib="$CEF_LIB"
-        else
-            warn "$web_why; packaging browser identity without sketerm-webengine"
-        fi
-    else
-        say "building daemon only"
-        zig build mux -Doptimize=ReleaseFast
-    fi
-    # The portable daemon compiles the Opus probe out and stays
-    # static/codec-free by design; it is what gets scp'd to servers.
-    zig build mux-portable -Doptimize=ReleaseFast
+    sketerm_build "$root" "$1" "$web_ok" "$CEF_INCLUDE" "$CEF_LIB" "$web_why"
 }
 
 # ------------------------------------------------------------------ stage
@@ -284,7 +261,10 @@ deb_depends_of() {
             if [ -z "$pkg" ]; then
                 pkg=$(dpkg -S "$(readlink -f "$lib")" 2>/dev/null | head -1 | cut -d: -f1) || true
             fi
-            [ -n "$pkg" ] && printf '%s\n' "$pkg"
+            # "[ -n ] && printf" would leave the loop with status 1 when the
+            # LAST library is dpkg-unowned (e.g. a hand-installed libcef.so),
+            # and pipefail would then kill the script without a message.
+            if [ -n "$pkg" ]; then printf '%s\n' "$pkg"; fi
         done | sort -u | paste -sd, - | sed 's/,/, /g'
 }
 

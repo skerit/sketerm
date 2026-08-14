@@ -556,4 +556,91 @@ cmp -s "$fixture/zig-out/bin/sketerm-webengine" \
     "$work/pkg/usr/bin/sketerm-webengine" \
     || fail "packaged sketerm-webengine did not come from the current build"
 
+# ------------------------------------------------------------------------
+# The version algorithm and the build recipe exist ONCE, in stage.sh, and
+# both backends reach them through it. These assertions are what stops the
+# copies growing back: they compare each caller's observable result against
+# a direct call to the shared helper.
+
+source "$here/stage.sh"
+
+shared_ver=$(sketerm_pkgver "$fixture")
+[ -n "$shared_ver" ] || fail "sketerm_pkgver produced no version"
+[ "$shared_ver" = "$(grep -m1 '\.version' "$root/build.zig.zon" \
+    | sed -E 's/.*"([^"]+)".*/\1/')" ] \
+    || fail "sketerm_pkgver did not derive the version from build.zig.zon"
+
+# The Debian backend's package filename must carry exactly that version.
+# (The last deb built above is the auto-mode mux one; only the version part
+# is asserted here, the name part is covered by the runs that produced it.)
+[[ "$(basename "$(<"$INSTALL_TEST_DEB_LOG")")" == *"_${shared_ver}-1_amd64.deb" ]] \
+    || fail "dpkg backend version diverged from sketerm_pkgver"
+
+# ...and so must PKGBUILD's pkgver().
+arch_ver=$(
+    startdir="$fixture/dist"
+    source "$here/PKGBUILD"
+    pkgver
+)
+[ "$arch_ver" = "$shared_ver" ] \
+    || fail "PKGBUILD pkgver() diverged from sketerm_pkgver ($arch_ver vs $shared_ver)"
+
+# PKGBUILD build() must be nothing but the shared recipe with the distro
+# CEF paths: same zig invocations, same order.
+(
+    export PATH="$fakebin:$PATH" INSTALL_TEST_ZIG_LOG="$work/shared-arch-build.log"
+    : > "$INSTALL_TEST_ZIG_LOG"
+    sketerm_build "$fixture" gui 1 /usr/include/cef /usr/lib/cef >/dev/null 2>&1
+)
+cmp -s "$work/shared-arch-build.log" "$work/package-zig.log" \
+    || fail "PKGBUILD build() diverged from the shared sketerm_build recipe"
+
+# The non-Arch GUI build must be the same recipe with the probed CEF paths.
+mkdir -p "$work/shared-tmp"
+BASH_ENV="$work/no-packager.bash" \
+    TMPDIR="$work/shared-tmp" \
+    PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    CEF_INCLUDE="$cef_include" \
+    CEF_LIB="$cef_lib" \
+    INSTALL_TEST_ZIG_LOG="$work/installer-gui-build.log" \
+    "$fixture/dist/install.sh" --gui-only --no-install \
+    > "$work/installer-gui-build.out" 2>&1
+(
+    export PATH="$fakebin:$PATH" INSTALL_TEST_ZIG_LOG="$work/shared-gui-build.log"
+    : > "$INSTALL_TEST_ZIG_LOG"
+    sketerm_build "$fixture" gui 1 "$cef_include" "$cef_lib" >/dev/null 2>&1
+)
+cmp -s "$work/shared-gui-build.log" "$work/installer-gui-build.log" \
+    || fail "install.sh GUI build diverged from the shared sketerm_build recipe"
+
+# Same for the mux-only kind, and for a GUI build with no CEF available.
+BASH_ENV="$work/no-packager.bash" \
+    TMPDIR="$work/shared-tmp" \
+    PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    INSTALL_TEST_ZIG_LOG="$work/installer-mux-build.log" \
+    "$fixture/dist/install.sh" --mux-only --no-install \
+    > "$work/installer-mux-build.out" 2>&1
+(
+    export PATH="$fakebin:$PATH" INSTALL_TEST_ZIG_LOG="$work/shared-mux-build.log"
+    : > "$INSTALL_TEST_ZIG_LOG"
+    sketerm_build "$fixture" mux 0 "$cef_include" "$cef_lib" "no cef" >/dev/null 2>&1
+)
+cmp -s "$work/shared-mux-build.log" "$work/installer-mux-build.log" \
+    || fail "install.sh mux build diverged from the shared sketerm_build recipe"
+[[ "$(<"$work/shared-mux-build.log")" != *"<web>"* ]] \
+    || fail "shared mux recipe built the browser helper"
+
+(
+    export PATH="$fakebin:$PATH" INSTALL_TEST_ZIG_LOG="$work/shared-nocef-build.log"
+    : > "$INSTALL_TEST_ZIG_LOG"
+    sketerm_build "$fixture" gui 0 /nope /nope "CEF headers or runtime not found" \
+        > "$work/shared-nocef.out" 2>&1
+)
+[[ "$(<"$work/shared-nocef-build.log")" != *"<web>"* ]] \
+    || fail "shared recipe built the browser helper without CEF"
+[[ "$(<"$work/shared-nocef.out")" == *"packaging browser identity without sketerm-webengine"* ]] \
+    || fail "shared recipe did not explain the omitted browser helper"
+
 printf 'PASS: installer argument routing and package contents\n'

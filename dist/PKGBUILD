@@ -72,34 +72,17 @@ source "$startdir/stage.sh"
 _srcroot() { echo "$startdir/.."; }
 
 pkgver() {
-    cd "$(_srcroot)"
-    local ver
-    ver=$(grep -m1 '\.version' build.zig.zon | sed -E 's/.*"([^"]+)".*/\1/')
-    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        printf '%s.r%s.g%s' \
-            "$ver" \
-            "$(git rev-list --count HEAD)" \
-            "$(git rev-parse --short=7 HEAD)"
-    else
-        printf '%s' "$ver"
-    fi
+    sketerm_pkgver "$(_srcroot)"
 }
 
 build() {
-    cd "$(_srcroot)"
-    # Normal builds runtime-load Opus automatically. The portable daemon
-    # compiles the probe out and stays static/codec-free by design.
-    zig build -Doptimize=ReleaseFast
-    zig build mux-portable -Doptimize=ReleaseFast
-    # Browser helper, built against the DISTRO cef (see depends): the
-    # headers and the runtime live in two places there, unlike the
-    # single-tree upstream tarball, so both halves are pointed at
-    # explicitly. -Dcef-runtime-dir defaults to -Dcef-lib, which is
-    # already the installed location, so the rpath and the LD_PRELOAD
-    # the helper re-execs with are both correct in the package.
-    zig build web -Doptimize=ReleaseFast \
-        -Dcef-include=/usr/include/cef \
-        -Dcef-lib=/usr/lib/cef
+    # The browser helper is built against the DISTRO cef (see depends), so
+    # its two paths are spelled out here as literals rather than taken from
+    # $CEF_INCLUDE/$CEF_LIB the way install.sh's non-Arch backends do: the
+    # Arch package must link against the same cef on every host, and makepkg
+    # does not scrub the caller's environment. web_ok is 1 unconditionally
+    # because cef is a hard dependency of this package, not a probed option.
+    sketerm_build "$(_srcroot)" gui 1 /usr/include/cef /usr/lib/cef
 }
 
 package() {
