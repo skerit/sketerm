@@ -744,8 +744,12 @@ pub fn hasBubbleChord(keyval: c_uint, state: c.GdkModifierType) bool {
 /// Return whether this key must reach browser type-ahead before global bindings.
 pub fn isTypeaheadKey(keyval: c_uint, state: c.GdkModifierType) bool {
     const mods = state & input.SIGNIFICANT_MODS;
-    const uni = c.gdk_keyval_to_unicode(keyval);
-    return (mods == 0 or mods == c.GDK_SHIFT_MASK) and uni >= 0x21 and uni <= 0x7e;
+    return (mods == 0 or mods == c.GDK_SHIFT_MASK) and printableAscii(c.gdk_keyval_to_unicode(keyval));
+}
+
+/// Type-ahead's raw material: printable ASCII, byte-comparable to file names.
+fn printableAscii(uni: u32) bool {
+    return uni >= 0x21 and uni <= 0x7e;
 }
 
 fn chordUndo(self: *BrowserView) bool {
@@ -1420,9 +1424,8 @@ pub fn typeaheadBackspace(self: *BrowserView) bool {
 /// keep dispatching them.
 pub fn typeahead(self: *BrowserView, keyval: c_uint) bool {
     const uni = c.gdk_keyval_to_unicode(keyval);
-    // Printable ASCII only: a jump prefix is compared against
-    // file names byte-wise, and space is a selection key.
-    if (uni < 0x21 or uni > 0x7e) return false;
+    // Space is excluded: it is a selection key.
+    if (!printableAscii(uni)) return false;
     const tab = self.currentTab() orelse return false;
     if (tab.view_mode == .icons) return false;
     const now = c.g_get_monotonic_time();
@@ -1610,8 +1613,7 @@ fn expectTypeaheadDoesNotShadow(bindings: []const input.Binding) !void {
     for (bindings) |b| {
         const mods = b.mods & input.SIGNIFICANT_MODS;
         if (mods != 0 and mods != c.GDK_SHIFT_MASK) continue;
-        const uni = c.gdk_keyval_to_unicode(b.keyval);
-        if (uni >= 0x21 and uni <= 0x7e) {
+        if (printableAscii(c.gdk_keyval_to_unicode(b.keyval))) {
             std.debug.print("global binding {s} uses a bare printable key type-ahead eats first\n", .{
                 input.actionName(b.action),
             });

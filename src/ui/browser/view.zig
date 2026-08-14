@@ -23,6 +23,7 @@ const clipboard_mod = @import("../../filebrowser/clipboard.zig");
 const places_mod = @import("../../filebrowser/places.zig");
 const emblems_mod = @import("../../filebrowser/emblems.zig");
 const gitstatus = @import("../../filebrowser/gitstatus.zig");
+const debounce = @import("../debounce.zig");
 const iconload = @import("../iconload.zig");
 const toolbtn = @import("../toolbtn.zig");
 const Pane = @import("../pane.zig").Pane;
@@ -266,7 +267,7 @@ pub const BrowserView = struct {
     /// Persisted sidebar width, and the debounce that writes it (a
     /// drag emits notify::position per pixel).
     sidebar_px: i32 = places_mod.DEFAULT_SIDEBAR_PX,
-    sidebar_save_src: c.guint = 0,
+    sidebar_save: debounce.State = .{},
     /// Persisted sidebar open state; null = never toggled, so the
     /// default follows the application identity.
     sidebar_open: ?bool = null,
@@ -1254,6 +1255,13 @@ pub const BrowserView = struct {
     }
 
     pub fn deinit(self: *BrowserView) void {
+        // Flush rather than drop: a sidebar drag in the last 400ms
+        // before teardown is still the width the user chose. This runs
+        // BEFORE unregisterView, because savePlaces on an unregistered
+        // view is a no-op whenever another browser face is live.
+        const sidebar_flush = self.sidebar_save.teardown();
+        if (sidebar_flush.source != 0) _ = c.g_source_remove(sidebar_flush.source);
+        if (sidebar_flush.persist) self.savePlaces();
         @import("places.zig").unregisterView(self);
         // Close the quick-look viewer FIRST: its destroy handler and
         // activate callback carry a raw pointer to this view, and the
@@ -1270,10 +1278,6 @@ pub const BrowserView = struct {
         if (self.switch_idle != 0) {
             _ = c.g_source_remove(self.switch_idle);
             self.switch_idle = 0;
-        }
-        if (self.sidebar_save_src != 0) {
-            _ = c.g_source_remove(self.sidebar_save_src);
-            self.sidebar_save_src = 0;
         }
         if (self.bar_idle_src != 0) {
             _ = c.g_source_remove(self.bar_idle_src);
@@ -1948,8 +1952,8 @@ pub const BrowserView = struct {
         const px = total - c.gtk_paned_get_position(@ptrCast(@alignCast(obj)));
         if (px < 220) return;
         self.preview_px = @min(px, 700);
-        if (self.sidebar_save_src != 0) _ = c.g_source_remove(self.sidebar_save_src);
-        self.sidebar_save_src = c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self));
+        if (self.sidebar_save.source != 0) _ = c.g_source_remove(self.sidebar_save.source);
+        self.sidebar_save.scheduled(c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self)));
     }
 
     fn onSidebarPosition(obj: *c.GObject, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
@@ -1960,14 +1964,13 @@ pub const BrowserView = struct {
         const pos = c.gtk_paned_get_position(@ptrCast(@alignCast(obj)));
         if (pos < places_mod.MIN_SIDEBAR_PX) return;
         self.sidebar_px = places_mod.clampSidebarPx(pos);
-        if (self.sidebar_save_src != 0) _ = c.g_source_remove(self.sidebar_save_src);
-        self.sidebar_save_src = c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self));
+        if (self.sidebar_save.source != 0) _ = c.g_source_remove(self.sidebar_save.source);
+        self.sidebar_save.scheduled(c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self)));
     }
 
     fn onSidebarSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(BrowserView, user);
-        self.sidebar_save_src = 0;
-        self.savePlaces();
+        if (self.sidebar_save.fired()) self.savePlaces();
         return 0;
     }
 

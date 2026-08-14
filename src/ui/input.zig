@@ -236,12 +236,18 @@ pub fn matchBinding(bindings: []const Binding, keyval: c_uint, mods: c_uint) ?Ac
 ///         through to its own handling; otherwise `runAction`'s
 ///         verdict, which is 0 for an action that declined to run.
 pub fn fallbackToPaneBindings(ictx: *Ctx, keyval: c_uint, state: c.GdkModifierType) ?c.gboolean {
-    const bindings: []const Binding =
-        if (ictx.bindings.len > 0) ictx.bindings else &default_bindings;
-    const lower: c_uint = c.gdk_keyval_to_lower(keyval);
-    const action = matchBinding(bindings, lower, state) orelse
-        matchBinding(bindings, keyval, state) orelse return null;
+    const action = matchWithDefaults(ictx.bindings, keyval, state) orelse return null;
     return runAction(ictx, action);
+}
+
+/// Match against `bindings` (or `default_bindings` when empty), trying
+/// the lowercased keyval before the raw one (GTK4 emits uppercase
+/// keysyms under Shift; the tables are lowercase).
+pub fn matchWithDefaults(bindings: []const Binding, keyval: c_uint, state: c.GdkModifierType) ?Action {
+    const table: []const Binding =
+        if (bindings.len > 0) bindings else &default_bindings;
+    return matchBinding(table, c.gdk_keyval_to_lower(keyval), state) orelse
+        matchBinding(table, keyval, state);
 }
 
 /// Rebuild `list` as `default_bindings` overlaid with config

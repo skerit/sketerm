@@ -13,6 +13,7 @@ comptime {
     _ = @import("util/suggest.zig");
     _ = @import("util/pattern.zig");
     _ = @import("util/pathz.zig");
+    _ = @import("util/atomicwrite.zig");
     _ = @import("util/filehash.zig");
     _ = @import("util/shellquote.zig");
     _ = @import("util/humantype.zig");
@@ -35,6 +36,7 @@ comptime {
     _ = @import("web/axtree.zig");
     _ = @import("web/semnav.zig");
     _ = @import("web/reader_guards.zig");
+    _ = @import("web/quarantine.zig");
     // WebExtensions foundation: match patterns, MV2 manifest parse,
     // storage.local JSON, and the XPI/zip reader — all pure std.
     _ = @import("web/webext/match.zig");
@@ -48,6 +50,7 @@ comptime {
     _ = @import("web/webext/i18n.zig");
     _ = @import("web/webext/tabs.zig");
     _ = @import("web/webext/action.zig");
+    _ = @import("web/webext/reply.zig");
     _ = @import("web/webext/host.zig");
     _ = @import("util/crashlog.zig");
     _ = @import("util/shellintegration.zig");
@@ -99,7 +102,7 @@ comptime {
     _ = @import("ui/imhost.zig");
     _ = @import("ui/tree.zig");
     _ = @import("ui/tabforest.zig");
-    _ = @import("ui/sidebar_save.zig");
+    _ = @import("ui/debounce.zig");
     _ = @import("ui/commandcat.zig");
     _ = @import("ui/quake.zig");
     _ = @import("ui/hints.zig");

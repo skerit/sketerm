@@ -442,10 +442,7 @@ pub fn onSelectionKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, st
     const pane = tab.view.pane;
     const ictx = if (pane) |p| p.input_ctx else null;
     if (ictx) |ctx| {
-        const bindings: []const input.Binding = if (ctx.bindings.len > 0) ctx.bindings else &input.default_bindings;
-        const lower = c.gdk_keyval_to_lower(keyval);
-        const action = input.matchBinding(bindings, lower, state) orelse
-            input.matchBinding(bindings, keyval, state);
+        const action = input.matchWithDefaults(ctx.bindings, keyval, state);
         if (action) |a| switch (a) {
             .toggle_tab_sidebar, .tab_collapse, .tab_expand, .tab_tree_next, .tab_tree_prev =>
                 return input.runAction(ctx, a),

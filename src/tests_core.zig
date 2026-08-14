@@ -115,7 +115,7 @@ comptime {
     // Toolkit-free UI models: the tab forest is generic over its Ref
     // and imports nothing but std, so it belongs in both roots.
     _ = @import("ui/tabforest.zig");
-    _ = @import("ui/sidebar_save.zig");
+    _ = @import("ui/debounce.zig");
     _ = @import("ui/commandcat.zig");
     _ = @import("ui/panel/canary.zig");
     _ = @import("ui/panel/doc.zig");
@@ -198,6 +198,7 @@ comptime {
     _ = @import("web/axtree.zig");
     _ = @import("web/semnav.zig");
     _ = @import("web/reader_guards.zig");
+    _ = @import("web/quarantine.zig");
     // WebExtensions foundation: match patterns, MV2 manifest parse,
     // storage.local JSON, and the XPI/zip reader — all pure std.
     _ = @import("web/webext/match.zig");
@@ -211,6 +212,7 @@ comptime {
     _ = @import("web/webext/i18n.zig");
     _ = @import("web/webext/tabs.zig");
     _ = @import("web/webext/action.zig");
+    _ = @import("web/webext/reply.zig");
     _ = @import("web/webext/host.zig");
     _ = @import("util/content.zig");
     _ = @import("util/crashlog.zig");
@@ -222,6 +224,7 @@ comptime {
     _ = @import("util/mounts.zig");
     _ = @import("util/ocr.zig");
     _ = @import("util/pathz.zig");
+    _ = @import("util/atomicwrite.zig");
     _ = @import("util/pattern.zig");
     _ = @import("util/percent.zig");
     _ = @import("util/suggest.zig");

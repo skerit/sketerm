@@ -1802,11 +1802,7 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
     // Shift alone stays with the bare-key switch (`<`, `>`, `+`).
     const mods = state & input.SIGNIFICANT_MODS;
     if ((mods & ~@as(c_uint, c.GDK_SHIFT_MASK)) != 0) {
-        const bindings: []const input.Binding =
-            if (self.bindings.len > 0) self.bindings else &input.default_bindings;
-        const lower_kv: c_uint = c.gdk_keyval_to_lower(keyval);
-        const action = input.matchBinding(bindings, lower_kv, mods) orelse
-            input.matchBinding(bindings, keyval, mods) orelse return 0;
+        const action = input.matchWithDefaults(self.bindings, keyval, mods) orelse return 0;
         switch (action) {
             .font_inc => self.canvas.zoomBy(1.2),
             .font_dec => self.canvas.zoomBy(1.0 / 1.2),

@@ -1,4 +1,7 @@
-//! Exactly-once state machine for the tree-sidebar config debounce.
+//! Exactly-once state machine for a debounced write: the pending write
+//! is consumed by whichever of the timeout and the teardown arrives
+//! first, so a teardown inside the debounce window still FLUSHES rather
+//! than dropping the user's last change.
 
 const std = @import("std");
 
