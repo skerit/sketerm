@@ -1224,6 +1224,7 @@ pub fn appendTabInfos(
                 try std.fmt.allocPrint(arena, "#{x:0>2}{x:0>2}{x:0>2}", .{ col[0], col[1], col[2] })
             else
                 null,
+            .tree_parent = if (self.tab_forest.parentOf(page)) |pp| tabPageId(pp) else null,
             .panes = pane_infos.items,
         });
     }

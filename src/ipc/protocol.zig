@@ -147,6 +147,9 @@ pub const TabInfo = struct {
     selected: bool,
     /// "#rrggbb" when a tab colour is set.
     color: ?[]const u8 = null,
+    /// Tab id of this tab's parent in the window's tab forest
+    /// (tree-style tabs); null for a root tab.
+    tree_parent: ?u32 = null,
     panes: []const PaneInfo,
 };
 
@@ -355,4 +358,12 @@ test "writeOk / writeErr shapes" {
     const tabs = [_]TabInfo{.{ .id = 1, .title = "Tab", .selected = true, .panes = &panes }};
     try writeOk(&out, a, "tabs", tabs[0..]);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"pid\":42") != null);
+    // Root tabs must still EMIT tree_parent (as null): smoke-e2e's
+    // structural nesting probe anchors on the key being present.
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"tree_parent\":null") != null);
+
+    out.clearRetainingCapacity();
+    const child = [_]TabInfo{.{ .id = 2, .title = "Child", .selected = false, .tree_parent = 1, .panes = &panes }};
+    try writeOk(&out, a, "tabs", child[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"tree_parent\":1") != null);
 }
