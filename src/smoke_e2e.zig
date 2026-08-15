@@ -2389,6 +2389,67 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
 /// row starts one INDENT_PX in) and its top edge IS the row's slot, and
 /// a dropped tab becomes the active one, so the chip lands on exactly
 /// the row whose new place is under test.
+/// Where a `list` reply places the tab holding pane `pane`: tab id,
+/// tree parent and byte position (list order proxy). Field-order
+/// dependent by design: TabInfo serializes id..tree_parent..panes,
+/// pane objects carry no "tree_parent" and no arrays, so the nearest
+/// preceding markers of a pane id are its own tab's.
+const TabLoc = struct { id: u32, parent: ?u32, pos: usize };
+
+fn tabOfPane(resp: []const u8, pane: u32) ?TabLoc {
+    var needle_buf: [32]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"id\":{d},", .{pane}) catch return null;
+    var search: usize = 0;
+    while (std.mem.indexOfPos(u8, resp, search, needle)) |at| {
+        search = at + 1;
+        const tp = std.mem.lastIndexOf(u8, resp[0..at], "\"tree_parent\":") orelse continue;
+        const panes_open = std.mem.indexOfPos(u8, resp, tp, "\"panes\":[") orelse continue;
+        // The match must sit INSIDE that panes array, not be the next
+        // tab's own id (or a pane of a later tab).
+        if (panes_open > at) continue;
+        const close = std.mem.indexOfPos(u8, resp, panes_open, "]") orelse continue;
+        if (at > close) continue;
+        const id_at = std.mem.lastIndexOf(u8, resp[0..tp], "\"id\":") orelse continue;
+        const id = parseNumAfter(resp[id_at..], "\"id\":") orelse continue;
+        const tail = resp[tp + "\"tree_parent\":".len ..];
+        const parent: ?u32 = if (std.mem.startsWith(u8, tail, "null"))
+            null
+        else
+            parseNumAfter(resp[tp..], "\"tree_parent\":");
+        return .{ .id = id, .parent = parent, .pos = id_at };
+    }
+    return null;
+}
+
+/// Poll `list` until the tab holding `pane` reports the wanted parent
+/// (compared by tab id; `want_parent_of` names the pane whose tab must
+/// be the parent, null = must be a root tab).
+fn waitTreeParent(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    pane: u32,
+    want_parent_of: ?u32,
+    timeout_ms: u32,
+) ?TabLoc {
+    var waited: u32 = 0;
+    while (waited <= timeout_ms) : (waited += 200) {
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n")) |r| {
+            defer allocator.free(r);
+            if (tabOfPane(r, pane)) |loc| {
+                const want: ?u32 = if (want_parent_of) |p|
+                    (tabOfPane(r, p) orelse return null).id
+                else
+                    null;
+                const ok = if (want) |w| loc.parent != null and loc.parent.? == w else loc.parent == null;
+                if (ok) return loc;
+            }
+        }
+        _ = app.pumpOnce(200);
+    }
+    return null;
+}
+
 fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
     var keep_ids: [64]u32 = undefined;
     var keep_n: usize = 0;
@@ -2435,24 +2496,33 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         }
     };
     const from = mid.of(last_row);
-    const onto = mid.of(first_row);
+    // The accent block a row paints is only the strip ABOVE its label
+    // (text scanlines break the solid runs), so the block's midpoint
+    // sits in the row's top third — the "drop above" zone. Aim at the
+    // ROW's center instead: the first and last blocks are two uniform
+    // row pitches apart, and each block's top tracks its row's top.
+    const row_pitch: f64 = @as(f64, @floatFromInt(last_row.min_y - first_row.min_y)) / 2.0;
+    const onto = .{
+        .x = mid.of(first_row).x,
+        .y = @as(f64, @floatFromInt(first_row.min_y)) + row_pitch / 2.0,
+    };
 
     // 1. Drop ON the first row -> the dragged tab becomes its child.
+    //    Asserted structurally via the tab forest (`list` reports
+    //    tree_parent): TST-photon rows span the full sidebar width at
+    //    every depth, so nesting no longer moves the row's left edge
+    //    and a pixel-indent probe cannot see it.
     app.drag(win_id, from.x, from.y, onto.x, onto.y, 1) catch return "dragging a sidebar row onto another failed";
     _ = app.waitIdle(300, 6_000);
-    const nested = blk: {
-        var waited: u32 = 0;
-        while (waited < 6_000) : (waited += 100) {
-            if (sidebarChipBounds(app, win_id)) |b| {
-                if (b.min_x > first_row.min_x) break :blk b;
-            }
-            _ = app.pumpOnce(100);
+    if (waitTreeParent(allocator, app, sock_path, extra[1], 1, 6_000) == null) {
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n")) |r| {
+            defer allocator.free(r);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: tabs after the nest drop: %.*s\n", @as(c_int, @intCast(r.len)), r.ptr);
         }
-        break :blk sidebarChipBounds(app, win_id) orelse
-            return "the dragged sidebar row disappeared";
-    };
-    if (nested.min_x <= first_row.min_x)
         return "dropping a sidebar row onto another did not nest it under that row";
+    }
+    const nested = sidebarChipBounds(app, win_id) orelse
+        return "the dragged sidebar row disappeared";
     if (nested.min_y <= first_row.min_y)
         return "a nested sidebar row did not follow its new parent";
 
@@ -2461,19 +2531,10 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     app.drag(win_id, mid.of(nested).x, mid.of(nested).y, onto.x, empty_y, 1) catch
         return "dragging a sidebar row onto the empty list failed";
     _ = app.waitIdle(300, 6_000);
-    const unnested = blk: {
-        var waited: u32 = 0;
-        while (waited < 6_000) : (waited += 100) {
-            if (sidebarChipBounds(app, win_id)) |b| {
-                if (b.min_x == first_row.min_x) break :blk b;
-            }
-            _ = app.pumpOnce(100);
-        }
-        break :blk sidebarChipBounds(app, win_id) orelse
-            return "the unnested sidebar row disappeared";
-    };
-    if (unnested.min_x != first_row.min_x)
+    if (waitTreeParent(allocator, app, sock_path, extra[1], null, 6_000) == null)
         return "dropping a sidebar row on the empty list did not return it to the root level";
+    const unnested = sidebarChipBounds(app, win_id) orelse
+        return "the unnested sidebar row disappeared";
 
     // 3. Drop on the TOP of the first row -> reorder above it, still a
     //    root. This is the gesture the old drag had no notion of: it
@@ -2497,7 +2558,7 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         _ = c.fprintf(platform.stderr(), "smoke-e2e: reorder target y %zu, landed at %zu\n", first_row.min_y, reordered.min_y);
         return "dropping a sidebar row above another did not move it to the top";
     }
-    if (reordered.min_x != first_row.min_x)
+    if (waitTreeParent(allocator, app, sock_path, extra[1], null, 2_000) == null)
         return "a row dropped BETWEEN rows was nested instead of reordered";
 
     if (app.screenshotPng(win_id, 1400, null, 0)) |shot| {
