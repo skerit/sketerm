@@ -2498,12 +2498,15 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
             };
         }
     };
-    const from = mid.of(last_row);
     // The accent block a row paints is only the strip ABOVE its label
     // (text scanlines break the solid runs), so the block's midpoint
     // sits in the row's top third — the "drop above" zone. Aim at the
-    // ROW's center instead: the first and last blocks are two uniform
-    // row pitches apart, and each block's top tracks its row's top.
+    // ROW's center instead, derived from the row pitch (the first and
+    // last blocks are two uniform pitches apart). The block-top-to-
+    // row-top offset jitters a few pixels with font rendering, and the
+    // "into" zone is the middle 40% of a ~27px row, so one fixed aim
+    // point is a coin toss near the boundary: probe a few offsets and
+    // let the structural tree_parent check judge each drop.
     const row_pitch: f64 = @as(f64, @floatFromInt(last_row.min_y - first_row.min_y)) / 2.0;
     const onto = .{
         .x = mid.of(first_row).x,
@@ -2515,12 +2518,37 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     //    tree_parent): TST-photon rows span the full sidebar width at
     //    every depth, so nesting no longer moves the row's left edge
     //    and a pixel-indent probe cannot see it.
-    app.drag(win_id, from.x, from.y, onto.x, onto.y, 1) catch return "dragging a sidebar row onto another failed";
-    _ = app.waitIdle(300, 6_000);
-    if (waitTreeParent(allocator, app, sock_path, extra[1], 1, 6_000) == null) {
+    const nest_offsets = [_]f64{ 0.5, 0.62, 0.4, 0.72 };
+    var nested_ok = false;
+    for (nest_offsets, 0..) |frac, attempt| {
+        // A missed drop reorders rows (above/below zone), so every
+        // attempt re-learns both rectangles by focusing each tab.
+        var b_first = first_row;
+        var b_drag = last_row;
+        if (attempt > 0) {
+            if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+            _ = app.waitIdle(200, 4_000);
+            b_first = sidebarChipBounds(app, win_id) orelse return "the first tab's row vanished between nest attempts";
+            var refocus_buf: [96]u8 = undefined;
+            const refocus = std.fmt.bufPrint(&refocus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{extra[1]}) catch
+                return "building the drag-stage refocus command failed";
+            if (roundtrip(allocator, sock_path, refocus)) |r| allocator.free(r);
+            _ = app.waitIdle(200, 4_000);
+            b_drag = sidebarChipBounds(app, win_id) orelse return "the dragged tab's row vanished between nest attempts";
+        }
+        const y = @as(f64, @floatFromInt(b_first.min_y)) + row_pitch * frac;
+        app.drag(win_id, mid.of(b_drag).x, mid.of(b_drag).y, mid.of(b_first).x, y, 1) catch
+            return "dragging a sidebar row onto another failed";
+        _ = app.waitIdle(300, 6_000);
+        if (waitTreeParent(allocator, app, sock_path, extra[1], 1, 3_000) != null) {
+            nested_ok = true;
+            break;
+        }
+    }
+    if (!nested_ok) {
         if (roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n")) |r| {
             defer allocator.free(r);
-            _ = c.fprintf(platform.stderr(), "smoke-e2e: tabs after the nest drop: %.*s\n", @as(c_int, @intCast(r.len)), r.ptr);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: tabs after the nest drops: %.*s\n", @as(c_int, @intCast(r.len)), r.ptr);
         }
         return "dropping a sidebar row onto another did not nest it under that row";
     }
