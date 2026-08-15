@@ -61,6 +61,7 @@ var g_engine: ?webdrive.Engine = null;
 var g_headless_alloc: ?std.mem.Allocator = null;
 var g_headless_dir: ?[]const u8 = null;
 var g_headless_instance: ?[]const u8 = null;
+var g_headless_mux_sock: ?[]const u8 = null;
 
 /// Session default verbosity for `web_snapshot` (0 terse / 1 normal /
 /// 2 long text). Passing `detail` on a call CHANGES it, exactly the way
@@ -101,13 +102,23 @@ test "detail is per-request and sticky for the session" {
     try std.testing.expectEqual(false, detailFor(parsed.value).changed);
 }
 
-/// Arm the headless fallback. `dir`/`instance` must outlive the server
-/// (they are the isolation dir strings, which do). The helper itself is
-/// spawned lazily on the first web tool call that needs it.
-pub fn configureHeadless(allocator: std.mem.Allocator, dir: []const u8, instance: ?[]const u8) void {
+/// Arm the headless fallback. `dir`/`instance`/`mux_sock` must outlive
+/// the server (they are the isolation strings, which do). The helper
+/// itself is spawned lazily on the first web tool call that needs it;
+/// `mux_sock` is the instance daemon its watchable Wayland session is
+/// created on (null = plain headless only).
+pub fn configureHeadless(allocator: std.mem.Allocator, dir: []const u8, instance: ?[]const u8, mux_sock: ?[]const u8) void {
     g_headless_alloc = allocator;
     g_headless_dir = dir;
     g_headless_instance = instance;
+    g_headless_mux_sock = mux_sock;
+}
+
+/// Name of the live watchable web session, when the headless engine is
+/// running as a mux session's Wayland client; null otherwise.
+pub fn sessionInfo() ?[]const u8 {
+    if (g_engine) |*e| return e.sessionName();
+    return null;
 }
 
 /// Kill and reap the owned helper; part of server teardown (stdin EOF
@@ -129,7 +140,7 @@ fn headlessEngine() ?*webdrive.Engine {
     if (g_engine == null) {
         const alloc = g_headless_alloc orelse return null;
         const dir = g_headless_dir orelse return null;
-        g_engine = webdrive.Engine.init(alloc, dir, g_headless_instance) catch return null;
+        g_engine = webdrive.Engine.init(alloc, dir, g_headless_instance, g_headless_mux_sock) catch return null;
     }
     return &g_engine.?;
 }

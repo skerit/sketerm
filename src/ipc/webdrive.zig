@@ -6,27 +6,56 @@
 //! deadline — a wedged helper costs one described error, never a hang.
 //!
 //! Views here are HELPER views, not GUI panes: there is no widget, no
-//! tab and no user looking at them. The helper runs CEF with
-//! `--ozone-platform=headless` (no GPU process, software raster), which
-//! is the correct configuration for an unattended browser.
+//! tab and no user looking at them, and the views are windowless (OSR)
+//! browsers with a software raster either way.
 //!
-//! ## Discoverability (a future "view along" GUI)
+//! ## The watchable web session
+//!
+//! Given a mux daemon socket (`Engine.init`'s `mux_sock` — the MCP
+//! instance's private daemon), the engine first spawns a
+//! Wayland-hosting mux app session named `web-<pid>-<nonce>` (the
+//! `display create` machinery, `src/mux/display.zig`) and starts the
+//! helper as a Wayland CLIENT of it: `SKETERM_WEB_OZONE=wayland` +
+//! the session's environment, software rendering. The session is what
+//! a human attaches to (`Session Overview`, or `sketerm mux
+//! sock:<dir>/mux.sock attach <name>`): the assistant's browsing is a
+//! session on a daemon instead of an invisible private process. What
+//! that buys TODAY: page audio reaches the session's Pulse server (an
+//! attached viewer hears it), the session is enumerable/attachable,
+//! and its lifetime tracks the helper's. What it does NOT yet buy:
+//! OSR browsers create no Wayland toplevels, so the session shows no
+//! windows — window-level watch-along needs windowed browsers or a
+//! presenter surface in the helper, on top of this seam.
+//!
+//! Session setup is best-effort with an automatic fallback: any
+//! failure — no daemon, an old daemon, a helper that cannot even start
+//! against the session's compositor — lands in the plain headless mode
+//! that existed before (`--ozone-platform=headless`), and a
+//! startup-with-session failure latches so the tools never flap.
+//! `SKETERM_WEB_SESSION=0` opts out entirely. A leaked session (MCP
+//! SIGKILL) is reaped by its own 60s no-client TTL.
+//!
+//! ## Discoverability
 //!
 //! The helper socket lives at the WELL-KNOWN name `web.sock` inside the
 //! MCP instance directory (`$XDG_RUNTIME_DIR/sketerm/mcp-tmp-<pid>/` or
 //! `mcp-<name>/`), next to a presence file `web.json`:
-//!   {"mcp_pid":N,"helper_pid":N,"client":"sketerm-mcp[:name]","started_at_ms":N}
-//! written when the helper comes up and unlinked with it, so a GUI can
-//! enumerate assistant browser sessions by scanning the instance dirs.
-//! NOTE for that future feature: src/web/server.zig serves exactly ONE
-//! client and exits when it disconnects — a second (viewer) client
-//! needs multi-client support there first. This driver deliberately
-//! assumes nothing beyond "I created my views": view ids are engine
-//! scoped, not connection scoped.
+//!   {"mcp_pid":N,"helper_pid":N,"client":"sketerm-mcp[:name]","started_at_ms":N,
+//!    "session":"web-...","mux_socket":"..."}
+//! (the last two only in session mode) written when the helper comes up
+//! and unlinked with it, so a GUI can enumerate assistant browser
+//! sessions by scanning the instance dirs. NOTE for a frame-level "view
+//! along": src/web/server.zig serves exactly ONE client and exits when
+//! it disconnects — a second (viewer) client needs multi-client support
+//! there first. This driver deliberately assumes nothing beyond "I
+//! created my views": view ids are engine scoped, not connection
+//! scoped.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
+const muxclient = @import("../mux/client.zig");
+const display = @import("../mux/display.zig");
 const proto = @import("../web/protocol.zig");
 const reader_model = @import("../web/reader.zig");
 const reader_guards = @import("../web/reader_guards.zig");
@@ -174,6 +203,25 @@ pub const View = struct {
 
 pub const State = enum { idle, ready, unavailable };
 
+/// The Wayland-hosting mux session the helper renders into, plus the
+/// daemon connection that created it (kept for the origin-fenced
+/// destroy at teardown).
+const WebSession = struct {
+    conn: muxclient.Conn,
+    created: display.Created,
+};
+
+/// NUL-terminated copies of a session's environment, prepared BEFORE
+/// fork (no allocation between fork and exec).
+const SessionEnv = struct {
+    wl: [4096:0]u8 = undefined,
+    rt: [4096:0]u8 = undefined,
+    pulse: [4200:0]u8 = undefined,
+    have_rt: bool = false,
+    have_pulse: bool = false,
+    active: bool = false,
+};
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     /// Directory holding the helper socket and its cache; owned.
@@ -182,6 +230,14 @@ pub const Engine = struct {
     /// helper logs and a future viewer can attribute the session to an
     /// assistant rather than an anonymous client. Owned.
     client_name: []u8,
+    /// Mux daemon socket for the watchable web session; null disables
+    /// session hosting outright. Owned.
+    mux_sock: ?[]u8 = null,
+    session: ?WebSession = null,
+    /// Latched when a helper failed to START with the session
+    /// environment: later spawns go plain headless instead of paying a
+    /// doomed session + spawn per tool call.
+    session_blocked: bool = false,
     state: State = .idle,
     /// Why `state == .unavailable`. Static strings only.
     reason: []const u8 = "",
@@ -214,14 +270,16 @@ pub const Engine = struct {
     cap_intercept: bool = false,
     next_sem_request: u32 = 1,
 
-    pub fn init(gpa: std.mem.Allocator, dir: []const u8, instance: ?[]const u8) !Engine {
+    pub fn init(gpa: std.mem.Allocator, dir: []const u8, instance: ?[]const u8, mux_sock: ?[]const u8) !Engine {
         const owned_dir = try gpa.dupe(u8, dir);
         errdefer gpa.free(owned_dir);
         const name = if (instance) |n|
             try std.fmt.allocPrint(gpa, "sketerm-mcp:{s}", .{n})
         else
             try gpa.dupe(u8, "sketerm-mcp");
-        return .{ .gpa = gpa, .dir = owned_dir, .client_name = name };
+        errdefer gpa.free(name);
+        const owned_sock: ?[]u8 = if (mux_sock) |sck| try gpa.dupe(u8, sck) else null;
+        return .{ .gpa = gpa, .dir = owned_dir, .client_name = name, .mux_sock = owned_sock };
     }
 
     /// Kill and reap the helper; safe to call from a signal-driven
@@ -244,6 +302,13 @@ pub const Engine = struct {
             self.pid = -1;
         }
         self.removePresence();
+        // After the helper: its Wayland connection must be gone before
+        // the session's socket goes away under it.
+        self.teardownSession(true);
+        if (self.mux_sock) |sck| {
+            self.gpa.free(sck);
+            self.mux_sock = null;
+        }
         self.clearViews();
         self.views.deinit(self.gpa);
         self.in.deinit(self.gpa);
@@ -253,6 +318,86 @@ pub const Engine = struct {
         self.state = .idle;
     }
 
+    /// Name of the live watchable Wayland session the helper was
+    /// started against; null in plain headless mode.
+    pub fn sessionName(self: *const Engine) ?[]const u8 {
+        if (self.session) |*s| return s.created.name;
+        return null;
+    }
+
+    fn sessionWanted(self: *const Engine) bool {
+        if (self.mux_sock == null or self.session_blocked) return false;
+        const v = c.getenv("SKETERM_WEB_SESSION") orelse return true;
+        const s = std.mem.span(v);
+        return !(std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "no"));
+    }
+
+    /// Create (or verify) the web session. Best effort: on any failure
+    /// the engine simply stays in plain headless mode.
+    fn ensureSession(self: *Engine) void {
+        if (!self.sessionWanted()) return;
+        if (self.session) |*s| {
+            // A daemon restart takes the session's display socket with
+            // it; a stale one must not be exported to a fresh helper.
+            var z: [4096:0]u8 = undefined;
+            const p = std.fmt.bufPrintZ(&z, "{s}", .{s.created.wl_display}) catch return;
+            if (c.access(p.ptr, c.F_OK) == 0) return;
+            self.teardownSession(false);
+        }
+        var conn = muxclient.Conn.connectLocalAutostartAt(self.gpa, self.mux_sock) catch return;
+        var nonce: [4]u8 = undefined;
+        if (c.getentropy(&nonce, nonce.len) != 0) std.mem.writeInt(u32, &nonce, @bitCast(c.getpid()), .little);
+        var name_buf: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buf, "web-{d}-{x}", .{
+            c.getpid(), std.mem.readInt(u32, &nonce, .little),
+        }) catch unreachable;
+        // No Xwayland (the helper is a native Wayland client), software
+        // GL, and a short TTL as the orphan backstop: with no attached
+        // viewer and no live Wayland client the daemon reaps it.
+        const created = display.spawnSession(self.gpa, &conn, .{
+            .xwayland = .disabled,
+            .ttl_secs = 60,
+        }, name) orelse {
+            conn.deinit();
+            return;
+        };
+        self.session = .{ .conn = conn, .created = created };
+    }
+
+    fn teardownSession(self: *Engine, destroy: bool) void {
+        if (self.session) |*s| {
+            if (destroy) _ = display.destroySession(
+                self.gpa,
+                &s.conn,
+                s.created.name,
+                &s.created.origin_id,
+                s.created.pid,
+                s.created.wl_display,
+            );
+            s.conn.deinit();
+            s.created.deinit();
+            self.session = null;
+        }
+    }
+
+    /// Snapshot the session's environment into fork-safe buffers.
+    fn sessionEnv(self: *const Engine) SessionEnv {
+        var env = SessionEnv{};
+        const s: *const WebSession = if (self.session) |*sp| sp else return env;
+        _ = std.fmt.bufPrintZ(&env.wl, "{s}", .{s.created.wl_display}) catch return env;
+        if (s.created.runtime_dir.len > 0) {
+            _ = std.fmt.bufPrintZ(&env.rt, "{s}", .{s.created.runtime_dir}) catch return env;
+            env.have_rt = true;
+        }
+        if (s.created.pulse_server.len > 0) {
+            if (std.fmt.bufPrintZ(&env.pulse, "unix:{s}", .{s.created.pulse_server})) |_| {
+                env.have_pulse = true;
+            } else |_| {}
+        }
+        env.active = true;
+        return env;
+    }
+
     /// Write `web.json` next to the socket (see the header). Best
     /// effort: enumeration metadata, never load-bearing.
     fn writePresence(self: *Engine) void {
@@ -260,11 +405,20 @@ pub const Engine = struct {
         const p = std.fmt.bufPrintZ(&path_z, "{s}/web.json", .{self.dir}) catch return;
         const f = c.fopen(p.ptr, "w") orelse return;
         defer _ = c.fclose(f);
-        var line: [512]u8 = undefined;
-        const s = std.fmt.bufPrint(&line, "{{\"mcp_pid\":{d},\"helper_pid\":{d},\"client\":\"{s}\",\"started_at_ms\":{d}}}\n", .{
+        var line: [8704]u8 = undefined;
+        var len: usize = 0;
+        len += (std.fmt.bufPrint(line[len..], "{{\"mcp_pid\":{d},\"helper_pid\":{d},\"client\":\"{s}\",\"started_at_ms\":{d}", .{
             c.getpid(), self.pid, self.client_name, clock.nowMs(),
-        }) catch return;
-        _ = c.fwrite(s.ptr, 1, s.len, f);
+        }) catch return).len;
+        if (self.session) |*ws| {
+            // Session name + daemon socket contain no JSON specials
+            // (daemon-validated name, filesystem path we minted).
+            len += (std.fmt.bufPrint(line[len..], ",\"session\":\"{s}\",\"mux_socket\":\"{s}\"", .{
+                ws.created.name, self.mux_sock.?,
+            }) catch return).len;
+        }
+        len += (std.fmt.bufPrint(line[len..], "}}\n", .{}) catch return).len;
+        _ = c.fwrite(&line, 1, len, f);
     }
 
     fn removePresence(self: *Engine) void {
@@ -348,9 +502,33 @@ pub const Engine = struct {
             return self.failStart("helper socket path exceeds the unix socket limit (use a shorter runtime dir)");
         var cache_z: [4096:0]u8 = undefined;
         _ = std.fmt.bufPrintZ(&cache_z, "{s}/web-cache", .{self.dir}) catch return self.failStart("helper cache path too long");
+
+        // Watchable session first (best effort); the helper is then
+        // started as that session's Wayland client.
+        self.ensureSession();
+        if (self.startHelper(bin, sock, &sock_z, &cache_z)) return true;
+
+        // A helper that cannot even start against the session's
+        // compositor must not cost the web tools: drop the session,
+        // latch, and retry once in the plain headless mode.
+        if (self.session != null) {
+            self.teardownSession(true);
+            self.session_blocked = true;
+            const note = "sketerm mcp: web helper failed to start in session mode; retrying plain headless\n";
+            _ = c.write(2, note, note.len);
+            if (self.state == .unavailable and self.retryable) self.state = .idle;
+            return self.startHelper(bin, sock, &sock_z, &cache_z);
+        }
+        return false;
+    }
+
+    /// One spawn + connect + handshake attempt. On success the engine
+    /// is `.ready` with the presence file written.
+    fn startHelper(self: *Engine, bin: [*:0]const u8, sock: [:0]const u8, sock_z: *[108:0]u8, cache_z: *[4096:0]u8) bool {
         // A stale socket from a crashed helper would make the connect
         // succeed against nothing.
         _ = c.unlink(sock.ptr);
+        const env = self.sessionEnv();
 
         const pid = c.fork();
         if (pid == 0) {
@@ -362,7 +540,22 @@ pub const Engine = struct {
                 _ = c.dup2(devnull, 1);
                 if (devnull > 2) _ = c.close(devnull);
             }
-            var argv: [6:null]?[*:0]const u8 = .{ bin, "--socket", &sock_z, "--cache-dir", &cache_z, null };
+            if (env.active) {
+                // The session's display, software rendering. The exact
+                // env recipe is display.zig's `run` (never derive wl-*
+                // paths; the daemon returned these).
+                _ = c.setenv("WAYLAND_DISPLAY", &env.wl, 1);
+                if (env.have_rt) _ = c.setenv("XDG_RUNTIME_DIR", &env.rt, 1);
+                _ = c.setenv("XDG_SESSION_TYPE", "wayland", 1);
+                if (env.have_pulse) _ = c.setenv("PULSE_SERVER", &env.pulse, 1);
+                _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+                _ = c.setenv("SKETERM_WEB_OZONE", "wayland", 1);
+                _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
+                _ = c.unsetenv("WAYLAND_SOCKET");
+                _ = c.unsetenv("DISPLAY");
+                _ = c.unsetenv("XAUTHORITY");
+            }
+            var argv: [6:null]?[*:0]const u8 = .{ bin, "--socket", sock_z, "--cache-dir", cache_z, null };
             _ = c.execv(bin, @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
@@ -1114,7 +1307,7 @@ pub const Engine = struct {
 
 test "a snapshot reply is exactly the helper's coalesced answer; strays are dropped" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
     defer {
         eng.state = .idle; // no child to reap
         eng.deinit();
@@ -1146,7 +1339,7 @@ test "a snapshot reply is exactly the helper's coalesced answer; strays are drop
 
 test "a full-mode wait is not satisfied by a spontaneous delta" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
     defer {
         eng.state = .idle;
         eng.deinit();
@@ -1167,7 +1360,7 @@ test "a full-mode wait is not satisfied by a spontaneous delta" {
 
 test "correlated replies ignore old request ids and preserve reader provenance" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
     defer {
         eng.state = .idle;
         eng.deinit();
@@ -1203,7 +1396,7 @@ test "legacy timeout quarantine consumes exactly one late reply" {
 
 test "wait cleanup tolerates a view destroyed while the operation ran" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
     defer {
         eng.state = .idle;
         eng.deinit();
@@ -1221,7 +1414,7 @@ test "wait cleanup tolerates a view destroyed while the operation ran" {
 
 test "the current view is the last one touched, not the oldest" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
     defer {
         eng.state = .idle; // no child to reap
         eng.deinit();

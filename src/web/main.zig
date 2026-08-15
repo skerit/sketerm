@@ -18,6 +18,7 @@ const std = @import("std");
 const c = @import("cbindings");
 const build_options = @import("build_options");
 const cefhost = @import("cefhost.zig");
+const ozone = @import("ozone.zig");
 const server = @import("server.zig");
 const pathz = @import("../util/pathz.zig");
 
@@ -231,15 +232,28 @@ fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
     }
     // A CEF subprocess is this binary re-executed with Chromium's own
     // command line, which already carries the platform the browser
-    // process chose — so the probe below runs exactly once, in the
-    // browser process, and every child inherits its answer.
-    var chosen: ?[]const u8 = null;
+    // process chose — so the probes below run exactly once, in the
+    // browser process, and every child inherits its answer. The
+    // decision itself lives in ozone.zig (`SKETERM_WEB_OZONE` is
+    // webdrive forcing the helper onto a mux session's display);
+    // probes stay short-circuited here so a headless pick costs no
+    // compositor connect.
+    var explicit: ?[]const u8 = null;
     for (argv) |a| {
         const s = std.mem.span(a);
-        if (std.mem.startsWith(u8, s, "--ozone-platform=")) chosen = s["--ozone-platform=".len ..];
+        if (std.mem.startsWith(u8, s, "--ozone-platform=")) explicit = s["--ozone-platform=".len ..];
     }
-    if (chosen == null) {
-        const want: [*:0]const u8 = if (gpuWanted() and waylandReachable() and renderNodePresent())
+    const override: ?[]const u8 = if (c.getenv("SKETERM_WEB_OZONE")) |o| std.mem.span(o) else null;
+    const choice = blk: {
+        if (explicit != null) break :blk ozone.choose(explicit, null, gpuWanted(), false, false);
+        const forced_wayland = if (override) |o| std.mem.eql(u8, o, "wayland") else false;
+        const g = gpuWanted();
+        const w = if (g or forced_wayland) waylandReachable() else false;
+        const r = if (g and w and !forced_wayland) renderNodePresent() else false;
+        break :blk ozone.choose(null, override, g, w, r);
+    };
+    if (explicit == null) {
+        const want: [*:0]const u8 = if (std.mem.eql(u8, choice.platform, "wayland"))
             "--ozone-platform=wayland"
         else
             "--ozone-platform=headless";
@@ -247,7 +261,10 @@ fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
             buf[n] = @constCast(@ptrCast(want));
             n += 1;
         }
-        chosen = std.mem.span(want)["--ozone-platform=".len ..];
+    }
+    if (choice.disable_gpu and n < buf.len) {
+        buf[n] = @constCast(@ptrCast("--disable-gpu"));
+        n += 1;
     }
     // Subpixel (LCD) text AA. MEASURED on the software (headless-ozone)
     // path: no effect — glyph pixels stay 100% neutral gray with the
@@ -264,7 +281,7 @@ fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
     }
     // Only a real ozone platform ever produces a GPU process here, and
     // only wayland was measured to deliver shared textures.
-    cefhost.setAccelerated(std.mem.eql(u8, chosen.?, "wayland"));
+    cefhost.setAccelerated(choice.accelerated);
     return buf[0..n];
 }
 

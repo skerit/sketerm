@@ -14,6 +14,7 @@ const muxclient = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const panelstore = @import("ipc/panelstore.zig");
 const protocol = @import("ipc/protocol.zig");
+const webproto = @import("web/protocol.zig");
 const version = @import("version.zig");
 
 fn say(msg: []const u8) void {
@@ -485,9 +486,20 @@ fn sessionCount(allocator: std.mem.Allocator, owner: *muxclient.Conn) usize {
     return parsed.value.sessions.len;
 }
 
-pub fn main() u8 {
+pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa = std.heap.DebugAllocator(.{}){};
     const allocator = gpa.allocator();
+
+    // The web-session stage points SKETERM_WEB_BIN at THIS binary: a
+    // protocol-v1-speaking fake webengine that records its environment,
+    // so the session plumbing is provable with no CEF installed. The
+    // env guard keeps a plain smoke run out of this branch.
+    if (c.getenv("SKETERM_FAKE_WEBENGINE") != null) {
+        for (init.args.vector, 0..) |a, i| {
+            if (std.mem.eql(u8, std.mem.span(a), "--socket") and i + 1 < init.args.vector.len)
+                return fakeWebengine(allocator, std.mem.span(init.args.vector[i + 1]));
+        }
+    }
 
     // Isolated runtime dir so nothing touches the user's real daemon.
     var rt_buf: [256]u8 = undefined;
@@ -522,6 +534,11 @@ pub fn main() u8 {
     defer _ = c.unsetenv("SKETERM_MUX_BIN");
     if (c.getenv("SKETERM_SMOKE_MCP_WEB_ONLY") != null)
         return webOnly(allocator, exe, rt);
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBSESSION_ONLY") != null) {
+        webSessionFakeStage(allocator, exe, rt);
+        say("smoke-mcp: focused watchable web session ok");
+        return 0;
+    }
 
     // ── Stage 1: ephemeral isolation + headless terminal ──────────
     {
@@ -1877,6 +1894,10 @@ pub fn main() u8 {
         say("smoke-mcp: ui_show_files ok");
     }
 
+    // ── watchable web session plumbing (no CEF needed) ─────────────
+    webSessionFakeStage(allocator, exe, rt);
+    say("smoke-mcp: watchable web session plumbing ok");
+
     // ── web_* headless: isolated mode, NO GUI, no --shared ─────────
     //
     // The regression this guards: the web tools once hard-failed with
@@ -1994,6 +2015,26 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
         fail("helper socket is not at the well-known instance-dir path");
     if (!fileExists(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable))
         fail("web.json presence file missing next to the helper socket");
+
+    // Session mode is best-effort with an automatic headless fallback
+    // (a CEF build that cannot start against the session compositor
+    // must not cost the web tools). Report which mode a REAL helper
+    // engaged; when the session engaged, both capability and presence
+    // reporting must name it.
+    {
+        const caps_open = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, caps_open, "\\\"web_backend\\\":\\\"session\\\"") != null) {
+            if (std.mem.indexOf(u8, caps_open, "\\\"web_session\\\":\\\"web-") == null)
+                fail("session web backend reported without a session name");
+            var wj_buf: [8192]u8 = undefined;
+            const wj = readSmall(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable, &wj_buf);
+            if (std.mem.indexOf(u8, wj, "\"session\":\"web-") == null)
+                fail("session mode engaged but web.json does not name the session");
+            say("smoke-mcp: REAL helper engaged web session mode (CEF on the instance daemon's Wayland session)");
+        } else {
+            say("smoke-mcp: REAL helper fell back to plain headless (CEF did not start against the session compositor)");
+        }
+    }
 
     // web_act: a trusted click, whose reply carries the DELTA showing
     // the paragraph the click mutated.
@@ -2130,6 +2171,239 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     if (std.mem.indexOf(u8, legacy_read, "\\\"entities\\\"") != null)
         fail("the old-helper fallback fabricated rich reader entities");
     legacy.closeStdinWait();
+}
+
+/// Read a small file fully; empty slice when missing/unreadable.
+fn readSmall(path: []const u8, buf: []u8) []const u8 {
+    var z: [4096:0]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return "";
+    const f = c.fopen(p.ptr, "rb") orelse return "";
+    defer _ = c.fclose(f);
+    const n = c.fread(buf.ptr, 1, buf.len, f);
+    return buf[0..n];
+}
+
+/// `.list` a daemon's sessions as the raw welcome JSON; empty when the
+/// daemon is unreachable.
+fn listSessionsRaw(allocator: std.mem.Allocator, sock: []const u8, buf: []u8) []const u8 {
+    var conn = muxclient.Conn.connect(allocator, sock) catch return "";
+    defer conn.deinit();
+    conn.sendFrame(.list, "") catch return "";
+    const frame = conn.recvExpectFor(&.{.welcome}, 15_000) catch return "";
+    defer frame.deinit(allocator);
+    const n = @min(frame.payload.len, buf.len);
+    @memcpy(buf[0..n], frame.payload[0..n]);
+    return buf[0..n];
+}
+
+/// A minimal `sketerm-webengine` stand-in speaking protocol v1: dumps
+/// the environment webdrive handed it, answers the handshake, and
+/// serves just enough (nav events + a full snapshot) for `web_open` to
+/// settle. `SKETERM_FAKE_WEB_EXIT=1` = die on startup instead, the
+/// broken-CEF shape the session fallback must absorb.
+fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
+    if (c.getenv("SKETERM_FAKE_WEB_ENV")) |out_path| {
+        const f = c.fopen(out_path, "w");
+        if (f) |fp| {
+            defer _ = c.fclose(fp);
+            for ([_][*:0]const u8{ "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE", "PULSE_SERVER", "LIBGL_ALWAYS_SOFTWARE", "SKETERM_WEB_OZONE", "SKETERM_WEB_GPU", "WAYLAND_SOCKET", "DISPLAY" }) |key| {
+                const val = if (c.getenv(key)) |v| std.mem.span(@as([*:0]const u8, v)) else "";
+                var line: [4300]u8 = undefined;
+                const s = std.fmt.bufPrint(&line, "{s}={s}\n", .{ key, val }) catch continue;
+                _ = c.fwrite(s.ptr, 1, s.len, fp);
+            }
+        }
+    }
+    if (c.getenv("SKETERM_FAKE_WEB_EXIT") != null) return 1;
+
+    var addr = std.mem.zeroes(c.struct_sockaddr_un);
+    if (sock_path.len + 1 > addr.sun_path.len) return 1;
+    addr.sun_family = c.AF_UNIX;
+    @memcpy(addr.sun_path[0..sock_path.len], sock_path);
+    const lfd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (lfd < 0) return 1;
+    if (c.bind(lfd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return 1;
+    if (c.listen(lfd, 1) != 0) return 1;
+    const fd = c.accept(lfd, null, null);
+    if (fd < 0) return 1;
+    _ = c.close(lfd);
+
+    var in: std.ArrayList(u8) = .empty;
+    defer in.deinit(allocator);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    var url_buf: [2048]u8 = undefined;
+    var url_len: usize = 0;
+    while (true) {
+        var tmp: [65536]u8 = undefined;
+        const n = c.read(fd, &tmp, tmp.len);
+        if (n <= 0) return 0; // client gone = normal helper exit
+        in.appendSlice(allocator, tmp[0..@intCast(n)]) catch return 1;
+        var reader = webproto.Reader.init(in.items);
+        while (reader.next() catch return 1) |frame| {
+            out.clearRetainingCapacity();
+            switch (frame.tag) {
+                .hello => {
+                    webproto.encode(allocator, &out, webproto.HelloAck{
+                        .proto = webproto.PROTO_VERSION,
+                        .engine_name = "fake",
+                        .engine_version = "0",
+                        .caps = &.{ webproto.CAP_FRAMES_SHM, webproto.CAP_SEMANTIC, webproto.CAP_VIEW_CREATE_URL },
+                    }) catch return 1;
+                },
+                .view_create_url => {
+                    const req = webproto.decode(webproto.ViewCreateUrl, frame.payload) catch return 1;
+                    url_len = @min(req.url.len, url_buf.len);
+                    @memcpy(url_buf[0..url_len], req.url[0..url_len]);
+                    webproto.encode(allocator, &out, webproto.EvNavState{
+                        .view = req.view,
+                        .can_back = 0,
+                        .can_fwd = 0,
+                        .loading = 0,
+                        .url = url_buf[0..url_len],
+                    }) catch return 1;
+                    webproto.encode(allocator, &out, webproto.EvLoad{
+                        .view = req.view,
+                        .state = @intFromEnum(webproto.LoadState.finished),
+                        .url = url_buf[0..url_len],
+                    }) catch return 1;
+                },
+                .sem_snapshot_req => {
+                    const req = webproto.decode(webproto.SemSnapshotReq, frame.payload) catch return 1;
+                    webproto.encode(allocator, &out, webproto.SemSnapshot{
+                        .view = req.view,
+                        .doc_gen = 1,
+                        .rev = 1,
+                        .kind = @intFromEnum(webproto.SnapKind.full),
+                        .payload = .{ .s = "[1] FAKE-SESSION-DOC\n" },
+                    }) catch return 1;
+                },
+                else => {},
+            }
+            var off: usize = 0;
+            while (off < out.items.len) {
+                const wn = c.write(fd, out.items.ptr + off, out.items.len - off);
+                if (wn <= 0) return 0;
+                off += @intCast(wn);
+            }
+        }
+        const used = reader.consumed();
+        if (used != 0 and used <= in.items.len) {
+            const rest = in.items.len - used;
+            std.mem.copyForwards(u8, in.items[0..rest], in.items[used..]);
+            in.shrinkRetainingCapacity(rest);
+        }
+    }
+}
+
+/// CEF-free proof of the watchable web session: the fake helper above
+/// stands in for sketerm-webengine, and the stage asserts the session
+/// exists on the instance daemon, that its exact environment reached
+/// the helper, that capabilities + web.json name it, that a
+/// helper-startup failure falls back headless WITHOUT leaking the
+/// session, and that SKETERM_WEB_SESSION=0 opts out.
+fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    // Resolve OUR OWN binary here: "/proc/self/exe" would resolve in
+    // the MCP process and hand webdrive `sketerm` as its "helper".
+    var self_buf: [4096:0]u8 = undefined;
+    const self_len = c.readlink("/proc/self/exe", &self_buf, self_buf.len - 1);
+    if (self_len <= 0) fail("cannot resolve the smoke binary path");
+    self_buf[@intCast(self_len)] = 0;
+    _ = c.setenv("SKETERM_WEB_BIN", &self_buf, 1);
+    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    _ = c.setenv("SKETERM_FAKE_WEBENGINE", "1", 1);
+    defer _ = c.unsetenv("SKETERM_FAKE_WEBENGINE");
+    var envout_buf: [512]u8 = undefined;
+    const envout = std.fmt.bufPrintZ(&envout_buf, "{s}/fake-web-env.txt", .{rt}) catch unreachable;
+    _ = c.setenv("SKETERM_FAKE_WEB_ENV", envout.ptr, 1);
+    defer _ = c.unsetenv("SKETERM_FAKE_WEB_ENV");
+    var args_buf: [256]u8 = undefined;
+    var probe_buf: [512]u8 = undefined;
+    var file_buf: [8192]u8 = undefined;
+    var list_buf: [128 * 1024]u8 = undefined;
+
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/session\"}");
+        const opened = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, opened, "isError") != null)
+            fail("web_open failed against the fake session helper");
+        if (std.mem.indexOf(u8, opened, "FAKE-SESSION-DOC") == null)
+            fail("web_open's snapshot did not come from the fake helper");
+
+        const caps = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, caps, "\\\"web_backend\\\":\\\"session\\\"") == null or
+            std.mem.indexOf(u8, caps, "\\\"web_session\\\":\\\"web-") == null)
+            fail("capabilities does not report the watchable web session");
+
+        const pj = readSmall(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable, &file_buf);
+        if (std.mem.indexOf(u8, pj, "\"session\":\"web-") == null or
+            std.mem.indexOf(u8, pj, "mux.sock") == null)
+            fail("web.json does not name the watchable session + daemon socket");
+
+        // The instance daemon really hosts it, as a display session.
+        const priv = std.fmt.bufPrint(&args_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ rt, m.pid }) catch unreachable;
+        const listing = listSessionsRaw(allocator, priv, &list_buf);
+        if (std.mem.indexOf(u8, listing, "web-") == null or
+            std.mem.indexOf(u8, listing, "\"display\":true") == null)
+            fail("the instance daemon does not list the web session as a display session");
+
+        // The helper got the DAEMON'S environment, never a derived one.
+        const env = readSmall(envout, &file_buf);
+        const wl_at = std.mem.indexOf(u8, env, "WAYLAND_DISPLAY=") orelse fail("fake helper recorded no environment");
+        const wl_line = env[wl_at + "WAYLAND_DISPLAY=".len ..];
+        const wl_end = std.mem.indexOfScalar(u8, wl_line, '\n') orelse fail("malformed env dump");
+        const wl = wl_line[0..wl_end];
+        if (wl.len == 0) fail("helper started without the session's WAYLAND_DISPLAY");
+        if (std.mem.indexOf(u8, listing, wl) == null)
+            fail("the helper's WAYLAND_DISPLAY is not the daemon-reported session display");
+        if (std.mem.indexOf(u8, env, "SKETERM_WEB_OZONE=wayland\n") == null or
+            std.mem.indexOf(u8, env, "LIBGL_ALWAYS_SOFTWARE=1\n") == null or
+            std.mem.indexOf(u8, env, "SKETERM_WEB_GPU=0\n") == null or
+            std.mem.indexOf(u8, env, "WAYLAND_SOCKET=\n") == null or
+            std.mem.indexOf(u8, env, "DISPLAY=\n") == null)
+            fail("session helper environment is missing the forced software-wayland recipe");
+        m.closeStdinWait();
+    }
+
+    // A helper that dies on startup must cost the session, not the web
+    // tools' error clarity — and must not leak the session.
+    {
+        _ = c.setenv("SKETERM_FAKE_WEB_EXIT", "1", 1);
+        defer _ = c.unsetenv("SKETERM_FAKE_WEB_EXIT");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/broken\"}");
+        const failed = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, failed, "isError") == null or
+            std.mem.indexOf(u8, failed, "exited during startup") == null)
+            fail("a startup-dead helper did not surface as the described startup error");
+        const priv = std.fmt.bufPrint(&args_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ rt, m.pid }) catch unreachable;
+        const listing = listSessionsRaw(allocator, priv, &list_buf);
+        if (std.mem.indexOf(u8, listing, "web-") != null)
+            fail("the fallback leaked the web session on the instance daemon");
+        m.closeStdinWait();
+    }
+
+    // Explicit opt-out: plain headless, no session anywhere.
+    {
+        _ = c.setenv("SKETERM_WEB_SESSION", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_SESSION");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/optout\"}");
+        const opened = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, opened, "isError") != null)
+            fail("web_open failed with the session opted out");
+        const caps = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, caps, "\\\"web_backend\\\":\\\"headless\\\"") == null)
+            fail("opt-out did not fall back to the plain headless backend");
+        const pj = readSmall(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable, &file_buf);
+        if (std.mem.indexOf(u8, pj, "\"session\"") != null)
+            fail("opt-out still advertised a session in web.json");
+        m.closeStdinWait();
+    }
 }
 
 /// Run only the optional browser stage for focused E2E validation.

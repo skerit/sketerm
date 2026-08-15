@@ -104,13 +104,31 @@ const Listing = struct {
     sessions: []Sess = &.{},
 };
 
+pub const XwaylandMode = enum { auto, required, disabled };
+
+/// The `display create` spawn shape, minus CLI concerns — the one
+/// implementation behind the CLI and programmatic callers (webdrive's
+/// watchable web session), so the two can never drift.
+pub const SpawnOpts = struct {
+    isolated: bool = false,
+    gpu: bool = false,
+    xwayland: XwaylandMode = .auto,
+    ttl_secs: u32 = 0,
+    kb_layout: []const u8 = "",
+    output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
+    output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
+    /// Fail (and roll back) when the daemon cannot apply the requested
+    /// output size, instead of accepting its default.
+    require_size: bool = false,
+};
+
 const Args = struct {
     cmd: []const u8 = "",
     name: []const u8 = "",
     socket: ?[]const u8 = null,
     isolated: bool = false,
     gpu: bool = false,
-    xwayland: enum { auto, required, disabled } = .auto,
+    xwayland: XwaylandMode = .auto,
     ttl: u32 = 0,
     ttl_set: bool = false,
     kb_layout: []const u8 = "",
@@ -120,6 +138,19 @@ const Args = struct {
     output_width: u32 = wlcomp.DEFAULT_OUTPUT_WIDTH,
     output_height: u32 = wlcomp.DEFAULT_OUTPUT_HEIGHT,
     command: []const []const u8 = &.{},
+
+    fn spawnOpts(a: Args) SpawnOpts {
+        return .{
+            .isolated = a.isolated,
+            .gpu = a.gpu,
+            .xwayland = a.xwayland,
+            .ttl_secs = a.ttl,
+            .kb_layout = a.kb_layout,
+            .output_width = a.output_width,
+            .output_height = a.output_height,
+            .require_size = a.size_set,
+        };
+    }
 };
 
 fn sigNoop(_: c_int) callconv(.c) void {}
@@ -372,7 +403,7 @@ fn writeEnvJson(w: *std.Io.Writer, env: Env) !void {
     try w.writeAll("}");
 }
 
-const Created = struct {
+pub const Created = struct {
     allocator: std.mem.Allocator,
     name: []u8,
     origin_id: wire.SessionOriginId,
@@ -388,7 +419,7 @@ const Created = struct {
     output_width: u32,
     output_height: u32,
 
-    fn deinit(self: *Created) void {
+    pub fn deinit(self: *Created) void {
         self.allocator.free(self.name);
         self.allocator.free(self.wl_display);
         self.allocator.free(self.pulse_server);
@@ -438,7 +469,9 @@ fn waitSocketGone(path: []const u8) bool {
     return c.access(z.ptr, c.F_OK) != 0;
 }
 
-fn destroyRaw(
+/// Origin-fenced session destruction; safe against a same-name
+/// replacement created by another process.
+pub fn destroySession(
     allocator: std.mem.Allocator,
     conn: *client.Conn,
     name: []const u8,
@@ -475,7 +508,9 @@ fn destroyRaw(
     return true;
 }
 
-fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name: []const u8) ?Created {
+/// Spawn a Wayland-hosting display session and return its identity +
+/// environment; errors are reported on stderr and rolled back.
+pub fn spawnSession(allocator: std.mem.Allocator, conn: *client.Conn, a: SpawnOpts, name: []const u8) ?Created {
     if (!conn.display_v2 or !conn.kill_origin_fence) {
         errPrint("daemon is too old for display lifecycle safety; upgrade sketerm-mux", .{});
         return null;
@@ -488,7 +523,7 @@ fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name:
         .require_xwayland = a.xwayland == .required,
         .isolated = a.isolated,
         .gpu = a.gpu,
-        .ttl_secs = a.ttl,
+        .ttl_secs = a.ttl_secs,
         .output_width = a.output_width,
         .output_height = a.output_height,
         .kb_layout = a.kb_layout,
@@ -538,51 +573,51 @@ fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name:
     }
     if (r.wl_display.len == 0) {
         errPrint("session '{s}' came up without a Wayland display", .{name});
-        if (r.pid != 0) _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, "");
+        if (r.pid != 0) _ = destroySession(allocator, conn, name, r.origin_id, r.pid, "");
         return null;
     }
-    if (a.size_set and (r.output_width != a.output_width or r.output_height != a.output_height)) {
+    if (a.require_size and (r.output_width != a.output_width or r.output_height != a.output_height)) {
         errPrint("daemon did not apply requested output size {d}x{d}", .{ a.output_width, a.output_height });
-        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
+        _ = destroySession(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     }
     if (a.xwayland == .required and !r.xwayland) {
         errPrint("daemon could not start required rootless Xwayland", .{});
-        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
+        _ = destroySession(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     }
     if (r.xwayland and !xwayland.waitReady(r.x_display, r.xauthority, 10_000)) {
         errPrint("rootless Xwayland at {s} did not become ready", .{r.x_display});
-        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
+        _ = destroySession(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         if (a.xwayland == .auto) {
             errPrint("continuing with a Wayland-only display", .{});
             var fallback = a;
             fallback.xwayland = .disabled;
-            return spawnDisplay(allocator, conn, fallback, name);
+            return spawnSession(allocator, conn, fallback, name);
         }
         return null;
     }
     const name_owned = allocator.dupe(u8, name) catch {
         errPrint("create '{s}': out of memory", .{name});
-        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
+        _ = destroySession(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     const wl_owned = allocator.dupe(u8, r.wl_display) catch {
         allocator.free(name_owned);
-        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
+        _ = destroySession(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     const pa_owned = allocator.dupe(u8, r.pulse_server) catch {
         allocator.free(wl_owned);
         allocator.free(name_owned);
-        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
+        _ = destroySession(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     const rt_owned = allocator.dupe(u8, r.runtime_dir) catch {
         allocator.free(pa_owned);
         allocator.free(wl_owned);
         allocator.free(name_owned);
-        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
+        _ = destroySession(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     const x_owned = allocator.dupe(u8, r.x_display) catch {
@@ -590,7 +625,7 @@ fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name:
         allocator.free(pa_owned);
         allocator.free(wl_owned);
         allocator.free(name_owned);
-        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
+        _ = destroySession(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     const xa_owned = allocator.dupe(u8, r.xauthority) catch {
@@ -599,7 +634,7 @@ fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name:
         allocator.free(pa_owned);
         allocator.free(wl_owned);
         allocator.free(name_owned);
-        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
+        _ = destroySession(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     return .{
@@ -675,11 +710,11 @@ fn create(allocator: std.mem.Allocator, a: Args) u8 {
     const name = if (a.name.len > 0) a.name else generatedName(&name_buf);
     var conn = connect(allocator, a.socket) orelse return 1;
     defer conn.deinit();
-    var created = spawnDisplay(allocator, &conn, a, name) orelse return 1;
+    var created = spawnSession(allocator, &conn, a.spawnOpts(), name) orelse return 1;
     defer created.deinit();
     printCreated(allocator, &created, a.json) catch {
         errPrint("could not write create result; rolling session '{s}' back", .{name});
-        _ = destroyRaw(allocator, &conn, name, &created.origin_id, created.pid, created.wl_display);
+        _ = destroySession(allocator, &conn, name, &created.origin_id, created.pid, created.wl_display);
         return 1;
     };
     return 0;
@@ -819,7 +854,7 @@ fn destroy(allocator: std.mem.Allocator, a: Args) u8 {
         }
     }
     if (!expected_origin_id_valid or
-        !destroyRaw(allocator, &conn, a.name, &expected_origin_id, expected_pid, wl_path)) return 1;
+        !destroySession(allocator, &conn, a.name, &expected_origin_id, expected_pid, wl_path)) return 1;
     if (a.json)
         outPrint("{\"ok\":true}\n") catch return 1
     else
@@ -924,11 +959,11 @@ fn runCommand(allocator: std.mem.Allocator, a_in: Args) u8 {
         errPrint("daemon is too old for display run; upgrade sketerm-mux", .{});
         return 125;
     }
-    var created = spawnDisplay(allocator, &conn, a, name) orelse return 125;
+    var created = spawnSession(allocator, &conn, a.spawnOpts(), name) orelse return 125;
     defer created.deinit();
     var cleanup_display = true;
     defer {
-        if (cleanup_display) _ = destroyRaw(allocator, &conn, name, &created.origin_id, created.pid, created.wl_display);
+        if (cleanup_display) _ = destroySession(allocator, &conn, name, &created.origin_id, created.pid, created.wl_display);
     }
     var lease = holdRunLease(allocator, a.socket, name) orelse return 125;
     var lease_live = true;
@@ -1063,7 +1098,7 @@ fn runCommand(allocator: std.mem.Allocator, a_in: Args) u8 {
     lease_live = false;
     cleanup_display = false;
     var final_result = result;
-    if (!destroyRaw(allocator, &conn, name, &created.origin_id, created.pid, created.wl_display) and result == 0) final_result = 125;
+    if (!destroySession(allocator, &conn, name, &created.origin_id, created.pid, created.wl_display) and result == 0) final_result = 125;
 
     // Restore caller dispositions while these signals are blocked. Anything
     // arriving after this snapshot is delivered under the caller's policy.
