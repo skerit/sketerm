@@ -1137,6 +1137,27 @@ pub fn refreshTitlebarCss(self: *Window) void {
         \\.sketerm-titlebar-inactive {{ background-color: rgba({d}, {d}, {d}, {d:.3}); color: rgba({d}, {d}, {d}, {d:.3}); }}
         \\.sketerm-titlebar-label {{ font-weight: bold; }}
         \\.sketerm-titlebar.sketerm-broadcast {{ box-shadow: inset 0 0 0 2px rgba(255, 200, 60, 0.95); }}
+        \\/* Titlebar strip controls: pane menu button, per-app-window
+        \\   taskbar buttons and the lease chip's Take-control button.
+        \\   Sized to keep the 18 px bar from growing. */
+        \\.sketerm-titlebar-btn {{
+        \\    min-height: 16px;
+        \\    min-width: 16px;
+        \\    padding: 0px 5px;
+        \\    margin: 0px 1px;
+        \\    font-size: 11px;
+        \\}}
+        \\/* Lease/roster chip: "AI attached" / "View only — X controls".
+        \\   Same accent family as the driven border and AI badge. */
+        \\.sketerm-titlebar-chip {{
+        \\    background-color: rgba(255, 120, 40, 0.92);
+        \\    color: white;
+        \\    font-weight: bold;
+        \\    font-size: 10px;
+        \\    padding: 0px 6px;
+        \\    border-radius: 7px;
+        \\    margin: 1px 2px;
+        \\}}
         \\
         \\/* Assistant-is-driving indicator: accent border on the
         \\   pane whose session has a headless MCP client attached,

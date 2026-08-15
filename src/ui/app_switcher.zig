@@ -606,6 +606,7 @@ fn addFetchedAudioRow(self: *Switcher, daemon: *DaemonState, session: *const mux
     const entry = appendRow(self, .audio, displayApplication(info), subtitle, null, if (info.icon.len > 0) info.icon else "audio-x-generic-symbolic", true) orelse return;
     entry.kind = .attach;
     setSessionTarget(self, entry, session.name, daemon.host, session.origin_id, true);
+    addWatchButton(self, entry);
     setIdentity(self, entry, "audio:{s}\x00{s}\x00{d}\x00{s}\x00{s}", .{ daemon.host orelse "", session.name, info.pid, info.application, info.binary });
 }
 
@@ -618,6 +619,7 @@ fn addAvailableRow(self: *Switcher, daemon: *DaemonState, session: *const mux_cl
     const entry = appendRow(self, .available, title, subtitle, null, if (session.app) "application-x-executable-symbolic" else "utilities-terminal-symbolic", false) orelse return;
     entry.kind = .attach;
     setSessionTarget(self, entry, session.name, daemon.host, session.origin_id, true);
+    addWatchButton(self, entry);
     setIdentity(self, entry, "attach:{s}\x00{s}", .{ daemon.host orelse "", session.name });
 }
 
@@ -743,6 +745,29 @@ fn setSessionTarget(
     _ = c.g_signal_connect_data(button, "clicked", @ptrCast(&onKillClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     // Keep the stop action before the trailing navigation arrow.
     c.gtk_box_insert_child_after(@ptrCast(body), button, c.gtk_widget_get_prev_sibling(c.gtk_widget_get_last_child(body)));
+}
+
+/// Add the read-only Watch action to an attachable row. A watch
+/// attach mirrors the session without taking the controller lease,
+/// so it never steals input from whoever is driving (an assistant
+/// included); the pane's titlebar chip offers Take Control later.
+fn addWatchButton(self: *Switcher, entry: *Entry) void {
+    const body = c.gtk_list_box_row_get_child(@ptrCast(entry.row)) orelse return;
+    const button = c.gtk_button_new_from_icon_name("view-reveal-symbolic").?;
+    c.gtk_widget_set_valign(button, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_add_css_class(button, "flat");
+    c.gtk_widget_set_tooltip_text(button, "Watch read-only - view the session without taking control of it");
+    c.g_object_set_data(@ptrCast(button), "sketerm-overview-entry", @ptrCast(entry));
+    _ = c.g_signal_connect_data(button, "clicked", @ptrCast(&onWatchClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+    c.gtk_box_insert_child_after(@ptrCast(body), button, c.gtk_widget_get_prev_sibling(c.gtk_widget_get_last_child(body)));
+}
+
+fn onWatchClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Switcher, user);
+    const data = c.g_object_get_data(@ptrCast(button), "sketerm-overview-entry") orelse return;
+    const entry: *Entry = @ptrCast(@alignCast(data));
+    const target = entry.target orelse return;
+    startAttach(self, target, .read_only);
 }
 
 fn applySearch(self: *Switcher, preferred: ?[]const u8) void {
@@ -935,7 +960,7 @@ fn activateEntry(self: *Switcher, entry: *Entry) void {
         },
         .attach => {
             const target = entry.target orelse return;
-            startAttach(self, target);
+            startAttach(self, target, .default);
             return;
         },
     }
@@ -1377,6 +1402,9 @@ const Attach = struct {
     conn: ?mux_client.Conn = null,
     snapshot: ?mux_client.Conn.OwnedFrame = null,
     identity: mux_client.AttachIdentity = .{},
+    /// Controller-lease intent: Watch attaches read-only and never
+    /// takes the lease; the default attach takes it when free.
+    lease: muxtabs.Lease = .default,
 
     fn destroy(self: *Attach) void {
         const allocator = std.heap.c_allocator;
@@ -1389,7 +1417,7 @@ const Attach = struct {
     }
 };
 
-fn startAttach(self: *Switcher, target: SessionTarget) void {
+fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease) void {
     if (self.attaching) return;
     const allocator = std.heap.c_allocator;
     const ctx = allocator.create(Attach) catch return;
@@ -1400,6 +1428,7 @@ fn startAttach(self: *Switcher, target: SessionTarget) void {
             allocator.destroy(ctx);
             return;
         },
+        .lease = lease,
     };
     if (target.host) |host| {
         ctx.host = allocator.dupe(u8, host) catch {
@@ -1434,7 +1463,12 @@ fn startAttach(self: *Switcher, target: SessionTarget) void {
 }
 
 fn attachOnConn(ctx: *Attach, conn: *mux_client.Conn) bool {
-    conn.sendAttach(ctx.session, .{ .kind = "gui", .panel_rpc = conn.panel_rpc }) catch return false;
+    conn.sendAttach(ctx.session, .{
+        .kind = "gui",
+        .read_only = ctx.lease == .read_only,
+        .control = ctx.lease == .control,
+        .panel_rpc = conn.panel_rpc,
+    }) catch return false;
     const attached = conn.recvGuiAttachFor(20_000) catch return false;
     ctx.snapshot = attached.snapshot;
     ctx.identity = attached.identity;
@@ -1490,7 +1524,7 @@ fn onAttachIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             ctx.identity,
             null,
             null,
-            .default,
+            ctx.lease,
         )) |_| {
             ok = true;
         } else |_| {}

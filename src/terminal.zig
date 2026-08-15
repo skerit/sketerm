@@ -148,6 +148,10 @@ pub const Terminal = struct {
     /// headless MCP clients: the "assistant is driving" signal.
     peer_total: u32 = 0,
     peer_drivers: u32 = 0,
+    /// Attached-viewer count from the last control_state frame (the
+    /// peer_info total counts panel-only clients too; this one is the
+    /// number the daemon reports for the seat roster).
+    peer_viewers: u32 = 0,
     /// Controller lease (control_state frames): does THIS client drive
     /// the session's Wayland seat? A forwarded app renders for every
     /// viewer, but only the controller's input reaches it. Seeded true
@@ -2308,9 +2312,22 @@ pub const Terminal = struct {
         }
         self.has_control = parsed.value.controller;
         const label = parsed.value.controller_label;
+        const holder_changed = !std.mem.eql(
+            u8,
+            self.control_holder[0..self.control_holder_len],
+            label[0..@min(label.len, self.control_holder.len)],
+        );
         self.control_holder_len = @min(label.len, self.control_holder.len);
         @memcpy(self.control_holder[0..self.control_holder_len], label[0..self.control_holder_len]);
+        const viewers_changed = self.peer_viewers != parsed.value.viewers;
+        self.peer_viewers = parsed.value.viewers;
         self.startTransportUpgrade();
+        // The titlebar lease chip reads has_control/holder/viewers, so
+        // any roster movement must reach the on_peers sink, not just
+        // lease flips.
+        if (was != self.has_control or holder_changed or viewers_changed) {
+            if (self.on_peers) |f| f(self.user_ctx);
+        }
         if (was == self.has_control) return;
         const session = if (self.remote) |r| r.session else "?";
         if (self.has_control) {

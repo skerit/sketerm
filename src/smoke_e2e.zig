@@ -800,6 +800,9 @@ pub fn main() u8 {
         if (sidebarDragStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("tree sidebar drag: a row nested under another, unnested onto the empty list, and reordered above it");
 
+        if (watchAlongStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("watch-along: driver attach raised the accent indicator, detach retired it, and a read-only watch pane showed the view-only chip");
+
         if (have_web_action) {
             if (webActionGuiStage(allocator, app, sock_path)) |why| return failMsg(why);
             say("browser action: WebGroup switching refreshed per-tab icons; a trusted click opened, drove, closed and tore down a real extension popup");
@@ -2572,6 +2575,134 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);
+    return null;
+}
+
+/// Pixels of the shared "assistant accent" rgba(255,120,40): the
+/// sketerm-driven pane border and the titlebar lease chip both paint
+/// it, and nothing else in the default theme does.
+fn accentPixels(app: *appdrive.App, win_id: u32) usize {
+    for (app.windows.items) |w| {
+        if (w.id != win_id or w.w <= 0 or w.h <= 0) continue;
+        const width: usize = @intCast(w.w);
+        const height: usize = @intCast(w.h);
+        const px = w.pixels.items;
+        if (px.len < width * height * 4) return 0;
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i + 3 < px.len) : (i += 4) {
+            const b: i32 = px[i];
+            const g: i32 = px[i + 1];
+            const r: i32 = px[i + 2];
+            if (r > 220 and g > 85 and g < 160 and b < 90) n += 1;
+        }
+        return n;
+    }
+    return 0;
+}
+
+fn waitAccent(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u32) bool {
+    var waited: u32 = 0;
+    while (waited <= timeout_ms) : (waited += 200) {
+        const n = accentPixels(app, win_id);
+        if (want and n >= 200) return true;
+        if (!want and n < 20) return true;
+        _ = app.pumpOnce(200);
+    }
+    return false;
+}
+
+/// Watch-along end to end: an attached headless "assistant" (kind
+/// mcp) must surface the driven indicator + auto-shown titlebar chip
+/// with no configuration, its detach must retire them, and a
+/// read-only watch attach of the same session must show the
+/// view-only lease chip.
+fn watchAlongStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = app.windows.items[0].id;
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed before the watch-along stage";
+        defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
+    }
+    if (accentPixels(app, win_id) >= 200)
+        return "assistant accent pixels present before any driver attached";
+
+    // The GUI pane's session, from the daemon's own list (the rig's
+    // GUI runs exactly one shell pane here; the display session is
+    // an app session and is skipped).
+    var conn = muxclient.Conn.connect(allocator, g_mux_sock) catch
+        return "dialing the rig daemon for the watch-along stage failed";
+    var have_conn = true;
+    defer if (have_conn) conn.deinit();
+    conn.sendFrame(.list, "") catch return "daemon list request failed in the watch-along stage";
+    var name_buf: [128]u8 = undefined;
+    const session_name: []const u8 = blk: {
+        const f = conn.recvExpectFor(&.{.welcome}, 5_000) catch
+            return "daemon list reply failed in the watch-along stage";
+        defer f.deinit(allocator);
+        const Probe = struct { sessions: []const struct {
+            name: []const u8 = "",
+            app: bool = false,
+        } = &.{} };
+        const parsed = std.json.parseFromSlice(Probe, allocator, f.payload, .{
+            .ignore_unknown_fields = true,
+        }) catch return "daemon list reply unparsable in the watch-along stage";
+        defer parsed.deinit();
+        var found: ?[]const u8 = null;
+        for (parsed.value.sessions) |s| {
+            if (s.app) continue;
+            if (found != null) return "expected exactly one shell session before the watch-along stage";
+            if (s.name.len > name_buf.len) return "shell session name too long for the watch-along stage";
+            @memcpy(name_buf[0..s.name.len], s.name);
+            found = name_buf[0..s.name.len];
+        }
+        break :blk found orelse return "no shell session on the rig daemon";
+    };
+
+    // 1. A headless assistant attaches (read-only: a driver must not
+    //    need the lease to be visible).
+    conn.sendAttach(session_name, .{ .kind = "mcp", .read_only = true }) catch
+        return "assistant driver attach send failed";
+    {
+        const att = conn.recvGuiAttachFor(20_000) catch return "assistant driver attach handshake failed";
+        att.snapshot.deinit(allocator);
+    }
+    if (!waitAccent(app, win_id, true, 10_000))
+        return "an attached assistant driver raised no accent indicator or titlebar chip";
+
+    // 2. The driver detaches: the indicator must retire.
+    conn.deinit();
+    have_conn = false;
+    if (!waitAccent(app, win_id, false, 10_000))
+        return "the assistant indicator survived the driver detaching";
+
+    // 3. Watch the session read-only from the GUI (the Session
+    //    Overview's Watch button uses the same lease plumbing): the
+    //    new pane must show the view-only chip because the original
+    //    pane holds the controller lease.
+    var cmd_buf: [256]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "{{\"cmd\":\"attach-session\",\"data\":\"{s}\",\"read_only\":true}}\n", .{session_name}) catch
+        return "building the watch attach command failed";
+    {
+        const r = roundtrip(allocator, sock_path, cmd) orelse
+            return "read-only attach-session roundtrip failed";
+        defer allocator.free(r);
+        if (std.mem.indexOf(u8, r, "\"ok\":true") == null)
+            return "read-only attach-session was refused";
+    }
+    _ = app.waitIdle(300, 6_000);
+    if (!waitAccent(app, win_id, true, 10_000))
+        return "a read-only watch pane showed no view-only chip";
+
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    if (!waitAccent(app, win_id, false, 10_000))
+        return "the view-only chip survived closing the watch pane";
     return null;
 }
 

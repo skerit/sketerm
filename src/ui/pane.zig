@@ -258,9 +258,6 @@ pub const Pane = struct {
     app_embed_box: ?*c.GtkWidget = null,
     /// True while the embedded view is showing (terminal hidden).
     app_embed_active: bool = false,
-    /// "App window open — click to raise" banner, shown in window
-    /// view mode while the app has floating windows.
-    app_banner: ?*c.GtkWidget = null,
     /// Config app_view pushed by the Window: embed apps in the tab
     /// (true) or float them with a banner tab (false, default).
     app_view_tab: bool = false,
@@ -268,6 +265,27 @@ pub const Pane = struct {
     titlebar_label: ?*c.GtkLabel = null,
     titlebar_visible: bool = false,
     titlebar_active: bool = false,
+    /// Baseline titlebar visibility pushed by the Window (config
+    /// show_titlebar). The effective state ORs in titlebar_auto, so
+    /// session activity can surface the bar on panes that keep it
+    /// hidden otherwise.
+    titlebar_config_visible: bool = false,
+    /// Activity wants the titlebar shown: floating app windows, a
+    /// view-only lease, or an attached assistant. Replaces the old
+    /// "App window open — click to raise" banner.
+    titlebar_auto: bool = false,
+    /// Per-window taskbar buttons for the session's floating app
+    /// windows, inside the titlebar.
+    titlebar_apps_box: ?*c.GtkWidget = null,
+    /// True while titlebar_apps_box has at least one button.
+    titlebar_apps_shown: bool = false,
+    /// Lease/roster chip: "AI attached" / "View only — holder".
+    titlebar_chip: ?*c.GtkWidget = null,
+    titlebar_chip_label: ?*c.GtkLabel = null,
+    titlebar_take_btn: ?*c.GtkWidget = null,
+    /// Any floating (non-embedded) app window is open across the
+    /// session's app channels.
+    app_windows_open: bool = false,
     /// User-locked title — when true, on_title sink drops incoming
     /// OSC 0/1/2 updates so the manual string sticks. Cleared via
     /// the menu's "Set Pane Title…" → empty input.
@@ -337,6 +355,14 @@ pub const Pane = struct {
         c.gtk_widget_add_css_class(tb_box, "sketerm-titlebar");
         c.gtk_widget_add_css_class(tb_box, "sketerm-titlebar-inactive");
         c.gtk_widget_set_visible(tb_box, 0);
+        // Pane menu button (Terminator-style): the same single context
+        // menu the right-click path opens, one click away.
+        const tb_menu = c.gtk_button_new_from_icon_name("open-menu-symbolic");
+        c.gtk_widget_add_css_class(tb_menu, "flat");
+        c.gtk_widget_add_css_class(tb_menu, "sketerm-titlebar-btn");
+        c.gtk_widget_set_tooltip_text(tb_menu, "Pane menu");
+        _ = c.g_signal_connect_data(tb_menu, "clicked", @ptrCast(&onTitlebarMenuClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(tb_box), tb_menu);
         const tb_label_w = c.gtk_label_new("Terminal");
         c.gtk_widget_add_css_class(tb_label_w, "sketerm-titlebar-label");
         c.gtk_label_set_xalign(@ptrCast(@alignCast(tb_label_w)), 0.0);
@@ -347,6 +373,28 @@ pub const Pane = struct {
         c.gtk_widget_set_margin_top(tb_label_w, 1);
         c.gtk_widget_set_margin_bottom(tb_label_w, 1);
         c.gtk_box_append(@ptrCast(tb_box), tb_label_w);
+
+        // Per-window taskbar buttons for the session's floating app
+        // windows (populated by rebuildTitlebarApps).
+        const tb_apps = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 2);
+        c.gtk_widget_set_visible(tb_apps, 0);
+        c.gtk_box_append(@ptrCast(tb_box), tb_apps);
+
+        // Lease/roster chip: who is driving this session, and the way
+        // back to the controller lease from a view-only attach.
+        const tb_chip = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+        c.gtk_widget_add_css_class(tb_chip, "sketerm-titlebar-chip");
+        c.gtk_widget_set_visible(tb_chip, 0);
+        const tb_chip_label = c.gtk_label_new("");
+        c.gtk_box_append(@ptrCast(tb_chip), tb_chip_label);
+        const tb_take = c.gtk_button_new_with_label("Take control");
+        c.gtk_widget_add_css_class(tb_take, "flat");
+        c.gtk_widget_add_css_class(tb_take, "sketerm-titlebar-btn");
+        c.gtk_widget_set_tooltip_text(tb_take, "Take this session's controller lease so your input reaches it");
+        c.gtk_widget_set_visible(tb_take, 0);
+        _ = c.g_signal_connect_data(tb_take, "clicked", @ptrCast(&onTakeControlClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_append(@ptrCast(tb_chip), tb_take);
+        c.gtk_box_append(@ptrCast(tb_box), tb_chip);
 
         // Click on the titlebar to focus the underlying GLArea so
         // typing immediately reaches that pane.
@@ -419,6 +467,10 @@ pub const Pane = struct {
         self.offload_widget = offload;
         self.titlebar_box = tb_box;
         self.titlebar_label = @ptrCast(@alignCast(tb_label_w));
+        self.titlebar_apps_box = tb_apps;
+        self.titlebar_chip = tb_chip;
+        self.titlebar_chip_label = @ptrCast(@alignCast(tb_chip_label));
+        self.titlebar_take_btn = tb_take;
 
         // The widgets-dead fence: closing a pane destroys its widget
         // subtree immediately while Pane.deinit is deferred, so late
@@ -1483,12 +1535,21 @@ pub const Pane = struct {
         self.refreshTitlebarLabel();
     }
 
-    /// Show / hide the per-pane title bar.
+    /// Set the config-driven baseline for the per-pane title bar.
+    /// Session activity (floating app windows, a view-only lease, an
+    /// attached assistant) can still force the bar visible on top of
+    /// a hidden baseline — the bar doubles as the activity strip.
     pub fn setTitlebarVisible(self: *Pane, visible: bool) void {
+        self.titlebar_config_visible = visible;
+        self.applyTitlebarVisibility();
+    }
+
+    fn applyTitlebarVisibility(self: *Pane) void {
         const tb = self.titlebar_box orelse return;
-        if (self.titlebar_visible == visible) return;
-        self.titlebar_visible = visible;
-        c.gtk_widget_set_visible(tb, if (visible) 1 else 0);
+        const effective = self.titlebar_config_visible or self.titlebar_auto;
+        if (self.titlebar_visible == effective) return;
+        self.titlebar_visible = effective;
+        c.gtk_widget_set_visible(tb, if (effective) 1 else 0);
     }
 
     /// Toggle active / inactive CSS class on the title bar. The
@@ -1852,10 +1913,26 @@ fn onAppRequestEmbed(ctx: ?*anyopaque) void {
     h.popIn();
 }
 
-fn onAppBannerClick(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    const self = cast.userData(Pane, user);
-    const remote = self.terminal.remote orelse return;
-    for (remote.napps.items) |na| na.host.presentAll();
+/// User-data of one per-window taskbar button in the titlebar. The
+/// button owns it (destroy notify); the host pointer is validated
+/// against the live napps list on every click, since a host can die
+/// between the windows-changed event and the strip rebuild it queues.
+const TbWinCtx = struct {
+    allocator: std.mem.Allocator,
+    pane: *Pane,
+    host: *anyopaque,
+    surface: u32,
+};
+
+fn onTitlebarAppClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(TbWinCtx, user);
+    const remote = ctx.pane.terminal.remote orelse return;
+    for (remote.napps.items) |na| {
+        if (@as(*anyopaque, @ptrCast(na.host)) == ctx.host) {
+            na.host.presentSurface(ctx.surface);
+            return;
+        }
+    }
 }
 
 /// The app's open-window count changed. Zero windows across every
@@ -1935,21 +2012,128 @@ fn onBrowserBannerClick(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     self.setBrowserVisible(true);
 }
 
-/// Show/hide the "app window open" banner above the log.
+/// Floating-app-window presence changed: refresh the titlebar strip.
+/// (Absorbed the old "App window open — click to raise" banner; the
+/// strip's per-window buttons are the click-to-raise now.)
 fn setAppBanner(self: *Pane, show: bool) void {
-    if (show) {
-        if (self.app_banner == null) {
-            const btn = c.gtk_button_new_with_label("App window open — click to raise");
-            c.gtk_widget_add_css_class(btn, "sketerm-app-banner");
-            c.gtk_widget_set_hexpand(btn, 1);
-            _ = c.g_signal_connect_data(@ptrCast(btn), "clicked", @ptrCast(&onAppBannerClick), @ptrCast(self), null, 0);
-            if (self.wrapper_box) |wrap| c.gtk_box_prepend(@ptrCast(wrap), btn);
-            self.app_banner = btn;
+    self.app_windows_open = show;
+    updateTitlebarActivity(self);
+}
+
+/// Recompute the whole titlebar activity surface: per-window taskbar
+/// buttons, the lease/roster chip, and whether activity forces the
+/// bar visible over a hidden config baseline.
+fn updateTitlebarActivity(self: *Pane) void {
+    if (self.widgets_dead) return;
+    rebuildTitlebarApps(self);
+    const view_only = updateControlChip(self);
+    self.titlebar_auto = self.titlebar_apps_shown or view_only or
+        self.terminal.peer_drivers > 0;
+    self.applyTitlebarVisibility();
+}
+
+/// One button per floating (non-embedded) app window of the session,
+/// labelled with the window title. Rebuilt from ground truth on every
+/// windows-changed event; contexts are owned by their buttons.
+fn rebuildTitlebarApps(self: *Pane) void {
+    const box = self.titlebar_apps_box orelse return;
+    while (c.gtk_widget_get_first_child(box)) |child| c.gtk_box_remove(@ptrCast(box), child);
+    var buttons: usize = 0;
+    if (self.app_windows_open) {
+        if (self.terminal.remote) |remote| {
+            for (remote.napps.items) |na| {
+                const infos = na.host.windowInfos(self.allocator);
+                defer self.allocator.free(infos);
+                for (infos) |info| {
+                    defer if (info.paintable) |p| c.g_object_unref(p);
+                    if (info.embedded) continue;
+                    const title = std.mem.span(info.title);
+                    var buf: [96:0]u8 = undefined;
+                    const label = std.fmt.bufPrintZ(&buf, "{s}", .{
+                        if (title.len > 0) title else if (info.app_id.len > 0) info.app_id else "App",
+                    }) catch "App";
+                    const btn = c.gtk_button_new_with_label(label.ptr);
+                    c.gtk_widget_add_css_class(btn, "flat");
+                    c.gtk_widget_add_css_class(btn, "sketerm-titlebar-btn");
+                    c.gtk_widget_set_tooltip_text(btn, "Raise this app window");
+                    if (c.gtk_button_get_child(@ptrCast(btn))) |bl|
+                        c.gtk_label_set_ellipsize(@ptrCast(@alignCast(bl)), c.PANGO_ELLIPSIZE_END);
+                    const ctx = self.allocator.create(TbWinCtx) catch {
+                        _ = c.g_object_ref_sink(btn);
+                        c.g_object_unref(btn);
+                        continue;
+                    };
+                    ctx.* = .{
+                        .allocator = self.allocator,
+                        .pane = self,
+                        .host = @ptrCast(na.host),
+                        .surface = info.surface,
+                    };
+                    _ = c.g_signal_connect_data(
+                        btn,
+                        "clicked",
+                        @ptrCast(&onTitlebarAppClicked),
+                        @ptrCast(ctx),
+                        @ptrCast(cast.destroyCtx(TbWinCtx)),
+                        c.G_CONNECT_DEFAULT,
+                    );
+                    c.gtk_box_append(@ptrCast(box), btn);
+                    buttons += 1;
+                }
+            }
         }
-        c.gtk_widget_set_visible(self.app_banner.?, 1);
-    } else if (self.app_banner) |b| {
-        c.gtk_widget_set_visible(b, 0);
     }
+    self.titlebar_apps_shown = buttons > 0;
+    c.gtk_widget_set_visible(box, @intFromBool(buttons > 0));
+}
+
+/// Refresh the lease/roster chip from Terminal state. Returns true
+/// when this client is a view-only attach (lease not held).
+fn updateControlChip(self: *Pane) bool {
+    const chip = self.titlebar_chip orelse return false;
+    const term = self.terminal;
+    const view_only = if (term.remote) |r| r.control_known and !term.has_control else false;
+    const driven = term.peer_drivers > 0;
+    if (!view_only and !driven) {
+        c.gtk_widget_set_visible(chip, 0);
+        return false;
+    }
+    var buf: [128:0]u8 = undefined;
+    const holder = term.control_holder[0..term.control_holder_len];
+    const text = if (view_only)
+        (if (holder.len > 0)
+            std.fmt.bufPrintZ(&buf, "View only - {s} controls", .{holder}) catch "View only"
+        else
+            std.fmt.bufPrintZ(&buf, "View only", .{}) catch "View only")
+    else
+        std.fmt.bufPrintZ(&buf, "AI attached", .{}) catch "AI attached";
+    if (self.titlebar_chip_label) |lbl| c.gtk_label_set_text(lbl, text.ptr);
+    var tip: [160:0]u8 = undefined;
+    const tip_z = std.fmt.bufPrintZ(&tip, "{d} viewer(s) attached to this session", .{term.peer_viewers}) catch null;
+    c.gtk_widget_set_tooltip_text(chip, if (tip_z) |t| t.ptr else null);
+    if (self.titlebar_take_btn) |btn| c.gtk_widget_set_visible(btn, @intFromBool(view_only));
+    c.gtk_widget_set_visible(chip, 1);
+    return view_only;
+}
+
+/// Titlebar "Take control": acquire the lease if free, evict the
+/// holder otherwise (the daemon answers with a control_state frame
+/// either way, which refreshes the chip).
+fn onTakeControlClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    self.terminal.requestControl(self.terminal.control_holder_len != 0);
+}
+
+/// Titlebar menu button: open the pane's single context menu (same
+/// popover, action group and pre-popup hook as the right-click path),
+/// anchored at the button.
+fn onTitlebarMenuClicked(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    if (self.nonTerminalFaceVisible()) return;
+    var out: c.graphene_point_t = undefined;
+    const from = c.graphene_point_t{ .x = 0, .y = 0 };
+    if (c.gtk_widget_compute_point(@ptrCast(@alignCast(btn)), @ptrCast(self.surface.area), &from, &out) == 0) return;
+    _ = menu.popupAt(@ptrCast(self.surface.area), @floatCast(out.x), @floatCast(out.y));
 }
 
 /// Attach roster changed: show/hide the "assistant is driving"
@@ -1957,6 +2141,7 @@ fn setAppBanner(self: *Pane, show: bool) void {
 /// every forwarded app window of this session.
 fn onPeersChanged(ctx: ?*anyopaque) void {
     const self = cast.userData(Pane, ctx);
+    if (self.widgets_dead) return;
     const driven = self.terminal.peer_drivers > 0;
     if (self.wrapper_box) |wrap| {
         if (driven)
@@ -1967,6 +2152,8 @@ fn onPeersChanged(ctx: ?*anyopaque) void {
     if (self.terminal.remote) |remote| {
         for (remote.napps.items) |na| na.host.setDriven(driven);
     }
+    // Lease chip + auto-shown titlebar track the same roster.
+    updateTitlebarActivity(self);
 }
 
 fn onSetProfileEvent(ctx: ?*anyopaque, name: []const u8) void {
