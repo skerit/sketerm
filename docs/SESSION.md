@@ -18408,3 +18408,34 @@ alive across shows. Transport loss cancels uncommitted panel work (by
 design), so a connect-show-disconnect client gets `ok` replies while
 its document replaces silently never commit. The MCP layer always held
 a cached requester, which is why it never saw this.
+
+## A2UI office dogfood: scenes, input and reliable control (2026-08-15)
+
+Skehive's office-first control surface drove the first spatial A2UI
+extension. Panels now support a fixed-coordinate `scene` container and
+native submitting `text_input` fields. Full document replacements keep
+unchanged input drafts and focus, and replacing an existing panel no
+longer steals focus from another tab. Scene structural patches rebuild
+safely instead of treating a live GtkFixed parent as a GtkBox.
+
+Panel RPC v2 adds acknowledged reliable events with a random panel-
+lifetime epoch, monotonic sequence/cursor state and visible overflow.
+The request carries its expected epoch, so a delayed acknowledgement
+from a previous GUI lifetime cannot consume new interactions. Legacy
+destructive readers remain supported and account for events they make
+unavailable to reliable retry. Mixed v1/v2 requesters route only to a
+presenter that supports their required capability.
+
+`panel-open-session` is a relay-only, origin-fenced operation that opens
+an existing session from the same daemon in a new selected tab. It
+derives transport from the presenting terminal, accepts no host/socket/
+command override and uses bounded request-token replay so a lost reply
+cannot open duplicate tabs. Mux kills gained a separately negotiated
+origin fence; identity-aware lifecycle callers refuse old daemons rather
+than silently sending an ignored field.
+
+Verified with 2,533 passing tests (6 skipped), `mux-client-check`, mux and
+broker smokes, and the focused real-GTK panel/relay smoke. A separate
+headless GUI run rendered skehive's generated office, created an agent,
+delivered work through its mux TUI and left the origin-fenced terminal
+tab selected after the office refreshed.
