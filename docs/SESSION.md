@@ -18472,3 +18472,43 @@ Full unit suites, `mux-portable` (native + aarch64-macos),
 smoke-mcp` currently fails in the pre-existing panel stage ("ui_save
 failed without a GUI") on this host, on unmodified master too — the new
 stage is reachable via `SKETERM_SMOKE_MCP_WEBSESSION_ONLY=1`.
+
+## 2026-08-15 — watch-along: titlebar activity strip, lease chip, Watch verb
+
+Watching what an assistant does is now a first-class GUI verb instead
+of a `--shared` opt-in. The mux layer always had the transport (multi-
+viewer sessions, controller lease, `peer_info` driver roster); what was
+missing was UI. The per-pane titlebar becomes the session activity
+strip: a pane-menu button on the left (Terminator-style — the same
+single context menu the right-click path opens, anchored at the
+button), one raise button per floating app window of the session
+(labelled with the window title via `AppHost.windowInfos`, absorbing
+the old "App window open — click to raise" banner), and a lease/roster
+chip on the right — "AI attached" while a headless mcp client drives,
+or "View only — <holder> controls" plus a Take Control button on a
+read-only attach. Activity (app windows, a view-only lease, an
+attached assistant) forces the titlebar visible over a hidden
+`show_titlebar` baseline, so the strip doubles as the banner it
+replaced. `handleControlState` now stores the viewer count and fires
+the `on_peers` sink on any roster movement, not just lease flips.
+
+The Session Overview grew the missing read-only verb: a Watch button
+(eye icon) on every attachable row attaches with `Lease.read_only`, so
+observing an assistant's session never steals the controller lease —
+the chip's Take Control is the deliberate escalation. `list` (IPC)
+now reports each tab's `tree_parent`, which also let smoke-e2e assert
+sidebar drag-nesting structurally: the TST-photon restyle had made the
+old pixel-indent probe unable to see nesting (full-width rows), and
+the accent-block midpoint aim actually landed in the "drop above"
+zone — the stage now derives the row center from the row pitch,
+probes a few offsets, and judges each drop by `tree_parent`.
+
+New smoke-e2e stage proves the loop end to end on the real compositor:
+a kind=mcp read-only attach must raise the driven border + chip with
+no configuration, its detach must retire them, and a read-only
+attach-session must show the view-only chip (the original pane holds
+the lease), retiring when the watch pane closes. Unit suites,
+mux-portable, and dist/test-mux-build.sh all green. Known reds on this
+host, unrelated and pre-existing (identical on two-day-old commits):
+the browser-action GUI stage (varying failures around the extension
+popup/split) and smoke-mcp's panel stage.
