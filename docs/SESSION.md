@@ -18439,3 +18439,36 @@ broker smokes, and the focused real-GTK panel/relay smoke. A separate
 headless GUI run rendered skehive's generated office, created an agent,
 delivered work through its mux TUI and left the origin-fenced terminal
 tab selected after the office refreshed.
+
+## Watchable web session: assistant browsing lands on the mux daemon (2026-08-15)
+
+The MCP server's headless browser stopped being an invisible private
+process. On first use, `webdrive` now spawns a Wayland-hosting mux app
+session (`web-<pid>-<nonce>`, the shared `display.spawnSession` path
+extracted from `sketerm-mux display create`) on the instance's own
+daemon and starts `sketerm-webengine` as that session's Wayland client:
+`SKETERM_WEB_OZONE=wayland` forces the ozone pick past the render-node
+veto, `--disable-gpu` keeps frames on the software shm path, and the
+exact daemon-returned environment (never derived) is applied in the
+fork. The session is enumerable and attachable — capabilities reports
+`web_backend:"session"` plus `web_session`, and `web.json` names the
+session and daemon socket — so a human can attach a viewer to follow
+an assistant's browsing session; today that carries the session's page
+audio and lifetime (OSR browsers still create no toplevels; windowed
+watch-along is the next layer on this seam). Everything is best-effort:
+session failure, a helper that cannot start against the hub, or
+`SKETERM_WEB_SESSION=0` all land in the exact prior plain-headless mode,
+and a leaked session dies by its own 60s no-client TTL.
+
+Verified end to end twice: a CEF-free smoke stage drives a fake
+protocol-v1 helper and asserts the session exists as a display session
+on the private daemon, the helper received the daemon's environment
+verbatim, fallback does not leak the session, and opt-out works; and
+the REAL helper (system CEF 151) engaged session mode on this host —
+CEF ran against the mux hub compositor with the full web tool stage
+green (snapshots, trusted clicks, reader mode, screenshots, settle).
+Full unit suites, `mux-portable` (native + aarch64-macos),
+`dist/test-mux-build.sh`, and smoke-mux also pass. Note: `zig build
+smoke-mcp` currently fails in the pre-existing panel stage ("ui_save
+failed without a GUI") on this host, on unmodified master too — the new
+stage is reachable via `SKETERM_SMOKE_MCP_WEBSESSION_ONLY=1`.
