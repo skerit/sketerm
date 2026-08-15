@@ -670,7 +670,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         _ = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch return fail("WAYLAND_DISPLAY too long", .{});
     }
     // BEFORE the GUI: the brain is client-side.
-    drive = appdrive.App.attachExisting(allocator, g_session, null, mux_sock) catch
+    drive = appdrive.App.attachExisting(allocator, g_session, null, mux_sock, null) catch
         return fail("could not attach a viewer", .{});
     const app = drive.?;
 

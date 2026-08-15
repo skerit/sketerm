@@ -37,21 +37,26 @@ pub const MAX_PATH: usize = 1024;
 pub const MAX_ID: usize = events.MAX_ID; // 64
 pub const MAX_OPTIONS: usize = 64;
 /// Select options and button actions ride in fixed-size event
-/// payloads, so their length is bounded to the event text capacity.
-pub const MAX_OPTION: usize = events.MAX_TEXT; // 128
+/// payloads and retain their original compact bound.
+pub const MAX_OPTION: usize = events.MAX_SHORT_TEXT; // 128
 pub const MAX_CLASSES: usize = 8;
 pub const MAX_DATA_KEYS: usize = 64;
 pub const MAX_DEPTH: usize = 32;
 pub const MAX_PATCH_OPS: usize = 256;
 pub const MAX_JSON_BYTES: usize = 1 << 20;
+pub const MAX_SCENE_SIZE: i64 = 4096;
+/// Coordinates are intentionally wider than the logical canvas so
+/// partially off-scene placements remain useful without accepting
+/// arbitrary JSON integer magnitudes.
+pub const MAX_SCENE_COORD: i64 = 1 << 20;
 
 /// The style vocabulary. Named classes only — each maps to a
 /// pre-approved rendering (mostly Adwaita style classes); unknown
-/// names are rejected at parse time so the agent gets feedback
+/// names are rejected at parse time so the caller gets feedback
 /// instead of silence.
 pub const CLASSES = [_][]const u8{
-    "dim", "accent", "success", "warning", "error",
-    "card", "monospace", "center", "end", "expand",
+    "dim",  "accent",    "success", "warning", "error",
+    "card", "monospace", "center",  "end",     "expand",
 };
 
 pub const Error = error{
@@ -92,19 +97,15 @@ fn diagSet(diag: ?*Diag, comptime fmt: []const u8, args: anytype) void {
 // ─── catalog ────────────────────────────────────────────────────
 //
 // Deliberately small. What made the cut and why:
-// - column/row: the only layout primitives; everything composes.
+// - column/row/scene: flowing and fixed-position layout primitives.
 // - heading/text: static content; heading levels map to Adwaita
 //   title-1..4.
-// - image + image_compare: the primary use case (training previews,
-//   A/B slider).
-// - button/slider/select: the minimal interactive set that covers
-//   approve/reject, thresholds, and picking one of N.
+// - image + image_compare: static media and interactive comparison.
+// - button/slider/select/text_input: compact interaction primitives.
 // - progress/separator/spacer: cheap, high-value layout polish for
-//   long-running training dashboards.
-// Dropped for now: text input (free text toward an agent wants
-// validation/submit semantics that deserve their own design),
-// checkbox (a two-option select covers it), table/list (a column of
-// rows covers small sets; a virtualized table is a later component).
+//   live dashboards.
+// Dropped for now: checkbox (a two-option select covers it), table/list
+// (a column of rows covers small sets; a virtualized table is later).
 
 pub const Kind = enum {
     column,
@@ -119,9 +120,11 @@ pub const Kind = enum {
     progress,
     separator,
     spacer,
+    scene,
+    text_input,
 
     pub fn isContainer(self: Kind) bool {
-        return self == .column or self == .row;
+        return self == .column or self == .row or self == .scene;
     }
 };
 
@@ -143,8 +146,18 @@ pub const Props = union(Kind) {
     progress: Progress,
     separator: void,
     spacer: Spacer,
+    scene: Scene,
+    text_input: TextInput,
 
     pub const Container = struct { children: [][]u8 };
+    pub const Placement = struct {
+        id: []u8,
+        x: i32,
+        y: i32,
+        width: u16,
+        height: u16,
+    };
+    pub const Scene = struct { width: u16, height: u16, children: []Placement };
     pub const Heading = struct { text: []u8, level: u8 }; // 1..4
     pub const Text = struct { text: []u8 };
     pub const Image = struct { src: []u8, caption: []u8 };
@@ -154,6 +167,7 @@ pub const Props = union(Kind) {
     pub const Select = struct { options: [][]u8, value: []u8 };
     pub const Progress = struct { value: f64, label: []u8, indeterminate: bool };
     pub const Spacer = struct { size: u16 }; // 0 = expand
+    pub const TextInput = struct { value: []u8, placeholder: []u8, clear_on_submit: bool };
 };
 
 pub const Component = struct {
@@ -438,6 +452,12 @@ pub const Document = struct {
                         return Error.BadRef;
                     }
                 },
+                .scene => |scene| for (scene.children) |placement| {
+                    if (self.components.getPtr(placement.id) == null) {
+                        diagSet(diag, "\"{s}\" references missing child \"{s}\"", .{ entry.key_ptr.*, placement.id });
+                        return Error.BadRef;
+                    }
+                },
                 else => {},
             }
         }
@@ -466,6 +486,9 @@ pub const Document = struct {
         switch (comp.props) {
             .column, .row => |cont| for (cont.children) |child| {
                 try self.walk(visited, child, depth + 1, diag);
+            },
+            .scene => |scene| for (scene.children) |placement| {
+                try self.walk(visited, placement.id, depth + 1, diag);
             },
             else => {},
         }
@@ -721,6 +744,25 @@ pub const Document = struct {
                     a.free(cont.children);
                     cont.children = kept;
                 },
+                .scene => |*scene| {
+                    var matches: usize = 0;
+                    for (scene.children) |placement| {
+                        if (std.mem.eql(u8, placement.id, id)) matches += 1;
+                    }
+                    if (matches == 0) continue;
+                    const kept = a.alloc(Props.Placement, scene.children.len - matches) catch return Error.OutOfMemory;
+                    var n: usize = 0;
+                    for (scene.children) |placement| {
+                        if (std.mem.eql(u8, placement.id, id)) {
+                            a.free(placement.id);
+                        } else {
+                            kept[n] = placement;
+                            n += 1;
+                        }
+                    }
+                    a.free(scene.children);
+                    scene.children = kept;
+                },
                 else => {},
             }
         }
@@ -860,6 +902,61 @@ fn parseComponent(
             const cont = Props.Container{ .children = children.toOwnedSlice(a) catch return Error.OutOfMemory };
             break :blk if (kind == .column) .{ .column = cont } else .{ .row = cont };
         },
+        .scene => blk: {
+            const width = try sceneSize(obj, "width", id, diag);
+            const height = try sceneSize(obj, "height", id, diag);
+            const children_v = obj.get("children") orelse {
+                diagSet(diag, "\"{s}\": scene needs \"children\"", .{id});
+                return Error.Malformed;
+            };
+            const children_a = switch (children_v) {
+                .array => |x| x.items,
+                else => {
+                    diagSet(diag, "\"{s}\": scene \"children\" must be an array of placements", .{id});
+                    return Error.BadValue;
+                },
+            };
+            if (children_a.len > MAX_CHILDREN) {
+                diagSet(diag, "\"{s}\": more than {d} children", .{ id, MAX_CHILDREN });
+                return Error.TooBig;
+            }
+            var placements: std.ArrayList(Props.Placement) = .empty;
+            errdefer {
+                for (placements.items) |placement| a.free(placement.id);
+                placements.deinit(a);
+            }
+            for (children_a) |placement_v| {
+                const placement = switch (placement_v) {
+                    .object => |o| o,
+                    else => {
+                        diagSet(diag, "\"{s}\": each scene child must be a placement object", .{id});
+                        return Error.BadValue;
+                    },
+                };
+                const child_id = strField(placement, "id") orelse {
+                    diagSet(diag, "\"{s}\": scene placement missing \"id\"", .{id});
+                    return Error.Malformed;
+                };
+                if (!validId(child_id)) {
+                    diagSet(diag, "\"{s}\": invalid child id \"{s}\"", .{ id, child_id });
+                    return Error.BadId;
+                }
+                const owned_id = try dupe(a, child_id);
+                errdefer a.free(owned_id);
+                placements.append(a, .{
+                    .id = owned_id,
+                    .x = try sceneCoord(placement, "x", id, diag),
+                    .y = try sceneCoord(placement, "y", id, diag),
+                    .width = try sceneSize(placement, "width", id, diag),
+                    .height = try sceneSize(placement, "height", id, diag),
+                }) catch return Error.OutOfMemory;
+            }
+            break :blk .{ .scene = .{
+                .width = width,
+                .height = height,
+                .children = placements.toOwnedSlice(a) catch return Error.OutOfMemory,
+            } };
+        },
         .heading => blk: {
             const text = try ownedText(a, obj, "text", id, diag);
             errdefer a.free(text);
@@ -987,6 +1084,24 @@ fn parseComponent(
             }
             break :blk .{ .spacer = .{ .size = size } };
         },
+        .text_input => blk: {
+            const input_value = try ownedOptUtf8Text(a, obj, "value", id, diag);
+            errdefer a.free(input_value);
+            const placeholder = try ownedOptUtf8Text(a, obj, "placeholder", id, diag);
+            errdefer a.free(placeholder);
+            const clear_on_submit = if (obj.get("clear_on_submit")) |v| switch (v) {
+                .bool => |b| b,
+                else => {
+                    diagSet(diag, "\"{s}\": \"clear_on_submit\" must be a boolean", .{id});
+                    return Error.BadValue;
+                },
+            } else false;
+            break :blk .{ .text_input = .{
+                .value = input_value,
+                .placeholder = placeholder,
+                .clear_on_submit = clear_on_submit,
+            } };
+        },
     };
     errdefer freeProps(a, props);
 
@@ -1076,11 +1191,68 @@ fn ownedPath(
     return dupe(a, s);
 }
 
+fn ownedOptUtf8Text(
+    a: std.mem.Allocator,
+    obj: std.json.ObjectMap,
+    key: []const u8,
+    id: []const u8,
+    diag: ?*Diag,
+) Error![]u8 {
+    const text = try ownedOptText(a, obj, key, id, diag);
+    errdefer a.free(text);
+    if (!std.unicode.utf8ValidateSlice(text)) {
+        diagSet(diag, "\"{s}\": \"{s}\" must be valid UTF-8", .{ id, key });
+        return Error.BadValue;
+    }
+    return text;
+}
+
+fn requiredInteger(
+    obj: std.json.ObjectMap,
+    key: []const u8,
+    id: []const u8,
+    diag: ?*Diag,
+) Error!i64 {
+    const value = obj.get(key) orelse {
+        diagSet(diag, "\"{s}\": missing integer \"{s}\"", .{ id, key });
+        return Error.Malformed;
+    };
+    return switch (value) {
+        .integer => |n| n,
+        else => {
+            diagSet(diag, "\"{s}\": \"{s}\" must be an integer", .{ id, key });
+            return Error.BadValue;
+        },
+    };
+}
+
+fn sceneSize(obj: std.json.ObjectMap, key: []const u8, id: []const u8, diag: ?*Diag) Error!u16 {
+    const value = try requiredInteger(obj, key, id, diag);
+    if (value < 1 or value > MAX_SCENE_SIZE) {
+        diagSet(diag, "\"{s}\": \"{s}\" must be 1..{d}", .{ id, key, MAX_SCENE_SIZE });
+        return Error.BadValue;
+    }
+    return @intCast(value);
+}
+
+fn sceneCoord(obj: std.json.ObjectMap, key: []const u8, id: []const u8, diag: ?*Diag) Error!i32 {
+    const value = try requiredInteger(obj, key, id, diag);
+    if (value < -MAX_SCENE_COORD or value > MAX_SCENE_COORD) {
+        diagSet(diag, "\"{s}\": \"{s}\" must be within -{d}..{d}", .{ id, key, MAX_SCENE_COORD, MAX_SCENE_COORD });
+        return Error.BadValue;
+    }
+    return @intCast(value);
+}
+
 fn freeProps(a: std.mem.Allocator, props: Props) void {
     switch (props) {
         .column, .row => |cont| {
             for (cont.children) |ch| a.free(ch);
             if (cont.children.len > 0) a.free(cont.children);
+        },
+        .scene => |scene| {
+            for (scene.children) |placement| a.free(placement.id);
+            if (scene.children.len > 0) a.free(scene.children);
         },
         .heading => |h| a.free(h.text),
         .text => |txt| a.free(txt.text),
@@ -1107,6 +1279,10 @@ fn freeProps(a: std.mem.Allocator, props: Props) void {
         .progress => |p| a.free(p.label),
         .separator => {},
         .spacer => {},
+        .text_input => |input| {
+            a.free(input.value);
+            a.free(input.placeholder);
+        },
     }
 }
 
@@ -1132,6 +1308,21 @@ fn writeComponent(w: *std.Io.Writer, comp: *const Component) !void {
             for (cont.children, 0..) |ch, i| {
                 if (i > 0) try w.writeByte(',');
                 try jsonStr(w, ch);
+            }
+            try w.writeByte(']');
+        },
+        .scene => |scene| {
+            try w.print(",\"width\":{d},\"height\":{d},\"children\":[", .{ scene.width, scene.height });
+            for (scene.children, 0..) |placement, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeAll("{\"id\":");
+                try jsonStr(w, placement.id);
+                try w.print(",\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d}}}", .{
+                    placement.x,
+                    placement.y,
+                    placement.width,
+                    placement.height,
+                });
             }
             try w.writeByte(']');
         },
@@ -1196,6 +1387,14 @@ fn writeComponent(w: *std.Io.Writer, comp: *const Component) !void {
         },
         .separator => {},
         .spacer => |sp| try w.print(",\"size\":{d}", .{sp.size}),
+        .text_input => |input| {
+            try w.writeAll(",\"value\":");
+            try jsonStr(w, input.value);
+            try w.writeAll(",\"placeholder\":");
+            try jsonStr(w, input.placeholder);
+            try w.writeAll(",\"clear_on_submit\":");
+            try w.writeAll(if (input.clear_on_submit) "true" else "false");
+        },
     }
     if (comp.classes.len > 0) {
         try w.writeAll(",\"class\":[");
@@ -1363,6 +1562,123 @@ test "JSON round-trip is canonical and lossless" {
     try t.expectEqual(@as(f64, 1.5), doc2.data.get("zoom").?.number);
 }
 
+test "scene and text_input parse, default, and round-trip losslessly" {
+    const source =
+        \\{"root":"canvas","components":{
+        \\ "canvas":{"type":"scene","width":640,"height":360,"children":[
+        \\   {"id":"back","x":-24,"y":12,"width":320,"height":80},
+        \\   {"id":"query","x":48,"y":120,"width":400,"height":48}]},
+        \\ "back":{"type":"text","text":"background"},
+        \\ "query":{"type":"text_input","value":"hello","placeholder":"Ask here","clear_on_submit":true},
+        \\ "defaults":{"type":"text_input"}}}
+    ;
+    var doc = try Document.parse(t.allocator, source, null);
+    defer doc.deinit();
+
+    const scene = doc.get("canvas").?.props.scene;
+    try t.expectEqual(@as(u16, 640), scene.width);
+    try t.expectEqual(@as(u16, 360), scene.height);
+    try t.expectEqual(@as(usize, 2), scene.children.len);
+    try t.expectEqualStrings("back", scene.children[0].id);
+    try t.expectEqual(@as(i32, -24), scene.children[0].x);
+    try t.expectEqualStrings("query", scene.children[1].id);
+    try t.expectEqual(@as(u16, 48), scene.children[1].height);
+
+    const input = doc.get("query").?.props.text_input;
+    try t.expectEqualStrings("hello", input.value);
+    try t.expectEqualStrings("Ask here", input.placeholder);
+    try t.expect(input.clear_on_submit);
+    const defaults = doc.get("defaults").?.props.text_input;
+    try t.expectEqualStrings("", defaults.value);
+    try t.expectEqualStrings("", defaults.placeholder);
+    try t.expect(!defaults.clear_on_submit);
+
+    const once = try doc.toJson(t.allocator);
+    defer t.allocator.free(once);
+    var copy = try Document.parse(t.allocator, once, null);
+    defer copy.deinit();
+    const twice = try copy.toJson(t.allocator);
+    defer t.allocator.free(twice);
+    try t.expectEqualStrings(once, twice);
+    try t.expectEqual(@as(i32, -24), copy.get("canvas").?.props.scene.children[0].x);
+    try t.expect(copy.get("query").?.props.text_input.clear_on_submit);
+}
+
+test "scene dimensions, placements, and references are validated" {
+    var diag = Diag{};
+    for ([_][]const u8{
+        \\{"root":"s","components":{"s":{"type":"scene","width":0,"height":1,"children":[]}}}
+        ,
+        \\{"root":"s","components":{"s":{"type":"scene","width":4097,"height":1,"children":[]}}}
+        ,
+        \\{"root":"s","components":{"s":{"type":"scene","width":1.5,"height":1,"children":[]}}}
+        ,
+        \\{"root":"s","components":{"s":{"type":"scene","width":1,"height":1,"children":[{"id":"x","x":1048577,"y":0,"width":1,"height":1}]},"x":{"type":"text","text":"x"}}}
+        ,
+        \\{"root":"s","components":{"s":{"type":"scene","width":1,"height":1,"children":[{"id":"x","x":0,"y":0,"width":0,"height":1}]},"x":{"type":"text","text":"x"}}}
+        ,
+    }) |bad| try t.expectError(Error.BadValue, Document.parse(t.allocator, bad, &diag));
+
+    try t.expectError(Error.Malformed, Document.parse(t.allocator,
+        \\{"root":"s","components":{"s":{"type":"scene","width":1,"height":1}}}
+    , &diag));
+    try t.expectError(Error.BadRef, Document.parse(t.allocator,
+        \\{"root":"s","components":{"s":{"type":"scene","width":1,"height":1,"children":[{"id":"missing","x":0,"y":0,"width":1,"height":1}]}}}
+    , &diag));
+    try t.expectError(Error.Cycle, Document.parse(t.allocator,
+        \\{"root":"s","components":{"s":{"type":"scene","width":1,"height":1,"children":[{"id":"s","x":0,"y":0,"width":1,"height":1}]}}}
+    , &diag));
+    try t.expectError(Error.Cycle, Document.parse(t.allocator,
+        \\{"root":"s","components":{
+        \\ "s":{"type":"scene","width":10,"height":10,"children":[{"id":"x","x":0,"y":0,"width":1,"height":1},{"id":"x","x":1,"y":1,"width":1,"height":1}]},
+        \\ "x":{"type":"text","text":"once"}}}
+    , &diag));
+}
+
+test "text_input accepts 4096 UTF-8 bytes and rejects larger fields" {
+    const max_text = "x" ** MAX_TEXT;
+    const too_long = "x" ** (MAX_TEXT + 1);
+    const valid = try std.fmt.allocPrint(
+        t.allocator,
+        "{{\"root\":\"q\",\"components\":{{\"q\":{{\"type\":\"text_input\",\"value\":\"{s}\",\"placeholder\":\"{s}\"}}}}}}",
+        .{ max_text, max_text },
+    );
+    defer t.allocator.free(valid);
+    var doc = try Document.parse(t.allocator, valid, null);
+    defer doc.deinit();
+    try t.expectEqual(@as(usize, MAX_TEXT), doc.get("q").?.props.text_input.value.len);
+
+    const invalid = try std.fmt.allocPrint(
+        t.allocator,
+        "{{\"root\":\"q\",\"components\":{{\"q\":{{\"type\":\"text_input\",\"value\":\"{s}\"}}}}}}",
+        .{too_long},
+    );
+    defer t.allocator.free(invalid);
+    try t.expectError(Error.TooBig, Document.parse(t.allocator, invalid, null));
+    try t.expectEqual(@as(usize, 128), MAX_OPTION);
+}
+
+test "button actions retain their 128-byte bound" {
+    const max_action = "a" ** MAX_OPTION;
+    const accepted = try std.fmt.allocPrint(
+        t.allocator,
+        "{{\"root\":\"b\",\"components\":{{\"b\":{{\"type\":\"button\",\"text\":\"Go\",\"action\":\"{s}\"}}}}}}",
+        .{max_action},
+    );
+    defer t.allocator.free(accepted);
+    var doc = try Document.parse(t.allocator, accepted, null);
+    defer doc.deinit();
+    try t.expectEqualStrings(max_action, doc.get("b").?.props.button.action);
+
+    const rejected = try std.fmt.allocPrint(
+        t.allocator,
+        "{{\"root\":\"b\",\"components\":{{\"b\":{{\"type\":\"button\",\"text\":\"Go\",\"action\":\"{s}x\"}}}}}}",
+        .{max_action},
+    );
+    defer t.allocator.free(rejected);
+    try t.expectError(Error.TooBig, Document.parse(t.allocator, rejected, null));
+}
+
 test "patch: set, attach, remove, data, title, root" {
     var doc = try Document.parse(t.allocator, FULL_DOC, null);
     defer doc.deinit();
@@ -1410,6 +1726,42 @@ test "patch: set, attach, remove, data, title, root" {
     defer applied3.deinit();
     try t.expect(applied3.root_changed);
     try t.expectEqualStrings("empty", doc.root);
+}
+
+test "scene patches are transactional and removal detaches placements" {
+    var doc = try Document.parse(t.allocator,
+        \\{"root":"s","components":{
+        \\ "s":{"type":"scene","width":100,"height":80,"children":[{"id":"a","x":0,"y":0,"width":20,"height":20},{"id":"b","x":20,"y":0,"width":20,"height":20}]},
+        \\ "a":{"type":"text","text":"A"},
+        \\ "b":{"type":"text_input","placeholder":"B"}}}
+    , null);
+    defer doc.deinit();
+
+    var applied = try doc.applyPatch(
+        \\[
+        \\ {"op":"set","id":"s","component":{"type":"scene","width":120,"height":90,"children":[{"id":"b","x":-5,"y":7,"width":40,"height":30},{"id":"a","x":60,"y":7,"width":20,"height":20}]}},
+        \\ {"op":"set","id":"b","component":{"type":"text_input","value":"ready","placeholder":"Type","clear_on_submit":true}}
+        \\]
+    , null);
+    defer applied.deinit();
+    try t.expectEqual(@as(usize, 2), applied.set.len);
+    try t.expectEqualStrings("b", doc.get("s").?.props.scene.children[0].id);
+    try t.expectEqual(@as(i32, -5), doc.get("s").?.props.scene.children[0].x);
+    try t.expectEqualStrings("ready", doc.get("b").?.props.text_input.value);
+
+    var removed = try doc.applyPatch("[{\"op\":\"remove\",\"id\":\"a\"}]", null);
+    defer removed.deinit();
+    try t.expectEqual(@as(usize, 1), doc.get("s").?.props.scene.children.len);
+    try t.expectEqualStrings("b", doc.get("s").?.props.scene.children[0].id);
+
+    const before = try doc.toJson(t.allocator);
+    defer t.allocator.free(before);
+    try t.expectError(Error.Cycle, doc.applyPatch(
+        \\[{"op":"set","id":"s","component":{"type":"scene","width":120,"height":90,"children":[{"id":"b","x":0,"y":0,"width":10,"height":10},{"id":"b","x":10,"y":0,"width":10,"height":10}]}}]
+    , null));
+    const after = try doc.toJson(t.allocator);
+    defer t.allocator.free(after);
+    try t.expectEqualStrings(before, after);
 }
 
 test "a failing patch rolls back completely" {

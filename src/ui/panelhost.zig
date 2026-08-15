@@ -22,7 +22,7 @@
 //! the widgets behind it.
 //!
 //! Threading: registry/document/widget commits run on GTK; bounded workers do
-//! transport setup, file reads, cache IO and decode. `panel-events` NEVER
+//! transport setup, file reads, cache IO and decode. Panel event commands NEVER
 //! blocks — it drains whatever the queue
 //! holds and answers immediately, even with nothing. Blocking
 //! `ui_wait_event` semantics belong to the MCP layer polling this
@@ -38,6 +38,7 @@ const Terminal = term_mod.Terminal;
 const DrainHandle = term_mod.DrainHandle;
 const mux_client = @import("../mux/client.zig");
 const mux_daemon = @import("../mux/daemon.zig");
+const panelrpc = @import("../mux/panelrpc.zig");
 const mux_wire = @import("../mux/wire.zig");
 const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
@@ -92,6 +93,8 @@ pub const Entry = struct {
     magic: u32 = MAGIC,
     allocator: std.mem.Allocator,
     panel_id: u32,
+    /// Random identity for this live entry's reliable event sequence space.
+    event_epoch: panelrpc.EventEpoch,
     /// Owned.
     name: []u8,
     /// Owned. `null` = the caller had no session identity.
@@ -128,9 +131,35 @@ const RelayViewer = struct {
     pane: ?*Pane,
 };
 
+const OpenSessionWaiter = struct {
+    drain: *DrainHandle,
+    generation: u64,
+    request_id: u64,
+};
+
+const OpenSessionToken = struct {
+    allocator: std.mem.Allocator,
+    token: []u8,
+    target_session: []u8,
+    target_origin_id: mux_wire.SessionOriginId,
+    waiters: std.ArrayListUnmanaged(OpenSessionWaiter) = .empty,
+    reply: ?[]u8 = null,
+    completed_serial: u64 = 0,
+
+    fn deinit(self: *OpenSessionToken) void {
+        self.waiters.deinit(self.allocator);
+        if (self.reply) |reply| self.allocator.free(reply);
+        self.allocator.free(self.token);
+        self.allocator.free(self.target_session);
+        self.allocator.destroy(self);
+    }
+};
+
 const RelayScope = struct {
     origin_id: mux_daemon.SessionOriginId,
     viewers: std.ArrayListUnmanaged(RelayViewer) = .empty,
+    open_session_tokens: std.ArrayListUnmanaged(*OpenSessionToken) = .empty,
+    next_open_completion: u64 = 1,
 };
 
 const Scope = union(enum) {
@@ -300,6 +329,8 @@ const PanelTabJob = struct {
     deadline_ms: i64,
     name: []u8,
     spawned_session: []u8,
+    spawned_origin_id: mux_wire.SessionOriginId = undefined,
+    spawned_origin_id_valid: bool = false,
     document: []u8,
     shell: []u8,
     term: []u8,
@@ -325,7 +356,10 @@ const PanelTabJob = struct {
         const cancel_fd = self.cancel_fd.load(.acquire);
         if (cancel_fd >= 0) _ = c.close(cancel_fd);
         if (self.conn) |*conn| {
-            if (self.spawned) conn.queueJson(.kill, .{ .name = self.spawned_session }) catch {};
+            if (self.spawned) conn.queueKill(.{
+                .name = self.spawned_session,
+                .origin_id = if (self.spawned_origin_id_valid) &self.spawned_origin_id else "",
+            }) catch {};
             conn.deinit();
         }
         if (self.snapshot) |snapshot| self.allocator.free(snapshot);
@@ -342,6 +376,57 @@ const PanelTabJob = struct {
     }
 };
 
+const PanelOpenSessionJob = struct {
+    allocator: std.mem.Allocator,
+    window: *Window,
+    pane: ?*Pane,
+    scope: *RelayScope,
+    token: *OpenSessionToken,
+    origin: *DrainHandle,
+    generation: u64,
+    deadline_ms: i64,
+    target_session: []u8,
+    target_origin_id: mux_wire.SessionOriginId,
+    /// Exact local daemon socket, or null for a remote transport.
+    socket: ?[]u8,
+    /// Source-derived reconnect/display transport spec. Null is the ordinary
+    /// local daemon; a custom local daemon retains its source "sock:" spec.
+    host: ?[]u8,
+    port_range: []u8,
+    canceled: std.atomic.Value(bool) = .init(false),
+    cancel_fd: std.atomic.Value(c_int) = .init(-1),
+    conn: ?mux_client.Conn = null,
+    snapshot: ?[]u8 = null,
+    identity: mux_client.AttachIdentity = .{},
+    failure: [192]u8 = undefined,
+    failure_len: usize = 0,
+
+    fn setFailure(self: *PanelOpenSessionJob, message: []const u8) void {
+        const n = @min(message.len, self.failure.len);
+        @memcpy(self.failure[0..n], message[0..n]);
+        self.failure_len = n;
+    }
+
+    fn failureMessage(self: *const PanelOpenSessionJob) []const u8 {
+        return if (self.failure_len > 0)
+            self.failure[0..self.failure_len]
+        else
+            "panel session open failed";
+    }
+
+    fn deinit(self: *PanelOpenSessionJob) void {
+        const cancel_fd = self.cancel_fd.load(.acquire);
+        if (cancel_fd >= 0) _ = c.close(cancel_fd);
+        if (self.conn) |*conn| conn.deinit();
+        if (self.snapshot) |snapshot| self.allocator.free(snapshot);
+        self.allocator.free(self.target_session);
+        if (self.socket) |socket| self.allocator.free(socket);
+        if (self.host) |host| self.allocator.free(host);
+        if (self.port_range.len > 0) self.allocator.free(self.port_range);
+        self.allocator.destroy(self);
+    }
+};
+
 var hydrations: std.ArrayListUnmanaged(*Hydration) = .empty;
 var queued_panel_operations: std.ArrayListUnmanaged(*QueuedPanelOperation) = .empty;
 var next_hydration_id: u64 = 1;
@@ -352,9 +437,12 @@ var panel_asset_cache: ?*assets.Cache = null;
 var cache_init_active = false;
 var cache_store_lock: std.atomic.Value(bool) = .init(false);
 var panel_tab_jobs: std.ArrayListUnmanaged(*PanelTabJob) = .empty;
+var panel_open_session_jobs: std.ArrayListUnmanaged(*PanelOpenSessionJob) = .empty;
 
 const MAX_PENDING_PANEL_OPERATIONS: usize = 16;
 const MAX_PENDING_PER_ORIGIN: usize = 4;
+const MAX_OPEN_SESSION_COMPLETED: usize = 64;
+const MAX_OPEN_SESSION_WAITERS: usize = 32;
 
 fn register(allocator: std.mem.Allocator, entry: *Entry) !void {
     try panels.append(allocator, entry);
@@ -458,11 +546,14 @@ fn releaseRelayScopeIfIdle(scope: *RelayScope) void {
     for (hydrations.items) |pending| if (pending.relay_scope == scope) return;
     for (queued_panel_operations.items) |queued| if (queued.scope == scope) return;
     for (panel_tab_jobs.items) |job| if (job.scope == scope) return;
+    for (panel_open_session_jobs.items) |job| if (job.scope == scope) return;
     for (panels.items) |entry| if (relayScope(entry.scope) == scope) return;
     for (relay_scopes.items, 0..) |candidate, i| {
         if (candidate != scope) continue;
         _ = relay_scopes.swapRemove(i);
         scope.viewers.deinit(std.heap.c_allocator);
+        for (scope.open_session_tokens.items) |token| token.deinit();
+        scope.open_session_tokens.deinit(std.heap.c_allocator);
         std.heap.c_allocator.destroy(scope);
         return;
     }
@@ -589,6 +680,18 @@ pub fn dispatchRelay(
         return relayError(terminal, request_id, message);
     };
     defer parsed.deinit();
+    if (std.mem.eql(u8, parsed.value.cmd, "panel-open-session")) {
+        var exact = panelrpc.parseOpenSessionRequest(self.allocator, request) catch |err| {
+            var buf: [160]u8 = undefined;
+            const message = std.fmt.bufPrint(
+                &buf,
+                "invalid panel-open-session request: {s}",
+                .{@errorName(err)},
+            ) catch "invalid panel-open-session request";
+            return relayError(terminal, request_id, message);
+        };
+        exact.deinit();
+    }
     const remote = terminal.remote orelse return relayError(terminal, request_id, "panel presenter is not attached");
     const scope = relayScopeForTerminal(terminal) orelse
         return relayError(terminal, request_id, "panel presenter has no session scope");
@@ -663,11 +766,15 @@ fn dispatchRequest(
     } else if (eql(u8, req.cmd, "panel-get")) {
         try panelGet(self, req, out, allocator, if (relay) |r| .{ .relay = r.scope } else .direct);
     } else if (eql(u8, req.cmd, "panel-events")) {
-        try panelEvents(self, req, out, allocator, if (relay) |r| .{ .relay = r.scope } else .direct);
+        try panelEvents(self, req, out, allocator, if (relay) |r| .{ .relay = r.scope } else .direct, false);
+    } else if (eql(u8, req.cmd, "panel-events-reliable")) {
+        try panelEvents(self, req, out, allocator, if (relay) |r| .{ .relay = r.scope } else .direct, true);
     } else if (eql(u8, req.cmd, "panel-list")) {
         try panelList(self, req, out, allocator, relay);
     } else if (eql(u8, req.cmd, "panel-close")) {
         try panelClose(self, req, out, allocator, if (relay) |r| .{ .relay = r.scope } else .direct);
+    } else if (eql(u8, req.cmd, "panel-open-session")) {
+        return panelOpenSession(out, allocator, req, relay);
     } else {
         try protocol.writeErr(out, allocator, "unknown panel command");
     }
@@ -692,7 +799,8 @@ fn preparePanelOperation(
     relay: Relay,
     hydrate_remote: bool,
 ) void {
-    if (hydrations.items.len + queued_panel_operations.items.len + panel_tab_jobs.items.len >= MAX_PENDING_PANEL_OPERATIONS)
+    if (hydrations.items.len + queued_panel_operations.items.len + panel_tab_jobs.items.len +
+        panel_open_session_jobs.items.len >= MAX_PENDING_PANEL_OPERATIONS)
         return relayError(terminal, request_id, "too many panel operations are pending");
     var origin_pending: usize = 0;
     for (hydrations.items) |pending| if (pending.relay_scope == relay.scope) {
@@ -937,7 +1045,8 @@ fn prepareDirectLocalImages(
     document: []const u8,
     changed_paths: ?*const assets.Paths,
 ) !void {
-    if (hydrations.items.len + queued_panel_operations.items.len + panel_tab_jobs.items.len >= MAX_PENDING_PANEL_OPERATIONS)
+    if (hydrations.items.len + queued_panel_operations.items.len + panel_tab_jobs.items.len +
+        panel_open_session_jobs.items.len >= MAX_PENDING_PANEL_OPERATIONS)
         return error.Busy;
     var parsed = try Doc.Document.parse(self.allocator, document, null);
     defer parsed.deinit();
@@ -1011,6 +1120,11 @@ pub fn adoptTerminalOwner(terminal: *Terminal, pane: *Pane, owner: *Window) void
         pending.pane = pane;
     }
     for (panel_tab_jobs.items) |job| {
+        if (job.origin != drain) continue;
+        job.window = owner;
+        job.pane = pane;
+    }
+    for (panel_open_session_jobs.items) |job| {
         if (job.origin != drain) continue;
         job.window = owner;
         job.pane = pane;
@@ -1841,6 +1955,388 @@ fn abortNew(
     return err;
 }
 
+fn panelOpenSession(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    req: protocol.Request,
+    relay: ?Relay,
+) !DispatchOutcome {
+    const source = relay orelse {
+        try protocol.writeErr(out, allocator, "panel-open-session is relay-only and cannot use a direct GUI socket");
+        return .complete;
+    };
+    const target_session = req.mux_session orelse {
+        try protocol.writeErr(out, allocator, "panel-open-session requires mux_session");
+        return .complete;
+    };
+    const target_origin_id = req.mux_origin_id orelse {
+        try protocol.writeErr(out, allocator, "panel-open-session requires mux_origin_id");
+        return .complete;
+    };
+    const request_token = req.request_token orelse {
+        try protocol.writeErr(out, allocator, "panel-open-session requires request_token");
+        return .complete;
+    };
+    if (!panelrpc.validRequestToken(request_token)) {
+        try protocol.writeErrCode(out, allocator, "invalid_request_token", "panel-open-session request_token is invalid");
+        return .complete;
+    }
+
+    if (findOpenSessionToken(source.scope, request_token)) |existing| {
+        if (!std.mem.eql(u8, existing.target_session, target_session) or
+            !std.mem.eql(u8, &existing.target_origin_id, target_origin_id))
+        {
+            try protocol.writeErrCode(
+                out,
+                allocator,
+                "request_token_conflict",
+                "panel-open-session request_token was already used for a different target",
+            );
+            return .complete;
+        }
+        if (existing.reply) |reply| {
+            try out.appendSlice(allocator, reply);
+            return .complete;
+        }
+        addOpenSessionWaiter(existing, source) catch {
+            try protocol.writeErr(out, allocator, "too many retries are waiting for this panel-open-session request");
+            return .complete;
+        };
+        return .pending;
+    }
+
+    const token = createOpenSessionToken(source.scope, request_token, target_session, target_origin_id) catch |err| {
+        var buf: [160]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "panel-open-session could not reserve request_token: {s}", .{@errorName(err)}) catch
+            "panel-open-session could not reserve request_token";
+        try protocol.writeErr(out, allocator, message);
+        return .complete;
+    };
+    addOpenSessionWaiter(token, source) catch |err| {
+        removeOpenSessionToken(source.scope, token);
+        var buf: [160]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "panel-open-session could not reserve reply waiter: {s}", .{@errorName(err)}) catch
+            "panel-open-session could not reserve reply waiter";
+        try protocol.writeErr(out, allocator, message);
+        return .complete;
+    };
+    startPanelOpenSession(source, token, target_session, target_origin_id) catch |err| {
+        var buf: [160]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "panel-open-session could not start: {s}", .{@errorName(err)}) catch
+            "panel-open-session could not start";
+        try protocol.writeErr(out, allocator, message);
+        token.waiters.clearRetainingCapacity();
+        cacheOpenSessionReply(source.scope, token, out.items) catch
+            removeOpenSessionToken(source.scope, token);
+        return .complete;
+    };
+    return .pending;
+}
+
+fn findOpenSessionToken(scope: *RelayScope, request_token: []const u8) ?*OpenSessionToken {
+    for (scope.open_session_tokens.items) |token| {
+        if (std.mem.eql(u8, token.token, request_token)) return token;
+    }
+    return null;
+}
+
+fn createOpenSessionToken(
+    scope: *RelayScope,
+    request_token: []const u8,
+    target_session: []const u8,
+    target_origin_id: []const u8,
+) !*OpenSessionToken {
+    const a = std.heap.c_allocator;
+    const token = try a.create(OpenSessionToken);
+    errdefer a.destroy(token);
+    const token_copy = try a.dupe(u8, request_token);
+    errdefer a.free(token_copy);
+    const session_copy = try a.dupe(u8, target_session);
+    errdefer a.free(session_copy);
+    token.* = .{
+        .allocator = a,
+        .token = token_copy,
+        .target_session = session_copy,
+        .target_origin_id = target_origin_id[0..mux_wire.SESSION_ORIGIN_ID_LEN].*,
+    };
+    try scope.open_session_tokens.append(a, token);
+    return token;
+}
+
+fn addOpenSessionWaiter(token: *OpenSessionToken, relay: Relay) !void {
+    if (token.waiters.items.len >= MAX_OPEN_SESSION_WAITERS) return error.TooManyWaiters;
+    const remote = relay.terminal.remote orelse return error.Disconnected;
+    try token.waiters.append(token.allocator, .{
+        .drain = relay.terminal.drain,
+        .generation = remote.panel_generation,
+        .request_id = relay.request_id,
+    });
+}
+
+fn removeOpenSessionToken(scope: *RelayScope, token: *OpenSessionToken) void {
+    for (scope.open_session_tokens.items, 0..) |candidate, i| {
+        if (candidate != token) continue;
+        _ = scope.open_session_tokens.orderedRemove(i);
+        token.deinit();
+        return;
+    }
+}
+
+fn cacheOpenSessionReply(scope: *RelayScope, token: *OpenSessionToken, reply: []const u8) !void {
+    token.reply = try token.allocator.dupe(u8, reply);
+    token.completed_serial = scope.next_open_completion;
+    scope.next_open_completion +%= 1;
+    if (scope.next_open_completion == 0) scope.next_open_completion = 1;
+    pruneOpenSessionReplies(scope);
+}
+
+fn pruneOpenSessionReplies(scope: *RelayScope) void {
+    while (true) {
+        var completed: usize = 0;
+        var oldest: ?*OpenSessionToken = null;
+        for (scope.open_session_tokens.items) |token| {
+            if (token.reply == null) continue;
+            completed += 1;
+            if (oldest == null or token.completed_serial < oldest.?.completed_serial) oldest = token;
+        }
+        if (completed <= MAX_OPEN_SESSION_COMPLETED) return;
+        removeOpenSessionToken(scope, oldest.?);
+    }
+}
+
+fn openSessionWaiterTerminal(scope: *RelayScope, waiter: OpenSessionWaiter) ?*Terminal {
+    if (!waiter.drain.alive.load(.acquire)) return null;
+    const terminal = waiter.drain.terminal orelse return null;
+    const remote = terminal.remote orelse return null;
+    if (!remote.canSend() or remote.panel_generation != waiter.generation) return null;
+    const scope_ctx = terminal.panel_scope_ctx orelse return null;
+    if (@as(*RelayScope, @ptrCast(@alignCast(scope_ctx))) != scope) return null;
+    return terminal;
+}
+
+fn completeOpenSessionToken(scope: *RelayScope, token: *OpenSessionToken, reply: []const u8) void {
+    cacheOpenSessionReply(scope, token, reply) catch {
+        for (token.waiters.items) |waiter| if (openSessionWaiterTerminal(scope, waiter)) |terminal| {
+            relayError(terminal, waiter.request_id, "panel-open-session could not cache its completed reply");
+        };
+        removeOpenSessionToken(scope, token);
+        return;
+    };
+    for (token.waiters.items) |waiter| if (openSessionWaiterTerminal(scope, waiter)) |terminal| {
+        terminal.replyPanelRequest(waiter.request_id, token.reply.?);
+    };
+    token.waiters.clearRetainingCapacity();
+}
+
+fn startPanelOpenSession(
+    relay: Relay,
+    token: *OpenSessionToken,
+    target_session: []const u8,
+    target_origin_id: []const u8,
+) !void {
+    if (@import("../util/clock.zig").nowMs() >= relay.deadline_ms) return error.Timeout;
+    if (panel_open_session_jobs.items.len >= MAX_PENDING_PANEL_OPERATIONS) return error.Busy;
+    var origin_pending: usize = 0;
+    for (panel_open_session_jobs.items) |job| if (job.scope == relay.scope) {
+        origin_pending += 1;
+    };
+    if (origin_pending >= MAX_PENDING_PER_ORIGIN) return error.Busy;
+    if (target_session.len < 1 or target_session.len > mux_wire.MAX_SESSION_NAME)
+        return error.InvalidSession;
+    if (!mux_wire.validSessionOriginId(target_origin_id)) return error.InvalidOriginId;
+
+    const remote = relay.terminal.remote orelse return error.Disconnected;
+    if (!remote.canSend()) return error.Disconnected;
+    const a = std.heap.c_allocator;
+    const socket: ?[]u8 = if (remote.conn.transport == .local)
+        try remote.conn.localDaemonOrigin(a)
+    else
+        null;
+    errdefer if (socket) |value| a.free(value);
+    const host: ?[]u8 = if (remote.host) |value| try a.dupe(u8, value) else null;
+    errdefer if (host) |value| a.free(value);
+    if (socket == null and host == null) return error.MissingSourceTransport;
+    const port_range: []u8 = if (remote.port_range.len > 0)
+        try a.dupe(u8, remote.port_range)
+    else
+        &.{};
+    errdefer if (port_range.len > 0) a.free(port_range);
+    const session_copy = try a.dupe(u8, target_session);
+    errdefer a.free(session_copy);
+    const job = try a.create(PanelOpenSessionJob);
+    errdefer a.destroy(job);
+    job.* = .{
+        .allocator = a,
+        .window = relay.window,
+        .pane = relay.pane,
+        .scope = relay.scope,
+        .token = token,
+        .origin = relay.terminal.drain,
+        .generation = remote.panel_generation,
+        .deadline_ms = relay.deadline_ms,
+        .target_session = session_copy,
+        .target_origin_id = target_origin_id[0..mux_wire.SESSION_ORIGIN_ID_LEN].*,
+        .socket = socket,
+        .host = host,
+        .port_range = port_range,
+    };
+    try panel_open_session_jobs.append(a, job);
+    errdefer _ = panel_open_session_jobs.pop();
+    const thread = try std.Thread.spawn(.{}, panelOpenSessionThreadMain, .{job});
+    thread.detach();
+}
+
+fn removePanelOpenSessionJob(job: *PanelOpenSessionJob) void {
+    for (panel_open_session_jobs.items, 0..) |candidate, i| {
+        if (candidate != job) continue;
+        _ = panel_open_session_jobs.orderedRemove(i);
+        return;
+    }
+}
+
+fn panelOpenSessionThreadMain(job: *PanelOpenSessionJob) void {
+    panelOpenSessionConnect(job) catch |err| {
+        if (job.failure_len == 0) job.setFailure(@errorName(err));
+    };
+    _ = c.g_idle_add(@ptrCast(&panelOpenSessionDone), @ptrCast(job));
+}
+
+fn panelOpenSessionConnect(job: *PanelOpenSessionJob) !void {
+    if (job.canceled.load(.acquire)) return error.Canceled;
+    var conn = if (job.socket) |socket|
+        try mux_client.Conn.connectProbed(job.allocator, socket)
+    else
+        try mux_client.Conn.connectRemote(
+            job.allocator,
+            job.host orelse return error.MissingSourceTransport,
+            if (job.port_range.len > 0) job.port_range else null,
+        );
+    errdefer conn.deinit();
+    const cancel_fd = c.fcntl(conn.fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
+    if (cancel_fd < 0) return error.CancelFdFailed;
+    job.cancel_fd.store(cancel_fd, .release);
+    if (job.canceled.load(.acquire)) return error.Canceled;
+
+    var remain = job.deadline_ms - @import("../util/clock.zig").nowMs();
+    if (remain <= 0) return error.Timeout;
+    conn.write_timeout_ms = @intCast(@min(remain, std.math.maxInt(c_int)));
+    try conn.sendAttach(job.target_session, .{
+        .origin_id = &job.target_origin_id,
+        .kind = "gui",
+        .panel_rpc = conn.panel_rpc,
+    });
+    remain = job.deadline_ms - @import("../util/clock.zig").nowMs();
+    if (remain <= 0) return error.Timeout;
+    const attached = conn.recvGuiAttachFor(remain) catch |err| {
+        if (err == error.DaemonError and conn.lastErr().len > 0) job.setFailure(conn.lastErr());
+        return err;
+    };
+    if (!attached.identity.valid or
+        !std.mem.eql(u8, attached.identity.originId(), &job.target_origin_id))
+    {
+        attached.snapshot.deinit(job.allocator);
+        job.setFailure("target session origin identity changed");
+        return error.SessionOriginMismatch;
+    }
+    conn.setNonBlocking();
+    job.snapshot = attached.snapshot.payload;
+    job.identity = attached.identity;
+    job.conn = conn;
+}
+
+fn panelOpenSessionDone(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const job = cast.userData(PanelOpenSessionJob, user);
+    removePanelOpenSessionJob(job);
+    const scope = job.scope;
+    defer {
+        job.deinit();
+        releaseRelayScopeIfIdle(scope);
+    }
+    const source = panelOpenSessionCommitSource(job) orelse {
+        finishOpenSessionError(job, "panel-open-session source scope is no longer available");
+        return 0;
+    };
+    if (job.conn == null or job.snapshot == null) {
+        finishOpenSessionError(job, job.failureMessage());
+        return 0;
+    }
+    if (@import("../util/clock.zig").nowMs() >= job.deadline_ms) {
+        finishOpenSessionError(job, "panel-open-session deadline exceeded");
+        return 0;
+    }
+
+    const host = currentHydrationWindow(job.window, source.pane);
+    var conn = job.conn.?;
+    conn.write_timeout_ms = 0;
+    job.conn = null;
+    const target_name = job.identity.name();
+    const attached = @import("muxtabs.zig").attachMuxPreparedTab(
+        host,
+        conn,
+        target_name,
+        if (job.host) |value| value else null,
+        job.snapshot.?,
+        job.identity,
+        .default,
+    ) catch |err| {
+        var buf: [160]u8 = undefined;
+        const message = std.fmt.bufPrint(&buf, "panel-open-session tab commit failed: {s}", .{@errorName(err)}) catch
+            "panel-open-session tab commit failed";
+        finishOpenSessionError(job, message);
+        return 0;
+    };
+    const target = attached.pane.terminal.remote orelse {
+        finishOpenSessionError(job, "panel-open-session target has no mux identity");
+        return 0;
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(host.allocator);
+    protocol.writeOkFlat(&out, host.allocator, .{
+        .session = target.session,
+        .origin_id = target.origin_id,
+        .tab = remotectl.tabPageId(attached.page),
+        .pane = attached.pane.id,
+    }) catch return 0;
+    completeOpenSessionToken(job.scope, job.token, out.items);
+    return 0;
+}
+
+fn finishOpenSessionError(job: *PanelOpenSessionJob, message: []const u8) void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(job.allocator);
+    protocol.writeErr(&out, job.allocator, message) catch return;
+    completeOpenSessionToken(job.scope, job.token, out.items);
+}
+
+const PanelOpenSessionSource = struct {
+    terminal: *Terminal,
+    pane: ?*Pane,
+};
+
+fn panelOpenSessionCommitSource(job: *const PanelOpenSessionJob) ?PanelOpenSessionSource {
+    if (job.canceled.load(.acquire)) return null;
+    for (job.scope.viewers.items) |viewer| {
+        if (!viewer.drain.alive.load(.acquire)) continue;
+        const terminal = viewer.drain.terminal orelse continue;
+        const remote = terminal.remote orelse continue;
+        if (!remote.canSend()) continue;
+        const scope_ctx = terminal.panel_scope_ctx orelse continue;
+        const scope: *RelayScope = @ptrCast(@alignCast(scope_ctx));
+        if (scope == job.scope and std.mem.eql(u8, remote.origin_id, &scope.origin_id)) return .{
+            .terminal = terminal,
+            .pane = viewer.pane,
+        };
+    }
+    return null;
+}
+
+fn cancelPanelOpenSession(job: *PanelOpenSessionJob) void {
+    job.canceled.store(true, .release);
+    const fd = job.cancel_fd.load(.acquire);
+    if (fd >= 0) _ = c.shutdown(fd, c.SHUT_RDWR);
+}
+
 fn startPanelTab(
     relay: Relay,
     request_id: u64,
@@ -1946,7 +2442,10 @@ fn panelTabConnect(job: *PanelTabJob) !void {
     var conn = try mux_client.Conn.connectLocalAutostart(job.allocator);
     var spawned = false;
     errdefer {
-        if (spawned) conn.sendJson(.kill, .{ .name = job.spawned_session }) catch {};
+        if (spawned) conn.sendKill(.{
+            .name = job.spawned_session,
+            .origin_id = if (job.spawned_origin_id_valid) &job.spawned_origin_id else "",
+        }) catch {};
         conn.deinit();
     }
     const cancel_fd = c.fcntl(conn.fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
@@ -1974,10 +2473,22 @@ fn panelTabConnect(job: *PanelTabJob) !void {
     remain = job.deadline_ms - @import("../util/clock.zig").nowMs();
     if (remain <= 0) return error.Timeout;
     const ok = try conn.recvExpectFor(&.{.ok}, remain);
-    ok.deinit(job.allocator);
+    defer ok.deinit(job.allocator);
+    const SpawnReply = struct { origin_id: []const u8 = "" };
+    var parsed = std.json.parseFromSlice(SpawnReply, job.allocator, ok.payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.MalformedSpawnReply;
+    defer parsed.deinit();
+    if (!mux_wire.validSessionOriginId(parsed.value.origin_id)) return error.MalformedSpawnReply;
+    @memcpy(&job.spawned_origin_id, parsed.value.origin_id);
+    job.spawned_origin_id_valid = true;
     spawned = true;
     if (job.canceled.load(.acquire)) return error.Canceled;
-    try conn.sendAttach(job.spawned_session, .{ .kind = "gui", .panel_rpc = conn.panel_rpc });
+    try conn.sendAttach(job.spawned_session, .{
+        .origin_id = &job.spawned_origin_id,
+        .kind = "gui",
+        .panel_rpc = conn.panel_rpc,
+    });
     remain = job.deadline_ms - @import("../util/clock.zig").nowMs();
     if (remain <= 0) return error.Timeout;
     const attached = try conn.recvGuiAttachFor(remain);
@@ -2086,6 +2597,7 @@ fn panelTabDone(user: ?*anyopaque) callconv(.c) c.gboolean {
     if (reports) |items| {
         protocol.writeOkFlat(&out, host.allocator, .{
             .panel_id = entry.panel_id,
+            .event_epoch = &entry.event_epoch,
             .session = wireSession(entry.session),
             .assets = items,
             .asset_failures = reportFailureCount(items),
@@ -2093,6 +2605,7 @@ fn panelTabDone(user: ?*anyopaque) callconv(.c) c.gboolean {
     } else {
         protocol.writeOkFlat(&out, host.allocator, .{
             .panel_id = entry.panel_id,
+            .event_epoch = &entry.event_epoch,
             .session = wireSession(entry.session),
         }) catch return 0;
     }
@@ -2153,6 +2666,7 @@ fn panelShow(
     const session = if (relay) |r| @as(?[]const u8, r.session) else scopeOf(req, origin);
     const host = if (relay) |r| r.window else self;
     const scope: Scope = if (relay) |r| .{ .relay = r.scope } else .direct;
+    const replacing = byKey(scope, session, name) != null;
 
     // A relayed tab needs a daemon-backed Pane, but every socket operation in
     // newShellTab is blocking. Validate now, then prepare that transport on a
@@ -2179,7 +2693,7 @@ fn panelShow(
         try diagErr(out, allocator, &diag, err);
         return .complete;
     };
-    presentEntry(host, entry);
+    if (!replacing) presentEntry(host, entry);
     if (relay == null and resolver == null) if (origin orelse host.focusedPane()) |pane| {
         entry.asset_origin = pane.terminal.drain;
         prepareDirectLocalImages(host, pane.terminal.drain, entry, document, null) catch {};
@@ -2187,6 +2701,7 @@ fn panelShow(
     if (report) |asset_report| {
         try protocol.writeOkFlat(out, allocator, .{
             .panel_id = entry.panel_id,
+            .event_epoch = &entry.event_epoch,
             .session = wireSession(entry.session),
             .assets = asset_report,
             .asset_failures = reportFailureCount(asset_report),
@@ -2194,6 +2709,7 @@ fn panelShow(
     } else {
         try protocol.writeOkFlat(out, allocator, .{
             .panel_id = entry.panel_id,
+            .event_epoch = &entry.event_epoch,
             .session = wireSession(entry.session),
         });
     }
@@ -2208,6 +2724,8 @@ pub const ShowError = error{
     NoPane,
     /// The panel's own tab or window could not be created.
     NoHost,
+    /// Reliable event identity cannot safely be minted without entropy.
+    RandomFailed,
 };
 
 /// Mount `document` as the panel `(session, name)`. THE mounting path:
@@ -2275,6 +2793,11 @@ fn showDocumentOrigin(
             return ShowError.BadDocument;
         };
 
+    const event_epoch = mux_daemon.newSessionOriginId() catch {
+        view.deinit();
+        diag.set("panel: cryptographic random source unavailable", .{});
+        return ShowError.RandomFailed;
+    };
     const entry = allocator.create(Entry) catch {
         view.deinit();
         return oom(diag);
@@ -2282,6 +2805,7 @@ fn showDocumentOrigin(
     entry.* = .{
         .allocator = allocator,
         .panel_id = next_panel_id,
+        .event_epoch = event_epoch,
         .name = allocator.dupe(u8, name) catch {
             allocator.destroy(entry);
             view.deinit();
@@ -2536,6 +3060,7 @@ fn panelGet(
     defer allocator.free(json);
     try protocol.writeOkFlat(out, allocator, .{
         .document = json,
+        .event_epoch = &entry.event_epoch,
         .name = entry.name,
         .session = wireSession(entry.session),
         .title = entry.view.title(),
@@ -2550,15 +3075,51 @@ fn panelEvents(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     scope: Scope,
+    reliable: bool,
 ) !void {
     const id = req.panel_id orelse
-        return protocol.writeErr(out, allocator, "panel-events requires panel_id");
+        return protocol.writeErr(out, allocator, if (reliable)
+            "panel-events-reliable requires panel_id"
+        else
+            "panel-events requires panel_id");
     const entry = byRequestId(self, req, id, scope) orelse
         return protocol.writeErr(out, allocator, "no such panel");
+    if (reliable) panelrpc.validateReliableEventsRequest(
+        req.ack,
+        req.event_epoch,
+        &entry.event_epoch,
+    ) catch |err| return protocol.writeErrCode(
+        out,
+        allocator,
+        switch (err) {
+            error.MissingEventEpoch => "event_epoch_required",
+            error.InvalidEventEpoch => "invalid_event_epoch",
+            error.EventEpochMismatch => "event_epoch_mismatch",
+        },
+        switch (err) {
+            error.MissingEventEpoch => "panel-events-reliable requires event_epoch when ack is nonzero",
+            error.InvalidEventEpoch => "panel-events-reliable event_epoch is invalid",
+            error.EventEpochMismatch => "panel event epoch changed; acknowledgement was not applied",
+        },
+    );
+    try writePanelEvents(&entry.view.queue, entry.event_epoch, req.ack, reliable, out, allocator);
+}
 
-    var buf: [events.CAP]events.Event = undefined;
-    const n = entry.view.queue.drainInto(&buf);
-    const dropped = entry.view.queue.takeDropped();
+/// Serialize either the legacy destructive drain or the v2 acknowledged peek.
+/// The 256+ KiB Event scratch lives on the heap, never the GTK main stack.
+fn writePanelEvents(
+    queue: *events.Queue,
+    event_epoch: panelrpc.EventEpoch,
+    ack: u64,
+    reliable: bool,
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) !void {
+    const buf = try allocator.alloc(events.Event, events.CAP);
+    defer allocator.free(buf);
+    const snapshot = if (reliable) queue.reliableInto(ack, buf) else null;
+    const n = if (snapshot) |state| state.count else queue.drainInto(buf);
+    const dropped = if (reliable) @as(u64, 0) else queue.takeDropped();
 
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2568,6 +3129,7 @@ fn panelEvents(
     try list.ensureTotalCapacity(arena, n);
     for (buf[0..n]) |ev| {
         list.appendAssumeCapacity(.{
+            .seq = ev.seq,
             .component = try arena.dupe(u8, ev.id()),
             .kind = @tagName(ev.kind),
             .value = switch (ev.value) {
@@ -2579,10 +3141,19 @@ fn panelEvents(
             .ts = ev.ts_ms,
         });
     }
-    try protocol.writeOkFlat(out, allocator, .{
-        .events = list.items,
-        .dropped = @as(u32, @intCast(@min(dropped, std.math.maxInt(u32)))),
-    });
+    if (snapshot) |state| {
+        try protocol.writeOkFlat(out, allocator, .{
+            .event_epoch = &event_epoch,
+            .events = list.items,
+            .cursor = state.cursor,
+            .dropped_total = state.dropped_total,
+        });
+    } else {
+        try protocol.writeOkFlat(out, allocator, .{
+            .events = list.items,
+            .dropped = @as(u32, @intCast(@min(dropped, std.math.maxInt(u32)))),
+        });
+    }
 }
 
 /// Which live panels a `panel-list` is asking for. `none` and a named
@@ -2633,6 +3204,7 @@ fn panelList(
         }
         try list.append(arena, .{
             .panel_id = e.panel_id,
+            .event_epoch = &e.event_epoch,
             .name = e.name,
             .session = wireSession(e.session),
             .title = e.view.title(),
@@ -2759,6 +3331,7 @@ fn cancelTerminalPanelWork(terminal: *Terminal, permanent: bool) void {
 
 fn cancelScopePanelWork(scope: *RelayScope) void {
     for (panel_tab_jobs.items) |job| if (job.scope == scope) cancelPanelTab(job);
+    for (panel_open_session_jobs.items) |job| if (job.scope == scope) cancelPanelOpenSession(job);
     var i: usize = 0;
     while (i < queued_panel_operations.items.len) {
         const queued = queued_panel_operations.items[i];
@@ -2944,6 +3517,8 @@ fn onWindowClosed(ctx: *anyopaque) void {
 
 // ─── tests ──────────────────────────────────────────────────────
 
+const TEST_EVENT_EPOCH: panelrpc.EventEpoch = "10000000000000000000000000000001".*;
+
 test "every panel-host decl type-checks" {
     // Lazy analysis: a signature error in a trampoline no test calls
     // would otherwise slip through `zig build test`.
@@ -2957,6 +3532,14 @@ test "target names round-trip, and default to a tab" {
     try std.testing.expectEqual(Target.window, Target.fromName("window").?);
     try std.testing.expectEqual(@as(?Target, null), Target.fromName("popover"));
     try std.testing.expectEqualStrings("window", Target.window.name());
+}
+
+test "new panel event epochs have the session-origin shape and do not repeat" {
+    const first = try mux_daemon.newSessionOriginId();
+    const second = try mux_daemon.newSessionOriginId();
+    try std.testing.expect(panelrpc.validEventEpoch(&first));
+    try std.testing.expect(panelrpc.validEventEpoch(&second));
+    try std.testing.expect(!std.mem.eql(u8, &first, &second));
 }
 
 test "a sessionless panel-show and a sessionless store operation agree on the key" {
@@ -3005,6 +3588,7 @@ test "registry keys by (session, name)" {
     var e1 = Entry{
         .allocator = a,
         .panel_id = 1,
+        .event_epoch = TEST_EVENT_EPOCH,
         .name = @constCast("train"),
         .session = @constCast("s1"),
         .target = .tab,
@@ -3013,6 +3597,7 @@ test "registry keys by (session, name)" {
     var e2 = Entry{
         .allocator = a,
         .panel_id = 2,
+        .event_epoch = TEST_EVENT_EPOCH,
         .name = @constCast("train"),
         .session = @constCast("s2"),
         .target = .window,
@@ -3021,6 +3606,7 @@ test "registry keys by (session, name)" {
     var e3 = Entry{
         .allocator = a,
         .panel_id = 3,
+        .event_epoch = TEST_EVENT_EPOCH,
         .name = @constCast("train"),
         .session = null,
         .target = .tab,
@@ -3094,6 +3680,7 @@ test "relay registry qualifies keys by session lifetime origin" {
     var a_entry = Entry{
         .allocator = a,
         .panel_id = 41,
+        .event_epoch = TEST_EVENT_EPOCH,
         .name = @constCast("same-name"),
         .session = a_session,
         .scope = .{ .relay = &scope_a },
@@ -3104,6 +3691,7 @@ test "relay registry qualifies keys by session lifetime origin" {
     var b_entry = Entry{
         .allocator = a,
         .panel_id = 42,
+        .event_epoch = TEST_EVENT_EPOCH,
         .name = @constCast("same-name"),
         .session = @constCast("same-session"),
         .scope = .{ .relay = &scope_b },
@@ -3195,6 +3783,7 @@ test "same-process duplicate attachments share panels through reconnect until la
     var entry = Entry{
         .allocator = a,
         .panel_id = 77,
+        .event_epoch = TEST_EVENT_EPOCH,
         .name = @constCast("shared-panel"),
         .session = @constCast("shared"),
         .scope = .{ .relay = shared },
@@ -3345,6 +3934,7 @@ test "closing a direct panel removes hydration before late worker handback" {
     var entry = Entry{
         .allocator = a,
         .panel_id = 991,
+        .event_epoch = TEST_EVENT_EPOCH,
         .name = @constCast("closing"),
         .session = null,
         .target = .window,
@@ -3387,6 +3977,7 @@ test "scope extraction cannot spin while tab closure is deferred" {
     var first = Entry{
         .allocator = a,
         .panel_id = 1,
+        .event_epoch = TEST_EVENT_EPOCH,
         .name = @constCast("first"),
         .session = @constCast("s"),
         .scope = .{ .relay = &scope },
@@ -3396,6 +3987,7 @@ test "scope extraction cannot spin while tab closure is deferred" {
     var second = Entry{
         .allocator = a,
         .panel_id = 2,
+        .event_epoch = TEST_EVENT_EPOCH,
         .name = @constCast("second"),
         .session = @constCast("s"),
         .scope = .{ .relay = &scope },
@@ -3734,6 +4326,230 @@ test "panel tab cancel duplicate cannot shutdown a reused worker fd" {
     try std.testing.expectEqual(@as(isize, 1), c.read(replacement[1], &byte, 1));
     try std.testing.expectEqual(@as(u8, 0x5a), byte);
     try std.testing.expectEqual(@as(isize, 0), c.read(original[1], &byte, 1));
+}
+
+test "panel open-session token cache coalesces and bounds completed retries" {
+    const a = std.heap.c_allocator;
+    var scope = RelayScope{ .origin_id = "10000000000000000000000000000001".* };
+    defer {
+        for (scope.open_session_tokens.items) |token| token.deinit();
+        scope.open_session_tokens.deinit(a);
+    }
+    const first = try createOpenSessionToken(
+        &scope,
+        "first-token",
+        "target",
+        "20000000000000000000000000000002",
+    );
+    try std.testing.expectEqual(first, findOpenSessionToken(&scope, "first-token").?);
+    try cacheOpenSessionReply(&scope, first, "{\"ok\":true,\"pane\":7}\n");
+    try std.testing.expectEqualStrings("{\"ok\":true,\"pane\":7}\n", first.reply.?);
+
+    for (0..MAX_OPEN_SESSION_COMPLETED) |i| {
+        var token_buf: [32]u8 = undefined;
+        const request_token = try std.fmt.bufPrint(&token_buf, "bounded-{d}", .{i});
+        const token = try createOpenSessionToken(
+            &scope,
+            request_token,
+            "target",
+            "20000000000000000000000000000002",
+        );
+        try cacheOpenSessionReply(&scope, token, "{\"ok\":false,\"error\":\"done\"}\n");
+    }
+    try std.testing.expect(findOpenSessionToken(&scope, "first-token") == null);
+    try std.testing.expectEqual(@as(usize, MAX_OPEN_SESSION_COMPLETED), scope.open_session_tokens.items.len);
+    try std.testing.expect(findOpenSessionToken(&scope, "bounded-63") != null);
+}
+
+test "panel open-session cancel duplicate cannot shutdown a reused worker fd" {
+    var original: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &original));
+    defer _ = c.close(original[1]);
+    const worker_fd = original[0];
+    const cancel_fd = c.fcntl(worker_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
+    try std.testing.expect(cancel_fd >= 0);
+    defer _ = c.close(cancel_fd);
+    _ = c.close(worker_fd);
+
+    var replacement: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &replacement));
+    defer _ = c.close(replacement[0]);
+    defer _ = c.close(replacement[1]);
+    try std.testing.expectEqual(worker_fd, replacement[0]);
+
+    var job: PanelOpenSessionJob = undefined;
+    job.canceled = .init(false);
+    job.cancel_fd = .init(cancel_fd);
+    cancelPanelOpenSession(&job);
+
+    var byte: u8 = 0x5a;
+    try std.testing.expectEqual(@as(isize, 1), c.write(replacement[0], &byte, 1));
+    byte = 0;
+    try std.testing.expectEqual(@as(isize, 1), c.read(replacement[1], &byte, 1));
+    try std.testing.expectEqual(@as(u8, 0x5a), byte);
+    try std.testing.expectEqual(@as(isize, 0), c.read(original[1], &byte, 1));
+}
+
+test "panel reliable events retry acknowledge overflow and preserve legacy drain" {
+    const a = std.testing.allocator;
+    var queue = events.Queue.init();
+    queue.push(events.Event.init("query", .submit, events.Value.fromText("draft")));
+    queue.push(events.Event.init("ok", .click, .none));
+
+    var first: std.ArrayList(u8) = .empty;
+    defer first.deinit(a);
+    try writePanelEvents(&queue, TEST_EVENT_EPOCH, 0, true, &first, a);
+    var retry: std.ArrayList(u8) = .empty;
+    defer retry.deinit(a);
+    try writePanelEvents(&queue, TEST_EVENT_EPOCH, 0, true, &retry, a);
+    try std.testing.expectEqualStrings(first.items, retry.items);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, first.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(
+        &TEST_EVENT_EPOCH,
+        parsed.value.object.get("event_epoch").?.string,
+    );
+    const cursor: u64 = @intCast(parsed.value.object.get("cursor").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.get("events").?.array.items.len);
+    try std.testing.expectEqualStrings("draft", parsed.value.object.get("events").?.array.items[0].object.get("value").?.string);
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("events").?.array.items[0].object.get("seq").?.integer);
+
+    var acked: std.ArrayList(u8) = .empty;
+    defer acked.deinit(a);
+    try writePanelEvents(&queue, TEST_EVENT_EPOCH, cursor, true, &acked, a);
+    var acked_parsed = try std.json.parseFromSlice(std.json.Value, a, acked.items, .{});
+    defer acked_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), acked_parsed.value.object.get("events").?.array.items.len);
+    try std.testing.expectEqual(@as(i64, @intCast(cursor)), acked_parsed.value.object.get("cursor").?.integer);
+
+    var overflow = events.Queue.init();
+    for (0..events.CAP + 2) |i| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "e{d}", .{i});
+        overflow.push(events.Event.init(id, .click, .none));
+    }
+    var overflow_out: std.ArrayList(u8) = .empty;
+    defer overflow_out.deinit(a);
+    try writePanelEvents(&overflow, TEST_EVENT_EPOCH, 0, true, &overflow_out, a);
+    var overflow_parsed = try std.json.parseFromSlice(std.json.Value, a, overflow_out.items, .{});
+    defer overflow_parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 2), overflow_parsed.value.object.get("dropped_total").?.integer);
+    try std.testing.expectEqual(@as(usize, events.CAP), overflow_parsed.value.object.get("events").?.array.items.len);
+
+    var legacy = events.Queue.init();
+    legacy.push(events.Event.init("once", .click, .none));
+    var drained: std.ArrayList(u8) = .empty;
+    defer drained.deinit(a);
+    try writePanelEvents(&legacy, TEST_EVENT_EPOCH, 0, false, &drained, a);
+    var empty: std.ArrayList(u8) = .empty;
+    defer empty.deinit(a);
+    try writePanelEvents(&legacy, TEST_EVENT_EPOCH, 0, false, &empty, a);
+    var empty_parsed = try std.json.parseFromSlice(std.json.Value, a, empty.items, .{});
+    defer empty_parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty_parsed.value.object.get("events").?.array.items.len);
+    try std.testing.expect(empty_parsed.value.object.get("cursor") == null);
+    try std.testing.expect(empty_parsed.value.object.get("dropped") != null);
+
+    var switched = events.Queue.init();
+    switched.push(events.Event.init("old", .click, .none));
+    var reliable_old: std.ArrayList(u8) = .empty;
+    defer reliable_old.deinit(a);
+    try writePanelEvents(&switched, TEST_EVENT_EPOCH, 0, true, &reliable_old, a);
+    var reliable_parsed = try std.json.parseFromSlice(std.json.Value, a, reliable_old.items, .{});
+    defer reliable_parsed.deinit();
+    const old_cursor: u64 = @intCast(reliable_parsed.value.object.get("cursor").?.integer);
+    var destructive: std.ArrayList(u8) = .empty;
+    defer destructive.deinit(a);
+    try writePanelEvents(&switched, TEST_EVENT_EPOCH, 0, false, &destructive, a);
+    switched.push(events.Event.init("fresh", .click, .none));
+    var after_switch: std.ArrayList(u8) = .empty;
+    defer after_switch.deinit(a);
+    try writePanelEvents(&switched, TEST_EVENT_EPOCH, old_cursor, true, &after_switch, a);
+    var after_parsed = try std.json.parseFromSlice(std.json.Value, a, after_switch.items, .{});
+    defer after_parsed.deinit();
+    const switched_events = after_parsed.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), switched_events.len);
+    try std.testing.expectEqualStrings("fresh", switched_events[0].object.get("component").?.string);
+    try std.testing.expectEqual(@as(i64, 1), after_parsed.value.object.get("dropped_total").?.integer);
+}
+
+test "panel host epoch-fences acknowledgement before mixed reader mutation" {
+    const a = std.testing.allocator;
+    const saved_panels = panels;
+    panels = .empty;
+    defer {
+        panels.deinit(a);
+        panels = saved_panels;
+    }
+    var scope = RelayScope{ .origin_id = "30000000000000000000000000000003".* };
+    var view = PanelView{
+        .allocator = a,
+        .asset_resolver = assets.Resolver.init(a, null),
+        .queue = events.Queue.init(),
+        .root_box = undefined,
+        .scroller = undefined,
+    };
+    defer view.asset_resolver.deinit();
+    var entry = Entry{
+        .allocator = a,
+        .panel_id = 901,
+        .event_epoch = TEST_EVENT_EPOCH,
+        .name = @constCast("mixed"),
+        .session = @constCast("session"),
+        .scope = .{ .relay = &scope },
+        .target = .tab,
+        .view = &view,
+    };
+    try panels.append(a, &entry);
+    var window: Window = undefined;
+
+    view.queue.push(events.Event.init("first", .click, .none));
+    var discovery: std.ArrayList(u8) = .empty;
+    defer discovery.deinit(a);
+    try panelEvents(&window, .{
+        .cmd = "panel-events-reliable",
+        .panel_id = entry.panel_id,
+        .ack = 0,
+    }, &discovery, a, .{ .relay = &scope }, true);
+    var discovered = try std.json.parseFromSlice(std.json.Value, a, discovery.items, .{});
+    defer discovered.deinit();
+    const cursor: u64 = @intCast(discovered.value.object.get("cursor").?.integer);
+
+    var mismatch: std.ArrayList(u8) = .empty;
+    defer mismatch.deinit(a);
+    try panelEvents(&window, .{
+        .cmd = "panel-events-reliable",
+        .panel_id = entry.panel_id,
+        .ack = cursor,
+        .event_epoch = "20000000000000000000000000000002",
+    }, &mismatch, a, .{ .relay = &scope }, true);
+    try std.testing.expect(std.mem.indexOf(u8, mismatch.items, "\"error_code\":\"event_epoch_mismatch\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), view.queue.pending());
+
+    var legacy: std.ArrayList(u8) = .empty;
+    defer legacy.deinit(a);
+    try panelEvents(&window, .{
+        .cmd = "panel-events",
+        .panel_id = entry.panel_id,
+    }, &legacy, a, .{ .relay = &scope }, false);
+    view.queue.push(events.Event.init("fresh", .click, .none));
+
+    var retry: std.ArrayList(u8) = .empty;
+    defer retry.deinit(a);
+    try panelEvents(&window, .{
+        .cmd = "panel-events-reliable",
+        .panel_id = entry.panel_id,
+        .ack = cursor,
+        .event_epoch = &TEST_EVENT_EPOCH,
+    }, &retry, a, .{ .relay = &scope }, true);
+    var retried = try std.json.parseFromSlice(std.json.Value, a, retry.items, .{});
+    defer retried.deinit();
+    const retried_events = retried.value.object.get("events").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), retried_events.len);
+    try std.testing.expectEqualStrings("fresh", retried_events[0].object.get("component").?.string);
+    try std.testing.expectEqual(@as(i64, 1), retried.value.object.get("dropped_total").?.integer);
+    try std.testing.expect(retried.value.object.get("cursor").?.integer > @as(i64, @intCast(cursor)));
 }
 
 test "local panel reads enforce deadline byte and dimension bounds off GTK" {

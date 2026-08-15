@@ -384,6 +384,103 @@ test "panel relay cancellation removes exact queued frames and rebases later rou
     try t.expectEqual(@as(usize, 0), rest.len);
 }
 
+test "panel relay uses each requester's v1 or v2 presenter requirement" {
+    const t = std.testing;
+    const a = t.allocator;
+    var empty: [0]u8 = .{};
+    var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    defer daemon.clients.deinit(a);
+    defer daemon.panel_routes.deinit(a);
+    var session: Session = undefined;
+    session.exited = false;
+
+    var requester_v1 = Client{
+        .allocator = a,
+        .fd = -1,
+        .id = 20,
+        .attached = &session,
+        .kind = .mcp,
+        .panel_rpc_support = 1,
+        .panel_rpc = 1,
+        .panel_only = true,
+    };
+    defer clearClient(&requester_v1, a);
+    var requester_v2 = Client{
+        .allocator = a,
+        .fd = -1,
+        .id = 21,
+        .attached = &session,
+        .kind = .mcp,
+        .panel_rpc_support = 2,
+        .panel_rpc = 2,
+        .panel_only = true,
+    };
+    defer clearClient(&requester_v2, a);
+    var presenter_v1 = Client{
+        .allocator = a,
+        .fd = -1,
+        .id = 1,
+        .attached = &session,
+        .kind = .gui,
+        .panel_rpc_support = 1,
+        .panel_rpc = 1,
+    };
+    defer clearClient(&presenter_v1, a);
+    var presenter_v2 = Client{
+        .allocator = a,
+        .fd = -1,
+        .id = 2,
+        .attached = &session,
+        .kind = .gui,
+        .panel_rpc_support = 2,
+        .panel_rpc = 2,
+    };
+    defer clearClient(&presenter_v2, a);
+    try daemon.clients.append(a, &presenter_v2);
+    try daemon.clients.append(a, &requester_v2);
+    try daemon.clients.append(a, &presenter_v1);
+    try daemon.clients.append(a, &requester_v1);
+
+    var v1_call = try envelope(a, 1, "{\"cmd\":\"panel-events\"}");
+    defer v1_call.deinit(a);
+    daemon.handlePanelRequest(&requester_v1, v1_call.items);
+    try t.expectEqual(&presenter_v1, daemon.panel_routes.items[0].presenter);
+    try t.expectEqual(@as(u8, 1), daemon.panel_routes.items[0].panel_rpc);
+    const v1_route = daemon.panel_routes.items[0].route_id;
+    var v1_reply = try envelope(a, v1_route, "{\"ok\":true,\"events\":[],\"dropped\":0}");
+    defer v1_reply.deinit(a);
+    daemon.handlePanelReply(&presenter_v1, v1_reply.items);
+    try t.expectEqual(@as(usize, 0), daemon.panel_routes.items.len);
+
+    var v2_call = try envelope(a, 2, "{\"cmd\":\"panel-events-reliable\",\"ack\":0}");
+    defer v2_call.deinit(a);
+    daemon.handlePanelRequest(&requester_v2, v2_call.items);
+    try t.expectEqual(&presenter_v2, daemon.panel_routes.items[0].presenter);
+    try t.expectEqual(@as(u8, 2), daemon.panel_routes.items[0].panel_rpc);
+    const v2_route = daemon.panel_routes.items[0].route_id;
+    var v2_reply = try envelope(a, v2_route, "{\"ok\":true,\"event_epoch\":\"10000000000000000000000000000001\",\"events\":[],\"cursor\":0,\"dropped_total\":0}");
+    defer v2_reply.deinit(a);
+    daemon.handlePanelReply(&presenter_v2, v2_reply.items);
+    try t.expectEqual(@as(usize, 0), daemon.panel_routes.items.len);
+
+    // A v1 requester may use a newer presenter when no v1 presenter remains.
+    presenter_v1.dead = true;
+    requester_v1.wbuf.clearRetainingCapacity();
+    presenter_v2.wbuf.clearRetainingCapacity();
+    daemon.handlePanelRequest(&requester_v1, v1_call.items);
+    try t.expectEqual(&presenter_v2, daemon.panel_routes.items[0].presenter);
+    daemon.panelClientDetached(&requester_v1, "test complete");
+
+    // A v2 requester must never fall back to the surviving v1 presenter.
+    presenter_v1.dead = false;
+    presenter_v2.dead = true;
+    requester_v2.wbuf.clearRetainingCapacity();
+    daemon.handlePanelRequest(&requester_v2, v2_call.items);
+    try t.expectEqual(@as(usize, 0), daemon.panel_routes.items.len);
+    const refusal = try firstEnvelope(&requester_v2, .panel_reply);
+    try t.expect(std.mem.indexOf(u8, refusal.json, "no compatible GUI") != null);
+}
+
 test "duplicate presenter attachment takes concurrent work after detach" {
     const t = std.testing;
     const a = t.allocator;
@@ -543,6 +640,7 @@ test "panel route caps report explicit pre-delivery resend safety" {
         .requester = &requester,
         .presenter = &presenter,
         .session = &session,
+        .panel_rpc = wire.PANEL_RPC_VERSION,
         .deadline_ms = 1,
         .presenter_stream_start = 0,
         .presenter_stream_len = 1,
@@ -614,7 +712,7 @@ test "panel-only reattach clears viewer replay and audio subscription state" {
     daemon_serve.handleFrame(&daemon, &client, .{ .ftype = .detach, .payload = "" });
     daemon_serve.handleFrame(&daemon, &client, .{
         .ftype = .attach,
-        .payload = "{\"name\":\"current-name\",\"kind\":\"mcp\",\"panel_only\":true,\"panel_rpc\":1}",
+        .payload = "{\"name\":\"current-name\",\"kind\":\"mcp\",\"panel_only\":true,\"panel_rpc\":2}",
     });
     try t.expectEqual(&session, client.attached.?);
     try t.expect(client.panel_only);
@@ -661,7 +759,7 @@ test "same-name replacement rejects reconnect with the prior lifetime origin" {
     };
     defer clearClient(&client, a);
 
-    daemon.handleAttach(&client, "{\"name\":\"same\",\"kind\":\"gui\",\"origin_id\":\"10000000000000000000000000000001\",\"panel_rpc\":1,\"identity_first\":true}");
+    daemon.handleAttach(&client, "{\"name\":\"same\",\"kind\":\"gui\",\"origin_id\":\"10000000000000000000000000000001\",\"panel_rpc\":2,\"identity_first\":true}");
     try t.expect(client.attached == null);
     const refusal = (try wire.peelFrame(client.wbuf.items)) orelse return error.TestUnexpectedResult;
     try t.expectEqual(wire.FrameType.err, refusal.frame.ftype);

@@ -95,8 +95,14 @@ pub fn listInstalledApps(allocator: std.mem.Allocator, host: ?[]const u8, local_
 /// One live app session in a daemon's `list` reply.
 pub const AppSessionRef = struct {
     name: []u8,
+    origin_id: wire.SessionOriginId = undefined,
+    origin_id_valid: bool = false,
     /// Session child pid on the daemon's host (0 = unknown).
     pid: i32 = 0,
+
+    pub fn originId(self: *const AppSessionRef) []const u8 {
+        return if (self.origin_id_valid) &self.origin_id else "";
+    }
 };
 
 /// Live app sessions on the daemon at `sock`, WITHOUT autostarting one
@@ -114,6 +120,7 @@ pub fn listAppSessions(allocator: std.mem.Allocator, sock: []const u8) Error![]A
     const Listing = struct {
         sessions: []const struct {
             name: []const u8,
+            origin_id: []const u8 = "",
             app: bool = false,
             exited: bool = false,
             pid: i32 = 0,
@@ -132,12 +139,46 @@ pub fn listAppSessions(allocator: std.mem.Allocator, sock: []const u8) Error![]A
     for (parsed.value.sessions) |s| {
         if (!s.app or s.exited) continue;
         const n = allocator.dupe(u8, s.name) catch return Error.OutOfMemory;
-        refs.append(allocator, .{ .name = n, .pid = s.pid }) catch {
+        var ref = AppSessionRef{ .name = n, .pid = s.pid };
+        if (wire.validSessionOriginId(s.origin_id)) {
+            @memcpy(&ref.origin_id, s.origin_id);
+            ref.origin_id_valid = true;
+        }
+        refs.append(allocator, ref) catch {
             allocator.free(n);
             return Error.OutOfMemory;
         };
     }
     return refs.toOwnedSlice(allocator) catch Error.OutOfMemory;
+}
+
+fn sessionOriginFromList(
+    conn: *muxclient.Conn,
+    allocator: std.mem.Allocator,
+    session_name: []const u8,
+    timeout_ms: i64,
+) ?wire.SessionOriginId {
+    conn.sendFrame(.list, "") catch return null;
+    const frame = conn.recvExpectFor(&.{.welcome}, timeout_ms) catch return null;
+    defer frame.deinit(allocator);
+    const Listing = struct {
+        sessions: []const struct {
+            name: []const u8 = "",
+            origin_name: []const u8 = "",
+            origin_id: []const u8 = "",
+        } = &.{},
+    };
+    var parsed = std.json.parseFromSlice(Listing, allocator, frame.payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    for (parsed.value.sessions) |session| {
+        if (!std.mem.eql(u8, session.name, session_name) and
+            !std.mem.eql(u8, session.origin_name, session_name)) continue;
+        if (!wire.validSessionOriginId(session.origin_id)) return null;
+        return session.origin_id[0..wire.SESSION_ORIGIN_ID_LEN].*;
+    }
+    return null;
 }
 
 /// One rendered toplevel (or popup) surface of one app channel.
@@ -370,6 +411,8 @@ pub const App = struct {
     allocator: std.mem.Allocator,
     conn: muxclient.Conn,
     name: []u8,
+    origin_id: wire.SessionOriginId = undefined,
+    origin_id_valid: bool = false,
     chans: std.AutoArrayHashMapUnmanaged(u32, *Chan) = .empty,
     /// Audio channels (tracked to discard stray data). Headless: we
     /// never subscribe, so the daemon's real-time self-clock paces
@@ -581,25 +624,40 @@ pub const App = struct {
         var spawn_pid: i32 = 0;
         var spawn_ow: u32 = 0;
         var spawn_oh: u32 = 0;
+        var spawn_origin_id: wire.SessionOriginId = undefined;
+        var spawn_origin_id_valid = false;
         {
             const ok = conn.recvExpectFor(&.{.ok}, opts.step_timeout_ms) catch |err| {
                 setStepErr("spawn", &conn, err);
                 return Error.SpawnFailed;
             };
             defer ok.deinit(allocator);
-            const OkReply = struct { pid: i32 = 0, output_width: u32 = 0, output_height: u32 = 0 };
+            const OkReply = struct {
+                origin_id: []const u8 = "",
+                pid: i32 = 0,
+                output_width: u32 = 0,
+                output_height: u32 = 0,
+            };
             if (std.json.parseFromSlice(OkReply, allocator, ok.payload, .{
                 .ignore_unknown_fields = true,
             })) |p| {
                 spawn_pid = p.value.pid;
                 spawn_ow = p.value.output_width;
                 spawn_oh = p.value.output_height;
+                if (wire.validSessionOriginId(p.value.origin_id)) {
+                    @memcpy(&spawn_origin_id, p.value.origin_id);
+                    spawn_origin_id_valid = true;
+                }
                 p.deinit();
             } else |_| {}
         }
         // MCP drives the seat: ask for the controller lease outright
         // (takeover), which is what every app tool already assumes.
-        conn.sendJson(.attach, .{ .name = name, .kind = "mcp", .control = true }) catch return Error.SpawnFailed;
+        conn.sendAttach(name, .{
+            .origin_id = if (spawn_origin_id_valid) &spawn_origin_id else "",
+            .kind = "mcp",
+            .control = true,
+        }) catch return Error.SpawnFailed;
         const snap = conn.recvExpectFor(&.{.snapshot}, opts.step_timeout_ms) catch |err| {
             setStepErr("attach", &conn, err);
             return Error.SpawnFailed;
@@ -611,6 +669,8 @@ pub const App = struct {
             .allocator = allocator,
             .conn = conn,
             .name = name,
+            .origin_id = spawn_origin_id,
+            .origin_id_valid = spawn_origin_id_valid,
             .layout = layout,
             .pid = spawn_pid,
             .output_width = spawn_ow,
@@ -633,6 +693,7 @@ pub const App = struct {
         session_name: []const u8,
         kb_layout: ?[]const u8,
         local_sock: ?[]const u8,
+        expected_origin_id: ?[]const u8,
     ) Error!*App {
         launch_err_len = 0;
         const layout_name = kb_layout orelse "";
@@ -654,9 +715,23 @@ pub const App = struct {
 
         const name = allocator.dupe(u8, session_name) catch return Error.OutOfMemory;
         errdefer allocator.free(name);
+        var origin_id: wire.SessionOriginId = undefined;
+        var origin_id_valid = false;
+        if (expected_origin_id) |expected| {
+            if (!wire.validSessionOriginId(expected)) return Error.SpawnFailed;
+            @memcpy(&origin_id, expected);
+            origin_id_valid = true;
+        } else if (sessionOriginFromList(&conn, allocator, name, 15_000)) |discovered| {
+            origin_id = discovered;
+            origin_id_valid = true;
+        }
         // MCP drives the seat: ask for the controller lease outright
         // (takeover), which is what every app tool already assumes.
-        conn.sendJson(.attach, .{ .name = name, .kind = "mcp", .control = true }) catch return Error.SpawnFailed;
+        conn.sendAttach(name, .{
+            .origin_id = if (origin_id_valid) &origin_id else "",
+            .kind = "mcp",
+            .control = true,
+        }) catch return Error.SpawnFailed;
         const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch |err| {
             setStepErr("attach", &conn, err);
             return Error.SpawnFailed;
@@ -668,6 +743,8 @@ pub const App = struct {
             .allocator = allocator,
             .conn = conn,
             .name = name,
+            .origin_id = origin_id,
+            .origin_id_valid = origin_id_valid,
             .layout = layout,
             .local_sock = if (local_sock) |p| allocator.dupe(u8, p) catch null else null,
         };
@@ -696,7 +773,10 @@ pub const App = struct {
     /// must go through here.
     pub fn killAndWait(self: *App, timeout_ms: i64) KillOutcome {
         if (self.exited) return .already_exited;
-        self.conn.sendJson(.kill, .{ .name = self.name }) catch return .unconfirmed;
+        self.conn.sendKill(.{
+            .name = self.name,
+            .origin_id = if (self.origin_id_valid) &self.origin_id else "",
+        }) catch return .unconfirmed;
         const f = self.conn.recvExpectFor(&.{ .ok, .gone }, timeout_ms) catch |err| {
             // DaemonError = "no such session": already gone daemon-side.
             return if (err == error.DaemonError) .already_exited else .unconfirmed;
@@ -718,7 +798,10 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         const a = self.allocator;
         if (!self.exited) {
-            self.conn.sendJson(.kill, .{ .name = self.name }) catch {};
+            self.conn.sendKill(.{
+                .name = self.name,
+                .origin_id = if (self.origin_id_valid) &self.origin_id else "",
+            }) catch {};
         }
         self.conn.deinit();
         for (self.chans.values()) |ch| {

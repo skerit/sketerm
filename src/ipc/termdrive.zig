@@ -513,6 +513,8 @@ pub const Term = struct {
     allocator: std.mem.Allocator,
     conn: muxclient.Conn,
     name: []u8,
+    origin_id: wire.SessionOriginId = undefined,
+    origin_id_valid: bool = false,
     pool: *Pool,
     screen: ?*Screen = null,
     /// Highest snapshot/events seq seen — the quiescence signal.
@@ -586,8 +588,27 @@ pub const Term = struct {
         } else {
             conn.sendJson(.spawn, .{ .name = name, .argv = &.{shell}, .rows = rows, .cols = cols, .login_shell = true, .shell_integration = si_wire }) catch return Error.SpawnFailed;
         }
-        (conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed).deinit(allocator);
-        conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
+        var origin_id: wire.SessionOriginId = undefined;
+        var origin_id_valid = false;
+        {
+            const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
+            defer ok.deinit(allocator);
+            const SpawnReply = struct { origin_id: []const u8 = "" };
+            var parsed = std.json.parseFromSlice(SpawnReply, allocator, ok.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch null;
+            if (parsed) |*reply| {
+                defer reply.deinit();
+                if (wire.validSessionOriginId(reply.value.origin_id)) {
+                    @memcpy(&origin_id, reply.value.origin_id);
+                    origin_id_valid = true;
+                }
+            }
+        }
+        conn.sendAttach(name, .{
+            .origin_id = if (origin_id_valid) &origin_id else "",
+            .kind = "mcp",
+        }) catch return Error.SpawnFailed;
         const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch return Error.SpawnFailed;
         defer snap.deinit(allocator);
 
@@ -596,7 +617,15 @@ pub const Term = struct {
         pool.* = Pool.init(allocator) catch return Error.OutOfMemory;
         errdefer pool.deinit();
         const self = allocator.create(Term) catch return Error.OutOfMemory;
-        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .pool = pool, .integration = si != null };
+        self.* = .{
+            .allocator = allocator,
+            .conn = conn,
+            .name = name,
+            .origin_id = origin_id,
+            .origin_id_valid = origin_id_valid,
+            .pool = pool,
+            .integration = si != null,
+        };
         self.shell_name = allocator.dupe(u8, std.fs.path.basename(shell)) catch null;
         self.applySnapshot(snap.payload) catch {};
         return self;
@@ -626,8 +655,27 @@ pub const Term = struct {
         errdefer allocator.free(name);
 
         conn.sendJson(.spawn, .{ .name = name, .argv = argv, .rows = rows, .cols = cols, .ttl_secs = 3600 }) catch return Error.SpawnFailed;
-        (conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed).deinit(allocator);
-        conn.sendJson(.attach, .{ .name = name, .kind = "mcp" }) catch return Error.SpawnFailed;
+        var origin_id: wire.SessionOriginId = undefined;
+        var origin_id_valid = false;
+        {
+            const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
+            defer ok.deinit(allocator);
+            const SpawnReply = struct { origin_id: []const u8 = "" };
+            var parsed = std.json.parseFromSlice(SpawnReply, allocator, ok.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch null;
+            if (parsed) |*reply| {
+                defer reply.deinit();
+                if (wire.validSessionOriginId(reply.value.origin_id)) {
+                    @memcpy(&origin_id, reply.value.origin_id);
+                    origin_id_valid = true;
+                }
+            }
+        }
+        conn.sendAttach(name, .{
+            .origin_id = if (origin_id_valid) &origin_id else "",
+            .kind = "mcp",
+        }) catch return Error.SpawnFailed;
         const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch return Error.SpawnFailed;
         defer snap.deinit(allocator);
 
@@ -636,7 +684,14 @@ pub const Term = struct {
         pool.* = Pool.init(allocator) catch return Error.OutOfMemory;
         errdefer pool.deinit();
         const self = allocator.create(Term) catch return Error.OutOfMemory;
-        self.* = .{ .allocator = allocator, .conn = conn, .name = name, .pool = pool };
+        self.* = .{
+            .allocator = allocator,
+            .conn = conn,
+            .name = name,
+            .origin_id = origin_id,
+            .origin_id_valid = origin_id_valid,
+            .pool = pool,
+        };
         self.remote_host = allocator.dupe(u8, host) catch null;
         self.applySnapshot(snap.payload) catch {};
         return self;
@@ -644,7 +699,10 @@ pub const Term = struct {
 
     pub fn deinit(self: *Term) void {
         const a = self.allocator;
-        if (!self.exited) self.conn.sendJson(.kill, .{ .name = self.name }) catch {};
+        if (!self.exited) self.conn.sendKill(.{
+            .name = self.name,
+            .origin_id = if (self.origin_id_valid) &self.origin_id else "",
+        }) catch {};
         if (self.shell_name) |s| a.free(s);
         if (self.remote_host) |h| a.free(h);
         self.conn.deinit();
@@ -749,7 +807,10 @@ pub const Term = struct {
             return;
         };
         conn.setNonBlocking();
-        conn.sendJson(.attach, .{ .name = self.name, .kind = "mcp" }) catch {
+        conn.sendAttach(self.name, .{
+            .origin_id = if (self.origin_id_valid) &self.origin_id else "",
+            .kind = "mcp",
+        }) catch {
             conn.deinit();
             self.exited = true;
             return;

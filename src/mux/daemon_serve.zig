@@ -889,6 +889,10 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // destruction. New clients must gate those requests because
                 // old daemons silently ignore unknown JSON members.
                 .display_v2 = true,
+                // KillReq.origin_id is enforced before name resolution. A
+                // client must gate the additive field on this bit because an
+                // older daemon would silently ignore it and kill by name.
+                .kill_origin_fence = true,
                 // Capability, same reasoning as udp_ticket: an lsp_open
                 // toward an old daemon would answer `.err`, which is
                 // misattributable on a multiplexed connection — and its

@@ -84,6 +84,7 @@ pub const FailureKind = enum {
     legacy_daemon,
     unsupported,
     no_compatible_gui,
+    no_such_session,
     origin_unreachable,
     origin_timeout,
     attach_failed,
@@ -177,6 +178,7 @@ pub const Pool = struct {
     }
 
     pub fn deinit(self: *Pool) void {
+        self.setActive(-1);
         const allocator = self.allocator;
         for (self.entries.items) |*entry| entry.deinit(self.allocator);
         self.entries.deinit(self.allocator);
@@ -195,8 +197,10 @@ pub const Pool = struct {
     }
 
     fn setActive(self: *Pool, fd: c_int) void {
-        self.active_fd.store(fd, .release);
-        if (self.watchdog_fd) |slot| slot.store(fd, .release);
+        setActiveSlot(&self.active_fd, fd);
+        if (self.watchdog_fd) |slot| {
+            if (slot != &self.active_fd) setActiveSlot(slot, fd);
+        }
     }
 
     /// Send exactly once and wait for the matching reply ID.
@@ -379,6 +383,7 @@ fn ensureFailureKind(err: anyerror) FailureKind {
     return switch (err) {
         error.LegacyPanelIdentityUnsupported => .legacy_daemon,
         error.PanelRpcUnsupported => .unsupported,
+        error.PanelSessionNotFound => .no_such_session,
         error.SessionOriginMismatch => .identity_mismatch,
         error.DaemonError => .attach_failed,
         error.MalformedPanelAttachMetadata => .malformed_attach,
@@ -388,10 +393,18 @@ fn ensureFailureKind(err: anyerror) FailureKind {
     };
 }
 
+fn setActiveSlot(slot: *std.atomic.Value(c_int), fd: c_int) void {
+    muxclient.releasePanelRequesterFd(slot);
+    if (fd < 0) return;
+    const duplicate = c.fcntl(fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
+    if (duplicate >= 0) slot.store(duplicate, .release);
+}
+
 test "paneldrive keeps legacy capability timeout and malformed negotiation distinct" {
     const t = std.testing;
     try t.expectEqual(FailureKind.legacy_daemon, ensureFailureKind(error.LegacyPanelIdentityUnsupported));
     try t.expectEqual(FailureKind.unsupported, ensureFailureKind(error.PanelRpcUnsupported));
+    try t.expectEqual(FailureKind.no_such_session, ensureFailureKind(error.PanelSessionNotFound));
     try t.expectEqual(FailureKind.origin_timeout, ensureFailureKind(error.Timeout));
     try t.expectEqual(FailureKind.malformed_welcome, ensureFailureKind(error.MalformedPanelWelcome));
     try t.expectEqual(FailureKind.malformed_attach, ensureFailureKind(error.MalformedPanelAttachMetadata));
@@ -691,7 +704,7 @@ const AttachMetadataScript = struct {
         defer peer.deinit();
         const hello = peer.recvExpect(&.{.hello}) catch return;
         hello.deinit(peer.allocator);
-        peer.sendFrame(.welcome, "{\"proto\":0,\"server_proto\":6,\"negotiation\":1,\"panel_rpc\":1}") catch return;
+        peer.sendFrame(.welcome, "{\"proto\":0,\"server_proto\":6,\"negotiation\":1,\"panel_rpc\":2}") catch return;
         const attach = peer.recvExpect(&.{.attach}) catch return;
         attach.deinit(peer.allocator);
         peer.sendFrame(.ok, self.reply) catch return;
@@ -710,7 +723,7 @@ const IdentityRefusalScript = struct {
         defer peer.deinit();
         const hello = peer.recvExpect(&.{.hello}) catch return;
         hello.deinit(peer.allocator);
-        peer.sendFrame(.welcome, "{\"proto\":0,\"server_proto\":6,\"negotiation\":1,\"panel_rpc\":1}") catch return;
+        peer.sendFrame(.welcome, "{\"proto\":0,\"server_proto\":6,\"negotiation\":1,\"panel_rpc\":2}") catch return;
         const attach = peer.recvExpect(&.{.attach}) catch return;
         defer attach.deinit(peer.allocator);
         const Attach = struct { origin_id: []const u8 = "" };

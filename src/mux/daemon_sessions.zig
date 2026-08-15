@@ -450,11 +450,13 @@ pub fn brokerAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("no shared terminal profile; session preserved");
         return;
     }
-    const panel_rpc = @min(cl.panel_rpc_support, parsed.value.panel_rpc);
-    if (parsed.value.panel_only and panel_rpc < wire.PANEL_RPC_VERSION) {
+    if (parsed.value.panel_only and
+        (parsed.value.panel_rpc == 0 or parsed.value.panel_rpc > cl.panel_rpc_support))
+    {
         cl.queueErr("panel-only attach requires panel_rpc capability");
         return;
     }
+    const panel_rpc = @min(cl.panel_rpc_support, parsed.value.panel_rpc);
     const w = brokerFindWorker(self, parsed.value.name) orelse {
         cl.queueErr("no such session");
         return;
@@ -568,6 +570,13 @@ pub fn brokerKill(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("no such session");
         return;
     };
+    if (parsed.value.origin_id.len > 0 and
+        (!dmod.validSessionOriginId(parsed.value.origin_id) or
+            !std.mem.eql(u8, parsed.value.origin_id, &w.origin_id)))
+    {
+        cl.queueErr("session origin identity changed");
+        return;
+    }
     if (parsed.value.require_display and !w.display) {
         cl.queueErr("session is not a display session");
         return;
@@ -585,6 +594,60 @@ pub fn brokerKill(self: *Daemon, cl: *Client, payload: []const u8) void {
     _ = controlSend(w.control_fd, "K", -1);
     w.dead = true;
     cl.queueJson(.ok, .{ .ok = true });
+}
+
+test "broker kill origin fence preserves replacements and accepts exact or absent identity" {
+    const t = std.testing;
+    const a = t.allocator;
+    var control: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&control, 4096));
+    defer _ = c.close(control[0]);
+    defer _ = c.close(control[1]);
+
+    var empty: [0]u8 = .{};
+    var broker = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..], .is_broker = true };
+    defer broker.workers.deinit(a);
+    var requester = Client{ .allocator = a, .fd = -1 };
+    defer requester.rbuf.deinit(a);
+    defer requester.wbuf.deinit(a);
+    defer requester.audio_wbuf.deinit(a);
+    var replacement = Worker{
+        .allocator = a,
+        .name = @constCast("same"),
+        .origin_name = @constCast("same"),
+        .origin_id = "20000000000000000000000000000002".*,
+        .pid = 123,
+        .control_fd = control[0],
+    };
+    try broker.workers.append(a, &replacement);
+
+    brokerKill(&broker, &requester, "{\"name\":\"same\",\"origin_id\":\"10000000000000000000000000000001\"}");
+    try t.expect(!replacement.dead);
+    var reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.err, reply.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, reply.frame.payload, "origin identity changed") != null);
+    var pfd = c.struct_pollfd{ .fd = control[1], .events = c.POLLIN, .revents = 0 };
+    try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
+
+    requester.wbuf.clearRetainingCapacity();
+    brokerKill(&broker, &requester, "{\"name\":\"same\",\"origin_id\":\"not-an-id\"}");
+    try t.expect(!replacement.dead);
+    reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.err, reply.frame.ftype);
+
+    requester.wbuf.clearRetainingCapacity();
+    brokerKill(&broker, &requester, "{\"name\":\"same\",\"origin_id\":\"20000000000000000000000000000002\"}");
+    try t.expect(replacement.dead);
+    var marker: [1]u8 = undefined;
+    try t.expectEqual(@as(isize, 1), c.recv(control[1], &marker, marker.len, 0));
+    try t.expectEqual(@as(u8, 'K'), marker[0]);
+
+    replacement.dead = false;
+    requester.wbuf.clearRetainingCapacity();
+    brokerKill(&broker, &requester, "{\"name\":\"same\"}");
+    try t.expect(replacement.dead);
+    try t.expectEqual(@as(isize, 1), c.recv(control[1], &marker, marker.len, 0));
+    try t.expectEqual(@as(u8, 'K'), marker[0]);
 }
 
 /// Answer whoever asked for a rename: a broker client directly, or the worker
@@ -1214,11 +1277,13 @@ pub fn handleAttach(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("no shared terminal profile; session preserved");
         return;
     }
-    const panel_rpc = @min(cl.panel_rpc_support, parsed.value.panel_rpc);
-    if (parsed.value.panel_only and panel_rpc < wire.PANEL_RPC_VERSION) {
+    if (parsed.value.panel_only and
+        (parsed.value.panel_rpc == 0 or parsed.value.panel_rpc > cl.panel_rpc_support))
+    {
         cl.queueErr("panel-only attach requires panel_rpc capability");
         return;
     }
+    const panel_rpc = @min(cl.panel_rpc_support, parsed.value.panel_rpc);
     // A REFUSED attach used to log nothing at all, which made the log
     // unable to answer the one question a GUI post-mortem needs: did the
     // client even get as far as asking? Log both refusals.

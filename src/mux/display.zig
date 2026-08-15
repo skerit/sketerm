@@ -11,6 +11,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const client = @import("client.zig");
 const daemon = @import("daemon.zig");
+const wire = @import("wire.zig");
 const platform = @import("../util/platform.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
 const xwayland = @import("xwayland.zig");
@@ -76,6 +77,7 @@ const DESTROY_HELP = "Usage: sketerm-mux display destroy NAME [--json] [--socket
 
 const Sess = struct {
     name: []const u8 = "",
+    origin_id: []const u8 = "",
     rows: u16 = 0,
     cols: u16 = 0,
     clients: u32 = 0,
@@ -174,7 +176,7 @@ test "display: runCommandStart finds the command past valued flags" {
     try t.expectEqual(@as(?usize, 2), runCommandStart(&.{ "--size", "800x600", "game", "--level" }));
     try t.expectEqual(@as(?usize, 3), runCommandStart(&.{ "--gpu", "--ttl", "60", "cmd" }));
     try t.expectEqual(@as(?usize, null), runCommandStart(&.{ "--size", "800x600", "--", "cmd" }));
-    try t.expectEqual(@as(?usize, null), runCommandStart(&.{ "--help" }));
+    try t.expectEqual(@as(?usize, null), runCommandStart(&.{"--help"}));
     try t.expectEqual(@as(?usize, null), runCommandStart(&.{}));
 }
 
@@ -373,6 +375,7 @@ fn writeEnvJson(w: *std.Io.Writer, env: Env) !void {
 const Created = struct {
     allocator: std.mem.Allocator,
     name: []u8,
+    origin_id: wire.SessionOriginId,
     wl_display: []u8,
     pulse_server: []u8,
     runtime_dir: []u8,
@@ -397,6 +400,7 @@ const Created = struct {
     fn sess(self: *const Created) Sess {
         return .{
             .name = self.name,
+            .origin_id = &self.origin_id,
             .display = true,
             .gpu = self.gpu,
             .xwayland = self.xwayland,
@@ -434,13 +438,21 @@ fn waitSocketGone(path: []const u8) bool {
     return c.access(z.ptr, c.F_OK) != 0;
 }
 
-fn destroyRaw(allocator: std.mem.Allocator, conn: *client.Conn, name: []const u8, pid: i32, wl_path: []const u8) bool {
-    if (!conn.display_v2) {
+fn destroyRaw(
+    allocator: std.mem.Allocator,
+    conn: *client.Conn,
+    name: []const u8,
+    origin_id: []const u8,
+    pid: i32,
+    wl_path: []const u8,
+) bool {
+    if (!conn.display_v2 or !conn.kill_origin_fence or !wire.validSessionOriginId(origin_id)) {
         errPrint("daemon is too old for safe display destruction; upgrade sketerm-mux", .{});
         return false;
     }
-    conn.sendJson(.kill, .{
+    conn.sendKill(.{
         .name = name,
+        .origin_id = origin_id,
         .require_display = true,
         .expected_pid = pid,
         .expected_wl_display = wl_path,
@@ -464,7 +476,7 @@ fn destroyRaw(allocator: std.mem.Allocator, conn: *client.Conn, name: []const u8
 }
 
 fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name: []const u8) ?Created {
-    if (!conn.display_v2) {
+    if (!conn.display_v2 or !conn.kill_origin_fence) {
         errPrint("daemon is too old for display lifecycle safety; upgrade sketerm-mux", .{});
         return null;
     }
@@ -487,6 +499,7 @@ fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name:
         return null;
     };
     const Reply = struct {
+        origin_id: []const u8 = "",
         pid: i32 = 0,
         wl_display: []const u8 = "",
         pulse_server: []const u8 = "",
@@ -519,24 +532,28 @@ fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name:
     };
     defer parsed.deinit();
     const r = parsed.value;
+    if (!wire.validSessionOriginId(r.origin_id)) {
+        errPrint("create '{s}': daemon reply omitted the session lifetime identity; refusing unsafe lifecycle management", .{name});
+        return null;
+    }
     if (r.wl_display.len == 0) {
         errPrint("session '{s}' came up without a Wayland display", .{name});
-        if (r.pid != 0) _ = destroyRaw(allocator, conn, name, r.pid, "");
+        if (r.pid != 0) _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, "");
         return null;
     }
     if (a.size_set and (r.output_width != a.output_width or r.output_height != a.output_height)) {
         errPrint("daemon did not apply requested output size {d}x{d}", .{ a.output_width, a.output_height });
-        _ = destroyRaw(allocator, conn, name, r.pid, r.wl_display);
+        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     }
     if (a.xwayland == .required and !r.xwayland) {
         errPrint("daemon could not start required rootless Xwayland", .{});
-        _ = destroyRaw(allocator, conn, name, r.pid, r.wl_display);
+        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     }
     if (r.xwayland and !xwayland.waitReady(r.x_display, r.xauthority, 10_000)) {
         errPrint("rootless Xwayland at {s} did not become ready", .{r.x_display});
-        _ = destroyRaw(allocator, conn, name, r.pid, r.wl_display);
+        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         if (a.xwayland == .auto) {
             errPrint("continuing with a Wayland-only display", .{});
             var fallback = a;
@@ -547,25 +564,25 @@ fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name:
     }
     const name_owned = allocator.dupe(u8, name) catch {
         errPrint("create '{s}': out of memory", .{name});
-        if (conn.display_v2) _ = destroyRaw(allocator, conn, name, r.pid, r.wl_display);
+        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     const wl_owned = allocator.dupe(u8, r.wl_display) catch {
         allocator.free(name_owned);
-        if (conn.display_v2) _ = destroyRaw(allocator, conn, name, r.pid, r.wl_display);
+        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     const pa_owned = allocator.dupe(u8, r.pulse_server) catch {
         allocator.free(wl_owned);
         allocator.free(name_owned);
-        if (conn.display_v2) _ = destroyRaw(allocator, conn, name, r.pid, r.wl_display);
+        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     const rt_owned = allocator.dupe(u8, r.runtime_dir) catch {
         allocator.free(pa_owned);
         allocator.free(wl_owned);
         allocator.free(name_owned);
-        if (conn.display_v2) _ = destroyRaw(allocator, conn, name, r.pid, r.wl_display);
+        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     const x_owned = allocator.dupe(u8, r.x_display) catch {
@@ -573,7 +590,7 @@ fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name:
         allocator.free(pa_owned);
         allocator.free(wl_owned);
         allocator.free(name_owned);
-        if (conn.display_v2) _ = destroyRaw(allocator, conn, name, r.pid, r.wl_display);
+        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     const xa_owned = allocator.dupe(u8, r.xauthority) catch {
@@ -582,12 +599,13 @@ fn spawnDisplay(allocator: std.mem.Allocator, conn: *client.Conn, a: Args, name:
         allocator.free(pa_owned);
         allocator.free(wl_owned);
         allocator.free(name_owned);
-        if (conn.display_v2) _ = destroyRaw(allocator, conn, name, r.pid, r.wl_display);
+        _ = destroyRaw(allocator, conn, name, r.origin_id, r.pid, r.wl_display);
         return null;
     };
     return .{
         .allocator = allocator,
         .name = name_owned,
+        .origin_id = r.origin_id[0..wire.SESSION_ORIGIN_ID_LEN].*,
         .wl_display = wl_owned,
         .pulse_server = pa_owned,
         .runtime_dir = rt_owned,
@@ -607,8 +625,9 @@ fn printCreated(allocator: std.mem.Allocator, created: *const Created, json: boo
     if (!json) {
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
-        try aw.writer.print("session {s}\npid={d}\noutput={d}x{d}\nWAYLAND_DISPLAY={s}\nXDG_RUNTIME_DIR={s}\nXDG_SESSION_TYPE=wayland\n", .{
+        try aw.writer.print("session {s}\norigin_id={s}\npid={d}\noutput={d}x{d}\nWAYLAND_DISPLAY={s}\nXDG_RUNTIME_DIR={s}\nXDG_SESSION_TYPE=wayland\n", .{
             created.name,
+            &created.origin_id,
             created.pid,
             created.output_width,
             created.output_height,
@@ -636,6 +655,8 @@ fn printCreated(allocator: std.mem.Allocator, created: *const Created, json: boo
     const w = &aw.writer;
     try w.writeAll("{\"session\":");
     try std.json.Stringify.value(created.name, .{}, w);
+    try w.writeAll(",\"origin_id\":");
+    try std.json.Stringify.value(&created.origin_id, .{}, w);
     try w.print(",\"pid\":{d},\"output\":{{\"width\":{d},\"height\":{d}}},\"gpu\":{},\"xwayland\":{},\"environment\":", .{
         created.pid, created.output_width, created.output_height, created.gpu, created.xwayland,
     });
@@ -658,7 +679,7 @@ fn create(allocator: std.mem.Allocator, a: Args) u8 {
     defer created.deinit();
     printCreated(allocator, &created, a.json) catch {
         errPrint("could not write create result; rolling session '{s}' back", .{name});
-        _ = destroyRaw(allocator, &conn, name, created.pid, created.wl_display);
+        _ = destroyRaw(allocator, &conn, name, &created.origin_id, created.pid, created.wl_display);
         return 1;
     };
     return 0;
@@ -668,6 +689,8 @@ fn writeSessJson(w: *std.Io.Writer, s: Sess) !void {
     const env = envOf(s);
     try w.writeAll("{\"session\":");
     try std.json.Stringify.value(s.name, .{}, w);
+    try w.writeAll(",\"origin_id\":");
+    try std.json.Stringify.value(s.origin_id, .{}, w);
     try w.print(",\"display\":{},\"app\":{},\"exited\":{},\"pid\":{d},\"viewers\":{d},\"ttl_secs\":{d},\"gpu\":{},\"xwayland\":{},\"output\":{{\"width\":{d},\"height\":{d}}}", .{
         s.display, s.app, s.exited, s.pid, s.viewers, s.ttl_secs, s.gpu, s.xwayland, s.output_width, s.output_height,
     });
@@ -689,7 +712,7 @@ fn writeSessJson(w: *std.Io.Writer, s: Sess) !void {
 fn inspect(allocator: std.mem.Allocator, a: Args) u8 {
     var conn = connect(allocator, a.socket) orelse return 1;
     defer conn.deinit();
-    if (!conn.display_v2) {
+    if (!conn.display_v2 or !conn.kill_origin_fence) {
         errPrint("daemon is too old to report reliable display metadata; upgrade sketerm-mux", .{});
         return 1;
     }
@@ -765,6 +788,8 @@ fn destroy(allocator: std.mem.Allocator, a: Args) u8 {
     var wl_path: []u8 = allocator.dupe(u8, "") catch return 1;
     defer allocator.free(wl_path);
     var expected_pid: i32 = 0;
+    var expected_origin_id: wire.SessionOriginId = undefined;
+    var expected_origin_id_valid = false;
     {
         var listing = listSessions(allocator, &conn) orelse return 1;
         defer listing.deinit();
@@ -780,6 +805,12 @@ fn destroy(allocator: std.mem.Allocator, a: Args) u8 {
             allocator.free(wl_path);
             wl_path = fresh;
             expected_pid = s.pid;
+            if (!wire.validSessionOriginId(s.origin_id)) {
+                errPrint("display session '{s}' has no safe lifetime identity", .{a.name});
+                return 1;
+            }
+            expected_origin_id = s.origin_id[0..wire.SESSION_ORIGIN_ID_LEN].*;
+            expected_origin_id_valid = true;
             break;
         }
         if (!found) {
@@ -787,7 +818,8 @@ fn destroy(allocator: std.mem.Allocator, a: Args) u8 {
             return 1;
         }
     }
-    if (!destroyRaw(allocator, &conn, a.name, expected_pid, wl_path)) return 1;
+    if (!expected_origin_id_valid or
+        !destroyRaw(allocator, &conn, a.name, &expected_origin_id, expected_pid, wl_path)) return 1;
     if (a.json)
         outPrint("{\"ok\":true}\n") catch return 1
     else
@@ -896,7 +928,7 @@ fn runCommand(allocator: std.mem.Allocator, a_in: Args) u8 {
     defer created.deinit();
     var cleanup_display = true;
     defer {
-        if (cleanup_display) _ = destroyRaw(allocator, &conn, name, created.pid, created.wl_display);
+        if (cleanup_display) _ = destroyRaw(allocator, &conn, name, &created.origin_id, created.pid, created.wl_display);
     }
     var lease = holdRunLease(allocator, a.socket, name) orelse return 125;
     var lease_live = true;
@@ -1031,7 +1063,7 @@ fn runCommand(allocator: std.mem.Allocator, a_in: Args) u8 {
     lease_live = false;
     cleanup_display = false;
     var final_result = result;
-    if (!destroyRaw(allocator, &conn, name, created.pid, created.wl_display) and result == 0) final_result = 125;
+    if (!destroyRaw(allocator, &conn, name, &created.origin_id, created.pid, created.wl_display) and result == 0) final_result = 125;
 
     // Restore caller dispositions while these signals are blocked. Anything
     // arriving after this snapshot is delivered under the caller's policy.

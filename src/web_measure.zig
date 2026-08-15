@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (wl.len == 0 or wl[0] != '/') return fail("no WAYLAND_DISPLAY");
     _ = std.fmt.bufPrintZ(&wl_z, "{s}", .{wl}) catch return fail("WAYLAND_DISPLAY too long");
 
-    drive = appdrive.App.attachExisting(allocator, SESSION, null, mux_sock) catch
+    drive = appdrive.App.attachExisting(allocator, SESSION, null, mux_sock, null) catch
         return fail("viewer attach failed");
     const app = drive.?;
 

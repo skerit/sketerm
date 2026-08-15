@@ -12,20 +12,47 @@ fn fail(msg: []const u8) noreturn {
     std.process.exit(1);
 }
 
-fn attachPresenter(
+fn attachPresenterVersion(
     allocator: std.mem.Allocator,
     sock_path: []const u8,
     session: []const u8,
+    panel_rpc: u8,
 ) client_mod.Conn {
     var conn = client_mod.Conn.connectProbed(allocator, sock_path) catch fail("presenter connect");
     if (conn.panel_rpc != wire.PANEL_RPC_VERSION) fail("welcome did not negotiate current panel_rpc");
     conn.sendAttach(session, .{
         .kind = "gui",
         .read_only = true,
-        .panel_rpc = wire.PANEL_RPC_VERSION,
+        .panel_rpc = panel_rpc,
     }) catch fail("presenter attach send");
     (conn.recvExpectFor(&.{.snapshot}, 5_000) catch fail("presenter did not receive snapshot")).deinit(allocator);
     return conn;
+}
+
+fn attachPresenter(allocator: std.mem.Allocator, sock_path: []const u8, session: []const u8) client_mod.Conn {
+    return attachPresenterVersion(allocator, sock_path, session, wire.PANEL_RPC_VERSION);
+}
+
+fn attachRequesterVersion(
+    allocator: std.mem.Allocator,
+    sock_path: []const u8,
+    session: []const u8,
+    panel_rpc: u8,
+) client_mod.Conn {
+    var conn = client_mod.Conn.connectProbed(allocator, sock_path) catch fail("versioned requester connect");
+    conn.sendAttach(session, .{
+        .kind = "mcp",
+        .read_only = true,
+        .panel_only = true,
+        .panel_rpc = panel_rpc,
+    }) catch fail("versioned requester attach send");
+    (conn.recvExpectFor(&.{.ok}, 5_000) catch fail("versioned requester attach reply")).deinit(allocator);
+    return conn;
+}
+
+fn detachAttached(conn: *client_mod.Conn) void {
+    conn.sendJson(.detach, .{}) catch fail("versioned peer detach send");
+    (conn.recvExpectFor(&.{.ok}, 5_000) catch fail("versioned peer detach reply")).deinit(conn.allocator);
 }
 
 /// A released GUI predating panel_rpc: it is a real terminal viewer but not a
@@ -279,6 +306,63 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     if (unsupported_gui.id != 12 or std.mem.indexOf(u8, unsupported_gui.json, "no compatible GUI") == null)
         fail("an attached GUI without panel_rpc was treated as compatible");
     legacy_gui.deinit();
+
+    // The requester attachment's negotiated requirement selects presenters:
+    // v1 remains compatible with both generations, while v2 can never route
+    // its reliable operation to a v1 GUI. This shared stage runs against the
+    // monolith and the broker/worker handoff.
+    var presenter_v1 = attachPresenterVersion(allocator, sock_path, "panel-stage", 1);
+    var presenter_v2 = attachPresenterVersion(allocator, sock_path, "panel-stage", 2);
+    var requester_v1 = attachRequesterVersion(allocator, sock_path, "panel-stage", 1);
+    var requester_v2 = attachRequesterVersion(allocator, sock_path, "panel-stage", 2);
+
+    requester_v1.sendPanelRequest(14, "{\"cmd\":\"panel-events\",\"panel_id\":1}") catch fail("v1 mixed request");
+    const mixed_v1 = recvEnvelope(allocator, &presenter_v1, .panel_request, 5_000);
+    defer allocator.free(mixed_v1.json);
+    expectNoFrame(&presenter_v2, .panel_request, 250, "v1 request skipped the earlier v1 presenter");
+    presenter_v1.sendPanelReply(mixed_v1.id, "{\"ok\":true,\"events\":[],\"dropped\":0}") catch fail("v1 mixed reply");
+    const mixed_v1_reply = recvEnvelope(allocator, &requester_v1, .panel_reply, 5_000);
+    defer allocator.free(mixed_v1_reply.json);
+    if (mixed_v1_reply.id != 14) fail("v1 mixed reply lost its caller id");
+
+    requester_v2.sendPanelRequest(15, "{\"cmd\":\"panel-events-reliable\",\"panel_id\":1,\"ack\":0}") catch fail("v2 mixed request");
+    const mixed_v2 = recvEnvelope(allocator, &presenter_v2, .panel_request, 5_000);
+    defer allocator.free(mixed_v2.json);
+    expectNoFrame(&presenter_v1, .panel_request, 250, "v2 requester routed to a v1 presenter");
+    presenter_v2.sendPanelReply(mixed_v2.id, "{\"ok\":true,\"event_epoch\":\"10000000000000000000000000000001\",\"events\":[],\"cursor\":0,\"dropped_total\":0}") catch fail("v2 mixed reply");
+    const mixed_v2_reply = recvEnvelope(allocator, &requester_v2, .panel_reply, 5_000);
+    defer allocator.free(mixed_v2_reply.json);
+    if (mixed_v2_reply.id != 15) fail("v2 mixed reply lost its caller id");
+
+    requester_v2.sendPanelRequest(
+        16,
+        "{\"cmd\":\"panel-open-session\",\"mux_session\":\"target\",\"mux_origin_id\":\"10000000000000000000000000000001\",\"request_token\":\"relay-smoke-16\"}",
+    ) catch fail("v2 panel-open-session request");
+    const open_call = recvEnvelope(allocator, &presenter_v2, .panel_request, 5_000);
+    defer allocator.free(open_call.json);
+    if (std.mem.indexOf(u8, open_call.json, "\"mux_session\":\"target\"") == null or
+        std.mem.indexOf(u8, open_call.json, "\"mux_origin_id\":\"10000000000000000000000000000001\"") == null)
+        fail("broker relay changed panel-open-session identity fields");
+    if (std.mem.indexOf(u8, open_call.json, "\"request_token\":\"relay-smoke-16\"") == null)
+        fail("broker relay changed panel-open-session request token");
+    expectNoFrame(&presenter_v1, .panel_request, 250, "panel-open-session routed to a v1 presenter");
+    presenter_v2.sendPanelReply(
+        open_call.id,
+        "{\"ok\":true,\"session\":\"target\",\"origin_id\":\"10000000000000000000000000000001\",\"tab\":4,\"pane\":5}",
+    ) catch fail("v2 panel-open-session reply");
+    const open_reply = recvEnvelope(allocator, &requester_v2, .panel_reply, 5_000);
+    defer allocator.free(open_reply.json);
+    if (open_reply.id != 16 or std.mem.indexOf(u8, open_reply.json, "\"pane\":5") == null)
+        fail("broker relay did not restore panel-open-session response");
+
+    detachAttached(&requester_v1);
+    detachAttached(&requester_v2);
+    detachAttached(&presenter_v1);
+    detachAttached(&presenter_v2);
+    requester_v1.deinit();
+    requester_v2.deinit();
+    presenter_v1.deinit();
+    presenter_v2.deinit();
 
     // A hostile peer can bypass the client helper and send an envelope over
     // the panel-specific cap while remaining under MAX_FRAME. It must receive

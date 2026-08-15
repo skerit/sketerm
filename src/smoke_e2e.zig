@@ -579,7 +579,7 @@ pub fn main() u8 {
 
         // Attach BEFORE the GUI starts: the brain lives client-side, so
         // an unattended hub never configures the toplevel it is handed.
-        drive = appdrive.App.attachExisting(allocator, DISPLAY_SESSION, null, mux_sock) catch {
+        drive = appdrive.App.attachExisting(allocator, DISPLAY_SESSION, null, mux_sock, null) catch {
             _ = c.fprintf(platform.stderr(), "smoke-e2e: attach said: %s\n", appdrive.lastLaunchErr().ptr);
             return fail("could not attach a viewer to the display session");
         };
@@ -730,6 +730,17 @@ pub fn main() u8 {
     if (c.getenv("SKETERM_SMOKE_E2E_WEB_ONLY") != null) {
         if (mcpWebReaderStage(allocator, sock_path, rt)) |why| return failMsg(why);
         say("mcp GUI web adapter: focused reader-ID stage passed");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_PANEL_ONLY") != null) {
+        const app = drive orelse return fail("focused panel smoke has no display driver");
+        var gui_session_buf: [64]u8 = undefined;
+        const gui_session = std.fmt.bufPrintZ(&gui_session_buf, "s{d}-1", .{pid}) catch return fail("GUI session name");
+        if (panelRelayGuiStage(allocator, mux_sock, gui_session, sock_path)) |why| return failMsg(why);
+        say("panel relay: focused transport, session-open, replacement, and lifecycle stage passed");
+        if (panelStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("panel: focused real-GTK scene, text input, events, patch, compare, and lifecycle stage passed");
         teardown();
         return 0;
     }
@@ -2023,8 +2034,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         return "creating a second tab for real tree-key coverage failed";
     allocator.free(seed_tab);
     _ = app.waitIdle(300, 5_000);
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
-        return "terminal focus failed before real tree-key coverage";
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else return "terminal focus failed before real tree-key coverage";
     _ = app.waitIdle(200, 4_000);
     if (expectRealTreeStep(allocator, app, sock_path, tree_prev_key, "terminal")) |err| return err;
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
@@ -2041,8 +2051,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     var browser_focus_buf: [96]u8 = undefined;
     const browser_focus = std.fmt.bufPrint(&browser_focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{browser_pane}) catch
         return "building the file-browser focus request failed";
-    if (roundtrip(allocator, sock_path, browser_focus)) |r| allocator.free(r) else
-        return "file-browser focus failed before real tree-key coverage";
+    if (roundtrip(allocator, sock_path, browser_focus)) |r| allocator.free(r) else return "file-browser focus failed before real tree-key coverage";
     _ = app.waitIdle(400, 8_000);
     if (app.windows.items.len == 0) return "the display session lost its window";
     const win_id = app.windows.items[0].id;
@@ -2058,8 +2067,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     var focus_buf: [96]u8 = undefined;
     const editor_focus = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{editor_pane}) catch
         return "building the editor focus request failed";
-    if (roundtrip(allocator, sock_path, editor_focus)) |r| allocator.free(r) else
-        return "editor focus failed before real tree-key coverage";
+    if (roundtrip(allocator, sock_path, editor_focus)) |r| allocator.free(r) else return "editor focus failed before real tree-key coverage";
     _ = app.waitIdle(300, 5_000);
     if (expectRealTreeStep(allocator, app, sock_path, tree_prev_key, "editor")) |err| return err;
 
@@ -2076,8 +2084,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         return "the real sidebar toggle shortcut did not show the sidebar";
     if (configHasSidebarKey(allocator, rt))
         return "showing the sidebar at runtime wrote show_tab_sidebar into config.conf";
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
-        return "terminal focus failed before the sidebar hide shortcut";
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else return "terminal focus failed before the sidebar hide shortcut";
     _ = app.waitIdle(200, 4_000);
     app.pressKey(null, tree_toggle_key) catch return "injecting the sidebar hide shortcut failed";
     _ = app.waitIdle(400, 5_000);
@@ -2111,13 +2118,11 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     var web_nav_buf: [192]u8 = undefined;
     const web_nav = std.fmt.bufPrint(&web_nav_buf, "{{\"cmd\":\"web-navigate\",\"pane\":{d},\"data\":\"data:text/html,tree-key-smoke\"}}\n", .{web_pane}) catch
         return "building the initial web navigation command failed";
-    if (roundtrip(allocator, sock_path, web_nav)) |r| allocator.free(r) else
-        return "initial web navigation roundtrip failed";
+    if (roundtrip(allocator, sock_path, web_nav)) |r| allocator.free(r) else return "initial web navigation roundtrip failed";
     var initial_web_focus_buf: [96]u8 = undefined;
     const initial_web_focus = std.fmt.bufPrint(&initial_web_focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{web_pane}) catch
         return "building the initial web focus command failed";
-    if (roundtrip(allocator, sock_path, initial_web_focus)) |r| allocator.free(r) else
-        return "initial web focus roundtrip failed";
+    if (roundtrip(allocator, sock_path, initial_web_focus)) |r| allocator.free(r) else return "initial web focus roundtrip failed";
     _ = app.waitIdle(200, 4_000);
 
     // ── sidebar CLOSED: new_tab is a WINDOW tab ────────────────
@@ -2135,8 +2140,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         defer allocator.free(r);
         break :blk selectedTabFirstPane(r);
     };
-    if (roundtrip(allocator, sock_path, initial_web_focus)) |r| allocator.free(r) else
-        return "web focus roundtrip failed before the closed-sidebar tree check";
+    if (roundtrip(allocator, sock_path, initial_web_focus)) |r| allocator.free(r) else return "web focus roundtrip failed before the closed-sidebar tree check";
     _ = app.waitIdle(200, 4_000);
     app.pressKey(null, tree_prev_key) catch return "injecting tab_tree_prev failed with the sidebar closed";
     _ = app.waitIdle(300, 5_000);
@@ -2227,10 +2231,8 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         if (countTabs(r) != tabs_with_sidebar)
             return "with the tree sidebar open, new_tab ALSO opened a window tab";
     }
-    if (roundtrip(allocator, sock_path, web_nav)) |r| allocator.free(r) else
-        return "child web navigation roundtrip failed";
-    if (roundtrip(allocator, sock_path, focus_cmd)) |r| allocator.free(r) else
-        return "child web focus roundtrip failed";
+    if (roundtrip(allocator, sock_path, web_nav)) |r| allocator.free(r) else return "child web navigation roundtrip failed";
+    if (roundtrip(allocator, sock_path, focus_cmd)) |r| allocator.free(r) else return "child web focus roundtrip failed";
     _ = app.waitIdle(300, 5_000);
 
     // ── the tree ACTIONS follow the sidebar, not the window ────
@@ -2352,8 +2354,7 @@ fn treeSidebarStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     }
     if (!saw_width) return "the dragged sidebar width was never written to config.conf";
     // Put the window back the way the later stages expect it.
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
-        return "terminal focus failed before the final sidebar hide";
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else return "terminal focus failed before the final sidebar hide";
     _ = app.waitIdle(200, 4_000);
     app.pressKey(null, tree_toggle_key) catch return "injecting toggle_tab_sidebar (off) failed";
     if (!waitSidebarVisible(app, win_id, false, 6_000))
@@ -2409,8 +2410,7 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         slot.* = parseNumAfter(r, "\"pane\":") orelse return "a new tab for the drag stage reported no pane";
     }
     _ = app.waitIdle(300, 5_000);
-    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
-        return "terminal focus failed before opening the sidebar for the drag stage";
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else return "terminal focus failed before opening the sidebar for the drag stage";
     _ = app.waitIdle(200, 4_000);
     app.pressKey(null, tree_toggle_key) catch return "injecting toggle_tab_sidebar for the drag stage failed";
     if (!waitSidebarVisible(app, win_id, true, 6_000))
@@ -2421,8 +2421,7 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     var focus_buf: [96]u8 = undefined;
     const focus_last = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{extra[1]}) catch
         return "building the drag-stage focus command failed";
-    if (roundtrip(allocator, sock_path, focus_last)) |r| allocator.free(r) else
-        return "focusing the last tab for the drag stage failed";
+    if (roundtrip(allocator, sock_path, focus_last)) |r| allocator.free(r) else return "focusing the last tab for the drag stage failed";
     _ = app.waitIdle(300, 5_000);
     const last_row = sidebarChipBounds(app, win_id) orelse return "the last tab's sidebar row was not visible";
     if (last_row.min_x != first_row.min_x) return "two root sidebar rows started at different indents";
@@ -2565,9 +2564,7 @@ fn prepareWebActionFixture(allocator: std.mem.Allocator, rt: [:0]const u8) bool 
     if (!writeSolidPng(allocator, orange_path.ptr, 0xff, 0x70, 0x10)) return false;
     const registry_path = std.fmt.bufPrintZ(&path_buf, "{s}/registry.json", .{base}) catch return false;
     var registry_buf: [1024]u8 = undefined;
-    const registry = std.fmt.bufPrint(&registry_buf,
-        "[{{\"id\":\"{s}\",\"dir\":\"{s}\",\"enabled\":true,\"owned\":false}}]",
-        .{ web_action_id, ext }) catch return false;
+    const registry = std.fmt.bufPrint(&registry_buf, "[{{\"id\":\"{s}\",\"dir\":\"{s}\",\"enabled\":true,\"owned\":false}}]", .{ web_action_id, ext }) catch return false;
     return writeFile(registry_path, registry);
 }
 
@@ -2597,8 +2594,7 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
         break :blk listPaneIds(before, &keep_ids);
     };
 
-    const open = roundtrip(allocator, sock,
-        "{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"data:text/html,<title>action-one</title><body style='margin:0;background:%23eee'>one</body>\"}\n") orelse
+    const open = roundtrip(allocator, sock, "{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"data:text/html,<title>action-one</title><body style='margin:0;background:%23eee'>one</body>\"}\n") orelse
         return "opening the browser-action page failed";
     defer allocator.free(open);
     if (std.mem.indexOf(u8, open, "\"ok\":true") == null) return "the browser-action page was rejected";
@@ -2622,14 +2618,10 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
 
     // Open another PAGE in the same WebGroup, then navigate it to the
     // URL that gives it the orange per-tab override.
-    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"toggle_tab_sidebar\"}\n")) |r| allocator.free(r) else
-        return "opening the tree sidebar for the browser-action stage failed";
-    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"new_tab\"}\n")) |r| allocator.free(r) else
-        return "opening the second WebGroup page failed";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"toggle_tab_sidebar\"}\n")) |r| allocator.free(r) else return "opening the tree sidebar for the browser-action stage failed";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"new_tab\"}\n")) |r| allocator.free(r) else return "opening the second WebGroup page failed";
     var nav_buf: [512]u8 = undefined;
-    const nav = std.fmt.bufPrint(&nav_buf,
-        "{{\"cmd\":\"web-navigate\",\"pane\":{d},\"data\":\"data:text/html,<title>action-two</title><body style='margin:0;background:%23ddd'>two</body>\"}}\n",
-        .{pane}) catch return "building the second-page navigation failed";
+    const nav = std.fmt.bufPrint(&nav_buf, "{{\"cmd\":\"web-navigate\",\"pane\":{d},\"data\":\"data:text/html,<title>action-two</title><body style='margin:0;background:%23ddd'>two</body>\"}}\n", .{pane}) catch return "building the second-page navigation failed";
     if (roundtrip(allocator, sock, nav)) |r| allocator.free(r) else return "navigating the second WebGroup page failed";
     _ = app.waitIdle(300, 8_000);
     var second_view: u32 = 0;
@@ -2645,8 +2637,7 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
     } else return "switching the WebGroup to its second page did not refresh the orange per-tab action icon";
 
     // Switch back and require the blue icon to return before clicking it.
-    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"tab_tree_prev\"}\n")) |r| allocator.free(r) else
-        return "switching back to the first WebGroup page failed";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"tab_tree_prev\"}\n")) |r| allocator.free(r) else return "switching back to the first WebGroup page failed";
     tries = 0;
     var action = blue;
     while (tries < 100) : (tries += 1) {
@@ -2679,8 +2670,7 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
     // A split has two visible browser toolbars, but only its focused pane
     // is the active MV2 tab. The inactive face must receive the empty
     // replace-all snapshot rather than keeping its old clickable action.
-    const split_open = roundtrip(allocator, sock,
-        "{\"cmd\":\"web-open\",\"target\":\"split\",\"data\":\"data:text/html,<title>action-two</title><body style='margin:0;background:%23ddd'>split</body>\"}\n") orelse
+    const split_open = roundtrip(allocator, sock, "{\"cmd\":\"web-open\",\"target\":\"split\",\"data\":\"data:text/html,<title>action-two</title><body style='margin:0;background:%23ddd'>split</body>\"}\n") orelse
         return "opening the browser-action split failed";
     defer allocator.free(split_open);
     const split_pane = parseNumAfter(split_open, "\"pane\":") orelse {
@@ -2699,8 +2689,7 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
     // Repeat across real GTK toplevels. The new focused window gets the
     // action and its trusted click must open a real popup there; returning
     // focus to the primary clears the secondary's stale action.
-    const window_open = roundtrip(allocator, sock,
-        "{\"cmd\":\"web-open\",\"target\":\"window\",\"data\":\"data:text/html,<title>action-two</title><body style='margin:0;background:%23ddd'>window</body>\"}\n") orelse
+    const window_open = roundtrip(allocator, sock, "{\"cmd\":\"web-open\",\"target\":\"window\",\"data\":\"data:text/html,<title>action-two</title><body style='margin:0;background:%23ddd'>window</body>\"}\n") orelse
         return "opening the browser-action window failed";
     defer allocator.free(window_open);
     const window_pane = parseNumAfter(window_open, "\"pane\":") orelse return "the browser-action window returned no pane";
@@ -2766,8 +2755,7 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
 
     if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"toggle_tab_sidebar\"}\n")) |r| allocator.free(r);
     closeAddedPanes(allocator, sock, app, keep_ids[0..keep_n]);
-    if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else
-        return "restoring terminal focus after the browser-action stage failed";
+    if (roundtrip(allocator, sock, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else return "restoring terminal focus after the browser-action stage failed";
     _ = app.waitIdle(200, 4_000);
     return null;
 }
@@ -4221,6 +4209,23 @@ fn panelRelayCall(
     return allocator.dupe(u8, envelope.json) catch null;
 }
 
+fn fixedIdentityField(allocator: std.mem.Allocator, json: []const u8, field: []const u8) ?muxwire.SessionOriginId {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const value = parsed.value.object.get(field) orelse return null;
+    if (value != .string or !muxwire.validSessionOriginId(value.string)) return null;
+    return value.string[0..muxwire.SESSION_ORIGIN_ID_LEN].*;
+}
+
+fn sessionOriginId(allocator: std.mem.Allocator, mux_sock: []const u8, session: []const u8) ?muxwire.SessionOriginId {
+    var requester = muxclient.connectPanelRequester(allocator, mux_sock, session, 10_000) catch return null;
+    defer requester.deinit();
+    const origin_id = requester.panelOriginId();
+    if (!muxwire.validSessionOriginId(origin_id)) return null;
+    return origin_id[0..muxwire.SESSION_ORIGIN_ID_LEN].*;
+}
+
 /// A control-socket request whose reply is read LATER, on a connection of its
 /// own, so a liveness probe on a SECOND connection can overlap the work the
 /// request kicked off. `roundtrip` cannot express that: it blocks until the
@@ -4335,6 +4340,49 @@ fn listedPaneIds(allocator: std.mem.Allocator, gui_sock: [:0]const u8) ?[]u32 {
     return ids.toOwnedSlice(allocator) catch null;
 }
 
+fn samePaneIds(a: []const u32, b: []const u32) bool {
+    if (a.len != b.len) return false;
+    for (a) |id| {
+        var found = false;
+        for (b) |other| if (id == other) {
+            found = true;
+            break;
+        };
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn paneIsSelectedTab(
+    allocator: std.mem.Allocator,
+    gui_sock: [:0]const u8,
+    tab_id: u32,
+    pane_id: u32,
+) bool {
+    const response = roundtrip(allocator, gui_sock, "{\"cmd\":\"list\"}\n") orelse return false;
+    defer allocator.free(response);
+    const PaneInfo = struct { id: u32 = 0 };
+    const TabInfo = struct {
+        id: u32 = 0,
+        selected: bool = false,
+        panes: []const PaneInfo = &.{},
+    };
+    const Listing = struct {
+        ok: bool = false,
+        tabs: []const TabInfo = &.{},
+    };
+    var parsed = std.json.parseFromSlice(Listing, allocator, response, .{
+        .ignore_unknown_fields = true,
+    }) catch return false;
+    defer parsed.deinit();
+    if (!parsed.value.ok) return false;
+    for (parsed.value.tabs) |tab| {
+        if (tab.id != tab_id or !tab.selected) continue;
+        for (tab.panes) |pane| if (pane.id == pane_id) return true;
+    }
+    return false;
+}
+
 /// The id of the first pane that appeared since `before`, polled to a
 /// deadline. Several IPC commands create a pane without answering with its id;
 /// this is how a later teardown can still be fenced on that exact pane.
@@ -4427,6 +4475,8 @@ fn panelRelayGuiStage(
         return "the GUI rejected a valid relayed panel document";
     const panel_id = parseNumAfter(shown, "\"panel_id\":") orelse
         return "the relayed panel-show reply had no panel_id";
+    const event_epoch = fixedIdentityField(allocator, shown, "event_epoch") orelse
+        return "the relayed panel-show reply had no valid event_epoch";
     var session_needle_buf: [96]u8 = undefined;
     const session_needle = std.fmt.bufPrint(&session_needle_buf, "\"session\":\"{s}\"", .{session}) catch
         return "the GUI session name was too long";
@@ -4448,6 +4498,22 @@ fn panelRelayGuiStage(
     defer allocator.free(direct_list);
     if (std.mem.indexOf(u8, direct_list, "relay-native") != null)
         return "direct GUI IPC listed a mux-origin panel";
+    const before_direct_open = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes before direct panel-open-session refusal";
+    defer allocator.free(before_direct_open);
+    const direct_open = roundtrip(
+        allocator,
+        gui_sock,
+        "{\"cmd\":\"panel-open-session\",\"mux_session\":\"forged\",\"mux_origin_id\":\"10000000000000000000000000000001\"}\n",
+    ) orelse return "direct panel-open-session refusal did not answer";
+    defer allocator.free(direct_open);
+    if (std.mem.indexOf(u8, direct_open, "relay-only") == null)
+        return "direct GUI socket invocation of panel-open-session was not refused";
+    const after_direct_open = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes after direct panel-open-session refusal";
+    defer allocator.free(after_direct_open);
+    if (!samePaneIds(before_direct_open, after_direct_open))
+        return "direct panel-open-session invocation opened a pane";
 
     // Rename through the daemon. The panel remains keyed by immutable origin,
     // while list/get metadata deliberately follows the mutable display name.
@@ -4471,6 +4537,213 @@ fn panelRelayGuiStage(
     if (!waitPanelListMatch(allocator, &requester, 0x5100, &.{ "relay-native", session_needle }, 10_000))
         return "restoring the relay session name left stale panel metadata";
 
+    // panel-open-session has two authority fields plus one bounded idempotency
+    // token. The
+    // source Terminal supplies the daemon/remote transport and the destination
+    // is always a fresh selected tab; direct sockets and routing overrides are
+    // rejected before any connection starts.
+    const wrong_session = "panel-open-wrong";
+    admin.sendJson(.spawn, .{
+        .name = wrong_session,
+        .argv = [_][]const u8{ "sh", "-c", "sleep 30" },
+        .rows = @as(u16, 24),
+        .cols = @as(u16, 80),
+        .ttl_secs = @as(u32, 120),
+    }) catch return "could not spawn panel-open wrong-origin fixture";
+    (admin.recvExpectFor(&.{.ok}, 10_000) catch return "panel-open wrong-origin spawn was not acknowledged").deinit(allocator);
+    const wrong_real_origin = sessionOriginId(allocator, mux_sock, wrong_session) orelse
+        return "could not read panel-open wrong-origin fixture identity";
+    var wrong_origin = wrong_real_origin;
+    wrong_origin[0] = if (wrong_origin[0] == '0') '1' else '0';
+    const before_wrong = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes before wrong-origin open";
+    defer allocator.free(before_wrong);
+    var open_buf: [512]u8 = undefined;
+    const wrong_request = std.fmt.bufPrint(
+        &open_buf,
+        "{{\"cmd\":\"panel-open-session\",\"mux_session\":\"{s}\",\"mux_origin_id\":\"{s}\",\"request_token\":\"wrong-origin\"}}",
+        .{ wrong_session, &wrong_origin },
+    ) catch return "formatting wrong-origin panel-open-session failed";
+    const wrong_reply = panelRelayCall(allocator, &requester, 0x5110, wrong_request) orelse
+        return "wrong-origin panel-open-session did not reply";
+    defer allocator.free(wrong_reply);
+    if (std.mem.indexOf(u8, wrong_reply, "origin identity changed") == null)
+        return "wrong-origin panel-open-session was not fenced by the daemon";
+    const after_wrong = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes after wrong-origin open";
+    defer allocator.free(after_wrong);
+    if (!samePaneIds(before_wrong, after_wrong))
+        return "wrong-origin panel-open-session opened a pane";
+    admin.sendKill(.{ .name = wrong_session, .origin_id = &wrong_real_origin }) catch
+        return "could not clean up wrong-origin fixture";
+    (admin.recvExpectFor(&.{.ok}, 10_000) catch return "wrong-origin fixture cleanup was not acknowledged").deinit(allocator);
+
+    const stale_session = "panel-open-stale";
+    admin.sendJson(.spawn, .{
+        .name = stale_session,
+        .argv = [_][]const u8{ "sh", "-c", "sleep 30" },
+        .rows = @as(u16, 24),
+        .cols = @as(u16, 80),
+        .ttl_secs = @as(u32, 120),
+    }) catch return "could not spawn panel-open stale-origin fixture";
+    (admin.recvExpectFor(&.{.ok}, 10_000) catch return "panel-open stale-origin spawn was not acknowledged").deinit(allocator);
+    const stale_origin = sessionOriginId(allocator, mux_sock, stale_session) orelse
+        return "could not read panel-open stale fixture identity";
+    admin.sendKill(.{ .name = stale_session, .origin_id = &stale_origin }) catch
+        return "could not kill panel-open stale fixture";
+    (admin.recvExpectFor(&.{.ok}, 10_000) catch return "panel-open stale fixture kill was not acknowledged").deinit(allocator);
+    admin.sendJson(.spawn, .{
+        .name = stale_session,
+        .argv = [_][]const u8{ "sh", "-c", "sleep 30" },
+        .rows = @as(u16, 24),
+        .cols = @as(u16, 80),
+        .ttl_secs = @as(u32, 120),
+    }) catch return "could not spawn panel-open same-name replacement";
+    (admin.recvExpectFor(&.{.ok}, 10_000) catch return "panel-open replacement spawn was not acknowledged").deinit(allocator);
+    const replacement_origin = sessionOriginId(allocator, mux_sock, stale_session) orelse
+        return "could not read panel-open replacement identity";
+    if (std.mem.eql(u8, &stale_origin, &replacement_origin))
+        return "same-name panel-open replacement reused its origin identity";
+    const before_stale = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes before stale-origin open";
+    defer allocator.free(before_stale);
+    const stale_request = std.fmt.bufPrint(
+        &open_buf,
+        "{{\"cmd\":\"panel-open-session\",\"mux_session\":\"{s}\",\"mux_origin_id\":\"{s}\",\"request_token\":\"stale-origin\"}}",
+        .{ stale_session, &stale_origin },
+    ) catch return "formatting stale-origin panel-open-session failed";
+    const stale_reply = panelRelayCall(allocator, &requester, 0x5111, stale_request) orelse
+        return "stale-origin panel-open-session did not reply";
+    defer allocator.free(stale_reply);
+    if (std.mem.indexOf(u8, stale_reply, "origin identity changed") == null)
+        return "stale-origin panel-open-session adopted a same-name replacement";
+    const after_stale = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes after stale-origin open";
+    defer allocator.free(after_stale);
+    if (!samePaneIds(before_stale, after_stale))
+        return "stale-origin panel-open-session opened a pane";
+    admin.sendKill(.{ .name = stale_session, .origin_id = &replacement_origin }) catch
+        return "could not clean up panel-open replacement";
+    (admin.recvExpectFor(&.{.ok}, 10_000) catch return "panel-open replacement cleanup was not acknowledged").deinit(allocator);
+
+    const app_session = "panel-open-app";
+    admin.sendJson(.spawn, .{
+        .name = app_session,
+        .argv = [_][]const u8{ "sh", "-c", "printf 'panel-open-app\\n'; sleep 30" },
+        .rows = @as(u16, 24),
+        .cols = @as(u16, 80),
+        .app = true,
+        .ttl_secs = @as(u32, 120),
+    }) catch return "could not spawn panel-open app fixture";
+    (admin.recvExpectFor(&.{.ok}, 10_000) catch return "panel-open app spawn was not acknowledged").deinit(allocator);
+    const app_origin = sessionOriginId(allocator, mux_sock, app_session) orelse
+        return "could not read panel-open app identity";
+    const before_override = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes before routing-override refusal";
+    defer allocator.free(before_override);
+    const override_request = std.fmt.bufPrint(
+        &open_buf,
+        "{{\"cmd\":\"panel-open-session\",\"mux_session\":\"{s}\",\"mux_origin_id\":\"{s}\",\"request_token\":\"hostile-override\",\"host\":\"attacker\",\"socket\":\"/tmp/attacker\",\"command\":\"evil\",\"takeover\":true}}",
+        .{ app_session, &app_origin },
+    ) catch return "formatting routing-override panel-open-session failed";
+    const override_reply = panelRelayCall(allocator, &requester, 0x5112, override_request) orelse
+        return "routing-override panel-open-session did not reply";
+    defer allocator.free(override_reply);
+    if (std.mem.indexOf(u8, override_reply, "UnexpectedField") == null)
+        return "panel-open-session accepted requester routing or takeover fields";
+    const after_override = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes after routing-override refusal";
+    defer allocator.free(after_override);
+    if (!samePaneIds(before_override, after_override))
+        return "routing-override panel-open-session opened a pane";
+
+    const app_request = std.fmt.bufPrint(
+        &open_buf,
+        "{{\"cmd\":\"panel-open-session\",\"mux_session\":\"{s}\",\"mux_origin_id\":\"{s}\",\"request_token\":\"lost-reply-proof-5113\"}}",
+        .{ app_session, &app_origin },
+    ) catch return "formatting exact panel-open-session failed";
+    const before_exact = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes before exact panel-open-session";
+    defer allocator.free(before_exact);
+    requester.sendPanelRequest(0x5113, app_request) catch
+        return "could not send exact panel-open-session";
+    if (!guiResponsive(allocator, gui_sock))
+        return "GTK stopped serving while panel-open-session connected and attached";
+    const app_frame = requester.recvExpectFor(&.{.panel_reply}, 45_000) catch
+        return "exact panel-open-session never replied";
+    defer app_frame.deinit(allocator);
+    const app_envelope = muxwire.decodePanelEnvelope(app_frame.payload) catch
+        return "exact panel-open-session returned a malformed envelope";
+    if (app_envelope.id != 0x5113 or std.mem.indexOf(u8, app_envelope.json, "\"ok\":true") == null)
+        return "exact panel-open-session returned the wrong correlated result";
+    if (fixedIdentityField(allocator, app_envelope.json, "origin_id")) |opened_origin| {
+        if (!std.mem.eql(u8, &opened_origin, &app_origin))
+            return "panel-open-session reply reported a different target origin";
+    } else return "panel-open-session reply had no valid target origin";
+    const opened_tab = parseNumAfter(app_envelope.json, "\"tab\":") orelse
+        return "panel-open-session reply had no tab id";
+    const opened_pane = parseNumAfter(app_envelope.json, "\"pane\":") orelse
+        return "panel-open-session reply had no pane id";
+    if (!paneIsSelectedTab(allocator, gui_sock, opened_tab, opened_pane))
+        return "panel-open-session did not force the app target into a selected tab";
+    const after_first_open = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes after exact panel-open-session";
+    defer allocator.free(after_first_open);
+    if (after_first_open.len != before_exact.len + 1)
+        return "exact panel-open-session did not add exactly one pane";
+
+    const reshown = panelRelayCall(
+        allocator,
+        &requester,
+        0x51131,
+        "{\"cmd\":\"panel-show\",\"name\":\"relay-native\",\"target\":\"pane\"," ++
+            "\"document\":\"{\\\"title\\\":\\\"Relayed 3\\\",\\\"root\\\":\\\"r\\\"," ++
+            "\\\"components\\\":{\\\"r\\\":{\\\"type\\\":\\\"heading\\\",\\\"text\\\":\\\"Relayed again\\\",\\\"level\\\":1}}}\"}",
+    ) orelse return "immediate same-name full panel re-show timed out";
+    defer allocator.free(reshown);
+    if (parseNumAfter(reshown, "\"panel_id\":") != panel_id)
+        return "same-name full panel re-show changed the panel id";
+    const reshown_epoch = fixedIdentityField(allocator, reshown, "event_epoch") orelse
+        return "same-name full panel re-show returned no event_epoch";
+    if (!std.mem.eql(u8, &reshown_epoch, &event_epoch))
+        return "same-name full panel re-show changed the event epoch";
+    if (!paneIsSelectedTab(allocator, gui_sock, opened_tab, opened_pane))
+        return "same-name panel re-show stole selection from the newly opened session tab";
+
+    // Treat the first reply as lost and retry the exact request token. The GUI
+    // must return the byte-identical completed result without another tab.
+    requester.sendPanelRequest(0x5114, app_request) catch
+        return "could not retry the lost panel-open-session reply";
+    const retry_frame = requester.recvExpectFor(&.{.panel_reply}, 10_000) catch
+        return "panel-open-session retry never returned its cached result";
+    defer retry_frame.deinit(allocator);
+    const retry_envelope = muxwire.decodePanelEnvelope(retry_frame.payload) catch
+        return "panel-open-session retry returned a malformed envelope";
+    if (retry_envelope.id != 0x5114 or !std.mem.eql(u8, retry_envelope.json, app_envelope.json))
+        return "panel-open-session retry did not return the original result";
+    const after_retry = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes after panel-open-session retry";
+    defer allocator.free(after_retry);
+    if (!samePaneIds(after_first_open, after_retry))
+        return "panel-open-session retry opened a duplicate pane";
+    var office_get_buf: [128]u8 = undefined;
+    const office_get_req = std.fmt.bufPrint(
+        &office_get_buf,
+        "{{\"cmd\":\"panel-get\",\"panel_id\":{d}}}",
+        .{panel_id},
+    ) catch return "formatting office survival probe failed";
+    const office_live = panelRelayCall(allocator, &requester, 0x5115, office_get_req) orelse
+        return "source office panel did not answer after opening a target";
+    defer allocator.free(office_live);
+    if (std.mem.indexOf(u8, office_live, "Relayed") == null or
+        fixedIdentityField(allocator, office_live, "event_epoch") == null)
+        return "opening a target destroyed or replaced the source office panel";
+    if (!closeGuiPaneAndWait(allocator, gui_sock, opened_pane))
+        return "closing the panel-open target tab did not finish";
+    admin.sendKill(.{ .name = app_session, .origin_id = &app_origin }) catch
+        return "could not clean up panel-open app fixture";
+    (admin.recvExpectFor(&.{.ok}, 10_000) catch return "panel-open app cleanup was not acknowledged").deinit(allocator);
+
     var patch_buf: [256]u8 = undefined;
     const patch = std.fmt.bufPrint(
         &patch_buf,
@@ -4483,6 +4756,20 @@ fn panelRelayGuiStage(
     if (std.mem.indexOf(u8, patched, "\"ok\":true") == null)
         return "relayed panel-patch failed";
 
+    var events_buf: [160]u8 = undefined;
+    const reliable_req = std.fmt.bufPrint(
+        &events_buf,
+        "{{\"cmd\":\"panel-events-reliable\",\"panel_id\":{d},\"ack\":0}}",
+        .{panel_id},
+    ) catch return "formatting reliable event epoch probe failed";
+    const reliable = panelRelayCall(allocator, &requester, 0x5021, reliable_req) orelse
+        return "reliable event epoch probe timed out";
+    defer allocator.free(reliable);
+    const reliable_epoch = fixedIdentityField(allocator, reliable, "event_epoch") orelse
+        return "reliable panel-events reply had no valid event_epoch";
+    if (!std.mem.eql(u8, &reliable_epoch, &event_epoch))
+        return "panel patch changed the reliable event epoch";
+
     var close_buf: [96]u8 = undefined;
     const close = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d}}}", .{panel_id}) catch
         return "relay close request formatting failed";
@@ -4491,6 +4778,32 @@ fn panelRelayGuiStage(
     defer allocator.free(closed);
     if (std.mem.indexOf(u8, closed, "\"ok\":true") == null)
         return "relayed panel-close failed";
+
+    const recreated = panelRelayCall(
+        allocator,
+        &requester,
+        0x5031,
+        "{\"cmd\":\"panel-show\",\"name\":\"relay-native\",\"target\":\"pane\"," ++
+            "\"document\":\"{\\\"root\\\":\\\"r\\\",\\\"components\\\":{\\\"r\\\":{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"new lifetime\\\"}}}\"}",
+    ) orelse return "recreating the closed panel timed out";
+    defer allocator.free(recreated);
+    const recreated_id = parseNumAfter(recreated, "\"panel_id\":") orelse
+        return "recreated panel returned no panel id";
+    if (recreated_id == panel_id) return "recreated panel reused a destroyed panel id";
+    const recreated_epoch = fixedIdentityField(allocator, recreated, "event_epoch") orelse
+        return "recreated panel returned no valid event_epoch";
+    if (std.mem.eql(u8, &recreated_epoch, &event_epoch))
+        return "destroyed and recreated panel reused its event epoch";
+    const recreated_close = std.fmt.bufPrint(
+        &close_buf,
+        "{{\"cmd\":\"panel-close\",\"panel_id\":{d}}}",
+        .{recreated_id},
+    ) catch return "formatting recreated panel close failed";
+    const recreated_closed = panelRelayCall(allocator, &requester, 0x5032, recreated_close) orelse
+        return "closing recreated panel timed out";
+    defer allocator.free(recreated_closed);
+    if (std.mem.indexOf(u8, recreated_closed, "\"ok\":true") == null)
+        return "closing recreated panel failed";
 
     // One relay scope hosts many panels at once across all three targets,
     // same-name replacement reuses the panel in place rather than adding
@@ -4586,6 +4899,9 @@ fn panelRelayGuiStage(
     // The default target is a fresh tab. Send without waiting, then prove the
     // GUI socket remains serviceable while daemon connect/spawn/attach runs on
     // the worker; finally consume the correlated reply and close the tab.
+    const before_relay_tab = listedPaneIds(allocator, gui_sock) orelse
+        return "could not list panes before the initial relayed tab panel";
+    defer allocator.free(before_relay_tab);
     requester.sendPanelRequest(
         0x504,
         "{\"cmd\":\"panel-show\",\"name\":\"relay-tab\",\"document\":\"{\\\"root\\\":\\\"t\\\",\\\"components\\\":{\\\"t\\\":{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"async tab\\\"}}}\"}",
@@ -4604,6 +4920,13 @@ fn panelRelayGuiStage(
         return "the asynchronous relayed tab returned the wrong correlated result";
     const tab_id = parseNumAfter(tab_envelope.json, "\"panel_id\":") orelse
         return "the asynchronous relayed tab returned no panel id";
+    const relay_tab_pane = newPaneId(allocator, gui_sock, before_relay_tab, 10_000) orelse
+        return "the initial relayed tab panel did not open a new pane";
+    const relay_tab_list = roundtrip(allocator, gui_sock, "{\"cmd\":\"list\"}\n") orelse
+        return "could not inspect selection after the initial relayed tab panel";
+    defer allocator.free(relay_tab_list);
+    if (!selectedTabHasPane(relay_tab_list, relay_tab_pane))
+        return "the initial relayed tab panel did not select its new tab";
     var tab_close_buf: [96]u8 = undefined;
     const tab_close_req = std.fmt.bufPrint(&tab_close_buf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d}}}", .{tab_id}) catch
         return "formatting asynchronous tab close failed";
@@ -4956,6 +5279,35 @@ fn panelRelayGuiStage(
     return null;
 }
 
+fn waitPanelTextEvent(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    panel_id: u32,
+    component: []const u8,
+    kind: []const u8,
+    value: []const u8,
+) bool {
+    const component_field = std.fmt.allocPrint(allocator, "\"component\":\"{s}\"", .{component}) catch return false;
+    defer allocator.free(component_field);
+    const kind_field = std.fmt.allocPrint(allocator, "\"kind\":\"{s}\"", .{kind}) catch return false;
+    defer allocator.free(kind_field);
+    const value_field = std.fmt.allocPrint(allocator, "\"value\":\"{s}\"", .{value}) catch return false;
+    defer allocator.free(value_field);
+    var tries: u32 = 0;
+    while (tries < 40) : (tries += 1) {
+        _ = app.pumpOnce(150);
+        var req_buf: [128]u8 = undefined;
+        const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"panel-events\",\"panel_id\":{d},\"session\":\"e2e-scope\"}}\n", .{panel_id}) catch return false;
+        const reply = roundtrip(allocator, sock_path, req) orelse return false;
+        defer allocator.free(reply);
+        if (std.mem.indexOf(u8, reply, component_field) != null and
+            std.mem.indexOf(u8, reply, kind_field) != null and
+            std.mem.indexOf(u8, reply, value_field) != null) return true;
+    }
+    return false;
+}
+
 /// Declarative UI panels, end to end. What only a live run can prove:
 /// the renderer builds real widgets from a document, GTK gestures
 /// reach the event queue (the button click and the slider drag are
@@ -5126,7 +5478,94 @@ fn panelStage(
     }
     if (!got_change) return "dragging the slider produced no change event";
 
-    // 6. The image_compare, on a PANE face this time: two generated
+    // 6. A fixed-position scene mounts children in back-to-front order.
+    // The text input overlaps a selectable text leaf but is placed last;
+    // a center click must therefore focus the entry. Enter submits its
+    // value, clear_on_submit clears it locally, and a leaf patch updates
+    // the same focused GtkEntry in place.
+    const scene_req =
+        "{\"cmd\":\"panel-show\",\"name\":\"e2e\",\"session\":\"e2e-scope\",\"target\":\"window\"," ++
+        "\"document\":\"{\\\"version\\\":1,\\\"title\\\":\\\"Scene input\\\",\\\"root\\\":\\\"canvas\\\"," ++
+        "\\\"components\\\":{\\\"canvas\\\":{\\\"type\\\":\\\"scene\\\",\\\"width\\\":820,\\\"height\\\":580," ++
+        "\\\"children\\\":[{\\\"id\\\":\\\"behind\\\",\\\"x\\\":120,\\\"y\\\":250,\\\"width\\\":660,\\\"height\\\":64}," ++
+        "{\\\"id\\\":\\\"query\\\",\\\"x\\\":120,\\\"y\\\":250,\\\"width\\\":660,\\\"height\\\":64}]}," ++
+        "\\\"behind\\\":{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"behind\\\"}," ++
+        "\\\"query\\\":{\\\"type\\\":\\\"text_input\\\",\\\"placeholder\\\":\\\"Type here\\\",\\\"clear_on_submit\\\":true}}}\"}\n";
+    const scene_shown = roundtrip(allocator, sock_path, scene_req) orelse return "panel-show(scene) roundtrip";
+    defer allocator.free(scene_shown);
+    if (std.mem.indexOf(u8, scene_shown, "\"ok\":true") == null) return "panel-show(scene) not ok";
+    if ((parseNumAfter(scene_shown, "\"panel_id\":") orelse return "panel-show(scene) has no panel_id") != panel_id)
+        return "re-showing the scene changed the panel id";
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+    app.clickEx(win_id, cx, cy, 1, 100, 1) catch return "clicking the scene text_input failed";
+    app.typeText(win_id, "scene-submit") catch return "typing into the scene text_input failed";
+
+    const placeholder_patch = std.fmt.bufPrint(
+        &patch_buf,
+        "{{\"cmd\":\"panel-patch\",\"panel_id\":{d},\"session\":\"e2e-scope\",\"patch\":\"[{{\\\"op\\\":\\\"set\\\",\\\"id\\\":\\\"query\\\",\\\"component\\\":{{\\\"type\\\":\\\"text_input\\\",\\\"placeholder\\\":\\\"Updated\\\",\\\"clear_on_submit\\\":true}}}}]\"}}\n",
+        .{panel_id},
+    ) catch return "text_input placeholder patch fmt";
+    const placeholder_patched = roundtrip(allocator, sock_path, placeholder_patch) orelse
+        return "text_input placeholder patch roundtrip";
+    defer allocator.free(placeholder_patched);
+    if (std.mem.indexOf(u8, placeholder_patched, "\"ok\":true") == null)
+        return "text_input placeholder patch not ok";
+    app.pressKey(win_id, "Return") catch return "submitting the scene text_input failed";
+    if (!waitPanelTextEvent(allocator, app, sock_path, panel_id, "query", "submit", "scene-submit"))
+        return "the placeholder-only patch lost the focused text_input draft";
+    app.pressKey(win_id, "Return") catch return "resubmitting the cleared text_input failed";
+    if (!waitPanelTextEvent(allocator, app, sock_path, panel_id, "query", "submit", ""))
+        return "clear_on_submit did not clear the native entry locally";
+
+    app.typeText(win_id, "policy-draft") catch return "typing the clear-policy draft failed";
+    const clear_policy_patch = std.fmt.bufPrint(
+        &patch_buf,
+        "{{\"cmd\":\"panel-patch\",\"panel_id\":{d},\"session\":\"e2e-scope\",\"patch\":\"[{{\\\"op\\\":\\\"set\\\",\\\"id\\\":\\\"query\\\",\\\"component\\\":{{\\\"type\\\":\\\"text_input\\\",\\\"placeholder\\\":\\\"Updated\\\",\\\"clear_on_submit\\\":false}}}}]\"}}\n",
+        .{panel_id},
+    ) catch return "text_input clear-policy patch fmt";
+    const clear_policy_patched = roundtrip(allocator, sock_path, clear_policy_patch) orelse
+        return "text_input clear-policy patch roundtrip";
+    defer allocator.free(clear_policy_patched);
+    if (std.mem.indexOf(u8, clear_policy_patched, "\"ok\":true") == null)
+        return "text_input clear-policy patch not ok";
+    app.pressKey(win_id, "Return") catch return "submitting the clear-policy draft failed";
+    if (!waitPanelTextEvent(allocator, app, sock_path, panel_id, "query", "submit", "policy-draft"))
+        return "the clear_on_submit-only patch lost the focused text_input draft";
+    app.pressKey(win_id, "Return") catch return "resubmitting the retained clear-policy draft failed";
+    if (!waitPanelTextEvent(allocator, app, sock_path, panel_id, "query", "submit", "policy-draft"))
+        return "clear_on_submit=false did not retain the native entry value";
+
+    const input_patch = std.fmt.bufPrint(
+        &patch_buf,
+        "{{\"cmd\":\"panel-patch\",\"panel_id\":{d},\"session\":\"e2e-scope\",\"patch\":\"[{{\\\"op\\\":\\\"set\\\",\\\"id\\\":\\\"query\\\",\\\"component\\\":{{\\\"type\\\":\\\"text_input\\\",\\\"value\\\":\\\"patched\\\",\\\"placeholder\\\":\\\"Updated\\\",\\\"clear_on_submit\\\":false}}}}]\"}}\n",
+        .{panel_id},
+    ) catch return "text_input patch fmt";
+    const input_patched = roundtrip(allocator, sock_path, input_patch) orelse return "text_input patch roundtrip";
+    defer allocator.free(input_patched);
+    if (std.mem.indexOf(u8, input_patched, "\"ok\":true") == null) return "text_input patch not ok";
+    app.pressKey(win_id, "Return") catch return "submitting the patched text_input failed";
+    if (!waitPanelTextEvent(allocator, app, sock_path, panel_id, "query", "submit", "patched"))
+        return "the text_input leaf patch rebuilt the focused entry or failed to update its value";
+
+    // This is the ordered multi-op regression for the old GtkFixed crash:
+    // the first op changes the leaf kind, while the second removes it from
+    // the scene. The final document no longer names the old parent-child
+    // relation, but the live widget is still parented by GtkFixed until the
+    // transaction commits. No GtkBox API may be called on that parent.
+    var structural_buf: [768]u8 = undefined;
+    const structural_patch = std.fmt.bufPrint(
+        &structural_buf,
+        "{{\"cmd\":\"panel-patch\",\"panel_id\":{d},\"session\":\"e2e-scope\",\"patch\":\"[{{\\\"op\\\":\\\"set\\\",\\\"id\\\":\\\"query\\\",\\\"component\\\":{{\\\"type\\\":\\\"button\\\",\\\"text\\\":\\\"Detached\\\",\\\"action\\\":\\\"detached\\\"}}}},{{\\\"op\\\":\\\"set\\\",\\\"id\\\":\\\"canvas\\\",\\\"component\\\":{{\\\"type\\\":\\\"scene\\\",\\\"width\\\":820,\\\"height\\\":580,\\\"children\\\":[{{\\\"id\\\":\\\"behind\\\",\\\"x\\\":120,\\\"y\\\":250,\\\"width\\\":660,\\\"height\\\":64}}]}}}}]\"}}\n",
+        .{panel_id},
+    ) catch return "scene structural regression patch fmt";
+    const structural = roundtrip(allocator, sock_path, structural_patch) orelse
+        return "scene structural regression patch roundtrip";
+    defer allocator.free(structural);
+    if (std.mem.indexOf(u8, structural, "\"ok\":true") == null)
+        return "scene structural regression patch was refused";
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+
+    // 7. The image_compare, on a PANE face this time: two generated
     // images, then a drag that must move the split (i.e. repaint).
     const left_png = std.fmt.allocPrintSentinel(allocator, "{s}/panel-left.png", .{rt}, 0) catch return "alloc";
     defer allocator.free(left_png);
@@ -5243,7 +5682,7 @@ fn panelStage(
         std.mem.indexOf(u8, released_doc, right_png) != null)
         return "direct image removal left the document and resolver transaction divergent";
 
-    // 7. Close both. The compare panel sat ON pane 1, so closing it
+    // 8. Close both. The compare panel sat ON pane 1, so closing it
     // must give the pane back to its shell rather than close the tab.
     var close_buf: [128]u8 = undefined;
     const close_cmp = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"panel-close\",\"panel_id\":{d},\"session\":\"e2e-scope\"}}\n", .{cmp_id}) catch
@@ -8226,7 +8665,7 @@ fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const 
 
     // Attach before the GUI starts — the compositor brain is
     // client-side, so an unattended hub configures no toplevel.
-    dk_drive = appdrive.App.attachExisting(allocator, DEADKEY_SESSION, "be", mux_sock) catch
+    dk_drive = appdrive.App.attachExisting(allocator, DEADKEY_SESSION, "be", mux_sock, null) catch
         return "could not attach a viewer to the Belgian display session";
     const app = dk_drive.?;
 

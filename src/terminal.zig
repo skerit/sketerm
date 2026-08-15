@@ -2989,10 +2989,10 @@ pub const Terminal = struct {
         remote.conn.flushQueuedFor(remote.conn.write_timeout_ms) catch {};
         if (remote.conn.wbuf.items.len == 0) {
             if (remote.ephemeral) {
-                var kbuf: [128]u8 = undefined;
-                if (std.fmt.bufPrint(&kbuf, "{{\"name\":\"{s}\"}}", .{remote.session})) |payload| {
-                    remote.conn.sendFrame(.kill, payload) catch {};
-                } else |_| {}
+                remote.conn.sendKill(.{
+                    .name = remote.session,
+                    .origin_id = remote.origin_id,
+                }) catch {};
             } else {
                 remote.conn.sendFrame(.detach, "") catch {};
             }

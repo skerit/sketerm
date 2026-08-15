@@ -18,9 +18,10 @@
 //!   blocking on its own socket read does not need it.
 //! - A main-loop host that must not block instead sets `on_push`,
 //!   which fires on the pushing (main) thread after the lock is
-//!   released — arm an idle / complete a pending IPC reply from
-//!   there, then drain with `drainInto`. This is the zero-latency
-//!   path; `waitAny` is the convenience fallback.
+//!   released. Reliable consumers use `reliableInto`; legacy consumers
+//!   use the destructive `drainInto`. A legacy drain advances the shared
+//!   cursor and counts every removed event as unavailable to reliable retry;
+//!   sequence and cursor values never regress when readers are mixed.
 //! - `close()` makes further waits return immediately (within one
 //!   poll tick) and further pushes no-ops; pending events stay
 //!   drainable. It is how panel teardown unblocks a pending
@@ -32,10 +33,13 @@ const clock = @import("../../util/clock.zig");
 
 /// Longest component id (mirrored by doc.zig's id validation).
 pub const MAX_ID: usize = 64;
-/// Longest text payload an event carries (select options and button
-/// action names are bounded to this at document parse time).
-pub const MAX_TEXT: usize = 128;
-/// Ring capacity. Full queue drops the OLDEST event (the assistant
+/// Longest text payload an event carries. This accommodates submitted
+/// text_input values without allocating in GTK signal handlers.
+pub const MAX_TEXT: usize = 4096;
+/// Existing short interaction values (button actions and select
+/// options) retain their original bound.
+pub const MAX_SHORT_TEXT: usize = 128;
+/// Ring capacity. Full queue drops the OLDEST event (the consumer
 /// prefers fresh interactions over stale ones) and counts the drop.
 pub const CAP: usize = 64;
 
@@ -44,7 +48,7 @@ pub const CAP: usize = 64;
 /// that need instant delivery.
 const POLL_NS: c_long = 10 * std.time.ns_per_ms;
 
-pub const Kind = enum { click, change };
+pub const Kind = enum { click, change, submit };
 
 pub const Value = union(enum) {
     none: void,
@@ -54,7 +58,7 @@ pub const Value = union(enum) {
 
     pub const Text = struct {
         buf: [MAX_TEXT]u8 = undefined,
-        len: u8 = 0,
+        len: u16 = 0,
 
         pub fn slice(self: *const Text) []const u8 {
             return self.buf[0..self.len];
@@ -71,6 +75,8 @@ pub const Value = union(enum) {
 };
 
 pub const Event = struct {
+    /// Queue-assigned monotonic sequence. Zero means not queued yet.
+    seq: u64 = 0,
     id_buf: [MAX_ID]u8 = undefined,
     id_len: u8 = 0,
     kind: Kind = .click,
@@ -92,6 +98,10 @@ pub const Event = struct {
     }
 };
 
+/// Fixed resident queue storage per live panel, excluding the PanelView and
+/// transient heap scratch used to serialize a response.
+pub const STORAGE_BYTES: usize = @sizeOf(Event) * CAP;
+
 fn sleepBriefly() void {
     var ts: c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = POLL_NS };
     _ = c.nanosleep(&ts, null);
@@ -102,7 +112,11 @@ pub const Queue = struct {
     ring: [CAP]Event = undefined,
     head: usize = 0,
     count: usize = 0,
+    next_seq: u64 = 1,
+    /// Highest sequence returned or made unavailable by either reader mode.
+    reliable_cursor: u64 = 0,
     dropped: u64 = 0,
+    dropped_total: u64 = 0,
     closed: bool = false,
     /// Fired on the pushing thread, after the lock is released, once
     /// per successful push. For main-loop hosts that cannot block.
@@ -136,19 +150,35 @@ pub const Queue = struct {
             var coalesced = false;
             if (ev.kind == .change and self.count > 0) {
                 const last = &self.ring[(self.head + self.count - 1) % CAP];
-                if (last.kind == .change and std.mem.eql(u8, last.id(), ev.id())) {
-                    last.* = ev;
+                // Once a reliable reader has observed an event, replacing it
+                // would make a lost-reply retry return different bytes. Append
+                // after that cursor; only unseen tail changes may coalesce.
+                if (last.seq > self.reliable_cursor and last.kind == .change and std.mem.eql(u8, last.id(), ev.id())) {
+                    var replacement = ev;
+                    replacement.seq = last.seq;
+                    last.* = replacement;
                     coalesced = true;
                 }
             }
             if (!coalesced) {
-                if (self.count == CAP) {
-                    self.head = (self.head + 1) % CAP;
-                    self.count -= 1;
-                    self.dropped += 1;
+                // Never recycle sequence numbers. At u64 exhaustion, report
+                // every further event as dropped rather than making an old ack
+                // ambiguous with a new epoch.
+                if (self.next_seq == 0) {
+                    self.noteDropped();
+                    notify = true;
+                } else {
+                    if (self.count == CAP) {
+                        self.head = (self.head + 1) % CAP;
+                        self.count -= 1;
+                        self.noteDropped();
+                    }
+                    var queued = ev;
+                    queued.seq = self.next_seq;
+                    self.next_seq +%= 1;
+                    self.ring[(self.head + self.count) % CAP] = queued;
+                    self.count += 1;
                 }
-                self.ring[(self.head + self.count) % CAP] = ev;
-                self.count += 1;
             }
             notify = true;
         }
@@ -157,12 +187,23 @@ pub const Queue = struct {
         }
     }
 
+    fn noteDropped(self: *Queue) void {
+        self.dropped +|= 1;
+        self.dropped_total +|= 1;
+    }
+
+    fn noteReliableUnavailable(self: *Queue, ev: Event) void {
+        self.reliable_cursor = @max(self.reliable_cursor, ev.seq);
+        self.dropped_total +|= 1;
+    }
+
     /// Oldest pending event, or null. Non-blocking; main-thread safe.
     pub fn tryPop(self: *Queue) ?Event {
         self.acquire();
         defer self.release();
         if (self.count == 0) return null;
         const ev = self.ring[self.head];
+        self.noteReliableUnavailable(ev);
         self.head = (self.head + 1) % CAP;
         self.count -= 1;
         return ev;
@@ -175,10 +216,41 @@ pub const Queue = struct {
         var n: usize = 0;
         while (n < buf.len and self.count > 0) : (n += 1) {
             buf[n] = self.ring[self.head];
+            self.noteReliableUnavailable(buf[n]);
             self.head = (self.head + 1) % CAP;
             self.count -= 1;
         }
         return n;
+    }
+
+    pub const Reliable = struct {
+        count: usize,
+        cursor: u64,
+        dropped_total: u64,
+    };
+
+    /// Acknowledge only sequences this queue has previously returned, then
+    /// COPY all remaining events without removing them. A retry with the same
+    /// ack therefore repeats every unacknowledged event unless bounded
+    /// overflow explicitly increased dropped_total.
+    pub fn reliableInto(self: *Queue, ack: u64, buf: []Event) Reliable {
+        self.acquire();
+        defer self.release();
+        const effective_ack = @min(ack, self.reliable_cursor);
+        while (self.count > 0) {
+            const event = self.ring[self.head];
+            if (event.seq > effective_ack) break;
+            self.head = (self.head + 1) % CAP;
+            self.count -= 1;
+        }
+        const n = @min(buf.len, self.count);
+        for (0..n) |i| buf[i] = self.ring[(self.head + i) % CAP];
+        if (n > 0) self.reliable_cursor = @max(self.reliable_cursor, buf[n - 1].seq);
+        return .{
+            .count = n,
+            .cursor = self.reliable_cursor,
+            .dropped_total = self.dropped_total,
+        };
     }
 
     pub fn pending(self: *Queue) usize {
@@ -315,4 +387,100 @@ test "drainInto, on_push hook, and event payload accessors" {
     try std.testing.expectEqualStrings("epoch-41", buf[0].value.text.slice());
     try std.testing.expectEqualStrings("ok", buf[1].id());
     try std.testing.expect(buf[1].ts_ms >= buf[0].ts_ms);
+}
+
+test "submitted text preserves the full 4096-byte payload" {
+    const value = "x" ** MAX_TEXT;
+    const ev = Event.init("query", .submit, Value.fromText(value));
+    try std.testing.expectEqualStrings(value, ev.value.text.slice());
+    try std.testing.expectEqual(Kind.submit, ev.kind);
+}
+
+test "reliable reads retry exactly, acknowledge through cursor, and protect observed changes from coalescing" {
+    var q = Queue.init();
+    q.push(Event.init("slider", .change, .{ .number = 1 }));
+    var first_buf: [CAP]Event = undefined;
+    const first = q.reliableInto(0, &first_buf);
+    try std.testing.expectEqual(@as(usize, 1), first.count);
+    try std.testing.expectEqual(@as(u64, 1), first.cursor);
+
+    // This cannot replace seq 1 after it was returned but not acknowledged.
+    q.push(Event.init("slider", .change, .{ .number = 2 }));
+    var retry_buf: [CAP]Event = undefined;
+    const retry = q.reliableInto(0, &retry_buf);
+    try std.testing.expectEqual(@as(usize, 2), retry.count);
+    try std.testing.expectEqual(@as(u64, 1), retry_buf[0].seq);
+    try std.testing.expectEqual(@as(f64, 1), retry_buf[0].value.number);
+    try std.testing.expectEqual(@as(u64, 2), retry_buf[1].seq);
+
+    var remaining_buf: [CAP]Event = undefined;
+    const remaining = q.reliableInto(first.cursor, &remaining_buf);
+    try std.testing.expectEqual(@as(usize, 1), remaining.count);
+    try std.testing.expectEqual(@as(u64, 2), remaining_buf[0].seq);
+    const empty = q.reliableInto(remaining.cursor, &remaining_buf);
+    try std.testing.expectEqual(@as(usize, 0), empty.count);
+    try std.testing.expectEqual(@as(u64, 2), empty.cursor);
+}
+
+test "reliable overflow and mixed legacy loss are cumulative" {
+    var q = Queue.init();
+    for (0..CAP + 3) |i| {
+        var id_buf: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "e{d}", .{i});
+        q.push(Event.init(id, .click, .none));
+    }
+    var reliable_buf: [CAP]Event = undefined;
+    const snapshot = q.reliableInto(0, &reliable_buf);
+    try std.testing.expectEqual(@as(usize, CAP), snapshot.count);
+    try std.testing.expectEqual(@as(u64, 3), snapshot.dropped_total);
+    try std.testing.expectEqual(@as(u64, 4), reliable_buf[0].seq);
+    const retry = q.reliableInto(0, &reliable_buf);
+    try std.testing.expectEqual(snapshot.cursor, retry.cursor);
+    try std.testing.expectEqual(snapshot.dropped_total, retry.dropped_total);
+
+    var drained: [CAP]Event = undefined;
+    try std.testing.expectEqual(@as(usize, CAP), q.drainInto(&drained));
+    try std.testing.expectEqual(@as(usize, 0), q.pending());
+    try std.testing.expectEqual(@as(u64, 3), q.takeDropped());
+    try std.testing.expectEqual(@as(u64, 0), q.takeDropped());
+    const after_legacy = q.reliableInto(0, &reliable_buf);
+    try std.testing.expectEqual(@as(u64, CAP + 3), after_legacy.dropped_total);
+    try std.testing.expectEqual(snapshot.cursor, after_legacy.cursor);
+}
+
+test "legacy drain advances reliable loss and old acknowledgements cannot regress" {
+    var q = Queue.init();
+    q.push(Event.init("seen", .click, .none));
+    var reliable_buf: [CAP]Event = undefined;
+    const first = q.reliableInto(0, &reliable_buf);
+    try std.testing.expectEqual(@as(u64, 1), first.cursor);
+
+    // This event was never acknowledged by the reliable reader, but legacy
+    // semantics deliberately consume the complete shared queue.
+    q.push(Event.init("legacy-only", .click, .none));
+    var legacy_buf: [CAP]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 2), q.drainInto(&legacy_buf));
+    try std.testing.expectEqual(@as(u64, 2), q.reliable_cursor);
+
+    // The prior reliable cursor is no longer valid in this epoch. Sequence
+    // numbers never rewind, so presenting it cannot erase the fresh event.
+    q.push(Event.init("fresh", .click, .none));
+    const switched = q.reliableInto(first.cursor, &reliable_buf);
+    try std.testing.expectEqual(@as(usize, 1), switched.count);
+    try std.testing.expectEqualStrings("fresh", reliable_buf[0].id());
+    try std.testing.expectEqual(@as(u64, 3), switched.cursor);
+    try std.testing.expectEqual(@as(u64, 2), switched.dropped_total);
+}
+
+test "sequence exhaustion drops rather than wrapping into an ambiguous epoch" {
+    var q = Queue.init();
+    q.next_seq = std.math.maxInt(u64);
+    q.push(Event.init("last", .click, .none));
+    q.push(Event.init("wrapped", .click, .none));
+    try std.testing.expectEqual(@as(usize, 1), q.pending());
+    var buf: [CAP]Event = undefined;
+    const snapshot = q.reliableInto(0, &buf);
+    try std.testing.expectEqual(std.math.maxInt(u64), snapshot.cursor);
+    try std.testing.expectEqual(std.math.maxInt(u64), buf[0].seq);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.dropped_total);
 }

@@ -235,6 +235,12 @@ Three fences make that safe, and all three are needed:
   same shell, so the pane goes `.unavailable` instead of reattaching to
   something else. Session names are reusable; identities are not.
 
+Destructive lifecycle owners use the same identity for kill. The daemon
+advertises `kill_origin_fence:true` only when it enforces `KillReq.origin_id`;
+`Conn.sendKill` refuses a fenced request when that capability is absent instead
+of sending an additive field that an older daemon would silently ignore. Only
+callers that genuinely have no lifetime identity use the legacy name-only kill.
+
 The same machinery does the SSH -> UDP transport upgrade
 (`startTransportUpgrade` / `finishTransportUpgrade`), which is refused
 while an upload, download or recording is in flight.

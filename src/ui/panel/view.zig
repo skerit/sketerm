@@ -25,10 +25,10 @@
 //!   wait contract).
 //!
 //! Patching: `applyPatch` updates leaf widgets IN PLACE (label text,
-//! slider value, progress fraction, image file, compare sides — the
+//! text input, slider value, progress fraction, image file, compare sides — the
 //! compare keeps its zoom/pan/split across an image swap, which is
-//! the epoch-by-epoch training loop working as intended). Structural
-//! changes (children lists, root swap, removals, kind or class
+//! useful across repeated comparisons). Structural
+//! changes (flow/scene children, root swap, removals, kind or class
 //! changes) rebuild the affected tree wholesale — correctness first,
 //! and a panel is bounded at 512 components.
 
@@ -115,6 +115,13 @@ pub const PanelView = struct {
         picture: ?*c.GtkWidget = null,
         caption: ?*c.GtkWidget = null,
         compare: ?*Compare = null,
+    };
+
+    const PreservedInput = struct {
+        id: []u8,
+        declared_value: []u8,
+        draft: ?[]u8,
+        focused: bool,
     };
 
     // ---- lifecycle ---------------------------------------------------
@@ -261,6 +268,9 @@ pub const PanelView = struct {
         diag: ?*Doc.Diag,
     ) Doc.Error!void {
         var fresh = try Doc.Document.parse(self.allocator, json_text, diag);
+        errdefer fresh.deinit();
+        var preserved = try self.captureInputs(&fresh);
+        defer self.freePreservedInputs(&preserved);
         if (self.doc) |*old| {
             fresh.revision = old.revision + 1;
             old.deinit();
@@ -271,6 +281,7 @@ pub const PanelView = struct {
             self.applying = true;
             defer self.applying = false;
             self.rebuildAll();
+            self.restoreInputs(preserved.items);
         }
         self.notifyChanged();
     }
@@ -302,13 +313,15 @@ pub const PanelView = struct {
             if (diag) |d| d.set("no document to patch (setDocument first)", .{});
             return Doc.Error.Malformed;
         }
+        var preserved = try self.captureInputs(null);
+        defer self.freePreservedInputs(&preserved);
         var applied = try self.doc.?.applyPatch(json_text, diag);
         defer applied.deinit();
         if (resolver) |prepared| self.asset_resolver.replaceFrom(prepared);
         if (!self.widgets_dead) {
             self.applying = true;
             defer self.applying = false;
-            var rebuild = applied.root_changed or applied.removed.len > 0;
+            var rebuild = self.patchNeedsStructuralRebuild(&applied);
             if (!rebuild) {
                 for (applied.set) |id| {
                     if (!self.updateOne(id)) {
@@ -322,8 +335,93 @@ pub const PanelView = struct {
             } else if (resolver != null) {
                 self.refreshImages();
             }
+            self.restoreInputs(preserved.items);
         }
         if (applied.title_changed) self.notifyChanged();
+    }
+
+    /// Decide structural rebuilds before touching any live leaf. The document
+    /// already contains the whole multi-op result, while `built` still mirrors
+    /// the old GTK tree; updating a leaf first can therefore see it as
+    /// unmounted even though its live parent is still a GtkFixed.
+    fn patchNeedsStructuralRebuild(self: *const PanelView, applied: *const Doc.Document.Applied) bool {
+        if (applied.root_changed or applied.removed.len > 0) return true;
+        const document = &(self.doc orelse return true);
+        for (applied.set) |id| {
+            const old = self.built.get(id) orelse continue;
+            const new = document.get(id) orelse continue;
+            if (old.kind.isContainer() or new.kind().isContainer()) return true;
+        }
+        return false;
+    }
+
+    fn captureInputs(self: *const PanelView, fresh: ?*const Doc.Document) Doc.Error!std.ArrayList(PreservedInput) {
+        var preserved: std.ArrayList(PreservedInput) = .empty;
+        errdefer self.freePreservedInputs(&preserved);
+        if (self.widgets_dead) return preserved;
+        const old = &(self.doc orelse return preserved);
+        var it = old.components.iterator();
+        while (it.next()) |entry| {
+            const old_input = switch (entry.value_ptr.props) {
+                .text_input => |input| input,
+                else => continue,
+            };
+            const next_input = if (fresh) |document| blk: {
+                const component = document.get(entry.key_ptr.*) orelse continue;
+                break :blk switch (component.props) {
+                    .text_input => |input| input,
+                    else => continue,
+                };
+            } else old_input;
+            const built = self.built.get(entry.key_ptr.*) orelse continue;
+            if (built.kind != .text_input) continue;
+            const focused = (c.gtk_widget_get_state_flags(built.widget) & c.GTK_STATE_FLAG_FOCUS_WITHIN) != 0;
+            const keep_draft = std.mem.eql(u8, old_input.value, next_input.value);
+            if (!focused and !keep_draft) continue;
+            const id = self.allocator.dupe(u8, entry.key_ptr.*) catch return Doc.Error.OutOfMemory;
+            errdefer self.allocator.free(id);
+            const declared_value = self.allocator.dupe(u8, old_input.value) catch return Doc.Error.OutOfMemory;
+            errdefer self.allocator.free(declared_value);
+            var draft: ?[]u8 = null;
+            if (keep_draft) {
+                const raw = c.gtk_editable_get_text(@ptrCast(built.widget));
+                const text = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+                const n = utf8Prefix(text, Doc.MAX_TEXT);
+                draft = self.allocator.dupe(u8, text[0..n]) catch return Doc.Error.OutOfMemory;
+            }
+            errdefer if (draft) |text| self.allocator.free(text);
+            preserved.append(self.allocator, .{
+                .id = id,
+                .declared_value = declared_value,
+                .draft = draft,
+                .focused = focused,
+            }) catch
+                return Doc.Error.OutOfMemory;
+        }
+        return preserved;
+    }
+
+    fn freePreservedInputs(self: *const PanelView, preserved: *std.ArrayList(PreservedInput)) void {
+        for (preserved.items) |input| {
+            self.allocator.free(input.id);
+            self.allocator.free(input.declared_value);
+            if (input.draft) |draft| self.allocator.free(draft);
+        }
+        preserved.deinit(self.allocator);
+    }
+
+    fn restoreInputs(self: *PanelView, preserved: []const PreservedInput) void {
+        for (preserved) |input| {
+            const built = self.built.get(input.id) orelse continue;
+            if (built.kind != .text_input) continue;
+            const document = &(self.doc orelse continue);
+            const component = document.get(input.id) orelse continue;
+            if (component.kind() != .text_input) continue;
+            if (std.mem.eql(u8, input.declared_value, component.props.text_input.value)) {
+                if (input.draft) |draft| setEntryValue(built.widget, draft);
+            }
+            if (input.focused) _ = c.gtk_widget_grab_focus(built.widget);
+        }
     }
 
     /// The live document in `Document.toJson`'s canonical form (sorted
@@ -404,7 +502,20 @@ pub const PanelView = struct {
         self.built = .empty;
     }
 
+    fn parkContentFocus(self: *PanelView) void {
+        const root = c.gtk_widget_get_root(self.scroller) orelse return;
+        const focused = c.gtk_root_get_focus(@ptrCast(root)) orelse return;
+        if (focused == self.scroller or
+            c.gtk_widget_is_ancestor(focused, self.scroller) != 0)
+        {
+            _ = c.gtk_widget_grab_focus(self.scroller);
+        }
+    }
+
     fn rebuildAll(self: *PanelView) void {
+        // Keep GTK's focus pointer out of the subtree that set_child replaces.
+        // Full document replacement may restore a preserved input afterwards.
+        self.parkContentFocus();
         self.clearBuilt();
         if (self.widgets_dead) return;
         const d = &(self.doc orelse {
@@ -444,6 +555,23 @@ pub const PanelView = struct {
                     c.gtk_box_append(@ptrCast(box), self.buildComponent(child, depth + 1, is_col));
                 }
                 break :blk box;
+            },
+            .scene => |scene| blk: {
+                const fixed = c.gtk_fixed_new().?;
+                setMinimumRequest(fixed, scene.width, scene.height);
+                for (scene.children) |placement| {
+                    const child = self.buildComponent(placement.id, depth + 1, true);
+                    // GtkFixed positions the child, but GTK size requests are
+                    // minima: natural sizing may allocate more than this box.
+                    setMinimumRequest(child, placement.width, placement.height);
+                    c.gtk_fixed_put(
+                        @ptrCast(fixed),
+                        child,
+                        @floatFromInt(placement.x),
+                        @floatFromInt(placement.y),
+                    );
+                }
+                break :blk fixed;
             },
             .heading => |h| blk: {
                 const label = self.textLabel(h.text);
@@ -524,6 +652,14 @@ pub const PanelView = struct {
                     if (vertical) c.gtk_widget_set_vexpand(box, 1) else c.gtk_widget_set_hexpand(box, 1);
                 }
                 break :blk box;
+            },
+            .text_input => |input| blk: {
+                const entry = c.gtk_entry_new().?;
+                c.gtk_entry_set_max_length(@ptrCast(entry), @intCast(Doc.MAX_TEXT));
+                setTextInput(entry, input);
+                self.connectComp(entry, "changed", @ptrCast(&onTextInputChanged), id);
+                self.connectComp(entry, "activate", @ptrCast(&onTextInputActivate), id);
+                break :blk entry;
             },
         };
 
@@ -669,6 +805,8 @@ pub const PanelView = struct {
             .progress => |p| setProgress(entry.widget, p),
             .separator => {},
             .spacer => return self.swapOne(id, entry.*),
+            .scene => unreachable,
+            .text_input => |input| setTextInput(entry.widget, input),
         }
         return true;
     }
@@ -683,8 +821,13 @@ pub const PanelView = struct {
         if (comp.kind().isContainer() or entry.kind.isContainer()) return false;
         const old = entry.widget;
         const parent = c.gtk_widget_get_parent(old) orelse return false;
-        // By construction every non-root component widget lives in a
-        // container's GtkBox.
+        // The live widget tree still reflects the pre-patch document. Never
+        // infer its parent type from the already-updated model: a multi-op
+        // patch may have removed this leaf from an old GtkFixed scene.
+        if (c.g_type_check_instance_is_a(
+            @ptrCast(@alignCast(parent)),
+            c.gtk_box_get_type(),
+        ) == 0) return false;
         const vertical = c.gtk_orientable_get_orientation(@ptrCast(@alignCast(parent))) == c.GTK_ORIENTATION_VERTICAL;
         const fresh = self.buildComponent(id, 1, vertical);
         c.gtk_box_insert_child_after(@ptrCast(parent), fresh, old);
@@ -704,6 +847,9 @@ pub const PanelView = struct {
         switch (comp.props) {
             .column, .row => |cont| for (cont.children) |child| {
                 if (reachFrom(d, child, id, depth + 1)) return true;
+            },
+            .scene => |scene| for (scene.children) |placement| {
+                if (reachFrom(d, placement.id, id, depth + 1)) return true;
             },
             else => {},
         }
@@ -807,6 +953,41 @@ pub const PanelView = struct {
         if (idx == c.GTK_INVALID_LIST_POSITION or idx >= options.len) return;
         view.queue.push(events.Event.init(ctx.id, .change, events.Value.fromText(options[idx])));
     }
+
+    fn onTextInputChanged(editable: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
+        const ctx = canary.live(CompCtx, user) orelse return;
+        const view = ctx.view orelse return;
+        if (view.widgets_dead or view.applying) return;
+        const raw = c.gtk_editable_get_text(editable) orelse return;
+        const text = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+        if (text.len <= Doc.MAX_TEXT) return;
+        const n = utf8Prefix(text, Doc.MAX_TEXT);
+        var zbuf: [Doc.MAX_TEXT + 1]u8 = undefined;
+        @memcpy(zbuf[0..n], text[0..n]);
+        zbuf[n] = 0;
+        view.applying = true;
+        defer view.applying = false;
+        c.gtk_editable_set_text(editable, @ptrCast(&zbuf));
+        c.gtk_editable_set_position(editable, -1);
+    }
+
+    fn onTextInputActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
+        const ctx = canary.live(CompCtx, user) orelse return;
+        const view = ctx.view orelse return;
+        if (view.widgets_dead or view.applying) return;
+        const d = &(view.doc orelse return);
+        const comp = d.get(ctx.id) orelse return;
+        if (comp.kind() != .text_input) return;
+        const raw = c.gtk_editable_get_text(@ptrCast(entry)) orelse return;
+        const text = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+        const n = utf8Prefix(text, Doc.MAX_TEXT);
+        view.queue.push(events.Event.init(ctx.id, .submit, events.Value.fromText(text[0..n])));
+        if (comp.props.text_input.clear_on_submit) {
+            view.applying = true;
+            defer view.applying = false;
+            c.gtk_editable_set_text(@ptrCast(entry), "");
+        }
+    }
 };
 
 /// Pair GtkPicture's internal pixbuf ref with the same residency lease.
@@ -853,6 +1034,35 @@ fn headingClass(level: u8) [*:0]const u8 {
 fn setLabelText(label: *c.GtkWidget, text: []const u8) void {
     var zbuf: [Doc.MAX_TEXT + 1]u8 = undefined;
     c.gtk_label_set_text(@ptrCast(label), zOf(&zbuf, text));
+}
+
+fn setTextInput(entry: *c.GtkWidget, input: Doc.Props.TextInput) void {
+    setEntryValue(entry, input.value);
+    var placeholder_buf: [Doc.MAX_TEXT + 1]u8 = undefined;
+    c.gtk_entry_set_placeholder_text(@ptrCast(entry), zOf(&placeholder_buf, input.placeholder));
+}
+
+fn setEntryValue(entry: *c.GtkWidget, value: []const u8) void {
+    var value_buf: [Doc.MAX_TEXT + 1]u8 = undefined;
+    c.gtk_editable_set_text(@ptrCast(entry), zOf(&value_buf, value));
+}
+
+const MinimumRequest = struct { width: c_int, height: c_int };
+
+fn minimumRequest(width: u16, height: u16) MinimumRequest {
+    return .{ .width = @intCast(width), .height = @intCast(height) };
+}
+
+fn setMinimumRequest(widget: *c.GtkWidget, width: u16, height: u16) void {
+    const request = minimumRequest(width, height);
+    c.gtk_widget_set_size_request(widget, request.width, request.height);
+}
+
+fn utf8Prefix(text: []const u8, max: usize) usize {
+    if (text.len <= max and std.unicode.utf8ValidateSlice(text)) return text.len;
+    var end = @min(text.len, max);
+    while (end > 0 and !std.unicode.utf8ValidateSlice(text[0..end])) end -= 1;
+    return end;
 }
 
 /// Bounded stack null-termination (doc.zig caps every text at
@@ -1021,8 +1231,8 @@ const Compare = struct {
     }
 
     /// (Re)load both sides. Zoom/pan/split are deliberately KEPT: a
-    /// training loop patching in the next epoch's frames while the
-    /// user is zoomed onto an artifact must not reset the viewport.
+    /// replacing compared media while the user is inspecting a detail
+    /// must not reset the viewport.
     fn setSides(self: *Compare, ic: Doc.Props.ImageCompare, resolver: *const assets.Resolver) void {
         self.loadSide(&self.left_lease, &self.left_path, &self.left_error, &self.left_label, ic.left, resolver);
         self.loadSide(&self.right_lease, &self.right_path, &self.right_error, &self.right_label, ic.right, resolver);
@@ -1416,6 +1626,52 @@ test "optionsHash tracks option-list identity" {
     try std.testing.expectEqual(optionsHash(&opts1), optionsHash(&opts2));
     // The separator keeps "one","two" distinct from "onet","wo".
     try std.testing.expect(optionsHash(&opts1) != optionsHash(&opts3));
+}
+
+test "text input byte limiting preserves UTF-8 boundaries" {
+    try std.testing.expectEqual(@as(usize, 4096), utf8Prefix("x" ** 5000, 4096));
+    try std.testing.expectEqual(@as(usize, 1), utf8Prefix("A\xe2\x82\xacB", 3));
+    try std.testing.expectEqual(@as(usize, 4), utf8Prefix("A\xe2\x82\xacB", 4));
+}
+
+test "scene geometry maps declared sizes to GTK minimum requests" {
+    try std.testing.expectEqual(MinimumRequest{ .width = 4096, .height = 1 }, minimumRequest(4096, 1));
+}
+
+test "multi-op leaf replacement before scene unmount preflights a rebuild" {
+    const a = std.testing.allocator;
+    const document = try Doc.Document.parse(a,
+        \\{"root":"canvas","components":{
+        \\ "canvas":{"type":"scene","width":100,"height":100,"children":[{"id":"leaf","x":0,"y":0,"width":20,"height":20}]},
+        \\ "leaf":{"type":"text","text":"old"}}}
+    , null);
+    var view = PanelView{
+        .allocator = a,
+        .doc = document,
+        .asset_resolver = assets.Resolver.init(a, null),
+        .queue = events.Queue.init(),
+        .root_box = undefined,
+        .scroller = undefined,
+    };
+    defer {
+        view.clearBuilt();
+        view.doc.?.deinit();
+        view.asset_resolver.deinit();
+    }
+    try view.built.put(a, try a.dupe(u8, "canvas"), .{ .widget = undefined, .kind = .scene });
+    try view.built.put(a, try a.dupe(u8, "leaf"), .{ .widget = undefined, .kind = .text });
+
+    // Operation order is the regression: the leaf changes kind before the
+    // scene unmounts it. Without preflight, swapOne sees the NEW graph, misses
+    // the scene parent, and invokes GtkBox APIs on the OLD live GtkFixed.
+    var applied = try view.doc.?.applyPatch(
+        \\[
+        \\ {"op":"set","id":"leaf","component":{"type":"button","text":"new"}},
+        \\ {"op":"set","id":"canvas","component":{"type":"scene","width":100,"height":100,"children":[]}}
+        \\]
+    , null);
+    defer applied.deinit();
+    try std.testing.expect(view.patchNeedsStructuralRebuild(&applied));
 }
 
 test "image compare preserves both path-specific decode failures" {

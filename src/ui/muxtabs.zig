@@ -431,7 +431,10 @@ pub fn makeRemotePaneFromSnap(
         errdefer {
             if (ephemeral) {
                 conn.setNonBlocking();
-                conn.queueJson(.kill, .{ .name = name }) catch {};
+                conn.queueKill(.{
+                    .name = name,
+                    .origin_id = identity.originId(),
+                }) catch {};
             }
             conn.deinit();
         }
@@ -859,6 +862,22 @@ pub fn attachMuxLease(self: *Window, conn_in: @import("../mux/client.zig").Conn,
 
 /// Finish an attach whose transport handshake and snapshot ran off-thread.
 pub fn attachMuxPrepared(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, snapshot_payload: []const u8, identity: @import("../mux/client.zig").AttachIdentity, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile, lease: Lease) !void {
+    _ = try attachMuxPreparedMode(self, conn_in, name, host, snapshot_payload, identity, takeover, profile, lease, false);
+}
+
+pub const PreparedTab = struct {
+    pane: *Pane,
+    page: *c.AdwTabPage,
+};
+
+/// Finish an off-thread attach in a new selected tab, including app sessions
+/// that ordinary app-view policy would otherwise keep tabless.
+pub fn attachMuxPreparedTab(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, snapshot_payload: []const u8, identity: @import("../mux/client.zig").AttachIdentity, lease: Lease) !PreparedTab {
+    return (try attachMuxPreparedMode(self, conn_in, name, host, snapshot_payload, identity, null, null, lease, true)) orelse
+        error.TabPlacementFailed;
+}
+
+fn attachMuxPreparedMode(self: *Window, conn_in: @import("../mux/client.zig").Conn, name: []const u8, host: ?[]const u8, snapshot_payload: []const u8, identity: @import("../mux/client.zig").AttachIdentity, takeover: ?*Pane, profile: ?*const @import("../config.zig").Profile, lease: Lease, force_tab: bool) !?PreparedTab {
     var conn = conn_in;
 
     // App sessions in window view mode attach TABLESS (their
@@ -870,14 +889,16 @@ pub fn attachMuxPrepared(self: *Window, conn_in: @import("../mux/client.zig").Co
         conn.deinit();
         return error.BadSnapshot;
     };
-    if (takeover == null and self.config.app_view == .window and envelope.app) {
-        return attachMuxApp(self, conn, name, host, snapshot_payload, identity, lease == .read_only, lease == .control);
+    if (!force_tab and takeover == null and self.config.app_view == .window and envelope.app) {
+        try attachMuxApp(self, conn, name, host, snapshot_payload, identity, lease == .read_only, lease == .control);
+        return null;
     }
 
     crashlog.set("mux attach '{s}' @ {s} takeover={} - building pane", .{ name, host orelse "local", takeover != null });
     const pane = try makeRemotePaneFromSnap(self, conn, name, host, snapshot_payload, identity, null, lease == .read_only, lease == .control, false);
     pane.active_profile = if (profile) |p| p.name else null;
     self.applyPaneConfig(pane, .{ .profile = profile });
+    if (force_tab) pane.app_view_tab = true;
 
     var title_buf: [160:0]u8 = undefined;
     const title_z = if (host) |h|
@@ -905,6 +926,7 @@ pub fn attachMuxPrepared(self: *Window, conn_in: @import("../mux/client.zig").Co
     c.adw_tab_page_set_tooltip(page, title_z.ptr);
     c.adw_tab_view_set_selected_page(self.tab_view, page);
     _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
+    return .{ .pane = pane, .page = page };
 }
 
 // ── tabless app-session callbacks (Terminal → AppSession) ────────

@@ -234,7 +234,7 @@ pub fn main() u8 {
 
     // Attach the compositor brain BEFORE the GUI: nothing configures
     // the toplevel otherwise and the window never paints.
-    drive = appdrive.App.attachExisting(allocator, DISPLAY_SESSION, null, mux_sock) catch {
+    drive = appdrive.App.attachExisting(allocator, DISPLAY_SESSION, null, mux_sock, null) catch {
         _ = c.fprintf(platform.stderr(), "smoke-atspi: attach said: %s\n", appdrive.lastLaunchErr().ptr);
         return fail("could not attach a viewer to the display session");
     };

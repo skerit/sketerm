@@ -74,6 +74,19 @@ pub const Request = struct {
     /// panel-patch / panel-events / panel-close: the handle panel-show
     /// returned.
     panel_id: ?u32 = null,
+    /// panel-events-reliable: acknowledge all previously returned events
+    /// through this sequence before peeking the remaining queue.
+    ack: u64 = 0,
+    /// Reliable event sequence identity. Omit or send empty only for initial
+    /// discovery with ack=0; retries and acknowledgements echo the epoch.
+    event_epoch: ?[]const u8 = null,
+    /// panel-open-session: exact target session and immutable lifetime fence.
+    /// Transport and placement are derived from the relayed source Terminal.
+    mux_session: ?[]const u8 = null,
+    mux_origin_id: ?[]const u8 = null,
+    /// Required idempotency key for panel-open-session. Safe ASCII, at most
+    /// 128 bytes; retries reuse it and receive the original result.
+    request_token: ?[]const u8 = null,
 
     // ---- web-* (browser views, src/ui/webface.zig) --------------------
     //
@@ -140,6 +153,7 @@ pub const TabInfo = struct {
 /// One live panel, as reported by `panel-list`.
 pub const PanelInfo = struct {
     panel_id: u32,
+    event_epoch: []const u8,
     name: []const u8,
     session: []const u8,
     title: []const u8,
@@ -151,6 +165,8 @@ pub const PanelInfo = struct {
 /// null / number / bool / string depending on the component; `ts` is
 /// monotonic milliseconds (ordering and deltas only, not wall time).
 pub const PanelEvent = struct {
+    /// Monotonic sequence assigned by the live panel queue.
+    seq: u64 = 0,
     component: []const u8,
     kind: []const u8,
     value: std.json.Value,
@@ -210,6 +226,23 @@ pub fn writeErr(out: *std.ArrayList(u8), allocator: std.mem.Allocator, msg: []co
     try out.appendSlice(allocator, aw.written());
 }
 
+pub fn writeErrCode(
+    out: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+    code: []const u8,
+    msg: []const u8,
+) !void {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    const w = &aw.writer;
+    try w.writeAll("{\"ok\":false,\"error\":");
+    try std.json.Stringify.value(msg, .{}, w);
+    try w.writeAll(",\"error_code\":");
+    try std.json.Stringify.value(code, .{}, w);
+    try w.writeAll("}\n");
+    try out.appendSlice(allocator, aw.written());
+}
+
 test "parseRequest: minimal + addressed" {
     const a = std.testing.allocator;
     var p1 = try parseRequest(a, "{\"cmd\":\"list\"}");
@@ -236,9 +269,11 @@ test "parseRequest: panel-* fields" {
     try std.testing.expectEqualStrings("window", p.value.target.?);
     try std.testing.expectEqualStrings("{\"root\":\"r\"}", p.value.document.?);
 
-    var p2 = try parseRequest(a, "{\"cmd\":\"panel-events\",\"panel_id\":7}");
+    var p2 = try parseRequest(a, "{\"cmd\":\"panel-events-reliable\",\"panel_id\":7,\"ack\":42,\"event_epoch\":\"10000000000000000000000000000001\"}");
     defer p2.deinit();
     try std.testing.expectEqual(@as(?u32, 7), p2.value.panel_id);
+    try std.testing.expectEqual(@as(u64, 42), p2.value.ack);
+    try std.testing.expectEqualStrings("10000000000000000000000000000001", p2.value.event_epoch.?);
 }
 
 test "writeOkFlat merges payload fields at the top level" {
@@ -257,15 +292,36 @@ test "writeOkFlat merges payload fields at the top level" {
     // Panel event array shape, including a null and a string value.
     out.clearRetainingCapacity();
     const evs = [_]PanelEvent{
-        .{ .component = "ok", .kind = "click", .value = .null, .ts = 5 },
-        .{ .component = "pick", .kind = "change", .value = .{ .string = "epoch 41" }, .ts = 6 },
+        .{ .seq = 1, .component = "ok", .kind = "click", .value = .null, .ts = 5 },
+        .{ .seq = 2, .component = "pick", .kind = "change", .value = .{ .string = "epoch 41" }, .ts = 6 },
     };
     try writeOkFlat(&out, a, .{ .events = evs[0..], .dropped = @as(u32, 2) });
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"value\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"value\":\"epoch 41\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"seq\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"dropped\":2") != null);
     // NDJSON framing: the whole reply is one line.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, out.items, "\n"));
+}
+
+test "panel submit event serializes a 4096-byte value without truncation" {
+    const a = std.testing.allocator;
+    const submitted = "q" ** 4096;
+    const evs = [_]PanelEvent{.{
+        .component = "query",
+        .kind = "submit",
+        .value = .{ .string = submitted },
+        .ts = 9,
+    }};
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try writeOkFlat(&out, a, .{ .events = evs[0..], .dropped = @as(u32, 0) });
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, out.items, .{});
+    defer parsed.deinit();
+    const event = parsed.value.object.get("events").?.array.items[0].object;
+    try std.testing.expectEqualStrings("submit", event.get("kind").?.string);
+    try std.testing.expectEqualStrings(submitted, event.get("value").?.string);
 }
 
 test "parseRequest: unknown fields ignored, junk rejected" {

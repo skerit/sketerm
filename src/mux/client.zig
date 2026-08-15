@@ -288,6 +288,10 @@ pub const Conn = struct {
     udp_tickets: bool = false,
     /// Display output geometry and guarded display-only kill requests.
     display_v2: bool = false,
+    /// Daemon enforces KillReq.origin_id before resolving a destructive kill.
+    /// Older daemons silently ignore that additive field, so fenced callers
+    /// must refuse unless this welcome capability is present.
+    kill_origin_fence: bool = false,
     /// Daemon answers `lsp_open` (welcome capability): it can spawn a
     /// language server near the files and bridge its stdio as a byte
     /// channel. Absent = degrade silently, like a missing server.
@@ -463,6 +467,7 @@ pub const Conn = struct {
         self.durable_copy = false;
         self.copy_no_replace = false;
         self.display_v2 = false;
+        self.kill_origin_fence = false;
         self.lsp_support = false;
         self.cast_playback = false;
         self.web_store = false;
@@ -481,6 +486,7 @@ pub const Conn = struct {
             durable_copy: bool = false,
             copy_no_replace: bool = false,
             display_v2: bool = false,
+            kill_origin_fence: bool = false,
             lsp: bool = false,
             cast_playback: bool = false,
             web_store: bool = false,
@@ -504,6 +510,7 @@ pub const Conn = struct {
             self.durable_copy = parsed.value.durable_copy;
             self.copy_no_replace = parsed.value.copy_no_replace;
             self.display_v2 = parsed.value.display_v2;
+            self.kill_origin_fence = parsed.value.kill_origin_fence;
             self.lsp_support = parsed.value.lsp;
             self.cast_playback = parsed.value.cast_playback;
             self.web_store = parsed.value.web_store;
@@ -1307,6 +1314,24 @@ pub const Conn = struct {
         try self.sendFrame(ftype, aw.written());
     }
 
+    /// Send a name-only legacy kill or a negotiated lifetime-fenced kill.
+    pub fn sendKill(self: *Conn, req: wire.KillReq) !void {
+        if (req.origin_id.len > 0) {
+            if (!wire.validSessionOriginId(req.origin_id)) return error.InvalidSessionOriginId;
+            if (!self.kill_origin_fence) return error.KillOriginFenceUnsupported;
+        }
+        try self.sendJson(.kill, req);
+    }
+
+    /// Nonblocking `sendKill` variant for GUI teardown paths.
+    pub fn queueKill(self: *Conn, req: wire.KillReq) !void {
+        if (req.origin_id.len > 0) {
+            if (!wire.validSessionOriginId(req.origin_id)) return error.InvalidSessionOriginId;
+            if (!self.kill_origin_fence) return error.KillOriginFenceUnsupported;
+        }
+        try self.queueJson(.kill, req);
+    }
+
     /// queueFrame's JSON twin: never waits on the fd. The caller owns
     /// flushing any wbuf remainder (a POLLOUT watch or pump loop).
     pub fn queueJson(self: *Conn, ftype: wire.FrameType, value: anytype) !void {
@@ -1724,6 +1749,49 @@ fn connectPanelRequesterUntil(
     return connectPanelRequesterUntilExpected(allocator, sock_path, session, "", deadline_ms, active_fd);
 }
 
+/// Atomically claim, interrupt, and close a requester cancellation fd.
+/// Callers must use this instead of load+shutdown so the worker cannot close
+/// and reuse the descriptor between those two operations.
+pub fn cancelPanelRequesterFd(slot: *std.atomic.Value(c_int)) void {
+    const fd = slot.swap(-1, .acq_rel);
+    if (fd < 0) return;
+    _ = c.shutdown(fd, c.SHUT_RDWR);
+    _ = c.close(fd);
+}
+
+/// Atomically retire a published cancellation duplicate without interrupting
+/// the underlying socket after a requester operation completed normally.
+pub fn releasePanelRequesterFd(slot: *std.atomic.Value(c_int)) void {
+    clearPanelRequesterFd(slot);
+}
+
+fn clearPanelRequesterFd(slot: ?*std.atomic.Value(c_int)) void {
+    const active = slot orelse return;
+    const fd = active.swap(-1, .acq_rel);
+    if (fd >= 0) _ = c.close(fd);
+}
+
+fn publishPanelRequesterFd(slot: ?*std.atomic.Value(c_int), source_fd: c_int) !void {
+    const active = slot orelse return;
+    clearPanelRequesterFd(active);
+    const cancel_fd = c.fcntl(source_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
+    if (cancel_fd < 0) return error.CancelFdFailed;
+    active.store(cancel_fd, .release);
+}
+
+fn classifyPanelRequesterAttachError(conn: *const Conn, err: anyerror) anyerror {
+    if (err != error.DaemonError) return err;
+    if (std.mem.eql(u8, conn.lastErr(), "no such session")) return error.PanelSessionNotFound;
+    if (std.mem.eql(u8, conn.lastErr(), "session origin identity changed"))
+        return error.SessionOriginMismatch;
+    return err;
+}
+
+/// Errors that prove the requested session lifetime is absent at this daemon.
+pub fn panelRequesterKnownAbsent(err: anyerror) bool {
+    return err == error.PanelSessionNotFound or err == error.SessionOriginMismatch;
+}
+
 /// Panel-only attach with an optional immutable lifetime fence.
 pub fn connectPanelRequesterUntilExpected(
     allocator: std.mem.Allocator,
@@ -1740,8 +1808,8 @@ pub fn connectPanelRequesterUntilExpected(
     errdefer {
         if (fd_owned) _ = c.close(fd);
     }
-    if (active_fd) |slot| slot.store(fd, .release);
-    errdefer if (active_fd) |slot| slot.store(-1, .release);
+    try publishPanelRequesterFd(active_fd, fd);
+    defer clearPanelRequesterFd(active_fd);
 
     const flags = c.fcntl(fd, c.F_GETFL);
     if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) != 0)
@@ -1795,11 +1863,8 @@ pub fn connectPanelRequesterUntilExpected(
     }, deadline_ms);
     remain = deadline_ms - monotonicMs();
     if (remain <= 0) return error.Timeout;
-    const ok = conn.recvExpectFor(&.{.ok}, remain) catch |err| {
-        if (err == error.DaemonError and std.mem.eql(u8, conn.lastErr(), "session origin identity changed"))
-            return error.SessionOriginMismatch;
-        return err;
-    };
+    const ok = conn.recvExpectFor(&.{.ok}, remain) catch |err|
+        return classifyPanelRequesterAttachError(&conn, err);
     defer ok.deinit(allocator);
     const Attached = struct {
         ok: bool = false,
@@ -1856,7 +1921,7 @@ test "panel identity support requires a valid positive capability classification
         try panelIdentitySupport(t.allocator, "{\"proto\":6,\"panel_rpc\":0,\"attach_identity\":true}"),
     );
     try t.expectEqual(
-        PanelIdentitySupport.current,
+        PanelIdentitySupport.unsupported,
         try panelIdentitySupport(t.allocator, "{\"proto\":6,\"panel_rpc\":1,\"attach_identity\":true}"),
     );
     try t.expectEqual(
@@ -1949,6 +2014,7 @@ test "expired panel deadlines cannot connect flush or send initial bytes" {
 const PanelAttachReplyScript = struct {
     listener: c_int,
     reply: []const u8,
+    ftype: wire.FrameType = .ok,
 
     fn run(self: PanelAttachReplyScript) void {
         const accepted = c.accept(self.listener, null, null);
@@ -1960,7 +2026,7 @@ const PanelAttachReplyScript = struct {
         peer.sendFrame(.welcome, "{\"proto\":0,\"server_proto\":6,\"negotiation\":1,\"panel_rpc\":2}") catch return;
         const attach = peer.recvExpect(&.{.attach}) catch return;
         attach.deinit(peer.allocator);
-        peer.sendFrame(.ok, self.reply) catch return;
+        peer.sendFrame(self.ftype, self.reply) catch return;
     }
 };
 
@@ -2032,6 +2098,93 @@ test "panel-only attach reports a valid unexpected origin id as an identity mism
     );
     thread.join();
     try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+}
+
+test "panel-only attach returns a typed no-such-session error" {
+    const t = std.testing;
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-no-session-{d}.sock", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    defer _ = c.unlink(path.ptr);
+    const listener = try panelAttachListener(path);
+    defer _ = c.close(listener);
+    const thread = try std.Thread.spawn(.{}, PanelAttachReplyScript.run, .{PanelAttachReplyScript{
+        .listener = listener,
+        .reply = "{\"error\":\"no such session\"}",
+        .ftype = .err,
+    }});
+    var active: std.atomic.Value(c_int) = .init(-1);
+    try t.expectError(
+        error.PanelSessionNotFound,
+        connectPanelRequesterUntilExpected(
+            t.allocator,
+            path,
+            "gone",
+            "10000000000000000000000000000001",
+            monotonicMs() + 2_000,
+            &active,
+        ),
+    );
+    thread.join();
+    try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+}
+
+test "panel requester attach errors preserve daemon diagnostics and classify known absence" {
+    const t = std.testing;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+    var conn = Conn{ .allocator = t.allocator, .fd = pair[0] };
+    defer conn.deinit();
+    var peer = Conn{ .allocator = t.allocator, .fd = pair[1] };
+    defer peer.deinit();
+    try peer.sendFrame(.err, "{\"error\":\"no such session\"}");
+    var recv_err: ?anyerror = null;
+    if (conn.recvExpectFor(&.{.ok}, 1_000)) |frame| {
+        frame.deinit(t.allocator);
+        return error.TestUnexpectedResult;
+    } else |err| recv_err = err;
+    try t.expectEqual(error.DaemonError, recv_err.?);
+    try t.expectEqualStrings("no such session", conn.lastErr());
+    const classified = classifyPanelRequesterAttachError(&conn, recv_err.?);
+    try t.expectEqual(error.PanelSessionNotFound, classified);
+    try t.expect(panelRequesterKnownAbsent(classified));
+    try t.expectEqualStrings("no such session", conn.lastErr());
+
+    conn.last_err_len = "session origin identity changed".len;
+    @memcpy(conn.last_err[0..conn.last_err_len], "session origin identity changed");
+    const mismatch = classifyPanelRequesterAttachError(&conn, error.DaemonError);
+    try t.expectEqual(error.SessionOriginMismatch, mismatch);
+    try t.expect(panelRequesterKnownAbsent(mismatch));
+    try t.expectEqualStrings("session origin identity changed", conn.lastErr());
+    try t.expect(!panelRequesterKnownAbsent(error.DaemonError));
+}
+
+test "panel requester cancellation claims a duplicate before descriptor reuse" {
+    const t = std.testing;
+    var original: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &original));
+    defer _ = c.close(original[1]);
+    const worker_fd = original[0];
+    var active: std.atomic.Value(c_int) = .init(-1);
+    try publishPanelRequesterFd(&active, worker_fd);
+    const cancel_fd = active.load(.acquire);
+    try t.expect(cancel_fd >= 0 and cancel_fd != worker_fd);
+
+    _ = c.close(worker_fd);
+    var replacement: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &replacement));
+    defer _ = c.close(replacement[0]);
+    defer _ = c.close(replacement[1]);
+    try t.expectEqual(worker_fd, replacement[0]);
+
+    cancelPanelRequesterFd(&active);
+    try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+    var byte: u8 = 0x5a;
+    try t.expectEqual(@as(isize, 1), c.write(replacement[0], &byte, 1));
+    byte = 0;
+    try t.expectEqual(@as(isize, 1), c.read(replacement[1], &byte, 1));
+    try t.expectEqual(@as(u8, 0x5a), byte);
+    try t.expectEqual(@as(isize, 0), c.read(original[1], &byte, 1));
 }
 
 test "panel-only attach preserves an exact maximum-length immutable origin" {
@@ -2280,9 +2433,12 @@ test "welcome records older and future daemon profiles without rejecting either"
     try std.testing.expectEqual(@as(u32, 6), conn.proto);
     try std.testing.expectEqual(@as(u32, 9), conn.server_proto);
     try std.testing.expect(!conn.durable_copy);
+    try std.testing.expect(!conn.kill_origin_fence);
     conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1,\"durable_copy\":true,\"copy_no_replace\":true}");
     try std.testing.expect(conn.durable_copy);
     try std.testing.expect(conn.copy_no_replace);
+    conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1,\"kill_origin_fence\":true}");
+    try std.testing.expect(conn.kill_origin_fence);
     conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1}");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
     try std.testing.expectEqual(@as(u8, 0), conn.panel_rpc);
@@ -2300,6 +2456,32 @@ test "welcome records older and future daemon profiles without rejecting either"
     try std.testing.expectError(error.NoSharedTerminalProfile, conn.queueFrame(.kill, "{}"));
     conn.applyWelcome(a, "{");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
+}
+
+test "fenced kill refuses old daemons before sending bytes" {
+    const t = std.testing;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), @import("../util/platform.zig").socketpairCloexec(&pair));
+    var conn = Conn{ .allocator = t.allocator, .fd = pair[0], .proto = wire.PROTO_VERSION };
+    defer conn.deinit();
+    var peer = Conn{ .allocator = t.allocator, .fd = pair[1], .proto = wire.PROTO_VERSION };
+    defer peer.deinit();
+
+    const req = wire.KillReq{
+        .name = "same",
+        .origin_id = "10000000000000000000000000000001",
+    };
+    try t.expectError(error.KillOriginFenceUnsupported, conn.sendKill(req));
+    var pfd = c.struct_pollfd{ .fd = peer.fd, .events = c.POLLIN, .revents = 0 };
+    try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
+
+    conn.kill_origin_fence = true;
+    try conn.sendKill(req);
+    const frame = try peer.recvExpectFor(&.{.kill}, 1_000);
+    defer frame.deinit(t.allocator);
+    var parsed = try std.json.parseFromSlice(wire.KillReq, t.allocator, frame.payload, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings(req.origin_id, parsed.value.origin_id);
 }
 
 test "identity-first GUI attach survives loss before trailing metadata and fences reincarnation" {

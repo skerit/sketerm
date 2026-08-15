@@ -445,7 +445,7 @@ pub const MAX_FRAME = 16 << 20; // images can be chunky; bound anyway
 
 /// Independent capability version for panel RPC; it does not alter the
 /// terminal snapshot/event profile selected by PROTO_VERSION.
-pub const PANEL_RPC_VERSION: u8 = 1;
+pub const PANEL_RPC_VERSION: u8 = 2;
 
 /// Lifetime-unique session incarnation identity as it appears on the wire:
 /// 32 lowercase hex digits. Minting lives daemon-side (needs entropy);
@@ -453,6 +453,7 @@ pub const PANEL_RPC_VERSION: u8 = 1;
 pub const SESSION_ORIGIN_ID_BYTES: usize = 16;
 pub const SESSION_ORIGIN_ID_LEN: usize = SESSION_ORIGIN_ID_BYTES * 2;
 pub const SessionOriginId = [SESSION_ORIGIN_ID_LEN]u8;
+pub const MAX_SESSION_NAME: usize = 64;
 
 pub fn validSessionOriginId(id: []const u8) bool {
     if (id.len != SESSION_ORIGIN_ID_LEN) return false;
@@ -1116,6 +1117,9 @@ pub const AttachReq = struct {
 
 pub const KillReq = struct {
     name: []const u8 = "",
+    /// Optional lifetime fence: callers that know the immutable session
+    /// identity must not kill a same-name replacement.
+    origin_id: []const u8 = "",
     /// Display CLI safety fence: never let `display destroy` kill a shell
     /// session that happens to share the requested name.
     require_display: bool = false,

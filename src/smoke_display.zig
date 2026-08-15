@@ -91,6 +91,7 @@ fn runCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResult {
 
 const CreateReply = struct {
     session: []const u8 = "",
+    origin_id: []const u8 = "",
     pid: i32 = 0,
     output: struct {
         width: u32 = 0,
@@ -676,6 +677,7 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     var pa_buf: [4096]u8 = undefined;
     var pa_len: usize = 0;
     var dsp1_pid: i32 = 0;
+    var dsp1_origin_id: @import("mux/wire.zig").SessionOriginId = undefined;
     {
         const r = runCli(allocator, &.{ "create", "--name", "dsp1", "--size", "1024x768", "--no-xwayland", "--json", "--socket", sock_path });
         defer r.deinit(allocator);
@@ -687,6 +689,9 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
         defer parsed.deinit();
         const env = parsed.value.environment;
         if (!std.mem.eql(u8, parsed.value.session, "dsp1")) fail("create: wrong session name in reply");
+        if (!@import("mux/wire.zig").validSessionOriginId(parsed.value.origin_id))
+            fail("create: no valid session origin id in reply");
+        @memcpy(&dsp1_origin_id, parsed.value.origin_id);
         dsp1_pid = parsed.value.pid;
         if (dsp1_pid <= 0) fail("create: no keeper pid in reply");
         if (parsed.value.output.width != 1024 or parsed.value.output.height != 768)
@@ -771,8 +776,9 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     {
         var conn = client_mod.Conn.connectProbed(allocator, sock_path) catch fail("identity guard: connect");
         defer conn.deinit();
-        conn.sendJson(.kill, .{
+        conn.sendKill(.{
             .name = "dsp1",
+            .origin_id = &dsp1_origin_id,
             .require_display = true,
             .expected_pid = dsp1_pid + 1,
             .expected_wl_display = wl_path,
@@ -977,8 +983,8 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
 fn xwaylandStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     if (c.access("/usr/bin/xprop", c.X_OK) == 0) {
         const run_result = runCli(allocator, &.{
-            "run", "--name", "dspx11-run", "--xwayland", "--socket", sock_path, "--",
-            "/bin/sh", "-c", "test -n \"$DISPLAY\" && test -r \"$XAUTHORITY\" && /usr/bin/xprop -root >/dev/null && printf x11-run-ok",
+            "run",     "--name", "dspx11-run",                                                                                              "--xwayland", "--socket", sock_path, "--",
+            "/bin/sh", "-c",     "test -n \"$DISPLAY\" && test -r \"$XAUTHORITY\" && /usr/bin/xprop -root >/dev/null && printf x11-run-ok",
         });
         defer run_result.deinit(allocator);
         if (run_result.code != 0 or !std.mem.eql(u8, run_result.out, "x11-run-ok"))

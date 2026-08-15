@@ -118,7 +118,7 @@ pub fn newSessionOriginId() !SessionOriginId {
 
 /// Upper bound on session names; also sizes the fixed broker/worker
 /// rename control datagrams ('R'/'N' buffers).
-pub const MAX_SESSION_NAME: usize = 64;
+pub const MAX_SESSION_NAME = wire.MAX_SESSION_NAME;
 
 /// True when a rename target fits the control-channel name bound.
 pub fn validSessionName(name: []const u8) bool {
@@ -777,6 +777,8 @@ pub const PanelRoute = struct {
     requester: *Client,
     presenter: *Client,
     session: *Session,
+    /// Minimum presenter capability required by this requester attachment.
+    panel_rpc: u8,
     deadline_ms: i64,
     presenter_stream_start: u64,
     presenter_stream_len: usize,
@@ -4070,11 +4072,11 @@ pub const Daemon = struct {
     /// one by client id. There is no requester-to-presenter binding — when a
     /// presenter detaches or dies, the next request simply selects whichever
     /// panel-capable attachment is present then.
-    fn panelPresenter(self: *Daemon, s: *Session) ?*Client {
+    fn panelPresenter(self: *Daemon, s: *Session, required_panel_rpc: u8) ?*Client {
         var selected: ?*Client = null;
         for (self.clients.items) |candidate| {
             if (!terminalViewer(candidate, s) or candidate.kind != .gui or
-                candidate.panel_rpc < wire.PANEL_RPC_VERSION)
+                candidate.panel_rpc < required_panel_rpc)
                 continue;
             if (selected == null or candidate.id < selected.?.id) selected = candidate;
         }
@@ -4233,7 +4235,7 @@ pub const Daemon = struct {
     }
 
     pub fn handlePanelRequest(self: *Daemon, requester: *Client, payload: []const u8) void {
-        if (!requester.panel_only or requester.panel_rpc < wire.PANEL_RPC_VERSION) {
+        if (!requester.panel_only or requester.panel_rpc == 0) {
             requester.queueErr("panel_request requires a panel-only attachment");
             return;
         }
@@ -4265,7 +4267,7 @@ pub const Daemon = struct {
             self.queuePanelPreDelivery(requester, envelope.id, "requester panel route limit reached before request delivery");
             return;
         }
-        const presenter = self.panelPresenter(s) orelse {
+        const presenter = self.panelPresenter(s, requester.panel_rpc) orelse {
             self.queuePanelPreDeliveryCode(
                 requester,
                 envelope.id,
@@ -4298,6 +4300,7 @@ pub const Daemon = struct {
             .requester = requester,
             .presenter = presenter,
             .session = s,
+            .panel_rpc = requester.panel_rpc,
             .deadline_ms = nowMs() + PANEL_ROUTE_TIMEOUT_MS,
             .presenter_stream_start = stream_start,
             .presenter_stream_len = payload.len + 5,
@@ -4305,7 +4308,7 @@ pub const Daemon = struct {
     }
 
     pub fn handlePanelReply(self: *Daemon, presenter: *Client, payload: []const u8) void {
-        if (presenter.panel_only or presenter.kind != .gui or presenter.panel_rpc < wire.PANEL_RPC_VERSION) {
+        if (presenter.panel_only or presenter.kind != .gui or presenter.panel_rpc == 0) {
             presenter.queueErr("panel_reply requires a presenter attachment");
             return;
         }
@@ -4398,7 +4401,7 @@ pub const Daemon = struct {
         while (i < self.panel_routes.items.len) {
             const route = self.panel_routes.items[i];
             if (route.requester.dead or route.requester.attached != route.session or
-                !route.requester.panel_only or route.requester.panel_rpc < wire.PANEL_RPC_VERSION)
+                !route.requester.panel_only or route.requester.panel_rpc < route.panel_rpc)
             {
                 _ = self.cancelQueuedPanelRoute(route);
                 _ = self.panel_routes.swapRemove(i);
@@ -4408,7 +4411,7 @@ pub const Daemon = struct {
                 "session closed"
             else if (route.presenter.dead or route.presenter.attached != route.session or
                 route.presenter.panel_only or route.presenter.kind != .gui or
-                route.presenter.panel_rpc < wire.PANEL_RPC_VERSION)
+                route.presenter.panel_rpc < route.panel_rpc)
                 "panel presenter disconnected"
             else if (now >= route.deadline_ms)
                 "panel request timed out"
@@ -5367,6 +5370,13 @@ pub const Daemon = struct {
             cl.queueErr("no such session");
             return;
         };
+        if (parsed.value.origin_id.len > 0 and
+            (!validSessionOriginId(parsed.value.origin_id) or
+                !std.mem.eql(u8, parsed.value.origin_id, &s.origin_id)))
+        {
+            cl.queueErr("session origin identity changed");
+            return;
+        }
         if (parsed.value.require_display and !s.display) {
             cl.queueErr("session is not a display session");
             return;
@@ -5383,6 +5393,53 @@ pub const Daemon = struct {
         }
         self.removeSession(s);
         cl.queueJson(.ok, .{ .ok = true });
+    }
+
+    test "direct kill origin fence preserves replacements and accepts exact or absent identity" {
+        const t = std.testing;
+        const a = t.allocator;
+        var empty: [0]u8 = .{};
+        var daemon = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+        defer daemon.sessions.deinit(a);
+        defer daemon.clients.deinit(a);
+        defer daemon.channels.deinit(a);
+        defer daemon.panel_routes.deinit(a);
+        var requester = Client{ .allocator = a, .fd = -1 };
+        defer requester.rbuf.deinit(a);
+        defer requester.wbuf.deinit(a);
+        defer requester.audio_wbuf.deinit(a);
+        var replacement: Session = undefined;
+        replacement.name = @constCast("same");
+        replacement.origin_name = @constCast("same");
+        replacement.origin_id = "20000000000000000000000000000002".*;
+        replacement.controller = null;
+        replacement.exited = false;
+        try daemon.sessions.append(a, &replacement);
+
+        daemon.handleKill(&requester, "{\"name\":\"same\",\"origin_id\":\"10000000000000000000000000000001\"}");
+        try t.expect(!replacement.exited);
+        var reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+        try t.expectEqual(wire.FrameType.err, reply.frame.ftype);
+        try t.expect(std.mem.indexOf(u8, reply.frame.payload, "origin identity changed") != null);
+
+        requester.wbuf.clearRetainingCapacity();
+        daemon.handleKill(&requester, "{\"name\":\"same\",\"origin_id\":\"not-an-id\"}");
+        try t.expect(!replacement.exited);
+        reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+        try t.expectEqual(wire.FrameType.err, reply.frame.ftype);
+
+        requester.wbuf.clearRetainingCapacity();
+        daemon.handleKill(&requester, "{\"name\":\"same\",\"origin_id\":\"20000000000000000000000000000002\"}");
+        try t.expect(replacement.exited);
+        reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+        try t.expectEqual(wire.FrameType.ok, reply.frame.ftype);
+
+        replacement.exited = false;
+        requester.wbuf.clearRetainingCapacity();
+        daemon.handleKill(&requester, "{\"name\":\"same\"}");
+        try t.expect(replacement.exited);
+        reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+        try t.expectEqual(wire.FrameType.ok, reply.frame.ftype);
     }
 
     pub fn handleRename(self: *Daemon, cl: *Client, payload: []const u8) void {

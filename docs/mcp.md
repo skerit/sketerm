@@ -158,8 +158,9 @@ what it clicked instead of refusing on content grounds.
 ## Panels (`ui_*`)
 
 `ui_show` renders a declarative document as native GTK widgets inside
-the user's sketerm window: images, an A/B `image_compare` slider,
-headings, sliders, selects, progress bars, buttons. The assistant
+the user's sketerm window: flowing or fixed-position layouts, images,
+an A/B `image_compare` slider, text inputs, headings, sliders, selects,
+progress bars, and buttons. The assistant
 authors JSON; there is no raw HTML, CSS or script, and the component
 catalog in `src/ui/panel/doc.zig` is the entire vocabulary. An image path
 belongs to the panel's session host. For a remote mux session the attached
@@ -180,9 +181,41 @@ do not need to copy remote images to the GUI host first.
 `ui_close` and `ui_delete` are deliberately different tools: closing
 keeps the saved copy, deleting is an unlink with no undo.
 
-The tools are adapters over six control-socket commands --
-`panel-show`, `panel-patch`, `panel-get`, `panel-events`, `panel-list`,
-`panel-close` -- plus the disk store.
+The tools are adapters over the control-socket commands `panel-show`,
+`panel-patch`, `panel-get`, legacy destructive `panel-events`, v2 acknowledged
+`panel-events-reliable`, `panel-list`, and `panel-close`, plus the disk store.
+The mux negotiates the panel RPC version per attachment: v1 requesters continue
+to use v1 or newer presenters, while v2 requesters route only to v2 presenters.
+Every live panel has a random `event_epoch`. Reliable discovery uses `ack:0`
+with `event_epoch` absent or empty; a retry may echo that epoch with `ack:0`, and
+every nonzero acknowledgement must carry the exact current epoch. Missing,
+malformed, and stale epochs return typed errors before the queue is changed.
+
+### Component catalog
+
+Documents use a flat `components` map and a `root` id. Child references
+participate in one graph: every reference must resolve, a reachable component
+may be mounted only once, and cycles are rejected. The complete component
+vocabulary is:
+
+- `column` / `row`: `{children:[ids]}`.
+- `scene`: `{width,height,children:[{id,x,y,width,height}]}`. Logical and
+  placement sizes are integers from 1 through 4096. `x` and `y` are integers
+  from -1048576 through 1048576. Array order is z-order from back to front.
+- `heading`: `{text,level}` with level 1 through 4; `text`: `{text}`.
+- `text_input`: `{value,placeholder,clear_on_submit}`. All fields are optional;
+  strings default to empty and are limited to 4096 UTF-8 bytes, while
+  `clear_on_submit` defaults to false. Enter emits a `submit` event carrying
+  the current text and optionally clears the entry locally.
+- `image`: `{src,caption}`; `image_compare`:
+  `{left:{src,label},right:{src,label}}`.
+- `button`: `{text,action}`; `slider`: `{min,max,step,value}`; `select`:
+  `{options,value}`.
+- `progress`: `{value,label,indeterminate}`; `separator`; `spacer`: `{size}`.
+
+Any component may use named classes from `dim`, `accent`, `success`, `warning`,
+`error`, `card`, `monospace`, `center`, `end`, and `expand`. There is no raw
+HTML, CSS, script, or arbitrary drawing component.
 
 ### `ui_show_files`: the one-call image case
 
@@ -268,8 +301,13 @@ distinct from an ABSENT one (absent means "scope me to the requesting
 pane"). Several assistants drive one sketerm, so one assistant's panels
 are neither visible to nor collidable with another's, and re-showing a
 name REPLACES that panel's document in place -- same window, same
-`panel_id`, and an `image_compare` keeps its zoom, pan and split across
-the swap.
+`panel_id`. A full re-show rebuilds the component tree, but preserves focus and
+an unsent `text_input` draft when the replacement keeps the same declared
+value. An in-place `text_input` patch follows the same rule: changing only its
+placeholder or `clear_on_submit` keeps a focused/in-progress draft, while a
+changed declared `value` is authoritative. Other widget-local state resets.
+Use a leaf `ui_patch` to preserve state such as an `image_compare`'s zoom, pan,
+and split while changing its images.
 
 Saved documents live under the session's daemon and lifetime:
 
@@ -320,12 +358,21 @@ Events are drained, not sampled, so an interaction that happened
 between calls is still delivered. If the panel's 64-event queue
 overflowed, the reply states how many older events were dropped -- a
 truncated interaction stream is never presented as the whole history. A
+`text_input` Enter event has kind `submit` and carries up to 4096 UTF-8 bytes;
+button actions and select options remain bounded to 128 bytes. A
 panel the GUI confirms is absent ends the wait immediately and says so. A
 pre-delivery transport failure instead reports that open/closed state and
 queued events are unknown, with `events_may_have_been_drained: false` and
 `resend_safe: true`. If a direct or relayed `panel-events` request was written
 but its reply is lost, the error states that queued events may already have
 been drained and does not retry or claim that nothing was missed.
+
+Raw RPC v2 consumers may instead use `panel-events-reliable`. Successful
+replies carry the same valid `event_epoch`, a nondecreasing `cursor`, cumulative
+`dropped_total`, and events with strictly increasing nonzero `seq` values no
+greater than the cursor. A legacy destructive reader that removes data retained
+for reliable retry advances that cursor and increments `dropped_total`; a later
+old acknowledgement therefore cannot regress or wedge the stream.
 
 ### Live panel transport
 
@@ -376,7 +423,10 @@ reported and never resent automatically, because replaying
 Presenter replies are validated beyond JSON syntax: the top level must
 be an object, `ok` must be boolean, failures need a non-empty `error`,
 and successes require the operation result (`panel_id > 0`, `document`,
-`panels`, or `events` plus `dropped`). A presenter that answers badly fails
+`panels`, or the operation-specific event fields). Reliable events are checked
+one by one: every item is an object with a valid component id, known kind,
+scalar value, nonnegative timestamp, and a strictly increasing nonzero sequence
+not beyond the reply cursor. A presenter that answers badly fails
 every route already assigned to it, but keeps its panel capability: one broken
 reply is a bug in one handler, and silently demoting a GUI to "panels no longer
 work here" would hide it. A structured daemon failure keeps the correctly
@@ -391,6 +441,15 @@ carry `failure_class: "pre_delivery"`, `mutation_may_have_applied: false`,
 and `resend_safe: true`. The direct control request cap is 4 MiB, enough for
 an exactly 1 MiB valid panel document after JSON-string escaping and request
 metadata; the document parser cap remains exactly 1 MiB.
+
+The relay-only `panel-open-session` operation accepts only `mux_session`, its
+exact `mux_origin_id`, and a required safe-ASCII `request_token` of at most 128
+bytes. The GUI derives transport and placement from the source relay scope.
+Tokens are target-bound: an in-flight duplicate joins the original operation,
+and a completed duplicate returns the original reply without opening another
+tab. Each relay scope retains only the last 64 completed tokens; the cache dies
+with that GUI relay scope, so a GUI restart cannot duplicate an old tab that no
+longer exists.
 
 Sessionless calls and daemons positively identified as predating panel relay
 retain the explicit direct `--socket` path. If neither live transport exists,

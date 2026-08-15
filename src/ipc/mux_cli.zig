@@ -937,11 +937,15 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
             continue;
         }
         if (key.len == 1 and key[0] == 'x' and selected < sessions.len) {
-            const name = sessions[selected].name;
+            const selected_session = sessions[selected];
+            const name = selected_session.name;
             if (muxConnect(allocator, host)) |conn_v| {
                 var conn = conn_v;
                 defer conn.deinit();
-                conn.sendJson(.kill, .{ .name = name }) catch {};
+                conn.sendKill(.{
+                    .name = name,
+                    .origin_id = selected_session.origin_id,
+                }) catch {};
                 if (conn.recvExpect(&.{.ok})) |f| f.deinit(allocator) else |_| {}
             }
             // Refresh the list.

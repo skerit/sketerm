@@ -16,6 +16,9 @@ pub const platform = @import("util/platform.zig");
 pub const client = @import("mux/client.zig");
 pub const sockpath = @import("mux/sockpath.zig");
 pub const snapshot = @import("mux/snapshot.zig");
+/// Panel RPC command/reply schemas and validation, including reliable event
+/// epoch identity and relay-only exact-session opening.
+pub const panelrpc = @import("mux/panelrpc.zig");
 /// The declarative A2UI panel document model (pure Zig + libc, no
 /// GTK): out-of-repo panel authors validate against the REAL parser
 /// instead of guessing at the vocabulary.

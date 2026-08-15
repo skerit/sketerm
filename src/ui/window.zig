@@ -2910,11 +2910,10 @@ pub const Window = struct {
         const pane = self.focusedPane() orelse return;
         const remote = pane.terminal.remote orelse return;
         if (!remote.closed and remote.connected) {
-            var aw: std.Io.Writer.Allocating = .init(self.allocator);
-            defer aw.deinit();
-            if (std.json.Stringify.value(.{ .name = remote.session }, .{}, &aw.writer)) {
-                remote.conn.sendFrame(.kill, aw.written()) catch {};
-            } else |_| {}
+            remote.conn.sendKill(.{
+                .name = remote.session,
+                .origin_id = remote.origin_id,
+            }) catch {};
         }
         self.closeFocusedPane();
     }

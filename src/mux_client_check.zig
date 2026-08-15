@@ -11,6 +11,8 @@ comptime {
     std.testing.refAllDecls(sdk.client);
     std.testing.refAllDecls(sdk.sockpath);
     std.testing.refAllDecls(sdk.snapshot);
+    std.testing.refAllDecls(sdk.panelrpc);
+    std.testing.refAllDecls(sdk.paneldoc);
 }
 
 pub fn main() void {}

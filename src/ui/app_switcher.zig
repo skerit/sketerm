@@ -11,6 +11,7 @@ const Terminal = @import("../terminal.zig").Terminal;
 const AppHost = @import("../wlapp.zig").AppHost;
 const WsHost = @import("../winapp.zig").WsHost;
 const mux_client = @import("../mux/client.zig");
+const mux_wire = @import("../mux/wire.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const muxtabs = @import("muxtabs.zig");
 
@@ -25,10 +26,12 @@ const Group = struct {
 const SessionTarget = struct {
     session: []u8,
     host: ?[]u8,
+    origin_id: ?[]u8 = null,
 
     fn deinit(self: *SessionTarget, allocator: std.mem.Allocator) void {
         allocator.free(self.session);
         if (self.host) |host| allocator.free(host);
+        if (self.origin_id) |origin_id| allocator.free(origin_id);
     }
 };
 
@@ -65,6 +68,7 @@ const DaemonState = struct {
     busy: bool = false,
     /// At most one stop request queued while busy (switcher allocator).
     pending_kill: ?[]u8 = null,
+    pending_kill_origin: ?[]u8 = null,
     fingerprint: u64 = 0,
     generation: u64 = 0,
     failed: bool = false,
@@ -75,6 +79,7 @@ const DaemonState = struct {
         if (self.listing) |*listing| listing.deinit();
         if (self.conn) |*conn| conn.deinit();
         if (self.pending_kill) |session| allocator.free(session);
+        if (self.pending_kill_origin) |origin_id| allocator.free(origin_id);
     }
 };
 
@@ -476,7 +481,7 @@ fn addAudioRow(self: *Switcher, term: *Terminal, pane: ?*Pane, app_session: ?*mu
     entry.pane = pane;
     entry.app_session = app_session;
     if (app_session != null and remote.napps.items.len > 0) entry.native_host = remote.napps.items[0].host;
-    setSessionTarget(self, entry, remote.session, remote.host, true);
+    setSessionTarget(self, entry, remote.session, remote.host, remote.origin_id, true);
     setIdentity(self, entry, "audio-attached:{d}\x00{d}\x00{s}\x00{s}", .{ @intFromPtr(term), info.pid, info.application, info.binary });
 }
 
@@ -533,7 +538,7 @@ fn addHiddenAppRow(self: *Switcher, app_session: *muxtabs.AppSession) void {
     const entry = appendRow(self, .applications, remote.session, subtitle, null, "view-conceal-symbolic", false) orelse return;
     entry.kind = .hidden_app;
     entry.app_session = app_session;
-    setSessionTarget(self, entry, remote.session, remote.host, true);
+    setSessionTarget(self, entry, remote.session, remote.host, remote.origin_id, true);
     setIdentity(self, entry, "hidden:{d}", .{@intFromPtr(app_session.terminal)});
 }
 
@@ -600,7 +605,7 @@ fn addFetchedAudioRow(self: *Switcher, daemon: *DaemonState, session: *const mux
     }) catch "Playing on an available session";
     const entry = appendRow(self, .audio, displayApplication(info), subtitle, null, if (info.icon.len > 0) info.icon else "audio-x-generic-symbolic", true) orelse return;
     entry.kind = .attach;
-    setSessionTarget(self, entry, session.name, daemon.host, true);
+    setSessionTarget(self, entry, session.name, daemon.host, session.origin_id, true);
     setIdentity(self, entry, "audio:{s}\x00{s}\x00{d}\x00{s}\x00{s}", .{ daemon.host orelse "", session.name, info.pid, info.application, info.binary });
 }
 
@@ -612,7 +617,7 @@ fn addAvailableRow(self: *Switcher, daemon: *DaemonState, session: *const mux_cl
     const subtitle = std.fmt.bufPrintZ(&subtitle_buf, "{s} - {s} - session {s} - {s} - {d} viewer(s)", .{ kind, daemon.origin, session.name, cwd, session.viewerCount() }) catch "Available mux session";
     const entry = appendRow(self, .available, title, subtitle, null, if (session.app) "application-x-executable-symbolic" else "utilities-terminal-symbolic", false) orelse return;
     entry.kind = .attach;
-    setSessionTarget(self, entry, session.name, daemon.host, true);
+    setSessionTarget(self, entry, session.name, daemon.host, session.origin_id, true);
     setIdentity(self, entry, "attach:{s}\x00{s}", .{ daemon.host orelse "", session.name });
 }
 
@@ -701,13 +706,28 @@ fn appendRow(self: *Switcher, section: Section, title: []const u8, subtitle: [:0
     return entry;
 }
 
-fn setSessionTarget(self: *Switcher, entry: *Entry, session: []const u8, host: ?[]const u8, can_kill: bool) void {
+fn setSessionTarget(
+    self: *Switcher,
+    entry: *Entry,
+    session: []const u8,
+    host: ?[]const u8,
+    origin_id: []const u8,
+    can_kill: bool,
+) void {
     const host_copy = if (host) |value| self.allocator.dupe(u8, value) catch return else null;
     const session_copy = self.allocator.dupe(u8, session) catch {
         if (host_copy) |value| self.allocator.free(value);
         return;
     };
-    entry.target = .{ .host = host_copy, .session = session_copy };
+    const origin_copy = if (mux_wire.validSessionOriginId(origin_id))
+        self.allocator.dupe(u8, origin_id) catch {
+            if (host_copy) |value| self.allocator.free(value);
+            self.allocator.free(session_copy);
+            return;
+        }
+    else
+        null;
+    entry.target = .{ .host = host_copy, .session = session_copy, .origin_id = origin_copy };
     if (!can_kill) return;
     const body = c.gtk_list_box_row_get_child(@ptrCast(entry.row)) orelse return;
     const button = c.gtk_button_new_from_icon_name("process-stop-symbolic").?;
@@ -1069,6 +1089,7 @@ const Op = struct {
     sw: *Switcher,
     host: ?[]u8,
     kill_session: ?[]u8 = null,
+    kill_origin_id: ?[]u8 = null,
     conn: ?mux_client.Conn = null,
     ticket: ?mux_client.UdpTicket = null,
     generation: u64 = 0,
@@ -1082,12 +1103,13 @@ const Op = struct {
         if (self.parsed) |*parsed| parsed.deinit();
         if (self.host) |host| allocator.free(host);
         if (self.kill_session) |session| allocator.free(session);
+        if (self.kill_origin_id) |origin_id| allocator.free(origin_id);
         allocator.destroy(self);
     }
 };
 
 fn startAllFetches(self: *Switcher) void {
-    for (self.daemons.items) |*daemon| startOp(self, daemon, null);
+    for (self.daemons.items) |*daemon| startOp(self, daemon, null, null);
     self.updateStatus();
 }
 
@@ -1103,12 +1125,24 @@ fn bareRemoteHost(host: ?[]const u8) ?[]const u8 {
 /// tracked in `kills` exactly while a submission exists (queued or in
 /// flight), which is what keeps every matching stop button insensitive
 /// across re-renders.
-fn startOp(self: *Switcher, daemon: *DaemonState, kill_session: ?[]const u8) void {
+fn startOp(
+    self: *Switcher,
+    daemon: *DaemonState,
+    kill_session: ?[]const u8,
+    kill_origin_id: ?[]const u8,
+) void {
     const daemon_host: ?[]const u8 = if (daemon.host) |value| value else null;
     if (daemon.busy) {
         if (kill_session) |session| {
             if (daemon.pending_kill != null) return;
             daemon.pending_kill = self.allocator.dupe(u8, session) catch return;
+            if (kill_origin_id) |origin_id| {
+                daemon.pending_kill_origin = self.allocator.dupe(u8, origin_id) catch {
+                    self.allocator.free(daemon.pending_kill.?);
+                    daemon.pending_kill = null;
+                    return;
+                };
+            }
             self.markKilling(daemon_host, session);
         }
         return;
@@ -1133,6 +1167,15 @@ fn startOp(self: *Switcher, daemon: *DaemonState, kill_session: ?[]const u8) voi
             self.unmarkKilling(daemon_host, session);
             return;
         };
+        if (kill_origin_id) |origin_id| {
+            ctx.kill_origin_id = allocator.dupe(u8, origin_id) catch {
+                allocator.free(ctx.kill_session.?);
+                if (ctx.host) |host| allocator.free(host);
+                allocator.destroy(ctx);
+                self.unmarkKilling(daemon_host, session);
+                return;
+            };
+        }
         self.markKilling(daemon_host, session);
     }
     if (daemon.conn) |conn| {
@@ -1208,7 +1251,10 @@ fn runOp(ctx: *Op) bool {
     const allocator = std.heap.c_allocator;
     const conn = &ctx.conn.?;
     if (ctx.kill_session) |session| {
-        conn.sendJson(.kill, .{ .name = session }) catch return false;
+        conn.sendKill(.{
+            .name = session,
+            .origin_id = ctx.kill_origin_id orelse "",
+        }) catch return false;
         const f = conn.recvExpectFor(&.{.ok}, 10_000) catch return false;
         f.deinit(allocator);
         ctx.ok = true;
@@ -1284,12 +1330,12 @@ fn onOpIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
                 changed = true;
                 if (ctx.ok) {
                     markFetchedSessionExited(self, host, session);
-                    startOp(self, daemon, null);
+                    startOp(self, daemon, null, null);
                 } else {
                     self.note = "stop failed: the session or daemon may be gone";
                 }
             } else if (ctx.generation != daemon.generation) {
-                startOp(self, daemon, null);
+                startOp(self, daemon, null, null);
             } else {
                 const failed = !ctx.ok;
                 changed = daemon.failed != failed;
@@ -1304,9 +1350,12 @@ fn onOpIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             }
             if (daemon.pending_kill) |session| {
                 daemon.pending_kill = null;
+                const pending_origin = daemon.pending_kill_origin;
+                daemon.pending_kill_origin = null;
                 // Already marked at queue time; startOp re-marks (dedup)
                 // for the in-flight phase.
-                startOp(self, daemon, session);
+                startOp(self, daemon, session, pending_origin);
+                if (pending_origin) |origin_id| self.allocator.free(origin_id);
                 self.allocator.free(session);
             }
         }
@@ -1471,7 +1520,7 @@ fn onKillClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     if (self.isKilling(host, target.session)) return;
     const daemon = findDaemon(self, host) orelse return;
     self.note = "";
-    startOp(self, daemon, target.session);
+    startOp(self, daemon, target.session, target.origin_id);
     // A re-render mid-kill rebuilds every row; the kill mark keeps the
     // rebuilt buttons insensitive, so disabling + rendering is enough.
     c.gtk_widget_set_sensitive(@ptrCast(button), 0);

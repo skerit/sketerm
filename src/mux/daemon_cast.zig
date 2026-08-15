@@ -840,7 +840,7 @@ test "identity-first attach is capability-gated and preserves legacy snapshot or
     legacy.panel_rpc_support = wire.PANEL_RPC_VERSION;
     daemon_serve.handleFrame(d, legacy, .{
         .ftype = .attach,
-        .payload = "{\"name\":\"identity-order\",\"kind\":\"gui\",\"panel_rpc\":1}",
+        .payload = "{\"name\":\"identity-order\",\"kind\":\"gui\",\"panel_rpc\":2}",
     });
     var first = (try wire.peelFrame(legacy.wbuf.items)) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(wire.FrameType.snapshot, first.frame.ftype);
@@ -851,7 +851,7 @@ test "identity-first attach is capability-gated and preserves legacy snapshot or
     current.panel_rpc_support = wire.PANEL_RPC_VERSION;
     daemon_serve.handleFrame(d, current, .{
         .ftype = .attach,
-        .payload = "{\"name\":\"identity-order\",\"kind\":\"gui\",\"panel_rpc\":1,\"identity_first\":true}",
+        .payload = "{\"name\":\"identity-order\",\"kind\":\"gui\",\"panel_rpc\":2,\"identity_first\":true}",
     });
     first = (try wire.peelFrame(current.wbuf.items)) orelse return error.TestUnexpectedResult;
     try testing.expectEqual(wire.FrameType.session_meta, first.frame.ftype);
