@@ -420,7 +420,14 @@ pub const PanelView = struct {
             if (std.mem.eql(u8, input.declared_value, component.props.text_input.value)) {
                 if (input.draft) |draft| setEntryValue(built.widget, draft);
             }
-            if (input.focused) _ = c.gtk_widget_grab_focus(built.widget);
+            if (input.focused and
+                (c.gtk_widget_get_state_flags(built.widget) & c.GTK_STATE_FLAG_FOCUS_WITHIN) == 0)
+            {
+                // gtk_widget_grab_focus would select-all (gtk-entry-select-on-focus),
+                // so the next keystroke after a refresh would replace the draft.
+                _ = c.gtk_entry_grab_focus_without_selecting(@ptrCast(built.widget));
+                c.gtk_editable_set_position(@ptrCast(built.widget), -1);
+            }
         }
     }
 

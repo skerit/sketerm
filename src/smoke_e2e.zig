@@ -5499,6 +5499,10 @@ fn panelStage(
     _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
     app.clickEx(win_id, cx, cy, 1, 100, 1) catch return "clicking the scene text_input failed";
     app.typeText(win_id, "scene-submit") catch return "typing into the scene text_input failed";
+    // Injected keys are asynchronous while the patch arrives on a separate
+    // socket; wait for repaints to settle so no keystroke lands mid-
+    // replacement (capture-and-restore would legitimately drop it).
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
 
     const placeholder_patch = std.fmt.bufPrint(
         &patch_buf,
@@ -5518,6 +5522,7 @@ fn panelStage(
         return "clear_on_submit did not clear the native entry locally";
 
     app.typeText(win_id, "policy-draft") catch return "typing the clear-policy draft failed";
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
     const clear_policy_patch = std.fmt.bufPrint(
         &patch_buf,
         "{{\"cmd\":\"panel-patch\",\"panel_id\":{d},\"session\":\"e2e-scope\",\"patch\":\"[{{\\\"op\\\":\\\"set\\\",\\\"id\\\":\\\"query\\\",\\\"component\\\":{{\\\"type\\\":\\\"text_input\\\",\\\"placeholder\\\":\\\"Updated\\\",\\\"clear_on_submit\\\":false}}}}]\"}}\n",
@@ -5546,6 +5551,30 @@ fn panelStage(
     app.pressKey(win_id, "Return") catch return "submitting the patched text_input failed";
     if (!waitPanelTextEvent(allocator, app, sock_path, panel_id, "query", "submit", "patched"))
         return "the text_input leaf patch rebuilt the focused entry or failed to update its value";
+
+    // A FULL document replacement (panel-show over a live panel) must keep
+    // the focused entry's unsubmitted draft AND restore focus without
+    // selecting: typing after the rebuild has to append to the draft, not
+    // replace a select-all'd entry.
+    app.pressKey(win_id, "End") catch return "moving the entry cursor to the end failed";
+    app.typeText(win_id, "-full") catch return "typing the full-replacement draft failed";
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+    const reshow_req =
+        "{\"cmd\":\"panel-show\",\"name\":\"e2e\",\"session\":\"e2e-scope\",\"target\":\"window\"," ++
+        "\"document\":\"{\\\"version\\\":1,\\\"title\\\":\\\"Scene input\\\",\\\"root\\\":\\\"canvas\\\"," ++
+        "\\\"components\\\":{\\\"canvas\\\":{\\\"type\\\":\\\"scene\\\",\\\"width\\\":820,\\\"height\\\":580," ++
+        "\\\"children\\\":[{\\\"id\\\":\\\"behind\\\",\\\"x\\\":120,\\\"y\\\":250,\\\"width\\\":660,\\\"height\\\":64}," ++
+        "{\\\"id\\\":\\\"query\\\",\\\"x\\\":120,\\\"y\\\":250,\\\"width\\\":660,\\\"height\\\":64}]}," ++
+        "\\\"behind\\\":{\\\"type\\\":\\\"text\\\",\\\"text\\\":\\\"behind\\\"}," ++
+        "\\\"query\\\":{\\\"type\\\":\\\"text_input\\\",\\\"value\\\":\\\"patched\\\",\\\"placeholder\\\":\\\"Updated\\\",\\\"clear_on_submit\\\":false}}}\"}\n";
+    const reshown = roundtrip(allocator, sock_path, reshow_req) orelse return "panel-show(full replacement) roundtrip";
+    defer allocator.free(reshown);
+    if (std.mem.indexOf(u8, reshown, "\"ok\":true") == null) return "panel-show(full replacement) not ok";
+    _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
+    app.typeText(win_id, "-kept") catch return "typing after the full replacement failed";
+    app.pressKey(win_id, "Return") catch return "submitting the full-replacement draft failed";
+    if (!waitPanelTextEvent(allocator, app, sock_path, panel_id, "query", "submit", "patched-full-kept"))
+        return "the full document replacement lost the focused text_input draft or reselected it";
 
     // This is the ordered multi-op regression for the old GtkFixed crash:
     // the first op changes the leaf kind, while the second removes it from

@@ -2297,7 +2297,12 @@ fn panelOpenSessionDone(user: ?*anyopaque) callconv(.c) c.gboolean {
         .origin_id = target.origin_id,
         .tab = remotectl.tabPageId(attached.page),
         .pane = attached.pane.id,
-    }) catch return 0;
+    }) catch {
+        // The token must always resolve; a stuck-pending token would make
+        // every retry of this idempotent request permanently unanswerable.
+        finishOpenSessionError(job, "panel-open-session reply could not be rendered");
+        return 0;
+    };
     completeOpenSessionToken(job.scope, job.token, out.items);
     return 0;
 }
