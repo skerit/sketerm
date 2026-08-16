@@ -17,12 +17,14 @@ const muxclient = @import("../../mux/client.zig");
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const Dir = @import("types.zig").Dir;
+const Entry = @import("types.zig").Entry;
 const HostConn = @import("types.zig").HostConn;
 const JobRow = @import("types.zig").JobRow;
 const MAX_ATTR_COLUMNS = @import("render.zig").MAX_ATTR_COLUMNS;
 const Pending = @import("types.zig").Pending;
 const WireDelta = @import("types.zig").WireDelta;
 const WireReply = @import("types.zig").WireReply;
+const DeferredDeltas = @import("../../mux/fs_boundary.zig").Deferred;
 const errorPhrase = @import("../../filebrowser/format.zig").errorPhrase;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const cast = @import("../../util/cast.zig");
@@ -824,6 +826,7 @@ pub fn sendListingOp(self: *BrowserView, p: *Pending) void {
             .req = p.req,
             .op = "list",
             .path = p.dir.path,
+            .view = p.dir.view_id,
             .attrs = attrs,
         }),
     }
@@ -879,6 +882,7 @@ pub fn queueListing(self: *BrowserView, tab: *BTab, dir: *Dir, op: @FieldType(Pe
         self.allocator.destroy(p);
         return;
     };
+    p.listing_generation = dir.snapshot.begin(self.allocator);
     if (tab.hc.state == .ready) {
         self.sendListingOp(p);
     } else if (tab.hc.state == .dead) {
@@ -888,6 +892,7 @@ pub fn queueListing(self: *BrowserView, tab: *BTab, dir: *Dir, op: @FieldType(Pe
         const why = std.fmt.bufPrint(&buf, "not connected to {s}", .{tab.hc.label()}) catch "not connected";
         self.setStatus(why);
         dir.setLoadError(why);
+        self.dropPending(self.pending.items.len - 1);
     }
 }
 
@@ -1085,9 +1090,27 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     // Listing chunk run?
     for (self.pending.items, 0..) |p, i| {
         if (p.req != rep.req) continue;
+        // A newer refresh owns the directory now. Its snapshot is the
+        // only baseline allowed to replace the model; consume this old
+        // chunk run without touching live rows.
+        if (!p.dir.snapshot.isCurrent(p.listing_generation)) {
+            if (!rep.more) self.dropPending(i);
+            return false;
+        }
         if (!rep.ok) {
+            var deferred: ?DeferredDeltas = if (p.navigation == null and p.dir.snapshot.finish(p.listing_generation))
+                p.dir.snapshot.take()
+            else
+                null;
+            const tab = p.tab;
+            const dir = p.dir;
+            const hc_pending = p.hc;
             self.listingRefused(p, rep.@"error");
             self.dropPending(i);
+            if (deferred) |*batch| {
+                defer batch.deinit(self.allocator);
+                _ = applyDeferredDeltas(self, tab, dir, hc_pending, batch);
+            }
             return true;
         }
         p.dir.clearLoadError();
@@ -1102,6 +1125,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             }
             if (!rep.more) {
                 colview.invalidateBackingRefs(p.tab);
+                noteSnapshotChanges(self, p.tab, p.dir, p.staged.items);
                 for (p.dir.entries.items) |*e| e.deinit(self.allocator);
                 p.dir.entries.deinit(self.allocator);
                 p.dir.entries = p.staged;
@@ -1109,7 +1133,18 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 p.dir.loaded = true;
                 p.dir.sort();
                 if (rep.truncated) self.setStatus("listing truncated (very large directory)");
+                var deferred: ?DeferredDeltas = if (p.dir.snapshot.finish(p.listing_generation))
+                    p.dir.snapshot.take()
+                else
+                    null;
+                const tab = p.tab;
+                const dir = p.dir;
+                const hc_pending = p.hc;
                 self.dropPending(i);
+                if (deferred) |*batch| {
+                    defer batch.deinit(self.allocator);
+                    _ = applyDeferredDeltas(self, tab, dir, hc_pending, batch);
+                }
                 return true;
             }
             return false;
@@ -1141,7 +1176,23 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             self.commitNavigation(p.tab, p.hc, p.dir, intent, rep.path);
             rendered = true;
         }
-        if (!rep.more) self.dropPending(i);
+        if (!rep.more) {
+            var deferred: ?DeferredDeltas = if (p.dir.snapshot.finish(p.listing_generation))
+                p.dir.snapshot.take()
+            else
+                null;
+            const tab = p.tab;
+            const dir = p.dir;
+            const hc_pending = p.hc;
+            self.dropPending(i);
+            const delta_dirty = if (deferred) |*batch| blk: {
+                defer batch.deinit(self.allocator);
+                break :blk applyDeferredDeltas(self, tab, dir, hc_pending, batch);
+            } else false;
+            // commitNavigation already rendered this tab; reporting
+            // dirty too is needed only when deferred deltas changed it.
+            return !rendered or delta_dirty;
+        }
         // commitNavigation already rendered this tab; reporting dirty
         // too would rebuild the same listing again in the same drain.
         return !rendered;
@@ -1406,6 +1457,7 @@ pub fn listingRefused(self: *BrowserView, p: *Pending, reason: []const u8) void 
 
 pub fn dropPending(self: *BrowserView, i: usize) void {
     const p = self.pending.swapRemove(i);
+    p.dir.snapshot.cancel(self.allocator, p.listing_generation);
     for (p.staged.items) |*e| e.deinit(self.allocator);
     p.staged.deinit(self.allocator);
     if (p.navigation != null) {
@@ -1436,6 +1488,7 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     for (self.tabs.items) |tab| {
         if (tab.hc != hc) continue;
         const dir = tab.dirByView(d.view) orelse continue;
+        if (dir.snapshot.push(self.allocator, payload)) return false;
         if (d.gone) {
             dir.gone = true;
             if (dir == tab.root) {
@@ -1502,6 +1555,39 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         return structural;
     }
     return false;
+}
+
+fn applyDeferredDeltas(self: *BrowserView, tab: *BTab, dir: *Dir, hc: *HostConn, deferred: *DeferredDeltas) bool {
+    if (deferred.resync) {
+        self.refreshDir(tab, dir);
+        return false;
+    }
+    var dirty = false;
+    for (deferred.payloads.items) |payload| {
+        if (self.onDelta(hc, payload)) dirty = true;
+    }
+    return dirty;
+}
+
+/// Mark only added, removed, or content-changed rows before a whole snapshot swap.
+fn noteSnapshotChanges(self: *BrowserView, tab: *BTab, dir: *Dir, fresh: []const Entry) void {
+    var old: std.StringHashMapUnmanaged(*const Entry) = .empty;
+    defer old.deinit(self.allocator);
+    for (dir.entries.items) |*entry| {
+        old.put(self.allocator, entry.name, entry) catch {
+            tab.changed_all = true;
+            return;
+        };
+    }
+    for (fresh) |*entry| {
+        if (old.fetchRemove(entry.name)) |previous| {
+            if (!previous.value.sameListing(entry)) tab.noteChanged(dir, entry.name);
+        } else {
+            tab.noteChanged(dir, entry.name);
+        }
+    }
+    var remaining = old.iterator();
+    while (remaining.next()) |entry| tab.noteChanged(dir, entry.key_ptr.*);
 }
 
 pub fn makeDir(self: *BrowserView, path: []const u8) ?*Dir {

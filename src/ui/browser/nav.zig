@@ -314,6 +314,7 @@ pub fn navigateMode(self: *BrowserView, tab: *BTab, host_in: ?[]const u8, path_i
         new_dir.deinit();
         return;
     };
+    p.listing_generation = new_dir.snapshot.begin(self.allocator);
     if (new_hc.state == .dead) {
         self.setStatus("destination host is unavailable");
         self.dropPending(self.pending.items.len - 1);

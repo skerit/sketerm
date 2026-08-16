@@ -140,6 +140,7 @@ comptime {
     _ = @import("mux/drmdev.zig");
     _ = @import("mux/disk_usage.zig");
     _ = @import("mux/fsjob.zig");
+    _ = @import("mux/fs_boundary.zig");
     _ = @import("mux/fsjournal.zig");
     _ = @import("mux/fsserve.zig");
     _ = @import("mux/icons.zig");

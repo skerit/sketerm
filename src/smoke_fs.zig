@@ -196,6 +196,164 @@ const DeltaLog = struct {
     }
 };
 
+/// Hold one snapshot behind the listing watermark, mutate after its first
+/// chunk, then overlap two refreshes and verify the wire's snapshot boundary.
+fn snapshotBoundaryStage(allocator: std.mem.Allocator, fs: *fsdrive.Fs, dir: []const u8) void {
+    const view: u32 = 8;
+    const initial_req: u32 = 9100;
+    const refresh_one: u32 = 9101;
+    const refresh_two: u32 = 9102;
+    const Reply = struct {
+        req: u32 = 0,
+        ok: bool = false,
+        more: bool = false,
+        entries: []struct {
+            name: []const u8 = "",
+            size: u64 = 0,
+        } = &.{},
+    };
+    const Delta = struct {
+        view: u32 = 0,
+        changes: []struct {
+            op: []const u8 = "",
+            name: []const u8 = "",
+            entry: ?struct { size: u64 = 0 } = null,
+        } = &.{},
+    };
+
+    fs.conn.sendJson(.fs_op, .{
+        .req = initial_req,
+        .op = "open_view",
+        .path = dir,
+        .view = view,
+    }) catch fail("boundary open send");
+
+    // The marker names sort into the first chunk, so the snapshot is
+    // provably stale after the mutations below rather than merely old
+    // in theory.
+    while (true) {
+        const frame = fs.conn.recvFrameFor(3000) catch fail("boundary first chunk recv");
+        defer frame.deinit(allocator);
+        if (frame.ftype == .fs_delta) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const delta = std.json.parseFromSliceLeaky(Delta, arena.allocator(), frame.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch fail("boundary early delta parse");
+            if (delta.view == view) fail("boundary delta preceded first snapshot chunk");
+            continue;
+        }
+        if (frame.ftype != .fs_reply) continue;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const reply = std.json.parseFromSliceLeaky(Reply, arena.allocator(), frame.payload, .{
+            .ignore_unknown_fields = true,
+        }) catch fail("boundary first reply parse");
+        if (reply.req != initial_req) continue;
+        if (!reply.ok or !reply.more) fail("boundary initial snapshot did not stay open");
+        var saw_delete = false;
+        var saw_modify = false;
+        var saw_rename = false;
+        for (reply.entries) |entry| {
+            if (std.mem.eql(u8, entry.name, "000-delete")) saw_delete = true;
+            if (std.mem.eql(u8, entry.name, "001-modify") and entry.size == 3) saw_modify = true;
+            if (std.mem.eql(u8, entry.name, "002-rename-old")) saw_rename = true;
+        }
+        if (!saw_delete or !saw_modify or !saw_rename)
+            fail("boundary markers were not in the stale first chunk");
+        break;
+    }
+
+    var z: [4096]u8 = undefined;
+    if (c.unlink(fsserve.joinZ(&z, dir, "000-delete") catch fail("boundary delete path")) != 0)
+        fail("boundary delete");
+    touch(dir, "001-modify", "modified");
+    var old_z: [4096]u8 = undefined;
+    var new_z: [4096]u8 = undefined;
+    if (c.rename(
+        fsserve.joinZ(&old_z, dir, "002-rename-old") catch fail("boundary rename old path"),
+        fsserve.joinZ(&new_z, dir, "003-rename-new") catch fail("boundary rename new path"),
+    ) != 0) fail("boundary rename");
+    touch(dir, "004-created", "new");
+
+    // Both refreshes name the view explicitly. The daemon must keep
+    // the watch burst behind all three final chunks, regardless of
+    // which refresh completes first.
+    fs.conn.sendJson(.fs_op, .{
+        .req = refresh_one,
+        .op = "list",
+        .path = dir,
+        .view = view,
+    }) catch fail("boundary first refresh send");
+    fs.conn.sendJson(.fs_op, .{
+        .req = refresh_two,
+        .op = "list",
+        .path = dir,
+        .view = view,
+    }) catch fail("boundary second refresh send");
+
+    var finals = [_]bool{ false, false, false };
+    var delta_mask: u8 = 0;
+    var latest_deleted = false;
+    var latest_modified = false;
+    var latest_old_name = false;
+    var latest_new_name = false;
+    var latest_created = false;
+    var rounds: usize = 0;
+    while (rounds < 1000) : (rounds += 1) {
+        const frame = fs.conn.recvFrameFor(3000) catch fail("boundary drain recv");
+        defer frame.deinit(allocator);
+        if (frame.ftype == .fs_reply) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const reply = std.json.parseFromSliceLeaky(Reply, arena.allocator(), frame.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch fail("boundary reply parse");
+            const idx: ?usize = switch (reply.req) {
+                initial_req => 0,
+                refresh_one => 1,
+                refresh_two => 2,
+                else => null,
+            };
+            if (idx == null) continue;
+            if (!reply.ok) fail("boundary listing refused");
+            if (reply.req == refresh_two) {
+                for (reply.entries) |entry| {
+                    if (std.mem.eql(u8, entry.name, "000-delete")) latest_deleted = true;
+                    if (std.mem.eql(u8, entry.name, "001-modify") and entry.size == 8) latest_modified = true;
+                    if (std.mem.eql(u8, entry.name, "002-rename-old")) latest_old_name = true;
+                    if (std.mem.eql(u8, entry.name, "003-rename-new")) latest_new_name = true;
+                    if (std.mem.eql(u8, entry.name, "004-created")) latest_created = true;
+                }
+            }
+            if (!reply.more) finals[idx.?] = true;
+        } else if (frame.ftype == .fs_delta) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const delta = std.json.parseFromSliceLeaky(Delta, arena.allocator(), frame.payload, .{
+                .ignore_unknown_fields = true,
+            }) catch fail("boundary delta parse");
+            if (delta.view != view) continue;
+            if (!finals[0] or !finals[1] or !finals[2])
+                fail("boundary delta preceded an overlapping snapshot final");
+            for (delta.changes) |change| {
+                if (std.mem.eql(u8, change.op, "del") and std.mem.eql(u8, change.name, "000-delete")) delta_mask |= 1;
+                if (std.mem.eql(u8, change.op, "upsert") and std.mem.eql(u8, change.name, "001-modify") and
+                    change.entry != null and change.entry.?.size == 8) delta_mask |= 2;
+                if (std.mem.eql(u8, change.op, "del") and std.mem.eql(u8, change.name, "002-rename-old")) delta_mask |= 4;
+                if (std.mem.eql(u8, change.op, "upsert") and std.mem.eql(u8, change.name, "003-rename-new")) delta_mask |= 8;
+                if (std.mem.eql(u8, change.op, "upsert") and std.mem.eql(u8, change.name, "004-created")) delta_mask |= 16;
+            }
+        }
+        if (finals[0] and finals[1] and finals[2] and delta_mask == 31) break;
+    }
+    if (!finals[0] or !finals[1] or !finals[2]) fail("boundary snapshot final missing");
+    if (delta_mask != 31) fail("boundary deferred mutation set incomplete");
+    if (latest_deleted or latest_old_name or !latest_modified or !latest_new_name or !latest_created)
+        fail("boundary newest refresh did not match filesystem state");
+    fs.closeView(view) catch failErr("boundary close view", fs.lastErr());
+}
+
 fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []const u8) void {
     var dbuf: [64]u8 = undefined;
     const dir = mkTmpDir(&dbuf, tag);
@@ -317,16 +475,20 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
     {
         var i: usize = 0;
         var nb: [32]u8 = undefined;
-        while (i < 1300) : (i += 1) {
+        while (i < 6000) : (i += 1) {
             var wn = std.Io.Writer.fixed(&nb);
             wn.print("f{d:0>4}", .{i}) catch fail("fmt name");
             touch(chunk_dir, wn.buffered(), "");
         }
+        touch(chunk_dir, "000-delete", "old");
+        touch(chunk_dir, "001-modify", "old");
+        touch(chunk_dir, "002-rename-old", "move");
     }
     var big = fs.list(chunk_dir) catch failErr("big list", fs.lastErr());
-    if (big.entries.len != 1300) fail("chunked listing count");
+    if (big.entries.len != 6003) fail("chunked listing count");
     if (big.truncated) fail("chunked listing truncated");
     big.deinit();
+    snapshotBoundaryStage(allocator, &fs, chunk_dir);
 
     // ── dir-gone view ──────────────────────────────────────────
     var gbuf: [64]u8 = undefined;

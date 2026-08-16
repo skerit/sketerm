@@ -36,6 +36,7 @@ const kitty_image = @import("../parser/kitty_image.zig");
 const logring = @import("logring.zig");
 const fsserve = @import("fsserve.zig");
 const fsjournal = @import("fsjournal.zig");
+const fs_boundary = @import("fs_boundary.zig");
 const build_options = @import("build_options");
 const version = @import("../version.zig");
 const wlvcodec = @import("../wlhost/vcodec.zig");
@@ -1910,9 +1911,10 @@ pub const FsListing = struct {
     idx: usize = 0,
     dev: u64 = 0,
     truncated: bool = false,
-    /// View id for child-count deltas; null = no live view (plain
-    /// list from a non-view client), counts are skipped.
-    view: ?u32,
+    /// Live view whose snapshot boundary this listing participates in;
+    /// null for plain lists from non-view clients.
+    view: ?*FsView,
+    boundary_open: bool = false,
     /// Directory entries seen while statting (arena); the count phase
     /// re-sends each as an upsert with `children` filled in.
     dirs: std.ArrayList(fsserve.Entry) = .empty,
@@ -1942,8 +1944,10 @@ pub const FsView = struct {
     /// Comma-separated extended-attribute names this view asked for;
     /// deltas must carry the same attributes as the initial listing.
     attrs: []u8 = &.{},
+    boundary: fs_boundary.Server = .{},
 
     pub fn deinit(self: *FsView) void {
+        self.boundary.deinit(self.allocator);
         self.allocator.free(self.path);
         if (self.attrs.len > 0) self.allocator.free(self.attrs);
         self.allocator.destroy(self);

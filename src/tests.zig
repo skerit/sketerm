@@ -228,6 +228,7 @@ comptime {
     _ = @import("fsmount.zig");
     _ = @import("mux/daemon_cast.zig");
     _ = @import("mux/daemon_debug.zig");
+    _ = @import("mux/fs_boundary.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");
     _ = @import("mux/pulse.zig");

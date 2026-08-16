@@ -1934,11 +1934,17 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         fsOpenView(self, cl, r);
     } else if (std.mem.eql(u8, r.op, "list")) {
         // A refresh of a directory this client also watches gets its
-        // child counts refreshed too (deltas ride the view).
-        const view: ?u32 = for (self.fs_views.items) |v| {
-            if (v.client == cl and !v.gone and std.mem.eql(u8, v.path, r.path)) break v.id;
+        // snapshot boundary and child counts on that exact view. Old
+        // clients omit `view`, so path matching remains the fallback.
+        const view: ?*FsView = if (r.view != 0) blk: {
+            const exact = for (self.fs_views.items) |v| {
+                if (v.client == cl and !v.gone and v.id == r.view) break v;
+            } else return fsReplyErr(cl, r.req, "no such view");
+            break :blk exact;
+        } else for (self.fs_views.items) |v| {
+            if (v.client == cl and !v.gone and std.mem.eql(u8, v.path, r.path)) break v;
         } else null;
-        _ = fsStartListing(self, cl, r.req, r.path, r.attrs, view);
+        _ = fsStartListing(self, cl, r.req, if (view) |v| v.path else r.path, r.attrs, view);
     } else if (std.mem.eql(u8, r.op, "stat")) {
         fsStat(self, cl, r);
     } else if (std.mem.eql(u8, r.op, "read")) {
@@ -2276,7 +2282,7 @@ pub fn fsOpenView(self: *Daemon, cl: *Client, r: FsOpReq) void {
     };
     // Listing failure (dir vanished between checks) → the open as
     // a whole failed; the view must not linger daemon-side.
-    if (!fsStartListing(self, cl, r.req, canon, r.attrs, r.view))
+    if (!fsStartListing(self, cl, r.req, canon, r.attrs, view))
         dropFsViewAt(self, self.fs_views.items.len - 1);
 }
 
@@ -2306,7 +2312,7 @@ pub fn dropFsViewAt(self: *Daemon, i: usize) void {
     var j: usize = 0;
     while (j < self.fs_listings.items.len) {
         const l = self.fs_listings.items[j];
-        if (l.client == v.client and l.view != null and l.view.? == v.id) {
+        if (l.client == v.client and l.view == v) {
             if (l.stage == .stat) {
                 l.client.queueJson(.fs_reply, .{
                     .req = l.req,
@@ -2317,6 +2323,8 @@ pub fn dropFsViewAt(self: *Daemon, i: usize) void {
                     .aborted = true,
                 });
             }
+            l.boundary_open = false;
+            l.view = null;
             _ = self.fs_listings.swapRemove(j);
             l.deinit();
         } else j += 1;
@@ -2375,7 +2383,7 @@ const LISTING_WATERMARK: usize = 1 << 20;
 /// chunk run (`more:true` until the last) every client already
 /// accumulates. `view` non-null schedules async child counts after
 /// the listing, delivered as upsert deltas on that view.
-pub fn fsStartListing(self: *Daemon, cl: *Client, req: u32, dir_path: []const u8, attr_spec: []const u8, view: ?u32) bool {
+pub fn fsStartListing(self: *Daemon, cl: *Client, req: u32, dir_path: []const u8, attr_spec: []const u8, view: ?*FsView) bool {
     var arena_state = std.heap.ArenaAllocator.init(self.allocator);
     // The REASON travels: "cannot open directory" made a permission
     // denial and a vanished directory indistinguishable, and a
@@ -2432,6 +2440,10 @@ pub fn fsStartListing(self: *Daemon, cl: *Client, req: u32, dir_path: []const u8
         fsReplyErr(cl, req, "out of memory");
         return false;
     };
+    if (view) |v| {
+        v.boundary.begin();
+        listing.boundary_open = true;
+    }
     // First batch immediately: a small local directory completes in
     // this very call, keeping the old one-round-trip latency.
     if (pumpListing(self, listing)) {
@@ -2455,7 +2467,10 @@ pub fn pumpFsListings(self: *Daemon) void {
 
 /// One batch of one listing. True = finished (caller removes it).
 fn pumpListing(self: *Daemon, listing: *dmod.FsListing) bool {
-    if (listing.client.dead) return true;
+    if (listing.client.dead) {
+        closeListingBoundary(self, listing, false);
+        return true;
+    }
     if (listing.client.queuedBytes() >= LISTING_WATERMARK) return false;
     const a = listing.arena.allocator();
     switch (listing.stage) {
@@ -2489,19 +2504,21 @@ fn pumpListing(self: *Daemon, listing: *dmod.FsListing) bool {
                 });
             }
             if (!last) return false;
+            closeListingBoundary(self, listing, true);
             if (listing.view == null or listing.dirs.items.len == 0) return true;
             listing.stage = .count;
             return false;
         },
         .count => {
-            const view_id = listing.view orelse return true;
-            // The view may have died since (tab closed, navigation).
-            const alive = for (self.fs_views.items) |v| {
-                if (v.client == listing.client and v.id == view_id and !v.gone) break true;
-            } else false;
-            if (!alive) return true;
+            const view = listing.view orelse return true;
+            if (view.gone) return true;
+            // Another refresh snapshot for this view is still open.
+            // Count upserts are deltas too, so they wait behind it.
+            if (view.boundary.active > 0) return false;
             var changes: std.ArrayList(FsChange) = .empty;
             const deadline = nowMs() + COUNT_BATCH_MS;
+            var attr_buf: [MAX_ATTR_NAMES][]const u8 = undefined;
+            const attrs = splitAttrs(listing.attrs, &attr_buf);
             while (listing.count_idx < listing.dirs.items.len) {
                 const e = &listing.dirs.items[listing.count_idx];
                 listing.count_idx += 1;
@@ -2511,17 +2528,81 @@ fn pumpListing(self: *Daemon, listing: *dmod.FsListing) bool {
                     // Vanished or over the cap: leave it unknown
                     // rather than upsert a stale entry back to life.
                     if (cnt >= 0) {
-                        e.children = cnt;
-                        changes.append(a, .{ .op = "upsert", .name = e.name, .entry = e.* }) catch break;
+                        // The entry may have changed while snapshots
+                        // streamed. Re-stat so a late count cannot
+                        // overwrite a newer watch delta with old metadata.
+                        if (fsserve.statEntryAttrs(a, listing.path, e.name, attrs, true)) |fresh| {
+                            var counted = fresh;
+                            counted.children = if (counted.tdir) cnt else -1;
+                            changes.append(a, .{ .op = "upsert", .name = counted.name, .entry = counted }) catch break;
+                        }
                     }
                 } else |_| {}
                 if (nowMs() >= deadline) break;
             }
             if (changes.items.len > 0)
-                listing.client.queueJson(.fs_delta, .{ .view = view_id, .changes = changes.items });
+                listing.client.queueJson(.fs_delta, .{ .view = view.id, .changes = changes.items });
             return listing.count_idx == listing.dirs.items.len;
         },
     }
+}
+
+fn closeListingBoundary(self: *Daemon, listing: *dmod.FsListing, flush: bool) void {
+    if (!listing.boundary_open) return;
+    listing.boundary_open = false;
+    const view = listing.view orelse return;
+    if (!view.boundary.finish()) return;
+    if (flush) {
+        flushFsViewBoundary(view);
+    } else {
+        view.boundary.clear(self.allocator);
+    }
+}
+
+/// Emit the current state of every name touched while snapshots were active.
+fn flushFsViewBoundary(view: *FsView) void {
+    const allocator = view.allocator;
+    defer view.boundary.clear(allocator);
+    if (view.boundary.gone) {
+        view.gone = true;
+        view.client.queueJson(.fs_delta, .{
+            .view = view.id,
+            .gone = true,
+            .changes = &[_]FsChange{},
+        });
+        return;
+    }
+    if (view.boundary.resync) {
+        view.client.queueJson(.fs_delta, .{
+            .view = view.id,
+            .resync = true,
+            .changes = &[_]FsChange{},
+        });
+        return;
+    }
+    if (view.boundary.names.items.len == 0) return;
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var changes: std.ArrayList(FsChange) = .empty;
+    var attr_buf: [MAX_ATTR_NAMES][]const u8 = undefined;
+    const attrs = splitAttrs(view.attrs, &attr_buf);
+    for (view.boundary.names.items) |name| {
+        if (fsserve.statEntryAttrs(arena, view.path, name, attrs, true)) |entry| {
+            changes.append(arena, .{ .op = "upsert", .name = entry.name, .entry = entry }) catch {
+                view.client.queueJson(.fs_delta, .{ .view = view.id, .resync = true, .changes = &[_]FsChange{} });
+                return;
+            };
+        } else {
+            changes.append(arena, .{ .op = "del", .name = name }) catch {
+                view.client.queueJson(.fs_delta, .{ .view = view.id, .resync = true, .changes = &[_]FsChange{} });
+                return;
+            };
+        }
+    }
+    if (changes.items.len > 0)
+        view.client.queueJson(.fs_delta, .{ .view = view.id, .changes = changes.items });
 }
 
 pub fn fsStat(self: *Daemon, cl: *Client, r: FsOpReq) void {
@@ -2885,7 +2966,20 @@ pub fn fsWatchReadable(self: *Daemon) void {
     }
 
     for (touched.items) |pv| {
-        if (pv.gone) {
+        // A streamed snapshot is an older baseline. Keep every watch
+        // verdict behind all overlapping snapshots for this view;
+        // flushFsViewBoundary re-stats the bounded name set after the
+        // matching final reply has been queued.
+        if (pv.view.boundary.active > 0) {
+            if (pv.gone) {
+                pv.view.boundary.markGone(self.allocator);
+            } else if (pv.resync) {
+                pv.view.boundary.markResync(self.allocator);
+            } else {
+                for (pv.changes.items) |change|
+                    pv.view.boundary.deferName(self.allocator, change.name);
+            }
+        } else if (pv.gone) {
             pv.view.gone = true;
             pv.view.client.queueJson(.fs_delta, .{
                 .view = pv.view.id,

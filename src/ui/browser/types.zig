@@ -10,6 +10,7 @@ const colkeys = @import("../../filebrowser/colkeys.zig");
 const fsdrive = @import("../../ipc/fsdrive.zig");
 const fstransfer = @import("../../ipc/fstransfer.zig");
 const browser_model = @import("../../filebrowser/model.zig");
+const fs_boundary = @import("../../mux/fs_boundary.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
 const TabQuery = @import("search.zig").TabQuery;
@@ -64,6 +65,22 @@ pub const Entry = struct {
         if (self.attrs.len > 0) allocator.free(self.attrs);
         for (self.meta) |v| allocator.free(v);
         if (self.meta.len > 0) allocator.free(self.meta);
+    }
+
+    /// Compare fields supplied by a directory listing; media metadata is reapplied separately.
+    pub fn sameListing(self: *const Entry, other: *const Entry) bool {
+        if (!std.mem.eql(u8, self.name, other.name) or !std.mem.eql(u8, self.kind, other.kind)) return false;
+        if (self.size != other.size or self.mode != other.mode or self.mtime_ms != other.mtime_ms) return false;
+        if (self.atime_ms != other.atime_ms or self.ctime_ms != other.ctime_ms) return false;
+        if (self.uid != other.uid or self.gid != other.gid or self.btime_ms != other.btime_ms) return false;
+        if (self.nlink != other.nlink or self.blocks != other.blocks or self.children != other.children) return false;
+        if (self.tdir != other.tdir or !std.mem.eql(u8, self.owner, other.owner) or
+            !std.mem.eql(u8, self.group, other.group) or !std.mem.eql(u8, self.tags, other.tags)) return false;
+        if ((self.target == null) != (other.target == null)) return false;
+        if (self.target) |target| if (!std.mem.eql(u8, target, other.target.?)) return false;
+        if (self.attrs.len != other.attrs.len) return false;
+        for (self.attrs, other.attrs) |a, b| if (!std.mem.eql(u8, a, b)) return false;
+        return true;
     }
 };
 
@@ -341,8 +358,10 @@ pub const Dir = struct {
     dev: u64 = 0,
     descending: bool = false,
     dirs_first: bool = true,
+    snapshot: fs_boundary.Client = .{},
 
     pub fn deinit(self: *Dir) void {
+        self.snapshot.deinit(self.allocator);
         for (self.entries.items) |*e| e.deinit(self.allocator);
         self.entries.deinit(self.allocator);
         if (self.archive.len > 0) self.allocator.free(self.archive);
@@ -962,6 +981,7 @@ pub const Pending = struct {
     op: enum { open_view, list },
     navigation: ?NavigationIntent = null,
     navigation_generation: u64 = 0,
+    listing_generation: u64 = 0,
     sent: bool = false,
     staged: std.ArrayList(Entry) = .empty,
 };
