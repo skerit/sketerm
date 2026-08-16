@@ -749,6 +749,13 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_TABBAR_ONLY") != null) {
+        if (platform.is_macos) return fail("focused TabBar smoke is GTK-only");
+        if (themeSingletonStage(allocator, drive, rt, &wl_z)) |why| return failMsg(why);
+        say("TabBar lifetime: secondary close and ordinary shutdown severed active effect/warning callbacks");
+        teardown();
+        return 0;
+    }
 
     // 1. list — exactly one tab with at least one pane.
     const list_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return fail("list roundtrip");
@@ -7956,9 +7963,10 @@ fn panePanelLifetimeStage(
 
 /// A secondary window's `Window` struct is freed by
 /// `deferredWindowFree` while GTK can still be finalizing its widgets.
-/// Exercise all three owners that have regressed here: one Preferences
+/// Exercise all four owners that have regressed here: one Preferences
 /// child per Window, sidebar callbacks retained by disposing widgets,
-/// and the process-global `AdwStyleManager` singleton.
+/// TabBar timeout/widget callbacks, and the process-global
+/// `AdwStyleManager` singleton.
 ///
 /// Its OWN GUI instance, for two reasons: the flip hook has to be set
 /// in the environment at exec time, and a colour scheme changing every
@@ -8005,6 +8013,9 @@ fn themeSingletonStage(
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
         _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
+        // Every custom strip keeps real effect/warning sources pending and
+        // aborts unless its Window severs all raw callbacks before freeing it.
+        _ = c.setenv("SKETERM_VERIFY_TABBAR_TEARDOWN", "1", 1);
         _ = c.setenv("XDG_CONFIG_HOME", theme_cfg.ptr, 1);
         // The hook this stage exists for: nothing outside the process
         // can emit notify::dark (libadwaita takes the system preference

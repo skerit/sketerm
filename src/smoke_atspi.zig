@@ -256,6 +256,9 @@ pub fn main() u8 {
         // GUI abort if TerminalSurface storage reaches deinit before
         // its callbacks and live GL state are synchronously severed.
         _ = c.setenv("SKETERM_VERIFY_SURFACE_TEARDOWN", "1", 1);
+        // Keep the TabBar effect/warning sources live and require its
+        // pre-widget teardown to remove every raw-data closure.
+        _ = c.setenv("SKETERM_VERIFY_TABBAR_TEARDOWN", "1", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);

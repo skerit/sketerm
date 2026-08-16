@@ -342,6 +342,14 @@ pub const TabBar = struct {
     box: *c.GtkWidget,
     tabs: std.ArrayList(*Tab) = .empty,
     tick_id: c.guint = 0,
+    reorder_gesture: ?*c.GtkGesture = null,
+    drop_target: ?*c.GtkDropTarget = null,
+    /// Set by `sever` before any source or widget callback can outlive the
+    /// owning Window. Public entry points become no-ops once set.
+    callbacks_severed: bool = false,
+    /// Smoke-only assertions that both raw-pointer timeout classes and all
+    /// signal closures were live, then removed, at the teardown choke point.
+    verify_teardown: bool = false,
     detach_ctx: ?*anyopaque = null,
     on_detach: ?*const fn (ctx: ?*anyopaque, view: *c.AdwTabView, page: *c.AdwTabPage) void = null,
     transfer_ctx: ?*anyopaque = null,
@@ -386,6 +394,8 @@ pub const TabBar = struct {
         /// Always present (so it sets the tab height like AdwTab); hidden
         /// on pinned tabs.
         close_btn: ?*c.GtkWidget = null,
+        middle_click: ?*c.GtkGesture = null,
+        right_click: ?*c.GtkGesture = null,
         title_handler: c.gulong = 0,
         icon_handler: c.gulong = 0,
         /// Visual horizontal shift (px) used during a reorder: the
@@ -443,6 +453,7 @@ pub const TabBar = struct {
             .view = view,
             .root = tabbar,
             .box = @ptrCast(box),
+            .verify_teardown = c.getenv("SKETERM_VERIFY_TABBAR_TEARDOWN") != null,
         };
 
         // In-bar visual reorder (AdwTabBox-style): one drag gesture on the
@@ -458,6 +469,7 @@ pub const TabBar = struct {
         _ = c.g_signal_connect_data(reorder, "drag-update", @ptrCast(&onReorderUpdate), self, null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(reorder, "drag-end", @ptrCast(&onReorderEnd), self, null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(box, @ptrCast(@alignCast(reorder)));
+        self.reorder_gesture = reorder;
 
         // Accept GDK drags pulled in from another window's strip (the
         // cross-window transfer half of the hybrid; in-bar reorder never
@@ -465,6 +477,7 @@ pub const TabBar = struct {
         const drop = c.gtk_drop_target_new(c.G_TYPE_INT, c.GDK_ACTION_MOVE);
         _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onDrop), self, null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(box, @ptrCast(@alignCast(drop)));
+        self.drop_target = drop;
 
         _ = c.g_signal_connect_data(view, "page-attached", @ptrCast(&onStructure), self, null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(view, "page-detached", @ptrCast(&onStructure), self, null, c.G_CONNECT_DEFAULT);
@@ -476,7 +489,7 @@ pub const TabBar = struct {
     }
 
     pub fn ensureTick(self: *TabBar) void {
-        if (self.tick_id != 0) return;
+        if (self.callbacks_severed or self.tick_id != 0) return;
         self.tick_id = c.g_timeout_add(33, @ptrCast(&onTick), self);
     }
 
@@ -498,6 +511,7 @@ pub const TabBar = struct {
     /// are excluded — the tick is animating those (warnEval keeps it awake);
     /// they need no wake-up.
     fn rescheduleWarn(self: *TabBar) void {
+        if (self.callbacks_severed) return;
         if (self.warn_arm_id != 0) {
             _ = c.g_source_remove(self.warn_arm_id);
             self.warn_arm_id = 0;
@@ -511,7 +525,13 @@ pub const TabBar = struct {
             if (deadline <= now) continue; // already past → tick is animating it
             if (soonest == null or deadline < soonest.?) soonest = deadline;
         }
-        const d = soonest orelse return;
+        const d = soonest orelse {
+            // Keep the one-shot source genuinely live until teardown in the
+            // focused smokes, even after a warning crossed its deadline.
+            if (self.verify_teardown)
+                self.warn_arm_id = c.g_timeout_add(3_600_000, @ptrCast(&onWarnArm), self);
+            return;
+        };
         // +50ms so warnEval is comfortably past the threshold when we wake.
         const ms: c.guint = @intCast(@max(@divFloor(d - now, 1000) + 50, 1));
         self.warn_arm_id = c.g_timeout_add(ms, @ptrCast(&onWarnArm), self);
@@ -520,6 +540,7 @@ pub const TabBar = struct {
     /// Mark the selected tab's `:selected` state (what libadwaita's
     /// `tabbar tab:selected` rule styles) and repaint glows.
     pub fn refresh(self: *TabBar) void {
+        if (self.callbacks_severed) return;
         const sel = c.adw_tab_view_get_selected_page(self.view);
         for (self.tabs.items, 0..) |t, idx| {
             const this_sel = sel == @as(?*c.AdwTabPage, t.page);
@@ -546,8 +567,58 @@ pub const TabBar = struct {
         // retain a pointer to a Tab that this loop is about to free.
         self.reorder = null;
         for (self.tabs.items) |t| {
-            if (t.title_handler != 0) c.g_signal_handler_disconnect(@ptrCast(t.page), t.title_handler);
-            if (t.icon_handler != 0) c.g_signal_handler_disconnect(@ptrCast(t.page), t.icon_handler);
+            var disconnected = c.g_signal_handlers_disconnect_matched(
+                @as(c.gpointer, @ptrCast(t.page)),
+                c.G_SIGNAL_MATCH_DATA,
+                0,
+                0,
+                null,
+                null,
+                @as(c.gpointer, @ptrCast(t)),
+            );
+            if (t.close_btn) |close| {
+                disconnected += c.g_signal_handlers_disconnect_matched(
+                    @as(c.gpointer, @ptrCast(close)),
+                    c.G_SIGNAL_MATCH_DATA,
+                    0,
+                    0,
+                    null,
+                    null,
+                    @as(c.gpointer, @ptrCast(t)),
+                );
+            }
+            if (t.middle_click) |click| {
+                disconnected += c.g_signal_handlers_disconnect_matched(
+                    @as(c.gpointer, @ptrCast(click)),
+                    c.G_SIGNAL_MATCH_DATA,
+                    0,
+                    0,
+                    null,
+                    null,
+                    @as(c.gpointer, @ptrCast(t)),
+                );
+            }
+            if (t.right_click) |click| {
+                disconnected += c.g_signal_handlers_disconnect_matched(
+                    @as(c.gpointer, @ptrCast(click)),
+                    c.G_SIGNAL_MATCH_DATA,
+                    0,
+                    0,
+                    null,
+                    null,
+                    @as(c.gpointer, @ptrCast(t)),
+                );
+            }
+            t.title_handler = 0;
+            t.icon_handler = 0;
+            c.g_object_set_data(@ptrCast(@alignCast(t.tab_box)), "sketerm-tab", null);
+            c.g_object_set_data(@ptrCast(@alignCast(t.child)), "sketerm-tab", null);
+            if (t.sep_before) |s|
+                c.g_object_set_data(@ptrCast(@alignCast(s)), "sketerm-sep-tab", null);
+            if (self.verify_teardown and disconnected != 5) {
+                std.debug.print("sketerm: TabBar tab sever mismatch (signals={d})\n", .{disconnected});
+                c.abort();
+            }
             if (t.sep_before) |s| c.gtk_box_remove(@ptrCast(self.box), s);
             c.gtk_box_remove(@ptrCast(self.box), t.child);
             self.allocator.destroy(t);
@@ -556,6 +627,7 @@ pub const TabBar = struct {
     }
 
     pub fn rebuild(self: *TabBar) void {
+        if (self.callbacks_severed) return;
         self.clearTabs();
         const n = c.adw_tab_view_get_n_pages(self.view);
         var i: c_int = 0;
@@ -580,12 +652,26 @@ pub const TabBar = struct {
         }
         self.refreshHidden();
         self.refresh();
+        if (self.verify_teardown) {
+            // Exercise real effect state and a silence deadline while the
+            // source assertions keep both raw-pointer callbacks pending.
+            for (self.tabs.items) |t| {
+                var settings = tab_effects.tabSettings(t.page);
+                settings.show_activity = true;
+                settings.warn_inactive = true;
+                tab_effects.setTabSettings(t.page, settings);
+                tab_effects.recordActivity(t.page);
+            }
+            self.ensureTick();
+            self.rescheduleWarn();
+        }
     }
 
     /// Apply the tree-collapse hidden state to the strip: a hidden
     /// tab's widget (and its leading separator) goes invisible. Cheap
     /// enough to run after any collapse/expand without a rebuild.
     pub fn refreshHidden(self: *TabBar) void {
+        if (self.callbacks_severed) return;
         const f = self.is_hidden orelse return;
         for (self.tabs.items) |t| {
             const hid = f(self.hidden_ctx, t.page);
@@ -641,7 +727,6 @@ pub const TabBar = struct {
         c.gtk_widget_add_css_class(close, "tab-close-button");
         c.gtk_widget_set_valign(close, c.GTK_ALIGN_CENTER);
         c.gtk_widget_set_visible(close, @intFromBool(!pinned));
-        _ = c.g_signal_connect_data(close, "clicked", @ptrCast(&onClose), t, null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_set_parent(close, tab_box);
 
         t.* = .{
@@ -666,6 +751,7 @@ pub const TabBar = struct {
         c.gtk_gesture_single_set_button(@ptrCast(click), 2);
         _ = c.g_signal_connect_data(click, "pressed", @ptrCast(&onPressed), t, null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(tab_box, @ptrCast(@alignCast(click)));
+        t.middle_click = click;
 
         // Right-click → tab context menu (rename, effect toggles, …). Owned
         // by the Window via the `on_context` hook.
@@ -673,12 +759,19 @@ pub const TabBar = struct {
         c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
         _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightPressed), t, null, c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(tab_box, @ptrCast(@alignCast(rclick)));
+        t.right_click = rclick;
 
+        _ = c.g_signal_connect_data(close, "clicked", @ptrCast(&onClose), t, null, c.G_CONNECT_DEFAULT);
         t.title_handler = c.g_signal_connect_data(@ptrCast(page), "notify::title", @ptrCast(&onTitle), t, null, c.G_CONNECT_DEFAULT);
         t.icon_handler = c.g_signal_connect_data(@ptrCast(page), "notify::icon", @ptrCast(&onIcon), t, null, c.G_CONNECT_DEFAULT);
     }
 
-    pub fn deinit(self: *TabBar) void {
+    /// Fence every callback carrying this controller or one of its Tab records while widgets are valid.
+    pub fn sever(self: *TabBar) void {
+        if (self.callbacks_severed) return;
+        self.callbacks_severed = true;
+
+        const sources_live = self.tick_id != 0 and self.warn_arm_id != 0;
         if (self.tick_id != 0) {
             _ = c.g_source_remove(self.tick_id);
             self.tick_id = 0;
@@ -690,8 +783,68 @@ pub const TabBar = struct {
         if (dragged) |d| {
             if (d.view == self.view) clearDragged();
         }
+
+        var disconnected: c.guint = c.g_signal_handlers_disconnect_matched(
+            @as(c.gpointer, @ptrCast(self.view)),
+            c.G_SIGNAL_MATCH_DATA,
+            0,
+            0,
+            null,
+            null,
+            @as(c.gpointer, @ptrCast(self)),
+        );
+        if (self.reorder_gesture) |gesture| {
+            disconnected += c.g_signal_handlers_disconnect_matched(
+                @as(c.gpointer, @ptrCast(gesture)),
+                c.G_SIGNAL_MATCH_DATA,
+                0,
+                0,
+                null,
+                null,
+                @as(c.gpointer, @ptrCast(self)),
+            );
+            self.reorder_gesture = null;
+        }
+        if (self.drop_target) |target| {
+            disconnected += c.g_signal_handlers_disconnect_matched(
+                @as(c.gpointer, @ptrCast(target)),
+                c.G_SIGNAL_MATCH_DATA,
+                0,
+                0,
+                null,
+                null,
+                @as(c.gpointer, @ptrCast(self)),
+            );
+            self.drop_target = null;
+        }
+
+        self.detach_ctx = null;
+        self.on_detach = null;
+        self.transfer_ctx = null;
+        self.on_transfer = null;
+        self.context_ctx = null;
+        self.on_context = null;
+        self.hidden_ctx = null;
+        self.is_hidden = null;
+        self.config = &default_config;
         self.clearTabs();
         self.tabs.deinit(self.allocator);
+
+        if (self.verify_teardown and (!sources_live or disconnected != 8)) {
+            std.debug.print(
+                "sketerm: TabBar sever mismatch (sources={}, signals={d})\n",
+                .{ sources_live, disconnected },
+            );
+            c.abort();
+        }
+    }
+
+    pub fn deinit(self: *TabBar) void {
+        if (self.verify_teardown and !self.callbacks_severed) {
+            std.debug.print("sketerm: TabBar deinit reached before pre-widget sever\n", .{});
+            c.abort();
+        }
+        self.sever();
         self.allocator.destroy(self);
     }
 };
@@ -825,6 +978,7 @@ fn onTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     // while any tab is mid-slide or being dragged.
     if (dragging or any_active) c.gtk_widget_queue_draw(self.box);
     if (!any_active and !dragging) {
+        if (self.verify_teardown) return 1;
         self.tick_id = 0;
         return 0;
     }

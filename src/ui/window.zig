@@ -1133,6 +1133,7 @@ pub const Window = struct {
         if (self.si_zsh_shim) |s| self.allocator.free(s);
         if (self.si_fish_shim) |s| self.allocator.free(s);
         if (self.si_bash_shim) |s| self.allocator.free(s);
+        self.tabbar.deinit();
         self.tab_forest.deinit();
         self.config.deinit();
         self.allocator.destroy(self);
@@ -1140,13 +1141,20 @@ pub const Window = struct {
 
     /// Fence widget callbacks and flush pending sidebar config before GTK disposal can outlive this Window.
     fn beginDestroy(self: *Window) void {
+        if (self.destroying) return;
         self.destroying = true;
+        self.tabbar.sever();
         @import("prefs.zig").closeForWindow(@ptrCast(self));
         if (self.tab_sidebar) |sb| sb.sever();
         self.tab_sidebar = null;
         const sidebar_flush = self.sidebar_config_save.teardown();
         if (sidebar_flush.source != 0) _ = c.g_source_remove(sidebar_flush.source);
         if (sidebar_flush.persist) winconfig_mod.persistConfig(self);
+    }
+
+    fn destroyToplevel(self: *Window) void {
+        self.beginDestroy();
+        c.gtk_window_destroy(@ptrCast(self.app_window));
     }
 
     /// Drop every signal handler this Window installed on an object
@@ -2364,7 +2372,7 @@ pub const Window = struct {
         const page = c.adw_tab_view_get_selected_page(self.tab_view) orelse return;
         const win = self.spawnSecondaryWindow() orelse return;
         if (!win.transferPageFrom(self.tab_view, page, 0))
-            c.gtk_window_destroy(@ptrCast(win.app_window));
+            win.destroyToplevel();
     }
 
     /// Take ownership of a pane that arrived from another Window via
@@ -3817,7 +3825,7 @@ pub const Window = struct {
         if (c.adw_tab_view_get_n_pages(self.tab_view) <= 1) return;
         const win = self.spawnSecondaryWindow() orelse return;
         if (!win.transferPageFrom(self.tab_view, page, 0))
-            c.gtk_window_destroy(@ptrCast(win.app_window));
+            win.destroyToplevel();
     }
 
     /// Discard the web pages of every pane hidden by collapsing
@@ -4715,8 +4723,7 @@ fn onCloseTabResponse(user: ?*anyopaque, resp: []const u8) void {
     }
 }
 
-/// Window-level close-request gate. Returning TRUE blocks the close
-/// while we ask; on accept we close manually via gtk_window_close.
+/// Window-level close-request gate that prepares accepted closes before GTK disposal.
 fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Window, user);
 
@@ -4743,7 +4750,10 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
                 dirty,
                 if (dirty == 1) @as([]const u8, "") else @as([]const u8, "s"),
             }) catch "There are editor files with unsaved changes.";
-            const pending = self.allocator.create(PendingCloseWin) catch return 0;
+            const pending = self.allocator.create(PendingCloseWin) catch {
+                self.beginDestroy();
+                return 0;
+            };
             pending.* = .{ .win = self };
             if (confirm.present(self.app_window, .{
                 .heading = "Discard unsaved changes?",
@@ -4755,16 +4765,23 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
                 .kick_root = self.app_window,
             }, .{ .allocator = self.allocator, .cb = &onCloseWinResponse, .ctx = @ptrCast(pending) }) == null) {
                 self.allocator.destroy(pending);
+                self.beginDestroy();
                 return 0;
             }
             return 1;
         }
     }
 
-    if (self.config.confirm_close == .never) return 0;
+    if (self.config.confirm_close == .never) {
+        self.beginDestroy();
+        return 0;
+    }
 
     const npanes = self.panes.items.len;
-    if (self.config.confirm_close == .multiple and npanes <= 1) return 0;
+    if (self.config.confirm_close == .multiple and npanes <= 1) {
+        self.beginDestroy();
+        return 0;
+    }
 
     const body_buf = std.fmt.allocPrintSentinel(
         self.allocator,
@@ -4777,11 +4794,15 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
         0,
     ) catch {
         // Fall back to a generic body — never block close on OOM.
+        self.beginDestroy();
         return 0;
     };
     defer self.allocator.free(body_buf);
 
-    const pending = self.allocator.create(PendingCloseWin) catch return 0;
+    const pending = self.allocator.create(PendingCloseWin) catch {
+        self.beginDestroy();
+        return 0;
+    };
     pending.* = .{ .win = self };
 
     if (confirm.present(self.app_window, .{
@@ -4794,6 +4815,7 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
         .kick_root = self.app_window,
     }, .{ .allocator = self.allocator, .cb = &onCloseWinResponse, .ctx = @ptrCast(pending) }) == null) {
         self.allocator.destroy(pending);
+        self.beginDestroy();
         return 0;
     }
     return 1; // block while dialog is up
@@ -4808,9 +4830,8 @@ fn onCloseWinResponse(user: ?*anyopaque, resp: []const u8) void {
             pending.win.saveLayoutQuietly();
             pending.win.layout_saved_final = true;
         }
-        // Disconnect our close-request handler before destroying so
-        // it doesn't fire again on the actual close.
-        c.gtk_window_destroy(@ptrCast(pending.win.app_window));
+        // Enter the same pre-destroy choke point as unprompted closes.
+        pending.win.destroyToplevel();
     }
 }
 
@@ -4923,7 +4944,7 @@ fn onPageDetachedIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
         } else {
             // A secondary window with no tabs left has no reason to
             // exist — its last tab was closed or dragged elsewhere.
-            c.gtk_window_destroy(@ptrCast(self.app_window));
+            self.destroyToplevel();
             return 0;
         }
     }
@@ -4975,7 +4996,7 @@ fn onTabDetach(ctx: ?*anyopaque, view: *c.AdwTabView, page: *c.AdwTabPage) void 
     const self = cast.userData(Window, ctx);
     const win = self.spawnSecondaryWindow() orelse return;
     if (!win.transferPageFrom(view, page, 0))
-        c.gtk_window_destroy(@ptrCast(win.app_window));
+        win.destroyToplevel();
 }
 
 fn onTabTransfer(
@@ -4996,7 +5017,7 @@ fn onCreateWindow(_: *c.AdwTabView, user: ?*anyopaque) callconv(.c) ?*c.AdwTabVi
     const win = self.spawnSecondaryWindow() orelse return null;
     reserveNativeDragDestination(self, win) catch {
         showToast(self, "Could not move the tab: out of memory");
-        c.gtk_window_destroy(@ptrCast(win.app_window));
+        win.destroyToplevel();
         return null;
     };
     return win.tab_view;
@@ -5015,7 +5036,10 @@ fn reserveNativeDragDestination(source: *Window, destination: *Window) !void {
 /// unmapped path in onPageDetached.
 fn onWindowDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
-    self.beginDestroy();
+    if (!self.destroying) {
+        std.debug.print("sketerm: GtkWindow destroyed before Window.beginDestroy\n", .{});
+        c.abort();
+    }
     if (self.is_primary) {
         const app = c.g_application_get_default();
         if (app != null) c.g_application_quit(@ptrCast(@alignCast(app)));
