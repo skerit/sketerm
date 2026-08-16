@@ -634,6 +634,13 @@ pub const Client = struct {
     /// identity contexts). An older helper ignores the frames and every
     /// view shares one cookie jar — silent, correct degradation.
     cap_contexts: bool = false,
+    /// The helper applies proxy preferences transactionally and refuses
+    /// unknown nonzero contexts instead of falling back to direct traffic.
+    /// Egress views require this; ordinary direct views do not.
+    cap_contexts_fail_closed: bool = false,
+    /// The current connection's `hello_ack` has arrived. Egress views wait
+    /// for it because capability absence is a refusal, not degradation.
+    hello_done: bool = false,
     /// The helper accepts the 0xC0 user-content sets (userscripts +
     /// userstyles). On the ack the client fetches both sets from the
     /// daemon web store and pushes them; an older helper skips the
@@ -822,6 +829,9 @@ pub const Client = struct {
         // Capabilities belong to the CONNECTION, not to the client: a
         // restart may land on a different helper build.
         self.cap_discard = false;
+        self.cap_contexts = false;
+        self.cap_contexts_fail_closed = false;
+        self.hello_done = false;
         self.cap_frames_inline = false;
         self.cap_filter_subscribe = false;
         self.cap_reader_ids = false;
@@ -1170,6 +1180,7 @@ pub const Client = struct {
                 self.cap_a11y = false;
                 self.cap_a11y_caret = false;
                 self.cap_contexts = false;
+                self.cap_contexts_fail_closed = false;
                 self.cap_userscripts = false;
                 self.cap_sitedata = false;
                 self.cap_scroll = false;
@@ -1190,6 +1201,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.cap_a11y_caret = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.cap_contexts_fail_closed = true;
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.cap_userscripts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.cap_sitedata = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SCROLL)) self.cap_scroll = true;
@@ -1208,6 +1220,7 @@ pub const Client = struct {
                     self.fail("The browser helper on the remote host is too old for remote browsing (no frames-inline capability).");
                     return;
                 }
+                self.hello_done = true;
                 if (self.isRemote()) {
                     self.cap_webext = false;
                     self.cap_webext_tabs = false;
@@ -1222,6 +1235,10 @@ pub const Client = struct {
                 // The capability was unknown until this reply, so this
                 // is the first point the configured set can be sent.
                 publishFilterSubs(self);
+                // Direct views were minted optimistically before the ack.
+                // Egress views wait until the strict context guarantee is
+                // known, so release (or visibly refuse) those waiters now.
+                for (self.faces.items) |face| face.ensureView();
             },
             .ev_webext_state => {
                 const st = proto.decode(proto.EvWebextState, frame.payload) catch return;
@@ -1310,6 +1327,10 @@ pub const Client = struct {
             .ev_load_error => {
                 const ev = proto.decode(proto.EvLoadError, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onLoadError(ev);
+            },
+            .ev_view_create_failed => {
+                const ev = proto.decode(proto.EvViewCreateFailed, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| face.onViewCreateFailed(ev);
             },
             .ev_cursor => {
                 const ev = proto.decode(proto.EvCursor, frame.payload) catch return;
@@ -1620,6 +1641,14 @@ pub fn findContainer(id: u32) ?*Container {
     return null;
 }
 
+const EgressSupport = enum { waiting, ready, unsupported };
+
+fn egressSupport(hello_done: bool, contexts: bool, fail_closed: bool) EgressSupport {
+    if (!hello_done) return .waiting;
+    if (!contexts or !fail_closed) return .unsupported;
+    return .ready;
+}
+
 /// Accent color of a container, or null for the default context.
 pub fn containerColor(id: u32) ?[3]u8 {
     if (id == 0) return null;
@@ -1681,7 +1710,18 @@ pub const ContainerSpec = struct {
     remote_host: []const u8 = "",
 };
 
+const EgressFactory = *const fn (std.mem.Allocator, []const u8) ?*socksbridge.Egress;
+
+fn createEgress(gpa: std.mem.Allocator, host: []const u8) ?*socksbridge.Egress {
+    return socksbridge.Egress.create(gpa, host, mux_cli.muxConnect);
+}
+
 pub fn createContainerAt(gpa: std.mem.Allocator, spec: ContainerSpec) u32 {
+    return createContainerAtWith(gpa, spec, createEgress);
+}
+
+fn createContainerAtWith(gpa: std.mem.Allocator, spec: ContainerSpec, make_egress: EgressFactory) u32 {
+    if (spec.egress_host.len != 0 and spec.remote_host.len != 0) return 0;
     // Ephemeral containers are minted here and never stored, so their
     // ids come from a DISJOINT high range: the daemon store counts up
     // from 1, and an incognito tab opened before the stored registry
@@ -1720,24 +1760,43 @@ pub fn createContainerAt(gpa: std.mem.Allocator, spec: ContainerSpec) u32 {
         gpa.free(host_owned);
         return 0;
     };
-    var proxy_owned: []u8 = gpa.dupe(u8, "") catch {
+    var egress: ?*socksbridge.Egress = null;
+    const proxy_owned: []u8 = if (egress_host.len != 0) blk: {
+        const eg = make_egress(gpa, egress_host) orelse {
+            gpa.free(name_owned);
+            gpa.free(jar_owned);
+            gpa.free(host_owned);
+            gpa.free(remote_owned);
+            return 0;
+        };
+        const proxy = std.fmt.allocPrint(gpa, "socks5://127.0.0.1:{d}", .{eg.port()}) catch {
+            eg.stop();
+            eg.destroy();
+            gpa.free(name_owned);
+            gpa.free(jar_owned);
+            gpa.free(host_owned);
+            gpa.free(remote_owned);
+            return 0;
+        };
+        if (proxy.len == 0 or !eg.spawn()) {
+            eg.stop();
+            eg.destroy();
+            gpa.free(proxy);
+            gpa.free(name_owned);
+            gpa.free(jar_owned);
+            gpa.free(host_owned);
+            gpa.free(remote_owned);
+            return 0;
+        }
+        egress = eg;
+        break :blk proxy;
+    } else gpa.dupe(u8, "") catch {
         gpa.free(name_owned);
         gpa.free(jar_owned);
         gpa.free(host_owned);
         gpa.free(remote_owned);
         return 0;
     };
-    var egress: ?*socksbridge.Egress = null;
-    if (egress_host.len != 0) {
-        if (socksbridge.Egress.create(gpa, egress_host, mux_cli.muxConnect)) |eg| {
-            eg.spawn();
-            egress = eg;
-            gpa.free(proxy_owned);
-            proxy_owned = std.fmt.allocPrint(gpa, "socks5://127.0.0.1:{d}", .{eg.port()}) catch blk: {
-                break :blk gpa.dupe(u8, "") catch unreachable;
-            };
-        }
-    }
 
     g_containers.append(gpa, .{
         .id = id,
@@ -2068,6 +2127,32 @@ test "containerForUrl falls back when no rule names the host" {
     try t.expectEqual(@as(u32, 9), containerForUrl("about:blank", 9));
 }
 
+test "egress containers are not registered without a bridge" {
+    const t = std.testing;
+    const Stub = struct {
+        fn create(_: std.mem.Allocator, _: []const u8) ?*socksbridge.Egress {
+            return null;
+        }
+    };
+    const before = g_containers.items.len;
+    const id = createContainerAtWith(t.allocator, .{
+        .id = 0x7fff_ff00,
+        .name = "unreachable",
+        .ephemeral = true,
+        .egress_host = "missing.example",
+    }, Stub.create);
+    try t.expectEqual(@as(u32, 0), id);
+    try t.expectEqual(before, g_containers.items.len);
+}
+
+test "egress waits for strict helper context support" {
+    const t = std.testing;
+    try t.expectEqual(EgressSupport.waiting, egressSupport(false, false, false));
+    try t.expectEqual(EgressSupport.unsupported, egressSupport(true, false, false));
+    try t.expectEqual(EgressSupport.unsupported, egressSupport(true, true, false));
+    try t.expectEqual(EgressSupport.ready, egressSupport(true, true, true));
+}
+
 /// Container a url should open in. An explicit per-site rule BEATS the
 /// container that would otherwise be inherited — that is what "always
 /// open this site in Work" means, including when the link was followed
@@ -2352,14 +2437,20 @@ fn onContainerAdded(user: ?*anyopaque, ok: bool, payload: []const u8) void {
         id = webstore.parseContainerId(arena.allocator(), payload);
     }
     if (id != 0) {
+        const stored_id = id;
         id = createContainerAt(gpa, .{
-            .id = id,
+            .id = stored_id,
             .name = p.name,
             .jar = p.name,
             .color = p.color,
             .egress_host = p.egress_host,
             .remote_host = p.remote_host,
         });
+        // The daemon write happened first so it could mint the stable id.
+        // If local setup cannot make the corresponding live container,
+        // remove that half-committed record instead of reviving it on the
+        // next launch as an apparently usable route.
+        if (id == 0) _ = webstore.containerRemove(gpa, stored_id, null, &onStoreAck);
     }
     if (p.cb) |cb| cb(p.ctx, id);
 }
@@ -5081,7 +5172,33 @@ pub const WebFace = struct {
         // wrong identity silently. The stored registry arrives
         // asynchronously, so a container-bound face waits for it and
         // `markContainersReady` kicks every waiter.
-        if (self.container != 0 and !g_containers_loaded) return;
+        if (self.container != 0) {
+            if (!g_containers_loaded) return;
+            const ctn = findContainer(self.container) orelse {
+                self.setStatus("Browser view creation failed: the requested container is unavailable.", false);
+                return;
+            };
+            if (ctn.egress_host.len != 0) {
+                switch (egressSupport(cl.hello_done, cl.cap_contexts, cl.cap_contexts_fail_closed)) {
+                    .waiting => return,
+                    .unsupported => {
+                        self.setStatus("Browser view creation failed: this helper cannot enforce fail-closed egress.", false);
+                        return;
+                    },
+                    .ready => {},
+                }
+                // Creation guarantees both, but keep the policy at the
+                // last boundary before view_create as well: a damaged
+                // registry must not turn an egress face into a direct one.
+                if (ctn.proxy.len == 0 or ctn.egress == null) {
+                    self.setStatus("Browser view creation failed: the egress bridge is unavailable.", true);
+                    return;
+                }
+                // Ordered immediately before view_create. This also makes
+                // Reload retry a context whose first proxy setup was refused.
+                publishOne(cl, ctn);
+            }
+        }
         // THE FIRST BUFFER MUST ALREADY BE THE RIGHT SIZE. The area's
         // CURRENT allocation is the truth whenever it has one; the
         // 800x600 below is for a face whose widget has never been laid
@@ -5852,6 +5969,16 @@ pub const WebFace = struct {
         }
         var buf: [512]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, "Could not load {s}: {s} ({d})", .{ ev.url, ev.msg, ev.code }) catch "Could not load this page.";
+        self.setStatus(msg, true);
+    }
+
+    pub fn onViewCreateFailed(self: *WebFace, ev: proto.EvViewCreateFailed) void {
+        self.view_live = false;
+        self.stopDiscardTimer();
+        self.dropMap();
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "Browser view creation failed: {s}.", .{ev.reason}) catch
+            "Browser view creation failed.";
         self.setStatus(msg, true);
     }
 

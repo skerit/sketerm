@@ -735,6 +735,16 @@ fn semanticResult(comptime T: type) bool {
 // Host
 // ---------------------------------------------------------------------
 
+const ProxyPref = struct {
+    dict: *cef.cef_dictionary_value_t,
+    value: *cef.cef_value_t,
+
+    fn releaseAll(self: ProxyPref) void {
+        release(&self.value.base);
+        release(&self.dict.base);
+    }
+};
+
 /// The browser fleet plus its outbound protocol queue.
 ///
 /// A single instance per process, reachable from the C callbacks
@@ -787,6 +797,9 @@ pub const Host = struct {
     /// id; id 0 is the shared default (a null request context) and never
     /// appears here.
     contexts: std.ArrayList(Ctx) = .empty,
+    /// CEF's preference manager can keep the supplied value graph beyond
+    /// `set_preference`; retain it for the helper lifetime.
+    proxy_prefs: std.ArrayList(ProxyPref) = .empty,
 
     /// WebExtensions host: the loaded-extension registry, storage and
     /// browser.* dispatch. Content-script injection and background-page
@@ -999,6 +1012,8 @@ pub const Host = struct {
         self.downloads.deinit(self.gpa);
         for (self.contexts.items) |ctx| release(&ctx.rc.base.base);
         self.contexts.deinit(self.gpa);
+        for (self.proxy_prefs.items) |pref| pref.releaseAll();
+        self.proxy_prefs.deinit(self.gpa);
         self.us_scripts.deinit(self.gpa);
         if (self.us_script_arena) |*a| a.deinit();
         self.us_styles.deinit(self.gpa);
@@ -1046,16 +1061,27 @@ pub const Host = struct {
 
         const rc: *cef.cef_request_context_t = cef.cef_request_context_create_context(&settings, null) orelse return;
 
+        // A proxied context is all-or-nothing. Registering an rc whose
+        // preference was refused would make its views use direct traffic.
+        const pref: ?ProxyPref = if (req.proxy.len != 0) applyProxy(rc, req.proxy) orelse {
+            release(&rc.base.base);
+            return;
+        } else null;
+        if (pref) |p| self.proxy_prefs.append(self.gpa, p) catch {
+            p.releaseAll();
+            release(&rc.base.base);
+            return;
+        };
+
         // The global registration does not reach this context.
         registerExtSchemeOn(rc);
-
-        if (req.proxy.len != 0) applyProxy(rc, req.proxy);
 
         self.contexts.append(self.gpa, .{
             .id = req.id,
             .rc = rc,
             .ephemeral = req.ephemeral != 0,
         }) catch {
+            if (pref != null) self.proxy_prefs.pop().?.releaseAll();
             release(&rc.base.base);
             return;
         };
@@ -1122,6 +1148,14 @@ pub const Host = struct {
     /// `initial_url` means a blank document.
     fn createViewAt(self: *Host, req: proto.ViewCreate, initial_url: []const u8) !void {
         if (req.view == 0 or self.find(req.view) != null) return;
+        if (req.context != 0 and self.lookupContext(req.context) == null) {
+            self.post(proto.EvViewCreateFailed{
+                .view = req.view,
+                .context = req.context,
+                .reason = "requested browser context does not exist",
+            });
+            return;
+        }
         const v = try self.gpa.create(View);
         errdefer self.gpa.destroy(v);
         const scale: u16 = if (req.scale_x1000 == 0) 1000 else req.scale_x1000;
@@ -8071,29 +8105,46 @@ fn sanitizeContextName(name: []const u8, id: u32, buf: *[256]u8) []const u8 {
 /// browser spike proved: `set_preference("proxy", {mode:"fixed_servers",
 /// server:<url>})` on the context's base preference manager. A socks5
 /// url makes the engine resolve DNS at the proxy end — the "browse via
-/// server X" property. Failure is logged to CEF's log, never fatal.
-fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) void {
-    const dict: *cef.cef_dictionary_value_t = cef.cef_dictionary_value_create() orelse return;
-    var k = std.mem.zeroes(cef.cef_string_t);
-    var v = std.mem.zeroes(cef.cef_string_t);
-    setStr("mode", &k);
-    setStr("fixed_servers", &v);
-    _ = (dict.set_string orelse return)(dict, &k, &v);
-    cef.cef_string_utf16_clear(&k);
-    cef.cef_string_utf16_clear(&v);
-    setStr("server", &k);
-    setStr(proxy_url, &v);
-    _ = (dict.set_string orelse return)(dict, &k, &v);
-    cef.cef_string_utf16_clear(&v);
+/// server X" property. Null leaves the caller responsible for dropping the
+/// request context before any view can use it.
+fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) ?ProxyPref {
+    // Deterministic smoke seam for the otherwise engine-controlled refusal.
+    if (c.getenv("SKETERM_WEB_FAIL_PROXY") != null) return null;
 
-    const val: *cef.cef_value_t = cef.cef_value_create() orelse return;
-    _ = (val.set_dictionary orelse return)(val, dict);
-    setStr("proxy", &k);
+    const dict: *cef.cef_dictionary_value_t = cef.cef_dictionary_value_create() orelse return null;
+    var keep_dict = false;
+    defer if (!keep_dict) release(&dict.base);
+    var mode_key = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&mode_key);
+    var mode_value = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&mode_value);
+    setStr("mode", &mode_key);
+    setStr("fixed_servers", &mode_value);
+    if ((dict.set_string orelse return null)(dict, &mode_key, &mode_value) == 0) return null;
+
+    var server_key = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&server_key);
+    var server_value = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&server_value);
+    setStr("server", &server_key);
+    setStr(proxy_url, &server_value);
+    if ((dict.set_string orelse return null)(dict, &server_key, &server_value) == 0) return null;
+
+    const val: *cef.cef_value_t = cef.cef_value_create() orelse return null;
+    var keep_value = false;
+    defer if (!keep_value) release(&val.base);
+    if ((val.set_dictionary orelse return null)(val, dict) == 0) return null;
+
+    var pref_key = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&pref_key);
+    setStr("proxy", &pref_key);
     var err = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&err);
     const base: *cef.cef_preference_manager_t = &rc.base;
-    _ = (base.set_preference orelse return)(base, &k, val, &err);
-    cef.cef_string_utf16_clear(&k);
-    cef.cef_string_utf16_clear(&err);
+    if ((base.set_preference orelse return null)(base, &pref_key, val, &err) == 0) return null;
+    keep_dict = true;
+    keep_value = true;
+    return .{ .dict = dict, .value = val };
 }
 
 /// Borrowed UTF-8 view of a CEF string; `free` releases it.

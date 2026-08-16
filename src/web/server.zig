@@ -76,6 +76,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_A11Y,
     proto.CAP_A11Y_CARET,
     proto.CAP_CONTEXTS,
+    proto.CAP_CONTEXTS_FAIL_CLOSED,
     proto.CAP_USERSCRIPTS,
     proto.CAP_SITEDATA,
     proto.CAP_FRAMES_INLINE,

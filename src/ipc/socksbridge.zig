@@ -170,6 +170,11 @@ pub const Bridge = struct {
         const lfd = platformSocket();
         if (lfd < 0) return error.SocketFailed;
         self.listen_fd = lfd;
+        errdefer {
+            _ = c.close(lfd);
+            self.listen_fd = -1;
+            self.port = 0;
+        }
         var one: c_int = 1;
         _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
         var sa = std.mem.zeroes(c.struct_sockaddr_in);
@@ -181,18 +186,15 @@ pub const Bridge = struct {
         // Read back the actual port when auto-picked.
         var got = std.mem.zeroes(c.struct_sockaddr_in);
         var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-        if (c.getsockname(lfd, @ptrCast(&got), &glen) == 0) {
-            self.port = std.mem.bigToNative(u16, got.sin_port);
-        } else {
-            self.port = want_port;
-        }
+        if (c.getsockname(lfd, @ptrCast(&got), &glen) != 0) return error.GetsocknameFailed;
+        self.port = std.mem.bigToNative(u16, got.sin_port);
+        if (self.port == 0) return error.InvalidPort;
         // Self-pipe so another thread can wake the loop to stop it.
         var pipefds: [2]c_int = .{ -1, -1 };
-        if (c.pipe(&pipefds) == 0) {
-            self.stop_r = pipefds[0];
-            self.stop_w = pipefds[1];
-            _ = c.fcntl(self.stop_r, c.F_SETFL, c.O_NONBLOCK);
-        }
+        if (c.pipe(&pipefds) != 0) return error.PipeFailed;
+        self.stop_r = pipefds[0];
+        self.stop_w = pipefds[1];
+        _ = c.fcntl(self.stop_r, c.F_SETFL, c.O_NONBLOCK);
     }
 
     /// Wake the poll loop and make `run` return. Thread-safe (a single
@@ -431,8 +433,9 @@ pub const Egress = struct {
         return self.bridge.port;
     }
 
-    pub fn spawn(self: *Egress) void {
-        self.thread = std.Thread.spawn(.{}, Egress.worker, .{self}) catch null;
+    pub fn spawn(self: *Egress) bool {
+        self.thread = std.Thread.spawn(.{}, Egress.worker, .{self}) catch return false;
+        return true;
     }
 
     fn worker(self: *Egress) void {

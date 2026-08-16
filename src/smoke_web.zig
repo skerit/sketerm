@@ -92,6 +92,8 @@ const cookie_probe_value = "abcd1234";
 const egress_view_a: u32 = 5;
 const egress_view_b: u32 = 6;
 const egress_view_c: u32 = 7;
+const egress_unknown_view: u32 = 11;
+const egress_proxy_fail_view: u32 = 12;
 
 /// Stage-37 views. Both are pointed at the SAME loopback origin in two
 /// different containers: origin separation would explain a cookie not
@@ -847,6 +849,7 @@ const Client = struct {
     ack_print_pdf: bool = false,
     ack_downloads: bool = false,
     ack_contexts: bool = false,
+    ack_contexts_fail_closed: bool = false,
     ack_webext: bool = false,
     ack_webext_tabs: bool = false,
     ack_filter_subscribe: bool = false,
@@ -939,6 +942,11 @@ const Client = struct {
     /// Failed main-frame loads (`ev_load_error`), which is what a
     /// cancelled certificate decision produces.
     load_err_seq: u32 = 0,
+    view_create_fail_seq: u32 = 0,
+    view_create_fail_view: u32 = 0,
+    view_create_fail_context: u32 = 0,
+    view_create_fail_reason: [128]u8 = @splat(0),
+    view_create_fail_reason_len: usize = 0,
 
     /// Permission prompts the helper is holding for us.
     perm_seq: u32 = 0,
@@ -1349,6 +1357,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.ack_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.ack_a11y_caret = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.ack_contexts = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.ack_contexts_fail_closed = true;
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.ack_userscripts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.ack_sitedata = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.ack_frames_inline = true;
@@ -1724,6 +1733,14 @@ const Client = struct {
                 if (g_echo_console) {
                     std.debug.print("  [load-error v{d} code {d}] {s}: {s}\n", .{ e.view, e.code, e.url, e.msg });
                 }
+            },
+            .ev_view_create_failed => {
+                const e = proto.decode(proto.EvViewCreateFailed, frame.payload) catch fail("ev_view_create_failed decode");
+                self.view_create_fail_view = e.view;
+                self.view_create_fail_context = e.context;
+                self.view_create_fail_reason_len = @min(e.reason.len, self.view_create_fail_reason.len);
+                @memcpy(self.view_create_fail_reason[0..self.view_create_fail_reason_len], e.reason[0..self.view_create_fail_reason_len]);
+                self.view_create_fail_seq += 1;
             },
             .ev_cert_error => {
                 const e = proto.decode(proto.EvCertError, frame.payload) catch fail("ev_cert_error decode");
@@ -6848,6 +6865,28 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
         if (ec.ack_proto != proto.PROTO_VERSION) fail("stage 26 egress: no hello_ack from the egress helper");
         if (!ec.ack_contexts) fail("stage 26 egress: hello_ack lacks the contexts capability");
+        if (!ec.ack_contexts_fail_closed) fail("stage 26 egress: hello_ack lacks the contexts-fail-closed capability");
+
+        // A nonzero context that was never created must not resolve to the
+        // global direct context. The helper reports only this view's failure
+        // and stays alive for the valid egress stages below.
+        {
+            const seq = ec.view_create_fail_seq;
+            ec.send(proto.ViewCreate{
+                .view = egress_unknown_view,
+                .w = 320,
+                .h = 240,
+                .scale_x1000 = 1000,
+                .context = 999,
+            });
+            if (!ec.waitSeq(&ec.view_create_fail_seq, seq, 10_000))
+                fail("stage 26 fail-closed: an unknown context did not fail the view");
+            if (ec.view_create_fail_view != egress_unknown_view or ec.view_create_fail_context != 999)
+                fail("stage 26 fail-closed: the failure named the wrong view or context");
+            if (ec.view_create_fail_reason_len == 0)
+                fail("stage 26 fail-closed: the creation failure had no reason");
+            pass("stage 26 fail-closed unknown context (no global direct fallback)");
+        }
 
         // Stage 26: a dedicated identity context pointed at a SOCKS5
         // proxy. Its navigation must reach the proxy with the hostname
@@ -6938,6 +6977,50 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // (the whole feature was just proven above). What still MUST hold
         // is that the process terminates rather than hangs.
         reapHelperTolerant(eg_pid, "stages 26/27 egress", 30_000);
+    }
+
+    // A context whose proxy preference is refused is rolled back before it
+    // enters the helper registry. The immediately following view therefore
+    // fails exactly like any other missing context and never gets a buffer.
+    {
+        var sock_fail_buf: [96]u8 = undefined;
+        const sock_fail = std.fmt.bufPrintZ(&sock_fail_buf, "{s}/xf.sock", .{dir}) catch fail("socket path");
+        var cache_fail_buf: [128]u8 = undefined;
+        const cache_fail = std.fmt.bufPrintZ(&cache_fail_buf, "{s}/cache-egress-fail", .{dir}) catch fail("cache path");
+        _ = c.setenv("SKETERM_WEB_FAIL_PROXY", "1", 1);
+        const fail_pid = spawnHelper(exe, sock_fail.ptr, cache_fail.ptr, "--ozone-platform=headless", null, false);
+        _ = c.unsetenv("SKETERM_WEB_FAIL_PROXY");
+        g_pid = fail_pid;
+        var fc = Client{ .gpa = gpa, .fd = connectWithRetry(sock_fail.ptr, sock_fail.len) };
+        fc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-egress-fail" });
+        {
+            const deadline = nowMs() + 20_000;
+            while (fc.ack_proto == 0 and nowMs() < deadline) fc.pump(100);
+        }
+        if (!fc.ack_contexts or !fc.ack_contexts_fail_closed)
+            fail("stage 26 proxy refusal: helper lacks strict context support");
+        fc.send(proto.ContextCreate{
+            .id = 13,
+            .ephemeral = 1,
+            .name = "proxy-refused",
+            .proxy = "socks5://127.0.0.1:9",
+        });
+        fc.send(proto.ViewCreate{
+            .view = egress_proxy_fail_view,
+            .w = 320,
+            .h = 240,
+            .scale_x1000 = 1000,
+            .context = 13,
+        });
+        if (!fc.waitSeq(&fc.view_create_fail_seq, 0, 10_000))
+            fail("stage 26 proxy refusal: the view did not report creation failure");
+        if (fc.view_create_fail_view != egress_proxy_fail_view or fc.view_create_fail_context != 13)
+            fail("stage 26 proxy refusal: the failure named the wrong view or context");
+        if (fc.fb_seq != 0 or fc.dma_seq != 0 or fc.inline_seq != 0)
+            fail("stage 26 proxy refusal: a failed egress view still received a frame buffer");
+        pass("stage 26 proxy refusal (context rollback, view creation fails closed)");
+        fc.deinit();
+        reapHelper(fail_pid, "stage 26 proxy refusal");
     }
 
     // ── Stage 37: cookie JAR isolation between containers ─────

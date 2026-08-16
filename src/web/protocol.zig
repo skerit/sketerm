@@ -102,6 +102,12 @@ pub const CAP_USERSCRIPTS = "userscripts";
 /// (0 = the shared default context). A client without this capability
 /// keeps sending `context = 0` and every view shares one jar.
 pub const CAP_CONTEXTS = "contexts";
+/// The helper creates proxied contexts transactionally and refuses a view
+/// whose nonzero context does not exist, reporting `ev_view_create_failed`.
+/// Egress clients require this in addition to `CAP_CONTEXTS`; an older helper
+/// may otherwise resolve a failed or unknown context through the direct global
+/// request context.
+pub const CAP_CONTEXTS_FAIL_CLOSED = "contexts-fail-closed";
 /// The helper accepts the 0xC8-block site-data frames: enumerate the
 /// cookies a site can see (`cookies_req` -> `ev_cookies`), delete one
 /// (`cookie_delete`), clear them all (`cookies_clear`), and clear the
@@ -250,6 +256,7 @@ pub const Tag = enum(u8) {
     intercept_log = 0x85,
     context_create = 0x90,
     context_destroy = 0x91,
+    ev_view_create_failed = 0x92,
     sem_eval = 0xA0,
     sem_eval_result = 0xA1,
     devtools_show = 0xA2,
@@ -2189,6 +2196,16 @@ pub const ContextDestroy = struct {
     id: u32,
 };
 
+/// A view was not created because its requested context was unavailable.
+/// The helper keeps serving other views; retrying may recreate the context
+/// first and then submit the same client-owned view id again.
+pub const EvViewCreateFailed = struct {
+    pub const tag: Tag = .ev_view_create_failed;
+    view: u32,
+    context: u32,
+    reason: []const u8,
+};
+
 // -- cookies + site data (0xC8 block, capability "sitedata") ----------
 
 /// Most cookies one `ev_cookies` carries. A site with more is not
@@ -3031,6 +3048,7 @@ test "round-trip: container/context frames" {
     });
     try roundTrip(ContextCreate, .{ .id = 4, .ephemeral = 0, .name = "", .proxy = "" });
     try roundTrip(ContextDestroy, .{ .id = 3 });
+    try roundTrip(EvViewCreateFailed, .{ .view = 7, .context = 3, .reason = "requested browser context does not exist" });
 }
 
 test "round-trip: webext frames" {
