@@ -252,6 +252,10 @@ pub fn main() u8 {
         // `atspi`, not `1`: GTK4 silently ignores the GTK3-ism.
         _ = c.setenv("GTK_A11Y", "atspi", 1);
         _ = c.setenv("DBUS_SESSION_BUS_ADDRESS", hub.?.bus_addr_z.ptr, 1);
+        // The final SIGTERM follows a real Wayland GL commit. Make the
+        // GUI abort if TerminalSurface storage reaches deinit before
+        // its callbacks and live GL state are synchronously severed.
+        _ = c.setenv("SKETERM_VERIFY_SURFACE_TEARDOWN", "1", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);

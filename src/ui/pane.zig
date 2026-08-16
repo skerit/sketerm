@@ -781,10 +781,6 @@ pub const Pane = struct {
     }
 
     pub fn deinit(self: *Pane) void {
-        // GLib timeouts hold a raw *TerminalSurface — sever them
-        // before freeing. (The frame-clock tick is widget-owned and
-        // dies with the GtkGLArea; the g_timeout sources are not.)
-        self.surface.stopVisualSources();
         // Defensive: unmap normally detaches first, but a pane torn down
         // while still mapped must not leave a dangling AX child.
         detachA11y(self);
@@ -817,9 +813,7 @@ pub const Pane = struct {
         self.allocator.destroy(self);
     }
 
-    /// Sever every face that outlives the pane's widget subtree — IM
-    /// context, browser, editor, panel, forwarded-app embed — while
-    /// that subtree is still alive. Idempotent.
+    /// Sever the renderer callbacks and every face while the pane's widget subtree is still alive.
     ///
     /// THE single teardown entry point: every path that is about to
     /// destroy a pane's widgets (close, split-collapse, mux takeover,
@@ -833,6 +827,7 @@ pub const Pane = struct {
         const was_severing = self.severing_faces;
         self.severing_faces = true;
         defer self.severing_faces = was_severing;
+        self.surface.sever(self.widgets_dead);
         self.detachIm();
         self.detachBrowser();
         self.detachEditor();

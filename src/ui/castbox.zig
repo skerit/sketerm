@@ -11,7 +11,8 @@
 //! Widget ownership: the host parents `surfaceWidget()` and
 //! `barWidget()` wherever it wants (castview keeps the bar as an Adw
 //! bottom bar; the viewer stacks them in its content area). Teardown
-//! contract, in order: `severLive()` (fences every timer and sink),
+//! contract, in order: `severLive()` (fences surface callbacks, timers
+//! and sinks),
 //! then let the widgets die (window destroy, or explicit removal from
 //! their containers), then `destroy()` — which kills the ephemeral
 //! session and frees the struct. The bar chrome is the shared
@@ -207,7 +208,7 @@ pub const CastPlayerBox = struct {
         if (self.severed) return;
         self.severed = true;
         self.playbar.sever();
-        self.surface.stopVisualSources();
+        self.surface.sever(false);
         self.terminal.clearSinks();
     }
 

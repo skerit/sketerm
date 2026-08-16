@@ -694,6 +694,11 @@ pub fn main() u8 {
         // after every split/close — divergence aborts the app, which
         // fails this harness.
         _ = c.setenv("SKETERM_VERIFY_TREE", "1", 1);
+        // The final SIGTERM happens after the terminal has committed a
+        // real GL frame. Abort if any TerminalSurface reaches deinit
+        // before its area signals, frame tick, and live GL state were
+        // synchronously severed.
+        _ = c.setenv("SKETERM_VERIFY_SURFACE_TEARDOWN", "1", 1);
         // Hermeticity: on a dev box with at-spi running, the GUI child
         // would otherwise register its accessibles on the USER'S real
         // a11y bus. This harness isolates every other resource, so it

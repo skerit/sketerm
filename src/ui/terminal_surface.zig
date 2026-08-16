@@ -134,6 +134,12 @@ pub const TerminalSurface = struct {
     shader_cleared: bool = false,
     image_store: ImageStore,
     allocator: std.mem.Allocator,
+    /// True once the host's pre-widget-destruction hook removed every
+    /// callback whose user-data is this surface.
+    callbacks_severed: bool = false,
+    /// A successful realize has made GL state live in this area's
+    /// context; unrealize or sever clears it after releasing the state.
+    gl_live: bool = false,
     /// GTK tick callback id (0 = not registered). The tick pumps at
     /// frame rate, so it is reserved for genuinely per-frame work
     /// (shader animation, kitty image animation) and self-removes
@@ -267,11 +273,9 @@ pub const TerminalSurface = struct {
             .allocator = allocator,
         };
 
-        // GL lifecycle. These signals carry a raw *TerminalSurface:
-        // the surface is embedded in its host's heap allocation,
-        // whose free is deferred past the widget tree's destruction
-        // (the host owns that ordering) — the same lifetime contract
-        // the pre-split Pane had for these connections.
+        // GL lifecycle. These signals carry a raw *TerminalSurface;
+        // every host must call sever() before either the widget tree or
+        // the surface storage dies.
         _ = c.g_signal_connect_data(
             area_widget,
             "realize",
@@ -323,12 +327,17 @@ pub const TerminalSurface = struct {
         self.ensureTickRunning();
     }
 
-    /// Free everything the surface owns. GLib timeouts hold a raw
-    /// *TerminalSurface — the host must guarantee this runs before
-    /// the surface's memory is freed. (The frame-clock tick is
-    /// widget-owned and dies with the GtkGLArea; the g_timeout
-    /// sources are not.)
+    /// Free everything the surface owns after `sever` has fenced callbacks.
     pub fn deinit(self: *TerminalSurface) void {
+        if (c.getenv("SKETERM_VERIFY_SURFACE_TEARDOWN") != null and
+            (!self.callbacks_severed or self.gl_live))
+        {
+            std.debug.print(
+                "sketerm: TerminalSurface deinit before callback/GL teardown (severed={}, gl_live={})\n",
+                .{ self.callbacks_severed, self.gl_live },
+            );
+            c.abort();
+        }
         self.stopVisualSources();
         self.grid_pass.deinit();
         self.cell_pass.deinit();
@@ -343,10 +352,55 @@ pub const TerminalSurface = struct {
         self.atlas = null;
     }
 
-    /// Remove every GLib timeout that redraws this surface (cursor
-    /// blink, cursor trail, bell fade). Idempotent; the single
-    /// teardown point for all visual sources holding a raw
-    /// *TerminalSurface.
+    /// Fence every callback carrying this raw pointer while the host still owns the storage.
+    pub fn sever(self: *TerminalSurface, widgets_dead: bool) void {
+        if (self.callbacks_severed) return;
+
+        if (widgets_dead) {
+            // GTK already removed the widget-owned tick. Clear its stale
+            // id before stopVisualSources so it never dereferences area,
+            // and suppress an offload-policy callback through dead widgets.
+            self.tick_id = 0;
+            self.continuous_frames_reported = false;
+        }
+        self.stopVisualSources();
+        if (widgets_dead) {
+            // Finalization removed widget-owned signals and ticks. The
+            // unrealize signal ran while this storage was still alive.
+            self.callbacks_severed = true;
+            return;
+        }
+
+        const area_widget: *c.GtkWidget = @ptrCast(self.area);
+        const disconnected = c.g_signal_handlers_disconnect_matched(
+            @ptrCast(self.area),
+            c.G_SIGNAL_MATCH_DATA,
+            0,
+            0,
+            null,
+            null,
+            @ptrCast(self),
+        );
+
+        // The later widget destruction can no longer deliver unrealize,
+        // so release the context-owned objects now while it is valid.
+        if (c.gtk_widget_get_realized(area_widget) != 0) releaseAreaGL(self, self.area);
+        self.callbacks_severed = true;
+
+        // ReleaseFast drops asserts; the smoke's explicit mode keeps a
+        // missing registration or teardown path observable.
+        if (c.getenv("SKETERM_VERIFY_SURFACE_TEARDOWN") != null and
+            (disconnected != 6 or self.gl_live))
+        {
+            std.debug.print(
+                "sketerm: TerminalSurface sever mismatch (signals={d}, gl_live={})\n",
+                .{ disconnected, self.gl_live },
+            );
+            c.abort();
+        }
+    }
+
+    /// Idempotently remove every frame-clock/GLib source holding this raw pointer.
     pub fn stopVisualSources(self: *TerminalSurface) void {
         self.stopTick();
         self.stopBlinkTimer();
@@ -630,6 +684,7 @@ pub const TerminalSurface = struct {
     /// call this so the tick is alive to pump. Keep the tick OFF for
     /// slow timers — see the `tick_id` field doc for why.
     pub fn ensureTickRunning(self: *TerminalSurface) void {
+        if (self.callbacks_severed) return;
         if (self.tick_id != 0) {
             if (self.continuousWorkRequested()) self.setContinuousFrames(true);
             return;
@@ -1226,9 +1281,12 @@ fn imageNumberOf(ctx: ?*anyopaque, image_id: u32) u32 {
 
 fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(TerminalSurface, user);
-    // Make the about-to-die context current so glDelete* lands on the
-    // right resources. After this signal returns GTK tears the context
-    // down — there is no second chance.
+    releaseAreaGL(self, area);
+}
+
+fn releaseAreaGL(self: *TerminalSurface, area: *c.GtkGLArea) void {
+    // Make the area's context current so glDelete* lands on the right
+    // resources. Unrealize and explicit sever both use this one path.
     c.gtk_gl_area_make_current(area);
     if (c.gtk_gl_area_get_error(area) != null) {
         // Context is already broken; nothing useful to delete against
@@ -1240,6 +1298,7 @@ fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         self.shader_pass.forgetGL();
         self.linear_target.forgetGL();
         self.image_store.forgetGL();
+        self.gl_live = false;
         return;
     }
     self.grid_pass.releaseGL();
@@ -1250,6 +1309,7 @@ fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     self.linear_target.releaseGL();
     self.image_store.releaseGL();
     if (self.atlas) |a| a.releaseGL();
+    self.gl_live = false;
 }
 
 fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
@@ -1262,6 +1322,7 @@ fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         std.debug.print("sketerm: pane realize GL error: {s}\n", .{msg});
         return;
     }
+    self.gl_live = true;
 
     // gtk_widget_unparent unrealizes a widget. A reparent (split,
     // tab move, layout shuffle) therefore destroys our GL context
