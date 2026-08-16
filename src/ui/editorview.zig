@@ -4291,7 +4291,7 @@ pub const EditorView = struct {
                     // (empty, but now FINAL) buffer has to be opened on
                     // the server from here — `openDocument` defers
                     // while `loading` is set, which it no longer is.
-                    if (self.lsp) |m| m.ensureOpen(tab) else self.attachLsp(tab);
+                    if (self.lsp) |m| m.ensureOpen(tab, job.gen) else self.attachLsp(tab);
                     self.setStatus("New file.");
                     self.refresh(tab);
                     return;
@@ -4325,7 +4325,7 @@ pub const EditorView = struct {
                 // The observer the swap dropped has to be re-installed
                 // and the server told the content changed wholesale;
                 // a first-time load is where the server is attached.
-                if (self.lsp) |m| m.onDocumentReplaced(tab) else self.attachLsp(tab);
+                if (self.lsp) |m| m.onDocumentReplaced(tab, job.gen) else self.attachLsp(tab);
                 tab.layout.invalidateAll();
                 tab.rows_lines = 0;
                 tab.anchor = .{};
@@ -4967,7 +4967,7 @@ pub const EditorView = struct {
         tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
         tab.doc.addObserver(self.a11y_src.editObserver());
         self.ensureHighlighter(tab);
-        if (self.lsp) |m| m.onDocumentReplaced(tab) else self.attachLsp(tab);
+        if (self.lsp) |m| m.onDocumentReplaced(tab, 0) else self.attachLsp(tab);
         tab.layout.invalidateAll();
         tab.rows_lines = 0;
         tab.anchor = .{};

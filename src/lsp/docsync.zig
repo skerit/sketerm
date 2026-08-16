@@ -82,11 +82,20 @@ pub const DocSync = struct {
         return self.queue.items.len > 0 or self.needs_full;
     }
 
+    /// A numeric workspace edit version is current only for the exact synchronized document state.
+    pub fn acceptsEditVersion(self: *const DocSync, version: i64, document_revision: u64) bool {
+        return self.open and version == self.version and !self.hasPendingChanges() and
+            document_revision == self.revision;
+    }
+
     /// Capture one transaction's edits against the PRE-edit document.
     /// Call from `before_apply`; `doc` still holds the old text.
     pub fn noteEdits(self: *DocSync, doc: *const Document, edits: []const tr.Edit, enc: pos.Encoding) void {
         if (!self.open) return;
         if (edits.len == 0) return;
+        // One transaction produces one new document revision, regardless
+        // of how many edits it contains.
+        self.revision = doc.revision + 1;
         var i = edits.len;
         while (i > 0) {
             i -= 1;
@@ -182,4 +191,36 @@ test "docsync: ranges use the negotiated encoding" {
     ds.clearQueue();
     ds.noteEdits(&doc, &edits, .utf8);
     try testing.expectEqual(@as(u32, 4), ds.queue.items[0].range.start.character);
+}
+
+test "docsync: workspace edit rejects a mismatched numeric version" {
+    var doc = try Document.initFromBytes(testing.allocator, "abc");
+    defer doc.deinit();
+    var ds = DocSync.init(testing.allocator);
+    defer ds.deinit();
+    ds.open = true;
+    ds.version = 7;
+    ds.revision = doc.revision;
+
+    try testing.expect(!ds.acceptsEditVersion(6, doc.revision));
+    try testing.expect(!ds.acceptsEditVersion(8, doc.revision));
+}
+
+test "docsync: unchanged synchronized document accepts its numeric version" {
+    var doc = try Document.initFromBytes(testing.allocator, "abc");
+    defer doc.deinit();
+    var ds = DocSync.init(testing.allocator);
+    defer ds.deinit();
+    ds.open = true;
+    ds.version = 7;
+    ds.revision = doc.revision;
+
+    try testing.expect(ds.acceptsEditVersion(7, doc.revision));
+
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(testing.allocator);
+    try tx.addInsert(testing.allocator, 0, "x");
+    ds.noteEdits(&doc, tx.edits.items, .utf16);
+    _ = try doc.applyTransaction(&tx);
+    try testing.expect(!ds.acceptsEditVersion(7, doc.revision));
 }

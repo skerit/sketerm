@@ -891,6 +891,20 @@ const ListPopup = struct {
     }
 };
 
+/// Identifies the exact document state an edit-producing request or deferred edit belongs to.
+const EditStamp = struct {
+    tab_id: u64,
+    revision: u64,
+
+    fn fromRequest(req: session.Request) EditStamp {
+        return .{ .tab_id = req.tab_id, .revision = req.revision };
+    }
+
+    fn matches(self: EditStamp, tab_id: u64, revision: u64) bool {
+        return self.tab_id == tab_id and self.revision == revision;
+    }
+};
+
 const HoverPopup = struct {
     mgr: *Manager,
     popover: ?*c.GtkWidget = null,
@@ -939,6 +953,13 @@ const PendingEdit = struct {
     /// borrows its parse arena, which dies with the response.
     edits: []u8,
     enc: pos.Encoding,
+    /// Placeholder document and load this edit was queued against.
+    stamp: EditStamp,
+    load_gen: u64,
+
+    fn matches(self: PendingEdit, tab_id: u64, revision: u64, load_gen: u64) bool {
+        return self.load_gen == load_gen and self.stamp.matches(tab_id, revision);
+    }
 };
 
 pub const Manager = struct {
@@ -1480,6 +1501,7 @@ pub const Manager = struct {
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
         st.sync.version = 1;
+        st.sync.revision = tab.doc.revision;
         dbg("didOpen {s} ({s}, {d} bytes)", .{ st.sync.uri, st.sync.language_id, text.len });
         cn.sess.didOpen(st.sync.uri, st.sync.language_id, st.sync.version, text);
         st.sync.open = true;
@@ -1492,7 +1514,8 @@ pub const Manager = struct {
 
     /// The async load finished with nothing to load (a new file): there
     /// is no document-replace to ride on, so open it from here.
-    pub fn ensureOpen(self: *Manager, tab: *ETab) void {
+    pub fn ensureOpen(self: *Manager, tab: *ETab, load_gen: u64) void {
+        self.finishPendingEdits(tab, load_gen);
         const st = tab.lsp orelse {
             self.attachTab(tab);
             return;
@@ -1618,16 +1641,12 @@ pub const Manager = struct {
     /// The document object was replaced (a load/reload): the old
     /// observer died with it and the server must be told the content
     /// changed wholesale.
-    pub fn onDocumentReplaced(self: *Manager, tab: *ETab) void {
+    pub fn onDocumentReplaced(self: *Manager, tab: *ETab, load_gen: u64) void {
         // A WorkspaceEdit for a file that had no tab opened one; its
         // bytes have just arrived, so its edits apply now. Done BEFORE
         // the sync bookkeeping below so the server is told about the
         // final text in one didChange rather than two.
-        const drained = self.drainPendingEdits(tab);
-        if (drained > 0) {
-            self.pending_touched += drained;
-            self.reportDeferredEdits();
-        }
+        self.finishPendingEdits(tab, load_gen);
         const st = tab.lsp orelse {
             self.attachTab(tab);
             return;
@@ -1649,6 +1668,7 @@ pub const Manager = struct {
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
         st.sync.version += 1;
+        st.sync.revision = tab.doc.revision;
         cn.sess.didChange(st.sync.uri, st.sync.version, &.{}, text);
         cn.pumpWrite();
         self.armDecorations(tab);
@@ -2345,11 +2365,17 @@ pub const Manager = struct {
     }
 
     fn onRenameEdit(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope) void {
-        _ = req;
         if (env.has_error) {
             self.view.setStatusText("Rename failed.");
             return;
         }
+        const tab = self.view.findTabByIdPublic(req.tab_id) orelse return;
+        if (!EditStamp.fromRequest(req).matches(tab.id, tab.doc.revision)) {
+            self.view.setStatusText("Document changed while renaming; try again.");
+            return;
+        }
+        const st = tab.lsp orelse return;
+        if (st.conn != cn) return;
         if (env.result != .object) {
             self.view.setStatusText("Rename produced no changes.");
             return;
@@ -2370,6 +2396,8 @@ pub const Manager = struct {
         /// Entries that could not be applied at all (malformed, or the
         /// tab could not be opened).
         skipped: usize = 0,
+        /// A numeric document version described older text.
+        stale: bool = false,
     };
 
     /// Apply a `WorkspaceEdit`. THE cross-file applier: rename, code
@@ -2400,6 +2428,7 @@ pub const Manager = struct {
         // when both are present, per the spec.
         if (obj.get("documentChanges")) |dc| {
             if (dc == .array) {
+                if (!self.documentChangesCurrent(cn, dc.array.items)) return .{ .stale = true };
                 for (dc.array.items) |entry| {
                     if (entry != .object) continue;
                     // create/rename/delete file operations carry a
@@ -2426,6 +2455,25 @@ pub const Manager = struct {
         return out;
     }
 
+    /// Validate every numeric TextDocumentEdit version before any file is mutated.
+    fn documentChangesCurrent(self: *Manager, cn: *Conn, changes: []const std.json.Value) bool {
+        for (changes) |entry| {
+            if (entry != .object or entry.object.get("kind") != null) continue;
+            const td = entry.object.get("textDocument") orelse continue;
+            if (td != .object) continue;
+            const version = switch (textDocumentVersion(td.object.get("version"))) {
+                .unversioned => continue,
+                .invalid => return false,
+                .numeric => |v| v,
+            };
+            const uri = strOf(td.object.get("uri")) orelse continue;
+            const tab = self.tabForUri(cn, uri) orelse continue;
+            const st = tab.lsp orelse continue;
+            if (st.sync.open and !st.sync.acceptsEditVersion(version, tab.doc.revision)) return false;
+        }
+        return true;
+    }
+
     /// Apply a `TextEdit[]` to the tab holding `uri`, as ONE
     /// transaction — one undo unit per document.
     ///
@@ -2441,6 +2489,14 @@ pub const Manager = struct {
     /// units, one per file — and `reportEditOutcome` says so out loud.
     fn applyEditsToUri(self: *Manager, cn: *Conn, uri: []const u8, edits: std.json.Value, out: *EditOutcome) void {
         if (self.tabForUri(cn, uri)) |tab| {
+            if (tab.loading) {
+                const spec = tab.spec orelse {
+                    out.skipped += 1;
+                    return;
+                };
+                self.deferTextEdits(tab, spec, edits, cn.sess.caps.encoding, out);
+                return;
+            }
             if (self.applyTextEdits(tab, edits, cn.sess.caps.encoding)) out.touched += 1 else out.skipped += 1;
             return;
         }
@@ -2458,33 +2514,62 @@ pub const Manager = struct {
         // tabForSpec normalizes, tabForUri does not.
         if (self.view.tabForSpec(spec)) |tab| {
             defer self.alloc.free(spec);
+            if (tab.loading) {
+                self.deferTextEdits(tab, spec, edits, cn.sess.caps.encoding, out);
+                return;
+            }
             if (self.applyTextEdits(tab, edits, cn.sess.caps.encoding)) out.touched += 1 else out.skipped += 1;
             return;
         }
-        const blob = serializeValue(self.alloc, edits) catch {
-            self.alloc.free(spec);
+        defer self.alloc.free(spec);
+        self.view.openSpecAtLineCol(spec, 0, 0);
+        const tab = self.view.tabForSpec(spec) orelse {
             out.skipped += 1;
             return;
         };
-        self.pending_edits.append(self.alloc, .{
-            .spec = spec,
-            .edits = blob,
-            .enc = cn.sess.caps.encoding,
-        }) catch {
-            self.alloc.free(spec);
+        self.deferTextEdits(tab, spec, edits, cn.sess.caps.encoding, out);
+    }
+
+    fn deferTextEdits(
+        self: *Manager,
+        tab: *ETab,
+        spec: []const u8,
+        edits: std.json.Value,
+        enc: pos.Encoding,
+        out: *EditOutcome,
+    ) void {
+        const blob = serializeValue(self.alloc, edits) catch {
+            out.skipped += 1;
+            return;
+        };
+        const owned_spec = self.alloc.dupe(u8, spec) catch {
             self.alloc.free(blob);
             out.skipped += 1;
             return;
         };
-        self.view.openSpecAtLineCol(spec, 0, 0);
+        self.pending_edits.append(self.alloc, .{
+            .spec = owned_spec,
+            .edits = blob,
+            .enc = enc,
+            .stamp = .{ .tab_id = tab.id, .revision = tab.doc.revision },
+            .load_gen = tab.io_gen,
+        }) catch {
+            self.alloc.free(owned_spec);
+            self.alloc.free(blob);
+            out.skipped += 1;
+            return;
+        };
         out.opened += 1;
     }
 
+    const PendingOutcome = struct { applied: usize = 0, stale: usize = 0 };
+
     /// Apply (and drop) every queued edit for `tab`, now that it has its
-    /// bytes. @return how many were applied.
-    fn drainPendingEdits(self: *Manager, tab: *ETab) usize {
-        if (self.pending_edits.items.len == 0) return 0;
-        var applied: usize = 0;
+    /// bytes.
+    fn drainPendingEdits(self: *Manager, tab: *ETab, load_gen: u64) PendingOutcome {
+        var out = PendingOutcome{};
+        if (self.pending_edits.items.len == 0) return out;
+        const loaded_revision = tab.doc.revision;
         var i: usize = 0;
         while (i < self.pending_edits.items.len) {
             const p = self.pending_edits.items[i];
@@ -2499,11 +2584,25 @@ pub const Manager = struct {
                 self.alloc.free(p.spec);
                 self.alloc.free(p.edits);
             }
+            if (!p.matches(tab.id, loaded_revision, load_gen)) {
+                out.stale += 1;
+                continue;
+            }
             var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, p.edits, .{}) catch continue;
             defer parsed.deinit();
-            if (self.applyTextEdits(tab, parsed.value, p.enc)) applied += 1;
+            if (self.applyTextEdits(tab, parsed.value, p.enc)) out.applied += 1;
         }
-        return applied;
+        return out;
+    }
+
+    fn finishPendingEdits(self: *Manager, tab: *ETab, load_gen: u64) void {
+        const drained = self.drainPendingEdits(tab, load_gen);
+        if (drained.applied > 0) {
+            self.pending_touched += drained.applied;
+            self.reportDeferredEdits();
+        }
+        if (drained.stale > 0)
+            self.view.setStatusText("Document changed before a deferred edit could be applied.");
     }
 
     fn dropPendingEdits(self: *Manager) void {
@@ -2785,7 +2884,7 @@ pub const Manager = struct {
             return;
         }
         // The actions' edits are in this revision's coordinates.
-        if (tab.doc.revision != req.revision) {
+        if (!EditStamp.fromRequest(req).matches(tab.id, tab.doc.revision)) {
             self.view.setStatusText("Document changed; ask again.");
             return;
         }
@@ -2848,22 +2947,37 @@ pub const Manager = struct {
     ///     `codeAction/resolve` fills it in first.
     fn acceptCodeAction(self: *Manager) void {
         if (self.list.shown.items.len == 0) return self.closePopup();
+        const stamp = EditStamp{ .tab_id = self.list.tab_id, .revision = self.list.revision };
+        const tab = self.view.activeTab() orelse return self.closePopup();
+        if (!stamp.matches(tab.id, tab.doc.revision)) {
+            self.closePopup();
+            self.view.setStatusText("Document changed; ask for code actions again.");
+            return;
+        }
         const idx = self.list.shown.items[self.list.sel];
         const raw = self.alloc.dupe(u8, self.list.items.items[idx].raw) catch return self.closePopup();
         defer self.alloc.free(raw);
         self.closePopup();
         const r = self.quietReady() orelse return;
+        if (!stamp.matches(r.tab.id, r.tab.doc.revision)) {
+            self.view.setStatusText("Document changed; ask for code actions again.");
+            return;
+        }
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{}) catch return;
         defer parsed.deinit();
-        self.runCodeAction(r.cn, parsed.value, raw);
+        self.runCodeAction(r.cn, parsed.value, raw, stamp);
     }
 
-    fn runCodeAction(self: *Manager, cn: *Conn, action: std.json.Value, raw: []const u8) void {
+    fn runCodeAction(self: *Manager, cn: *Conn, action: std.json.Value, raw: []const u8, stamp: EditStamp) void {
         if (action != .object) return;
         const o = action.object;
         var did_something = false;
         if (o.get("edit")) |edit| {
             const res = self.applyWorkspaceEdit(cn, edit);
+            if (res.stale) {
+                self.reportEditOutcome(res);
+                return;
+            }
             did_something = res.touched > 0 or res.skipped > 0;
             self.reportEditOutcome(res);
         }
@@ -2878,22 +2992,27 @@ pub const Manager = struct {
             self.view.setStatusText("The server offered an action with nothing to apply.");
             return;
         }
-        const tab = self.view.activeTab() orelse return;
         _ = cn.sess.sendRequest(.code_action_resolve, "codeAction/resolve", raw, .{
             .id = 0,
             .kind = .code_action_resolve,
-            .tab_id = tab.id,
-            .revision = tab.doc.revision,
+            .tab_id = stamp.tab_id,
+            .revision = stamp.revision,
         });
         cn.pumpWrite();
     }
 
     fn onCodeActionResolved(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope) void {
-        _ = req;
         if (env.has_error) {
             self.view.setStatusText("The server could not resolve that action.");
             return;
         }
+        const tab = self.view.findTabByIdPublic(req.tab_id) orelse return;
+        if (!EditStamp.fromRequest(req).matches(tab.id, tab.doc.revision)) {
+            self.view.setStatusText("Document changed; ask for code actions again.");
+            return;
+        }
+        const st = tab.lsp orelse return;
+        if (st.conn != cn) return;
         const o = switch (env.result) {
             .object => |obj| obj,
             else => return,
@@ -2959,6 +3078,10 @@ pub const Manager = struct {
     /// count without reporting the undo shape is what made that a
     /// surprise; saying it in the same breath is the whole fix.
     fn reportOutcome(self: *Manager, comptime verb: []const u8, r: EditOutcome) void {
+        if (r.stale) {
+            self.view.setStatusText("Document changed; the edit was not applied.");
+            return;
+        }
         var buf: [320:0]u8 = undefined;
         var w: std.ArrayList(u8) = .empty;
         defer w.deinit(self.alloc);
@@ -4164,6 +4287,21 @@ fn strOf(v: ?std.json.Value) ?[]const u8 {
     };
 }
 
+const TextDocumentVersion = union(enum) {
+    unversioned,
+    numeric: i64,
+    invalid,
+};
+
+fn textDocumentVersion(v: ?std.json.Value) TextDocumentVersion {
+    const value = v orelse return .unversioned;
+    return switch (value) {
+        .null => .unversioned,
+        .integer => |version| .{ .numeric = version },
+        else => .invalid,
+    };
+}
+
 /// `CompletionList` (`{isIncomplete, items}`) and a bare array both
 /// occur in the wild.
 fn completionItems(v: std.json.Value) ?[]const std.json.Value {
@@ -4280,4 +4418,45 @@ fn symbolKindName(v: ?std.json.Value) []const u8 {
         25 => "operator",    26 => "type parameter",
         else => "",
     };
+}
+
+test "lsp workspace edit: edit during rename invalidates the response stamp" {
+    const stamp = EditStamp{ .tab_id = 3, .revision = 11 };
+    try std.testing.expect(stamp.matches(3, 11));
+    try std.testing.expect(!stamp.matches(3, 12));
+}
+
+test "lsp workspace edit: code action accept and resolve reject newer text" {
+    const offered = EditStamp{ .tab_id = 4, .revision = 20 };
+    try std.testing.expect(!offered.matches(4, 21));
+
+    const resolve_req = session.Request{
+        .id = 9,
+        .kind = .code_action_resolve,
+        .tab_id = 4,
+        .revision = 21,
+    };
+    const resolving = EditStamp.fromRequest(resolve_req);
+    try std.testing.expect(resolving.matches(4, 21));
+    try std.testing.expect(!resolving.matches(4, 22));
+}
+
+test "lsp workspace edit: deferred edits belong to one load and revision" {
+    const pending = PendingEdit{
+        .spec = &.{},
+        .edits = &.{},
+        .enc = .utf16,
+        .stamp = .{ .tab_id = 5, .revision = 0 },
+        .load_gen = 17,
+    };
+    try std.testing.expect(pending.matches(5, 0, 17));
+    try std.testing.expect(!pending.matches(5, 1, 17));
+    try std.testing.expect(!pending.matches(5, 0, 18));
+}
+
+test "lsp workspace edit: null and absent versions remain unversioned" {
+    try std.testing.expect(textDocumentVersion(null) == .unversioned);
+    try std.testing.expect(textDocumentVersion(.null) == .unversioned);
+    try std.testing.expect(textDocumentVersion(.{ .integer = 7 }) == .numeric);
+    try std.testing.expect(textDocumentVersion(.{ .string = "7" }) == .invalid);
 }
