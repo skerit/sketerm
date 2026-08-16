@@ -33,7 +33,7 @@ pub const Command = struct {
     height: u32 = 0,
     /// Z-order (`z=`).
     z: i32 = 0,
-    /// Compression (`o=`): 0=none, 1=zlib.
+    /// Compression (`o=`): 0=none, 1=zlib, maxInt(u32)=unsupported.
     compression: u32 = 0,
     /// Quiet level (`q=`): 0=verbose, 1/2=quiet error response.
     quiet: u32 = 0,
@@ -147,7 +147,7 @@ fn applyKv(cmd: *Command, key: []const u8, val: []const u8) void {
         's' => cmd.width = parseUint(val),
         'v' => cmd.height = parseUint(val),
         'z' => cmd.z = parseInt(val),
-        'o' => cmd.compression = parseUint(val),
+        'o' => cmd.compression = parseCompression(val),
         'q' => cmd.quiet = parseUint(val),
         'm' => cmd.more = parseUint(val),
         'x' => cmd.src_x = parseUint(val),
@@ -190,6 +190,12 @@ fn parseUint(s: []const u8) u32 {
     return n;
 }
 
+fn parseCompression(s: []const u8) u32 {
+    if (std.mem.eql(u8, s, "z") or std.mem.eql(u8, s, "1")) return 1;
+    if (std.mem.eql(u8, s, "0")) return 0;
+    return std.math.maxInt(u32);
+}
+
 fn parseInt(s: []const u8) i32 {
     if (s.len == 0) return 0;
     if (s[0] == '-') {
@@ -229,6 +235,15 @@ test "oversized numeric fields saturate instead of overflowing" {
     try std.testing.expectEqual(std.math.maxInt(i32), cmd.z);
     const neg = try parse("Ga=p,z=-99999999999999999999");
     try std.testing.expectEqual(std.math.minInt(i32), neg.z);
+}
+
+test "compression accepts zlib literals and rejects unknown codecs" {
+    const zlib = try parse("Ga=t,o=z");
+    try std.testing.expectEqual(@as(u32, 1), zlib.compression);
+    const numeric = try parse("Ga=t,o=1");
+    try std.testing.expectEqual(@as(u32, 1), numeric.compression);
+    const unknown = try parse("Ga=t,o=x");
+    try std.testing.expectEqual(std.math.maxInt(u32), unknown.compression);
 }
 
 test "unicode placement flag + grid size" {

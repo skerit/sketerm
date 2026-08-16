@@ -281,7 +281,7 @@ test "graphics: sub-cell offsets reach the placement" {
     screen.sink = .{ .ctx = null, .on_image = Capture.sink };
 
     // 2x2 RGBA, placed with a 3,5 pixel offset inside its cell.
-    screen.onApc("Ga=T,f=32,s=2,v=2,i=1,X=3,Y=5;AAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    screen.onApc("Ga=T,f=32,s=2,v=2,i=1,X=3,Y=5;AAAAAAAAAAAAAAAAAAAAAA==");
     try std.testing.expect(Capture.got != null);
     try std.testing.expectEqual(@as(u32, 3), Capture.got.?.cell_x_offset);
     try std.testing.expectEqual(@as(u32, 5), Capture.got.?.cell_y_offset);

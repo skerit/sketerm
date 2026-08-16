@@ -19,6 +19,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const kitty = @import("../parser/kitty_image.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
+const image_size = @import("image_size.zig");
 
 pub const Frame = struct {
     rgba: []u8,
@@ -54,10 +55,6 @@ pub const StoredImage = struct {
     /// otherwise. `d=n/N` deletes by this rather than by id.
     number: u32 = 0,
 
-    fn rgbaLen(self: *const StoredImage) usize {
-        return @as(usize, self.width) * @as(usize, self.height) * 4;
-    }
-
     /// Total decoded bytes retained by this image (all frames, or the
     /// standalone buffer for a static image).
     fn storedBytes(self: *const StoredImage) usize {
@@ -76,8 +73,8 @@ const MAX_FRAMES: usize = 1024;
 /// transmissions with distinct ids and never finalizes them would otherwise
 /// grow the accum table without bound.
 const MAX_ACCUMS: usize = 32;
-/// Fallback per-transmission payload cap when no memory budget is set.
-const DEFAULT_ACCUM_CAP: usize = 256 * 1024 * 1024;
+/// Minimum allowance for zlib framing above decoded bytes.
+const MIN_TRANSFER_OVERHEAD: usize = 64;
 
 /// In-progress chunked transfer. Cleared on m=0 or first non-chunked.
 pub const Accum = struct {
@@ -89,6 +86,8 @@ pub const Accum = struct {
     medium: u8,
     /// Compression flag from the first chunk (`o=z` → 1).
     compression: u32,
+    /// Declared data size (`S=`), required for compressed PNG input.
+    data_size: u32,
     /// Original action from the first chunk — drives whether
     /// finalize triggers a place.
     action: kitty.Action,
@@ -112,6 +111,39 @@ pub const Accum = struct {
         self.payload.deinit(allocator);
     }
 };
+
+const RawLayout = struct {
+    pixels: usize,
+    input_bytes: usize,
+    rgba_bytes: usize,
+};
+
+fn rawLayout(format: u32, width: u32, height: u32) ?RawLayout {
+    const channels: usize = switch (format) {
+        24 => 3,
+        32 => 4,
+        else => return null,
+    };
+    const input_bytes = image_size.byteLen(width, height, channels) catch return null;
+    const rgba_bytes = image_size.byteLen(width, height, 4) catch return null;
+    return .{
+        .pixels = rgba_bytes / 4,
+        .input_bytes = input_bytes,
+        .rgba_bytes = rgba_bytes,
+    };
+}
+
+fn inflateExact(src: []const u8, dst: []u8) bool {
+    var src_reader: std.Io.Reader = .fixed(src);
+    const flate = std.compress.flate;
+    var window: [flate.max_window_len]u8 = undefined;
+    var dec: flate.Decompress = .init(&src_reader, .zlib, &window);
+    const n = dec.reader.readSliceShort(dst) catch return false;
+    if (n != dst.len) return false;
+    var probe: [1]u8 = undefined;
+    const extra = dec.reader.readSliceShort(&probe) catch return false;
+    return extra == 0;
+}
 
 pub const Manager = struct {
     allocator: std.mem.Allocator,
@@ -178,10 +210,39 @@ pub const Manager = struct {
         self.evictStoreForBudget(image_id);
     }
 
-    /// Max bytes a single chunked transmission may accumulate before it is
-    /// poisoned. Ties to the memory budget when set, else a fixed fallback.
+    /// Max encoded bytes a transmission may accumulate for the effective
+    /// decoded limit, including bounded zlib framing overhead.
     fn accumCap(self: *const Manager) usize {
-        return if (self.budget_bytes > 0) self.budget_bytes else DEFAULT_ACCUM_CAP;
+        const decoded = image_size.decodedLimit(self.budget_bytes);
+        const overhead = decoded / 100 + MIN_TRANSFER_OVERHEAD;
+        const transfer = std.math.add(usize, decoded, overhead) catch decoded;
+        return std.base64.standard.Encoder.calcSize(transfer);
+    }
+
+    fn frameFitsBudget(
+        self: *const Manager,
+        image_id: u32,
+        acc: *const Accum,
+        width: u32,
+        height: u32,
+        rgba_bytes: usize,
+    ) bool {
+        if (acc.action != .transmit_frame or self.budget_bytes == 0) return true;
+        const existing = self.store.get(image_id) orelse return false;
+        if (existing.width != width or existing.height != height) return false;
+
+        const before = existing.storedBytes();
+        var removed: usize = 0;
+        if (existing.frames.items.len > 0) {
+            if (acc.frame_target > 0 and acc.frame_target <= existing.frames.items.len) {
+                removed = existing.frames.items[acc.frame_target - 1].rgba.len;
+            } else if (existing.frames.items.len >= MAX_FRAMES) {
+                removed = existing.frames.items[0].rgba.len;
+            }
+        }
+        const after_removal = before - @min(before, removed);
+        const after = std.math.add(usize, after_removal, rgba_bytes) catch return false;
+        return after <= self.budget_bytes;
     }
 
     /// Evict the oldest stored images (lowest `seq`) until the store fits
@@ -302,6 +363,7 @@ pub const Manager = struct {
                         .height = cmd.height,
                         .medium = cmd.medium,
                         .compression = cmd.compression,
+                        .data_size = cmd.data_size,
                         .action = cmd.action,
                         // Frame-only metadata (z=delay, c=target frame,
                         // r=compose source, C=compose mode). Stored
@@ -320,7 +382,8 @@ pub const Manager = struct {
                     // stream would otherwise grow one accumulator without
                     // bound. Past the cap, poison it (finalize bails) and drop
                     // the buffer so the memory is reclaimed immediately.
-                    if (acc.payload.items.len + cmd.payload.len > self.accumCap()) {
+                    const payload_len = std.math.add(usize, acc.payload.items.len, cmd.payload.len) catch std.math.maxInt(usize);
+                    if (payload_len > self.accumCap()) {
                         acc.poisoned = true;
                         acc.payload.clearAndFree(self.allocator);
                     } else if (!acc.poisoned) {
@@ -449,21 +512,36 @@ pub const Manager = struct {
             return false;
         }
 
-        // Strip whitespace/newlines from the accumulated base64.
-        var stripped: std.ArrayList(u8) = .empty;
-        defer stripped.deinit(self.allocator);
-        try stripped.ensureTotalCapacity(self.allocator, acc.payload.items.len);
+        if (acc.compression > 1) return false;
+        const raw_layout: ?RawLayout = switch (acc.format) {
+            24, 32 => rawLayout(acc.format, acc.width, acc.height) orelse return false,
+            100 => null,
+            else => return false,
+        };
+        if (raw_layout) |layout| {
+            if (layout.rgba_bytes > image_size.decodedLimit(self.budget_bytes)) return false;
+            if (!self.frameFitsBudget(image_id, acc, acc.width, acc.height, layout.rgba_bytes)) return false;
+        }
+
+        // Strip whitespace/newlines in place so finalization does not retain a
+        // second attacker-sized copy of the encoded transfer.
+        var stripped_len: usize = 0;
         for (acc.payload.items) |b| {
             if (b == ' ' or b == '\n' or b == '\r' or b == '\t') continue;
-            try stripped.append(self.allocator, b);
+            acc.payload.items[stripped_len] = b;
+            stripped_len += 1;
         }
-        if (stripped.items.len == 0) return false;
+        acc.payload.items.len = stripped_len;
+        if (acc.payload.items.len == 0) return false;
 
         const decoder = std.base64.standard.Decoder;
-        const out_len = decoder.calcSizeForSlice(stripped.items) catch return false;
+        const out_len = decoder.calcSizeForSlice(acc.payload.items) catch return false;
+        if (acc.medium == 'd' and acc.compression == 0) {
+            if (raw_layout) |layout| if (out_len != layout.input_bytes) return false;
+        }
         const decoded = try self.allocator.alloc(u8, out_len);
         defer self.allocator.free(decoded);
-        decoder.decode(decoded, stripped.items) catch return false;
+        decoder.decode(decoded, acc.payload.items) catch return false;
 
         // For tempfile / file medium: payload (post-base64) is a path.
         var raw_bytes: []const u8 = decoded;
@@ -487,46 +565,41 @@ pub const Manager = struct {
             }
         }
 
-        // Optional zlib decompression (`o=z`). Tools rarely set this
-        // for PNG (already deflate-encoded); it shows up for raw
-        // f=24/32 payloads. Use std.compress.flate with the .zlib
-        // container.
+        // Optional zlib decompression (`o=z`). Raw formats have an exact
+        // length from dimensions; compressed PNG requires `S=` by protocol.
         var owned_inflated: ?[]u8 = null;
         defer if (owned_inflated) |b| self.allocator.free(b);
         if (acc.compression == 1) {
-            var src_reader: std.Io.Reader = .fixed(raw_bytes);
-            const flate = std.compress.flate;
-            var window: [flate.max_window_len]u8 = undefined;
-            var dec: flate.Decompress = .init(&src_reader, .zlib, &window);
-            var aw: std.Io.Writer.Allocating = .init(self.allocator);
-            errdefer aw.deinit();
-            _ = dec.reader.streamRemaining(&aw.writer) catch {
-                aw.deinit();
-                return false;
+            const inflated_len = if (raw_layout) |layout|
+                layout.input_bytes
+            else blk: {
+                if (acc.data_size == 0) return false;
+                break :blk @as(usize, acc.data_size);
             };
-            const inflated = aw.toOwnedSlice() catch return false;
+            if (inflated_len > image_size.decodedLimit(self.budget_bytes)) return false;
+            const inflated = try self.allocator.alloc(u8, inflated_len);
             owned_inflated = inflated;
+            if (!inflateExact(raw_bytes, inflated)) return false;
             raw_bytes = inflated;
         }
 
         // Decode according to format.
         const stored: StoredImage = switch (acc.format) {
             32 => blk: {
-                if (acc.width == 0 or acc.height == 0) return false;
-                const need = acc.width * acc.height * 4;
-                if (raw_bytes.len < need) return false;
-                const out = try self.allocator.alloc(u8, need);
-                @memcpy(out, raw_bytes[0..need]);
+                const need = raw_layout.?.rgba_bytes;
+                if (raw_bytes.len != need) return false;
+                const out = if (owned_inflated) |inflated| take: {
+                    owned_inflated = null;
+                    break :take inflated;
+                } else try self.allocator.dupe(u8, raw_bytes);
                 break :blk .{ .rgba = out, .width = acc.width, .height = acc.height };
             },
             24 => blk: {
-                if (acc.width == 0 or acc.height == 0) return false;
-                const npix = acc.width * acc.height;
-                const need_in = npix * 3;
-                if (raw_bytes.len < need_in) return false;
-                const out = try self.allocator.alloc(u8, npix * 4);
+                const layout = raw_layout.?;
+                if (raw_bytes.len != layout.input_bytes) return false;
+                const out = try self.allocator.alloc(u8, layout.rgba_bytes);
                 var i: usize = 0;
-                while (i < npix) : (i += 1) {
+                while (i < layout.pixels) : (i += 1) {
                     out[i * 4 + 0] = raw_bytes[i * 3 + 0];
                     out[i * 4 + 1] = raw_bytes[i * 3 + 1];
                     out[i * 4 + 2] = raw_bytes[i * 3 + 2];
@@ -535,8 +608,23 @@ pub const Manager = struct {
                 break :blk .{ .rgba = out, .width = acc.width, .height = acc.height };
             },
             100 => blk: {
-                // PNG via stb_image. Decoder ignores acc.width/height
-                // and reads the actual image dimensions from the file.
+                if (raw_bytes.len > std.math.maxInt(c_int)) return false;
+                var info_w: c_int = 0;
+                var info_h: c_int = 0;
+                var info_ch: c_int = 0;
+                if (c.stbi_info_from_memory(
+                    raw_bytes.ptr,
+                    @intCast(raw_bytes.len),
+                    &info_w,
+                    &info_h,
+                    &info_ch,
+                ) == 0 or info_w <= 0 or info_h <= 0 or info_ch <= 0 or info_ch > 4) return false;
+                const png_w: u32 = @intCast(info_w);
+                const png_h: u32 = @intCast(info_h);
+                const need = image_size.byteLen(png_w, png_h, 4) catch return false;
+                if (need > image_size.decodedLimit(self.budget_bytes)) return false;
+                if (!self.frameFitsBudget(image_id, acc, png_w, png_h, need)) return false;
+
                 var w: c_int = 0;
                 var h: c_int = 0;
                 var ch: c_int = 0;
@@ -548,21 +636,20 @@ pub const Manager = struct {
                     &ch,
                     4,
                 );
-                if (pix == null or w <= 0 or h <= 0) {
+                if (pix == null or w != info_w or h != info_h or ch != info_ch) {
                     if (self.debug) std.debug.print(
-                        "[kitty] PNG decode failed: stb_image returned null/zero (id={d}, payload={d}B)\n",
+                        "[kitty] PNG decode failed or changed metadata (id={d}, payload={d}B)\n",
                         .{ image_id, raw_bytes.len },
                     );
                     return false;
                 }
-                const need: usize = @intCast(w * h * 4);
+                defer c.stbi_image_free(pix);
                 const out = try self.allocator.alloc(u8, need);
                 @memcpy(out, pix[0..need]);
-                c.stbi_image_free(pix);
                 break :blk .{
                     .rgba = out,
-                    .width = @intCast(w),
-                    .height = @intCast(h),
+                    .width = png_w,
+                    .height = png_h,
                 };
             },
             else => return false,
@@ -776,6 +863,25 @@ pub const Manager = struct {
     }
 };
 
+fn testBase64(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const out = try allocator.alloc(u8, encoder.calcSize(bytes.len));
+    _ = encoder.encode(out, bytes);
+    return out;
+}
+
+fn testZlibBase64(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const compressed_buf = try allocator.alloc(u8, bytes.len + 128);
+    defer allocator.free(compressed_buf);
+    var writer = std.Io.Writer.fixed(compressed_buf);
+    const flate = std.compress.flate;
+    var window: [flate.max_window_len]u8 = undefined;
+    var compressor = try flate.Compress.init(&writer, &window, .zlib, .fastest);
+    try compressor.writer.writeAll(bytes);
+    try compressor.finish();
+    return testBase64(allocator, writer.buffered());
+}
+
 test "manager handles single-chunk RGBA transmit_and_place" {
     var mgr = Manager.init(std.testing.allocator);
     defer mgr.deinit();
@@ -849,6 +955,235 @@ test "manager accumulates multi-chunk PNG" {
     };
     try std.testing.expectEqual(@as(u32, 1), stored.width);
     try std.testing.expectEqual(@as(u32, 1), stored.height);
+
+    // Compressed PNG is valid when S= declares the exact inflated PNG size.
+    const compressed = try testZlibBase64(std.testing.allocator, &tiny_png);
+    defer std.testing.allocator.free(compressed);
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 10,
+        .format = 100,
+        .compression = 1,
+        .data_size = tiny_png.len,
+        .payload = compressed,
+    });
+    try std.testing.expect(mgr.get(10) != null);
+
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 11,
+        .format = 100,
+        .compression = 1,
+        .data_size = tiny_png.len - 1,
+        .payload = compressed,
+    });
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 12,
+        .format = 100,
+        .compression = 1,
+        .payload = compressed,
+    });
+    try std.testing.expect(mgr.get(11) == null);
+    try std.testing.expect(mgr.get(12) == null);
+}
+
+test "manager accepts chunked zlib RGB and RGBA images" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const rgba = [_]u8{
+        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+        0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0xFF,
+    };
+    const rgba_b64 = try testZlibBase64(std.testing.allocator, &rgba);
+    defer std.testing.allocator.free(rgba_b64);
+    const mid = rgba_b64.len / 2;
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 20,
+        .format = 32,
+        .width = 2,
+        .height = 2,
+        .compression = 1,
+        .more = 1,
+        .payload = rgba_b64[0..mid],
+    });
+    _ = mgr.ingest(.{ .image_id = 0, .more = 0, .payload = rgba_b64[mid..] });
+    try std.testing.expectEqualSlices(u8, &rgba, mgr.get(20).?.rgba);
+
+    const rgb = [_]u8{ 0x01, 0x02, 0x03, 0x11, 0x12, 0x13 };
+    const rgb_b64 = try testZlibBase64(std.testing.allocator, &rgb);
+    defer std.testing.allocator.free(rgb_b64);
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 21,
+        .format = 24,
+        .width = 2,
+        .height = 1,
+        .compression = 1,
+        .payload = rgb_b64,
+    });
+    try std.testing.expectEqualSlices(u8, &.{ 0x01, 0x02, 0x03, 0xFF, 0x11, 0x12, 0x13, 0xFF }, mgr.get(21).?.rgba);
+}
+
+test "manager rejects invalid and overflowing raw dimensions" {
+    try std.testing.expectError(image_size.Error.InvalidDimensions, image_size.byteLen(0, 1, 4));
+    try std.testing.expectError(
+        image_size.Error.TooLarge,
+        image_size.byteLen(std.math.maxInt(u32), std.math.maxInt(u32), 4),
+    );
+
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+    const payload = "AAAAAA==";
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 30,
+        .format = 32,
+        .width = 0,
+        .height = 1,
+        .payload = payload,
+    });
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 31,
+        .format = 32,
+        .width = image_size.max_dimension + 1,
+        .height = 1,
+        .payload = payload,
+    });
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 32,
+        .format = 32,
+        .width = std.math.maxInt(u32),
+        .height = std.math.maxInt(u32),
+        .payload = payload,
+    });
+    try std.testing.expect(mgr.get(30) == null);
+    try std.testing.expect(mgr.get(31) == null);
+    try std.testing.expect(mgr.get(32) == null);
+}
+
+test "manager rejects short and long raw payloads" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+    const bytes = [_]u8{0xA5} ** 17;
+    const short = try testBase64(std.testing.allocator, bytes[0..15]);
+    defer std.testing.allocator.free(short);
+    const long = try testBase64(std.testing.allocator, &bytes);
+    defer std.testing.allocator.free(long);
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 40,
+        .format = 32,
+        .width = 2,
+        .height = 2,
+        .payload = short,
+    });
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 41,
+        .format = 32,
+        .width = 2,
+        .height = 2,
+        .payload = long,
+    });
+    try std.testing.expect(mgr.get(40) == null);
+    try std.testing.expect(mgr.get(41) == null);
+}
+
+test "manager rejects short and long zlib inflation" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+    const bytes = [_]u8{0x5A} ** 17;
+    const short = try testZlibBase64(std.testing.allocator, bytes[0..15]);
+    defer std.testing.allocator.free(short);
+    const long = try testZlibBase64(std.testing.allocator, &bytes);
+    defer std.testing.allocator.free(long);
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 50,
+        .format = 32,
+        .width = 2,
+        .height = 2,
+        .compression = 1,
+        .payload = short,
+    });
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 51,
+        .format = 32,
+        .width = 2,
+        .height = 2,
+        .compression = 1,
+        .payload = long,
+    });
+    try std.testing.expect(mgr.get(50) == null);
+    try std.testing.expect(mgr.get(51) == null);
+}
+
+test "manager bounds high-ratio zlib inflation to metadata size" {
+    var bomb: [64 * 1024]u8 = undefined;
+    @memset(&bomb, 0);
+    const payload = try testZlibBase64(std.testing.allocator, &bomb);
+    defer std.testing.allocator.free(payload);
+
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 60,
+        .format = 32,
+        .width = 1,
+        .height = 1,
+        .compression = 1,
+        .payload = payload,
+    });
+    try std.testing.expect(mgr.get(60) == null);
+}
+
+test "manager enforces decoded budget at the exact edge" {
+    const rgba = [_]u8{0xCC} ** 16;
+    const payload = try testBase64(std.testing.allocator, &rgba);
+    defer std.testing.allocator.free(payload);
+
+    var exact = Manager.init(std.testing.allocator);
+    defer exact.deinit();
+    exact.budget_bytes = rgba.len;
+    _ = exact.ingest(.{
+        .action = .transmit,
+        .image_id = 70,
+        .format = 32,
+        .width = 2,
+        .height = 2,
+        .payload = payload,
+    });
+    try std.testing.expect(exact.get(70) != null);
+    _ = exact.ingest(.{
+        .action = .transmit_frame,
+        .image_id = 70,
+        .format = 32,
+        .width = 2,
+        .height = 2,
+        .payload = payload,
+    });
+    try std.testing.expectEqual(@as(usize, 0), exact.get(70).?.frames.items.len);
+    try std.testing.expectEqual(rgba.len, exact.store_bytes);
+
+    var undersized = Manager.init(std.testing.allocator);
+    defer undersized.deinit();
+    undersized.budget_bytes = rgba.len - 1;
+    _ = undersized.ingest(.{
+        .action = .transmit,
+        .image_id = 71,
+        .format = 32,
+        .width = 2,
+        .height = 2,
+        .payload = payload,
+    });
+    try std.testing.expect(undersized.get(71) == null);
 }
 
 test "manager: a=p before any transmit returns none" {

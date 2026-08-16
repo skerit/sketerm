@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const image_size = @import("image_size.zig");
 
 pub const Image = struct {
     width: u32,
@@ -93,13 +94,11 @@ pub const Store = struct {
 
     /// Evict oldest non-deleting images (FIFO) until `incoming` more bytes
     /// fit under the budget. Evicted images keep their entry (so the GL
-    /// texture is torn down by the next flush) but drop their CPU pixels
-    /// now. Never evicts so hard that a single over-budget image can't be
-    /// added — that one image is allowed through.
+    /// texture is torn down by the next flush) but drop their CPU pixels now.
     fn evictForBudget(self: *Store, incoming: usize) void {
         if (self.budget_bytes == 0) return;
         var i: usize = 0;
-        while (self.live_bytes + incoming > self.budget_bytes and i < self.images.items.len) : (i += 1) {
+        while (self.live_bytes > self.budget_bytes - incoming and i < self.images.items.len) : (i += 1) {
             const img = &self.images.items[i];
             if (img.deleting or img.pending == null) continue;
             self.freePending(img);
@@ -189,8 +188,9 @@ pub const Store = struct {
     };
 
     pub fn addFull(self: *Store, o: AddOpts) !void {
-        const need = o.width * o.height * 4;
-        if (o.rgba.len < need) return error.NotEnoughPixels;
+        const need = image_size.byteLen(o.width, o.height, 4) catch |err| return err;
+        if (o.rgba.len != need) return error.PixelDataLengthMismatch;
+        if (self.budget_bytes > 0 and need > self.budget_bytes) return error.ImageBudgetExceeded;
         // Same (image_id, placement_id) replaces — apps that re-place
         // every frame (emberglyph) would otherwise leak entries.
         // Mark for delete; flushUploads/flushDeletesNoGL frees pending
@@ -288,8 +288,8 @@ pub const Store = struct {
         for (self.images.items) |*img| {
             if (img.image_id != image_id) continue;
             if (img.last_seen_generation == generation) continue;
-            const need: usize = @as(usize, img.width) * @as(usize, img.height) * 4;
-            if (rgba.len < need) continue;
+            const need = image_size.byteLen(img.width, img.height, 4) catch continue;
+            if (rgba.len != need) continue;
             self.freePending(img);
             const dup = try self.allocator.dupe(u8, rgba[0..need]);
             self.live_bytes += dup.len;
@@ -437,6 +437,64 @@ test "addWithId stores image_id" {
     const rgba = [_]u8{0} ** 16; // 2x2 RGBA
     try s.addWithId(&rgba, 2, 2, 0, 0, 42);
     try std.testing.expectEqual(@as(u32, 42), s.images.items[0].image_id);
+}
+
+test "addFull rejects invalid dimensions and inconsistent pixel lengths" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    const rgba = [_]u8{0} ** 17;
+
+    try std.testing.expectError(image_size.Error.InvalidDimensions, s.addFull(.{
+        .rgba = rgba[0..16],
+        .width = 0,
+        .height = 2,
+        .row = 0,
+        .col = 0,
+    }));
+    try std.testing.expectError(image_size.Error.TooLarge, s.addFull(.{
+        .rgba = rgba[0..16],
+        .width = std.math.maxInt(u32),
+        .height = std.math.maxInt(u32),
+        .row = 0,
+        .col = 0,
+    }));
+    try std.testing.expectError(error.PixelDataLengthMismatch, s.addFull(.{
+        .rgba = rgba[0..15],
+        .width = 2,
+        .height = 2,
+        .row = 0,
+        .col = 0,
+    }));
+    try std.testing.expectError(error.PixelDataLengthMismatch, s.addFull(.{
+        .rgba = &rgba,
+        .width = 2,
+        .height = 2,
+        .row = 0,
+        .col = 0,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), s.count());
+}
+
+test "addFull enforces the decoded budget at the exact edge" {
+    const rgba = [_]u8{0} ** 16;
+
+    var exact = Store.init(std.testing.allocator);
+    defer exact.deinit();
+    exact.budget_bytes = rgba.len;
+    try exact.addFull(.{ .rgba = &rgba, .width = 2, .height = 2, .row = 0, .col = 0 });
+    try std.testing.expectEqual(rgba.len, exact.live_bytes);
+
+    var undersized = Store.init(std.testing.allocator);
+    defer undersized.deinit();
+    undersized.budget_bytes = rgba.len - 1;
+    try std.testing.expectError(error.ImageBudgetExceeded, undersized.addFull(.{
+        .rgba = &rgba,
+        .width = 2,
+        .height = 2,
+        .row = 0,
+        .col = 0,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), undersized.live_bytes);
 }
 
 test "markByIdForDelete flags only matching images" {
