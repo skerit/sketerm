@@ -1212,10 +1212,14 @@ pub const Conn = struct {
     /// write_timeout_ms poll (its EAGAIN path), and reads must go
     /// through recvFrameFor/recvExpectFor/fillAvailable — plain
     /// recvFrame's blocking read() would misread EAGAIN as a hangup.
-    pub fn setNonBlocking(self: *Conn) void {
+    pub fn setNonBlockingChecked(self: *Conn) !void {
         const fl = c.fcntl(self.fd, c.F_GETFL);
-        if (fl < 0) return;
-        _ = c.fcntl(self.fd, c.F_SETFL, fl | c.O_NONBLOCK);
+        if (fl < 0 or c.fcntl(self.fd, c.F_SETFL, fl | c.O_NONBLOCK) != 0)
+            return error.NonBlockingFailed;
+    }
+
+    pub fn setNonBlocking(self: *Conn) void {
+        self.setNonBlockingChecked() catch {};
     }
 
     /// Poll `fd` for readability, bounded by `timeout_ms`. A timeout or
@@ -1702,11 +1706,22 @@ pub const Conn = struct {
         var budget: usize = 4 << 20;
         while (true) {
             var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
-            if (c.poll(&pfd, 1, 0) <= 0) return true;
+            const polled = c.poll(&pfd, 1, 0);
+            if (polled < 0) {
+                if (std.posix.errno(polled) == .INTR) continue;
+                return false;
+            }
+            if (polled == 0) return true;
             if ((pfd.revents & (c.POLLIN | c.POLLHUP)) == 0) return true;
             var tmp: [16384]u8 = undefined;
             const n = c.read(self.fd, &tmp, tmp.len);
-            if (n <= 0) return false; // hung up
+            if (n == 0) return false;
+            if (n < 0) {
+                const e = std.posix.errno(n);
+                if (e == .INTR) continue;
+                if (e == .AGAIN) return true;
+                return false;
+            }
             self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch return false;
             if (@as(usize, @intCast(n)) < tmp.len) return true; // drained the socket
             if (budget <= @as(usize, @intCast(n))) return true; // cap hit; rest next pump

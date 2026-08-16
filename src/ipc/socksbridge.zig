@@ -17,6 +17,8 @@ const c = @import("../c.zig").c;
 const socks5 = @import("socks5.zig");
 const wire = @import("../mux/wire.zig");
 const client = @import("../mux/client.zig");
+const platform = @import("../util/platform.zig");
+const FdCancel = @import("../util/fdcancel.zig").FdCancel;
 
 // ---------------------------------------------------------------------
 // SOCKS5 protocol driver (pure, unit-tested)
@@ -153,8 +155,8 @@ const Session = struct {
         return self.out.items.len - self.out_off;
     }
 
-    fn pollEvents(self: *const Session) c_short {
-        var events: c_short = if (self.close_after_flush) 0 else c.POLLIN;
+    fn pollEvents(self: *const Session, mux_blocked: bool) c_short {
+        var events: c_short = if (self.close_after_flush or mux_blocked) 0 else c.POLLIN;
         if (self.pendingOut() != 0) events |= c.POLLOUT;
         return events;
     }
@@ -182,8 +184,7 @@ pub const Bridge = struct {
     /// possibly-slow connect completes on another thread.
     conn: ?*client.Conn = null,
     listen_fd: c_int = -1,
-    stop_r: c_int = -1,
-    stop_w: c_int = -1,
+    stop: ?platform.Wakeup = null,
     /// Bound loopback port (host order), valid after `listen`.
     port: u16 = 0,
     next_req: u32 = 1,
@@ -199,6 +200,14 @@ pub const Bridge = struct {
 
     /// Bind 127.0.0.1 on `want_port` (0 = auto-pick) and start listening.
     pub fn listen(self: *Bridge, want_port: u16) !void {
+        try self.listenUsing(want_port, platform.Wakeup.init);
+    }
+
+    fn listenUsing(
+        self: *Bridge,
+        want_port: u16,
+        wakeup_init: *const fn () anyerror!platform.Wakeup,
+    ) !void {
         const lfd = platformSocket();
         if (lfd < 0) return error.SocketFailed;
         self.listen_fd = lfd;
@@ -207,6 +216,7 @@ pub const Bridge = struct {
             self.listen_fd = -1;
             self.port = 0;
         }
+        try setNonBlockingFd(lfd);
         var one: c_int = 1;
         _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
         var sa = std.mem.zeroes(c.struct_sockaddr_in);
@@ -221,21 +231,12 @@ pub const Bridge = struct {
         if (c.getsockname(lfd, @ptrCast(&got), &glen) != 0) return error.GetsocknameFailed;
         self.port = std.mem.bigToNative(u16, got.sin_port);
         if (self.port == 0) return error.InvalidPort;
-        // Self-pipe so another thread can wake the loop to stop it.
-        var pipefds: [2]c_int = .{ -1, -1 };
-        if (c.pipe(&pipefds) != 0) return error.PipeFailed;
-        self.stop_r = pipefds[0];
-        self.stop_w = pipefds[1];
-        _ = c.fcntl(self.stop_r, c.F_SETFL, c.O_NONBLOCK);
+        self.stop = try wakeup_init();
     }
 
-    /// Wake the poll loop and make `run` return. Thread-safe (a single
-    /// byte on the self-pipe).
+    /// Wake the poll loop and make `run` return.
     pub fn requestStop(self: *Bridge) void {
-        if (self.stop_w >= 0) {
-            const b: [1]u8 = .{0};
-            _ = c.write(self.stop_w, &b, 1);
-        }
+        if (self.stop) |wake| wake.signal();
     }
 
     pub fn deinit(self: *Bridge) void {
@@ -246,13 +247,9 @@ pub const Bridge = struct {
             _ = c.close(self.listen_fd);
             self.listen_fd = -1;
         }
-        if (self.stop_r >= 0) {
-            _ = c.close(self.stop_r);
-            self.stop_r = -1;
-        }
-        if (self.stop_w >= 0) {
-            _ = c.close(self.stop_w);
-            self.stop_w = -1;
+        if (self.stop) |wake| {
+            wake.close();
+            self.stop = null;
         }
     }
 
@@ -346,15 +343,23 @@ pub const Bridge = struct {
     /// Serve until `requestStop` or the mux connection drops.
     pub fn run(self: *Bridge) void {
         const conn = self.conn orelse return;
+        const stop = self.stop orelse return;
+        conn.setNonBlockingChecked() catch return;
         while (true) {
+            if (!self.drainConnFrames()) return;
+            const mux_blocked = conn.wbuf.items.len != 0;
             var fds: [3 + MAX_SESSIONS]c.struct_pollfd = undefined;
-            fds[0] = .{ .fd = conn.fd, .events = c.POLLIN, .revents = 0 };
-            fds[1] = .{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 };
-            fds[2] = .{ .fd = self.stop_r, .events = c.POLLIN, .revents = 0 };
+            fds[0] = .{
+                .fd = conn.fd,
+                .events = @intCast(c.POLLIN | if (mux_blocked) c.POLLOUT else 0),
+                .revents = 0,
+            };
+            fds[1] = .{ .fd = self.listen_fd, .events = if (mux_blocked) 0 else c.POLLIN, .revents = 0 };
+            fds[2] = .{ .fd = stop.read_fd, .events = c.POLLIN, .revents = 0 };
             for (&self.sessions, 0..) |*s, i| {
                 fds[3 + i] = .{
                     .fd = if (s.active()) s.fd else -1,
-                    .events = if (s.active()) s.pollEvents() else 0,
+                    .events = if (s.active()) s.pollEvents(mux_blocked) else 0,
                     .revents = 0,
                 };
             }
@@ -364,9 +369,11 @@ pub const Bridge = struct {
                 return;
             }
 
-            if (fds[2].revents & c.POLLIN != 0) return;
+            if (fds[2].revents != 0) return;
 
-            if (fds[1].revents & c.POLLIN != 0) self.acceptOne();
+            if (fds[0].revents & c.POLLOUT != 0) conn.flushQueued() catch return;
+
+            if (fds[1].revents & c.POLLIN != 0 and conn.wbuf.items.len == 0) self.acceptOne();
 
             if (fds[0].revents & (c.POLLIN | c.POLLHUP) != 0) {
                 if (!self.pumpConn()) return;
@@ -378,7 +385,8 @@ pub const Bridge = struct {
                 const revents = fds[3 + i].revents;
                 if (revents & c.POLLOUT != 0) self.flushSession(s);
                 if (!s.active()) continue;
-                if (revents & (c.POLLIN | c.POLLHUP) != 0) self.pumpSession(s);
+                if (revents & (c.POLLIN | c.POLLHUP) != 0 and conn.wbuf.items.len == 0)
+                    self.pumpSession(s);
                 if (!s.active()) continue;
                 if (revents & (c.POLLERR | c.POLLNVAL) != 0) self.closeSession(s, true);
             }
@@ -388,7 +396,10 @@ pub const Bridge = struct {
     fn acceptOne(self: *Bridge) void {
         const afd = c.accept(self.listen_fd, null, null);
         if (afd < 0) return;
-        _ = c.fcntl(afd, c.F_SETFL, c.O_NONBLOCK);
+        setNonBlockingFd(afd) catch {
+            _ = c.close(afd);
+            return;
+        };
         const slot = self.freeSlot() orelse {
             _ = c.close(afd);
             return;
@@ -412,7 +423,7 @@ pub const Bridge = struct {
             s.req_id = self.next_req;
             self.next_req += 1;
             const conn = self.conn orelse return;
-            conn.sendJson(.stream_open, .{
+            conn.queueJson(.stream_open, .{
                 .req = s.req_id,
                 .host = host,
                 .port = act.connect_port,
@@ -429,11 +440,18 @@ pub const Bridge = struct {
     /// Frames from the daemon: `stream_reply`, `chan_data`, `chan_close`.
     fn pumpConn(self: *Bridge) bool {
         const conn = self.conn orelse return false;
-        var f = conn.recvFrame() catch return false;
+        const connected = conn.fillAvailable();
+        if (!self.drainConnFrames()) return false;
+        return connected;
+    }
+
+    fn drainConnFrames(self: *Bridge) bool {
+        const conn = self.conn orelse return false;
         while (true) {
+            const maybe = conn.takeFrame() catch return false;
+            const f = maybe orelse break;
             self.handleConnFrame(f.ftype, f.payload);
             f.deinit(self.allocator);
-            f = (conn.takeFrame() catch return false) orelse break;
         }
         return true;
     }
@@ -482,14 +500,14 @@ pub const Bridge = struct {
             const take = @min(data.len - off, msg.len - 4);
             @memcpy(msg[0..4], &hdr);
             @memcpy(msg[4 .. 4 + take], data[off .. off + take]);
-            (self.conn orelse return).sendFrame(.chan_data, msg[0 .. 4 + take]) catch return;
+            (self.conn orelse return).queueFrame(.chan_data, msg[0 .. 4 + take]) catch return;
             off += take;
         }
     }
 
     fn sendChanClose(self: *Bridge, chan: u32) void {
         var hdr: [4]u8 = undefined;
-        (self.conn orelse return).sendFrame(.chan_close, wire.putChanHeader(&hdr, chan)) catch {};
+        (self.conn orelse return).queueFrame(.chan_close, wire.putChanHeader(&hdr, chan)) catch {};
     }
 };
 
@@ -508,6 +526,7 @@ pub const Egress = struct {
     host: [256]u8 = undefined,
     host_len: usize = 0,
     thread: ?std.Thread = null,
+    cancel: FdCancel = .{},
 
     /// How the worker reaches the egress host's daemon. Mirrors the mux
     /// host-string convention: null = local autostart socket.
@@ -546,6 +565,9 @@ pub const Egress = struct {
         if (self.connectFn(self.allocator, h)) |conn| {
             self.conn = conn;
             self.conn_ok = true;
+            self.conn.setNonBlockingChecked() catch return;
+            if (!(self.cancel.publish(self.conn.fd) catch return)) return;
+            defer self.cancel.release();
             self.bridge.setConn(&self.conn);
             self.bridge.run();
         }
@@ -556,6 +578,7 @@ pub const Egress = struct {
     /// Stop serving, join the worker, close everything. Safe to call
     /// once; the caller frees the Egress afterwards via `destroy`.
     pub fn stop(self: *Egress) void {
+        self.cancel.stop();
         self.bridge.requestStop();
         if (self.thread) |t| t.join();
         self.thread = null;
@@ -573,11 +596,17 @@ pub const Egress = struct {
 };
 
 fn platformSocket() c_int {
-    return @import("../util/platform.zig").socketCloexec(c.AF_INET, c.SOCK_STREAM, 0);
+    return platform.socketCloexec(c.AF_INET, c.SOCK_STREAM, 0);
+}
+
+fn setNonBlockingFd(fd: c_int) !void {
+    const flags = c.fcntl(fd, c.F_GETFL);
+    if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) != 0)
+        return error.NonBlockingFailed;
 }
 
 // ---------------------------------------------------------------------
-// Tests (driver only; the poll loop is covered by smoke-web)
+// Tests
 // ---------------------------------------------------------------------
 
 test "driver: greeting then domain CONNECT" {
@@ -687,8 +716,8 @@ test "transport: stalled reader preserves replies and tunnel bytes before close"
     // While that close is pending, only writability can advance the session.
     bridge.closeAfterFlush(s, true);
     try t.expect(s.active());
-    try t.expect(s.pollEvents() & c.POLLIN == 0);
-    try t.expect(s.pollEvents() & c.POLLOUT != 0);
+    try t.expect(s.pollEvents(false) & c.POLLIN == 0);
+    try t.expect(s.pollEvents(false) & c.POLLOUT != 0);
 
     var received: std.ArrayList(u8) = .empty;
     defer received.deinit(a);
@@ -768,8 +797,8 @@ test "transport: buffered daemon frames preserve connect-data-close order" {
     var close_header: [4]u8 = undefined;
     try wire.appendFrame(&stream, a, .chan_close, wire.putChanHeader(&close_header, 7));
 
-    // recvFrame may fill rbuf with several frames in one read. Preloading that
-    // exact state makes the regression deterministic: no fd readiness recurs.
+    // Preloading several frames makes the regression deterministic: no fd
+    // readiness recurs after the buffered batch is drained.
     try conn.rbuf.appendSlice(a, stream.items);
     try t.expect(bridge.pumpConn());
     try t.expect(!s.active());
@@ -782,4 +811,127 @@ test "transport: buffered daemon frames preserve connect-data-close order" {
     @memcpy(expected[0..success.len], &success);
     @memcpy(expected[success.len..], "alphabeta");
     try t.expectEqualSlices(u8, &expected, received.items);
+}
+
+fn testWakeupFailure() !platform.Wakeup {
+    return error.TestWakeupFailure;
+}
+
+fn testRunAndStop(bridge: *Bridge) !void {
+    const thread = try std.Thread.spawn(.{}, Bridge.run, .{bridge});
+    _ = c.usleep(20_000);
+    const start = testNowMs();
+    bridge.requestStop();
+    thread.join();
+    try std.testing.expect(testNowMs() - start < 1_000);
+}
+
+fn testNowMs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+}
+
+test "transport: wakeup setup failure closes the listener" {
+    const t = std.testing;
+    var bridge = Bridge.init(t.allocator);
+    defer bridge.deinit();
+    try t.expectError(error.TestWakeupFailure, bridge.listenUsing(0, testWakeupFailure));
+    try t.expectEqual(@as(c_int, -1), bridge.listen_fd);
+    try t.expectEqual(@as(u16, 0), bridge.port);
+    try t.expect(bridge.stop == null);
+}
+
+test "transport: stop wakes an idle mux poll" {
+    const t = std.testing;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+    defer _ = c.close(pair[1]);
+    var conn = client.Conn{ .allocator = t.allocator, .fd = pair[0] };
+    defer conn.deinit();
+    var bridge = Bridge.init(t.allocator);
+    defer bridge.deinit();
+    try bridge.listen(0);
+    bridge.setConn(&conn);
+    try testRunAndStop(&bridge);
+}
+
+test "transport: stop interrupts a partial mux header" {
+    const t = std.testing;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+    defer _ = c.close(pair[1]);
+    var conn = client.Conn{ .allocator = t.allocator, .fd = pair[0] };
+    defer conn.deinit();
+    try conn.setNonBlockingChecked();
+    var bridge = Bridge.init(t.allocator);
+    defer bridge.deinit();
+    try bridge.listen(0);
+    bridge.setConn(&conn);
+
+    const partial = [_]u8{ 5, 0 };
+    try t.expectEqual(@as(isize, partial.len), c.write(pair[1], &partial, partial.len));
+    try t.expect(bridge.pumpConn());
+    try t.expectEqual(partial.len, conn.rbuf.items.len);
+    try testRunAndStop(&bridge);
+}
+
+test "transport: stop interrupts mux-send backpressure" {
+    const t = std.testing;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+    defer _ = c.close(pair[1]);
+    const tiny: c_int = 1024;
+    try t.expectEqual(@as(c_int, 0), c.setsockopt(pair[0], c.SOL_SOCKET, c.SO_SNDBUF, &tiny, @sizeOf(c_int)));
+    var conn = client.Conn{ .allocator = t.allocator, .fd = pair[0] };
+    defer conn.deinit();
+    try conn.setNonBlockingChecked();
+    const payload = [_]u8{0x5a} ** (32 * 1024);
+    var attempts: usize = 0;
+    while (conn.wbuf.items.len == 0 and attempts < 128) : (attempts += 1)
+        try conn.queueFrame(.chan_data, &payload);
+    try t.expect(conn.wbuf.items.len != 0);
+
+    var bridge = Bridge.init(t.allocator);
+    defer bridge.deinit();
+    try bridge.listen(0);
+    bridge.setConn(&conn);
+    try testRunAndStop(&bridge);
+}
+
+const TestEgressConnector = struct {
+    var fd: std.atomic.Value(c_int) = .init(-1);
+
+    fn connect(allocator: std.mem.Allocator, _: ?[]const u8) ?client.Conn {
+        const owned = fd.swap(-1, .acq_rel);
+        if (owned < 0) return null;
+        return .{ .allocator = allocator, .fd = owned };
+    }
+};
+
+test "egress stop interrupts the published mux endpoint before join" {
+    const t = std.testing;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+    defer _ = c.close(pair[1]);
+    TestEgressConnector.fd.store(pair[0], .release);
+    const egress = Egress.create(t.allocator, "test", TestEgressConnector.connect) orelse
+        return error.TestUnexpectedResult;
+    var stopped = false;
+    defer {
+        if (!stopped) egress.stop();
+        egress.destroy();
+    }
+    try t.expect(egress.spawn());
+    const deadline = testNowMs() + 1_000;
+    while (egress.cancel.fd.load(.acquire) < 0 and testNowMs() < deadline)
+        _ = c.usleep(1_000);
+    try t.expect(egress.cancel.fd.load(.acquire) >= 0);
+
+    const start = testNowMs();
+    egress.stop();
+    stopped = true;
+    try t.expect(testNowMs() - start < 1_000);
+    var byte: u8 = 0;
+    try t.expectEqual(@as(isize, 0), c.read(pair[1], &byte, 1));
 }
