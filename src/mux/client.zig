@@ -1252,6 +1252,11 @@ pub const Conn = struct {
         return self.flushQueuedFor(self.write_timeout_ms);
     }
 
+    /// Deliver one complete frame against an absolute monotonic deadline.
+    pub fn sendFrameUntil(self: *Conn, ftype: wire.FrameType, payload: []const u8, deadline_ms: i64) !void {
+        try self.queueFrameUntil(ftype, payload, deadline_ms);
+    }
+
     /// Queue one complete frame and write only what the nonblocking fd
     /// accepts immediately. Partial writes remain resumable in `wbuf`.
     pub fn queueFrame(self: *Conn, ftype: wire.FrameType, payload: []const u8) !void {
@@ -1322,6 +1327,11 @@ pub const Conn = struct {
         defer aw.deinit();
         try std.json.Stringify.value(value, .{}, &aw.writer);
         try self.sendFrame(ftype, aw.written());
+    }
+
+    /// Serialize and deliver one JSON frame against an absolute deadline.
+    pub fn sendJsonUntil(self: *Conn, ftype: wire.FrameType, value: anytype, deadline_ms: i64) !void {
+        try self.queueJsonUntil(ftype, value, deadline_ms);
     }
 
     /// Send a name-only legacy kill or a negotiated lifetime-fenced kill.
@@ -1774,30 +1784,45 @@ fn connectPanelRequesterUntil(
 /// Callers must use this instead of load+shutdown so the worker cannot close
 /// and reuse the descriptor between those two operations.
 pub fn cancelPanelRequesterFd(slot: *std.atomic.Value(c_int)) void {
+    cancelCancellationFd(slot);
+}
+
+/// Atomically retire a published cancellation duplicate without interrupting
+/// the underlying socket after a requester operation completed normally.
+pub fn releasePanelRequesterFd(slot: *std.atomic.Value(c_int)) void {
+    releaseCancellationFd(slot);
+}
+
+fn clearPanelRequesterFd(slot: ?*std.atomic.Value(c_int)) void {
+    const active = slot orelse return;
+    releaseCancellationFd(active);
+}
+
+fn publishPanelRequesterFd(slot: ?*std.atomic.Value(c_int), source_fd: c_int) !void {
+    const active = slot orelse return;
+    try publishCancellationFd(active, source_fd);
+}
+
+/// Atomically claim and interrupt a published duplicate without descriptor-reuse races.
+pub fn cancelCancellationFd(slot: *std.atomic.Value(c_int)) void {
     const fd = slot.swap(-1, .acq_rel);
     if (fd < 0) return;
     _ = c.shutdown(fd, c.SHUT_RDWR);
     _ = c.close(fd);
 }
 
-/// Atomically retire a published cancellation duplicate without interrupting
-/// the underlying socket after a requester operation completed normally.
-pub fn releasePanelRequesterFd(slot: *std.atomic.Value(c_int)) void {
-    clearPanelRequesterFd(slot);
-}
-
-fn clearPanelRequesterFd(slot: ?*std.atomic.Value(c_int)) void {
-    const active = slot orelse return;
-    const fd = active.swap(-1, .acq_rel);
+/// Retire a published cancellation duplicate without interrupting its socket.
+pub fn releaseCancellationFd(slot: *std.atomic.Value(c_int)) void {
+    const fd = slot.swap(-1, .acq_rel);
     if (fd >= 0) _ = c.close(fd);
 }
 
-fn publishPanelRequesterFd(slot: ?*std.atomic.Value(c_int), source_fd: c_int) !void {
-    const active = slot orelse return;
-    clearPanelRequesterFd(active);
+/// Publish a cancellation-only duplicate of a live connection fd.
+pub fn publishCancellationFd(slot: *std.atomic.Value(c_int), source_fd: c_int) !void {
+    releaseCancellationFd(slot);
     const cancel_fd = c.fcntl(source_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
     if (cancel_fd < 0) return error.CancelFdFailed;
-    active.store(cancel_fd, .release);
+    slot.store(cancel_fd, .release);
 }
 
 fn classifyPanelRequesterAttachError(conn: *const Conn, err: anyerror) anyerror {

@@ -443,7 +443,7 @@ fn sweepStaleEphemeral(allocator: std.mem.Allocator) void {
 
 /// Central hard timeout — ONE watchdog covering EVERY tool call, not
 /// per-tool special cases. If a call exceeds the cap, the watchdog
-/// shuts down all mux connection fds registered at call start; every
+/// shuts down all mux connection fds registered for the call; every
 /// bounded IO loop on them then errors within its own (much shorter)
 /// deadline, the call returns an error, and the server keeps serving.
 /// A backstop for wedges no per-path deadline anticipated — not a
@@ -468,7 +468,10 @@ pub const Watchdog = struct {
     /// cannot close fds, and normal calls finish far under the cap.
     var fds: [128]c_int = undefined;
     var fd_count: usize = 0;
+    /// A panel connection may be established after begin().
     var dynamic_fd: std.atomic.Value(c_int) = .init(-1);
+    /// The persistent fs connection is lazy and may be replaced mid-call.
+    var fs_fd: std.atomic.Value(c_int) = .init(-1);
     pub var fired: std.atomic.Value(bool) = .init(false);
     pub var hard_ms: i64 = 150_000;
 
@@ -507,6 +510,11 @@ pub const Watchdog = struct {
         started_ms = 0;
     }
 
+    fn cancelDynamicFds() void {
+        muxclient.cancelPanelRequesterFd(&dynamic_fd);
+        muxclient.cancelCancellationFd(&fs_fd);
+    }
+
     fn loop() void {
         while (true) {
             var ts = c.struct_timespec{ .tv_sec = 1, .tv_nsec = 0 };
@@ -519,7 +527,7 @@ pub const Watchdog = struct {
                 // A panel socket may have been created after begin() and can
                 // still be in connect/hello/attach. Pool exposes that call's
                 // fd atomically so the watchdog covers establishment too.
-                muxclient.cancelPanelRequesterFd(&dynamic_fd);
+                cancelDynamicFds();
             }
             _ = c.pthread_mutex_unlock(&mu);
             if (overdue) {
@@ -1688,18 +1696,84 @@ const FsState = struct {
     fn get(self: *FsState) ?*fsdrive.Fs {
         if (self.fs == null) {
             const conn = muxclient.Conn.connectLocalAutostartAt(self.allocator, app_state.mux_sock) catch return null;
-            self.fs = fsdrive.Fs.initConn(self.allocator, conn);
+            if (!self.adoptConn(conn)) return null;
         }
         return &self.fs.?;
     }
 
+    fn adoptConn(self: *FsState, conn_in: muxclient.Conn) bool {
+        var conn = conn_in;
+        // The hello is already complete. Switch before any fs request or
+        // potentially large fs_write so Conn's deadline polls can work.
+        conn.setNonBlockingChecked() catch {
+            conn.deinit();
+            return false;
+        };
+        muxclient.publishCancellationFd(&Watchdog.fs_fd, conn.fd) catch {
+            conn.deinit();
+            return false;
+        };
+        self.fs = fsdrive.Fs.initConn(self.allocator, conn);
+        return true;
+    }
+
     fn drop(self: *FsState) void {
+        muxclient.releaseCancellationFd(&Watchdog.fs_fd);
         if (self.fs) |*f| f.deinit();
         self.fs = null;
     }
 };
 
 var fs_state: FsState = .{ .allocator = undefined };
+
+test "watchdog fs cancellation follows a replacement connection during one call" {
+    const t = std.testing;
+    muxclient.releaseCancellationFd(&Watchdog.fs_fd);
+    Watchdog.initLock();
+    Watchdog.begin();
+    defer Watchdog.end();
+
+    var state = FsState{ .allocator = t.allocator };
+    defer state.drop();
+    var first: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &first));
+    defer _ = c.close(first[1]);
+    const first_fd = first[0];
+    try t.expect(state.adoptConn(.{ .allocator = t.allocator, .fd = first[0] }));
+    const flags = c.fcntl(state.fs.?.pollFd(), c.F_GETFL);
+    try t.expect(flags >= 0 and flags & c.O_NONBLOCK != 0);
+    try t.expect(Watchdog.fs_fd.load(.acquire) >= 0);
+
+    state.drop();
+    try t.expectEqual(@as(c_int, -1), Watchdog.fs_fd.load(.acquire));
+    var replacement: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &replacement));
+    defer _ = c.close(replacement[1]);
+    try t.expectEqual(first_fd, replacement[0]);
+    try t.expect(state.adoptConn(.{ .allocator = t.allocator, .fd = replacement[0] }));
+
+    const Cancel = struct {
+        fn run() void {
+            _ = c.usleep(50_000);
+            Watchdog.cancelDynamicFds();
+        }
+    };
+    const canceler = try std.Thread.spawn(.{}, Cancel.run, .{});
+    defer canceler.join();
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const start = monoMs();
+    try t.expectError(
+        fsdrive.Error.NotConnected,
+        state.fs.?.statPath(arena_state.allocator(), "/tmp/watchdog-no-reply"),
+    );
+    try t.expect(monoMs() - start < 500);
+    try t.expectEqual(@as(c_int, -1), Watchdog.fs_fd.load(.acquire));
+
+    state.drop();
+    try t.expect(!state.adoptConn(.{ .allocator = t.allocator, .fd = -1 }));
+    try t.expectEqual(@as(c_int, -1), Watchdog.fs_fd.load(.acquire));
+}
 
 /// Server mode facts for the `capabilities` preflight tool.
 var srv_mode: []const u8 = "isolated";
@@ -3579,6 +3653,9 @@ fn fsFail(arena: std.mem.Allocator, fs: *fsdrive.Fs, what: []const u8, err: fsdr
     const msg = std.fmt.allocPrint(arena, "{s} failed: {s} ({s})", .{
         what, fs.lastErr(), @errorName(err),
     }) catch return error.OutOfMemory;
+    // A send timeout may have left half a frame on the stream. Preserve the
+    // timeout verdict, but retire that connection before the next request.
+    if (!fs.usable()) fs_state.drop();
     return toolResult(arena, msg, true) orelse error.OutOfMemory;
 }
 

@@ -7,10 +7,9 @@
 //! transport is Conn's business). GTK-free and libc-only so it serves
 //! the GUI browser pane, MCP tools, and headless smokes alike.
 //!
-//! No-hang invariant: every wait is deadline-bounded (recvFrameFor);
-//! replies are matched by the `req` nonce in the fs_reply HEADER,
-//! never by arrival order, and fs_delta pushes arriving mid-wait are
-//! stashed, not dropped.
+//! No-hang invariant: every send and wait is deadline-bounded; replies
+//! are matched by the `req` nonce in the fs_reply HEADER, never by
+//! arrival order, and fs_delta pushes arriving mid-wait are stashed.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -373,6 +372,9 @@ pub const Fs = struct {
     conflict: ?InstallResult = null,
     /// Distinguishes concurrent atomic saves from one connection.
     save_seq: u32 = 0,
+    /// A deadline/error after partial frame delivery makes the stream
+    /// framing unsafe to reuse; the owner must reconnect it.
+    send_broken: bool = false,
 
     /// Adopt an already hello-probed connection (ownership moves).
     pub fn initConn(allocator: std.mem.Allocator, conn: client.Conn) Fs {
@@ -407,6 +409,10 @@ pub const Fs = struct {
     /// Exposes the transport for integration into an external poll loop.
     pub fn pollFd(self: *const Fs) c_int {
         return self.conn.fd;
+    }
+
+    pub fn usable(self: *const Fs) bool {
+        return !self.send_broken;
     }
 
     fn setErr(self: *Fs, msg: []const u8) void {
@@ -672,7 +678,37 @@ pub const Fs = struct {
         }
     }
 
-    fn sendOp(self: *Fs, op: []const u8, req: u32, args: anytype) Error!void {
+    fn sendJsonFor(self: *Fs, ftype: wire.FrameType, value: anytype, timeout_ms: i64) Error!void {
+        if (self.send_broken) return Error.NotConnected;
+        self.conn.sendJsonUntil(ftype, value, nowMs() + timeout_ms) catch |err| switch (err) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            error.Timeout => {
+                self.send_broken = true;
+                return Error.Timeout;
+            },
+            else => {
+                self.send_broken = true;
+                return Error.NotConnected;
+            },
+        };
+    }
+
+    fn sendFrameFor(self: *Fs, ftype: wire.FrameType, payload: []const u8, timeout_ms: i64) Error!void {
+        if (self.send_broken) return Error.NotConnected;
+        self.conn.sendFrameUntil(ftype, payload, nowMs() + timeout_ms) catch |err| switch (err) {
+            error.OutOfMemory => return Error.OutOfMemory,
+            error.Timeout => {
+                self.send_broken = true;
+                return Error.Timeout;
+            },
+            else => {
+                self.send_broken = true;
+                return Error.NotConnected;
+            },
+        };
+    }
+
+    fn sendOpFor(self: *Fs, op: []const u8, req: u32, args: anytype, timeout_ms: i64) Error!void {
         const Base = struct {
             req: u32,
             op: []const u8,
@@ -717,7 +753,11 @@ pub const Fs = struct {
         inline for (@typeInfo(@TypeOf(args)).@"struct".fields) |fld| {
             @field(b, fld.name) = @field(args, fld.name);
         }
-        self.conn.sendJson(.fs_op, b) catch return Error.NotConnected;
+        try self.sendJsonFor(.fs_op, b, timeout_ms);
+    }
+
+    fn sendOp(self: *Fs, op: []const u8, req: u32, args: anytype) Error!void {
+        try self.sendOpFor(op, req, args, OP_TIMEOUT_MS);
     }
 
     /// Collect a chunked listing reply run into one Listing.
@@ -1024,21 +1064,7 @@ pub const Fs = struct {
         const req = self.nextReq();
         self.pending_ops.append(self.allocator, .{ .req = req, .kind = .write }) catch
             return Error.OutOfMemory;
-        var payload: std.ArrayList(u8) = .empty;
-        defer payload.deinit(self.allocator);
-        var hdr: [15]u8 = undefined;
-        std.mem.writeInt(u32, hdr[0..4], req, .little);
-        std.mem.writeInt(u64, hdr[4..12], off, .little);
-        hdr[12] = flags.byte();
-        std.mem.writeInt(u16, hdr[13..15], @intCast(path.len), .little);
-        const send: Error!void = blk: {
-            payload.appendSlice(self.allocator, &hdr) catch break :blk Error.OutOfMemory;
-            payload.appendSlice(self.allocator, path) catch break :blk Error.OutOfMemory;
-            payload.appendSlice(self.allocator, data) catch break :blk Error.OutOfMemory;
-            self.conn.sendFrame(.fs_write, payload.items) catch break :blk Error.NotConnected;
-            break :blk {};
-        };
-        send catch |err| {
+        self.sendWriteFor(req, path, off, data, flags, OP_TIMEOUT_MS + uploadBudgetMs(data.len)) catch |err| {
             const i = self.pendingIndex(req).?;
             _ = self.pending_ops.orderedRemove(i);
             return err;
@@ -1160,6 +1186,18 @@ pub const Fs = struct {
     pub fn write(self: *Fs, path: []const u8, off: u64, data: []const u8, flags: WriteFlags) Error!u64 {
         if (path.len > std.math.maxInt(u16)) return Error.BadReply;
         const req = self.nextReq();
+        const upload_ms = uploadBudgetMs(data.len);
+        try self.sendWriteFor(req, path, off, data, flags, OP_TIMEOUT_MS + upload_ms);
+
+        var scratch = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch.deinit();
+        // The ack cannot beat the payload up a slow link: budget the
+        // wait for the upload itself, not just the round trip.
+        const rep = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS + upload_ms);
+        return rep.written;
+    }
+
+    fn sendWriteFor(self: *Fs, req: u32, path: []const u8, off: u64, data: []const u8, flags: WriteFlags, timeout_ms: i64) Error!void {
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(self.allocator);
         var hdr: [15]u8 = undefined;
@@ -1170,15 +1208,7 @@ pub const Fs = struct {
         payload.appendSlice(self.allocator, &hdr) catch return Error.OutOfMemory;
         payload.appendSlice(self.allocator, path) catch return Error.OutOfMemory;
         payload.appendSlice(self.allocator, data) catch return Error.OutOfMemory;
-        self.conn.sendFrame(.fs_write, payload.items) catch return Error.NotConnected;
-
-        var scratch = std.heap.ArenaAllocator.init(self.allocator);
-        defer scratch.deinit();
-        // The ack cannot beat the payload up a slow link: budget the
-        // wait for the upload itself, not just the round trip.
-        const upload_ms: i64 = @intCast(@min(@as(u64, @intCast(OP_CAP_MS - OP_TIMEOUT_MS)), data.len / (WRITE_MIN_RATE / 1000)));
-        const rep = try self.awaitReply(scratch.allocator(), req, OP_TIMEOUT_MS + upload_ms);
-        return rep.written;
+        try self.sendFrameFor(.fs_write, payload.items, timeout_ms);
     }
 
     // ── atomic save ─────────────────────────────────────────────
@@ -1771,4 +1801,74 @@ test "disk usage job fields survive the fsdrive event mirror" {
     try t.expectEqual(@as(u64, 2), event.errors);
     try t.expectEqual(@as(u64, 3), event.skipped);
     try t.expectEqual(@as(i64, 456), event.mtime_ms);
+}
+
+const StallAfterHello = struct {
+    fd: c_int,
+
+    fn run(self: StallAfterHello) void {
+        var peer = client.Conn{ .allocator = std.heap.c_allocator, .fd = self.fd };
+        defer peer.deinit();
+        const hello = peer.recvExpect(&.{.hello}) catch return;
+        hello.deinit(peer.allocator);
+        peer.sendFrame(.welcome, "{\"proto\":6,\"server_proto\":6,\"negotiation\":1}") catch return;
+        // Keep the socket open but consume no fs request bytes.
+        _ = c.usleep(250_000);
+    }
+};
+
+test "fs write send deadline survives a daemon that stops reading after hello" {
+    const t = std.testing;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+    var sndbuf: c_int = 4096;
+    try t.expectEqual(@as(c_int, 0), c.setsockopt(pair[0], c.SOL_SOCKET, c.SO_SNDBUF, &sndbuf, @sizeOf(c_int)));
+    const server = try std.Thread.spawn(.{}, StallAfterHello.run, .{StallAfterHello{ .fd = pair[1] }});
+    defer server.join();
+
+    var conn = client.Conn{ .allocator = t.allocator, .fd = pair[0] };
+    var conn_owned = true;
+    defer if (conn_owned) conn.deinit();
+    try conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION });
+    const welcome = try conn.recvExpectFor(&.{.welcome}, 1_000);
+    welcome.deinit(t.allocator);
+    try conn.setNonBlockingChecked();
+    const flags = c.fcntl(conn.fd, c.F_GETFL);
+    try t.expect(flags >= 0 and flags & c.O_NONBLOCK != 0);
+
+    var fs = Fs.initConn(t.allocator, conn);
+    conn_owned = false;
+    defer fs.deinit();
+    const data = try t.allocator.alloc(u8, 4 << 20);
+    defer t.allocator.free(data);
+    @memset(data, 'x');
+    const start = nowMs();
+    try t.expectError(
+        Error.Timeout,
+        fs.sendWriteFor(fs.nextReq(), "/tmp/stalled", 0, data, .{}, 75),
+    );
+    try t.expect(nowMs() - start < 500);
+    try t.expect(!fs.usable());
+}
+
+test "fs reply wait returns its documented timeout when the daemon stops replying" {
+    const t = std.testing;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
+    var fs = Fs.initConn(t.allocator, .{ .allocator = t.allocator, .fd = pair[0] });
+    defer fs.deinit();
+    try fs.conn.setNonBlockingChecked();
+    const req = fs.nextReq();
+    try fs.sendOpFor("stat", req, .{ .path = "/tmp/no-reply" }, 100);
+
+    var peer = client.Conn{ .allocator = t.allocator, .fd = pair[1] };
+    defer peer.deinit();
+    const request = try peer.recvExpectFor(&.{.fs_op}, 1_000);
+    request.deinit(t.allocator);
+    var scratch = std.heap.ArenaAllocator.init(t.allocator);
+    defer scratch.deinit();
+    const start = nowMs();
+    try t.expectError(Error.Timeout, fs.awaitReply(scratch.allocator(), req, 75));
+    try t.expect(nowMs() - start < 500);
+    try t.expect(fs.usable());
 }
