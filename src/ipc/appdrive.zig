@@ -20,6 +20,7 @@ const videorec = @import("../util/videorec.zig");
 const evkeys = @import("evkeys.zig");
 const xkblayout = @import("xkblayout.zig");
 const keymaps = @import("../wlhost/keymaps.zig");
+const launch_cleanup = @import("launch_cleanup.zig");
 
 const nowMs = @import("../util/clock.zig").nowMs;
 
@@ -592,6 +593,10 @@ pub const App = struct {
             setStepErr("hello handshake", &conn, err);
             return Error.SpawnFailed;
         }).deinit(allocator);
+        if (!conn.kill_origin_fence) {
+            setLaunchErr("spawn: daemon does not support lifetime-fenced cleanup", .{});
+            return Error.SpawnFailed;
+        }
 
         name_counter += 1;
         const name = std.fmt.allocPrint(allocator, "mcpapp-{d}-{d}", .{ c.getpid(), name_counter }) catch
@@ -621,65 +626,83 @@ pub const App = struct {
             .output_width = if (opts.output_width != 0) opts.output_width else wlcomp.DEFAULT_OUTPUT_WIDTH,
             .output_height = if (opts.output_height != 0) opts.output_height else wlcomp.DEFAULT_OUTPUT_HEIGHT,
         }) catch return Error.SpawnFailed;
-        var spawn_pid: i32 = 0;
-        var spawn_ow: u32 = 0;
-        var spawn_oh: u32 = 0;
-        var spawn_origin_id: wire.SessionOriginId = undefined;
-        var spawn_origin_id_valid = false;
-        {
-            const ok = conn.recvExpectFor(&.{.ok}, opts.step_timeout_ms) catch |err| {
-                setStepErr("spawn", &conn, err);
-                return Error.SpawnFailed;
-            };
-            defer ok.deinit(allocator);
-            const OkReply = struct {
-                origin_id: []const u8 = "",
-                pid: i32 = 0,
-                output_width: u32 = 0,
-                output_height: u32 = 0,
-            };
-            if (std.json.parseFromSlice(OkReply, allocator, ok.payload, .{
-                .ignore_unknown_fields = true,
-            })) |p| {
-                spawn_pid = p.value.pid;
-                spawn_ow = p.value.output_width;
-                spawn_oh = p.value.output_height;
-                if (wire.validSessionOriginId(p.value.origin_id)) {
-                    @memcpy(&spawn_origin_id, p.value.origin_id);
-                    spawn_origin_id_valid = true;
-                }
-                p.deinit();
-            } else |_| {}
-        }
+        const ok = conn.recvExpectFor(&.{.ok}, opts.step_timeout_ms) catch |err| {
+            setStepErr("spawn", &conn, err);
+            return Error.SpawnFailed;
+        };
+        defer ok.deinit(allocator);
+        const endpoint = launch_cleanup.Endpoint{
+            .target = if (opts.host) |host|
+                .{ .remote = host }
+            else
+                .{ .local = opts.local_sock },
+        };
+        return finishLaunch(allocator, &conn, name, &layout, opts, endpoint, ok.payload);
+    }
+
+    fn finishLaunch(
+        allocator: std.mem.Allocator,
+        conn: *muxclient.Conn,
+        name: []u8,
+        layout: *?xkblayout.Layout,
+        opts: LaunchOpts,
+        endpoint: launch_cleanup.Endpoint,
+        spawn_payload: []const u8,
+    ) Error!*App {
+        const meta = launch_cleanup.parseSpawnMeta(spawn_payload) catch {
+            setLaunchErr("spawn: daemon returned malformed session identity", .{});
+            return Error.SpawnFailed;
+        };
+        var cleanup = launch_cleanup.Guard.init(conn, name, meta.origin_id, endpoint, opts.step_timeout_ms);
+        errdefer cleanup.rollback();
+
         // MCP drives the seat: ask for the controller lease outright
         // (takeover), which is what every app tool already assumes.
         conn.sendAttach(name, .{
-            .origin_id = if (spawn_origin_id_valid) &spawn_origin_id else "",
+            .origin_id = &meta.origin_id,
             .kind = "mcp",
             .control = true,
         }) catch return Error.SpawnFailed;
         const snap = conn.recvExpectFor(&.{.snapshot}, opts.step_timeout_ms) catch |err| {
-            setStepErr("attach", &conn, err);
+            setStepErr("attach", conn, err);
             return Error.SpawnFailed;
         };
         defer snap.deinit(allocator);
 
+        var restored = restoreTermSnapshot(allocator, snap.payload) catch |err| {
+            setLaunchErr("attach snapshot: {s}", .{@errorName(err)});
+            return if (err == error.OutOfMemory) Error.OutOfMemory else Error.SpawnFailed;
+        };
+        errdefer restored.deinit(allocator);
+        const local_sock = if (opts.host == null and opts.local_sock != null)
+            allocator.dupe(u8, opts.local_sock.?) catch return Error.OutOfMemory
+        else
+            null;
+        errdefer if (local_sock) |path| allocator.free(path);
+        const ssh_host = if (opts.host) |host|
+            allocator.dupe(u8, host) catch return Error.OutOfMemory
+        else
+            null;
+        errdefer if (ssh_host) |host| allocator.free(host);
         const self = allocator.create(App) catch return Error.OutOfMemory;
         self.* = .{
             .allocator = allocator,
-            .conn = conn,
+            .conn = conn.*,
             .name = name,
-            .origin_id = spawn_origin_id,
-            .origin_id_valid = spawn_origin_id_valid,
-            .layout = layout,
-            .pid = spawn_pid,
-            .output_width = spawn_ow,
-            .output_height = spawn_oh,
-            .local_sock = if (opts.host == null) (if (opts.local_sock) |p| allocator.dupe(u8, p) catch null else null) else null,
-            .ssh_host = if (opts.host) |h| allocator.dupe(u8, h) catch null else null,
+            .origin_id = meta.origin_id,
+            .origin_id_valid = true,
+            .layout = layout.*,
+            .pid = meta.pid,
+            .output_width = meta.output_width,
+            .output_height = meta.output_height,
+            .term_pool = restored.pool,
+            .term_screen = restored.screen,
+            .term_seq = restored.seq,
+            .local_sock = local_sock,
+            .ssh_host = ssh_host,
         };
-        layout = null; // ownership moved
-        self.applyTermSnapshot(snap.payload);
+        layout.* = null;
+        cleanup.disarm();
         return self;
     }
 
@@ -840,31 +863,40 @@ pub const App = struct {
         a.destroy(self);
     }
 
-    /// Rebuild the terminal mirror from an attach snapshot
-    /// (versioned envelope + serialized Screen). Best-effort: a decode
-    /// failure just leaves the mirror empty (output unavailable).
-    fn applyTermSnapshot(self: *App, payload: []const u8) void {
-        const envelope = snapshot.peelEnvelope(payload) catch return;
-        const a = self.allocator;
-        self.term_seq = envelope.seq;
-        if (self.term_screen) |s| s.deinit();
-        self.term_screen = null;
-        if (self.term_pool == null) {
-            const p = a.create(Pool) catch return;
-            p.* = Pool.init(a) catch {
-                a.destroy(p);
-                return;
-            };
-            self.term_pool = p;
-        } else {
-            self.term_pool.?.deinit();
-            self.term_pool.?.* = Pool.init(a) catch {
-                a.destroy(self.term_pool.?);
-                self.term_pool = null;
-                return;
-            };
+    const RestoredTerm = struct {
+        seq: u64,
+        pool: *Pool,
+        screen: *Screen,
+
+        fn deinit(self: *RestoredTerm, allocator: std.mem.Allocator) void {
+            self.screen.deinit();
+            self.pool.deinit();
+            allocator.destroy(self.pool);
         }
-        self.term_screen = snapshot.restore(a, self.term_pool.?, envelope.body) catch null;
+    };
+
+    fn restoreTermSnapshot(allocator: std.mem.Allocator, payload: []const u8) !RestoredTerm {
+        const envelope = try snapshot.peelEnvelope(payload);
+        const pool = try allocator.create(Pool);
+        errdefer allocator.destroy(pool);
+        pool.* = try Pool.init(allocator);
+        errdefer pool.deinit();
+        const screen = try snapshot.restore(allocator, pool, envelope.body);
+        return .{ .seq = envelope.seq, .pool = pool, .screen = screen };
+    }
+
+    /// Rebuild the terminal mirror from a later daemon snapshot.
+    fn applyTermSnapshot(self: *App, payload: []const u8) void {
+        const a = self.allocator;
+        const restored = restoreTermSnapshot(a, payload) catch return;
+        if (self.term_screen) |s| s.deinit();
+        if (self.term_pool) |p| {
+            p.deinit();
+            a.destroy(p);
+        }
+        self.term_seq = restored.seq;
+        self.term_pool = restored.pool;
+        self.term_screen = restored.screen;
     }
 
     /// Apply an `.events` frame ([seq:u64][count:u32] + wire events)
@@ -3367,4 +3399,157 @@ test "post-mortem log push + exit are peeled when EOF lands in the same read" {
     try t.expect(app.exited);
     try t.expectEqual(@as(i32, -11), app.exit_status);
     try t.expectEqualSlices(u8, payload.items, app.log_buf.items);
+}
+
+const LaunchFailure = enum { attach_send, malformed_snapshot, snapshot_timeout, cleanup_connect };
+
+fn testLaunchFailure(failure: LaunchFailure) !void {
+    const t = std.testing;
+    const fake = @import("launch_cleanup_test.zig");
+    var daemon = try fake.Harness.init(t.allocator);
+    defer daemon.deinit();
+    const name = try t.allocator.dupe(u8, "fake-app");
+    defer t.allocator.free(name);
+    var layout: ?xkblayout.Layout = null;
+    var conn = daemon.takePrimary(t.allocator);
+    defer conn.deinit();
+    const opts = App.LaunchOpts{ .local_sock = "/fake/mux.sock", .step_timeout_ms = 5 };
+    const endpoint = daemon.localEndpoint();
+
+    switch (failure) {
+        .attach_send => {
+            _ = c.close(conn.fd);
+            conn.fd = -1;
+            try daemon.queueFreshAck();
+        },
+        .malformed_snapshot => {
+            try daemon.queueSnapshot("not-a-snapshot");
+            try daemon.queuePrimaryAck();
+        },
+        .snapshot_timeout => try daemon.queueFreshAck(),
+        .cleanup_connect => {
+            try daemon.queueSnapshot("not-a-snapshot");
+            daemon.closePrimaryPeer();
+            daemon.reconnect_fails = true;
+        },
+    }
+
+    try t.expectError(Error.SpawnFailed, App.finishLaunch(
+        t.allocator,
+        &conn,
+        name,
+        &layout,
+        opts,
+        endpoint,
+        fake.SPAWN_REPLY,
+    ));
+    switch (failure) {
+        .attach_send => try daemon.expectFreshKill(name),
+        .malformed_snapshot => {
+            try daemon.expectAttach(name, true);
+            try daemon.expectPrimaryKill(name);
+        },
+        .snapshot_timeout => {
+            try daemon.expectAttach(name, true);
+            try daemon.expectPrimaryKill(name);
+            try daemon.expectFreshKill(name);
+        },
+        .cleanup_connect => {
+            try t.expectEqual(@as(usize, 1), daemon.reconnect_calls);
+        },
+    }
+    if (failure != .cleanup_connect) try daemon.expectSessionGone();
+}
+
+test "App launch rolls back when attach send fails" {
+    try testLaunchFailure(.attach_send);
+}
+
+test "App launch rolls back a malformed snapshot" {
+    try testLaunchFailure(.malformed_snapshot);
+}
+
+test "App launch rolls back a timed-out snapshot over a fresh connection" {
+    try testLaunchFailure(.snapshot_timeout);
+}
+
+test "App launch preserves its error when cleanup cannot connect" {
+    try testLaunchFailure(.cleanup_connect);
+}
+
+fn testLaunchAllocationFailures(remote: bool) !void {
+    const t = std.testing;
+    const fake = @import("launch_cleanup_test.zig");
+    const snapshot_payload = try fake.snapshotPayload(t.allocator, true);
+    defer t.allocator.free(snapshot_payload);
+
+    var baseline = std.testing.FailingAllocator.init(t.allocator, .{});
+    const baseline_allocator = baseline.allocator();
+    const baseline_name = try baseline_allocator.dupe(u8, "fake-app");
+    const first_post_spawn = baseline.alloc_index;
+    var baseline_daemon = try fake.Harness.init(t.allocator);
+    defer baseline_daemon.deinit();
+    try baseline_daemon.queueSnapshot(snapshot_payload);
+    var baseline_conn = baseline_daemon.takePrimary(baseline_allocator);
+    var baseline_layout: ?xkblayout.Layout = null;
+    const baseline_opts = App.LaunchOpts{
+        .host = if (remote) "fake-host" else null,
+        .local_sock = if (remote) null else "/fake/mux.sock",
+        .step_timeout_ms = 20,
+    };
+    const baseline_endpoint = if (remote) baseline_daemon.remoteEndpoint() else baseline_daemon.localEndpoint();
+    const app = try App.finishLaunch(
+        baseline_allocator,
+        &baseline_conn,
+        baseline_name,
+        &baseline_layout,
+        baseline_opts,
+        baseline_endpoint,
+        fake.SPAWN_REPLY,
+    );
+    const allocation_end = baseline.alloc_index;
+    try t.expect(allocation_end > first_post_spawn);
+    try baseline_daemon.expectAttach(baseline_name, true);
+    try baseline_daemon.expectPrimaryQuiet();
+    app.deinit();
+    try baseline_daemon.expectPrimaryKill("fake-app");
+    try baseline_daemon.expectSessionGone();
+    try t.expectEqual(@as(usize, 0), baseline_daemon.reconnect_calls);
+
+    var fail_index = first_post_spawn;
+    while (fail_index < allocation_end) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+        const name = try allocator.dupe(u8, "fake-app");
+        defer allocator.free(name);
+        var daemon = try fake.Harness.init(t.allocator);
+        defer daemon.deinit();
+        try daemon.queueSnapshot(snapshot_payload);
+        try daemon.queueFreshAck();
+        var conn = daemon.takePrimary(allocator);
+        defer conn.deinit();
+        var layout: ?xkblayout.Layout = null;
+        const endpoint = if (remote) daemon.remoteEndpoint() else daemon.localEndpoint();
+        _ = App.finishLaunch(
+            allocator,
+            &conn,
+            name,
+            &layout,
+            baseline_opts,
+            endpoint,
+            fake.SPAWN_REPLY,
+        ) catch {};
+        try t.expect(failing.has_induced_failure);
+        try daemon.expectFreshKill(name);
+        try daemon.expectSessionGone();
+        try t.expectEqual(@as(usize, 1), daemon.reconnect_calls);
+    }
+}
+
+test "App local launch rolls back every post-spawn allocation failure" {
+    try testLaunchAllocationFailures(false);
+}
+
+test "App remote launch rolls back every post-spawn allocation failure" {
+    try testLaunchAllocationFailures(true);
 }

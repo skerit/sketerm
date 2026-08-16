@@ -14,6 +14,7 @@ const snapshot = @import("../mux/snapshot.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
 const keys = @import("keys.zig");
+const launch_cleanup = @import("launch_cleanup.zig");
 
 const nowMs = @import("../util/clock.zig").nowMs;
 
@@ -565,6 +566,7 @@ pub const Term = struct {
         conn.setNonBlocking();
         conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch return Error.SpawnFailed;
         (conn.recvExpectFor(&.{.welcome}, 15_000) catch return Error.SpawnFailed).deinit(allocator);
+        if (!conn.kill_origin_fence) return Error.SpawnFailed;
 
         name_counter += 1;
         const name = std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
@@ -588,47 +590,19 @@ pub const Term = struct {
         } else {
             conn.sendJson(.spawn, .{ .name = name, .argv = &.{shell}, .rows = rows, .cols = cols, .login_shell = true, .shell_integration = si_wire }) catch return Error.SpawnFailed;
         }
-        var origin_id: wire.SessionOriginId = undefined;
-        var origin_id_valid = false;
-        {
-            const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
-            defer ok.deinit(allocator);
-            const SpawnReply = struct { origin_id: []const u8 = "" };
-            var parsed = std.json.parseFromSlice(SpawnReply, allocator, ok.payload, .{
-                .ignore_unknown_fields = true,
-            }) catch null;
-            if (parsed) |*reply| {
-                defer reply.deinit();
-                if (wire.validSessionOriginId(reply.value.origin_id)) {
-                    @memcpy(&origin_id, reply.value.origin_id);
-                    origin_id_valid = true;
-                }
-            }
-        }
-        conn.sendAttach(name, .{
-            .origin_id = if (origin_id_valid) &origin_id else "",
-            .kind = "mcp",
-        }) catch return Error.SpawnFailed;
-        const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch return Error.SpawnFailed;
-        defer snap.deinit(allocator);
-
-        const pool = allocator.create(Pool) catch return Error.OutOfMemory;
-        errdefer allocator.destroy(pool);
-        pool.* = Pool.init(allocator) catch return Error.OutOfMemory;
-        errdefer pool.deinit();
-        const self = allocator.create(Term) catch return Error.OutOfMemory;
-        self.* = .{
-            .allocator = allocator,
-            .conn = conn,
-            .name = name,
-            .origin_id = origin_id,
-            .origin_id_valid = origin_id_valid,
-            .pool = pool,
-            .integration = si != null,
-        };
-        self.shell_name = allocator.dupe(u8, std.fs.path.basename(shell)) catch null;
-        self.applySnapshot(snap.payload) catch {};
-        return self;
+        const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
+        defer ok.deinit(allocator);
+        return finishSpawn(
+            allocator,
+            &conn,
+            name,
+            shell,
+            si != null,
+            null,
+            .{ .target = .{ .local = local_sock } },
+            ok.payload,
+            15_000,
+        );
     }
 
     /// Spawn a session on `host`'s OWN sketerm-mux daemon (found via
@@ -648,6 +622,7 @@ pub const Term = struct {
         errdefer conn.deinit();
         // connectSsh already proved hello → welcome; just bound reads.
         conn.setNonBlocking();
+        if (!conn.kill_origin_fence) return Error.SpawnFailed;
 
         name_counter += 1;
         const name = std.fmt.allocPrint(allocator, "mcpterm-{d}-{d}", .{ c.getpid(), name_counter }) catch
@@ -655,45 +630,75 @@ pub const Term = struct {
         errdefer allocator.free(name);
 
         conn.sendJson(.spawn, .{ .name = name, .argv = argv, .rows = rows, .cols = cols, .ttl_secs = 3600 }) catch return Error.SpawnFailed;
-        var origin_id: wire.SessionOriginId = undefined;
-        var origin_id_valid = false;
-        {
-            const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
-            defer ok.deinit(allocator);
-            const SpawnReply = struct { origin_id: []const u8 = "" };
-            var parsed = std.json.parseFromSlice(SpawnReply, allocator, ok.payload, .{
-                .ignore_unknown_fields = true,
-            }) catch null;
-            if (parsed) |*reply| {
-                defer reply.deinit();
-                if (wire.validSessionOriginId(reply.value.origin_id)) {
-                    @memcpy(&origin_id, reply.value.origin_id);
-                    origin_id_valid = true;
-                }
-            }
-        }
+        const ok = conn.recvExpectFor(&.{.ok}, 15_000) catch return Error.SpawnFailed;
+        defer ok.deinit(allocator);
+        return finishSpawn(
+            allocator,
+            &conn,
+            name,
+            argv[0],
+            false,
+            host,
+            .{ .target = .{ .remote = host } },
+            ok.payload,
+            15_000,
+        );
+    }
+
+    fn finishSpawn(
+        allocator: std.mem.Allocator,
+        conn: *muxclient.Conn,
+        name: []u8,
+        shell: []const u8,
+        integration: bool,
+        remote_host: ?[]const u8,
+        endpoint: launch_cleanup.Endpoint,
+        spawn_payload: []const u8,
+        timeout_ms: i64,
+    ) Error!*Term {
+        const meta = launch_cleanup.parseSpawnMeta(spawn_payload) catch return Error.SpawnFailed;
+        var cleanup = launch_cleanup.Guard.init(conn, name, meta.origin_id, endpoint, timeout_ms);
+        errdefer cleanup.rollback();
+
         conn.sendAttach(name, .{
-            .origin_id = if (origin_id_valid) &origin_id else "",
+            .origin_id = &meta.origin_id,
             .kind = "mcp",
         }) catch return Error.SpawnFailed;
-        const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch return Error.SpawnFailed;
+        const snap = conn.recvExpectFor(&.{.snapshot}, timeout_ms) catch |err|
+            return if (err == error.OutOfMemory) Error.OutOfMemory else Error.SpawnFailed;
         defer snap.deinit(allocator);
 
+        const envelope = snapshot.peelEnvelope(snap.payload) catch return Error.SpawnFailed;
         const pool = allocator.create(Pool) catch return Error.OutOfMemory;
         errdefer allocator.destroy(pool);
         pool.* = Pool.init(allocator) catch return Error.OutOfMemory;
         errdefer pool.deinit();
+        const screen = snapshot.restore(allocator, pool, envelope.body) catch |err|
+            return if (err == error.OutOfMemory) Error.OutOfMemory else Error.SpawnFailed;
+        errdefer screen.deinit();
+        const shell_name = allocator.dupe(u8, std.fs.path.basename(shell)) catch return Error.OutOfMemory;
+        errdefer allocator.free(shell_name);
+        const host_owned = if (remote_host) |host|
+            allocator.dupe(u8, host) catch return Error.OutOfMemory
+        else
+            null;
+        errdefer if (host_owned) |host| allocator.free(host);
         const self = allocator.create(Term) catch return Error.OutOfMemory;
         self.* = .{
             .allocator = allocator,
-            .conn = conn,
+            .conn = conn.*,
             .name = name,
-            .origin_id = origin_id,
-            .origin_id_valid = origin_id_valid,
+            .origin_id = meta.origin_id,
+            .origin_id_valid = true,
             .pool = pool,
+            .screen = screen,
+            .seq = envelope.seq,
+            .integration = integration,
+            .shell_name = shell_name,
+            .remote_host = host_owned,
         };
-        self.remote_host = allocator.dupe(u8, host) catch null;
-        self.applySnapshot(snap.payload) catch {};
+        if (self.screen) |restored| self.app_cursor = restored.app_cursor_keys;
+        cleanup.disarm();
         return self;
     }
 
@@ -1186,3 +1191,151 @@ pub const Term = struct {
         }
     }
 };
+
+const SpawnFailure = enum { attach_send, malformed_snapshot, snapshot_timeout, cleanup_connect };
+
+fn testSpawnFailure(failure: SpawnFailure) !void {
+    const t = std.testing;
+    const fake = @import("launch_cleanup_test.zig");
+    var daemon = try fake.Harness.init(t.allocator);
+    defer daemon.deinit();
+    const name = try t.allocator.dupe(u8, "fake-term");
+    defer t.allocator.free(name);
+    var conn = daemon.takePrimary(t.allocator);
+    defer conn.deinit();
+    const endpoint = daemon.remoteEndpoint();
+
+    switch (failure) {
+        .attach_send => {
+            _ = c.close(conn.fd);
+            conn.fd = -1;
+            try daemon.queueFreshAck();
+        },
+        .malformed_snapshot => {
+            try daemon.queueSnapshot("not-a-snapshot");
+            try daemon.queuePrimaryAck();
+        },
+        .snapshot_timeout => try daemon.queueFreshAck(),
+        .cleanup_connect => {
+            try daemon.queueSnapshot("not-a-snapshot");
+            daemon.closePrimaryPeer();
+            daemon.reconnect_fails = true;
+        },
+    }
+
+    try t.expectError(Error.SpawnFailed, Term.finishSpawn(
+        t.allocator,
+        &conn,
+        name,
+        "/bin/sh",
+        false,
+        "fake-host",
+        endpoint,
+        fake.SPAWN_REPLY,
+        5,
+    ));
+    switch (failure) {
+        .attach_send => try daemon.expectFreshKill(name),
+        .malformed_snapshot => {
+            try daemon.expectAttach(name, false);
+            try daemon.expectPrimaryKill(name);
+        },
+        .snapshot_timeout => {
+            try daemon.expectAttach(name, false);
+            try daemon.expectPrimaryKill(name);
+            try daemon.expectFreshKill(name);
+        },
+        .cleanup_connect => try t.expectEqual(@as(usize, 1), daemon.reconnect_calls),
+    }
+    if (failure != .cleanup_connect) try daemon.expectSessionGone();
+}
+
+test "Term spawn rolls back when attach send fails" {
+    try testSpawnFailure(.attach_send);
+}
+
+test "Term spawn rolls back a malformed snapshot" {
+    try testSpawnFailure(.malformed_snapshot);
+}
+
+test "Term spawn rolls back a timed-out snapshot over a fresh connection" {
+    try testSpawnFailure(.snapshot_timeout);
+}
+
+test "Term spawn preserves its error when cleanup cannot connect" {
+    try testSpawnFailure(.cleanup_connect);
+}
+
+fn testSpawnAllocationFailures(remote: bool) !void {
+    const t = std.testing;
+    const fake = @import("launch_cleanup_test.zig");
+    const snapshot_payload = try fake.snapshotPayload(t.allocator, false);
+    defer t.allocator.free(snapshot_payload);
+
+    var baseline = std.testing.FailingAllocator.init(t.allocator, .{});
+    const baseline_allocator = baseline.allocator();
+    const baseline_name = try baseline_allocator.dupe(u8, "fake-term");
+    const first_post_spawn = baseline.alloc_index;
+    var baseline_daemon = try fake.Harness.init(t.allocator);
+    defer baseline_daemon.deinit();
+    try baseline_daemon.queueSnapshot(snapshot_payload);
+    var baseline_conn = baseline_daemon.takePrimary(baseline_allocator);
+    const baseline_endpoint = if (remote) baseline_daemon.remoteEndpoint() else baseline_daemon.localEndpoint();
+    const term = try Term.finishSpawn(
+        baseline_allocator,
+        &baseline_conn,
+        baseline_name,
+        "/bin/sh",
+        !remote,
+        if (remote) "fake-host" else null,
+        baseline_endpoint,
+        fake.SPAWN_REPLY,
+        20,
+    );
+    const allocation_end = baseline.alloc_index;
+    try t.expect(allocation_end > first_post_spawn);
+    try baseline_daemon.expectAttach(baseline_name, false);
+    try baseline_daemon.expectPrimaryQuiet();
+    term.deinit();
+    try baseline_daemon.expectPrimaryKill("fake-term");
+    try baseline_daemon.expectSessionGone();
+    try t.expectEqual(@as(usize, 0), baseline_daemon.reconnect_calls);
+
+    var fail_index = first_post_spawn;
+    while (fail_index < allocation_end) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        const allocator = failing.allocator();
+        const name = try allocator.dupe(u8, "fake-term");
+        defer allocator.free(name);
+        var daemon = try fake.Harness.init(t.allocator);
+        defer daemon.deinit();
+        try daemon.queueSnapshot(snapshot_payload);
+        try daemon.queueFreshAck();
+        var conn = daemon.takePrimary(allocator);
+        defer conn.deinit();
+        const endpoint = if (remote) daemon.remoteEndpoint() else daemon.localEndpoint();
+        _ = Term.finishSpawn(
+            allocator,
+            &conn,
+            name,
+            "/bin/sh",
+            !remote,
+            if (remote) "fake-host" else null,
+            endpoint,
+            fake.SPAWN_REPLY,
+            20,
+        ) catch {};
+        try t.expect(failing.has_induced_failure);
+        try daemon.expectFreshKill(name);
+        try daemon.expectSessionGone();
+        try t.expectEqual(@as(usize, 1), daemon.reconnect_calls);
+    }
+}
+
+test "Term local spawn rolls back every post-spawn allocation failure" {
+    try testSpawnAllocationFailures(false);
+}
+
+test "Term remote mux spawn rolls back every post-spawn allocation failure" {
+    try testSpawnAllocationFailures(true);
+}
