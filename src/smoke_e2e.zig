@@ -86,6 +86,8 @@ var vcast_pid: c.pid_t = -1;
 /// `sketerm files` window hosting the quick-look stage (its own app
 /// identity in the shared display session), killed by EXACT pid.
 var qlfiles_pid: c.pid_t = -1;
+/// Focused inline-rename lifetime child, always reaped by exact pid.
+var renamefiles_pid: c.pid_t = -1;
 var dk_drive: ?*appdrive.App = null;
 var dk_ready = false;
 var g_alloc: std.mem.Allocator = undefined;
@@ -155,6 +157,10 @@ fn teardown() void {
     if (qlfiles_pid > 0) {
         reap(qlfiles_pid, c.SIGKILL, 0);
         qlfiles_pid = -1;
+    }
+    if (renamefiles_pid > 0) {
+        reap(renamefiles_pid, c.SIGKILL, 0);
+        renamefiles_pid = -1;
     }
     if (drive) |app| {
         // detach, not kill: the session is destroyed by name below, so
@@ -756,6 +762,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_INLINE_RENAME_ONLY") != null) {
+        const app = drive orelse return fail("focused inline-rename smoke has no display driver");
+        if (!have_wl) return fail("focused inline-rename smoke is GTK/Wayland-only");
+        if (inlineRenameLifetimeStage(allocator, app, rt, sock_path, &wl_z)) |why| return failMsg(why);
+        say("inline rename: normal completion and tab/pane/window teardown canceled pending idles");
+        teardown();
+        return 0;
+    }
 
     // 1. list — exactly one tab with at least one pane.
     const list_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return fail("list roundtrip");
@@ -827,6 +841,9 @@ pub fn main() u8 {
         if (!platform.is_macos) {
             if (themeSingletonStage(allocator, drive, rt, &wl_z)) |why| return failMsg(why);
             say("secondary window reused one Preferences child, flushed its pending sidebar toggle on close, and survived later global style flips");
+
+            if (inlineRenameLifetimeStage(allocator, app, rt, sock_path, &wl_z)) |why| return failMsg(why);
+            say("inline rename: normal completion and tab/pane/window teardown canceled pending idles");
         }
 
         // The palette RANKS rather than filters. Also before copy mode,
@@ -4365,6 +4382,268 @@ fn waitWindowGone(app: *appdrive.App, win_id: u32, timeout_ms: i64) bool {
         _ = app.pumpOnce(200);
     }
     return app.winById(win_id) == null;
+}
+
+const RenameFilesChild = struct {
+    pid: c.pid_t,
+    win: u32,
+};
+
+fn launchRenameFiles(
+    app: *appdrive.App,
+    dir: [:0]const u8,
+    tag: []const u8,
+    verify_scope: [:0]const u8,
+    wl: [*:0]const u8,
+) ?RenameFilesChild {
+    _ = app.drainLive(2_000);
+    var known: [32]u32 = undefined;
+    var n_known: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_known >= known.len) continue;
+        known[n_known] = w.id;
+        n_known += 1;
+    }
+
+    var app_id_buf: [128:0]u8 = undefined;
+    const app_id = std.fmt.bufPrintZ(&app_id_buf, "dev.sker.sketerm.e2erename{s}", .{tag}) catch return null;
+    const pid = c.fork();
+    if (pid < 0) return null;
+    if (pid == 0) {
+        dieWithParent();
+        _ = c.setenv("SKETERM_APP_ID", app_id.ptr, 1);
+        if (verify_scope.len > 0)
+            _ = c.setenv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN", verify_scope.ptr, 1)
+        else
+            _ = c.unsetenv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN");
+        _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = c.unsetenv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        _ = c.setenv("GTK_A11Y", "none", 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "files", dir.ptr, null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    renamefiles_pid = pid;
+
+    const deadline = clock.nowMs() + 25_000;
+    while (clock.nowMs() < deadline) {
+        if (hasToplevelOtherThan(app, known[0..n_known])) |win|
+            return .{ .pid = pid, .win = win };
+    }
+    return null;
+}
+
+fn pumpRenameFor(app: *appdrive.App, duration_ms: i64) void {
+    const deadline = clock.nowMs() + duration_ms;
+    while (clock.nowMs() < deadline) _ = app.pumpOnce(50);
+}
+
+fn armInlineRename(
+    app: *appdrive.App,
+    win_id: u32,
+    initial: []const u8,
+    replacement: []const u8,
+    x_fraction: f64,
+    cancel: bool,
+) bool {
+    const win = app.winById(win_id) orelse return false;
+    const x = @as(f64, @floatFromInt(win.w)) * x_fraction;
+    const y = @as(f64, @floatFromInt(win.h)) * 0.65;
+    app.clickEx(win_id, x, y, 1, 60, 1) catch return false;
+    pumpRenameFor(app, 250);
+    app.pressKey(win_id, initial) catch return false;
+    pumpRenameFor(app, 250);
+    app.pressKey(win_id, "Escape") catch return false;
+    pumpRenameFor(app, 200);
+    app.pressKey(win_id, "F2") catch return false;
+    pumpRenameFor(app, 300);
+    app.typeText(win_id, replacement) catch return false;
+    pumpRenameFor(app, 250);
+    if (cancel) {
+        app.pressKey(win_id, "Escape") catch return false;
+        // The verification mode turns this cancel idle into a long
+        // one-shot. Pump until GTK has armed it, then close synchronously.
+        pumpRenameFor(app, 300);
+    }
+    return app.winById(win_id) != null;
+}
+
+fn closeRenameFiles(app: *appdrive.App, child: RenameFilesChild) bool {
+    app.closeWindow(child.win) catch return false;
+    if (!waitWindowGone(app, child.win, 15_000)) return false;
+    var status: c_int = 0;
+    const deadline = clock.nowMs() + 15_000;
+    while (clock.nowMs() < deadline) {
+        if (c.waitpid(child.pid, &status, c.WNOHANG) == child.pid) {
+            renamefiles_pid = -1;
+            return c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0;
+        }
+        _ = c.usleep(100_000);
+    }
+    return false;
+}
+
+fn findRenameControlSocket(
+    allocator: std.mem.Allocator,
+    rt: []const u8,
+    main_sock: []const u8,
+    out: *[512:0]u8,
+) ?[:0]u8 {
+    var dir_buf: [512:0]u8 = undefined;
+    const dir_path = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return null;
+    const dir = c.opendir(dir_path.ptr) orelse return null;
+    defer _ = c.closedir(dir);
+    while (c.readdir(dir)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (!std.mem.endsWith(u8, name, ".sock") or std.mem.eql(u8, name, "mux.sock")) continue;
+        const candidate = std.fmt.bufPrintZ(out, "{s}/sketerm/{s}", .{ rt, name }) catch continue;
+        if (std.mem.eql(u8, candidate, main_sock)) continue;
+        const probe = roundtrip(allocator, candidate, "{\"cmd\":\"list\"}\n") orelse continue;
+        defer allocator.free(probe);
+        if (std.mem.indexOf(u8, probe, "\"ok\":true") != null) return candidate;
+    }
+    return null;
+}
+
+/// Exercise inline rename completion and every BrowserView/Tab teardown owner.
+fn inlineRenameLifetimeStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    main_sock: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    var dir_buf: [512:0]u8 = undefined;
+    var file_buf: [560:0]u8 = undefined;
+    var normal_buf: [560:0]u8 = undefined;
+
+    // Normal Enter completion in an otherwise idle listing.
+    const normal_dir = std.fmt.bufPrintZ(&dir_buf, "{s}/rename-normal", .{rt}) catch
+        return "inline rename normal directory path is too long";
+    _ = c.mkdir(normal_dir.ptr, 0o700);
+    const normal = std.fmt.bufPrintZ(&normal_buf, "{s}/normal.txt", .{normal_dir}) catch
+        return "inline rename normal path is too long";
+    if (!writeFile(normal, "normal\n")) return "could not seed the normal rename file";
+    const normal_child = launchRenameFiles(app, normal_dir, "normal", "", wl) orelse
+        return "the normal inline rename child never mapped";
+    _ = app.waitVisualSettle(normal_child.win, 400, 15_000, 0.002, null);
+    if (!armInlineRename(app, normal_child.win, "n", "completed", 0.58, false))
+        return "could not begin the normal inline rename";
+    app.pressKey(normal_child.win, "Enter") catch return "could not commit the normal inline rename";
+    var completed_buf: [560:0]u8 = undefined;
+    const completed = std.fmt.bufPrintZ(&completed_buf, "{s}/completed.txt", .{normal_dir}) catch
+        return "inline rename completed path is too long";
+    var completed_ok = false;
+    var waited: u32 = 0;
+    while (waited < 10_000) : (waited += 200) {
+        _ = app.pumpOnce(200);
+        if (c.access(completed.ptr, c.F_OK) == 0 and c.access(normal.ptr, c.F_OK) != 0) {
+            completed_ok = true;
+            break;
+        }
+    }
+    if (!completed_ok) return "Enter did not complete the inline rename";
+    if (!closeRenameFiles(app, normal_child))
+        return "normal inline rename child did not close cleanly";
+
+    // Close the whole window while an Escape verdict owns a pending source.
+    const window_dir = std.fmt.bufPrintZ(&dir_buf, "{s}/rename-window", .{rt}) catch
+        return "inline rename window directory path is too long";
+    _ = c.mkdir(window_dir.ptr, 0o700);
+    const window_file = std.fmt.bufPrintZ(&file_buf, "{s}/window.txt", .{window_dir}) catch
+        return "inline rename window path is too long";
+    if (!writeFile(window_file, "window\n")) return "could not seed the window-close rename file";
+    const window_child = launchRenameFiles(app, window_dir, "window", "view", wl) orelse
+        return "the inline rename window child never mapped";
+    _ = app.waitVisualSettle(window_child.win, 400, 15_000, 0.002, null);
+    if (!armInlineRename(app, window_child.win, "w", "abandoned", 0.58, true))
+        return "could not arm inline rename before window close";
+    if (!closeRenameFiles(app, window_child))
+        return "window close did not synchronously dispose the pending inline rename";
+
+    // Closing the browser's own GtkNotebook page frees its BTab while
+    // the BrowserView remains alive.
+    const tab_dir = std.fmt.bufPrintZ(&dir_buf, "{s}/rename-tab", .{rt}) catch
+        return "inline rename tab directory path is too long";
+    _ = c.mkdir(tab_dir.ptr, 0o700);
+    const tab_file = std.fmt.bufPrintZ(&file_buf, "{s}/tab.txt", .{tab_dir}) catch
+        return "inline rename tab path is too long";
+    if (!writeFile(tab_file, "tab\n")) return "could not seed the tab-close rename file";
+    const tab_child = launchRenameFiles(app, tab_dir, "tab", "tab", wl) orelse
+        return "the inline rename tab child never mapped";
+    _ = app.waitVisualSettle(tab_child.win, 400, 15_000, 0.002, null);
+    if (!armInlineRename(app, tab_child.win, "t", "abandoned", 0.58, true))
+        return "could not arm inline rename before browser-tab close";
+    const tab_win = app.winById(tab_child.win) orelse return "the inline rename tab window vanished";
+    app.click(
+        tab_child.win,
+        @as(f64, @floatFromInt(tab_win.w)) * 0.29,
+        @as(f64, @floatFromInt(tab_win.h)) * 0.258,
+        2,
+    ) catch return "could not middle-click the browser tab";
+    _ = app.pumpOnce(800);
+    if (app.winById(tab_child.win) == null) return "browser-tab close killed the files window";
+    if (!closeRenameFiles(app, tab_child))
+        return "browser-tab close did not synchronously dispose the pending inline rename";
+
+    // A split pane owns a separate BrowserView. Close that pane while
+    // its cancel source is pending, then prove the sibling still serves.
+    const pane_dir = std.fmt.bufPrintZ(&dir_buf, "{s}/rename-pane", .{rt}) catch
+        return "inline rename pane directory path is too long";
+    _ = c.mkdir(pane_dir.ptr, 0o700);
+    const pane_file = std.fmt.bufPrintZ(&file_buf, "{s}/pane.txt", .{pane_dir}) catch
+        return "inline rename pane path is too long";
+    if (!writeFile(pane_file, "pane\n")) return "could not seed the pane-close rename file";
+    const pane_child = launchRenameFiles(app, pane_dir, "pane", "view", wl) orelse
+        return "the inline rename pane child never mapped";
+    var sock_buf: [512:0]u8 = undefined;
+    waited = 0;
+    const sock = while (waited < 10_000) : (waited += 100) {
+        if (findRenameControlSocket(allocator, rt, main_sock, &sock_buf)) |found| break found;
+        _ = c.usleep(100_000);
+    } else return "inline rename child control socket never appeared";
+    const split = roundtrip(allocator, sock, "{\"cmd\":\"split\",\"pane\":1,\"direction\":\"h\"}\n") orelse
+        return "inline rename pane split did not reply";
+    defer allocator.free(split);
+    if (std.mem.indexOf(u8, split, "\"ok\":true") == null)
+        return "inline rename pane split was rejected";
+    const pane_id = parseNumAfter(split, "\"pane\":") orelse
+        return "inline rename pane split returned no pane id";
+    var browser_buf: [700]u8 = undefined;
+    const browser_req = std.fmt.bufPrint(
+        &browser_buf,
+        "{{\"cmd\":\"browser-here\",\"pane\":{d},\"data\":\"{s}\"}}\n",
+        .{ pane_id, pane_dir },
+    ) catch return "inline rename browser-here request is too long";
+    const browser = roundtrip(allocator, sock, browser_req) orelse
+        return "inline rename browser-here did not reply";
+    defer allocator.free(browser);
+    if (std.mem.indexOf(u8, browser, "\"ok\":true") == null)
+        return "inline rename browser-here was rejected";
+    _ = app.pumpOnce(1_500);
+    if (!armInlineRename(app, pane_child.win, "p", "abandoned", 0.82, true))
+        return "could not arm inline rename before pane close";
+    var close_buf: [128]u8 = undefined;
+    const close_req = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{pane_id}) catch
+        return "inline rename close-pane request is too long";
+    const closed = roundtrip(allocator, sock, close_req) orelse
+        return "inline rename close-pane did not reply";
+    defer allocator.free(closed);
+    if (std.mem.indexOf(u8, closed, "\"ok\":true") == null)
+        return "inline rename close-pane was rejected";
+    _ = app.pumpOnce(800);
+    const healthy = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse
+        return "files process stopped serving after inline rename pane close";
+    defer allocator.free(healthy);
+    if (std.mem.indexOf(u8, healthy, "\"ok\":true") == null)
+        return "files process was unhealthy after inline rename pane close";
+    if (!closeRenameFiles(app, pane_child))
+        return "files process did not close cleanly after inline rename pane teardown";
+
+    _ = app.drainLive(2_000);
+    return null;
 }
 
 /// Files' Quick Look, hosted by the shared Viewer. What only a live

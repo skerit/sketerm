@@ -1612,6 +1612,10 @@ pub const InlineRename = struct {
     row: *c.GtkWidget,
     label: *c.GtkWidget,
     text: *c.GtkWidget,
+    keys: ?*c.GtkEventController,
+    focus: ?*c.GtkEventController,
+    /// The deferred finish callback, owned and canceled with this edit.
+    idle_source: c.guint = 0,
     /// Guards re-entry: focus-leave fires again during teardown.
     done: bool = false,
     commit: bool = false,
@@ -1624,7 +1628,7 @@ pub const InlineRename = struct {
 /// dialog. The entry is scrolled into view first so its cell is
 /// bound by the time the label is looked up.
 pub fn startInlineRename(self: *BrowserView, tab: *BTab, path: []const u8) void {
-    if (self.inline_rename) |ir| finishInlineRenameDeferred(ir, false);
+    cancelInlineRename(self, null);
     const base = std.fs.path.basename(path);
     if (base.len == 0 or base.len > 511) return self.entryDialog(tab, .rename, path);
     const row = colview.nameCellForPath(tab, path) orelse return self.entryDialog(tab, .rename, path);
@@ -1652,6 +1656,9 @@ pub fn startInlineRename(self: *BrowserView, tab: *BTab, path: []const u8) void 
     c.gtk_widget_set_visible(label, 0);
     c.gtk_box_insert_child_after(@ptrCast(@alignCast(box)), text, label);
 
+    const keys = c.gtk_event_controller_key_new();
+    const focus = c.gtk_event_controller_focus_new();
+
     ctx.* = .{
         .allocator = self.allocator,
         .view = self,
@@ -1660,6 +1667,8 @@ pub fn startInlineRename(self: *BrowserView, tab: *BTab, path: []const u8) void 
         .row = @ptrCast(@alignCast(row)),
         .label = label,
         .text = text,
+        .keys = keys,
+        .focus = focus,
     };
     _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(ctx.row)));
     _ = c.g_object_ref(@as(?*anyopaque, @ptrCast(ctx.label)));
@@ -1667,10 +1676,8 @@ pub fn startInlineRename(self: *BrowserView, tab: *BTab, path: []const u8) void 
     self.inline_rename = ctx;
 
     _ = c.g_signal_connect_data(text, "activate", @ptrCast(&onInlineRenameActivate), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
-    const keys = c.gtk_event_controller_key_new();
     _ = c.g_signal_connect_data(keys, "key-pressed", @ptrCast(&onInlineRenameKey), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(text, keys);
-    const focus = c.gtk_event_controller_focus_new();
     _ = c.g_signal_connect_data(focus, "leave", @ptrCast(&onInlineRenameFocusOut), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(text, focus);
 
@@ -1707,11 +1714,18 @@ pub fn finishInlineRenameDeferred(ctx: *InlineRename, commit: bool) void {
     if (ctx.done) return;
     ctx.done = true;
     ctx.commit = commit;
-    _ = c.g_idle_add(@ptrCast(&inlineRenameIdle), @ptrCast(ctx));
+    // The focused lifetime smoke holds a cancel verdict pending until
+    // the close path proves it removed this exact source. Commits keep
+    // normal idle timing so the same run covers successful rename too.
+    ctx.idle_source = if (!commit and c.getenv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN") != null)
+        c.g_timeout_add(60_000, @ptrCast(&inlineRenameIdle), @ptrCast(ctx))
+    else
+        c.g_idle_add(@ptrCast(&inlineRenameIdle), @ptrCast(ctx));
 }
 
 fn inlineRenameIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     const ctx = cast.userData(InlineRename, user);
+    ctx.idle_source = 0;
     const self = ctx.view;
     const tab = ctx.tab;
     if (ctx.commit) {
@@ -1724,21 +1738,109 @@ fn inlineRenameIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             commitRename(self, tab, ctx.path, name);
         }
     }
-    c.gtk_widget_set_visible(ctx.label, 1);
-    if (c.gtk_widget_get_parent(ctx.text)) |parent|
-        c.gtk_box_remove(@ptrCast(@alignCast(parent)), ctx.text);
-    const row = ctx.row;
+    disposeInlineRename(ctx, true);
+    return 0;
+}
+
+/// Cancel and synchronously dispose the active edit, optionally only for `tab`.
+pub fn cancelInlineRename(self: *BrowserView, tab: ?*BTab) void {
+    const ctx = self.inline_rename orelse return;
+    if (tab) |target| {
+        if (ctx.tab != target) return;
+    }
+    ctx.done = true;
+    ctx.commit = false;
+    disposeInlineRename(ctx, false);
+}
+
+/// Abort the focused smoke unless `scope` is closing an edit with a pending source.
+pub fn verifyInlineRenameTeardown(self: *BrowserView, tab: ?*BTab, scope: []const u8) void {
+    const raw = c.getenv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN") orelse return;
+    const expected = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+    if (!std.mem.eql(u8, expected, scope)) {
+        // Closing the whole view is the final backstop for the focused
+        // tab smoke: if its middle-click missed, do not pass by merely
+        // disposing the still-live edit through the broader owner.
+        if (std.mem.eql(u8, scope, "view")) {
+            std.debug.print("sketerm: inline rename expected {s} teardown before view close\n", .{expected});
+            c.abort();
+        }
+        return;
+    }
+    const ctx = self.inline_rename orelse {
+        std.debug.print("sketerm: inline rename teardown had no active edit ({s})\n", .{scope});
+        c.abort();
+    };
+    if (ctx.idle_source == 0 or (tab != null and ctx.tab != tab.?)) {
+        std.debug.print("sketerm: inline rename teardown missed its pending source ({s})\n", .{scope});
+        c.abort();
+    }
+    // A split close can leave another BrowserView alive in the same
+    // process; only the close this smoke armed is expected to assert.
+    _ = c.unsetenv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN");
+}
+
+fn disposeInlineRename(ctx: *InlineRename, refocus: bool) void {
+    const self = ctx.view;
+    const tab = ctx.tab;
+    if (ctx.idle_source != 0) {
+        const source = ctx.idle_source;
+        ctx.idle_source = 0;
+        _ = c.g_source_remove(source);
+    }
+
+    // The context is shared by three signal closures. Disconnect them
+    // before releasing the text widget so no external widget reference
+    // can keep a callback pointing at the freed context.
+    _ = c.g_signal_handlers_disconnect_matched(
+        @ptrCast(ctx.text),
+        c.G_SIGNAL_MATCH_DATA,
+        0,
+        0,
+        null,
+        null,
+        @ptrCast(ctx),
+    );
+    if (ctx.keys) |keys| {
+        _ = c.g_signal_handlers_disconnect_matched(
+            @ptrCast(keys),
+            c.G_SIGNAL_MATCH_DATA,
+            0,
+            0,
+            null,
+            null,
+            @ptrCast(ctx),
+        );
+    }
+    if (ctx.focus) |focus| {
+        _ = c.g_signal_handlers_disconnect_matched(
+            @ptrCast(focus),
+            c.G_SIGNAL_MATCH_DATA,
+            0,
+            0,
+            null,
+            null,
+            @ptrCast(ctx),
+        );
+    }
+
+    if (!self.widgets_dead) {
+        c.gtk_widget_set_visible(ctx.label, 1);
+        if (c.gtk_widget_get_parent(ctx.text)) |parent|
+            c.gtk_box_remove(@ptrCast(@alignCast(parent)), ctx.text);
+    }
+    if (self.inline_rename == ctx) self.inline_rename = null;
+
     c.g_object_unref(@as(?*anyopaque, @ptrCast(ctx.text)));
     c.g_object_unref(@as(?*anyopaque, @ptrCast(ctx.label)));
-    if (self.inline_rename == ctx) self.inline_rename = null;
+    c.g_object_unref(@as(?*anyopaque, @ptrCast(ctx.row)));
     self.allocator.free(ctx.path);
     self.allocator.destroy(ctx);
+
     // Focus back into the listing so the browser's chords keep
     // working after the edit (the cell root itself is not focusable).
-    if (tabAlive(self, tab))
+    if (refocus and !self.widgets_dead and tabAlive(self, tab))
         _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(tab.colview)));
-    c.g_object_unref(@as(?*anyopaque, @ptrCast(row)));
-    return 0;
 }
 
 /// Fetch the .trashinfo for a trashed entry, then restore it to

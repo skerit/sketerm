@@ -687,6 +687,8 @@ pub const BrowserView = struct {
     pub const onDeleteConfirmed = @import("ops.zig").onDeleteConfirmed;
     pub const entryDialog = @import("ops.zig").entryDialog;
     pub const startInlineRename = @import("ops.zig").startInlineRename;
+    pub const cancelInlineRename = @import("ops.zig").cancelInlineRename;
+    pub const verifyInlineRenameTeardown = @import("ops.zig").verifyInlineRenameTeardown;
     pub const onEntryDialogActivate = @import("ops.zig").onEntryDialogActivate;
     pub const startTrashRestore = @import("ops.zig").startTrashRestore;
     pub const feedRestore = @import("ops.zig").feedRestore;
@@ -1028,6 +1030,8 @@ pub const BrowserView = struct {
 
     fn prepareDestroyCb(ctx: *anyopaque) void {
         const self: *BrowserView = @ptrCast(@alignCast(ctx));
+        self.verifyInlineRenameTeardown(null, "view");
+        self.cancelInlineRename(null);
         self.widgets_dead = true;
         self.severPreviewAnimation();
     }
@@ -1256,6 +1260,7 @@ pub const BrowserView = struct {
     }
 
     pub fn deinit(self: *BrowserView) void {
+        self.cancelInlineRename(null);
         // Flush rather than drop: a sidebar drag in the last 400ms
         // before teardown is still the width the user chose. This runs
         // BEFORE unregisterView, because savePlaces on an unregistered

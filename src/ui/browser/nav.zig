@@ -226,6 +226,8 @@ pub fn onTabCloseClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn closeTab(self: *BrowserView, tab: *BTab) void {
+    self.verifyInlineRenameTeardown(tab, "tab");
+    self.cancelInlineRename(tab);
     // Snapshot first: undo-close-tab needs the location AND the
     // history this is about to free.
     self.stashClosedTab(tab);
