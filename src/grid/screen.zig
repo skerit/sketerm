@@ -12,6 +12,7 @@ const Flags = @import("cell.zig").Flags;
 const flagsToU8 = @import("cell.zig").flagsToU8;
 const flagsFromU8 = @import("cell.zig").flagsFromU8;
 const Line = @import("line.zig").Line;
+const LineScaling = @import("line.zig").Scaling;
 const style_pool = @import("style_pool.zig");
 const Pool = style_pool.Pool;
 const Entry = style_pool.Entry;
@@ -1307,7 +1308,10 @@ pub const Screen = struct {
         const cols_changed = new_cols != self.cols;
         if (cols_changed and !self.use_alt) {
             // reflowMain clears the (row, col)-keyed cluster map itself.
-            try self.reflowMain(new_cols, new_rows);
+            self.reflowMain(new_cols, new_rows) catch |err| {
+                self.viewport_epoch -%= 1;
+                return err;
+            };
         } else {
             // resizeBuffer truncates/pads each line and shifts cells to
             // new (row, col) positions (column resize, and row-count
@@ -1363,12 +1367,9 @@ pub const Screen = struct {
     /// self.col to match the rebuilt layout.
     fn reflowMain(self: *Screen, new_cols: u16, new_rows: u16) !void {
         const reflow = @import("reflow.zig");
-        // Reflow shifts every cell to a new (row, col); the cluster
-        // map keyed by (row, col) becomes meaningless. Drop it.
-        self.clearAllClusters();
 
         // Build a single logical-line stream from scrollback, then active.
-        // Capture cursor's logical position before consuming. Walk the
+        // Capture cursor's logical position before rebuilding. Walk the
         // scrollback ring in oldest→newest order via scrollbackLine.
         var combined: std.ArrayList(Line) = .empty;
         defer combined.deinit(self.allocator);
@@ -1393,20 +1394,22 @@ pub const Screen = struct {
         }
         reflow.trim(&logicals, self.allocator);
 
-        const all_rows = try reflow.rechunk(self.allocator, logicals.items, new_cols);
+        var all_rows = try reflow.rechunk(self.allocator, logicals.items, new_cols);
+        defer {
+            for (all_rows) |*ln| ln.deinit(self.allocator);
+            self.allocator.free(all_rows);
+        }
+
         // Stamp fresh IDs on every reflowed row. Pre-reflow IDs are
         // irretrievable since cells got redistributed; better to give
         // each post-reflow row a clean ID than leave it 0 (collides
         // with "unset"). prompt_marks become stale across a width
         // change — accepted v1 limitation.
-        for (all_rows) |*ln| ln.id = self.nextLineId();
-        // `all_rows` is owned and we need to redistribute it into
-        // active + scrollback. Free the old buffers first.
-        for (self.active) |*ln| ln.deinit(self.allocator);
-        self.allocator.free(self.active);
-        for (self.scrollback.items) |*ln| ln.deinit(self.allocator);
-        self.scrollback.clearRetainingCapacity();
-        self.scrollback_head = 0;
+        var next_line_id = self.next_line_id;
+        for (all_rows) |*ln| {
+            ln.id = next_line_id;
+            next_line_id += 1;
+        }
 
         // Compute cursor's new (row, col) within all_rows.
         const new_pos = reflow.positionAfterRechunk(all_rows, cursor_pos.idx, cursor_pos.col, new_cols);
@@ -1420,44 +1423,71 @@ pub const Screen = struct {
             active_first = sb_rows;
         }
 
-        // Fill scrollback via the ring-aware push helper.
-        if (sb_rows > 0) {
-            const sb_slice = all_rows[0..sb_rows];
-            for (sb_slice) |row| {
-                self.pushScrollback(row.cells, row.id, row.continues_above);
-            }
-        }
-
-        // Fill active with the rest, padding if needed.
+        // Build the complete active replacement before transferring any
+        // ownership out of the current Screen.
         const taken = all_rows.len - sb_rows;
-        const new_active = try self.allocator.alloc(Line, new_rows);
-        errdefer self.allocator.free(new_active);
+        var new_active = try self.allocator.alloc(Line, new_rows);
+        var active_initialized: usize = 0;
+        errdefer {
+            for (new_active[0..active_initialized]) |*ln| ln.deinit(self.allocator);
+            self.allocator.free(new_active);
+        }
         var i: usize = 0;
         while (i < taken and i < new_rows) : (i += 1) {
             new_active[i] = all_rows[active_first + i];
+            all_rows[active_first + i].cells = &.{};
+            active_initialized += 1;
         }
         // Pad if we have fewer logical rows than fit. Each new line
         // gets a fresh ID.
         while (i < new_rows) : (i += 1) {
             new_active[i] = try Line.init(self.allocator, new_cols);
-            new_active[i].id = self.nextLineId();
+            new_active[i].id = next_line_id;
+            next_line_id += 1;
+            active_initialized += 1;
         }
-        // Free the slice carrier (the rows themselves were moved out).
-        self.allocator.free(all_rows);
-        self.active = new_active;
 
-        // Re-place cursor.
+        // A fresh ring retains the same newest scrollback rows as pushing
+        // every reflowed row through the capped ring one at a time.
+        var new_scrollback: std.ArrayList(Line) = .empty;
+        errdefer {
+            for (new_scrollback.items) |*ln| ln.deinit(self.allocator);
+            new_scrollback.deinit(self.allocator);
+        }
+        const keep_sb = @min(sb_rows, self.scrollback_capacity);
+        try new_scrollback.ensureTotalCapacity(self.allocator, keep_sb);
+        const first_kept = sb_rows - keep_sb;
+        for (all_rows[first_kept..sb_rows]) |*ln| {
+            new_scrollback.appendAssumeCapacity(ln.*);
+            ln.cells = &.{};
+        }
+
+        // Compute all replacement metadata before the allocation-free commit.
+        var replacement_row: u16 = 0;
+        var replacement_col: u16 = 0;
         if (new_pos.row >= sb_rows) {
             const new_row = new_pos.row - sb_rows;
-            self.row = if (new_row >= new_rows) new_rows - 1 else @intCast(new_row);
-            self.col = @min(new_pos.col, new_cols - 1);
-        } else {
-            // Cursor's logical position landed in scrollback (rare —
-            // happens if narrowing pushes content above visible area).
-            // Place at top-left of active.
-            self.row = 0;
-            self.col = 0;
+            replacement_row = if (new_row >= new_rows) new_rows - 1 else @intCast(new_row);
+            replacement_col = @min(new_pos.col, new_cols - 1);
         }
+
+        const old_active = self.active;
+        var old_scrollback = self.scrollback;
+
+        self.active = new_active;
+        self.scrollback = new_scrollback;
+        self.scrollback_head = 0;
+        self.row = replacement_row;
+        self.col = replacement_col;
+        self.next_line_id = next_line_id;
+
+        // Reflow shifts every cell to a new (row, col); the cluster map
+        // becomes meaningless only once the replacement is committed.
+        self.clearAllClusters();
+        for (old_active) |*ln| ln.deinit(self.allocator);
+        self.allocator.free(old_active);
+        for (old_scrollback.items) |*ln| ln.deinit(self.allocator);
+        old_scrollback.deinit(self.allocator);
     }
 
     fn resizeBuffer(
@@ -4388,6 +4418,11 @@ const ScrollFailureScenario = enum {
     whole_region,
 };
 
+const ReflowFailureScenario = enum {
+    active_padding,
+    scrollback,
+};
+
 const ScrollLineState = struct {
     cells_ptr: usize,
     cells_hash: u64,
@@ -4461,6 +4496,243 @@ const ScrollState = struct {
         for (screen.scrollback.items, 0..) |line, i| try expected.scrollback[i].expectEqual(line);
     }
 };
+
+const ReflowState = struct {
+    const max_lines = 32;
+
+    active: [max_lines]ScrollLineState = undefined,
+    active_ptr: usize,
+    active_len: usize,
+    scrollback: [max_lines]ScrollLineState = undefined,
+    scrollback_ptr: usize,
+    scrollback_len: usize,
+    scrollback_alloc_capacity: usize,
+    scrollback_head: usize,
+    scrollback_capacity: usize,
+    cols: u16,
+    rows: u16,
+    row: u16,
+    col: u16,
+    saved_row: u16,
+    saved_col: u16,
+    scroll_top: u16,
+    scroll_bot: u16,
+    next_line_id: u64,
+    view_offset: u32,
+    viewport_epoch: u32,
+    pending_wrap: bool,
+    dirty: bool,
+    content_hash: u64,
+    cluster_ptr: usize,
+    cluster_len: usize,
+    cluster_hash: u64,
+    cluster_count: usize,
+    tab_stops_ptr: usize,
+    tab_stops_len: usize,
+    tab_stops_hash: u64,
+
+    fn capture(screen: *Screen) ReflowState {
+        std.debug.assert(screen.active.len <= max_lines);
+        std.debug.assert(screen.scrollback.items.len <= max_lines);
+        const cluster = screen.clusterAt(1, 1);
+        var cluster_hasher = std.hash.Wyhash.init(0);
+        cluster_hasher.update(std.mem.sliceAsBytes(cluster));
+        var tabs_hasher = std.hash.Wyhash.init(0);
+        tabs_hasher.update(std.mem.sliceAsBytes(screen.tab_stops.items));
+        var state = ReflowState{
+            .active_ptr = @intFromPtr(screen.active.ptr),
+            .active_len = screen.active.len,
+            .scrollback_ptr = @intFromPtr(screen.scrollback.items.ptr),
+            .scrollback_len = screen.scrollback.items.len,
+            .scrollback_alloc_capacity = screen.scrollback.capacity,
+            .scrollback_head = screen.scrollback_head,
+            .scrollback_capacity = screen.scrollback_capacity,
+            .cols = screen.cols,
+            .rows = screen.rows,
+            .row = screen.row,
+            .col = screen.col,
+            .saved_row = screen.saved_row,
+            .saved_col = screen.saved_col,
+            .scroll_top = screen.scroll_top,
+            .scroll_bot = screen.scroll_bot,
+            .next_line_id = screen.next_line_id,
+            .view_offset = screen.view_offset,
+            .viewport_epoch = screen.viewport_epoch,
+            .pending_wrap = screen.pending_wrap,
+            .dirty = screen.dirty,
+            .content_hash = screen.contentHash(),
+            .cluster_ptr = @intFromPtr(cluster.ptr),
+            .cluster_len = cluster.len,
+            .cluster_hash = cluster_hasher.final(),
+            .cluster_count = screen.clusters.count(),
+            .tab_stops_ptr = @intFromPtr(screen.tab_stops.items.ptr),
+            .tab_stops_len = screen.tab_stops.items.len,
+            .tab_stops_hash = tabs_hasher.final(),
+        };
+        for (screen.active, 0..) |line, i| state.active[i] = ScrollLineState.capture(line);
+        for (screen.scrollback.items, 0..) |line, i| state.scrollback[i] = ScrollLineState.capture(line);
+        return state;
+    }
+
+    fn expectUnchanged(expected: ReflowState, screen: *Screen) !void {
+        try std.testing.expectEqual(expected.active_ptr, @intFromPtr(screen.active.ptr));
+        try std.testing.expectEqual(expected.active_len, screen.active.len);
+        try std.testing.expectEqual(expected.scrollback_ptr, @intFromPtr(screen.scrollback.items.ptr));
+        try std.testing.expectEqual(expected.scrollback_len, screen.scrollback.items.len);
+        try std.testing.expectEqual(expected.scrollback_alloc_capacity, screen.scrollback.capacity);
+        try std.testing.expectEqual(expected.scrollback_head, screen.scrollback_head);
+        try std.testing.expectEqual(expected.scrollback_capacity, screen.scrollback_capacity);
+        try std.testing.expectEqual(expected.cols, screen.cols);
+        try std.testing.expectEqual(expected.rows, screen.rows);
+        try std.testing.expectEqual(expected.row, screen.row);
+        try std.testing.expectEqual(expected.col, screen.col);
+        try std.testing.expectEqual(expected.saved_row, screen.saved_row);
+        try std.testing.expectEqual(expected.saved_col, screen.saved_col);
+        try std.testing.expectEqual(expected.scroll_top, screen.scroll_top);
+        try std.testing.expectEqual(expected.scroll_bot, screen.scroll_bot);
+        try std.testing.expectEqual(expected.next_line_id, screen.next_line_id);
+        try std.testing.expectEqual(expected.view_offset, screen.view_offset);
+        try std.testing.expectEqual(expected.viewport_epoch, screen.viewport_epoch);
+        try std.testing.expectEqual(expected.pending_wrap, screen.pending_wrap);
+        try std.testing.expectEqual(expected.dirty, screen.dirty);
+        try std.testing.expectEqual(expected.content_hash, screen.contentHash());
+        const cluster = screen.clusterAt(1, 1);
+        var cluster_hasher = std.hash.Wyhash.init(0);
+        cluster_hasher.update(std.mem.sliceAsBytes(cluster));
+        try std.testing.expectEqual(expected.cluster_ptr, @intFromPtr(cluster.ptr));
+        try std.testing.expectEqual(expected.cluster_len, cluster.len);
+        try std.testing.expectEqual(expected.cluster_hash, cluster_hasher.final());
+        try std.testing.expectEqual(expected.cluster_count, screen.clusters.count());
+        var tabs_hasher = std.hash.Wyhash.init(0);
+        tabs_hasher.update(std.mem.sliceAsBytes(screen.tab_stops.items));
+        try std.testing.expectEqual(expected.tab_stops_ptr, @intFromPtr(screen.tab_stops.items.ptr));
+        try std.testing.expectEqual(expected.tab_stops_len, screen.tab_stops.items.len);
+        try std.testing.expectEqual(expected.tab_stops_hash, tabs_hasher.final());
+        for (screen.active, 0..) |line, i| try expected.active[i].expectEqual(line);
+        for (screen.scrollback.items, 0..) |line, i| try expected.scrollback[i].expectEqual(line);
+    }
+};
+
+fn reflowScenarioDimensions(scenario: ReflowFailureScenario) struct { old_cols: u16, old_rows: u16, new_cols: u16, new_rows: u16 } {
+    return switch (scenario) {
+        .active_padding => .{ .old_cols = 12, .old_rows = 4, .new_cols = 6, .new_rows = 6 },
+        .scrollback => .{ .old_cols = 6, .old_rows = 3, .new_cols = 3, .new_rows = 2 },
+    };
+}
+
+fn setReflowTestLine(line: *Line, text: []const u8, continues_above: bool, scaling: LineScaling) void {
+    @memset(line.cells, .{});
+    for (text, 0..) |rune, i| line.cells[i].rune = rune;
+    line.continues_above = continues_above;
+    line.scaling = scaling;
+    line.dirty = false;
+}
+
+fn prepareReflowFailureScreen(screen: *Screen, scenario: ReflowFailureScenario) !void {
+    switch (scenario) {
+        .active_padding => {
+            try screen.setScrollbackCapacity(4);
+            setReflowTestLine(&screen.active[0], "abc", false, .dwl);
+            setReflowTestLine(&screen.active[1], "def", false, .dhl_top);
+            setReflowTestLine(&screen.active[2], "", false, .dhl_bot);
+            setReflowTestLine(&screen.active[3], "", false, .single);
+        },
+        .scrollback => {
+            try screen.setScrollbackCapacity(2);
+            for ("abc") |rune| try pushScrollbackRune(screen, rune);
+            setReflowTestLine(&screen.active[0], "ABCDEF", false, .dwl);
+            setReflowTestLine(&screen.active[1], "GHIJKL", false, .dhl_top);
+            setReflowTestLine(&screen.active[2], "MNOPQR", false, .dhl_bot);
+        },
+    }
+    screen.appendCluster(1, 1, 0x0301);
+    screen.appendCluster(1, 1, 0x200D);
+    screen.row = 1;
+    screen.col = if (scenario == .active_padding) 2 else 4;
+    screen.saved_row = 2;
+    screen.saved_col = 1;
+    screen.scroll_top = 1;
+    screen.scroll_bot = screen.rows - 1;
+    screen.view_offset = @min(screen.scrollbackCount(), 1);
+    screen.viewport_epoch = 41;
+    screen.pending_wrap = true;
+    screen.dirty = false;
+}
+
+fn expectSuccessfulReflow(screen: *Screen, scenario: ReflowFailureScenario, old_next_line_id: u64) !void {
+    const dims = reflowScenarioDimensions(scenario);
+    try std.testing.expectEqual(dims.new_cols, screen.cols);
+    try std.testing.expectEqual(dims.new_rows, screen.rows);
+    try std.testing.expectEqual(@as(usize, 0), screen.clusters.count());
+    try std.testing.expectEqual(@as(u32, 42), screen.viewport_epoch);
+    try expectScreenBuffersUnique(screen);
+    switch (scenario) {
+        .active_padding => {
+            try std.testing.expectEqual(@as(u32, 0), screen.scrollbackCount());
+            try std.testing.expectEqual(@as(u32, 'a'), screen.active[0].cells[0].rune);
+            try std.testing.expectEqual(@as(u32, 'f'), screen.active[1].cells[2].rune);
+            for (screen.active[2..]) |line| try std.testing.expectEqual(@as(u32, 0), line.cells[0].rune);
+            try std.testing.expectEqual(old_next_line_id + 6, screen.next_line_id);
+        },
+        .scrollback => {
+            try expectScrollbackRunes(screen, "GJ");
+            try std.testing.expectEqual(@as(usize, 0), screen.scrollback_head);
+            try std.testing.expectEqual(@as(u32, 'M'), screen.active[0].cells[0].rune);
+            try std.testing.expectEqual(@as(u32, 'P'), screen.active[1].cells[0].rune);
+            try std.testing.expectEqual(old_next_line_id + 8, screen.next_line_id);
+        },
+    }
+    const rendered = try screen.extractScreen(std.testing.allocator);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(rendered.len > 0);
+}
+
+fn runReflowFailureScenario(scenario: ReflowFailureScenario, fail_index: ?usize) !usize {
+    const dims = reflowScenarioDimensions(scenario);
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var screen = try Screen.init(std.testing.allocator, &pool, dims.old_cols, dims.old_rows);
+    defer screen.deinit();
+    try prepareReflowFailureScreen(screen, scenario);
+    const before = ReflowState.capture(screen);
+
+    var config: std.testing.FailingAllocator.Config = .{};
+    if (fail_index) |index| config.fail_index = index;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, config);
+    const old_allocator = screen.allocator;
+    screen.allocator = failing.allocator();
+    var resize_error: ?anyerror = null;
+    screen.resize(dims.new_cols, dims.new_rows) catch |err| {
+        resize_error = err;
+    };
+    screen.allocator = old_allocator;
+
+    if (fail_index != null) {
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expectEqual(error.OutOfMemory, resize_error.?);
+        try before.expectUnchanged(screen);
+        try expectScreenBuffersUnique(screen);
+        const rendered = try screen.extractScreen(std.testing.allocator);
+        defer std.testing.allocator.free(rendered);
+        try std.testing.expect(rendered.len > 0);
+
+        // A failed resize leaves the same object safe to resize again.
+        try screen.resize(dims.new_cols, dims.new_rows);
+    } else {
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(?anyerror, null), resize_error);
+    }
+    try expectSuccessfulReflow(screen, scenario, before.next_line_id);
+    return failing.alloc_index;
+}
+
+fn expectAllReflowAllocationFailures(scenario: ReflowFailureScenario) !void {
+    const allocations = try runReflowFailureScenario(scenario, null);
+    try std.testing.expect(allocations > 0);
+    for (0..allocations) |fail_index| {
+        _ = try runReflowFailureScenario(scenario, fail_index);
+    }
+}
 
 fn scrollScenarioRows(scenario: ScrollFailureScenario) u16 {
     return switch (scenario) {
@@ -4811,6 +5083,14 @@ test "scroll up partial-region allocation failure preserves ownership" {
 
 test "scroll up whole-region allocation failures preserve ownership" {
     try expectAllScrollAllocationFailures(.whole_region, 12);
+}
+
+test "reflow active-padding allocation failures preserve ownership" {
+    try expectAllReflowAllocationFailures(.active_padding);
+}
+
+test "reflow scrollback allocation failures preserve ownership" {
+    try expectAllReflowAllocationFailures(.scrollback);
 }
 
 test "scrollback capacity grow then shrink keeps newest lines" {

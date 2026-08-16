@@ -124,6 +124,7 @@ pub fn rechunk(
         if (ll.cells.items.len == 0) {
             // Empty logical line → one empty row.
             const cells = try allocator.alloc(Cell, new_cols);
+            errdefer allocator.free(cells);
             @memset(cells, .{});
             try rows.append(allocator, .{ .cells = cells, .continues_above = false, .dirty = true });
             continue;
@@ -134,6 +135,7 @@ pub fn rechunk(
             const remaining = ll.cells.items.len - i;
             const take = @min(remaining, @as(usize, new_cols));
             const cells = try allocator.alloc(Cell, new_cols);
+            errdefer allocator.free(cells);
             @memcpy(cells[0..take], ll.cells.items[i .. i + take]);
             if (take < new_cols) @memset(cells[take..], .{});
             try rows.append(allocator, .{
