@@ -656,6 +656,12 @@ pub fn runWorker(
     base_dir: []const u8,
     broker_sock: []const u8,
 ) !void {
+    wire.validateTerminalSize(req.rows, req.cols) catch |err| {
+        var ebuf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&ebuf, "E{s}", .{@errorName(err)}) catch "E?";
+        _ = controlSend(control_fd, msg, -1);
+        return err;
+    };
     const self = try initWorker(allocator, control_fd, base_dir, broker_sock);
     defer self.deinit();
     // If spawnSession fails, report WHY over the control channel ('E' +
@@ -955,7 +961,10 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             if (frame.payload.len < 4) return;
             const rows = std.mem.readInt(u16, frame.payload[0..2], .little);
             const cols = std.mem.readInt(u16, frame.payload[2..4], .little);
-            if (rows == 0 or cols == 0 or rows > 1000 or cols > 1000) return;
+            wire.validateTerminalSize(rows, cols) catch {
+                cl.queueErr(wire.TERMINAL_SIZE_PROTOCOL_ERROR);
+                return;
+            };
             s.screen.resize(cols, rows) catch return;
             pty.setSize(rows, cols);
             if (s.cast_recorder) |*rec| rec.resize(nowMs(), cols, rows);

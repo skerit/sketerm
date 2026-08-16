@@ -2281,6 +2281,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const w = conn.recvExpect(&.{.welcome}) catch fail("welcome");
     w.deinit(allocator);
 
+    @import("smoke_spawn_limits.zig").runRejected(allocator, sock_path);
+    @import("smoke_spawn_limits.zig").runAcceptedMaximum(allocator, sock_path);
+    std.debug.print("smoke-mux: spawn dimension limits ok\n", .{});
+
     // Spawn a session running a shell.
     conn.sendJson(.spawn, .{
         .name = "smoke",
@@ -2412,6 +2416,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     mirror.applySnapshot(snap3.payload) catch fail("snapshot3 apply");
     snap3.deinit(allocator);
     if (mirror.screen.?.rows != 20 or mirror.screen.?.cols != 80) fail("resize geometry");
+
+    std.mem.writeInt(u16, rsz[0..2], 513, .little);
+    std.mem.writeInt(u16, rsz[2..4], 512, .little);
+    conn.sendFrame(.resize, &rsz) catch fail("oversize resize send");
+    const resize_err = conn.recvExpect(&.{.err}) catch fail("oversize resize not rejected");
+    if (std.mem.indexOf(u8, resize_err.payload, wire.TERMINAL_SIZE_PROTOCOL_ERROR) == null)
+        fail("oversize resize error changed");
+    resize_err.deinit(allocator);
 
     // Native Wayland app pipe end-to-end (scripted client).
     nativePipeStage(allocator, &conn, sock_path);

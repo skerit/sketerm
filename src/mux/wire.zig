@@ -979,6 +979,36 @@ test "protocol negotiation selects the highest shared historical profile" {
 pub const DEFAULT_OUTPUT_WIDTH: u32 = 1920;
 pub const DEFAULT_OUTPUT_HEIGHT: u32 = 1080;
 
+/// Terminal grids are bounded independently per axis and by total cell count.
+pub const MAX_TERMINAL_AXIS: u16 = 1000;
+pub const MAX_TERMINAL_CELLS: u32 = 256 * 1024;
+pub const TERMINAL_SIZE_PROTOCOL_ERROR = std.fmt.comptimePrint(
+    "bad terminal size (rows and cols must each be 1..{d} and total cells must not exceed {d})",
+    .{ MAX_TERMINAL_AXIS, MAX_TERMINAL_CELLS },
+);
+
+pub fn validateTerminalSize(rows: u16, cols: u16) error{InvalidTerminalSize}!void {
+    if (rows == 0 or cols == 0) return error.InvalidTerminalSize;
+    if (rows > MAX_TERMINAL_AXIS or cols > MAX_TERMINAL_AXIS) return error.InvalidTerminalSize;
+    if (@as(u32, rows) * @as(u32, cols) > MAX_TERMINAL_CELLS) return error.InvalidTerminalSize;
+}
+
+test "terminal dimensions are bounded per axis and by total cells" {
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(0, 80));
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(24, 0));
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(1001, 1));
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(1, 1001));
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(65535, 1));
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(1, 65535));
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(513, 512));
+    try validateTerminalSize(512, 512);
+    try validateTerminalSize(MAX_TERMINAL_AXIS, 1);
+    try std.testing.expectEqualStrings(
+        "bad terminal size (rows and cols must each be 1..1000 and total cells must not exceed 262144)",
+        TERMINAL_SIZE_PROTOCOL_ERROR,
+    );
+}
+
 pub const SpawnReq = struct {
     name: []const u8 = "",
     argv: []const []const u8 = &.{},

@@ -86,6 +86,10 @@ pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("spawn needs a name");
         return;
     }
+    wire.validateTerminalSize(req.rows, req.cols) catch {
+        cl.queueErr(wire.TERMINAL_SIZE_PROTOCOL_ERROR);
+        return;
+    };
     if (!validOutputSize(req)) {
         cl.queueErr("bad output size (dimensions must be 1..16384 and at most 64 megapixels)");
         return;
@@ -223,6 +227,10 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("spawn needs a name");
         return;
     }
+    wire.validateTerminalSize(req.rows, req.cols) catch {
+        cl.queueErr(wire.TERMINAL_SIZE_PROTOCOL_ERROR);
+        return;
+    };
     if (!validOutputSize(req)) {
         cl.queueErr("bad output size (dimensions must be 1..16384 and at most 64 megapixels)");
         return;
@@ -936,6 +944,7 @@ pub fn spawnSession(self: *Daemon, req_in: SpawnReq) !*Session {
 }
 
 pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: SessionOriginId) !*Session {
+    try wire.validateTerminalSize(req_in.rows, req_in.cols);
     const allocator = self.allocator;
 
     // Cast playback: no child, no hubs, no PTY — its own spawn path.

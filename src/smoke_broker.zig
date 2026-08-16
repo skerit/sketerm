@@ -241,6 +241,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     std.debug.print("smoke-broker: daemon PID metadata ok\n", .{});
 
+    @import("smoke_spawn_limits.zig").runRejected(allocator, sock_path);
+    if (firstChildOf(bpid) > 0) fail("spawn limits: rejected request forked a worker");
+    @import("smoke_spawn_limits.zig").runAcceptedMaximum(allocator, sock_path);
+    var limit_wait: usize = 0;
+    while (limit_wait < 100 and firstChildOf(bpid) > 0) : (limit_wait += 1)
+        _ = c.usleep(20_000);
+    if (firstChildOf(bpid) > 0) fail("spawn limits: accepted-boundary worker was not reaped");
+    std.debug.print("smoke-broker: spawn dimension limits before worker fork ok\n", .{});
+
     // ── clean-exit reaping: a worker whose shell exits on its own must tear
     //    down and be reaped (no orphan, no stale `list` entry) — nobody kills
     //    it. Done first, on a clean slate, so the ephemeral worker is the
