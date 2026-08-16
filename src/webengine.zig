@@ -12,3 +12,7 @@
 //! may import.
 
 pub const main = @import("web/main.zig").main;
+
+test {
+    _ = @import("web/cefhost.zig");
+}

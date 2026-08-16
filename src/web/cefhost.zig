@@ -142,6 +142,20 @@ comptime {
 extern fn memfd_create(name: [*:0]const u8, flags: c_uint) c_int;
 const MFD_CLOEXEC: c_uint = 1;
 
+const FrameMap = []align(std.heap.page_size_min) u8;
+
+/// Wraps fallible browser-spawn calls so CEF-gated tests can inject failures without starting the engine.
+const BrowserSpawnOps = struct {
+    ctx: ?*anyopaque = null,
+    create_browser: *const fn (?*anyopaque, *Host, *View, []const u8) ?*cef.cef_browser_t = Host.createBrowserSystem,
+    create_memfd: *const fn (?*anyopaque) ?c_int = Host.createMemfdSystem,
+    truncate: *const fn (?*anyopaque, c_int, usize) bool = Host.truncateSystem,
+    map: *const fn (?*anyopaque, usize, bool, c_int) ?FrameMap = Host.mapSystem,
+    announce: *const fn (?*anyopaque, *Host, *View, c_int) anyerror!void = Host.announceBufferSystem,
+};
+
+const system_browser_spawn_ops: BrowserSpawnOps = .{};
+
 /// Cap on damage rects forwarded per paint; beyond it a single
 /// full-view rect is cheaper than the bookkeeping.
 ///
@@ -1147,6 +1161,10 @@ pub const Host = struct {
     /// (view ids are client-allocated and never reused). An empty
     /// `initial_url` means a blank document.
     fn createViewAt(self: *Host, req: proto.ViewCreate, initial_url: []const u8) !void {
+        return self.createViewAtWith(req, initial_url, &system_browser_spawn_ops);
+    }
+
+    fn createViewAtWith(self: *Host, req: proto.ViewCreate, initial_url: []const u8, ops: *const BrowserSpawnOps) !void {
         if (req.view == 0 or self.find(req.view) != null) return;
         if (req.context != 0 and self.lookupContext(req.context) == null) {
             self.post(proto.EvViewCreateFailed{
@@ -1156,6 +1174,15 @@ pub const Host = struct {
             });
             return;
         }
+        const v = try self.registerView(req);
+        // registerView transferred ownership to Host.views. From here on
+        // every failure leaves cleanup to that owner, never to spawnBrowser.
+        errdefer self.destroyView(v.id);
+        try self.spawnBrowserWith(v, initial_url, ops);
+    }
+
+    /// Construct a view and transfer ownership only after it is in the list.
+    fn registerView(self: *Host, req: proto.ViewCreate) !*View {
         const v = try self.gpa.create(View);
         errdefer self.gpa.destroy(v);
         const scale: u16 = if (req.scale_x1000 == 0) 1000 else req.scale_x1000;
@@ -1171,9 +1198,9 @@ pub const Host = struct {
             .context = req.context,
             .sem = semantic.View.init(self.gpa),
         };
+        errdefer v.sem.deinit();
         try self.views.append(self.gpa, v);
-        errdefer _ = self.views.pop();
-        return self.spawnBrowser(v, initial_url);
+        return v;
     }
 
     /// Give an EXISTING view record a windowless browser at
@@ -1183,9 +1210,31 @@ pub const Host = struct {
     /// here, which is what makes a revived view identical to a fresh one
     /// in everything but its id: same window info, same per-browser
     /// opaque background, same zoom-carried scale, same buffer
-    /// announcement. A failure destroys the view rather than leaving a
-    /// record nothing can render.
+    /// announcement. The caller owns the view record throughout and
+    /// decides whether a failure destroys it or leaves it discarded.
     fn spawnBrowser(self: *Host, v: *View, initial_url: []const u8) !void {
+        return self.spawnBrowserWith(v, initial_url, &system_browser_spawn_ops);
+    }
+
+    fn spawnBrowserWith(self: *Host, v: *View, initial_url: []const u8, ops: *const BrowserSpawnOps) !void {
+        const browser = ops.create_browser(ops.ctx, self, v, initial_url) orelse return error.BrowserCreateFailed;
+        v.browser = browser;
+        v.cef_id = browserInt(browser, "get_identifier");
+        interceptRegister(self.gpa, v.id, v.cef_id);
+        applyZoom(v);
+        // A revived (or freshly created) browser knows nothing of the
+        // client's earlier `a11y_enable`; re-apply it. ALWAYS, including
+        // the off case: leaving the engine at STATE_DEFAULT lets it turn
+        // accessibility on by ITSELF whenever the platform looks like it
+        // wants it (an at-spi bus on the session, i.e. every GNOME/KDE
+        // desktop with toolkit-accessibility set). The whole a11y block
+        // is opt-in per view — a view that never asked must not have the
+        // engine's AX machinery running behind the client's back.
+        applyA11yState(v);
+        try self.allocBufferWith(v, ops);
+    }
+
+    fn createBrowserSystem(_: ?*anyopaque, self: *Host, v: *View, initial_url: []const u8) ?*cef.cef_browser_t {
         var winfo = windowlessInfo(v);
         var bsettings = windowlessSettings(v);
 
@@ -1203,26 +1252,34 @@ pub const Host = struct {
             null,
             self.lookupContext(v.context),
         );
-        if (browser == null) return error.BrowserCreateFailed;
-        v.browser = browser;
-        v.cef_id = browserInt(browser, "get_identifier");
-        interceptRegister(self.gpa, v.id, v.cef_id);
-        applyZoom(v);
-        // A revived (or freshly created) browser knows nothing of the
-        // client's earlier `a11y_enable`; re-apply it. ALWAYS, including
-        // the off case: leaving the engine at STATE_DEFAULT lets it turn
-        // accessibility on by ITSELF whenever the platform looks like it
-        // wants it (an at-spi bus on the session, i.e. every GNOME/KDE
-        // desktop with toolkit-accessibility set). The whole a11y block
-        // is opt-in per view — a view that never asked must not have the
-        // engine's AX machinery running behind the client's back.
-        applyA11yState(v);
-        // A view without a frame buffer is invisible and unfixable, so
-        // the whole view goes rather than leaving a stranded browser.
-        self.allocBuffer(v) catch |e| {
-            self.destroyView(v.id);
-            return e;
-        };
+        return browser;
+    }
+
+    fn createMemfdSystem(_: ?*anyopaque) ?c_int {
+        const fd = memfd_create("sketerm-web-view", MFD_CLOEXEC);
+        return if (fd >= 0) fd else null;
+    }
+
+    fn truncateSystem(_: ?*anyopaque, fd: c_int, size: usize) bool {
+        return c.ftruncate(fd, @intCast(size)) == 0;
+    }
+
+    fn mapSystem(_: ?*anyopaque, size: usize, shared: bool, fd: c_int) ?FrameMap {
+        const flags = if (shared) c.MAP_SHARED else c.MAP_PRIVATE | c.MAP_ANONYMOUS;
+        const addr = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, flags, fd, 0);
+        if (addr == c.MAP_FAILED) return null;
+        const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
+        return bytes[0..size];
+    }
+
+    fn announceBufferSystem(_: ?*anyopaque, self: *Host, v: *View, fd: c_int) !void {
+        try self.out.post(proto.FrameBuffer{
+            .view = v.id,
+            .buf_id = v.buf_id,
+            .w = v.pw,
+            .h = v.ph,
+            .stride = v.stride(),
+        }, fd);
     }
 
     /// Enumerated exits for everything that could wait on `id` forever.
@@ -1339,11 +1396,15 @@ pub const Host = struct {
         const id = v.id;
         v.discarded = false;
         v.hidden = false;
-        self.spawnBrowser(v, url) catch {
-            // A hard failure destroys the view outright (spawnBrowser
-            // will not strand a record with no buffer); if it is still
-            // here, it stays discarded rather than pretending.
-            if (self.find(id) != null) v.discarded = true;
+        self.spawnBrowser(v, url) catch |err| {
+            // Browser creation used to leave the retained record
+            // discarded, while a later frame-buffer failure destroyed it.
+            // Keep that distinction while making this owner perform both.
+            if (err == error.BrowserCreateFailed) {
+                v.discarded = true;
+            } else {
+                self.destroyView(id);
+            }
         };
     }
 
@@ -1848,6 +1909,10 @@ pub const Host = struct {
     /// The buffer is PHYSICAL: stride is exactly pw*4 — no padding, per
     /// the spec — and the announced w/h are pw/ph.
     fn allocBuffer(self: *Host, v: *View) !void {
+        return self.allocBufferWith(v, &system_browser_spawn_ops);
+    }
+
+    fn allocBufferWith(self: *Host, v: *View, ops: *const BrowserSpawnOps) !void {
         if (v.map.len != 0) {
             _ = c.munmap(v.map.ptr, v.map.len);
             v.map = &.{};
@@ -1858,10 +1923,7 @@ pub const Host = struct {
             // pixels in-band), so an anonymous mapping replaces the
             // memfd and nothing is announced — the first frame_inline
             // carries the new geometry instead.
-            const addr = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
-            if (addr == c.MAP_FAILED) return error.MmapFailed;
-            const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
-            v.map = bytes[0..size];
+            v.map = ops.map(ops.ctx, size, false, -1) orelse return error.MmapFailed;
             v.buf_unpainted = true;
             v.buf_id +%= 1;
             if (v.buf_id == 0) v.buf_id = 1;
@@ -1873,28 +1935,18 @@ pub const Host = struct {
             }.f);
             return;
         }
-        const fd = memfd_create("sketerm-web-view", MFD_CLOEXEC);
-        if (fd < 0) return error.MemfdFailed;
+        const fd = ops.create_memfd(ops.ctx) orelse return error.MemfdFailed;
         var keep_fd = false;
         defer if (!keep_fd) {
             _ = c.close(fd);
         };
-        if (c.ftruncate(fd, @intCast(size)) != 0) return error.FtruncateFailed;
-        const addr = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_SHARED, fd, 0);
-        if (addr == c.MAP_FAILED) return error.MmapFailed;
-        const bytes: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(addr));
-        v.map = bytes[0..size];
+        if (!ops.truncate(ops.ctx, fd, size)) return error.FtruncateFailed;
+        v.map = ops.map(ops.ctx, size, true, fd) orelse return error.MmapFailed;
         @memset(v.map, 0);
         v.buf_unpainted = true;
         v.buf_id +%= 1;
         if (v.buf_id == 0) v.buf_id = 1;
-        try self.out.post(proto.FrameBuffer{
-            .view = v.id,
-            .buf_id = v.buf_id,
-            .w = v.pw,
-            .h = v.ph,
-            .stride = v.stride(),
-        }, fd);
+        try ops.announce(ops.ctx, self, v, fd);
         keep_fd = true;
         // Ask for a repaint INTO the buffer just installed (the fields
         // above already point at it, so this cannot land in the old
@@ -5117,8 +5169,9 @@ pub const Host = struct {
             .sem = semantic.View.init(gpa),
         };
         defer v.sem.deinit();
+        defer v.pending.deinit(gpa);
         try host.views.append(gpa, v);
-        defer host.views.clearRetainingCapacity();
+        defer host.views.deinit(gpa);
 
         const arg = try gpa.dupe(u8, "typed");
         _ = try host.pushPending(v, .{ .req = nextReq(v), .kind = .read });
@@ -6029,6 +6082,189 @@ pub const Host = struct {
 };
 
 var g_host: ?*Host = null;
+
+const ViewConstructionTest = struct {
+    const Failure = enum { none, browser, memfd, truncate, map, announce };
+
+    failure: Failure = .none,
+    seed_semantic: bool = false,
+    semantic_seeded: bool = false,
+    browser_calls: usize = 0,
+    last_fd: c_int = -1,
+    last_map: ?FrameMap = null,
+
+    var fake_browser: cef.cef_browser_t = undefined;
+
+    fn ops(self: *ViewConstructionTest) BrowserSpawnOps {
+        return .{
+            .ctx = self,
+            .create_browser = createBrowser,
+            .create_memfd = createMemfd,
+            .truncate = truncate,
+            .map = map,
+            .announce = announce,
+        };
+    }
+
+    fn state(ctx: ?*anyopaque) *ViewConstructionTest {
+        return @ptrCast(@alignCast(ctx.?));
+    }
+
+    fn browserId(_: [*c]cef.cef_browser_t) callconv(.c) c_int {
+        return 0;
+    }
+
+    fn createBrowser(ctx: ?*anyopaque, _: *Host, v: *View, _: []const u8) ?*cef.cef_browser_t {
+        const self = state(ctx);
+        self.browser_calls += 1;
+        if (self.seed_semantic) {
+            const nodes = [_]semantic.InNode{.{ .id = 1, .role = "document", .name = "owned semantic state" }};
+            v.sem.apply(.{ .doc = 1, .nodes = &nodes }) catch return null;
+            self.semantic_seeded = true;
+        }
+        if (self.failure == .browser) return null;
+        fake_browser = std.mem.zeroes(cef.cef_browser_t);
+        fake_browser.get_identifier = browserId;
+        return &fake_browser;
+    }
+
+    fn createMemfd(ctx: ?*anyopaque) ?c_int {
+        const self = state(ctx);
+        if (self.failure == .memfd) return null;
+        const fd = Host.createMemfdSystem(null) orelse return null;
+        self.last_fd = fd;
+        return fd;
+    }
+
+    fn truncate(ctx: ?*anyopaque, fd: c_int, size: usize) bool {
+        if (state(ctx).failure == .truncate) return false;
+        return Host.truncateSystem(null, fd, size);
+    }
+
+    fn map(ctx: ?*anyopaque, size: usize, shared: bool, fd: c_int) ?FrameMap {
+        const self = state(ctx);
+        if (self.failure == .map) return null;
+        const mapping = Host.mapSystem(null, size, shared, fd) orelse return null;
+        self.last_map = mapping;
+        return mapping;
+    }
+
+    fn announce(ctx: ?*anyopaque, host: *Host, v: *View, fd: c_int) !void {
+        if (state(ctx).failure == .announce) return error.InjectedAnnouncementFailure;
+        try Host.announceBufferSystem(null, host, v, fd);
+    }
+
+    fn expectReleased(self: *const ViewConstructionTest) !void {
+        if (self.last_fd >= 0) try std.testing.expect(c.fcntl(self.last_fd, c.F_GETFD) < 0);
+        if (self.last_map) |mapping| {
+            var resident: u8 = 0;
+            try std.testing.expect(c.mincore(mapping.ptr, mapping.len, &resident) != 0);
+        }
+    }
+
+    fn req(id: u32, context: u32) proto.ViewCreate {
+        return .{ .view = id, .w = 8, .h = 8, .scale_x1000 = 1000, .context = context };
+    }
+
+    fn closeOutboxFds(out: *proto.Outbox) void {
+        while (out.front()) |msg| {
+            for (msg.fdSlice()) |fd| _ = c.close(fd);
+            out.advance(msg.bytes.len);
+        }
+    }
+
+    fn allocationCase(gpa: std.mem.Allocator) !void {
+        var out = proto.Outbox.init(std.testing.allocator);
+        defer out.deinit();
+        defer closeOutboxFds(&out);
+        var host = Host.init(gpa, &out);
+        defer host.deinit();
+
+        // Exact capacity makes the second append an allocation point.
+        try host.views.ensureTotalCapacityPrecise(gpa, 1);
+        const prior = try host.registerView(req(41, 0));
+        var injected: ViewConstructionTest = .{};
+        var spawn_ops = injected.ops();
+        if (host.createViewAtWith(req(42, 0), "", &spawn_ops)) |_| {
+            try std.testing.expectEqual(@as(usize, 2), host.viewCount());
+            try std.testing.expect(host.find(41) == prior);
+            host.destroyView(42);
+            closeOutboxFds(&out);
+            try injected.expectReleased();
+        } else |err| {
+            try std.testing.expectEqual(@as(usize, 1), host.viewCount());
+            try std.testing.expect(host.find(41) == prior);
+            try std.testing.expect(host.find(42) == null);
+            return err;
+        }
+    }
+};
+
+test "view construction allocation failures preserve prior views" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        ViewConstructionTest.allocationCase,
+        .{},
+    );
+}
+
+test "view construction system failures release one owned view" {
+    const Case = struct { failure: ViewConstructionTest.Failure, inline_mode: bool = false };
+    const cases = [_]Case{
+        .{ .failure = .browser },
+        .{ .failure = .memfd },
+        .{ .failure = .truncate },
+        .{ .failure = .map },
+        .{ .failure = .map, .inline_mode = true },
+        .{ .failure = .announce },
+    };
+
+    for (cases) |case| {
+        var out = proto.Outbox.init(std.testing.allocator);
+        defer out.deinit();
+        defer ViewConstructionTest.closeOutboxFds(&out);
+        var host = Host.init(std.testing.allocator, &out);
+        defer host.deinit();
+        host.inline_mode = case.inline_mode;
+
+        const prior = try host.registerView(ViewConstructionTest.req(51, 0));
+        var injected = ViewConstructionTest{ .failure = case.failure, .seed_semantic = true };
+        var spawn_ops = injected.ops();
+        if (host.createViewAtWith(ViewConstructionTest.req(52, 0), "", &spawn_ops)) |_| {
+            return error.ExpectedConstructionFailure;
+        } else |_| {}
+
+        try std.testing.expect(injected.semantic_seeded);
+        try std.testing.expectEqual(@as(usize, 1), host.viewCount());
+        try std.testing.expect(host.find(51) == prior);
+        try std.testing.expect(host.find(52) == null);
+        try injected.expectReleased();
+    }
+}
+
+test "view construction rejects a missing context before ownership transfer" {
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    defer ViewConstructionTest.closeOutboxFds(&out);
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+
+    const prior = try host.registerView(ViewConstructionTest.req(61, 0));
+    var injected: ViewConstructionTest = .{};
+    var spawn_ops = injected.ops();
+    try host.createViewAtWith(ViewConstructionTest.req(62, 99), "", &spawn_ops);
+
+    try std.testing.expectEqual(@as(usize, 1), host.viewCount());
+    try std.testing.expect(host.find(61) == prior);
+    try std.testing.expect(host.find(62) == null);
+    try std.testing.expectEqual(@as(usize, 0), injected.browser_calls);
+    var reader = proto.Reader.init(out.front().?.bytes);
+    const frame = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.ev_view_create_failed, frame.tag);
+    const failure = try proto.decode(proto.EvViewCreateFailed, frame.payload);
+    try std.testing.expectEqual(@as(u32, 62), failure.view);
+    try std.testing.expectEqual(@as(u32, 99), failure.context);
+}
 
 // ---------------------------------------------------------------------
 // Cookies + site data (capability "sitedata")

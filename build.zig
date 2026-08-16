@@ -1204,6 +1204,7 @@ fn addCef(
     fetch_ext_step.dependOn(&fetch_ext.step);
 
     const web_step = b.step("web", "Build sketerm-webengine, the CEF browser helper (needs `zig build fetch-cef`)");
+    const test_web_step = b.step("test-web", "Run CEF-gated browser-helper unit tests");
     const smoke_web_step = b.step("smoke-web", "browser-helper end-to-end smoke (headless)");
     const bench_wreq_step = b.step("bench-webreq", "Blocking-webRequest added-latency benchmark (real helper, real page)");
 
@@ -1221,6 +1222,7 @@ fn addCef(
             .{ release_dir, include_root },
         ));
         web_step.dependOn(&missing.step);
+        test_web_step.dependOn(&missing.step);
         smoke_web_step.dependOn(&missing.step);
         bench_wreq_step.dependOn(&missing.step);
         return;
@@ -1302,6 +1304,11 @@ fn addCef(
         .root_module = web_mod,
         .use_lld = use_lld,
     });
+    const web_tests = b.addTest(.{
+        .root_module = web_mod,
+        .use_lld = use_lld,
+    });
+    test_web_step.dependOn(&b.addRunArtifact(web_tests).step);
     // Installed by the `web` step only — never by `b.installArtifact`,
     // which would drag CEF into the default build.
     web_step.dependOn(&b.addInstallArtifact(web_exe, .{}).step);
