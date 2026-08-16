@@ -705,6 +705,10 @@ pub fn main() u8 {
         // before its area signals, frame tick, and live GL state were
         // synchronously severed.
         _ = c.setenv("SKETERM_VERIFY_SURFACE_TEARDOWN", "1", 1);
+        // Arm editor-local atlas texture accounting. The focused stage
+        // queries it after zoom/config rebuilds and reparenting; closing
+        // that editor aborts if final create/delete totals do not match.
+        _ = c.setenv("SKETERM_VERIFY_EDITOR_ATLAS_GL", "1", 1);
         // Hermeticity: on a dev box with at-spi running, the GUI child
         // would otherwise register its accessibles on the USER'S real
         // a11y bus. This harness isolates every other resource, so it
@@ -767,6 +771,42 @@ pub fn main() u8 {
         if (!have_wl) return fail("focused inline-rename smoke is GTK/Wayland-only");
         if (inlineRenameLifetimeStage(allocator, app, rt, sock_path, &wl_z)) |why| return failMsg(why);
         say("inline rename: normal completion and tab/pane/window teardown canceled pending idles");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_EDITOR_ATLAS_ONLY") != null) {
+        const app = drive orelse return fail("focused editor atlas smoke has no display driver");
+        const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"new-editor-tab\"}\n") orelse
+            return fail("focused editor atlas tab open failed");
+        defer allocator.free(opened);
+        const pane = parseNumAfter(opened, "\"pane\":") orelse
+            return fail("focused editor atlas tab returned no pane");
+        var req_buf: [128]u8 = undefined;
+        const focus_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch
+            return fail("focused editor atlas focus format");
+        const focused = roundtrip(allocator, sock_path, focus_req) orelse
+            return fail("focused editor atlas focus failed");
+        defer allocator.free(focused);
+        if (std.mem.indexOf(u8, focused, "\"ok\":true") == null)
+            return fail("focused editor atlas focus was refused");
+        _ = app.drainLive(1_000);
+        if (editorAtlasLifecycleStage(allocator, app, sock_path, rt, pane)) |why| return failMsg(why);
+
+        const close_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{pane}) catch
+            return fail("focused editor atlas close format");
+        const closed = roundtrip(allocator, sock_path, close_req) orelse
+            return fail("focused editor atlas close failed");
+        defer allocator.free(closed);
+        if (std.mem.indexOf(u8, closed, "\"ok\":true") == null)
+            return fail("focused editor atlas close was refused");
+        if (!waitPaneGone(allocator, sock_path, pane, 15_000))
+            return fail("focused editor atlas pane did not finish teardown");
+        const alive = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return fail("GUI exited during editor atlas teardown");
+        defer allocator.free(alive);
+        if (std.mem.indexOf(u8, alive, "\"ok\":true") == null)
+            return fail("GUI became unhealthy during editor atlas teardown");
+        say("editor atlas: zoom/config/failure/re-realize accounting and final teardown passed");
         teardown();
         return 0;
     }
@@ -1081,6 +1121,8 @@ pub fn main() u8 {
         if (drive) |app| {
             if (editorInputStage(allocator, app)) |why| return failMsg(why);
             say("editor search bar opened by a real Ctrl+F, on the Wayland IM path");
+            if (editorAtlasLifecycleStage(allocator, app, sock_path, rt, epane)) |why| return failMsg(why);
+            say("editor atlas: zoom/config rebuilds and re-realize kept one live texture; teardown verifier armed");
         }
 
         // 6c-2. The project layer, on a REAL git repository: root
@@ -9254,6 +9296,226 @@ fn editorInputStage(allocator: std.mem.Allocator, app: *appdrive.App) ?[]const u
     app.pressKey(null, "escape") catch return "injecting escape failed";
     if (!app.waitChangeSince(win_id, &ref2, 15_000, 0.02, null))
         return "escape did not close the editor's search bar";
+    return null;
+}
+
+const EditorAtlasStats = struct {
+    created: u64 = 0,
+    deleted: u64 = 0,
+    live: u64 = 0,
+    realized: bool = false,
+    texture_valid: bool = false,
+    font_size: u16 = 0,
+};
+
+const EditorAtlasReply = struct {
+    ok: bool = false,
+    atlas: EditorAtlasStats = .{},
+};
+
+fn editorAtlasStats(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32) ?EditorAtlasStats {
+    var req_buf: [128]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"editor-atlas-stats\",\"pane\":{d}}}\n", .{pane}) catch return null;
+    const reply = roundtrip(allocator, sock_path, req) orelse return null;
+    defer allocator.free(reply);
+    var parsed = std.json.parseFromSlice(EditorAtlasReply, allocator, reply, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    if (!parsed.value.ok) return null;
+    return parsed.value.atlas;
+}
+
+fn editorAtlasHealthy(stats: EditorAtlasStats) bool {
+    return stats.created > 0 and stats.deleted + 1 == stats.created and
+        stats.live == 1 and stats.realized and stats.texture_valid;
+}
+
+fn waitEditorAtlasExact(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    pane: u32,
+    created: u64,
+    deleted: u64,
+    font_size: u16,
+) ?EditorAtlasStats {
+    var waited: u32 = 0;
+    while (waited < 15_000) : (waited += 100) {
+        _ = app.pumpOnce(100);
+        const stats = editorAtlasStats(allocator, sock_path, pane) orelse continue;
+        if (stats.created == created and stats.deleted == deleted and
+            stats.font_size == font_size and editorAtlasHealthy(stats)) return stats;
+    }
+    return null;
+}
+
+fn waitEditorAtlasRecreated(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    pane: u32,
+    before: EditorAtlasStats,
+) ?EditorAtlasStats {
+    var waited: u32 = 0;
+    while (waited < 15_000) : (waited += 100) {
+        _ = app.pumpOnce(100);
+        const stats = editorAtlasStats(allocator, sock_path, pane) orelse continue;
+        if (stats.created > before.created and stats.deleted >= before.deleted and
+            stats.created - before.created == stats.deleted - before.deleted and
+            stats.font_size == before.font_size and editorAtlasHealthy(stats)) return stats;
+    }
+    return null;
+}
+
+/// Exercise the real EditorView atlas replacement and widget GL lifecycle.
+fn editorAtlasLifecycleStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    rt: []const u8,
+    pane: u32,
+) ?[]const u8 {
+    var stats = blk: {
+        var waited: u32 = 0;
+        while (waited < 15_000) : (waited += 100) {
+            _ = app.pumpOnce(100);
+            const current = editorAtlasStats(allocator, sock_path, pane) orelse continue;
+            if (editorAtlasHealthy(current)) break :blk current;
+        }
+        return "the editor did not start with exactly one valid atlas texture";
+    };
+    const configured_size = stats.font_size;
+
+    // Real user zoom actions: each replacement creates one texture and
+    // deletes its predecessor while the editor area's context is current.
+    var zoom_round: u32 = 0;
+    while (zoom_round < 3) : (zoom_round += 1) {
+        const next_size = stats.font_size + 1;
+        app.pressKey(null, "ctrl+=") catch return "injecting editor font zoom failed";
+        stats = waitEditorAtlasExact(
+            allocator,
+            app,
+            sock_path,
+            pane,
+            stats.created + 1,
+            stats.deleted + 1,
+            next_size,
+        ) orelse return "an editor zoom did not create one texture and delete one texture";
+    }
+
+    // Fail after replacement CPU state exists but before the active atlas
+    // is retired. The old texture must remain valid and the counters must
+    // not move; the following ordinary zoom proves the view recovers.
+    var req_buf: [128]u8 = undefined;
+    const fail_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"editor-atlas-fail-next\",\"pane\":{d}}}\n", .{pane}) catch
+        return "formatting the editor atlas failure request failed";
+    const armed = roundtrip(allocator, sock_path, fail_req) orelse
+        return "arming the editor atlas rebuild failure failed";
+    defer allocator.free(armed);
+    if (std.mem.indexOf(u8, armed, "\"ok\":true") == null)
+        return "the editor atlas rebuild failure hook was refused";
+    const failed_size = stats.font_size + 1;
+    app.pressKey(null, "ctrl+=") catch return "injecting the failing editor font zoom failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created,
+        stats.deleted,
+        failed_size,
+    ) orelse return "a failed editor rebuild deleted or replaced the active atlas texture";
+
+    const recovered_size = stats.font_size + 1;
+    app.pressKey(null, "ctrl+=") catch return "injecting the editor recovery zoom failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        recovered_size,
+    ) orelse return "the editor did not recover after a failed atlas rebuild";
+
+    // Config sync uses the same rebuild path, including rename-over saves.
+    var cfg_buf: [512:0]u8 = undefined;
+    const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/sketerm/config.conf", .{rt}) catch return "editor atlas config path";
+    const cfg_size_1: u16 = if (stats.font_size != 27) 27 else 28;
+    var body_buf: [96]u8 = undefined;
+    const body_1 = std.fmt.bufPrint(&body_buf, "# editor atlas smoke\neditor_font_size = {d}\n", .{cfg_size_1}) catch
+        return "formatting editor atlas config failed";
+    if (!writeFile(cfg_path, body_1)) return "writing editor atlas config failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        cfg_size_1,
+    ) orelse return "an editor config rebuild did not balance its atlas texture";
+
+    var tmp_buf: [512:0]u8 = undefined;
+    const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "{s}/sketerm/config.conf.editor-atlas", .{rt}) catch
+        return "editor atlas temp config path";
+    const cfg_size_2: u16 = if (cfg_size_1 == 29) 30 else 29;
+    const body_2 = std.fmt.bufPrint(&body_buf, "# editor atlas smoke rename\neditor_font_size = {d}\n", .{cfg_size_2}) catch
+        return "formatting renamed editor atlas config failed";
+    if (!writeFile(tmp_path, body_2)) return "writing renamed editor atlas config failed";
+    if (c.rename(tmp_path.ptr, cfg_path.ptr) != 0) return "renaming editor atlas config failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        cfg_size_2,
+    ) orelse return "a rename-over editor config rebuild did not balance its atlas texture";
+
+    _ = c.unlink(cfg_path.ptr);
+    const reload_req = std.fmt.bufPrint(
+        &req_buf,
+        "{{\"cmd\":\"action\",\"pane\":{d},\"data\":\"reload_config\"}}\n",
+        .{pane},
+    ) catch return "formatting editor config reset failed";
+    const reloaded = roundtrip(allocator, sock_path, reload_req) orelse return "resetting editor config failed";
+    defer allocator.free(reloaded);
+    if (std.mem.indexOf(u8, reloaded, "\"ok\":true") == null) return "resetting editor config was refused";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        configured_size,
+    ) orelse return "resetting editor config did not balance its atlas texture";
+
+    // Splitting reparents the editor subtree, forcing an unrealize/realize;
+    // collapsing the split does it again. Each cycle must retire every old
+    // texture and leave exactly the one belonging to the new live context.
+    const split_req = std.fmt.bufPrint(
+        &req_buf,
+        "{{\"cmd\":\"split\",\"pane\":{d},\"direction\":\"h\"}}\n",
+        .{pane},
+    ) catch return "formatting editor re-realize split failed";
+    const split = roundtrip(allocator, sock_path, split_req) orelse return "editor re-realize split failed";
+    defer allocator.free(split);
+    if (std.mem.indexOf(u8, split, "\"ok\":true") == null) return "editor re-realize split was refused";
+    const other = parseNumAfter(split, "\"pane\":") orelse return "editor re-realize split returned no pane";
+    stats = waitEditorAtlasRecreated(allocator, app, sock_path, pane, stats) orelse
+        return "splitting did not release and recreate the editor atlas texture";
+
+    const close_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{other}) catch
+        return "formatting editor re-realize collapse failed";
+    const closed = roundtrip(allocator, sock_path, close_req) orelse return "editor re-realize collapse failed";
+    defer allocator.free(closed);
+    if (std.mem.indexOf(u8, closed, "\"ok\":true") == null) return "editor re-realize collapse was refused";
+    _ = waitEditorAtlasRecreated(allocator, app, sock_path, pane, stats) orelse
+        return "collapsing the split did not release and recreate the editor atlas texture";
     return null;
 }
 

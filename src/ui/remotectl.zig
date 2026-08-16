@@ -511,6 +511,21 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             .title = scr.last_title orelse "",
             .seq = pane.terminal.activity_seq,
         });
+    } else if (eql(u8, req.cmd, "editor-atlas-stats")) {
+        if (c.getenv("SKETERM_VERIFY_EDITOR_ATLAS_GL") == null)
+            return ipc_protocol.writeErr(out, allocator, "editor atlas verification is not enabled");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const view = @import("editorview.zig").EditorView.fromPane(pane) orelse
+            return ipc_protocol.writeErr(out, allocator, "pane has no editor face");
+        try ipc_protocol.writeOk(out, allocator, "atlas", view.atlasTextureStats());
+    } else if (eql(u8, req.cmd, "editor-atlas-fail-next")) {
+        if (c.getenv("SKETERM_VERIFY_EDITOR_ATLAS_GL") == null)
+            return ipc_protocol.writeErr(out, allocator, "editor atlas verification is not enabled");
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const view = @import("editorview.zig").EditorView.fromPane(pane) orelse
+            return ipc_protocol.writeErr(out, allocator, "pane has no editor face");
+        view.failNextAtlasRebuildForTest();
+        try ipc_protocol.writeOk(out, allocator, null, {});
     } else if (eql(u8, req.cmd, "im-probe")) {
         // Debug hook: push hardware keycodes (GDK code = evdev + 8,
         // comma-separated in `data`) through the FOCUSED face's IM

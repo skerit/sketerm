@@ -807,6 +807,15 @@ const ClosedDoc = struct {
 };
 
 pub const EditorView = struct {
+    pub const AtlasTextureStats = struct {
+        created: u64,
+        deleted: u64,
+        live: u64,
+        realized: bool,
+        texture_valid: bool,
+        font_size: u16,
+    };
+
     allocator: std.mem.Allocator,
     pane: ?*Pane = null,
     fence: *Fence = undefined,
@@ -919,6 +928,10 @@ pub const EditorView = struct {
     preedit_cursor: usize = 0,
 
     atlas: ?*Atlas = null,
+    atlas_textures_created: u64 = 0,
+    atlas_textures_deleted: u64 = 0,
+    atlas_verify_accounting: bool = false,
+    atlas_test_fail_after_create: bool = false,
     /// Valid iff `atlas != null`; address handed to every Layout.
     book: FontBook = undefined,
     pass: EditorPass,
@@ -1787,17 +1800,69 @@ pub const EditorView = struct {
         if (c.gtk_widget_get_realized(@ptrCast(self.area)) == 0) return;
         c.gtk_gl_area_make_current(self.area);
         if (c.gtk_gl_area_get_error(self.area) != null) return;
+
+        // Construct CPU state first: a font/allocation failure must leave
+        // the active atlas and its texture untouched.
+        const replacement = self.createAtlas() orelse return;
+        if (self.atlas_test_fail_after_create) {
+            self.atlas_test_fail_after_create = false;
+            replacement.deinit();
+            return;
+        }
         if (self.atlas) |old| {
+            self.releaseAtlasGL(old);
             old.deinit();
             self.atlas = null;
         }
-        self.atlas = self.createAtlas() orelse return;
-        self.atlas.?.realize();
-        self.book = FontBook.init(self.atlas.?);
+        self.atlas = replacement;
+        self.realizeAtlas(replacement);
+        self.book = FontBook.init(replacement);
         for (self.tabs.items) |t| {
             t.layout.invalidateAll();
             t.rows_lines = 0; // row heights changed: re-estimate
         }
+    }
+
+    fn realizeAtlas(self: *EditorView, atlas: *Atlas) void {
+        const had_texture = atlas.realized and atlas.gl_tex != 0;
+        atlas.realize();
+        if (!had_texture and atlas.realized and atlas.gl_tex != 0)
+            self.atlas_textures_created += 1;
+    }
+
+    fn releaseAtlasGL(self: *EditorView, atlas: *Atlas) void {
+        const had_texture = atlas.realized and atlas.gl_tex != 0;
+        atlas.releaseGL();
+        if (had_texture) self.atlas_textures_deleted += 1;
+    }
+
+    /// Return editor-local GL texture accounting for the GUI smoke rig.
+    pub fn atlasTextureStats(self: *EditorView) AtlasTextureStats {
+        self.atlas_verify_accounting = true;
+        var texture_valid = false;
+        if (!self.widgets_dead and c.gtk_widget_get_realized(@ptrCast(self.area)) != 0) {
+            c.gtk_gl_area_make_current(self.area);
+            if (c.gtk_gl_area_get_error(self.area) == null) {
+                if (self.atlas) |atlas| {
+                    if (atlas.realized and atlas.gl_tex != 0)
+                        texture_valid = c.glIsTexture(atlas.gl_tex) != 0;
+                }
+            }
+        }
+        return .{
+            .created = self.atlas_textures_created,
+            .deleted = self.atlas_textures_deleted,
+            .live = self.atlas_textures_created -| self.atlas_textures_deleted,
+            .realized = if (self.atlas) |atlas| atlas.realized else false,
+            .texture_valid = texture_valid,
+            .font_size = self.font_size,
+        };
+    }
+
+    /// Inject one post-construction rebuild failure for the GUI smoke rig.
+    pub fn failNextAtlasRebuildForTest(self: *EditorView) void {
+        self.atlas_verify_accounting = true;
+        self.atlas_test_fail_after_create = true;
     }
 
     /// Apply a new font size through the same machinery syncConfig
@@ -2084,6 +2149,12 @@ pub const EditorView = struct {
         if (self.atlas) |a| {
             a.deinit();
             self.atlas = null;
+        }
+        if (self.atlas_verify_accounting and self.atlas_textures_created != self.atlas_textures_deleted) {
+            std.debug.panic(
+                "editor atlas texture imbalance at teardown: created={d} deleted={d}",
+                .{ self.atlas_textures_created, self.atlas_textures_deleted },
+            );
         }
         self.ed_bindings.deinit(self.allocator);
         self.pass.deinit();
@@ -3016,7 +3087,7 @@ pub const EditorView = struct {
             std.debug.print("sketerm: editor realize found no usable font\n", .{});
             return;
         }
-        self.atlas.?.realize();
+        self.realizeAtlas(self.atlas.?);
         self.book = FontBook.init(self.atlas.?);
         for (self.tabs.items) |t| t.layout.invalidateAll();
         self.pass.realize() catch {
@@ -3034,7 +3105,7 @@ pub const EditorView = struct {
         }
         self.pass.releaseGL();
         self.linear_target.releaseGL();
-        if (self.atlas) |a| a.releaseGL();
+        if (self.atlas) |a| self.releaseAtlasGL(a);
     }
 
     fn onRender(area: *c.GtkGLArea, _: ?*c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {
