@@ -581,9 +581,10 @@ pub fn unregisterView(self: *BrowserView) void {
 }
 
 /// Publish a bookmark mutation through the full places snapshot.
-fn bookmarksChanged(self: *BrowserView) void {
-    self.savePlaces();
+fn bookmarksChanged(self: *BrowserView) bool {
+    const saved = self.savePlaces();
     if (self.places_on and !self.widgets_dead) self.renderPlaces();
+    return saved;
 }
 
 /// Heap ctx on each places row (freed with the row).
@@ -615,7 +616,7 @@ pub fn onPlacesToggled(btn: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) 
     // performs at startup IS the stored state.
     if (self.chrome_ready) {
         self.sidebar_open = self.places_on;
-        self.savePlaces();
+        _ = self.savePlaces();
     }
 }
 
@@ -659,7 +660,7 @@ pub fn toggleSectionHidden(self: *BrowserView, key: []const u8) void {
         if (!std.mem.eql(u8, k, key)) continue;
         self.allocator.free(k);
         _ = self.hidden_sections.orderedRemove(i);
-        self.savePlaces();
+        _ = self.savePlaces();
         self.renderPlaces();
         return;
     }
@@ -668,7 +669,7 @@ pub fn toggleSectionHidden(self: *BrowserView, key: []const u8) void {
         self.allocator.free(owned);
         return;
     };
-    self.savePlaces();
+    _ = self.savePlaces();
     self.renderPlaces();
 }
 
@@ -740,7 +741,7 @@ pub fn moveSection(self: *BrowserView, key: []const u8, up: bool) void {
         const owned = self.allocator.dupe(u8, k) catch continue;
         self.section_order.append(self.allocator, owned) catch self.allocator.free(owned);
     }
-    self.savePlaces();
+    _ = self.savePlaces();
     self.renderPlaces();
 }
 
@@ -1660,9 +1661,9 @@ fn onPlacesMenuRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         }
     }
     if (bookmark_changed) {
-        bookmarksChanged(self);
+        _ = bookmarksChanged(self);
     } else {
-        self.savePlaces();
+        _ = self.savePlaces();
         self.renderPlaces();
     }
 }
@@ -1680,7 +1681,7 @@ pub fn onPlaceActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, user: ?*anyopaq
         if (name.len > nbuf.len) return;
         @memcpy(nbuf[0..name.len], name);
         toggleSection(self, nbuf[0..name.len]);
-        self.savePlaces();
+        _ = self.savePlaces();
         self.renderPlaces();
         return;
     }
@@ -1758,27 +1759,27 @@ pub fn onSaveSearchClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void
         self.allocator.free(pat);
         return;
     };
-    self.savePlaces();
+    const saved = self.savePlaces();
     if (self.places_on) self.renderPlaces();
-    self.setStatusFmt("saved query: {s}", .{ls.pattern});
+    if (saved) self.setStatusFmt("saved query: {s}", .{ls.pattern});
 }
 
-pub fn savePlaces(self: *BrowserView) void {
+pub fn savePlaces(self: *BrowserView) bool {
     // attach() can migrate a legacy collection before registering the
     // new face. If another face already owns current process state,
     // that not-yet-live disk snapshot must not replace it.
     const source_index = registeredIndex(self);
-    if (live_views.items.len > 0 and source_index == null) return;
+    if (live_views.items.len > 0 and source_index == null) return true;
     if (source_index) |i| {
         if (!live_views.items[i].synced) {
             if (authoritative) |*current| {
                 live_views.items[i].synced = syncView(self, current.value);
             }
-            return;
+            return true;
         }
     }
 
-    const next = if (authoritative) |*current| blk: {
+    var next = if (authoritative) |*current| blk: {
         var sources: MergeSources = .{};
         // Other views go first so the explicit saver wins only when
         // both changed the same field; unrelated pending changes merge.
@@ -1787,9 +1788,20 @@ pub fn savePlaces(self: *BrowserView) void {
             sources.consider(entry.view, current.value);
         }
         sources.consider(self, current.value);
-        break :blk Authority.captureMerged(self.allocator, current.value, sources) orelse return;
-    } else Authority.capture(self) orelse return;
-    places_mod.save(self.allocator, next.value);
+        break :blk Authority.captureMerged(self.allocator, current.value, sources) orelse {
+            self.setStatus("places changed in this session but could not be serialized");
+            return false;
+        };
+    } else Authority.capture(self) orelse {
+        self.setStatus("places changed in this session but could not be serialized");
+        return false;
+    };
+    places_mod.save(self.allocator, next.value) catch |err| {
+        std.debug.print("sketerm: places persist failed: {s}\n", .{@errorName(err)});
+        self.setStatusFmt("places changed in this session but could not be saved ({s})", .{@errorName(err)});
+        next.deinit();
+        return false;
+    };
     for (live_views.items) |*entry| {
         const view = entry.view;
         entry.synced = syncView(view, next.value);
@@ -1797,6 +1809,7 @@ pub fn savePlaces(self: *BrowserView) void {
     }
     if (authoritative) |*current| current.deinit();
     authoritative = next;
+    return true;
 }
 
 /// The custom label for bookmark `i`, or null when it should derive
@@ -1863,7 +1876,7 @@ pub fn moveBookmark(self: *BrowserView, i: usize, up: bool) void {
     std.mem.swap([]u8, &self.bookmark_labels.items[i], &self.bookmark_labels.items[j]);
     if (!padParallel(self, &self.bookmark_icons, @max(i, j))) return;
     std.mem.swap([]u8, &self.bookmark_icons.items[i], &self.bookmark_icons.items[j]);
-    bookmarksChanged(self);
+    _ = bookmarksChanged(self);
 }
 
 /// Set (or with "" clear) the custom label of bookmark `i`.
@@ -1873,7 +1886,7 @@ pub fn setBookmarkLabel(self: *BrowserView, i: usize, label: []const u8) void {
     const owned = self.allocator.dupe(u8, label) catch return;
     self.allocator.free(self.bookmark_labels.items[i]);
     self.bookmark_labels.items[i] = owned;
-    bookmarksChanged(self);
+    _ = bookmarksChanged(self);
 }
 
 /// Set (or with "" reset) the custom icon of bookmark `i`.
@@ -1883,7 +1896,7 @@ pub fn setBookmarkIcon(self: *BrowserView, i: usize, icon: []const u8) void {
     const owned = self.allocator.dupe(u8, icon) catch return;
     self.allocator.free(self.bookmark_icons.items[i]);
     self.bookmark_icons.items[i] = owned;
-    bookmarksChanged(self);
+    _ = bookmarksChanged(self);
 }
 
 pub fn addBookmark(self: *BrowserView, spec: []const u8) void {
@@ -1899,8 +1912,7 @@ pub fn addBookmark(self: *BrowserView, spec: []const u8) void {
     if (empty) |e| self.bookmark_labels.append(self.allocator, e) catch self.allocator.free(e);
     const empty_icon = self.allocator.dupe(u8, "") catch null;
     if (empty_icon) |e| self.bookmark_icons.append(self.allocator, e) catch self.allocator.free(e);
-    bookmarksChanged(self);
-    self.setStatusFmt("bookmarked: {s}", .{spec});
+    if (bookmarksChanged(self)) self.setStatusFmt("bookmarked: {s}", .{spec});
 }
 
 /// Bookmark the CURRENT tab's directory (menu + Ctrl+D).
@@ -1920,7 +1932,7 @@ pub fn recordRecentSpec(self: *BrowserView, spec: []const u8) void {
     _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
     const now_ms = @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
     places_mod.recordVisit(self.allocator, &self.frecency, spec, now_ms, places_mod.FRECENCY_CAP);
-    self.savePlaces();
+    _ = self.savePlaces();
     if (self.places_on) self.renderPlaces();
 }
 

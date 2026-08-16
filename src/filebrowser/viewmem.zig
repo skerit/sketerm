@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const model = @import("model.zig");
 const pathz = @import("../util/pathz.zig");
 const profile = @import("../util/profile.zig");
@@ -239,9 +240,13 @@ pub const Store = struct {
     }
 
     pub fn load(allocator: std.mem.Allocator) Store {
-        var pbuf: [4096]u8 = undefined;
         const path = filePath(allocator) catch return Store.init(allocator);
         defer allocator.free(path);
+        return loadFromPath(allocator, path);
+    }
+
+    fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) Store {
+        var pbuf: [4096]u8 = undefined;
         const fp = c.fopen(pathz.pathZ(&pbuf, path) catch return Store.init(allocator), "rb") orelse
             return Store.init(allocator);
         defer _ = c.fclose(fp);
@@ -252,16 +257,17 @@ pub const Store = struct {
         return decode(allocator, bytes[0..n]);
     }
 
-    pub fn save(self: *const Store) void {
-        const path = filePath(self.allocator) catch return;
+    pub fn save(self: *const Store) !void {
+        const path = try filePath(self.allocator);
         defer self.allocator.free(path);
-        pathz.makeParentDirs(path) catch return;
-        const json = self.encode(self.allocator) catch return;
+        try self.saveToPath(path);
+    }
+
+    fn saveToPath(self: *const Store, path: []const u8) !void {
+        const json = try self.encode(self.allocator);
         defer self.allocator.free(json);
-        var pbuf: [4096]u8 = undefined;
-        const fp = c.fopen(pathz.pathZ(&pbuf, path) catch return, "wb") orelse return;
-        defer _ = c.fclose(fp);
-        _ = c.fwrite(json.ptr, 1, json.len, fp);
+        try pathz.makeParentDirs(path);
+        try atomicwrite.writeFile(path, json, 0o600);
     }
 };
 
@@ -315,6 +321,32 @@ test "a folder's settings survive an encode/decode round trip" {
     // The local folder is a different key, not an overwrite.
     try t.expect(back.peek("", "/home/me") != null);
     try t.expect(back.peek("box", "/home/me") == null);
+}
+
+test "view memory save replaces and loads the complete store" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-viewmem-save-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/viewmem.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    var store = Store.init(t.allocator);
+    defer store.deinit();
+    store.remember(.{ .path = "/one", .view = .compact });
+    try store.saveToPath(path);
+    store.remember(.{ .host = "box", .path = "/two", .view = .icons });
+    try store.saveToPath(path);
+
+    var loaded = Store.loadFromPath(t.allocator, path);
+    defer loaded.deinit();
+    try t.expectEqual(@as(usize, 2), loaded.count());
+    try t.expectEqual(model.ViewMode.compact, loaded.peek("", "/one").?.view);
+    try t.expectEqual(model.ViewMode.icons, loaded.peek("box", "/two").?.view);
 }
 
 test "remembering the same folder replaces instead of duplicating" {

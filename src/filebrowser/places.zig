@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 const profile = @import("../util/profile.zig");
 
@@ -190,9 +191,13 @@ pub fn filePath(allocator: std.mem.Allocator) ![]u8 {
 }
 
 pub fn load(allocator: std.mem.Allocator) ?std.json.Parsed(Places) {
-    var pbuf: [4096]u8 = undefined;
     const path = filePath(allocator) catch return null;
     defer allocator.free(path);
+    return loadFromPath(allocator, path);
+}
+
+fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?std.json.Parsed(Places) {
+    var pbuf: [4096]u8 = undefined;
     const fp = c.fopen(pathz.pathZ(&pbuf, path) catch return null, "rb") orelse return null;
     defer _ = c.fclose(fp);
     var bytes: [256 * 1024]u8 = undefined;
@@ -204,17 +209,18 @@ pub fn load(allocator: std.mem.Allocator) ?std.json.Parsed(Places) {
     }) catch null;
 }
 
-pub fn save(allocator: std.mem.Allocator, p: Places) void {
-    const path = filePath(allocator) catch return;
+pub fn save(allocator: std.mem.Allocator, p: Places) !void {
+    const path = try filePath(allocator);
     defer allocator.free(path);
-    pathz.makeParentDirs(path) catch return;
+    try saveToPath(allocator, path, p);
+}
+
+fn saveToPath(allocator: std.mem.Allocator, path: []const u8, p: Places) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    std.json.Stringify.value(p, .{}, &out.writer) catch return;
-    var pbuf: [4096]u8 = undefined;
-    const fp = c.fopen(pathz.pathZ(&pbuf, path) catch return, "wb") orelse return;
-    defer _ = c.fclose(fp);
-    _ = c.fwrite(out.written().ptr, 1, out.written().len, fp);
+    try std.json.Stringify.value(p, .{}, &out.writer);
+    try pathz.makeParentDirs(path);
+    try atomicwrite.writeFile(path, out.written(), 0o600);
 }
 
 /// Front-insert `spec` into an owned-string list, deduping and
@@ -302,6 +308,46 @@ test "sidebar fields round-trip through the saved JSON" {
     try t.expectEqual(@as(i32, 245), parsed.value.sidebar_px);
     try t.expectEqual(@as(?bool, false), parsed.value.sidebar_open);
     try t.expectEqual(true, parsed.value.zebra);
+}
+
+test "places save replaces a complete file and loads the replacement" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-places-save-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/places.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    try saveToPath(t.allocator, path, .{ .sidebar_px = 201 });
+    try saveToPath(t.allocator, path, .{ .sidebar_px = 287, .zebra = true });
+    const parsed = loadFromPath(t.allocator, path) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try t.expectEqual(@as(i32, 287), parsed.value.sidebar_px);
+    try t.expect(parsed.value.zebra);
+}
+
+test "places serialization failure preserves the prior valid file" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-places-serialize-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/places.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    try saveToPath(t.allocator, path, .{ .sidebar_px = 211 });
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    try t.expectError(error.WriteFailed, saveToPath(failing.allocator(), path, .{ .sidebar_px = 333 }));
+    const parsed = loadFromPath(t.allocator, path) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try t.expectEqual(@as(i32, 211), parsed.value.sidebar_px);
 }
 
 test "clampSidebarPx rejects widths that would break the layout" {

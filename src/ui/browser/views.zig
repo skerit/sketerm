@@ -378,6 +378,15 @@ fn memStore(self: *BrowserView) *viewmem.Store {
     return &self.views.mem.?;
 }
 
+fn saveViewMemory(self: *BrowserView, store: *const viewmem.Store) bool {
+    store.save() catch |err| {
+        std.debug.print("sketerm: folder-view persist failed: {s}\n", .{@errorName(err)});
+        self.setStatusFmt("folder view settings changed in this session but could not be saved ({s})", .{@errorName(err)});
+        return false;
+    };
+    return true;
+}
+
 /// True for the tabs whose location is a real remembered folder
 /// (search results, collections and archives are not folders).
 fn memorable(tab: *BTab) bool {
@@ -439,14 +448,14 @@ pub fn rememberFolder(self: *BrowserView, tab: *BTab) void {
         .col_widths = widths[0..n],
         .name_width = tab.name_width,
     });
-    store.save();
+    _ = saveViewMemory(self, store);
 }
 
 pub fn forgetFolder(self: *BrowserView, tab: *BTab) void {
     const store = memStore(self);
     if (store.forget(tab.hc.host orelse "", tab.root.path)) {
-        store.save();
-        self.setStatusFmt("forgot the view settings for {s}", .{tab.root.path});
+        if (saveViewMemory(self, store))
+            self.setStatusFmt("forgot the view settings for {s}", .{tab.root.path});
     } else {
         self.setStatus("this folder has no remembered view settings");
     }
@@ -456,8 +465,8 @@ pub fn forgetAllFolders(self: *BrowserView) void {
     const store = memStore(self);
     const n = store.count();
     store.forgetAll();
-    store.save();
-    self.setStatusFmt("forgot the view settings of {d} folder(s)", .{n});
+    if (saveViewMemory(self, store))
+        self.setStatusFmt("forgot the view settings of {d} folder(s)", .{n});
 }
 
 // -- the view menu -----------------------------------------------
@@ -655,7 +664,7 @@ pub fn onZebraToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.c) 
             c.gtk_widget_remove_css_class(cv, "sketerm-fb-zebra");
         }
     }
-    self.savePlaces();
+    _ = self.savePlaces();
 }
 
 pub fn onZoomIn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

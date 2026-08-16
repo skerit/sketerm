@@ -1745,7 +1745,7 @@ pub fn onSideInfoToggled(check: *c.GtkCheckButton, user: ?*anyopaque) callconv(.
     self.side_info = want;
     c.gtk_widget_set_visible(self.side_card, @intFromBool(want));
     if (want) updateSideCard(self);
-    self.savePlaces();
+    _ = self.savePlaces();
 }
 
 fn clearInfoGrid(self: *BrowserView) void {
@@ -2934,7 +2934,6 @@ fn onQuickLookActivate(user: ?*anyopaque, spec: []const u8) void {
     self.quickLookClose();
     render_mod.activatePath(tab, path, false);
 }
-
 
 test "remote-thumb cache header round-trips and rejects foreign bytes" {
     const t = std.testing;

@@ -1267,7 +1267,7 @@ pub const BrowserView = struct {
         // view is a no-op whenever another browser face is live.
         const sidebar_flush = self.sidebar_save.teardown();
         if (sidebar_flush.source != 0) _ = c.g_source_remove(sidebar_flush.source);
-        if (sidebar_flush.persist) self.savePlaces();
+        if (sidebar_flush.persist) _ = self.savePlaces();
         @import("places.zig").unregisterView(self);
         // Close the quick-look viewer FIRST: its destroy handler and
         // activate callback carry a raw pointer to this view, and the
@@ -1976,7 +1976,7 @@ pub const BrowserView = struct {
 
     fn onSidebarSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(BrowserView, user);
-        if (self.sidebar_save.fired()) self.savePlaces();
+        if (self.sidebar_save.fired()) _ = self.savePlaces();
         return 0;
     }
 

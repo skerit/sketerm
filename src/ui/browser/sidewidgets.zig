@@ -547,7 +547,7 @@ fn drawGraph(area: *c.GtkDrawingArea, cr: *c.cairo_t, width: c_int, height: c_in
 /// and the sidebar.
 fn commitEdit(self: *BrowserView) void {
     resetRuns(self);
-    self.savePlaces();
+    _ = self.savePlaces();
     if (self.places_on) self.renderPlaces();
 }
 

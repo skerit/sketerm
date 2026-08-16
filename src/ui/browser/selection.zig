@@ -81,6 +81,15 @@ pub fn regStore(self: *BrowserView) *registers.Store {
     return &self.sel.store.?;
 }
 
+fn saveRegisters(self: *BrowserView, store: *const registers.Store) bool {
+    store.save() catch |err| {
+        std.debug.print("sketerm: register persist failed: {s}\n", .{@errorName(err)});
+        self.setStatusFmt("registers changed in this session but could not be saved ({s})", .{@errorName(err)});
+        return false;
+    };
+    return true;
+}
+
 fn rememberName(self: *BrowserView, name: []const u8) void {
     const owned = self.allocator.dupe(u8, name) catch return;
     if (self.sel.last_name) |old| self.allocator.free(old);
@@ -100,9 +109,9 @@ pub fn migrateCollection(self: *BrowserView, items: []const places_mod.CollItem)
     const store = regStore(self);
     if (store.sizeOf(registers.COLLECTION) == 0) {
         for (items) |ci| _ = store.add(registers.COLLECTION, registers.entryFromSpec(ci.spec, ci.dir));
-        store.save();
+        if (!saveRegisters(self, store)) return;
     }
-    self.savePlaces();
+    _ = self.savePlaces();
 }
 
 // -- sticky selection --------------------------------------------
@@ -444,8 +453,7 @@ pub fn onSelectionKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, st
     if (ictx) |ctx| {
         const action = input.matchWithDefaults(ctx.bindings, keyval, state);
         if (action) |a| switch (a) {
-            .toggle_tab_sidebar, .tab_collapse, .tab_expand, .tab_tree_next, .tab_tree_prev =>
-                return input.runAction(ctx, a),
+            .toggle_tab_sidebar, .tab_collapse, .tab_expand, .tab_tree_next, .tab_tree_prev => return input.runAction(ctx, a),
             else => {},
         };
     }
@@ -553,11 +561,11 @@ pub fn markEntries(self: *BrowserView, name: []const u8, items: []const register
 /// Persist and report the outcome of a marking run.
 fn reportMarks(self: *BrowserView, name: []const u8, added: usize, full: bool) void {
     const store = regStore(self);
-    store.save();
+    const saved = saveRegisters(self, store);
     rememberName(self, name);
-    if (full) {
+    if (saved and full) {
         self.setStatusFmt("register {s} is full ({d} marks max)", .{ name, registers.MAX_ENTRIES });
-    } else {
+    } else if (saved) {
         self.setStatusFmt("marked {d} item(s) in register {s} ({d} total)", .{ added, name, store.sizeOf(name) });
     }
     if (self.places_on) self.renderPlaces();
@@ -591,8 +599,7 @@ pub fn onMenuRegisterRemove(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) voi
     const entry = registers.entryFromSpec(spec, false);
     const store = regStore(self);
     if (store.remove(owned_name, entry.host, entry.path)) {
-        store.save();
-        self.setStatusFmt("unmarked: {s}", .{spec});
+        if (saveRegisters(self, store)) self.setStatusFmt("unmarked: {s}", .{spec});
     }
     refreshRegisterTab(self, owned_name);
     if (self.places_on) self.renderPlaces();
@@ -807,10 +814,12 @@ pub fn deleteRegister(self: *BrowserView, name: []const u8) void {
     // dispatched; a host that was still connecting keeps its marks so
     // a second run finishes the job.
     if (waiting == 0) _ = store.drop(name);
-    store.save();
+    const saved = saveRegisters(self, store);
     refreshRegisterTab(self, name);
     if (self.places_on) self.renderPlaces();
-    if (waiting > 0) {
+    if (!saved) {
+        return;
+    } else if (waiting > 0) {
         self.setStatusFmt("deleting {d} item(s); {d} kept: their host is still connecting, run it again", .{ sent, waiting });
     } else {
         self.setStatusFmt("deleting {d} marked item(s); register {s} forgotten", .{ sent, name });
@@ -1037,8 +1046,8 @@ pub fn onRegAction(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         .forget => {
             const store = regStore(self);
             if (store.drop(name)) {
-                store.save();
-                self.setStatusFmt("forgot register {s} (files untouched)", .{name});
+                if (saveRegisters(self, store))
+                    self.setStatusFmt("forgot register {s} (files untouched)", .{name});
             }
             refreshRegisterTab(self, name);
             if (self.places_on) self.renderPlaces();

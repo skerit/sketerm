@@ -12,6 +12,7 @@ const c = @import("../../c.zig").c;
 const wire = @import("../../mux/wire.zig");
 const file_transfers = @import("../file_transfers.zig");
 const fstransfer = @import("../../ipc/fstransfer.zig");
+const incomplete = @import("../../filebrowser/incomplete.zig");
 const xferqueue = @import("../../filebrowser/xferqueue.zig");
 
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
@@ -1943,13 +1944,16 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
             self.setStatusFmt("job failed: {s} ({s})", .{ row.label, e.message });
             // Out of automatic attempts: remember the interrupted copy
             // so a later paste of the same source offers Continue.
-            if (row.retry) |r| @import("../../filebrowser/incomplete.zig").record(
+            if (row.retry) |r| incomplete.record(
                 self.allocator,
                 r.src_hc.host orelse "",
                 r.src_path,
                 r.dst_hc.host orelse "",
                 r.dst_path,
-            );
+            ) catch |err| {
+                std.debug.print("sketerm: interrupted-copy persist failed: {s}\n", .{@errorName(err)});
+                self.setStatusFmt("job failed: {s}; its interrupted-copy state could not be saved ({s})", .{ row.label, @errorName(err) });
+            };
         }
         if (row.undo_op) |u| {
             row.undo_op = null;
@@ -1969,13 +1973,16 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
         row.state = .canceled;
         _ = acknowledgeUserCopy(self, row, true);
         self.setStatusFmt("canceled: {s}", .{row.label});
-        if (row.retry) |r| @import("../../filebrowser/incomplete.zig").record(
+        if (row.retry) |r| incomplete.record(
             self.allocator,
             r.src_hc.host orelse "",
             r.src_path,
             r.dst_hc.host orelse "",
             r.dst_path,
-        );
+        ) catch |err| {
+            std.debug.print("sketerm: interrupted-copy persist failed: {s}\n", .{@errorName(err)});
+            self.setStatusFmt("canceled: {s}; its interrupted-copy state could not be saved ({s})", .{ row.label, @errorName(err) });
+        };
         if (row.undo_op) |u| {
             row.undo_op = null;
             u.destroy(self.allocator);
@@ -1993,11 +2000,14 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
     }
     // A completed copy is no longer "interrupted".
     if (row.state == .finished) {
-        if (row.retry) |r| @import("../../filebrowser/incomplete.zig").clear(
+        if (row.retry) |r| incomplete.clear(
             self.allocator,
             r.dst_hc.host orelse "",
             r.dst_path,
-        );
+        ) catch |err| {
+            std.debug.print("sketerm: interrupted-copy clear failed: {s}\n", .{@errorName(err)});
+            self.setStatusFmt("copy completed, but its interrupted-copy state could not be cleared ({s})", .{@errorName(err)});
+        };
     }
     // A finished cross-host copy releases its destination.
     if (row.dest_key != 0 and row.terminal()) self.pumpCopyQueue();

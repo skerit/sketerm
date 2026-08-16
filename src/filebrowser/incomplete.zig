@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 const profile = @import("../util/profile.zig");
 
@@ -21,7 +22,7 @@ pub const Entry = struct {
 };
 
 const File = struct {
-    incomplete: []Entry = &.{},
+    incomplete: []const Entry = &.{},
 };
 
 pub fn filePath(allocator: std.mem.Allocator) ![]u8 {
@@ -35,9 +36,13 @@ pub fn filePath(allocator: std.mem.Allocator) ![]u8 {
 }
 
 fn load(allocator: std.mem.Allocator) ?std.json.Parsed(File) {
-    var pbuf: [4096]u8 = undefined;
     const path = filePath(allocator) catch return null;
     defer allocator.free(path);
+    return loadFromPath(allocator, path);
+}
+
+fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?std.json.Parsed(File) {
+    var pbuf: [4096]u8 = undefined;
     const fp = c.fopen(pathz.pathZ(&pbuf, path) catch return null, "rb") orelse return null;
     defer _ = c.fclose(fp);
     var bytes: [256 * 1024]u8 = undefined;
@@ -49,17 +54,18 @@ fn load(allocator: std.mem.Allocator) ?std.json.Parsed(File) {
     }) catch null;
 }
 
-fn save(allocator: std.mem.Allocator, f: File) void {
-    const path = filePath(allocator) catch return;
+fn save(allocator: std.mem.Allocator, f: File) !void {
+    const path = try filePath(allocator);
     defer allocator.free(path);
-    pathz.makeParentDirs(path) catch return;
+    try saveToPath(allocator, path, f);
+}
+
+fn saveToPath(allocator: std.mem.Allocator, path: []const u8, f: File) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    std.json.Stringify.value(f, .{}, &out.writer) catch return;
-    var pbuf: [4096]u8 = undefined;
-    const fp = c.fopen(pathz.pathZ(&pbuf, path) catch return, "wb") orelse return;
-    defer _ = c.fclose(fp);
-    _ = c.fwrite(out.written().ptr, 1, out.written().len, fp);
+    try std.json.Stringify.value(f, .{}, &out.writer);
+    try pathz.makeParentDirs(path);
+    try atomicwrite.writeFile(path, out.written(), 0o600);
 }
 
 fn eql(e: Entry, src_host: []const u8, src: []const u8, dst_host: []const u8, dst: []const u8) bool {
@@ -68,7 +74,7 @@ fn eql(e: Entry, src_host: []const u8, src: []const u8, dst_host: []const u8, ds
 }
 
 /// Remember an interrupted copy (idempotent; newest kept).
-pub fn record(allocator: std.mem.Allocator, src_host: []const u8, src: []const u8, dst_host: []const u8, dst: []const u8) void {
+pub fn record(allocator: std.mem.Allocator, src_host: []const u8, src: []const u8, dst_host: []const u8, dst: []const u8) !void {
     var list: std.ArrayList(Entry) = .empty;
     defer list.deinit(allocator);
     const parsed = load(allocator);
@@ -76,16 +82,16 @@ pub fn record(allocator: std.mem.Allocator, src_host: []const u8, src: []const u
     if (parsed) |p| {
         for (p.value.incomplete) |e| {
             if (!eql(e, src_host, src, dst_host, dst))
-                list.append(allocator, e) catch return;
+                try list.append(allocator, e);
         }
     }
-    list.append(allocator, .{ .src_host = src_host, .src = src, .dst_host = dst_host, .dst = dst }) catch return;
+    try list.append(allocator, .{ .src_host = src_host, .src = src, .dst_host = dst_host, .dst = dst });
     while (list.items.len > CAP) _ = list.orderedRemove(0);
-    save(allocator, .{ .incomplete = list.items });
+    try save(allocator, .{ .incomplete = list.items });
 }
 
 /// Forget every entry landing on `dst` (a completed or replaced copy).
-pub fn clear(allocator: std.mem.Allocator, dst_host: []const u8, dst: []const u8) void {
+pub fn clear(allocator: std.mem.Allocator, dst_host: []const u8, dst: []const u8) !void {
     const parsed = load(allocator) orelse return;
     defer parsed.deinit();
     var list: std.ArrayList(Entry) = .empty;
@@ -96,9 +102,9 @@ pub fn clear(allocator: std.mem.Allocator, dst_host: []const u8, dst: []const u8
             dropped = true;
             continue;
         }
-        list.append(allocator, e) catch return;
+        try list.append(allocator, e);
     }
-    if (dropped) save(allocator, .{ .incomplete = list.items });
+    if (dropped) try save(allocator, .{ .incomplete = list.items });
 }
 
 /// Is this exact src -> dst pair a known interrupted copy?
@@ -109,6 +115,33 @@ pub fn match(allocator: std.mem.Allocator, src_host: []const u8, src: []const u8
         if (eql(e, src_host, src, dst_host, dst)) return true;
     }
     return false;
+}
+
+test "incomplete-copy save replaces and loads the complete list" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-incomplete-save-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/incomplete.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    const first = [_]Entry{.{ .src = "/one", .dst = "/target" }};
+    try saveToPath(t.allocator, path, .{ .incomplete = &first });
+    const second = [_]Entry{
+        .{ .src = "/one", .dst = "/target" },
+        .{ .src_host = "box", .src = "/two", .dst = "/other" },
+    };
+    try saveToPath(t.allocator, path, .{ .incomplete = &second });
+
+    const loaded = loadFromPath(t.allocator, path) orelse return error.TestUnexpectedResult;
+    defer loaded.deinit();
+    try t.expectEqual(@as(usize, 2), loaded.value.incomplete.len);
+    try t.expectEqualStrings("box", loaded.value.incomplete[1].src_host);
+    try t.expectEqualStrings("/other", loaded.value.incomplete[1].dst);
 }
 
 test "incomplete: record, match, clear round-trip" {
@@ -136,11 +169,11 @@ test "incomplete: record, match, clear round-trip" {
     };
 
     try t.expect(!match(t.allocator, "gobelijn", "/a", "", "/b"));
-    record(t.allocator, "gobelijn", "/a", "", "/b");
+    try record(t.allocator, "gobelijn", "/a", "", "/b");
     try t.expect(match(t.allocator, "gobelijn", "/a", "", "/b"));
     try t.expect(!match(t.allocator, "gobelijn", "/a", "", "/c"));
     // Idempotent record does not grow the list.
-    record(t.allocator, "gobelijn", "/a", "", "/b");
-    clear(t.allocator, "", "/b");
+    try record(t.allocator, "gobelijn", "/a", "", "/b");
+    try clear(t.allocator, "", "/b");
     try t.expect(!match(t.allocator, "gobelijn", "/a", "", "/b"));
 }
