@@ -3359,6 +3359,12 @@ test "config: parses key=value lines" {
     try std.testing.expectEqual(false, cfg.cursor_blink);
 }
 
+test "config: scrollback accepts zero" {
+    var cfg = try Config.loadFromBytes(std.testing.allocator, "scrollback = 0");
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 0), cfg.settings.scrollback);
+}
+
 test "config: parses #RRGGBB and RGB triplets" {
     const body =
         \\default_fg = #abcdef

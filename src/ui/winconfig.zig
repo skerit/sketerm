@@ -319,6 +319,12 @@ fn fontOptsDiffer(
     return false;
 }
 
+fn applyScrollbackCapacity(screen: *@import("../grid/screen.zig").Screen, capacity: u32) void {
+    screen.setScrollbackCapacity(@intCast(capacity)) catch |err| {
+        std.debug.print("sketerm: scrollback capacity apply failed: {s}\n", .{@errorName(err)});
+    };
+}
+
 pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) void {
     const s: *const @import("../config.zig").ProfileSettings =
         if (opts.profile) |p| &p.settings else &self.config.settings;
@@ -347,7 +353,7 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     pane.surface.grid_pass.enable_bidi = self.config.bidi;
     pane.surface.text_blending = textBlendMode(self.config.text_blending);
     applyPanePresentation(self, pane, s);
-    term.screen.scrollback_capacity = s.scrollback;
+    applyScrollbackCapacity(term.screen, s.scrollback);
     pane.surface.image_store.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
     term.screen.kitty_images.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
     term.screen.bracketed_paste = self.config.bracketed_paste;
@@ -886,7 +892,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         // Behavior.
         screen.bracketed_paste = self.config.bracketed_paste;
         screen.modify_other_keys = self.config.modify_other_keys;
-        screen.scrollback_capacity = s.scrollback;
+        applyScrollbackCapacity(screen, s.scrollback);
         screen.scroll_on_output = self.config.scroll_on_output;
         screen.word_chars = self.config.word_chars;
         if (p.input_ctx) |ictx| {

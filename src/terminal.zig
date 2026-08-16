@@ -1579,7 +1579,8 @@ pub const Terminal = struct {
     fn applyRemoteSnapshot(self: *Terminal, payload: []const u8) !void {
         const envelope = try mux_snapshot.peelEnvelope(payload);
         const fresh = try mux_snapshot.restore(self.allocator, &self.pool, envelope.body);
-        fresh.scrollback_capacity = self.screen.scrollback_capacity;
+        errdefer fresh.deinit();
+        try fresh.setScrollbackCapacity(self.screen.scrollback_capacity);
         fresh.word_chars = self.screen.word_chars;
         fresh.cell_pixel_w = self.screen.cell_pixel_w;
         fresh.cell_pixel_h = self.screen.cell_pixel_h;

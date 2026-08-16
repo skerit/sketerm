@@ -1518,6 +1518,7 @@ pub const Screen = struct {
     /// happened (pre-cap fill).
     pub fn pushScrollbackTakeOld(self: *Screen, cells: []Cell, line_id: u64, continues_above: bool) ?[]Cell {
         const cap = self.scrollback_capacity;
+        if (cap == 0) return cells;
         if (self.scrollback.items.len < cap) {
             // Pre-allocate the full ring on first push to avoid the
             // growth-realloc chain (~14 grows from empty to 10k).
@@ -1543,6 +1544,53 @@ pub const Screen = struct {
     fn pushScrollback(self: *Screen, cells: []Cell, line_id: u64, continues_above: bool) void {
         if (self.pushScrollbackTakeOld(cells, line_id, continues_above)) |old_cells| {
             self.allocator.free(old_cells);
+        }
+    }
+
+    /// Changes the scrollback limit while retaining the newest lines in logical order.
+    pub fn setScrollbackCapacity(self: *Screen, capacity: usize) !void {
+        const len = self.scrollback.items.len;
+        const keep = @min(len, capacity);
+
+        if (capacity == self.scrollback_capacity and len <= capacity) return;
+        if (self.scrollback_head == 0 and keep == len) {
+            self.scrollback_capacity = capacity;
+            return;
+        }
+
+        if (keep == 0) {
+            for (self.scrollback.items) |*ln| ln.deinit(self.allocator);
+            self.scrollback.clearRetainingCapacity();
+            self.scrollback_head = 0;
+            self.scrollback_capacity = capacity;
+            self.view_offset = 0;
+            if (len > 0) self.dirty = true;
+            return;
+        }
+
+        var replacement: std.ArrayList(Line) = .empty;
+        errdefer replacement.deinit(self.allocator);
+        try replacement.ensureTotalCapacity(self.allocator, keep);
+
+        const first_kept = len - keep;
+        var i: usize = 0;
+        while (i < keep) : (i += 1) {
+            const old_index = (self.scrollback_head + first_kept + i) % len;
+            replacement.appendAssumeCapacity(self.scrollback.items[old_index]);
+        }
+
+        i = 0;
+        while (i < first_kept) : (i += 1) {
+            const old_index = (self.scrollback_head + i) % len;
+            self.scrollback.items[old_index].deinit(self.allocator);
+        }
+        self.scrollback.deinit(self.allocator);
+        self.scrollback = replacement;
+        self.scrollback_head = 0;
+        self.scrollback_capacity = capacity;
+        if (keep < len) {
+            self.view_offset = @min(self.view_offset, @as(u32, @intCast(keep)));
+            self.dirty = true;
         }
     }
 
@@ -4314,6 +4362,20 @@ fn asciiCaseEq(haystack: []const u8, needle_lower: []const u8) bool {
 
 // ── Tests ────────────────────────────────────────────────────────
 
+fn pushScrollbackRune(screen: *Screen, rune: u32) !void {
+    const cells = try screen.allocator.alloc(Cell, screen.cols);
+    @memset(cells, .{});
+    cells[0].rune = rune;
+    screen.pushScrollback(cells, screen.nextLineId(), false);
+}
+
+fn expectScrollbackRunes(screen: *const Screen, expected: []const u8) !void {
+    try std.testing.expectEqual(@as(u32, @intCast(expected.len)), screen.scrollbackCount());
+    for (expected, 0..) |rune, i| {
+        try std.testing.expectEqual(@as(u32, rune), screen.scrollbackLine(@intCast(i)).cells[0].rune);
+    }
+}
+
 test "init / blank cells" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
@@ -4448,7 +4510,7 @@ test "column resize in alt screen normalizes main scrollback width" {
     defer pool.deinit();
     var s = try Screen.init(std.testing.allocator, &pool, 5, 3);
     defer s.deinit();
-    s.scrollback_capacity = 2;
+    try s.setScrollbackCapacity(2);
     // Fill the ring so its buffers will be recycled on the next scroll.
     s.printCp('a');
     s.execute('\r');
@@ -4488,6 +4550,98 @@ test "scroll up moves content" {
     try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 0).rune);
     try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(1, 0).rune);
     try std.testing.expectEqual(@as(u32, 0), s.cellAt(2, 0).rune);
+}
+
+test "zero-capacity first scroll keeps no history and reuses the row" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 3, 2);
+    defer s.deinit();
+    try s.setScrollbackCapacity(0);
+
+    s.active[0].cells[0].rune = 'x';
+    const top_cells = s.active[0].cells.ptr;
+    s.scrollUp(1);
+
+    try std.testing.expectEqual(@as(u32, 0), s.scrollbackCount());
+    try std.testing.expectEqual(@as(usize, 0), s.scrollback_head);
+    try std.testing.expectEqual(top_cells, s.active[1].cells.ptr);
+    try std.testing.expectEqual(@as(u32, 0), s.active[1].cells[0].rune);
+}
+
+test "scrollback capacity grow then shrink keeps newest lines" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 3, 2);
+    defer s.deinit();
+    try s.setScrollbackCapacity(2);
+    try pushScrollbackRune(s, 'a');
+    try pushScrollbackRune(s, 'b');
+
+    try s.setScrollbackCapacity(4);
+    try pushScrollbackRune(s, 'c');
+    try pushScrollbackRune(s, 'd');
+    try expectScrollbackRunes(s, "abcd");
+
+    try s.setScrollbackCapacity(3);
+    try expectScrollbackRunes(s, "bcd");
+    try std.testing.expectEqual(@as(usize, 0), s.scrollback_head);
+}
+
+test "scrollback capacity shrink after wrap preserves logical order" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 3, 2);
+    defer s.deinit();
+    try s.setScrollbackCapacity(3);
+    for ("abcde") |rune| try pushScrollbackRune(s, rune);
+    try std.testing.expect(s.scrollback_head != 0);
+    try expectScrollbackRunes(s, "cde");
+
+    try s.setScrollbackCapacity(2);
+    try expectScrollbackRunes(s, "de");
+    try std.testing.expectEqual(@as(usize, 0), s.scrollback_head);
+}
+
+test "scrollback capacity shrink to zero frees all rows" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 3, 2);
+    defer s.deinit();
+    try s.setScrollbackCapacity(3);
+    for ("abc") |rune| try pushScrollbackRune(s, rune);
+    s.view_offset = 3;
+    s.dirty = false;
+
+    try s.setScrollbackCapacity(0);
+    try std.testing.expectEqual(@as(u32, 0), s.scrollbackCount());
+    try std.testing.expectEqual(@as(usize, 0), s.scrollback_head);
+    try std.testing.expectEqual(@as(usize, 0), s.scrollback_capacity);
+    try std.testing.expectEqual(@as(u32, 0), s.view_offset);
+    try std.testing.expect(s.dirty);
+}
+
+test "scrollback capacity allocation failure leaves wrapped ring unchanged" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 3, 2);
+    defer s.deinit();
+    try s.setScrollbackCapacity(3);
+    for ("abcde") |rune| try pushScrollbackRune(s, rune);
+    const old_head = s.scrollback_head;
+    const old_capacity = s.scrollback_capacity;
+    s.view_offset = 2;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    const old_allocator = s.allocator;
+    s.allocator = failing.allocator();
+    defer s.allocator = old_allocator;
+    try std.testing.expectError(error.OutOfMemory, s.setScrollbackCapacity(2));
+
+    try std.testing.expectEqual(old_capacity, s.scrollback_capacity);
+    try std.testing.expectEqual(old_head, s.scrollback_head);
+    try std.testing.expectEqual(@as(u32, 2), s.view_offset);
+    try expectScrollbackRunes(s, "cde");
 }
 
 test "decstbm scroll region" {
@@ -4722,7 +4876,7 @@ test "ED 3 resets scrollback_head so eviction order survives a clear" {
     defer pool.deinit();
     var s = try Screen.init(std.testing.allocator, &pool, 3, 2);
     defer s.deinit();
-    s.scrollback_capacity = 3; // tiny ring so we wrap quickly
+    try s.setScrollbackCapacity(3); // tiny ring so we wrap quickly
     // Fill the ring + wrap a few times to advance scrollback_head.
     inline for (0..6) |_| {
         s.printCp('x');
@@ -7572,7 +7726,7 @@ test "imageRowForAnchor tracks a line through scroll, scrollback and eviction" {
     defer pool.deinit();
     var s = try Screen.init(std.testing.allocator, &pool, 8, 5);
     defer s.deinit();
-    s.scrollback_capacity = 50;
+    try s.setScrollbackCapacity(50);
 
     // Anchor to the line currently at row 2 (id assigned at init).
     const id = s.buf()[2].id;
