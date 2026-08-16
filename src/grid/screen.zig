@@ -1510,40 +1510,59 @@ pub const Screen = struct {
         ln.dirty = true;
     }
 
-    /// Push a line into scrollback. Caller transfers ownership of
-    /// the cells slice. When at capacity, the evicted oldest cells
-    /// buffer is RETURNED rather than freed — caller can reuse it as
-    /// the new bottom-row cells (one alloc + one free saved per
-    /// scroll on the hot path). Returns null when no eviction
-    /// happened (pre-cap fill).
-    pub fn pushScrollbackTakeOld(self: *Screen, cells: []Cell, line_id: u64, continues_above: bool) ?[]Cell {
+    pub const ScrollbackPush = union(enum) {
+        /// Scrollback took ownership without returning a buffer.
+        retained,
+        /// The caller owns this buffer after the transfer.
+        caller_owned: []Cell,
+    };
+
+    /// Reserves every append needed for an allocation-free batch of scrollback transfers.
+    pub fn reserveScrollbackPushes(self: *Screen, count: usize) !void {
         const cap = self.scrollback_capacity;
-        if (cap == 0) return cells;
-        if (self.scrollback.items.len < cap) {
-            // Pre-allocate the full ring on first push to avoid the
-            // growth-realloc chain (~14 grows from empty to 10k).
-            if (self.scrollback.capacity == 0 and cap > 0) {
-                self.scrollback.ensureTotalCapacity(self.allocator, cap) catch {
-                    // Fall back to incremental growth.
-                };
-            }
-            self.scrollback.append(self.allocator, .{ .cells = cells, .id = line_id, .continues_above = continues_above }) catch {
-                self.allocator.free(cells);
+        const len = self.scrollback.items.len;
+        if (count == 0 or cap == 0 or len >= cap) return;
+        const needed = len + @min(count, cap - len);
+        if (self.scrollback.capacity >= needed) return;
+
+        // Pre-allocate the full ring on first push to avoid the
+        // growth-realloc chain (~14 grows from empty to 10k). A small
+        // reserve may still succeed if the full-ring request cannot.
+        if (self.scrollback.capacity == 0 and needed < cap) {
+            self.scrollback.ensureTotalCapacity(self.allocator, cap) catch {
+                try self.scrollback.ensureTotalCapacity(self.allocator, needed);
             };
-            return null;
+        } else {
+            try self.scrollback.ensureTotalCapacity(self.allocator, needed);
+        }
+    }
+
+    /// Transfers a line after reservation and returns any buffer that remains caller-owned.
+    pub fn pushScrollbackTakeOld(self: *Screen, cells: []Cell, line_id: u64, continues_above: bool) ScrollbackPush {
+        const cap = self.scrollback_capacity;
+        if (cap == 0) return .{ .caller_owned = cells };
+        if (self.scrollback.items.len < cap) {
+            std.debug.assert(self.scrollback.capacity > self.scrollback.items.len);
+            self.scrollback.appendAssumeCapacity(.{ .cells = cells, .id = line_id, .continues_above = continues_above });
+            return .retained;
         }
         const head = self.scrollback_head;
         const old_cells = self.scrollback.items[head].cells;
         self.scrollback.items[head] = .{ .cells = cells, .id = line_id, .continues_above = continues_above };
         self.scrollback_head = (head + 1) % cap;
-        return old_cells;
+        return .{ .caller_owned = old_cells };
     }
 
     /// Push helper that frees the evicted cells. Used when the caller
     /// can't reuse the buffer (e.g. width changed during reflow).
     fn pushScrollback(self: *Screen, cells: []Cell, line_id: u64, continues_above: bool) void {
-        if (self.pushScrollbackTakeOld(cells, line_id, continues_above)) |old_cells| {
-            self.allocator.free(old_cells);
+        self.reserveScrollbackPushes(1) catch {
+            self.allocator.free(cells);
+            return;
+        };
+        switch (self.pushScrollbackTakeOld(cells, line_id, continues_above)) {
+            .retained => {},
+            .caller_owned => |old_cells| self.allocator.free(old_cells),
         }
     }
 
@@ -4362,6 +4381,215 @@ fn asciiCaseEq(haystack: []const u8, needle_lower: []const u8) bool {
 
 // ── Tests ────────────────────────────────────────────────────────
 
+const ScrollFailureScenario = enum {
+    pre_capacity,
+    full_ring,
+    partial_region,
+    whole_region,
+};
+
+const ScrollLineState = struct {
+    cells_ptr: usize,
+    cells_hash: u64,
+    dirty: bool,
+    continues_above: bool,
+    id: u64,
+    scaling: u8,
+
+    fn capture(line: Line) ScrollLineState {
+        var hash = std.hash.Wyhash.init(0);
+        hash.update(std.mem.sliceAsBytes(line.cells));
+        return .{
+            .cells_ptr = @intFromPtr(line.cells.ptr),
+            .cells_hash = hash.final(),
+            .dirty = line.dirty,
+            .continues_above = line.continues_above,
+            .id = line.id,
+            .scaling = @intFromEnum(line.scaling),
+        };
+    }
+
+    fn expectEqual(expected: ScrollLineState, line: Line) !void {
+        try std.testing.expectEqual(expected.cells_ptr, @intFromPtr(line.cells.ptr));
+        try std.testing.expectEqual(expected.cells_hash, capture(line).cells_hash);
+        try std.testing.expectEqual(expected.dirty, line.dirty);
+        try std.testing.expectEqual(expected.continues_above, line.continues_above);
+        try std.testing.expectEqual(expected.id, line.id);
+        try std.testing.expectEqual(expected.scaling, @intFromEnum(line.scaling));
+    }
+};
+
+const ScrollState = struct {
+    const max_lines = 32;
+
+    active: [max_lines]ScrollLineState = undefined,
+    active_len: usize,
+    scrollback: [max_lines]ScrollLineState = undefined,
+    scrollback_len: usize,
+    scrollback_head: usize,
+    next_line_id: u64,
+    view_offset: u32,
+    cluster_len: usize,
+    link_count: usize,
+
+    fn capture(screen: *Screen) ScrollState {
+        std.debug.assert(screen.active.len <= max_lines);
+        std.debug.assert(screen.scrollback.items.len <= max_lines);
+        var state = ScrollState{
+            .active_len = screen.active.len,
+            .scrollback_len = screen.scrollback.items.len,
+            .scrollback_head = screen.scrollback_head,
+            .next_line_id = screen.next_line_id,
+            .view_offset = screen.view_offset,
+            .cluster_len = screen.clusterAt(2, 1).len,
+            .link_count = screen.links.count(),
+        };
+        for (screen.active, 0..) |line, i| state.active[i] = ScrollLineState.capture(line);
+        for (screen.scrollback.items, 0..) |line, i| state.scrollback[i] = ScrollLineState.capture(line);
+        return state;
+    }
+
+    fn expectUnchanged(expected: ScrollState, screen: *Screen) !void {
+        try std.testing.expectEqual(expected.active_len, screen.active.len);
+        try std.testing.expectEqual(expected.scrollback_len, screen.scrollback.items.len);
+        try std.testing.expectEqual(expected.scrollback_head, screen.scrollback_head);
+        try std.testing.expectEqual(expected.next_line_id, screen.next_line_id);
+        try std.testing.expectEqual(expected.view_offset, screen.view_offset);
+        try std.testing.expectEqual(expected.cluster_len, screen.clusterAt(2, 1).len);
+        try std.testing.expectEqual(expected.link_count, screen.links.count());
+        for (screen.active, 0..) |line, i| try expected.active[i].expectEqual(line);
+        for (screen.scrollback.items, 0..) |line, i| try expected.scrollback[i].expectEqual(line);
+    }
+};
+
+fn scrollScenarioRows(scenario: ScrollFailureScenario) u16 {
+    return switch (scenario) {
+        .pre_capacity => 4,
+        .full_ring, .partial_region => 12,
+        .whole_region => 10,
+    };
+}
+
+fn scrollScenarioMove(scenario: ScrollFailureScenario) u16 {
+    return switch (scenario) {
+        .pre_capacity => 2,
+        .full_ring, .partial_region => 9,
+        .whole_region => 10,
+    };
+}
+
+fn prepareScrollFailureScreen(screen: *Screen, scenario: ScrollFailureScenario) !void {
+    const capacity: usize = switch (scenario) {
+        .pre_capacity, .partial_region => 8,
+        .full_ring => 3,
+        .whole_region => 20,
+    };
+    try screen.setScrollbackCapacity(capacity);
+
+    for (screen.active, 0..) |*line, i| {
+        line.cells[0].rune = @as(u32, 'A') + @as(u32, @intCast(i));
+        line.cells[1].rune = @as(u32, 'a') + @as(u32, @intCast(i));
+        line.dirty = i % 2 == 0;
+        line.continues_above = i % 3 == 1;
+        line.scaling = if (i % 2 == 0) .dwl else .single;
+    }
+    screen.appendCluster(2, 1, 0x0301);
+    const uri = try screen.allocator.dupe(u8, "https://scroll.test");
+    errdefer screen.allocator.free(uri);
+    try screen.links.put(1, uri);
+    screen.active[2].cells[0].flags |= 0b0000_0100;
+    screen.active[2].cells[0].reserved = 1;
+
+    if (scenario == .full_ring) {
+        for ("abcde") |rune| try pushScrollbackRune(screen, rune);
+        screen.view_offset = 2;
+    } else if (scenario == .partial_region) {
+        screen.scroll_top = 1;
+        screen.scroll_bot = screen.rows - 1;
+    }
+}
+
+fn expectScreenBuffersUnique(screen: *Screen) !void {
+    for (screen.active, 0..) |line, i| {
+        try std.testing.expectEqual(@as(usize, screen.cols), line.cells.len);
+        for (screen.active[i + 1 ..]) |other| try std.testing.expect(line.cells.ptr != other.cells.ptr);
+        for (screen.scrollback.items) |other| try std.testing.expect(line.cells.ptr != other.cells.ptr);
+    }
+    for (screen.scrollback.items, 0..) |line, i| {
+        try std.testing.expectEqual(@as(usize, screen.cols), line.cells.len);
+        for (screen.scrollback.items[i + 1 ..]) |other| try std.testing.expect(line.cells.ptr != other.cells.ptr);
+    }
+}
+
+fn expectScreenRenderable(screen: *Screen) !void {
+    try expectScreenBuffersUnique(screen);
+    _ = screen.contentHash();
+    screen.view_offset = @min(screen.scrollbackCount(), @as(u32, screen.rows));
+    const rendered = try screen.extractScreen(std.testing.allocator);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expect(rendered.len > 0);
+}
+
+fn expectSuccessfulScroll(screen: *Screen, scenario: ScrollFailureScenario) !void {
+    try std.testing.expectEqual(@as(usize, 0), screen.clusters.count());
+    try std.testing.expectEqual(@as(usize, 1), screen.links.count());
+    switch (scenario) {
+        .pre_capacity => {
+            try expectScrollbackRunes(screen, "AB");
+            try std.testing.expectEqual(@as(u32, 'C'), screen.active[0].cells[0].rune);
+        },
+        .full_ring => {
+            try expectScrollbackRunes(screen, "GHI");
+            try std.testing.expectEqual(@as(u32, 'J'), screen.active[0].cells[0].rune);
+        },
+        .partial_region => {
+            try std.testing.expectEqual(@as(u32, 0), screen.scrollbackCount());
+            try std.testing.expectEqual(@as(u32, 'A'), screen.active[0].cells[0].rune);
+            try std.testing.expectEqual(@as(u32, 'K'), screen.active[1].cells[0].rune);
+        },
+        .whole_region => {
+            try expectScrollbackRunes(screen, "ABCDEFGHIJ");
+            for (screen.active) |line| try std.testing.expectEqual(@as(u32, 0), line.cells[0].rune);
+        },
+    }
+}
+
+fn runScrollFailureScenario(scenario: ScrollFailureScenario, fail_index: ?usize) !usize {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var screen = try Screen.init(std.testing.allocator, &pool, 3, scrollScenarioRows(scenario));
+    defer screen.deinit();
+    try prepareScrollFailureScreen(screen, scenario);
+    const before = ScrollState.capture(screen);
+
+    var config: std.testing.FailingAllocator.Config = .{};
+    if (fail_index) |index| config.fail_index = index;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, config);
+    const old_allocator = screen.allocator;
+    screen.allocator = failing.allocator();
+    screen.scrollUp(scrollScenarioMove(scenario));
+    screen.allocator = old_allocator;
+
+    if (fail_index != null) {
+        try std.testing.expect(failing.has_induced_failure);
+        try before.expectUnchanged(screen);
+    } else {
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(before.next_line_id + scrollScenarioMove(scenario), screen.next_line_id);
+        try expectSuccessfulScroll(screen, scenario);
+    }
+    try expectScreenRenderable(screen);
+    return failing.alloc_index;
+}
+
+fn expectAllScrollAllocationFailures(scenario: ScrollFailureScenario, expected_allocations: usize) !void {
+    const allocations = try runScrollFailureScenario(scenario, null);
+    try std.testing.expectEqual(expected_allocations, allocations);
+    for (0..allocations) |fail_index| {
+        _ = try runScrollFailureScenario(scenario, fail_index);
+    }
+}
+
 fn pushScrollbackRune(screen: *Screen, rune: u32) !void {
     const cells = try screen.allocator.alloc(Cell, screen.cols);
     @memset(cells, .{});
@@ -4567,6 +4795,22 @@ test "zero-capacity first scroll keeps no history and reuses the row" {
     try std.testing.expectEqual(@as(usize, 0), s.scrollback_head);
     try std.testing.expectEqual(top_cells, s.active[1].cells.ptr);
     try std.testing.expectEqual(@as(u32, 0), s.active[1].cells[0].rune);
+}
+
+test "scroll up pre-capacity allocation failures preserve ownership" {
+    try expectAllScrollAllocationFailures(.pre_capacity, 3);
+}
+
+test "scroll up full-ring allocation failure preserves ownership" {
+    try expectAllScrollAllocationFailures(.full_ring, 1);
+}
+
+test "scroll up partial-region allocation failure preserves ownership" {
+    try expectAllScrollAllocationFailures(.partial_region, 1);
+}
+
+test "scroll up whole-region allocation failures preserve ownership" {
+    try expectAllScrollAllocationFailures(.whole_region, 12);
 }
 
 test "scrollback capacity grow then shrink keeps newest lines" {

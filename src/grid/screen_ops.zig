@@ -817,7 +817,6 @@ pub fn eraseLine(self: *Screen, mode: u32) void {
 // ── Scroll ───────────────────────────────────────────────────
 
 pub fn scrollUp(self: *Screen, n: u32) void {
-    self.clearAllClusters();
     if (self.scroll_top >= self.scroll_bot) return;
     const region: u16 = self.scroll_bot - self.scroll_top + 1;
     const move: u16 = @intCast(@min(n, @as(u32, region)));
@@ -825,60 +824,62 @@ pub fn scrollUp(self: *Screen, n: u32) void {
 
     const push_to_sb = !self.use_alt and self.scroll_top == 0;
 
-    if (move < region) {
-        // Stash cells, ids, AND continues_above of the rows about
-        // to scroll out — they belong to the content, not the
-        // array slot. Common case is move=1; use stack scratch
-        // up to 8 to avoid the steady-state allocator hit.
-        var stash_stack: [8][]Cell = undefined;
-        var ids_stack: [8]u64 = undefined;
-        var ca_stack: [8]bool = undefined;
-        var stash_heap: ?[][]Cell = null;
-        var ids_heap: ?[]u64 = null;
-        var ca_heap: ?[]bool = null;
-        defer if (stash_heap) |h| self.allocator.free(h);
-        defer if (ids_heap) |h| self.allocator.free(h);
-        defer if (ca_heap) |h| self.allocator.free(h);
-        const stash: [][]Cell = if (move <= stash_stack.len) stash_stack[0..move] else blk: {
-            const h = self.allocator.alloc([]Cell, move) catch return;
-            stash_heap = h;
-            break :blk h;
+    const Plan = struct {
+        cells: []Cell,
+        id: u64,
+        continues_above: bool,
+        replacement: ?[]Cell = null,
+    };
+    var plan_stack: [8]Plan = undefined;
+    var plan_heap: ?[]Plan = null;
+    defer if (plan_heap) |h| self.allocator.free(h);
+    const plan: []Plan = if (move <= plan_stack.len) plan_stack[0..move] else blk: {
+        const h = self.allocator.alloc(Plan, move) catch return;
+        plan_heap = h;
+        break :blk h;
+    };
+    var k: u16 = 0;
+    while (k < move) : (k += 1) {
+        const src = lines[self.scroll_top + k];
+        plan[k] = .{
+            .cells = src.cells,
+            .id = src.id,
+            .continues_above = src.continues_above,
         };
-        const stash_ids: []u64 = if (move <= ids_stack.len) ids_stack[0..move] else blk: {
-            const h = self.allocator.alloc(u64, move) catch return;
-            ids_heap = h;
-            break :blk h;
-        };
-        const stash_ca: []bool = if (move <= ca_stack.len) ca_stack[0..move] else blk: {
-            const h = self.allocator.alloc(bool, move) catch return;
-            ca_heap = h;
-            break :blk h;
-        };
-        var i: u16 = 0;
-        while (i < move) : (i += 1) {
-            stash[i] = lines[self.scroll_top + i].cells;
-            stash_ids[i] = lines[self.scroll_top + i].id;
-            stash_ca[i] = lines[self.scroll_top + i].continues_above;
-        }
+    }
+    defer for (plan) |p| {
+        if (p.replacement) |cells| self.allocator.free(cells);
+    };
 
-        if (push_to_sb) {
-            // Hand the top-row cells DIRECTLY to scrollback (no
-            // dupe). When the ring is full, the evicted oldest
-            // cells come back — reuse them as the new bottom-row
-            // buffer. Net 0 allocations per scroll in steady state.
-            var k: u16 = 0;
-            while (k < move) : (k += 1) {
-                const top_cells = stash[k];
-                if (self.pushScrollbackTakeOld(top_cells, stash_ids[k], stash_ca[k])) |reused| {
-                    stash[k] = reused;
-                } else {
-                    // Pre-cap: scrollback took ownership, alloc
-                    // fresh for the new bottom row.
-                    const new_buf = self.allocator.alloc(Cell, self.cols) catch break;
-                    stash[k] = new_buf;
-                }
+    if (push_to_sb) {
+        self.reserveScrollbackPushes(move) catch return;
+        const available = self.scrollback_capacity - self.scrollback.items.len;
+        const replacements: u16 = @intCast(@min(@as(usize, move), available));
+        k = 0;
+        while (k < replacements) : (k += 1) {
+            plan[k].replacement = self.allocator.alloc(Cell, self.cols) catch return;
+        }
+    }
+
+    // No ownership changes or side-table invalidation happen until every
+    // allocation needed by the complete scroll has succeeded.
+    self.clearAllClusters();
+
+    if (push_to_sb) {
+        k = 0;
+        while (k < move) : (k += 1) {
+            switch (self.pushScrollbackTakeOld(plan[k].cells, plan[k].id, plan[k].continues_above)) {
+                .retained => {
+                    plan[k].cells = plan[k].replacement.?;
+                    plan[k].replacement = null;
+                },
+                .caller_owned => |cells| plan[k].cells = cells,
             }
         }
+    }
+
+    if (move < region) {
+        var i: u16 = 0;
 
         // Shift cells + ids up by `move`.
         i = 0;
@@ -892,34 +893,16 @@ pub fn scrollUp(self: *Screen, n: u32) void {
         i = 0;
         while (i < move) : (i += 1) {
             const dst = self.scroll_bot - move + 1 + i;
-            lines[dst].cells = stash[i];
+            lines[dst].cells = plan[i].cells;
             @memset(lines[dst].cells, .{});
             lines[dst].continues_above = false;
             lines[dst].id = self.nextLineId();
             lines[dst].scaling = .single;
         }
     } else {
-        // Whole region scrolled; everything goes to scrollback (or
-        // is dropped, on alt screen).
-        if (push_to_sb) {
-            // Same swap-buffer trick: hand cells to scrollback,
-            // reuse evicted (or alloc fresh) for the now-blank row.
-            var k: u16 = 0;
-            while (k < region) : (k += 1) {
-                const idx = self.scroll_top + k;
-                const old_cells = lines[idx].cells;
-                const old_id = lines[idx].id;
-                const old_ca = lines[idx].continues_above;
-                if (self.pushScrollbackTakeOld(old_cells, old_id, old_ca)) |reused| {
-                    lines[idx].cells = reused;
-                } else {
-                    const new_buf = self.allocator.alloc(Cell, self.cols) catch break;
-                    lines[idx].cells = new_buf;
-                }
-            }
-        }
         var i: u16 = self.scroll_top;
         while (i <= self.scroll_bot) : (i += 1) {
+            lines[i].cells = plan[i - self.scroll_top].cells;
             @memset(lines[i].cells, .{});
             lines[i].continues_above = false;
             lines[i].id = self.nextLineId();
