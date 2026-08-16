@@ -19,7 +19,21 @@ pub const Error = error{
     Truncated,
     UnsupportedMethod,
     BadData,
+    LimitExceeded,
+    UnsafeName,
+    DuplicateName,
+    ChecksumMismatch,
     OutOfMemory,
+};
+
+pub const limits = struct {
+    pub const archive_size: usize = 64 * 1024 * 1024;
+    pub const entries: usize = 8192;
+    pub const entry_uncompressed: usize = 64 * 1024 * 1024;
+    pub const aggregate_uncompressed: usize = 256 * 1024 * 1024;
+    pub const name_length: usize = 1024;
+    pub const compression_ratio: usize = 200;
+    pub const ratio_slack: usize = 64 * 1024;
 };
 
 pub const Entry = struct {
@@ -53,109 +67,267 @@ pub const Archive = struct {
 const eocd_sig: u32 = 0x06054b50;
 const cdh_sig: u32 = 0x02014b50;
 const lfh_sig: u32 = 0x04034b50;
+const data_descriptor_flag: u16 = 1 << 3;
+const encrypted_flags: u16 = (1 << 0) | (1 << 6) | (1 << 13);
 
-/// Decode `bytes` (a whole archive) into an owned `Archive`. Every
-/// entry's data is decompressed eagerly — extension bundles are small,
-/// and a caller that streamed would have to hold the archive anyway.
+const Pending = struct {
+    name: []const u8,
+    comp: []const u8 = &.{},
+    comp_size: usize,
+    uncomp_size: usize,
+    lfh_off: usize,
+    crc: u32,
+    flags: u16,
+    method: u16,
+    is_dir: bool,
+};
+
+/// Decode a bounded, single-disk ZIP archive into owned entries.
 pub fn read(gpa: std.mem.Allocator, bytes: []const u8) Error!Archive {
-    const eocd = findEocd(bytes) orelse return error.NotZip;
-    const total = readU16(bytes, eocd + 10) orelse return error.Truncated;
-    var cd_off = readU32(bytes, eocd + 16) orelse return error.Truncated;
+    if (bytes.len > limits.archive_size) return error.LimitExceeded;
 
-    var list = std.ArrayList(Entry).empty;
-    errdefer {
-        for (list.items) |e| gpa.free(e.data);
-        list.deinit(gpa);
-    }
+    const eocd_off = try findEocd(bytes);
+    const eocd = try range(bytes, eocd_off, 22, bytes.len);
+    const disk = le16(eocd, 4);
+    const cd_disk = le16(eocd, 6);
+    const disk_entries = le16(eocd, 8);
+    const total_u16 = le16(eocd, 10);
+    const cd_size_u32 = le32(eocd, 12);
+    const cd_off_u32 = le32(eocd, 16);
+    if (disk != 0 or cd_disk != 0 or disk_entries != total_u16) return error.BadData;
+    if (total_u16 == std.math.maxInt(u16) or
+        cd_size_u32 == std.math.maxInt(u32) or
+        cd_off_u32 == std.math.maxInt(u32)) return error.BadData;
 
-    var i: usize = 0;
-    while (i < total) : (i += 1) {
-        if (readU32(bytes, cd_off) != cdh_sig) return error.BadData;
-        const method = readU16(bytes, cd_off + 10) orelse return error.Truncated;
-        const comp_size = readU32(bytes, cd_off + 20) orelse return error.Truncated;
-        const uncomp_size = readU32(bytes, cd_off + 24) orelse return error.Truncated;
-        const name_len = readU16(bytes, cd_off + 28) orelse return error.Truncated;
-        const extra_len = readU16(bytes, cd_off + 30) orelse return error.Truncated;
-        const comment_len = readU16(bytes, cd_off + 32) orelse return error.Truncated;
-        const lfh_off = readU32(bytes, cd_off + 42) orelse return error.Truncated;
-        const name_start = cd_off + 46;
-        if (name_start + name_len > bytes.len) return error.Truncated;
-        const name = bytes[name_start .. name_start + name_len];
+    const total: usize = total_u16;
+    if (total > limits.entries) return error.LimitExceeded;
+    const cd_size = toUsize(cd_size_u32) orelse return error.BadData;
+    const cd_start = toUsize(cd_off_u32) orelse return error.BadData;
+    _ = try range(bytes, cd_start, cd_size, eocd_off);
+    const cd_end = std.math.add(usize, cd_start, cd_size) catch return error.BadData;
 
-        const data = try extractLocal(gpa, bytes, lfh_off, method, comp_size, uncomp_size);
-        try list.append(gpa, .{
+    var pending = std.ArrayList(Pending).empty;
+    defer pending.deinit(gpa);
+    pending.ensureTotalCapacity(gpa, total) catch return error.OutOfMemory;
+
+    var names: std.StringHashMapUnmanaged(void) = .empty;
+    defer names.deinit(gpa);
+
+    var aggregate: usize = 0;
+    var cd_cursor = cd_start;
+    for (0..total) |_| {
+        const header = try consume(bytes, &cd_cursor, 46, cd_end);
+        if (le32(header, 0) != cdh_sig) return error.BadData;
+        const flags = le16(header, 8);
+        const method = le16(header, 10);
+        const crc = le32(header, 16);
+        const comp_u32 = le32(header, 20);
+        const uncomp_u32 = le32(header, 24);
+        const name_len: usize = le16(header, 28);
+        const extra_len: usize = le16(header, 30);
+        const comment_len: usize = le16(header, 32);
+        const disk_start = le16(header, 34);
+        const lfh_u32 = le32(header, 42);
+
+        if (flags & encrypted_flags != 0 or disk_start != 0) return error.BadData;
+        if (method != 0 and method != 8) return error.UnsupportedMethod;
+        if (comp_u32 == std.math.maxInt(u32) or
+            uncomp_u32 == std.math.maxInt(u32) or
+            lfh_u32 == std.math.maxInt(u32)) return error.BadData;
+        if (name_len > limits.name_length) return error.LimitExceeded;
+
+        const name = try consume(bytes, &cd_cursor, name_len, cd_end);
+        _ = try consume(bytes, &cd_cursor, extra_len, cd_end);
+        _ = try consume(bytes, &cd_cursor, comment_len, cd_end);
+        const is_dir = try validateName(name);
+        if (names.contains(name)) return error.DuplicateName;
+        names.put(gpa, name, {}) catch return error.OutOfMemory;
+
+        const comp_size = toUsize(comp_u32) orelse return error.BadData;
+        const uncomp_size = toUsize(uncomp_u32) orelse return error.BadData;
+        if (uncomp_size > limits.entry_uncompressed) return error.LimitExceeded;
+        aggregate = std.math.add(usize, aggregate, uncomp_size) catch return error.LimitExceeded;
+        if (aggregate > limits.aggregate_uncompressed) return error.LimitExceeded;
+        if (is_dir and uncomp_size != 0) return error.BadData;
+
+        pending.appendAssumeCapacity(.{
             .name = name,
-            .data = data,
-            .is_dir = name.len > 0 and name[name.len - 1] == '/',
+            .comp_size = comp_size,
+            .uncomp_size = uncomp_size,
+            .lfh_off = toUsize(lfh_u32) orelse return error.BadData,
+            .crc = crc,
+            .flags = flags,
+            .method = method,
+            .is_dir = is_dir,
         });
+    }
+    if (cd_cursor != cd_end) return error.BadData;
 
-        cd_off = name_start + name_len + extra_len + comment_len;
-        if (cd_off > bytes.len) return error.Truncated;
+    for (pending.items) |*entry| {
+        try validateSizes(entry.method, entry.comp_size, entry.uncomp_size);
+        entry.comp = try localData(bytes, cd_start, entry);
     }
 
-    return .{ .entries = try list.toOwnedSlice(gpa), .gpa = gpa };
+    const entries = gpa.alloc(Entry, pending.items.len) catch return error.OutOfMemory;
+    var initialized: usize = 0;
+    errdefer {
+        for (entries[0..initialized]) |entry| gpa.free(entry.data);
+        gpa.free(entries);
+    }
+    for (pending.items) |entry| {
+        const data = try extract(gpa, entry.comp, entry.method, entry.uncomp_size, entry.crc);
+        entries[initialized] = .{ .name = entry.name, .data = data, .is_dir = entry.is_dir };
+        initialized += 1;
+    }
+    return .{ .entries = entries, .gpa = gpa };
 }
 
-/// Extract one entry's bytes given its LOCAL file header offset (the
-/// central directory's sizes are authoritative; the local header's may
-/// be zero when a data descriptor trails).
-fn extractLocal(
-    gpa: std.mem.Allocator,
+fn localData(
     bytes: []const u8,
-    lfh_off: u32,
-    method: u16,
-    comp_size: u32,
-    uncomp_size: u32,
-) Error![]u8 {
-    if (readU32(bytes, lfh_off) != lfh_sig) return error.BadData;
-    const name_len = readU16(bytes, lfh_off + 26) orelse return error.Truncated;
-    const extra_len = readU16(bytes, lfh_off + 28) orelse return error.Truncated;
-    const data_off = lfh_off + 30 + name_len + extra_len;
-    if (data_off + comp_size > bytes.len) return error.Truncated;
-    const comp = bytes[data_off .. data_off + comp_size];
+    cd_start: usize,
+    entry: *const Pending,
+) Error![]const u8 {
+    var cursor = entry.lfh_off;
+    const header = try consume(bytes, &cursor, 30, cd_start);
+    if (le32(header, 0) != lfh_sig) return error.BadData;
+    const flags = le16(header, 6);
+    const method = le16(header, 8);
+    const crc = le32(header, 14);
+    const comp_size = le32(header, 18);
+    const uncomp_size = le32(header, 22);
+    const name_len: usize = le16(header, 26);
+    const extra_len: usize = le16(header, 28);
+    if (flags != entry.flags or method != entry.method) return error.BadData;
+    if (name_len > limits.name_length) return error.LimitExceeded;
 
-    switch (method) {
-        0 => {
-            // STORE: comp_size must equal uncomp_size.
-            if (comp_size != uncomp_size) return error.BadData;
-            return gpa.dupe(u8, comp) catch return error.OutOfMemory;
-        },
-        8 => {
+    const name = try consume(bytes, &cursor, name_len, cd_start);
+    if (!std.mem.eql(u8, name, entry.name)) return error.BadData;
+    _ = try consume(bytes, &cursor, extra_len, cd_start);
+
+    const local_comp_size = toUsize(comp_size) orelse return error.BadData;
+    const local_uncomp_size = toUsize(uncomp_size) orelse return error.BadData;
+
+    if (flags & data_descriptor_flag == 0) {
+        if (crc != entry.crc or local_comp_size != entry.comp_size or local_uncomp_size != entry.uncomp_size)
+            return error.BadData;
+    } else {
+        if ((crc != 0 and crc != entry.crc) or
+            (local_comp_size != 0 and local_comp_size != entry.comp_size) or
+            (local_uncomp_size != 0 and local_uncomp_size != entry.uncomp_size)) return error.BadData;
+    }
+    return consume(bytes, &cursor, entry.comp_size, cd_start);
+}
+
+fn extract(
+    gpa: std.mem.Allocator,
+    comp: []const u8,
+    method: u16,
+    uncomp_size: usize,
+    expected_crc: u32,
+) Error![]u8 {
+    const out = switch (method) {
+        0 => gpa.dupe(u8, comp) catch return error.OutOfMemory,
+        8 => blk: {
             const out = gpa.alloc(u8, uncomp_size) catch return error.OutOfMemory;
             errdefer gpa.free(out);
-            if (uncomp_size == 0) return out;
             var in = std.Io.Reader.fixed(comp);
             var window: [std.compress.flate.max_window_len]u8 = undefined;
             var d = std.compress.flate.Decompress.init(&in, .raw, &window);
             const n = d.reader.readSliceShort(out) catch return error.BadData;
             if (n != uncomp_size) return error.BadData;
-            return out;
+            var probe: [1]u8 = undefined;
+            const extra = d.reader.readSliceShort(&probe) catch return error.BadData;
+            if (extra != 0 or in.bufferedLen() != 0) return error.BadData;
+            break :blk out;
         },
         else => return error.UnsupportedMethod,
-    }
+    };
+    errdefer gpa.free(out);
+    if (std.hash.crc.Crc32.hash(out) != expected_crc) return error.ChecksumMismatch;
+    return out;
 }
 
-/// Scan backwards for the End Of Central Directory signature. The EOCD
-/// is at the very end save for an optional trailing comment (max 64KB),
-/// so a bounded backward scan finds it.
-fn findEocd(bytes: []const u8) ?usize {
-    if (bytes.len < 22) return null;
+fn validateSizes(method: u16, comp_size: usize, uncomp_size: usize) Error!void {
+    if (method == 0) {
+        if (comp_size != uncomp_size) return error.BadData;
+        return;
+    }
+    if (uncomp_size != 0 and comp_size == 0) return error.BadData;
+    var allowed = std.math.mul(usize, comp_size, limits.compression_ratio) catch std.math.maxInt(usize);
+    allowed = std.math.add(usize, allowed, limits.ratio_slack) catch std.math.maxInt(usize);
+    if (uncomp_size > allowed) return error.LimitExceeded;
+}
+
+fn validateName(name: []const u8) Error!bool {
+    if (name.len == 0 or name.len > limits.name_length) return error.UnsafeName;
+    if (name[0] == '/' or
+        std.mem.indexOfScalar(u8, name, 0) != null or
+        std.mem.indexOfScalar(u8, name, '\\') != null or
+        (name.len >= 2 and std.ascii.isAlphabetic(name[0]) and name[1] == ':'))
+        return error.UnsafeName;
+
+    const is_dir = name[name.len - 1] == '/';
+    const path = if (is_dir) name[0 .. name.len - 1] else name;
+    if (path.len == 0) return error.UnsafeName;
+    var components = std.mem.splitScalar(u8, path, '/');
+    while (components.next()) |component| {
+        if (component.len == 0 or
+            std.mem.eql(u8, component, ".") or
+            std.mem.eql(u8, component, "..")) return error.UnsafeName;
+    }
+    return is_dir;
+}
+
+/// Find an EOCD whose declared comment reaches the exact archive end.
+fn findEocd(bytes: []const u8) Error!usize {
+    if (bytes.len < 22) return error.NotZip;
     const min_from = if (bytes.len > 22 + 0xffff) bytes.len - 22 - 0xffff else 0;
     var i = bytes.len - 22;
-    while (true) : (i -= 1) {
-        if (readU32(bytes, i) == eocd_sig) return i;
-        if (i == min_from) return null;
+    var saw_signature = false;
+    while (true) {
+        if (readU32(bytes, i) == eocd_sig) {
+            saw_signature = true;
+            const candidate = try range(bytes, i, 22, bytes.len);
+            const comment_len = le16(candidate, 20);
+            if (comment_len == bytes.len - i - 22) return i;
+        }
+        if (i == min_from) break;
+        i -= 1;
     }
+    return if (saw_signature) error.BadData else error.NotZip;
 }
 
-fn readU16(bytes: []const u8, off: usize) ?u16 {
-    if (off + 2 > bytes.len) return null;
+fn range(bytes: []const u8, off: usize, len: usize, limit: usize) Error![]const u8 {
+    if (limit > bytes.len or off > limit or len > limit - off) return error.Truncated;
+    return bytes[off .. off + len];
+}
+
+fn consume(bytes: []const u8, cursor: *usize, len: usize, limit: usize) Error![]const u8 {
+    const result = try range(bytes, cursor.*, len, limit);
+    cursor.* = std.math.add(usize, cursor.*, len) catch return error.BadData;
+    return result;
+}
+
+fn toUsize(value: anytype) ?usize {
+    return std.math.cast(usize, value);
+}
+
+fn le16(bytes: []const u8, off: usize) u16 {
     return std.mem.readInt(u16, bytes[off..][0..2], .little);
 }
 
-fn readU32(bytes: []const u8, off: usize) ?u32 {
-    if (off + 4 > bytes.len) return null;
+fn le32(bytes: []const u8, off: usize) u32 {
     return std.mem.readInt(u32, bytes[off..][0..4], .little);
+}
+
+fn readU16(bytes: []const u8, off: usize) ?u16 {
+    if (off > bytes.len or bytes.len - off < 2) return null;
+    return le16(bytes, off);
+}
+
+fn readU32(bytes: []const u8, off: usize) ?u32 {
+    if (off > bytes.len or bytes.len - off < 4) return null;
+    return le32(bytes, off);
 }
 
 // ─── tests ──────────────────────────────────────────────────────────
@@ -261,6 +433,31 @@ fn putU32(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v: u32) !void {
     try out.appendSlice(gpa, &std.mem.toBytes(std.mem.nativeToLittle(u32, v)));
 }
 
+fn setU16(bytes: []u8, off: usize, value: u16) void {
+    std.mem.writeInt(u16, bytes[off..][0..2], value, .little);
+}
+
+fn setU32(bytes: []u8, off: usize, value: u32) void {
+    std.mem.writeInt(u32, bytes[off..][0..4], value, .little);
+}
+
+fn testEocdOffset(zip: []const u8) usize {
+    return zip.len - 22 - readU16(zip, zip.len - 2).?;
+}
+
+fn testCentralOffset(zip: []const u8, index: usize) usize {
+    var cursor: usize = readU32(zip, testEocdOffset(zip) + 16).?;
+    for (0..index) |_| {
+        cursor += 46 + readU16(zip, cursor + 28).? +
+            readU16(zip, cursor + 30).? + readU16(zip, cursor + 32).?;
+    }
+    return cursor;
+}
+
+fn testLocalOffset(zip: []const u8, central: usize) usize {
+    return readU32(zip, central + 42).?;
+}
+
 test "reads store and deflate entries" {
     const gpa = t.allocator;
     const long = "manifest content " ** 40; // compressible payload
@@ -268,12 +465,13 @@ test "reads store and deflate entries" {
         .{ .name = "manifest.json", .data = "{\"name\":\"x\"}", .deflate = false },
         .{ .name = "bg.js", .data = long, .deflate = true },
         .{ .name = "dir/", .data = "", .deflate = false },
+        .{ .name = "compressed-dir/", .data = "", .deflate = true },
     });
     defer gpa.free(zip);
 
     var arc = try read(gpa, zip);
     defer arc.deinit();
-    try t.expectEqual(@as(usize, 3), arc.entries.len);
+    try t.expectEqual(@as(usize, 4), arc.entries.len);
 
     const man = arc.find("manifest.json").?;
     try t.expectEqualStrings("{\"name\":\"x\"}", man.data);
@@ -285,6 +483,283 @@ test "reads store and deflate entries" {
     const dir = arc.find("dir/").?;
     try t.expect(dir.is_dir);
     try t.expectEqual(@as(usize, 0), dir.data.len);
+
+    const compressed_dir = arc.find("compressed-dir/").?;
+    try t.expect(compressed_dir.is_dir);
+    try t.expectEqual(@as(usize, 0), compressed_dir.data.len);
+}
+
+test "accepts an EOCD comment and data descriptor metadata" {
+    const gpa = t.allocator;
+    const original = try buildZip(gpa, &.{
+        .{ .name = "manifest.json", .data = "{\"name\":\"descriptor\"}", .deflate = true },
+    });
+    defer gpa.free(original);
+
+    const old_cd = testCentralOffset(original, 0);
+    const old_eocd = testEocdOffset(original);
+    const descriptor_len = 16;
+    const comment = "xpi comment";
+    const zip = try gpa.alloc(u8, original.len + descriptor_len + comment.len);
+    defer gpa.free(zip);
+    @memcpy(zip[0..old_cd], original[0..old_cd]);
+    @memcpy(zip[old_cd + descriptor_len ..][0 .. original.len - old_cd], original[old_cd..]);
+
+    const moved_cd = old_cd + descriptor_len;
+    const moved_eocd = old_eocd + descriptor_len;
+    const crc = readU32(original, old_cd + 16).?;
+    const comp_size = readU32(original, old_cd + 20).?;
+    const uncomp_size = readU32(original, old_cd + 24).?;
+    setU32(zip, old_cd, 0x08074b50);
+    setU32(zip, old_cd + 4, crc);
+    setU32(zip, old_cd + 8, comp_size);
+    setU32(zip, old_cd + 12, uncomp_size);
+    setU16(zip, 6, data_descriptor_flag);
+    setU32(zip, 14, 0);
+    setU32(zip, 18, 0);
+    setU32(zip, 22, 0);
+    setU16(zip, moved_cd + 8, data_descriptor_flag);
+    setU32(zip, moved_eocd + 16, @intCast(moved_cd));
+    setU16(zip, moved_eocd + 20, @intCast(comment.len));
+    @memcpy(zip[moved_eocd + 22 ..], comment);
+
+    var arc = try read(gpa, zip);
+    defer arc.deinit();
+    try t.expectEqualStrings("{\"name\":\"descriptor\"}", arc.find("manifest.json").?.data);
+}
+
+test "rejects entry count, output size, aggregate, and ratio bombs" {
+    const gpa = t.allocator;
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        const eocd = testEocdOffset(zip);
+        setU16(zip, eocd + 8, @intCast(limits.entries + 1));
+        setU16(zip, eocd + 10, @intCast(limits.entries + 1));
+        try t.expectError(error.LimitExceeded, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        const central = testCentralOffset(zip, 0);
+        const local = testLocalOffset(zip, central);
+        setU32(zip, central + 24, @intCast(limits.entry_uncompressed + 1));
+        setU32(zip, local + 22, @intCast(limits.entry_uncompressed + 1));
+        try t.expectError(error.LimitExceeded, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{
+            .{ .name = "a", .data = "x", .deflate = false },
+            .{ .name = "b", .data = "x", .deflate = false },
+            .{ .name = "c", .data = "x", .deflate = false },
+            .{ .name = "d", .data = "x", .deflate = false },
+            .{ .name = "e", .data = "x", .deflate = false },
+        });
+        defer gpa.free(zip);
+        for (0..5) |i| {
+            const central = testCentralOffset(zip, i);
+            const local = testLocalOffset(zip, central);
+            setU32(zip, central + 24, @intCast(limits.entry_uncompressed));
+            setU32(zip, local + 22, @intCast(limits.entry_uncompressed));
+        }
+        try t.expectError(error.LimitExceeded, read(gpa, zip));
+    }
+
+    {
+        const data = try gpa.alloc(u8, 128 * 1024);
+        defer gpa.free(data);
+        @memset(data, 'A');
+        const zip = try buildZip(gpa, &.{.{ .name = "bomb", .data = data, .deflate = true }});
+        defer gpa.free(zip);
+        try t.expectError(error.LimitExceeded, read(gpa, zip));
+    }
+}
+
+test "rejects overlong, duplicate, and unsafe names" {
+    const gpa = t.allocator;
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        setU16(zip, testCentralOffset(zip, 0) + 28, @intCast(limits.name_length + 1));
+        try t.expectError(error.LimitExceeded, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{
+            .{ .name = "manifest.json", .data = "one", .deflate = false },
+            .{ .name = "manifest.json", .data = "two", .deflate = true },
+        });
+        defer gpa.free(zip);
+        try t.expectError(error.DuplicateName, read(gpa, zip));
+    }
+
+    for ([_][]const u8{
+        "../manifest.json",
+        "dir/../manifest.json",
+        "/manifest.json",
+        "C:/manifest.json",
+        "dir\\manifest.json",
+        "./manifest.json",
+        "dir//manifest.json",
+        "\x00manifest.json",
+    }) |name| {
+        const zip = try buildZip(gpa, &.{.{ .name = name, .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        try t.expectError(error.UnsafeName, read(gpa, zip));
+    }
+}
+
+test "rejects malformed EOCD and central directory extents" {
+    const gpa = t.allocator;
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        setU16(zip, testEocdOffset(zip) + 20, 1);
+        try t.expectError(error.BadData, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        const eocd = testEocdOffset(zip);
+        setU32(zip, eocd + 12, 0x40);
+        setU32(zip, eocd + 16, 0xfffffff0);
+        try t.expectError(error.Truncated, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        setU16(zip, testCentralOffset(zip, 0) + 30, 1);
+        try t.expectError(error.Truncated, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        const eocd = testEocdOffset(zip);
+        setU32(zip, eocd + 12, 45);
+        try t.expectError(error.Truncated, read(gpa, zip));
+    }
+}
+
+test "rejects checked arithmetic and local extent overflow" {
+    const gpa = t.allocator;
+    try t.expectError(error.Truncated, range("abc", std.math.maxInt(usize) - 1, 4, 3));
+    var cursor: usize = std.math.maxInt(usize) - 1;
+    try t.expectError(error.Truncated, consume("abc", &cursor, 4, 3));
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        setU32(zip, testCentralOffset(zip, 0) + 42, 0xfffffff0);
+        try t.expectError(error.Truncated, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "contents", .deflate = true }});
+        defer gpa.free(zip);
+        const central = testCentralOffset(zip, 0);
+        const local = testLocalOffset(zip, central);
+        const too_large = readU32(zip, central + 20).? + 1;
+        setU32(zip, central + 20, too_large);
+        setU32(zip, local + 18, too_large);
+        try t.expectError(error.Truncated, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        setU16(zip, 28, 0xffff);
+        try t.expectError(error.Truncated, read(gpa, zip));
+    }
+}
+
+test "rejects local and central metadata disagreement" {
+    const gpa = t.allocator;
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        setU16(zip, 8, 8);
+        try t.expectError(error.BadData, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        zip[30] = 'b';
+        try t.expectError(error.BadData, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        setU32(zip, 18, 2);
+        try t.expectError(error.BadData, read(gpa, zip));
+    }
+}
+
+test "requires exact deflate output and compressed EOF" {
+    const gpa = t.allocator;
+    const data = "deflate output with enough bytes to detect both mismatch directions";
+
+    for ([_]u32{ data.len - 1, data.len + 1 }) |declared| {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = data, .deflate = true }});
+        defer gpa.free(zip);
+        const central = testCentralOffset(zip, 0);
+        const local = testLocalOffset(zip, central);
+        setU32(zip, central + 24, declared);
+        setU32(zip, local + 22, declared);
+        try t.expectError(error.BadData, read(gpa, zip));
+    }
+
+    const original = try buildZip(gpa, &.{.{ .name = "a", .data = data, .deflate = true }});
+    defer gpa.free(original);
+    const old_cd = testCentralOffset(original, 0);
+    const old_eocd = testEocdOffset(original);
+    const zip = try gpa.alloc(u8, original.len + 1);
+    defer gpa.free(zip);
+    @memcpy(zip[0..old_cd], original[0..old_cd]);
+    zip[old_cd] = 0;
+    @memcpy(zip[old_cd + 1 ..], original[old_cd..]);
+    const moved_cd = old_cd + 1;
+    const moved_eocd = old_eocd + 1;
+    const comp_size = readU32(original, old_cd + 20).? + 1;
+    setU32(zip, 18, comp_size);
+    setU32(zip, moved_cd + 20, comp_size);
+    setU32(zip, moved_eocd + 16, @intCast(moved_cd));
+    try t.expectError(error.BadData, read(gpa, zip));
+}
+
+test "rejects CRC mismatch and unsupported compression methods" {
+    const gpa = t.allocator;
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        const central = testCentralOffset(zip, 0);
+        const local = testLocalOffset(zip, central);
+        const wrong_crc = readU32(zip, central + 16).? ^ 1;
+        setU32(zip, central + 16, wrong_crc);
+        setU32(zip, local + 14, wrong_crc);
+        try t.expectError(error.ChecksumMismatch, read(gpa, zip));
+    }
+
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        const central = testCentralOffset(zip, 0);
+        const local = testLocalOffset(zip, central);
+        setU16(zip, central + 10, 99);
+        setU16(zip, local + 8, 99);
+        try t.expectError(error.UnsupportedMethod, read(gpa, zip));
+    }
 }
 
 test "rejects non-zip bytes" {
