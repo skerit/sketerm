@@ -6,6 +6,57 @@
 
 const std = @import("std");
 const Harness = @import("../parser/test_harness.zig").Harness;
+const Screen = @import("screen.zig").Screen;
+
+const wide_left: u8 = 0b0000_0001;
+const wide_cont: u8 = 0b0000_0010;
+
+fn expectLineWidePairsValid(cells: []const @import("cell.zig").Cell) !void {
+    for (cells, 0..) |cell, col| {
+        const pair_flags = cell.flags & (wide_left | wide_cont);
+        if (pair_flags == wide_left) {
+            try std.testing.expect(cell.rune != 0);
+            try std.testing.expect(col + 1 < cells.len);
+            try std.testing.expectEqual(wide_cont, cells[col + 1].flags & (wide_left | wide_cont));
+            try std.testing.expectEqual(@as(u32, 0), cells[col + 1].rune);
+        } else if (pair_flags == wide_cont) {
+            try std.testing.expect(col > 0);
+            try std.testing.expectEqual(wide_left, cells[col - 1].flags & (wide_left | wide_cont));
+            try std.testing.expect(cells[col - 1].rune != 0);
+        } else {
+            try std.testing.expectEqual(@as(u8, 0), pair_flags);
+        }
+    }
+}
+
+fn expectAllWidePairsValid(screen: *Screen) !void {
+    for (screen.active) |line| try expectLineWidePairsValid(line.cells);
+    var i: u32 = 0;
+    while (i < screen.scrollbackCount()) : (i += 1) {
+        try expectLineWidePairsValid(screen.scrollbackLine(i).cells);
+    }
+}
+
+fn expectWidePair(screen: *Screen, row: u16, col: u16, rune: u32) !void {
+    const cells = screen.line(row).cells;
+    try std.testing.expect(col + 1 < cells.len);
+    try std.testing.expectEqual(rune, cells[col].rune);
+    try std.testing.expectEqual(wide_left, cells[col].flags & (wide_left | wide_cont));
+    try std.testing.expectEqual(@as(u32, 0), cells[col + 1].rune);
+    try std.testing.expectEqual(wide_cont, cells[col + 1].flags & (wide_left | wide_cont));
+}
+
+fn expectClusterForRune(screen: *Screen, rune: u32, expected: []const u32) !void {
+    var found = false;
+    for (screen.active, 0..) |line, row| {
+        for (line.cells, 0..) |cell, col| {
+            if (cell.rune != rune) continue;
+            found = true;
+            try std.testing.expectEqualSlices(u32, expected, screen.clusterAt(@intCast(row), @intCast(col)));
+        }
+    }
+    try std.testing.expect(found);
+}
 
 test "reflow: widening rejoins soft-wrapped logical line" {
     var h = try Harness.init(std.testing.allocator, 5, 4);
@@ -40,6 +91,90 @@ test "reflow: narrowing splits a long line into multiple rows" {
     const r1 = try h.line(std.testing.allocator, 1);
     defer std.testing.allocator.free(r1);
     try std.testing.expectEqualStrings("wor", r1);
+}
+
+test "reflow: trimming preserves a wide pair in the final old columns" {
+    var h = try Harness.init(std.testing.allocator, 4, 6);
+    defer h.deinit();
+    h.arm();
+    h.feed("ab\xe7\x95\x8c");
+
+    try expectWidePair(h.screen, 0, 2, 0x754C);
+    try h.screen.resize(6, 6);
+    try expectWidePair(h.screen, 0, 2, 0x754C);
+    try expectAllWidePairsValid(h.screen);
+
+    const line = try h.line(std.testing.allocator, 0);
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings("ab\xe7\x95\x8c", line);
+}
+
+test "reflow: a wide glyph moves when only one column remains" {
+    var h = try Harness.init(std.testing.allocator, 5, 6);
+    defer h.deinit();
+    h.arm();
+    h.feed("abcd\xe7\x95\x8cx");
+
+    try std.testing.expectEqual(@as(u32, 0), h.screen.line(0).cells[4].rune);
+    try expectWidePair(h.screen, 1, 0, 0x754C);
+    try std.testing.expect(h.screen.line(1).continues_above);
+
+    try h.screen.resize(6, 6);
+    try expectWidePair(h.screen, 0, 4, 0x754C);
+    try std.testing.expectEqual(@as(u32, 'x'), h.screen.line(1).cells[0].rune);
+    try std.testing.expect(h.screen.line(1).continues_above);
+
+    try h.screen.resize(5, 6);
+    try std.testing.expectEqual(@as(u32, 0), h.screen.line(0).cells[4].rune);
+    try expectWidePair(h.screen, 1, 0, 0x754C);
+    try std.testing.expectEqual(@as(u32, 'x'), h.screen.line(1).cells[2].rune);
+    try expectAllWidePairsValid(h.screen);
+}
+
+test "reflow: wide pair honors exact and off-by-one boundaries" {
+    var h = try Harness.init(std.testing.allocator, 8, 6);
+    defer h.deinit();
+    h.arm();
+    h.feed("ab\xe7\x95\x8cc");
+
+    try h.screen.resize(4, 6);
+    try expectWidePair(h.screen, 0, 2, 0x754C);
+    try std.testing.expectEqual(@as(u32, 'c'), h.screen.line(1).cells[0].rune);
+    try std.testing.expect(h.screen.line(1).continues_above);
+    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
+    try std.testing.expectEqual(@as(u16, 1), h.screen.col);
+
+    try h.screen.resize(3, 6);
+    try std.testing.expectEqual(@as(u32, 0), h.screen.line(0).cells[2].rune);
+    try expectWidePair(h.screen, 1, 0, 0x754C);
+    try std.testing.expectEqual(@as(u32, 'c'), h.screen.line(1).cells[2].rune);
+    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
+    try std.testing.expectEqual(@as(u16, 2), h.screen.col);
+
+    try h.screen.resize(5, 6);
+    try expectWidePair(h.screen, 0, 2, 0x754C);
+    try std.testing.expectEqual(@as(u32, 'c'), h.screen.line(0).cells[4].rune);
+    try expectAllWidePairsValid(h.screen);
+}
+
+test "reflow: CJK emoji and combining clusters survive round trips" {
+    const text = "a\xe7\x95\x8c\xcc\x81\xf0\x9f\x99\x82\xef\xb8\x8fb";
+    var h = try Harness.init(std.testing.allocator, 8, 10);
+    defer h.deinit();
+    h.arm();
+    h.feed(text);
+
+    const widths = [_]u16{ 4, 6, 3, 5, 8, 4, 7, 3, 8 };
+    for (widths) |width| {
+        try h.screen.resize(width, 10);
+        try expectAllWidePairsValid(h.screen);
+        try expectClusterForRune(h.screen, 0x754C, &.{0x0301});
+        try expectClusterForRune(h.screen, 0x1F642, &.{0xFE0F});
+
+        const extracted = try h.screen.extractScrollback(std.testing.allocator);
+        defer std.testing.allocator.free(extracted);
+        try std.testing.expect(std.mem.startsWith(u8, extracted, text));
+    }
 }
 
 test "reflow: separate logical lines stay separate" {

@@ -1307,7 +1307,7 @@ pub const Screen = struct {
 
         const cols_changed = new_cols != self.cols;
         if (cols_changed and !self.use_alt) {
-            // reflowMain clears the (row, col)-keyed cluster map itself.
+            // reflowMain remaps active (row, col)-keyed clusters itself.
             self.reflowMain(new_cols, new_rows) catch |err| {
                 self.viewport_epoch -%= 1;
                 return err;
@@ -1412,7 +1412,7 @@ pub const Screen = struct {
         }
 
         // Compute cursor's new (row, col) within all_rows.
-        const new_pos = reflow.positionAfterRechunk(all_rows, cursor_pos.idx, cursor_pos.col, new_cols);
+        const new_pos = reflow.positionAfterRechunk(logicals.items, all_rows, cursor_pos.idx, cursor_pos.col, new_cols);
 
         // The active screen is the bottom new_rows of all_rows; pad
         // with blank rows if there are fewer logical rows than fit.
@@ -1462,6 +1462,48 @@ pub const Screen = struct {
             ln.cells = &.{};
         }
 
+        // Plan active cluster moves without taking ownership from the old
+        // map. The carrier is the only allocation; the ArrayList values move
+        // into their new hash slots after every fallible step has succeeded.
+        const ClusterMove = struct {
+            key: ?u32,
+            value: std.ArrayList(u32),
+        };
+        var cluster_moves: std.ArrayList(ClusterMove) = .empty;
+        defer cluster_moves.deinit(self.allocator);
+        try cluster_moves.ensureTotalCapacity(self.allocator, self.clusters.count());
+        var cluster_it = self.clusters.iterator();
+        while (cluster_it.next()) |entry| {
+            const old_key = entry.key_ptr.*;
+            const old_row: u16 = @intCast(old_key >> 16);
+            const old_col: u16 = @intCast(old_key & 0xFFFF);
+            var key: ?u32 = null;
+            if (old_row < self.rows and old_col < self.cols) {
+                const source = reflow.positionInLogicals(
+                    combined.items,
+                    @intCast(sb_count + old_row),
+                    old_col,
+                );
+                const destination = reflow.positionAfterRechunk(
+                    logicals.items,
+                    all_rows,
+                    source.idx,
+                    source.col,
+                    new_cols,
+                );
+                if (destination.row >= sb_rows) {
+                    const active_row = destination.row - sb_rows;
+                    if (active_row < new_rows) {
+                        const cell = new_active[active_row].cells[destination.col];
+                        if (cell.rune != 0 and cell.flags & 0b0000_0010 == 0) {
+                            key = cellKey(@intCast(active_row), destination.col);
+                        }
+                    }
+                }
+            }
+            cluster_moves.appendAssumeCapacity(.{ .key = key, .value = entry.value_ptr.* });
+        }
+
         // Compute all replacement metadata before the allocation-free commit.
         var replacement_row: u16 = 0;
         var replacement_col: u16 = 0;
@@ -1481,9 +1523,17 @@ pub const Screen = struct {
         self.col = replacement_col;
         self.next_line_id = next_line_id;
 
-        // Reflow shifts every cell to a new (row, col); the cluster map
-        // becomes meaningless only once the replacement is committed.
-        self.clearAllClusters();
+        if (cluster_moves.items.len > 0) {
+            self.clusters.clearRetainingCapacity();
+            for (cluster_moves.items) |move| {
+                if (move.key) |key| {
+                    self.clusters.putAssumeCapacityNoClobber(key, move.value);
+                } else {
+                    var value = move.value;
+                    value.deinit(self.allocator);
+                }
+            }
+        }
         for (old_active) |*ln| ln.deinit(self.allocator);
         self.allocator.free(old_active);
         for (old_scrollback.items) |*ln| ln.deinit(self.allocator);
@@ -4663,11 +4713,12 @@ fn expectSuccessfulReflow(screen: *Screen, scenario: ReflowFailureScenario, old_
     const dims = reflowScenarioDimensions(scenario);
     try std.testing.expectEqual(dims.new_cols, screen.cols);
     try std.testing.expectEqual(dims.new_rows, screen.rows);
-    try std.testing.expectEqual(@as(usize, 0), screen.clusters.count());
     try std.testing.expectEqual(@as(u32, 42), screen.viewport_epoch);
     try expectScreenBuffersUnique(screen);
     switch (scenario) {
         .active_padding => {
+            try std.testing.expectEqual(@as(usize, 1), screen.clusters.count());
+            try std.testing.expectEqualSlices(u32, &.{ 0x0301, 0x200D }, screen.clusterAt(1, 1));
             try std.testing.expectEqual(@as(u32, 0), screen.scrollbackCount());
             try std.testing.expectEqual(@as(u32, 'a'), screen.active[0].cells[0].rune);
             try std.testing.expectEqual(@as(u32, 'f'), screen.active[1].cells[2].rune);
@@ -4675,6 +4726,9 @@ fn expectSuccessfulReflow(screen: *Screen, scenario: ReflowFailureScenario, old_
             try std.testing.expectEqual(old_next_line_id + 6, screen.next_line_id);
         },
         .scrollback => {
+            // Cluster storage only addresses active rows; this cell moved
+            // into scrollback and is discarded consistently with scrolling.
+            try std.testing.expectEqual(@as(usize, 0), screen.clusters.count());
             try expectScrollbackRunes(screen, "GJ");
             try std.testing.expectEqual(@as(usize, 0), screen.scrollback_head);
             try std.testing.expectEqual(@as(u32, 'M'), screen.active[0].cells[0].rune);
