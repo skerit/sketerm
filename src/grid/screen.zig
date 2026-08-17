@@ -1323,6 +1323,23 @@ pub const Screen = struct {
             staged_active = try StagedBuffer.stage(self.allocator, self.active, new_cols, new_rows);
         }
 
+        // Tab stops are the one piece the commit phase cannot roll back,
+        // so reserve their storage here: `resizeTabStops` then only moves
+        // a length. Swallowing this allocation failure left tab_stops
+        // shorter than `cols` forever, which the snapshot encoder used to
+        // reject on every attempt.
+        // Tab stops are the one piece the commit phase cannot roll back,
+        // so reserve their storage here: `resizeTabStops` then only moves
+        // a length. Swallowing this allocation failure left tab_stops
+        // shorter than `cols` forever, which the snapshot encoder used to
+        // reject on every attempt.
+        // Tab stops are the one piece the commit phase cannot roll back,
+        // so reserve their storage here: `resizeTabStops` then only moves
+        // a length. Swallowing this allocation failure left tab_stops
+        // shorter than `cols` forever, which the snapshot encoder used to
+        // reject on every attempt.
+        try self.tab_stops.ensureTotalCapacity(self.allocator, new_cols);
+
         var staged_alt: ?StagedBuffer = null;
         errdefer if (staged_alt) |*s| s.abort(self.allocator);
         if (self.alt) |alt_buf| {
@@ -4309,9 +4326,14 @@ pub const Screen = struct {
 
     /// Resize tab_stops, preserving existing values and adding default
     /// every-8 stops in the new range.
+    ///
+    /// Infallible by construction: the only caller (`resize`) reserved the
+    /// capacity during its fallible staging phase, so this cannot allocate
+    /// and cannot leave `tab_stops.len != cols`.
     fn resizeTabStops(self: *Screen, new_cols: u16) void {
+        std.debug.assert(self.tab_stops.capacity >= new_cols);
         const old_len = self.tab_stops.items.len;
-        self.tab_stops.resize(self.allocator, new_cols) catch return;
+        self.tab_stops.items.len = new_cols;
         if (new_cols > old_len) {
             for (self.tab_stops.items[old_len..], old_len..) |*s, i|
                 s.* = (i % 8 == 0 and i != 0);
@@ -4954,6 +4976,38 @@ fn expectAllReflowAllocationFailures(scenario: ReflowFailureScenario) !void {
     try std.testing.expect(allocations > 0);
     for (0..allocations) |fail_index| {
         _ = try runReflowFailureScenario(scenario, fail_index);
+    }
+}
+
+test "resize keeps tab_stops sized to cols under every allocation failure" {
+    const t = std.testing;
+    var pool = try Pool.init(t.allocator);
+    defer pool.deinit();
+    var probe = try Screen.init(t.allocator, &pool, 40, 6);
+    defer probe.deinit();
+
+    var counting = t.FailingAllocator.init(t.allocator, .{});
+    probe.allocator = counting.allocator();
+    try probe.resize(400, 6);
+    probe.allocator = t.allocator;
+    const allocations = counting.alloc_index;
+    try t.expect(allocations > 0);
+
+    for (0..allocations) |index| {
+        const config: t.FailingAllocator.Config = .{ .fail_index = index };
+        var p2 = try Pool.init(t.allocator);
+        defer p2.deinit();
+        var s2 = try Screen.init(t.allocator, &p2, 40, 6);
+        defer s2.deinit();
+            var failing = t.FailingAllocator.init(t.allocator, config);
+        s2.allocator = failing.allocator();
+        const result = s2.resize(400, 6);
+        s2.allocator = t.allocator;
+        result catch |err| try t.expectEqual(error.OutOfMemory, err);
+        // Whether the resize applied or rolled back, tab_stops must still
+        // describe the live grid. A short array is permanent: every later
+        // snapshot of this screen used to fail, freezing all its viewers.
+        try t.expectEqual(@as(usize, s2.cols), s2.tab_stops.items.len);
     }
 }
 

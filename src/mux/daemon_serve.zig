@@ -776,7 +776,9 @@ pub fn clientWritable(self: *Daemon, cl: *Client) void {
     // session — the final screen is exactly what a crash-flood
     // post-mortem needs.
     const fully_drained = cl.queuedBytes() == 0 and cl.write_lane == .none;
-    if (fully_drained and cl.needs_resync) {
+    // A client whose retry budget ran out is already carrying its
+    // give-up notice; `retryPendingSnapshots` drops it once that drains.
+    if (fully_drained and cl.needs_resync and !cl.resync_gave_up) {
         if (cl.attached) |s| {
             log.debug("resync snapshot toward drained client (session '{s}')", .{s.name});
             self.queueSnapshot(cl, s);

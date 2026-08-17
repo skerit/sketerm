@@ -304,9 +304,20 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
         try s.byte(@intFromEnum(screen.charset_g1));
         try s.byte(@intFromEnum(screen.active_charset));
         try s.byte(@intFromEnum(screen.pending_single_shift));
-        if (screen.tab_stops.items.len != screen.cols) return error.BadScreenState;
-        try s.int(u16, @intCast(screen.tab_stops.items.len));
-        for (screen.tab_stops.items) |stop| try s.boolean(stop);
+        // The wire shape is exactly `cols` stops, but a Screen whose
+        // tab_stops fell out of sync (an allocation failure during a
+        // resize used to leave it short) must still serialize: refusing
+        // here froze every viewer of that session permanently. Normalize
+        // to the grid width instead, padding with the default 8-column
+        // rule — the same values `resizeTabStops` would have written.
+        try s.int(u16, screen.cols);
+        for (0..screen.cols) |col| {
+            const stop = if (col < screen.tab_stops.items.len)
+                screen.tab_stops.items[col]
+            else
+                (col % 8 == 0 and col != 0);
+            try s.boolean(stop);
+        }
 
         try s.int(u32, screen.last_print_cp);
         try s.int(u32, screen.last_print_key);
@@ -328,7 +339,9 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
         if (screen.title_stack_depth > screen.title_stack.len) return error.BadScreenState;
         try s.byte(screen.title_stack_depth);
         for (screen.title_stack[0..screen.title_stack_depth]) |entry| {
-            try s.bytes(entry orelse return error.BadScreenState);
+            // An unset slot below the depth is a lost title, not a
+            // reason to withhold the whole screen from every viewer.
+            try s.bytes(entry orelse "");
         }
     }
 }
@@ -1616,6 +1629,54 @@ test "snapshot: v7 interpreter omissions restore documented defaults" {
     try testing.expectEqual(@as(u8, 0), restored.kitty_kbd_other_depth);
     try testing.expectEqual(@as(u8, 0), restored.title_stack_depth);
     try testing.expectEqual(restored.prompt_marks_len, restored.prompt_marks_head);
+}
+
+test "snapshot: a short tab_stops array normalizes instead of failing" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 80, 24);
+    defer h.deinit();
+
+    // Exactly the state a swallowed allocation failure in Screen.resize
+    // used to leave behind. Refusing to encode it froze every viewer of
+    // the session permanently, because events stay withheld until a
+    // snapshot succeeds.
+    h.screen.tab_stops.items[16] = true;
+    h.screen.tab_stops.shrinkRetainingCapacity(20);
+    try testing.expect(h.screen.tab_stops.items.len != h.screen.cols);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serializeVersion(h.screen, &body, a, SNAPSHOT_VERSION);
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+    const restored = try restore(a, &pool, body.items);
+    defer restored.deinit();
+
+    try testing.expectEqual(h.screen.cols, @as(u16, @intCast(restored.tab_stops.items.len)));
+    for (restored.tab_stops.items, 0..) |stop, idx| {
+        const expected = if (idx < 20) (idx == 16 or (idx != 0 and idx % 8 == 0)) else (idx != 0 and idx % 8 == 0);
+        try testing.expectEqual(expected, stop);
+    }
+}
+
+test "snapshot: an unset title stack slot encodes as empty" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 80, 24);
+    defer h.deinit();
+
+    h.screen.title_stack_depth = 1;
+    h.screen.title_stack[0] = null;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serializeVersion(h.screen, &body, a, SNAPSHOT_VERSION);
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+    const restored = try restore(a, &pool, body.items);
+    defer restored.deinit();
+
+    try testing.expectEqual(@as(u8, 1), restored.title_stack_depth);
+    try testing.expectEqualStrings("", restored.title_stack[0].?);
 }
 
 test "snapshot: envelope detects pre-v4 and current headers" {

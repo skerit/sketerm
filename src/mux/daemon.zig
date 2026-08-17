@@ -665,6 +665,19 @@ pub const Client = struct {
     /// event streaming resumes. Keeps a flooded client's backlog
     /// bounded instead of racing toward the MAX_WBUF reap.
     needs_resync: bool = false,
+    /// Consecutive failed attempts to satisfy `needs_resync`. Events are
+    /// withheld while a resync is pending, so a snapshot that never
+    /// succeeds would freeze this client on a stale grid forever — the
+    /// budget below converts that into a reported disconnect.
+    resync_attempts: u8 = 0,
+    /// Monotonic ms before which the next resync attempt is skipped. A
+    /// full grid + scrollback serialization per tick, under the memory
+    /// pressure that just failed one, is the opposite of recovery.
+    resync_retry_at_ms: i64 = 0,
+    /// The retry budget ran out: the client was told, and the connection
+    /// is dropped as soon as that notice drains so its next attach starts
+    /// from a fresh snapshot.
+    resync_gave_up: bool = false,
     /// Native app-channel units were withheld because this MCP
     /// client's wbuf exceeded NATIVE_BACKLOG (it drains only during
     /// tool calls; streaming into the queue meanwhile is unbounded —
@@ -689,6 +702,24 @@ pub const Client = struct {
     pub fn resetAttachmentStreamState(self: *Client) void {
         self.needs_resync = false;
         self.needs_native_resync = false;
+        self.resync_attempts = 0;
+        self.resync_retry_at_ms = 0;
+        self.resync_gave_up = false;
+    }
+
+    /// Snapshot attempts allowed for one pending resync before the client
+    /// is told and disconnected. Ten attempts with the backoff below span
+    /// roughly six seconds — long enough for a transient allocation
+    /// failure to clear, short enough that a permanently unserializable
+    /// screen does not sit unreported.
+    pub const MAX_RESYNC_ATTEMPTS: u8 = 10;
+    const RESYNC_RETRY_BASE_MS: i64 = 50;
+    const RESYNC_RETRY_MAX_MS: i64 = 1000;
+
+    /// Exponential backoff for attempt `n` (1-based), capped.
+    fn resyncBackoffMs(attempt: u8) i64 {
+        const shift: u6 = @intCast(@min(attempt -| 1, 5));
+        return @min(RESYNC_RETRY_BASE_MS << shift, RESYNC_RETRY_MAX_MS);
     }
 
     pub fn deinit(self: *Client) void {
@@ -4777,8 +4808,36 @@ pub const Daemon = struct {
         });
     }
 
+    /// Account one failed snapshot attempt against the client's resync
+    /// budget, scheduling a backed-off retry or giving up loudly.
+    ///
+    /// Giving up is what keeps a permanently unserializable screen from
+    /// freezing a viewer: `ingestFinish` withholds `.events` for as long
+    /// as `needs_resync` is set, so without a terminal state the client
+    /// would receive nothing at all and never be told why.
+    fn noteResyncFailure(_: *Daemon, cl: *Client, s: *Session, what: []const u8) void {
+        if (cl.dead or cl.resync_gave_up) return;
+        cl.resync_attempts +|= 1;
+        if (cl.resync_attempts >= Client.MAX_RESYNC_ATTEMPTS) {
+            cl.resync_gave_up = true;
+            log.warn("{s}; giving up after {d} attempts, dropping client (session '{s}')", .{ what, cl.resync_attempts, s.name });
+            cl.queueErr("snapshot resync failed repeatedly; reconnect for a fresh screen");
+            return;
+        }
+        const delay = Client.resyncBackoffMs(cl.resync_attempts);
+        cl.resync_retry_at_ms = nowMs() + delay;
+        // Only the first failure is a warning: warnings also hit stderr,
+        // and a per-tick warn on a shared log is how this used to become
+        // a second failure mode on top of the frozen session.
+        if (cl.resync_attempts == 1)
+            log.warn("{s}; retrying (session '{s}')", .{ what, s.name })
+        else
+            log.debug("{s}; retry #{d} in {d}ms (session '{s}')", .{ what, cl.resync_attempts, delay, s.name });
+    }
+
     pub fn queueSnapshot(self: *Daemon, cl: *Client, s: *Session) void {
         if (!terminalViewer(cl, s)) return;
+        if (cl.resync_gave_up) return;
         cl.needs_resync = true;
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
@@ -4788,21 +4847,22 @@ pub const Daemon = struct {
         seq_hdr[8] = if (s.app) 1 else 0;
         const header = if (cl.proto >= 4) seq_hdr[0..9] else seq_hdr[0..8];
         buf.appendSlice(self.allocator, header) catch {
-            log.warn("snapshot header allocation failed; resync remains pending (session '{s}')", .{s.name});
+            self.noteResyncFailure(cl, s, "snapshot header allocation failed");
             return;
         };
         snapshot.serializeVersion(s.screen, &buf, self.allocator, cl.snapshot_version) catch {
-            log.warn("snapshot serialization failed; resync remains pending (session '{s}')", .{s.name});
+            self.noteResyncFailure(cl, s, "snapshot serialization failed");
             return;
         };
         if (!cl.tryQueueFrameIn(&cl.wbuf, .snapshot, buf.items)) {
-            if (!cl.dead)
-                log.warn("snapshot frame allocation failed; resync remains pending (session '{s}')", .{s.name});
+            self.noteResyncFailure(cl, s, "snapshot frame allocation failed");
             return;
         }
         // A full snapshot supersedes any withheld events once the complete
         // frame is in FIFO order ahead of every event accepted from now on.
         cl.needs_resync = false;
+        cl.resync_attempts = 0;
+        cl.resync_retry_at_ms = 0;
         var cwd_buf: [4096]u8 = undefined;
         // A newly attached client has no facts yet, so sample the
         // foreground program now rather than making it wait for the
@@ -4824,16 +4884,27 @@ pub const Daemon = struct {
     }
 
     fn retryPendingSnapshots(self: *Daemon) void {
+        const now = nowMs();
         for (self.clients.items) |cl| {
-            if (cl.dead or !cl.needs_resync or cl.queuedBytes() != 0 or cl.write_lane != .none) continue;
+            if (cl.dead or !cl.needs_resync) continue;
+            if (cl.resync_gave_up) {
+                // The give-up notice is the last frame this client gets;
+                // drop the connection once it has drained so the client's
+                // own reconnect starts from a fresh snapshot.
+                if (cl.queuedBytes() == 0 and cl.write_lane == .none) cl.dead = true;
+                continue;
+            }
+            if (cl.queuedBytes() != 0 or cl.write_lane != .none) continue;
+            if (now < cl.resync_retry_at_ms) continue;
             if (cl.attached) |s| self.queueSnapshot(cl, s);
         }
     }
 
     fn requireSnapshot(self: *Daemon, cl: *Client, s: *Session) void {
-        if (cl.dead or !terminalViewer(cl, s)) return;
+        if (cl.dead or cl.resync_gave_up or !terminalViewer(cl, s)) return;
         cl.needs_resync = true;
-        if (cl.queuedBytes() == 0 and cl.write_lane == .none) self.queueSnapshot(cl, s);
+        if (cl.queuedBytes() == 0 and cl.write_lane == .none and nowMs() >= cl.resync_retry_at_ms)
+            self.queueSnapshot(cl, s);
     }
 
     /// Minimum gap between two foreground-program samples for one
@@ -6437,7 +6508,11 @@ fn runEventsPayloadAllocationFailure(fail_index: ?usize) !usize {
     harness.daemon.allocator = failing.allocator();
     harness.daemon.ingestFinish(&harness.session, &batch, true);
     harness.daemon.allocator = t.allocator;
-    if (fail_index != null) harness.daemon.retryPendingSnapshots();
+    if (fail_index != null) {
+        // Skip the failure backoff; recovery, not its pacing, is under test.
+        for (&harness.clients) |*cl| cl.resync_retry_at_ms = 0;
+        harness.daemon.retryPendingSnapshots();
+    }
 
     if (fail_index) |_| {
         try t.expect(failing.has_induced_failure);
@@ -6483,6 +6558,8 @@ test "one client frame allocation failure snapshots only that client" {
     EventCollector.emit(@ptrCast(&batch), .{ .print_run = run });
     harness.daemon.ingestFinish(&harness.session, &batch, true);
     harness.clients[0].allocator = t.allocator;
+    // Skip the failure backoff; recovery, not its pacing, is under test.
+    harness.clients[0].resync_retry_at_ms = 0;
     harness.daemon.retryPendingSnapshots();
 
     try t.expect(failing.has_induced_failure);
@@ -6504,6 +6581,98 @@ test "one client frame allocation failure snapshots only that client" {
         try t.expectEqual(@as(usize, 0), summary.snapshots);
         try t.expectEqual(@as(usize, 1), summary.events);
     }
+}
+
+/// Fails every allocation, unlike `std.testing.FailingAllocator`, which
+/// fails exactly one index. A snapshot that can NEVER be produced is the
+/// state that used to freeze a client forever.
+const AlwaysOom = struct {
+    fn alloc(_: *anyopaque, _: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+        return false;
+    }
+    fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+        return null;
+    }
+    fn free(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {}
+    const vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+    fn allocator() std.mem.Allocator {
+        return .{ .ptr = undefined, .vtable = &vtable };
+    }
+};
+
+fn countFrames(cl: *Client, ftype: wire.FrameType) !usize {
+    var found: usize = 0;
+    var offset: usize = 0;
+    while (offset < cl.wbuf.items.len) {
+        const peeled = (try wire.peelFrame(cl.wbuf.items[offset..])) orelse return error.TestUnexpectedResult;
+        offset += peeled.consumed;
+        if (peeled.frame.ftype == ftype) found += 1;
+    }
+    return found;
+}
+
+test "a snapshot that never succeeds tells the client instead of freezing it" {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+
+    const cl = &harness.clients[0];
+    harness.daemon.allocator = AlwaysOom.allocator();
+    var attempt: usize = 0;
+    while (attempt < Client.MAX_RESYNC_ATTEMPTS) : (attempt += 1) {
+        // Skip the backoff wall clock; the budget is what is under test.
+        cl.resync_retry_at_ms = 0;
+        harness.daemon.queueSnapshot(cl, &harness.session);
+        try t.expect(cl.needs_resync);
+    }
+    harness.daemon.allocator = t.allocator;
+
+    // Told, not frozen: the budget ran out and the client holds an .err.
+    try t.expect(cl.resync_gave_up);
+    try t.expectEqual(@as(usize, 0), try countFrames(cl, .snapshot));
+    try t.expectEqual(@as(usize, 1), try countFrames(cl, .err));
+
+    // Retrying stops, and the connection drops once the notice drains so
+    // the client's own reconnect starts from a fresh snapshot.
+    try t.expect(!cl.dead);
+    harness.daemon.retryPendingSnapshots();
+    try t.expect(!cl.dead);
+    cl.wbuf.clearRetainingCapacity();
+    harness.daemon.retryPendingSnapshots();
+    try t.expect(cl.dead);
+}
+
+test "resync retries back off instead of re-serializing every tick" {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+
+    const cl = &harness.clients[0];
+    harness.daemon.allocator = AlwaysOom.allocator();
+    harness.daemon.queueSnapshot(cl, &harness.session);
+    harness.daemon.allocator = t.allocator;
+    try t.expectEqual(@as(u8, 1), cl.resync_attempts);
+    try t.expect(cl.resync_retry_at_ms > nowMs());
+
+    // A tick inside the backoff window must not re-serialize the grid.
+    harness.daemon.retryPendingSnapshots();
+    try t.expectEqual(@as(u8, 1), cl.resync_attempts);
+    try t.expectEqual(@as(usize, 0), try countFrames(cl, .snapshot));
+
+    // Once due, the retry runs and a success clears the budget.
+    cl.resync_retry_at_ms = 0;
+    harness.daemon.retryPendingSnapshots();
+    try t.expect(!cl.needs_resync);
+    try t.expectEqual(@as(u8, 0), cl.resync_attempts);
+    try t.expectEqual(@as(usize, 1), try countFrames(cl, .snapshot));
 }
 
 pub const defaultSocketPath = @import("sockpath.zig").defaultSocketPath;
