@@ -1148,8 +1148,20 @@ pub const DEFAULT_OUTPUT_WIDTH: u32 = 1920;
 pub const DEFAULT_OUTPUT_HEIGHT: u32 = 1080;
 
 /// Terminal grids are bounded independently per axis and by total cell count.
-pub const MAX_TERMINAL_AXIS: u16 = 1000;
-pub const MAX_TERMINAL_CELLS: u32 = 256 * 1024;
+///
+/// The per-axis bound only has to be wider than any grid real hardware can
+/// produce; the CELL bound is the one that caps what the daemon allocates.
+/// 1000 columns rejected real displays — a 5120px-wide panel at a 5px cell
+/// is 1024 columns, and a window spanning two 4K panels is worse. 4096 is
+/// the bound the cast reader and the snapshot decoder already used, so
+/// every grid limit in the tree can now be this one number.
+///
+/// 1 Mi cells is an 8 MB active grid (Cell is 8 bytes flat). A window
+/// spanning three 4K panels at a tiny 5x10 cell is ~500k cells, so this
+/// clears real hardware with headroom while still refusing a 4096x4096
+/// cast header (16.7 Mi cells, ~134 MB of grid plus scrollback).
+pub const MAX_TERMINAL_AXIS: u16 = 4096;
+pub const MAX_TERMINAL_CELLS: u32 = 1024 * 1024;
 pub const TERMINAL_SIZE_PROTOCOL_ERROR = std.fmt.comptimePrint(
     "bad terminal size (rows and cols must each be 1..{d} and total cells must not exceed {d})",
     .{ MAX_TERMINAL_AXIS, MAX_TERMINAL_CELLS },
@@ -1164,15 +1176,21 @@ pub fn validateTerminalSize(rows: u16, cols: u16) error{InvalidTerminalSize}!voi
 test "terminal dimensions are bounded per axis and by total cells" {
     try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(0, 80));
     try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(24, 0));
-    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(1001, 1));
-    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(1, 1001));
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(MAX_TERMINAL_AXIS + 1, 1));
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(1, MAX_TERMINAL_AXIS + 1));
     try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(65535, 1));
     try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(1, 65535));
-    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(513, 512));
-    try validateTerminalSize(512, 512);
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(1025, 1024));
+    try validateTerminalSize(1024, 1024);
     try validateTerminalSize(MAX_TERMINAL_AXIS, 1);
+    // Grids real hardware produces must not be refused: a 5120px panel at
+    // a 5px cell, and a window spanning two 4K panels at 5x10 cells.
+    try validateTerminalSize(60, 1024);
+    try validateTerminalSize(216, 1536);
+    // A 4096x4096 cast header is still far past the cell bound.
+    try std.testing.expectError(error.InvalidTerminalSize, validateTerminalSize(4096, 4096));
     try std.testing.expectEqualStrings(
-        "bad terminal size (rows and cols must each be 1..1000 and total cells must not exceed 262144)",
+        "bad terminal size (rows and cols must each be 1..4096 and total cells must not exceed 1048576)",
         TERMINAL_SIZE_PROTOCOL_ERROR,
     );
 }

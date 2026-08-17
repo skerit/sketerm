@@ -963,7 +963,10 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
             const rows = std.mem.readInt(u16, frame.payload[0..2], .little);
             const cols = std.mem.readInt(u16, frame.payload[2..4], .little);
             wire.validateTerminalSize(rows, cols) catch {
-                cl.queueErr(wire.TERMINAL_SIZE_PROTOCOL_ERROR);
+                // Tagged: an untagged rejection was dropped by the GUI (or
+                // charged to an unrelated pending rename/record) and the
+                // user just kept a mis-sized grid with no message.
+                cl.queueErrFor(wire.TERMINAL_SIZE_PROTOCOL_ERROR, "resize");
                 return;
             };
             s.screen.resize(cols, rows) catch return;

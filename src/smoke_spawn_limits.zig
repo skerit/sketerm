@@ -66,10 +66,10 @@ pub fn runRejected(allocator: std.mem.Allocator, sock_path: []const u8) void {
     const cases = [_]Case{
         .{ .label = "zero-rows", .rows = 0, .cols = 80 },
         .{ .label = "zero-cols", .rows = 24, .cols = 0 },
-        .{ .label = "1001-rows", .rows = wire.MAX_TERMINAL_AXIS + 1, .cols = 1 },
-        .{ .label = "1001-cols", .rows = 1, .cols = wire.MAX_TERMINAL_AXIS + 1 },
-        .{ .label = "65535-rows", .rows = std.math.maxInt(u16), .cols = 1 },
-        .{ .label = "65535-cols", .rows = 1, .cols = std.math.maxInt(u16) },
+        .{ .label = "axis-over-rows", .rows = wire.MAX_TERMINAL_AXIS + 1, .cols = 1 },
+        .{ .label = "axis-over-cols", .rows = 1, .cols = wire.MAX_TERMINAL_AXIS + 1 },
+        .{ .label = "u16-max-rows", .rows = std.math.maxInt(u16), .cols = 1 },
+        .{ .label = "u16-max-cols", .rows = 1, .cols = std.math.maxInt(u16) },
         .{ .label = "cell-boundary", .rows = ACCEPTED_ROWS + 1, .cols = ACCEPTED_COLS },
     };
     for (cases) |case| {

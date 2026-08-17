@@ -805,6 +805,17 @@ pub const Client = struct {
     pub fn queueErr(self: *Client, msg: []const u8) void {
         self.queueJson(.err, .{ .@"error" = msg });
     }
+
+    /// An `.err` that names the request it answers.
+    ///
+    /// `.err` carries no correlation id, so an untagged one is guesswork on
+    /// the client: `terminal.zig` attributes it to whichever of its
+    /// one-at-a-time requests is outstanding, which silently consumed a
+    /// pending rename/record whenever the daemon refused something else.
+    /// A tagged error is dispatched on `for` and can never be misread.
+    pub fn queueErrFor(self: *Client, msg: []const u8, request: []const u8) void {
+        self.queueJson(.err, .{ .@"error" = msg, .@"for" = request });
+    }
 };
 
 /// One daemon-owned correlation rewrite between a panel-only requester and

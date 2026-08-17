@@ -2417,12 +2417,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     snap3.deinit(allocator);
     if (mirror.screen.?.rows != 20 or mirror.screen.?.cols != 80) fail("resize geometry");
 
-    std.mem.writeInt(u16, rsz[0..2], 513, .little);
-    std.mem.writeInt(u16, rsz[2..4], 512, .little);
+    // One cell past the total-cell bound, derived from the constant so
+    // raising the limit cannot leave this stage waiting on an .err the
+    // daemon now has no reason to send.
+    const over_rows: u16 = 1024;
+    const over_cols: u16 = @intCast(wire.MAX_TERMINAL_CELLS / over_rows + 1);
+    std.mem.writeInt(u16, rsz[0..2], over_rows, .little);
+    std.mem.writeInt(u16, rsz[2..4], over_cols, .little);
     conn.sendFrame(.resize, &rsz) catch fail("oversize resize send");
     const resize_err = conn.recvExpect(&.{.err}) catch fail("oversize resize not rejected");
     if (std.mem.indexOf(u8, resize_err.payload, wire.TERMINAL_SIZE_PROTOCOL_ERROR) == null)
         fail("oversize resize error changed");
+    // The rejection must name the request it answers, or a client with an
+    // unrelated request outstanding charges the error to that one instead.
+    if (std.mem.indexOf(u8, resize_err.payload, "\"for\":\"resize\"") == null)
+        fail("oversize resize error is not attributable");
     resize_err.deinit(allocator);
 
     // Native Wayland app pipe end-to-end (scripted client).

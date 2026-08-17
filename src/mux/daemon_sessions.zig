@@ -448,26 +448,26 @@ test "spawn preparation normalizes monolith and broker requests identically" {
         },
         .{
             .label = "grid axis over boundary",
-            .payload = "{\"name\":\"grid-axis-over\",\"argv\":[\"cmd\"],\"rows\":1001,\"cols\":1}",
+            .payload = "{\"name\":\"grid-axis-over\",\"argv\":[\"cmd\"],\"rows\":4097,\"cols\":1}",
             .expected_error = error.InvalidTerminalSize,
             .expected_error_text = wire.TERMINAL_SIZE_PROTOCOL_ERROR,
         },
         .{
             .label = "grid cells over boundary",
-            .payload = "{\"name\":\"grid-cells-over\",\"argv\":[\"cmd\"],\"rows\":513,\"cols\":512}",
+            .payload = "{\"name\":\"grid-cells-over\",\"argv\":[\"cmd\"],\"rows\":1025,\"cols\":1024}",
             .expected_error = error.InvalidTerminalSize,
             .expected_error_text = wire.TERMINAL_SIZE_PROTOCOL_ERROR,
         },
         .{
             .label = "grid cells at boundary",
-            .payload = "{\"name\":\"grid-cells-max\",\"argv\":[\"cmd\"],\"rows\":512,\"cols\":512}",
-            .expected_rows = 512,
-            .expected_cols = 512,
+            .payload = "{\"name\":\"grid-cells-max\",\"argv\":[\"cmd\"],\"rows\":1024,\"cols\":1024}",
+            .expected_rows = 1024,
+            .expected_cols = 1024,
         },
         .{
             .label = "grid axis at boundary",
-            .payload = "{\"name\":\"grid-axis-max\",\"argv\":[\"cmd\"],\"rows\":1000,\"cols\":1}",
-            .expected_rows = 1000,
+            .payload = "{\"name\":\"grid-axis-max\",\"argv\":[\"cmd\"],\"rows\":4096,\"cols\":1}",
+            .expected_rows = 4096,
             .expected_cols = 1,
         },
         .{

@@ -1289,6 +1289,71 @@ pub const Terminal = struct {
         if (!from_fd_watch and id != 0) _ = c.g_source_remove(id);
     }
 
+    pub const RemoteError = struct {
+        /// The request the daemon named, or empty when it named none.
+        request: []const u8 = "",
+        message: []const u8 = "",
+    };
+
+    fn scanJsonString(s: []const u8, i: *usize) ?[]const u8 {
+        if (i.* >= s.len or s[i.*] != '"') return null;
+        i.* += 1;
+        const start = i.*;
+        while (i.* < s.len) : (i.* += 1) {
+            switch (s[i.*]) {
+                '\\' => i.* += 1,
+                '"' => {
+                    const out = s[start..i.*];
+                    i.* += 1;
+                    return out;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// Peel an `.err` payload (`{"error":"...","for":"..."}`).
+    ///
+    /// Both values are daemon-authored and escape-free, so the result
+    /// borrows the payload verbatim; anything unparseable degrades to the
+    /// whole payload as the message with no named request, which is
+    /// exactly the pre-tag behaviour.
+    pub fn classifyRemoteError(payload: []const u8) RemoteError {
+        var out: RemoteError = .{ .message = payload };
+        const open = std.mem.indexOfScalar(u8, payload, '{') orelse return out;
+        var i = open + 1;
+        while (i < payload.len) {
+            while (i < payload.len and (payload[i] == ' ' or payload[i] == ',')) i += 1;
+            if (i >= payload.len or payload[i] == '}') break;
+            const key = scanJsonString(payload, &i) orelse break;
+            while (i < payload.len and (payload[i] == ' ' or payload[i] == ':')) i += 1;
+            const val = scanJsonString(payload, &i) orelse break;
+            if (std.mem.eql(u8, key, "error")) {
+                out.message = val;
+            } else if (std.mem.eql(u8, key, "for")) {
+                out.request = val;
+            }
+        }
+        return out;
+    }
+
+    /// Surface a daemon rejection the user cannot otherwise observe.
+    ///
+    /// A refused resize in particular leaves the grid mis-sized until
+    /// something else resizes it, and stderr is invisible in a GUI — so
+    /// this goes out through the notification sink as well.
+    fn reportRemoteError(self: *Terminal, info: RemoteError) void {
+        std.debug.print("sketerm: mux rejected {s}: {s}\n", .{ info.request, info.message });
+        if (self.on_notification) |f| f(self.user_ctx, .{
+            .id = "sketerm-mux-error",
+            .title = "Session request refused",
+            .body = info.message,
+            .urgency = 2,
+            .want_focus = false,
+        });
+    }
+
     fn handleRemoteFrame(self: *Terminal, frame: mux_wire.Frame) void {
         switch (frame.ftype) {
             .events => {
@@ -1373,15 +1438,23 @@ pub const Terminal = struct {
             },
             .err => {
                 const remote = self.remote orelse return;
+                const info = classifyRemoteError(frame.payload);
+                // An error that names its request is never charged to an
+                // unrelated pending one. Only an untagged `.err` falls
+                // through to the one-at-a-time guesswork below.
+                if (info.request.len > 0) {
+                    self.reportRemoteError(info);
+                    return;
+                }
                 if (remote.pending_record != 0) {
-                    std.debug.print("sketerm: session record request rejected: {s}\n", .{frame.payload});
+                    std.debug.print("sketerm: session record request rejected: {s}\n", .{info.message});
                     remote.pending_record = 0;
                     self.recording = false;
                     if (self.on_recording_changed) |f| f(self.user_ctx, false);
                     return;
                 }
                 if (remote.pending_rename) |pending| {
-                    std.debug.print("sketerm: mux rename of '{s}' rejected: {s}\n", .{ remote.session, frame.payload });
+                    std.debug.print("sketerm: mux rename of '{s}' rejected: {s}\n", .{ remote.session, info.message });
                     self.allocator.free(pending);
                     remote.pending_rename = null;
                 }
@@ -3763,4 +3836,68 @@ test "canceling an asynchronous remote file read ignores late frames" {
     );
     term.handleRemoteFrame(.{ .ftype = .fs_reply, .payload = reply });
     try testing.expect(!capture.called);
+}
+
+test "a tagged mux error is never charged to an unrelated pending request" {
+    const plain = Terminal.classifyRemoteError("{\"error\":\"no such session\"}");
+    try std.testing.expectEqualStrings("", plain.request);
+    try std.testing.expectEqualStrings("no such session", plain.message);
+
+    const tagged = Terminal.classifyRemoteError(
+        "{\"error\":\"bad terminal size (rows and cols must each be 1..4096 and total cells must not exceed 1048576)\",\"for\":\"resize\"}",
+    );
+    try std.testing.expectEqualStrings("resize", tagged.request);
+    try std.testing.expectEqualStrings(
+        "bad terminal size (rows and cols must each be 1..4096 and total cells must not exceed 1048576)",
+        tagged.message,
+    );
+
+    // A message that merely mentions the tag key must not be mistaken
+    // for one, and an unparseable payload degrades to the old shape.
+    const decoy = Terminal.classifyRemoteError("{\"error\":\"\\\"for\\\":\\\"resize\\\" is not a session\"}");
+    try std.testing.expectEqualStrings("", decoy.request);
+    const junk = Terminal.classifyRemoteError("not json at all");
+    try std.testing.expectEqualStrings("", junk.request);
+    try std.testing.expectEqualStrings("not json at all", junk.message);
+}
+
+test "a rejected resize is reported and leaves a pending rename alone" {
+    const a = std.testing.allocator;
+    var remote = Terminal.Remote{
+        .conn = .{ .allocator = a, .fd = -1 },
+        .session = try a.dupe(u8, "work"),
+        .origin_name = @constCast("work"),
+        .pending_rename = try a.dupe(u8, "renamed"),
+        .predictor = undefined,
+    };
+    defer a.free(remote.session);
+    defer if (remote.pending_rename) |p| a.free(p);
+
+    const Capture = struct {
+        var body: [256]u8 = undefined;
+        var len: usize = 0;
+        var calls: u32 = 0;
+        fn notify(_: ?*anyopaque, ev: Screen.NotificationEvent) void {
+            calls += 1;
+            len = @min(ev.body.len, body.len);
+            @memcpy(body[0..len], ev.body[0..len]);
+        }
+    };
+    Capture.calls = 0;
+
+    var term: Terminal = undefined;
+    term.allocator = a;
+    term.remote = &remote;
+    term.user_ctx = null;
+    term.on_notification = Capture.notify;
+
+    term.handleRemoteFrame(.{
+        .ftype = .err,
+        .payload = "{\"error\":\"" ++ mux_wire.TERMINAL_SIZE_PROTOCOL_ERROR ++ "\",\"for\":\"resize\"}",
+    });
+
+    // The user is told, and the unrelated rename is still outstanding.
+    try std.testing.expectEqual(@as(u32, 1), Capture.calls);
+    try std.testing.expectEqualStrings(mux_wire.TERMINAL_SIZE_PROTOCOL_ERROR, Capture.body[0..Capture.len]);
+    try std.testing.expect(remote.pending_rename != null);
 }
