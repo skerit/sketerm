@@ -4,6 +4,7 @@ const std = @import("std");
 const c = @import("../../c.zig").c;
 const build_options = @import("build_options");
 const pathz = @import("../../util/pathz.zig");
+const atomicwrite = @import("../../util/atomicwrite.zig");
 const Doc = @import("doc.zig");
 const canary = @import("canary.zig");
 
@@ -701,16 +702,15 @@ const Blob = struct {
 /// Install bytes under their SHA-256 name after bounded cache pruning.
 ///
 /// This is a recoverable cache: sources remain in panel documents and are
-/// rehydrated on a miss. The cross-file prune/install sequence keeps its
-/// specialized stage, but deliberately does not fsync cache data or entries.
+/// rehydrated on a miss. Installed through the shared
+/// writer's cache policy, which deliberately does not fsync data or entries.
 pub fn store(
     allocator: std.mem.Allocator,
     root: []const u8,
     bytes: []const u8,
     protected: []const [64]u8,
-    nonce: u64,
 ) StoreError!Stored {
-    return storeWithOptions(allocator, root, bytes, protected, nonce, .{}, true);
+    return storeWithOptions(allocator, root, bytes, protected, .{}, true);
 }
 
 fn storeWithOptions(
@@ -718,7 +718,6 @@ fn storeWithOptions(
     root: []const u8,
     bytes: []const u8,
     protected: []const [64]u8,
-    nonce: u64,
     limits: CacheLimits,
     commit: bool,
 ) StoreError!Stored {
@@ -790,36 +789,11 @@ fn storeWithOptions(
     if (total_bytes +| need > limits.max_bytes or blob_count >= limits.max_blobs)
         return error.Capacity;
 
-    const stage = std.fmt.allocPrint(
-        allocator,
-        "{s}/.{s}.{d}.{d}.part",
-        .{ root, &hash, c.getpid(), nonce },
-    ) catch return error.OutOfMemory;
-    defer allocator.free(stage);
-    var stage_buf: [4096]u8 = undefined;
-    const stage_z = pathz.pathZ(&stage_buf, stage) catch return error.IoFailed;
-    _ = c.unlink(stage_z);
-    const fd = c.open(stage_z, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o600));
-    if (fd < 0) return error.IoFailed;
-    var closed = false;
-    errdefer {
-        if (!closed) _ = c.close(fd);
-        _ = c.unlink(stage_z);
-    }
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n > 0) {
-            off += @intCast(n);
-            continue;
-        }
-        if (n < 0 and std.posix.errno(n) == .INTR) continue;
-        return error.IoFailed;
-    }
-    closed = true;
-    if (c.close(fd) != 0) return error.IoFailed;
+    // The shared writer owns staging: unique name, O_EXCL|O_NOFOLLOW, EINTR
+    // handling and the no-fsync cache policy this cache wants, all in one
+    // place that the sweepers below recognise by name.
     if (!commit) return error.IoFailed;
-    if (c.rename(stage_z, target_z) != 0) return error.IoFailed;
+    atomicwrite.writeCacheFile(target, bytes, 0o600) catch return error.IoFailed;
     return .{ .allocator = allocator, .path = target, .hash = hash, .bytes = bytes.len };
 }
 
@@ -895,7 +869,7 @@ fn scanCache(
             continue;
         }
         const mtime = statMtimeSecs(st);
-        if (std.mem.endsWith(u8, name, ".part")) {
+        if (atomicwrite.isStageName(name)) {
             if (now - mtime >= partial_stale_secs) _ = c.unlink(full_z);
             allocator.free(full);
             continue;
@@ -945,7 +919,7 @@ fn cleanupProcessNamespaces(parent: []const u8, current_root: []const u8) void {
             if (std.mem.eql(u8, owner, ".") or std.mem.eql(u8, owner, "..")) continue;
             scanned += 1;
             if (!validOwnerName(owner)) {
-                if (validBlobName(owner) or std.mem.endsWith(u8, owner, ".part")) legacy_files = true;
+                if (validBlobName(owner) or atomicwrite.isStageName(owner)) legacy_files = true;
                 continue;
             }
             var owner_path_buf: [4096:0]u8 = undefined;
@@ -1017,7 +991,7 @@ fn cleanupLegacyNamespace(path: []const u8) void {
     const dir = c.opendir(path_z) orelse return;
     while (c.readdir(dir)) |entry| {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
-        if (!validBlobName(name) and !std.mem.endsWith(u8, name, ".part")) continue;
+        if (!validBlobName(name) and !atomicwrite.isStageName(name)) continue;
         var file_buf: [4096:0]u8 = undefined;
         const file = std.fmt.bufPrintZ(&file_buf, "{s}/{s}", .{ path, name }) catch continue;
         var st: c.struct_stat = undefined;
@@ -1146,7 +1120,7 @@ test "panel resolver maps logical paths without changing document serialization"
 
     const protected = try cache.protected(testing.allocator);
     defer testing.allocator.free(protected);
-    var blob = try store(testing.allocator, root, "frame-one", protected, 1);
+    var blob = try store(testing.allocator, root, "frame-one", protected);
     defer blob.deinit();
     var resolver = Resolver.init(testing.allocator, &cache);
     defer resolver.deinit();
@@ -1168,14 +1142,14 @@ test "panel cache verifies content, stages atomically, and refreshes a reused lo
     rmTree(root);
     defer rmTree(root);
 
-    var first = try storeWithOptions(testing.allocator, root, "red pixels", &.{}, 1, .{}, true);
+    var first = try storeWithOptions(testing.allocator, root, "red pixels", &.{}, .{}, true);
     defer first.deinit();
-    var same = try storeWithOptions(testing.allocator, root, "red pixels", &.{}, 2, .{}, true);
+    var same = try storeWithOptions(testing.allocator, root, "red pixels", &.{}, .{}, true);
     defer same.deinit();
     try testing.expectEqualStrings(first.path, same.path);
     try testing.expectEqual(first.hash, same.hash);
 
-    var second = try storeWithOptions(testing.allocator, root, "blue pixels", &.{}, 3, .{}, true);
+    var second = try storeWithOptions(testing.allocator, root, "blue pixels", &.{}, .{}, true);
     defer second.deinit();
     try testing.expect(!std.mem.eql(u8, first.path, second.path));
     try testing.expect(!std.mem.eql(u8, &first.hash, &second.hash));
@@ -1208,7 +1182,7 @@ test "panel cache verifies content, stages atomically, and refreshes a reused lo
     };
     try testing.expectError(
         error.IoFailed,
-        storeWithOptions(testing.allocator, root, "never committed", &.{}, 4, .{}, false),
+        storeWithOptions(testing.allocator, root, "never committed", &.{}, .{}, false),
     );
     var after_count: usize = 0;
     var zbuf: [4096]u8 = undefined;
@@ -1229,13 +1203,13 @@ test "panel cache bounds pruning and protects leased blobs" {
     defer rmTree(root);
     const limits = CacheLimits{ .max_bytes = 64, .max_blobs = 1, .partial_stale_secs = 0 };
 
-    var first = try storeWithOptions(testing.allocator, root, "first", &.{}, 1, limits, true);
+    var first = try storeWithOptions(testing.allocator, root, "first", &.{}, limits, true);
     defer first.deinit();
     try testing.expectError(
         error.Capacity,
-        storeWithOptions(testing.allocator, root, "second", &.{first.hash}, 2, limits, true),
+        storeWithOptions(testing.allocator, root, "second", &.{first.hash}, limits, true),
     );
-    var second = try storeWithOptions(testing.allocator, root, "second", &.{}, 3, limits, true);
+    var second = try storeWithOptions(testing.allocator, root, "second", &.{}, limits, true);
     defer second.deinit();
     try testing.expect(!std.mem.eql(u8, first.path, second.path));
     var first_buf: [4096]u8 = undefined;
@@ -1243,20 +1217,22 @@ test "panel cache bounds pruning and protects leased blobs" {
     var second_buf: [4096]u8 = undefined;
     try testing.expect(c.access(try pathz.pathZ(&second_buf, second.path), c.R_OK) == 0);
 
-    const stale = try std.fmt.allocPrint(testing.allocator, "{s}/.stale.part", .{root});
-    defer testing.allocator.free(stale);
-    var stale_buf: [4096]u8 = undefined;
-    const stale_z = try pathz.pathZ(&stale_buf, stale);
+    // Derive the orphan's name from the writer that produces one: a
+    // hand-built suffix passes while the sweeper matches nothing real.
+    var stale_root: [4096]u8 = undefined;
+    const stale_target = try std.fmt.bufPrint(&stale_root, "{s}/stale.blob", .{root});
+    var stale_stage: atomicwrite.StageBuf = undefined;
+    const stale_z = (try atomicwrite.stagePath(&stale_stage, stale_target)).ptr;
     const fd = c.open(stale_z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));
     try testing.expect(fd >= 0);
     _ = c.close(fd);
-    var same = try storeWithOptions(testing.allocator, root, "second", &.{}, 4, limits, true);
+    var same = try storeWithOptions(testing.allocator, root, "second", &.{}, limits, true);
     same.deinit();
     try testing.expect(c.access(stale_z, c.F_OK) != 0);
 
     const oversized = try testing.allocator.alloc(u8, MAX_ASSET_BYTES + 1);
     defer testing.allocator.free(oversized);
-    try testing.expectError(error.TooBig, store(testing.allocator, root, oversized, &.{}, 5));
+    try testing.expectError(error.TooBig, store(testing.allocator, root, oversized, &.{}));
 }
 
 test "panel cache namespace is isolated by GUI process" {

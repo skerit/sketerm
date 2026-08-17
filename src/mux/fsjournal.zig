@@ -3,6 +3,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
+const atomicwrite = @import("../util/atomicwrite.zig");
 
 pub const VERSION: u32 = 5;
 pub const MIN_READ_VERSION: u32 = 1;
@@ -87,11 +88,8 @@ pub fn phaseRank(phase: []const u8) u8 {
     return 0;
 }
 
-fn recordPath(buf: []u8, dir: []const u8, id: u64, temporary: bool) ![:0]u8 {
-    return if (temporary)
-        std.fmt.bufPrintZ(buf, "{s}/{d}.json.tmp-{d}", .{ dir, id, c.getpid() })
-    else
-        std.fmt.bufPrintZ(buf, "{s}/{d}.json", .{ dir, id });
+fn recordPath(buf: []u8, dir: []const u8, id: u64) ![:0]u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/{d}.json", .{ dir, id });
 }
 
 fn cancelPath(buf: []u8, dir: []const u8, id: u64) ![:0]u8 {
@@ -237,48 +235,20 @@ pub fn ensureDir(dir: []const u8) bool {
     return c.mkdir(p, 0o700) == 0 or std.posix.errno(@as(c_int, -1)) == .EXIST;
 }
 
+/// Replace one job record durably.
+///
+/// The shared writer owns the staging and the directory sync: its stage is
+/// unique per CALL, where the old fixed `.json.tmp-<pid>` let two saves in
+/// one process corrupt each other's, and it opens `O_EXCL|O_NOFOLLOW`
+/// where `fopen` followed a symlink into the journal directory.
 pub fn save(dir: []const u8, record: Record) !void {
     if (!ensureDir(dir)) return error.CreateFailed;
     var final_buf: [4096:0]u8 = undefined;
-    var temp_buf: [4096:0]u8 = undefined;
-    const final = try recordPath(&final_buf, dir, record.id, false);
-    const temp = try recordPath(&temp_buf, dir, record.id, true);
-    const fp = c.fopen(temp.ptr, "wb") orelse return error.WriteFailed;
-    const fd = c.fileno(fp);
-    if (fd < 0 or c.fchmod(fd, @as(c.mode_t, 0o600)) != 0) {
-        _ = c.fclose(fp);
-        _ = c.unlink(temp.ptr);
-        return error.WriteFailed;
-    }
+    const final = try recordPath(&final_buf, dir, record.id);
     var bytes: [16 * 1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&bytes);
-    std.json.Stringify.value(record, .{}, &w) catch {
-        _ = c.fclose(fp);
-        _ = c.unlink(temp.ptr);
-        return error.WriteFailed;
-    };
-    const out = w.buffered();
-    if (c.fwrite(out.ptr, 1, out.len, fp) != out.len or c.fflush(fp) != 0) {
-        _ = c.fclose(fp);
-        _ = c.unlink(temp.ptr);
-        return error.WriteFailed;
-    }
-    if (c.fsync(fd) != 0) {
-        _ = c.fclose(fp);
-        _ = c.unlink(temp.ptr);
-        return error.WriteFailed;
-    }
-    if (c.fclose(fp) != 0) {
-        _ = c.unlink(temp.ptr);
-        return error.WriteFailed;
-    }
-    if (c.rename(temp.ptr, final.ptr) != 0) {
-        _ = c.unlink(temp.ptr);
-        return error.WriteFailed;
-    }
-    // Persist the directory entry too: after a power loss a durable
-    // job must not regress to the pre-rename record.
-    if (!syncDir(dir)) return error.WriteFailed;
+    std.json.Stringify.value(record, .{}, &w) catch return error.WriteFailed;
+    atomicwrite.writeFileExact(final, w.buffered(), 0o600) catch return error.WriteFailed;
 }
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Record) {
@@ -373,6 +343,45 @@ test "job journal save/load is atomic and complete" {
     try std.testing.expectEqual(@as(u32, 2), parsed.value.recovery_attempts);
     try std.testing.expectEqualStrings("transport", parsed.value.error_kind);
     try std.testing.expect(parsed.value.acknowledged);
+}
+
+test "a symlink planted at the old fixed stage name cannot be written through" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const base = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/jobs", .{&tmp.sub_path});
+    try std.testing.expect(ensureDir(base));
+
+    const victim = try std.fmt.allocPrint(a, "{s}/victim", .{base});
+    var victim_buf: [4096]u8 = undefined;
+    const victim_z = try pathz.pathZ(&victim_buf, victim);
+    const vfd = c.open(victim_z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+    try std.testing.expect(vfd >= 0);
+    try std.testing.expect(c.write(vfd, "keep-me", 7) == 7);
+    _ = c.close(vfd);
+
+    // The old writer opened `<id>.json.tmp-<pid>` with fopen("wb"), which
+    // follows a symlink out of the journal directory.
+    const bait = try std.fmt.allocPrint(a, "{s}/7.json.tmp-{d}", .{ base, c.getpid() });
+    var bait_buf: [4096]u8 = undefined;
+    try std.testing.expect(c.symlink(victim_z, try pathz.pathZ(&bait_buf, bait)) == 0);
+
+    try save(base, .{ .id = 7, .op = "copy", .src = "/a", .dst = "/b" });
+
+    const vfd2 = c.open(victim_z, c.O_RDONLY | c.O_CLOEXEC);
+    try std.testing.expect(vfd2 >= 0);
+    defer _ = c.close(vfd2);
+    var got: [32]u8 = undefined;
+    const n = c.read(vfd2, &got, got.len);
+    try std.testing.expect(n == 7);
+    try std.testing.expectEqualStrings("keep-me", got[0..7]);
+
+    const path = try std.fmt.allocPrint(a, "{s}/7.json", .{base});
+    const parsed = try load(a, path);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u64, 7), parsed.value.id);
 }
 
 test "cancel fence is durable, idempotent, and independent of journal saves" {

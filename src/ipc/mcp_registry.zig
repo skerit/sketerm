@@ -7,6 +7,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
+const atomicwrite = @import("../util/atomicwrite.zig");
 
 pub const Mode = enum {
     isolated,
@@ -90,11 +91,6 @@ pub const Lease = struct {
         errdefer _ = c.close(fd);
         if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) return error.LockHeld;
 
-        // Runtime-only publication: the held flock is authoritative and the
-        // record is deleted at process exit. Rename keeps readers atomic, but
-        // fsync would buy no recovery value because stale records are swept.
-        const tmp_path = try std.fmt.allocPrint(allocator, "{s}/{d}.json.tmp", .{ dir, pid });
-        defer allocator.free(tmp_path);
         var aw: std.Io.Writer.Allocating = .init(allocator);
         defer aw.deinit();
         try std.json.Stringify.value(Record{
@@ -106,21 +102,11 @@ pub const Lease = struct {
             .mux_socket = registration.mux_socket,
         }, .{}, &aw.writer);
 
-        const tmp_z = try pathZ(&z, tmp_path);
-        const out = c.open(tmp_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));
-        if (out < 0) return error.RecordOpenFailed;
-        var out_open = true;
-        errdefer {
-            if (out_open) _ = c.close(out);
-        }
-        errdefer _ = c.unlink(tmp_z.ptr);
-        try writeAll(out, aw.written());
-        const close_rc = c.close(out);
-        out_open = false;
-        if (close_rc != 0) return error.RecordWriteFailed;
-        var record_z_buf: [4096]u8 = undefined;
-        const record_z = try pathZ(&record_z_buf, record_path);
-        if (c.rename(tmp_z.ptr, record_z.ptr) != 0) return error.RecordRenameFailed;
+        // Runtime-only publication: the held flock is authoritative and the
+        // record is deleted at process exit, so `writeCacheFile` — the shared
+        // writer's no-fsync policy, which exists for exactly this case.
+        atomicwrite.writeCacheFile(record_path, aw.written(), 0o600) catch
+            return error.RecordWriteFailed;
 
         return .{
             .allocator = allocator,
@@ -320,19 +306,6 @@ fn pathZ(buf: *[4096]u8, path: []const u8) ![:0]const u8 {
 fn unlinkPath(path: []const u8) void {
     var z: [4096]u8 = undefined;
     if (pathZ(&z, path)) |p| _ = c.unlink(p.ptr) else |_| {}
-}
-
-fn writeAll(fd: c_int, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n > 0) {
-            off += @intCast(n);
-            continue;
-        }
-        if (n < 0 and std.posix.errno(n) == .INTR) continue;
-        return error.RecordWriteFailed;
-    }
 }
 
 const ScopedRuntime = struct {

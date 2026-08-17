@@ -24,8 +24,9 @@
 //!     `fcntl`) because fcntl locks are per PROCESS and are dropped by
 //!     closing ANY descriptor to the file.
 //!   * `<key>.rec` — one JSON header line, '\n', then the raw buffer
-//!     bytes. Replaced atomically (temp + fsync + rename + directory
-//!     fsync), so a reader never sees a half-written record. The header
+//!     bytes. Replaced through `util/atomicwrite.zig` (unique exclusive
+//!     stage, fsync, rename, directory fsync), so a reader never sees a
+//!     half-written record. The header
 //!     is JSON for forward compatibility; the content is NOT, because
 //!     JSON-escaping a 100MB buffer on every autosave is not a cost
 //!     worth paying.
@@ -80,6 +81,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
+const atomicwrite = @import("../util/atomicwrite.zig");
 const doc_mod = @import("document.zig");
 const Document = doc_mod.Document;
 const reload = @import("reload.zig");
@@ -314,7 +316,7 @@ pub const Handle = struct {
         blob[header_json.len] = '\n';
         @memcpy(blob[header_json.len + 1 ..], content);
 
-        try writeFileAtomic(self.alloc, self.rec_path, blob);
+        try writeFileAtomic(self.rec_path, blob);
         self.written_revision = h.revision;
     }
 };
@@ -351,36 +353,15 @@ pub fn open(alloc: Allocator, spec: []const u8) !Handle {
     };
 }
 
-fn writeFileAtomic(alloc: Allocator, path: []const u8, bytes: []const u8) !void {
-    const temp = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, c.getpid() });
-    defer alloc.free(temp);
-    var pz: [4096]u8 = undefined;
-    var tz: [4096]u8 = undefined;
-    const tmp_z = try pathz.pathZ(&tz, temp);
-    const fp = c.fopen(tmp_z, "wb") orelse return Error.WriteFailed;
-    var ok = bytes.len == 0 or c.fwrite(bytes.ptr, 1, bytes.len, fp) == bytes.len;
-    if (ok) ok = c.fflush(fp) == 0;
-    if (ok) {
-        const fd = c.fileno(fp);
-        ok = fd >= 0 and c.fsync(fd) == 0;
-    }
-    if (c.fclose(fp) != 0) ok = false;
-    if (!ok) {
-        _ = c.unlink(tmp_z);
-        return Error.WriteFailed;
-    }
-    if (c.rename(tmp_z, try pathz.pathZ(&pz, path)) != 0) {
-        _ = c.unlink(tmp_z);
-        return Error.WriteFailed;
-    }
-    // A rename that is not durable can resurrect the OLD snapshot after
-    // a crash, which is stale work presented as recovered work.
-    const parent = std.fs.path.dirname(path) orelse return;
-    var dz: [4096]u8 = undefined;
-    const dfd = c.open(try pathz.pathZ(&dz, parent), c.O_RDONLY | c.O_DIRECTORY);
-    if (dfd < 0) return;
-    defer _ = c.close(dfd);
-    _ = c.fsync(dfd);
+/// Replace a record durably.
+///
+/// The shared writer, not a local copy: its stage is unique per CALL (two
+/// concurrent snapshot saves in one process shared `.tmp-<pid>` and
+/// corrupted each other) and it opens `O_EXCL|O_NOFOLLOW`, where `fopen`
+/// followed a symlink planted in the journal directory. It also syncs the
+/// parent, so a crash cannot resurrect the OLD snapshot as recovered work.
+fn writeFileAtomic(path: []const u8, bytes: []const u8) !void {
+    atomicwrite.writeFileExact(path, bytes, 0o600) catch return Error.WriteFailed;
 }
 
 // ---- reading ----------------------------------------------------------
@@ -885,6 +866,44 @@ test "journal: prune drops records older than the cutoff" {
     try testing.expectEqual(@as(usize, 0), entries.len);
 }
 
+test "journal: a symlink at the old fixed stage name cannot be written through" {
+    const alloc = testing.allocator;
+    var scope = try ScopedDir.init(alloc, "symlink");
+    defer scope.deinit();
+
+    const dir = try dirPath(alloc);
+    defer alloc.free(dir);
+    try ensureDir(dir);
+
+    const victim = try std.fmt.allocPrint(alloc, "{s}/victim", .{dir});
+    defer alloc.free(victim);
+    var victim_buf: [4096]u8 = undefined;
+    const victim_z = try pathz.pathZ(&victim_buf, victim);
+    const vfd = c.open(victim_z, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+    try testing.expect(vfd >= 0);
+    try testing.expect(c.write(vfd, "keep-me", 7) == 7);
+    _ = c.close(vfd);
+
+    // The old writer staged at `<rec>.tmp-<pid>` through fopen("wb"), which
+    // follows a symlink straight out of the journal directory.
+    const rec_path = try std.fmt.allocPrint(alloc, "{s}/0000000000000001-1.rec", .{dir});
+    defer alloc.free(rec_path);
+    const bait = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ rec_path, c.getpid() });
+    defer alloc.free(bait);
+    var bait_buf: [4096]u8 = undefined;
+    try testing.expect(c.symlink(victim_z, try pathz.pathZ(&bait_buf, bait)) == 0);
+
+    try writeFileAtomic(rec_path, "{\"version\":1,\"spec\":\"/tmp/x\"}\nbody");
+
+    const vfd2 = c.open(victim_z, c.O_RDONLY | c.O_CLOEXEC);
+    try testing.expect(vfd2 >= 0);
+    defer _ = c.close(vfd2);
+    var got: [32]u8 = undefined;
+    const n = c.read(vfd2, &got, got.len);
+    try testing.expect(n == 7);
+    try testing.expectEqualStrings("keep-me", got[0..7]);
+}
+
 test "journal: a record from a NEWER sketerm is left alone" {
     const alloc = testing.allocator;
     var scope = try ScopedDir.init(alloc, "future");
@@ -896,7 +915,6 @@ test "journal: a record from a NEWER sketerm is left alone" {
     const rec_path = try std.fmt.allocPrint(alloc, "{s}/ffffffffffffffff-1.rec", .{dir});
     defer alloc.free(rec_path);
     try writeFileAtomic(
-        alloc,
         rec_path,
         "{\"version\":999,\"spec\":\"/tmp/x\",\"revision\":2,\"saved_revision\":1}\nbody",
     );
