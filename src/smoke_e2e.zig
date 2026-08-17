@@ -2569,28 +2569,56 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
 
     // 3. Drop on the TOP of the first row -> reorder above it, still a
     //    root. This is the gesture the old drag had no notion of: it
-    //    could only ever make the dropped-on row a parent.
-    const above_y = @as(f64, @floatFromInt(first_row.min_y)) + 2.0;
-    app.drag(win_id, mid.of(unnested).x, mid.of(unnested).y, onto.x, above_y, 1) catch
-        return "dragging a sidebar row above another failed";
-    _ = app.waitIdle(300, 6_000);
-    const reordered = blk: {
+    //    could only ever make the dropped-on row a parent. Same probing
+    //    as the nest gesture, for the same reason: the chip's top pixel
+    //    sits a few jittering pixels ABOVE the row widget's input box
+    //    (list border + font metrics), so one fixed offset can land in
+    //    the list background — where a drop is the root no-op — instead
+    //    of the row's "above" zone (its top 30%, about 8px).
+    const above_offsets = [_]f64{ 4.0, 6.0, 2.0, 8.0 };
+    var reordered_ok = false;
+    for (above_offsets, 0..) |off, attempt| {
+        var b_first = first_row;
+        var b_drag = unnested;
+        if (attempt > 0) {
+            // A missed drop may have nested or reordered elsewhere;
+            // re-learn both rectangles by focusing each tab in turn.
+            if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+            _ = app.waitIdle(200, 4_000);
+            b_first = sidebarChipBounds(app, win_id) orelse return "the first tab's row vanished between reorder attempts";
+            var refocus_buf: [96]u8 = undefined;
+            const refocus = std.fmt.bufPrint(&refocus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{extra[1]}) catch
+                return "building the reorder refocus command failed";
+            if (roundtrip(allocator, sock_path, refocus)) |r| allocator.free(r);
+            _ = app.waitIdle(200, 4_000);
+            b_drag = sidebarChipBounds(app, win_id) orelse return "the dragged tab's row vanished between reorder attempts";
+        }
+        const above_y = @as(f64, @floatFromInt(b_first.min_y)) + off;
+        app.drag(win_id, mid.of(b_drag).x, mid.of(b_drag).y, mid.of(b_first).x, above_y, 1) catch
+            return "dragging a sidebar row above another failed";
+        _ = app.waitIdle(300, 6_000);
+        // Success is structural AND visual: a root again, drawn above
+        // the old first row.
+        if (waitTreeParent(allocator, app, sock_path, extra[1], null, 3_000) == null) continue;
         var waited: u32 = 0;
-        while (waited < 6_000) : (waited += 100) {
+        while (waited < 3_000) : (waited += 100) {
             if (sidebarChipBounds(app, win_id)) |b| {
-                if (b.min_y <= first_row.min_y) break :blk b;
+                if (b.min_y <= b_first.min_y) {
+                    reordered_ok = true;
+                    break;
+                }
             }
             _ = app.pumpOnce(100);
         }
-        break :blk sidebarChipBounds(app, win_id) orelse
-            return "the reordered sidebar row disappeared";
-    };
-    if (reordered.min_y > first_row.min_y) {
-        _ = c.fprintf(platform.stderr(), "smoke-e2e: reorder target y %zu, landed at %zu\n", first_row.min_y, reordered.min_y);
+        if (reordered_ok) break;
+    }
+    if (!reordered_ok) {
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n")) |r| {
+            defer allocator.free(r);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: tabs after the reorder drops: %.*s\n", @as(c_int, @intCast(r.len)), r.ptr);
+        }
         return "dropping a sidebar row above another did not move it to the top";
     }
-    if (waitTreeParent(allocator, app, sock_path, extra[1], null, 2_000) == null)
-        return "a row dropped BETWEEN rows was nested instead of reordered";
 
     if (app.screenshotPng(win_id, 1400, null, 0)) |shot| {
         defer allocator.free(shot.png);

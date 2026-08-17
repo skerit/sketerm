@@ -1964,6 +1964,24 @@ pub const App = struct {
             try self.sendIntents(win.chan, units.items);
             self.pumpFor(12);
         }
+        // Settle jiggle: GTK's own drag threshold eats the first ~8px
+        // of motion, so a short drag can reach (x2,y2) BEFORE the
+        // toolkit calls start_drag — leaving the dnd session zero or
+        // one motion events. GTK's drop-target picking never settles
+        // on so few (zero -> no target, release cancels the source;
+        // one -> an ancestor target can win over the widget under the
+        // pointer). A real hand always jitters at the destination, so
+        // emulate that: a few sub-pixel-scale motions at the target
+        // guarantee the session sees enough movement to pick and
+        // accept the right drop target, wherever the threshold fired.
+        var j: u32 = 0;
+        while (j < 4) : (j += 1) {
+            const dy: f64 = if (j % 2 == 0) 1.0 else 0.0;
+            units.clearRetainingCapacity();
+            wlpipe.appendSeatMotion(&units, a, x2 - off_x, y2 + dy - off_y) catch return Error.OutOfMemory;
+            try self.sendIntents(win.chan, units.items);
+            self.pumpFor(30);
+        }
         self.pumpFor(150);
         units.clearRetainingCapacity();
         wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
