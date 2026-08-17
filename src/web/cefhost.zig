@@ -1381,23 +1381,31 @@ pub const Host = struct {
     /// reload. The navigation history is NOT restored (see
     /// `View.discarded`).
     fn reviveView(self: *Host, v: *View) void {
+        return self.reviveViewWith(v, &system_browser_spawn_ops);
+    }
+
+    fn reviveViewWith(self: *Host, v: *View, ops: *const BrowserSpawnOps) void {
         if (!v.discarded) return;
         // `spawnBrowser` can reach `setUrl` through an address-change
         // callback fired inside create_browser_sync, which would free
         // the very slice it is loading; the copy costs one url.
         const url = self.gpa.dupe(u8, v.url) catch return;
         defer self.gpa.free(url);
-        self.reviveAt(v, url);
+        self.reviveAtWith(v, url, ops);
     }
 
     /// Revive a discarded view AT `url` — the same single document a
     /// fresh `view_create_url` produces, which is why a navigation into
     /// a discarded view does not first load the address it had.
     fn reviveAt(self: *Host, v: *View, url: []const u8) void {
+        return self.reviveAtWith(v, url, &system_browser_spawn_ops);
+    }
+
+    fn reviveAtWith(self: *Host, v: *View, url: []const u8, ops: *const BrowserSpawnOps) void {
         const id = v.id;
         v.discarded = false;
         v.hidden = false;
-        self.spawnBrowser(v, url) catch |err| {
+        self.spawnBrowserWith(v, url, ops) catch |err| {
             // Browser creation used to leave the retained record
             // discarded, while a later frame-buffer failure destroyed it.
             // Keep that distinction while making this owner perform both.
@@ -1414,8 +1422,20 @@ pub const Host = struct {
     /// "somebody is using this page again". Null when the id is unknown
     /// or the revival failed, which every caller treats as "ignore".
     fn findWake(self: *Host, id: u32) ?*View {
-        const v = self.find(id) orelse return null;
-        if (v.discarded) self.reviveView(v);
+        return self.findWakeWith(id, &system_browser_spawn_ops);
+    }
+
+    fn findWakeWith(self: *Host, id: u32, ops: *const BrowserSpawnOps) ?*View {
+        var v = self.find(id) orelse return null;
+        if (v.discarded) {
+            self.reviveViewWith(v, ops);
+            // A failed revival is `reviveAt`'s to own, and everything but
+            // `BrowserCreateFailed` DESTROYS the record, so the pointer
+            // is re-established from the table rather than dereferenced
+            // again. Reading `v.discarded` off freed memory returned the
+            // dangling view to callers that then wrote through it.
+            v = self.find(id) orelse return null;
+        }
         if (v.discarded) return null;
         return v;
     }
@@ -6290,6 +6310,55 @@ test "view construction system failures release one owned view" {
         try std.testing.expect(host.find(52) == null);
         try injected.expectReleased();
     }
+}
+
+test "a failed revival leaves findWake with no view to hand back" {
+    // Everything but `BrowserCreateFailed` makes `reviveAt` destroy the
+    // record it was reviving, so `findWake` must re-establish liveness
+    // instead of reading `discarded` back off freed memory -- which read
+    // false, returned the dangling view, and let the callers write
+    // through it into whatever reused the slot.
+    const cases = [_]ViewConstructionTest.Failure{ .memfd, .truncate, .map, .announce };
+    for (cases) |failure| {
+        var out = proto.Outbox.init(std.testing.allocator);
+        defer out.deinit();
+        defer ViewConstructionTest.closeOutboxFds(&out);
+        var host = Host.init(std.testing.allocator, &out);
+        defer host.deinit();
+
+        const prior = try host.registerView(ViewConstructionTest.req(71, 0));
+        const doomed = try host.registerView(ViewConstructionTest.req(72, 0));
+        host.discardView(doomed.id);
+        try std.testing.expect(doomed.discarded);
+
+        var injected = ViewConstructionTest{ .failure = failure };
+        var spawn_ops = injected.ops();
+        try std.testing.expect(host.findWakeWith(72, &spawn_ops) == null);
+        try std.testing.expectEqual(@as(usize, 1), host.viewCount());
+        try std.testing.expect(host.find(72) == null);
+        try std.testing.expect(host.find(71) == prior);
+        try std.testing.expect(!prior.discarded);
+        try injected.expectReleased();
+    }
+}
+
+test "a revival refused by the engine keeps the view discarded" {
+    // The other half of `reviveAt`'s split: BrowserCreateFailed retains
+    // the record, so the id stays known and a later attempt can succeed.
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    defer ViewConstructionTest.closeOutboxFds(&out);
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+
+    const v = try host.registerView(ViewConstructionTest.req(81, 0));
+    host.discardView(v.id);
+    var injected = ViewConstructionTest{ .failure = .browser };
+    var spawn_ops = injected.ops();
+    try std.testing.expect(host.findWakeWith(81, &spawn_ops) == null);
+    try std.testing.expectEqual(@as(usize, 1), host.viewCount());
+    try std.testing.expect(host.find(81) == v);
+    try std.testing.expect(v.discarded);
 }
 
 test "view construction rejects a missing context before ownership transfer" {
