@@ -2922,8 +2922,11 @@ pub const Host = struct {
             });
             return;
         }
-        self.quiesceWebext(req.id, "extension was reinstalled or toggled");
-        const e = self.webext.set(req.id, req.dir, req.enabled != 0) catch {
+        var prepared = self.webext.prepareSet(req.id, req.dir, req.enabled != 0) catch {
+            if (self.webext.find(req.id)) |old| {
+                self.postWebextState(old);
+                return;
+            }
             self.post(proto.EvWebextState{
                 .id = req.id,
                 .name = "",
@@ -2934,6 +2937,9 @@ pub const Host = struct {
             });
             return;
         };
+        defer prepared.deinit();
+        self.quiesceWebext(req.id, "extension was reinstalled or toggled");
+        const e = self.webext.commitSet(&prepared);
         if (e.enabled and e.ok) {
             self.publishOrigin(e);
             self.ensureBackground(e);

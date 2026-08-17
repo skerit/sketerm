@@ -89,6 +89,35 @@ pub const Extension = struct {
     }
 };
 
+/// A complete replacement that owns every field until `commitSet` consumes it.
+pub const PreparedSet = struct {
+    gpa: std.mem.Allocator,
+    ext: Extension,
+    consumed: bool = false,
+
+    pub fn deinit(self: *PreparedSet) void {
+        if (!self.consumed) freeCandidate(self.gpa, &self.ext);
+        self.consumed = true;
+    }
+};
+
+fn freeBytes(gpa: std.mem.Allocator, value: []u8) void {
+    if (value.len != 0) gpa.free(value);
+}
+
+fn dupeBytes(gpa: std.mem.Allocator, value: []const u8) ![]u8 {
+    return if (value.len == 0) &.{} else try gpa.dupe(u8, value);
+}
+
+fn freeCandidate(gpa: std.mem.Allocator, e: *Extension) void {
+    freeBytes(gpa, e.id);
+    freeBytes(gpa, e.dir);
+    freeBytes(gpa, e.err);
+    if (e.man) |*m| m.deinit();
+    e.action.deinit(gpa);
+    e.* = undefined;
+}
+
 pub const Host = struct {
     gpa: std.mem.Allocator,
     /// `$XDG_DATA_HOME/sketerm/webext` — per-extension storage lives in
@@ -108,7 +137,7 @@ pub const Host = struct {
         for (self.exts.items) |*e| self.freeExt(e);
         self.exts.deinit(self.gpa);
         self.tabs.deinit(self.gpa);
-        self.gpa.free(self.data_dir);
+        freeBytes(self.gpa, self.data_dir);
     }
 
     fn freeExt(self: *Host, e: *Extension) void {
@@ -121,9 +150,9 @@ pub const Host = struct {
             self.gpa.destroy(r);
             e.wreq = null;
         }
-        self.gpa.free(e.id);
-        self.gpa.free(e.dir);
-        if (e.err.len != 0) self.gpa.free(e.err);
+        freeBytes(self.gpa, e.id);
+        freeBytes(self.gpa, e.dir);
+        freeBytes(self.gpa, e.err);
         if (e.man) |*m| m.deinit();
         if (e.store) |*s| s.deinit();
         e.action.deinit(self.gpa);
@@ -149,37 +178,55 @@ pub const Host = struct {
     /// `dir/manifest.json` every call so a re-enable picks up edits.
     /// Never fails hard: a bad manifest records `ok = false` + `err`.
     pub fn set(self: *Host, id: []const u8, dir: []const u8, enabled: bool) !*Extension {
+        var prepared = try self.prepareSet(id, dir, enabled);
+        defer prepared.deinit();
+        return self.commitSet(&prepared);
+    }
+
+    /// Allocate and parse a complete extension instance without changing live state.
+    pub fn prepareSet(self: *Host, id: []const u8, dir: []const u8, enabled: bool) !PreparedSet {
         if (!manifest.idValid(id)) return error.InvalidExtensionId;
-        var e = self.find(id) orelse blk: {
-            const new_id = try self.gpa.dupe(u8, id);
-            const new_dir = self.gpa.dupe(u8, dir) catch |err| {
-                self.gpa.free(new_id);
-                return err;
-            };
-            self.exts.append(self.gpa, .{ .id = new_id, .dir = new_dir }) catch |err| {
-                self.gpa.free(new_id);
-                self.gpa.free(new_dir);
-                return err;
-            };
-            break :blk &self.exts.items[self.exts.items.len - 1];
+        var candidate = Extension{
+            .id = try dupeBytes(self.gpa, id),
+            .dir = &.{},
+            .enabled = enabled,
         };
-        // A changed dir re-points the record.
-        if (!std.mem.eql(u8, e.dir, dir)) {
-            const new_dir = try self.gpa.dupe(u8, dir);
-            self.gpa.free(e.dir);
-            e.dir = new_dir;
+        errdefer freeCandidate(self.gpa, &candidate);
+        candidate.dir = try dupeBytes(self.gpa, dir);
+        try self.parseCandidate(&candidate);
+        try mintCapability(&candidate);
+        if (self.find(id) == null) try self.exts.ensureUnusedCapacity(self.gpa, 1);
+        return .{ .gpa = self.gpa, .ext = candidate };
+    }
+
+    /// Replace or append a prepared instance without performing allocations.
+    pub fn commitSet(self: *Host, prepared: *PreparedSet) *Extension {
+        std.debug.assert(!prepared.consumed);
+        const candidate = &prepared.ext;
+        if (self.find(candidate.id)) |e| {
+            self.clearParsedState(e);
+            freeBytes(self.gpa, e.dir);
+            e.dir = candidate.dir;
+            candidate.dir = &.{};
+            e.enabled = candidate.enabled;
+            e.ok = candidate.ok;
+            e.err = candidate.err;
+            candidate.err = &.{};
+            e.man = candidate.man;
+            candidate.man = null;
+            e.action = candidate.action;
+            candidate.action = .{};
+            e.capability = candidate.capability;
+            e.capability_ok = candidate.capability_ok;
+            freeBytes(self.gpa, candidate.id);
+            candidate.id = &.{};
+            prepared.consumed = true;
+            return e;
         }
-        // Every set represents a new extension instance, including a
-        // disable/re-enable and an unpacked package being reinstalled in
-        // place. Invalidate the old authority before doing anything that
-        // can fail, then mint a replacement for this instance.
-        e.capability = @splat(0);
-        e.capability_ok = false;
-        e.enabled = false;
-        try mintCapability(e);
-        e.enabled = enabled;
-        self.reparse(e);
-        return e;
+
+        self.exts.appendAssumeCapacity(candidate.*);
+        prepared.consumed = true;
+        return &self.exts.items[self.exts.items.len - 1];
     }
 
     /// Resolve an enabled extension only when its rotating capability
@@ -230,7 +277,7 @@ pub const Host = struct {
         webrequest.refreshAnyLocked();
     }
 
-    fn reparse(self: *Host, e: *Extension) void {
+    fn clearParsedState(self: *Host, e: *Extension) void {
         // The compiled host permissions belong to the OLD manifest.
         if (e.wreq) |r| {
             webrequest.acquire();
@@ -246,31 +293,35 @@ pub const Host = struct {
             e.man = null;
         }
         e.action.deinit(self.gpa);
-        if (e.err.len != 0) {
-            self.gpa.free(e.err);
-            e.err = &.{};
-        }
+        freeBytes(self.gpa, e.err);
+        e.err = &.{};
         e.ok = false;
+    }
+
+    fn parseCandidate(self: *Host, e: *Extension) !void {
         var path_buf: [4096]u8 = undefined;
         const mpath = std.fmt.bufPrint(&path_buf, "{s}/manifest.json", .{e.dir}) catch {
-            e.err = self.gpa.dupe(u8, "path too long") catch &.{};
+            e.err = try dupeBytes(self.gpa, "path too long");
             return;
         };
-        const bytes = readFileZ(self.gpa, mpath, 4 * 1024 * 1024) orelse {
-            e.err = self.gpa.dupe(u8, "manifest.json not readable") catch &.{};
-            return;
+        const bytes = readFileZFallible(self.gpa, mpath, 4 * 1024 * 1024) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ReadFailed => {
+                e.err = try dupeBytes(self.gpa, "manifest.json not readable");
+                return;
+            },
         };
         defer self.gpa.free(bytes);
         var m = manifest.parse(self.gpa, bytes) catch |err| {
-            e.err = std.fmt.allocPrint(self.gpa, "manifest parse: {s}", .{@errorName(err)}) catch &.{};
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            e.err = try std.fmt.allocPrint(self.gpa, "manifest parse: {s}", .{@errorName(err)});
             return;
         };
         const action_kind: manifest.ActionKind = if (m.browser_action != null) .browser else .page;
         const action_manifest = m.browser_action orelse m.page_action;
-        const action_state = action.State.init(self.gpa, action_kind, action_manifest) catch {
+        const action_state = action.State.init(self.gpa, action_kind, action_manifest) catch |err| {
             m.deinit();
-            e.err = self.gpa.dupe(u8, "browser action: out of memory") catch &.{};
-            return;
+            return err;
         };
         e.man = m;
         e.action = action_state;
@@ -718,6 +769,162 @@ test "extension capabilities authorize only their owning instance and rotate" {
     try std.testing.expect(host.authorize("one@sketerm.test", &one.capability) == one);
 }
 
+const allocation_test_id = "allocation@sketerm.test";
+const allocation_manifest_old =
+    \\{"manifest_version":2,"name":"Allocation Old","version":"1",
+    \\ "browser_specific_settings":{"gecko":{"id":"allocation@sketerm.test"}},
+    \\ "permissions":["tabs","storage"],
+    \\ "browser_action":{"default_title":"Old Action","default_icon":"old.svg","default_popup":"old.html"}}
+;
+const allocation_manifest_new =
+    \\{"manifest_version":2,"name":"Allocation New","version":"2",
+    \\ "browser_specific_settings":{"gecko":{"id":"allocation@sketerm.test"}},
+    \\ "permissions":["tabs","storage","webRequest"],
+    \\ "browser_action":{"default_title":"New Action","default_icon":"new.svg","default_popup":"new.html"}}
+;
+
+const AllocationTestDir = struct {
+    storage: [96:0]u8,
+
+    fn init() !AllocationTestDir {
+        var self = AllocationTestDir{ .storage = undefined };
+        const template = "/tmp/sketerm-webext-host-XXXXXX";
+        @memcpy(self.storage[0..template.len], template);
+        self.storage[template.len] = 0;
+        _ = c.mkdtemp(@ptrCast(&self.storage)) orelse return error.SkipZigTest;
+
+        var old_buf: [256]u8 = undefined;
+        const old_dir = self.child("old", &old_buf);
+        var new_buf: [256]u8 = undefined;
+        const new_dir = self.child("new", &new_buf);
+        mkdirAll(old_dir);
+        mkdirAll(new_dir);
+        try writeAllocationManifest(old_dir, allocation_manifest_old);
+        try writeAllocationManifest(new_dir, allocation_manifest_new);
+        return self;
+    }
+
+    fn path(self: *const AllocationTestDir) []const u8 {
+        return std.mem.sliceTo(&self.storage, 0);
+    }
+
+    fn child(self: *const AllocationTestDir, name: []const u8, out: []u8) []const u8 {
+        return std.fmt.bufPrint(out, "{s}/{s}", .{ self.path(), name }) catch unreachable;
+    }
+
+    fn deinit(self: *AllocationTestDir) void {
+        var path_buf: [320:0]u8 = undefined;
+        for ([_][]const u8{ "old/manifest.json", "new/manifest.json" }) |rel| {
+            const child_path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ self.path(), rel }) catch continue;
+            _ = c.unlink(child_path.ptr);
+        }
+        for ([_][]const u8{ "old", "new" }) |rel| {
+            const child_path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}", .{ self.path(), rel }) catch continue;
+            _ = c.rmdir(child_path.ptr);
+        }
+        _ = c.rmdir(@ptrCast(&self.storage));
+    }
+};
+
+fn writeAllocationManifest(dir: []const u8, bytes: []const u8) !void {
+    var path_buf: [320:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/manifest.json", .{dir});
+    const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+    if (fd < 0) return error.WriteFailed;
+    defer _ = c.close(fd);
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
+        if (n <= 0) return error.WriteFailed;
+        off += @intCast(n);
+    }
+}
+
+fn registrationAllocationCase(dir: []const u8, fail_index: ?usize) !usize {
+    const t = std.testing;
+    var config: t.FailingAllocator.Config = .{};
+    if (fail_index) |index| config.fail_index = index;
+    var failing = t.FailingAllocator.init(t.allocator, config);
+    var host = Host{ .gpa = failing.allocator(), .data_dir = &.{} };
+    defer host.deinit();
+
+    if (fail_index != null) {
+        try t.expectError(error.OutOfMemory, host.set(allocation_test_id, dir, true));
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(@as(usize, 0), host.exts.items.len);
+        try t.expect(host.find(allocation_test_id) == null);
+    } else {
+        const e = try host.set(allocation_test_id, dir, true);
+        try t.expectEqualStrings("Allocation New", e.name());
+        try t.expectEqualStrings("2", e.version());
+        try t.expectEqualStrings("New Action", e.action.effective(0).title);
+        try t.expect(host.authorize(allocation_test_id, &e.capability) == e);
+    }
+    return failing.alloc_index;
+}
+
+test "extension registration rolls back every allocation failure" {
+    var dir = try AllocationTestDir.init();
+    defer dir.deinit();
+    var new_buf: [256]u8 = undefined;
+    const new_dir = dir.child("new", &new_buf);
+    const allocations = try registrationAllocationCase(new_dir, null);
+    try std.testing.expect(allocations > 8);
+    for (0..allocations) |fail_index| {
+        _ = try registrationAllocationCase(new_dir, fail_index);
+    }
+}
+
+const AllocationRange = struct { first: usize, end: usize };
+
+fn reloadAllocationCase(old_dir: []const u8, new_dir: []const u8, fail_index: ?usize) !AllocationRange {
+    const t = std.testing;
+    var config: t.FailingAllocator.Config = .{};
+    if (fail_index) |index| config.fail_index = index;
+    var failing = t.FailingAllocator.init(t.allocator, config);
+    var host = Host{ .gpa = failing.allocator(), .data_dir = &.{} };
+    defer host.deinit();
+
+    const old = try host.set(allocation_test_id, old_dir, true);
+    const old_capability = old.capability;
+    const first = failing.alloc_index;
+    if (fail_index != null) {
+        try t.expectError(error.OutOfMemory, host.set(allocation_test_id, new_dir, true));
+        try t.expect(failing.has_induced_failure);
+        const retained = host.find(allocation_test_id).?;
+        try t.expect(retained == old);
+        try t.expectEqualStrings(old_dir, retained.dir);
+        try t.expectEqualStrings("Allocation Old", retained.name());
+        try t.expectEqualStrings("1", retained.version());
+        try t.expectEqualStrings("Old Action", retained.action.effective(0).title);
+        try t.expectEqualStrings("old.html", retained.action.effective(0).popup);
+        try t.expect(host.authorize(allocation_test_id, &old_capability) == retained);
+    } else {
+        const replacement = try host.set(allocation_test_id, new_dir, true);
+        try t.expect(replacement == old);
+        try t.expectEqualStrings(new_dir, replacement.dir);
+        try t.expectEqualStrings("Allocation New", replacement.name());
+        try t.expectEqualStrings("2", replacement.version());
+        try t.expect(host.authorizeCapability(&old_capability) == null);
+        try t.expect(host.authorize(allocation_test_id, &replacement.capability) == replacement);
+    }
+    return .{ .first = first, .end = failing.alloc_index };
+}
+
+test "extension reload preserves the live instance at every allocation failure" {
+    var dir = try AllocationTestDir.init();
+    defer dir.deinit();
+    var old_buf: [256]u8 = undefined;
+    const old_dir = dir.child("old", &old_buf);
+    var new_buf: [256]u8 = undefined;
+    const new_dir = dir.child("new", &new_buf);
+    const baseline = try reloadAllocationCase(old_dir, new_dir, null);
+    try std.testing.expect(baseline.end - baseline.first > 8);
+    for (baseline.first..baseline.end) |fail_index| {
+        _ = try reloadAllocationCase(old_dir, new_dir, fail_index);
+    }
+}
+
 // -- filesystem (libc) ------------------------------------------------
 
 /// Read a whole file bounded at `max`, owned by `gpa`. Exposed so
@@ -728,21 +935,27 @@ pub fn readFilePub(gpa: std.mem.Allocator, path: []const u8, max: usize) ?[]u8 {
 }
 
 fn readFileZ(gpa: std.mem.Allocator, path: []const u8, max: usize) ?[]u8 {
+    return readFileZFallible(gpa, path, max) catch null;
+}
+
+const ReadFileError = error{ OutOfMemory, ReadFailed };
+
+fn readFileZFallible(gpa: std.mem.Allocator, path: []const u8, max: usize) ReadFileError![]u8 {
     var zbuf: [4200]u8 = undefined;
-    if (path.len + 1 > zbuf.len) return null;
+    if (path.len + 1 > zbuf.len) return error.ReadFailed;
     @memcpy(zbuf[0..path.len], path);
     zbuf[path.len] = 0;
     const fd = c.open(@ptrCast(&zbuf), c.O_RDONLY);
-    if (fd < 0) return null;
+    if (fd < 0) return error.ReadFailed;
     defer _ = c.close(fd);
     var st: c.struct_stat = undefined;
-    if (c.fstat(fd, &st) != 0) return null;
+    if (c.fstat(fd, &st) != 0) return error.ReadFailed;
     const size: usize = @intCast(@max(st.st_size, 0));
     if (size == 0 or size > max) {
-        if (size == 0) return gpa.alloc(u8, 0) catch null;
-        return null;
+        if (size == 0) return &.{};
+        return error.ReadFailed;
     }
-    const buf = gpa.alloc(u8, size) catch return null;
+    const buf = gpa.alloc(u8, size) catch return error.OutOfMemory;
     errdefer gpa.free(buf);
     var got: usize = 0;
     while (got < size) {
@@ -751,8 +964,7 @@ fn readFileZ(gpa: std.mem.Allocator, path: []const u8, max: usize) ?[]u8 {
         got += @intCast(n);
     }
     if (got != size) {
-        gpa.free(buf);
-        return null;
+        return error.ReadFailed;
     }
     return buf;
 }

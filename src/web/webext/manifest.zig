@@ -110,7 +110,10 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) ParseError!Manifest {
     errdefer m.arena.deinit();
     const a = m.arena.allocator();
 
-    const parsed = std.json.parseFromSlice(std.json.Value, a, json, .{}) catch return error.BadJson;
+    const parsed = std.json.parseFromSlice(std.json.Value, a, json, .{}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadJson,
+    };
     const root = switch (parsed.value) {
         .object => |o| o,
         else => return error.NotObject,
@@ -126,10 +129,10 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) ParseError!Manifest {
     // differs enough that silently parsing it would mislead a user.
     if (m.manifest_version >= 3) return error.UnsupportedManifestVersion;
 
-    m.name = dupStr(a, root.get("name")) orelse return error.MissingName;
-    m.version = dupStr(a, root.get("version")) orelse return error.MissingVersion;
-    m.description = dupStr(a, root.get("description")) orelse "";
-    m.default_locale = dupStr(a, root.get("default_locale"));
+    m.name = try dupStr(a, root.get("name")) orelse return error.MissingName;
+    m.version = try dupStr(a, root.get("version")) orelse return error.MissingVersion;
+    m.description = try dupStr(a, root.get("description")) orelse "";
+    m.default_locale = try dupStr(a, root.get("default_locale"));
 
     m.permissions = try dupStrArray(a, root.get("permissions"));
     m.host_permissions = try dupStrArray(a, root.get("host_permissions"));
@@ -145,7 +148,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) ParseError!Manifest {
                 script.exclude_matches = try dupStrArray(a, o.get("exclude_matches"));
                 script.js = try dupStrArray(a, o.get("js"));
                 script.css = try dupStrArray(a, o.get("css"));
-                if (dupStr(a, o.get("run_at"))) |ra| script.run_at = RunAt.fromStr(ra);
+                if (try dupStr(a, o.get("run_at"))) |ra| script.run_at = RunAt.fromStr(ra);
                 if (o.get("all_frames")) |af| script.all_frames = (af == .bool and af.bool);
                 try list.append(a, script);
             }
@@ -158,7 +161,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) ParseError!Manifest {
             const o = bg.object;
             var b = Background{};
             b.scripts = try dupStrArray(a, o.get("scripts"));
-            b.page = dupStr(a, o.get("page"));
+            b.page = try dupStr(a, o.get("page"));
             if (o.get("persistent")) |p| b.persistent = !(p == .bool and !p.bool);
             m.background = b;
         }
@@ -169,7 +172,7 @@ pub fn parse(gpa: std.mem.Allocator, json: []const u8) ParseError!Manifest {
     if (root.get("browser_specific_settings") orelse root.get("applications")) |bss| {
         if (bss == .object) {
             if (bss.object.get("gecko")) |g| {
-                if (g == .object) m.gecko_id = dupStr(a, g.object.get("id"));
+                if (g == .object) m.gecko_id = try dupStr(a, g.object.get("id"));
             }
         }
     }
@@ -190,8 +193,8 @@ fn parseAction(a: std.mem.Allocator, value: std.json.Value) ParseError!?BrowserA
     if (value != .object) return null;
     const o = value.object;
     var act = BrowserAction{};
-    act.default_title = dupStr(a, o.get("default_title"));
-    act.default_popup = dupStr(a, o.get("default_popup"));
+    act.default_title = try dupStr(a, o.get("default_title"));
+    act.default_popup = try dupStr(a, o.get("default_popup"));
     if (o.get("default_icon")) |di| {
         if (iconFromValue(di)) |path| act.default_icon = a.dupe(u8, path) catch return error.OutOfMemory;
     }
@@ -223,10 +226,10 @@ pub fn iconFromValue(v: std.json.Value) ?[]const u8 {
     return best;
 }
 
-fn dupStr(a: std.mem.Allocator, val: ?std.json.Value) ?[]const u8 {
+fn dupStr(a: std.mem.Allocator, val: ?std.json.Value) ParseError!?[]const u8 {
     const v = val orelse return null;
     return switch (v) {
-        .string => |s| a.dupe(u8, s) catch null,
+        .string => |s| a.dupe(u8, s) catch return error.OutOfMemory,
         else => null,
     };
 }

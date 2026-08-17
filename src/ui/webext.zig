@@ -27,11 +27,11 @@ const atomicwrite = @import("../util/atomicwrite.zig");
 
 /// One installed extension as the GUI tracks it.
 pub const Ext = struct {
-    id: []u8,
+    id: []u8 = &.{},
     /// Absolute unpacked directory the helper loads.
-    dir: []u8,
-    name: []u8,
-    version: []u8,
+    dir: []u8 = &.{},
+    name: []u8 = &.{},
+    version: []u8 = &.{},
     enabled: bool,
     /// The helper's last report (`ev_webext_state`): whether it loaded.
     ok: bool = false,
@@ -61,17 +61,43 @@ pub fn assetPath(gpa: std.mem.Allocator, id: []const u8, rel: []const u8) ?[]u8 
     return std.fmt.allocPrint(gpa, "{s}/{s}", .{ e.dir, clean }) catch null;
 }
 
-fn dupe(s: []const u8) []u8 {
-    return (g_gpa orelse unreachable).dupe(u8, s) catch @constCast("");
+fn dupeOwned(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+    return if (s.len == 0) &.{} else try gpa.dupe(u8, s);
+}
+
+fn freeOwned(gpa: std.mem.Allocator, value: []u8) void {
+    if (value.len != 0) gpa.free(value);
+}
+
+fn freeExtWith(gpa: std.mem.Allocator, e: *Ext) void {
+    freeOwned(gpa, e.id);
+    freeOwned(gpa, e.dir);
+    freeOwned(gpa, e.name);
+    freeOwned(gpa, e.version);
+    freeOwned(gpa, e.err);
+    e.* = undefined;
 }
 
 fn freeExt(e: *Ext) void {
-    const gpa = g_gpa orelse return;
-    gpa.free(e.id);
-    gpa.free(e.dir);
-    gpa.free(e.name);
-    gpa.free(e.version);
-    if (e.err.len != 0) gpa.free(e.err);
+    freeExtWith(g_gpa orelse return, e);
+}
+
+fn initExt(
+    gpa: std.mem.Allocator,
+    id: []const u8,
+    dir: []const u8,
+    name: []const u8,
+    version: []const u8,
+    enabled: bool,
+    owned_files: bool,
+) !Ext {
+    var e = Ext{ .enabled = enabled, .owned_files = owned_files };
+    errdefer freeExtWith(gpa, &e);
+    e.id = try dupeOwned(gpa, id);
+    e.dir = try dupeOwned(gpa, dir);
+    e.name = try dupeOwned(gpa, name);
+    e.version = try dupeOwned(gpa, version);
+    return e;
 }
 
 fn find(id: []const u8) ?*Ext {
@@ -81,16 +107,30 @@ fn find(id: []const u8) ?*Ext {
     return null;
 }
 
-/// Data dir (`$XDG_DATA_HOME/sketerm/webext`), owned by the caller.
-fn dataDir(gpa: std.mem.Allocator) ?[]u8 {
-    if (c.getenv("XDG_DATA_HOME")) |xdg| {
-        const base = std.mem.span(xdg);
-        if (base.len != 0) return std.fmt.allocPrint(gpa, "{s}/sketerm/webext", .{base}) catch null;
-    }
-    if (c.getenv("HOME")) |home| {
-        return std.fmt.allocPrint(gpa, "{s}/.local/share/sketerm/webext", .{std.mem.span(home)}) catch null;
+fn findIndex(id: []const u8) ?usize {
+    for (g_exts.items, 0..) |e, i| {
+        if (std.mem.eql(u8, e.id, id)) return i;
     }
     return null;
+}
+
+fn contains(exts: []const Ext, id: []const u8) bool {
+    for (exts) |e| {
+        if (std.mem.eql(u8, e.id, id)) return true;
+    }
+    return false;
+}
+
+/// Data dir (`$XDG_DATA_HOME/sketerm/webext`), owned by the caller.
+fn dataDir(gpa: std.mem.Allocator) InstallError![]u8 {
+    if (c.getenv("XDG_DATA_HOME")) |xdg| {
+        const base = std.mem.span(xdg);
+        if (base.len != 0) return std.fmt.allocPrint(gpa, "{s}/sketerm/webext", .{base}) catch error.OutOfMemory;
+    }
+    if (c.getenv("HOME")) |home| {
+        return std.fmt.allocPrint(gpa, "{s}/.local/share/sketerm/webext", .{std.mem.span(home)}) catch error.OutOfMemory;
+    }
+    return error.WriteFailed;
 }
 
 // -- registry persistence --------------------------------------------
@@ -98,43 +138,63 @@ fn dataDir(gpa: std.mem.Allocator) ?[]u8 {
 /// Load the persisted registry once. Safe to call repeatedly.
 pub fn ensureLoaded(gpa: std.mem.Allocator) void {
     if (g_loaded) return;
+    if (g_gpa == null) g_gpa = gpa;
+    const owner = g_gpa.?;
+    const loaded = loadRegistry(owner) catch return;
+    for (g_exts.items) |*e| freeExtWith(owner, e);
+    g_exts.deinit(owner);
+    g_exts = loaded;
     g_loaded = true;
-    g_gpa = gpa;
-    const dir = dataDir(gpa) orelse return;
+}
+
+fn loadRegistry(gpa: std.mem.Allocator) InstallError!std.ArrayList(Ext) {
+    var loaded: std.ArrayList(Ext) = .empty;
+    errdefer {
+        for (loaded.items) |*e| freeExtWith(gpa, e);
+        loaded.deinit(gpa);
+    }
+    const dir = try dataDir(gpa);
     defer gpa.free(dir);
-    const path = std.fmt.allocPrint(gpa, "{s}/registry.json", .{dir}) catch return;
+    const path = std.fmt.allocPrint(gpa, "{s}/registry.json", .{dir}) catch return error.OutOfMemory;
     defer gpa.free(path);
-    const bytes = readFile(gpa, path) orelse return;
+    const bytes = readFile(gpa, path) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ReadFailed => loaded,
+    };
     defer gpa.free(bytes);
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch return;
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => loaded,
+    };
     defer parsed.deinit();
-    if (parsed.value != .array) return;
+    if (parsed.value != .array) return loaded;
     for (parsed.value.array.items) |item| {
         if (item != .object) continue;
         const o = item.object;
         const id = strField(o, "id") orelse continue;
-        if (!manifest.idValid(id) or find(id) != null) continue;
+        if (!manifest.idValid(id) or contains(loaded.items, id)) continue;
         const edir = strField(o, "dir") orelse continue;
         const enabled = if (o.get("enabled")) |v| (v == .bool and v.bool) else false;
         const owned = if (o.get("owned")) |v| (v == .bool and v.bool) else false;
         // Fill name/version from the manifest if it still parses.
         var name: []const u8 = "";
         var version: []const u8 = "";
-        var man = readManifest(gpa, edir) catch null;
+        var man = readManifest(gpa, edir) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => null,
+        };
         defer if (man) |*m| m.deinit();
         if (man) |*m| {
             name = m.name;
             version = m.version;
         }
-        g_exts.append(gpa, .{
-            .id = dupe(id),
-            .dir = dupe(edir),
-            .name = dupe(name),
-            .version = dupe(version),
-            .enabled = enabled,
-            .owned_files = owned,
-        }) catch {};
+        var fresh = initExt(gpa, id, edir, name, version, enabled, owned) catch return error.OutOfMemory;
+        loaded.append(gpa, fresh) catch {
+            freeExtWith(gpa, &fresh);
+            return error.OutOfMemory;
+        };
     }
+    return loaded;
 }
 
 fn strField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
@@ -142,9 +202,28 @@ fn strField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return if (v == .string) v.string else null;
 }
 
-fn save() InstallError!void {
+const RegistryEdit = union(enum) {
+    replace: struct { index: usize, entry: *const Ext },
+    append: *const Ext,
+    remove: usize,
+};
+
+fn writeRegistryEntry(w: *std.Io.Writer, e: Ext, first: *bool) InstallError!void {
+    if (!first.*) w.writeByte(',') catch return error.OutOfMemory;
+    first.* = false;
+    w.writeAll("{\"id\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(e.id, .{}, w) catch return error.OutOfMemory;
+    w.writeAll(",\"dir\":") catch return error.OutOfMemory;
+    std.json.Stringify.value(e.dir, .{}, w) catch return error.OutOfMemory;
+    w.print(",\"enabled\":{s},\"owned\":{s}}}", .{
+        if (e.enabled) "true" else "false",
+        if (e.owned_files) "true" else "false",
+    }) catch return error.OutOfMemory;
+}
+
+fn save(edit: RegistryEdit) InstallError!void {
     const gpa = g_gpa orelse return error.WriteFailed;
-    const dir = dataDir(gpa) orelse return error.WriteFailed;
+    const dir = try dataDir(gpa);
     defer gpa.free(dir);
     pathz.makeDirs(dir, 0o700) catch return error.WriteFailed;
     const path = std.fmt.allocPrint(gpa, "{s}/registry.json", .{dir}) catch return error.OutOfMemory;
@@ -153,17 +232,19 @@ fn save() InstallError!void {
     defer aw.deinit();
     const w = &aw.writer;
     w.writeByte('[') catch return error.OutOfMemory;
+    var first = true;
     for (g_exts.items, 0..) |e, i| {
-        if (i != 0) w.writeByte(',') catch return error.OutOfMemory;
-        w.writeAll("{\"id\":") catch return error.OutOfMemory;
-        std.json.Stringify.value(e.id, .{}, w) catch return error.OutOfMemory;
-        w.writeAll(",\"dir\":") catch return error.OutOfMemory;
-        std.json.Stringify.value(e.dir, .{}, w) catch return error.OutOfMemory;
-        w.print(",\"enabled\":{s},\"owned\":{s}}}", .{
-            if (e.enabled) "true" else "false",
-            if (e.owned_files) "true" else "false",
-        }) catch return error.OutOfMemory;
+        switch (edit) {
+            .replace => |replacement| if (replacement.index == i) {
+                try writeRegistryEntry(w, replacement.entry.*, &first);
+                continue;
+            },
+            .remove => |removed| if (removed == i) continue,
+            else => {},
+        }
+        try writeRegistryEntry(w, e, &first);
     }
+    if (edit == .append) try writeRegistryEntry(w, edit.append.*, &first);
     w.writeByte(']') catch return error.OutOfMemory;
     atomicwrite.writeFile(path, aw.written(), 0o600) catch return error.WriteFailed;
 }
@@ -189,17 +270,26 @@ pub fn onState(st: proto.EvWebextState) void {
     // folding that into the old registry would make a later refusal partial.
     if (pendingById(st.id) != null) return;
     const e = find(st.id) orelse return;
-    if (st.name.len != 0) {
-        gpa.free(e.name);
-        e.name = gpa.dupe(u8, st.name) catch e.name;
+    const new_name = if (st.name.len != 0) dupeOwned(gpa, st.name) catch return else null;
+    var committed = false;
+    defer if (!committed) if (new_name) |value| freeOwned(gpa, value);
+    const new_version = if (st.version.len != 0) dupeOwned(gpa, st.version) catch return else null;
+    defer if (!committed) if (new_version) |value| freeOwned(gpa, value);
+    const new_err = dupeOwned(gpa, st.err) catch return;
+    defer if (!committed) freeOwned(gpa, new_err);
+
+    if (new_name) |value| {
+        freeOwned(gpa, e.name);
+        e.name = value;
     }
-    if (st.version.len != 0) {
-        gpa.free(e.version);
-        e.version = gpa.dupe(u8, st.version) catch e.version;
+    if (new_version) |value| {
+        freeOwned(gpa, e.version);
+        e.version = value;
     }
     e.ok = st.ok != 0;
-    if (e.err.len != 0) gpa.free(e.err);
-    e.err = gpa.dupe(u8, st.err) catch &.{};
+    freeOwned(gpa, e.err);
+    e.err = new_err;
+    committed = true;
     refreshOpenManager();
 }
 
@@ -246,7 +336,10 @@ pub fn installUnpacked(gpa: std.mem.Allocator, dir: []const u8) InstallError![]c
 /// Install an `.xpi`/`.zip` through a staged helper-coordinated transaction.
 pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError!void {
     ensureLoaded(gpa);
-    const bytes = readFile(gpa, xpi_path) orelse return error.NoManifest;
+    const bytes = readFile(gpa, xpi_path) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ReadFailed => error.NoManifest,
+    };
     defer gpa.free(bytes);
     var arc = zip.read(gpa, bytes) catch return error.BadArchive;
     defer arc.deinit();
@@ -254,7 +347,7 @@ pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError
     var man = manifest.parse(gpa, man_entry.data) catch |err| return mapParseError(err);
     defer man.deinit();
 
-    const base = dataDir(gpa) orelse return error.WriteFailed;
+    const base = try dataDir(gpa);
     defer gpa.free(base);
     var tx = extinstall.begin(gpa, base, &arc, &man) catch |err| return mapInstallError(err);
     var tx_owned = true;
@@ -435,7 +528,7 @@ pub fn onInstallCommitted(ev: proto.EvWebextInstallCommitted) void {
     if (find(pending.tx.id)) |installed| {
         installed.enabled = pending.enabled;
         installed.ok = true;
-        if (installed.err.len != 0) pending.gpa.free(installed.err);
+        freeOwned(pending.gpa, installed.err);
         installed.err = &.{};
     }
     pending.tx.finish() catch |err| {
@@ -486,73 +579,51 @@ fn updateRegistry(
     owned: bool,
 ) InstallError![]const u8 {
     if (find(id)) |e| {
-        const new_dir = gpa.dupe(u8, dir) catch return error.OutOfMemory;
-        const new_name = gpa.dupe(u8, name) catch {
-            gpa.free(new_dir);
+        const index = findIndex(id) orelse return error.WriteFailed;
+        const new_dir = dupeOwned(gpa, dir) catch return error.OutOfMemory;
+        const new_name = dupeOwned(gpa, name) catch {
+            freeOwned(gpa, new_dir);
             return error.OutOfMemory;
         };
-        const new_version = gpa.dupe(u8, version) catch {
-            gpa.free(new_dir);
-            gpa.free(new_name);
+        const new_version = dupeOwned(gpa, version) catch {
+            freeOwned(gpa, new_dir);
+            freeOwned(gpa, new_name);
             return error.OutOfMemory;
         };
         const old_dir = e.dir;
         const old_name = e.name;
         const old_version = e.version;
         const old_owned = e.owned_files;
+        var candidate = e.*;
+        candidate.dir = new_dir;
+        candidate.name = new_name;
+        candidate.version = new_version;
+        candidate.owned_files = owned;
+        save(.{ .replace = .{ .index = index, .entry = &candidate } }) catch |err| {
+            freeOwned(gpa, new_dir);
+            freeOwned(gpa, new_name);
+            freeOwned(gpa, new_version);
+            return err;
+        };
         e.dir = new_dir;
         e.name = new_name;
         e.version = new_version;
         e.owned_files = owned;
-        save() catch |err| {
-            e.dir = old_dir;
-            e.name = old_name;
-            e.version = old_version;
-            e.owned_files = old_owned;
-            gpa.free(new_dir);
-            gpa.free(new_name);
-            gpa.free(new_version);
-            save() catch {};
-            return err;
-        };
-        gpa.free(old_name);
-        gpa.free(old_version);
+        freeOwned(gpa, old_name);
+        freeOwned(gpa, old_version);
         if (old_owned and !std.mem.eql(u8, old_dir, dir)) removeTree(gpa, old_dir);
-        gpa.free(old_dir);
+        freeOwned(gpa, old_dir);
     } else {
-        var fresh = Ext{
-            .id = gpa.dupe(u8, id) catch return error.OutOfMemory,
-            .dir = undefined,
-            .name = undefined,
-            .version = undefined,
-            .enabled = true,
-            .owned_files = owned,
-        };
-        fresh.dir = gpa.dupe(u8, dir) catch {
-            gpa.free(fresh.id);
+        var fresh = initExt(gpa, id, dir, name, version, true, owned) catch return error.OutOfMemory;
+        g_exts.ensureUnusedCapacity(gpa, 1) catch {
+            freeExtWith(gpa, &fresh);
             return error.OutOfMemory;
         };
-        fresh.name = gpa.dupe(u8, name) catch {
-            gpa.free(fresh.id);
-            gpa.free(fresh.dir);
-            return error.OutOfMemory;
-        };
-        fresh.version = gpa.dupe(u8, version) catch {
-            gpa.free(fresh.id);
-            gpa.free(fresh.dir);
-            gpa.free(fresh.name);
-            return error.OutOfMemory;
-        };
-        g_exts.append(gpa, fresh) catch {
-            freeExt(&fresh);
-            return error.OutOfMemory;
-        };
-        save() catch |err| {
-            var removed = g_exts.pop().?;
-            freeExt(&removed);
-            save() catch {};
+        save(.{ .append = &fresh }) catch |err| {
+            freeExtWith(gpa, &fresh);
             return err;
         };
+        g_exts.appendAssumeCapacity(fresh);
     }
     const e = find(id) orelse return error.WriteFailed;
     return e.id;
@@ -562,12 +633,11 @@ pub fn setEnabled(id: []const u8, on: bool) void {
     if (!manifest.idValid(id)) return;
     const e = find(id) orelse return;
     if (pendingById(id) != null) return;
-    const old = e.enabled;
+    const index = findIndex(id) orelse return;
+    var candidate = e.*;
+    candidate.enabled = on;
+    save(.{ .replace = .{ .index = index, .entry = &candidate } }) catch return;
     e.enabled = on;
-    save() catch {
-        e.enabled = old;
-        return;
-    };
     webface.client().post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (on) 1 else 0 });
     refreshOpenManager();
 }
@@ -578,13 +648,13 @@ pub fn remove(id: []const u8) void {
     const gpa = g_gpa orelse return;
     for (g_exts.items, 0..) |*e, i| {
         if (!std.mem.eql(u8, e.id, id)) continue;
+        save(.{ .remove = i }) catch return;
         webface.client().post(proto.WebextRemove{ .id = e.id });
         // Files under our data dir may be deleted; an in-place unpacked
         // dir is left alone.
         if (e.owned_files) removeTree(gpa, e.dir);
         freeExt(e);
         _ = g_exts.orderedRemove(i);
-        save() catch {};
         refreshOpenManager();
         return;
     }
@@ -646,6 +716,20 @@ fn refreshOpenManager() void {
     if (g_manager) |m| rebuildList(m);
 }
 
+const ManagerLabels = struct {
+    title: [:0]const u8,
+    subtitle: [:0]const u8,
+};
+
+fn managerLabels(e: *const Ext, title_buf: *[160:0]u8, subtitle_buf: *[256:0]u8) ManagerLabels {
+    const title = std.fmt.bufPrintZ(title_buf, "{s}", .{if (e.name.len != 0) e.name else e.id}) catch "extension";
+    const subtitle = if (!e.ok and e.err.len != 0)
+        std.fmt.bufPrintZ(subtitle_buf, "v{s} — error: {s}", .{ e.version, e.err }) catch ""
+    else
+        std.fmt.bufPrintZ(subtitle_buf, "v{s}", .{e.version}) catch "";
+    return .{ .title = title, .subtitle = subtitle };
+}
+
 /// Rebuild the installed-list group from the registry. A row per
 /// extension: name/version + a switch and a Remove button.
 fn rebuildList(m: *Manager) void {
@@ -670,14 +754,10 @@ fn rebuildList(m: *Manager) void {
     for (g_exts.items) |*e| {
         const row = c.adw_action_row_new();
         var tbuf: [160:0]u8 = undefined;
-        const title = std.fmt.bufPrintZ(&tbuf, "{s}", .{if (e.name.len != 0) e.name else e.id}) catch "extension";
-        c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title.ptr);
         var sbuf: [256:0]u8 = undefined;
-        const sub = if (!e.ok and e.err.len != 0)
-            std.fmt.bufPrintZ(&sbuf, "v{s} — error: {s}", .{ e.version, e.err }) catch ""
-        else
-            std.fmt.bufPrintZ(&sbuf, "v{s}", .{e.version}) catch "";
-        if (sub.len != 0) c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), sub.ptr);
+        const labels = managerLabels(e, &tbuf, &sbuf);
+        c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), labels.title.ptr);
+        if (labels.subtitle.len != 0) c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), labels.subtitle.ptr);
 
         // Enabled switch. A context that cannot be built (invalid
         // registry id, OOM) leaves the row without controls rather than
@@ -817,33 +897,39 @@ fn reportInstallError(err: InstallError) void {
 fn readManifest(gpa: std.mem.Allocator, dir: []const u8) InstallError!manifest.Manifest {
     const path = std.fmt.allocPrint(gpa, "{s}/manifest.json", .{dir}) catch return error.OutOfMemory;
     defer gpa.free(path);
-    const bytes = readFile(gpa, path) orelse return error.NoManifest;
+    const bytes = readFile(gpa, path) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ReadFailed => error.NoManifest,
+    };
     defer gpa.free(bytes);
     return manifest.parse(gpa, bytes) catch |err| mapParseError(err);
 }
 
-fn readFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+const ReadError = error{ OutOfMemory, ReadFailed };
+
+fn readFile(gpa: std.mem.Allocator, path: []const u8) ReadError![]u8 {
     var zbuf: [4096]u8 = undefined;
-    if (path.len + 1 > zbuf.len) return null;
+    if (path.len + 1 > zbuf.len) return error.ReadFailed;
     @memcpy(zbuf[0..path.len], path);
     zbuf[path.len] = 0;
     const fd = c.open(@ptrCast(&zbuf), c.O_RDONLY);
-    if (fd < 0) return null;
+    if (fd < 0) return error.ReadFailed;
     defer _ = c.close(fd);
     var st: c.struct_stat = undefined;
-    if (c.fstat(fd, &st) != 0) return null;
+    if (c.fstat(fd, &st) != 0) return error.ReadFailed;
     const size: usize = @intCast(@max(st.st_size, 0));
-    if (size == 0 or size > 64 * 1024 * 1024) return null;
-    const buf = gpa.alloc(u8, size) catch return null;
+    if (size == 0 or size > 64 * 1024 * 1024) return error.ReadFailed;
+    const buf = gpa.alloc(u8, size) catch return error.OutOfMemory;
     var got: usize = 0;
     while (got < size) {
         const n = c.read(fd, buf.ptr + got, size - got);
+        if (n < 0 and std.c._errno().* == c.EINTR) continue;
         if (n <= 0) break;
         got += @intCast(n);
     }
     if (got != size) {
         gpa.free(buf);
-        return null;
+        return error.ReadFailed;
     }
     return buf;
 }
@@ -876,4 +962,285 @@ fn removeTree(gpa: std.mem.Allocator, path: []const u8) void {
     }
     _ = c.closedir(dir);
     _ = c.rmdir(@ptrCast(&zbuf));
+}
+
+const allocation_test_id = "gui-allocation@sketerm.test";
+const allocation_old_registry =
+    "[{\"id\":\"gui-allocation@sketerm.test\",\"dir\":\"/old\",\"enabled\":true,\"owned\":false}]";
+const allocation_manifest =
+    \\{"manifest_version":2,"name":"Reloaded Name","version":"3",
+    \\ "browser_specific_settings":{"gecko":{"id":"gui-allocation@sketerm.test"}}}
+;
+
+const AllocationTestDir = struct {
+    storage: [96:0]u8,
+    old_xdg: ?[]u8,
+
+    fn init() !AllocationTestDir {
+        var self = AllocationTestDir{ .storage = undefined, .old_xdg = null };
+        const template = "/tmp/sketerm-ui-webext-XXXXXX";
+        @memcpy(self.storage[0..template.len], template);
+        self.storage[template.len] = 0;
+        _ = c.mkdtemp(@ptrCast(&self.storage)) orelse return error.SkipZigTest;
+        if (c.getenv("XDG_DATA_HOME")) |old| self.old_xdg = try std.testing.allocator.dupe(u8, std.mem.span(old));
+        if (c.setenv("XDG_DATA_HOME", @ptrCast(&self.storage), 1) != 0) return error.SkipZigTest;
+
+        var package_buf: [256]u8 = undefined;
+        const package = self.packageDir(&package_buf);
+        pathz.makeDirs(package, 0o700) catch return error.SkipZigTest;
+        var manifest_buf: [320]u8 = undefined;
+        const manifest_path = std.fmt.bufPrint(&manifest_buf, "{s}/manifest.json", .{package}) catch unreachable;
+        try writeAllocationFile(manifest_path, allocation_manifest);
+        return self;
+    }
+
+    fn path(self: *const AllocationTestDir) []const u8 {
+        return std.mem.sliceTo(&self.storage, 0);
+    }
+
+    fn packageDir(self: *const AllocationTestDir, out: []u8) []const u8 {
+        return std.fmt.bufPrint(out, "{s}/package", .{self.path()}) catch unreachable;
+    }
+
+    fn registryPath(self: *const AllocationTestDir, out: []u8) []const u8 {
+        return std.fmt.bufPrint(out, "{s}/sketerm/webext/registry.json", .{self.path()}) catch unreachable;
+    }
+
+    fn writeRegistry(self: *const AllocationTestDir, bytes: []const u8) !void {
+        var dir_buf: [256]u8 = undefined;
+        const dir = std.fmt.bufPrint(&dir_buf, "{s}/sketerm/webext", .{self.path()}) catch unreachable;
+        try pathz.makeDirs(dir, 0o700);
+        var path_buf: [320]u8 = undefined;
+        try writeAllocationFile(self.registryPath(&path_buf), bytes);
+    }
+
+    fn expectRegistry(self: *const AllocationTestDir, expected: []const u8) !void {
+        var path_buf: [320]u8 = undefined;
+        const bytes = try readFile(std.testing.allocator, self.registryPath(&path_buf));
+        defer std.testing.allocator.free(bytes);
+        try std.testing.expectEqualStrings(expected, bytes);
+    }
+
+    fn deinit(self: *AllocationTestDir) void {
+        if (self.old_xdg) |old| {
+            var old_z: [4096:0]u8 = undefined;
+            const value = std.fmt.bufPrintZ(&old_z, "{s}", .{old}) catch "";
+            _ = c.setenv("XDG_DATA_HOME", value.ptr, 1);
+            std.testing.allocator.free(old);
+        } else {
+            _ = c.unsetenv("XDG_DATA_HOME");
+        }
+        removeTree(std.testing.allocator, self.path());
+    }
+};
+
+fn writeAllocationFile(path: []const u8, bytes: []const u8) !void {
+    var path_buf: [4096:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
+    const fd = c.open(path_z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+    if (fd < 0) return error.WriteFailed;
+    defer _ = c.close(fd);
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
+        if (n < 0 and std.c._errno().* == c.EINTR) continue;
+        if (n <= 0) return error.WriteFailed;
+        off += @intCast(n);
+    }
+}
+
+fn resetAllocationRegistry() void {
+    const gpa = g_gpa orelse return;
+    for (g_exts.items) |*e| freeExtWith(gpa, e);
+    g_exts.deinit(gpa);
+    g_exts = .empty;
+    g_gpa = null;
+    g_loaded = false;
+}
+
+fn seedAllocationEntry(gpa: std.mem.Allocator) !*Ext {
+    var fresh = try initExt(gpa, allocation_test_id, "/old", "Old Name", "1", true, false);
+    errdefer freeExtWith(gpa, &fresh);
+    fresh.ok = true;
+    fresh.err = try dupeOwned(gpa, "old error");
+    try g_exts.append(gpa, fresh);
+    return &g_exts.items[g_exts.items.len - 1];
+}
+
+fn expectAllocationEntry(
+    dir: []const u8,
+    name: []const u8,
+    version: []const u8,
+    ok: bool,
+    err: []const u8,
+    title: []const u8,
+    subtitle: []const u8,
+) !void {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 1), extensions().len);
+    const e = find(allocation_test_id).?;
+    try t.expectEqualStrings(dir, e.dir);
+    try t.expectEqualStrings(name, e.name);
+    try t.expectEqualStrings(version, e.version);
+    try t.expectEqual(ok, e.ok);
+    try t.expectEqualStrings(err, e.err);
+    var title_buf: [160:0]u8 = undefined;
+    var subtitle_buf: [256:0]u8 = undefined;
+    const labels = managerLabels(e, &title_buf, &subtitle_buf);
+    try t.expectEqualStrings(title, labels.title);
+    try t.expectEqualStrings(subtitle, labels.subtitle);
+    if (ok) {
+        const asset = assetPath(t.allocator, allocation_test_id, "icons/icon.svg").?;
+        defer t.allocator.free(asset);
+        var expected_buf: [256]u8 = undefined;
+        const expected = try std.fmt.bufPrint(&expected_buf, "{s}/icons/icon.svg", .{dir});
+        try t.expectEqualStrings(expected, asset);
+    }
+}
+
+const AllocationRange = struct { first: usize, end: usize };
+
+fn stateUpdateAllocationCase(fail_index: ?usize) !AllocationRange {
+    const t = std.testing;
+    var config: t.FailingAllocator.Config = .{};
+    if (fail_index) |index| config.fail_index = index;
+    var failing = t.FailingAllocator.init(t.allocator, config);
+    g_gpa = failing.allocator();
+    defer resetAllocationRegistry();
+    _ = try seedAllocationEntry(failing.allocator());
+    const first = failing.alloc_index;
+
+    onState(.{
+        .id = allocation_test_id,
+        .name = "New Name",
+        .version = "2",
+        .enabled = 1,
+        .ok = 0,
+        .err = "new error",
+    });
+    if (fail_index != null) {
+        try t.expect(failing.has_induced_failure);
+        try expectAllocationEntry("/old", "Old Name", "1", true, "old error", "Old Name", "v1");
+    } else {
+        try expectAllocationEntry("/old", "New Name", "2", false, "new error", "New Name", "v2 — error: new error");
+    }
+    return .{ .first = first, .end = failing.alloc_index };
+}
+
+fn registryUpdateAllocationCase(env: *const AllocationTestDir, existing: bool, fail_index: ?usize) !AllocationRange {
+    const t = std.testing;
+    try env.writeRegistry(if (existing) allocation_old_registry else "[]");
+    var config: t.FailingAllocator.Config = .{};
+    if (fail_index) |index| config.fail_index = index;
+    var failing = t.FailingAllocator.init(t.allocator, config);
+    g_gpa = failing.allocator();
+    defer resetAllocationRegistry();
+    if (existing) _ = try seedAllocationEntry(failing.allocator());
+    const first = failing.alloc_index;
+
+    const result = updateRegistry(failing.allocator(), "/new", allocation_test_id, "Registered Name", "2", false);
+    if (fail_index != null) {
+        try t.expectError(error.OutOfMemory, result);
+        try t.expect(failing.has_induced_failure);
+        if (existing) {
+            try expectAllocationEntry("/old", "Old Name", "1", true, "old error", "Old Name", "v1");
+            try env.expectRegistry(allocation_old_registry);
+        } else {
+            try t.expectEqual(@as(usize, 0), extensions().len);
+            try env.expectRegistry("[]");
+        }
+    } else {
+        _ = try result;
+        try expectAllocationEntry("/new", "Registered Name", "2", if (existing) true else false, if (existing) "old error" else "", "Registered Name", "v2");
+    }
+    return .{ .first = first, .end = failing.alloc_index };
+}
+
+fn removalAllocationCase(env: *const AllocationTestDir, fail_index: ?usize) !AllocationRange {
+    const t = std.testing;
+    try env.writeRegistry(allocation_old_registry);
+    var config: t.FailingAllocator.Config = .{};
+    if (fail_index) |index| config.fail_index = index;
+    var failing = t.FailingAllocator.init(t.allocator, config);
+    g_gpa = failing.allocator();
+    defer resetAllocationRegistry();
+    _ = try seedAllocationEntry(failing.allocator());
+    const first = failing.alloc_index;
+
+    remove(allocation_test_id);
+    if (fail_index != null) {
+        try t.expect(failing.has_induced_failure);
+        try expectAllocationEntry("/old", "Old Name", "1", true, "old error", "Old Name", "v1");
+        try env.expectRegistry(allocation_old_registry);
+    } else {
+        try t.expectEqual(@as(usize, 0), extensions().len);
+        try env.expectRegistry("[]");
+    }
+    return .{ .first = first, .end = failing.alloc_index };
+}
+
+fn reloadAllocationCase(env: *const AllocationTestDir, fail_index: ?usize) !AllocationRange {
+    const t = std.testing;
+    var package_buf: [256]u8 = undefined;
+    const package = env.packageDir(&package_buf);
+    var json_buf: [768]u8 = undefined;
+    const registry = try std.fmt.bufPrint(
+        &json_buf,
+        "[{{\"id\":\"{s}\",\"dir\":\"{s}\",\"enabled\":true,\"owned\":false}}]",
+        .{ allocation_test_id, package },
+    );
+    try env.writeRegistry(registry);
+
+    var config: t.FailingAllocator.Config = .{};
+    if (fail_index) |index| config.fail_index = index;
+    var failing = t.FailingAllocator.init(t.allocator, config);
+    g_gpa = failing.allocator();
+    defer resetAllocationRegistry();
+    _ = try seedAllocationEntry(failing.allocator());
+    const first = failing.alloc_index;
+
+    ensureLoaded(failing.allocator());
+    if (fail_index != null) {
+        try t.expect(failing.has_induced_failure);
+        try t.expect(!g_loaded);
+        try expectAllocationEntry("/old", "Old Name", "1", true, "old error", "Old Name", "v1");
+    } else {
+        try t.expect(g_loaded);
+        try expectAllocationEntry(package, "Reloaded Name", "3", false, "", "Reloaded Name", "v3");
+    }
+    return .{ .first = first, .end = failing.alloc_index };
+}
+
+test "GUI web extension state stays renderable across every allocation failure" {
+    const t = std.testing;
+    const state = try stateUpdateAllocationCase(null);
+    try t.expectEqual(@as(usize, 3), state.end - state.first);
+    for (state.first..state.end) |fail_index| _ = try stateUpdateAllocationCase(fail_index);
+
+    var env = try AllocationTestDir.init();
+    defer env.deinit();
+
+    const registration = try registryUpdateAllocationCase(&env, false, null);
+    try t.expect(registration.end > registration.first + 4);
+    for (registration.first..registration.end) |fail_index| {
+        _ = try registryUpdateAllocationCase(&env, false, fail_index);
+    }
+
+    const update = try registryUpdateAllocationCase(&env, true, null);
+    try t.expect(update.end > update.first + 3);
+    for (update.first..update.end) |fail_index| {
+        _ = try registryUpdateAllocationCase(&env, true, fail_index);
+    }
+
+    const removal = try removalAllocationCase(&env, null);
+    try t.expect(removal.end > removal.first);
+    for (removal.first..removal.end) |fail_index| {
+        _ = try removalAllocationCase(&env, fail_index);
+    }
+
+    const reload = try reloadAllocationCase(&env, null);
+    try t.expect(reload.end > reload.first + 8);
+    for (reload.first..reload.end) |fail_index| {
+        _ = try reloadAllocationCase(&env, fail_index);
+    }
 }
