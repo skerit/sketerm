@@ -4320,6 +4320,19 @@ pub const EditorView = struct {
         switch (job.kind) {
             .load => {
                 tab.loading = false;
+                // A cross-file edit (rename, code action) parks its
+                // hunk for a LOADING tab and the outcome line already
+                // told the user it applied. So every exit below must
+                // either deliver it or say it was lost — enforced here
+                // rather than remembered at four return statements.
+                // The delivering paths clear `undelivered`; the
+                // tab-closing ones report through `detachTab`, which
+                // makes this defer a no-op for them.
+                var undelivered = true;
+                const load_tab_id = tab.id; // the closing paths free `tab`
+                defer if (undelivered) {
+                    if (self.lsp) |m| m.failPendingEdits(load_tab_id, "the file could not be loaded");
+                };
                 if (job.binary) {
                     self.errorDialog("Cannot edit binary file", job.errText());
                     self.closeTabForce(tab);
@@ -4341,6 +4354,7 @@ pub const EditorView = struct {
                     // (empty, but now FINAL) buffer has to be opened on
                     // the server from here — `openDocument` defers
                     // while `loading` is set, which it no longer is.
+                    undelivered = false; // ensureOpen drains
                     if (self.lsp) |m| m.ensureOpen(tab, job.gen) else self.attachLsp(tab);
                     self.setStatus("New file.");
                     self.refresh(tab);
@@ -4348,6 +4362,14 @@ pub const EditorView = struct {
                 }
                 if (job.keep_position and tab.keep_active) {
                     self.finishReloadInPlace(tab, job);
+                    // The document object SURVIVES a reload-in-place,
+                    // so no replace hook runs and this is the only
+                    // place the queued edits can be delivered. True
+                    // even when the diff failed: the buffer is then
+                    // the text the server described, so the edits
+                    // still fit.
+                    undelivered = false;
+                    if (self.lsp) |m| m.finishPendingEdits(tab, job.gen);
                     return;
                 }
                 var new_doc = Document.initFromBytes(self.allocator, job.bytes) catch {
@@ -4375,6 +4397,7 @@ pub const EditorView = struct {
                 // The observer the swap dropped has to be re-installed
                 // and the server told the content changed wholesale;
                 // a first-time load is where the server is attached.
+                undelivered = false; // onDocumentReplaced drains
                 if (self.lsp) |m| m.onDocumentReplaced(tab, job.gen) else self.attachLsp(tab);
                 tab.layout.invalidateAll();
                 tab.rows_lines = 0;

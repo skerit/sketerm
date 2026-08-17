@@ -361,9 +361,15 @@ and never reports a count alone.
 a file the user has not opened used to be counted as skipped and left
 alone, which is how a rename silently missed most of its own work. The
 tab is now opened through the ordinary machinery, and — because the load
-is async — the `TextEdit[]` is queued against the tab's spec and applied
-by `onDocumentReplaced` when the bytes land, then reported again with
-the final count. Applying through the daemon's atomic install path
+is async — the `TextEdit[]` is queued in `lsp/pending.zig` against the
+tab and its LOAD, then applied when the bytes land and reported again
+with the final count. The queue's rule is "applied or reported, never
+forgotten": a hunk is identified by tab plus load generation (never by
+document revision — a load replaces the document and a reload-in-place
+advances its revision by design), and `EditorView.onIoDone` fails any
+entry a load could not deliver instead of leaving it queued, which is
+how a rename used to lose the one file that happened to be reloading
+after telling the user it had applied. Applying through the daemon's atomic install path
 instead was rejected: a file written that way has no `Document`, hence no
 undo entry at all, which is strictly worse than the per-file undo this
 section is about.

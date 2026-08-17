@@ -63,6 +63,7 @@ const servers = @import("../lsp/servers.zig");
 const proc = @import("../lsp/proc.zig");
 const diagnostics = @import("../lsp/diagnostics.zig");
 const docsync = @import("../lsp/docsync.zig");
+const pending_mod = @import("../lsp/pending.zig");
 const semantic = @import("../lsp/semantic.zig");
 const inlay = @import("../lsp/inlay.zig");
 const layout_mod = @import("../render/editor_layout.zig");
@@ -1068,26 +1069,6 @@ const SigPopup = struct {
 // Manager: one per EditorView
 // ======================================================================
 
-/// A `WorkspaceEdit` entry for a file that was not open. The tab is
-/// opened and the edits ride here until its bytes arrive; the encoding
-/// is captured now because the connection that produced them may be
-/// gone by then, and it is the only thing `applyTextEdits` needs from it.
-const PendingEdit = struct {
-    /// Tab spec (`local:/path` or `host:/path`), owned.
-    spec: []u8,
-    /// The `TextEdit[]` re-serialized, owned — a `std.json.Value`
-    /// borrows its parse arena, which dies with the response.
-    edits: []u8,
-    enc: pos.Encoding,
-    /// Placeholder document and load this edit was queued against.
-    stamp: EditStamp,
-    load_gen: u64,
-
-    fn matches(self: PendingEdit, tab_id: u64, revision: u64, load_gen: u64) bool {
-        return self.load_gen == load_gen and self.stamp.matches(tab_id, revision);
-    }
-};
-
 pub const Manager = struct {
     view: *EditorView,
     alloc: std.mem.Allocator,
@@ -1121,10 +1102,10 @@ pub const Manager = struct {
     /// Byte offset the last dwell request was made for — a pointer
     /// wandering within one word must not re-ask.
     dwell_offset: usize = std.math.maxInt(usize),
-    /// `TextEdit[]`s from a `WorkspaceEdit` whose file had no tab yet.
-    /// The tab has been asked to open; the edits apply when its async
-    /// load lands (`onDocumentReplaced`). See `applyWorkspaceEdit`.
-    pending_edits: std.ArrayList(PendingEdit) = .empty,
+    /// `TextEdit[]`s from a `WorkspaceEdit` whose file was still
+    /// loading. They apply when that load settles, and are reported
+    /// when it cannot deliver them. See `applyWorkspaceEdit`.
+    pending_edits: pending_mod.Queue = .{},
     /// How many of the current WorkspaceEdit's files have been written
     /// so far, for the "…and here is the final count" status line the
     /// deferred half owes the user.
@@ -1153,7 +1134,6 @@ pub const Manager = struct {
         while (self.links.pop()) |link| link.destroyLink();
         self.links.deinit(self.alloc);
         self.list.deinit();
-        self.dropPendingEdits();
         self.pending_edits.deinit(self.alloc);
         self.hint_view.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
@@ -1726,6 +1706,11 @@ pub const Manager = struct {
 
     /// The tab is closing (or its document was replaced by a reload).
     pub fn detachTab(self: *Manager, tab: *ETab) void {
+        // Before the early return below: a tab can be queued for
+        // deferred edits and then close (a binary or unreadable file
+        // closes its own tab from the load handler) whether or not it
+        // ever got a server.
+        self.failPendingEdits(tab.id, "the document closed");
         const st = tab.lsp orelse return;
         if (self.list.open and self.list.tab_id == tab.id) self.closePopup();
         if (self.hover.open) self.closeHover();
@@ -2754,24 +2739,20 @@ pub const Manager = struct {
         enc: pos.Encoding,
         out: *EditOutcome,
     ) void {
+        // Not actually loading — the open never started, or the tab
+        // was already there with its bytes. Apply now: an entry no
+        // load will ever settle is exactly the silent loss this queue
+        // exists to prevent.
+        if (!tab.loading) {
+            if (self.applyTextEdits(tab, edits, enc)) out.touched += 1 else out.skipped += 1;
+            return;
+        }
         const blob = serializeValue(self.alloc, edits) catch {
             out.skipped += 1;
             return;
         };
-        const owned_spec = self.alloc.dupe(u8, spec) catch {
-            self.alloc.free(blob);
-            out.skipped += 1;
-            return;
-        };
-        self.pending_edits.append(self.alloc, .{
-            .spec = owned_spec,
-            .edits = blob,
-            .enc = enc,
-            .stamp = .{ .tab_id = tab.id, .revision = tab.doc.revision },
-            .load_gen = tab.io_gen,
-        }) catch {
-            self.alloc.free(owned_spec);
-            self.alloc.free(blob);
+        defer self.alloc.free(blob);
+        self.pending_edits.push(self.alloc, spec, blob, enc, tab.id, tab.io_gen) catch {
             out.skipped += 1;
             return;
         };
@@ -2780,53 +2761,55 @@ pub const Manager = struct {
 
     const PendingOutcome = struct { applied: usize = 0, stale: usize = 0 };
 
-    /// Apply (and drop) every queued edit for `tab`, now that it has its
-    /// bytes.
+    /// Apply (and drop) every queued edit for `tab`, now that its load
+    /// has settled. Nothing stays queued afterwards.
     fn drainPendingEdits(self: *Manager, tab: *ETab, load_gen: u64) PendingOutcome {
-        var out = PendingOutcome{};
-        if (self.pending_edits.items.len == 0) return out;
-        const loaded_revision = tab.doc.revision;
-        var i: usize = 0;
-        while (i < self.pending_edits.items.len) {
-            const p = self.pending_edits.items[i];
-            // tabForSpec normalizes the spelling (`local:/x` vs `/x`),
-            // which a byte compare against `tab.spec` would not.
-            if (self.view.tabForSpec(p.spec) != tab) {
-                i += 1;
-                continue;
-            }
-            _ = self.pending_edits.orderedRemove(i);
-            defer {
-                self.alloc.free(p.spec);
-                self.alloc.free(p.edits);
-            }
-            if (!p.matches(tab.id, loaded_revision, load_gen)) {
-                out.stale += 1;
-                continue;
-            }
-            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, p.edits, .{}) catch continue;
+        var taken = self.pending_edits.take(self.alloc, tab.id, load_gen);
+        defer {
+            for (taken.ready.items) |e| e.deinit(self.alloc);
+            taken.ready.deinit(self.alloc);
+        }
+        var out = PendingOutcome{ .stale = taken.stale };
+        for (taken.ready.items) |e| {
+            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, e.edits, .{}) catch continue;
             defer parsed.deinit();
-            if (self.applyTextEdits(tab, parsed.value, p.enc)) out.applied += 1;
+            if (self.applyTextEdits(tab, parsed.value, e.enc)) out.applied += 1;
         }
         return out;
     }
 
-    fn finishPendingEdits(self: *Manager, tab: *ETab, load_gen: u64) void {
+    /// A load settled: deliver what it was carrying for this tab.
+    ///
+    /// EVERY path that clears `ETab.loading` has to reach this or
+    /// `failPendingEdits` — a first load, a not-found load, a
+    /// reload-in-place, and a load that ends in the tab being closed.
+    /// `EditorView.onIoDone` enforces that with a defer rather than by
+    /// remembering.
+    pub fn finishPendingEdits(self: *Manager, tab: *ETab, load_gen: u64) void {
         const drained = self.drainPendingEdits(tab, load_gen);
         if (drained.applied > 0) {
             self.pending_touched += drained.applied;
             self.reportDeferredEdits();
         }
         if (drained.stale > 0)
-            self.view.setStatusText("Document changed before a deferred edit could be applied.");
+            self.view.setStatusText("This document was replaced before a deferred edit could be applied.");
     }
 
-    fn dropPendingEdits(self: *Manager) void {
-        for (self.pending_edits.items) |p| {
-            self.alloc.free(p.spec);
-            self.alloc.free(p.edits);
-        }
-        self.pending_edits.clearRetainingCapacity();
+    /// The tab can never receive its queued edits (it is closing, or
+    /// its load failed). Say so: `reportEditOutcome` already promised
+    /// the user those files were edited.
+    /// Takes an ID rather than a pointer: the tab is often already
+    /// destroyed by the path that has to report this.
+    pub fn failPendingEdits(self: *Manager, tab_id: u64, why: [*:0]const u8) void {
+        const lost = self.pending_edits.drop(self.alloc, tab_id);
+        if (lost == 0) return;
+        var buf: [200:0]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(
+            &buf,
+            "{d} edit(s) from a cross-file change were NOT applied: {s}.",
+            .{ lost, why },
+        ) catch "A cross-file edit was not applied.";
+        self.view.setStatusText(msg);
     }
 
     fn applyTextEdits(self: *Manager, tab: *ETab, edits_val: std.json.Value, enc: pos.Encoding) bool {
@@ -3332,7 +3315,7 @@ pub const Manager = struct {
     /// left with a count that was only a promise.
     fn reportDeferredEdits(self: *Manager) void {
         var buf: [200:0]u8 = undefined;
-        const remaining = self.pending_edits.items.len;
+        const remaining = self.pending_edits.len();
         const msg = if (remaining > 0)
             std.fmt.bufPrintZ(
                 &buf,
@@ -4788,18 +4771,8 @@ test "lsp workspace edit: code action accept and resolve reject newer text" {
     try std.testing.expect(!resolving.matches(4, 22));
 }
 
-test "lsp workspace edit: deferred edits belong to one load and revision" {
-    const pending = PendingEdit{
-        .spec = &.{},
-        .edits = &.{},
-        .enc = .utf16,
-        .stamp = .{ .tab_id = 5, .revision = 0 },
-        .load_gen = 17,
-    };
-    try std.testing.expect(pending.matches(5, 0, 17));
-    try std.testing.expect(!pending.matches(5, 1, 17));
-    try std.testing.expect(!pending.matches(5, 0, 18));
-}
+// Deferred-edit identity now lives in `lsp/pending.zig`, which is
+// GTK-free and tested in both roots.
 
 test "lsp workspace edit: null and absent versions remain unversioned" {
     try std.testing.expect(textDocumentVersion(null) == .unversioned);
