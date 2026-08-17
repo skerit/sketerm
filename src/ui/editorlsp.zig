@@ -906,6 +906,26 @@ const Item = struct {
     has_edit: bool = false,
     /// Documentation, filled in lazily by resolve. Owned.
     doc: []u8 = &.{},
+    /// Exact completionItem/resolve request currently targeting this
+    /// item. A row index is not identity across list replacements.
+    resolve_id: i64 = 0,
+};
+
+const CompletionStamp = struct {
+    tab_id: u64,
+    revision: u64,
+    generation: u64,
+
+    fn matches(self: CompletionStamp, tab_id: u64, revision: u64, generation: u64) bool {
+        return self.tab_id == tab_id and self.revision == revision and self.generation == generation;
+    }
+
+    fn matchesResolve(self: CompletionStamp, req: session.Request, generation: u64, resolve_id: i64) bool {
+        const ref = unpackCompletionRef(req.aux);
+        return self.matches(req.tab_id, req.revision, generation) and
+            ref.generation == @as(u32, @truncate(self.generation)) and
+            resolve_id == req.id;
+    }
 };
 
 const ListPopup = struct {
@@ -924,6 +944,8 @@ const ListPopup = struct {
     /// Document revision the list was computed for; a moved revision
     /// makes an ACCEPT unsafe (offsets would be wrong).
     revision: u64 = 0,
+    /// Manager-owned generation of this exact completion list.
+    generation: u64 = 0,
     /// Completion: byte range the accepted text replaces.
     range_start: usize = 0,
     range_end: usize = 0,
@@ -950,6 +972,10 @@ const ListPopup = struct {
         self.items.deinit(a);
         self.shown.deinit(a);
         self.filter.deinit(a);
+    }
+
+    fn completionStamp(self: *const ListPopup) CompletionStamp {
+        return .{ .tab_id = self.tab_id, .revision = self.revision, .generation = self.generation };
     }
 };
 
@@ -1033,6 +1059,11 @@ pub const Manager = struct {
     /// silently instead of redialing per document.
     links: std.ArrayList(*RemoteLink) = .empty,
     list: ListPopup = undefined,
+    /// Monotonic context generation and exact in-flight completion
+    /// request. Edits, caret moves and popup close all invalidate both.
+    completion_generation: u64 = 0,
+    completion_request_id: i64 = 0,
+    completion_request_conn: ?*Conn = null,
     hover: HoverPopup = undefined,
     sig: SigPopup = undefined,
     /// Scratch for building JSON params.
@@ -1677,6 +1708,12 @@ pub const Manager = struct {
     /// Called after every document mutation. Arms the didChange
     /// debounce; the flush itself is what the server sees.
     pub fn onEdited(self: *Manager, tab: *ETab) void {
+        if ((self.completion_request_id != 0 or
+            (self.list.open and self.list.mode == .completion)) and
+            self.list.tab_id == tab.id and self.list.revision != tab.doc.revision)
+        {
+            self.invalidateCompletion();
+        }
         const st = tab.lsp orelse return;
         if (st.conn == null or !st.sync.open) return;
         // Hints and token spans describe bytes that just moved. They
@@ -1933,6 +1970,13 @@ pub const Manager = struct {
 
     // ---- completion ------------------------------------------------------
 
+    fn invalidateCompletion(self: *Manager) void {
+        self.completion_generation +%= 1;
+        if (self.completion_generation == 0) self.completion_generation = 1;
+        self.completion_request_id = 0;
+        self.completion_request_conn = null;
+    }
+
     pub fn requestCompletion(self: *Manager, explicit: bool) void {
         const r = self.ready("completion") orelse return;
         if (!r.cn.sess.caps.completion) {
@@ -1946,15 +1990,35 @@ pub const Manager = struct {
         var extra: [64]u8 = undefined;
         const ex = std.fmt.bufPrint(&extra, ",\"context\":{{\"triggerKind\":{d}}}", .{trigger_kind}) catch "";
         const params = self.docPosParams(r, caret, ex) orelse return;
+        self.invalidateCompletion();
+        self.list.tab_id = r.tab.id;
+        self.list.revision = r.tab.doc.revision;
         self.list.range_start = word_start;
         self.list.range_end = caret;
-        self.issue(r, .completion, "textDocument/completion", params, word_start);
+        r.cn.sess.cancelKind(.completion, r.tab.id);
+        const sent = r.cn.sess.sendRequest(.completion, "textDocument/completion", params, .{
+            .id = 0,
+            .kind = .completion,
+            .tab_id = r.tab.id,
+            .revision = r.tab.doc.revision,
+            .aux = word_start,
+        });
+        if (sent) |req| {
+            self.completion_request_id = req.id;
+            self.completion_request_conn = r.cn;
+        }
+        r.cn.pumpWrite();
     }
 
     fn onCompletion(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
+        const request_conn = self.completion_request_conn orelse return;
+        if (request_conn != cn or self.completion_request_id != req.id) return;
+        self.completion_request_id = 0;
+        self.completion_request_conn = null;
         const tab = maybe_tab orelse return;
         if (env.has_error) {
             dbg("completion error: {s}", .{env.err_message});
+            self.closePopup();
             return;
         }
         // Staleness: the document moved on, so every range in this
@@ -1972,6 +2036,7 @@ pub const Manager = struct {
         self.list.mode = .completion;
         self.list.tab_id = tab.id;
         self.list.revision = req.revision;
+        self.list.generation = self.completion_generation;
         self.list.range_start = @min(req.aux, tab.doc.rope.len());
         self.list.range_end = tab.sels.primary().head;
         self.list.filter.clearRetainingCapacity();
@@ -2021,14 +2086,23 @@ pub const Manager = struct {
 
     fn onCompletionResolve(self: *Manager, req: session.Request, env: rpc.Envelope) void {
         if (env.has_error or !self.list.open or self.list.mode != .completion) return;
-        const idx = req.aux;
+        const ref = unpackCompletionRef(req.aux);
+        const idx = ref.index;
         if (idx >= self.list.items.items.len) return;
+        const tab = self.view.findTabByIdPublic(req.tab_id) orelse return;
+        const item = &self.list.items.items[idx];
+        if (!self.list.completionStamp().matchesResolve(
+            req,
+            self.completion_generation,
+            item.resolve_id,
+        )) return;
+        if (tab.doc.revision != req.revision) return;
+        item.resolve_id = 0;
         const doc_text = hoverText(self.alloc, env.result) catch return;
         if (doc_text.len == 0) {
             self.alloc.free(doc_text);
             return;
         }
-        const item = &self.list.items.items[idx];
         if (item.doc.len > 0) self.alloc.free(item.doc);
         item.doc = doc_text;
         self.refreshPopupHeader();
@@ -2041,17 +2115,19 @@ pub const Manager = struct {
         const item = &self.list.items.items[idx];
         if (item.doc.len > 0 or item.raw.len == 0) return;
         const tab = self.view.activeTab() orelse return;
+        if (!self.list.completionStamp().matches(tab.id, tab.doc.revision, self.completion_generation)) return;
         const st = tab.lsp orelse return;
         const cn = st.conn orelse return;
         if (!cn.sess.caps.completion_resolve) return;
         cn.sess.cancelKind(.completion_resolve, tab.id);
-        _ = cn.sess.sendRequest(.completion_resolve, "completionItem/resolve", item.raw, .{
+        const sent = cn.sess.sendRequest(.completion_resolve, "completionItem/resolve", item.raw, .{
             .id = 0,
             .kind = .completion_resolve,
             .tab_id = tab.id,
-            .revision = tab.doc.revision,
-            .aux = idx,
+            .revision = self.list.revision,
+            .aux = packCompletionRef(self.list.generation, idx),
         });
+        if (sent) |req| item.resolve_id = req.id;
         cn.pumpWrite();
     }
 
@@ -2061,7 +2137,8 @@ pub const Manager = struct {
             return;
         }
         const tab = self.view.activeTab() orelse return self.closePopup();
-        if (tab.id != self.list.tab_id) return self.closePopup();
+        if (!self.list.completionStamp().matches(tab.id, tab.doc.revision, self.completion_generation))
+            return self.closePopup();
         const idx = self.list.shown.items[self.list.sel];
         const item = self.list.items.items[idx];
         const caret = tab.sels.primary().head;
@@ -3777,12 +3854,20 @@ pub const Manager = struct {
     }
 
     pub fn closePopup(self: *Manager) void {
-        if (!self.list.open) return;
+        const was_open = self.list.open;
+        self.invalidateCompletion();
         self.list.open = false;
         self.list.mode = .none;
+        self.list.tab_id = 0;
+        self.list.revision = 0;
+        self.list.generation = 0;
+        self.list.range_start = 0;
+        self.list.range_end = 0;
         self.list.clearItems();
         self.list.filter.clearRetainingCapacity();
-        if (self.list.popover) |p| c.gtk_popover_popdown(@ptrCast(p));
+        if (was_open) {
+            if (self.list.popover) |p| c.gtk_popover_popdown(@ptrCast(p));
+        }
     }
 
     pub fn popupOpen(self: *const Manager) bool {
@@ -4138,10 +4223,23 @@ pub const Manager = struct {
         self.closeHover();
         self.cancelDwell();
         self.trackSignature();
-        if (!self.list.open) return;
-        if (self.list.mode != .completion) return;
-        const tab = self.view.activeTab() orelse return self.closePopup();
+        const completion_active = self.completion_request_id != 0 or
+            (self.list.open and self.list.mode == .completion);
+        if (!completion_active) return;
+        const tab = self.view.activeTab() orelse {
+            self.invalidateCompletion();
+            if (self.list.open and self.list.mode == .completion) self.closePopup();
+            return;
+        };
+        if (tab.id != self.list.tab_id) {
+            self.invalidateCompletion();
+            if (self.list.open and self.list.mode == .completion) self.closePopup();
+            return;
+        }
         const caret = tab.sels.primary().head;
+        if (tab.doc.revision == self.list.revision and caret == self.list.range_end) return;
+        self.invalidateCompletion();
+        if (!self.list.open or self.list.mode != .completion) return;
         if (caret < self.list.range_start) return self.closePopup();
         self.list.range_end = caret;
         // Re-request against the new prefix, debounced.
@@ -4254,6 +4352,16 @@ fn packWindow(from: u32, to: u32) u64 {
 
 fn unpackWindow(v: u64) struct { from: u32, to: u32 } {
     return .{ .from = @intCast(v >> 32), .to = @truncate(v) };
+}
+
+/// `Request.aux` for `completionItem/resolve`: exact list generation
+/// plus row index, so replacement lists cannot receive an old reply.
+fn packCompletionRef(generation: u64, index: usize) u64 {
+    return (@as(u64, @as(u32, @truncate(generation))) << 32) | @as(u64, @as(u32, @truncate(index)));
+}
+
+fn unpackCompletionRef(v: u64) struct { generation: u32, index: usize } {
+    return .{ .generation = @intCast(v >> 32), .index = @as(u32, @truncate(v)) };
 }
 
 /// `Request.aux` for an `inlayHint/resolve`: which hint, in which
@@ -4514,6 +4622,66 @@ fn symbolKindName(v: ?std.json.Value) []const u8 {
         25 => "operator",    26 => "type parameter",
         else => "",
     };
+}
+
+test "lsp completion: edit then accept before debounce rejects stale ranges" {
+    const offered = CompletionStamp{ .tab_id = 3, .revision = 11, .generation = 7 };
+    try std.testing.expect(!offered.matches(3, 12, 8));
+}
+
+test "lsp completion: old resolve cannot update a replacement list" {
+    const replacement = CompletionStamp{ .tab_id = 3, .revision = 11, .generation = 8 };
+    const old_req = session.Request{
+        .id = 41,
+        .kind = .completion_resolve,
+        .tab_id = 3,
+        .revision = 11,
+        .aux = packCompletionRef(7, 0),
+    };
+    try std.testing.expect(!replacement.matchesResolve(old_req, 8, 41));
+}
+
+test "lsp completion: identical labels do not identify resolve generations" {
+    const label = "sameLabel";
+    const old_item = Item{ .label = @constCast(label), .detail = &.{}, .payload = &.{}, .resolve_id = 51 };
+    const new_item = Item{ .label = @constCast(label), .detail = &.{}, .payload = &.{}, .resolve_id = 52 };
+    const current = CompletionStamp{ .tab_id = 4, .revision = 20, .generation = 10 };
+    const old_req = session.Request{
+        .id = old_item.resolve_id,
+        .kind = .completion_resolve,
+        .tab_id = 4,
+        .revision = 20,
+        .aux = packCompletionRef(9, 0),
+    };
+    try std.testing.expectEqualStrings(old_item.label, new_item.label);
+    try std.testing.expect(!current.matchesResolve(old_req, 10, new_item.resolve_id));
+}
+
+test "lsp completion: close invalidates acceptance and resolve" {
+    const closed_generation: u64 = 14;
+    const offered = CompletionStamp{ .tab_id = 5, .revision = 2, .generation = 13 };
+    const resolve_req = session.Request{
+        .id = 61,
+        .kind = .completion_resolve,
+        .tab_id = 5,
+        .revision = 2,
+        .aux = packCompletionRef(13, 0),
+    };
+    try std.testing.expect(!offered.matches(5, 2, closed_generation));
+    try std.testing.expect(!offered.matchesResolve(resolve_req, closed_generation, resolve_req.id));
+}
+
+test "lsp completion: unchanged list accepts and resolves" {
+    const offered = CompletionStamp{ .tab_id = 6, .revision = 30, .generation = 15 };
+    const resolve_req = session.Request{
+        .id = 71,
+        .kind = .completion_resolve,
+        .tab_id = 6,
+        .revision = 30,
+        .aux = packCompletionRef(15, 2),
+    };
+    try std.testing.expect(offered.matches(6, 30, 15));
+    try std.testing.expect(offered.matchesResolve(resolve_req, 15, resolve_req.id));
 }
 
 test "lsp workspace edit: edit during rename invalidates the response stamp" {
