@@ -17,6 +17,7 @@ const c = @import("../c.zig").c;
 const socks5 = @import("socks5.zig");
 const wire = @import("../mux/wire.zig");
 const client = @import("../mux/client.zig");
+const channel_pump = @import("../mux/channel_pump.zig");
 const platform = @import("../util/platform.zig");
 const FdCancel = @import("../util/fdcancel.zig").FdCancel;
 
@@ -137,42 +138,17 @@ const MAX_SESSIONS = 64;
 const MAX_SESSION_OUT = 1 << 20;
 
 const Session = struct {
-    fd: c_int = -1,
+    local: channel_pump.Local = .{},
     socks: Socks = .{},
     req_id: u32 = 0,
-    chan_id: u32 = 0,
     tunneled: bool = false,
-    out: std.ArrayList(u8) = .empty,
-    out_off: usize = 0,
-    close_after_flush: bool = false,
-    remote_closed: bool = false,
 
     fn active(self: *const Session) bool {
-        return self.fd >= 0;
-    }
-
-    fn pendingOut(self: *const Session) usize {
-        return self.out.items.len - self.out_off;
+        return self.local.active();
     }
 
     fn pollEvents(self: *const Session, mux_blocked: bool) c_short {
-        var events: c_short = if (self.close_after_flush or mux_blocked) 0 else c.POLLIN;
-        if (self.pendingOut() != 0) events |= c.POLLOUT;
-        return events;
-    }
-
-    /// Append one whole protocol/data payload or reject it without
-    /// changing the queue when the per-session bound would be exceeded.
-    fn enqueue(self: *Session, allocator: std.mem.Allocator, data: []const u8) !void {
-        if (self.close_after_flush) return error.SessionClosing;
-        if (self.out_off != 0) {
-            const pending = self.pendingOut();
-            std.mem.copyForwards(u8, self.out.items[0..pending], self.out.items[self.out_off..]);
-            self.out.shrinkRetainingCapacity(pending);
-            self.out_off = 0;
-        }
-        if (data.len > MAX_SESSION_OUT - self.out.items.len) return error.Backpressure;
-        try self.out.appendSlice(allocator, data);
+        return self.local.events(!mux_blocked);
     }
 };
 
@@ -216,7 +192,7 @@ pub const Bridge = struct {
             self.listen_fd = -1;
             self.port = 0;
         }
-        try setNonBlockingFd(lfd);
+        try channel_pump.configureFd(lfd);
         var one: c_int = 1;
         _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
         var sa = std.mem.zeroes(c.struct_sockaddr_in);
@@ -240,16 +216,21 @@ pub const Bridge = struct {
     }
 
     pub fn deinit(self: *Bridge) void {
+        self.closeServing();
+        if (self.stop) |wake| {
+            wake.close();
+            self.stop = null;
+        }
+    }
+
+    fn closeServing(self: *Bridge) void {
         for (&self.sessions) |*s| {
             self.closeSession(s, false);
         }
         if (self.listen_fd >= 0) {
             _ = c.close(self.listen_fd);
             self.listen_fd = -1;
-        }
-        if (self.stop) |wake| {
-            wake.close();
-            self.stop = null;
+            self.port = 0;
         }
     }
 
@@ -262,22 +243,25 @@ pub const Bridge = struct {
 
     fn byReq(self: *Bridge, req: u32) ?*Session {
         for (&self.sessions) |*s| {
-            if (s.active() and !s.close_after_flush and s.req_id == req and !s.tunneled) return s;
+            if (s.active() and !s.local.close_after_flush and s.req_id == req and !s.tunneled) return s;
         }
         return null;
     }
 
     fn byChan(self: *Bridge, chan: u32) ?*Session {
         for (&self.sessions) |*s| {
-            if (s.active() and !s.close_after_flush and s.tunneled and s.chan_id == chan) return s;
+            if (s.active() and !s.local.close_after_flush and s.tunneled and s.local.chan == chan) return s;
         }
         return null;
     }
 
     fn closeSession(self: *Bridge, s: *Session, notify_channel: bool) void {
-        if (notify_channel and s.tunneled and !s.remote_closed) self.sendChanClose(s.chan_id);
-        if (s.fd >= 0) _ = c.close(s.fd);
-        s.out.deinit(self.allocator);
+        var pump = self.channelPump() orelse {
+            s.local.deinit(self.allocator);
+            s.* = .{};
+            return;
+        };
+        pump.closeLocal(&s.local, notify_channel and s.tunneled);
         s.* = .{};
     }
 
@@ -285,58 +269,50 @@ pub const Bridge = struct {
     /// nonblocking flush attempt. Allocation failure and the documented
     /// queue bound are fatal for this session; EAGAIN is not.
     fn queueSession(self: *Bridge, s: *Session, data: []const u8, close_after: bool) void {
-        s.enqueue(self.allocator, data) catch {
+        var pump = self.channelPump() orelse {
+            self.closeSession(s, false);
+            return;
+        };
+        const active = pump.queueLocal(&s.local, data, close_after, false) catch {
             self.closeSession(s, true);
             return;
         };
-        if (close_after) s.close_after_flush = true;
-        self.flushSession(s);
+        if (!active) s.* = .{};
     }
 
     fn flushSession(self: *Bridge, s: *Session) void {
-        while (s.pendingOut() != 0) {
-            const data = s.out.items[s.out_off..];
-            const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
-                c.send(s.fd, data.ptr, data.len, c.MSG_NOSIGNAL)
-            else
-                c.write(s.fd, data.ptr, data.len);
-            if (n > 0) {
-                s.out_off += @intCast(n);
-                continue;
-            }
-            if (n == 0) {
-                self.closeSession(s, true);
-                return;
-            }
-            const e = std.posix.errno(n);
-            if (e == .INTR) continue;
-            if (e == .AGAIN) return;
-            self.closeSession(s, true);
-            return;
-        }
-        s.out.clearRetainingCapacity();
-        s.out_off = 0;
-        if (s.close_after_flush) self.closeSession(s, false);
+        var pump = self.channelPump() orelse return self.closeSession(s, false);
+        if (!pump.flushLocal(&s.local)) s.* = .{};
     }
 
-    fn closeAfterFlush(self: *Bridge, s: *Session, remote_closed: bool) void {
-        s.remote_closed = remote_closed;
-        self.queueSession(s, &.{}, true);
+    fn closeAfterFlush(self: *Bridge, s: *Session) void {
+        var pump = self.channelPump() orelse return self.closeSession(s, false);
+        if (!pump.remoteClose(&s.local)) s.* = .{};
     }
 
     fn readSession(self: *Bridge, s: *Session, buf: []u8) ?[]const u8 {
-        while (true) {
-            const n = c.read(s.fd, buf.ptr, buf.len);
-            if (n > 0) return buf[0..@intCast(n)];
-            if (n == 0) {
+        return switch (channel_pump.readLocal(s.local.fd, buf)) {
+            .data => |data| data,
+            .would_block => null,
+            .eof, .failed => blk: {
                 self.closeSession(s, true);
-                return null;
-            }
-            const e = std.posix.errno(n);
-            if (e == .INTR) continue;
-            if (e == .AGAIN) return null;
-            self.closeSession(s, true);
-            return null;
+                break :blk null;
+            },
+        };
+    }
+
+    fn channelPump(self: *Bridge) ?channel_pump.Pump {
+        return channel_pump.Pump.init(self.allocator, self.conn orelse return null);
+    }
+
+    fn finishMuxClose(self: *Bridge) void {
+        var refs: [MAX_SESSIONS]*channel_pump.Local = undefined;
+        for (&self.sessions, 0..) |*s, index| refs[index] = &s.local;
+        var pump = self.channelPump() orelse return;
+        const cancel_fd = if (self.stop) |stop| stop.read_fd else -1;
+        pump.finishAfterMuxClose(&refs, cancel_fd, channel_pump.nowMs() + 5000);
+        for (&self.sessions) |*s| {
+            if (!s.local.active()) s.* = .{};
         }
     }
 
@@ -344,41 +320,37 @@ pub const Bridge = struct {
     pub fn run(self: *Bridge) void {
         const conn = self.conn orelse return;
         const stop = self.stop orelse return;
-        conn.setNonBlockingChecked() catch return;
+        defer self.closeServing();
+        var pump = channel_pump.Pump.init(self.allocator, conn);
+        pump.prepare() catch return;
         while (true) {
             if (!self.drainConnFrames()) return;
             const mux_blocked = conn.wbuf.items.len != 0;
             var fds: [3 + MAX_SESSIONS]c.struct_pollfd = undefined;
             fds[0] = .{
                 .fd = conn.fd,
-                .events = @intCast(c.POLLIN | if (mux_blocked) c.POLLOUT else 0),
+                .events = pump.muxEvents(true),
                 .revents = 0,
             };
             fds[1] = .{ .fd = self.listen_fd, .events = if (mux_blocked) 0 else c.POLLIN, .revents = 0 };
             fds[2] = .{ .fd = stop.read_fd, .events = c.POLLIN, .revents = 0 };
             for (&self.sessions, 0..) |*s, i| {
                 fds[3 + i] = .{
-                    .fd = if (s.active()) s.fd else -1,
+                    .fd = if (s.active()) s.local.fd else -1,
                     .events = if (s.active()) s.pollEvents(mux_blocked) else 0,
                     .revents = 0,
                 };
             }
-            const poll_result = c.poll(&fds, fds.len, -1);
-            if (poll_result < 0) {
-                if (std.posix.errno(poll_result) == .INTR) continue;
-                return;
-            }
+            if (channel_pump.wait(&fds, 2, null) != .ready) return;
 
-            if (fds[2].revents != 0) return;
-
-            if (fds[0].revents & c.POLLOUT != 0) conn.flushQueued() catch return;
+            if (fds[0].revents & c.POLLOUT != 0 and !pump.flushMux()) return;
 
             if (fds[1].revents & c.POLLIN != 0 and conn.wbuf.items.len == 0) self.acceptOne();
 
             if (fds[0].revents & (c.POLLIN | c.POLLHUP) != 0) {
                 if (!self.pumpConn()) return;
             }
-            if (fds[0].revents & (c.POLLERR | c.POLLNVAL) != 0) return;
+            if (channel_pump.badPoll(fds[0].revents) or channel_pump.badPoll(fds[1].revents)) return;
 
             for (&self.sessions, 0..) |*s, i| {
                 if (!s.active()) continue;
@@ -388,23 +360,22 @@ pub const Bridge = struct {
                 if (revents & (c.POLLIN | c.POLLHUP) != 0 and conn.wbuf.items.len == 0)
                     self.pumpSession(s);
                 if (!s.active()) continue;
-                if (revents & (c.POLLERR | c.POLLNVAL) != 0) self.closeSession(s, true);
+                if (channel_pump.badPoll(revents)) self.closeSession(s, true);
             }
         }
     }
 
     fn acceptOne(self: *Bridge) void {
-        const afd = c.accept(self.listen_fd, null, null);
-        if (afd < 0) return;
-        setNonBlockingFd(afd) catch {
-            _ = c.close(afd);
-            return;
-        };
+        const afd = (channel_pump.accept(self.listen_fd) catch return) orelse return;
         const slot = self.freeSlot() orelse {
             _ = c.close(afd);
             return;
         };
-        slot.* = .{ .fd = afd };
+        slot.* = .{};
+        slot.local.open(afd, MAX_SESSION_OUT) catch {
+            _ = c.close(afd);
+            return;
+        };
     }
 
     /// Client bytes for one session: SOCKS handshake pre-tunnel, raw
@@ -413,7 +384,7 @@ pub const Bridge = struct {
         var buf: [32 * 1024]u8 = undefined;
         const data = self.readSession(s, &buf) orelse return;
         if (s.tunneled) {
-            self.sendChanData(s.chan_id, data);
+            self.sendChanData(s.local.chan, data);
             return;
         }
         const act = s.socks.feed(data);
@@ -446,20 +417,21 @@ pub const Bridge = struct {
 
     /// Frames from the daemon: `stream_reply`, `chan_data`, `chan_close`.
     fn pumpConn(self: *Bridge) bool {
-        const conn = self.conn orelse return false;
-        const connected = conn.fillAvailable();
-        if (!self.drainConnFrames()) return false;
-        return connected;
+        var pump = self.channelPump() orelse return false;
+        if (pump.receive(self, Bridge.handlePumpFrame) == .open) return true;
+        self.finishMuxClose();
+        return false;
     }
 
     fn drainConnFrames(self: *Bridge) bool {
-        const conn = self.conn orelse return false;
-        while (true) {
-            const maybe = conn.takeFrame() catch return false;
-            const f = maybe orelse break;
-            self.handleConnFrame(f.ftype, f.payload);
-            f.deinit(self.allocator);
-        }
+        var pump = self.channelPump() orelse return false;
+        if (pump.drainBuffered(self, Bridge.handlePumpFrame) == .open) return true;
+        self.finishMuxClose();
+        return false;
+    }
+
+    fn handlePumpFrame(self: *Bridge, ftype: wire.FrameType, payload: []const u8) bool {
+        self.handleConnFrame(ftype, payload);
         return true;
     }
 
@@ -483,7 +455,7 @@ pub const Bridge = struct {
                 const r = parsed.value;
                 const s = self.byReq(r.req) orelse return;
                 if (r.ok and r.chan != 0) {
-                    s.chan_id = r.chan;
+                    s.local.chan = r.chan;
                     s.tunneled = true;
                     self.queueSession(s, s.socks.openedReply(), false);
                     if (!s.active()) return;
@@ -500,7 +472,7 @@ pub const Bridge = struct {
             },
             .chan_close => {
                 const id = wire.decodeChanId(payload) orelse return;
-                if (self.byChan(id)) |s| self.closeAfterFlush(s, true);
+                if (self.byChan(id)) |s| self.closeAfterFlush(s);
             },
             // This connection is dedicated to stream egress, but `.err`
             // has no request id. Fail every pending CONNECT so none can
@@ -513,22 +485,8 @@ pub const Bridge = struct {
     }
 
     fn sendChanData(self: *Bridge, chan: u32, data: []const u8) void {
-        var hdr: [4]u8 = undefined;
-        var msg: [4 + 32 * 1024]u8 = undefined;
-        _ = wire.putChanHeader(&hdr, chan);
-        var off: usize = 0;
-        while (off < data.len) {
-            const take = @min(data.len - off, msg.len - 4);
-            @memcpy(msg[0..4], &hdr);
-            @memcpy(msg[4 .. 4 + take], data[off .. off + take]);
-            (self.conn orelse return).queueFrame(.chan_data, msg[0 .. 4 + take]) catch return;
-            off += take;
-        }
-    }
-
-    fn sendChanClose(self: *Bridge, chan: u32) void {
-        var hdr: [4]u8 = undefined;
-        (self.conn orelse return).queueFrame(.chan_close, wire.putChanHeader(&hdr, chan)) catch {};
+        var pump = self.channelPump() orelse return;
+        pump.queueData(chan, data) catch {};
     }
 };
 
@@ -582,6 +540,7 @@ pub const Egress = struct {
     }
 
     fn worker(self: *Egress) void {
+        defer self.bridge.closeServing();
         const h: ?[]const u8 = if (self.host_len == 0) null else self.host[0..self.host_len];
         if (self.connectFn(self.allocator, h)) |conn| {
             self.conn = conn;
@@ -594,14 +553,13 @@ pub const Egress = struct {
                     self.host[0..].ptr,
                 );
             }
-            self.conn.setNonBlockingChecked() catch return;
             if (!(self.cancel.publish(self.conn.fd) catch return)) return;
             defer self.cancel.release();
             self.bridge.setConn(&self.conn);
             self.bridge.run();
+            return;
         }
-        // Connect failed OR the bridge returned (mux dropped / stopped):
-        // nothing left to serve, the loop exits with the thread.
+        // A connect failure leaves nothing to serve.
     }
 
     /// Stop serving, join the worker, close everything. Safe to call
@@ -626,12 +584,6 @@ pub const Egress = struct {
 
 fn platformSocket() c_int {
     return platform.socketCloexec(c.AF_INET, c.SOCK_STREAM, 0);
-}
-
-fn setNonBlockingFd(fd: c_int) !void {
-    const flags = c.fcntl(fd, c.F_GETFL);
-    if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) != 0)
-        return error.NonBlockingFailed;
 }
 
 // ---------------------------------------------------------------------
@@ -713,11 +665,17 @@ test "transport: stalled reader preserves replies and tunnel bytes before close"
     try testSetNonBlocking(pair[1]);
     const tiny: c_int = 1024;
     try t.expectEqual(@as(c_int, 0), c.setsockopt(pair[0], c.SOL_SOCKET, c.SO_SNDBUF, &tiny, @sizeOf(c_int)));
+    var mux_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&mux_pair));
+    defer _ = c.close(mux_pair[1]);
+    var conn = client.Conn{ .allocator = a, .fd = mux_pair[0], .proto = wire.PROTO_VERSION };
+    defer conn.deinit();
 
     var bridge = Bridge.init(a);
     defer bridge.deinit();
+    bridge.setConn(&conn);
     const s = &bridge.sessions[0];
-    s.* = .{ .fd = pair[0] };
+    try s.local.open(pair[0], MAX_SESSION_OUT);
 
     var expected: std.ArrayList(u8) = .empty;
     defer expected.deinit(a);
@@ -730,7 +688,7 @@ test "transport: stalled reader preserves replies and tunnel bytes before close"
     try expected.appendSlice(a, connected);
     bridge.queueSession(s, connected, false);
     s.tunneled = true;
-    s.chan_id = 9;
+    s.local.chan = 9;
 
     const body = try a.alloc(u8, 512 * 1024);
     defer a.free(body);
@@ -738,12 +696,12 @@ test "transport: stalled reader preserves replies and tunnel bytes before close"
     try expected.appendSlice(a, body);
     bridge.queueSession(s, body, false);
     try t.expect(s.active());
-    try t.expect(s.pendingOut() != 0);
-    try t.expect(s.pendingOut() <= MAX_SESSION_OUT);
+    try t.expect(s.local.pending() != 0);
+    try t.expect(s.local.pending() <= MAX_SESSION_OUT);
 
     // A remote chan_close is ordered after every accepted chan_data byte.
     // While that close is pending, only writability can advance the session.
-    bridge.closeAfterFlush(s, true);
+    bridge.closeAfterFlush(s);
     try t.expect(s.active());
     try t.expect(s.pollEvents(false) & c.POLLIN == 0);
     try t.expect(s.pollEvents(false) & c.POLLOUT != 0);
@@ -753,7 +711,7 @@ test "transport: stalled reader preserves replies and tunnel bytes before close"
     while (s.active()) {
         try t.expect(!try testDrainSocket(pair[1], &received));
         if (!s.active()) break;
-        var pfd = c.struct_pollfd{ .fd = s.fd, .events = c.POLLOUT, .revents = 0 };
+        var pfd = c.struct_pollfd{ .fd = s.local.fd, .events = c.POLLOUT, .revents = 0 };
         try t.expect(c.poll(&pfd, 1, 1000) > 0);
         try t.expect(pfd.revents & c.POLLOUT != 0);
         bridge.flushSession(s);
@@ -772,18 +730,24 @@ test "transport: queue limit closes the session without retaining memory" {
     try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
     defer _ = c.close(pair[1]);
     try testSetNonBlocking(pair[0]);
+    var mux_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&mux_pair));
+    defer _ = c.close(mux_pair[1]);
+    var conn = client.Conn{ .allocator = a, .fd = mux_pair[0], .proto = wire.PROTO_VERSION };
+    defer conn.deinit();
 
     var bridge = Bridge.init(a);
     defer bridge.deinit();
+    bridge.setConn(&conn);
     const s = &bridge.sessions[0];
-    s.* = .{ .fd = pair[0] };
+    try s.local.open(pair[0], MAX_SESSION_OUT);
     const over_limit = try a.alloc(u8, MAX_SESSION_OUT + 1);
     defer a.free(over_limit);
     bridge.queueSession(s, over_limit, false);
 
     try t.expect(!s.active());
-    try t.expectEqual(@as(usize, 0), s.out.items.len);
-    try t.expectEqual(@as(usize, 0), s.out.capacity);
+    try t.expectEqual(@as(usize, 0), s.local.out.items.len);
+    try t.expectEqual(@as(usize, 0), s.local.out.capacity);
     var byte: [1]u8 = undefined;
     try t.expectEqual(@as(isize, 0), c.read(pair[1], &byte, byte.len));
 }
@@ -808,7 +772,8 @@ test "transport: buffered daemon frames preserve connect-data-close order" {
     defer bridge.deinit();
     bridge.setConn(&conn);
     const s = &bridge.sessions[0];
-    s.* = .{ .fd = local_pair[0], .req_id = 42 };
+    s.* = .{ .req_id = 42 };
+    try s.local.open(local_pair[0], MAX_SESSION_OUT);
 
     var stream: std.ArrayList(u8) = .empty;
     defer stream.deinit(a);
@@ -840,6 +805,48 @@ test "transport: buffered daemon frames preserve connect-data-close order" {
     @memcpy(expected[0..success.len], &success);
     @memcpy(expected[success.len..], "alphabeta");
     try t.expectEqualSlices(u8, &expected, received.items);
+}
+
+test "transport: local tunnel EOF queues chan_close" {
+    const t = std.testing;
+    var mux_pair: [2]c_int = undefined;
+    var local_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&mux_pair));
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&local_pair));
+    var conn = client.Conn{ .allocator = t.allocator, .fd = mux_pair[0], .proto = wire.PROTO_VERSION };
+    defer conn.deinit();
+    var daemon = client.Conn{ .allocator = t.allocator, .fd = mux_pair[1], .proto = wire.PROTO_VERSION };
+    defer daemon.deinit();
+    var bridge = Bridge.init(t.allocator);
+    defer bridge.deinit();
+    bridge.setConn(&conn);
+    const s = &bridge.sessions[0];
+    try s.local.open(local_pair[0], MAX_SESSION_OUT);
+    s.local.chan = 31;
+    s.tunneled = true;
+    _ = c.close(local_pair[1]);
+
+    bridge.pumpSession(s);
+    try t.expect(!s.active());
+    const frame = try daemon.recvExpectFor(&.{.chan_close}, 1000);
+    defer frame.deinit(t.allocator);
+    try t.expectEqual(@as(?u32, 31), wire.decodeChanId(frame.payload));
+}
+
+test "transport: gone and mux EOF stop the SOCKS bridge" {
+    const t = std.testing;
+    var pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+    var conn = client.Conn{ .allocator = t.allocator, .fd = pair[0], .proto = wire.PROTO_VERSION };
+    defer conn.deinit();
+    var bridge = Bridge.init(t.allocator);
+    defer bridge.deinit();
+    bridge.setConn(&conn);
+    try wire.appendFrame(&conn.rbuf, t.allocator, .gone, "");
+    try t.expect(!bridge.drainConnFrames());
+    _ = c.shutdown(pair[1], c.SHUT_RDWR);
+    _ = c.close(pair[1]);
+    try t.expect(!bridge.pumpConn());
 }
 
 fn testWakeupFailure() !platform.Wakeup {

@@ -11,6 +11,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const mux_client = @import("../mux/client.zig");
+const channel_pump = @import("../mux/channel_pump.zig");
 const mux_daemon = @import("../mux/daemon.zig");
 const mux_wire = @import("../mux/wire.zig");
 const pulse = @import("../mux/pulse.zig");
@@ -487,6 +488,7 @@ fn muxForward(allocator: std.mem.Allocator, host: ?[]const u8, spec: []const u8)
     const lfd = platform.socketCloexec(c.AF_INET, c.SOCK_STREAM, 0);
     if (lfd < 0) return 1;
     defer _ = c.close(lfd);
+    channel_pump.configureFd(lfd) catch return 1;
     var one: c_int = 1;
     _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
     var sa = std.mem.zeroes(c.struct_sockaddr_in);
@@ -499,118 +501,287 @@ fn muxForward(allocator: std.mem.Allocator, host: ?[]const u8, spec: []const u8)
     }
     _ = c.printf("forwarding 127.0.0.1:%u -> remote 127.0.0.1:%u (Ctrl+C stops)\n", @as(c_uint, local), @as(c_uint, remote));
 
-    const MAXC = 64;
-    const Fwd = struct { id: u32 = 0, fd: c_int = -1 };
-    var fwds = [_]Fwd{.{}} ** MAXC;
-    // Accepted fds whose chan_open hasn't arrived yet; the daemon
-    // answers forward_opens in order, so a FIFO correlates them.
-    var pending = [_]c_int{-1} ** MAXC;
-    var pending_n: usize = 0;
+    var forwarder = Forwarder.init(allocator, &conn, lfd, remote);
+    defer forwarder.deinit();
+    if (forwarder.run()) return 0;
+    _ = c.fprintf(platform.stderr(), "sketerm mux forward: connection lost\n");
+    return 1;
+}
 
-    while (true) {
-        var fds: [2 + MAXC]c.struct_pollfd = undefined;
-        fds[0] = .{ .fd = conn.fd, .events = c.POLLIN, .revents = 0 };
-        fds[1] = .{ .fd = lfd, .events = c.POLLIN, .revents = 0 };
-        for (fwds, 0..) |fw, i| fds[2 + i] = .{ .fd = fw.fd, .events = c.POLLIN, .revents = 0 };
-        if (c.poll(&fds, fds.len, -1) < 0) return 1;
+const MAX_FORWARDS = 64;
+const MAX_FORWARD_OUT: usize = 1 << 20;
 
-        if (fds[1].revents & c.POLLIN != 0) {
-            const afd = c.accept(lfd, null, null);
-            if (afd >= 0) {
-                var free_slots: usize = 0;
-                for (fwds) |fw| {
-                    if (fw.fd == -1) free_slots += 1;
-                }
-                if (pending_n >= MAXC or free_slots <= pending_n) {
-                    _ = c.close(afd);
-                } else if (conn.sendJson(.forward_open, .{ .port = remote })) |_| {
-                    pending[pending_n] = afd;
-                    pending_n += 1;
-                } else |_| {
-                    _ = c.close(afd);
-                    _ = c.fprintf(platform.stderr(), "sketerm mux forward: connection lost\n");
-                    return 1;
-                }
-            }
+const Forwarder = struct {
+    allocator: std.mem.Allocator,
+    conn: *mux_client.Conn,
+    listen_fd: c_int,
+    remote_port: u16,
+    cancel_fd: c_int = -1,
+    locals: [MAX_FORWARDS]channel_pump.Local = @splat(.{}),
+    /// Slot indexes awaiting ordered `chan_open` replies.
+    pending: [MAX_FORWARDS]u8 = @splat(0),
+    pending_n: usize = 0,
+
+    fn init(allocator: std.mem.Allocator, conn: *mux_client.Conn, listen_fd: c_int, remote_port: u16) Forwarder {
+        return .{ .allocator = allocator, .conn = conn, .listen_fd = listen_fd, .remote_port = remote_port };
+    }
+
+    fn newPump(self: *Forwarder) channel_pump.Pump {
+        return channel_pump.Pump.init(self.allocator, self.conn);
+    }
+
+    fn deinit(self: *Forwarder) void {
+        var pump = self.newPump();
+        for (&self.locals) |*local| pump.closeLocal(local, false);
+    }
+
+    fn freeSlot(self: *Forwarder) ?usize {
+        for (&self.locals, 0..) |*local, index| {
+            if (!local.active()) return index;
         }
+        return null;
+    }
 
-        if (fds[0].revents & (c.POLLIN | c.POLLHUP) != 0) {
-            const f = conn.recvFrame() catch {
-                _ = c.fprintf(platform.stderr(), "sketerm mux forward: connection lost\n");
-                return 1;
-            };
-            defer f.deinit(allocator);
-            switch (f.ftype) {
-                .chan_open => blk: {
-                    const open = mux_wire.decodeChanOpen(f.payload) orelse break :blk;
-                    if (open.kind != .tcp_forward) break :blk;
-                    if (pending_n == 0) break :blk;
-                    const afd = pending[0];
-                    std.mem.copyForwards(c_int, pending[0 .. pending_n - 1], pending[1..pending_n]);
-                    pending_n -= 1;
-                    for (&fwds) |*fw| {
-                        if (fw.fd == -1) {
-                            fw.* = .{ .id = open.id, .fd = afd };
-                            break;
-                        }
-                    }
-                },
-                .chan_data => blk: {
-                    if (f.payload.len < 4) break :blk;
-                    const id = mux_wire.decodeChanId(f.payload) orelse break :blk;
-                    for (&fwds) |*fw| {
-                        if (fw.fd != -1 and fw.id == id) {
-                            var off: usize = 4;
-                            while (off < f.payload.len) {
-                                const n = c.write(fw.fd, f.payload.ptr + off, f.payload.len - off);
-                                if (n <= 0) break;
-                                off += @intCast(n);
-                            }
-                            break;
-                        }
-                    }
-                },
-                .chan_close => blk: {
-                    const id = mux_wire.decodeChanId(f.payload) orelse break :blk;
-                    for (&fwds) |*fw| {
-                        if (fw.fd != -1 and fw.id == id) {
-                            _ = c.close(fw.fd);
-                            fw.* = .{};
-                            break;
-                        }
-                    }
-                },
-                .err => {
-                    // A refused forward_open: drop the oldest waiter.
-                    if (pending_n > 0) {
-                        _ = c.close(pending[0]);
-                        std.mem.copyForwards(c_int, pending[0 .. pending_n - 1], pending[1..pending_n]);
-                        pending_n -= 1;
-                    }
-                },
-                else => {},
-            }
+    fn byChan(self: *Forwarder, chan: u32) ?*channel_pump.Local {
+        for (&self.locals) |*local| {
+            if (local.active() and local.chan == chan) return local;
         }
+        return null;
+    }
 
-        for (&fwds, 0..) |*fw, i| {
-            if (fw.fd == -1) continue;
-            if (fds[2 + i].revents & (c.POLLIN | c.POLLHUP) == 0) continue;
-            var buf: [4 + 32768]u8 = undefined;
-            const n = c.read(fw.fd, buf[4..].ptr, buf.len - 4);
-            if (n <= 0) {
-                var hdr: [4]u8 = undefined;
-                conn.sendFrame(.chan_close, mux_wire.putChanHeader(&hdr, fw.id)) catch {};
-                _ = c.close(fw.fd);
-                fw.* = .{};
-                continue;
-            }
-            std.mem.writeInt(u32, buf[0..4], fw.id, .little);
-            conn.sendFrame(.chan_data, buf[0 .. 4 + @as(usize, @intCast(n))]) catch {
-                _ = c.fprintf(platform.stderr(), "sketerm mux forward: connection lost\n");
-                return 1;
-            };
+    fn popPending(self: *Forwarder) ?usize {
+        if (self.pending_n == 0) return null;
+        const index = self.pending[0];
+        std.mem.copyForwards(u8, self.pending[0 .. self.pending_n - 1], self.pending[1..self.pending_n]);
+        self.pending_n -= 1;
+        return index;
+    }
+
+    fn acceptOne(self: *Forwarder) bool {
+        const fd = (channel_pump.accept(self.listen_fd) catch return false) orelse return true;
+        const index = self.freeSlot() orelse {
+            _ = c.close(fd);
+            return true;
+        };
+        self.locals[index].open(fd, MAX_FORWARD_OUT) catch {
+            _ = c.close(fd);
+            return true;
+        };
+        self.conn.queueJson(.forward_open, .{ .port = self.remote_port }) catch {
+            var pump = self.newPump();
+            pump.closeLocal(&self.locals[index], false);
+            return false;
+        };
+        self.pending[self.pending_n] = @intCast(index);
+        self.pending_n += 1;
+        return true;
+    }
+
+    fn handleFrame(self: *Forwarder, ftype: mux_wire.FrameType, payload: []const u8) bool {
+        var pump = self.newPump();
+        switch (ftype) {
+            .chan_open => {
+                const opened = mux_wire.decodeChanOpen(payload) orelse return true;
+                if (opened.kind != .tcp_forward) return true;
+                const index = self.popPending() orelse {
+                    pump.queueClose(opened.id) catch {};
+                    return true;
+                };
+                if (!self.locals[index].active()) {
+                    pump.queueClose(opened.id) catch {};
+                    return true;
+                }
+                self.locals[index].chan = opened.id;
+            },
+            .chan_data => {
+                const id = mux_wire.decodeChanId(payload) orelse return true;
+                const local = self.byChan(id) orelse return true;
+                _ = pump.queueLocal(local, payload[4..], false, false) catch {
+                    pump.closeLocal(local, true);
+                    return true;
+                };
+            },
+            .chan_close => {
+                const id = mux_wire.decodeChanId(payload) orelse return true;
+                if (self.byChan(id)) |local| _ = pump.remoteClose(local);
+            },
+            // A refused forward_open has no request id; replies are ordered.
+            .err => if (self.popPending()) |index| pump.closeLocal(&self.locals[index], false),
+            else => {},
+        }
+        return true;
+    }
+
+    fn drainBuffered(self: *Forwarder) bool {
+        var pump = self.newPump();
+        if (pump.drainBuffered(self, Forwarder.handleFrame) == .open) return true;
+        self.finishMuxClose();
+        return false;
+    }
+
+    fn receive(self: *Forwarder) bool {
+        var pump = self.newPump();
+        if (pump.receive(self, Forwarder.handleFrame) == .open) return true;
+        self.finishMuxClose();
+        return false;
+    }
+
+    fn finishMuxClose(self: *Forwarder) void {
+        var refs: [MAX_FORWARDS]*channel_pump.Local = undefined;
+        for (&self.locals, 0..) |*local, index| refs[index] = local;
+        var pump = self.newPump();
+        pump.finishAfterMuxClose(&refs, self.cancel_fd, channel_pump.nowMs() + 5000);
+    }
+
+    fn pumpLocal(self: *Forwarder, local: *channel_pump.Local) void {
+        var pump = self.newPump();
+        var buf: [channel_pump.DATA_CHUNK]u8 = undefined;
+        switch (channel_pump.readLocal(local.fd, &buf)) {
+            .data => |data| pump.queueData(local.chan, data) catch pump.closeLocal(local, true),
+            .would_block => {},
+            .eof, .failed => pump.closeLocal(local, true),
         }
     }
+
+    fn run(self: *Forwarder) bool {
+        var pump = self.newPump();
+        pump.prepare() catch return false;
+        while (true) {
+            if (!self.drainBuffered()) return false;
+            const mux_blocked = self.conn.wbuf.items.len != 0;
+            const cancel_index = 2 + MAX_FORWARDS;
+            var fds: [3 + MAX_FORWARDS]c.struct_pollfd = undefined;
+            fds[0] = .{ .fd = self.conn.fd, .events = pump.muxEvents(true), .revents = 0 };
+            fds[1] = .{
+                .fd = self.listen_fd,
+                .events = if (!mux_blocked and self.pending_n < MAX_FORWARDS and self.freeSlot() != null) c.POLLIN else 0,
+                .revents = 0,
+            };
+            for (&self.locals, 0..) |*local, index| {
+                fds[2 + index] = .{
+                    .fd = if (local.active()) local.fd else -1,
+                    .events = if (local.active() and local.chan != 0) local.events(!mux_blocked) else 0,
+                    .revents = 0,
+                };
+            }
+            fds[cancel_index] = .{ .fd = self.cancel_fd, .events = c.POLLIN, .revents = 0 };
+            switch (channel_pump.wait(&fds, if (self.cancel_fd >= 0) cancel_index else null, null)) {
+                .ready => {},
+                .cancelled => return true,
+                .timeout => unreachable,
+                .failed => return false,
+            }
+
+            if (fds[0].revents & c.POLLOUT != 0 and !pump.flushMux()) return false;
+            if (fds[1].revents & c.POLLIN != 0 and self.conn.wbuf.items.len == 0)
+                if (!self.acceptOne()) return false;
+            if (fds[0].revents & (c.POLLIN | c.POLLHUP) != 0)
+                if (!self.receive()) return false;
+            if (channel_pump.badPoll(fds[0].revents) or channel_pump.badPoll(fds[1].revents)) return false;
+
+            for (&self.locals, 0..) |*local, index| {
+                if (!local.active()) continue;
+                const revents = fds[2 + index].revents;
+                if (revents & c.POLLOUT != 0) _ = pump.flushLocal(local);
+                if (!local.active()) continue;
+                if (revents & (c.POLLIN | c.POLLHUP) != 0 and self.conn.wbuf.items.len == 0) {
+                    self.pumpLocal(local);
+                }
+                if (local.active() and channel_pump.badPoll(revents)) pump.closeLocal(local, true);
+            }
+        }
+    }
+};
+
+test "forward pump drains buffered open-data-close frames in order" {
+    const t = std.testing;
+    var mux_pair: [2]c_int = undefined;
+    var local_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&mux_pair));
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&local_pair));
+    defer _ = c.close(mux_pair[1]);
+    defer _ = c.close(local_pair[1]);
+    var conn = mux_client.Conn{ .allocator = t.allocator, .fd = mux_pair[0], .proto = mux_wire.PROTO_VERSION };
+    defer conn.deinit();
+    var forwarder = Forwarder.init(t.allocator, &conn, -1, 80);
+    defer forwarder.deinit();
+    try forwarder.locals[0].open(local_pair[0], MAX_FORWARD_OUT);
+    forwarder.pending[0] = 0;
+    forwarder.pending_n = 1;
+
+    var open_buf: [5]u8 = undefined;
+    try mux_wire.appendFrame(&conn.rbuf, t.allocator, .chan_open, mux_wire.encodeChanOpen(&open_buf, 7, .tcp_forward));
+    var data: [4 + 9]u8 = undefined;
+    std.mem.writeInt(u32, data[0..4], 7, .little);
+    @memcpy(data[4..], "alphabeta");
+    try mux_wire.appendFrame(&conn.rbuf, t.allocator, .chan_data, &data);
+    var close_header: [4]u8 = undefined;
+    try mux_wire.appendFrame(&conn.rbuf, t.allocator, .chan_close, mux_wire.putChanHeader(&close_header, 7));
+
+    try t.expect(forwarder.drainBuffered());
+    try t.expect(!forwarder.locals[0].active());
+    var got: [9]u8 = undefined;
+    try t.expectEqual(@as(isize, got.len), c.read(local_pair[1], &got, got.len));
+    try t.expectEqualStrings("alphabeta", &got);
+    var eof: [1]u8 = undefined;
+    try t.expectEqual(@as(isize, 0), c.read(local_pair[1], &eof, eof.len));
+}
+
+test "forward pump turns local EOF into chan_close" {
+    const t = std.testing;
+    var mux_pair: [2]c_int = undefined;
+    var local_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&mux_pair));
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&local_pair));
+    var conn = mux_client.Conn{ .allocator = t.allocator, .fd = mux_pair[0], .proto = mux_wire.PROTO_VERSION };
+    defer conn.deinit();
+    var peer = mux_client.Conn{ .allocator = t.allocator, .fd = mux_pair[1], .proto = mux_wire.PROTO_VERSION };
+    defer peer.deinit();
+    var forwarder = Forwarder.init(t.allocator, &conn, -1, 80);
+    defer forwarder.deinit();
+    try forwarder.locals[0].open(local_pair[0], MAX_FORWARD_OUT);
+    forwarder.locals[0].chan = 23;
+    _ = c.close(local_pair[1]);
+
+    forwarder.pumpLocal(&forwarder.locals[0]);
+    try t.expect(!forwarder.locals[0].active());
+    const frame = try peer.recvExpectFor(&.{.chan_close}, 1000);
+    defer frame.deinit(t.allocator);
+    try t.expectEqual(@as(?u32, 23), mux_wire.decodeChanId(frame.payload));
+}
+
+test "forward pump handles refusal, gone, mux EOF, and cancellation" {
+    const t = std.testing;
+    var mux_pair: [2]c_int = undefined;
+    var local_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&mux_pair));
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&local_pair));
+    var conn = mux_client.Conn{ .allocator = t.allocator, .fd = mux_pair[0], .proto = mux_wire.PROTO_VERSION };
+    defer conn.deinit();
+    var forwarder = Forwarder.init(t.allocator, &conn, -1, 80);
+    defer forwarder.deinit();
+    try forwarder.locals[0].open(local_pair[0], MAX_FORWARD_OUT);
+    forwarder.pending[0] = 0;
+    forwarder.pending_n = 1;
+    try t.expect(forwarder.handleFrame(.err, "refused"));
+    try t.expect(!forwarder.locals[0].active());
+    try t.expectEqual(@as(usize, 0), forwarder.pending_n);
+    _ = c.close(local_pair[1]);
+
+    try mux_wire.appendFrame(&conn.rbuf, t.allocator, .gone, "");
+    try t.expect(!forwarder.drainBuffered());
+
+    const wake = try platform.Wakeup.init();
+    defer wake.close();
+    forwarder.cancel_fd = wake.read_fd;
+    wake.signal();
+    try t.expect(forwarder.run());
+
+    _ = c.shutdown(mux_pair[1], c.SHUT_RDWR);
+    _ = c.close(mux_pair[1]);
+    mux_pair[1] = -1;
+    forwarder.cancel_fd = -1;
+    try t.expect(!forwarder.receive());
 }
 
 /// One search hit as the daemon reports it.

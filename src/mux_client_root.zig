@@ -14,6 +14,7 @@ pub const wire = @import("mux/wire.zig");
 pub const c = @import("c.zig").c;
 pub const platform = @import("util/platform.zig");
 pub const client = @import("mux/client.zig");
+pub const channel_pump = @import("mux/channel_pump.zig");
 pub const sockpath = @import("mux/sockpath.zig");
 pub const snapshot = @import("mux/snapshot.zig");
 /// Panel RPC command/reply schemas and validation, including reliable event

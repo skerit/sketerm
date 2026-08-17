@@ -9,6 +9,7 @@ const sdk = @import("mux-client");
 comptime {
     std.testing.refAllDecls(sdk.wire);
     std.testing.refAllDecls(sdk.client);
+    std.testing.refAllDecls(sdk.channel_pump);
     std.testing.refAllDecls(sdk.sockpath);
     std.testing.refAllDecls(sdk.snapshot);
     std.testing.refAllDecls(sdk.panelrpc);

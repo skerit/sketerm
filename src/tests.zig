@@ -167,6 +167,7 @@ comptime {
     _ = @import("a11y/webproj.zig");
     _ = @import("a11y/detect.zig");
     _ = @import("ipc/protocol.zig");
+    _ = @import("mux/channel_pump.zig");
     _ = @import("ipc/mux_cli.zig");
     _ = @import("ipc/keys.zig");
     _ = @import("ipc/socks5.zig");

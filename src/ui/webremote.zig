@@ -12,13 +12,14 @@
 //! main thread — no idle handback, nothing to fence.
 //!
 //! GTK-free except for c.zig's libc surface: the worker owns a
-//! `mux/client.Conn` and a plain poll loop, the socksbridge shape.
+//! `mux/client.Conn` driven through the shared channel pump.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const wire = @import("../mux/wire.zig");
 const mux_client = @import("../mux/client.zig");
+const channel_pump = @import("../mux/channel_pump.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const FdCancel = @import("../util/fdcancel.zig").FdCancel;
 
@@ -35,8 +36,8 @@ pub const Bridge = struct {
     /// The end the webface Client adopts. Owned by the CLIENT once
     /// `guiFd` was taken; the bridge never touches it.
     gui_fd: c_int = -1,
-    /// The bridge-owned end of the socketpair.
-    fd: c_int = -1,
+    /// The bridge-owned end of the socketpair and its bounded output queue.
+    local: channel_pump.Local = .{},
     /// Required wakeup for every worker poll.
     wakeup: ?platform.Wakeup = null,
     thread: ?std.Thread = null,
@@ -74,7 +75,7 @@ pub const Bridge = struct {
             allocator.destroy(self);
             return null;
         };
-        setNonBlockingFd(pair[1]) catch {
+        self.local.open(pair[1], MAX_LOCAL_OUT) catch {
             wakeup.close();
             _ = c.close(pair[0]);
             _ = c.close(pair[1]);
@@ -82,7 +83,6 @@ pub const Bridge = struct {
             return null;
         };
         self.gui_fd = pair[0];
-        self.fd = pair[1];
         self.wakeup = wakeup;
         return self;
     }
@@ -109,11 +109,10 @@ pub const Bridge = struct {
     pub fn stop(self: *Bridge) void {
         self.cancel.stop();
         if (self.wakeup) |wake| wake.signal();
-        if (self.fd >= 0) _ = c.shutdown(self.fd, c.SHUT_RDWR);
+        self.local.shutdown();
         if (self.thread) |t| t.join();
         self.thread = null;
-        if (self.fd >= 0) _ = c.close(self.fd);
-        self.fd = -1;
+        self.local.deinit(self.allocator);
         if (self.gui_fd >= 0) _ = c.close(self.gui_fd);
         self.gui_fd = -1;
         if (self.wakeup) |wake| {
@@ -129,10 +128,14 @@ pub const Bridge = struct {
 
     fn failWith(self: *Bridge, reason: []const u8) void {
         if (self.cancel.isStopped()) return;
+        self.recordReason(reason);
+        self.local.shutdown();
+    }
+
+    fn recordReason(self: *Bridge, reason: []const u8) void {
         const n = @min(reason.len, self.reason.len);
         @memcpy(self.reason[0..n], reason[0..n]);
         self.reason_len.store(n, .release);
-        if (self.fd >= 0) _ = c.shutdown(self.fd, c.SHUT_RDWR);
     }
 
     fn worker(self: *Bridge) void {
@@ -143,7 +146,8 @@ pub const Bridge = struct {
         };
         self.conn = conn;
         self.conn_ok = true;
-        self.conn.setNonBlockingChecked() catch {
+        var pump = channel_pump.Pump.init(self.allocator, &self.conn);
+        pump.prepare() catch {
             self.failWith("Could not make the remote daemon connection nonblocking.");
             return;
         };
@@ -157,7 +161,7 @@ pub const Bridge = struct {
             return;
         }
         const chan = self.openHelper() orelse return;
-        self.pump(chan);
+        self.relay(chan);
         // However the pump ended, the close IS the notification.
         if (self.reason_len.load(.acquire) == 0)
             self.failWith("The connection to the remote browser helper was lost.");
@@ -171,52 +175,52 @@ pub const Bridge = struct {
             return null;
         };
         const wakeup = self.wakeup orelse return null;
-        const deadline = nowMs() + REPLY_TIMEOUT_MS;
+        const deadline = channel_pump.nowMs() + REPLY_TIMEOUT_MS;
+        var pump = channel_pump.Pump.init(self.allocator, &self.conn);
         while (true) {
             switch (self.drainOpenFrames()) {
                 .opened => |chan| return chan,
                 .failed => return null,
                 .pending => {},
             }
-            const left = deadline - nowMs();
-            if (left <= 0) {
+            if (deadline - channel_pump.nowMs() <= 0) {
                 self.failWith("The remote daemon did not answer the browser-helper request in time.");
                 return null;
             }
             var fds: [2]c.struct_pollfd = .{
                 .{
                     .fd = self.conn.fd,
-                    .events = @intCast(c.POLLIN | if (self.conn.wbuf.items.len != 0) c.POLLOUT else 0),
+                    .events = pump.muxEvents(true),
                     .revents = 0,
                 },
                 .{ .fd = wakeup.read_fd, .events = c.POLLIN, .revents = 0 },
             };
-            const polled = c.poll(&fds, fds.len, @intCast(left));
-            if (polled < 0) {
-                if (std.posix.errno(polled) == .INTR) continue;
-                self.failWith("Lost the connection to the remote daemon while opening the browser helper.");
-                return null;
+            switch (channel_pump.wait(&fds, 1, deadline)) {
+                .ready => {},
+                .cancelled => return null,
+                .timeout => {
+                    self.failWith("The remote daemon did not answer the browser-helper request in time.");
+                    return null;
+                },
+                .failed => {
+                    self.failWith("Lost the connection to the remote daemon while opening the browser helper.");
+                    return null;
+                },
             }
-            if (fds[1].revents != 0) return null;
             if (fds[0].revents & c.POLLOUT != 0) {
-                self.conn.flushQueued() catch {
+                if (!pump.flushMux()) {
                     self.failWith("Could not ask the remote daemon for a browser helper.");
                     return null;
-                };
+                }
             }
             if (fds[0].revents & (c.POLLIN | c.POLLHUP) != 0) {
-                const connected = self.conn.fillAvailable();
-                switch (self.drainOpenFrames()) {
+                switch (self.receiveOpenFrames()) {
                     .opened => |chan| return chan,
                     .failed => return null,
                     .pending => {},
                 }
-                if (!connected) {
-                    self.failWith("Lost the connection to the remote daemon while opening the browser helper.");
-                    return null;
-                }
             }
-            if (fds[0].revents & (c.POLLERR | c.POLLNVAL) != 0) {
+            if (channel_pump.badPoll(fds[0].revents)) {
                 self.failWith("Lost the connection to the remote daemon while opening the browser helper.");
                 return null;
             }
@@ -224,203 +228,191 @@ pub const Bridge = struct {
     }
 
     fn drainOpenFrames(self: *Bridge) OpenState {
+        return self.processOpenFrames(false);
+    }
+
+    fn receiveOpenFrames(self: *Bridge) OpenState {
+        return self.processOpenFrames(true);
+    }
+
+    fn processOpenFrames(self: *Bridge, receive: bool) OpenState {
+        var state: OpenState = .pending;
+        var context = OpenContext{ .bridge = self, .state = &state };
+        var pump = channel_pump.Pump.init(self.allocator, &self.conn);
+        const result = if (receive)
+            pump.receive(&context, handleOpenFrame)
+        else
+            pump.drainBuffered(&context, handleOpenFrame);
+        return switch (result) {
+            .open, .stopped => state,
+            .gone, .eof => blk: {
+                self.failWith("Lost the connection to the remote daemon while opening the browser helper.");
+                break :blk .failed;
+            },
+            .failed => blk: {
+                self.failWith("The remote daemon answered the helper request with garbage.");
+                break :blk .failed;
+            },
+        };
+    }
+
+    const OpenContext = struct {
+        bridge: *Bridge,
+        state: *OpenState,
+    };
+
+    fn handleOpenFrame(context: *OpenContext, ftype: wire.FrameType, payload: []const u8) bool {
+        const self = context.bridge;
         const Reply = struct {
             req: u32 = 0,
             ok: bool = false,
             chan: u32 = 0,
             @"error": []const u8 = "",
         };
-        while (true) {
-            const f = (self.conn.takeFrame() catch {
-                self.failWith("The remote daemon answered the helper request with garbage.");
-                return .failed;
-            }) orelse return .pending;
-            defer f.deinit(self.allocator);
-            switch (f.ftype) {
-                .web_helper_reply => {
-                    var parsed = std.json.parseFromSlice(Reply, self.allocator, f.payload, .{
-                        .ignore_unknown_fields = true,
-                    }) catch {
-                        self.failWith("The remote daemon answered the helper request with garbage.");
-                        return .failed;
-                    };
-                    defer parsed.deinit();
-                    if (parsed.value.req != 1 or !parsed.value.ok or parsed.value.chan == 0) {
-                        if (parsed.value.@"error".len != 0) {
-                            var buf: [192]u8 = undefined;
-                            const msg = std.fmt.bufPrint(&buf, "Remote browser helper failed: {s}", .{parsed.value.@"error"}) catch parsed.value.@"error";
-                            self.failWith(msg);
-                        } else self.failWith("The remote daemon could not start a browser helper.");
-                        return .failed;
-                    }
-                    return .{ .opened = parsed.value.chan };
-                },
-                .err => {
-                    self.failWith("The remote daemon refused the browser-helper request.");
-                    return .failed;
-                },
-                .gone => return .failed,
-                else => {},
-            }
+        switch (ftype) {
+            .web_helper_reply => {
+                var parsed = std.json.parseFromSlice(Reply, self.allocator, payload, .{
+                    .ignore_unknown_fields = true,
+                }) catch {
+                    self.failWith("The remote daemon answered the helper request with garbage.");
+                    context.state.* = .failed;
+                    return false;
+                };
+                defer parsed.deinit();
+                if (parsed.value.req != 1 or !parsed.value.ok or parsed.value.chan == 0) {
+                    if (parsed.value.@"error".len != 0) {
+                        var buf: [192]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&buf, "Remote browser helper failed: {s}", .{parsed.value.@"error"}) catch parsed.value.@"error";
+                        self.failWith(msg);
+                    } else self.failWith("The remote daemon could not start a browser helper.");
+                    context.state.* = .failed;
+                    return false;
+                }
+                context.state.* = .{ .opened = parsed.value.chan };
+                return false;
+            },
+            .err => {
+                self.failWith("The remote daemon refused the browser-helper request.");
+                context.state.* = .failed;
+                return false;
+            },
+            else => {},
         }
+        return true;
     }
 
-    const Pending = struct {
-        bytes: std.ArrayList(u8) = .empty,
-        off: usize = 0,
-
-        fn len(self: *const Pending) usize {
-            return self.bytes.items.len - self.off;
-        }
-
-        fn append(self: *Pending, allocator: std.mem.Allocator, data: []const u8) !void {
-            if (self.off != 0) {
-                const pending = self.len();
-                std.mem.copyForwards(u8, self.bytes.items[0..pending], self.bytes.items[self.off..]);
-                self.bytes.shrinkRetainingCapacity(pending);
-                self.off = 0;
-            }
-            if (data.len > MAX_LOCAL_OUT - self.bytes.items.len) return error.Backpressure;
-            try self.bytes.appendSlice(allocator, data);
-        }
-
-        fn flush(self: *Pending, fd: c_int) bool {
-            while (self.len() != 0) {
-                const data = self.bytes.items[self.off..];
-                const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
-                    c.send(fd, data.ptr, data.len, c.MSG_NOSIGNAL)
-                else
-                    c.write(fd, data.ptr, data.len);
-                if (n > 0) {
-                    self.off += @intCast(n);
-                    continue;
-                }
-                if (n == 0) return false;
-                const e = std.posix.errno(n);
-                if (e == .INTR) continue;
-                if (e == .AGAIN) return true;
-                return false;
-            }
-            self.bytes.clearRetainingCapacity();
-            self.off = 0;
-            return true;
-        }
-    };
-
     /// Relay bytes both ways until either side dies or `stop` wakes us.
-    fn pump(self: *Bridge, chan: u32) void {
+    fn relay(self: *Bridge, chan: u32) void {
         const wakeup = self.wakeup orelse return;
-        var local_out = Pending{};
-        defer local_out.bytes.deinit(self.allocator);
+        self.local.chan = chan;
+        var pump = channel_pump.Pump.init(self.allocator, &self.conn);
         while (true) {
-            if (local_out.len() == 0 and !self.drainConnFrames(chan, &local_out)) return;
+            if (!self.handleDrainResult(pump.drainBuffered(self, Bridge.handlePumpFrame))) return;
+            if (!self.local.active()) return;
             var fds: [3]c.struct_pollfd = .{
                 .{
                     .fd = self.conn.fd,
-                    .events = @intCast((if (local_out.len() == 0) c.POLLIN else 0) |
-                        (if (self.conn.wbuf.items.len != 0) c.POLLOUT else 0)),
+                    .events = pump.muxEvents(self.local.pending() == 0 and !self.local.close_after_flush),
                     .revents = 0,
                 },
                 .{
-                    .fd = self.fd,
-                    .events = @intCast((if (self.conn.wbuf.items.len == 0) c.POLLIN else 0) |
-                        (if (local_out.len() != 0) c.POLLOUT else 0)),
+                    .fd = self.local.fd,
+                    .events = self.local.events(self.conn.wbuf.items.len == 0),
                     .revents = 0,
                 },
                 .{ .fd = wakeup.read_fd, .events = c.POLLIN, .revents = 0 },
             };
-            const polled = c.poll(&fds, fds.len, -1);
-            if (polled < 0) {
-                if (std.posix.errno(polled) == .INTR) continue;
+            if (channel_pump.wait(&fds, 2, null) != .ready) return;
+            if (fds[0].revents & c.POLLOUT != 0)
+                if (!pump.flushMux()) return;
+            if (fds[1].revents & c.POLLOUT != 0 and
+                !pump.flushLocalNotify(&self.local, self, Bridge.beforeLocalClose)) return;
+            if (!self.local.active()) return;
+            if (fds[1].revents & (c.POLLIN | c.POLLHUP) != 0 and self.conn.wbuf.items.len == 0)
+                if (!self.pumpLocal(&pump)) return;
+            if (fds[0].revents & (c.POLLIN | c.POLLHUP) != 0 and self.local.pending() == 0)
+                if (!self.handleDrainResult(pump.receive(self, Bridge.handlePumpFrame))) return;
+            if (channel_pump.badPoll(fds[1].revents)) {
+                self.beforeLocalClose(&self.local, true);
+                pump.closeLocal(&self.local, true);
                 return;
             }
-            if (fds[2].revents != 0) return;
-            if (fds[0].revents & c.POLLOUT != 0)
-                self.conn.flushQueued() catch return;
-            if (fds[1].revents & c.POLLOUT != 0 and !local_out.flush(self.fd)) return;
-            if (fds[1].revents & (c.POLLIN | c.POLLHUP) != 0 and self.conn.wbuf.items.len == 0)
-                if (!self.pumpLocal(chan)) return;
-            if (fds[0].revents & (c.POLLIN | c.POLLHUP) != 0 and local_out.len() == 0)
-                if (!self.pumpConn(chan, &local_out)) return;
-            if (fds[0].revents & (c.POLLERR | c.POLLNVAL) != 0 or
-                fds[1].revents & (c.POLLERR | c.POLLNVAL) != 0) return;
+            if (channel_pump.badPoll(fds[0].revents)) return;
         }
     }
 
-    fn pumpLocal(self: *Bridge, chan: u32) bool {
+    fn pumpLocal(self: *Bridge, pump: *channel_pump.Pump) bool {
         var buf: [32 * 1024]u8 = undefined;
-        while (true) {
-            const n = c.read(self.fd, &buf, buf.len);
-            if (n > 0) return self.sendChanData(chan, buf[0..@intCast(n)]);
-            if (n == 0) return false;
-            const e = std.posix.errno(n);
-            if (e == .INTR) continue;
-            if (e == .AGAIN) return true;
-            return false;
-        }
+        return switch (channel_pump.readLocal(self.local.fd, &buf)) {
+            .data => |data| blk: {
+                pump.queueData(self.local.chan, data) catch break :blk false;
+                break :blk true;
+            },
+            .would_block => true,
+            .eof, .failed => blk: {
+                self.beforeLocalClose(&self.local, true);
+                pump.closeLocal(&self.local, true);
+                break :blk false;
+            },
+        };
     }
 
-    fn sendChanData(self: *Bridge, chan: u32, data: []const u8) bool {
-        var hdr: [4]u8 = undefined;
-        var msg: [4 + 32 * 1024]u8 = undefined;
-        _ = wire.putChanHeader(&hdr, chan);
-        var off: usize = 0;
-        while (off < data.len) {
-            const take = @min(data.len - off, msg.len - 4);
-            @memcpy(msg[0..4], &hdr);
-            @memcpy(msg[4 .. 4 + take], data[off .. off + take]);
-            self.conn.queueFrame(.chan_data, msg[0 .. 4 + take]) catch return false;
-            off += take;
-        }
-        return true;
-    }
-
-    fn pumpConn(self: *Bridge, chan: u32, local_out: *Pending) bool {
-        const connected = self.conn.fillAvailable();
-        if (!self.drainConnFrames(chan, local_out)) return false;
-        return connected;
-    }
-
-    fn drainConnFrames(self: *Bridge, chan: u32, local_out: *Pending) bool {
-        while (local_out.len() == 0) {
-            const f = (self.conn.takeFrame() catch return false) orelse break;
-            defer f.deinit(self.allocator);
-            switch (f.ftype) {
-                .chan_data => {
-                    const id = wire.decodeChanId(f.payload) orelse continue;
-                    if (id != chan) continue;
-                    local_out.append(self.allocator, f.payload[4..]) catch {
-                        self.failWith("The local browser helper stopped accepting forwarded data.");
-                        return false;
-                    };
-                    if (!local_out.flush(self.fd)) return false;
-                },
-                .chan_close => {
-                    const id = wire.decodeChanId(f.payload) orelse continue;
-                    if (id == chan) {
-                        self.failWith("The remote browser helper exited.");
-                        return false;
-                    }
-                },
-                .gone => return false,
-                else => {},
-            }
+    fn handlePumpFrame(self: *Bridge, ftype: wire.FrameType, payload: []const u8) bool {
+        var pump = channel_pump.Pump.init(self.allocator, &self.conn);
+        switch (ftype) {
+            .chan_data => {
+                const id = wire.decodeChanId(payload) orelse return true;
+                if (id != self.local.chan) return true;
+                _ = pump.queueLocalNotify(
+                    &self.local,
+                    payload[4..],
+                    false,
+                    false,
+                    self,
+                    Bridge.beforeLocalClose,
+                ) catch {
+                    self.recordReason("The local browser helper stopped accepting forwarded data.");
+                    pump.closeLocal(&self.local, true);
+                    return false;
+                };
+                return self.local.active();
+            },
+            .chan_close => {
+                const id = wire.decodeChanId(payload) orelse return true;
+                if (id == self.local.chan) {
+                    self.recordReason("The remote browser helper exited.");
+                    _ = pump.remoteClose(&self.local);
+                }
+            },
+            .err => {
+                self.failWith("The remote daemon reported an error while forwarding the browser helper.");
+                return false;
+            },
+            else => {},
         }
         return true;
+    }
+
+    fn handleDrainResult(self: *Bridge, result: channel_pump.DrainResult) bool {
+        return switch (result) {
+            .open => true,
+            .stopped, .failed => false,
+            .gone, .eof => blk: {
+                var pump = channel_pump.Pump.init(self.allocator, &self.conn);
+                const wake_fd = if (self.wakeup) |wake| wake.read_fd else -1;
+                const refs = [_]*channel_pump.Local{&self.local};
+                self.recordReason("The connection to the remote browser helper was lost.");
+                pump.finishAfterMuxClose(&refs, wake_fd, channel_pump.nowMs() + 15_000);
+                break :blk false;
+            },
+        };
+    }
+
+    fn beforeLocalClose(self: *Bridge, _: *channel_pump.Local, _: bool) void {
+        if (self.reason_len.load(.acquire) == 0)
+            self.recordReason("The connection to the remote browser helper was lost.");
     }
 };
-
-fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
-
-fn setNonBlockingFd(fd: c_int) !void {
-    const flags = c.fcntl(fd, c.F_GETFL);
-    if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) != 0)
-        return error.NonBlockingFailed;
-}
 
 fn testWakeupFailure() !platform.Wakeup {
     return error.TestWakeupFailure;
@@ -458,7 +450,7 @@ const TestBridge = struct {
 
     fn start(self: *TestBridge) !void {
         const bridge = self.bridge orelse return error.TestUnexpectedResult;
-        bridge.thread = try std.Thread.spawn(.{}, Bridge.pump, .{ bridge, @as(u32, 7) });
+        bridge.thread = try std.Thread.spawn(.{}, Bridge.relay, .{ bridge, @as(u32, 7) });
     }
 
     fn stop(self: *TestBridge) void {
@@ -475,9 +467,9 @@ const TestBridge = struct {
 fn testStartAndStop(test_bridge: *TestBridge) !void {
     try test_bridge.start();
     _ = c.usleep(20_000);
-    const start = nowMs();
+    const start = channel_pump.nowMs();
     test_bridge.stop();
-    try std.testing.expect(nowMs() - start < 1_000);
+    try std.testing.expect(channel_pump.nowMs() - start < 1_000);
 }
 
 fn testFillSocket(fd: c_int) !void {
@@ -498,6 +490,43 @@ fn testFillSocket(fd: c_int) !void {
         return error.TestUnexpectedResult;
     }
     try t.expect(total != 0);
+}
+
+fn testReadExact(fd: c_int, out: []u8) !void {
+    const deadline = channel_pump.nowMs() + 2000;
+    var off: usize = 0;
+    while (off < out.len) {
+        const left = deadline - channel_pump.nowMs();
+        if (left <= 0) return error.Timeout;
+        var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+        const result = c.poll(&pfd, 1, @intCast(left));
+        if (result < 0 and std.posix.errno(result) == .INTR) continue;
+        if (result <= 0) return error.Timeout;
+        const n = c.read(fd, out.ptr + off, out.len - off);
+        if (n > 0) {
+            off += @intCast(n);
+            continue;
+        }
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        return error.UnexpectedEof;
+    }
+}
+
+fn testExpectEof(fd: c_int) !void {
+    const deadline = channel_pump.nowMs() + 2000;
+    while (true) {
+        const left = deadline - channel_pump.nowMs();
+        if (left <= 0) return error.Timeout;
+        var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+        const result = c.poll(&pfd, 1, @intCast(left));
+        if (result < 0 and std.posix.errno(result) == .INTR) continue;
+        if (result <= 0) return error.Timeout;
+        var byte: u8 = undefined;
+        const n = c.read(fd, &byte, 1);
+        if (n == 0) return;
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        return error.UnexpectedData;
+    }
 }
 
 test "remote bridge setup fails when its required wakeup cannot be created" {
@@ -539,8 +568,8 @@ test "remote bridge stop interrupts helper-write backpressure" {
     defer test_bridge.stop();
     const bridge = test_bridge.bridge.?;
     const tiny: c_int = 1024;
-    try t.expectEqual(@as(c_int, 0), c.setsockopt(bridge.fd, c.SOL_SOCKET, c.SO_SNDBUF, &tiny, @sizeOf(c_int)));
-    try testFillSocket(bridge.fd);
+    try t.expectEqual(@as(c_int, 0), c.setsockopt(bridge.local.fd, c.SOL_SOCKET, c.SO_SNDBUF, &tiny, @sizeOf(c_int)));
+    try testFillSocket(bridge.local.fd);
 
     var payload: std.ArrayList(u8) = .empty;
     defer payload.deinit(t.allocator);
@@ -549,4 +578,107 @@ test "remote bridge stop interrupts helper-write backpressure" {
     try payload.appendNTimes(t.allocator, 0x3c, 512 * 1024);
     try wire.appendFrame(&bridge.conn.rbuf, t.allocator, .chan_data, payload.items);
     try testStartAndStop(&test_bridge);
+}
+
+test "remote bridge preserves multiple short-written frames before chan_close" {
+    const t = std.testing;
+    var test_bridge = try TestBridge.init();
+    defer test_bridge.stop();
+    const bridge = test_bridge.bridge.?;
+    const tiny: c_int = 1024;
+    try t.expectEqual(@as(c_int, 0), c.setsockopt(bridge.local.fd, c.SOL_SOCKET, c.SO_SNDBUF, &tiny, @sizeOf(c_int)));
+    const first = try t.allocator.alloc(u8, 256 * 1024);
+    defer t.allocator.free(first);
+    const second = try t.allocator.alloc(u8, 256 * 1024);
+    defer t.allocator.free(second);
+    @memset(first, 0x31);
+    @memset(second, 0x72);
+    for ([_][]const u8{ first, second }) |body| {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(t.allocator);
+        var header: [4]u8 = undefined;
+        try payload.appendSlice(t.allocator, wire.putChanHeader(&header, 7));
+        try payload.appendSlice(t.allocator, body);
+        try wire.appendFrame(&bridge.conn.rbuf, t.allocator, .chan_data, payload.items);
+    }
+    var close_header: [4]u8 = undefined;
+    try wire.appendFrame(&bridge.conn.rbuf, t.allocator, .chan_close, wire.putChanHeader(&close_header, 7));
+    try test_bridge.start();
+
+    const got = try t.allocator.alloc(u8, first.len + second.len);
+    defer t.allocator.free(got);
+    try testReadExact(test_bridge.gui_fd, got);
+    try t.expectEqualSlices(u8, first, got[0..first.len]);
+    try t.expectEqualSlices(u8, second, got[first.len..]);
+    try testExpectEof(test_bridge.gui_fd);
+    try t.expectEqualStrings("The remote browser helper exited.", bridge.takeReason());
+}
+
+test "remote bridge local EOF queues chan_close" {
+    const t = std.testing;
+    var test_bridge = try TestBridge.init();
+    defer test_bridge.stop();
+    const bridge = test_bridge.bridge.?;
+    var peer = mux_client.Conn{
+        .allocator = t.allocator,
+        .fd = test_bridge.mux_peer,
+        .proto = wire.PROTO_VERSION,
+    };
+    test_bridge.mux_peer = -1;
+    defer peer.deinit();
+    _ = c.close(test_bridge.gui_fd);
+    test_bridge.gui_fd = -1;
+    try test_bridge.start();
+
+    const frame = try peer.recvExpectFor(&.{.chan_close}, 1000);
+    defer frame.deinit(t.allocator);
+    try t.expectEqual(@as(?u32, 7), wire.decodeChanId(frame.payload));
+    _ = bridge;
+}
+
+test "remote bridge daemon error closes the local endpoint" {
+    const t = std.testing;
+    var test_bridge = try TestBridge.init();
+    defer test_bridge.stop();
+    const bridge = test_bridge.bridge.?;
+    try wire.appendFrame(&bridge.conn.rbuf, t.allocator, .err, "failure");
+    try test_bridge.start();
+    try testExpectEof(test_bridge.gui_fd);
+    try t.expect(std.mem.indexOf(u8, bridge.takeReason(), "reported an error") != null);
+}
+
+test "remote bridge gone closes the local endpoint" {
+    const t = std.testing;
+    var test_bridge = try TestBridge.init();
+    defer test_bridge.stop();
+    const bridge = test_bridge.bridge.?;
+    try wire.appendFrame(&bridge.conn.rbuf, t.allocator, .gone, "");
+    try test_bridge.start();
+    try testExpectEof(test_bridge.gui_fd);
+}
+
+test "remote bridge mux EOF closes the local endpoint" {
+    var test_bridge = try TestBridge.init();
+    defer test_bridge.stop();
+    _ = c.shutdown(test_bridge.mux_peer, c.SHUT_RDWR);
+    _ = c.close(test_bridge.mux_peer);
+    test_bridge.mux_peer = -1;
+    try test_bridge.start();
+    try testExpectEof(test_bridge.gui_fd);
+}
+
+test "remote bridge queue limit closes the local endpoint" {
+    const t = std.testing;
+    var test_bridge = try TestBridge.init();
+    defer test_bridge.stop();
+    const bridge = test_bridge.bridge.?;
+    bridge.local.chan = 7;
+    const payload = try t.allocator.alloc(u8, 4 + MAX_LOCAL_OUT + 1);
+    defer t.allocator.free(payload);
+    @memset(payload, 0);
+    std.mem.writeInt(u32, payload[0..4], 7, .little);
+    const handled = bridge.handlePumpFrame(.chan_data, payload);
+    if (handled) return error.QueueLimitWasAccepted;
+    if (std.mem.indexOf(u8, bridge.takeReason(), "stopped accepting") == null)
+        return error.QueueLimitReasonMissing;
 }
