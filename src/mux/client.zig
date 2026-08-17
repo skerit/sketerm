@@ -307,6 +307,11 @@ pub const Conn = struct {
     /// and per-site settings stored on the daemon's host. Absent =
     /// never send the frame; the client degrades to no persistence.
     web_store: bool = false,
+    /// Daemon answers `stream_open` (welcome capability): it can open an
+    /// arbitrary-host TCP stream with DNS resolved on the daemon host.
+    /// Absent = never send the frame; an old daemon's generic `.err`
+    /// cannot be correlated to one of several pending CONNECT requests.
+    stream_open: bool = false,
     /// Daemon answers `web_helper_open` (welcome capability): it can
     /// spawn a sketerm-webengine browser helper on ITS host and bridge
     /// the protocol socket as a byte channel. Absent = remote browsing
@@ -475,6 +480,7 @@ pub const Conn = struct {
         self.lsp_support = false;
         self.cast_playback = false;
         self.web_store = false;
+        self.stream_open = false;
         self.web_helper = false;
         self.panel_rpc = 0;
         self.attach_identity = false;
@@ -495,6 +501,7 @@ pub const Conn = struct {
             lsp: bool = false,
             cast_playback: bool = false,
             web_store: bool = false,
+            stream_open: bool = false,
             web_helper: bool = false,
             panel_rpc: u8 = 0,
             attach_identity: bool = false,
@@ -520,6 +527,7 @@ pub const Conn = struct {
             self.lsp_support = parsed.value.lsp;
             self.cast_playback = parsed.value.cast_playback;
             self.web_store = parsed.value.web_store;
+            self.stream_open = parsed.value.stream_open;
             self.web_helper = parsed.value.web_helper;
             self.panel_rpc = @min(parsed.value.panel_rpc, wire.PANEL_RPC_VERSION);
             self.attach_identity = parsed.value.attach_identity;
@@ -2503,6 +2511,29 @@ test "welcome records older and future daemon profiles without rejecting either"
     try std.testing.expectError(error.NoSharedTerminalProfile, conn.queueFrame(.kill, "{}"));
     conn.applyWelcome(a, "{");
     try std.testing.expectEqual(@as(u32, 0), conn.proto);
+}
+
+test "stream_open welcome capability is strict and resets across reconnects" {
+    const t = std.testing;
+    const a = t.allocator;
+    var conn = Conn{ .allocator = a, .fd = -1 };
+
+    conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1}");
+    try t.expect(!conn.stream_open);
+    conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1,\"stream_open\":true}");
+    try t.expect(conn.stream_open);
+    conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1,\"stream_open\":false}");
+    try t.expect(!conn.stream_open);
+
+    // A malformed capability invalidates the welcome rather than being
+    // interpreted as support, and a later reconnect starts from false.
+    conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1,\"stream_open\":\"yes\"}");
+    try t.expect(!conn.stream_open);
+    try t.expectEqual(@as(u32, 0), conn.proto);
+    conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1,\"stream_open\":true}");
+    try t.expect(conn.stream_open);
+    conn.applyWelcome(a, "{\"proto\":6,\"negotiation\":1}");
+    try t.expect(!conn.stream_open);
 }
 
 test "fenced kill refuses old daemons before sending bytes" {

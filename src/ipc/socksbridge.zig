@@ -420,9 +420,16 @@ pub const Bridge = struct {
         if (act.reply.len != 0 or act.close) self.queueSession(s, act.reply, act.close);
         if (!s.active()) return;
         if (act.connect_host) |host| {
+            const conn = self.conn orelse return;
+            // The wire contract forbids probing an old daemon with an
+            // unknown frame. Keep the listener fail-closed and answer the
+            // browser in SOCKS terms instead of leaving CONNECT pending.
+            if (!conn.stream_open) {
+                self.queueSession(s, s.socks.failedReply(), true);
+                return;
+            }
             s.req_id = self.next_req;
             self.next_req += 1;
-            const conn = self.conn orelse return;
             conn.queueJson(.stream_open, .{
                 .req = s.req_id,
                 .host = host,
@@ -456,12 +463,22 @@ pub const Bridge = struct {
         return true;
     }
 
+    fn failPending(self: *Bridge) void {
+        for (&self.sessions) |*s| {
+            if (s.active() and !s.tunneled and s.req_id != 0)
+                self.queueSession(s, s.socks.failedReply(), true);
+        }
+    }
+
     fn handleConnFrame(self: *Bridge, ftype: wire.FrameType, payload: []const u8) void {
         switch (ftype) {
             .stream_reply => {
                 var parsed = std.json.parseFromSlice(StreamReply, self.allocator, payload, .{
                     .ignore_unknown_fields = true,
-                }) catch return;
+                }) catch {
+                    self.failPending();
+                    return;
+                };
                 defer parsed.deinit();
                 const r = parsed.value;
                 const s = self.byReq(r.req) orelse return;
@@ -485,6 +502,10 @@ pub const Bridge = struct {
                 const id = wire.decodeChanId(payload) orelse return;
                 if (self.byChan(id)) |s| self.closeAfterFlush(s, true);
             },
+            // This connection is dedicated to stream egress, but `.err`
+            // has no request id. Fail every pending CONNECT so none can
+            // wait forever; established channels remain valid.
+            .err => self.failPending(),
             // chan_open (kind tcp_forward) is confirmation only — we
             // correlate by req via stream_reply.
             else => {},
@@ -565,6 +586,14 @@ pub const Egress = struct {
         if (self.connectFn(self.allocator, h)) |conn| {
             self.conn = conn;
             self.conn_ok = true;
+            if (!self.conn.stream_open) {
+                _ = c.fprintf(
+                    platform.stderr(),
+                    "sketerm web: egress through %.*s is unavailable: that host's sketerm-mux is too old (welcome lacks stream_open:true); SOCKS requests will fail closed\n",
+                    @as(c_int, @intCast(self.host_len)),
+                    self.host[0..].ptr,
+                );
+            }
             self.conn.setNonBlockingChecked() catch return;
             if (!(self.cancel.publish(self.conn.fd) catch return)) return;
             defer self.cancel.release();
@@ -832,6 +861,240 @@ fn testNowMs() i64 {
     return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
 }
 
+const TestMuxPair = struct {
+    conn: client.Conn,
+    daemon: client.Conn,
+
+    fn init(welcome: []const u8) !TestMuxPair {
+        const a = std.testing.allocator;
+        var pair: [2]c_int = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+        var daemon = client.Conn{ .allocator = a, .fd = pair[1] };
+        errdefer daemon.deinit();
+
+        // A fake daemon may queue its welcome before reading hello; the
+        // socket still proves that Conn.probe emitted and consumed both.
+        try daemon.sendFrame(.welcome, welcome);
+        var conn = try client.Conn.probe(a, .{ .allocator = a, .fd = pair[0] });
+        errdefer conn.deinit();
+        const hello = try daemon.recvExpectFor(&.{.hello}, 1_000);
+        hello.deinit(a);
+        return .{ .conn = conn, .daemon = daemon };
+    }
+
+    fn deinit(self: *TestMuxPair) void {
+        self.conn.deinit();
+        self.daemon.deinit();
+    }
+};
+
+fn testConnectBridge(port: u16) !c_int {
+    const fd = platformSocket();
+    if (fd < 0) return error.SocketFailed;
+    errdefer _ = c.close(fd);
+    var sa = std.mem.zeroes(c.struct_sockaddr_in);
+    sa.sin_family = c.AF_INET;
+    sa.sin_port = std.mem.nativeToBig(u16, port);
+    sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
+    if (c.connect(fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0)
+        return error.ConnectFailed;
+    return fd;
+}
+
+fn testWriteAll(fd: c_int, data: []const u8) !void {
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
+            c.send(fd, data.ptr + off, data.len - off, c.MSG_NOSIGNAL)
+        else
+            c.write(fd, data.ptr + off, data.len - off);
+        if (n > 0) {
+            off += @intCast(n);
+            continue;
+        }
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        return error.WriteFailed;
+    }
+}
+
+fn testReadExactFor(fd: c_int, out: []u8, timeout_ms: i64) !void {
+    const deadline = testNowMs() + timeout_ms;
+    var off: usize = 0;
+    while (off < out.len) {
+        const left = deadline - testNowMs();
+        if (left <= 0) return error.Timeout;
+        var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+        const polled = c.poll(&pfd, 1, @intCast(left));
+        if (polled < 0 and std.posix.errno(polled) == .INTR) continue;
+        if (polled <= 0) return error.Timeout;
+        const n = c.read(fd, out.ptr + off, out.len - off);
+        if (n > 0) {
+            off += @intCast(n);
+            continue;
+        }
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        return error.UnexpectedEof;
+    }
+}
+
+fn testExpectEofFor(fd: c_int, timeout_ms: i64) !void {
+    const deadline = testNowMs() + timeout_ms;
+    while (true) {
+        const left = deadline - testNowMs();
+        if (left <= 0) return error.Timeout;
+        var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+        const polled = c.poll(&pfd, 1, @intCast(left));
+        if (polled < 0 and std.posix.errno(polled) == .INTR) continue;
+        if (polled <= 0) return error.Timeout;
+        var byte: u8 = 0;
+        const n = c.read(fd, &byte, 1);
+        if (n == 0) return;
+        if (n < 0 and std.posix.errno(n) == .INTR) continue;
+        return error.UnexpectedData;
+    }
+}
+
+test "transport: old daemon capability fails SOCKS CONNECT without stream_open" {
+    const t = std.testing;
+    var mux = try TestMuxPair.init("{\"proto\":6,\"negotiation\":1}");
+    defer mux.deinit();
+    try t.expect(!mux.conn.stream_open);
+
+    var bridge = Bridge.init(t.allocator);
+    defer bridge.deinit();
+    try bridge.listen(0);
+    bridge.setConn(&mux.conn);
+    const runner = try std.Thread.spawn(.{}, Bridge.run, .{&bridge});
+    defer {
+        bridge.requestStop();
+        runner.join();
+    }
+
+    const local = try testConnectBridge(bridge.port);
+    defer _ = c.close(local);
+    const request = [_]u8{
+        0x05, 0x01, 0x00,
+        0x05, 0x01, 0x00,
+        0x01, 127,  0,
+        0,    1,    0x01,
+        0xbb,
+    };
+    try testWriteAll(local, &request);
+    var got: [12]u8 = undefined;
+    try testReadExactFor(local, &got, 1_000);
+    try t.expectEqualSlices(u8, &socks5.methodReply(true), got[0..2]);
+    try t.expectEqualSlices(u8, &socks5.connectReply(.host_unreachable), got[2..]);
+    try testExpectEofFor(local, 1_000);
+
+    var pfd = c.struct_pollfd{ .fd = mux.daemon.fd, .events = c.POLLIN, .revents = 0 };
+    try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 50));
+}
+
+test "transport: generic daemon error fails the pending SOCKS CONNECT" {
+    const t = std.testing;
+    var mux = try TestMuxPair.init("{\"proto\":6,\"negotiation\":1,\"stream_open\":true}");
+    defer mux.deinit();
+    try t.expect(mux.conn.stream_open);
+
+    var bridge = Bridge.init(t.allocator);
+    defer bridge.deinit();
+    try bridge.listen(0);
+    bridge.setConn(&mux.conn);
+    const runner = try std.Thread.spawn(.{}, Bridge.run, .{&bridge});
+    defer {
+        bridge.requestStop();
+        runner.join();
+    }
+
+    const local = try testConnectBridge(bridge.port);
+    defer _ = c.close(local);
+    const request = [_]u8{
+        0x05, 0x01, 0x00,
+        0x05, 0x01, 0x00,
+        0x01, 127,  0,
+        0,    1,    0x01,
+        0xbb,
+    };
+    try testWriteAll(local, &request);
+    var greeting: [2]u8 = undefined;
+    try testReadExactFor(local, &greeting, 1_000);
+    try t.expectEqualSlices(u8, &socks5.methodReply(true), &greeting);
+    const open = try mux.daemon.recvExpectFor(&.{.stream_open}, 1_000);
+    open.deinit(t.allocator);
+    try mux.daemon.sendFrame(.err, "{\"error\":\"unknown frame\"}");
+
+    var failed: [10]u8 = undefined;
+    try testReadExactFor(local, &failed, 1_000);
+    try t.expectEqualSlices(u8, &socks5.connectReply(.host_unreachable), &failed);
+    try testExpectEofFor(local, 1_000);
+}
+
+test "transport: capable daemon opens a successful stream" {
+    const t = std.testing;
+    var mux = try TestMuxPair.init("{\"proto\":6,\"negotiation\":1,\"stream_open\":true}");
+    defer mux.deinit();
+    try t.expect(mux.conn.stream_open);
+
+    var bridge = Bridge.init(t.allocator);
+    defer bridge.deinit();
+    try bridge.listen(0);
+    bridge.setConn(&mux.conn);
+    const runner = try std.Thread.spawn(.{}, Bridge.run, .{&bridge});
+    defer {
+        bridge.requestStop();
+        runner.join();
+    }
+
+    const local = try testConnectBridge(bridge.port);
+    defer _ = c.close(local);
+    const request = [_]u8{
+        0x05, 0x01, 0x00,
+        0x05, 0x01, 0x00,
+        0x01, 127,  0,
+        0,    1,    0x01,
+        0xbb,
+    } ++ "early".*;
+    try testWriteAll(local, &request);
+    var greeting: [2]u8 = undefined;
+    try testReadExactFor(local, &greeting, 1_000);
+    try t.expectEqualSlices(u8, &socks5.methodReply(true), &greeting);
+
+    const open = try mux.daemon.recvExpectFor(&.{.stream_open}, 1_000);
+    defer open.deinit(t.allocator);
+    const Open = struct { req: u32, host: []const u8, port: u16 };
+    var parsed = try std.json.parseFromSlice(Open, t.allocator, open.payload, .{});
+    defer parsed.deinit();
+    try t.expectEqualStrings("127.0.0.1", parsed.value.host);
+    try t.expectEqual(@as(u16, 443), parsed.value.port);
+    const req_id = parsed.value.req;
+
+    const chan: u32 = 17;
+    var open_buf: [5]u8 = undefined;
+    try mux.daemon.sendFrame(.chan_open, wire.encodeChanOpen(&open_buf, chan, .tcp_forward));
+    var reply_buf: [96]u8 = undefined;
+    const reply = try std.fmt.bufPrint(&reply_buf, "{{\"req\":{d},\"ok\":true,\"chan\":{d}}}", .{ req_id, chan });
+    try mux.daemon.sendFrame(.stream_reply, reply);
+
+    const early = try mux.daemon.recvExpectFor(&.{.chan_data}, 1_000);
+    defer early.deinit(t.allocator);
+    try t.expectEqual(chan, wire.decodeChanId(early.payload).?);
+    try t.expectEqualStrings("early", early.payload[4..]);
+
+    var data: [4 + "remote".len]u8 = undefined;
+    var data_hdr: [4]u8 = undefined;
+    @memcpy(data[0..4], wire.putChanHeader(&data_hdr, chan));
+    @memcpy(data[4..], "remote");
+    try mux.daemon.sendFrame(.chan_data, &data);
+    var close_hdr: [4]u8 = undefined;
+    try mux.daemon.sendFrame(.chan_close, wire.putChanHeader(&close_hdr, chan));
+
+    var got: [10 + "remote".len]u8 = undefined;
+    try testReadExactFor(local, &got, 1_000);
+    try t.expectEqualSlices(u8, &socks5.connectReply(.ok), got[0..10]);
+    try t.expectEqualStrings("remote", got[10..]);
+    try testExpectEofFor(local, 1_000);
+}
+
 test "transport: wakeup setup failure closes the listener" {
     const t = std.testing;
     var bridge = Bridge.init(t.allocator);
@@ -905,7 +1168,7 @@ const TestEgressConnector = struct {
     fn connect(allocator: std.mem.Allocator, _: ?[]const u8) ?client.Conn {
         const owned = fd.swap(-1, .acq_rel);
         if (owned < 0) return null;
-        return .{ .allocator = allocator, .fd = owned };
+        return .{ .allocator = allocator, .fd = owned, .stream_open = true };
     }
 };
 
