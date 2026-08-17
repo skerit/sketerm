@@ -58,10 +58,116 @@ fn validOutputSize(req: SpawnReq) bool {
     return @as(u64, req.output_width) * req.output_height <= 64 * 1024 * 1024;
 }
 
+const SpawnNormalizeError = error{
+    BadSpawnRequest,
+    SpawnNeedsName,
+    InvalidTerminalSize,
+    InvalidOutputSize,
+    OutOfMemory,
+};
+
+/// Owns the parsed request and any injected login-shell storage until deinit.
+const NormalizedSpawnRequest = struct {
+    allocator: std.mem.Allocator,
+    parsed: std.json.Parsed(SpawnReq),
+    req: SpawnReq,
+    owned_shell: ?[]u8 = null,
+    owned_argv: ?[][]const u8 = null,
+
+    fn deinit(self: *NormalizedSpawnRequest) void {
+        if (self.owned_argv) |argv| self.allocator.free(argv);
+        if (self.owned_shell) |shell| self.allocator.free(shell);
+        self.parsed.deinit();
+    }
+};
+
+fn normalizeSpawnRequest(
+    allocator: std.mem.Allocator,
+    payload: []const u8,
+    account_shell: *const fn () []const u8,
+) SpawnNormalizeError!NormalizedSpawnRequest {
+    var parsed = std.json.parseFromSlice(SpawnReq, allocator, payload, .{
+        .ignore_unknown_fields = true,
+    }) catch return error.BadSpawnRequest;
+    errdefer parsed.deinit();
+
+    var req = parsed.value;
+    if (req.name.len == 0 or req.name.len > 64) return error.SpawnNeedsName;
+    wire.validateTerminalSize(req.rows, req.cols) catch return error.InvalidTerminalSize;
+    if (!validOutputSize(req)) return error.InvalidOutputSize;
+
+    var owned_shell: ?[]u8 = null;
+    errdefer if (owned_shell) |shell| allocator.free(shell);
+    var owned_argv: ?[][]const u8 = null;
+    errdefer if (owned_argv) |argv| allocator.free(argv);
+
+    // Empty argv = "the daemon host's login shell" — remote clients cannot
+    // know what's installed here. Displays and casts substitute no shell.
+    if (req.argv.len == 0 and !req.display and req.cast_path.len == 0) {
+        owned_shell = try allocator.dupe(u8, account_shell());
+        owned_argv = try allocator.alloc([]const u8, 1);
+        owned_argv.?[0] = owned_shell.?;
+        req.argv = owned_argv.?;
+        req.login_shell = true;
+    }
+
+    return .{
+        .allocator = allocator,
+        .parsed = parsed,
+        .req = req,
+        .owned_shell = owned_shell,
+        .owned_argv = owned_argv,
+    };
+}
+
+const SpawnEntry = enum { monolith, broker };
+
+/// Owns a normalized request and records the entry path's namespace lookup.
+const PreparedSpawnRequest = struct {
+    normalized: NormalizedSpawnRequest,
+    name_exists: bool,
+
+    fn deinit(self: *PreparedSpawnRequest) void {
+        self.normalized.deinit();
+    }
+};
+
+fn prepareSpawnRequest(
+    self: *Daemon,
+    payload: []const u8,
+    entry: SpawnEntry,
+    account_shell: *const fn () []const u8,
+) SpawnNormalizeError!PreparedSpawnRequest {
+    var normalized = try normalizeSpawnRequest(self.allocator, payload, account_shell);
+    errdefer normalized.deinit();
+    const name_exists = switch (entry) {
+        .monolith => findSession(self, normalized.req.name) != null,
+        .broker => brokerNameInUse(self, normalized.req.name, null),
+    };
+    return .{ .normalized = normalized, .name_exists = name_exists };
+}
+
+fn spawnNormalizeErrorText(err: SpawnNormalizeError) []const u8 {
+    return switch (err) {
+        error.BadSpawnRequest => "bad spawn request",
+        error.SpawnNeedsName => "spawn needs a name",
+        error.InvalidTerminalSize => wire.TERMINAL_SIZE_PROTOCOL_ERROR,
+        error.InvalidOutputSize => "bad output size (dimensions must be 1..16384 and at most 64 megapixels)",
+        error.OutOfMemory => "oom",
+    };
+}
+
+fn queueSpawnNormalizeError(cl: *Client, err: SpawnNormalizeError) void {
+    cl.queueErr(spawnNormalizeErrorText(err));
+}
+
+fn nameExistsText(buf: *[192]u8, name: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "session '{s}' already exists (use a different name or destroy it)", .{name}) catch "session name already exists";
+}
+
 fn queueNameExists(cl: *Client, name: []const u8) void {
     var buf: [192]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "session '{s}' already exists (use a different name or destroy it)", .{name}) catch "session name already exists";
-    cl.queueErr(msg);
+    cl.queueErr(nameExistsText(&buf, name));
 }
 
 pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
@@ -74,36 +180,13 @@ pub fn handleSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueErr("session workers cannot spawn another session");
         return;
     }
-    var parsed = std.json.parseFromSlice(SpawnReq, self.allocator, payload, .{
-        .ignore_unknown_fields = true,
-    }) catch {
-        cl.queueErr("bad spawn request");
+    var prepared = prepareSpawnRequest(self, payload, .monolith, shell_util.accountLoginShell) catch |err| {
+        queueSpawnNormalizeError(cl, err);
         return;
     };
-    defer parsed.deinit();
-    var req = parsed.value;
-    if (req.name.len == 0 or req.name.len > 64) {
-        cl.queueErr("spawn needs a name");
-        return;
-    }
-    wire.validateTerminalSize(req.rows, req.cols) catch {
-        cl.queueErr(wire.TERMINAL_SIZE_PROTOCOL_ERROR);
-        return;
-    };
-    if (!validOutputSize(req)) {
-        cl.queueErr("bad output size (dimensions must be 1..16384 and at most 64 megapixels)");
-        return;
-    }
-    // Empty argv = "the daemon host's login shell" — remote
-    // clients can't know what's installed here. Display sessions
-    // (keeper argv substituted) and cast playback (no child at all)
-    // are exempt.
-    const default_shell: []const []const u8 = &.{shell_util.accountLoginShell()};
-    if (req.argv.len == 0 and !req.display and req.cast_path.len == 0) {
-        req.argv = default_shell;
-        req.login_shell = true;
-    }
-    if (findSession(self, req.name) != null) {
+    defer prepared.deinit();
+    const req = prepared.normalized.req;
+    if (prepared.name_exists) {
         queueNameExists(cl, req.name);
         return;
     }
@@ -215,32 +298,13 @@ pub fn closeInheritedBrokerFds(self: *Daemon, control_fd: c_int) void {
 /// fork-without-exec — the child runs `runWorker` against an inherited
 /// (COW) copy of the SpawnReq; it first drops every broker fd it inherited.
 pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
-    var parsed = std.json.parseFromSlice(SpawnReq, self.allocator, payload, .{
-        .ignore_unknown_fields = true,
-    }) catch {
-        cl.queueErr("bad spawn request");
+    var prepared = prepareSpawnRequest(self, payload, .broker, shell_util.accountLoginShell) catch |err| {
+        queueSpawnNormalizeError(cl, err);
         return;
     };
-    defer parsed.deinit();
-    var req = parsed.value;
-    if (req.name.len == 0 or req.name.len > 64) {
-        cl.queueErr("spawn needs a name");
-        return;
-    }
-    wire.validateTerminalSize(req.rows, req.cols) catch {
-        cl.queueErr(wire.TERMINAL_SIZE_PROTOCOL_ERROR);
-        return;
-    };
-    if (!validOutputSize(req)) {
-        cl.queueErr("bad output size (dimensions must be 1..16384 and at most 64 megapixels)");
-        return;
-    }
-    const default_shell: []const []const u8 = &.{shell_util.accountLoginShell()};
-    if (req.argv.len == 0 and !req.display and req.cast_path.len == 0) {
-        req.argv = default_shell;
-        req.login_shell = true;
-    }
-    if (brokerFindWorker(self, req.name) != null or brokerNameInUse(self, req.name, null)) {
+    defer prepared.deinit();
+    const req = prepared.normalized.req;
+    if (prepared.name_exists) {
         queueNameExists(cl, req.name);
         return;
     }
@@ -268,7 +332,7 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
     if (pid == 0) {
         // Worker child: drop every inherited broker fd, then become a
         // single-session worker. `req` is valid here via COW; we _exit
-        // before the parent's `defer parsed.deinit()` matters to us.
+        // before the parent's normalized request is released.
         _ = c.close(sp[0]);
         closeInheritedBrokerFds(self, sp[1]);
         _ = c.setsid();
@@ -327,6 +391,292 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
     // Reply is deferred: `brokerOnWorkerControl` sends `.ok` when the
     // worker reports 'Y' (session up), or `.err` if the worker dies first
     // (spawnSession failed). The client is blocked in recvExpect(.ok).
+}
+
+fn testAccountLoginShell() []const u8 {
+    return "/test/account-shell";
+}
+
+test "spawn preparation normalizes monolith and broker requests identically" {
+    const t = std.testing;
+    const account_shell = testAccountLoginShell();
+    const ExpectedArgv = enum { command, shell, empty };
+    const Case = struct {
+        label: []const u8,
+        payload: []const u8,
+        expected_error: ?SpawnNormalizeError = null,
+        expected_error_text: []const u8 = "",
+        expected_collision: bool = false,
+        expected_collision_text: []const u8 = "",
+        expected_argv: ExpectedArgv = .command,
+        expected_login_shell: bool = false,
+        expected_rows: u16 = 24,
+        expected_cols: u16 = 80,
+        expected_output_width: u32 = wire.DEFAULT_OUTPUT_WIDTH,
+        expected_output_height: u32 = wire.DEFAULT_OUTPUT_HEIGHT,
+        expected_display: bool = false,
+        expected_cast: bool = false,
+    };
+    const cases = [_]Case{
+        .{
+            .label = "bad json",
+            .payload = "{",
+            .expected_error = error.BadSpawnRequest,
+            .expected_error_text = "bad spawn request",
+        },
+        .{
+            .label = "empty name",
+            .payload = "{}",
+            .expected_error = error.SpawnNeedsName,
+            .expected_error_text = "spawn needs a name",
+        },
+        .{
+            .label = "long name",
+            .payload = "{\"name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+            .expected_error = error.SpawnNeedsName,
+            .expected_error_text = "spawn needs a name",
+        },
+        .{
+            .label = "name at boundary",
+            .payload = "{\"name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"argv\":[\"cmd\"]}",
+        },
+        .{
+            .label = "zero grid",
+            .payload = "{\"name\":\"grid-zero\",\"argv\":[\"cmd\"],\"rows\":0}",
+            .expected_error = error.InvalidTerminalSize,
+            .expected_error_text = wire.TERMINAL_SIZE_PROTOCOL_ERROR,
+        },
+        .{
+            .label = "grid axis over boundary",
+            .payload = "{\"name\":\"grid-axis-over\",\"argv\":[\"cmd\"],\"rows\":1001,\"cols\":1}",
+            .expected_error = error.InvalidTerminalSize,
+            .expected_error_text = wire.TERMINAL_SIZE_PROTOCOL_ERROR,
+        },
+        .{
+            .label = "grid cells over boundary",
+            .payload = "{\"name\":\"grid-cells-over\",\"argv\":[\"cmd\"],\"rows\":513,\"cols\":512}",
+            .expected_error = error.InvalidTerminalSize,
+            .expected_error_text = wire.TERMINAL_SIZE_PROTOCOL_ERROR,
+        },
+        .{
+            .label = "grid cells at boundary",
+            .payload = "{\"name\":\"grid-cells-max\",\"argv\":[\"cmd\"],\"rows\":512,\"cols\":512}",
+            .expected_rows = 512,
+            .expected_cols = 512,
+        },
+        .{
+            .label = "grid axis at boundary",
+            .payload = "{\"name\":\"grid-axis-max\",\"argv\":[\"cmd\"],\"rows\":1000,\"cols\":1}",
+            .expected_rows = 1000,
+            .expected_cols = 1,
+        },
+        .{
+            .label = "zero output width",
+            .payload = "{\"name\":\"output-zero-width\",\"argv\":[\"cmd\"],\"output_width\":0}",
+            .expected_error = error.InvalidOutputSize,
+            .expected_error_text = "bad output size (dimensions must be 1..16384 and at most 64 megapixels)",
+        },
+        .{
+            .label = "zero output height",
+            .payload = "{\"name\":\"output-zero-height\",\"argv\":[\"cmd\"],\"output_height\":0}",
+            .expected_error = error.InvalidOutputSize,
+            .expected_error_text = "bad output size (dimensions must be 1..16384 and at most 64 megapixels)",
+        },
+        .{
+            .label = "output axis over boundary",
+            .payload = "{\"name\":\"output-axis-over\",\"argv\":[\"cmd\"],\"output_width\":16385,\"output_height\":1}",
+            .expected_error = error.InvalidOutputSize,
+            .expected_error_text = "bad output size (dimensions must be 1..16384 and at most 64 megapixels)",
+        },
+        .{
+            .label = "output pixels over boundary",
+            .payload = "{\"name\":\"output-pixels-over\",\"argv\":[\"cmd\"],\"output_width\":16384,\"output_height\":4097}",
+            .expected_error = error.InvalidOutputSize,
+            .expected_error_text = "bad output size (dimensions must be 1..16384 and at most 64 megapixels)",
+        },
+        .{
+            .label = "output pixels at boundary",
+            .payload = "{\"name\":\"output-pixels-max\",\"argv\":[\"cmd\"],\"output_width\":16384,\"output_height\":4096}",
+            .expected_output_width = 16384,
+            .expected_output_height = 4096,
+        },
+        .{
+            .label = "empty argv",
+            .payload = "{\"name\":\"shell\"}",
+            .expected_argv = .shell,
+            .expected_login_shell = true,
+        },
+        .{
+            .label = "display empty argv exception",
+            .payload = "{\"name\":\"display\",\"display\":true}",
+            .expected_argv = .empty,
+            .expected_display = true,
+        },
+        .{
+            .label = "cast empty argv exception",
+            .payload = "{\"name\":\"cast\",\"cast_path\":\"/tmp/demo.cast\"}",
+            .expected_argv = .empty,
+            .expected_cast = true,
+        },
+        .{
+            .label = "explicit argv preserves login flag",
+            .payload = "{\"name\":\"explicit-login\",\"argv\":[\"cmd\"],\"login_shell\":true}",
+            .expected_login_shell = true,
+        },
+        .{
+            .label = "current name collision after shell injection",
+            .payload = "{\"name\":\"taken\"}",
+            .expected_collision = true,
+            .expected_collision_text = "session 'taken' already exists (use a different name or destroy it)",
+            .expected_argv = .shell,
+            .expected_login_shell = true,
+        },
+        .{
+            .label = "origin name collision",
+            .payload = "{\"name\":\"spawned-as\",\"argv\":[\"cmd\"]}",
+            .expected_collision = true,
+            .expected_collision_text = "session 'spawned-as' already exists (use a different name or destroy it)",
+        },
+        .{
+            .label = "dead broker identity is reusable",
+            .payload = "{\"name\":\"dead-taken\",\"argv\":[\"cmd\"]}",
+        },
+    };
+
+    var monolith_empty: [0]u8 = .{};
+    var broker_empty: [0]u8 = .{};
+    var monolith = Daemon{ .allocator = t.allocator, .listen_fd = -1, .sock_path = monolith_empty[0..] };
+    var broker = Daemon{ .allocator = t.allocator, .listen_fd = -1, .sock_path = broker_empty[0..], .is_broker = true };
+
+    var monolith_current = "taken".*;
+    var monolith_origin = "spawned-as".*;
+    var collision_session: Session = undefined;
+    collision_session.name = monolith_current[0..];
+    collision_session.origin_name = monolith_origin[0..];
+    var session_items = [_]*Session{&collision_session};
+    monolith.sessions = .{ .items = &session_items, .capacity = session_items.len };
+
+    var broker_current = "taken".*;
+    var broker_origin = "spawned-as".*;
+    var collision_worker: Worker = undefined;
+    collision_worker.name = broker_current[0..];
+    collision_worker.origin_name = broker_origin[0..];
+    collision_worker.dead = false;
+    var dead_current = "dead-taken".*;
+    var dead_origin = "dead-spawned-as".*;
+    var dead_worker: Worker = undefined;
+    dead_worker.name = dead_current[0..];
+    dead_worker.origin_name = dead_origin[0..];
+    dead_worker.dead = true;
+    var worker_items = [_]*Worker{ &collision_worker, &dead_worker };
+    broker.workers = .{ .items = &worker_items, .capacity = worker_items.len };
+    for ([_][]const u8{ "taken", "spawned-as", "dead-taken", "dead-spawned-as", "free" }) |name| {
+        try t.expectEqual(brokerFindWorker(&broker, name) != null, brokerNameInUse(&broker, name, null));
+    }
+
+    for (cases) |case| {
+        var monolith_prepared: ?PreparedSpawnRequest = null;
+        var monolith_error: ?SpawnNormalizeError = null;
+        monolith_prepared = prepareSpawnRequest(&monolith, case.payload, .monolith, testAccountLoginShell) catch |err| blk: {
+            monolith_error = err;
+            break :blk null;
+        };
+        defer if (monolith_prepared) |*prepared| prepared.deinit();
+
+        var broker_prepared: ?PreparedSpawnRequest = null;
+        var broker_error: ?SpawnNormalizeError = null;
+        broker_prepared = prepareSpawnRequest(&broker, case.payload, .broker, testAccountLoginShell) catch |err| blk: {
+            broker_error = err;
+            break :blk null;
+        };
+        defer if (broker_prepared) |*prepared| prepared.deinit();
+
+        try t.expectEqual(monolith_error, broker_error);
+        try t.expectEqual(case.expected_error, monolith_error);
+        if (monolith_error) |err| {
+            try t.expectEqualStrings(case.expected_error_text, spawnNormalizeErrorText(err));
+            continue;
+        }
+
+        const monolith_ready = &monolith_prepared.?;
+        const broker_ready = &broker_prepared.?;
+        try t.expectEqual(monolith_ready.name_exists, broker_ready.name_exists);
+        try t.expectEqual(case.expected_collision, monolith_ready.name_exists);
+
+        var monolith_json: std.Io.Writer.Allocating = .init(t.allocator);
+        defer monolith_json.deinit();
+        var broker_json: std.Io.Writer.Allocating = .init(t.allocator);
+        defer broker_json.deinit();
+        try std.json.Stringify.value(monolith_ready.normalized.req, .{}, &monolith_json.writer);
+        try std.json.Stringify.value(broker_ready.normalized.req, .{}, &broker_json.writer);
+        try t.expectEqualStrings(monolith_json.written(), broker_json.written());
+
+        const req = monolith_ready.normalized.req;
+        try t.expectEqual(case.expected_login_shell, req.login_shell);
+        try t.expectEqual(case.expected_rows, req.rows);
+        try t.expectEqual(case.expected_cols, req.cols);
+        try t.expectEqual(case.expected_output_width, req.output_width);
+        try t.expectEqual(case.expected_output_height, req.output_height);
+        try t.expectEqual(case.expected_display, req.display);
+        try t.expectEqual(case.expected_cast, req.cast_path.len > 0);
+        switch (case.expected_argv) {
+            .command => {
+                try t.expectEqual(@as(usize, 1), req.argv.len);
+                try t.expectEqualStrings("cmd", req.argv[0]);
+            },
+            .shell => {
+                try t.expectEqual(@as(usize, 1), req.argv.len);
+                try t.expectEqualStrings(account_shell, req.argv[0]);
+            },
+            .empty => try t.expectEqual(@as(usize, 0), req.argv.len),
+        }
+        if (case.expected_collision) {
+            var monolith_buf: [192]u8 = undefined;
+            var broker_buf: [192]u8 = undefined;
+            const monolith_text = nameExistsText(&monolith_buf, monolith_ready.normalized.req.name);
+            const broker_text = nameExistsText(&broker_buf, broker_ready.normalized.req.name);
+            try t.expectEqualStrings(monolith_text, broker_text);
+            try t.expectEqualStrings(case.expected_collision_text, monolith_text);
+        }
+    }
+}
+
+test "spawn preparation owns login shell allocations failure-atomically" {
+    const t = std.testing;
+    const payload = "{\"name\":\"shell-oom\"}";
+
+    for ([_]SpawnEntry{ .monolith, .broker }) |entry| {
+        var empty: [0]u8 = .{};
+        var baseline_allocator = t.FailingAllocator.init(t.allocator, .{});
+        var daemon = Daemon{
+            .allocator = baseline_allocator.allocator(),
+            .listen_fd = -1,
+            .sock_path = empty[0..],
+            .is_broker = entry == .broker,
+        };
+        var prepared = try prepareSpawnRequest(&daemon, payload, entry, testAccountLoginShell);
+        prepared.deinit();
+        const allocations = baseline_allocator.alloc_index;
+        try t.expect(allocations >= 2);
+
+        var parse_oom = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+        daemon.allocator = parse_oom.allocator();
+        try t.expectError(error.BadSpawnRequest, prepareSpawnRequest(&daemon, payload, entry, testAccountLoginShell));
+        try t.expect(parse_oom.has_induced_failure);
+        try t.expectEqualStrings("bad spawn request", spawnNormalizeErrorText(error.BadSpawnRequest));
+
+        for (allocations - 2..allocations) |fail_index| {
+            var shell_oom = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+            daemon.allocator = shell_oom.allocator();
+            try t.expectError(error.OutOfMemory, prepareSpawnRequest(&daemon, payload, entry, testAccountLoginShell));
+            try t.expect(shell_oom.has_induced_failure);
+            try t.expectEqualStrings("oom", spawnNormalizeErrorText(error.OutOfMemory));
+
+            daemon.allocator = t.allocator;
+            var retry = try prepareSpawnRequest(&daemon, payload, entry, testAccountLoginShell);
+            retry.deinit();
+        }
+    }
 }
 
 test "new workers close every broker descriptor and release stale listeners" {
