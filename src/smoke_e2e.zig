@@ -33,6 +33,7 @@ const muxwire = @import("mux/wire.zig");
 const panel_assets = @import("ui/panel/assets.zig");
 const panelhost = @import("ui/panelhost.zig");
 const editor_pass = @import("render/editor_pass.zig");
+const atlas_mod = @import("render/atlas.zig");
 const wlcomp = @import("wlhost/compositor.zig");
 const clock = @import("util/clock.zig");
 
@@ -806,7 +807,7 @@ pub fn main() u8 {
         defer allocator.free(alive);
         if (std.mem.indexOf(u8, alive, "\"ok\":true") == null)
             return fail("GUI became unhealthy during editor atlas teardown");
-        say("editor atlas: zoom/config/failure/re-realize accounting and final teardown passed");
+        say("editor atlas: zoom/config/profile/failure/re-realize accounting and final teardown passed");
         teardown();
         return 0;
     }
@@ -9312,6 +9313,11 @@ const EditorAtlasStats = struct {
     realized: bool = false,
     texture_valid: bool = false,
     font_size: u16 = 0,
+    line_height: u16 = 0,
+    line_pad: i16 = 0,
+    font_path_set: bool = false,
+    config_syncs: u64 = 0,
+    layout_rebuilds: u64 = 0,
 };
 
 const EditorAtlasReply = struct {
@@ -9344,6 +9350,8 @@ fn waitEditorAtlasExact(
     pane: u32,
     created: u64,
     deleted: u64,
+    config_syncs: u64,
+    layout_rebuilds: u64,
     font_size: u16,
 ) ?EditorAtlasStats {
     var waited: u32 = 0;
@@ -9351,6 +9359,7 @@ fn waitEditorAtlasExact(
         _ = app.pumpOnce(100);
         const stats = editorAtlasStats(allocator, sock_path, pane) orelse continue;
         if (stats.created == created and stats.deleted == deleted and
+            stats.config_syncs == config_syncs and stats.layout_rebuilds == layout_rebuilds and
             stats.font_size == font_size and editorAtlasHealthy(stats)) return stats;
     }
     return null;
@@ -9406,6 +9415,8 @@ fn editorAtlasLifecycleStage(
             pane,
             stats.created + 1,
             stats.deleted + 1,
+            stats.config_syncs,
+            stats.layout_rebuilds + 1,
             next_size,
         ) orelse return "an editor zoom did not create one texture and delete one texture";
     }
@@ -9430,6 +9441,8 @@ fn editorAtlasLifecycleStage(
         pane,
         stats.created,
         stats.deleted,
+        stats.config_syncs,
+        stats.layout_rebuilds,
         failed_size,
     ) orelse return "a failed editor rebuild deleted or replaced the active atlas texture";
 
@@ -9442,6 +9455,8 @@ fn editorAtlasLifecycleStage(
         pane,
         stats.created + 1,
         stats.deleted + 1,
+        stats.config_syncs,
+        stats.layout_rebuilds + 1,
         recovered_size,
     ) orelse return "the editor did not recover after a failed atlas rebuild";
 
@@ -9449,7 +9464,7 @@ fn editorAtlasLifecycleStage(
     var cfg_buf: [512:0]u8 = undefined;
     const cfg_path = std.fmt.bufPrintZ(&cfg_buf, "{s}/sketerm/config.conf", .{rt}) catch return "editor atlas config path";
     const cfg_size_1: u16 = if (stats.font_size != 27) 27 else 28;
-    var body_buf: [96]u8 = undefined;
+    var body_buf: [2048]u8 = undefined;
     const body_1 = std.fmt.bufPrint(&body_buf, "# editor atlas smoke\neditor_font_size = {d}\n", .{cfg_size_1}) catch
         return "formatting editor atlas config failed";
     if (!writeFile(cfg_path, body_1)) return "writing editor atlas config failed";
@@ -9460,6 +9475,8 @@ fn editorAtlasLifecycleStage(
         pane,
         stats.created + 1,
         stats.deleted + 1,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds + 1,
         cfg_size_1,
     ) orelse return "an editor config rebuild did not balance its atlas texture";
 
@@ -9478,8 +9495,201 @@ fn editorAtlasLifecycleStage(
         pane,
         stats.created + 1,
         stats.deleted + 1,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds + 1,
         cfg_size_2,
     ) orelse return "a rename-over editor config rebuild did not balance its atlas texture";
+
+    // The effective font bundle is more than family + size. Exercise
+    // path set/change/remove, explicit-editor-family precedence, line
+    // padding, and a live named-profile switch against the real GL view.
+    const font_path = atlas_mod.resolveFamilyPath(allocator, "DejaVu Sans") orelse
+        return "fontconfig found no font for the editor config smoke";
+    defer allocator.free(font_path);
+    var link_buf: [512:0]u8 = undefined;
+    const font_link = std.fmt.bufPrintZ(&link_buf, "{s}/editor-font-link.ttf", .{rt}) catch
+        return "editor config font link path is too long";
+    _ = c.unlink(font_link.ptr);
+    if (c.symlink(font_path.ptr, font_link.ptr) != 0)
+        return "creating the editor config font link failed";
+    defer _ = c.unlink(font_link.ptr);
+
+    const path_set = std.fmt.bufPrint(
+        &body_buf,
+        "# editor font path set\nfont = {s}\neditor_font_size = {d}\n",
+        .{ font_path, cfg_size_2 },
+    ) catch return "formatting the editor font path config failed";
+    if (!writeFile(cfg_path, path_set)) return "writing the editor font path config failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds + 1,
+        cfg_size_2,
+    ) orelse return "setting editor font_path did not rebuild one atlas and layout";
+    if (!stats.font_path_set or stats.line_pad != 0)
+        return "setting editor font_path did not update the owned effective bundle";
+
+    const path_changed = std.fmt.bufPrint(
+        &body_buf,
+        "# editor font path change\nfont = {s}\neditor_font_size = {d}\n",
+        .{ font_link, cfg_size_2 },
+    ) catch return "formatting the changed editor font path config failed";
+    if (!writeFile(cfg_path, path_changed)) return "writing the changed editor font path config failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds + 1,
+        cfg_size_2,
+    ) orelse return "changing editor font_path did not rebuild one atlas and layout";
+    if (!stats.font_path_set) return "changing editor font_path dropped the owned path";
+
+    const path_removed = std.fmt.bufPrint(
+        &body_buf,
+        "# editor font path remove\neditor_font_size = {d}\n",
+        .{cfg_size_2},
+    ) catch return "formatting the removed editor font path config failed";
+    if (!writeFile(cfg_path, path_removed)) return "writing the removed editor font path config failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds + 1,
+        cfg_size_2,
+    ) orelse return "removing editor font_path did not rebuild one atlas and layout";
+    if (stats.font_path_set) return "removing editor font_path left the old owned path active";
+
+    const explicit_family = std.fmt.bufPrint(
+        &body_buf,
+        "# editor family wins over terminal path\nfont = {s}\neditor_font_family = DejaVu Sans\neditor_font_size = {d}\n",
+        .{ font_path, cfg_size_2 },
+    ) catch return "formatting the explicit editor family config failed";
+    if (!writeFile(cfg_path, explicit_family)) return "writing the explicit editor family config failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds + 1,
+        cfg_size_2,
+    ) orelse return "an explicit editor family did not rebuild one atlas and layout";
+    if (stats.font_path_set) return "an explicit editor family did not suppress the terminal font path";
+
+    const family_removed = std.fmt.bufPrint(
+        &body_buf,
+        "# editor family remove restores terminal path\nfont = {s}\neditor_font_size = {d}\n",
+        .{ font_path, cfg_size_2 },
+    ) catch return "formatting the removed editor family config failed";
+    if (!writeFile(cfg_path, family_removed)) return "writing the removed editor family config failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds + 1,
+        cfg_size_2,
+    ) orelse return "removing the explicit editor family did not rebuild one atlas and layout";
+    if (!stats.font_path_set) return "removing the explicit editor family did not restore the terminal font path";
+
+    const line_height_before = stats.line_height;
+    const padded = std.fmt.bufPrint(
+        &body_buf,
+        "# editor line padding\nfont = {s}\neditor_font_size = {d}\nline_pad_px = 4\n",
+        .{ font_path, cfg_size_2 },
+    ) catch return "formatting the editor line padding config failed";
+    if (!writeFile(cfg_path, padded)) return "writing the editor line padding config failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds + 1,
+        cfg_size_2,
+    ) orelse return "changing editor line padding did not rebuild one atlas and layout";
+    if (stats.line_pad != 4 or stats.line_height != line_height_before + 4)
+        return "editor line padding did not change the effective line layout";
+
+    const profile_cfg = std.fmt.bufPrint(
+        &body_buf,
+        "# editor profile switch\nfont = {s}\neditor_font_size = {d}\nline_pad_px = 4\n\n[profile.editor-alt]\nfont = {s}\nline_pad_px = 7\n",
+        .{ font_path, cfg_size_2, font_link },
+    ) catch return "formatting the editor profile config failed";
+    if (!writeFile(cfg_path, profile_cfg)) return "writing the editor profile config failed";
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created,
+        stats.deleted,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds,
+        cfg_size_2,
+    ) orelse return "loading an unchanged default editor profile rebuilt the atlas or layout";
+
+    var toggle_buf: [128]u8 = undefined;
+    const toggle_req = std.fmt.bufPrint(
+        &toggle_buf,
+        "{{\"cmd\":\"action\",\"pane\":{d},\"data\":\"toggle_editor_face\"}}\n",
+        .{pane},
+    ) catch return "formatting the editor profile face toggle failed";
+    const hidden = roundtrip(allocator, sock_path, toggle_req) orelse
+        return "hiding the editor for its profile switch failed";
+    defer allocator.free(hidden);
+    if (std.mem.indexOf(u8, hidden, "\"ok\":true") == null)
+        return "hiding the editor for its profile switch was refused";
+    const profile_req = std.fmt.bufPrint(
+        &req_buf,
+        "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"printf '\\\\033]1337;SetProfile=editor-alt\\\\a'\\n\"}}\n",
+        .{pane},
+    ) catch return "formatting the editor profile switch command failed";
+    const switched = roundtrip(allocator, sock_path, profile_req) orelse
+        return "sending the editor profile switch failed";
+    defer allocator.free(switched);
+    if (std.mem.indexOf(u8, switched, "\"ok\":true") == null)
+        return "sending the editor profile switch was refused";
+    const default_profile_height = stats.line_height;
+    stats = waitEditorAtlasExact(
+        allocator,
+        app,
+        sock_path,
+        pane,
+        stats.created + 1,
+        stats.deleted + 1,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds + 1,
+        cfg_size_2,
+    ) orelse return "applying a profile did not sync the editor exactly once";
+    if (!stats.font_path_set or stats.line_pad != 7 or stats.line_height != default_profile_height + 3)
+        return "the editor did not adopt the named profile's complete font bundle";
+
+    const shown = roundtrip(allocator, sock_path, toggle_req) orelse
+        return "showing the editor after its profile switch failed";
+    defer allocator.free(shown);
+    if (std.mem.indexOf(u8, shown, "\"ok\":true") == null)
+        return "showing the editor after its profile switch was refused";
 
     _ = c.unlink(cfg_path.ptr);
     const reload_req = std.fmt.bufPrint(
@@ -9497,6 +9707,8 @@ fn editorAtlasLifecycleStage(
         pane,
         stats.created + 1,
         stats.deleted + 1,
+        stats.config_syncs + 1,
+        stats.layout_rebuilds + 1,
         configured_size,
     ) orelse return "resetting editor config did not balance its atlas texture";
 

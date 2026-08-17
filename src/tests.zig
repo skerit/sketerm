@@ -109,6 +109,7 @@ comptime {
     _ = @import("ui/quake.zig");
     _ = @import("ui/hints.zig");
     _ = @import("ui/pane.zig");
+    _ = @import("ui/editorconfig.zig");
     _ = @import("ui/winconfig.zig");
     _ = @import("ui/tab_effects.zig");
     _ = @import("ui/hostmount.zig");

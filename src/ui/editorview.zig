@@ -134,6 +134,7 @@ const muxclient = @import("../mux/client.zig");
 const input = @import("input.zig");
 const findbar = @import("findbar.zig");
 const Config = @import("../config.zig").Config;
+const OwnedFontSettings = @import("editorconfig.zig").OwnedFontSettings;
 const fpicker = @import("../filebrowser/picker.zig");
 const editorlsp = @import("editorlsp.zig");
 const lsp_session = @import("../lsp/session.zig");
@@ -814,6 +815,11 @@ pub const EditorView = struct {
         realized: bool,
         texture_valid: bool,
         font_size: u16,
+        line_height: u16,
+        line_pad: i16,
+        font_path_set: bool,
+        config_syncs: u64,
+        layout_rebuilds: u64,
     };
 
     allocator: std.mem.Allocator,
@@ -932,6 +938,8 @@ pub const EditorView = struct {
     atlas_textures_deleted: u64 = 0,
     atlas_verify_accounting: bool = false,
     atlas_test_fail_after_create: bool = false,
+    config_syncs: u64 = 0,
+    layout_rebuilds: u64 = 0,
     /// Valid iff `atlas != null`; address handed to every Layout.
     book: FontBook = undefined,
     pass: EditorPass,
@@ -954,13 +962,9 @@ pub const EditorView = struct {
     /// Session-only on purpose, like the browser's.
     closed_docs: std.ArrayList(ClosedDoc) = .empty,
 
-    // Owned copies of the pane's font resolution inputs (the pane's
-    // own fields live in the Config arena and re-point on config
-    // reload; the editor face keeps its attach-time values).
-    font_path: ?[]u8 = null,
-    font_family: ?[]u8 = null,
-    font_size: u16 = 14,
-    line_pad: i16 = 0,
+    // Complete effective ProfileSettings font bundle. Every string is
+    // owned because the config arena can be replaced under this view.
+    font: OwnedFontSettings = .{},
 
     /// Editor settings, OWNED copies re-resolved through
     /// `ownerWindow().config` (never slices into the config arena —
@@ -1105,10 +1109,10 @@ pub const EditorView = struct {
         self.results = psearch.Results.init(allocator);
         self.fence = Fence.create(self) orelse return error.OutOfMemory;
         self.pane = pane;
-        self.font_size = pane.surface.font_size;
-        self.line_pad = pane.surface.line_pad_px;
-        if (pane.surface.font_path) |fp| self.font_path = allocator.dupe(u8, fp) catch null;
-        if (pane.surface.font_family) |ff| self.font_family = allocator.dupe(u8, ff) catch null;
+        self.font.font_size = pane.surface.font_size;
+        self.font.line_pad = pane.surface.line_pad_px;
+        if (pane.surface.font_path) |fp| self.font.font_path = allocator.dupe(u8, fp) catch null;
+        if (pane.surface.font_family) |ff| self.font.font_family = allocator.dupe(u8, ff) catch null;
 
         self.buildUi();
         pane.attachEditor(self.root_box, @ptrCast(self), prepareDestroyCb, destroyCb, focusCb);
@@ -1131,6 +1135,9 @@ pub const EditorView = struct {
             &win.config
         else
             self.standalone_config orelse return;
+        self.config_syncs += 1;
+        const profile_name = if (self.pane) |pane| pane.active_profile else null;
+        const font_changed = self.font.sync(self.allocator, cfg, profile_name) catch return;
         self.tab_width = @max(1, cfg.editor_tab_width);
         self.insert_spaces = cfg.editor_insert_spaces;
         self.soft_wrap_default = cfg.editor_soft_wrap;
@@ -1175,39 +1182,6 @@ pub const EditorView = struct {
         self.theme = theme_mod.byName(cfg.editor_theme);
         self.applyThemeColors();
 
-        // Font: the editor keys win, else this profile's terminal font.
-        const pane = self.pane;
-        const prof = if (pane) |p| p.active_profile orelse "" else "";
-        const s = cfg.profileSettings(prof);
-        const want_family: []const u8 = if (s.editor_font_family.len > 0)
-            s.editor_font_family
-        else
-            s.font_family;
-        const want_size: u16 = if (s.editor_font_size > 0) s.editor_font_size else s.font_size;
-        // An explicit editor family overrides the profile font FILE
-        // (a path pointing at a monospace terminal font must not win
-        // over "use Cantarell in the editor").
-        const drop_path = s.editor_font_family.len > 0;
-
-        var font_changed = false;
-        if (want_size != self.font_size) {
-            self.font_size = want_size;
-            font_changed = true;
-        }
-        const have_family: []const u8 = self.font_family orelse "";
-        if (!std.mem.eql(u8, have_family, want_family)) {
-            if (self.font_family) |old| self.allocator.free(old);
-            self.font_family = if (want_family.len > 0)
-                self.allocator.dupe(u8, want_family) catch null
-            else
-                null;
-            font_changed = true;
-        }
-        if (drop_path and self.font_path != null) {
-            self.allocator.free(self.font_path.?);
-            self.font_path = null;
-            font_changed = true;
-        }
         if (font_changed) self.rebuildAtlas();
 
         for (self.tabs.items) |t| {
@@ -1821,6 +1795,7 @@ pub const EditorView = struct {
             t.layout.invalidateAll();
             t.rows_lines = 0; // row heights changed: re-estimate
         }
+        self.layout_rebuilds += 1;
     }
 
     fn realizeAtlas(self: *EditorView, atlas: *Atlas) void {
@@ -1855,7 +1830,12 @@ pub const EditorView = struct {
             .live = self.atlas_textures_created -| self.atlas_textures_deleted,
             .realized = if (self.atlas) |atlas| atlas.realized else false,
             .texture_valid = texture_valid,
-            .font_size = self.font_size,
+            .font_size = self.font.font_size,
+            .line_height = if (self.atlas) |atlas| atlas.cell_h else 0,
+            .line_pad = self.font.line_pad,
+            .font_path_set = self.font.font_path != null,
+            .config_syncs = self.config_syncs,
+            .layout_rebuilds = self.layout_rebuilds,
         };
     }
 
@@ -1870,8 +1850,8 @@ pub const EditorView = struct {
     /// every layout + row estimate), wrap re-measure, redraw.
     pub fn setFontSize(self: *EditorView, size: u16) void {
         const clamped: u16 = @intCast(std.math.clamp(@as(i32, size), 6, 72));
-        if (clamped == self.font_size) return;
-        self.font_size = clamped;
+        if (clamped == self.font.font_size) return;
+        self.font.font_size = clamped;
         self.rebuildAtlas();
         for (self.tabs.items) |t| self.applyWrapWidth(t);
         if (self.active) |t| self.ensureCaretVisible(t);
@@ -1885,7 +1865,7 @@ pub const EditorView = struct {
         const cfg: *const Config = if (self.ownerWindow()) |win|
             &win.config
         else
-            self.standalone_config orelse return self.font_size;
+            self.standalone_config orelse return self.font.font_size;
         const prof = if (self.pane) |p| p.active_profile orelse "" else "";
         const s = cfg.profileSettings(prof);
         return if (s.editor_font_size > 0) s.editor_font_size else s.font_size;
@@ -1908,7 +1888,7 @@ pub const EditorView = struct {
             self.setFontSize(self.configuredFontSize());
             return;
         }
-        const new = std.math.clamp(@as(i32, @intCast(self.font_size)) + delta, 6, 72);
+        const new = std.math.clamp(@as(i32, @intCast(self.font.font_size)) + delta, 6, 72);
         self.setFontSize(@intCast(new));
     }
 
@@ -2158,8 +2138,7 @@ pub const EditorView = struct {
         }
         self.ed_bindings.deinit(self.allocator);
         self.pass.deinit();
-        if (self.font_path) |s| self.allocator.free(s);
-        if (self.font_family) |s| self.allocator.free(s);
+        self.font.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -3030,7 +3009,7 @@ pub const EditorView = struct {
     fn physicalFontSize(self: *EditorView) u16 {
         const scale: f64 = @floatFromInt(c.gtk_widget_get_scale_factor(@ptrCast(self.area)));
         const dpi: f64 = 96.0 * scale;
-        const px: f64 = @as(f64, @floatFromInt(self.font_size)) * dpi / 72.0;
+        const px: f64 = @as(f64, @floatFromInt(self.font.font_size)) * dpi / 72.0;
         return @intFromFloat(@max(1.0, @round(px)));
     }
 
@@ -3039,20 +3018,20 @@ pub const EditorView = struct {
     /// built-in candidates.
     fn createAtlas(self: *EditorView) ?*Atlas {
         const size = self.physicalFontSize();
-        if (self.font_path) |fp| {
+        if (self.font.font_path) |fp| {
             if (self.tryAtlasPath(fp, size)) |a| return a;
         }
-        if (self.font_family) |fam| {
+        if (self.font.font_family) |fam| {
             if (atlas_mod.resolveFamilyPath(self.allocator, fam)) |path| {
                 defer self.allocator.free(path);
-                if (Atlas.initOpts(self.allocator, path.ptr, size, self.line_pad)) |a| return a else |_| {}
+                if (Atlas.initOpts(self.allocator, path.ptr, size, self.font.line_pad)) |a| return a else |_| {}
             }
         }
         if (@import("../util/profile.zig").getenv("SKETERM_FONT")) |env_path| {
             if (self.tryAtlasPath(env_path, size)) |a| return a;
         }
         for (pane_mod.FONT_CANDIDATES) |path| {
-            if (Atlas.initOpts(self.allocator, path, size, self.line_pad)) |a| return a else |_| continue;
+            if (Atlas.initOpts(self.allocator, path, size, self.font.line_pad)) |a| return a else |_| continue;
         }
         return null;
     }
@@ -3061,7 +3040,7 @@ pub const EditorView = struct {
         const z = self.allocator.allocSentinel(u8, fp.len, 0) catch return null;
         defer self.allocator.free(z);
         @memcpy(z, fp);
-        return Atlas.initOpts(self.allocator, z.ptr, size, self.line_pad) catch null;
+        return Atlas.initOpts(self.allocator, z.ptr, size, self.font.line_pad) catch null;
     }
 
     fn onRealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {

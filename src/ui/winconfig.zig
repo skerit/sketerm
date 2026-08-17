@@ -582,6 +582,8 @@ pub fn applyProfileToPane(self: *Window, pane: *Pane, profile_name: []const u8) 
     const old_opts = pane.surface.font_opts;
 
     self.applyPaneConfig(pane, .{ .profile = profile });
+    if (@import("editorview.zig").EditorView.fromPane(pane)) |editor|
+        editor.syncConfig();
 
     const font_changed = pane.surface.font_size != old_size or
         !eqOptStr(old_path, pane.surface.font_path) or
