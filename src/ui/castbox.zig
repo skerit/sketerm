@@ -171,6 +171,7 @@ pub const CastPlayerBox = struct {
         terminal.on_render_request = onRenderRequest;
         terminal.on_image = onImageEvent;
         terminal.on_image_delete_full = onImageDeleteEvent;
+        terminal.on_image_animation = onImageAnimationEvent;
         terminal.on_glyph_coverage = onGlyphCoverage;
         terminal.on_title = onTitleEvent;
         terminal.on_play_state = onPlayState;
@@ -250,6 +251,11 @@ pub const CastPlayerBox = struct {
     fn onImageDeleteEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Screen.ImageDeleteEvent) void {
         const self = cast.userData(CastPlayerBox, ctx);
         self.surface.deleteImages(ev);
+    }
+
+    fn onImageAnimationEvent(ctx: ?*anyopaque) void {
+        const self = cast.userData(CastPlayerBox, ctx);
+        self.surface.imageAnimationChanged();
     }
 
     fn onGlyphCoverage(ctx: ?*anyopaque, cp: u32) bool {

@@ -558,7 +558,7 @@ fn appearancePage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(shader_group)), "Custom shader");
     c.adw_preferences_group_set_description(@ptrCast(@alignCast(shader_group)), "Shadertoy-style fragment shader applied to the whole frame (CRT, glow, …). Compile errors disable it — the terminal keeps rendering.");
     addEntryRowString(@ptrCast(@alignCast(shader_group)), ctx, "Shader file (GLSL, mainImage)", "", &ctx.edit.custom_shader, applyOnly);
-    addSwitchRow(@ptrCast(@alignCast(shader_group)), ctx, "Animate", "Redraw continuously so iTime advances.", &ctx.cfg.custom_shader_animation, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(shader_group)), ctx, "Animate", "Redraw continuously so iTime advances. Named presets keep their own setting; every animated shader suspends graphics offload.", &ctx.cfg.custom_shader_animation, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(shader_group)));
 
     // Overlay scrollbar. App-level (see the comment on Config.scrollbar):
@@ -1399,7 +1399,7 @@ fn behaviorPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     // Compositing.
     const comp_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(comp_group)), "Compositing");
-    addSwitchRow(@ptrCast(@alignCast(comp_group)), ctx, "Graphics offload", "Wayland subsurface scanout fast path. Turn off if your compositor misbehaves with subsurfaces.", &ctx.cfg.graphics_offload, applyOnly);
+    addSwitchRow(@ptrCast(@alignCast(comp_group)), ctx, "Graphics offload", "Wayland subsurface scanout fast path. Automatically suspended during continuous shader animation.", &ctx.cfg.graphics_offload, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(comp_group)));
 
     // LAST on this page: a rebuild re-appends it (see Ctx.hint_group).

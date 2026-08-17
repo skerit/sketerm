@@ -477,6 +477,7 @@ fn registerPane(self: *Window, pane: *Pane, term: *Terminal) !void {
     try self.terminals.ensureUnusedCapacity(self.allocator, 1);
     self.panes.appendAssumeCapacity(pane);
     self.terminals.appendAssumeCapacity(term);
+    self.syncWindowGraphicsOffload();
 }
 
 /// Layout restore for a durable mux pane: attach when the

@@ -460,6 +460,9 @@ pub const ShaderPass = struct {
     fb_h: c_int = 0,
     /// Generation the current program (or failure) was built from.
     built_generation: u32 = std.math.maxInt(u32),
+    /// Source identity is part of the cache key: window and pane
+    /// sources have independent generation counters that may match.
+    built_source: ?*const Source = null,
     /// Compile failed for built_generation — render direct, stay quiet.
     failed: bool = false,
     frame_counter: i32 = 0,
@@ -500,6 +503,7 @@ pub const ShaderPass = struct {
         self.dim_u_darken = -1;
         self.dim_u_desat = -1;
         self.built_generation = std.math.maxInt(u32);
+        self.built_source = null;
         self.failed = false;
     }
 
@@ -544,10 +548,17 @@ pub const ShaderPass = struct {
     }
 
     /// Whether the pass would redirect rendering this frame.
+    /// Whether the cached program (or failure) was built from exactly
+    /// this Source. Identity is part of the key: window and pane
+    /// sources have independent generation counters that may match.
+    fn buildCacheValid(self: *const ShaderPass, src: *const Source) bool {
+        return self.built_source == src and self.built_generation == src.generation;
+    }
+
     pub fn active(self: *const ShaderPass) bool {
         const src = self.source orelse return false;
         if (src.src == null) return false;
-        return !(self.failed and self.built_generation == src.generation);
+        return !(self.failed and self.buildCacheValid(src));
     }
 
     /// Compile/refresh the program for the current Source generation.
@@ -556,7 +567,8 @@ pub const ShaderPass = struct {
     pub fn ensureProgram(self: *ShaderPass, allocator: std.mem.Allocator) bool {
         const src = self.source orelse return false;
         const user = src.src orelse return false;
-        if (self.built_generation == src.generation) return !self.failed;
+        if (self.buildCacheValid(src)) return !self.failed;
+        self.built_source = src;
         self.built_generation = src.generation;
         self.failed = true; // pessimistic until everything below lands
 
@@ -877,3 +889,28 @@ pub const ShaderPass = struct {
         c.glEnable(c.GL_BLEND);
     }
 };
+
+test "shader build cache includes source identity" {
+    const fragment = "void mainImage(out vec4 c, in vec2 p) { c = vec4(1.0); }";
+    var global = Source{ .src = fragment, .generation = 7 };
+    var pane = Source{ .src = fragment, .generation = 7 };
+
+    var pass = ShaderPass{
+        .source = &global,
+        .built_source = &global,
+        .built_generation = 7,
+        .failed = true,
+    };
+    try std.testing.expect(pass.buildCacheValid(&global));
+    try std.testing.expect(!pass.buildCacheValid(&pane));
+    try std.testing.expect(!pass.active());
+
+    // Same bytes and generation, different Source: the cached failure
+    // must not stick to the pane-level source.
+    pass.source = &pane;
+    try std.testing.expect(pass.active());
+
+    pane.generation = 8;
+    pass.built_source = &pane;
+    try std.testing.expect(!pass.buildCacheValid(&pane));
+}

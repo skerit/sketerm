@@ -342,13 +342,13 @@ that framebuffer and costs nothing extra.
 | `ligatures` | bool | `true` | HarfBuzz shaping. |
 | `bidi` | bool | `true` | fribidi reorder; pure-ASCII lines skip it. |
 | `auto_theme` | bool | `true` | Follow AdwStyleManager light/dark. Off honours `default_fg` / `default_bg` exactly and disables the `light.` / `dark.` variants. |
-| `graphics_offload` | bool | `true` | GtkGraphicsOffload for pane GL content. Disable as an escape hatch for compositor/GTK subsurface bugs. |
+| `graphics_offload` | bool | `true` | GtkGraphicsOffload for pane GL content. Automatically suspended across a whole window while any pane continuously renders an animated shader or Kitty image. |
 | `allow_bold` | bool | `true` | Whether the bold attribute affects rendering at all. |
 | `bold_is_bright` | bool | `true` | Bold also lifts palette 0..7 to 8..15 (xterm convention). |
 | `minimum_contrast` | float | `1.0` | Clamped 1..21. Minimum WCAG contrast between text and its cell background; text below it snaps to white or black. `1.0` = off. |
 | `inactive_darken` | float | `0.2` | Clamped 0..1. Uniform darken of an unfocused pane's final composited image, so colour relations are preserved. |
 | `inactive_desaturate` | float | `0.0` | Clamped 0..1. Blend an unfocused pane toward luma. |
-| `custom_shader_animation` | bool | `false` | Redraw continuously so `iTime` advances. Applies to whichever shader a pane resolves to. |
+| `custom_shader_animation` | bool | `false` | Redraw continuously so `iTime` advances for config and manually selected shaders. Named presets keep their own `animate` value. Any effective animated shader suspends graphics offload across its whole window because the panes share one frame clock. |
 | `browser_max_fps` | int | `0` | Ceiling on how often a browser pane's page repaints. `0` = follow the output the window is on. Anything else must be `5`..`1000`; out of range is a parse error. |
 | `web_discard_minutes` | int | `30` | Minutes a web pane may stay off screen before its page is discarded outright (the browser is destroyed and the pane keeps its last frame, dimmed). `0` = never. |
 | `web_popup_policy` | enum | `block-gestureless` | What a browser pane does with a popup a page asks for: `block-gestureless`, `allow`, `block-all`. Anything else is a parse error. |

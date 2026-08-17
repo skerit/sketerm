@@ -550,6 +550,9 @@ pub const Screen = struct {
         on_clipboard_set: ?*const fn (ctx: ?*anyopaque, text: []const u8) void = null,
         on_cwd: ?*const fn (ctx: ?*anyopaque, cwd: []const u8) void = null,
         on_image: ?*const fn (ctx: ?*anyopaque, img: ImageEvent) void = null,
+        /// Kitty animation/control state changed. Render hosts use this
+        /// to install or retire continuous frame-clock work directly.
+        on_image_animation: ?*const fn (ctx: ?*anyopaque) void = null,
         on_notification: ?*const fn (ctx: ?*anyopaque, ev: NotificationEvent) void = null,
         /// ConEmu progress report `OSC 9 ; 4 ; st ; pr` (emitted by
         /// zig build, systemd, PowerShell, ...). st: 0 clear,
@@ -3049,6 +3052,7 @@ pub const Screen = struct {
                     else => {},
                 }
             }
+            if (self.sink.on_image_animation) |f| f(self.sink.ctx);
             self.dirty = true;
             return;
         }
@@ -3058,7 +3062,10 @@ pub const Screen = struct {
         // the image later. The transmit half still has to run so the
         // pixels get stored.
         if (cmd.unicode_placement == 1) {
-            _ = self.kitty_images.ingest(cmd);
+            const outcome = self.kitty_images.ingest(cmd);
+            if (outcome.animation_changed) {
+                if (self.sink.on_image_animation) |f| f(self.sink.ctx);
+            }
             if (cmd.image_id != 0) {
                 self.virtual_placements.put(cmd.image_id, .{
                     .rows = cmd.cells_high, // r=
@@ -3073,6 +3080,10 @@ pub const Screen = struct {
         // Ingest into the Manager — handles chunking, base64, PNG/RGB/
         // RGBA decode, transmit-only vs transmit-and-place, place-by-id.
         const outcome = self.kitty_images.ingest(cmd);
+        if (outcome.animation_changed) {
+            self.dirty = true;
+            if (self.sink.on_image_animation) |f| f(self.sink.ctx);
+        }
         if (outcome.action != .place) return;
 
         const stored = self.kitty_images.get(outcome.image_id) orelse return;

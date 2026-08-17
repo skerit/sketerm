@@ -52,6 +52,21 @@ pub const FONT_CANDIDATES = if (@import("../util/platform.zig").is_macos) [_][*:
     "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
 };
 
+pub fn loadShaderFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const max_size = 256 * 1024;
+    var path_z: [4096]u8 = undefined;
+    if (path.len >= path_z.len) return null;
+    @memcpy(path_z[0..path.len], path);
+    path_z[path.len] = 0;
+    const fp = c.fopen(@ptrCast(&path_z), "rb") orelse return null;
+    defer _ = c.fclose(fp);
+    const scratch = allocator.alloc(u8, max_size + 1) catch return null;
+    defer allocator.free(scratch);
+    const n = c.fread(scratch.ptr, 1, scratch.len, fp);
+    if (n == 0 or n > max_size or c.ferror(fp) != 0) return null;
+    return allocator.dupe(u8, scratch[0..n]) catch null;
+}
+
 pub const TerminalSurface = struct {
     /// Presentation-geometry policy. `live_terminal` is the pane
     /// behaviour: the widget allocation drives the cell grid (the
@@ -210,6 +225,14 @@ pub const TerminalSurface = struct {
     /// The widget allocation changed the grid's column/row COUNT
     /// (live_terminal only). Never fired by fixed_grid.
     on_grid_geometry: ?*const fn (ctx: ?*anyopaque) void = null,
+    /// Continuous shader/kitty playback started or stopped. A GTK frame
+    /// clock tick affects every offload subsurface in the toplevel, so
+    /// the host must apply this as a window-wide presentation policy.
+    on_continuous_frames: ?*const fn (ctx: ?*anyopaque) void = null,
+    continuous_frames_reported: bool = false,
+    /// Defers the inactive report until after GTK has removed the tick
+    /// callback that returned G_SOURCE_REMOVE.
+    continuous_release_idle: c_uint = 0,
 
     /// Construct the surface in place (its address is baked into GTK
     /// signal user-data, so it must already live at its final,
@@ -291,6 +314,7 @@ pub const TerminalSurface = struct {
         // tick: an animating shader self-removes it while unmapped,
         // so nothing else would resume the animation.
         _ = c.g_signal_connect_data(area_widget, "map", @ptrCast(&onAreaMap), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(area_widget, "unmap", @ptrCast(&onAreaUnmap), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
         // Tick is installed on demand via ensureTickRunning. It
         // self-removes when no time-driven work is active. First
@@ -324,6 +348,7 @@ pub const TerminalSurface = struct {
     /// teardown point for all visual sources holding a raw
     /// *TerminalSurface.
     pub fn stopVisualSources(self: *TerminalSurface) void {
+        self.stopTick();
         self.stopBlinkTimer();
         self.stopTrailTimer();
         if (self.bell_timer != 0) {
@@ -605,13 +630,30 @@ pub const TerminalSurface = struct {
     /// call this so the tick is alive to pump. Keep the tick OFF for
     /// slow timers — see the `tick_id` field doc for why.
     pub fn ensureTickRunning(self: *TerminalSurface) void {
-        if (self.tick_id != 0) return;
+        if (self.tick_id != 0) {
+            if (self.continuousWorkRequested()) self.setContinuousFrames(true);
+            return;
+        }
         self.tick_id = c.gtk_widget_add_tick_callback(
             @ptrCast(self.area),
             @ptrCast(&onTick),
             @ptrCast(self),
             null,
         );
+        if (self.tick_id != 0 and self.continuousWorkRequested())
+            self.setContinuousFrames(true);
+    }
+
+    fn stopTick(self: *TerminalSurface) void {
+        if (self.tick_id != 0) {
+            c.gtk_widget_remove_tick_callback(@ptrCast(self.area), self.tick_id);
+            self.tick_id = 0;
+        }
+        if (self.continuous_release_idle != 0) {
+            _ = c.g_source_remove(self.continuous_release_idle);
+            self.continuous_release_idle = 0;
+        }
+        self.setContinuousFrames(false);
     }
 
     /// Whether the current cursor shape is a blinking variant.
@@ -782,13 +824,12 @@ pub const TerminalSurface = struct {
     /// file immediately; a same-path call only refreshes `animate`.
     /// `user_pick` marks the choice as explicit so profile/config
     /// pushes won't overwrite it. Returns false when the file could
-    /// not be read (surface falls back to the window default).
+    /// not be read; the previous selection stays untouched then.
     pub fn setCustomShader(self: *TerminalSurface, path: ?[]const u8, animate: bool, user_pick: bool) bool {
-        // Setting a real shader cancels an explicit clear.
-        if (path != null) self.shader_cleared = false;
         if (path == null and self.custom_shader_path == null) return true;
         if (path) |p| if (self.custom_shader_path) |cur| {
             if (std.mem.eql(u8, p, cur)) {
+                self.shader_cleared = false;
                 self.shader_own.animate = animate;
                 if (user_pick) self.custom_shader_user = true;
                 self.updateShaderTick();
@@ -796,57 +837,45 @@ pub const TerminalSurface = struct {
             }
         };
 
-        // Drop the old own shader.
+        // Load everything the swap needs BEFORE dropping the old
+        // shader, so an unreadable file cannot destroy a working one.
+        var new_src: ?[]u8 = null;
+        var new_path: ?[]u8 = null;
+        var new_dir: ?[]u8 = null;
+        if (path) |p| {
+            new_src = loadShaderFile(self.allocator, p) orelse {
+                std.debug.print("sketerm: pane shader not readable: {s}\n", .{p});
+                return false;
+            };
+            new_path = self.allocator.dupe(u8, p) catch {
+                self.allocator.free(new_src.?);
+                return false;
+            };
+            // Shader-relative //@texture paths resolve against this.
+            if (std.fs.path.dirname(p)) |d| {
+                new_dir = self.allocator.dupe(u8, d) catch {
+                    self.allocator.free(new_src.?);
+                    self.allocator.free(new_path.?);
+                    return false;
+                };
+            }
+        }
+
         if (self.shader_own_src) |s| self.allocator.free(s);
         if (self.custom_shader_path) |s| self.allocator.free(s);
         if (self.shader_own_dir) |d| self.allocator.free(d);
-        self.shader_own_src = null;
-        self.custom_shader_path = null;
-        self.shader_own_dir = null;
-        self.shader_own.src = null;
-        self.shader_own.dir = null;
-        self.custom_shader_user = false;
-
-        var ok = true;
-        if (path) |p| read: {
-            var path_z: [4096]u8 = undefined;
-            if (p.len >= path_z.len) {
-                ok = false;
-                break :read;
-            }
-            @memcpy(path_z[0..p.len], p);
-            path_z[p.len] = 0;
-            const fp = c.fopen(@ptrCast(&path_z), "rb") orelse {
-                std.debug.print("sketerm: pane shader not readable: {s}\n", .{p});
-                ok = false;
-                break :read;
-            };
-            defer _ = c.fclose(fp);
-            const buf = self.allocator.alloc(u8, 256 * 1024) catch {
-                ok = false;
-                break :read;
-            };
-            const n = c.fread(buf.ptr, 1, buf.len, fp);
-            if (n == 0) {
-                self.allocator.free(buf);
-                ok = false;
-                break :read;
-            }
-            self.shader_own_src = self.allocator.realloc(buf, n) catch buf[0..n];
-            self.shader_own.src = self.shader_own_src;
-            self.custom_shader_path = self.allocator.dupe(u8, p) catch null;
-            // Shader-relative //@texture paths resolve against this.
-            if (std.fs.path.dirname(p)) |d| {
-                self.shader_own_dir = self.allocator.dupe(u8, d) catch null;
-                self.shader_own.dir = self.shader_own_dir;
-            }
-            self.custom_shader_user = user_pick;
-        }
+        self.shader_own_src = new_src;
+        self.custom_shader_path = new_path;
+        self.shader_own_dir = new_dir;
+        self.shader_own.src = new_src;
+        self.shader_own.dir = new_dir;
+        self.custom_shader_user = if (path != null) user_pick else false;
+        if (path != null) self.shader_cleared = false;
         self.shader_own.animate = animate;
         self.shader_own.generation +%= 1;
         self.refreshShaderBinding();
         self.updateShaderTick();
-        return ok;
+        return true;
     }
 
     /// Point the GL pass at the surface's own shader when one is
@@ -860,6 +889,48 @@ pub const TerminalSurface = struct {
         } else {
             self.shader_pass.source = self.shader_default_source;
         }
+    }
+
+    /// Whether the bound shader source requests continuous rendering.
+    pub fn shaderRequestsAnimation(self: *const TerminalSurface) bool {
+        const src = self.shader_pass.source orelse return false;
+        return src.src != null and src.animate;
+    }
+
+    fn continuousWorkRequested(self: *const TerminalSurface) bool {
+        if (c.gtk_widget_get_mapped(@ptrCast(self.area)) == 0) return false;
+        if (self.shaderRequestsAnimation()) return true;
+        var it = self.terminal.screen.kitty_images.store.iterator();
+        while (it.next()) |entry| {
+            const image = entry.value_ptr;
+            if (image.frames.items.len >= 2 and image.playing) return true;
+        }
+        return false;
+    }
+
+    /// Whether this surface currently owns a continuous frame-clock
+    /// callback, as reported to the window-wide offload policy.
+    pub fn continuousFramesActive(self: *const TerminalSurface) bool {
+        return self.continuous_frames_reported;
+    }
+
+    /// Start the continuous tick after an event changed shader/kitty
+    /// playback state. Called only at transition points (kitty
+    /// animation commands, shader changes), never per frame.
+    pub fn syncContinuousTick(self: *TerminalSurface) void {
+        if (!self.continuousWorkRequested()) return;
+        self.ensureTickRunning();
+    }
+
+    fn setContinuousFrames(self: *TerminalSurface, active: bool) void {
+        if (active == self.continuous_frames_reported) return;
+        self.continuous_frames_reported = active;
+        if (self.on_continuous_frames) |callback| callback(self.host_ctx);
+    }
+
+    fn scheduleContinuousRelease(self: *TerminalSurface) void {
+        if (!self.continuous_frames_reported or self.continuous_release_idle != 0) return;
+        self.continuous_release_idle = c.g_idle_add(@ptrCast(&onContinuousRelease), @ptrCast(self));
     }
 
     /// Bind a shader preset's params to this surface: own copies of
@@ -1087,6 +1158,30 @@ pub const TerminalSurface = struct {
         // Image arrival may include an animation; ensure tick is up
         // to pump frames if the idle path had stopped it.
         self.ensureTickRunning();
+    }
+
+    fn uploadKittyAnimationFrames(self: *TerminalSurface) void {
+        var it = self.terminal.screen.kitty_images.store.iterator();
+        while (it.next()) |entry| {
+            const img = entry.value_ptr;
+            if (img.frames.items.len < 2) continue;
+            self.image_store.uploadFrame(entry.key_ptr.*, img.generation, img.rgba) catch |err| {
+                std.debug.print("sketerm: image_store.uploadFrame failed (id={d}): {s}\n", .{ entry.key_ptr.*, @errorName(err) });
+            };
+        }
+    }
+
+    /// A Kitty frame/control command changed playback or selected a
+    /// frame. Upload the selected pixels now and establish continuous
+    /// policy before the next frame-clock callback.
+    pub fn imageAnimationChanged(self: *TerminalSurface) void {
+        self.uploadKittyAnimationFrames();
+        self.syncContinuousTick();
+        // DECSET 2026 stages image and text updates atomically. Keep
+        // the selected frame uploaded internally, but wait for DECRST
+        // before exposing it through the GLArea.
+        if (!self.terminal.screen.sync_output)
+            c.gtk_gl_area_queue_render(@ptrCast(self.area));
     }
 
     /// Kitty `d=` delete request against the stored images.
@@ -1462,6 +1557,10 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
     if (screen.child_exited) {
         screen.child_exited = false;
         self.tick_id = 0;
+        // The continuous report drops via the release idle so it runs
+        // only after GTK removed this callback; teardown paths cancel
+        // it through stopVisualSources.
+        self.scheduleContinuousRelease();
         if (self.on_child_exit) |f| f(self.host_ctx, screen.child_exit_status);
         // The exit hook may have torn the surface down (exit_action
         // .close); `self` is potentially freed. Returning CONTINUE
@@ -1490,14 +1589,7 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
     // Unmapped panes skip the advance entirely (nobody sees the
     // frames; onAreaMap re-arms the tick and playback resumes).
     if (mapped and screen.kitty_images.advanceAnimations(now)) {
-        var it = screen.kitty_images.store.iterator();
-        while (it.next()) |entry| {
-            const img = entry.value_ptr;
-            if (img.frames.items.len < 2) continue;
-            self.image_store.uploadFrame(entry.key_ptr.*, img.generation, img.rgba) catch |err| {
-                std.debug.print("sketerm: image_store.uploadFrame failed (id={d}): {s}\n", .{ entry.key_ptr.*, @errorName(err) });
-            };
-        }
+        self.uploadKittyAnimationFrames();
         screen.dirty = true;
     }
 
@@ -1533,9 +1625,20 @@ fn onTick(area: *c.GtkWidget, _: *c.GdkFrameClock, user: ?*anyopaque) callconv(.
     };
     if (!has_anim_work and !shader_animating) {
         self.tick_id = 0;
+        self.scheduleContinuousRelease();
         return 0; // G_SOURCE_REMOVE
     }
+    self.setContinuousFrames(true);
     return 1; // G_SOURCE_CONTINUE
+}
+
+fn onContinuousRelease(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(TerminalSurface, user);
+    self.continuous_release_idle = 0;
+    // New work may have installed another callback before this idle
+    // ran. Its eventual removal owns the next release attempt.
+    if (self.tick_id == 0) self.setContinuousFrames(false);
+    return 0; // G_SOURCE_REMOVE
 }
 
 /// Blink timeout body — toggles the cursor phase and self-removes
@@ -1597,9 +1700,7 @@ fn onTrailTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
 /// Whether the surface's effective shader requests per-frame
 /// animation.
 fn shaderAnimates(self: *TerminalSurface) bool {
-    if (!self.shader_pass.active()) return false;
-    const src = self.shader_pass.source orelse return false;
-    return src.animate;
+    return self.shader_pass.active() and self.shaderRequestsAnimation();
 }
 
 fn onAreaMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
@@ -1609,6 +1710,11 @@ fn onAreaMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     // resume playback now that the pane is visible again. The tick
     // drops right back out if nothing is actually playing.
     self.ensureTickRunning();
+}
+
+fn onAreaUnmap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(TerminalSurface, user);
+    self.stopTick();
 }
 
 fn onResize(_: *c.GtkGLArea, width: c_int, height: c_int, user: ?*anyopaque) callconv(.c) void {

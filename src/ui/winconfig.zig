@@ -6,11 +6,13 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const render_kick = @import("../util/render_kick.zig");
 const Config = @import("../config.zig").Config;
 const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
 const Window = winmod.Window;
 const shader_preset_mod = @import("../shader_preset.zig");
+const terminal_surface_mod = @import("terminal_surface.zig");
 const logActionError = winmod.logActionError;
 const connectManualPopoverClose = winmod.connectManualPopoverClose;
 const isDarkBg = winmod.isDarkBg;
@@ -43,6 +45,30 @@ fn textBlendMode(v: @import("../config.zig").TextBlending) @import("../render/bl
     };
 }
 
+/// A toplevel frame-clock tick invalidates every offload subsurface.
+fn graphicsOffloadEnabled(config: *const Config, continuous_frames: bool) bool {
+    return config.graphics_offload and !continuous_frames;
+}
+
+/// The single owner of the offload decision: one frame clock drives
+/// the whole toplevel, so policy is window-wide, never per-pane (see
+/// docs/SESSION.md 2026-08-16). While an in-window dialog is open a
+/// desired enable is parked as a suspend mark that dialog close
+/// restores (render_kick.resumeOffloads).
+pub fn syncWindowGraphicsOffload(self: *Window) void {
+    const continuous = for (self.panes.items) |pane| {
+        if (pane.surface.continuousFramesActive()) break true;
+    } else false;
+    const want = graphicsOffloadEnabled(&self.config, continuous);
+    const dialog_active = render_kick.dialogActive(self.app_window);
+    for (self.panes.items) |pane| {
+        if (want and dialog_active)
+            pane.deferGraphicsOffloadEnable()
+        else
+            pane.setGraphicsOffload(want);
+    }
+}
+
 const PresetButtonCtx = struct {
     window: *Window,
     preset_name: [:0]u8, // owned, freed by GDestroyNotify
@@ -61,7 +87,6 @@ const ShaderPickCtx = struct {
     pane: *Pane,
     allocator: std.mem.Allocator,
 };
-
 
 /// Look up a named profile in the active Config, or null if no
 /// such profile exists. Caller-borrowed slice (Config arena).
@@ -161,13 +186,15 @@ pub fn setPaneShaderParam(self: *Window, pane: *Pane, name: []const u8, value: f
 }
 
 /// Load + apply a named shader preset to `pane`. False when the
-/// preset (or its shader file) can't be read.
+/// preset (or its shader file) can't be read; the pane's previous
+/// shader selection is preserved on failure.
 pub fn applyShaderPresetByName(self: *Window, pane: *Pane, name: []const u8) bool {
     var arena_state = std.heap.ArenaAllocator.init(self.allocator);
     defer arena_state.deinit();
     const preset = shader_preset_mod.load(arena_state.allocator(), name) catch return false;
     if (preset.shader_path.len == 0) return false;
     if (!pane.setCustomShader(preset.shader_path, preset.animate, true)) return false;
+    syncWindowGraphicsOffload(self);
     pane.applyShaderPresetParams(name, preset.params);
     return true;
 }
@@ -210,6 +237,7 @@ pub fn clearPaneShader(self: *Window) void {
     // profile/global and survives config reloads (Pane.shader_cleared).
     pane.dropShaderPreset(self.config.shader_params.items);
     pane.clearShader();
+    syncWindowGraphicsOffload(self);
 }
 
 /// applyPaneConfig with the pane's stored profile re-resolved by
@@ -304,7 +332,6 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     pane.surface.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
     pane.restartBlinkTimer();
     pane.applyTrailConfig(self.config.cursor_trail, self.config.cursor_trail_ms);
-    pane.setGraphicsOffload(self.config.graphics_offload);
     pane.app_view_tab = self.config.app_view == .tab;
     pane.surface.line_pad_px = s.line_pad_px;
     pane.surface.grid_pass.pad = s.padding;
@@ -345,6 +372,7 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
         );
     }
     pane.refreshShaderBinding();
+    syncWindowGraphicsOffload(self);
     pane.updateShaderTick();
 }
 
@@ -842,7 +870,6 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
             c.gtk_widget_queue_resize(p.widget());
         }
         // Rendering.
-        p.setGraphicsOffload(self.config.graphics_offload);
         // Affects the next app launch; live views keep their mode
         // (pop in/out via the window's host menu).
         p.app_view_tab = self.config.app_view == .tab;
@@ -894,10 +921,11 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
                 self.config.custom_shader_animation,
                 false,
             );
-        } else if (p.surface.custom_shader_user) {
+        } else if (p.surface.custom_shader_user and !p.hasOwnShaderParams()) {
             p.surface.shader_own.animate = self.config.custom_shader_animation;
         }
         p.refreshShaderBinding();
+        p.updateShaderTick();
         // Mouse / link / autohide flags on the Pane itself.
         p.copy_on_selection = self.config.copy_on_selection;
         p.clear_select_on_copy = self.config.clear_select_on_copy;
@@ -938,6 +966,10 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         p.surface.markAllCellsDirty();
         c.gtk_gl_area_queue_render(@ptrCast(p.surface.area));
     }
+
+    // Once, after every pane picked up its new shader/animation state:
+    // the graphics_offload key itself may have flipped.
+    syncWindowGraphicsOffload(self);
 
     // Refresh CSS provider so any title_*_* color changes take
     // effect immediately on the active/inactive classes.
@@ -988,6 +1020,22 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     @import("configwatch.zig").afterApply(self);
 
     if (opts.persist) persistConfig(self);
+}
+
+test "continuous shader animation suppresses graphics offload" {
+    var config: Config = .{};
+    try std.testing.expect(graphicsOffloadEnabled(&config, false));
+    try std.testing.expect(!graphicsOffloadEnabled(&config, true));
+
+    // The reported continuous state decides, not the global animation
+    // flag: named presets animate via preset.animate regardless of it.
+    config.custom_shader_animation = true;
+    try std.testing.expect(graphicsOffloadEnabled(&config, false));
+    try std.testing.expect(!graphicsOffloadEnabled(&config, true));
+
+    config.custom_shader_animation = false;
+    config.graphics_offload = false;
+    try std.testing.expect(!graphicsOffloadEnabled(&config, false));
 }
 
 /// Write the live config back to the file the process reads — the
@@ -1048,43 +1096,28 @@ pub fn refreshBgSource(self: *Window) void {
 /// (Re-)read the custom_shader file into shader_source. Call on
 /// startup and whenever a custom_shader* key may have changed.
 pub fn refreshShaderSource(self: *Window) void {
-    if (self.shader_source.src) |s| {
-        self.allocator.free(s);
-        self.shader_source.src = null;
-    }
-    if (self.shader_source.dir) |d| {
-        self.allocator.free(d);
-        self.shader_source.dir = null;
-    }
     self.shader_source.animate = self.config.custom_shader_animation;
     self.shader_source.overrides = self.config.shader_params.items;
 
     const path = self.config.settings.custom_shader;
+    var source: ?[]u8 = null;
+    var dir: ?[]u8 = null;
     if (path.len > 0) {
-        // Shader-relative //@texture paths resolve against this.
-        if (std.fs.path.dirname(path)) |d| {
-            self.shader_source.dir = self.allocator.dupe(u8, d) catch null;
-        }
-    }
-    if (path.len > 0) blk: {
-        var path_z: [4096]u8 = undefined;
-        if (path.len >= path_z.len) break :blk;
-        @memcpy(path_z[0..path.len], path);
-        path_z[path.len] = 0;
-        const fp = c.fopen(@ptrCast(&path_z), "rb") orelse {
+        source = terminal_surface_mod.loadShaderFile(self.allocator, path) orelse {
             std.debug.print("sketerm: custom_shader not readable: {s}\n", .{path});
-            break :blk;
+            return;
         };
-        defer _ = c.fclose(fp);
-        const max_bytes: usize = 256 * 1024;
-        const buf = self.allocator.alloc(u8, max_bytes) catch break :blk;
-        const n = c.fread(buf.ptr, 1, buf.len, fp);
-        if (n == 0) {
-            self.allocator.free(buf);
-            break :blk;
+        if (std.fs.path.dirname(path)) |path_dir| {
+            dir = self.allocator.dupe(u8, path_dir) catch {
+                self.allocator.free(source.?);
+                return;
+            };
         }
-        self.shader_source.src = self.allocator.realloc(buf, n) catch buf[0..n];
     }
+    if (self.shader_source.src) |old| self.allocator.free(old);
+    if (self.shader_source.dir) |old| self.allocator.free(old);
+    self.shader_source.src = source;
+    self.shader_source.dir = dir;
     self.shader_source.generation +%= 1;
 }
 
@@ -1346,9 +1379,11 @@ pub fn onShaderPicked(user: ?*anyopaque, result: ?@import("../filebrowser/picker
         "The GL shader compiler reads the file locally — pick a shader on this machine.",
     ) orelse return;
     // Strictly per-pane: the pick lands on the clicked pane only. A
-    // manual file pick replaces any bound preset.
+    // manual file pick replaces any bound preset; an unreadable file
+    // leaves the previous selection untouched.
+    if (!ctx.pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true)) return;
     ctx.pane.dropShaderPreset(ctx.win.config.shader_params.items);
-    _ = ctx.pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true);
+    syncWindowGraphicsOffload(ctx.win);
 }
 
 /// The system flipped light/dark: re-resolve every pane against its

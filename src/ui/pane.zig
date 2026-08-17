@@ -122,6 +122,9 @@ pub const Pane = struct {
     /// Fired exactly once when the PTY child exits. Window decides
     /// what to do (close pane / restart shell / hold).
     win_on_child_exit: ?*const fn (ctx: ?*anyopaque, pane: *Pane, status: i32) void = null,
+    /// Continuous rendering changed; Window re-evaluates offload for
+    /// every pane because one frame clock drives the whole toplevel.
+    win_on_continuous_frames: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
     /// Fired when the session died unexpectedly (crash/OOM). Window shows the
     /// crashed-tab overlay (sad face + "Start new session").
     win_crash_ctx: ?*anyopaque = null,
@@ -341,6 +344,7 @@ pub const Pane = struct {
         self.surface.on_child_exit = onSurfaceChildExit;
         self.surface.on_before_redraw = onSurfaceBeforeRedraw;
         self.surface.on_grid_geometry = onSurfaceGridGeometry;
+        self.surface.on_continuous_frames = onSurfaceContinuousFrames;
         const area_widget: *c.GtkWidget = self.surface.widget();
         // Widget → Pane back-pointer for tree walks that only have
         // the GTK side (tab transfer between windows adopts panes by
@@ -448,7 +452,10 @@ pub const Pane = struct {
         // — every frame logs either an offload success or the reason
         // it fell back (CSS effects, overlapping siblings, etc.).
         const offload = c.gtk_graphics_offload_new(area_widget);
-        c.gtk_graphics_offload_set_enabled(@ptrCast(offload), c.GTK_GRAPHICS_OFFLOAD_ENABLED);
+        // Window policy is authoritative and cannot run until this pane
+        // is registered. Keep it disabled across construction so a new
+        // pane cannot bypass an already-animating sibling or dialog.
+        c.gtk_graphics_offload_set_enabled(@ptrCast(offload), c.GTK_GRAPHICS_OFFLOAD_DISABLED);
         c.gtk_graphics_offload_set_black_background(@ptrCast(offload), 1);
         c.gtk_widget_set_vexpand(offload, 1);
         c.gtk_widget_set_hexpand(offload, 1);
@@ -483,6 +490,7 @@ pub const Pane = struct {
         terminal.user_ctx = @ptrCast(self);
         terminal.on_image = onImageEvent;
         terminal.on_image_delete_full = onImageDeleteFullEvent;
+        terminal.on_image_animation = onImageAnimationEvent;
         terminal.on_title = onTitleEvent;
         terminal.on_cwd_changed = onCwdEvent;
         terminal.on_program_changed = onProgramEvent;
@@ -1441,6 +1449,14 @@ pub const Pane = struct {
         );
     }
 
+    pub fn clearGraphicsOffloadSuspension(self: *Pane) void {
+        if (self.offload_widget) |offload| render_kick.clearOffloadSuspended(offload);
+    }
+
+    pub fn deferGraphicsOffloadEnable(self: *Pane) void {
+        if (self.offload_widget) |offload| render_kick.deferOffloadEnable(offload);
+    }
+
     /// Set the per-pane title bar text. Called from the on_title sink
     /// when the running shell emits an OSC 0/1/2 escape. Idempotent
     /// when the new text matches the cached value. The label is set
@@ -1580,6 +1596,11 @@ fn onSurfaceChildExit(ctx: ?*anyopaque, status: i32) void {
     if (self.win_on_child_exit) |f| f(self.win_child_ctx, self, status);
 }
 
+fn onSurfaceContinuousFrames(ctx: ?*anyopaque) void {
+    const self = cast.userData(Pane, ctx);
+    if (self.win_on_continuous_frames) |callback| callback(self.win_clip_ctx, self);
+}
+
 /// A dirty redraw is about to be queued: update the IME cursor
 /// location so fcitx5 / ibus position their popups at the right
 /// cell. ImHost.setCursorLocation debounces against the last
@@ -1613,6 +1634,13 @@ fn onImageEvent(ctx: ?*anyopaque, img: Screen.ImageEvent) void {
 fn onImageDeleteFullEvent(ctx: ?*anyopaque, ev: @import("../grid/screen.zig").Screen.ImageDeleteEvent) void {
     const self = cast.userData(Pane, ctx);
     self.surface.deleteImages(ev);
+}
+
+fn onImageAnimationEvent(ctx: ?*anyopaque) void {
+    const self = cast.userData(Pane, ctx);
+    // This callback runs while the kitty command is being applied,
+    // before any frame-clock tick can observe the new playback state.
+    self.surface.imageAnimationChanged();
 }
 
 fn onTitleEvent(ctx: ?*anyopaque, title: []const u8) void {

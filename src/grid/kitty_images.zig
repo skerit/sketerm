@@ -212,6 +212,10 @@ pub const Manager = struct {
     ///   - .place: caller should place stored image_id at cursor
     pub const Outcome = struct {
         action: enum { none, place },
+        /// Playback metadata changed or a frame made an image animated.
+        /// The renderer must re-evaluate its continuous tick before the
+        /// next frame-clock callback.
+        animation_changed: bool = false,
         image_id: u32,
         placement_id: u32,
         z: i32,
@@ -254,7 +258,9 @@ pub const Manager = struct {
         // accumulate.
         if (effective == .animate) {
             self.applyAnimateControl(cmd);
-            return default;
+            var outcome = default;
+            outcome.animation_changed = true;
+            return outcome;
         }
 
         switch (effective) {
@@ -344,6 +350,11 @@ pub const Manager = struct {
                         .src_w = cmd.src_w,
                         .src_h = cmd.src_h,
                     };
+                }
+                if (original_action == .transmit_frame) {
+                    var outcome = default;
+                    outcome.animation_changed = true;
+                    return outcome;
                 }
                 return default;
             },
@@ -885,7 +896,8 @@ test "animation: a=f appends a frame" {
         .payload = bB,
         .z = 200,
     };
-    _ = mgr.ingest(cmd_f);
+    const frame_outcome = mgr.ingest(cmd_f);
+    try std.testing.expect(frame_outcome.animation_changed);
 
     const stored = mgr.store.getPtr(5).?;
     try std.testing.expectEqual(@as(usize, 2), stored.frames.items.len);
@@ -978,7 +990,8 @@ test "animation: a=a stop pauses playback" {
 
     // Stop via a=a, c=1.
     const stop_cmd = kitty.Command{ .action = .animate, .image_id = 8, .cells_wide = 1 };
-    _ = mgr.ingest(stop_cmd);
+    const stop_outcome = mgr.ingest(stop_cmd);
+    try std.testing.expect(stop_outcome.animation_changed);
     try std.testing.expect(!mgr.store.getPtr(8).?.playing);
 
     // advanceAnimations does nothing when not playing.
@@ -988,7 +1001,8 @@ test "animation: a=a stop pauses playback" {
 
     // Re-run via a=a, c=2.
     const run_cmd = kitty.Command{ .action = .animate, .image_id = 8, .cells_wide = 2 };
-    _ = mgr.ingest(run_cmd);
+    const run_outcome = mgr.ingest(run_cmd);
+    try std.testing.expect(run_outcome.animation_changed);
     try std.testing.expect(mgr.store.getPtr(8).?.playing);
 }
 

@@ -55,6 +55,21 @@ pub fn clearOffloadSuspended(offload: *c.GtkWidget) void {
     c.g_object_set_qdata(@ptrCast(@alignCast(offload)), suspendQuark(), null);
 }
 
+/// Whether an ancestor toplevel currently has an in-window dialog open.
+pub fn dialogActive(widget: *c.GtkWidget) bool {
+    var current: ?*c.GtkWidget = widget;
+    while (current) |w| : (current = c.gtk_widget_get_parent(w)) {
+        if (dialogCount(w) > 0) return true;
+    }
+    return false;
+}
+
+/// Remember a desired enable while keeping the offload disabled.
+pub fn deferOffloadEnable(offload: *c.GtkWidget) void {
+    c.gtk_graphics_offload_set_enabled(@ptrCast(offload), c.GTK_GRAPHICS_OFFLOAD_DISABLED);
+    c.g_object_set_qdata(@ptrCast(@alignCast(offload)), suspendQuark(), @ptrFromInt(1));
+}
+
 fn dialogCount(root: *c.GtkWidget) usize {
     return @intFromPtr(c.g_object_get_qdata(@ptrCast(@alignCast(root)), dialogCountQuark()));
 }

@@ -20,6 +20,7 @@ const Capture = struct {
     fired: bool = false,
     cells_wide: u32 = 0,
     cells_high: u32 = 0,
+    animation_changes: usize = 0,
     allocator: std.mem.Allocator,
 
     fn deinit(self: *Capture) void {
@@ -38,6 +39,11 @@ const Capture = struct {
         self.cells_high = ev.cells_high;
         if (self.rgba) |b| self.allocator.free(b);
         self.rgba = self.allocator.dupe(u8, ev.rgba) catch null;
+    }
+
+    fn animation(ctx: ?*anyopaque) void {
+        const self: *Capture = @ptrCast(@alignCast(ctx.?));
+        self.animation_changes += 1;
     }
 };
 
@@ -59,7 +65,11 @@ const Harness = struct {
         errdefer screen.deinit();
         const cap = try a.create(Capture);
         cap.* = .{ .allocator = a };
-        screen.sink = .{ .ctx = @ptrCast(cap), .on_image = Capture.sink };
+        screen.sink = .{
+            .ctx = @ptrCast(cap),
+            .on_image = Capture.sink,
+            .on_image_animation = Capture.animation,
+        };
         return .{
             .pool = pool_ptr,
             .screen = screen,
@@ -226,6 +236,16 @@ test "kitty a=t then a=p places previously-transmitted image" {
     try std.testing.expect(h.capture.fired);
     try std.testing.expectEqual(@as(u32, 1), h.capture.width);
     try std.testing.expectEqual(@as(u32, 5), h.capture.image_id);
+
+    // Appending the second frame turns the stored image into active
+    // playback and must notify the render host before its first tick.
+    var frame_buf: [128]u8 = undefined;
+    const frame = try std.fmt.bufPrint(&frame_buf, "\x1b_Gi=5,a=f,f=32,s=1,v=1;{s}\x1b\\", .{b64});
+    h.feed(frame);
+    try std.testing.expectEqual(@as(usize, 1), h.capture.animation_changes);
+
+    h.feed("\x1b_Gi=5,a=a,c=1\x1b\\");
+    try std.testing.expectEqual(@as(usize, 2), h.capture.animation_changes);
 }
 
 // Sixel via DCS — should also fire the same on_image sink.

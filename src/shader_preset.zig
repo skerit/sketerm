@@ -14,6 +14,7 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const ParamKV = @import("render/shader_pass.zig").ParamKV;
 const pathz_util = @import("util/pathz.zig");
+const atomicwrite = @import("util/atomicwrite.zig");
 
 pub const Preset = struct {
     name: []const u8 = "",
@@ -119,11 +120,7 @@ pub fn save(allocator: std.mem.Allocator, preset: Preset) !void {
     const text = try serialize(allocator, preset);
     defer allocator.free(text);
 
-    var path_z: [4096]u8 = undefined;
-    const fp = c.fopen(try pathz_util.pathZ(&path_z, path), "wb") orelse return error.WriteFailed;
-    const written = c.fwrite(text.ptr, 1, text.len, fp);
-    const close_ok = c.fclose(fp) == 0;
-    if (written != text.len or !close_ok) return error.WriteFailed;
+    atomicwrite.writeFile(path, text, 0o600) catch return error.WriteFailed;
 }
 
 /// Load a preset by name; everything duped into `allocator` (use an
@@ -138,9 +135,11 @@ pub fn load(allocator: std.mem.Allocator, name: []const u8) !Preset {
     var path_z: [4096]u8 = undefined;
     const fp = c.fopen(try pathz_util.pathZ(&path_z, path), "rb") orelse return error.NotFound;
     defer _ = c.fclose(fp);
-    const buf = try allocator.alloc(u8, 64 * 1024);
+    const max_size = 64 * 1024;
+    const buf = try allocator.alloc(u8, max_size + 1);
     defer allocator.free(buf);
     const n = c.fread(buf.ptr, 1, buf.len, fp);
+    if (n > max_size or c.ferror(fp) != 0) return error.ReadFailed;
     var preset = try parse(allocator, buf[0..n]);
     preset.name = try allocator.dupe(u8, name);
     return preset;

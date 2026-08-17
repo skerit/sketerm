@@ -116,6 +116,7 @@ pub const Terminal = struct {
     on_bell: ?*const fn (ctx: ?*anyopaque) void = null,
     on_image: ?*const fn (ctx: ?*anyopaque, img: Screen.ImageEvent) void = null,
     on_image_delete_full: ?*const fn (ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void = null,
+    on_image_animation: ?*const fn (ctx: ?*anyopaque) void = null,
     on_notification: ?*const fn (ctx: ?*anyopaque, ev: Screen.NotificationEvent) void = null,
     on_pointer_shape: ?*const fn (ctx: ?*anyopaque, name: []const u8) void = null,
     /// OSC 1337 ; SetProfile=<name> — app asks the GUI to restyle this
@@ -1200,6 +1201,7 @@ pub const Terminal = struct {
             .on_cwd = sinkCwd,
             .on_image = sinkImage,
             .on_image_delete_full = sinkImageDeleteFull,
+            .on_image_animation = sinkImageAnimation,
             .on_decanm = sinkDecanm,
             .on_notification = sinkNotification,
             .on_progress = sinkProgress,
@@ -2879,6 +2881,11 @@ pub const Terminal = struct {
         if (self.on_image_delete_full) |f| f(self.user_ctx, ev);
     }
 
+    fn sinkImageAnimation(ctx: ?*anyopaque) void {
+        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
+        if (self.on_image_animation) |f| f(self.user_ctx);
+    }
+
     fn sinkNotification(ctx: ?*anyopaque, ev: Screen.NotificationEvent) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
         if (self.on_notification) |f| f(self.user_ctx, ev);
@@ -2941,6 +2948,7 @@ pub const Terminal = struct {
         self.on_bell = null;
         self.on_image = null;
         self.on_image_delete_full = null;
+        self.on_image_animation = null;
         self.on_notification = null;
         self.on_progress = null;
         self.on_pointer_shape = null;

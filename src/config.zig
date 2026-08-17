@@ -856,9 +856,10 @@ pub const Config = struct {
     // Rendering
     ligatures: bool = true,
     /// GtkGraphicsOffload for pane GL content (Wayland subsurface +
-    /// dmabuf scanout fast path). Disable to force GSK compositing —
-    /// escape hatch for compositor/GTK subsurface bugs (a KWin/GTK
-    /// frame-callback object-id leak crashed long sessions).
+    /// dmabuf scanout fast path). Disable to force GSK compositing.
+    /// Continuous custom-shader animation suppresses it automatically:
+    /// KWin leaks one frame-callback object id per offloaded surface and
+    /// frame until libwayland's object table is exhausted.
     graphics_offload: bool = true,
     /// Bidirectional text reorder via fribidi. Only affects lines
     /// containing non-ASCII codepoints; pure-ASCII lines skip it.
@@ -1230,7 +1231,9 @@ pub const Config = struct {
 
     /// Redraw continuously so iTime advances (CRT flicker, glow…).
     /// Off = the shader still runs but only on normal damage.
-    /// Applies to whichever custom shader a pane resolves to.
+    /// Applies to config/manual shaders; named presets keep their own
+    /// animation setting. Any effective animated shader suppresses
+    /// graphics offload across its whole toplevel frame clock.
     custom_shader_animation: bool = false,
 
     /// Custom keybindings. List of (action_name, accelerator) pairs

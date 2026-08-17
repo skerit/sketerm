@@ -188,6 +188,11 @@ fn onManualPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void 
     }
 }
 
+fn onPaneContinuousFrames(ctx: ?*anyopaque, _: *Pane) void {
+    const self = cast.userData(Window, ctx);
+    self.syncWindowGraphicsOffload();
+}
+
 /// Wire the per-open unparent-on-close for a manually-parented
 /// popover. Call once, right after gtk_widget_set_parent.
 pub fn connectManualPopoverClose(popover: *c.GtkWidget) void {
@@ -1076,7 +1081,14 @@ pub const Window = struct {
             const terminal = origin orelse break;
             terminal.closePanelOrigin();
         }
-        for (self.panes.items) |p| p.detachAppHost();
+        for (self.panes.items) |p| {
+            p.detachAppHost();
+            // Pane.deinit stops frame-clock callbacks. Suppress their
+            // window-wide offload notification before freeing any pane,
+            // because the remaining array entries otherwise include
+            // panes already destroyed earlier in the loop below.
+            p.win_on_continuous_frames = null;
+        }
         for (self.terminals.items) |t| t.clearSinks();
         for (self.terminals.items) |t| t.deinit();
         for (self.panes.items) |p| p.deinit();
@@ -1212,6 +1224,7 @@ pub const Window = struct {
     pub const findProfile = winconfig.findProfile;
     pub const setPaneShaderParam = winconfig.setPaneShaderParam;
     pub const applyShaderPresetByName = winconfig.applyShaderPresetByName;
+    pub const syncWindowGraphicsOffload = winconfig.syncWindowGraphicsOffload;
     pub const setShaderParam = winconfig.setShaderParam;
     pub const applyPaneConfigByName = winconfig.applyPaneConfigByName;
     pub const applyPaneConfig = winconfig.applyPaneConfig;
@@ -2223,6 +2236,7 @@ pub const Window = struct {
         pane.win_on_bell = termsinks_mod.onTermBell;
         pane.win_child_ctx = @ptrCast(self);
         pane.win_on_child_exit = termsinks_mod.onTermChildExit;
+        pane.win_on_continuous_frames = onPaneContinuousFrames;
         pane.win_crash_ctx = @ptrCast(self);
         pane.win_on_crashed = onPaneCrashed;
         pane.win_cwd_ctx = @ptrCast(self);
@@ -2265,6 +2279,7 @@ pub const Window = struct {
     /// (unlistPane) and cross-window tab adoption, where the pane
     /// lives on under another Window.
     pub fn disownPane(self: *Window, pane: *Pane) void {
+        pane.win_on_continuous_frames = null;
         if (self.search_pane == pane) self.closeSearch();
         if (self.hints_pane == pane) self.exitHints();
         if (self.copymode_pane == pane) self.exitCopyMode();
@@ -2286,6 +2301,7 @@ pub const Window = struct {
                 break;
             }
         }
+        self.syncWindowGraphicsOffload();
     }
 
     /// Sever a pane from the window before teardown: disown it, fence
@@ -2368,6 +2384,9 @@ pub const Window = struct {
             return;
         };
         src.disownPane(pane);
+        // A dialog in the source window may have marked this widget for
+        // re-enable on close. It no longer belongs to that widget tree.
+        pane.clearGraphicsOffloadSuspension();
         self.panes.appendAssumeCapacity(pane);
         self.terminals.appendAssumeCapacity(pane.terminal);
         self.wirePaneSinks(pane);

@@ -46,6 +46,7 @@ const Ctx = struct {
     dir_copy: ?[]u8 = null,
     preview_source: shader_pass.Source = .{},
     preview_pass: shader_pass.ShaderPass = .{},
+    preview_compile_ok: bool = false,
     dummy_tex: c_uint = 0,
     epoch_us: i64 = 0,
     tick_id: c_uint = 0,
@@ -450,7 +451,7 @@ fn updatePresetButtons(ctx: *Ctx) void {
                 if (shader_preset.validName(name)) valid = 1;
             }
         }
-        c.gtk_widget_set_sensitive(b, valid);
+        c.gtk_widget_set_sensitive(b, if (ctx.preview_compile_ok) valid else 0);
     }
 }
 
@@ -580,20 +581,28 @@ fn onSavePresetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         };
         n += 1;
     }
+    // Save the shader's OWN animate flag, not the global setting: a
+    // preset must reproduce the behaviour the preview showed. The
+    // preview compiled this exact source; refuse to persist a preset
+    // whose shader does not compile.
+    const animate = pane.surface.shaderRequestsAnimation();
+    if (!ctx.preview_compile_ok) return;
+    // Bind the pane to the preset it is about to save, so layout
+    // persistence records the name and further slider edits stay
+    // per-pane. The pane may be riding the global default shader —
+    // give it its own pick first or the overrides have no effect.
+    // Binding before saving means an unreadable shader file never
+    // persists a preset pointing at it.
+    if (!pane.setCustomShader(path, animate, true)) return;
     shader_preset.save(ctx.allocator, .{
         .name = name,
         .shader_path = path,
-        .animate = ctx.win.config.custom_shader_animation,
+        .animate = animate,
         .params = kvs[0..n],
     }) catch |err| {
         std.debug.print("sketerm: preset save failed: {s}\n", .{@errorName(err)});
         return;
     };
-    // Bind the pane to the preset it just saved, so layout
-    // persistence records the name and further slider edits stay
-    // per-pane. The pane may be riding the global default shader —
-    // give it its own pick first or the overrides have no effect.
-    if (!pane.setCustomShader(path, ctx.win.config.custom_shader_animation, true)) return;
     pane.applyShaderPresetParams(name, kvs[0..n]);
 
     // Make sure the dropdown lists the (possibly new) name and
@@ -773,7 +782,12 @@ fn onPreviewRender(area: *c.GtkGLArea, _: *c.GdkGLContext, user: ?*anyopaque) ca
     ctx.preview_source.overrides = effectiveOverrides(ctx);
 
     const sp = &ctx.preview_pass;
-    if (!sp.ensureProgram(ctx.allocator)) return 1;
+    const compiled = sp.ensureProgram(ctx.allocator);
+    if (compiled != ctx.preview_compile_ok) {
+        ctx.preview_compile_ok = compiled;
+        updatePresetButtons(ctx);
+    }
+    if (!compiled) return 1;
     c.glGetIntegerv(c.GL_DRAW_FRAMEBUFFER_BINDING, &sp.prev_fbo);
     sp.tex = ctx.dummy_tex;
     const now = c.g_get_monotonic_time();
