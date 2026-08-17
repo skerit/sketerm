@@ -1301,53 +1301,100 @@ pub const Screen = struct {
     /// re-chunked at new_cols, redistributed). The alt buffer always
     /// truncates/pads — apps that use it (vim, less, htop) handle
     /// their own resize. Cursor is re-placed at its logical position.
+    ///
+    /// Failure-atomic: every allocation is staged before anything
+    /// observable changes, so an OOM leaves the screen exactly as it
+    /// was. It has to be — `cellAt` indexes rows unchecked, so a
+    /// half-applied resize (rows at the new width, `cols` still at the
+    /// old one, or the two buffers disagreeing) is an out-of-bounds
+    /// write on the next print, not a degraded display.
     pub fn resize(self: *Screen, new_cols: u16, new_rows: u16) !void {
         if (new_cols == self.cols and new_rows == self.rows) return;
-        self.viewport_epoch +%= 1;
 
         const cols_changed = new_cols != self.cols;
-        if (cols_changed and !self.use_alt) {
-            // reflowMain remaps active (row, col)-keyed clusters itself.
+        // reflowMain remaps active (row, col)-keyed clusters itself and
+        // is failure-atomic on its own; every other buffer is staged.
+        const reflow_main = cols_changed and !self.use_alt;
+
+        // ── Stage ────────────────────────────────────────────────
+        var staged_active: ?StagedBuffer = null;
+        errdefer if (staged_active) |*s| s.abort(self.allocator);
+        if (!reflow_main) {
+            staged_active = try StagedBuffer.stage(self.allocator, self.active, new_cols, new_rows);
+        }
+
+        var staged_alt: ?StagedBuffer = null;
+        errdefer if (staged_alt) |*s| s.abort(self.allocator);
+        if (self.alt) |alt_buf| {
+            // The alt buffer always truncates/pads — apps that use it
+            // handle their own resize.
+            staged_alt = try StagedBuffer.stage(self.allocator, alt_buf, new_cols, new_rows);
+        }
+
+        // While the alternate screen is active, the main buffer is resized
+        // without reflow. Its scrollback must follow the new width too:
+        // evicted scrollback cell slices are reused as active rows by the
+        // scroll hot path after returning to the main screen.
+        const restage_scrollback = cols_changed and self.use_alt and self.scrollback.items.len > 0;
+        var staged_sb: [][]Cell = &.{};
+        var staged_sb_ready: usize = 0;
+        errdefer if (staged_sb.len > 0) {
+            for (staged_sb[0..staged_sb_ready]) |cells| self.allocator.free(cells);
+            self.allocator.free(staged_sb);
+        };
+        if (restage_scrollback) {
+            staged_sb = try self.allocator.alloc([]Cell, self.scrollback.items.len);
+            while (staged_sb_ready < staged_sb.len) : (staged_sb_ready += 1) {
+                staged_sb[staged_sb_ready] = try copyCells(
+                    self.allocator,
+                    self.scrollback.items[staged_sb_ready].cells,
+                    new_cols,
+                );
+            }
+        }
+
+        // ── Commit ───────────────────────────────────────────────
+        self.viewport_epoch +%= 1;
+        if (reflow_main) {
             self.reflowMain(new_cols, new_rows) catch |err| {
                 self.viewport_epoch -%= 1;
                 return err;
             };
         } else {
-            // resizeBuffer truncates/pads each line and shifts cells to
-            // new (row, col) positions (column resize, and row-count
-            // changes move cells to new row indices). The cluster map is
-            // keyed by (row, col), so drop it wholesale — same coarse
-            // approach reflowMain takes. Covers the main-buffer
-            // truncate/pad path and the alt buffer below.
+            // The truncate/pad path shifts cells to new (row, col)
+            // positions (column resize, and row-count changes move cells
+            // to new row indices). The cluster map is keyed by (row, col)
+            // in the CURRENT buffer, so drop it wholesale — same coarse
+            // approach reflowMain takes. The alt commit below must NOT
+            // repeat this: when reflowMain ran it just remapped those
+            // keys, and they describe the main buffer, not the alt one.
             self.clearAllClusters();
-            try resizeBuffer(self.allocator, &self.active, self.rows, new_cols, new_rows, !self.use_alt, self);
-            // resizeBuffer's shrink branch drops rows from the TOP and
-            // shifts surviving content up — move the cursor with its
-            // line, or it ends up pointing rows below the content it
-            // was on (the clamp below alone is not enough).
+            // The shrink branch drops rows from the TOP and shifts
+            // surviving content up — move the cursor with its line, or it
+            // ends up pointing rows below the content it was on (the
+            // clamp below alone is not enough).
             if (new_rows < self.rows) {
                 const drop = self.rows - new_rows;
                 self.row -|= drop;
                 self.saved_row -|= drop;
             }
+            staged_active.?.commit(self, &self.active, !self.use_alt);
+            staged_active = null;
         }
-        if (self.alt) |alt_buf| {
-            var alt_mut = alt_buf;
-            // Alt buffer always truncates/pads via resizeBuffer; if the
-            // reflowMain branch ran above, the cluster map is already
-            // cleared, so this is at worst a no-op fast-path return.
-            self.clearAllClusters();
-            try resizeBuffer(self.allocator, &alt_mut, self.rows, new_cols, new_rows, false, self);
+        if (staged_alt) |*staged| {
+            var alt_mut = self.alt.?;
+            staged.commit(self, &alt_mut, false);
             self.alt = alt_mut;
+            staged_alt = null;
         }
-        // While the alternate screen is active, the main buffer is resized
-        // without reflow. Its scrollback must follow the new width too:
-        // evicted scrollback cell slices are reused as active rows by the
-        // scroll hot path after returning to the main screen.
-        if (cols_changed and self.use_alt) {
-            for (self.scrollback.items) |*ln| {
-                try resizeLineCells(self.allocator, ln, new_cols);
+        if (staged_sb.len > 0) {
+            for (self.scrollback.items, staged_sb) |*ln, cells| {
+                if (ln.cells.len > 0) self.allocator.free(ln.cells);
+                ln.cells = cells;
+                ln.dirty = true;
             }
+            self.allocator.free(staged_sb);
+            staged_sb = &.{};
         }
 
         self.resizeTabStops(new_cols);
@@ -1540,55 +1587,103 @@ pub const Screen = struct {
         old_scrollback.deinit(self.allocator);
     }
 
-    fn resizeBuffer(
-        allocator: std.mem.Allocator,
-        slot: *[]Line,
-        old_rows: u16,
-        new_cols: u16,
-        new_rows: u16,
-        push_to_sb: bool,
-        screen: *Screen,
-    ) !void {
-        // First, resize each line's cells to new width.
-        for (slot.*) |*ln| {
-            try resizeLineCells(allocator, ln, new_cols);
+    /// A row's cells re-laid at `new_cols`, truncating or blank-padding.
+    fn copyCells(allocator: std.mem.Allocator, src: []const Cell, new_cols: u16) ![]Cell {
+        const cells = try allocator.alloc(Cell, new_cols);
+        @memset(cells, .{});
+        const n = @min(src.len, @as(usize, new_cols));
+        @memcpy(cells[0..n], src[0..n]);
+        return cells;
+    }
+
+    /// A complete truncate/pad replacement for one line buffer, built off
+    /// to the side.
+    ///
+    /// `stage` performs every allocation the swap needs and touches
+    /// nothing the `Screen` owns, so it can fail freely; `commit` is
+    /// allocation-free and therefore cannot. This is what makes a resize
+    /// that runs out of memory a no-op rather than a screen whose rows
+    /// and `cols` disagree.
+    const StagedBuffer = struct {
+        /// The replacement buffer, `new_rows` lines at `new_cols`.
+        rows: []Line,
+        /// Lines shifted off the TOP by a row-count shrink, already at
+        /// the new width, awaiting a scrollback push or a free.
+        dropped: []Line,
+        /// Index in `rows` from which lines are freshly minted padding
+        /// and need an ID stamped at commit — IDs come from the Screen's
+        /// counter, which staging must not advance.
+        fresh_from: usize,
+
+        fn stage(
+            allocator: std.mem.Allocator,
+            src: []const Line,
+            new_cols: u16,
+            new_rows: u16,
+        ) !StagedBuffer {
+            const drop = if (src.len > new_rows) src.len - new_rows else 0;
+            const keep = src.len - drop;
+
+            const rows = try allocator.alloc(Line, new_rows);
+            var rows_ready: usize = 0;
+            errdefer {
+                for (rows[0..rows_ready]) |*ln| ln.deinit(allocator);
+                allocator.free(rows);
+            }
+            const dropped = try allocator.alloc(Line, drop);
+            var dropped_ready: usize = 0;
+            errdefer {
+                for (dropped[0..dropped_ready]) |*ln| ln.deinit(allocator);
+                allocator.free(dropped);
+            }
+
+            while (dropped_ready < drop) : (dropped_ready += 1) {
+                dropped[dropped_ready] = try stageLine(allocator, src[dropped_ready], new_cols);
+            }
+            while (rows_ready < keep) : (rows_ready += 1) {
+                rows[rows_ready] = try stageLine(allocator, src[drop + rows_ready], new_cols);
+            }
+            while (rows_ready < new_rows) : (rows_ready += 1) {
+                rows[rows_ready] = try Line.init(allocator, new_cols);
+            }
+            return .{ .rows = rows, .dropped = dropped, .fresh_from = keep };
         }
 
-        // Then adjust row count.
-        if (new_rows > old_rows) {
-            const new_buf = try allocator.realloc(slot.*, new_rows);
-            var i: u16 = old_rows;
-            while (i < new_rows) : (i += 1) {
-                new_buf[i] = try Line.init(allocator, new_cols);
-                new_buf[i].id = screen.nextLineId();
-            }
-            slot.* = new_buf;
-        } else if (new_rows < old_rows) {
-            const drop = old_rows - new_rows;
-            var i: u16 = 0;
-            while (i < drop) : (i += 1) {
+        fn stageLine(allocator: std.mem.Allocator, src: Line, new_cols: u16) !Line {
+            var out = src;
+            out.cells = try copyCells(allocator, src.cells, new_cols);
+            if (src.cells.len != new_cols) out.dirty = true;
+            return out;
+        }
+
+        /// Releases the staged buffer without disturbing the Screen.
+        fn abort(self: *StagedBuffer, allocator: std.mem.Allocator) void {
+            for (self.rows) |*ln| ln.deinit(allocator);
+            allocator.free(self.rows);
+            for (self.dropped) |*ln| ln.deinit(allocator);
+            allocator.free(self.dropped);
+        }
+
+        /// Installs the staged buffer into `slot`, freeing what was
+        /// there. `push_to_sb` hands rows dropped off the top to
+        /// scrollback, which absorbs its own allocation failure by
+        /// dropping the line — every step here is infallible.
+        fn commit(self: *StagedBuffer, screen: *Screen, slot: *[]Line, push_to_sb: bool) void {
+            for (self.rows[self.fresh_from..]) |*ln| ln.id = screen.nextLineId();
+            for (slot.*) |*ln| ln.deinit(screen.allocator);
+            screen.allocator.free(slot.*);
+            slot.* = self.rows;
+            for (self.dropped) |*ln| {
                 if (push_to_sb) {
-                    const copy = allocator.dupe(Cell, slot.*[i].cells) catch null;
-                    if (copy) |cells| screen.pushScrollback(cells, slot.*[i].id, slot.*[i].continues_above);
+                    screen.pushScrollback(ln.cells, ln.id, ln.continues_above);
+                    ln.cells = &.{};
+                } else {
+                    ln.deinit(screen.allocator);
                 }
-                slot.*[i].deinit(allocator);
             }
-            std.mem.copyForwards(Line, slot.*[0..new_rows], slot.*[drop..]);
-            const new_buf = try allocator.realloc(slot.*, new_rows);
-            slot.* = new_buf;
+            screen.allocator.free(self.dropped);
         }
-    }
-
-    fn resizeLineCells(allocator: std.mem.Allocator, ln: *Line, new_cols: u16) !void {
-        if (ln.cells.len == new_cols) return;
-        const new_cells = try allocator.alloc(Cell, new_cols);
-        @memset(new_cells, .{});
-        const n = @min(ln.cells.len, @as(usize, new_cols));
-        @memcpy(new_cells[0..n], ln.cells[0..n]);
-        if (ln.cells.len > 0) allocator.free(ln.cells);
-        ln.cells = new_cells;
-        ln.dirty = true;
-    }
+    };
 
     pub const ScrollbackPush = union(enum) {
         /// Scrollback took ownership without returning a buffer.
@@ -4471,6 +4566,13 @@ const ScrollFailureScenario = enum {
 const ReflowFailureScenario = enum {
     active_padding,
     scrollback,
+    /// Main buffer reflows while an alt buffer merely EXISTS — the state
+    /// every pane that has ever run vim is in, since the alt buffer is
+    /// allocated on first use and never freed.
+    alt_allocated,
+    /// Alt screen is active: both buffers truncate/pad and the main
+    /// buffer's scrollback has to follow the new width too.
+    alt_active,
 };
 
 const ScrollLineState = struct {
@@ -4553,6 +4655,10 @@ const ReflowState = struct {
     active: [max_lines]ScrollLineState = undefined,
     active_ptr: usize,
     active_len: usize,
+    alt: [max_lines]ScrollLineState = undefined,
+    alt_ptr: usize,
+    alt_len: usize,
+    use_alt: bool,
     scrollback: [max_lines]ScrollLineState = undefined,
     scrollback_ptr: usize,
     scrollback_len: usize,
@@ -4592,6 +4698,9 @@ const ReflowState = struct {
         var state = ReflowState{
             .active_ptr = @intFromPtr(screen.active.ptr),
             .active_len = screen.active.len,
+            .alt_ptr = if (screen.alt) |alt| @intFromPtr(alt.ptr) else 0,
+            .alt_len = if (screen.alt) |alt| alt.len else 0,
+            .use_alt = screen.use_alt,
             .scrollback_ptr = @intFromPtr(screen.scrollback.items.ptr),
             .scrollback_len = screen.scrollback.items.len,
             .scrollback_alloc_capacity = screen.scrollback.capacity,
@@ -4620,6 +4729,9 @@ const ReflowState = struct {
             .tab_stops_hash = tabs_hasher.final(),
         };
         for (screen.active, 0..) |line, i| state.active[i] = ScrollLineState.capture(line);
+        if (screen.alt) |alt| for (alt, 0..) |line, i| {
+            state.alt[i] = ScrollLineState.capture(line);
+        };
         for (screen.scrollback.items, 0..) |line, i| state.scrollback[i] = ScrollLineState.capture(line);
         return state;
     }
@@ -4627,6 +4739,12 @@ const ReflowState = struct {
     fn expectUnchanged(expected: ReflowState, screen: *Screen) !void {
         try std.testing.expectEqual(expected.active_ptr, @intFromPtr(screen.active.ptr));
         try std.testing.expectEqual(expected.active_len, screen.active.len);
+        try std.testing.expectEqual(expected.use_alt, screen.use_alt);
+        try std.testing.expectEqual(expected.alt_ptr, if (screen.alt) |alt| @intFromPtr(alt.ptr) else 0);
+        try std.testing.expectEqual(expected.alt_len, if (screen.alt) |alt| alt.len else 0);
+        if (screen.alt) |alt| for (alt, 0..) |line, i| {
+            try expected.alt[i].expectEqual(line);
+        };
         try std.testing.expectEqual(expected.scrollback_ptr, @intFromPtr(screen.scrollback.items.ptr));
         try std.testing.expectEqual(expected.scrollback_len, screen.scrollback.items.len);
         try std.testing.expectEqual(expected.scrollback_alloc_capacity, screen.scrollback.capacity);
@@ -4665,8 +4783,17 @@ const ReflowState = struct {
 
 fn reflowScenarioDimensions(scenario: ReflowFailureScenario) struct { old_cols: u16, old_rows: u16, new_cols: u16, new_rows: u16 } {
     return switch (scenario) {
-        .active_padding => .{ .old_cols = 12, .old_rows = 4, .new_cols = 6, .new_rows = 6 },
-        .scrollback => .{ .old_cols = 6, .old_rows = 3, .new_cols = 3, .new_rows = 2 },
+        .active_padding, .alt_allocated => .{ .old_cols = 12, .old_rows = 4, .new_cols = 6, .new_rows = 6 },
+        .scrollback, .alt_active => .{ .old_cols = 6, .old_rows = 3, .new_cols = 3, .new_rows = 2 },
+    };
+}
+
+fn altReflowRow(i: usize) []const u8 {
+    return switch (i) {
+        0 => "vim1",
+        1 => "vim2",
+        2 => "vim3",
+        else => "vim4",
     };
 }
 
@@ -4680,14 +4807,14 @@ fn setReflowTestLine(line: *Line, text: []const u8, continues_above: bool, scali
 
 fn prepareReflowFailureScreen(screen: *Screen, scenario: ReflowFailureScenario) !void {
     switch (scenario) {
-        .active_padding => {
+        .active_padding, .alt_allocated => {
             try screen.setScrollbackCapacity(4);
             setReflowTestLine(&screen.active[0], "abc", false, .dwl);
             setReflowTestLine(&screen.active[1], "def", false, .dhl_top);
             setReflowTestLine(&screen.active[2], "", false, .dhl_bot);
             setReflowTestLine(&screen.active[3], "", false, .single);
         },
-        .scrollback => {
+        .scrollback, .alt_active => {
             try screen.setScrollbackCapacity(2);
             for ("abc") |rune| try pushScrollbackRune(screen, rune);
             setReflowTestLine(&screen.active[0], "ABCDEF", false, .dwl);
@@ -4695,10 +4822,19 @@ fn prepareReflowFailureScreen(screen: *Screen, scenario: ReflowFailureScenario) 
             setReflowTestLine(&screen.active[2], "MNOPQR", false, .dhl_bot);
         },
     }
+    if (scenario == .alt_allocated or scenario == .alt_active) {
+        // Entering the alt screen once allocates the buffer for good;
+        // .alt_allocated leaves it behind the way a finished vim does.
+        screen.toggleAltScreen(true);
+        for (screen.alt.?, 0..) |*line, i| {
+            setReflowTestLine(line, altReflowRow(i), false, .single);
+        }
+        if (scenario == .alt_allocated) screen.toggleAltScreen(false);
+    }
     screen.appendCluster(1, 1, 0x0301);
     screen.appendCluster(1, 1, 0x200D);
     screen.row = 1;
-    screen.col = if (scenario == .active_padding) 2 else 4;
+    screen.col = if (scenario == .active_padding or scenario == .alt_allocated) 2 else 4;
     screen.saved_row = 2;
     screen.saved_col = 1;
     screen.scroll_top = 1;
@@ -4716,14 +4852,47 @@ fn expectSuccessfulReflow(screen: *Screen, scenario: ReflowFailureScenario, old_
     try std.testing.expectEqual(@as(u32, 42), screen.viewport_epoch);
     try expectScreenBuffersUnique(screen);
     switch (scenario) {
-        .active_padding => {
+        .active_padding, .alt_allocated => {
+            // A reflow keeps the (row, col)-keyed clusters it remapped —
+            // an alt buffer merely existing must not wipe them.
             try std.testing.expectEqual(@as(usize, 1), screen.clusters.count());
             try std.testing.expectEqualSlices(u32, &.{ 0x0301, 0x200D }, screen.clusterAt(1, 1));
             try std.testing.expectEqual(@as(u32, 0), screen.scrollbackCount());
             try std.testing.expectEqual(@as(u32, 'a'), screen.active[0].cells[0].rune);
             try std.testing.expectEqual(@as(u32, 'f'), screen.active[1].cells[2].rune);
             for (screen.active[2..]) |line| try std.testing.expectEqual(@as(u32, 0), line.cells[0].rune);
-            try std.testing.expectEqual(old_next_line_id + 6, screen.next_line_id);
+            if (scenario == .active_padding) {
+                try std.testing.expect(screen.alt == null);
+                try std.testing.expectEqual(old_next_line_id + 6, screen.next_line_id);
+            } else {
+                // The alt buffer grew 4 -> 6 rows, so two padding lines
+                // took IDs after the six the reflow minted.
+                try std.testing.expectEqual(old_next_line_id + 8, screen.next_line_id);
+                const alt = screen.alt.?;
+                try std.testing.expectEqual(@as(usize, 6), alt.len);
+                try std.testing.expectEqualStrings("vim1", altReflowRow(0));
+                try std.testing.expectEqual(@as(u32, 'v'), alt[0].cells[0].rune);
+                try std.testing.expectEqual(@as(u32, '4'), alt[3].cells[3].rune);
+                for (alt[4..]) |line| try std.testing.expectEqual(@as(u32, 0), line.cells[0].rune);
+            }
+        },
+        .alt_active => {
+            // Truncate/pad invalidates (row, col) keys in the buffer the
+            // clusters describe, so they go wholesale.
+            try std.testing.expectEqual(@as(usize, 0), screen.clusters.count());
+            try std.testing.expectEqual(old_next_line_id, screen.next_line_id);
+            // Main buffer: top row dropped (no scrollback push while the
+            // alt screen is up), survivors truncated to 3 columns.
+            try std.testing.expectEqual(@as(u32, 'G'), screen.active[0].cells[0].rune);
+            try std.testing.expectEqual(@as(u32, 'I'), screen.active[0].cells[2].rune);
+            try std.testing.expectEqual(@as(u32, 'M'), screen.active[1].cells[0].rune);
+            // Scrollback followed the new width.
+            try expectScrollbackRunes(screen, "bc");
+            // Alt buffer: same truncate/pad, top row dropped.
+            const alt = screen.alt.?;
+            try std.testing.expectEqual(@as(usize, 2), alt.len);
+            try std.testing.expectEqual(@as(u32, 'v'), alt[0].cells[0].rune);
+            try std.testing.expectEqual(@as(u32, 'm'), alt[1].cells[2].rune);
         },
         .scrollback => {
             // Cluster storage only addresses active rows; this cell moved
@@ -4836,6 +5005,15 @@ fn prepareScrollFailureScreen(screen: *Screen, scenario: ScrollFailureScenario) 
 }
 
 fn expectScreenBuffersUnique(screen: *Screen) !void {
+    if (screen.alt) |alt| {
+        try std.testing.expectEqual(@as(usize, screen.rows), alt.len);
+        for (alt, 0..) |line, i| {
+            try std.testing.expectEqual(@as(usize, screen.cols), line.cells.len);
+            for (alt[i + 1 ..]) |other| try std.testing.expect(line.cells.ptr != other.cells.ptr);
+            for (screen.active) |other| try std.testing.expect(line.cells.ptr != other.cells.ptr);
+            for (screen.scrollback.items) |other| try std.testing.expect(line.cells.ptr != other.cells.ptr);
+        }
+    }
     for (screen.active, 0..) |line, i| {
         try std.testing.expectEqual(@as(usize, screen.cols), line.cells.len);
         for (screen.active[i + 1 ..]) |other| try std.testing.expect(line.cells.ptr != other.cells.ptr);
@@ -5145,6 +5323,14 @@ test "reflow active-padding allocation failures preserve ownership" {
 
 test "reflow scrollback allocation failures preserve ownership" {
     try expectAllReflowAllocationFailures(.scrollback);
+}
+
+test "reflow with an allocated alt buffer preserves ownership on failure" {
+    try expectAllReflowAllocationFailures(.alt_allocated);
+}
+
+test "resize under the alt screen preserves ownership on failure" {
+    try expectAllReflowAllocationFailures(.alt_active);
 }
 
 test "scrollback capacity grow then shrink keeps newest lines" {
