@@ -341,6 +341,10 @@ pub fn scopeDir(allocator: std.mem.Allocator, scope: Scope) Error![]u8 {
 /// Name the socket path a hash directory came from, so `panels/by-origin`
 /// is readable by a human. Best effort and never read back: it is a label,
 /// not a validation record, and a failure to write it must not fail a save.
+///
+/// It names a socket path, so it gets the same 0600 as everything else this
+/// store writes: a user running `umask 077` had a private marker before the
+/// shared writer arrived, and must not be handed a world-readable one now.
 fn noteOriginPath(allocator: std.mem.Allocator, origin: OriginScope) void {
     const root = panelsRoot(allocator) catch return;
     defer allocator.free(root);
@@ -351,7 +355,7 @@ fn noteOriginPath(allocator: std.mem.Allocator, origin: OriginScope) void {
     defer allocator.free(marker);
     if (fileExists(marker)) return;
     pathz.makeParentDirs(marker) catch return;
-    atomicwrite.writeFileExact(marker, origin.daemon_origin, 0o644) catch {};
+    atomicwrite.writeFileExact(marker, origin.daemon_origin, 0o600) catch {};
 }
 
 fn panelPathScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8, diag: ?*Diag) Error![]u8 {
@@ -1052,6 +1056,20 @@ test "origin-qualified stores isolate daemons and survive session rename" {
     var after_rename = try loadScoped(t.allocator, renamed, "same", null);
     defer after_rename.deinit();
     try t.expectEqualStrings("Daemon A", after_rename.title);
+
+    // The origin marker names a socket path and is as private as the
+    // panels beside it, whatever umask the process happens to run under.
+    const root = try panelsRoot(t.allocator);
+    defer t.allocator.free(root);
+    const hash = originHash(origin_a.origin.daemon_origin);
+    const marker = try std.fmt.allocPrint(t.allocator, "{s}/{s}/{s}/origin", .{
+        root, BY_ORIGIN_DIR, &hash,
+    });
+    defer t.allocator.free(marker);
+    var marker_z: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    try t.expect(c.lstat(try pathz.pathZ(&marker_z, marker), &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
 }
 
 test "same-name session reincarnations have isolated lifetime stores" {

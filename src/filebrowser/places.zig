@@ -215,12 +215,14 @@ pub fn save(allocator: std.mem.Allocator, p: Places) !void {
     try saveToPath(allocator, path, p);
 }
 
+/// The app owns this file, so its mode is FORCED: a copy an older build
+/// created 0644 must be narrowed, not preserved forever.
 fn saveToPath(allocator: std.mem.Allocator, path: []const u8, p: Places) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try std.json.Stringify.value(p, .{}, &out.writer);
     try pathz.makeParentDirs(path);
-    try atomicwrite.writeFile(path, out.written(), 0o600);
+    try atomicwrite.writeFileExact(path, out.written(), 0o600);
 }
 
 /// Front-insert `spec` into an owned-string list, deduping and

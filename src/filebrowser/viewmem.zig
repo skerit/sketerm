@@ -263,11 +263,13 @@ pub const Store = struct {
         try self.saveToPath(path);
     }
 
+    /// The app owns this file, so its mode is FORCED: a copy an older
+    /// build created 0644 must be narrowed, not preserved forever.
     fn saveToPath(self: *const Store, path: []const u8) !void {
         const json = try self.encode(self.allocator);
         defer self.allocator.free(json);
         try pathz.makeParentDirs(path);
-        try atomicwrite.writeFile(path, json, 0o600);
+        try atomicwrite.writeFileExact(path, json, 0o600);
     }
 };
 

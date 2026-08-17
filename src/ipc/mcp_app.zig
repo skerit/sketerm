@@ -63,8 +63,9 @@ const appErr = mcp.appErr;
 const argFloat = mcp.argFloat;
 const argInt = mcp.argInt;
 
+/// The caller named this path, so an existing file keeps its own mode.
 fn saveRecording(path: []const u8, bytes: []const u8) atomicwrite.Error!void {
-    try atomicwrite.writeFileExact(path, bytes, 0o600);
+    try atomicwrite.writeFile(path, bytes, 0o600);
 }
 
 pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {

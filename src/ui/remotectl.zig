@@ -22,8 +22,9 @@ const Window = winmod.Window;
 /// Process-global pane-id counter (ids are global across windows).
 var next_pane_id: u32 = 1;
 
+/// The caller named this path, so an existing file keeps its own mode.
 fn saveScreenshot(path: []const u8, bytes: []const u8) atomicwrite.Error!void {
-    try atomicwrite.writeFileExact(path, bytes, 0o600);
+    try atomicwrite.writeFile(path, bytes, 0o600);
 }
 
 pub fn allocPaneId(_: *Window) u32 {

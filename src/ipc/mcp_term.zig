@@ -153,13 +153,17 @@ test "validShellName" {
     try t.expect(!validShellName("../../bin/sh"));
 }
 
-/// Write bytes to an absolute local path; false on any failure.
+/// Write bytes to an absolute local path the CALLER named; false on any failure.
+///
+/// A fresh file is private, but an existing one keeps its own mode: this is
+/// the user's path, and clamping `output_file=/srv/www/build.log` back to
+/// 0600 on every write makes the server that reads it start returning 403.
 pub fn writeFileBytes(path: []const u8, bytes: []const u8) bool {
-    atomicwrite.writeFileExact(path, bytes, 0o600) catch return false;
+    atomicwrite.writeFile(path, bytes, 0o600) catch return false;
     return true;
 }
 
-test "term output files use private complete replacement" {
+test "term output files are created private and keep the user's mode" {
     const t = std.testing;
     var tmpl = "/tmp/sketerm-term-output-XXXXXX".*;
     const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
@@ -172,10 +176,14 @@ test "term output files use private complete replacement" {
     defer _ = c.unlink(path_z.ptr);
 
     try t.expect(writeFileBytes(path, "first"));
-    try t.expect(writeFileBytes(path, "second-and-complete"));
     var st: c.struct_stat = undefined;
     try t.expect(c.stat(path_z.ptr, &st) == 0);
     try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+
+    try t.expect(c.chmod(path_z.ptr, @as(c.mode_t, 0o644)) == 0);
+    try t.expect(writeFileBytes(path, "second-and-complete"));
+    try t.expect(c.stat(path_z.ptr, &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o644), @as(c_uint, @intCast(st.st_mode & 0o777)));
 }
 
 pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {

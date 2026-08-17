@@ -60,12 +60,14 @@ fn save(allocator: std.mem.Allocator, f: File) !void {
     try saveToPath(allocator, path, f);
 }
 
+/// The app owns this file, so its mode is FORCED: a copy an older build
+/// created 0644 must be narrowed, not preserved forever.
 fn saveToPath(allocator: std.mem.Allocator, path: []const u8, f: File) !void {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     try std.json.Stringify.value(f, .{}, &out.writer);
     try pathz.makeParentDirs(path);
-    try atomicwrite.writeFile(path, out.written(), 0o600);
+    try atomicwrite.writeFileExact(path, out.written(), 0o600);
 }
 
 fn eql(e: Entry, src_host: []const u8, src: []const u8, dst_host: []const u8, dst: []const u8) bool {
@@ -136,6 +138,14 @@ test "incomplete-copy save replaces and loads the complete list" {
         .{ .src_host = "box", .src = "/two", .dst = "/other" },
     };
     try saveToPath(t.allocator, path, .{ .incomplete = &second });
+
+    // The app owns this file, so a copy an older build left world-readable
+    // must be narrowed on the next save, not preserved forever.
+    try t.expect(c.chmod(path_z.ptr, @as(c.mode_t, 0o644)) == 0);
+    try saveToPath(t.allocator, path, .{ .incomplete = &second });
+    var st: c.struct_stat = undefined;
+    try t.expect(c.stat(path_z.ptr, &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
 
     const loaded = loadFromPath(t.allocator, path) orelse return error.TestUnexpectedResult;
     defer loaded.deinit();
