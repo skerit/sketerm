@@ -235,11 +235,20 @@ fn writeFileWithOps(
     while (off < bytes.len) {
         const n = ops.write(fd, bytes.ptr + off, bytes.len - off);
         if (n < 0 and std.c._errno().* == c.EINTR) continue;
-        if (n <= 0) return syscallError(error.WriteFailed);
+        if (n < 0) return syscallError(error.WriteFailed);
+        // A zero-length write is not an error, so errno still holds
+        // whatever an earlier call left there; classifying it would
+        // invent a NotFound/PermissionDenied that never happened.
+        if (n == 0) return error.WriteFailed;
         off += @intCast(n);
     }
-    if (sync_policy == .durable and ops.fsync(fd) != 0)
-        return syscallError(error.DataSyncFailed);
+    // A signal during fsync must not discard a fully written stage.
+    if (sync_policy == .durable) {
+        while (ops.fsync(fd) != 0) {
+            if (std.c._errno().* == c.EINTR) continue;
+            return syscallError(error.DataSyncFailed);
+        }
+    }
 
     stage_open = false;
     if (ops.close(fd) != 0) return syscallError(error.CloseFailed);
@@ -259,6 +268,7 @@ const FaultOps = struct {
     short_write: usize = std.math.maxInt(usize),
     fail_write_after: ?usize = null,
     fail_data_sync: bool = false,
+    eintr_data_syncs: usize = 0,
     fail_parent_sync: bool = false,
     fail_rename: bool = false,
     collide_once: bool = false,
@@ -334,6 +344,10 @@ const FaultOps = struct {
             }
         } else if (self.fail_data_sync) {
             std.c._errno().* = c.EIO;
+            return -1;
+        } else if (self.eintr_data_syncs > 0) {
+            self.eintr_data_syncs -= 1;
+            std.c._errno().* = c.EINTR;
             return -1;
         } else {
             self.data_syncs += 1;
@@ -552,6 +566,40 @@ test "write and data-sync failures preserve the old file and clean the stage" {
     try std.testing.expectError(error.DataSyncFailed, writeFileWithOps(&sync_ops, path, "new-unsynced", 0o600, .durable, .preserve_existing));
     try std.testing.expect(c.lstat(sync_ops.lastStage().ptr, &st) != 0);
     try std.testing.expectEqualStrings("old-valid", try readTestFile(path, &got));
+}
+
+test "an interrupted data sync is retried and a stalled write is not misclassified" {
+    var tmpl = "/tmp/sketerm-atomicwrite-eintr-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    var eintr_ops: FaultOps = .{ .eintr_data_syncs = 2 };
+    try writeFileWithOps(&eintr_ops, path, "survives a signal", 0o600, .durable, .preserve_existing);
+    var got: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("survives a signal", try readTestFile(path, &got));
+    try std.testing.expectEqual(@as(usize, 1), eintr_ops.data_syncs);
+
+    // The destination's lstat leaves ENOENT in errno; a write that returns
+    // zero must not be reported through it as though the path were missing.
+    var missing_buf: [512]u8 = undefined;
+    const missing = try std.fmt.bufPrint(&missing_buf, "{s}/fresh.json", .{base});
+    var stall_ops: FaultOps = .{ .short_write = 0 };
+    try std.testing.expectError(error.WriteFailed, writeFileWithOps(
+        &stall_ops,
+        missing,
+        "never lands",
+        0o600,
+        .durable,
+        .preserve_existing,
+    ));
+    var st: c.struct_stat = undefined;
+    try std.testing.expect(c.lstat(stall_ops.lastStage().ptr, &st) != 0);
 }
 
 test "a failed parent sync reports the committed replacement as saved" {
