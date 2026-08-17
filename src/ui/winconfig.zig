@@ -18,6 +18,8 @@ const connectManualPopoverClose = winmod.connectManualPopoverClose;
 const isDarkBg = winmod.isDarkBg;
 const ProfileSettings = @import("../config.zig").ProfileSettings;
 const ColorScheme = @import("../config.zig").ColorScheme;
+const palette_default_256 = @import("../grid/palette.zig").default_256;
+const palette_default_ansi: [16][3]u8 = palette_default_256[0..16].*;
 
 const ProfileButtonCtx = struct {
     window: *Window,
@@ -404,14 +406,24 @@ pub fn applyPanePresentation(
 }
 
 /// Effective 16-colour palette for a settings bundle: explicit
-/// `palette` wins; `scheme` alone resolves through the built-in
-/// table; null = keep the built-in 256-table values.
-pub fn resolvePalette(s: *const @import("../config.zig").ProfileSettings) ?[16][3]u8 {
+/// `palette` wins, then `scheme`, then the built-in ANSI defaults.
+pub fn resolvePalette(s: *const @import("../config.zig").ProfileSettings) [16][3]u8 {
     if (s.palette) |p| return p;
     if (s.scheme.len > 0) {
         if (@import("../grid/schemes.zig").lookup(s.scheme)) |sch| return sch.palette;
     }
-    return null;
+    return palette_default_ansi;
+}
+
+/// Replace only the config-owned ANSI range in screen and renderer state.
+fn applyResolvedPalette(
+    screen_palette: *[256][3]u8,
+    renderer_palette: *[256][3]u8,
+    s: *const ProfileSettings,
+) void {
+    const palette = resolvePalette(s);
+    @memcpy(screen_palette[0..16], palette[0..]);
+    @memcpy(renderer_palette[0..16], palette[0..]);
 }
 
 /// Right-click → "New Tab as Profile…" picker. Opens a popover
@@ -736,15 +748,9 @@ pub fn pushPaneColors(self: *Window, pane: *Pane, s: *const ProfileSettings) voi
     pane.surface.grid_pass.default_bg = fg_bg.bg;
     pane.surface.cell_pass.default_fg = fg_bg.fg;
     pane.surface.cell_pass.default_bg = fg_bg.bg;
-    // Palette (16 ANSI colours). Entries 16..255 keep their built-in
-    // 256-table values.
-    if (resolvePalette(&eff)) |pal| {
-        var i: usize = 0;
-        while (i < 16) : (i += 1) {
-            screen.palette[i] = pal[i];
-            pane.surface.grid_pass.palette[i] = pal[i];
-        }
-    }
+    // Palette (16 ANSI colours). Runtime OSC changes outside this
+    // config-owned range remain untouched.
+    applyResolvedPalette(&screen.palette, &pane.surface.grid_pass.palette, &eff);
 }
 
 /// Open the preferences dialog. Live-applies changes via
@@ -1507,4 +1513,110 @@ pub fn resolveConfigSavePath(allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}/.config/sketerm/config.conf", .{home});
     }
     return error.NoConfigPath;
+}
+
+test "palette apply resets custom ANSI colors to built-in defaults" {
+    var screen_palette = palette_default_256;
+    var renderer_palette = palette_default_256;
+    var custom_palette: [16][3]u8 = undefined;
+    for (&custom_palette, 0..) |*entry, i| {
+        const channel: u8 = @intCast(i);
+        entry.* = .{ channel, 0x80, 0xff - channel };
+    }
+    const custom = ProfileSettings{ .palette = custom_palette };
+    applyResolvedPalette(&screen_palette, &renderer_palette, &custom);
+    try std.testing.expectEqual(custom_palette, screen_palette[0..16].*);
+    try std.testing.expectEqual(custom_palette, renderer_palette[0..16].*);
+
+    const defaults = ProfileSettings{};
+    applyResolvedPalette(&screen_palette, &renderer_palette, &defaults);
+    try std.testing.expectEqual(palette_default_ansi, screen_palette[0..16].*);
+    try std.testing.expectEqual(palette_default_ansi, renderer_palette[0..16].*);
+}
+
+test "palette apply switches complete live profile palettes" {
+    const schemes = @import("../grid/schemes.zig");
+    const solarized = schemes.lookup("solarized_dark").?.palette;
+    const nord = schemes.lookup("nord").?.palette;
+    const first = ProfileSettings{ .scheme = "solarized_dark" };
+    const second = ProfileSettings{ .scheme = "nord" };
+    var screen_palette = palette_default_256;
+    var renderer_palette = palette_default_256;
+
+    applyResolvedPalette(&screen_palette, &renderer_palette, &first);
+    try std.testing.expectEqual(solarized, screen_palette[0..16].*);
+    try std.testing.expectEqual(solarized, renderer_palette[0..16].*);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &second);
+    try std.testing.expectEqual(nord, screen_palette[0..16].*);
+    try std.testing.expectEqual(nord, renderer_palette[0..16].*);
+}
+
+test "palette apply resets a null light-dark variant to defaults" {
+    var light_palette: [16][3]u8 = undefined;
+    for (&light_palette, 0..) |*entry, i| {
+        const channel: u8 = @intCast(i);
+        entry.* = .{ 0xf0, channel, 0x20 };
+    }
+    var settings = ProfileSettings{};
+    settings.light.palette = light_palette;
+    var screen_palette = palette_default_256;
+    var renderer_palette = palette_default_256;
+
+    const light = settings.forScheme(.light);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &light);
+    try std.testing.expectEqual(light_palette, screen_palette[0..16].*);
+    const dark = settings.forScheme(.dark);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &dark);
+    try std.testing.expectEqual(palette_default_ansi, screen_palette[0..16].*);
+    try std.testing.expectEqual(palette_default_ansi, renderer_palette[0..16].*);
+}
+
+test "repeated palette reload is deterministic and preserves extended OSC colors" {
+    var custom_palette: [16][3]u8 = undefined;
+    for (&custom_palette, 0..) |*entry, i| {
+        const channel: u8 = @intCast(i);
+        entry.* = .{ 0x40, 0x70 + channel, 0xa0 };
+    }
+    const settings = ProfileSettings{ .palette = custom_palette };
+    var screen_palette = palette_default_256;
+    var renderer_palette = palette_default_256;
+    screen_palette[16] = .{ 1, 2, 3 };
+    screen_palette[200] = .{ 4, 5, 6 };
+    renderer_palette[16] = .{ 7, 8, 9 };
+    renderer_palette[200] = .{ 10, 11, 12 };
+
+    for (0..4) |iteration| {
+        const runtime: u8 = @intCast(iteration);
+        screen_palette[1] = .{ runtime, runtime, runtime };
+        renderer_palette[1] = .{ runtime, runtime, runtime };
+        applyResolvedPalette(&screen_palette, &renderer_palette, &settings);
+        try std.testing.expectEqual(custom_palette, screen_palette[0..16].*);
+        try std.testing.expectEqual(custom_palette, renderer_palette[0..16].*);
+        try std.testing.expectEqual([3]u8{ 1, 2, 3 }, screen_palette[16]);
+        try std.testing.expectEqual([3]u8{ 4, 5, 6 }, screen_palette[200]);
+        try std.testing.expectEqual([3]u8{ 7, 8, 9 }, renderer_palette[16]);
+        try std.testing.expectEqual([3]u8{ 10, 11, 12 }, renderer_palette[200]);
+    }
+}
+
+test "renderer color resolution observes restored ANSI defaults" {
+    var screen_palette = palette_default_256;
+    var renderer_palette = palette_default_256;
+    var custom_palette = palette_default_ansi;
+    custom_palette[1] = .{ 1, 2, 3 };
+    const custom = ProfileSettings{ .palette = custom_palette };
+    applyResolvedPalette(&screen_palette, &renderer_palette, &custom);
+    const defaults = ProfileSettings{};
+    applyResolvedPalette(&screen_palette, &renderer_palette, &defaults);
+
+    const style = @import("../render/style.zig");
+    const unused: [4]f32 = .{ 0, 0, 0, 1 };
+    const expected: [4]f32 = .{
+        @as(f32, @floatFromInt(palette_default_ansi[1][0])) / 255.0,
+        @as(f32, @floatFromInt(palette_default_ansi[1][1])) / 255.0,
+        @as(f32, @floatFromInt(palette_default_ansi[1][2])) / 255.0,
+        1.0,
+    };
+    try std.testing.expectEqual(expected, style.colorToRGBA(.{ .palette = 1 }, true, unused, unused, &screen_palette));
+    try std.testing.expectEqual(expected, style.colorToRGBA(.{ .palette = 1 }, true, unused, unused, &renderer_palette));
 }

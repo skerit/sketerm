@@ -810,6 +810,12 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_CONFIG_ONLY") != null) {
+        if (configReloadStage(allocator, sock_path, rt)) |why| return failMsg(why);
+        say("config: focused live in-place, rename-over, watcher, and repeated reload stage passed");
+        teardown();
+        return 0;
+    }
 
     // 1. list — exactly one tab with at least one pane.
     const list_resp = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return fail("list roundtrip");
