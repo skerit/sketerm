@@ -9,6 +9,7 @@ const c = @import("../c.zig").c;
 const muxclient = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 const snapshot = @import("../mux/snapshot.zig");
+const Event = @import("../parser/event.zig").Event;
 const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
 const wlpipe = @import("../wlhost/pipe.zig");
@@ -483,6 +484,7 @@ pub const App = struct {
     term_pool: ?*Pool = null,
     term_screen: ?*Screen = null,
     term_seq: u64 = 0,
+    term_desynced: bool = false,
     /// Connect target, kept for side connections (logGetFresh): the
     /// private-instance socket path and/or SSH host used at launch.
     local_sock: ?[]u8 = null,
@@ -895,24 +897,30 @@ pub const App = struct {
             a.destroy(p);
         }
         self.term_seq = restored.seq;
+        self.term_desynced = false;
         self.term_pool = restored.pool;
         self.term_screen = restored.screen;
+    }
+
+    fn applyTermEvent(screen: *Screen, ev: Event) void {
+        screen.apply(ev);
     }
 
     /// Apply an `.events` frame ([seq:u64][count:u32] + wire events)
     /// to the terminal mirror.
     fn applyTermEvents(self: *App, payload: []const u8) void {
-        if (payload.len < 12) return;
-        const base = std.mem.readInt(u64, payload[0..8], .little);
-        const n = std.mem.readInt(u32, payload[8..12], .little);
+        if (self.term_desynced) return;
         const screen = self.term_screen orelse return;
-        var r = wire.Reader.init(payload[12..]);
-        while (!r.atEnd()) {
-            var ev = r.getEvent(self.allocator) catch break;
-            screen.apply(ev);
-            ev.deinit(self.allocator);
-        }
-        self.term_seq = base + n;
+        self.term_seq = wire.applyEventFrame(
+            payload,
+            self.term_seq,
+            self.allocator,
+            screen,
+            applyTermEvent,
+        ) catch {
+            self.term_desynced = true;
+            return;
+        };
     }
 
     /// The app's PTY output (stdout+stderr as rendered by the

@@ -307,6 +307,8 @@ pub const Terminal = struct {
         /// Preserve an acquired/requested controller lease across transport
         /// replacement; a replacement attach may need to evict the stale fd.
         force_control: bool = false,
+        /// Sequence expected at the head of the next EVENTS frame.
+        event_seq: u64 = 0,
         control_known: bool = false,
         /// Rename sent to the daemon, awaiting its OK. Committed to
         /// `session` on .ok, dropped on .err. Owned while non-null.
@@ -623,6 +625,7 @@ pub const Terminal = struct {
             .port_range = port_range_owned,
             .read_only = read_only,
             .force_control = want_control,
+            .event_seq = envelope.seq,
             .predictor = predict_mod.Predictor.init(allocator),
             .is_app = envelope.app,
         };
@@ -1289,19 +1292,23 @@ pub const Terminal = struct {
     fn handleRemoteFrame(self: *Terminal, frame: mux_wire.Frame) void {
         switch (frame.ftype) {
             .events => {
-                if (frame.payload.len < 12) return;
                 // Snapshot the line-id counter so we can tell, after applying,
                 // whether new lines were born (scroll/append) — a definite
                 // visible change — vs. an in-place repaint that needs hashing.
                 const line_id_before = self.screen.next_line_id;
-                var any = false;
-                var r = mux_wire.Reader.init(frame.payload[12..]);
-                while (!r.atEnd()) {
-                    var ev = r.getEvent(self.allocator) catch return;
-                    self.screen.apply(ev);
-                    ev.deinit(self.allocator);
-                    any = true;
-                }
+                const event_remote = self.remote orelse return;
+                const old_seq = event_remote.event_seq;
+                event_remote.event_seq = mux_wire.applyEventFrame(
+                    frame.payload,
+                    old_seq,
+                    self.allocator,
+                    self.screen,
+                    applyRemoteEvent,
+                ) catch {
+                    self.transportLost("malformed event stream");
+                    return;
+                };
+                const any = event_remote.event_seq != old_seq;
                 if (any) self.activity_seq +%= 1;
                 // Tab-activity signal (drives the aurora glow + inactivity
                 // warning). Ported from the old in-process drain: fire only on
@@ -1590,6 +1597,7 @@ pub const Terminal = struct {
         fresh.color_scheme_dark = self.screen.color_scheme_dark;
         restored.commitReplacing(&self.screen);
         self.wireScreenSink();
+        if (self.remote) |remote| remote.event_seq = envelope.seq;
         self.hash_valid = false;
         self.activity_seq +%= 1;
         if (self.remote) |remote| {
@@ -1598,6 +1606,10 @@ pub const Terminal = struct {
         }
         self.replayRetainedImages();
         if (self.on_render_request) |f| f(self.user_ctx);
+    }
+
+    fn applyRemoteEvent(screen: *Screen, ev: Event) void {
+        screen.apply(ev);
     }
 
     /// Ask the daemon to rename this remote session. The new name is

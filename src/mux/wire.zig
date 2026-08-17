@@ -571,6 +571,8 @@ pub const Writer = struct {
     /// `dcs_end`) are never produced by the current parser and are
     /// not representable on the wire.
     pub fn putEvent(self: *Writer, ev: Event) !void {
+        const start = self.buf.items.len;
+        errdefer self.buf.shrinkRetainingCapacity(start);
         switch (ev) {
             .print => |cp| {
                 try self.buf.append(self.allocator, @intFromEnum(EventTag.print));
@@ -736,9 +738,43 @@ pub const Reader = struct {
     }
 };
 
+pub const EventFrameError = ReadError || error{
+    SequenceMismatch,
+    CountMismatch,
+    SequenceOverflow,
+};
+
+/// Decode and visit one sequence-stamped EVENTS payload.
+pub fn applyEventFrame(
+    payload: []const u8,
+    expected_seq: u64,
+    allocator: std.mem.Allocator,
+    ctx: anytype,
+    apply: fn (@TypeOf(ctx), Event) void,
+) EventFrameError!u64 {
+    if (payload.len < 12) return error.Truncated;
+    const base = std.mem.readInt(u64, payload[0..8], .little);
+    if (base != expected_seq) return error.SequenceMismatch;
+    const count = std.mem.readInt(u32, payload[8..12], .little);
+    const next_seq = std.math.add(u64, base, count) catch return error.SequenceOverflow;
+
+    var reader = Reader.init(payload[12..]);
+    var decoded: u32 = 0;
+    while (decoded < count) : (decoded += 1) {
+        if (reader.atEnd()) return error.CountMismatch;
+        var ev = try reader.getEvent(allocator);
+        apply(ctx, ev);
+        ev.deinit(allocator);
+    }
+    if (!reader.atEnd()) return error.CountMismatch;
+    return next_seq;
+}
+
 /// Write one frame (type + payload) to a buffer: u32 len, u8 type,
 /// payload. `len` covers type + payload.
 pub fn appendFrame(out: *std.ArrayList(u8), allocator: std.mem.Allocator, ftype: FrameType, payload: []const u8) !void {
+    const start = out.items.len;
+    errdefer out.shrinkRetainingCapacity(start);
     var hdr: [5]u8 = undefined;
     std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len + 1), .little);
     hdr[4] = @intFromEnum(ftype);
@@ -790,6 +826,138 @@ fn roundtrip(allocator: std.mem.Allocator, ev: Event) !Event {
     const out = try r.getEvent(allocator);
     try std.testing.expect(r.atEnd());
     return out;
+}
+
+fn runPutEventAllocationFailure(fail_index: ?usize) !usize {
+    const t = std.testing;
+    var failing_config: t.FailingAllocator.Config = .{};
+    if (fail_index) |index| failing_config.fail_index = index;
+    var failing = t.FailingAllocator.init(t.allocator, failing_config);
+
+    var writer = Writer.init(failing.allocator());
+    defer writer.buf.deinit(t.allocator);
+    try writer.buf.ensureTotalCapacityPrecise(t.allocator, 4);
+    try writer.buf.appendSlice(t.allocator, "seed");
+
+    var proto: Event.Dcs = .{};
+    proto.n_params = proto.params.len;
+    for (&proto.params, 0..) |*param, i| param.* = @intCast(i + 1);
+    proto.n_intermediates = proto.intermediates.len;
+    @memcpy(&proto.intermediates, "$+! ");
+    proto.final = 'q';
+    var body: [256]u8 = .{'x'} ** 256;
+    const event: Event = .{ .dcs = .{ .proto = proto, .body = &body } };
+
+    if (fail_index) |_| {
+        try t.expectError(error.OutOfMemory, writer.putEvent(event));
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqualStrings("seed", writer.buf.items);
+
+        // Retained capacity from any successful prefix append remains reusable.
+        writer.allocator = t.allocator;
+        try writer.putEvent(event);
+        var reader = Reader.init(writer.buf.items[4..]);
+        var decoded = try reader.getEvent(t.allocator);
+        defer decoded.deinit(t.allocator);
+        try t.expect(reader.atEnd());
+        try t.expectEqualStrings(&body, decoded.dcs.body);
+    } else {
+        try writer.putEvent(event);
+        try t.expect(!failing.has_induced_failure);
+    }
+    return failing.alloc_index;
+}
+
+test "wire: event serialization rolls back every allocation failure" {
+    const t = std.testing;
+    const allocations = try runPutEventAllocationFailure(null);
+    try t.expect(allocations > 1);
+    for (0..allocations) |fail_index| {
+        _ = try runPutEventAllocationFailure(fail_index);
+    }
+}
+
+fn runAppendFrameAllocationFailure(fail_index: ?usize) !usize {
+    const t = std.testing;
+    var failing_config: t.FailingAllocator.Config = .{};
+    if (fail_index) |index| failing_config.fail_index = index;
+    var failing = t.FailingAllocator.init(t.allocator, failing_config);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t.allocator);
+    try out.ensureTotalCapacityPrecise(t.allocator, 4);
+    try out.appendSlice(t.allocator, "seed");
+    const payload = [_]u8{'p'} ** 256;
+
+    if (fail_index) |_| {
+        try t.expectError(error.OutOfMemory, appendFrame(&out, failing.allocator(), .events, &payload));
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqualStrings("seed", out.items);
+
+        try appendFrame(&out, t.allocator, .events, &payload);
+        const peeled = (try peelFrame(out.items[4..])).?;
+        try t.expectEqual(FrameType.events, peeled.frame.ftype);
+        try t.expectEqualSlices(u8, &payload, peeled.frame.payload);
+        try t.expectEqual(out.items.len - 4, peeled.consumed);
+    } else {
+        try appendFrame(&out, failing.allocator(), .events, &payload);
+        try t.expect(!failing.has_induced_failure);
+    }
+    return failing.alloc_index;
+}
+
+test "wire: frame serialization rolls back every allocation failure" {
+    const t = std.testing;
+    const allocations = try runAppendFrameAllocationFailure(null);
+    try t.expect(allocations > 1);
+    for (0..allocations) |fail_index| {
+        _ = try runAppendFrameAllocationFailure(fail_index);
+    }
+}
+
+const EventFrameProbe = struct {
+    count: u32 = 0,
+    last: u32 = 0,
+
+    fn apply(self: *EventFrameProbe, ev: Event) void {
+        self.count += 1;
+        if (ev == .print) self.last = ev.print;
+    }
+};
+
+test "wire: event frames validate sequence count and complete records" {
+    const t = std.testing;
+    const a = t.allocator;
+    var records = Writer.init(a);
+    defer records.deinit();
+    try records.putEvent(.{ .print = 'A' });
+    try records.putEvent(.{ .print = 'B' });
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(a);
+    var header: [12]u8 = undefined;
+    std.mem.writeInt(u64, header[0..8], 41, .little);
+    std.mem.writeInt(u32, header[8..12], 2, .little);
+    try payload.appendSlice(a, &header);
+    try payload.appendSlice(a, records.buf.items);
+
+    var probe = EventFrameProbe{};
+    try t.expectEqual(@as(u64, 43), try applyEventFrame(payload.items, 41, a, &probe, EventFrameProbe.apply));
+    try t.expectEqual(@as(u32, 2), probe.count);
+    try t.expectEqual(@as(u32, 'B'), probe.last);
+
+    probe = .{};
+    try t.expectError(error.SequenceMismatch, applyEventFrame(payload.items, 40, a, &probe, EventFrameProbe.apply));
+    try t.expectEqual(@as(u32, 0), probe.count);
+
+    std.mem.writeInt(u32, payload.items[8..12], 1, .little);
+    try t.expectError(error.CountMismatch, applyEventFrame(payload.items, 41, a, &probe, EventFrameProbe.apply));
+    std.mem.writeInt(u32, payload.items[8..12], 3, .little);
+    try t.expectError(error.CountMismatch, applyEventFrame(payload.items, 41, a, &probe, EventFrameProbe.apply));
+
+    std.mem.writeInt(u64, payload.items[0..8], std.math.maxInt(u64), .little);
+    std.mem.writeInt(u32, payload.items[8..12], 2, .little);
+    try t.expectError(error.SequenceOverflow, applyEventFrame(payload.items, std.math.maxInt(u64), a, &probe, EventFrameProbe.apply));
 }
 
 test "wire: simple events round-trip" {

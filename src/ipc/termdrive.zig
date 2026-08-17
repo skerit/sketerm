@@ -11,6 +11,7 @@ const c = @import("../c.zig").c;
 const muxclient = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 const snapshot = @import("../mux/snapshot.zig");
+const Event = @import("../parser/event.zig").Event;
 const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
 const keys = @import("keys.zig");
@@ -520,6 +521,7 @@ pub const Term = struct {
     screen: ?*Screen = null,
     /// Highest snapshot/events seq seen — the quiescence signal.
     seq: u64 = 0,
+    events_desynced: bool = false,
     exited: bool = false,
     exit_status: i32 = 0,
     exit_status_known: bool = false,
@@ -727,21 +729,27 @@ pub const Term = struct {
         self.pool.* = try Pool.init(self.allocator);
         self.screen = try snapshot.restore(self.allocator, self.pool, envelope.body);
         if (self.screen) |s| self.app_cursor = s.app_cursor_keys;
+        self.events_desynced = false;
+    }
+
+    fn applyScreenEvent(screen: *Screen, ev: Event) void {
+        screen.apply(ev);
     }
 
     fn applyEvents(self: *Term, payload: []const u8) void {
-        if (payload.len < 12) return;
-        const base = std.mem.readInt(u64, payload[0..8], .little);
-        const n = std.mem.readInt(u32, payload[8..12], .little);
+        if (self.events_desynced) return;
         const screen = self.screen orelse return;
-        var r = wire.Reader.init(payload[12..]);
-        while (!r.atEnd()) {
-            var ev = r.getEvent(self.allocator) catch break;
-            screen.apply(ev);
-            ev.deinit(self.allocator);
-        }
+        self.seq = wire.applyEventFrame(
+            payload,
+            self.seq,
+            self.allocator,
+            screen,
+            applyScreenEvent,
+        ) catch {
+            self.events_desynced = true;
+            return;
+        };
         self.app_cursor = screen.app_cursor_keys;
-        self.seq = base + n;
     }
 
     fn handleFrame(self: *Term, ftype: wire.FrameType, payload: []const u8) void {

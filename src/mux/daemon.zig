@@ -722,12 +722,18 @@ pub const Client = struct {
     }
 
     fn queueFrameIn(self: *Client, out: *std.ArrayList(u8), ftype: wire.FrameType, payload: []const u8) void {
-        if (self.dead) return;
-        wire.appendFrame(out, self.allocator, ftype, payload) catch {
+        if (!self.tryQueueFrameIn(out, ftype, payload) and !self.dead) self.dead = true;
+    }
+
+    /// Queue one complete frame while leaving allocation-failure policy to the caller.
+    fn tryQueueFrameIn(self: *Client, out: *std.ArrayList(u8), ftype: wire.FrameType, payload: []const u8) bool {
+        if (self.dead) return false;
+        wire.appendFrame(out, self.allocator, ftype, payload) catch return false;
+        if (self.queuedBytes() > MAX_WBUF) {
             self.dead = true;
-            return;
-        };
-        if (self.queuedBytes() > MAX_WBUF) self.dead = true;
+            return false;
+        }
+        return true;
     }
 
     pub fn queuedBytes(self: *const Client) usize {
@@ -2658,6 +2664,7 @@ pub const Daemon = struct {
     pub fn tick(self: *Daemon, timeout_ms: i32) !void {
         const tick_now = nowMs();
         self.panelRoutesTick(tick_now);
+        self.retryPendingSnapshots();
         var poll_timeout = self.pulseTick(timeout_ms);
         // Cast playback: deliver due events, clamp to the next deadline.
         poll_timeout = self.castTick(poll_timeout);
@@ -4772,10 +4779,7 @@ pub const Daemon = struct {
 
     pub fn queueSnapshot(self: *Daemon, cl: *Client, s: *Session) void {
         if (!terminalViewer(cl, s)) return;
-        // A full snapshot supersedes any withheld events — whatever
-        // triggered it (attach, resize, resync), the client is current
-        // again once this lands.
-        cl.needs_resync = false;
+        cl.needs_resync = true;
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
         // Protocol 1-3 used [seq:u64]; protocol 4 added the app byte.
@@ -4784,14 +4788,21 @@ pub const Daemon = struct {
         seq_hdr[8] = if (s.app) 1 else 0;
         const header = if (cl.proto >= 4) seq_hdr[0..9] else seq_hdr[0..8];
         buf.appendSlice(self.allocator, header) catch {
-            cl.dead = true;
+            log.warn("snapshot header allocation failed; resync remains pending (session '{s}')", .{s.name});
             return;
         };
         snapshot.serializeVersion(s.screen, &buf, self.allocator, cl.snapshot_version) catch {
-            cl.queueErr("snapshot failed");
+            log.warn("snapshot serialization failed; resync remains pending (session '{s}')", .{s.name});
             return;
         };
-        cl.queueFrame(.snapshot, buf.items);
+        if (!cl.tryQueueFrameIn(&cl.wbuf, .snapshot, buf.items)) {
+            if (!cl.dead)
+                log.warn("snapshot frame allocation failed; resync remains pending (session '{s}')", .{s.name});
+            return;
+        }
+        // A full snapshot supersedes any withheld events once the complete
+        // frame is in FIFO order ahead of every event accepted from now on.
+        cl.needs_resync = false;
         var cwd_buf: [4096]u8 = undefined;
         // A newly attached client has no facts yet, so sample the
         // foreground program now rather than making it wait for the
@@ -4810,6 +4821,19 @@ pub const Daemon = struct {
         });
         // A cast viewer needs the playback state to render controls.
         if (s.castPtr()) |cp| daemon_cast.queuePlayState(cl, cp);
+    }
+
+    fn retryPendingSnapshots(self: *Daemon) void {
+        for (self.clients.items) |cl| {
+            if (cl.dead or !cl.needs_resync or cl.queuedBytes() != 0 or cl.write_lane != .none) continue;
+            if (cl.attached) |s| self.queueSnapshot(cl, s);
+        }
+    }
+
+    fn requireSnapshot(self: *Daemon, cl: *Client, s: *Session) void {
+        if (cl.dead or !terminalViewer(cl, s)) return;
+        cl.needs_resync = true;
+        if (cl.queuedBytes() == 0 and cl.write_lane == .none) self.queueSnapshot(cl, s);
     }
 
     /// Minimum gap between two foreground-program samples for one
@@ -5626,7 +5650,7 @@ pub const Daemon = struct {
         defer total_events.deinitMarkers();
 
         const n_events = total_events.count;
-        if (n_events == 0 and total_events.markers.items.len == 0) return;
+        if (n_events == 0 and !total_events.serialization_failed and total_events.markers.items.len == 0) return;
         if (!broadcast) return;
         // Real terminal output this drain → the session is active now.
         s.last_activity_ms = nowMs();
@@ -5638,14 +5662,44 @@ pub const Daemon = struct {
             }
         }
         if (any_attached) self.sampleForeground(s);
-        if (any_attached and n_events > 0) {
+        publish: {
+            if (total_events.serialization_failed) {
+                for (self.clients.items) |cl| self.requireSnapshot(cl, s);
+                log.warn("event serialization failed; snapshot resync scheduled (session '{s}')", .{s.name});
+                break :publish;
+            }
+            if (n_events == 0) break :publish;
+
+            const next_seq = std.math.add(u64, s.seq, @as(u64, n_events)) catch {
+                for (self.clients.items) |cl| self.requireSnapshot(cl, s);
+                log.warn("event sequence exhausted; snapshot resync scheduled (session '{s}')", .{s.name});
+                break :publish;
+            };
+            if (!any_attached) {
+                s.seq = next_seq;
+                break :publish;
+            }
+
             var payload: std.ArrayList(u8) = .empty;
             defer payload.deinit(self.allocator);
             var hdr: [12]u8 = undefined;
             std.mem.writeInt(u64, hdr[0..8], s.seq, .little);
             std.mem.writeInt(u32, hdr[8..12], n_events, .little);
-            payload.appendSlice(self.allocator, &hdr) catch return;
-            payload.appendSlice(self.allocator, total_events.writer.buf.items) catch return;
+            payload.appendSlice(self.allocator, &hdr) catch {
+                for (self.clients.items) |cl| self.requireSnapshot(cl, s);
+                log.warn("events header allocation failed; snapshot resync scheduled (session '{s}')", .{s.name});
+                break :publish;
+            };
+            payload.appendSlice(self.allocator, total_events.writer.buf.items) catch {
+                for (self.clients.items) |cl| self.requireSnapshot(cl, s);
+                log.warn("events payload allocation failed; snapshot resync scheduled (session '{s}')", .{s.name});
+                break :publish;
+            };
+
+            // Once a complete shared payload exists, its sequence is committed.
+            // A client-specific frame allocation failure recovers from a snapshot
+            // stamped with this new value while successful peers keep streaming.
+            s.seq = next_seq;
             for (self.clients.items) |cl| {
                 if (!terminalViewer(cl, s)) continue;
                 // Backpressure: a client this far behind (flooding
@@ -5659,7 +5713,9 @@ pub const Daemon = struct {
                     log.debug("client queues {d}B over events backlog; snapshot resync scheduled (session '{s}')", .{ cl.queuedBytes(), s.name });
                     continue;
                 }
-                cl.queueFrame(.events, payload.items);
+                if (!cl.tryQueueFrameIn(&cl.wbuf, .events, payload.items)) {
+                    if (!cl.dead) self.requireSnapshot(cl, s);
+                }
             }
         }
         // Markers push to every attached client regardless of the
@@ -5672,7 +5728,6 @@ pub const Daemon = struct {
             }
             log.debug("marker #{d} '{s}' after={d} (session '{s}')", .{ m.id, m.label, m.after, s.name });
         }
-        s.seq += n_events;
     }
 
     fn sessionExited(self: *Daemon, s: *Session) void {
@@ -6043,6 +6098,8 @@ pub const EventCollector = struct {
     screen: *Screen,
     writer: wire.Writer,
     count: u32 = 0,
+    /// The current batch cannot be represented as a contiguous event stream.
+    serialization_failed: bool = false,
     /// Session log ring to feed (escape-free lines); null = don't.
     ring: ?*logring.LogRing = null,
     /// Wall-clock stamp for lines committed during this drain.
@@ -6139,9 +6196,15 @@ pub const EventCollector = struct {
             .execute => |b| r.feedControl(b, self.wall_ms),
             else => {},
         };
-        self.writer.putEvent(fwd) catch {};
+        if (!self.serialization_failed) {
+            self.writer.putEvent(fwd) catch {
+                self.serialization_failed = true;
+                self.writer.buf.clearRetainingCapacity();
+                self.count = 0;
+            };
+            if (!self.serialization_failed) self.count += 1;
+        }
         self.screen.apply(fwd);
-        self.count += 1;
         var mut = ev;
         mut.deinit(self.allocator);
     }
@@ -6161,5 +6224,286 @@ pub const EventCollector = struct {
         };
     }
 };
+
+const EventIngestTestHarness = struct {
+    allocator: std.mem.Allocator,
+    daemon: Daemon,
+    pool: Pool,
+    screen: *Screen,
+    session: Session,
+    clients: [2]Client,
+
+    fn init(allocator: std.mem.Allocator) !*EventIngestTestHarness {
+        const self = try allocator.create(EventIngestTestHarness);
+        errdefer allocator.destroy(self);
+        self.allocator = allocator;
+        self.pool = try Pool.init(allocator);
+        errdefer self.pool.deinit();
+        self.screen = try Screen.init(allocator, &self.pool, 80, 4);
+        errdefer self.screen.deinit();
+        self.session = .{
+            .allocator = allocator,
+            .name = @constCast("event-ingest-test"),
+            .origin_name = @constCast("event-ingest-test"),
+            .origin_id = .{'0'} ** SESSION_ORIGIN_ID_LEN,
+            .source = .{ .pty = .{ .master_fd = -1, .child_pid = -1 } },
+            .parser = Parser.init(allocator),
+            .pool = &self.pool,
+            .screen = self.screen,
+            .log = logring.LogRing.init(allocator),
+        };
+        self.daemon = .{ .allocator = allocator, .listen_fd = -1, .sock_path = &.{} };
+        self.clients = .{
+            .{ .allocator = allocator, .fd = -1, .attached = &self.session },
+            .{ .allocator = allocator, .fd = -1, .attached = &self.session },
+        };
+        errdefer {
+            self.session.log.deinit();
+            self.session.parser.deinit();
+        }
+        try self.daemon.clients.append(allocator, &self.clients[0]);
+        errdefer self.daemon.clients.deinit(allocator);
+        try self.daemon.clients.append(allocator, &self.clients[1]);
+        return self;
+    }
+
+    fn deinit(self: *EventIngestTestHarness) void {
+        for (&self.clients) |*cl| {
+            cl.rbuf.deinit(self.allocator);
+            cl.wbuf.deinit(self.allocator);
+            cl.audio_wbuf.deinit(self.allocator);
+        }
+        self.daemon.clients.deinit(self.allocator);
+        self.session.log.deinit();
+        self.session.parser.deinit();
+        self.screen.deinit();
+        self.pool.deinit();
+        self.allocator.destroy(self);
+    }
+
+    fn clearFrames(self: *EventIngestTestHarness) void {
+        for (&self.clients) |*cl| cl.wbuf.clearRetainingCapacity();
+    }
+};
+
+const EventIngestFrameSummary = struct {
+    snapshots: usize = 0,
+    events: usize = 0,
+};
+
+fn expectSnapshotFrames(
+    allocator: std.mem.Allocator,
+    cl: *Client,
+    expected_seq: u64,
+    expected_prefix: []const u8,
+) !EventIngestFrameSummary {
+    const t = std.testing;
+    var summary = EventIngestFrameSummary{};
+    var offset: usize = 0;
+    while (offset < cl.wbuf.items.len) {
+        const peeled = (try wire.peelFrame(cl.wbuf.items[offset..])) orelse return error.TestUnexpectedResult;
+        offset += peeled.consumed;
+        switch (peeled.frame.ftype) {
+            .snapshot => {
+                summary.snapshots += 1;
+                const envelope = try snapshot.peelEnvelope(peeled.frame.payload);
+                try t.expectEqual(expected_seq, envelope.seq);
+                var pool = try Pool.init(allocator);
+                defer pool.deinit();
+                const restored = try snapshot.restore(allocator, &pool, envelope.body);
+                defer restored.deinit();
+                for (expected_prefix, 0..) |byte, col| {
+                    try t.expectEqual(@as(u32, byte), restored.active[0].cells[col].rune);
+                }
+            },
+            .events => summary.events += 1,
+            else => {},
+        }
+    }
+    try t.expectEqual(cl.wbuf.items.len, offset);
+    return summary;
+}
+
+const EventIngestProbe = struct {
+    bytes: [128]u8 = undefined,
+    len: usize = 0,
+
+    fn apply(self: *EventIngestProbe, ev: Event) void {
+        switch (ev) {
+            .print => |cp| if (cp <= 0x7f and self.len < self.bytes.len) {
+                self.bytes[self.len] = @intCast(cp);
+                self.len += 1;
+            },
+            .print_byte => |byte| if (self.len < self.bytes.len) {
+                self.bytes[self.len] = byte;
+                self.len += 1;
+            },
+            .print_run => |run| {
+                const n = @min(run.len, self.bytes.len - self.len);
+                @memcpy(self.bytes[self.len..][0..n], run.bytes[0..n]);
+                self.len += n;
+            },
+            else => {},
+        }
+    }
+};
+
+fn expectEventFrames(
+    allocator: std.mem.Allocator,
+    cl: *Client,
+    expected_base: u64,
+    expected_next: u64,
+    expected_bytes: []const u8,
+) !EventIngestFrameSummary {
+    const t = std.testing;
+    var summary = EventIngestFrameSummary{};
+    var offset: usize = 0;
+    while (offset < cl.wbuf.items.len) {
+        const peeled = (try wire.peelFrame(cl.wbuf.items[offset..])) orelse return error.TestUnexpectedResult;
+        offset += peeled.consumed;
+        switch (peeled.frame.ftype) {
+            .snapshot => summary.snapshots += 1,
+            .events => {
+                summary.events += 1;
+                var probe = EventIngestProbe{};
+                try t.expectEqual(
+                    expected_next,
+                    try wire.applyEventFrame(
+                        peeled.frame.payload,
+                        expected_base,
+                        allocator,
+                        &probe,
+                        EventIngestProbe.apply,
+                    ),
+                );
+                try t.expectEqualStrings(expected_bytes, probe.bytes[0..probe.len]);
+            },
+            else => {},
+        }
+    }
+    try t.expectEqual(cl.wbuf.items.len, offset);
+    return summary;
+}
+
+test "event collector serialization failure snapshots every client before later events" {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    var failed_batch = harness.daemon.ingestBegin(&harness.session);
+    failed_batch.writer.allocator = failing.allocator();
+    EventCollector.emit(@ptrCast(&failed_batch), .{ .print = 'A' });
+    EventCollector.emit(@ptrCast(&failed_batch), .{ .print = 'B' });
+    try t.expect(failing.has_induced_failure);
+    try t.expect(failed_batch.serialization_failed);
+    try t.expectEqual(@as(u32, 0), failed_batch.count);
+    harness.daemon.ingestFinish(&harness.session, &failed_batch, true);
+
+    try t.expectEqual(@as(u64, 0), harness.session.seq);
+    for (&harness.clients) |*cl| {
+        try t.expect(!cl.needs_resync);
+        const summary = try expectSnapshotFrames(t.allocator, cl, 0, "AB");
+        try t.expectEqual(@as(usize, 1), summary.snapshots);
+        try t.expectEqual(@as(usize, 0), summary.events);
+    }
+
+    harness.clearFrames();
+    var next_batch = harness.daemon.ingestBegin(&harness.session);
+    EventCollector.emit(@ptrCast(&next_batch), .{ .print = 'C' });
+    harness.daemon.ingestFinish(&harness.session, &next_batch, true);
+    try t.expectEqual(@as(u64, 1), harness.session.seq);
+    for (&harness.clients) |*cl| {
+        const summary = try expectEventFrames(t.allocator, cl, 0, 1, "C");
+        try t.expectEqual(@as(usize, 0), summary.snapshots);
+        try t.expectEqual(@as(usize, 1), summary.events);
+    }
+}
+
+fn runEventsPayloadAllocationFailure(fail_index: ?usize) !usize {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+
+    var run: Event.PrintRun = .{};
+    run.len = run.bytes.len;
+    @memset(&run.bytes, 'x');
+    var batch = harness.daemon.ingestBegin(&harness.session);
+    EventCollector.emit(@ptrCast(&batch), .{ .print_run = run });
+
+    var config: t.FailingAllocator.Config = .{};
+    if (fail_index) |index| config.fail_index = index;
+    var failing = t.FailingAllocator.init(t.allocator, config);
+    harness.daemon.allocator = failing.allocator();
+    harness.daemon.ingestFinish(&harness.session, &batch, true);
+    harness.daemon.allocator = t.allocator;
+    if (fail_index != null) harness.daemon.retryPendingSnapshots();
+
+    if (fail_index) |_| {
+        try t.expect(failing.has_induced_failure);
+        try t.expectEqual(@as(u64, 0), harness.session.seq);
+        for (&harness.clients) |*cl| {
+            const summary = try expectSnapshotFrames(t.allocator, cl, 0, run.bytes[0..run.len]);
+            try t.expectEqual(@as(usize, 1), summary.snapshots);
+            try t.expectEqual(@as(usize, 0), summary.events);
+        }
+    } else {
+        try t.expect(!failing.has_induced_failure);
+        try t.expectEqual(@as(u64, 1), harness.session.seq);
+        for (&harness.clients) |*cl| {
+            const summary = try expectEventFrames(t.allocator, cl, 0, 1, run.bytes[0..run.len]);
+            try t.expectEqual(@as(usize, 0), summary.snapshots);
+            try t.expectEqual(@as(usize, 1), summary.events);
+        }
+    }
+    return failing.alloc_index;
+}
+
+test "events payload allocation failures snapshot every client" {
+    const t = std.testing;
+    const allocations = try runEventsPayloadAllocationFailure(null);
+    try t.expect(allocations > 0);
+    for (0..allocations) |fail_index| {
+        _ = try runEventsPayloadAllocationFailure(fail_index);
+    }
+}
+
+test "one client frame allocation failure snapshots only that client" {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    try harness.clients[0].wbuf.ensureTotalCapacityPrecise(t.allocator, 5);
+    harness.clients[0].allocator = failing.allocator();
+    var run: Event.PrintRun = .{};
+    run.len = run.bytes.len;
+    @memset(&run.bytes, 'y');
+    var batch = harness.daemon.ingestBegin(&harness.session);
+    EventCollector.emit(@ptrCast(&batch), .{ .print_run = run });
+    harness.daemon.ingestFinish(&harness.session, &batch, true);
+    harness.clients[0].allocator = t.allocator;
+    harness.daemon.retryPendingSnapshots();
+
+    try t.expect(failing.has_induced_failure);
+    try t.expectEqual(@as(u64, 1), harness.session.seq);
+    const recovered = try expectSnapshotFrames(t.allocator, &harness.clients[0], 1, run.bytes[0..run.len]);
+    try t.expectEqual(@as(usize, 1), recovered.snapshots);
+    try t.expectEqual(@as(usize, 0), recovered.events);
+    const streamed = try expectEventFrames(t.allocator, &harness.clients[1], 0, 1, run.bytes[0..run.len]);
+    try t.expectEqual(@as(usize, 0), streamed.snapshots);
+    try t.expectEqual(@as(usize, 1), streamed.events);
+
+    harness.clearFrames();
+    var next_batch = harness.daemon.ingestBegin(&harness.session);
+    EventCollector.emit(@ptrCast(&next_batch), .{ .print = 'Z' });
+    harness.daemon.ingestFinish(&harness.session, &next_batch, true);
+    try t.expectEqual(@as(u64, 2), harness.session.seq);
+    for (&harness.clients) |*cl| {
+        const summary = try expectEventFrames(t.allocator, cl, 1, 2, "Z");
+        try t.expectEqual(@as(usize, 0), summary.snapshots);
+        try t.expectEqual(@as(usize, 1), summary.events);
+    }
+}
 
 pub const defaultSocketPath = @import("sockpath.zig").defaultSocketPath;
