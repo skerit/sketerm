@@ -107,6 +107,17 @@ pub const Pool = struct {
         self.index.deinit(self.allocator);
     }
 
+    /// Builds a complete pool while leaving `entries` caller-owned on error.
+    pub fn initReplacement(allocator: std.mem.Allocator, entries: std.ArrayList(Entry)) !Pool {
+        var replacement = Pool{ .allocator = allocator };
+        errdefer replacement.index.deinit(allocator);
+        for (entries.items, 0..) |entry, i| {
+            try replacement.index.put(allocator, entryKey(entry), @intCast(i));
+        }
+        replacement.entries = entries;
+        return replacement;
+    }
+
     /// Returns the index for an existing entry, or appends a new one.
     pub fn intern(self: *Pool, e: Entry) !u16 {
         if (self.last_idx < self.entries.items.len and

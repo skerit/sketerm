@@ -373,9 +373,45 @@ const Src = struct {
     }
 };
 
-/// Restore a snapshot into a NEW Screen built on `pool` (whose
-/// contents are replaced). Returns the Screen; caller owns it.
-pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*Screen {
+pub const StagedRestore = struct {
+    screen: *Screen,
+    replacement_pool: *Pool,
+    target_pool: *Pool,
+    pool_allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *StagedRestore) void {
+        self.screen.deinit();
+        self.replacement_pool.deinit();
+        self.pool_allocator.destroy(self.replacement_pool);
+    }
+
+    /// Commits the staged pool and returns ownership of the restored screen.
+    pub fn commit(self: *StagedRestore) *Screen {
+        const old_pool = self.target_pool.*;
+        self.target_pool.* = self.replacement_pool.*;
+        self.replacement_pool.* = old_pool;
+        self.screen.pool = self.target_pool;
+        self.replacement_pool.deinit();
+        self.pool_allocator.destroy(self.replacement_pool);
+        return self.screen;
+    }
+
+    /// Swaps the restored screen and pool into a live caller-owned slot.
+    pub fn commitReplacing(self: *StagedRestore, current: **Screen) void {
+        std.debug.assert(current.*.pool == self.target_pool);
+        const old_screen = current.*;
+        const old_pool = self.target_pool.*;
+        self.target_pool.* = self.replacement_pool.*;
+        self.replacement_pool.* = old_pool;
+        self.screen.pool = self.target_pool;
+        old_screen.pool = self.replacement_pool;
+        current.* = self.screen;
+        self.screen = old_screen;
+    }
+};
+
+/// Restores a snapshot without mutating `pool` until the stage is committed.
+pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !StagedRestore {
     var src = Src{ .bytes = bytes };
 
     const version = try src.int(u32);
@@ -386,35 +422,33 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     const rows = try src.int(u16);
     if (cols == 0 or rows == 0 or cols > 4096 or rows > 4096) return error.BadSnapshot;
 
-    // Pool: replace contents wholesale via replaceEntries, which also
-    // rebuilds the dedup `index` map in lockstep. The grid reuses an
-    // existing pool across resize/reattach snapshots, so just swapping
-    // `entries` (and leaving `index` stale) would make the next interned
-    // colour resolve to a slot it no longer occupies -- green renders as
-    // red after a resize. replaceEntries is the same path compactStylePool
-    // uses, so the index stays correct.
+    // The replacement pool stays private until every field below has parsed.
+    // A live Screen may still be interpreting cells through `pool` on error.
     const n_styles = try src.int(u16);
     if (n_styles == 0) return error.BadSnapshot; // index 0 = default always exists
-    {
-        var new_entries: std.ArrayList(style_pool.Entry) = .empty;
-        errdefer new_entries.deinit(pool.allocator);
-        try new_entries.ensureTotalCapacity(pool.allocator, n_styles);
-        for (0..n_styles) |_| {
-            const fg = try src.color();
-            const bg = try src.color();
-            const ul = try src.color();
-            const attrs_raw = try src.int(u16);
-            new_entries.appendAssumeCapacity(.{
-                .fg = fg,
-                .bg = bg,
-                .underline_color = ul,
-                .attrs = @bitCast(attrs_raw),
-            });
-        }
-        pool.replaceEntries(new_entries); // adopts new_entries + rebuilds index
+    var new_entries: std.ArrayList(style_pool.Entry) = .empty;
+    errdefer new_entries.deinit(pool.allocator);
+    try new_entries.ensureTotalCapacity(pool.allocator, n_styles);
+    for (0..n_styles) |_| {
+        const fg = try src.color();
+        const bg = try src.color();
+        const ul = try src.color();
+        const attrs_raw = try src.int(u16);
+        new_entries.appendAssumeCapacity(.{
+            .fg = fg,
+            .bg = bg,
+            .underline_color = ul,
+            .attrs = @bitCast(attrs_raw),
+        });
     }
 
-    const screen = try Screen.init(allocator, pool, cols, rows);
+    const replacement_pool = try pool.allocator.create(Pool);
+    errdefer pool.allocator.destroy(replacement_pool);
+    replacement_pool.* = try Pool.initReplacement(pool.allocator, new_entries);
+    new_entries = .empty;
+    errdefer replacement_pool.deinit();
+
+    const screen = try Screen.init(allocator, replacement_pool, cols, rows);
     errdefer screen.deinit();
 
     // Active rows: swap each freshly-built line for the snapshot one.
@@ -591,13 +625,258 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
     }
 
     screen.dirty = true;
-    return screen;
+    return .{
+        .screen = screen,
+        .replacement_pool = replacement_pool,
+        .target_pool = pool,
+        .pool_allocator = pool.allocator,
+    };
+}
+
+/// Restores a snapshot into a new Screen and replaces `pool` on success.
+pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*Screen {
+    var staged = try restoreStaged(allocator, pool, bytes);
+    errdefer staged.deinit();
+    return staged.commit();
 }
 
 // ── tests ───────────────────────────────────────────────────────
 
 const testing = std.testing;
 const Harness = @import("../parser/test_harness.zig").Harness;
+
+const LiveRestoreState = struct {
+    bytes: []u8,
+    entries: []style_pool.Entry,
+    entries_ptr: [*]style_pool.Entry,
+    entries_capacity: usize,
+    index_count: usize,
+    last_idx: u16,
+    active_cells_ptr: [*]Cell,
+    title_ptr: [*]u8,
+
+    fn capture(allocator: std.mem.Allocator, screen: *const Screen, pool: *const Pool) !LiveRestoreState {
+        const entries = try allocator.dupe(style_pool.Entry, pool.entries.items);
+        errdefer allocator.free(entries);
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try serialize(screen, &out, allocator);
+        return .{
+            .bytes = try out.toOwnedSlice(allocator),
+            .entries = entries,
+            .entries_ptr = pool.entries.items.ptr,
+            .entries_capacity = pool.entries.capacity,
+            .index_count = pool.index.count(),
+            .last_idx = pool.last_idx,
+            .active_cells_ptr = screen.active[0].cells.ptr,
+            .title_ptr = screen.last_title.?.ptr,
+        };
+    }
+
+    fn deinit(self: *LiveRestoreState, allocator: std.mem.Allocator) void {
+        allocator.free(self.bytes);
+        allocator.free(self.entries);
+    }
+
+    fn expectUnchanged(self: *const LiveRestoreState, screen: *const Screen, pool: *const Pool) !void {
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(testing.allocator);
+        try serialize(screen, &out, testing.allocator);
+        try testing.expectEqualSlices(u8, self.bytes, out.items);
+        try testing.expectEqual(self.entries_ptr, pool.entries.items.ptr);
+        try testing.expectEqual(self.entries_capacity, pool.entries.capacity);
+        try testing.expectEqual(self.index_count, pool.index.count());
+        try testing.expectEqual(self.last_idx, pool.last_idx);
+        try testing.expectEqual(self.active_cells_ptr, screen.active[0].cells.ptr);
+        try testing.expectEqual(self.title_ptr, screen.last_title.?.ptr);
+        try testing.expectEqual(self.entries.len, pool.entries.items.len);
+        for (self.entries, pool.entries.items) |before, after| {
+            try testing.expect(style_pool.Entry.equal(before, after));
+        }
+    }
+};
+
+fn initPopulatedLiveScreen(allocator: std.mem.Allocator, pool: *Pool) !*Screen {
+    const red = style_pool.Entry{ .fg = .{ .palette = 1 } };
+    const green = style_pool.Entry{ .fg = .{ .palette = 2 } };
+    const red_idx = try pool.intern(red);
+    const green_idx = try pool.intern(green);
+    const screen = try Screen.init(allocator, pool, 9, 3);
+    errdefer screen.deinit();
+    screen.active[0].cells[0].rune = 'L';
+    screen.active[0].cells[0].style_ref = red_idx;
+    screen.active[1].cells[2].rune = 'V';
+    screen.active[1].cells[2].style_ref = green_idx;
+    screen.row = 1;
+    screen.col = 2;
+    screen.scrollback_capacity = 2;
+    screen.last_title = try allocator.dupe(u8, "live screen");
+    const uri = try allocator.dupe(u8, "https://live.invalid");
+    errdefer allocator.free(uri);
+    try screen.links.put(7, uri);
+    screen.current_link_id = 7;
+    screen.next_link_id = 8;
+    return screen;
+}
+
+fn expectLivePoolLookup(pool: *Pool) !void {
+    const before_len = pool.entries.items.len;
+    const red = style_pool.Entry{ .fg = .{ .palette = 1 } };
+    try testing.expectEqual(@as(u16, 1), try pool.intern(red));
+    try testing.expectEqual(before_len, pool.entries.items.len);
+}
+
+fn makeFailureSnapshot(allocator: std.mem.Allocator) ![]u8 {
+    const gp = @import("../parser/glyph_protocol.zig");
+    var h = try Harness.init(allocator, 12, 4);
+    defer h.deinit();
+    h.screen.retain_images = true;
+    h.feed("\x1b[31mred\x1b[0m\r\n");
+    h.feed("\x1b[1;4;38:2::10:20:30mfancy\x1b[0m\r\n");
+    for (0..10) |_| h.feed("scroll line\r\n");
+    h.feed("\x1b]0;replacement title\x07");
+    h.feed("\x1b[?1049halt e\xcc\x81 ");
+    h.feed("\x1b]8;;https://replacement.invalid\x07link\x1b]8;;\x07");
+    h.feed("\x1b_Gf=32,s=1,v=1,t=d,a=T,i=9,p=2,z=5;/wAA/w==\x1b\\");
+    const triangle = try gp.triangleBytes(allocator);
+    defer allocator.free(triangle);
+    const glyph = try allocator.dupe(u8, triangle);
+    try h.screen.glyphs.registerAdopt(0xE100, glyph, .glyf, 1000, 1);
+    try testing.expect(h.pool.entries.items.len > 1);
+    try testing.expect(h.screen.alt != null);
+    try testing.expect(h.screen.scrollbackCount() > 2);
+    try testing.expect(h.screen.last_title != null);
+    try testing.expect(h.screen.links.count() > 0);
+    try testing.expect(h.screen.clusters.count() > 0);
+    try testing.expect(h.screen.retained_images.items.len > 0);
+    try testing.expect(h.screen.glyphs.count() > 0);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try serialize(h.screen, &out, allocator);
+    return out.toOwnedSlice(allocator);
+}
+
+const FirstLineOffsets = struct {
+    n_styles: u16,
+    scaling: usize,
+    first_cell: usize,
+};
+
+fn firstLineOffsets(bytes: []const u8) !FirstLineOffsets {
+    var src = Src{ .bytes = bytes };
+    _ = try src.int(u32);
+    _ = try src.int(u16);
+    _ = try src.int(u16);
+    const n_styles = try src.int(u16);
+    for (0..n_styles) |_| {
+        _ = try src.color();
+        _ = try src.color();
+        _ = try src.color();
+        _ = try src.int(u16);
+    }
+    _ = try src.int(u64);
+    _ = try src.boolean();
+    const scaling = src.pos;
+    _ = try src.byte();
+    _ = try src.int(u16);
+    return .{ .n_styles = n_styles, .scaling = scaling, .first_cell = src.pos };
+}
+
+const RestoreAllocationRange = struct {
+    first: usize,
+    restore_end: usize,
+    end: usize,
+};
+
+fn runRestoreAllocationFailure(snapshot_bytes: []const u8, fail_index: ?usize) !RestoreAllocationRange {
+    var config: testing.FailingAllocator.Config = .{};
+    if (fail_index) |index| config.fail_index = index;
+    var failing = testing.FailingAllocator.init(testing.allocator, config);
+    const allocator = failing.allocator();
+
+    var pool = try Pool.init(allocator);
+    defer pool.deinit();
+    var live = try initPopulatedLiveScreen(allocator, &pool);
+    defer live.deinit();
+    var before = try LiveRestoreState.capture(testing.allocator, live, &pool);
+    defer before.deinit(testing.allocator);
+
+    const first = failing.alloc_index;
+    var restore_end = first;
+    var failure: ?anyerror = null;
+    restore_attempt: {
+        var staged = restoreStaged(allocator, &pool, snapshot_bytes) catch |err| {
+            failure = err;
+            break :restore_attempt;
+        };
+        defer staged.deinit();
+        restore_end = failing.alloc_index;
+        staged.screen.setScrollbackCapacity(live.scrollback_capacity) catch |err| {
+            failure = err;
+            break :restore_attempt;
+        };
+    }
+    const end = failing.alloc_index;
+
+    if (fail_index != null) {
+        try testing.expect(failing.has_induced_failure);
+        try testing.expect(failure != null);
+    } else {
+        try testing.expect(!failing.has_induced_failure);
+        try testing.expectEqual(@as(?anyerror, null), failure);
+    }
+    try before.expectUnchanged(live, &pool);
+    try expectLivePoolLookup(&pool);
+    return .{ .first = first, .restore_end = restore_end, .end = end };
+}
+
+test "snapshot: failed staged restores preserve a populated live screen and pool" {
+    const a = testing.allocator;
+    const snapshot_bytes = try makeFailureSnapshot(a);
+    defer a.free(snapshot_bytes);
+    const offsets = try firstLineOffsets(snapshot_bytes);
+
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+    const live = try initPopulatedLiveScreen(a, &pool);
+    defer live.deinit();
+    var before = try LiveRestoreState.capture(a, live, &pool);
+    defer before.deinit(a);
+
+    try testing.expectError(
+        error.Truncated,
+        restoreStaged(a, &pool, snapshot_bytes[0 .. offsets.first_cell + @sizeOf(Cell) - 1]),
+    );
+    try before.expectUnchanged(live, &pool);
+
+    const old_scaling = snapshot_bytes[offsets.scaling];
+    snapshot_bytes[offsets.scaling] = 4;
+    try testing.expectError(error.BadSnapshot, restoreStaged(a, &pool, snapshot_bytes));
+    snapshot_bytes[offsets.scaling] = old_scaling;
+    try before.expectUnchanged(live, &pool);
+
+    const style_offset = offsets.first_cell + @offsetOf(Cell, "style_ref");
+    const old_style = std.mem.readInt(u16, snapshot_bytes[style_offset..][0..2], .little);
+    std.mem.writeInt(u16, snapshot_bytes[style_offset..][0..2], offsets.n_styles, .little);
+    try testing.expectError(error.BadSnapshot, restoreStaged(a, &pool, snapshot_bytes));
+    std.mem.writeInt(u16, snapshot_bytes[style_offset..][0..2], old_style, .little);
+    try before.expectUnchanged(live, &pool);
+    try expectLivePoolLookup(&pool);
+}
+
+test "snapshot: every staged restore allocation failure preserves live state" {
+    const a = testing.allocator;
+    const snapshot_bytes = try makeFailureSnapshot(a);
+    defer a.free(snapshot_bytes);
+
+    const baseline = try runRestoreAllocationFailure(snapshot_bytes, null);
+    try testing.expect(baseline.restore_end > baseline.first);
+    try testing.expect(baseline.end > baseline.restore_end);
+    for (baseline.first..baseline.end) |fail_index| {
+        _ = try runRestoreAllocationFailure(snapshot_bytes, fail_index);
+    }
+}
 
 test "restore rebuilds the pool index: colours don't swap after a resize" {
     const a = testing.allocator;
