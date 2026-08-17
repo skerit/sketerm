@@ -241,7 +241,7 @@ fn onChanged(
 /// Start (or don't) the watcher for a freshly built window.
 pub fn install(window: *Window) void {
     if (!window.config.config_auto_reload) return;
-    const path = winconfig.resolveActiveConfigPath(window.allocator) orelse return;
+    const path = winconfig.resolveActiveConfigPath(window.allocator) catch return;
     defer window.allocator.free(path);
     window.config_watch = Watcher.start(window, path);
 }

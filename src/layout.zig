@@ -8,6 +8,9 @@ const c = @import("c.zig").c;
 const browser_model = @import("filebrowser/model.zig");
 const editor_model = @import("editor/model.zig");
 const web_model = @import("web/model.zig");
+const atomicwrite = @import("util/atomicwrite.zig");
+
+pub const MAX_FILE_BYTES: usize = 1024 * 1024;
 
 pub const Orient = enum { horizontal, vertical };
 
@@ -102,36 +105,20 @@ pub const Layout = struct {
 // every file transfer there. There is now exactly one, in
 // `util/platform.zig`. Do not reintroduce a local variant.
 
-pub fn save(layout: Layout, path: []const u8) !void {
+pub fn save(allocator: std.mem.Allocator, layout: Layout, path: []const u8) !void {
     try makeParentDirs(path);
+    try atomicwrite.writeSerialized(
+        allocator,
+        path,
+        MAX_FILE_BYTES,
+        0o600,
+        layout,
+        serialiseForSave,
+    );
+}
 
-    var path_z: [4096]u8 = undefined;
-    if (path.len + 4 >= path_z.len) return error.PathTooLong;
-    @memcpy(path_z[0..path.len], path);
-    path_z[path.len] = 0;
-
-    var tmp_z: [4096]u8 = undefined;
-    @memcpy(tmp_z[0..path.len], path);
-    @memcpy(tmp_z[path.len .. path.len + 4], ".tmp");
-    tmp_z[path.len + 4] = 0;
-
-    const fp = c.fopen(@ptrCast(&tmp_z), "wb") orelse return error.WriteFailed;
-    var write_buf: [16384]u8 = undefined;
-    var w = std.Io.Writer.fixed(&write_buf);
-    std.json.Stringify.value(layout, .{ .whitespace = .indent_2 }, &w) catch |err| {
-        _ = c.fclose(fp);
-        return err;
-    };
-    const bytes = w.buffered();
-    if (c.fwrite(bytes.ptr, 1, bytes.len, fp) != bytes.len) {
-        _ = c.fclose(fp);
-        return error.WriteFailed;
-    }
-    if (c.fclose(fp) != 0) return error.WriteFailed;
-    if (c.rename(@ptrCast(&tmp_z), @ptrCast(&path_z)) != 0) {
-        _ = c.unlink(@ptrCast(&tmp_z));
-        return error.WriteFailed;
-    }
+fn serialiseForSave(layout: Layout, w: *std.Io.Writer) !void {
+    try std.json.Stringify.value(layout, .{ .whitespace = .indent_2 }, w);
 }
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Layout) {
@@ -140,7 +127,7 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Lay
     defer _ = c.fclose(fp);
     if (c.fseek(fp, 0, c.SEEK_END) != 0) return error.ReadFailed;
     const size_long = c.ftell(fp);
-    if (size_long <= 0 or size_long > 1024 * 1024) return error.BadFile;
+    if (size_long <= 0 or size_long > MAX_FILE_BYTES) return error.BadFile;
     if (c.fseek(fp, 0, c.SEEK_SET) != 0) return error.ReadFailed;
     const size: usize = @intCast(size_long);
     const bytes = try allocator.alloc(u8, size);
@@ -199,7 +186,7 @@ test "round trip preserves editor pane state" {
         .command = &cmd,
         .editor = .{ .files = &files, .active = 1 },
     } } }};
-    try save(Layout{ .tabs = &tabs }, file_path);
+    try save(a, Layout{ .tabs = &tabs }, file_path);
     const parsed = try load(a, file_path);
     defer parsed.deinit();
     const state = parsed.value.tabs[0].tree.pane.editor.?;
@@ -235,7 +222,7 @@ test "round trip with split tree" {
         .{ .title = "single", .tree = .{ .pane = .{ .cwd = "/var", .command = &cmd1 } } },
     };
     const layout = Layout{ .tabs = &tabs };
-    try save(layout, file_path);
+    try save(a, layout, file_path);
 
     const parsed = try load(a, file_path);
     defer parsed.deinit();
@@ -269,7 +256,7 @@ test "round trip preserves PaneSpec.profile" {
             .profile = "ssh-prod",
         } } },
     };
-    try save(.{ .tabs = &tabs }, file_path);
+    try save(a, .{ .tabs = &tabs }, file_path);
 
     const parsed = try load(a, file_path);
     defer parsed.deinit();
@@ -300,7 +287,7 @@ test "round trip preserves TabSpec.pinned" {
             .command = &cmd,
         } } }, // pinned defaults to false
     };
-    try save(.{ .tabs = &tabs }, file_path);
+    try save(a, .{ .tabs = &tabs }, file_path);
 
     const parsed = try load(a, file_path);
     defer parsed.deinit();
@@ -326,7 +313,7 @@ test "round trip preserves per-tab effect toggles, defaults on old files" {
         // Defaults.
         .{ .title = "plain", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } } },
     };
-    try save(.{ .tabs = &tabs }, file_path);
+    try save(a, .{ .tabs = &tabs }, file_path);
 
     const parsed = try load(a, file_path);
     defer parsed.deinit();
@@ -354,7 +341,7 @@ test "round trip preserves tab-tree nesting; old files load flat" {
         .{ .title = "child", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } }, .tree_parent = 0 },
         .{ .title = "root2", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } } },
     };
-    try save(.{ .tabs = &tabs }, file_path);
+    try save(a, .{ .tabs = &tabs }, file_path);
 
     const parsed = try load(a, file_path);
     defer parsed.deinit();
@@ -448,7 +435,7 @@ test "round trip preserves web pane state" {
         .ratio = 0.5,
         .children = &kids,
     } } }};
-    try save(.{ .tabs = &tabs }, file_path);
+    try save(a, .{ .tabs = &tabs }, file_path);
 
     const parsed = try load(a, file_path);
     defer parsed.deinit();
@@ -515,11 +502,71 @@ test "round trip preserves full browser pane state" {
         .command = &cmd,
         .browser = .{ .tabs = &btabs },
     } } }};
-    try save(.{ .tabs = &tabs }, file_path);
+    try save(a, .{ .tabs = &tabs }, file_path);
     const parsed = try load(a, file_path);
     defer parsed.deinit();
     const state = parsed.value.tabs[0].tree.pane.browser.?;
     try std.testing.expectEqual(browser_model.ViewMode.miller, state.tabs[0].view);
     try std.testing.expectEqualStrings("box", state.tabs[0].location.host);
     try std.testing.expect(state.tabs[0].show_hidden);
+}
+
+test "layout save accepts the load limit and preserves the old file on rejection" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-layout-size-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/layout.json", .{base});
+    defer _ = c.unlink(path.ptr);
+
+    const command = [_][]const u8{"sh"};
+    var tabs = [_]TabSpec{.{
+        .title = "",
+        .tree = .{ .pane = .{ .cwd = "/", .command = &command } },
+    }};
+    var overhead_buf: [1024]u8 = undefined;
+    var overhead_writer = std.Io.Writer.fixed(&overhead_buf);
+    try serialiseForSave(.{ .tabs = &tabs }, &overhead_writer);
+    const overhead = overhead_writer.buffered().len;
+
+    const targets = [_]usize{
+        16 * 1024,
+        16 * 1024 + 1,
+        MAX_FILE_BYTES - 1,
+        MAX_FILE_BYTES,
+    };
+    for (targets) |target| {
+        const title = try t.allocator.alloc(u8, target - overhead);
+        defer t.allocator.free(title);
+        @memset(title, 'x');
+        tabs[0].title = title;
+        try save(t.allocator, .{ .tabs = &tabs }, path);
+
+        var st: c.struct_stat = undefined;
+        try t.expect(c.stat(path.ptr, &st) == 0);
+        try t.expectEqual(target, @as(usize, @intCast(st.st_size)));
+        const parsed = try load(t.allocator, path);
+        defer parsed.deinit();
+        try t.expectEqual(title.len, parsed.value.tabs[0].title.len);
+        try t.expect(std.mem.allEqual(u8, parsed.value.tabs[0].title, 'x'));
+    }
+
+    const too_large_title = try t.allocator.alloc(u8, MAX_FILE_BYTES + 1 - overhead);
+    defer t.allocator.free(too_large_title);
+    @memset(too_large_title, 'y');
+    tabs[0].title = too_large_title;
+    try t.expectError(error.OutputTooLarge, save(t.allocator, .{ .tabs = &tabs }, path));
+
+    var allocator_config: t.FailingAllocator.Config = .{};
+    allocator_config.fail_index = 0;
+    var failing = t.FailingAllocator.init(t.allocator, allocator_config);
+    try t.expectError(error.OutOfMemory, save(failing.allocator(), .{ .tabs = &tabs }, path));
+    try t.expect(failing.has_induced_failure);
+
+    const preserved = try load(t.allocator, path);
+    defer preserved.deinit();
+    try t.expectEqual(MAX_FILE_BYTES - overhead, preserved.value.tabs[0].title.len);
+    try t.expect(std.mem.allEqual(u8, preserved.value.tabs[0].title, 'x'));
 }

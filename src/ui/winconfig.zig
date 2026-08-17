@@ -1048,15 +1048,29 @@ test "continuous shader animation suppresses graphics offload" {
 /// `--config` override when there is one, so an in-app edit does not
 /// silently land in the XDG file the user isn't using.
 pub fn persistConfig(self: *Window) void {
-    const path = resolveActiveConfigPath(self.allocator) orelse return;
+    const path = resolveActiveConfigPath(self.allocator) catch |err| {
+        reportConfigPersistError(self, err);
+        return;
+    };
     defer self.allocator.free(path);
-    self.config.save(path) catch |err| {
-        std.debug.print("sketerm: prefs persist failed: {s}\n", .{@errorName(err)});
+    self.config.save(self.allocator, path) catch |err| {
+        reportConfigPersistError(self, err);
         return;
     };
     // Our own write must not come back through the file watcher as a
     // user edit — every in-app save lands here, sliders included.
     @import("configwatch.zig").noteSelfWrite(self);
+}
+
+fn reportConfigPersistError(self: *Window, err: anyerror) void {
+    std.debug.print("sketerm: prefs persist failed: {s}\n", .{@errorName(err)});
+    if (self.destroying) return;
+    var msg: [224]u8 = undefined;
+    winmod.showToast(
+        self,
+        std.fmt.bufPrint(&msg, "Preferences applied but could not be saved: {s}", .{@errorName(err)}) catch
+            "Preferences applied but could not be saved",
+    );
 }
 
 /// Rebuild bg_source from config: decode the image (if any) or
@@ -1352,11 +1366,10 @@ pub fn configPathOverride() ?[]const u8 {
 }
 
 /// The file the running process loaded its config from: the
-/// `--config` override, else the XDG path. Caller frees. Null when
-/// neither HOME nor XDG_CONFIG_HOME is set (nothing to watch).
-pub fn resolveActiveConfigPath(allocator: std.mem.Allocator) ?[]u8 {
-    if (config_override_path) |p| return allocator.dupe(u8, p) catch null;
-    return resolveConfigSavePath(allocator) catch null;
+/// `--config` override, else the XDG path; caller frees the result.
+pub fn resolveActiveConfigPath(allocator: std.mem.Allocator) ![]u8 {
+    if (config_override_path) |p| return try allocator.dupe(u8, p);
+    return try resolveConfigSavePath(allocator);
 }
 
 pub fn onShaderPicked(user: ?*anyopaque, result: ?@import("../filebrowser/picker.zig").Result) void {

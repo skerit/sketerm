@@ -836,7 +836,10 @@ pub fn saveLayoutAs(self: *Window) void {
         },
         &onSaveLayoutAsDone,
         @ptrCast(self),
-    ) catch return;
+    ) catch |err| {
+        reportLayoutSaveError(self, err);
+        return;
+    };
 }
 
 /// Pick a saved layout (.json/.layout) and append its tabs to the
@@ -864,7 +867,7 @@ pub fn saveLayoutToDefault(self: *Window) !void {
 
     const path = try layout_mod.defaultSavePath(arena);
     const layout = try self.collectLayout(arena);
-    try layout_mod.save(layout, path);
+    try layout_mod.save(self.allocator, layout, path);
 }
 
 /// Save current state to the default path. Non-fatal: a failure is
@@ -957,17 +960,21 @@ pub fn saveDefaultLayout(self: *Window) void {
 
     const path = layout_mod.defaultLayoutPath(arena) catch |err| {
         std.debug.print("sketerm: default layout path failed: {s}\n", .{@errorName(err)});
+        reportLayoutSaveError(self, err);
         return;
     };
     const layout = self.collectLayout(arena) catch |err| {
         std.debug.print("sketerm: collect layout failed: {s}\n", .{@errorName(err)});
+        reportLayoutSaveError(self, err);
         return;
     };
-    layout_mod.save(layout, path) catch |err| {
+    layout_mod.save(self.allocator, layout, path) catch |err| {
         std.debug.print("sketerm: save default layout to {s} failed: {s}\n", .{ path, @errorName(err) });
+        reportLayoutSaveError(self, err);
         return;
     };
     std.debug.print("sketerm: saved default layout to {s}\n", .{path});
+    winmod.showToast(self, "Default layout saved");
 }
 
 /// Load $XDG_STATE_HOME/sketerm/default.json if it exists. Returns
@@ -1013,8 +1020,25 @@ pub fn onSaveLayoutAsDone(user: ?*anyopaque, result: ?fpicker.Result) void {
     var arena_state = std.heap.ArenaAllocator.init(self.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const layout = self.collectLayout(arena) catch return;
-    layout_mod.save(layout, path) catch return;
+    const layout = self.collectLayout(arena) catch |err| {
+        reportLayoutSaveError(self, err);
+        return;
+    };
+    layout_mod.save(self.allocator, layout, path) catch |err| {
+        std.debug.print("sketerm: save layout to {s} failed: {s}\n", .{ path, @errorName(err) });
+        reportLayoutSaveError(self, err);
+        return;
+    };
+    winmod.showToast(self, "Layout saved");
+}
+
+fn reportLayoutSaveError(self: *Window, err: anyerror) void {
+    logActionError("save_layout", err);
+    var msg: [192]u8 = undefined;
+    winmod.showToast(
+        self,
+        std.fmt.bufPrint(&msg, "Could not save layout: {s}", .{@errorName(err)}) catch "Could not save layout",
+    );
 }
 
 pub fn onLoadLayoutDone(user: ?*anyopaque, result: ?fpicker.Result) void {

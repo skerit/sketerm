@@ -13,7 +13,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const lsp_servers = @import("lsp/servers.zig");
 const filtersub = @import("web/filtersub.zig");
+const atomicwrite = @import("util/atomicwrite.zig");
 pub const titlefmt = @import("util/titlefmt.zig");
+
+pub const MAX_FILE_BYTES: usize = 64 * 1024;
 
 /// Historical tab-label behaviour: the OSC 0/2 title, verbatim.
 pub const default_tab_title = "{{ TITLE }}";
@@ -1535,13 +1538,12 @@ pub const Config = struct {
         path_z[path.len] = 0;
         const fp = c.fopen(@ptrCast(&path_z), "rb") orelse return error.NotReadable;
         defer _ = c.fclose(fp);
-        const max_bytes: usize = 64 * 1024;
-        var buf: [max_bytes]u8 = undefined;
+        var buf: [MAX_FILE_BYTES + 1]u8 = undefined;
         const n = c.fread(&buf, 1, buf.len, fp);
-        if (n == buf.len and c.feof(fp) == 0) {
+        if (n > MAX_FILE_BYTES) {
             warnConfig("{s} larger than 64 KiB; trailing settings ignored", .{path});
         }
-        var cfg = try loadFromBytes(allocator, buf[0..n]);
+        var cfg = try loadFromBytes(allocator, buf[0..@min(n, MAX_FILE_BYTES)]);
         applyEnvOverrides(&cfg, allocator);
         return cfg;
     }
@@ -1601,8 +1603,7 @@ pub const Config = struct {
         return self.platform_sections.items.len > 0;
     }
 
-    pub fn save(self: *const Config, path: []const u8) !void {
-        const c = @import("c.zig").c;
+    pub fn save(self: *const Config, allocator: std.mem.Allocator, path: []const u8) !void {
         try makeParentDirs(path);
         if (self.hasPlatformSections()) {
             warnConfig(
@@ -1611,33 +1612,18 @@ pub const Config = struct {
             );
         }
 
-        var path_z: [4096]u8 = undefined;
-        if (path.len + 4 >= path_z.len) return error.PathTooLong;
-        @memcpy(path_z[0..path.len], path);
-        path_z[path.len] = 0;
+        try atomicwrite.writeSerialized(
+            allocator,
+            path,
+            MAX_FILE_BYTES,
+            0o600,
+            self,
+            serialiseForSave,
+        );
+    }
 
-        var tmp_z: [4096]u8 = undefined;
-        @memcpy(tmp_z[0..path.len], path);
-        @memcpy(tmp_z[path.len .. path.len + 4], ".tmp");
-        tmp_z[path.len + 4] = 0;
-
-        const fp = c.fopen(@ptrCast(&tmp_z), "wb") orelse return error.WriteFailed;
-        var write_buf: [16384]u8 = undefined;
-        var w = std.Io.Writer.fixed(&write_buf);
-        self.serialise(&w) catch |err| {
-            _ = c.fclose(fp);
-            return err;
-        };
-        const bytes = w.buffered();
-        if (c.fwrite(bytes.ptr, 1, bytes.len, fp) != bytes.len) {
-            _ = c.fclose(fp);
-            return error.WriteFailed;
-        }
-        if (c.fclose(fp) != 0) return error.WriteFailed;
-        if (c.rename(@ptrCast(&tmp_z), @ptrCast(&path_z)) != 0) {
-            _ = c.unlink(@ptrCast(&tmp_z));
-            return error.WriteFailed;
-        }
+    fn serialiseForSave(self: *const Config, w: *std.Io.Writer) !void {
+        try self.serialise(w);
     }
 
     /// Same content as save() but directly into a Writer — used by
@@ -5107,7 +5093,7 @@ test "config: the prefs save path keeps platform sections and flattens this plat
     , .{ p.mine, p.other });
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
-    try cfg.save(path);
+    try cfg.save(std.testing.allocator, path);
 
     var re = try Config.loadFromPath(std.testing.allocator, path);
     defer re.deinit();
@@ -5128,6 +5114,63 @@ test "config: the prefs save path keeps platform sections and flattens this plat
     try std.testing.expect(std.mem.indexOf(u8, text, "font_size = 10") == null);
     const hdr_at = std.mem.indexOf(u8, text, "[platform.") orelse return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.indexOf(u8, text[0..hdr_at], "font_size = 20") != null);
+}
+
+test "config: save accepts the load limit and preserves the old file on rejection" {
+    const t = std.testing;
+    const c = @import("c.zig").c;
+    var tmpl = "/tmp/sketerm-config-size-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/config.conf", .{base});
+    defer _ = c.unlink(path.ptr);
+
+    var empty_value = Config{ .word_chars = "" };
+    var overhead_buf: [256]u8 = undefined;
+    var overhead_writer = std.Io.Writer.fixed(&overhead_buf);
+    try empty_value.serialise(&overhead_writer);
+    const overhead = overhead_writer.buffered().len;
+
+    const targets = [_]usize{
+        16 * 1024,
+        16 * 1024 + 1,
+        MAX_FILE_BYTES - 1,
+        MAX_FILE_BYTES,
+    };
+    for (targets) |target| {
+        const value = try t.allocator.alloc(u8, target - overhead);
+        defer t.allocator.free(value);
+        @memset(value, 'x');
+        var cfg = Config{ .word_chars = value };
+        try cfg.save(t.allocator, path);
+
+        var st: c.struct_stat = undefined;
+        try t.expect(c.stat(path.ptr, &st) == 0);
+        try t.expectEqual(target, @as(usize, @intCast(st.st_size)));
+        var loaded = try Config.loadFromPath(t.allocator, path);
+        defer loaded.deinit();
+        try t.expectEqual(value.len, loaded.word_chars.len);
+        try t.expect(std.mem.allEqual(u8, loaded.word_chars, 'x'));
+    }
+
+    const too_large_value = try t.allocator.alloc(u8, MAX_FILE_BYTES + 1 - overhead);
+    defer t.allocator.free(too_large_value);
+    @memset(too_large_value, 'y');
+    var too_large = Config{ .word_chars = too_large_value };
+    try t.expectError(error.OutputTooLarge, too_large.save(t.allocator, path));
+
+    var allocator_config: t.FailingAllocator.Config = .{};
+    allocator_config.fail_index = 0;
+    var failing = t.FailingAllocator.init(t.allocator, allocator_config);
+    try t.expectError(error.OutOfMemory, too_large.save(failing.allocator(), path));
+    try t.expect(failing.has_induced_failure);
+
+    var preserved = try Config.loadFromPath(t.allocator, path);
+    defer preserved.deinit();
+    try t.expectEqual(MAX_FILE_BYTES - overhead, preserved.word_chars.len);
+    try t.expect(std.mem.allEqual(u8, preserved.word_chars, 'x'));
 }
 
 test "config: web_search_engine parses, validates, round-trips and clones" {

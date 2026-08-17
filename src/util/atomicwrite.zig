@@ -60,6 +60,59 @@ pub fn writeFile(path: []const u8, bytes: []const u8, create_mode: u32) Error!vo
     return writeFileWithOps(&ops, path, bytes, create_mode);
 }
 
+const PosixFileWriter = struct {
+    fn write(_: *@This(), path: []const u8, bytes: []const u8, create_mode: u32) Error!void {
+        return writeFile(path, bytes, create_mode);
+    }
+};
+
+/// Serialize at most `max_bytes` before atomically replacing `path`.
+pub fn writeSerialized(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+    create_mode: u32,
+    value: anytype,
+    comptime serialise: anytype,
+) !void {
+    var file_writer: PosixFileWriter = .{};
+    return writeSerializedWith(
+        allocator,
+        path,
+        max_bytes,
+        create_mode,
+        value,
+        serialise,
+        &file_writer,
+    );
+}
+
+fn writeSerializedWith(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_bytes: usize,
+    create_mode: u32,
+    value: anytype,
+    comptime serialise: anytype,
+    file_writer: anytype,
+) !void {
+    // Allocating gives formatters their normal growable-writer semantics;
+    // the fixed backing allocator turns the load limit into a hard ceiling.
+    const storage = try allocator.alloc(u8, max_bytes);
+    defer allocator.free(storage);
+    var bounded = std.heap.FixedBufferAllocator.init(storage);
+    var out = std.Io.Writer.Allocating.initCapacity(bounded.allocator(), max_bytes) catch
+        return error.OutOfMemory;
+    defer out.deinit();
+
+    serialise(value, &out.writer) catch |err| {
+        // The bounded allocator is the only source of Writer failure here.
+        if (err == error.WriteFailed) return error.OutputTooLarge;
+        return err;
+    };
+    try file_writer.write(path, out.written(), create_mode);
+}
+
 fn writeFileWithOps(ops: anytype, path: []const u8, bytes: []const u8, create_mode: u32) Error!void {
     if (path.len == 0 or path.len >= MAX_PATH) return error.NameTooLong;
 
@@ -252,6 +305,109 @@ fn readTestFile(path: []const u8, buf: []u8) ![]const u8 {
         used += @intCast(n);
     }
     return buf[0..used];
+}
+
+const SerializedFixture = struct {
+    bytes: []const u8,
+    fail: bool = false,
+
+    fn serialise(self: *const @This(), writer: *std.Io.Writer) !void {
+        try writer.writeAll(self.bytes);
+        if (self.fail) return error.SerializationFailed;
+    }
+};
+
+const FailingFileWriter = struct {
+    failure: ?Error = null,
+    calls: usize = 0,
+
+    fn write(self: *@This(), path: []const u8, bytes: []const u8, create_mode: u32) Error!void {
+        self.calls += 1;
+        if (self.failure) |err| return err;
+        return writeFile(path, bytes, create_mode);
+    }
+};
+
+test "writeSerialized preserves the old file across every pre-install failure" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-serialized-fail-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+    try writeFile(path, "old-valid", 0o600);
+
+    const fixture: SerializedFixture = .{ .bytes = "new-valid" };
+    var allocator_config: t.FailingAllocator.Config = .{};
+    allocator_config.fail_index = 0;
+    var failing_allocator = t.FailingAllocator.init(t.allocator, allocator_config);
+    var file_writer: FailingFileWriter = .{};
+    try t.expectError(error.OutOfMemory, writeSerializedWith(
+        failing_allocator.allocator(),
+        path,
+        64,
+        0o600,
+        &fixture,
+        SerializedFixture.serialise,
+        &file_writer,
+    ));
+    try t.expect(failing_allocator.has_induced_failure);
+    try t.expectEqual(@as(usize, 0), file_writer.calls);
+
+    const broken: SerializedFixture = .{ .bytes = "partial", .fail = true };
+    try t.expectError(error.SerializationFailed, writeSerializedWith(
+        t.allocator,
+        path,
+        64,
+        0o600,
+        &broken,
+        SerializedFixture.serialise,
+        &file_writer,
+    ));
+    try t.expectEqual(@as(usize, 0), file_writer.calls);
+
+    const oversized: SerializedFixture = .{ .bytes = "123456789" };
+    try t.expectError(error.OutputTooLarge, writeSerializedWith(
+        t.allocator,
+        path,
+        8,
+        0o600,
+        &oversized,
+        SerializedFixture.serialise,
+        &file_writer,
+    ));
+    try t.expectEqual(@as(usize, 0), file_writer.calls);
+
+    file_writer.failure = error.WriteFailed;
+    try t.expectError(error.WriteFailed, writeSerializedWith(
+        t.allocator,
+        path,
+        64,
+        0o600,
+        &fixture,
+        SerializedFixture.serialise,
+        &file_writer,
+    ));
+    try t.expectEqual(@as(usize, 1), file_writer.calls);
+
+    file_writer.failure = error.RenameFailed;
+    try t.expectError(error.RenameFailed, writeSerializedWith(
+        t.allocator,
+        path,
+        64,
+        0o600,
+        &fixture,
+        SerializedFixture.serialise,
+        &file_writer,
+    ));
+    try t.expectEqual(@as(usize, 2), file_writer.calls);
+
+    var got: [32]u8 = undefined;
+    try t.expectEqualStrings("old-valid", try readTestFile(path, &got));
 }
 
 test "writeFile completes short writes and syncs the parent" {
