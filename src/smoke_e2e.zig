@@ -2023,6 +2023,11 @@ fn commandPaletteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pa
     // "the shell" then asserts on pane 1.
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(300, 5_000);
+    // Hand the next stage a QUIET window: the dialog dismisses with a
+    // fade, and until it finishes GTK can still route (and eat) the
+    // first keystrokes typed at the shell underneath.
+    if (app.windows.items.len > 0)
+        _ = app.waitVisualSettle(app.windows.items[0].id, 300, 5_000, 0.002, null);
     return null;
 }
 
@@ -8604,7 +8609,28 @@ fn cursorRow(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?usize {
 fn copyModeStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
     // Three words sharing a prefix, so a motion that stops one word
     // early or late yanks something visibly different.
-    app.typeText(null, "echo ZQalpha ZQbeta ZQgamma\n") catch return "injecting the sample line failed";
+    //
+    // Typed WITHOUT the newline first, and verified on the prompt
+    // before submitting: a stage that just tore down a dialog (the
+    // palette) can leave GTK routing the first few keystrokes into the
+    // dying grab: one real run lost exactly "echo" and executed
+    // " ZQalpha ..." as a command. Retyping after ctrl+u is safe and
+    // does not weaken the marker assertion below, which still demands
+    // the shell actually ECHO the line.
+    const sample = "echo ZQalpha ZQbeta ZQgamma";
+    var typed_ok = false;
+    var attempts: u32 = 0;
+    while (attempts < 5) : (attempts += 1) {
+        app.pressKey(null, "ctrl+u") catch return "clearing the shell line failed";
+        _ = app.waitIdle(120, 2_000);
+        app.typeText(null, sample) catch return "injecting the sample line failed";
+        if (waitMarkerCount(allocator, sock_path, sample, 1, 3_000)) {
+            typed_ok = true;
+            break;
+        }
+    }
+    if (!typed_ok) return "the sample line never appeared intact on the prompt";
+    app.typeText(null, "\n") catch return "injecting the sample line failed";
     // Twice: the echoed command line, and its output.
     if (!waitMarkerCount(allocator, sock_path, "ZQbeta", 2, 15_000)) {
         // Say WHICH way it went wrong: a pane that no longer exists, a
