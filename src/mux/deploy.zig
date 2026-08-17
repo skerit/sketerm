@@ -440,10 +440,12 @@ fn runSshCommand(_: ?*anyopaque, ssh_bin: [*:0]const u8, host: []const u8, comma
 
 const FakeRunner = struct {
     statuses: [2]u8,
+    expected_arch_case: []const u8 = "",
     calls: usize = 0,
     uploads: usize = 0,
     upload_script_ok: bool = false,
     check_script_ok: bool = false,
+    arch_guard_ok: bool = false,
 
     fn run(raw: ?*anyopaque, _: [*:0]const u8, _: []const u8, command: [:0]const u8, input: ?[]const u8) u8 {
         const self: *FakeRunner = @ptrCast(@alignCast(raw.?));
@@ -459,6 +461,8 @@ const FakeRunner = struct {
             // payload read, and ends in a newline.
             self.check_script_ok = std.mem.indexOf(u8, command, "head -c 1234 ") != null and
                 command.len > 0 and command[command.len - 1] == '\n';
+            self.arch_guard_ok = self.expected_arch_case.len == 0 or
+                std.mem.indexOf(u8, command, self.expected_arch_case) != null;
         }
         const status = self.statuses[@min(self.calls, self.statuses.len - 1)];
         self.calls += 1;
@@ -577,15 +581,37 @@ test "deployment falls back when an upload fails" {
     try std.testing.expectEqual(@as(usize, 1), fake.uploads);
 }
 
-test "portable artifact architecture comes from its ELF header" {
+test "deployment accepts supported portable ELF architectures" {
+    const cases = [_]struct { machine: u16, arch: Arch, remote_names: []const u8 }{
+        .{ .machine = 62, .arch = .x86_64, .remote_names = "Linux:x86_64|Linux:amd64" },
+        .{ .machine = 183, .arch = .aarch64, .remote_names = "Linux:aarch64|Linux:arm64" },
+    };
+    for (cases) |case| {
+        var header = [_]u8{0} ** 20;
+        @memcpy(header[0..4], "\x7fELF");
+        header[4] = 2;
+        header[5] = 1;
+        std.mem.writeInt(u16, header[18..20], case.machine, .little);
+        const arch = elfArch(&header).?;
+        try std.testing.expectEqual(case.arch, arch);
+
+        var fake = FakeRunner{
+            .statuses = .{ 0, 0 },
+            .expected_arch_case = case.remote_names,
+        };
+        var result = ensureUsing(std.testing.allocator, "box", "ssh", .{
+            .path = "/tmp/mux-portable",
+            .arch = arch,
+            .hash = .{ .hex = [_]u8{'f'} ** 64, .size = 1234 },
+        }, .{ .ctx = &fake, .run = FakeRunner.run }).?;
+        result.deinit();
+        try std.testing.expect(fake.arch_guard_ok);
+    }
+
     var header = [_]u8{0} ** 20;
     @memcpy(header[0..4], "\x7fELF");
     header[4] = 2;
     header[5] = 1;
-    std.mem.writeInt(u16, header[18..20], 62, .little);
-    try std.testing.expectEqual(Arch.x86_64, elfArch(&header).?);
-    std.mem.writeInt(u16, header[18..20], 183, .little);
-    try std.testing.expectEqual(Arch.aarch64, elfArch(&header).?);
     std.mem.writeInt(u16, header[18..20], 3, .little);
     try std.testing.expect(elfArch(&header) == null);
 }

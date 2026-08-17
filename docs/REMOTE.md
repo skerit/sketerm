@@ -14,11 +14,13 @@ atomically under `$HOME/.cache/sketerm/mux/`. Content-addressed names let old
 and new binaries coexist, so an upgrade never overwrites a binary that may
 still back durable sessions.
 
-The packaged artifact supports x86_64 Linux. An explicit cross-built artifact
-can be selected with `SKETERM_MUX_PORTABLE`; its ELF architecture is checked
-before deployment. If the artifact is unavailable, the server architecture is
-unsupported, `sha256sum` is absent, or deployment is prohibited, Sketerm falls
-back to `sketerm-mux` on the remote non-interactive PATH.
+The packaged artifact matches the package host architecture: x86_64 packages
+carry an x86_64 Linux artifact and aarch64 packages carry an aarch64 Linux
+artifact. An explicit cross-built artifact can be selected with
+`SKETERM_MUX_PORTABLE`; its ELF architecture is checked before deployment. If
+the artifact is unavailable, the server architecture is unsupported,
+`sha256sum` is absent, or deployment is prohibited, Sketerm falls back to
+`sketerm-mux` on the remote non-interactive PATH.
 
 Deployment is independent of the remote login shell (fish, csh, anything):
 the ssh command is always a single word — `sh` with the script on stdin for
@@ -37,8 +39,8 @@ daemon is running, such as after a reboot. There is currently no live session
 handover between daemon builds.
 
 Manual deployment remains available when automatic deployment is unsuitable.
-The portable build is one static binary that runs on any x86_64 Linux host,
-regardless of CPU generation or libc:
+The portable build is one static binary that runs on any Linux host matching
+its architecture, regardless of CPU generation or libc:
 
 ```
 scp /usr/lib/sketerm/sketerm-mux-portable server:/tmp/
@@ -46,7 +48,8 @@ ssh server sudo install -m755 /tmp/sketerm-mux-portable /usr/local/bin/sketerm-m
 ```
 
 (From the repo instead: `zig build mux-portable`, artifact at
-`zig-out/bin/sketerm-mux-portable`.)
+`zig-out/bin/sketerm-mux-portable`. That direct command defaults to x86_64;
+pass `-Dportable-target=aarch64-linux-musl` for aarch64.)
 
 Do NOT copy `/usr/bin/sketerm-mux`: the default build is optimized
 for the CPU it was built on, so a binary from a recent machine dies

@@ -218,7 +218,7 @@ EOF
 cat > "$fakebin/dpkg" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
-    --print-architecture) printf 'amd64\n' ;;
+    --print-architecture) printf '%s\n' "${INSTALL_TEST_DPKG_ARCH:-amd64}" ;;
     -S)
         case "$2" in
             */libalpha.so) printf 'alpha-runtime:%s\n' "$2" ;;
@@ -230,6 +230,15 @@ case "${1:-}" in
         esac ;;
     *) printf 'forbidden dpkg invocation: %s\n' "$*" >> "$INSTALL_TEST_FORBIDDEN"; exit 91 ;;
 esac
+EOF
+
+cat > "$fakebin/uname" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = -m ]; then
+    printf '%s\n' "${INSTALL_TEST_UNAME_M:-x86_64}"
+    exit 0
+fi
+exec /usr/bin/uname "$@"
 EOF
 
 cat > "$fakebin/ldd" <<'EOF'
@@ -262,6 +271,10 @@ if [ -x "$stagedir/usr/bin/sketerm" ]; then
 fi
 cp "$stagedir/DEBIAN/control" "$INSTALL_TEST_CONTROL_LOG"
 printf '%s\n' "$debfile" > "$INSTALL_TEST_DEB_LOG"
+if [ -n "${INSTALL_TEST_STAGED_PORTABLE_LOG:-}" ]; then
+    cp "$stagedir/usr/lib/sketerm/sketerm-mux-portable" \
+        "$INSTALL_TEST_STAGED_PORTABLE_LOG"
+fi
 if [ -n "${INSTALL_TEST_REAL_DPKG_DEB:-}" ]; then
     exec "$INSTALL_TEST_REAL_DPKG_DEB" "$@"
 fi
@@ -310,7 +323,7 @@ command() {
 EOF
 
 chmod +x "$fixture/dist/install.sh" "$fakebin/zig" "$fakebin/dpkg-query" \
-    "$fakebin/dpkg" "$fakebin/ldd" "$fakebin/dpkg-deb" \
+    "$fakebin/dpkg" "$fakebin/uname" "$fakebin/ldd" "$fakebin/dpkg-deb" \
     "$fakebin/sudo" "$fakebin/apt-get"
 
 cef_include="$work/cef/include-root"
@@ -350,6 +363,22 @@ INSTALL_TEST_FORBIDDEN="$work/forbidden.log"
 INSTALL_TEST_APT_LOG="$work/apt.log"
 INSTALL_TEST_DEPS_READY="$work/deps-ready"
 INSTALL_TEST_CONTROL_LOG="$work/control"
+
+rm -f "$work/unsupported-package-zig.log"
+set +e
+BASH_ENV="$work/no-makepkg.bash" \
+    PATH="$fakebin:$PATH" \
+    INSTALL_TEST_DPKG_ARCH=riscv64 \
+    INSTALL_TEST_ZIG_LOG="$work/unsupported-package-zig.log" \
+    "$fixture/dist/install.sh" --mux-only --no-install \
+    > "$work/unsupported-package-arch.out" 2>&1
+status=$?
+set -e
+[ "$status" -eq 1 ] || fail "installer accepted an unsupported package architecture"
+[ ! -e "$work/unsupported-package-zig.log" ] \
+    || fail "installer started building an unsupported package architecture"
+[[ "$(<"$work/unsupported-package-arch.out")" == *"unsupported Linux package architecture"* ]] \
+    || fail "installer did not explain its unsupported architecture policy"
 
 rm -f "$INSTALL_TEST_DEPS_READY"
 : > "$INSTALL_TEST_APT_LOG"
@@ -408,7 +437,7 @@ BASH_ENV="$work/no-makepkg.bash" \
     || fail "non-Arch --no-install attempted a privileged install"
 [[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <-Doptimize=ReleaseFast>"* ]] \
     || fail "non-Arch GUI build was not invoked"
-[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast>"* ]] \
+[[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast> <-Dportable-target=x86_64-linux-musl>"* ]] \
     || fail "non-Arch portable daemon build was not invoked"
 [[ "$(<"$INSTALL_TEST_ZIG_LOG")" == *"<call> <build> <web> <-Doptimize=ReleaseFast> <-Dcef-include=$cef_include> <-Dcef-lib=$cef_lib>"* ]] \
     || fail "non-Arch browser helper build was not invoked"
@@ -578,6 +607,7 @@ BASH_ENV="$work/no-packager.bash" \
 
 (
     export INSTALL_TEST_ZIG_LOG="$work/package-zig.log"
+    CARCH=x86_64
     startdir="$fixture/dist"
     pkgdir="$work/pkg"
     source "$here/PKGBUILD"
@@ -607,6 +637,22 @@ cmp -s "$fixture/zig-out/bin/sketerm-webengine" \
 
 source "$here/stage.sh"
 
+[ "$(sketerm_portable_target_for_arch x86_64)" = x86_64-linux-musl ] \
+    || fail "x86_64 portable target mapping is wrong"
+[ "$(sketerm_portable_target_for_arch amd64)" = x86_64-linux-musl ] \
+    || fail "amd64 portable target mapping is wrong"
+[ "$(sketerm_portable_target_for_arch aarch64)" = aarch64-linux-musl ] \
+    || fail "aarch64 portable target mapping is wrong"
+[ "$(sketerm_portable_target_for_arch arm64)" = aarch64-linux-musl ] \
+    || fail "arm64 portable target mapping is wrong"
+set +e
+sketerm_portable_target_for_arch riscv64 > "$work/unsupported-arch.out" 2>&1
+status=$?
+set -e
+[ "$status" -eq 1 ] || fail "unsupported packaging architecture was accepted"
+[[ "$(<"$work/unsupported-arch.out")" == *"unsupported Linux package architecture"* ]] \
+    || fail "unsupported packaging architecture failure was not explicit"
+
 shared_ver=$(sketerm_pkgver "$fixture")
 [ -n "$shared_ver" ] || fail "sketerm_pkgver produced no version"
 [ "$shared_ver" = "$(grep -m1 '\.version' "$root/build.zig.zon" \
@@ -633,7 +679,7 @@ arch_ver=$(
 (
     export PATH="$fakebin:$PATH" INSTALL_TEST_ZIG_LOG="$work/shared-arch-build.log"
     : > "$INSTALL_TEST_ZIG_LOG"
-    sketerm_build "$fixture" gui 1 /usr/include/cef /usr/lib/cef >/dev/null 2>&1
+    sketerm_build "$fixture" gui 1 /usr/include/cef /usr/lib/cef "" x86_64 >/dev/null 2>&1
 )
 cmp -s "$work/shared-arch-build.log" "$work/package-zig.log" \
     || fail "PKGBUILD build() diverged from the shared sketerm_build recipe"
@@ -652,7 +698,7 @@ BASH_ENV="$work/no-packager.bash" \
 (
     export PATH="$fakebin:$PATH" INSTALL_TEST_ZIG_LOG="$work/shared-gui-build.log"
     : > "$INSTALL_TEST_ZIG_LOG"
-    sketerm_build "$fixture" gui 1 "$cef_include" "$cef_lib" >/dev/null 2>&1
+    sketerm_build "$fixture" gui 1 "$cef_include" "$cef_lib" "" amd64 >/dev/null 2>&1
 )
 cmp -s "$work/shared-gui-build.log" "$work/installer-gui-build.log" \
     || fail "install.sh GUI build diverged from the shared sketerm_build recipe"
@@ -668,7 +714,7 @@ BASH_ENV="$work/no-packager.bash" \
 (
     export PATH="$fakebin:$PATH" INSTALL_TEST_ZIG_LOG="$work/shared-mux-build.log"
     : > "$INSTALL_TEST_ZIG_LOG"
-    sketerm_build "$fixture" mux 0 "$cef_include" "$cef_lib" "no cef" >/dev/null 2>&1
+    sketerm_build "$fixture" mux 0 "$cef_include" "$cef_lib" "no cef" amd64 >/dev/null 2>&1
 )
 cmp -s "$work/shared-mux-build.log" "$work/installer-mux-build.log" \
     || fail "install.sh mux build diverged from the shared sketerm_build recipe"
@@ -678,12 +724,94 @@ cmp -s "$work/shared-mux-build.log" "$work/installer-mux-build.log" \
 (
     export PATH="$fakebin:$PATH" INSTALL_TEST_ZIG_LOG="$work/shared-nocef-build.log"
     : > "$INSTALL_TEST_ZIG_LOG"
-    sketerm_build "$fixture" gui 0 /nope /nope "CEF headers or runtime not found" \
+    sketerm_build "$fixture" gui 0 /nope /nope "CEF headers or runtime not found" x86_64 \
         > "$work/shared-nocef.out" 2>&1
 )
 [[ "$(<"$work/shared-nocef-build.log")" != *"<web>"* ]] \
     || fail "shared recipe built the browser helper without CEF"
 [[ "$(<"$work/shared-nocef.out")" == *"packaging browser identity without sketerm-webengine"* ]] \
     || fail "shared recipe did not explain the omitted browser helper"
+
+# Build the real deployment artifact for each supported package architecture,
+# then pass it through both plain and Debian staging. Reading e_machine from the
+# staged/package copy catches a target argument that was omitted or mismapped.
+elf_machine() {
+    local lo hi
+    read -r lo hi < <(od -An -tu1 -j18 -N2 "$1")
+    printf '%s\n' "$((lo + hi * 256))"
+}
+
+for spec in \
+        'x86_64 x86_64-linux-musl 62 amd64' \
+        'aarch64 aarch64-linux-musl 183 arm64'; do
+    read -r host_arch portable_target machine deb_arch <<< "$spec"
+    cross_prefix="$work/cross-$host_arch"
+    (
+        cd "$root"
+        zig build mux-portable -Doptimize=ReleaseFast \
+            -Dportable-target="$portable_target" --prefix "$cross_prefix"
+    )
+    cross_artifact="$cross_prefix/bin/sketerm-mux-portable"
+    [ "$(elf_machine "$cross_artifact")" -eq "$machine" ] \
+        || fail "$portable_target build has the wrong ELF e_machine"
+
+    cp "$cross_artifact" "$fixture/zig-out/bin/sketerm-mux"
+    cp "$cross_artifact" "$fixture/zig-out/bin/sketerm-mux-portable"
+
+    plain_arch_tmp="$work/plain-$host_arch"
+    mkdir -p "$plain_arch_tmp"
+    : > "$work/plain-$host_arch-zig.log"
+    BASH_ENV="$work/no-packager.bash" \
+        TMPDIR="$plain_arch_tmp" \
+        PATH="$fakebin:$PATH" \
+        SKETERM_TIC="$fakebin/tic" \
+        INSTALL_TEST_UNAME_M="$host_arch" \
+        INSTALL_TEST_ZIG_LOG="$work/plain-$host_arch-zig.log" \
+        "$fixture/dist/install.sh" --mux-only --no-install \
+        > "$work/plain-$host_arch.out" 2>&1
+    plain_arch_stages=("$plain_arch_tmp"/tmp.*)
+    [ ${#plain_arch_stages[@]} -eq 1 ] \
+        || fail "$host_arch plain packaging did not preserve exactly one stage"
+    plain_portable="${plain_arch_stages[0]}/usr/lib/sketerm/sketerm-mux-portable"
+    [ "$(elf_machine "$plain_portable")" -eq "$machine" ] \
+        || fail "$host_arch plain stage has the wrong portable ELF e_machine"
+    [[ "$(<"$work/plain-$host_arch-zig.log")" == \
+        *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast> <-Dportable-target=$portable_target>"* ]] \
+        || fail "$host_arch plain packaging did not pass $portable_target"
+
+    : > "$work/debian-$host_arch-zig.log"
+    staged_portable="$work/debian-$host_arch-portable"
+    BASH_ENV="$work/no-makepkg.bash" \
+        PATH="$fakebin:$PATH" \
+        SKETERM_TIC="$fakebin/tic" \
+        INSTALL_TEST_DPKG_ARCH="$deb_arch" \
+        INSTALL_TEST_ZIG_LOG="$work/debian-$host_arch-zig.log" \
+        INSTALL_TEST_DEB_LOG="$INSTALL_TEST_DEB_LOG" \
+        INSTALL_TEST_CONTROL_LOG="$INSTALL_TEST_CONTROL_LOG" \
+        INSTALL_TEST_STAGED_PORTABLE_LOG="$staged_portable" \
+        INSTALL_TEST_REAL_DPKG_DEB="$real_dpkg_deb" \
+        INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
+        "$fixture/dist/install.sh" --mux-only --no-install \
+        > "$work/debian-$host_arch.out" 2>&1
+    [ "$(grep '^Architecture:' "$INSTALL_TEST_CONTROL_LOG")" = "Architecture: $deb_arch" ] \
+        || fail "$host_arch Debian control architecture is inconsistent"
+    [[ "$(basename "$(<"$INSTALL_TEST_DEB_LOG")")" == *"_${deb_arch}.deb" ]] \
+        || fail "$host_arch Debian filename architecture is inconsistent"
+    [ "$(elf_machine "$staged_portable")" -eq "$machine" ] \
+        || fail "$host_arch Debian stage has the wrong portable ELF e_machine"
+    [[ "$(<"$work/debian-$host_arch-zig.log")" == \
+        *"<call> <build> <mux-portable> <-Doptimize=ReleaseFast> <-Dportable-target=$portable_target>"* ]] \
+        || fail "$host_arch Debian packaging did not pass $portable_target"
+
+    if [ -n "$real_dpkg_deb" ]; then
+        deb_extract="$work/debian-$host_arch-extract"
+        mkdir -p "$deb_extract"
+        "$real_dpkg_deb" -x "$(<"$INSTALL_TEST_DEB_LOG")" "$deb_extract"
+        [ "$($real_dpkg_deb -f "$(<"$INSTALL_TEST_DEB_LOG")" Architecture)" = "$deb_arch" ] \
+            || fail "$host_arch Debian archive architecture is inconsistent"
+        [ "$(elf_machine "$deb_extract/usr/lib/sketerm/sketerm-mux-portable")" -eq "$machine" ] \
+            || fail "$host_arch Debian archive has the wrong portable ELF e_machine"
+    fi
+done
 
 printf 'PASS: installer argument routing and package contents\n'

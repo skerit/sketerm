@@ -224,7 +224,7 @@ install_deb_deps() {
 
 build_all() {
     check_zig
-    sketerm_build "$root" "$1" "$web_ok" "$CEF_INCLUDE" "$CEF_LIB" "$web_why"
+    sketerm_build "$root" "$1" "$web_ok" "$CEF_INCLUDE" "$CEF_LIB" "$web_why" "$2"
 }
 
 # ------------------------------------------------------------------ stage
@@ -271,9 +271,8 @@ deb_depends_of() {
 }
 
 do_debian() {
-    local kind=$1 ver arch pkgname deps stagedir debfile
+    local kind=$1 arch=$2 ver pkgname deps stagedir debfile
     ver=$(pkg_version)
-    arch=$(dpkg --print-architecture)
 
     # Distinct package names so a mux-only install and a full install do
     # not silently claim each other's file list.
@@ -408,6 +407,9 @@ select_kind() {
 
 if command -v dpkg-deb >/dev/null 2>&1; then
     [ "$want_prefix" -eq 0 ] || die "--prefix applies only to plain installs without a package manager"
+    package_arch=$(dpkg --print-architecture) \
+        || die "could not determine the Debian package architecture"
+    sketerm_portable_target_for_arch "$package_arch" >/dev/null || exit 1
     if [ "$want_deps" -eq 1 ]; then
         check_zig
         if [ "$mode" = mux ]; then
@@ -417,14 +419,16 @@ if command -v dpkg-deb >/dev/null 2>&1; then
         fi
     fi
     select_kind
-    build_all "$kind"
-    do_debian "$kind"
+    build_all "$kind" "$package_arch"
+    do_debian "$kind" "$package_arch"
 else
     [ "$want_deps" -eq 0 ] \
         || die "--deps requires an Arch-compatible GUI package build or a dpkg-based host"
     warn "no makepkg and no dpkg-deb; falling back to a plain install"
+    package_arch=$(uname -m) || die "could not determine the host architecture"
+    sketerm_portable_target_for_arch "$package_arch" >/dev/null || exit 1
     select_kind
-    build_all "$kind"
+    build_all "$kind" "$package_arch"
     do_plain "$kind"
 fi
 

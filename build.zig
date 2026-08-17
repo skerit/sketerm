@@ -240,7 +240,9 @@ pub fn build(b: *std.Build) void {
     // in, e.g., memcpy-sized vector loops). This artifact is baseline
     // CPU + static musl: one binary that runs on any Linux box of the
     // same architecture, regardless of CPU generation or libc. Cross-
-    // arch via `-Dportable-target=aarch64-linux-musl`.
+    // arch via `-Dportable-target=aarch64-linux-musl`. Linux packaging
+    // always passes its package architecture explicitly; the x86_64
+    // fallback below is only the direct developer-command default.
     // fribidi is deliberately NOT linked: the daemon never calls bidi
     // (ldd of the native build confirms it's dropped), and there is no
     // static musl fribidi on build hosts. A new daemon-side fribidi

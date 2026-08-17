@@ -21,6 +21,18 @@ sketerm_warn() {
     fi
 }
 
+# Map the package manager's host architecture to the deployment artifact's
+# baseline Linux target. Keep aliases from both dpkg and uname/makepkg here.
+sketerm_portable_target_for_arch() {
+    case "$1" in
+        x86_64|amd64) printf 'x86_64-linux-musl\n' ;;
+        aarch64|arm64) printf 'aarch64-linux-musl\n' ;;
+        *)
+            printf '==> ERROR: unsupported Linux package architecture for sketerm-mux-portable: %s (supported: x86_64/amd64, aarch64/arm64)\n' "$1" >&2
+            return 1 ;;
+    esac
+}
+
 # The one derivation of the semver whose one source of truth is .version in
 # build.zig.zon. A non-git tree (release tarball) simply has no .r<n>.g<sha>.
 sketerm_pkgver() {
@@ -36,10 +48,12 @@ sketerm_pkgver() {
 }
 
 # The one build recipe. $web_ok gates the browser helper; $web_skip_reason is
-# the caller's explanation for why it is off (empty when the caller never
-# probes, i.e. the Arch package, which requires the distro cef outright).
+# the caller's explanation for why it is off, and $7 is the package manager's
+# host architecture (empty reason for Arch, which requires distro cef).
 sketerm_build() {
     local root=$1 kind=$2 web_ok=$3 cef_include=$4 cef_lib=$5 web_skip_reason=${6:-}
+    local package_arch=$7 portable_target
+    portable_target=$(sketerm_portable_target_for_arch "$package_arch") || return 1
     cd "$root"
 
     if [ "$kind" = gui ]; then
@@ -67,7 +81,8 @@ sketerm_build() {
 
     # The portable daemon compiles the Opus probe out and stays
     # static/codec-free by design; it is what gets scp'd to servers.
-    zig build mux-portable -Doptimize=ReleaseFast
+    zig build mux-portable -Doptimize=ReleaseFast \
+        -Dportable-target="$portable_target"
 }
 
 # Stage the package-independent install tree for every Linux backend.

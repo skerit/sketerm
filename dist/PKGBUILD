@@ -82,7 +82,7 @@ build() {
     # Arch package must link against the same cef on every host, and makepkg
     # does not scrub the caller's environment. web_ok is 1 unconditionally
     # because cef is a hard dependency of this package, not a probed option.
-    sketerm_build "$(_srcroot)" gui 1 /usr/include/cef /usr/lib/cef
+    sketerm_build "$(_srcroot)" gui 1 /usr/include/cef /usr/lib/cef "" "$CARCH"
 }
 
 package() {
