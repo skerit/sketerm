@@ -538,7 +538,9 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
         }
         screen.alt = alt;
     }
-    screen.use_alt = try src.boolean();
+    const use_alt = try src.boolean();
+    if (use_alt and screen.alt == null) return error.BadSnapshot;
+    screen.use_alt = use_alt;
     // The whole grid was just replaced under the cursor; anything
     // interpolating from its old position (the cursor trail) must
     // teleport rather than smear across content it never saw.
@@ -1047,6 +1049,41 @@ const FirstLineOffsets = struct {
     first_cell: usize,
 };
 
+const AlternateStateOffsets = struct {
+    has_alt: usize,
+    use_alt: usize,
+};
+
+fn skipSerializedLine(src: *Src) !void {
+    _ = try src.int(u64);
+    _ = try src.boolean();
+    _ = try src.byte();
+    const n_cells = try src.int(u16);
+    _ = try src.take(@as(usize, n_cells) * @sizeOf(Cell));
+}
+
+fn alternateStateOffsets(bytes: []const u8) !AlternateStateOffsets {
+    var src = Src{ .bytes = bytes };
+    _ = try src.int(u32);
+    _ = try src.int(u16);
+    const rows = try src.int(u16);
+    const n_styles = try src.int(u16);
+    for (0..n_styles) |_| {
+        _ = try src.color();
+        _ = try src.color();
+        _ = try src.color();
+        _ = try src.int(u16);
+    }
+    for (0..rows) |_| try skipSerializedLine(&src);
+    const has_alt = src.pos;
+    if (try src.boolean()) {
+        for (0..rows) |_| try skipSerializedLine(&src);
+    }
+    const use_alt = src.pos;
+    _ = try src.boolean();
+    return .{ .has_alt = has_alt, .use_alt = use_alt };
+}
+
 fn firstLineOffsets(bytes: []const u8) !FirstLineOffsets {
     var src = Src{ .bytes = bytes };
     _ = try src.int(u32);
@@ -1147,6 +1184,34 @@ test "snapshot: failed staged restores preserve a populated live screen and pool
     std.mem.writeInt(u16, snapshot_bytes[style_offset..][0..2], old_style, .little);
     try before.expectUnchanged(live, &pool);
     try expectLivePoolLookup(&pool);
+}
+
+test "snapshot: inconsistent alternate state is rejected without touching live state" {
+    const a = testing.allocator;
+    var source = try Harness.init(a, 8, 3);
+    defer source.deinit();
+    source.feed("main only");
+
+    for ([_]u32{ LEGACY_SNAPSHOT_VERSION, SNAPSHOT_VERSION }) |version| {
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(a);
+        try serializeVersion(source.screen, &body, a, version);
+        const offsets = try alternateStateOffsets(body.items);
+        try testing.expectEqual(@as(u8, 0), body.items[offsets.has_alt]);
+        try testing.expectEqual(@as(u8, 0), body.items[offsets.use_alt]);
+        body.items[offsets.use_alt] = 1;
+
+        var pool = try Pool.init(a);
+        defer pool.deinit();
+        const live = try initPopulatedLiveScreen(a, &pool);
+        defer live.deinit();
+        var before = try LiveRestoreState.capture(a, live, &pool);
+        defer before.deinit(a);
+
+        try testing.expectError(error.BadSnapshot, restoreStaged(a, &pool, body.items));
+        try before.expectUnchanged(live, &pool);
+        try expectLivePoolLookup(&pool);
+    }
 }
 
 test "snapshot: every staged restore allocation failure preserves live state" {
@@ -1662,20 +1727,22 @@ test "snapshot: alt screen state survives" {
     h.feed("\x1b[?1049h"); // enter alt
     h.feed("altscreen");
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(a);
-    try serialize(screen, &buf, a);
+    for ([_]u32{ LEGACY_SNAPSHOT_VERSION, SNAPSHOT_VERSION }) |version| {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        try serializeVersion(screen, &buf, a, version);
 
-    var pool2 = try Pool.init(a);
-    defer pool2.deinit();
-    const back = try restore(a, &pool2, buf.items);
-    defer back.deinit();
+        var pool2 = try Pool.init(a);
+        defer pool2.deinit();
+        const back = try restore(a, &pool2, buf.items);
+        defer back.deinit();
 
-    try testing.expect(back.use_alt);
-    try testing.expect(back.alt != null);
-    const txt = try back.extractScreen(a);
-    defer a.free(txt);
-    try testing.expect(std.mem.indexOf(u8, txt, "altscreen") != null);
+        try testing.expect(back.use_alt);
+        try testing.expect(back.alt != null);
+        const txt = try back.extractScreen(a);
+        defer a.free(txt);
+        try testing.expect(std.mem.indexOf(u8, txt, "altscreen") != null);
+    }
 }
 
 test "snapshot: corrupt input errors cleanly" {
