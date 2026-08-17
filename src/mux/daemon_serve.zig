@@ -885,6 +885,10 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // terminal job survives until an explicit job_ack.
                 .durable_copy = true,
                 .copy_no_replace = true,
+                // Cancellation and final installation are one durable
+                // election; canceled no-replace staging is recovered
+                // across helper and daemon restarts.
+                .durable_copy_v2 = true,
                 // Additive JSON display fields plus guarded display-only
                 // destruction. New clients must gate those requests because
                 // old daemons silently ignore unknown JSON members.
@@ -1814,6 +1818,9 @@ pub const FsOpReq = struct {
     /// already owns staged data, instead of minting a fresh job whose
     /// randomized stage can never see it. Old daemons ignore it.
     transfer_token: []const u8 = "",
+    /// A logical retry whose only purpose is durable cancellation
+    /// recovery. A v2 coordinator arms the old job before restart.
+    cancel_requested: bool = false,
     /// Comma-separated extended-attribute names to include with
     /// every entry (listings, stat and deltas).
     attrs: []const u8 = "",
@@ -1847,8 +1854,58 @@ pub const FsChange = struct {
     entry: ?fsserve.Entry = null,
 };
 
+/// Errno tags whose failure is the LINK or a backing network
+/// filesystem dying rather than the filesystem refusing. Only these
+/// earn the client's automatic retry; everything else (ACCES, NOENT,
+/// NOSPC, IO, ...) answers the same way forever, and only the manual
+/// Retry in the client makes sense for it.
+const TRANSIENT_ERRNO_TAGS = [_][]const u8{
+    "TIMEDOUT",
+    "NOTCONN",
+    "CONNRESET",
+    "CONNREFUSED",
+    "CONNABORTED",
+    "HOSTUNREACH",
+    "HOSTDOWN",
+    "NETUNREACH",
+    "NETDOWN",
+    "NETRESET",
+    "PIPE",
+};
+
+/// Classify an fs_reply error message by the errno tag it carries
+/// (fsserve.errnoName spells failures as bare tags like "ACCES").
+pub fn fsErrKind(msg: []const u8) []const u8 {
+    for (TRANSIENT_ERRNO_TAGS) |tag| {
+        if (hasErrnoToken(msg, tag)) return "transport";
+    }
+    return "permanent";
+}
+
+fn hasErrnoToken(msg: []const u8, tag: []const u8) bool {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, msg, start, tag)) |idx| : (start = idx + 1) {
+        const boundary_before = idx == 0 or !std.ascii.isAlphanumeric(msg[idx - 1]);
+        const end = idx + tag.len;
+        const boundary_after = end == msg.len or !std.ascii.isAlphanumeric(msg[end]);
+        if (boundary_before and boundary_after) return true;
+    }
+    return false;
+}
+
 pub fn fsReplyErr(cl: *Client, req: u32, msg: []const u8) void {
-    cl.queueJson(.fs_reply, .{ .req = req, .ok = false, .@"error" = msg });
+    cl.queueJson(.fs_reply, .{ .req = req, .ok = false, .@"error" = msg, .kind = fsErrKind(msg) });
+}
+
+test "fs_reply errors classify transient link failures as transport" {
+    try std.testing.expectEqualStrings("permanent", fsErrKind("ACCES"));
+    try std.testing.expectEqualStrings("permanent", fsErrKind("NOENT"));
+    try std.testing.expectEqualStrings("permanent", fsErrKind("NOSPC"));
+    try std.testing.expectEqualStrings("permanent", fsErrKind("cannot fsync directory parent"));
+    try std.testing.expectEqualStrings("transport", fsErrKind("TIMEDOUT"));
+    try std.testing.expectEqualStrings("transport", fsErrKind("read failed: CONNRESET"));
+    // Tag must stand alone, never match inside a longer word.
+    try std.testing.expectEqualStrings("permanent", fsErrKind("file PIPELINE.md is missing"));
 }
 
 pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {

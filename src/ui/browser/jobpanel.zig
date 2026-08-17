@@ -72,7 +72,7 @@ const Key = struct {
     }
 };
 
-const RowState = enum { queued, running, paused, finished, failed, canceled };
+const RowState = enum { queued, waiting_retry, running, paused, finished, failed, canceled };
 
 /// Which controls this row's underlying job actually supports. A
 /// control that cannot work is never rendered, rather than rendered
@@ -115,6 +115,9 @@ const Row = struct {
     files_done: usize = 0,
     files_total: usize = 0,
     message: []const u8 = "",
+    retry_attempt: u8 = 0,
+    retry_max: u8 = 0,
+    retry_due_ms: i64 = 0,
     controls: Controls = .{},
     /// Shared presentation identity of one paste/drop command.
     batch_id: u64 = 0,
@@ -134,7 +137,7 @@ const Row = struct {
     deferred: ?*jobs.DeferredTransfer = null,
 
     fn active(self: Row) bool {
-        return self.state == .queued or self.state == .running or self.state == .paused;
+        return self.state == .queued or self.state == .waiting_retry or self.state == .running or self.state == .paused;
     }
 };
 
@@ -317,9 +320,18 @@ fn durableRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList
     const service = self.transfer_service orelse return;
     const rows = service.rows(arena, @ptrCast(self)) catch return;
     for (rows) |d| {
+        var represented = false;
+        for (self.jobs.items) |job| if (job.retry) |retry| {
+            if (std.mem.eql(u8, retry.token, d.token)) {
+                represented = true;
+                break;
+            }
+        };
+        if (represented) continue;
         const terminal = d.state == .done or d.state == .failed or d.state == .canceled;
         const state: RowState = switch (d.state) {
-            .queued, .submitting, .waiting_retry => if (d.paused) .paused else .queued,
+            .queued, .submitting => if (d.paused) .paused else .queued,
+            .waiting_retry => if (d.paused) .paused else .waiting_retry,
             .running => if (d.paused) .paused else .running,
             .done => .finished,
             .failed => .failed,
@@ -339,6 +351,9 @@ fn durableRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList
             .src = hostQualified(arena, d.src_host, d.src_path),
             .dst = hostQualified(arena, d.dst_host, d.dst_path),
             .message = d.message,
+            .retry_attempt = d.attempts,
+            .retry_max = @import("../file_transfers.zig").AUTO_RETRIES,
+            .retry_due_ms = d.retry_due_ms,
             .batch_id = d.batch_id,
             .batch_total = @intCast(d.batch_total),
             .batch_item = d.token,
@@ -408,7 +423,9 @@ fn transferRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayLis
 fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(Row)) void {
     for (self.jobs.items) |j| {
         const successor_active = jobs.copySuccessorActive(self, j);
-        const state: RowState = switch (j.state) {
+        const state: RowState = if (j.retry_scheduled)
+            .waiting_retry
+        else switch (j.state) {
             .running => .running,
             .paused => .paused,
             .finished => .finished,
@@ -441,20 +458,27 @@ fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(
             .files_done = @intCast(j.files_done),
             .files_total = @intCast(j.files_total),
             .message = j.messageText(),
+            .retry_attempt = if (j.retry) |retry| retry.attempts else 0,
+            .retry_max = @import("../file_transfers.zig").AUTO_RETRIES,
+            .retry_due_ms = j.retry_due_ms,
             .batch_id = j.batch_id,
             .batch_total = j.batch_total,
             .batch_item = if (j.retry) |retry| retry.token else "",
             .move = if (j.retry) |retry| retry.move else false,
-            .controls = .{
-                .pause = !j.terminal() and j.state != .paused,
-                .unpause = j.state == .paused,
-                .cancel = !j.terminal(),
-                .dismiss = j.terminal() and !j.retry_scheduled and !successor_active,
-                .retry = j.state == .failed and j.retry != null and !j.retry_scheduled and !successor_active,
-            },
+            .controls = daemonControls(j, successor_active),
             .hc = j.hc,
         }) catch return;
     }
+}
+
+fn daemonControls(job: *const @import("types.zig").JobRow, successor_active: bool) Controls {
+    return .{
+        .pause = !job.terminal() and job.state != .paused,
+        .unpause = job.state == .paused,
+        .cancel = !job.terminal() or job.retry_scheduled,
+        .dismiss = job.terminal() and !job.retry_scheduled and !successor_active,
+        .retry = job.state == .failed and job.retry != null and !job.retry_scheduled and !successor_active,
+    };
 }
 
 /// Batched start requests waiting for the daemon's job id. They are
@@ -728,7 +752,7 @@ fn groupedRows(self: *BrowserView, arena: std.mem.Allocator, raw: []const Row) [
             batch.active_frac += @min(1.0, @as(f64, @floatFromInt(row.done)) / @as(f64, @floatFromInt(row.total)));
         switch (row.state) {
             .running => batch.running += 1,
-            .queued => batch.queued += 1,
+            .queued, .waiting_retry => batch.queued += 1,
             .paused => batch.paused += 1,
             .finished => batch.finished += 1,
             .failed => batch.failed += 1,
@@ -861,6 +885,7 @@ const StateLook = struct { icon: [*:0]const u8, class: [*:0]const u8 };
 fn stateLook(state: RowState, stalled: bool) StateLook {
     return switch (state) {
         .queued => .{ .icon = "hourglass-symbolic", .class = "dim-label" },
+        .waiting_retry => .{ .icon = "view-refresh-symbolic", .class = "warning" },
         .running => if (stalled)
             .{ .icon = "network-offline-symbolic", .class = "warning" }
         else
@@ -922,6 +947,22 @@ fn statsText(buf: []u8, row: Row, meter: *const Meter) []const u8 {
             w.print("paused", .{}) catch {};
         },
         .queued => w.print("queued", .{}) catch {},
+        .waiting_retry => {
+            const seconds: i64 = if (row.retry_due_ms > 0)
+                @max(0, @divTrunc(row.retry_due_ms - nowMs() + 999, 1000))
+            else
+                0;
+            if (row.retry_max > 0) {
+                if (seconds > 0)
+                    w.print("retry {d} of {d} in {d}s", .{ row.retry_attempt, row.retry_max, seconds }) catch {}
+                else
+                    w.print("retry {d} of {d} shortly", .{ row.retry_attempt, row.retry_max }) catch {};
+            } else if (seconds > 0) {
+                w.print("retrying in {d}s", .{seconds}) catch {};
+            } else {
+                w.print("retrying shortly", .{}) catch {};
+            }
+        },
         .finished => {
             const size = if (row.total > 0) row.total else row.done;
             if (size > 0) w.print("{s}", .{fmtSize(&a, size)}) catch {};
@@ -1000,7 +1041,7 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
                 }
                 if (r.total > 0) remaining += r.total -| r.done else remaining_known = false;
             },
-            .queued => waiting += 1,
+            .queued, .waiting_retry => waiting += 1,
             .failed => {
                 failed += 1;
                 // A batch row's message is member-count bookkeeping
@@ -1089,7 +1130,7 @@ fn centerSummary(buf: []u8, rows: []const Row, panel: *Panel) []const u8 {
         if (r.batch_child) continue;
         switch (r.state) {
             .running, .paused => running += 1,
-            .queued => waiting += 1,
+            .queued, .waiting_retry => waiting += 1,
             else => {},
         }
         if (panel.find(r.key)) |m| {
@@ -1188,7 +1229,10 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         switch (ctx.kind) {
             .move_up => service.moveQueued(token, -1),
             .move_down => service.moveQueued(token, 1),
-            .cancel => service.cancel(token),
+            .cancel => if (!service.cancel(token)) {
+                self.setStatus("could not persist transfer cancellation");
+                return;
+            },
             .dismiss => if (!service.dismissMediated(token)) {
                 self.setStatus("could not persist transfer dismissal");
                 return;
@@ -1206,6 +1250,13 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             .move_up => self.moveTransfer(t, -1),
             .move_down => self.moveTransfer(t, 1),
             .cancel => {
+                if (t.token) |token| {
+                    const service = self.transfer_service orelse return;
+                    if (!service.requestMediatedCancel(token)) {
+                        self.setStatus("could not persist transfer cancellation");
+                        return;
+                    }
+                }
                 t.x.cancel();
                 self.reapTransfers();
             },
@@ -1258,10 +1309,27 @@ pub fn onJobBtn(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             self.markJob(hc, ctx.job, .running);
         },
         .cancel => {
-            for (self.jobs.items) |j| {
+            for (self.jobs.items, 0..) |j, i| {
                 if (j.hc != hc or j.job != ctx.job) continue;
                 if (j.retry) |retry| {
                     const service = self.transfer_service orelse return;
+                    if (j.retry_scheduled) {
+                        if (!service.cancel(retry.token)) {
+                            self.setStatus("could not persist transfer cancellation recovery");
+                            return;
+                        }
+                        self.cancelScheduledRetry(retry.token);
+                        if (j.undo_op) |u| u.destroy(self.allocator);
+                        if (j.undo_trash_orig) |o| self.allocator.free(o);
+                        if (j.history_op) |op| op.destroy(self.allocator);
+                        retry.destroy(self.allocator);
+                        self.allocator.free(j.label);
+                        self.allocator.destroy(j);
+                        _ = self.jobs.orderedRemove(i);
+                        self.setStatus("canceling transfer safely; cleaning destination staging data");
+                        self.renderJobs();
+                        return;
+                    }
                     if (!service.requestMediatedCancel(retry.token)) {
                         self.setStatus("could not persist transfer cancellation");
                         return;
@@ -1547,6 +1615,7 @@ fn applyRow(row: Row, meter: *Meter) void {
         c.gtk_label_set_text(label, copyZ(&z, statsText(&buf, row, meter)));
         setColorClass(@ptrCast(@alignCast(label)), switch (row.state) {
             .running => if (meter.status.stalled) "warning" else "dim-label",
+            .waiting_retry => "warning",
             .failed => "error",
             else => "dim-label",
         });
@@ -1560,7 +1629,7 @@ fn applyRow(row: Row, meter: *Meter) void {
             0;
         bar.kind = switch (row.state) {
             .failed => .err,
-            .paused, .queued => .dim,
+            .paused, .queued, .waiting_retry => .dim,
             .running => if (meter.status.stalled) .warn else .accent,
             else => .accent,
         };
@@ -2030,7 +2099,25 @@ fn rebuild(self: *BrowserView, rows: []const Row, info: *const StripInfo) void {
     dropUnseenMeters(self);
     if (rows.len == 0) {
         panel.scroll_state = null;
-        panel.built = false;
+        if (panel.center_open) {
+            const center = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 8);
+            c.gtk_widget_set_margin_start(center, 8);
+            c.gtk_widget_set_margin_end(center, 8);
+            c.gtk_widget_set_margin_top(center, 6);
+            c.gtk_widget_set_margin_bottom(center, 6);
+            const title = c.gtk_label_new("Transfers");
+            c.gtk_label_set_xalign(@ptrCast(title), 0);
+            c.gtk_widget_add_css_class(title, "heading");
+            c.gtk_box_append(@ptrCast(center), title);
+            const empty = c.gtk_label_new("No transfers");
+            c.gtk_label_set_xalign(@ptrCast(empty), 0);
+            c.gtk_widget_add_css_class(empty, "dim-label");
+            c.gtk_box_append(@ptrCast(center), empty);
+            c.gtk_box_append(@ptrCast(self.jobs_box), center);
+            panel.built = true;
+        } else {
+            panel.built = false;
+        }
         return;
     }
 
@@ -2166,7 +2253,7 @@ pub fn renderJobs(self: *BrowserView) void {
     defer arena.deinit();
     const raw = collectRows(self, arena.allocator());
     const grouped = groupedRows(self, arena.allocator(), raw);
-    c.gtk_widget_set_visible(self.jobs_box, if (grouped.len > 0) 1 else 0);
+    c.gtk_widget_set_visible(self.jobs_box, if (grouped.len > 0 or self.jobs_panel.center_open) 1 else 0);
     syncMeters(self, grouped);
     const rows = orderedRows(self, arena.allocator(), grouped);
     const info = stripInfo(rows, &self.jobs_panel);
@@ -2260,4 +2347,64 @@ test "panel scroll restoration preserves position and bottom following" {
     try std.testing.expectEqual(@as(f64, 75), scrollTarget(.{ .value = 75, .at_bottom = false }, 0, 500, 100));
     try std.testing.expectEqual(@as(f64, 400), scrollTarget(.{ .value = 300, .at_bottom = true }, 0, 500, 100));
     try std.testing.expectEqual(@as(f64, 40), scrollTarget(.{ .value = 75, .at_bottom = false }, 0, 100, 60));
+}
+
+test "waiting retry stays active, counted down, and cancelable" {
+    const row = Row{
+        .key = .{ .kind = .daemon, .job = 9 },
+        .label = "small.txt",
+        .state = .waiting_retry,
+        .retry_attempt = 2,
+        .retry_max = 3,
+        .retry_due_ms = nowMs() + 5_000,
+    };
+    var meter = Meter{ .key = row.key };
+    var buf: [160]u8 = undefined;
+    const text = statsText(&buf, row, &meter);
+    try std.testing.expect(row.active());
+    try std.testing.expect(std.mem.startsWith(u8, text, "retry 2 of 3 in "));
+
+    const empty: []u8 = @constCast(&[_]u8{});
+    const job = @import("types.zig").JobRow{
+        // Dangling but aligned: daemonControls never dereferences it,
+        // and a ReleaseFast-only build has no poison value for
+        // `undefined`.
+        .hc = @ptrFromInt(@alignOf(HostConn)),
+        .job = 9,
+        .label = empty,
+        .state = .failed,
+        .retry_scheduled = true,
+    };
+    const controls = daemonControls(&job, false);
+    try std.testing.expect(controls.cancel);
+    try std.testing.expect(!controls.retry and !controls.dismiss);
+}
+
+test "a failed transfer always offers manual retry and dismiss" {
+    const empty: []u8 = @constCast(&[_]u8{});
+    // Dangling but aligned: daemonControls dereferences neither.
+    const dangling: *HostConn = @ptrFromInt(@alignOf(HostConn));
+    var retry = @import("types.zig").CopyRetry{
+        .coordinator = dangling,
+        .src_hc = dangling,
+        .dst_hc = dangling,
+        .src_path = empty,
+        .dst_path = empty,
+        .label = empty,
+        .token = empty,
+        .dest_key = 0,
+    };
+    // A "permanent" daemon error kind suppresses only the AUTOMATIC
+    // attempts: the settled row's own button stays live either way,
+    // which is why nothing here depends on the failure kind.
+    const job = @import("types.zig").JobRow{
+        .hc = dangling,
+        .job = 9,
+        .label = empty,
+        .state = .failed,
+        .retry = &retry,
+    };
+    const controls = daemonControls(&job, false);
+    try std.testing.expect(controls.retry and controls.dismiss);
+    try std.testing.expect(!controls.pause and !controls.cancel);
 }

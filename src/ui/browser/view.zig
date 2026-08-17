@@ -437,6 +437,7 @@ pub const BrowserView = struct {
     pub const hostDied = @import("conn.zig").hostDied;
     pub const sendOp = @import("conn.zig").sendOp;
     pub const sendOpOk = @import("conn.zig").sendOpOk;
+    pub const sendOpResult = @import("conn.zig").sendOpResult;
     pub const closeViewOf = @import("conn.zig").closeViewOf;
     pub const ensureWriteFlush = @import("conn.zig").ensureWriteFlush;
     pub const scheduleReconnect = @import("conn.zig").scheduleReconnect;

@@ -29,6 +29,7 @@ const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const launchLocal = @import("open.zig").launchLocal;
 const launchLocalWithApp = @import("open.zig").launchLocalWithApp;
 const cast = @import("../../util/cast.zig");
+const nowMs = @import("../../util/clock.zig").nowMs;
 
 pub const CopyAck = struct {
     req: u32 = 0,
@@ -36,6 +37,7 @@ pub const CopyAck = struct {
     token: []u8,
     hc: *HostConn,
     attempts: u8 = 0,
+    retry_due_ms: i64 = 0,
 };
 
 pub fn feedTransfers(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType, payload: []const u8) bool {
@@ -181,7 +183,7 @@ pub fn reapTransfers(self: *BrowserView) void {
         if (token_copy) |token| {
             if (self.transfer_service) |service| {
                 if (!ok and !canceled) {
-                    retry_mediated = service.recordMediatedFailure(token, t.x.errMsg(), COPY_AUTO_RETRIES);
+                    retry_mediated = service.recordMediatedFailure(token, t.x.errMsg(), t.x.retryable());
                 }
             }
         }
@@ -440,6 +442,14 @@ fn submitCrossCopy(self: *BrowserView, item: *CopyItem) void {
 /// with the same idempotent `resume` flag -- never a second code path.
 /// @return false when nothing was sent (the record is destroyed then).
 fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
+    const predecessor_token = self.allocator.dupe(u8, retry.token) catch {
+        clearPredecessorRetryState(self, retry.token);
+        retry.destroy(self.allocator);
+        return false;
+    };
+    defer self.allocator.free(predecessor_token);
+    var retained = false;
+    defer if (!retained) clearPredecessorRetryState(self, predecessor_token);
     const service = self.transfer_service orelse {
         retry.destroy(self.allocator);
         return false;
@@ -449,13 +459,14 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
         return false;
     }
     if (service.mediatedAckPending(retry.token)) {
+        retry.retry_due_ms = nowMs() + 1_000;
         self.retry_pending.append(self.allocator, retry) catch {
             service.setMediatedFailed(retry.token, "could not wait for transfer acknowledgment", true);
             retry.destroy(self.allocator);
             return false;
         };
-        if (self.retry_timer == 0)
-            self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+        armRetryTimer(self);
+        retained = true;
         return true;
     }
     if (retry.coordinator.state != .ready) {
@@ -503,18 +514,17 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
     // coordinator resolves the other side through ITS OWN ssh/UDP
     // config — which is exactly what direct transfer means.
     const client_token = service.mediatedClientToken(retry.token) orelse {
-        for (self.pending_jobs.items, 0..) |pending, i| {
-            if (pending == pj) {
-                _ = self.pending_jobs.orderedRemove(i);
-                break;
-            }
-        }
-        self.allocator.free(pj.label);
-        self.allocator.destroy(pj);
+        dropPendingJob(self, pj);
         retry.destroy(self.allocator);
         return false;
     };
-    self.sendOp(retry.coordinator, .{
+    if (!service.mediatedSubmissionStarted(retry.token)) {
+        dropPendingJob(self, pj);
+        service.abandonMediated(retry.token);
+        retry.destroy(self.allocator);
+        return false;
+    }
+    const send_result = self.sendOpResult(retry.coordinator, .{
         .req = req,
         .op = "cross_copy",
         .path = retry.src_path,
@@ -531,13 +541,58 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
         // failed job that already owns the staged bytes instead of
         // minting a fresh job with an unreachable stage.
         .transfer_token = retry.token,
+        .cancel_requested = service.mediatedCancelRequested(retry.token),
     });
+    if (send_result != .ok) {
+        dropPendingJob(self, pj);
+        const retryable = send_result == .transport;
+        if (service.recordMediatedFailure(
+            retry.token,
+            if (retryable) "coordinator connection lost while submitting transfer" else "could not queue transfer request",
+            retryable,
+        )) {
+            retry.attempts = service.mediatedAttempts(retry.token);
+            retry.retry_due_ms = service.mediatedRetryDue(retry.token);
+            self.retry_pending.append(self.allocator, retry) catch {
+                service.setMediatedFailed(retry.token, "could not schedule transfer retry", true);
+                retry.destroy(self.allocator);
+                return false;
+            };
+            armRetryTimer(self);
+            retained = true;
+            return true;
+        }
+        retry.destroy(self.allocator);
+        return false;
+    }
     if (retry.attempts == 0) {
         self.setStatusFmt("durable transfer started: {s}", .{retry.label});
     } else {
         self.setStatusFmt("resuming transfer (attempt {d}): {s}", .{ retry.attempts + 1, retry.label });
     }
+    retained = true;
     return true;
+}
+
+/// Unlist and free a submission that never reached the wire.
+fn dropPendingJob(self: *BrowserView, pj: *PendingJob) void {
+    for (self.pending_jobs.items, 0..) |pending, i| {
+        if (pending == pj) {
+            _ = self.pending_jobs.orderedRemove(i);
+            break;
+        }
+    }
+    self.allocator.free(pj.label);
+    self.allocator.destroy(pj);
+}
+
+fn clearPredecessorRetryState(self: *BrowserView, token: []const u8) void {
+    for (self.jobs.items) |row| {
+        const row_retry = row.retry orelse continue;
+        if (!std.mem.eql(u8, row_retry.token, token)) continue;
+        row.retry_scheduled = false;
+        row.retry_due_ms = 0;
+    }
 }
 
 /// The resumed attempt's row replaces the failed one it came from:
@@ -571,44 +626,114 @@ pub fn dropSupersededRetryRows(self: *BrowserView, fresh: *JobRow) void {
 /// the bytes already moved: the stable transfer_token makes the daemon
 /// restart the failed job itself (same id, same stage), even though
 /// the per-attempt client_token rotates.
-const COPY_AUTO_RETRIES: u8 = 3;
+const COPY_AUTO_RETRIES = file_transfers.AUTO_RETRIES;
 /// Delay before an automatic resume: the daemon-side job already spent
 /// its own reconnect budget, so a host that answers again needs a
 /// moment, not another immediate hammering.
-const COPY_RETRY_DELAY_MS: c.guint = 5_000;
+const COPY_RETRY_DELAY_MS = file_transfers.RETRY_DELAY_MS;
 
-/// Submit everything whose delay has elapsed. The timer is view-owned,
-/// but every retry also has a ledger record another face can adopt.
+fn requiresDurableCoordinator(move: bool, no_replace: bool) bool {
+    return move or no_replace;
+}
+
+fn copyRetryDue(self: *BrowserView, retry: *const CopyRetry) i64 {
+    if (retry.retry_due_ms > 0) return retry.retry_due_ms;
+    if (self.transfer_service) |service| {
+        const due = service.mediatedRetryDue(retry.token);
+        if (due > 0) return due;
+    }
+    return nowMs();
+}
+
+/// Fold one deadline into the earliest one seen so far.
+fn earliest(current: ?i64, candidate: i64) i64 {
+    return if (current) |cur| @min(cur, candidate) else candidate;
+}
+
+/// Arm one view timer at the earliest individual retry deadline.
+pub fn armRetryTimer(self: *BrowserView) void {
+    if (self.retry_timer != 0) {
+        _ = c.g_source_remove(self.retry_timer);
+        self.retry_timer = 0;
+    }
+    const now = nowMs();
+    var due: ?i64 = null;
+    for (self.retry_pending.items) |retry| {
+        due = earliest(due, copyRetryDue(self, retry));
+    }
+    if (self.transfer_service) |service| for (self.mediated_retry_tokens.items) |token| {
+        // A record with no deadline of its own is due immediately.
+        const recorded = service.mediatedRetryDue(token);
+        due = earliest(due, if (recorded > 0) recorded else now);
+    };
+    for (self.copy_acks.items) |ack| {
+        if (ack.req != 0) continue;
+        const candidate = if (ack.retry_due_ms > 0)
+            ack.retry_due_ms
+        else if (ack.hc.state == .ready)
+            now
+        else
+            now + COPY_RETRY_DELAY_MS;
+        due = earliest(due, candidate);
+    }
+    if (due) |deadline| {
+        const delay = @max(@as(i64, 1), deadline - now);
+        self.retry_timer = c.g_timeout_add(
+            @intCast(@min(delay, std.math.maxInt(c.guint))),
+            @ptrCast(&onRetryTimer),
+            @ptrCast(self),
+        );
+    }
+}
+
+/// Submit only entries whose own delay has elapsed.
 pub fn onRetryTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(BrowserView, user);
     self.retry_timer = 0;
-    var pending = self.retry_pending;
-    self.retry_pending = .empty;
-    defer pending.deinit(self.allocator);
-    for (pending.items) |retry| _ = submitRetry(self, retry);
-    var mediated = self.mediated_retry_tokens;
-    self.mediated_retry_tokens = .empty;
-    defer mediated.deinit(self.allocator);
-    for (mediated.items) |token| {
+    const now = nowMs();
+    var i: usize = 0;
+    while (i < self.retry_pending.items.len) {
+        const retry = self.retry_pending.items[i];
+        if (copyRetryDue(self, retry) > now) {
+            i += 1;
+            continue;
+        }
+        _ = self.retry_pending.orderedRemove(i);
+        retry.retry_due_ms = 0;
+        _ = submitRetry(self, retry);
+    }
+    i = 0;
+    while (i < self.mediated_retry_tokens.items.len) {
+        const token = self.mediated_retry_tokens.items[i];
+        const due = if (self.transfer_service) |service| service.mediatedRetryDue(token) else 0;
+        if (due > now) {
+            i += 1;
+            continue;
+        }
+        _ = self.mediated_retry_tokens.orderedRemove(i);
         if (self.transfer_service) |service| service.redispatchMediated(token);
         self.allocator.free(token);
     }
     for (self.copy_acks.items) |*ack| {
+        if (ack.retry_due_ms > now) continue;
         if (ack.hc.state == .dead)
             ack.hc = self.hostConnFor(ack.hc.host) orelse ack.hc;
+        ack.retry_due_ms = 0;
     }
     pumpCopyAcks(self);
     self.renderJobs();
+    armRetryTimer(self);
     return 0;
 }
 
 /// A DIRECT remote-to-remote copy whose coordinator could not reach
 /// its peer: resubmit the SAME job through the local daemon (the
-/// relay), which resumes from any staged partial. Spends no automatic
-/// resume attempt — the direct try moved no bytes.
+/// relay), which resumes from any staged partial. This is another
+/// automatic attempt and therefore spends the shared retry budget.
 fn fallbackDirectCopy(self: *BrowserView, row: *JobRow, kind: []const u8) bool {
     const retry = row.retry orelse return false;
     if (!retry.direct or !std.mem.eql(u8, kind, "unreachable")) return false;
+    if (retry.attempts >= COPY_AUTO_RETRIES) return false;
     // hostConnFor STARTS a local connection when the view has none yet
     // (a view browsing two remotes never needed one before) — so a
     // still-connecting coordinator goes through the retry timer, by
@@ -616,25 +741,52 @@ fn fallbackDirectCopy(self: *BrowserView, row: *JobRow, kind: []const u8) bool {
     const local = self.hostConnFor(null) orelse return false;
     if (local.state == .dead) return false;
     if (local.state == .ready and !coordinatorSupports(local, retry.move, retry.no_replace)) return false;
-    retry.coordinator = local;
-    retry.direct = false;
-    if (self.transfer_service) |service| {
-        if (!service.renewMediatedAttempt(retry.token, local.host orelse "", false)) return false;
-        retry.attempts = service.mediatedAttempts(retry.token);
-    } else return false;
-    row.retry = retry.clone(self.allocator);
-    if (local.state == .ready) {
-        const submitted = submitRetry(self, retry);
-        if (submitted) row.retry_scheduled = true;
-        return submitted;
+    return armAutomaticRetry(self, row, retry, local, false, "could not schedule transfer fallback");
+}
+
+/// Charge one automatic attempt to the durable record and arm it on
+/// both the live retry and the clone the failed row keeps.
+/// @return false when nothing was armed (the row keeps its clone).
+fn armAutomaticRetry(
+    self: *BrowserView,
+    row: *JobRow,
+    retry: *CopyRetry,
+    coordinator: *HostConn,
+    direct: bool,
+    failure_message: []const u8,
+) bool {
+    // The row keeps a clone: the user can still press Retry after the
+    // automatic attempts are done, and the failed row is what carries
+    // that button.
+    const row_retry = retry.clone(self.allocator) orelse return false;
+    const service = self.transfer_service orelse {
+        row_retry.destroy(self.allocator);
+        return false;
+    };
+    if (!service.renewMediatedAttempt(retry.token, coordinator.host orelse "", true)) {
+        row_retry.destroy(self.allocator);
+        return false;
+    }
+    const attempts = service.mediatedAttempts(retry.token);
+    const retry_due_ms = service.mediatedRetryDue(retry.token);
+    for ([_]*CopyRetry{ retry, row_retry }) |record| {
+        record.coordinator = coordinator;
+        record.direct = direct;
+        record.attempts = attempts;
+        record.retry_due_ms = retry_due_ms;
     }
     self.retry_pending.append(self.allocator, retry) catch {
+        service.setMediatedFailed(retry.token, failure_message, false);
+        row.retry = row_retry;
         retry.destroy(self.allocator);
         return false;
     };
+    row.retry = row_retry;
+    // No Retry button while an automatic attempt is armed: pressing it
+    // then would run the same copy twice.
     row.retry_scheduled = true;
-    if (self.retry_timer == 0)
-        self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+    row.retry_due_ms = retry_due_ms;
+    armRetryTimer(self);
     return true;
 }
 
@@ -647,24 +799,7 @@ fn scheduleCopyRetry(self: *BrowserView, row: *JobRow) bool {
         if (self.transfer_service) |service| service.setMediatedFailed(retry.token, row.messageText(), false);
         return false;
     }
-    if (self.transfer_service) |service| {
-        if (!service.renewMediatedAttempt(retry.token, retry.coordinator.host orelse "", true)) return false;
-        retry.attempts = service.mediatedAttempts(retry.token);
-    } else return false;
-    // The row keeps a clone: the user can still press Retry after the
-    // automatic attempts are done, and the failed row is what carries
-    // that button.
-    row.retry = retry.clone(self.allocator);
-    self.retry_pending.append(self.allocator, retry) catch {
-        retry.destroy(self.allocator);
-        return false;
-    };
-    // No Retry button while an automatic attempt is armed: pressing it
-    // then would run the same copy twice.
-    row.retry_scheduled = true;
-    if (self.retry_timer == 0)
-        self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
-    return true;
+    return armAutomaticRetry(self, row, retry, retry.coordinator, retry.direct, "could not schedule transfer retry");
 }
 
 /// Drop everything waiting on the retry timer (view teardown).
@@ -702,53 +837,84 @@ pub fn cancelScheduledRetry(self: *BrowserView, token: []const u8) void {
         _ = self.mediated_retry_tokens.orderedRemove(i);
         self.allocator.free(pending);
     }
+    i = 0;
+    while (i < self.copy_acks.items.len) {
+        const ack = self.copy_acks.items[i];
+        if (!std.mem.eql(u8, ack.token, token)) {
+            i += 1;
+            continue;
+        }
+        _ = self.copy_acks.orderedRemove(i);
+        self.allocator.free(ack.token);
+    }
+    armRetryTimer(self);
 }
 
-fn scheduleMediatedRetry(self: *BrowserView, token: []const u8) bool {
+pub fn scheduleMediatedRetry(self: *BrowserView, token: []const u8) bool {
+    for (self.mediated_retry_tokens.items) |pending|
+        if (std.mem.eql(u8, pending, token)) return true;
     const owned = self.allocator.dupe(u8, token) catch return false;
     self.mediated_retry_tokens.append(self.allocator, owned) catch {
         self.allocator.free(owned);
         return false;
     };
-    if (self.retry_timer == 0)
-        self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+    armRetryTimer(self);
     return true;
 }
 
 /// A daemon refused the start request before a JobRow existed. Keep
 /// the durable record and retry it through the same bounded resume
 /// path instead of letting an invisible claimed record strand it.
-pub fn retryRejectedCopy(self: *BrowserView, retry: *CopyRetry, reason: []const u8) bool {
-    if (retry.no_replace and (std.mem.indexOf(u8, reason, "destination exists") != null or
-        std.mem.indexOf(u8, reason, "EXIST") != null))
-    {
-        if (self.transfer_service) |service|
-            _ = service.recordMediatedFailure(retry.token, "destination appeared before the transfer could be installed", 1);
-        retry.destroy(self.allocator);
-        return false;
-    }
-    if (retry.attempts >= COPY_AUTO_RETRIES) {
-        if (self.transfer_service) |service| _ = service.recordMediatedFailure(retry.token, "daemon refused the transfer start", 1);
-        retry.destroy(self.allocator);
-        return false;
-    }
+pub fn retryRejectedCopy(self: *BrowserView, retry: *CopyRetry, reason: []const u8, kind: []const u8) bool {
     const service = self.transfer_service orelse {
         retry.destroy(self.allocator);
         return false;
     };
+    if (service.mediatedCancelRequested(retry.token)) {
+        if (std.mem.eql(u8, kind, "retryable_cleanup")) {
+            if (!service.recordMediatedCancellationFailure(retry.token, reason))
+                service.unclaimMediated(retry.token);
+            retry.destroy(self.allocator);
+            return false;
+        }
+        if (!service.cancelRejectedMediated(retry.token)) service.unclaimMediated(retry.token);
+        retry.destroy(self.allocator);
+        return false;
+    }
+    if (!service.mediatedSubmissionRejected(retry.token)) {
+        retry.destroy(self.allocator);
+        return false;
+    }
+    if (retry.no_replace and (std.mem.indexOf(u8, reason, "destination exists") != null or
+        std.mem.indexOf(u8, reason, "EXIST") != null))
+    {
+        _ = service.recordMediatedFailure(retry.token, "destination appeared before the transfer could be installed", false);
+        retry.destroy(self.allocator);
+        return false;
+    }
+    if (!file_transfers.retryableFailureKind(kind)) {
+        _ = service.recordMediatedFailure(retry.token, reason, false);
+        retry.destroy(self.allocator);
+        return false;
+    }
+    if (retry.attempts >= COPY_AUTO_RETRIES) {
+        _ = service.recordMediatedFailure(retry.token, "daemon refused the transfer start", false);
+        retry.destroy(self.allocator);
+        return false;
+    }
     if (!service.renewMediatedAttempt(retry.token, retry.coordinator.host orelse "", true)) {
         service.abandonMediated(retry.token);
         retry.destroy(self.allocator);
         return false;
     }
     retry.attempts = service.mediatedAttempts(retry.token);
+    retry.retry_due_ms = service.mediatedRetryDue(retry.token);
     self.retry_pending.append(self.allocator, retry) catch {
-        _ = service.recordMediatedFailure(retry.token, "could not schedule transfer retry", 1);
+        _ = service.recordMediatedFailure(retry.token, "could not schedule transfer retry", false);
         retry.destroy(self.allocator);
         return false;
     };
-    if (self.retry_timer == 0)
-        self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+    armRetryTimer(self);
     return true;
 }
 
@@ -758,10 +924,18 @@ pub fn retryRejectedCopy(self: *BrowserView, retry: *CopyRetry, reason: []const 
 pub fn retryCopyJob(self: *BrowserView, row: *JobRow) void {
     if (row.retry_scheduled) return;
     const retry = row.retry orelse return;
-    if (self.transfer_service) |service| {
-        if (!service.restartMediatedAttempt(retry.token)) return;
-    } else return;
     const fresh = retry.clone(self.allocator) orelse return;
+    const service = self.transfer_service orelse {
+        fresh.destroy(self.allocator);
+        return;
+    };
+    if (!service.restartMediatedAttempt(retry.token)) {
+        // The record refuses only while it still owes the daemon an
+        // acknowledgment; saying so beats a button that does nothing.
+        self.setStatusFmt("retry not started yet, the transfer is still settling: {s}", .{row.label});
+        fresh.destroy(self.allocator);
+        return;
+    }
     fresh.attempts = 0;
     // The new attempt's row replaces this one once the daemon answers
     // (dropSupersededRetryRows); until then the button stays hidden.
@@ -780,6 +954,7 @@ fn queueUserCopyAck(self: *BrowserView, token_in: []const u8, job: u64, host: []
         .job = job,
         .token = token,
         .hc = hc,
+        .retry_due_ms = if (hc.state == .ready) 0 else nowMs() + COPY_RETRY_DELAY_MS,
     }) catch {
         self.allocator.free(token);
         return false;
@@ -791,19 +966,25 @@ fn queueUserCopyAck(self: *BrowserView, token_in: []const u8, job: u64, host: []
 pub fn pumpCopyAcks(self: *BrowserView) void {
     for (self.copy_acks.items) |*ack| {
         if (ack.hc.state == .dead) {
-            if (self.retry_timer == 0)
-                self.retry_timer = c.g_timeout_add(COPY_RETRY_DELAY_MS, @ptrCast(&onRetryTimer), @ptrCast(self));
+            if (ack.retry_due_ms == 0) ack.retry_due_ms = nowMs() + COPY_RETRY_DELAY_MS;
             continue;
         }
-        if (ack.req != 0 or ack.hc.state != .ready) continue;
+        if (ack.req != 0 or ack.hc.state != .ready or ack.retry_due_ms > nowMs()) continue;
         ack.req = self.nextReq();
-        self.sendOp(ack.hc, .{ .req = ack.req, .op = "job_ack", .job = ack.job });
+        if (self.sendOpResult(ack.hc, .{ .req = ack.req, .op = "job_ack", .job = ack.job }) != .ok) {
+            ack.req = 0;
+            ack.retry_due_ms = nowMs() + COPY_RETRY_DELAY_MS;
+        }
     }
+    armRetryTimer(self);
 }
 
 fn acknowledgeUserCopy(self: *BrowserView, row: *JobRow, finish: bool) bool {
     const retry = row.retry orelse return true;
     const service = self.transfer_service orelse return false;
+    // An error after cancellation is not a completed cancellation. Keep
+    // the daemon journal instead of acknowledging away its recovery state.
+    if (!finish and service.mediatedCancelRequested(retry.token)) return true;
     const host = row.hc.host orelse "";
     if (!service.noteMediatedTerminal(retry.token, host, row.job, finish)) return false;
     if (!queueUserCopyAck(self, retry.token, row.job, host)) service.unclaimMediated(retry.token);
@@ -887,14 +1068,38 @@ pub const TransferOpts = struct {
 };
 
 /// The daemon that should coordinate a cross-host copy/move, or null
-/// when none qualifies (a move then degrades to client-mediated).
+/// when none qualifies. Moves and no-replace user copies wait for a
+/// durable coordinator rather than crossing an ambiguous install boundary.
 /// Remote-to-remote picks the destination daemon when it advertises
 /// cross_move; everything else (and the fallback) is the local daemon,
 /// which for a MOVE must itself advertise cross_move.
 fn coordinatorSupports(hc: *const HostConn, move: bool, no_replace: bool) bool {
-    return hc.state == .ready and hc.conn.durable_copy and
+    return hc.state == .ready and hc.conn.durable_copy and hc.conn.durable_copy_v2 and
         (!move or hc.conn.cross_move) and
         (!no_replace or hc.conn.copy_no_replace);
+}
+
+test "durable coordinator requires install and cancellation election support" {
+    // Every field is written: this project builds ReleaseFast only, so
+    // a field left `undefined` is real stack garbage, not a poison
+    // value. `view` is a dangling-but-aligned pointer because nothing
+    // under test dereferences it.
+    var hc: HostConn = .{
+        .view = @ptrFromInt(@alignOf(BrowserView)),
+        .host = null,
+        .state = .ready,
+        .conn = .{
+            .allocator = std.testing.allocator,
+            .fd = -1,
+            .durable_copy = true,
+            .cross_move = true,
+            .copy_no_replace = true,
+        },
+    };
+    try std.testing.expect(!coordinatorSupports(&hc, false, false));
+    hc.conn.durable_copy_v2 = true;
+    try std.testing.expect(coordinatorSupports(&hc, false, false));
+    try std.testing.expect(coordinatorSupports(&hc, true, true));
 }
 
 fn pickCoordinator(self: *BrowserView, src_hc: *HostConn, dst_hc: *HostConn, move: bool, no_replace: bool) ?*HostConn {
@@ -1144,14 +1349,20 @@ fn startTransferImpl(
                 deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, coordinator, false);
                 return;
             }
-            if (coordinator.conn.durable_copy and (!opts.no_replace or coordinator.conn.copy_no_replace) and (!opts.delete_src_after or coordinator.conn.cross_move)) {
+            if (coordinatorSupports(coordinator, opts.delete_src_after, opts.no_replace)) {
                 enqueueCrossCopy(self, coordinator, src_hc, src_path, dst_hc, dst_path, opts.delete_src_after, opts.no_replace, opts.batch_id, opts.batch_total, user_token);
                 return;
             }
         }
-        if (opts.delete_src_after) {
+        if (requiresDurableCoordinator(opts.delete_src_after, opts.no_replace)) {
             deferTransfer(self, src_hc, src_path, dst_hc, dst_path, opts, user_token, null, true);
-            self.setStatus("move queued until a daemon with durable move support is available");
+            // The per-user daemon outlives GUI restarts, so "waiting for
+            // a capable daemon" reads as a hang: name the one action
+            // that resolves it.
+            self.setStatus(if (opts.delete_src_after)
+                "move queued: the running sketerm-mux daemon predates durable move support -- restart the daemon to start it"
+            else
+                "copy queued: the running sketerm-mux daemon predates durable no-replace support -- restart the daemon to start it");
             return;
         }
         if (src_hc.state != .ready or dst_hc.state != .ready) {
@@ -1283,6 +1494,13 @@ fn startTransferImpl(
     self.renderJobs();
 }
 
+test "moves and collision-sensitive copies require a durable coordinator" {
+    try std.testing.expect(!requiresDurableCoordinator(false, false));
+    try std.testing.expect(requiresDurableCoordinator(true, false));
+    try std.testing.expect(requiresDurableCoordinator(false, true));
+    try std.testing.expect(requiresDurableCoordinator(true, true));
+}
+
 /// Rebuild a client-mediated transfer from its ledger record: the
 /// service hands over records whose previous owner is gone (a closed
 /// browser face, a crashed process), and the staged `.skpart` plus the
@@ -1291,8 +1509,21 @@ pub fn adoptMediated(ctx: *anyopaque, rec: @import("../file_transfers.zig").Medi
     const self: *BrowserView = @ptrCast(@alignCast(ctx));
     if (rec.record_version < @import("../../filebrowser/transfers.zig").VERSION and rec.delete_src_after) {
         if (self.transfer_service) |service|
-            _ = service.recordMediatedFailure(rec.token, "legacy move held because its copy/delete phase is unknown", 1);
+            _ = service.recordMediatedFailure(rec.token, "legacy move held because its copy/delete phase is unknown", false);
         self.setStatus("legacy move held safely; retry it with the current daemon");
+        return;
+    }
+    // A client-mediated fallback has no daemon job to cancel. Once its
+    // durable intent says cancel, retire it instead of reconstructing
+    // Xfer and risking post-crash open/watch side effects.
+    if (rec.cancel_requested and (!rec.user_copy or !rec.coordinator_set)) {
+        const name = self.allocator.dupe(u8, std.fs.path.basename(rec.dst_path)) catch null;
+        defer if (name) |owned| self.allocator.free(owned);
+        const canceled = if (self.transfer_service) |service| service.cancelMediatedQueued(rec.token) else false;
+        if (canceled)
+            self.setStatusFmt("transfer cancellation recovered: {s}", .{name orelse "transfer"})
+        else
+            self.setStatusFmt("could not persist recovered cancellation: {s}", .{name orelse "transfer"});
         return;
     }
     if (rec.user_copy) {
@@ -1677,8 +1908,24 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
                 std.mem.indexOf(u8, e.message, "EXIST") != null)
         else
             false;
+        const cancellation_requested = if (row.retry) |retry|
+            if (self.transfer_service) |service| service.mediatedCancelRequested(retry.token) else false
+        else
+            false;
         if (row.retry != null and !ack_saved) {
             self.setStatus("transfer failed, but its durable acknowledgment could not be saved");
+        } else if (cancellation_requested) {
+            const scheduled = if (row.retry) |retry|
+                if (self.transfer_service) |service| service.recordMediatedCancellationFailure(retry.token, e.message) else false
+            else
+                false;
+            if (scheduled) {
+                self.setStatusFmt("transfer cancellation recovery scheduled: {s}", .{row.label});
+                row.setMessage("cancellation recovery scheduled");
+            } else {
+                self.setStatusFmt("transfer cancellation needs attention: {s}", .{row.label});
+                row.setMessage("cancellation recovery could not be scheduled");
+            }
         } else if (destination_collision) {
             if (row.retry) |retry| if (self.transfer_service) |service|
                 service.setMediatedFailed(retry.token, "destination appeared before the transfer could be installed", false);
@@ -1687,10 +1934,12 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
         } else if (fallbackDirectCopy(self, row, e.kind)) {
             self.setStatusFmt("direct host-to-host failed, relaying via this machine: {s}", .{row.label});
             row.setMessage("hosts cannot reach each other -- relaying via this machine");
-        } else if (scheduleCopyRetry(self, row)) {
+        } else if (file_transfers.retryableFailureKind(e.kind) and scheduleCopyRetry(self, row)) {
             self.setStatusFmt("transfer interrupted, resuming shortly: {s} ({s})", .{ row.label, e.message });
             row.setMessage("interrupted -- resuming automatically");
         } else {
+            if (row.retry) |retry| if (self.transfer_service) |service|
+                service.setMediatedFailed(retry.token, row.messageText(), false);
             self.setStatusFmt("job failed: {s} ({s})", .{ row.label, e.message });
             // Out of automatic attempts: remember the interrupted copy
             // so a later paste of the same source offers Continue.

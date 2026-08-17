@@ -144,6 +144,7 @@ const ItemCtx = struct {
         reload,
         toggle_hidden,
         toggle_sidebar,
+        toggle_transfers,
         mode_details,
         mode_compact,
         mode_icons,
@@ -340,6 +341,7 @@ fn openMenu(btn: *c.GtkButton, ctx: *BarCtx) ?*c.GtkWidget {
             const tab = if (bv) |v| v.currentTab() else null;
             addCheck(root, toggles, a, win, target_pane, "Show Hidden Files", if (tab) |t| t.show_hidden else false, .toggle_hidden);
             addCheck(root, toggles, a, win, target_pane, "Places Sidebar", if (bv) |v| v.places_on else true, .toggle_sidebar);
+            addCheck(root, toggles, a, win, target_pane, "Transfers", if (bv) |v| v.jobs_panel.center_open else false, .toggle_transfers);
             const modes = m.section();
             const mode: ?browser_model.ViewMode = if (tab) |t| t.view_mode else null;
             addCheck(root, modes, a, win, target_pane, "Details List", mode == .details, .mode_details);
@@ -428,6 +430,7 @@ fn onItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             const active = c.gtk_toggle_button_get_active(v.places_toggle);
             c.gtk_toggle_button_set_active(v.places_toggle, @intFromBool(active == 0));
         },
+        .toggle_transfers => if (bv) |v| @import("jobpanel.zig").toggleTransferCenter(v),
         .mode_details => setMode(bv, .details),
         .mode_compact => setMode(bv, .compact),
         .mode_icons => setMode(bv, .icons),
@@ -492,4 +495,3 @@ fn goTrash(v: *BrowserView) void {
     @memcpy(spec_buf[0..td.len], td);
     v.navigateSpec(tab, spec_buf[0..td.len]);
 }
-

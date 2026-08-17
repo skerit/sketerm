@@ -264,7 +264,7 @@ pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     } else {
         hc.state = .dead;
         view.setStatusFmt("cannot connect to {s}", .{hc.label()});
-        view.pumpDeferredTransfers();
+        view.scheduleReconnect(ctx.host);
         view.pumpCopyAcks();
         // The listings queued while connecting will never be answered.
         // Without this the tabs that asked for them sit at "Listing..."
@@ -361,9 +361,10 @@ pub const Reconnect = struct {
     }
 };
 
-/// Re-dial delays; after the last one the host stays dead until the
-/// user navigates (every attempt may spawn a real ssh).
-const RECONNECT_DELAYS_MS = [_]c.guint{ 3_000, 8_000, 20_000, 45_000 };
+/// Re-dial delays; after three attempts the host stays dead until the
+/// user navigates (every attempt may spawn a real ssh). The first is
+/// never earlier than the transfer retry floor.
+const RECONNECT_DELAYS_MS = [_]c.guint{ 5_000, 10_000, 20_000 };
 
 /// A connection dropped while tabs were on it: retry by timer so a
 /// rebooted host comes back without the user re-navigating.
@@ -402,18 +403,33 @@ fn onReconnectTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = r.view;
     r.source = 0;
     if (self.widgets_dead) return 0;
-    // Anything already live (or dialing) for this host? Then this
-    // timer's job is done — wireReady adopts the stranded tabs.
+    // A ready connection ends the retry. A slow dial does not: keep
+    // this record (and its spent-attempt count) until its handback says
+    // success or failure, instead of resetting the bound per dial.
     for (self.conns.items) |hc| {
-        if (hc.state != .dead and hostEq(hc.host, r.host)) {
+        if (!hostEq(hc.host, r.host)) continue;
+        if (hc.state == .ready) {
             self.clearReconnect(r.host);
             return 0;
         }
+        if (hc.state == .connecting) {
+            const next = RECONNECT_DELAYS_MS[@min(r.attempts, RECONNECT_DELAYS_MS.len - 1)];
+            r.source = c.g_timeout_add(next, @ptrCast(&onReconnectTick), @ptrCast(r));
+            return 0;
+        }
     }
-    // Still worth dialing? Only while a tab is stranded on this host.
+    // Still worth dialing? Tabs and durable deferred transfers both
+    // retain a reason to reconnect; neither may spin a worker directly
+    // from a failed connection handback.
     var stranded = false;
     for (self.tabs.items) |tab| {
         if (tab.hc.state == .dead and hostEq(tab.hc.host, r.host)) stranded = true;
+    }
+    for (self.deferred_transfers.items) |d| {
+        if ((d.src_hc.state == .dead and hostEq(d.src_hc.host, r.host)) or
+            (d.dst_hc.state == .dead and hostEq(d.dst_hc.host, r.host)) or
+            (d.coordinator != null and d.coordinator.?.state == .dead and hostEq(d.coordinator.?.host, r.host)))
+            stranded = true;
     }
     if (!stranded) {
         self.clearReconnect(r.host);
@@ -452,6 +468,17 @@ pub fn requestHostDirs(self: *BrowserView, hc: *HostConn) void {
 /// Connection died: fail its transfers FIRST (they hold *Conn),
 /// then release the socket. Tabs keep referencing the dead
 /// HostConn; navigating again reconnects.
+const LostTransfer = struct { token: []u8, attempt_started: bool };
+
+fn rememberTransferLoss(self: *BrowserView, list: *std.ArrayList(LostTransfer), token: []const u8, attempt_started: bool) void {
+    for (list.items) |*existing| if (std.mem.eql(u8, existing.token, token)) {
+        existing.attempt_started = existing.attempt_started or attempt_started;
+        return;
+    };
+    const owned = self.allocator.dupe(u8, token) catch return;
+    list.append(self.allocator, .{ .token = owned, .attempt_started = attempt_started }) catch self.allocator.free(owned);
+}
+
 fn rememberRedispatch(self: *BrowserView, list: *std.ArrayList([]u8), token: []const u8) void {
     for (list.items) |existing| if (std.mem.eql(u8, existing, token)) return;
     const owned = self.allocator.dupe(u8, token) catch return;
@@ -460,10 +487,13 @@ fn rememberRedispatch(self: *BrowserView, list: *std.ArrayList([]u8), token: []c
 
 pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     @import("diskusage.zig").hostDied(self, hc);
-    var redispatch: std.ArrayList([]u8) = .empty;
+    var retry_after_loss: std.ArrayList(LostTransfer) = .empty;
+    var redispatch_acks: std.ArrayList([]u8) = .empty;
     defer {
-        for (redispatch.items) |token| self.allocator.free(token);
-        redispatch.deinit(self.allocator);
+        for (retry_after_loss.items) |lost| self.allocator.free(lost.token);
+        retry_after_loss.deinit(self.allocator);
+        for (redispatch_acks.items) |token| self.allocator.free(token);
+        redispatch_acks.deinit(self.allocator);
     }
     mediacols.hostDied(self, hc);
     // In-flight listings can never be answered. A navigation
@@ -479,7 +509,7 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
         if (t.src_hc == hc or t.dst_hc == hc) {
             self.setStatusFmt("transfer failed: connection to {s} lost", .{hc.label()});
             if (t.upload_watch) |wt| wt.uploading = false;
-            if (t.token) |token| rememberRedispatch(self, &redispatch, token);
+            if (t.token) |token| rememberTransferLoss(self, &retry_after_loss, token, t.started);
             t.x.deinit();
             self.allocator.free(t.label);
             t.freeExtras(self.allocator);
@@ -495,7 +525,7 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
             continue;
         }
         if (pj.retry) |retry| {
-            rememberRedispatch(self, &redispatch, retry.token);
+            rememberTransferLoss(self, &retry_after_loss, retry.token, true);
             retry.destroy(self.allocator);
         }
         self.allocator.free(pj.label);
@@ -517,12 +547,12 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     i = 0;
     while (i < self.jobs.items.len) {
         const row = self.jobs.items[i];
-        if (row.hc != hc or row.retry == null) {
+        if (row.hc != hc or row.retry == null or row.terminal()) {
             i += 1;
             continue;
         }
         if (row.retry) |retry| {
-            rememberRedispatch(self, &redispatch, retry.token);
+            rememberTransferLoss(self, &retry_after_loss, retry.token, true);
             retry.destroy(self.allocator);
         }
         self.allocator.free(row.label);
@@ -536,9 +566,20 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
             i += 1;
             continue;
         }
-        rememberRedispatch(self, &redispatch, ack.token);
+        rememberRedispatch(self, &redispatch_acks, ack.token);
         self.allocator.free(ack.token);
         _ = self.copy_acks.orderedRemove(i);
+    }
+    i = 0;
+    while (i < self.retry_pending.items.len) {
+        const retry = self.retry_pending.items[i];
+        if (retry.coordinator != hc and retry.src_hc != hc and retry.dst_hc != hc) {
+            i += 1;
+            continue;
+        }
+        rememberTransferLoss(self, &retry_after_loss, retry.token, false);
+        _ = self.retry_pending.orderedRemove(i);
+        retry.destroy(self.allocator);
     }
     i = 0;
     while (i < self.pending_history.items.len) {
@@ -613,9 +654,12 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
     hc.conn.deinit();
     hc.state = .dead;
     self.pumpCopyQueue();
-    self.pumpDeferredTransfers();
     if (self.transfer_service) |service| {
-        for (redispatch.items) |token| service.redispatchMediated(token);
+        for (retry_after_loss.items) |transfer_loss| {
+            if (service.recordMediatedTransportLoss(transfer_loss.token, lost, transfer_loss.attempt_started))
+                _ = @import("jobs.zig").scheduleMediatedRetry(self, transfer_loss.token);
+        }
+        for (redispatch_acks.items) |token| service.redispatchMediated(token);
     }
     self.renderJobs();
     // A remote host with tabs still on it gets re-dialed by timer; a
@@ -624,6 +668,9 @@ pub fn hostDied(self: *BrowserView, hc: *HostConn) void {
         var stranded = false;
         for (self.tabs.items) |tab| {
             if (tab.hc == hc) stranded = true;
+        }
+        for (self.deferred_transfers.items) |d| {
+            if (d.src_hc == hc or d.dst_hc == hc or d.coordinator == hc) stranded = true;
         }
         if (stranded) {
             self.setStatusFmt("connection to {s} lost — reconnecting…", .{hc.label()});
@@ -638,17 +685,27 @@ pub fn sendOp(self: *BrowserView, hc: *HostConn, args: anytype) void {
     _ = self.sendOpOk(hc, args);
 }
 
+pub const SendResult = enum { ok, transport, setup };
+
 pub fn sendOpOk(self: *BrowserView, hc: *HostConn, args: anytype) bool {
+    return self.sendOpResult(hc, args) == .ok;
+}
+
+pub fn sendOpResult(self: *BrowserView, hc: *HostConn, args: anytype) SendResult {
     if (hc.state != .ready) {
         self.setStatusFmt("not connected to {s}", .{hc.label()});
-        return false;
+        return .transport;
     }
-    hc.conn.queueJson(.fs_op, args) catch {
-        self.setStatus("daemon connection lost");
-        return false;
+    hc.conn.queueJson(.fs_op, args) catch |err| {
+        if (err == error.WriteFailed) {
+            self.setStatus("daemon connection lost");
+            return .transport;
+        }
+        self.setStatusFmt("could not queue filesystem request: {s}", .{@errorName(err)});
+        return .setup;
     };
     self.ensureWriteFlush(hc);
-    return true;
+    return .ok;
 }
 
 pub fn closeViewOf(self: *BrowserView, hc: *HostConn, dir: *Dir) void {
@@ -965,8 +1022,8 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         if (!rep.ok and !std.mem.eql(u8, rep.@"error", "no such job")) {
             self.copy_acks.items[i].req = 0;
             self.copy_acks.items[i].attempts +|= 1;
-            if (self.retry_timer == 0)
-                self.retry_timer = c.g_timeout_add(1000, @ptrCast(&@import("jobs.zig").onRetryTimer), @ptrCast(self));
+            self.copy_acks.items[i].retry_due_ms = @import("../../util/clock.zig").nowMs() + 1_000;
+            @import("jobs.zig").armRetryTimer(self);
             return false;
         }
         const completed = self.copy_acks.orderedRemove(i);
@@ -1093,8 +1150,10 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     for (self.pending_jobs.items, 0..) |pj, i| {
         if (pj.req != rep.req) continue;
         if (rep.ok and rep.job != 0) {
+            var mediated_start_recorded = true;
             if (pj.retry) |retry| {
-                if (self.transfer_service) |service| _ = service.mediatedJobStarted(retry.token, rep.job);
+                if (self.transfer_service) |service|
+                    mediated_start_recorded = service.mediatedJobStarted(retry.token, rep.job);
             }
             if (pj.kind == .query) {
                 // The tab may have closed since the request went out;
@@ -1184,7 +1243,11 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             self.allocator.destroy(pj);
             if (row.retry) |retry| {
                 if (self.transfer_service) |service| {
-                    if (service.mediatedCancelRequested(retry.token)) {
+                    if (!mediated_start_recorded) {
+                        _ = service.requestMediatedCancel(retry.token);
+                        row.setMessage("canceling: transfer job id could not be persisted");
+                        self.sendOp(row.hc, .{ .req = self.nextReq(), .op = "job_cancel", .job = row.job });
+                    } else if (service.mediatedCancelRequested(retry.token)) {
                         self.sendOp(row.hc, .{ .req = self.nextReq(), .op = "job_cancel", .job = row.job });
                     } else if (service.mediatedPaused(retry.token)) {
                         self.sendOp(row.hc, .{ .req = self.nextReq(), .op = "job_pause", .job = row.job });
@@ -1216,7 +1279,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             if (pj.history_op) |op| self.restoreHistory(op, pj.history_direction.?);
             if (pj.retry) |r| {
                 pj.retry = null;
-                if (@import("jobs.zig").retryRejectedCopy(self, r, rep.@"error"))
+                if (@import("jobs.zig").retryRejectedCopy(self, r, rep.@"error", rep.kind))
                     self.setStatusFmt("transfer start failed, retrying shortly: {s} ({s})", .{ pj.label, errorPhrase(rep.@"error") });
             }
             self.allocator.free(pj.label);

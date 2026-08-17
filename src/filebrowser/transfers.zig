@@ -27,7 +27,7 @@ const pathz = @import("../util/pathz.zig");
 const platform = @import("../util/platform.zig");
 const profile = @import("../util/profile.zig");
 
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 pub const MIN_READ_VERSION: u32 = 2;
 pub const MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
 
@@ -99,6 +99,10 @@ pub const Intent = struct {
     /// coordinator_set distinguishes that from an unsubmitted record.
     coordinator_host: []const u8 = "",
     coordinator_set: bool = false,
+    /// The coordinator may have accepted the current submission even
+    /// though its start reply was lost. Cancellation must recover and
+    /// target that attempt instead of merely dropping a retry timer.
+    submission_uncertain: bool = false,
     /// Daemon that still needs ack_job acknowledged. It is separate
     /// from coordinator_host because a retry may use another daemon.
     ack_host: []const u8 = "",
@@ -672,13 +676,14 @@ test "a queued browser move persists its recovery identity" {
     try t.expectEqualStrings("batch-1", v.batch_token);
 }
 
-test "ledger v5 excludes older writers while retaining v2 recovery" {
+test "ledger v6 excludes older writers while retaining v2 recovery" {
     try std.testing.expect(!readableVersion(1));
     try std.testing.expect(readableVersion(2));
     try std.testing.expect(readableVersion(3));
     try std.testing.expect(readableVersion(4));
     try std.testing.expect(readableVersion(5));
-    try std.testing.expect(!readableVersion(6));
+    try std.testing.expect(readableVersion(6));
+    try std.testing.expect(!readableVersion(7));
 }
 
 test "list reports every record identity in the ledger directory" {

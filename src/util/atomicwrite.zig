@@ -20,13 +20,22 @@ pub const MAX_PATH = 4096;
 /// `O_NOFOLLOW` on the temporary: a symlink planted where our `.part`
 /// goes would otherwise redirect the write. The partial file is
 /// unlinked on every failure, so a failed write leaves nothing behind
-/// and the previous contents intact.
+/// and the previous contents intact. The temporary name is FIXED
+/// (`<path>.part`, not per-pid): a crash between open and rename leaves
+/// one file the next write truncates and reuses, and the filter-cache
+/// sweep in `web/cefhost.zig` only recognizes that exact name.
 pub fn writeFile(path: []const u8, bytes: []const u8, mode: u32) Error!void {
     if (path.len >= MAX_PATH) return error.NameTooLong;
     var tmp_buf: [MAX_PATH + 8]u8 = undefined;
     const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.part", .{path}) catch return error.NameTooLong;
     var dst_buf: [MAX_PATH + 8]u8 = undefined;
     const dst = std.fmt.bufPrintZ(&dst_buf, "{s}", .{path}) catch return error.NameTooLong;
+    const parent = std.fs.path.dirname(path) orelse ".";
+    var parent_buf: [MAX_PATH + 8]u8 = undefined;
+    const parent_z = std.fmt.bufPrintZ(&parent_buf, "{s}", .{parent}) catch return error.NameTooLong;
+    const dir_fd = c.open(parent_z.ptr, c.O_RDONLY | c.O_CLOEXEC);
+    if (dir_fd < 0) return error.OpenFailed;
+    defer _ = c.close(dir_fd);
 
     const fd = c.open(
         tmp.ptr,
@@ -58,6 +67,10 @@ pub fn writeFile(path: []const u8, bytes: []const u8, mode: u32) Error!void {
         _ = c.unlink(tmp.ptr);
         return error.RenameFailed;
     }
+    // The destination is committed now and cannot be rolled back safely.
+    // A directory-sync failure weakens crash durability, but must not be
+    // reported as though the previous file were still in place.
+    _ = c.fsync(dir_fd);
 }
 
 test "writeFile replaces contents and leaves no partial file" {
@@ -66,12 +79,14 @@ test "writeFile replaces contents and leaves no partial file" {
     const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/list.txt", .{base});
+    var z_buf: [512:0]u8 = undefined;
+    const z = try std.fmt.bufPrintZ(&z_buf, "{s}", .{path});
+    defer _ = c.rmdir(dir);
+    defer _ = c.unlink(z.ptr);
 
     try writeFile(path, "first", 0o600);
     try writeFile(path, "second-and-longer", 0o600);
 
-    var z_buf: [512:0]u8 = undefined;
-    const z = try std.fmt.bufPrintZ(&z_buf, "{s}", .{path});
     const fd = c.open(z.ptr, c.O_RDONLY);
     try std.testing.expect(fd >= 0);
     defer _ = c.close(fd);

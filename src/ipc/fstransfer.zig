@@ -26,8 +26,29 @@ const std = @import("std");
 const client = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 const fsserve = @import("../mux/fsserve.zig");
+const errorPhrase = @import("../filebrowser/format.zig").errorPhrase;
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
+
+fn queueErrorIsTransport(err: anyerror) bool {
+    return err == error.WriteFailed;
+}
+
+/// Fail `self` after a queue attempt on `side`, shared by Transfer and Xfer.
+///
+/// A transport error is marked transient so the client may retry it; any
+/// other error names itself, because it is a bug rather than a lost link.
+fn failQueue(self: anytype, side: Side, err: anyerror) void {
+    if (queueErrorIsTransport(err)) return self.failTransport(switch (side) {
+        .src => "source connection lost",
+        .dst => "destination connection lost",
+    });
+    const who: []const u8 = switch (side) {
+        .src => "source",
+        .dst => "destination",
+    };
+    self.failFmt("{s} request setup failed: {s}", .{ who, @errorName(err) });
+}
 
 /// Read/write chunk size. Under fsserve.MAX_READ and comfortably
 /// inside one wire frame with the fs_write header.
@@ -108,6 +129,7 @@ pub const Transfer = struct {
     paused: bool = false,
     err_buf: [192]u8 = undefined,
     err_len: usize = 0,
+    transient_failure: bool = false,
 
     pub const State = enum {
         idle,
@@ -194,6 +216,11 @@ pub const Transfer = struct {
         self.state = .failed;
     }
 
+    fn failTransport(self: *Transfer, msg: []const u8) void {
+        self.transient_failure = true;
+        self.fail(msg);
+    }
+
     fn failFmt(self: *Transfer, comptime fmt: []const u8, args: anytype) void {
         const msg = std.fmt.bufPrint(&self.err_buf, fmt, args) catch fmt;
         self.err_len = msg.len;
@@ -201,16 +228,16 @@ pub const Transfer = struct {
     }
 
     fn sendSrcOp(self: *Transfer, args: anytype) bool {
-        self.src.queueJson(.fs_op, args) catch {
-            self.fail("source connection lost");
+        self.src.queueJson(.fs_op, args) catch |err| {
+            failQueue(self, .src, err);
             return false;
         };
         return true;
     }
 
     fn sendDstOp(self: *Transfer, args: anytype) bool {
-        self.dst.queueJson(.fs_op, args) catch {
-            self.fail("destination connection lost");
+        self.dst.queueJson(.fs_op, args) catch |err| {
+            failQueue(self, .dst, err);
             return false;
         };
         return true;
@@ -274,7 +301,7 @@ pub const Transfer = struct {
     fn onReply(self: *Transfer, side: Side, rep: Reply) void {
         switch (self.state) {
             .stat_src => {
-                if (!rep.ok) return self.failFmt("source: {s}", .{rep.@"error"});
+                if (!rep.ok) return self.failFmt("source: {s}", .{errorPhrase(rep.@"error")});
                 const e = rep.entry orelse return self.fail("source: bad stat reply");
                 if (!std.mem.eql(u8, e.kind, "file"))
                     return self.fail("source is not a regular file");
@@ -314,7 +341,7 @@ pub const Transfer = struct {
             },
             .read => {
                 if (side != .src) return;
-                if (!rep.ok) return self.failFmt("read: {s}", .{rep.@"error"});
+                if (!rep.ok) return self.failFmt("read: {s}", .{errorPhrase(rep.@"error")});
                 if (self.chunk.items.len == 0 and self.off < self.size)
                     return self.fail("source shrank during copy");
                 self.hasher.update(self.chunk.items);
@@ -322,7 +349,7 @@ pub const Transfer = struct {
             },
             .write => {
                 if (side != .dst) return;
-                if (!rep.ok) return self.failFmt("write: {s}", .{rep.@"error"});
+                if (!rep.ok) return self.failFmt("write: {s}", .{errorPhrase(rep.@"error")});
                 self.off += self.chunk.items.len;
                 self.chunk.clearRetainingCapacity();
                 if (self.off >= self.size) {
@@ -343,14 +370,14 @@ pub const Transfer = struct {
                 if (!rep.ok) {
                     if (self.no_replace and std.mem.indexOf(u8, rep.@"error", "EXIST") != null)
                         self.dst.queueJson(.fs_op, .{ .req = self.nr(), .op = "delete", .path = self.staged }) catch {};
-                    return self.failFmt("finalize: {s}", .{rep.@"error"});
+                    return self.failFmt("finalize: {s}", .{errorPhrase(rep.@"error")});
                 }
                 self.req_dst = self.nr();
                 self.state = .hash_start_dst;
                 _ = self.sendDstOp(.{ .req = self.req_dst, .op = "hash", .path = self.dst_path });
             },
             .hash_start_dst => {
-                if (!rep.ok or rep.job == 0) return self.failFmt("verify: {s}", .{rep.@"error"});
+                if (!rep.ok or rep.job == 0) return self.failFmt("verify: {s}", .{errorPhrase(rep.@"error")});
                 self.job_dst = rep.job;
                 if (self.resumed_from > 0 or self.verifying_skip) {
                     // The client never saw the partial's bytes — hash
@@ -368,7 +395,7 @@ pub const Transfer = struct {
                 self.state = .hash_wait;
             },
             .hash_start_src => {
-                if (!rep.ok or rep.job == 0) return self.failFmt("verify: {s}", .{rep.@"error"});
+                if (!rep.ok or rep.job == 0) return self.failFmt("verify: {s}", .{errorPhrase(rep.@"error")});
                 self.job_src = rep.job;
                 self.state = .hash_wait;
             },
@@ -446,7 +473,7 @@ pub const Transfer = struct {
             self.req_dst = self.nr();
             self.state = .write;
             self.chunk.clearRetainingCapacity();
-            self.sendWriteFrame(&.{}) catch return self.fail("destination connection lost");
+            self.sendWriteFrame(&.{}) catch |err| return failQueue(self, .dst, err);
             return;
         }
         self.requestRead();
@@ -488,7 +515,7 @@ pub const Transfer = struct {
     fn sendChunk(self: *Transfer) void {
         self.req_dst = self.nr();
         self.state = .write;
-        self.sendWriteFrame(self.chunk.items) catch return self.fail("destination connection lost");
+        self.sendWriteFrame(self.chunk.items) catch |err| return failQueue(self, .dst, err);
     }
 
     fn sendWriteFrame(self: *Transfer, data: []const u8) !void {
@@ -550,6 +577,7 @@ pub const Xfer = struct {
     paused: bool = false,
     err_buf: [192]u8 = undefined,
     err_len: usize = 0,
+    transient_failure: bool = false,
 
     const Item = struct { rel: []u8, size: u64 };
     const Link = struct { rel: []u8, target: []u8 };
@@ -606,6 +634,10 @@ pub const Xfer = struct {
         return self.err_buf[0..self.err_len];
     }
 
+    pub fn retryable(self: *const Xfer) bool {
+        return self.transient_failure;
+    }
+
     pub fn isTerminal(self: *const Xfer) bool {
         return switch (self.state) {
             .done, .failed, .canceled => true,
@@ -652,6 +684,11 @@ pub const Xfer = struct {
         self.state = .failed;
     }
 
+    fn failTransport(self: *Xfer, msg: []const u8) void {
+        self.transient_failure = true;
+        self.fail(msg);
+    }
+
     fn failFmt(self: *Xfer, comptime fmt: []const u8, args: anytype) void {
         const msg = std.fmt.bufPrint(&self.err_buf, fmt, args) catch fmt;
         self.err_len = msg.len;
@@ -665,8 +702,8 @@ pub const Xfer = struct {
         }
         self.list_req = self.nr();
         self.state = .stat_root;
-        self.src.queueJson(.fs_op, .{ .req = self.list_req, .op = "stat", .path = self.src_root }) catch
-            self.fail("source connection lost");
+        self.src.queueJson(.fs_op, .{ .req = self.list_req, .op = "stat", .path = self.src_root }) catch |err|
+            failQueue(self, .src, err);
     }
 
     pub fn cancel(self: *Xfer) void {
@@ -697,6 +734,13 @@ pub const Xfer = struct {
     pub fn isPaused(self: *const Xfer) bool {
         if (self.isTerminal()) return false;
         return self.paused;
+    }
+
+    /// True once pause has reached a boundary with no request in flight.
+    pub fn pauseSettled(self: *const Xfer) bool {
+        if (!self.paused or self.isTerminal()) return false;
+        if (self.cur) |t| return t.state == .paused;
+        return self.state == .copying;
     }
 
     fn srcAbs(self: *Xfer, buf: []u8, rel: []const u8) ?[]const u8 {
@@ -732,7 +776,7 @@ pub const Xfer = struct {
         _ = side;
         switch (self.state) {
             .stat_root => {
-                if (!rep.ok) return self.failFmt("source: {s}", .{rep.@"error"});
+                if (!rep.ok) return self.failFmt("source: {s}", .{errorPhrase(rep.@"error")});
                 const e = rep.entry orelse return self.fail("source: bad stat reply");
                 if (std.mem.eql(u8, e.kind, "file")) {
                     self.single_file = true;
@@ -767,7 +811,7 @@ pub const Xfer = struct {
                 self.listNext();
             },
             .walking => {
-                if (!rep.ok) return self.failFmt("list: {s}", .{rep.@"error"});
+                if (!rep.ok) return self.failFmt("list: {s}", .{errorPhrase(rep.@"error")});
                 if (rep.truncated) return self.fail("directory too large (listing truncated)");
                 const rel = self.listing_rel orelse return self.fail("walk state lost");
                 for (rep.entries) |e| {
@@ -810,7 +854,7 @@ pub const Xfer = struct {
                         else => false,
                     };
                     if ((self.no_replace and root) or std.mem.indexOf(u8, rep.@"error", "EXIST") == null)
-                        return self.failFmt("destination setup: {s}", .{rep.@"error"});
+                        return self.failFmt("destination setup: {s}", .{errorPhrase(rep.@"error")});
                 }
                 self.setup_idx += 1;
                 self.setupNext();
@@ -840,8 +884,8 @@ pub const Xfer = struct {
         var buf: [4096]u8 = undefined;
         const abs = self.srcAbs(&buf, rel) orelse return self.fail("path too long");
         self.list_req = self.nr();
-        self.src.queueJson(.fs_op, .{ .req = self.list_req, .op = "list", .path = abs }) catch
-            self.fail("source connection lost");
+        self.src.queueJson(.fs_op, .{ .req = self.list_req, .op = "list", .path = abs }) catch |err|
+            failQueue(self, .src, err);
     }
 
     fn setupNext(self: *Xfer) void {
@@ -856,8 +900,8 @@ pub const Xfer = struct {
                 const abs = self.dstAbs(&buf, self.dirs.items[self.setup_idx]) orelse
                     return self.fail("path too long");
                 self.setup_req = self.nr();
-                self.dst.queueJson(.fs_op, .{ .req = self.setup_req, .op = "mkdir", .path = abs }) catch
-                    self.fail("destination connection lost");
+                self.dst.queueJson(.fs_op, .{ .req = self.setup_req, .op = "mkdir", .path = abs }) catch |err|
+                    failQueue(self, .dst, err);
             },
             .symlinks => {
                 if (self.setup_idx >= self.links.items.len) {
@@ -874,7 +918,7 @@ pub const Xfer = struct {
                     .op = "symlink",
                     .path = abs,
                     .to = l.target,
-                }) catch self.fail("destination connection lost");
+                }) catch |err| failQueue(self, .dst, err);
             },
             else => {},
         }
@@ -918,6 +962,7 @@ pub const Xfer = struct {
             var buf: [256]u8 = undefined;
             const base = std.fs.path.basename(t.src_path);
             const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ base, t.errMsg() }) catch t.errMsg();
+            self.transient_failure = t.transient_failure;
             return self.fail(msg);
         }
         self.done_bytes += self.files.items[self.cur_idx].size;
@@ -928,3 +973,25 @@ pub const Xfer = struct {
         self.startNextFile();
     }
 };
+
+test "client-mediated retries only connection failures" {
+    const empty: []u8 = @constCast(&[_]u8{});
+    var xfer = Xfer{
+        .allocator = std.testing.allocator,
+        .src = undefined,
+        .dst = undefined,
+        .next_req = undefined,
+        .src_root = empty,
+        .dst_root = empty,
+        .resumable = true,
+    };
+    xfer.fail("permission denied");
+    try std.testing.expect(!xfer.retryable());
+
+    xfer.state = .idle;
+    xfer.failTransport("source connection lost");
+    try std.testing.expect(xfer.retryable());
+    try std.testing.expect(queueErrorIsTransport(error.WriteFailed));
+    try std.testing.expect(!queueErrorIsTransport(error.PathTooLong));
+    try std.testing.expect(!queueErrorIsTransport(error.OutOfMemory));
+}

@@ -101,6 +101,7 @@ pub const WireReply = struct {
     req: u32 = 0,
     ok: bool = false,
     @"error": []const u8 = "",
+    kind: []const u8 = "",
     path: []const u8 = "",
     entries: []WireEntry = &.{},
     /// `stat` answers with ONE entry rather than a listing.
@@ -129,6 +130,14 @@ pub const WireReply = struct {
     bavail: u64 = 0,
     frsize: u64 = 0,
 };
+
+test "filesystem refusal keeps its structured failure kind" {
+    const parsed = try std.json.parseFromSlice(WireReply, std.testing.allocator,
+        \\{"req":7,"ok":false,"error":"permission denied","kind":"permanent"}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("permanent", parsed.value.kind);
+}
 
 /// One host-side application (daemon `apps` op reply).
 pub const WireApp = struct {
@@ -980,12 +989,13 @@ pub const CopyRetry = struct {
     /// Automatic attempts already spent, so a host that is simply gone
     /// stops costing retries and the row settles as failed.
     attempts: u8 = 0,
+    retry_due_ms: i64 = 0,
     /// A MOVE: the helper deletes the verified source (delete_src).
     move: bool = false,
     no_replace: bool = false,
     /// The coordinator is a REMOTE daemon dialing its peer directly.
-    /// An "unreachable" failure re-coordinates through the local
-    /// daemon instead of burning resume attempts.
+    /// An "unreachable" failure re-coordinates through the local daemon
+    /// as the next bounded automatic attempt.
     direct: bool = false,
 
     pub fn destroy(self: *CopyRetry, allocator: std.mem.Allocator) void {
@@ -1032,6 +1042,7 @@ pub const CopyRetry = struct {
             .batch_total = self.batch_total,
             .dest_key = self.dest_key,
             .attempts = self.attempts,
+            .retry_due_ms = self.retry_due_ms,
             .move = self.move,
             .no_replace = self.no_replace,
             .direct = self.direct,
@@ -1121,6 +1132,8 @@ pub const JobRow = struct {
     /// the row offers no Retry button (pressing it would double the
     /// copy) and disappears once the new attempt's row lands.
     retry_scheduled: bool = false,
+    /// Monotonic deadline for the visible automatic-retry countdown.
+    retry_due_ms: i64 = 0,
 
     pub fn terminal(self: *const JobRow) bool {
         return self.state == .finished or self.state == .failed or self.state == .canceled;

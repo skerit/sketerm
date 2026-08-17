@@ -4,8 +4,11 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const pathz = @import("../util/pathz.zig");
 
+pub const VERSION: u32 = 5;
+pub const MIN_READ_VERSION: u32 = 1;
+
 pub const Record = struct {
-    version: u32 = 4,
+    version: u32 = VERSION,
     id: u64,
     op: []const u8,
     state: []const u8 = "running",
@@ -34,7 +37,8 @@ pub const Record = struct {
     /// source identity, "destination_staged" protects a no-replace
     /// directory install, "copied" means every entry was installed and
     /// verified, "quarantined" captures the source root, and
-    /// "source_deleted" means its removal completed.
+    /// "deleting" commits to source cleanup (cancellation can no longer
+    /// restore a complete tree), and "source_deleted" means it completed.
     phase: []const u8 = "",
     /// Persisted before source quarantine so a lost rename reply or
     /// helper crash can resume without ever deleting `src` by pathname.
@@ -58,6 +62,9 @@ pub const Record = struct {
     files_done: u64 = 0,
     files_total: u64 = 0,
     message: []const u8 = "",
+    /// Structured terminal cause used by clients to decide whether an
+    /// automatic retry is safe (for example "transport" or "permanent").
+    error_kind: []const u8 = "",
     /// Stable caller identity used to reconcile a submission whose
     /// reply was lost when the client disconnected.
     client_token: []const u8 = "",
@@ -71,7 +78,8 @@ pub const Record = struct {
 };
 
 pub fn phaseRank(phase: []const u8) u8 {
-    if (std.mem.eql(u8, phase, "source_deleted")) return 5;
+    if (std.mem.eql(u8, phase, "source_deleted")) return 6;
+    if (std.mem.eql(u8, phase, "deleting")) return 5;
     if (std.mem.eql(u8, phase, "quarantined")) return 4;
     if (std.mem.eql(u8, phase, "copied")) return 3;
     if (std.mem.eql(u8, phase, "destination_staged")) return 2;
@@ -84,6 +92,142 @@ fn recordPath(buf: []u8, dir: []const u8, id: u64, temporary: bool) ![:0]u8 {
         std.fmt.bufPrintZ(buf, "{s}/{d}.json.tmp-{d}", .{ dir, id, c.getpid() })
     else
         std.fmt.bufPrintZ(buf, "{s}/{d}.json", .{ dir, id });
+}
+
+fn cancelPath(buf: []u8, dir: []const u8, id: u64) ![:0]u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/{d}.cancel", .{ dir, id });
+}
+
+fn controlPath(buf: []u8, dir: []const u8, id: u64) ![:0]u8 {
+    return std.fmt.bufPrintZ(buf, "{s}/{d}.control", .{ dir, id });
+}
+
+fn syncDir(dir: []const u8) bool {
+    var z: [4096]u8 = undefined;
+    const dfd = c.open(pathz.pathZ(&z, dir) catch return false, c.O_RDONLY | c.O_DIRECTORY);
+    if (dfd < 0) return false;
+    defer _ = c.close(dfd);
+    return c.fsync(dfd) == 0;
+}
+
+pub const ControlLock = struct {
+    fd: c_int,
+
+    pub fn release(self: ControlLock) void {
+        _ = c.close(self.fd);
+    }
+};
+
+/// Serialize cancellation with the helper's delete and terminal commits.
+pub fn lockControl(dir: []const u8, id: u64) !ControlLock {
+    if (!ensureDir(dir)) return error.CreateFailed;
+    var path_buf: [4096:0]u8 = undefined;
+    const path = try controlPath(&path_buf, dir, id);
+    const fd = c.open(path.ptr, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+    if (fd < 0) return error.LockFailed;
+    errdefer _ = c.close(fd);
+    while (c.flock(fd, c.LOCK_EX) != 0) {
+        if (std.posix.errno(@as(c_int, -1)) == .INTR) continue;
+        return error.LockFailed;
+    }
+    return .{ .fd = fd };
+}
+
+/// Try the cancellation election without blocking the daemon poll loop.
+pub fn tryLockControl(dir: []const u8, id: u64) !?ControlLock {
+    if (!ensureDir(dir)) return error.CreateFailed;
+    var path_buf: [4096:0]u8 = undefined;
+    const path = try controlPath(&path_buf, dir, id);
+    const fd = c.open(path.ptr, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+    if (fd < 0) return error.LockFailed;
+    errdefer _ = c.close(fd);
+    if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) {
+        if (std.posix.errno(@as(c_int, -1)) == .AGAIN) {
+            _ = c.close(fd);
+            return null;
+        }
+        return error.LockFailed;
+    }
+    return .{ .fd = fd };
+}
+
+pub const CancelResult = enum {
+    requested,
+    delete_committed,
+    finished,
+};
+
+fn createCancel(dir: []const u8, id: u64) bool {
+    var path_buf: [4096:0]u8 = undefined;
+    const path = cancelPath(&path_buf, dir, id) catch return false;
+    const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+    if (fd < 0) {
+        if (std.posix.errno(@as(c_int, -1)) != .EXIST) return false;
+        return true;
+    }
+    if (c.fsync(fd) != 0) {
+        _ = c.close(fd);
+        _ = c.unlink(path.ptr);
+        return false;
+    }
+    if (c.close(fd) != 0) {
+        _ = c.unlink(path.ptr);
+        return false;
+    }
+    return syncDir(dir);
+}
+
+/// Try to persist cancellation now; null means the helper owns the
+/// election. Cancellation succeeds only when source deletion has not
+/// committed. There is deliberately no blocking variant: the daemon
+/// must never wait on the helper's flock in its poll loop.
+pub fn tryRequestCancel(allocator: std.mem.Allocator, dir: []const u8, id: u64) !?CancelResult {
+    const guard = (try tryLockControl(dir, id)) orelse return null;
+    defer guard.release();
+    return try requestCancelLocked(allocator, dir, id, false);
+}
+
+/// Arm cleanup before restarting a failed durable transfer.
+pub fn tryRequestRecoveryCancel(allocator: std.mem.Allocator, dir: []const u8, id: u64) !?CancelResult {
+    const guard = (try tryLockControl(dir, id)) orelse return null;
+    defer guard.release();
+    return try requestCancelLocked(allocator, dir, id, true);
+}
+
+fn requestCancelLocked(allocator: std.mem.Allocator, dir: []const u8, id: u64, allow_failed: bool) !CancelResult {
+    if (cancelRequested(dir, id)) return .requested;
+
+    var path_buf: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{d}.json", .{ dir, id });
+    const parsed = try load(allocator, path);
+    defer parsed.deinit();
+    if (phaseRank(parsed.value.phase) >= phaseRank("deleting")) return .delete_committed;
+    if (std.mem.eql(u8, parsed.value.state, "done") or
+        (!allow_failed and std.mem.eql(u8, parsed.value.state, "failed")) or
+        std.mem.eql(u8, parsed.value.state, "canceled")) return .finished;
+    if (!createCancel(dir, id)) return error.WriteFailed;
+    return .requested;
+}
+
+pub fn cancelRequested(dir: []const u8, id: u64) bool {
+    var path_buf: [4096:0]u8 = undefined;
+    const path = cancelPath(&path_buf, dir, id) catch return false;
+    return c.access(path.ptr, c.F_OK) == 0;
+}
+
+/// Remove a cancellation fence after a terminal journal record is durable.
+pub fn clearCancel(dir: []const u8, id: u64) bool {
+    var path_buf: [4096:0]u8 = undefined;
+    const path = cancelPath(&path_buf, dir, id) catch return false;
+    if (c.unlink(path.ptr) != 0 and std.posix.errno(@as(c_int, -1)) != .NOENT) return false;
+    return syncDir(dir);
+}
+
+/// Remove the inactive serialization sidecar with the job journal.
+pub fn clearControl(dir: []const u8, id: u64) void {
+    var path_buf: [4096:0]u8 = undefined;
+    const path = controlPath(&path_buf, dir, id) catch return;
+    _ = c.unlink(path.ptr);
 }
 
 pub fn ensureDir(dir: []const u8) bool {
@@ -129,12 +273,7 @@ pub fn save(dir: []const u8, record: Record) !void {
     }
     // Persist the directory entry too: after a power loss a durable
     // job must not regress to the pre-rename record.
-    var dir_buf: [4096]u8 = undefined;
-    const dir_z = pathz.pathZ(&dir_buf, dir) catch return;
-    const dfd = c.open(dir_z, c.O_RDONLY | c.O_DIRECTORY);
-    if (dfd < 0) return error.WriteFailed;
-    defer _ = c.close(dfd);
-    if (c.fsync(dfd) != 0) return error.WriteFailed;
+    if (!syncDir(dir)) return error.WriteFailed;
 }
 
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Record) {
@@ -144,6 +283,14 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !std.json.Parsed(Rec
     var bytes: [16 * 1024]u8 = undefined;
     const n = c.fread(&bytes, 1, bytes.len, fp);
     if (n == 0 or n == bytes.len) return error.BadRecord;
+    const Header = struct { version: ?u32 = null };
+    const header = try std.json.parseFromSlice(Header, allocator, bytes[0..n], .{
+        .ignore_unknown_fields = true,
+    });
+    defer header.deinit();
+    const record_version = header.value.version orelse return error.BadRecord;
+    if (record_version < MIN_READ_VERSION or record_version > VERSION)
+        return error.UnsupportedVersion;
     return std.json.parseFromSlice(Record, allocator, bytes[0..n], .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
@@ -181,6 +328,7 @@ test "job journal save/load is atomic and complete" {
         .source_dev = 7,
         .source_ino = 9,
         .recovery_attempts = 2,
+        .error_kind = "transport",
         .acknowledged = true,
     });
     const path = try std.fmt.allocPrint(arena.allocator(), "{s}/42.json", .{base});
@@ -208,7 +356,58 @@ test "job journal save/load is atomic and complete" {
     try std.testing.expectEqual(@as(u64, 7), parsed.value.source_dev);
     try std.testing.expectEqual(@as(u64, 9), parsed.value.source_ino);
     try std.testing.expectEqual(@as(u32, 2), parsed.value.recovery_attempts);
+    try std.testing.expectEqualStrings("transport", parsed.value.error_kind);
     try std.testing.expect(parsed.value.acknowledged);
+}
+
+test "cancel fence is durable, idempotent, and independent of journal saves" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const base = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}/jobs", .{&tmp.sub_path});
+    try save(base, .{ .id = 7, .op = "cross_copy", .state = "running" });
+    try std.testing.expectEqual(CancelResult.requested, (try tryRequestCancel(std.testing.allocator, base, 7)).?);
+    try std.testing.expectEqual(CancelResult.requested, (try tryRequestCancel(std.testing.allocator, base, 7)).?);
+    try std.testing.expect(cancelRequested(base, 7));
+    try std.testing.expect(cancelRequested(base, 7));
+    try std.testing.expect(clearCancel(base, 7));
+    try std.testing.expect(!cancelRequested(base, 7));
+}
+
+test "cancel request loses after the deleting boundary" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const base = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}/jobs", .{&tmp.sub_path});
+    try save(base, .{ .id = 8, .op = "cross_copy", .state = "running", .phase = "deleting" });
+    try std.testing.expectEqual(CancelResult.delete_committed, (try tryRequestCancel(std.testing.allocator, base, 8)).?);
+    try std.testing.expect(!cancelRequested(base, 8));
+}
+
+test "nonblocking cancellation election reports a held helper lock" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const base = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}/jobs", .{&tmp.sub_path});
+    try save(base, .{ .id = 9, .op = "cross_copy", .state = "running" });
+    const held = try lockControl(base, 9);
+    try std.testing.expect((try tryRequestCancel(std.testing.allocator, base, 9)) == null);
+    held.release();
+    try std.testing.expectEqual(CancelResult.requested, (try tryRequestCancel(std.testing.allocator, base, 9)).?);
+}
+
+test "journal reader rejects a future durability version" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const base = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}/jobs", .{&tmp.sub_path});
+    try save(base, .{ .version = VERSION + 1, .id = 10, .op = "cross_copy" });
+    const path = try std.fmt.allocPrint(arena.allocator(), "{s}/10.json", .{base});
+    try std.testing.expectError(error.UnsupportedVersion, load(arena.allocator(), path));
 }
 
 test "move journal phases are monotonic" {
@@ -216,5 +415,6 @@ test "move journal phases are monotonic" {
     try std.testing.expect(phaseRank("rename_planned") < phaseRank("destination_staged"));
     try std.testing.expect(phaseRank("destination_staged") < phaseRank("copied"));
     try std.testing.expect(phaseRank("copied") < phaseRank("quarantined"));
-    try std.testing.expect(phaseRank("quarantined") < phaseRank("source_deleted"));
+    try std.testing.expect(phaseRank("quarantined") < phaseRank("deleting"));
+    try std.testing.expect(phaseRank("deleting") < phaseRank("source_deleted"));
 }

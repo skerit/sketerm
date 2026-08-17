@@ -278,6 +278,9 @@ pub const Conn = struct {
     /// job_ack, so browser-owned intents can survive view handoff.
     durable_copy: bool = false,
     copy_no_replace: bool = false,
+    /// cross_copy serializes cancellation against final installation
+    /// and source deletion, including restart recovery.
+    durable_copy_v2: bool = false,
     /// The daemon's announced build id (git describe). Empty = a
     /// daemon that predates the announce — stale by definition.
     server_build: [72]u8 = undefined,
@@ -466,6 +469,7 @@ pub const Conn = struct {
         self.cross_move = false;
         self.durable_copy = false;
         self.copy_no_replace = false;
+        self.durable_copy_v2 = false;
         self.display_v2 = false;
         self.kill_origin_fence = false;
         self.lsp_support = false;
@@ -485,6 +489,7 @@ pub const Conn = struct {
             cross_move: bool = false,
             durable_copy: bool = false,
             copy_no_replace: bool = false,
+            durable_copy_v2: bool = false,
             display_v2: bool = false,
             kill_origin_fence: bool = false,
             lsp: bool = false,
@@ -509,6 +514,7 @@ pub const Conn = struct {
             self.cross_move = parsed.value.cross_move;
             self.durable_copy = parsed.value.durable_copy;
             self.copy_no_replace = parsed.value.copy_no_replace;
+            self.durable_copy_v2 = parsed.value.durable_copy_v2;
             self.display_v2 = parsed.value.display_v2;
             self.kill_origin_fence = parsed.value.kill_origin_fence;
             self.lsp_support = parsed.value.lsp;
@@ -2434,9 +2440,10 @@ test "welcome records older and future daemon profiles without rejecting either"
     try std.testing.expectEqual(@as(u32, 9), conn.server_proto);
     try std.testing.expect(!conn.durable_copy);
     try std.testing.expect(!conn.kill_origin_fence);
-    conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1,\"durable_copy\":true,\"copy_no_replace\":true}");
+    conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1,\"durable_copy\":true,\"copy_no_replace\":true,\"durable_copy_v2\":true}");
     try std.testing.expect(conn.durable_copy);
     try std.testing.expect(conn.copy_no_replace);
+    try std.testing.expect(conn.durable_copy_v2);
     conn.applyWelcome(a, "{\"proto\":6,\"server_proto\":9,\"negotiation\":1,\"kill_origin_fence\":true}");
     try std.testing.expect(conn.kill_origin_fence);
     conn.applyWelcome(a, "{\"proto\":0,\"server_proto\":9,\"negotiation\":1}");

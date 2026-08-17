@@ -747,6 +747,144 @@ const MoveHelperKill = struct {
     killed: bool = false,
 };
 
+const MoveCancel = struct {
+    journal: []const u8,
+    coordinator_sock: []const u8,
+    job: u64,
+    phase: []const u8 = "copied",
+    kill_before_request: bool = false,
+    requested: bool = false,
+    killed: bool = false,
+};
+
+const MoveStageCancel = struct {
+    journal: []const u8,
+    coordinator_sock: []const u8,
+    job: u64,
+    stage: [4096]u8 = undefined,
+    stage_len: usize = 0,
+    requested: bool = false,
+};
+
+const InstallElectionCancel = struct {
+    journal: []const u8,
+    coordinator_sock: []const u8,
+    job: u64,
+    dst: []const u8,
+    after_install: bool,
+    seed_link_temps: bool = false,
+    stage: [4096]u8 = undefined,
+    stage_len: usize = 0,
+    requested: bool = false,
+    killed: bool = false,
+};
+
+fn cancelAtInstallElection(ctx: *InstallElectionCancel) void {
+    var waited: usize = 0;
+    while (waited < 20_000) : (waited += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        if (fsjournal.load(arena.allocator(), ctx.journal)) |parsed_value| {
+            var parsed = parsed_value;
+            defer parsed.deinit();
+            if (std.mem.eql(u8, parsed.value.phase, "destination_staged") and
+                parsed.value.destination_stage.len > 0)
+            {
+                const stage_exists = exists(parsed.value.destination_stage);
+                const final_exists = exists(ctx.dst);
+                const ready = if (ctx.after_install)
+                    final_exists and !stage_exists
+                else
+                    stage_exists and !final_exists;
+                if (ready) {
+                    ctx.stage_len = @min(parsed.value.destination_stage.len, ctx.stage.len);
+                    @memcpy(ctx.stage[0..ctx.stage_len], parsed.value.destination_stage[0..ctx.stage_len]);
+                    if (ctx.seed_link_temps) {
+                        var legacy_buf: [4096:0]u8 = undefined;
+                        var scoped_buf: [4096:0]u8 = undefined;
+                        const legacy = std.fmt.bufPrintZ(&legacy_buf, "{s}.skpart-link", .{parsed.value.destination_stage}) catch return;
+                        const scoped = std.fmt.bufPrintZ(&scoped_buf, "{s}.skpart-link-{d}", .{ parsed.value.destination_stage, ctx.job }) catch return;
+                        _ = c.symlink("stale-link-temp", legacy.ptr);
+                        _ = c.symlink("scoped-link-temp", scoped.ptr);
+                    }
+                    var fs = fsdrive.Fs.connect(std.heap.page_allocator, ctx.coordinator_sock) catch return;
+                    defer fs.deinit();
+                    fs.jobCancel(ctx.job) catch return;
+                    ctx.requested = true;
+                    if (ctx.after_install and parsed.value.pid > 0 and
+                        c.kill(-@as(c.pid_t, @intCast(parsed.value.pid)), c.SIGKILL) == 0)
+                        ctx.killed = true;
+                    return;
+                }
+            }
+        } else |_| {}
+        _ = c.usleep(1_000);
+    }
+}
+
+fn cancelMoveInDestinationStage(ctx: *MoveStageCancel) void {
+    var waited: usize = 0;
+    while (waited < 20_000) : (waited += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        if (fsjournal.load(arena.allocator(), ctx.journal)) |parsed_value| {
+            var parsed = parsed_value;
+            defer parsed.deinit();
+            if (std.mem.eql(u8, parsed.value.phase, "rename_planned") and
+                parsed.value.destination_stage.len > 0)
+            {
+                var part_buf: [4096]u8 = undefined;
+                const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{parsed.value.destination_stage}) catch return;
+                var z: [4096]u8 = undefined;
+                var st: c.struct_stat = undefined;
+                if (c.stat(pathz.pathZ(&z, part) catch return, &st) == 0 and st.st_size >= 1 << 20) {
+                    ctx.stage_len = @min(parsed.value.destination_stage.len, ctx.stage.len);
+                    @memcpy(ctx.stage[0..ctx.stage_len], parsed.value.destination_stage[0..ctx.stage_len]);
+                    var fs = fsdrive.Fs.connect(std.heap.page_allocator, ctx.coordinator_sock) catch return;
+                    defer fs.deinit();
+                    fs.jobCancel(ctx.job) catch return;
+                    ctx.requested = true;
+                    return;
+                }
+            }
+        } else |_| {}
+        _ = c.usleep(1_000);
+    }
+}
+
+fn cancelMoveAfterQuarantine(ctx: *MoveCancel) void {
+    var waited: usize = 0;
+    while (waited < 20_000) : (waited += 1) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        if (fsjournal.load(arena.allocator(), ctx.journal)) |parsed_value| {
+            var parsed = parsed_value;
+            defer parsed.deinit();
+            const phase_matches = std.mem.eql(u8, parsed.value.phase, ctx.phase);
+            const quarantine_ready = parsed.value.source_quarantine.len > 0 and
+                (ctx.kill_before_request or exists(parsed.value.source_quarantine));
+            if (phase_matches and quarantine_ready) {
+                if (ctx.kill_before_request and parsed.value.pid > 0 and
+                    c.kill(-@as(c.pid_t, @intCast(parsed.value.pid)), c.SIGKILL) == 0)
+                {
+                    ctx.killed = true;
+                }
+                var fs = fsdrive.Fs.connect(std.heap.page_allocator, ctx.coordinator_sock) catch return;
+                defer fs.deinit();
+                fs.jobCancel(ctx.job) catch return;
+                ctx.requested = true;
+                if (!ctx.kill_before_request and parsed.value.pid > 0 and
+                    c.kill(-@as(c.pid_t, @intCast(parsed.value.pid)), c.SIGKILL) == 0)
+                {
+                    ctx.killed = true;
+                }
+                return;
+            }
+        } else |_| {}
+        _ = c.usleep(1_000);
+    }
+}
+
 fn killMoveHelperAfterCopy(ctx: *MoveHelperKill) void {
     var waited: usize = 0;
     while (waited < 20_000) : (waited += 1) {
@@ -2396,9 +2534,13 @@ fn xferStage(allocator: std.mem.Allocator, sock_a: []const u8, sock_b: []const u
         if (pumpXfer(allocator, x, &conns, 30_000, 2 << 20)) fail("pause xfer finished before the pause");
         x.pause();
         if (!x.isPaused()) fail("pause did not take");
-        // One already-requested chunk may still land; after that the
-        // transfer must be completely still.
-        pumpFor(allocator, x, &conns, 600);
+        // One already-requested chunk may still land. Wait for the
+        // state machine's actual chunk boundary rather than assuming a
+        // fixed delay is enough on every host.
+        var pause_waited: i64 = 0;
+        while (!x.pauseSettled() and pause_waited < 5_000) : (pause_waited += 20)
+            pumpFor(allocator, x, &conns, 20);
+        if (!x.pauseSettled()) fail("paused xfer never reached its chunk boundary");
         const held_done = x.progress().done;
         const held_size = stagedSize(&fsb, allocator, staged);
         if (held_size == 0) fail("paused xfer has no staged partial");
@@ -2720,16 +2862,29 @@ fn crossStage(
             var xz: [4096]u8 = undefined;
             _ = c.unlink(pathz.pathZ(&xz, xdst) catch unreachable);
             defer _ = c.unlink(pathz.pathZ(&xz, xdst) catch unreachable);
-            const job = fs.startCrossCopyOpts("", xsrc, "", xdst, true, .{ .delete_src = true, .no_replace = true }) catch
+            const job = fs.startCrossCopyTokenOpts("", xsrc, "", xdst, true, "xdev-file-attempt-1", .{
+                .delete_src = true,
+                .no_replace = true,
+                .transfer_token = "xdev-file-transfer",
+            }) catch
                 failErr("cross: start xdev move", fs.lastErr());
             var xjournal_buf: [4096]u8 = undefined;
             const xjournal = journalPathOf(allocator, &xjournal_buf, sock_dst, job);
             var xkiller_ctx = MoveHelperKill{ .journal = xjournal };
             const xkiller = std.Thread.spawn(.{}, killMoveHelperInDestinationStage, .{&xkiller_ctx}) catch
                 fail("cross: XDEV file helper killer");
-            const res = collectJob(&fs, job, 120_000);
+            const interrupted = collectJob(&fs, job, 120_000);
             xkiller.join();
             if (!xkiller_ctx.killed) fail("cross: XDEV file helper was not killed after staging");
+            if (!interrupted.is("error") or !std.mem.eql(u8, interrupted.kindText(), "transport"))
+                failErr("cross: killed XDEV helper was not a transport attempt failure", interrupted.messageText());
+            _ = c.usleep(5_100_000);
+            const retry_job = fs.startCrossCopyTokenOpts("", xsrc, "", xdst, true, "xdev-file-attempt-2", .{
+                .delete_src = true,
+                .no_replace = true,
+                .transfer_token = "xdev-file-transfer",
+            }) catch failErr("cross: retry xdev move", fs.lastErr());
+            const res = collectJob(&fs, retry_job, 120_000);
             if (!res.is("done")) failErr("cross: XDEV move did not fall back to copy/delete", res.messageText());
             const xgot = fileSha(xdst) orelse fail("cross: xdev destination hash");
             if (!std.mem.eql(u8, &xgot, &xwant)) fail("cross: xdev move content mismatch");
@@ -2751,18 +2906,28 @@ fn crossStage(
             const tree_dst = std.fmt.bufPrint(&tree_paths[2], "/dev/shm/sketerm-smoke-fs-xdev-tree-{d}", .{c.getpid()}) catch unreachable;
             daemon_mod.removeTreeBestEffort(tree_dst);
             defer daemon_mod.removeTreeBestEffort(tree_dst);
-            const tree_job = fs.startCrossCopyOpts("", tree_src, "", tree_dst, true, .{
+            const tree_job = fs.startCrossCopyTokenOpts("", tree_src, "", tree_dst, true, "xdev-tree-attempt-1", .{
                 .delete_src = true,
                 .no_replace = true,
+                .transfer_token = "xdev-tree-transfer",
             }) catch failErr("cross: start resumable XDEV tree move", fs.lastErr());
             var journal_buf: [4096]u8 = undefined;
             const journal = journalPathOf(allocator, &journal_buf, sock_dst, tree_job);
             var killer_ctx = MoveHelperKill{ .journal = journal, .stage_child = "payload.bin" };
             const killer = std.Thread.spawn(.{}, killMoveHelperInDestinationStage, .{&killer_ctx}) catch
                 fail("cross: XDEV tree helper killer");
-            const tree_res = collectJob(&fs, tree_job, 180_000);
+            const tree_interrupted = collectJob(&fs, tree_job, 180_000);
             killer.join();
             if (!killer_ctx.killed) fail("cross: XDEV tree helper was not killed in its destination stage");
+            if (!tree_interrupted.is("error") or !std.mem.eql(u8, tree_interrupted.kindText(), "transport"))
+                failErr("cross: killed XDEV tree helper was not a transport attempt failure", tree_interrupted.messageText());
+            _ = c.usleep(5_100_000);
+            const tree_retry = fs.startCrossCopyTokenOpts("", tree_src, "", tree_dst, true, "xdev-tree-attempt-2", .{
+                .delete_src = true,
+                .no_replace = true,
+                .transfer_token = "xdev-tree-transfer",
+            }) catch failErr("cross: retry resumable XDEV tree move", fs.lastErr());
+            const tree_res = collectJob(&fs, tree_retry, 180_000);
             if (!tree_res.is("done")) failErr("cross: XDEV tree move did not recover", tree_res.messageText());
             if (exists(tree_src)) fail("cross: recovered XDEV tree left its source");
             var moved_file_buf: [256]u8 = undefined;
@@ -2782,9 +2947,10 @@ fn crossStage(
             const stale_dst = std.fmt.bufPrint(&stale_paths[2], "/dev/shm/sketerm-smoke-fs-xdev-stale-{d}", .{c.getpid()}) catch unreachable;
             daemon_mod.removeTreeBestEffort(stale_dst);
             defer daemon_mod.removeTreeBestEffort(stale_dst);
-            const stale_job = fs.startCrossCopyOpts("", stale_src, "", stale_dst, true, .{
+            const stale_job = fs.startCrossCopyTokenOpts("", stale_src, "", stale_dst, true, "xdev-stale-attempt-1", .{
                 .delete_src = true,
                 .no_replace = true,
+                .transfer_token = "xdev-stale-transfer",
             }) catch failErr("cross: start stale-stage XDEV move", fs.lastErr());
             var stale_journal_buf: [4096]u8 = undefined;
             const stale_journal = journalPathOf(allocator, &stale_journal_buf, sock_dst, stale_job);
@@ -2795,9 +2961,18 @@ fn crossStage(
             };
             const stale_killer = std.Thread.spawn(.{}, killMoveHelperInDestinationStage, .{&stale_killer_ctx}) catch
                 fail("cross: stale-stage helper killer");
-            const stale_res = collectJob(&fs, stale_job, 180_000);
+            const stale_interrupted = collectJob(&fs, stale_job, 180_000);
             stale_killer.join();
             if (!stale_killer_ctx.killed) fail("cross: stale-stage helper was not killed after copying its entry");
+            if (!stale_interrupted.is("error") or !std.mem.eql(u8, stale_interrupted.kindText(), "transport"))
+                failErr("cross: killed stale-stage helper was not a transport attempt failure", stale_interrupted.messageText());
+            _ = c.usleep(5_100_000);
+            const stale_retry = fs.startCrossCopyTokenOpts("", stale_src, "", stale_dst, true, "xdev-stale-attempt-2", .{
+                .delete_src = true,
+                .no_replace = true,
+                .transfer_token = "xdev-stale-transfer",
+            }) catch failErr("cross: retry stale-stage XDEV move", fs.lastErr());
+            const stale_res = collectJob(&fs, stale_retry, 180_000);
             if (!stale_res.is("error")) fail("cross: stale staged entry was silently installed");
             if (!exists(stale_src)) fail("cross: stale-stage refusal deleted the current source root");
             if (exists(stale_dst)) fail("cross: stale-stage refusal installed the destination root");
@@ -2825,6 +3000,42 @@ fn crossStage(
         if (!std.mem.eql(u8, &got, &want)) fail("cross: clean copy content mismatch");
     }
 
+    // A filesystem refusal is terminal, readable, and structurally
+    // distinct from a dropped link so the Files UI never retries it.
+    if (c.geteuid() != 0) {
+        var denied_paths: [2][256]u8 = undefined;
+        const denied_src = std.fmt.bufPrint(&denied_paths[0], "{s}/permission-denied.bin", .{src_dir}) catch unreachable;
+        const denied_dst = std.fmt.bufPrint(&denied_paths[1], "{s}/permission-denied.bin", .{dst_dir}) catch unreachable;
+        writePattern(denied_src, 4096, 0x33);
+        var denied_z: [4096]u8 = undefined;
+        const denied_src_z = pathz.pathZ(&denied_z, denied_src) catch unreachable;
+        if (c.chmod(denied_src_z, 0o000) != 0) fail("cross: chmod denied source");
+        defer _ = c.chmod(denied_src_z, 0o600);
+        const denied_job = fs.startCrossCopy("ssh:127.0.0.1", denied_src, "", denied_dst, true) catch
+            failErr("cross: start permission-denied copy", fs.lastErr());
+        const denied = collectJob(&fs, denied_job, 120_000);
+        if (!denied.is("error")) fail("cross: permission-denied source reported success");
+        if (!std.mem.eql(u8, denied.kindText(), "permanent"))
+            failErr("cross: permission denial was not permanent", denied.kindText());
+        if (std.mem.indexOf(u8, denied.messageText(), "permission denied") == null)
+            failErr("cross: permission denial leaked a raw errno", denied.messageText());
+        if (exists(denied_dst)) fail("cross: permission-denied copy installed a destination");
+    }
+    // Root bypasses mode-bit denial, so keep one permanent-error probe
+    // that is deterministic under every test identity.
+    {
+        var missing_paths: [2][256]u8 = undefined;
+        const missing_src = std.fmt.bufPrint(&missing_paths[0], "{s}/missing-source.bin", .{src_dir}) catch unreachable;
+        const missing_dst = std.fmt.bufPrint(&missing_paths[1], "{s}/missing-destination.bin", .{dst_dir}) catch unreachable;
+        const missing_job = fs.startCrossCopy("ssh:127.0.0.1", missing_src, "", missing_dst, true) catch
+            failErr("cross: start missing-source copy", fs.lastErr());
+        const missing = collectJob(&fs, missing_job, 120_000);
+        if (!missing.is("error")) fail("cross: missing source reported success");
+        if (!std.mem.eql(u8, missing.kindText(), "permanent"))
+            failErr("cross: missing source was not permanent", missing.kindText());
+        if (exists(missing_dst)) fail("cross: missing-source copy installed a destination");
+    }
+
     // A matching final file is not proof that this no-replace job
     // installed it. Even identical bytes must leave a move source alone.
     {
@@ -2836,10 +3047,19 @@ fn crossStage(
         const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{
             .delete_src = true,
             .no_replace = true,
+            .transfer_token = "collision-retry-proof",
         }) catch failErr("cross: start no-replace collision", fs.lastErr());
         const res = collectJob(&fs, job, 120_000);
         if (!res.is("error")) fail("cross: no-replace collision reported success");
         if (!exists(src)) fail("cross: no-replace collision deleted its source");
+        const retry_job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{
+            .delete_src = true,
+            .no_replace = true,
+            .transfer_token = "collision-retry-proof",
+        }) catch failErr("cross: retry no-replace collision", fs.lastErr());
+        const retry_res = collectJob(&fs, retry_job, 120_000);
+        if (!retry_res.is("error")) fail("cross: retried no-replace collision reported success");
+        if (!exists(src)) fail("cross: retried no-replace collision deleted its source");
         const got = fileSha(dst) orelse fail("cross: collision destination hash");
         const expected = fileSha(src) orelse fail("cross: collision source hash");
         if (!std.mem.eql(u8, &got, &expected)) fail("cross: collision damaged destination");
@@ -2946,6 +3166,214 @@ fn crossStage(
         var st: c.struct_stat = undefined;
         if (c.lstat(pathz.pathZ(&z2, mv_src) catch unreachable, &st) == 0)
             fail("cross: move left the source file behind");
+    }
+    {
+        // Cancellation during a no-replace root-file copy removes both
+        // the journaled hidden stage and its still-growing .skpart.
+        var paths: [2][256]u8 = undefined;
+        const src = std.fmt.bufPrint(&paths[0], "{s}/cancel-in-stage.bin", .{src_dir}) catch unreachable;
+        writePattern(src, 64 << 20, 0x76);
+        const dst = std.fmt.bufPrint(&paths[1], "{s}/cancel-in-stage.bin", .{dst_dir}) catch unreachable;
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{
+            .delete_src = true,
+            .no_replace = true,
+        }) catch failErr("cross: start staged cancellation move", fs.lastErr());
+        var journal_buf: [4096]u8 = undefined;
+        const journal = journalPathOf(allocator, &journal_buf, sock_dst, job);
+        var cancel = MoveStageCancel{ .journal = journal, .coordinator_sock = sock_dst, .job = job };
+        const canceler = std.Thread.spawn(.{}, cancelMoveInDestinationStage, .{&cancel}) catch
+            fail("cross: staged cancellation watcher");
+        const outcome = collectJob(&fs, job, 180_000);
+        canceler.join();
+        if (!cancel.requested) fail("cross: cancellation missed the destination staging window");
+        if (!outcome.is("canceled")) failErr("cross: staged move cancellation did not report canceled", outcome.messageText());
+        if (!exists(src)) fail("cross: staged move cancellation removed its source");
+        if (exists(dst)) fail("cross: staged move cancellation installed its destination");
+        const stage = cancel.stage[0..cancel.stage_len];
+        if (stage.len == 0 or exists(stage)) fail("cross: canceled move retained its destination stage");
+        var part_buf: [4096]u8 = undefined;
+        const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{stage}) catch unreachable;
+        if (exists(part)) fail("cross: canceled move retained its destination stage partial");
+    }
+    {
+        // A copy owns the same randomized no-replace stage as a move;
+        // cancellation must not orphan it merely because source deletion
+        // was never requested.
+        var paths: [2][256]u8 = undefined;
+        const src = std.fmt.bufPrint(&paths[0], "{s}/cancel-copy-in-stage.bin", .{src_dir}) catch unreachable;
+        writePattern(src, 64 << 20, 0x75);
+        const dst = std.fmt.bufPrint(&paths[1], "{s}/cancel-copy-in-stage.bin", .{dst_dir}) catch unreachable;
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{
+            .no_replace = true,
+        }) catch failErr("cross: start staged cancellation copy", fs.lastErr());
+        var journal_buf: [4096]u8 = undefined;
+        const journal = journalPathOf(allocator, &journal_buf, sock_dst, job);
+        var cancel = MoveStageCancel{ .journal = journal, .coordinator_sock = sock_dst, .job = job };
+        const canceler = std.Thread.spawn(.{}, cancelMoveInDestinationStage, .{&cancel}) catch
+            fail("cross: staged copy cancellation watcher");
+        const outcome = collectJob(&fs, job, 180_000);
+        canceler.join();
+        if (!cancel.requested) fail("cross: copy cancellation missed the destination staging window");
+        if (!outcome.is("canceled")) failErr("cross: staged copy cancellation did not report canceled", outcome.messageText());
+        if (!exists(src)) fail("cross: staged copy cancellation removed its source");
+        if (exists(dst)) fail("cross: staged copy cancellation installed its destination");
+        const stage = cancel.stage[0..cancel.stage_len];
+        if (stage.len == 0 or exists(stage)) fail("cross: canceled copy retained its destination stage");
+        var part_buf: [4096]u8 = undefined;
+        const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{stage}) catch unreachable;
+        if (exists(part)) fail("cross: canceled copy retained its destination stage partial");
+    }
+    {
+        // Cancellation that wins the install lock must remove the private
+        // root and leave the no-replace final name untouched.
+        var paths: [2][256]u8 = undefined;
+        const src = std.fmt.bufPrint(&paths[0], "{s}/cancel-before-install.bin", .{src_dir}) catch unreachable;
+        const dst = std.fmt.bufPrint(&paths[1], "{s}/cancel-before-install.bin", .{dst_dir}) catch unreachable;
+        writePattern(src, 4 << 20, 0x74);
+        _ = c.setenv("SKETERM_FSJOB_PRE_INSTALL_DELAY_MS", "1000", 1);
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{
+            .no_replace = true,
+        }) catch failErr("cross: start pre-install cancellation copy", fs.lastErr());
+        var journal_buf: [4096]u8 = undefined;
+        const journal = journalPathOf(allocator, &journal_buf, sock_dst, job);
+        var cancel = InstallElectionCancel{
+            .journal = journal,
+            .coordinator_sock = sock_dst,
+            .job = job,
+            .dst = dst,
+            .after_install = false,
+            .seed_link_temps = true,
+        };
+        const canceler = std.Thread.spawn(.{}, cancelAtInstallElection, .{&cancel}) catch
+            fail("cross: pre-install cancellation watcher");
+        const outcome = collectJob(&fs, job, 180_000);
+        _ = c.unsetenv("SKETERM_FSJOB_PRE_INSTALL_DELAY_MS");
+        canceler.join();
+        if (!cancel.requested) fail("cross: cancellation missed the final install election");
+        if (!outcome.is("canceled")) failErr("cross: pre-install election did not cancel", outcome.messageText());
+        if (!exists(src)) fail("cross: pre-install cancellation removed its source");
+        if (exists(dst)) fail("cross: pre-install cancellation installed its destination");
+        const stage = cancel.stage[0..cancel.stage_len];
+        if (stage.len == 0 or exists(stage)) fail("cross: pre-install cancellation retained its private root");
+        var temp_paths: [2][4096]u8 = undefined;
+        const legacy = std.fmt.bufPrint(&temp_paths[0], "{s}.skpart-link", .{stage}) catch unreachable;
+        const scoped = std.fmt.bufPrint(&temp_paths[1], "{s}.skpart-link-{d}", .{ stage, job }) catch unreachable;
+        if (exists(legacy) or exists(scoped)) fail("cross: cancellation retained a symlink staging temporary");
+    }
+    {
+        // If exclusive rename wins first, a cancel plus immediate helper
+        // death must recover the matching final as DONE, never report a
+        // cancellation that silently leaves an installed file behind.
+        var paths: [2][256]u8 = undefined;
+        const src = std.fmt.bufPrint(&paths[0], "{s}/cancel-after-install.bin", .{src_dir}) catch unreachable;
+        const dst = std.fmt.bufPrint(&paths[1], "{s}/cancel-after-install.bin", .{dst_dir}) catch unreachable;
+        writePattern(src, 4 << 20, 0x73);
+        const post_install_want = fileSha(src) orelse fail("cross: post-install source hash");
+        _ = c.setenv("SKETERM_FSJOB_POST_INSTALL_DELAY_MS", "1000", 1);
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{
+            .no_replace = true,
+        }) catch failErr("cross: start post-install cancellation copy", fs.lastErr());
+        var journal_buf: [4096]u8 = undefined;
+        const journal = journalPathOf(allocator, &journal_buf, sock_dst, job);
+        var cancel = InstallElectionCancel{
+            .journal = journal,
+            .coordinator_sock = sock_dst,
+            .job = job,
+            .dst = dst,
+            .after_install = true,
+        };
+        const canceler = std.Thread.spawn(.{}, cancelAtInstallElection, .{&cancel}) catch
+            fail("cross: post-install cancellation watcher");
+        const outcome = collectJob(&fs, job, 180_000);
+        _ = c.unsetenv("SKETERM_FSJOB_POST_INSTALL_DELAY_MS");
+        canceler.join();
+        if (!cancel.requested) fail("cross: cancellation missed the post-install window");
+        if (!cancel.killed) fail("cross: post-install helper was not interrupted");
+        if (!outcome.is("done")) failErr("cross: installed destination was not reconciled as done", outcome.messageText());
+        if (!exists(src) or !exists(dst)) fail("cross: post-install recovery lost source or destination");
+        const got = fileSha(dst) orelse fail("cross: post-install destination hash");
+        if (!std.mem.eql(u8, &got, &post_install_want)) fail("cross: post-install recovery changed destination content");
+        const stage = cancel.stage[0..cancel.stage_len];
+        if (stage.len == 0 or exists(stage)) fail("cross: post-install recovery retained its private root");
+        const journal_dir = std.fs.path.dirname(journal) orelse fail("cross: post-install journal directory missing");
+        if (fsjournal.cancelRequested(journal_dir, job)) fail("cross: completed post-install recovery left its cancel fence armed");
+    }
+    {
+        // Cancellation is fenced before the helper is touched. Even if
+        // the source has already been quarantined, the helper restores
+        // it and persists canceled instead of resuming source deletion.
+        var paths: [3][256]u8 = undefined;
+        const src = std.fmt.bufPrint(&paths[0], "{s}/cancel-after-quarantine", .{src_dir}) catch unreachable;
+        mkdirAt(src);
+        var i: usize = 0;
+        while (i < 256) : (i += 1) {
+            var name: [64]u8 = undefined;
+            touch(src, std.fmt.bufPrint(&name, "item-{d}.txt", .{i}) catch unreachable, "cancel recovery");
+        }
+        const dst = std.fmt.bufPrint(&paths[1], "{s}/cancel-after-quarantine", .{dst_dir}) catch unreachable;
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{
+            .delete_src = true,
+            .no_replace = true,
+        }) catch failErr("cross: start cancel-safe move", fs.lastErr());
+        var journal_buf: [4096]u8 = undefined;
+        const journal = journalPathOf(allocator, &journal_buf, sock_dst, job);
+        var cancel = MoveCancel{ .journal = journal, .coordinator_sock = sock_dst, .job = job };
+        const canceler = std.Thread.spawn(.{}, cancelMoveAfterQuarantine, .{&cancel}) catch
+            fail("cross: cancel-safe move watcher");
+        const outcome = collectJob(&fs, job, 180_000);
+        canceler.join();
+        if (!cancel.requested) fail("cross: cancel request missed the quarantine window");
+        if (!cancel.killed) fail("cross: cancel recovery helper was not interrupted after the durable request");
+        if (!outcome.is("canceled")) failErr("cross: safely canceled move did not report canceled", outcome.messageText());
+        if (!exists(src)) fail("cross: canceled move left its source hidden in quarantine");
+        if (!exists(dst)) fail("cross: canceled move lost its completed destination");
+        const journal_dir = std.fs.path.dirname(journal) orelse fail("cross: canceled move journal directory missing");
+        if (fsjournal.cancelRequested(journal_dir, job))
+            fail("cross: canceled move left its durable cancel fence armed");
+    }
+    {
+        // Once source deletion begins, restoration is no longer safe:
+        // the quarantine may already be missing children. A cancellation
+        // racing that boundary is deferred, even across helper death, and
+        // the verified move completes instead of restoring a partial tree.
+        var paths: [3][256]u8 = undefined;
+        const src = std.fmt.bufPrint(&paths[0], "{s}/cancel-during-delete", .{src_dir}) catch unreachable;
+        mkdirAt(src);
+        var i: usize = 0;
+        while (i < 32) : (i += 1) {
+            var name: [64]u8 = undefined;
+            touch(src, std.fmt.bufPrint(&name, "item-{d}.txt", .{i}) catch unreachable, "deferred cancel");
+        }
+        const dst = std.fmt.bufPrint(&paths[1], "{s}/cancel-during-delete", .{dst_dir}) catch unreachable;
+        _ = c.setenv("SKETERM_FSJOB_DELETE_DELAY_MS", "1000", 1);
+        const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{
+            .delete_src = true,
+            .no_replace = true,
+        }) catch failErr("cross: start deferred-cancel move", fs.lastErr());
+        var journal_buf: [4096]u8 = undefined;
+        const journal = journalPathOf(allocator, &journal_buf, sock_dst, job);
+        var cancel = MoveCancel{
+            .journal = journal,
+            .coordinator_sock = sock_dst,
+            .job = job,
+            .phase = "deleting",
+            .kill_before_request = true,
+        };
+        const canceler = std.Thread.spawn(.{}, cancelMoveAfterQuarantine, .{&cancel}) catch
+            fail("cross: deferred-cancel move watcher");
+        const outcome = collectJob(&fs, job, 180_000);
+        _ = c.unsetenv("SKETERM_FSJOB_DELETE_DELAY_MS");
+        canceler.join();
+        if (!cancel.requested) fail("cross: cancel request missed the deletion window");
+        if (!cancel.killed) fail("cross: deleting move helper was not interrupted before cancellation");
+        if (!outcome.is("done")) failErr("cross: cancellation restored a partially deleted move", outcome.messageText());
+        if (exists(src)) fail("cross: deferred-cancel move restored a partial source tree");
+        var child_buf: [256]u8 = undefined;
+        const child = std.fmt.bufPrint(&child_buf, "{s}/item-0.txt", .{dst}) catch unreachable;
+        if (!exists(child)) fail("cross: deferred-cancel move lost destination content");
+        const journal_dir = std.fs.path.dirname(journal) orelse fail("cross: deferred-cancel journal directory missing");
+        if (fsjournal.cancelRequested(journal_dir, job))
+            fail("cross: completed deferred cancellation left its fence armed");
     }
     {
         // Once the copied source is atomically quarantined, the original
@@ -3129,8 +3557,10 @@ fn crossStage(
         const first = collectJob(&fs, job, 120_000);
         killer.join();
         if (!killer_ctx.killed) fail("cross: retry-resume helper was not killed mid-transfer");
-        if (!first.is("error")) fail("cross: killed copy attempt did not report failure");
+        if (!first.is("error") or !std.mem.eql(u8, first.kindText(), "transport"))
+            fail("cross: killed copy attempt was not a transport failure");
         // The retry: NEW client_token, SAME transfer_token.
+        _ = c.usleep(5_100_000);
         const retry_job = fs.startCrossCopyTokenOpts("ssh:127.0.0.1", rs_src, "", rs_dst, true, "attempt-2", .{
             .no_replace = true,
             .transfer_token = "xfer-retry-resume",

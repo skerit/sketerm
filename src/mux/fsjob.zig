@@ -37,6 +37,9 @@ fn sigNoop(_: c_int) callconv(.c) void {}
 const nowMs = @import("../util/clock.zig").nowMs;
 
 pub const CHUNK: usize = 256 * 1024;
+/// Distinguishes a helper's own durable-journal failure from transport
+/// interruption when no terminal event can safely be emitted.
+pub const JOURNAL_EXIT_CODE: u8 = 74;
 /// Emit a progress line at least every this many bytes.
 // 1 MiB: at typical WAN rates the panel gets a sample every second
 // or two — 4 MiB made sub-4-MB/s transfers read as stalled between
@@ -175,20 +178,30 @@ fn encodeEvent(buf: []u8, value: anytype) ?[]const u8 {
     return w.buffered();
 }
 
+/// Truncating owned copy of a caller's transient slice.
+fn Str(comptime cap: usize) type {
+    return struct {
+        buf: [cap]u8 = undefined,
+        len: usize = 0,
+
+        fn set(self: *@This(), text: []const u8) void {
+            self.len = @min(text.len, self.buf.len);
+            @memcpy(self.buf[0..self.len], text[0..self.len]);
+        }
+
+        fn slice(self: *const @This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+}
+
 const DurableProgress = struct {
     done: u64 = 0,
     total: u64 = 0,
     resumed_from: u64 = 0,
     files_done: u64 = 0,
     files_total: u64 = 0,
-    phase: [24]u8 = undefined,
-    phase_len: usize = 0,
-
-    fn setPhase(self: *DurableProgress, phase: []const u8) void {
-        const n = @min(phase.len, self.phase.len);
-        @memcpy(self.phase[0..n], phase[0..n]);
-        self.phase_len = n;
-    }
+    phase: Str(24) = .{},
 };
 
 const CrossDurable = struct {
@@ -200,27 +213,52 @@ const CrossDurable = struct {
     source_ino: u64 = 0,
 };
 
-threadlocal var durable_progress: DurableProgress = .{};
-threadlocal var durable_retryable_cleanup = false;
+/// Durable-outcome state of the ONE job this helper process runs,
+/// shared by emit/journal code that has no CrossCopy at hand.
+/// Threadlocal so parallel test threads cannot share it; serve()
+/// resets it wholesale.
+const DurableState = struct {
+    progress: DurableProgress = .{},
+    retryable_cleanup: bool = false,
+    cancel_requested: bool = false,
+    cancel_complete: bool = false,
+    delete_started: bool = false,
+    error_kind: Str(32) = .{},
+    message: Str(512) = .{},
+    defer_terminal: bool = false,
+    terminal_event: Str(32 * 1024) = .{},
+};
+
+threadlocal var durable_state: DurableState = .{};
 
 fn captureDurableProgress(value: anytype) void {
     const T = @TypeOf(value);
-    if (@hasField(T, "done")) durable_progress.done = @intCast(value.done);
-    if (@hasField(T, "total")) durable_progress.total = @intCast(value.total);
-    if (@hasField(T, "resumed_from")) durable_progress.resumed_from = @intCast(value.resumed_from);
-    if (@hasField(T, "files_done")) durable_progress.files_done = @intCast(value.files_done);
-    if (@hasField(T, "files_total")) durable_progress.files_total = @intCast(value.files_total);
-    if (@hasField(T, "phase")) durable_progress.setPhase(value.phase);
+    if (@hasField(T, "done")) durable_state.progress.done = @intCast(value.done);
+    if (@hasField(T, "total")) durable_state.progress.total = @intCast(value.total);
+    if (@hasField(T, "resumed_from")) durable_state.progress.resumed_from = @intCast(value.resumed_from);
+    if (@hasField(T, "files_done")) durable_state.progress.files_done = @intCast(value.files_done);
+    if (@hasField(T, "files_total")) durable_state.progress.files_total = @intCast(value.files_total);
+    if (@hasField(T, "phase")) durable_state.progress.phase.set(value.phase);
 }
 
 fn emit(value: anytype) void {
     captureDurableProgress(value);
     // A 4 KiB text preview can expand sixfold under JSON escaping.
     var buf: [32 * 1024]u8 = undefined;
-    emitRaw(encodeEvent(&buf, value) orelse return);
+    const encoded = encodeEvent(&buf, value) orelse return;
+    const T = @TypeOf(value);
+    if (durable_state.defer_terminal and @hasField(T, "ev")) {
+        const ev: []const u8 = value.ev;
+        if (std.mem.eql(u8, ev, "done") or std.mem.eql(u8, ev, "error") or std.mem.eql(u8, ev, "canceled")) {
+            durable_state.terminal_event.set(encoded);
+            return;
+        }
+    }
+    emitRaw(encoded);
 }
 
 fn emitError(msg: []const u8) u8 {
+    durable_state.message.set(msg);
     emit(.{ .ev = "error", .message = msg });
     return 1;
 }
@@ -230,7 +268,16 @@ fn emitError(msg: []const u8) u8 {
 /// browser retries the same job through a different coordinator
 /// instead of burning resume attempts.
 fn emitErrorKind(kind: []const u8, msg: []const u8) u8 {
+    durable_state.error_kind.set(kind);
+    durable_state.message.set(msg);
     emit(.{ .ev = "error", .message = msg, .kind = kind });
+    return 1;
+}
+
+fn emitCanceled(msg: []const u8) u8 {
+    durable_state.cancel_complete = true;
+    durable_state.message.set(msg);
+    emit(.{ .ev = "canceled", .message = msg });
     return 1;
 }
 
@@ -316,8 +363,7 @@ const Progress = struct {
 /// Read the one-line JSON spec from stdin and run the job. The
 /// process exists for exactly this operation.
 pub fn serve(allocator: std.mem.Allocator) u8 {
-    durable_progress = .{};
-    durable_retryable_cleanup = false;
+    durable_state = .{};
     // A daemon restart closes the progress pipe. The operation must
     // continue rather than dying from SIGPIPE while reporting progress.
     _ = c.signal(c.SIGPIPE, &sigNoop);
@@ -339,12 +385,17 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
     }) catch return emitError("bad job spec");
     defer parsed.deinit();
     const spec = parsed.value;
-    durable_progress.done = spec.done;
-    durable_progress.total = spec.total;
-    durable_progress.resumed_from = spec.resumed_from;
-    durable_progress.files_done = spec.files_done;
-    durable_progress.files_total = spec.files_total;
-    durable_progress.setPhase(spec.phase);
+    // A durable job publishes its terminal event only after the same
+    // outcome is in the journal. Otherwise a client can observe and
+    // acknowledge "failed" immediately before cancellation recovery
+    // commits the record back to "running".
+    durable_state.defer_terminal = spec.job_id != 0 and spec.journal_dir.len != 0;
+    durable_state.progress.done = spec.done;
+    durable_state.progress.total = spec.total;
+    durable_state.progress.resumed_from = spec.resumed_from;
+    durable_state.progress.files_done = spec.files_done;
+    durable_state.progress.files_total = spec.files_total;
+    durable_state.progress.phase.set(spec.phase);
 
     const rc: u8 = if (std.mem.eql(u8, spec.op, "copy"))
         runCopy(allocator, spec)
@@ -402,12 +453,44 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
         runSecureDelete(spec)
     else
         emitError("unknown job op");
-    saveHelperJournal(allocator, spec, if (rc == 0) "done" else if (durable_retryable_cleanup) "running" else "failed") catch {};
+    const terminal_state = if (rc == 0)
+        "done"
+    else if (durable_state.cancel_complete)
+        "canceled"
+    else if (durable_state.retryable_cleanup)
+        "running"
+    else
+        "failed";
+    // On journal failure publish nothing. The daemon observes helper
+    // exit, persists its own terminal reconciliation, and only then
+    // emits an error; emitting here would recreate the exact
+    // terminal-before-journal race this buffer prevents.
+    const saved_state = saveHelperJournal(allocator, spec, terminal_state) catch return JOURNAL_EXIT_CODE;
+    durable_state.defer_terminal = false;
+    if (!std.mem.eql(u8, saved_state, terminal_state)) {
+        if (std.mem.eql(u8, saved_state, "canceled")) {
+            emit(.{ .ev = "canceled", .message = "transfer canceled; source left in place" });
+        } else if (std.mem.eql(u8, saved_state, "running")) {
+            emit(.{
+                .ev = "error",
+                .message = "cancel requested; resolving the durable source state",
+                .kind = "retryable_cleanup",
+            });
+        }
+    } else if (durable_state.terminal_event.len > 0) {
+        emitRaw(durable_state.terminal_event.slice());
+    }
+    if (std.mem.eql(u8, saved_state, "done") or std.mem.eql(u8, saved_state, "canceled"))
+        _ = fsjournal.clearCancel(spec.journal_dir, spec.job_id);
     return rc;
 }
 
-fn saveHelperJournal(allocator: std.mem.Allocator, spec: Spec, state: []const u8) !void {
-    if (spec.job_id == 0 or spec.journal_dir.len == 0) return;
+fn saveHelperJournal(allocator: std.mem.Allocator, spec: Spec, state: []const u8) ![]const u8 {
+    if (spec.job_id == 0 or spec.journal_dir.len == 0) return state;
+    var control: ?fsjournal.ControlLock = null;
+    if ((spec.delete_src or spec.no_replace) and std.mem.eql(u8, spec.op, "cross_copy"))
+        control = try fsjournal.lockControl(spec.journal_dir, spec.job_id);
+    defer if (control) |guard| guard.release();
     var acknowledged = false;
     var old_done = spec.done;
     var old_total = spec.total;
@@ -442,12 +525,25 @@ fn saveHelperJournal(allocator: std.mem.Allocator, spec: Spec, state: []const u8
             if (old_source_ino == 0) old_source_ino = p.value.source_ino;
         }
     } else |_| {}
-    const reported_phase = durable_progress.phase[0..durable_progress.phase_len];
+    const reported_phase = durable_state.progress.phase.slice();
     const phase = if (fsjournal.phaseRank(reported_phase) > fsjournal.phaseRank(old_phase)) reported_phase else old_phase;
+    var saved_state: []const u8 = state;
+    var message: []const u8 = durable_state.message.slice();
+    var error_kind: []const u8 = durable_state.error_kind.slice();
+    if (std.mem.eql(u8, state, "failed") and !durable_state.cancel_requested and
+        fsjournal.cancelRequested(spec.journal_dir, spec.job_id))
+    {
+        // The failure raced cancellation. Source placement is not proven
+        // here, even before copied (an atomic rename may be between
+        // durable phases), so leave it to a recovery resolver.
+        saved_state = "running";
+        message = "cancel requested; resolving the durable source state";
+        error_kind = "retryable_cleanup";
+    }
     try fsjournal.save(spec.journal_dir, .{
         .id = spec.job_id,
         .op = spec.op,
-        .state = state,
+        .state = saved_state,
         .src = spec.src,
         .dst = spec.dst,
         .pattern = spec.pattern,
@@ -467,25 +563,30 @@ fn saveHelperJournal(allocator: std.mem.Allocator, spec: Spec, state: []const u8
         .source_ino = old_source_ino,
         .recovery_attempts = spec.recovery_attempts,
         .pid = c.getpid(),
-        .done = @max(old_done, durable_progress.done),
-        .total = @max(old_total, durable_progress.total),
-        .resumed_from = @max(old_resumed, durable_progress.resumed_from),
-        .files_done = @max(old_files_done, durable_progress.files_done),
-        .files_total = @max(old_files_total, durable_progress.files_total),
+        .done = @max(old_done, durable_state.progress.done),
+        .total = @max(old_total, durable_state.progress.total),
+        .resumed_from = @max(old_resumed, durable_state.progress.resumed_from),
+        .files_done = @max(old_files_done, durable_state.progress.files_done),
+        .files_total = @max(old_files_total, durable_state.progress.files_total),
+        .message = message,
+        .error_kind = error_kind,
         .client_token = spec.client_token,
         .transfer_token = spec.transfer_token,
         .acknowledged = acknowledged,
     });
+    return saved_state;
 }
 
-fn persistCrossPhase(spec: Spec, phase: []const u8, progress: *const Progress, durable: CrossDurable) bool {
-    durable_progress.done = progress.done;
-    durable_progress.total = progress.total;
-    durable_progress.resumed_from = progress.resumed;
-    durable_progress.files_done = progress.entries_done;
-    durable_progress.files_total = progress.entries_total;
-    durable_progress.setPhase(phase);
-    if (spec.job_id == 0 or spec.journal_dir.len == 0) return true;
+fn saveCrossPhase(spec: Spec, phase: []const u8, progress: *const Progress, durable: CrossDurable) bool {
+    durable_state.progress.done = progress.done;
+    durable_state.progress.total = progress.total;
+    durable_state.progress.resumed_from = progress.resumed;
+    durable_state.progress.files_done = progress.entries_done;
+    durable_state.progress.files_total = progress.entries_total;
+    if (spec.job_id == 0 or spec.journal_dir.len == 0) {
+        durable_state.progress.phase.set(phase);
+        return true;
+    }
     fsjournal.save(spec.journal_dir, .{
         .id = spec.job_id,
         .op = spec.op,
@@ -514,9 +615,15 @@ fn persistCrossPhase(spec: Spec, phase: []const u8, progress: *const Progress, d
         .resumed_from = progress.resumed,
         .files_done = progress.entries_done,
         .files_total = progress.entries_total,
+        .error_kind = "",
         .client_token = spec.client_token,
         .transfer_token = spec.transfer_token,
     }) catch return false;
+    durable_state.progress.phase.set(phase);
+    return true;
+}
+
+fn emitCrossPhase(phase: []const u8, progress: *const Progress) void {
     emit(.{
         .ev = "progress",
         .done = progress.done,
@@ -526,6 +633,11 @@ fn persistCrossPhase(spec: Spec, phase: []const u8, progress: *const Progress, d
         .files_total = progress.entries_total,
         .phase = phase,
     });
+}
+
+fn persistCrossPhase(spec: Spec, phase: []const u8, progress: *const Progress, durable: CrossDurable) bool {
+    if (!saveCrossPhase(spec, phase, progress, durable)) return false;
+    emitCrossPhase(phase, progress);
     return true;
 }
 
@@ -1983,10 +2095,33 @@ fn isTransportError(err: fsdrive.Error) bool {
     return err == fsdrive.Error.Timeout or err == fsdrive.Error.NotConnected;
 }
 
-/// Reconnect budget for ONE cross-host copy. A multi-GB transfer over
-/// a home link legitimately outlives several drops, so the ceiling is
-/// generous; it exists only so a permanently dead host ends the job
-/// instead of spinning on it forever.
+fn needsCleanupRetry(move: bool, retryable_transport: bool, phase: []const u8) bool {
+    return move and retryable_transport and
+        fsjournal.phaseRank(phase) >= fsjournal.phaseRank("copied");
+}
+
+fn moveDeletionStarted(delete_src: bool, phase: []const u8) bool {
+    return delete_src and fsjournal.phaseRank(phase) >= fsjournal.phaseRank("deleting");
+}
+
+/// The one cancellation probe: sticky once seen, and never true after
+/// the deletion boundary (cancel can no longer restore the source).
+fn durableCancelRequested(journal_dir: []const u8, job_id: u64) bool {
+    if (durable_state.delete_started) return false;
+    if (durable_state.cancel_requested) return true;
+    if (job_id == 0 or journal_dir.len == 0) return false;
+    durable_state.cancel_requested = fsjournal.cancelRequested(journal_dir, job_id);
+    return durable_state.cancel_requested;
+}
+
+const CLEANUP_RECONNECT_BACKOFF_MS = [_]u32{ 5_000, 10_000, 20_000 };
+
+/// Reconnect budget for ONE cross-host copy attempt. A multi-GB
+/// transfer over a home link legitimately outlives several drops, so
+/// the ceiling is generous; it exists only so a permanently dead host
+/// ends the attempt instead of spinning on it forever. Exhaustion
+/// fails with kind "transport", so the client ledger's own retry
+/// policy still applies on top.
 const RECONNECT_ATTEMPTS: u32 = 6;
 const RECONNECT_BUDGET: u32 = 200;
 const RECONNECT_BACKOFF_MS = [_]u32{ 1_000, 2_000, 4_000, 8_000, 15_000, 30_000 };
@@ -2007,6 +2142,8 @@ const CrossCopy = struct {
     allocator: std.mem.Allocator,
     src: *fsdrive.Fs,
     dst: *fsdrive.Fs,
+    journal_dir: []const u8 = "",
+    job_id: u64 = 0,
     /// Host strings the two sides were opened with, so a dropped link
     /// can be dialled again.
     src_host: []const u8,
@@ -2028,12 +2165,13 @@ const CrossCopy = struct {
     /// This job is a MOVE — drives the "copy already installed" note
     /// on failures past the copied boundary.
     move: bool = false,
-    /// Content digests proven THIS run, keyed on stat identity (dev,
-    /// ino, size, mtime_ns; ctime excluded — the quarantine and
-    /// install renames update it without touching content, the same
-    /// rationale as `fingerprint`). The move flow re-proves the same
-    /// bytes at every durable boundary; without this a multi-GB move
-    /// reread both whole files four to six times after the transfer.
+    /// Content digests proven THIS run, keyed on stat identity. ctime
+    /// deliberately participates: an in-place edit with restored mtime
+    /// must never authorize deletion through a stale digest, and ctime
+    /// is the one timestamp such an edit cannot forge. Our OWN
+    /// quarantine/install renames also bump ctime without touching
+    /// content; hashRefreshAfterRename restamps the entry there, so
+    /// the guard costs no multi-GB rehash at those boundaries.
     hash_seen: std.ArrayList(HashSeen) = .empty,
 
     const HashSeen = struct {
@@ -2042,7 +2180,13 @@ const CrossCopy = struct {
         ino: u64,
         size: u64,
         mtime_ns: i64,
+        ctime_ns: i64,
         digest: [64]u8,
+
+        fn matches(self: HashSeen, side: Side, e: fsdrive.Entry) bool {
+            return self.side == side and self.dev == e.dev and self.ino == e.ino and
+                self.size == e.size and self.mtime_ns == e.mtime_ns and self.ctime_ns == e.ctime_ns;
+        }
     };
     /// Cache cap: a tree larger than this restarts the cache rather
     /// than growing without bound (the verify passes walk in the same
@@ -2053,10 +2197,12 @@ const CrossCopy = struct {
         self.hash_seen.deinit(self.allocator);
     }
 
+    fn canceled(self: *CrossCopy) bool {
+        return durableCancelRequested(self.journal_dir, self.job_id);
+    }
+
     /// hash() through the per-run digest cache. Trust level: a cache
-    /// hit means "same inode, size and mtime_ns as when the digest was
-    /// computed", which is the identity the manifest checks already
-    /// rely on (`ManifestItem.matches`).
+    /// hit means the inode, size and both change timestamps still match.
     fn hashCached(self: *CrossCopy, side: Side, path: []const u8) ?[64]u8 {
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -2067,13 +2213,40 @@ const CrossCopy = struct {
         };
         if (!std.mem.eql(u8, e.kind, "file")) return self.hash(side, path);
         for (self.hash_seen.items) |*seen| {
-            if (seen.side == side and seen.dev == e.dev and seen.ino == e.ino and
-                seen.size == e.size and seen.mtime_ns == e.mtime_ns)
-                return seen.digest;
+            if (seen.matches(side, e)) return seen.digest;
         }
         const digest = self.hash(side, path) orelse return null;
         self.hashRemember(side, e, &digest);
         return digest;
+    }
+
+    /// After WE renamed `path`, adopt its fresh ctime into any cached
+    /// digest for the same inode. A rename changes only ctime; every
+    /// other identity drift means someone else touched the file, and
+    /// the entry is dropped so the next use rehashes. Best effort with
+    /// no reconnect: it can run under the control lock, and a skipped
+    /// restamp only costs a rehash later.
+    fn hashRefreshAfterRename(self: *CrossCopy, side: Side, path: []const u8) void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const e = self.fsOf(side).statPath(arena.allocator(), path) catch return;
+        if (!std.mem.eql(u8, e.kind, "file")) return;
+        hashRestampRenamed(&self.hash_seen, side, e);
+    }
+
+    fn hashRestampRenamed(list: *std.ArrayList(HashSeen), side: Side, e: fsdrive.Entry) void {
+        var i: usize = 0;
+        while (i < list.items.len) {
+            const seen = &list.items[i];
+            if (seen.side != side or seen.dev != e.dev or seen.ino != e.ino) {
+                i += 1;
+            } else if (seen.size == e.size and seen.mtime_ns == e.mtime_ns) {
+                seen.ctime_ns = e.ctime_ns;
+                i += 1;
+            } else {
+                _ = list.swapRemove(i);
+            }
+        }
     }
 
     fn hashRemember(self: *CrossCopy, side: Side, e: fsdrive.Entry, digest: *const [64]u8) void {
@@ -2084,6 +2257,7 @@ const CrossCopy = struct {
             .ino = e.ino,
             .size = e.size,
             .mtime_ns = e.mtime_ns,
+            .ctime_ns = e.ctime_ns,
             .digest = digest.*,
         }) catch {};
     }
@@ -2118,7 +2292,12 @@ const CrossCopy = struct {
     fn failOp(self: *CrossCopy, side: Side, what: []const u8, path: []const u8, err: fsdrive.Error) void {
         const detail = self.fsOf(side).lastErr();
         if (err == fsdrive.Error.FsOpFailed and detail.len > 0) {
-            self.fail("{s} {s} on {s}: {s}", .{ what, tailOf(path), self.hostLabel(side), detail });
+            self.fail("{s} {s} on {s}: {s}", .{
+                what,
+                tailOf(path),
+                self.hostLabel(side),
+                @import("../filebrowser/format.zig").errorPhrase(detail),
+            });
         } else {
             self.fail("{s} {s} on {s}: {s}", .{ what, tailOf(path), self.hostLabel(side), @errorName(err) });
         }
@@ -2130,10 +2309,13 @@ const CrossCopy = struct {
     }
 
     fn emitFailure(self: *const CrossCopy) u8 {
-        const phase = durable_progress.phase[0..durable_progress.phase_len];
-        if (self.retryable_transport and fsjournal.phaseRank(phase) >= fsjournal.phaseRank("rename_planned")) {
-            durable_retryable_cleanup = true;
-            return emitErrorKind("retryable_cleanup", self.failedReason());
+        const phase = durable_state.progress.phase.slice();
+        _ = durableCancelRequested(self.journal_dir, self.job_id);
+        if (durable_state.cancel_requested and fsjournal.phaseRank(phase) < fsjournal.phaseRank("deleting")) {
+            return cancelCleanupRetry("cancel requested; resolving the durable source state");
+        }
+        if (needsCleanupRetry(self.move, self.retryable_transport, phase)) {
+            return cancelCleanupRetry(self.failedReason());
         }
         if (self.move and fsjournal.phaseRank(phase) >= fsjournal.phaseRank("copied")) {
             // Past "copied" the destination is verified and installed
@@ -2143,9 +2325,9 @@ const CrossCopy = struct {
             var w = std.Io.Writer.fixed(&buf);
             w.print("the copy is complete and installed; {s}", .{self.failedReason()}) catch
                 return emitError(self.failedReason());
-            return emitError(w.buffered());
+            return emitErrorKind(if (self.retryable_transport) "transport" else "permanent", w.buffered());
         }
-        return emitError(self.failedReason());
+        return emitErrorKind(if (self.retryable_transport) "transport" else "permanent", self.failedReason());
     }
 
     /// Emit a progress line carrying a human note. The daemon keeps the
@@ -2182,7 +2364,8 @@ const CrossCopy = struct {
     /// Re-establish ONE side's connection. The transfer itself needs no
     /// other repair: every read and write names an explicit offset, and
     /// the staged `.skpart` on the destination already holds everything
-    /// acknowledged so far.
+    /// acknowledged so far. Giving up marks the attempt retryable, so
+    /// the client ledger's transport policy takes over.
     fn reconnect(self: *CrossCopy, side: Side) bool {
         if (self.reconnects >= RECONNECT_BUDGET) {
             self.retryable_transport = true;
@@ -2193,6 +2376,9 @@ const CrossCopy = struct {
         }
         var attempt: u32 = 0;
         while (attempt < RECONNECT_ATTEMPTS) : (attempt += 1) {
+            // A cancel request must not wait out up to a minute of
+            // backoff; the retryable failure routes it to recovery.
+            if (self.canceled()) break;
             self.reconnects += 1;
             const wait_ms = RECONNECT_BACKOFF_MS[@min(attempt, RECONNECT_BACKOFF_MS.len - 1)];
             self.notice("{s} {s} unreachable -- reconnecting in {d}s (attempt {d}/{d})", .{
@@ -2382,8 +2568,7 @@ const CrossCopy = struct {
         // utimens moved the destination's mtime off the cached
         // identity: rebind the proven digest to what a later verify
         // pass will stat, so it does not reread the whole file.
-        arena_meta.deinit();
-        arena_meta = std.heap.ArenaAllocator.init(self.allocator);
+        _ = arena_meta.reset(.retain_capacity);
         if (self.statProbe(.dst, arena_meta.allocator(), dst_path)) |e| {
             if (std.mem.eql(u8, e.kind, "file") and e.size == size)
                 self.hashRemember(.dst, e, &dh);
@@ -2432,6 +2617,7 @@ const CrossCopy = struct {
                 writes.deinit(self.allocator);
             }
             engine: while (true) {
+                if (self.canceled()) return false;
                 while (reads.items.len < XFER_WINDOW and next < size) {
                     const want: u32 = @intCast(@min(@as(u64, XFER_CHUNK), size - next));
                     const req = self.src.readSubmit(src_path, next, want) catch |err| {
@@ -2564,6 +2750,8 @@ const CrossCopy = struct {
                 self.failOp(.dst, "rename", to, err);
                 return false;
             };
+            // No digest restamp here: copyFile rebinds the proven
+            // digest after its utimens anyway.
             return true;
         }
     }
@@ -2825,7 +3013,8 @@ const CrossCopy = struct {
 
     fn copyLink(self: *CrossCopy, target: []const u8, dst_path: []const u8, no_replace: bool) bool {
         var temp_buf: [4096]u8 = undefined;
-        const temp = std.fmt.bufPrint(&temp_buf, "{s}.skpart-link-{d}", .{ dst_path, c.getpid() }) catch {
+        const temp_id: u64 = if (self.job_id != 0) self.job_id else @intCast(c.getpid());
+        const temp = std.fmt.bufPrint(&temp_buf, "{s}.skpart-link-{d}", .{ dst_path, temp_id }) catch {
             self.fail("destination path too long: {s}", .{tailOf(dst_path)});
             return false;
         };
@@ -2867,8 +3056,7 @@ const CrossCopy = struct {
                 .dir => if (!self.mkdirDst(dp)) return false,
                 .file => {
                     if (!self.copyFile(sp, dp, item.size, allow_resume, false)) return false;
-                    stat_arena.deinit();
-                    stat_arena = std.heap.ArenaAllocator.init(self.allocator);
+                    _ = stat_arena.reset(.retain_capacity);
                     const after = self.statRequired(.src, stat_arena.allocator(), sp) orelse return false;
                     if (!item.matches(after)) {
                         self.fail("source changed while copying: {s}", .{tailOf(sp)});
@@ -3078,32 +3266,169 @@ const CrossCopy = struct {
                 // Rename may have committed before its reply was lost.
                 // Only the persisted source snapshot can claim the
                 // quarantine; an unrelated collision is never removed.
-                if (self.snapshotMatches(durable.quarantine, durable)) return true;
+                if (self.snapshotMatches(durable.quarantine, durable)) {
+                    self.hashRefreshAfterRename(.src, durable.quarantine);
+                    return true;
+                }
                 var arena = std.heap.ArenaAllocator.init(self.allocator);
                 defer arena.deinit();
                 if (self.statProbe(.src, arena.allocator(), durable.quarantine) != null) {
                     self.fail("source quarantine collision; retained both paths", .{});
                     return false;
                 }
-                arena.deinit();
-                arena = std.heap.ArenaAllocator.init(self.allocator);
+                _ = arena.reset(.retain_capacity);
                 if (self.statProbe(.src, arena.allocator(), src_path) == null) {
                     self.fail("source disappeared before it could be quarantined", .{});
                     return false;
                 }
                 continue;
             };
+            self.hashRefreshAfterRename(.src, durable.quarantine);
             return true;
         }
     }
 
-    fn restoreQuarantine(self: *CrossCopy, src_path: []const u8, quarantine: []const u8) void {
-        self.src.renameNoReplace(quarantine, src_path) catch {
-            self.fail("could not restore unverified source; retained it at {s}", .{tailOf(quarantine)});
-        };
+    fn restoreQuarantine(self: *CrossCopy, src_path: []const u8, quarantine: []const u8) bool {
+        while (true) {
+            self.src.renameNoReplace(quarantine, src_path) catch |err| {
+                if (isTransportError(err)) {
+                    if (!self.reconnect(.src)) return false;
+                    continue;
+                }
+                self.fail("could not restore source; retained it at {s}", .{quarantine});
+                return false;
+            };
+            return true;
+        }
     }
 
-    fn installStagedRoot(self: *CrossCopy, manifest: *const Manifest, src_root: []const u8, stage: []const u8, dst_root: []const u8, root: fsdrive.Entry) bool {
+    fn deleteOwnedDestinationPath(self: *CrossCopy, path: []const u8) bool {
+        while (true) {
+            self.dst.deletePath(path) catch |err| {
+                if (err == fsdrive.Error.FsOpFailed and isNoEnt(self.dst)) return true;
+                if (isTransportError(err)) {
+                    if (!self.reconnect(.dst)) return false;
+                    continue;
+                }
+                self.failOp(.dst, "remove canceled staging path", path, err);
+                return false;
+            };
+            return true;
+        }
+    }
+
+    /// Remove the journaled no-replace stage without following symlinks.
+    fn removeDestinationStage(self: *CrossCopy, stage: []const u8) bool {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const before = self.fail_len;
+        if (self.statProbe(.dst, arena.allocator(), stage)) |root| {
+            if (std.mem.eql(u8, root.kind, "dir")) {
+                var manifest = Manifest{ .allocator = self.allocator };
+                defer manifest.deinit();
+                if (!self.buildManifestSide(.dst, &manifest, stage, "")) return false;
+                var i = manifest.items.items.len;
+                while (i > 0) {
+                    i -= 1;
+                    var child_buf: [4096]u8 = undefined;
+                    const child = treePath(&child_buf, stage, manifest.items.items[i].rel) orelse {
+                        self.fail("destination staging path is too long: {s}", .{tailOf(stage)});
+                        return false;
+                    };
+                    if (!self.deleteOwnedDestinationPath(child)) return false;
+                }
+            }
+            if (!self.deleteOwnedDestinationPath(stage)) return false;
+        } else if (isNoEnt(self.dst)) {
+            self.fail_len = before;
+        } else return false;
+
+        // A root file is copied through this sibling before it is
+        // renamed to `stage`; cancellation can arrive between those two.
+        var part_buf: [4096]u8 = undefined;
+        const part = std.fmt.bufPrint(&part_buf, "{s}.skpart", .{stage}) catch {
+            self.fail("destination staging path is too long: {s}", .{tailOf(stage)});
+            return false;
+        };
+        if (!self.deleteOwnedDestinationPath(part)) return false;
+        const link_part = std.fmt.bufPrint(&part_buf, "{s}.skpart-link-{d}", .{ stage, self.job_id }) catch return false;
+        if (!self.deleteOwnedDestinationPath(link_part)) return false;
+        const legacy_link_part = std.fmt.bufPrint(&part_buf, "{s}.skpart-link", .{stage}) catch return false;
+        return self.deleteOwnedDestinationPath(legacy_link_part);
+    }
+
+    fn removeCanceledPartials(self: *CrossCopy, src_root: []const u8, dst_root: []const u8) bool {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const root = self.statRequired(.src, arena.allocator(), src_root) orelse return false;
+        var manifest = Manifest{ .allocator = self.allocator };
+        defer manifest.deinit();
+        if (std.mem.eql(u8, root.kind, "dir")) {
+            if (!self.buildManifest(&manifest, src_root, "")) return false;
+        } else {
+            manifest.append("", root) catch {
+                self.fail("cannot enumerate canceled transfer staging", .{});
+                return false;
+            };
+        }
+        for (manifest.items.items) |*item| {
+            var dst_buf: [4096]u8 = undefined;
+            const destination = if (item.rel.len == 0)
+                dst_root
+            else
+                treePath(&dst_buf, dst_root, item.rel) orelse {
+                    self.fail("destination staging path is too long: {s}", .{tailOf(dst_root)});
+                    return false;
+                };
+            var part_buf: [4096]u8 = undefined;
+            const part = switch (item.kind) {
+                .file => std.fmt.bufPrint(&part_buf, "{s}.skpart", .{destination}),
+                .link => std.fmt.bufPrint(&part_buf, "{s}.skpart-link-{d}", .{ destination, self.job_id }),
+                else => continue,
+            } catch {
+                self.fail("destination staging path is too long: {s}", .{tailOf(destination)});
+                return false;
+            };
+            if (!self.deleteOwnedDestinationPath(part)) return false;
+            if (item.kind == .link) {
+                const legacy = std.fmt.bufPrint(&part_buf, "{s}.skpart-link", .{destination}) catch return false;
+                if (!self.deleteOwnedDestinationPath(legacy)) return false;
+            }
+        }
+        return true;
+    }
+
+    const InstallRename = enum { installed, transport, canceled, failed };
+
+    /// The exclusive final rename, serialized against cancellation when
+    /// the job is journaled.
+    fn installRename(self: *CrossCopy, spec: Spec, stage: []const u8, dst_root: []const u8) InstallRename {
+        if (spec.job_id != 0 and spec.journal_dir.len > 0) {
+            const guard = fsjournal.lockControl(spec.journal_dir, spec.job_id) catch {
+                self.fail("cannot lock staged destination install: {s}", .{tailOf(dst_root)});
+                return .failed;
+            };
+            defer guard.release();
+            if (fsjournal.cancelRequested(spec.journal_dir, spec.job_id)) {
+                durable_state.cancel_requested = true;
+                return .canceled;
+            }
+            return self.installRenameOnce(stage, dst_root);
+        }
+        return self.installRenameOnce(stage, dst_root);
+    }
+
+    fn installRenameOnce(self: *CrossCopy, stage: []const u8, dst_root: []const u8) InstallRename {
+        self.dst.renameNoReplace(stage, dst_root) catch |err| {
+            if (isTransportError(err)) return .transport;
+            self.failOp(.dst, "install", dst_root, err);
+            return .failed;
+        };
+        self.hashRefreshAfterRename(.dst, dst_root);
+        return .installed;
+    }
+
+    fn installStagedRoot(self: *CrossCopy, spec: Spec, manifest: *const Manifest, src_root: []const u8, stage: []const u8, dst_root: []const u8, root: fsdrive.Entry) bool {
         while (true) {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -3121,15 +3446,17 @@ const CrossCopy = struct {
                     self.fail("destination appeared before staged directory install: {s}", .{tailOf(dst_root)});
                     return false;
                 }
-                self.dst.renameNoReplace(stage, dst_root) catch |err| {
-                    if (isTransportError(err)) {
+                switch (self.installRename(spec, stage, dst_root)) {
+                    .installed => return true,
+                    .transport => {
+                        // Reconnect outside the control lock: backoff can
+                        // take a minute and cancellation must stay
+                        // persistable meanwhile.
                         if (!self.reconnect(.dst)) return false;
                         continue;
-                    }
-                    self.failOp(.dst, "install", dst_root, err);
-                    return false;
-                };
-                return true;
+                    },
+                    .canceled, .failed => return false,
+                }
             }
             if (final != null and
                 (!std.mem.eql(u8, root.kind, "dir") or self.destinationShapeMatches(manifest, dst_root)) and
@@ -3206,8 +3533,7 @@ const CrossCopy = struct {
                 return false;
             }
         }
-        arena.deinit();
-        arena = std.heap.ArenaAllocator.init(self.allocator);
+        _ = arena.reset(.retain_capacity);
         const final_source = self.statProbe(.src, arena.allocator(), src_path) orelse {
             if (isNoEnt(self.src)) return true;
             self.fail("cannot re-check source before deletion: {s}", .{tailOf(src_path)});
@@ -3260,14 +3586,35 @@ fn sleepMs(ms: u32) void {
     }
 }
 
+/// Test hook that widens the durable deletion boundary for crash injection.
+fn delayDeletingForTest() void {
+    delayForTest("SKETERM_FSJOB_DELETE_DELAY_MS");
+}
+
+fn delayForTest(name: [*:0]const u8) void {
+    const raw = c.getenv(name) orelse return;
+    const text = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+    const ms = std.fmt.parseInt(u32, text, 10) catch return;
+    sleepMs(@min(ms, 10_000));
+}
+
+fn cancelRequested(spec: Spec) bool {
+    return durableCancelRequested(spec.journal_dir, spec.job_id);
+}
+
 /// Open one side, retrying the dial itself: the destination daemon may
 /// still be starting, or the route may be flapping at exactly the wrong
-/// moment. Only after the retries are spent is the job refused.
-fn connectHostFsRetrying(allocator: std.mem.Allocator, host: []const u8, side: Side, max_tries: u32) ?fsdrive.Fs {
+/// moment. `max_tries` caps the attempts (0 = the full reconnect
+/// budget; direct remote-to-remote submissions set a small cap so an
+/// unreachable peer fails in seconds). No sleep follows the final
+/// failed attempt — the caller reports it immediately.
+fn connectHostFsRetrying(allocator: std.mem.Allocator, host: []const u8, side: Side, max_tries: u32, spec: Spec, allow_canceled: bool) ?fsdrive.Fs {
     const tries = if (max_tries == 0) RECONNECT_ATTEMPTS else @min(max_tries, RECONNECT_ATTEMPTS);
     var attempt: u32 = 0;
     while (attempt < tries) : (attempt += 1) {
+        if (!allow_canceled and cancelRequested(spec)) return null;
         if (connectHostFs(allocator, host)) |fs| return fs else |_| {}
+        if (attempt + 1 >= tries) break;
         const wait_ms = RECONNECT_BACKOFF_MS[@min(attempt, RECONNECT_BACKOFF_MS.len - 1)];
         var buf: [160]u8 = undefined;
         var w = std.Io.Writer.fixed(&buf);
@@ -3319,6 +3666,258 @@ fn durableFromSpec(spec: Spec) CrossDurable {
     };
 }
 
+fn cancellationSpec(spec: Spec, phase: []const u8, durable: CrossDurable, progress: *const Progress) Spec {
+    var out = spec;
+    out.phase = phase;
+    out.source_quarantine = durable.quarantine;
+    out.destination_stage = durable.destination_stage;
+    out.source_fingerprint = durable.fingerprint;
+    out.source_kind = durable.source_kind;
+    out.source_dev = durable.source_dev;
+    out.source_ino = durable.source_ino;
+    out.done = progress.done;
+    out.total = progress.total;
+    out.resumed_from = progress.resumed;
+    out.files_done = progress.entries_done;
+    out.files_total = progress.entries_total;
+    return out;
+}
+
+const DeleteCommit = enum { committed, canceled, failed };
+
+fn commitDeleting(spec: Spec, progress: *const Progress, durable: CrossDurable) DeleteCommit {
+    if (spec.job_id == 0 or spec.journal_dir.len == 0)
+        return if (persistCrossPhase(spec, "deleting", progress, durable)) .committed else .failed;
+    const guard = fsjournal.lockControl(spec.journal_dir, spec.job_id) catch return .failed;
+    if (fsjournal.cancelRequested(spec.journal_dir, spec.job_id)) {
+        guard.release();
+        durable_state.cancel_requested = true;
+        return .canceled;
+    }
+    const saved = saveCrossPhase(spec, "deleting", progress, durable);
+    guard.release();
+    if (!saved) return .failed;
+    emitCrossPhase("deleting", progress);
+    return .committed;
+}
+
+/// Cancellation cleanup hit transport trouble: keep the durable record
+/// recoverable instead of answering permanently.
+fn cancelCleanupRetry(msg: []const u8) u8 {
+    durable_state.retryable_cleanup = true;
+    return emitErrorKind("retryable_cleanup", msg);
+}
+
+/// The verdict every probe in the cancellation resolver shares:
+/// transport trouble stays recoverable, anything else is permanent.
+fn cancelOutcome(cc: *const CrossCopy, retry_msg: []const u8, permanent_msg: []const u8) u8 {
+    if (cc.retryable_transport) return cancelCleanupRetry(retry_msg);
+    return emitErrorKind("permanent", permanent_msg);
+}
+
+fn connectCancellationHost(allocator: std.mem.Allocator, host: []const u8) ?fsdrive.Fs {
+    var attempt: usize = 0;
+    while (attempt < 3) : (attempt += 1) {
+        if (connectHostFs(allocator, host)) |fs| return fs else |_| {}
+        if (attempt + 1 < 3) sleepMs(CLEANUP_RECONNECT_BACKOFF_MS[attempt]);
+    }
+    return null;
+}
+
+fn emitCanceledAfterStageCleanup(allocator: std.mem.Allocator, spec: Spec, source: *fsdrive.Fs, message: []const u8) u8 {
+    if (fsjournal.phaseRank(spec.phase) >= fsjournal.phaseRank("copied"))
+        return emitCanceled(message);
+    var dst = connectCancellationHost(allocator, spec.dst_host) orelse {
+        return cancelCleanupRetry("cancel requested; reconnecting later to remove destination staging data");
+    };
+    defer dst.deinit();
+    var cleanup = CrossCopy{
+        .allocator = allocator,
+        .src = source,
+        .dst = &dst,
+        .journal_dir = spec.journal_dir,
+        .job_id = spec.job_id,
+        .src_host = spec.src_host,
+        .dst_host = spec.dst_host,
+        .move = true,
+    };
+    defer cleanup.deinitCaches();
+    const cleaned = if (spec.destination_stage.len > 0)
+        cleanup.removeDestinationStage(spec.destination_stage)
+    else
+        cleanup.removeCanceledPartials(spec.src, spec.dst);
+    if (!cleaned) {
+        if (cleanup.retryable_transport)
+            return cancelCleanupRetry("cancel requested; reconnecting later to remove destination staging data");
+        var buf: [400]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        w.print("cancel requested; destination staging data retained at {s}: {s}", .{
+            spec.destination_stage,
+            cleanup.failedReason(),
+        }) catch return emitErrorKind("permanent", "cancel requested; destination staging data could not be removed");
+        return emitErrorKind("permanent", w.buffered());
+    }
+    return emitCanceled(message);
+}
+
+/// Resolve a durable move cancellation without ever resuming source deletion.
+fn finishMoveCancellation(allocator: std.mem.Allocator, spec: Spec) u8 {
+    durable_state.cancel_requested = true;
+    const phase = fsjournal.phaseRank(spec.phase);
+    if (!spec.delete_src) {
+        if (spec.destination_stage.len == 0)
+            return emitCanceled("transfer canceled; source left in place");
+        var dst = connectCancellationHost(allocator, spec.dst_host) orelse {
+            return cancelCleanupRetry("cancel requested; reconnecting later to remove destination staging data");
+        };
+        defer dst.deinit();
+        var cleanup = CrossCopy{
+            .allocator = allocator,
+            .src = &dst,
+            .dst = &dst,
+            .journal_dir = spec.journal_dir,
+            .job_id = spec.job_id,
+            .src_host = spec.dst_host,
+            .dst_host = spec.dst_host,
+        };
+        defer cleanup.deinitCaches();
+        if (cleanup.removeDestinationStage(spec.destination_stage))
+            return emitCanceled("transfer canceled; destination staging data removed");
+        return cancelOutcome(
+            &cleanup,
+            "cancel requested; reconnecting later to remove destination staging data",
+            "cancel requested; destination staging data could not be removed",
+        );
+    }
+    if (phase >= fsjournal.phaseRank("source_deleted")) {
+        durable_state.progress.phase.set("source_deleted");
+        emitCopyDone(&.{
+            .done = spec.done,
+            .total = spec.total,
+            .resumed = spec.resumed_from,
+            .entries_done = spec.files_done,
+            .entries_total = spec.files_total,
+        });
+        return 0;
+    }
+
+    var src = connectCancellationHost(allocator, spec.src_host) orelse {
+        return cancelCleanupRetry("cancel requested; cannot reconnect to restore the source");
+    };
+    defer src.deinit();
+    var cc = CrossCopy{
+        .allocator = allocator,
+        .src = &src,
+        .dst = &src,
+        .journal_dir = spec.journal_dir,
+        .job_id = spec.job_id,
+        .src_host = spec.src_host,
+        .dst_host = spec.src_host,
+        .move = true,
+    };
+    defer cc.deinitCaches();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const durable = durableFromSpec(spec);
+    if (phase < fsjournal.phaseRank("copied") or spec.source_quarantine.len == 0) {
+        if (cc.statProbe(.src, arena.allocator(), spec.src)) |root| {
+            if (phase >= fsjournal.phaseRank("rename_planned") and !CrossCopy.durableMatchesRoot(durable, root))
+                return emitErrorKind("permanent", "source identity changed before cancellation completed");
+            if (phase >= fsjournal.phaseRank("copied")) {
+                if (durable.fingerprint.len == 0)
+                    return emitErrorKind("permanent", "move recovery record cannot prove the copied source");
+                if (!cc.snapshotMatches(spec.src, durable))
+                    return cancelOutcome(
+                        &cc,
+                        "cancel requested; reconnecting later to prove the source",
+                        "source no longer matches the copied snapshot; cancellation remains pending",
+                    );
+            }
+            return emitCanceledAfterStageCleanup(allocator, spec, &src, "transfer canceled; source left in place");
+        }
+        if (phase == fsjournal.phaseRank("rename_planned") and
+            std.mem.eql(u8, spec.src_host, spec.dst_host))
+        {
+            // The atomic rename and its phase write are separate syscalls.
+            // If cancellation won the lock after the rename but before the
+            // journal write, destination identity proves completion.
+            cc.fail_len = 0;
+            _ = arena.reset(.retain_capacity);
+            if (cc.statProbe(.src, arena.allocator(), spec.dst)) |destination| {
+                if (CrossCopy.durableMatchesRoot(durable, destination)) {
+                    var progress = Progress{
+                        .done = @max(spec.done, 1),
+                        .total = @max(spec.total, 1),
+                        .resumed = spec.resumed_from,
+                        .entries_done = @max(spec.files_done, 1),
+                        .entries_total = @max(spec.files_total, 1),
+                    };
+                    _ = saveCrossPhase(spec, "source_deleted", &progress, durable);
+                    emitCopyDone(&progress);
+                    return 0;
+                }
+            }
+        }
+        return cancelOutcome(
+            &cc,
+            "cancel requested; source could not be inspected",
+            if (CrossCopy.isNoEnt(cc.src))
+                "source is missing before deletion committed; cancellation remains unresolved"
+            else
+                "source could not be inspected; cancellation remains unresolved",
+        );
+    }
+    if (cc.statProbe(.src, arena.allocator(), spec.source_quarantine)) |_| {
+        if (!cc.snapshotMatches(spec.source_quarantine, durable))
+            return cancelOutcome(
+                &cc,
+                "cancel requested; reconnecting later to prove the source quarantine",
+                "source quarantine no longer matches the copied source; retained it for recovery",
+            );
+        if (cc.restoreQuarantine(spec.src, spec.source_quarantine))
+            return emitCanceledAfterStageCleanup(allocator, spec, &src, "move canceled; source restored and completed destination retained");
+        if (cc.retryable_transport)
+            return cancelCleanupRetry("cancel requested; reconnecting later to restore the source");
+        // rename-no-replace may have committed before an error reply.
+        cc.fail_len = 0;
+        _ = arena.reset(.retain_capacity);
+        if (cc.snapshotMatches(spec.src, durable)) {
+            _ = arena.reset(.retain_capacity);
+            if (cc.statProbe(.src, arena.allocator(), spec.source_quarantine) == null and CrossCopy.isNoEnt(cc.src))
+                return emitCanceledAfterStageCleanup(allocator, spec, &src, "move canceled; source restored and completed destination retained");
+        }
+        return cancelOutcome(
+            &cc,
+            "cancel requested; reconnecting later to confirm source restoration",
+            cc.failedReason(),
+        );
+    }
+    if (!CrossCopy.isNoEnt(cc.src))
+        return cancelOutcome(
+            &cc,
+            "cancel requested; source quarantine could not be inspected",
+            "source quarantine could not be inspected; cancellation remains pending",
+        );
+    cc.fail_len = 0;
+    _ = arena.reset(.retain_capacity);
+    if (cc.statProbe(.src, arena.allocator(), spec.src)) |_| {
+        if (cc.snapshotMatches(spec.src, durable))
+            return emitCanceledAfterStageCleanup(allocator, spec, &src, "move canceled; source left in place and completed destination retained");
+        return cancelOutcome(
+            &cc,
+            "cancel requested; reconnecting later to prove the source",
+            "source path contains replacement content; quarantine retained for recovery",
+        );
+    }
+    if (!CrossCopy.isNoEnt(cc.src))
+        return cancelOutcome(
+            &cc,
+            "cancel requested; source location could not be inspected",
+            "source location could not be inspected; cancellation remains pending",
+        );
+    return emitErrorKind("permanent", "source and quarantine are both missing before deletion committed; cancellation remains unresolved");
+}
+
 fn emitCrossDialFailure(spec: Spec, side: Side, host: []const u8) u8 {
     var buf: [160]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
@@ -3328,13 +3927,19 @@ fn emitCrossDialFailure(spec: Spec, side: Side, host: []const u8) u8 {
         fsjournal.phaseRank(spec.phase) >= fsjournal.phaseRank("rename_planned") and
         fsjournal.phaseRank(spec.phase) < fsjournal.phaseRank("source_deleted"))
     {
-        durable_retryable_cleanup = true;
-        return emitErrorKind("retryable_cleanup", w.buffered());
+        return cancelCleanupRetry(w.buffered());
     }
     return emitErrorKind("unreachable", w.buffered());
 }
 
-fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
+fn runCrossCopy(allocator: std.mem.Allocator, spec_in: Spec) u8 {
+    var spec = spec_in;
+    // Older same-host attempts wrote `deleting` before rename reported
+    // whether it had to fall back to copy. No quarantine means no copy
+    // deletion ever started, so recover from the last honest boundary.
+    if (spec.delete_src and std.mem.eql(u8, spec.src_host, spec.dst_host) and
+        std.mem.eql(u8, spec.phase, "deleting") and spec.source_quarantine.len == 0)
+        spec.phase = "rename_planned";
     if (spec.dst.len == 0) return emitError("cross_copy needs destination");
     if (spec.delete_src and spec.@"resume" and std.mem.eql(u8, spec.phase, "source_deleted")) {
         emit(.{
@@ -3348,13 +3953,22 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
         });
         return 0;
     }
+    durable_state.delete_started = moveDeletionStarted(spec.delete_src, spec.phase);
+    const reconcile_staged_install = !spec.delete_src and spec.no_replace and
+        fsjournal.phaseRank(spec.phase) >= fsjournal.phaseRank("destination_staged");
+    if (cancelRequested(spec) and !reconcile_staged_install) return finishMoveCancellation(allocator, spec);
     const src_label = if (spec.src_host.len == 0) "local" else spec.src_host;
     const dst_label = if (spec.dst_host.len == 0) "local" else spec.dst_host;
-    var src = connectHostFsRetrying(allocator, spec.src_host, .src, spec.dial_tries) orelse
-        return emitCrossDialFailure(spec, .src, src_label);
+    var src = connectHostFsRetrying(allocator, spec.src_host, .src, spec.dial_tries, spec, reconcile_staged_install) orelse
+        return if (reconcile_staged_install)
+            cancelCleanupRetry("cancel requested; reconnecting later to reconcile the destination install")
+        else if (durable_state.cancel_requested)
+            finishMoveCancellation(allocator, spec)
+        else
+            emitCrossDialFailure(spec, .src, src_label);
     defer src.deinit();
-    var dst = connectHostFsRetrying(allocator, spec.dst_host, .dst, spec.dial_tries) orelse
-        return emitCrossDialFailure(spec, .dst, dst_label);
+    var dst = connectHostFsRetrying(allocator, spec.dst_host, .dst, spec.dial_tries, spec, reconcile_staged_install) orelse
+        return if (durable_state.cancel_requested) finishMoveCancellation(allocator, spec) else emitCrossDialFailure(spec, .dst, dst_label);
     defer dst.deinit();
     const journal_phase = fsjournal.phaseRank(spec.phase);
     const resume_phase = if (std.mem.eql(u8, spec.phase, "rename_planned")) 0 else journal_phase;
@@ -3362,6 +3976,8 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
         .allocator = allocator,
         .src = &src,
         .dst = &dst,
+        .journal_dir = spec.journal_dir,
+        .job_id = spec.job_id,
         .src_host = spec.src_host,
         .dst_host = spec.dst_host,
         .no_replace = spec.no_replace,
@@ -3402,18 +4018,35 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
     if (spec.delete_src and std.mem.eql(u8, spec.src_host, spec.dst_host) and
         (journal_phase == 0 or std.mem.eql(u8, spec.phase, "rename_planned")))
     {
-        switch (cc.tryRenameMove(spec.src, spec.dst, move_durable)) {
+        var control: ?fsjournal.ControlLock = null;
+        if (spec.job_id != 0 and spec.journal_dir.len != 0) {
+            control = fsjournal.lockControl(spec.journal_dir, spec.job_id) catch
+                return emitError("move could not lock its atomic rename boundary");
+            if (fsjournal.cancelRequested(spec.journal_dir, spec.job_id)) {
+                control.?.release();
+                durable_state.cancel_requested = true;
+                return finishMoveCancellation(allocator, cancellationSpec(spec, "rename_planned", move_durable, &cc.progress));
+            }
+        }
+        const rename_result = cc.tryRenameMove(spec.src, spec.dst, move_durable);
+        if (rename_result == .moved) {
+            durable_state.delete_started = true;
+            cc.progress.done = 1;
+            cc.progress.total = 1;
+            cc.progress.entries_done = 1;
+            cc.progress.entries_total = 1;
+            const saved = saveCrossPhase(spec, "source_deleted", &cc.progress, move_durable);
+            if (control) |guard| guard.release();
+            if (saved) emitCrossPhase("source_deleted", &cc.progress);
+        } else if (control) |guard| guard.release();
+        switch (rename_result) {
             .moved => {
-                cc.progress.done = 1;
-                cc.progress.total = 1;
-                cc.progress.entries_done = 1;
-                cc.progress.entries_total = 1;
-                if (!persistCrossPhase(spec, "source_deleted", &cc.progress, move_durable))
-                    return emitError("move completed but its durable phase could not be saved");
                 emitCopyDone(&cc.progress);
                 return 0;
             },
-            .copy_fallback => {},
+            .copy_fallback => {
+                durable_state.delete_started = false;
+            },
             .failed => return cc.emitFailure(),
         }
     }
@@ -3426,8 +4059,7 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
         if (cc.statProbe(.src, arena.allocator(), durable.quarantine) != null) {
             active_src = durable.quarantine;
             captured = true;
-            arena.deinit();
-            arena = std.heap.ArenaAllocator.init(allocator);
+            _ = arena.reset(.retain_capacity);
         } else if (resume_phase >= fsjournal.phaseRank("quarantined") and CrossCopy.isNoEnt(cc.src)) {
             // Cleanup completed before its final phase write. The
             // original path is unrelated once quarantine was durable.
@@ -3503,7 +4135,12 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
     // against its own success. A FRESH job never claims a matching
     // destination (an identical file is not proof that THIS job put it
     // there — the collision smoke pins that down for moves).
-    const prior_attempt = spec.destination_stage.len > 0 or spec.phase.len > 0 or spec.done > 0;
+    // Only destination_staged proves this job completed and verified
+    // its private root immediately before the exclusive rename. The
+    // earlier rename_planned phase merely reserves a stage pathname;
+    // treating it as ownership lets a retry claim an unrelated
+    // identical collision and, for a move, delete the source.
+    const prior_attempt = fsjournal.phaseRank(spec.phase) >= fsjournal.phaseRank("destination_staged");
     var already_installed = false;
     if (spec.no_replace and resume_phase == 0) {
         var final_arena = std.heap.ArenaAllocator.init(allocator);
@@ -3576,13 +4213,19 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
                 return cc.emitFailure();
             }
         }
-        if (!cc.installStagedRoot(&manifest, active_src, durable.destination_stage, spec.dst, root))
-            return cc.emitFailure();
+        delayForTest("SKETERM_FSJOB_PRE_INSTALL_DELAY_MS");
+        if (!cc.installStagedRoot(spec, &manifest, active_src, durable.destination_stage, spec.dst, root))
+            return if (durable_state.cancel_requested)
+                finishMoveCancellation(allocator, cancellationSpec(spec, "destination_staged", durable, &cc.progress))
+            else
+                cc.emitFailure();
+        delayForTest("SKETERM_FSJOB_POST_INSTALL_DELAY_MS");
     }
     if (!spec.delete_src) {
         emitCopyDone(&cc.progress);
         return 0;
     }
+    if (cc.canceled()) return finishMoveCancellation(allocator, spec);
 
     var fingerprint_buf: [Sha256.digest_length * 2]u8 = undefined;
     if (resume_phase < fsjournal.phaseRank("quarantined")) {
@@ -3614,7 +4257,7 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
             return emitError("copy completed but its durable move phase could not be saved");
         if (!cc.quarantineSource(spec.src, durable)) return cc.emitFailure();
         if (!cc.snapshotMatches(durable.quarantine, durable)) {
-            cc.restoreQuarantine(spec.src, durable.quarantine);
+            _ = cc.restoreQuarantine(spec.src, durable.quarantine);
             if (cc.fail_len == 0)
                 cc.fail("source changed during quarantine; restored it", .{});
             return cc.emitFailure();
@@ -3622,17 +4265,36 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
         active_src = durable.quarantine;
         captured = true;
     }
+    if (cc.canceled())
+        return finishMoveCancellation(allocator, cancellationSpec(spec, "copied", durable, &cc.progress));
     if (!cc.verifyDestination(&manifest, active_src, spec.dst, root)) return cc.emitFailure();
     if (resume_phase < fsjournal.phaseRank("quarantined")) {
         if (!persistCrossPhase(spec, "quarantined", &cc.progress, durable)) {
-            if (captured) cc.restoreQuarantine(spec.src, durable.quarantine);
+            if (captured) _ = cc.restoreQuarantine(spec.src, durable.quarantine);
             return emitError("source quarantined but its durable phase could not be saved");
         }
     }
+    if (cc.canceled())
+        return finishMoveCancellation(allocator, cancellationSpec(spec, "quarantined", durable, &cc.progress));
+    if (resume_phase < fsjournal.phaseRank("deleting")) {
+        switch (commitDeleting(spec, &cc.progress, durable)) {
+            .committed => {},
+            .canceled => return finishMoveCancellation(allocator, cancellationSpec(spec, "quarantined", durable, &cc.progress)),
+            .failed => return emitError("source cleanup could not persist its cancellation boundary"),
+        }
+    }
+    // Past this durable boundary a tree may be partially removed. A
+    // later cancellation must finish cleanup, never restore a partial
+    // quarantine under the original source name.
+    durable_state.delete_started = true;
+    delayDeletingForTest();
     if (std.mem.eql(u8, root.kind, "dir")) {
-        if (!cc.deleteManifest(&manifest, active_src, spec.dst, root)) return cc.emitFailure();
-    } else if (!cc.deleteCopiedFile(&manifest.items.items[0], active_src, spec.dst))
+        if (!cc.deleteManifest(&manifest, active_src, spec.dst, root)) {
+            return cc.emitFailure();
+        }
+    } else if (!cc.deleteCopiedFile(&manifest.items.items[0], active_src, spec.dst)) {
         return cc.emitFailure();
+    }
     if (!persistCrossPhase(spec, "source_deleted", &cc.progress, durable))
         return emitError("source was deleted but the durable move phase could not be saved");
     emitCopyDone(&cc.progress);
@@ -5502,7 +6164,7 @@ test "video poster: a clip shorter than the 1s seek still yields a frame" {
     const src = std.fmt.bufPrintZ(&src_z, "/tmp/.sketerm-test-poster-{d}.mp4", .{c.getpid()}) catch unreachable;
     defer _ = c.unlink(src.ptr);
     const make = [_:null]?[*:0]const u8{
-        "ffmpeg", "-y",                                          "-v", "error", "-f", "lavfi",
+        "ffmpeg", "-y",                                      "-v", "error", "-f", "lavfi",
         "-i",     "testsrc=duration=0.5:size=64x48:rate=30", src,  null,
     };
     // No lavfi/x264 on this host: nothing to assert about.
@@ -5741,6 +6403,56 @@ test "cross-copy source deletion recognizes idempotent NOENT" {
     try std.testing.expect(!CrossCopy.noEntDetail("NOTEMPTY"));
 }
 
+test "cross-copy terminal errors classify permanent and transport failures" {
+    durable_state.cancel_requested = false;
+    durable_state.error_kind.len = 0;
+    var copy = CrossCopy{
+        .allocator = std.testing.allocator,
+        .src = undefined,
+        .dst = undefined,
+        .src_host = "darkshire",
+        .dst_host = "",
+    };
+    copy.fail("read small.txt on darkshire: permission denied", .{});
+    _ = copy.emitFailure();
+    try std.testing.expectEqualStrings("permanent", durable_state.error_kind.slice());
+
+    durable_state.error_kind.len = 0;
+    copy.retryable_transport = true;
+    _ = copy.emitFailure();
+    try std.testing.expectEqualStrings("transport", durable_state.error_kind.slice());
+}
+
+test "cleanup-only retries and deferred cancellation begin with source deletion" {
+    try std.testing.expect(!needsCleanupRetry(false, true, "rename_planned"));
+    try std.testing.expect(!needsCleanupRetry(true, true, "rename_planned"));
+    try std.testing.expect(needsCleanupRetry(true, true, "copied"));
+    try std.testing.expect(!needsCleanupRetry(true, false, "deleting"));
+    try std.testing.expect(!moveDeletionStarted(true, "quarantined"));
+    try std.testing.expect(moveDeletionStarted(true, "deleting"));
+    try std.testing.expect(!moveDeletionStarted(false, "deleting"));
+}
+
+test "durable terminal events stay buffered until journal commit" {
+    durable_state.defer_terminal = true;
+    durable_state.terminal_event.len = 0;
+    defer {
+        durable_state.defer_terminal = false;
+        durable_state.terminal_event.len = 0;
+    }
+
+    emit(.{ .ev = "error", .message = "deferred", .kind = "transport" });
+    try std.testing.expect(durable_state.terminal_event.len > 0);
+    const buffered = durable_state.terminal_event.slice();
+    try std.testing.expect(std.mem.indexOf(u8, buffered, "\"ev\":\"error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffered, "\"message\":\"deferred\"") != null);
+
+    durable_state.defer_terminal = false;
+    durable_state.terminal_event.len = 0;
+    emit(.{ .ev = "progress", .done = @as(u64, 1) });
+    try std.testing.expectEqual(@as(usize, 0), durable_state.terminal_event.len);
+}
+
 test "helper journals retain progress and explicit move phase" {
     const t = std.testing;
     var tmp = t.tmpDir(.{});
@@ -5769,7 +6481,10 @@ test "helper journals retain progress and explicit move phase" {
         .entries_total = 9,
         .quiet = true,
     };
-    durable_progress = .{};
+    durable_state.progress = .{};
+    durable_state.cancel_requested = false;
+    durable_state.error_kind.set("permanent");
+    durable_state.message.set("copy failed permanently");
     try t.expect(persistCrossPhase(spec, "copied", &progress, .{
         .quarantine = "/.sketerm-move-73-deadbeef",
         .fingerprint = "0123456789abcdef",
@@ -5779,13 +6494,13 @@ test "helper journals retain progress and explicit move phase" {
     }));
     // A terminal error carries no counters. Its final helper write must
     // preserve the durable copy boundary and progress rather than zero it.
-    durable_progress.done = 0;
-    durable_progress.total = 0;
-    durable_progress.resumed_from = 0;
-    durable_progress.files_done = 0;
-    durable_progress.files_total = 0;
-    durable_progress.phase_len = 0;
-    try saveHelperJournal(t.allocator, spec, "failed");
+    durable_state.progress.done = 0;
+    durable_state.progress.total = 0;
+    durable_state.progress.resumed_from = 0;
+    durable_state.progress.files_done = 0;
+    durable_state.progress.files_total = 0;
+    durable_state.progress.phase.len = 0;
+    _ = try saveHelperJournal(t.allocator, spec, "failed");
     const path = try std.fmt.allocPrint(arena.allocator(), "{s}/73.json", .{dir});
     const parsed = try fsjournal.load(arena.allocator(), path);
     defer parsed.deinit();
@@ -5802,4 +6517,95 @@ test "helper journals retain progress and explicit move phase" {
     try t.expectEqualStrings("file", parsed.value.source_kind);
     try t.expectEqual(@as(u64, 4), parsed.value.source_dev);
     try t.expectEqual(@as(u64, 5), parsed.value.source_ino);
+    try t.expectEqualStrings("copy failed permanently", parsed.value.message);
+    try t.expectEqualStrings("permanent", parsed.value.error_kind);
+}
+
+test "durable cancellation wins before deleting is committed" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const dir = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}/jobs", .{&tmp.sub_path});
+    try fsjournal.save(dir, .{
+        .id = 74,
+        .op = "cross_copy",
+        .state = "running",
+        .delete_src = true,
+        .phase = "quarantined",
+    });
+    try t.expectEqual(fsjournal.CancelResult.requested, (try fsjournal.tryRequestCancel(t.allocator, dir, 74)).?);
+    durable_state.cancel_requested = false;
+    const spec = Spec{ .op = "cross_copy", .job_id = 74, .journal_dir = dir, .delete_src = true };
+    const progress = Progress{ .quiet = true };
+    try t.expectEqual(DeleteCommit.canceled, commitDeleting(spec, &progress, .{}));
+
+    const path = try std.fmt.allocPrint(arena.allocator(), "{s}/74.json", .{dir});
+    const parsed = try fsjournal.load(arena.allocator(), path);
+    defer parsed.deinit();
+    try t.expectEqualStrings("quarantined", parsed.value.phase);
+    try t.expect(fsjournal.cancelRequested(dir, 74));
+}
+
+test "digest cache rejects in-place changes with restored mtime" {
+    const seen = CrossCopy.HashSeen{
+        .side = .src,
+        .dev = 1,
+        .ino = 2,
+        .size = 3,
+        .mtime_ns = 4,
+        .ctime_ns = 5,
+        .digest = [_]u8{0} ** 64,
+    };
+    var entry = fsdrive.Entry{
+        .name = "file",
+        .kind = "file",
+        .dev = 1,
+        .ino = 2,
+        .size = 3,
+        .mtime_ns = 4,
+        .ctime_ns = 5,
+    };
+    try std.testing.expect(seen.matches(.src, entry));
+    entry.ctime_ns += 1;
+    try std.testing.expect(!seen.matches(.src, entry));
+}
+
+test "digest cache survives our own rename but drops foreign changes" {
+    const t = std.testing;
+    var list: std.ArrayList(CrossCopy.HashSeen) = .empty;
+    defer list.deinit(t.allocator);
+    try list.append(t.allocator, .{
+        .side = .dst,
+        .dev = 1,
+        .ino = 2,
+        .size = 3,
+        .mtime_ns = 4,
+        .ctime_ns = 5,
+        .digest = [_]u8{0} ** 64,
+    });
+    // Our rename moved only ctime: the digest is restamped, not lost.
+    CrossCopy.hashRestampRenamed(&list, .dst, .{
+        .name = "f",
+        .kind = "file",
+        .dev = 1,
+        .ino = 2,
+        .size = 3,
+        .mtime_ns = 4,
+        .ctime_ns = 9,
+    });
+    try t.expectEqual(@as(usize, 1), list.items.len);
+    try t.expectEqual(@as(i64, 9), list.items[0].ctime_ns);
+    // Same inode, different size: replacement content forces a rehash.
+    CrossCopy.hashRestampRenamed(&list, .dst, .{
+        .name = "f",
+        .kind = "file",
+        .dev = 1,
+        .ino = 2,
+        .size = 7,
+        .mtime_ns = 4,
+        .ctime_ns = 11,
+    });
+    try t.expectEqual(@as(usize, 0), list.items.len);
 }

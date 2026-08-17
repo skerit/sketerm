@@ -26,12 +26,33 @@ const store = @import("../filebrowser/transfers.zig");
 const xferqueue = @import("../filebrowser/xferqueue.zig");
 const pathz = @import("../util/pathz.zig");
 const cast = @import("../util/cast.zig");
+const nowMs = @import("../util/clock.zig").nowMs;
 
 pub const NotifyFn = *const fn (ctx: *anyopaque, text: []const u8) void;
 const Subscriber = struct { ctx: *anyopaque, callback: NotifyFn };
 
 /// How often orphaned records (an owner that crashed) are looked for.
 const SWEEP_MS: c.guint = 15_000;
+pub const AUTO_RETRIES: u8 = 3;
+pub const RETRY_DELAY_MS: c.guint = 5_000;
+
+pub fn retryableFailureKind(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "transport") or std.mem.eql(u8, kind, "unreachable");
+}
+
+pub fn automaticRetryAllowed(failures: u8, retryable: bool) bool {
+    return retryable and failures <= AUTO_RETRIES;
+}
+
+fn transferRetryEligible(it: *const Intent) bool {
+    if (it.state != .waiting_retry) return false;
+    return !it.cancel_requested or it.job != 0 or it.submission_uncertain or it.mediated;
+}
+
+fn cancelNeedsSubmissionRecovery(it: *const Intent) bool {
+    return (it.state == .queued or it.state == .waiting_retry) and
+        it.submission_uncertain and it.ack_job == 0;
+}
 
 const Intent = struct {
     handle: store.Handle,
@@ -54,6 +75,8 @@ const Intent = struct {
     submitted_generation: u64,
     message: []u8,
     attempts: u8 = 0,
+    /// Volatile monotonic deadline for the visible retry countdown.
+    retry_due_ms: i64 = 0,
     cancel_requested: bool = false,
     submitted_size: u64 = 0,
     submitted_mtime_ns: i64 = 0,
@@ -80,6 +103,7 @@ const Intent = struct {
     batch_token: []u8,
     coordinator_host: []u8,
     coordinator_set: bool = false,
+    submission_uncertain: bool = false,
     ack_host: []u8,
     claimed: bool = false,
     open_when_done: bool = false,
@@ -131,6 +155,7 @@ const Intent = struct {
                 .batch_token = self.batch_token,
                 .coordinator_host = self.coordinator_host,
                 .coordinator_set = self.coordinator_set,
+                .submission_uncertain = self.submission_uncertain,
                 .ack_host = self.ack_host,
                 .open_when_done = self.open_when_done,
                 .delete_src_after = self.delete_src_after,
@@ -144,6 +169,32 @@ const Intent = struct {
         inline for (.{ self.token, self.client_token, self.src_host, self.src_path, self.dst_host, self.dst_path, self.app_id, self.watch_token, self.message, self.coordinator_host, self.ack_host, self.batch_token }) |s|
             a.free(s);
         a.destroy(self);
+    }
+};
+
+/// One all-or-nothing durable mutation of an Intent.
+///
+/// The snapshot is the WHOLE record, so a field added to Intent is
+/// rolled back without touching any call site; the mutation itself runs
+/// between `begin` and `commit`. Slices the mutation allocated are
+/// still the caller's to free on failure -- `saved` holds the pointers
+/// it replaced, which is also where a successful caller finds the old
+/// ones to release.
+const IntentTxn = struct {
+    service: *Service,
+    intent: *Intent,
+    saved: Intent,
+
+    fn begin(service: *Service, it: *Intent) IntentTxn {
+        return .{ .service = service, .intent = it, .saved = it.* };
+    }
+
+    /// @return false after restoring every field, when the record could
+    /// not be persisted.
+    fn commit(self: IntentTxn) bool {
+        if (self.service.writeIntentOk(self.intent)) return true;
+        self.intent.* = self.saved;
+        return false;
     }
 };
 
@@ -281,6 +332,8 @@ pub const QueueRow = struct {
     batch_id: u64 = 0,
     batch_total: u64 = 0,
     delete_src_after: bool = false,
+    attempts: u8 = 0,
+    retry_due_ms: i64 = 0,
 };
 
 /// One client-mediated transfer as handed to a driver.
@@ -305,6 +358,7 @@ pub const MediatedRec = struct {
     coordinator_set: bool,
     ack_host: []const u8,
     ack_job: u64,
+    cancel_requested: bool,
     retired: bool,
     attempts: u8,
     state: store.State,
@@ -339,6 +393,7 @@ pub const Service = struct {
     conn: ?muxclient.Conn = null,
     fd_watch: c.guint = 0,
     retry_source: c.guint = 0,
+    transfer_retry_source: c.guint = 0,
     sweep_source: c.guint = 0,
     next_req: u32 = 1,
     order_seq: u64 = 0,
@@ -378,6 +433,7 @@ pub const Service = struct {
         self.persist();
         if (self.sweep_source != 0) _ = c.g_source_remove(self.sweep_source);
         if (self.retry_source != 0) _ = c.g_source_remove(self.retry_source);
+        if (self.transfer_retry_source != 0) _ = c.g_source_remove(self.transfer_retry_source);
         if (self.fd_watch != 0) _ = c.g_source_remove(self.fd_watch);
         if (self.conn) |*conn| conn.deinit();
         if (self.legacy_lock) |lock| lock.release();
@@ -553,6 +609,7 @@ pub const Service = struct {
         self.handLooseIntents();
         self.handAllBatches();
         self.queueDirtyWatches();
+        self.armTransferRetry();
         self.refreshViews();
     }
 
@@ -732,13 +789,20 @@ pub const Service = struct {
             .dst_host = dst_host,
             .dst_path = dst_path,
             .app_id = app_id,
-            .state = if (value.state == .done or value.state == .canceled or value.state == .failed) value.state else .queued,
+            .state = if (value.state == .done or value.state == .canceled or value.state == .failed or value.state == .waiting_retry)
+                value.state
+            else
+                .queued,
             .job = value.job,
             .order = if (value.order == 0) self.nextOrder() else value.order,
             .watch_token = watch_token,
             .submitted_generation = value.submitted_generation,
             .message = message,
             .attempts = value.attempts,
+            // Monotonic timestamps cannot survive a restart. Give a
+            // recovered retry a fresh full delay rather than running it
+            // immediately or persisting a wall-clock deadline.
+            .retry_due_ms = if (value.state == .waiting_retry) nowMs() + RETRY_DELAY_MS else 0,
             .cancel_requested = value.cancel_requested,
             .submitted_size = value.submitted_size,
             .submitted_mtime_ns = value.submitted_mtime_ns,
@@ -753,6 +817,7 @@ pub const Service = struct {
             .batch_token = batch_token,
             .coordinator_host = coordinator_host,
             .coordinator_set = value.coordinator_set,
+            .submission_uncertain = value.submission_uncertain,
             .ack_host = ack_host,
             .open_when_done = value.open_when_done,
             .delete_src_after = value.delete_src_after,
@@ -916,15 +981,80 @@ pub const Service = struct {
         self.retry_delay_ms = @min(@as(c.guint, 30_000), self.retry_delay_ms * 2);
     }
 
+    fn scheduleTransferRetry(self: *Service, it: *Intent) void {
+        it.retry_due_ms = nowMs() + RETRY_DELAY_MS;
+        self.armTransferRetry();
+    }
+
+    fn armTransferRetry(self: *Service) void {
+        if (self.transfer_retry_source != 0 or self.shutting_down) return;
+        const now = nowMs();
+        var delay: ?i64 = null;
+        for (self.intents.items) |it| {
+            if (!transferRetryEligible(it)) continue;
+            // A submitted job whose cancel reply was lost must be
+            // re-owned so the cancellation fence can finish. An
+            // unsubmitted cancellation has no daemon state and is
+            // retired synchronously by cancel().
+            const remaining = @max(@as(i64, 1), it.retry_due_ms - now);
+            delay = if (delay) |d| @min(d, remaining) else remaining;
+        }
+        if (delay) |ms|
+            self.transfer_retry_source = c.g_timeout_add(@intCast(@min(ms, std.math.maxInt(c.guint))), @ptrCast(&onTransferRetry), @ptrCast(self));
+    }
+
+    fn onTransferRetry(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(Service, user);
+        self.transfer_retry_source = 0;
+        const now = nowMs();
+        var i: usize = 0;
+        while (i < self.intents.items.len) {
+            const it = self.intents.items[i];
+            if (!transferRetryEligible(it) or it.retry_due_ms > now) {
+                i += 1;
+                continue;
+            }
+            it.retry_due_ms = 0;
+            it.state = .queued;
+            if (it.mediated) {
+                if (!it.claimed) {
+                    // Live views retain their claim and run their own
+                    // per-record deadline. A recovered record has no
+                    // owner, so hand it back once its durable delay
+                    // expires instead of feeding it to pump(), which
+                    // intentionally handles daemon-owned work only.
+                    if (self.writeIntentOk(it)) self.handToDriver(it);
+                }
+            } else {
+                self.writeIntent(it);
+            }
+            if (i < self.intents.items.len and self.intents.items[i] == it) i += 1;
+        }
+        self.pump();
+        self.refreshViews();
+        self.armTransferRetry();
+        return 0;
+    }
+
     fn onRetry(user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(Service, user);
         self.retry_source = 0;
         self.connect();
-        for (self.intents.items) |it| {
-            if (it.state == .waiting_retry and !it.cancel_requested) it.state = .queued;
-        }
         self.pump();
         return 0;
+    }
+
+    fn recordDirectTransportLoss(self: *Service, it: *Intent) void {
+        const unresolved = it.submission_uncertain or it.job != 0;
+        if (!it.cancel_requested and !unresolved) it.attempts +|= 1;
+        // Reclaiming a possibly-live idempotent attempt is not permission
+        // to create new work and cannot be bounded by the work retry budget.
+        const retry = it.cancel_requested or unresolved or automaticRetryAllowed(it.attempts, true);
+        it.state = if (retry) .waiting_retry else .failed;
+        it.retry_due_ms = if (retry) nowMs() + RETRY_DELAY_MS else 0;
+        self.replaceMessage(it, "daemon connection lost during transfer");
+        if (!retry)
+            self.notify("transfer failed: {s}", .{std.fs.path.basename(it.dst_path)});
     }
 
     fn disconnected(self: *Service) void {
@@ -938,9 +1068,13 @@ pub const Service = struct {
         self.pending.clearRetainingCapacity();
         for (self.intents.items) |it| {
             it.ack_req = 0;
-            if (it.state == .submitting or it.state == .running) it.state = .queued;
+            if (!it.mediated and (it.state == .submitting or it.state == .running)) {
+                self.recordDirectTransportLoss(it);
+            }
         }
         self.persist();
+        self.armTransferRetry();
+        self.refreshViews();
         self.scheduleRetry();
     }
 
@@ -980,7 +1114,7 @@ pub const Service = struct {
     }
 
     fn onReply(self: *Service, payload: []const u8) void {
-        const Reply = struct { req: u32 = 0, ok: bool = false, job: u64 = 0, state: []const u8 = "", done: u64 = 0, total: u64 = 0, @"error": []const u8 = "", message: []const u8 = "" };
+        const Reply = struct { req: u32 = 0, ok: bool = false, job: u64 = 0, state: []const u8 = "", done: u64 = 0, total: u64 = 0, @"error": []const u8 = "", message: []const u8 = "", kind: []const u8 = "" };
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const rep = std.json.parseFromSliceLeaky(Reply, arena.allocator(), payload, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch return;
@@ -1003,6 +1137,7 @@ pub const Service = struct {
         for (self.pending.items, 0..) |p, i| {
             if (p.req != rep.req) continue;
             _ = self.pending.orderedRemove(i);
+            p.intent.submission_uncertain = false;
             if (!rep.ok or rep.job == 0) {
                 if (p.intent.cancel_requested) {
                     p.intent.state = .canceled;
@@ -1010,9 +1145,8 @@ pub const Service = struct {
                     self.pump();
                     return;
                 }
-                p.intent.state = .waiting_retry;
+                p.intent.state = .failed;
                 self.replaceMessage(p.intent, rep.@"error");
-                self.scheduleRetry();
             } else {
                 p.intent.job = rep.job;
                 p.intent.state = parseState(rep.state) orelse .running;
@@ -1029,9 +1163,12 @@ pub const Service = struct {
                     if (!self.sendJobControl(p.intent.job, "job_pause")) self.disconnect_after_drain = true;
                 }
                 if (p.intent.state == .done)
-                    self.complete(p.intent, true, rep.message)
-                else if (p.intent.state == .failed or p.intent.state == .canceled)
-                    self.complete(p.intent, false, rep.message);
+                    self.complete(p.intent, true, false, rep.message, false)
+                else if (p.intent.state == .failed or p.intent.state == .canceled) {
+                    const canceled = p.intent.state == .canceled;
+                    if (canceled) p.intent.cancel_requested = true;
+                    self.complete(p.intent, false, canceled, rep.message, retryableFailureKind(rep.kind));
+                }
             }
             self.persist();
             self.pump();
@@ -1047,6 +1184,7 @@ pub const Service = struct {
             done: u64 = 0,
             total: u64 = 0,
             resumed_from: u64 = 0,
+            kind: []const u8 = "",
         };
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
@@ -1054,9 +1192,11 @@ pub const Service = struct {
         for (self.intents.items) |it| {
             if (it.job != ev.job or it.retired) continue;
             if (std.mem.eql(u8, ev.ev, "done")) {
-                self.complete(it, true, "");
+                self.complete(it, true, false, "", false);
             } else if (std.mem.eql(u8, ev.ev, "error") or std.mem.eql(u8, ev.ev, "canceled")) {
-                self.complete(it, false, ev.message);
+                const canceled = std.mem.eql(u8, ev.ev, "canceled");
+                if (canceled) it.cancel_requested = true;
+                self.complete(it, false, canceled, ev.message, std.mem.eql(u8, ev.ev, "error") and retryableFailureKind(ev.kind));
             } else if (std.mem.eql(u8, ev.ev, "paused") or std.mem.eql(u8, ev.ev, "resumed")) {
                 // The daemon is the authority on whether the helper is
                 // stopped; a pause from another client shows up here.
@@ -1086,10 +1226,39 @@ pub const Service = struct {
         it.message = replacement;
     }
 
-    fn complete(self: *Service, it: *Intent, ok: bool, message: []const u8) void {
+    fn scheduleCancellationRecovery(self: *Service, it: *Intent, message: []const u8) bool {
+        const fresh = self.newToken() catch return false;
+        const replacement_message = self.allocator.dupe(u8, message) catch {
+            self.allocator.free(fresh);
+            return false;
+        };
+        const txn = IntentTxn.begin(self, it);
+        it.record_version = store.VERSION;
+        it.client_token = fresh;
+        it.message = replacement_message;
+        it.ack_job = 0;
+        it.ack_durable = false;
+        it.state = .waiting_retry;
+        it.retry_due_ms = nowMs() + RETRY_DELAY_MS;
+        it.submission_uncertain = false;
+        it.claimed = false;
+        it.cancel_requested = true;
+        if (!txn.commit()) {
+            self.allocator.free(fresh);
+            self.allocator.free(replacement_message);
+            return false;
+        }
+        self.allocator.free(txn.saved.client_token);
+        self.allocator.free(txn.saved.message);
+        self.armTransferRetry();
+        return true;
+    }
+
+    fn complete(self: *Service, it: *Intent, ok: bool, canceled: bool, message: []const u8, retryable: bool) void {
         const terminal_job = it.job;
+        it.submission_uncertain = false;
         if (!ok) {
-            if (it.cancel_requested) {
+            if (canceled) {
                 it.ack_job = terminal_job;
                 it.ack_durable = false;
                 it.state = .canceled;
@@ -1098,8 +1267,31 @@ pub const Service = struct {
                 self.pump();
                 return;
             }
+            if (it.cancel_requested) {
+                // A terminal error is not proof that cancellation safely
+                // restored the source. Rotate the client identity to restart
+                // durable cleanup, but keep the old job unacknowledged until
+                // the helper reports a source-safe terminal result.
+                if (self.scheduleCancellationRecovery(it, message))
+                    self.notify("transfer cancellation recovery scheduled: {s}", .{std.fs.path.basename(it.dst_path)})
+                else
+                    self.notify("transfer cancellation needs attention: {s}", .{std.fs.path.basename(it.dst_path)});
+                self.pump();
+                return;
+            }
+            if (!retryable) {
+                it.ack_job = terminal_job;
+                it.ack_durable = false;
+                it.state = .failed;
+                self.replaceMessage(it, message);
+                self.notify("transfer failed: {s}", .{std.fs.path.basename(it.dst_path)});
+                if (!self.writeIntentOk(it)) return;
+                self.pumpAcksNow();
+                self.pump();
+                return;
+            }
             it.attempts +|= 1;
-            if (it.attempts >= 8) {
+            if (!automaticRetryAllowed(it.attempts, true)) {
                 it.ack_job = terminal_job;
                 it.ack_durable = false;
                 it.state = .failed;
@@ -1113,19 +1305,47 @@ pub const Service = struct {
             // A terminal daemon job cannot be restarted under the same
             // idempotency token. A fresh attempt keeps the .skpart
             // checkpoint but receives a new job identity.
-            const token = self.newToken() catch null;
-            if (token) |fresh| {
-                self.allocator.free(it.client_token);
-                it.client_token = fresh;
-                it.job = 0;
-            }
+            // Deliberately NOT an IntentTxn rollback: when the retry
+            // rotation cannot be made durable, restoring the pre-mutation
+            // record would advertise a waiting_retry that no ledger backs
+            // and that a GUI restart silently drops. Downgrading to
+            // .failed keeps the row visible and manually retryable, and
+            // the ack fields stay mutated because the daemon job is
+            // terminal whether or not our write succeeded.
+            const fresh = self.newToken() catch {
+                it.ack_job = terminal_job;
+                it.ack_durable = false;
+                it.state = .failed;
+                it.retry_due_ms = 0;
+                self.replaceMessage(it, "could not allocate a durable retry identity");
+                if (self.writeIntentOk(it)) self.pumpAcksNow();
+                self.pump();
+                return;
+            };
+            const previous_token = it.client_token;
+            const previous_job = it.job;
+            it.client_token = fresh;
+            it.job = 0;
             it.state = .waiting_retry;
             it.ack_job = terminal_job;
             it.ack_durable = false;
+            it.retry_due_ms = nowMs() + RETRY_DELAY_MS;
             self.replaceMessage(it, message);
+            if (!self.writeIntentOk(it)) {
+                // Same rule as above: the identity fields roll back, but
+                // the state intentionally lands on .failed instead of the
+                // pre-mutation value — an unpersisted waiting_retry is a
+                // silent no-op after a restart.
+                it.client_token = previous_token;
+                it.job = previous_job;
+                it.state = .failed;
+                it.retry_due_ms = 0;
+                self.allocator.free(fresh);
+                return;
+            }
+            self.allocator.free(previous_token);
             self.notify("transfer deferred: {s}", .{std.fs.path.basename(it.dst_path)});
-            _ = self.writeIntentOk(it);
-            self.scheduleRetry();
+            self.armTransferRetry();
             self.pump();
             return;
         }
@@ -1398,13 +1618,14 @@ pub const Service = struct {
             self.connect();
             return;
         };
-        if (!conn.durable_copy) {
+        const current_durable_copy = conn.durable_copy and conn.durable_copy_v2;
+        if (!current_durable_copy) {
             if (!self.pumpAcks(conn)) return;
             var changed = false;
             var legacy_work = false;
             for (self.intents.items) |it| {
                 if (it.retired or it.ack_job != 0 or it.mediated) continue;
-                if (it.record_version < store.VERSION) {
+                if (it.record_version < store.VERSION and conn.durable_copy) {
                     // v2 service jobs already used their ledger token
                     // as an idempotency key and remain safe to reown on
                     // the daemon that created them.
@@ -1440,10 +1661,14 @@ pub const Service = struct {
         var n: usize = 0;
         for (self.intents.items, 0..) |it, i| {
             if (it.retired or it.mediated or it.paused or it.ack_job != 0) continue;
-            if (!conn.durable_copy and it.record_version >= store.VERSION) continue;
+            if (!current_durable_copy and it.record_version >= store.VERSION) continue;
             const state: ?xferqueue.State = switch (it.state) {
                 .submitting, .running => .running,
-                .queued => if (it.cancel_requested) null else .queued,
+                // A canceled queued record can only get here after a
+                // connection loss with a known daemon job. Re-submit
+                // the stable token, learn the live job id, then
+                // re-assert job_cancel in onReply.
+                .queued => if (it.cancel_requested and it.job == 0 and !it.submission_uncertain) null else .queued,
                 else => null,
             };
             if (state) |s| {
@@ -1465,12 +1690,24 @@ pub const Service = struct {
         const req = self.next_req;
         self.next_req +%= 1;
         if (self.next_req == 0) self.next_req = 1;
-        it.state = .submitting;
-        if (conn.durable_copy) it.record_version = store.VERSION;
+        if (conn.durable_copy_v2) it.record_version = store.VERSION;
         self.pending.append(self.allocator, .{ .req = req, .intent = it }) catch {
-            it.state = .queued;
+            it.state = .failed;
+            it.submission_uncertain = false;
+            it.retry_due_ms = 0;
+            self.replaceMessage(it, "could not queue transfer request");
+            self.writeIntent(it);
+            self.refreshViews();
             return true;
         };
+        it.state = .submitting;
+        it.submission_uncertain = true;
+        if (!self.writeIntentOk(it)) {
+            _ = self.pending.pop();
+            it.state = .failed;
+            it.submission_uncertain = false;
+            return true;
+        }
         conn.sendJson(.fs_op, .{
             .req = req,
             .op = "cross_copy",
@@ -1483,11 +1720,19 @@ pub const Service = struct {
             // Stable across attempts: a capable daemon restarts the
             // failed job (and its staged data) instead of duplicating.
             .transfer_token = it.token,
-        }) catch {
+        }) catch |err| {
             _ = self.pending.pop();
-            it.state = .queued;
-            self.requestDisconnect();
-            return false;
+            if (err == error.WriteFailed) {
+                self.requestDisconnect();
+                return false;
+            }
+            it.state = .failed;
+            it.submission_uncertain = false;
+            it.retry_due_ms = 0;
+            self.replaceMessage(it, "could not serialize transfer request");
+            self.writeIntent(it);
+            self.refreshViews();
+            return true;
         };
         return true;
     }
@@ -1498,12 +1743,9 @@ pub const Service = struct {
         for (self.intents.items) |it| {
             if (!std.mem.eql(u8, it.token, token)) continue;
             if (it.paused == paused) return;
-            const previous = it.paused;
+            const txn = IntentTxn.begin(self, it);
             it.paused = paused;
-            if (!self.writeIntentOk(it)) {
-                it.paused = previous;
-                return;
-            }
+            if (!txn.commit()) return;
             const live = it.job != 0 and (it.state == .running or it.state == .submitting);
             if (live) {
                 if (!self.sendJobControl(it.job, if (paused) "job_pause" else "job_resume"))
@@ -1536,22 +1778,91 @@ pub const Service = struct {
         self.persist();
     }
 
-    pub fn cancel(self: *Service, token: []const u8) void {
+    /// Persist cancellation before any caller removes volatile retry state.
+    pub fn cancel(self: *Service, token: []const u8) bool {
         for (self.intents.items) |it| {
             if (!std.mem.eql(u8, it.token, token)) continue;
-            if (it.job == 0 and (it.state == .queued or it.state == .waiting_retry or it.state == .failed)) {
-                it.state = .canceled;
-                it.retired = true;
-                if (!self.writeIntentOk(it)) return;
-                _ = self.retire(it);
-                self.pump();
-                return;
-            }
-            it.cancel_requested = true;
-            if (!self.writeIntentOk(it)) return;
-            if (it.job != 0 and !self.sendJobControl(it.job, "job_cancel")) self.requestDisconnect();
-            return;
+            return self.cancelIntent(it);
         }
+        return true;
+    }
+
+    /// The cancel waterfall: the first matching case owns the record,
+    /// and each case is its own durable transaction.
+    fn cancelIntent(self: *Service, it: *Intent) bool {
+        if (it.cancel_requested and it.state != .done and it.state != .canceled)
+            return self.reassertCancel(it);
+        if (cancelNeedsSubmissionRecovery(it))
+            return self.cancelUnresolvedSubmission(it);
+        if (it.mediated and it.user_copy and it.coordinator_set and
+            (it.state == .waiting_retry or it.state == .failed))
+        {
+            const scheduled = self.scheduleCancellationRecovery(it, "automatic retry canceled; cleaning destination staging data");
+            self.refreshViews();
+            return scheduled;
+        }
+        if (it.mediated and (it.state == .waiting_retry or it.state == .failed))
+            return self.cancelIdleMediated(it);
+        if (it.job == 0 and (it.state == .queued or it.state == .waiting_retry or it.state == .failed))
+            return self.cancelUnsubmitted(it);
+        return self.flagCancelRequested(it);
+    }
+
+    /// Already durably canceled: re-assert it toward the daemon rather
+    /// than writing the same record again.
+    fn reassertCancel(self: *Service, it: *Intent) bool {
+        if (it.state == .waiting_retry) self.armTransferRetry();
+        if (it.job != 0 and (it.state == .running or it.state == .submitting) and
+            !self.sendJobControl(it.job, "job_cancel")) self.requestDisconnect();
+        return true;
+    }
+
+    /// A lost start reply leaves job=0 even though the coordinator may
+    /// be running the copy. Keep the record until a driver reclaims the
+    /// stable token and reasserts job_cancel against the recovered id.
+    fn cancelUnresolvedSubmission(self: *Service, it: *Intent) bool {
+        const txn = IntentTxn.begin(self, it);
+        it.cancel_requested = true;
+        it.state = .waiting_retry;
+        it.retry_due_ms = nowMs();
+        it.claimed = false;
+        if (!txn.commit()) return false;
+        self.armTransferRetry();
+        self.refreshViews();
+        return true;
+    }
+
+    /// A mediated transfer with no daemon work left: cancel it outright.
+    fn cancelIdleMediated(self: *Service, it: *Intent) bool {
+        const txn = IntentTxn.begin(self, it);
+        it.cancel_requested = true;
+        it.retry_due_ms = 0;
+        it.state = .canceled;
+        it.retired = true;
+        if (!txn.commit()) return false;
+        if (it.ack_job == 0 and !self.childManifestExists(it.token, it.batch_token)) self.removeIntent(it);
+        self.refreshViews();
+        return true;
+    }
+
+    /// Never handed to a daemon job: cancel and retire it directly.
+    fn cancelUnsubmitted(self: *Service, it: *Intent) bool {
+        const txn = IntentTxn.begin(self, it);
+        it.state = .canceled;
+        it.retired = true;
+        if (!txn.commit()) return false;
+        _ = self.retire(it);
+        self.pump();
+        return true;
+    }
+
+    /// Live daemon work: record the request, then ask the daemon.
+    fn flagCancelRequested(self: *Service, it: *Intent) bool {
+        const txn = IntentTxn.begin(self, it);
+        it.cancel_requested = true;
+        if (!txn.commit()) return false;
+        if (it.job != 0 and !self.sendJobControl(it.job, "job_cancel")) self.requestDisconnect();
+        return true;
     }
 
     /// job_cancel / job_pause / job_resume toward a live job.
@@ -1607,8 +1918,10 @@ pub const Service = struct {
         var out: std.ArrayList(QueueRow) = .empty;
         for (self.intents.items) |it| {
             // Retired records are bookkeeping, and mediated ones are
-            // rendered by the view that runs them.
-            if (it.retired or (it.mediated and (it.state != .failed or it.claimed))) continue;
+            // rendered by the view that runs them except while no live
+            // attempt exists and the logical retry must remain visible.
+            if (it.retired) continue;
+            if (it.mediated and it.state != .waiting_retry and (it.state != .failed or it.claimed)) continue;
             // One panel per record: the pane that submitted it, or --
             // for records without a living submitter (recovery,
             // watch sync-backs, a closed pane) -- the primary view.
@@ -1634,6 +1947,8 @@ pub const Service = struct {
                 .batch_id = it.batch_id,
                 .batch_total = it.batch_total,
                 .delete_src_after = it.delete_src_after,
+                .attempts = it.attempts,
+                .retry_due_ms = it.retry_due_ms,
             });
         }
         return out.toOwnedSlice(allocator);
@@ -1668,6 +1983,7 @@ pub const Service = struct {
             .coordinator_set = it.coordinator_set,
             .ack_host = it.ack_host,
             .ack_job = it.ack_job,
+            .cancel_requested = it.cancel_requested,
             .retired = it.retired,
             .attempts = it.attempts,
             .state = it.state,
@@ -1694,14 +2010,22 @@ pub const Service = struct {
 
     fn handToDriver(self: *Service, it: *Intent) void {
         if (it.claimed) return;
+        if (it.state == .waiting_retry and it.retry_due_ms > nowMs()) {
+            self.armTransferRetry();
+            return;
+        }
         if (it.ack_job == 0 and (it.retired or it.state == .done or it.state == .canceled)) return;
         if (it.state == .failed and it.ack_job == 0) return;
         const driver = if (self.drivers.items.len > 0) self.drivers.items[0] else return;
         self.handIntentTo(driver, it);
     }
 
-    fn handIntentTo(_: *Service, driver: Driver, it: *Intent) void {
+    fn handIntentTo(self: *Service, driver: Driver, it: *Intent) void {
         if (it.claimed) return;
+        if (it.state == .waiting_retry and it.retry_due_ms > nowMs()) {
+            self.armTransferRetry();
+            return;
+        }
         if (it.ack_job == 0 and (it.retired or it.state == .done or it.state == .canceled)) return;
         if (it.state == .failed and it.ack_job == 0) return;
         it.claimed = true;
@@ -2344,22 +2668,51 @@ pub const Service = struct {
         return it.attempts;
     }
 
+    pub fn mediatedRetryDue(self: *Service, token: []const u8) i64 {
+        const it = self.intentByToken(token) orelse return 0;
+        return it.retry_due_ms;
+    }
+
     pub fn requestMediatedCancel(self: *Service, token: []const u8) bool {
         const it = self.intentByToken(token) orelse return false;
+        const txn = IntentTxn.begin(self, it);
         it.cancel_requested = true;
-        self.writeIntent(it);
-        return !self.durability_error;
+        return txn.commit();
     }
 
     /// Cancel work that has not been submitted to a daemon yet.
     pub fn cancelMediatedQueued(self: *Service, token: []const u8) bool {
         const it = self.intentByToken(token) orelse return false;
+        if (it.submission_uncertain) return false;
+        const txn = IntentTxn.begin(self, it);
         it.cancel_requested = true;
+        it.submission_uncertain = false;
         it.state = .canceled;
         it.retired = true;
-        if (!self.writeIntentOk(it)) return false;
+        if (!txn.commit()) return false;
         if (!self.childManifestExists(it.token, it.batch_token)) self.removeIntent(it);
         self.refreshViews();
+        return true;
+    }
+
+    /// Complete cancellation after an authoritative start rejection.
+    pub fn cancelRejectedMediated(self: *Service, token: []const u8) bool {
+        const it = self.intentByToken(token) orelse return false;
+        if (!it.cancel_requested) return false;
+        const txn = IntentTxn.begin(self, it);
+        it.submission_uncertain = false;
+        it.state = .canceled;
+        it.retired = true;
+        if (!txn.commit()) return false;
+        if (!self.childManifestExists(it.token, it.batch_token)) self.removeIntent(it);
+        self.refreshViews();
+        return true;
+    }
+
+    /// Mark an explicit start rejection as proof that no submission is live.
+    pub fn mediatedSubmissionRejected(self: *Service, token: []const u8) bool {
+        const it = self.intentByToken(token) orelse return false;
+        it.submission_uncertain = false;
         return true;
     }
 
@@ -2375,7 +2728,8 @@ pub const Service = struct {
 
     pub fn mediatedRunnable(self: *Service, token: []const u8) bool {
         const it = self.intentByToken(token) orelse return false;
-        return !it.retired and it.state != .failed and it.state != .canceled and it.state != .done;
+        return !it.retired and it.state != .failed and it.state != .canceled and it.state != .done and
+            (it.state != .waiting_retry or it.retry_due_ms <= nowMs());
     }
 
     pub fn mediatedAckPending(self: *Service, token: []const u8) bool {
@@ -2406,9 +2760,22 @@ pub const Service = struct {
     pub fn mediatedJobStarted(self: *Service, token: []const u8, job: u64) bool {
         const it = self.intentByToken(token) orelse return false;
         it.job = job;
+        it.submission_uncertain = false;
         it.state = .running;
+        it.retry_due_ms = 0;
         self.writeIntent(it);
         return !self.durability_error;
+    }
+
+    /// Fence the interval between sending a start request and learning
+    /// its job id, so cancellation waits for and targets the real job.
+    pub fn mediatedSubmissionStarted(self: *Service, token: []const u8) bool {
+        const it = self.intentByToken(token) orelse return false;
+        if (it.retired or it.state == .canceled or it.state == .done) return false;
+        it.record_version = store.VERSION;
+        it.state = .submitting;
+        it.submission_uncertain = true;
+        return self.writeIntentOk(it);
     }
 
     /// Persist terminal acknowledgment state before retry/retirement.
@@ -2417,9 +2784,10 @@ pub const Service = struct {
         if (!self.replaceIntentString(&it.ack_host, host)) return false;
         it.ack_job = job;
         it.ack_durable = false;
-        const terminal = finish or it.cancel_requested;
+        it.submission_uncertain = false;
+        const terminal = finish;
         it.retired = terminal;
-        it.state = if (it.cancel_requested) .canceled else if (terminal) .done else .waiting_retry;
+        it.state = if (terminal and it.cancel_requested) .canceled else if (terminal) .done else .waiting_retry;
         if (!self.writeIntentOk(it)) {
             // A later sweep retries the write and hands the durable ACK
             // back to a driver once it succeeds.
@@ -2438,7 +2806,6 @@ pub const Service = struct {
     pub fn mediatedAcked(self: *Service, token: []const u8, job: u64) bool {
         const it = self.intentByToken(token) orelse return false;
         if (it.ack_job != job) return false;
-        const resume_after_ack = !it.retired and !it.claimed and it.state == .waiting_retry;
         it.ack_job = 0;
         it.ack_durable = false;
         if (!self.replaceIntentString(&it.ack_host, "")) return false;
@@ -2449,7 +2816,6 @@ pub const Service = struct {
                 self.removeIntent(it);
             }
         } else {
-            if (resume_after_ack) it.state = .queued;
             self.writeIntent(it);
         }
         self.refreshViews();
@@ -2458,17 +2824,32 @@ pub const Service = struct {
 
     /// Record one failed mediated attempt and decide whether it may
     /// retry automatically. A spent record remains visible and durable.
-    pub fn recordMediatedFailure(self: *Service, token: []const u8, message: []const u8, max_attempts: u8) bool {
+    pub fn recordMediatedFailure(self: *Service, token: []const u8, message: []const u8, retryable: bool) bool {
         const it = self.intentByToken(token) orelse return false;
+        if (!retryable) {
+            self.replaceMessage(it, message);
+            it.retry_due_ms = 0;
+            it.state = .failed;
+            it.submission_uncertain = false;
+            it.claimed = false;
+            if (!self.writeIntentOk(it)) return false;
+            self.refreshViews();
+            return false;
+        }
         it.attempts +|= 1;
         self.replaceMessage(it, message);
-        const retry = it.attempts < max_attempts;
+        // Re-submitting an uncertain idempotency token recovers the
+        // same possible daemon job; it is cancellation/source-safety
+        // resolution, not permission to create another work attempt.
+        const retry = it.submission_uncertain or automaticRetryAllowed(it.attempts, true);
         it.state = if (retry) .waiting_retry else .failed;
+        it.retry_due_ms = if (retry) nowMs() + RETRY_DELAY_MS else 0;
         if (!retry) it.claimed = false;
         if (!self.writeIntentOk(it)) {
             if (retry) it.claimed = false;
             return false;
         }
+        if (retry) self.armTransferRetry();
         self.refreshViews();
         return retry and !self.durability_error;
     }
@@ -2477,6 +2858,7 @@ pub const Service = struct {
         const it = self.intentByToken(token) orelse return;
         self.replaceMessage(it, message);
         it.state = .failed;
+        it.retry_due_ms = 0;
         if (unclaim) it.claimed = false;
         self.writeIntent(it);
     }
@@ -2488,7 +2870,9 @@ pub const Service = struct {
         self.allocator.free(it.client_token);
         it.client_token = fresh;
         it.attempts = 0;
+        it.retry_due_ms = 0;
         it.state = .queued;
+        it.submission_uncertain = false;
         it.retired = false;
         it.claimed = false;
         if (!self.writeIntentOk(it)) return;
@@ -2505,8 +2889,10 @@ pub const Service = struct {
         self.allocator.free(it.client_token);
         it.client_token = fresh;
         it.attempts = 0;
+        it.retry_due_ms = 0;
         it.job = 0;
         it.state = .queued;
+        it.submission_uncertain = false;
         it.retired = false;
         if (!self.writeIntentOk(it)) {
             it.claimed = false;
@@ -2519,6 +2905,7 @@ pub const Service = struct {
     /// daemon acknowledgment and delete the record only after it lands.
     pub fn dismissMediated(self: *Service, token: []const u8) bool {
         const it = self.intentByToken(token) orelse return true;
+        if (it.cancel_requested and it.state != .canceled and it.state != .done) return false;
         if (it.ack_job == 0) {
             it.retired = true;
             it.state = .canceled;
@@ -2536,6 +2923,7 @@ pub const Service = struct {
     pub fn useMediatedFallback(self: *Service, token: []const u8) bool {
         const it = self.intentByToken(token) orelse return false;
         it.coordinator_set = false;
+        it.submission_uncertain = false;
         if (!self.replaceIntentString(&it.coordinator_host, "")) return false;
         self.writeIntent(it);
         return !self.durability_error;
@@ -2554,12 +2942,64 @@ pub const Service = struct {
         it.client_token = fresh;
         it.coordinator_set = true;
         it.job = 0;
+        it.submission_uncertain = false;
         if (count_attempt) it.attempts +|= 1;
+        it.state = .waiting_retry;
+        it.retry_due_ms = nowMs() + RETRY_DELAY_MS;
         if (!self.writeIntentOk(it)) {
             it.claimed = false;
             return false;
         }
+        self.armTransferRetry();
         return true;
+    }
+
+    /// Fold a lost coordinator into the same bounded retry policy as a
+    /// structured transport failure. Work that had not started waits but
+    /// does not spend an attempt.
+    pub fn recordMediatedTransportLoss(self: *Service, token: []const u8, message: []const u8, attempt_started: bool) bool {
+        const it = self.intentByToken(token) orelse return false;
+        if (it.retired or it.state == .done or it.state == .canceled or it.state == .failed)
+            return false;
+        if (it.state == .waiting_retry) {
+            // The view-side retry object died with its HostConn. Drop
+            // that volatile claim so this or another driver can rebuild
+            // it from the durable record when the deadline expires.
+            it.claimed = false;
+            if (attempt_started or it.job != 0) {
+                it.record_version = store.VERSION;
+                it.submission_uncertain = true;
+            }
+            if (!self.writeIntentOk(it)) return false;
+            self.armTransferRetry();
+            return true;
+        }
+        self.replaceMessage(it, message);
+        if (attempt_started and !it.cancel_requested) it.attempts +|= 1;
+        const unresolved = it.submission_uncertain or attempt_started or it.job != 0;
+        if (unresolved) it.record_version = store.VERSION;
+        const retry = it.cancel_requested or unresolved or automaticRetryAllowed(it.attempts, true);
+        it.state = if (retry) .waiting_retry else .failed;
+        it.retry_due_ms = if (retry) nowMs() + RETRY_DELAY_MS else 0;
+        it.submission_uncertain = unresolved;
+        // Connection teardown destroys every live view-side attempt,
+        // including one that is waiting only to re-assert cancellation.
+        it.claimed = false;
+        if (!self.writeIntentOk(it)) {
+            return false;
+        }
+        if (retry) self.armTransferRetry();
+        self.refreshViews();
+        return retry;
+    }
+
+    /// Retry durable cleanup after a canceled daemon job ended ambiguously.
+    pub fn recordMediatedCancellationFailure(self: *Service, token: []const u8, message: []const u8) bool {
+        const it = self.intentByToken(token) orelse return false;
+        if (!it.cancel_requested or it.ack_job != 0) return false;
+        const scheduled = self.scheduleCancellationRecovery(it, message);
+        self.refreshViews();
+        return scheduled;
     }
 
     pub fn setMediatedPaused(self: *Service, token: []const u8, paused: bool) bool {
@@ -2579,6 +3019,7 @@ pub const Service = struct {
         const it = self.intentByToken(token) orelse return true;
         it.retired = true;
         it.state = if (it.cancel_requested) .canceled else .done;
+        it.submission_uncertain = false;
         if (!self.writeIntentOk(it)) return false;
         // This exact copy just succeeded: siblings still claiming these
         // endpoints failed (a crashed session's leftovers) are moot.
@@ -2874,6 +3315,15 @@ test "a durable batch materializes deterministic child records" {
     try t.expect(child.delete_src_after and child.coordinator_set);
     try t.expectEqualStrings("/source/b", child.src_path);
     try t.expectEqualStrings("relay", child.coordinator_host);
+    try t.expect(service.mediatedSubmissionStarted(child_token));
+    _ = service.cancel(child_token);
+    const canceling = service.intentByToken(child_token) orelse return error.ChildMissing;
+    try t.expect(canceling.cancel_requested and !canceling.retired);
+    try t.expectEqual(store.State.submitting, canceling.state);
+    const canceling_record = (try store.readToken(t.allocator, .intent, child_token)) orelse return error.ChildMissing;
+    defer canceling_record.deinit();
+    try t.expect(canceling_record.value.intent.cancel_requested and !canceling_record.value.intent.retired);
+    try t.expectEqual(store.State.submitting, canceling_record.value.intent.state);
     try t.expect(service.finishMediated(child_token));
     try t.expectEqual(@as(usize, 1), service.intents.items.len);
 
@@ -2913,6 +3363,397 @@ test "a durable batch materializes deterministic child records" {
     try t.expect(recovered.finishUserBatch(batch_token_copy));
     try t.expectEqual(@as(usize, 0), recovered.batches.items.len);
     try t.expectEqual(@as(usize, 0), recovered.intents.items.len);
+}
+
+test "automatic retry policy is transient-only and allows three retries" {
+    try std.testing.expect(retryableFailureKind("transport"));
+    try std.testing.expect(retryableFailureKind("unreachable"));
+    try std.testing.expect(!retryableFailureKind("permanent"));
+    try std.testing.expect(!retryableFailureKind(""));
+    try std.testing.expect(automaticRetryAllowed(1, true));
+    try std.testing.expect(automaticRetryAllowed(3, true));
+    try std.testing.expect(!automaticRetryAllowed(4, true));
+    try std.testing.expect(!automaticRetryAllowed(1, false));
+}
+
+/// A fully-initialized test Intent, off the ledger.
+///
+/// This build is ReleaseFast only, so `var it: Intent = undefined` plus
+/// a few assignments leaves real stack garbage in every other field --
+/// including the ones a predicate under test reads. Going through
+/// `dupIntent` gives every field its declared default instead. The
+/// handle is inert (lock_fd -1, empty paths); free with
+/// `destroyTestIntent`.
+fn testIntent(service: *Service, value: store.Intent) !*Intent {
+    const a = service.allocator;
+    const token = try a.dupe(u8, value.token);
+    errdefer a.free(token);
+    const json_path = try a.dupe(u8, "");
+    errdefer a.free(json_path);
+    const lock_path = try a.dupe(u8, "");
+    errdefer a.free(lock_path);
+    return service.dupIntent(.{
+        .allocator = a,
+        .rtype = .intent,
+        .token = token,
+        .json_path = json_path,
+        .lock_path = lock_path,
+        .lock_fd = -1,
+    }, value);
+}
+
+fn destroyTestIntent(it: *Intent, allocator: std.mem.Allocator) void {
+    it.handle.release();
+    it.destroy(allocator);
+}
+
+test "cancellation retries only when daemon work may still exist" {
+    const t = std.testing;
+    var service = Service{ .allocator = t.allocator };
+    const it = try testIntent(&service, .{
+        .token = "retry-eligible",
+        .state = .waiting_retry,
+        .cancel_requested = true,
+    });
+    defer destroyTestIntent(it, t.allocator);
+    try t.expect(!transferRetryEligible(it));
+
+    it.job = 41;
+    try t.expect(transferRetryEligible(it));
+
+    it.job = 0;
+    it.submission_uncertain = true;
+    try t.expect(transferRetryEligible(it));
+
+    it.submission_uncertain = false;
+    it.mediated = true;
+    try t.expect(transferRetryEligible(it));
+}
+
+test "cancellation retains an unresolved submitted attempt" {
+    const t = std.testing;
+    var service = Service{ .allocator = t.allocator };
+    const it = try testIntent(&service, .{
+        .token = "cancel-uncertain",
+        .state = .waiting_retry,
+        .submission_uncertain = true,
+    });
+    defer destroyTestIntent(it, t.allocator);
+    try t.expect(cancelNeedsSubmissionRecovery(it));
+
+    it.ack_job = 9;
+    try t.expect(!cancelNeedsSubmissionRecovery(it));
+    it.ack_job = 0;
+    it.submission_uncertain = false;
+    try t.expect(!cancelNeedsSubmissionRecovery(it));
+    it.submission_uncertain = true;
+    it.state = .failed;
+    try t.expect(!cancelNeedsSubmissionRecovery(it));
+    it.state = .queued;
+    try t.expect(cancelNeedsSubmissionRecovery(it));
+}
+
+test "recovered retry waits and repeated transport loss spends one bounded attempt" {
+    const t = std.testing;
+    const old = if (c.getenv("XDG_STATE_HOME")) |value|
+        try t.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
+    else
+        null;
+    defer {
+        if (old) |value| {
+            var z: [4096:0]u8 = undefined;
+            const restored = std.fmt.bufPrintZ(&z, "{s}", .{value}) catch unreachable;
+            _ = c.setenv("XDG_STATE_HOME", restored.ptr, 1);
+            t.allocator.free(value);
+        } else {
+            _ = c.unsetenv("XDG_STATE_HOME");
+        }
+    }
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_buf: [4096:0]u8 = undefined;
+    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
+
+    var service = Service{ .allocator = t.allocator };
+    const handle = (try store.open(t.allocator, .intent, "retry-test")).?;
+    const before = nowMs();
+    const it = try service.dupIntent(handle, .{
+        .token = "retry-test",
+        .state = .waiting_retry,
+        .attempts = 2,
+        .mediated = true,
+    });
+    try service.intents.append(t.allocator, it);
+    defer {
+        if (service.transfer_retry_source != 0) _ = c.g_source_remove(service.transfer_retry_source);
+        service.intents.deinit(t.allocator);
+        _ = it.handle.destroyRecord();
+        it.destroy(t.allocator);
+    }
+    try t.expectEqual(store.State.waiting_retry, it.state);
+    try t.expectEqual(@as(u8, 2), it.attempts);
+    try t.expect(it.retry_due_ms >= before + RETRY_DELAY_MS);
+
+    it.state = .running;
+    it.retry_due_ms = 0;
+    it.claimed = true;
+    try t.expect(service.recordMediatedTransportLoss(it.token, "connection lost", true));
+    try t.expectEqual(@as(u8, 3), it.attempts);
+    try t.expectEqual(store.State.waiting_retry, it.state);
+    try t.expect(!it.claimed);
+    it.claimed = true;
+    try t.expect(service.recordMediatedTransportLoss(it.token, "connection lost again", true));
+    try t.expectEqual(@as(u8, 3), it.attempts);
+    try t.expect(!it.claimed);
+
+    it.state = .running;
+    it.retry_due_ms = 0;
+    it.submission_uncertain = false;
+    try t.expect(!service.recordMediatedFailure(it.token, "structured transport failure", true));
+    try t.expectEqual(@as(u8, 4), it.attempts);
+    try t.expectEqual(store.State.failed, it.state);
+    try t.expectEqual(@as(i64, 0), it.retry_due_ms);
+
+    it.state = .running;
+    it.retry_due_ms = 0;
+    it.claimed = true;
+    it.cancel_requested = true;
+    try t.expect(service.recordMediatedTransportLoss(it.token, "connection lost while canceling", true));
+    try t.expectEqual(@as(u8, 4), it.attempts);
+    try t.expectEqual(store.State.waiting_retry, it.state);
+    try t.expect(!it.claimed);
+}
+
+test "direct transport loss waits and exhausts the same retry budget" {
+    const t = std.testing;
+    var service = Service{ .allocator = t.allocator };
+    var handle = store.Handle{
+        .allocator = t.allocator,
+        .rtype = .intent,
+        .token = try t.allocator.dupe(u8, ""),
+        .json_path = try t.allocator.dupe(u8, ""),
+        .lock_path = try t.allocator.dupe(u8, ""),
+        .lock_fd = -1,
+    };
+    const it = service.dupIntent(handle, .{
+        .token = "direct-retry",
+        .state = .running,
+        .dst = .{ .path = "/destination" },
+    }) catch |err| {
+        handle.release();
+        return err;
+    };
+    defer {
+        it.handle.release();
+        it.destroy(t.allocator);
+    }
+
+    var failure: u8 = 1;
+    while (failure <= AUTO_RETRIES) : (failure += 1) {
+        const before = nowMs();
+        service.recordDirectTransportLoss(it);
+        try t.expectEqual(failure, it.attempts);
+        try t.expectEqual(store.State.waiting_retry, it.state);
+        try t.expect(it.retry_due_ms >= before + RETRY_DELAY_MS);
+        it.state = .running;
+    }
+    service.recordDirectTransportLoss(it);
+    try t.expectEqual(AUTO_RETRIES + 1, it.attempts);
+    try t.expectEqual(store.State.failed, it.state);
+    try t.expectEqual(@as(i64, 0), it.retry_due_ms);
+
+    it.state = .running;
+    it.job = 91;
+    it.cancel_requested = true;
+    service.recordDirectTransportLoss(it);
+    try t.expectEqual(AUTO_RETRIES + 1, it.attempts);
+    try t.expectEqual(store.State.waiting_retry, it.state);
+    try t.expect(it.retry_due_ms > 0);
+}
+
+test "unresolved cancellation retains both recovery ledgers" {
+    const t = std.testing;
+    const old = if (c.getenv("XDG_STATE_HOME")) |value|
+        try t.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
+    else
+        null;
+    defer {
+        if (old) |value| {
+            var z: [4096:0]u8 = undefined;
+            const restored = std.fmt.bufPrintZ(&z, "{s}", .{value}) catch unreachable;
+            _ = c.setenv("XDG_STATE_HOME", restored.ptr, 1);
+            t.allocator.free(value);
+        } else {
+            _ = c.unsetenv("XDG_STATE_HOME");
+        }
+    }
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_buf: [4096:0]u8 = undefined;
+    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
+
+    var service = Service{ .allocator = t.allocator, .shutting_down = true };
+    const handle = (try store.open(t.allocator, .intent, "cancel-unresolved")).?;
+    const it = try service.dupIntent(handle, .{
+        .token = "cancel-unresolved",
+        .state = .running,
+        .job = 91,
+        .cancel_requested = true,
+        .dst = .{ .path = "/destination" },
+    });
+    try service.intents.append(t.allocator, it);
+    defer {
+        service.intents.deinit(t.allocator);
+        _ = it.handle.destroyRecord();
+        it.destroy(t.allocator);
+    }
+
+    service.complete(it, false, false, "source identity could not be proven", false);
+    try t.expectEqual(store.State.waiting_retry, it.state);
+    try t.expect(it.retry_due_ms > 0);
+    try t.expect(!it.retired);
+    try t.expectEqual(@as(u64, 0), it.ack_job);
+    try t.expectEqual(@as(u64, 91), it.job);
+    try t.expect(!service.dismissMediated(it.token));
+    const record = (try store.readToken(t.allocator, .intent, it.token)) orelse return error.MissingRecord;
+    defer record.deinit();
+    try t.expect(record.value.intent.cancel_requested);
+    try t.expect(!record.value.intent.retired);
+    try t.expectEqual(store.State.waiting_retry, record.value.intent.state);
+    try t.expectEqual(@as(u64, 91), record.value.intent.job);
+}
+
+test "repeated cancellation keeps an unresolved mediated recovery" {
+    const t = std.testing;
+    var service = Service{ .allocator = t.allocator, .shutting_down = true };
+    defer service.intents.deinit(t.allocator);
+    const it = try testIntent(&service, .{
+        .token = "cancel-repeat",
+        .mediated = true,
+        .state = .waiting_retry,
+        .job = 91,
+        .cancel_requested = true,
+    });
+    defer destroyTestIntent(it, t.allocator);
+    try service.intents.append(t.allocator, it);
+    defer {
+        if (service.transfer_retry_source != 0) _ = c.g_source_remove(service.transfer_retry_source);
+    }
+
+    _ = service.cancel("cancel-repeat");
+    try t.expectEqual(store.State.waiting_retry, it.state);
+    try t.expect(!it.retired);
+    try t.expectEqual(@as(u64, 91), it.job);
+    try t.expect(it.retry_due_ms > 0);
+}
+
+test "canceling a scheduled daemon retry durably rotates cleanup identity" {
+    const t = std.testing;
+    const old_state = if (c.getenv("XDG_STATE_HOME")) |value|
+        try t.allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(value))))
+    else
+        null;
+    defer {
+        if (old_state) |value| {
+            var z: [4096:0]u8 = undefined;
+            const restored = std.fmt.bufPrintZ(&z, "{s}", .{value}) catch unreachable;
+            _ = c.setenv("XDG_STATE_HOME", restored.ptr, 1);
+            t.allocator.free(value);
+        } else {
+            _ = c.unsetenv("XDG_STATE_HOME");
+        }
+    }
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var state_buf: [4096:0]u8 = undefined;
+    const state = try std.fmt.bufPrintZ(&state_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = c.setenv("XDG_STATE_HOME", state.ptr, 1);
+
+    var service = Service{ .allocator = t.allocator, .shutting_down = true };
+    const handle = (try store.open(t.allocator, .intent, "cancel-scheduled")).?;
+    const it = try service.dupIntent(handle, .{
+        .token = "cancel-scheduled",
+        .client_token = "old-attempt",
+        .state = .waiting_retry,
+        .job = 91,
+        .ack_job = 91,
+        .ack_host = "relay",
+        .mediated = true,
+        .user_copy = true,
+        .coordinator_set = true,
+    });
+    it.record_version = 5;
+    try service.intents.append(t.allocator, it);
+    it.claimed = true;
+    defer {
+        service.intents.deinit(t.allocator);
+        _ = it.handle.destroyRecord();
+        it.destroy(t.allocator);
+    }
+
+    try t.expect(service.cancel(it.token));
+    try t.expect(it.cancel_requested);
+    try t.expectEqual(store.State.waiting_retry, it.state);
+    try t.expectEqual(@as(u64, 0), it.ack_job);
+    try t.expect(!it.claimed);
+    try t.expectEqual(store.VERSION, it.record_version);
+    try t.expect(!std.mem.eql(u8, it.client_token, "old-attempt"));
+    const record = (try store.readToken(t.allocator, .intent, it.token)) orelse return error.MissingRecord;
+    defer record.deinit();
+    try t.expect(record.value.intent.cancel_requested);
+    try t.expectEqual(store.State.waiting_retry, record.value.intent.state);
+    try t.expectEqual(@as(u64, 0), record.value.intent.ack_job);
+    try t.expectEqual(store.VERSION, record.value.version);
+}
+
+test "failed scheduled-cancel persistence restores every retry field" {
+    const t = std.testing;
+    var service = Service{ .allocator = t.allocator, .shutting_down = true };
+    var handle = store.Handle{
+        .allocator = t.allocator,
+        .rtype = .intent,
+        .token = try t.allocator.dupe(u8, "cancel-rollback"),
+        .json_path = try t.allocator.dupe(u8, "/proc/self/sketerm-cancel-rollback.json"),
+        .lock_path = try t.allocator.dupe(u8, "/proc/self/sketerm-cancel-rollback.lock"),
+        .lock_fd = -1,
+    };
+    const it = service.dupIntent(handle, .{
+        .token = "cancel-rollback",
+        .client_token = "old-attempt",
+        .state = .waiting_retry,
+        .job = 91,
+        .ack_job = 91,
+        .ack_host = "relay",
+        .message = "retry pending",
+        .mediated = true,
+        .user_copy = true,
+        .coordinator_set = true,
+    }) catch |err| {
+        handle.release();
+        return err;
+    };
+    try service.intents.append(t.allocator, it);
+    it.claimed = true;
+    defer {
+        service.intents.deinit(t.allocator);
+        it.handle.release();
+        it.destroy(t.allocator);
+    }
+
+    try t.expect(!service.cancel(it.token));
+    try t.expect(!it.cancel_requested);
+    try t.expectEqual(store.State.waiting_retry, it.state);
+    try t.expectEqual(@as(u64, 91), it.ack_job);
+    try t.expect(it.claimed);
+    try t.expectEqualStrings("old-attempt", it.client_token);
+    try t.expectEqualStrings("retry pending", it.message);
+    // A second click must retry the durable write rather than take the
+    // already-canceled fast path after the first failed mutation.
+    try t.expect(!service.cancel(it.token));
+    try t.expect(!it.cancel_requested);
+    try t.expectEqual(@as(u64, 91), it.ack_job);
 }
 
 pub fn acquire(allocator: std.mem.Allocator, notify_ctx: ?*anyopaque, notify_fn: ?NotifyFn) !*Service {

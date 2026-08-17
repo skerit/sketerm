@@ -7907,7 +7907,7 @@ pub const WebFace = struct {
                 d.canceled = true;
                 if (d.upload_token) |token| {
                     if (self.ownerWindow()) |w| {
-                        if (w.transferService()) |svc| svc.cancel(token);
+                        if (w.transferService()) |svc| _ = svc.cancel(token);
                     }
                 }
                 // The tick sees the canceled state and removes the row.

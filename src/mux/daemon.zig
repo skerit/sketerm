@@ -2028,6 +2028,16 @@ pub const FsJob = struct {
     acknowledged: bool = false,
     ack_req: u32 = 0,
     terminal_pending: bool = false,
+    /// A durable move cancel fence is waiting for the helper to restore
+    /// an intact quarantine or finish cleanup, then publish terminal state.
+    cancel_pending: bool = false,
+    /// The daemon never blocks its poll loop on the helper's install/delete
+    /// election. This stays set until a nonblocking lock attempt persists
+    /// cancellation or observes that the helper already committed.
+    cancel_election_pending: bool = false,
+    cancel_client: ?*Client = null,
+    cancel_req: u32 = 0,
+    cancel_reply_start: bool = false,
     /// Helper died after a durable cross-move boundary; reap replaces
     /// it with a recovery helper before exposing a terminal failure.
     restart_pending: bool = false,
@@ -2137,7 +2147,8 @@ pub const FsJob = struct {
     }
 
     pub fn retentionReady(self: *const FsJob) bool {
-        return self.finished() and !self.terminal_pending and self.out_fd < 0;
+        return self.finished() and !self.cancel_pending and !self.cancel_election_pending and
+            !self.terminal_pending and self.out_fd < 0;
     }
 };
 
@@ -3025,6 +3036,7 @@ pub const Daemon = struct {
     const restoreFsJobs = daemon_fsjobs.restoreFsJobs;
     const refreshDetachedFsJobs = daemon_fsjobs.refreshDetachedFsJobs;
     const restartCrashedFsJobs = daemon_fsjobs.restartCrashedFsJobs;
+    const pumpFsJobCancelElections = daemon_fsjobs.pumpFsJobCancelElections;
     const fsJobEmit = daemon_fsjobs.fsJobEmit;
     const fsJobReadable = daemon_fsjobs.fsJobReadable;
     const MetaKV = daemon_fsjobs.MetaKV;
@@ -5807,8 +5819,16 @@ pub const Daemon = struct {
         // event route dies with it. Finished jobs are retained for
         // job_list, bounded, oldest dropped first.
         {
+            self.pumpFsJobCancelElections();
             self.restartCrashedFsJobs();
             for (self.fs_jobs.items) |j| {
+                if (j.cancel_client) |cancel_client| {
+                    if (cancel_client.dead) {
+                        j.cancel_client = null;
+                        j.cancel_req = 0;
+                        j.cancel_reply_start = false;
+                    }
+                }
                 if (j.owner) |o| {
                     if (o.dead) {
                         // pid > 0 is load-bearing: kill(-0) would signal
@@ -5881,10 +5901,7 @@ pub const Daemon = struct {
             while (token_count > MAX_TOKEN_JOBS and i < self.fs_jobs.items.len) {
                 const j = self.fs_jobs.items[i];
                 if (j.retentionReady() and j.client_token.len > 0 and j.acknowledged) {
-                    var record_buf: [4096]u8 = undefined;
-                    if (std.fmt.bufPrintZ(&record_buf, "{s}/{d}.json", .{ self.fs_job_dir, j.id })) |record| {
-                        _ = c.unlink(record.ptr);
-                    } else |_| {}
+                    self.deleteFsJobJournal(j.id);
                     _ = self.fs_jobs.orderedRemove(i);
                     j.deinit(false);
                     token_count -= 1;

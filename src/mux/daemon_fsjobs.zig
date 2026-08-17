@@ -8,6 +8,7 @@ const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const wire = @import("wire.zig");
 const fsjournal = @import("fsjournal.zig");
+const fsjob = @import("fsjob.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
@@ -34,6 +35,31 @@ const PREVIEW_ASSET_TTL_MS: i64 = 300_000;
 /// daemon_serve's routing asks here rather than keeping its own list.
 pub fn jobOpFor(op: []const u8) ?FsJob.Op {
     return std.meta.stringToEnum(FsJob.Op, op);
+}
+
+fn queueFsJobStartReply(self: *Daemon, cl: *Client, req: u32, job: *FsJob) void {
+    job.owner = cl;
+    cl.queueJson(.fs_reply, .{
+        .req = req,
+        .ok = true,
+        .job = job.id,
+        .state = @tagName(job.state),
+        .done = job.done,
+        .total = job.total,
+        .resumed_from = job.resumed_from,
+        .file = job.cur_file[0..job.cur_file_len],
+        .files_done = job.files_done,
+        .files_total = job.files_total,
+        .message = job.message[0..job.message_len],
+        .kind = job.err_kind[0..job.err_kind_len],
+    });
+    if (job.finished()) {
+        fsJobEmit(self, job, switch (job.state) {
+            .done => "done",
+            .canceled => "canceled",
+            else => "error",
+        });
+    }
 }
 
 pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
@@ -92,37 +118,77 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
             } else if (!same_attempt and existing.state == .failed and r.@"resume" and
                 (op == .cross_copy or op == .copy))
             {
-                if (restartFsJobFromJournal(self, cl, existing, r.client_token)) |replacement|
+                if (r.cancel_requested and op == .cross_copy) {
+                    const cancel_result = fsjournal.tryRequestRecoveryCancel(self.allocator, self.fs_job_dir, existing.id) catch {
+                        cl.queueJson(.fs_reply, .{
+                            .req = r.req,
+                            .ok = false,
+                            .@"error" = "cannot persist cancellation before transfer restart",
+                            .kind = "retryable_cleanup",
+                        });
+                        return;
+                    } orelse {
+                        cl.queueJson(.fs_reply, .{
+                            .req = r.req,
+                            .ok = false,
+                            .@"error" = "cancellation election is busy",
+                            .kind = "retryable_cleanup",
+                        });
+                        return;
+                    };
+                    _ = cancel_result;
+                }
+                if (restartFsJobFromJournal(self, cl, existing, r.client_token)) |replacement| {
                     existing = replacement;
+                } else {
+                    existing.setMessage("could not restart transfer from its durable journal");
+                    setFsJobErrorKind(existing, "permanent");
+                    saveFsJob(self, existing) catch {
+                        existing.terminal_pending = true;
+                    };
+                }
+            }
+            if (r.cancel_requested and !existing.finished() and
+                !fsjournal.cancelRequested(self.fs_job_dir, existing.id))
+            {
+                const cancel_result = fsjournal.tryRequestCancel(self.allocator, self.fs_job_dir, existing.id) catch {
+                    cl.queueJson(.fs_reply, .{
+                        .req = r.req,
+                        .ok = false,
+                        .@"error" = "cannot persist cancellation while adopting transfer",
+                        .kind = "retryable_cleanup",
+                    });
+                    return;
+                };
+                if (cancel_result) |settled| {
+                    applyDurableCancelResult(self, existing, settled);
+                } else {
+                    if (existing.cancel_election_pending) {
+                        cl.queueJson(.fs_reply, .{
+                            .req = r.req,
+                            .ok = false,
+                            .@"error" = "transfer cancellation election is already pending",
+                            .kind = "retryable_cleanup",
+                        });
+                        return;
+                    }
+                    existing.cancel_election_pending = true;
+                    existing.cancel_client = cl;
+                    existing.cancel_req = r.req;
+                    existing.cancel_reply_start = true;
+                    return;
+                }
             }
             if (existing.terminal_pending) {
                 saveFsJob(self, existing) catch return fsReplyErr(cl, r.req, "cannot persist terminal job state");
                 existing.terminal_pending = false;
             }
-            existing.owner = cl;
-            cl.queueJson(.fs_reply, .{
-                .req = r.req,
-                .ok = true,
-                .job = existing.id,
-                .state = @tagName(existing.state),
-                .done = existing.done,
-                .total = existing.total,
-                .resumed_from = existing.resumed_from,
-                .file = existing.cur_file[0..existing.cur_file_len],
-                .files_done = existing.files_done,
-                .files_total = existing.files_total,
-                .message = existing.message[0..existing.message_len],
-            });
-            if (existing.finished()) {
-                fsJobEmit(self, existing, switch (existing.state) {
-                    .done => "done",
-                    .canceled => "canceled",
-                    else => "error",
-                });
-            }
+            queueFsJobStartReply(self, cl, r.req, existing);
             return;
         }
     }
+    if (r.cancel_requested)
+        return fsReplyErr(cl, r.req, "canceled transfer has no durable coordinator job to recover");
     var source_owner: ?*FsJob = null;
     if (r.delete_source) {
         for (self.fs_jobs.items) |existing| {
@@ -136,6 +202,8 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         if (source_owner == null)
             return fsReplyErr(cl, r.req, "preview source is not a completed asset owned by this client");
     }
+    if (self.next_fs_job_id == std.math.maxInt(u64))
+        return fsReplyErr(cl, r.req, "filesystem job identity namespace is exhausted");
     const job = spawnFsJob(self, cl, op, self.next_fs_job_id, .{
         .src = r.path,
         .dst = r.to,
@@ -162,7 +230,7 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         producer.owns_dst = false;
         producer.cleanup_at_ms = nowMs();
     }
-    self.next_fs_job_id = job.id + 1;
+    self.next_fs_job_id = job.id +| 1;
     cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .job = job.id });
 }
 
@@ -264,6 +332,8 @@ pub const FsJobArgs = struct {
     source_dev: u64 = 0,
     source_ino: u64 = 0,
     recovery_attempts: u32 = 0,
+    initial_message: []const u8 = "",
+    initial_error_kind: []const u8 = "",
     done: u64 = 0,
     total: u64 = 0,
     resumed_from: u64 = 0,
@@ -418,8 +488,11 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .files_done = args.files_done,
         .files_total = args.files_total,
         .recovery_attempts = args.recovery_attempts,
+        .cancel_pending = !ephemeral and fsjournal.cancelRequested(self.fs_job_dir, id),
     };
     job.setPhase(args.phase);
+    job.setMessage(args.initial_message);
+    setFsJobErrorKind(job, args.initial_error_kind);
     job_initialized = true;
     // The job owns the read end from here on; its deinit closes it,
     // so the pipe errdefer must not close it a second time.
@@ -459,9 +532,13 @@ pub fn fsOpFromName(name: []const u8) ?FsJob.Op {
 }
 
 fn moveHelperOwnsJournal(job: *const FsJob) bool {
-    if (job.op != .cross_copy or !job.delete_src or job.pid <= 0) return false;
+    if (job.op != .cross_copy or (!job.delete_src and !job.no_replace) or job.pid <= 0) return false;
     if (job.out_fd >= 0) return true;
     return !job.finished() and c.kill(job.pid, 0) == 0;
+}
+
+fn cancelNeedsDurableFence(op: FsJob.Op, delete_src: bool, no_replace: bool) bool {
+    return op == .cross_copy and (delete_src or no_replace);
 }
 
 pub fn journalFsJob(self: *Daemon, job: *FsJob) void {
@@ -542,6 +619,7 @@ pub fn saveFsJob(self: *Daemon, job: *FsJob) !void {
         .files_done = job.files_done,
         .files_total = job.files_total,
         .message = job.message[0..job.message_len],
+        .error_kind = job.err_kind[0..job.err_kind_len],
         .client_token = job.client_token,
         .transfer_token = job.transfer_token,
         .acknowledged = job.acknowledged,
@@ -549,9 +627,81 @@ pub fn saveFsJob(self: *Daemon, job: *FsJob) !void {
 }
 
 pub fn deleteFsJobJournal(self: *Daemon, id: u64) void {
+    const guard = fsjournal.lockControl(self.fs_job_dir, id) catch return;
     var path_buf: [4096:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{d}.json", .{ self.fs_job_dir, id }) catch return;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/{d}.json", .{ self.fs_job_dir, id }) catch {
+        guard.release();
+        return;
+    };
+    if (!fsjournal.clearCancel(self.fs_job_dir, id)) {
+        guard.release();
+        return;
+    }
     _ = c.unlink(path.ptr);
+    guard.release();
+    fsjournal.clearControl(self.fs_job_dir, id);
+}
+
+fn applyDurableCancelResult(self: *Daemon, job: *FsJob, result: fsjournal.CancelResult) void {
+    switch (result) {
+        .requested => {
+            job.cancel_pending = true;
+            job.state = .running;
+            job.setMessage("canceling safely");
+            fsJobEmit(self, job, "progress");
+        },
+        .delete_committed => {
+            job.cancel_pending = false;
+            job.setMessage("source deletion already committed; finishing cleanup");
+            fsJobEmit(self, job, "progress");
+        },
+        .finished => {},
+    }
+}
+
+fn finishCancelElection(self: *Daemon, job: *FsJob, result: fsjournal.CancelResult) void {
+    applyDurableCancelResult(self, job, result);
+    if (job.cancel_client) |cl| if (!cl.dead and job.cancel_req != 0) {
+        if (job.cancel_reply_start)
+            queueFsJobStartReply(self, cl, job.cancel_req, job)
+        else
+            cl.queueJson(.fs_reply, .{ .req = job.cancel_req, .ok = true });
+    };
+    job.cancel_client = null;
+    job.cancel_req = 0;
+    job.cancel_reply_start = false;
+    job.cancel_election_pending = false;
+}
+
+/// Retry helper-held cancellation elections without blocking the poll loop.
+pub fn pumpFsJobCancelElections(self: *Daemon) void {
+    for (self.fs_jobs.items) |job| {
+        if (!job.cancel_election_pending) continue;
+        const result = fsjournal.tryRequestCancel(self.allocator, self.fs_job_dir, job.id) catch {
+            if (job.cancel_client) |cl| if (!cl.dead and job.cancel_req != 0) {
+                if (job.cancel_reply_start)
+                    cl.queueJson(.fs_reply, .{
+                        .req = job.cancel_req,
+                        .ok = false,
+                        .@"error" = "cannot persist cancellation while adopting transfer",
+                        .kind = "retryable_cleanup",
+                    })
+                else
+                    fsReplyErr(cl, job.cancel_req, "cannot persist transfer cancellation");
+            };
+            job.cancel_client = null;
+            job.cancel_req = 0;
+            job.cancel_reply_start = false;
+            job.cancel_election_pending = false;
+            continue;
+        } orelse continue;
+        finishCancelElection(self, job, result);
+    }
+}
+
+fn setFsJobErrorKind(job: *FsJob, kind: []const u8) void {
+    job.err_kind_len = @min(kind.len, job.err_kind.len);
+    @memcpy(job.err_kind[0..job.err_kind_len], kind[0..job.err_kind_len]);
 }
 
 pub fn restoredFsJob(self: *Daemon, rec: fsjournal.Record, op: FsJob.Op, state: FsJob.State) ?*FsJob {
@@ -599,14 +749,33 @@ pub fn restoredFsJob(self: *Daemon, rec: fsjournal.Record, op: FsJob.Op, state: 
         .delete_src = rec.delete_src,
         .verify = rec.verify,
         .recovery_attempts = rec.recovery_attempts,
+        .cancel_pending = fsjournal.cancelRequested(self.fs_job_dir, rec.id),
     };
     job.setMessage(rec.message);
+    setFsJobErrorKind(job, rec.error_kind);
     job.setPhase(rec.phase);
     self.fs_jobs.append(self.allocator, job) catch {
         job.deinit(false);
         return null;
     };
     return job;
+}
+
+fn phaseNeedsSafetyRecovery(rec: fsjournal.Record) bool {
+    if (!rec.delete_src or !std.mem.eql(u8, rec.op, "cross_copy")) return false;
+    const phase = fsjournal.phaseRank(rec.phase);
+    return phase >= fsjournal.phaseRank("copied") and phase < fsjournal.phaseRank("source_deleted");
+}
+
+fn needsSafetyRecovery(fs_job_dir: []const u8, rec: fsjournal.Record) bool {
+    if (!std.mem.eql(u8, rec.op, "cross_copy")) return false;
+    if (rec.delete_src) return fsjournal.cancelRequested(fs_job_dir, rec.id) or phaseNeedsSafetyRecovery(rec);
+    return rec.no_replace and fsjournal.cancelRequested(fs_job_dir, rec.id);
+}
+
+fn journalIdFromName(name: []const u8) ?u64 {
+    if (!std.mem.endsWith(u8, name, ".json")) return null;
+    return std.fmt.parseInt(u64, name[0 .. name.len - ".json".len], 10) catch null;
 }
 
 /// Reconstruct stable job IDs. Interrupted local copies respawn with
@@ -621,7 +790,10 @@ pub fn restoreFsJobs(self: *Daemon) void {
     defer _ = c.closedir(dir);
     while (c.readdir(dir)) |de| {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
-        if (!std.mem.endsWith(u8, name, ".json")) continue;
+        const filename_id = journalIdFromName(name) orelse continue;
+        // An unsupported record is still authoritative for its id. Reusing
+        // that number would overwrite its only staging/quarantine ledger.
+        self.next_fs_job_id = @max(self.next_fs_job_id, filename_id +| 1);
         var pbuf: [4096]u8 = undefined;
         const path = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ self.fs_job_dir, name }) catch continue;
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
@@ -630,7 +802,7 @@ pub fn restoreFsJobs(self: *Daemon) void {
         defer parsed.deinit();
         const rec = parsed.value;
         const op = fsOpFromName(rec.op) orelse continue;
-        self.next_fs_job_id = @max(self.next_fs_job_id, rec.id + 1);
+        self.next_fs_job_id = @max(self.next_fs_job_id, rec.id +| 1);
         const state: FsJob.State = if (std.mem.eql(u8, rec.state, "done"))
             .done
         else if (std.mem.eql(u8, rec.state, "failed"))
@@ -641,21 +813,35 @@ pub fn restoreFsJobs(self: *Daemon) void {
             .paused
         else
             .running;
-        if (state == .done or state == .failed or state == .canceled) {
+        if (state == .done or state == .canceled) {
+            _ = fsjournal.clearCancel(self.fs_job_dir, rec.id);
+            _ = restoredFsJob(self, rec, op, state);
+            continue;
+        }
+        const safety_recovery = needsSafetyRecovery(self.fs_job_dir, rec);
+        if (state == .failed and !safety_recovery) {
             _ = restoredFsJob(self, rec, op, state);
             continue;
         }
         if (rec.pid > 0 and c.kill(@intCast(rec.pid), 0) == 0) {
-            _ = restoredFsJob(self, rec, op, state);
+            _ = restoredFsJob(self, rec, op, if (safety_recovery) .running else state);
             continue;
         }
         if (op == .copy or op == .cross_copy or op == .live_find) {
-            const cleanup_recovery = op == .cross_copy and rec.delete_src and
-                fsjournal.phaseRank(rec.phase) >= fsjournal.phaseRank("rename_planned") and
-                fsjournal.phaseRank(rec.phase) < fsjournal.phaseRank("source_deleted");
+            const cleanup_recovery = safety_recovery;
+            if (op != .live_find and !cleanup_recovery) {
+                const job = restoredFsJob(self, rec, op, .failed) orelse continue;
+                job.setMessage("transfer helper was interrupted; waiting for the durable retry policy");
+                setFsJobErrorKind(job, "transport");
+                saveFsJob(self, job) catch {
+                    job.terminal_pending = true;
+                };
+                continue;
+            }
             if (cleanup_recovery and rec.recovery_attempts >= 3) {
                 const job = restoredFsJob(self, rec, op, .failed) orelse continue;
                 job.setMessage("source cleanup repeatedly crashed; quarantine retained");
+                setFsJobErrorKind(job, "permanent");
                 saveFsJob(self, job) catch {
                     job.terminal_pending = true;
                 };
@@ -690,6 +876,8 @@ pub fn restoreFsJobs(self: *Daemon) void {
                 .resumed_from = rec.resumed_from,
                 .files_done = rec.files_done,
                 .files_total = rec.files_total,
+                .initial_message = rec.message,
+                .initial_error_kind = rec.error_kind,
                 .preserve_journal_on_failure = true,
             }) catch {
                 const job = restoredFsJob(self, rec, op, .failed) orelse continue;
@@ -737,6 +925,7 @@ pub fn refreshDetachedFsJobs(self: *Daemon) void {
         };
         defer parsed.deinit();
         const state = parsed.value.state;
+        job.pid = -1;
         job.done = @max(job.done, parsed.value.done);
         job.total = @max(job.total, parsed.value.total);
         job.resumed_from = @max(job.resumed_from, parsed.value.resumed_from);
@@ -744,19 +933,39 @@ pub fn refreshDetachedFsJobs(self: *Daemon) void {
         job.files_total = @max(job.files_total, parsed.value.files_total);
         if (fsjournal.phaseRank(parsed.value.phase) > fsjournal.phaseRank(job.phase[0..job.phase_len]))
             job.setPhase(parsed.value.phase);
+        setFsJobErrorKind(job, parsed.value.error_kind);
         if (std.mem.eql(u8, state, "done")) {
             job.state = .done;
+            job.cancel_pending = false;
+            job.setMessage(parsed.value.message);
+            _ = fsjournal.clearCancel(self.fs_job_dir, job.id);
             fsJobEmit(self, job, "done");
-        } else if (job.op == .cross_copy and parsed.value.delete_src and
-            !std.mem.eql(u8, state, "failed") and !std.mem.eql(u8, state, "canceled") and
-            fsjournal.phaseRank(parsed.value.phase) >= fsjournal.phaseRank("rename_planned") and
-            fsjournal.phaseRank(parsed.value.phase) < fsjournal.phaseRank("source_deleted"))
-        {
+        } else if (std.mem.eql(u8, state, "canceled")) {
+            job.state = .canceled;
+            job.cancel_pending = false;
+            job.setMessage(parsed.value.message);
+            _ = fsjournal.clearCancel(self.fs_job_dir, job.id);
+            fsJobEmit(self, job, "canceled");
+        } else if (needsSafetyRecovery(self.fs_job_dir, parsed.value)) {
             job.pid = -1;
             job.restart_pending = true;
-        } else {
+        } else if (std.mem.eql(u8, state, "failed")) {
+            // The detached helper reached a structured terminal result.
+            // Preserve its kind: only an unexplained disappearance is a
+            // transport failure eligible for automatic retry.
             job.state = .failed;
             job.setMessage(parsed.value.message);
+            fsJobEmit(self, job, "error");
+        } else {
+            job.state = .failed;
+            if (job.op == .copy or job.op == .cross_copy) {
+                job.setMessage("transfer helper was interrupted; waiting for the durable retry policy");
+                setFsJobErrorKind(job, "transport");
+                saveFsJob(self, job) catch {
+                    job.terminal_pending = true;
+                    continue;
+                };
+            } else job.setMessage(parsed.value.message);
             fsJobEmit(self, job, "error");
         }
     }
@@ -792,6 +1001,7 @@ pub fn restartCrashedFsJobs(self: *Daemon) void {
             old.restart_pending = false;
             old.state = .failed;
             old.setMessage("source cleanup repeatedly crashed; quarantine retained");
+            setFsJobErrorKind(old, "permanent");
             old.terminal_pending = true;
             continue;
         }
@@ -805,7 +1015,7 @@ pub fn restartCrashedFsJobs(self: *Daemon) void {
             .transfer_token = rec.transfer_token,
             .resumable = true,
             .copy = .{ .conflict = rec.conflict, .no_replace = rec.no_replace },
-            .delete_src = true,
+            .delete_src = rec.delete_src,
             .verify = rec.verify,
             .phase = rec.phase,
             .source_quarantine = rec.source_quarantine,
@@ -820,11 +1030,14 @@ pub fn restartCrashedFsJobs(self: *Daemon) void {
             .resumed_from = rec.resumed_from,
             .files_done = rec.files_done,
             .files_total = rec.files_total,
+            .initial_message = rec.message,
+            .initial_error_kind = rec.error_kind,
             .preserve_journal_on_failure = true,
         }) catch {
             old.restart_pending = false;
             old.state = .failed;
             old.setMessage("could not resume source cleanup after helper crash");
+            setFsJobErrorKind(old, "permanent");
             old.terminal_pending = true;
             continue;
         };
@@ -854,6 +1067,7 @@ pub fn fsJobOp(self: *Daemon, cl: *Client, r: FsOpReq) void {
             dst_host: []const u8,
             client_token: []const u8,
             message: []const u8,
+            kind: []const u8,
         };
         var rows: std.ArrayList(Row) = .empty;
         defer rows.deinit(self.allocator);
@@ -871,6 +1085,7 @@ pub fn fsJobOp(self: *Daemon, cl: *Client, r: FsOpReq) void {
                 .dst_host = j.dst_host,
                 .client_token = j.client_token,
                 .message = j.message[0..j.message_len],
+                .kind = j.err_kind[0..j.err_kind_len],
             }) catch break;
         }
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true, .jobs = rows.items });
@@ -897,24 +1112,44 @@ pub fn fsJobOp(self: *Daemon, cl: *Client, r: FsOpReq) void {
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "job_cancel")) {
         if (!job.finished()) {
-            const helper_owns_journal = moveHelperOwnsJournal(job);
+            const durable_cancel = cancelNeedsDurableFence(job.op, job.delete_src, job.no_replace);
+            if (durable_cancel) {
+                // A previously paused helper may have stopped while
+                // committing its journal. Resume it before waiting for
+                // the cancellation/delete election lock.
+                if (job.pid > 0) _ = c.kill(-job.pid, c.SIGCONT);
+                if (job.cancel_election_pending)
+                    return fsReplyErr(cl, r.req, "job cancellation election is already pending");
+                const result = fsjournal.tryRequestCancel(self.allocator, self.fs_job_dir, job.id) catch
+                    return fsReplyErr(cl, r.req, "cannot persist transfer cancellation");
+                if (result) |settled| {
+                    applyDurableCancelResult(self, job, settled);
+                    cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
+                } else {
+                    job.cancel_election_pending = true;
+                    job.cancel_client = cl;
+                    job.cancel_req = r.req;
+                }
+                return;
+            }
             // SIGCONT first: a SIGSTOPped child never dispatches
             // SIGKILL... actually SIGKILL cannot be blocked even
             // stopped, but the CONT keeps wait semantics simple.
-            _ = c.kill(-job.pid, c.SIGCONT);
-            _ = c.kill(-job.pid, c.SIGKILL);
-            job.state = .canceled;
-            if (!helper_owns_journal) {
-                saveFsJob(self, job) catch {
-                    job.terminal_pending = true;
-                    return fsReplyErr(cl, r.req, "cannot persist canceled job state");
-                };
+            if (job.pid > 0) {
+                _ = c.kill(-job.pid, c.SIGCONT);
+                _ = c.kill(-job.pid, c.SIGKILL);
             }
+            job.state = .canceled;
+            saveFsJob(self, job) catch {
+                job.terminal_pending = true;
+                return fsReplyErr(cl, r.req, "cannot persist canceled job state");
+            };
             fsJobEmit(self, job, "canceled");
         }
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "job_pause")) {
         if (job.finished()) return fsReplyErr(cl, r.req, "job already finished");
+        if (job.cancel_pending) return fsReplyErr(cl, r.req, "job cancellation is pending");
         _ = c.kill(-job.pid, c.SIGSTOP);
         job.state = .paused;
         journalFsJob(self, job);
@@ -1179,6 +1414,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         // Cancel raced completion: the work DID finish — honesty
         // says report done, not canceled.
         job.state = .done;
+        job.cancel_pending = false;
         if (e.hash.len == 64) {
             @memcpy(&job.hash_hex, e.hash[0..64]);
             job.has_hash = true;
@@ -1197,11 +1433,15 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
             };
         }
         fsJobEmit(self, job, "done");
+    } else if (std.mem.eql(u8, e.ev, "canceled")) {
+        job.state = .canceled;
+        job.cancel_pending = false;
+        job.setMessage(e.message);
+        fsJobEmit(self, job, "canceled");
     } else if (std.mem.eql(u8, e.ev, "error")) {
         job.setMessage(e.message);
-        job.err_kind_len = @min(e.kind.len, job.err_kind.len);
-        @memcpy(job.err_kind[0..job.err_kind_len], e.kind[0..job.err_kind_len]);
-        if (job.op == .cross_copy and job.delete_src and
+        setFsJobErrorKind(job, e.kind);
+        if (cancelNeedsDurableFence(job.op, job.delete_src, job.no_replace) and
             std.mem.eql(u8, e.kind, "retryable_cleanup"))
         {
             // The helper's final journal record remains running. EOF
@@ -1236,12 +1476,13 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
 pub fn fsJobExited(self: *Daemon, job: *FsJob) void {
     var st: c_int = 0;
     _ = c.waitpid(job.pid, &st, 0);
+    const journal_failed = c.WIFEXITED(st) and c.WEXITSTATUS(st) == fsjob.JOURNAL_EXIT_CODE;
     job.releaseOwnedSource();
     _ = c.close(job.out_fd);
     job.out_fd = -1;
     var emit_terminal = job.terminal_pending;
     if (!job.finished()) {
-        if (job.op == .cross_copy and job.delete_src) {
+        if (cancelNeedsDurableFence(job.op, job.delete_src, job.no_replace)) {
             var path_buf: [4096]u8 = undefined;
             if (std.fmt.bufPrint(&path_buf, "{s}/{d}.json", .{ self.fs_job_dir, job.id })) |path| {
                 var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -1249,20 +1490,48 @@ pub fn fsJobExited(self: *Daemon, job: *FsJob) void {
                 if (fsjournal.load(arena.allocator(), path)) |parsed_value| {
                     var parsed = parsed_value;
                     defer parsed.deinit();
-                    if (fsjournal.phaseRank(parsed.value.phase) >= fsjournal.phaseRank("rename_planned") and
-                        fsjournal.phaseRank(parsed.value.phase) < fsjournal.phaseRank("source_deleted"))
+                    job.done = @max(job.done, parsed.value.done);
+                    job.total = @max(job.total, parsed.value.total);
+                    job.resumed_from = @max(job.resumed_from, parsed.value.resumed_from);
+                    job.files_done = @max(job.files_done, parsed.value.files_done);
+                    job.files_total = @max(job.files_total, parsed.value.files_total);
+                    job.setPhase(parsed.value.phase);
+                    job.setMessage(parsed.value.message);
+                    setFsJobErrorKind(job, parsed.value.error_kind);
+                    if (std.mem.eql(u8, parsed.value.state, "done") or
+                        std.mem.eql(u8, parsed.value.state, "canceled"))
                     {
-                        job.setPhase(parsed.value.phase);
+                        job.state = if (std.mem.eql(u8, parsed.value.state, "done"))
+                            .done
+                        else
+                            .canceled;
+                        job.cancel_pending = false;
+                        emit_terminal = true;
+                    } else if (needsSafetyRecovery(self.fs_job_dir, parsed.value)) {
                         job.pid = -1;
                         job.restart_pending = true;
                         return;
+                    } else if (std.mem.eql(u8, parsed.value.state, "failed")) {
+                        job.state = .failed;
+                        emit_terminal = true;
                     }
                 } else |_| {}
             } else |_| {}
         }
-        job.state = .failed;
-        job.setMessage("job helper died");
-        emit_terminal = true;
+        if (!job.finished()) {
+            job.state = .failed;
+            if (journal_failed) {
+                job.setMessage("transfer helper could not persist its terminal journal state");
+                setFsJobErrorKind(job, "permanent");
+            } else if (job.op == .copy or job.op == .cross_copy) {
+                job.setMessage("transfer helper was interrupted; waiting for the durable retry policy");
+                setFsJobErrorKind(job, "transport");
+            } else {
+                job.setMessage("job helper died");
+                setFsJobErrorKind(job, "permanent");
+            }
+            emit_terminal = true;
+        }
     }
     // The helper writes its detached-recovery record just before
     // exiting. Reassert daemon-owned progress/acknowledgment only
@@ -1288,4 +1557,64 @@ pub fn fsJobExited(self: *Daemon, job: *FsJob) void {
     }
     // Retention trim happens in reap() — this runs mid-iteration
     // over fs_jobs and must not reshape the list.
+}
+
+test "detached terminal records restore their structured error kind" {
+    var none = [_]u8{};
+    var job = FsJob{
+        .allocator = std.testing.allocator,
+        .id = 1,
+        .op = .cross_copy,
+        .owner = null,
+        .pid = -1,
+        .out_fd = -1,
+        .src = &none,
+        .dst = &none,
+        .pattern = &none,
+        .src_host = &none,
+        .dst_host = &none,
+        .client_token = &none,
+        .transfer_token = &none,
+        .conflict = &none,
+    };
+    setFsJobErrorKind(&job, "transport");
+    try std.testing.expectEqualStrings("transport", job.err_kind[0..job.err_kind_len]);
+}
+
+test "cross moves and no-replace copies use the durable cancellation fence" {
+    try std.testing.expect(cancelNeedsDurableFence(.cross_copy, true, false));
+    try std.testing.expect(cancelNeedsDurableFence(.cross_copy, false, true));
+    try std.testing.expect(!cancelNeedsDurableFence(.cross_copy, false, false));
+    try std.testing.expect(!cancelNeedsDurableFence(.copy, true, true));
+}
+
+test "only source-safety phases bypass the client retry policy" {
+    try std.testing.expect(!phaseNeedsSafetyRecovery(.{ .id = 1, .op = "cross_copy", .delete_src = true, .phase = "rename_planned" }));
+    try std.testing.expect(phaseNeedsSafetyRecovery(.{ .id = 1, .op = "cross_copy", .delete_src = true, .phase = "copied" }));
+    try std.testing.expect(phaseNeedsSafetyRecovery(.{ .id = 1, .op = "cross_copy", .delete_src = true, .phase = "deleting" }));
+    try std.testing.expect(!phaseNeedsSafetyRecovery(.{ .id = 1, .op = "cross_copy", .delete_src = true, .phase = "source_deleted" }));
+    try std.testing.expect(!phaseNeedsSafetyRecovery(.{ .id = 1, .op = "copy", .phase = "copied" }));
+}
+
+test "journal filenames reserve ids even when their payload is unreadable" {
+    try std.testing.expectEqual(@as(?u64, 42), journalIdFromName("42.json"));
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), journalIdFromName("18446744073709551615.json"));
+    try std.testing.expect(journalIdFromName("42.cancel") == null);
+    try std.testing.expect(journalIdFromName("bad.json") == null);
+}
+
+test "cancel-marked failed no-replace copy still requires recovery" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const dir = try std.fmt.allocPrint(arena.allocator(), ".zig-cache/tmp/{s}/jobs", .{&tmp.sub_path});
+    try fsjournal.save(dir, .{ .id = 44, .op = "cross_copy", .state = "failed", .no_replace = true });
+    try std.testing.expectEqual(fsjournal.CancelResult.requested, (try fsjournal.tryRequestRecoveryCancel(std.testing.allocator, dir, 44)).?);
+    try std.testing.expect(needsSafetyRecovery(dir, .{
+        .id = 44,
+        .op = "cross_copy",
+        .state = "failed",
+        .no_replace = true,
+    }));
 }
