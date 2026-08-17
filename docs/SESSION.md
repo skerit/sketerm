@@ -18580,3 +18580,42 @@ gesture does and verifies structure between attempts. Both fixes are
 rig-layer; moveNextTo, zoneAt, and the row drop handlers were correct.
 The run now proceeds to the browser-action stage, the separately
 documented pre-existing known-red on this host.
+
+## 2026-08-17: the e2e chain, and two product bugs hiding behind it
+
+Fixing the sidebar reorder stage unmasked four more stages that had
+never been reachable. Each was investigated on its own; two turned out
+to be real product defects that no test had ever been able to see.
+
+Product: destroying a keyboard-focused xdg_popup zeroed the hub's
+`keyboard_focus` instead of returning it to the parent, which
+xdg_popup.grab requires. GTK keeps a parent toplevel `is-active` while
+its own popup holds focus, so the hub and GTK disagreed: a later focus
+switch sent no `wl_keyboard.leave` to the first window, latching its
+active state (and its toolbar action) forever. Focus now re-enters the
+parent on both destroy orders, with a unit test for each.
+
+Product: the sidebar paned separator declared a wide grab area but
+allocated `min-width: 1px` with 2px margins. GTK hit-tests only the
+allocated box -- margins are not pickable -- so the drag target was one
+physical pixel. The separator is now allocated 5px with the thin line
+drawn as a centered background gradient (3px on hover), the same total
+footprint, and is grabbable by an actual hand.
+
+Rig: `appdrive.drag` could finish moving before GTK's ~8px drag
+threshold fired, so a dnd session sometimes saw no motion and no target
+accepted; drags now settle-jiggle before release. `focusWindow` was
+added because the hub has no click-to-focus and the browser-action
+stage never actually focused its second window. Two pixel scans were
+wrong rather than unlucky: a toolbar scan clipped at y=180 under taller
+header stacks, and a chip-edge measured with `max` over scanline runs
+merged with the focused pane's accent border, aiming the divider drag
+~90px inside the terminal pane (now the per-row mode). The copy-mode
+stage typed into a dialog still fading out and lost the leading "echo",
+so the palette stage now waits for visual settle and copy mode verifies
+the line on the prompt before submitting.
+
+With those in, smoke-e2e passed end to end twice. Later runs failed in
+the viewer stage's OCR assertions with varying messages while the host
+sat at load 17 under an unrelated ffmpeg job -- the documented tesseract
+flake class, not a regression, but worth re-confirming on an idle host.
