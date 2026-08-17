@@ -347,8 +347,58 @@ do_debian() {
 
 # -------------------------------------------------------------- plain path
 
+PLAIN_MANIFEST_REL=share/sketerm/plain-install-manifest
+
+plain_make_manifest() {
+    local stagedir=$1 output=$2
+    printf '# sketerm plain-install manifest v1\n' > "$output"
+    (
+        cd "$stagedir/usr"
+        find . \( -type f -o -type l \) -printf '%P\n'
+        printf '%s\n' "$PLAIN_MANIFEST_REL"
+    ) | LC_ALL=C sort -u >> "$output"
+}
+
+plain_manifest_has() {
+    grep -Fqx -- "$2" "$1"
+}
+
+plain_validate_managed_path() {
+    local path=$1
+    case "$path" in
+        ''|/*|.|..|./*|../*|*/.|*/..|*/./*|*/../*|*//*|*$'\r'*) return 1 ;;
+    esac
+    case "$path" in
+        bin/*|lib/*|share/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+plain_remove_managed_path() {
+    local path=$1 target
+    plain_validate_managed_path "$path" \
+        || die "unsafe path in plain-install manifest: $path"
+    target="$prefix/$path"
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        as_root rm -f -- "$target" \
+            || die "could not remove obsolete managed file: $target"
+    fi
+}
+
+plain_remove_obsolete() {
+    local previous=$1 current=$2 path
+    while IFS= read -r path || [ -n "$path" ]; do
+        case "$path" in ''|\#*) continue ;; esac
+        plain_validate_managed_path "$path" \
+            || die "unsafe path in plain-install manifest: $path"
+        if ! plain_manifest_has "$current" "$path"; then
+            plain_remove_managed_path "$path"
+        fi
+    done < "$previous"
+}
+
 do_plain() {
-    local kind=$1 stagedir
+    local kind=$1 stagedir new_manifest manifest manifest_tmp
     stagedir=$(mktemp -d)
     trap 'rm -rf "$stagedir"' RETURN
     stage "$stagedir" "$kind"
@@ -361,8 +411,34 @@ do_plain() {
         return
     fi
 
+    new_manifest="$stagedir/plain-install-manifest"
+    plain_make_manifest "$stagedir" "$new_manifest"
+    manifest="$prefix/$PLAIN_MANIFEST_REL"
+
+    if [ -e "$manifest" ] || [ -L "$manifest" ]; then
+        [ -f "$manifest" ] && [ ! -L "$manifest" ] && [ -r "$manifest" ] \
+            || die "plain-install manifest is not a readable regular file: $manifest"
+        plain_remove_obsolete "$manifest" "$new_manifest"
+    elif ! plain_manifest_has "$new_manifest" bin/sketerm-webengine; then
+        # Plain installs made before manifests existed still own this exact
+        # optional helper path. Remove it on the first CEF-less upgrade so
+        # findbin cannot launch an old helper beside the new GUI.
+        plain_remove_managed_path bin/sketerm-webengine
+    fi
+
     say "installing into $prefix (no package manager involvement)"
-    as_root cp -a "$stagedir/usr/." "$prefix/"
+    as_root cp -a "$stagedir/usr/." "$prefix/" \
+        || die "could not copy the staged install into $prefix"
+
+    # Publish ownership last. A failed or interrupted copy therefore leaves
+    # the previous manifest available for a safe retry.
+    manifest_tmp="$manifest.new"
+    as_root install -m644 "$new_manifest" "$manifest_tmp" \
+        || die "could not stage the plain-install manifest: $manifest_tmp"
+    if ! as_root mv -f -- "$manifest_tmp" "$manifest"; then
+        as_root rm -f -- "$manifest_tmp" || true
+        die "could not publish the plain-install manifest: $manifest"
+    fi
 }
 
 # ----------------------------------------------------------------- driver

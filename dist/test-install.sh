@@ -595,6 +595,146 @@ plain_no_cef_stage=("$work/plain-no-cef-tmp"/tmp.*)
 [[ "$(<"$work/plain-no-cef.out")" == *"packaging browser identity without sketerm-webengine"* ]] \
     || fail "CEF-less stage did not report its browser-helper limitation"
 
+cat > "$fakebin/cp" <<'EOF'
+#!/usr/bin/env bash
+dest=${!#}
+if [ -n "${INSTALL_TEST_CP_FAIL_DEST:-}" ] \
+        && [ "$dest" = "$INSTALL_TEST_CP_FAIL_DEST" ]; then
+    printf 'simulated interrupted plain install\n' >&2
+    exit 73
+fi
+exec /usr/bin/cp "$@"
+EOF
+chmod +x "$fakebin/cp"
+
+run_plain_gui_install() {
+    local output=$1 install_prefix=$2 with_cef=$3
+    local include lib
+    if [ "$with_cef" -eq 1 ]; then
+        include=$cef_include
+        lib=$cef_lib
+    else
+        include=$work/no-cef-include
+        lib=$work/no-cef-lib
+    fi
+    BASH_ENV="$work/no-packager.bash" \
+        PATH="$fakebin:$PATH" \
+        SKETERM_TIC="$fakebin/tic" \
+        CEF_INCLUDE="$include" \
+        CEF_LIB="$lib" \
+        INSTALL_TEST_ALLOW_SUDO=1 \
+        INSTALL_TEST_CP_FAIL_DEST="${INSTALL_TEST_CP_FAIL_DEST:-}" \
+        INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+        "$fixture/dist/install.sh" --gui-only --prefix "$install_prefix" \
+        > "$output" 2>&1
+}
+
+# Plain installs own only paths listed in their prefix manifest. A CEF-less
+# upgrade removes a previously managed helper even when it was modified, but
+# leaves unrelated files alone. Re-enabling CEF installs and tracks it again.
+plain_upgrade_prefix="$work/plain-upgrade-prefix"
+mkdir -p "$plain_upgrade_prefix"
+run_plain_gui_install "$work/plain-upgrade-cef.out" "$plain_upgrade_prefix" 1
+plain_manifest="$plain_upgrade_prefix/share/sketerm/plain-install-manifest"
+[ -x "$plain_upgrade_prefix/bin/sketerm-webengine" ] \
+    || fail "CEF plain install omitted sketerm-webengine"
+[ -f "$plain_manifest" ] \
+    || fail "plain install did not publish its managed-file manifest"
+grep -Fqx bin/sketerm-webengine "$plain_manifest" \
+    || fail "plain manifest omitted sketerm-webengine"
+
+mkdir -p "$plain_upgrade_prefix/share/unrelated"
+printf 'keep bin\n' > "$plain_upgrade_prefix/bin/not-sketerm"
+printf 'keep shared\n' > "$plain_upgrade_prefix/share/unrelated/keep"
+printf 'keep local\n' > "$plain_upgrade_prefix/share/sketerm/local-note"
+printf 'retired asset\n' > "$plain_upgrade_prefix/share/sketerm/retired-asset"
+printf 'share/sketerm/retired-asset\n' >> "$plain_manifest"
+printf 'locally modified helper\n' > "$plain_upgrade_prefix/bin/sketerm-webengine"
+chmod +x "$plain_upgrade_prefix/bin/sketerm-webengine"
+
+run_plain_gui_install "$work/plain-upgrade-no-cef.out" "$plain_upgrade_prefix" 0
+[ ! -e "$plain_upgrade_prefix/bin/sketerm-webengine" ] \
+    || fail "CEF-less upgrade retained a modified managed helper"
+! grep -Fqx bin/sketerm-webengine "$plain_manifest" \
+    || fail "CEF-less upgrade kept sketerm-webengine in the manifest"
+[ "$(<"$plain_upgrade_prefix/bin/not-sketerm")" = 'keep bin' ] \
+    || fail "plain upgrade changed an unrelated bin file"
+[ "$(<"$plain_upgrade_prefix/share/unrelated/keep")" = 'keep shared' ] \
+    || fail "plain upgrade changed an unrelated share file"
+[ "$(<"$plain_upgrade_prefix/share/sketerm/local-note")" = 'keep local' ] \
+    || fail "plain upgrade changed an untracked file in a managed directory"
+[ ! -e "$plain_upgrade_prefix/share/sketerm/retired-asset" ] \
+    || fail "plain upgrade retained another obsolete managed asset"
+
+run_plain_gui_install "$work/plain-upgrade-reenable.out" "$plain_upgrade_prefix" 1
+cmp -s "$fixture/zig-out/bin/sketerm-webengine" \
+    "$plain_upgrade_prefix/bin/sketerm-webengine" \
+    || fail "re-enabled CEF did not restore the current helper"
+grep -Fqx bin/sketerm-webengine "$plain_manifest" \
+    || fail "re-enabled CEF did not restore helper ownership"
+
+# Obsolete cleanup happens before the overlay, while manifest replacement is
+# last. An interrupted copy therefore cannot leave the stale helper runnable,
+# and the old manifest remains available for the next retry.
+cp "$plain_manifest" "$work/plain-manifest-before-interrupt"
+set +e
+INSTALL_TEST_CP_FAIL_DEST="$plain_upgrade_prefix/" \
+    run_plain_gui_install "$work/plain-upgrade-interrupted.out" \
+        "$plain_upgrade_prefix" 0
+status=$?
+set -e
+[ "$status" -eq 1 ] || fail "interrupted plain copy reported success"
+[[ "$(<"$work/plain-upgrade-interrupted.out")" == *"could not copy the staged install"* ]] \
+    || fail "interrupted plain copy was not reported"
+! grep -q ' done$' "$work/plain-upgrade-interrupted.out" \
+    || fail "interrupted plain copy printed the final success report"
+[ ! -e "$plain_upgrade_prefix/bin/sketerm-webengine" ] \
+    || fail "interrupted CEF-less upgrade left the stale helper runnable"
+cmp -s "$work/plain-manifest-before-interrupt" "$plain_manifest" \
+    || fail "interrupted plain copy published a replacement manifest"
+
+run_plain_gui_install "$work/plain-upgrade-retry.out" "$plain_upgrade_prefix" 0
+! grep -Fqx bin/sketerm-webengine "$plain_manifest" \
+    || fail "plain retry did not retire helper ownership"
+run_plain_gui_install "$work/plain-upgrade-reenable-again.out" "$plain_upgrade_prefix" 1
+[ -x "$plain_upgrade_prefix/bin/sketerm-webengine" ] \
+    || fail "CEF re-enable after an interrupted upgrade omitted the helper"
+
+# The first fixed upgrade has no previous manifest to consult. The exact
+# historical optional-helper path is migrated explicitly; no other untracked
+# prefix content is inferred to be owned.
+plain_legacy_prefix="$work/plain-legacy-prefix"
+mkdir -p "$plain_legacy_prefix/bin" "$plain_legacy_prefix/share/legacy"
+cp "$fixture/zig-out/bin/sketerm-webengine" \
+    "$plain_legacy_prefix/bin/sketerm-webengine"
+printf 'legacy unrelated\n' > "$plain_legacy_prefix/share/legacy/keep"
+run_plain_gui_install "$work/plain-legacy-upgrade.out" "$plain_legacy_prefix" 0
+[ ! -e "$plain_legacy_prefix/bin/sketerm-webengine" ] \
+    || fail "first manifest upgrade retained the legacy helper"
+[ "$(<"$plain_legacy_prefix/share/legacy/keep")" = 'legacy unrelated' ] \
+    || fail "first manifest upgrade changed unrelated legacy content"
+
+# A managed path that cannot be removed is a hard failure before new files or
+# a new ownership manifest are published.
+plain_blocked_prefix="$work/plain-blocked-prefix"
+mkdir -p "$plain_blocked_prefix"
+run_plain_gui_install "$work/plain-blocked-setup.out" "$plain_blocked_prefix" 1
+blocked_manifest="$plain_blocked_prefix/share/sketerm/plain-install-manifest"
+cp "$blocked_manifest" "$work/plain-blocked-manifest-before"
+rm -f "$plain_blocked_prefix/bin/sketerm-webengine"
+mkdir "$plain_blocked_prefix/bin/sketerm-webengine"
+set +e
+run_plain_gui_install "$work/plain-blocked-upgrade.out" "$plain_blocked_prefix" 0
+status=$?
+set -e
+[ "$status" -eq 1 ] || fail "failed obsolete cleanup reported success"
+[[ "$(<"$work/plain-blocked-upgrade.out")" == *"could not remove obsolete managed file"* ]] \
+    || fail "failed obsolete cleanup was not reported"
+! grep -q ' done$' "$work/plain-blocked-upgrade.out" \
+    || fail "failed obsolete cleanup printed the final success report"
+cmp -s "$work/plain-blocked-manifest-before" "$blocked_manifest" \
+    || fail "failed obsolete cleanup published a replacement manifest"
+
 BASH_ENV="$work/no-packager.bash" \
     PATH="$fakebin:$PATH" \
     SKETERM_TIC="$fakebin/tic" \
@@ -625,6 +765,8 @@ BASH_ENV="$work/no-packager.bash" \
 
 [ -x "$work/pkg/usr/bin/sketerm-webengine" ] \
     || fail "PKGBUILD package() did not include sketerm-webengine"
+[ ! -e "$work/pkg/usr/share/sketerm/plain-install-manifest" ] \
+    || fail "PKGBUILD package() included plain-install ownership metadata"
 cmp -s "$fixture/zig-out/bin/sketerm-webengine" \
     "$work/pkg/usr/bin/sketerm-webengine" \
     || fail "packaged sketerm-webengine did not come from the current build"
