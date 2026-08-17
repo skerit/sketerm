@@ -5949,6 +5949,90 @@ test "xdg_popup.reposition: repositioned + configure + view move" {
     try t.expectEqualSlices([2]u32, &repos_expect, evs.items);
 }
 
+test "destroying a keyboard-focused popup returns focus to its parent" {
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 4, 3);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 6, 4);
+    { // parent: surface 5 -> xdg 6 -> toplevel 7, committed
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(5);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 4, 2);
+        b2.putNewId(6);
+        b2.putObject(5);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 6, 1);
+        b3.putNewId(7);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 5, 6); // commit
+        try req(&comp, try b4.finish());
+    }
+    { // popup: surface 8 -> xdg 9, positioner 10, popup 11 on parent 6
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(8);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 4, 2);
+        b2.putNewId(9);
+        b2.putObject(8);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 4, 1); // create_positioner
+        b3.putNewId(10);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 10, 1); // set_size(100, 50)
+        b4.putInt(100);
+        b4.putInt(50);
+        try req(&comp, try b4.finish());
+        var b5 = wire.Builder.init(&buf, 10, 2); // set_anchor_rect(0, 0, 1, 1)
+        b5.putInt(0);
+        b5.putInt(0);
+        b5.putInt(1);
+        b5.putInt(1);
+        try req(&comp, try b5.finish());
+        var b6 = wire.Builder.init(&buf, 9, 2); // get_popup(11, parent 6, pos 10)
+        b6.putNewId(11);
+        b6.putObject(6);
+        b6.putObject(10);
+        try req(&comp, try b6.finish());
+        var b7 = wire.Builder.init(&buf, 8, 6); // commit
+        try req(&comp, try b7.finish());
+    }
+
+    try comp.keyboardEnter(5);
+    try comp.keyboardEnter(8); // grab: the popup takes the keyboard
+    try t.expectEqual(@as(u32, 8), comp.keyboard_focus);
+
+    { // xdg_popup.destroy (GTK's path: the wl_surface is cached)
+        var b = wire.Builder.init(&buf, 11, 0);
+        try req(&comp, try b.finish());
+    }
+    // xdg_popup.grab semantics: focus falls back to the parent, not to
+    // "nothing" (which desynchronizes the client's is-active latch).
+    try t.expectEqual(@as(u32, 5), comp.keyboard_focus);
+
+    { // popup again on the cached surface: xdg 9 survived the role
+        // destroy, so get_popup(13, parent 6, pos 10) rebinds it.
+        var b = wire.Builder.init(&buf, 9, 2);
+        b.putNewId(13);
+        b.putObject(6);
+        b.putObject(10);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 8, 6); // commit
+        try req(&comp, try b2.finish());
+    }
+    try comp.keyboardEnter(8);
+    try t.expectEqual(@as(u32, 8), comp.keyboard_focus);
+    { // wl_surface.destroy on the focused popup: same fallback
+        var b = wire.Builder.init(&buf, 8, 0);
+        try req(&comp, try b.finish());
+    }
+    try t.expectEqual(@as(u32, 5), comp.keyboard_focus);
+}
+
 test "state sync v2: versions and input-protocol state round-trip" {
     var tv = TestView{};
     var brain = try Compositor.init(t.allocator, tv.view());

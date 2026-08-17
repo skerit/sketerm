@@ -874,9 +874,24 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
         switch (hdr.opcode) {
             0 => { // destroy
                 if (self.grabbed_popup == sid) self.grabbed_popup = 0;
+                var parent: u32 = 0;
                 if (self.surfaces.getPtr(sid)) |surf| {
+                    parent = surf.parent;
                     surf.popup = 0;
                     surf.configured = false;
+                }
+                // xdg_popup.grab semantics: a dismissed popup returns
+                // keyboard focus to its parent. GTK destroys only the
+                // role object here (the wl_surface is cached for
+                // reuse), so this — not wl_surface.destroy — is where
+                // a focused popup usually ends. Zeroing focus instead
+                // desynchronizes the client's is-active latch: the
+                // parent toplevel never gets a leave, and the next
+                // focus switch to another toplevel skips it too.
+                if (self.keyboard_focus == sid) {
+                    try self.keyboardLeave();
+                    if (parent != 0 and self.surfaces.contains(parent))
+                        self.keyboardEnter(parent) catch {};
                 }
                 if (self.view.popup_gone) |cb| cb(self.view.ctx, sid);
                 _ = self.xdg_map.remove(hdr.object);
@@ -1154,7 +1169,19 @@ pub fn surfaceRequest(self: *Compositor, hdr: wire.Header, it: *wire.ArgIter) Er
                 if (self.view.subsurface_gone) |cb| cb(self.view.ctx, hdr.object);
             }
             if (self.pointer_focus == hdr.object) self.pointer_focus = 0;
-            if (self.keyboard_focus == hdr.object) self.keyboard_focus = 0;
+            if (self.keyboard_focus == hdr.object) {
+                // xdg_popup.grab semantics: dismissing a grabbing popup
+                // returns keyboard focus to the parent surface. Merely
+                // zeroing the focus desynchronizes hub and client: the
+                // client's toplevel stays "active" (it never receives a
+                // leave -- its popup had the focus, and that surface is
+                // gone), and the next focus switch to another toplevel
+                // then skips the leave too, latching is-active forever.
+                self.keyboard_focus = 0;
+                const parent = if (surf.popup != 0) surf.parent else 0;
+                if (parent != 0 and self.surfaces.contains(parent))
+                    self.keyboardEnter(parent) catch {};
+            }
             // Constraints on a dead surface are defunct (their
             // objects survive until the client destroys them).
             var cit = self.constraints.valueIterator();
