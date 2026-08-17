@@ -260,6 +260,11 @@ pub const Conn = struct {
     closing: bool = false,
     /// Grace timer between `shutdown` and SIGKILL; 0 = none.
     kill_timer: c_uint = 0,
+    /// Deferred removal after a transport/session failure; 0 = none.
+    remove_idle: c_uint = 0,
+    /// Exact-pid child watch. It outlives this connection when teardown
+    /// wins the race with child exit.
+    child_watch: ?*LocalChildWatch = null,
     /// Last line the server wrote to stderr, for the status line.
     last_stderr: [160]u8 = undefined,
     last_stderr_len: usize = 0,
@@ -326,6 +331,7 @@ pub const Conn = struct {
     /// buffering (its own G_IO_OUT watch), so the whole queue moves at
     /// once.
     fn pumpWrite(self: *Conn) void {
+        if (self.closing) return;
         if (self.remote) |*rm| {
             if (self.sess.out.items.len == 0) return;
             defer {
@@ -496,6 +502,10 @@ pub const Conn = struct {
             _ = c.g_source_remove(self.kill_timer);
             self.kill_timer = 0;
         }
+        if (self.remove_idle != 0) {
+            _ = c.g_source_remove(self.remove_idle);
+            self.remove_idle = 0;
+        }
     }
 
     fn destroy(self: *Conn) void {
@@ -518,7 +528,15 @@ pub const Conn = struct {
         }
         self.child.killHard();
         self.child.closePipes();
-        _ = self.child.reap();
+        if (self.child_watch) |watch| {
+            watch.conn = null;
+            self.child_watch = null;
+            self.child.pid = -1;
+        } else {
+            // Only possible if installing the child watch failed before
+            // this connection became visible to the main loop.
+            self.child.reapBlocking();
+        }
         self.sess.deinit();
         const a = mgr.alloc;
         a.free(self.name);
@@ -527,6 +545,50 @@ pub const Conn = struct {
         a.destroy(self);
         // After the free: the idle-link scan must not see this Conn.
         if (drop_link) |link| mgr.maybeDropLink(link);
+    }
+};
+
+/// GLib owns this exact-pid child watch until reap, independently of its nullable `Conn` back-pointer.
+const LocalChildWatch = struct {
+    pid: c.pid_t,
+    conn: ?*Conn,
+    source: c_uint = 0,
+
+    fn create(pid: c.pid_t, conn: ?*Conn) ?*LocalChildWatch {
+        const self = std.heap.c_allocator.create(LocalChildWatch) catch return null;
+        self.* = .{ .pid = pid, .conn = conn };
+        self.source = c.g_child_watch_add_full(
+            c.G_PRIORITY_DEFAULT,
+            pid,
+            @ptrCast(&onExited),
+            @ptrCast(self),
+            @ptrCast(&free),
+        );
+        if (self.source == 0) {
+            std.heap.c_allocator.destroy(self);
+            return null;
+        }
+        return self;
+    }
+
+    fn onExited(pid: c.GPid, _: c_int, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(LocalChildWatch, user);
+        self.source = 0;
+        c.g_spawn_close_pid(pid);
+        if (pid != self.pid) return;
+        const cn = self.conn orelse return;
+        self.conn = null;
+        if (cn.child_watch != self) return;
+        cn.child_watch = null;
+        // A crashed leader may leave build tools in its process group.
+        // While that group exists its id cannot be reused.
+        _ = c.kill(-pid, c.SIGKILL);
+        cn.child.pid = -1;
+        if (!cn.closing) cn.sess.markDead();
+    }
+
+    fn free(user: ?*anyopaque) callconv(.c) void {
+        std.heap.c_allocator.destroy(cast.userData(LocalChildWatch, user));
     }
 };
 
@@ -1059,7 +1121,7 @@ pub const Manager = struct {
 
     fn findConn(self: *Manager, name: []const u8, root: []const u8) ?*Conn {
         for (self.conns.items) |cn| {
-            if (cn.closing) continue;
+            if (cn.closing or cn.sess.state == .dead) continue;
             if (cn.remote != null) continue;
             if (std.mem.eql(u8, cn.name, name) and std.mem.eql(u8, cn.root, root)) return cn;
         }
@@ -1383,6 +1445,19 @@ pub const Manager = struct {
             self.alloc.destroy(cn);
             return null;
         };
+        cn.child_watch = LocalChildWatch.create(cn.child.pid, cn) orelse {
+            // No source can reap this child later, so finish the exact
+            // child synchronously before discarding the failed spawn.
+            cn.child.killHard();
+            cn.child.closePipes();
+            cn.child.reapBlocking();
+            cn.sess.deinit();
+            self.alloc.free(cn.name);
+            self.alloc.free(cn.root);
+            self.alloc.free(cn.root_uri);
+            self.alloc.destroy(cn);
+            return null;
+        };
         cn.watch_out = c.g_unix_fd_add(
             cn.child.stdout,
             c.G_IO_IN | c.G_IO_ERR | c.G_IO_HUP,
@@ -1419,6 +1494,8 @@ pub const Manager = struct {
 
     fn onServerDead(self: *Manager, cn: *Conn) void {
         dbg("{s} dead: {s} / stderr: {s}", .{ cn.name, cn.sess.errText(), cn.stderrText() });
+        const local = cn.remote == null;
+        if (local) cn.closing = true;
         for (self.view.tabs.items) |tab| {
             const st = tab.lsp orelse continue;
             if (st.conn != cn) continue;
@@ -1427,10 +1504,25 @@ pub const Manager = struct {
             st.diags.clear();
             st.dropDecorations();
         }
+        if (local) cn.refs = 0;
         if (self.list.open and self.list.mode != .none) self.closePopup();
         self.closeSignature();
         cn.dropWatches();
+        // Session callbacks are reached from fd and child-watch
+        // callbacks. Removing/freeing their Conn inline would make the
+        // callback return through freed user-data, so local removal is
+        // always deferred to a fresh main-loop turn. Remote teardown is
+        // owned by its daemon channel/link and deliberately unchanged.
+        if (local and cn.remove_idle == 0)
+            cn.remove_idle = c.g_idle_add(@ptrCast(&onRemoveDeadIdle), @ptrCast(cn));
         self.view.queueRenderExternal();
+    }
+
+    fn onRemoveDeadIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const cn = cast.userData(Conn, user);
+        cn.remove_idle = 0;
+        cn.mgr.removeConn(cn);
+        return 0;
     }
 
     // ---- tab lifecycle -------------------------------------------------
@@ -1558,9 +1650,9 @@ pub const Manager = struct {
         for (self.conns.items, 0..) |x, i| {
             if (x != cn) continue;
             _ = self.conns.orderedRemove(i);
-            break;
+            cn.destroy();
+            return;
         }
-        cn.destroy();
     }
 
     /// The tab is closing (or its document was replaced by a reload).
@@ -4463,4 +4555,177 @@ test "lsp workspace edit: null and absent versions remain unversioned" {
     try std.testing.expect(textDocumentVersion(.null) == .unversioned);
     try std.testing.expect(textDocumentVersion(.{ .integer = 7 }) == .numeric);
     try std.testing.expect(textDocumentVersion(.{ .string = "7" }) == .invalid);
+}
+
+fn testWaitForChildReaped(pid: c.pid_t, timeout_ms: usize) bool {
+    var elapsed: usize = 0;
+    while (elapsed < timeout_ms) : (elapsed += 1) {
+        while (c.g_main_context_iteration(null, 0) != 0) {}
+        if (c.kill(pid, 0) < 0 and std.posix.errno(-1) == .SRCH) {
+            var status: c_int = 0;
+            const r = c.waitpid(pid, &status, c.WNOHANG);
+            if (r < 0 and std.posix.errno(r) == .INTR) continue;
+            return r < 0;
+        }
+        _ = c.usleep(1000);
+    }
+    return false;
+}
+
+fn testWaitForProcessGroupGone(pgid: c.pid_t, timeout_ms: usize) bool {
+    var elapsed: usize = 0;
+    while (elapsed < timeout_ms) : (elapsed += 1) {
+        while (c.g_main_context_iteration(null, 0) != 0) {}
+        if (c.kill(-pgid, 0) < 0 and std.posix.errno(-1) == .SRCH) return true;
+        _ = c.usleep(1000);
+    }
+    return false;
+}
+
+fn testWaitForFakeServerReady(child: *proc.Child) bool {
+    var buf: [64]u8 = undefined;
+    var used: usize = 0;
+    var elapsed: usize = 0;
+    while (elapsed < 2000) : (elapsed += 1) {
+        const n = c.read(child.stdout, buf[used..].ptr, buf.len - used);
+        if (n > 0) {
+            used += @intCast(n);
+            if (std.mem.indexOf(u8, buf[0..used], "ready") != null) return true;
+        }
+        _ = c.usleep(1000);
+    }
+    return false;
+}
+
+test "lsp local pool rejects a dead connection and selects its replacement" {
+    const testing = std.testing;
+    var view: EditorView = undefined;
+    var mgr = Manager{ .view = &view, .alloc = testing.allocator };
+    defer mgr.conns.deinit(testing.allocator);
+
+    var dead = Conn{
+        .mgr = &mgr,
+        .name = @constCast(@as([]const u8, "fake")),
+        .root = @constCast(@as([]const u8, "/workspace")),
+        .root_uri = @constCast(@as([]const u8, "file:///workspace")),
+        .sess = undefined,
+    };
+    dead.sess = session.Session.init(testing.allocator, dead.handler());
+    defer dead.sess.deinit();
+    dead.sess.state = .dead;
+    try mgr.conns.append(testing.allocator, &dead);
+    try testing.expect(mgr.findConn("fake", "/workspace") == null);
+
+    var replacement = Conn{
+        .mgr = &mgr,
+        .name = @constCast(@as([]const u8, "fake")),
+        .root = @constCast(@as([]const u8, "/workspace")),
+        .root_uri = @constCast(@as([]const u8, "file:///workspace")),
+        .sess = undefined,
+    };
+    replacement.sess = session.Session.init(testing.allocator, replacement.handler());
+    defer replacement.sess.deinit();
+    replacement.sess.state = .initializing;
+    try mgr.conns.append(testing.allocator, &replacement);
+    try testing.expectEqual(&replacement, mgr.findConn("fake", "/workspace").?);
+}
+
+test "lsp local child watch reaps a crashed fake server before restart" {
+    const testing = std.testing;
+    var crashed = try proc.spawn(testing.allocator, "sh", &.{ "-c", "exit 23" }, "/");
+    const crashed_pid = crashed.pid;
+    const crashed_watch = LocalChildWatch.create(crashed_pid, null);
+    try testing.expect(crashed_watch != null);
+    if (crashed_watch == null) {
+        crashed.killHard();
+        crashed.closePipes();
+        crashed.reapBlocking();
+        return;
+    }
+    crashed.closePipes();
+    try testing.expect(testWaitForChildReaped(crashed_pid, 2000));
+
+    var replacement = try proc.spawn(
+        testing.allocator,
+        "sh",
+        &.{ "-c", "trap '' TERM; printf 'ready\\n'; while :; do sleep 1; done" },
+        "/",
+    );
+    const replacement_pid = replacement.pid;
+    const replacement_watch = LocalChildWatch.create(replacement_pid, null);
+    try testing.expect(replacement_watch != null);
+    if (replacement_watch == null) {
+        replacement.killHard();
+        replacement.closePipes();
+        replacement.reapBlocking();
+        return;
+    }
+    try testing.expect(testWaitForFakeServerReady(&replacement));
+    replacement.killHard();
+    replacement.closePipes();
+    try testing.expect(testWaitForChildReaped(replacement_pid, 2000));
+    try testing.expect(testWaitForProcessGroupGone(replacement_pid, 2000));
+}
+
+test "lsp local shutdown retains reap watch after connection teardown" {
+    const testing = std.testing;
+    var child = try proc.spawn(
+        testing.allocator,
+        "sh",
+        &.{ "-c", "trap '' TERM; printf 'ready\\n'; while :; do sleep 1; done" },
+        "/",
+    );
+    const pid = child.pid;
+    var child_owned = true;
+    defer if (child_owned) {
+        child.killHard();
+        child.closePipes();
+        child.reapBlocking();
+    };
+    try testing.expect(testWaitForFakeServerReady(&child));
+
+    var view: EditorView = undefined;
+    var mgr = Manager{ .view = &view, .alloc = testing.allocator };
+    defer mgr.conns.deinit(testing.allocator);
+    const cn = try testing.allocator.create(Conn);
+    cn.* = .{
+        .mgr = &mgr,
+        .name = try testing.allocator.dupe(u8, "fake"),
+        .root = try testing.allocator.dupe(u8, "/workspace"),
+        .root_uri = try testing.allocator.dupe(u8, "file:///workspace"),
+        .child = child,
+        .sess = undefined,
+    };
+    child_owned = false;
+    cn.sess = session.Session.init(testing.allocator, cn.handler());
+    cn.child_watch = LocalChildWatch.create(pid, cn);
+    try testing.expect(cn.child_watch != null);
+    if (cn.child_watch == null) {
+        cn.destroy();
+        return;
+    }
+    try mgr.conns.append(testing.allocator, cn);
+
+    cn.child.terminate();
+    var elapsed: usize = 0;
+    while (elapsed < 30) : (elapsed += 1) {
+        while (c.g_main_context_iteration(null, 0) != 0) {}
+        _ = c.usleep(1000);
+    }
+    try testing.expect(c.kill(pid, 0) == 0);
+
+    // The dead-session callback schedules this idle instead of freeing
+    // Conn on its own stack; after it runs, only the detached child-watch
+    // record remains to observe and reap the SIGKILLed exact child.
+    cn.closing = true;
+    cn.remove_idle = c.g_idle_add(@ptrCast(&Manager.onRemoveDeadIdle), @ptrCast(cn));
+    try testing.expect(cn.remove_idle != 0);
+    var idle_spins: usize = 0;
+    while (mgr.conns.items.len > 0 and idle_spins < 100) : (idle_spins += 1) {
+        _ = c.g_main_context_iteration(null, 0);
+        _ = c.usleep(1000);
+    }
+    try testing.expectEqual(@as(usize, 0), mgr.conns.items.len);
+    try testing.expect(testWaitForChildReaped(pid, 2000));
+    try testing.expect(testWaitForProcessGroupGone(pid, 2000));
 }

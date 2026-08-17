@@ -45,13 +45,20 @@ pub const Child = struct {
     /// SIGTERM the process group. `kill` (SIGKILL) is the follow-up a
     /// caller makes after giving the server a moment to exit.
     pub fn terminate(self: *Child) void {
-        if (self.pid <= 0) return;
-        _ = c.kill(-self.pid, c.SIGTERM);
+        self.signalGroup(c.SIGTERM);
     }
 
     pub fn killHard(self: *Child) void {
+        self.signalGroup(c.SIGKILL);
+    }
+
+    /// Signal the server's exact process group, falling back to its PID
+    /// while the child is still racing to establish that group.
+    fn signalGroup(self: *Child, sig: c_int) void {
         if (self.pid <= 0) return;
-        _ = c.kill(-self.pid, c.SIGKILL);
+        const r = c.kill(-self.pid, sig);
+        if (r < 0 and std.posix.errno(@as(isize, r)) == .SRCH)
+            _ = c.kill(self.pid, sig);
     }
 
     /// Non-blocking reap. Returns true once the child is gone.
@@ -69,6 +76,19 @@ pub const Child = struct {
             return true;
         }
         return false;
+    }
+
+    /// Block until this exact child is reaped; only for setup-failure paths without a main-loop watch.
+    pub fn reapBlocking(self: *Child) void {
+        if (self.pid <= 0) return;
+        var status: c_int = 0;
+        while (true) {
+            const r = c.waitpid(self.pid, &status, 0);
+            if (r == self.pid) break;
+            if (r < 0 and std.posix.errno(r) == .INTR) continue;
+            break;
+        }
+        self.pid = -1;
     }
 };
 
@@ -152,6 +172,10 @@ pub fn spawn(
         c._exit(127);
     }
 
+    // Close the fork-to-setpgid race from the parent side too. Either
+    // this wins, or the child's identical call already did.
+    _ = c.setpgid(pid, pid);
+
     _ = c.close(in_fds[0]);
     _ = c.close(out_fds[1]);
     _ = c.close(err_fds[1]);
@@ -226,6 +250,7 @@ pub fn spawnSock(
         _ = c.execvp(cmd_z.ptr, @ptrCast(argv.items.ptr));
         c._exit(127);
     }
+    _ = c.setpgid(pid, pid);
     _ = c.close(pair[1]);
     setNonBlocking(pair[0]);
     return .{ .pid = pid, .fd = pair[0] };
@@ -297,7 +322,7 @@ test "proc: spawn round-trips bytes through a child's stdio" {
     defer {
         child.killHard();
         child.closePipes();
-        _ = child.reap();
+        child.reapBlocking();
     }
     try testing.expect(child.alive());
     const msg = "hello lsp\n";
@@ -358,7 +383,7 @@ test "proc: spawning a missing binary yields a child that dies immediately" {
     var child = try spawn(testing.allocator, "sketerm-no-such-binary-xyz", &.{}, "/");
     defer {
         child.closePipes();
-        _ = child.reap();
+        child.reapBlocking();
     }
     // The fork succeeds; the exec does not, and the parent learns about
     // it as EOF on stdout — the degradation path the UI relies on.
