@@ -211,6 +211,13 @@ the document is **dropped** — this is the same discipline
   `completionItem/resolve` answer is correlated to its list and item and
   carries documentation TEXT, so it too is revision-independent;
 * formatting: refused with "Document changed while formatting";
+* documentSymbol (the outline panel): refused and re-asked. Filling the
+  outline stamps it with the current revision, so a mis-mapped fill
+  would be believed until the next edit — the panel keeps its
+  Tree-sitter answer until a reply for the text on screen arrives.
+  Whether a request is in flight is asked of the `Session` rather than
+  tracked in the panel, so a dead server cannot leave a tab waiting
+  forever;
 * diagnostics: a numeric publication is accepted only for the latest
   sent document version. Its ranges are decoded against that version's
   editor revision, then carried through any still-debounced edits by the

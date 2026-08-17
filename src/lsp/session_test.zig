@@ -707,3 +707,42 @@ test "session: requests are refused once the session is dead" {
     s.markDead();
     try testing.expect(s.sendRequest(.hover, "textDocument/hover", "{}", .{ .id = 0, .kind = .hover }) == null);
 }
+
+test "session: a dead server leaves no request in flight" {
+    // The outline panel asks "is my documentSymbol still out there?"
+    // instead of keeping a pending flag, so a server that dies with one
+    // outstanding must not look like it is still thinking — that is
+    // what once left a tab never asking for symbols again.
+    const alloc = testing.allocator;
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var s = Session.init(alloc, rec.handler());
+    defer s.deinit();
+    try readySession(alloc, &s);
+    _ = s.sendRequest(.document_symbol, "textDocument/documentSymbol", "{}", .{
+        .id = 0,
+        .kind = .document_symbol,
+        .tab_id = 4,
+    });
+    try testing.expect(s.hasPending(.document_symbol, 4));
+    try testing.expect(!s.hasPending(.document_symbol, 5));
+    s.markDead();
+    try testing.expect(!s.hasPending(.document_symbol, 4));
+}
+
+test "session: a closing tab leaves no request in flight" {
+    const alloc = testing.allocator;
+    var rec = Recorder{ .alloc = alloc };
+    defer rec.deinit();
+    var s = Session.init(alloc, rec.handler());
+    defer s.deinit();
+    try readySession(alloc, &s);
+    _ = s.sendRequest(.document_symbol, "textDocument/documentSymbol", "{}", .{
+        .id = 0,
+        .kind = .document_symbol,
+        .tab_id = 6,
+    });
+    try testing.expect(s.hasPending(.document_symbol, 6));
+    s.forgetTab(6);
+    try testing.expect(!s.hasPending(.document_symbol, 6));
+}

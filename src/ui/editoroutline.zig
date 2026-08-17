@@ -39,6 +39,7 @@ const ETab = ev.ETab;
 const outline_mod = @import("../editor/outline.zig");
 const syntax = @import("../editor/syntax.zig");
 const lsp_pos = @import("../lsp/position.zig");
+const lsp_symbols = @import("../lsp/symbols.zig");
 
 pub fn buildPanel(view: *EditorView) void {
     const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
@@ -127,19 +128,37 @@ fn requestLsp(view: *EditorView, tab: *ETab) void {
     if (tab.lsp == null) return;
     if (tab != view.activeTab()) return;
     const m = view.lsp orelse return;
-    if (tab.outline_pending) return;
-    if (m.requestOutlineSymbols()) tab.outline_pending = true;
+    // Asked, never remembered: a "pending" flag has to be cleared on
+    // every failure path there is (server death, tab detach, session
+    // reset), and the one that was missed left the tab never asking a
+    // language server again for the rest of its life.
+    if (m.outlineRequestInFlight(tab)) return;
+    _ = m.requestOutlineSymbols();
 }
 
-/// Fill from a `documentSymbol` reply. Both response shapes are handled
-/// (hierarchical `DocumentSymbol[]` with `children`, and the flat
-/// `SymbolInformation[]` with `location`).
-pub fn fillFromLsp(view: *EditorView, tab: *ETab, result: std.json.Value, enc: lsp_pos.Encoding) void {
-    tab.outline_pending = false;
-    tab.outline.clear();
-    walkLsp(tab, result, enc, 0);
-    tab.outline.source = .lsp;
-    tab.outline.revision = tab.doc.revision;
+/// Fill from a `documentSymbol` reply, or ask again.
+///
+/// `reply_revision` is the revision the request was built against. A
+/// reply for anything else describes lines that have moved, and filling
+/// from it would stamp those wrong offsets as authoritative until the
+/// next edit — so it is dropped and re-asked instead.
+pub fn fillFromLsp(
+    view: *EditorView,
+    tab: *ETab,
+    result: std.json.Value,
+    enc: lsp_pos.Encoding,
+    reply_revision: u64,
+) void {
+    lsp_symbols.fromLsp(&tab.outline, &tab.doc, result, enc, reply_revision) catch |err| {
+        if (err == error.Stale) {
+            // The tree answer already on screen stays; the fresh
+            // request is the one that will replace it.
+            requestLsp(view, tab);
+            return;
+        }
+        lspFailed(view, tab);
+        return;
+    };
     tab.outline_rev = tab.doc.revision;
     render(view, tab);
 }
@@ -147,61 +166,9 @@ pub fn fillFromLsp(view: *EditorView, tab: *ETab, result: std.json.Value, enc: l
 /// The server answered, but with nothing usable: fall back to the tree
 /// rather than showing an empty panel.
 pub fn lspFailed(view: *EditorView, tab: *ETab) void {
-    tab.outline_pending = false;
     if (tab.outline.source == .lsp) tab.outline.clear();
     fillFromTree(view, tab);
     render(view, tab);
-}
-
-fn walkLsp(tab: *ETab, v: std.json.Value, enc: lsp_pos.Encoding, depth: u16) void {
-    const arr = switch (v) {
-        .array => |a| a,
-        else => return,
-    };
-    for (arr.items) |x| {
-        if (x != .object) continue;
-        const o = x.object;
-        const name = strOf(o.get("name")) orelse continue;
-        const kind = outline_mod.fromLsp(intOf(o.get("kind")) orelse 0);
-        const detail = strOf(o.get("detail")) orelse "";
-        var full = o.get("range") orelse std.json.Value.null;
-        var sel = o.get("selectionRange") orelse std.json.Value.null;
-        if (o.get("location")) |loc| {
-            if (loc == .object) {
-                full = loc.object.get("range") orelse std.json.Value.null;
-                sel = full;
-            }
-        }
-        if (sel == .null) sel = full;
-        const fr = lsp_pos.rangeToOffsets(&tab.doc.rope, lsp_pos.parseRange(full), enc);
-        const sr = lsp_pos.rangeToOffsets(&tab.doc.rope, lsp_pos.parseRange(sel), enc);
-        tab.outline.push(.{
-            .kind = kind,
-            .depth = depth,
-            .start = fr.start,
-            .end = fr.end,
-            .sel = sr.start,
-            .name = name,
-            .detail = detail,
-        }) catch return;
-        if (o.get("children")) |kids| walkLsp(tab, kids, enc, depth + 1);
-    }
-}
-
-fn strOf(v: ?std.json.Value) ?[]const u8 {
-    const val = v orelse return null;
-    return switch (val) {
-        .string => |s| s,
-        else => null,
-    };
-}
-
-fn intOf(v: ?std.json.Value) ?i64 {
-    const val = v orelse return null;
-    return switch (val) {
-        .integer => |i| i,
-        else => null,
-    };
 }
 
 // ---- rendering --------------------------------------------------------

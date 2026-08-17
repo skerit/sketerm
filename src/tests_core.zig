@@ -48,6 +48,7 @@ comptime {
     _ = @import("lsp/diagnostics.zig");
     _ = @import("lsp/docsync.zig");
     _ = @import("lsp/pending.zig");
+    _ = @import("lsp/symbols.zig");
     _ = @import("lsp/proc.zig");
     _ = @import("filebrowser/cache.zig");
     _ = @import("filebrowser/colkeys.zig");

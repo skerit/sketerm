@@ -2410,6 +2410,17 @@ pub const Manager = struct {
     /// to the outline panel".
     pub const OUTLINE_AUX: u64 = 1;
 
+    /// True while this tab's `documentSymbol` request is still with the
+    /// server. The session IS the record: it drops pending requests on
+    /// a server death, a reset and a tab detach, so there is no flag to
+    /// forget to clear.
+    pub fn outlineRequestInFlight(self: *Manager, tab: *ETab) bool {
+        _ = self;
+        const st = tab.lsp orelse return false;
+        const cn = st.conn orelse return false;
+        return cn.sess.hasPending(.document_symbol, tab.id);
+    }
+
     pub fn requestWorkspaceSymbols(self: *Manager) void {
         const r = self.ready("workspace symbols") orelse return;
         if (!r.cn.sess.caps.workspace_symbol) {
@@ -2451,7 +2462,7 @@ pub const Manager = struct {
                 const conn = st.conn orelse break :blk pos.Encoding.utf16;
                 break :blk conn.sess.caps.encoding;
             } else pos.Encoding.utf16;
-            editoroutline.fillFromLsp(self.view, tab, env.result, enc);
+            editoroutline.fillFromLsp(self.view, tab, env.result, enc, req.revision);
             return;
         }
         if (env.has_error) {

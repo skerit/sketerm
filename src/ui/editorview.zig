@@ -646,10 +646,9 @@ pub const ETab = struct {
     /// Symbol outline: LSP `documentSymbol` where a server answers, the
     /// Tree-sitter tree otherwise.
     outline: outline_mod.Outline,
-    /// Document revision the outline was built at, and whether an LSP
-    /// request for it is outstanding.
+    /// Document revision the outline was built at. Whether a request
+    /// is outstanding is asked of the session, not tracked here.
     outline_rev: u64 = 0,
-    outline_pending: bool = false,
 
     /// Top visible LINE restored from the layout, applied once the
     /// async load lands (the anchor itself is a wrap-dependent quantity
