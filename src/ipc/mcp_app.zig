@@ -457,8 +457,10 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         return toolResult(arena, summary, false) orelse error.OutOfMemory;
     }
     if (eql(u8, name, "app_output")) {
-        const text = app.output(argBool(args, "scrollback")) catch
-            return appErr(arena, "no terminal mirror for this app (output unavailable)");
+        const text = app.output(argBool(args, "scrollback")) catch |err| return appErr(arena, switch (err) {
+            appdrive.Error.Desynced => "this app's terminal mirror lost sync with the session and could not be rebuilt, so its content is stale; use app_log, which is served daemon-side",
+            else => "no terminal mirror for this app (output unavailable)",
+        });
         defer mcp.app_state.allocator.free(text);
         var msg: []const u8 = try arena.dupe(u8, text);
         if (std.mem.trim(u8, text, " \n\t\r").len == 0) {

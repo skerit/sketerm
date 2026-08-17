@@ -25,6 +25,10 @@ pub const Error = error{
     Timeout,
     BadKey,
     OutOfMemory,
+    /// The mirror stopped being able to follow the session's event stream
+    /// and could not be rebuilt. Distinct from NotConnected: the session is
+    /// alive, this client's copy of its screen is not.
+    Desynced,
 };
 
 pub const CompletionSource = enum { none, shell_integration, process_tracking };
@@ -748,6 +752,27 @@ pub const Term = struct {
         screen.apply(ev);
     }
 
+    /// Rebuild the mirror after it stopped being able to follow the event
+    /// stream. `detach` + `attach` on this same connection is a real resync
+    /// with no new verb: the daemon answers every attach with a snapshot.
+    ///
+    /// A desync must never be left to serve stale content. `seq` stops
+    /// moving, so `waitIdle` reports idle immediately and every read hands
+    /// back the screen frozen at the moment of the failure — with nothing
+    /// said to the caller. A resync that cannot complete is therefore
+    /// downgraded to transport loss, which the callers already handle.
+    fn resyncMirror(self: *Term) void {
+        self.conn.sendFrame(.detach, "") catch return self.transportLost();
+        (self.conn.recvExpectFor(&.{.ok}, 5_000) catch return self.transportLost()).deinit(self.allocator);
+        self.conn.sendAttach(self.name, .{
+            .origin_id = if (self.origin_id_valid) &self.origin_id else "",
+            .kind = "mcp",
+        }) catch return self.transportLost();
+        const snap = self.conn.recvExpectFor(&.{.snapshot}, 15_000) catch return self.transportLost();
+        defer snap.deinit(self.allocator);
+        self.applySnapshot(snap.payload) catch return self.transportLost();
+    }
+
     fn applyEvents(self: *Term, payload: []const u8) void {
         if (self.events_desynced) return;
         const screen = self.screen orelse return;
@@ -759,6 +784,7 @@ pub const Term = struct {
             applyScreenEvent,
         ) catch {
             self.events_desynced = true;
+            self.resyncMirror();
             return;
         };
         self.app_cursor = screen.app_cursor_keys;
@@ -1183,9 +1209,20 @@ pub const Term = struct {
         }
     }
 
+    /// The mirror stopped following the event stream and could not be
+    /// rebuilt: nothing derived from it describes the session any more.
+    pub fn isDesynced(self: *const Term) bool {
+        return self.events_desynced;
+    }
+
     /// Rendered screen text (drains pending events first).
+    ///
+    /// A mirror that could not be resynced is refused rather than served:
+    /// its content is frozen at the decode failure and looks like a quiet
+    /// terminal to the caller.
     pub fn readScreen(self: *Term, scrollback: bool) Error![]u8 {
         self.drain();
+        if (self.events_desynced) return Error.Desynced;
         const screen = self.screen orelse return Error.NotConnected;
         return (if (scrollback)
             screen.extractScrollback(self.allocator)
@@ -1194,7 +1231,12 @@ pub const Term = struct {
     }
 
     /// Block until output is quiet; this does not imply the foreground command exited.
+    ///
+    /// A mirror that could not be resynced is NOT idle — its `seq` is frozen
+    /// by the failure, not by the session going quiet, and reporting idle
+    /// there is how a stale screen used to read as a settled one.
     pub fn waitIdle(self: *Term, quiet_ms: i64, timeout_ms: i64) bool {
+        if (self.events_desynced) return false;
         const deadline = nowMs() + timeout_ms;
         var last_seq = self.seq;
         var last_change = nowMs();
@@ -1259,6 +1301,86 @@ fn testSpawnFailure(failure: SpawnFailure) !void {
         .cleanup_connect => try t.expectEqual(@as(usize, 1), daemon.reconnect_calls),
     }
     if (failure != .cleanup_connect) try daemon.expectSessionGone();
+}
+
+/// A local Term attached to the fake daemon's primary socketpair.
+fn spawnFakeTerm(daemon: *@import("launch_cleanup_test.zig").Harness, conn: *muxclient.Conn) !*Term {
+    const a = std.testing.allocator;
+    const name = try a.dupe(u8, "fake-term");
+    errdefer a.free(name);
+    return Term.finishSpawn(
+        a,
+        conn,
+        name,
+        "/bin/sh",
+        false,
+        null,
+        daemon.localEndpoint(),
+        @import("launch_cleanup_test.zig").SPAWN_REPLY,
+        1_000,
+    );
+}
+
+test "a desynced mirror resyncs instead of serving a frozen screen" {
+    const t = std.testing;
+    const fake = @import("launch_cleanup_test.zig");
+    const payload = try fake.snapshotPayload(t.allocator, false);
+    defer t.allocator.free(payload);
+
+    var daemon = try fake.Harness.init(t.allocator);
+    defer daemon.deinit();
+    var conn = daemon.takePrimary(t.allocator);
+    try daemon.queueSnapshot(payload);
+    const term = try spawnFakeTerm(&daemon, &conn);
+    defer {
+        term.exited = true; // no kill through the fake
+        term.deinit();
+    }
+    try daemon.expectAttach("fake-term", false);
+
+    // An undecodable event frame, then the detach ack + fresh snapshot the
+    // resync asks for. Without the resync the mirror would freeze here:
+    // seq stops moving, so waitIdle reports idle at once and every read
+    // serves the screen as it stood at the failure.
+    try daemon.queueEvents("\x00\x00\x00\x00");
+    try daemon.queuePrimaryAck();
+    try daemon.queueSnapshot(payload);
+    term.drain();
+
+    // Proof the mirror was REBUILT rather than healed by chance: only the
+    // resync re-attaches, and the daemon answers an attach with a snapshot.
+    try daemon.expectAttach("fake-term", false);
+    try t.expect(!term.isDesynced());
+    try t.expectEqual(@as(u64, 7), term.seq);
+    const text = try term.readScreen(false);
+    t.allocator.free(text);
+}
+
+test "a mirror that cannot resync is refused, never reported idle" {
+    const t = std.testing;
+    const fake = @import("launch_cleanup_test.zig");
+    const payload = try fake.snapshotPayload(t.allocator, false);
+    defer t.allocator.free(payload);
+
+    var daemon = try fake.Harness.init(t.allocator);
+    defer daemon.deinit();
+    var conn = daemon.takePrimary(t.allocator);
+    try daemon.queueSnapshot(payload);
+    const term = try spawnFakeTerm(&daemon, &conn);
+    defer {
+        term.exited = true;
+        term.deinit();
+    }
+    try daemon.expectAttach("fake-term", false);
+
+    try daemon.queueEvents("\x00\x00\x00\x00");
+    daemon.closePrimaryPeer();
+    term.drain();
+
+    try t.expect(term.isDesynced());
+    try t.expectError(Error.Desynced, term.readScreen(false));
+    // The stale mirror must not read as a settled terminal.
+    try t.expect(!term.waitIdle(1, 1));
 }
 
 test "Term spawn rolls back when attach send fails" {

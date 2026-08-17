@@ -75,6 +75,10 @@ pub const Harness = struct {
         try self.primary_peer.sendFrame(.snapshot, payload);
     }
 
+    pub fn queueEvents(self: *Harness, payload: []const u8) !void {
+        try self.primary_peer.sendFrame(.events, payload);
+    }
+
     pub fn queuePrimaryAck(self: *Harness) !void {
         try self.primary_peer.sendFrame(.ok, "{\"ok\":true}");
     }

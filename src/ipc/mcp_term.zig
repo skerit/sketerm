@@ -413,7 +413,10 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
     if (eql(u8, name, "term_read")) {
         t.drain();
         const sb = argBool(args, "scrollback");
-        const text = t.readScreen(sb) catch return appErr(arena, "read failed (terminal exited?)");
+        const text = t.readScreen(sb) catch |err| return appErr(arena, switch (err) {
+            termdrive.Error.Desynced => "this terminal's mirror lost sync with the session and could not be rebuilt; its content is stale. Close it (term_close) and open a new one",
+            else => "read failed (terminal exited?)",
+        });
         defer mcp.term_state.allocator.free(text);
         if (t.exited) {
             // Make an exited terminal's state unambiguous: the final
@@ -607,7 +610,9 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         const settled = t.waitIdle(quiet_ms, timeout_ms);
         // Prompt-aware verdict when integration can tell: "quiet
         // because sleeping" must not masquerade as "done".
-        const msg = if (!settled)
+        const msg = if (!settled and t.isDesynced())
+            "NOT idle: this terminal's mirror lost sync with the session and could not be rebuilt, so quiescence cannot be observed. Close it (term_close) and open a new one"
+        else if (!settled)
             "still active at timeout"
         else if (t.integration and t.foregroundRunning())
             "idle, but a foreground command is still RUNNING (output is quiet, not finished)"

@@ -35,6 +35,10 @@ pub const Error = error{
     NoClipboard,
     NotRecording,
     OutOfMemory,
+    /// The PTY mirror stopped being able to follow the session's event
+    /// stream and could not be rebuilt. The app is alive; this client's
+    /// copy of its terminal output is not.
+    Desynced,
 };
 
 /// WHY the last `App.launch`/`attachExisting` failed, human-readable
@@ -886,6 +890,44 @@ pub const App = struct {
         screen.apply(ev);
     }
 
+    /// Rebuild the PTY mirror from a fresh daemon snapshot after it stopped
+    /// being able to follow the event stream.
+    ///
+    /// Runs over a read-only SIDE connection (the `logGetFresh` shape): the
+    /// primary connection carries this app's native pixel channels, and a
+    /// detach/attach there would replay every one of them to fix a terminal
+    /// mirror. An attach is answered with a snapshot by definition, so no
+    /// new verb is needed. A failed resync leaves `term_desynced` set and
+    /// `output()` refuses rather than serving a screen frozen at the
+    /// decode failure with nothing said to the caller.
+    fn resyncTermMirror(self: *App) void {
+        const a = self.allocator;
+        const deadline = nowMs() + 10_000;
+        var conn = blk: {
+            if (self.ssh_host) |h| break :blk muxclient.Conn.connectSsh(a, h) catch return;
+            break :blk muxclient.Conn.connectLocalAutostartAt(a, self.local_sock) catch return;
+        };
+        defer conn.deinit();
+        conn.setNonBlocking();
+        conn.sendJson(.hello, .{
+            .proto = wire.PROTO_VERSION,
+            .min_proto = @as(u32, 1),
+            .negotiation = @as(u8, 1),
+            .snapshot_max = snapshot.SNAPSHOT_VERSION,
+            .native_state_max = @as(u8, 0),
+            .audio = false,
+            .winstream = false,
+            .video = false,
+        }) catch return;
+        (conn.recvExpectFor(&.{.welcome}, @max(deadline - nowMs(), 1)) catch return).deinit(a);
+        // Read-only: this side connection must never take the controller
+        // lease off the primary one.
+        conn.sendJson(.attach, .{ .name = self.name, .kind = "cli", .read_only = true }) catch return;
+        const snap = conn.recvExpectFor(&.{.snapshot}, @max(deadline - nowMs(), 1)) catch return;
+        defer snap.deinit(a);
+        self.applyTermSnapshot(snap.payload);
+    }
+
     /// Apply an `.events` frame ([seq:u64][count:u32] + wire events)
     /// to the terminal mirror.
     fn applyTermEvents(self: *App, payload: []const u8) void {
@@ -899,6 +941,7 @@ pub const App = struct {
             applyTermEvent,
         ) catch {
             self.term_desynced = true;
+            self.resyncTermMirror();
             return;
         };
     }
@@ -908,6 +951,7 @@ pub const App = struct {
     /// Caller owns the bytes.
     pub fn output(self: *App, scrollback: bool) Error![]u8 {
         self.drain();
+        if (self.term_desynced) return Error.Desynced;
         const screen = self.term_screen orelse return Error.NotConnected;
         return (if (scrollback)
             screen.extractScrollback(self.allocator)
@@ -3438,6 +3482,42 @@ fn testLaunchFailure(failure: LaunchFailure) !void {
         },
     }
     if (failure != .cleanup_connect) try daemon.expectSessionGone();
+}
+
+test "an app whose mirror lost sync refuses to serve it" {
+    const t = std.testing;
+    const fake = @import("launch_cleanup_test.zig");
+    const payload = try fake.snapshotPayload(t.allocator, true);
+    defer t.allocator.free(payload);
+
+    var daemon = try fake.Harness.init(t.allocator);
+    defer daemon.deinit();
+    const name = try t.allocator.dupe(u8, "fake-app");
+    var layout: ?xkblayout.Layout = null;
+    var conn = daemon.takePrimary(t.allocator);
+    try daemon.queueSnapshot(payload);
+    const app = try App.finishLaunch(
+        t.allocator,
+        &conn,
+        name,
+        &layout,
+        .{ .local_sock = "/fake/mux.sock", .step_timeout_ms = 5 },
+        daemon.localEndpoint(),
+        fake.SPAWN_REPLY,
+    );
+    defer {
+        app.exited = true; // no kill through the fake
+        app.deinit();
+    }
+    try daemon.expectAttach(name, true);
+    const healthy = try app.output(false); // a healthy mirror serves normally
+    t.allocator.free(healthy);
+
+    // Once the mirror can no longer follow the stream and the resync did
+    // not restore it, its content is frozen at the failure. Serving that
+    // as the app's output — with nothing said — is the whole defect.
+    app.term_desynced = true;
+    try t.expectError(Error.Desynced, app.output(false));
 }
 
 test "App launch rolls back when attach send fails" {
