@@ -145,7 +145,8 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
     // Second install of the SAME artifact as `sketerm-files`: the
     // dedicated file manager ships as its own executable (argv[0]
     // dispatch in filebrowser/entry.zig) so desktop taskbars that
@@ -194,9 +195,10 @@ pub fn build(b: *std.Build) void {
         .root_module = mux_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(mux_exe);
+    const install_mux = b.addInstallArtifact(mux_exe, .{});
+    b.getInstallStep().dependOn(&install_mux.step);
     const mux_step = b.step("mux", "Build the sketerm-mux session daemon");
-    mux_step.dependOn(&b.addInstallArtifact(mux_exe, .{}).step);
+    mux_step.dependOn(&install_mux.step);
 
     // Public mux-client SDK — the supported module for OUT-OF-REPO
     // daemon clients (agent harnesses, automation). Consumers add
@@ -441,7 +443,8 @@ pub fn build(b: *std.Build) void {
         .use_lld = use_lld,
     });
     const smoke_mcp_run = b.addRunArtifact(smoke_mcp);
-    smoke_mcp_run.step.dependOn(b.getInstallStep()); // execs zig-out/bin/sketerm
+    smoke_mcp_run.step.dependOn(&install_exe.step);
+    smoke_mcp_run.step.dependOn(&install_mux.step);
     smoke_mcp_run.setCwd(b.path("."));
     const smoke_mcp_step = b.step("smoke-mcp", "MCP isolation + headless-terminal smoke (headless)");
     smoke_mcp_step.dependOn(&smoke_mcp_run.step);
@@ -483,7 +486,6 @@ pub fn build(b: *std.Build) void {
         .root_module = spike_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(spike);
     const spike_run = b.addRunArtifact(spike);
     const spike_step = b.step("spike-gl", "Run the M0.5 GL share-group spike");
     spike_step.dependOn(&spike_run.step);
@@ -502,7 +504,6 @@ pub fn build(b: *std.Build) void {
         .root_module = shell_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(shell);
     const shell_run = b.addRunArtifact(shell);
     const shell_step = b.step("spike-shell", "Headless PTY/parser/screen smoke");
     shell_step.dependOn(&shell_run.step);
@@ -521,7 +522,6 @@ pub fn build(b: *std.Build) void {
         .root_module = replay_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(replay);
     const replay_run = b.addRunArtifact(replay);
     if (b.args) |args| replay_run.addArgs(args);
     const replay_step = b.step("replay", "Replay a captured PTY byte stream into a Screen dump");
@@ -541,7 +541,6 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(bench);
     const bench_run = b.addRunArtifact(bench);
     const bench_step = b.step("bench-parser", "Parser microbenchmark");
     bench_step.dependOn(&bench_run.step);
@@ -562,7 +561,6 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_ed_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(bench_ed);
     const bench_ed_run = b.addRunArtifact(bench_ed);
     if (b.args) |args| bench_ed_run.addArgs(args);
     const bench_ed_step = b.step("bench-editor", "Editor rope/document large-file benchmark");
@@ -594,7 +592,6 @@ pub fn build(b: *std.Build) void {
         .root_module = smoke_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(smoke);
     const smoke_run = b.addRunArtifact(smoke);
     const smoke_step = b.step("smoke-image", "Headless GL image render check");
     smoke_step.dependOn(&smoke_run.step);
@@ -619,11 +616,10 @@ pub fn build(b: *std.Build) void {
         .root_module = smoke_e2e_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(smoke_e2e);
     const smoke_e2e_run = b.addRunArtifact(smoke_e2e);
-    // It execs zig-out/bin/sketerm, so the main install must finish
-    // first, and the cwd must be the project root (default).
-    smoke_e2e_run.step.dependOn(b.getInstallStep());
+    // It execs the canonical GUI and daemon from zig-out/bin.
+    smoke_e2e_run.step.dependOn(&install_exe.step);
+    smoke_e2e_run.step.dependOn(&install_mux.step);
     smoke_e2e_run.setCwd(b.path("."));
     const smoke_e2e_step = b.step("smoke-e2e", "End-to-end GUI smoke on sketerm's own compositor (headless, no X)");
     smoke_e2e_step.dependOn(&smoke_e2e_run.step);
@@ -645,9 +641,9 @@ pub fn build(b: *std.Build) void {
             .root_module = wm_mod,
             .use_lld = use_lld,
         });
-        b.installArtifact(wm);
         const wm_run = b.addRunArtifact(wm);
-        wm_run.step.dependOn(b.getInstallStep());
+        wm_run.step.dependOn(&install_exe.step);
+        wm_run.step.dependOn(&install_mux.step);
         wm_run.setCwd(b.path("."));
         if (b.args) |args| wm_run.addArgs(args);
         const wm_step = b.step("measure-web", "Browser latency/sharpness measurement rig (headless display session)");
@@ -673,11 +669,9 @@ pub fn build(b: *std.Build) void {
         .root_module = smoke_lsp_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(smoke_lsp);
     const smoke_lsp_run = b.addRunArtifact(smoke_lsp);
-    // getInstallStep covers sketerm, sketerm-mux AND sketerm-lsp-stub
-    // (all three are b.installArtifact'ed).
-    smoke_lsp_run.step.dependOn(b.getInstallStep());
+    smoke_lsp_run.step.dependOn(&install_exe.step);
+    smoke_lsp_run.step.dependOn(&install_mux.step);
     smoke_lsp_run.setCwd(b.path("."));
     const smoke_lsp_step = b.step("smoke-lsp-gui", "Drive the real editor GUI against a real language server (headless, no X)");
     smoke_lsp_step.dependOn(&smoke_lsp_run.step);
@@ -705,9 +699,8 @@ pub fn build(b: *std.Build) void {
             .use_lld = use_lld,
         });
         const smoke_atspi_run = b.addRunArtifact(smoke_atspi);
-        // It execs zig-out/bin/sketerm + sketerm-mux, so install first;
-        // cwd must be the project root.
-        smoke_atspi_run.step.dependOn(b.getInstallStep());
+        smoke_atspi_run.step.dependOn(&install_exe.step);
+        smoke_atspi_run.step.dependOn(&install_mux.step);
         smoke_atspi_run.setCwd(b.path("."));
         const smoke_atspi_step = b.step("smoke-atspi", "Terminal-pane AT-SPI accessibility smoke on a private a11y bus (headless, no X)");
         smoke_atspi_step.dependOn(&smoke_atspi_run.step);
@@ -804,7 +797,6 @@ pub fn build(b: *std.Build) void {
         .root_module = smoke_cell_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(smoke_cell);
     const smoke_cell_run = b.addRunArtifact(smoke_cell);
     const smoke_cell_step = b.step("smoke-cell", "Headless GL cell-pipeline render check");
     smoke_cell_step.dependOn(&smoke_cell_run.step);
@@ -830,7 +822,6 @@ pub fn build(b: *std.Build) void {
         .root_module = bench_cell_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(bench_cell);
     const bench_cell_run = b.addRunArtifact(bench_cell);
     const bench_cell_step = b.step("bench-cell-upload", "Headless cell-upload microbench (isolates GL from GTK)");
     bench_cell_step.dependOn(&bench_cell_run.step);
@@ -855,7 +846,6 @@ pub fn build(b: *std.Build) void {
         .root_module = smoke_trans_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(smoke_trans);
     const smoke_trans_run = b.addRunArtifact(smoke_trans);
     const smoke_trans_step = b.step("smoke-transparency", "Headless GL bg-alpha render check");
     smoke_trans_step.dependOn(&smoke_trans_run.step);
@@ -880,7 +870,6 @@ pub fn build(b: *std.Build) void {
         .root_module = spike_editor_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(spike_editor);
     const spike_editor_run = b.addRunArtifact(spike_editor);
     const spike_editor_step = b.step("spike-editor-text", "Headless proportional-text render spike (editor foundation)");
     spike_editor_step.dependOn(&spike_editor_run.step);
@@ -904,9 +893,10 @@ pub fn build(b: *std.Build) void {
         .root_module = lsp_stub_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(lsp_stub);
+    const install_lsp_stub = b.addInstallArtifact(lsp_stub, .{});
     const lsp_stub_step = b.step("lsp-stub", "Build the scripted stub language server used by the tests");
-    lsp_stub_step.dependOn(&b.addInstallArtifact(lsp_stub, .{}).step);
+    lsp_stub_step.dependOn(&install_lsp_stub.step);
+    smoke_lsp_run.step.dependOn(&install_lsp_stub.step);
 
     // Headless editor-pipeline smoke — `zig build smoke-editor`.
     // Renders a real Document through editor_font itemization +
@@ -929,11 +919,10 @@ pub fn build(b: *std.Build) void {
         .root_module = smoke_editor_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(smoke_editor);
     const smoke_editor_run = b.addRunArtifact(smoke_editor);
     // The LSP stage spawns the stub server by path; building it first
     // is what makes `zig build smoke-editor` self-contained.
-    smoke_editor_run.step.dependOn(&b.addInstallArtifact(lsp_stub, .{}).step);
+    smoke_editor_run.step.dependOn(&install_lsp_stub.step);
     const smoke_editor_step = b.step("smoke-editor", "Headless editor text pipeline render check");
     smoke_editor_step.dependOn(&smoke_editor_run.step);
     }
@@ -959,7 +948,6 @@ pub fn build(b: *std.Build) void {
         .root_module = smoke_core_mod,
         .use_lld = use_lld,
     });
-    b.installArtifact(smoke_core);
     const smoke_core_run = b.addRunArtifact(smoke_core);
     const smoke_core_step = b.step("smoke-gl-core", "Compile all shaders under desktop GL 3.3 core (macOS GL path)");
     smoke_core_step.dependOn(&smoke_core_run.step);
