@@ -9,6 +9,7 @@
         "build.zig.zon",
         "src",
         "data",
+        "dist/test-test-roots.sh",
         "terminfo",
         "vendor/aro_shims",
         "vendor/avdec_shim.c",

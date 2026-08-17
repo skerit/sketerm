@@ -63,7 +63,26 @@ for path in "$package/vendor"/*; do
 done
 shopt -u dotglob nullglob
 
-for excluded in .git .zig-cache zig-cache zig-out zig-pkg dist; do
+dist_entries=(
+    test-test-roots.sh
+)
+
+for entry in "${dist_entries[@]}"; do
+    [ -f "$package/dist/$entry" ] \
+        || fail "fetched archive omitted dist/$entry"
+done
+
+shopt -s dotglob nullglob
+for path in "$package/dist"/*; do
+    entry=${path##*/}
+    case " ${dist_entries[*]} " in
+        *" $entry "*) ;;
+        *) fail "fetched archive unexpectedly included dist/$entry" ;;
+    esac
+done
+shopt -u dotglob nullglob
+
+for excluded in .git .zig-cache zig-cache zig-out zig-pkg; do
     [ ! -e "$package/$excluded" ] \
         || fail "fetched archive unexpectedly included $excluded"
 done
@@ -107,6 +126,9 @@ cef_lib=${CEF_LIB:-/usr/lib/cef}
 if [ -f "$cef_include/include/capi/cef_app_capi.h" ] \
         && [ -f "$cef_lib/libcef.so" ]; then
     run_build web \
+        -Dcef-include="$cef_include" \
+        -Dcef-lib="$cef_lib"
+    run_build test-web \
         -Dcef-include="$cef_include" \
         -Dcef-lib="$cef_lib"
 else
