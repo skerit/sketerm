@@ -1201,16 +1201,26 @@ fn installCss(any_widget: *c.GtkWidget) void {
         \\/* The window paints every `paned > separator` as a solid
         \\   pane-gap bar (winconfig `refreshTitlebarCss`). This divider
         \\   is a control the user drags, so it gets the stock look back
-        \\   with a wide enough grab area. */
+        \\   with a wide enough grab area. GTK only hit-tests the
+        \\   separator's ALLOCATED box — margins are not pickable — so
+        \\   the grab width must come from min-width, with the thin line
+        \\   drawn as a centered background instead of a thin widget
+        \\   (min-width: 1px + margins made a one-pixel drag target). */
         \\paned.sketerm-tst-paned.horizontal > separator {
-        \\  background-color: alpha(currentColor, 0.15);
-        \\  background-image: none;
-        \\  min-width: 1px;
-        \\  margin: 0 2px;
+        \\  background-color: transparent;
+        \\  background-image: linear-gradient(to right,
+        \\    alpha(currentColor, 0.15), alpha(currentColor, 0.15));
+        \\  background-size: 1px 100%;
+        \\  background-repeat: no-repeat;
+        \\  background-position: center;
+        \\  min-width: 5px;
+        \\  margin: 0;
         \\  box-shadow: none;
         \\}
         \\paned.sketerm-tst-paned.horizontal > separator:hover {
-        \\  background-color: @theme_selected_bg_color;
+        \\  background-image: linear-gradient(to right,
+        \\    @theme_selected_bg_color, @theme_selected_bg_color);
+        \\  background-size: 3px 100%;
         \\}
     ;
     cssutil.install("tabsidebar", any_widget, css);
