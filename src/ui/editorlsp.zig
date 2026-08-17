@@ -1425,7 +1425,6 @@ pub const Manager = struct {
             st.conn = null;
             st.sync.open = false;
             st.diags.clear();
-            st.diags.published = false;
             st.dropDecorations();
         }
         if (self.list.open and self.list.mode != .none) self.closePopup();
@@ -1500,13 +1499,10 @@ pub const Manager = struct {
         }
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
-        st.sync.version = 1;
-        st.sync.revision = tab.doc.revision;
+        st.sync.noteSent(1, tab.doc.revision, text);
         dbg("didOpen {s} ({s}, {d} bytes)", .{ st.sync.uri, st.sync.language_id, text.len });
         cn.sess.didOpen(st.sync.uri, st.sync.language_id, st.sync.version, text);
         st.sync.open = true;
-        st.sync.clearQueue();
-        st.sync.needs_full = false;
         st.dropDecorations();
         cn.pumpWrite();
         self.armDecorations(tab);
@@ -1652,7 +1648,6 @@ pub const Manager = struct {
             return;
         };
         st.diags.clear();
-        st.diags.published = false;
         st.sync.clearQueue();
         st.sync.needs_full = false;
         st.dropDecorations();
@@ -1667,8 +1662,7 @@ pub const Manager = struct {
         }
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
-        st.sync.version += 1;
-        st.sync.revision = tab.doc.revision;
+        st.sync.noteSent(st.sync.version + 1, tab.doc.revision, text);
         cn.sess.didChange(st.sync.uri, st.sync.version, &.{}, text);
         cn.pumpWrite();
         self.armDecorations(tab);
@@ -1700,6 +1694,16 @@ pub const Manager = struct {
             return;
         };
         const st = tab.lsp orelse return;
+        const version: ?i64 = switch (textDocumentVersion(obj.get("version"))) {
+            .unversioned => null,
+            .numeric => |v| v,
+            .invalid => return,
+        };
+        if (!st.diags.acceptsPublication(version)) return;
+        const mapper = st.sync.diagnosticMapper(&tab.doc, version) orelse {
+            dbg("stale diagnostics for {s}: version {any}, sent {d}", .{ uri, version, st.sync.version });
+            return;
+        };
         const arr = switch (obj.get("diagnostics") orelse std.json.Value.null) {
             .array => |a| a,
             else => return,
@@ -1716,7 +1720,7 @@ pub const Manager = struct {
         for (arr.items) |d| {
             if (d != .object) continue;
             const dr = pos.parseRange(d.object.get("range") orelse .null);
-            const offs = pos.rangeToOffsets(&tab.doc.rope, dr, enc);
+            const offs = mapper.rangeToOffsets(dr, enc);
             const msg = switch (d.object.get("message") orelse std.json.Value.null) {
                 .string => |s| s,
                 else => "",
@@ -1746,7 +1750,7 @@ pub const Manager = struct {
             };
         }
         dbg("diagnostics for {s}: {d}", .{ uri, list.items.len });
-        st.diags.replace(tab.doc.revision, list.items) catch {};
+        if (!(st.diags.replacePublication(mapper.revision, version, list.items) catch false)) return;
         self.view.queueRenderExternal();
         self.view.updateStatusExternal();
     }

@@ -204,11 +204,15 @@ the document is **dropped** — this is the same discipline
 
 * completion, hover: dropped (their ranges describe text that is gone);
 * formatting: refused with "Document changed while formatting";
-* diagnostics: **not** dropped. They are the one long-lived result, so
-  they are converted once to byte offsets and then carried through every
-  subsequent edit by `Store.mapThrough` — the same `tr.mapOffset`
-  primitive selections and fold anchors use. A publish replaces the set
-  wholesale.
+* diagnostics: a numeric publication is accepted only for the latest
+  sent document version. Its ranges are decoded against that version's
+  editor revision, then carried through any still-debounced edits by the
+  same `tr.mapOffset` primitive selections and fold anchors use. Late or
+  unknown versions are dropped, so they cannot replace a newer set.
+  Servers that omit `version` remain supported; their ranges use the
+  latest sent snapshot conservatively, and an unversioned publication
+  cannot replace an already-versioned set. Once accepted, diagnostics
+  remain the one long-lived result and continue mapping through edits.
 
 ## Debounce and cancellation
 

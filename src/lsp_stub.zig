@@ -50,6 +50,7 @@ const rpc = @import("lsp/rpc.zig");
 
 var doc_text: std.ArrayList(u8) = .empty;
 var doc_uri: std.ArrayList(u8) = .empty;
+var doc_version: i64 = 0;
 var utf8_mode = false;
 /// `--range-only`: advertise `semanticTokens/range` and NOT `full`, the
 /// shape a client that only implements `full` treats as no provider at
@@ -104,9 +105,12 @@ fn handle(body: []const u8) bool {
             const text = strOf(objGet(td, "text")) orelse "";
             reportDidOpen(text.len);
             setDoc(strOf(objGet(td, "uri")) orelse "", text);
+            doc_version = versionOf(objGet(td, "version")) orelse 0;
             publishDiagnostics();
         } else if (std.mem.eql(u8, env.method, "textDocument/didChange")) {
             applyChanges(env.params);
+            if (objGet(env.params, "textDocument")) |td|
+                doc_version = versionOf(objGet(td, "version")) orelse doc_version;
             publishDiagnostics();
         }
         return false;
@@ -340,7 +344,7 @@ fn publishDiagnostics() void {
     defer out.deinit(alloc);
     out.appendSlice(alloc, "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"") catch return;
     out.appendSlice(alloc, doc_uri.items) catch return;
-    out.appendSlice(alloc, "\",\"diagnostics\":[") catch return;
+    out.print(alloc, "\",\"version\":{d},\"diagnostics\":[", .{doc_version}) catch return;
     var first = true;
     inline for (.{ .{ "BAD", 1, "stub: BAD is not allowed" }, .{ "MEH", 2, "stub: MEH is discouraged" } }) |spec| {
         var from: usize = 0;
@@ -859,5 +863,13 @@ fn intOf(v: ?std.json.Value) usize {
     return switch (val) {
         .integer => |i| if (i < 0) 0 else @intCast(i),
         else => 0,
+    };
+}
+
+fn versionOf(v: ?std.json.Value) ?i64 {
+    const value = v orelse return null;
+    return switch (value) {
+        .integer => |i| i,
+        else => null,
     };
 }

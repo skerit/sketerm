@@ -312,6 +312,7 @@ test "session: the client advertises what these features actually need" {
     try testing.expect(std.mem.indexOf(u8, session.CLIENT_CAPS, "\"readonly\"") != null);
     try testing.expect(std.mem.indexOf(u8, session.CLIENT_CAPS, "\"deprecated\"") != null);
     try testing.expect(std.mem.indexOf(u8, session.CLIENT_CAPS, "\"defaultLibrary\"") != null);
+    try testing.expect(std.mem.indexOf(u8, session.CLIENT_CAPS, "\"versionSupport\":true") != null);
 }
 
 test "session: the new capabilities default to off" {

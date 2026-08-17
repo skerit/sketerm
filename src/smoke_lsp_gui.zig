@@ -272,7 +272,7 @@ const ZLS_BODY =
 ;
 
 /// Which server the rig drives: `SKETERM_SMOKE_LSP` forces one
-/// (ts|clangd|zls|stub); otherwise the first installed real server
+/// (ts|clangd|zls|stub|stub-utf8); otherwise the first installed real server
 /// wins, the scripted stub last.
 fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
     const forced: []const u8 = if (c.getenv("SKETERM_SMOKE_LSP")) |v| std.mem.span(v) else "";
@@ -342,7 +342,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
     return .{
         .name = "stub",
         .command = stub_path,
-        .args = "",
+        .args = if (want.is("stub-utf8")) "--utf8" else "",
         .languages = "zig",
         .root_files = "build.zig",
         .file = "main.zig",

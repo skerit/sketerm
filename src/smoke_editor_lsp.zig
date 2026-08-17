@@ -108,12 +108,19 @@ const Harness = struct {
             .array => |a| a,
             else => return,
         };
+        const version: ?i64 = switch (obj.get("version") orelse std.json.Value.null) {
+            .integer => |v| v,
+            .null => null,
+            else => return,
+        };
+        if (!self.diags.acceptsPublication(version)) return;
+        const mapper = self.sync.diagnosticMapper(&self.doc, version) orelse return;
         var list: std.ArrayList(diagnostics.Diagnostic) = .empty;
         defer list.deinit(self.alloc);
         for (arr.items) |d| {
             if (d != .object) continue;
             const r = pos.parseRange(d.object.get("range") orelse .null);
-            const offs = pos.rangeToOffsets(&self.doc.rope, r, self.sess.caps.encoding);
+            const offs = mapper.rangeToOffsets(r, self.sess.caps.encoding);
             const msg = switch (d.object.get("message") orelse std.json.Value.null) {
                 .string => |s| s,
                 else => "",
@@ -130,7 +137,7 @@ const Harness = struct {
                 .source = @constCast(@as([]const u8, "stub")),
             }) catch return;
         }
-        self.diags.replace(self.doc.revision, list.items) catch return;
+        if (!(self.diags.replacePublication(mapper.revision, version, list.items) catch false)) return;
         self.published += 1;
     }
 
@@ -272,10 +279,10 @@ fn rangeOnlyStage(alloc: std.mem.Allocator) !?u8 {
 
     try h.sync.setUri(URI);
     h.sync.open = true;
-    h.sync.version = 1;
     {
         const text = try h.doc.textAlloc(alloc);
         defer alloc.free(text);
+        h.sync.noteSent(1, h.doc.revision, text);
         h.sess.didOpen(URI, "zig", 1, text);
     }
 
@@ -336,10 +343,10 @@ fn runOnce(alloc: std.mem.Allocator, utf8: bool) !?u8 {
     try h.sync.setUri(URI);
     h.sync.language_id = "zig";
     h.sync.open = true;
-    h.sync.version = 1;
     {
         const text = try h.doc.textAlloc(alloc);
         defer alloc.free(text);
+        h.sync.noteSent(1, h.doc.revision, text);
         h.sess.didOpen(URI, "zig", 1, text);
     }
     if (!h.waitFor(&h, Harness.publishedCond, 4000)) return fail("no diagnostics published", .{});
@@ -510,7 +517,7 @@ fn runOnce(alloc: std.mem.Allocator, utf8: bool) !?u8 {
         {
             const text = try h.doc.textAlloc(alloc);
             defer alloc.free(text);
-            h.sync.version += 1;
+            h.sync.noteSent(h.sync.version + 1, h.doc.revision, text);
             h.sess.didChange(URI, h.sync.version, &.{}, text);
             h.pump();
         }

@@ -74,6 +74,9 @@ pub const Store = struct {
     /// True once a publish has landed — distinguishes "no problems"
     /// from "the server has not answered yet".
     published: bool = false,
+    /// Numeric document version carried by the accepted publication;
+    /// null means the server omitted it.
+    lsp_version: ?i64 = null,
 
     pub fn init(alloc: Allocator) Store {
         return .{ .alloc = alloc };
@@ -91,12 +94,34 @@ pub const Store = struct {
             if (d.raw.len > 0) self.alloc.free(d.raw);
         }
         self.items.clearRetainingCapacity();
+        self.published = false;
+        self.lsp_version = null;
     }
 
     /// Replace the whole set (LSP publishes are always complete).
     /// Items are sorted by start offset so navigation and the render
     /// pass can both walk them linearly.
     pub fn replace(self: *Store, revision: u64, incoming: []const Diagnostic) Allocator.Error!void {
+        try self.replaceImpl(revision, null, incoming);
+    }
+
+    /// Replace a publication unless its version is older or ambiguously unversioned after a versioned set.
+    pub fn replacePublication(self: *Store, revision: u64, version: ?i64, incoming: []const Diagnostic) Allocator.Error!bool {
+        if (!self.acceptsPublication(version)) return false;
+        try self.replaceImpl(revision, version, incoming);
+        return true;
+    }
+
+    pub fn acceptsPublication(self: *const Store, version: ?i64) bool {
+        if (!self.published) return true;
+        if (version) |incoming| {
+            const current = self.lsp_version orelse return true;
+            return incoming >= current;
+        }
+        return self.lsp_version == null;
+    }
+
+    fn replaceImpl(self: *Store, revision: u64, version: ?i64, incoming: []const Diagnostic) Allocator.Error!void {
         self.clear();
         try self.items.ensureTotalCapacity(self.alloc, incoming.len);
         for (incoming) |d| {
@@ -112,6 +137,7 @@ pub const Store = struct {
         std.mem.sort(Diagnostic, self.items.items, {}, lessByStart);
         self.revision = revision;
         self.published = true;
+        self.lsp_version = version;
     }
 
     fn lessByStart(_: void, a: Diagnostic, b: Diagnostic) bool {
@@ -306,4 +332,33 @@ test "diagnostics: a deletion swallowing a range collapses it, never inverts it"
     s.mapThrough(&edits);
     try testing.expectEqual(@as(usize, 5), s.items.items[0].start);
     try testing.expect(s.items.items[0].end >= s.items.items[0].start);
+}
+
+test "diagnostics: v1 arriving after v2 cannot overwrite the newer set" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try testing.expect(try s.replacePublication(2, 2, &.{mk(0, 1, .err, "v2")}));
+    try testing.expect(!try s.replacePublication(1, 1, &.{mk(5, 6, .warning, "late v1")}));
+    try testing.expectEqual(@as(?i64, 2), s.lsp_version);
+    try testing.expectEqualStrings("v2", s.items.items[0].message);
+}
+
+test "diagnostics: duplicate versions replace in arrival order" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try testing.expect(try s.replacePublication(7, 3, &.{mk(1, 2, .err, "first")}));
+    try testing.expect(try s.replacePublication(7, 3, &.{mk(4, 5, .warning, "duplicate")}));
+    try testing.expectEqual(@as(usize, 4), s.items.items[0].start);
+    try testing.expectEqualStrings("duplicate", s.items.items[0].message);
+}
+
+test "diagnostics: unversioned publications remain compatible but never replace versioned diagnostics" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try testing.expect(try s.replacePublication(1, null, &.{mk(0, 1, .err, "legacy one")}));
+    try testing.expect(try s.replacePublication(2, null, &.{mk(2, 3, .warning, "legacy two")}));
+    try testing.expectEqualStrings("legacy two", s.items.items[0].message);
+    try testing.expect(try s.replacePublication(3, 4, &.{mk(4, 5, .err, "versioned")}));
+    try testing.expect(!try s.replacePublication(4, null, &.{mk(6, 7, .err, "ambiguous")}));
+    try testing.expectEqualStrings("versioned", s.items.items[0].message);
 }
