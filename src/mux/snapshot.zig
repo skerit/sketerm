@@ -15,6 +15,14 @@
 //! v7: no field changes — it marks colrv1 support. A v6 peer's
 //! `Format` enum has no tag 2, so its restore would reject the whole
 //! snapshot; colrv1 entries are withheld from v6 bodies instead.
+//! v8: a trailing interpreter-state block carries DECSC/DECRC state,
+//! charsets, single shift, tab stops, UTF-8/REP context, title stack,
+//! omitted terminal modes, keyboard stacks, and the prompt-ring head.
+//! v1-v7 bodies restore those fields to Screen.init defaults: cursor
+//! save at 0,0 with default style/modes/charsets and no link; ASCII G0,
+//! no single shift, default 8-column tabs, empty decoder/REP/title and
+//! keyboard stacks, normal video, DECCOLM disabled, and a prompt head
+//! derived from the serialized mark count (zero when the ring is full).
 
 const std = @import("std");
 const Screen = @import("../grid/screen.zig").Screen;
@@ -23,7 +31,7 @@ const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION = 7;
+pub const SNAPSHOT_VERSION = 8;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
 
 /// v5: byte budget for the Glyph Protocol glossary tail. Newest
@@ -278,6 +286,51 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
             try s.bytes(ge.e.payload);
         }
     }
+
+    // v8 tail: state consulted while applying later parser events. It
+    // stays last so every historical body remains byte-for-byte stable.
+    if (version >= 8) {
+        try s.int(u16, screen.saved_row);
+        try s.int(u16, screen.saved_col);
+        try s.int(u16, screen.saved_style);
+        try s.boolean(screen.saved_origin);
+        try s.boolean(screen.saved_autowrap);
+        try s.byte(@intFromEnum(screen.saved_charset_g0));
+        try s.byte(@intFromEnum(screen.saved_charset_g1));
+        try s.byte(@intFromEnum(screen.saved_active_charset));
+        try s.byte(screen.saved_link_id);
+
+        try s.byte(@intFromEnum(screen.charset_g0));
+        try s.byte(@intFromEnum(screen.charset_g1));
+        try s.byte(@intFromEnum(screen.active_charset));
+        try s.byte(@intFromEnum(screen.pending_single_shift));
+        if (screen.tab_stops.items.len != screen.cols) return error.BadScreenState;
+        try s.int(u16, @intCast(screen.tab_stops.items.len));
+        for (screen.tab_stops.items) |stop| try s.boolean(stop);
+
+        try s.int(u32, screen.last_print_cp);
+        try s.int(u32, screen.last_print_key);
+        try s.byte(screen.decoder.expected);
+        try s.byte(screen.decoder.have);
+        try s.int(u32, screen.decoder.buf);
+
+        try s.byte(screen.modify_other_keys);
+        try s.boolean(screen.reverse_screen);
+        try s.boolean(screen.allow_decolm);
+        try s.byte(screen.kitty_kbd_flags);
+        try s.byte(screen.kitty_kbd_depth);
+        try s.out.appendSlice(allocator, screen.kitty_kbd_stack[0..]);
+        try s.byte(screen.kitty_kbd_other_flags);
+        try s.byte(screen.kitty_kbd_other_depth);
+        try s.out.appendSlice(allocator, screen.kitty_kbd_other_stack[0..]);
+
+        try s.int(u16, screen.prompt_marks_head);
+        if (screen.title_stack_depth > screen.title_stack.len) return error.BadScreenState;
+        try s.byte(screen.title_stack_depth);
+        for (screen.title_stack[0..screen.title_stack_depth]) |entry| {
+            try s.bytes(entry orelse return error.BadScreenState);
+        }
+    }
 }
 
 pub const Envelope = struct {
@@ -327,6 +380,14 @@ const Src = struct {
         return (try self.byte()) != 0;
     }
 
+    fn strictBoolean(self: *Src) Error!bool {
+        return switch (try self.byte()) {
+            0 => false,
+            1 => true,
+            else => error.BadSnapshot,
+        };
+    }
+
     fn color(self: *Src) Error!style_pool.Color {
         return switch (try self.byte()) {
             0 => .default,
@@ -372,6 +433,13 @@ const Src = struct {
         };
     }
 };
+
+fn validateLinkState(screen: *const Screen) !void {
+    if (screen.current_link_id != 0 and !screen.links.contains(screen.current_link_id))
+        return error.BadSnapshot;
+    if (screen.saved_link_id != 0 and !screen.links.contains(screen.saved_link_id))
+        return error.BadSnapshot;
+}
 
 pub const StagedRestore = struct {
     screen: *Screen,
@@ -524,8 +592,10 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
     }
 
     const n_links = try src.int(u16);
+    if (n_links > 255) return error.BadSnapshot;
     for (0..n_links) |_| {
         const key = try src.byte();
+        if (key == 0 or screen.links.contains(key)) return error.BadSnapshot;
         const uri_len = try src.int(u32);
         const uri = try src.take(uri_len);
         const copy = try allocator.dupe(u8, uri);
@@ -546,8 +616,14 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
         try screen.clusters.put(key, list);
     }
 
-    screen.prompt_marks_len = @min(try src.int(u16), screen.prompt_marks.len);
+    const prompt_marks_len = try src.int(u16);
+    if (prompt_marks_len > screen.prompt_marks.len) return error.BadSnapshot;
+    screen.prompt_marks_len = prompt_marks_len;
     for (0..screen.prompt_marks_len) |idx| screen.prompt_marks[idx] = try src.int(u64);
+    screen.prompt_marks_head = if (screen.prompt_marks_len < screen.prompt_marks.len)
+        screen.prompt_marks_len
+    else
+        0;
 
     // Retained image placements — parked on the screen; the client
     // replays them into its image sink once a pane is wired
@@ -624,6 +700,75 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
         }
     }
 
+    // v8 tail: older snapshots intentionally keep Screen.init defaults
+    // (and the derived prompt-ring head above).
+    if (version >= 8) {
+        screen.saved_row = try src.int(u16);
+        screen.saved_col = try src.int(u16);
+        screen.saved_style = try src.int(u16);
+        if (screen.saved_style >= n_styles) return error.BadSnapshot;
+        screen.saved_origin = try src.strictBoolean();
+        screen.saved_autowrap = try src.strictBoolean();
+        screen.saved_charset_g0 = std.enums.fromInt(Screen.Charset, try src.byte()) orelse return error.BadSnapshot;
+        screen.saved_charset_g1 = std.enums.fromInt(Screen.Charset, try src.byte()) orelse return error.BadSnapshot;
+        screen.saved_active_charset = std.enums.fromInt(Screen.ActiveCharset, try src.byte()) orelse return error.BadSnapshot;
+        screen.saved_link_id = try src.byte();
+
+        screen.charset_g0 = std.enums.fromInt(Screen.Charset, try src.byte()) orelse return error.BadSnapshot;
+        screen.charset_g1 = std.enums.fromInt(Screen.Charset, try src.byte()) orelse return error.BadSnapshot;
+        screen.active_charset = std.enums.fromInt(Screen.ActiveCharset, try src.byte()) orelse return error.BadSnapshot;
+        screen.pending_single_shift = std.enums.fromInt(Screen.PendingSingleShift, try src.byte()) orelse return error.BadSnapshot;
+        const n_tab_stops = try src.int(u16);
+        if (n_tab_stops != cols or screen.tab_stops.items.len != cols) return error.BadSnapshot;
+        for (screen.tab_stops.items) |*stop| stop.* = try src.strictBoolean();
+
+        screen.last_print_cp = try src.int(u32);
+        screen.last_print_key = try src.int(u32);
+        const decoder_expected = try src.byte();
+        const decoder_have = try src.byte();
+        const decoder_buf = try src.int(u32);
+        const decoder_valid = if (decoder_expected == 0)
+            decoder_have == 0 and decoder_buf == 0
+        else
+            decoder_expected >= 2 and decoder_expected <= 4 and
+                decoder_have >= 1 and decoder_have < decoder_expected;
+        if (!decoder_valid) return error.BadSnapshot;
+        screen.decoder.expected = @intCast(decoder_expected);
+        screen.decoder.have = @intCast(decoder_have);
+        screen.decoder.buf = decoder_buf;
+
+        screen.modify_other_keys = try src.byte();
+        if (screen.modify_other_keys > 2) return error.BadSnapshot;
+        screen.reverse_screen = try src.strictBoolean();
+        screen.allow_decolm = try src.strictBoolean();
+        screen.kitty_kbd_flags = try src.byte();
+        screen.kitty_kbd_depth = try src.byte();
+        if (screen.kitty_kbd_depth > screen.kitty_kbd_stack.len) return error.BadSnapshot;
+        @memcpy(screen.kitty_kbd_stack[0..], try src.take(screen.kitty_kbd_stack.len));
+        screen.kitty_kbd_other_flags = try src.byte();
+        screen.kitty_kbd_other_depth = try src.byte();
+        if (screen.kitty_kbd_other_depth > screen.kitty_kbd_other_stack.len) return error.BadSnapshot;
+        @memcpy(screen.kitty_kbd_other_stack[0..], try src.take(screen.kitty_kbd_other_stack.len));
+
+        screen.prompt_marks_head = try src.int(u16);
+        if (screen.prompt_marks_head >= screen.prompt_marks.len or
+            (screen.prompt_marks_len < screen.prompt_marks.len and
+                screen.prompt_marks_head != screen.prompt_marks_len))
+        {
+            return error.BadSnapshot;
+        }
+        screen.title_stack_depth = try src.byte();
+        if (screen.title_stack_depth > screen.title_stack.len) return error.BadSnapshot;
+        for (0..screen.title_stack_depth) |idx| {
+            const stack_title_len = try src.int(u32);
+            const title = try src.take(stack_title_len);
+            screen.title_stack[idx] = try allocator.dupe(u8, title);
+        }
+    }
+
+    if (version >= 8) try validateLinkState(screen);
+    if (version >= 8 and src.pos != src.bytes.len) return error.BadSnapshot;
+
     screen.dirty = true;
     return .{
         .screen = screen,
@@ -644,6 +789,145 @@ pub fn restore(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u8) !*S
 
 const testing = std.testing;
 const Harness = @import("../parser/test_harness.zig").Harness;
+const Parser = @import("../parser/vt.zig").Parser;
+const Event = @import("../parser/event.zig").Event;
+
+const PairFeeder = struct {
+    parser: Parser,
+    allocator: std.mem.Allocator,
+    daemon: *Screen,
+    client: *Screen,
+
+    fn init(allocator: std.mem.Allocator, daemon: *Screen, client: *Screen) PairFeeder {
+        return .{
+            .parser = Parser.init(allocator),
+            .allocator = allocator,
+            .daemon = daemon,
+            .client = client,
+        };
+    }
+
+    fn deinit(self: *PairFeeder) void {
+        self.parser.deinit();
+    }
+
+    fn emit(user: ?*anyopaque, ev: Event) void {
+        const self: *PairFeeder = @ptrCast(@alignCast(user.?));
+        var owned = ev;
+        self.daemon.apply(ev);
+        self.client.apply(ev);
+        owned.deinit(self.allocator);
+    }
+
+    fn feed(self: *PairFeeder, bytes: []const u8) void {
+        self.parser.advance(bytes, emit, @ptrCast(self));
+    }
+};
+
+fn expectLineEqual(expected: *const Line, actual: *const Line) !void {
+    try testing.expectEqual(expected.id, actual.id);
+    try testing.expectEqual(expected.continues_above, actual.continues_above);
+    try testing.expectEqual(expected.scaling, actual.scaling);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected.cells), std.mem.sliceAsBytes(actual.cells));
+}
+
+fn expectOptionalStringEqual(expected: ?[]u8, actual: ?[]u8) !void {
+    try testing.expectEqual(expected != null, actual != null);
+    if (expected) |value| try testing.expectEqualStrings(value, actual.?);
+}
+
+fn expectScreensEqual(expected: *const Screen, actual: *const Screen) !void {
+    try testing.expectEqual(expected.cols, actual.cols);
+    try testing.expectEqual(expected.rows, actual.rows);
+    try testing.expectEqual(expected.use_alt, actual.use_alt);
+    for (expected.active, actual.active) |*left, *right| try expectLineEqual(left, right);
+    try testing.expectEqual(expected.alt != null, actual.alt != null);
+    if (expected.alt) |left_alt| {
+        for (left_alt, actual.alt.?) |*left, *right| try expectLineEqual(left, right);
+    }
+    try testing.expectEqual(expected.scrollbackCount(), actual.scrollbackCount());
+    var sb: u32 = 0;
+    while (sb < expected.scrollbackCount()) : (sb += 1) {
+        try expectLineEqual(expected.scrollbackLine(sb), actual.scrollbackLine(sb));
+    }
+
+    try testing.expectEqual(expected.row, actual.row);
+    try testing.expectEqual(expected.col, actual.col);
+    try testing.expectEqual(expected.saved_row, actual.saved_row);
+    try testing.expectEqual(expected.saved_col, actual.saved_col);
+    try testing.expectEqual(expected.saved_style, actual.saved_style);
+    try testing.expectEqual(expected.saved_origin, actual.saved_origin);
+    try testing.expectEqual(expected.saved_autowrap, actual.saved_autowrap);
+    try testing.expectEqual(expected.saved_charset_g0, actual.saved_charset_g0);
+    try testing.expectEqual(expected.saved_charset_g1, actual.saved_charset_g1);
+    try testing.expectEqual(expected.saved_active_charset, actual.saved_active_charset);
+    try testing.expectEqual(expected.saved_link_id, actual.saved_link_id);
+    try testing.expectEqual(expected.cur_style, actual.cur_style);
+    try testing.expectEqual(expected.scroll_top, actual.scroll_top);
+    try testing.expectEqual(expected.scroll_bot, actual.scroll_bot);
+    try testing.expectEqual(expected.pending_wrap, actual.pending_wrap);
+    try testing.expectEqual(expected.next_line_id, actual.next_line_id);
+
+    try testing.expectEqual(expected.autowrap, actual.autowrap);
+    try testing.expectEqual(expected.origin_mode, actual.origin_mode);
+    try testing.expectEqual(expected.insert_mode, actual.insert_mode);
+    try testing.expectEqual(expected.bracketed_paste, actual.bracketed_paste);
+    try testing.expectEqual(expected.line_feed_mode, actual.line_feed_mode);
+    try testing.expectEqual(expected.app_cursor_keys, actual.app_cursor_keys);
+    try testing.expectEqual(expected.app_keypad, actual.app_keypad);
+    try testing.expectEqual(expected.cursor_visible, actual.cursor_visible);
+    try testing.expectEqual(expected.cursor_shape, actual.cursor_shape);
+    try testing.expectEqual(expected.mouse_mode, actual.mouse_mode);
+    try testing.expectEqual(expected.mouse_sgr, actual.mouse_sgr);
+    try testing.expectEqual(expected.mouse_enc, actual.mouse_enc);
+    try testing.expectEqual(expected.focus_reports, actual.focus_reports);
+    try testing.expectEqual(expected.sync_output, actual.sync_output);
+    try testing.expectEqual(expected.mode_2031, actual.mode_2031);
+    try testing.expectEqual(expected.in_band_resize, actual.in_band_resize);
+    try testing.expectEqual(expected.reverse_screen, actual.reverse_screen);
+    try testing.expectEqual(expected.allow_decolm, actual.allow_decolm);
+    try testing.expectEqual(expected.modify_other_keys, actual.modify_other_keys);
+
+    try testing.expectEqual(expected.charset_g0, actual.charset_g0);
+    try testing.expectEqual(expected.charset_g1, actual.charset_g1);
+    try testing.expectEqual(expected.active_charset, actual.active_charset);
+    try testing.expectEqual(expected.pending_single_shift, actual.pending_single_shift);
+    try testing.expectEqualSlices(bool, expected.tab_stops.items, actual.tab_stops.items);
+    try testing.expectEqual(expected.last_print_cp, actual.last_print_cp);
+    try testing.expectEqual(expected.last_print_key, actual.last_print_key);
+    try testing.expectEqual(expected.decoder.expected, actual.decoder.expected);
+    try testing.expectEqual(expected.decoder.have, actual.decoder.have);
+    try testing.expectEqual(expected.decoder.buf, actual.decoder.buf);
+
+    try testing.expectEqual(expected.kitty_kbd_flags, actual.kitty_kbd_flags);
+    try testing.expectEqual(expected.kitty_kbd_depth, actual.kitty_kbd_depth);
+    try testing.expectEqualSlices(u8, &expected.kitty_kbd_stack, &actual.kitty_kbd_stack);
+    try testing.expectEqual(expected.kitty_kbd_other_flags, actual.kitty_kbd_other_flags);
+    try testing.expectEqual(expected.kitty_kbd_other_depth, actual.kitty_kbd_other_depth);
+    try testing.expectEqualSlices(u8, &expected.kitty_kbd_other_stack, &actual.kitty_kbd_other_stack);
+
+    try testing.expectEqual(expected.current_link_id, actual.current_link_id);
+    try testing.expectEqual(expected.next_link_id, actual.next_link_id);
+    try testing.expectEqual(expected.links.count(), actual.links.count());
+    var links = expected.links.iterator();
+    while (links.next()) |entry| {
+        try testing.expectEqualStrings(entry.value_ptr.*, actual.links.get(entry.key_ptr.*) orelse return error.TestExpectedEqual);
+    }
+
+    try expectOptionalStringEqual(expected.last_title, actual.last_title);
+    try testing.expectEqual(expected.title_stack_depth, actual.title_stack_depth);
+    for (0..expected.title_stack_depth) |idx| {
+        try testing.expectEqualStrings(expected.title_stack[idx].?, actual.title_stack[idx].?);
+    }
+    try testing.expectEqual(expected.prompt_marks_len, actual.prompt_marks_len);
+    try testing.expectEqual(expected.prompt_marks_head, actual.prompt_marks_head);
+    try testing.expectEqualSlices(u64, &expected.prompt_marks, &actual.prompt_marks);
+
+    try testing.expectEqual(expected.pool.entries.items.len, actual.pool.entries.items.len);
+    for (expected.pool.entries.items, actual.pool.entries.items) |left, right| {
+        try testing.expect(style_pool.Entry.equal(left, right));
+    }
+}
 
 const LiveRestoreState = struct {
     bytes: []u8,
@@ -979,6 +1263,150 @@ test "snapshot: populated screen round-trips" {
     try testing.expectEqualStrings(txt_a, txt_b);
 }
 
+test "snapshot: v8 interpreter state stays aligned after attach" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 16, 6);
+    defer h.deinit();
+
+    h.feed("\x1b]0;base title\x07\x1b[22t\x1b]0;inner title\x07");
+    h.feed("\x1b]8;;https://main.invalid\x07\x1b[31m\x1b(0\x1b[?7l\x1b[?6h\x1b[3;4H");
+    h.feed("\x1b[>5u\x1b[?1049h");
+    h.feed("\x1b]8;;https://alt.invalid\x07\x1b[32m\x1b)0\x0e\x1b[?7h\x1b[?6l");
+    h.feed("\x1b[3g\x1b[6G\x1bH\x1b[1G\x1b[>3u\x1b[?5h\x1b[?40h\x1b[>4;2mR\r");
+    h.feed("\x1b]133;A\x07");
+
+    try testing.expect(h.screen.use_alt);
+    try testing.expectEqual(@as(u8, 3), h.screen.kitty_kbd_flags);
+    try testing.expectEqual(@as(u8, 5), h.screen.kitty_kbd_other_flags);
+    try testing.expectEqual(@as(u16, 1), h.screen.prompt_marks_head);
+    const main_row = h.screen.saved_row;
+    const main_col = h.screen.saved_col;
+    const main_style = h.screen.saved_style;
+    const main_link = h.screen.saved_link_id;
+    const alt_style = h.screen.cur_style;
+    const alt_link = h.screen.current_link_id;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(h.screen, &body, a);
+    var client_pool = try Pool.init(a);
+    defer client_pool.deinit();
+    const client = try restore(a, &client_pool, body.items);
+    defer client.deinit();
+    try expectScreensEqual(h.screen, client);
+
+    var pair = PairFeeder.init(a, h.screen, client);
+    defer pair.deinit();
+
+    // Current G1 graphics and OSC 8 state affect the first post-attach
+    // glyph before any restore operation runs.
+    pair.feed("q");
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqual(@as(u32, 0x2500), client.alt.?[0].cells[0].rune);
+    try testing.expectEqual(alt_style, client.alt.?[0].cells[0].style_ref);
+    try testing.expectEqual(alt_link, client.alt.?[0].cells[0].reserved);
+
+    // Explicit DECRC must restore every saved field, not merely row/col.
+    pair.feed("\x1b8");
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqual(main_row, client.row);
+    try testing.expectEqual(main_col, client.col);
+    try testing.expectEqual(main_style, client.cur_style);
+    try testing.expectEqual(main_link, client.current_link_id);
+    try testing.expect(client.origin_mode);
+    try testing.expect(!client.autowrap);
+    try testing.expectEqual(Screen.Charset.dec_graphics, client.charset_g0);
+
+    // Restore a stacked title, then REP the carried last-glyph context.
+    pair.feed("\x1b[23t\x1b[2b");
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqualStrings("base title", client.last_title.?);
+
+    // HT must use the custom stop at zero-based column 5.
+    pair.feed("\r\t");
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqual(@as(u16, 5), client.col);
+
+    // Pop the alt-screen keyboard stack, then leave via 1049. The
+    // parked main keyboard state and DECSC state must both return.
+    pair.feed("\x1b[<1u\x1b[?1049l");
+    try expectScreensEqual(h.screen, client);
+    try testing.expect(!client.use_alt);
+    try testing.expectEqual(@as(u8, 5), client.kitty_kbd_flags);
+    try testing.expectEqual(main_row, client.row);
+    try testing.expectEqual(main_col, client.col);
+    try testing.expectEqual(main_style, client.cur_style);
+    try testing.expectEqual(main_link, client.current_link_id);
+    try testing.expect(client.origin_mode);
+    try testing.expect(!client.autowrap);
+    try testing.expectEqual(Screen.Charset.dec_graphics, client.charset_g0);
+    try testing.expectEqual(Screen.ActiveCharset.g0, client.active_charset);
+
+    // The restored style, DEC graphics designation, and OSC 8 link all
+    // affect the first main-screen glyph emitted after leaving the alt.
+    pair.feed("q");
+    try expectScreensEqual(h.screen, client);
+    const restored_cell = client.active[main_row].cells[main_col];
+    try testing.expectEqual(@as(u32, 0x2500), restored_cell.rune);
+    try testing.expectEqual(main_style, restored_cell.style_ref);
+    try testing.expectEqual(main_link, restored_cell.reserved);
+}
+
+fn runSingleShiftSnapshotCase(shift: []const u8) !void {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 8, 2);
+    defer h.deinit();
+    h.feed("\x1b(0");
+    h.feed(shift);
+    try testing.expect(h.screen.pending_single_shift != .none);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(h.screen, &body, a);
+    var client_pool = try Pool.init(a);
+    defer client_pool.deinit();
+    const client = try restore(a, &client_pool, body.items);
+    defer client.deinit();
+    try expectScreensEqual(h.screen, client);
+
+    var pair = PairFeeder.init(a, h.screen, client);
+    defer pair.deinit();
+    pair.feed("q");
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqual(Screen.PendingSingleShift.none, client.pending_single_shift);
+    try testing.expectEqual(@as(u32, 'q'), client.active[0].cells[0].rune);
+}
+
+test "snapshot: SS2 and SS3 survive until the next printable event" {
+    try runSingleShiftSnapshotCase("\x1bN");
+    try runSingleShiftSnapshotCase("\x1bO");
+}
+
+test "snapshot: partial UTF-8 decode resumes after attach" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 8, 2);
+    defer h.deinit();
+    h.feed("A\xe2");
+    try testing.expectEqual(@as(u3, 3), h.screen.decoder.expected);
+    try testing.expectEqual(@as(u3, 1), h.screen.decoder.have);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(h.screen, &body, a);
+    var client_pool = try Pool.init(a);
+    defer client_pool.deinit();
+    const client = try restore(a, &client_pool, body.items);
+    defer client.deinit();
+    try expectScreensEqual(h.screen, client);
+
+    var pair = PairFeeder.init(a, h.screen, client);
+    defer pair.deinit();
+    pair.feed("\x82\xac");
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqual(@as(u32, 0x20ac), client.active[0].cells[1].rune);
+    try testing.expectEqual(@as(u3, 0), client.decoder.expected);
+}
+
 test "snapshot: v3 payload (no command tail) restores with defaults" {
     const a = testing.allocator;
     var h = try Harness.init(a, 20, 6);
@@ -1048,6 +1476,83 @@ test "snapshot: v1 and v2 bodies remain readable" {
     }
 }
 
+test "snapshot: v7 interpreter omissions restore documented defaults" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 12, 3);
+    defer h.deinit();
+    h.feed("\x1b[31mX\x1b]8;;https://saved.invalid\x07");
+    h.feed("\x1b]0;outer\x07\x1b[22t\x1b]0;inner\x07\x1b]133;A\x07");
+
+    h.screen.saved_row = 2;
+    h.screen.saved_col = 10;
+    h.screen.saved_style = h.screen.cur_style;
+    h.screen.saved_origin = true;
+    h.screen.saved_autowrap = false;
+    h.screen.saved_charset_g0 = .dec_graphics;
+    h.screen.saved_charset_g1 = .dec_graphics;
+    h.screen.saved_active_charset = .g1;
+    h.screen.saved_link_id = h.screen.current_link_id;
+    h.screen.charset_g0 = .dec_graphics;
+    h.screen.charset_g1 = .dec_graphics;
+    h.screen.active_charset = .g1;
+    h.screen.pending_single_shift = .ss3;
+    @memset(h.screen.tab_stops.items, false);
+    h.screen.tab_stops.items[5] = true;
+    h.screen.last_print_cp = 'Z';
+    h.screen.last_print_key = 7;
+    h.screen.decoder.expected = 3;
+    h.screen.decoder.have = 1;
+    h.screen.decoder.buf = 2;
+    h.screen.modify_other_keys = 2;
+    h.screen.reverse_screen = true;
+    h.screen.allow_decolm = true;
+    h.screen.kitty_kbd_flags = 7;
+    h.screen.kitty_kbd_depth = 2;
+    h.screen.kitty_kbd_stack = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    h.screen.kitty_kbd_other_flags = 9;
+    h.screen.kitty_kbd_other_depth = 1;
+    h.screen.kitty_kbd_other_stack = .{ 9, 8, 7, 6, 5, 4, 3, 2, 1 };
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serializeVersion(h.screen, &body, a, 7);
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+    const restored = try restore(a, &pool, body.items);
+    defer restored.deinit();
+
+    try testing.expectEqual(@as(u16, 0), restored.saved_row);
+    try testing.expectEqual(@as(u16, 0), restored.saved_col);
+    try testing.expectEqual(@as(u16, 0), restored.saved_style);
+    try testing.expect(!restored.saved_origin);
+    try testing.expect(restored.saved_autowrap);
+    try testing.expectEqual(Screen.Charset.ascii, restored.saved_charset_g0);
+    try testing.expectEqual(Screen.Charset.ascii, restored.saved_charset_g1);
+    try testing.expectEqual(Screen.ActiveCharset.g0, restored.saved_active_charset);
+    try testing.expectEqual(@as(u8, 0), restored.saved_link_id);
+    try testing.expectEqual(Screen.Charset.ascii, restored.charset_g0);
+    try testing.expectEqual(Screen.Charset.ascii, restored.charset_g1);
+    try testing.expectEqual(Screen.ActiveCharset.g0, restored.active_charset);
+    try testing.expectEqual(Screen.PendingSingleShift.none, restored.pending_single_shift);
+    for (restored.tab_stops.items, 0..) |stop, idx| {
+        try testing.expectEqual(idx != 0 and idx % 8 == 0, stop);
+    }
+    try testing.expectEqual(@as(u32, 0), restored.last_print_cp);
+    try testing.expectEqual(@as(u32, 0), restored.last_print_key);
+    try testing.expectEqual(@as(u3, 0), restored.decoder.expected);
+    try testing.expectEqual(@as(u3, 0), restored.decoder.have);
+    try testing.expectEqual(@as(u32, 0), restored.decoder.buf);
+    try testing.expectEqual(@as(u8, 0), restored.modify_other_keys);
+    try testing.expect(!restored.reverse_screen);
+    try testing.expect(!restored.allow_decolm);
+    try testing.expectEqual(@as(u8, 0), restored.kitty_kbd_flags);
+    try testing.expectEqual(@as(u8, 0), restored.kitty_kbd_depth);
+    try testing.expectEqual(@as(u8, 0), restored.kitty_kbd_other_flags);
+    try testing.expectEqual(@as(u8, 0), restored.kitty_kbd_other_depth);
+    try testing.expectEqual(@as(u8, 0), restored.title_stack_depth);
+    try testing.expectEqual(restored.prompt_marks_len, restored.prompt_marks_head);
+}
+
 test "snapshot: envelope detects pre-v4 and current headers" {
     var legacy: [12]u8 = @splat(0);
     std.mem.writeInt(u64, legacy[0..8], 17, .little);
@@ -1070,6 +1575,7 @@ test "snapshot: envelope detects pre-v4 and current headers" {
 test "snapshot: negotiation honors the peer maximum" {
     try testing.expectEqual(@as(u8, 3), negotiateVersion(6, 3, true));
     try testing.expectEqual(@as(u8, 4), negotiateVersion(6, 4, true));
+    try testing.expectEqual(SNAPSHOT_VERSION, negotiateVersion(6, 255, true));
     try testing.expectEqual(@as(u8, 3), negotiateVersion(5, 0, false));
     try testing.expectEqual(@as(u8, 0), negotiateVersion(0, 4, true));
 }
@@ -1213,6 +1719,55 @@ test "snapshot: corrupt input errors cleanly" {
     var pool4 = try Pool.init(a);
     defer pool4.deinit();
     try testing.expectError(error.BadSnapshot, restore(a, &pool4, buf.items));
+}
+
+test "snapshot: v8 validates saved indexes and tab-stop dimensions" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 10, 3);
+    defer h.deinit();
+    h.feed("\x1b[31m\x1b]8;;https://saved.invalid\x07\x1b7");
+
+    var v7: std.ArrayList(u8) = .empty;
+    defer v7.deinit(a);
+    try serializeVersion(h.screen, &v7, a, 7);
+    var v8: std.ArrayList(u8) = .empty;
+    defer v8.deinit(a);
+    try serialize(h.screen, &v8, a);
+    const tail = v7.items.len;
+    try testing.expect(v8.items.len > tail + 18 + h.screen.cols);
+
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+
+    // saved_style is a pool index.
+    const saved_style_offset = tail + 4;
+    const saved_style = std.mem.readInt(u16, v8.items[saved_style_offset..][0..2], .little);
+    std.mem.writeInt(u16, v8.items[saved_style_offset..][0..2], @intCast(h.pool.entries.items.len), .little);
+    try testing.expectError(error.BadSnapshot, restore(a, &pool, v8.items));
+    std.mem.writeInt(u16, v8.items[saved_style_offset..][0..2], saved_style, .little);
+
+    // saved_link_id must be zero or resolve in the serialized link table.
+    const saved_link_offset = tail + 11;
+    const saved_link = v8.items[saved_link_offset];
+    v8.items[saved_link_offset] = 254;
+    try testing.expectError(error.BadSnapshot, restore(a, &pool, v8.items));
+    v8.items[saved_link_offset] = saved_link;
+
+    // The already-active link index is validated by the same rule.
+    h.screen.current_link_id = 254;
+    var bad_current_link: std.ArrayList(u8) = .empty;
+    defer bad_current_link.deinit(a);
+    try serialize(h.screen, &bad_current_link, a);
+    try testing.expectError(error.BadSnapshot, restore(a, &pool, bad_current_link.items));
+    h.screen.current_link_id = saved_link;
+
+    // The tab array is dimensioned exactly to the restored grid.
+    const tab_count_offset = tail + 16;
+    std.mem.writeInt(u16, v8.items[tab_count_offset..][0..2], h.screen.cols - 1, .little);
+    try testing.expectError(error.BadSnapshot, restore(a, &pool, v8.items));
+    std.mem.writeInt(u16, v8.items[tab_count_offset..][0..2], h.screen.cols, .little);
+    v8.items[tail + 18] = 2;
+    try testing.expectError(error.BadSnapshot, restore(a, &pool, v8.items));
 }
 
 test "restore normalizes lines whose serialized width diverges from cols" {
@@ -1375,8 +1930,8 @@ test "snapshot: empty glossary costs 4 bytes; v4 bodies restore empty" {
     try serializeVersion(h.screen, &v4buf, a, 4);
     var v5buf: std.ArrayList(u8) = .empty;
     defer v5buf.deinit(a);
-    try serialize(h.screen, &v5buf, a);
-    // Only the u32 count separates an empty-glossary v5+/v6 from a v4.
+    try serializeVersion(h.screen, &v5buf, a, 5);
+    // Only the u32 count separates an empty-glossary v5 from a v4.
     try testing.expectEqual(v4buf.items.len + 4, v5buf.items.len);
 
     var pool2 = try Pool.init(a);
