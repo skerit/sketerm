@@ -3,7 +3,9 @@
 //! a refetch, and whether a downloaded body is plausibly a filter list
 //! at all.
 //!
-//! Deliberately PURE — no CEF, no GTK, no allocator, no IO — because
+//! Deliberately PURE — no CEF, no GTK, no allocator, no IO (the one
+//! import, `util/atomicwrite.zig`, is used only for its stage-name
+//! vocabulary, never to touch the disk) — because
 //! these are the decisions that can OVERWRITE a working filter file,
 //! and they should be provable without a network or a browser. The
 //! fetch itself lives in `cefhost.zig`: the helper is the only process
@@ -12,6 +14,7 @@
 //! Compiled into the helper AND both test roots.
 
 const std = @import("std");
+const atomicwrite = @import("../util/atomicwrite.zig");
 
 /// Longest cache file name produced by `cacheName`.
 pub const MAX_NAME = 96;
@@ -102,8 +105,19 @@ pub fn isCacheName(name: []const u8) bool {
 }
 
 /// Whether `name` is the staging sibling of one of our cache files.
+///
+/// The stage-name format belongs to `util/atomicwrite.zig` (the only thing
+/// that writes one); recognising it by hand here is how orphaned stages
+/// stopped being collected once the writer was shared.
 pub fn isStageName(name: []const u8) bool {
-    return std.mem.endsWith(u8, name, ".part") and isCacheName(name[0 .. name.len - ".part".len]);
+    const base = atomicwrite.stageBaseName(name) orelse return false;
+    return isCacheName(base);
+}
+
+/// The cache file a staging sibling belongs to, or null.
+pub fn stageCacheName(name: []const u8) ?[]const u8 {
+    const base = atomicwrite.stageBaseName(name) orelse return null;
+    return if (isCacheName(base)) base else null;
 }
 
 /// Is a cache file due for a refetch?
@@ -193,10 +207,17 @@ test "cacheName copes with a url that has no usable segment" {
     try t.expect(!isCacheName("sub-abcdefghijklmnopqrstuvwxyz1234567-0000000000000000.txt"));
     try t.expect(!isCacheName("sub-list-000000000000000g.txt"));
     try t.expect(!isCacheName("sub-list-000000000000000A.txt"));
-    var part_buf: [MAX_NAME + 5]u8 = undefined;
-    const part = try std.fmt.bufPrint(&part_buf, "{s}.part", .{q});
-    try t.expect(isStageName(part));
-    try t.expect(!isStageName("sub-my-own-rules.txt.part"));
+    // Derive the stage name from the writer that produces it: a
+    // hand-built one passed while the sweeper matched nothing real.
+    var stage_buf: atomicwrite.StageBuf = undefined;
+    const stage = try atomicwrite.stagePath(&stage_buf, q);
+    try t.expect(isStageName(stage));
+    try t.expectEqualStrings(q, stageCacheName(stage).?);
+    var mine_buf: atomicwrite.StageBuf = undefined;
+    const mine = try atomicwrite.stagePath(&mine_buf, "sub-my-own-rules.txt");
+    try t.expect(!isStageName(mine));
+    try t.expect(stageCacheName(mine) == null);
+    try t.expect(!isStageName(q));
 }
 
 test "validUrl accepts only bounded HTTP subscription URLs with a host" {

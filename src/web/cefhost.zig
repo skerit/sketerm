@@ -6955,13 +6955,11 @@ fn filterSubReconcile(self: *Host) void {
         defer _ = c.closedir(dp);
         while (c.readdir(dp)) |entp| {
             const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entp.*.d_name)));
-            const cache_name = if (filtersub.isCacheName(name))
-                name
-            else if (filtersub.isStageName(name))
-                name[0 .. name.len - ".part".len]
-            else
-                continue;
-            if (subUrlWanted(self.filter_sub_urls.items, cache_name) and !filtersub.isStageName(name)) continue;
+            const staged = filtersub.stageCacheName(name);
+            const cache_name = staged orelse
+                (if (filtersub.isCacheName(name)) name else continue);
+            // A stage is always an orphan: the writer renames its own.
+            if (staged == null and subUrlWanted(self.filter_sub_urls.items, cache_name)) continue;
             var p_buf: [4352:0]u8 = undefined;
             const p = std.fmt.bufPrintZ(&p_buf, "{s}/{s}", .{ dir, name }) catch continue;
             if (c.unlink(p.ptr) == 0 and filtersub.isCacheName(name)) self.filter_sub_reload = true;

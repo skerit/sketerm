@@ -635,8 +635,12 @@ pub fn saveLocalThumbRecoverable(tc: *ThumbCtx, pb: *c.GdkPixbuf, tp_buf: *[4300
     if (std.fmt.bufPrintZ(&z, "{s}/normal", .{dir1})) |d2| {
         _ = c.mkdir(d2.ptr, 0o700);
     } else |_| return;
-    var tmp: [4320:0]u8 = undefined;
-    const tmps = std.fmt.bufPrintZ(&tmp, "{s}.sketerm-tmp-{x}", .{ tp_buf[0..tp_len], @intFromPtr(tc) }) catch return;
+    // gdk_pixbuf_save needs a path of its own, so this cannot go through
+    // atomicwrite; it must still stage under atomicwrite's name so the
+    // shared thumbnail directory's sweepers recognise an orphan, and so
+    // two saves through one context cannot collide on a single path.
+    var tmp: atomicwrite.StageBuf = undefined;
+    const tmps = atomicwrite.stagePath(&tmp, tp_buf[0..tp_len]) catch return;
     var uz: [4096 * 3 + 8:0]u8 = undefined;
     @memcpy(uz[0..uri.len], uri);
     uz[uri.len] = 0;

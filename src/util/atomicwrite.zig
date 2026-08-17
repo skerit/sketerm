@@ -20,8 +20,48 @@ pub const Error = error{
 };
 
 pub const MAX_PATH = 4096;
+/// A staging sibling is `<final name>` + this + `<pid>-<hex serial>`.
+///
+/// Sweepers (`web/filtersub.zig`, `web/cefhost.zig`, `ui/panel/assets.zig`)
+/// collect orphaned stages by name, so the format has exactly ONE home:
+/// this module, which is the only thing that produces it. Anything that
+/// must stage under a path of its own calls `stagePath`.
+pub const STAGE_INFIX = ".sketerm-tmp-";
 const STAGE_ATTEMPTS = 128;
+/// Buffer a staging path always fits in.
+pub const StageBuf = [MAX_PATH + 64:0]u8;
 var next_stage = std.atomic.Value(u64).init(1);
+
+/// Name a fresh staging sibling of `path`, unique within this process.
+pub fn stagePath(buf: *StageBuf, path: []const u8) error{NameTooLong}![:0]u8 {
+    const serial = next_stage.fetchAdd(1, .monotonic);
+    return std.fmt.bufPrintZ(buf, "{s}" ++ STAGE_INFIX ++ "{d}-{x}", .{
+        path,
+        c.getpid(),
+        serial,
+    }) catch error.NameTooLong;
+}
+
+/// The final name a staging sibling belongs to, or null when `name` is not one.
+pub fn stageBaseName(name: []const u8) ?[]const u8 {
+    const at = std.mem.lastIndexOf(u8, name, STAGE_INFIX) orelse return null;
+    if (at == 0) return null;
+    const tail = name[at + STAGE_INFIX.len ..];
+    const dash = std.mem.indexOfScalar(u8, tail, '-') orelse return null;
+    if (dash == 0 or dash + 1 == tail.len) return null;
+    for (tail[0..dash]) |ch| {
+        if (!std.ascii.isDigit(ch)) return null;
+    }
+    for (tail[dash + 1 ..]) |ch| {
+        if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) return null;
+    }
+    return name[0..at];
+}
+
+/// Whether `name` is one of our in-flight staging siblings.
+pub fn isStageName(name: []const u8) bool {
+    return stageBaseName(name) != null;
+}
 
 const SyncPolicy = enum { durable, recoverable_cache };
 const ModePolicy = enum { preserve_existing, exact };
@@ -197,16 +237,11 @@ fn writeFileWithOps(
         if (parent_fd >= 0) _ = ops.close(parent_fd);
     }
 
-    var stage_buf: [MAX_PATH + 64:0]u8 = undefined;
+    var stage_buf: StageBuf = undefined;
     var stage: [:0]u8 = undefined;
     var fd: c_int = -1;
     for (0..STAGE_ATTEMPTS) |_| {
-        const serial = next_stage.fetchAdd(1, .monotonic);
-        stage = std.fmt.bufPrintZ(&stage_buf, "{s}.sketerm-tmp-{d}-{x}", .{
-            path,
-            c.getpid(),
-            serial,
-        }) catch return error.NameTooLong;
+        stage = try stagePath(&stage_buf, path);
         fd = ops.open(
             stage.ptr,
             c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC | c.O_NOFOLLOW,
@@ -566,6 +601,40 @@ test "write and data-sync failures preserve the old file and clean the stage" {
     try std.testing.expectError(error.DataSyncFailed, writeFileWithOps(&sync_ops, path, "new-unsynced", 0o600, .durable, .preserve_existing));
     try std.testing.expect(c.lstat(sync_ops.lastStage().ptr, &st) != 0);
     try std.testing.expectEqualStrings("old-valid", try readTestFile(path, &got));
+}
+
+test "every staged name a writer produces is recognised as one" {
+    const t = std.testing;
+    var buf: StageBuf = undefined;
+    const first = try stagePath(&buf, "/tmp/dir/sub-list-0123456789abcdef.txt");
+    try t.expectEqualStrings("/tmp/dir/sub-list-0123456789abcdef.txt", stageBaseName(first).?);
+    var second_buf: StageBuf = undefined;
+    const second = try stagePath(&second_buf, "/tmp/dir/sub-list-0123456789abcdef.txt");
+    try t.expect(!std.mem.eql(u8, first, second));
+
+    // A real install must be sweepable by name too, not just a built one.
+    var tmpl = "/tmp/sketerm-atomicwrite-stagename-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+    var ops: FaultOps = .{ .fail_rename = true };
+    try t.expectError(error.RenameFailed, writeFileWithOps(&ops, path, "x", 0o600, .durable, .exact));
+    const staged = ops.lastStage();
+    const leaf = staged[std.mem.lastIndexOfScalar(u8, staged, '/').? + 1 ..];
+    try t.expect(isStageName(leaf));
+    try t.expectEqualStrings("state.json", stageBaseName(leaf).?);
+
+    try t.expect(!isStageName("state.json"));
+    try t.expect(!isStageName(".sketerm-tmp-12-1"));
+    try t.expect(!isStageName("state.json.sketerm-tmp-12"));
+    try t.expect(!isStageName("state.json.sketerm-tmp-x2-1"));
+    try t.expect(!isStageName("state.json.sketerm-tmp-12-1F"));
+    try t.expect(!isStageName("state.json.part"));
 }
 
 test "an interrupted data sync is retried and a stalled write is not misclassified" {
