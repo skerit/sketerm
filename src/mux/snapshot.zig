@@ -29,6 +29,7 @@ const Screen = @import("../grid/screen.zig").Screen;
 const Line = @import("../grid/line.zig").Line;
 const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
+const wire = @import("wire.zig");
 const Pool = style_pool.Pool;
 
 pub const SNAPSHOT_VERSION = 8;
@@ -501,7 +502,9 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
     if (version < 1 or version > SNAPSHOT_VERSION) return error.SnapshotVersionMismatch;
     const cols = try src.int(u16);
     const rows = try src.int(u16);
-    if (cols == 0 or rows == 0 or cols > 4096 or rows > 4096) return error.BadSnapshot;
+    // The same grid bound every other entry point uses: a snapshot body is
+    // as untrusted as a spawn request, and it names the grid we allocate.
+    wire.validateTerminalSize(rows, cols) catch return error.BadSnapshot;
 
     // The replacement pool stays private until every field below has parsed.
     // A live Screen may still be interpreting cells through `pool` on error.

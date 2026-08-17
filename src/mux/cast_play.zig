@@ -5,18 +5,17 @@
 //! normalized to ABSOLUTE milliseconds (v2's absolute seconds converted,
 //! v3's per-event intervals accumulated) with `idle_time_limit` already
 //! applied, so a consumer only ever sees a monotonic ms timeline. A cast
-//! is untrusted input: lines are capped at 4 MiB, dimensions at 4096, and
-//! every malformed line is a returned error rather than a crash.
+//! is untrusted input: lines are capped at 4 MiB, dimensions are bounded by
+//! the one grid limit every entry point shares (`wire.validateTerminalSize`),
+//! and every malformed line is a returned error rather than a crash.
 //! musl-clean (pure std, no libc/GTK/GLib).
 
 const std = @import("std");
+const wire = @import("wire.zig");
 
 /// Longest accepted line, header or event. A longer one is a hard error:
 /// silently truncating would hand the terminal a torn escape sequence.
 pub const max_line = 4 * 1024 * 1024;
-
-/// Largest accepted cols/rows in the header and in resize events.
-pub const max_dim = 4096;
 
 pub const Error = error{
     LineTooLong,
@@ -278,12 +277,8 @@ fn parseDims(s: []const u8) ?[2]u16 {
     const x = std.mem.indexOfScalar(u8, s, 'x') orelse return null;
     const cols = std.fmt.parseInt(u16, s[0..x], 10) catch return null;
     const rows = std.fmt.parseInt(u16, s[x + 1 ..], 10) catch return null;
-    if (!validDim(cols) or !validDim(rows)) return null;
+    wire.validateTerminalSize(rows, cols) catch return null;
     return .{ cols, rows };
-}
-
-fn validDim(d: u16) bool {
-    return d >= 1 and d <= max_dim;
 }
 
 pub fn freeHeader(allocator: std.mem.Allocator, h: *Header) void {
@@ -318,8 +313,14 @@ fn intOf(v: std.json.Value) ?i64 {
 fn dimOf(obj: std.json.ObjectMap, key: []const u8) Error!u16 {
     const v = obj.get(key) orelse return error.BadHeader;
     const n = intOf(v) orelse return error.BadHeader;
-    if (n < 1 or n > max_dim) return error.BadDimensions;
+    if (n < 1 or n > wire.MAX_TERMINAL_AXIS) return error.BadDimensions;
     return @intCast(n);
+}
+
+/// Per-axis bounds alone let a 4096x4096 header through; the total-cell
+/// bound is the one that caps what the grid costs.
+fn checkHeaderDims(h: Header) Error!void {
+    wire.validateTerminalSize(h.rows, h.cols) catch return error.BadDimensions;
 }
 
 fn parseTheme(allocator: std.mem.Allocator, obj: std.json.ObjectMap) Error!Theme {
@@ -370,6 +371,7 @@ pub fn parseHeader(allocator: std.mem.Allocator, line: []const u8) Error!Header 
         h.rows = try dimOf(obj, "height");
         h.theme = try parseTheme(allocator, obj);
     }
+    try checkHeaderDims(h);
     h.title = try dupString(allocator, obj, "title");
     if (obj.get("timestamp")) |t| h.timestamp = intOf(t);
     if (obj.get("idle_time_limit")) |t| {

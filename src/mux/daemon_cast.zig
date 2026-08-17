@@ -824,6 +824,59 @@ test "cast spawn: header validated eagerly, screen sized from it, paused at 0" {
     );
 }
 
+test "a cast cannot buy a grid no other entry point could ask for" {
+    const a = testing.allocator;
+    const d = try newTestDaemon(a);
+    defer d.deinit();
+
+    // 4096x4096 clears every per-axis bound and is ~134 MB of active grid.
+    // Cast playback is the one entry point that sizes a Screen from file
+    // contents, so it must pass the same gate as a spawn or a resize.
+    const huge = try writeTempCast(a,
+        \\{"version": 2, "width": 4096, "height": 4096}
+        \\[0.1, "o", "hi"]
+        \\
+    );
+    defer {
+        unlinkPath(huge);
+        a.free(huge);
+    }
+    try testing.expectError(
+        error.BadDimensions,
+        d.spawnSession(.{ .name = "huge", .cast_path = huge }),
+    );
+
+    // A recorded resize record is bounded the same way. Like any other
+    // corrupt line it ends playback and retains what already played.
+    const grow = try writeTempCast(a,
+        \\{"version": 2, "width": 20, "height": 5}
+        \\[0.1, "o", "before"]
+        \\[0.2, "r", "4096x4096"]
+        \\[0.3, "o", "after"]
+        \\
+    );
+    defer {
+        unlinkPath(grow);
+        a.free(grow);
+    }
+    const s = try spawnCast(d, grow, "grow");
+    const cl = try newTestClient(d, s);
+    const t0: i64 = 70_000;
+    castOnAttach(d, s, t0);
+    cl.wbuf.clearRetainingCapacity();
+
+    _ = castServiceAll(d, t0 + 5000);
+    try testing.expectEqual(@as(u16, 20), s.screen.cols);
+    try testing.expectEqual(@as(u16, 5), s.screen.rows);
+    var frames: std.ArrayList(TFrame) = .empty;
+    defer freeFrames(a, &frames);
+    try takeFrames(a, cl, &frames);
+    var apcs: usize = 0;
+    const all = try eventsText(a, frames.items, &apcs);
+    defer a.free(all);
+    try testing.expectEqualStrings("before", all);
+}
+
 test "identity-first attach is capability-gated and preserves legacy snapshot order" {
     const a = testing.allocator;
     const d = try newTestDaemon(a);
