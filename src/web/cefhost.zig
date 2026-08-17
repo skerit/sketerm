@@ -51,6 +51,7 @@ const pathz = @import("../util/pathz.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const userscript = @import("userscript.zig");
 const webexthost = @import("webext/host.zig");
+const extinstall = @import("webext/install.zig");
 const extmatch = @import("webext/match.zig");
 const extmanifest = @import("webext/manifest.zig");
 const webrequest = @import("webext/webrequest.zig");
@@ -2921,19 +2922,7 @@ pub const Host = struct {
             });
             return;
         }
-        // `webext_set` reparses/reinstalls the extension. Tear down the
-        // old instance before `Host.set` rotates its capability, so no
-        // background page, port, route or hold retains old authority.
-        if (self.webext.find(req.id)) |old| {
-            self.revokeExtension(old, "extension was reinstalled or toggled");
-            wreqAbandonExt(req.id);
-            self.repliesAbandonExt(req.id);
-            self.portsAbandonExt(req.id);
-            self.webext.clearListeners(old);
-            self.teardownBackground(old);
-            self.teardownPopups(req.id);
-            self.unpublishOrigin(req.id);
-        }
+        self.quiesceWebext(req.id, "extension was reinstalled or toggled");
         const e = self.webext.set(req.id, req.dir, req.enabled != 0) catch {
             self.post(proto.EvWebextState{
                 .id = req.id,
@@ -2960,6 +2949,61 @@ pub const Host = struct {
         }
         self.postWebextState(e);
         self.postActionsForActiveViews();
+    }
+
+    /// Validate a staged tree before quiescing the currently running instance.
+    pub fn webextInstallPrepare(self: *Host, req: proto.WebextInstallPrepare) void {
+        if (!extmanifest.idValid(req.id)) {
+            self.post(proto.EvWebextInstallPrepared{ .req = req.req, .id = req.id, .ok = 0, .err = "invalid extension id" });
+            return;
+        }
+        var candidate = extinstall.validateDirectory(self.gpa, req.dir, req.id, req.version, null) catch |err| {
+            self.post(proto.EvWebextInstallPrepared{ .req = req.req, .id = req.id, .ok = 0, .err = @errorName(err) });
+            return;
+        };
+        candidate.deinit();
+        self.quiesceWebext(req.id, "extension upgrade is committing");
+        self.postActionsForActiveViews();
+        self.post(proto.EvWebextInstallPrepared{ .req = req.req, .id = req.id, .ok = 1, .err = "" });
+    }
+
+    /// Load a package after the GUI's atomic swap and correlate the result.
+    pub fn webextInstallCommit(self: *Host, req: proto.WebextInstallCommit) void {
+        self.webextSet(.{ .id = req.id, .dir = req.dir, .enabled = req.enabled });
+        const installed = self.webext.find(req.id);
+        const ok = if (installed) |e|
+            e.ok and e.enabled == (req.enabled != 0) and
+                std.mem.eql(u8, if (e.man) |*m| m.version else "", req.version)
+        else
+            false;
+        var detail: []const u8 = "extension load failed";
+        if (installed) |e| {
+            if (!ok) {
+                if (e.err.len != 0) detail = e.err else if (!std.mem.eql(u8, if (e.man) |*m| m.version else "", req.version)) detail = "extension version mismatch";
+                self.quiesceWebext(req.id, "extension upgrade was refused");
+            }
+        }
+        self.post(proto.EvWebextInstallCommitted{
+            .req = req.req,
+            .id = req.id,
+            .ok = @intFromBool(ok),
+            .err = if (ok) "" else detail,
+        });
+    }
+
+    fn quiesceWebext(self: *Host, id: []const u8, reason: []const u8) void {
+        const old = self.webext.find(id) orelse return;
+        self.revokeExtension(old, reason);
+        wreqAbandonExt(id);
+        self.repliesAbandonExt(id);
+        self.portsAbandonExt(id);
+        self.webext.clearListeners(old);
+        self.teardownBackground(old);
+        self.teardownPopups(id);
+        self.unpublishOrigin(id);
+        old.enabled = false;
+        old.capability = @splat(0);
+        old.capability_ok = false;
     }
 
     /// Make `chrome-extension://<host>/` resolve to this extension's

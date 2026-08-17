@@ -172,6 +172,9 @@ pub const CAP_SEMANTIC_REQUEST_IDS = "semantic-request-ids";
 /// accepts trusted toolbar activations, and presents declared popups as
 /// dedicated extension-page views (0xB7-0xB9).
 pub const CAP_WEBEXT_ACTION = "webext-action";
+/// The helper validates and quiesces an extension before the GUI swaps its
+/// staged package, then returns a correlated result after loading the commit.
+pub const CAP_WEBEXT_TRANSACTION = "webext-transaction";
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -275,7 +278,10 @@ pub const Tag = enum(u8) {
     ev_webext_popup = 0xB9,
     ev_webext_open_popup = 0xBA,
     webext_open_popup_result = 0xBB,
-    // 0xBC-0xBF stay reserved for the WebExtensions block.
+    webext_install_prepare = 0xBC,
+    ev_webext_install_prepared = 0xBD,
+    webext_install_commit = 0xBE,
+    ev_webext_install_committed = 0xBF,
     //
     // NOTE for anyone reading the 0xB4-0xBF reservation as originally
     // written: there is deliberately NO `webext_request` /
@@ -2427,6 +2433,42 @@ pub const EvWebextState = struct {
     err: []const u8,
 };
 
+/// Validate a staged package without changing the live extension. On success
+/// the helper quiesces the old instance before acknowledging the request.
+pub const WebextInstallPrepare = struct {
+    pub const tag: Tag = .webext_install_prepare;
+    req: u32,
+    id: []const u8,
+    dir: []const u8,
+    version: []const u8,
+};
+
+pub const EvWebextInstallPrepared = struct {
+    pub const tag: Tag = .ev_webext_install_prepared;
+    req: u32,
+    id: []const u8,
+    ok: u8,
+    err: []const u8,
+};
+
+/// Load the live path after the GUI atomically installed the prepared tree.
+pub const WebextInstallCommit = struct {
+    pub const tag: Tag = .webext_install_commit;
+    req: u32,
+    id: []const u8,
+    dir: []const u8,
+    version: []const u8,
+    enabled: u8,
+};
+
+pub const EvWebextInstallCommitted = struct {
+    pub const tag: Tag = .ev_webext_install_committed;
+    req: u32,
+    id: []const u8,
+    ok: u8,
+    err: []const u8,
+};
+
 /// Ask for one `ev_webext_wreq_stats` per extension that has ever
 /// registered a blocking-webRequest listener.
 pub const WebextWreqStatsReq = struct {
@@ -3054,6 +3096,10 @@ test "round-trip: container/context frames" {
 test "round-trip: webext frames" {
     try roundTrip(WebextSet, .{ .id = "abc123", .dir = "/home/x/.local/share/sketerm/webext/abc123", .enabled = 1 });
     try roundTrip(WebextSet, .{ .id = "abc123", .dir = "", .enabled = 0 });
+    try roundTrip(WebextInstallPrepare, .{ .req = 7, .id = "abc123", .dir = "/tmp/.abc123.stage", .version = "2" });
+    try roundTrip(EvWebextInstallPrepared, .{ .req = 7, .id = "abc123", .ok = 1, .err = "" });
+    try roundTrip(WebextInstallCommit, .{ .req = 7, .id = "abc123", .dir = "/data/abc123", .version = "2", .enabled = 1 });
+    try roundTrip(EvWebextInstallCommitted, .{ .req = 7, .id = "abc123", .ok = 0, .err = "refused" });
     try roundTrip(WebextRemove, .{ .id = "abc123" });
     try roundTrip(WebextListReq, .{});
     try roundTrip(EvWebextState, .{

@@ -27,6 +27,7 @@ pub fn currentErrno() c_int {
 }
 
 pub const RenameNoReplaceResult = enum { ok, exists, cross_device, failed };
+pub const RenameExchangeResult = enum { ok, unsupported, cross_device, failed };
 
 /// Atomically install `old_path` at a destination that must not exist.
 pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameNoReplaceResult {
@@ -43,6 +44,26 @@ pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameN
     if (rc == 0) return .ok;
     return switch (std.posix.errno(rc)) {
         .EXIST => .exists,
+        .XDEV => .cross_device,
+        else => .failed,
+    };
+}
+
+/// Atomically exchange two existing paths on the same filesystem.
+pub fn renameExchange(first: [*:0]const u8, second: [*:0]const u8) RenameExchangeResult {
+    if (is_linux) {
+        const linux = std.os.linux;
+        return switch (linux.errno(linux.renameat2(c.AT_FDCWD, first, c.AT_FDCWD, second, .{ .EXCHANGE = true }))) {
+            .SUCCESS => .ok,
+            .NOSYS, .INVAL, .OPNOTSUPP => .unsupported,
+            .XDEV => .cross_device,
+            else => .failed,
+        };
+    }
+    const rc = c.renamex_np(first, second, @intCast(c.RENAME_SWAP));
+    if (rc == 0) return .ok;
+    return switch (std.posix.errno(rc)) {
+        .NOSYS, .INVAL, .OPNOTSUPP => .unsupported,
         .XDEV => .cross_device,
         else => .failed,
     };

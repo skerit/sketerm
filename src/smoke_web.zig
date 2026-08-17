@@ -854,6 +854,7 @@ const Client = struct {
     ack_webext_tabs: bool = false,
     ack_filter_subscribe: bool = false,
     ack_webext_action: bool = false,
+    ack_webext_transaction: bool = false,
 
     action_seq: u32 = 0,
     action_view: u32 = 0,
@@ -883,6 +884,11 @@ const Client = struct {
     we_name_len: usize = 0,
     we_err: [256]u8 = @splat(0),
     we_err_len: usize = 0,
+    we_prepare_seq: u32 = 0,
+    we_prepare_req: u32 = 0,
+    we_prepare_ok: u8 = 0xff,
+    we_prepare_err: [128]u8 = @splat(0),
+    we_prepare_err_len: usize = 0,
 
     /// Last `ev_webext_wreq_stats` observed (stage 34).
     wq_seen: bool = false,
@@ -1365,6 +1371,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.ack_webext_tabs = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.ack_filter_subscribe = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_ACTION)) self.ack_webext_action = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TRANSACTION)) self.ack_webext_transaction = true;
                 }
             },
             .frame_inline => {
@@ -1593,6 +1600,14 @@ const Client = struct {
                 self.we_err_len = @min(st.err.len, self.we_err.len);
                 @memcpy(self.we_err[0..self.we_err_len], st.err[0..self.we_err_len]);
                 self.we_seq += 1;
+            },
+            .ev_webext_install_prepared => {
+                const ev = proto.decode(proto.EvWebextInstallPrepared, frame.payload) catch fail("ev_webext_install_prepared decode");
+                self.we_prepare_req = ev.req;
+                self.we_prepare_ok = ev.ok;
+                self.we_prepare_err_len = @min(ev.err.len, self.we_prepare_err.len);
+                @memcpy(self.we_prepare_err[0..self.we_prepare_err_len], ev.err[0..self.we_prepare_err_len]);
+                self.we_prepare_seq += 1;
             },
             .ev_webext_actions => {
                 const ev = proto.decode(proto.EvWebextActions, frame.payload) catch fail("ev_webext_actions decode");
@@ -3158,6 +3173,10 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     var ext_buf: [4096]u8 = undefined;
     const ext_dir = std.fmt.bufPrint(&ext_buf, "{s}/wefix", .{dir}) catch fail("webext ext path");
     if (!writeFixture(ext_dir)) fail("stage 33 webext: could not write the fixture extension");
+    var reject_buf: [4096]u8 = undefined;
+    const reject_dir = std.fmt.bufPrintZ(&reject_buf, "{s}/we-reject", .{dir}) catch fail("webext reject path");
+    mkdirZ(reject_dir);
+    if (!writeFile(reject_dir, "manifest.json", fx_manifest)) fail("stage 33 webext: could not write reject fixture");
     // The helper reads XDG_DATA_HOME for its per-extension storage; a
     // child inherits this, and both runs share it so storage persists.
     _ = c.setenv("XDG_DATA_HOME", data_dir.ptr, 1);
@@ -3182,6 +3201,7 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
             while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
         }
         if (!cl.ack_webext) fail("stage 33 webext: hello_ack lacks the webext capability");
+        if (!cl.ack_webext_transaction) fail("stage 33 webext: hello_ack lacks the webext transaction capability");
 
         cl.send(proto.WebextSet{ .id = ext_id, .dir = ext_dir, .enabled = 1 });
         {
@@ -3193,6 +3213,33 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
         if (!std.mem.eql(u8, cl.we_name[0..cl.we_name_len], "sketerm smoke fixture")) {
             fail("stage 33 webext: manifest name not reported");
         }
+
+        // The candidate has a valid matching manifest but none of its
+        // declared assets. The helper must reject it before quiescing the
+        // currently running extension.
+        const prepare_before = cl.we_prepare_seq;
+        cl.send(proto.WebextInstallPrepare{
+            .req = 901,
+            .id = ext_id,
+            .dir = reject_dir,
+            .version = "1.0",
+        });
+        {
+            const d = nowMs() + 5_000;
+            while (cl.we_prepare_seq == prepare_before and nowMs() < d) cl.pump(100);
+        }
+        if (cl.we_prepare_seq == prepare_before or cl.we_prepare_req != 901 or
+            cl.we_prepare_ok != 0 or cl.we_prepare_err_len == 0)
+            fail("stage 33 webext: invalid staged upgrade was not refused");
+        cl.we_ok = 0xff;
+        cl.send(proto.WebextListReq{});
+        {
+            const d = nowMs() + 5_000;
+            while (cl.we_ok == 0xff and nowMs() < d) cl.pump(100);
+        }
+        if (cl.we_ok != 1 or cl.we_enabled != 1)
+            fail("stage 33 webext: helper refusal disturbed the working extension");
+        pass("stage 33c transactional helper refusal preserves the working extension");
 
         // A head start for the background page, NOT the guarantee: the
         // fixture's content script retries its sendMessage until the

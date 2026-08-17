@@ -151,16 +151,23 @@ pub const Host = struct {
     pub fn set(self: *Host, id: []const u8, dir: []const u8, enabled: bool) !*Extension {
         if (!manifest.idValid(id)) return error.InvalidExtensionId;
         var e = self.find(id) orelse blk: {
-            try self.exts.append(self.gpa, .{
-                .id = try self.gpa.dupe(u8, id),
-                .dir = try self.gpa.dupe(u8, dir),
-            });
+            const new_id = try self.gpa.dupe(u8, id);
+            const new_dir = self.gpa.dupe(u8, dir) catch |err| {
+                self.gpa.free(new_id);
+                return err;
+            };
+            self.exts.append(self.gpa, .{ .id = new_id, .dir = new_dir }) catch |err| {
+                self.gpa.free(new_id);
+                self.gpa.free(new_dir);
+                return err;
+            };
             break :blk &self.exts.items[self.exts.items.len - 1];
         };
         // A changed dir re-points the record.
         if (!std.mem.eql(u8, e.dir, dir)) {
+            const new_dir = try self.gpa.dupe(u8, dir);
             self.gpa.free(e.dir);
-            e.dir = try self.gpa.dupe(u8, dir);
+            e.dir = new_dir;
         }
         // Every set represents a new extension instance, including a
         // disable/re-enable and an unpacked package being reinstalled in

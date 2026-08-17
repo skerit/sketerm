@@ -671,6 +671,8 @@ pub const Client = struct {
     cap_webext_tabs: bool = false,
     /// The helper exposes browser-action toolbar state and real popups.
     cap_webext_action: bool = false,
+    /// Correlated prepare/commit handshake for failure-atomic package upgrades.
+    cap_webext_transaction: bool = false,
     /// The helper fetches subscribed filter lists itself (0xC4).
     cap_filter_subscribe: bool = false,
     /// Rich reader results and revision-guarded reader actions.
@@ -802,6 +804,7 @@ pub const Client = struct {
     }
 
     fn failWith(self: *Client, reason: []const u8, retryable: bool) void {
+        if (!self.isRemote()) webext.onHelperUnavailable();
         self.teardownConnection();
         self.state = .unavailable;
         self.reason = reason;
@@ -839,6 +842,7 @@ pub const Client = struct {
         self.cap_webext = false;
         self.cap_webext_tabs = false;
         self.cap_webext_action = false;
+        self.cap_webext_transaction = false;
         if (self.bridge) |br| {
             self.bridge = null;
             br.stop();
@@ -1032,9 +1036,15 @@ pub const Client = struct {
     /// helper must never block the GLib loop, so the remainder rides a
     /// writable-fd watch.
     pub fn post(self: *Client, value: anytype) void {
-        if (self.state != .ready) return;
-        self.out.post(value, null) catch return;
+        _ = self.postChecked(value);
+    }
+
+    /// Queue a frame, reporting allocation loss or a connection failure.
+    pub fn postChecked(self: *Client, value: anytype) bool {
+        if (self.state != .ready) return false;
+        self.out.post(value, null) catch return false;
         self.flush();
+        return self.state == .ready;
     }
 
     fn flush(self: *Client) void {
@@ -1191,6 +1201,7 @@ pub const Client = struct {
                 self.cap_webext = false;
                 self.cap_webext_tabs = false;
                 self.cap_webext_action = false;
+                self.cap_webext_transaction = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -1209,6 +1220,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.cap_webext = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.cap_webext_tabs = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_ACTION)) self.cap_webext_action = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TRANSACTION)) self.cap_webext_transaction = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.cap_filter_subscribe = true;
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
@@ -1225,6 +1237,7 @@ pub const Client = struct {
                     self.cap_webext = false;
                     self.cap_webext_tabs = false;
                     self.cap_webext_action = false;
+                    self.cap_webext_transaction = false;
                 } else if (self.cap_webext) {
                     webext.publish(self);
                     tabsChanged();
@@ -1243,6 +1256,14 @@ pub const Client = struct {
             .ev_webext_state => {
                 const st = proto.decode(proto.EvWebextState, frame.payload) catch return;
                 webext.onState(st);
+            },
+            .ev_webext_install_prepared => {
+                const ev = proto.decode(proto.EvWebextInstallPrepared, frame.payload) catch return;
+                webext.onInstallPrepared(ev);
+            },
+            .ev_webext_install_committed => {
+                const ev = proto.decode(proto.EvWebextInstallCommitted, frame.payload) catch return;
+                webext.onInstallCommitted(ev);
             },
             .ev_webext_actions => {
                 const ev = proto.decode(proto.EvWebextActions, frame.payload) catch return;

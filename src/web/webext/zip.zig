@@ -258,7 +258,8 @@ fn validateSizes(method: u16, comp_size: usize, uncomp_size: usize) Error!void {
     if (uncomp_size > allowed) return error.LimitExceeded;
 }
 
-fn validateName(name: []const u8) Error!bool {
+/// Apply the archive entry path policy without extracting an entry.
+pub fn validateName(name: []const u8) Error!bool {
     if (name.len == 0 or name.len > limits.name_length) return error.UnsafeName;
     if (name[0] == '/' or
         std.mem.indexOfScalar(u8, name, 0) != null or

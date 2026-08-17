@@ -21,7 +21,9 @@ const webface = @import("webface.zig");
 const proto = @import("../web/protocol.zig");
 const manifest = @import("../web/webext/manifest.zig");
 const zip = @import("../web/webext/zip.zig");
+const extinstall = @import("../web/webext/install.zig");
 const pathz = @import("../util/pathz.zig");
+const atomicwrite = @import("../util/atomicwrite.zig");
 
 /// One installed extension as the GUI tracks it.
 pub const Ext = struct {
@@ -140,30 +142,30 @@ fn strField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
     return if (v == .string) v.string else null;
 }
 
-fn save() void {
-    const gpa = g_gpa orelse return;
-    const dir = dataDir(gpa) orelse return;
+fn save() InstallError!void {
+    const gpa = g_gpa orelse return error.WriteFailed;
+    const dir = dataDir(gpa) orelse return error.WriteFailed;
     defer gpa.free(dir);
-    mkdirAll(dir);
-    const path = std.fmt.allocPrint(gpa, "{s}/registry.json", .{dir}) catch return;
+    pathz.makeDirs(dir, 0o700) catch return error.WriteFailed;
+    const path = std.fmt.allocPrint(gpa, "{s}/registry.json", .{dir}) catch return error.OutOfMemory;
     defer gpa.free(path);
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const w = &aw.writer;
-    w.writeByte('[') catch return;
+    w.writeByte('[') catch return error.OutOfMemory;
     for (g_exts.items, 0..) |e, i| {
-        if (i != 0) w.writeByte(',') catch return;
-        w.writeAll("{\"id\":") catch return;
-        std.json.Stringify.value(e.id, .{}, w) catch return;
-        w.writeAll(",\"dir\":") catch return;
-        std.json.Stringify.value(e.dir, .{}, w) catch return;
+        if (i != 0) w.writeByte(',') catch return error.OutOfMemory;
+        w.writeAll("{\"id\":") catch return error.OutOfMemory;
+        std.json.Stringify.value(e.id, .{}, w) catch return error.OutOfMemory;
+        w.writeAll(",\"dir\":") catch return error.OutOfMemory;
+        std.json.Stringify.value(e.dir, .{}, w) catch return error.OutOfMemory;
         w.print(",\"enabled\":{s},\"owned\":{s}}}", .{
             if (e.enabled) "true" else "false",
             if (e.owned_files) "true" else "false",
-        }) catch return;
+        }) catch return error.OutOfMemory;
     }
-    w.writeByte(']') catch return;
-    writeFile(path, aw.written());
+    w.writeByte(']') catch return error.OutOfMemory;
+    atomicwrite.writeFile(path, aw.written(), 0o600) catch return error.WriteFailed;
 }
 
 // -- publish / helper state ------------------------------------------
@@ -182,6 +184,10 @@ pub fn publish(cl: *webface.Client) void {
 pub fn onState(st: proto.EvWebextState) void {
     const gpa = g_gpa orelse return;
     if (!manifest.idValid(st.id)) return;
+    // A correlated install owns this id until commit or rollback. The
+    // helper also emits the legacy state frame while loading the candidate;
+    // folding that into the old registry would make a later refusal partial.
+    if (pendingById(st.id) != null) return;
     const e = find(st.id) orelse return;
     if (st.name.len != 0) {
         gpa.free(e.name);
@@ -204,6 +210,8 @@ pub const InstallError = error{
     NoManifest,
     WriteFailed,
     BadArchive,
+    InstallBusy,
+    HelperRefused,
     /// An MV3 package. Its own error because it is the ONE failure a
     /// user hits by accident (every Chrome Web Store download is MV3)
     /// and the only one where the fix is "get the Firefox build".
@@ -216,10 +224,11 @@ pub fn installErrorText(e: InstallError) [*:0]const u8 {
     return switch (e) {
         error.NoManifest => "No manifest.json was found in that folder or package.",
         error.BadManifest => "The manifest.json could not be parsed.",
-        error.UnsupportedManifestVersion =>
-            "This is a Manifest V3 extension. sketerm hosts the Firefox MV2 surface, " ++
+        error.UnsupportedManifestVersion => "This is a Manifest V3 extension. sketerm hosts the Firefox MV2 surface, " ++
             "where blocking webRequest still exists; install the Firefox build instead.",
         error.BadArchive => "That file is not a readable .xpi/.zip archive.",
+        error.InstallBusy => "This extension is already being installed by another sketerm process.",
+        error.HelperRefused => "The browser helper refused the staged extension; the previous version was restored.",
         error.WriteFailed => "The extension could not be written to the data directory.",
         error.OutOfMemory => "Out of memory.",
     };
@@ -234,8 +243,8 @@ pub fn installUnpacked(gpa: std.mem.Allocator, dir: []const u8) InstallError![]c
     return register(gpa, dir, &man, false);
 }
 
-/// Install an `.xpi`/`.zip`: unpack it under the data dir and register.
-pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError![]const u8 {
+/// Install an `.xpi`/`.zip` through a staged helper-coordinated transaction.
+pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError!void {
     ensureLoaded(gpa);
     const bytes = readFile(gpa, xpi_path) orelse return error.NoManifest;
     defer gpa.free(bytes);
@@ -245,28 +254,200 @@ pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError
     var man = manifest.parse(gpa, man_entry.data) catch |err| return mapParseError(err);
     defer man.deinit();
 
-    var idbuf: [manifest.MAX_ID_LEN]u8 = undefined;
-    const id = manifest.extensionId(&man, &idbuf);
     const base = dataDir(gpa) orelse return error.WriteFailed;
     defer gpa.free(base);
-    const dest = std.fmt.allocPrint(gpa, "{s}/{s}", .{ base, id }) catch return error.OutOfMemory;
-    defer gpa.free(dest);
-    // AN UPGRADE REPLACES, it does not merge. The id is version-
-    // independent, so v2 unpacks over v1's directory; without this wipe
-    // every file v2 dropped would survive as a stale asset the helper
-    // still serves over `chrome-extension://`.
-    removeTree(gpa, dest);
-    mkdirAll(dest);
-    for (arc.entries) |entry| {
-        if (entry.is_dir) continue;
-        // Reject any path that escapes the destination.
-        if (std.mem.indexOf(u8, entry.name, "..") != null) continue;
-        const full = std.fmt.allocPrint(gpa, "{s}/{s}", .{ dest, entry.name }) catch continue;
-        defer gpa.free(full);
-        if (std.fs.path.dirname(full)) |d| mkdirAll(d);
-        writeFile(full, entry.data);
+    var tx = extinstall.begin(gpa, base, &arc, &man) catch |err| return mapInstallError(err);
+    var tx_owned = true;
+    defer if (tx_owned) tx.deinit();
+
+    const cl = webface.client();
+    if (cl.state == .ready) {
+        if (!cl.cap_webext_transaction) return error.HelperRefused;
+        const pending = gpa.create(PendingInstall) catch return error.OutOfMemory;
+        var pending_owned = true;
+        errdefer if (pending_owned) gpa.destroy(pending);
+        pending.* = .{
+            .gpa = gpa,
+            .req = next_install_req,
+            .tx = tx,
+        };
+        next_install_req +%= 1;
+        if (next_install_req == 0) next_install_req = 1;
+        g_pending.append(gpa, pending) catch return error.OutOfMemory;
+        tx_owned = false;
+        pending_owned = false;
+        pending.timer = c.g_timeout_add(INSTALL_TIMEOUT_MS, @ptrCast(&onInstallTimeout), pending);
+        const req = pending.req;
+        if (!cl.postChecked(proto.WebextInstallPrepare{
+            .req = req,
+            .id = pending.tx.id,
+            .dir = pending.tx.stage,
+            .version = pending.tx.version,
+        })) {
+            if (pendingByReq(req)) |live| discardPending(live, false);
+            return error.HelperRefused;
+        }
+        return;
     }
-    return register(gpa, dest, &man, true);
+
+    tx.commit() catch |err| return mapInstallError(err);
+    _ = try updateRegistry(gpa, tx.dest, tx.id, tx.name, tx.version, true);
+    tx.finish() catch |err| std.debug.print("webext: obsolete extension cleanup failed: {s}\n", .{@errorName(err)});
+    refreshOpenManager();
+}
+
+fn mapInstallError(err: extinstall.Error) InstallError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.UnsupportedManifestVersion => error.UnsupportedManifestVersion,
+        error.BadManifest, error.IdentityMismatch, error.VersionMismatch, error.MissingAsset, error.UnsafeAsset => error.BadManifest,
+        error.ConcurrentInstall => error.InstallBusy,
+        else => error.WriteFailed,
+    };
+}
+
+const INSTALL_TIMEOUT_MS = 15_000;
+
+const PendingInstall = struct {
+    gpa: std.mem.Allocator,
+    req: u32,
+    tx: extinstall.Transaction,
+    timer: c.guint = 0,
+    enabled: bool = true,
+    phase: enum { waiting_prepare, waiting_commit } = .waiting_prepare,
+};
+
+var g_pending: std.ArrayList(*PendingInstall) = .empty;
+var next_install_req: u32 = 1;
+
+fn pendingByReq(req: u32) ?*PendingInstall {
+    for (g_pending.items) |pending| {
+        if (pending.req == req) return pending;
+    }
+    return null;
+}
+
+fn pendingById(id: []const u8) ?*PendingInstall {
+    for (g_pending.items) |pending| {
+        if (std.mem.eql(u8, pending.tx.id, id)) return pending;
+    }
+    return null;
+}
+
+fn destroyPending(pending: *PendingInstall) void {
+    if (pending.timer != 0) {
+        _ = c.g_source_remove(pending.timer);
+        pending.timer = 0;
+    }
+    for (g_pending.items, 0..) |item, i| {
+        if (item == pending) {
+            _ = g_pending.orderedRemove(i);
+            break;
+        }
+    }
+    pending.tx.deinit();
+    pending.gpa.destroy(pending);
+}
+
+fn restoreHelper(pending: *PendingInstall) void {
+    const cl = webface.client();
+    if (cl.state != .ready or !cl.cap_webext) return;
+    if (find(pending.tx.id)) |old| {
+        _ = cl.postChecked(proto.WebextSet{
+            .id = old.id,
+            .dir = old.dir,
+            .enabled = @intFromBool(old.enabled),
+        });
+    } else {
+        _ = cl.postChecked(proto.WebextRemove{ .id = pending.tx.id });
+    }
+}
+
+fn discardPending(pending: *PendingInstall, restore_helper: bool) void {
+    pending.tx.rollback() catch |rollback_err| {
+        std.debug.print("webext: install rollback failed: {s}\n", .{@errorName(rollback_err)});
+    };
+    if (restore_helper) restoreHelper(pending);
+    destroyPending(pending);
+}
+
+fn failPending(pending: *PendingInstall, err: InstallError, restore_helper: bool) void {
+    discardPending(pending, restore_helper);
+    reportInstallError(err);
+}
+
+fn onInstallTimeout(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const pending = cast.userData(PendingInstall, user);
+    pending.timer = 0;
+    failPending(pending, error.HelperRefused, true);
+    return 0;
+}
+
+/// Continue an install only after the helper validated and quiesced the old instance.
+pub fn onInstallPrepared(ev: proto.EvWebextInstallPrepared) void {
+    const pending = pendingByReq(ev.req) orelse return;
+    if (!std.mem.eql(u8, pending.tx.id, ev.id) or pending.phase != .waiting_prepare) return;
+    if (ev.ok == 0) {
+        std.debug.print("webext: staged extension refused: {s}\n", .{ev.err});
+        failPending(pending, error.HelperRefused, false);
+        return;
+    }
+    pending.phase = .waiting_commit;
+    pending.enabled = if (find(pending.tx.id)) |old| old.enabled else true;
+    pending.tx.commit() catch |err| {
+        std.debug.print("webext: atomic extension swap failed: {s}\n", .{@errorName(err)});
+        failPending(pending, mapInstallError(err), true);
+        return;
+    };
+    const req = pending.req;
+    const cl = webface.client();
+    if (!cl.postChecked(proto.WebextInstallCommit{
+        .req = req,
+        .id = pending.tx.id,
+        .dir = pending.tx.dest,
+        .version = pending.tx.version,
+        .enabled = @intFromBool(pending.enabled),
+    })) {
+        if (pendingByReq(req)) |live| failPending(live, error.HelperRefused, false);
+    }
+}
+
+/// Accept or roll back the swapped tree from the helper's correlated load result.
+pub fn onInstallCommitted(ev: proto.EvWebextInstallCommitted) void {
+    const pending = pendingByReq(ev.req) orelse return;
+    if (!std.mem.eql(u8, pending.tx.id, ev.id) or pending.phase != .waiting_commit) return;
+    if (ev.ok == 0) {
+        std.debug.print("webext: committed extension refused: {s}\n", .{ev.err});
+        failPending(pending, error.HelperRefused, true);
+        return;
+    }
+    _ = updateRegistry(
+        pending.gpa,
+        pending.tx.dest,
+        pending.tx.id,
+        pending.tx.name,
+        pending.tx.version,
+        true,
+    ) catch |err| {
+        failPending(pending, err, true);
+        return;
+    };
+    if (find(pending.tx.id)) |installed| {
+        installed.enabled = pending.enabled;
+        installed.ok = true;
+        if (installed.err.len != 0) pending.gpa.free(installed.err);
+        installed.err = &.{};
+    }
+    pending.tx.finish() catch |err| {
+        std.debug.print("webext: obsolete extension cleanup failed: {s}\n", .{@errorName(err)});
+    };
+    refreshOpenManager();
+    destroyPending(pending);
+}
+
+/// A helper disconnect makes every in-flight prepare/commit untrustworthy.
+pub fn onHelperUnavailable() void {
+    while (g_pending.items.len != 0) failPending(g_pending.items[0], error.HelperRefused, false);
 }
 
 fn mapParseError(err: manifest.ParseError) InstallError {
@@ -287,64 +468,113 @@ fn mapParseError(err: manifest.ParseError) InstallError {
 fn register(gpa: std.mem.Allocator, dir: []const u8, man: *manifest.Manifest, owned: bool) InstallError![]const u8 {
     var idbuf: [manifest.MAX_ID_LEN]u8 = undefined;
     const id = manifest.extensionId(man, &idbuf);
+    const result = try updateRegistry(gpa, dir, id, man.name, man.version, owned);
+    const e = find(id) orelse return error.WriteFailed;
+    webface.client().post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = 0 });
+    webface.client().post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (e.enabled) 1 else 0 });
+    refreshOpenManager();
+    return result;
+}
+
+/// Apply one already-accepted install to memory and durable registry as one unit.
+fn updateRegistry(
+    gpa: std.mem.Allocator,
+    dir: []const u8,
+    id: []const u8,
+    name: []const u8,
+    version: []const u8,
+    owned: bool,
+) InstallError![]const u8 {
     if (find(id)) |e| {
-        // An upgrade whose files moved (unpacked -> packaged, or the
-        // other way) must not strand the old owned copy on disk.
-        if (e.owned_files and !std.mem.eql(u8, e.dir, dir)) removeTree(gpa, e.dir);
         const new_dir = gpa.dupe(u8, dir) catch return error.OutOfMemory;
-        const new_name = gpa.dupe(u8, man.name) catch {
+        const new_name = gpa.dupe(u8, name) catch {
             gpa.free(new_dir);
             return error.OutOfMemory;
         };
-        const new_version = gpa.dupe(u8, man.version) catch {
+        const new_version = gpa.dupe(u8, version) catch {
             gpa.free(new_dir);
             gpa.free(new_name);
             return error.OutOfMemory;
         };
-        gpa.free(e.dir);
+        const old_dir = e.dir;
+        const old_name = e.name;
+        const old_version = e.version;
+        const old_owned = e.owned_files;
         e.dir = new_dir;
-        gpa.free(e.name);
         e.name = new_name;
-        gpa.free(e.version);
         e.version = new_version;
         e.owned_files = owned;
+        save() catch |err| {
+            e.dir = old_dir;
+            e.name = old_name;
+            e.version = old_version;
+            e.owned_files = old_owned;
+            gpa.free(new_dir);
+            gpa.free(new_name);
+            gpa.free(new_version);
+            save() catch {};
+            return err;
+        };
+        gpa.free(old_name);
+        gpa.free(old_version);
+        if (old_owned and !std.mem.eql(u8, old_dir, dir)) removeTree(gpa, old_dir);
+        gpa.free(old_dir);
     } else {
         var fresh = Ext{
             .id = gpa.dupe(u8, id) catch return error.OutOfMemory,
-            .dir = gpa.dupe(u8, dir) catch return error.OutOfMemory,
-            .name = gpa.dupe(u8, man.name) catch return error.OutOfMemory,
-            .version = gpa.dupe(u8, man.version) catch return error.OutOfMemory,
+            .dir = undefined,
+            .name = undefined,
+            .version = undefined,
             .enabled = true,
             .owned_files = owned,
+        };
+        fresh.dir = gpa.dupe(u8, dir) catch {
+            gpa.free(fresh.id);
+            return error.OutOfMemory;
+        };
+        fresh.name = gpa.dupe(u8, name) catch {
+            gpa.free(fresh.id);
+            gpa.free(fresh.dir);
+            return error.OutOfMemory;
+        };
+        fresh.version = gpa.dupe(u8, version) catch {
+            gpa.free(fresh.id);
+            gpa.free(fresh.dir);
+            gpa.free(fresh.name);
+            return error.OutOfMemory;
         };
         g_exts.append(gpa, fresh) catch {
             freeExt(&fresh);
             return error.OutOfMemory;
         };
+        save() catch |err| {
+            var removed = g_exts.pop().?;
+            freeExt(&removed);
+            save() catch {};
+            return err;
+        };
     }
-    save();
     const e = find(id) orelse return error.WriteFailed;
-    // A REPLACED extension must be torn down in the helper before the
-    // new files are announced: the same id keeps the same storage but
-    // its background page, listeners and content scripts belong to the
-    // version that is going away.
-    webface.client().post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = 0 });
-    webface.client().post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (e.enabled) 1 else 0 });
-    refreshOpenManager();
     return e.id;
 }
 
 pub fn setEnabled(id: []const u8, on: bool) void {
     if (!manifest.idValid(id)) return;
     const e = find(id) orelse return;
+    if (pendingById(id) != null) return;
+    const old = e.enabled;
     e.enabled = on;
-    save();
+    save() catch {
+        e.enabled = old;
+        return;
+    };
     webface.client().post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (on) 1 else 0 });
     refreshOpenManager();
 }
 
 pub fn remove(id: []const u8) void {
     if (!manifest.idValid(id)) return;
+    if (pendingById(id) != null) return;
     const gpa = g_gpa orelse return;
     for (g_exts.items, 0..) |*e, i| {
         if (!std.mem.eql(u8, e.id, id)) continue;
@@ -354,7 +584,7 @@ pub fn remove(id: []const u8) void {
         if (e.owned_files) removeTree(gpa, e.dir);
         freeExt(e);
         _ = g_exts.orderedRemove(i);
-        save();
+        save() catch {};
         refreshOpenManager();
         return;
     }
@@ -616,26 +846,6 @@ fn readFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
         return null;
     }
     return buf;
-}
-
-fn writeFile(path: []const u8, bytes: []const u8) void {
-    var zbuf: [4096]u8 = undefined;
-    if (path.len + 1 > zbuf.len) return;
-    @memcpy(zbuf[0..path.len], path);
-    zbuf[path.len] = 0;
-    const fd = c.open(@ptrCast(&zbuf), c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o644));
-    if (fd < 0) return;
-    defer _ = c.close(fd);
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n <= 0) break;
-        off += @intCast(n);
-    }
-}
-
-fn mkdirAll(path: []const u8) void {
-    pathz.makeDirs(path, 0o755) catch {};
 }
 
 /// Best-effort recursive delete of an owned extension directory.
