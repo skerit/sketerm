@@ -671,11 +671,13 @@ pub const App = struct {
         };
         defer snap.deinit(allocator);
 
-        var restored = restoreTermSnapshot(allocator, snap.payload) catch |err| {
-            setLaunchErr("attach snapshot: {s}", .{@errorName(err)});
-            return if (err == error.OutOfMemory) Error.OutOfMemory else Error.SpawnFailed;
-        };
-        errdefer restored.deinit(allocator);
+        // Best-effort. The PTY mirror backs `app_output`; it is not the
+        // session. A snapshot this client cannot decode — a version or
+        // size skew against a daemon it did not ship with — must not roll
+        // back an app that spawned and is running fine, or a durable
+        // session on a pre-upgrade daemon stops being launchable at all.
+        const restored: ?snapshot.OwnedRestore = snapshot.restoreOwned(allocator, snap.payload) catch null;
+        errdefer if (restored) |r| r.deinit(allocator);
         const local_sock = if (opts.host == null and opts.local_sock != null)
             allocator.dupe(u8, opts.local_sock.?) catch return Error.OutOfMemory
         else
@@ -697,9 +699,9 @@ pub const App = struct {
             .pid = meta.pid,
             .output_width = meta.output_width,
             .output_height = meta.output_height,
-            .term_pool = restored.pool,
-            .term_screen = restored.screen,
-            .term_seq = restored.seq,
+            .term_pool = if (restored) |r| r.pool else null,
+            .term_screen = if (restored) |r| r.screen else null,
+            .term_seq = if (restored) |r| r.seq else 0,
             .local_sock = local_sock,
             .ssh_host = ssh_host,
         };
@@ -865,32 +867,10 @@ pub const App = struct {
         a.destroy(self);
     }
 
-    const RestoredTerm = struct {
-        seq: u64,
-        pool: *Pool,
-        screen: *Screen,
-
-        fn deinit(self: *RestoredTerm, allocator: std.mem.Allocator) void {
-            self.screen.deinit();
-            self.pool.deinit();
-            allocator.destroy(self.pool);
-        }
-    };
-
-    fn restoreTermSnapshot(allocator: std.mem.Allocator, payload: []const u8) !RestoredTerm {
-        const envelope = try snapshot.peelEnvelope(payload);
-        const pool = try allocator.create(Pool);
-        errdefer allocator.destroy(pool);
-        pool.* = try Pool.init(allocator);
-        errdefer pool.deinit();
-        const screen = try snapshot.restore(allocator, pool, envelope.body);
-        return .{ .seq = envelope.seq, .pool = pool, .screen = screen };
-    }
-
     /// Rebuild the terminal mirror from a later daemon snapshot.
     fn applyTermSnapshot(self: *App, payload: []const u8) void {
         const a = self.allocator;
-        const restored = restoreTermSnapshot(a, payload) catch return;
+        const restored = snapshot.restoreOwned(a, payload) catch return;
         if (self.term_screen) |s| s.deinit();
         if (self.term_pool) |p| {
             p.deinit();
@@ -3409,7 +3389,7 @@ test "post-mortem log push + exit are peeled when EOF lands in the same read" {
     try t.expectEqualSlices(u8, payload.items, app.log_buf.items);
 }
 
-const LaunchFailure = enum { attach_send, malformed_snapshot, snapshot_timeout, cleanup_connect };
+const LaunchFailure = enum { attach_send, snapshot_timeout, cleanup_connect };
 
 fn testLaunchFailure(failure: LaunchFailure) !void {
     const t = std.testing;
@@ -3430,13 +3410,8 @@ fn testLaunchFailure(failure: LaunchFailure) !void {
             conn.fd = -1;
             try daemon.queueFreshAck();
         },
-        .malformed_snapshot => {
-            try daemon.queueSnapshot("not-a-snapshot");
-            try daemon.queuePrimaryAck();
-        },
         .snapshot_timeout => try daemon.queueFreshAck(),
         .cleanup_connect => {
-            try daemon.queueSnapshot("not-a-snapshot");
             daemon.closePrimaryPeer();
             daemon.reconnect_fails = true;
         },
@@ -3453,10 +3428,6 @@ fn testLaunchFailure(failure: LaunchFailure) !void {
     ));
     switch (failure) {
         .attach_send => try daemon.expectFreshKill(name),
-        .malformed_snapshot => {
-            try daemon.expectAttach(name, true);
-            try daemon.expectPrimaryKill(name);
-        },
         .snapshot_timeout => {
             try daemon.expectAttach(name, true);
             try daemon.expectPrimaryKill(name);
@@ -3473,8 +3444,34 @@ test "App launch rolls back when attach send fails" {
     try testLaunchFailure(.attach_send);
 }
 
-test "App launch rolls back a malformed snapshot" {
-    try testLaunchFailure(.malformed_snapshot);
+test "App launch survives a snapshot it cannot decode" {
+    const t = std.testing;
+    const fake = @import("launch_cleanup_test.zig");
+    var daemon = try fake.Harness.init(t.allocator);
+    defer daemon.deinit();
+    const name = try t.allocator.dupe(u8, "fake-app");
+    var layout: ?xkblayout.Layout = null;
+    var conn = daemon.takePrimary(t.allocator);
+    const opts = App.LaunchOpts{ .local_sock = "/fake/mux.sock", .step_timeout_ms = 5 };
+    try daemon.queueSnapshot("not-a-snapshot");
+
+    // The PTY mirror backs app_output; it is not the app. A snapshot this
+    // client cannot decode used to turn "app runs, output unavailable"
+    // into "launch_app failed and the app was killed".
+    const app = try App.finishLaunch(
+        t.allocator,
+        &conn,
+        name,
+        &layout,
+        opts,
+        daemon.localEndpoint(),
+        fake.SPAWN_REPLY,
+    );
+    try t.expect(app.term_screen == null);
+    try t.expect(app.term_pool == null);
+    try t.expectError(Error.NotConnected, app.output(false));
+    try daemon.expectAttach(name, true);
+    app.deinit();
 }
 
 test "App launch rolls back a timed-out snapshot over a fresh connection" {

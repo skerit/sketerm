@@ -670,14 +670,23 @@ pub const Term = struct {
             return if (err == error.OutOfMemory) Error.OutOfMemory else Error.SpawnFailed;
         defer snap.deinit(allocator);
 
-        const envelope = snapshot.peelEnvelope(snap.payload) catch return Error.SpawnFailed;
-        const pool = allocator.create(Pool) catch return Error.OutOfMemory;
-        errdefer allocator.destroy(pool);
-        pool.* = Pool.init(allocator) catch return Error.OutOfMemory;
-        errdefer pool.deinit();
-        const screen = snapshot.restore(allocator, pool, envelope.body) catch |err|
-            return if (err == error.OutOfMemory) Error.OutOfMemory else Error.SpawnFailed;
-        errdefer screen.deinit();
+        // Best-effort, like appdrive's: the mirror backs term_read, not the
+        // session. A snapshot skew against a pre-upgrade daemon must leave
+        // the term attached and usable, not kill a shell that just spawned.
+        const restored: ?snapshot.OwnedRestore = snapshot.restoreOwned(allocator, snap.payload) catch null;
+        errdefer if (restored) |r| r.deinit(allocator);
+        const pool = if (restored) |r| r.pool else blk: {
+            const p = allocator.create(Pool) catch return Error.OutOfMemory;
+            p.* = Pool.init(allocator) catch {
+                allocator.destroy(p);
+                return Error.OutOfMemory;
+            };
+            break :blk p;
+        };
+        errdefer if (restored == null) {
+            pool.deinit();
+            allocator.destroy(pool);
+        };
         const shell_name = allocator.dupe(u8, std.fs.path.basename(shell)) catch return Error.OutOfMemory;
         errdefer allocator.free(shell_name);
         const host_owned = if (remote_host) |host|
@@ -693,13 +702,13 @@ pub const Term = struct {
             .origin_id = meta.origin_id,
             .origin_id_valid = true,
             .pool = pool,
-            .screen = screen,
-            .seq = envelope.seq,
+            .screen = if (restored) |r| r.screen else null,
+            .seq = if (restored) |r| r.seq else 0,
             .integration = integration,
             .shell_name = shell_name,
             .remote_host = host_owned,
         };
-        if (self.screen) |restored| self.app_cursor = restored.app_cursor_keys;
+        if (self.screen) |mirror| self.app_cursor = mirror.app_cursor_keys;
         cleanup.disarm();
         return self;
     }
@@ -720,15 +729,18 @@ pub const Term = struct {
         a.destroy(self);
     }
 
+    /// Swap the mirror for a freshly restored one. Failure-atomic: the
+    /// previous screen keeps serving reads if the new body will not decode.
     fn applySnapshot(self: *Term, payload: []const u8) !void {
-        const envelope = try snapshot.peelEnvelope(payload);
-        self.seq = envelope.seq;
+        const a = self.allocator;
+        const restored = try snapshot.restoreOwned(a, payload);
         if (self.screen) |s| s.deinit();
-        self.screen = null;
         self.pool.deinit();
-        self.pool.* = try Pool.init(self.allocator);
-        self.screen = try snapshot.restore(self.allocator, self.pool, envelope.body);
-        if (self.screen) |s| self.app_cursor = s.app_cursor_keys;
+        a.destroy(self.pool);
+        self.seq = restored.seq;
+        self.pool = restored.pool;
+        self.screen = restored.screen;
+        self.app_cursor = restored.screen.app_cursor_keys;
         self.events_desynced = false;
     }
 
@@ -1200,7 +1212,7 @@ pub const Term = struct {
     }
 };
 
-const SpawnFailure = enum { attach_send, malformed_snapshot, snapshot_timeout, cleanup_connect };
+const SpawnFailure = enum { attach_send, snapshot_timeout, cleanup_connect };
 
 fn testSpawnFailure(failure: SpawnFailure) !void {
     const t = std.testing;
@@ -1219,13 +1231,8 @@ fn testSpawnFailure(failure: SpawnFailure) !void {
             conn.fd = -1;
             try daemon.queueFreshAck();
         },
-        .malformed_snapshot => {
-            try daemon.queueSnapshot("not-a-snapshot");
-            try daemon.queuePrimaryAck();
-        },
         .snapshot_timeout => try daemon.queueFreshAck(),
         .cleanup_connect => {
-            try daemon.queueSnapshot("not-a-snapshot");
             daemon.closePrimaryPeer();
             daemon.reconnect_fails = true;
         },
@@ -1244,10 +1251,6 @@ fn testSpawnFailure(failure: SpawnFailure) !void {
     ));
     switch (failure) {
         .attach_send => try daemon.expectFreshKill(name),
-        .malformed_snapshot => {
-            try daemon.expectAttach(name, false);
-            try daemon.expectPrimaryKill(name);
-        },
         .snapshot_timeout => {
             try daemon.expectAttach(name, false);
             try daemon.expectPrimaryKill(name);
@@ -1262,8 +1265,35 @@ test "Term spawn rolls back when attach send fails" {
     try testSpawnFailure(.attach_send);
 }
 
-test "Term spawn rolls back a malformed snapshot" {
-    try testSpawnFailure(.malformed_snapshot);
+test "Term spawn survives a snapshot it cannot decode" {
+    const t = std.testing;
+    const fake = @import("launch_cleanup_test.zig");
+    var daemon = try fake.Harness.init(t.allocator);
+    defer daemon.deinit();
+    const name = try t.allocator.dupe(u8, "fake-term");
+    var conn = daemon.takePrimary(t.allocator);
+    const endpoint = daemon.remoteEndpoint();
+    try daemon.queueSnapshot("not-a-snapshot");
+
+    // The mirror backs term_read; it is not the session. A snapshot skew
+    // against a pre-upgrade daemon used to kill a shell that had spawned
+    // and was running fine.
+    const term = try Term.finishSpawn(
+        t.allocator,
+        &conn,
+        name,
+        "/bin/sh",
+        false,
+        "fake-host",
+        endpoint,
+        fake.SPAWN_REPLY,
+        5,
+    );
+    try t.expect(term.screen == null);
+    try t.expectEqual(@as(u64, 0), term.seq);
+    try daemon.expectAttach(name, false);
+    term.exited = true; // deinit must not send a kill through the fake
+    term.deinit();
 }
 
 test "Term spawn rolls back a timed-out snapshot over a fresh connection" {

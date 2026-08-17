@@ -347,6 +347,36 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
     }
 }
 
+/// A restored Screen together with the private style Pool its cells index.
+///
+/// Every mux CLIENT that mirrors a session needs exactly this triple, and
+/// the two that do (appdrive, termdrive) had hand-rolled it four times
+/// between them. The pool must be replaced together with the screen — a
+/// screen restored against a pool that is later reset indexes a dead table.
+pub const OwnedRestore = struct {
+    seq: u64,
+    pool: *Pool,
+    screen: *Screen,
+
+    pub fn deinit(self: OwnedRestore, allocator: std.mem.Allocator) void {
+        self.screen.deinit();
+        self.pool.deinit();
+        allocator.destroy(self.pool);
+    }
+};
+
+/// Peel a snapshot frame's envelope and restore its body into a fresh pool.
+/// Failure-atomic: nothing is allocated to the caller unless it all worked.
+pub fn restoreOwned(allocator: std.mem.Allocator, payload: []const u8) !OwnedRestore {
+    const envelope = try peelEnvelope(payload);
+    const pool = try allocator.create(Pool);
+    errdefer allocator.destroy(pool);
+    pool.* = try Pool.init(allocator);
+    errdefer pool.deinit();
+    const screen = try restore(allocator, pool, envelope.body);
+    return .{ .seq = envelope.seq, .pool = pool, .screen = screen };
+}
+
 pub const Envelope = struct {
     seq: u64,
     app: bool,
