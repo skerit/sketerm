@@ -149,12 +149,16 @@ comptime {
     _ = @import("mux/kitty_inline.zig");
     _ = @import("mux/daemon_cast.zig");
     _ = @import("mux/daemon_debug.zig");
+    _ = @import("mux/daemon.zig");
+    _ = @import("mux/daemon_serve.zig");
+    _ = @import("mux/daemon_sessions.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");
     _ = @import("mux/mediameta.zig");
     _ = @import("mux/mediameta_test.zig");
     _ = @import("mux/opuscodec.zig");
     _ = @import("mux/panel_relay_test.zig");
+    _ = @import("mux/panelrpc.zig");
     _ = @import("mux/predict.zig");
     _ = @import("mux/pulse.zig");
     _ = @import("mux/client.zig");
@@ -165,6 +169,7 @@ comptime {
     _ = @import("mux/wavcap.zig");
     _ = @import("mux/wire.zig");
     _ = @import("mux/webstore.zig");
+    _ = @import("mux/xwayland.zig");
     _ = @import("parser/clipboard_conformance_test.zig");
     _ = @import("parser/conformance_test.zig");
     _ = @import("parser/event.zig");
@@ -221,6 +226,7 @@ comptime {
     _ = @import("util/content.zig");
     _ = @import("util/crashlog.zig");
     _ = @import("util/filehash.zig");
+    _ = @import("util/fdcancel.zig");
     _ = @import("util/humantype.zig");
     _ = @import("util/imagecodec.zig");
     _ = @import("util/markdown.zig");
@@ -247,6 +253,7 @@ comptime {
     _ = @import("winstream/source.zig");
     _ = @import("wlhost/compositor.zig");
     _ = @import("wlhost/dmabuf.zig");
+    _ = @import("wlhost/keymaps.zig");
     _ = @import("wlhost/pipe.zig");
     _ = @import("wlhost/pixcodec.zig");
     _ = @import("wlhost/protocol.zig");

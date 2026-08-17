@@ -976,7 +976,13 @@ pub fn build(b: *std.Build) void {
         .use_lld = if (test_llvm) use_lld else false,
     });
     const run_tests = b.addRunArtifact(tests);
+    const test_roots = b.addSystemCommand(&.{ "bash" });
+    test_roots.addFileArg(b.path("dist/test-test-roots.sh"));
+    test_roots.has_side_effects = true;
+    const test_graph_step = b.step("test-graph", "Verify direct unit-test root coverage and dependency tiers");
+    test_graph_step.dependOn(&test_roots.step);
     const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&test_roots.step);
     test_step.dependOn(&run_tests.step);
 
     // GTK-free subset — `zig build test-core`. The full `test` step
@@ -1007,6 +1013,7 @@ pub fn build(b: *std.Build) void {
         .use_lld = if (test_llvm) use_lld else false,
     });
     const core_test_step = b.step("test-core", "Run the GTK-free unit-test subset (no GUI toolchain needed)");
+    core_test_step.dependOn(&test_roots.step);
     core_test_step.dependOn(&b.addRunArtifact(coretests).step);
 
     // Optional CEF browser helper — `zig build fetch-cef` / `zig build
@@ -1014,7 +1021,7 @@ pub fn build(b: *std.Build) void {
     // step, the binary distribution is never downloaded unless the fetch
     // step is asked for by name, and the CEF headers are only translated
     // when that distribution is already on disk.
-    addCef(b, target, optimize, strip, use_lld, core_cbindings_mod, mux_exe);
+    addCef(b, target, optimize, strip, use_lld, core_cbindings_mod, mux_exe, &test_roots.step);
 }
 
 /// Pinned CEF binary distribution ("minimal" distro, linux64). SINGLE
@@ -1061,6 +1068,7 @@ fn addCef(
     use_lld: bool,
     core_cbindings_mod: *std.Build.Module,
     mux_exe: *std.Build.Step.Compile,
+    test_roots: *std.Build.Step,
 ) void {
     // Default cache location, XDG-correct: $XDG_CACHE_HOME/sketerm/cef/
     // <version>/ (~/.cache/... when unset). Version-scoped so several
@@ -1195,6 +1203,7 @@ fn addCef(
 
     const web_step = b.step("web", "Build sketerm-webengine, the CEF browser helper (needs `zig build fetch-cef`)");
     const test_web_step = b.step("test-web", "Run CEF-gated browser-helper unit tests");
+    test_web_step.dependOn(test_roots);
     const smoke_web_step = b.step("smoke-web", "browser-helper end-to-end smoke (headless)");
     const bench_wreq_step = b.step("bench-webreq", "Blocking-webRequest added-latency benchmark (real helper, real page)");
 

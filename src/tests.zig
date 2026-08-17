@@ -19,6 +19,7 @@ comptime {
     _ = @import("util/humantype.zig");
     _ = @import("util/platform.zig");
     _ = @import("util/clock.zig");
+    _ = @import("util/fdcancel.zig");
     // browser helper protocol + keymap: pure std, no CEF — the helper
     // itself is opt-in (`zig build web`) but its wire format and key
     // mapping are testable everywhere.
@@ -130,6 +131,9 @@ comptime {
     // these modules silently never runs unless the file is referenced
     // here by name. Proven with a deliberately failing canary.
     _ = @import("ui/webface.zig");
+    _ = @import("ui/webaction.zig");
+    _ = @import("ui/webext.zig");
+    _ = @import("ui/webremote.zig");
     _ = @import("ui/webreader.zig");
     _ = @import("ui/webstore.zig");
     _ = @import("ui/websiteinfo.zig");
@@ -137,6 +141,7 @@ comptime {
     _ = @import("ui/browser.zig");
     _ = @import("ui/browser/view.zig");
     _ = @import("ui/browser/types.zig");
+    _ = @import("ui/browser/colview.zig");
     _ = @import("ui/browser/conn.zig");
     _ = @import("ui/browser/render.zig");
     _ = @import("ui/browser/mediacols.zig");
@@ -177,6 +182,8 @@ comptime {
     _ = @import("ipc/appdrive.zig");
     _ = @import("ipc/webdrive.zig");
     _ = @import("ipc/mcp.zig");
+    _ = @import("ipc/mcp_app.zig");
+    _ = @import("ipc/mcp_term.zig");
     _ = @import("ipc/mcp_web.zig");
     _ = @import("ipc/paneldrive.zig");
     _ = @import("ipc/evkeys.zig");
@@ -191,6 +198,7 @@ comptime {
     _ = @import("util/mounts.zig");
     _ = @import("util/markdown.zig");
     _ = @import("render/bg_pass.zig");
+    _ = @import("render/shader_pass.zig");
     _ = @import("mux/wire.zig");
     _ = @import("mux/webstore.zig");
     _ = @import("mux/fsserve.zig");
@@ -232,10 +240,14 @@ comptime {
     _ = @import("fsmount.zig");
     _ = @import("mux/daemon_cast.zig");
     _ = @import("mux/daemon_debug.zig");
+    _ = @import("mux/daemon.zig");
+    _ = @import("mux/daemon_serve.zig");
+    _ = @import("mux/daemon_sessions.zig");
     _ = @import("mux/fs_boundary.zig");
     _ = @import("mux/log.zig");
     _ = @import("mux/logring.zig");
     _ = @import("mux/pulse.zig");
+    _ = @import("mux/panelrpc.zig");
     _ = @import("mux/wavcap.zig");
     _ = @import("mux/opuscodec.zig");
     _ = @import("mux/panel_relay_test.zig");
@@ -254,6 +266,7 @@ comptime {
     _ = @import("mux/rudp.zig");
     _ = @import("mux/display.zig");
     _ = @import("mux/keep.zig");
+    _ = @import("mux/xwayland.zig");
     _ = @import("render/atlas_test.zig");
     _ = @import("render/atlas.zig");
     _ = @import("render/cell_pass.zig");
@@ -270,6 +283,7 @@ comptime {
     _ = @import("grid/bidi.zig");
     _ = @import("grid/schemes.zig");
     _ = @import("wlhost/wire.zig");
+    _ = @import("wlhost/keymaps.zig");
     _ = @import("wlhost/dmabuf.zig");
     _ = @import("wlhost/protocol.zig");
     _ = @import("wlhost/track.zig");
@@ -283,6 +297,7 @@ comptime {
     _ = @import("winstream/keymap.zig");
     _ = @import("remote_window.zig");
     _ = @import("terminal.zig");
+    _ = @import("audio_sink.zig");
     _ = @import("editor/rope.zig");
     _ = @import("editor/fuzz.zig");
     _ = @import("editor/stress.zig");
@@ -319,6 +334,7 @@ comptime {
     _ = @import("render/editor_viewport.zig");
     _ = @import("render/editor_pass.zig");
     _ = @import("ui/menu.zig");
+    _ = @import("ui/editormenu.zig");
     _ = @import("ui/appmenu.zig");
     _ = @import("ui/palette.zig");
     _ = @import("ui/panel/canary.zig");
@@ -329,6 +345,9 @@ comptime {
     _ = @import("ui/panelhost.zig");
     _ = @import("ui/panelwin.zig");
     _ = @import("ui/panelpicker.zig");
+    _ = @import("ui/window.zig");
+    _ = @import("ui/muxtabs.zig");
+    _ = @import("ui/remotectl.zig");
     _ = @import("wlapp.zig");
     _ = @import("doctor.zig");
 }
