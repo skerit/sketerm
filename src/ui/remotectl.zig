@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const crashlog = @import("../util/crashlog.zig");
 const clipboard = @import("clipboard.zig");
 const ipc_protocol = @import("../ipc/protocol.zig");
@@ -20,6 +21,10 @@ const Window = winmod.Window;
 
 /// Process-global pane-id counter (ids are global across windows).
 var next_pane_id: u32 = 1;
+
+fn saveScreenshot(path: []const u8, bytes: []const u8) atomicwrite.Error!void {
+    try atomicwrite.writeFileExact(path, bytes, 0o600);
+}
 
 pub fn allocPaneId(_: *Window) u32 {
     const id = next_pane_id;
@@ -571,13 +576,16 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         defer c.g_bytes_unref(bytes);
         var sz: c.gsize = 0;
         const ptr = c.g_bytes_get_data(bytes, &sz);
-        const path_z = try allocator.dupeZ(u8, path);
-        defer allocator.free(path_z);
-        const f = c.fopen(path_z.ptr, "wb") orelse
-            return ipc_protocol.writeErr(out, allocator, "cannot open output path for writing");
-        const wrote = c.fwrite(ptr, 1, sz, f);
-        _ = c.fclose(f);
-        if (wrote != sz) return ipc_protocol.writeErr(out, allocator, "short write to output path");
+        const data = @as([*]const u8, @ptrCast(ptr))[0..sz];
+        saveScreenshot(path, data) catch |err| {
+            var msg: [160]u8 = undefined;
+            return ipc_protocol.writeErr(
+                out,
+                allocator,
+                std.fmt.bufPrint(&msg, "cannot save screenshot: {s}", .{@errorName(err)}) catch
+                    "cannot save screenshot",
+            );
+        };
         try ipc_protocol.writeOk(out, allocator, "screenshot", .{ .path = path, .bytes = @as(u64, sz) });
     } else if (eql(u8, req.cmd, "record-start")) {
         // The daemon writes the file (on ITS host); the OK here
@@ -1243,4 +1251,22 @@ pub fn appendTabInfos(
             .panes = pane_infos.items,
         });
     }
+}
+
+test "IPC screenshots use private complete replacement" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-ipc-shot-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/shot.png", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    try saveScreenshot(path, "png");
+    var st: c.struct_stat = undefined;
+    try t.expect(c.stat(path_z.ptr, &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
 }

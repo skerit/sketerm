@@ -33,17 +33,16 @@
 //! byte-stable across round-trips, so a stored panel diffs cleanly and
 //! re-saving an unchanged document rewrites identical bytes.
 //!
-//! Writes are staged into `.<name>.<pid>.sketerm-part` in the same
-//! directory and `rename(2)`d into place, so a crash mid-save can never
-//! leave a half-written document that fails to parse on the next load.
-//! The staging name starts with a dot and does not end in `.json`, so a
-//! leftover from a killed process is invisible to `list`.
+//! Writes use the shared durable atomic writer: unique exclusive sibling
+//! stage, checked write and close, data sync, rename, then parent sync.
+//! A save therefore leaves either the prior document or the complete new one.
 //!
 //! libc file IO only (Zig 0.16 has no `std.fs.cwd`). GTK-free: in both
 //! test roots.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 const wire = @import("../mux/wire.zig");
 const doc = @import("../ui/panel/doc.zig");
@@ -351,9 +350,8 @@ fn noteOriginPath(allocator: std.mem.Allocator, origin: OriginScope) void {
     }) catch return;
     defer allocator.free(marker);
     if (fileExists(marker)) return;
-    const stage = std.fmt.allocPrint(allocator, "{s}.{d}.sketerm-part", .{ marker, c.getpid() }) catch return;
-    defer allocator.free(stage);
-    writeAtomic(stage, marker, origin.daemon_origin, true) catch {};
+    pathz.makeParentDirs(marker) catch return;
+    atomicwrite.writeFileExact(marker, origin.daemon_origin, 0o644) catch {};
 }
 
 fn panelPathScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8, diag: ?*Diag) Error![]u8 {
@@ -361,12 +359,6 @@ fn panelPathScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8,
     const dir = try scopeDir(allocator, scope);
     defer allocator.free(dir);
     return std.fmt.allocPrint(allocator, "{s}/{s}.json", .{ dir, name }) catch Error.OutOfMemory;
-}
-
-fn stagePathScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8) Error![]u8 {
-    const dir = try scopeDir(allocator, scope);
-    defer allocator.free(dir);
-    return std.fmt.allocPrint(allocator, "{s}/.{s}.{d}.sketerm-part", .{ dir, name, c.getpid() }) catch Error.OutOfMemory;
 }
 
 // ─── write / read primitives ────────────────────────────────────
@@ -380,44 +372,14 @@ fn errnoError(err: std.posix.E) Error {
     };
 }
 
-/// Stage `bytes` next to `path` and, when `commit`, rename it over
-/// `path`. `commit = false` exists for the atomicity test: it is
-/// exactly the state a crash between write and rename leaves behind.
-fn writeAtomic(stage: []const u8, path: []const u8, bytes: []const u8, commit: bool) Error!void {
-    pathz.makeParentDirs(path) catch return Error.IoFailed;
-    var szbuf: [4096]u8 = undefined;
-    const stage_z = pathz.pathZ(&szbuf, stage) catch return Error.IoFailed;
-    {
-        const f = c.fopen(stage_z, "wb") orelse return errnoError(std.posix.errno(@as(c_int, -1)));
-        var closed = false;
-        errdefer if (!closed) {
-            _ = c.fclose(f);
-            _ = c.unlink(stage_z);
-        };
-        if (bytes.len > 0 and c.fwrite(bytes.ptr, 1, bytes.len, f) != bytes.len) return Error.IoFailed;
-        if (c.fflush(f) != 0) return Error.IoFailed;
-        // Durability before the rename: without it the rename can land
-        // in the journal ahead of the data and a power cut yields a
-        // present-but-empty panel, which is the failure this whole
-        // path exists to prevent.
-        _ = c.fsync(c.fileno(f));
-        closed = true;
-        if (c.fclose(f) != 0) {
-            _ = c.unlink(stage_z);
-            return Error.IoFailed;
-        }
-    }
-    if (!commit) return;
-    var pzbuf: [4096]u8 = undefined;
-    const path_z = pathz.pathZ(&pzbuf, path) catch {
-        _ = c.unlink(stage_z);
-        return Error.IoFailed;
+/// Preserve the store's public error distinctions across the shared writer.
+fn atomicError(err: atomicwrite.Error) Error {
+    return switch (err) {
+        error.NotFound => Error.NotFound,
+        error.PermissionDenied => Error.PermissionDenied,
+        error.ReadOnlyFileSystem => Error.ReadOnlyFileSystem,
+        else => Error.IoFailed,
     };
-    if (c.rename(stage_z, path_z) != 0) {
-        const err = errnoError(std.posix.errno(@as(c_int, -1)));
-        _ = c.unlink(stage_z);
-        return err;
-    }
 }
 
 fn readFile(allocator: std.mem.Allocator, path: []const u8) Error![]u8 {
@@ -504,9 +466,8 @@ fn saveBytesScoped(
         }
     }
 
-    const stage = try stagePathScoped(allocator, scope, name);
-    defer allocator.free(stage);
-    try writeAtomic(stage, path, bytes, true);
+    pathz.makeParentDirs(path) catch return Error.IoFailed;
+    atomicwrite.writeFileExact(path, bytes, 0o600) catch |err| return atomicError(err);
     return bytes.len;
 }
 
@@ -559,10 +520,8 @@ pub fn existsScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8
 pub fn deleteScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8, diag: ?*Diag) Error!void {
     const path = try panelPathScoped(allocator, scope, name, diag);
     defer allocator.free(path);
-    var zbuf: [4096]u8 = undefined;
-    const z = pathz.pathZ(&zbuf, path) catch return Error.IoFailed;
-    if (c.unlink(z) != 0) {
-        const err = errnoError(std.posix.errno(@as(c_int, -1)));
+    atomicwrite.deleteFile(path) catch |atomic_err| {
+        const err = atomicError(atomic_err);
         if (diag) |d| switch (err) {
             Error.NotFound => d.set("no panel \"{s}\" saved in scope {s}", .{ name, scopeLabel(scope) }),
             Error.PermissionDenied => d.set("permission denied deleting panel \"{s}\" from scope {s}", .{ name, scopeLabel(scope) }),
@@ -570,7 +529,7 @@ pub fn deleteScoped(allocator: std.mem.Allocator, scope: Scope, name: []const u8
             else => d.set("I/O failure deleting panel \"{s}\" from scope {s}", .{ name, scopeLabel(scope) }),
         };
         return err;
-    }
+    };
 }
 
 /// One stored panel, as an MCP tool wants to report it.
@@ -1129,7 +1088,7 @@ test "same-name session reincarnations have isolated lifetime stores" {
     try t.expect(!std.mem.eql(u8, first_dir, second_dir));
 }
 
-test "a crash between write and rename leaves no partial document" {
+test "panel saves are private, failure-preserving, concurrent, and stage-clean" {
     var scratch: Scratch = undefined;
     try scratch.init("atomic");
     defer scratch.deinit();
@@ -1137,33 +1096,60 @@ test "a crash between write and rename leaves no partial document" {
     _ = try saveJsonScoped(t.allocator, .{ .session = "s1" }, "keeper", DOC, null);
     const before = try loadJsonScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
     defer t.allocator.free(before);
-
-    // Exactly what a kill between fwrite and rename leaves behind.
     const path = try panelPathScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
     defer t.allocator.free(path);
-    const stage = try stagePathScoped(t.allocator, .{ .session = "s1" }, "keeper");
-    defer t.allocator.free(stage);
-    try writeAtomic(stage, path, "{ truncated garba", false);
+    var path_buf: [4096]u8 = undefined;
+    const path_z = try pathz.pathZ(&path_buf, path);
+    var st: c.struct_stat = undefined;
+    try t.expect(c.stat(path_z, &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
 
-    // The old document is intact and still parses...
+    const dir = try sessionDir(t.allocator, "s1");
+    defer t.allocator.free(dir);
+    var dir_buf: [4096]u8 = undefined;
+    const dir_z = try pathz.pathZ(&dir_buf, dir);
+    try t.expect(c.chmod(dir_z, 0o500) == 0);
+    const failed = saveJsonScoped(t.allocator, .{ .session = "s1" }, "keeper",
+        \\{"root":"r","title":"Must not land","components":{"r":{"type":"text","text":"x"}}}
+    , null);
+    try t.expect(c.chmod(dir_z, 0o700) == 0);
+    try t.expectError(Error.PermissionDenied, failed);
     const after = try loadJsonScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
     defer t.allocator.free(after);
     try t.expectEqualStrings(before, after);
-    var still = try loadScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
-    still.deinit();
 
-    // ...and the abandoned staging file is invisible to the store.
-    try t.expect(fileExists(stage));
-    const entries = try listScoped(t.allocator, .{ .session = "s1" });
-    defer freeList(t.allocator, entries);
-    try t.expectEqual(@as(usize, 1), entries.len);
-    try t.expectEqualStrings("keeper", entries[0].name);
+    const ThreadCtx = struct {
+        json: []const u8,
+        failed: bool = false,
 
-    // The next real save commits and clears nothing else.
-    _ = try saveJsonScoped(t.allocator, .{ .session = "s1" }, "keeper", DOC, null);
-    const again = try loadJsonScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
-    defer t.allocator.free(again);
-    try t.expectEqualStrings(before, again);
+        fn run(self: *@This()) void {
+            _ = saveJsonScoped(std.heap.c_allocator, .{ .session = "s1" }, "keeper", self.json, null) catch {
+                self.failed = true;
+                return;
+            };
+        }
+    };
+    var one = ThreadCtx{ .json =
+        \\{"root":"r","title":"Writer one","components":{"r":{"type":"text","text":"one"}}}
+    };
+    var two = ThreadCtx{ .json =
+        \\{"root":"r","title":"Writer two","components":{"r":{"type":"text","text":"two"}}}
+    };
+    const first = try std.Thread.spawn(.{}, ThreadCtx.run, .{&one});
+    const second = try std.Thread.spawn(.{}, ThreadCtx.run, .{&two});
+    first.join();
+    second.join();
+    try t.expect(!one.failed and !two.failed);
+    var final = try loadScoped(t.allocator, .{ .session = "s1" }, "keeper", null);
+    defer final.deinit();
+    try t.expect(std.mem.eql(u8, final.title, "Writer one") or std.mem.eql(u8, final.title, "Writer two"));
+
+    const dp = c.opendir(dir_z) orelse return error.TestUnexpectedResult;
+    defer _ = c.closedir(dp);
+    while (c.readdir(dp)) |entry| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        try t.expect(std.mem.indexOf(u8, name, ".sketerm-tmp-") == null);
+    }
 }
 
 test "delete distinguishes a missing panel from an undeletable one" {
@@ -1197,9 +1183,7 @@ test "a corrupt stored file reports a diagnostic" {
     _ = try saveJsonScoped(t.allocator, .{ .session = "s1" }, "broken", DOC, null);
     const path = try panelPathScoped(t.allocator, .{ .session = "s1" }, "broken", null);
     defer t.allocator.free(path);
-    const stage = try stagePathScoped(t.allocator, .{ .session = "s1" }, "broken");
-    defer t.allocator.free(stage);
-    try writeAtomic(stage, path, "{\"root\":\"gone\",\"components\":{}}", true);
+    try atomicwrite.writeFile(path, "{\"root\":\"gone\",\"components\":{}}", 0o600);
 
     var diag = Diag{};
     try t.expectError(Error.Corrupt, loadScoped(t.allocator, .{ .session = "s1" }, "broken", &diag));
@@ -1207,7 +1191,7 @@ test "a corrupt stored file reports a diagnostic" {
     try t.expect(std.mem.indexOf(u8, diag.msg(), "gone") != null);
 
     // Not JSON at all is the same story, not a crash.
-    try writeAtomic(stage, path, "\x00\xffnot json", true);
+    try atomicwrite.writeFile(path, "\x00\xffnot json", 0o600);
     diag = Diag{};
     try t.expectError(Error.Corrupt, loadScoped(t.allocator, .{ .session = "s1" }, "broken", &diag));
     try t.expect(diag.len > 0);

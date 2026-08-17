@@ -9,15 +9,22 @@
 //! Spec: key = md5 of the file:// URI (percent-encoded path),
 //! stored as thumbnails/normal/<md5>.png (128px tier) with
 //! Thumb::URI + Thumb::MTime tEXt chunks for staleness checks.
+//! Entries are rebuildable caches: installs are atomic and checked, but use
+//! the explicitly non-durable cache writer rather than paying for fsync.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 
 pub const Tier = enum { normal, large, x_large };
 
 fn tierName(tier: Tier) []const u8 {
-    return switch (tier) { .normal => "normal", .large => "large", .x_large => "x-large" };
+    return switch (tier) {
+        .normal => "normal",
+        .large => "large",
+        .x_large => "x-large",
+    };
 }
 
 /// RFC 3986 unreserved set plus '/'; everything else is %XX-encoded
@@ -139,7 +146,10 @@ pub fn installPng(
         const len = std.mem.readInt(u32, input.items[i..][0..4], .big);
         const end = i + 12 + @as(usize, len);
         if (end > input.items.len) return error.BadPng;
-        if (std.mem.eql(u8, input.items[i + 4 .. i + 8], "IEND")) { iend = i; break; }
+        if (std.mem.eql(u8, input.items[i + 4 .. i + 8], "IEND")) {
+            iend = i;
+            break;
+        }
         i = end;
     }
     const cut = iend orelse return error.BadPng;
@@ -155,19 +165,7 @@ pub fn installPng(
     try output.appendSlice(allocator, input.items[cut..]);
 
     try pathz.makeParentDirs(final_path);
-    const temp = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ final_path, c.getpid() });
-    defer allocator.free(temp);
-    var tz: [4096]u8 = undefined;
-    const out = c.fopen(try pathz.pathZ(&tz, temp), "wb") orelse return error.WriteFailed;
-    if (c.fwrite(output.items.ptr, 1, output.items.len, out) != output.items.len or c.fflush(out) != 0) {
-        _ = c.fclose(out);
-        return error.WriteFailed;
-    }
-    _ = c.fsync(c.fileno(out));
-    if (c.fclose(out) != 0) return error.WriteFailed;
-    _ = c.chmod(try pathz.pathZ(&tz, temp), 0o600);
-    var fz: [4096]u8 = undefined;
-    if (c.rename(try pathz.pathZ(&tz, temp), try pathz.pathZ(&fz, final_path)) != 0) return error.WriteFailed;
+    try atomicwrite.writeCacheFile(final_path, output.items, 0o600);
 }
 
 /// Validate both mandatory freedesktop metadata chunks without

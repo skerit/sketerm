@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const termdrive = @import("termdrive.zig");
 const mcp = @import("mcp.zig");
 const termIdOf = mcp.termIdOf;
@@ -154,12 +155,27 @@ test "validShellName" {
 
 /// Write bytes to an absolute local path; false on any failure.
 pub fn writeFileBytes(path: []const u8, bytes: []const u8) bool {
-    var pbuf: [4096]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return false;
-    const f = c.fopen(path_z.ptr, "wb") orelse return false;
-    const n = if (bytes.len == 0) 0 else c.fwrite(bytes.ptr, 1, bytes.len, f);
-    const bad = c.fclose(f) != 0;
-    return n == bytes.len and !bad;
+    atomicwrite.writeFileExact(path, bytes, 0o600) catch return false;
+    return true;
+}
+
+test "term output files use private complete replacement" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-term-output-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/output.txt", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    try t.expect(writeFileBytes(path, "first"));
+    try t.expect(writeFileBytes(path, "second-and-complete"));
+    var st: c.struct_stat = undefined;
+    try t.expect(c.stat(path_z.ptr, &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
 }
 
 pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {

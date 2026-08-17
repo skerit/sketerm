@@ -21,6 +21,7 @@ const i18n = @import("i18n.zig");
 const tabs = @import("tabs.zig");
 const action = @import("action.zig");
 const reply = @import("reply.zig");
+const atomicwrite = @import("../../util/atomicwrite.zig");
 const pathz = @import("../../util/pathz.zig");
 
 /// The session's language tag, for `i18n` locale negotiation. POSIX
@@ -368,17 +369,18 @@ pub const Host = struct {
         return readFileZ(self.gpa, path, 16 * 1024 * 1024);
     }
 
-    fn persist(self: *Host, e: *Extension) void {
-        if (self.data_dir.len == 0) return;
-        const s = self.storeFor(e);
-        const bytes = s.serialize(self.gpa) catch return;
+    fn persistStore(self: *Host, e: *Extension, s: *storage.Store) !void {
+        if (self.data_dir.len == 0) return error.StorageUnavailable;
+        const bytes = try s.serialize(self.gpa);
         defer self.gpa.free(bytes);
         var dir_buf: [4096]u8 = undefined;
-        const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ self.data_dir, e.id }) catch return;
-        mkdirAll(dir);
+        const dir = std.fmt.bufPrint(&dir_buf, "{s}/{s}", .{ self.data_dir, e.id }) catch
+            return error.PathTooLong;
+        try pathz.makeDirs(dir, 0o700);
         var path_buf: [4200]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/storage.json", .{dir}) catch return;
-        writeFileZ(path, bytes);
+        const path = std.fmt.bufPrint(&path_buf, "{s}/storage.json", .{dir}) catch
+            return error.PathTooLong;
+        try atomicwrite.writeFileExact(path, bytes, 0o600);
     }
 
     // -- browser.* dispatch (THE SEAM) --------------------------------
@@ -521,33 +523,52 @@ pub const Host = struct {
             const obj = s.get(self.gpa, keys) catch return self.errResult("oom");
             defer self.gpa.free(obj);
             return self.wrapResult(obj);
-        } else if (std.mem.eql(u8, method, "set")) {
-            const patch = if (args.len > 0) self.valueToJson(args[0]) else self.gpa.dupe(u8, "{}") catch null;
-            defer if (patch) |p| self.gpa.free(p);
-            const ch = s.set(self.gpa, patch orelse "{}") catch return self.errResult("oom");
-            if (!std.mem.eql(u8, ch, "{}")) {
-                self.persist(e);
-                changed.* = ch;
-            } else self.gpa.free(ch);
-            return self.gpa.dupe(u8, "{\"result\":null}") catch self.errResult("oom");
-        } else if (std.mem.eql(u8, method, "remove")) {
-            const keys = self.keysFromArg(if (args.len > 0) args[0] else .null) catch return self.errResult("oom");
+        }
+        const is_set = std.mem.eql(u8, method, "set");
+        const is_remove = std.mem.eql(u8, method, "remove");
+        const is_clear = std.mem.eql(u8, method, "clear");
+        if (!is_set and !is_remove and !is_clear) return self.errResult("unknown storage method");
+
+        // Mutate a deep copy first. The live store and its on-disk file
+        // move together only after the durable replacement succeeds.
+        var candidate = s.clone(self.gpa) catch |err| return self.errResult(@errorName(err));
+        var candidate_owned = true;
+        defer if (candidate_owned) candidate.deinit();
+        const ch = if (is_set) blk: {
+            const patch = if (args.len > 0)
+                self.valueToJson(args[0]) catch |err| return self.errResult(@errorName(err))
+            else
+                self.gpa.dupe(u8, "{}") catch |err| return self.errResult(@errorName(err));
+            defer self.gpa.free(patch);
+            break :blk candidate.set(self.gpa, patch) catch |err|
+                return self.errResult(@errorName(err));
+        } else if (is_remove) blk: {
+            const keys = self.keysFromArg(if (args.len > 0) args[0] else .null) catch |err|
+                return self.errResult(@errorName(err));
             defer self.gpa.free(keys);
-            const ch = s.remove(self.gpa, keys) catch return self.errResult("oom");
-            if (!std.mem.eql(u8, ch, "{}")) {
-                self.persist(e);
-                changed.* = ch;
-            } else self.gpa.free(ch);
-            return self.gpa.dupe(u8, "{\"result\":null}") catch self.errResult("oom");
-        } else if (std.mem.eql(u8, method, "clear")) {
-            const ch = s.clear(self.gpa) catch return self.errResult("oom");
-            if (!std.mem.eql(u8, ch, "{}")) {
-                self.persist(e);
-                changed.* = ch;
-            } else self.gpa.free(ch);
+            break :blk candidate.remove(self.gpa, keys) catch |err|
+                return self.errResult(@errorName(err));
+        } else candidate.clear(self.gpa) catch |err|
+            return self.errResult(@errorName(err));
+
+        if (std.mem.eql(u8, ch, "{}")) {
+            self.gpa.free(ch);
             return self.gpa.dupe(u8, "{\"result\":null}") catch self.errResult("oom");
         }
-        return self.errResult("unknown storage method");
+        const result = self.gpa.dupe(u8, "{\"result\":null}") catch {
+            self.gpa.free(ch);
+            return self.errResult("oom");
+        };
+        self.persistStore(e, &candidate) catch |err| {
+            self.gpa.free(result);
+            self.gpa.free(ch);
+            return self.errResult(@errorName(err));
+        };
+        s.deinit();
+        s.* = candidate;
+        candidate_owned = false;
+        changed.* = ch;
+        return result;
     }
 
     fn dispatchRuntime(self: *Host, e: *Extension, method: []const u8, _: []const u8) []u8 {
@@ -708,11 +729,11 @@ pub const Host = struct {
         return list.toOwnedSlice(self.gpa);
     }
 
-    fn valueToJson(self: *Host, v: std.json.Value) ?[]u8 {
+    fn valueToJson(self: *Host, v: std.json.Value) ![]u8 {
         var aw: std.Io.Writer.Allocating = .init(self.gpa);
         errdefer aw.deinit();
-        std.json.Stringify.value(v, .{}, &aw.writer) catch return null;
-        return aw.toOwnedSlice() catch null;
+        try std.json.Stringify.value(v, .{}, &aw.writer);
+        return aw.toOwnedSlice();
     }
 
     /// Wrap a raw JSON value string as `{"result":<value>}`.
@@ -767,6 +788,79 @@ test "extension capabilities authorize only their owning instance and rotate" {
     try std.testing.expect(host.rotateCapability(one));
     try std.testing.expect(host.authorizeCapability(&one_cap) == null);
     try std.testing.expect(host.authorize("one@sketerm.test", &one.capability) == one);
+}
+
+test "storage.local commits memory and private disk state together" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-webext-storage-XXXXXX".*;
+    const base_z = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(base_z)));
+    defer {
+        var zbuf: [512:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/webext/storage@sketerm.test/storage.json", .{base})) |p| {
+            _ = c.unlink(p.ptr);
+        } else |_| {}
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/webext/storage@sketerm.test", .{base})) |p| {
+            _ = c.rmdir(p.ptr);
+        } else |_| {}
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/webext", .{base})) |p| {
+            _ = c.rmdir(p.ptr);
+        } else |_| {}
+        _ = c.rmdir(base_z);
+    }
+
+    const data_dir = try std.fmt.allocPrint(t.allocator, "{s}/webext", .{base});
+    var host = Host{ .gpa = t.allocator, .data_dir = data_dir };
+    defer host.deinit();
+    var ext = Extension{
+        .id = try t.allocator.dupe(u8, "storage@sketerm.test"),
+        .dir = &.{},
+        .store = storage.Store.load(t.allocator, "{\"secret\":\"old\"}"),
+    };
+    defer {
+        ext.store.?.deinit();
+        t.allocator.free(ext.id);
+    }
+
+    var changed: ?[]u8 = null;
+    const first = host.dispatchStorage(&ext, "set", "[{\"secret\":\"one\"}]", &changed);
+    defer t.allocator.free(first);
+    try t.expect(std.mem.indexOf(u8, first, "\"result\":null") != null);
+    if (changed) |bytes| t.allocator.free(bytes);
+
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/storage@sketerm.test/storage.json", .{data_dir});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    var st: c.struct_stat = undefined;
+    try t.expect(c.stat(path_z.ptr, &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+
+    const parent = std.fs.path.dirname(path).?;
+    var parent_z_buf: [512:0]u8 = undefined;
+    const parent_z = try std.fmt.bufPrintZ(&parent_z_buf, "{s}", .{parent});
+    try t.expect(c.chmod(parent_z.ptr, 0o500) == 0);
+    changed = null;
+    const failed = host.dispatchStorage(&ext, "set", "[{\"secret\":\"must-not-land\"}]", &changed);
+    defer t.allocator.free(failed);
+    try t.expect(c.chmod(parent_z.ptr, 0o700) == 0);
+    try t.expect(std.mem.indexOf(u8, failed, "PermissionDenied") != null);
+    try t.expectEqual(@as(?[]u8, null), changed);
+
+    const got = try ext.store.?.get(t.allocator, &.{"secret"});
+    defer t.allocator.free(got);
+    try t.expectEqualStrings("{\"secret\":\"one\"}", got);
+    const disk = try readFileZFallible(t.allocator, path, 1024);
+    defer t.allocator.free(disk);
+    try t.expect(std.mem.indexOf(u8, disk, "\"one\"") != null);
+    try t.expect(std.mem.indexOf(u8, disk, "must-not-land") == null);
+
+    const dp = c.opendir(parent_z.ptr) orelse return error.TestUnexpectedResult;
+    defer _ = c.closedir(dp);
+    while (c.readdir(dp)) |entry| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        try t.expect(std.mem.indexOf(u8, name, ".sketerm-tmp-") == null);
+    }
 }
 
 const allocation_test_id = "allocation@sketerm.test";
@@ -967,18 +1061,6 @@ fn readFileZFallible(gpa: std.mem.Allocator, path: []const u8, max: usize) ReadF
         return error.ReadFailed;
     }
     return buf;
-}
-
-fn writeFileZ(path: [*:0]const u8, bytes: []const u8) void {
-    const fd = c.open(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
-    if (fd < 0) return;
-    defer _ = c.close(fd);
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n <= 0) break;
-        off += @intCast(n);
-    }
 }
 
 fn mkdirAll(path: []const u8) void {

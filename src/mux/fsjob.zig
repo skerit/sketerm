@@ -15,6 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const png = @import("../util/png.zig");
 const imagecodec = @import("../util/imagecodec.zig");
 const pathz = @import("../util/pathz.zig");
@@ -1142,35 +1143,16 @@ fn runWireThumb(allocator: std.mem.Allocator, spec: Spec, thumbnail_only: bool, 
     const enc = encodeWire(allocator, enc_src, spec.image_codecs, 512) orelse return null;
     defer allocator.free(enc.bytes);
 
-    // Install: atomic rename, then stamp the file's mtime with the
-    // SOURCE's so the hit check above is a plain stat compare.
+    // Install through the explicitly non-durable cache writer, then stamp
+    // mtime with the SOURCE's so the hit check above is a plain stat compare.
     var dbuf: [4096]u8 = undefined;
     const dest = thumbs.wireThumbPath(cache_root, spec.src, tier, enc.ext, &dbuf) orelse return emitError("thumbnail path too long");
     pathz.makeParentDirs(dest) catch return emitError("cannot create wire thumb cache");
     if (std.fs.path.dirname(dest)) |dir| sweepWireThumbs(dir);
-    var tz: [4200:0]u8 = undefined;
-    const tmp = std.fmt.bufPrintZ(&tz, "{s}.tmp{d}", .{ dest, c.getpid() }) catch return emitError("thumbnail path too long");
-    const fd = c.open(tmp.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));
-    if (fd < 0) return emitErrno("wire thumb open");
-    var ok = false;
-    defer if (!ok) {
-        _ = c.unlink(tmp.ptr);
-    };
-    var off: usize = 0;
-    while (off < enc.bytes.len) {
-        const n = c.write(fd, enc.bytes.ptr + off, enc.bytes.len - off);
-        if (n < 0 and std.posix.errno(n) == .INTR) continue;
-        if (n <= 0) {
-            _ = c.close(fd);
-            return emitError("wire thumb write failed");
-        }
-        off += @intCast(n);
-    }
-    if (c.close(fd) != 0) return emitError("wire thumb write failed");
+    atomicwrite.writeCacheFile(dest, enc.bytes, 0o600) catch |err|
+        return emitError(@errorName(err));
     var dz: [4096:0]u8 = undefined;
     const destz = pathz.pathZ(&dz, dest) catch return emitError("thumbnail path too long");
-    if (c.rename(tmp.ptr, destz) != 0) return emitErrno("wire thumb install");
-    ok = true;
     const tv = [2]c.struct_timeval{
         .{ .tv_sec = @intCast(mtime_sec), .tv_usec = 0 },
         .{ .tv_sec = @intCast(mtime_sec), .tv_usec = 0 },
@@ -5756,7 +5738,7 @@ const MediaCache = struct {
         return found;
     }
 
-    fn append(self: *MediaCache, line: []const u8) void {
+    fn appendRecoverable(self: *MediaCache, line: []const u8) void {
         if (self.path_len == 0) return;
         var z: [4096]u8 = undefined;
         const p = pathz.pathZ(&z, self.path()) catch return;
@@ -5764,14 +5746,18 @@ const MediaCache = struct {
         if (fd < 0) return;
         // One write(2) per record: an interleaved append from another
         // job helper can then never split a line.
-        _ = c.write(fd, line.ptr, line.len);
+        // Failure only drops a cache entry; the next request re-extracts it.
+        if (c.write(fd, line.ptr, line.len) != @as(isize, @intCast(line.len))) {
+            _ = c.close(fd);
+            return;
+        }
         _ = c.close(fd);
         self.appended += 1;
     }
 
     /// Trim the cache back under its cap. A lost race with another
     /// helper's compaction only costs re-extraction, never correctness.
-    fn finish(self: *MediaCache, allocator: std.mem.Allocator) void {
+    fn finishRecoverable(self: *MediaCache, allocator: std.mem.Allocator) void {
         if (self.path_len == 0 or self.appended == 0) return;
         var z: [4096]u8 = undefined;
         const p = pathz.pathZ(&z, self.path()) catch return;
@@ -5789,19 +5775,14 @@ const MediaCache = struct {
             if (count < MEDIA_CACHE_KEEP_LINES) count += 1 else oldest = (oldest + 1) % MEDIA_CACHE_KEEP_LINES;
             off += nl + 1;
         }
-        var tmp_buf: [4096]u8 = undefined;
-        const tmp = std.fmt.bufPrint(&tmp_buf, "{s}.tmp-{d}", .{ self.path(), c.getpid() }) catch return;
-        var tz: [4096]u8 = undefined;
-        const tp = pathz.pathZ(&tz, tmp) catch return;
-        const fd = c.open(tp, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));
-        if (fd < 0) return;
+        var compacted: std.ArrayList(u8) = .empty;
+        defer compacted.deinit(allocator);
         for (0..count) |i| {
             const start = starts[(oldest + i) % MEDIA_CACHE_KEEP_LINES];
             const nl = std.mem.indexOfScalar(u8, all[start..], '\n') orelse break;
-            _ = c.write(fd, all.ptr + start, nl + 1);
+            compacted.appendSlice(allocator, all[start .. start + nl + 1]) catch return;
         }
-        _ = c.close(fd);
-        if (c.rename(tp, p) != 0) _ = c.unlink(tp);
+        atomicwrite.writeCacheFile(self.path(), compacted.items, 0o600) catch return;
     }
 };
 
@@ -5900,7 +5881,7 @@ fn runMediaMeta(allocator: std.mem.Allocator, spec: Spec) u8 {
         mediaOne(allocator, &bufs, &cache, full, &budget);
         done += 1;
     }
-    cache.finish(allocator);
+    cache.finishRecoverable(allocator);
     emit(.{ .ev = "done", .done = done, .total = done, .matches = done, .truncated = truncated });
     return 0;
 }
@@ -5965,7 +5946,7 @@ fn mediaOne(allocator: std.mem.Allocator, bufs: *MediaBufs, cache: *MediaCache, 
 
     var line_buf: [8192]u8 = undefined;
     if (encodeEvent(&line_buf, MediaRecord{ .key = &key, .kind = m.kind.name(), .meta = fields })) |line|
-        cache.append(line);
+        cache.appendRecoverable(line);
 }
 
 fn preadAll(fd: c_int, buf: []u8, off: u64) usize {

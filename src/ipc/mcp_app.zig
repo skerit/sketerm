@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const appdrive = @import("appdrive.zig");
 const mcp = @import("mcp.zig");
 const imageResultTagged = mcp.imageResultTagged;
@@ -61,6 +62,10 @@ const AppStop = mcp.AppStop;
 const appErr = mcp.appErr;
 const argFloat = mcp.argFloat;
 const argInt = mcp.argInt;
+
+fn saveRecording(path: []const u8, bytes: []const u8) atomicwrite.Error!void {
+    try atomicwrite.writeFileExact(path, bytes, 0o600);
+}
 
 pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
@@ -1864,11 +1869,10 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         const ext = if (result.webm) "webm" else "gif";
         const path = argStr(args, "path") orelse
             try std.fmt.allocPrint(arena, "/tmp/sketerm-rec-{d}-{d}.{s}", .{ c.getpid(), ts.tv_sec, ext });
-        const path_z = try std.fmt.allocPrint(arena, "{s}\x00", .{path});
-        const f = c.fopen(path_z.ptr, "wb") orelse return appErr(arena, "cannot write the output path");
-        const wr = c.fwrite(result.data.ptr, 1, result.data.len, f);
-        _ = c.fclose(f);
-        if (wr != result.data.len) return appErr(arena, "short write saving the recording");
+        saveRecording(path, result.data) catch |err| {
+            const msg = try std.fmt.allocPrint(arena, "cannot save the recording: {s}", .{@errorName(err)});
+            return appErr(arena, msg);
+        };
         const msg = try std.fmt.allocPrint(arena, "saved {d} frames ({d} KiB {s}) to {s}", .{ result.frames, result.data.len / 1024, ext, path });
         return toolResult(arena, msg, false) orelse error.OutOfMemory;
     }
@@ -2404,4 +2408,22 @@ test "a min_frames shortfall only claims NOT LIVE when nothing painted" {
     const dead = try shortFramesVerdict(arena, 2, 0, 10, 5_000, 5_000);
     try t.expect(std.mem.indexOf(u8, dead, "NOT LIVE") != null);
     try t.expect(std.mem.indexOf(u8, dead, "app_backtrace") != null);
+}
+
+test "app recordings use private complete replacement" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-app-recording-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/capture.webm", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    try saveRecording(path, "recording");
+    var st: c.struct_stat = undefined;
+    try t.expect(c.stat(path_z.ptr, &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
 }

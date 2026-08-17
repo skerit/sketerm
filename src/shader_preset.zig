@@ -13,8 +13,8 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const ParamKV = @import("render/shader_pass.zig").ParamKV;
-const pathz_util = @import("util/pathz.zig");
 const atomicwrite = @import("util/atomicwrite.zig");
+const pathz_util = @import("util/pathz.zig");
 
 pub const Preset = struct {
     name: []const u8 = "",
@@ -116,11 +116,14 @@ pub fn save(allocator: std.mem.Allocator, preset: Preset) !void {
     defer allocator.free(dir);
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}.conf", .{ dir, preset.name });
     defer allocator.free(path);
+    try saveToPath(allocator, path, preset);
+}
+
+fn saveToPath(allocator: std.mem.Allocator, path: []const u8, preset: Preset) !void {
     try pathz_util.makeParentDirs(path);
     const text = try serialize(allocator, preset);
     defer allocator.free(text);
-
-    atomicwrite.writeFile(path, text, 0o600) catch return error.WriteFailed;
+    try atomicwrite.writeFileExact(path, text, 0o600);
 }
 
 /// Load a preset by name; everything duped into `allocator` (use an
@@ -131,7 +134,10 @@ pub fn load(allocator: std.mem.Allocator, name: []const u8) !Preset {
     defer allocator.free(dir);
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}.conf", .{ dir, name });
     defer allocator.free(path);
+    return loadFromPath(allocator, name, path);
+}
 
+fn loadFromPath(allocator: std.mem.Allocator, name: []const u8, path: []const u8) !Preset {
     var path_z: [4096]u8 = undefined;
     const fp = c.fopen(try pathz_util.pathZ(&path_z, path), "rb") orelse return error.NotFound;
     defer _ = c.fclose(fp);
@@ -151,8 +157,7 @@ pub fn delete(allocator: std.mem.Allocator, name: []const u8) !void {
     defer allocator.free(dir);
     const path = try std.fmt.allocPrint(allocator, "{s}/{s}.conf", .{ dir, name });
     defer allocator.free(path);
-    var path_z: [4096]u8 = undefined;
-    if (c.unlink(try pathz_util.pathZ(&path_z, path)) != 0) return error.DeleteFailed;
+    atomicwrite.deleteFile(path) catch return error.DeleteFailed;
 }
 
 /// Sorted preset names (filename stems of *.conf), duped into
@@ -235,4 +240,43 @@ test "validName rejects path escapes" {
     try std.testing.expect(!validName(".hidden"));
     try std.testing.expect(!validName("a/b"));
     try std.testing.expect(!validName("x" ** 65));
+}
+
+test "shader preset save is private and preserves the prior file before install" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-shader-preset-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/amber.conf", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    try saveToPath(t.allocator, path, .{
+        .name = "amber",
+        .shader_path = "/old.glsl",
+        .animate = false,
+    });
+    var st: c.struct_stat = undefined;
+    try t.expect(c.stat(path_z.ptr, &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    if (saveToPath(failing.allocator(), path, .{
+        .name = "amber",
+        .shader_path = "/new.glsl",
+    })) |_| {
+        return error.TestExpectedError;
+    } else |_| {}
+
+    const retained = try loadFromPath(t.allocator, "amber", path);
+    defer {
+        t.allocator.free(retained.name);
+        t.allocator.free(retained.shader_path);
+        t.allocator.free(retained.params);
+    }
+    try t.expectEqualStrings("/old.glsl", retained.shader_path);
+    try t.expect(!retained.animate);
 }

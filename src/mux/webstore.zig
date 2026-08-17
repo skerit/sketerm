@@ -8,12 +8,14 @@
 //! (per-URL visit count + last-visit time for omnibox ranking) and
 //! compacted in place once the log grows past ~2x the live entry count.
 //! Bookmarks, site settings, userscripts and userstyles are small
-//! whole-file JSON documents written atomically (tmp + rename). Pure
+//! whole-file JSON documents written through the shared durable atomic
+//! writer. Pure
 //! libc file IO — no GTK, no sockets; unit-tested headless in BOTH
 //! test roots.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 
 /// Hard cap on live history entries; compaction prunes oldest-by-visit.
@@ -103,25 +105,10 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, cap: usize) ?[]
     };
 }
 
-/// Atomic whole-file replace: tmp sibling, fsync, rename.
-fn writeFileAtomic(dir: []const u8, path: []const u8, bytes: []const u8) !void {
+/// Durable whole-file replacement for daemon-owned browser state.
+fn writeDurableFile(dir: []const u8, path: []const u8, bytes: []const u8) !void {
     if (!ensureDir(dir)) return error.CreateFailed;
-    var tmp_buf: [4096:0]u8 = undefined;
-    var final_buf: [4096]u8 = undefined;
-    const tmp = std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp.{d}", .{ path, c.getpid() }) catch return error.BadPath;
-    const final = pathz.pathZ(&final_buf, path) catch return error.BadPath;
-    const fp = c.fopen(tmp.ptr, "wb") orelse return error.WriteFailed;
-    var ok = bytes.len == 0 or c.fwrite(bytes.ptr, 1, bytes.len, fp) == bytes.len;
-    ok = ok and c.fflush(fp) == 0;
-    if (ok) {
-        const fd = c.fileno(fp);
-        ok = fd >= 0 and c.fsync(fd) == 0;
-    }
-    if (c.fclose(fp) != 0) ok = false;
-    if (!ok or c.rename(tmp.ptr, final) != 0) {
-        _ = c.unlink(tmp.ptr);
-        return error.WriteFailed;
-    }
+    try atomicwrite.writeFileExact(path, bytes, 0o600);
 }
 
 /// One history log line. A visit carries url/t/title (n defaults to 1);
@@ -270,6 +257,10 @@ pub const WebStore = struct {
     containers: std.ArrayList(Container) = .empty,
     next_container_id: u32 = 1,
     container_sites: std.ArrayList(ContainerSite) = .empty,
+    /// Compaction follows an already-committed append, so failure is logged
+    /// once and retried later rather than turning a successful visit into an
+    /// ambiguous client error.
+    compaction_error_reported: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, dir: []const u8) !WebStore {
         var self: WebStore = .{
@@ -398,6 +389,9 @@ pub const WebStore = struct {
         std.json.Stringify.value(rec, .{}, &aw.writer) catch return error.WriteFailed;
         aw.writer.writeByte('\n') catch return error.WriteFailed;
         const line = aw.writer.buffered();
+        // This is an append-only journal, not a whole-file state snapshot.
+        // Closing checks delivery to the kernel; syncing every navigation
+        // would stall browsing, so a power cut may lose only the newest line.
         const fp = c.fopen(p, "ab") orelse return error.WriteFailed;
         const wrote = c.fwrite(line.ptr, 1, line.len, fp) == line.len;
         const closed = c.fclose(fp) == 0;
@@ -444,14 +438,21 @@ pub const WebStore = struct {
         self.history.clearRetainingCapacity();
         var pb: [4096]u8 = undefined;
         const path = try self.filePath(&pb, "history.jsonl");
-        try writeFileAtomic(self.dir, path, "");
+        try writeDurableFile(self.dir, path, "");
         self.log_lines = 0;
     }
 
     fn maybeCompact(self: *WebStore) void {
         const live = self.history.count();
         if (self.log_lines <= 2 * live + COMPACT_SLACK and live <= MAX_HISTORY) return;
-        self.compact() catch {};
+        self.compact() catch |err| {
+            if (!self.compaction_error_reported) {
+                std.debug.print("sketerm: web history compaction failed: {s}\n", .{@errorName(err)});
+                self.compaction_error_reported = true;
+            }
+            return;
+        };
+        self.compaction_error_reported = false;
     }
 
     /// Rewrite the log as one summed record per URL (atomic), pruning
@@ -474,7 +475,7 @@ pub const WebStore = struct {
         }
         var pb: [4096]u8 = undefined;
         const path = try self.filePath(&pb, "history.jsonl");
-        try writeFileAtomic(self.dir, path, aw.writer.buffered());
+        try writeDurableFile(self.dir, path, aw.writer.buffered());
         self.log_lines = lines;
     }
 
@@ -636,7 +637,7 @@ pub const WebStore = struct {
         }, .{}, &aw.writer) catch return error.WriteFailed;
         var pb: [4096]u8 = undefined;
         const path = try self.filePath(&pb, "bookmarks.json");
-        try writeFileAtomic(self.dir, path, aw.writer.buffered());
+        try writeDurableFile(self.dir, path, aw.writer.buffered());
     }
 
     /// Append a bookmark; returns its id.
@@ -800,7 +801,7 @@ pub const WebStore = struct {
         std.json.Stringify.value(SitesDoc{ .sites = dtos.items }, .{}, &aw.writer) catch return error.WriteFailed;
         var pb: [4096]u8 = undefined;
         const path = try self.filePath(&pb, "sites.json");
-        try writeFileAtomic(self.dir, path, aw.writer.buffered());
+        try writeDurableFile(self.dir, path, aw.writer.buffered());
     }
 
     /// Case-normalized lookup. The returned pointer is invalidated by
@@ -936,7 +937,7 @@ pub const WebStore = struct {
         }, .{}, &aw.writer) catch return error.WriteFailed;
         var pb: [4096]u8 = undefined;
         const path = try self.filePath(&pb, "userscripts.json");
-        try writeFileAtomic(self.dir, path, aw.writer.buffered());
+        try writeDurableFile(self.dir, path, aw.writer.buffered());
     }
 
     /// Store one userscript (enabled); returns its id. The daemon does
@@ -1037,7 +1038,7 @@ pub const WebStore = struct {
             return error.WriteFailed;
         var pb: [4096]u8 = undefined;
         const path = try self.filePath(&pb, "userstyles.json");
-        try writeFileAtomic(self.dir, path, aw.writer.buffered());
+        try writeDurableFile(self.dir, path, aw.writer.buffered());
     }
 
     /// One style per host: set replaces, empty css deletes. The host
@@ -1209,7 +1210,7 @@ pub const WebStore = struct {
         }, .{}, &aw.writer) catch return error.WriteFailed;
         var pb: [4096]u8 = undefined;
         const path = try self.filePath(&pb, "containers.json");
-        try writeFileAtomic(self.dir, path, aw.writer.buffered());
+        try writeDurableFile(self.dir, path, aw.writer.buffered());
     }
 
     pub fn containerFind(self: *WebStore, id: u32) ?*Container {
@@ -1379,6 +1380,62 @@ fn rmTree(dir: []const u8) void {
     }
     const d = std.fmt.bufPrintZ(&pb, "{s}", .{dir}) catch return;
     _ = c.rmdir(d.ptr);
+}
+
+test "webstore durable files preserve mode, old bytes, concurrency, and cleanup" {
+    const t = std.testing;
+    var db: [64]u8 = undefined;
+    const dir = testDir(&db) orelse return error.SkipZigTest;
+    defer rmTree(dir);
+    var path_buf: [4096]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/bookmarks.json", .{dir});
+    var path_z_buf: [4096]u8 = undefined;
+    const path_z = try pathz.pathZ(&path_z_buf, path);
+
+    try writeDurableFile(dir, path, "old-valid");
+    var st: c.struct_stat = undefined;
+    try t.expect(c.stat(path_z, &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+
+    var dir_z_buf: [4096]u8 = undefined;
+    const dir_z = try pathz.pathZ(&dir_z_buf, dir);
+    try t.expect(c.chmod(dir_z, 0o500) == 0);
+    const failed = writeDurableFile(dir, path, "must-not-land");
+    try t.expect(c.chmod(dir_z, 0o700) == 0);
+    try t.expectError(error.PermissionDenied, failed);
+    const retained = readFileAlloc(t.allocator, path, 64) orelse return error.TestUnexpectedResult;
+    defer t.allocator.free(retained);
+    try t.expectEqualStrings("old-valid", retained);
+
+    const Ctx = struct {
+        dir: []const u8,
+        path: []const u8,
+        bytes: []const u8,
+        failed: bool = false,
+
+        fn run(self: *@This()) void {
+            writeDurableFile(self.dir, self.path, self.bytes) catch {
+                self.failed = true;
+            };
+        }
+    };
+    var one = Ctx{ .dir = dir, .path = path, .bytes = "complete-writer-one" };
+    var two = Ctx{ .dir = dir, .path = path, .bytes = "complete-writer-two" };
+    const first = try std.Thread.spawn(.{}, Ctx.run, .{&one});
+    const second = try std.Thread.spawn(.{}, Ctx.run, .{&two});
+    first.join();
+    second.join();
+    try t.expect(!one.failed and !two.failed);
+    const final = readFileAlloc(t.allocator, path, 64) orelse return error.TestUnexpectedResult;
+    defer t.allocator.free(final);
+    try t.expect(std.mem.eql(u8, final, one.bytes) or std.mem.eql(u8, final, two.bytes));
+
+    const dp = c.opendir(dir_z) orelse return error.TestUnexpectedResult;
+    defer _ = c.closedir(dp);
+    while (c.readdir(dp)) |entry| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        try t.expect(std.mem.indexOf(u8, name, ".sketerm-tmp-") == null);
+    }
 }
 
 test "webstore: originOf extracts and lowercases scheme+host" {

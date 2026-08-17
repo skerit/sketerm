@@ -11,10 +11,12 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const cast = @import("../util/cast.zig");
 const pathz = @import("../util/pathz.zig");
 const suggest = @import("../util/suggest.zig");
-const Window = @import("window.zig").Window;
+const window_mod = @import("window.zig");
+const Window = window_mod.Window;
 const Pane = @import("pane.zig").Pane;
 const Terminal = @import("../terminal.zig").Terminal;
 
@@ -68,6 +70,10 @@ fn recentsPath(allocator: std.mem.Allocator) ![]u8 {
 fn loadRecents(allocator: std.mem.Allocator) ?std.json.Parsed([]RecentEntry) {
     const path = recentsPath(allocator) catch return null;
     defer allocator.free(path);
+    return loadRecentsFromPath(allocator, path);
+}
+
+fn loadRecentsFromPath(allocator: std.mem.Allocator, path: []const u8) ?std.json.Parsed([]RecentEntry) {
     var zbuf: [4096]u8 = undefined;
     const z = pathz.pathZ(&zbuf, path) catch return null;
     const f = c.fopen(z, "rb") orelse return null;
@@ -82,30 +88,37 @@ fn loadRecents(allocator: std.mem.Allocator) ?std.json.Parsed([]RecentEntry) {
 }
 
 /// Prepend (host, name, exec, icon), dedupe by host+exec, cap, save.
-fn saveRecent(allocator: std.mem.Allocator, host: []const u8, name: []const u8, exec: []const u8, icon: []const u8) void {
+fn saveRecent(allocator: std.mem.Allocator, host: []const u8, name: []const u8, exec: []const u8, icon: []const u8) !void {
+    const path = try recentsPath(allocator);
+    defer allocator.free(path);
+    try saveRecentToPath(allocator, path, host, name, exec, icon);
+}
+
+fn saveRecentToPath(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    host: []const u8,
+    name: []const u8,
+    exec: []const u8,
+    icon: []const u8,
+) !void {
     var list: std.ArrayList(RecentEntry) = .empty;
     defer list.deinit(allocator);
-    list.append(allocator, .{ .host = host, .name = name, .exec = exec, .icon = icon }) catch return;
-    const old = loadRecents(allocator);
+    try list.append(allocator, .{ .host = host, .name = name, .exec = exec, .icon = icon });
+    const old = loadRecentsFromPath(allocator, path);
     defer if (old) |o| o.deinit();
     if (old) |o| {
         for (o.value) |e| {
             if (std.mem.eql(u8, e.host, host) and std.mem.eql(u8, e.exec, exec)) continue;
             if (list.items.len >= max_recents) break;
-            list.append(allocator, e) catch break;
+            try list.append(allocator, e);
         }
     }
     var aw: std.Io.Writer.Allocating = .init(allocator);
     defer aw.deinit();
-    std.json.Stringify.value(list.items, .{}, &aw.writer) catch return;
-    const path = recentsPath(allocator) catch return;
-    defer allocator.free(path);
-    pathz.makeParentDirs(path) catch return;
-    var zbuf: [4096]u8 = undefined;
-    const z = pathz.pathZ(&zbuf, path) catch return;
-    const f = c.fopen(z, "wb") orelse return;
-    defer _ = c.fclose(f);
-    _ = c.fwrite(aw.written().ptr, 1, aw.written().len, f);
+    try std.json.Stringify.value(list.items, .{}, &aw.writer);
+    try pathz.makeParentDirs(path);
+    try atomicwrite.writeFileExact(path, aw.written(), 0o600);
 }
 
 /// 1-based recency rank of (host, exec), 0 = not recent.
@@ -398,7 +411,15 @@ fn launchRow(self: *Launcher, row: *c.GtkListBoxRow, gpu_override: ?bool) void {
         c.gtk_label_set_text(@ptrCast(self.status), "Launch failed (daemon refused the app session)");
         return;
     };
-    saveRecent(self.allocator, self.host, name, exec, icon);
+    saveRecent(self.allocator, self.host, name, exec, icon) catch |err| {
+        std.debug.print("sketerm: app launcher recents save failed: {s}\n", .{@errorName(err)});
+        var msg: [192]u8 = undefined;
+        window_mod.showToast(
+            self.win,
+            std.fmt.bufPrint(&msg, "App launched, but its recent entry was not saved: {s}", .{@errorName(err)}) catch
+                "App launched, but its recent entry was not saved",
+        );
+    };
     c.gtk_window_destroy(@ptrCast(self.window));
 }
 
@@ -431,4 +452,42 @@ fn clearList(list: *c.GtkWidget) void {
     while (c.gtk_widget_get_first_child(list)) |child| {
         c.gtk_list_box_remove(@ptrCast(list), child);
     }
+}
+
+test "app launcher recents use private atomic replacement" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-app-recents-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/recent-apps.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    try saveRecentToPath(t.allocator, path, "", "Editor", "editor", "text-editor");
+    try saveRecentToPath(t.allocator, path, "host", "Browser", "browser", "web-browser");
+    var parsed = loadRecentsFromPath(t.allocator, path) orelse return error.TestUnexpectedResult;
+    defer parsed.deinit();
+    try t.expectEqual(@as(usize, 2), parsed.value.len);
+    try t.expectEqualStrings("browser", parsed.value[0].exec);
+
+    var st: c.struct_stat = undefined;
+    try t.expect(c.stat(path_z.ptr, &st) == 0);
+    try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+
+    var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    try t.expectError(error.OutOfMemory, saveRecentToPath(
+        failing.allocator(),
+        path,
+        "",
+        "Broken",
+        "broken",
+        "",
+    ));
+    var retained = loadRecentsFromPath(t.allocator, path) orelse return error.TestUnexpectedResult;
+    defer retained.deinit();
+    try t.expectEqual(@as(usize, 2), retained.value.len);
+    try t.expectEqualStrings("browser", retained.value[0].exec);
 }

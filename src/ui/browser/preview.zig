@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const atomicwrite = @import("../../util/atomicwrite.zig");
 const clock = @import("../../util/clock.zig");
 const wire = @import("../../mux/wire.zig");
 const colkeys = @import("../../filebrowser/colkeys.zig");
@@ -537,7 +538,7 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
             var pz: [4300:0]u8 = undefined;
             const pp = std.fmt.bufPrintZ(&pz, "{s}", .{req.path}) catch return;
             pixbuf = c.gdk_pixbuf_new_from_file_at_size(pp.ptr, 128, 128, null);
-            if (pixbuf != null) thumbSaveLocal(tc, pixbuf.?, &tp_buf, tp.len, uri, msec);
+            if (pixbuf != null) saveLocalThumbRecoverable(tc, pixbuf.?, &tp_buf, tp.len, uri, msec);
         }
     } else if (req.animate) {
         // Original bytes of an animated-capable image: decode every
@@ -623,9 +624,8 @@ pub fn thumbProcess(tc: *ThumbCtx, req: *ThumbReq) void {
     _ = c.g_idle_add(@ptrCast(&onThumbIdle), @ptrCast(res));
 }
 
-/// Worker-side spec save: dirs 700, temp file in place, PNG with
-/// URI/MTime tEXt chunks, chmod 600, atomic rename.
-pub fn thumbSaveLocal(tc: *ThumbCtx, pb: *c.GdkPixbuf, tp_buf: *[4300:0]u8, tp_len: usize, uri: []const u8, msec: [:0]const u8) void {
+/// Atomically install a rebuildable local thumbnail without durability syncs.
+pub fn saveLocalThumbRecoverable(tc: *ThumbCtx, pb: *c.GdkPixbuf, tp_buf: *[4300:0]u8, tp_len: usize, uri: []const u8, msec: [:0]const u8) void {
     var dbuf: [4300]u8 = undefined;
     const dir1 = std.fmt.bufPrint(&dbuf, "{s}/thumbnails", .{tc.cache_dir}) catch return;
     var z: [4300:0]u8 = undefined;
@@ -640,9 +640,14 @@ pub fn thumbSaveLocal(tc: *ThumbCtx, pb: *c.GdkPixbuf, tp_buf: *[4300:0]u8, tp_l
     var uz: [4096 * 3 + 8:0]u8 = undefined;
     @memcpy(uz[0..uri.len], uri);
     uz[uri.len] = 0;
+    var installed = false;
+    defer {
+        if (!installed) _ = c.unlink(tmps.ptr);
+    }
     if (c.gdk_pixbuf_save(pb, tmps.ptr, "png", null, "tEXt::Thumb::URI", &uz, "tEXt::Thumb::MTime", msec.ptr, @as(?*anyopaque, null)) == 0) return;
-    _ = c.chmod(tmps.ptr, 0o600);
-    _ = c.rename(tmps.ptr, tp_buf);
+    if (c.chmod(tmps.ptr, 0o600) != 0) return;
+    if (c.rename(tmps.ptr, tp_buf) != 0) return;
+    installed = true;
 }
 
 pub fn onThumbIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -941,23 +946,16 @@ fn writeRemoteThumbCache(host: []const u8, path: []const u8, mtime_ms: i64, byte
     }
     var z: [4096:0]u8 = undefined;
     const final = remoteThumbCachePath(&z, identity) orelse return;
-    // Atomic install: a crash mid-write must never leave a torn file
-    // that a later run would trust (the header would not parse, but
-    // torn payload bytes after a valid header still decode-fail into
-    // thumb_failed for a session).
-    var tmpz: [4200:0]u8 = undefined;
-    const tmp = std.fmt.bufPrintZ(&tmpz, "{s}.tmp{d}", .{ std.mem.span(final), c.getpid() }) catch return;
-    const f = c.fopen(tmp.ptr, "wb") orelse return;
-    var ok = false;
-    defer {
-        if (!ok) _ = c.unlink(tmp.ptr);
-    }
+    // Recoverable cache: complete readers matter, persistence across a power
+    // cut does not. The named cache API keeps unique staging and cleanup while
+    // deliberately omitting data and parent fsyncs.
     var hdr: [REMOTE_THUMB_HDR]u8 = undefined;
     packRemoteThumbHeader(&hdr, mtime_ms);
-    const whdr = c.fwrite(&hdr, 1, hdr.len, f);
-    const wbytes = c.fwrite(bytes.ptr, 1, bytes.len, f);
-    if (c.fclose(f) != 0 or whdr != hdr.len or wbytes != bytes.len) return;
-    ok = c.rename(tmp.ptr, final) == 0;
+    const payload = std.heap.c_allocator.alloc(u8, hdr.len + bytes.len) catch return;
+    defer std.heap.c_allocator.free(payload);
+    @memcpy(payload[0..hdr.len], &hdr);
+    @memcpy(payload[hdr.len..], bytes);
+    atomicwrite.writeCacheFile(std.mem.span(final), payload, 0o600) catch return;
 }
 
 /// Oldest-first prune, run at most once per process and only when

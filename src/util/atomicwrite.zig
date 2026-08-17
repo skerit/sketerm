@@ -5,20 +5,27 @@ const c = @import("cbindings");
 
 pub const Error = error{
     NameTooLong,
+    NotFound,
     StatFailed,
     ParentOpenFailed,
     OpenFailed,
+    PermissionDenied,
+    ReadOnlyFileSystem,
     PermissionFailed,
     WriteFailed,
     DataSyncFailed,
     CloseFailed,
     RenameFailed,
+    DeleteFailed,
     ParentSyncFailed,
 };
 
 pub const MAX_PATH = 4096;
 const STAGE_ATTEMPTS = 128;
 var next_stage = std.atomic.Value(u64).init(1);
+
+const SyncPolicy = enum { durable, recoverable_cache };
+const ModePolicy = enum { preserve_existing, exact };
 
 const PosixOps = struct {
     fn open(_: *@This(), path: [*:0]const u8, flags: c_int, mode: c_uint) c_int {
@@ -57,7 +64,34 @@ const PosixOps = struct {
 /// Atomically replace `path`, preserving an existing regular file's mode.
 pub fn writeFile(path: []const u8, bytes: []const u8, create_mode: u32) Error!void {
     var ops: PosixOps = .{};
-    return writeFileWithOps(&ops, path, bytes, create_mode);
+    return writeFileWithOps(&ops, path, bytes, create_mode, .durable, .preserve_existing);
+}
+
+/// Atomically replace `path` with exactly `mode`, including on replacement.
+pub fn writeFileExact(path: []const u8, bytes: []const u8, mode: u32) Error!void {
+    var ops: PosixOps = .{};
+    return writeFileWithOps(&ops, path, bytes, mode, .durable, .exact);
+}
+
+/// Atomically replace a rebuildable cache file without forcing it to stable storage.
+pub fn writeCacheFile(path: []const u8, bytes: []const u8, mode: u32) Error!void {
+    var ops: PosixOps = .{};
+    return writeFileWithOps(&ops, path, bytes, mode, .recoverable_cache, .exact);
+}
+
+/// Durably delete one file by syncing its parent after unlink.
+pub fn deleteFile(path: []const u8) Error!void {
+    if (path.len == 0 or path.len >= MAX_PATH) return error.NameTooLong;
+    var path_buf: [MAX_PATH:0]u8 = undefined;
+    const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.NameTooLong;
+    const parent = std.fs.path.dirname(path) orelse ".";
+    var parent_buf: [MAX_PATH:0]u8 = undefined;
+    const parent_z = std.fmt.bufPrintZ(&parent_buf, "{s}", .{parent}) catch return error.NameTooLong;
+    const parent_fd = c.open(parent_z.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC, @as(c_uint, 0));
+    if (parent_fd < 0) return syscallError(error.ParentOpenFailed);
+    defer _ = c.close(parent_fd);
+    if (c.unlink(path_z.ptr) != 0) return syscallError(error.DeleteFailed);
+    if (c.fsync(parent_fd) != 0) return syscallError(error.ParentSyncFailed);
 }
 
 const PosixFileWriter = struct {
@@ -113,7 +147,23 @@ fn writeSerializedWith(
     try file_writer.write(path, out.written(), create_mode);
 }
 
-fn writeFileWithOps(ops: anytype, path: []const u8, bytes: []const u8, create_mode: u32) Error!void {
+fn syscallError(fallback: Error) Error {
+    return switch (std.c._errno().*) {
+        c.ENOENT => error.NotFound,
+        c.EACCES, c.EPERM => error.PermissionDenied,
+        c.EROFS => error.ReadOnlyFileSystem,
+        else => fallback,
+    };
+}
+
+fn writeFileWithOps(
+    ops: anytype,
+    path: []const u8,
+    bytes: []const u8,
+    create_mode: u32,
+    sync_policy: SyncPolicy,
+    mode_policy: ModePolicy,
+) Error!void {
     if (path.len == 0 or path.len >= MAX_PATH) return error.NameTooLong;
 
     var dst_buf: [MAX_PATH:0]u8 = undefined;
@@ -123,19 +173,27 @@ fn writeFileWithOps(ops: anytype, path: []const u8, bytes: []const u8, create_mo
     const parent_z = std.fmt.bufPrintZ(&parent_buf, "{s}", .{parent}) catch return error.NameTooLong;
 
     var install_mode: c_uint = @intCast(create_mode & 0o777);
-    var target_stat: c.struct_stat = undefined;
-    if (ops.lstat(dst.ptr, &target_stat) == 0) {
-        if ((target_stat.st_mode & c.S_IFMT) == c.S_IFREG)
-            install_mode = @intCast(target_stat.st_mode & 0o777);
-    } else if (std.c._errno().* != c.ENOENT) {
-        return error.StatFailed;
+    if (mode_policy == .preserve_existing) {
+        var target_stat: c.struct_stat = undefined;
+        if (ops.lstat(dst.ptr, &target_stat) == 0) {
+            if ((target_stat.st_mode & c.S_IFMT) == c.S_IFREG)
+                install_mode = @intCast(target_stat.st_mode & 0o777);
+        } else if (std.c._errno().* != c.ENOENT) {
+            return syscallError(error.StatFailed);
+        }
     }
 
-    // Hold the directory open across the install so the durability sync
-    // names the directory in which the rename actually happened.
-    const parent_fd = ops.open(parent_z.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC, 0);
-    if (parent_fd < 0) return error.ParentOpenFailed;
-    defer _ = ops.close(parent_fd);
+    // Durable replacements hold the directory open across the install so
+    // the final sync names the directory in which the rename happened.
+    const parent_fd = if (sync_policy == .durable)
+        ops.open(parent_z.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC, 0)
+    else
+        -1;
+    if (sync_policy == .durable and parent_fd < 0)
+        return syscallError(error.ParentOpenFailed);
+    defer {
+        if (parent_fd >= 0) _ = ops.close(parent_fd);
+    }
 
     var stage_buf: [MAX_PATH + 64:0]u8 = undefined;
     var stage: [:0]u8 = undefined;
@@ -153,7 +211,7 @@ fn writeFileWithOps(ops: anytype, path: []const u8, bytes: []const u8, create_mo
             install_mode,
         );
         if (fd >= 0) break;
-        if (std.c._errno().* != c.EEXIST) return error.OpenFailed;
+        if (std.c._errno().* != c.EEXIST) return syscallError(error.OpenFailed);
     }
     if (fd < 0) return error.OpenFailed;
 
@@ -168,25 +226,29 @@ fn writeFileWithOps(ops: anytype, path: []const u8, bytes: []const u8, create_mo
 
     // Apply the exact requested/preserved access bits instead of allowing
     // umask or a reused process environment to broaden or narrow them.
-    if (ops.fchmod(fd, install_mode) != 0) return error.PermissionFailed;
+    if (ops.fchmod(fd, install_mode) != 0)
+        return syscallError(error.PermissionFailed);
 
     var off: usize = 0;
     while (off < bytes.len) {
         const n = ops.write(fd, bytes.ptr + off, bytes.len - off);
         if (n < 0 and std.c._errno().* == c.EINTR) continue;
-        if (n <= 0) return error.WriteFailed;
+        if (n <= 0) return syscallError(error.WriteFailed);
         off += @intCast(n);
     }
-    if (ops.fsync(fd) != 0) return error.DataSyncFailed;
+    if (sync_policy == .durable and ops.fsync(fd) != 0)
+        return syscallError(error.DataSyncFailed);
 
     stage_open = false;
-    if (ops.close(fd) != 0) return error.CloseFailed;
-    if (ops.renameFile(stage.ptr, dst.ptr) != 0) return error.RenameFailed;
+    if (ops.close(fd) != 0) return syscallError(error.CloseFailed);
+    if (ops.renameFile(stage.ptr, dst.ptr) != 0)
+        return syscallError(error.RenameFailed);
     stage_exists = false;
 
     // Once rename succeeds the new path is complete, but it is not a
     // durable replacement until the directory entry itself reaches disk.
-    if (ops.fsync(parent_fd) != 0) return error.ParentSyncFailed;
+    if (sync_policy == .durable and ops.fsync(parent_fd) != 0)
+        return syscallError(error.ParentSyncFailed);
 }
 
 const FaultOps = struct {
@@ -197,6 +259,7 @@ const FaultOps = struct {
     collide_once: bool = false,
     written: usize = 0,
     parent_fd: c_int = -1,
+    data_syncs: usize = 0,
     parent_syncs: usize = 0,
     last_stage: [MAX_PATH + 64:0]u8 = undefined,
     last_stage_len: usize = 0,
@@ -261,6 +324,8 @@ const FaultOps = struct {
         } else if (self.fail_data_sync) {
             std.c._errno().* = c.EIO;
             return -1;
+        } else {
+            self.data_syncs += 1;
         }
         return c.fsync(fd);
     }
@@ -423,10 +488,33 @@ test "writeFile completes short writes and syncs the parent" {
     }
 
     var ops: FaultOps = .{ .short_write = 3 };
-    try writeFileWithOps(&ops, path, "complete short write", 0o600);
+    try writeFileWithOps(&ops, path, "complete short write", 0o600, .durable, .preserve_existing);
     var got: [64]u8 = undefined;
     try std.testing.expectEqualStrings("complete short write", try readTestFile(path, &got));
     try std.testing.expectEqual(@as(usize, 1), ops.parent_syncs);
+}
+
+test "writeCacheFile keeps atomic install checks but deliberately skips syncs" {
+    var tmpl = "/tmp/sketerm-atomicwrite-cache-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/cache.bin", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    try writeFile(path, "old-public-cache", 0o644);
+    var ops: FaultOps = .{ .short_write = 2, .fail_data_sync = true };
+    try writeFileWithOps(&ops, path, "recoverable", 0o600, .recoverable_cache, .exact);
+    var got: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("recoverable", try readTestFile(path, &got));
+    try std.testing.expectEqual(@as(usize, 0), ops.data_syncs);
+    try std.testing.expectEqual(@as(usize, 0), ops.parent_syncs);
+    var st: c.struct_stat = undefined;
+    try std.testing.expect(c.lstat(path_z.ptr, &st) == 0);
+    try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
 }
 
 test "write and data-sync failures preserve the old file and clean the stage" {
@@ -443,14 +531,14 @@ test "write and data-sync failures preserve the old file and clean the stage" {
     try writeFile(path, "old-valid", 0o600);
 
     var write_ops: FaultOps = .{ .short_write = 2, .fail_write_after = 4 };
-    try std.testing.expectError(error.WriteFailed, writeFileWithOps(&write_ops, path, "new-incomplete", 0o600));
+    try std.testing.expectError(error.WriteFailed, writeFileWithOps(&write_ops, path, "new-incomplete", 0o600, .durable, .preserve_existing));
     var st: c.struct_stat = undefined;
     try std.testing.expect(c.lstat(write_ops.lastStage().ptr, &st) != 0);
     var got: [64]u8 = undefined;
     try std.testing.expectEqualStrings("old-valid", try readTestFile(path, &got));
 
     var sync_ops: FaultOps = .{ .fail_data_sync = true };
-    try std.testing.expectError(error.DataSyncFailed, writeFileWithOps(&sync_ops, path, "new-unsynced", 0o600));
+    try std.testing.expectError(error.DataSyncFailed, writeFileWithOps(&sync_ops, path, "new-unsynced", 0o600, .durable, .preserve_existing));
     try std.testing.expect(c.lstat(sync_ops.lastStage().ptr, &st) != 0);
     try std.testing.expectEqualStrings("old-valid", try readTestFile(path, &got));
 }
@@ -468,7 +556,7 @@ test "a stale exclusive stage is bypassed without deleting it" {
     }
 
     var ops: FaultOps = .{ .collide_once = true };
-    try writeFileWithOps(&ops, path, "new", 0o600);
+    try writeFileWithOps(&ops, path, "new", 0o600, .durable, .preserve_existing);
     defer _ = c.unlink(ops.collisionStage().ptr);
     var st: c.struct_stat = undefined;
     try std.testing.expect(c.lstat(ops.collisionStage().ptr, &st) == 0);
@@ -490,7 +578,7 @@ test "rename failure preserves the old file and removes its stage" {
     try writeFile(path, "old-valid", 0o600);
 
     var ops: FaultOps = .{ .fail_rename = true };
-    try std.testing.expectError(error.RenameFailed, writeFileWithOps(&ops, path, "new", 0o600));
+    try std.testing.expectError(error.RenameFailed, writeFileWithOps(&ops, path, "new", 0o600, .durable, .preserve_existing));
     var st: c.struct_stat = undefined;
     try std.testing.expect(c.lstat(ops.lastStage().ptr, &st) != 0);
     var got: [32]u8 = undefined;
@@ -518,6 +606,26 @@ test "writeFile creates restrictive files and preserves replacement mode" {
     try std.testing.expectEqual(@as(c_uint, 0o640), @as(c_uint, @intCast(st.st_mode & 0o777)));
     var got: [64]u8 = undefined;
     try std.testing.expectEqualStrings("second-and-longer", try readTestFile(path, &got));
+}
+
+test "writeFileExact replaces an existing file with the requested mode" {
+    var tmpl = "/tmp/sketerm-atomicwrite-exact-mode-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    try writeFile(path, "public", 0o644);
+    try writeFileExact(path, "private", 0o600);
+    var st: c.struct_stat = undefined;
+    try std.testing.expect(c.lstat(path_z.ptr, &st) == 0);
+    try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+    var got: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("private", try readTestFile(path, &got));
 }
 
 test "concurrent writers install one complete value without stage collisions" {
@@ -565,9 +673,26 @@ test "concurrent writers install one complete value without stage collisions" {
 
 test "writeFile refuses an unopenable destination" {
     try std.testing.expectError(
-        error.ParentOpenFailed,
+        error.NotFound,
         writeFile("/proc/definitely/not/writable", "x", 0o600),
     );
     const long = [_]u8{'a'} ** MAX_PATH;
     try std.testing.expectError(error.NameTooLong, writeFile(&long, "x", 0o600));
+}
+
+test "deleteFile removes a file durably and reports absence" {
+    var tmpl = "/tmp/sketerm-atomicwrite-delete-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+
+    try writeFile(path, "state", 0o600);
+    try deleteFile(path);
+    var st: c.struct_stat = undefined;
+    try std.testing.expect(c.lstat(path_z.ptr, &st) != 0);
+    try std.testing.expectError(error.NotFound, deleteFile(path));
 }

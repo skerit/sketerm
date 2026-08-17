@@ -601,6 +601,12 @@ fn onSavePresetClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         .params = kvs[0..n],
     }) catch |err| {
         std.debug.print("sketerm: preset save failed: {s}\n", .{@errorName(err)});
+        var msg: [160]u8 = undefined;
+        @import("window.zig").showToast(
+            ctx.win,
+            std.fmt.bufPrint(&msg, "Could not save shader preset: {s}", .{@errorName(err)}) catch
+                "Could not save shader preset",
+        );
         return;
     };
     pane.applyShaderPresetParams(name, kvs[0..n]);

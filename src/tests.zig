@@ -120,6 +120,7 @@ comptime {
     _ = @import("ui/viewer.zig");
     _ = @import("ui/castview.zig");
     _ = @import("ui/secrets.zig");
+    _ = @import("ui/app_launcher.zig");
     _ = @import("ui/app_switcher.zig");
     _ = @import("ui/editorlsp.zig");
     _ = @import("ui/editorproj.zig");

@@ -244,6 +244,12 @@ pub fn save(dir: []const u8, record: Record) !void {
     const final = try recordPath(&final_buf, dir, record.id, false);
     const temp = try recordPath(&temp_buf, dir, record.id, true);
     const fp = c.fopen(temp.ptr, "wb") orelse return error.WriteFailed;
+    const fd = c.fileno(fp);
+    if (fd < 0 or c.fchmod(fd, @as(c.mode_t, 0o600)) != 0) {
+        _ = c.fclose(fp);
+        _ = c.unlink(temp.ptr);
+        return error.WriteFailed;
+    }
     var bytes: [16 * 1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&bytes);
     std.json.Stringify.value(record, .{}, &w) catch {
@@ -257,8 +263,7 @@ pub fn save(dir: []const u8, record: Record) !void {
         _ = c.unlink(temp.ptr);
         return error.WriteFailed;
     }
-    const fd = c.fileno(fp);
-    if (fd < 0 or c.fsync(fd) != 0) {
+    if (c.fsync(fd) != 0) {
         _ = c.fclose(fp);
         _ = c.unlink(temp.ptr);
         return error.WriteFailed;
@@ -332,6 +337,16 @@ test "job journal save/load is atomic and complete" {
         .acknowledged = true,
     });
     const path = try std.fmt.allocPrint(arena.allocator(), "{s}/42.json", .{base});
+    var path_buf: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    try std.testing.expect(c.stat(try pathz.pathZ(&path_buf, path), &st) == 0);
+    try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+
+    try std.testing.expectError(error.WriteFailed, save(base, .{
+        .id = 42,
+        .op = "copy",
+        .message = "x" ** (17 * 1024),
+    }));
     const parsed = try load(arena.allocator(), path);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u64, 42), parsed.value.id);

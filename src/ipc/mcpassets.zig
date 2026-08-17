@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 
 pub const Error = error{ BadName, NotFound, TooBig, IoFailed, OutOfMemory };
@@ -79,12 +80,12 @@ pub fn save(allocator: std.mem.Allocator, kind: Kind, name: []const u8, bytes: [
     if (bytes.len > MAX_BYTES) return Error.TooBig;
     const path = try assetPath(allocator, kind, name);
     defer allocator.free(path);
+    try saveToPath(path, bytes);
+}
+
+fn saveToPath(path: []const u8, bytes: []const u8) Error!void {
     pathz.makeParentDirs(path) catch return Error.IoFailed;
-    var zbuf: [4096]u8 = undefined;
-    const z = pathz.pathZ(&zbuf, path) catch return Error.IoFailed;
-    const f = c.fopen(z, "wb") orelse return Error.IoFailed;
-    defer _ = c.fclose(f);
-    if (c.fwrite(bytes.ptr, 1, bytes.len, f) != bytes.len) return Error.IoFailed;
+    atomicwrite.writeFileExact(path, bytes, 0o600) catch return Error.IoFailed;
 }
 
 /// Caller frees the returned bytes.
@@ -108,9 +109,10 @@ pub fn load(allocator: std.mem.Allocator, kind: Kind, name: []const u8) Error![]
 pub fn delete(allocator: std.mem.Allocator, kind: Kind, name: []const u8) Error!void {
     const path = try assetPath(allocator, kind, name);
     defer allocator.free(path);
-    var zbuf: [4096]u8 = undefined;
-    const z = pathz.pathZ(&zbuf, path) catch return Error.IoFailed;
-    if (c.unlink(z) != 0) return Error.NotFound;
+    atomicwrite.deleteFile(path) catch |err| return switch (err) {
+        error.NotFound => Error.NotFound,
+        else => Error.IoFailed,
+    };
 }
 
 /// Names (extension stripped) of every stored asset of `kind`,
@@ -160,19 +162,41 @@ test "asset names are validated" {
 
 test "save/load/list/delete round-trip in an isolated state dir" {
     const a = std.testing.allocator;
-    var dirbuf: [128]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&dirbuf, "/tmp/sketerm-assets-test-{d}", .{c.getpid()});
+    var dirbuf = "/tmp/sketerm-assets-test-XXXXXX".*;
+    const dir_z = c.mkdtemp(&dirbuf) orelse return error.SkipZigTest;
+    const dir = std.mem.span(@as([*:0]u8, @ptrCast(dir_z)));
     var zbuf: [4096]u8 = undefined;
-    _ = c.mkdir(try pathz.pathZ(&zbuf, dir), 0o755);
     var envbuf: [160]u8 = undefined;
     const env = try std.fmt.bufPrintZ(&envbuf, "{s}", .{dir});
     _ = c.setenv("XDG_STATE_HOME", env, 1);
-    defer _ = c.unsetenv("XDG_STATE_HOME");
+    defer {
+        _ = c.unsetenv("XDG_STATE_HOME");
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros", .{dir})) |macros| {
+            _ = c.rmdir(macros.ptr);
+        } else |_| {}
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm", .{dir})) |root| {
+            _ = c.rmdir(root.ptr);
+        } else |_| {}
+        _ = c.rmdir(dir_z);
+    }
 
     try save(a, .macro, "walk-to-riker", "{\"actions\":[{\"wait\":100}]}");
     const bytes = try load(a, .macro, "walk-to-riker");
     defer a.free(bytes);
     try std.testing.expectEqualStrings("{\"actions\":[{\"wait\":100}]}", bytes);
+
+    const path = try assetPath(a, .macro, "walk-to-riker");
+    defer a.free(path);
+    var st: c.struct_stat = undefined;
+    try std.testing.expect(c.stat(try pathz.pathZ(&zbuf, path), &st) == 0);
+    try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+
+    const too_big = try a.alloc(u8, MAX_BYTES + 1);
+    defer a.free(too_big);
+    try std.testing.expectError(Error.TooBig, save(a, .macro, "walk-to-riker", too_big));
+    const retained = try load(a, .macro, "walk-to-riker");
+    defer a.free(retained);
+    try std.testing.expectEqualStrings("{\"actions\":[{\"wait\":100}]}", retained);
 
     const names = try list(a, .macro);
     defer {
@@ -185,4 +209,49 @@ test "save/load/list/delete round-trip in an isolated state dir" {
     try delete(a, .macro, "walk-to-riker");
     try std.testing.expectError(Error.NotFound, load(a, .macro, "walk-to-riker"));
     try std.testing.expectError(Error.BadName, save(a, .macro, "../evil", "x"));
+}
+
+test "concurrent asset saves install one complete value and clean stages" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-assets-race-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/macro.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    const Ctx = struct {
+        path: []const u8,
+        bytes: []const u8,
+        failed: bool = false,
+
+        fn run(self: *@This()) void {
+            saveToPath(self.path, self.bytes) catch {
+                self.failed = true;
+            };
+        }
+    };
+    var one = Ctx{ .path = path, .bytes = "{\"writer\":1}" };
+    var two = Ctx{ .path = path, .bytes = "{\"writer\":2}" };
+    const first = try std.Thread.spawn(.{}, Ctx.run, .{&one});
+    const second = try std.Thread.spawn(.{}, Ctx.run, .{&two});
+    first.join();
+    second.join();
+    try t.expect(!one.failed and !two.failed);
+
+    const f = c.fopen(path_z.ptr, "rb") orelse return error.TestUnexpectedResult;
+    defer _ = c.fclose(f);
+    var bytes: [32]u8 = undefined;
+    const n = c.fread(&bytes, 1, bytes.len, f);
+    try t.expect(std.mem.eql(u8, bytes[0..n], one.bytes) or std.mem.eql(u8, bytes[0..n], two.bytes));
+
+    const dp = c.opendir(dir) orelse return error.TestUnexpectedResult;
+    defer _ = c.closedir(dp);
+    while (c.readdir(dp)) |entry| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
+        try t.expect(std.mem.indexOf(u8, name, ".sketerm-tmp-") == null);
+    }
 }

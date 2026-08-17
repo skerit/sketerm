@@ -90,6 +90,9 @@ pub const Lease = struct {
         errdefer _ = c.close(fd);
         if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) return error.LockHeld;
 
+        // Runtime-only publication: the held flock is authoritative and the
+        // record is deleted at process exit. Rename keeps readers atomic, but
+        // fsync would buy no recovery value because stale records are swept.
         const tmp_path = try std.fmt.allocPrint(allocator, "{s}/{d}.json.tmp", .{ dir, pid });
         defer allocator.free(tmp_path);
         var aw: std.Io.Writer.Allocating = .init(allocator);

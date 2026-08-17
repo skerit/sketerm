@@ -699,6 +699,10 @@ const Blob = struct {
 };
 
 /// Install bytes under their SHA-256 name after bounded cache pruning.
+///
+/// This is a recoverable cache: sources remain in panel documents and are
+/// rehydrated on a miss. The cross-file prune/install sequence keeps its
+/// specialized stage, but deliberately does not fsync cache data or entries.
 pub fn store(
     allocator: std.mem.Allocator,
     root: []const u8,
@@ -812,16 +816,10 @@ fn storeWithOptions(
         if (n < 0 and std.posix.errno(n) == .INTR) continue;
         return error.IoFailed;
     }
-    if (c.fsync(fd) != 0) return error.IoFailed;
     closed = true;
     if (c.close(fd) != 0) return error.IoFailed;
     if (!commit) return error.IoFailed;
     if (c.rename(stage_z, target_z) != 0) return error.IoFailed;
-    const dir_fd = c.open(root_z, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
-    if (dir_fd >= 0) {
-        _ = c.fsync(dir_fd);
-        _ = c.close(dir_fd);
-    }
     return .{ .allocator = allocator, .path = target, .hash = hash, .bytes = bytes.len };
 }
 

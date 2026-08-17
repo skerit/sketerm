@@ -1,7 +1,12 @@
 //! Persistent sparse-range cache for mux-backed filesystem mounts.
+//!
+//! Every file is recoverable from its remote source. Metadata therefore uses
+//! the explicitly non-durable cache writer: readers still get atomic complete
+//! files, but range updates do not force data or directory syncs.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
 
 pub const Range = struct { start: u64, end: u64 };
@@ -19,7 +24,9 @@ pub fn stateName(state: State) []const u8 {
 pub const RangeSet = struct {
     items: std.ArrayList(Range) = .empty,
 
-    pub fn deinit(self: *RangeSet, a: std.mem.Allocator) void { self.items.deinit(a); }
+    pub fn deinit(self: *RangeSet, a: std.mem.Allocator) void {
+        self.items.deinit(a);
+    }
 
     pub fn contains(self: *const RangeSet, start: u64, end: u64) bool {
         if (start == end) return true;
@@ -43,7 +50,9 @@ pub const RangeSet = struct {
         }
         try self.items.append(a, merged);
         std.mem.sort(Range, self.items.items, {}, struct {
-            fn lt(_: void, x: Range, y: Range) bool { return x.start < y.start; }
+            fn lt(_: void, x: Range, y: Range) bool {
+                return x.start < y.start;
+            }
         }.lt);
     }
 
@@ -127,11 +136,7 @@ pub const Cache = struct {
         self.allocator.free(self.root);
     }
 
-    fn persist(self: *Cache, e: *Entry) bool {
-        const tmp_path = std.fmt.allocPrint(self.allocator, "{s}.tmp.{d}", .{ e.meta_path, c.getpid() }) catch return false;
-        defer self.allocator.free(tmp_path);
-        var z: [4096]u8 = undefined;
-        const fp = c.fopen(pathz.pathZ(&z, tmp_path) catch return false, "wb") orelse return false;
+    fn persistRecoverableMeta(self: *Cache, e: *Entry) bool {
         var w: std.Io.Writer.Allocating = .init(self.allocator);
         defer w.deinit();
         std.json.Stringify.value(DiskMeta{
@@ -140,24 +145,8 @@ pub const Cache = struct {
             .pinned = e.pinned,
             .key = e.key,
             .ranges = e.ranges.items.items,
-        }, .{}, &w.writer) catch {
-            _ = c.fclose(fp);
-            _ = c.unlink(pathz.pathZ(&z, tmp_path) catch return false);
-            return false;
-        };
-        const bytes = w.written();
-        const written = c.fwrite(bytes.ptr, 1, bytes.len, fp);
-        const flushed = written == bytes.len and c.fflush(fp) == 0;
-        const closed = c.fclose(fp) == 0;
-        if (!flushed or !closed) {
-            _ = c.unlink(pathz.pathZ(&z, tmp_path) catch return false);
-            return false;
-        }
-        var z2: [4096]u8 = undefined;
-        if (c.rename(pathz.pathZ(&z, tmp_path) catch return false, pathz.pathZ(&z2, e.meta_path) catch return false) != 0) {
-            _ = c.unlink(pathz.pathZ(&z, tmp_path) catch return false);
-            return false;
-        }
+        }, .{}, &w.writer) catch return false;
+        atomicwrite.writeCacheFile(e.meta_path, w.written(), 0o600) catch return false;
         return true;
     }
 
@@ -215,7 +204,7 @@ pub const Cache = struct {
         var z: [4096]u8 = undefined;
         const fd = c.open(pathz.pathZ(&z, e.data_path) catch return, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c.mode_t, 0o600));
         if (fd >= 0) _ = c.close(fd);
-        _ = self.persist(e);
+        _ = self.persistRecoverableMeta(e);
     }
 
     pub fn read(self: *Cache, e: *Entry, off: u64, len: usize, out: *std.ArrayList(u8)) bool {
@@ -231,7 +220,10 @@ pub const Cache = struct {
         var got: usize = 0;
         while (got < end - off) {
             const n = c.pread(fd, out.items[start_len + got ..].ptr, @as(usize, @intCast(end - off)) - got, @intCast(off + got));
-            if (n <= 0) { out.shrinkRetainingCapacity(start_len); return false; }
+            if (n <= 0) {
+                out.shrinkRetainingCapacity(start_len);
+                return false;
+            }
             got += @intCast(n);
         }
         return true;
@@ -249,13 +241,13 @@ pub const Cache = struct {
             done += @intCast(n);
         }
         e.ranges.add(self.allocator, off, off +| @as(u64, @intCast(bytes.len))) catch return false;
-        return self.persist(e);
+        return self.persistRecoverableMeta(e);
     }
 
     pub fn setPinned(self: *Cache, e: *Entry, pinned: bool) bool {
         const old = e.pinned;
         e.pinned = pinned;
-        if (self.persist(e)) return true;
+        if (self.persistRecoverableMeta(e)) return true;
         e.pinned = old;
         return false;
     }
@@ -325,7 +317,7 @@ pub const Cache = struct {
         staged.key = owned;
         staged.data_path = new_data;
         staged.meta_path = new_meta;
-        if (!self.persist(&staged)) {
+        if (!self.persistRecoverableMeta(&staged)) {
             self.allocator.free(new_meta);
             self.allocator.free(new_data);
             self.allocator.free(owned);
@@ -400,7 +392,7 @@ pub const Cache = struct {
         var z: [4096]u8 = undefined;
         if (c.unlink(pathz.pathZ(&z, e.data_path) catch return false) != 0 and std.posix.errno(-1) != .NOENT)
             return false;
-        return self.persist(e);
+        return self.persistRecoverableMeta(e);
     }
 };
 
@@ -435,7 +427,11 @@ test "RangeSet merges overlap and reports hydrated spans" {
 test "cache state distinguishes placeholder partial hydrated and pinned" {
     var e = Entry{
         .allocator = std.testing.allocator,
-        .key = &.{}, .data_path = &.{}, .meta_path = &.{}, .version = 1, .size = 100,
+        .key = &.{},
+        .data_path = &.{},
+        .meta_path = &.{},
+        .version = 1,
+        .size = 100,
     };
     defer e.ranges.deinit(std.testing.allocator);
     try std.testing.expectEqual(State.placeholder, e.state());

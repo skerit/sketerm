@@ -32,12 +32,25 @@ pub const Store = struct {
     /// input yields an empty store rather than an error: a corrupt
     /// storage file must not brick an extension.
     pub fn load(gpa: std.mem.Allocator, bytes: []const u8) Store {
+        return loadFallible(gpa, bytes) catch Store.init(gpa);
+    }
+
+    fn loadFallible(gpa: std.mem.Allocator, bytes: []const u8) !Store {
         var s = Store.init(gpa);
+        errdefer s.deinit();
         const a = s.arena.allocator();
         if (bytes.len == 0) return s;
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return s;
-        if (parsed == .object) s.obj = parsed.object;
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
+        if (parsed != .object) return error.InvalidStorage;
+        s.obj = parsed.object;
         return s;
+    }
+
+    /// Deep-copy the store so a disk-backed mutation can commit transactionally.
+    pub fn clone(self: *Store, gpa: std.mem.Allocator) !Store {
+        const bytes = try self.serialize(gpa);
+        defer gpa.free(bytes);
+        return loadFallible(gpa, bytes);
     }
 
     /// Serialize the whole store to a JSON object string, owned by
@@ -331,6 +344,23 @@ test "serialize and load survive a round trip (the restart case)" {
     const p = try s2.get(gpa, &.{"persisted"});
     defer gpa.free(p);
     try t.expectEqualStrings("{\"persisted\":true}", p);
+}
+
+test "clone isolates a prospective persistence transaction" {
+    const gpa = t.allocator;
+    var original = Store.load(gpa, "{\"value\":1}");
+    defer original.deinit();
+    var candidate = try original.clone(gpa);
+    defer candidate.deinit();
+    const changed = try candidate.set(gpa, "{\"value\":2}");
+    defer gpa.free(changed);
+
+    const before = try original.get(gpa, &.{"value"});
+    defer gpa.free(before);
+    const after = try candidate.get(gpa, &.{"value"});
+    defer gpa.free(after);
+    try t.expectEqualStrings("{\"value\":1}", before);
+    try t.expectEqualStrings("{\"value\":2}", after);
 }
 
 test "load tolerates corrupt bytes" {
