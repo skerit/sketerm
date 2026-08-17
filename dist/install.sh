@@ -233,7 +233,7 @@ build_all() {
 # shared with PKGBUILD.package().
 
 stage() {
-    local dest=$1 kind=$2 tic_bin=${SKETERM_TIC:-}
+    local dest=$1 kind=$2 service_prefix=${3:-/usr} tic_bin=${SKETERM_TIC:-}
     if [ -n "$tic_bin" ]; then
         [ -x "$tic_bin" ] || die "SKETERM_TIC is not executable: $tic_bin"
     elif [ -x /usr/bin/tic ]; then
@@ -245,7 +245,8 @@ stage() {
     if [ -z "$tic_bin" ]; then
         warn "tic not found (install ncurses-bin); skipping terminfo entry"
     fi
-    sketerm_stage "$root" "$dest" "$kind" "$web_ok" "$tic_bin" sketerm
+    sketerm_stage "$root" "$dest" "$kind" "$web_ok" "$tic_bin" sketerm \
+        "$service_prefix"
 }
 
 # ------------------------------------------------------------- debian path
@@ -401,7 +402,7 @@ do_plain() {
     local kind=$1 stagedir new_manifest manifest manifest_tmp
     stagedir=$(mktemp -d)
     trap 'rm -rf "$stagedir"' RETURN
-    stage "$stagedir" "$kind"
+    stage "$stagedir" "$kind" "$prefix"
 
     if [ "$do_install" -eq 0 ]; then
         say "staged in $stagedir (not installed)"
@@ -504,6 +505,13 @@ else
     package_arch=$(uname -m) || die "could not determine the host architecture"
     sketerm_portable_target_for_arch "$package_arch" >/dev/null || exit 1
     select_kind
+    if [ "$kind" = gui ]; then
+        sketerm_validate_install_prefix "$prefix" \
+            || die "plain-install prefix must be an absolute path containing only printable ASCII characters"
+        while [ "$prefix" != / ] && [[ "$prefix" == */ ]]; do
+            prefix=${prefix%/}
+        done
+    fi
     build_all "$kind" "$package_arch"
     do_plain "$kind"
 fi

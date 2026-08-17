@@ -268,6 +268,8 @@ debfile=$4
 if [ -x "$stagedir/usr/bin/sketerm" ]; then
     [ -x "$stagedir/usr/bin/sketerm-webengine" ] || exit 96
     [ -f "$stagedir/usr/share/xdg-desktop-portal/portals/sketerm.portal" ] || exit 97
+    [ "$(grep '^Exec=' "$stagedir/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service")" = \
+        'Exec=/usr/bin/sketerm portal' ] || exit 98
 fi
 cp "$stagedir/DEBIAN/control" "$INSTALL_TEST_CONTROL_LOG"
 printf '%s\n' "$debfile" > "$INSTALL_TEST_DEB_LOG"
@@ -529,6 +531,25 @@ for bad_zig in 0.15.2 0.17.0; do
     [ ! -e "$INSTALL_TEST_ZIG_LOG" ] || fail "unsupported Zig $bad_zig started a build"
 done
 
+rm -f "$INSTALL_TEST_ZIG_LOG"
+unsafe_prefix="$work/plain-prefix"$'\n''Exec=/bin/false'
+set +e
+BASH_ENV="$work/no-packager.bash" \
+    PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+    "$fixture/dist/install.sh" --gui-only --no-install \
+        --prefix "$unsafe_prefix" \
+    > "$work/plain-unsafe-prefix.out" 2>&1
+status=$?
+set -e
+[ "$status" -eq 1 ] || fail "plain install accepted a newline in its prefix"
+[[ "$(<"$work/plain-unsafe-prefix.out")" == \
+    *"absolute path containing only printable ASCII characters"* ]] \
+    || fail "unsafe plain prefix failure was not explicit"
+[ ! -e "$INSTALL_TEST_ZIG_LOG" ] \
+    || fail "unsafe plain prefix was rejected only after starting the build"
+
 : > "$INSTALL_TEST_APT_LOG"
 set +e
 BASH_ENV="$work/no-makepkg.bash" \
@@ -572,6 +593,10 @@ for path in \
     usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service; do
     [ -e "${plain_stage[0]}/$path" ] || fail "plain GUI stage omitted $path"
 done
+plain_default_service="${plain_stage[0]}/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service"
+[ "$(grep '^Exec=' "$plain_default_service")" = \
+    'Exec="/usr/local/bin/sketerm" portal' ] \
+    || fail "default plain stage did not activate /usr/local/bin/sketerm"
 
 mkdir -p "$work/plain-no-cef-tmp"
 set +e
@@ -629,6 +654,48 @@ run_plain_gui_install() {
         > "$output" 2>&1
 }
 
+# Prefixes that need both service-file escaping and D-Bus argv quoting retain
+# their exact executable path. If the D-Bus test tools are installed, exercise
+# the actual activation parser as well as the staged text.
+plain_special_prefix="$work/plain prefix \$cash \`tick\` 'single' \"double\" back\\slash #hash &semi; =eq"
+mkdir -p "$plain_special_prefix"
+run_plain_gui_install "$work/plain-special.out" "$plain_special_prefix" 1
+plain_special_service="$plain_special_prefix/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service"
+plain_special_manifest="$plain_special_prefix/share/sketerm/plain-install-manifest"
+[ -x "$plain_special_prefix/bin/sketerm" ] \
+    || fail "custom-prefix activation command does not exist"
+[ "$(grep -c '^Exec=' "$plain_special_service")" -eq 1 ] \
+    || fail "custom-prefix service does not contain exactly one Exec entry"
+grep -Fqx 'Name=org.freedesktop.impl.portal.desktop.sketerm' \
+    "$plain_special_service" \
+    || fail "custom-prefix service changed its D-Bus name"
+grep -Fqx 'share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service' \
+    "$plain_special_manifest" \
+    || fail "plain manifest omitted the generated portal service"
+
+if command -v dbus-run-session >/dev/null 2>&1 \
+        && command -v dbus-send >/dev/null 2>&1 \
+        && command -v dbus-test-tool >/dev/null 2>&1 \
+        && command -v timeout >/dev/null 2>&1; then
+    rm -f "$plain_special_prefix/bin/sketerm"
+    cat > "$plain_special_prefix/bin/sketerm" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$INSTALL_TEST_ACTIVATION_LOG"
+exec dbus-test-tool echo --name=org.freedesktop.impl.portal.desktop.sketerm
+EOF
+    chmod +x "$plain_special_prefix/bin/sketerm"
+    INSTALL_TEST_ACTIVATION_LOG="$work/activation-argv" \
+        XDG_DATA_HOME="$work/activation-data-home" \
+        XDG_DATA_DIRS="$plain_special_prefix/share" \
+        dbus-run-session -- timeout 15 dbus-send --session --print-reply \
+            --dest=org.freedesktop.impl.portal.desktop.sketerm \
+            /org/freedesktop/portal/desktop org.freedesktop.DBus.Peer.Ping \
+            > "$work/activation.out" 2>&1 \
+        || fail "D-Bus could not activate the custom-prefix service: $(<"$work/activation.out")"
+    [ "$(<"$work/activation-argv")" = portal ] \
+        || fail "D-Bus activation did not execute the generated command"
+fi
+
 # Plain installs own only paths listed in their prefix manifest. A CEF-less
 # upgrade removes a previously managed helper even when it was modified, but
 # leaves unrelated files alone. Re-enabling CEF installs and tracks it again.
@@ -642,6 +709,9 @@ plain_manifest="$plain_upgrade_prefix/share/sketerm/plain-install-manifest"
     || fail "plain install did not publish its managed-file manifest"
 grep -Fqx bin/sketerm-webengine "$plain_manifest" \
     || fail "plain manifest omitted sketerm-webengine"
+grep -Fqx 'share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service' \
+    "$plain_manifest" \
+    || fail "plain upgrade manifest omitted the portal service"
 
 mkdir -p "$plain_upgrade_prefix/share/unrelated"
 printf 'keep bin\n' > "$plain_upgrade_prefix/bin/not-sketerm"
@@ -651,6 +721,11 @@ printf 'retired asset\n' > "$plain_upgrade_prefix/share/sketerm/retired-asset"
 printf 'share/sketerm/retired-asset\n' >> "$plain_manifest"
 printf 'locally modified helper\n' > "$plain_upgrade_prefix/bin/sketerm-webengine"
 chmod +x "$plain_upgrade_prefix/bin/sketerm-webengine"
+printf '%s\n' \
+    '[D-BUS Service]' \
+    'Name=org.freedesktop.impl.portal.desktop.sketerm' \
+    'Exec=/stale/sketerm portal' \
+    > "$plain_upgrade_prefix/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service"
 
 run_plain_gui_install "$work/plain-upgrade-no-cef.out" "$plain_upgrade_prefix" 0
 [ ! -e "$plain_upgrade_prefix/bin/sketerm-webengine" ] \
@@ -665,6 +740,9 @@ run_plain_gui_install "$work/plain-upgrade-no-cef.out" "$plain_upgrade_prefix" 0
     || fail "plain upgrade changed an untracked file in a managed directory"
 [ ! -e "$plain_upgrade_prefix/share/sketerm/retired-asset" ] \
     || fail "plain upgrade retained another obsolete managed asset"
+[ "$(grep '^Exec=' "$plain_upgrade_prefix/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service")" = \
+    "Exec=\"$plain_upgrade_prefix/bin/sketerm\" portal" ] \
+    || fail "plain upgrade did not refresh the portal activation command"
 
 run_plain_gui_install "$work/plain-upgrade-reenable.out" "$plain_upgrade_prefix" 1
 cmp -s "$fixture/zig-out/bin/sketerm-webengine" \
@@ -765,6 +843,12 @@ BASH_ENV="$work/no-packager.bash" \
 
 [ -x "$work/pkg/usr/bin/sketerm-webengine" ] \
     || fail "PKGBUILD package() did not include sketerm-webengine"
+[ "$(grep '^Exec=' "$work/pkg/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service")" = \
+    'Exec=/usr/bin/sketerm portal' ] \
+    || fail "PKGBUILD package() did not retain the canonical /usr activation path"
+cmp -s "$root/data/org.freedesktop.impl.portal.desktop.sketerm.service" \
+    "$work/pkg/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service" \
+    || fail "PKGBUILD package() rewrote the canonical portal service"
 [ ! -e "$work/pkg/usr/share/sketerm/plain-install-manifest" ] \
     || fail "PKGBUILD package() included plain-install ownership metadata"
 cmp -s "$fixture/zig-out/bin/sketerm-webengine" \

@@ -21,6 +21,77 @@ sketerm_warn() {
     fi
 }
 
+sketerm_validate_install_prefix() {
+    local prefix=$1
+    local LC_ALL=C
+    [[ "$prefix" == /* && "$prefix" != *[![:print:]]* ]]
+}
+
+# Quote one activation argument through both the service-file value decoder
+# and D-Bus's shell-style command-line parser.
+sketerm_quote_service_arg() {
+    local value=$1 quoted='"' char
+    local i
+    for ((i = 0; i < ${#value}; i++)); do
+        char=${value:i:1}
+        case "$char" in
+            '"'|'$'|'`') quoted+="\\\\$char" ;;
+            '\')         quoted+='\\\\' ;;
+            *)           quoted+="$char" ;;
+        esac
+    done
+    printf '%s"\n' "$quoted"
+}
+
+sketerm_install_portal_service() {
+    local source=$1 output=$2 prefix=$3 executable quoted line
+    local found=0 tmp="$output.tmp"
+
+    sketerm_validate_install_prefix "$prefix" || {
+        printf '==> ERROR: install prefix must be an absolute path containing only printable ASCII characters\n' >&2
+        return 1
+    }
+    while [ "$prefix" != / ] && [[ "$prefix" == */ ]]; do
+        prefix=${prefix%/}
+    done
+
+    # Distro packages install the canonical source file unchanged.
+    if [ "$prefix" = /usr ]; then
+        install -Dm644 "$source" "$output"
+        return
+    fi
+
+    if [ "$prefix" = / ]; then
+        executable=/bin/sketerm
+    else
+        executable="$prefix/bin/sketerm"
+    fi
+    quoted=$(sketerm_quote_service_arg "$executable")
+
+    install -d "$(dirname "$output")"
+    : > "$tmp"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            'Exec=/usr/bin/sketerm portal')
+                printf 'Exec=%s portal\n' "$quoted" >> "$tmp"
+                found=$((found + 1)) ;;
+            Exec=*)
+                rm -f "$tmp"
+                printf '==> ERROR: unexpected Exec entry in %s\n' "$source" >&2
+                return 1 ;;
+            *)
+                printf '%s\n' "$line" >> "$tmp" ;;
+        esac
+    done < "$source"
+    if [ "$found" -ne 1 ]; then
+        rm -f "$tmp"
+        printf '==> ERROR: expected exactly one portal Exec entry in %s\n' "$source" >&2
+        return 1
+    fi
+    install -m644 "$tmp" "$output"
+    rm -f "$tmp"
+}
+
 # Map the package manager's host architecture to the deployment artifact's
 # baseline Linux target. Keep aliases from both dpkg and uname/makepkg here.
 sketerm_portable_target_for_arch() {
@@ -88,6 +159,7 @@ sketerm_build() {
 # Stage the package-independent install tree for every Linux backend.
 sketerm_stage() {
     local root=$1 dest=$2 kind=$3 with_web=$4 tic_bin=$5 license_name=$6
+    local service_prefix=${7:-/usr}
     local i
     cd "$root"
 
@@ -122,8 +194,10 @@ sketerm_stage() {
 
         install -Dm644 data/sketerm.portal \
             "$dest/usr/share/xdg-desktop-portal/portals/sketerm.portal"
-        install -Dm644 data/org.freedesktop.impl.portal.desktop.sketerm.service \
-            "$dest/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service"
+        sketerm_install_portal_service \
+            data/org.freedesktop.impl.portal.desktop.sketerm.service \
+            "$dest/usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service" \
+            "$service_prefix"
         install -Dm644 data/sample.layout "$dest/usr/share/sketerm/sample.layout"
 
         for i in crt crt-lottes crt-easymode zfast-crt; do
