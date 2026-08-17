@@ -1688,6 +1688,19 @@ fn writePng(path: [*:0]const u8, bytes: []const u8) void {
 const CHIP_MIN_W: usize = 60;
 const CHIP_MIN_H: usize = 8;
 
+/// Index with the highest count; later index wins ties.
+fn modeIndex(hist: []const u16) usize {
+    var best: usize = 0;
+    var best_count: u16 = 0;
+    for (hist, 0..) |count, i| {
+        if (count >= best_count and count > 0) {
+            best = i;
+            best_count = count;
+        }
+    }
+    return best;
+}
+
 fn sidebarChipBounds(app: *appdrive.App, win_id: u32) ?struct { min_x: usize, max_x: usize, min_y: usize, max_y: usize } {
     for (app.windows.items) |w| {
         if (w.id != win_id or w.w <= 0 or w.h <= 0) continue;
@@ -1697,9 +1710,16 @@ fn sidebarChipBounds(app: *appdrive.App, win_id: u32) ?struct { min_x: usize, ma
         if (px.len < width * height * 4) return null;
         const limit = width / 3;
         var min_x = limit;
-        var max_x: usize = 0;
         var min_y: usize = 0;
         var run_rows: usize = 0;
+        // Per-row run-END histogram for the current candidate block.
+        // The block's right edge is the MODE of its rows' run ends, not
+        // the max: when the selected row is the FIRST row, the chip's
+        // top scanlines are contiguous with the focused pane's accent
+        // border TOP line and merge into one run reaching the scan
+        // limit — a max let those few rows inflate the chip edge by
+        // ~90px and the divider stage then grabbed inside the pane.
+        var end_hist = [_]u16{0} ** 4096;
         var y: usize = 0;
         while (y < height) : (y += 1) {
             const row = y * width * 4;
@@ -1729,18 +1749,20 @@ fn sidebarChipBounds(app: *appdrive.App, win_id: u32) ?struct { min_x: usize, ma
                 if (run_rows == 0) {
                     min_y = y;
                     min_x = best_start;
-                    max_x = best_start + best_len - 1;
                 } else {
                     min_x = @min(min_x, best_start);
-                    max_x = @max(max_x, best_start + best_len - 1);
                 }
+                end_hist[@min(best_start + best_len - 1, end_hist.len - 1)] += 1;
                 run_rows += 1;
                 continue;
             }
-            if (run_rows >= CHIP_MIN_H) return .{ .min_x = min_x, .max_x = max_x, .min_y = min_y, .max_y = y - 1 };
+            if (run_rows >= CHIP_MIN_H)
+                return .{ .min_x = min_x, .max_x = modeIndex(&end_hist), .min_y = min_y, .max_y = y - 1 };
+            if (run_rows > 0) @memset(&end_hist, 0);
             run_rows = 0;
         }
-        if (run_rows >= CHIP_MIN_H) return .{ .min_x = min_x, .max_x = max_x, .min_y = min_y, .max_y = height - 1 };
+        if (run_rows >= CHIP_MIN_H)
+            return .{ .min_x = min_x, .max_x = modeIndex(&end_hist), .min_y = min_y, .max_y = height - 1 };
         return null;
     }
     return null;
