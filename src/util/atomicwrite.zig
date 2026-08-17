@@ -28,7 +28,7 @@ const SyncPolicy = enum { durable, recoverable_cache };
 const ModePolicy = enum { preserve_existing, exact };
 
 const PosixOps = struct {
-    fn open(_: *@This(), path: [*:0]const u8, flags: c_int, mode: c_uint) c_int {
+    fn open(_: *@This(), path: [*:0]const u8, flags: c_int, mode: c.mode_t) c_int {
         return c.open(path, flags, mode);
     }
 
@@ -36,7 +36,7 @@ const PosixOps = struct {
         return c.lstat(path, st);
     }
 
-    fn fchmod(_: *@This(), fd: c_int, mode: c_uint) c_int {
+    fn fchmod(_: *@This(), fd: c_int, mode: c.mode_t) c_int {
         return c.fchmod(fd, mode);
     }
 
@@ -87,7 +87,7 @@ pub fn deleteFile(path: []const u8) Error!void {
     const parent = std.fs.path.dirname(path) orelse ".";
     var parent_buf: [MAX_PATH:0]u8 = undefined;
     const parent_z = std.fmt.bufPrintZ(&parent_buf, "{s}", .{parent}) catch return error.NameTooLong;
-    const parent_fd = c.open(parent_z.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC, @as(c_uint, 0));
+    const parent_fd = c.open(parent_z.ptr, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC, @as(c.mode_t, 0));
     if (parent_fd < 0) return syscallError(error.ParentOpenFailed);
     defer _ = c.close(parent_fd);
     if (c.unlink(path_z.ptr) != 0) return syscallError(error.DeleteFailed);
@@ -172,7 +172,7 @@ fn writeFileWithOps(
     var parent_buf: [MAX_PATH:0]u8 = undefined;
     const parent_z = std.fmt.bufPrintZ(&parent_buf, "{s}", .{parent}) catch return error.NameTooLong;
 
-    var install_mode: c_uint = @intCast(create_mode & 0o777);
+    var install_mode: c.mode_t = @intCast(create_mode & 0o777);
     if (mode_policy == .preserve_existing) {
         var target_stat: c.struct_stat = undefined;
         if (ops.lstat(dst.ptr, &target_stat) == 0) {
@@ -273,7 +273,7 @@ const FaultOps = struct {
         len.* = value.len;
     }
 
-    fn open(self: *@This(), path: [*:0]const u8, flags: c_int, mode: c_uint) c_int {
+    fn open(self: *@This(), path: [*:0]const u8, flags: c_int, mode: c.mode_t) c_int {
         if ((flags & c.O_DIRECTORY) != 0) {
             const fd = c.open(path, flags, mode);
             self.parent_fd = fd;
@@ -300,7 +300,7 @@ const FaultOps = struct {
         return c.lstat(path, st);
     }
 
-    fn fchmod(_: *@This(), fd: c_int, mode: c_uint) c_int {
+    fn fchmod(_: *@This(), fd: c_int, mode: c.mode_t) c_int {
         return c.fchmod(fd, mode);
     }
 
@@ -514,7 +514,7 @@ test "writeCacheFile keeps atomic install checks but deliberately skips syncs" {
     try std.testing.expectEqual(@as(usize, 0), ops.parent_syncs);
     var st: c.struct_stat = undefined;
     try std.testing.expect(c.lstat(path_z.ptr, &st) == 0);
-    try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+    try std.testing.expectEqual(@as(c.mode_t, 0o600), @as(c.mode_t, @intCast(st.st_mode & 0o777)));
 }
 
 test "write and data-sync failures preserve the old file and clean the stage" {
@@ -599,11 +599,11 @@ test "writeFile creates restrictive files and preserves replacement mode" {
     try writeFile(path, "first", 0o600);
     var st: c.struct_stat = undefined;
     try std.testing.expect(c.lstat(path_z.ptr, &st) == 0);
-    try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
-    try std.testing.expect(c.chmod(path_z.ptr, 0o640) == 0);
+    try std.testing.expectEqual(@as(c.mode_t, 0o600), @as(c.mode_t, @intCast(st.st_mode & 0o777)));
+    try std.testing.expect(c.chmod(path_z.ptr, @as(c.mode_t, 0o640)) == 0);
     try writeFile(path, "second-and-longer", 0o600);
     try std.testing.expect(c.lstat(path_z.ptr, &st) == 0);
-    try std.testing.expectEqual(@as(c_uint, 0o640), @as(c_uint, @intCast(st.st_mode & 0o777)));
+    try std.testing.expectEqual(@as(c.mode_t, 0o640), @as(c.mode_t, @intCast(st.st_mode & 0o777)));
     var got: [64]u8 = undefined;
     try std.testing.expectEqualStrings("second-and-longer", try readTestFile(path, &got));
 }
@@ -623,7 +623,7 @@ test "writeFileExact replaces an existing file with the requested mode" {
     try writeFileExact(path, "private", 0o600);
     var st: c.struct_stat = undefined;
     try std.testing.expect(c.lstat(path_z.ptr, &st) == 0);
-    try std.testing.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+    try std.testing.expectEqual(@as(c.mode_t, 0o600), @as(c.mode_t, @intCast(st.st_mode & 0o777)));
     var got: [16]u8 = undefined;
     try std.testing.expectEqualStrings("private", try readTestFile(path, &got));
 }

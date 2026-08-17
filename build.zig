@@ -259,6 +259,20 @@ pub fn build(b: *std.Build) void {
     }) catch @panic("bad -Dportable-target triple");
     const portable_target = b.resolveTargetQuery(portable_query);
     const portable_cbindings = buildCoreCBindings(b, portable_target, optimize);
+    // Compile the focused test root for every portable target. This analyzes
+    // both the production and fault-injected syscall adapters without trying
+    // to run a cross-compiled test binary on the build host.
+    const atomicwrite_portable_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/util/atomicwrite.zig"),
+        .target = portable_target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    atomicwrite_portable_test_mod.addImport("cbindings", portable_cbindings);
+    const atomicwrite_portable_tests = b.addTest(.{
+        .root_module = atomicwrite_portable_test_mod,
+        .use_lld = portable_target.result.os.tag == .linux,
+    });
     const mux_portable_mod = b.createModule(.{
         .root_source_file = b.path("src/mux_main.zig"),
         .target = portable_target,
@@ -302,6 +316,7 @@ pub fn build(b: *std.Build) void {
         "mux-portable",
         "Build a baseline-CPU static-musl sketerm-mux for scp-to-server",
     );
+    mux_portable_step.dependOn(&atomicwrite_portable_tests.step);
     mux_portable_step.dependOn(&b.addInstallArtifact(mux_portable_exe, .{}).step);
 
     // Mux end-to-end smoke — `zig build smoke-mux` (headless).
@@ -984,6 +999,21 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&test_roots.step);
     test_step.dependOn(&run_tests.step);
+
+    const atomicwrite_tests_mod = b.createModule(.{
+        .root_source_file = b.path("src/util/atomicwrite.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    atomicwrite_tests_mod.addImport("cbindings", core_cbindings_mod);
+    const atomicwrite_tests = b.addTest(.{
+        .root_module = atomicwrite_tests_mod,
+        .use_llvm = test_llvm,
+        .use_lld = if (test_llvm) use_lld else false,
+    });
+    const atomicwrite_test_step = b.step("test-atomicwrite", "Run atomic file replacement tests");
+    atomicwrite_test_step.dependOn(&b.addRunArtifact(atomicwrite_tests).step);
 
     // GTK-free subset — `zig build test-core`. The full `test` step
     // above compiles the GUI, so on a host whose GTK is older than the
