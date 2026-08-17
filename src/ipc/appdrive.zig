@@ -2107,6 +2107,27 @@ pub const App = struct {
         try self.pressKey(win_id, "ctrl+v");
     }
 
+    /// Give a toplevel the window focus, as a real compositor does
+    /// when a new window maps or the user focus-switches. The viewer
+    /// is the compositor brain, so focus policy is its job: the seat
+    /// keyboard enters the target, and the xdg `activated` configure
+    /// state moves with it (GTK's window `is-active`, and everything
+    /// gated on it, follows that state) — including an explicit
+    /// deactivating configure for every other mapped toplevel, which
+    /// nothing else ever rescinds.
+    pub fn focusWindow(self: *App, win_id: u32) Error!void {
+        _ = try self.kbdTarget(win_id);
+        const a = self.allocator;
+        for (self.windows.items) |w| {
+            if (w.popup or w.w <= 0 or w.h <= 0) continue;
+            const bits: u32 = if (w.id == win_id) 1 else 0;
+            var units: std.ArrayList(u8) = .empty;
+            defer units.deinit(a);
+            wlpipe.appendConfigure(&units, a, w.sid, w.w, w.h, bits) catch return Error.OutOfMemory;
+            try self.sendIntents(w.chan, units.items);
+        }
+    }
+
     /// Aim the keyboard at a window (idempotent).
     fn kbdTarget(self: *App, win_id: u32) Error!*Window {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;

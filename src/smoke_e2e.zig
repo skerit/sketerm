@@ -2949,6 +2949,10 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
         }
         return "the browser-action second window never mapped";
     };
+    // GTK `is-active` (the mirror's focused-window signal) follows the
+    // seat keyboard focus, which is viewer policy on this compositor: a
+    // real desktop focuses a newly mapped window, so do the same.
+    app.focusWindow(second_win) catch return "focusing the browser-action second window failed";
     const second_action = waitToolbarExclusive(app, second_win, .orange, .blue, 15_000) orelse
         return "the focused second window did not own the orange action";
     if (waitSplitToolbarAbsent(app, win_id, .blue, 15_000) == null)
@@ -2966,6 +2970,9 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
         return "building the primary-window focus request failed";
     if (roundtrip(allocator, sock, focus_primary)) |r| allocator.free(r) else return "returning focus to the primary window failed";
     const primary_win = app.winById(win_id) orelse return "the primary browser-action window disappeared";
+    // The hub has no click-to-focus: return the seat keyboard too, as
+    // the compositor would when its focused toplevel goes away.
+    app.focusWindow(win_id) catch return "returning keyboard focus to the primary window failed";
     app.clickEx(win_id, @floatFromInt(@divTrunc(primary_win.w * 3, 8)), @floatFromInt(@divTrunc(primary_win.h, 2)), 1, 100, 1) catch
         return "injecting a real focus click into the primary window failed";
     if (waitSplitToolbarExclusive(app, win_id, .blue, true, .orange, 15_000) == null)
@@ -3020,7 +3027,12 @@ fn findToolbarColorRange(app: *appdrive.App, win_id: u32, color: ToolbarColor, l
     if (win.w <= 0 or win.h <= 0) return null;
     const w: usize = @intCast(win.w);
     const h: usize = @intCast(win.h);
-    const limit_y = @min(h, 180);
+    // Deep enough for headerbar + window tab bar + browser notebook
+    // header + toolbar stacked; the fixture page bodies are near-gray
+    // and cannot match any of the color predicates, so overshooting
+    // into content is safe. 180 once cut the toolbar off by a few
+    // pixels and made these probes miss a visibly rendered action.
+    const limit_y = @min(h, 300);
     var y: usize = 0;
     while (y < limit_y) : (y += 1) {
         var x: usize = if (left_half) 0 else w / 2;
@@ -3050,7 +3062,10 @@ fn toolbarColorMatches(pixel: []const u8, color: ToolbarColor) bool {
     const g = pixel[1];
     const r = pixel[2];
     return switch (color) {
-        .blue => b > 180 and b > r +| 80 and b > g +| 40,
+        // Matches the fixture icon's pure blue (0x2060ff) but NOT the
+        // Adwaita selection accent (#3584e4) painted under a selected
+        // tab-sidebar row, which the old looser bounds also matched.
+        .blue => b > 240 and r < 48 and g > 64 and g < 128,
         .orange => r > 180 and g > 50 and g < 170 and b < 80,
         .green => g > 120 and g > r +| 70 and g > b +| 70,
     };
