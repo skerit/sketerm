@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const image_size = @import("../grid/image_size.zig");
 
 /// One `width=` / `height=` value. iTerm2 accepts four spellings and
 /// `auto` is indistinguishable from "not sent" — both mean "derive me
@@ -109,6 +110,23 @@ pub fn decodePayload(allocator: std.mem.Allocator, payload: []const u8) !Decoded
     const png_magic = [_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
     if (decoded.len < 8 or !std.mem.eql(u8, decoded[0..8], &png_magic)) return out;
 
+    // Read the header FIRST: stb allocates width*height*4 itself, so a
+    // dimension check afterwards is already too late. A flat-colour PNG
+    // compresses so well that a payload well under the OSC cap can ask
+    // for gigabytes, and this parse runs inside the session daemon.
+    if (decoded.len > std.math.maxInt(c_int)) return error.PngDecode;
+    var info_w: c_int = 0;
+    var info_h: c_int = 0;
+    var info_ch: c_int = 0;
+    if (c.stbi_info_from_memory(
+        decoded.ptr,
+        @intCast(decoded.len),
+        &info_w,
+        &info_h,
+        &info_ch,
+    ) == 0 or info_w <= 0 or info_h <= 0) return error.PngDecode;
+    const npix = try image_size.byteLen(@intCast(info_w), @intCast(info_h), 4);
+
     // Decode PNG → RGBA via vendored stb_image.
     var w: c_int = 0;
     var h: c_int = 0;
@@ -121,10 +139,16 @@ pub fn decodePayload(allocator: std.mem.Allocator, payload: []const u8) !Decoded
         &channels,
         4,
     );
-    if (pix_ptr == null or w <= 0 or h <= 0) return error.PngDecode;
+    if (pix_ptr == null) return error.PngDecode;
+    if (w != info_w or h != info_h) {
+        c.stbi_image_free(pix_ptr);
+        return error.PngDecode;
+    }
 
-    const npix: usize = @intCast(w * h * 4);
-    const out_rgba = try allocator.alloc(u8, npix);
+    const out_rgba = allocator.alloc(u8, npix) catch |err| {
+        c.stbi_image_free(pix_ptr);
+        return err;
+    };
     @memcpy(out_rgba, pix_ptr[0..npix]);
     c.stbi_image_free(pix_ptr);
 
@@ -222,6 +246,102 @@ fn decodeName(out: *Decoded, b64: []const u8) void {
     if (n == 0 or n > out.name_buf.len) return;
     decoder.decode(out.name_buf[0..n], b64) catch return;
     out.name_len = @intCast(n);
+}
+
+/// A PNG signature, a well-formed IHDR and an EMPTY IDAT. stb's header
+/// scan stops at the first IDAT, so this is enough to exercise the
+/// dimension preflight without an encoder having to produce (or a
+/// decoder having to allocate) the pixels it advertises.
+fn pngHeader(buf: *[45]u8, w: u32, h: u32) []const u8 {
+    buf[0..8].* = .{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+    std.mem.writeInt(u32, buf[8..12], 13, .big);
+    buf[12..16].* = "IHDR".*;
+    std.mem.writeInt(u32, buf[16..20], w, .big);
+    std.mem.writeInt(u32, buf[20..24], h, .big);
+    buf[24] = 8; // bit depth
+    buf[25] = 2; // colour type: truecolour
+    buf[26] = 0; // deflate
+    buf[27] = 0; // adaptive filtering
+    buf[28] = 0; // no interlace
+    std.mem.writeInt(u32, buf[29..33], std.hash.crc.Crc32.hash(buf[12..29]), .big);
+    std.mem.writeInt(u32, buf[33..37], 0, .big);
+    buf[37..41].* = "IDAT".*;
+    std.mem.writeInt(u32, buf[41..45], std.hash.crc.Crc32.hash(buf[37..41]), .big);
+    return buf[0..45];
+}
+
+fn itermPayload(allocator: std.mem.Allocator, png: []const u8) ![]u8 {
+    const enc = std.base64.standard.Encoder;
+    const prefix = "File=inline=1:";
+    const out = try allocator.alloc(u8, prefix.len + enc.calcSize(png.len));
+    @memcpy(out[0..prefix.len], prefix);
+    _ = enc.encode(out[prefix.len..], png);
+    return out;
+}
+
+fn decodeHeaderOnly(w: u32, h: u32) !Decoded {
+    var buf: [45]u8 = undefined;
+    const payload = try itermPayload(std.testing.allocator, pngHeader(&buf, w, h));
+    defer std.testing.allocator.free(payload);
+    return decodePayload(std.testing.allocator, payload);
+}
+
+test "oversized image is rejected before any pixel buffer is allocated" {
+    // One past the axis cap. The distinguishing assertion is the error
+    // IDENTITY: TooLarge can only come from the header preflight, while
+    // an unbounded decoder reaches stb and reports PngDecode instead.
+    try std.testing.expectError(image_size.Error.TooLarge, decodeHeaderOnly(image_size.max_dimension + 1, 1));
+    try std.testing.expectError(image_size.Error.TooLarge, decodeHeaderOnly(1, image_size.max_dimension + 1));
+    // Within both axis caps but over the decoded-byte cap: 8192x8193x4
+    // is 256MB + 32KB.
+    try std.testing.expectError(image_size.Error.TooLarge, decodeHeaderOnly(8192, 8193));
+    // A zero axis is not a size at all.
+    try std.testing.expectError(error.PngDecode, decodeHeaderOnly(0, 8));
+}
+
+test "an image exactly at the cap is not rejected by the preflight" {
+    // Both boundaries pass the size check and fail later, on the absent
+    // pixel data — proof the cap is inclusive and nothing over-rejects.
+    try std.testing.expectError(error.PngDecode, decodeHeaderOnly(image_size.max_dimension, 1));
+    // 8192*8192*4 is exactly max_decoded_bytes.
+    try std.testing.expectError(error.PngDecode, decodeHeaderOnly(8192, 8192));
+}
+
+const PngSink = struct {
+    list: std.ArrayList(u8) = .empty,
+    failed: bool = false,
+
+    fn write(ctx: ?*anyopaque, data: ?*anyopaque, size: c_int) callconv(.c) void {
+        const self: *PngSink = @ptrCast(@alignCast(ctx.?));
+        if (size <= 0) return;
+        const bytes: [*]const u8 = @ptrCast(data.?);
+        self.list.appendSlice(std.testing.allocator, bytes[0..@intCast(size)]) catch {
+            self.failed = true;
+        };
+    }
+};
+
+test "a large but valid image still decodes" {
+    const w = 600;
+    const h = 400;
+    const src = try std.testing.allocator.alloc(u8, w * h * 4);
+    defer std.testing.allocator.free(src);
+    for (src, 0..) |*b, i| b.* = if (i % 4 == 3) 0xFF else @truncate(i / 4);
+
+    var sink = PngSink{};
+    defer sink.list.deinit(std.testing.allocator);
+    try std.testing.expect(c.stbi_write_png_to_func(&PngSink.write, &sink, w, h, 4, src.ptr, w * 4) != 0);
+    try std.testing.expect(!sink.failed);
+
+    const payload = try itermPayload(std.testing.allocator, sink.list.items);
+    defer std.testing.allocator.free(payload);
+    const out = try decodePayload(std.testing.allocator, payload);
+    defer std.testing.allocator.free(out.rgba);
+    try std.testing.expectEqual(Format.png, out.format);
+    try std.testing.expectEqual(@as(u32, w), out.width);
+    try std.testing.expectEqual(@as(u32, h), out.height);
+    try std.testing.expectEqual(@as(usize, w * h * 4), out.rgba.len);
+    try std.testing.expectEqualSlices(u8, src, out.rgba);
 }
 
 test "rejects non-PNG payload" {
