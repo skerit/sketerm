@@ -863,8 +863,8 @@ pub const Screen = struct {
     pub fn imageRowForAnchor(self: *Screen, anchor_id: u64) ImageRow {
         if (anchor_id == 0) return .offscreen;
         const b = self.buf();
-        const sb_count = self.scrollback.items.len;
-        const view_off: usize = @min(self.view_offset, sb_count);
+        const sb_count = self.scrollbackCount();
+        const view_off: u32 = @min(self.view_offset, sb_count);
 
         // Current buffer: display row = buffer index + view_off.
         for (b, 0..) |ln, i| {
@@ -877,10 +877,10 @@ pub const Screen = struct {
         // rows (GL clips the part above). Bounded by `rows`, so the scan
         // stays cheap regardless of ring size.
         if (sb_count > 0) {
-            const win_lo: usize = (sb_count -| view_off) -| self.rows;
-            var i: usize = win_lo;
+            const win_lo: u32 = (sb_count -| view_off) -| self.rows;
+            var i: u32 = win_lo;
             while (i < sb_count) : (i += 1) {
-                if (self.scrollback.items[i].id == anchor_id) {
+                if (self.scrollbackLine(i).id == anchor_id) {
                     return .{ .visible = @as(i32, @intCast(i)) - @as(i32, @intCast(sb_count)) + @as(i32, @intCast(view_off)) };
                 }
             }
@@ -890,7 +890,7 @@ pub const Screen = struct {
         // in birth order, so anything older than the oldest surviving
         // line has been evicted; otherwise it's simply scrolled away.
         const oldest: u64 = if (sb_count > 0)
-            self.scrollback.items[0].id
+            self.scrollbackLine(0).id
         else if (b.len > 0)
             b[0].id
         else
@@ -8299,50 +8299,76 @@ test "OSC 21 query + set" {
     try std.testing.expectEqualStrings("\x1b]21;background=rgb:0000/0000/0000\x1b\\", OscCapture.got());
 }
 
-test "imageRowForAnchor tracks a line through scroll, scrollback and eviction" {
+fn expectImageAnchorVisible(screen: *Screen, anchor_id: u64, expected_row: i32) !void {
+    switch (screen.imageRowForAnchor(anchor_id)) {
+        .visible => |row| try std.testing.expectEqual(expected_row, row),
+        else => return error.NotVisible,
+    }
+}
+
+test "imageRowForAnchor tracks multiple anchors through a wrapped ring" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
-    var s = try Screen.init(std.testing.allocator, &pool, 8, 5);
+    var s = try Screen.init(std.testing.allocator, &pool, 8, 3);
     defer s.deinit();
-    try s.setScrollbackCapacity(50);
+    try s.setScrollbackCapacity(4);
 
-    // Anchor to the line currently at row 2 (id assigned at init).
-    const id = s.buf()[2].id;
-    try std.testing.expect(id != 0);
+    const older = s.buf()[1].id;
+    const newer = s.buf()[2].id;
+    try expectImageAnchorVisible(s, older, 1);
+    try expectImageAnchorVisible(s, newer, 2);
 
-    const Row = struct {
-        fn expectVisible(scr: *Screen, anchor: u64, want: i32) !void {
-            switch (scr.imageRowForAnchor(anchor)) {
-                .visible => |r| try std.testing.expectEqual(want, r),
-                else => return error.NotVisible,
-            }
-        }
-    };
+    // Five scrolls rotate the full ring while both anchors survive in
+    // logical slots 0 and 1, which are physical slots 1 and 2.
+    for (0..5) |_| s.scrollUp(1);
+    try std.testing.expect(s.scrollback_head != 0);
+    try std.testing.expectEqual(older, s.scrollbackLine(0).id);
+    try std.testing.expectEqual(newer, s.scrollbackLine(1).id);
+    try std.testing.expectEqual(Screen.ImageRow.offscreen, s.imageRowForAnchor(older));
+    try expectImageAnchorVisible(s, newer, -3);
 
-    // While the line stays in the active buffer it tracks up row by row.
-    // (scrollUp(n) caps n at the region height, so scroll one line at a
-    // time — exactly how lineFeed drives it.)
-    try Row.expectVisible(s, id, 2);
-    s.scrollUp(1);
-    try Row.expectVisible(s, id, 1);
-    s.scrollUp(1);
-    try Row.expectVisible(s, id, 0);
-
-    // Scroll it deep into scrollback (well past one screen height). It
-    // landed at scrollback index 2 (pushed 3rd). With no view offset it
-    // is off-screen but still alive.
-    for (0..15) |_| s.scrollUp(1);
-    try std.testing.expectEqual(Screen.ImageRow.offscreen, s.imageRowForAnchor(id));
-
-    // Offsetting the view to bring index 2 to the top row shows it again.
-    const sb_count: u32 = @intCast(s.scrollback.items.len);
-    s.view_offset = sb_count - 2;
-    try Row.expectVisible(s, id, 0);
+    s.view_offset = s.scrollbackCount();
+    try expectImageAnchorVisible(s, older, 0);
+    try expectImageAnchorVisible(s, newer, 1);
     s.view_offset = 0;
 
-    // Push past the 50-line ring so the anchor line is evicted entirely.
-    for (0..60) |_| s.scrollUp(1);
-    try std.testing.expectEqual(Screen.ImageRow.evicted, s.imageRowForAnchor(id));
+    // One more push evicts only the older anchor. The newer anchor is
+    // offscreen, not evicted, until the following push removes it too.
+    s.scrollUp(1);
+    try std.testing.expectEqual(Screen.ImageRow.evicted, s.imageRowForAnchor(older));
+    try std.testing.expectEqual(Screen.ImageRow.offscreen, s.imageRowForAnchor(newer));
+    s.view_offset = s.scrollbackCount();
+    try expectImageAnchorVisible(s, newer, 0);
+    s.scrollUp(1);
+    try std.testing.expectEqual(Screen.ImageRow.evicted, s.imageRowForAnchor(newer));
+}
+
+test "imageRowForAnchor preserves surviving anchors across capacity shrink" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 8, 2);
+    defer s.deinit();
+    try s.setScrollbackCapacity(5);
+
+    for (0..7) |_| s.scrollUp(1);
+    try std.testing.expect(s.scrollback_head != 0);
+    const dropped = s.scrollbackLine(0).id;
+    const surviving = s.scrollbackLine(2).id;
+    s.view_offset = 3;
+    try expectImageAnchorVisible(s, dropped, -2);
+    try expectImageAnchorVisible(s, surviving, 0);
+
+    try s.setScrollbackCapacity(3);
+    try std.testing.expectEqual(Screen.ImageRow.evicted, s.imageRowForAnchor(dropped));
+    try expectImageAnchorVisible(s, surviving, 0);
+    s.view_offset = 0;
+    try std.testing.expectEqual(Screen.ImageRow.offscreen, s.imageRowForAnchor(surviving));
+
+    const active_anchor = s.buf()[0].id;
+    try s.setScrollbackCapacity(0);
+    try std.testing.expectEqual(@as(u32, 0), s.scrollbackCount());
+    try std.testing.expectEqual(Screen.ImageRow.evicted, s.imageRowForAnchor(surviving));
+    try expectImageAnchorVisible(s, active_anchor, 0);
 }
 
 test "emitImage stamps an anchor id from the placement row" {
