@@ -18512,3 +18512,71 @@ mux-portable, and dist/test-mux-build.sh all green. Known reds on this
 host, unrelated and pre-existing (identical on two-day-old commits):
 the browser-action GUI stage (varying failures around the extension
 popup/split) and smoke-mcp's panel stage.
+
+## 2026-08-16: continuous shader animation suspends graphics offload
+
+A second live terminal crash confirmed that the July frame-clock
+mitigation reduced KWin's Wayland callback leak but did not eliminate
+it when continuous animation was requested. The process ran for
+68,121.86 seconds with `custom_shader_animation = true`; its core held
+15,728,642 libwayland client object slots (`0xf00002`), a zero free
+list, and no display or protocol error. `wl_surface_frame` therefore
+returned NULL at the object-table cap and GTK 4.22.4 dereferenced it in
+`gdk_wayland_subsurface_request_frame`. The average 231 leaked ids per
+second matches one frame callback per offloaded pane per frame.
+
+Window presentation policy now disables graphics offload across the
+whole toplevel while any pane owns a continuous frame-clock tick,
+including named shader presets and Kitty image playback. New, restored,
+and moved panes enter disabled until that policy is applied; offload is
+re-enabled from an idle only after GTK removes the final tick callback.
+Static panes retain the dmabuf scanout path when no sibling animates,
+avoiding the 4K offload performance regression during ordinary use.
+
+## 2026-08-17: durable transfer retries, cancellation, and error kinds
+
+A remote permission failure ("Read ... on darkshire: ACCESS") exposed
+that the Files copy path retried permanent errors forever with no
+visible way to stop. Every fs_reply error now carries a kind: an errno
+classifier stamps timeouts/resets/unreachable-network tags as
+"transport"/"unreachable" and everything else (ACCES, NOENT, NOSPC)
+as "permanent". Only transport kinds earn automatic retries -- three
+attempts, five seconds apart, one budget shared by the daemon-owned
+and client-mediated routes, surviving daemon disconnects and process
+restarts. Permanent failures fail once; manual Retry is never gated
+on the kind. Waiting retries show a countdown with a working Cancel,
+the Transfer Center gained a View menu entry and an empty state, and
+raw errno tags render as phrases ("permission denied").
+
+Cancellation is durable and source-safe: cross-host moves journal
+phases (destination_staged, rename_planned, copied, deleting) under
+a control lock; cancel requests persist as sidecars, are elected
+nonblockingly in the daemon poll loop, and either restore quarantined
+sources or, past the deleting boundary, finish cleanup. Cancelling a
+scheduled retry arms the sidecar before the job can restart, so a
+fast retry cannot race the cancellation into a completed install.
+Moves and no-replace copies require the durable_copy_v2 welcome
+capability; older daemons defer the job with a restart notice.
+
+In-helper reconnect stays: a dropped link resumes at the exact byte
+offset with per-drop backoff (the multi-GB-over-home-link property),
+and only reconnect exhaustion charges a transport attempt. Verified
+digests cache per run keyed on stat identity including ctime; our own
+quarantine/install renames restamp the cached ctime from a fresh stat
+instead of widening the key, so renames stay rehash-free while an
+in-place edit with a restored mtime still forces a rehash.
+
+## 2026-08-17: smoke-e2e drags settle before release; reorder probes offsets
+
+The tree-sidebar reorder stage failed on this host because appdrive's
+interpolated drag could finish moving before GTK's ~8px drag threshold
+fired, leaving the Wayland dnd session with zero or one motion events
+-- no drop target ever accepted. Drags now jiggle 1px four times at the
+destination before releasing. The reorder drop also aimed 2px under the
+selection chip, which sits ~3px above the row widget's input box, so
+the drop hit the list background whose make-root target is a no-op for
+a root tab. The stage now probes row-local offsets like the nest
+gesture does and verifies structure between attempts. Both fixes are
+rig-layer; moveNextTo, zoneAt, and the row drop handlers were correct.
+The run now proceeds to the browser-action stage, the separately
+documented pre-existing known-red on this host.
