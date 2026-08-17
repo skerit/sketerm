@@ -194,9 +194,11 @@ DEB_BUILD_DEPS=(
 # Debian releases do not consistently provide the pinned Zig toolchain, so
 # --deps installs only distro-provided prerequisites. check_zig() gives the
 # exact requirement instead of asking apt for an unavailable package/version.
-# The daemon links libc only, so a mux-only build needs no -dev packages
-# beyond a compiler driver and tic for the terminfo entry.
-DEB_BUILD_DEPS_MUX=(build-essential ncurses-bin)
+# The shipped daemon links libc only, but both daemon builds translate the
+# core header containing fribidi.h. pkg-config and libfribidi-dev are therefore
+# build-time requirements even though the unused native link is dropped and
+# mux-portable deliberately does not link fribidi.
+DEB_BUILD_DEPS_MUX=(build-essential pkg-config ncurses-bin libfribidi-dev)
 
 install_deb_deps() {
     local -n list=$1

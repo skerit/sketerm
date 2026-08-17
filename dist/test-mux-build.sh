@@ -42,5 +42,9 @@ if grep -Eq 'gtk4|libadwaita|glib-2.0|gio|freetype|harfbuzz|epoxy|fontconfig|vpx
     printf 'FAIL: mux build probed GUI dependencies\n' >&2
     exit 1
 fi
+if ! grep -q 'fribidi' "$work/pkg-config.log"; then
+    printf 'FAIL: clean mux builds did not probe fribidi build headers\n' >&2
+    exit 1
+fi
 
 printf 'PASS: mux builds avoid GUI dependency probes\n'

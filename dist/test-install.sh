@@ -13,6 +13,11 @@ real_dpkg_deb=$(command -v dpkg-deb || true)
 
 cat > "$fakebin/pkg-config" <<'EOF'
 #!/usr/bin/env bash
+if [ -n "${INSTALL_TEST_PKG_CONFIG_LOG:-}" ]; then
+    printf '<pkg-config>' >> "$INSTALL_TEST_PKG_CONFIG_LOG"
+    printf ' <%s>' "$@" >> "$INSTALL_TEST_PKG_CONFIG_LOG"
+    printf '\n' >> "$INSTALL_TEST_PKG_CONFIG_LOG"
+fi
 if [ "${INSTALL_TEST_PKG_CONFIG_FAIL:-0}" -eq 1 ] \
         && [ ! -e "${INSTALL_TEST_DEPS_READY:-/no/such/file}" ]; then
     printf 'missing development package\n' >&2
@@ -75,7 +80,7 @@ run_installer() {
 INSTALL_TEST_ARGV="$work/actual-argv"
 INSTALL_TEST_CWD="$work/actual-cwd"
 
-run_installer "$work/help.out" --help
+INSTALL_TEST_PKG_CONFIG_FAIL=1 run_installer "$work/help.out" --help
 [[ "$(<"$work/help.out")" == *"./install.sh --no-install"* ]] \
     || fail "help omitted documented installer flags"
 [[ "$(<"$work/help.out")" != *"set -euo pipefail"* ]] \
@@ -191,6 +196,10 @@ cat > "$fakebin/zig" <<'EOF'
 if [ "${1:-}" = version ]; then
     printf '%s\n' "${INSTALL_TEST_ZIG_VERSION:-0.16.0}"
     exit 0
+fi
+if [ "${INSTALL_TEST_ZIG_PROBE_FRIBIDI:-0}" -eq 1 ] \
+        && [ "${1:-}" = build ]; then
+    pkg-config --cflags-only-I fribidi >/dev/null
 fi
 printf '<call>' >> "$INSTALL_TEST_ZIG_LOG"
 printf ' <%s>' "$@" >> "$INSTALL_TEST_ZIG_LOG"
@@ -341,6 +350,40 @@ INSTALL_TEST_FORBIDDEN="$work/forbidden.log"
 INSTALL_TEST_APT_LOG="$work/apt.log"
 INSTALL_TEST_DEPS_READY="$work/deps-ready"
 INSTALL_TEST_CONTROL_LOG="$work/control"
+
+rm -f "$INSTALL_TEST_DEPS_READY"
+: > "$INSTALL_TEST_APT_LOG"
+: > "$work/pkg-config.log"
+BASH_ENV="$work/no-makepkg.bash" \
+    PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    INSTALL_TEST_PKG_CONFIG_FAIL=1 \
+    INSTALL_TEST_PKG_CONFIG_LOG="$work/pkg-config.log" \
+    INSTALL_TEST_ZIG_PROBE_FRIBIDI=1 \
+    INSTALL_TEST_DEPS_MISSING=1 \
+    INSTALL_TEST_DEPS_READY="$INSTALL_TEST_DEPS_READY" \
+    INSTALL_TEST_APT_LOG="$INSTALL_TEST_APT_LOG" \
+    INSTALL_TEST_ALLOW_SUDO=1 \
+    INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+    INSTALL_TEST_DEB_LOG="$INSTALL_TEST_DEB_LOG" \
+    INSTALL_TEST_CONTROL_LOG="$INSTALL_TEST_CONTROL_LOG" \
+    INSTALL_TEST_REAL_DPKG_DEB="$real_dpkg_deb" \
+    INSTALL_TEST_FORBIDDEN="$INSTALL_TEST_FORBIDDEN" \
+    "$fixture/dist/install.sh" --mux-only --deps --no-install \
+    > "$work/debian-mux-deps.out" 2>&1
+printf '%s\n' \
+    '<apt> <update>' \
+    '<apt> <install> <-y> <build-essential> <pkg-config> <ncurses-bin> <libfribidi-dev>' \
+    > "$work/expected-mux-apt.log"
+cmp -s "$work/expected-mux-apt.log" "$INSTALL_TEST_APT_LOG" \
+    || fail "--mux-only --deps package list or apt order did not match"
+printf '%s\n' \
+    '<pkg-config> <--cflags-only-I> <fribidi>' \
+    '<pkg-config> <--cflags-only-I> <fribidi>' \
+    > "$work/expected-mux-pkg-config.log"
+cmp -s "$work/expected-mux-pkg-config.log" "$work/pkg-config.log" \
+    || fail "mux builds did not probe fribidi cleanly after dependency installation"
+
 BASH_ENV="$work/no-makepkg.bash" \
     PATH="$fakebin:$PATH" \
     SKETERM_TIC="$fakebin/tic" \
