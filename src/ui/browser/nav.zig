@@ -587,6 +587,11 @@ pub fn syncPathEntry(self: *BrowserView, tab: *BTab) void {
 }
 
 pub fn setStatus(self: *BrowserView, msg: []const u8) void {
+    // The guard belongs with the widget access, not with each caller:
+    // teardown-time paths (savePlaces flushed from `deinit`, which runs
+    // with `widgets_dead` already set) report failures through here, and
+    // the label is finalized by then.
+    if (self.widgets_dead) return;
     var buf: [256:0]u8 = undefined;
     const n = @min(msg.len, buf.len - 1);
     @memcpy(buf[0..n], msg[0..n]);
@@ -1637,4 +1642,18 @@ test "capture forwarding leaves bubble browser chords to the browser" {
     try std.testing.expect(isTypeaheadKey(c.GDK_KEY_a, 0));
     try std.testing.expect(isTypeaheadKey(c.GDK_KEY_A, c.GDK_SHIFT_MASK));
     try std.testing.expect(!isTypeaheadKey(c.GDK_KEY_a, c.GDK_CONTROL_MASK));
+}
+
+test "a status write after teardown never touches the finalized label" {
+    // The label is destroyed with the widget tree, so the only honest
+    // stand-in here is a pointer that must not be dereferenced: the
+    // test reaching its end IS the assertion, and removing the guard
+    // faults instead of passing. `savePlaces` reports its failures
+    // through these two, and `BrowserView.deinit` flushes a pending
+    // sidebar write with `widgets_dead` already set.
+    var view = BrowserView{ .allocator = std.testing.allocator, .pane = undefined };
+    view.status_label = @ptrFromInt(0x8);
+    view.widgets_dead = true;
+    view.setStatus("places changed in this session but could not be serialized");
+    view.setStatusFmt("could not be saved ({s})", .{"AccessDenied"});
 }
