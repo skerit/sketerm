@@ -33,7 +33,9 @@
 //!     that replaces the whole array.
 //!
 //! `--utf8` makes it negotiate `positionEncoding: utf-8`, which is how
-//! the test rig checks both encodings against the same document.
+//! the test rig checks both encodings against the same document, and
+//! `--completion-delay-ms=<n>` gives completion the round-trip latency
+//! a real server has.
 //!
 //! ## The didOpen report
 //!
@@ -61,6 +63,12 @@ var range_only = false;
 /// editor has not opened, and a `create` file operation — the three
 /// outcomes a client's WorkspaceEdit applier has to tell apart.
 var rename_multi = false;
+/// `--completion-delay-ms=<n>`: sit on every `textDocument/completion`
+/// for that long before answering. Real servers take 200ms-2s on a big
+/// translation unit, and that latency is exactly the window a client's
+/// "accept the visible list" path has to survive — a rig that answers
+/// in a microsecond can never enter it.
+var completion_delay_ms: u32 = 0;
 var alloc: std.mem.Allocator = undefined;
 /// The packed semantic-token array we last sent, and the id that names
 /// it — what a `full/delta` request quotes back.
@@ -77,6 +85,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.eql(u8, s, "--utf8")) utf8_mode = true;
         if (std.mem.eql(u8, s, "--range-only")) range_only = true;
         if (std.mem.eql(u8, s, "--rename-multi")) rename_multi = true;
+        const delay_flag = "--completion-delay-ms=";
+        if (std.mem.startsWith(u8, s, delay_flag))
+            completion_delay_ms = std.fmt.parseInt(u32, s[delay_flag.len..], 10) catch 0;
     }
 
     var reader = rpc.Reader{};
@@ -123,6 +134,7 @@ fn handle(body: []const u8) bool {
     } else if (std.mem.eql(u8, env.method, "shutdown")) {
         replyRaw(id, "null");
     } else if (std.mem.eql(u8, env.method, "textDocument/completion")) {
+        if (completion_delay_ms > 0) _ = c.usleep(completion_delay_ms * 1000);
         replyRaw(id, COMPLETION_RESULT);
     } else if (std.mem.eql(u8, env.method, "completionItem/resolve")) {
         replyResolve(id, env.params);

@@ -153,6 +153,25 @@ fn writeFile(path: [*:0]const u8, bytes: []const u8) bool {
     return c.fwrite(bytes.ptr, 1, bytes.len, f) == bytes.len;
 }
 
+/// Read a whole (small) file. Caller frees.
+fn readFile(allocator: std.mem.Allocator, path: [*:0]const u8) ?[]u8 {
+    const f = c.fopen(path, "rb") orelse return null;
+    defer _ = c.fclose(f);
+    var out: std.ArrayList(u8) = .empty;
+    while (true) {
+        var buf: [4096]u8 = undefined;
+        const n = c.fread(&buf, 1, buf.len, f);
+        if (n == 0) break;
+        out.appendSlice(allocator, buf[0..n]) catch break;
+    }
+    return out.toOwnedSlice(allocator) catch null;
+}
+
+/// Trailing text of `s` with whitespace and newlines removed from the end.
+fn trimmedTail(s: []const u8) []const u8 {
+    return std.mem.trimEnd(u8, s, " \t\r\n");
+}
+
 /// The document + config for whichever server we found.
 const Plan = struct {
     /// Registry name for the `[lsp.<name>]` section.
@@ -177,6 +196,10 @@ const Plan = struct {
     marker: []const u8,
     marker_body: []const u8,
     body: []const u8,
+    /// One more character typed while the completion popup is open,
+    /// for the accept-during-the-debounce race. It must keep the word
+    /// being completed a word (the list is NOT filtered locally).
+    race_extra: []const u8 = "x",
     /// Text to type after Ctrl+Space is pressed at the end of the file.
     real_server: bool,
 };
@@ -342,7 +365,13 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
     return .{
         .name = "stub",
         .command = stub_path,
-        .args = if (want.is("stub-utf8")) "--utf8" else "",
+        // The completion delay is what makes the accept-during-the-
+        // debounce race deterministic instead of a coin flip against
+        // an instant answer.
+        .args = if (want.is("stub-utf8"))
+            "--utf8 --completion-delay-ms=800"
+        else
+            "--completion-delay-ms=800",
         .languages = "zig",
         .root_files = "build.zig",
         .file = "main.zig",
@@ -350,6 +379,7 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
         .marker_body = "// workspace root marker\n",
         .body = ZIG_BODY,
         .completion_prefix = "stub",
+        .race_extra = "A",
         .signature_call = " stubCall(",
         .real_server = false,
     };
@@ -914,6 +944,80 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     if (changed == 0) return fail("accepting a completion changed nothing on screen", .{});
     savePng(app, win_id, shot("completion-accepted.png"));
     say("PASS completion accepted ({d} pixels changed) -> zig-out/smoke-lsp-gui{s}-completion-accepted.png", .{ changed, g_leg });
+
+    // ── 4a. accept DURING the re-request debounce ─────────────────
+    //
+    // The rhythm every user has: type a prefix, the list appears, type
+    // one more letter, hit Enter at once. By then the caret handler has
+    // invalidated the list and armed a 120ms re-request, and the server
+    // (delayed on purpose here, like a real one on a big TU) has not
+    // answered it. That is the state an accept has to work in, and
+    // pixels cannot tell "inserted the completion" from "inserted
+    // nothing" — so the document is saved and read back from disk.
+    {
+        app.pressKey(win_id, "ctrl+End") catch {};
+        pumpFor(app, 300);
+        app.typeText(win_id, plan.completion_prefix) catch {};
+        pumpFor(app, 600);
+        const popups_before_race = popupCount(app);
+        app.pressKey(win_id, "ctrl+space") catch {};
+        var race_ok = false;
+        spent = 0;
+        while (spent < 20_000) : (spent += 200) {
+            pumpFor(app, 200);
+            if (popupCount(app) > popups_before_race) {
+                race_ok = true;
+                break;
+            }
+        }
+        if (!race_ok) return fail("Ctrl+Space opened no completion popup for the race", .{});
+        // Same rule as the stage above: the list must still be there a
+        // moment later. A popup count that flickered up for one poll is
+        // not a shown completion list, and the race below would then be
+        // measuring a Return that simply fell through to the document.
+        pumpFor(app, 1200);
+        if (popupCount(app) <= popups_before_race)
+            return fail("the race completion popup did not stay open", .{});
+
+        // No pump between these two: the whole point is that Enter
+        // arrives before the re-request has been answered.
+        app.typeText(win_id, plan.race_extra) catch {};
+        app.pressKey(win_id, "Return") catch {};
+        pumpFor(app, 2500);
+        if (popupCount(app) > popups_before_race)
+            return fail("the race accept left the completion popup open", .{});
+        savePng(app, win_id, shot("completion-race.png"));
+
+        var typed_buf: [64]u8 = undefined;
+        const typed = std.fmt.bufPrint(&typed_buf, "{s}{s}", .{
+            std.mem.trim(u8, plan.completion_prefix, " \t"),
+            plan.race_extra,
+        }) catch return fail("race text", .{});
+        app.pressKey(win_id, "ctrl+s") catch {};
+        var accepted = false;
+        var saw: []u8 = &.{};
+        spent = 0;
+        while (spent < 15_000) : (spent += 250) {
+            pumpFor(app, 250);
+            const content = readFile(allocator, doc_path.ptr) orelse continue;
+            defer allocator.free(content);
+            const tail = trimmedTail(content);
+            // The exact label is the server's business (and the row
+            // selection carries over from the previous list); what
+            // must be true is that the raw characters we typed are no
+            // longer sitting there unreplaced.
+            if (std.mem.endsWith(u8, tail, typed)) continue; // nothing accepted (yet)
+            accepted = true;
+            if (saw.len > 0) allocator.free(saw);
+            const line_start = if (std.mem.lastIndexOfScalar(u8, tail, '\n')) |nl| nl + 1 else 0;
+            saw = allocator.dupe(u8, tail[line_start..]) catch &.{};
+            break;
+        }
+        defer if (saw.len > 0) allocator.free(saw);
+        if (!accepted)
+            return fail("accepting a completion one keystroke after the list arrived inserted nothing", .{});
+        say("PASS completion accepted mid-debounce (document tail: …{s})", .{saw});
+    }
 
     // ── 4b. signature help ────────────────────────────────────────
     //

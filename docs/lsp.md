@@ -202,7 +202,14 @@ the answer carries it back. A response whose revision no longer matches
 the document is **dropped** — this is the same discipline
 `editor/syntax.zig` uses for parse results. Concretely:
 
-* completion, hover: dropped (their ranges describe text that is gone);
+* completion, hover: dropped (their ranges describe text that is gone).
+  ACCEPTING from an already-shown completion list is deliberately not
+  gated the same way: the popup stays up across a keystroke on purpose
+  (it re-requests on a 120 ms debounce), so the accept falls back from
+  the server's `textEdit` offsets to the client word scan — word start
+  plus live caret — rather than inserting nothing. A
+  `completionItem/resolve` answer is correlated to its list and item and
+  carries documentation TEXT, so it too is revision-independent;
 * formatting: refused with "Document changed while formatting";
 * diagnostics: a numeric publication is accepted only for the latest
   sent document version. Its ranges are decoded against that version's

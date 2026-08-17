@@ -920,13 +920,51 @@ const CompletionStamp = struct {
         return self.tab_id == tab_id and self.revision == revision and self.generation == generation;
     }
 
-    fn matchesResolve(self: CompletionStamp, req: session.Request, generation: u64, resolve_id: i64) bool {
+    /// A `completionItem/resolve` answer belongs to THIS list's item.
+    ///
+    /// Deliberately NOT gated on the manager's live generation: every
+    /// keystroke bumps that while the popup stays open (the caret
+    /// handler re-requests on a debounce), and documentation text has
+    /// no offsets to go stale. What must hold is identity — same tab,
+    /// same list, same in-flight request.
+    fn matchesResolve(self: CompletionStamp, req: session.Request, resolve_id: i64) bool {
         const ref = unpackCompletionRef(req.aux);
-        return self.matches(req.tab_id, req.revision, generation) and
+        return self.tab_id == req.tab_id and self.revision == req.revision and
             ref.generation == @as(u32, @truncate(self.generation)) and
             resolve_id == req.id;
     }
 };
+
+/// Byte range an accepted completion replaces.
+const AcceptRange = struct { start: usize, end: usize };
+
+/// Where an accepted item's text goes, or null when the list belongs to
+/// another tab entirely.
+///
+/// Only a server-supplied `textEdit` is measured against the revision
+/// the list was computed for, so only that branch is gated on it. The
+/// client-side scan is not: `range_start` is a WORD start, which typing
+/// more of the same word cannot move, and the end is the live caret.
+/// A moved revision therefore downgrades to the scan instead of
+/// refusing — refusing is what made "type a letter, press Enter within
+/// the completion debounce" insert nothing at all and say nothing.
+fn completionAcceptRange(
+    stamp: CompletionStamp,
+    range_start: usize,
+    item: Item,
+    tab_id: u64,
+    revision: u64,
+    caret: usize,
+    rope_len: usize,
+) ?AcceptRange {
+    if (stamp.tab_id != tab_id) return null;
+    const server_offsets = item.has_edit and stamp.revision == revision;
+    var start = if (server_offsets) item.edit_start else range_start;
+    var end = if (server_offsets) @max(item.edit_end, caret) else caret;
+    start = @min(start, rope_len);
+    end = @min(@max(end, start), rope_len);
+    return .{ .start = start, .end = end };
+}
 
 const ListPopup = struct {
     mgr: *Manager,
@@ -2089,14 +2127,12 @@ pub const Manager = struct {
         const ref = unpackCompletionRef(req.aux);
         const idx = ref.index;
         if (idx >= self.list.items.items.len) return;
-        const tab = self.view.findTabByIdPublic(req.tab_id) orelse return;
+        // No tab lookup and no document-revision gate: the payload is
+        // documentation TEXT, not offsets, and the popup is
+        // deliberately still open over a document the user has typed
+        // into. `matchesResolve` carries the identity that matters.
         const item = &self.list.items.items[idx];
-        if (!self.list.completionStamp().matchesResolve(
-            req,
-            self.completion_generation,
-            item.resolve_id,
-        )) return;
-        if (tab.doc.revision != req.revision) return;
+        if (!self.list.completionStamp().matchesResolve(req, item.resolve_id)) return;
         item.resolve_id = 0;
         const doc_text = hoverText(self.alloc, env.result) catch return;
         if (doc_text.len == 0) {
@@ -2115,7 +2151,10 @@ pub const Manager = struct {
         const item = &self.list.items.items[idx];
         if (item.doc.len > 0 or item.raw.len == 0) return;
         const tab = self.view.activeTab() orelse return;
-        if (!self.list.completionStamp().matches(tab.id, tab.doc.revision, self.completion_generation)) return;
+        // Same tab is the whole precondition: a resolve fetches
+        // documentation for a LIST ITEM, and the reply is correlated
+        // back by `matchesResolve` rather than by the live revision.
+        if (self.list.tab_id != tab.id) return;
         const st = tab.lsp orelse return;
         const cn = st.conn orelse return;
         if (!cn.sess.caps.completion_resolve) return;
@@ -2137,15 +2176,19 @@ pub const Manager = struct {
             return;
         }
         const tab = self.view.activeTab() orelse return self.closePopup();
-        if (!self.list.completionStamp().matches(tab.id, tab.doc.revision, self.completion_generation))
-            return self.closePopup();
         const idx = self.list.shown.items[self.list.sel];
         const item = self.list.items.items[idx];
-        const caret = tab.sels.primary().head;
-        var start = if (item.has_edit) item.edit_start else self.list.range_start;
-        var end = if (item.has_edit) @max(item.edit_end, caret) else caret;
-        start = @min(start, tab.doc.rope.len());
-        end = @min(@max(end, start), tab.doc.rope.len());
+        const range = completionAcceptRange(
+            self.list.completionStamp(),
+            self.list.range_start,
+            item,
+            tab.id,
+            tab.doc.revision,
+            tab.sels.primary().head,
+            tab.doc.rope.len(),
+        ) orelse return self.closePopup();
+        const start = range.start;
+        const end = range.end;
         const text = self.alloc.dupe(u8, item.payload) catch return;
         defer self.alloc.free(text);
         self.closePopup();
@@ -4624,13 +4667,65 @@ fn symbolKindName(v: ?std.json.Value) []const u8 {
     };
 }
 
-test "lsp completion: edit then accept before debounce rejects stale ranges" {
-    const offered = CompletionStamp{ .tab_id = 3, .revision = 11, .generation = 7 };
-    try std.testing.expect(!offered.matches(3, 12, 8));
+/// `std.deb` + the completion list, before the extra `u` is typed.
+const accept_test_stamp = CompletionStamp{ .tab_id = 3, .revision = 11, .generation = 7 };
+
+fn plainItem() Item {
+    return .{ .label = @constCast("debug"), .detail = &.{}, .payload = @constCast("debug") };
+}
+
+test "lsp completion: a keystroke before Enter still inserts, from the word start" {
+    // The user typed `std.deb`, the list arrived (revision 11, word
+    // start 4), then typed `u` — revision 12, caret 8 — and pressed
+    // Enter inside the 120ms re-request debounce.
+    const r = completionAcceptRange(accept_test_stamp, 4, plainItem(), 3, 12, 8, 64) orelse
+        return error.AcceptWasRefused;
+    try std.testing.expectEqual(@as(usize, 4), r.start);
+    try std.testing.expectEqual(@as(usize, 8), r.end);
+}
+
+test "lsp completion: a server textEdit is used only at its own revision" {
+    var item = plainItem();
+    item.has_edit = true;
+    item.edit_start = 2;
+    item.edit_end = 7;
+
+    // Same revision: the server's range is authoritative, extended to
+    // the live caret.
+    const fresh = completionAcceptRange(accept_test_stamp, 4, item, 3, 11, 7, 64) orelse
+        return error.AcceptWasRefused;
+    try std.testing.expectEqual(@as(usize, 2), fresh.start);
+    try std.testing.expectEqual(@as(usize, 7), fresh.end);
+
+    // One keystroke later those offsets describe text that moved, so
+    // the client word scan answers instead — and the accept still
+    // happens rather than silently doing nothing.
+    const moved = completionAcceptRange(accept_test_stamp, 4, item, 3, 12, 8, 64) orelse
+        return error.AcceptWasRefused;
+    try std.testing.expectEqual(@as(usize, 4), moved.start);
+    try std.testing.expectEqual(@as(usize, 8), moved.end);
+}
+
+test "lsp completion: offsets are clamped to the document" {
+    var item = plainItem();
+    item.has_edit = true;
+    item.edit_start = 90;
+    item.edit_end = 120;
+    const r = completionAcceptRange(accept_test_stamp, 4, item, 3, 11, 8, 64) orelse
+        return error.AcceptWasRefused;
+    try std.testing.expectEqual(@as(usize, 64), r.start);
+    try std.testing.expectEqual(@as(usize, 64), r.end);
+}
+
+test "lsp completion: another tab (or a closed list) cannot accept" {
+    try std.testing.expect(completionAcceptRange(accept_test_stamp, 4, plainItem(), 9, 11, 8, 64) == null);
+    // closePopup() zeroes the stamp; no live tab has id 0.
+    const closed = CompletionStamp{ .tab_id = 0, .revision = 0, .generation = 0 };
+    try std.testing.expect(completionAcceptRange(closed, 0, plainItem(), 3, 11, 8, 64) == null);
 }
 
 test "lsp completion: old resolve cannot update a replacement list" {
-    const replacement = CompletionStamp{ .tab_id = 3, .revision = 11, .generation = 8 };
+    const replacement = CompletionStamp{ .tab_id = 3, .revision = 12, .generation = 8 };
     const old_req = session.Request{
         .id = 41,
         .kind = .completion_resolve,
@@ -4638,7 +4733,7 @@ test "lsp completion: old resolve cannot update a replacement list" {
         .revision = 11,
         .aux = packCompletionRef(7, 0),
     };
-    try std.testing.expect(!replacement.matchesResolve(old_req, 8, 41));
+    try std.testing.expect(!replacement.matchesResolve(old_req, 41));
 }
 
 test "lsp completion: identical labels do not identify resolve generations" {
@@ -4654,24 +4749,13 @@ test "lsp completion: identical labels do not identify resolve generations" {
         .aux = packCompletionRef(9, 0),
     };
     try std.testing.expectEqualStrings(old_item.label, new_item.label);
-    try std.testing.expect(!current.matchesResolve(old_req, 10, new_item.resolve_id));
+    try std.testing.expect(!current.matchesResolve(old_req, new_item.resolve_id));
 }
 
-test "lsp completion: close invalidates acceptance and resolve" {
-    const closed_generation: u64 = 14;
-    const offered = CompletionStamp{ .tab_id = 5, .revision = 2, .generation = 13 };
-    const resolve_req = session.Request{
-        .id = 61,
-        .kind = .completion_resolve,
-        .tab_id = 5,
-        .revision = 2,
-        .aux = packCompletionRef(13, 0),
-    };
-    try std.testing.expect(!offered.matches(5, 2, closed_generation));
-    try std.testing.expect(!offered.matchesResolve(resolve_req, closed_generation, resolve_req.id));
-}
-
-test "lsp completion: unchanged list accepts and resolves" {
+test "lsp completion: a resolve for the live list lands after a keystroke" {
+    // The list is unchanged; only the DOCUMENT moved on (generation 15
+    // -> 16 through invalidateCompletion). Documentation has no
+    // offsets, so the answer must still fill the item in.
     const offered = CompletionStamp{ .tab_id = 6, .revision = 30, .generation = 15 };
     const resolve_req = session.Request{
         .id = 71,
@@ -4680,8 +4764,7 @@ test "lsp completion: unchanged list accepts and resolves" {
         .revision = 30,
         .aux = packCompletionRef(15, 2),
     };
-    try std.testing.expect(offered.matches(6, 30, 15));
-    try std.testing.expect(offered.matchesResolve(resolve_req, 15, resolve_req.id));
+    try std.testing.expect(offered.matchesResolve(resolve_req, resolve_req.id));
 }
 
 test "lsp workspace edit: edit during rename invalidates the response stamp" {
