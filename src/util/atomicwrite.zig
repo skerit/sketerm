@@ -17,7 +17,6 @@ pub const Error = error{
     CloseFailed,
     RenameFailed,
     DeleteFailed,
-    ParentSyncFailed,
 };
 
 pub const MAX_PATH = 4096;
@@ -91,7 +90,10 @@ pub fn deleteFile(path: []const u8) Error!void {
     if (parent_fd < 0) return syscallError(error.ParentOpenFailed);
     defer _ = c.close(parent_fd);
     if (c.unlink(path_z.ptr) != 0) return syscallError(error.DeleteFailed);
-    if (c.fsync(parent_fd) != 0) return syscallError(error.ParentSyncFailed);
+    // The unlink is committed and cannot be rolled back. Losing the
+    // directory sync weakens crash durability, but reporting it would tell
+    // the caller the file is still there when it is already gone.
+    _ = c.fsync(parent_fd);
 }
 
 const PosixFileWriter = struct {
@@ -245,16 +247,19 @@ fn writeFileWithOps(
         return syscallError(error.RenameFailed);
     stage_exists = false;
 
-    // Once rename succeeds the new path is complete, but it is not a
-    // durable replacement until the directory entry itself reaches disk.
-    if (sync_policy == .durable and ops.fsync(parent_fd) != 0)
-        return syscallError(error.ParentSyncFailed);
+    // The destination is committed now and cannot be rolled back safely.
+    // A directory-sync failure weakens crash durability, but must not be
+    // reported as though the previous file were still in place: FUSE and
+    // network filesystems fail fsync() on a directory fd outright, and a
+    // caller that rolls back there discards data that is already on disk.
+    if (sync_policy == .durable) _ = ops.fsync(parent_fd);
 }
 
 const FaultOps = struct {
     short_write: usize = std.math.maxInt(usize),
     fail_write_after: ?usize = null,
     fail_data_sync: bool = false,
+    fail_parent_sync: bool = false,
     fail_rename: bool = false,
     collide_once: bool = false,
     written: usize = 0,
@@ -321,6 +326,12 @@ const FaultOps = struct {
     fn fsync(self: *@This(), fd: c_int) c_int {
         if (fd == self.parent_fd) {
             self.parent_syncs += 1;
+            if (self.fail_parent_sync) {
+                // EROFS is what made the old failure indistinguishable from
+                // "the write never happened"; keep that exact laundering here.
+                std.c._errno().* = c.EROFS;
+                return -1;
+            }
         } else if (self.fail_data_sync) {
             std.c._errno().* = c.EIO;
             return -1;
@@ -541,6 +552,30 @@ test "write and data-sync failures preserve the old file and clean the stage" {
     try std.testing.expectError(error.DataSyncFailed, writeFileWithOps(&sync_ops, path, "new-unsynced", 0o600, .durable, .preserve_existing));
     try std.testing.expect(c.lstat(sync_ops.lastStage().ptr, &st) != 0);
     try std.testing.expectEqualStrings("old-valid", try readTestFile(path, &got));
+}
+
+test "a failed parent sync reports the committed replacement as saved" {
+    var tmpl = "/tmp/sketerm-atomicwrite-dirsync-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+    try writeFile(path, "old-valid", 0o600);
+
+    // A directory fsync that fails (FUSE, NFS) must not be laundered into a
+    // "nothing was written" error: the rename already committed, so a caller
+    // that rolls back or warns here discards data that is on disk.
+    var ops: FaultOps = .{ .fail_parent_sync = true };
+    try writeFileWithOps(&ops, path, "new-committed", 0o600, .durable, .preserve_existing);
+    try std.testing.expectEqual(@as(usize, 1), ops.parent_syncs);
+    var got: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("new-committed", try readTestFile(path, &got));
+    var st: c.struct_stat = undefined;
+    try std.testing.expect(c.lstat(ops.lastStage().ptr, &st) != 0);
 }
 
 test "a stale exclusive stage is bypassed without deleting it" {
