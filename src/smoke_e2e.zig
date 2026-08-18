@@ -710,6 +710,11 @@ pub fn main() u8 {
         // queries it after zoom/config rebuilds and reparenting; closing
         // that editor aborts if final create/delete totals do not match.
         _ = c.setenv("SKETERM_VERIFY_EDITOR_ATLAS_GL", "1", 1);
+        // Same for the editor face's own callbacks: an EditorView that
+        // reaches deinit with its GL-area signals still connected (or
+        // its GL state still live) aborts instead of letting GTK call
+        // into freed storage later.
+        _ = c.setenv("SKETERM_VERIFY_EDITOR_TEARDOWN", "1", 1);
         // Hermeticity: on a dev box with at-spi running, the GUI child
         // would otherwise register its accessibles on the USER'S real
         // a11y bus. This harness isolates every other resource, so it

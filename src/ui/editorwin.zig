@@ -364,6 +364,10 @@ pub const EditorWindow = struct {
         if (self.destroyed) return;
         self.destroyed = true;
         self.view.on_changed = null;
+        // The window's widgets are being finalized: the view's area
+        // signals go with them and its unrealize has run, so record the
+        // sever now rather than at the qdata finalize below.
+        self.view.sever(true);
         self.view.widgets_dead = true;
         if (self.goto_timer != 0) {
             _ = c.g_source_remove(self.goto_timer);

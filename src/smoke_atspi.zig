@@ -259,6 +259,13 @@ pub fn main() u8 {
         // Keep the TabBar effect/warning sources live and require its
         // pre-widget teardown to remove every raw-data closure.
         _ = c.setenv("SKETERM_VERIFY_TABBAR_TEARDOWN", "1", 1);
+        // The editor face has the same contract: its GtkGLArea signals
+        // carry a raw *EditorView, so an EditorView that reaches deinit
+        // unsevered (or with live GL state) aborts here instead of
+        // letting GTK call into freed storage afterwards. The atlas
+        // accounting the last stage arms is checked at that same point.
+        _ = c.setenv("SKETERM_VERIFY_EDITOR_TEARDOWN", "1", 1);
+        _ = c.setenv("SKETERM_VERIFY_EDITOR_ATLAS_GL", "1", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -436,6 +443,13 @@ pub fn main() u8 {
 
     // ── 11. the editor's CHROME: gutter menu, status menu, sticky ───
     if (editorChromeStage(allocator, rt, sock_path)) |msg| {
+        _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
+        teardown();
+        return 1;
+    }
+
+    // ── 12. an editor pane left ALIVE through the shutdown ──────────
+    if (editorTeardownStage(allocator, rt, sock_path)) |msg| {
         _ = c.fprintf(platform.stderr(), "smoke-atspi: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
         teardown();
         return 1;
@@ -1778,5 +1792,88 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
         app.drain();
         _ = c.usleep(200_000);
     }
+    return null;
+}
+
+/// Leave one editor pane open, with its GL atlas accounting armed, so
+/// the graceful shutdown below runs the real teardown order:
+/// window.deinit -> pane.deinit -> severFaces -> detachEditor, with the
+/// GtkGLArea still alive. A face that does not sever there leaves GTK
+/// calling unrealize/destroy into freed storage, and its texture
+/// counted-but-never-deleted; both abort the GUI, which the exit-status
+/// check reports. Every other editor stage closes its panes first,
+/// which is exactly what hid this.
+fn editorTeardownStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]const u8) ?[]const u8 {
+    var efile_buf: [512]u8 = undefined;
+    const efile = std.fmt.bufPrintZ(&efile_buf, "{s}/atspi-editor-teardown.txt", .{rt}) catch return "teardown editor path";
+    var req_buf: [700]u8 = undefined;
+    const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{efile}) catch return "fmt";
+    const rp = roundtrip(allocator, sock_path, rq) orelse return "teardown new-editor-tab roundtrip";
+    defer allocator.free(rp);
+    if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return "teardown new-editor-tab not ok";
+    const epane = parseNumAfter(rp, "\"pane\":") orelse return "teardown new-editor-tab reply has no pane id";
+
+    // Querying the stats is ALSO what arms the accounting, so this
+    // poll is the arming step, not just a readiness check.
+    var waited: u32 = 0;
+    while (waited < 15_000) : (waited += 200) {
+        _ = c.usleep(200_000);
+        var sreq_buf: [128]u8 = undefined;
+        const sreq = std.fmt.bufPrint(&sreq_buf, "{{\"cmd\":\"editor-atlas-stats\",\"pane\":{d}}}\n", .{epane}) catch return "fmt";
+        const sresp = roundtrip(allocator, sock_path, sreq) orelse continue;
+        defer allocator.free(sresp);
+        if (std.mem.indexOf(u8, sresp, "\"ok\":true") == null) continue;
+        if (std.mem.indexOf(u8, sresp, "\"texture_valid\":true") == null) continue;
+        if (std.mem.indexOf(u8, sresp, "\"live\":1") == null) continue;
+        say("editor pane left open for the graceful shutdown, atlas accounting armed");
+        break;
+    } else return "the shutdown editor pane never reported one live atlas texture";
+
+    // A SECOND armed pane, closed while its widgets are still up: that
+    // is the path where `Pane.severFaces` reaches the editor face with
+    // a live GtkGLArea, so the sever runs its real work (disconnect the
+    // five area handlers, release the atlas texture under the context)
+    // and its own verifier can catch a missed registration.
+    var cfile_buf: [512]u8 = undefined;
+    const cfile = std.fmt.bufPrintZ(&cfile_buf, "{s}/atspi-editor-sever.txt", .{rt}) catch return "sever editor path";
+    const crq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{cfile}) catch return "fmt";
+    const crp = roundtrip(allocator, sock_path, crq) orelse return "sever new-editor-tab roundtrip";
+    defer allocator.free(crp);
+    if (std.mem.indexOf(u8, crp, "\"ok\":true") == null) return "sever new-editor-tab not ok";
+    const cpane = parseNumAfter(crp, "\"pane\":") orelse return "sever new-editor-tab reply has no pane id";
+    var cwaited: u32 = 0;
+    while (cwaited < 15_000) : (cwaited += 200) {
+        _ = c.usleep(200_000);
+        var sreq_buf: [128]u8 = undefined;
+        const sreq = std.fmt.bufPrint(&sreq_buf, "{{\"cmd\":\"editor-atlas-stats\",\"pane\":{d}}}\n", .{cpane}) catch return "fmt";
+        const sresp = roundtrip(allocator, sock_path, sreq) orelse continue;
+        defer allocator.free(sresp);
+        if (std.mem.indexOf(u8, sresp, "\"texture_valid\":true") == null) continue;
+        break;
+    } else return "the sever editor pane never reported a valid atlas texture";
+
+    // Take the context out from under the release, the way a lost
+    // context or a reparent that outran us does. The texture name dies
+    // with it, so the accounting must record it — forgetting it left
+    // the balance one short and made the teardown assertion assert
+    // something false.
+    var breq_buf: [128]u8 = undefined;
+    const breq = std.fmt.bufPrint(&breq_buf, "{{\"cmd\":\"editor-atlas-break-next\",\"pane\":{d}}}\n", .{cpane}) catch return "fmt";
+    const brp = roundtrip(allocator, sock_path, breq) orelse return "editor-atlas-break-next roundtrip";
+    defer allocator.free(brp);
+    if (std.mem.indexOf(u8, brp, "\"ok\":true") == null) return "editor-atlas-break-next was refused";
+
+    var creq_buf: [128]u8 = undefined;
+    const creq = std.fmt.bufPrint(&creq_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{cpane}) catch return "fmt";
+    const cresp = roundtrip(allocator, sock_path, creq) orelse return "close-pane roundtrip";
+    defer allocator.free(cresp);
+    if (std.mem.indexOf(u8, cresp, "\"ok\":true") == null) return "close-pane not ok";
+    _ = c.usleep(500_000);
+    const alive = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+        return "GUI stopped serving after closing an armed editor pane";
+    defer allocator.free(alive);
+    if (std.mem.indexOf(u8, alive, "\"ok\":true") == null)
+        return "GUI unhealthy after closing an armed editor pane";
+    say("editor pane closed with its widgets alive and a dead GL context: severed, accounted, still serving");
     return null;
 }

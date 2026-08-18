@@ -933,10 +933,20 @@ pub const EditorView = struct {
     preedit_cursor: usize = 0,
 
     atlas: ?*Atlas = null,
+    /// True once the pane's pre-widget-destruction hook removed every
+    /// callback whose user-data is this view.
+    callbacks_severed: bool = false,
+    /// A successful realize has made GL state live in the area's
+    /// context; unrealize or sever clears it after releasing it.
+    gl_live: bool = false,
     atlas_textures_created: u64 = 0,
     atlas_textures_deleted: u64 = 0,
     atlas_verify_accounting: bool = false,
     atlas_test_fail_after_create: bool = false,
+    /// Test hook: make the next GL release behave as if the area's
+    /// context had already died (a real, reachable state — a lost
+    /// context, a reparent that outran us).
+    atlas_test_break_next_release: bool = false,
     config_syncs: u64 = 0,
     layout_rebuilds: u64 = 0,
     /// Valid iff `atlas != null`; address handed to every Layout.
@@ -1810,6 +1820,16 @@ pub const EditorView = struct {
         if (had_texture) self.atlas_textures_deleted += 1;
     }
 
+    /// The context that owned this texture is gone — broken, or
+    /// replaced by a re-realize, or destroyed with the widget. The name
+    /// died with it, so account for it WITHOUT a glDelete that would
+    /// land on whatever context happens to be current.
+    fn dropAtlasGL(self: *EditorView, atlas: *Atlas) void {
+        if (atlas.realized and atlas.gl_tex != 0) self.atlas_textures_deleted += 1;
+        atlas.gl_tex = 0;
+        atlas.realized = false;
+    }
+
     /// Return editor-local GL texture accounting for the GUI smoke rig.
     pub fn atlasTextureStats(self: *EditorView) AtlasTextureStats {
         self.atlas_verify_accounting = true;
@@ -1842,6 +1862,15 @@ pub const EditorView = struct {
     pub fn failNextAtlasRebuildForTest(self: *EditorView) void {
         self.atlas_verify_accounting = true;
         self.atlas_test_fail_after_create = true;
+    }
+
+    /// Make the next GL release find a dead context, for the GUI smoke
+    /// rig. The texture is gone with that context, so the accounting
+    /// has to record it — silently forgetting it is what left the
+    /// balance one short and the teardown assertion lying.
+    pub fn breakNextAtlasReleaseForTest(self: *EditorView) void {
+        self.atlas_verify_accounting = true;
+        self.atlas_test_break_next_release = true;
     }
 
     /// Apply a new font size through the same machinery syncConfig
@@ -1995,6 +2024,10 @@ pub const EditorView = struct {
         // GL area is still a live widget. Idempotent, and the area's
         // own ::destroy severs again on the paths that skip this one.
         if (!self.widgets_dead and !widgets_dead) a11y.sever(@ptrCast(self.area));
+        // Then the canvas's own signals, while the area is still a live
+        // widget: they carry a raw *EditorView and this storage is
+        // freed before GTK disposes the tree.
+        self.sever(self.widgets_dead or widgets_dead);
         self.widgets_dead = self.widgets_dead or widgets_dead;
         // No-ops itself (through ownerWindow) once widgets_dead is set,
         // which is why the pane's verdict has to be folded in first and
@@ -2093,7 +2126,60 @@ pub const EditorView = struct {
         }
     }
 
+    /// Fence every callback carrying this raw pointer while the host
+    /// still owns the storage — the same contract `TerminalSurface`
+    /// has, reached from `Pane.severFaces` through `prepareDestroyCb`.
+    ///
+    /// `widgets_dead` means GTK already finalized the subtree: its
+    /// signals went with it, and the unrealize it emitted then ran
+    /// while this storage was alive, so there is nothing left to do
+    /// but record it. Idempotent.
+    pub fn sever(self: *EditorView, widgets_dead: bool) void {
+        if (self.callbacks_severed) return;
+        if (widgets_dead) {
+            self.callbacks_severed = true;
+            return;
+        }
+        const area_widget: *c.GtkWidget = @ptrCast(self.area);
+        const disconnected = c.g_signal_handlers_disconnect_matched(
+            @ptrCast(self.area),
+            c.G_SIGNAL_MATCH_DATA,
+            0,
+            0,
+            null,
+            null,
+            @ptrCast(self),
+        );
+        // The later widget destruction can no longer deliver
+        // unrealize, so release the context-owned objects now, while
+        // the context is still valid.
+        if (c.gtk_widget_get_realized(area_widget) != 0) self.releaseAreaGL();
+        self.callbacks_severed = true;
+
+        // ReleaseFast drops asserts; the smoke's explicit mode keeps a
+        // missing registration or teardown path observable.
+        // realize/unrealize/render/resize/destroy = 5.
+        if (c.getenv("SKETERM_VERIFY_EDITOR_TEARDOWN") != null and
+            (disconnected != 5 or self.gl_live))
+        {
+            std.debug.print(
+                "sketerm: EditorView sever mismatch (signals={d}, gl_live={})\n",
+                .{ disconnected, self.gl_live },
+            );
+            c.abort();
+        }
+    }
+
     pub fn deinit(self: *EditorView) void {
+        if (c.getenv("SKETERM_VERIFY_EDITOR_TEARDOWN") != null and
+            (!self.callbacks_severed or self.gl_live))
+        {
+            std.debug.print(
+                "sketerm: EditorView deinit before callback/GL teardown (severed={}, gl_live={})\n",
+                .{ self.callbacks_severed, self.gl_live },
+            );
+            c.abort();
+        }
         self.fence.close();
         // Last resort — every ordinary path severed already (either
         // `prepareDestroyCb` or the area's ::destroy). Only safe while
@@ -2126,6 +2212,10 @@ pub const EditorView = struct {
         self.results.deinit();
         if (self.project_markers) |m| self.allocator.free(m);
         if (self.atlas) |a| {
+            // Reaching here with GL still live means no unrealize and
+            // no sever ran: the context died with the widget, so the
+            // texture is gone whether or not anyone deleted it.
+            if (self.gl_live) self.dropAtlasGL(a);
             a.deinit();
             self.atlas = null;
         }
@@ -3053,8 +3143,11 @@ pub const EditorView = struct {
             return;
         }
         // Every realize is potentially a re-realize (reparent killed
-        // the old context): drop stale handles first.
+        // the old context): drop stale handles first. The old texture's
+        // name died with that context — count it, never glDelete it
+        // here.
         if (self.atlas) |old| {
+            self.dropAtlasGL(old);
             old.deinit();
             self.atlas = null;
         }
@@ -3066,6 +3159,7 @@ pub const EditorView = struct {
             return;
         }
         self.realizeAtlas(self.atlas.?);
+        self.gl_live = true;
         self.book = FontBook.init(self.atlas.?);
         for (self.tabs.items) |t| t.layout.invalidateAll();
         self.pass.realize() catch {
@@ -3074,16 +3168,34 @@ pub const EditorView = struct {
         };
     }
 
-    fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
+    fn onUnrealize(_: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(EditorView, user);
+        self.releaseAreaGL();
+    }
+
+    /// Release everything the area's GL context owns, under that
+    /// context. Unrealize and an explicit `sever` both come here.
+    fn releaseAreaGL(self: *EditorView) void {
+        const area = self.area;
         c.gtk_gl_area_make_current(area);
-        if (c.gtk_gl_area_get_error(area) != null) {
+        const broken = if (self.atlas_test_break_next_release) blk: {
+            self.atlas_test_break_next_release = false;
+            break :blk true;
+        } else c.gtk_gl_area_get_error(area) != null;
+        if (broken) {
+            // The context is already broken: nothing to delete against,
+            // and the texture name went with it. Forgetting it without
+            // accounting is what left the balance one short.
             self.pass.forgetGL();
+            self.linear_target.forgetGL();
+            if (self.atlas) |a| self.dropAtlasGL(a);
+            self.gl_live = false;
             return;
         }
         self.pass.releaseGL();
         self.linear_target.releaseGL();
         if (self.atlas) |a| self.releaseAtlasGL(a);
+        self.gl_live = false;
     }
 
     fn onRender(area: *c.GtkGLArea, _: ?*c.GdkGLContext, user: ?*anyopaque) callconv(.c) c.gboolean {
