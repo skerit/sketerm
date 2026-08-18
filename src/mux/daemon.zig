@@ -1456,9 +1456,11 @@ pub const Native = struct {
     /// frame) and an allocation-churn win (buffers stay at high
     /// water instead of realloc-per-frame).
     pixscratch: wlpixcodec.Scratch = .{},
-    /// Set once the attached client advertises it can decode the video
-    /// codec (capability negotiation — not yet implemented). Until then
-    /// videoCommit stays dormant: never emit a tile no client can decode.
+    /// Video consensus for this channel: set by `videoOk` when at least
+    /// one native viewer of the session is attached and EVERY one of them
+    /// advertised video decoding. Recomputed on client churn
+    /// (`refreshVideoGates`). While false videoCommit stays dormant:
+    /// never emit a tile some attached client cannot decode.
     wants_video: bool = false,
     /// Icon injection back-pointers (set after the Channel exists) so
     /// the brain's toplevel_app_id callback can resolve the app's icon
