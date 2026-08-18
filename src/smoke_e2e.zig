@@ -782,6 +782,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_SIDEBAR_DRAG_ONLY") != null) {
+        const app = drive orelse return fail("focused sidebar-drag smoke has no display driver");
+        if (!have_wl) return fail("focused sidebar-drag smoke is GTK/Wayland-only");
+        if (sidebarDragStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("tree sidebar drag: focused nest, unnest, and reorder stage passed");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_TABBAR_ONLY") != null) {
         if (platform.is_macos) return fail("focused TabBar smoke is GTK-only");
         if (themeSingletonStage(allocator, drive, rt, &wl_z)) |why| return failMsg(why);
@@ -1806,7 +1814,9 @@ fn modeIndex(hist: []const u16) usize {
     return best;
 }
 
-fn sidebarChipBounds(app: *appdrive.App, win_id: u32) ?struct { min_x: usize, max_x: usize, min_y: usize, max_y: usize } {
+const ChipBounds = struct { min_x: usize, max_x: usize, min_y: usize, max_y: usize };
+
+fn sidebarChipBounds(app: *appdrive.App, win_id: u32) ?ChipBounds {
     for (app.windows.items) |w| {
         if (w.id != win_id or w.w <= 0 or w.h <= 0) continue;
         const width: usize = @intCast(w.w);
@@ -1915,6 +1925,41 @@ fn sidebarChipPoint(app: *appdrive.App, win_id: u32) ?struct { x: f64, y: f64 } 
         .x = @floatFromInt((bounds.min_x + bounds.max_x) / 2),
         .y = @floatFromInt((bounds.min_y + bounds.max_y) / 2),
     };
+}
+
+/// The two sidebar rows a drag needs, learned by focusing each pane in
+/// turn and reading the active-row chip. A single chip read after
+/// waitIdle races the COMMITTED frame under load (the focus applies,
+/// the repaint lands frames later), so a stale read hands the drag the
+/// wrong rectangle; requiring the two reads to land on DIFFERENT rows
+/// makes the pair self-healing — a stale second read equals the first
+/// and the loop re-reads until a fresh frame arrives.
+fn learnDragRowPair(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    sock_path: [:0]const u8,
+    win_id: u32,
+    drag_pane: u32,
+    require_below: bool,
+    timeout_ms: u32,
+) ?struct { first: ChipBounds, drag: ChipBounds } {
+    var focus_buf: [96]u8 = undefined;
+    const focus_drag = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{drag_pane}) catch return null;
+    var waited: u32 = 0;
+    while (waited <= timeout_ms) : (waited += 400) {
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r) else return null;
+        _ = app.waitIdle(200, 4_000);
+        const first = sidebarChipBounds(app, win_id);
+        if (roundtrip(allocator, sock_path, focus_drag)) |r| allocator.free(r) else return null;
+        _ = app.waitIdle(200, 4_000);
+        const drag = sidebarChipBounds(app, win_id);
+        if (first != null and drag != null and drag.?.min_y != first.?.min_y and
+            first.?.min_x == drag.?.min_x and
+            (!require_below or drag.?.min_y > first.?.min_y))
+            return .{ .first = first.?, .drag = drag.? };
+        _ = app.pumpOnce(400);
+    }
+    return null;
 }
 
 /// Count `"pane":N` occurrences in a `web-list` reply: how many browser
@@ -2613,15 +2658,13 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         return "the sidebar never opened for the drag stage";
 
     // Learn both rows' rectangles by making each tab current in turn.
-    const first_row = sidebarChipBounds(app, win_id) orelse return "the first tab's sidebar row was not visible";
-    var focus_buf: [96]u8 = undefined;
-    const focus_last = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{extra[1]}) catch
-        return "building the drag-stage focus command failed";
-    if (roundtrip(allocator, sock_path, focus_last)) |r| allocator.free(r) else return "focusing the last tab for the drag stage failed";
-    _ = app.waitIdle(300, 5_000);
-    const last_row = sidebarChipBounds(app, win_id) orelse return "the last tab's sidebar row was not visible";
-    if (last_row.min_x != first_row.min_x) return "two root sidebar rows started at different indents";
-    if (last_row.min_y <= first_row.min_y) return "the last tab's row is not below the first tab's";
+    // learnDragRowPair re-reads until the chip provably moved between
+    // the two focuses: the old single-read learn raced the committed
+    // frame under CPU load and handed the drag a stale rectangle.
+    const pair0 = learnDragRowPair(allocator, app, sock_path, win_id, extra[1], true, 20_000) orelse
+        return "the two sidebar rows never painted as distinct same-indent rows";
+    const first_row = pair0.first;
+    const last_row = pair0.drag;
     const mid = struct {
         fn of(b: anytype) struct { x: f64, y: f64 } {
             return .{
@@ -2652,28 +2695,25 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     //    and a pixel-indent probe cannot see it.
     const nest_offsets = [_]f64{ 0.5, 0.62, 0.4, 0.72 };
     var nested_ok = false;
+    var nest_src_y: usize = 0;
     for (nest_offsets, 0..) |frac, attempt| {
         // A missed drop reorders rows (above/below zone), so every
         // attempt re-learns both rectangles by focusing each tab.
         var b_first = first_row;
         var b_drag = last_row;
         if (attempt > 0) {
-            if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
-            _ = app.waitIdle(200, 4_000);
-            b_first = sidebarChipBounds(app, win_id) orelse return "the first tab's row vanished between nest attempts";
-            var refocus_buf: [96]u8 = undefined;
-            const refocus = std.fmt.bufPrint(&refocus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{extra[1]}) catch
-                return "building the drag-stage refocus command failed";
-            if (roundtrip(allocator, sock_path, refocus)) |r| allocator.free(r);
-            _ = app.waitIdle(200, 4_000);
-            b_drag = sidebarChipBounds(app, win_id) orelse return "the dragged tab's row vanished between nest attempts";
+            const pair = learnDragRowPair(allocator, app, sock_path, win_id, extra[1], false, 12_000) orelse
+                return "the sidebar rows vanished between nest attempts";
+            b_first = pair.first;
+            b_drag = pair.drag;
         }
         const y = @as(f64, @floatFromInt(b_first.min_y)) + row_pitch * frac;
-        app.drag(win_id, mid.of(b_drag).x, mid.of(b_drag).y, mid.of(b_first).x, y, 1) catch
+        app.dragDnd(win_id, mid.of(b_drag).x, mid.of(b_drag).y, mid.of(b_first).x, y, 1) catch
             return "dragging a sidebar row onto another failed";
         _ = app.waitIdle(300, 6_000);
         if (waitTreeParent(allocator, app, sock_path, extra[1], 1, 3_000) != null) {
             nested_ok = true;
+            nest_src_y = b_drag.min_y;
             break;
         }
     }
@@ -2684,19 +2724,33 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
         }
         return "dropping a sidebar row onto another did not nest it under that row";
     }
-    const nested = sidebarChipBounds(app, win_id) orelse
-        return "the dragged sidebar row disappeared";
-    if (nested.min_y <= first_row.min_y)
-        return "a nested sidebar row did not follow its new parent";
+    // Nesting under the first row moves the dragged row up one pitch,
+    // so a chip still at its pre-drag y is a stale frame — poll it out
+    // rather than dragging from a rectangle the drop just invalidated.
+    var nested: ChipBounds = undefined;
+    var nested_seen = false;
+    var nwaited: u32 = 0;
+    while (nwaited < 6_000) : (nwaited += 200) {
+        if (sidebarChipBounds(app, win_id)) |b| {
+            if (b.min_y != nest_src_y and b.min_y > first_row.min_y) {
+                nested = b;
+                nested_seen = true;
+                break;
+            }
+        }
+        _ = app.pumpOnce(200);
+    }
+    if (!nested_seen)
+        return "the dragged sidebar row never repainted below its new parent";
 
     // 2. Drop on the empty list below the rows -> back to the root level.
     const empty_y = @as(f64, @floatFromInt(app.windows.items[0].h)) * 0.75;
-    app.drag(win_id, mid.of(nested).x, mid.of(nested).y, onto.x, empty_y, 1) catch
+    app.dragDnd(win_id, mid.of(nested).x, mid.of(nested).y, onto.x, empty_y, 1) catch
         return "dragging a sidebar row onto the empty list failed";
     _ = app.waitIdle(300, 6_000);
     if (waitTreeParent(allocator, app, sock_path, extra[1], null, 6_000) == null)
         return "dropping a sidebar row on the empty list did not return it to the root level";
-    const unnested = sidebarChipBounds(app, win_id) orelse
+    if (sidebarChipBounds(app, win_id) == null)
         return "the unnested sidebar row disappeared";
 
     // 3. Drop on the TOP of the first row -> reorder above it, still a
@@ -2709,24 +2763,16 @@ fn sidebarDragStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path:
     //    of the row's "above" zone (its top 30%, about 8px).
     const above_offsets = [_]f64{ 4.0, 6.0, 2.0, 8.0 };
     var reordered_ok = false;
-    for (above_offsets, 0..) |off, attempt| {
-        var b_first = first_row;
-        var b_drag = unnested;
-        if (attempt > 0) {
-            // A missed drop may have nested or reordered elsewhere;
-            // re-learn both rectangles by focusing each tab in turn.
-            if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
-            _ = app.waitIdle(200, 4_000);
-            b_first = sidebarChipBounds(app, win_id) orelse return "the first tab's row vanished between reorder attempts";
-            var refocus_buf: [96]u8 = undefined;
-            const refocus = std.fmt.bufPrint(&refocus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{extra[1]}) catch
-                return "building the reorder refocus command failed";
-            if (roundtrip(allocator, sock_path, refocus)) |r| allocator.free(r);
-            _ = app.waitIdle(200, 4_000);
-            b_drag = sidebarChipBounds(app, win_id) orelse return "the dragged tab's row vanished between reorder attempts";
-        }
+    for (above_offsets) |off| {
+        // A missed drop may have nested or reordered elsewhere, and a
+        // single-shot rectangle races the repaint; learn a fresh,
+        // provably-distinct pair before every attempt.
+        const pair = learnDragRowPair(allocator, app, sock_path, win_id, extra[1], false, 12_000) orelse
+            return "the sidebar rows vanished between reorder attempts";
+        const b_first = pair.first;
+        const b_drag = pair.drag;
         const above_y = @as(f64, @floatFromInt(b_first.min_y)) + off;
-        app.drag(win_id, mid.of(b_drag).x, mid.of(b_drag).y, mid.of(b_first).x, above_y, 1) catch
+        app.dragDnd(win_id, mid.of(b_drag).x, mid.of(b_drag).y, mid.of(b_first).x, above_y, 1) catch
             return "dragging a sidebar row above another failed";
         _ = app.waitIdle(300, 6_000);
         // Success is structural AND visual: a root again, drawn above

@@ -19080,3 +19080,19 @@ before) plus 2x quiet. smoke-fs also never removed ANY of its ~32
 per-run /tmp roots (1029 had accumulated); every root is registered
 and removed at exit, pass or fail; SKETERM_SMOKE_FS_KEEP=1 preserves a
 failed run's evidence.
+
+## 2026-08-19: sidebar drag-and-drop survives a starved client
+
+The smoke-e2e sidebar stage failed under CPU load because appdrive's
+drag() released the button on wall-clock pacing: a starved GUI could
+still be mid dnd-conversation, and a release processed before its own
+start_drag left the dnd serial stale, degrading the gesture to a
+click ("did not nest"). New dragDnd() holds the release (bounded, 8s)
+until the replica compositor mirrors the client's own start-drag and
+drop-target accept -- ground truth, not a heuristic -- with a 2s
+committed-frame gate after the jiggle motions. The stage also learns
+its two drag rows self-healingly (two chip reads must land on
+DIFFERENT rows, so a stale frame re-reads instead of handing the drag
+a wrong rectangle) and gains SKETERM_SMOKE_E2E_SIDEBAR_DRAG_ONLY=1.
+Verified 3/3 under a 40-spinner load that failed 3/3 before, plus
+quiet. Pointer-grab drags (paned dividers) keep plain drag().

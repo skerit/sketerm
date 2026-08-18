@@ -2033,6 +2033,24 @@ pub const App = struct {
     /// Press-move-release drag. Motions go out in small bursts with
     /// pumps between so the app sees a gesture, not one event blob.
     pub fn drag(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32) Error!void {
+        return self.dragInner(win_id, x1, y1, x2, y2, button, false);
+    }
+
+    /// drag() for a toolkit DRAG-AND-DROP destination. The release is
+    /// held (bounded) until the replica compositor has seen the client
+    /// START the dnd session and the drop target ACCEPT it — the two
+    /// requests a starved client sends late. A release the client
+    /// processes before its own start_drag leaves the dnd serial stale
+    /// and the whole gesture degrades to a click; wall-clock pacing
+    /// cannot exclude that on a loaded host (smoke-e2e's sidebar stage
+    /// failed 3/3 under a 40-spinner load exactly this way). Use for
+    /// GtkDropTarget flows; pointer-grab drags (paned dividers) never
+    /// flip the dnd state and should keep calling drag().
+    pub fn dragDnd(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32) Error!void {
+        return self.dragInner(win_id, x1, y1, x2, y2, button, true);
+    }
+
+    fn dragInner(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32, expect_dnd: bool) Error!void {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
@@ -2075,6 +2093,7 @@ pub const App = struct {
         // emulate that: a few sub-pixel-scale motions at the target
         // guarantee the session sees enough movement to pick and
         // accept the right drop target, wherever the threshold fired.
+        const frames_before_jiggle = if (self.winById(win_id)) |w| w.frames else 0;
         var j: u32 = 0;
         while (j < 4) : (j += 1) {
             const dy: f64 = if (j % 2 == 0) 1.0 else 0.0;
@@ -2084,6 +2103,33 @@ pub const App = struct {
             self.pumpFor(30);
         }
         self.pumpFor(150);
+        // Evidence, not wall time: a starved client (CPU-loaded host)
+        // can still be mid dnd-conversation when the fixed pumps run
+        // out, and a release it has not caught up to CANCELS the drag.
+        // A frame committed after the jiggle proves its main loop ran
+        // past the motions; bounded so a target that repaints nothing
+        // costs 2s, never a hang. The window is re-resolved because
+        // pumping can grow the windows list and move it.
+        const release_deadline = nowMs() + 2_000;
+        while (nowMs() < release_deadline and !self.exited) {
+            const w = self.winById(win_id) orelse break;
+            if (w.frames > frames_before_jiggle) break;
+            _ = self.pumpOnce(20);
+        }
+        if (expect_dnd) {
+            // The replica mirrors the client's own wl_data_device
+            // requests, so this is ground truth, not a heuristic. The
+            // timeout is the fallback for a drop point no target
+            // accepts — the release still goes out, as a real hand's
+            // would.
+            const dnd_deadline = nowMs() + 8_000;
+            while (nowMs() < dnd_deadline and !self.exited) {
+                const w = self.winById(win_id) orelse break;
+                const ch = self.chans.get(w.chan) orelse break;
+                if (ch.comp.drag.active and ch.comp.drag.accepted) break;
+                _ = self.pumpOnce(20);
+            }
+        }
         units.clearRetainingCapacity();
         wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
         try self.sendIntents(win.chan, units.items);
