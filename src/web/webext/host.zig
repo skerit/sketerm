@@ -23,6 +23,7 @@ const action = @import("action.zig");
 const reply = @import("reply.zig");
 const atomicwrite = @import("../../util/atomicwrite.zig");
 const pathz = @import("../../util/pathz.zig");
+const clock = @import("../../util/clock.zig");
 
 /// The session's language tag, for `i18n` locale negotiation. POSIX
 /// order, and everything after the encoding or modifier is dropped
@@ -64,6 +65,12 @@ pub const Extension = struct {
     man: ?manifest.Manifest = null,
     /// Lazily-loaded persisted storage.local.
     store: ?storage.Store = null,
+    /// Set when `store` holds writes the file does not. `flushStores`
+    /// writes them once the coalescing window has passed, and teardown
+    /// FLUSHES rather than drops (the `ui/debounce.zig` contract).
+    store_dirty: bool = false,
+    /// Monotonic ms after which a dirty store is written.
+    store_due_ms: i64 = 0,
     /// The hidden background-page view id, 0 when the extension has no
     /// background or is disabled. Owned by cefhost; recorded here so a
     /// routing lookup finds it.
@@ -119,6 +126,11 @@ fn freeCandidate(gpa: std.mem.Allocator, e: *Extension) void {
     e.* = undefined;
 }
 
+/// How long a burst of `storage.local` writes is coalesced. A page that
+/// stores on every keystroke otherwise pays a full serialize plus two
+/// fsyncs per call, synchronously inside its own promise.
+const store_coalesce_ms: i64 = 400;
+
 pub const Host = struct {
     gpa: std.mem.Allocator,
     /// `$XDG_DATA_HOME/sketerm/webext` — per-extension storage lives in
@@ -135,13 +147,40 @@ pub const Host = struct {
     }
 
     pub fn deinit(self: *Host) void {
+        self.flushStores(std.math.maxInt(i64));
         for (self.exts.items) |*e| self.freeExt(e);
         self.exts.deinit(self.gpa);
         self.tabs.deinit(self.gpa);
         freeBytes(self.gpa, self.data_dir);
     }
 
+    /// Write every storage.local whose coalescing window has expired.
+    /// `now_ms` of `maxInt` means "flush everything now" (teardown).
+    /// A failed write keeps the store dirty and retries next window, so
+    /// a transient ENOSPC does not silently discard the extension's data.
+    pub fn flushStores(self: *Host, now_ms: i64) void {
+        for (self.exts.items) |*e| {
+            if (!e.store_dirty or now_ms < e.store_due_ms) continue;
+            const s = &(e.store orelse continue);
+            self.persistStore(e, s) catch |err| {
+                std.debug.print(
+                    "sketerm-webengine: storage.local write failed for {s}: {s}\n",
+                    .{ e.id, @errorName(err) },
+                );
+                e.store_due_ms = now_ms +| store_coalesce_ms;
+                continue;
+            };
+            e.store_dirty = false;
+        }
+    }
+
     fn freeExt(self: *Host, e: *Extension) void {
+        // Teardown flushes: an extension removed inside the coalescing
+        // window must not lose the write it already saw succeed.
+        if (e.store_dirty) {
+            if (e.store) |*s| self.persistStore(e, s) catch {};
+            e.store_dirty = false;
+        }
         // ORDER IS THE SAFETY PROPERTY: the slot must leave the
         // published table before the registry it points at is freed, or
         // the engine's IO thread can read a dangling pointer.
@@ -529,26 +568,26 @@ pub const Host = struct {
         const is_clear = std.mem.eql(u8, method, "clear");
         if (!is_set and !is_remove and !is_clear) return self.errResult("unknown storage method");
 
-        // Mutate a deep copy first. The live store and its on-disk file
-        // move together only after the durable replacement succeeds.
-        var candidate = s.clone(self.gpa) catch |err| return self.errResult(@errorName(err));
-        var candidate_owned = true;
-        defer if (candidate_owned) candidate.deinit();
+        // Mutate the live store; the file follows on the next
+        // `flushStores`. The write used to happen HERE, transactionally
+        // on a deep copy — a full serialize, a full JSON reparse and two
+        // fsyncs inside the page's promise, per `set`. A page that
+        // stores per keystroke paid that every keystroke.
         const ch = if (is_set) blk: {
             const patch = if (args.len > 0)
                 self.valueToJson(args[0]) catch |err| return self.errResult(@errorName(err))
             else
                 self.gpa.dupe(u8, "{}") catch |err| return self.errResult(@errorName(err));
             defer self.gpa.free(patch);
-            break :blk candidate.set(self.gpa, patch) catch |err|
+            break :blk s.set(self.gpa, patch) catch |err|
                 return self.errResult(@errorName(err));
         } else if (is_remove) blk: {
             const keys = self.keysFromArg(if (args.len > 0) args[0] else .null) catch |err|
                 return self.errResult(@errorName(err));
             defer self.gpa.free(keys);
-            break :blk candidate.remove(self.gpa, keys) catch |err|
+            break :blk s.remove(self.gpa, keys) catch |err|
                 return self.errResult(@errorName(err));
-        } else candidate.clear(self.gpa) catch |err|
+        } else s.clear(self.gpa) catch |err|
             return self.errResult(@errorName(err));
 
         if (std.mem.eql(u8, ch, "{}")) {
@@ -559,14 +598,10 @@ pub const Host = struct {
             self.gpa.free(ch);
             return self.errResult("oom");
         };
-        self.persistStore(e, &candidate) catch |err| {
-            self.gpa.free(result);
-            self.gpa.free(ch);
-            return self.errResult(@errorName(err));
-        };
-        s.deinit();
-        s.* = candidate;
-        candidate_owned = false;
+        if (!e.store_dirty) {
+            e.store_dirty = true;
+            e.store_due_ms = clock.nowMs() +| store_coalesce_ms;
+        }
         changed.* = ch;
         return result;
     }
@@ -790,7 +825,7 @@ test "extension capabilities authorize only their owning instance and rotate" {
     try std.testing.expect(host.authorize("one@sketerm.test", &one.capability) == one);
 }
 
-test "storage.local commits memory and private disk state together" {
+test "storage.local answers immediately and writes once the window passes" {
     const t = std.testing;
     var tmpl = "/tmp/sketerm-webext-storage-XXXXXX".*;
     const base_z = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
@@ -812,48 +847,69 @@ test "storage.local commits memory and private disk state together" {
     const data_dir = try std.fmt.allocPrint(t.allocator, "{s}/webext", .{base});
     var host = Host{ .gpa = t.allocator, .data_dir = data_dir };
     defer host.deinit();
-    var ext = Extension{
+    try host.exts.append(t.allocator, .{
         .id = try t.allocator.dupe(u8, "storage@sketerm.test"),
         .dir = &.{},
         .store = storage.Store.load(t.allocator, "{\"secret\":\"old\"}"),
-    };
-    defer {
-        ext.store.?.deinit();
-        t.allocator.free(ext.id);
-    }
-
-    var changed: ?[]u8 = null;
-    const first = host.dispatchStorage(&ext, "set", "[{\"secret\":\"one\"}]", &changed);
-    defer t.allocator.free(first);
-    try t.expect(std.mem.indexOf(u8, first, "\"result\":null") != null);
-    if (changed) |bytes| t.allocator.free(bytes);
+    });
+    const ext = &host.exts.items[0];
 
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/storage@sketerm.test/storage.json", .{data_dir});
     var path_z_buf: [512:0]u8 = undefined;
     const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
     var st: c.struct_stat = undefined;
+
+    var changed: ?[]u8 = null;
+    const first = host.dispatchStorage(ext, "set", "[{\"secret\":\"one\"}]", &changed);
+    defer t.allocator.free(first);
+    try t.expect(std.mem.indexOf(u8, first, "\"result\":null") != null);
+    if (changed) |bytes| t.allocator.free(bytes);
+
+    // The page's promise resolved without touching the disk: no
+    // serialize, no reparse, no pair of fsyncs inside the call.
+    try t.expect(ext.store_dirty);
+    try t.expect(c.stat(path_z.ptr, &st) != 0);
+    // ...and a burst does not accumulate writes either.
+    const due = ext.store_due_ms;
+    changed = null;
+    const second = host.dispatchStorage(ext, "set", "[{\"secret\":\"two\"}]", &changed);
+    defer t.allocator.free(second);
+    if (changed) |bytes| t.allocator.free(bytes);
+    try t.expectEqual(due, ext.store_due_ms);
+    try t.expect(c.stat(path_z.ptr, &st) != 0);
+
+    // Before the window expires nothing is written.
+    host.flushStores(ext.store_due_ms - 1);
+    try t.expect(c.stat(path_z.ptr, &st) != 0);
+
+    host.flushStores(ext.store_due_ms);
+    try t.expect(!ext.store_dirty);
     try t.expect(c.stat(path_z.ptr, &st) == 0);
     try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
 
+    // A failing write keeps the store dirty and retries; it never drops
+    // data the extension already saw stored.
     const parent = std.fs.path.dirname(path).?;
     var parent_z_buf: [512:0]u8 = undefined;
     const parent_z = try std.fmt.bufPrintZ(&parent_z_buf, "{s}", .{parent});
-    try t.expect(c.chmod(parent_z.ptr, 0o500) == 0);
     changed = null;
-    const failed = host.dispatchStorage(&ext, "set", "[{\"secret\":\"must-not-land\"}]", &changed);
-    defer t.allocator.free(failed);
+    const third = host.dispatchStorage(ext, "set", "[{\"secret\":\"three\"}]", &changed);
+    defer t.allocator.free(third);
+    if (changed) |bytes| t.allocator.free(bytes);
+    try t.expect(c.chmod(parent_z.ptr, 0o500) == 0);
+    host.flushStores(std.math.maxInt(i64));
+    try t.expect(ext.store_dirty);
     try t.expect(c.chmod(parent_z.ptr, 0o700) == 0);
-    try t.expect(std.mem.indexOf(u8, failed, "PermissionDenied") != null);
-    try t.expectEqual(@as(?[]u8, null), changed);
+    host.flushStores(std.math.maxInt(i64));
+    try t.expect(!ext.store_dirty);
 
     const got = try ext.store.?.get(t.allocator, &.{"secret"});
     defer t.allocator.free(got);
-    try t.expectEqualStrings("{\"secret\":\"one\"}", got);
+    try t.expectEqualStrings("{\"secret\":\"three\"}", got);
     const disk = try readFileZFallible(t.allocator, path, 1024);
     defer t.allocator.free(disk);
-    try t.expect(std.mem.indexOf(u8, disk, "\"one\"") != null);
-    try t.expect(std.mem.indexOf(u8, disk, "must-not-land") == null);
+    try t.expect(std.mem.indexOf(u8, disk, "\"three\"") != null);
 
     const dp = c.opendir(parent_z.ptr) orelse return error.TestUnexpectedResult;
     defer _ = c.closedir(dp);
@@ -861,6 +917,49 @@ test "storage.local commits memory and private disk state together" {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&entry.*.d_name)));
         try t.expect(std.mem.indexOf(u8, name, ".sketerm-tmp-") == null);
     }
+}
+
+test "an extension torn down inside the window still writes its store" {
+    const t = std.testing;
+    var tmpl = "/tmp/sketerm-webext-flush-XXXXXX".*;
+    const base_z = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(base_z)));
+    var path_buf: [512]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/webext/flush@sketerm.test/storage.json", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer {
+        var zbuf: [512:0]u8 = undefined;
+        _ = c.unlink(path_z.ptr);
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/webext/flush@sketerm.test", .{base})) |p| {
+            _ = c.rmdir(p.ptr);
+        } else |_| {}
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/webext", .{base})) |p| {
+            _ = c.rmdir(p.ptr);
+        } else |_| {}
+        _ = c.rmdir(base_z);
+    }
+
+    const data_dir = try std.fmt.allocPrint(t.allocator, "{s}/webext", .{base});
+    {
+        var host = Host{ .gpa = t.allocator, .data_dir = data_dir };
+        defer host.deinit();
+        try host.exts.append(t.allocator, .{
+            .id = try t.allocator.dupe(u8, "flush@sketerm.test"),
+            .dir = &.{},
+            .store = storage.Store.load(t.allocator, "{}"),
+        });
+        var changed: ?[]u8 = null;
+        const res = host.dispatchStorage(&host.exts.items[0], "set", "[{\"k\":\"v\"}]", &changed);
+        t.allocator.free(res);
+        if (changed) |bytes| t.allocator.free(bytes);
+        var st: c.struct_stat = undefined;
+        try t.expect(c.stat(path_z.ptr, &st) != 0);
+        // host.deinit() runs here: teardown FLUSHES, never drops.
+    }
+    const disk = try readFileZFallible(t.allocator, path, 1024);
+    defer t.allocator.free(disk);
+    try t.expect(std.mem.indexOf(u8, disk, "\"v\"") != null);
 }
 
 const allocation_test_id = "allocation@sketerm.test";

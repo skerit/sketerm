@@ -268,6 +268,12 @@ pub const BrowserView = struct {
     /// drag emits notify::position per pixel).
     sidebar_px: i32 = places_mod.DEFAULT_SIDEBAR_PX,
     sidebar_save: debounce.State = .{},
+    /// Recents/frecency write debounce. Every directory click, Back,
+    /// Forward and breadcrumb records a visit, and a places write is a
+    /// full serialize plus an fsync of the file AND its directory —
+    /// 5-50ms per click on NFS or an encrypted disk. Flushed, not
+    /// dropped, by `deinit`.
+    recent_save: debounce.State = .{},
     /// Persisted sidebar open state; null = never toggled, so the
     /// default follows the application identity.
     sidebar_open: ?bool = null,
@@ -1267,7 +1273,9 @@ pub const BrowserView = struct {
         // view is a no-op whenever another browser face is live.
         const sidebar_flush = self.sidebar_save.teardown();
         if (sidebar_flush.source != 0) _ = c.g_source_remove(sidebar_flush.source);
-        if (sidebar_flush.persist) _ = self.savePlaces();
+        const recent_flush = self.recent_save.teardown();
+        if (recent_flush.source != 0) _ = c.g_source_remove(recent_flush.source);
+        if (sidebar_flush.persist or recent_flush.persist) _ = self.savePlaces();
         @import("places.zig").unregisterView(self);
         // Close the quick-look viewer FIRST: its destroy handler and
         // activate callback carry a raw pointer to this view, and the

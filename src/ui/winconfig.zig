@@ -230,7 +230,9 @@ pub fn setShaderParam(self: *Window, name: []const u8, value: f32, color: ?[3]f3
     }
     repointShaderOverrides(self);
     for (self.panes.items) |p| c.gtk_gl_area_queue_render(@ptrCast(p.surface.area));
-    persistConfig(self);
+    // Debounced: a two-second slider drag is 100+ ticks, and each write
+    // is a full serialize plus two fsyncs on the main loop.
+    self.scheduleConfigSave();
 }
 
 pub fn clearPaneShader(self: *Window) void {
@@ -1049,7 +1051,9 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     // stamped on a watcher that exists.
     @import("configwatch.zig").afterApply(self);
 
-    if (opts.persist) persistConfig(self);
+    // Debounced: a spin row emits one apply per tick and a colour
+    // picker one per drag frame. `Window.beginDestroy` flushes.
+    if (opts.persist) self.scheduleConfigSave();
 }
 
 test "continuous shader animation suppresses graphics offload" {
@@ -1086,9 +1090,31 @@ pub fn persistConfig(self: *Window) void {
     @import("configwatch.zig").noteSelfWrite(self);
 }
 
+/// Repeat-suppressor for a toast that a retrying writer would
+/// otherwise stack: a failing disk keeps failing, and 100 identical
+/// 4-second toasts bury the window. Same message inside the toast's
+/// own lifetime = one toast.
+pub const ToastGate = struct {
+    /// `@errorName` result — a static string, safe to hold.
+    last: []const u8 = &.{},
+    last_ms: i64 = 0,
+    /// Matches adw_toast_set_timeout(4) in `showToast`.
+    pub const repeat_ms: i64 = 4000;
+
+    pub fn allow(self: *ToastGate, name: []const u8, now_ms: i64) bool {
+        if (self.last.len != 0 and
+            std.mem.eql(u8, self.last, name) and
+            now_ms -| self.last_ms < repeat_ms) return false;
+        self.last = name;
+        self.last_ms = now_ms;
+        return true;
+    }
+};
+
 fn reportConfigPersistError(self: *Window, err: anyerror) void {
     std.debug.print("sketerm: prefs persist failed: {s}\n", .{@errorName(err)});
     if (self.destroying) return;
+    if (!self.persist_toast.allow(@errorName(err), @import("../util/clock.zig").nowMs())) return;
     var msg: [224]u8 = undefined;
     winmod.showToast(
         self,
@@ -1692,4 +1718,16 @@ test "renderer color resolution observes restored ANSI defaults" {
     };
     try std.testing.expectEqual(expected, style.colorToRGBA(.{ .palette = 1 }, true, unused, unused, &screen_palette));
     try std.testing.expectEqual(expected, style.colorToRGBA(.{ .palette = 1 }, true, unused, unused, &renderer_palette));
+}
+
+test "the persist toast is deduped for the length of its own timeout" {
+    var gate = ToastGate{};
+    try std.testing.expect(gate.allow("AccessDenied", 1_000));
+    // A 400ms-debounced retry loop must not stack a second toast.
+    try std.testing.expect(!gate.allow("AccessDenied", 1_400));
+    try std.testing.expect(!gate.allow("AccessDenied", 1_000 + ToastGate.repeat_ms - 1));
+    // Once the old toast is gone, the still-failing write says so again.
+    try std.testing.expect(gate.allow("AccessDenied", 1_000 + ToastGate.repeat_ms));
+    // A DIFFERENT failure is news and is never suppressed.
+    try std.testing.expect(gate.allow("NoConfigPath", 1_000 + ToastGate.repeat_ms));
 }

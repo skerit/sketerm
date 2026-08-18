@@ -257,9 +257,16 @@ pub const Window = struct {
     /// so a config reload must not push one window's choice into every
     /// other window.
     sidebar_user_set: bool = false,
-    /// Debounce for writing sidebar visibility or a dragged width back
-    /// to config: a divider drag emits notify::position per pixel.
-    sidebar_config_save: Debounce = .{},
+    /// Debounce for writing config.conf back to disk. Every in-app
+    /// config write coalesces here: a divider drag emits
+    /// notify::position per pixel and a shader slider one value-changed
+    /// per frame, and each write is a full serialize plus two fsyncs on
+    /// the GTK main loop. `beginDestroy` FLUSHES it, so nothing the user
+    /// changed in the last 400ms is lost on close.
+    config_save: Debounce = .{},
+    /// Suppresses a repeated "could not be saved" toast; a failing disk
+    /// fails on every debounce tick and would stack them 4 seconds deep.
+    persist_toast: winconfig_mod.ToastGate = .{},
     /// HBox holding [sidebar | toast_overlay] as the toolbar content.
     content_box: *c.GtkWidget,
     /// Opener page consumed by the NEXT page-attached, so a web popup /
@@ -1147,7 +1154,7 @@ pub const Window = struct {
         @import("prefs.zig").closeForWindow(@ptrCast(self));
         if (self.tab_sidebar) |sb| sb.sever();
         self.tab_sidebar = null;
-        const sidebar_flush = self.sidebar_config_save.teardown();
+        const sidebar_flush = self.config_save.teardown();
         if (sidebar_flush.source != 0) _ = c.g_source_remove(sidebar_flush.source);
         if (sidebar_flush.persist) winconfig_mod.persistConfig(self);
     }
@@ -3915,11 +3922,13 @@ pub const Window = struct {
         @import("prefs.zig").noteTabSidebarVisibility(@ptrCast(self), show);
     }
 
-    fn scheduleSidebarConfigSave(self: *Window) void {
-        if (self.sidebar_config_save.source != 0)
-            _ = c.g_source_remove(self.sidebar_config_save.source);
-        const source = c.g_timeout_add(400, @ptrCast(&onSidebarSaveTick), @ptrCast(self));
-        self.sidebar_config_save.scheduled(source);
+    /// Arm (or re-arm) the debounced config.conf write. The single
+    /// entry point for every in-app config mutation that persists.
+    pub fn scheduleConfigSave(self: *Window) void {
+        if (self.config_save.source != 0)
+            _ = c.g_source_remove(self.config_save.source);
+        const source = c.g_timeout_add(400, @ptrCast(&onConfigSaveTick), @ptrCast(self));
+        self.config_save.scheduled(source);
     }
 
     /// True while the tree sidebar is the tab surface for browsers:
@@ -5175,12 +5184,12 @@ fn onSidebarPosition(_: *c.GObject, _: ?*anyopaque, user: ?*anyopaque) callconv(
     const w: u16 = @intCast(pos);
     if (w == self.config.tab_sidebar_width) return;
     self.config.tab_sidebar_width = w;
-    self.scheduleSidebarConfigSave();
+    self.scheduleConfigSave();
 }
 
-fn onSidebarSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+fn onConfigSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Window, user);
-    if (self.sidebar_config_save.fired()) @import("winconfig.zig").persistConfig(self);
+    if (self.config_save.fired()) @import("winconfig.zig").persistConfig(self);
     return 0; // G_SOURCE_REMOVE
 }
 

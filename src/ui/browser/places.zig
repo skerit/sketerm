@@ -1932,8 +1932,24 @@ pub fn recordRecentSpec(self: *BrowserView, spec: []const u8) void {
     _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
     const now_ms = @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
     places_mod.recordVisit(self.allocator, &self.frecency, spec, now_ms, places_mod.FRECENCY_CAP);
-    _ = self.savePlaces();
+    // Debounced: navigation is a per-click path and the whole places
+    // file (bookmarks, labels, 200 frecency entries, section order) is
+    // rewritten and fsynced twice per save. In-memory state is already
+    // updated, so the sidebar below shows the new recents immediately.
+    scheduleRecentSave(self);
     if (self.places_on) self.renderPlaces();
+}
+
+/// Arm (or re-arm) the debounced places write for visit recording.
+fn scheduleRecentSave(self: *BrowserView) void {
+    if (self.recent_save.source != 0) _ = c.g_source_remove(self.recent_save.source);
+    self.recent_save.scheduled(c.g_timeout_add(400, @ptrCast(&onRecentSaveTick), @ptrCast(self)));
+}
+
+fn onRecentSaveTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = @import("../../util/cast.zig").userData(BrowserView, user);
+    if (self.recent_save.fired()) _ = self.savePlaces();
+    return 0; // G_SOURCE_REMOVE
 }
 
 test "hostSectionTitle titleizes the bare host name" {

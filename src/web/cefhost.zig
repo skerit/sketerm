@@ -4232,6 +4232,9 @@ pub const Host = struct {
 
     /// Perform the deferred extension restarts. Once per poll turn.
     pub fn webextPump(self: *Host) void {
+        // Debounced storage.local writes land here, one loop iteration
+        // after their window expires.
+        self.webext.flushStores(nowMs());
         if (self.webext_reload.items.len == 0) return;
         const pending = self.webext_reload.toOwnedSlice(self.gpa) catch return;
         defer {
