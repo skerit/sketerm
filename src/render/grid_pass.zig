@@ -1220,10 +1220,11 @@ pub const GridPass = struct {
     /// SGR line decorations (underline / double / curly / strike /
     /// overline) for one overlay cell at its visual column. CellPass
     /// draws these in-shader for plain rows; overlay rows get flat
-    /// quads here, except curly, which gets a strip quad evaluated by
-    /// the shared `sk_curlyCoverage` so both passes draw the same
-    /// wave. Honours SGR 58 underline_color, falling back to the
-    /// resolved fg.
+    /// quads here — placed by the SAME `style.zig` geometry, so a row
+    /// that switches passes has no seam — except curly, which gets a
+    /// strip quad evaluated by the shared `sk_curlyCoverage` so both
+    /// passes draw the same wave. Honours SGR 58 underline_color,
+    /// falling back to the resolved fg.
     fn emitCellDeco(
         self: *GridPass,
         pool: *const StylePool,
@@ -1254,28 +1255,33 @@ pub const GridPass = struct {
         const is_wide = (cell.flags & 0b0000_0001) != 0;
         const x: f32 = self.pad + @as(f32, @floatFromInt(visual_col)) * cw * x_scale;
         const w: f32 = cw * x_scale * (if (is_wide) @as(f32, 2.0) else 1.0);
-        const thin: f32 = @max(1.0, ch / 14.0);
+        // Every rect comes from the shared geometry in style.zig, the
+        // same numbers the CellPass shader places its strip with.
+        const push = struct {
+            fn line(gp: *GridPass, r: style_util.DecoRect, px: f32, py: f32, pw: f32, col: [4]f32) !void {
+                try gp.pushQuadDim(.{ px, py + r.y }, .{ pw, r.h }, .{ 0, 0 }, .{ 0, 0 }, col, 0.0, 1.0);
+            }
+        }.line;
 
         if (a.double_underline) {
-            try self.pushQuadDim(.{ x, y + ch - thin - 1.0 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
-            try self.pushQuadDim(.{ x, y + ch - 3.0 * thin - 1.0 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+            for (style_util.decoDoubleLines(ch)) |r| try push(self, r, x, y, w, color);
         } else if (a.curly_underline) {
-            const strip_h = style_util.curlyStripHeight(ch);
+            const strip = style_util.decoStrip(.curly, ch);
             try self.pushCurlyQuad(
-                .{ x, y + ch - strip_h },
-                .{ w, strip_h },
+                .{ x, y + strip.y },
+                .{ w, strip.h },
                 color,
                 self.effectiveBg(style),
                 w,
             );
         } else if (a.underline) {
-            try self.pushQuadDim(.{ x, y + ch - thin - 1.0 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+            try push(self, style_util.decoStrip(.underline, ch), x, y, w, color);
         }
         if (a.strikethrough) {
-            try self.pushQuadDim(.{ x, y + ch * 0.5 - thin * 0.5 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+            try push(self, style_util.decoStrip(.strikethrough, ch), x, y, w, color);
         }
         if (a.overline) {
-            try self.pushQuadDim(.{ x, y }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+            try push(self, style_util.decoStrip(.overline, ch), x, y, w, color);
         }
     }
 

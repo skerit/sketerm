@@ -1384,6 +1384,12 @@ pub fn main() !u8 {
         if (rc != 0) return rc;
     }
 
+    // Straight decorations: CellPass vs GridPass pixel parity.
+    {
+        const rc = try decoGeometryStage(allocator);
+        if (rc != 0) return rc;
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }
@@ -1688,7 +1694,9 @@ fn blendModeStage(allocator: std.mem.Allocator) !u8 {
     return 0;
 }
 
-// ---- curly underline ----------------------------------------------
+// ---- SGR line decorations ------------------------------------------
+
+const style_util = @import("render/style.zig");
 
 /// Undercurl parity between the two shader pairs. Row 0 is ASCII, so
 /// CellPass draws it in-shader; row 2 is Hebrew, which routes the row
@@ -1791,7 +1799,12 @@ fn curlyUnderlineStage(allocator: std.mem.Allocator) !u8 {
     const ch: usize = atlas.?.cell_h;
     const cw: usize = atlas.?.cell_w;
     const pad: usize = @intFromFloat(grid_pass.pad);
-    const strip_h: usize = @intFromFloat(@import("render/style.zig").curlyStripHeight(@floatFromInt(ch)));
+    // Ask the shared geometry where the strip is — it no longer sits
+    // flush with the cell bottom (there is a 1px clearance now), and
+    // hardcoding either number here would just be a third copy.
+    const strip = style_util.decoStrip(.curly, @floatFromInt(ch));
+    const strip_h: usize = @intFromFloat(strip.h);
+    const strip_y: usize = @intFromFloat(strip.y);
 
     // Per-column centre of mass of the red decoration pixels inside a
     // row's strip, in top-down pixels relative to the strip's top.
@@ -1824,8 +1837,8 @@ fn curlyUnderlineStage(allocator: std.mem.Allocator) !u8 {
     defer allocator.free(cell_profile);
     const grid_profile = try allocator.alloc(f32, span);
     defer allocator.free(grid_profile);
-    profile(fb, wu, hu, pad + ch - strip_h, strip_h, pad, span, cell_profile);
-    profile(fb, wu, hu, pad + 3 * ch - strip_h, strip_h, pad, span, grid_profile);
+    profile(fb, wu, hu, pad + strip_y, strip_h, pad, span, cell_profile);
+    profile(fb, wu, hu, pad + 2 * ch + strip_y, strip_h, pad, span, grid_profile);
 
     var failures: u8 = 0;
     const rows = [2]struct { name: []const u8, prof: []const f32 }{
@@ -1874,5 +1887,222 @@ fn curlyUnderlineStage(allocator: std.mem.Allocator) !u8 {
 
     if (failures != 0) return 82;
     std.debug.print("smoke-cell: curly underline matches across CellPass/GridPass (worst {d:.2}px)\n", .{worst});
+    return 0;
+}
+
+/// Underline / double underline / strikethrough / overline must land
+/// on the SAME scanlines whichever pass draws them, and on the
+/// scanlines `render/style.zig` says. The curly stage above is the
+/// wave's counterpart to this one.
+///
+/// Both halves matter. The two passes rasterise decorations through
+/// completely different code — CellPass places a strip in its vertex
+/// shader and shades it, GridPass emits flat quads on the CPU — so a
+/// row that gets routed to the overlay (RTL / complex script / DW-DH)
+/// used to show a different underline from its plain neighbour. The
+/// stage renders the same decorated spaces on a plain row and on a
+/// row carrying one Thai codepoint (complex script, still LTR, so
+/// columns do not move) and compares the two per-column vertical
+/// profiles bit for bit. It then compares BOTH against the rects the
+/// shared geometry predicts, so a pass that drifts in lockstep with
+/// its own private copy of the maths still fails.
+fn decoGeometryStage(allocator: std.mem.Allocator) !u8 {
+    const DW: c_int = 320;
+    const DH: c_int = 160;
+
+    var fbo: c_uint = 0;
+    var rbo: c_uint = 0;
+    c.glGenFramebuffers(1, &fbo);
+    c.glGenRenderbuffers(1, &rbo);
+    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
+    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, DW, DH);
+    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
+    defer {
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, 0);
+        c.glDeleteFramebuffers(1, &fbo);
+        c.glDeleteRenderbuffers(1, &rbo);
+    }
+    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
+        std.debug.print("smoke-cell: deco FAIL - framebuffer incomplete\n", .{});
+        return 84;
+    }
+
+    var atlas: ?*Atlas = null;
+    for (FONT_CANDIDATES) |path| {
+        if (Atlas.init(allocator, path, FONT_SIZE)) |a| {
+            atlas = a;
+            break;
+        } else |_| continue;
+    }
+    if (atlas == null) {
+        std.debug.print("smoke-cell: deco FAIL - no font\n", .{});
+        return 85;
+    }
+    defer atlas.?.deinit();
+    atlas.?.realize();
+
+    var pool = try StylePool.init(allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(allocator, &pool, 24, 6);
+    defer screen.deinit();
+
+    var parser = @import("parser/vt.zig").Parser.init(allocator);
+    defer parser.deinit();
+    const Ctx = struct { screen: *Screen, allocator: std.mem.Allocator };
+    const Emit = struct {
+        fn cb(user: ?*anyopaque, ev: @import("parser/event.zig").Event) void {
+            const ec: *Ctx = @ptrCast(@alignCast(user.?));
+            var mut = ev;
+            ec.screen.apply(ev);
+            mut.deinit(ec.allocator);
+        }
+    };
+    var ec = Ctx{ .screen = screen, .allocator = allocator };
+
+    // Decorated SPACES only: nothing but the decoration is lit inside
+    // the probed columns, so a profile is the decoration itself.
+    // Column groups (0-based): 0-1 underline, 3-4 double, 6-7 strike,
+    // 9-10 overline, 12-13 curly; the odd columns between them stay
+    // undecorated.
+    const deco_row =
+        "\x1b[38;2;255;0;0m" ++
+        "\x1b[4m  \x1b[24m " ++
+        "\x1b[21m  \x1b[24m " ++
+        "\x1b[9m  \x1b[29m " ++
+        "\x1b[53m  \x1b[55m " ++
+        "\x1b[4:3m  \x1b[24m";
+    parser.advance("\x1b[1;1H" ++ deco_row ++ "\x1b[3;1H" ++ deco_row ++
+        // One Thai codepoint far to the right of the probes routes row
+        // 3 to the GridPass overlay (complex script) while leaving the
+        // row left-to-right, so visual columns == logical columns.
+        "\x1b[3;21H\u{0E01}" ++
+        // Park the cursor on the last row so its quad cannot land in a
+        // probed band.
+        "\x1b[6;24H", Emit.cb, @ptrCast(&ec));
+
+    var cell_pass = CellPass.init(allocator);
+    defer cell_pass.deinit();
+    try cell_pass.realize();
+    var grid_pass = GridPass.init(allocator);
+    defer grid_pass.deinit();
+    try grid_pass.realize();
+    grid_pass.canvas_w = @floatFromInt(DW);
+    grid_pass.canvas_h = @floatFromInt(DH);
+
+    c.glViewport(0, 0, DW, DH);
+    c.glClearColor(0, 0, 0, 1);
+    c.glClear(c.GL_COLOR_BUFFER_BIT);
+    cell_pass.markAllDirty();
+    try cell_pass.rebuildAndUpload(screen, &pool, atlas.?);
+    cell_pass.draw(atlas.?, DW, DH);
+    grid_pass.vbuf_valid = false;
+    try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
+    grid_pass.draw(atlas.?, DW, DH);
+    c.glFinish();
+
+    const fb = try allocator.alloc(u8, @as(usize, @intCast(DW * DH)) * 4);
+    defer allocator.free(fb);
+    c.glReadPixels(0, 0, DW, DH, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+
+    const wu: usize = @intCast(DW);
+    const hu: usize = @intCast(DH);
+    const cw: usize = atlas.?.cell_w;
+    const chu: usize = atlas.?.cell_h;
+    const chf: f32 = @floatFromInt(chu);
+    const pad: usize = @intFromFloat(grid_pass.pad);
+
+    const helpers = struct {
+        /// Lit test at a screen pixel — glReadPixels is bottom-up.
+        fn lit(buf: []const u8, w: usize, h: usize, x: usize, y_top: usize) bool {
+            const o = ((h - 1 - y_top) * w + x) * 4;
+            const sum: u32 = @as(u32, buf[o]) + buf[o + 1] + buf[o + 2];
+            return sum > 30;
+        }
+        fn markRect(r: style_util.DecoRect, out: []bool) void {
+            var i: usize = @intFromFloat(r.y);
+            const end: usize = @intFromFloat(r.y + r.h);
+            while (i < end and i < out.len) : (i += 1) out[i] = true;
+        }
+    };
+
+    const profile = try allocator.alloc(bool, chu * 2);
+    defer allocator.free(profile);
+    const want = try allocator.alloc(bool, chu);
+    defer allocator.free(want);
+
+    const Group = struct { name: []const u8, col: usize, kind: style_util.Deco };
+    const groups = [_]Group{
+        .{ .name = "underline", .col = 0, .kind = .underline },
+        .{ .name = "double", .col = 3, .kind = .double_underline },
+        .{ .name = "strike", .col = 6, .kind = .strikethrough },
+        .{ .name = "overline", .col = 9, .kind = .overline },
+        .{ .name = "curly", .col = 12, .kind = .curly },
+    };
+
+    var failures: u8 = 0;
+    for (groups) |grp| {
+        const x = pad + grp.col * cw + cw / 2;
+        const cell_prof = profile[0..chu];
+        const grid_prof = profile[chu..];
+        for (0..chu) |dy| {
+            // Row 0 is drawn by CellPass, row 2 by the GridPass overlay.
+            cell_prof[dy] = helpers.lit(fb, wu, hu, x, pad + dy);
+            grid_prof[dy] = helpers.lit(fb, wu, hu, x, pad + 2 * chu + dy);
+        }
+
+        var n_cell: usize = 0;
+        var n_grid: usize = 0;
+        for (cell_prof) |b| n_cell += @intFromBool(b);
+        for (grid_prof) |b| n_grid += @intFromBool(b);
+        std.debug.print("smoke-cell: deco {s} lit cell={d} grid={d} (ch={d})\n", .{ grp.name, n_cell, n_grid, chu });
+        if (n_cell == 0 or n_grid == 0) {
+            std.debug.print("smoke-cell: deco FAIL - {s} missing from a pass (cell={d} grid={d})\n", .{ grp.name, n_cell, n_grid });
+            failures += 1;
+            continue;
+        }
+
+        if (grp.kind == .curly) {
+            // The wave's SHAPE is curlyUnderlineStage's job; what this
+            // stage adds is where the strip sits, which that stage
+            // takes as given. Neither pass may light a pixel outside
+            // the shared strip.
+            @memset(want, false);
+            helpers.markRect(style_util.decoStrip(.curly, chf), want);
+            for (0..chu) |dy| {
+                if ((cell_prof[dy] or grid_prof[dy]) and !want[dy]) {
+                    std.debug.print("smoke-cell: deco FAIL - curly lit outside its strip at dy={d}\n", .{dy});
+                    failures += 1;
+                    break;
+                }
+            }
+            continue;
+        }
+
+        @memset(want, false);
+        if (grp.kind == .double_underline) {
+            for (style_util.decoDoubleLines(chf)) |r| helpers.markRect(r, want);
+        } else {
+            helpers.markRect(style_util.decoStrip(grp.kind, chf), want);
+        }
+
+        var mismatch_pass: usize = 0;
+        var mismatch_want: usize = 0;
+        for (0..chu) |dy| {
+            if (cell_prof[dy] != grid_prof[dy]) mismatch_pass += 1;
+            if (cell_prof[dy] != want[dy] or grid_prof[dy] != want[dy]) mismatch_want += 1;
+        }
+        if (mismatch_pass != 0) {
+            std.debug.print("smoke-cell: deco FAIL - {s} differs between CellPass and GridPass on {d} scanline(s)\n", .{ grp.name, mismatch_pass });
+            failures += 1;
+        }
+        if (mismatch_want != 0) {
+            std.debug.print("smoke-cell: deco FAIL - {s} does not match style.zig geometry on {d} scanline(s)\n", .{ grp.name, mismatch_want });
+            failures += 1;
+        }
+    }
+
+    if (failures != 0) return 86;
+    std.debug.print("smoke-cell: deco geometry parity OK\n", .{});
     return 0;
 }

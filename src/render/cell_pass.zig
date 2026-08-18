@@ -42,9 +42,9 @@ pub const Instance = extern struct {
     glyph_layer: f32 = 0,
     /// 0 = render glyph normally; >0.5 = no glyph (degenerate triangle).
     has_glyph: f32 = 0,
-    /// Line-decoration kind. 0 = none, 1 = underline, 2 = double
-    /// underline, 3 = curly underline, 4 = strikethrough, 5 = overline.
-    /// Drawn in a third pass after bg + glyph; uses `fg` for color.
+    /// Line-decoration kind — `style.zig`'s `Deco` as a float. Drawn
+    /// in a third pass after bg + glyph; uses `fg` for color, and its
+    /// strip rect comes from `style.zig`'s shared geometry.
     deco: f32 = 0,
     /// 1.0 = render this glyph italicized via a horizontal shear in
     /// the glyph pass. 0.0 = upright. Cheaper than loading a second
@@ -147,38 +147,13 @@ pub const VERT_SRC = style_util.DECO_GLSL ++
     \\        // the post-shear position later (after the corner-mix below
     \\        // assembles `pos`).
     \\    } else {
-    \\        // Decoration: derive a strip rect from the cell rect.
-    \\        // Heights: thin = max(2, ch/12). Curly is taller (ch/6)
-    \\        // because the wave needs vertical room.
-    \\        float kind = a_deco + 0.5;
-    \\        float ch = a_cell_size.y;
-    \\        float thin = max(2.0, ch / 12.0);
-    \\        float curly_h = sk_curlyStripH(ch);
-    \\        float dy = 0.0;
-    \\        float dh = thin;
-    \\        if (kind >= 1.0 && kind < 2.0) {
-    \\            // single underline — bottom strip
-    \\            dy = ch - thin;
-    \\            dh = thin;
-    \\        } else if (kind >= 2.0 && kind < 3.0) {
-    \\            // double underline — bottom 3px strip; frag draws 2 lines
-    \\            dy = ch - thin * 2.0 - 1.0;
-    \\            dh = thin * 2.0 + 1.0;
-    \\        } else if (kind >= 3.0 && kind < 4.0) {
-    \\            // curly underline — taller strip near the bottom
-    \\            dy = ch - curly_h;
-    \\            dh = curly_h;
-    \\        } else if (kind >= 4.0 && kind < 5.0) {
-    \\            // strikethrough — middle
-    \\            dy = ch * 0.55 - thin * 0.5;
-    \\            dh = thin;
-    \\        } else if (kind >= 5.0 && kind < 6.0) {
-    \\            // overline — top strip
-    \\            dy = 0.0;
-    \\            dh = thin;
-    \\        }
-    \\        origin = a_cell_xy + vec2(0.0, dy);
-    \\        size = vec2(a_cell_size.x, dh);
+    \\        // Decoration: the strip rect comes from the SHARED
+    \\        // geometry (render/style.zig, mirrored into this shader
+    \\        // as sk_decoStrip) so an overlay row drawn by GridPass
+    \\        // puts the same line in the same pixels.
+    \\        vec2 strip = sk_decoStrip(a_deco, a_cell_size.y);
+    \\        origin = a_cell_xy + vec2(0.0, strip.x);
+    \\        size = vec2(a_cell_size.x, strip.y);
     \\        v_color = vec4(a_deco_color.rgb * u_dim_fg, a_deco_color.a);
     \\        v_is_glyph = 0.0;
     \\        v_deco_kind = a_deco;
@@ -204,9 +179,10 @@ pub const VERT_SRC = style_util.DECO_GLSL ++
 // GLSL-side named constants:
 //   ATLAS_TEXEL = 1 / atlas page size — used for the faux-bold
 //                 one-texel left-neighbor sample.
-// The curly-underline constants and `sk_curlyCoverage` come from
-// `style.DECO_GLSL`, shared with GridPass so the two passes cannot
-// draw a different wave on the same row.
+// Every decoration constant — the strip rects, the double-underline
+// thirds, and `sk_curlyCoverage` — comes from `style.DECO_GLSL`,
+// shared with GridPass so the two passes cannot draw a different
+// line, or a different wave, on the same row.
 pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.comptimePrint(
     \\
     \\const float ATLAS_TEXEL = 1.0 / {d}.0;
@@ -260,7 +236,7 @@ pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.compt
     \\    if (kind >= 2.0 && kind < 3.0) {{
     \\        // Double underline: top half + bottom half drawn, gap in middle.
     \\        float vy = v_deco_local.y;
-    \\        if (vy > 0.33 && vy < 0.66) discard;
+    \\        if (vy > SK_DECO_DOUBLE_LO && vy < SK_DECO_DOUBLE_HI) discard;
     \\        o_frag = sk_out(v_color);
     \\        return;
     \\    }}
@@ -683,12 +659,7 @@ pub const CellPass = struct {
                 cached_fg = resolved.fg;
                 cached_bg = if (resolved.has_bg) resolved.bg else .{ 0, 0, 0, 0 };
                 cached_has_bg = resolved.has_bg;
-                cached_deco = if (style.attrs.curly_underline) 3.0
-                    else if (style.attrs.double_underline) 2.0
-                    else if (style.attrs.underline) 1.0
-                    else if (style.attrs.strikethrough) 4.0
-                    else if (style.attrs.overline) 5.0
-                    else 0.0;
+                cached_deco = @floatFromInt(@intFromEnum(style_util.decoKind(style.attrs)));
                 cached_deco_color = switch (style.underline_color) {
                     .default => cached_fg,
                     else => self.colorToRGBA(style.underline_color, true),
