@@ -24,7 +24,6 @@ pub const Error = error{
     DataSyncFailed,
     CloseFailed,
     RenameFailed,
-    ParentSyncFailed,
     OutOfMemory,
 };
 
@@ -34,10 +33,12 @@ const STAGE_ATTEMPTS = 128;
 var next_stage = std.atomic.Value(u64).init(1);
 
 const PosixWriteOps = struct {
-    fn open(_: *@This(), path: [*:0]const u8, flags: c_int, mode: c_uint) c_int {
+    // `c.mode_t` is c_uint on Linux and c_ushort on Darwin: spelling
+    // either concretely here is a hard compile error on the other.
+    fn open(_: *@This(), path: [*:0]const u8, flags: c_int, mode: c.mode_t) c_int {
         return c.open(path, flags, mode);
     }
-    fn fchmod(_: *@This(), fd: c_int, mode: c_uint) c_int {
+    fn fchmod(_: *@This(), fd: c_int, mode: c.mode_t) c_int {
         return c.fchmod(fd, mode);
     }
     fn write(_: *@This(), fd: c_int, bytes: [*]const u8, len: usize) isize {
@@ -65,6 +66,10 @@ pub const Transaction = struct {
     /// The directory swap, as a field so a test can run the whole
     /// upgrade on a filesystem that has no RENAME_EXCHANGE.
     exchange: *const fn ([*:0]const u8, [*:0]const u8) platform.RenameExchangeResult = platform.renameExchange,
+    /// The directory fsync, as a field for the same reason `exchange` is
+    /// one: a test has to be able to run the whole install on a
+    /// filesystem whose directory fsync fails.
+    sync_dir: *const fn ([*:0]const u8) c_int = posixSyncDir,
 
     /// Put the complete staged tree at its live path without deleting the old tree.
     pub fn commit(self: *Transaction) Error!void {
@@ -87,10 +92,19 @@ pub const Transaction = struct {
             }
         }
         self.phase = .committed;
-        syncDir(self.base) catch |err| {
-            self.rollback() catch {};
-            return err;
-        };
+        self.syncBase();
+    }
+
+    /// Push the install directory's entry to disk, best effort.
+    ///
+    /// Every caller runs AFTER a rename that has already committed and
+    /// cannot be rolled back. A directory fsync fails outright on FUSE
+    /// and network homes, so reporting it would tell the caller nothing
+    /// was installed while the new tree is already live.
+    fn syncBase(self: *Transaction) void {
+        var base_z_buf: [MAX_PATH]u8 = undefined;
+        const base_z = pathz.pathZ(&base_z_buf, self.base) catch return;
+        _ = self.sync_dir(base_z);
     }
 
     /// Exchange the staged and live trees, leaving the old tree at the
@@ -141,22 +155,19 @@ pub const Transaction = struct {
             return error.RenameFailed;
         }
         _ = removeTree(self.stage);
-        const sync_result = syncDir(self.base);
+        self.syncBase();
         self.phase = .done;
-        const release_result = self.releaseLock();
-        try sync_result;
-        try release_result;
+        return self.releaseLock();
     }
 
     /// Accept the committed tree, then remove the obsolete tree left at the stage path.
     pub fn finish(self: *Transaction) Error!void {
         if (self.phase != .committed) return error.RenameFailed;
         const removed = !self.replaced_existing or removeTree(self.stage);
-        const sync_result = syncDir(self.base);
+        self.syncBase();
         self.phase = .done;
         const release_result = self.releaseLock();
         if (!removed) return error.WriteFailed;
-        try sync_result;
         try release_result;
     }
 
@@ -272,7 +283,7 @@ fn beginWithOps(
             try writeEntry(ops, full, entry.data);
         }
     }
-    try syncTree(stage_path);
+    try syncTree(stage_path, 0);
 
     var staged = try validateDirectory(gpa, stage_path, expected_id, expected.version, expected.name);
     staged.deinit();
@@ -411,19 +422,34 @@ fn mkdirAll(path: []const u8) Error!void {
     if (c.lstat(path_z, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFDIR) return error.MkdirFailed;
 }
 
-fn syncDir(path: []const u8) Error!void {
-    var path_z_buf: [MAX_PATH]u8 = undefined;
-    const path_z = pathz.pathZ(&path_z_buf, path) catch return error.PathTooLong;
+/// Open, fsync and close one directory. @return -1 on any failure.
+fn posixSyncDir(path_z: [*:0]const u8) c_int {
     const fd = c.open(path_z, c.O_RDONLY | c.O_DIRECTORY | c.O_CLOEXEC);
-    if (fd < 0) return error.OpenFailed;
-    if (c.fsync(fd) != 0) {
-        _ = c.close(fd);
-        return error.ParentSyncFailed;
-    }
-    if (c.close(fd) != 0) return error.CloseFailed;
+    if (fd < 0) return -1;
+    const synced = c.fsync(fd);
+    if (c.close(fd) != 0) return -1;
+    return synced;
 }
 
-fn syncTree(path: []const u8) Error!void {
+/// Best-effort directory sync; see `Transaction.syncBase` for why a
+/// directory fsync is never a verdict on whether the data is there.
+fn syncDir(path: []const u8) void {
+    var path_z_buf: [MAX_PATH]u8 = undefined;
+    const path_z = pathz.pathZ(&path_z_buf, path) catch return;
+    _ = posixSyncDir(path_z);
+}
+
+/// How deep the tree walkers below will follow.
+///
+/// `zip.limits.name_depth` bounds what an archive can ask us to create,
+/// so this is comfortably above any tree we mint; it exists because
+/// these walks recurse on directory contents, which a tree we did NOT
+/// mint could nest arbitrarily. Refusing is recoverable, a smashed main
+/// -thread stack under live GTK frames is not.
+const MAX_TREE_DEPTH: usize = 64;
+
+fn syncTree(path: []const u8, depth: usize) Error!void {
+    if (depth > MAX_TREE_DEPTH) return error.UnsafeAsset;
     var path_z_buf: [MAX_PATH]u8 = undefined;
     const path_z = pathz.pathZ(&path_z_buf, path) catch return error.PathTooLong;
     const dir = c.opendir(path_z) orelse return error.OpenFailed;
@@ -440,11 +466,11 @@ fn syncTree(path: []const u8) Error!void {
         const child_z = pathz.pathZ(&child_z_buf, child) catch return error.PathTooLong;
         var st: c.struct_stat = undefined;
         if (c.lstat(child_z, &st) != 0) return error.OpenFailed;
-        if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) try syncTree(child);
+        if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) try syncTree(child, depth + 1);
     }
     open = false;
     if (c.closedir(dir) != 0) return error.CloseFailed;
-    try syncDir(path);
+    syncDir(path);
 }
 
 fn cleanupStages(base: []const u8, prefix: []const u8) void {
@@ -462,7 +488,13 @@ fn cleanupStages(base: []const u8, prefix: []const u8) void {
 }
 
 /// Allocation-free recursive cleanup so OOM cannot strand a partial stage by itself.
+/// @return false when anything was left behind, over-deep trees included.
 fn removeTree(path: []const u8) bool {
+    return removeTreeAt(path, 0);
+}
+
+fn removeTreeAt(path: []const u8, depth: usize) bool {
+    if (depth > MAX_TREE_DEPTH) return false;
     var path_z_buf: [MAX_PATH]u8 = undefined;
     const path_z = pathz.pathZ(&path_z_buf, path) catch return false;
     var st: c.struct_stat = undefined;
@@ -478,7 +510,7 @@ fn removeTree(path: []const u8) bool {
             ok = false;
             continue;
         };
-        if (!removeTree(child)) ok = false;
+        if (!removeTreeAt(child, depth + 1)) ok = false;
     }
     if (c.closedir(dir) != 0) ok = false;
     if (c.rmdir(path_z) != 0) ok = false;
@@ -582,10 +614,10 @@ const FaultWriteOps = struct {
     failure: Failure = .none,
     max_write: usize = std.math.maxInt(usize),
 
-    fn open(_: *@This(), path: [*:0]const u8, flags: c_int, mode: c_uint) c_int {
+    fn open(_: *@This(), path: [*:0]const u8, flags: c_int, mode: c.mode_t) c_int {
         return c.open(path, flags, mode);
     }
-    fn fchmod(self: *@This(), fd: c_int, mode: c_uint) c_int {
+    fn fchmod(self: *@This(), fd: c_int, mode: c.mode_t) c_int {
         if (self.failure == .permission) {
             std.c._errno().* = c.EACCES;
             return -1;
@@ -849,4 +881,56 @@ test "a rejected upgrade rolls back without RENAME_EXCHANGE" {
     var new_z_buf: [MAX_PATH]u8 = undefined;
     var st: c.struct_stat = undefined;
     try t.expect(c.lstat(try pathz.pathZ(&new_z_buf, new_path), &st) != 0);
+}
+
+/// A home whose directory fsync is refused (FUSE, NFS, CIFS): EROFS is
+/// what made the old failure indistinguishable from "nothing installed".
+fn testSyncDirRefused(_: [*:0]const u8) c_int {
+    std.c._errno().* = c.EROFS;
+    return -1;
+}
+
+test "an upgrade completes on a filesystem whose directory fsync fails" {
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const dest = try setupOld(dir.path());
+    defer t.allocator.free(dest);
+    var tx = try beginV2(dir.path());
+    tx.sync_dir = testSyncDirRefused;
+    defer tx.deinit();
+    // The rename has committed by the time the directory is synced, so a
+    // refused sync must not roll the new tree back out.
+    try tx.commit();
+    try tx.finish();
+    const new_path = try std.fmt.allocPrint(t.allocator, "{s}/new.js", .{dest});
+    defer t.allocator.free(new_path);
+    var buf: [32]u8 = undefined;
+    try t.expectEqualStrings("new-complete", try readTestFile(new_path, &buf));
+    try t.expectEqual(@as(usize, 0), stageCount(dir.path()));
+    const old_path = try std.fmt.allocPrint(t.allocator, "{s}/old.js", .{dest});
+    defer t.allocator.free(old_path);
+    var old_z_buf: [MAX_PATH]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    try t.expect(c.lstat(try pathz.pathZ(&old_z_buf, old_path), &st) != 0);
+}
+
+test "tree walks refuse a directory nested deeper than they will recurse" {
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    var deep: std.ArrayList(u8) = .empty;
+    defer deep.deinit(t.allocator);
+    try deep.appendSlice(t.allocator, dir.path());
+    for (0..MAX_TREE_DEPTH + 2) |_| try deep.appendSlice(t.allocator, "/d");
+    try mkdirAll(deep.items);
+
+    try t.expectError(error.UnsafeAsset, syncTree(dir.path(), 0));
+    try t.expect(!removeTree(dir.path()));
+
+    // TestDir.deinit cannot clean this up either, so unwind by hand from
+    // the leaf: that the walkers refuse is the point of the test.
+    var len = deep.items.len;
+    while (len > dir.path().len) : (len -= 2) {
+        var z: [MAX_PATH]u8 = undefined;
+        _ = c.rmdir(try pathz.pathZ(&z, deep.items[0..len]));
+    }
 }

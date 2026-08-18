@@ -32,6 +32,11 @@ pub const limits = struct {
     pub const entry_uncompressed: usize = 64 * 1024 * 1024;
     pub const aggregate_uncompressed: usize = 256 * 1024 * 1024;
     pub const name_length: usize = 1024;
+    /// Path components one entry name may have. Unpacking and cleanup
+    /// walk the installed tree, so archive depth is stack depth: 1024
+    /// bytes of name buys ~512 levels, enough to overflow the main
+    /// thread's stack mid-install. No real extension is anywhere near.
+    pub const name_depth: usize = 32;
     pub const compression_ratio: usize = 200;
     pub const ratio_slack: usize = 64 * 1024;
 };
@@ -271,10 +276,13 @@ pub fn validateName(name: []const u8) Error!bool {
     const path = if (is_dir) name[0 .. name.len - 1] else name;
     if (path.len == 0) return error.UnsafeName;
     var components = std.mem.splitScalar(u8, path, '/');
+    var depth: usize = 0;
     while (components.next()) |component| {
         if (component.len == 0 or
             std.mem.eql(u8, component, ".") or
             std.mem.eql(u8, component, "..")) return error.UnsafeName;
+        depth += 1;
+        if (depth > limits.name_depth) return error.UnsafeName;
     }
     return is_dir;
 }
@@ -611,6 +619,30 @@ test "rejects overlong, duplicate, and unsafe names" {
         const zip = try buildZip(gpa, &.{.{ .name = name, .data = "x", .deflate = false }});
         defer gpa.free(zip);
         try t.expectError(error.UnsafeName, read(gpa, zip));
+    }
+
+    // Depth, not just length: `a/a/.../x` fits well inside the name
+    // budget while nesting deep enough to overflow the stack of anything
+    // that walks the unpacked tree.
+    {
+        var deep: std.ArrayList(u8) = .empty;
+        defer deep.deinit(gpa);
+        for (0..limits.name_depth) |_| try deep.appendSlice(gpa, "a/");
+        try deep.appendSlice(gpa, "x");
+        try t.expect(deep.items.len <= limits.name_length);
+        try t.expectError(error.UnsafeName, validateName(deep.items));
+        const zip = try buildZip(gpa, &.{.{ .name = deep.items, .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        try t.expectError(error.UnsafeName, read(gpa, zip));
+    }
+
+    // One component under the cap still installs.
+    {
+        var ok_name: std.ArrayList(u8) = .empty;
+        defer ok_name.deinit(gpa);
+        for (0..limits.name_depth - 1) |_| try ok_name.appendSlice(gpa, "a/");
+        try ok_name.appendSlice(gpa, "x");
+        try t.expect(!try validateName(ok_name.items));
     }
 }
 
