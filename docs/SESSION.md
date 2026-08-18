@@ -18993,3 +18993,19 @@ demuxers or decoders without them); ffmpeg is an optdepend on the host
 serving the files. Video/audio extension vocabularies moved to
 `filebrowser/paths.zig`, read by the poster generator, the classifier
 and the playback route alike.
+
+Seeking, same day: a transcoded spool cannot be byte-seeked (GStreamer's
+seek is a byte seek on the source and the bytes are still being
+written), so the Viewer now owns the transport: a `GtkPicture` paints
+the media stream and the shared `Playbar` drives it. A local file and a
+raw remote stream seek natively; a transcoded remote stream seeks by
+RESTARTING the host encode from the target (`preview_stream` takes
+`start_ms`, `-ss` before `-i`, so it lands on the keyframe at or before
+it), and the bar shows offset + stream timestamp against the source
+duration the helper probes with ffprobe on the first progress event
+(`duration_ms` on the job wire; 0 = unknown, unseekable timeline).
+`,` `.` `<` `>` and the slider all go through the bar; smoke-stream
+covers the seek encode (from 2000ms of a 3s clip: shorter, decodes,
+same duration). `SKETERM_SMOKE_E2E_VIEWER_ONLY=1` runs the viewer batch
+stage alone; the full smoke-e2e currently fails earlier in the CEF
+browser-action stage on this host, on the committed baseline too.

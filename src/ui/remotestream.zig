@@ -73,6 +73,13 @@ const Backend = struct {
     host: ?[]u8,
     path: []u8,
     mode: Mode,
+    /// `.transcode`: encode from this offset (the viewer's time seek).
+    start_ms: u64 = 0,
+    /// `.transcode`: the source duration the host probed (0 = unknown),
+    /// written on the streaming thread, read by the GUI's transport bar.
+    duration_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// `.transcode` actually engaged (vs. fell back to raw), for the GUI.
+    transcoded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     fs: ?fsdrive.Fs = null,
     /// `.transcode`: the job and its spool; `spool_done` once the encode
     /// finished, after which a short read is a real EOF.
@@ -118,7 +125,7 @@ const Backend = struct {
     /// reads of the original rather than fail playback outright.
     fn startTranscode(self: *Backend) void {
         const fs = &self.fs.?;
-        const job = fs.startPreviewStream(self.path) catch {
+        const job = fs.startPreviewStream(self.path, self.start_ms) catch {
             self.mode = .raw;
             return;
         };
@@ -129,6 +136,8 @@ const Backend = struct {
             if (std.mem.eql(u8, ev.ev, "progress") and ev.path.len > 0) {
                 self.spool = self.allocator.dupe(u8, ev.path) catch break;
                 self.job = job;
+                self.duration_ms.store(ev.duration_ms, .release);
+                self.transcoded.store(true, .release);
                 return;
             }
             if (ev.terminal()) break;
@@ -335,14 +344,30 @@ fn finalize(object: [*c]c.GObject) callconv(.c) void {
     if (parent_class) |pc| if (pc.finalize) |f| f(object);
 }
 
+/// The transcoded source's duration in ms (0 = not known yet, or a raw
+/// stream), safe from any thread.
+pub fn durationMs(stream: *c.GInputStream) u64 {
+    const backend = instanceOf(stream).backend orelse return 0;
+    return backend.duration_ms.load(.acquire);
+}
+
+/// Whether this stream is (still) a transcoded spool: false before the
+/// first touch and after a fallback to raw range reads.
+pub fn isTranscoded(stream: *c.GInputStream) bool {
+    const backend = instanceOf(stream).backend orelse return false;
+    return backend.transcoded.load(.acquire);
+}
+
 /// A new stream for `path` on `host` (null = the local daemon). Nothing
-/// connects until GStreamer first touches it. Caller owns one reference.
-pub fn new(host: ?[]const u8, path: []const u8, mode: Mode) ?*c.GInputStream {
+/// connects until GStreamer first touches it. `start_ms` is where a
+/// `.transcode` encode begins. Caller owns one reference.
+pub fn new(host: ?[]const u8, path: []const u8, mode: Mode, start_ms: u64) ?*c.GInputStream {
     const allocator = std.heap.c_allocator;
     const backend = allocator.create(Backend) catch return null;
     backend.* = .{
         .allocator = allocator,
         .mode = mode,
+        .start_ms = start_ms,
         .host = if (host) |h| (allocator.dupe(u8, h) catch {
             allocator.destroy(backend);
             return null;

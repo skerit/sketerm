@@ -590,10 +590,25 @@ pub const ViewerWindow = struct {
     /// text content is showing.
     text_slot: *c.GtkWidget,
     text_view: *c.GtkTextView,
-    /// The playback surface (GtkVideo with its own controls); hidden
-    /// unless video/audio content is showing. One for the window; the
-    /// media stream inside is swapped per item.
+    /// The playback surface: a GtkPicture painting the media stream
+    /// plus the viewer's own transport bar, in one box hidden unless
+    /// video/audio content is showing. Our own bar (not GtkVideo's)
+    /// because a transcoded remote stream seeks by RESTARTING the host
+    /// encode at a time offset, which GStreamer's byte seek cannot do.
     video_slot: *c.GtkWidget,
+    video_picture: *c.GtkWidget,
+    video_bar: *Playbar,
+    /// The remote input stream behind the current media stream (our own
+    /// reference), null for local files.
+    video_input: ?*c.GInputStream = null,
+    /// Where the current (transcoded) segment starts in the source; the
+    /// bar shows offset + stream timestamp.
+    video_offset_ms: u64 = 0,
+    /// The current item was opened in transcode mode (a time seek is a
+    /// restart, unless the stream reports it fell back to raw).
+    video_transcode: bool = false,
+    /// 200ms position push into the transport bar (0 = none).
+    video_tick: c.guint = 0,
     options: Options,
     /// Header controls hidden while a cast is showing.
     image_controls: [IMAGE_CONTROL_COUNT]*c.GtkWidget,
@@ -687,11 +702,23 @@ pub const ViewerWindow = struct {
         c.gtk_widget_set_vexpand(cast_slot, 1);
         c.gtk_widget_set_visible(cast_slot, 0);
         c.gtk_box_append(@ptrCast(content), cast_slot);
-        const video_slot = c.gtk_video_new().?;
+        const video_slot = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
         c.gtk_widget_set_vexpand(video_slot, 1);
-        c.gtk_widget_set_hexpand(video_slot, 1);
-        c.gtk_video_set_autoplay(@ptrCast(video_slot), 1);
         c.gtk_widget_set_visible(video_slot, 0);
+        const video_picture = c.gtk_picture_new().?;
+        c.gtk_picture_set_content_fit(@ptrCast(video_picture), c.GTK_CONTENT_FIT_CONTAIN);
+        c.gtk_widget_set_vexpand(video_picture, 1);
+        c.gtk_widget_set_hexpand(video_picture, 1);
+        c.gtk_box_append(@ptrCast(video_slot), video_picture);
+        const video_bar = try Playbar.create(allocator, .{
+            .ctx = @ptrCast(self),
+            .toggle = &srcVideoToggle,
+            .restart = &srcVideoRestart,
+            .seek_to_ms = &srcVideoSeekTo,
+        }, .{ .restart_button = true, .speed_dropdown = false, .seek_throttle_ms = 200, .seek_guard_us = 2_000_000 });
+        errdefer video_bar.destroy();
+        c.gtk_widget_set_tooltip_text(video_bar.scale, "Seek (,/. 5s, </> 30s)");
+        c.gtk_box_append(@ptrCast(video_slot), video_bar.widget());
         c.gtk_box_append(@ptrCast(content), video_slot);
         const text_slot = c.gtk_scrolled_window_new().?;
         c.gtk_scrolled_window_set_policy(@ptrCast(text_slot), c.GTK_POLICY_AUTOMATIC, c.GTK_POLICY_AUTOMATIC);
@@ -753,6 +780,8 @@ pub const ViewerWindow = struct {
             .text_slot = text_slot,
             .text_view = @ptrCast(@alignCast(text_view)),
             .video_slot = video_slot,
+            .video_picture = video_picture,
+            .video_bar = video_bar,
             .options = options,
             .image_controls = .{
                 zoom_out,    @ptrCast(@alignCast(zoom_label)), zoom_in,     fit_button,
@@ -860,9 +889,14 @@ pub const ViewerWindow = struct {
             .video => |stream| {
                 _ = c.g_signal_handlers_disconnect_matched(@ptrCast(stream), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @ptrCast(self));
                 c.g_object_unref(@ptrCast(stream));
+                if (self.video_input) |vin| c.g_object_unref(@ptrCast(vin));
+                self.video_input = null;
             },
             else => {},
         }
+        if (self.video_tick != 0) _ = c.g_source_remove(self.video_tick);
+        self.video_tick = 0;
+        self.video_bar.destroy();
         if (self.pending_mount) |pending| pending.viewer = null;
         self.pending_mount = null;
         self.anim_bar.destroy();
@@ -896,6 +930,9 @@ pub const ViewerWindow = struct {
             .video => |stream| c.gtk_media_stream_pause(stream),
             else => {},
         }
+        self.video_bar.sever();
+        if (self.video_tick != 0) _ = c.g_source_remove(self.video_tick);
+        self.video_tick = 0;
     }
 
     /// Show exactly one content surface and the header controls that
@@ -930,28 +967,55 @@ pub const ViewerWindow = struct {
     }
 
     /// Release the outgoing item's media stream: detach it from the
-    /// GtkVideo (which stops playback) and drop our reference. Safe in
+    /// picture (which stops playback) and drop our references. Safe in
     /// any content mode.
     fn closeVideo(self: *ViewerWindow) void {
-        const stream = switch (self.content) {
-            .video => |s| s,
-            else => return,
-        };
-        self.content = .image;
-        _ = c.g_signal_handlers_disconnect_matched(@ptrCast(stream), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @ptrCast(self));
-        c.gtk_video_set_media_stream(@ptrCast(self.video_slot), null);
-        c.g_object_unref(@ptrCast(stream));
+        self.releaseVideoStream();
+        if (self.content == .video) self.content = .image;
         self.setContentMode(.image);
     }
 
+    /// Drop the current media stream and its input, keeping the video
+    /// content mode (a time seek replaces the stream in place).
+    fn releaseVideoStream(self: *ViewerWindow) void {
+        const stream = switch (self.content) {
+            .video => |st| st,
+            else => return,
+        };
+        if (self.video_tick != 0) _ = c.g_source_remove(self.video_tick);
+        self.video_tick = 0;
+        _ = c.g_signal_handlers_disconnect_matched(@ptrCast(stream), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @ptrCast(self));
+        c.gtk_media_stream_pause(stream);
+        c.gtk_picture_set_paintable(@ptrCast(self.video_picture), null);
+        c.g_object_unref(@ptrCast(stream));
+        if (self.video_input) |vin| c.g_object_unref(@ptrCast(vin));
+        self.video_input = null;
+        self.content = .image;
+    }
+
     /// Play a video/audio resource in place. A LOCAL file is a plain
-    /// GtkMediaFile; a remote one streams through the daemon via a
-    /// seekable input stream (`remotestream.zig`). Playback failure
-    /// (missing GStreamer plugins, unreadable file) falls back to the
-    /// daemon poster so the item still shows something.
+    /// GtkMediaFile; a remote one streams through the daemon
+    /// (`remotestream.zig`: a transcoded spool for video, range reads
+    /// for audio). Playback failure (missing GStreamer plugins,
+    /// unreadable file) falls back to the daemon poster so the item
+    /// still shows something.
     fn showVideo(self: *ViewerWindow, resource: model.Resource) void {
         self.target.cancel();
         self.setMetadata(if (paths.isVideoName(resource.name())) "Video" else "Audio");
+        self.video_transcode = resource.host != null and paths.isVideoName(resource.name());
+        var buf: [600:0]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&buf, "Opening {s}...", .{resource.name()}) catch "Opening...";
+        c.gtk_label_set_text(self.status, text.ptr);
+        self.canvas.setAccessible(resource.name(), "Playing", false);
+        self.startVideoStream(resource, 0);
+    }
+
+    /// Open (or, on a time seek, re-open) the media stream for
+    /// `resource` from `start_ms`. Only a transcoded remote stream
+    /// honours a nonzero start; the others start at 0 and seek natively.
+    fn startVideoStream(self: *ViewerWindow, resource: model.Resource, start_ms: u64) void {
+        self.releaseVideoStream();
+        self.video_offset_ms = start_ms;
         const stream: *c.GtkMediaStream = blk: {
             if (resource.host == null) {
                 var z: [4096:0]u8 = undefined;
@@ -960,9 +1024,9 @@ pub const ViewerWindow = struct {
             }
             // Video is transcoded on the host to a cheap preview; audio
             // streams as-is (its bitrate is the whole point).
-            const mode: remotestream.Mode = if (paths.isVideoName(resource.name())) .transcode else .raw;
-            const remote = remotestream.new(resource.host, resource.path, mode) orelse break :blk null;
-            defer c.g_object_unref(@ptrCast(remote));
+            const mode: remotestream.Mode = if (self.video_transcode) .transcode else .raw;
+            const remote = remotestream.new(resource.host, resource.path, mode, start_ms) orelse break :blk null;
+            self.video_input = remote;
             break :blk c.gtk_media_file_new_for_input_stream(remote);
         } orelse {
             c.gtk_label_set_text(self.status, "Unable to start playback; showing the poster");
@@ -971,12 +1035,87 @@ pub const ViewerWindow = struct {
         self.content = .{ .video = stream };
         _ = c.g_signal_connect_data(@ptrCast(stream), "notify::error", @ptrCast(&onVideoError), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(@ptrCast(stream), "notify::prepared", @ptrCast(&onVideoPrepared), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        c.gtk_video_set_media_stream(@ptrCast(self.video_slot), stream);
+        _ = c.g_signal_connect_data(@ptrCast(stream), "notify::ended", @ptrCast(&onVideoEnded), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_picture_set_paintable(@ptrCast(self.video_picture), @ptrCast(stream));
         self.setContentMode(.video);
-        var buf: [600:0]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&buf, "Opening {s}...", .{resource.name()}) catch "Opening...";
-        c.gtk_label_set_text(self.status, text.ptr);
-        self.canvas.setAccessible(resource.name(), "Playing", false);
+        c.gtk_media_stream_play(stream);
+        self.video_tick = c.g_timeout_add(200, @ptrCast(&onVideoTick), @ptrCast(self));
+        self.syncVideoBar();
+    }
+
+    /// Whether a seek on the current item must restart the host encode.
+    fn videoSeeksByRestart(self: *ViewerWindow) bool {
+        if (!self.video_transcode) return false;
+        const vin = self.video_input orelse return false;
+        // Before the stream is touched the mode is still the requested
+        // one; after, the stream says whether the transcode engaged.
+        const stream = switch (self.content) {
+            .video => |st| st,
+            else => return false,
+        };
+        if (c.gtk_media_stream_is_prepared(stream) == 0) return true;
+        return remotestream.isTranscoded(vin);
+    }
+
+    /// Absolute time seek in source ms.
+    fn seekVideoTo(self: *ViewerWindow, target_ms: u64) void {
+        const stream = switch (self.content) {
+            .video => |st| st,
+            else => return,
+        };
+        var target = target_ms;
+        if (self.videoDurationMs()) |d| target = @min(target, d);
+        if (self.videoSeeksByRestart()) {
+            const resource = self.current() orelse return;
+            self.startVideoStream(resource, target);
+            return;
+        }
+        if (c.gtk_media_stream_is_seekable(stream) == 0) return;
+        c.gtk_media_stream_seek(stream, @intCast(target * 1000));
+    }
+
+    /// The source duration the transport bar shows: the host's probe for
+    /// a transcoded stream (its own timeline starts at the seek offset),
+    /// the stream's for everything else. Null while unknown.
+    fn videoDurationMs(self: *ViewerWindow) ?u64 {
+        const stream = switch (self.content) {
+            .video => |st| st,
+            else => return null,
+        };
+        if (self.videoSeeksByRestart()) {
+            const d = remotestream.durationMs(self.video_input.?);
+            return if (d > 0) d else null;
+        }
+        const d = c.gtk_media_stream_get_duration(stream);
+        return if (d > 0) @intCast(@divTrunc(d, 1000)) else null;
+    }
+
+    fn videoPositionMs(self: *ViewerWindow) u64 {
+        const stream = switch (self.content) {
+            .video => |st| st,
+            else => return 0,
+        };
+        const ts = c.gtk_media_stream_get_timestamp(stream);
+        const local: u64 = if (ts > 0) @intCast(@divTrunc(ts, 1000)) else 0;
+        return self.video_offset_ms + local;
+    }
+
+    fn syncVideoBar(self: *ViewerWindow) void {
+        const stream = switch (self.content) {
+            .video => |st| st,
+            else => return,
+        };
+        const kind: Playbar.Kind = if (c.gtk_media_stream_get_ended(stream) != 0)
+            .finished
+        else if (c.gtk_media_stream_get_playing(stream) != 0)
+            .playing
+        else
+            .paused;
+        self.video_bar.setState(.{
+            .kind = kind,
+            .position_ms = self.videoPositionMs(),
+            .duration_ms = self.videoDurationMs(),
+        });
     }
 
     /// The image pipeline: a daemon-rendered preview (poster for
@@ -1612,16 +1751,40 @@ fn toggleVideo(stream: *c.GtkMediaStream) void {
     if (c.gtk_media_stream_get_playing(stream) != 0) c.gtk_media_stream_pause(stream) else c.gtk_media_stream_play(stream);
 }
 
-/// Seek relative to the current position, clamped to the file; the
-/// stream API is in microseconds.
-fn seekVideo(stream: *c.GtkMediaStream, delta_ms: i64) void {
-    if (c.gtk_media_stream_is_seekable(stream) == 0) return;
-    const now: i64 = c.gtk_media_stream_get_timestamp(stream);
-    const duration: i64 = c.gtk_media_stream_get_duration(stream);
-    var target = now + delta_ms * 1000;
-    if (target < 0) target = 0;
-    if (duration > 0 and target > duration) target = duration;
-    c.gtk_media_stream_seek(stream, target);
+fn srcVideoToggle(ctx: ?*anyopaque) void {
+    const self = cast.userData(ViewerWindow, ctx);
+    switch (self.content) {
+        .video => |stream| toggleVideo(stream),
+        else => {},
+    }
+    self.syncVideoBar();
+}
+
+fn srcVideoRestart(ctx: ?*anyopaque) void {
+    cast.userData(ViewerWindow, ctx).seekVideoTo(0);
+}
+
+fn srcVideoSeekTo(ctx: ?*anyopaque, target_ms: u64) void {
+    cast.userData(ViewerWindow, ctx).seekVideoTo(target_ms);
+}
+
+fn onVideoTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(ViewerWindow, user);
+    if (self.content != .video) {
+        self.video_tick = 0;
+        return 0;
+    }
+    self.syncVideoBar();
+    return 1;
+}
+
+fn onVideoEnded(stream: *c.GtkMediaStream, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(ViewerWindow, user);
+    switch (self.content) {
+        .video => |current_stream| if (current_stream != stream) return,
+        else => return,
+    }
+    self.syncVideoBar();
 }
 
 /// The stream failed (no decoder, unreadable file, dropped host): say
@@ -1648,8 +1811,9 @@ fn onVideoPrepared(stream: *c.GtkMediaStream, _: ?*c.GParamSpec, user: ?*anyopaq
         else => return,
     }
     if (c.gtk_media_stream_is_prepared(stream) == 0) return;
+    self.syncVideoBar();
     const resource = self.current() orelse return;
-    const duration_ms: u64 = @intCast(@divTrunc(c.gtk_media_stream_get_duration(stream), 1000));
+    const duration_ms: u64 = self.videoDurationMs() orelse 0;
     var buf: [600:0]u8 = undefined;
     const text = std.fmt.bufPrintZ(&buf, "{s}  {d}:{d:0>2}{s}", .{
         resource.name(),
@@ -1926,11 +2090,11 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
                 c.GDK_KEY_Right => self.move(1),
                 c.GDK_KEY_space, c.GDK_KEY_KP_Space => toggleVideo(stream),
                 c.GDK_KEY_k, c.GDK_KEY_K => if (self.options.close_on_space) toggleVideo(stream) else return 0,
-                c.GDK_KEY_comma => seekVideo(stream, -5_000),
-                c.GDK_KEY_period => seekVideo(stream, 5_000),
-                c.GDK_KEY_less => seekVideo(stream, -30_000),
-                c.GDK_KEY_greater => seekVideo(stream, 30_000),
-                c.GDK_KEY_r, c.GDK_KEY_R => c.gtk_media_stream_seek(stream, 0),
+                c.GDK_KEY_comma => self.video_bar.seekRelative(-5_000),
+                c.GDK_KEY_period => self.video_bar.seekRelative(5_000),
+                c.GDK_KEY_less => self.video_bar.seekRelative(-30_000),
+                c.GDK_KEY_greater => self.video_bar.seekRelative(30_000),
+                c.GDK_KEY_r, c.GDK_KEY_R => self.seekVideoTo(0),
                 c.GDK_KEY_F11 => toggleFullscreen(self),
                 c.GDK_KEY_Escape => if (self.fullscreen) toggleFullscreen(self) else return 0,
                 else => return 0,

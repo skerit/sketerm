@@ -2052,6 +2052,8 @@ pub const FsJob = struct {
     /// status is reported, not treated as a failed job.
     rejected: u64 = 0,
     exit_status: i64 = 0,
+    /// preview_stream: the source's duration, once the helper probed it.
+    duration_ms: u64 = 0,
     /// Entry the helper is working on RIGHT NOW, and how far through
     /// its entry count it is. The helper puts the path on the wire
     /// only when it changes, so this is sticky between updates.

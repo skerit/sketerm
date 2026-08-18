@@ -768,6 +768,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_VIEWER_ONLY") != null) {
+        const app = drive orelse return fail("focused viewer smoke has no display driver");
+        if (!have_wl) return fail("focused viewer smoke is GTK/Wayland-only");
+        if (viewerCastStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
+        say("viewer: focused image/cast/text/hex/video batch stage passed");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_TABBAR_ONLY") != null) {
         if (platform.is_macos) return fail("focused TabBar smoke is GTK-only");
         if (themeSingletonStage(allocator, drive, rt, &wl_z)) |why| return failMsg(why);

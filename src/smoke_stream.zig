@@ -130,7 +130,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     // ── transcode mode: growing spool, push-mode contract ────────
     {
-        const stream = remotestream.new(host, std.mem.span(clip.ptr), .transcode) orelse fail("new transcode stream");
+        const stream = remotestream.new(host, std.mem.span(clip.ptr), .transcode, 0) orelse fail("new transcode stream");
         defer c.g_object_unref(@ptrCast(stream));
         const file_stream: *c.GFileInputStream = @ptrCast(stream);
         // Same order giostreamsrc uses at start: seekability, then size.
@@ -150,11 +150,28 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         writeFile(spool_copy.ptr, bytes);
         if (!run(&[_:null]?[*:0]const u8{ "ffmpeg", "-nostdin", "-v", "error", "-i", spool_copy.ptr, "-f", "null", "-", null })) fail("spool does not decode");
         std.debug.print("smoke-stream: PASS transcode ({d} -> {d} bytes, fragmented MP4, decodes)\n", .{ clip_size, bytes.len });
+        const full_len = bytes.len;
+        const dur = remotestream.durationMs(stream);
+        if (dur < 2_500 or dur > 3_500) fail("transcode stream did not report the source duration (~3000ms)");
+        if (!remotestream.isTranscoded(stream)) fail("transcode stream must report itself transcoded");
+
+        // A time seek is a fresh encode from the offset: shorter output,
+        // still a decodable fragmented MP4, same duration report.
+        const seeked = remotestream.new(host, std.mem.span(clip.ptr), .transcode, 2_000) orelse fail("new seeked stream");
+        defer c.g_object_unref(@ptrCast(seeked));
+        const tail_bytes = readAllStream(allocator, seeked) catch fail("seeked read");
+        defer allocator.free(tail_bytes);
+        if (tail_bytes.len < 512 or tail_bytes.len >= full_len) fail("seeked encode is not shorter than the full one");
+        if (!std.mem.eql(u8, tail_bytes[4..8], "ftyp")) fail("seeked spool is not an MP4");
+        writeFile(spool_copy.ptr, tail_bytes);
+        if (!run(&[_:null]?[*:0]const u8{ "ffmpeg", "-nostdin", "-v", "error", "-i", spool_copy.ptr, "-f", "null", "-", null })) fail("seeked spool does not decode");
+        if (remotestream.durationMs(seeked) != dur) fail("seeked stream reports a different duration");
+        std.debug.print("smoke-stream: PASS seek (encode from 2000ms: {d} bytes, decodes, duration {d}ms)\n", .{ tail_bytes.len, dur });
     }
 
     // ── raw mode: seekable, sized, byte-identical ────────────────
     {
-        const stream = remotestream.new(host, std.mem.span(clip.ptr), .raw) orelse fail("new raw stream");
+        const stream = remotestream.new(host, std.mem.span(clip.ptr), .raw, 0) orelse fail("new raw stream");
         defer c.g_object_unref(@ptrCast(stream));
         const file_stream: *c.GFileInputStream = @ptrCast(stream);
         if (c.g_seekable_can_seek(@ptrCast(stream)) == 0) fail("raw stream must be seekable");

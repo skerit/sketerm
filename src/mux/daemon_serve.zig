@@ -1815,6 +1815,9 @@ pub const FsOpReq = struct {
     pattern: []const u8 = "",
     /// find: only entries modified within this window (0 = all).
     within_ms: u64 = 0,
+    /// preview_stream: encode from this offset (a time seek restarts
+    /// the transcode here).
+    start_ms: u64 = 0,
     /// find: raise the match cap (0 = default 2000; hard 200k).
     max_matches: u64 = 0,
     mode: u32 = 0,

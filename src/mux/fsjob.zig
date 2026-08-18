@@ -80,6 +80,8 @@ pub const Spec = struct {
     journal_dir: []const u8 = "",
     /// find: only entries modified within this window (0 = all).
     within_ms: u64 = 0,
+    /// preview_stream: encode from this offset.
+    start_ms: u64 = 0,
     /// find: raise the match cap (0 = default; clamped to 200k).
     max_matches: u64 = 0,
     client_token: []const u8 = "",
@@ -1010,9 +1012,17 @@ fn runPreviewStream(spec: Spec) u8 {
     if (fd < 0) return emitErrno("spool create");
     _ = c.close(fd);
     emit(.{ .ev = "asset", .path = out });
+    // Duration up front (ffprobe, when present) so the viewer can show a
+    // seekable timeline before the encode is anywhere near done.
+    const duration_ms = probeDurationMs(source.ptr);
+    // A time seek is a fresh job from `start_ms`: input seeking (-ss
+    // before -i) lands on the keyframe at or before it, cheaply.
+    var ss_buf: [32:0]u8 = undefined;
+    const ss = std.fmt.bufPrintZ(&ss_buf, "{d}.{d:0>3}", .{ spec.start_ms / 1000, spec.start_ms % 1000 }) catch unreachable;
     const argv = [_:null]?[*:0]const u8{
         "ffmpeg",         "-nostdin",   "-y",              "-v",                     "error",
-        "-i",             source.ptr,   "-map",            "0:v:0",                  "-map",
+        "-ss",            ss.ptr,       "-i",              source.ptr,               "-map",
+        "0:v:0",          "-map",
         "0:a:0?",         "-vf",        PREVIEW_STREAM_VF, "-c:v",                   "libx264",
         "-preset",        "ultrafast",  "-tune",           "zerolatency",            "-crf",
         "28",             "-maxrate",   "2500k",           "-bufsize",               "5000k",
@@ -1031,7 +1041,7 @@ fn runPreviewStream(spec: Spec) u8 {
     }
     // The viewer starts reading here; every later progress event
     // repeats the path and reports the spool's growth.
-    emit(.{ .ev = "progress", .path = out, .done = @as(u64, 0), .total = @as(u64, @intCast(st.st_size)) });
+    emit(.{ .ev = "progress", .path = out, .done = @as(u64, 0), .total = @as(u64, @intCast(st.st_size)), .duration_ms = duration_ms });
     var status: c_int = 0;
     while (true) {
         const rc = c.waitpid(pid, &status, c.WNOHANG);
@@ -1044,7 +1054,7 @@ fn runPreviewStream(spec: Spec) u8 {
         _ = c.nanosleep(&ts, null);
         var spool_st: c.struct_stat = undefined;
         const written: u64 = if (c.stat(out.ptr, &spool_st) == 0) @intCast(spool_st.st_size) else 0;
-        emit(.{ .ev = "progress", .path = out, .done = written, .total = @as(u64, @intCast(st.st_size)) });
+        emit(.{ .ev = "progress", .path = out, .done = written, .total = @as(u64, @intCast(st.st_size)), .duration_ms = duration_ms });
     }
     if (!(c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0)) return emitError("ffmpeg could not transcode this file");
     var spool_st: c.struct_stat = undefined;
@@ -1056,6 +1066,33 @@ fn runPreviewStream(spec: Spec) u8 {
 /// Width capped at 1280 (never upscaled), height follows the aspect and
 /// stays even for yuv420p.
 const PREVIEW_STREAM_VF = "scale=w='min(1280,iw)':h=-2";
+
+/// The container duration in ms via ffprobe; 0 when unknown (no
+/// ffprobe, or a stream without one), which the viewer shows as an
+/// unseekable timeline.
+fn probeDurationMs(source: [*:0]const u8) u64 {
+    var out: [512]u8 = undefined;
+    const n = ffprobeEntries(source, "format=duration", &out);
+    return parseDurationMs(out[0..n]);
+}
+
+/// "duration=83.456\n" -> 83456. Tolerates ffprobe's N/A and noise.
+fn parseDurationMs(text: []const u8) u64 {
+    const key = "duration=";
+    const at = std.mem.indexOf(u8, text, key) orelse return 0;
+    var rest = text[at + key.len ..];
+    if (std.mem.indexOfScalar(u8, rest, '\n')) |nl| rest = rest[0..nl];
+    rest = std.mem.trim(u8, rest, " \t\r");
+    const secs = std.fmt.parseFloat(f64, rest) catch return 0;
+    if (!(secs > 0) or secs > 1e9) return 0;
+    return @intFromFloat(secs * 1000.0);
+}
+
+test "parseDurationMs reads ffprobe output and rejects N/A" {
+    try std.testing.expectEqual(@as(u64, 83456), parseDurationMs("duration=83.456\n"));
+    try std.testing.expectEqual(@as(u64, 0), parseDurationMs("duration=N/A\n"));
+    try std.testing.expectEqual(@as(u64, 0), parseDurationMs(""));
+}
 
 const image_exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".jxl", ".bmp", ".tif", ".tiff", ".ico", ".svg", ".avif", ".heic", ".heif" };
 const pdf_exts = [_][]const u8{".pdf"};

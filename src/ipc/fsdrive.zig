@@ -278,6 +278,8 @@ pub const JobEvent = struct {
     /// command's exit status (both on the done event).
     rejected: u64 = 0,
     exit_status: i64 = 0,
+    /// preview_stream: the source's total duration (0 = unknown).
+    duration_ms: u64 = 0,
     /// Progress detail: the entry in flight (sticky daemon-side, so
     /// present on every event once the job has named one) plus the
     /// entry counters of a tree operation.
@@ -482,6 +484,7 @@ pub const Fs = struct {
             watch_limit: bool = false,
             rejected: u64 = 0,
             exit_status: i64 = 0,
+            duration_ms: u64 = 0,
             file: []const u8 = "",
             files_done: u64 = 0,
             files_total: u64 = 0,
@@ -534,6 +537,7 @@ pub const Fs = struct {
             .watch_limit = parsed.watch_limit,
             .rejected = parsed.rejected,
             .exit_status = parsed.exit_status,
+            .duration_ms = parsed.duration_ms,
             .file = parsed.file,
             .files_done = parsed.files_done,
             .files_total = parsed.files_total,
@@ -746,6 +750,7 @@ pub const Fs = struct {
             /// find/live_find: only entries modified inside this
             /// window (0 = all), and a raised match cap.
             within_ms: u64 = 0,
+            start_ms: u64 = 0,
             max_matches: u64 = 0,
             mode: u32 = 0,
             uid: ?u32 = null,
@@ -1611,8 +1616,8 @@ pub const Fs = struct {
 
     /// Transcode a video into a growing low-bitrate spool for playback;
     /// the first progress event names the spool, `done` closes it.
-    pub fn startPreviewStream(self: *Fs, path: []const u8) Error!u64 {
-        return self.startJob("preview_stream", .{ .path = path });
+    pub fn startPreviewStream(self: *Fs, path: []const u8, start_ms: u64) Error!u64 {
+        return self.startJob("preview_stream", .{ .path = path, .start_ms = start_ms });
     }
 
     /// Recursive size; the done event carries bytes in `done` and the

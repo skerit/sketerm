@@ -214,6 +214,7 @@ pub fn fsStartJob(self: *Daemon, cl: *Client, r: FsOpReq) void {
         .transfer_token = r.transfer_token,
         .resumable = r.@"resume",
         .within_ms = r.within_ms,
+        .start_ms = r.start_ms,
         .max_matches = r.max_matches,
         .perm = .{ .mode = r.mode, .uid = if (r.uid) |v| @as(i64, v) else -1, .gid = if (r.gid) |v| @as(i64, v) else -1 },
         .copy = .{ .conflict = r.conflict, .dir_mode = r.dir_mode, .no_replace = r.no_replace },
@@ -313,6 +314,7 @@ pub const FsJobArgs = struct {
     transfer_token: []const u8 = "",
     resumable: bool = false,
     within_ms: u64 = 0,
+    start_ms: u64 = 0,
     max_matches: u64 = 0,
     perm: PermArgs = .{},
     copy: CopyArgs = .{},
@@ -375,6 +377,7 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         .job_id = id,
         .journal_dir = if (ephemeral) "" else self.fs_job_dir,
         .within_ms = within_ms,
+        .start_ms = args.start_ms,
         .max_matches = max_matches,
         .client_token = client_token,
         .transfer_token = args.transfer_token,
@@ -1268,6 +1271,7 @@ pub fn fsJobEmit(self: *Daemon, job: *FsJob, ev: []const u8) void {
         .truncated = job.truncated,
         .rejected = job.rejected,
         .exit_status = job.exit_status,
+        .duration_ms = job.duration_ms,
         .path = job.done_path[0..job.done_path_len],
         .keep = job.done_kept,
         .kind = job.err_kind[0..job.err_kind_len],
@@ -1325,6 +1329,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         /// what the command exited with (-1 = killed by a signal).
         rejected: u64 = 0,
         exit_status: i64 = 0,
+        duration_ms: u64 = 0,
         /// Progress detail: the entry in flight (present only when
         /// it CHANGED — the helper does not repeat it) and the
         /// entry counters for tree operations.
@@ -1457,6 +1462,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         @memcpy(job.cur_file[0..job.cur_file_len], e.file[0..job.cur_file_len]);
     }
     if (e.resumed_from > 0) job.resumed_from = e.resumed_from;
+    if (e.duration_ms > 0) job.duration_ms = e.duration_ms;
     if (e.files_done > job.files_done) job.files_done = e.files_done;
     if (e.files_total > job.files_total) job.files_total = e.files_total;
     if (fsjournal.phaseRank(e.phase) > fsjournal.phaseRank(job.phase[0..job.phase_len])) job.setPhase(e.phase);
