@@ -19046,3 +19046,19 @@ shell into the same slot (restart-in-place = the detach landing), and
 (also `SKETERM_SMOKE_E2E_EXIT_ACTION_ONLY=1`) proves the risky path:
 the pane closing ITSELF from the frame-clock tick, GUI healthy after.
 docs/lifecycle.md updated; its drift note about the dead branch is gone.
+
+## 2026-08-18: cast teardown criticals fixed; cast e2e children fail on criticals
+
+Closing a window whose content was a cast (sketerm play, or the
+Viewer's cast item) emitted three GLib/GTK criticals: GTK4 window
+dispose finalizes children BEFORE the window's ::destroy handler runs,
+so CastPlayerBox.severLive -- called from that handler -- reached
+surface.sever(false), which disconnects and queries an already
+finalized GLArea. The box now watches its surface widget's ::destroy
+(borrowed user-data; the box always outlives the widget per the
+teardown contract) and passes that knowledge to sever, taking the
+widgets_dead path panes already use. Both cast-hosting e2e children
+(e2ecast, e2evcast) now run with G_DEBUG=fatal-criticals: a critical
+aborts the child and the existing WIFEXITED(0) assertions at window
+close turn it into a red stage -- the negative control (old sever(false)
+restored) fails with "the viewer exited abnormally on window close".

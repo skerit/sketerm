@@ -3951,6 +3951,10 @@ fn castPlaybackStage(
         _ = c.unsetenv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
+        // A GLib/GTK critical (e.g. severing a finalized surface at
+        // teardown) aborts the child; the clean-exit assertion below
+        // then turns log noise into a red stage.
+        _ = c.setenv("G_DEBUG", "fatal-criticals", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "play", cast_path.ptr, null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -4290,6 +4294,9 @@ fn viewerCastStage(
         _ = c.unsetenv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
+        // Same guard as the sketerm-play child: criticals abort, and
+        // the WIFEXITED(0) check at window close makes that a failure.
+        _ = c.setenv("G_DEBUG", "fatal-criticals", 1);
         if (have_video) {
             const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, cast_path.ptr, txt_path.ptr, bin_path.ptr, vid_path.ptr, null };
             _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));

@@ -74,6 +74,11 @@ pub const CastPlayerBox = struct {
 
     /// True once severLive ran; makes it idempotent.
     severed: bool = false,
+    /// Set by the surface widget's ::destroy watch. GTK4 window dispose
+    /// finalizes children BEFORE the window's own ::destroy handler
+    /// runs, so a host severing from that handler is already too late
+    /// to touch the area; severLive reads this instead of assuming.
+    widgets_dead: bool = false,
 
     /// Spawn a cast-playback session for `spec` (local path or
     /// host:/path) and build the playback widgets on it. `log_prefix`
@@ -159,6 +164,20 @@ pub const CastPlayerBox = struct {
         self.surface.font_features = if (s.font_features.len > 0) s.font_features else null;
         self.surface.setFocused(true); // solid cursor, no inactive dim
 
+        // Watch the area's death so severLive knows whether sever may
+        // still touch the widget. The box always outlives the widget
+        // (teardown contract: destroy() runs after the widgets die),
+        // so the borrowed user-data cannot dangle; the closure dies
+        // with the widget, so no disconnect is needed.
+        _ = c.g_signal_connect_data(
+            self.surface.widget(),
+            "destroy",
+            @ptrCast(&onSurfaceWidgetDestroy),
+            @ptrCast(self),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+
         // ── sink wiring: PASSIVE VIEWER POLICY ─────────────────────
         // The cast is UNTRUSTED recorded content, so only what
         // rendering and the transport bar need is wired: render
@@ -208,8 +227,13 @@ pub const CastPlayerBox = struct {
         if (self.severed) return;
         self.severed = true;
         self.playbar.sever();
-        self.surface.sever(false);
+        self.surface.sever(self.widgets_dead);
         self.terminal.clearSinks();
+    }
+
+    fn onSurfaceWidgetDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(CastPlayerBox, user);
+        self.widgets_dead = true;
     }
 
     /// Free the box and kill the ephemeral session (Terminal.deinit
