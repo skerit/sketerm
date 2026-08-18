@@ -1165,26 +1165,41 @@ pub fn notifyColorScheme(self: *Screen, dark: bool) void {
     respondForce(self, if (dark) "\x1b[?997;1n" else "\x1b[?997;2n");
 }
 
+/// Allocate a fresh alt-screen line buffer.
+///
+/// Error-returning on purpose: the partial-build rollback below is an
+/// `errdefer`, which only runs on an error return. Inlined into the
+/// `void` `toggleAltScreen` it silently leaked every line built so far.
+fn allocAltLines(self: *Screen) ![]Line {
+    const alt = try self.allocator.alloc(Line, self.rows);
+    var i: u16 = 0;
+    errdefer {
+        for (alt[0..i]) |*l| l.deinit(self.allocator);
+        self.allocator.free(alt);
+    }
+    while (i < self.rows) : (i += 1) {
+        alt[i] = try Line.init(self.allocator, self.cols);
+        alt[i].id = self.nextLineId();
+    }
+    return alt;
+}
+
 pub fn toggleAltScreen(self: *Screen, on: bool) void {
     if (on == self.use_alt) return;
+    // Allocate BEFORE touching any screen state. Out of memory here
+    // degrades to "no switch at all", which needs the screen left
+    // exactly as it was: a half-applied switch (clusters dropped, but
+    // the buffer never swapped) corrupts the visible grid instead.
+    const fresh: ?[]Line = if (on and self.alt == null)
+        allocAltLines(self) catch return
+    else
+        null;
     // Clusters are keyed by (row, col) in the ACTIVE buffer; after
     // the swap every key points at the other buffer's content.
     // Same for the last-print cell used for cluster attachment.
     self.clearAllClusters();
     self.last_print_cp = 0;
-    if (on and self.alt == null) {
-        const alt = self.allocator.alloc(Line, self.rows) catch return;
-        var i: u16 = 0;
-        errdefer {
-            for (alt[0..i]) |*l| l.deinit(self.allocator);
-            self.allocator.free(alt);
-        }
-        while (i < self.rows) : (i += 1) {
-            alt[i] = Line.init(self.allocator, self.cols) catch return;
-            alt[i].id = self.nextLineId();
-        }
-        self.alt = alt;
-    }
+    if (fresh) |alt| self.alt = alt;
     if (on) {
         self.use_alt = true;
         for (self.alt.?) |*l| {
@@ -1403,8 +1418,9 @@ pub fn compactStylePool(self: *Screen) void {
     defer self.allocator.free(remap);
     @memset(remap, Pool.unused_index);
 
+    // No errdefer here: this function is `void`, so an errdefer would
+    // never run. Every bail-out below deinits `new_entries` explicitly.
     var new_entries: std.ArrayList(Entry) = .empty;
-    errdefer new_entries.deinit(self.allocator);
     var i: usize = 0;
     while (i < old_len) : (i += 1) {
         if (!used[i]) continue;

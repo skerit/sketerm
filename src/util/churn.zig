@@ -65,10 +65,16 @@ pub const Tracker = struct {
         const rows = tileCount(self.opts, height);
         const n = cols * rows;
         if (n != self.heat.len) {
+            // Allocate before freeing. Freeing first leaves `heat` and
+            // `touched` dangling if either allocation then fails, and the
+            // tracker's own `deinit` would free them a second time.
+            const heat = try self.allocator.alloc(u8, n);
+            errdefer self.allocator.free(heat);
+            const touched = try self.allocator.alloc(bool, n);
             self.allocator.free(self.heat);
             self.allocator.free(self.touched);
-            self.heat = try self.allocator.alloc(u8, n);
-            self.touched = try self.allocator.alloc(bool, n);
+            self.heat = heat;
+            self.touched = touched;
         }
         self.cols = cols;
         self.rows = rows;
@@ -235,4 +241,40 @@ test "resize resets heat (tile coords no longer align)" {
     try t.expect(!tr.hot(0, 0, 64, 64)); // wiped
     try t.expectEqual(@as(u32, 4), tr.cols);
     try t.expectEqual(@as(u32, 4), tr.rows);
+}
+
+test "resize allocation failure keeps the old grid intact" {
+    // The tracker used to free both buffers before allocating the
+    // replacements, so a failed grow left `heat`/`touched` dangling --
+    // memset through them, and `deinit` freed them a second time.
+    var tr = try Tracker.init(t.allocator, 128, 128, .{ .tile = 64, .hot_threshold = 4 });
+    defer tr.deinit();
+    frames(&tr, 6, 0, 0, 64, 64);
+
+    var probe = try Tracker.init(t.allocator, 128, 128, .{ .tile = 64 });
+    defer probe.deinit();
+    var counting = t.FailingAllocator.init(t.allocator, .{});
+    probe.allocator = counting.allocator();
+    try probe.resize(1024, 1024);
+    probe.allocator = t.allocator;
+    try t.expect(counting.alloc_index > 0);
+
+    for (0..counting.alloc_index) |index| {
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = index });
+        tr.allocator = failing.allocator();
+        const result = tr.resize(1024, 1024);
+        tr.allocator = t.allocator;
+        result catch |err| {
+            try t.expectEqual(error.OutOfMemory, err);
+            // Untouched: still the 2x2 grid, still hot where it was.
+            try t.expectEqual(@as(usize, 4), tr.heat.len);
+            try t.expectEqual(@as(usize, 4), tr.touched.len);
+            try t.expect(tr.hot(0, 0, 64, 64));
+            continue;
+        };
+        // It succeeded, so the buffers must describe the NEW grid.
+        try t.expectEqual(@as(usize, tr.cols * tr.rows), tr.heat.len);
+        try tr.resize(128, 128);
+        frames(&tr, 6, 0, 0, 64, 64);
+    }
 }

@@ -5320,6 +5320,52 @@ test "column resize in alt screen normalizes main scrollback width" {
     for (s.active) |ln| try std.testing.expectEqual(@as(usize, 9), ln.cells.len);
 }
 
+test "alt screen allocation failure leaves the screen untouched" {
+    const t = std.testing;
+    // Sweep every allocation the first `?1049h` makes and fail it. Each
+    // failure must leak nothing (testing.allocator asserts that at
+    // deinit) and must leave the primary screen fully intact -- this
+    // used to leak the line vector plus every Line already built, and
+    // to drop the cluster table for a switch that never happened.
+    var probe_pool = try Pool.init(t.allocator);
+    defer probe_pool.deinit();
+    var probe = try Screen.init(t.allocator, &probe_pool, 20, 8);
+    defer probe.deinit();
+    var counting = t.FailingAllocator.init(t.allocator, .{});
+    probe.allocator = counting.allocator();
+    probe.toggleAltScreen(true);
+    probe.allocator = t.allocator;
+    const allocations = counting.alloc_index;
+    try t.expect(allocations > 0);
+
+    for (0..allocations) |index| {
+        var pool = try Pool.init(t.allocator);
+        defer pool.deinit();
+        var s = try Screen.init(t.allocator, &pool, 20, 8);
+        defer s.deinit();
+        // A cluster on the primary screen: dropping it is the visible
+        // half of a half-applied switch.
+        s.printCp('e');
+        s.appendCluster(0, 0, 0x301);
+        try t.expectEqual(@as(usize, 1), s.clusterAt(0, 0).len);
+
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = index });
+        s.allocator = failing.allocator();
+        s.toggleAltScreen(true);
+        s.allocator = t.allocator;
+
+        if (s.use_alt) {
+            // The switch went through, so every line must be real.
+            try t.expect(s.alt != null);
+            for (s.alt.?) |ln| try t.expectEqual(@as(usize, 20), ln.cells.len);
+        } else {
+            // Degraded: nothing switched, so nothing may have changed.
+            try t.expect(s.alt == null);
+            try t.expectEqual(@as(usize, 1), s.clusterAt(0, 0).len);
+        }
+    }
+}
+
 test "scroll up moves content" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
