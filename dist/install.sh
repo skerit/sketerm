@@ -376,7 +376,7 @@ plain_validate_managed_path() {
 }
 
 plain_remove_managed_path() {
-    local path=$1 target
+    local path=$1 target dir
     plain_validate_managed_path "$path" \
         || die "unsafe path in plain-install manifest: $path"
     target="$prefix/$path"
@@ -384,6 +384,16 @@ plain_remove_managed_path() {
         as_root rm -f -- "$target" \
             || die "could not remove obsolete managed file: $target"
     fi
+    # The manifest lists files only, so emptied directories have nothing else
+    # to drive their removal (share/sketerm/shaders survived every GUI ->
+    # mux-only downgrade). rmdir refuses a directory that still holds
+    # anything, so pruning upward can only reclaim what this install emptied.
+    dir=${path%/*}
+    while [ "$dir" != "$path" ] && [ -n "$dir" ]; do
+        as_root rmdir -- "$prefix/$dir" 2>/dev/null || break
+        path=$dir
+        dir=${path%/*}
+    done
 }
 
 plain_remove_obsolete() {
@@ -420,11 +430,16 @@ do_plain() {
         [ -f "$manifest" ] && [ ! -L "$manifest" ] && [ -r "$manifest" ] \
             || die "plain-install manifest is not a readable regular file: $manifest"
         plain_remove_obsolete "$manifest" "$new_manifest"
-    elif ! plain_manifest_has "$new_manifest" bin/sketerm-webengine; then
-        # Plain installs made before manifests existed still own this exact
-        # optional helper path. Remove it on the first CEF-less upgrade so
-        # findbin cannot launch an old helper beside the new GUI.
-        plain_remove_managed_path bin/sketerm-webengine
+    elif ! plain_manifest_has "$new_manifest" bin/sketerm-webengine \
+            && { [ -e "$prefix/bin/sketerm-webengine" ] \
+                 || [ -L "$prefix/bin/sketerm-webengine" ]; }; then
+        # The manifest IS the ownership record, so with no manifest yet this
+        # installer owns nothing in the prefix. It used to delete this one
+        # legacy path unconditionally, which on --prefix /usr silently removed
+        # the distro package's helper. Report it instead; a stale helper beside
+        # a new GUI is a nuisance, deleting another package's file is not.
+        warn "$prefix/bin/sketerm-webengine was not installed by this script and is left alone"
+        warn "it may belong to a system package; remove it yourself if the GUI starts a stale browser helper"
     fi
 
     say "installing into $prefix (no package manager involvement)"

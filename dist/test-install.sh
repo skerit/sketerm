@@ -783,19 +783,50 @@ run_plain_gui_install "$work/plain-upgrade-reenable-again.out" "$plain_upgrade_p
 [ -x "$plain_upgrade_prefix/bin/sketerm-webengine" ] \
     || fail "CEF re-enable after an interrupted upgrade omitted the helper"
 
-# The first fixed upgrade has no previous manifest to consult. The exact
-# historical optional-helper path is migrated explicitly; no other untracked
-# prefix content is inferred to be owned.
+# An install into a prefix with no manifest owns nothing there yet, so it must
+# not delete anything -- including the optional helper path it would install
+# itself, which under --prefix /usr belongs to the distro package. It reports
+# the leftover instead.
 plain_legacy_prefix="$work/plain-legacy-prefix"
 mkdir -p "$plain_legacy_prefix/bin" "$plain_legacy_prefix/share/legacy"
 cp "$fixture/zig-out/bin/sketerm-webengine" \
     "$plain_legacy_prefix/bin/sketerm-webengine"
 printf 'legacy unrelated\n' > "$plain_legacy_prefix/share/legacy/keep"
 run_plain_gui_install "$work/plain-legacy-upgrade.out" "$plain_legacy_prefix" 0
-[ ! -e "$plain_legacy_prefix/bin/sketerm-webengine" ] \
-    || fail "first manifest upgrade retained the legacy helper"
+[ -e "$plain_legacy_prefix/bin/sketerm-webengine" ] \
+    || fail "first manifest upgrade deleted an unmanaged helper"
+[[ "$(<"$work/plain-legacy-upgrade.out")" == *"was not installed by this script and is left alone"* ]] \
+    || fail "first manifest upgrade did not report the unmanaged helper"
 [ "$(<"$plain_legacy_prefix/share/legacy/keep")" = 'legacy unrelated' ] \
     || fail "first manifest upgrade changed unrelated legacy content"
+
+# Once that install published a manifest, the helper is still not in it, so a
+# second CEF-less run must go on leaving it alone.
+run_plain_gui_install "$work/plain-legacy-again.out" "$plain_legacy_prefix" 0
+[ -e "$plain_legacy_prefix/bin/sketerm-webengine" ] \
+    || fail "manifest-tracked upgrade deleted an unmanaged helper"
+
+# Manifest cleanup reclaims the directories it empties, and only those.
+plain_downgrade_prefix="$work/plain-downgrade-prefix"
+mkdir -p "$plain_downgrade_prefix"
+run_plain_gui_install "$work/plain-downgrade-gui.out" "$plain_downgrade_prefix" 1
+[ -d "$plain_downgrade_prefix/share/sketerm/shaders" ] \
+    || fail "plain GUI install omitted the shader directory"
+printf 'foreign icon\n' \
+    > "$plain_downgrade_prefix/share/icons/hicolor/scalable/apps/other.svg"
+BASH_ENV="$work/no-packager.bash" \
+    PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
+    INSTALL_TEST_ALLOW_SUDO=1 \
+    INSTALL_TEST_ZIG_LOG="$INSTALL_TEST_ZIG_LOG" \
+    "$fixture/dist/install.sh" --mux-only --prefix "$plain_downgrade_prefix" \
+    > "$work/plain-downgrade-mux.out" 2>&1
+[ ! -e "$plain_downgrade_prefix/share/sketerm/shaders" ] \
+    || fail "mux-only downgrade left the emptied shader directory behind"
+[ -f "$plain_downgrade_prefix/share/icons/hicolor/scalable/apps/other.svg" ] \
+    || fail "directory pruning removed a foreign file"
+[ -d "$plain_downgrade_prefix/share/sketerm" ] \
+    || fail "directory pruning removed a directory that still holds files"
 
 # A managed path that cannot be removed is a hard failure before new files or
 # a new ownership manifest are published.
