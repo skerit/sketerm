@@ -463,8 +463,9 @@ fn addOpenAppItem(
 /// chooser dialog's local section.
 fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
     const path = ctx.path orelse return;
-    // A cast gets BOTH: the Viewer for a navigable batch alongside the
-    // folder's other resources, "Play in Sketerm" for a dedicated window.
+    // The Viewer takes images, video/audio and casts. A cast gets BOTH:
+    // the Viewer for a navigable batch alongside the folder's other
+    // resources, "Play in Sketerm" for a dedicated window.
     if (isViewerName(path))
         m.itemIcon("Open in Sketerm Viewer", .{ .name = "image-x-generic-symbolic" }, &onMenuViewer, ctx);
     if (isCastName(path))

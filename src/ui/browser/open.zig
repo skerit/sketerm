@@ -318,7 +318,8 @@ pub fn collectListingSpecs(
 }
 
 /// Launch the internal Viewer with this tab's ordered viewable sequence
-/// (images and `.cast` recordings, which it plays in place) without FUSE.
+/// (images, video/audio, and `.cast` recordings, the last two played in
+/// place) without FUSE.
 pub fn launchViewer(self: *BrowserView, tab: *BTab, current: []const u8) void {
     const allocator = self.allocator;
     var walk: SpecWalk = .{};

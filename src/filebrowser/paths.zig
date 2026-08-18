@@ -161,10 +161,12 @@ pub fn isCastName(name: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(name, ".cast");
 }
 
-/// Resources the Sketerm Viewer can show in a navigable batch: images
-/// plus terminal recordings, which it plays in place.
+/// Resources the Sketerm Viewer can show in a navigable batch: images,
+/// video/audio it plays with a GtkMediaStream, plus terminal recordings,
+/// which it plays in place. Declared BELOW `isPlayableName` in reading
+/// order but not in dependency order — Zig hoists, so this is fine.
 pub fn isViewerName(name: []const u8) bool {
-    return isImageName(name) or isCastName(name);
+    return isImageName(name) or isCastName(name) or isPlayableName(name);
 }
 
 /// The coarse content classes every by-name consumer agrees on.
@@ -368,12 +370,17 @@ test "classify is the single oracle: cast beats media beats text" {
     try t.expectEqual(ContentClass.text, classify("a.cast.gz"));
 }
 
-test "isViewerName covers images and casts but nothing else" {
+test "isViewerName covers images, casts and playable media but nothing else" {
     const t = std.testing;
     try t.expect(isViewerName("photo.JPG"));
     try t.expect(isViewerName("session.cast"));
+    try t.expect(isViewerName("clip.mp4"));
+    try t.expect(isViewerName("song.FLAC"));
     try t.expect(!isViewerName("notes.txt"));
-    try t.expect(!isViewerName("clip.mp4"));
+    try t.expect(!isViewerName("paper.pdf"));
+    // Every playable resource is a viewer resource; the viewer routes
+    // them to its media stream (viewer.zig `isPlayableName` branch).
+    for (video_exts ++ audio_exts) |ext| try t.expect(isViewerName(ext));
 }
 
 test "formatSpecAlloc preserves resources larger than the fixed scratch buffer" {
