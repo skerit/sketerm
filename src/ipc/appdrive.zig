@@ -333,10 +333,28 @@ const SubPix = struct {
     pixels: std.ArrayList(u8) = .empty,
 };
 
+/// Bytes a tightly-packed `w` x `h` BGRA image must occupy, or null
+/// when the geometry is degenerate or the product would not fit.
+/// The ONE place a declared geometry is turned into a length.
+fn frameBytes(w: i32, h: i32) ?usize {
+    if (w <= 0 or h <= 0) return null;
+    const px = std.math.mul(usize, @intCast(w), @intCast(h)) catch return null;
+    return std.math.mul(usize, px, 4) catch return null;
+}
+
+/// Whether a stored buffer really carries the geometry it declares.
+/// Frame geometry is DECLARED by the compositor side across a process
+/// boundary, so nothing downstream may index by w/h until this passed.
+fn geometryFits(pixels: []const u8, w: i32, h: i32) bool {
+    const need = frameBytes(w, h) orelse return false;
+    return pixels.len >= need;
+}
+
 /// Alpha-blend `src` (tightly packed sw*4, wl_shm byte order BGRA
 /// with PREMULTIPLIED alpha) onto `dst` (tightly packed dw*4) at
 /// (`ox`,`oy`), clipping to the destination. `format` 1 (XRGB8888)
-/// carries no alpha: those pixels are copied opaque.
+/// carries no alpha: those pixels are copied opaque. A buffer shorter
+/// than its declared geometry paints nothing at all.
 fn blendLayer(
     dst: []u8,
     dw: i32,
@@ -348,21 +366,25 @@ fn blendLayer(
     oy: i32,
     format: u32,
 ) void {
-    if (dw <= 0 or dh <= 0 or sw <= 0 or sh <= 0) return;
+    if (!geometryFits(dst, dw, dh) or !geometryFits(src, sw, sh)) return;
     const opaque_fmt = format == 1;
-    var sy: i32 = @max(0, -oy);
+    // Offsets are client-chosen i32s: 64-bit arithmetic keeps the
+    // clipping honest for values whose negation or sum would wrap.
+    const ox64: i64 = ox;
+    const oy64: i64 = oy;
+    var sy: i64 = @max(0, -oy64);
     while (sy < sh) : (sy += 1) {
-        const dy = oy + sy;
+        const dy = oy64 + sy;
         if (dy >= dh) break;
         const srow = @as(usize, @intCast(sy)) * @as(usize, @intCast(sw)) * 4;
         const drow = @as(usize, @intCast(dy)) * @as(usize, @intCast(dw)) * 4;
         if (srow + @as(usize, @intCast(sw)) * 4 > src.len) break;
-        const sx0: i32 = @max(0, -ox);
-        const sx1: i32 = @min(sw, dw - ox);
+        const sx0: i64 = @max(0, -ox64);
+        const sx1: i64 = @min(sw, @as(i64, dw) - ox64);
         if (sx1 <= sx0) continue;
         const n: usize = @intCast(sx1 - sx0);
         const s0 = srow + @as(usize, @intCast(sx0)) * 4;
-        const d0 = drow + @as(usize, @intCast(ox + sx0)) * 4;
+        const d0 = drow + @as(usize, @intCast(ox64 + sx0)) * 4;
         if (d0 + n * 4 > dst.len or s0 + n * 4 > src.len) break;
         const srun = src[s0..][0 .. n * 4];
         const drun = dst[d0..][0 .. n * 4];
@@ -1591,29 +1613,34 @@ pub const App = struct {
         defer layers.deinit(a);
         ch.comp.subtreeLayers(a, win.sid, &layers) catch {};
         const n_below = wlcomp.Compositor.belowCount(layers.items);
-        if (n_below == 0) {
+        const need = frameBytes(win.w, win.h) orelse return;
+        // The root's buffer can lag its declared size (a frame whose
+        // copy hit OOM, or a resize whose base frame was dropped):
+        // composite over a cleared canvas instead of trusting it.
+        const base_ok = win.base_pixels.items.len >= need;
+        if (n_below == 0 and base_ok) {
             // Nothing paints under the root: start FROM its buffer
             // instead of blending it over a cleared canvas (the
             // overwhelmingly common shape, and a full-window blend per
             // frame is pure cost).
-            win.pixels.appendSlice(a, win.base_pixels.items) catch return;
+            win.pixels.appendSlice(a, win.base_pixels.items[0..need]) catch return;
             if (layers.items.len == 0) return;
         } else {
-            const need = @as(usize, @intCast(win.w)) * @as(usize, @intCast(win.h)) * 4;
             win.pixels.appendNTimes(a, 0, need) catch return;
+            for (layers.items[0..n_below]) |l| paintLayer(ch, win, l);
+            if (base_ok)
+                blendLayer(win.pixels.items, win.w, win.h, win.base_pixels.items, win.w, win.h, 0, 0, win.format);
         }
-        const paint = struct {
-            fn one(chan: *Chan, w: *Window, l: wlcomp.Compositor.SubLayer) void {
-                const sp = chan.subsurfaces.getPtr(l.sid) orelse return;
-                if (sp.pixels.items.len == 0) return;
-                blendLayer(w.pixels.items, w.w, w.h, sp.pixels.items, sp.w, sp.h, l.x, l.y, sp.format);
-            }
-        }.one;
-        if (n_below > 0) {
-            for (layers.items[0..n_below]) |l| paint(ch, win, l);
-            blendLayer(win.pixels.items, win.w, win.h, win.base_pixels.items, win.w, win.h, 0, 0, win.format);
-        }
-        for (layers.items[n_below..]) |l| paint(ch, win, l);
+        for (layers.items[n_below..]) |l| paintLayer(ch, win, l);
+    }
+
+    /// Composite one stored subsurface layer onto its window. A layer
+    /// whose stored pixels fall short of its declared size is SKIPPED:
+    /// one stale layer costs its own content, never the frame.
+    fn paintLayer(chan: *Chan, w: *Window, l: wlcomp.Compositor.SubLayer) void {
+        const sp = chan.subsurfaces.getPtr(l.sid) orelse return;
+        if (!geometryFits(sp.pixels.items, sp.w, sp.h)) return;
+        blendLayer(w.pixels.items, w.w, w.h, sp.pixels.items, sp.w, sp.h, l.x, l.y, sp.format);
     }
 
     fn onSubsurfaceGoneWindow(ch: *Chan, sid: u32) void {
@@ -1649,29 +1676,39 @@ pub const App = struct {
         _ = lw;
         _ = lh;
         const ch = chanOf(ctx);
+        // THE trust boundary: w/h and the buffer arrive together from
+        // the compositor side, and every consumer downstream (blend,
+        // screenshots, OCR, templates, recordings, diffs) indexes by
+        // w/h. Pair them only once the buffer is proven long enough;
+        // a short frame is dropped whole, leaving the previous frame
+        // AND the geometry that matches it in place.
+        if (!geometryFits(pixels, w, h)) return;
         const win = blk: {
             if (ch.subsurfaces.getPtr(sid)) |sp| {
                 // Subsurface content: stash it and recomposite the
                 // window it belongs to. This IS the app's repaint for
                 // toolkits that render everything into a subsurface
                 // (Firefox), so it counts as a window frame.
+                // Store first, declare after: a copy that fails must
+                // leave the PREVIOUS size/pixels pair intact rather
+                // than a new size with no bytes behind it.
+                sp.pixels.resize(ch.app.allocator, pixels.len) catch return;
+                @memcpy(sp.pixels.items, pixels);
                 sp.w = w;
                 sp.h = h;
                 sp.format = format;
-                sp.pixels.clearRetainingCapacity();
-                sp.pixels.appendSlice(ch.app.allocator, pixels) catch {};
                 const root = ch.comp.rootSurface(sid);
                 const rw = ch.app.winBySurface(ch.id, root) orelse return;
                 recomposite(ch, rw);
                 break :blk rw;
             }
             const win = ch.app.ensureWindow(ch.id, sid, false) orelse return;
+            win.base_pixels.resize(ch.app.allocator, pixels.len) catch return;
+            @memcpy(win.base_pixels.items, pixels);
             win.w = w;
             win.h = h;
             win.scale = scale;
             win.format = format;
-            win.base_pixels.clearRetainingCapacity();
-            win.base_pixels.appendSlice(ch.app.allocator, pixels) catch {};
             recomposite(ch, win);
             break :blk win;
         };
@@ -3643,4 +3680,88 @@ test "App local launch rolls back every post-spawn allocation failure" {
 
 test "App remote launch rolls back every post-spawn allocation failure" {
     try testLaunchAllocationFailures(true);
+}
+
+test "frameBytes: degenerate and overflowing geometry has no length" {
+    const t = std.testing;
+    try t.expectEqual(@as(?usize, 64), frameBytes(4, 4));
+    try t.expectEqual(@as(?usize, null), frameBytes(0, 4));
+    try t.expectEqual(@as(?usize, null), frameBytes(4, -1));
+    // The largest declarable frame still computes exactly (it fits a
+    // 64-bit usize) — and no real buffer is ever that long.
+    const huge = frameBytes(std.math.maxInt(i32), std.math.maxInt(i32)).?;
+    try t.expectEqual(@as(usize, 18446744056529682436), huge);
+    const px = [_]u8{0} ** 64;
+    try t.expect(geometryFits(&px, 4, 4));
+    try t.expect(!geometryFits(px[0..60], 4, 4));
+    try t.expect(!geometryFits(&px, 4, 0));
+}
+
+test "blendLayer: a layer shorter than its declared geometry paints nothing" {
+    const t = std.testing;
+    var dst = [_]u8{7} ** 64; // 4x4
+    const untouched = dst;
+
+    // Declared 4x4 (64 bytes) but only 8 bytes stored: the whole
+    // blend is skipped, not truncated mid-row.
+    const short = [_]u8{ 1, 2, 3, 255, 4, 5, 6, 255 };
+    blendLayer(&dst, 4, 4, &short, 4, 4, 0, 0, 1);
+    try t.expectEqualSlices(u8, &untouched, &dst);
+
+    // A destination that is short for ITS geometry is equally refused.
+    var short_dst = [_]u8{7} ** 32;
+    const full = [_]u8{9} ** 64;
+    blendLayer(&short_dst, 4, 4, &full, 4, 4, 0, 0, 1);
+    try t.expectEqualSlices(u8, &([_]u8{7} ** 32), &short_dst);
+
+    // Control: the same call with a correctly sized layer does paint
+    // (format 1 = XRGB, so alpha lands opaque).
+    blendLayer(&dst, 4, 4, &full, 4, 4, 0, 0, 1);
+    var want = [_]u8{9} ** 64;
+    var i: usize = 3;
+    while (i < want.len) : (i += 4) want[i] = 255;
+    try t.expectEqualSlices(u8, &want, &dst);
+}
+
+test "blendLayer: extreme offsets clip instead of wrapping" {
+    const t = std.testing;
+    var dst = [_]u8{7} ** 64; // 4x4
+    const src = [_]u8{9} ** 16; // 2x2
+    // Negation/addition of these would wrap in 32-bit arithmetic.
+    blendLayer(&dst, 4, 4, &src, 2, 2, std.math.minInt(i32), 0, 1);
+    blendLayer(&dst, 4, 4, &src, 2, 2, 0, std.math.minInt(i32), 1);
+    blendLayer(&dst, 4, 4, &src, 2, 2, std.math.maxInt(i32), std.math.maxInt(i32), 1);
+    try t.expectEqualSlices(u8, &([_]u8{7} ** 64), &dst);
+}
+
+test "onFrame: a buffer shorter than its declared geometry is dropped whole" {
+    const t = std.testing;
+    const a = t.allocator;
+    var app = App{ .allocator = a, .conn = undefined, .name = @constCast("test") };
+    defer testTeardown(&app);
+
+    var pl: [5]u8 = undefined;
+    app.handleFrame(.chan_open, testChanOpenPayload(&pl, 3));
+    const ch = app.chans.get(3).?;
+
+    // A 2x2 frame carrying 8 of its 16 bytes: no window content, no
+    // geometry, no frame counted.
+    const short = [_]u8{ 1, 2, 3, 255, 4, 5, 6, 255 };
+    App.onFrame(ch, 1, 2, 2, 1, 2, 2, 1, &short);
+    try t.expectEqual(@as(usize, 0), app.windows.items.len);
+
+    // A well-formed frame is accepted, and a later short one leaves it
+    // (and the geometry that matches it) untouched.
+    const good = [_]u8{9} ** 16;
+    App.onFrame(ch, 1, 2, 2, 1, 2, 2, 1, &good);
+    const win = app.winBySurface(3, 1).?;
+    try t.expectEqual(@as(u64, 1), win.frames);
+    try t.expectEqual(@as(i32, 2), win.w);
+    try t.expectEqualSlices(u8, &good, win.pixels.items);
+
+    App.onFrame(ch, 1, 8, 8, 1, 8, 8, 1, &short);
+    try t.expectEqual(@as(u64, 1), win.frames);
+    try t.expectEqual(@as(i32, 2), win.w);
+    try t.expectEqual(@as(i32, 2), win.h);
+    try t.expectEqualSlices(u8, &good, win.pixels.items);
 }
