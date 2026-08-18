@@ -935,15 +935,19 @@ pub fn parseId(entry: *c.GtkWidget) ?u32 {
 
 // ── Previous Versions (btrfs snapshots) ──────────────────────────
 
-/// The dim one-liner every failure path degrades to.
-const SNAP_NONE = "No snapshots found (Timeshift/snapper btrfs snapshots are detected)";
+/// Shown when every source was searched and nothing matched.
+const SNAP_NONE = "No previous versions found (searched Timeshift and .snapshots directories)";
+/// Shown when the search could not run or was cut short (host gone,
+/// dialog superseded).
+const SNAP_UNAVAILABLE = "Snapshot search unavailable";
 
 /// The in-flight snapshot discovery for an open Properties dialog:
 /// a small client-driven state machine over plain `list`/`stat` ops,
 /// so it needs no daemon verb and works for remote hosts unchanged.
-/// The box is g_object_ref'd, so a closed dialog cannot dangle; one
-/// per view (a newer dialog supersedes an older search), mirroring
-/// `AttrRequest`.
+/// Timeshift is probed first, then every ancestor `.snapshots`
+/// nearest-first (snapper configs are per-subvolume). The box is
+/// g_object_ref'd, so a closed dialog cannot dangle; one per view (a
+/// newer dialog supersedes an older search), mirroring `AttrRequest`.
 pub const SnapRequest = struct {
     allocator: std.mem.Allocator,
     hc: *HostConn,
@@ -952,8 +956,22 @@ pub const SnapRequest = struct {
     path: []u8,
     /// The ONE outstanding fs request (list chunks share it).
     req: u32,
-    phase: enum { list_timeshift, probe_localhost, probe_at, list_snapper, stat_versions },
+    phase: enum { list_timeshift, probe_localhost, probe_at, list_snapdir, stat_versions },
     layout: snapshots.Layout = .timeshift_localhost,
+    /// The ancestor walk over `path`; slices reference `path`.
+    iter: ?snapshots.SnapdirIter = null,
+    /// The snapshot directory the current names came from (owned);
+    /// null while the source is Timeshift.
+    list_root: ?[]u8 = null,
+    /// `path[rel_start..]` is the file relative to the subvolume the
+    /// current source covers (0 for Timeshift = the absolute path).
+    rel_start: usize = 0,
+    /// Whether names came from an ancestor snapdir (per-name layout)
+    /// rather than Timeshift (request-wide layout).
+    from_snapdir: bool = false,
+    /// The first snapshot directory the daemon could not read
+    /// (owned) -- reported instead of "none found".
+    denied: ?[]u8 = null,
     /// Snapshot names (owned), newest first once sorted.
     names: std.ArrayList([]u8) = .empty,
     /// The candidate currently being stat'ed.
@@ -966,11 +984,25 @@ pub const SnapRequest = struct {
         self.names.clearRetainingCapacity();
     }
 
+    fn listRoot(self: *const SnapRequest) []const u8 {
+        return self.list_root orelse snapshots.TIMESHIFT_ROOT;
+    }
+
+    fn rel(self: *const SnapRequest) []const u8 {
+        return self.path[self.rel_start..];
+    }
+
+    fn layoutFor(self: *const SnapRequest, name: []const u8) snapshots.Layout {
+        return if (self.from_snapdir) snapshots.snapdirNameLayout(name) else self.layout;
+    }
+
     fn destroy(self: *SnapRequest) void {
         c.g_object_unref(@ptrCast(self.box));
         self.clearNames();
         self.names.deinit(self.allocator);
         self.hits.deinit(self.allocator);
+        if (self.list_root) |r| self.allocator.free(r);
+        if (self.denied) |d| self.allocator.free(d);
         self.allocator.free(self.path);
         self.allocator.destroy(self);
     }
@@ -990,11 +1022,27 @@ pub fn endSnapRequest(self: *BrowserView) void {
     sr.destroy();
 }
 
-/// Show the none-line and end the search: every error path lands
-/// here (host death included), deliberately silent about the reason.
+/// Abort the search without a verdict (host death, superseded
+/// dialog): the section reads "unavailable", never a false "none".
 pub fn snapDegrade(self: *BrowserView) void {
     const sr = self.snap_request orelse return;
-    setSnapLine(sr.box, SNAP_NONE);
+    setSnapLine(sr.box, SNAP_UNAVAILABLE);
+    self.endSnapRequest();
+}
+
+/// Every source is exhausted: report "none", or the first snapshot
+/// directory the daemon was refused access to.
+fn snapFinishNone(self: *BrowserView, sr: *SnapRequest) void {
+    if (sr.denied) |dir| {
+        var msg: [640:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&msg, "Snapshots at {s} are not readable (permission denied)", .{dir})) |m| {
+            setSnapLine(sr.box, m.ptr);
+        } else |_| {
+            setSnapLine(sr.box, "Snapshots exist but are not readable (permission denied)");
+        }
+    } else {
+        setSnapLine(sr.box, SNAP_NONE);
+    }
     self.endSnapRequest();
 }
 
@@ -1002,15 +1050,15 @@ pub fn requestSnapshots(self: *BrowserView, ctx: *PropsCtx, box: *c.GtkWidget) v
     const hc = ctx.tab.hc;
     if (self.snap_request != null) {
         // A newer dialog supersedes the older search (one in flight
-        // per view, like AttrRequest); its section settles as "none".
-        setSnapLine(self.snap_request.?.box, SNAP_NONE);
+        // per view, like AttrRequest).
+        setSnapLine(self.snap_request.?.box, SNAP_UNAVAILABLE);
         self.endSnapRequest();
     }
-    if (hc.state != .ready) return setSnapLine(box, SNAP_NONE);
-    const sr = self.allocator.create(SnapRequest) catch return setSnapLine(box, SNAP_NONE);
+    if (hc.state != .ready) return setSnapLine(box, SNAP_UNAVAILABLE);
+    const sr = self.allocator.create(SnapRequest) catch return setSnapLine(box, SNAP_UNAVAILABLE);
     const path = self.allocator.dupe(u8, ctx.path) catch {
         self.allocator.destroy(sr);
-        return setSnapLine(box, SNAP_NONE);
+        return setSnapLine(box, SNAP_UNAVAILABLE);
     };
     _ = c.g_object_ref(@ptrCast(box));
     sr.* = .{
@@ -1020,23 +1068,38 @@ pub fn requestSnapshots(self: *BrowserView, ctx: *PropsCtx, box: *c.GtkWidget) v
         .path = path,
         .req = self.nextReq(),
         .phase = .list_timeshift,
+        .iter = snapshots.SnapdirIter.init(path),
     };
     self.snap_request = sr;
     self.sendOp(hc, .{ .req = sr.req, .op = "list", .path = snapshots.TIMESHIFT_ROOT });
 }
 
-/// Advance to the snapper layout after Timeshift yielded nothing.
-fn snapTrySnapper(self: *BrowserView, sr: *SnapRequest) void {
+/// Advance to the next ancestor `.snapshots` candidate (nearest
+/// first); past the last, settle the section.
+fn snapAdvanceSnapdir(self: *BrowserView, sr: *SnapRequest) void {
     sr.clearNames();
-    sr.phase = .list_snapper;
+    sr.hits.clearRetainingCapacity();
+    sr.from_snapdir = true;
+    var buf: [4700]u8 = undefined;
+    const probe = blk: {
+        if (sr.iter) |*it| {
+            if (it.next(&buf)) |p| break :blk p;
+        }
+        return snapFinishNone(self, sr);
+    };
+    const root = sr.allocator.dupe(u8, probe.snapdir) catch return snapFinishNone(self, sr);
+    if (sr.list_root) |old| sr.allocator.free(old);
+    sr.list_root = root;
+    sr.rel_start = sr.path.len - probe.rel.len;
+    sr.phase = .list_snapdir;
     sr.req = self.nextReq();
-    self.sendOp(sr.hc, .{ .req = sr.req, .op = "list", .path = snapshots.SNAPPER_ROOT });
+    self.sendOp(sr.hc, .{ .req = sr.req, .op = "list", .path = root });
 }
 
 /// Sort newest first, cap the stat work, and begin statting versions.
 fn snapStartStats(self: *BrowserView, sr: *SnapRequest) void {
-    if (sr.names.items.len == 0) return snapDegrade(self);
-    snapshots.sortNewestFirst(sr.names.items, sr.layout == .snapper);
+    if (sr.names.items.len == 0) return snapAdvanceSnapdir(self, sr);
+    snapshots.sortNewestFirst(sr.names.items);
     while (sr.names.items.len > snapshots.MAX_SNAPSHOTS) {
         const n = sr.names.pop() orelse break;
         sr.allocator.free(n);
@@ -1049,9 +1112,10 @@ fn snapStartStats(self: *BrowserView, sr: *SnapRequest) void {
 /// Stat the next candidate, skipping ones whose path cannot be
 /// built; past the last, finish.
 fn snapSendNextStat(self: *BrowserView, sr: *SnapRequest) void {
-    var buf: [4600]u8 = undefined;
+    var buf: [4700]u8 = undefined;
     while (sr.idx < sr.names.items.len) {
-        const vpath = snapshots.versionPath(&buf, sr.layout, sr.names.items[sr.idx], sr.path) orelse {
+        const name = sr.names.items[sr.idx];
+        const vpath = snapshots.versionPath(&buf, sr.layoutFor(name), sr.listRoot(), name, sr.rel()) orelse {
             sr.idx += 1;
             continue;
         };
@@ -1062,14 +1126,17 @@ fn snapSendNextStat(self: *BrowserView, sr: *SnapRequest) void {
     snapFinish(self, sr);
 }
 
-/// Dedupe the hits and render one row per surviving version.
+/// Dedupe the hits and render one row per surviving version. A
+/// source whose snapshots never contained the file keeps walking:
+/// the nearest `.snapshots` may be unrelated to the file's subvolume.
 fn snapFinish(self: *BrowserView, sr: *SnapRequest) void {
     const kept = snapshots.dedupeNewestFirst(sr.hits.items);
-    if (kept == 0) return snapDegrade(self);
+    if (kept == 0) return snapAdvanceSnapdir(self, sr);
     clearBox(sr.box);
-    var buf: [4600]u8 = undefined;
+    var buf: [4700]u8 = undefined;
     for (sr.hits.items[0..kept]) |v| {
-        const vpath = snapshots.versionPath(&buf, sr.layout, sr.names.items[v.snap], sr.path) orelse continue;
+        const name = sr.names.items[v.snap];
+        const vpath = snapshots.versionPath(&buf, sr.layoutFor(name), sr.listRoot(), name, sr.rel()) orelse continue;
         appendSnapRow(self, sr, vpath, v);
     }
     if (c.gtk_widget_get_first_child(sr.box) == null) setSnapLine(sr.box, SNAP_NONE);
@@ -1190,33 +1257,38 @@ pub fn feedSnapRequest(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
     if (rep.req == 0 or rep.req != sr.req) return false;
 
     switch (sr.phase) {
-        .list_timeshift, .list_snapper => {
-            const snapper = sr.phase == .list_snapper;
+        .list_timeshift, .list_snapdir => {
+            const snapdir = sr.phase == .list_snapdir;
             if (!rep.ok) {
-                if (snapper) snapDegrade(self) else snapTrySnapper(self, sr);
+                // An unreadable snapdir is a finding, not an absence:
+                // remember the first so the section can say so.
+                if (snapdir and sr.denied == null and
+                    (std.mem.eql(u8, rep.@"error", "ACCES") or std.mem.eql(u8, rep.@"error", "PERM")))
+                {
+                    sr.denied = sr.allocator.dupe(u8, sr.listRoot()) catch null;
+                }
+                snapAdvanceSnapdir(self, sr);
                 return true;
             }
             for (rep.entries) |we| {
                 if (!we.tdir) continue;
-                if (snapper and !snapshots.isSnapperName(we.name)) continue;
                 const name = sr.allocator.dupe(u8, we.name) catch continue;
                 sr.names.append(sr.allocator, name) catch sr.allocator.free(name);
             }
             if (rep.more) return true;
             if (sr.names.items.len == 0) {
-                if (snapper) snapDegrade(self) else snapTrySnapper(self, sr);
+                snapAdvanceSnapdir(self, sr);
                 return true;
             }
-            if (snapper) {
-                sr.layout = .snapper;
+            if (snapdir) {
                 snapStartStats(self, sr);
                 return true;
             }
             // Which Timeshift sub-layout? Probe the newest snapshot.
-            snapshots.sortNewestFirst(sr.names.items, false);
-            var buf: [4600]u8 = undefined;
+            snapshots.sortNewestFirst(sr.names.items);
+            var buf: [4700]u8 = undefined;
             const probe = snapshots.timeshiftProbe(&buf, sr.names.items[0], false) orelse {
-                snapTrySnapper(self, sr);
+                snapAdvanceSnapdir(self, sr);
                 return true;
             };
             sr.phase = .probe_localhost;
@@ -1230,9 +1302,9 @@ pub fn feedSnapRequest(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                 snapStartStats(self, sr);
                 return true;
             }
-            var buf: [4600]u8 = undefined;
+            var buf: [4700]u8 = undefined;
             const probe = snapshots.timeshiftProbe(&buf, sr.names.items[0], true) orelse {
-                snapTrySnapper(self, sr);
+                snapAdvanceSnapdir(self, sr);
                 return true;
             };
             sr.phase = .probe_at;
@@ -1246,8 +1318,8 @@ pub fn feedSnapRequest(self: *BrowserView, hc: *HostConn, ftype: wire.FrameType,
                 snapStartStats(self, sr);
             } else {
                 // The Timeshift root exists but maps nothing we
-                // recognize; snapper may still cover this path.
-                snapTrySnapper(self, sr);
+                // recognize; the ancestor walk may still cover it.
+                snapAdvanceSnapdir(self, sr);
             }
             return true;
         },

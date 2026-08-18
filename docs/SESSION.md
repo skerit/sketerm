@@ -19009,3 +19009,23 @@ covers the seek encode (from 2000ms of a 3s clip: shorter, decodes,
 same duration). `SKETERM_SMOKE_E2E_VIEWER_ONLY=1` runs the viewer batch
 stage alone; the full smoke-e2e currently fails earlier in the CEF
 browser-action stage on this host, on the committed baseline too.
+
+## 2026-08-18: Previous Versions finds per-subvolume and plain snapshots
+
+The Properties snapshot search only probed /.snapshots, which is
+snapper's ROOT config alone -- a "home" config lives at
+/home/.snapshots, so hourly home snapshots were never found and every
+failure (permission denied included) rendered as "No snapshots found".
+The search now walks the file's ancestors nearest-first, probing
+<ancestor>/.snapshots via the same daemon list/stat ops, and maps each
+entry by name: numeric = snapper (N/snapshot/rel), anything else = a
+plain snapshot root (btrbk-style name.20260818T1200/rel). A source
+whose snapshots never contained the file keeps walking instead of
+settling, Timeshift keeps priority, and an EACCES on a snapshot
+directory is reported as "not readable (permission denied)" with the
+path rather than as absence (snapper dirs are root:root 750 by
+default). Pure logic -- the ancestor iterator, per-name layout routing,
+rel-path mapping, and the family-aware newest-first sort -- lives in
+filebrowser/snapshots.zig (both test roots, tests for each); props.zig
+only drives the request state machine. Host death or a superseding
+dialog now reads "Snapshot search unavailable", never a false "none".
