@@ -19062,3 +19062,21 @@ widgets_dead path panes already use. Both cast-hosting e2e children
 aborts the child and the existing WIFEXITED(0) assertions at window
 close turn it into a red stage -- the negative control (old sever(false)
 restored) fails with "the viewer exited abnormally on window close".
+
+## 2026-08-18: smoke-fs cancel-window made deterministic; runs clean up /tmp
+
+The "cancel request missed the quarantine window" stage raced a
+scheduler-luck window: the journal shows "copied" with an existing
+quarantine only between the quarantine rename and the "quarantined"
+persist. The daemon is correct (commitDeleting takes the control lock
+and checks the durable cancel fence before committing "deleting", so a
+cancel before that boundary always wins); the rig now pins the window
+open with SKETERM_FSJOB_QUARANTINE_DELAY_MS=1000 (fourth hook in the
+delayForTest family), and the watcher's budget matches collectJob's
+180s (the old 20s expired before quarantine even happened on a loaded
+host) with an early exit once the phase rank passes its target.
+Verified 2x under 40 busy-loop CPU load (the condition that failed 3/3
+before) plus 2x quiet. smoke-fs also never removed ANY of its ~32
+per-run /tmp roots (1029 had accumulated); every root is registered
+and removed at exit, pass or fail; SKETERM_SMOKE_FS_KEEP=1 preserves a
+failed run's evidence.

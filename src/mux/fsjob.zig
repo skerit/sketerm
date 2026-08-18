@@ -4361,6 +4361,10 @@ fn runCrossCopy(allocator: std.mem.Allocator, spec_in: Spec) u8 {
         active_src = durable.quarantine;
         captured = true;
     }
+    // Test hook: hold the captured quarantine observable (journal still
+    // "copied") so a rig can land a durable cancel deterministically
+    // instead of racing the verify-then-commit gap.
+    delayForTest("SKETERM_FSJOB_QUARANTINE_DELAY_MS");
     if (cc.canceled())
         return finishMoveCancellation(allocator, cancellationSpec(spec, "copied", durable, &cc.progress));
     if (!cc.verifyDestination(&manifest, active_src, spec.dst, root)) return cc.emitFailure();

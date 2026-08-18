@@ -33,12 +33,40 @@ fn mtime(st: c.struct_stat) c.struct_timespec {
 
 fn fail(comptime msg: []const u8) noreturn {
     std.debug.print("smoke-fs: FAIL: " ++ msg ++ "\n", .{});
+    cleanupTmpRoots(true);
     std.process.exit(1);
 }
 
 fn failErr(comptime msg: []const u8, e: []const u8) noreturn {
     std.debug.print("smoke-fs: FAIL: " ++ msg ++ " ({s})\n", .{e});
+    cleanupTmpRoots(true);
     std.process.exit(1);
+}
+
+// Every /tmp root this run creates, removed at exit. Historically
+// nothing was ever removed (~32 dirs per run, pass or fail) and
+// failed-run archaeology hid in a thousand siblings. Registered from
+// the main thread before stages run; a fail() from a watcher thread
+// only reads.
+var tmp_roots: [40][96]u8 = undefined;
+var tmp_root_lens: [40]u8 = @splat(0);
+var tmp_root_count: usize = 0;
+
+fn registerTmpRoot(path: []const u8) void {
+    if (tmp_root_count >= tmp_roots.len or path.len > tmp_roots[0].len) return;
+    @memcpy(tmp_roots[tmp_root_count][0..path.len], path);
+    tmp_root_lens[tmp_root_count] = @intCast(path.len);
+    tmp_root_count += 1;
+}
+
+/// SKETERM_SMOKE_FS_KEEP=1 preserves a FAILED run's evidence; a
+/// passing run always cleans up after itself.
+fn cleanupTmpRoots(failed: bool) void {
+    if (failed) {
+        if (c.getenv("SKETERM_SMOKE_FS_KEEP")) |_| return;
+    }
+    for (0..tmp_root_count) |i|
+        daemon_mod.removeTreeBestEffort(tmp_roots[i][0..tmp_root_lens[i]]);
 }
 
 fn daemonMain(d: *daemon_mod.Daemon) void {
@@ -63,6 +91,7 @@ fn mkTmpDir(buf: *[64]u8, comptime tag: []const u8) []const u8 {
     if (span.len >= buf.len) fail("tmp dir path too long once canonical");
     @memcpy(buf[0..span.len], span);
     buf[span.len] = 0;
+    registerTmpRoot(buf[0..span.len]);
     return buf[0..span.len];
 }
 
@@ -1031,13 +1060,17 @@ fn cancelMoveInDestinationStage(ctx: *MoveStageCancel) void {
 }
 
 fn cancelMoveAfterQuarantine(ctx: *MoveCancel) void {
+    // Budget matches collectJob's: on a loaded host the phases BEFORE
+    // the window can alone take longer than the old 20s. A genuinely
+    // missed window exits early below instead of burning the budget.
     var waited: usize = 0;
-    while (waited < 20_000) : (waited += 1) {
+    while (waited < 180_000) : (waited += 1) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         if (fsjournal.load(arena.allocator(), ctx.journal)) |parsed_value| {
             var parsed = parsed_value;
             defer parsed.deinit();
+            if (fsjournal.phaseRank(parsed.value.phase) > fsjournal.phaseRank(ctx.phase)) return;
             const phase_matches = std.mem.eql(u8, parsed.value.phase, ctx.phase);
             const quarantine_ready = parsed.value.source_quarantine.len > 0 and
                 (ctx.kill_before_request or exists(parsed.value.source_quarantine));
@@ -3489,6 +3522,10 @@ fn crossStage(
             touch(src, std.fmt.bufPrint(&name, "item-{d}.txt", .{i}) catch unreachable, "cancel recovery");
         }
         const dst = std.fmt.bufPrint(&paths[1], "{s}/cancel-after-quarantine", .{dst_dir}) catch unreachable;
+        // Deterministic window: without the hook the watcher must catch
+        // the verify-then-persist gap, which is scheduler luck on a
+        // loaded host (this stage failed 3/3 under parallel builds).
+        _ = c.setenv("SKETERM_FSJOB_QUARANTINE_DELAY_MS", "1000", 1);
         const job = fs.startCrossCopyOpts("ssh:127.0.0.1", src, "", dst, true, .{
             .delete_src = true,
             .no_replace = true,
@@ -3499,6 +3536,7 @@ fn crossStage(
         const canceler = std.Thread.spawn(.{}, cancelMoveAfterQuarantine, .{&cancel}) catch
             fail("cross: cancel-safe move watcher");
         const outcome = collectJob(&fs, job, 180_000);
+        _ = c.unsetenv("SKETERM_FSJOB_QUARANTINE_DELAY_MS");
         canceler.join();
         if (!cancel.requested) fail("cross: cancel request missed the quarantine window");
         if (!cancel.killed) fail("cross: cancel recovery helper was not interrupted after the durable request");
@@ -4596,17 +4634,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var media_cache_buf: [128:0]u8 = undefined;
     const media_cache = std.fmt.bufPrintZ(&media_cache_buf, "/tmp/sketerm-smoke-fs-media-{d}", .{c.getpid()}) catch unreachable;
     _ = c.setenv("SKETERM_MEDIA_CACHE_DIR", media_cache.ptr, 1);
+    registerTmpRoot(media_cache);
     // Image previews install freedesktop thumbnail-cache entries under
     // XDG_CACHE_HOME; keep those out of the real user cache too.
     var thumb_cache_buf: [128:0]u8 = undefined;
     const thumb_cache = std.fmt.bufPrintZ(&thumb_cache_buf, "/tmp/sketerm-smoke-fs-cache-{d}", .{c.getpid()}) catch unreachable;
     _ = c.setenv("XDG_CACHE_HOME", thumb_cache.ptr, 1);
+    registerTmpRoot(thumb_cache);
     // Fs-job journals live under the STATE dir now (reboot-durable
     // resume); isolate it or smoke daemons would journal into the real
     // ~/.local/state and adopt each other's records across runs.
     var state_buf: [128:0]u8 = undefined;
     const state_dir = std.fmt.bufPrintZ(&state_buf, "/tmp/sketerm-smoke-fs-state-{d}", .{c.getpid()}) catch unreachable;
     _ = c.setenv("XDG_STATE_HOME", state_dir.ptr, 1);
+    registerTmpRoot(state_dir);
     var gpa_state: std.heap.DebugAllocator(.{ .safety = true }) = .{};
     defer if (gpa_state.deinit() == .leak) {
         std.debug.print("smoke-fs: FAIL — leaked memory (see GPA report above)\n", .{});
@@ -4617,6 +4658,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── monolith pass ──────────────────────────────────────────
     var path_buf: [128]u8 = undefined;
     const sock_path = std.fmt.bufPrint(&path_buf, "/tmp/sketerm-smoke-fs-{d}/mux.sock", .{c.getpid()}) catch unreachable;
+    registerTmpRoot(std.fs.path.dirname(sock_path).?);
     const d = daemon_mod.Daemon.init(allocator, sock_path) catch fail("daemon init");
     const th = std.Thread.spawn(.{}, daemonMain, .{d}) catch fail("thread spawn");
     fsStage(allocator, sock_path, "mono");
@@ -4648,7 +4690,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const sock_xb = std.fmt.bufPrint(&xb_buf, "/tmp/sketerm-smoke-fs-xb{d}/sketerm/mux.sock", .{c.getpid()}) catch unreachable;
     // Daemon.init mkdirs only the socket's immediate parent.
     var xb_base_buf: [128]u8 = undefined;
-    mkdirAt(std.fmt.bufPrint(&xb_base_buf, "/tmp/sketerm-smoke-fs-xb{d}", .{c.getpid()}) catch unreachable);
+    const xb_base = std.fmt.bufPrint(&xb_base_buf, "/tmp/sketerm-smoke-fs-xb{d}", .{c.getpid()}) catch unreachable;
+    mkdirAt(xb_base);
+    registerTmpRoot(xb_base);
+    registerTmpRoot(std.fs.path.dirname(sock_xa).?);
     const da = daemon_mod.Daemon.init(allocator, sock_xa) catch fail("daemon A init");
     const tha = std.Thread.spawn(.{}, daemonMain, .{da}) catch fail("thread A spawn");
     const db = daemon_mod.Daemon.init(allocator, sock_xb) catch fail("daemon B init");
@@ -4679,6 +4724,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // answer — a monolith-only green would hide a handoff bug) ──
     var bpath_buf: [128]u8 = undefined;
     const bsock = std.fmt.bufPrint(&bpath_buf, "/tmp/sketerm-smoke-fs-b{d}/mux.sock", .{c.getpid()}) catch unreachable;
+    registerTmpRoot(std.fs.path.dirname(bsock).?);
     const bd = daemon_mod.Daemon.init(allocator, bsock) catch fail("broker init");
     bd.is_broker = true;
     const bth = std.Thread.spawn(.{}, daemonMain, .{bd}) catch fail("broker thread");
@@ -4698,6 +4744,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     bth.join();
     bd.deinit();
 
+    cleanupTmpRoots(false);
     std.debug.print("smoke-fs: OK\n", .{});
     return 0;
 }
