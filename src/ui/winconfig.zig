@@ -406,22 +406,33 @@ pub fn applyPanePresentation(
 }
 
 /// Effective 16-colour palette for a settings bundle: explicit
-/// `palette` wins, then `scheme`, then the built-in ANSI defaults.
-pub fn resolvePalette(s: *const @import("../config.zig").ProfileSettings) [16][3]u8 {
+/// `palette` wins, then `scheme`; null means the config claims no
+/// ANSI colours at all.
+pub fn resolvePalette(s: *const @import("../config.zig").ProfileSettings) ?[16][3]u8 {
     if (s.palette) |p| return p;
     if (s.scheme.len > 0) {
         if (@import("../grid/schemes.zig").lookup(s.scheme)) |sch| return sch.palette;
     }
-    return palette_default_ansi;
+    return null;
 }
 
-/// Replace only the config-owned ANSI range in screen and renderer state.
+/// Replace only the ANSI entries the config owns, in screen and
+/// renderer state. `owned` is the palette this target was last given
+/// by the config: dropping a `palette`/`scheme` restores the built-in
+/// ANSI defaults over it, while a config that never owned the range
+/// leaves runtime OSC 4 colours untouched. Entries 16..255 are never
+/// config-owned. Updated in place to the new ownership.
 fn applyResolvedPalette(
     screen_palette: *[256][3]u8,
     renderer_palette: *[256][3]u8,
+    owned: *?[16][3]u8,
     s: *const ProfileSettings,
 ) void {
-    const palette = resolvePalette(s);
+    const next = resolvePalette(s);
+    const write: ?[16][3]u8 = next orelse
+        (if (owned.* != null) palette_default_ansi else null);
+    owned.* = next;
+    const palette = write orelse return;
     @memcpy(screen_palette[0..16], palette[0..]);
     @memcpy(renderer_palette[0..16], palette[0..]);
 }
@@ -750,9 +761,14 @@ pub fn pushPaneColors(self: *Window, pane: *Pane, s: *const ProfileSettings) voi
     pane.surface.grid_pass.default_bg = fg_bg.bg;
     pane.surface.cell_pass.default_fg = fg_bg.fg;
     pane.surface.cell_pass.default_bg = fg_bg.bg;
-    // Palette (16 ANSI colours). Runtime OSC changes outside this
+    // Palette (16 ANSI colours). Runtime OSC changes outside the
     // config-owned range remain untouched.
-    applyResolvedPalette(&screen.palette, &pane.surface.grid_pass.palette, &eff);
+    applyResolvedPalette(
+        &screen.palette,
+        &pane.surface.grid_pass.palette,
+        &pane.config_palette,
+        &eff,
+    );
 }
 
 /// Open the preferences dialog. Live-applies changes via
@@ -1520,20 +1536,72 @@ pub fn resolveConfigSavePath(allocator: std.mem.Allocator) ![]u8 {
 test "palette apply resets custom ANSI colors to built-in defaults" {
     var screen_palette = palette_default_256;
     var renderer_palette = palette_default_256;
+    var owned: ?[16][3]u8 = null;
     var custom_palette: [16][3]u8 = undefined;
     for (&custom_palette, 0..) |*entry, i| {
         const channel: u8 = @intCast(i);
         entry.* = .{ channel, 0x80, 0xff - channel };
     }
     const custom = ProfileSettings{ .palette = custom_palette };
-    applyResolvedPalette(&screen_palette, &renderer_palette, &custom);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &custom);
     try std.testing.expectEqual(custom_palette, screen_palette[0..16].*);
     try std.testing.expectEqual(custom_palette, renderer_palette[0..16].*);
 
     const defaults = ProfileSettings{};
-    applyResolvedPalette(&screen_palette, &renderer_palette, &defaults);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &defaults);
     try std.testing.expectEqual(palette_default_ansi, screen_palette[0..16].*);
     try std.testing.expectEqual(palette_default_ansi, renderer_palette[0..16].*);
+    try std.testing.expect(owned == null);
+}
+
+test "palette apply leaves OSC 4 colors alone when the config owns none" {
+    // A config with neither `palette` nor `scheme` owns no ANSI entry,
+    // so a reload (prefs toggle, auto_theme flip, config watcher) must
+    // not stamp the built-in defaults over a runtime OSC 4 change.
+    var screen_palette = palette_default_256;
+    var renderer_palette = palette_default_256;
+    var owned: ?[16][3]u8 = null;
+    const defaults = ProfileSettings{};
+
+    const osc4: [3]u8 = .{ 0x00, 0xff, 0x00 };
+    screen_palette[1] = osc4;
+    renderer_palette[1] = osc4;
+    for (0..3) |_| {
+        applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &defaults);
+        try std.testing.expectEqual(osc4, screen_palette[1]);
+        try std.testing.expectEqual(osc4, renderer_palette[1]);
+    }
+    // Everything else stays at the built-in defaults it started from.
+    try std.testing.expectEqual(palette_default_256[2], screen_palette[2]);
+}
+
+test "palette apply restores defaults only over what the config owned" {
+    var screen_palette = palette_default_256;
+    var renderer_palette = palette_default_256;
+    var owned: ?[16][3]u8 = null;
+    const schemes = @import("../grid/schemes.zig");
+    const nord = schemes.lookup("nord").?.palette;
+
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &ProfileSettings{ .scheme = "nord" });
+    try std.testing.expectEqual(nord, screen_palette[0..16].*);
+    try std.testing.expect(owned != null);
+
+    // Dropping the scheme is what a2e684b fixed: the stale scheme
+    // colours must NOT survive into a palette-less config.
+    const osc4: [3]u8 = .{ 0x00, 0xff, 0x00 };
+    screen_palette[1] = osc4;
+    renderer_palette[1] = osc4;
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &ProfileSettings{});
+    try std.testing.expectEqual(palette_default_ansi, screen_palette[0..16].*);
+    try std.testing.expectEqual(palette_default_ansi, renderer_palette[0..16].*);
+
+    // ...and only once: the next reload owns nothing, so a fresh OSC 4
+    // colour now survives.
+    screen_palette[1] = osc4;
+    renderer_palette[1] = osc4;
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &ProfileSettings{});
+    try std.testing.expectEqual(osc4, screen_palette[1]);
+    try std.testing.expectEqual(osc4, renderer_palette[1]);
 }
 
 test "palette apply switches complete live profile palettes" {
@@ -1544,11 +1612,12 @@ test "palette apply switches complete live profile palettes" {
     const second = ProfileSettings{ .scheme = "nord" };
     var screen_palette = palette_default_256;
     var renderer_palette = palette_default_256;
+    var owned: ?[16][3]u8 = null;
 
-    applyResolvedPalette(&screen_palette, &renderer_palette, &first);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &first);
     try std.testing.expectEqual(solarized, screen_palette[0..16].*);
     try std.testing.expectEqual(solarized, renderer_palette[0..16].*);
-    applyResolvedPalette(&screen_palette, &renderer_palette, &second);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &second);
     try std.testing.expectEqual(nord, screen_palette[0..16].*);
     try std.testing.expectEqual(nord, renderer_palette[0..16].*);
 }
@@ -1563,14 +1632,14 @@ test "palette apply resets a null light-dark variant to defaults" {
     settings.light.palette = light_palette;
     var screen_palette = palette_default_256;
     var renderer_palette = palette_default_256;
+    var owned: ?[16][3]u8 = null;
 
     const light = settings.forScheme(.light);
-    applyResolvedPalette(&screen_palette, &renderer_palette, &light);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &light);
     try std.testing.expectEqual(light_palette, screen_palette[0..16].*);
     const dark = settings.forScheme(.dark);
-    applyResolvedPalette(&screen_palette, &renderer_palette, &dark);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &dark);
     try std.testing.expectEqual(palette_default_ansi, screen_palette[0..16].*);
-    try std.testing.expectEqual(palette_default_ansi, renderer_palette[0..16].*);
 }
 
 test "repeated palette reload is deterministic and preserves extended OSC colors" {
@@ -1582,6 +1651,7 @@ test "repeated palette reload is deterministic and preserves extended OSC colors
     const settings = ProfileSettings{ .palette = custom_palette };
     var screen_palette = palette_default_256;
     var renderer_palette = palette_default_256;
+    var owned: ?[16][3]u8 = null;
     screen_palette[16] = .{ 1, 2, 3 };
     screen_palette[200] = .{ 4, 5, 6 };
     renderer_palette[16] = .{ 7, 8, 9 };
@@ -1591,7 +1661,7 @@ test "repeated palette reload is deterministic and preserves extended OSC colors
         const runtime: u8 = @intCast(iteration);
         screen_palette[1] = .{ runtime, runtime, runtime };
         renderer_palette[1] = .{ runtime, runtime, runtime };
-        applyResolvedPalette(&screen_palette, &renderer_palette, &settings);
+        applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &settings);
         try std.testing.expectEqual(custom_palette, screen_palette[0..16].*);
         try std.testing.expectEqual(custom_palette, renderer_palette[0..16].*);
         try std.testing.expectEqual([3]u8{ 1, 2, 3 }, screen_palette[16]);
@@ -1604,12 +1674,13 @@ test "repeated palette reload is deterministic and preserves extended OSC colors
 test "renderer color resolution observes restored ANSI defaults" {
     var screen_palette = palette_default_256;
     var renderer_palette = palette_default_256;
+    var owned: ?[16][3]u8 = null;
     var custom_palette = palette_default_ansi;
     custom_palette[1] = .{ 1, 2, 3 };
     const custom = ProfileSettings{ .palette = custom_palette };
-    applyResolvedPalette(&screen_palette, &renderer_palette, &custom);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &custom);
     const defaults = ProfileSettings{};
-    applyResolvedPalette(&screen_palette, &renderer_palette, &defaults);
+    applyResolvedPalette(&screen_palette, &renderer_palette, &owned, &defaults);
 
     const style = @import("../render/style.zig");
     const unused: [4]f32 = .{ 0, 0, 0, 1 };

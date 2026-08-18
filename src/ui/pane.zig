@@ -310,6 +310,12 @@ pub const Pane = struct {
     /// Owned by the Window (Config arena).
     active_profile: ?[]const u8 = null,
 
+    /// The ANSI palette the config last pushed onto this pane, or null
+    /// when the config never owned those entries. `winconfig`'s palette
+    /// push consults it so a reload only rewrites what the config owns
+    /// and leaves OSC 4 colours alone on a palette-less config.
+    config_palette: ?[16][3]u8 = null,
+
     /// argv the PTY child was spawned with, deep-copied. Layout save
     /// reads this so a round-trip keeps the real command (`ssh host`,
     /// `nvim .`) instead of collapsing every pane to $SHELL. Owned;
