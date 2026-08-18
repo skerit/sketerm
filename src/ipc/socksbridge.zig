@@ -504,8 +504,10 @@ pub const Egress = struct {
     conn_ok: bool = false,
     host: [256]u8 = undefined,
     host_len: usize = 0,
-    thread: ?std.Thread = null,
     cancel: FdCancel = .{},
+    /// Owner reference plus one per running worker. Whoever drops the
+    /// last one frees; see `close` for why this is not a join.
+    refs: std.atomic.Value(u32) = .init(1),
 
     /// How the worker reaches the egress host's daemon. Mirrors the mux
     /// host-string convention: null = local autostart socket.
@@ -535,11 +537,18 @@ pub const Egress = struct {
     }
 
     pub fn spawn(self: *Egress) bool {
-        self.thread = std.Thread.spawn(.{}, Egress.worker, .{self}) catch return false;
+        _ = self.refs.fetchAdd(1, .acq_rel);
+        const thread = std.Thread.spawn(.{}, Egress.worker, .{self}) catch {
+            self.release();
+            return false;
+        };
+        // Detached on purpose: `close` must never join (see there).
+        thread.detach();
         return true;
     }
 
     fn worker(self: *Egress) void {
+        defer self.release();
         defer self.bridge.closeServing();
         const h: ?[]const u8 = if (self.host_len == 0) null else self.host[0..self.host_len];
         if (self.connectFn(self.allocator, h)) |conn| {
@@ -562,23 +571,31 @@ pub const Egress = struct {
         // A connect failure leaves nothing to serve.
     }
 
-    /// Stop serving, join the worker, close everything. Safe to call
-    /// once; the caller frees the Egress afterwards via `destroy`.
-    pub fn stop(self: *Egress) void {
+    /// Stop serving and drop the owner's reference. Call once; the
+    /// egress is gone when it returns and must not be touched again.
+    ///
+    /// It deliberately does NOT join. The worker's first act is the mux
+    /// connect, which can sit in a TCP or SSH connect to an unreachable
+    /// egress host for the kernel's whole timeout and is the one phase
+    /// `cancel` cannot interrupt — joining runs on the GTK main thread
+    /// (deleting a container), and froze the entire GUI for exactly that
+    /// long. The last reference frees instead, whichever side holds it.
+    pub fn close(self: *Egress) void {
         self.cancel.stop();
         self.bridge.requestStop();
-        if (self.thread) |t| t.join();
-        self.thread = null;
+        self.release();
+    }
+
+    /// Drop one reference; the last one tears the egress down.
+    fn release(self: *Egress) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         self.bridge.deinit();
+        self.cancel.release();
         if (self.conn_ok) {
             self.conn.deinit();
             self.conn_ok = false;
         }
-    }
-
-    pub fn destroy(self: *Egress) void {
-        const a = self.allocator;
-        a.destroy(self);
+        self.allocator.destroy(self);
     }
 };
 
@@ -1179,7 +1196,18 @@ const TestEgressConnector = struct {
     }
 };
 
-test "egress stop interrupts the published mux endpoint before join" {
+/// `Egress.worker` releases the reference `spawn` takes, so this stands
+/// in for `spawn` with a handle the test can join — `close` no longer
+/// joins, and test teardown must stay deterministic.
+fn testSpawnJoinable(egress: *Egress) !std.Thread {
+    _ = egress.refs.fetchAdd(1, .acq_rel);
+    return std.Thread.spawn(.{}, Egress.worker, .{egress}) catch |err| {
+        egress.release();
+        return err;
+    };
+}
+
+test "egress close interrupts the published mux endpoint" {
     const t = std.testing;
     var pair: [2]c_int = undefined;
     try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
@@ -1187,21 +1215,48 @@ test "egress stop interrupts the published mux endpoint before join" {
     TestEgressConnector.fd.store(pair[0], .release);
     const egress = Egress.create(t.allocator, "test", TestEgressConnector.connect) orelse
         return error.TestUnexpectedResult;
-    var stopped = false;
-    defer {
-        if (!stopped) egress.stop();
-        egress.destroy();
-    }
-    try t.expect(egress.spawn());
+    var closed = false;
+    defer if (!closed) egress.close();
+    const thread = try testSpawnJoinable(egress);
+    defer thread.join();
     const deadline = testNowMs() + 1_000;
     while (egress.cancel.fd.load(.acquire) < 0 and testNowMs() < deadline)
         _ = c.usleep(1_000);
     try t.expect(egress.cancel.fd.load(.acquire) >= 0);
 
     const start = testNowMs();
-    egress.stop();
-    stopped = true;
+    egress.close();
+    closed = true;
     try t.expect(testNowMs() - start < 1_000);
     var byte: u8 = 0;
     try t.expectEqual(@as(isize, 0), c.read(pair[1], &byte, 1));
+}
+
+/// A connect to a host that is not answering: it blocks, and nothing
+/// published to `cancel` can interrupt it.
+var test_connect_entered = std.atomic.Value(bool).init(false);
+var test_connect_until = std.atomic.Value(i64).init(0);
+
+fn testBlockingConnect(_: std.mem.Allocator, _: ?[]const u8) ?client.Conn {
+    test_connect_entered.store(true, .release);
+    while (testNowMs() < test_connect_until.load(.acquire)) _ = c.usleep(2_000);
+    return null;
+}
+
+test "closing an egress parked in its connect does not wait for the connect" {
+    // Deleting an egress container while its host is unreachable used to
+    // join a worker that had not published a cancellable fd yet, from the
+    // GTK main thread: the whole GUI froze for the connect timeout.
+    const t = std.testing;
+    const egress = Egress.create(t.allocator, "test", testBlockingConnect) orelse
+        return error.TestUnexpectedResult;
+    test_connect_entered.store(false, .release);
+    test_connect_until.store(testNowMs() + 800, .release);
+    const thread = try testSpawnJoinable(egress);
+    defer thread.join();
+    while (!test_connect_entered.load(.acquire)) _ = c.usleep(1_000);
+
+    const start = testNowMs();
+    egress.close();
+    try t.expect(testNowMs() - start < 300);
 }

@@ -40,10 +40,15 @@ pub const Bridge = struct {
     local: channel_pump.Local = .{},
     /// Required wakeup for every worker poll.
     wakeup: ?platform.Wakeup = null,
-    thread: ?std.Thread = null,
     conn: mux_client.Conn = undefined,
     conn_ok: bool = false,
     cancel: FdCancel = .{},
+    /// How the worker reaches the host's daemon. A field so a test can
+    /// hold the connect open and prove `stop` does not wait for it.
+    connectFn: *const fn (allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn = mux_cli.muxConnect,
+    /// Owner reference plus one per running worker. Whoever drops the
+    /// last one frees; see `stop` for why this is not a join.
+    refs: std.atomic.Value(u32) = .init(1),
     /// Why the bridge died, for `Client.lost()` to show. The atomic length
     /// publishes the bytes before shutdown makes the GUI observe HUP.
     reason: [192]u8 = undefined,
@@ -95,9 +100,14 @@ pub const Bridge = struct {
     }
 
     pub fn spawn(self: *Bridge) void {
-        self.thread = std.Thread.spawn(.{}, Bridge.worker, .{self}) catch null;
-        if (self.thread == null)
+        _ = self.refs.fetchAdd(1, .acq_rel);
+        const thread = std.Thread.spawn(.{}, Bridge.worker, .{self}) catch {
             self.failWith("could not start the remote-helper bridge worker");
+            self.release();
+            return;
+        };
+        // Detached on purpose: `stop` must never join (see there).
+        thread.detach();
     }
 
     /// The reason the worker recorded before dying, or "".
@@ -105,13 +115,31 @@ pub const Bridge = struct {
         return self.reason[0..self.reason_len.load(.acquire)];
     }
 
-    /// Stop the worker, interrupt its sockets, and free everything.
+    /// Interrupt the worker and drop the owner's reference.
+    ///
+    /// This runs on the GTK main thread and deliberately does NOT join.
+    /// The worker's first act is a mux connect, which can sit in a TCP
+    /// or SSH connect to an unreachable egress host for the kernel's
+    /// whole timeout and is the one phase `cancel` cannot interrupt —
+    /// joining there froze the entire GUI for the duration of closing a
+    /// remote browser tab. The last reference frees instead, whichever
+    /// side holds it.
+    ///
+    /// It also does not touch `local`. The worker OWNS that endpoint and
+    /// closes it on several paths (`pumpLocal` EOF, chan_close,
+    /// `finishAfterMuxClose`), so reading `local.fd` from here could
+    /// shut down an fd number GTK has already reused for something else.
+    /// Every worker poll watches `wakeup.read_fd` as its cancel index,
+    /// so the signal below already IS the cancellation.
     pub fn stop(self: *Bridge) void {
         self.cancel.stop();
         if (self.wakeup) |wake| wake.signal();
-        self.local.shutdown();
-        if (self.thread) |t| t.join();
-        self.thread = null;
+        self.release();
+    }
+
+    /// Drop one reference; the last one tears the bridge down.
+    fn release(self: *Bridge) void {
+        if (self.refs.fetchSub(1, .acq_rel) != 1) return;
         self.local.deinit(self.allocator);
         if (self.gui_fd >= 0) _ = c.close(self.gui_fd);
         self.gui_fd = -1;
@@ -119,6 +147,7 @@ pub const Bridge = struct {
             wake.close();
             self.wakeup = null;
         }
+        self.cancel.release();
         if (self.conn_ok) {
             self.conn.deinit();
             self.conn_ok = false;
@@ -139,8 +168,9 @@ pub const Bridge = struct {
     }
 
     fn worker(self: *Bridge) void {
+        defer self.release();
         const h = self.host[0..self.host_len];
-        const conn = mux_cli.muxConnect(self.allocator, if (h.len == 0) null else h) orelse {
+        const conn = self.connectFn(self.allocator, if (h.len == 0) null else h) orelse {
             self.failWith("Could not reach the sketerm-mux daemon on that host.");
             return;
         };
@@ -422,6 +452,9 @@ const TestBridge = struct {
     bridge: ?*Bridge,
     gui_fd: c_int,
     mux_peer: c_int,
+    /// `Bridge.stop` no longer joins, so the test owns the handle and
+    /// joins it itself -- teardown here must stay deterministic.
+    thread: ?std.Thread = null,
 
     fn init() !TestBridge {
         const t = std.testing;
@@ -450,13 +483,26 @@ const TestBridge = struct {
 
     fn start(self: *TestBridge) !void {
         const bridge = self.bridge orelse return error.TestUnexpectedResult;
-        bridge.thread = try std.Thread.spawn(.{}, Bridge.relay, .{ bridge, @as(u32, 7) });
+        _ = bridge.refs.fetchAdd(1, .acq_rel);
+        self.thread = std.Thread.spawn(.{}, TestBridge.relayThread, .{bridge}) catch |err| {
+            bridge.release();
+            return err;
+        };
+    }
+
+    fn relayThread(bridge: *Bridge) void {
+        defer bridge.release();
+        bridge.relay(7);
     }
 
     fn stop(self: *TestBridge) void {
         const bridge = self.bridge orelse return;
         self.bridge = null;
         bridge.stop();
+        if (self.thread) |thread| {
+            thread.join();
+            self.thread = null;
+        }
         _ = c.close(self.gui_fd);
         _ = c.close(self.mux_peer);
         self.gui_fd = -1;
@@ -681,4 +727,81 @@ test "remote bridge queue limit closes the local endpoint" {
     if (handled) return error.QueueLimitWasAccepted;
     if (std.mem.indexOf(u8, bridge.takeReason(), "stopped accepting") == null)
         return error.QueueLimitReasonMissing;
+}
+
+/// The worker's connect stand-in: it blocks until `test_connect_until`,
+/// exactly like a TCP/SSH connect to a host that is not answering.
+var test_connect_entered = std.atomic.Value(bool).init(false);
+var test_connect_until = std.atomic.Value(i64).init(0);
+
+fn testBlockingConnect(_: std.mem.Allocator, _: ?[]const u8) ?mux_client.Conn {
+    test_connect_entered.store(true, .release);
+    while (channel_pump.nowMs() < test_connect_until.load(.acquire)) _ = c.usleep(2_000);
+    return null;
+}
+
+/// `Bridge.worker` releases the reference `spawn` takes, so this stands
+/// in for `spawn` with a handle the test can join.
+fn testJoinableWorker(bridge: *Bridge) void {
+    bridge.worker();
+}
+
+test "stopping a bridge parked in its connect does not wait for the connect" {
+    // Closing a remote browser tab while the host is unreachable used to
+    // join a worker that had not published a cancellable fd yet, so the
+    // whole GUI main loop froze for the connect timeout.
+    const t = std.testing;
+    const bridge = Bridge.createUsing(t.allocator, "test", platform.Wakeup.init) orelse
+        return error.TestUnexpectedResult;
+    bridge.connectFn = testBlockingConnect;
+    const gui_fd = bridge.guiFd();
+    defer _ = c.close(gui_fd);
+
+    test_connect_entered.store(false, .release);
+    test_connect_until.store(channel_pump.nowMs() + 800, .release);
+    _ = bridge.refs.fetchAdd(1, .acq_rel);
+    const thread = std.Thread.spawn(.{}, testJoinableWorker, .{bridge}) catch |err| {
+        bridge.release();
+        return err;
+    };
+    defer thread.join();
+    while (!test_connect_entered.load(.acquire)) _ = c.usleep(1_000);
+
+    const started = channel_pump.nowMs();
+    bridge.stop();
+    try t.expect(channel_pump.nowMs() - started < 300);
+}
+
+test "stop leaves the worker-owned local endpoint alone" {
+    // `local` is closed by the worker on several paths, and the GTK
+    // thread reuses fd numbers constantly, so a shutdown() from `stop`
+    // could land on an unrelated GUI socket (the Wayland display, a
+    // pane's mux connection). Model exactly that: the number `local`
+    // still holds now belongs to somebody else.
+    const t = std.testing;
+    const bridge = Bridge.createUsing(t.allocator, "test", platform.Wakeup.init) orelse
+        return error.TestUnexpectedResult;
+    const gui_fd = bridge.guiFd();
+    defer _ = c.close(gui_fd);
+    // Stand in for a live worker so `stop` only drops the owner ref.
+    _ = bridge.refs.fetchAdd(1, .acq_rel);
+
+    const stale = bridge.local.fd;
+    _ = c.close(stale);
+    var pair: [2]c_int = .{ -1, -1 };
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
+    defer _ = c.close(pair[0]);
+    defer _ = c.close(pair[1]);
+    try t.expect(pair[0] == stale or pair[1] == stale);
+
+    bridge.stop();
+
+    const byte = [_]u8{0x7e};
+    try t.expectEqual(@as(isize, 1), c.write(pair[0], &byte, 1));
+    var got: [1]u8 = undefined;
+    try t.expectEqual(@as(isize, 1), c.read(pair[1], &got, 1));
+    try t.expectEqual(@as(u8, 0x7e), got[0]);
+
+    bridge.local = .{};
+    bridge.release();
 }

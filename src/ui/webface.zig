@@ -1791,8 +1791,7 @@ fn createContainerAtWith(gpa: std.mem.Allocator, spec: ContainerSpec, make_egres
             return 0;
         };
         const proxy = std.fmt.allocPrint(gpa, "socks5://127.0.0.1:{d}", .{eg.port()}) catch {
-            eg.stop();
-            eg.destroy();
+            eg.close();
             gpa.free(name_owned);
             gpa.free(jar_owned);
             gpa.free(host_owned);
@@ -1800,8 +1799,7 @@ fn createContainerAtWith(gpa: std.mem.Allocator, spec: ContainerSpec, make_egres
             return 0;
         };
         if (proxy.len == 0 or !eg.spawn()) {
-            eg.stop();
-            eg.destroy();
+            eg.close();
             gpa.free(proxy);
             gpa.free(name_owned);
             gpa.free(jar_owned);
@@ -1831,8 +1829,7 @@ fn createContainerAtWith(gpa: std.mem.Allocator, spec: ContainerSpec, make_egres
         .egress = egress,
     }) catch {
         if (egress) |eg| {
-            eg.stop();
-            eg.destroy();
+            eg.close();
         }
         gpa.free(name_owned);
         gpa.free(jar_owned);
@@ -1878,8 +1875,7 @@ pub fn destroyContainer(gpa: std.mem.Allocator, id: u32) bool {
             if (cl.state == .ready) cl.post(proto.ContextDestroy{ .id = id });
         }
         if (ctn.egress) |eg| {
-            eg.stop();
-            eg.destroy();
+            eg.close();
         }
         const dead = g_containers.orderedRemove(i);
         gpa.free(dead.name);
