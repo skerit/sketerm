@@ -18876,3 +18876,64 @@ artifact cannot be produced. Those hosts get their daemon back, with a
 warning naming exactly what is missing, and `sketerm mux <host>` says
 so when there is no portable artifact to deploy instead of leaving the
 user with an unexplained "command not found" from the far end.
+
+## 2026-08-18: the latent tail — index width, carried state, and locks
+
+The review's blocking findings were done; this is the tail of latent
+ones that were triaged out of that pass and then fixed on their own.
+None had bitten a user yet. All five were a step away from doing so.
+
+`scrollback` is a `u32` key and the reflow row indices were `u16`. Past
+65535 scrollback lines a width-changing resize placed the cursor and
+every grapheme cluster against a truncated index, and the two halves
+had to move together: widening only the call sites, with the loop
+counter left at `u16`, turns a wrong answer into an infinite loop.
+`positionInLogicals` is now typed on the domain it actually walks
+(scrollback plus active) rather than on the active grid's.
+
+Snapshot v8 had been introduced to stop a reattached client diverging
+from the daemon, and it still omitted five pieces of persistent,
+app-driven state: the completed OSC 133 zone ring, the Kitty
+placeholder assembly and auto-increment context, virtual placements,
+the OSC 17/19 selection colours, and OSC 1337 user variables. The
+placeholder context decides how the NEXT PRINTED CELL is interpreted,
+which is the exact class of state the version exists to carry. They
+travel in v9 -- a bump rather than a longer tail, because the v8 body
+is validated with an exact end-of-body check, so appending in place
+would make every v8 reader reject every attach.
+
+The reason that gap opened twice is that "which Screen fields survive a
+reattach" had no declaring home: serialize, restore and compare each
+hand-enumerated a subset of 131 fields. Every field is now classified
+carried, derived or transient, with a comptime walk over
+`std.meta.fields(Screen)` that fails the build on an unclassified field
+AND on a stale entry. Adding field 132 is one edit or the build breaks.
+
+Two LSP fail-closed rules had no recovery. A `"version": 1.0` -- a
+float, which some servers emit -- was classified unreadable and dropped
+the publish, silently, for the whole session; and once any versioned
+publish had arrived, an unversioned one was refused forever, which is
+how several servers report config- or build-triggered diagnostics.
+Both degrade now. A publish carrying a demonstrably older version is
+still refused, which was the point of the original change. Two sibling
+latches went with them: a replaced document drops its queue and its
+anchor map together (dropping only the queue left the map describing a
+document that no longer existed), and an empty transaction advances the
+synchronized revision, because `Document.revision` bumps unconditionally
+and a single lagging revision failed both edits and diagnostics closed.
+
+The helper retained a proxy value graph per egress context and had no
+way to release it -- the entry carried no context id, so a helper
+churning ephemeral containers grew forever. The entries are keyed and
+released with their context now. CEF's headers document that
+`get_all_preferences` copies and say nothing either way about
+`set_preference`, so the retention itself stays.
+
+`registry.json` was the last piece of the install transaction with no
+cross-process lock, and locking it alone would not have been enough:
+each process rewrote the whole file from its own in-memory view, so two
+installs of DIFFERENT extensions lost one entry. The registry now has
+one home that takes an flock, re-reads the file inside it, applies the
+change by extension id to what is actually on disk, and writes. The
+lock is always taken while an install lock is held and never the other
+way round.
