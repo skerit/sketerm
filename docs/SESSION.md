@@ -18619,3 +18619,260 @@ With those in, smoke-e2e passed end to end twice. Later runs failed in
 the viewer stage's OCR assertions with varying messages while the host
 sat at load 17 under an unrelated ffmpeg job -- the documented tesseract
 flake class, not a regression, but worth re-confirming on an idle host.
+
+## 2026-08-17: the failure-atomicity sweep
+
+Three days of systematic review of allocation-failure and teardown
+paths, roughly eighty commits. One shape kept coming back: state was
+mutated before the allocation that could fail, so an OOM left a
+half-applied structure that the next operation indexed into. The worst
+of them were not theoretical. `Screen.resize` committed new-width rows
+before the alt buffer and scrollback were resized, so a failure there
+returned with rows at `new_cols` while `cols` still held the old value
+-- and `cellAt` indexes unchecked, so the very next print wrote past the
+allocation. Scroll-up transferred active buffers before its scrollback
+slots existed; reflow replaced buffers it had not finished building;
+the alt-screen switch cleared the cluster table for a switch that then
+did not happen.
+
+The fix is the same everywhere and is worth copying: build the
+replacement under temporary ownership, validate the whole payload, then
+commit with no allocation left to fail. Snapshot restore stages pools
+and screens and swaps both together, so a corrupt or OOM-failed restore
+leaves the live terminal untouched. The webext registry stages entries
+and helper instances before replacing live state. A failed spawned MCP
+client is now one transaction with an origin-fenced kill rather than a
+half-registered session. Each of these landed with its own induced-OOM
+coverage, which is what makes the invariant hold rather than the
+comment saying it does.
+
+## 2026-08-18: errdefer that never runs
+
+Zig accepts `errdefer` inside a function that cannot return an error --
+`void`, `?T`, a plain value -- compiles it without a warning, and then
+never runs it. Only an error return triggers an errdefer, and such a
+function has none, so every `catch return null` inside it skips the
+rollback while reading as correct cleanup. A tree-wide sweep found 22.
+
+They were not decorative. `Screen.toggleAltScreen` is `void`, so the
+first `DECSET ?1049h` of any vim or less under memory pressure leaked
+the line vector and every Line built. The daemon's `restoredFsJob`
+returns `?*FsJob` and had eight of them: an OOM part-way through
+journal restore leaked every earlier dupe. `watchEvents` leaked a D-Bus
+connection AND its socket fd on two paths, which repeated failures turn
+into fd exhaustion. The file browser's Exec/field-code builders and the
+web helper's four buffer builders leaked the partially built buffer on
+each of a dozen early returns.
+
+`zig build lint-errdefer` (`src/lint_errdefer.zig`) now fails
+`test`/`test-core`/`test-web` on any new one. It is an AST walk over
+`std.zig.Ast` -- the compiler's own parser -- so comments, strings,
+`test` blocks and nested functions classify exactly instead of by grep,
+and it self-checks its classifier against fifteen fixtures before
+scanning. The standard fix is to give the function an error-returning
+body under its existing optional face, not to delete the errdefer.
+
+## 2026-08-17: one declaring home per mechanism
+
+The sweep kept finding the same logic written two and three times, each
+copy subtly weaker, which is how several of the bugs above got in.
+Consolidated in this pass: the nonblocking local-fd/mux pump behind
+port forwarding, the SOCKS bridge and remote browsing is now
+`mux/channel_pump.zig` (three drift-prone loops before); durable
+whole-file replacement is `util/atomicwrite.zig`, and the editor and
+job journals, the MCP registry and the panel asset cache all stopped
+reinventing a weaker half of it; spawn-request validation, shell
+injection and error mapping have one owned preparation path shared by
+monolith and broker; the four hand-rolled copies of peel-restore-into-
+a-fresh-pool converge on `snapshot.restoreOwned`; the three grid limits
+became one; `client.zig` had re-implemented `util/fdcancel.zig` one
+commit after it landed, without the stop latch, and panelhost carried
+two more copies.
+
+The stage-name case is the clearest argument for the rule: the shared
+writer's unique stage name never matched filtersub's hardcoded `.part`,
+so every crashed filter or thumbnail write left an orphan that no
+sweeper collected, and `preview.zig` had a third, pointer-keyed scheme
+that could collide. The format now has exactly one home and everything
+stages through it.
+
+## 2026-08-17: snapshot v8, capability negotiation, and real bounds
+
+Snapshot v8 appends the saved and live interpreter state, without which
+a client applying post-attach events diverged from the daemon; legacy
+bodies keep documented defaults. A `use_alt` snapshot that omits the
+alternate grid is now rejected before a staged restore commits. A
+failed event serialization rolls back its partial appends and only
+publishes a sequence change for a complete batch, and a snapshot that
+keeps failing tells the client and drops it instead of withholding
+`.events` forever while re-serializing the whole grid every tick.
+
+Untrusted input got real limits. Cast playback built its Screen from
+the file header and from recorded resize records behind nothing but a
+4096-per-axis check, so a 4096x4096 header bought ~134MB of grid; both
+Kitty and iTerm inline images decoded with no preflight, and a small
+crafted PNG made stb allocate gigabytes inside `sketerm-mux` until the
+OOM killer took every session with it. Everything now goes through
+`wire.validateTerminalSize` and `image_size.byteLen`.
+
+The grid cap moved the other way at the same time: 1000 columns
+rejected real hardware (a 5120px panel at a 5px cell is 1024). The axis
+cap is 4096 with a total-cell bound (1 Mi cells, an 8 MB grid) doing
+the real work -- and a refused resize is now visible, because `.err`
+carries the id of the request it answers instead of being dropped or
+charged to a pending rename. SOCKS negotiates `stream_open` per mux
+connection and fails closed against daemons that lack it, rather than
+discovering it through a generic protocol error.
+
+## 2026-08-17: the webext transactional installer
+
+Extension archives are staged and validated under a per-extension lock,
+the helper acknowledges prepare and commit, and the package tree plus
+registry state swap atomically or roll back together -- covered for
+write failure, OOM, crash, contention, refusal, upgrade and rollback in
+both unit roots and smoke-web. XPI decompression validates every extent
+and local header before allocating, caps inflate work, and verifies
+names and CRCs.
+
+Two follow-ups were needed and are the interesting part. A remote
+helper reports `.ready` with every webext capability zeroed, so a
+readiness-only gate refused every .xpi with "the previous version was
+restored" while nothing had been sent and nothing restored; the
+installer falls back to a local install when no helper can stage. And
+`renameExchange` returning `.unsupported` was treated as failure, which
+broke EVERY upgrade on NFS, CIFS, old overlayfs and HFS+.
+
+## 2026-08-17: packaging, the build graph, and two enforced invariants
+
+The deployment daemon is now built for the package's architecture
+rather than the builder's, mapped from dpkg/uname/makepkg names to
+explicit musl targets, with both supported architectures cross-staged
+and their ELF headers asserted. Debian mux-only builds install the
+fribidi headers they actually probe. The Zig package archive enumerates
+every vendored runtime and shim the advertised build steps need, and is
+verified to build independently of workspace artifacts. Private tools
+no longer install by default.
+
+Plain installs (no makepkg, no dpkg) grew an ownership manifest: paths
+absent from the next stage are removed before the new tree is
+overlaid, and the manifest is published last so an interrupted copy
+leaves the previous one available for a retry. The D-Bus portal service
+is generated with the installed executable path for a non-`/usr`
+prefix, escaped through both the service-file value decoder and D-Bus's
+shell-style parser, with the real `dbus-run-session` activation
+exercised in the test.
+
+Two build-time gates landed with all this. `dist/test-test-roots.sh`
+scans every `src/**.zig` for a `test` block and fails unless the right
+roots import it, so a test nobody imports is a build error rather than
+a test that silently never runs; it is a dependency of `test`,
+`test-core` and `test-web`, and had to be added to the packaged archive
+for the same reason.
+
+## 2026-08-18: teardown ordering and callback liveness
+
+Graceful shutdown frees Zig-side storage before GTK disposes the widget
+tree, which turned every unsevered handler into a use-after-free. The
+pane's render surface, the tab bar and the editor face all now
+disconnect their handlers and cancel their raw timeout sources at a
+sever hook before the storage goes, asserted in the signal-driven smoke
+rigs. The editor's GL area was the worst of them: realize, unrealize,
+render, resize and destroy all carried a raw `*EditorView` that nothing
+ever disconnected, and the face relied on GTK unrealizing first.
+
+The rest of this group is CLAUDE.md's three mechanisms applied where
+the wrong one had been picked. The path-completion popover now owns the
+view's pointer through a qdata `GDestroyNotify`, because
+`BrowserView.deinit` closes it after `widgets_dead` and nothing nulled
+the field. The inline rename idle is tracked and synchronously disposed
+before its tab can be freed. The files status bar refuses a finalized
+label. On the web side, `stop()` used to shut down an fd the worker may
+already have closed and reused, and joined a worker still inside an
+uncancellable mux connect -- closing a remote tab with the host down
+froze the GTK main loop for the whole connect timeout; teardown now
+hands ownership to a refcount and cancels through the wakeup every poll
+already watches.
+
+One near-miss is worth recording: `close-request` is NOT emitted for
+`gtk_window_destroy`, so the first caller to rely on it would have
+killed a window with running shells. The window recovers by running
+`beginDestroy` late and only aborts under a VERIFY env var, and the
+teardown signal counts are derived at the connect sites so an added or
+removed signal is detected instead of matching a stale literal.
+
+## 2026-08-18: the LSP staleness pass
+
+Every LSP reply is an answer to a document state that may no longer
+exist, and the client believed several of them. Diagnostics are now
+mapped through the pending edits between the version they were computed
+against and the current rope, and rejected when stale or ambiguous
+rather than replacing newer results (unversioned servers still work).
+Rename and code-action edits validate their revision before applying
+ranges, and a deferred cross-file hunk is bound to tab+load so it
+cannot land in a document that was swapped underneath it -- and every
+load path now settles, because a reload-in-place and a load that closes
+its own tab both cleared `loading` without draining, leaving a rename's
+hunk queued forever after the user was told it applied.
+
+The outline was the one reply mapped against the rope as it is now and
+then stamped with the current revision, so typing during its flight
+left every entry pointing at old line numbers; mapping moved to
+GTK-free `lsp/symbols.zig`, which refuses instead. Dead local server
+connections are reaped outside active callbacks and cannot be reused.
+
+The completion popup needed a correction after its own fix: it
+deliberately survives a keystroke and re-requests on a 120ms debounce,
+so gating the whole accept on the revision stamp made Enter insert
+nothing for that window plus the server's latency. Only a server
+`textEdit` needs the revision; the word scan does not.
+
+## 2026-08-18: the hardening regressions
+
+Four commits in this series had to be walked back in part, and the
+pattern is the same each time: a bound or a reset was applied wider
+than the bug that motivated it.
+
+`image_memory_mb` became a hard per-image reject, so a low budget made
+`icat` draw nothing and left animations at zero frames; the budget
+evicts FIFO again behind an unmovable 256MB ceiling, and an axis no
+longer rejects an image that fits in bytes since `GL_MAX_TEXTURE_SIZE`
+is answered by downscaling at upload. Resolving the effective ANSI
+palette on every config change stamped the built-in defaults over
+entries 0..15, so a default config lost OSC 4 colours on any prefs
+toggle or theme flip; each pane now remembers what the config last gave
+it and rewrites only that range. The webext readiness gate and the LSP
+completion gate are described above.
+
+The lesson that generalizes: a validation added at an entry point
+should reject inputs the entry point can actually receive, and a reset
+should own exactly the state it wrote. Both are cheap to test and both
+of these shipped without such a test.
+
+## 2026-08-18: three installer defects
+
+`dist/stage.sh` had started rejecting any prefix byte outside printable
+ASCII, so a user whose home directory carries an accent could no longer
+install into it. Nothing needed that: D-Bus service files are UTF-8 and
+the activation escaper handles arbitrary bytes (its test activates a
+service from a prefix containing `$ \ ' " # & =` and spaces under
+`dbus-run-session`). Only newlines and control characters, which the
+file format genuinely cannot represent, are rejected now.
+
+The plain-install manifest is the ownership record, but the no-manifest
+case still deleted `bin/sketerm-webengine` unconditionally as a legacy
+migration -- so an Arch user running `--prefix /usr --gui-only` on a
+host without CEF headers had pacman's own helper silently removed by a
+script that never installed it. A path this installer did not record is
+no longer its to delete; the leftover is reported instead. Manifest
+cleanup also now reclaims the directories it empties (`rmdir` upward,
+which by construction cannot touch a directory holding anything else),
+so `share/sketerm/shaders/` no longer survives a GUI to mux-only
+downgrade.
+
+Unsupported architectures had gone from degraded to no-install: armhf,
+i386 and riscv64 aborted before kind selection even for `--mux-only`,
+although the daemon builds fine there and only the portable deployment
+artifact cannot be produced. Those hosts get their daemon back, with a
+warning naming exactly what is missing, and `sketerm mux <host>` says
+so when there is no portable artifact to deploy instead of leaving the
+user with an unexplained "command not found" from the far end.
