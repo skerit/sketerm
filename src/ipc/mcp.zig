@@ -385,7 +385,8 @@ fn setupIsolation(allocator: std.mem.Allocator, name: ?[]const u8, durable: bool
         std.fmt.allocPrint(allocator, "{s}/sketerm/mcp-{s}", .{ rt, n }) catch return null
     else
         std.fmt.allocPrint(allocator, "{s}/sketerm/mcp-tmp-{d}", .{ rt, c.getpid() }) catch return null;
-    errdefer allocator.free(dir);
+    // No errdefer: `?Isolation` cannot return an error, so it would
+    // never run. Both bail-outs below free `dir` explicitly.
     const dir_z = std.fmt.bufPrintZ(&z_buf, "{s}", .{dir}) catch {
         allocator.free(dir);
         return null;

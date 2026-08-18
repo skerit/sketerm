@@ -317,9 +317,15 @@ pub fn buildBootstrapScript(
 
 /// Read a whole file (bounded), libc IO like the rest of this module.
 fn readScriptFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    return readScriptFileAlloc(allocator, path) catch null;
+}
+
+/// Error-returning so the `errdefer` runs. As a `?[]u8` body the final
+/// `toOwnedSlice(allocator) catch null` leaked the whole file.
+fn readScriptFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     var pbuf: [4096]u8 = undefined;
-    const path_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{path}) catch return null;
-    const f = c.fopen(path_z.ptr, "rb") orelse return null;
+    const path_z = try std.fmt.bufPrintZ(&pbuf, "{s}", .{path});
+    const f = c.fopen(path_z.ptr, "rb") orelse return error.OpenFailed;
     defer _ = c.fclose(f);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -327,16 +333,10 @@ fn readScriptFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
     while (true) {
         const n = c.fread(&buf, 1, buf.len, f);
         if (n == 0) break;
-        out.appendSlice(allocator, buf[0..n]) catch {
-            out.deinit(allocator);
-            return null;
-        };
-        if (out.items.len > 256 * 1024) {
-            out.deinit(allocator);
-            return null;
-        }
+        try out.appendSlice(allocator, buf[0..n]);
+        if (out.items.len > 256 * 1024) return error.StreamTooLong;
     }
-    return out.toOwnedSlice(allocator) catch null;
+    return out.toOwnedSlice(allocator);
 }
 
 fn buildBootstrapVia(allocator: std.mem.Allocator, comptime wrapped: bool) ?[]u8 {
