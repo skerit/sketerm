@@ -29,7 +29,6 @@ pub const Error = error{
 
 pub const limits = struct {
     pub const archive_size: usize = 64 * 1024 * 1024;
-    pub const entries: usize = 8192;
     pub const entry_uncompressed: usize = 64 * 1024 * 1024;
     pub const aggregate_uncompressed: usize = 256 * 1024 * 1024;
     pub const name_length: usize = 1024;
@@ -107,8 +106,12 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) Error!Archive {
         cd_size_u32 == std.math.maxInt(u32) or
         cd_off_u32 == std.math.maxInt(u32)) return error.UnsupportedZip64;
 
+    // There is deliberately no entry-COUNT limit. Neither Chrome nor
+    // Firefox imposes one, archive_size and aggregate_uncompressed
+    // already bound the work, and zip64 is refused above so the count
+    // is a u16 anyway: the capacity reserved below cannot exceed 64Ki
+    // entries.
     const total: usize = total_u16;
-    if (total > limits.entries) return error.LimitExceeded;
     const cd_size = toUsize(cd_size_u32) orelse return error.BadData;
     const cd_start = toUsize(cd_off_u32) orelse return error.BadData;
     _ = try range(bytes, cd_start, cd_size, eocd_off);
@@ -537,17 +540,8 @@ test "accepts an EOCD comment and data descriptor metadata" {
     try t.expectEqualStrings("{\"name\":\"descriptor\"}", arc.find("manifest.json").?.data);
 }
 
-test "rejects entry count, output size, and aggregate bombs" {
+test "rejects output size and aggregate bombs" {
     const gpa = t.allocator;
-
-    {
-        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
-        defer gpa.free(zip);
-        const eocd = testEocdOffset(zip);
-        setU16(zip, eocd + 8, @intCast(limits.entries + 1));
-        setU16(zip, eocd + 10, @intCast(limits.entries + 1));
-        try t.expectError(error.LimitExceeded, read(gpa, zip));
-    }
 
     {
         const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
