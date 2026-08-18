@@ -121,6 +121,7 @@ comptime {
     _ = @import("ui/cssutil.zig");
     _ = @import("ui/playbar.zig");
     _ = @import("ui/viewer.zig");
+    _ = @import("ui/remotestream.zig");
     _ = @import("ui/castview.zig");
     _ = @import("ui/secrets.zig");
     _ = @import("ui/app_launcher.zig");

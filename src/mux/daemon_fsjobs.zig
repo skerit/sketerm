@@ -291,7 +291,7 @@ fn restartFsJobFromJournal(self: *Daemon, cl: *Client, existing: *FsJob, client_
 /// with the requesting client. They report a view's decoration, not
 /// a mutation worth recovering.
 pub fn ephemeralOp(op: FsJob.Op) bool {
-    return op == .thumbnail or op == .preview or op == .preview_transport or op == .dir_size or op == .media_meta or op == .git_status or op == .diff or op == .git_diff or op == .disk_usage;
+    return FsJob.producesAsset(op) or op == .dir_size or op == .media_meta or op == .git_status or op == .diff or op == .git_diff or op == .disk_usage;
 }
 
 /// Recursive-permission arguments; -1 keeps the current owner or
@@ -1216,6 +1216,20 @@ pub fn fsJobOp(self: *Daemon, cl: *Client, r: FsOpReq) void {
     }
 }
 
+/// When a job's scratch asset may go: now if nobody owns it, after the
+/// TTL for a one-shot preview, and for a playback spool only once its
+/// owner disconnects (the client-death sweep turns a positive stamp
+/// into "now"), since the viewer keeps reading it long after the
+/// encode finished.
+fn armAssetCleanup(job: *FsJob) void {
+    job.cleanup_at_ms = if (job.owner == null or job.owner.?.dead)
+        nowMs()
+    else if (job.op == .preview_stream)
+        std.math.maxInt(i64)
+    else
+        nowMs() + PREVIEW_ASSET_TTL_MS;
+}
+
 /// Push one fs_job event toward the owner (if still alive).
 pub fn fsJobEmit(self: *Daemon, job: *FsJob, ev: []const u8) void {
     _ = self;
@@ -1370,7 +1384,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
     if (std.mem.eql(u8, e.ev, "asset")) {
         job.done_path_len = @min(e.path.len, job.done_path.len);
         @memcpy(job.done_path[0..job.done_path_len], e.path[0..job.done_path_len]);
-        job.cleanup_at_ms = if (job.owner == null or job.owner.?.dead) nowMs() else nowMs() + PREVIEW_ASSET_TTL_MS;
+        armAssetCleanup(job);
         return;
     }
     if (std.mem.eql(u8, e.ev, "repo")) {
@@ -1473,8 +1487,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         job.done_kept = e.keep;
         job.done_text_len = @min(e.text.len, job.done_text.len);
         @memcpy(job.done_text[0..job.done_text_len], e.text[0..job.done_text_len]);
-        if (job.owns_dst or job.owns_src or job.op == .thumbnail or job.op == .preview or job.op == .preview_transport)
-            job.cleanup_at_ms = if (job.owner == null or job.owner.?.dead) nowMs() else nowMs() + PREVIEW_ASSET_TTL_MS;
+        if (job.owns_dst or job.owns_src or FsJob.producesAsset(job.op)) armAssetCleanup(job);
         if (!moveHelperOwnsJournal(job)) {
             saveFsJob(self, job) catch {
                 job.terminal_pending = true;

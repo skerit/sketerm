@@ -2011,7 +2011,14 @@ pub const FsView = struct {
 pub const DebugJob = @import("daemon_debug.zig").DebugJob;
 
 pub const FsJob = struct {
-    pub const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta, preview_transport, git_status, diff, split, combine, secure_delete, git_diff, disk_usage };
+    pub const Op = enum { copy, delete_tree, hash, find, grep, extract, archive_create, archive_list, archive_extract, trash, trash_restore, cross_copy, panelize, live_find, thumbnail, preview, dir_size, perm_tree, media_meta, preview_transport, preview_stream, git_status, diff, split, combine, secure_delete, git_diff, disk_usage };
+
+    /// Ops whose result is a daemon-owned scratch file (the `asset`
+    /// path) that is unlinked when the job is dropped -- the ONE list
+    /// the unlink and the TTL arming both read.
+    pub fn producesAsset(op: Op) bool {
+        return op == .thumbnail or op == .preview or op == .preview_transport or op == .preview_stream;
+    }
     pub const State = enum { running, paused, done, failed, canceled };
 
     allocator: std.mem.Allocator,
@@ -2124,8 +2131,7 @@ pub const FsJob = struct {
         if (self.out_fd >= 0) _ = c.close(self.out_fd);
         self.releaseOwnedSource();
         if (self.owns_dst) self.unlinkOwned(self.dst);
-        if ((self.op == .thumbnail or self.op == .preview or self.op == .preview_transport) and
-            self.done_path_len > 0 and !self.done_kept)
+        if (producesAsset(self.op) and self.done_path_len > 0 and !self.done_kept)
             self.unlinkOwned(self.done_path[0..self.done_path_len]);
         self.lbuf.deinit(self.allocator);
         self.allocator.free(self.src);

@@ -639,6 +639,26 @@ pub fn build(b: *std.Build) void {
     const smoke_e2e_step = b.step("smoke-e2e", "End-to-end GUI smoke on sketerm's own compositor (headless, no X)");
     smoke_e2e_step.dependOn(&smoke_e2e_run.step);
 
+    // Remote-playback smoke — `zig build smoke-stream` (headless, no
+    // display): daemon thread + the viewer's remotestream GObject driven
+    // as giostreamsrc drives it, both transcode and raw modes.
+    const smoke_stream_mod = b.createModule(.{
+        .root_source_file = b.path("src/smoke_stream.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    configureSysDeps(b, smoke_stream_mod, cbindings_mod);
+    smoke_stream_mod.addImport("build_options", glib_opts_mod);
+    const smoke_stream = b.addExecutable(.{
+        .name = "sketerm-smoke-stream",
+        .root_module = smoke_stream_mod,
+        .use_lld = use_lld,
+    });
+    const smoke_stream_run = b.addRunArtifact(smoke_stream);
+    const smoke_stream_step = b.step("smoke-stream", "Remote video playback stream smoke: daemon transcode spool + GIO stream (headless)");
+    smoke_stream_step.dependOn(&smoke_stream_run.step);
+
     // Browser measurement rig — `zig build measure-web`. Same display-
     // session recipe as smoke-e2e, plus a fractional viewer scale, for
     // the hover-latency and sharpness numbers (src/web_measure.zig).

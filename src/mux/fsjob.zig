@@ -438,6 +438,8 @@ pub fn serve(allocator: std.mem.Allocator) u8 {
         runPreview(allocator, spec, false)
     else if (std.mem.eql(u8, spec.op, "preview_transport"))
         runPreviewTransport(allocator, spec)
+    else if (std.mem.eql(u8, spec.op, "preview_stream"))
+        runPreviewStream(spec)
     else if (std.mem.eql(u8, spec.op, "media_meta"))
         runMediaMeta(allocator, spec)
     else if (std.mem.eql(u8, spec.op, "git_status"))
@@ -980,10 +982,85 @@ fn runPreviewTransport(allocator: std.mem.Allocator, spec: Spec) u8 {
     return 0;
 }
 
+/// Cheap remote playback: transcode a video into a low-bitrate,
+/// capped-width fragmented MP4 spool under /tmp, growing while the
+/// viewer plays it. Registered as an `asset` (the daemon unlinks it once
+/// the job dies or the client goes), and its path rides the first
+/// progress event so the viewer can start reading before the encode is
+/// done. ffmpeg runs in this helper's process group, so a client that
+/// disconnects kills the encode with the helper.
+fn runPreviewStream(spec: Spec) u8 {
+    var source_z: [4096:0]u8 = undefined;
+    const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return emitError("preview path too long");
+    var st: c.struct_stat = undefined;
+    if (c.stat(source.ptr, &st) != 0) return emitErrno("preview stat");
+    if (!binaryExists("ffmpeg")) return emitErrorKind("no_encoder", "ffmpeg is not installed on this host");
+    var random: [8]u8 = undefined;
+    if (c.getentropy(&random, random.len) != 0) {
+        var ts: c.struct_timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+        std.mem.writeInt(u64, &random, (@as(u64, @intCast(c.getpid())) << 32) ^ @as(u32, @intCast(ts.tv_nsec)), .little);
+    }
+    var out_z: [4096:0]u8 = undefined;
+    const out = std.fmt.bufPrintZ(&out_z, "/tmp/.sketerm-preview-{x}.mp4", .{std.mem.readInt(u64, &random, .little)}) catch
+        return emitError("spool path too long");
+    // Create it ourselves (exclusive, private) so the name is claimed
+    // and registered before ffmpeg starts writing.
+    const fd = c.open(out.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+    if (fd < 0) return emitErrno("spool create");
+    _ = c.close(fd);
+    emit(.{ .ev = "asset", .path = out });
+    const argv = [_:null]?[*:0]const u8{
+        "ffmpeg",         "-nostdin",   "-y",              "-v",                     "error",
+        "-i",             source.ptr,   "-map",            "0:v:0",                  "-map",
+        "0:a:0?",         "-vf",        PREVIEW_STREAM_VF, "-c:v",                   "libx264",
+        "-preset",        "ultrafast",  "-tune",           "zerolatency",            "-crf",
+        "28",             "-maxrate",   "2500k",           "-bufsize",               "5000k",
+        "-pix_fmt",       "yuv420p",    "-c:a",            "aac",                    "-b:a",
+        "128k",           "-ac",        "2",               "-movflags",              "frag_keyframe+empty_moov+default_base_moof",
+        "-f",             "mp4",        out.ptr,           null,
+    };
+    const pid = c.fork();
+    if (pid < 0) {
+        _ = c.unlink(out.ptr);
+        return emitErrno("fork");
+    }
+    if (pid == 0) {
+        _ = c.execvp(argv[0].?, @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    // The viewer starts reading here; every later progress event
+    // repeats the path and reports the spool's growth.
+    emit(.{ .ev = "progress", .path = out, .done = @as(u64, 0), .total = @as(u64, @intCast(st.st_size)) });
+    var status: c_int = 0;
+    while (true) {
+        const rc = c.waitpid(pid, &status, c.WNOHANG);
+        if (rc == pid) break;
+        if (rc < 0 and std.posix.errno(rc) != .INTR) {
+            _ = c.kill(pid, c.SIGKILL);
+            return emitErrno("waitpid");
+        }
+        var ts: c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = 250 * std.time.ns_per_ms };
+        _ = c.nanosleep(&ts, null);
+        var spool_st: c.struct_stat = undefined;
+        const written: u64 = if (c.stat(out.ptr, &spool_st) == 0) @intCast(spool_st.st_size) else 0;
+        emit(.{ .ev = "progress", .path = out, .done = written, .total = @as(u64, @intCast(st.st_size)) });
+    }
+    if (!(c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0)) return emitError("ffmpeg could not transcode this file");
+    var spool_st: c.struct_stat = undefined;
+    const written: u64 = if (c.stat(out.ptr, &spool_st) == 0) @intCast(spool_st.st_size) else 0;
+    emit(.{ .ev = "done", .path = out, .done = written, .total = written });
+    return 0;
+}
+
+/// Width capped at 1280 (never upscaled), height follows the aspect and
+/// stays even for yuv420p.
+const PREVIEW_STREAM_VF = "scale=w='min(1280,iw)':h=-2";
+
 const image_exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".jxl", ".bmp", ".tif", ".tiff", ".ico", ".svg", ".avif", ".heic", ".heif" };
 const pdf_exts = [_][]const u8{".pdf"};
-const video_exts = [_][]const u8{ ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg" };
-const audio_exts = [_][]const u8{ ".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac" };
+const video_exts = @import("../filebrowser/paths.zig").video_exts;
+const audio_exts = @import("../filebrowser/paths.zig").audio_exts;
 
 /// This host's XDG cache root ("/tmp" as the last resort).
 fn cacheRootDir(buf: []u8) []const u8 {

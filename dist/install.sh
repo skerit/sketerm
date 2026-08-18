@@ -323,7 +323,7 @@ do_debian() {
         # Runtime-dlopen'd, all optional by design: absent means the
         # feature degrades, never that the binary fails to start.
         if [ "$kind" = gui ]; then
-            echo "Recommends: libopus0, libglycin-2-0, glycin-loaders"
+            echo "Recommends: libopus0, libglycin-2-0, glycin-loaders, gstreamer1.0-plugins-good, gstreamer1.0-libav, gstreamer1.0-pipewire, ffmpeg"
         else
             echo "Recommends: libopus0"
         fi

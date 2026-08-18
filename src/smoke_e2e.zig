@@ -4229,6 +4229,28 @@ fn viewerCastStage(
         if (!ok) return "short write on the binary file";
     }
 
+    // The video half: a solid-orange 3s clip (a colour no other item
+    // shows). Playback and the poster fallback both paint it, so the
+    // assertion holds with or without GStreamer decoders on the host.
+    var vid_path_buf: [512:0]u8 = undefined;
+    const vid_path = std.fmt.bufPrintZ(&vid_path_buf, "{s}/viewer-e2e-clip.mp4", .{rt}) catch return "video path too long";
+    const have_video = blk: {
+        const fpid = c.fork();
+        if (fpid < 0) break :blk false;
+        if (fpid == 0) {
+            const argv = [_:null]?[*:0]const u8{
+                "ffmpeg", "-nostdin", "-y",       "-v",          "error", "-f",         "lavfi",  "-i",       "color=c=0xFF8000:s=320x240:d=3:r=15",
+                "-c:v",   "libx264",  "-preset",  "ultrafast",   "-pix_fmt", "yuv420p", vid_path.ptr, null,
+            };
+            _ = c.execvp("ffmpeg", @ptrCast(@constCast(&argv)));
+            c._exit(127);
+        }
+        var st: c_int = 0;
+        _ = c.waitpid(fpid, &st, 0);
+        break :blk c.WIFEXITED(st) and c.WEXITSTATUS(st) == 0;
+    };
+    if (!have_video) say("viewer video: ffmpeg unavailable; the batch carries no video item");
+
     var known: [16]u32 = undefined;
     var n_known: usize = 0;
     for (app.windows.items) |w| {
@@ -4249,8 +4271,13 @@ fn viewerCastStage(
         _ = c.unsetenv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
-        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, cast_path.ptr, txt_path.ptr, bin_path.ptr, null };
-        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        if (have_video) {
+            const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, cast_path.ptr, txt_path.ptr, bin_path.ptr, vid_path.ptr, null };
+            _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        } else {
+            const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "view", img_path.ptr, cast_path.ptr, txt_path.ptr, bin_path.ptr, null };
+            _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        }
         c._exit(127);
     }
     vcast_pid = pid;
@@ -4370,6 +4397,20 @@ fn viewerCastStage(
     app.pressKey(vwin, "Right") catch return "injecting Right failed";
     if (!viewerWaitOcr(allocator, app, vwin, "HEXPROOF", 25_000))
         return "the binary item's hex dump never rendered (no HEXPROOF in the OCR text)";
+
+    if (have_video) {
+        // Right -> the VIDEO item: the player (or, without decoders,
+        // the daemon poster) paints the clip's orange; Left tears the
+        // media stream down and restores the hex dump.
+        app.pressKey(vwin, "Right") catch return "injecting Right failed";
+        if (!castWaitRgb(allocator, app, vwin, .{ 0xFF, 0x80, 0x00 }, 400, true, 30_000))
+            return "the video item never painted its clip (neither playback nor the poster fallback)";
+        app.pressKey(vwin, "Left") catch return "injecting Left failed";
+        if (!castWaitRgb(allocator, app, vwin, .{ 0xFF, 0x80, 0x00 }, 400, false, 15_000))
+            return "navigating away from the video did not clear its frame";
+        if (!viewerWaitOcr(allocator, app, vwin, "HEXPROOF", 25_000))
+            return "navigating back from the video did not restore the hex dump";
+    }
 
     // Left -> text again (the backwards direction into text).
     app.pressKey(vwin, "Left") catch return "injecting Left failed";

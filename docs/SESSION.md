@@ -18937,3 +18937,59 @@ one home that takes an flock, re-reads the file inside it, applies the
 change by extension id to what is actually on disk, and writes. The
 lock is always taken while an install lock is held and never the other
 way round.
+
+## 2026-08-18: viewer playback, remote previews, Places user dirs
+
+Three user reports, all real. The Files sidebar's "Local Places" listed
+Home, File System and Trash and nothing else: nobody had built the XDG
+user directories. The daemon's `homedir` reply now carries `dirs`, the
+freedesktop user directories THAT host actually has (resolved from its
+own `user-dirs.dirs`, defaults under `$HOME`, a directory disabled by
+pointing at `$HOME/` skipped), and both the local and the per-host
+sidebar sections render them. The table (XDG key, default, label, icon)
+lives once in `fsserve.zig`; the daemon resolves paths from it and the
+sidebar picks icons from it.
+
+Every video opened in the Viewer said "Unable to load full resolution:
+SourceTooLarge", local or remote. One misplaced line: the 128MB
+whole-file ceiling sat ABOVE the variant branch in `fetch`, so it
+refused the PREVIEW load of any large video before ever asking the
+daemon for its poster; the failed preview then chained into "load the
+original as an image", which hit the same ceiling. The ceiling belongs
+to whole-file reads only, and a failed poster of a video/audio/pdf no
+longer chains into downloading the whole file to fail again.
+
+Playback exists now. `Content.video` holds a `GtkMediaStream` shown by
+one window-owned `GtkVideo`; Space/K toggle, `,` `.` `<` `>` seek, R
+restarts, Left/Right stay batch navigation, and any stream error
+(missing GStreamer plugins, unreadable file) says why and falls back to
+the daemon poster. A local file is a plain `GtkMediaFile`. A REMOTE
+file is `ui/remotestream.zig`: a `GFileInputStream` subclass GStreamer's
+`giostreamsrc` reads on its streaming thread, connecting to the file
+service lazily there (never on the GUI thread). Two modes. Video asks
+the remote daemon for a `preview_stream` job -- ffmpeg encodes a
+capped-width (1280), CRF 28 ultrafast h264 + AAC FRAGMENTED MP4 spool
+under /tmp -- and reads that while it grows: non-seekable, size unknown
+(so giostreamsrc stays in push mode; a size of 0 would be an instant
+EOS), a short read waits for the encoder. A 4K original never crosses
+the link; a host without ffmpeg degrades transparently to raw range
+reads. Audio, and the fallback, stream the original through a 4MB
+read-ahead window: seekable, sized, so qtdemux can find a trailing moov.
+The spool is a daemon `asset` whose cleanup is armed "when the owner
+disconnects" rather than after the usual 5-minute TTL, since the viewer
+keeps reading it long after the encode finished; the job is ephemeral,
+so closing the stream's connection kills helper and ffmpeg (process
+group) and unlinks the spool.
+
+`zig build smoke-stream` proves the remote path headless: daemon thread
++ the real GObject driven the way giostreamsrc drives it -- transcode
+mode yields a fragmented MP4 that ffmpeg decodes, raw mode is sized,
+seekable and byte-identical, and the spool is gone once the client goes.
+smoke-e2e's viewer stage now carries a solid-orange clip: playback and
+the poster fallback both paint it, so the assertion holds on hosts with
+and without decoders. Packaging: gst-plugins-good, gst-libav and
+gst-plugin-pipewire are GUI depends (GTK's built-in backend has no
+demuxers or decoders without them); ffmpeg is an optdepend on the host
+serving the files. Video/audio extension vocabularies moved to
+`filebrowser/paths.zig`, read by the poster generator, the classifier
+and the playback route alike.

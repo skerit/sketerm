@@ -189,14 +189,32 @@ pub fn isWorkerImageName(name: []const u8) bool {
     return false;
 }
 
-pub fn isPreviewMediaName(name: []const u8) bool {
-    if (isImageName(name)) return true;
-    const exts = [_][]const u8{
-        ".pdf", ".mp4",  ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg",
-        ".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac",
-    };
+/// THE video / audio extension vocabularies: the daemon's poster
+/// generator, the preview classifier and the viewer's playback route
+/// all read these, so a format added here is known everywhere at once.
+pub const video_exts = [_][]const u8{ ".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".mpeg", ".mpg" };
+pub const audio_exts = [_][]const u8{ ".mp3", ".flac", ".ogg", ".opus", ".wav", ".m4a", ".aac" };
+
+fn hasExt(name: []const u8, exts: []const []const u8) bool {
     for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
     return false;
+}
+
+pub fn isVideoName(name: []const u8) bool {
+    return hasExt(name, &video_exts);
+}
+
+pub fn isAudioName(name: []const u8) bool {
+    return hasExt(name, &audio_exts);
+}
+
+/// Anything the viewer can PLAY (GtkMediaStream): video and audio.
+pub fn isPlayableName(name: []const u8) bool {
+    return isVideoName(name) or isAudioName(name);
+}
+
+pub fn isPreviewMediaName(name: []const u8) bool {
+    return isImageName(name) or std.ascii.endsWithIgnoreCase(name, ".pdf") or isPlayableName(name);
 }
 
 pub fn isArchivePath(path: []const u8) bool {

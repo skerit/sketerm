@@ -21,6 +21,7 @@ const classicmenu = @import("browser/classicmenu.zig");
 const browser_open = @import("browser/open.zig");
 const format = @import("../filebrowser/format.zig");
 const appmenu = @import("appmenu.zig");
+const remotestream = @import("remotestream.zig");
 
 pub const Variant = enum { preview, original, external_copy, head };
 const PREVIEW_BYTES_MAX: usize = 2 << 20;
@@ -219,7 +220,7 @@ fn discardWork(work: *LoadWork) void {
     target.unref();
 }
 
-fn connectFs(host: ?[]const u8) !fsdrive.Fs {
+pub fn connectFs(host: ?[]const u8) !fsdrive.Fs {
     const allocator = std.heap.c_allocator;
     const conn = if (host) |remote| blk: {
         var config = Config.load(allocator);
@@ -331,8 +332,10 @@ fn fetch(work: *LoadWork) !FetchPayload {
             .bytes = try out.toOwnedSlice(allocator),
         };
     }
-    if (source.size > ORIGINAL_BYTES_MAX) return error.SourceTooLarge;
     if (variant == .original or variant == .external_copy) {
+        // The ceiling belongs to whole-file reads only: a preview of a
+        // multi-GB video is a small daemon-rendered poster.
+        if (source.size > ORIGINAL_BYTES_MAX) return error.SourceTooLarge;
         const bytes = try readAll(&fs, resource.path, ORIGINAL_BYTES_MAX);
         var payload = FetchPayload{ .source_size = bytes.len, .bytes = bytes };
         fetchMetadata(&fs, resource, &payload);
@@ -521,6 +524,9 @@ pub const Content = union(enum) {
     image,
     text,
     cast: *castbox.CastPlayerBox,
+    /// Video/audio playback: the window's one GtkVideo shows this
+    /// per-item media stream (owned reference), released on navigation.
+    video: *c.GtkMediaStream,
 };
 
 /// Number of header controls that only make sense for images and hide
@@ -551,7 +557,7 @@ pub const ViewerWindow = struct {
     };
 
     /// Which content family owns the window chrome right now.
-    const Mode = enum { image, text, cast };
+    const Mode = enum { image, text, cast, video };
 
     allocator: std.mem.Allocator,
     window: *c.GtkWidget,
@@ -584,6 +590,10 @@ pub const ViewerWindow = struct {
     /// text content is showing.
     text_slot: *c.GtkWidget,
     text_view: *c.GtkTextView,
+    /// The playback surface (GtkVideo with its own controls); hidden
+    /// unless video/audio content is showing. One for the window; the
+    /// media stream inside is swapped per item.
+    video_slot: *c.GtkWidget,
     options: Options,
     /// Header controls hidden while a cast is showing.
     image_controls: [IMAGE_CONTROL_COUNT]*c.GtkWidget,
@@ -677,6 +687,12 @@ pub const ViewerWindow = struct {
         c.gtk_widget_set_vexpand(cast_slot, 1);
         c.gtk_widget_set_visible(cast_slot, 0);
         c.gtk_box_append(@ptrCast(content), cast_slot);
+        const video_slot = c.gtk_video_new().?;
+        c.gtk_widget_set_vexpand(video_slot, 1);
+        c.gtk_widget_set_hexpand(video_slot, 1);
+        c.gtk_video_set_autoplay(@ptrCast(video_slot), 1);
+        c.gtk_widget_set_visible(video_slot, 0);
+        c.gtk_box_append(@ptrCast(content), video_slot);
         const text_slot = c.gtk_scrolled_window_new().?;
         c.gtk_scrolled_window_set_policy(@ptrCast(text_slot), c.GTK_POLICY_AUTOMATIC, c.GTK_POLICY_AUTOMATIC);
         c.gtk_widget_set_vexpand(text_slot, 1);
@@ -736,6 +752,7 @@ pub const ViewerWindow = struct {
             .cast_slot = cast_slot,
             .text_slot = text_slot,
             .text_view = @ptrCast(@alignCast(text_view)),
+            .video_slot = video_slot,
             .options = options,
             .image_controls = .{
                 zoom_out,    @ptrCast(@alignCast(zoom_label)), zoom_in,     fit_button,
@@ -840,6 +857,10 @@ pub const ViewerWindow = struct {
         // severed the timers/sinks when the window started dying).
         switch (self.content) {
             .cast => |box| box.destroy(),
+            .video => |stream| {
+                _ = c.g_signal_handlers_disconnect_matched(@ptrCast(stream), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @ptrCast(self));
+                c.g_object_unref(@ptrCast(stream));
+            },
             else => {},
         }
         if (self.pending_mount) |pending| pending.viewer = null;
@@ -872,6 +893,7 @@ pub const ViewerWindow = struct {
         self.anim_bar.sever();
         switch (self.content) {
             .cast => |box| box.severLive(),
+            .video => |stream| c.gtk_media_stream_pause(stream),
             else => {},
         }
     }
@@ -884,6 +906,7 @@ pub const ViewerWindow = struct {
         c.gtk_widget_set_visible(self.anim_bar.widget(), @intFromBool(image and self.session.animated()));
         c.gtk_widget_set_visible(self.cast_slot, @intFromBool(mode == .cast));
         c.gtk_widget_set_visible(self.text_slot, @intFromBool(mode == .text));
+        c.gtk_widget_set_visible(self.video_slot, @intFromBool(mode == .video));
         for (self.image_controls) |w| c.gtk_widget_set_visible(w, @intFromBool(image));
         if (!image) c.gtk_widget_set_visible(self.original_button, 0);
     }
@@ -904,6 +927,65 @@ pub const ViewerWindow = struct {
         box.destroy();
         self.cast_title_len = 0;
         self.setContentMode(.image);
+    }
+
+    /// Release the outgoing item's media stream: detach it from the
+    /// GtkVideo (which stops playback) and drop our reference. Safe in
+    /// any content mode.
+    fn closeVideo(self: *ViewerWindow) void {
+        const stream = switch (self.content) {
+            .video => |s| s,
+            else => return,
+        };
+        self.content = .image;
+        _ = c.g_signal_handlers_disconnect_matched(@ptrCast(stream), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @ptrCast(self));
+        c.gtk_video_set_media_stream(@ptrCast(self.video_slot), null);
+        c.g_object_unref(@ptrCast(stream));
+        self.setContentMode(.image);
+    }
+
+    /// Play a video/audio resource in place. A LOCAL file is a plain
+    /// GtkMediaFile; a remote one streams through the daemon via a
+    /// seekable input stream (`remotestream.zig`). Playback failure
+    /// (missing GStreamer plugins, unreadable file) falls back to the
+    /// daemon poster so the item still shows something.
+    fn showVideo(self: *ViewerWindow, resource: model.Resource) void {
+        self.target.cancel();
+        self.setMetadata(if (paths.isVideoName(resource.name())) "Video" else "Audio");
+        const stream: *c.GtkMediaStream = blk: {
+            if (resource.host == null) {
+                var z: [4096:0]u8 = undefined;
+                const path_z = std.fmt.bufPrintZ(&z, "{s}", .{resource.path}) catch break :blk null;
+                break :blk c.gtk_media_file_new_for_filename(path_z.ptr);
+            }
+            // Video is transcoded on the host to a cheap preview; audio
+            // streams as-is (its bitrate is the whole point).
+            const mode: remotestream.Mode = if (paths.isVideoName(resource.name())) .transcode else .raw;
+            const remote = remotestream.new(resource.host, resource.path, mode) orelse break :blk null;
+            defer c.g_object_unref(@ptrCast(remote));
+            break :blk c.gtk_media_file_new_for_input_stream(remote);
+        } orelse {
+            c.gtk_label_set_text(self.status, "Unable to start playback; showing the poster");
+            return self.showPoster(resource);
+        };
+        self.content = .{ .video = stream };
+        _ = c.g_signal_connect_data(@ptrCast(stream), "notify::error", @ptrCast(&onVideoError), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(@ptrCast(stream), "notify::prepared", @ptrCast(&onVideoPrepared), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_video_set_media_stream(@ptrCast(self.video_slot), stream);
+        self.setContentMode(.video);
+        var buf: [600:0]u8 = undefined;
+        const text = std.fmt.bufPrintZ(&buf, "Opening {s}...", .{resource.name()}) catch "Opening...";
+        c.gtk_label_set_text(self.status, text.ptr);
+        self.canvas.setAccessible(resource.name(), "Playing", false);
+    }
+
+    /// The image pipeline: a daemon-rendered preview (poster for
+    /// video/audio/pdf), then for images the full-resolution chain.
+    fn showPoster(self: *ViewerWindow, resource: model.Resource) void {
+        self.setContentMode(.image);
+        c.gtk_label_set_text(self.status, "Loading preview...");
+        self.canvas.setAccessible(resource.name(), "Loading preview", true);
+        if (!self.target.start(resource.spec, .preview)) c.gtk_label_set_text(self.status, "Could not start preview loader");
     }
 
     fn showCast(self: *ViewerWindow, resource: model.Resource) void {
@@ -946,6 +1028,7 @@ pub const ViewerWindow = struct {
 
     fn showCurrent(self: *ViewerWindow) void {
         self.closeCast();
+        self.closeVideo();
         self.content = .image;
         self.session.clear();
         self.canvas.fit();
@@ -975,10 +1058,8 @@ pub const ViewerWindow = struct {
             .text => return self.showText(resource),
             .image => {},
         }
-        self.setContentMode(.image);
-        c.gtk_label_set_text(self.status, "Loading preview...");
-        self.canvas.setAccessible(resource.name(), "Loading preview", true);
-        if (!self.target.start(resource.spec, .preview)) c.gtk_label_set_text(self.status, "Could not start preview loader");
+        if (paths.isPlayableName(resource.name())) return self.showVideo(resource);
+        self.showPoster(resource);
     }
 
     fn loadOriginal(self: *ViewerWindow) void {
@@ -1340,11 +1421,14 @@ fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
     const self = cast.userData(ViewerWindow, user);
     if (result.variant == .head) return onHeadLoaded(self, result);
     const image = if (result.decoded) |*decoded_image| decoded_image else {
+        // Only an IMAGE has an original worth decoding client-side; a
+        // failed video/audio/pdf poster must not chain into downloading
+        // the whole file to fail again as "not an image".
         if (result.variant == .preview) {
-            if (self.current()) |resource| {
+            if (self.current()) |resource| if (!posterOnly(resource.name())) {
                 c.gtk_label_set_text(self.status, "Preview unavailable; loading the original image...");
                 if (self.target.start(resource.spec, .original)) return;
-            }
+            };
         }
         var message: [256:0]u8 = undefined;
         const text = std.fmt.bufPrintZ(&message, "Unable to load {s}: {s}", .{
@@ -1419,11 +1503,14 @@ const LocalPreviewKind = enum {
     poster_only,
 };
 
+/// A name whose only client-side representation is the daemon's poster.
+fn posterOnly(name: []const u8) bool {
+    return !(paths.isImageName(name) or mayAnimate(name));
+}
+
 fn localPreviewKind(resource: model.Resource) LocalPreviewKind {
     if (resource.host != null) return .not_local;
-    const name = resource.name();
-    if (paths.isImageName(name) or mayAnimate(name)) return .decodable;
-    return .poster_only;
+    return if (posterOnly(resource.name())) .poster_only else .decodable;
 }
 
 test "localPreviewKind separates local images from posters and remotes" {
@@ -1519,6 +1606,58 @@ fn onRotateRight(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
 fn onPlayPause(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(ViewerWindow, user);
     self.session.togglePlayback();
+}
+
+fn toggleVideo(stream: *c.GtkMediaStream) void {
+    if (c.gtk_media_stream_get_playing(stream) != 0) c.gtk_media_stream_pause(stream) else c.gtk_media_stream_play(stream);
+}
+
+/// Seek relative to the current position, clamped to the file; the
+/// stream API is in microseconds.
+fn seekVideo(stream: *c.GtkMediaStream, delta_ms: i64) void {
+    if (c.gtk_media_stream_is_seekable(stream) == 0) return;
+    const now: i64 = c.gtk_media_stream_get_timestamp(stream);
+    const duration: i64 = c.gtk_media_stream_get_duration(stream);
+    var target = now + delta_ms * 1000;
+    if (target < 0) target = 0;
+    if (duration > 0 and target > duration) target = duration;
+    c.gtk_media_stream_seek(stream, target);
+}
+
+/// The stream failed (no decoder, unreadable file, dropped host): say
+/// why and fall back to the daemon poster.
+fn onVideoError(stream: *c.GtkMediaStream, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(ViewerWindow, user);
+    switch (self.content) {
+        .video => |current_stream| if (current_stream != stream) return,
+        else => return,
+    }
+    const err = c.gtk_media_stream_get_error(stream);
+    const reason: []const u8 = if (err != null and err.*.message != null) std.mem.span(err.*.message) else "unknown error";
+    var buf: [512:0]u8 = undefined;
+    const text = std.fmt.bufPrintZ(&buf, "Playback failed: {s}; showing the poster", .{reason}) catch "Playback failed; showing the poster";
+    self.closeVideo();
+    if (self.current()) |resource| self.showPoster(resource);
+    c.gtk_label_set_text(self.status, text.ptr);
+}
+
+fn onVideoPrepared(stream: *c.GtkMediaStream, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(ViewerWindow, user);
+    switch (self.content) {
+        .video => |current_stream| if (current_stream != stream) return,
+        else => return,
+    }
+    if (c.gtk_media_stream_is_prepared(stream) == 0) return;
+    const resource = self.current() orelse return;
+    const duration_ms: u64 = @intCast(@divTrunc(c.gtk_media_stream_get_duration(stream), 1000));
+    var buf: [600:0]u8 = undefined;
+    const text = std.fmt.bufPrintZ(&buf, "{s}  {d}:{d:0>2}{s}", .{
+        resource.name(),
+        duration_ms / 60_000,
+        (duration_ms / 1000) % 60,
+        if (c.gtk_media_stream_has_video(stream) != 0) "" else "  audio only",
+    }) catch "Playing";
+    c.gtk_label_set_text(self.status, text.ptr);
 }
 
 fn onCastTitle(user: ?*anyopaque, name: []const u8) void {
@@ -1775,6 +1914,23 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
                 c.GDK_KEY_less => box.seekRelative(-30_000),
                 c.GDK_KEY_greater => box.seekRelative(30_000),
                 c.GDK_KEY_r, c.GDK_KEY_R => box.restart(),
+                c.GDK_KEY_F11 => toggleFullscreen(self),
+                c.GDK_KEY_Escape => if (self.fullscreen) toggleFullscreen(self) else return 0,
+                else => return 0,
+            }
+            return 1;
+        },
+        .video => |stream| {
+            switch (keyval) {
+                c.GDK_KEY_Left => self.move(-1),
+                c.GDK_KEY_Right => self.move(1),
+                c.GDK_KEY_space, c.GDK_KEY_KP_Space => toggleVideo(stream),
+                c.GDK_KEY_k, c.GDK_KEY_K => if (self.options.close_on_space) toggleVideo(stream) else return 0,
+                c.GDK_KEY_comma => seekVideo(stream, -5_000),
+                c.GDK_KEY_period => seekVideo(stream, 5_000),
+                c.GDK_KEY_less => seekVideo(stream, -30_000),
+                c.GDK_KEY_greater => seekVideo(stream, 30_000),
+                c.GDK_KEY_r, c.GDK_KEY_R => c.gtk_media_stream_seek(stream, 0),
                 c.GDK_KEY_F11 => toggleFullscreen(self),
                 c.GDK_KEY_Escape => if (self.fullscreen) toggleFullscreen(self) else return 0,
                 else => return 0,

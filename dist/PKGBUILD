@@ -43,6 +43,14 @@ depends=(
     'opus'     # runtime-loaded remote-audio compression
     'glycin'   # sandboxed runtime-loaded image decoding for Viewer
     'libheif'  # Glycin AVIF/HEIF loader runtime
+    # Viewer video/audio playback goes through GTK's built-in GStreamer
+    # media backend, which needs demuxers/decoders/sinks the gtk4 package
+    # does not pull in: -good (mp4/mkv/webm demux), -libav (h264/aac),
+    # pipewire sink. Remote video reaches the player as a low-bitrate
+    # h264 spool the remote daemon encodes with ffmpeg (optdepends).
+    'gst-plugins-good'
+    'gst-libav'
+    'gst-plugin-pipewire'
     # Browser engine for `sketerm web` / web panes. The DISTRO package
     # is used deliberately rather than the pinned upstream tarball the
     # dev flow downloads (`zig build fetch-cef`): it keeps ~300MB of
@@ -53,6 +61,7 @@ depends=(
     'cef'
 )
 optdepends=(
+    'ffmpeg: video posters, media metadata, and cheap remote video previews (on the host serving the files)'
     'xorg-xwayland: X11 application support in external displays'
     'xwayland-satellite>=0.8.1: rootless X window management in external displays'
 )

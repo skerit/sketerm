@@ -588,6 +588,26 @@ pub const Fs = struct {
         return self.job_events.orderedRemove(0);
     }
 
+    /// Wait for one job's NEXT event of any kind (progress included),
+    /// preserving events for other jobs. Null on timeout.
+    pub fn waitJobEvent(self: *Fs, job: u64, timeout_ms: i64) Error!?JobEvent {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            var i: usize = 0;
+            while (i < self.job_events.items.len) : (i += 1) {
+                if (self.job_events.items[i].job == job) return self.job_events.orderedRemove(i);
+            }
+            const remain = deadline - nowMs();
+            if (remain <= 0) return null;
+            const frame = self.conn.recvFrameFor(remain) catch |err| switch (err) {
+                error.Timeout => return null,
+                else => return Error.NotConnected,
+            };
+            defer frame.deinit(self.allocator);
+            self.stashPush(frame.ftype, frame.payload);
+        }
+    }
+
     /// Wait for one job's terminal event while preserving events for other jobs.
     pub fn waitJobTerminal(self: *Fs, job: u64, timeout_ms: i64) Error!JobEvent {
         const deadline = nowMs() + timeout_ms;
@@ -1587,6 +1607,12 @@ pub const Fs = struct {
     /// bounded sidecar the receiver reads and then unlinks.
     pub fn startPreviewCodecs(self: *Fs, path: []const u8, image_codecs: []const u8) Error!u64 {
         return self.startJob("preview", .{ .path = path, .image_codecs = image_codecs });
+    }
+
+    /// Transcode a video into a growing low-bitrate spool for playback;
+    /// the first progress event names the spool, `done` closes it.
+    pub fn startPreviewStream(self: *Fs, path: []const u8) Error!u64 {
+        return self.startJob("preview_stream", .{ .path = path });
     }
 
     /// Recursive size; the done event carries bytes in `done` and the
