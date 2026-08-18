@@ -10,9 +10,9 @@ const Screen = @import("../grid/screen.zig").Screen;
 const Terminal = @import("../terminal.zig").Terminal;
 const Pane = @import("pane.zig").Pane;
 const clipboard = @import("clipboard.zig");
+const ExitAction = @import("../config.zig").ExitAction;
 const winmod = @import("window.zig");
 const Window = winmod.Window;
-const logActionError = winmod.logActionError;
 const tabPageForPane = winmod.tabPageForPane;
 const showToast = winmod.showToast;
 const tab_effects = @import("tab_effects.zig");
@@ -79,37 +79,54 @@ pub fn onTermClipboardSet(ctx: ?*anyopaque, text: []const u8) void {
     clipboard.copyText(self.allocator, self.app_window, text);
 }
 
+/// What a pane does when its session's child exits, as pure policy so
+/// it is testable without GTK. `onTermChildExit` is the only caller.
+pub const ExitDisposition = enum { hold_app_log, close, restart, hold };
+
+/// @param is_app forwarded `sketerm app` session.
+/// @param app_window_opened that app showed a window at least once.
+pub fn exitDisposition(action: ExitAction, hold_override: bool, is_app: bool, app_window_opened: bool) ExitDisposition {
+    // A forwarded app that exited before ever opening a window failed
+    // to launch, and its frozen log is the only diagnostic — held
+    // regardless of exit_action or --hold.
+    if (is_app and !app_window_opened) return .hold_app_log;
+    if (hold_override) return .hold;
+    return switch (action) {
+        .close => .close,
+        .restart => .restart,
+        .hold => .hold,
+    };
+}
+
+test "exitDisposition maps config and overrides" {
+    const t = std.testing;
+    try t.expectEqual(ExitDisposition.hold_app_log, exitDisposition(.close, true, true, false));
+    try t.expectEqual(ExitDisposition.close, exitDisposition(.close, false, true, true));
+    try t.expectEqual(ExitDisposition.hold, exitDisposition(.close, true, false, false));
+    try t.expectEqual(ExitDisposition.hold, exitDisposition(.restart, true, false, false));
+    try t.expectEqual(ExitDisposition.restart, exitDisposition(.restart, false, false, false));
+    try t.expectEqual(ExitDisposition.hold, exitDisposition(.hold, false, false, false));
+}
+
 pub fn onTermChildExit(ctx: ?*anyopaque, pane: *Pane, status: i32) void {
     const self = cast.userData(Window, ctx);
-    // A remote pane "exiting" means the mux session ended or the
-    // connection dropped — normally land in a local shell so the tab
-    // survives (exit_action governs local children only). Exception: a
-    // forwarded app (`sketerm app`) that exited before ever showing a
-    // window has failed to launch, and its log is the only useful
-    // output — hold the pane with that log visible instead of wiping it.
-    if (pane.terminal.remote) |remote| {
-        if (remote.is_app and !remote.app_window_opened) {
-            self.holdExitedAppPane(pane, status);
-            return;
-        }
-        self.detachPaneToShell(pane);
-        return;
-    }
-    const action = if (self.hold_override) .hold else self.config.exit_action;
-    switch (action) {
+    const remote = pane.terminal.remote;
+    const disposition = exitDisposition(
+        self.config.exit_action,
+        self.hold_override,
+        if (remote) |r| r.is_app else false,
+        if (remote) |r| r.app_window_opened else false,
+    );
+    switch (disposition) {
+        .hold_app_log => self.holdExitedAppPane(pane, status),
         .close => self.closePane(pane),
-        .restart => {
-            // Spawn a fresh shell in a new pane and replace the
-            // exited one. v1 implementation: just close the dead
-            // pane and spawn a new tab. Truly in-place restart
-            // would need PTY-level surgery in Terminal.
-            self.closePane(pane);
-            self.newShellTab(null) catch |err| logActionError("exit_restart_new_tab", err);
-        },
-        .hold => {
-            // Already showed the "[process exited]" banner; do
-            // nothing further. User can close the pane manually.
-        },
+        // Every terminal is a daemon session, so restart-in-place is a
+        // fresh local shell swapped into the same slot — the same
+        // landing detachPaneToShell performs.
+        .restart => self.detachPaneToShell(pane),
+        // The "[process exited]" banner is already on screen
+        // (Screen.onChildEof); the user closes the pane manually.
+        .hold => {},
     }
 }
 

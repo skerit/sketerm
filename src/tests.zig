@@ -353,6 +353,7 @@ comptime {
     _ = @import("ui/panelpicker.zig");
     _ = @import("ui/window.zig");
     _ = @import("ui/muxtabs.zig");
+    _ = @import("ui/termsinks.zig");
     _ = @import("ui/remotectl.zig");
     _ = @import("wlapp.zig");
     _ = @import("doctor.zig");

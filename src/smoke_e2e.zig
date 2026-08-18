@@ -776,6 +776,12 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_EXIT_ACTION_ONLY") != null) {
+        if (exitActionStage(allocator, sock_path)) |why| return failMsg(why);
+        say("exit_action: a pane whose shell exited closed itself, GUI healthy");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_TABBAR_ONLY") != null) {
         if (platform.is_macos) return fail("focused TabBar smoke is GTK-only");
         if (themeSingletonStage(allocator, drive, rt, &wl_z)) |why| return failMsg(why);
@@ -977,6 +983,11 @@ pub fn main() u8 {
     // added one pane, close-pane removed one — net equal to list2.
     const ids2 = std.mem.count(u8, list2, "\"id\":");
     if (!waitIdCount(allocator, sock_path, ids2, true, 10_000)) return fail("close-pane wrong pane count");
+
+    // 5b. A pane whose shell EXITS (rather than being closed) applies
+    // exit_action=close: it removes itself from the tick path.
+    if (exitActionStage(allocator, sock_path)) |why| return failMsg(why);
+    say("exit_action: a pane whose shell exited closed itself, GUI healthy");
 
     // 6. Closing a split that wears a browser face must synchronously
     // stop its filesystem mux watch and fence GTK's synchronous model
@@ -9306,6 +9317,42 @@ fn waitIdCount(allocator: std.mem.Allocator, sock_path: [:0]const u8, want: usiz
         _ = c.usleep(100_000);
         waited += 100;
     }
+}
+
+/// exit_action=close (the default): a pane whose session's child exits
+/// must close ITSELF — driven from the frame-clock tick, the one path
+/// that destroys the pane's GLArea from inside its own callback. The
+/// pane count returning to baseline with the GUI still answering is
+/// the assertion.
+fn exitActionStage(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?[]const u8 {
+    const before = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "exit-action: list roundtrip";
+    defer allocator.free(before);
+    if (std.mem.indexOf(u8, before, "\"ok\":true") == null) return "exit-action: list not ok";
+    const ids_before = std.mem.count(u8, before, "\"id\":");
+
+    const split = roundtrip(allocator, sock_path, "{\"cmd\":\"split\",\"pane\":1,\"direction\":\"h\"}\n") orelse return "exit-action: split roundtrip";
+    defer allocator.free(split);
+    if (std.mem.indexOf(u8, split, "\"ok\":true") == null) return "exit-action: split not ok";
+    if (!waitIdCount(allocator, sock_path, ids_before + 1, true, 10_000)) return "exit-action: split did not add a pane";
+
+    const mid = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "exit-action: list2 roundtrip";
+    defer allocator.free(mid);
+    const doomed = otherPaneInSelectedTab(mid, 1);
+    if (doomed == 0) return "exit-action: no fresh pane to exit";
+
+    var buf: [96]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"exit\\n\"}}\n", .{doomed}) catch return "exit-action: fmt";
+    const sent = roundtrip(allocator, sock_path, cmd) orelse return "exit-action: send-text roundtrip";
+    defer allocator.free(sent);
+    if (std.mem.indexOf(u8, sent, "\"ok\":true") == null) return "exit-action: send-text not ok";
+
+    // shell exit -> daemon .exit frame -> mirror child_exited -> tick
+    // -> exitDisposition(.close) -> closePane.
+    if (!waitIdCount(allocator, sock_path, ids_before, true, 20_000)) return "exit-action: the exited pane never closed";
+    const after = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "exit-action: GUI died after the pane exit";
+    defer allocator.free(after);
+    if (std.mem.indexOf(u8, after, "\"ok\":true") == null) return "exit-action: GUI unhealthy after the pane exit";
+    return null;
 }
 
 fn waitPaneGone(allocator: std.mem.Allocator, sock_path: [:0]const u8, pane: u32, ms: u32) bool {

@@ -19029,3 +19029,20 @@ rel-path mapping, and the family-aware newest-first sort -- lives in
 filebrowser/snapshots.zig (both test roots, tests for each); props.zig
 only drives the request state machine. Host death or a superseding
 dialog now reads "Snapshot search unavailable", never a false "none".
+
+
+## 2026-08-18: exit_action and --hold govern terminal panes again
+
+Since the unified-client rework every terminal is a daemon session, and
+`Window.onTermChildExit` returned early for any pane with a `remote` --
+so `exit_action` (still parsed, still in prefs) and `--hold` did
+nothing: an exited shell always swapped in a fresh local one. The
+policy now lives in `exitDisposition` (pure, unit-tested): a forwarded
+app that exited before opening a window is held with its log regardless
+(failed-launch diagnostic), otherwise `--hold` then `exit_action`
+decide -- `close` (default) closes the pane, `restart` swaps a fresh
+shell into the same slot (restart-in-place = the detach landing), and
+`hold` keeps the frozen grid with its exit banner. New smoke-e2e stage
+(also `SKETERM_SMOKE_E2E_EXIT_ACTION_ONLY=1`) proves the risky path:
+the pane closing ITSELF from the frame-clock tick, GUI healthy after.
+docs/lifecycle.md updated; its drift note about the dead branch is gone.

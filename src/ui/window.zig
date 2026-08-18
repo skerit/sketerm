@@ -2230,9 +2230,9 @@ pub const Window = struct {
     /// place pane→window callbacks are connected — every pane
     /// creation path (tab, split, layout restore, mux attach) goes
     /// through here, so a new sink added here reaches all of them.
-    /// All handlers are pane-aware and no-op when irrelevant (e.g.
-    /// child-exit on a remote pane means "session ended / connection
-    /// lost" and detaches to a local shell instead of exit_action).
+    /// All handlers are pane-aware and no-op when irrelevant.
+    /// Child-exit (the session's child exited, or the session was
+    /// killed) applies exit_action / --hold via exitDisposition.
     pub fn wirePaneSinks(self: *Window, pane: *Pane) void {
         pane.terminal.on_panel_request = onPanePanelRequest;
         pane.terminal.on_panel_origin_close = @import("panelhost.zig").closeOrigin;

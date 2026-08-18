@@ -199,11 +199,15 @@ directly) when no GUI is wired.
 
 `TerminalSurface`'s tick notices `child_exited`, and the pane forwards it
 through `on_child_exit` -> `Window.onTermChildExit`
-(`src/ui/termsinks.zig`). For a forwarded app (`remote.is_app`) that
-exited before ever opening a window, the pane is HELD with its log
-visible - that log is the only diagnostic a failed launch produces.
-Otherwise `Window.detachPaneToShell` swaps a fresh local shell pane into
-the same slot, so the tab survives.
+(`src/ui/termsinks.zig`), which applies `exitDisposition` (pure,
+unit-tested): a forwarded app (`remote.is_app`) that exited before ever
+opening a window is HELD with its log visible regardless of
+configuration - that log is the only diagnostic a failed launch
+produces. Otherwise `--hold`, then `config.exit_action`, decide:
+`close` (the default) closes the pane, `restart` swaps a fresh local
+shell into the same slot (`Window.detachPaneToShell` - restart-in-place,
+since every terminal is a daemon session), and `hold` leaves the frozen
+grid with its "[process exited]" banner for the user to close.
 
 The frame loop has one ordering rule that is easy to break: after
 dispatching a frame, `remoteSocketCb` re-checks `remote.closed` and
@@ -508,15 +512,10 @@ auto-loaded when no flag is given. `--no-save` suppresses the exit save;
 
 ## Known drift in the code
 
-Two stale references to the pre-mux design survive in comments, and are
+One stale reference to the pre-mux design survives in comments, and is
 worth knowing about when grepping:
 
 - `src/pty.zig`'s `decodeStatus` docblock tells you to keep it in
   lockstep with `Terminal.reapStatus`. That function no longer exists;
   the guard it described now lives in `Pty.reap` / `Pty.closeAndReap`.
   `src/mux/CLAUDE.md` repeats the same stale name.
-- `Window.onTermChildExit` (`src/ui/termsinks.zig`) returns early for
-  every pane with a `remote`, and since every Terminal is remote, the
-  `config.exit_action` branch below it (close / restart / hold, plus the
-  `--hold` override) is unreachable for terminal panes. The setting is
-  still parsed, still written by `prefs.zig`, and has no effect.
