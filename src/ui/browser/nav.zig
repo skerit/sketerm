@@ -1061,11 +1061,34 @@ pub fn cancelPathCompletion(self: *BrowserView) void {
     self.closePathCompletion();
 }
 
-pub fn closePathCompletion(self: *BrowserView) void {
-    if (self.completion_popover) |pop| {
-        self.completion_popover = null;
-        if (c.gtk_widget_get_parent(pop) != null) c.gtk_widget_unparent(pop);
+/// The completion popover OWNS the pointer the view holds to it
+/// (CLAUDE.md mechanism 1): the qdata notify below runs at the
+/// popover's finalize -- including the finalize GTK performs when the
+/// path entry it is parented to is destroyed -- and nulls
+/// `completion_popover` there. Without it, `closePathCompletion` from
+/// `BrowserView.deinit` (which runs AFTER `widgets_dead`) read a
+/// finalized widget and called `gtk_widget_get_parent` on it.
+const CompletionOwner = struct {
+    allocator: std.mem.Allocator,
+    view: *BrowserView,
+    /// The popover this notify speaks for; a newer one must survive an
+    /// older one's finalize.
+    pop: *c.GtkWidget,
+
+    fn free(user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(CompletionOwner, user);
+        if (ctx.view.completion_popover == ctx.pop) ctx.view.completion_popover = null;
+        ctx.allocator.destroy(ctx);
     }
+};
+
+pub fn closePathCompletion(self: *BrowserView) void {
+    const pop = self.completion_popover orelse return;
+    // Unparenting drops the last reference, so the notify above nulls
+    // the field; clearing it here as well keeps the close idempotent
+    // for a popover something else still holds a reference to.
+    self.completion_popover = null;
+    if (c.gtk_widget_get_parent(pop) != null) c.gtk_widget_unparent(pop);
 }
 
 pub fn onPathChanged(_: *c.GtkEditable, user: ?*anyopaque) callconv(.c) void {
@@ -1193,6 +1216,22 @@ pub fn showCompletionNames(self: *BrowserView, display_prefix: []const u8, prefi
     }
     _ = c.g_signal_connect_data(list, "row-activated", @ptrCast(&onCompletionActivated), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
     c.gtk_popover_set_child(@ptrCast(pop), list);
+    // Hand the popover ownership of the view's pointer to it BEFORE
+    // parenting: from here on, whatever destroys it also clears the
+    // field.
+    const owner = self.allocator.create(CompletionOwner) catch {
+        // No owner, no popover: an unowned one would leave a raw
+        // pointer nothing nulls, which is the bug this replaced.
+        unrefFloating(pop);
+        return;
+    };
+    owner.* = .{ .allocator = self.allocator, .view = self, .pop = pop };
+    c.g_object_set_data_full(
+        @ptrCast(pop),
+        "sketerm-completion-owner",
+        @ptrCast(owner),
+        @ptrCast(&CompletionOwner.free),
+    );
     c.gtk_widget_set_parent(pop, @ptrCast(@alignCast(self.path_entry)));
     self.completion_popover = pop;
     c.gtk_popover_popup(@ptrCast(pop));
@@ -1656,4 +1695,48 @@ test "a status write after teardown never touches the finalized label" {
     view.widgets_dead = true;
     view.setStatus("places changed in this session but could not be serialized");
     view.setStatusFmt("could not be saved ({s})", .{"AccessDenied"});
+}
+
+test "the completion popover owns the view's pointer to it" {
+    // GTK runs `CompletionOwner.free` from the popover's finalize; this
+    // calls it directly, because the decision under test is WHICH
+    // pointer a finalize clears, not that GTK dispatches the notify.
+    var view = BrowserView{ .allocator = std.testing.allocator, .pane = undefined };
+    const first: *c.GtkWidget = @ptrFromInt(0x10);
+    const second: *c.GtkWidget = @ptrFromInt(0x20);
+
+    view.completion_popover = first;
+    var owner = try std.testing.allocator.create(CompletionOwner);
+    owner.* = .{ .allocator = std.testing.allocator, .view = &view, .pop = first };
+    CompletionOwner.free(@ptrCast(owner));
+    try std.testing.expect(view.completion_popover == null);
+
+    // A LATER popover must survive an earlier one's finalize.
+    view.completion_popover = second;
+    owner = try std.testing.allocator.create(CompletionOwner);
+    owner.* = .{ .allocator = std.testing.allocator, .view = &view, .pop = first };
+    CompletionOwner.free(@ptrCast(owner));
+    try std.testing.expect(view.completion_popover == second);
+}
+
+test "closePathCompletion after the widget tree died dereferences nothing" {
+    // `BrowserView.deinit` calls this with `widgets_dead` already set,
+    // so the popover may be finalized memory. As above, the pointer is
+    // a stand-in that must never be dereferenced: reaching the end IS
+    // the assertion, and a close that reads the field faults instead.
+    var view = BrowserView{ .allocator = std.testing.allocator, .pane = undefined };
+    view.completion_popover = @ptrFromInt(0x8);
+    view.widgets_dead = true;
+
+    // Destroying the entry finalizes the popover, which runs this.
+    const owner = try std.testing.allocator.create(CompletionOwner);
+    owner.* = .{
+        .allocator = std.testing.allocator,
+        .view = &view,
+        .pop = view.completion_popover.?,
+    };
+    CompletionOwner.free(@ptrCast(owner));
+
+    view.closePathCompletion();
+    view.cancelPathCompletion();
 }
