@@ -216,10 +216,13 @@ pub fn rechunk(
 
 /// Compute the (logical_index, col_within_logical) of a position
 /// (row, col) in the original buffer.
-pub fn positionInLogicals(rows: []const Line, row: u16, col: u16) struct { idx: usize, col: u32 } {
+/// `row` indexes scrollback + active together, so it is `usize`: a large
+/// `scrollback` setting puts it past 65535 and a `u16` counter would wrap
+/// into an infinite loop.
+pub fn positionInLogicals(rows: []const Line, row: usize, col: u16) struct { idx: usize, col: u32 } {
     var idx: usize = 0;
     var col_in: u32 = 0;
-    var r: u16 = 0;
+    var r: usize = 0;
     while (r <= row and r < rows.len) : (r += 1) {
         if (r > 0 and !rows[r].continues_above) {
             idx += 1;

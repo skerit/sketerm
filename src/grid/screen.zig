@@ -1437,7 +1437,7 @@ pub const Screen = struct {
 
         const cursor_pos = reflow.positionInLogicals(
             combined.items,
-            @intCast(sb_count + self.row),
+            @as(usize, sb_count) + self.row,
             self.col,
         );
 
@@ -1535,7 +1535,7 @@ pub const Screen = struct {
             if (old_row < self.rows and old_col < self.cols) {
                 const source = reflow.positionInLogicals(
                     combined.items,
-                    @intCast(sb_count + old_row),
+                    @as(usize, sb_count) + old_row,
                     old_col,
                 );
                 const destination = reflow.positionAfterRechunk(

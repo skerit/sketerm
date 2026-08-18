@@ -287,3 +287,44 @@ test "reflow: alt screen does NOT reflow" {
     defer std.testing.allocator.free(r1);
     try std.testing.expectEqualStrings("wor", r1);
 }
+
+test "reflow: scrollback past 65535 rows keeps cursor and clusters placed" {
+    // Regression: reflowMain used to hand `positionInLogicals` a u16 row
+    // index. `scrollback` is a u32 config key, so once scrollback + rows
+    // exceeds 65535 the index truncated (illegal behaviour under
+    // ReleaseFast) and both the cursor and every cluster key were
+    // remapped against the wrong logical line.
+    const Cell = @import("cell.zig").Cell;
+    var h = try Harness.init(std.testing.allocator, 5, 4);
+    defer h.deinit();
+    h.arm();
+
+    const sb_lines: usize = 65_600;
+    h.screen.scrollback_capacity = sb_lines;
+    try h.screen.reserveScrollbackPushes(sb_lines);
+    var pushed: usize = 0;
+    while (pushed < sb_lines) : (pushed += 1) {
+        const cells = try std.testing.allocator.alloc(Cell, h.screen.cols);
+        @memset(cells, .{});
+        switch (h.screen.pushScrollbackTakeOld(cells, h.screen.nextLineId(), false)) {
+            .retained => {},
+            .caller_owned => |old| std.testing.allocator.free(old),
+        }
+    }
+    try std.testing.expectEqual(@as(u32, sb_lines), h.screen.scrollbackCount());
+
+    // "hellowor" wraps to rows 0-1; the combining acute attaches to 'r'.
+    h.feed("hellowor\xcc\x81");
+    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
+    try std.testing.expectEqual(@as(u16, 3), h.screen.col);
+    try std.testing.expectEqual(@as(usize, 1), h.screen.clusterAt(1, 2).len);
+
+    try h.screen.resize(10, 4);
+
+    // The blanks stay their own logical lines, so the rejoined
+    // "hellowor" is the last of sb_lines + 1 rows: active row 3.
+    try std.testing.expectEqual(@as(u16, 3), h.screen.row);
+    try std.testing.expectEqual(@as(u16, 8), h.screen.col);
+    try std.testing.expectEqual(@as(u32, 'r'), h.screen.cellAt(3, 7).rune);
+    try std.testing.expectEqual(@as(usize, 1), h.screen.clusterAt(3, 7).len);
+}
