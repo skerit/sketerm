@@ -143,6 +143,9 @@ pub const WireReply = struct {
     /// The HOST's freedesktop template directory (XDG_TEMPLATES_DIR),
     /// resolved by the daemon that owns the files.
     templates: []const u8 = "",
+    /// The HOST's existing freedesktop user directories (Downloads,
+    /// Pictures, ...) for the sidebar; same `homedir` reply.
+    dirs: []WireUserDir = &.{},
     /// statfs: free space = bavail * frsize.
     bavail: u64 = 0,
     frsize: u64 = 0,
@@ -155,6 +158,17 @@ test "filesystem refusal keeps its structured failure kind" {
     defer parsed.deinit();
     try std.testing.expectEqualStrings("permanent", parsed.value.kind);
 }
+
+pub const WireUserDir = struct {
+    label: []const u8 = "",
+    path: []const u8 = "",
+};
+
+/// A host's user directory as the sidebar keeps it (both slices owned).
+pub const UserDirEntry = struct {
+    label: []u8,
+    path: []u8,
+};
 
 /// One host-side application (daemon `apps` op reply).
 pub const WireApp = struct {
@@ -270,6 +284,9 @@ pub const HostConn = struct {
     /// The host's home directory (same `homedir` reply); what the
     /// sidebar's per-host places section navigates to.
     home_dir: ?[]u8 = null,
+    /// The host's existing user directories (same reply), in the
+    /// daemon's table order.
+    user_dirs: []UserDirEntry = &.{},
     /// The one in-flight `homedir` request (0 = none). A second
     /// request for the same facts would be a wasted round trip that
     /// could also land first and be dropped as unrecognized.
@@ -290,6 +307,11 @@ pub const HostConn = struct {
         if (self.state == .ready) self.conn.deinit();
         if (self.templates_dir) |td| allocator.free(td);
         if (self.home_dir) |hd| allocator.free(hd);
+        for (self.user_dirs) |d| {
+            allocator.free(d.label);
+            allocator.free(d.path);
+        }
+        if (self.user_dirs.len > 0) allocator.free(self.user_dirs);
         if (self.host) |h| allocator.free(h);
         allocator.destroy(self);
     }

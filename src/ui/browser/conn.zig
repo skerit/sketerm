@@ -14,6 +14,7 @@ const colview = @import("colview.zig");
 const mediacols = @import("mediacols.zig");
 const muxclient = @import("../../mux/client.zig");
 
+const types = @import("types.zig");
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
 const Dir = @import("types.zig").Dir;
@@ -465,6 +466,30 @@ pub fn requestHostDirs(self: *BrowserView, hc: *HostConn) void {
     if (hc.dirs_known or hc.dirs_req != 0 or hc.state != .ready) return;
     hc.dirs_req = self.nextReq();
     self.sendOp(hc, .{ .req = hc.dirs_req, .op = "homedir", .path = "/" });
+}
+
+/// Copy the reply's user directories onto the connection (all-or-nothing).
+fn adoptUserDirs(self: *BrowserView, hc: *HostConn, wire: []const types.WireUserDir) void {
+    const list = self.allocator.alloc(types.UserDirEntry, wire.len) catch return;
+    var n: usize = 0;
+    errdefer_free: {
+        for (wire) |w| {
+            const label = self.allocator.dupe(u8, w.label) catch break :errdefer_free;
+            const path = self.allocator.dupe(u8, w.path) catch {
+                self.allocator.free(label);
+                break :errdefer_free;
+            };
+            list[n] = .{ .label = label, .path = path };
+            n += 1;
+        }
+        hc.user_dirs = list;
+        return;
+    }
+    for (list[0..n]) |d| {
+        self.allocator.free(d.label);
+        self.allocator.free(d.path);
+    }
+    self.allocator.free(list);
 }
 
 /// Connection died: fail its transfers FIRST (they hold *Conn),
@@ -1409,10 +1434,11 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             hc.templates_dir = self.allocator.dupe(u8, rep.templates) catch null;
         if (rep.ok and rep.home.len > 0 and hc.home_dir == null)
             hc.home_dir = self.allocator.dupe(u8, rep.home) catch null;
+        if (rep.ok and rep.dirs.len > 0 and hc.user_dirs.len == 0) adoptUserDirs(self, hc, rep.dirs);
         self.templatesHostDirs(hc);
-        // The sidebar's per-host section shows this host's Home once
-        // it is known.
-        if (self.places_on and hc.host != null) self.renderPlaces();
+        // The sidebar shows this host's Home and user directories once
+        // they are known -- the local section too.
+        if (self.places_on) self.renderPlaces();
         return false;
     }
     // Open With host-apps reply?

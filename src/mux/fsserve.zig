@@ -511,20 +511,51 @@ pub fn parseUserDir(content: []const u8, key: []const u8, home: []const u8, buf:
     return std.fmt.bufPrint(buf, "{s}", .{value}) catch null;
 }
 
+/// The freedesktop user directories the sidebar lists. ONE table:
+/// the daemon resolves paths from it, the sidebar picks icons from it.
+pub const UserDir = struct { key: []const u8, default: []const u8, label: [:0]const u8, icon: [:0]const u8 };
+pub const user_dirs = [_]UserDir{
+    .{ .key = "XDG_DESKTOP_DIR", .default = "Desktop", .label = "Desktop", .icon = "user-desktop-symbolic" },
+    .{ .key = "XDG_DOCUMENTS_DIR", .default = "Documents", .label = "Documents", .icon = "folder-documents-symbolic" },
+    .{ .key = "XDG_DOWNLOAD_DIR", .default = "Downloads", .label = "Downloads", .icon = "folder-download-symbolic" },
+    .{ .key = "XDG_MUSIC_DIR", .default = "Music", .label = "Music", .icon = "folder-music-symbolic" },
+    .{ .key = "XDG_PICTURES_DIR", .default = "Pictures", .label = "Pictures", .icon = "folder-pictures-symbolic" },
+    .{ .key = "XDG_VIDEOS_DIR", .default = "Videos", .label = "Videos", .icon = "folder-videos-symbolic" },
+    .{ .key = "XDG_PUBLICSHARE_DIR", .default = "Public", .label = "Public", .icon = "folder-publicshare-symbolic" },
+};
+
+/// The sidebar icon for a user directory the daemon reported by label;
+/// an unknown label (a newer daemon) gets the plain folder icon.
+pub fn userDirIcon(label: []const u8) [:0]const u8 {
+    for (user_dirs) |d| if (std.mem.eql(u8, d.label, label)) return d.icon;
+    return "folder-symbolic";
+}
+
+/// Read `$XDG_CONFIG_HOME/user-dirs.dirs` into `body`; empty when absent.
+pub fn readUserDirsFile(config_home: []const u8, body: []u8) []const u8 {
+    var path_buf: [4096]u8 = undefined;
+    const dirs = std.fmt.bufPrint(&path_buf, "{s}/user-dirs.dirs", .{config_home}) catch return "";
+    var z: [4096]u8 = undefined;
+    const zp = pathz.pathZ(&z, dirs) catch return "";
+    const f = c.fopen(zp, "rb") orelse return "";
+    defer _ = c.fclose(f);
+    const n = c.fread(body.ptr, 1, body.len, f);
+    return body[0..n];
+}
+
+/// One user directory's path: the user-dirs.dirs value, else the
+/// freedesktop default under `home`. Existence is the caller's check.
+pub fn userDirPath(body: []const u8, dir: UserDir, home: []const u8, buf: []u8) ?[]const u8 {
+    if (parseUserDir(body, dir.key, home, buf)) |p| return p;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ home, dir.default }) catch null;
+}
+
 /// This host's template directory: `XDG_TEMPLATES_DIR` when
 /// user-dirs.dirs sets it, else `$HOME/Templates`. The directory need
 /// not exist; the caller lists it and reports an empty menu.
 pub fn templatesDir(home: []const u8, config_home: []const u8, buf: []u8) []const u8 {
-    var path_buf: [4096]u8 = undefined;
-    const dirs = std.fmt.bufPrint(&path_buf, "{s}/user-dirs.dirs", .{config_home}) catch
-        return fallbackTemplates(home, buf);
-    var z: [4096]u8 = undefined;
-    const zp = pathz.pathZ(&z, dirs) catch return fallbackTemplates(home, buf);
-    const f = c.fopen(zp, "rb") orelse return fallbackTemplates(home, buf);
-    defer _ = c.fclose(f);
     var body: [8192]u8 = undefined;
-    const n = c.fread(&body, 1, body.len, f);
-    return parseUserDir(body[0..n], "XDG_TEMPLATES_DIR", home, buf) orelse
+    return parseUserDir(readUserDirsFile(config_home, &body), "XDG_TEMPLATES_DIR", home, buf) orelse
         fallbackTemplates(home, buf);
 }
 
@@ -961,6 +992,18 @@ test "templatesDir reads user-dirs.dirs and falls back to $HOME/Templates" {
     try t.expectEqualStrings("/home/u/Templates", templatesDir("/home/u", dir, &buf));
     try touch(dir, "user-dirs.dirs", "XDG_TEMPLATES_DIR=\"$HOME/Modeles\"\n");
     try t.expectEqualStrings("/home/u/Modeles", templatesDir("/home/u", dir, &buf));
+}
+
+test "userDirPath: user-dirs.dirs value, else the freedesktop default; icons come from the same table" {
+    const t = std.testing;
+    var buf: [4096]u8 = undefined;
+    const body = "XDG_DOWNLOAD_DIR=\"$HOME/Binnen\"\nXDG_DESKTOP_DIR=\"$HOME/\"\n";
+    try t.expectEqualStrings("/home/u/Binnen", userDirPath(body, user_dirs[2], "/home/u", &buf).?);
+    try t.expectEqualStrings("/home/u/Pictures", userDirPath(body, user_dirs[4], "/home/u", &buf).?);
+    // A disabled desktop dir resolves to $HOME itself; the daemon skips it.
+    try t.expectEqualStrings("/home/u/", userDirPath(body, user_dirs[0], "/home/u", &buf).?);
+    try t.expectEqualStrings("folder-download-symbolic", userDirIcon("Downloads"));
+    try t.expectEqualStrings("folder-symbolic", userDirIcon("Whatever"));
 }
 
 test "listDir: rich entries, dirs-first ci sort, symlink target" {

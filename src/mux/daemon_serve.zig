@@ -2028,12 +2028,30 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
             std.fmt.bufPrint(&config_buf, "{s}/.config", .{home}) catch "/tmp";
         var templates_buf: [4096]u8 = undefined;
         const templates = fsserve.templatesDir(home, config_home, &templates_buf);
+        // The sidebar's user directories, only those that exist here.
+        var body: [8192]u8 = undefined;
+        const dirs_body = fsserve.readUserDirsFile(config_home, &body);
+        var dir_bufs: [fsserve.user_dirs.len][4096]u8 = undefined;
+        var dirs: [fsserve.user_dirs.len]struct { label: []const u8, path: []const u8 } = undefined;
+        var ndirs: usize = 0;
+        for (fsserve.user_dirs, 0..) |d, i| {
+            const p = fsserve.userDirPath(dirs_body, d, home, &dir_bufs[i]) orelse continue;
+            // xdg-user-dirs disables a directory by pointing it at "$HOME/".
+            if (std.mem.eql(u8, std.mem.trimEnd(u8, p, "/"), std.mem.trimEnd(u8, home, "/"))) continue;
+            var z: [4096]u8 = undefined;
+            var st: c.struct_stat = undefined;
+            const pz = pathZ(&z, p) catch continue;
+            if (c.stat(pz, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFDIR) continue;
+            dirs[ndirs] = .{ .label = d.label, .path = p };
+            ndirs += 1;
+        }
         cl.queueJson(.fs_reply, .{
             .req = r.req,
             .ok = true,
             .home = home,
             .cache = cache,
             .templates = templates,
+            .dirs = dirs[0..ndirs],
         });
     } else if (std.mem.eql(u8, r.op, "mkdir")) {
         var z: [4096]u8 = undefined;

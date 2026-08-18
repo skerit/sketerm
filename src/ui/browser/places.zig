@@ -20,6 +20,8 @@ const classicmenu = @import("classicmenu.zig");
 const iconload = @import("../iconload.zig");
 const sidewidgets = @import("sidewidgets.zig");
 const cast = @import("../../util/cast.zig");
+const fsserve = @import("../../mux/fsserve.zig");
+const HostConn = @import("types.zig").HostConn;
 
 /// Browser faces in this process. `authoritative` owns the one
 /// process-wide places snapshot; registered views are synchronized to
@@ -1001,9 +1003,29 @@ fn renderLocalSection(self: *BrowserView) void {
         self.placeRow("user-home-symbolic", "Home", hs, false)
     else |_|
         self.placeRow("user-home-symbolic", "Home", home, false);
+    if (knownHostConn(self, null)) |hc| renderUserDirRows(self, hc, "local");
     self.placeRow("drive-harddisk-symbolic", "File System", "local:/", false);
     var trash_buf: [4200]u8 = undefined;
     if (trashFilesDir(&trash_buf)) |td| self.placeRow("user-trash-symbolic", "Trash", td, false);
+}
+
+/// An existing connection for `host` (null = local) without creating one.
+fn knownHostConn(self: *BrowserView, host: ?[]const u8) ?*HostConn {
+    for (self.conns.items) |hc| {
+        if (hc.state != .dead and paths.hostEq(hc.host, host)) return hc;
+    }
+    return null;
+}
+
+/// The host's freedesktop user directories, as its daemon reported
+/// them (only those that exist there); the icon comes from the same
+/// table the daemon resolved the paths from.
+fn renderUserDirRows(self: *BrowserView, hc: *HostConn, host_prefix: []const u8) void {
+    var spec_buf: [4600]u8 = undefined;
+    for (hc.user_dirs) |d| {
+        const spec = std.fmt.bufPrint(&spec_buf, "{s}:{s}", .{ host_prefix, d.path }) catch continue;
+        self.placeRow(fsserve.userDirIcon(d.label), d.label, spec, false);
+    }
 }
 
 /// Browsing another machine adds ITS places under its own name — the
@@ -1025,6 +1047,7 @@ fn renderRemoteSection(self: *BrowserView) void {
             self.placeRow("user-home-symbolic", "Home", hs, false)
         else |_| {}
     }
+    renderUserDirRows(self, tab.hc, host);
     if (std.fmt.bufPrint(&spec_buf, "{s}:/", .{host})) |rs|
         self.placeRow("drive-harddisk-symbolic", "File System", rs, false)
     else |_| {}
