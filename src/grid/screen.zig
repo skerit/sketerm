@@ -1328,16 +1328,6 @@ pub const Screen = struct {
         // a length. Swallowing this allocation failure left tab_stops
         // shorter than `cols` forever, which the snapshot encoder used to
         // reject on every attempt.
-        // Tab stops are the one piece the commit phase cannot roll back,
-        // so reserve their storage here: `resizeTabStops` then only moves
-        // a length. Swallowing this allocation failure left tab_stops
-        // shorter than `cols` forever, which the snapshot encoder used to
-        // reject on every attempt.
-        // Tab stops are the one piece the commit phase cannot roll back,
-        // so reserve their storage here: `resizeTabStops` then only moves
-        // a length. Swallowing this allocation failure left tab_stops
-        // shorter than `cols` forever, which the snapshot encoder used to
-        // reject on every attempt.
         try self.tab_stops.ensureTotalCapacity(self.allocator, new_cols);
 
         var staged_alt: ?StagedBuffer = null;
@@ -1617,10 +1607,12 @@ pub const Screen = struct {
     /// to the side.
     ///
     /// `stage` performs every allocation the swap needs and touches
-    /// nothing the `Screen` owns, so it can fail freely; `commit` is
-    /// allocation-free and therefore cannot. This is what makes a resize
-    /// that runs out of memory a no-op rather than a screen whose rows
-    /// and `cols` disagree.
+    /// nothing the `Screen` owns, so it can fail freely; `commit` cannot
+    /// fail. Note that is a property of `commit`, not an absence of
+    /// allocation in it: the scrollback push it makes absorbs its own
+    /// failure by dropping the line. Anything added to `commit` has to
+    /// keep that property, or a resize that runs out of memory stops
+    /// being a no-op and becomes a screen whose rows and `cols` disagree.
     const StagedBuffer = struct {
         /// The replacement buffer, `new_rows` lines at `new_cols`.
         rows: []Line,
