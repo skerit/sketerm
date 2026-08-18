@@ -21,10 +21,15 @@ sketerm_warn() {
     fi
 }
 
+# The service file is UTF-8 and both the escaper below and D-Bus's value
+# decoder handle arbitrary bytes, so only what genuinely breaks the file
+# format is rejected: a newline ends the line, and control characters are not
+# representable in it. A home directory with an accented name is a normal
+# prefix, and rejecting it as non-ASCII bought nothing.
 sketerm_validate_install_prefix() {
     local prefix=$1
     local LC_ALL=C
-    [[ "$prefix" == /* && "$prefix" != *[![:print:]]* ]]
+    [[ "$prefix" == /* && "$prefix" != *[[:cntrl:]]* ]]
 }
 
 # Quote one activation argument through both the service-file value decoder
@@ -48,7 +53,7 @@ sketerm_install_portal_service() {
     local found=0 tmp="$output.tmp"
 
     sketerm_validate_install_prefix "$prefix" || {
-        printf '==> ERROR: install prefix must be an absolute path containing only printable ASCII characters\n' >&2
+        printf '==> ERROR: install prefix must be an absolute path free of newlines and control characters\n' >&2
         return 1
     }
     while [ "$prefix" != / ] && [[ "$prefix" == */ ]]; do

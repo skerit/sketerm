@@ -545,7 +545,7 @@ status=$?
 set -e
 [ "$status" -eq 1 ] || fail "plain install accepted a newline in its prefix"
 [[ "$(<"$work/plain-unsafe-prefix.out")" == \
-    *"absolute path containing only printable ASCII characters"* ]] \
+    *"absolute path free of newlines and control characters"* ]] \
     || fail "unsafe plain prefix failure was not explicit"
 [ ! -e "$INSTALL_TEST_ZIG_LOG" ] \
     || fail "unsafe plain prefix was rejected only after starting the build"
@@ -655,9 +655,12 @@ run_plain_gui_install() {
 }
 
 # Prefixes that need both service-file escaping and D-Bus argv quoting retain
-# their exact executable path. If the D-Bus test tools are installed, exercise
-# the actual activation parser as well as the staged text.
-plain_special_prefix="$work/plain prefix \$cash \`tick\` 'single' \"double\" back\\slash #hash &semi; =eq"
+# their exact executable path, non-ASCII bytes included: a home directory with
+# an accented name must install like any other. If the D-Bus test tools are
+# installed, exercise the actual activation parser as well as the staged text.
+# UTF-8 e-acute / i-diaeresis, spelled in escapes so this file stays ASCII.
+plain_accent=$'pr\303\251fix na\303\257ve'
+plain_special_prefix="$work/plain $plain_accent \$cash \`tick\` 'single' \"double\" back\\slash #hash &semi; =eq"
 mkdir -p "$plain_special_prefix"
 run_plain_gui_install "$work/plain-special.out" "$plain_special_prefix" 1
 plain_special_service="$plain_special_prefix/share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service"
@@ -669,6 +672,8 @@ plain_special_manifest="$plain_special_prefix/share/sketerm/plain-install-manife
 grep -Fqx 'Name=org.freedesktop.impl.portal.desktop.sketerm' \
     "$plain_special_service" \
     || fail "custom-prefix service changed its D-Bus name"
+grep -Fq "$plain_accent" "$plain_special_service" \
+    || fail "custom-prefix service lost the non-ASCII part of the prefix"
 grep -Fqx 'share/dbus-1/services/org.freedesktop.impl.portal.desktop.sketerm.service' \
     "$plain_special_manifest" \
     || fail "plain manifest omitted the generated portal service"

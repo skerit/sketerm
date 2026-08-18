@@ -507,7 +507,7 @@ else
     select_kind
     if [ "$kind" = gui ]; then
         sketerm_validate_install_prefix "$prefix" \
-            || die "plain-install prefix must be an absolute path containing only printable ASCII characters"
+            || die "plain-install prefix must be an absolute path free of newlines and control characters"
         while [ "$prefix" != / ] && [[ "$prefix" == */ ]]; do
             prefix=${prefix%/}
         done
