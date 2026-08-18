@@ -10,7 +10,15 @@ const editor_model = @import("editor/model.zig");
 const web_model = @import("web/model.zig");
 const atomicwrite = @import("util/atomicwrite.zig");
 
-pub const MAX_FILE_BYTES: usize = 1024 * 1024;
+/// Ceiling for a serialized layout, both on save and on load. It is
+/// deliberately far above any plausible session: at 1MB a big session
+/// (many tabs, long titles, browser/editor state per pane) could reach
+/// it, and the shutdown auto-save (`winlayout.saveLayoutQuietly`) then
+/// dropped the user's whole session with one stderr line. The refusal
+/// past this point stays — the serialize is in-memory, so a runaway is
+/// cheap to refuse and expensive to write. Note `atomicwrite` reserves
+/// this many bytes up front for the bounded serialize.
+pub const MAX_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 pub const Orient = enum { horizontal, vertical };
 
@@ -569,4 +577,56 @@ test "layout save accepts the load limit and preserves the old file on rejection
     defer preserved.deinit();
     try t.expectEqual(MAX_FILE_BYTES - overhead, preserved.value.tabs[0].title.len);
     try t.expect(std.mem.allEqual(u8, preserved.value.tabs[0].title, 'x'));
+}
+
+test "a session far larger than any real one stays inside the size ceiling" {
+    // The ceiling exists to refuse a runaway, not to lose a session: the
+    // shutdown auto-save (winlayout.saveLayoutQuietly) cannot report a
+    // refusal beyond one stderr line, so the headroom must be provable
+    // rather than assumed. 200 tabs x 8 durable panes with long paths,
+    // commands, titles and session names is already implausible.
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+
+    const tab_count = 200;
+    const panes_per_tab = 8;
+    const command = [_][]const u8{ "/usr/bin/env", "bash", "-lc", "cd \"$PWD\" && exec \"$SHELL\" -l" };
+
+    const tabs = try a.alloc(TabSpec, tab_count);
+    for (tabs, 0..) |*tab, i| {
+        var tree: Tree = undefined;
+        for (0..panes_per_tab) |p| {
+            const pane: Tree = .{ .pane = .{
+                .cwd = try std.fmt.allocPrint(a, "/home/username/projects/some-long-monorepo/services/backend/src/tab{d}/pane{d}", .{ i, p }),
+                .command = &command,
+                .profile = "a-profile-name",
+                .custom_shader = "/home/username/.config/sketerm/shaders/crt-with-a-long-name.glsl",
+                .shader_preset = "crt-with-a-long-name",
+                .mux_session = try std.fmt.allocPrint(a, "durable-session-tab{d}-pane{d}", .{ i, p }),
+                .mux_host = "udp:build-box.internal.example.com",
+            } };
+            if (p == 0) {
+                tree = pane;
+                continue;
+            }
+            const children = try a.alloc(Tree, 2);
+            children[0] = tree;
+            children[1] = pane;
+            tree = .{ .split = .{ .orientation = .horizontal, .ratio = 0.5, .children = children } };
+        }
+        tab.* = .{
+            .title = try std.fmt.allocPrint(a, "tab {d}: a reasonably long human-written tab title", .{i}),
+            .tree = tree,
+            .color = "#ff8800",
+        };
+    }
+
+    var out = std.Io.Writer.Allocating.init(a);
+    defer out.deinit();
+    try serialiseForSave(.{ .tabs = tabs }, &out.writer);
+    const size = out.written().len;
+    try t.expect(size > 1024 * 1024); // past the ceiling this used to have
+    try t.expect(size < MAX_FILE_BYTES / 2); // and still half the cap away
 }
