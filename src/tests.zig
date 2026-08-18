@@ -80,6 +80,7 @@ comptime {
     _ = @import("grid/screen.zig");
     _ = @import("grid/selection.zig");
     _ = @import("grid/selection_conformance_test.zig");
+    _ = @import("grid/image_size.zig");
     _ = @import("grid/image_store.zig");
     _ = @import("grid/reflow.zig");
     _ = @import("grid/reflow_screen_test.zig");

@@ -328,7 +328,7 @@ that framebuffer and costs nothing extra.
 | `track_tab_activity` | bool | `true` | Per-tab activity indicator, computed in the event drain so it works for unfocused tabs. |
 | `inactive_warn_secs` | int | `60` | Silence before a tab's inactivity warning fires. The toggle itself is per-tab (right-click a tab); this is the shared threshold. |
 | `tab_ack_delay_secs` | float | `1.0` | Clamped 0..6. How long a tab must stay selected before viewing it clears its inactivity warning. |
-| `image_memory_mb` | int | `320` | Per-pane cap on retained decoded-image memory; past it the oldest images are evicted FIFO. `0` = unlimited. |
+| `image_memory_mb` | int | `320` | Per-pane target for retained decoded-image memory; past it the oldest images are evicted FIFO. It is a retention budget, not a per-image size limit: a single image larger than the whole budget still renders (the hard per-image ceiling is 256 MB and does not move with this key). `0` = unlimited. |
 | `config_auto_reload` | bool | `true` | See Reload semantics. |
 | `clipboard_read` | bool/enum | `false` | Accepts `allow` / `deny` as well as the bool forms. Allows apps to READ the clipboard via OSC 52 query. Off by default because anything on the PTY, including remote programs, could exfiltrate it. |
 | `search_case_sensitive` | bool | `false` | Default for the search box; the actual default is smart-case unless this or Ctrl+I overrides. |

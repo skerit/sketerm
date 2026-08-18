@@ -62,6 +62,13 @@ pub const Image = struct {
     /// (newly added image, frame advance, post-context-loss). Cleared
     /// by flushUploads after the GL upload completes.
     pending_dirty: bool = true,
+    /// Size of the texture actually uploaded. Equal to width/height
+    /// unless an axis exceeded GL_MAX_TEXTURE_SIZE, in which case
+    /// flushUploads uploads a downscaled copy. The renderer samples with
+    /// normalized coordinates, so geometry and src-rect crops still use
+    /// width/height and stay correct.
+    tex_w: u32 = 0,
+    tex_h: u32 = 0,
 };
 
 pub const Store = struct {
@@ -78,6 +85,9 @@ pub const Store = struct {
     live_bytes: usize = 0,
     /// Cap on `live_bytes` (0 = unlimited). Set from `config.image_memory_mb`.
     budget_bytes: usize = 0,
+    /// GL_MAX_TEXTURE_SIZE for the current context (0 = not queried yet).
+    /// Cleared by forgetGL so a new context is asked again.
+    max_texture_size: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
@@ -94,11 +104,15 @@ pub const Store = struct {
 
     /// Evict oldest non-deleting images (FIFO) until `incoming` more bytes
     /// fit under the budget. Evicted images keep their entry (so the GL
-    /// texture is torn down by the next flush) but drop their CPU pixels now.
+    /// texture is torn down by the next flush) but drop their CPU pixels
+    /// now. Never evicts so hard that a single over-budget image can't be
+    /// added — that one image is allowed through, because `image_memory_mb`
+    /// is a retention budget, not a per-image size limit (the hard limit is
+    /// `image_size.max_decoded_bytes`).
     fn evictForBudget(self: *Store, incoming: usize) void {
         if (self.budget_bytes == 0) return;
         var i: usize = 0;
-        while (self.live_bytes > self.budget_bytes - incoming and i < self.images.items.len) : (i += 1) {
+        while (self.live_bytes + incoming > self.budget_bytes and i < self.images.items.len) : (i += 1) {
             const img = &self.images.items[i];
             if (img.deleting or img.pending == null) continue;
             self.freePending(img);
@@ -188,9 +202,22 @@ pub const Store = struct {
     };
 
     pub fn addFull(self: *Store, o: AddOpts) !void {
-        const need = image_size.byteLen(o.width, o.height, 4) catch |err| return err;
-        if (o.rgba.len != need) return error.PixelDataLengthMismatch;
-        if (self.budget_bytes > 0 and need > self.budget_bytes) return error.ImageBudgetExceeded;
+        // `byteLen` enforces the hard per-image ceiling; the configured
+        // budget is answered with eviction below, never with a reject.
+        const need = image_size.byteLen(o.width, o.height, 4) catch |err| {
+            if (self.debug) std.debug.print(
+                "[image] rejected {d}x{d} image id={d}: {s}\n",
+                .{ o.width, o.height, o.image_id, @errorName(err) },
+            );
+            return err;
+        };
+        if (o.rgba.len != need) {
+            if (self.debug) std.debug.print(
+                "[image] rejected id={d}: pixel data is {d}B, {d}x{d} RGBA needs {d}B\n",
+                .{ o.image_id, o.rgba.len, o.width, o.height, need },
+            );
+            return error.PixelDataLengthMismatch;
+        }
         // Same (image_id, placement_id) replaces — apps that re-place
         // every frame (emberglyph) would otherwise leak entries.
         // Mark for delete; flushUploads/flushDeletesNoGL frees pending
@@ -311,6 +338,8 @@ pub const Store = struct {
     /// re-uploads them into the new context. Memory cost: each
     /// image holds its RGBA indefinitely until a delete dispatch.
     pub fn forgetGL(self: *Store) void {
+        // The next context may report a different GL_MAX_TEXTURE_SIZE.
+        self.max_texture_size = 0;
         for (self.images.items) |*img| {
             img.gl_tex = 0;
             img.pending_dirty = true;
@@ -323,6 +352,7 @@ pub const Store = struct {
     /// this, every closed pane leaks one GL texture per kitty image
     /// it had displayed, into the shared window context.
     pub fn releaseGL(self: *Store) void {
+        self.max_texture_size = 0;
         for (self.images.items) |*img| {
             if (img.gl_tex != 0) {
                 c.glDeleteTextures(1, &img.gl_tex);
@@ -354,6 +384,77 @@ pub const Store = struct {
         }
     }
 
+    /// Largest texture axis this GL context accepts, queried once.
+    /// 0 until a context has answered.
+    fn maxTextureSize(self: *Store) u32 {
+        if (self.max_texture_size == 0) {
+            var got: c_int = 0;
+            c.glGetIntegerv(c.GL_MAX_TEXTURE_SIZE, &got);
+            // Every GLES3/GL3.3 implementation guarantees at least 2048;
+            // a failed query must not turn into "scale everything to 1px".
+            self.max_texture_size = if (got > 0) @intCast(got) else image_size.max_dimension;
+        }
+        return self.max_texture_size;
+    }
+
+    const Fitted = struct { pixels: []const u8, owned: bool };
+
+    /// Return pixels sized for what GL will accept. Split from
+    /// `scaleForLimit` so the GL query stays out of GTK-free builds,
+    /// where `glGetIntegerv` does not exist.
+    fn fitToTexture(self: *Store, img: *Image, source: []const u8) Fitted {
+        return self.scaleForLimit(img, source, self.maxTextureSize());
+    }
+
+    /// Downscale (nearest, integer-stepped) when an axis is over `limit`.
+    /// Sets `tex_w`/`tex_h`. Falls back to the untouched source if the
+    /// scratch allocation fails — the upload then errors instead of
+    /// drawing, which is what happened before, and stays visible under
+    /// `--debug-images`.
+    fn scaleForLimit(self: *Store, img: *Image, source: []const u8, limit: u32) Fitted {
+        if (img.width <= limit and img.height <= limit) {
+            img.tex_w = img.width;
+            img.tex_h = img.height;
+            return .{ .pixels = source, .owned = false };
+        }
+        const tw: u32 = @min(img.width, limit);
+        const th: u32 = @min(img.height, limit);
+        const bytes = image_size.byteLen(tw, th, 4) catch {
+            img.tex_w = img.width;
+            img.tex_h = img.height;
+            return .{ .pixels = source, .owned = false };
+        };
+        const out = self.allocator.alloc(u8, bytes) catch {
+            if (self.debug) std.debug.print(
+                "[image] id={d}: no memory to downscale {d}x{d} to {d}x{d}\n",
+                .{ img.image_id, img.width, img.height, tw, th },
+            );
+            img.tex_w = img.width;
+            img.tex_h = img.height;
+            return .{ .pixels = source, .owned = false };
+        };
+        var y: u32 = 0;
+        while (y < th) : (y += 1) {
+            const sy: u64 = @as(u64, y) * img.height / th;
+            const src_row = @as(usize, @intCast(sy)) * @as(usize, img.width) * 4;
+            const dst_row = @as(usize, y) * @as(usize, tw) * 4;
+            var x: u32 = 0;
+            while (x < tw) : (x += 1) {
+                const sx: u64 = @as(u64, x) * img.width / tw;
+                const s_off = src_row + @as(usize, @intCast(sx)) * 4;
+                const d_off = dst_row + @as(usize, x) * 4;
+                @memcpy(out[d_off .. d_off + 4], source[s_off .. s_off + 4]);
+            }
+        }
+        if (self.debug) std.debug.print(
+            "[image] id={d}: {d}x{d} exceeds GL_MAX_TEXTURE_SIZE {d}; uploading {d}x{d}\n",
+            .{ img.image_id, img.width, img.height, limit, tw, th },
+        );
+        img.tex_w = tw;
+        img.tex_h = th;
+        return .{ .pixels = out, .owned = true };
+    }
+
     /// Upload pending images to GL, free deleted ones. Caller must
     /// have a current GL context. Source pixels (img.pending) are
     /// retained AFTER upload so re-realize after context loss can
@@ -376,7 +477,14 @@ pub const Store = struct {
         // (gl_tex != 0) does a sub-image update.
         for (self.images.items) |*img| {
             if (!img.pending_dirty) continue;
-            const pending = img.pending orelse continue;
+            const source = img.pending orelse continue;
+            // GL_MAX_TEXTURE_SIZE, not the decode path, is what bounds an
+            // axis. Past it the upload would fail and the image would
+            // silently not draw, so scale the texture down instead; UVs
+            // are normalized, so nothing else has to know.
+            const fitted = self.fitToTexture(img, source);
+            defer if (fitted.owned) self.allocator.free(@constCast(fitted.pixels));
+            const pending = fitted.pixels;
             if (img.gl_tex == 0) {
                 c.glGenTextures(1, &img.gl_tex);
                 c.glBindTexture(c.GL_TEXTURE_2D, img.gl_tex);
@@ -385,8 +493,8 @@ pub const Store = struct {
                     c.GL_TEXTURE_2D,
                     0,
                     c.GL_RGBA8,
-                    @intCast(img.width),
-                    @intCast(img.height),
+                    @intCast(img.tex_w),
+                    @intCast(img.tex_h),
                     0,
                     c.GL_RGBA,
                     c.GL_UNSIGNED_BYTE,
@@ -399,8 +507,8 @@ pub const Store = struct {
                 const err = c.glGetError();
                 if (self.debug) {
                     std.debug.print(
-                        "[image] upload id={d} placement={d} {d}x{d} cell=({d},{d}) tex={d} glErr=0x{x}\n",
-                        .{ img.image_id, img.placement_id, img.width, img.height, img.cell_row, img.cell_col, img.gl_tex, err },
+                        "[image] upload id={d} placement={d} {d}x{d} (texture {d}x{d}) cell=({d},{d}) tex={d} glErr=0x{x}\n",
+                        .{ img.image_id, img.placement_id, img.width, img.height, img.tex_w, img.tex_h, img.cell_row, img.cell_col, img.gl_tex, err },
                     );
                 }
             } else {
@@ -411,8 +519,8 @@ pub const Store = struct {
                     0,
                     0,
                     0,
-                    @intCast(img.width),
-                    @intCast(img.height),
+                    @intCast(img.tex_w),
+                    @intCast(img.tex_h),
                     c.GL_RGBA,
                     c.GL_UNSIGNED_BYTE,
                     pending.ptr,
@@ -475,7 +583,7 @@ test "addFull rejects invalid dimensions and inconsistent pixel lengths" {
     try std.testing.expectEqual(@as(usize, 0), s.count());
 }
 
-test "addFull enforces the decoded budget at the exact edge" {
+test "addFull evicts for the configured budget instead of rejecting" {
     const rgba = [_]u8{0} ** 16;
 
     var exact = Store.init(std.testing.allocator);
@@ -483,18 +591,63 @@ test "addFull enforces the decoded budget at the exact edge" {
     exact.budget_bytes = rgba.len;
     try exact.addFull(.{ .rgba = &rgba, .width = 2, .height = 2, .row = 0, .col = 0 });
     try std.testing.expectEqual(rgba.len, exact.live_bytes);
+    // A second image does not fit alongside the first: the OLDEST is
+    // evicted (FIFO), the new one is stored.
+    try exact.addFull(.{ .rgba = &rgba, .width = 2, .height = 2, .row = 1, .col = 0 });
+    try std.testing.expectEqual(rgba.len, exact.live_bytes);
+    try std.testing.expect(exact.images.items[0].deleting);
+    try std.testing.expect(!exact.images.items[1].deleting);
 
+    // An image larger than the whole budget is still rendered: the budget
+    // is a retention target, not a per-image size limit. `icat` on a big
+    // screenshot with image_memory_mb=16 must not draw nothing.
     var undersized = Store.init(std.testing.allocator);
     defer undersized.deinit();
     undersized.budget_bytes = rgba.len - 1;
-    try std.testing.expectError(error.ImageBudgetExceeded, undersized.addFull(.{
-        .rgba = &rgba,
-        .width = 2,
-        .height = 2,
-        .row = 0,
-        .col = 0,
-    }));
-    try std.testing.expectEqual(@as(usize, 0), undersized.live_bytes);
+    try undersized.addFull(.{ .rgba = &rgba, .width = 2, .height = 2, .row = 0, .col = 0 });
+    try std.testing.expectEqual(rgba.len, undersized.live_bytes);
+    try std.testing.expectEqual(@as(usize, 1), undersized.count());
+}
+
+test "addFull accepts a wide strip that fits the byte budget" {
+    // 20000x2 RGBA = 160KB: one axis is past max_dimension, the total is
+    // nowhere near the ceiling. GL_MAX_TEXTURE_SIZE is handled at upload.
+    const w: u32 = 20000;
+    const h: u32 = 2;
+    const rgba = try std.testing.allocator.alloc(u8, w * h * 4);
+    defer std.testing.allocator.free(rgba);
+    @memset(rgba, 0x7F);
+
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    try s.addFull(.{ .rgba = rgba, .width = w, .height = h, .row = 0, .col = 0 });
+    try std.testing.expectEqual(@as(usize, 1), s.count());
+}
+
+test "scaleForLimit downscales past the GL axis limit and leaves geometry alone" {
+    const w: u32 = 8;
+    const h: u32 = 4;
+    const rgba = [_]u8{0x11} ** (w * h * 4);
+
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    try s.addFull(.{ .rgba = &rgba, .width = w, .height = h, .row = 0, .col = 0 });
+    const img = &s.images.items[0];
+    const fitted = s.scaleForLimit(img, img.pending.?, 4); // pretend GL reported 4
+    defer if (fitted.owned) std.testing.allocator.free(@constCast(fitted.pixels));
+    try std.testing.expect(fitted.owned);
+    try std.testing.expectEqual(@as(u32, 4), img.tex_w);
+    try std.testing.expectEqual(@as(u32, 4), img.tex_h);
+    try std.testing.expectEqual(@as(usize, 4 * 4 * 4), fitted.pixels.len);
+    // Placement geometry and src-rect normalization still use the real size.
+    try std.testing.expectEqual(w, img.width);
+    try std.testing.expectEqual(h, img.height);
+
+    // Within the limit nothing is copied.
+    const direct = s.scaleForLimit(img, img.pending.?, 64);
+    try std.testing.expect(!direct.owned);
+    try std.testing.expectEqual(w, img.tex_w);
+    try std.testing.expectEqual(h, img.tex_h);
 }
 
 test "markByIdForDelete flags only matching images" {

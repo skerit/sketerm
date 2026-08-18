@@ -81,6 +81,7 @@ comptime {
     _ = @import("grid/bidi.zig");
     _ = @import("grid/cell.zig");
     _ = @import("grid/image_pipeline_test.zig");
+    _ = @import("grid/image_size.zig");
     _ = @import("grid/image_store.zig");
     _ = @import("grid/kitty_images.zig");
     _ = @import("grid/kitty_placeholder.zig");

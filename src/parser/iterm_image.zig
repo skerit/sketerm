@@ -287,14 +287,14 @@ fn decodeHeaderOnly(w: u32, h: u32) !Decoded {
 }
 
 test "oversized image is rejected before any pixel buffer is allocated" {
-    // One past the axis cap. The distinguishing assertion is the error
-    // IDENTITY: TooLarge can only come from the header preflight, while
-    // an unbounded decoder reaches stb and reports PngDecode instead.
-    try std.testing.expectError(image_size.Error.TooLarge, decodeHeaderOnly(image_size.max_dimension + 1, 1));
-    try std.testing.expectError(image_size.Error.TooLarge, decodeHeaderOnly(1, image_size.max_dimension + 1));
-    // Within both axis caps but over the decoded-byte cap: 8192x8193x4
-    // is 256MB + 32KB.
+    // Over the decoded-byte ceiling: 8192x8193x4 is 256MB + 32KB. The
+    // distinguishing assertion is the error IDENTITY: TooLarge can only
+    // come from the header preflight, while an unbounded decoder reaches
+    // stb and reports PngDecode instead.
     try std.testing.expectError(image_size.Error.TooLarge, decodeHeaderOnly(8192, 8193));
+    // 16M x 5 RGBA = 320MB: each axis is within what stb will report,
+    // the product is not.
+    try std.testing.expectError(image_size.Error.TooLarge, decodeHeaderOnly(16_000_000, 5));
     // A zero axis is not a size at all.
     try std.testing.expectError(error.PngDecode, decodeHeaderOnly(0, 8));
 }
@@ -305,6 +305,9 @@ test "an image exactly at the cap is not rejected by the preflight" {
     try std.testing.expectError(error.PngDecode, decodeHeaderOnly(image_size.max_dimension, 1));
     // 8192*8192*4 is exactly max_decoded_bytes.
     try std.testing.expectError(error.PngDecode, decodeHeaderOnly(8192, 8192));
+    // A long thin strip is small in bytes: only GL_MAX_TEXTURE_SIZE
+    // bounds its axis, and that is answered at upload by downscaling.
+    try std.testing.expectError(error.PngDecode, decodeHeaderOnly(image_size.max_dimension * 2, 4));
 }
 
 const PngSink = struct {

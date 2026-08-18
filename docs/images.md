@@ -29,7 +29,9 @@ daemon-side as well as GUI-side. Keyed by Kitty `image_id`:
 - `accums` - in-flight chunked transmissions (`m=1` until `m=0`),
   keyed by image id, capped at `MAX_ACCUMS` (32).
 - `budget_bytes` / `store_bytes` - retained-source accounting, fed
-  from `config.image_memory_mb`, with FIFO eviction by `seq`.
+  from `config.image_memory_mb`, with FIFO eviction by `seq`. A
+  budget too small for the incoming image evicts everything else and
+  lets it through; it never rejects.
 - `number` - the client's `I=` image NUMBER, so `d=n` / `d=N` can
   delete by it.
 
@@ -230,13 +232,32 @@ background tab burns nothing.
   (`store_bytes`) and to the placement store's retained pixels
   (`live_bytes`). Both evict oldest-first rather than refusing new
   images, and both allow a single over-budget image through so one
-  large image cannot be starved out.
+  large image cannot be starved out. An animation frame that does
+  not fit is likewise appended and pays for itself by evicting other
+  images; it is never dropped.
+- **Hard per-image ceiling**: `image_size.max_decoded_bytes`
+  (256 MB), checked by `image_size.byteLen` on every decode path
+  (kitty, iTerm2, the placement store). It is deliberately NOT
+  derived from `image_memory_mb` - a tuning knob must not be able to
+  make a legitimate image undisplayable, and a safety limit must not
+  be raiseable by a config edit.
+- **Axis limits**: bounded at UPLOAD, not at decode. `byteLen` cares
+  only about total bytes, so a 20000x10 strip (spectrogram, git
+  graph, panorama) decodes fine; `Store.flushUploads` asks GL for
+  `GL_MAX_TEXTURE_SIZE` and uploads a downscaled copy past it
+  (`scaleForLimit`, recorded in `tex_w`/`tex_h`). Placement geometry
+  and `src_x/y/w/h` crops keep using the real `width`/`height`
+  because the renderer samples with normalized coordinates.
+- **Every rejection is observable** under `--debug-images`:
+  `Manager.reject` prints the id and the reason for each dropped
+  transfer, and `Store.addFull` does the same for a bad size or a
+  pixel-length mismatch.
 - **Sixel dimensions**: clamped to `MAX_DIM` (10000) per side
   before allocation.
 - **Kitty in-flight transfers**: `MAX_ACCUMS` (32) concurrent
   chunked transmissions; `MAX_FRAMES` (1024) animation frames per
-  image; a per-transmission payload cap that tracks the memory
-  budget (`DEFAULT_ACCUM_CAP` when no budget is set).
+  image; a per-transmission payload cap derived from the hard
+  decoded ceiling (`accumCap`), not from `image_memory_mb`.
 - **Kitty media**: `t=d` (direct), `t=f` (file path) and `t=t`
   (tempfile, read then `unlink`) are supported. `t=s` (POSIX shared
   memory) is NOT.

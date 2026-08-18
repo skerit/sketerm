@@ -159,7 +159,10 @@ pub const Manager = struct {
     /// bad base64, RGB undersize, etc.). Wired by `--debug-images`.
     debug: bool = false,
     /// Cap on retained decoded-source bytes (0 = unlimited). Set from
-    /// `config.image_memory_mb`. Past it, oldest stored images are evicted.
+    /// `config.image_memory_mb`. Past it, the OLDEST stored images are
+    /// evicted FIFO — it is a retention target, never a per-image size
+    /// limit. The hard per-image limit is `image_size.max_decoded_bytes`
+    /// and does not move with the config.
     budget_bytes: usize = 0,
     /// Live decoded-source bytes across `store` (kept in sync by
     /// `freeStoredImage` / the insert path).
@@ -210,39 +213,33 @@ pub const Manager = struct {
         self.evictStoreForBudget(image_id);
     }
 
-    /// Max encoded bytes a transmission may accumulate for the effective
-    /// decoded limit, including bounded zlib framing overhead.
+    /// Max encoded bytes a transmission may accumulate for the hard
+    /// decoded ceiling, including bounded zlib framing overhead. Derived
+    /// from `max_decoded_bytes`, not from the configured budget: lowering
+    /// `image_memory_mb` must not make a legitimate image untransmittable.
     fn accumCap(self: *const Manager) usize {
-        const decoded = image_size.decodedLimit(self.budget_bytes);
+        _ = self;
+        const decoded = image_size.max_decoded_bytes;
         const overhead = decoded / 100 + MIN_TRANSFER_OVERHEAD;
         const transfer = std.math.add(usize, decoded, overhead) catch decoded;
         return std.base64.standard.Encoder.calcSize(transfer);
     }
 
-    fn frameFitsBudget(
+    /// A frame may only extend an image that exists and has the same
+    /// dimensions. Deliberately says nothing about the byte budget: a
+    /// frame that does not fit evicts OTHER images (`evictStoreForBudget`
+    /// after the append), it is never refused — refusing produced an
+    /// animation stuck at zero frames on a low `image_memory_mb`.
+    fn frameTargetValid(
         self: *const Manager,
         image_id: u32,
         acc: *const Accum,
         width: u32,
         height: u32,
-        rgba_bytes: usize,
     ) bool {
-        if (acc.action != .transmit_frame or self.budget_bytes == 0) return true;
+        if (acc.action != .transmit_frame) return true;
         const existing = self.store.get(image_id) orelse return false;
-        if (existing.width != width or existing.height != height) return false;
-
-        const before = existing.storedBytes();
-        var removed: usize = 0;
-        if (existing.frames.items.len > 0) {
-            if (acc.frame_target > 0 and acc.frame_target <= existing.frames.items.len) {
-                removed = existing.frames.items[acc.frame_target - 1].rgba.len;
-            } else if (existing.frames.items.len >= MAX_FRAMES) {
-                removed = existing.frames.items[0].rgba.len;
-            }
-        }
-        const after_removal = before - @min(before, removed);
-        const after = std.math.add(usize, after_removal, rgba_bytes) catch return false;
-        return after <= self.budget_bytes;
+        return existing.width == width and existing.height == height;
     }
 
     /// Evict the oldest stored images (lowest `seq`) until the store fits
@@ -494,6 +491,22 @@ pub const Manager = struct {
         return self.store.get(image_id);
     }
 
+    /// Report a dropped transfer under `--debug-images` and return false.
+    /// Every rejection in `finalize` goes through this: a silently
+    /// discarded image is indistinguishable from a renderer bug.
+    fn reject(
+        self: *const Manager,
+        image_id: u32,
+        comptime reason: []const u8,
+        args: anytype,
+    ) bool {
+        if (self.debug) std.debug.print(
+            "[kitty] dropping image id={d}: " ++ reason ++ "\n",
+            .{image_id} ++ args,
+        );
+        return false;
+    }
+
     /// Decode the accumulated payload for `image_id`, store it, drop
     /// the accumulator. Returns true if a usable image was stored.
     fn finalize(self: *Manager, image_id: u32) !bool {
@@ -505,23 +518,23 @@ pub const Manager = struct {
         // mid-chunk-stream so the payload is truncated. Decoding it
         // would silently produce a corrupt image.
         if (acc.poisoned) {
-            if (self.debug) std.debug.print(
-                "[kitty] dropping poisoned chunk stream (id={d}, OOM during append)\n",
-                .{image_id},
-            );
-            return false;
+            return self.reject(image_id, "poisoned chunk stream (OOM during append)", .{});
         }
 
-        if (acc.compression > 1) return false;
+        if (acc.compression > 1)
+            return self.reject(image_id, "unsupported compression o={d}", .{acc.compression});
         const raw_layout: ?RawLayout = switch (acc.format) {
-            24, 32 => rawLayout(acc.format, acc.width, acc.height) orelse return false,
+            24, 32 => rawLayout(acc.format, acc.width, acc.height) orelse
+                return self.reject(
+                    image_id,
+                    "{d}x{d} f={d} is not a decodable size (0, overflow, or past the {d}B ceiling)",
+                    .{ acc.width, acc.height, acc.format, image_size.max_decoded_bytes },
+                ),
             100 => null,
-            else => return false,
+            else => return self.reject(image_id, "unsupported format f={d}", .{acc.format}),
         };
-        if (raw_layout) |layout| {
-            if (layout.rgba_bytes > image_size.decodedLimit(self.budget_bytes)) return false;
-            if (!self.frameFitsBudget(image_id, acc, acc.width, acc.height, layout.rgba_bytes)) return false;
-        }
+        if (raw_layout != null and !self.frameTargetValid(image_id, acc, acc.width, acc.height))
+            return self.reject(image_id, "a=f frame does not match a stored {d}x{d} image", .{ acc.width, acc.height });
 
         // Strip whitespace/newlines in place so finalization does not retain a
         // second attacker-sized copy of the encoded transfer.
@@ -532,16 +545,23 @@ pub const Manager = struct {
             stripped_len += 1;
         }
         acc.payload.items.len = stripped_len;
-        if (acc.payload.items.len == 0) return false;
+        if (acc.payload.items.len == 0) return self.reject(image_id, "empty payload", .{});
 
         const decoder = std.base64.standard.Decoder;
-        const out_len = decoder.calcSizeForSlice(acc.payload.items) catch return false;
+        const out_len = decoder.calcSizeForSlice(acc.payload.items) catch
+            return self.reject(image_id, "payload is not valid base64 ({d}B)", .{acc.payload.items.len});
         if (acc.medium == 'd' and acc.compression == 0) {
-            if (raw_layout) |layout| if (out_len != layout.input_bytes) return false;
+            if (raw_layout) |layout| if (out_len != layout.input_bytes)
+                return self.reject(
+                    image_id,
+                    "payload decodes to {d}B, {d}x{d} f={d} needs {d}B",
+                    .{ out_len, acc.width, acc.height, acc.format, layout.input_bytes },
+                );
         }
         const decoded = try self.allocator.alloc(u8, out_len);
         defer self.allocator.free(decoded);
-        decoder.decode(decoded, acc.payload.items) catch return false;
+        decoder.decode(decoded, acc.payload.items) catch
+            return self.reject(image_id, "base64 decode failed", .{});
 
         // For tempfile / file medium: payload (post-base64) is a path.
         var raw_bytes: []const u8 = decoded;
@@ -549,7 +569,8 @@ pub const Manager = struct {
         defer if (owned_file_data) |b| self.allocator.free(b);
         if (acc.medium == 't' or acc.medium == 'f') {
             const path = std.mem.trimEnd(u8, decoded, "\x00 \r\n\t");
-            const data = self.readFile(path) catch return false;
+            const data = self.readFile(path) catch
+                return self.reject(image_id, "cannot read t=/f= file '{s}'", .{path});
             owned_file_data = data;
             raw_bytes = data;
             if (acc.medium == 't') {
@@ -573,13 +594,20 @@ pub const Manager = struct {
             const inflated_len = if (raw_layout) |layout|
                 layout.input_bytes
             else blk: {
-                if (acc.data_size == 0) return false;
+                if (acc.data_size == 0)
+                    return self.reject(image_id, "compressed PNG without S= (size unknown)", .{});
                 break :blk @as(usize, acc.data_size);
             };
-            if (inflated_len > image_size.decodedLimit(self.budget_bytes)) return false;
+            if (inflated_len > image_size.max_decoded_bytes)
+                return self.reject(
+                    image_id,
+                    "inflated size {d}B is past the {d}B ceiling",
+                    .{ inflated_len, image_size.max_decoded_bytes },
+                );
             const inflated = try self.allocator.alloc(u8, inflated_len);
             owned_inflated = inflated;
-            if (!inflateExact(raw_bytes, inflated)) return false;
+            if (!inflateExact(raw_bytes, inflated))
+                return self.reject(image_id, "zlib payload does not inflate to exactly {d}B", .{inflated_len});
             raw_bytes = inflated;
         }
 
@@ -587,7 +615,8 @@ pub const Manager = struct {
         const stored: StoredImage = switch (acc.format) {
             32 => blk: {
                 const need = raw_layout.?.rgba_bytes;
-                if (raw_bytes.len != need) return false;
+                if (raw_bytes.len != need)
+                    return self.reject(image_id, "RGBA payload is {d}B, need {d}B", .{ raw_bytes.len, need });
                 const out = if (owned_inflated) |inflated| take: {
                     owned_inflated = null;
                     break :take inflated;
@@ -596,7 +625,8 @@ pub const Manager = struct {
             },
             24 => blk: {
                 const layout = raw_layout.?;
-                if (raw_bytes.len != layout.input_bytes) return false;
+                if (raw_bytes.len != layout.input_bytes)
+                    return self.reject(image_id, "RGB payload is {d}B, need {d}B", .{ raw_bytes.len, layout.input_bytes });
                 const out = try self.allocator.alloc(u8, layout.rgba_bytes);
                 var i: usize = 0;
                 while (i < layout.pixels) : (i += 1) {
@@ -608,7 +638,8 @@ pub const Manager = struct {
                 break :blk .{ .rgba = out, .width = acc.width, .height = acc.height };
             },
             100 => blk: {
-                if (raw_bytes.len > std.math.maxInt(c_int)) return false;
+                if (raw_bytes.len > std.math.maxInt(c_int))
+                    return self.reject(image_id, "PNG payload of {d}B is too large to decode", .{raw_bytes.len});
                 var info_w: c_int = 0;
                 var info_h: c_int = 0;
                 var info_ch: c_int = 0;
@@ -618,12 +649,14 @@ pub const Manager = struct {
                     &info_w,
                     &info_h,
                     &info_ch,
-                ) == 0 or info_w <= 0 or info_h <= 0 or info_ch <= 0 or info_ch > 4) return false;
+                ) == 0 or info_w <= 0 or info_h <= 0 or info_ch <= 0 or info_ch > 4)
+                    return self.reject(image_id, "PNG header is unreadable ({d}B payload)", .{raw_bytes.len});
                 const png_w: u32 = @intCast(info_w);
                 const png_h: u32 = @intCast(info_h);
-                const need = image_size.byteLen(png_w, png_h, 4) catch return false;
-                if (need > image_size.decodedLimit(self.budget_bytes)) return false;
-                if (!self.frameFitsBudget(image_id, acc, png_w, png_h, need)) return false;
+                const need = image_size.byteLen(png_w, png_h, 4) catch |err|
+                    return self.reject(image_id, "PNG {d}x{d}: {s}", .{ png_w, png_h, @errorName(err) });
+                if (!self.frameTargetValid(image_id, acc, png_w, png_h))
+                    return self.reject(image_id, "a=f PNG frame does not match a stored {d}x{d} image", .{ png_w, png_h });
 
                 var w: c_int = 0;
                 var h: c_int = 0;
@@ -636,13 +669,12 @@ pub const Manager = struct {
                     &ch,
                     4,
                 );
-                if (pix == null or w != info_w or h != info_h or ch != info_ch) {
-                    if (self.debug) std.debug.print(
-                        "[kitty] PNG decode failed or changed metadata (id={d}, payload={d}B)\n",
-                        .{ image_id, raw_bytes.len },
+                if (pix == null or w != info_w or h != info_h or ch != info_ch)
+                    return self.reject(
+                        image_id,
+                        "PNG decode failed or changed metadata ({d}B payload)",
+                        .{raw_bytes.len},
                     );
-                    return false;
-                }
                 defer c.stbi_image_free(pix);
                 const out = try self.allocator.alloc(u8, need);
                 @memcpy(out, pix[0..need]);
@@ -652,7 +684,7 @@ pub const Manager = struct {
                     .height = png_h,
                 };
             },
-            else => return false,
+            else => return self.reject(image_id, "unsupported format f={d}", .{acc.format}),
         };
 
         // Frame-data action: append (or compose into) the existing
@@ -679,12 +711,16 @@ pub const Manager = struct {
         const existing = self.store.getPtr(image_id) orelse {
             // No source image; treat as a regular store.
             self.allocator.free(new_frame.rgba);
-            return false;
+            return self.reject(image_id, "a=f frame for an image that was never transmitted", .{});
         };
         // Frames must match dimensions of the source.
         if (new_frame.width != existing.width or new_frame.height != existing.height) {
             self.allocator.free(new_frame.rgba);
-            return false;
+            return self.reject(
+                image_id,
+                "a=f frame is {d}x{d}, the image is {d}x{d}",
+                .{ new_frame.width, new_frame.height, existing.width, existing.height },
+            );
         }
 
         // Snapshot the image's byte footprint so we can apply the net delta
@@ -1047,14 +1083,6 @@ test "manager rejects invalid and overflowing raw dimensions" {
     });
     _ = mgr.ingest(.{
         .action = .transmit,
-        .image_id = 31,
-        .format = 32,
-        .width = image_size.max_dimension + 1,
-        .height = 1,
-        .payload = payload,
-    });
-    _ = mgr.ingest(.{
-        .action = .transmit,
         .image_id = 32,
         .format = 32,
         .width = std.math.maxInt(u32),
@@ -1062,7 +1090,6 @@ test "manager rejects invalid and overflowing raw dimensions" {
         .payload = payload,
     });
     try std.testing.expect(mgr.get(30) == null);
-    try std.testing.expect(mgr.get(31) == null);
     try std.testing.expect(mgr.get(32) == null);
 }
 
@@ -1144,15 +1171,15 @@ test "manager bounds high-ratio zlib inflation to metadata size" {
     try std.testing.expect(mgr.get(60) == null);
 }
 
-test "manager enforces decoded budget at the exact edge" {
+test "the configured budget evicts, it never rejects" {
     const rgba = [_]u8{0xCC} ** 16;
     const payload = try testBase64(std.testing.allocator, &rgba);
     defer std.testing.allocator.free(payload);
 
-    var exact = Manager.init(std.testing.allocator);
-    defer exact.deinit();
-    exact.budget_bytes = rgba.len;
-    _ = exact.ingest(.{
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+    mgr.budget_bytes = rgba.len;
+    _ = mgr.ingest(.{
         .action = .transmit,
         .image_id = 70,
         .format = 32,
@@ -1160,8 +1187,11 @@ test "manager enforces decoded budget at the exact edge" {
         .height = 2,
         .payload = payload,
     });
-    try std.testing.expect(exact.get(70) != null);
-    _ = exact.ingest(.{
+    try std.testing.expect(mgr.get(70) != null);
+
+    // An animation frame that does not fit the budget must still be
+    // appended — the budget is answered by evicting OTHER images.
+    _ = mgr.ingest(.{
         .action = .transmit_frame,
         .image_id = 70,
         .format = 32,
@@ -1169,9 +1199,10 @@ test "manager enforces decoded budget at the exact edge" {
         .height = 2,
         .payload = payload,
     });
-    try std.testing.expectEqual(@as(usize, 0), exact.get(70).?.frames.items.len);
-    try std.testing.expectEqual(rgba.len, exact.store_bytes);
+    try std.testing.expectEqual(@as(usize, 2), mgr.get(70).?.frames.items.len);
 
+    // A whole image larger than the budget still stores: `icat` on a big
+    // screenshot with a low image_memory_mb must not render nothing.
     var undersized = Manager.init(std.testing.allocator);
     defer undersized.deinit();
     undersized.budget_bytes = rgba.len - 1;
@@ -1183,7 +1214,51 @@ test "manager enforces decoded budget at the exact edge" {
         .height = 2,
         .payload = payload,
     });
-    try std.testing.expect(undersized.get(71) == null);
+    try std.testing.expect(undersized.get(71) != null);
+
+    // ...and the OLDEST is evicted when a second one arrives.
+    var fifo = Manager.init(std.testing.allocator);
+    defer fifo.deinit();
+    fifo.budget_bytes = rgba.len;
+    for ([_]u32{ 80, 81 }) |id| {
+        _ = fifo.ingest(.{
+            .action = .transmit,
+            .image_id = id,
+            .format = 32,
+            .width = 2,
+            .height = 2,
+            .payload = payload,
+        });
+    }
+    try std.testing.expect(fifo.get(80) == null);
+    try std.testing.expect(fifo.get(81) != null);
+    try std.testing.expectEqual(rgba.len, fifo.store_bytes);
+}
+
+test "a wide strip decodes: only total bytes bound an image" {
+    // 20000x2 RGBA = 160KB. One axis is past max_dimension; the total is
+    // trivial. GL_MAX_TEXTURE_SIZE is handled at upload, not at decode.
+    const w: u32 = 20000;
+    const h: u32 = 2;
+    const rgba = try std.testing.allocator.alloc(u8, w * h * 4);
+    defer std.testing.allocator.free(rgba);
+    @memset(rgba, 0x40);
+    const payload = try testBase64(std.testing.allocator, rgba);
+    defer std.testing.allocator.free(payload);
+
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 90,
+        .format = 32,
+        .width = w,
+        .height = h,
+        .payload = payload,
+    });
+    const stored = mgr.get(90) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(w, stored.width);
+    try std.testing.expectEqual(h, stored.height);
 }
 
 test "manager: a=p before any transmit returns none" {
@@ -1362,14 +1437,18 @@ test "store budget evicts oldest images and bounds store_bytes" {
 test "unterminated chunked transmission is capped, not unbounded" {
     var mgr = Manager.init(std.testing.allocator);
     defer mgr.deinit();
-    mgr.budget_bytes = 1024; // tiny accum cap
+    // The cap follows the hard ceiling, not `budget_bytes` — a small
+    // configured budget must not make a legitimate transfer impossible.
+    mgr.budget_bytes = 1024;
+    const cap = mgr.accumCap();
+    try std.testing.expect(cap > mgr.budget_bytes);
     const chunk = [_]u8{'A'} ** 512;
-    // Keep sending m=1 chunks for one id; payload must not grow past the cap.
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         _ = mgr.ingest(.{ .action = .transmit, .image_id = 1, .payload = &chunk, .more = 1 });
     }
     const acc = mgr.accums.getPtr(1).?;
-    try std.testing.expect(acc.poisoned);
-    try std.testing.expect(acc.payload.items.len <= mgr.budget_bytes);
+    // Well under the cap: nothing poisoned, nothing dropped.
+    try std.testing.expect(!acc.poisoned);
+    try std.testing.expectEqual(@as(usize, 100 * chunk.len), acc.payload.items.len);
 }
