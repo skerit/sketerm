@@ -188,7 +188,10 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
         std.fmt.bufPrint(&status_buf, "{s}{s}", .{ counted, gnote }) catch counted
     else
         counted;
-    self.setStatus(cmsg);
+    // A running transfer reports its progress on this line (jobs.zig
+    // onJobEvent) and the copy itself re-renders the destination tab;
+    // the summary yields while one runs instead of the two alternating.
+    if (!@import("jobs.zig").anyRunning(self)) self.setStatus(cmsg);
     applyPendingReveal(self, tab);
 
     // Fetching runs LAST: the rows it measures against are the ones

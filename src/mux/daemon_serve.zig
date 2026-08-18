@@ -1906,6 +1906,48 @@ fn hasErrnoToken(msg: []const u8, tag: []const u8) bool {
     return false;
 }
 
+const FsStatvfs = struct { bsize: u64, frsize: u64, blocks: u64, bfree: u64, bavail: u64, files: u64, ffree: u64, namemax: u64 };
+
+/// musl's `struct statvfs` carries an anonymous bitfield that translate-c
+/// turns opaque, so on those targets the (verified, 64-bit LE) layout is
+/// declared by hand rather than serving made-up numbers as `bavail = 0`.
+const MuslStatvfs = extern struct {
+    f_bsize: c_ulong,
+    f_frsize: c_ulong,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_favail: u64,
+    f_fsid: c_ulong,
+    f_flag: c_ulong,
+    f_namemax: c_ulong,
+    f_type: c_uint,
+    __reserved: [5]c_int,
+};
+
+fn fsStatvfs(path: [*:0]const u8) ?FsStatvfs {
+    if (comptime @typeInfo(c.struct_statvfs) == .@"opaque") {
+        comptime {
+            if (@sizeOf(c_ulong) != 8 or @import("builtin").cpu.arch.endian() != .little)
+                @compileError("hand-declared musl statvfs layout is only verified for 64-bit little-endian targets");
+            std.debug.assert(@sizeOf(MuslStatvfs) == 112);
+            std.debug.assert(@offsetOf(MuslStatvfs, "f_bavail") == 32);
+            std.debug.assert(@offsetOf(MuslStatvfs, "f_namemax") == 80);
+        }
+        const S = struct {
+            extern "c" fn statvfs(path: [*:0]const u8, buf: *MuslStatvfs) c_int;
+        };
+        var st: MuslStatvfs = undefined;
+        if (S.statvfs(path, &st) != 0) return null;
+        return .{ .bsize = st.f_bsize, .frsize = st.f_frsize, .blocks = st.f_blocks, .bfree = st.f_bfree, .bavail = st.f_bavail, .files = st.f_files, .ffree = st.f_ffree, .namemax = st.f_namemax };
+    }
+    var st: c.struct_statvfs = undefined;
+    if (c.statvfs(path, &st) != 0) return null;
+    return .{ .bsize = st.f_bsize, .frsize = st.f_frsize, .blocks = st.f_blocks, .bfree = st.f_bfree, .bavail = st.f_bavail, .files = st.f_files, .ffree = st.f_ffree, .namemax = st.f_namemax };
+}
+
 pub fn fsReplyErr(cl: *Client, req: u32, msg: []const u8) void {
     cl.queueJson(.fs_reply, .{ .req = req, .ok = false, .@"error" = msg, .kind = fsErrKind(msg) });
 }
@@ -2194,41 +2236,20 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "statfs")) {
-        // musl's struct statvfs contains an anonymous bitfield
-        // that translate-c cannot represent (the type comes out
-        // opaque), so musl-portable daemons serve conservative
-        // defaults instead of real filesystem numbers.
-        if (comptime @typeInfo(c.struct_statvfs) == .@"opaque") {
-            cl.queueJson(.fs_reply, .{
-                .req = r.req,
-                .ok = true,
-                .bsize = @as(u64, 4096),
-                .frsize = @as(u64, 4096),
-                .blocks = @as(u64, 0),
-                .bfree = @as(u64, 0),
-                .bavail = @as(u64, 0),
-                .files = @as(u64, 0),
-                .ffree = @as(u64, 0),
-                .namemax = @as(u64, 255),
-            });
-            return;
-        }
         var z: [4096]u8 = undefined;
         const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
-        var st: c.struct_statvfs = undefined;
-        const rc = c.statvfs(p, &st);
-        if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
+        const st = fsStatvfs(p) orelse return fsReplyErr(cl, r.req, fsserve.errnoName(-1));
         cl.queueJson(.fs_reply, .{
             .req = r.req,
             .ok = true,
-            .bsize = st.f_bsize,
-            .frsize = st.f_frsize,
-            .blocks = st.f_blocks,
-            .bfree = st.f_bfree,
-            .bavail = st.f_bavail,
-            .files = st.f_files,
-            .ffree = st.f_ffree,
-            .namemax = st.f_namemax,
+            .bsize = st.bsize,
+            .frsize = st.frsize,
+            .blocks = st.blocks,
+            .bfree = st.bfree,
+            .bavail = st.bavail,
+            .files = st.files,
+            .ffree = st.ffree,
+            .namemax = st.namemax,
         });
     } else {
         fsReplyErr(cl, r.req, "unknown fs op");

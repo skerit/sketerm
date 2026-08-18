@@ -1775,6 +1775,12 @@ pub fn startDaemonJobKind(
     }
 }
 
+/// Whether a job is still running, i.e. the status line carries live progress.
+pub fn anyRunning(self: *BrowserView) bool {
+    for (self.jobs.items) |row| if (row.state == .running) return true;
+    return false;
+}
+
 /// Job progress / completion → jobs panel + status bar (deltas
 /// already update the listing itself when the result lands).
 pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
