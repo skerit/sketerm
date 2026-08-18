@@ -80,9 +80,14 @@ pub fn defaultDirAlloc(allocator: std.mem.Allocator) ![]u8 {
 
 /// Whole small file into memory; null when absent/unreadable.
 fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, cap: usize) ?[]u8 {
+    return readFileAllocE(allocator, path, cap) catch null;
+}
+
+/// Error-returning so the `errdefer` runs; as a `?[]u8` body it did not.
+fn readFileAllocE(allocator: std.mem.Allocator, path: []const u8, cap: usize) ![]u8 {
     var z: [4096]u8 = undefined;
-    const p = pathz.pathZ(&z, path) catch return null;
-    const fp = c.fopen(p, "rb") orelse return null;
+    const p = try pathz.pathZ(&z, path);
+    const fp = c.fopen(p, "rb") orelse return error.OpenFailed;
     defer _ = c.fclose(fp);
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(allocator);
@@ -90,19 +95,10 @@ fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, cap: usize) ?[]
     while (true) {
         const n = c.fread(&buf, 1, buf.len, fp);
         if (n == 0) break;
-        list.appendSlice(allocator, buf[0..n]) catch {
-            list.deinit(allocator);
-            return null;
-        };
-        if (list.items.len > cap) {
-            list.deinit(allocator);
-            return null;
-        }
+        try list.appendSlice(allocator, buf[0..n]);
+        if (list.items.len > cap) return error.StreamTooLong;
     }
-    return list.toOwnedSlice(allocator) catch {
-        list.deinit(allocator);
-        return null;
-    };
+    return list.toOwnedSlice(allocator);
 }
 
 /// Durable whole-file replacement for daemon-owned browser state.

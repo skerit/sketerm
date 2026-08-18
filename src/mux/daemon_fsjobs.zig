@@ -704,24 +704,73 @@ fn setFsJobErrorKind(job: *FsJob, kind: []const u8) void {
     @memcpy(job.err_kind[0..job.err_kind_len], kind[0..job.err_kind_len]);
 }
 
+/// The eight journal strings a restored job owns.
+///
+/// Split out of `restoredFsJob` so the partial-build rollback is an
+/// `errdefer` in a function that actually returns an error. Inlined into
+/// the `?*FsJob` original, every one of those errdefers was dead: an OOM
+/// on the fourth dupe leaked the first three, in the daemon, on every
+/// journal restore.
+const RestoredStrings = struct {
+    src: []u8,
+    dst: []u8,
+    pattern: []u8,
+    src_host: []u8,
+    dst_host: []u8,
+    client_token: []u8,
+    transfer_token: []u8,
+    conflict: []u8,
+
+    fn free(self: RestoredStrings, allocator: std.mem.Allocator) void {
+        allocator.free(self.src);
+        allocator.free(self.dst);
+        allocator.free(self.pattern);
+        allocator.free(self.src_host);
+        allocator.free(self.dst_host);
+        allocator.free(self.client_token);
+        allocator.free(self.transfer_token);
+        allocator.free(self.conflict);
+    }
+};
+
+fn dupeRestoredStrings(allocator: std.mem.Allocator, rec: fsjournal.Record) !RestoredStrings {
+    const src = try allocator.dupe(u8, rec.src);
+    errdefer allocator.free(src);
+    const dst = try allocator.dupe(u8, rec.dst);
+    errdefer allocator.free(dst);
+    const pattern = try allocator.dupe(u8, rec.pattern);
+    errdefer allocator.free(pattern);
+    const src_host = try allocator.dupe(u8, rec.src_host);
+    errdefer allocator.free(src_host);
+    const dst_host = try allocator.dupe(u8, rec.dst_host);
+    errdefer allocator.free(dst_host);
+    const client_token = try allocator.dupe(u8, rec.client_token);
+    errdefer allocator.free(client_token);
+    const transfer_token = try allocator.dupe(u8, rec.transfer_token);
+    errdefer allocator.free(transfer_token);
+    const conflict = try allocator.dupe(u8, rec.conflict);
+    return .{
+        .src = src,
+        .dst = dst,
+        .pattern = pattern,
+        .src_host = src_host,
+        .dst_host = dst_host,
+        .client_token = client_token,
+        .transfer_token = transfer_token,
+        .conflict = conflict,
+    };
+}
+
 pub fn restoredFsJob(self: *Daemon, rec: fsjournal.Record, op: FsJob.Op, state: FsJob.State) ?*FsJob {
-    const src = self.allocator.dupe(u8, rec.src) catch return null;
-    errdefer self.allocator.free(src);
-    const dst = self.allocator.dupe(u8, rec.dst) catch return null;
-    errdefer self.allocator.free(dst);
-    const pattern = self.allocator.dupe(u8, rec.pattern) catch return null;
-    errdefer self.allocator.free(pattern);
-    const src_host = self.allocator.dupe(u8, rec.src_host) catch return null;
-    errdefer self.allocator.free(src_host);
-    const dst_host = self.allocator.dupe(u8, rec.dst_host) catch return null;
-    errdefer self.allocator.free(dst_host);
-    const client_token = self.allocator.dupe(u8, rec.client_token) catch return null;
-    errdefer self.allocator.free(client_token);
-    const transfer_token = self.allocator.dupe(u8, rec.transfer_token) catch return null;
-    errdefer self.allocator.free(transfer_token);
-    const conflict = self.allocator.dupe(u8, rec.conflict) catch return null;
-    errdefer self.allocator.free(conflict);
-    const job = self.allocator.create(FsJob) catch return null;
+    // Restore degrades to "this job is not adopted" on OOM; the journal
+    // record stays on disk for the next restore attempt. Both bail-outs
+    // below therefore clean up explicitly -- this function cannot return
+    // an error, so an errdefer here would never run.
+    const strings = dupeRestoredStrings(self.allocator, rec) catch return null;
+    const job = self.allocator.create(FsJob) catch {
+        strings.free(self.allocator);
+        return null;
+    };
     job.* = .{
         .allocator = self.allocator,
         .id = rec.id,
@@ -735,14 +784,14 @@ pub fn restoredFsJob(self: *Daemon, rec: fsjournal.Record, op: FsJob.Op, state: 
         .resumed_from = rec.resumed_from,
         .files_done = rec.files_done,
         .files_total = rec.files_total,
-        .src = src,
-        .dst = dst,
-        .pattern = pattern,
-        .src_host = src_host,
-        .dst_host = dst_host,
-        .client_token = client_token,
-        .transfer_token = transfer_token,
-        .conflict = conflict,
+        .src = strings.src,
+        .dst = strings.dst,
+        .pattern = strings.pattern,
+        .src_host = strings.src_host,
+        .dst_host = strings.dst_host,
+        .client_token = strings.client_token,
+        .transfer_token = strings.transfer_token,
+        .conflict = strings.conflict,
         .no_replace = rec.no_replace,
         .acknowledged = rec.acknowledged,
         .resumable = rec.@"resume",
@@ -1579,6 +1628,38 @@ test "detached terminal records restore their structured error kind" {
     };
     setFsJobErrorKind(&job, "transport");
     try std.testing.expectEqualStrings("transport", job.err_kind[0..job.err_kind_len]);
+}
+
+test "a restore that runs out of memory duplicates no string it cannot free" {
+    const t = std.testing;
+    // Every one of these eight dupes used to be guarded by an errdefer
+    // in a `?*FsJob` function, so none of them ever ran: an OOM on the
+    // fourth dupe leaked the first three, inside the daemon, on journal
+    // restore. Sweep every allocation and fail it -- testing.allocator
+    // reports any survivor.
+    const rec = fsjournal.Record{
+        .id = 7,
+        .op = "cross_copy",
+        .src = "/src/path",
+        .dst = "/dst/path",
+        .pattern = "*.txt",
+        .src_host = "alpha",
+        .dst_host = "beta",
+        .conflict = "skip",
+        .client_token = "client-token",
+        .transfer_token = "transfer-token",
+    };
+
+    var counting = t.FailingAllocator.init(t.allocator, .{});
+    const ok = try dupeRestoredStrings(counting.allocator(), rec);
+    ok.free(t.allocator);
+    const allocations = counting.alloc_index;
+    try t.expectEqual(@as(usize, 8), allocations);
+
+    for (0..allocations) |index| {
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = index });
+        try t.expectError(error.OutOfMemory, dupeRestoredStrings(failing.allocator(), rec));
+    }
 }
 
 test "cross moves and no-replace copies use the durable cancellation fence" {

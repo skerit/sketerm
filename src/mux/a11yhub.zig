@@ -313,14 +313,18 @@ pub const Hub = struct {
         var bus = self.openA11yBus(allocator) orelse return null;
         defer bus.deinit();
 
+        // No errdefer: this returns `?[]u8`, so one would never run.
+        // Every failure below releases `out` explicitly.
         var out: std.ArrayList(u8) = .empty;
-        errdefer out.deinit(allocator);
         var w = Walker{ .allocator = allocator, .conn = &bus, .out = &out, .count = 0 };
         w.node(ATSPI_REGISTRY_DEST, REGISTRY_ROOT, 0) catch {
             out.deinit(allocator);
             return null;
         };
-        return out.toOwnedSlice(allocator) catch null;
+        return out.toOwnedSlice(allocator) catch {
+            out.deinit(allocator);
+            return null;
+        };
     }
 
     /// org.a11y.atspi.Action.DoAction(index) on the node `id` (a tree
@@ -456,11 +460,17 @@ pub const Hub = struct {
     /// difference between a reader being told and a reader re-walking.
     /// Caller deinits.
     pub fn watchEvents(self: *Hub, allocator: std.mem.Allocator) ?EventWatch {
+        // `?EventWatch`, so an errdefer would never run: both bail-outs
+        // close the bus by hand. Leaking it here leaked the connection
+        // AND its socket fd, and a few retries exhausted the daemon's
+        // fd table.
         var bus = self.openA11yBus(allocator) orelse return null;
-        errdefer bus.deinit();
         var bw = dbus.Writer.init(allocator);
         defer bw.deinit();
-        bw.putString("type='signal',interface='org.a11y.atspi.Event.Object'") catch return null;
+        bw.putString("type='signal',interface='org.a11y.atspi.Event.Object'") catch {
+            bus.deinit();
+            return null;
+        };
         const r = bus.call(.{
             .mtype = .method_call,
             .path = "/org/freedesktop/DBus",
@@ -469,7 +479,10 @@ pub const Hub = struct {
             .destination = "org.freedesktop.DBus",
             .signature = "s",
             .body = bw.buf.items,
-        }) catch return null;
+        }) catch {
+            bus.deinit();
+            return null;
+        };
         allocator.free(r.body);
         return .{ .conn = bus, .allocator = allocator };
     }
