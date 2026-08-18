@@ -13,6 +13,7 @@ pub const Error = error{
     IdentityMismatch,
     VersionMismatch,
     MissingAsset,
+    AssetTooLarge,
     UnsafeAsset,
     PathTooLong,
     MkdirFailed,
@@ -28,7 +29,9 @@ pub const Error = error{
 };
 
 const MAX_PATH = 4096;
-const MAX_ASSET = 4 * 1024 * 1024;
+/// Manifest-referenced assets share the archive's per-entry ceiling;
+/// a tighter bound here only re-refuses what the zip already admitted.
+const MAX_ASSET = zip.limits.entry_uncompressed;
 const STAGE_ATTEMPTS = 128;
 var next_stage = std.atomic.Value(u64).init(1);
 
@@ -352,7 +355,8 @@ fn validateAsset(gpa: std.mem.Allocator, dir: []const u8, raw: []const u8) Error
     const path_z = pathz.pathZ(&path_z_buf, path) catch return error.PathTooLong;
     var st: c.struct_stat = undefined;
     if (c.lstat(path_z, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFREG or
-        st.st_size < 0 or st.st_size > MAX_ASSET) return error.MissingAsset;
+        st.st_size < 0) return error.MissingAsset;
+    if (st.st_size > MAX_ASSET) return error.AssetTooLarge;
 }
 
 fn mapManifestError(err: manifest.ParseError) Error {
@@ -762,6 +766,26 @@ test "helper candidate validation refuses missing assets identity and version" {
     try writeTestFile(asset, "new");
     try t.expectError(error.IdentityMismatch, validateDirectory(t.allocator, dir.path(), "other@sketerm.test", "2", "Transaction Test"));
     try t.expectError(error.VersionMismatch, validateDirectory(t.allocator, dir.path(), test_id, "3", "Transaction Test"));
+}
+
+test "helper candidate validation accepts an asset at the size limit and names an oversize one" {
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const man_path = try std.fmt.allocPrint(t.allocator, "{s}/manifest.json", .{dir.path()});
+    defer t.allocator.free(man_path);
+    try writeTestFile(man_path, manifest_v2);
+    const asset = try std.fmt.allocPrint(t.allocator, "{s}/new.js", .{dir.path()});
+    defer t.allocator.free(asset);
+    try writeTestFile(asset, "new");
+    var asset_z_buf: [MAX_PATH]u8 = undefined;
+    const asset_z = try pathz.pathZ(&asset_z_buf, asset);
+
+    // Sparse: only st_size matters to the check, so no bytes are written.
+    try t.expectEqual(@as(c_int, 0), c.truncate(asset_z, @intCast(MAX_ASSET)));
+    var man = try validateDirectory(t.allocator, dir.path(), test_id, "2", "Transaction Test");
+    man.deinit();
+    try t.expectEqual(@as(c_int, 0), c.truncate(asset_z, @intCast(MAX_ASSET + 1)));
+    try t.expectError(error.AssetTooLarge, validateDirectory(t.allocator, dir.path(), test_id, "2", "Transaction Test"));
 }
 
 test "crash leftovers are cleaned under the same-extension lock" {

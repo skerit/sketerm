@@ -249,6 +249,11 @@ pub const InstallError = error{
     NoManifest,
     WriteFailed,
     BadArchive,
+    /// Zip64 records: a valid archive we do not read, distinct from a
+    /// corrupt one so the user is not sent to re-download a good file.
+    UnsupportedZip64,
+    /// A manifest-referenced asset exists but exceeds the size ceiling.
+    AssetTooLarge,
     InstallBusy,
     HelperRefused,
     /// An MV3 package. Its own error because it is the ONE failure a
@@ -266,6 +271,8 @@ pub fn installErrorText(e: InstallError) [*:0]const u8 {
         error.UnsupportedManifestVersion => "This is a Manifest V3 extension. sketerm hosts the Firefox MV2 surface, " ++
             "where blocking webRequest still exists; install the Firefox build instead.",
         error.BadArchive => "That file is not a readable .xpi/.zip archive.",
+        error.UnsupportedZip64 => "That archive uses Zip64 records, which sketerm cannot read yet.",
+        error.AssetTooLarge => "A file the manifest references is larger than sketerm allows for one extension asset.",
         error.InstallBusy => "This extension is already being installed by another sketerm process.",
         error.HelperRefused => "The browser helper refused the staged extension; the previous version was restored.",
         error.WriteFailed => "The extension could not be written to the data directory.",
@@ -306,7 +313,11 @@ pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError
         error.ReadFailed => error.NoManifest,
     };
     defer gpa.free(bytes);
-    var arc = zip.read(gpa, bytes) catch return error.BadArchive;
+    var arc = zip.read(gpa, bytes) catch |err| return switch (err) {
+        error.UnsupportedZip64 => error.UnsupportedZip64,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadArchive,
+    };
     defer arc.deinit();
     const man_entry = arc.find("manifest.json") orelse return error.NoManifest;
     var man = manifest.parse(gpa, man_entry.data) catch |err| return mapParseError(err);
@@ -358,6 +369,7 @@ fn mapInstallError(err: extinstall.Error) InstallError {
         error.OutOfMemory => error.OutOfMemory,
         error.UnsupportedManifestVersion => error.UnsupportedManifestVersion,
         error.BadManifest, error.IdentityMismatch, error.VersionMismatch, error.MissingAsset, error.UnsafeAsset => error.BadManifest,
+        error.AssetTooLarge => error.AssetTooLarge,
         error.ConcurrentInstall => error.InstallBusy,
         else => error.WriteFailed,
     };

@@ -23,6 +23,7 @@ pub const Error = error{
     UnsafeName,
     DuplicateName,
     ChecksumMismatch,
+    UnsupportedZip64,
     OutOfMemory,
 };
 
@@ -37,8 +38,10 @@ pub const limits = struct {
     /// bytes of name buys ~512 levels, enough to overflow the main
     /// thread's stack mid-install. No real extension is anywhere near.
     pub const name_depth: usize = 32;
-    pub const compression_ratio: usize = 200;
-    pub const ratio_slack: usize = 64 * 1024;
+    // There is deliberately no per-entry compression-ratio bound. Deflate
+    // tops out near 1032:1, bundler source maps sit at ~400:1 (measured),
+    // and entry_uncompressed + aggregate_uncompressed already cap the
+    // work a bomb can cause; a ratio check can only add false positives.
 };
 
 pub const Entry = struct {
@@ -102,7 +105,7 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) Error!Archive {
     if (disk != 0 or cd_disk != 0 or disk_entries != total_u16) return error.BadData;
     if (total_u16 == std.math.maxInt(u16) or
         cd_size_u32 == std.math.maxInt(u32) or
-        cd_off_u32 == std.math.maxInt(u32)) return error.BadData;
+        cd_off_u32 == std.math.maxInt(u32)) return error.UnsupportedZip64;
 
     const total: usize = total_u16;
     if (total > limits.entries) return error.LimitExceeded;
@@ -138,7 +141,7 @@ pub fn read(gpa: std.mem.Allocator, bytes: []const u8) Error!Archive {
         if (method != 0 and method != 8) return error.UnsupportedMethod;
         if (comp_u32 == std.math.maxInt(u32) or
             uncomp_u32 == std.math.maxInt(u32) or
-            lfh_u32 == std.math.maxInt(u32)) return error.BadData;
+            lfh_u32 == std.math.maxInt(u32)) return error.UnsupportedZip64;
         if (name_len > limits.name_length) return error.LimitExceeded;
 
         const name = try consume(bytes, &cd_cursor, name_len, cd_end);
@@ -258,9 +261,6 @@ fn validateSizes(method: u16, comp_size: usize, uncomp_size: usize) Error!void {
         return;
     }
     if (uncomp_size != 0 and comp_size == 0) return error.BadData;
-    var allowed = std.math.mul(usize, comp_size, limits.compression_ratio) catch std.math.maxInt(usize);
-    allowed = std.math.add(usize, allowed, limits.ratio_slack) catch std.math.maxInt(usize);
-    if (uncomp_size > allowed) return error.LimitExceeded;
 }
 
 /// Apply the archive entry path policy without extracting an entry.
@@ -537,7 +537,7 @@ test "accepts an EOCD comment and data descriptor metadata" {
     try t.expectEqualStrings("{\"name\":\"descriptor\"}", arc.find("manifest.json").?.data);
 }
 
-test "rejects entry count, output size, aggregate, and ratio bombs" {
+test "rejects entry count, output size, and aggregate bombs" {
     const gpa = t.allocator;
 
     {
@@ -577,13 +577,40 @@ test "rejects entry count, output size, aggregate, and ratio bombs" {
         try t.expectError(error.LimitExceeded, read(gpa, zip));
     }
 
+}
+
+test "accepts a maximally compressible entry" {
+    // A source map or a zero-filled buffer is a legitimate ~400:1..1032:1
+    // entry; the size caps, not a ratio, are what bound bombs here.
+    const gpa = t.allocator;
+    const size: usize = 8 * 1024 * 1024;
+    const data = try gpa.alloc(u8, size);
+    defer gpa.free(data);
+    @memset(data, 0);
+    const zip = try buildZip(gpa, &.{.{ .name = "map.js.map", .data = data, .deflate = true }});
+    defer gpa.free(zip);
+    // Sanity: the entry really is extreme (>= 400:1), else this proves nothing.
+    const cd_off = le32(zip, zip.len - 22 + 16);
+    try t.expect(le32(zip, cd_off + 20) * 400 <= size);
+    var arc = try read(gpa, zip);
+    defer arc.deinit();
+    try t.expectEqual(size, arc.find("map.js.map").?.data.len);
+}
+
+test "reports Zip64 sentinels as unsupported, not corrupt" {
+    const gpa = t.allocator;
     {
-        const data = try gpa.alloc(u8, 128 * 1024);
-        defer gpa.free(data);
-        @memset(data, 'A');
-        const zip = try buildZip(gpa, &.{.{ .name = "bomb", .data = data, .deflate = true }});
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
         defer gpa.free(zip);
-        try t.expectError(error.LimitExceeded, read(gpa, zip));
+        setU32(zip, zip.len - 22 + 12, std.math.maxInt(u32));
+        try t.expectError(error.UnsupportedZip64, read(gpa, zip));
+    }
+    {
+        const zip = try buildZip(gpa, &.{.{ .name = "a", .data = "x", .deflate = false }});
+        defer gpa.free(zip);
+        const cd_off = le32(zip, zip.len - 22 + 16);
+        setU32(zip, cd_off + 24, std.math.maxInt(u32));
+        try t.expectError(error.UnsupportedZip64, read(gpa, zip));
     }
 }
 
