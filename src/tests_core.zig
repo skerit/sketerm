@@ -225,6 +225,7 @@ comptime {
     _ = @import("web/webext/i18n.zig");
     _ = @import("web/webext/tabs.zig");
     _ = @import("web/webext/action.zig");
+    _ = @import("web/webext/registry.zig");
     _ = @import("web/webext/reply.zig");
     _ = @import("web/webext/host.zig");
     _ = @import("util/content.zig");

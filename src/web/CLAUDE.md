@@ -259,7 +259,13 @@ attempt, and all four cost a live external dependency:
 MV2/Firefox-flavor extension host. The GUI owns the FILES (install an
 unpacked dir in place, or unpack an XPI under
 `$XDG_DATA_HOME/sketerm/webext/<id>/`; `src/ui/webext.zig` + its
-`registry.json`); the helper LOADS them and reports state. `webext_host`
+`registry.json`); the helper LOADS them and reports state. `registry.json` is rewritten WHOLE, so every read-modify-write of it
+runs inside a `flock` on `<webext dir>/.registry.lock`
+(`webext/registry.zig`) and applies its change, keyed by extension id,
+to what is on DISK rather than to `g_exts`. The per-extension install
+lock cannot cover this: two processes installing DIFFERENT extensions
+hold different locks, both read the old array and one entry vanishes.
+`webext_host`
 (`webext/host.zig`) owns the registry, `storage.local` persistence and
 the **`browser.*` dispatch seam** (`dispatchApi`, keyed on namespace —
 `webRequest` is now one of its arms, added WITHOUT restructuring the

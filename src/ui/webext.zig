@@ -22,6 +22,7 @@ const proto = @import("../web/protocol.zig");
 const manifest = @import("../web/webext/manifest.zig");
 const zip = @import("../web/webext/zip.zig");
 const extinstall = @import("../web/webext/install.zig");
+const extregistry = @import("../web/webext/registry.zig");
 const pathz = @import("../util/pathz.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 
@@ -107,20 +108,6 @@ fn find(id: []const u8) ?*Ext {
     return null;
 }
 
-fn findIndex(id: []const u8) ?usize {
-    for (g_exts.items, 0..) |e, i| {
-        if (std.mem.eql(u8, e.id, id)) return i;
-    }
-    return null;
-}
-
-fn contains(exts: []const Ext, id: []const u8) bool {
-    for (exts) |e| {
-        if (std.mem.eql(u8, e.id, id)) return true;
-    }
-    return false;
-}
-
 /// Data dir (`$XDG_DATA_HOME/sketerm/webext`), owned by the caller.
 fn dataDir(gpa: std.mem.Allocator) InstallError![]u8 {
     if (c.getenv("XDG_DATA_HOME")) |xdg| {
@@ -155,31 +142,16 @@ fn loadRegistry(gpa: std.mem.Allocator) InstallError!std.ArrayList(Ext) {
     }
     const dir = try dataDir(gpa);
     defer gpa.free(dir);
-    const path = std.fmt.allocPrint(gpa, "{s}/registry.json", .{dir}) catch return error.OutOfMemory;
-    defer gpa.free(path);
-    const bytes = readFile(gpa, path) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.ReadFailed => loaded,
-    };
-    defer gpa.free(bytes);
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |err| return switch (err) {
+    var persisted = extregistry.read(gpa, dir) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => loaded,
     };
-    defer parsed.deinit();
-    if (parsed.value != .array) return loaded;
-    for (parsed.value.array.items) |item| {
-        if (item != .object) continue;
-        const o = item.object;
-        const id = strField(o, "id") orelse continue;
-        if (!manifest.idValid(id) or contains(loaded.items, id)) continue;
-        const edir = strField(o, "dir") orelse continue;
-        const enabled = if (o.get("enabled")) |v| (v == .bool and v.bool) else false;
-        const owned = if (o.get("owned")) |v| (v == .bool and v.bool) else false;
+    defer persisted.deinit();
+    for (persisted.items.items) |rec| {
         // Fill name/version from the manifest if it still parses.
         var name: []const u8 = "";
         var version: []const u8 = "";
-        var man = readManifest(gpa, edir) catch |err| switch (err) {
+        var man = readManifest(gpa, rec.dir) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
@@ -188,7 +160,7 @@ fn loadRegistry(gpa: std.mem.Allocator) InstallError!std.ArrayList(Ext) {
             name = m.name;
             version = m.version;
         }
-        var fresh = initExt(gpa, id, edir, name, version, enabled, owned) catch return error.OutOfMemory;
+        var fresh = initExt(gpa, rec.id, rec.dir, name, version, rec.enabled, rec.owned) catch return error.OutOfMemory;
         loaded.append(gpa, fresh) catch {
             freeExtWith(gpa, &fresh);
             return error.OutOfMemory;
@@ -197,56 +169,33 @@ fn loadRegistry(gpa: std.mem.Allocator) InstallError!std.ArrayList(Ext) {
     return loaded;
 }
 
-fn strField(o: std.json.ObjectMap, key: []const u8) ?[]const u8 {
-    const v = o.get(key) orelse return null;
-    return if (v == .string) v.string else null;
-}
-
-const RegistryEdit = union(enum) {
-    replace: struct { index: usize, entry: *const Ext },
-    append: *const Ext,
-    remove: usize,
-};
-
-fn writeRegistryEntry(w: *std.Io.Writer, e: Ext, first: *bool) InstallError!void {
-    if (!first.*) w.writeByte(',') catch return error.OutOfMemory;
-    first.* = false;
-    w.writeAll("{\"id\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(e.id, .{}, w) catch return error.OutOfMemory;
-    w.writeAll(",\"dir\":") catch return error.OutOfMemory;
-    std.json.Stringify.value(e.dir, .{}, w) catch return error.OutOfMemory;
-    w.print(",\"enabled\":{s},\"owned\":{s}}}", .{
-        if (e.enabled) "true" else "false",
-        if (e.owned_files) "true" else "false",
-    }) catch return error.OutOfMemory;
-}
-
-fn save(edit: RegistryEdit) InstallError!void {
+/// Persist ONE change to `registry.json`.
+///
+/// The change is keyed by id and applied to what is on DISK, inside the
+/// registry's cross-process lock: `g_exts` is this process's view and
+/// may predate another sketerm's install, so rewriting the file from it
+/// is exactly how the other install's entry used to vanish.
+fn saveChange(change: extregistry.Change) InstallError!void {
     const gpa = g_gpa orelse return error.WriteFailed;
     const dir = try dataDir(gpa);
     defer gpa.free(dir);
-    pathz.makeDirs(dir, 0o700) catch return error.WriteFailed;
-    const path = std.fmt.allocPrint(gpa, "{s}/registry.json", .{dir}) catch return error.OutOfMemory;
-    defer gpa.free(path);
-    var aw: std.Io.Writer.Allocating = .init(gpa);
-    defer aw.deinit();
-    const w = &aw.writer;
-    w.writeByte('[') catch return error.OutOfMemory;
-    var first = true;
-    for (g_exts.items, 0..) |e, i| {
-        switch (edit) {
-            .replace => |replacement| if (replacement.index == i) {
-                try writeRegistryEntry(w, replacement.entry.*, &first);
-                continue;
-            },
-            .remove => |removed| if (removed == i) continue,
-            else => {},
-        }
-        try writeRegistryEntry(w, e, &first);
-    }
-    if (edit == .append) try writeRegistryEntry(w, edit.append.*, &first);
-    w.writeByte(']') catch return error.OutOfMemory;
-    atomicwrite.writeFile(path, aw.written(), 0o600) catch return error.WriteFailed;
+    extregistry.commit(gpa, dir, change) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.WriteFailed,
+    };
+}
+
+fn saveEntry(e: *const Ext) InstallError!void {
+    return saveChange(.{ .upsert = .{
+        .id = e.id,
+        .dir = e.dir,
+        .enabled = e.enabled,
+        .owned = e.owned_files,
+    } });
+}
+
+fn saveRemoval(id: []const u8) InstallError!void {
+    return saveChange(.{ .remove = id });
 }
 
 // -- publish / helper state ------------------------------------------
@@ -594,7 +543,6 @@ fn updateRegistry(
     owned: bool,
 ) InstallError![]const u8 {
     if (find(id)) |e| {
-        const index = findIndex(id) orelse return error.WriteFailed;
         const new_dir = dupeOwned(gpa, dir) catch return error.OutOfMemory;
         const new_name = dupeOwned(gpa, name) catch {
             freeOwned(gpa, new_dir);
@@ -614,7 +562,7 @@ fn updateRegistry(
         candidate.name = new_name;
         candidate.version = new_version;
         candidate.owned_files = owned;
-        save(.{ .replace = .{ .index = index, .entry = &candidate } }) catch |err| {
+        saveEntry(&candidate) catch |err| {
             freeOwned(gpa, new_dir);
             freeOwned(gpa, new_name);
             freeOwned(gpa, new_version);
@@ -634,7 +582,7 @@ fn updateRegistry(
             freeExtWith(gpa, &fresh);
             return error.OutOfMemory;
         };
-        save(.{ .append = &fresh }) catch |err| {
+        saveEntry(&fresh) catch |err| {
             freeExtWith(gpa, &fresh);
             return err;
         };
@@ -648,10 +596,9 @@ pub fn setEnabled(id: []const u8, on: bool) void {
     if (!manifest.idValid(id)) return;
     const e = find(id) orelse return;
     if (pendingById(id) != null) return;
-    const index = findIndex(id) orelse return;
     var candidate = e.*;
     candidate.enabled = on;
-    save(.{ .replace = .{ .index = index, .entry = &candidate } }) catch return;
+    saveEntry(&candidate) catch return;
     e.enabled = on;
     webface.client().post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (on) 1 else 0 });
     refreshOpenManager();
@@ -663,7 +610,7 @@ pub fn remove(id: []const u8) void {
     const gpa = g_gpa orelse return;
     for (g_exts.items, 0..) |*e, i| {
         if (!std.mem.eql(u8, e.id, id)) continue;
-        save(.{ .remove = i }) catch return;
+        saveRemoval(e.id) catch return;
         webface.client().post(proto.WebextRemove{ .id = e.id });
         // Files under our data dir may be deleted; an in-place unpacked
         // dir is left alone.
