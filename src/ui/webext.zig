@@ -333,6 +333,22 @@ pub fn installUnpacked(gpa: std.mem.Allocator, dir: []const u8) InstallError![]c
     return register(gpa, dir, &man, false);
 }
 
+/// Where an archive install is decided: staged through the helper, or
+/// unpacked and registered locally the way it always was.
+const ArchiveRoute = enum { helper_transaction, local };
+
+/// A REMOTE helper is `.ready` with every `webext` capability zeroed --
+/// extensions are local-browser only, and no package ever crosses the
+/// mux wire -- so readiness alone does not mean there is a helper that
+/// will answer a staged transaction. Asking one anyway refused the
+/// install with "the previous version was restored" while nothing had
+/// been sent anywhere and nothing restored, and left the two install
+/// buttons disagreeing (`installUnpacked` kept working).
+fn archiveRoute(ready: bool, cap_webext: bool, cap_transaction: bool) ArchiveRoute {
+    if (ready and cap_webext and cap_transaction) return .helper_transaction;
+    return .local;
+}
+
 /// Install an `.xpi`/`.zip` through a staged helper-coordinated transaction.
 pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError!void {
     ensureLoaded(gpa);
@@ -354,8 +370,7 @@ pub fn installArchive(gpa: std.mem.Allocator, xpi_path: []const u8) InstallError
     defer if (tx_owned) tx.deinit();
 
     const cl = webface.client();
-    if (cl.state == .ready) {
-        if (!cl.cap_webext_transaction) return error.HelperRefused;
+    if (archiveRoute(cl.state == .ready, cl.cap_webext, cl.cap_webext_transaction) == .helper_transaction) {
         const pending = gpa.create(PendingInstall) catch return error.OutOfMemory;
         var pending_owned = true;
         errdefer if (pending_owned) gpa.destroy(pending);
@@ -1243,4 +1258,14 @@ test "GUI web extension state stays renderable across every allocation failure" 
     for (reload.first..reload.end) |fail_index| {
         _ = try reloadAllocationCase(&env, fail_index);
     }
+}
+
+test "an archive install routes locally unless a helper can stage it" {
+    const t = std.testing;
+    // A remote browser pane: ready, but every webext capability zeroed.
+    try t.expectEqual(ArchiveRoute.local, archiveRoute(true, false, false));
+    // A local helper too old for the transaction keeps the legacy path.
+    try t.expectEqual(ArchiveRoute.local, archiveRoute(true, true, false));
+    try t.expectEqual(ArchiveRoute.local, archiveRoute(false, false, false));
+    try t.expectEqual(ArchiveRoute.helper_transaction, archiveRoute(true, true, true));
 }

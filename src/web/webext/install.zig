@@ -62,6 +62,9 @@ pub const Transaction = struct {
     lock_fd: c_int,
     phase: enum { staged, committed, done } = .staged,
     replaced_existing: bool = false,
+    /// The directory swap, as a field so a test can run the whole
+    /// upgrade on a filesystem that has no RENAME_EXCHANGE.
+    exchange: *const fn ([*:0]const u8, [*:0]const u8) platform.RenameExchangeResult = platform.renameExchange,
 
     /// Put the complete staged tree at its live path without deleting the old tree.
     pub fn commit(self: *Transaction) Error!void {
@@ -74,10 +77,7 @@ pub const Transaction = struct {
         var st: c.struct_stat = undefined;
         if (c.lstat(dest_z, &st) == 0) {
             if ((st.st_mode & c.S_IFMT) != c.S_IFDIR) return error.RenameFailed;
-            switch (platform.renameExchange(stage_z, dest_z)) {
-                .ok => {},
-                else => return error.RenameFailed,
-            }
+            try self.swapTrees(stage_z, dest_z);
             self.replaced_existing = true;
         } else {
             if (std.c._errno().* != c.ENOENT) return error.RenameFailed;
@@ -91,6 +91,35 @@ pub const Transaction = struct {
             self.rollback() catch {};
             return err;
         };
+    }
+
+    /// Exchange the staged and live trees, leaving the old tree at the
+    /// stage path — the state `finish` and `rollback` are written for.
+    ///
+    /// `RENAME_EXCHANGE` does not exist on NFS, CIFS, a pre-4.x
+    /// overlayfs upper, or macOS HFS+ (`renamex_np` answers ENOTSUP), so
+    /// collapsing `.unsupported` into a failure made FRESH installs work
+    /// (that path uses the better-supported `RENAME_NOREPLACE`) while
+    /// every UPGRADE failed permanently. The fallback is a rename aside
+    /// and back through a sibling under the same install lock: not
+    /// atomic, but each step is a rename, so a crash leaves the tree at
+    /// exactly one of three named paths rather than half-written.
+    fn swapTrees(self: *Transaction, stage_z: [*:0]const u8, dest_z: [*:0]const u8) Error!void {
+        switch (self.exchange(stage_z, dest_z)) {
+            .ok => return,
+            .unsupported => {},
+            else => return error.RenameFailed,
+        }
+        var aside_buf: [MAX_PATH]u8 = undefined;
+        const aside_z = std.fmt.bufPrintZ(&aside_buf, "{s}.swap", .{self.stage}) catch
+            return error.PathTooLong;
+        if (c.rename(dest_z, aside_z) != 0) return error.RenameFailed;
+        if (c.rename(stage_z, dest_z) != 0) {
+            // Put the live tree back before giving up.
+            _ = c.rename(aside_z, dest_z);
+            return error.RenameFailed;
+        }
+        if (c.rename(aside_z, stage_z) != 0) return error.RenameFailed;
     }
 
     /// Restore the pre-commit tree and remove only the rejected candidate.
@@ -107,7 +136,7 @@ pub const Transaction = struct {
         var stage_z_buf: [MAX_PATH]u8 = undefined;
         const stage_z = pathz.pathZ(&stage_z_buf, self.stage) catch return error.PathTooLong;
         if (self.replaced_existing) {
-            if (platform.renameExchange(stage_z, dest_z) != .ok) return error.RenameFailed;
+            try self.swapTrees(stage_z, dest_z);
         } else if (c.rename(dest_z, stage_z) != 0) {
             return error.RenameFailed;
         }
@@ -761,6 +790,55 @@ test "rejected committed upgrade rolls back the old tree" {
     const dest = try setupOld(dir.path());
     defer t.allocator.free(dest);
     var tx = try beginV2(dir.path());
+    defer tx.deinit();
+    try tx.commit();
+    try tx.rollback();
+    try expectOld(dest);
+    try t.expectEqual(@as(usize, 0), stageCount(dir.path()));
+    const new_path = try std.fmt.allocPrint(t.allocator, "{s}/new.js", .{dest});
+    defer t.allocator.free(new_path);
+    var new_z_buf: [MAX_PATH]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    try t.expect(c.lstat(try pathz.pathZ(&new_z_buf, new_path), &st) != 0);
+}
+
+/// A filesystem with no RENAME_EXCHANGE (NFS, CIFS, old overlayfs upper,
+/// HFS+): the syscall is refused, never attempted.
+fn testExchangeUnsupported(_: [*:0]const u8, _: [*:0]const u8) platform.RenameExchangeResult {
+    return .unsupported;
+}
+
+test "an upgrade completes on a filesystem without RENAME_EXCHANGE" {
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const dest = try setupOld(dir.path());
+    defer t.allocator.free(dest);
+    var tx = try beginV2(dir.path());
+    tx.exchange = testExchangeUnsupported;
+    defer tx.deinit();
+    try tx.commit();
+    const new_path = try std.fmt.allocPrint(t.allocator, "{s}/new.js", .{dest});
+    defer t.allocator.free(new_path);
+    var buf: [32]u8 = undefined;
+    try t.expectEqualStrings("new-complete", try readTestFile(new_path, &buf));
+    // The old tree waits at the stage path, exactly as after an exchange.
+    try t.expectEqual(@as(usize, 1), stageCount(dir.path()));
+    try tx.finish();
+    try t.expectEqual(@as(usize, 0), stageCount(dir.path()));
+    const old_path = try std.fmt.allocPrint(t.allocator, "{s}/old.js", .{dest});
+    defer t.allocator.free(old_path);
+    var old_z_buf: [MAX_PATH]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    try t.expect(c.lstat(try pathz.pathZ(&old_z_buf, old_path), &st) != 0);
+}
+
+test "a rejected upgrade rolls back without RENAME_EXCHANGE" {
+    var dir = try TestDir.init();
+    defer dir.deinit();
+    const dest = try setupOld(dir.path());
+    defer t.allocator.free(dest);
+    var tx = try beginV2(dir.path());
+    tx.exchange = testExchangeUnsupported;
     defer tx.deinit();
     try tx.commit();
     try tx.rollback();
