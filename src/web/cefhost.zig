@@ -1050,6 +1050,20 @@ pub const Host = struct {
         return null;
     }
 
+    /// The request context a view's browser must be created in.
+    ///
+    /// A NULL context means CEF's GLOBAL one -- no proxy, the shared
+    /// cookie jar -- so a view that asked for a container and whose
+    /// container is gone must REFUSE, never fall back. The container may
+    /// carry the SOCKS egress the page's traffic is supposed to leave
+    /// by, and a silent fall back to direct traffic is exactly the
+    /// privacy failure the create-time check was added to remove. Every
+    /// browser creation for a client view resolves its context here.
+    fn contextForSpawn(self: *Host, v: *const View) error{ContextGone}!?*cef.cef_request_context_t {
+        if (v.context == 0) return null;
+        return self.lookupContext(v.context) orelse error.ContextGone;
+    }
+
     /// Mint a per-tab identity context (its own cookie jar / cache),
     /// optionally routed through a proxy exactly as the spike proved:
     /// `set_preference("proxy", {mode:"fixed_servers", server:<url>})`
@@ -1218,6 +1232,11 @@ pub const Host = struct {
     }
 
     fn spawnBrowserWith(self: *Host, v: *View, initial_url: []const u8, ops: *const BrowserSpawnOps) !void {
+        // Refuse BEFORE the engine is asked: a vanished container must
+        // never resolve to the global context. This covers the revival
+        // of a discarded view, whose container can be destroyed while it
+        // holds no browser at all.
+        _ = try self.contextForSpawn(v);
         const browser = ops.create_browser(ops.ctx, self, v, initial_url) orelse return error.BrowserCreateFailed;
         v.browser = browser;
         v.cef_id = browserInt(browser, "get_identifier");
@@ -1251,7 +1270,7 @@ pub const Host = struct {
             &url,
             &bsettings,
             null,
-            self.lookupContext(v.context),
+            self.contextForSpawn(v) catch return null,
         );
         return browser;
     }
@@ -1409,7 +1428,10 @@ pub const Host = struct {
             // Browser creation used to leave the retained record
             // discarded, while a later frame-buffer failure destroyed it.
             // Keep that distinction while making this owner perform both.
-            if (err == error.BrowserCreateFailed) {
+            // A vanished container joins the first group: the record is
+            // worth keeping (the client still knows the id) and the page
+            // must not come back on the global context.
+            if (err == error.BrowserCreateFailed or err == error.ContextGone) {
                 v.discarded = true;
             } else {
                 self.destroyView(id);
@@ -1662,7 +1684,12 @@ pub const Host = struct {
                 if (get(bh)) |rc| return rc;
             }
         }
-        if (self.lookupContext(v.context)) |rc| {
+        if (v.context != 0) {
+            // Same rule as `contextForSpawn`: the global context is a
+            // DIFFERENT cookie jar and a different cache, so answering a
+            // container view from it would report and delete the wrong
+            // site's data. No context is an honest failure.
+            const rc = self.lookupContext(v.context) orelse return null;
             if (rc.base.base.add_ref) |add| add(&rc.base.base);
             return rc;
         }
@@ -1791,6 +1818,11 @@ pub const Host = struct {
                 defer release(&rc.base.base);
                 if (rc.clear_http_cache) |clear| clear(rc, null);
                 appendDetail(&detail_buf, &detail_len, "cache-whole-context");
+            } else {
+                // A destroyed container has no cache left to reach, and
+                // claiming success for work nothing performed is what
+                // every other arm of this reply refuses to do.
+                appendDetail(&detail_buf, &detail_len, "cache-context-gone");
             }
         }
         if (req.what & proto.sitedata_cookies != 0) {
@@ -3315,9 +3347,12 @@ pub const Host = struct {
             self.popupError(req, "out of memory");
             return;
         };
-        self.spawnPopup(v, url) catch {
+        self.spawnPopup(v, url) catch |err| {
             self.removePopupView(v);
-            self.popupError(req, "popup browser creation failed");
+            self.popupError(req, switch (err) {
+                error.ContextGone => "the page's browser context no longer exists",
+                else => "popup browser creation failed",
+            });
         };
     }
 
@@ -3341,6 +3376,10 @@ pub const Host = struct {
     }
 
     fn spawnPopup(self: *Host, v: *View, url_utf8: []const u8) !void {
+        // FIRST, before any engine call: the owner page's container may
+        // have been destroyed since it opened, and a popup created on
+        // the global context would leave the container's egress.
+        const rc = try self.contextForSpawn(v);
         var winfo = windowlessInfo(v);
         // Popups are short-lived and small. Force software frames so the
         // GTK popover owns one simple mapping, never a dma-buf pool.
@@ -3352,7 +3391,7 @@ pub const Host = struct {
         self.pending = v;
         defer self.pending = null;
         const browser = cef.cef_browser_host_create_browser_sync(
-            &winfo, &client, &url, &settings, null, self.lookupContext(v.context),
+            &winfo, &client, &url, &settings, null, rc,
         );
         if (browser == null) return error.BrowserCreateFailed;
         v.browser = browser;
@@ -6383,6 +6422,44 @@ test "view construction rejects a missing context before ownership transfer" {
     const failure = try proto.decode(proto.EvViewCreateFailed, frame.payload);
     try std.testing.expectEqual(@as(u32, 62), failure.view);
     try std.testing.expectEqual(@as(u32, 99), failure.context);
+}
+
+test "a revival whose container vanished is refused, not put on the global context" {
+    // NULL is the global request context: no proxy, the shared jar. A
+    // view minted in an egress container whose container was deleted
+    // while it was discarded must stay discarded rather than come back
+    // with its traffic leaving the machine directly.
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    defer ViewConstructionTest.closeOutboxFds(&out);
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+
+    const v = try host.registerView(ViewConstructionTest.req(91, 7));
+    host.discardView(v.id);
+    var injected: ViewConstructionTest = .{};
+    var spawn_ops = injected.ops();
+    try std.testing.expect(host.findWakeWith(91, &spawn_ops) == null);
+    try std.testing.expectEqual(@as(usize, 0), injected.browser_calls);
+    try std.testing.expectEqual(@as(usize, 1), host.viewCount());
+    try std.testing.expect(host.find(91) == v);
+    try std.testing.expect(v.discarded);
+}
+
+test "a popup whose owner's container vanished is refused before the engine call" {
+    // The owner page keeps working after its container is destroyed, so
+    // the popup it opens is the one path that could still hand a
+    // container's page to the global context.
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    defer ViewConstructionTest.closeOutboxFds(&out);
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+
+    const v = try host.registerView(ViewConstructionTest.req(proto.WEBEXT_POPUP_VIEW_BASE + 1, 7));
+    v.webext_popup = true;
+    try std.testing.expectError(error.ContextGone, host.spawnPopup(v, "about:blank"));
+    try std.testing.expect(v.browser == null);
 }
 
 // ---------------------------------------------------------------------
