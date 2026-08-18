@@ -2477,13 +2477,19 @@ pub const App = struct {
 
         // Fast path: whole window, no zoom, no marks, within the bound.
         if (annot.len == 0 and region == null and zoom == 1 and (max_dim == 0 or longest <= max_dim)) {
-            const bytes = png.encodeShm(a, pixels, uw, uh, uw * 4, format) catch
-                return Error.OutOfMemory;
+            const bytes = png.encodeShm(a, pixels, uw, uh, uw * 4, format) catch |e| switch (e) {
+                // The window's buffer disagrees with its declared
+                // geometry: no presentable image, same as empty pixels.
+                error.BadGeometry => return Error.NoSuchWindow,
+                else => return Error.OutOfMemory,
+            };
             return .{ .png = bytes, .img_w = uw, .img_h = uh, .scale = 1.0, .frame = frame };
         }
 
-        var rgba = png.shmToRgba(a, pixels, uw, uh, uw * 4, format) catch
-            return Error.OutOfMemory;
+        var rgba = png.shmToRgba(a, pixels, uw, uh, uw * 4, format) catch |e| switch (e) {
+            error.BadGeometry => return Error.NoSuchWindow,
+            else => return Error.OutOfMemory,
+        };
         var rw: u32 = uw;
         var rh: u32 = uh;
         defer a.free(rgba);

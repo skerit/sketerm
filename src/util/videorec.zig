@@ -58,7 +58,12 @@ pub const Rec = struct {
         fh &= ~@as(u32, 1);
         if (fw < 2 or fh < 2) return;
 
-        var rgba = png.shmToRgba(self.allocator, pixels, w, h, w * 4, format) catch return Error.OutOfMemory;
+        var rgba = png.shmToRgba(self.allocator, pixels, w, h, w * 4, format) catch |e| switch (e) {
+            // A frame whose buffer disagrees with its geometry is
+            // skipped like a degenerate-size frame, not a fatal error.
+            error.BadGeometry => return,
+            else => return Error.OutOfMemory,
+        };
         defer self.allocator.free(rgba);
         if (fw != w or fh != h) {
             const small = png.downscaleRgba(self.allocator, rgba, w, h, fw, fh) catch return Error.OutOfMemory;

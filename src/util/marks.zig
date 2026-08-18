@@ -133,7 +133,10 @@ fn drawOne(rgba: []u8, w: u32, h: u32, m: Mark) void {
 /// Draw every mark onto a tightly-packed RGBA buffer. Marks partially
 /// or fully outside the buffer clip safely.
 pub fn draw(rgba: []u8, w: u32, h: u32, marks: []const Mark) void {
-    std.debug.assert(rgba.len >= @as(usize, w) * h * 4);
+    // Explicit branch, not an assert: the buffer's geometry originates
+    // in another process and asserts compile away in ReleaseFast. A
+    // short buffer skips the annotations rather than writing past it.
+    if (rgba.len < @as(usize, w) * h * 4) return;
     for (marks) |m| drawOne(rgba, w, h, m);
 }
 
@@ -217,4 +220,10 @@ test "label digits render as white-on-black" {
     }
     try t.expect(saw_white);
     try t.expect(saw_black);
+}
+
+test "a buffer shorter than the declared geometry draws nothing" {
+    var px = [_]u8{7} ** 12; // one pixel short of 2x2
+    draw(px[0..], 2, 2, &.{.{ .x = 0, .y = 0, .kind = .click }});
+    for (px) |b| try t.expectEqual(@as(u8, 7), b);
 }

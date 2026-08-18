@@ -43,8 +43,13 @@ pub const Rec = struct {
             self.dropped += 1;
             return;
         }
-        var rgba = png.shmToRgba(self.allocator, pixels, w, h, w * 4, format) catch
-            return Error.OutOfMemory;
+        var rgba = png.shmToRgba(self.allocator, pixels, w, h, w * 4, format) catch |e| switch (e) {
+            error.BadGeometry => {
+                self.dropped += 1;
+                return;
+            },
+            else => return Error.OutOfMemory,
+        };
         var fw = w;
         var fh = h;
         const longest = @max(w, h);

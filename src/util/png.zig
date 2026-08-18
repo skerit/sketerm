@@ -5,7 +5,13 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 
-pub const Error = error{ EncodeFailed, OutOfMemory };
+// BadGeometry: declared dimensions disagree with the buffer. These
+// buffers arrive from other processes (Wayland app frames, the CEF
+// helper), and this tree builds ReleaseFast only, where
+// `std.debug.assert` compiles away -- so the guards are explicit
+// branches that fail the one operation instead of reading out of
+// bounds.
+pub const Error = error{ EncodeFailed, BadGeometry, OutOfMemory };
 
 const Sink = struct {
     allocator: std.mem.Allocator,
@@ -24,7 +30,7 @@ const Sink = struct {
 
 /// Encode tightly-packed RGBA pixels to PNG. Caller owns the result.
 pub fn encodeRgba(allocator: std.mem.Allocator, rgba: []const u8, w: u32, h: u32) Error![]u8 {
-    std.debug.assert(rgba.len >= @as(usize, w) * h * 4);
+    if (rgba.len < @as(usize, w) * h * 4) return Error.BadGeometry;
     var sink = Sink{ .allocator = allocator };
     errdefer sink.buf.deinit(allocator);
     const ok = c.stbi_write_png_to_func(
@@ -61,8 +67,8 @@ pub fn shmToRgba(
     stride: u32,
     format: u32,
 ) Error![]u8 {
-    std.debug.assert(stride >= w * 4);
-    std.debug.assert(pixels.len >= @as(usize, stride) * h);
+    if (stride < w * 4) return Error.BadGeometry;
+    if (pixels.len < @as(usize, stride) * h) return Error.BadGeometry;
     const opaque_alpha = format == @intFromEnum(ShmFormat.xrgb8888);
     const out = try allocator.alloc(u8, @as(usize, w) * h * 4);
     errdefer allocator.free(out);
@@ -103,8 +109,8 @@ pub fn downscaleRgba(
     dst_w: u32,
     dst_h: u32,
 ) Error![]u8 {
-    std.debug.assert(dst_w > 0 and dst_h > 0 and dst_w <= w and dst_h <= h);
-    std.debug.assert(rgba.len >= @as(usize, w) * h * 4);
+    if (dst_w == 0 or dst_h == 0 or dst_w > w or dst_h > h) return Error.BadGeometry;
+    if (rgba.len < @as(usize, w) * h * 4) return Error.BadGeometry;
     const out = try allocator.alloc(u8, @as(usize, dst_w) * dst_h * 4);
     errdefer allocator.free(out);
     var dy: u32 = 0;
@@ -150,8 +156,8 @@ pub fn upscaleRgba(
     h: u32,
     zoom: u32,
 ) Error![]u8 {
-    std.debug.assert(zoom >= 1);
-    std.debug.assert(rgba.len >= @as(usize, w) * h * 4);
+    if (zoom < 1) return Error.BadGeometry;
+    if (rgba.len < @as(usize, w) * h * 4) return Error.BadGeometry;
     const dw: usize = @as(usize, w) * zoom;
     const dh: usize = @as(usize, h) * zoom;
     const out = try allocator.alloc(u8, dw * dh * 4);
@@ -314,4 +320,21 @@ test "upscaleRgba blocks pixels without smoothing" {
             try std.testing.expectEqual(@as(u8, 255), big[o + 1]);
         }
     }
+}
+
+test "geometry that disagrees with the buffer is refused, not read past" {
+    const allocator = std.testing.allocator;
+    var px = [_]u8{0} ** 16; // 2x2 tight RGBA
+
+    // Buffer one pixel short of the declared 2x2.
+    try std.testing.expectError(Error.BadGeometry, encodeRgba(allocator, px[0..12], 2, 2));
+    try std.testing.expectError(Error.BadGeometry, shmToRgba(allocator, px[0..12], 2, 2, 8, @intFromEnum(ShmFormat.xrgb8888)));
+    // Stride below w*4.
+    try std.testing.expectError(Error.BadGeometry, shmToRgba(allocator, &px, 2, 2, 7, @intFromEnum(ShmFormat.xrgb8888)));
+    // Downscale target exceeding the source, and a zero target.
+    try std.testing.expectError(Error.BadGeometry, downscaleRgba(allocator, &px, 2, 2, 3, 1));
+    try std.testing.expectError(Error.BadGeometry, downscaleRgba(allocator, &px, 2, 2, 0, 1));
+    // Upscale with a short buffer and with zoom 0.
+    try std.testing.expectError(Error.BadGeometry, upscaleRgba(allocator, px[0..12], 2, 2, 2));
+    try std.testing.expectError(Error.BadGeometry, upscaleRgba(allocator, &px, 2, 2, 0));
 }
