@@ -670,7 +670,10 @@ const Forwarder = struct {
             switch (channel_pump.wait(&fds, if (self.cancel_fd >= 0) cancel_index else null, null)) {
                 .ready => {},
                 .cancelled => return true,
-                .timeout => unreachable,
+                // No deadline is passed, so poll(-1) cannot report one today.
+                // Re-polling is the correct handling if a deadline is ever
+                // added here; `unreachable` would be UB in ReleaseFast.
+                .timeout => continue,
                 .failed => return false,
             }
 
