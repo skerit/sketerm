@@ -751,6 +751,11 @@ fn semanticResult(comptime T: type) bool {
 // ---------------------------------------------------------------------
 
 const ProxyPref = struct {
+    /// The request context this preference was set on. The entry dies
+    /// with that context; an unkeyed entry could not be pruned even in
+    /// principle, so a helper churning ephemeral proxied containers
+    /// grew its retention list forever.
+    context: u32,
     dict: *cef.cef_dictionary_value_t,
     value: *cef.cef_value_t,
 
@@ -813,7 +818,10 @@ pub const Host = struct {
     /// appears here.
     contexts: std.ArrayList(Ctx) = .empty,
     /// CEF's preference manager can keep the supplied value graph beyond
-    /// `set_preference`; retain it for the helper lifetime.
+    /// `set_preference` (nothing in `cef_preference_capi.h` promises a
+    /// copy), so the graph is retained. It is keyed by context id and
+    /// released in `contextDestroy` -- the retention lasts as long as
+    /// the context that could still be reading it, not the process.
     proxy_prefs: std.ArrayList(ProxyPref) = .empty,
 
     /// WebExtensions host: the loaded-extension registry, storage and
@@ -1092,10 +1100,11 @@ pub const Host = struct {
 
         // A proxied context is all-or-nothing. Registering an rc whose
         // preference was refused would make its views use direct traffic.
-        const pref: ?ProxyPref = if (req.proxy.len != 0) applyProxy(rc, req.proxy) orelse {
+        var pref: ?ProxyPref = if (req.proxy.len != 0) applyProxy(rc, req.proxy) orelse {
             release(&rc.base.base);
             return;
         } else null;
+        if (pref) |*p| p.context = req.id;
         if (pref) |p| self.proxy_prefs.append(self.gpa, p) catch {
             p.releaseAll();
             release(&rc.base.base);
@@ -1125,7 +1134,18 @@ pub const Host = struct {
             if (ctx.id != id) continue;
             release(&ctx.rc.base.base);
             _ = self.contexts.swapRemove(i);
+            self.releaseProxyPrefs(id);
             return;
+        }
+    }
+
+    /// Drop the retained proxy value graph of a context that is gone.
+    fn releaseProxyPrefs(self: *Host, id: u32) void {
+        var i = self.proxy_prefs.items.len;
+        while (i > 0) {
+            i -= 1;
+            if (self.proxy_prefs.items[i].context != id) continue;
+            self.proxy_prefs.swapRemove(i).releaseAll();
         }
     }
 
@@ -6517,6 +6537,54 @@ test "a revival whose container vanished is refused, not put on the global conte
     try std.testing.expect(v.discarded);
 }
 
+test "a destroyed context releases the proxy value graph it retained" {
+    // The retention entry used to carry no context id, so it could not
+    // be pruned even in principle: a helper churning ephemeral proxied
+    // egress containers grew `proxy_prefs` for its whole lifetime.
+    const Fake = struct {
+        var released: usize = 0;
+        fn rel(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+            released += 1;
+            return 1;
+        }
+    };
+    Fake.released = 0;
+
+    var rc = std.mem.zeroes(cef.cef_request_context_t);
+    rc.base.base.release = Fake.rel;
+    var dict = std.mem.zeroes(cef.cef_dictionary_value_t);
+    dict.base.release = Fake.rel;
+    var value = std.mem.zeroes(cef.cef_value_t);
+    value.base.release = Fake.rel;
+    var other_rc = std.mem.zeroes(cef.cef_request_context_t);
+    other_rc.base.base.release = Fake.rel;
+    var other_dict = std.mem.zeroes(cef.cef_dictionary_value_t);
+    other_dict.base.release = Fake.rel;
+    var other_value = std.mem.zeroes(cef.cef_value_t);
+    other_value.base.release = Fake.rel;
+
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+    try host.contexts.append(host.gpa, .{ .id = 5, .rc = &rc, .ephemeral = true });
+    try host.contexts.append(host.gpa, .{ .id = 6, .rc = &other_rc, .ephemeral = true });
+    try host.proxy_prefs.append(host.gpa, .{ .context = 5, .dict = &dict, .value = &value });
+    try host.proxy_prefs.append(host.gpa, .{ .context = 6, .dict = &other_dict, .value = &other_value });
+
+    host.contextDestroy(5);
+
+    // The context reference plus both halves of its value graph.
+    try std.testing.expectEqual(@as(usize, 3), Fake.released);
+    try std.testing.expectEqual(@as(usize, 1), host.proxy_prefs.items.len);
+    try std.testing.expectEqual(@as(u32, 6), host.proxy_prefs.items[0].context);
+
+    // A surviving container keeps its own graph until it is destroyed.
+    host.contextDestroy(6);
+    try std.testing.expectEqual(@as(usize, 6), Fake.released);
+    try std.testing.expectEqual(@as(usize, 0), host.proxy_prefs.items.len);
+}
+
 test "a popup whose owner's container vanished is refused before the engine call" {
     // The owner page keeps working after its container is destroyed, so
     // the popup it opens is the one path that could still hand a
@@ -8646,7 +8714,8 @@ fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) ?ProxyPref 
     if ((base.set_preference orelse return null)(base, &pref_key, val, &err) == 0) return null;
     keep_dict = true;
     keep_value = true;
-    return .{ .dict = dict, .value = val };
+    // `context` is stamped by the caller, which owns the registration.
+    return .{ .context = 0, .dict = dict, .value = val };
 }
 
 /// Borrowed UTF-8 view of a CEF string; `free` releases it.
