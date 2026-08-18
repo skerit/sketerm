@@ -61,8 +61,16 @@ const FieldClass = enum {
 /// hand-enumerate a subset of a 130-field struct, and twice now
 /// persistent app-driven state was added to `Screen` and silently
 /// dropped on every attach because nothing tied those three lists to
-/// the struct. Adding a field without classifying it here fails the
-/// build; that is the whole point.
+/// the struct.
+///
+/// What the comptime gate below actually proves is NAME membership in
+/// both directions: a new `Screen` field with no entry here fails the
+/// build, and an entry naming a field that no longer exists fails too.
+/// It does NOT prove that a `.carried` field is serialized — nothing
+/// checks that `serializeVersion`/`restoreStaged` touch it, so a field
+/// classified `.carried` and then forgotten in those two functions
+/// still compiles and still drops on every attach. The gate forces the
+/// AUTHOR to make the call; the round trip is on the tests.
 const field_policy = [_]struct { name: []const u8, class: FieldClass }{
     // Grid geometry and contents.
     .{ .name = "cols", .class = .carried },
