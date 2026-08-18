@@ -1378,6 +1378,12 @@ pub fn main() !u8 {
         if (rc != 0) return rc;
     }
 
+    // Curly underline: a real wave in BOTH shader pairs.
+    {
+        const rc = try curlyUnderlineStage(allocator);
+        if (rc != 0) return rc;
+    }
+
     std.debug.print("smoke-cell: PASS\n", .{});
     return 0;
 }
@@ -1679,5 +1685,194 @@ fn blendModeStage(allocator: std.mem.Allocator) !u8 {
     }
 
     if (failures != 0) return 73;
+    return 0;
+}
+
+// ---- curly underline ----------------------------------------------
+
+/// Undercurl parity between the two shader pairs. Row 0 is ASCII, so
+/// CellPass draws it in-shader; row 2 is Hebrew, which routes the row
+/// to the GridPass overlay. Both carry `SGR 4:3` with an explicit red
+/// decoration colour (SGR 58), so the wave can be isolated from the
+/// white glyph pixels by colour alone.
+///
+/// The assertions are that each row's strip carries a wave at all (the
+/// per-column centre of mass has to move, which a straight line cannot
+/// do) and that the two rows' waves agree column by column.
+fn curlyUnderlineStage(allocator: std.mem.Allocator) !u8 {
+    const BW: c_int = 256;
+    const BH: c_int = 64;
+
+    var fbo: c_uint = 0;
+    var rbo: c_uint = 0;
+    c.glGenFramebuffers(1, &fbo);
+    c.glGenRenderbuffers(1, &rbo);
+    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
+    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, BW, BH);
+    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
+    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
+    defer {
+        c.glBindFramebuffer(c.GL_FRAMEBUFFER, 0);
+        c.glDeleteFramebuffers(1, &fbo);
+        c.glDeleteRenderbuffers(1, &rbo);
+    }
+    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
+        std.debug.print("smoke-cell: curly FAIL - framebuffer incomplete\n", .{});
+        return 80;
+    }
+
+    var atlas: ?*Atlas = null;
+    for (FONT_CANDIDATES) |path| {
+        if (Atlas.init(allocator, path, FONT_SIZE)) |a| {
+            atlas = a;
+            break;
+        } else |_| continue;
+    }
+    if (atlas == null) {
+        std.debug.print("smoke-cell: curly FAIL - no font\n", .{});
+        return 81;
+    }
+    defer atlas.?.deinit();
+    atlas.?.realize();
+
+    var pool = try StylePool.init(allocator);
+    defer pool.deinit();
+    const cols: usize = 12;
+    const screen = try Screen.init(allocator, &pool, @intCast(cols), 3);
+    defer screen.deinit();
+
+    var parser = @import("parser/vt.zig").Parser.init(allocator);
+    defer parser.deinit();
+    const Ctx = struct { screen: *Screen, allocator: std.mem.Allocator };
+    const Emit = struct {
+        fn cb(user: ?*anyopaque, ev: @import("parser/event.zig").Event) void {
+            const ec: *Ctx = @ptrCast(@alignCast(user.?));
+            var mut = ev;
+            ec.screen.apply(ev);
+            mut.deinit(ec.allocator);
+        }
+    };
+    var ec = Ctx{ .screen = screen, .allocator = allocator };
+    const deco = "\x1b[4:3m\x1b[58;2;255;0;0m";
+    parser.advance(
+        deco ++ "xxxxxxxxxxxx" ++
+            "\x1b[3;1H" ++ deco ++ "\u{05D0}\u{05D0}\u{05D0}\u{05D0}\u{05D0}\u{05D0}" ++
+            "\u{05D0}\u{05D0}\u{05D0}\u{05D0}\u{05D0}\u{05D0}\x1b[0m",
+        Emit.cb,
+        @ptrCast(&ec),
+    );
+
+    var cell_pass = CellPass.init(allocator);
+    defer cell_pass.deinit();
+    try cell_pass.realize();
+    var grid_pass = GridPass.init(allocator);
+    defer grid_pass.deinit();
+    try grid_pass.realize();
+    grid_pass.canvas_w = @floatFromInt(BW);
+    grid_pass.canvas_h = @floatFromInt(BH);
+
+    c.glViewport(0, 0, BW, BH);
+    c.glClearColor(0.0, 0.0, 0.0, 1.0);
+    c.glClear(c.GL_COLOR_BUFFER_BIT);
+    cell_pass.markAllDirty();
+    try cell_pass.rebuildAndUpload(screen, &pool, atlas.?);
+    cell_pass.draw(atlas.?, BW, BH);
+    grid_pass.vbuf_valid = false;
+    try grid_pass.buildVertices(screen, &pool, atlas.?, false, true, &.{});
+    grid_pass.draw(atlas.?, BW, BH);
+    c.glFinish();
+
+    const wu: usize = @intCast(BW);
+    const hu: usize = @intCast(BH);
+    const fb = try allocator.alloc(u8, wu * hu * 4);
+    defer allocator.free(fb);
+    c.glReadPixels(0, 0, BW, BH, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+
+    const ch: usize = atlas.?.cell_h;
+    const cw: usize = atlas.?.cell_w;
+    const pad: usize = @intFromFloat(grid_pass.pad);
+    const strip_h: usize = @intFromFloat(@import("render/style.zig").curlyStripHeight(@floatFromInt(ch)));
+
+    // Per-column centre of mass of the red decoration pixels inside a
+    // row's strip, in top-down pixels relative to the strip's top.
+    // NaN marks a column the wave does not reach.
+    const profile = struct {
+        fn go(buf: []const u8, w: usize, h: usize, top: usize, sh: usize, x0: usize, n: usize, out: []f32) void {
+            for (0..n) |i| {
+                var sum: f32 = 0;
+                var weight: f32 = 0;
+                for (0..sh) |dy| {
+                    const y_td = top + dy;
+                    if (y_td >= h) continue;
+                    const y = h - 1 - y_td; // glReadPixels is bottom-up
+                    const o = (y * w + x0 + i) * 4;
+                    const r: f32 = @floatFromInt(buf[o + 0]);
+                    const g: f32 = @floatFromInt(buf[o + 1]);
+                    const b: f32 = @floatFromInt(buf[o + 2]);
+                    // Decoration red; glyphs are white, bg is black.
+                    if (r < 40.0 or g > r * 0.5 or b > r * 0.5) continue;
+                    sum += r * @as(f32, @floatFromInt(dy));
+                    weight += r;
+                }
+                out[i] = if (weight > 0) sum / weight else std.math.nan(f32);
+            }
+        }
+    }.go;
+
+    const span = cols * cw;
+    const cell_profile = try allocator.alloc(f32, span);
+    defer allocator.free(cell_profile);
+    const grid_profile = try allocator.alloc(f32, span);
+    defer allocator.free(grid_profile);
+    profile(fb, wu, hu, pad + ch - strip_h, strip_h, pad, span, cell_profile);
+    profile(fb, wu, hu, pad + 3 * ch - strip_h, strip_h, pad, span, grid_profile);
+
+    var failures: u8 = 0;
+    const rows = [2]struct { name: []const u8, prof: []const f32 }{
+        .{ .name = "CellPass", .prof = cell_profile },
+        .{ .name = "GridPass", .prof = grid_profile },
+    };
+    for (rows) |row| {
+        var lo: f32 = std.math.floatMax(f32);
+        var hi: f32 = -std.math.floatMax(f32);
+        var lit: usize = 0;
+        for (row.prof) |v| {
+            if (std.math.isNan(v)) continue;
+            lit += 1;
+            lo = @min(lo, v);
+            hi = @max(hi, v);
+        }
+        if (lit * 4 < span * 3) {
+            std.debug.print("smoke-cell: curly FAIL - {s} drew the wave in only {d}/{d} columns\n", .{ row.name, lit, span });
+            failures += 1;
+            continue;
+        }
+        // A straight line (the old GridPass behaviour) has a constant
+        // centre of mass; the wave's amplitude is 0.45 of the strip.
+        if (hi - lo < @as(f32, @floatFromInt(strip_h)) * 0.4) {
+            std.debug.print("smoke-cell: curly FAIL - {s} strip is flat (peak-to-peak {d:.2}px of {d}px strip)\n", .{ row.name, hi - lo, strip_h });
+            failures += 1;
+        }
+    }
+
+    // Column-by-column agreement: both passes must draw the same wave
+    // at the same phase, or a row that straddles them shows a seam.
+    var worst: f32 = 0;
+    var compared: usize = 0;
+    for (cell_profile, grid_profile) |a, b| {
+        if (std.math.isNan(a) or std.math.isNan(b)) continue;
+        compared += 1;
+        worst = @max(worst, @abs(a - b));
+    }
+    if (compared * 4 < span * 3) {
+        std.debug.print("smoke-cell: curly FAIL - only {d}/{d} columns comparable\n", .{ compared, span });
+        failures += 1;
+    } else if (worst > 1.0) {
+        std.debug.print("smoke-cell: curly FAIL - passes disagree by {d:.2}px at worst\n", .{worst});
+        failures += 1;
+    }
+
+    if (failures != 0) return 82;
+    std.debug.print("smoke-cell: curly underline matches across CellPass/GridPass (worst {d:.2}px)\n", .{worst});
     return 0;
 }

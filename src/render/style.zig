@@ -65,6 +65,59 @@ pub fn colorToRGBA(
     };
 }
 
+/// Curly-underline geometry, in one place because both shader pairs
+/// draw it: CellPass in-shader per cell instance, GridPass as an
+/// overlay strip quad. The strip is `max(CURLY_STRIP_MIN_PX, cell_h /
+/// CURLY_STRIP_DIV)` tall and sits flush with the cell's bottom edge.
+pub const CURLY_STRIP_MIN_PX: f32 = 3.0;
+pub const CURLY_STRIP_DIV: f32 = 6.0;
+/// Wave amplitude as a fraction of the strip height (0.5 = full).
+pub const CURLY_AMPLITUDE: f32 = 0.45;
+/// Stroke thickness of the wave, in pixels.
+pub const CURLY_THICKNESS_PX: f32 = 1.5;
+
+/// Height of the curly-underline strip for a cell of `cell_h` pixels.
+pub fn curlyStripHeight(cell_h: f32) f32 {
+    return @max(CURLY_STRIP_MIN_PX, cell_h / CURLY_STRIP_DIV);
+}
+
+/// GLSL counterpart of the curly constants above, prepended to both
+/// the CellPass and GridPass shader sources. `sk_curlyCoverage`
+/// returns un-corrected edge coverage in [0,1]; 0 means the fragment
+/// is off the wave and the caller should discard. The caller applies
+/// `sk_correctCoverage` itself, since only it knows its bg.
+///
+/// The wave phase restarts at every cell (local x), so both passes
+/// share the same per-cell phase and a row rendered half by CellPass
+/// and half by GridPass matches.
+pub const DECO_GLSL = std.fmt.comptimePrint(
+    \\
+    \\const float SK_CURLY_STRIP_MIN_PX = {d:.4};
+    \\const float SK_CURLY_STRIP_DIV = {d:.4};
+    \\const float SK_CURLY_AMPLITUDE = {d:.4};
+    \\const float SK_CURLY_THICKNESS_PX = {d:.4};
+    \\const float SK_WAVE_TWO_PI = 6.2831853;
+    \\
+    \\float sk_curlyStripH(float cell_h) {{
+    \\    return max(SK_CURLY_STRIP_MIN_PX, cell_h / SK_CURLY_STRIP_DIV);
+    \\}}
+    \\
+    \\float sk_curlyCoverage(vec2 local, float cell_w_px) {{
+    \\    float x = local.x * cell_w_px;
+    \\    float period = max(8.0, cell_w_px / SK_CURLY_THICKNESS_PX);
+    \\    float yc = 0.5 + SK_CURLY_AMPLITUDE * sin(x * SK_WAVE_TWO_PI / period);
+    \\    float dist = abs(local.y - yc);
+    \\    // Strip height in px, approximated from the cell WIDTH: the
+    \\    // fragment stage has no cell height, and for a roughly 1:2
+    \\    // monospace cell the two are close enough for a 1.5px stroke.
+    \\    float strip_px = max(SK_CURLY_STRIP_MIN_PX, cell_w_px / SK_CURLY_STRIP_DIV);
+    \\    float thickness = SK_CURLY_THICKNESS_PX / strip_px;
+    \\    if (dist > thickness) return 0.0;
+    \\    return clamp((thickness - dist) / (thickness * 0.5), 0.0, 1.0);
+    \\}}
+    \\
+, .{ CURLY_STRIP_MIN_PX, CURLY_STRIP_DIV, CURLY_AMPLITUDE, CURLY_THICKNESS_PX });
+
 /// WCAG relative luminance of a normalized sRGB color.
 fn relativeLuminance(rgba: [4]f32) f32 {
     var lin: [3]f32 = undefined;

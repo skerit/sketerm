@@ -46,6 +46,10 @@ pub const VERT_SRC =
     \\// Effective bg behind this quad — only the linear-corrected
     \\// coverage remap reads it.
     \\in vec3 a_bg;
+    \\// Curly-underline strip: (local x, local y, cell width px). A
+    \\// non-zero z marks the quad as a curly strip; the fragment stage
+    \\// then draws the shared wave inside it instead of a solid fill.
+    \\in vec3 a_curly;
     \\
     \\uniform vec2 u_screen_px;
     \\uniform float u_dim_fg;
@@ -58,6 +62,7 @@ pub const VERT_SRC =
     \\out float v_bold;
     \\out float v_colored;
     \\out float v_dim_k;
+    \\out vec3 v_curly;
     \\
     \\void main() {
     \\    vec2 pos = a_pos;
@@ -77,12 +82,15 @@ pub const VERT_SRC =
     \\    v_bold = a_bold;
     \\    v_colored = a_colored;
     \\    v_dim_k = k;
+    \\    v_curly = a_curly;
     \\}
 ;
 
 // ATLAS_TEXEL = 1/PAGE_SIZE — per-texel UV step for the faux-bold
 // left-neighbor sample (see cell_pass.zig comment).
-pub const FRAG_SRC = blend.GLSL_HELPERS ++ std.fmt.comptimePrint(
+// `sk_curlyCoverage` comes from `style.DECO_GLSL`, shared with
+// CellPass so an overlay row's undercurl matches its neighbours'.
+pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.comptimePrint(
     \\
     \\const float ATLAS_TEXEL = 1.0 / {d}.0;
     \\
@@ -93,6 +101,7 @@ pub const FRAG_SRC = blend.GLSL_HELPERS ++ std.fmt.comptimePrint(
     \\in float v_bold;
     \\in float v_colored;
     \\in float v_dim_k;
+    \\in vec3 v_curly;
     \\
     \\uniform sampler2DArray u_atlas;
     \\
@@ -114,6 +123,12 @@ pub const FRAG_SRC = blend.GLSL_HELPERS ++ std.fmt.comptimePrint(
     \\            float cov = sk_correctCoverage(t.a, v_color.rgb, v_bg);
     \\            o_frag = sk_out(vec4(v_color.rgb, cov * v_color.a));
     \\        }}
+    \\    }} else if (v_curly.z > 0.0) {{
+    \\        // Curly underline strip: same wave CellPass draws, and the
+    \\        // same coverage remap since its edge is antialiased.
+    \\        float aa = sk_curlyCoverage(v_curly.xy, v_curly.z);
+    \\        if (aa <= 0.0) discard;
+    \\        o_frag = sk_out(vec4(v_color.rgb, v_color.a * sk_correctCoverage(aa, v_color.rgb, v_bg)));
     \\    }} else {{
     \\        o_frag = sk_out(v_color);
     \\    }}
@@ -137,6 +152,10 @@ const Vertex = extern struct {
     /// mode, and left at the pane clear colour for overlays that are
     /// not cell glyphs (cursor, selection, focus border, …).
     bg: [3]f32 = .{ 0, 0, 0 },
+    /// Curly-underline strip: (local x, local y, cell width px).
+    /// z == 0 (every other quad) means "not a curly strip"; the
+    /// fragment stage then fills solid as before.
+    curly: [3]f32 = .{ 0, 0, 0 },
 };
 
 /// Snapshot of every input that affects the overlay vertex buffer
@@ -428,6 +447,7 @@ pub const GridPass = struct {
             .{ .name = "a_baseline_y", .off = @offsetOf(Vertex, "baseline_y"), .count = 1 },
             .{ .name = "a_colored", .off = @offsetOf(Vertex, "colored"), .count = 1 },
             .{ .name = "a_bg", .off = @offsetOf(Vertex, "bg"), .count = 3 },
+            .{ .name = "a_curly", .off = @offsetOf(Vertex, "curly"), .count = 3 },
         };
         for (fields) |f| {
             const loc = c.glGetAttribLocation(self.program, f.name);
@@ -1200,9 +1220,10 @@ pub const GridPass = struct {
     /// SGR line decorations (underline / double / curly / strike /
     /// overline) for one overlay cell at its visual column. CellPass
     /// draws these in-shader for plain rows; overlay rows get flat
-    /// quads here — curly degrades to a thicker single line since
-    /// this pass has no wave fragment path. Honours SGR 58
-    /// underline_color, falling back to the resolved fg.
+    /// quads here, except curly, which gets a strip quad evaluated by
+    /// the shared `sk_curlyCoverage` so both passes draw the same
+    /// wave. Honours SGR 58 underline_color, falling back to the
+    /// resolved fg.
     fn emitCellDeco(
         self: *GridPass,
         pool: *const StylePool,
@@ -1239,8 +1260,14 @@ pub const GridPass = struct {
             try self.pushQuadDim(.{ x, y + ch - thin - 1.0 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
             try self.pushQuadDim(.{ x, y + ch - 3.0 * thin - 1.0 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
         } else if (a.curly_underline) {
-            const thick = thin * 2.0;
-            try self.pushQuadDim(.{ x, y + ch - thick - 1.0 }, .{ w, thick }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
+            const strip_h = style_util.curlyStripHeight(ch);
+            try self.pushCurlyQuad(
+                .{ x, y + ch - strip_h },
+                .{ w, strip_h },
+                color,
+                self.effectiveBg(style),
+                w,
+            );
         } else if (a.underline) {
             try self.pushQuadDim(.{ x, y + ch - thin - 1.0 }, .{ w, thin }, .{ 0, 0 }, .{ 0, 0 }, color, 0.0, 1.0);
         }
@@ -1432,6 +1459,31 @@ pub const GridPass = struct {
             .{ .pos = .{ px0, py1 }, .uv = .{ uv0[0], uv1[1], 0 }, .color = color, .is_glyph = is_glyph, .dim = dim },
         };
         try self.vbuf.appendSlice(self.allocator, &verts);
+    }
+
+    /// Curly-underline strip. Same quad as `pushQuadDim` plus the
+    /// per-corner strip-local coordinates the fragment stage needs to
+    /// evaluate the shared wave; `cell_w_px` sets its period and must
+    /// be the full strip width (two cells for a wide cell), the same
+    /// value CellPass's instance carries as `cell_size.x`.
+    fn pushCurlyQuad(
+        self: *GridPass,
+        origin: [2]f32,
+        size: [2]f32,
+        color: [4]f32,
+        bg: [4]f32,
+        cell_w_px: f32,
+    ) !void {
+        const px0 = origin[0];
+        const py0 = origin[1];
+        const px1 = origin[0] + size[0];
+        const py1 = origin[1] + size[1];
+        const b: [3]f32 = .{ bg[0], bg[1], bg[2] };
+        const tl = Vertex{ .pos = .{ px0, py0 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .curly = .{ 0, 0, cell_w_px } };
+        const tr = Vertex{ .pos = .{ px1, py0 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .curly = .{ 1, 0, cell_w_px } };
+        const bl = Vertex{ .pos = .{ px0, py1 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .curly = .{ 0, 1, cell_w_px } };
+        const br = Vertex{ .pos = .{ px1, py1 }, .uv = .{ 0, 0, 0 }, .color = color, .is_glyph = 0.0, .dim = 1.0, .bg = b, .curly = .{ 1, 1, cell_w_px } };
+        try self.vbuf.appendSlice(self.allocator, &[_]Vertex{ tl, tr, bl, tr, br, bl });
     }
 
     /// Solid fill of an arbitrary convex quad given as TL, TR, BR, BL

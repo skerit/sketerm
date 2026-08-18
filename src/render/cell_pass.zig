@@ -65,7 +65,7 @@ pub const Instance = extern struct {
 
 // ITALIC_SHEAR = tan(13°) ≈ 0.231: horizontal-shear factor used to
 // fake italics for any monospace font without a second FT face.
-pub const VERT_SRC =
+pub const VERT_SRC = style_util.DECO_GLSL ++
     \\const float ITALIC_SHEAR = 0.231;
 ++ "\nconst float ATLAS_TEXEL = 1.0 / " ++ std.fmt.comptimePrint("{d}", .{atlas_mod.PAGE_SIZE}) ++ ".0;\n" ++
     \\in vec2 a_cell_xy;
@@ -153,7 +153,7 @@ pub const VERT_SRC =
     \\        float kind = a_deco + 0.5;
     \\        float ch = a_cell_size.y;
     \\        float thin = max(2.0, ch / 12.0);
-    \\        float curly_h = max(3.0, ch / 6.0);
+    \\        float curly_h = sk_curlyStripH(ch);
     \\        float dy = 0.0;
     \\        float dh = thin;
     \\        if (kind >= 1.0 && kind < 2.0) {
@@ -202,19 +202,14 @@ pub const VERT_SRC =
 ;
 
 // GLSL-side named constants:
-//   ATLAS_TEXEL    = 1 / atlas page size — used for the faux-bold
-//                    one-texel left-neighbor sample.
-//   WAVE_TWO_PI    = 2π — period of the sine used for curly underline.
-//   WAVE_AMPLITUDE = vertical amplitude of the curly wave (0..1 within
-//                    the strip's local y).
-//   WAVE_THICKNESS_PX
-//                  = curly underline line thickness, in pixels.
-pub const FRAG_SRC = blend.GLSL_HELPERS ++ std.fmt.comptimePrint(
+//   ATLAS_TEXEL = 1 / atlas page size — used for the faux-bold
+//                 one-texel left-neighbor sample.
+// The curly-underline constants and `sk_curlyCoverage` come from
+// `style.DECO_GLSL`, shared with GridPass so the two passes cannot
+// draw a different wave on the same row.
+pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.comptimePrint(
     \\
     \\const float ATLAS_TEXEL = 1.0 / {d}.0;
-    \\const float WAVE_TWO_PI = 6.2831853;
-    \\const float WAVE_AMPLITUDE = 0.45;
-    \\const float WAVE_THICKNESS_PX = 1.5;
     \\
     \\in vec4 v_color;
     \\in vec3 v_bg;
@@ -270,17 +265,9 @@ pub const FRAG_SRC = blend.GLSL_HELPERS ++ std.fmt.comptimePrint(
     \\        return;
     \\    }}
     \\    if (kind >= 3.0 && kind < 4.0) {{
-    \\        // Curly: y midline with sine wave. Period ~= cell width / WAVE_THICKNESS_PX.
-    \\        float x = v_deco_local.x * v_deco_w_px;
-    \\        float wave = sin(x * WAVE_TWO_PI / max(8.0, v_deco_w_px / WAVE_THICKNESS_PX));
-    \\        float yc = 0.5 + WAVE_AMPLITUDE * wave; // 0..1 within strip
-    \\        float dist = abs(v_deco_local.y - yc);
-    \\        // ~WAVE_THICKNESS_PX px-equivalent line thickness in strip space.
-    \\        float strip_px = max(3.0, v_deco_w_px / 6.0);
-    \\        float thickness = WAVE_THICKNESS_PX / strip_px;
-    \\        if (dist > thickness) discard;
-    \\        // Anti-alias the edge.
-    \\        float aa = clamp((thickness - dist) / (thickness * 0.5), 0.0, 1.0);
+    \\        // Curly: anti-aliased sine wave inside the strip.
+    \\        float aa = sk_curlyCoverage(v_deco_local, v_deco_w_px);
+    \\        if (aa <= 0.0) discard;
     \\        // The curly wave's own antialiasing is coverage too, so it
     \\        // gets the same remap as a glyph edge.
     \\        o_frag = sk_out(vec4(v_color.rgb, v_color.a * sk_correctCoverage(aa, v_color.rgb, v_bg)));
