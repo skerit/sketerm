@@ -8,6 +8,10 @@ const wire = @import("wire.zig");
 const sockpath = @import("sockpath.zig");
 const deploy = @import("deploy.zig");
 const rudp = @import("rudp.zig");
+/// The one publish/stop/release mechanism for interrupting a blocking
+/// socket from another thread; re-exported so SDK consumers can declare
+/// the slot these connect helpers take.
+pub const FdCancel = @import("../util/fdcancel.zig").FdCancel;
 
 /// A brokered UDP connection ticket: a single-use listener the remote
 /// daemon bound for us, reachable with no ssh bootstrap of our own.
@@ -1783,54 +1787,24 @@ fn connectPanelRequesterUntil(
     sock_path: []const u8,
     session: []const u8,
     deadline_ms: i64,
-    active_fd: ?*std.atomic.Value(c_int),
+    active_fd: ?*FdCancel,
 ) !Conn {
     return connectPanelRequesterUntilExpected(allocator, sock_path, session, "", deadline_ms, active_fd);
 }
 
-/// Atomically claim, interrupt, and close a requester cancellation fd.
-/// Callers must use this instead of load+shutdown so the worker cannot close
-/// and reuse the descriptor between those two operations.
-pub fn cancelPanelRequesterFd(slot: *std.atomic.Value(c_int)) void {
-    cancelCancellationFd(slot);
-}
-
-/// Atomically retire a published cancellation duplicate without interrupting
-/// the underlying socket after a requester operation completed normally.
-pub fn releasePanelRequesterFd(slot: *std.atomic.Value(c_int)) void {
-    releaseCancellationFd(slot);
-}
-
-fn clearPanelRequesterFd(slot: ?*std.atomic.Value(c_int)) void {
+/// Publish this connection attempt's fd on the caller's cancellation slot.
+///
+/// @return error.Canceled when the slot was already stopped, so an
+/// operation cancelled between allocating the socket and publishing it
+/// gives up here instead of blocking on a descriptor nobody can reach.
+fn clearPanelRequesterFd(slot: ?*FdCancel) void {
     const active = slot orelse return;
-    releaseCancellationFd(active);
+    active.release();
 }
 
-fn publishPanelRequesterFd(slot: ?*std.atomic.Value(c_int), source_fd: c_int) !void {
+fn publishPanelRequesterFd(slot: ?*FdCancel, source_fd: c_int) !void {
     const active = slot orelse return;
-    try publishCancellationFd(active, source_fd);
-}
-
-/// Atomically claim and interrupt a published duplicate without descriptor-reuse races.
-pub fn cancelCancellationFd(slot: *std.atomic.Value(c_int)) void {
-    const fd = slot.swap(-1, .acq_rel);
-    if (fd < 0) return;
-    _ = c.shutdown(fd, c.SHUT_RDWR);
-    _ = c.close(fd);
-}
-
-/// Retire a published cancellation duplicate without interrupting its socket.
-pub fn releaseCancellationFd(slot: *std.atomic.Value(c_int)) void {
-    const fd = slot.swap(-1, .acq_rel);
-    if (fd >= 0) _ = c.close(fd);
-}
-
-/// Publish a cancellation-only duplicate of a live connection fd.
-pub fn publishCancellationFd(slot: *std.atomic.Value(c_int), source_fd: c_int) !void {
-    releaseCancellationFd(slot);
-    const cancel_fd = c.fcntl(source_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
-    if (cancel_fd < 0) return error.CancelFdFailed;
-    slot.store(cancel_fd, .release);
+    if (!try active.publish(source_fd)) return error.Canceled;
 }
 
 fn classifyPanelRequesterAttachError(conn: *const Conn, err: anyerror) anyerror {
@@ -1853,7 +1827,7 @@ pub fn connectPanelRequesterUntilExpected(
     session: []const u8,
     expected_origin_id: []const u8,
     deadline_ms: i64,
-    active_fd: ?*std.atomic.Value(c_int),
+    active_fd: ?*FdCancel,
 ) !Conn {
     if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
     const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
@@ -1988,10 +1962,10 @@ test "panel identity support requires a valid positive capability classification
 
 /// Relative-time convenience wrapper for non-MCP callers.
 pub fn connectPanelRequester(allocator: std.mem.Allocator, sock_path: []const u8, session: []const u8, timeout_ms: i64) !Conn {
-    var active: std.atomic.Value(c_int) = .init(-1);
-    const conn = try connectPanelRequesterUntil(allocator, sock_path, session, monotonicMs() + @max(timeout_ms, 0), &active);
-    active.store(-1, .release);
-    return conn;
+    var active: FdCancel = .{};
+    // The connect helper releases the slot itself; this local exists
+    // only because these callers have no watchdog to hand it.
+    return connectPanelRequesterUntil(allocator, sock_path, session, monotonicMs() + @max(timeout_ms, 0), &active);
 }
 
 test "panel requester connect, hello, and attach share one absolute deadline" {
@@ -2021,24 +1995,45 @@ test "panel requester connect, hello, and attach share one absolute deadline" {
     };
     const thread = try std.Thread.spawn(.{}, Stall.run, .{Stall{ .fd = listener }});
     defer thread.join();
-    var active: std.atomic.Value(c_int) = .init(-1);
+    var active: FdCancel = .{};
     const start = monotonicMs();
     try t.expectError(
         error.Timeout,
         connectPanelRequesterUntil(t.allocator, path, "session", start + 75, &active),
     );
     try t.expect(monotonicMs() - start < 500);
-    try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+    try t.expectEqual(@as(c_int, -1), active.fd.load(.acquire));
+}
+
+test "a panel connect that lost the stop race is cancelled before it dials" {
+    const t = std.testing;
+    // The watchdog fired between allocating this call's socket and
+    // publishing it. Without the stop latch the duplicate is published
+    // into a slot nobody will ever claim again and the connect runs on
+    // to its full deadline unreachable by any cancel.
+    var active: FdCancel = .{};
+    active.stop();
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-panel-stopped-{d}.sock", .{c.getpid()});
+    _ = c.unlink(path.ptr);
+    defer _ = c.unlink(path.ptr);
+    const listener = try panelAttachListener(path);
+    defer _ = c.close(listener);
+    try t.expectError(
+        error.Canceled,
+        connectPanelRequesterUntil(t.allocator, path, "session", monotonicMs() + 5_000, &active),
+    );
+    try t.expectEqual(@as(c_int, -1), active.fd.load(.acquire));
 }
 
 test "expired panel deadlines cannot connect flush or send initial bytes" {
     const t = std.testing;
-    var active: std.atomic.Value(c_int) = .init(-1);
+    var active: FdCancel = .{};
     try t.expectError(
         error.Timeout,
         connectPanelRequesterUntil(t.allocator, "/tmp/expired-panel.sock", "session", monotonicMs() - 1, &active),
     );
-    try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+    try t.expectEqual(@as(c_int, -1), active.fd.load(.acquire));
 
     var pair: [2]c_int = undefined;
     try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &pair));
@@ -2116,13 +2111,13 @@ test "panel-only attach rejects missing empty and truncated immutable origin met
             .listener = listener,
             .reply = reply,
         }});
-        var active: std.atomic.Value(c_int) = .init(-1);
+        var active: FdCancel = .{};
         try t.expectError(
             error.MalformedPanelAttachMetadata,
             connectPanelRequesterUntil(t.allocator, path, "requested-alias", monotonicMs() + 2_000, &active),
         );
         thread.join();
-        try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+        try t.expectEqual(@as(c_int, -1), active.fd.load(.acquire));
     }
 }
 
@@ -2138,7 +2133,7 @@ test "panel-only attach reports a valid unexpected origin id as an identity mism
         .listener = listener,
         .reply = "{\"ok\":true,\"panel_only\":true,\"origin_name\":\"replacement\",\"origin_id\":\"20000000000000000000000000000002\"}",
     }});
-    var active: std.atomic.Value(c_int) = .init(-1);
+    var active: FdCancel = .{};
     try t.expectError(
         error.SessionOriginMismatch,
         connectPanelRequesterUntilExpected(
@@ -2151,7 +2146,7 @@ test "panel-only attach reports a valid unexpected origin id as an identity mism
         ),
     );
     thread.join();
-    try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+    try t.expectEqual(@as(c_int, -1), active.fd.load(.acquire));
 }
 
 test "panel-only attach returns a typed no-such-session error" {
@@ -2167,7 +2162,7 @@ test "panel-only attach returns a typed no-such-session error" {
         .reply = "{\"error\":\"no such session\"}",
         .ftype = .err,
     }});
-    var active: std.atomic.Value(c_int) = .init(-1);
+    var active: FdCancel = .{};
     try t.expectError(
         error.PanelSessionNotFound,
         connectPanelRequesterUntilExpected(
@@ -2180,7 +2175,7 @@ test "panel-only attach returns a typed no-such-session error" {
         ),
     );
     thread.join();
-    try t.expectEqual(@as(c_int, -1), active.load(.acquire));
+    try t.expectEqual(@as(c_int, -1), active.fd.load(.acquire));
 }
 
 test "panel requester attach errors preserve daemon diagnostics and classify known absence" {
@@ -2211,34 +2206,6 @@ test "panel requester attach errors preserve daemon diagnostics and classify kno
     try t.expect(panelRequesterKnownAbsent(mismatch));
     try t.expectEqualStrings("session origin identity changed", conn.lastErr());
     try t.expect(!panelRequesterKnownAbsent(error.DaemonError));
-}
-
-test "panel requester cancellation claims a duplicate before descriptor reuse" {
-    const t = std.testing;
-    var original: [2]c_int = undefined;
-    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &original));
-    defer _ = c.close(original[1]);
-    const worker_fd = original[0];
-    var active: std.atomic.Value(c_int) = .init(-1);
-    try publishPanelRequesterFd(&active, worker_fd);
-    const cancel_fd = active.load(.acquire);
-    try t.expect(cancel_fd >= 0 and cancel_fd != worker_fd);
-
-    _ = c.close(worker_fd);
-    var replacement: [2]c_int = undefined;
-    try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &replacement));
-    defer _ = c.close(replacement[0]);
-    defer _ = c.close(replacement[1]);
-    try t.expectEqual(worker_fd, replacement[0]);
-
-    cancelPanelRequesterFd(&active);
-    try t.expectEqual(@as(c_int, -1), active.load(.acquire));
-    var byte: u8 = 0x5a;
-    try t.expectEqual(@as(isize, 1), c.write(replacement[0], &byte, 1));
-    byte = 0;
-    try t.expectEqual(@as(isize, 1), c.read(replacement[1], &byte, 1));
-    try t.expectEqual(@as(u8, 0x5a), byte);
-    try t.expectEqual(@as(isize, 0), c.read(original[1], &byte, 1));
 }
 
 test "panel-only attach preserves an exact maximum-length immutable origin" {

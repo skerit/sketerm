@@ -12,6 +12,7 @@ const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const mux_client = @import("../mux/client.zig");
 const channel_pump = @import("../mux/channel_pump.zig");
+const clock = @import("../util/clock.zig");
 const mux_daemon = @import("../mux/daemon.zig");
 const mux_wire = @import("../mux/wire.zig");
 const pulse = @import("../mux/pulse.zig");
@@ -630,7 +631,7 @@ const Forwarder = struct {
         var refs: [MAX_FORWARDS]*channel_pump.Local = undefined;
         for (&self.locals, 0..) |*local, index| refs[index] = local;
         var pump = self.newPump();
-        pump.finishAfterMuxClose(&refs, self.cancel_fd, channel_pump.nowMs() + 5000);
+        pump.finishAfterMuxClose(&refs, self.cancel_fd, clock.nowMs() + 5000);
     }
 
     fn pumpLocal(self: *Forwarder, local: *channel_pump.Local) void {

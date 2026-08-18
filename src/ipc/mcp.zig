@@ -469,9 +469,9 @@ pub const Watchdog = struct {
     var fds: [128]c_int = undefined;
     var fd_count: usize = 0;
     /// A panel connection may be established after begin().
-    var dynamic_fd: std.atomic.Value(c_int) = .init(-1);
+    var dynamic_fd: muxclient.FdCancel = .{};
     /// The persistent fs connection is lazy and may be replaced mid-call.
-    var fs_fd: std.atomic.Value(c_int) = .init(-1);
+    var fs_fd: muxclient.FdCancel = .{};
     pub var fired: std.atomic.Value(bool) = .init(false);
     pub var hard_ms: i64 = 150_000;
 
@@ -479,7 +479,12 @@ pub const Watchdog = struct {
         _ = c.pthread_mutex_lock(&mu);
         defer _ = c.pthread_mutex_unlock(&mu);
         fd_count = 0;
-        dynamic_fd.store(-1, .release);
+        // A previous call's panel connection is gone; the persistent fs
+        // one is deliberately kept, but both stop latches must clear or
+        // this call's publishes would be interrupted on arrival.
+        dynamic_fd.release();
+        dynamic_fd.arm();
+        fs_fd.arm();
         for (app_state.apps.values()) |a| addFd(a.conn.fd);
         for (term_state.terms.values()) |t| addFd(t.conn.fd);
         if (panel_pool) |pool| {
@@ -511,8 +516,8 @@ pub const Watchdog = struct {
     }
 
     fn cancelDynamicFds() void {
-        muxclient.cancelPanelRequesterFd(&dynamic_fd);
-        muxclient.cancelCancellationFd(&fs_fd);
+        dynamic_fd.stop();
+        fs_fd.stop();
     }
 
     fn loop() void {
@@ -1709,16 +1714,19 @@ const FsState = struct {
             conn.deinit();
             return false;
         };
-        muxclient.publishCancellationFd(&Watchdog.fs_fd, conn.fd) catch {
+        const armed = Watchdog.fs_fd.publish(conn.fd) catch false;
+        if (!armed) {
+            // Either the dup failed or the watchdog already fired: an
+            // uncancellable connection must not become the live one.
             conn.deinit();
             return false;
-        };
+        }
         self.fs = fsdrive.Fs.initConn(self.allocator, conn);
         return true;
     }
 
     fn drop(self: *FsState) void {
-        muxclient.releaseCancellationFd(&Watchdog.fs_fd);
+        Watchdog.fs_fd.release();
         if (self.fs) |*f| f.deinit();
         self.fs = null;
     }
@@ -1728,7 +1736,8 @@ var fs_state: FsState = .{ .allocator = undefined };
 
 test "watchdog fs cancellation follows a replacement connection during one call" {
     const t = std.testing;
-    muxclient.releaseCancellationFd(&Watchdog.fs_fd);
+    Watchdog.fs_fd.release();
+    Watchdog.fs_fd.arm();
     Watchdog.initLock();
     Watchdog.begin();
     defer Watchdog.end();
@@ -1742,10 +1751,10 @@ test "watchdog fs cancellation follows a replacement connection during one call"
     try t.expect(state.adoptConn(.{ .allocator = t.allocator, .fd = first[0] }));
     const flags = c.fcntl(state.fs.?.pollFd(), c.F_GETFL);
     try t.expect(flags >= 0 and flags & c.O_NONBLOCK != 0);
-    try t.expect(Watchdog.fs_fd.load(.acquire) >= 0);
+    try t.expect(Watchdog.fs_fd.fd.load(.acquire) >= 0);
 
     state.drop();
-    try t.expectEqual(@as(c_int, -1), Watchdog.fs_fd.load(.acquire));
+    try t.expectEqual(@as(c_int, -1), Watchdog.fs_fd.fd.load(.acquire));
     var replacement: [2]c_int = undefined;
     try t.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &replacement));
     defer _ = c.close(replacement[1]);
@@ -1768,11 +1777,11 @@ test "watchdog fs cancellation follows a replacement connection during one call"
         state.fs.?.statPath(arena_state.allocator(), "/tmp/watchdog-no-reply"),
     );
     try t.expect(monoMs() - start < 500);
-    try t.expectEqual(@as(c_int, -1), Watchdog.fs_fd.load(.acquire));
+    try t.expectEqual(@as(c_int, -1), Watchdog.fs_fd.fd.load(.acquire));
 
     state.drop();
     try t.expect(!state.adoptConn(.{ .allocator = t.allocator, .fd = -1 }));
-    try t.expectEqual(@as(c_int, -1), Watchdog.fs_fd.load(.acquire));
+    try t.expectEqual(@as(c_int, -1), Watchdog.fs_fd.fd.load(.acquire));
 }
 
 /// Server mode facts for the `capabilities` preflight tool.

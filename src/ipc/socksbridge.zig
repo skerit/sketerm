@@ -18,6 +18,7 @@ const socks5 = @import("socks5.zig");
 const wire = @import("../mux/wire.zig");
 const client = @import("../mux/client.zig");
 const channel_pump = @import("../mux/channel_pump.zig");
+const clock = @import("../util/clock.zig");
 const platform = @import("../util/platform.zig");
 const FdCancel = @import("../util/fdcancel.zig").FdCancel;
 
@@ -315,7 +316,7 @@ pub const Bridge = struct {
         for (&self.sessions, 0..) |*s, index| refs[index] = &s.local;
         var pump = self.channelPump() orelse return;
         const cancel_fd = if (self.stop) |stop| stop.read_fd else -1;
-        pump.finishAfterMuxClose(&refs, cancel_fd, channel_pump.nowMs() + 5000);
+        pump.finishAfterMuxClose(&refs, cancel_fd, clock.nowMs() + 5000);
         for (&self.sessions) |*s| {
             if (!s.local.active()) s.* = .{};
         }

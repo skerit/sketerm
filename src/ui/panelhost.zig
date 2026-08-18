@@ -340,11 +340,10 @@ const PanelTabJob = struct {
     login_shell: bool,
     report_assets: bool,
     resolver: assets.Resolver,
-    canceled: std.atomic.Value(bool) = .init(false),
-    /// Dedicated duplicate used only for cross-thread shutdown. The worker
-    /// never closes it; main-thread deinit does so after the handback, making
-    /// a loaded descriptor immune to reuse while cancellation is possible.
-    cancel_fd: std.atomic.Value(c_int) = .init(-1),
+    /// Cross-thread cancellation: a dedicated duplicate the worker never
+    /// closes, so a loaded descriptor is immune to reuse for as long as
+    /// cancellation is possible. Main-thread deinit releases it.
+    cancel: mux_client.FdCancel = .{},
     conn: ?@import("../mux/client.zig").Conn = null,
     snapshot: ?[]u8 = null,
     identity: @import("../mux/client.zig").AttachIdentity = .{},
@@ -352,8 +351,7 @@ const PanelTabJob = struct {
     failure: []const u8 = "panel tab setup failed",
 
     fn deinit(self: *PanelTabJob) void {
-        const cancel_fd = self.cancel_fd.load(.acquire);
-        if (cancel_fd >= 0) _ = c.close(cancel_fd);
+        self.cancel.release();
         if (self.conn) |*conn| {
             if (self.spawned) conn.queueKill(.{
                 .name = self.spawned_session,
@@ -392,8 +390,8 @@ const PanelOpenSessionJob = struct {
     /// local daemon; a custom local daemon retains its source "sock:" spec.
     host: ?[]u8,
     port_range: []u8,
-    canceled: std.atomic.Value(bool) = .init(false),
-    cancel_fd: std.atomic.Value(c_int) = .init(-1),
+    /// Cross-thread cancellation; see PanelTabJob.cancel.
+    cancel: mux_client.FdCancel = .{},
     conn: ?mux_client.Conn = null,
     snapshot: ?[]u8 = null,
     identity: mux_client.AttachIdentity = .{},
@@ -414,8 +412,7 @@ const PanelOpenSessionJob = struct {
     }
 
     fn deinit(self: *PanelOpenSessionJob) void {
-        const cancel_fd = self.cancel_fd.load(.acquire);
-        if (cancel_fd >= 0) _ = c.close(cancel_fd);
+        self.cancel.release();
         if (self.conn) |*conn| conn.deinit();
         if (self.snapshot) |snapshot| self.allocator.free(snapshot);
         self.allocator.free(self.target_session);
@@ -2199,7 +2196,7 @@ fn panelOpenSessionThreadMain(job: *PanelOpenSessionJob) void {
 }
 
 fn panelOpenSessionConnect(job: *PanelOpenSessionJob) !void {
-    if (job.canceled.load(.acquire)) return error.Canceled;
+    if (job.cancel.isStopped()) return error.Canceled;
     var conn = if (job.socket) |socket|
         try mux_client.Conn.connectProbed(job.allocator, socket)
     else
@@ -2209,10 +2206,9 @@ fn panelOpenSessionConnect(job: *PanelOpenSessionJob) !void {
             if (job.port_range.len > 0) job.port_range else null,
         );
     errdefer conn.deinit();
-    const cancel_fd = c.fcntl(conn.fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
-    if (cancel_fd < 0) return error.CancelFdFailed;
-    job.cancel_fd.store(cancel_fd, .release);
-    if (job.canceled.load(.acquire)) return error.Canceled;
+    // publish also settles the stop-before-publish window: a teardown
+    // that won the race interrupts this fd instead of losing it.
+    if (!try job.cancel.publish(conn.fd)) return error.Canceled;
 
     var remain = job.deadline_ms - @import("../util/clock.zig").nowMs();
     if (remain <= 0) return error.Timeout;
@@ -2317,7 +2313,7 @@ const PanelOpenSessionSource = struct {
 };
 
 fn panelOpenSessionCommitSource(job: *const PanelOpenSessionJob) ?PanelOpenSessionSource {
-    if (job.canceled.load(.acquire)) return null;
+    if (job.cancel.isStopped()) return null;
     for (job.scope.viewers.items) |viewer| {
         if (!viewer.drain.alive.load(.acquire)) continue;
         const terminal = viewer.drain.terminal orelse continue;
@@ -2334,9 +2330,7 @@ fn panelOpenSessionCommitSource(job: *const PanelOpenSessionJob) ?PanelOpenSessi
 }
 
 fn cancelPanelOpenSession(job: *PanelOpenSessionJob) void {
-    job.canceled.store(true, .release);
-    const fd = job.cancel_fd.load(.acquire);
-    if (fd >= 0) _ = c.shutdown(fd, c.SHUT_RDWR);
+    job.cancel.stop();
 }
 
 fn startPanelTab(
@@ -2440,7 +2434,7 @@ fn panelTabThreadMain(job: *PanelTabJob) void {
 }
 
 fn panelTabConnect(job: *PanelTabJob) !void {
-    if (job.canceled.load(.acquire)) return error.Canceled;
+    if (job.cancel.isStopped()) return error.Canceled;
     var conn = try mux_client.Conn.connectLocalAutostart(job.allocator);
     var spawned = false;
     errdefer {
@@ -2450,10 +2444,7 @@ fn panelTabConnect(job: *PanelTabJob) !void {
         }) catch {};
         conn.deinit();
     }
-    const cancel_fd = c.fcntl(conn.fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
-    if (cancel_fd < 0) return error.CancelFdFailed;
-    job.cancel_fd.store(cancel_fd, .release);
-    if (job.canceled.load(.acquire)) return error.Canceled;
+    if (!try job.cancel.publish(conn.fd)) return error.Canceled;
 
     var remain = job.deadline_ms - @import("../util/clock.zig").nowMs();
     if (remain <= 0) return error.Timeout;
@@ -2485,7 +2476,7 @@ fn panelTabConnect(job: *PanelTabJob) !void {
     @memcpy(&job.spawned_origin_id, parsed.value.origin_id);
     job.spawned_origin_id_valid = true;
     spawned = true;
-    if (job.canceled.load(.acquire)) return error.Canceled;
+    if (job.cancel.isStopped()) return error.Canceled;
     try conn.sendAttach(job.spawned_session, .{
         .origin_id = &job.spawned_origin_id,
         .kind = "gui",
@@ -2616,7 +2607,7 @@ fn panelTabDone(user: ?*anyopaque) callconv(.c) c.gboolean {
 }
 
 fn panelTabCommitTerminal(job: *const PanelTabJob) ?*Terminal {
-    if (job.canceled.load(.acquire) or !job.origin.alive.load(.acquire)) return null;
+    if (job.cancel.isStopped() or !job.origin.alive.load(.acquire)) return null;
     const terminal = job.origin.terminal orelse return null;
     const remote = terminal.remote orelse return null;
     if (!remote.canSend() or remote.panel_generation != job.generation) return null;
@@ -2631,9 +2622,7 @@ fn cancelPanelTabs(terminal: *Terminal) void {
 }
 
 fn cancelPanelTab(job: *PanelTabJob) void {
-    job.canceled.store(true, .release);
-    const fd = job.cancel_fd.load(.acquire);
-    if (fd >= 0) _ = c.shutdown(fd, c.SHUT_RDWR);
+    job.cancel.stop();
 }
 
 fn panelShow(
@@ -4233,8 +4222,7 @@ test "transport loss preserves direct local hydration and cancels relay work" {
     job.scope = &scope;
     job.origin = &drain;
     job.generation = remote.panel_generation;
-    job.canceled = .init(false);
-    job.cancel_fd = .init(-1);
+    job.cancel = .{};
     try panel_tab_jobs.append(a, &job);
     const queued = try a.create(QueuedPanelOperation);
     queued.* = .{
@@ -4272,7 +4260,7 @@ test "transport loss preserves direct local hydration and cancels relay work" {
     cancelPanelWork(&term);
     try std.testing.expect(assetOriginUsable(&drain));
     remote.connected = true;
-    try std.testing.expect(job.canceled.load(.acquire));
+    try std.testing.expect(job.cancel.isStopped());
     try std.testing.expectEqual(@as(usize, 0), queued_panel_operations.items.len);
     try std.testing.expectEqualSlices(*Hydration, &.{direct}, hydrations.items);
     try std.testing.expect(panelTabCommitTerminal(&job) == null);
@@ -4289,10 +4277,10 @@ test "teardown fences and interrupts asynchronous panel tab setup" {
     defer _ = c.close(pair[0]);
     defer _ = c.close(pair[1]);
     var job: PanelTabJob = undefined;
-    job.canceled = .init(false);
-    job.cancel_fd = .init(pair[0]);
+    job.cancel = .{};
+    _ = try job.cancel.publish(pair[0]);
     cancelPanelTab(&job);
-    try std.testing.expect(job.canceled.load(.acquire));
+    try std.testing.expect(job.cancel.isStopped());
     var byte: [1]u8 = undefined;
     try std.testing.expectEqual(@as(isize, 0), c.read(pair[1], &byte, byte.len));
 }
@@ -4302,9 +4290,9 @@ test "panel tab cancel duplicate cannot shutdown a reused worker fd" {
     try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &original));
     defer _ = c.close(original[1]);
     const worker_fd = original[0];
-    const cancel_fd = c.fcntl(worker_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
-    try std.testing.expect(cancel_fd >= 0);
-    defer _ = c.close(cancel_fd);
+    var job: PanelTabJob = undefined;
+    job.cancel = .{};
+    try std.testing.expect(try job.cancel.publish(worker_fd));
 
     // Reproduce the old race exactly: the worker closes its connection, then
     // another socket takes the same descriptor number before main cancels.
@@ -4315,9 +4303,6 @@ test "panel tab cancel duplicate cannot shutdown a reused worker fd" {
     defer _ = c.close(replacement[1]);
     try std.testing.expectEqual(worker_fd, replacement[0]);
 
-    var job: PanelTabJob = undefined;
-    job.canceled = .init(false);
-    job.cancel_fd = .init(cancel_fd);
     cancelPanelTab(&job);
 
     var byte: u8 = 0x5a;
@@ -4366,9 +4351,9 @@ test "panel open-session cancel duplicate cannot shutdown a reused worker fd" {
     try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &original));
     defer _ = c.close(original[1]);
     const worker_fd = original[0];
-    const cancel_fd = c.fcntl(worker_fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
-    try std.testing.expect(cancel_fd >= 0);
-    defer _ = c.close(cancel_fd);
+    var job: PanelOpenSessionJob = undefined;
+    job.cancel = .{};
+    try std.testing.expect(try job.cancel.publish(worker_fd));
     _ = c.close(worker_fd);
 
     var replacement: [2]c_int = undefined;
@@ -4377,9 +4362,6 @@ test "panel open-session cancel duplicate cannot shutdown a reused worker fd" {
     defer _ = c.close(replacement[1]);
     try std.testing.expectEqual(worker_fd, replacement[0]);
 
-    var job: PanelOpenSessionJob = undefined;
-    job.canceled = .init(false);
-    job.cancel_fd = .init(cancel_fd);
     cancelPanelOpenSession(&job);
 
     var byte: u8 = 0x5a;

@@ -168,8 +168,8 @@ pub const Pool = struct {
     /// The connection currently used by a tool call, including a socket still
     /// in nonblocking connect. Mirrored into `watchdog_fd` when the MCP
     /// watchdog registered one.
-    active_fd: std.atomic.Value(c_int) = .init(-1),
-    watchdog_fd: ?*std.atomic.Value(c_int) = null,
+    active_fd: muxclient.FdCancel = .{},
+    watchdog_fd: ?*muxclient.FdCancel = null,
 
     const MAX_CONNECTIONS: usize = 32;
 
@@ -192,7 +192,7 @@ pub const Pool = struct {
         return count;
     }
 
-    pub fn setWatchdogFd(self: *Pool, slot: *std.atomic.Value(c_int)) void {
+    pub fn setWatchdogFd(self: *Pool, slot: *muxclient.FdCancel) void {
         self.watchdog_fd = slot;
     }
 
@@ -393,11 +393,14 @@ fn ensureFailureKind(err: anyerror) FailureKind {
     };
 }
 
-fn setActiveSlot(slot: *std.atomic.Value(c_int), fd: c_int) void {
-    muxclient.releasePanelRequesterFd(slot);
-    if (fd < 0) return;
-    const duplicate = c.fcntl(fd, c.F_DUPFD_CLOEXEC, @as(c_int, 3));
-    if (duplicate >= 0) slot.store(duplicate, .release);
+fn setActiveSlot(slot: *muxclient.FdCancel, fd: c_int) void {
+    if (fd < 0) {
+        slot.release();
+        return;
+    }
+    // A stopped slot interrupts the duplicate immediately; the call it
+    // belonged to is already being torn down either way.
+    _ = slot.publish(fd) catch {};
 }
 
 test "paneldrive keeps legacy capability timeout and malformed negotiation distinct" {

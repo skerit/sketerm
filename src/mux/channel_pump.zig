@@ -4,14 +4,9 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const client = @import("client.zig");
 const wire = @import("wire.zig");
+const nowMs = @import("../util/clock.zig").nowMs;
 
 pub const DATA_CHUNK: usize = 32 * 1024;
-
-pub fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
 
 /// Make an inherited or accepted fd nonblocking and close-on-exec.
 pub fn configureFd(fd: c_int) !void {

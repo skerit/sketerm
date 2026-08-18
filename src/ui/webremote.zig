@@ -20,6 +20,7 @@ const platform = @import("../util/platform.zig");
 const wire = @import("../mux/wire.zig");
 const mux_client = @import("../mux/client.zig");
 const channel_pump = @import("../mux/channel_pump.zig");
+const clock = @import("../util/clock.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const FdCancel = @import("../util/fdcancel.zig").FdCancel;
 
@@ -205,7 +206,7 @@ pub const Bridge = struct {
             return null;
         };
         const wakeup = self.wakeup orelse return null;
-        const deadline = channel_pump.nowMs() + REPLY_TIMEOUT_MS;
+        const deadline = clock.nowMs() + REPLY_TIMEOUT_MS;
         var pump = channel_pump.Pump.init(self.allocator, &self.conn);
         while (true) {
             switch (self.drainOpenFrames()) {
@@ -213,7 +214,7 @@ pub const Bridge = struct {
                 .failed => return null,
                 .pending => {},
             }
-            if (deadline - channel_pump.nowMs() <= 0) {
+            if (deadline - clock.nowMs() <= 0) {
                 self.failWith("The remote daemon did not answer the browser-helper request in time.");
                 return null;
             }
@@ -432,7 +433,7 @@ pub const Bridge = struct {
                 const wake_fd = if (self.wakeup) |wake| wake.read_fd else -1;
                 const refs = [_]*channel_pump.Local{&self.local};
                 self.recordReason("The connection to the remote browser helper was lost.");
-                pump.finishAfterMuxClose(&refs, wake_fd, channel_pump.nowMs() + 15_000);
+                pump.finishAfterMuxClose(&refs, wake_fd, clock.nowMs() + 15_000);
                 break :blk false;
             },
         };
@@ -513,9 +514,9 @@ const TestBridge = struct {
 fn testStartAndStop(test_bridge: *TestBridge) !void {
     try test_bridge.start();
     _ = c.usleep(20_000);
-    const start = channel_pump.nowMs();
+    const start = clock.nowMs();
     test_bridge.stop();
-    try std.testing.expect(channel_pump.nowMs() - start < 1_000);
+    try std.testing.expect(clock.nowMs() - start < 1_000);
 }
 
 fn testFillSocket(fd: c_int) !void {
@@ -539,10 +540,10 @@ fn testFillSocket(fd: c_int) !void {
 }
 
 fn testReadExact(fd: c_int, out: []u8) !void {
-    const deadline = channel_pump.nowMs() + 2000;
+    const deadline = clock.nowMs() + 2000;
     var off: usize = 0;
     while (off < out.len) {
-        const left = deadline - channel_pump.nowMs();
+        const left = deadline - clock.nowMs();
         if (left <= 0) return error.Timeout;
         var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
         const result = c.poll(&pfd, 1, @intCast(left));
@@ -559,9 +560,9 @@ fn testReadExact(fd: c_int, out: []u8) !void {
 }
 
 fn testExpectEof(fd: c_int) !void {
-    const deadline = channel_pump.nowMs() + 2000;
+    const deadline = clock.nowMs() + 2000;
     while (true) {
-        const left = deadline - channel_pump.nowMs();
+        const left = deadline - clock.nowMs();
         if (left <= 0) return error.Timeout;
         var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
         const result = c.poll(&pfd, 1, @intCast(left));
@@ -736,7 +737,7 @@ var test_connect_until = std.atomic.Value(i64).init(0);
 
 fn testBlockingConnect(_: std.mem.Allocator, _: ?[]const u8) ?mux_client.Conn {
     test_connect_entered.store(true, .release);
-    while (channel_pump.nowMs() < test_connect_until.load(.acquire)) _ = c.usleep(2_000);
+    while (clock.nowMs() < test_connect_until.load(.acquire)) _ = c.usleep(2_000);
     return null;
 }
 
@@ -758,7 +759,7 @@ test "stopping a bridge parked in its connect does not wait for the connect" {
     defer _ = c.close(gui_fd);
 
     test_connect_entered.store(false, .release);
-    test_connect_until.store(channel_pump.nowMs() + 800, .release);
+    test_connect_until.store(clock.nowMs() + 800, .release);
     _ = bridge.refs.fetchAdd(1, .acq_rel);
     const thread = std.Thread.spawn(.{}, testJoinableWorker, .{bridge}) catch |err| {
         bridge.release();
@@ -767,9 +768,9 @@ test "stopping a bridge parked in its connect does not wait for the connect" {
     defer thread.join();
     while (!test_connect_entered.load(.acquire)) _ = c.usleep(1_000);
 
-    const started = channel_pump.nowMs();
+    const started = clock.nowMs();
     bridge.stop();
-    try t.expect(channel_pump.nowMs() - started < 300);
+    try t.expect(clock.nowMs() - started < 300);
 }
 
 test "stop leaves the worker-owned local endpoint alone" {
