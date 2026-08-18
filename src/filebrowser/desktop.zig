@@ -14,31 +14,39 @@ pub fn mimeListContains(list: []const u8, mime: []const u8) bool {
 
 /// Substitute a .desktop Exec line's field codes: %f/%F/%u/%U become
 /// the single-quoted path; other % codes are dropped; %% = literal %.
+/// Null on out of memory; the caller falls back to not launching.
 pub fn buildHostExecCmd(allocator: std.mem.Allocator, exec: []const u8, path: []const u8) ?[]u8 {
+    return buildHostExecCmdAlloc(allocator, exec, path) catch null;
+}
+
+/// The builder proper. It returns an error rather than null so the
+/// `errdefer` below is live: as a `?[]u8` body every partial `out` was
+/// leaked instead, on each of six failure paths.
+fn buildHostExecCmdAlloc(allocator: std.mem.Allocator, exec: []const u8, path: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var i: usize = 0;
     var substituted = false;
     while (i < exec.len) : (i += 1) {
         if (exec[i] != '%' or i + 1 >= exec.len) {
-            out.append(allocator, exec[i]) catch return null;
+            try out.append(allocator, exec[i]);
             continue;
         }
         i += 1;
         switch (exec[i]) {
             'f', 'F', 'u', 'U' => {
-                appendQuoted(&out, allocator, path) catch return null;
+                try appendQuoted(&out, allocator, path);
                 substituted = true;
             },
-            '%' => out.append(allocator, '%') catch return null,
+            '%' => try out.append(allocator, '%'),
             else => {},
         }
     }
     if (!substituted) {
-        out.append(allocator, ' ') catch return null;
-        appendQuoted(&out, allocator, path) catch return null;
+        try out.append(allocator, ' ');
+        try appendQuoted(&out, allocator, path);
     }
-    return out.toOwnedSlice(allocator) catch null;
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn appendQuoted(out: *std.ArrayList(u8), allocator: std.mem.Allocator, path: []const u8) !void {

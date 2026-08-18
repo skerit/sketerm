@@ -204,31 +204,42 @@ pub fn substitute(
     file: []const u8,
     out_path: []const u8,
 ) ?[]u8 {
+    return substituteAlloc(allocator, cmd, file, out_path) catch null;
+}
+
+/// The builder proper. Error-returning so its `errdefer` actually runs;
+/// as a `?[]u8` body each `catch return null` leaked the partial buffer.
+fn substituteAlloc(
+    allocator: std.mem.Allocator,
+    cmd: []const u8,
+    file: []const u8,
+    out_path: []const u8,
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     var saw_file = false;
     var i: usize = 0;
     while (i < cmd.len) : (i += 1) {
         if (cmd[i] != '%' or i + 1 >= cmd.len) {
-            out.append(allocator, cmd[i]) catch return null;
+            try out.append(allocator, cmd[i]);
             continue;
         }
         i += 1;
         switch (cmd[i]) {
             'f' => {
-                desktop.appendQuoted(&out, allocator, file) catch return null;
+                try desktop.appendQuoted(&out, allocator, file);
                 saw_file = true;
             },
-            'o' => desktop.appendQuoted(&out, allocator, out_path) catch return null,
-            '%' => out.append(allocator, '%') catch return null,
+            'o' => try desktop.appendQuoted(&out, allocator, out_path),
+            '%' => try out.append(allocator, '%'),
             else => {},
         }
     }
     if (!saw_file) {
-        out.append(allocator, ' ') catch return null;
-        desktop.appendQuoted(&out, allocator, file) catch return null;
+        try out.append(allocator, ' ');
+        try desktop.appendQuoted(&out, allocator, file);
     }
-    return out.toOwnedSlice(allocator) catch null;
+    return out.toOwnedSlice(allocator);
 }
 
 /// The shell line the host-command job runs: the substituted command
