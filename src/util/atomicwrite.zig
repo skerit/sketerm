@@ -1,4 +1,11 @@
 //! Durable whole-file replacement through a unique sibling stage.
+//!
+//! The stage NAME is part of the contract, not an implementation detail:
+//! several sweepers collect orphaned stages left by a crash, and they can
+//! only recognise them by name. So the format has exactly one declaring home
+//! (`STAGE_INFIX` + `stagePath` below) and every writer stages through it --
+//! a caller that invents its own suffix leaves debris nothing will ever
+//! collect, which is precisely what filtersub's hardcoded `.part` did.
 
 const std = @import("std");
 const c = @import("cbindings");
