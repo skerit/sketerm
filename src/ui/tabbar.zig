@@ -350,6 +350,10 @@ pub const TabBar = struct {
     /// Smoke-only assertions that both raw-pointer timeout classes and all
     /// signal closures were live, then removed, at the teardown choke point.
     verify_teardown: bool = false,
+    /// Signals carrying this controller as user-data, counted where they
+    /// are connected. `sever` checks its disconnect count against this
+    /// instead of a literal, so an added OR removed signal is detected.
+    signals: c.guint = 0,
     detach_ctx: ?*anyopaque = null,
     on_detach: ?*const fn (ctx: ?*anyopaque, view: *c.AdwTabView, page: *c.AdwTabPage) void = null,
     transfer_ctx: ?*anyopaque = null,
@@ -398,6 +402,9 @@ pub const TabBar = struct {
         right_click: ?*c.GtkGesture = null,
         title_handler: c.gulong = 0,
         icon_handler: c.gulong = 0,
+        /// Signals carrying this Tab as user-data, counted where they are
+        /// connected; `clearTabs` checks its disconnect count against it.
+        signals: c.guint = 0,
         /// Visual horizontal shift (px) used during a reorder: the
         /// dragged tab carries `drag_dx` (glued to the cursor); its
         /// neighbours carry an animated `slide` that eases toward
@@ -465,9 +472,9 @@ pub const TabBar = struct {
         // Capture phase so we claim the press before the header-bar's
         // window-drag gesture (otherwise dragging a tab moves the window).
         c.gtk_event_controller_set_propagation_phase(@ptrCast(@alignCast(reorder)), c.GTK_PHASE_CAPTURE);
-        _ = c.g_signal_connect_data(reorder, "drag-begin", @ptrCast(&onReorderBegin), self, null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(reorder, "drag-update", @ptrCast(&onReorderUpdate), self, null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(reorder, "drag-end", @ptrCast(&onReorderEnd), self, null, c.G_CONNECT_DEFAULT);
+        self.connectSelf(reorder, "drag-begin", @ptrCast(&onReorderBegin));
+        self.connectSelf(reorder, "drag-update", @ptrCast(&onReorderUpdate));
+        self.connectSelf(reorder, "drag-end", @ptrCast(&onReorderEnd));
         c.gtk_widget_add_controller(box, @ptrCast(@alignCast(reorder)));
         self.reorder_gesture = reorder;
 
@@ -475,14 +482,14 @@ pub const TabBar = struct {
         // cross-window transfer half of the hybrid; in-bar reorder never
         // uses content-DnD).
         const drop = c.gtk_drop_target_new(c.G_TYPE_INT, c.GDK_ACTION_MOVE);
-        _ = c.g_signal_connect_data(drop, "drop", @ptrCast(&onDrop), self, null, c.G_CONNECT_DEFAULT);
+        self.connectSelf(drop, "drop", @ptrCast(&onDrop));
         c.gtk_widget_add_controller(box, @ptrCast(@alignCast(drop)));
         self.drop_target = drop;
 
-        _ = c.g_signal_connect_data(view, "page-attached", @ptrCast(&onStructure), self, null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(view, "page-detached", @ptrCast(&onStructure), self, null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(view, "page-reordered", @ptrCast(&onStructure), self, null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(view, "notify::selected-page", @ptrCast(&onSelection), self, null, c.G_CONNECT_DEFAULT);
+        self.connectSelf(view, "page-attached", @ptrCast(&onStructure));
+        self.connectSelf(view, "page-detached", @ptrCast(&onStructure));
+        self.connectSelf(view, "page-reordered", @ptrCast(&onStructure));
+        self.connectSelf(view, "notify::selected-page", @ptrCast(&onSelection));
 
         self.rebuild();
         return self;
@@ -615,8 +622,11 @@ pub const TabBar = struct {
             c.g_object_set_data(@ptrCast(@alignCast(t.child)), "sketerm-tab", null);
             if (t.sep_before) |s|
                 c.g_object_set_data(@ptrCast(@alignCast(s)), "sketerm-sep-tab", null);
-            if (self.verify_teardown and disconnected != 5) {
-                std.debug.print("sketerm: TabBar tab sever mismatch (signals={d})\n", .{disconnected});
+            if (self.verify_teardown and disconnected != t.signals) {
+                std.debug.print(
+                    "sketerm: TabBar tab sever mismatch (signals={d}, connected={d})\n",
+                    .{ disconnected, t.signals },
+                );
                 c.abort();
             }
             if (t.sep_before) |s| c.gtk_box_remove(@ptrCast(self.box), s);
@@ -749,7 +759,7 @@ pub const TabBar = struct {
         // would deny it) — see onReorderBegin.
         const click = c.gtk_gesture_click_new();
         c.gtk_gesture_single_set_button(@ptrCast(click), 2);
-        _ = c.g_signal_connect_data(click, "pressed", @ptrCast(&onPressed), t, null, c.G_CONNECT_DEFAULT);
+        connectTab(t, click, "pressed", @ptrCast(&onPressed));
         c.gtk_widget_add_controller(tab_box, @ptrCast(@alignCast(click)));
         t.middle_click = click;
 
@@ -757,13 +767,29 @@ pub const TabBar = struct {
         // by the Window via the `on_context` hook.
         const rclick = c.gtk_gesture_click_new();
         c.gtk_gesture_single_set_button(@ptrCast(rclick), 3);
-        _ = c.g_signal_connect_data(rclick, "pressed", @ptrCast(&onRightPressed), t, null, c.G_CONNECT_DEFAULT);
+        connectTab(t, rclick, "pressed", @ptrCast(&onRightPressed));
         c.gtk_widget_add_controller(tab_box, @ptrCast(@alignCast(rclick)));
         t.right_click = rclick;
 
-        _ = c.g_signal_connect_data(close, "clicked", @ptrCast(&onClose), t, null, c.G_CONNECT_DEFAULT);
+        connectTab(t, close, "clicked", @ptrCast(&onClose));
         t.title_handler = c.g_signal_connect_data(@ptrCast(page), "notify::title", @ptrCast(&onTitle), t, null, c.G_CONNECT_DEFAULT);
+        t.signals += 1;
         t.icon_handler = c.g_signal_connect_data(@ptrCast(page), "notify::icon", @ptrCast(&onIcon), t, null, c.G_CONNECT_DEFAULT);
+        t.signals += 1;
+    }
+
+    /// Connect one signal carrying this controller as user-data and
+    /// record it, so `sever`'s expected count comes from the connect
+    /// sites rather than a hand-maintained literal.
+    fn connectSelf(self: *TabBar, obj: anytype, name: [*:0]const u8, cb: c.GCallback) void {
+        _ = c.g_signal_connect_data(obj, name, cb, self, null, c.G_CONNECT_DEFAULT);
+        self.signals += 1;
+    }
+
+    /// Same for a per-tab signal; `clearTabs` checks against `t.signals`.
+    fn connectTab(t: *Tab, obj: anytype, name: [*:0]const u8, cb: c.GCallback) void {
+        _ = c.g_signal_connect_data(obj, name, cb, t, null, c.G_CONNECT_DEFAULT);
+        t.signals += 1;
     }
 
     /// Fence every callback carrying this controller or one of its Tab records while widgets are valid.
@@ -830,10 +856,10 @@ pub const TabBar = struct {
         self.clearTabs();
         self.tabs.deinit(self.allocator);
 
-        if (self.verify_teardown and (!sources_live or disconnected != 8)) {
+        if (self.verify_teardown and (!sources_live or disconnected != self.signals)) {
             std.debug.print(
-                "sketerm: TabBar sever mismatch (sources={}, signals={d})\n",
-                .{ sources_live, disconnected },
+                "sketerm: TabBar sever mismatch (sources={}, signals={d}, connected={d})\n",
+                .{ sources_live, disconnected, self.signals },
             );
             c.abort();
         }

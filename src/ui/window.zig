@@ -5037,8 +5037,14 @@ fn reserveNativeDragDestination(source: *Window, destination: *Window) !void {
 fn onWindowDestroyed(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Window, user);
     if (!self.destroying) {
+        // `close-request` fires for user closes and `gtk_window_close`,
+        // never for a plain `gtk_window_destroy`, and a toolkit shutdown
+        // may destroy windows before this RUN_LAST handler. Recover by
+        // running the pre-destroy work here rather than killing a session
+        // with live shells; the smoke rigs still fail loudly.
         std.debug.print("sketerm: GtkWindow destroyed before Window.beginDestroy\n", .{});
-        c.abort();
+        if (c.getenv("SKETERM_VERIFY_WINDOW_TEARDOWN") != null) c.abort();
+        self.beginDestroy();
     }
     if (self.is_primary) {
         const app = c.g_application_get_default();

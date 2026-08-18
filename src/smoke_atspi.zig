@@ -259,6 +259,10 @@ pub fn main() u8 {
         // Keep the TabBar effect/warning sources live and require its
         // pre-widget teardown to remove every raw-data closure.
         _ = c.setenv("SKETERM_VERIFY_TABBAR_TEARDOWN", "1", 1);
+        // A toplevel destroyed without Window.beginDestroy leaks the
+        // pre-destroy work. The shipped binary recovers by running it
+        // late; here it must not happen at all.
+        _ = c.setenv("SKETERM_VERIFY_WINDOW_TEARDOWN", "1", 1);
         // The editor face has the same contract: its GtkGLArea signals
         // carry a raw *EditorView, so an EditorView that reaches deinit
         // unsevered (or with live GL state) aborts here instead of

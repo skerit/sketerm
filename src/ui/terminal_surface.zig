@@ -137,6 +137,11 @@ pub const TerminalSurface = struct {
     /// True once the host's pre-widget-destruction hook removed every
     /// callback whose user-data is this surface.
     callbacks_severed: bool = false,
+    /// How many area signals carry this surface as user-data, counted
+    /// where they are connected (`connectAreaSignal`). `sever` checks
+    /// its disconnect count against this instead of a literal, so both
+    /// an added AND a removed signal are detected.
+    area_signals: c_uint = 0,
     /// A successful realize has made GL state live in this area's
     /// context; unrealize or sever clears it after releasing the state.
     gl_live: bool = false,
@@ -276,55 +281,40 @@ pub const TerminalSurface = struct {
         // GL lifecycle. These signals carry a raw *TerminalSurface;
         // every host must call sever() before either the widget tree or
         // the surface storage dies.
-        _ = c.g_signal_connect_data(
-            area_widget,
-            "realize",
-            @ptrCast(&onRealize),
-            @ptrCast(self),
-            null,
-            c.G_CONNECT_DEFAULT,
-        );
+        self.connectAreaSignal(area_widget, "realize", @ptrCast(&onRealize));
         // unrealize fires while the GL context is STILL CURRENT —
         // last chance to glDelete owned resources. Without it the
         // surface's program / VAOs / VBOs / textures leak into the
         // window's shared context for as long as the window lives.
-        _ = c.g_signal_connect_data(
-            area_widget,
-            "unrealize",
-            @ptrCast(&onUnrealize),
-            @ptrCast(self),
-            null,
-            c.G_CONNECT_DEFAULT,
-        );
-        _ = c.g_signal_connect_data(
-            area_widget,
-            "render",
-            @ptrCast(&onRender),
-            @ptrCast(self),
-            null,
-            c.G_CONNECT_DEFAULT,
-        );
+        self.connectAreaSignal(area_widget, "unrealize", @ptrCast(&onUnrealize));
+        self.connectAreaSignal(area_widget, "render", @ptrCast(&onRender));
         // Resize → grid geometry (live_terminal: TIOCSWINSZ →
         // SIGWINCH child, via Terminal.requestResize).
-        _ = c.g_signal_connect_data(
-            area_widget,
-            "resize",
-            @ptrCast(&onResize),
-            @ptrCast(self),
-            null,
-            c.G_CONNECT_DEFAULT,
-        );
+        self.connectAreaSignal(area_widget, "resize", @ptrCast(&onResize));
         // Becoming visible again (tab switched back) must restart the
         // tick: an animating shader self-removes it while unmapped,
         // so nothing else would resume the animation.
-        _ = c.g_signal_connect_data(area_widget, "map", @ptrCast(&onAreaMap), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-        _ = c.g_signal_connect_data(area_widget, "unmap", @ptrCast(&onAreaUnmap), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        self.connectAreaSignal(area_widget, "map", @ptrCast(&onAreaMap));
+        self.connectAreaSignal(area_widget, "unmap", @ptrCast(&onAreaUnmap));
 
         // Tick is installed on demand via ensureTickRunning. It
         // self-removes when no time-driven work is active. First
         // install happens here so the cold-start cursor settles in
         // and any early animation events are picked up.
         self.ensureTickRunning();
+    }
+
+    /// Connect one area signal carrying this surface as user-data and
+    /// record it, so `sever`'s disconnect count is derived from the
+    /// connect sites rather than a hand-maintained literal.
+    fn connectAreaSignal(
+        self: *TerminalSurface,
+        area_widget: *c.GtkWidget,
+        name: [*:0]const u8,
+        cb: c.GCallback,
+    ) void {
+        _ = c.g_signal_connect_data(area_widget, name, cb, @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        self.area_signals += 1;
     }
 
     /// Free everything the surface owns after `sever` has fenced callbacks.
@@ -390,11 +380,11 @@ pub const TerminalSurface = struct {
         // ReleaseFast drops asserts; the smoke's explicit mode keeps a
         // missing registration or teardown path observable.
         if (c.getenv("SKETERM_VERIFY_SURFACE_TEARDOWN") != null and
-            (disconnected != 6 or self.gl_live))
+            (disconnected != self.area_signals or self.gl_live))
         {
             std.debug.print(
-                "sketerm: TerminalSurface sever mismatch (signals={d}, gl_live={})\n",
-                .{ disconnected, self.gl_live },
+                "sketerm: TerminalSurface sever mismatch (signals={d}, connected={d}, gl_live={})\n",
+                .{ disconnected, self.area_signals, self.gl_live },
             );
             c.abort();
         }

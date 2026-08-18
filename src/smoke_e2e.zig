@@ -706,6 +706,9 @@ pub fn main() u8 {
         // before its area signals, frame tick, and live GL state were
         // synchronously severed.
         _ = c.setenv("SKETERM_VERIFY_SURFACE_TEARDOWN", "1", 1);
+        // Every toplevel must reach Window.beginDestroy before GTK
+        // destroys it; the shipped binary recovers, the rig aborts.
+        _ = c.setenv("SKETERM_VERIFY_WINDOW_TEARDOWN", "1", 1);
         // Arm editor-local atlas texture accounting. The focused stage
         // queries it after zoom/config rebuilds and reparenting; closing
         // that editor aborts if final create/delete totals do not match.
