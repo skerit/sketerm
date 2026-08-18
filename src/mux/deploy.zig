@@ -124,6 +124,17 @@ pub fn prepare(allocator: std.mem.Allocator, host: []const u8) ?Prepared {
     return prepared;
 }
 
+/// Whether this install can auto-deploy a daemon at all.
+///
+/// False on a Linux architecture with no portable musl target: the installer
+/// packaged everything else and warned, so the remote host must already have
+/// sketerm-mux. Callers use this to say that instead of leaving the user with
+/// ssh's bare "command not found".
+pub fn portableAvailable() bool {
+    var buf: [4096:0]u8 = undefined;
+    return findPortable(&buf) != null;
+}
+
 /// Resolve the expected content-addressed path without touching the network.
 pub fn localPath(allocator: std.mem.Allocator) ?Prepared {
     if (c.getenv("SKETERM_SSH") != null and c.getenv("SKETERM_MUX_PORTABLE") == null) return null;

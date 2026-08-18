@@ -227,6 +227,21 @@ build_all() {
     sketerm_build "$root" "$1" "$web_ok" "$CEF_INCLUDE" "$CEF_LIB" "$web_why" "$2"
 }
 
+# The remote-deployment artifact has a fixed target list; everything else
+# builds on any Linux architecture. Sets portable_ok, and warns once here so
+# the omission is stated in installer terms rather than only build terms.
+probe_portable() {
+    # stderr suppressed: the build path names the architecture and the
+    # supported list a moment later, from the one place that owns them.
+    if sketerm_portable_target_for_arch "$1" >/dev/null 2>/dev/null; then
+        portable_ok=1
+    else
+        portable_ok=0
+        warn "packaging without sketerm-mux-portable; remote hosts reached with"
+        warn "\`sketerm ssh\`/\`sketerm mux <host>\` must have sketerm-mux installed already"
+    fi
+}
+
 # ------------------------------------------------------------------ stage
 #
 # Selects the host terminfo compiler, then calls the staging implementation
@@ -234,6 +249,7 @@ build_all() {
 
 stage() {
     local dest=$1 kind=$2 service_prefix=${3:-/usr} tic_bin=${SKETERM_TIC:-}
+    local with_portable=${portable_ok:-1}
     if [ -n "$tic_bin" ]; then
         [ -x "$tic_bin" ] || die "SKETERM_TIC is not executable: $tic_bin"
     elif [ -x /usr/bin/tic ]; then
@@ -246,7 +262,7 @@ stage() {
         warn "tic not found (install ncurses-bin); skipping terminfo entry"
     fi
     sketerm_stage "$root" "$dest" "$kind" "$web_ok" "$tic_bin" sketerm \
-        "$service_prefix"
+        "$service_prefix" "$with_portable"
 }
 
 # ------------------------------------------------------------- debian path
@@ -501,7 +517,7 @@ if command -v dpkg-deb >/dev/null 2>&1; then
     [ "$want_prefix" -eq 0 ] || die "--prefix applies only to plain installs without a package manager"
     package_arch=$(dpkg --print-architecture) \
         || die "could not determine the Debian package architecture"
-    sketerm_portable_target_for_arch "$package_arch" >/dev/null || exit 1
+    probe_portable "$package_arch"
     if [ "$want_deps" -eq 1 ]; then
         check_zig
         if [ "$mode" = mux ]; then
@@ -518,7 +534,7 @@ else
         || die "--deps requires an Arch-compatible GUI package build or a dpkg-based host"
     warn "no makepkg and no dpkg-deb; falling back to a plain install"
     package_arch=$(uname -m) || die "could not determine the host architecture"
-    sketerm_portable_target_for_arch "$package_arch" >/dev/null || exit 1
+    probe_portable "$package_arch"
     select_kind
     if [ "$kind" = gui ]; then
         sketerm_validate_install_prefix "$prefix" \

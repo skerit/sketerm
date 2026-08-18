@@ -86,7 +86,12 @@ build() {
 }
 
 package() {
-    sketerm_stage "$(_srcroot)" "$pkgdir" gui 1 tic "$pkgname"
+    # arch=() keeps this to the two architectures that have a portable
+    # target, but the flag is derived rather than assumed so build() and
+    # package() can never disagree about what was produced.
+    local with_portable=1
+    sketerm_portable_target_for_arch "$CARCH" >/dev/null || with_portable=0
+    sketerm_stage "$(_srcroot)" "$pkgdir" gui 1 tic "$pkgname" /usr "$with_portable"
 }
 
 # vim:set ts=4 sw=4 et:

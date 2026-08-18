@@ -366,21 +366,31 @@ INSTALL_TEST_APT_LOG="$work/apt.log"
 INSTALL_TEST_DEPS_READY="$work/deps-ready"
 INSTALL_TEST_CONTROL_LOG="$work/control"
 
+# An architecture with no portable musl target still gets its daemon: only
+# the remote-deployment artifact is impossible there, and it is packaged
+# without it after saying so.
 rm -f "$work/unsupported-package-zig.log"
-set +e
 BASH_ENV="$work/no-makepkg.bash" \
     PATH="$fakebin:$PATH" \
+    SKETERM_TIC="$fakebin/tic" \
     INSTALL_TEST_DPKG_ARCH=riscv64 \
     INSTALL_TEST_ZIG_LOG="$work/unsupported-package-zig.log" \
+    INSTALL_TEST_DEB_LOG="$work/unsupported-deb.log" \
+    INSTALL_TEST_CONTROL_LOG="$work/unsupported-control" \
+    INSTALL_TEST_FORBIDDEN="$work/forbidden.log" \
     "$fixture/dist/install.sh" --mux-only --no-install \
-    > "$work/unsupported-package-arch.out" 2>&1
-status=$?
-set -e
-[ "$status" -eq 1 ] || fail "installer accepted an unsupported package architecture"
-[ ! -e "$work/unsupported-package-zig.log" ] \
-    || fail "installer started building an unsupported package architecture"
+    > "$work/unsupported-package-arch.out" 2>&1 \
+    || fail "installer refused to build for an unsupported portable architecture"
+[[ "$(<"$work/unsupported-package-zig.log")" == *"<call> <build> <mux> <-Doptimize=ReleaseFast>"* ]] \
+    || fail "unsupported portable architecture did not build the daemon"
+[[ "$(<"$work/unsupported-package-zig.log")" != *"<mux-portable>"* ]] \
+    || fail "unsupported portable architecture attempted a portable build"
 [[ "$(<"$work/unsupported-package-arch.out")" == *"unsupported Linux package architecture"* ]] \
-    || fail "installer did not explain its unsupported architecture policy"
+    || fail "installer did not name the unsupported architecture"
+[[ "$(<"$work/unsupported-package-arch.out")" == *"must have sketerm-mux installed already"* ]] \
+    || fail "installer did not explain what the omitted artifact costs"
+[ "$(grep '^Architecture:' "$work/unsupported-control")" = 'Architecture: riscv64' ] \
+    || fail "unsupported portable architecture produced the wrong package arch"
 
 rm -f "$INSTALL_TEST_DEPS_READY"
 : > "$INSTALL_TEST_APT_LOG"
@@ -908,11 +918,14 @@ source "$here/stage.sh"
 [ "$(sketerm_portable_target_for_arch arm64)" = aarch64-linux-musl ] \
     || fail "arm64 portable target mapping is wrong"
 set +e
-sketerm_portable_target_for_arch riscv64 > "$work/unsupported-arch.out" 2>&1
+sketerm_portable_target_for_arch riscv64 \
+    > "$work/unsupported-arch.out" 2> "$work/unsupported-arch.err"
 status=$?
 set -e
 [ "$status" -eq 1 ] || fail "unsupported packaging architecture was accepted"
-[[ "$(<"$work/unsupported-arch.out")" == *"unsupported Linux package architecture"* ]] \
+[ ! -s "$work/unsupported-arch.out" ] \
+    || fail "unsupported packaging architecture emitted a target on stdout"
+[[ "$(<"$work/unsupported-arch.err")" == *"unsupported Linux package architecture"* ]] \
     || fail "unsupported packaging architecture failure was not explicit"
 
 shared_ver=$(sketerm_pkgver "$fixture")

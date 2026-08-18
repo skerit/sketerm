@@ -12,6 +12,7 @@ const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const mux_client = @import("../mux/client.zig");
 const channel_pump = @import("../mux/channel_pump.zig");
+const deploy = @import("../mux/deploy.zig");
 const clock = @import("../util/clock.zig");
 const mux_daemon = @import("../mux/daemon.zig");
 const mux_wire = @import("../mux/wire.zig");
@@ -872,19 +873,28 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
         const remote = mux_client.RemoteSpec.parse(h);
         const conn = mux_client.Conn.connectRemote(allocator, h, cfg.udpRange()) catch {
             const mode_name = @tagName(remote.mode);
+            // No portable artifact = this install cannot deploy the daemon
+            // for the user (a Linux architecture the packaging has no musl
+            // target for), so "not installed there" is the whole story.
+            const deploy_note: [*:0]const u8 = if (deploy.portableAvailable())
+                ""
+            else
+                "  this build ships no sketerm-mux-portable, so it cannot\n" ++
+                    "  deploy the daemon itself: install sketerm-mux there\n";
             _ = c.fprintf(
                 platform.stderr(),
                 "sketerm mux: cannot reach %.*s using %.*s transport policy\n" ++
                     "  see the real error:  ssh %.*s sketerm-mux --proxy\n" ++
                     "  common causes: sketerm-mux not installed there; binary built\n" ++
                     "  for a newer CPU (deploy `zig build mux-portable` instead);\n" ++
-                    "  key/agent auth not set up; or UDP filtered when forced\n",
+                    "  key/agent auth not set up; or UDP filtered when forced\n%s",
                 @as(c_int, @intCast(remote.host.len)),
                 remote.host.ptr,
                 @as(c_int, @intCast(mode_name.len)),
                 mode_name.ptr,
                 @as(c_int, @intCast(remote.host.len)),
                 remote.host.ptr,
+                deploy_note,
             );
             return null;
         };

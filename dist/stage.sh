@@ -99,12 +99,15 @@ sketerm_install_portal_service() {
 
 # Map the package manager's host architecture to the deployment artifact's
 # baseline Linux target. Keep aliases from both dpkg and uname/makepkg here.
+# Failure is NOT fatal: the daemon and GUI build fine on every Linux
+# architecture, only the musl artifact `sketerm ssh` scp's to a remote host
+# has a fixed target list. Callers degrade, so the message is a warning.
 sketerm_portable_target_for_arch() {
     case "$1" in
         x86_64|amd64) printf 'x86_64-linux-musl\n' ;;
         aarch64|arm64) printf 'aarch64-linux-musl\n' ;;
         *)
-            printf '==> ERROR: unsupported Linux package architecture for sketerm-mux-portable: %s (supported: x86_64/amd64, aarch64/arm64)\n' "$1" >&2
+            sketerm_warn "unsupported Linux package architecture for sketerm-mux-portable: $1 (supported: x86_64/amd64, aarch64/arm64)"
             return 1 ;;
     esac
 }
@@ -129,7 +132,7 @@ sketerm_pkgver() {
 sketerm_build() {
     local root=$1 kind=$2 web_ok=$3 cef_include=$4 cef_lib=$5 web_skip_reason=${6:-}
     local package_arch=$7 portable_target
-    portable_target=$(sketerm_portable_target_for_arch "$package_arch") || return 1
+    portable_target=$(sketerm_portable_target_for_arch "$package_arch") || portable_target=
     cd "$root"
 
     if [ "$kind" = gui ]; then
@@ -157,20 +160,28 @@ sketerm_build() {
 
     # The portable daemon compiles the Opus probe out and stays
     # static/codec-free by design; it is what gets scp'd to servers.
-    zig build mux-portable -Doptimize=ReleaseFast \
-        -Dportable-target="$portable_target"
+    if [ -n "$portable_target" ]; then
+        zig build mux-portable -Doptimize=ReleaseFast \
+            -Dportable-target="$portable_target"
+    else
+        sketerm_warn "packaging without sketerm-mux-portable; \`sketerm ssh <host>\` will need sketerm-mux already installed there"
+    fi
 }
 
 # Stage the package-independent install tree for every Linux backend.
 sketerm_stage() {
     local root=$1 dest=$2 kind=$3 with_web=$4 tic_bin=$5 license_name=$6
-    local service_prefix=${7:-/usr}
+    local service_prefix=${7:-/usr} with_portable=${8:-1}
     local i
     cd "$root"
 
     install -Dm755 zig-out/bin/sketerm-mux "$dest/usr/bin/sketerm-mux"
-    install -Dm755 zig-out/bin/sketerm-mux-portable \
-        "$dest/usr/lib/sketerm/sketerm-mux-portable"
+    # Told explicitly rather than probed: a zig-out left over from a build on
+    # another architecture must not be packaged as this one's artifact.
+    if [ "$with_portable" -eq 1 ]; then
+        install -Dm755 zig-out/bin/sketerm-mux-portable \
+            "$dest/usr/lib/sketerm/sketerm-mux-portable"
+    fi
 
     if [ "$kind" = gui ]; then
         install -Dm755 zig-out/bin/sketerm "$dest/usr/bin/sketerm"
