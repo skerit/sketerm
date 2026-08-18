@@ -15,6 +15,13 @@
 //! v7: no field changes — it marks colrv1 support. A v6 peer's
 //! `Format` enum has no tag 2, so its restore would reject the whole
 //! snapshot; colrv1 entries are withheld from v6 bodies instead.
+//! v9: a second trailing block carries the rest of the persistent,
+//! app-driven state: the completed OSC 133 zone ring, the Kitty
+//! placeholder assembly + auto-increment context, virtual placements,
+//! OSC 17/19 selection colors and the OSC 1337 user variables. v1-v8
+//! bodies restore those to Screen.init defaults: no completed zones, no
+//! placeholder context, no virtual placements, unset selection colors
+//! and an empty variable store.
 //! v8: a trailing interpreter-state block carries DECSC/DECRC state,
 //! charsets, single shift, tab stops, UTF-8/REP context, title stack,
 //! omitted terminal modes, keyboard stacks, and the prompt-ring head.
@@ -25,15 +32,228 @@
 //! derived from the serialized mark count (zero when the ring is full).
 
 const std = @import("std");
-const Screen = @import("../grid/screen.zig").Screen;
+const grid = @import("../grid/screen.zig");
+const Screen = grid.Screen;
 const Line = @import("../grid/line.zig").Line;
 const Cell = @import("../grid/cell.zig").Cell;
 const style_pool = @import("../grid/style_pool.zig");
 const wire = @import("wire.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION = 8;
+pub const SNAPSHOT_VERSION = 9;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
+
+/// What a `Screen` field means to a snapshot.
+const FieldClass = enum {
+    /// Written by `serializeVersion` and read back by `restoreStaged`.
+    carried,
+    /// Off the wire on purpose, because restore reconstructs it from
+    /// carried data or the restoring process owns it outright.
+    derived,
+    /// Off the wire on purpose, because it belongs to one viewer, one
+    /// process or one frame and would be wrong if it crossed the socket.
+    transient,
+};
+
+/// The declaring home for "which `Screen` fields survive a reattach".
+///
+/// `serializeVersion`, `restoreStaged` and the test comparator each
+/// hand-enumerate a subset of a 130-field struct, and twice now
+/// persistent app-driven state was added to `Screen` and silently
+/// dropped on every attach because nothing tied those three lists to
+/// the struct. Adding a field without classifying it here fails the
+/// build; that is the whole point.
+const field_policy = [_]struct { name: []const u8, class: FieldClass }{
+    // Grid geometry and contents.
+    .{ .name = "cols", .class = .carried },
+    .{ .name = "rows", .class = .carried },
+    .{ .name = "active", .class = .carried },
+    .{ .name = "alt", .class = .carried },
+    .{ .name = "use_alt", .class = .carried },
+    .{ .name = "scrollback", .class = .carried },
+    // Scrollback is re-linearized on restore; its cap and the viewport
+    // are the viewer's own policy, not the session's state.
+    .{ .name = "scrollback_head", .class = .derived },
+    .{ .name = "scrollback_capacity", .class = .transient },
+    .{ .name = "view_offset", .class = .transient },
+    .{ .name = "scroll_on_output", .class = .transient },
+    .{ .name = "track_activity", .class = .transient },
+    .{ .name = "word_chars", .class = .transient },
+    // Child lifetime is reported by wire frames, never by a snapshot.
+    .{ .name = "child_exited", .class = .transient },
+    .{ .name = "child_exit_status", .class = .transient },
+
+    // Cursor, saved cursor, scroll region.
+    .{ .name = "row", .class = .carried },
+    .{ .name = "col", .class = .carried },
+    .{ .name = "saved_row", .class = .carried },
+    .{ .name = "saved_col", .class = .carried },
+    .{ .name = "saved_style", .class = .carried },
+    .{ .name = "saved_origin", .class = .carried },
+    .{ .name = "saved_autowrap", .class = .carried },
+    .{ .name = "saved_charset_g0", .class = .carried },
+    .{ .name = "saved_charset_g1", .class = .carried },
+    .{ .name = "saved_active_charset", .class = .carried },
+    .{ .name = "saved_link_id", .class = .carried },
+    .{ .name = "cur_style", .class = .carried },
+    .{ .name = "scroll_top", .class = .carried },
+    .{ .name = "scroll_bot", .class = .carried },
+
+    // Modes.
+    .{ .name = "autowrap", .class = .carried },
+    .{ .name = "origin_mode", .class = .carried },
+    .{ .name = "insert_mode", .class = .carried },
+    .{ .name = "bracketed_paste", .class = .carried },
+    // Config policy and per-process role flags: the daemon's answer is
+    // not the viewer's answer.
+    .{ .name = "allow_clipboard_read", .class = .transient },
+    .{ .name = "mode_2031", .class = .carried },
+    .{ .name = "in_band_resize", .class = .carried },
+    .{ .name = "color_scheme_dark", .class = .transient },
+    .{ .name = "mute_responses", .class = .transient },
+    .{ .name = "defer_gui_queries", .class = .transient },
+    .{ .name = "line_feed_mode", .class = .carried },
+
+    // Titles.
+    .{ .name = "title_stack", .class = .carried },
+    .{ .name = "title_stack_depth", .class = .carried },
+    .{ .name = "last_title", .class = .carried },
+    // Font identity and cell metrics come from the viewer's renderer.
+    .{ .name = "font_name", .class = .transient },
+    .{ .name = "cell_pixel_w", .class = .transient },
+    .{ .name = "cell_pixel_h", .class = .transient },
+
+    .{ .name = "focus_reports", .class = .carried },
+    .{ .name = "app_cursor_keys", .class = .carried },
+    .{ .name = "app_keypad", .class = .carried },
+    .{ .name = "cursor_visible", .class = .carried },
+    .{ .name = "cursor_shape", .class = .carried },
+    // Blink phase and the trail epoch are render state; restore bumps
+    // the epoch itself so the trail teleports instead of smearing.
+    .{ .name = "cursor_blink_on", .class = .transient },
+    .{ .name = "viewport_epoch", .class = .derived },
+    .{ .name = "mouse_mode", .class = .carried },
+    .{ .name = "mouse_sgr", .class = .carried },
+    .{ .name = "mouse_enc", .class = .carried },
+    .{ .name = "pending_single_shift", .class = .carried },
+    .{ .name = "sync_output", .class = .carried },
+    .{ .name = "pending_wrap", .class = .carried },
+    .{ .name = "decoder", .class = .carried },
+    .{ .name = "dirty", .class = .derived },
+
+    // Overlays owned by the viewer's Window / Terminal.
+    .{ .name = "selection", .class = .transient },
+    .{ .name = "copy_cursor", .class = .transient },
+    .{ .name = "search_highlights", .class = .transient },
+    .{ .name = "search_active_idx", .class = .transient },
+    .{ .name = "hints_overlay", .class = .transient },
+    .{ .name = "predictions_overlay", .class = .transient },
+
+    // Image retention: the flag is the daemon's role, the list is the
+    // payload, the byte count is recomputed while restoring it.
+    .{ .name = "retain_images", .class = .transient },
+    .{ .name = "retained_images", .class = .carried },
+    .{ .name = "retained_image_bytes", .class = .derived },
+
+    .{ .name = "pool", .class = .derived },
+    .{ .name = "allocator", .class = .derived },
+
+    .{ .name = "current_link_id", .class = .carried },
+    .{ .name = "next_link_id", .class = .carried },
+    .{ .name = "links", .class = .carried },
+    // IME preedit and the bell timestamp belong to the local frame.
+    .{ .name = "preedit_text", .class = .transient },
+    .{ .name = "bell_at_us", .class = .transient },
+
+    .{ .name = "last_print_cp", .class = .carried },
+    .{ .name = "last_print_key", .class = .carried },
+    .{ .name = "clusters", .class = .carried },
+    // The image store is deliberately not carried: the pixels dwarf the
+    // rest of the body. Post-attach transmissions repopulate it, and
+    // pre-attach placements ride `retained_images` instead.
+    .{ .name = "kitty_images", .class = .transient },
+    .{ .name = "glyphs", .class = .carried },
+    .{ .name = "virtual_placements", .class = .carried },
+    .{ .name = "ph_pending", .class = .carried },
+    .{ .name = "ph_last", .class = .carried },
+
+    .{ .name = "default_fg", .class = .carried },
+    .{ .name = "default_bg", .class = .carried },
+    .{ .name = "cursor_color", .class = .carried },
+    // OSC 110/111 reset to the VIEWER's configured colors; carrying the
+    // daemon's would overwrite the user's theme on every attach.
+    .{ .name = "configured_fg", .class = .transient },
+    .{ .name = "configured_bg", .class = .transient },
+    .{ .name = "selection_bg", .class = .carried },
+    .{ .name = "selection_fg", .class = .carried },
+    .{ .name = "user_vars", .class = .carried },
+    .{ .name = "palette", .class = .carried },
+
+    .{ .name = "next_line_id", .class = .carried },
+    .{ .name = "prompt_marks", .class = .carried },
+    .{ .name = "prompt_marks_len", .class = .carried },
+    .{ .name = "prompt_marks_head", .class = .carried },
+    .{ .name = "pending_output_start_id", .class = .carried },
+    .{ .name = "pending_output_awaits_nl", .class = .carried },
+    .{ .name = "last_output_start_id", .class = .carried },
+    .{ .name = "last_output_end_id", .class = .carried },
+    .{ .name = "last_cmd_exit", .class = .carried },
+    .{ .name = "cmd_completion_seq", .class = .carried },
+    .{ .name = "cmd_zones", .class = .carried },
+    .{ .name = "cmd_zones_len", .class = .carried },
+    .{ .name = "cmd_zones_head", .class = .carried },
+
+    // OSC 99 accumulator: a half-received notification is dropped by
+    // design, exactly as a different identifier drops it live.
+    .{ .name = "notify_id", .class = .transient },
+    .{ .name = "notify_id_len", .class = .transient },
+    .{ .name = "notify_title", .class = .transient },
+    .{ .name = "notify_body", .class = .transient },
+    .{ .name = "notify_buttons", .class = .transient },
+    .{ .name = "notify_icon_data", .class = .transient },
+    .{ .name = "notify_icon_name", .class = .transient },
+    .{ .name = "notify_urgency", .class = .transient },
+    .{ .name = "notify_report", .class = .transient },
+    .{ .name = "notify_focus", .class = .transient },
+    .{ .name = "notify_occasion", .class = .transient },
+
+    .{ .name = "modify_other_keys", .class = .carried },
+    .{ .name = "reverse_screen", .class = .carried },
+    .{ .name = "allow_decolm", .class = .carried },
+    .{ .name = "kitty_kbd_flags", .class = .carried },
+    .{ .name = "kitty_kbd_stack", .class = .carried },
+    .{ .name = "kitty_kbd_depth", .class = .carried },
+    .{ .name = "kitty_kbd_other_flags", .class = .carried },
+    .{ .name = "kitty_kbd_other_stack", .class = .carried },
+    .{ .name = "kitty_kbd_other_depth", .class = .carried },
+    .{ .name = "tab_stops", .class = .carried },
+    .{ .name = "charset_g0", .class = .carried },
+    .{ .name = "charset_g1", .class = .carried },
+    .{ .name = "active_charset", .class = .carried },
+
+    // Callbacks into the hosting process.
+    .{ .name = "sink", .class = .transient },
+};
+
+comptime {
+    @setEvalBranchQuota(200_000);
+    for (std.meta.fields(Screen)) |f| {
+        var classified = false;
+        for (field_policy) |p| {
+            if (std.mem.eql(u8, p.name, f.name)) classified = true;
+        }
+        if (!classified) @compileError("Screen." ++ f.name ++ " is not classified in snapshot.zig field_policy:" ++
+            " add it as .carried (and extend serializeVersion, restoreStaged and expectScreensEqual)," ++
+            " .derived, or .transient");
+    }
+    for (field_policy) |p| {
+        var exists = false;
+        for (std.meta.fields(Screen)) |f| {
+            if (std.mem.eql(u8, p.name, f.name)) exists = true;
+        }
+        if (!exists) @compileError("snapshot.zig field_policy classifies Screen." ++ p.name ++ ", which no longer exists");
+    }
+}
 
 /// v5: byte budget for the Glyph Protocol glossary tail. Newest
 /// registrations win when the lot would overflow (same policy as
@@ -343,6 +563,60 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
             // An unset slot below the depth is a lost title, not a
             // reason to withhold the whole screen from every viewer.
             try s.bytes(entry orelse "");
+        }
+    }
+
+    // v9 tail: the remaining persistent app-driven state. Every field
+    // here decides how POST-attach input is interpreted or drawn, so a
+    // client without it diverges from the daemon on the next event.
+    if (version >= 9) {
+        // The completed-zone ring goes out whole, head included, so a
+        // later OSC 133 D lands in the same slot on both sides.
+        if (screen.cmd_zones_len > screen.cmd_zones.len or
+            screen.cmd_zones_head >= screen.cmd_zones.len) return error.BadScreenState;
+        try s.int(u16, screen.cmd_zones_len);
+        try s.int(u16, screen.cmd_zones_head);
+        try s.out.appendSlice(allocator, std.mem.asBytes(&screen.cmd_zones));
+
+        // Kitty placeholder assembly + auto-increment context: this is
+        // what the NEXT printed cell is resolved against.
+        if (screen.ph_pending) |pp| {
+            try s.byte(1);
+            try s.int(u16, pp.screen_row);
+            try s.int(u16, pp.screen_col);
+            try s.int(u32, pp.image_id);
+            for (pp.diac) |d| try s.int(u32, d);
+            try s.byte(pp.n_diac);
+        } else {
+            try s.byte(0);
+        }
+        if (screen.ph_last) |pl| {
+            try s.byte(1);
+            try s.int(u16, pl.screen_row);
+            try s.int(u16, pl.screen_col);
+            try s.int(u32, pl.image_id);
+            try s.int(u32, pl.img_row);
+            try s.int(u32, pl.img_col);
+        } else {
+            try s.byte(0);
+        }
+
+        try s.int(u32, @intCast(screen.virtual_placements.count()));
+        var vp_it = screen.virtual_placements.iterator();
+        while (vp_it.next()) |kv| {
+            try s.int(u32, kv.key_ptr.*);
+            try s.int(u32, kv.value_ptr.rows);
+            try s.int(u32, kv.value_ptr.cols);
+            try s.int(u32, kv.value_ptr.placement_id);
+        }
+
+        try s.f32x4(screen.selection_bg);
+        try s.f32x4(screen.selection_fg);
+
+        try s.int(u16, @intCast(screen.user_vars.items.len));
+        for (screen.user_vars.items) |uv| {
+            try s.bytes(uv.name);
+            try s.bytes(uv.value);
         }
     }
 }
@@ -814,6 +1088,80 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
         }
     }
 
+    // v9 tail: older snapshots keep Screen.init defaults here (no
+    // completed zones, no placeholder context, no virtual placements,
+    // unset selection colors, no user variables).
+    if (version >= 9) {
+        const zones_len = try src.int(u16);
+        const zones_head = try src.int(u16);
+        if (zones_len > screen.cmd_zones.len or zones_head >= screen.cmd_zones.len)
+            return error.BadSnapshot;
+        const zone_bytes = try src.take(@sizeOf(@TypeOf(screen.cmd_zones)));
+        @memcpy(std.mem.asBytes(&screen.cmd_zones), zone_bytes);
+        screen.cmd_zones_len = zones_len;
+        screen.cmd_zones_head = zones_head;
+
+        if (try src.strictBoolean()) {
+            const ph_row = try src.int(u16);
+            const ph_col = try src.int(u16);
+            const ph_image_id = try src.int(u32);
+            var diac: [3]u32 = undefined;
+            for (&diac) |*d| d.* = try src.int(u32);
+            const n_diac = try src.byte();
+            if (n_diac > diac.len or ph_row >= rows or ph_col >= cols) return error.BadSnapshot;
+            screen.ph_pending = .{
+                .screen_row = ph_row,
+                .screen_col = ph_col,
+                .image_id = ph_image_id,
+                .diac = diac,
+                .n_diac = n_diac,
+            };
+        }
+        if (try src.strictBoolean()) {
+            screen.ph_last = .{
+                .screen_row = try src.int(u16),
+                .screen_col = try src.int(u16),
+                .image_id = try src.int(u32),
+                .img_row = try src.int(u32),
+                .img_col = try src.int(u32),
+            };
+        }
+
+        const n_placements = try src.int(u32);
+        if (n_placements > grid.VIRTUAL_PLACEMENT_CAP) return error.BadSnapshot;
+        for (0..n_placements) |_| {
+            const key = try src.int(u32);
+            const placement = grid.VirtualPlacement{
+                .rows = try src.int(u32),
+                .cols = try src.int(u32),
+                .placement_id = try src.int(u32),
+            };
+            if (key == 0 or screen.virtual_placements.contains(key)) return error.BadSnapshot;
+            try screen.virtual_placements.put(key, placement);
+        }
+
+        screen.selection_bg = try src.f32x4();
+        screen.selection_fg = try src.f32x4();
+
+        const n_user_vars = try src.int(u16);
+        if (n_user_vars > grid.USER_VAR_CAP) return error.BadSnapshot;
+        try screen.user_vars.ensureTotalCapacity(allocator, n_user_vars);
+        for (0..n_user_vars) |_| {
+            const name_len = try src.int(u32);
+            const name = try src.take(name_len);
+            const value_len = try src.int(u32);
+            const value = try src.take(value_len);
+            // `setUserVar` never stores an empty value or a duplicate
+            // name: a body that does is malformed, not merely odd.
+            if (name.len == 0 or value.len == 0 or screen.userVar(name) != null)
+                return error.BadSnapshot;
+            const name_copy = try allocator.dupe(u8, name);
+            errdefer allocator.free(name_copy);
+            const value_copy = try allocator.dupe(u8, value);
+            screen.user_vars.appendAssumeCapacity(.{ .name = name_copy, .value = value_copy });
+        }
+    }
+
     if (version >= 8) try validateLinkState(screen);
     if (version >= 8 and src.pos != src.bytes.len) return error.BadSnapshot;
 
@@ -966,6 +1314,23 @@ fn expectScreensEqual(expected: *const Screen, actual: *const Screen) !void {
     try testing.expectEqual(expected.title_stack_depth, actual.title_stack_depth);
     for (0..expected.title_stack_depth) |idx| {
         try testing.expectEqualStrings(expected.title_stack[idx].?, actual.title_stack[idx].?);
+    }
+    try testing.expectEqual(expected.cmd_zones_len, actual.cmd_zones_len);
+    try testing.expectEqual(expected.cmd_zones_head, actual.cmd_zones_head);
+    try testing.expectEqualSlices(u8, std.mem.asBytes(&expected.cmd_zones), std.mem.asBytes(&actual.cmd_zones));
+    try testing.expectEqual(expected.ph_pending, actual.ph_pending);
+    try testing.expectEqual(expected.ph_last, actual.ph_last);
+    try testing.expectEqual(expected.virtual_placements.count(), actual.virtual_placements.count());
+    var placements = expected.virtual_placements.iterator();
+    while (placements.next()) |entry| {
+        try testing.expectEqual(entry.value_ptr.*, actual.virtual_placements.get(entry.key_ptr.*) orelse
+            return error.TestExpectedEqual);
+    }
+    try testing.expectEqual(expected.selection_bg, actual.selection_bg);
+    try testing.expectEqual(expected.selection_fg, actual.selection_fg);
+    try testing.expectEqual(expected.user_vars.items.len, actual.user_vars.items.len);
+    for (expected.user_vars.items) |uv| {
+        try testing.expectEqualStrings(uv.value, actual.userVar(uv.name) orelse return error.TestExpectedEqual);
     }
     try testing.expectEqual(expected.prompt_marks_len, actual.prompt_marks_len);
     try testing.expectEqual(expected.prompt_marks_head, actual.prompt_marks_head);
@@ -2100,4 +2465,135 @@ test "snapshot: empty glossary costs 4 bytes; v4 bodies restore empty" {
     const back = try restore(a, &pool2, v4buf.items);
     defer back.deinit();
     try testing.expectEqual(@as(usize, 0), back.glyphs.count());
+}
+
+/// Append a codepoint's UTF-8 -- Kitty placeholder + diacritic helper.
+fn appendCp(list: *std.ArrayList(u8), a: std.mem.Allocator, cp: u21) !void {
+    var buf: [4]u8 = undefined;
+    const n = try std.unicode.utf8Encode(cp, &buf);
+    try list.appendSlice(a, buf[0..n]);
+}
+
+test "snapshot: v9 zones, placeholder context and OSC state stay aligned after attach" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 20, 6);
+    defer h.deinit();
+
+    // Two completed OSC 133 zones, so the ring carries content AND a head.
+    h.feed("\x1b]133;A\x07\x1b]133;C\x07one\r\n\x1b]133;D;0\x07");
+    h.feed("\x1b]133;A\x07\x1b]133;C\x07two\r\n\x1b]133;D;3\x07");
+    try testing.expectEqual(@as(u16, 2), h.screen.cmd_zones_len);
+
+    // OSC 17/19 selection colors and two OSC 1337 user variables.
+    h.feed("\x1b]17;rgb:ffff/0000/0000\x07\x1b]19;#00ff00\x07");
+    h.feed("\x1b]1337;SetUserVar=branch=bWFpbg==\x07"); // "main"
+    h.feed("\x1b]1337;SetUserVar=host=Ym94\x07"); // "box"
+    try testing.expectEqual(@as(usize, 2), h.screen.user_vars.items.len);
+
+    // A Kitty virtual placement, then a placeholder cell left MID-
+    // ASSEMBLY: the base is printed and only its row diacritic has
+    // arrived, so the next event decides which tile the cell shows.
+    const rgba = [_]u8{
+        0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
+        0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    };
+    var b64_buf: [32]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
+    var tx_buf: [128]u8 = undefined;
+    h.feed(try std.fmt.bufPrint(&tx_buf, "\x1b_Gi=5,a=T,U=1,f=32,s=2,v=2,c=2,r=2;{s}\x1b\\", .{b64}));
+    var seq: std.ArrayList(u8) = .empty;
+    defer seq.deinit(a);
+    try seq.appendSlice(a, "\r\x1b[38;5;5m");
+    try appendCp(&seq, a, 0x10EEEE);
+    try appendCp(&seq, a, 0x0305); // image row 0
+    h.feed(seq.items);
+    try testing.expectEqual(@as(u32, 1), h.screen.virtual_placements.count());
+    try testing.expect(h.screen.ph_pending != null);
+    try testing.expectEqual(@as(u8, 1), h.screen.ph_pending.?.n_diac);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(h.screen, &body, a);
+    var client_pool = try Pool.init(a);
+    defer client_pool.deinit();
+    const client = try restore(a, &client_pool, body.items);
+    defer client.deinit();
+    try expectScreensEqual(h.screen, client);
+
+    var pair = PairFeeder.init(a, h.screen, client);
+    defer pair.deinit();
+
+    // The pending placeholder's column diacritic lands after attach.
+    var post: std.ArrayList(u8) = .empty;
+    defer post.deinit(a);
+    try appendCp(&post, a, 0x030D); // image column 1
+    try post.append(a, '\n');
+    pair.feed(post.items);
+    try expectScreensEqual(h.screen, client);
+    try testing.expect(client.ph_pending == null);
+    try testing.expectEqual(@as(u32, 5), client.ph_last.?.image_id);
+    try testing.expectEqual(@as(u32, 1), client.ph_last.?.img_col);
+
+    // A third command completes: it must land in the same ring slot on
+    // both sides, which only works if the ring and head crossed.
+    pair.feed("\x1b]133;A\x07\x1b]133;C\x07three\r\n\x1b]133;D;7\x07");
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqual(@as(u16, 3), client.cmd_zones_len);
+    try testing.expectEqual(@as(i32, 7), client.cmdZone(0).?.exit);
+    try testing.expectEqual(@as(i32, 3), client.cmdZone(1).?.exit);
+
+    // Setting an EXISTING user variable overwrites; on a client that
+    // never received it, the same bytes append a second entry instead.
+    pair.feed("\x1b]1337;SetUserVar=branch=ZGV2\x07"); // "dev"
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqual(@as(usize, 2), client.user_vars.items.len);
+    try testing.expectEqualStrings("dev", client.userVar("branch").?);
+
+    // A second virtual placement merges with the carried one.
+    var tx2_buf: [128]u8 = undefined;
+    pair.feed(try std.fmt.bufPrint(&tx2_buf, "\x1b_Gi=6,a=T,U=1,f=32,s=2,v=2,c=2,r=2;{s}\x1b\\", .{b64}));
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqual(@as(u32, 2), client.virtual_placements.count());
+
+    // OSC 117/119 reset to the unset sentinel from the CARRIED colors.
+    try testing.expectEqual(@as(f32, 1.0), client.selection_bg[0]);
+    try testing.expectEqual(@as(f32, 1.0), client.selection_fg[1]);
+    pair.feed("\x1b]117\x07\x1b]119\x07");
+    try expectScreensEqual(h.screen, client);
+    try testing.expectEqual(@as(f32, 0.0), client.selection_bg[3]);
+}
+
+test "snapshot: a v9 body is refused by a v8 reader and truncation is Truncated" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 8, 2);
+    defer h.deinit();
+    h.feed("\x1b]133;A\x07\x1b]133;C\x07x\r\n\x1b]133;D;1\x07");
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(h.screen, &body, a);
+
+    // A truncated tail is a short read, never garbage.
+    var pool_short = try Pool.init(a);
+    defer pool_short.deinit();
+    try testing.expectError(error.Truncated, restore(a, &pool_short, body.items[0 .. body.items.len - 4]));
+
+    // Restamping a v9 body as v8 must fail loudly: the v8 reader's
+    // end-of-body check is what makes the version bump mandatory.
+    const restamped = try a.dupe(u8, body.items);
+    defer a.free(restamped);
+    std.mem.writeInt(u32, restamped[0..4], 8, .little);
+    var pool_v8 = try Pool.init(a);
+    defer pool_v8.deinit();
+    try testing.expectError(error.BadSnapshot, restore(a, &pool_v8, restamped));
+
+    // And a genuine v8 body still restores through the v9 reader.
+    var v8_body: std.ArrayList(u8) = .empty;
+    defer v8_body.deinit(a);
+    try serializeVersion(h.screen, &v8_body, a, 8);
+    var pool_old = try Pool.init(a);
+    defer pool_old.deinit();
+    const old = try restore(a, &pool_old, v8_body.items);
+    defer old.deinit();
+    try testing.expectEqual(@as(u16, 0), old.cmd_zones_len);
 }

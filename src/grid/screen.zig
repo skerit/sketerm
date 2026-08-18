@@ -43,6 +43,12 @@ pub const CmdZoneRows = struct {
     exit: i32,
 };
 
+/// Upper bound on registered Kitty virtual placements. Bounded like
+/// `USER_VAR_CAP` because the map is app-keyed, is carried in every
+/// snapshot, and would otherwise grow without limit; past the cap a
+/// NEW image id is ignored while existing ones still update.
+pub const VIRTUAL_PLACEMENT_CAP = 1024;
+
 /// Upper bound on distinct `OSC 1337 ; SetUserVar` names; keeps a
 /// runaway app from growing the store without limit.
 pub const USER_VAR_CAP = 64;
@@ -3317,7 +3323,9 @@ pub const Screen = struct {
             if (outcome.animation_changed) {
                 if (self.sink.on_image_animation) |f| f(self.sink.ctx);
             }
-            if (cmd.image_id != 0) {
+            if (cmd.image_id != 0 and (self.virtual_placements.count() < VIRTUAL_PLACEMENT_CAP or
+                self.virtual_placements.contains(cmd.image_id)))
+            {
                 self.virtual_placements.put(cmd.image_id, .{
                     .rows = cmd.cells_high, // r=
                     .cols = cmd.cells_wide, // c=

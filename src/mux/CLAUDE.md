@@ -3,7 +3,7 @@ directory. The root file keeps a pointer and the non-negotiable invariants. -->
 
 # Mux (durable sessions)
 
-`sketerm-mux` is a single-threaded poll-loop daemon owning one PTY + Parser + authoritative `Screen` per session. The wire protocol (`src/mux/wire.zig`) carries **parsed events, never re-encoded escape sequences** — append-only FrameType/EventTag bytes, every parser `Event` round-trips losslessly. Attach = sequence-stamped `Screen` snapshot (`src/mux/snapshot.zig`) + live event stream.
+`sketerm-mux` is a single-threaded poll-loop daemon owning one PTY + Parser + authoritative `Screen` per session. The wire protocol (`src/mux/wire.zig`) carries **parsed events, never re-encoded escape sequences** — append-only FrameType/EventTag bytes, every parser `Event` round-trips losslessly. Attach = sequence-stamped `Screen` snapshot (`src/mux/snapshot.zig`) + live event stream. **Every `Screen` field is classified `carried` / `derived` / `transient` by `snapshot.zig`'s `field_policy`, and a field that is not classified fails the build.** Serialize, restore and the test comparator each hand-enumerate their own subset of a 130-field struct, which is how persistent app-driven state twice ended up silently dropped on every reattach; the table is the declaring home that makes the omission a compile error instead.
 
 Transports, all speaking the same protocol:
 - Local: Unix socket at `$XDG_RUNTIME_DIR/sketerm/mux.sock`.
