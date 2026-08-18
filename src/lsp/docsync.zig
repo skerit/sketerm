@@ -100,6 +100,12 @@ pub const DocSync = struct {
         self.queue.clearRetainingCapacity();
     }
 
+    /// Whether any captured change is still queued (a full-resync flag
+    /// alone does not count).
+    pub fn queueHasItems(self: *const DocSync) bool {
+        return self.queue.items.len > 0;
+    }
+
     pub fn hasPendingChanges(self: *const DocSync) bool {
         return self.queue.items.len > 0 or self.needs_full;
     }
@@ -115,6 +121,23 @@ pub const DocSync = struct {
         self.replaceSentRope(text);
     }
 
+    /// Forget everything describing the document that was just replaced.
+    ///
+    /// The queue and the anchor map are cleared as a PAIR: a map left
+    /// behind describes a document that no longer exists, and if
+    /// `sent_revision + map_batches.len` later coincides with the new
+    /// document's revision those edits get replayed onto the shadow
+    /// rope and every diagnostic decodes at the wrong offset. The sent
+    /// rope goes with them, and `needs_full` is set so a caller that
+    /// fails to send its didChange still resyncs on the next flush
+    /// instead of latching a half-described document.
+    pub fn resetForNewDocument(self: *DocSync) void {
+        self.clearQueue();
+        self.clearMap();
+        self.clearSentRope();
+        self.needs_full = true;
+    }
+
     /// A numeric workspace edit version is current only for the exact synchronized document state.
     pub fn acceptsEditVersion(self: *const DocSync, version: i64, document_revision: u64) bool {
         return self.open and version == self.version and !self.hasPendingChanges() and
@@ -125,7 +148,12 @@ pub const DocSync = struct {
     /// Call from `before_apply`; `doc` still holds the old text.
     pub fn noteEdits(self: *DocSync, doc: *const Document, edits: []const tr.Edit, enc: pos.Encoding) void {
         if (!self.open) return;
-        if (edits.len == 0) return;
+        // An EMPTY transaction is still a transaction: `Document`
+        // bumps its revision unconditionally, so returning early here
+        // would leave `revision` lagging forever and make both
+        // `acceptsEditVersion` and `diagnosticMapper` fail closed for
+        // the rest of the session. A zero-edit batch maps as identity,
+        // which is exactly what an empty transaction did.
         self.captureMap(doc, edits);
         // One transaction produces one new document revision, regardless
         // of how many edits it contains.
@@ -499,4 +527,56 @@ test "docsync: unversioned diagnostics map conservatively through unsent edits" 
         .end = .{ .line = 1, .character = 3 },
     }, .utf16);
     try testing.expectEqual(@as(usize, 4), offsets.start);
+}
+
+test "docsync: an empty transaction still advances the synchronized revision" {
+    // `Document.applyTransactionSel` bumps `revision` unconditionally,
+    // so skipping a zero-edit transaction left `revision` lagging the
+    // document forever: every publication mapper then answered null and
+    // every diagnostic was dropped for the rest of the session.
+    var doc = try Document.initFromBytes(testing.allocator, "A\nBAD");
+    defer doc.deinit();
+    var ds = DocSync.init(testing.allocator);
+    defer ds.deinit();
+    ds.open = true;
+    try noteSentDoc(&ds, 1, &doc);
+
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(testing.allocator);
+    ds.noteEdits(&doc, tx.edits.items, .utf16);
+    _ = try doc.applyTransaction(&tx);
+
+    try testing.expectEqual(doc.revision, ds.revision);
+    const mapper = ds.diagnosticMapper(&doc, 1) orelse return error.TestExpectedMapper;
+    const offsets = mapper.rangeToOffsets(.{
+        .start = .{ .line = 1, .character = 0 },
+        .end = .{ .line = 1, .character = 3 },
+    }, .utf16);
+    try testing.expectEqual(@as(usize, 2), offsets.start);
+    try testing.expectEqual(@as(usize, 5), offsets.end);
+}
+
+test "docsync: a replaced document drops its queue and its anchor map together" {
+    // The map describes the document that just died; replaying it onto
+    // the shadow rope decodes every diagnostic at the wrong offset.
+    var doc = try Document.initFromBytes(testing.allocator, "A\nBAD");
+    defer doc.deinit();
+    var ds = DocSync.init(testing.allocator);
+    defer ds.deinit();
+    ds.open = true;
+    try noteSentDoc(&ds, 1, &doc);
+
+    var tx = tr.Transaction.init(doc.revision);
+    defer tx.deinit(testing.allocator);
+    try tx.addInsert(testing.allocator, 0, "x\n");
+    ds.noteEdits(&doc, tx.edits.items, .utf16);
+    _ = try doc.applyTransaction(&tx);
+    try testing.expect(ds.diagnosticMapper(&doc, null) != null);
+
+    ds.resetForNewDocument();
+    try testing.expect(!ds.queueHasItems());
+    // No stale replay survives, and the next flush resyncs in full.
+    try testing.expect(ds.diagnosticMapper(&doc, null) == null);
+    try testing.expect(ds.needs_full);
+    try testing.expect(ds.hasPendingChanges());
 }

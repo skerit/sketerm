@@ -1800,8 +1800,10 @@ pub const Manager = struct {
             return;
         };
         st.diags.clear();
-        st.sync.clearQueue();
-        st.sync.needs_full = false;
+        // Queue AND anchor map, as a pair: the two early returns below
+        // skip `noteSent`, and a map describing the dead document would
+        // otherwise be replayed onto the shadow rope.
+        st.sync.resetForNewDocument();
         st.dropDecorations();
         tab.doc.addObserver(.{ .ctx = st, .before_apply = TabState.observeEdits });
         const cn = st.conn orelse {
@@ -1846,12 +1848,11 @@ pub const Manager = struct {
             return;
         };
         const st = tab.lsp orelse return;
-        const version: ?i64 = switch (textDocumentVersion(obj.get("version"))) {
-            .unversioned => null,
-            .numeric => |v| v,
-            .invalid => return,
-        };
-        if (!st.diags.acceptsPublication(version)) return;
+        const version: ?i64 = publicationVersion(obj.get("version"));
+        if (!st.diags.acceptsPublication(version)) {
+            dbg("dropping a diagnostics publish older than the accepted one for {s}", .{uri});
+            return;
+        }
         const mapper = st.sync.diagnosticMapper(&tab.doc, version) orelse {
             dbg("stale diagnostics for {s}: version {any}, sent {d}", .{ uri, version, st.sync.version });
             return;
@@ -4534,6 +4535,23 @@ const TextDocumentVersion = union(enum) {
     invalid,
 };
 
+/// The version to file a `publishDiagnostics` under.
+///
+/// A version that is not an integer is DEGRADED to unversioned, never
+/// treated as a reason to drop the publish: a server emitting
+/// `"version": 1.0` (`std.json` parses that as a float) would otherwise
+/// have every diagnostic discarded, silently, for the whole session.
+/// Staleness is still enforced wherever a version really is numeric —
+/// what is refused here is only the permanent silent drop. Workspace
+/// edits keep the strict classification: they MUTATE files, so an
+/// unreadable version there must still fail closed.
+fn publicationVersion(v: ?std.json.Value) ?i64 {
+    return switch (textDocumentVersion(v)) {
+        .numeric => |version| version,
+        .unversioned, .invalid => null,
+    };
+}
+
 fn textDocumentVersion(v: ?std.json.Value) TextDocumentVersion {
     const value = v orelse return .unversioned;
     return switch (value) {
@@ -4784,6 +4802,19 @@ test "lsp workspace edit: code action accept and resolve reject newer text" {
 
 // Deferred-edit identity now lives in `lsp/pending.zig`, which is
 // GTK-free and tested in both roots.
+
+test "lsp diagnostics: an unreadable publish version degrades instead of dropping" {
+    // `"version": 1.0` parses as a float. Classifying that as a hard
+    // drop discarded EVERY diagnostic publish, for the whole session,
+    // with nothing on screen and nothing in the log.
+    try std.testing.expect(publicationVersion(.{ .float = 1.0 }) == null);
+    try std.testing.expect(publicationVersion(.{ .string = "7" }) == null);
+    try std.testing.expect(publicationVersion(null) == null);
+    try std.testing.expect(publicationVersion(.null) == null);
+    try std.testing.expectEqual(@as(?i64, 7), publicationVersion(.{ .integer = 7 }));
+    // A workspace edit MUTATES files, so it keeps failing closed.
+    try std.testing.expect(textDocumentVersion(.{ .float = 1.0 }) == .invalid);
+}
 
 test "lsp workspace edit: null and absent versions remain unversioned" {
     try std.testing.expect(textDocumentVersion(null) == .unversioned);

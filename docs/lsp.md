@@ -224,9 +224,18 @@ the document is **dropped** — this is the same discipline
   same `tr.mapOffset` primitive selections and fold anchors use. Late or
   unknown versions are dropped, so they cannot replace a newer set.
   Servers that omit `version` remain supported; their ranges use the
-  latest sent snapshot conservatively, and an unversioned publication
-  cannot replace an already-versioned set. Once accepted, diagnostics
-  remain the one long-lived result and continue mapping through edits.
+  latest sent snapshot conservatively. Only a PROVABLY stale publication
+  is refused — two numeric versions on the same document with the
+  incoming one older. An unversioned publication is never provably
+  stale, so it is accepted even after a versioned one and resets the
+  expectation: servers in the vscode-languageserver-node family version
+  their didChange-triggered publishes and omit it on config- or
+  build-triggered ones, and latching would leave those retractions
+  permanently undelivered. A `version` field that is not an integer
+  (`1.0` parses as a float) degrades to unversioned rather than dropping
+  the publish; workspace edits keep the strict classification because
+  they mutate files. Once accepted, diagnostics remain the one
+  long-lived result and continue mapping through edits.
 
 ## Debounce and cancellation
 

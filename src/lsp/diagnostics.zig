@@ -105,20 +105,30 @@ pub const Store = struct {
         try self.replaceImpl(revision, null, incoming);
     }
 
-    /// Replace a publication unless its version is older or ambiguously unversioned after a versioned set.
+    /// Replace a publication unless its version is demonstrably older than the accepted one.
     pub fn replacePublication(self: *Store, revision: u64, version: ?i64, incoming: []const Diagnostic) Allocator.Error!bool {
         if (!self.acceptsPublication(version)) return false;
         try self.replaceImpl(revision, version, incoming);
         return true;
     }
 
+    /// Only a publication that is PROVABLY stale is refused: two
+    /// numeric versions on the same document, the incoming one older.
+    ///
+    /// An UNVERSIONED publish is never provably stale, so it is
+    /// accepted even after a versioned one. Servers in the
+    /// vscode-languageserver-node family attach `version` to publishes
+    /// triggered by a didChange and omit it on config- or
+    /// build-triggered ones; latching on the first versioned publish
+    /// left those servers' "all clear" permanently undelivered, with
+    /// no recovery path for the rest of the session. Accepting it also
+    /// resets `lsp_version`, so the store follows a server that stops
+    /// versioning rather than diverging from it.
     pub fn acceptsPublication(self: *const Store, version: ?i64) bool {
         if (!self.published) return true;
-        if (version) |incoming| {
-            const current = self.lsp_version orelse return true;
-            return incoming >= current;
-        }
-        return self.lsp_version == null;
+        const incoming = version orelse return true;
+        const current = self.lsp_version orelse return true;
+        return incoming >= current;
     }
 
     fn replaceImpl(self: *Store, revision: u64, version: ?i64, incoming: []const Diagnostic) Allocator.Error!void {
@@ -352,13 +362,40 @@ test "diagnostics: duplicate versions replace in arrival order" {
     try testing.expectEqualStrings("duplicate", s.items.items[0].message);
 }
 
-test "diagnostics: unversioned publications remain compatible but never replace versioned diagnostics" {
+test "diagnostics: unversioned publications remain compatible with versioned ones" {
     var s = Store.init(testing.allocator);
     defer s.deinit();
     try testing.expect(try s.replacePublication(1, null, &.{mk(0, 1, .err, "legacy one")}));
     try testing.expect(try s.replacePublication(2, null, &.{mk(2, 3, .warning, "legacy two")}));
     try testing.expectEqualStrings("legacy two", s.items.items[0].message);
     try testing.expect(try s.replacePublication(3, 4, &.{mk(4, 5, .err, "versioned")}));
-    try testing.expect(!try s.replacePublication(4, null, &.{mk(6, 7, .err, "ambiguous")}));
-    try testing.expectEqualStrings("versioned", s.items.items[0].message);
+    // An unversioned publish carries no evidence of being stale, so it
+    // lands and the store stops expecting versions -- the alternative
+    // latched the last versioned set for the whole session.
+    try testing.expect(try s.replacePublication(4, null, &.{mk(6, 7, .err, "config triggered")}));
+    try testing.expectEqualStrings("config triggered", s.items.items[0].message);
+    try testing.expect(s.lsp_version == null);
+    try testing.expect(try s.replacePublication(5, 5, &.{mk(8, 9, .err, "versioned again")}));
+    try testing.expectEqualStrings("versioned again", s.items.items[0].message);
+}
+
+test "diagnostics: an unversioned all-clear after a versioned set is delivered" {
+    // A build- or config-triggered publish omits `version` in the
+    // vscode-languageserver-node family; dropping it leaves the user
+    // looking at problems the server has already retracted.
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try testing.expect(try s.replacePublication(1, 7, &.{mk(0, 1, .err, "broken")}));
+    try testing.expect(s.acceptsPublication(null));
+    try testing.expect(try s.replacePublication(2, null, &.{}));
+    try testing.expectEqual(@as(usize, 0), s.items.items.len);
+    try testing.expect(s.published);
+}
+
+test "diagnostics: a provably older version is still refused" {
+    var s = Store.init(testing.allocator);
+    defer s.deinit();
+    try testing.expect(try s.replacePublication(1, 9, &.{mk(0, 1, .err, "current")}));
+    try testing.expect(!try s.replacePublication(2, 8, &.{mk(2, 3, .err, "stale")}));
+    try testing.expectEqualStrings("current", s.items.items[0].message);
 }
