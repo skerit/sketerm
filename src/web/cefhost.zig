@@ -1218,6 +1218,31 @@ pub const Host = struct {
         return v;
     }
 
+    /// Register the inspector view for `src`.
+    ///
+    /// Through `registerView`/`destroyView` like every other view, so
+    /// `Host.views` stays the single owner: this used to append by hand
+    /// and unwind with `views.pop()`, which drops whatever a
+    /// `swapRemove` moved into the last slot rather than the view it
+    /// meant.
+    fn registerDevtoolsView(self: *Host, src: *View) !*View {
+        self.next_devtools +%= 1;
+        if (self.next_devtools < proto.DEVTOOLS_VIEW_BASE) self.next_devtools = proto.DEVTOOLS_VIEW_BASE + 1;
+        const v = try self.registerView(.{
+            .view = self.next_devtools,
+            // The client resizes it the moment its surface is laid out;
+            // this is only what the first layout happens at.
+            .w = src.w,
+            .h = src.h,
+            .scale_x1000 = src.scale_x1000,
+            // The inspector is engine UI, never a container's page.
+            .context = 0,
+        });
+        v.devtools_of = src.id;
+        src.devtools_view = v.id;
+        return v;
+    }
+
     /// Give an EXISTING view record a windowless browser at
     /// `initial_url`, plus the frame buffer that makes it visible.
     ///
@@ -1518,25 +1543,8 @@ pub const Host = struct {
             return;
         }
 
-        self.next_devtools +%= 1;
-        if (self.next_devtools < proto.DEVTOOLS_VIEW_BASE) self.next_devtools = proto.DEVTOOLS_VIEW_BASE + 1;
-        const v = try self.gpa.create(View);
-        errdefer self.gpa.destroy(v);
-        v.* = .{
-            .id = self.next_devtools,
-            // The client resizes it the moment its surface is laid out;
-            // this is only what the first layout happens at.
-            .w = src.w,
-            .h = src.h,
-            .scale_x1000 = src.scale_x1000,
-            .pw = physicalOf(src.w, src.scale_x1000),
-            .ph = physicalOf(src.h, src.scale_x1000),
-            .devtools_of = src.id,
-            .sem = semantic.View.init(self.gpa),
-        };
-        try self.views.append(self.gpa, v);
-        errdefer _ = self.views.pop();
-        src.devtools_view = v.id;
+        const v = try self.registerDevtoolsView(src);
+        errdefer self.destroyView(v.id);
 
         var winfo = windowlessInfo(v);
         var bsettings = windowlessSettings(v);
@@ -6422,6 +6430,66 @@ test "view construction rejects a missing context before ownership transfer" {
     const failure = try proto.decode(proto.EvViewCreateFailed, frame.payload);
     try std.testing.expectEqual(@as(u32, 62), failure.view);
     try std.testing.expectEqual(@as(u32, 99), failure.context);
+}
+
+test "the inspector view is owned and unwound by the view list" {
+    // It used to be appended by hand and unwound with `views.pop()`, on
+    // a list managed everywhere else with `swapRemove`: the pop drops
+    // whatever moved into the last slot, not the view it meant. Pin the
+    // ownership contract -- registered through `registerView`, released
+    // through `destroyView` BY ID, and the source's back-pointer cleared
+    // by that release rather than by hand.
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    defer ViewConstructionTest.closeOutboxFds(&out);
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+
+    const src = try host.registerView(ViewConstructionTest.req(21, 0));
+    const other = try host.registerView(ViewConstructionTest.req(22, 0));
+    const dev = try host.registerDevtoolsView(src);
+    // A view appended AFTER the inspector is what `pop()` would take.
+    const later = try host.registerView(ViewConstructionTest.req(23, 0));
+
+    try std.testing.expect(dev.id > proto.DEVTOOLS_VIEW_BASE);
+    try std.testing.expectEqual(src.id, dev.devtools_of);
+    try std.testing.expectEqual(dev.id, src.devtools_view);
+    try std.testing.expect(host.find(dev.id) == dev);
+
+    host.destroyView(dev.id);
+    try std.testing.expect(host.find(dev.id) == null);
+    try std.testing.expectEqual(@as(u32, 0), src.devtools_view);
+    try std.testing.expect(host.find(21) == src);
+    try std.testing.expect(host.find(22) == other);
+    try std.testing.expect(host.find(23) == later);
+}
+
+fn devtoolsRegistrationCase(gpa: std.mem.Allocator) !void {
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    defer ViewConstructionTest.closeOutboxFds(&out);
+    var host = Host.init(gpa, &out);
+    defer host.deinit();
+
+    try host.views.ensureTotalCapacityPrecise(gpa, 1);
+    const src = try host.registerView(ViewConstructionTest.req(31, 0));
+    if (host.registerDevtoolsView(src)) |dev| {
+        try std.testing.expectEqual(@as(usize, 2), host.viewCount());
+        host.destroyView(dev.id);
+    } else |err| {
+        try std.testing.expectEqual(@as(usize, 1), host.viewCount());
+        try std.testing.expect(host.find(31) == src);
+        try std.testing.expectEqual(@as(u32, 0), src.devtools_view);
+        return err;
+    }
+}
+
+test "inspector registration allocation failures leave no orphan" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        devtoolsRegistrationCase,
+        .{},
+    );
 }
 
 test "a revival whose container vanished is refused, not put on the global context" {
