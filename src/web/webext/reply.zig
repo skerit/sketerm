@@ -27,12 +27,18 @@ pub fn err(gpa: std.mem.Allocator, message: []const u8) []u8 {
 }
 
 fn wrap(gpa: std.mem.Allocator, key: []const u8, value: []const u8) ?[]u8 {
+    return wrapAlloc(gpa, key, value) catch null;
+}
+
+/// Error-returning so the `errdefer` runs: as a `?[]u8` body every
+/// `catch return null` here leaked the whole allocating writer.
+fn wrapAlloc(gpa: std.mem.Allocator, key: []const u8, value: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
-    aw.writer.print("{{\"{s}\":", .{key}) catch return null;
-    std.json.Stringify.value(value, .{}, &aw.writer) catch return null;
-    aw.writer.writeByte('}') catch return null;
-    return aw.toOwnedSlice() catch null;
+    try aw.writer.print("{{\"{s}\":", .{key});
+    try std.json.Stringify.value(value, .{}, &aw.writer);
+    try aw.writer.writeByte('}');
+    return aw.toOwnedSlice();
 }
 
 test "error messages are escaped rather than emitted raw" {

@@ -7412,7 +7412,14 @@ fn interceptUnregister(gpa: std.mem.Allocator, view_id: u32) void {
 
 /// Read one file whole (bounded); caller frees.
 fn readFileBounded(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ?[]u8 {
-    const f = c.fopen(path, "rb") orelse return null;
+    return readFileBoundedAlloc(gpa, path, max) catch null;
+}
+
+/// Error-returning so the `errdefer` runs. As a `?[]u8` body, a read
+/// error or an over-cap file returned null with the partial read still
+/// on the heap.
+fn readFileBoundedAlloc(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ![]u8 {
+    const f = c.fopen(path, "rb") orelse return error.OpenFailed;
     defer _ = c.fclose(f);
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
@@ -7420,19 +7427,13 @@ fn readFileBounded(gpa: std.mem.Allocator, path: [*:0]const u8, max: usize) ?[]u
     while (true) {
         const n = c.fread(&buf, 1, buf.len, f);
         if (n == 0) {
-            if (c.ferror(f) != 0) return null;
+            if (c.ferror(f) != 0) return error.ReadFailed;
             break;
         }
-        if (n > max -| list.items.len) return null;
-        list.appendSlice(gpa, buf[0..n]) catch {
-            list.deinit(gpa);
-            return null;
-        };
+        if (n > max -| list.items.len) return error.StreamTooLong;
+        try list.appendSlice(gpa, buf[0..n]);
     }
-    return list.toOwnedSlice(gpa) catch {
-        list.deinit(gpa);
-        return null;
-    };
+    return list.toOwnedSlice(gpa);
 }
 
 /// $XDG_CONFIG_HOME/sketerm/filters (or ~/.config/...), NUL-terminated
@@ -9107,32 +9108,38 @@ fn spliceBootstrapTag(html: []const u8) ?[]u8 {
 /// bootstrap followed by one classic `<script src>` per declared script,
 /// in manifest order (MV2's own ordering).
 fn buildGeneratedBackground(slot: *const extorigins.Lookup) ?[]u8 {
+    return buildGeneratedBackgroundAlloc(slot) catch null;
+}
+
+/// Error-returning so the `errdefer` runs; as a `?[]u8` body every
+/// write failure leaked the document built so far.
+fn buildGeneratedBackgroundAlloc(slot: *const extorigins.Lookup) ![]u8 {
     var path_buf: [4096]u8 = undefined;
-    const mpath = std.fmt.bufPrint(&path_buf, "{s}/manifest.json", .{slot.dirSlice()}) catch return null;
-    const bytes = readFileC(mpath, webext_max_asset) orelse return null;
+    const mpath = try std.fmt.bufPrint(&path_buf, "{s}/manifest.json", .{slot.dirSlice()});
+    const bytes = readFileC(mpath, webext_max_asset) orelse return error.ManifestUnreadable;
     defer std.heap.c_allocator.free(bytes);
-    var man = extmanifest.parse(std.heap.c_allocator, bytes) catch return null;
+    var man = try extmanifest.parse(std.heap.c_allocator, bytes);
     defer man.deinit();
 
     var out: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    w.writeAll("<!doctype html><html><head><meta charset=\"utf-8\"><title>background</title>") catch return null;
-    w.writeAll(bootstrap_tag) catch return null;
+    try w.writeAll("<!doctype html><html><head><meta charset=\"utf-8\"><title>background</title>");
+    try w.writeAll(bootstrap_tag);
     if (man.background) |bg| {
         for (bg.scripts) |rel| {
             const clean = std.mem.trimStart(u8, rel, "/");
-            w.writeAll("<script src=\"/") catch return null;
             // The path goes into an HTML attribute; anything that could
             // close it out is refused rather than escaped, because a
             // manifest naming such a file is broken either way.
             if (std.mem.indexOfAny(u8, clean, "\"'<>") != null) continue;
-            w.writeAll(clean) catch return null;
-            w.writeAll("\"></script>") catch return null;
+            try w.writeAll("<script src=\"/");
+            try w.writeAll(clean);
+            try w.writeAll("\"></script>");
         }
     }
-    w.writeAll("</head><body></body></html>") catch return null;
-    return out.toOwnedSlice() catch null;
+    try w.writeAll("</head><body></body></html>");
+    return out.toOwnedSlice();
 }
 
 /// IO THREAD. Build the extension API bootstrap script.
@@ -9147,12 +9154,18 @@ fn buildGeneratedBackground(slot: *const extorigins.Lookup) ?[]u8 {
 /// here reads main-thread state.
 fn buildExtBootstrap(slot: *const extorigins.Lookup, host: []const u8) ?[]u8 {
     if (!sem_secret.ok) return null;
+    return buildExtBootstrapAlloc(slot, host) catch null;
+}
+
+/// Error-returning so the `errdefer` runs; as a `?[]u8` body each of
+/// the twenty-odd `catch return null` paths leaked the script so far.
+fn buildExtBootstrapAlloc(slot: *const extorigins.Lookup, host: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(std.heap.c_allocator);
     errdefer out.deinit();
     const w = &out.writer;
 
     var path_buf: [4096]u8 = undefined;
-    const mpath = std.fmt.bufPrint(&path_buf, "{s}/manifest.json", .{slot.dirSlice()}) catch return null;
+    const mpath = try std.fmt.bufPrint(&path_buf, "{s}/manifest.json", .{slot.dirSlice()});
     const man_bytes = readFileC(mpath, webext_max_asset);
     defer if (man_bytes) |b| std.heap.c_allocator.free(b);
 
@@ -9167,30 +9180,30 @@ fn buildExtBootstrap(slot: *const extorigins.Lookup, host: []const u8) ?[]u8 {
         } else |_| {}
     }
 
-    w.writeAll("(function(){try{var f=window[\"") catch return null;
-    w.writeAll(&sem_secret.slot) catch return null;
-    w.writeAll("\"];if(!f)return;f(JSON.stringify({op:\"ext-inject\",tok:\"") catch return null;
-    w.writeAll(&sem_secret.nonce) catch return null;
-    w.writeAll("\",priv:true,") catch return null;
-    if (c.getenv("SKETERM_WEB_EXT_DEBUG") != null) w.writeAll("dbg:true,") catch return null;
-    w.writeAll("ext:") catch return null;
-    jsonStr(w, slot.idSlice()) catch return null;
-    w.writeAll(",cap:") catch return null;
-    jsonStr(w, &slot.capability) catch return null;
-    w.writeAll(",base:") catch return null;
+    try w.writeAll("(function(){try{var f=window[\"");
+    try w.writeAll(&sem_secret.slot);
+    try w.writeAll("\"];if(!f)return;f(JSON.stringify({op:\"ext-inject\",tok:\"");
+    try w.writeAll(&sem_secret.nonce);
+    try w.writeAll("\",priv:true,");
+    if (c.getenv("SKETERM_WEB_EXT_DEBUG") != null) try w.writeAll("dbg:true,");
+    try w.writeAll("ext:");
+    try jsonStr(w, slot.idSlice());
+    try w.writeAll(",cap:");
+    try jsonStr(w, &slot.capability);
+    try w.writeAll(",base:");
     var base_buf: [128]u8 = undefined;
-    const base = std.fmt.bufPrint(&base_buf, ext_scheme ++ "://{s}/", .{host}) catch return null;
-    jsonStr(w, base) catch return null;
-    w.writeAll(",manifest:") catch return null;
-    w.writeAll(if (man_bytes) |b| b else "{}") catch return null;
-    w.writeAll(",messages:") catch return null;
-    w.writeAll(if (msg_bytes) |b| b else "null") catch return null;
+    const base = try std.fmt.bufPrint(&base_buf, ext_scheme ++ "://{s}/", .{host});
+    try jsonStr(w, base);
+    try w.writeAll(",manifest:");
+    try w.writeAll(if (man_bytes) |b| b else "{}");
+    try w.writeAll(",messages:");
+    try w.writeAll(if (msg_bytes) |b| b else "null");
     // A bootstrap that fails silently is an extension that is enabled,
     // loads, and does nothing at all — the exact failure mode this whole
     // area kept producing. Say so instead.
-    w.writeAll(",scripts:[],css:[]}));}catch(e){try{console.error(" ++
-        "'[sketerm-webext] API bootstrap failed: '+(e&&e.stack||e));}catch(e2){}}})()") catch return null;
-    return out.toOwnedSlice() catch null;
+    try w.writeAll(",scripts:[],css:[]}));}catch(e){try{console.error(" ++
+        "'[sketerm-webext] API bootstrap failed: '+(e&&e.stack||e));}catch(e2){}}})()");
+    return out.toOwnedSlice();
 }
 
 fn extResourceFor(data: []const u8, mime: []const u8, status: c_int) [*c]cef.cef_resource_handler_t {
@@ -10641,7 +10654,6 @@ fn onAcceleratedPaint(
     var fds: [proto.MAX_PLANES]i32 = @splat(-1);
     var planes: [proto.MAX_PLANES]proto.Plane = @splat(.{ .stride = 0, .offset = 0 });
     var got: u8 = 0;
-    errdefer {}
     var i: usize = 0;
     while (i < @as(usize, @intCast(n))) : (i += 1) {
         const p = inf.planes[i];
