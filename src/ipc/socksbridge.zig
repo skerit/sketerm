@@ -242,6 +242,11 @@ pub const Bridge = struct {
     }
 
     fn byReq(self: *Bridge, req: u32) ?*Session {
+        // A session that has not issued its CONNECT yet still has
+        // `req_id == 0`, and `StreamReply.req` defaults to 0 — so a
+        // reply with no `req` at all would otherwise hijack a session
+        // mid-handshake and answer a request it never made.
+        if (req == 0) return null;
         for (&self.sessions) |*s| {
             if (s.active() and !s.local.close_after_flush and s.req_id == req and !s.tunneled) return s;
         }
@@ -384,7 +389,7 @@ pub const Bridge = struct {
         var buf: [32 * 1024]u8 = undefined;
         const data = self.readSession(s, &buf) orelse return;
         if (s.tunneled) {
-            self.sendChanData(s.local.chan, data);
+            self.sendChanData(s, data);
             return;
         }
         const act = s.socks.feed(data);
@@ -460,7 +465,7 @@ pub const Bridge = struct {
                     self.queueSession(s, s.socks.openedReply(), false);
                     if (!s.active()) return;
                     const pre = s.socks.pretunnelBytes();
-                    if (pre.len != 0) self.sendChanData(r.chan, pre);
+                    if (pre.len != 0) self.sendChanData(s, pre);
                 } else {
                     self.queueSession(s, s.socks.failedReply(), true);
                 }
@@ -484,9 +489,14 @@ pub const Bridge = struct {
         }
     }
 
-    fn sendChanData(self: *Bridge, chan: u32, data: []const u8) void {
-        var pump = self.channelPump() orelse return;
-        pump.queueData(chan, data) catch {};
+    /// Relay tunnel bytes, or close the session.
+    ///
+    /// Dropping bytes here would corrupt the relayed TCP stream with no
+    /// error at either peer, so a queue that cannot take them ends the
+    /// session — the same choice both other pumps on this path make.
+    fn sendChanData(self: *Bridge, s: *Session, data: []const u8) void {
+        var pump = self.channelPump() orelse return self.closeSession(s, false);
+        pump.queueData(s.local.chan, data) catch self.closeSession(s, true);
     }
 };
 
@@ -1184,6 +1194,68 @@ test "transport: stop interrupts mux-send backpressure" {
     try bridge.listen(0);
     bridge.setConn(&conn);
     try testRunAndStop(&bridge);
+}
+
+test "transport: a stream_reply with no req cannot hijack a session mid-handshake" {
+    // `StreamReply.req` defaults to 0 and a session that has not issued
+    // its CONNECT yet still has `req_id == 0`. A garbled or buggy
+    // `stream_reply` would otherwise mark it tunneled and write a
+    // CONNECT success for a request the client never made.
+    const t = std.testing;
+    var mux = try TestMuxPair.init("{\"proto\":6,\"negotiation\":1,\"stream_open\":true}");
+    defer mux.deinit();
+
+    var bridge = Bridge.init(t.allocator);
+    defer bridge.deinit();
+    try bridge.listen(0);
+    bridge.setConn(&mux.conn);
+    const runner = try std.Thread.spawn(.{}, Bridge.run, .{&bridge});
+    defer {
+        bridge.requestStop();
+        runner.join();
+    }
+
+    const local = try testConnectBridge(bridge.port);
+    defer _ = c.close(local);
+    // Greeting only: the session is active, pre-CONNECT, req_id 0.
+    try testWriteAll(local, &.{ 0x05, 0x01, 0x00 });
+    var greeting: [2]u8 = undefined;
+    try testReadExactFor(local, &greeting, 1_000);
+    try t.expectEqualSlices(u8, &socks5.methodReply(true), &greeting);
+
+    try mux.daemon.sendFrame(.stream_reply, "{\"ok\":true,\"chan\":9}");
+
+    var pfd = c.struct_pollfd{ .fd = local, .events = c.POLLIN, .revents = 0 };
+    try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 200));
+}
+
+test "transport: a tunnel write that cannot be queued closes the session" {
+    // Dropping relayed bytes corrupts the tunnelled TCP stream with no
+    // error at either peer, so the session ends instead.
+    const t = std.testing;
+    var failing = std.testing.FailingAllocator.init(t.allocator, .{ .fail_index = 0 });
+    const a = failing.allocator();
+
+    var mux_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&mux_pair));
+    defer _ = c.close(mux_pair[1]);
+    var conn = client.Conn{ .allocator = a, .fd = mux_pair[0] };
+    defer conn.deinit();
+
+    var session_pair: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&session_pair));
+    defer _ = c.close(session_pair[1]);
+
+    var bridge = Bridge.init(a);
+    defer bridge.deinit();
+    bridge.setConn(&conn);
+    const s = &bridge.sessions[0];
+    try s.local.open(session_pair[0], MAX_SESSION_OUT);
+    s.local.chan = 9;
+    s.tunneled = true;
+
+    bridge.sendChanData(s, "tunnelled bytes");
+    try t.expect(!s.active());
 }
 
 const TestEgressConnector = struct {
