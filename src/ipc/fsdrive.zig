@@ -833,6 +833,14 @@ pub const Fs = struct {
         try self.simpleOp("attr_set", .{ .path = path, .pattern = name, .to = value });
     }
 
+    /// Refresh an open view: the file browser's reload shape, which
+    /// keeps the subscription and its snapshot boundary.
+    pub fn listView(self: *Fs, view_id: u32, path: []const u8) Error!Listing {
+        const req = self.nextReq();
+        try self.sendOp("list", req, .{ .path = path, .view = view_id });
+        return self.collectListing(req);
+    }
+
     /// One-shot listing, no subscription.
     pub fn list(self: *Fs, path: []const u8) Error!Listing {
         const req = self.nextReq();

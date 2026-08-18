@@ -500,6 +500,22 @@ fn fsStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: []
         _ = c.rmdir(pathz.pathZ(&z2, gone_dir) catch fail("gone path"));
     }
     if (!dlog.expectGone(&fs, 2)) fail("gone delta never arrived");
+    // rm -rf x && mkdir x, then refresh: the browser still holds the
+    // view id, so the daemon must revive that view against the path
+    // it was handed instead of refusing every later refresh.
+    {
+        var z2: [4096]u8 = undefined;
+        if (c.mkdir(pathz.pathZ(&z2, gone_dir) catch fail("regone path"), 0o755) != 0)
+            fail("recreate gone dir");
+    }
+    touch(gone_dir, "reborn", "x");
+    var rl = fs.listView(2, gone_dir) catch failErr("refresh recreated view", fs.lastErr());
+    if (findEntry(&rl, "reborn") == null) fail("refresh missed the recreated directory");
+    rl.deinit();
+    // The revived view is watched again, so deltas resume.
+    touch(gone_dir, "post-revive", "y");
+    if (dlog.expect(&fs, 2, "upsert", "post-revive") == null)
+        fail("revived view stopped delivering deltas");
     fs.closeView(2) catch failErr("close gone view", fs.lastErr());
 
     // ── close_view stops the stream ────────────────────────────

@@ -1114,6 +1114,10 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             return true;
         }
         p.dir.clearLoadError();
+        // A listing landed, so the directory exists again: a view
+        // parked by an earlier `gone` delta was just re-established
+        // daemon-side and its deltas resume.
+        p.dir.gone = false;
         if (rep.dev != 0) p.dir.dev = rep.dev;
 
         if (p.op == .list) {

@@ -1949,12 +1949,9 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         // A refresh of a directory this client also watches gets its
         // snapshot boundary and child counts on that exact view. Old
         // clients omit `view`, so path matching remains the fallback.
-        const view: ?*FsView = if (r.view != 0) blk: {
-            const exact = for (self.fs_views.items) |v| {
-                if (v.client == cl and !v.gone and v.id == r.view) break v;
-            } else return fsReplyErr(cl, r.req, "no such view");
-            break :blk exact;
-        } else for (self.fs_views.items) |v| {
+        const view: ?*FsView = if (r.view != 0)
+            fsViewForRefresh(self, cl, r)
+        else for (self.fs_views.items) |v| {
             if (v.client == cl and !v.gone and std.mem.eql(u8, v.path, r.path)) break v;
         } else null;
         _ = fsStartListing(self, cl, r.req, if (view) |v| v.path else r.path, r.attrs, view);
@@ -2244,6 +2241,68 @@ pub fn millisTimespec(ms: ?i64) c.struct_timespec {
         .tv_sec = @divFloor(value, 1000),
         .tv_nsec = @mod(value, 1000) * 1_000_000,
     };
+}
+
+/// Resolve the live view a `list` request names, reviving a parked one.
+///
+/// @return null when nothing usable resolves, so the caller lists
+/// `r.path` viewless and a real errno reaches the client as itself
+/// rather than as a misleading "no such view".
+fn fsViewForRefresh(self: *Daemon, cl: *Client, r: FsOpReq) ?*FsView {
+    for (self.fs_views.items) |v| {
+        if (v.client != cl or v.id != r.view) continue;
+        if (!v.gone) return v;
+        return if (fsReviveView(self, v, r.path)) v else null;
+    }
+    return null;
+}
+
+/// Re-establish a `gone` view against `path`, watch included.
+///
+/// A view whose directory was deleted keeps a dead inotify watch and
+/// never speaks again; refusing every later refresh on it made
+/// `rm -rf x && mkdir x` unrecoverable without navigating away, when
+/// the request itself carries the path to re-open.
+/// @return false when `path` is not a directory now.
+fn fsReviveView(self: *Daemon, v: *FsView, path: []const u8) bool {
+    var z: [4096]u8 = undefined;
+    const pz = pathZ(&z, path) catch return false;
+    var real_buf: [4096]u8 = undefined;
+    const canon: []const u8 = if (c.realpath(pz, &real_buf)) |rp|
+        std.mem.span(@as([*:0]const u8, @ptrCast(rp)))
+    else
+        return false;
+    var dst: c.struct_stat = undefined;
+    if (c.stat(@as([*:0]const u8, @ptrCast(real_buf[0..canon.len :0])), &dst) != 0 or
+        (dst.st_mode & c.S_IFMT) != c.S_IFDIR) return false;
+    const path_owned = self.allocator.dupe(u8, canon) catch return false;
+
+    // The old watch died with the old inode; a fresh one on the new
+    // directory is what makes deltas resume. dropFsViewAt's sharing
+    // rule applies here too (equal paths share one wd).
+    if (v.wd >= 0) {
+        var shared = false;
+        for (self.fs_views.items) |o| {
+            if (o != v and o.wd == v.wd) {
+                shared = true;
+                break;
+            }
+        }
+        if (!shared) self.fs_watch.remove(v.wd);
+        v.wd = -1;
+    }
+    self.allocator.free(v.path);
+    v.path = path_owned;
+    // The listing about to start is the new baseline, so any deferred
+    // burst (including the gone verdict itself) is stale.
+    v.boundary.clear(self.allocator);
+    v.gone = false;
+    if (self.fs_watch.ensure()) {
+        var z2: [4096]u8 = undefined;
+        const cz = pathZ(&z2, v.path) catch return true;
+        v.wd = self.fs_watch.add(cz);
+    }
+    return true;
 }
 
 pub fn fsOpenView(self: *Daemon, cl: *Client, r: FsOpReq) void {
