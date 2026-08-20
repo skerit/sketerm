@@ -200,6 +200,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.unsetenv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
+        // No first-run tour: a modal dialog would sit over the
+        // browser frames this rig measures.
+        _ = c.setenv("SKETERM_WELCOME", "0", 1);
         for (extra_env[0..n_env]) |kv| {
             if (std.mem.indexOfScalar(u8, kv, '=')) |eq| {
                 var kb: [128:0]u8 = undefined;

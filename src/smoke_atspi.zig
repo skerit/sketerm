@@ -245,6 +245,9 @@ pub fn main() u8 {
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         // `atspi`, not `1`: GTK4 silently ignores the GTK3-ism.
         _ = c.setenv("GTK_A11Y", "atspi", 1);
+        // No first-run tour: a modal dialog would swallow the
+        // clicks and key taps this rig aims at the window.
+        _ = c.setenv("SKETERM_WELCOME", "0", 1);
         _ = c.setenv("DBUS_SESSION_BUS_ADDRESS", hub.?.bus_addr_z.ptr, 1);
         // The final SIGTERM follows a real Wayland GL commit. Make the
         // GUI abort if TerminalSurface storage reaches deinit before

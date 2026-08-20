@@ -717,6 +717,9 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         _ = c.unsetenv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
+        // No first-run tour: a modal dialog would swallow the
+        // clicks and key taps this rig aims at the editor.
+        _ = c.setenv("SKETERM_WELCOME", "0", 1);
         // The client is silent by design; this is the only way to see
         // why a server did not attach when the rig fails.
         _ = c.setenv("SKETERM_LSP_DEBUG", "1", 1);
