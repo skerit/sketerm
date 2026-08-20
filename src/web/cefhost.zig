@@ -7189,7 +7189,13 @@ fn filterSubReconcile(self: *Host) void {
         var p_buf: [4352:0]u8 = undefined;
         const path = std.fmt.bufPrintZ(&p_buf, "{s}/{s}", .{ dir, name }) catch continue;
         var st: c.struct_stat = undefined;
-        const mtime: i64 = if (c.stat(path.ptr, &st) == 0) @intCast(st.st_mtim.tv_sec) else 0;
+        // Darwin spells it st_mtimespec; the same @hasField idiom guards
+        // every other stat site in the repo, and this was the one that
+        // would have blocked a macOS build of the helper.
+        const mtime: i64 = if (c.stat(path.ptr, &st) == 0)
+            @intCast((if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec).tv_sec)
+        else
+            0;
         // A missing file is always due, whatever the interval says --
         // otherwise `filter_update_hours = 0` would mean "subscribe to
         // this and never actually get it".
