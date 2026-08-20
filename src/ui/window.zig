@@ -4149,6 +4149,7 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
         },
         .zoom_pane => self.toggleZoomPane(),
         .prefs_open => self.openPrefs(),
+        .welcome_open => self.openWelcome(),
         .broadcast_cycle => self.cycleGroupSend(),
         .restore_closed_tab => self.restoreLastClosed(),
         .toggle_pin_tab => self.togglePinCurrentTab(),
@@ -4294,6 +4295,7 @@ fn onMenuAction(ctx: ?*anyopaque, action: @import("menu.zig").Action) void {
         .record_session_stop => if (self.focusedPane()) |p| p.terminal.requestRecordStop(),
         .launch_remote_app => if (self.focusedPane()) |p| @import("app_launcher.zig").open(self, p),
         .prefs_open => self.openPrefs(),
+        .welcome_open => self.openWelcome(),
         .search => self.openSearch(),
         else => {},
     }

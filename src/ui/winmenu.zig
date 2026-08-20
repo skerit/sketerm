@@ -92,6 +92,9 @@ pub fn show(win: *Window, anchor: *c.GtkWidget) void {
 
     const tail = m.section();
     row(tail, win, .prefs_open, true);
+    // Sits with the shared Help section appended right below it: the
+    // tour is discoverability, not a terminal verb.
+    row(tail, win, .welcome_open, true);
 
     appmenu.appendHelp(m, win.allocator, @ptrCast(@alignCast(win.app_window)), .terminal);
 

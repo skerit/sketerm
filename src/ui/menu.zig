@@ -70,6 +70,7 @@ pub const Action = enum {
     /// on the browser toolbar that is now invisible).
     show_web_face,
     prefs_open,
+    welcome_open,
 };
 
 pub const Sink = *const fn (ctx: ?*anyopaque, action: Action) void;
@@ -203,6 +204,7 @@ const MENU = [_]Item{
     .{ .bind = .{ .name = "clear-scrollback", .label = "Clear Scrollback", .detailed = "term.clear-scrollback", .icon = "edit-clear-all-symbolic", .action = .clear_scrollback } },
     .{ .bind = .{ .name = "reset", .label = "Reset Terminal", .detailed = "term.reset", .icon = "view-refresh-symbolic", .action = .reset_terminal } },
     .{ .bind = .{ .name = "prefs", .label = "Preferences…", .detailed = "term.prefs", .icon = "preferences-system-symbolic", .action = .prefs_open } },
+    .{ .bind = .{ .name = "welcome", .label = "Welcome Tour", .detailed = "term.welcome", .icon = "help-about-symbolic", .action = .welcome_open } },
 };
 
 /// Flat view of every action row (top-level and submenu children) —

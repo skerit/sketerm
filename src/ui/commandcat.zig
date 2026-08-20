@@ -234,6 +234,8 @@ pub const curated = [_]Row{
        .desc = "Cycle broadcast typing across panes: off → group → all → off.", .action = .broadcast_cycle },
     .{ .icon = "preferences-system-symbolic", .title = "Preferences",
        .desc = "Open the preferences dialog.", .action = .prefs_open },
+    .{ .icon = "help-about-symbolic", .title = "Welcome Tour",
+       .desc = "Re-open the first-run tour of what sketerm can do.", .action = .welcome_open },
 };
 
 /// Every row for `ctx`, in catalogue order: the curated set, then the

@@ -44,6 +44,10 @@ pub const Action = enum {
     pane_next,
     pane_prev,
     prefs_open,
+    /// Re-open the first-run Welcome tour on demand. Deliberately
+    /// unbound: the tour is a one-shot a user returns to rarely, so
+    /// it lives in the palette and the Help menu, not on a chord.
+    welcome_open,
     /// Cycle broadcast typing mode: off → group → all → off.
     broadcast_cycle,
     /// Re-open the most-recently-closed tab (browser convention).
