@@ -271,8 +271,18 @@ fn workerKeepsFd(fd: c_int, control_fd: c_int, scan_fd: c_int) bool {
 /// Close every descriptor except the worker control channel, stdio, and log.
 pub fn closeInheritedBrokerFds(self: *Daemon, control_fd: c_int) void {
     _ = self;
-    if (comptime builtin.os.tag == .linux) {
-        if (c.opendir("/proc/self/fd")) |dir| {
+    // Enumerate what is actually open when the OS says: /proc/self/fd
+    // on Linux, /dev/fd (fdescfs) on Darwin, which lists this process's
+    // descriptors in the same shape. Exact, and O(open fds) rather than
+    // O(limit) — which matters more now that the watcher raises the
+    // soft limit (fsserve.raiseFileLimit).
+    const fd_dir: ?[*:0]const u8 = switch (builtin.os.tag) {
+        .linux => "/proc/self/fd",
+        .macos => "/dev/fd",
+        else => null,
+    };
+    if (fd_dir) |dir_path| {
+        if (c.opendir(dir_path)) |dir| {
             defer _ = c.closedir(dir);
             const scan_fd = c.dirfd(dir);
             while (c.readdir(dir)) |ent| {
@@ -283,11 +293,24 @@ pub fn closeInheritedBrokerFds(self: *Daemon, control_fd: c_int) void {
             return;
         }
     }
-    const raw_max = c.sysconf(c._SC_OPEN_MAX);
-    const max_fd: c_int = if (raw_max > 3 and raw_max <= std.math.maxInt(c_int))
-        @intCast(raw_max)
-    else
-        65_536;
+    // Fallback sweep. Bound it by the HARD limit rather than
+    // sysconf(_SC_OPEN_MAX), which reports the SOFT one: the soft limit
+    // is raised at runtime, and anything that lowers it again would
+    // leave live descriptors sitting above the sysconf answer — i.e.
+    // inherited into a worker, unclosed, invisible.
+    const RLimit = extern struct { rlim_cur: u64, rlim_max: u64 };
+    const S = struct {
+        extern "c" fn getrlimit(resource: c_int, rlim: *RLimit) c_int;
+    };
+    const RLIMIT_NOFILE: c_int = if (builtin.os.tag == .macos) 8 else 7;
+    var bound: u64 = 65_536;
+    var rl: RLimit = undefined;
+    if (S.getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        // rlim_max is RLIM_INFINITY on Darwin, so clamp: an unbounded
+        // sweep is a hang, not thoroughness.
+        bound = @max(rl.rlim_cur, @min(rl.rlim_max, 65_536));
+    }
+    const max_fd: c_int = @intCast(@min(@max(bound, 1024), 262_144));
     var fd: c_int = 3;
     while (fd < max_fd) : (fd += 1) {
         if (!workerKeepsFd(fd, control_fd, -1)) _ = c.close(fd);
@@ -772,10 +795,23 @@ test "new workers close every broker descriptor and release stale listeners" {
     _ = c.close(pipe_server[1]);
     pipe_server[1] = -1;
 
-    for ([_]c_int{ client_pair[1], worker_pair[1], pipe_server[0] }) |peer_fd| {
-        var pfd = c.struct_pollfd{ .fd = peer_fd, .events = c.POLLIN | c.POLLHUP, .revents = 0 };
+    // Each peer says "the broker's copy is gone" in its own dialect. A
+    // stream socketpair and a pipe read 0 (EOF). The control pair is
+    // SOCK_SEQPACKET on Linux, which also EOFs — but SOCK_DGRAM on
+    // Darwin, where a closed peer surfaces as -1/ECONNRESET instead.
+    // That is the `n <= 0` rule platform.controlSocketpair documents and
+    // the production channel already follows; asserting it per peer
+    // keeps the other two honest about a real EOF regression.
+    const Peer = struct { fd: c_int, eofs: bool };
+    for ([_]Peer{
+        .{ .fd = client_pair[1], .eofs = true },
+        .{ .fd = worker_pair[1], .eofs = platform.is_linux },
+        .{ .fd = pipe_server[0], .eofs = true },
+    }) |peer| {
+        var pfd = c.struct_pollfd{ .fd = peer.fd, .events = c.POLLIN | c.POLLHUP, .revents = 0 };
         try t.expect(c.poll(&pfd, 1, 1_000) > 0);
-        try t.expectEqual(@as(isize, 0), c.read(peer_fd, &marker, 1));
+        const n = c.read(peer.fd, &marker, 1);
+        if (peer.eofs) try t.expectEqual(@as(isize, 0), n) else try t.expect(n <= 0);
     }
 
     const rebound_udp = platform.socketCloexec(c.AF_INET, c.SOCK_DGRAM, 0);
