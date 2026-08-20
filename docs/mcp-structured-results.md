@@ -146,6 +146,23 @@ pub const TOOLS = [_]ToolDef{ ... 112 entries ... };
   `output_schema`.
 - `outputSchema` is emitted in tools/list only when present.
 
+SHIPPED (wave 2). `src/ipc/mcp_tools.zig` holds `Group` (moved off
+mcpfilter, which re-exports it), `ToolDef`, the 112-entry `TOOLS`, the
+generated `TOOL_JSON`/`TOOLS_JSON`, and the comptime guards (unique
+names, non-empty descriptions, no tool/group name collision, no control
+byte in a description). Descriptions are stored DECODED and JSON-escaped
+during generation; input/output schemas are raw JSON text emitted
+verbatim. `mcpfilter.filterToolsJson(arena, policy)` rebuilds the
+narrowed array from `TOOL_JSON`; `renderedToolsJson` filters first, then
+substitutes the `%..._DEF%` tokens. Generation was proven byte-identical
+to the deleted literal before the literal went away.
+
+To give a tool a structured result in wave 3: add
+`.output_schema = \\{"type":"object","properties":{...}}` to its entry
+(a multiline literal, no escaping) — nothing else moves, and the
+`output_schema == null` assertions in mcp_tools.zig's and mcp.zig's
+table tests are the two places to relax as the wave progresses.
+
 ## Text-lane style rules
 
 - No JSON syntax, no braces, no escaped quotes.

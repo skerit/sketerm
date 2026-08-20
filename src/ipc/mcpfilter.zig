@@ -1,39 +1,21 @@
 //! Tool exposure policy for the MCP server: which of the ~100 tools a
 //! given assistant sees and may call.
 //!
-//! Group and read-only classification live here as typed Zig rather than
-//! as extra fields inside TOOLS_JSON, so the payload sent to clients stays
-//! a pure MCP document. A test in mcp.zig cross-checks the two lists, which
-//! is the only real risk: a tool added to one and not the other.
+//! Group and read-only classification are FACTS ON THE TABLE
+//! (`mcp_tools.TOOLS`), not a second list: `TOOL_META` below is
+//! generated from it, so a tool can never be advertised without a group
+//! or grouped without being advertised.
 //!
 //! Filtering tools/list is presentation, NOT enforcement — tools/call
 //! consults the same policy, or a client that learned a name elsewhere
 //! would still reach a withheld tool.
 
 const std = @import("std");
+const tools = @import("mcp_tools.zig");
 
-pub const Group = enum {
-    /// Tabs and panes of a running GUI.
-    panes,
-    /// Forwarded Wayland apps (launch, drive, screenshot).
-    app,
-    /// Daemon-owned headless terminals (term_*).
-    term,
-    /// File operations and transfers.
-    files,
-    /// Port forwarding.
-    net,
-    /// Browser automation over CDP.
-    browser,
-    /// Agent-authored UI panels.
-    ui,
-    /// Always exposed regardless of policy.
-    core,
-
-    pub fn name(self: Group) []const u8 {
-        return @tagName(self);
-    }
-};
+/// The group vocabulary lives on the table; re-exported so policy code
+/// and its callers keep spelling it `mcpfilter.Group`.
+pub const Group = tools.Group;
 
 pub const Meta = struct {
     name: []const u8,
@@ -44,169 +26,18 @@ pub const Meta = struct {
     mutates: bool,
 };
 
-fn ro(n: []const u8, g: Group) Meta {
-    return .{ .name = n, .group = g, .mutates = false };
-}
-
-fn rw(n: []const u8, g: Group) Meta {
-    return .{ .name = n, .group = g, .mutates = true };
-}
-
-pub const TOOL_META = [_]Meta{
-    // ── panes: the running GUI's tabs and panes ────────────────────
-    ro("list_terminals", .panes),
-    ro("read_screen", .panes),
-    ro("screenshot_pane", .panes),
-    rw("record_pane_start", .panes),
-    rw("record_pane_stop", .panes),
-    rw("send_text", .panes),
-    rw("send_keys", .panes),
-    rw("run_command", .panes),
-    ro("wait_idle", .panes),
-    rw("new_tab", .panes),
-    rw("split_pane", .panes),
-    rw("focus_pane", .panes),
-    rw("close_pane", .panes),
-
-    // ── app: forwarded Wayland applications ────────────────────────
-    ro("list_installed_apps", .app),
-    rw("launch_app", .app),
-    ro("list_apps", .app),
-    ro("app_windows", .app),
-    ro("screenshot_app", .app),
-    ro("get_app_state", .app),
-    ro("app_output", .app),
-    ro("app_log", .app),
-    ro("app_wait_log", .app),
-    rw("app_click", .app),
-    rw("app_actions", .app),
-    rw("app_mouse_move", .app),
-    rw("app_perform_action", .app),
-    rw("app_set_value", .app),
-    ro("app_wait_for_element", .app),
-    rw("app_drag", .app),
-    rw("app_type", .app),
-    ro("app_clipboard_get", .app),
-    rw("app_clipboard_set", .app),
-    rw("app_key", .app),
-    rw("app_scroll", .app),
-    rw("app_resize", .app),
-    ro("app_wait", .app),
-    ro("app_watch", .app),
-    // Sweeps the pointer across the window: input injection, not a read.
-    rw("app_hover_map", .app),
-    // Attaches a debugger to a live process; can wedge or kill it.
-    rw("app_backtrace", .app),
-    ro("app_a11y_tree", .app),
-    rw("app_record_start", .app),
-    rw("app_record_stop", .app),
-    ro("app_read_text", .app),
-    ro("app_wait_text", .app),
-    rw("app_template_save", .app),
-    ro("app_templates", .app),
-    ro("app_find_image", .app),
-    ro("app_wait_image", .app),
-    rw("app_macro_save", .app),
-    rw("app_macro_run", .app),
-    ro("app_macros", .app),
-    rw("close_app_window", .app),
-    rw("close_app", .app),
-
-    // ── term: headless daemon-owned terminals ──────────────────────
-    rw("term_open", .term),
-    ro("term_list", .term),
-    rw("term_run", .term),
-    rw("term_send_text", .term),
-    rw("term_send_keys", .term),
-    ro("term_read", .term),
-    ro("term_wait_idle", .term),
-    ro("term_wait_command", .term),
-    rw("term_resize", .term),
-    rw("term_close", .term),
-    rw("term_exec", .term),
-    rw("term_exec_wait", .term),
-    ro("term_wait_exit", .term),
-
-    // ── files ──────────────────────────────────────────────────────
-    rw("upload_file", .files),
-    // Writes the copy into the local filesystem.
-    rw("download_file", .files),
-    ro("file_list", .files),
-    ro("file_stat", .files),
-    ro("file_read", .files),
-    rw("file_write", .files),
-    rw("file_mkdir", .files),
-    rw("file_rename", .files),
-    rw("file_delete", .files),
-    rw("file_copy", .files),
-    rw("file_delete_tree", .files),
-    ro("file_hash", .files),
-    rw("file_extract", .files),
-    rw("file_archive_create", .files),
-    rw("file_trash", .files),
-    rw("file_chmod", .files),
-    rw("file_truncate", .files),
-    ro("file_media_info", .files),
-    ro("file_jobs", .files),
-    ro("file_job", .files),
-
-    // ── net ────────────────────────────────────────────────────────
-    rw("port_forward_open", .net),
-    ro("port_forward_list", .net),
-    ro("port_forward_check", .net),
-    rw("port_forward_close", .net),
-
-    // ── browser ────────────────────────────────────────────────────
-    ro("web_tabs", .browser),
-    rw("web_open", .browser),
-    rw("web_navigate", .browser),
-    ro("web_snapshot", .browser),
-    rw("web_act", .browser),
-    ro("web_expand", .browser),
-    ro("web_query", .browser),
-    ro("web_read", .browser),
-    ro("web_wait", .browser),
-    // Moves the page, and a scroll can trigger lazy loads.
-    rw("web_scroll", .browser),
-    rw("web_eval", .browser),
-    ro("web_screenshot", .browser),
-    rw("web_network", .browser),
-
-    // ── ui: agent-authored panels ──────────────────────────────────
-    rw("ui_show", .ui),
-    // A document generator over the same show path; still shows.
-    rw("ui_show_files", .ui),
-    rw("ui_patch", .ui),
-    // Waits for the user; changes nothing.
-    ro("ui_wait_event", .ui),
-    ro("ui_panels", .ui),
-    // Writes a document into the user's state dir.
-    rw("ui_save", .ui),
-    rw("ui_close", .ui),
-    // Unlinks a saved document.
-    rw("ui_delete", .ui),
-
-    // ── core: never filtered ───────────────────────────────────────
-    ro("capabilities", .core),
+/// Policy's view of the tool table, in table order.
+pub const TOOL_META: [tools.TOOLS.len]Meta = blk: {
+    var arr: [tools.TOOLS.len]Meta = undefined;
+    for (tools.TOOLS, 0..) |t, i| {
+        arr[i] = .{ .name = t.name, .group = t.group, .mutates = t.mutates };
+    }
+    break :blk arr;
 };
 
-// No group name may collide with a tool name, or a policy term would be
-// ambiguous.
-comptime {
-    @setEvalBranchQuota(20_000);
-    for (TOOL_META) |m| {
-        for (std.enums.values(Group)) |g| {
-            if (std.mem.eql(u8, m.name, @tagName(g)))
-                @compileError("tool name collides with a group name: " ++ m.name);
-        }
-    }
-}
-
 pub fn lookup(name: []const u8) ?Meta {
-    for (TOOL_META) |m| {
-        if (std.mem.eql(u8, m.name, name)) return m;
-    }
-    return null;
+    const t = tools.find(name) orelse return null;
+    return .{ .name = t.name, .group = t.group, .mutates = t.mutates };
 }
 
 pub const ParseError = error{
@@ -350,29 +181,21 @@ fn trim(s: []const u8) []const u8 {
 
 // ── tools/list filtering ──────────────────────────────────────────
 
-/// Rewrite a tools JSON array, keeping only the tools `policy` allows.
-///
-/// Scans top-level objects by brace depth rather than parsing: the schemas
-/// contain nested objects and braces inside strings, and a full parse plus
-/// re-serialize would reorder keys and reflow the hand-written payload.
-pub fn filterToolsJson(
-    arena: std.mem.Allocator,
-    tools_json: []const u8,
-    policy: Policy,
-) ![]const u8 {
-    if (policy.isUnrestricted()) return tools_json;
+/// The tools/list array narrowed to what `policy` allows, rebuilt from
+/// the table so no JSON has to be re-parsed to find out what a member
+/// is called.
+pub fn filterToolsJson(arena: std.mem.Allocator, policy: Policy) ![]const u8 {
+    if (policy.isUnrestricted()) return tools.TOOLS_JSON;
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeAll("[");
 
     var wrote: usize = 0;
-    var it = ObjectIter{ .src = tools_json };
-    while (it.next()) |obj| {
-        const name = objectName(obj) orelse continue;
-        if (!policy.allows(name)) continue;
+    for (TOOL_META, tools.TOOL_JSON) |m, json| {
+        if (!policy.allowsMeta(m)) continue;
         if (wrote > 0) try w.writeAll(",");
-        try w.writeAll(obj);
+        try w.writeAll(json);
         wrote += 1;
     }
 
@@ -402,56 +225,6 @@ pub fn suppressedGroups(policy: Policy, buf: []Group) []Group {
         }
     }
     return buf[0..n];
-}
-
-/// Iterates the top-level `{...}` members of a JSON array.
-const ObjectIter = struct {
-    src: []const u8,
-    i: usize = 0,
-
-    fn next(self: *ObjectIter) ?[]const u8 {
-        while (self.i < self.src.len and self.src[self.i] != '{') : (self.i += 1) {}
-        if (self.i >= self.src.len) return null;
-
-        const start = self.i;
-        var depth: usize = 0;
-        var in_str = false;
-        var esc = false;
-        while (self.i < self.src.len) : (self.i += 1) {
-            const ch = self.src[self.i];
-            if (esc) {
-                esc = false;
-                continue;
-            }
-            if (in_str) {
-                if (ch == '\\') esc = true else if (ch == '"') in_str = false;
-                continue;
-            }
-            switch (ch) {
-                '"' => in_str = true,
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if (depth == 0) {
-                        self.i += 1;
-                        return self.src[start..self.i];
-                    }
-                },
-                else => {},
-            }
-        }
-        return null; // unbalanced; caller gets a short list rather than garbage
-    }
-};
-
-/// The value of a tool object's top-level "name" key. The key is written
-/// first in every entry of TOOLS_JSON, so the first occurrence is it.
-fn objectName(obj: []const u8) ?[]const u8 {
-    const key = "\"name\":\"";
-    const at = std.mem.indexOf(u8, obj, key) orelse return null;
-    const rest = obj[at + key.len ..];
-    const end = std.mem.indexOfScalar(u8, rest, '"') orelse return null;
-    return rest[0..end];
 }
 
 // ── tests ─────────────────────────────────────────────────────────
@@ -529,36 +302,65 @@ test "validate rejects a typo and names it" {
     try Policy.validate("", &bad);
 }
 
-test "filterToolsJson keeps whole objects and fixes the commas" {
+test "filterToolsJson emits only the allowed tools, schemas intact" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const src =
-        \\[{"name":"app_click","inputSchema":{"type":"object","properties":{"x":{"type":"integer"}}}},{"name":"run_command","inputSchema":{"type":"object"}},{"name":"capabilities","inputSchema":{"type":"object"}}]
-    ;
-    const out = try filterToolsJson(arena, src, .{ .spec = "app" });
-
+    const out = try filterToolsJson(arena, .{ .spec = "app:ro" });
+    // Still one JSON line: the framing survives the rebuild.
+    try testing.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, out, .{});
-    try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
-    try testing.expectEqualStrings("app_click", parsed.value.array.items[0].object.get("name").?.string);
-    try testing.expectEqualStrings("capabilities", parsed.value.array.items[1].object.get("name").?.string);
-    // The nested schema travelled verbatim.
-    try testing.expect(std.mem.indexOf(u8, out, "\"x\":{\"type\":\"integer\"}") != null);
+    try testing.expect(parsed.value.array.items.len > 0);
+    try testing.expect(parsed.value.array.items.len < tools.TOOLS.len);
+
+    var saw_read = false;
+    var saw_core = false;
+    for (parsed.value.array.items) |item| {
+        const nm = item.object.get("name").?.string;
+        // Nothing withheld leaked through, in either direction.
+        try testing.expect((Policy{ .spec = "app:ro" }).allows(nm));
+        try testing.expect(item.object.get("inputSchema").?.object.get("properties") != null);
+        if (std.mem.eql(u8, nm, "screenshot_app")) saw_read = true;
+        if (std.mem.eql(u8, nm, "capabilities")) saw_core = true;
+        if (std.mem.eql(u8, nm, "app_click") or std.mem.eql(u8, nm, "run_command"))
+            return error.WithheldToolLeaked;
+    }
+    try testing.expect(saw_read);
+    // core survives every policy.
+    try testing.expect(saw_core);
+    // A nested schema travelled verbatim, quotes and braces included.
+    try testing.expect(std.mem.indexOf(u8, out, "\"inputSchema\":{\"type\":\"object\"") != null);
 }
 
-test "filterToolsJson is not confused by braces inside strings" {
+test "an unrestricted policy hands back the generated list unchanged" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const out = try filterToolsJson(arena_state.allocator(), .unrestricted);
+    try testing.expectEqualStrings(tools.TOOLS_JSON, out);
+}
+
+test "a policy denying everything still lists core" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-
-    const src =
-        \\[{"name":"app_click","description":"pass {\"x\":1} to it"},{"name":"run_command","description":"a } brace"}]
-    ;
-    const out = try filterToolsJson(arena, src, .{ .spec = "panes" });
+    const out = try filterToolsJson(arena, .{ .spec = "-all" });
     const parsed = try std.json.parseFromSlice(std.json.Value, arena, out, .{});
     try testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
-    try testing.expectEqualStrings("run_command", parsed.value.array.items[0].object.get("name").?.string);
+    try testing.expectEqualStrings("capabilities", parsed.value.array.items[0].object.get("name").?.string);
+}
+
+test "TOOL_META mirrors the table exactly" {
+    try testing.expectEqual(tools.TOOLS.len, TOOL_META.len);
+    for (TOOL_META, tools.TOOLS) |m, t| {
+        try testing.expectEqualStrings(t.name, m.name);
+        try testing.expectEqual(t.group, m.group);
+        try testing.expectEqual(t.mutates, m.mutates);
+        const l = lookup(t.name).?;
+        try testing.expectEqualStrings(t.name, l.name);
+        try testing.expectEqual(t.group, l.group);
+    }
+    try testing.expect(lookup("no_such_tool") == null);
 }
 
 test "suppressedGroups names the groups an assistant cannot reach" {

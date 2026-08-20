@@ -104,6 +104,7 @@ comptime {
     _ = @import("ipc/socksbridge.zig");
     _ = @import("ipc/mcpassets.zig");
     _ = @import("ipc/mcpfilter.zig");
+    _ = @import("ipc/mcp_tools.zig");
     _ = @import("ipc/mcp_registry.zig");
     _ = @import("ipc/mux_cli.zig");
     _ = @import("ipc/panelstore.zig");

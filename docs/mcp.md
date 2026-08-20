@@ -63,11 +63,11 @@ would enable it -- an assistant should not spend turns guessing.
 `capabilities` reports `tool_policy`: the raw spec, where it came from,
 the available group names and the suppressed ones.
 
-Group and read-only classification live in `src/ipc/mcpfilter.zig` as
-typed Zig, not as extra fields in the tools payload. A test in
-`src/ipc/mcp.zig` asserts the two lists name exactly the same tools, so
-a tool added to one and not the other fails the build rather than
-becoming quietly ungroupable.
+Group and read-only classification are fields of the one tool table,
+`src/ipc/mcp_tools.zig`, which also generates the tools/list payload
+(the extra fields never reach the wire). A tool is therefore one entry:
+it cannot be advertised without a group or grouped without being
+advertised.
 
 ## Terminal waits
 

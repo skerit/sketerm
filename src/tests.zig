@@ -193,6 +193,7 @@ comptime {
     _ = @import("ipc/xkblayout.zig");
     _ = @import("ipc/mcpassets.zig");
     _ = @import("ipc/mcpfilter.zig");
+    _ = @import("ipc/mcp_tools.zig");
     _ = @import("ipc/mcp_registry.zig");
     _ = @import("ipc/panelstore.zig");
     _ = @import("util/template.zig");
