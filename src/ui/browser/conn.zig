@@ -1144,6 +1144,11 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         // daemon-side and its deltas resume.
         p.dir.gone = false;
         if (rep.dev != 0) p.dir.dev = rep.dev;
+        // Every chunk of the run carries the same answer, and a
+        // refresh re-asks it: assign rather than latch, or a
+        // directory that got its watch back would keep claiming it
+        // is stale forever.
+        p.dir.watch_limit = rep.watch_limit;
 
         if (p.op == .list) {
             // Refresh of a live directory: the rows on screen stay

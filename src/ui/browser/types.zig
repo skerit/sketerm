@@ -127,6 +127,10 @@ pub const WireReply = struct {
     dev: u64 = 0,
     more: bool = false,
     truncated: bool = false,
+    /// This live view holds NO filesystem watch, because the host ran
+    /// out of watch capacity (kqueue descriptors, inotify slots). The
+    /// rows are real; nothing will update them.
+    watch_limit: bool = false,
     job: u64 = 0,
     state: []const u8 = "",
     done: u64 = 0,
@@ -157,6 +161,15 @@ test "filesystem refusal keeps its structured failure kind" {
     , .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("permanent", parsed.value.kind);
+}
+
+test "a watch-limited listing reply reaches the browser as such" {
+    const parsed = try std.json.parseFromSlice(WireReply, std.testing.allocator,
+        \\{"req":9,"ok":true,"path":"/deep","more":false,"watch_limit":true}
+    , .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    // Rows are real; deltas will never come. The tab has to say so.
+    try std.testing.expect(parsed.value.watch_limit);
 }
 
 pub const WireUserDir = struct {
@@ -353,6 +366,11 @@ pub const Dir = struct {
     /// than presenting the running count as final.
     streaming: bool = false,
     gone: bool = false,
+    /// The host could not watch this directory: its listing is real,
+    /// but no delta will follow it, so what is on screen goes stale
+    /// silently. Rides the DIR (like `load_error`) so every render
+    /// keeps saying it; a refresh re-reads and re-answers it.
+    watch_limit: bool = false,
     /// Why the last listing of this directory was refused (owned), or
     /// null. It rides the DIR so it dies with it, and so every render
     /// keeps saying it: a status-bar line alone is erased by the next

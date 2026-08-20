@@ -71,6 +71,11 @@ pub const Listing = struct {
     path: []const u8 = "",
     entries: []Entry = &.{},
     truncated: bool = false,
+    /// The daemon could not register a filesystem watch for this
+    /// view (kqueue descriptors / inotify slots exhausted): the
+    /// entries are real, but no delta will ever update them. A fresh
+    /// listing is the only way to re-read.
+    watch_limit: bool = false,
     /// Device id of the listed directory: what decides whether a hard
     /// link INTO it could work, without a per-entry cost.
     dev: u64 = 0,
@@ -182,6 +187,7 @@ const Reply = struct {
     entries: []Entry = &.{},
     more: bool = false,
     truncated: bool = false,
+    watch_limit: bool = false,
     entry: ?Entry = null,
     size: u64 = 0,
     eof: bool = false,
@@ -800,6 +806,7 @@ pub const Fs = struct {
                 out.path = a.dupe(u8, rep.path) catch return Error.OutOfMemory;
             if (rep.dev != 0) out.dev = rep.dev;
             if (rep.truncated) out.truncated = true;
+            if (rep.watch_limit) out.watch_limit = true;
             for (rep.entries) |e| {
                 entries.append(a, dupeEntry(a, e) catch return Error.OutOfMemory) catch
                     return Error.OutOfMemory;
@@ -1817,6 +1824,24 @@ pub const Fs = struct {
         }
     }
 };
+
+test "a listing reply's watch-limit answer survives the reply parse" {
+    const t = std.testing;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    // The daemon says the entries are real but the view holds no
+    // watch. A client that ignored the field would present a frozen
+    // listing as a live one.
+    const limited = try std.json.parseFromSliceLeaky(Reply, arena.allocator(),
+        \\{"req":3,"ok":true,"path":"/x","more":false,"watch_limit":true}
+    , .{ .ignore_unknown_fields = true });
+    try t.expect(limited.watch_limit);
+    // Absent means live: an older daemon never sends the field.
+    const live = try std.json.parseFromSliceLeaky(Reply, arena.allocator(),
+        \\{"req":3,"ok":true,"path":"/x","more":false}
+    , .{ .ignore_unknown_fields = true });
+    try t.expect(!live.watch_limit);
+}
 
 test "disk usage job fields survive the fsdrive event mirror" {
     const t = std.testing;

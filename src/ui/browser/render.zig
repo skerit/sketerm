@@ -179,13 +179,22 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     // nothing at all.
     var git_buf: [240]u8 = undefined;
     const gnote = self.gitSummaryNote(tab, &git_buf);
+    // What is on screen is real, but nothing will update it: the host
+    // could not register a watch for this directory. Said on every
+    // render (a status message would erase it) and right next to the
+    // count, which is the figure it qualifies.
+    var tail_buf: [360]u8 = undefined;
+    const tail: []const u8 = if (!tab.root.watch_limit)
+        gnote
+    else
+        std.fmt.bufPrint(&tail_buf, "{s}, not live: the host is out of watch capacity — refresh to re-read", .{gnote}) catch gnote;
     var status_buf: [960]u8 = undefined;
     const cmsg: []const u8 = if (tab.nav_error) |refused|
         std.fmt.bufPrint(&status_buf, "{s} -- still showing {s} ({s}{s})", .{
-            refused, tab.root.path, counted, gnote,
+            refused, tab.root.path, counted, tail,
         }) catch refused
-    else if (gnote.len > 0)
-        std.fmt.bufPrint(&status_buf, "{s}{s}", .{ counted, gnote }) catch counted
+    else if (tail.len > 0)
+        std.fmt.bufPrint(&status_buf, "{s}{s}", .{ counted, tail }) catch counted
     else
         counted;
     // A running transfer reports its progress on this line (jobs.zig
