@@ -1,4 +1,12 @@
-//! Platform mount-table normalization for direct mux bypass.
+//! This machine's mount table: one reader, two consumers.
+//!
+//! `forEach` walks the platform's mount list -- `/proc/self/mounts` on
+//! Linux, `getmntinfo()` on macOS, which has no /proc at all. `detect`
+//! (direct mux bypass: which sshfs/nfs mount holds this path) and the
+//! file browser's Devices sidebar both go through it. They had grown
+//! SEPARATE readers, and the sidebar's was Linux-only -- so on a Mac
+//! it opened /proc, got null, returned, and the whole section
+//! rendered as nothing at all.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -16,6 +24,65 @@ pub const Hit = struct {
     pub fn path(self: *const Hit) []const u8 { return self.path_buf[0..self.path_len]; }
     pub fn mountpoint(self: *const Hit) []const u8 { return self.mount_buf[0..self.mount_len]; }
 };
+
+/// One mount, as the platform reports it. The slices point into the
+/// walker's own scratch and are valid ONLY for the duration of the
+/// `visit` call -- copy anything that must outlive it.
+pub const Entry = struct {
+    source: []const u8,
+    mountpoint: []const u8,
+    fstype: []const u8,
+    /// The system's own answer to "should a file manager show this?"
+    /// (macOS MNT_DONTBROWSE). Always false where the platform has no
+    /// such concept: a filter that treats it as "hide" therefore hides
+    /// nothing extra on Linux.
+    dont_browse: bool = false,
+};
+
+/// Walk this machine's mount table, passing each entry to
+/// `ctx.visit(Entry)`. Visiting stops early when `visit` returns false
+/// (the Devices sidebar stops at its row budget). Reading the table is
+/// best-effort: an unreadable one yields no entries rather than an
+/// error, because every caller's answer to "no mounts" and "cannot
+/// tell" is the same.
+pub fn forEach(ctx: anytype) void {
+    if (comptime builtin.os.tag == .macos) {
+        var list: [*c]c.struct_statfs = null;
+        const count = c.getmntinfo(&list, c.MNT_NOWAIT);
+        if (count <= 0 or list == null) return;
+        var i: usize = 0;
+        while (i < @as(usize, @intCast(count))) : (i += 1) {
+            const rec = &list[i];
+            if (!ctx.visit(.{
+                .source = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_mntfromname))),
+                .mountpoint = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_mntonname))),
+                .fstype = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_fstypename))),
+                .dont_browse = rec.f_flags & @as(u32, @intCast(c.MNT_DONTBROWSE)) != 0,
+            })) return;
+        }
+        return;
+    }
+    const f = c.fopen("/proc/self/mounts", "r") orelse c.fopen("/proc/mounts", "r") orelse return;
+    defer _ = c.fclose(f);
+    var line: [4096]u8 = undefined;
+    while (c.fgets(&line, line.len, f) != null) {
+        const text = std.mem.sliceTo(std.mem.span(@as([*:0]const u8, @ptrCast(&line))), '\n');
+        var it = std.mem.tokenizeScalar(u8, text, ' ');
+        const src_raw = it.next() orelse continue;
+        const mp_raw = it.next() orelse continue;
+        const fs = it.next() orelse continue;
+        // /proc/mounts octal-escapes spaces and tabs in both names;
+        // decoding here is what stops each consumer inventing its own
+        // answer (the sidebar simply showed them raw).
+        var sb: [1024]u8 = undefined;
+        var mb: [1024]u8 = undefined;
+        if (!ctx.visit(.{
+            .source = unescape(&sb, src_raw),
+            .mountpoint = unescape(&mb, mp_raw),
+            .fstype = fs,
+        })) return;
+    }
+}
 
 fn unescape(buf: []u8, src: []const u8) []const u8 {
     var w: usize = 0;
@@ -76,39 +143,32 @@ fn consider(path: []const u8, source: []const u8, mountpoint: []const u8, out: *
     best.* = mountpoint.len;
 }
 
+/// The sshfs/nfs mount that holds `path`, if any: the direct mux
+/// bypass asks so it can talk to that host's daemon instead of
+/// pushing bytes through the mount.
 pub fn detect(path: []const u8, out: *Hit) bool {
-    var best: usize = 0;
-    if (comptime builtin.os.tag == .macos) {
-        var list: [*c]c.struct_statfs = null;
-        const count = c.getmntinfo(&list, c.MNT_NOWAIT);
-        if (count <= 0 or list == null) return false;
-        var i: usize = 0;
-        while (i < @as(usize, @intCast(count))) : (i += 1) {
-            const rec = list[i];
-            const source = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_mntfromname)));
-            const mountpoint = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_mntonname)));
-            const fs = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_fstypename)));
-            if (!std.mem.eql(u8, fs, "nfs") and std.mem.indexOf(u8, source, ":") == null) continue;
-            consider(path, source, mountpoint, out, &best);
-        }
-        return best > 0;
-    }
-    const f = c.fopen("/proc/self/mounts", "r") orelse c.fopen("/proc/mounts", "r") orelse return false;
-    defer _ = c.fclose(f);
-    var line: [4096]u8 = undefined;
-    while (c.fgets(&line, line.len, f) != null) {
-        const text = std.mem.sliceTo(std.mem.span(@as([*:0]const u8, @ptrCast(&line))), '\n');
-        var it = std.mem.tokenizeScalar(u8, text, ' ');
-        const src_raw = it.next() orelse continue;
-        const mp_raw = it.next() orelse continue;
-        const fs = it.next() orelse continue;
-        if (!std.mem.eql(u8, fs, "fuse.sshfs") and !std.mem.startsWith(u8, fs, "nfs")) continue;
-        var sb: [1024]u8 = undefined;
-        var mb: [1024]u8 = undefined;
-        consider(path, unescape(&sb, src_raw), unescape(&mb, mp_raw), out, &best);
-    }
-    return best > 0;
+    var walk: DetectWalk = .{ .path = path, .out = out };
+    forEach(&walk);
+    return walk.best > 0;
 }
+
+const DetectWalk = struct {
+    path: []const u8,
+    out: *Hit,
+    best: usize = 0,
+
+    fn visit(self: *DetectWalk, e: Entry) bool {
+        // A remote mount is what this is for. macOS names the host in
+        // the source (`box:/srv`) for every network filesystem, so the
+        // colon carries the test there; Linux types them explicitly.
+        const remote = if (comptime builtin.os.tag == .macos)
+            std.mem.eql(u8, e.fstype, "nfs") or std.mem.indexOf(u8, e.source, ":") != null
+        else
+            std.mem.eql(u8, e.fstype, "fuse.sshfs") or std.mem.startsWith(u8, e.fstype, "nfs");
+        if (remote) consider(self.path, e.source, e.mountpoint, self.out, &self.best);
+        return true;
+    }
+};
 
 test "mount source parsing handles ssh, bracketed IPv6, and root mapping" {
     const a = splitSource("user@box:/srv").?;

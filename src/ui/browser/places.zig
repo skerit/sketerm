@@ -22,6 +22,7 @@ const iconload = @import("../iconload.zig");
 const sidewidgets = @import("sidewidgets.zig");
 const cast = @import("../../util/cast.zig");
 const fsserve = @import("../../mux/fsserve.zig");
+const mounts = @import("../../util/mounts.zig");
 const HostConn = @import("types.zig").HostConn;
 
 /// Browser faces in this process. `authoritative` owns the one
@@ -1142,61 +1143,43 @@ const DeviceRows = struct {
         rows.shown += 1;
         return true;
     }
+
+    /// `mounts.forEach` contract: false stops the walk.
+    ///
+    /// The two platforms keep their OWN interesting-set on purpose.
+    /// The duplication that mattered was the mount-table READER, not
+    /// this predicate: /proc/mounts and getmntinfo list different
+    /// things, and widening Linux to every `fuse.*` here would fill
+    /// the sidebar with gvfsd and portal mounts nobody browses.
+    pub fn visit(rows: *DeviceRows, e: mounts.Entry) bool {
+        // macOS only; always false on Linux, so this hides nothing there.
+        if (e.dont_browse) return true;
+        const interesting = if (comptime builtin.os.tag == .macos)
+            std.mem.startsWith(u8, e.source, "/dev/") or
+                std.mem.startsWith(u8, e.fstype, "nfs") or
+                std.mem.eql(u8, e.fstype, "smbfs") or
+                std.mem.eql(u8, e.fstype, "afpfs") or
+                std.mem.eql(u8, e.fstype, "webdav") or
+                std.mem.startsWith(u8, e.fstype, "fuse")
+        else
+            std.mem.startsWith(u8, e.source, "/dev/") or
+                std.mem.startsWith(u8, e.fstype, "nfs") or
+                std.mem.eql(u8, e.fstype, "fuse.sshfs");
+        if (!interesting) return true;
+        return rows.add(e.mountpoint);
+    }
 };
 
-/// Devices: real block-device and network mounts, read from this
-/// machine's mount table -- `/proc/mounts` on Linux, `getmntinfo()` on
-/// macOS, which has no /proc at all.
+/// Devices: real block-device and network mounts of THIS machine.
 ///
-/// Reading /proc unconditionally is how this section came to render as
-/// NOTHING on a Mac: `fopen` returned null, the function returned, and
-/// an absent section is indistinguishable from a machine with no
-/// devices. Neither branch may return early without having tried.
+/// The mount table itself is `util/mounts.zig`'s job, shared with the
+/// direct-mux bypass. Reading /proc here directly is how the section
+/// came to render as NOTHING on a Mac -- `fopen` returned null, the
+/// function returned, and an absent section is indistinguishable from
+/// a machine with no devices.
 fn renderDevicesSection(self: *BrowserView) void {
     var rows: DeviceRows = .{ .view = self, .folded = sectionCollapsed(self, "Devices") };
-    if (comptime builtin.os.tag == .macos) {
-        var list: [*c]c.struct_statfs = null;
-        const count = c.getmntinfo(&list, c.MNT_NOWAIT);
-        if (count <= 0 or list == null) return;
-        var i: usize = 0;
-        while (i < @as(usize, @intCast(count))) : (i += 1) {
-            const rec = &list[i];
-            // MNT_DONTBROWSE is the system's own answer to "should a
-            // file manager show this?", and Finder's sidebar obeys it.
-            // Without it the twelve rows fill with /System/Volumes/*
-            // before the first disk anyone cares about is reached.
-            if (rec.f_flags & @as(u32, @intCast(c.MNT_DONTBROWSE)) != 0) continue;
-            const src = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_mntfromname)));
-            const mp = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_mntonname)));
-            const fstype = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_fstypename)));
-            const interesting = std.mem.startsWith(u8, src, "/dev/") or
-                std.mem.startsWith(u8, fstype, "nfs") or
-                std.mem.eql(u8, fstype, "smbfs") or
-                std.mem.eql(u8, fstype, "afpfs") or
-                std.mem.eql(u8, fstype, "webdav") or
-                std.mem.startsWith(u8, fstype, "fuse");
-            if (!interesting) continue;
-            if (!rows.add(mp)) return;
-        }
-        return;
-    }
-    const f = c.fopen("/proc/mounts", "rb") orelse return;
-    var buf: [32 * 1024]u8 = undefined;
-    const nread = c.fread(&buf, 1, buf.len, f);
-    _ = c.fclose(f);
-    var it = std.mem.tokenizeScalar(u8, buf[0..nread], '\n');
-    while (it.next()) |line| {
-        var fields = std.mem.tokenizeScalar(u8, line, ' ');
-        const src = fields.next() orelse continue;
-        // /proc/mounts octal-escapes spaces; show raw (rare).
-        const mp = fields.next() orelse continue;
-        const fstype = fields.next() orelse continue;
-        const interesting = std.mem.startsWith(u8, src, "/dev/") or
-            std.mem.startsWith(u8, fstype, "nfs") or
-            std.mem.eql(u8, fstype, "fuse.sshfs");
-        if (!interesting) continue;
-        if (!rows.add(mp)) return;
-    }
+    mounts.forEach(&rows);
 }
 
 // ── row context menu ─────────────────────────────────────────────
