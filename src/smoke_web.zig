@@ -49,6 +49,7 @@
 //! machine there either.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const proto = @import("web/protocol.zig");
 const zpool = @import("wlhost/zpool.zig");
@@ -2466,16 +2467,41 @@ fn certStage(cl: *Client, dir: []const u8) void {
     // consulting the handler it FAILS and says so, which is when the
     // GUI's permission banner becomes reachable and deserves a real
     // allow/deny round trip in place of this stage.
-    _ = cl.drive(3000, 120);
-    if (cl.perm_seq != 0) fail(
-        "stage 22g: the engine now DOES ask the client for permission -- " ++
-            "replace this stage with a real allow/deny round trip",
-    );
-    if (!std.mem.eql(u8, cl.title[0..cl.title_len], "geo:err1")) {
-        std.debug.print("smoke-web: title was '{s}'\n", .{cl.title[0..cl.title_len]});
-        fail("stage 22g: a secure-context geolocation call did not end in PERMISSION_DENIED");
+    // MEASURED divergence (2026-08-20): on macOS the same engine DOES
+    // consult the client — `ev_permission` arrives for this geolocation
+    // request — so there the stage is the real round trip the comment
+    // above promised: answer DENY, and the page must still end at
+    // PERMISSION_DENIED (code 1). Linux keeps the pin.
+    if (builtin.os.tag == .macos) {
+        var pwait: Past = .{ .cl = cl, .base = 0 };
+        if (!driveUntil(cl, 15_000, &pwait, struct {
+            fn f(w: *Past) bool {
+                return w.cl.perm_seq > 0;
+            }
+        }.f)) fail("stage 22g: no ev_permission for a secure-context geolocation call");
+        cl.send(proto.PermissionDecision{ .view = view_id, .prompt = cl.perm_id, .allow = 0 });
+        var twait: Past = .{ .cl = cl, .base = 0 };
+        if (!driveUntil(cl, 15_000, &twait, struct {
+            fn f(w: *Past) bool {
+                return std.mem.eql(u8, w.cl.title[0..w.cl.title_len], "geo:err1");
+            }
+        }.f)) {
+            std.debug.print("smoke-web: title was '{s}'\n", .{cl.title[0..cl.title_len]});
+            fail("stage 22g: a DENIED geolocation request did not end in PERMISSION_DENIED");
+        }
+        pass("stage 22g permission request (client consulted, denied, page sees code 1)");
+    } else {
+        _ = cl.drive(3000, 120);
+        if (cl.perm_seq != 0) fail(
+            "stage 22g: the engine now DOES ask the client for permission -- " ++
+                "replace this stage with a real allow/deny round trip",
+        );
+        if (!std.mem.eql(u8, cl.title[0..cl.title_len], "geo:err1")) {
+            std.debug.print("smoke-web: title was '{s}'\n", .{cl.title[0..cl.title_len]});
+            fail("stage 22g: a secure-context geolocation call did not end in PERMISSION_DENIED");
+        }
+        pass("stage 22g permission request (engine-denied; the client is never consulted yet)");
     }
-    pass("stage 22g permission request (engine-denied; the client is never consulted yet)");
 
     widevineStage(cl);
 
