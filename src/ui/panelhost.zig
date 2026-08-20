@@ -4104,7 +4104,8 @@ test "hydration completion unlinks before reentrant reply backpressure cancellat
     defer panel_asset_cache = previous_cache;
 
     var pair: [2]c_int = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), c.socketpair(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0, &pair));
+    // Darwin has no SOCK_CLOEXEC; platform.zig hides the fcntl fallback.
+    try std.testing.expectEqual(@as(c_int, 0), @import("../util/platform.zig").socketpairCloexec(&pair));
     defer _ = c.close(pair[1]);
     const predict = @import("../mux/predict.zig");
     var remote = Terminal.Remote{
