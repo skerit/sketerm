@@ -35,6 +35,7 @@
 //! them but the JSON strings and the two secrets (see `Secret`).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const cef = @import("cef");
 const c = @import("cbindings");
 const proto = @import("protocol.zig");
@@ -43,6 +44,7 @@ const proto = @import("protocol.zig");
 // helper's module root is src/web/.
 const zpool = @import("zpool");
 const keymap = @import("keymap.zig");
+const platform = @import("../util/platform.zig");
 const semantic = @import("semantic.zig");
 const semnav = @import("semnav.zig");
 const filter = @import("filter.zig");
@@ -139,7 +141,9 @@ comptime {
 }
 
 /// memfd_create hides behind _GNU_SOURCE, which translate-c does not
-/// define — declared here, resolved at link (Linux-only helper).
+/// define — declared here, resolved at link (Linux-only helper; the
+/// macOS side of `createMemfdSystem` goes through platform.anonFileFd,
+/// so this symbol is never referenced there).
 extern fn memfd_create(name: [*:0]const u8, flags: c_uint) c_int;
 const MFD_CLOEXEC: c_uint = 1;
 
@@ -1321,6 +1325,18 @@ pub const Host = struct {
     }
 
     fn createMemfdSystem(_: ?*anyopaque) ?c_int {
+        // Darwin has no memfd_create; `platform.anonFileFd` is the one
+        // place that difference lives (shm_open + immediate unlink
+        // there). Size 0 means "create, do not size": a macOS shm object
+        // accepts ftruncate EXACTLY ONCE, and `truncateSystem` needs
+        // that one call to set the view's real dimensions. Sizing it to
+        // 0 here instead cost the whole browser — the second ftruncate
+        // returned EINVAL, the frame buffer stayed empty and the helper
+        // gave up the socket right after the handshake.
+        if (builtin.target.os.tag == .macos) {
+            const fd = platform.anonFileFd(0);
+            return if (fd >= 0) fd else null;
+        }
         const fd = memfd_create("sketerm-web-view", MFD_CLOEXEC);
         return if (fd >= 0) fd else null;
     }
@@ -10710,6 +10726,16 @@ fn onAcceleratedPaint(
     _: [*c]const cef.cef_rect_t,
     info: [*c]const cef.cef_accelerated_paint_info_t,
 ) callconv(.c) void {
+    // macOS hands this callback an IOSurface, not dma-buf planes:
+    // `cef_accelerated_paint_info_t` there is
+    // {shared_texture_io_surface, format, extra} with no `planes` array
+    // and no `plane_count`. There is no wire frame for an IOSurface and
+    // no GTK importer for one either (`GdkDmabufTextureBuilder` is
+    // Linux-only), so the accelerated path is Linux-only by
+    // construction — `setAccelerated` is never given true on macOS, so
+    // this callback cannot fire there. The early return keeps the
+    // dma-buf field accesses below out of the macOS compile.
+    if (builtin.target.os.tag != .linux) return;
     if (ptype != cef.PET_VIEW) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
@@ -11799,6 +11825,31 @@ fn onSemPost(
 // Process bootstrap (the only CEF entry points main.zig needs)
 // ---------------------------------------------------------------------
 
+/// The macOS subprocess helper's executable, derived from OUR own
+/// location so a bundle stays relocatable (no build-time absolute
+/// path). Returns null when there is no helper beside us, which is the
+/// honest answer for an unbundled dev binary — CEF then fails loudly
+/// rather than us inventing a path that does not exist.
+///
+///   <app>.app/Contents/MacOS/sketerm-webengine          <- us
+///   <app>.app/Contents/Frameworks/
+///       sketerm-webengine Helper.app/Contents/MacOS/
+///           sketerm-webengine Helper                     <- returned
+fn macHelperPath(buf: *[4096:0]u8) ?[:0]const u8 {
+    var exe_buf: [4096:0]u8 = undefined;
+    const exe = platform.exePathZ(&exe_buf) orelse return null;
+    const macos_dir = std.fs.path.dirname(exe) orelse return null;
+    const contents = std.fs.path.dirname(macos_dir) orelse return null;
+    const name = "sketerm-webengine Helper";
+    const p = std.fmt.bufPrintZ(
+        buf,
+        "{s}/Frameworks/{s}.app/Contents/MacOS/{s}",
+        .{ contents, name, name },
+    ) catch return null;
+    if (c.access(p.ptr, c.X_OK) != 0) return null;
+    return p;
+}
+
 /// Configure the libcef API version. MUST be the first libcef call of
 /// any process — without it `cef_execute_process` spins forever.
 pub fn apiHash() bool {
@@ -11838,8 +11889,17 @@ pub fn executeProcess(argc: c_int, argv: [*c][*c]u8) ?u8 {
     return @intCast(@as(u32, @bitCast(code)) & 0xff);
 }
 
+/// macOS: create the NSApplication CEF's Cocoa message pump needs.
+/// Implemented in `mac_app.m`; see that file for why a helper without
+/// one initializes fine and then never completes a navigation.
+extern fn sketerm_web_init_nsapp() void;
+
 /// Bring CEF up in windowless mode with a private cache directory.
 pub fn initialize(argc: c_int, argv: [*c][*c]u8, cache_dir: []const u8, log_file: []const u8) bool {
+    // Before ANY CEF call that could touch NSApp: the first
+    // `sharedApplication` decides the class of the singleton, and CEF
+    // must find ours (it implements CefAppProtocol).
+    if (builtin.target.os.tag == .macos) sketerm_web_init_nsapp();
     // Browser process only: `executeProcess` never returns in a child,
     // so a renderer never mints and only ever reads what it was given.
     mintSecret();
@@ -11858,6 +11918,20 @@ pub fn initialize(argc: c_int, argv: [*c][*c]u8, cache_dir: []const u8, log_file
     setStr(log_file, &settings.log_file);
     defer cef.cef_string_utf16_clear(&settings.root_cache_path);
     defer cef.cef_string_utf16_clear(&settings.log_file);
+
+    // macOS launches every child (renderer, GPU, network service) from
+    // a SEPARATE helper .app bundle — re-executing the browser
+    // executable, which is what Linux does, fails with
+    // "GPU process launch failed: error_code=1003" and then a fatal
+    // "GPU process isn't usable. Goodbye." A helper needs its own
+    // bundle and Info.plist so that, among other things, it takes no
+    // dock icon; CEF's README documents the layout and
+    // `dist/macos-bundle.sh` builds it.
+    var helper_buf: [4096:0]u8 = undefined;
+    if (builtin.target.os.tag == .macos) {
+        if (macHelperPath(&helper_buf)) |p| setStr(p, &settings.browser_subprocess_path);
+    }
+    defer if (builtin.target.os.tag == .macos) cef.cef_string_utf16_clear(&settings.browser_subprocess_path);
     if (cef.cef_initialize(&args, &settings, &app, null) != 1) return false;
     // Only valid after initialize, and only in the browser process.
     registerExtSchemeFactory();

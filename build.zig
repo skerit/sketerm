@@ -1110,16 +1110,32 @@ pub fn build(b: *std.Build) void {
     addCef(b, target, optimize, strip, use_lld, core_cbindings_mod, mux_exe, &test_roots.step, &lint_errdefer.step);
 }
 
-/// Pinned CEF binary distribution ("minimal" distro, linux64). SINGLE
-/// source of truth: the download URL, the cache directory, the
-/// translated bindings and the linked libcef.so all derive from it.
-/// Bumping CEF is this one line plus a `zig build fetch-cef`.
+/// Pinned CEF binary distribution ("minimal" distro). SINGLE source of
+/// truth: the download URL, the cache directory, the translated
+/// bindings and the linked engine all derive from it. Bumping CEF is
+/// this one line plus the per-platform checksums and a `zig build
+/// fetch-cef`.
 const CEF_VERSION = "151.3.16+gbe1e15d+chromium-151.0.7922.109";
 
-/// SHA-256 of the linux64 "minimal" tarball for CEF_VERSION, checked
-/// after download. Cross-checked once against the SHA-1 the CDN's
-/// index.json publishes for the same file; bump both together.
-const CEF_SHA256 = "eaeb313e6039de464855893d287c4d5eb4ec7126978ea83c6164bf4a23dc017a";
+/// SHA-256 of the "minimal" tarball for CEF_VERSION, per CDN platform,
+/// checked after download. Each was cross-checked once against the
+/// SHA-1 the CDN's index.json publishes for the same file; bump them
+/// together with CEF_VERSION.
+const CEF_SHA256_LINUX64 = "eaeb313e6039de464855893d287c4d5eb4ec7126978ea83c6164bf4a23dc017a";
+const CEF_SHA256_MACOSARM64 = "80e6d586fc683a13002d49b913f7b71d01866b7619bec759e5b302b9d53e6995";
+
+/// The CDN platform slug and the checksum for a build target.
+///
+/// macOS is arm64-only here deliberately: `macosx64` exists on the CDN
+/// but nothing in this project has ever run on an Intel Mac, and a pin
+/// nobody verifies is worse than an honest refusal.
+fn cefPlatform(target: std.Target) ?struct { slug: []const u8, sha256: []const u8 } {
+    if (target.os.tag == .linux and target.cpu.arch == .x86_64)
+        return .{ .slug = "linux64", .sha256 = CEF_SHA256_LINUX64 };
+    if (target.os.tag == .macos and target.cpu.arch == .aarch64)
+        return .{ .slug = "macosarm64", .sha256 = CEF_SHA256_MACOSARM64 };
+    return null;
+}
 
 /// The REAL uBlock Origin build smoke-web stage 35 measures against.
 ///
@@ -1199,9 +1215,13 @@ fn addCef(
             url_version.append(b.allocator, ch) catch @panic("OOM");
         }
     }
+    // The CDN slug for THIS target. A platform with no pin gets a
+    // `web` step that says so rather than a build that half-works.
+    const cef_plat = cefPlatform(target.result);
+    const is_mac_cef = target.result.os.tag == .macos;
     const url = b.fmt(
-        "https://cef-builds.spotifycdn.com/cef_binary_{s}_linux64_minimal.tar.bz2",
-        .{url_version.items},
+        "https://cef-builds.spotifycdn.com/cef_binary_{s}_{s}_minimal.tar.bz2",
+        .{ url_version.items, if (cef_plat) |p| p.slug else "linux64" },
     );
 
     // curl + tar rather than Zig code: the fetch is a developer-invoked
@@ -1212,8 +1232,14 @@ fn addCef(
     const fetch = b.addSystemCommand(&.{
         "sh", "-c",
         \\set -eu
-        \\root="$1"; url="$2"
-        \\if [ -e "$root/Release/libcef.so" ]; then
+        \\root="$1"; url="$2"; sum="$3"; kind="$4"
+        \\fw="Chromium Embedded Framework"
+        \\if [ "$kind" = mac ]; then
+        \\  marker="$root/Release/$fw.framework/$fw"
+        \\else
+        \\  marker="$root/Release/libcef.so"
+        \\fi
+        \\if [ -e "$marker" ]; then
         \\  echo "cef: already present at $root"
         \\  exit 0
         \\fi
@@ -1222,17 +1248,41 @@ fn addCef(
         \\mkdir -p "$tmp"
         \\echo "cef: downloading $url"
         \\curl -fL --retry 3 -o "$tmp/cef.tar.bz2" "$url"
-        \\echo "$3  $tmp/cef.tar.bz2" | sha256sum -c - >/dev/null || {
+        \\# sha256sum is coreutils; macOS ships `shasum -a 256`. Pick
+        \\# whichever exists rather than making coreutils a build dep.
+        \\if command -v sha256sum >/dev/null 2>&1; then
+        \\  echo "$sum  $tmp/cef.tar.bz2" | sha256sum -c - >/dev/null || bad=1
+        \\else
+        \\  echo "$sum  $tmp/cef.tar.bz2" | shasum -a 256 -c - >/dev/null || bad=1
+        \\fi
+        \\if [ "${bad:-0}" = 1 ]; then
         \\  echo "cef: SHA-256 mismatch, refusing to unpack" >&2
         \\  rm -rf "$tmp"; exit 1
-        \\}
+        \\fi
         \\tar -xjf "$tmp/cef.tar.bz2" -C "$tmp" --strip-components=1
         \\rm -f "$tmp/cef.tar.bz2"
-        \\# icudtl.dat, the .pak files and locales/ are looked up NEXT TO
-        \\# libcef.so — CefSettings.resources_dir_path does NOT redirect
-        \\# the icudtl probe. Flattening Resources/* into Release/ is the
-        \\# standard CEF deploy layout and is required, not a shortcut.
-        \\cp -a "$tmp/Resources/." "$tmp/Release/"
+        \\if [ "$kind" = mac ]; then
+        \\  # macOS ships everything INSIDE the framework already —
+        \\  # there is no top-level Resources/ to flatten. What it does
+        \\  # need is the VERSIONED bundle layout: macOS 26 / Xcode 26
+        \\  # reject a flat framework, and CEF's README documents the
+        \\  # relative-symlink shape below as the fix.
+        \\  d="$tmp/Release/$fw.framework"
+        \\  mkdir -p "$d/Versions/A"
+        \\  for item in "$fw" Libraries Resources; do
+        \\    [ -e "$d/$item" ] || continue
+        \\    mv "$d/$item" "$d/Versions/A/$item"
+        \\    ln -s "Versions/Current/$item" "$d/$item"
+        \\  done
+        \\  ln -s A "$d/Versions/Current"
+        \\else
+        \\  # icudtl.dat, the .pak files and locales/ are looked up NEXT
+        \\  # TO libcef.so — CefSettings.resources_dir_path does NOT
+        \\  # redirect the icudtl probe. Flattening Resources/* into
+        \\  # Release/ is the standard CEF deploy layout and is
+        \\  # required, not a shortcut.
+        \\  cp -a "$tmp/Resources/." "$tmp/Release/"
+        \\fi
         \\rm -rf "$root"
         \\mv "$tmp" "$root"
         \\echo "cef: installed at $root"
@@ -1241,7 +1291,8 @@ fn addCef(
     });
     fetch.addArg(cef_root);
     fetch.addArg(url);
-    fetch.addArg(CEF_SHA256);
+    fetch.addArg(if (cef_plat) |p| p.sha256 else CEF_SHA256_LINUX64);
+    fetch.addArg(if (is_mac_cef) "mac" else "elf");
     // Produces no build output the graph can hash; without this the Run
     // step would be cached away and a deleted cache never re-fetched.
     fetch.has_side_effects = true;
@@ -1295,18 +1346,29 @@ fn addCef(
     const smoke_web_step = b.step("smoke-web", "browser-helper end-to-end smoke (headless)");
     const bench_wreq_step = b.step("bench-webreq", "Blocking-webRequest added-latency benchmark (real helper, real page)");
 
+    // The engine binary this platform actually ships: an ELF shared
+    // object on Linux, an unversioned framework bundle on macOS.
+    const cef_binary_rel = if (is_mac_cef)
+        "Chromium Embedded Framework.framework/Chromium Embedded Framework"
+    else
+        "libcef.so";
+
     // Probe the two halves separately: a split system install has no
     // Release dir at all, and a header-only hit would fail at link.
     const have_cef = blk: {
-        std.Io.Dir.accessAbsolute(b.graph.io, b.fmt("{s}/libcef.so", .{release_dir}), .{}) catch break :blk false;
+        if (cef_plat == null) break :blk false;
+        std.Io.Dir.accessAbsolute(b.graph.io, b.fmt("{s}/{s}", .{ release_dir, cef_binary_rel }), .{}) catch break :blk false;
         std.Io.Dir.accessAbsolute(b.graph.io, b.fmt("{s}/include/capi/cef_app_capi.h", .{include_root}), .{}) catch break :blk false;
         break :blk true;
     };
     if (!have_cef) {
-        const missing = b.addFail(b.fmt(
-            "no usable CEF at {s} (libcef.so) + {s} (headers) — run `zig build fetch-cef`, " ++
+        const missing = if (cef_plat == null) b.addFail(b.fmt(
+            "no pinned CEF distribution for {s}-{s} — the browser helper is Linux x86_64 and macOS arm64 only",
+            .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag) },
+        )) else b.addFail(b.fmt(
+            "no usable CEF at {s} ({s}) + {s} (headers) — run `zig build fetch-cef`, " ++
                 "or point -Dcef-include=/-Dcef-lib= at a system install (e.g. /usr/include/cef and /usr/lib/cef)",
-            .{ release_dir, include_root },
+            .{ release_dir, cef_binary_rel, include_root },
         ));
         web_step.dependOn(&missing.step);
         test_web_step.dependOn(&missing.step);
@@ -1325,6 +1387,12 @@ fn addCef(
         .optimize = optimize,
         .link_libc = true,
     });
+    // macOS SDKs before Xcode 14.3 ship no <uchar.h>, and CEF's
+    // cef_string_types.h only guards that include behind `#ifdef
+    // __clang__` — which Aro does not define, so it takes the
+    // unconditional branch and fails on a Command Line Tools SDK.
+    // Shim FIRST so it shadows nothing on a host that has the real one.
+    if (is_mac_cef) tc.addIncludePath(b.path("vendor/aro_shims/cef"));
     tc.addIncludePath(.{ .cwd_relative = include_root });
     const cef_mod = tc.createModule();
 
@@ -1369,11 +1437,52 @@ fn addCef(
     web_opts.addOption([]const u8, "version", semver);
     web_opts.addOption([]const u8, "cef_release_dir", runtime_dir);
     web_mod.addImport("build_options", web_opts.createModule());
-    web_mod.addLibraryPath(.{ .cwd_relative = release_dir });
-    web_mod.linkSystemLibrary("cef", .{});
-    // libcef.so is not on the loader's search path; the helper is not
-    // relocatable anyway (it needs the .pak/icudtl.dat next to the lib).
-    web_mod.addRPath(.{ .cwd_relative = runtime_dir });
+    if (is_mac_cef) {
+        // macOS links the framework DIRECTLY, and the framework's own
+        // install name is what makes that work:
+        //
+        //   @executable_path/../Frameworks/Chromium Embedded Framework
+        //       .framework/Chromium Embedded Framework
+        //
+        // That path is relative to the executable, and it is EXACTLY
+        // the layout a macOS bundle already has (`Contents/MacOS/exe`
+        // beside `Contents/Frameworks/`). So one binary works both
+        // from a bundle and from `zig-out/bin/` with the framework
+        // staged at `zig-out/Frameworks/` — see the install step below.
+        //
+        // CEF's README advises loading the framework dynamically
+        // instead (`cef_load_library`, via `libcef_dll_dylib.cc`). That
+        // route was tried first and abandoned for a toolchain reason,
+        // recorded here so nobody re-treads it: the wrapper is C++, its
+        // capi includes pull in <cstring>, and Zig 0.16 cannot supply
+        // C++ headers here — its BUNDLED libc++ fails to compile
+        // against a current macOS SDK (`INFINITY` undeclared in
+        // __random/clamp_to_integral.h), while the SDK's own libc++
+        // headers refuse to be used out of Zig's include order
+        // ("<cstring> tried including <string.h> but didn't find
+        // libc++'s"). Direct linking needs no C++ translation unit at
+        // all. The cost is that the helper is not relocatable away from
+        // its framework — which it never was on Linux either (it needs
+        // the .pak/icudtl.dat siblings there).
+        web_mod.addFrameworkPath(.{ .cwd_relative = release_dir });
+        web_mod.linkFramework("Chromium Embedded Framework", .{});
+        // CEF's macOS message pump runs on Cocoa's run loop, so the
+        // helper needs an NSApplication (implementing CefAppProtocol)
+        // before cef_initialize — without one it starts, spawns its
+        // children, and then never finishes a navigation. See the file.
+        web_mod.addCSourceFile(.{
+            .file = b.path("src/web/mac_app.m"),
+            .flags = &.{ "-fobjc-arc", "-fno-sanitize=undefined" },
+        });
+        web_mod.linkFramework("Cocoa", .{});
+    } else {
+        web_mod.addLibraryPath(.{ .cwd_relative = release_dir });
+        web_mod.linkSystemLibrary("cef", .{});
+        // libcef.so is not on the loader's search path; the helper is
+        // not relocatable anyway (it needs the .pak/icudtl.dat next to
+        // the lib).
+        web_mod.addRPath(.{ .cwd_relative = runtime_dir });
+    }
     // KNOWN CONSTRAINT, harmless for this stub: Zig emits libc BEFORE
     // libcef in DT_NEEDED no matter the CLI order, and libcef's zygote
     // resolves dlsym(RTLD_NEXT, "close") — which then misses and aborts
@@ -1400,6 +1509,25 @@ fn addCef(
     // which would drag CEF into the default build.
     web_step.dependOn(&b.addInstallArtifact(web_exe, .{}).step);
 
+    // macOS: the bare executable in `zig-out/bin/` CANNOT RUN. Chromium
+    // resolves icudtl.dat and its .pak files through the framework
+    // BUNDLE, which it only finds from a bundled main executable
+    // ("icudtl.dat not found in bundle", then cef_initialize fails),
+    // and it launches renderer/GPU/network children from a separate
+    // helper .app rather than by re-executing us. So the real artifact
+    // on this platform is `zig-out/sketerm-webengine.app`, assembled
+    // here; every piece of it answers a failure documented in the
+    // script. The loose binary is left in place as the thing the
+    // bundle is built FROM, not as something to run.
+    const mac_bundle = b.addSystemCommand(&.{"dist/macos-bundle.sh"});
+    if (is_mac_cef) {
+        mac_bundle.addArg(b.getInstallPath(.prefix, ""));
+        mac_bundle.addArtifactArg(web_exe);
+        mac_bundle.addArg(release_dir);
+        mac_bundle.has_side_effects = true;
+        web_step.dependOn(&mac_bundle.step);
+    }
+
     // Browser-helper smoke — `zig build smoke-web` (headless). Spawns
     // the helper on a private short socket and drives the v1 protocol
     // as a client: handshake, memfd paint, trusted click, typing,
@@ -1418,7 +1546,13 @@ fn addCef(
         .use_lld = use_lld,
     });
     const smoke_web_run = b.addRunArtifact(smoke_web);
-    smoke_web_run.addArtifactArg(web_exe);
+    if (is_mac_cef) {
+        // The loose executable cannot run on macOS (no bundle, so no
+        // icudtl.dat and no helper for children) — the rig has to drive
+        // the assembled .app, and therefore has to wait for it.
+        smoke_web_run.addArg(b.getInstallPath(.prefix, "sketerm-webengine.app/Contents/MacOS/sketerm-webengine"));
+        smoke_web_run.step.dependOn(&mac_bundle.step);
+    } else smoke_web_run.addArtifactArg(web_exe);
     // The remote-helper stage spawns a private sketerm-mux and asks IT
     // to launch the helper over a bridged byte channel.
     smoke_web_run.addArtifactArg(mux_exe);

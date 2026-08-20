@@ -9,12 +9,20 @@
 // libcef links no GTK, in either the upstream or the distro build.)
 //
 // Startup order matters and is not negotiable:
-//   1. re-exec with LD_PRELOAD=libcef.so (see below),
+//   1. re-exec with LD_PRELOAD=libcef.so (LINUX only; see below),
 //   2. cef_api_hash — the FIRST libcef call of any process,
 //   3. cef_execute_process — returns for CEF's own subprocesses,
 //   4. cef_initialize, then the socket loop.
+//
+// macOS differs in two ways, both in build.zig and documented there:
+// the framework is linked directly (dyld binds it through the
+// framework's own @executable_path/../Frameworks install name, so
+// step 1 has nothing to fix), and there is no ozone platform — the
+// engine renders through its own windowing layer and only the
+// SOFTWARE paint path is wired up (see buildCefArgv).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("cbindings");
 const build_options = @import("build_options");
 const cefhost = @import("cefhost.zig");
@@ -39,12 +47,18 @@ const PRELOAD_GUARD = "SKETERM_WEB_PRELOADED";
 pub fn main(init: std.process.Init.Minimal) u8 {
     const argv = init.args.vector;
 
-    // (1) DT_NEEDED order workaround. Zig always emits libc BEFORE
-    // libcef, and libcef's zygote resolves dlsym(RTLD_NEXT, "close") —
-    // which then misses glibc and aborts with SIGTRAP. LD_PRELOAD of
-    // libcef.so fixes the resolution order, and it can only be set
-    // before the loader runs, hence the re-exec.
-    if (c.getenv(PRELOAD_GUARD) == null) {
+    // (1) DT_NEEDED order workaround, LINUX ONLY. Zig always emits libc
+    // BEFORE libcef, and libcef's zygote resolves dlsym(RTLD_NEXT,
+    // "close") — which then misses glibc and aborts with SIGTRAP.
+    // LD_PRELOAD of libcef.so fixes the resolution order, and it can
+    // only be set before the loader runs, hence the re-exec.
+    //
+    // macOS needs nothing here: there is no zygote process on that
+    // platform, and the framework is bound by dyld through its own
+    // `@executable_path/../Frameworks/…` install name, so no load order
+    // is ours to fix. Do not "port" this — a re-exec would only cost a
+    // process spawn.
+    if (builtin.target.os.tag != .macos and c.getenv(PRELOAD_GUARD) == null) {
         reexecPreloaded(argv);
         // Only reachable if the re-exec failed; carry on and hope the
         // zygote never needs the symbol.
@@ -229,6 +243,20 @@ fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
         if (n == buf.len) break;
         buf[n] = @constCast(@ptrCast(a));
         n += 1;
+    }
+    // macOS has no ozone at all — Chromium uses its own windowing
+    // layer, and `--ozone-platform=` is simply not a switch there. The
+    // GPU decision the rest of this function makes is likewise moot:
+    // an accelerated OSR paint on macOS delivers an IOSurface, not
+    // dma-buf planes (`cef_accelerated_paint_info_t` has no `planes`
+    // array there), and there is neither a wire frame nor a GTK
+    // importer for one. So the helper stays on the SOFTWARE paint path
+    // and says so, rather than probing for a compositor that cannot
+    // exist. An IOSurface frame family would be a new capability, not
+    // a tweak here.
+    if (builtin.target.os.tag == .macos) {
+        cefhost.setAccelerated(false);
+        return buf[0..n];
     }
     // A CEF subprocess is this binary re-executed with Chromium's own
     // command line, which already carries the platform the browser
