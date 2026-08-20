@@ -283,6 +283,68 @@ environments only for ordinary binaries, not system ones like
 whose name matches exactly — on top of the known comm-`exe` trap for
 re-exec'd ones. Never trust it as a leftover census.
 
+## Second wave, 2026-08-20 (same day, after the section above)
+
+Landed on `macos-port-fixes-2` after the re-verification, all suites
+green on the settled tree (`test`, `test-core`, `smoke-mux`,
+`smoke-fs`, `smoke-web`, `smoke-e2e`, `mux-portable`):
+
+- **CEF browses on macOS — `smoke-web` fully green.** The load stall
+  was two stacked bugs: renderers launch from a separate
+  `Helper (Renderer).app` variant bundle (ours shipped only the plain
+  helper — same 1003 error as the GPU failure, one bundle level
+  deeper), and the cookie store hung forever asking the Keychain for
+  its encryption key (headless + ad-hoc-signed = the SecKeychain call
+  never returns; every http(s) request is held on the cookie load;
+  `--use-mock-keychain` on macOS). Details and the measured dead ends
+  (`isRunning` override, external pump) in `docs/cef-macos.md`.
+- **App chords live on Command now.** The macOS default table maps
+  Cmd where Linux has Ctrl+Shift; Ctrl belongs entirely to the shell
+  (Cmd+C is plain copy — `interrupt_or_copy` retired here). The
+  subtle half: GTK's IM consumes Cmd+letter before key handlers run
+  (its no-text mask covers Ctrl/Alt, not Meta), so a macOS-only
+  capture-phase controller swallows every Cmd chord ahead of the IM.
+  Known gap: Cmd+1..9 cannot fire on AZERTY (digits are shifted);
+  needs physical-keycode bindings, same as Linux Alt+digit.
+- **The panel canary "bug" never existed.** The ~10 `canary tripped`
+  lines per test run were the guard's own test coverage printing the
+  same alarming line a real trip would. Test-expected trips are
+  silenced (`expected_by_test`); the detector is unweakened. Two
+  sessions misdiagnosed this as a live use-after-free — the cost of a
+  detector whose test noise is indistinguishable from a real alarm.
+- Welcome tour reachable from the palette/menu (`welcome_open`);
+  watch-limited live views now say so in the file browser status line
+  (the forced end-to-end is Linux-only by construction — on Darwin the
+  fd starvation that refuses the watch also fails the listing).
+- Test isolation on macOS needs an explicit short `--socket` — the
+  XDG-only recipe attaches to the user's real daemon (now in
+  CLAUDE.md).
+
+### Open items after the second wave
+
+- `zig build test-web` has never worked on macOS: the test binary
+  links the CEF framework but nothing stages it alongside
+  `.zig-cache/o/<hash>/test`. Fix in `build.zig` (stage or rpath).
+- Headless-Mac browser use (SSH, no WindowServer) is unverified;
+  everything so far ran inside a logged-in Aqua session.
+- CEF GPU parity needs an IOSurface frame family — a new wire
+  protocol capability, not a patch.
+- **There is no headless GUI on macOS and there cannot be one** the
+  way Linux display sessions work: WindowServer is a per-machine
+  singleton, GTK's macos backend is the only one compiled, and an
+  SSH session without Aqua cannot create windows at all. The daemon
+  is headless everywhere; the CEF helper is headless by design; the
+  GTK GUI always needs a real WindowServer. Pragmatic options, none
+  implemented: a virtual display (CGVirtualDisplay) to keep test
+  windows off-screen-but-in-session, a GTK-Wayland-on-macOS build
+  (toolchain project), or a macOS VM (the only true isolation).
+- README/docs shortcut tables list only the Ctrl+Shift chords and
+  need a macOS column.
+- Cmd+1..9 / Cmd+Shift+[ ] on AZERTY (physical keycodes), the
+  smoke-display handover flake (seen once), the 560×96 notice card
+  clipping long text, VoiceOver for editor+browser — all still open
+  from the lists above.
+
 ## Building on a Mac (verified recipe)
 
 ```bash
