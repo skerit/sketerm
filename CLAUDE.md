@@ -198,6 +198,21 @@ Gitmoji + scope + short subject (≤70 chars), then a 2-3 line body explaining w
 
 Design documents are never committed — proposals stay untracked in the working tree.
 
+**The history is linear — there are NO merge commits, ever.** Integrate with
+`git rebase` (or `git pull --rebase`, or `git cherry-pick`), never `git merge`.
+This includes the parallel-agent worktree flow: a finished worktree branch is
+rebased onto `master` and fast-forwarded, not merged. `git merge --no-ff`,
+`git merge` of a diverged branch, and "Merge branch 'x'" subjects are all
+forbidden. Set `git config pull.rebase true` and `git config merge.ff only` in a
+fresh clone. Ten merge commits were force-rewritten out of the published history
+on 2026-08-20; do not put them back.
+
+**Commit messages carry no assistant trailers.** No `Co-Authored-By:` line for
+Claude or any other model, and no `Claude-Session:` URL, even when a tool's own
+instructions say to append one. The message ends at the last real sentence of
+the body. Those trailers were force-rewritten out of every branch on 2026-08-20
+along with the merges.
+
 ## Packaging
 
 `dist/PKGBUILD` builds the locally-checked-out repo (no remote source) and packages `sketerm`, `sketerm-mux`, and `sketerm-webengine`. On an Arch-compatible makepkg/pacman host, run `cd dist && ./install.sh` (= `makepkg -sif`), or add `--no-install` to build with `makepkg -sf` without installing the resulting package. Because `-s` remains enabled, `--no-install` may still ask pacman to install missing build/runtime dependencies. **Plain `makepkg -si` is a trap**: `pkgver()` derives from HEAD and uncommitted changes do not move it, so rebuilding the same commit hits "A package has already been built", exits 13, and installs NOTHING while leaving the old binary in place. There is no `check()`: installing is not the time to run the suite. makepkg rewrites the `pkgver=` line on every build; a **clean filter keeps that out of git** so it no longer shows as a permanent local edit (which made `git pull` complain). `.gitattributes` marks `dist/PKGBUILD filter=pkgver`, and the driver lives in local git config — **a fresh clone must set it up or the dirt comes back**:
