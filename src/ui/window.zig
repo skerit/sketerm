@@ -362,6 +362,9 @@ pub const Window = struct {
     /// Set before deinit starts so lifecycle helpers do not enqueue GTK work
     /// carrying this Window beyond its final teardown.
     destroying: bool = false,
+    /// The first-run tour is considered at most once per window;
+    /// `present()` runs again on a quake reveal and a layout restore.
+    welcome_checked: bool = false,
     /// `page-detached` decisions hold a raw Window until their idle runs.
     /// Secondary finalization waits for this count rather than freeing under
     /// one of those callbacks.
@@ -1328,6 +1331,20 @@ pub const Window = struct {
 
     pub fn present(self: *Window) void {
         c.gtk_window_present(@ptrCast(self.app_window));
+        // First-run tour, once per user. Deferred to an idle so the
+        // window is mapped before a dialog is attached to it, and
+        // guarded so a second present() (quake reveal, restore) cannot
+        // re-open it.
+        if (!self.welcome_checked) {
+            self.welcome_checked = true;
+            if (@import("welcome.zig").shouldShow())
+                _ = c.g_idle_add(@ptrCast(&welcomeIdle), @ptrCast(self));
+        }
+    }
+
+    /// Open the welcome tour on demand, independent of first-run state.
+    pub fn openWelcome(self: *Window) void {
+        @import("welcome.zig").open(self);
     }
 
     /// Quake-mode toggle. If the window is hidden / minimized,
@@ -4624,6 +4641,18 @@ fn countPanesInTree(self: *Window, root: *c.GtkWidget) usize {
         if (widgetIsAncestor(root, p.widget())) n += 1;
     }
     return n;
+}
+
+/// Show the first-run tour once the window is mapped.
+///
+/// The raw Window survives the hop because `destroying` is set before
+/// any teardown enqueues GTK work, and the idle is added from
+/// `present()` — a window cannot begin dying between those two points
+/// without setting it.
+fn welcomeIdle(user: ?*anyopaque) callconv(.c) c_int {
+    const win = cast.userData(Window, user);
+    if (!win.destroying) win.openWelcome();
+    return 0; // G_SOURCE_REMOVE
 }
 
 /// Pending close-page request. Heap-allocated so the AdwAlertDialog's

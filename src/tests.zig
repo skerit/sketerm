@@ -351,6 +351,7 @@ comptime {
     _ = @import("ui/panelhost.zig");
     _ = @import("ui/panelwin.zig");
     _ = @import("ui/panelpicker.zig");
+    _ = @import("ui/welcome.zig");
     _ = @import("ui/window.zig");
     _ = @import("ui/muxtabs.zig");
     _ = @import("ui/termsinks.zig");
