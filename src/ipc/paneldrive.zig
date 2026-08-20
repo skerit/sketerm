@@ -526,11 +526,16 @@ test "paneldrive origin prefers exact environment and otherwise names only the d
         } else _ = c.unsetenv("XDG_RUNTIME_DIR");
     }
 
+    // Compare canonical-to-canonical: resolve() canonicalizes on purpose
+    // (two spellings of one socket must share an identity), and on Darwin
+    // /tmp IS a symlink to /private/tmp, so the literal is not the answer.
     _ = c.setenv("SKETERM_MUX_SOCKET", "/tmp/exact-panel-origin.sock", 1);
     var exact = try Origin.resolve(t.allocator, "session-a");
     defer exact.deinit(t.allocator);
     try t.expectEqual(SocketSource.environment, exact.source);
-    try t.expectEqualStrings("/tmp/exact-panel-origin.sock", exact.socket);
+    const want_exact = try muxdaemon.canonicalSocketPath(t.allocator, "/tmp/exact-panel-origin.sock");
+    defer t.allocator.free(want_exact);
+    try t.expectEqualStrings(want_exact, exact.socket);
 
     _ = c.setenv("SKETERM_MUX_SOCKET", "relative-panel-origin.sock", 1);
     var relative = try Origin.resolve(t.allocator, "session-a");
@@ -544,7 +549,9 @@ test "paneldrive origin prefers exact environment and otherwise names only the d
     var compat = try Origin.resolve(t.allocator, "session-b");
     defer compat.deinit(t.allocator);
     try t.expectEqual(SocketSource.default_compat, compat.source);
-    try t.expectEqualStrings("/tmp/paneldrive-origin-test/sketerm/mux.sock", compat.socket);
+    const want_compat = try muxdaemon.canonicalSocketPath(t.allocator, "/tmp/paneldrive-origin-test/sketerm/mux.sock");
+    defer t.allocator.free(want_compat);
+    try t.expectEqualStrings(want_compat, compat.socket);
     try t.expectError(error.MissingSession, Origin.resolve(t.allocator, null));
 }
 

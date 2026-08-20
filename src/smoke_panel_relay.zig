@@ -501,7 +501,12 @@ pub fn run(allocator: std.mem.Allocator, sock_path: []const u8) void {
     newer_gui.sendJson(.log_get, .{ .tail = @as(u32, 100), .max_chars = @as(u32, 4096) }) catch fail("environment log request");
     const log_frame = newer_gui.recvExpectFor(&.{.log_data}, 5_000) catch fail("environment log reply");
     var expected_buf: [512]u8 = undefined;
-    const expected = std.fmt.bufPrint(&expected_buf, "MUXENV=[{s}] SESSION=[panel-stage]", .{sock_path}) catch fail("environment expectation too long");
+    // The daemon exports the CANONICAL spelling of its listener, so the
+    // expectation has to be canonical too -- on Darwin /tmp is a symlink
+    // to /private/tmp and the rig's own spelling never matches.
+    const canonical_sock = daemon_mod.canonicalSocketPath(allocator, sock_path) catch fail("canonicalize rig socket");
+    defer allocator.free(canonical_sock);
+    const expected = std.fmt.bufPrint(&expected_buf, "MUXENV=[{s}] SESSION=[panel-stage]", .{canonical_sock}) catch fail("environment expectation too long");
     if (std.mem.indexOf(u8, log_frame.payload, expected) == null) fail("PTY did not receive the exact owning SKETERM_MUX_SOCKET");
     log_frame.deinit(allocator);
 
