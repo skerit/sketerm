@@ -1305,7 +1305,7 @@ pub fn setupHubSocket(self: *Daemon, comptime prefix: []const u8, id: u32) ?Wayl
 /// suppresses the macOS auto gate (Linux-like behaviour),
 /// "all"/"sck" widen to every session, "stub"/other force the
 /// test pattern.
-pub fn winstreamGate(req: SpawnReq, hosts_apps: bool) struct { want: bool, use_sck: bool } {
+pub fn winstreamGate(req: SpawnReq, hosts_apps: bool) struct { want: bool, use_sck: bool, asked: bool } {
     const env = std.c.getenv("SKETERM_WINSTREAM");
     const val: ?[]const u8 = if (env) |e| std.mem.span(e) else null;
     const eq = struct {
@@ -1322,6 +1322,15 @@ pub fn winstreamGate(req: SpawnReq, hosts_apps: bool) struct { want: bool, use_s
     return .{
         .want = req.winstream or (val != null and !off and (req.app or widen)) or auto_mac,
         .use_sck = (comptime wssource.have_sck) and (val == null or eq(val, "sck")),
+        // Did this session ASK to stream, or did `auto_mac` arm it
+        // behind the user's back? Only a request earns a visible
+        // failure when the Screen Recording grant is missing: on a
+        // plain shell nobody asked for capture, so a notice WINDOW is
+        // unactionable noise on every launch (issue #4). The capture
+        // attempt itself still happens either way — it is what
+        // registers the binary in System Settings, and without that
+        // registration the grant can never be given.
+        .asked = req.winstream or req.app or (val != null and !off),
     };
 }
 
@@ -1636,7 +1645,9 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     if (ws_gate.want) create_ws: {
         const w = allocator.create(WsSource) catch break :create_ws;
         if (ws_gate.use_sck) {
-            w.* = WsSource.initSck(allocator, s.childPid()) catch |err| {
+            w.* = WsSource.initSck(allocator, s.childPid(), .{
+                .notice_on_denied = ws_gate.asked,
+            }) catch |err| {
                 log.warn("window capture init failed ({s}) — session '{s}' has no app streaming", .{ @errorName(err), req.name });
                 allocator.destroy(w);
                 break :create_ws;

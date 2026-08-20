@@ -17,6 +17,7 @@ const pixcodec = @import("../wlhost/pixcodec.zig");
 const vcodec = @import("../wlhost/vcodec.zig");
 const churn = @import("../util/churn.zig");
 const content = @import("../util/content.zig");
+const log = @import("../mux/log.zig");
 
 /// VideoToolbox H.264 encode is available (native macOS). The video
 /// route (hot + photographic windows → win_vtile) collapses out when
@@ -55,10 +56,27 @@ const status_screen: u32 = 1;
 /// Synthetic window that tells the user WHY nothing is streaming
 /// when the Screen Recording grant is missing — a silent hang is
 /// the one failure mode this backend must not have.
+///
+/// Shown ONLY to a session that asked to stream (see
+/// `Source.notice_on_denied`). A session the macOS auto gate armed on
+/// its own logs the refusal instead: it never requested capture, so a
+/// window on every launch is noise the user cannot act on.
 const notice_win: u32 = 0xfffffffe;
-const notice_w: i32 = 520;
-const notice_h: i32 = 80;
+const notice_w: i32 = 560;
+const notice_h: i32 = 96;
 const notice_title = "sketerm: grant Screen Recording to sketerm-mux on the Mac, then restart the daemon";
+/// Body text drawn INTO the card. The title above rides the wire for
+/// clients that show a titlebar; this is what a client without one
+/// shows, and before it existed such a client showed an empty box.
+const notice_body =
+    "Screen Recording is not granted.\n" ++
+    "System Settings > Privacy & Security > Screen Recording:\n" ++
+    "enable sketerm-mux, then restart the daemon.";
+
+/// Paints `notice_body` into a w*h BGRA (top-down) buffer using
+/// CoreText, which the shim has and the libc-only daemon does not.
+/// False = context creation failed; the caller keeps a plain card.
+extern fn sketerm_sck_render_notice(text: [*:0]const u8, w: i32, h: i32, out: [*]u8) bool;
 
 /// Per-window lossy-video state: a churn tracker + a fixed-resolution
 /// H.264 encoder (VideoToolbox), mirroring daemon.zig's Wayland
@@ -95,7 +113,14 @@ pub const Source = struct {
     /// `Encoded` aliases it but is appended into `out` before the next
     /// encode reuses it (same discipline as the stub).
     sc: pixcodec.Scratch = .{},
+    /// This session asked to stream, so a denied grant opens the
+    /// notice window. When false the denial is logged once instead.
+    notice_on_denied: bool = false,
     notice_open: bool = false,
+    /// The log line for a denied grant is emitted once per source —
+    /// poll runs every tick and the status never changes without a
+    /// daemon restart.
+    denied_logged: bool = false,
     /// Dedupe for shim error reporting — refresh retries reproduce
     /// the same failure string every few seconds.
     last_err: [512]u8 = undefined,
@@ -109,9 +134,9 @@ pub const Source = struct {
     /// Reused vcodec tile blob for the win_vtile body.
     vblob: std.ArrayList(u8) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, app_pid: i32) !Source {
+    pub fn init(allocator: std.mem.Allocator, app_pid: i32, notice_on_denied: bool) !Source {
         const ctx = sketerm_sck_create(app_pid) orelse return error.SckInitFailed;
-        return .{ .allocator = allocator, .ctx = ctx };
+        return .{ .allocator = allocator, .ctx = ctx, .notice_on_denied = notice_on_denied };
     }
 
     pub fn deinit(self: *Source) void {
@@ -159,16 +184,32 @@ pub const Source = struct {
         const evs = sketerm_sck_drain(self.ctx, &n);
 
         // Shim-side problems (TCC, fetch failures, stream errors)
-        // land in the daemon log — once per distinct message.
+        // land in the daemon log — once per distinct message. log.warn
+        // (not std.debug.print) so it reaches mux.log too: an
+        // autostarted daemon's stderr goes nowhere.
         var err_buf: [512]u8 = undefined;
         const elen = sketerm_sck_last_error(self.ctx, &err_buf, err_buf.len);
         if (elen > 0 and !std.mem.eql(u8, err_buf[0..elen], self.last_err[0..self.last_err_len])) {
-            std.debug.print("sketerm-mux winstream: {s}\n", .{err_buf[0..elen]});
+            log.warn("winstream: {s}", .{err_buf[0..elen]});
             @memcpy(self.last_err[0..elen], err_buf[0..elen]);
             self.last_err_len = elen;
         }
 
         if (sketerm_sck_status(self.ctx) & status_screen == 0) {
+            // No Screen Recording grant: capture cannot produce a single
+            // frame. A session that ASKED to stream gets the notice
+            // window — its feature visibly failed and the card says how
+            // to fix it. A session the macOS auto gate armed on its own
+            // gets one log line: it never asked, and a window on every
+            // plain shell launch is unactionable noise (issue #4).
+            if (!self.notice_on_denied) {
+                if (!self.denied_logged) {
+                    self.denied_logged = true;
+                    log.info("winstream: no Screen Recording grant; app capture is off " ++
+                        "for this session (grant it to sketerm-mux and restart the daemon)", .{});
+                }
+                return;
+            }
             if (!self.notice_open) {
                 self.notice_open = true;
                 try proto.appendWinOpen(out, out_allocator, .{
@@ -179,15 +220,19 @@ pub const Source = struct {
                 });
                 const px = try self.allocator.alloc(u8, @intCast(notice_w * 4 * notice_h));
                 defer self.allocator.free(px);
-                for (0..@intCast(notice_h)) |y| {
-                    for (0..@intCast(notice_w)) |x| {
-                        const i = (y * @as(usize, @intCast(notice_w)) + x) * 4;
-                        // Warning-yellow band on dark gray.
-                        const band = y < 8 or y >= @as(usize, @intCast(notice_h)) - 8;
-                        px[i + 0] = if (band) 0x00 else 0x30; // B
-                        px[i + 1] = if (band) 0xc8 else 0x30; // G
-                        px[i + 2] = if (band) 0xe8 else 0x30; // R
-                        px[i + 3] = 0xff;
+                if (!sketerm_sck_render_notice(notice_body, notice_w, notice_h, px.ptr)) {
+                    // CoreText context refused: keep the old plain card
+                    // rather than sending nothing.
+                    for (0..@intCast(notice_h)) |y| {
+                        for (0..@intCast(notice_w)) |x| {
+                            const i = (y * @as(usize, @intCast(notice_w)) + x) * 4;
+                            // Warning-yellow band on dark gray.
+                            const band = y < 8 or y >= @as(usize, @intCast(notice_h)) - 8;
+                            px[i + 0] = if (band) 0x00 else 0x30; // B
+                            px[i + 1] = if (band) 0xc8 else 0x30; // G
+                            px[i + 2] = if (band) 0xe8 else 0x30; // R
+                            px[i + 3] = 0xff;
+                        }
                     }
                 }
                 try proto.appendFrame(out, out_allocator, .{

@@ -23,6 +23,21 @@ const pixcodec = @import("../wlhost/pixcodec.zig");
 pub const have_sck = builtin.os.tag == .macos and build_options.winstream_sck;
 const SckImpl = if (have_sck) @import("sck.zig").Source else void;
 
+/// How an SCK source behaves when the Screen Recording grant is
+/// missing. Split out because the two cases are genuinely different
+/// users: one asked to stream, the other never did.
+pub const SckOpts = struct {
+    /// This session ASKED to stream (`sketerm app`, an explicit
+    /// winstream request, or an explicit SKETERM_WINSTREAM value), so a
+    /// missing grant is a visible failure it must report as a notice
+    /// window. False for a session the macOS auto gate armed on its
+    /// own: capture is still attempted (that registers the binary in
+    /// System Settings, the only route to a grant), but the refusal
+    /// goes to the daemon log rather than opening a window nobody
+    /// asked for.
+    notice_on_denied: bool = false,
+};
+
 pub const Source = union(enum) {
     stub: Stub,
     sck: SckImpl,
@@ -33,9 +48,9 @@ pub const Source = union(enum) {
 
     /// Real capture of the app rooted at `app_pid` (the session's
     /// PTY child) — windows of that process and its descendants.
-    pub fn initSck(allocator: std.mem.Allocator, app_pid: i32) !Source {
+    pub fn initSck(allocator: std.mem.Allocator, app_pid: i32, opts: SckOpts) !Source {
         if (comptime have_sck) {
-            return .{ .sck = try SckImpl.init(allocator, app_pid) };
+            return .{ .sck = try SckImpl.init(allocator, app_pid, opts.notice_on_denied) };
         }
         return error.Unsupported;
     }
