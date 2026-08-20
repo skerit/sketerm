@@ -2342,9 +2342,60 @@ fn fsReviveView(self: *Daemon, v: *FsView, path: []const u8) bool {
     if (self.fs_watch.ensure()) {
         var z2: [4096]u8 = undefined;
         const cz = pathZ(&z2, v.path) catch return true;
+        const was_full = self.fs_watch.exhausted;
         v.wd = self.fs_watch.add(cz);
+        noteWatchExhaustion(self, was_full, v.path);
     }
     return true;
+}
+
+/// Log the MOMENT the watch backend runs out, once. `exhausted` is
+/// sticky, so comparing it across a single `add` fires on the
+/// transition and never again — an out-of-descriptors daemon must not
+/// also drown its own log while a client retries.
+fn noteWatchExhaustion(self: *Daemon, was_full: bool, path: []const u8) void {
+    if (was_full or !self.fs_watch.exhausted) return;
+    log.warn("fs watch backend out of capacity at '{s}': views opened from now on list but do not update", .{path});
+}
+
+/// True when this view's watch was REFUSED for want of backend
+/// capacity: the listing is real, the deltas will never come, and the
+/// client has no way to tell that apart from a directory nobody
+/// touches. kqueue spends one descriptor per watch and hits
+/// EMFILE/ENFILE; inotify spends a max_user_watches slot and hits
+/// ENOSPC. `liveScanDir` reports exactly this condition on a query as
+/// `watch_limit`; a view owed the same answer and never got it.
+///
+/// `Watcher.exhausted` is sticky, so a later view that fails to watch
+/// for an unrelated reason is attributed to capacity too. That
+/// misnames the cause, never the fact: with `wd < 0` the view is not
+/// live either way, which is the part the client acts on.
+fn fsViewWatchLimited(self: *Daemon, view: ?*FsView) bool {
+    const v = view orelse return false;
+    return watchLimited(v.wd, self.fs_watch.exhausted);
+}
+
+/// The decision alone, so it can be pinned without a live Daemon.
+/// A view that HOLDS a watch is live no matter how exhausted the
+/// backend became afterwards — reporting those would cry wolf on
+/// every view once one refusal made the flag sticky.
+fn watchLimited(wd: c_int, backend_exhausted: bool) bool {
+    return wd < 0 and backend_exhausted;
+}
+
+test "a view is watch-limited only when it holds no watch AND the backend refused" {
+    const t = std.testing;
+    // No watch, backend out of capacity: the listing is real, the
+    // deltas never come — the one case the client must be told about.
+    try t.expect(watchLimited(-1, true));
+    // Holds a watch: live, even though `exhausted` is sticky and some
+    // OTHER view was refused earlier.
+    try t.expect(!watchLimited(3, true));
+    try t.expect(!watchLimited(0, true));
+    // No watch, backend never refused (no watcher backend at all, or a
+    // path-specific failure): not a capacity story, so not this flag.
+    try t.expect(!watchLimited(-1, false));
+    try t.expect(!watchLimited(3, false));
 }
 
 pub fn fsOpenView(self: *Daemon, cl: *Client, r: FsOpReq) void {
@@ -2370,7 +2421,9 @@ pub fn fsOpenView(self: *Daemon, cl: *Client, r: FsOpReq) void {
     if (self.fs_watch.ensure()) {
         var z2: [4096]u8 = undefined;
         const cz = pathZ(&z2, canon) catch return fsReplyErr(cl, r.req, "path too long");
+        const was_full = self.fs_watch.exhausted;
         wd = self.fs_watch.add(cz);
+        noteWatchExhaustion(self, was_full, canon);
     }
     const view = self.allocator.create(FsView) catch return fsReplyErr(cl, r.req, "out of memory");
     const path_owned = self.allocator.dupe(u8, canon) catch {
@@ -2615,6 +2668,7 @@ fn pumpListing(self: *Daemon, listing: *dmod.FsListing) bool {
                     .entries = chunk.items,
                     .more = !last,
                     .truncated = listing.truncated,
+                    .watch_limit = fsViewWatchLimited(self, listing.view),
                 });
             }
             if (!last) return false;
