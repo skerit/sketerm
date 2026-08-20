@@ -14,7 +14,7 @@ cat > "$work/bin/pkg-config" <<'EOF'
 printf '%s\n' "$*" >> "$SKETERM_PKG_CONFIG_LOG"
 for arg in "$@"; do
     case "$arg" in
-        gtk4|libadwaita-1|glib-2.0|gio-2.0|gio-unix-2.0|freetype2|harfbuzz|epoxy|fontconfig|vpx|libpulse|libpulse-mainloop-glib)
+        sketerm-gui|gtk4|libadwaita-1|glib-2.0|gio-2.0|gio-unix-2.0|freetype2|harfbuzz|epoxy|fontconfig|vpx|libpulse|libpulse-mainloop-glib)
             printf 'forbidden GUI pkg-config probe: %s\n' "$arg" >&2
             exit 86 ;;
     esac
@@ -37,7 +37,7 @@ cd "$root"
 run_mux_build mux
 run_mux_build mux-portable
 
-if grep -Eq 'gtk4|libadwaita|glib-2.0|gio|freetype|harfbuzz|epoxy|fontconfig|vpx|libpulse' \
+if grep -Eq 'sketerm-gui|gtk4|libadwaita|glib-2.0|gio|freetype|harfbuzz|epoxy|fontconfig|vpx|libpulse' \
         "$work/pkg-config.log"; then
     printf 'FAIL: mux build probed GUI dependencies\n' >&2
     exit 1

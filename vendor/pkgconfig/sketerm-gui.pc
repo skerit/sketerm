@@ -1,0 +1,20 @@
+# The GUI system-package roster, expressed as ONE virtual pkg-config
+# package. build.zig prepends this directory to PKG_CONFIG_PATH and links
+# `sketerm-gui` instead of the seven packages below.
+#
+# Why: Zig emits one `-l` per *package* it resolves and dedupes only by
+# package NAME, so overlapping closures (gtk4 and libadwaita-1 both expand
+# to -lgtk-4 -lharfbuzz -lglib-2.0 ...) reach the linker repeatedly. Zig's
+# self-hosted Mach-O linker — the only supported one for macOS since LLD
+# dropped Mach-O — emits one LC_LOAD_DYLIB per `-l`, and current dyld
+# REFUSES to load a binary naming the same dylib twice. Asking pkg-config
+# for the whole set at once makes it dedupe the closure itself, which is
+# what it has always done for a `Requires:` list.
+#
+# Adding a GUI dependency means adding it here — this file is the roster
+# for both the TranslateC header pass and the link flags, so the two
+# cannot drift apart.
+Name: sketerm-gui
+Description: sketerm GUI system dependency set (virtual)
+Version: 0
+Requires: gtk4 libadwaita-1 freetype2 harfbuzz epoxy fribidi fontconfig

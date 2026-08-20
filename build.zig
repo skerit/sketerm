@@ -8,6 +8,10 @@ const semver = @import("build.zig.zon").version;
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
 
+    // `vendor/pkgconfig/sketerm-gui.pc` (see `gui_pkg`) has to be on the
+    // pkg-config search path before any step resolves it.
+    registerGuiPkgConfigPath(b);
+
     // LLD is pinned on Linux because the self-hosted ELF linker
     // chokes on gcc 15's `.sframe` relocs in crt1.o. On macOS the
     // self-hosted Mach-O linker is the supported path — LLD's
@@ -1439,18 +1443,35 @@ fn addCef(
     bench_wreq_step.dependOn(&bench_wreq_run.step);
 }
 
-/// The one GUI system-package roster: TranslateC header resolution and
-/// module link flags must agree or a package compiles in one and is
-/// missing from the other.
-const gui_pkgs = [_][]const u8{
-    "gtk4",
-    "libadwaita-1",
-    "freetype2",
-    "harfbuzz",
-    "epoxy",
-    "fribidi",
-    "fontconfig",
-};
+/// The one GUI system-package roster lives in
+/// `vendor/pkgconfig/sketerm-gui.pc` as a virtual package whose
+/// `Requires:` lists gtk4, libadwaita-1, freetype2, harfbuzz, epoxy,
+/// fribidi and fontconfig. TranslateC header resolution and module link
+/// flags both ask for THIS name, so they cannot drift apart.
+///
+/// It is one package rather than seven because Zig resolves pkg-config
+/// per package and dedupes only by package NAME: gtk4 and libadwaita-1
+/// both expand to `-lgtk-4 -lharfbuzz -lglib-2.0 …`, so seven packages
+/// hand the linker the same library up to three times. Zig's self-hosted
+/// Mach-O linker (the only one that links Mach-O now — LLD's port is
+/// unsupported) emits one LC_LOAD_DYLIB per `-l`, and current dyld
+/// ABORTS a binary that names the same dylib twice. pkg-config dedupes a
+/// `Requires:` closure itself, so asking it once fixes this at the
+/// source. ELF hid the bug: GNU ld coalesces DT_NEEDED.
+const gui_pkg = "sketerm-gui";
+
+/// Make `vendor/pkgconfig/` visible to the pkg-config invocations Zig
+/// runs for `gui_pkg`, without disturbing a PKG_CONFIG_PATH the caller
+/// set. Only the search path is touched here — no package is resolved,
+/// so a GTK-less host can still build the daemon (`dist/test-mux-build.sh`).
+fn registerGuiPkgConfigPath(b: *std.Build) void {
+    const dir = b.pathFromRoot("vendor/pkgconfig");
+    const merged = if (b.graph.environ_map.get("PKG_CONFIG_PATH")) |prev|
+        b.fmt("{s}:{s}", .{ dir, prev })
+    else
+        dir;
+    b.graph.environ_map.put("PKG_CONFIG_PATH", merged) catch @panic("OOM");
+}
 
 /// Set up the out-of-process TranslateC step that turns
 /// `vendor/cimport_root.h` into a Zig module. Returns a module each
@@ -1475,9 +1496,7 @@ fn buildCBindings(
     // Same `-I` order as `configureSysDeps`: shim path first so it
     // shadows the system gdkversionmacros.h.
     tc.addIncludePath(b.path("vendor/aro_shims"));
-    for (gui_pkgs) |p| {
-        tc.linkSystemLibrary(p, .{ .use_pkg_config = .force });
-    }
+    tc.linkSystemLibrary(gui_pkg, .{ .use_pkg_config = .force });
     tc.addIncludePath(b.path("vendor"));
 
     // Post-process: replace `_ = @ptrCast(@alignCast(<expr>));` with
@@ -1767,7 +1786,7 @@ fn configureSysDeps(
 ) void {
     mod.addImport("cbindings", cbindings_mod);
     mod.addIncludePath(b.path("vendor/aro_shims"));
-    for (gui_pkgs) |lib| addPkgConfig(b, mod, lib);
+    addPkgConfig(b, mod, gui_pkg);
     // Per-window WM_CLASS for remote app windows (wlapp.zig calls
     // XChangeProperty directly — GTK links X11 but doesn't re-export
     // it). Linux-only; the macOS GUI has no X11.
