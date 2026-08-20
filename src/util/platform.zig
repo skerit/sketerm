@@ -574,6 +574,15 @@ extern fn memfd_create(name: [*:0]const u8, flags: c_uint) c_int;
 /// Anonymous file fd, sized and CLOEXEC — the shm backing for
 /// keymaps the mux daemon hands to Wayland apps. Linux: memfd.
 /// macOS: shm_open with a throwaway name, unlinked immediately.
+///
+/// **`size == 0` means "create it, do not size it"**, and that
+/// distinction is load-bearing on macOS: a POSIX shared-memory object
+/// there accepts `ftruncate` EXACTLY ONCE, and any later call fails
+/// with EINVAL. So a caller that sizes the object itself (the browser
+/// helper mints a frame buffer, then truncates it to the view's real
+/// dimensions) must not have that one chance spent here on a zero-sized
+/// truncate. Linux's memfd has no such rule and can be resized freely;
+/// passing 0 there simply skips a redundant syscall.
 pub fn anonFileFd(size: usize) c_int {
     var fd: c_int = -1;
     if (is_linux) {
@@ -589,7 +598,7 @@ pub fn anonFileFd(size: usize) c_int {
         }
     }
     if (fd < 0) return -1;
-    if (c.ftruncate(fd, @intCast(size)) != 0) {
+    if (size != 0 and c.ftruncate(fd, @intCast(size)) != 0) {
         _ = c.close(fd);
         return -1;
     }
