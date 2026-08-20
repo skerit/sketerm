@@ -1,5 +1,28 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-20: macOS is a working target — browser, Command keys, honest suites
+
+The CEF browser now works on macOS: `smoke-web` is fully green. The
+"no load-finished" stall was two stacked bugs — renderers must launch
+from their own `Helper (Renderer).app` variant bundle, and the cookie
+store hung forever asking the Keychain for its encryption key on a
+headless ad-hoc-signed helper (`--use-mock-keychain`). The permission
+handler's use-after-free (`Continue()` re-enters dismiss) was latent on
+Linux too.
+
+macOS defaults moved to Command: Cmd+T/W/D/F/V and friends, Ctrl now
+belongs entirely to the shell (Cmd+C is plain copy; `interrupt_or_copy`
+retired there). GTK's IM consumes Cmd+letter before key handlers run,
+so a capture-phase controller swallows every Cmd chord ahead of it —
+unmatched chords produce zero bytes at the PTY, proven with `cat -v`.
+
+Also landed: the welcome tour is reachable from the palette
+(`welcome_open`); watch-limited live views announce themselves in the
+file-browser status line; every GUI-launching rig suppresses the
+welcome dialog; and the panel canary's ten test-coverage trips no
+longer print the same line a real use-after-free would — which had two
+sessions chasing a bug that never existed.
+
 ## 2026-08-14: tree-style tabs — per-window sidebar, honest active row, real drag
 
 The tree-style tab sidebar was reported as behaving strangely: flaky
