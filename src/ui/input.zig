@@ -202,8 +202,99 @@ const bindings_after_tree = [_]Binding{
     .{ .keyval = c.GDK_KEY_F10, .mods = c.GDK_SHIFT_MASK, .action = .context_menu },
 };
 
+/// macOS app chords live on Command (GDK Meta), the platform's GUI
+/// modifier, leaving Control entirely to the shell — Ctrl+C is SIGINT
+/// again, which is the whole reason the Linux table needed the Shift
+/// qualifier. Mostly a 1:1 move of the Ctrl+Shift table to Cmd(+Shift);
+/// the deliberate divergences:
+///  - Cmd+C is a plain copy, not `interrupt_or_copy`: that heuristic
+///    only exists because Ctrl+C is already taken on Linux.
+///  - Cmd+A selects all / Cmd+Shift+A copies the screen (Select All is
+///    a platform convention too strong to leave unbound).
+///  - restore_closed_tab is Cmd+Shift+T (every macOS browser), NOT
+///    Cmd+Z — Cmd+Z means Undo everywhere and must stay unshadowed.
+///  - Cmd+Shift+H for show_scrollback and Cmd+Shift+M for zoom: plain
+///    Cmd+H/Cmd+M are the system's Hide/Minimize.
+const macos_app_bindings = [_]Binding{
+    // Cmd+...
+    .{ .keyval = c.GDK_KEY_t, .mods = c.GDK_META_MASK, .action = .new_tab },
+    .{ .keyval = c.GDK_KEY_w, .mods = c.GDK_META_MASK, .action = .close_tab },
+    .{ .keyval = c.GDK_KEY_d, .mods = c.GDK_META_MASK, .action = .split_h },
+    .{ .keyval = c.GDK_KEY_d, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .split_v },
+    .{ .keyval = c.GDK_KEY_f, .mods = c.GDK_META_MASK, .action = .search_open },
+    .{ .keyval = c.GDK_KEY_v, .mods = c.GDK_META_MASK, .action = .paste_clipboard },
+    .{ .keyval = c.GDK_KEY_c, .mods = c.GDK_META_MASK, .action = .copy_selection },
+    .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_META_MASK, .action = .select_all },
+    .{ .keyval = c.GDK_KEY_a, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .copy_screen },
+    .{ .keyval = c.GDK_KEY_k, .mods = c.GDK_META_MASK, .action = .clear_and_scrollback },
+    .{ .keyval = c.GDK_KEY_s, .mods = c.GDK_META_MASK, .action = .save_layout },
+    .{ .keyval = c.GDK_KEY_s, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .save_layout_as },
+    // Cmd+Shift+...
+    .{ .keyval = c.GDK_KEY_Up, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .prompt_prev },
+    .{ .keyval = c.GDK_KEY_Down, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .prompt_next },
+    .{ .keyval = c.GDK_KEY_Left, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .pane_prev },
+    .{ .keyval = c.GDK_KEY_Right, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .pane_next },
+    .{ .keyval = c.GDK_KEY_g, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .broadcast_cycle },
+    .{ .keyval = c.GDK_KEY_e, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .hints_open },
+    .{ .keyval = c.GDK_KEY_t, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .restore_closed_tab },
+    .{ .keyval = c.GDK_KEY_o, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .launch_app },
+    .{ .keyval = c.GDK_KEY_b, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .toggle_browser_face },
+    .{ .keyval = c.GDK_KEY_h, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .show_scrollback },
+    .{ .keyval = c.GDK_KEY_p, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .command_palette },
+    .{ .keyval = c.GDK_KEY_i, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .toggle_pin_tab },
+    .{ .keyval = c.GDK_KEY_x, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .copy_mode },
+    .{ .keyval = c.GDK_KEY_m, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .zoom_pane },
+};
+
+/// macOS shared-tail counterpart of `bindings_after_tree`. Tab digits
+/// move from Alt (which types ™£¢… on macOS keyboards) to Cmd; font
+/// and prefs chords move from Ctrl to Cmd; Cmd+Shift+[ / ] joins the
+/// Ctrl+Tab family for tab switching (both bracket and brace keyvals
+/// are bound — GDK reports the shifted glyph).
+const macos_bindings_after_tree = [_]Binding{
+    // Cmd+1..9 → jump to specific tab.
+    .{ .keyval = c.GDK_KEY_1, .mods = c.GDK_META_MASK, .action = .goto_tab_1 },
+    .{ .keyval = c.GDK_KEY_2, .mods = c.GDK_META_MASK, .action = .goto_tab_2 },
+    .{ .keyval = c.GDK_KEY_3, .mods = c.GDK_META_MASK, .action = .goto_tab_3 },
+    .{ .keyval = c.GDK_KEY_4, .mods = c.GDK_META_MASK, .action = .goto_tab_4 },
+    .{ .keyval = c.GDK_KEY_5, .mods = c.GDK_META_MASK, .action = .goto_tab_5 },
+    .{ .keyval = c.GDK_KEY_6, .mods = c.GDK_META_MASK, .action = .goto_tab_6 },
+    .{ .keyval = c.GDK_KEY_7, .mods = c.GDK_META_MASK, .action = .goto_tab_7 },
+    .{ .keyval = c.GDK_KEY_8, .mods = c.GDK_META_MASK, .action = .goto_tab_8 },
+    .{ .keyval = c.GDK_KEY_9, .mods = c.GDK_META_MASK, .action = .goto_tab_9 },
+    // Tab switching: the Ctrl+Tab family works here too (the ONE
+    // deliberate Control chord on macOS), plus the Cmd+Shift+[ / ]
+    // convention every macOS browser and editor follows.
+    .{ .keyval = c.GDK_KEY_Tab, .mods = c.GDK_CONTROL_MASK, .action = .next_tab },
+    .{ .keyval = c.GDK_KEY_ISO_Left_Tab, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .prev_tab },
+    .{ .keyval = c.GDK_KEY_Tab, .mods = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK, .action = .prev_tab },
+    .{ .keyval = c.GDK_KEY_bracketright, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .next_tab },
+    .{ .keyval = c.GDK_KEY_braceright, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .next_tab },
+    .{ .keyval = c.GDK_KEY_bracketleft, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .prev_tab },
+    .{ .keyval = c.GDK_KEY_braceleft, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .prev_tab },
+    // Font size on Cmd, matching every macOS app.
+    .{ .keyval = c.GDK_KEY_minus, .mods = c.GDK_META_MASK, .action = .font_dec },
+    .{ .keyval = c.GDK_KEY_KP_Subtract, .mods = c.GDK_META_MASK, .action = .font_dec },
+    .{ .keyval = c.GDK_KEY_equal, .mods = c.GDK_META_MASK, .action = .font_inc },
+    .{ .keyval = c.GDK_KEY_plus, .mods = c.GDK_META_MASK, .action = .font_inc },
+    .{ .keyval = c.GDK_KEY_plus, .mods = c.GDK_META_MASK | c.GDK_SHIFT_MASK, .action = .font_inc },
+    .{ .keyval = c.GDK_KEY_KP_Add, .mods = c.GDK_META_MASK, .action = .font_inc },
+    .{ .keyval = c.GDK_KEY_0, .mods = c.GDK_META_MASK, .action = .font_reset },
+    .{ .keyval = c.GDK_KEY_KP_0, .mods = c.GDK_META_MASK, .action = .font_reset },
+    .{ .keyval = c.GDK_KEY_comma, .mods = c.GDK_META_MASK, .action = .prefs_open },
+    // Scrollback. Cmd+Home/End follows the platform's document-start
+    // convention (no Shift, unlike the Linux Ctrl+Shift chords).
+    .{ .keyval = c.GDK_KEY_Page_Up, .mods = c.GDK_SHIFT_MASK, .action = .scrollback_page_up },
+    .{ .keyval = c.GDK_KEY_Page_Down, .mods = c.GDK_SHIFT_MASK, .action = .scrollback_page_down },
+    .{ .keyval = c.GDK_KEY_Home, .mods = c.GDK_META_MASK, .action = .scrollback_top },
+    .{ .keyval = c.GDK_KEY_End, .mods = c.GDK_META_MASK, .action = .scrollback_bottom },
+    // Context menu, same two conventions as Linux.
+    .{ .keyval = c.GDK_KEY_Menu, .mods = 0, .action = .context_menu },
+    .{ .keyval = c.GDK_KEY_F10, .mods = c.GDK_SHIFT_MASK, .action = .context_menu },
+};
+
 pub const linux_default_bindings = bindings_before_tree ++ linux_tree_bindings ++ bindings_after_tree;
-pub const macos_default_bindings = bindings_before_tree ++ macos_tree_bindings ++ bindings_after_tree;
+pub const macos_default_bindings = macos_app_bindings ++ macos_tree_bindings ++ macos_bindings_after_tree;
 
 /// Defaults selected for the build target. Both platform tables remain
 /// public so collision tests can audit them on either host.
@@ -517,14 +608,46 @@ pub fn accelToString(allocator: std.mem.Allocator, keyval: c_uint, mods: c_uint)
     return try allocator.dupe(u8, s);
 }
 
+/// Rewrite the "<Cmd>"/"<Command>" modifier spellings — what a macOS
+/// user will naturally type in config.conf — into "<Meta>", the only
+/// name GTK's parser knows for that mask (verified: GTK 4.22 returns
+/// failure for "<Cmd>t"). `gtk_accelerator_name` never emits the
+/// alias, so parse→format→parse round-trips stay stable. Returns the
+/// rewritten length, or null when `out` is too small.
+fn rewriteCmdAliases(accel: []const u8, out: []u8) ?usize {
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < accel.len) {
+        if (accel[i] == '<') {
+            if (std.mem.indexOfScalarPos(u8, accel, i, '>')) |end| {
+                const name = accel[i + 1 .. end];
+                if (std.ascii.eqlIgnoreCase(name, "cmd") or
+                    std.ascii.eqlIgnoreCase(name, "command"))
+                {
+                    const repl = "<Meta>";
+                    if (w + repl.len > out.len) return null;
+                    @memcpy(out[w..][0..repl.len], repl);
+                    w += repl.len;
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        if (w >= out.len) return null;
+        out[w] = accel[i];
+        w += 1;
+        i += 1;
+    }
+    return w;
+}
+
 /// Parse a GTK accelerator string. Returns null on failure (e.g. the
 /// user typed garbage in their config). Caller filters.
 pub fn parseAccel(accel: []const u8) ?struct { keyval: c_uint, mods: c_uint } {
     if (accel.len == 0) return null;
     var z_buf: [256:0]u8 = undefined;
-    if (accel.len >= z_buf.len) return null;
-    @memcpy(z_buf[0..accel.len], accel);
-    z_buf[accel.len] = 0;
+    const w = rewriteCmdAliases(accel, z_buf[0 .. z_buf.len - 1]) orelse return null;
+    z_buf[w] = 0;
 
     var kv: c_uint = 0;
     var m: c_uint = 0;
@@ -565,6 +688,30 @@ pub fn attach(widget: *c.GtkWidget, terminal: *Terminal, allocator: std.mem.Allo
         null,
         c.G_CONNECT_DEFAULT,
     );
+    // macOS: Command chords must be matched BEFORE the IM context sees
+    // them. GtkIMContextSimple's no-text-input mask covers Ctrl/Alt
+    // but not Meta, so it treats Cmd+T as the text 't', consumes the
+    // event, and `key-pressed` above never fires — verified on
+    // hardware (Cmd+Y typed a bare 'y' into the shell). A second
+    // controller in the CAPTURE phase runs the binding table first;
+    // unmatched Cmd chords stay unclaimed so GTK-native chords keep
+    // working, and the IM-commit guard in `onImCommit` plus the
+    // encoder's swallow keep them out of the PTY. The controller
+    // shares `ctx` with the connections above: same lifetime, torn
+    // down with the widget.
+    if (comptime builtin.os.tag == .macos) {
+        const cap = c.gtk_event_controller_key_new();
+        _ = c.g_signal_connect_data(
+            cap,
+            "key-pressed",
+            @ptrCast(&onKeyCaptureMeta),
+            @ptrCast(ctx),
+            null,
+            c.G_CONNECT_DEFAULT,
+        );
+        c.gtk_event_controller_set_propagation_phase(@ptrCast(cap), c.GTK_PHASE_CAPTURE);
+        c.gtk_widget_add_controller(widget, @ptrCast(cap));
+    }
     // Key-released — only emits to PTY when kitty kbd report-events
     // (flag 0x02) is enabled. Otherwise it's a no-op.
     _ = c.g_signal_connect_data(
@@ -651,6 +798,41 @@ fn onKeyReleased(
     var buf: [64]u8 = undefined;
     const n = encode(&buf, keyInputFor(ctx, kctrl, keyval, keycode, state, .release));
     if (n > 0) ctx.terminal.writeUserInput(buf[0..n]);
+}
+
+/// Capture-phase handler for Command chords on macOS — see the
+/// comment at its connection site in `attach`. Mirrors the sink
+/// ordering of `onKeyPressed` so hint/copy mode still own the
+/// keyboard while active.
+fn onKeyCaptureMeta(
+    kctrl: *c.GtkEventControllerKey,
+    keyval: c_uint,
+    keycode: c_uint,
+    state: c.GdkModifierType,
+    user: ?*anyopaque,
+) callconv(.c) c.gboolean {
+    _ = kctrl;
+    _ = keycode;
+    const ctx = cast.userData(Ctx, user);
+    if (state & c.GDK_META_MASK == 0) return 0;
+    if (isModifierKey(keyval)) return 0;
+    if (ctx.hint_sink) |hs| {
+        if (hs(ctx.hint_ctx, keyval, state)) return 1;
+    }
+    if (ctx.copymode_sink) |sink| {
+        // Copy mode owns the keyboard; whatever the sink decides, a
+        // Command chord must not continue toward the IM.
+        _ = sink(ctx.copymode_ctx, keyval, state);
+        return 1;
+    }
+    _ = fallbackToPaneBindings(ctx, keyval, state);
+    // Matched or not, the chord is consumed HERE. Letting an
+    // unmatched one propagate hands it to the IM context, which
+    // commits the bare glyph — Cmd+Y typed 'y' (verified on
+    // hardware). Consuming deterministically off the event's own
+    // state beats a commit-time modifier query, which reads logical
+    // device state and cannot be trusted for exactly these events.
+    return 1;
 }
 
 fn onImCommit(user: ?*anyopaque, text: []const u8) void {
@@ -1399,6 +1581,21 @@ pub fn encode(buf: []u8, input: KeyInput) usize {
         in.mods.shift = true;
     }
     const fl = Flags.from(in.kitty_flags);
+    // macOS: Command (GDK Meta) is the GUI-chrome modifier, and none
+    // of the legacy encodings can express it — falling through would
+    // fabricate a keypress the user did not make (an unbound Cmd+Y
+    // typed a bare 'y'; Cmd+Left acted as plain Left). Terminal.app
+    // and iTerm2 likewise send nothing for an unbound Cmd chord.
+    // Kitty-protocol clients still get them: once any flag is set the
+    // encoding carries the super/hyper/meta bits, and an app that
+    // opted in expects to bind them. Linux is deliberately exempt —
+    // X11 keymaps routinely alias Meta onto the Alt key, so state can
+    // carry ALT|META for a plain Alt+b, and swallowing there would
+    // break readline's M-b for those users.
+    if (comptime builtin.os.tag == .macos) {
+        if (!fl.any() and !isModifierKey(in.keyval) and
+            (in.mods.meta or in.mods.super or in.mods.hyper)) return 0;
+    }
     // Without the event-types flag there is nowhere to put the event
     // type, so only presses (and auto-repeats, which look like
     // presses) produce anything at all.
