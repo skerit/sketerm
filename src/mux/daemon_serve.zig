@@ -1977,6 +1977,12 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
     const r = parsed.value;
 
     if (std.mem.eql(u8, r.op, "close_view")) return fsCloseView(self, cl, r);
+    // Screen Recording is the DAEMON's permission, not the GUI's — it
+    // is the process that captures — so the GUI has to ask over the
+    // wire. Answered before the absolute-path check below: neither
+    // verb takes a path.
+    if (std.mem.eql(u8, r.op, "screen_perm")) return screenPerm(cl, r, false);
+    if (std.mem.eql(u8, r.op, "screen_perm_request")) return screenPerm(cl, r, true);
     if (std.mem.startsWith(u8, r.op, "job_")) return self.fsJobOp(cl, r);
     // Every other verb takes an absolute path — the client resolves
     // ~ and relative input; the daemon never guesses a cwd here.
@@ -2451,6 +2457,66 @@ pub fn fsOpenView(self: *Daemon, cl: *Client, r: FsOpReq) void {
     // a whole failed; the view must not linger daemon-side.
     if (!fsStartListing(self, cl, r.req, canon, r.attrs, view))
         dropFsViewAt(self, self.fs_views.items.len - 1);
+}
+
+/// Report — and optionally raise the system prompt for — this
+/// daemon's Screen Recording grant.
+///
+/// The GUI cannot answer this itself: `sketerm` and `sketerm-mux` are
+/// separate binaries with separate TCC identities, and the capture
+/// happens here. Preflighting in the GUI would report the wrong
+/// process's permission, which is worse than reporting none.
+///
+/// `supported=false` off macOS (and on a build without the SCK
+/// backend), so the welcome dialog can hide the step entirely rather
+/// than show a control that cannot mean anything.
+///
+/// Note `granted` cannot distinguish "never asked" from "denied" —
+/// `CGPreflightScreenCaptureAccess` returns false for both and no
+/// public API separates them. The reply says what is true and the UI
+/// offers both routes rather than guessing.
+fn screenPerm(cl: *Client, r: FsOpReq, do_request: bool) void {
+    const wssource = @import("../winstream/source.zig");
+    if (comptime !wssource.have_sck) {
+        cl.queueJson(.fs_reply, .{
+            .req = r.req,
+            .ok = true,
+            .supported = false,
+            .granted = false,
+            .adhoc = false,
+            .identity_known = false,
+        });
+        return;
+    }
+    const sck = @import("../winstream/sck.zig");
+    // Requesting BEFORE reading back is deliberate: a first-ever
+    // request can be answered by the user while the prompt is up, and
+    // reporting the pre-prompt value would look like the click did
+    // nothing. It usually still reads false here — TCC applies the
+    // grant to the next launch — which is why the dialog tells the
+    // user a daemon restart is what makes it live.
+    if (do_request) sck.permissionRequest();
+    const adhoc = sck.permissionIdentityAdhoc();
+    cl.queueJson(.fs_reply, .{
+        .req = r.req,
+        .ok = true,
+        .supported = true,
+        .granted = sck.permissionGranted(),
+        .adhoc = adhoc orelse false,
+        .identity_known = adhoc != null,
+        .exe = daemonExePath(),
+    });
+}
+
+/// This daemon's own executable path, so the dialog can name the
+/// binary the user must find in System Settings — with two daemons
+/// installed (a dev build and a signed one) the name alone is
+/// ambiguous, and picking the wrong row grants nothing.
+fn daemonExePath() []const u8 {
+    const S = struct {
+        var buf: [4096]u8 = undefined;
+    };
+    return platform.exePath(&S.buf) orelse "sketerm-mux";
 }
 
 pub fn fsCloseView(self: *Daemon, cl: *Client, r: FsOpReq) void {

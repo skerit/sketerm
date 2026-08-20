@@ -1217,3 +1217,124 @@ void sketerm_sck_close_win(SckCtx *ctx, uint32_t win) {
         [app terminate];
     }
 }
+
+// ─── Standalone TCC helpers ──────────────────────────────────────
+//
+// Deliberately usable WITHOUT an SckCtx: the welcome dialog asks the
+// daemon about Screen Recording before any session has armed capture,
+// and creating a context to find out would itself raise the one-time
+// prompt — the exact ambush issue #4 was about.
+//
+// What the OS does and does not allow, measured rather than assumed:
+//
+//   * CGPreflightScreenCaptureAccess() reports the CURRENT grant and
+//     never prompts.
+//   * CGRequestScreenCaptureAccess() only RAISES the prompt; a human
+//     must click it, in the Aqua session. There is no API that grants.
+//   * macOS prompts ONCE PER IDENTITY. After a denial the call is a
+//     silent no-op forever and only System Settings can undo it — so
+//     preflight-false cannot distinguish "never asked" from "denied",
+//     and the UI must not claim to know which.
+
+uint32_t sketerm_screen_perm_state(void) {
+    return CGPreflightScreenCaptureAccess() ? 1u : 0u;
+}
+
+void sketerm_screen_perm_request(void) {
+    // No return value on purpose: the answer arrives when the user
+    // clicks, long after this returns, and TCC applies it to the NEXT
+    // process launch. A caller that treated this as "granted?" would
+    // be reporting a click that has not happened yet.
+    CGRequestScreenCaptureAccess();
+}
+
+// A TCC grant is keyed to the binary's code-signing identity. An
+// ad-hoc (or linker-signed) binary is re-identified on every build —
+// its cdhash changes — so a grant made against one dev build silently
+// stops applying to the next. That turns "grant it once while you are
+// physically at the Mac" into a lie, which is precisely the promise
+// the welcome dialog makes on a headless install.
+//
+// Read the CodeDirectory's flags out of our own Mach-O rather than
+// asking Security.framework: this file is compiled into sketerm-mux,
+// and the daemon should not grow a framework dependency to answer one
+// boolean. CS_ADHOC is bit 1 of the CodeDirectory flags word.
+//
+// @return 1 ad-hoc (a grant will NOT persist), 0 stably signed,
+//         -1 unknown (unsigned, unreadable, or an unexpected layout).
+#include <mach-o/loader.h>
+#include <mach-o/fat.h>
+#include <mach-o/dyld.h>
+
+#define SK_CS_ADHOC 0x00000002
+
+static int sk_cd_flags_adhoc(const uint8_t *sig, size_t sig_len) {
+    // Code-signing SuperBlob, all fields big-endian.
+    if (sig_len < 12) return -1;
+    uint32_t count = OSSwapBigToHostInt32(*(const uint32_t *)(sig + 8));
+    if (count > 64) return -1;
+    for (uint32_t i = 0; i < count; i++) {
+        size_t ent = 12 + (size_t)i * 8;
+        if (ent + 8 > sig_len) return -1;
+        uint32_t off = OSSwapBigToHostInt32(*(const uint32_t *)(sig + ent + 4));
+        if ((size_t)off + 16 > sig_len) continue;
+        const uint8_t *blob = sig + off;
+        uint32_t magic = OSSwapBigToHostInt32(*(const uint32_t *)blob);
+        if (magic != 0xfade0c02u) continue; // CSMAGIC_CODEDIRECTORY
+        // struct CodeDirectory: magic, length, version, flags …
+        return (OSSwapBigToHostInt32(*(const uint32_t *)(blob + 12)) & SK_CS_ADHOC) ? 1 : 0;
+    }
+    return -1;
+}
+
+int sketerm_screen_perm_adhoc(void) {
+    char path[4096];
+    uint32_t cap = sizeof(path);
+    if (_NSGetExecutablePath(path, &cap) != 0) return -1;
+    NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
+    if (!data) return -1;
+    const uint8_t *base = data.bytes;
+    size_t len = data.length;
+    if (len < sizeof(struct mach_header_64)) return -1;
+
+    // Zig emits thin Mach-O; handle a fat wrapper anyway so a
+    // universal binary produced by a packaging step still answers.
+    size_t slice = 0;
+    uint32_t magic = *(const uint32_t *)base;
+    if (magic == FAT_MAGIC || magic == FAT_CIGAM) {
+        const struct fat_header *fh = (const struct fat_header *)base;
+        uint32_t n = OSSwapBigToHostInt32(fh->nfat_arch);
+        if (n == 0 || n > 16) return -1;
+        // Our own slice is the one matching this process's arch.
+#if defined(__arm64__)
+        const cpu_type_t want = CPU_TYPE_ARM64;
+#else
+        const cpu_type_t want = CPU_TYPE_X86_64;
+#endif
+        const struct fat_arch *fa = (const struct fat_arch *)(base + sizeof(*fh));
+        for (uint32_t i = 0; i < n; i++) {
+            if ((cpu_type_t)OSSwapBigToHostInt32((uint32_t)fa[i].cputype) == want) {
+                slice = OSSwapBigToHostInt32(fa[i].offset);
+                break;
+            }
+        }
+        if (slice == 0 || slice + sizeof(struct mach_header_64) > len) return -1;
+    }
+
+    const struct mach_header_64 *mh = (const struct mach_header_64 *)(base + slice);
+    if (mh->magic != MH_MAGIC_64) return -1;
+    const uint8_t *lc = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *cmd = (const struct load_command *)lc;
+        if ((const uint8_t *)cmd + sizeof(*cmd) > base + len) return -1;
+        if (cmd->cmd == LC_CODE_SIGNATURE) {
+            const struct linkedit_data_command *ld = (const struct linkedit_data_command *)cmd;
+            size_t off = slice + ld->dataoff;
+            if (off + ld->datasize > len) return -1;
+            return sk_cd_flags_adhoc(base + off, ld->datasize);
+        }
+        lc += cmd->cmdsize;
+        if (cmd->cmdsize == 0) return -1;
+    }
+    return -1; // no signature at all
+}

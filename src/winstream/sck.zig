@@ -53,6 +53,47 @@ extern fn sketerm_sck_snapshot(ctx: *anyopaque, win: u32, out_w: *i32, out_h: *i
 
 const status_screen: u32 = 1;
 
+// ─── Screen Recording permission, without arming capture ─────────
+//
+// The welcome dialog asks the daemon about the grant BEFORE any
+// session has streamed. Answering by creating a Source would itself
+// raise the one-time prompt — the ambush issue #4 was about — so
+// these three talk to TCC directly and hold no context.
+
+extern fn sketerm_screen_perm_state() u32;
+extern fn sketerm_screen_perm_request() void;
+extern fn sketerm_screen_perm_adhoc() c_int;
+
+/// Whether Screen Recording is granted to THIS binary right now.
+/// Never prompts.
+pub fn permissionGranted() bool {
+    return sketerm_screen_perm_state() & 1 != 0;
+}
+
+/// Raise the one-time system prompt. Returns nothing on purpose:
+/// the user's click lands long after this call, and TCC applies the
+/// answer to the NEXT launch of this binary. After a previous denial
+/// this is a silent no-op — macOS asks once per identity — which is
+/// why the caller must also offer the System Settings route.
+pub fn permissionRequest() void {
+    sketerm_screen_perm_request();
+}
+
+/// Whether a grant made against this binary would SURVIVE a rebuild.
+/// An ad-hoc / linker-signed binary is re-identified every build, so
+/// its grant silently stops applying — fatal to the "grant it once
+/// while you're at the Mac" promise on a headless install.
+///
+/// @return true ad-hoc (will not persist), false stably signed,
+///         null unknown (unsigned or an unreadable layout).
+pub fn permissionIdentityAdhoc() ?bool {
+    return switch (sketerm_screen_perm_adhoc()) {
+        1 => true,
+        0 => false,
+        else => null,
+    };
+}
+
 /// Synthetic window that tells the user WHY nothing is streaming
 /// when the Screen Recording grant is missing — a silent hang is
 /// the one failure mode this backend must not have.
