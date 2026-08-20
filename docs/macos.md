@@ -2,16 +2,25 @@
 
 Status: **verified on real hardware** (Apple Silicon, macOS 26.5.1,
 Homebrew GTK 4.22.4, Zig 0.16.0). The GUI builds and runs natively,
-`zig build test` passes (1299/1319, 20 skipped), `test-core`,
-`smoke-mux`, `smoke-e2e` and `smoke-a11y` PASS, remote macOS app
-windows stream to a client, and mux interop with a Linux daemon works
-over both SSH and UDP. Remaining gaps are listed at the bottom.
+`zig build test` passes (2828/2855, 27 skipped) and `test-core`
+(2317/2332, 15 skipped), `smoke-mux`, `smoke-fs`, `smoke-e2e` and
+`smoke-a11y` PASS, remote macOS app windows stream to a client, and
+mux interop with a Linux daemon works over both SSH and UDP.
+Remaining gaps are listed at the bottom.
 
 > **Re-verified 2026-08-04** after ~450 commits of drift. Four compile
 > breaks and, more importantly, **five behavioural bugs that a build
 > alone would never surface** — the daemon could not spawn a single
 > session, and every file transfer failed. Building is not the same as
 > working here; run the smoke rigs.
+
+> **Re-verified 2026-08-20** after another ~650 commits (the browser,
+> the LSP client, panels, the viewer). This time the GUI **did not even
+> load** — `dyld` aborts before `main` on a duplicate `LC_LOAD_DYLIB` —
+> and `zig build test` **did not compile at all**. Both had been true
+> for weeks with nobody noticing, because the things that would have
+> caught them are themselves Linux-only. See
+> *Re-verification 2026-08-20* below.
 
 ## Verified on hardware (2026-06)
 
@@ -127,6 +136,153 @@ crashlog's fixed truncating fallback into returning the empty string;
 filesystem, not `s/`, so `doctor` reported an installed terminfo as
 missing.
 
+## Re-verification 2026-08-20
+
+~650 commits of drift (the CEF browser, the LSP client, panels, the
+viewer, the tab sidebar). **Not one of them touched this file.** The
+two worst findings were not runtime bugs at all — they were a binary
+that could not load and a test root that could not compile, each
+sitting there for weeks because its own guard rail is Linux-only.
+
+### The GUI aborted in dyld before `main`
+
+`zig build` was green and every GUI binary died instantly:
+
+```
+dyld[…]: duplicate linked dylib '/opt/homebrew/opt/gtk4/lib/libgtk-4.1.dylib'
+```
+
+`configureSysDeps` and `buildCBindings` each linked seven GUI packages
+with `use_pkg_config = .force`, and **Zig dedupes only by PACKAGE name,
+not by resolved library** (`seen_system_libs`). `gtk4` and
+`libadwaita-1` have overlapping closures — both expand to `-lgtk-4
+-lpango-1.0 -lharfbuzz …` — and `harfbuzz` was also listed on its own,
+so the linker saw `-lharfbuzz` three times. Zig's Mach-O linker emits
+one `LC_LOAD_DYLIB` per `-l`, and current dyld treats a duplicate as
+fatal. ELF never showed it because GNU ld coalesces `DT_NEEDED`.
+
+Two independent changes combined to expose it: `addPkgConfig` moved from
+hand-expanding pkg-config output (which deduped, because Zig's map was
+then keyed on the *library*) to `.force`; and `use_lld` became
+Linux-only, which was forced, since **Zig 0.16 rejects LLD for Mach-O
+outright**. Fix: `vendor/pkgconfig/sketerm-gui.pc`, a virtual package
+whose `Requires:` holds the roster — pkg-config dedupes a `Requires:`
+closure natively, so one query yields one `-l` per library. Resolution
+stays lazy and the linked set is unchanged.
+
+### `zig build test` did not compile, and `test-core` masked it
+
+Four breaks, all in the GUI translate-c set:
+
+1. **The kqueue ABI was never mirrored into `vendor/cimport_root.h`.**
+   `fsserve.zig` compiles into `tests.zig`, so the GUI suite has not
+   built on a Mac since the kqueue watcher landed. The GUI set is
+   native-against-the-real-SDK (as its existing `<util.h>` assumes), so
+   it now `#include`s `<sys/event.h>` rather than copying the core
+   header's hand-declared block — the core hand-declares only because
+   the mux graph must stay translatable against Zig's bundled headers.
+2. **libpulse is Linux-only** but `tests.zig` imports `audio_sink.zig`
+   unconditionally and `terminal.zig` calls `AudioSink.create`. Off
+   Linux `create` now takes the module's own documented "local context
+   failed" path: PCM discarded, consumption still reported, remote apps
+   unaffected. CoreAudio is the fix if playback is ever wanted.
+3. **`SOCK_CLOEXEC` does not exist on Darwin** — one test used it
+   directly instead of `platform.socketpairCloexec`.
+4. **`lint-errdefer` picked its backend by TARGET, not host.** It
+   hardcoded `-fno-llvm/-fno-lld`; that `build-exe` dies with SIGKILL on
+   aarch64-macOS, and since all three test steps depend on it, `test`,
+   `test-core` and `test-web` went red before a single test ran.
+
+### `/tmp` is a symlink to `/private/tmp`
+
+`canonicalSocketPath` realpaths a socket's parent on purpose, so two
+spellings share one identity. Two rigs asserted the *spelling*:
+`paneldrive`'s socket-identity test, and `smoke-panel-relay` (the last
+stage of `smoke-mux`), which built `MUXENV` from its own `/tmp` form and
+then failed to match the daemon's canonical one. Both now canonicalize
+through the same function. Note `/private/tmp` costs 8 more bytes
+against Darwin's ~104-byte `sockaddr_un` cap.
+
+### Silent feature breakage (the expensive class)
+
+- **The file browser's Devices sidebar never rendered.**
+  `renderDevicesSection` opened `/proc/mounts`; `fopen` returned null
+  and the function bare-`return`ed, so an absent section was
+  indistinguishable from "no devices". Now has a `getmntinfo(MNT_NOWAIT)`
+  branch. It filters on **`MNT_DONTBROWSE`** — the flag Finder's own
+  sidebar obeys; without it the row budget is consumed by
+  `/System/Volumes/*` before any real disk appears.
+- **"Open on host" did nothing against a Mac host** (including
+  localhost): it exec'd `xdg-open`. The opener is now chosen on the
+  HOST — `xdg-open`, else `open`, else a visible failure — because
+  `host` may be Linux or macOS independently of the client.
+- **Live QUERIES silently truncated past ~250 directories.** kqueue
+  needs one `O_EVTONLY` fd PER DIRECTORY (inotify watches are not fds),
+  macOS's soft `RLIMIT_NOFILE` is **256**, and an EMFILE refusal was
+  swallowed by a bare `return`. Two halves to the fix: the daemon raises
+  its own soft limit, and a capacity refusal now reports
+  `watch_limit: true`. Measured on a 400-directory tree — 400/400 with
+  the raise, and with soft+hard forced to 200, 194/400 *that says so*,
+  where before it was 194/400 in silence.
+  **Darwin reports `rlim_max` for NOFILE as `RLIM_INFINITY` while the
+  real ceiling is `kern.maxfilesperproc`** — asking for the hard limit
+  verbatim is refused with EINVAL and leaves you at 256. Use a halving
+  ladder. The same sticky `exhausted` flag also now catches inotify's
+  **ENOSPC** (`max_user_watches`), which truncated just as silently on
+  Linux, and the daemon's live VIEWS report the limit too, not just
+  queries.
+
+  **Be precise about where the SILENT case lives.** Measured with a
+  daemon whose `RLIMIT_NOFILE` hard limit was pinned at 200: view 192
+  succeeded, view 193 failed outright with `MFILE`, and no reply ever
+  carried `watch_limit`. On macOS the starvation that refuses a watch
+  also kills the listing's `opendir`, so **the view path fails LOUDLY
+  here** — it was the recursive query walk that truncated in silence.
+  The genuinely silent view case needs the watch to fail while the
+  listing succeeds, which is inotify's **ENOSPC** with fds plentiful:
+  a real Linux condition, not reproducible on this Mac. The view-side
+  fix is therefore pinned by a unit test, not by hardware, and its
+  true positive is a Linux one. Do not read the `watch_limit` work as
+  macOS-motivated.
+
+### The smoke-e2e orphan was never a parent-death problem
+
+The standing theory — the rig leaks a daemon because macOS has no
+`PR_SET_PDEATHSIG` — was **wrong**. The leaked process is an autostarted
+*replacement* daemon the GUI double-forks when its connection drops: a
+child of init, nobody's descendant, unreachable by any parent-death
+mechanism. The real fences are `sweepRuntimeDir` (teardown) and
+`sweepStaleRuns` (startup), which kill by ENVIRONMENT, matching the
+isolated runtime dir that embeds the owning harness pid — and **both
+opened with `if (builtin.os.tag != .linux) return;`**. So nothing swept,
+every run leaked, and each next run's self-defence was also a no-op.
+`platform.listPids`/`environOfPid` (libproc + `sysctl KERN_PROCARGS2`)
+supply the enumeration on Darwin; the kill predicate is unchanged, so
+the user's real daemon still cannot match.
+
+**A Darwin `dieWithParent` is deliberately still a no-op.** Every call
+site execs immediately after. `PDEATHSIG` survives `execve`; a kqueue
+`EVFILT_PROC` watch and its thread do not. Covering an exec'd child
+needs a supervisor process — do not re-add a watch that cannot work.
+
+Worse, and the reason none of this was visible: **the rig had not
+compiled on macOS at all since `fd40d7f`** (`c.SIG_DFL` is a
+`@compileError` on Darwin) — and `fd40d7f` is *the Linux fix for this
+very orphan bug*. macOS got neither the fix nor the ability to test it.
+**The "4-in-10 passes" figure below therefore predates that commit and
+is not a valid baseline.** After the fix: 4/4 green, zero orphans, zero
+leftover runtime dirs, with the sweep firing visibly. Four consecutive
+runs is not proof the flake is cured — there is no valid before/after to
+compare against.
+
+Two measured facts now in doc comments: `KERN_PROCARGS2` is a snapshot
+**at execve**, so a post-exec `setenv` is invisible (Linux's
+`/proc/<pid>/environ` behaves the same); and macOS discloses
+environments only for ordinary binaries, not system ones like
+`/bin/sleep`. Also: `pgrep -x sketerm-mux` can MISS a running daemon
+whose name matches exactly — on top of the known comm-`exe` trap for
+re-exec'd ones. Never trust it as a leftover census.
+
 ## Building on a Mac (verified recipe)
 
 ```bash
@@ -185,7 +341,16 @@ was needed — pkgconf's defaults cover the brew prefix.
   networks).
 - `udp:localhost` v4/v6 resolution bug still applies — use a real IP
   or hostname.
-- **`smoke-e2e` is FLAKY on macOS — the top open bug.** It fails part
+- **`smoke-e2e` flake — LARGELY SUPERSEDED, read this first.** The
+  orphan half of what follows is fixed (see *Re-verification 2026-08-20*:
+  the sweeps were Linux-gated, and the rig had not compiled here since
+  `fd40d7f`). Every measurement below was taken on a rig that no longer
+  exists in that form, **including the 4-in-10 figure** — treat the
+  numbers as history, not as a baseline. What is NOT yet disproven is
+  whether the browser-split disconnect can still occur once the orphans
+  are gone; 4/4 green runs is encouraging and is not a cure. The
+  original entry, kept for its ruled-out list:
+  It fails part
   of the time at the browser-split stage with
   `{"ok":false,"error":"internal error: Disconnected"}`: the GUI's mux
   connection to its private daemon drops while that split is asking for
@@ -222,6 +387,72 @@ was needed — pkgconf's defaults cover the brew prefix.
   across repeated denied captures.
 - `.app` bundle / packaging not started (run from zig-out/bin).
 - Cmd-vs-Ctrl keybinding conventions not started.
+- **VoiceOver reaches the terminal pane ONLY.** `nsax` is attached by
+  `pane.zig` on the GL area's map; the editor and the browser route
+  their a11y through `GtkAccessibleText`/AT-SPI, and GTK4's atspi
+  backend is *Not available* on macOS — so those two faces are
+  invisible to VoiceOver. Closing it means an NSAccessibility
+  projection for `a11y/docview.zig` and `a11y/webproj.zig` over the
+  same neutral `a11y/view.zig` the terminal already uses. Real work,
+  not a patch.
+- **No base-layout rescue for shortcuts on a non-Latin layout.**
+  `input.zig baseLayoutCodepoint` returns 0 off Linux — it maps
+  evdev-derived keycodes that only X11 and Wayland deliver, so the
+  alternate codepoint is omitted from the key event. A Cyrillic or
+  Greek layout therefore gets no Ctrl-shortcut rescue here. The
+  conformance test asserts the degraded form off Linux and says so;
+  **do not "fix" it by faking a codepoint** — teaching
+  `baseLayoutCodepoint` the macOS keycode space is the real fix.
+- **The browser (`src/web`) has no macOS story.** CEF is pinned to a
+  linux64 tarball, and the helper's startup path is Linux by
+  construction (`LD_PRELOAD` re-exec, ozone platforms). The GUI
+  degrades with an explicit "browser helper is not installed" message,
+  so this is absent-by-construction rather than broken — but a macOS
+  browser needs the CEF macOS framework bundle and a different startup
+  sequence.
+- **`watch_limit` reaches the wire and the daemon log, but no UI.**
+  `fsdrive.Listing` and the file browser's `WireReply` have no such
+  field; clients parse with `ignore_unknown_fields = true`, so nothing
+  breaks and nothing shows. One-field follow-up.
+- **`pgrep -x sketerm-mux` is NOT a reliable leftover census here.** On
+  top of the known comm-`exe` trap for a daemon that re-exec'd via
+  `/proc/self/exe`, a plainly-named running daemon was observed absent
+  from `pgrep -x` output while `ps -p <pid>` showed it alive and
+  correctly named. Cross-check with `ps` before concluding a socket has
+  no owner — a stale daemon serving an old binary is the failure this
+  hides.
+- `smoke-display`'s "handover: viewers disagree about the new
+  controller" stage failed once and passed on re-run (2026-08-20). A
+  second, separate flake from the `smoke-e2e` one; uninvestigated.
+- **Every auto-armed session initialises AppKit inside the daemon.**
+  `ensure_windowserver()` calls `[NSApplication sharedApplication]`
+  from `sketerm_sck_create`, and the macOS auto gate arms SCK for any
+  app-hosting session — so a plain shell tab pays that cost. The
+  notice is now suppressed for sessions that never asked (see #4
+  below), but the arming itself was left deliberately: that same call
+  is what registers the binary in System Settings, and without it a
+  user can never grant Screen Recording at all.
+- **Issue #4 (fixed 2026-08-20): the grant notice on a plain launch.**
+  Every ungranted Mac user got a notice window on startup, rendering as
+  an empty yellow box. Two independent bugs: the gate armed capture for
+  every interactive session, and the notice's text existed ONLY as the
+  synthetic window's TITLE — the pixel buffer was a yellow band on grey
+  with nothing drawn into it. Now: a denied session that ASKED
+  (`req.app`, `req.winstream`, explicit `SKETERM_WINSTREAM`) gets a
+  drawn, legible card; an auto-armed one gets a single `log.info` line.
+  Note for anyone touching that card: `CGBitmapContextCreate` writes
+  rows **top-to-bottom in memory** — only its coordinate origin is
+  bottom-left. Reversing the rows renders it upside down, and a row-0
+  pixel check cannot catch it because the card is banded at both edges.
+- **A TCC grant cannot be given programmatically**, and the reporter of
+  #4 hit both reasons a manual one "doesn't stick".
+  `CGRequestScreenCaptureAccess()` only RAISES the prompt; a human must
+  click it in the Aqua session. macOS prompts **once per identity** —
+  after a dismissal only System Settings can undo it. And the grant is
+  keyed to the code signature, so an ad-hoc-signed `zig-out/bin`
+  daemon is re-identified every build. Grant a stably-signed installed
+  copy (`dist/deploy-macos.sh`, `docs/macos-winstream-setup.md`), never
+  the build tree.
 - **Live views/queries run on kqueue here, with one named gap.**
   `fsserve.Watcher` now has two backends behind a single event
   vocabulary (`Mask`, which IS inotify's bit values — pinned by a
