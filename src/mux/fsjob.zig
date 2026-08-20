@@ -4823,7 +4823,19 @@ fn liveScanDir(st: *LiveState, path: []const u8) void {
     var z: [4096]u8 = undefined;
     const pz = pathz.pathZ(&z, path) catch return;
     const wd = st.watcher.add(pz);
-    if (wd < 0) return;
+    if (wd < 0) {
+        // A refused watch is not the same as an empty one. When the
+        // backend is out of capacity (kqueue's fd budget, inotify's
+        // max_user_watches) this directory AND everything below it go
+        // unwatched, and the query keeps streaming as if it were live.
+        // A partial live view that says it is partial is usable; one
+        // that stays quiet is a wrong answer with no symptom.
+        if (st.watcher.exhausted and !st.watch_limit) {
+            st.watch_limit = true;
+            st.status_dirty = true;
+        }
+        return;
+    }
     // inotify hands back the SAME descriptor for a directory already
     // watched, which is how re-entering a known subtree costs nothing.
     for (st.watches.items) |w| {
@@ -4847,8 +4859,10 @@ fn liveScanDir(st: *LiveState, path: []const u8) void {
     }
 }
 
-/// Durable Haiku-style live filename query. Linux uses recursive inotify;
-/// other hosts report the missing watcher honestly instead of polling.
+/// Durable Haiku-style live filename query, watching the tree
+/// recursively: inotify on Linux, kqueue on macOS (see fsserve.Watcher
+/// for the one event the latter cannot see). A host with neither
+/// reports the missing watcher honestly instead of polling.
 fn runLiveFind(allocator: std.mem.Allocator, spec: Spec) u8 {
     if (spec.pattern.len == 0) return emitError("live_find needs pattern");
     var watcher: fsserve.Watcher = .{};

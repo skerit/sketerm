@@ -575,6 +575,46 @@ fn fallbackTemplates(home: []const u8, buf: []u8) []const u8 {
 /// change — create, delete, rename — is exact on both backends.
 pub const watch_sees_child_writes = is_linux;
 
+/// Raise this process's soft descriptor limit toward its hard one.
+/// No-op on Linux, where a watch is a kernel object rather than an fd.
+///
+/// A kqueue directory watch COSTS A DESCRIPTOR (one `O_EVTONLY` open
+/// per directory), so on Darwin the process fd budget IS the watch
+/// budget — and macOS hands a GUI-session process a soft RLIMIT_NOFILE
+/// of 256. A recursive live query exhausts that after a couple of
+/// hundred directories, and it is the daemon's OWN budget, shared with
+/// every client socket and pty it owns, so the starvation does not
+/// stay inside the watcher.
+///
+/// The ladder is not defensiveness for its own sake: Darwin reports
+/// `rlim_max` for NOFILE as RLIM_INFINITY while the real ceiling is
+/// `kern.maxfilesperproc`, so asking for the hard limit verbatim is
+/// refused with EINVAL and would leave the soft limit untouched.
+pub fn raiseFileLimit() void {
+    if (comptime is_linux) return;
+    // Hand-declared rather than taken from translate-c: <sys/resource.h>
+    // is only in the CORE cimport set, and this module is compiled into
+    // the GUI test root too. Same reason as daemon_sessions.applyWorkerLimits.
+    const RLimit = extern struct { rlim_cur: u64, rlim_max: u64 };
+    const S = struct {
+        extern "c" fn getrlimit(resource: c_int, rlim: *RLimit) c_int;
+        extern "c" fn setrlimit(resource: c_int, rlim: *const RLimit) c_int;
+    };
+    const RLIMIT_NOFILE: c_int = if (builtin.os.tag == .macos) 8 else 7;
+    // Enough for a deep tree plus the daemon's sockets and ptys, and
+    // well under kern.maxfilesperproc on any host that matters.
+    const want: u64 = 65_536;
+
+    var rl: RLimit = undefined;
+    if (S.getrlimit(RLIMIT_NOFILE, &rl) != 0) return;
+    if (rl.rlim_cur >= want) return;
+    var target = @min(rl.rlim_max, want);
+    while (target > rl.rlim_cur) : (target /= 2) {
+        const attempt = RLimit{ .rlim_cur = target, .rlim_max = rl.rlim_max };
+        if (S.setrlimit(RLIMIT_NOFILE, &attempt) == 0) return;
+    }
+}
+
 /// Directory-content event mask for views. IN_MODIFY is deliberately
 /// absent (a busy writer would flood; size updates land on
 /// IN_CLOSE_WRITE / IN_ATTRIB). Self-destruction of the watched dir
@@ -584,6 +624,15 @@ pub const Watcher = struct {
     /// kqueue backend bookkeeping (Darwin). Unused on Linux, where the
     /// kernel keeps all of this behind the inotify descriptor.
     kq: KqState = .{},
+    /// Sticky: a watch was refused because the BACKEND ran out of
+    /// capacity, not because the directory was bad. kqueue spends one
+    /// fd per watch and hits EMFILE/ENFILE; inotify spends a
+    /// max_user_watches slot and hits ENOSPC. Either way every
+    /// directory below the refusal is unwatched too, so a recursive
+    /// caller owes its client a "this view is partial" status — which
+    /// it cannot do if a refusal is indistinguishable from "nothing to
+    /// watch here". Cleared only by the caller.
+    exhausted: bool = false,
 
     /// Lazily create the watch fd (nonblocking, cloexec). False when
     /// the platform has no backend — views then serve the initial
@@ -593,6 +642,10 @@ pub const Watcher = struct {
         if (comptime is_linux) {
             self.fd = c.inotify_init1(c.IN_NONBLOCK | c.IN_CLOEXEC);
         } else {
+            // Every kqueue watch costs a descriptor, so the process
+            // limit IS the watch limit here. Raise it before the first
+            // one rather than discovering the ceiling mid-scan.
+            raiseFileLimit();
             // A kqueue fd is pollable, so it drops straight into the
             // daemon's existing poll set like the inotify one.
             self.fd = c.kqueue();
@@ -608,9 +661,16 @@ pub const Watcher = struct {
         if (comptime is_linux) {
             const mask: u32 = c.IN_CREATE | c.IN_DELETE | c.IN_MOVED_FROM | c.IN_MOVED_TO |
                 c.IN_CLOSE_WRITE | c.IN_ATTRIB | c.IN_DELETE_SELF | c.IN_MOVE_SELF;
-            return c.inotify_add_watch(self.fd, path, mask);
+            const wd = c.inotify_add_watch(self.fd, path, mask);
+            // ENOSPC here is max_user_watches, not a full disk — the
+            // kernel refuses every further watch for this user, so the
+            // rest of the tree is unwatchable, not just this directory.
+            if (wd < 0 and std.posix.errno(wd) == .NOSPC) self.exhausted = true;
+            return wd;
         }
-        return self.kq.add(self.fd, path);
+        const wd = self.kq.add(self.fd, path);
+        if (wd < 0 and self.kq.exhausted) self.exhausted = true;
+        return wd;
     }
 
     pub fn remove(self: *Watcher, wd: c_int) void {
@@ -660,6 +720,8 @@ const KqState = struct {
     pending: std.ArrayListUnmanaged(u8) = .empty,
     pending_off: usize = 0,
     next_wd: c_int = 1,
+    /// Last `add` failed for want of a descriptor (see Watcher.exhausted).
+    exhausted: bool = false,
 
     const alloc = std.heap.c_allocator;
 
@@ -690,7 +752,17 @@ const KqState = struct {
             if (std.mem.eql(u8, w.path, want)) return w.wd;
         }
         const dfd = c.open(path, c.O_EVTONLY | c.O_CLOEXEC);
-        if (dfd < 0) return -1;
+        if (dfd < 0) {
+            // Out of descriptors is a different answer from "that
+            // directory is gone": the first says the WATCHER is full
+            // and the caller's tree walk is now blind, the second is
+            // local to one path.
+            switch (std.posix.errno(dfd)) {
+                .MFILE, .NFILE => self.exhausted = true,
+                else => {},
+            }
+            return -1;
+        }
         const w = alloc.create(Watch) catch {
             _ = c.close(dfd);
             return -1;
