@@ -8,6 +8,7 @@
 //! for one concept.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../../c.zig").c;
 const clipboard = @import("../clipboard.zig");
 const places_mod = @import("../../filebrowser/places.zig");
@@ -1115,38 +1116,86 @@ fn renderRecentSection(self: *BrowserView) void {
     for (self.recent.items) |r| recentRow(self, r);
 }
 
-/// Devices: real block-device and network mounts, from /proc/mounts.
+/// One Devices row, plus the row budget and the lazily emitted header.
+/// Both mount-table readers below go through this, so the cap, the
+/// header and the "local:" qualification cannot drift apart per
+/// platform the way the readers themselves did.
+const DeviceRows = struct {
+    view: *BrowserView,
+    folded: bool,
+    shown: usize = 0,
+    first: bool = true,
+
+    /// False once the caller should stop reading the mount table.
+    fn add(rows: *DeviceRows, mountpoint: []const u8) bool {
+        if (rows.shown >= 12) return false;
+        if (rows.first) {
+            rows.view.placeHeader("Devices");
+            rows.first = false;
+            if (rows.folded) return false;
+        }
+        // "local:"-qualified: this is THIS machine's mount table, and a
+        // bare path would resolve against a remote tab's host.
+        var mp_spec_buf: [1200]u8 = undefined;
+        const mp_spec = std.fmt.bufPrint(&mp_spec_buf, "local:{s}", .{mountpoint}) catch mountpoint;
+        rows.view.placeRow("drive-harddisk-symbolic", mountpoint, mp_spec, false);
+        rows.shown += 1;
+        return true;
+    }
+};
+
+/// Devices: real block-device and network mounts, read from this
+/// machine's mount table -- `/proc/mounts` on Linux, `getmntinfo()` on
+/// macOS, which has no /proc at all.
+///
+/// Reading /proc unconditionally is how this section came to render as
+/// NOTHING on a Mac: `fopen` returned null, the function returned, and
+/// an absent section is indistinguishable from a machine with no
+/// devices. Neither branch may return early without having tried.
 fn renderDevicesSection(self: *BrowserView) void {
-    const devices_folded = sectionCollapsed(self, "Devices");
+    var rows: DeviceRows = .{ .view = self, .folded = sectionCollapsed(self, "Devices") };
+    if (comptime builtin.os.tag == .macos) {
+        var list: [*c]c.struct_statfs = null;
+        const count = c.getmntinfo(&list, c.MNT_NOWAIT);
+        if (count <= 0 or list == null) return;
+        var i: usize = 0;
+        while (i < @as(usize, @intCast(count))) : (i += 1) {
+            const rec = &list[i];
+            // MNT_DONTBROWSE is the system's own answer to "should a
+            // file manager show this?", and Finder's sidebar obeys it.
+            // Without it the twelve rows fill with /System/Volumes/*
+            // before the first disk anyone cares about is reached.
+            if (rec.f_flags & @as(u32, @intCast(c.MNT_DONTBROWSE)) != 0) continue;
+            const src = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_mntfromname)));
+            const mp = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_mntonname)));
+            const fstype = std.mem.span(@as([*:0]const u8, @ptrCast(&rec.f_fstypename)));
+            const interesting = std.mem.startsWith(u8, src, "/dev/") or
+                std.mem.startsWith(u8, fstype, "nfs") or
+                std.mem.eql(u8, fstype, "smbfs") or
+                std.mem.eql(u8, fstype, "afpfs") or
+                std.mem.eql(u8, fstype, "webdav") or
+                std.mem.startsWith(u8, fstype, "fuse");
+            if (!interesting) continue;
+            if (!rows.add(mp)) return;
+        }
+        return;
+    }
     const f = c.fopen("/proc/mounts", "rb") orelse return;
     var buf: [32 * 1024]u8 = undefined;
     const nread = c.fread(&buf, 1, buf.len, f);
     _ = c.fclose(f);
-    var shown: usize = 0;
-    var first_dev = true;
     var it = std.mem.tokenizeScalar(u8, buf[0..nread], '\n');
     while (it.next()) |line| {
-        if (shown >= 12) break;
         var fields = std.mem.tokenizeScalar(u8, line, ' ');
         const src = fields.next() orelse continue;
+        // /proc/mounts octal-escapes spaces; show raw (rare).
         const mp = fields.next() orelse continue;
         const fstype = fields.next() orelse continue;
         const interesting = std.mem.startsWith(u8, src, "/dev/") or
             std.mem.startsWith(u8, fstype, "nfs") or
             std.mem.eql(u8, fstype, "fuse.sshfs");
         if (!interesting) continue;
-        if (first_dev) {
-            self.placeHeader("Devices");
-            first_dev = false;
-            if (devices_folded) break;
-        }
-        // /proc/mounts octal-escapes spaces; show raw (rare).
-        // "local:"-qualified: /proc/mounts is THIS machine's table,
-        // and a bare path would resolve against a remote tab's host.
-        var mp_spec_buf: [1200]u8 = undefined;
-        const mp_spec = std.fmt.bufPrint(&mp_spec_buf, "local:{s}", .{mp}) catch mp;
-        self.placeRow("drive-harddisk-symbolic", mp, mp_spec, false);
-        shown += 1;
+        if (!rows.add(mp)) return;
     }
 }
 
