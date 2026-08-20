@@ -4927,8 +4927,17 @@ fn runFilterSubscriptionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: [
     pass("stage 39 filter subscription (fetch/reload, zero-hit block, rejected replacements, removal, teardown)");
 }
 
+/// SIGPIPE "ignore" via a no-op handler, the `sigNoop` pattern from
+/// mux_main.zig. `c.SIG_IGN` is a `@compileError` on Darwin (a
+/// function-pointer cast translate-c cannot render) and its raw value
+/// (1) violates fn-pointer alignment on aarch64-macos, so referencing
+/// it stops this rig building on macOS entirely. For SIGPIPE the no-op
+/// is equivalent: write() still returns EPIPE, the process just does
+/// not die.
+fn sigNoop(_: c_int) callconv(.c) void {}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
-    _ = c.signal(c.SIGPIPE, c.SIG_IGN);
+    _ = c.signal(c.SIGPIPE, &sigNoop);
     const argv = init.args.vector;
     if (argv.len < 2) {
         std.debug.print("smoke-web: usage: smoke-web <path-to-sketerm-web>\n", .{});
