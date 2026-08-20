@@ -1350,7 +1350,20 @@ test "web_helper_open: missing helper is a described refusal, a spawn bridges a 
     // 2. An executable helper spawns: chan_open (kind web_helper) then
     // the ok reply; the stand-in exits at once, so the channel EOFs and
     // the daemon retires it (chan_close toward the client).
-    _ = c.setenv("SKETERM_WEB_BIN", "/bin/true", 1);
+    //
+    // The stand-in is RESOLVED, not hardcoded: macOS ships `true` at
+    // /usr/bin only, and `findbin.find` treats a set-but-unusable
+    // SKETERM_WEB_BIN as an authoritative refusal (by design). A
+    // hardcoded /bin/true therefore turned this into step 1 again —
+    // a described ok:false instead of a spawn — and the daemon was
+    // never at fault.
+    const stand_in = blk: {
+        for ([_][*:0]const u8{ "/bin/true", "/usr/bin/true" }) |cand| {
+            if (c.access(cand, c.X_OK) == 0) break :blk cand;
+        }
+        return error.NoTrueBinary;
+    };
+    _ = c.setenv("SKETERM_WEB_BIN", stand_in, 1);
     try conn.sendJson(.web_helper_open, .{ .req = @as(u32, 6) });
     var chan_id: u32 = 0;
     {
