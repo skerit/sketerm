@@ -12,17 +12,34 @@
 //! If the local context fails (no audio stack), PCM is discarded but
 //! consumption is still reported: remote apps keep running silently
 //! instead of blocking on a full server buffer.
+//!
+//! macOS is exactly that "no audio stack" case, permanently: libpulse
+//! is Linux-only here (<pulse/*.h> sits inside the __linux__ branch of
+//! vendor/cimport_root.h), so `create` reports the context failed and
+//! every voice takes the discard-and-report path above. Remote apps
+//! still run; they just play to nothing. A local CoreAudio backend is
+//! the fix if playback is ever wanted -- not a stub that pretends.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const pulse = @import("mux/pulse.zig");
 const opuscodec = @import("mux/opuscodec.zig");
 const cast = @import("util/cast.zig");
 
+/// libpulse exists only in the Linux arm of the GUI cimport set.
+const have_pulse = builtin.os.tag == .linux;
+/// The three libpulse handles this file keeps. Off Linux they are
+/// uninhabited stand-ins so the struct still has fields and the
+/// callbacks still have signatures; every one of them stays null.
+const PaMainloop = if (have_pulse) c.pa_glib_mainloop else opaque {};
+const PaContext = if (have_pulse) c.pa_context else opaque {};
+const PaStream = if (have_pulse) c.pa_stream else opaque {};
+
 pub const AudioSink = struct {
     allocator: std.mem.Allocator,
-    ml: ?*c.pa_glib_mainloop = null,
-    ctx: ?*c.pa_context = null,
+    ml: ?*PaMainloop = null,
+    ctx: ?*PaContext = null,
     ctx_ready: bool = false,
     ctx_failed: bool = false,
     voices: std.AutoHashMapUnmanaged(u32, *Voice) = .empty,
@@ -35,7 +52,7 @@ pub const AudioSink = struct {
     const Voice = struct {
         sink: *AudioSink,
         id: u32,
-        stream: ?*c.pa_stream = null,
+        stream: ?*PaStream = null,
         /// PCM not yet accepted by the local stream.
         pending: std.ArrayList(u8) = .empty,
         format: u8 = 3,
@@ -85,6 +102,12 @@ pub const AudioSink = struct {
     pub fn create(allocator: std.mem.Allocator) !*AudioSink {
         const self = try allocator.create(AudioSink);
         self.* = .{ .allocator = allocator };
+        if (!have_pulse) {
+            // No local audio stack to connect to; the discard-and-report
+            // path keeps remote apps running.
+            self.ctx_failed = true;
+            return self;
+        }
         self.ml = c.pa_glib_mainloop_new(c.g_main_context_default());
         if (self.ml == null) {
             self.ctx_failed = true;
@@ -107,23 +130,27 @@ pub const AudioSink = struct {
         var it = self.voices.valueIterator();
         while (it.next()) |v| self.freeVoice(v.*);
         self.voices.deinit(self.allocator);
-        if (self.ctx) |ctx| {
-            c.pa_context_set_state_callback(ctx, null, null);
-            c.pa_context_disconnect(ctx);
-            c.pa_context_unref(ctx);
+        if (have_pulse) {
+            if (self.ctx) |ctx| {
+                c.pa_context_set_state_callback(ctx, null, null);
+                c.pa_context_disconnect(ctx);
+                c.pa_context_unref(ctx);
+            }
+            if (self.ml) |ml| c.pa_glib_mainloop_free(ml);
         }
-        if (self.ml) |ml| c.pa_glib_mainloop_free(ml);
         self.intents.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
     fn freeVoice(self: *AudioSink, v: *Voice) void {
         if (v.dec) |*d| d.deinit();
-        if (v.stream) |s| {
-            c.pa_stream_set_write_callback(s, null, null);
-            c.pa_stream_set_state_callback(s, null, null);
-            _ = c.pa_stream_disconnect(s);
-            c.pa_stream_unref(s);
+        if (have_pulse) {
+            if (v.stream) |s| {
+                c.pa_stream_set_write_callback(s, null, null);
+                c.pa_stream_set_state_callback(s, null, null);
+                _ = c.pa_stream_disconnect(s);
+                c.pa_stream_unref(s);
+            }
         }
         if (v.application.len > 0) self.allocator.free(v.application);
         if (v.binary.len > 0) self.allocator.free(v.binary);
@@ -213,10 +240,12 @@ pub const AudioSink = struct {
                 const id = std.mem.readInt(u32, payload[0..4], .little);
                 const v = self.voices.get(id) orelse return;
                 v.corked = payload[4] != 0;
-                if (v.stream) |s| {
-                    if (c.pa_stream_get_state(s) == c.PA_STREAM_READY) {
-                        const op = c.pa_stream_cork(s, @intFromBool(v.corked), null, null);
-                        if (op != null) c.pa_operation_unref(op);
+                if (have_pulse) {
+                    if (v.stream) |s| {
+                        if (c.pa_stream_get_state(s) == c.PA_STREAM_READY) {
+                            const op = c.pa_stream_cork(s, @intFromBool(v.corked), null, null);
+                            if (op != null) c.pa_operation_unref(op);
+                        }
                     }
                 }
             },
@@ -235,35 +264,41 @@ pub const AudioSink = struct {
 
     fn connectVoice(self: *AudioSink, v: *Voice) void {
         if (v.stream != null or self.ctx_failed) return;
-        var spec = c.pa_sample_spec{
-            .format = @intCast(v.format), // PA codes pass through
-            .rate = v.rate,
-            .channels = v.channels,
-        };
-        if (c.pa_sample_spec_valid(&spec) == 0) {
-            self.ctxFailVoice(v);
-            return;
-        }
-        const s = c.pa_stream_new(self.ctx, "sketerm remote", &spec, null) orelse {
-            self.ctxFailVoice(v);
-            return;
-        };
-        v.stream = s;
-        c.pa_stream_set_state_callback(s, onStreamState, v);
-        c.pa_stream_set_write_callback(s, onStreamWritable, v);
-        if (c.pa_stream_connect_playback(s, null, null, c.PA_STREAM_INTERPOLATE_TIMING | c.PA_STREAM_AUTO_TIMING_UPDATE | c.PA_STREAM_ADJUST_LATENCY, null, null) < 0) {
-            self.ctxFailVoice(v);
+        // Off Linux this is already unreachable -- create() sets
+        // ctx_failed -- but the body must not be analyzed either.
+        if (have_pulse) {
+            var spec = c.pa_sample_spec{
+                .format = @intCast(v.format), // PA codes pass through
+                .rate = v.rate,
+                .channels = v.channels,
+            };
+            if (c.pa_sample_spec_valid(&spec) == 0) {
+                self.ctxFailVoice(v);
+                return;
+            }
+            const s = c.pa_stream_new(self.ctx, "sketerm remote", &spec, null) orelse {
+                self.ctxFailVoice(v);
+                return;
+            };
+            v.stream = s;
+            c.pa_stream_set_state_callback(s, onStreamState, v);
+            c.pa_stream_set_write_callback(s, onStreamWritable, v);
+            if (c.pa_stream_connect_playback(s, null, null, c.PA_STREAM_INTERPOLATE_TIMING | c.PA_STREAM_AUTO_TIMING_UPDATE | c.PA_STREAM_ADJUST_LATENCY, null, null) < 0) {
+                self.ctxFailVoice(v);
+            }
         }
     }
 
     /// Local playback is unavailable for this voice: consume silently
     /// so the remote app never stalls.
     fn ctxFailVoice(self: *AudioSink, v: *Voice) void {
-        if (v.stream) |s| {
-            c.pa_stream_set_write_callback(s, null, null);
-            c.pa_stream_set_state_callback(s, null, null);
-            c.pa_stream_unref(s);
-            v.stream = null;
+        if (have_pulse) {
+            if (v.stream) |s| {
+                c.pa_stream_set_write_callback(s, null, null);
+                c.pa_stream_set_state_callback(s, null, null);
+                c.pa_stream_unref(s);
+                v.stream = null;
+            }
         }
         if (v.pending.items.len > 0) {
             self.reportConsumed(v.id, v.pending.items.len);
@@ -284,23 +319,26 @@ pub const AudioSink = struct {
             }
             return;
         }
-        const s = v.stream orelse return; // waits for ctx ready
-        if (c.pa_stream_get_state(s) != c.PA_STREAM_READY) return;
-        var consumed: usize = 0;
-        while (v.pending.items.len > 0) {
-            const writable = c.pa_stream_writable_size(s);
-            if (writable == 0 or writable == std.math.maxInt(usize)) break;
-            const n = @min(writable, v.pending.items.len);
-            if (c.pa_stream_write(s, v.pending.items.ptr, n, null, 0, c.PA_SEEK_RELATIVE) < 0) break;
-            consumed += n;
-            const rem = v.pending.items.len - n;
-            std.mem.copyForwards(u8, v.pending.items[0..rem], v.pending.items[n..]);
-            v.pending.shrinkRetainingCapacity(rem);
-        }
-        if (consumed > 0) {
-            self.reportConsumed(v.id, consumed);
-            self.reportLatency(v);
-            self.flush();
+        // Off Linux ctx_failed above already took the exit.
+        if (have_pulse) {
+            const s = v.stream orelse return; // waits for ctx ready
+            if (c.pa_stream_get_state(s) != c.PA_STREAM_READY) return;
+            var consumed: usize = 0;
+            while (v.pending.items.len > 0) {
+                const writable = c.pa_stream_writable_size(s);
+                if (writable == 0 or writable == std.math.maxInt(usize)) break;
+                const n = @min(writable, v.pending.items.len);
+                if (c.pa_stream_write(s, v.pending.items.ptr, n, null, 0, c.PA_SEEK_RELATIVE) < 0) break;
+                consumed += n;
+                const rem = v.pending.items.len - n;
+                std.mem.copyForwards(u8, v.pending.items[0..rem], v.pending.items[n..]);
+                v.pending.shrinkRetainingCapacity(rem);
+            }
+            if (consumed > 0) {
+                self.reportConsumed(v.id, consumed);
+                self.reportLatency(v);
+                self.flush();
+            }
         }
     }
 
@@ -312,19 +350,21 @@ pub const AudioSink = struct {
     }
 
     fn reportLatency(self: *AudioSink, v: *Voice) void {
-        const s = v.stream orelse return;
-        var usec: c.pa_usec_t = 0;
-        var negative: c_int = 0;
-        if (c.pa_stream_get_latency(s, &usec, &negative) < 0) return;
-        if (negative != 0) usec = 0;
-        // Only ship meaningful changes (>5 ms) — this rides the mux wire.
-        const diff = if (usec > v.last_latency_us) usec - v.last_latency_us else v.last_latency_us - usec;
-        if (diff < 5_000) return;
-        v.last_latency_us = usec;
-        var pl: [12]u8 = undefined;
-        std.mem.writeInt(u32, pl[0..4], v.id, .little);
-        std.mem.writeInt(u64, pl[4..12], usec, .little);
-        pulse.appendUnit(&self.intents, self.allocator, .latency, &pl) catch {};
+        if (have_pulse) {
+            const s = v.stream orelse return;
+            var usec: c.pa_usec_t = 0;
+            var negative: c_int = 0;
+            if (c.pa_stream_get_latency(s, &usec, &negative) < 0) return;
+            if (negative != 0) usec = 0;
+            // Only ship meaningful changes (>5 ms) — this rides the mux wire.
+            const diff = if (usec > v.last_latency_us) usec - v.last_latency_us else v.last_latency_us - usec;
+            if (diff < 5_000) return;
+            v.last_latency_us = usec;
+            var pl: [12]u8 = undefined;
+            std.mem.writeInt(u32, pl[0..4], v.id, .little);
+            std.mem.writeInt(u64, pl[4..12], usec, .little);
+            pulse.appendUnit(&self.intents, self.allocator, .latency, &pl) catch {};
+        }
     }
 
     pub fn takeOut(self: *AudioSink) []const u8 {
@@ -341,10 +381,10 @@ pub const AudioSink = struct {
 
     // ── libpulse callbacks (GLib main loop — main thread) ────────
 
-    fn onCtxState(ctx: ?*c.pa_context, user: ?*anyopaque) callconv(.c) void {
+    fn onCtxState(ctx: ?*PaContext, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(AudioSink, user);
         if (self.dead) return;
-        switch (c.pa_context_get_state(ctx)) {
+        if (have_pulse) switch (c.pa_context_get_state(ctx)) {
             c.PA_CONTEXT_READY => {
                 self.ctx_ready = true;
                 var it = self.voices.valueIterator();
@@ -357,20 +397,20 @@ pub const AudioSink = struct {
                 while (it.next()) |v| self.ctxFailVoice(v.*);
             },
             else => {},
-        }
+        };
     }
 
-    fn onStreamState(stream: ?*c.pa_stream, user: ?*anyopaque) callconv(.c) void {
+    fn onStreamState(stream: ?*PaStream, user: ?*anyopaque) callconv(.c) void {
         const v = cast.userData(Voice, user);
         if (v.sink.dead) return;
-        switch (c.pa_stream_get_state(stream)) {
+        if (have_pulse) switch (c.pa_stream_get_state(stream)) {
             c.PA_STREAM_READY => v.sink.pump(v),
             c.PA_STREAM_FAILED => v.sink.ctxFailVoice(v),
             else => {},
-        }
+        };
     }
 
-    fn onStreamWritable(_: ?*c.pa_stream, _: usize, user: ?*anyopaque) callconv(.c) void {
+    fn onStreamWritable(_: ?*PaStream, _: usize, user: ?*anyopaque) callconv(.c) void {
         const v = cast.userData(Voice, user);
         if (v.sink.dead) return;
         v.sink.pump(v);
