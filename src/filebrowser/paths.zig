@@ -3,6 +3,7 @@
 //! classification and destination-name uniquing.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const model = @import("model.zig");
 const mounts = @import("../util/mounts.zig");
@@ -265,6 +266,12 @@ fn mountCovers(path: []const u8, mountpoint: []const u8) bool {
 }
 
 pub fn isSketermMount(path: []const u8) bool {
+    // The sketerm FUSE filesystem is Linux-only -- both `fsmount.zig`
+    // and `hostmount.zig` gate on that -- so a host with no /proc can
+    // have no such mount and `false` is the CORRECT answer, not a
+    // failed read misreported as one. Said here so the next reader
+    // does not have to re-derive it from two other files.
+    if (comptime builtin.os.tag != .linux) return false;
     const f = c.fopen("/proc/self/mounts", "r") orelse c.fopen("/proc/mounts", "r") orelse return false;
     defer _ = c.fclose(f);
     var line_ptr: [*c]u8 = null;
