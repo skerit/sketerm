@@ -1111,11 +1111,11 @@ pub fn handleMessage(arena: std.mem.Allocator, backend: Backend, line: []const u
         if (!policy.allows(name_v.string)) {
             if (is_notification) return null;
             const msg = withheldMessage(arena, name_v.string) catch return null;
-            return rpcResult(arena, id, toolResult(arena, msg, true) orelse return null);
+            return rpcResult(arena, id, errRes(arena, .refused, msg) catch return null);
         }
         const outcome = callTool(arena, backend, name_v.string, args) catch |err| {
             const msg = std.fmt.allocPrint(arena, "tool failed: {s}", .{@errorName(err)}) catch return null;
-            return rpcResult(arena, id, toolResult(arena, msg, true) orelse return null);
+            return rpcResult(arena, id, errRes(arena, .failed, msg) catch return null);
         };
         if (is_notification) return null;
         return rpcResult(arena, id, outcome);
@@ -1174,18 +1174,7 @@ pub fn imageResult(arena: std.mem.Allocator, caption: []const u8, png_bytes: []c
 /// Like imageResult, but the --log trace file gets a "-tag" filename
 /// suffix (img-<pid>-NNNN-click.png) so shot kinds sort apart.
 pub fn imageResultTagged(arena: std.mem.Allocator, caption: []const u8, png_bytes: []const u8, tag: []const u8) ?[]const u8 {
-    if (mcp_log) |*l| l.logImage(caption, png_bytes, tag);
-    const enc = std.base64.standard.Encoder;
-    const b64 = arena.alloc(u8, enc.calcSize(png_bytes.len)) catch return null;
-    _ = enc.encode(b64, png_bytes);
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":") catch return null;
-    std.json.Stringify.value(caption, .{}, w) catch return null;
-    w.writeAll("},{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"") catch return null;
-    w.writeAll(b64) catch return null;
-    w.writeAll("\"}]}") catch return null;
-    return aw.written();
+    return imagesResultTagged(arena, caption, &.{png_bytes}, &.{tag});
 }
 
 /// Multi-image tool result: one caption text block, then every PNG as
@@ -1196,36 +1185,181 @@ pub fn imagesResult(arena: std.mem.Allocator, caption: []const u8, pngs: []const
 
 /// Like imagesResult, with an optional per-image tag list (parallel
 /// to `pngs`) for the --log trace filenames.
+/// Emits NO structuredContent: app_actions still splices one on via
+/// withActionStatus, and a second key would collide.
 pub fn imagesResultTagged(arena: std.mem.Allocator, caption: []const u8, pngs: []const []const u8, tags: ?[]const []const u8) ?[]const u8 {
-    const enc = std.base64.standard.Encoder;
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":") catch return null;
-    std.json.Stringify.value(caption, .{}, w) catch return null;
-    w.writeAll("}") catch return null;
-    for (pngs, 0..) |p, i| {
-        if (mcp_log) |*l| l.logImage(caption, p, if (tags) |ts| (if (i < ts.len) ts[i] else "") else "");
-        const b64 = arena.alloc(u8, enc.calcSize(p.len)) catch return null;
-        _ = enc.encode(b64, p);
-        w.writeAll(",{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"") catch return null;
-        w.writeAll(b64) catch return null;
-        w.writeAll("\"}") catch return null;
-    }
-    w.writeAll("]}") catch return null;
-    return aw.written();
+    var r = Res.init(arena);
+    if (caption.len != 0) r.text(caption) catch return null;
+    return r.finishWithImages(pngs, tags) catch null;
 }
 
 /// Wrap plain text as an MCP tool result: {"content":[{"type":"text",...}]}.
+/// The error path routes through errRes so every failure carries the
+/// uniform structured error shape.
 pub fn toolResult(arena: std.mem.Allocator, text: []const u8, is_error: bool) ?[]const u8 {
+    if (is_error) return errRes(arena, .failed, text) catch null;
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":") catch return null;
     std.json.Stringify.value(text, .{}, w) catch return null;
-    w.writeAll("}]") catch return null;
-    if (is_error) w.writeAll(",\"isError\":true") catch return null;
-    w.writeAll("}") catch return null;
+    w.writeAll("}]}") catch return null;
     return aw.written();
 }
+
+/// THE tool-failure vocabulary: every isError result names one of
+/// these. Facts ride the member (retryable); exhaustive switches only.
+pub const ErrCode = enum {
+    invalid_args,
+    not_found,
+    unavailable,
+    timeout,
+    refused,
+    conflict,
+    io_failed,
+    unknown_tool,
+    failed,
+
+    pub fn retryable(self: ErrCode) bool {
+        return switch (self) {
+            .timeout, .unavailable, .io_failed => true,
+            .invalid_args, .not_found, .refused, .conflict, .unknown_tool, .failed => false,
+        };
+    }
+};
+
+/// The uniform error result: message in the text lane, machine shape
+/// in structuredContent, isError set.
+pub fn errRes(arena: std.mem.Allocator, code: ErrCode, msg: []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+    try std.json.Stringify.value(msg, .{}, w);
+    try w.writeAll("}],\"structuredContent\":{\"error\":{\"code\":\"");
+    try w.writeAll(@tagName(code));
+    try w.writeAll("\",\"message\":");
+    try std.json.Stringify.value(msg, .{}, w);
+    try w.writeAll(",\"retryable\":");
+    try w.writeAll(if (code.retryable()) "true" else "false");
+    try w.writeAll("}},\"isError\":true}");
+    return aw.written();
+}
+
+/// Renders a value for the human text lane: bare strings, plain
+/// numbers, true/false — never JSON syntax.
+fn textValue(w: *std.Io.Writer, value: anytype) !void {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .bool => try w.writeAll(if (value) "true" else "false"),
+        .int, .comptime_int => try w.print("{d}", .{value}),
+        .float, .comptime_float => try w.print("{d}", .{value}),
+        .optional => if (value) |v| try textValue(w, v) else try w.writeAll("null"),
+        .@"enum" => try w.writeAll(@tagName(value)),
+        .pointer => |p| {
+            if (p.size == .slice and p.child == u8) {
+                try w.writeAll(value);
+            } else if (p.size == .one and @typeInfo(p.child) == .array and @typeInfo(p.child).array.child == u8) {
+                try w.writeAll(value);
+            } else {
+                try w.print("{any}", .{value});
+            }
+        },
+        else => try w.print("{any}", .{value}),
+    }
+}
+
+/// Two-lane tool-result builder: machine facts accumulate into
+/// structuredContent, token-efficient prose into ONE text content
+/// block (never JSON). NDJSON-safe: the serialized result carries no
+/// raw newline.
+pub const Res = struct {
+    arena: std.mem.Allocator,
+    sc: std.Io.Writer.Allocating,
+    tl: std.Io.Writer.Allocating,
+    has_structured: bool = false,
+
+    pub fn init(arena: std.mem.Allocator) Res {
+        return .{ .arena = arena, .sc = .init(arena), .tl = .init(arena) };
+    }
+
+    fn scKey(self: *Res, name: []const u8) !void {
+        const w = &self.sc.writer;
+        if (self.has_structured) try w.writeAll(",");
+        self.has_structured = true;
+        try w.writeAll("\"");
+        try w.writeAll(name);
+        try w.writeAll("\":");
+    }
+
+    fn textLine(self: *Res) !*std.Io.Writer {
+        const w = &self.tl.writer;
+        if (self.tl.written().len != 0) try w.writeAll("\n");
+        return w;
+    }
+
+    /// Structured fact plus an auto "name: value" text line.
+    pub fn field(self: *Res, name: []const u8, value: anytype) !void {
+        try self.fact(name, value);
+        const w = try self.textLine();
+        try w.writeAll(name);
+        try w.writeAll(": ");
+        try textValue(w, value);
+    }
+
+    /// Structured fact only — for what a human does not need repeated.
+    pub fn fact(self: *Res, name: []const u8, value: anytype) !void {
+        try self.scKey(name);
+        try std.json.Stringify.value(value, .{}, &self.sc.writer);
+    }
+
+    /// Verbatim pre-serialized JSON fact (payloads); no text line.
+    pub fn raw(self: *Res, name: []const u8, json: []const u8) !void {
+        try self.scKey(name);
+        try self.sc.writer.writeAll(json);
+    }
+
+    /// Free-form line for the text lane only.
+    pub fn text(self: *Res, line: []const u8) !void {
+        const w = try self.textLine();
+        try w.writeAll(line);
+    }
+
+    pub fn textf(self: *Res, comptime fmt: []const u8, args: anytype) !void {
+        const w = try self.textLine();
+        try w.print(fmt, args);
+    }
+
+    pub fn finish(self: *Res) ![]const u8 {
+        return self.finishWithImages(&.{}, null);
+    }
+
+    /// finish plus inline PNG content blocks after the text block.
+    /// `tags` (parallel to `pngs`) names the --log trace files.
+    pub fn finishWithImages(self: *Res, pngs: []const []const u8, tags: ?[]const []const u8) ![]const u8 {
+        var aw: std.Io.Writer.Allocating = .init(self.arena);
+        const w = &aw.writer;
+        const t = self.tl.written();
+        try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(if (t.len == 0) "ok" else t, .{}, w);
+        try w.writeAll("}");
+        const enc = std.base64.standard.Encoder;
+        for (pngs, 0..) |p, i| {
+            if (mcp_log) |*l| l.logImage(t, p, if (tags) |ts| (if (i < ts.len) ts[i] else "") else "");
+            const b64 = try self.arena.alloc(u8, enc.calcSize(p.len));
+            _ = enc.encode(b64, p);
+            try w.writeAll(",{\"type\":\"image\",\"mimeType\":\"image/png\",\"data\":\"");
+            try w.writeAll(b64);
+            try w.writeAll("\"}");
+        }
+        try w.writeAll("]");
+        if (self.has_structured) {
+            try w.writeAll(",\"structuredContent\":{");
+            try w.writeAll(self.sc.written());
+            try w.writeAll("}");
+        }
+        try w.writeAll("}");
+        return aw.written();
+    }
+};
 
 pub const ActionStatus = union(enum) {
     completed,
@@ -2498,7 +2632,7 @@ pub fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
 }
 
 pub fn appErr(arena: std.mem.Allocator, msg: []const u8) ![]const u8 {
-    return toolResult(arena, msg, true) orelse error.OutOfMemory;
+    return errRes(arena, .failed, msg);
 }
 
 /// Screenshot caption: window identity + how to map image coordinates
@@ -5220,7 +5354,7 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
         if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
         return toolResult(arena, "ok", false) orelse error.OutOfMemory;
     }
-    return toolResult(arena, "unknown tool", true) orelse error.OutOfMemory;
+    return errRes(arena, .unknown_tool, "unknown tool");
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -7837,4 +7971,88 @@ test "applyDebugWrap: gdb_commands become crash-point -ex args before --args" {
         try t.expect(r == .note and r.note.len == 0);
         try t.expectEqual(@as(usize, 1), argv.items.len);
     }
+}
+
+test "Res: two lanes — field auto-text, fact/raw quiet, textf, finish shape" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var r = Res.init(arena);
+    try r.textf("opened view {d}: {s}", .{ 12, "Example Domain" });
+    try r.field("url", @as([]const u8, "https://example.com"));
+    try r.field("settled", true);
+    try r.fact("revision", @as(u32, 7));
+    try r.raw("snapshot", "{\"k\":1}");
+    const out = try r.finish();
+
+    // Whole result parses as JSON.
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, out, .{});
+    const obj = parsed.value.object;
+    const content = obj.get("content").?.array;
+    try t.expectEqual(@as(usize, 1), content.items.len);
+    const text = content.items[0].object.get("text").?.string;
+    // Text lane: bare, no JSON syntax, auto lines for field() only.
+    try t.expectEqualStrings(
+        "opened view 12: Example Domain\nurl: https://example.com\nsettled: true",
+        text,
+    );
+    try t.expect(std.mem.indexOfScalar(u8, text, '{') == null);
+    const sc = obj.get("structuredContent").?.object;
+    try t.expectEqualStrings("https://example.com", sc.get("url").?.string);
+    try t.expect(sc.get("settled").?.bool);
+    try t.expectEqual(@as(i64, 7), sc.get("revision").?.integer);
+    try t.expectEqual(@as(i64, 1), sc.get("snapshot").?.object.get("k").?.integer);
+    try t.expect(obj.get("isError") == null);
+    // NDJSON: multi-line text lane never leaks a raw newline.
+    try t.expect(std.mem.indexOfScalar(u8, out, '\n') == null);
+}
+
+test "Res: empty text lane falls back to 'ok'; no fields omit structuredContent" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var r = Res.init(arena);
+    try r.fact("count", @as(u32, 3));
+    const out = try r.finish();
+    try t.expect(std.mem.indexOf(u8, out, "\"text\":\"ok\"") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"structuredContent\":{\"count\":3}") != null);
+
+    var plain = Res.init(arena);
+    try plain.text("terminal closed");
+    const pout = try plain.finish();
+    try t.expect(std.mem.indexOf(u8, pout, "structuredContent") == null);
+    try t.expect(std.mem.indexOf(u8, pout, "\"text\":\"terminal closed\"") != null);
+}
+
+test "errRes: uniform shape, code tag, retryable fact" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const nf = try errRes(arena, .not_found, "no web view with id 4");
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, nf, .{});
+    const obj = parsed.value.object;
+    try t.expect(obj.get("isError").?.bool);
+    try t.expectEqualStrings(
+        "no web view with id 4",
+        obj.get("content").?.array.items[0].object.get("text").?.string,
+    );
+    const e = obj.get("structuredContent").?.object.get("error").?.object;
+    try t.expectEqualStrings("not_found", e.get("code").?.string);
+    try t.expectEqualStrings("no web view with id 4", e.get("message").?.string);
+    try t.expect(!e.get("retryable").?.bool);
+
+    const to = try errRes(arena, .timeout, "did not settle");
+    try t.expect(std.mem.indexOf(u8, to, "\"code\":\"timeout\"") != null);
+    try t.expect(std.mem.indexOf(u8, to, "\"retryable\":true") != null);
+
+    // appErr rides the same shape with the migration-default code.
+    const ae = try appErr(arena, "boom");
+    try t.expect(std.mem.indexOf(u8, ae, "\"code\":\"failed\"") != null);
+    try t.expect(std.mem.indexOf(u8, ae, "\"isError\":true") != null);
 }

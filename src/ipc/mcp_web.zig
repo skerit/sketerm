@@ -1172,7 +1172,7 @@ pub fn webTool(
         }
     }
 
-    return mcp.appErr(arena, "unknown web tool");
+    return mcp.errRes(arena, .unknown_tool, "unknown web tool");
 }
 
 /// One eval that reports where the page is scrolled to, so "nothing

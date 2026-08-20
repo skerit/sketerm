@@ -638,7 +638,7 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         if (mcp.rec_state.casts.fetchSwapRemove(id)) |kv| mcp.rec_state.allocator.free(kv.value);
         return toolResult(arena, "terminal closed", false) orelse error.OutOfMemory;
     }
-    return appErr(arena, "unknown tool");
+    return mcp.errRes(arena, .unknown_tool, "unknown tool");
 }
 
 // ── File transfer + port forwards ─────────────────────────────────
@@ -1040,7 +1040,7 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         mcp.forward_state.removeOne(f);
         return toolResult(arena, "forward closed", false) orelse error.OutOfMemory;
     }
-    return appErr(arena, "unknown tool");
+    return mcp.errRes(arena, .unknown_tool, "unknown tool");
 }
 
 pub fn spawnForwardTerm(arena: std.mem.Allocator, host: []const u8, lp: u16, rh: []const u8, rp: u16) !*termdrive.Term {

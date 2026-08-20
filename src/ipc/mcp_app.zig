@@ -2085,7 +2085,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         };
         return toolResult(arena, msg, outcome == .unconfirmed) orelse error.OutOfMemory;
     }
-    return appErr(arena, "unknown tool");
+    return mcp.errRes(arena, .unknown_tool, "unknown tool");
 }
 
 // ── observation tools (app_watch / app_hover_map / app_backtrace) ──
