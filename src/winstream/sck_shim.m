@@ -18,8 +18,11 @@
 // mapped through the tracked SCWindow frame (both are top-left
 // origin global points). Needs the Accessibility TCC grant; the
 // Screen Recording grant gates capture. Missing grants surface
-// through sketerm_sck_status / sketerm_sck_last_error — the Zig
-// side turns them into a visible notice, never a silent hang.
+// through sketerm_sck_status / sketerm_sck_last_error — never a
+// silent hang. The Zig side turns them into a visible notice for a
+// session that ASKED to stream (painted by
+// sketerm_sck_render_notice below) and into a log line for one the
+// macOS auto gate armed on its own.
 
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
@@ -27,6 +30,7 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <CoreText/CoreText.h>
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <pthread.h>
@@ -35,6 +39,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdlib.h>
 
 // Max dirty rects accumulated for one window between drains. Damage
 // past this (or ≥ the area threshold) falls back to a whole frame —
@@ -776,6 +781,77 @@ size_t sketerm_sck_last_error(SckCtx *ctx, char *buf, size_t cap) {
     c->err[0] = 0;
     pthread_mutex_unlock(&c->mu);
     return n;
+}
+
+// ── grant notice ────────────────────────────────────────────────
+//
+// Paints the "no Screen Recording grant" card the Zig side streams as
+// a synthetic window. It lives here because the daemon links libc
+// only — no freetype, no GTK, no way to draw a glyph — while this
+// shim already has CoreText through the frameworks capture needs.
+// Before this existed the card was a bare yellow band and the message
+// rode only in the window TITLE, so a client without a titlebar
+// showed the user an empty box: a warning that warns of nothing.
+//
+// `out` is w*h*4 BGRA, TOP-DOWN to match every other frame on the
+// wire — which is what CGBitmapContext already writes: its ROWS run
+// top-to-bottom in memory even though its coordinate ORIGIN is
+// bottom-left. So drawing is done in CG coordinates (y=0 is the
+// bottom band) and the buffer needs no flip. Reversing the rows
+// "to convert" is the bug this comment exists to prevent: the two
+// yellow bands make an upside-down card look plausible in any
+// row-0 pixel check, and only a screenshot catches it.
+bool sketerm_sck_render_notice(const char *utf8, int32_t w, int32_t h, uint8_t *out) {
+    if (!utf8 || !out || w <= 0 || h <= 0) return false;
+    NSString *msg = [NSString stringWithUTF8String:utf8];
+    if (!msg) return false;
+
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    if (!cs) return false;
+    CGContextRef cg = CGBitmapContextCreate(out, (size_t)w, (size_t)h, 8, (size_t)w * 4, cs,
+                                            kCGImageAlphaPremultipliedFirst |
+                                            kCGBitmapByteOrder32Little);
+    if (!cg) { CGColorSpaceRelease(cs); return false; }
+
+    const CGFloat band = 8.0;
+    CGContextSetRGBFillColor(cg, 0.12, 0.12, 0.13, 1.0);
+    CGContextFillRect(cg, CGRectMake(0, 0, w, h));
+    CGContextSetRGBFillColor(cg, 0.91, 0.78, 0.0, 1.0);
+    CGContextFillRect(cg, CGRectMake(0, 0, w, band));
+    CGContextFillRect(cg, CGRectMake(0, h - band, w, band));
+
+    CTFontRef font = CTFontCreateWithName(CFSTR("Menlo"), 12.0, NULL);
+    if (!font) font = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 12.0, NULL);
+    CGColorRef fg = CGColorCreate(cs, (CGFloat[]){0.96, 0.96, 0.96, 1.0});
+    bool ok = false;
+    if (font && fg) {
+        NSDictionary *attrs = @{
+            (__bridge NSString *)kCTFontAttributeName            : (__bridge id)font,
+            (__bridge NSString *)kCTForegroundColorAttributeName : (__bridge id)fg,
+        };
+        NSAttributedString *as = [[NSAttributedString alloc] initWithString:msg attributes:attrs];
+        CTFramesetterRef fs = CTFramesetterCreateWithAttributedString((__bridge CFAttributedStringRef)as);
+        if (fs) {
+            // Inset inside both bands; CoreText fills a frame from its
+            // TOP edge downward, so this lands under the top band.
+            CGRect box = CGRectMake(12, band + 6, w - 24, h - 2 * (band + 6));
+            CGMutablePathRef path = CGPathCreateMutable();
+            CGPathAddRect(path, NULL, box);
+            CTFrameRef frame = CTFramesetterCreateFrame(fs, CFRangeMake(0, 0), path, NULL);
+            if (frame) {
+                CTFrameDraw(frame, cg);
+                CFRelease(frame);
+                ok = true;
+            }
+            CGPathRelease(path);
+            CFRelease(fs);
+        }
+    }
+    if (font) CFRelease(font);
+    if (fg) CGColorRelease(fg);
+    CGContextRelease(cg);
+    CGColorSpaceRelease(cs);
+    return ok;
 }
 
 const SckEvent *sketerm_sck_drain(SckCtx *ctx, size_t *out_n) {
