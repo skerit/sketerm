@@ -13,6 +13,7 @@
 //! `protocol` frames.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("cbindings");
 const proto = @import("protocol.zig");
 const cefhost = @import("cefhost.zig");
@@ -130,10 +131,30 @@ const CapList = struct {
     }
 };
 
+extern fn sketerm_web_add_iterate_timer(cb: *const fn (?*anyopaque) callconv(.c) void, ctx: ?*anyopaque) void;
+extern fn sketerm_web_remove_iterate_timer() void;
+
+/// CFRunLoop lifeline entry (macOS): one non-blocking iteration from
+/// inside whatever run loop currently owns the main thread.
+fn timerStep(ctx: ?*anyopaque) callconv(.c) void {
+    const self: *Server = @ptrCast(@alignCast(ctx orelse return));
+    if (self.client_fd < 0) return;
+    self.step_nonblocking = true;
+    defer self.step_nonblocking = false;
+    self.step();
+}
+
 pub const Server = struct {
     gpa: std.mem.Allocator,
     listen_fd: c_int = -1,
     client_fd: c_int = -1,
+    /// True while `step` is on the stack. On macOS one iteration can
+    /// re-enter through the CFRunLoop lifeline timer (see run()); the
+    /// guard makes that a no-op instead of a recursive drain.
+    in_step: bool = false,
+    /// Set by the timer entry: this iteration must not block in poll —
+    /// it runs INSIDE an AppKit run loop that has its own schedule.
+    step_nonblocking: bool = false,
     path: []const u8,
     in: std.ArrayList(u8) = .empty,
     out: proto.Outbox,
@@ -204,6 +225,24 @@ pub const Server = struct {
         cefhost.interceptInit(self.gpa);
         defer cefhost.interceptDeinit(self.gpa);
 
+        // macOS lifeline: Chromium UI-thread code can enter a nested
+        // run loop that bootstraps [NSApp run] and never hands the
+        // thread back to this loop (measured on the first
+        // subresource-bearing page load — smoke-web stage 22d froze
+        // with the main thread parked in -[NSApplication run]).
+        // Chromium keeps running inside that loop; only our socket
+        // serving would die. A repeating main-run-loop timer performs
+        // one NON-BLOCKING iteration from wherever the thread actually
+        // is, so the helper keeps serving through any nested loop.
+        // Same thread always — the single-threaded invariant above
+        // holds; `in_step` handles the re-entrancy.
+        if (builtin.target.os.tag == .macos) {
+            sketerm_web_add_iterate_timer(timerStep, self);
+        }
+        defer if (builtin.target.os.tag == .macos) {
+            sketerm_web_remove_iterate_timer();
+        };
+
         if (!self.preset_fd) try self.accept();
         while (self.client_fd >= 0) {
             self.step();
@@ -269,6 +308,9 @@ pub const Server = struct {
 
     /// One loop iteration: poll, drain the socket, pump CEF, flush.
     fn step(self: *Server) void {
+        if (self.in_step) return;
+        self.in_step = true;
+        defer self.in_step = false;
         // Two descriptors: the client, and the browser helper's own
         // blocking-webRequest wake pipe. A request HELD on CEF's IO
         // thread is a page that has stopped loading, and the decision
@@ -285,7 +327,9 @@ pub const Server = struct {
             .{ .fd = cefhost.webrequestWakeFd(), .events = c.POLLIN, .revents = 0 },
         };
         const nfds: c.nfds_t = if (pfds[1].fd >= 0) 2 else 1;
-        const timeout: c_int = if (cefhost.webrequestBusy())
+        const timeout: c_int = if (self.step_nonblocking)
+            0
+        else if (cefhost.webrequestBusy())
             // Already holding something: the answer arrives through
             // CEF's message loop, which only turns when we pump.
             (if (wreq_spin) 0 else wreq_timeout_ms)
