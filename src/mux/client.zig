@@ -2260,18 +2260,73 @@ test "local daemon origin is the exact connected listener, never a default guess
     try t.expectError(error.BadPath, unnamed.localDaemonOrigin(t.allocator));
 }
 
+/// True when `fd` appears in a child's `ls /dev/fd` listing, i.e. the
+/// child inherited it across exec.
+fn listingHasFd(listing: []const u8, fd: c_int) bool {
+    var it = std.mem.tokenizeAny(u8, listing, " \t\r\n");
+    while (it.next()) |tok| {
+        const n = std.fmt.parseInt(c_int, tok, 10) catch continue;
+        if (n == fd) return true;
+    }
+    return false;
+}
+
 test "transport fd is close-on-exec so it cannot leak into a later child" {
     // Regression: socketpair() without SOCK_CLOEXEC handed every transport
     // socket to every child spawned afterwards (proxy N held N-1 foreign
     // sockets, confirmed via /proc/<pid>/fd). The peer of an old connection
     // then cannot see EOF until the last of those children exits, so a dead
     // GUI's durable sessions stay attached on the daemon.
-    const a = std.testing.allocator;
-    var conn = try Conn.spawnOverSocketpair(a, "/bin/true", &[_:null]?[*:0]const u8{ "/bin/true", null });
+    //
+    // The stand-in is RESOLVED, not hardcoded: macOS ships `true` at
+    // /usr/bin only. With /bin/true the execvp simply failed here, the
+    // parent still got its socketpair back, and the FD_CLOEXEC assertion
+    // passed with NO CHILD EVER RUNNING -- green for the wrong reason.
+    // So the test now also spawns a real child and reads what it
+    // inherited: the flag bit is the mechanism, the listing is the
+    // consequence, and only the second one is what the regression broke.
+    const t = std.testing;
+    const a = t.allocator;
+    const stand_in = blk: {
+        for ([_][*:0]const u8{ "/bin/true", "/usr/bin/true" }) |cand| {
+            if (c.access(cand, c.X_OK) == 0) break :blk cand;
+        }
+        return error.NoTrueBinary;
+    };
+    var conn = try Conn.spawnOverSocketpair(a, stand_in, &[_:null]?[*:0]const u8{ stand_in, null });
     defer conn.deinit();
     const flags = c.fcntl(conn.fd, c.F_GETFD);
-    try std.testing.expect(flags >= 0);
-    try std.testing.expect(flags & c.FD_CLOEXEC != 0);
+    try t.expect(flags >= 0);
+    try t.expect(flags & c.FD_CLOEXEC != 0);
+
+    // Two dups of that same socket, parked at fd numbers no shell will
+    // reuse: one left inheritable, one marked cloexec. A later child must
+    // see the first and not the second. The inheritable one is the
+    // POSITIVE CONTROL -- without it, "absent from the listing" could just
+    // mean the listing never worked. Low fd numbers cannot be used for
+    // this: the child's own `ls` opens a directory fd and would land on
+    // whatever number the cloexec'd socket vacated.
+    const leaked = c.fcntl(conn.fd, c.F_DUPFD, @as(c_int, 60));
+    try t.expect(leaked >= 60);
+    defer _ = c.close(leaked);
+    const guarded = c.fcntl(conn.fd, c.F_DUPFD, @as(c_int, 70));
+    try t.expect(guarded >= 70);
+    defer _ = c.close(guarded);
+    try t.expectEqual(@as(c_int, 0), c.fcntl(guarded, c.F_SETFD, c.FD_CLOEXEC));
+
+    const sh: [*:0]const u8 = "/bin/sh";
+    var probe = try Conn.spawnOverSocketpair(a, sh, &[_:null]?[*:0]const u8{ sh, "-c", "ls /dev/fd", null });
+    defer probe.deinit();
+    var buf: [8192]u8 = undefined;
+    var used: usize = 0;
+    while (used < buf.len) {
+        const n = c.read(probe.fd, buf[used..].ptr, buf.len - used);
+        if (n <= 0) break;
+        used += @intCast(n);
+    }
+    const listing = buf[0..used];
+    try t.expect(listingHasFd(listing, leaked));
+    try t.expect(!listingHasFd(listing, guarded));
 }
 
 test "remote transport specs default to auto and preserve forced modes" {
