@@ -256,6 +256,27 @@ fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
     // a tweak here.
     if (builtin.target.os.tag == .macos) {
         cefhost.setAccelerated(false);
+        // Chromium's cookie store encrypts at rest with a key from the
+        // KEYCHAIN ("Chrome Safe Storage"). For this helper — headless,
+        // often ad-hoc-signed, re-identified every dev build — the
+        // SecKeychain call never returns: no prompt appears, the key
+        // never arrives, the cookie store never initializes, and CEF
+        // then holds EVERY http(s) request on its cookie load
+        // (`MaybeLoadCookies` in the interception wrapper), which
+        // presented as "no page over the network ever finishes
+        // loading" while data: URLs worked fine. The mock keychain is
+        // Chromium's own test escape for exactly this; cookies still
+        // persist, keyed by a mock secret instead of a keychain item.
+        // Revisit only alongside a stable signing identity AND a
+        // measured, bounded real-keychain path.
+        var have = false;
+        for (buf[0..n]) |a| {
+            if (std.mem.eql(u8, std.mem.span(@as([*:0]const u8, @ptrCast(a))), "--use-mock-keychain")) have = true;
+        }
+        if (!have and n < buf.len) {
+            buf[n] = @constCast(@ptrCast("--use-mock-keychain"));
+            n += 1;
+        }
         return buf[0..n];
     }
     // A CEF subprocess is this binary re-executed with Chromium's own
