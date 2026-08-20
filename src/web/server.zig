@@ -239,9 +239,19 @@ pub const Server = struct {
         while (true) {
             var pfd = c.struct_pollfd{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 };
             const n = c.poll(@ptrCast(&pfd), 1, idle_timeout_ms);
+            // BEFORE the pump. `cef_do_message_loop_work` runs a whole
+            // Chromium message-loop iteration and clobbers errno, so
+            // reading it afterwards reports whatever CEF's last syscall
+            // set — and a poll interrupted by a signal then looks like a
+            // hard failure. macOS makes this fatal on the FIRST idle
+            // tick (the helper died with "serve failed: PollFailed"
+            // before any client could connect); the same race was always
+            // present on Linux, where poll simply woke cleanly more
+            // often. `step()` below already reads errno immediately.
+            const poll_errno = errno();
             cefhost.pump();
             if (n < 0) {
-                if (errno() == c.EINTR) continue;
+                if (poll_errno == c.EINTR) continue;
                 return error.PollFailed;
             }
             if (n == 0) continue;
