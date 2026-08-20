@@ -406,6 +406,151 @@ pub fn foregroundProgram(master_fd: c_int, buf: []u8) ?[]const u8 {
     return buf[0..len];
 }
 
+/// macOS: every pid on the system, in one libproc call.
+extern fn proc_listallpids(buffer: ?*anyopaque, buffersize: c_int) c_int;
+
+/// macOS: raw sysctl. Used for KERN_PROCARGS2, the only way to read
+/// another process's environment on a system with no /proc.
+extern fn sysctl(
+    name: [*]c_int,
+    namelen: c_uint,
+    oldp: ?*anyopaque,
+    oldlenp: *usize,
+    newp: ?*anyopaque,
+    newlen: usize,
+) c_int;
+
+/// Every live pid, written into `buf`; returns the slice that fit.
+///
+/// Exists so a test rig can find the processes ONE of its runs started
+/// by looking at their environments — see `environOfPid`. Enumerating
+/// pids is the part with no portable spelling: Linux lists /proc,
+/// Darwin asks libproc.
+pub fn listPids(buf: []c.pid_t) []c.pid_t {
+    if (buf.len == 0) return buf[0..0];
+    if (is_macos) {
+        const bytes: c_int = @intCast(@min(buf.len * @sizeOf(c.pid_t), std.math.maxInt(c_int)));
+        const n = proc_listallpids(buf.ptr, bytes);
+        if (n <= 0) return buf[0..0];
+        return buf[0..@min(@as(usize, @intCast(n)), buf.len)];
+    }
+    const d = c.opendir("/proc") orelse return buf[0..0];
+    defer _ = c.closedir(d);
+    var used: usize = 0;
+    while (c.readdir(d)) |ent| {
+        if (used == buf.len) break;
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        buf[used] = std.fmt.parseInt(c.pid_t, name, 10) catch continue;
+        used += 1;
+    }
+    return buf[0..used];
+}
+
+/// A live process's environment block, NUL-separated, written into
+/// `buf`. Null when it cannot be read — a dead pid, another user's
+/// process, or a buffer too small to hold the answer.
+///
+/// **Null means "cannot establish ownership", and every caller must
+/// treat that as "not mine".** A sweep that kills what it cannot
+/// identify is a sweep that eventually kills the user's real daemon.
+///
+/// Linux reads /proc/<pid>/environ. macOS has no /proc: KERN_PROCARGS2
+/// returns one block laid out as `int argc`, the exec path, NUL
+/// padding, `argc` argv strings, and THEN the environment — so the
+/// environ block is found by stepping over the first two parts. What
+/// comes back is byte-identical in shape to Linux's file (NUL-separated
+/// `KEY=VALUE`), which is what lets both callers share one parser.
+///
+/// The whole args+environ region is copied, so `buf` must be big enough
+/// for both; 64 KiB covers any ordinary process. A short buffer fails
+/// closed (ENOMEM -> null) rather than returning a truncated block that
+/// a substring search could read as a miss.
+///
+/// **On macOS this is the environment AS OF execve, not the current
+/// one** — MEASURED, not assumed: a `setenv` after start is invisible
+/// through KERN_PROCARGS2, while the same variable inherited across an
+/// exec is right there. Linux's /proc/<pid>/environ has the same
+/// property for the same reason, so the two agree. Every caller here
+/// marks a child by calling `setenv` in the forked child BEFORE it
+/// execs, which is exactly the case that survives; do not switch a
+/// caller to marking itself after startup and expect a sweep to see it.
+///
+/// **macOS discloses the environment only for ORDINARY binaries.** An
+/// Apple platform binary (/bin/sleep and friends) comes back as a
+/// ~29-byte block holding argc and argv and NO environment at all,
+/// however the call is made — also measured. Our own locally built,
+/// ad-hoc-signed binaries disclose normally, which is all a sweep for
+/// sketerm's own processes needs. A caller that must identify a SYSTEM
+/// process this way cannot, and must not read that null as "no match".
+pub fn environOfPid(pid: c.pid_t, buf: []u8) ?[]u8 {
+    if (pid <= 0 or buf.len == 0) return null;
+    if (is_macos) {
+        const CTL_KERN: c_int = 1;
+        const KERN_PROCARGS2: c_int = 49;
+        var mib = [3]c_int{ CTL_KERN, KERN_PROCARGS2, pid };
+        var len: usize = buf.len;
+        if (sysctl(&mib, mib.len, buf.ptr, &len, null, 0) != 0) return null;
+        if (len <= @sizeOf(c_int)) return null;
+
+        var argc: c_int = undefined;
+        @memcpy(std.mem.asBytes(&argc), buf[0..@sizeOf(c_int)]);
+        if (argc < 0) return null;
+
+        var at: usize = @sizeOf(c_int);
+        // The exec path, then the NUL padding that aligns what follows.
+        while (at < len and buf[at] != 0) at += 1;
+        while (at < len and buf[at] == 0) at += 1;
+        // argc argv strings, each NUL-terminated.
+        var left: c_int = argc;
+        while (left > 0 and at < len) : (left -= 1) {
+            while (at < len and buf[at] != 0) at += 1;
+            at += 1;
+        }
+        if (left > 0 or at >= len) return null;
+        return buf[at..len];
+    }
+
+    var path_buf: [64:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/environ", .{pid}) catch return null;
+    const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) return null;
+    defer _ = c.close(fd);
+    var used: usize = 0;
+    while (used < buf.len) {
+        const n = c.read(fd, buf.ptr + used, buf.len - used);
+        if (n <= 0) break;
+        used += @intCast(n);
+    }
+    if (used == 0) return null;
+    return buf[0..used];
+}
+
+/// Make the calling process die when its parent does. Called in a
+/// forked child, before exec.
+///
+/// Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)`. That is a *process
+/// attribute* and SURVIVES execve — the only reason it is usable here,
+/// since every caller execs immediately afterwards.
+///
+/// **macOS has no equivalent, and this is deliberately a no-op rather
+/// than a kqueue watch.** `EVFILT_PROC`/`NOTE_EXIT` on the parent needs
+/// a live kqueue fd and a thread to read it; execve destroys both
+/// microseconds later, so the watch would be gone before the child is
+/// even the program it is meant to supervise. Covering an exec'd child
+/// would take a supervisor process wedged between parent and child.
+///
+/// Do not add one on the strength of the orphan bug: PDEATHSIG never
+/// covered that case on Linux either. The worst orphan a rig leaves is
+/// an AUTOSTARTED replacement daemon — double-forked, child of init,
+/// nobody's descendant. What catches it on both platforms is the
+/// environment sweep built on `listPids` + `environOfPid`.
+pub fn dieWithParent() void {
+    if (is_linux) {
+        const PR_SET_PDEATHSIG: c_long = 1;
+        _ = c.syscall(@intFromEnum(std.os.linux.SYS.prctl), PR_SET_PDEATHSIG, @as(c_long, c.SIGKILL));
+    }
+}
+
 /// memfd_create is in both glibc and musl libc but its declaration
 /// hides behind _GNU_SOURCE, which the translate-c pass doesn't
 /// define — declare it ourselves (Linux-only; resolved at link).
@@ -598,6 +743,60 @@ test "foregroundProgram reads the real foreground process on a pty" {
         _ = c.usleep(10_000);
     }
     return error.ForegroundProgramNeverResolved;
+}
+
+test "listPids finds this process among the live pids" {
+    var buf: [8192]c.pid_t = undefined;
+    const pids = listPids(&buf);
+    try std.testing.expect(pids.len > 1);
+    const self = c.getpid();
+    for (pids) |pid| {
+        if (pid == self) return;
+    }
+    return error.SelfNotListed;
+}
+
+test "environOfPid returns a well-formed inherited environment" {
+    // PATH is inherited across the exec that started this test runner,
+    // so it is in the exec-time snapshot on both platforms. (A marker
+    // set by THIS process would not be — see the next test.)
+    var buf: [64 * 1024]u8 = undefined;
+    const env = environOfPid(c.getpid(), &buf) orelse return error.NoEnviron;
+    try std.testing.expect(std.mem.indexOf(u8, env, "PATH=") != null);
+
+    // NUL-separated KEY=VALUE, the shape both sweeps parse.
+    var it = std.mem.splitScalar(u8, env, 0);
+    var pairs: usize = 0;
+    while (it.next()) |entry| {
+        if (entry.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, entry, '=') != null) pairs += 1;
+    }
+    try std.testing.expect(pairs > 0);
+}
+
+test "environOfPid reflects exec time, not the live environment" {
+    // Pins the semantic both callers depend on, on BOTH platforms: a
+    // process marks a child before exec, never itself afterwards. If
+    // this ever starts passing, someone has changed the mechanism and
+    // the sweeps' "set it in the child before execv" contract needs
+    // rechecking rather than celebrating.
+    const key = "SKETERM_PLATFORM_LIVE_ONLY_PROBE";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key, "1", 1));
+    defer _ = c.unsetenv(key);
+
+    var buf: [64 * 1024]u8 = undefined;
+    const env = environOfPid(c.getpid(), &buf) orelse return error.NoEnviron;
+    try std.testing.expect(std.mem.indexOf(u8, env, key) == null);
+}
+
+test "environOfPid fails closed rather than truncating" {
+    // Too small to hold the block: null, never a partial answer a
+    // substring search would misread as "this process is not mine".
+    var tiny: [16]u8 = undefined;
+    try std.testing.expect(environOfPid(c.getpid(), &tiny) == null);
+    var buf: [4096]u8 = undefined;
+    try std.testing.expect(environOfPid(-1, &buf) == null);
+    try std.testing.expect(environOfPid(0, &buf) == null);
 }
 
 test "foregroundProgram returns null for a non-tty fd" {
