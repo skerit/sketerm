@@ -204,7 +204,34 @@ test "no flags: legacy encodings are untouched" {
 
 test "no flags: Super cannot perturb a legacy sequence" {
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("\x1b[A", enc(&buf, .{ .keyval = c.GDK_KEY_Up, .mods = .{ .super = true } }));
+    // On macOS the GUI-modifier chord is swallowed outright (see the
+    // companion test below); on Linux it must pass through unperturbed
+    // because X11 keymaps routinely alias Meta onto the Alt key.
+    const expected = if (builtin.os.tag == .macos) "" else "\x1b[A";
+    try std.testing.expectEqualStrings(expected, enc(&buf, .{ .keyval = c.GDK_KEY_Up, .mods = .{ .super = true } }));
+}
+
+test "no flags: an unbound Command chord produces no bytes (macOS)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    var buf: [64]u8 = undefined;
+    // The legacy encodings cannot express Cmd; falling through used to
+    // fabricate a keypress (Cmd+Y typed 'y', Cmd+Left acted as Left).
+    try std.testing.expectEqualStrings("", enc(&buf, .{ .keyval = c.GDK_KEY_y, .mods = .{ .meta = true } }));
+    try std.testing.expectEqualStrings("", enc(&buf, .{ .keyval = c.GDK_KEY_Left, .mods = .{ .meta = true } }));
+    try std.testing.expectEqualStrings("", enc(&buf, .{ .keyval = c.GDK_KEY_Return, .mods = .{ .meta = true } }));
+    try std.testing.expectEqualStrings("", enc(&buf, .{ .keyval = c.GDK_KEY_y, .mods = .{ .meta = true, .shift = true } }));
+}
+
+test "kitty opt-in still reports Command chords (macOS)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    // An application that asked for disambiguation expects to bind
+    // GUI-modifier chords; meta is bit 5, so the parameter is 1+32.
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b[121;33u", enc(&buf, .{
+        .keyval = c.GDK_KEY_y,
+        .mods = .{ .meta = true },
+        .kitty_flags = input.FLAG_DISAMBIGUATE,
+    }));
 }
 
 test "0x01 disambiguate: only Escape and modified keys change" {
@@ -410,17 +437,78 @@ test "lock keys reach the wire only through the protocol's modifier field" {
 
 // ── matchBinding dispatch table coverage ──────────────────────────
 
-test "matchBinding: Ctrl+Shift+T → new_tab" {
-    const bindings = input.default_bindings[0..];
+test "matchBinding: Ctrl+Shift+T → new_tab (Linux table)" {
     const ctrl_shift = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK;
-    const got = input.matchBinding(bindings, c.GDK_KEY_t, ctrl_shift);
+    const got = input.matchBinding(&input.linux_default_bindings, c.GDK_KEY_t, ctrl_shift);
     try std.testing.expectEqual(@as(?input.Action, .new_tab), got);
 }
 
-test "matchBinding: Ctrl+Tab → next_tab (lone Ctrl, not Ctrl+Shift)" {
-    const bindings = input.default_bindings[0..];
-    const got = input.matchBinding(bindings, c.GDK_KEY_Tab, c.GDK_CONTROL_MASK);
-    try std.testing.expectEqual(@as(?input.Action, .next_tab), got);
+test "matchBinding: Ctrl+Tab → next_tab on BOTH platform tables" {
+    for ([_][]const input.Binding{ &input.linux_default_bindings, &input.macos_default_bindings }) |tbl| {
+        const got = input.matchBinding(tbl, c.GDK_KEY_Tab, c.GDK_CONTROL_MASK);
+        try std.testing.expectEqual(@as(?input.Action, .next_tab), got);
+    }
+}
+
+test "matchBinding: macOS app defaults live on Command" {
+    const M: c_uint = c.GDK_META_MASK;
+    const MS: c_uint = c.GDK_META_MASK | c.GDK_SHIFT_MASK;
+    const cases = [_]struct { keyval: c_uint, mods: c_uint, action: input.Action }{
+        .{ .keyval = c.GDK_KEY_t, .mods = M, .action = .new_tab },
+        .{ .keyval = c.GDK_KEY_w, .mods = M, .action = .close_tab },
+        // Cmd+C is a PLAIN copy: Ctrl+C reaches the shell untouched on
+        // macOS, so the interrupt_or_copy heuristic has no reason to
+        // exist there.
+        .{ .keyval = c.GDK_KEY_c, .mods = M, .action = .copy_selection },
+        .{ .keyval = c.GDK_KEY_v, .mods = M, .action = .paste_clipboard },
+        .{ .keyval = c.GDK_KEY_a, .mods = M, .action = .select_all },
+        .{ .keyval = c.GDK_KEY_comma, .mods = M, .action = .prefs_open },
+        .{ .keyval = c.GDK_KEY_1, .mods = M, .action = .goto_tab_1 },
+        .{ .keyval = c.GDK_KEY_9, .mods = M, .action = .goto_tab_9 },
+        // Cmd+Shift+T, the macOS-browser reopen convention — NOT
+        // Cmd+Z, which means Undo everywhere.
+        .{ .keyval = c.GDK_KEY_t, .mods = MS, .action = .restore_closed_tab },
+        .{ .keyval = c.GDK_KEY_p, .mods = MS, .action = .command_palette },
+        .{ .keyval = c.GDK_KEY_braceleft, .mods = MS, .action = .prev_tab },
+        .{ .keyval = c.GDK_KEY_braceright, .mods = MS, .action = .next_tab },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(
+            @as(?input.Action, case.action),
+            input.matchBinding(&input.macos_default_bindings, case.keyval, case.mods),
+        );
+    }
+    // Cmd+Z stays free for Undo.
+    try std.testing.expectEqual(
+        @as(?input.Action, null),
+        input.matchBinding(&input.macos_default_bindings, c.GDK_KEY_z, M),
+    );
+}
+
+test "macOS defaults: Control belongs to the shell" {
+    // The one deliberate exception is the Ctrl+Tab tab-switch family;
+    // every other Control chord must reach the child so Ctrl+C is
+    // SIGINT and readline keeps its whole namespace.
+    for (input.macos_default_bindings) |b| {
+        if (b.mods & c.GDK_CONTROL_MASK == 0) continue;
+        try std.testing.expect(b.keyval == c.GDK_KEY_Tab or b.keyval == c.GDK_KEY_ISO_Left_Tab);
+    }
+}
+
+test "parseAccel: <Cmd>/<Command> alias <Meta>, round-trip stable" {
+    const p = input.parseAccel("<Cmd>t").?;
+    try std.testing.expectEqual(@as(c_uint, c.GDK_KEY_t), p.keyval);
+    try std.testing.expect(p.mods & c.GDK_META_MASK != 0);
+    const q = input.parseAccel("<Command><Shift>p").?;
+    try std.testing.expect(q.mods & c.GDK_META_MASK != 0);
+    try std.testing.expect(q.mods & c.GDK_SHIFT_MASK != 0);
+    // parse → format → parse: gtk_accelerator_name spells it <Meta>,
+    // which must land on the same (keyval, mods).
+    const s = try input.accelToString(std.testing.allocator, p.keyval, p.mods);
+    defer std.testing.allocator.free(s);
+    const p2 = input.parseAccel(s).?;
+    try std.testing.expectEqual(p.keyval, p2.keyval);
+    try std.testing.expectEqual(p.mods, p2.mods);
 }
 
 test "matchBinding: Linux tree-tab defaults match their documented chords" {
@@ -526,7 +614,9 @@ test "Linux tree-tab defaults avoid common desktop reservations" {
 test "matchBinding: ignores Lock + Group bits via SIGNIFICANT_MODS filter" {
     // Caps Lock (GDK_LOCK_MASK = 0x02) is NOT in the significant set;
     // a binding for Ctrl+Shift+T should still match when Lock is on.
-    const bindings = input.default_bindings[0..];
+    // (The Linux table, explicitly: the macOS table has no Ctrl+Shift
+    // chords and the filter under test is platform-independent.)
+    const bindings = &input.linux_default_bindings;
     const mods: c_uint = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK | c.GDK_LOCK_MASK;
     const got = input.matchBinding(bindings, c.GDK_KEY_t, mods);
     try std.testing.expectEqual(@as(?input.Action, .new_tab), got);

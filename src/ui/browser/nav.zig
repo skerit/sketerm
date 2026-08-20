@@ -1618,7 +1618,7 @@ test "navigation preserves a live statfs request for one late refresh" {
     try t.expectEqual(FreeNavigationState{ .req = 0, .dirty = false }, freeNavigationState(0, true));
 }
 
-fn expectBrowserChordShadowsDeclared(bindings: []const input.Binding) !void {
+fn expectBrowserChordShadowsDeclared(bindings: []const input.Binding, other: []const input.Binding) !void {
     // onBrowserKey runs in the bubble phase and returns 1 for every
     // chord it claims, so anything in `browser_chords` is INVISIBLE
     // to the global binding table while a browser face has focus.
@@ -1639,19 +1639,24 @@ fn expectBrowserChordShadowsDeclared(bindings: []const input.Binding) !void {
                 return error.BrowserChordShadowDrifted;
             }
         } else if (chord.shadows) |stale| {
-            // The global moved away: drop the declaration rather than
-            // keep a rationale for a shadow that no longer happens.
-            std.debug.print("browser chord ({s}) still declares a shadow of {s}, which no longer binds it\n", .{
-                chord.what, input.actionName(stale),
-            });
-            return error.StaleBrowserChordShadow;
+            // The platform tables diverge (macOS globals live on
+            // Command), so a chord may shadow on one platform only —
+            // copy_screen sits on Ctrl+Shift+A on Linux and
+            // Cmd+Shift+A on macOS. A declaration is stale only when
+            // NEITHER table binds the chord.
+            if (input.matchBinding(other, chord.keyval, chord.mods) == null) {
+                std.debug.print("browser chord ({s}) still declares a shadow of {s}, which no longer binds it on any platform\n", .{
+                    chord.what, input.actionName(stale),
+                });
+                return error.StaleBrowserChordShadow;
+            }
         }
     }
 }
 
 test "no browser-face chord shadows a platform global binding undeclared" {
-    try expectBrowserChordShadowsDeclared(&input.linux_default_bindings);
-    try expectBrowserChordShadowsDeclared(&input.macos_default_bindings);
+    try expectBrowserChordShadowsDeclared(&input.linux_default_bindings, &input.macos_default_bindings);
+    try expectBrowserChordShadowsDeclared(&input.macos_default_bindings, &input.linux_default_bindings);
 }
 
 fn expectTypeaheadDoesNotShadow(bindings: []const input.Binding) !void {
