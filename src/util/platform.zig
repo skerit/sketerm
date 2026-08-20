@@ -525,6 +525,21 @@ pub fn environOfPid(pid: c.pid_t, buf: []u8) ?[]u8 {
     return buf[0..used];
 }
 
+/// A `signal()` handler slot: what libc calls `sig_t`.
+pub const SigHandler = ?*const fn (c_int) callconv(.c) void;
+
+/// `SIG_DFL` as a VALUE. <signal.h> defines it as a cast of 0 to a
+/// function pointer, and translate-c renders that as a `@compileError`
+/// on Darwin — so `c.SIG_DFL` compiles on Linux and breaks the macOS
+/// build the moment anything references it. That is not hypothetical:
+/// it is what stopped `smoke-e2e` building here at all.
+///
+/// A null function pointer IS 0, which is what the macro expands to, so
+/// this is the same value with a type Zig can carry. `SIG_IGN` gets no
+/// twin on purpose — its raw value (1) violates fn-pointer alignment on
+/// aarch64-macos; use a no-op handler instead (`sigNoop` in mux_main).
+pub const sig_dfl: SigHandler = null;
+
 /// Make the calling process die when its parent does. Called in a
 /// forked child, before exec.
 ///

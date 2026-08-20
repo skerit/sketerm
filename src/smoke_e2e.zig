@@ -245,6 +245,8 @@ fn sweepRuntimeDir(dir: []const u8) usize {
     var round: usize = 0;
     while (round < 3) : (round += 1) {
         var hits: usize = 0;
+        // 16384 is above kern.maxproc (16000 here) and above any
+        // Linux pid_max worth sweeping, so the list is never truncated.
         var pid_buf: [16384]c.pid_t = undefined;
         for (platform.listPids(&pid_buf)) |pid| {
             if (pid == self or pid <= 0) continue;
@@ -328,7 +330,7 @@ fn reportSwept(n: usize) void {
 /// The handler is not strictly async-signal-safe — it walks /proc — but
 /// it runs once, in a process that is exiting either way.
 fn onFatalSignal(sig: c_int) callconv(.c) void {
-    _ = c.signal(sig, c.SIG_DFL); // never re-enter on a fault inside teardown
+    _ = c.signal(sig, platform.sig_dfl); // never re-enter on a fault inside teardown
     teardown();
     if (g_rt.len > 0) {
         var z: [256:0]u8 = undefined;
@@ -10138,6 +10140,22 @@ fn cursorTrailStage(
     rt: []const u8,
     gui: c.pid_t,
 ) ?[]const u8 {
+    // macOS has no per-process CPU counter this can trust. MEASURED
+    // against a child doing 60 fps-shaped bursts: `ps` (ground truth)
+    // saw 0.10s of CPU over a 2s window while BOTH libproc sources —
+    // PROC_PIDTASKINFO's pti_total_user+system and proc_pid_rusage's
+    // ri_user_time+ri_system_time — reported 0.002s, ~50x under. XNU
+    // accumulates task-level time when a thread deschedules, which is
+    // not the same clock /proc/<pid>/stat keeps. A counter that reads
+    // 2% of reality would make `idle_on > idle_off + 60` unfailable:
+    // the stage would go green while a leaked 60 fps timer ran, which
+    // is worse than no coverage. So it is skipped here, loudly, until
+    // someone lands a Darwin counter verified against ps.
+    if (platform.is_macos) {
+        say("SKIP cursor-trail CPU stage (no trustworthy per-process CPU counter on macOS)");
+        return null;
+    }
+
     var path_buf: [512:0]u8 = undefined;
     const cfg_path = std.fmt.bufPrintZ(&path_buf, "{s}/sketerm/config.conf", .{rt}) catch return "config path";
 
