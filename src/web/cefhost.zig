@@ -11213,20 +11213,32 @@ fn resolveCert(v: *View, proceed: bool) void {
 /// only here.
 fn resolvePerm(p: *PendingPerm, allow: bool) void {
     if (!p.busy()) return;
-    if (p.prompt_cb) |cb| {
+    // TAKE the slot before continuing. `Continue()` can dismiss the
+    // prompt REENTRANTLY — measured on macOS (the first platform where
+    // the engine consults this handler at all): CEF 151 runs
+    // `on_dismiss_permission_prompt` INSIDE the cont call, and a
+    // dismiss that still finds this slot busy releases the callback,
+    // after which the release below was a use-after-free (SIGSEGV at a
+    // wild address, helper gone). With the slot already cleared the
+    // reentrant dismiss finds nothing and this function owns the one
+    // release.
+    const prompt_cb = p.prompt_cb;
+    const media_cb = p.media_cb;
+    const media_bits = p.media_bits;
+    p.* = .{};
+    if (prompt_cb) |cb| {
         if (cb.cont) |f| f(cb, if (allow)
             cef.CEF_PERMISSION_RESULT_ACCEPT
         else
             cef.CEF_PERMISSION_RESULT_DENY);
         release(&cb.base);
     }
-    if (p.media_cb) |cb| {
+    if (media_cb) |cb| {
         // A media callback grants BITS, not a boolean: handing back the
         // ones asked for is an allow, handing back none is a deny.
-        if (cb.cont) |f| f(cb, if (allow) p.media_bits else 0);
+        if (cb.cont) |f| f(cb, if (allow) media_bits else 0);
         release(&cb.base);
     }
-    p.* = .{};
 }
 
 /// Free slot for a new prompt on this view, or null when the view is
@@ -11893,6 +11905,7 @@ pub fn executeProcess(argc: c_int, argv: [*c][*c]u8) ?u8 {
 /// Implemented in `mac_app.m`; see that file for why a helper without
 /// one initializes fine and then never completes a navigation.
 extern fn sketerm_web_init_nsapp() void;
+extern fn sketerm_web_pump_runloop() void;
 
 /// Bring CEF up in windowless mode with a private cache directory.
 pub fn initialize(argc: c_int, argv: [*c][*c]u8, cache_dir: []const u8, log_file: []const u8) bool {
@@ -11913,7 +11926,17 @@ pub fn initialize(argc: c_int, argv: [*c][*c]u8, cache_dir: []const u8, log_file
     // MIGHT be transparent. Opaque is also what the face paints (it
     // composites over white).
     settings.background_color = 0xffffffff;
-    settings.log_severity = cef.LOGSEVERITY_WARNING;
+    // WARNING writes nothing when nothing warns, which made the first
+    // macOS load stall undiagnosable: the hardcoded value also beats
+    // any --log-severity on the command line. SKETERM_WEB_LOG=verbose
+    // is the debug tap (pair it with --v=1 in the argv for VLOGs).
+    settings.log_severity = blk: {
+        const e = c.getenv("SKETERM_WEB_LOG") orelse break :blk cef.LOGSEVERITY_WARNING;
+        const v = std.mem.span(e);
+        if (std.mem.eql(u8, v, "verbose")) break :blk cef.LOGSEVERITY_VERBOSE;
+        if (std.mem.eql(u8, v, "info")) break :blk cef.LOGSEVERITY_INFO;
+        break :blk cef.LOGSEVERITY_WARNING;
+    };
     setStr(cache_dir, &settings.root_cache_path);
     setStr(log_file, &settings.log_file);
     defer cef.cef_string_utf16_clear(&settings.root_cache_path);
