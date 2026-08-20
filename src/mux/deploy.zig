@@ -514,6 +514,13 @@ test "check and upload run through a real sh with the payload on stdin" {
     // every argument — a login shell has nothing to parse when the
     // remote command is one word), against an isolated $HOME.
     const builtin = @import("builtin");
+    // Linux-gated for a REASON, and NOT because of the /bin/true below:
+    // the fake ssh runs the check script on THIS host, and that script
+    // opens with `case "$(uname -s):$(uname -m)" in Linux:<arch>)`. On a
+    // Mac the guard correctly answers CHECK_UNSUPPORTED, so the test
+    // would FAIL rather than prove anything -- deploy targets Linux
+    // hosts. Do not "fix" this skip by resolving a stand-in binary; the
+    // remote-case guard is what is unsatisfiable here, not the payload.
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const arch: Arch = switch (builtin.cpu.arch) {
         .x86_64 => .x86_64,
