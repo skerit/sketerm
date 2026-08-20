@@ -104,6 +104,12 @@
 #else
 #include <util.h>        /* macOS: openpty/forkpty */
 #include <sys/random.h>  /* macOS: getentropy lives here */
+/* fsserve: the kqueue directory watcher that stands in for inotify.
+ * cimport_core.h hand-declares this ABI because the mux graph has to
+ * stay translatable against Zig's bundled Darwin headers; the GUI set
+ * only ever builds natively against the real SDK (as <util.h> above
+ * already assumes), so take the header and let it define the truth. */
+#include <sys/event.h>
 #endif
 /* Extended attributes (fsserve: user.sketerm.tags file tags).
  * Both glibc/musl and Darwin ship <sys/xattr.h>; the FUNCTIONS
