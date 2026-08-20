@@ -1,17 +1,19 @@
 # The CEF browser helper on macOS
 
-Status: **builds, initializes and serves the wire protocol; page loads
-do not complete yet.** `zig build smoke-web` reaches stage 1 (handshake)
-and fails at stage 2 with `no load-finished after navigate`. Everything
-below stage 2 — the framework, the bundle, the child processes, the
-shared frame buffer — is working and verified on hardware (Apple
-Silicon, macOS 26, CEF 151.3.16).
+Status: **the full `zig build smoke-web` suite passes on macOS —
+exit 0, every stage green** (Apple Silicon, macOS 26, CEF 151.3.16,
+verified 2026-08-20, including an eyeballed screenshot of a real
+rendered page). The one known red is `zig build test-web`: the unit
+test binary links the framework directly and dyld cannot resolve
+`@executable_path/../Frameworks/…` from `.zig-cache/o/<hash>/test` —
+the fix is staging (or symlinking) the framework next to the test
+binary in build.zig, and it has never worked on macOS.
 
 Read `src/web/CLAUDE.md` first. This file is only what differs here.
 
 ## What the platform actually requires
 
-Four things, each established by a specific failure rather than from
+Six things, each established by a specific failure rather than from
 documentation:
 
 1. **A different distribution.** macOS ships
@@ -23,7 +25,31 @@ documentation:
    ever run on an Intel Mac, and an unverified pin is worse than an
    honest refusal.
 
-2. **A `uchar.h` shim to translate the headers.** CEF's
+2. **A separate helper `.app` VARIANT per child type.** Chromium on
+   macOS launches a renderer from "<name> Helper (Renderer).app", not
+   from the plain "<name> Helper.app" that serves GPU/network/utility
+   children (look inside any Chrome or Electron bundle). With only the
+   plain helper present, every RENDERER launch fails with
+   `error_code=1003` (TS_LAUNCH_FAILED), every navigation dies
+   pre-commit as ERR_ABORTED, and no page ever reports loading — while
+   GPU and network children run, so the process tree looks healthy.
+   That was the original "no load-finished after navigate" stall.
+   `dist/macos-bundle.sh` ships the full standard set: Helper, (GPU),
+   (Renderer), (Plugin), (Alerts).
+
+3. **A mock keychain.** Chromium's cookie store encrypts at rest with
+   a key from the Keychain ("Chrome Safe Storage"). For this helper —
+   headless, ad-hoc-signed, re-identified every dev build — the
+   SecKeychain call simply never returns: no prompt, no error, the
+   cookie store never initializes (no `Default/Cookies` file ever
+   appears), and CEF then holds EVERY http(s) request on its cookie
+   load (`MaybeLoadCookies` in the interception wrapper — data: URLs
+   skip cookies, which is why only network URLs hung). `buildCefArgv`
+   appends `--use-mock-keychain` on macOS. Diagnosed with a netlog
+   (only a speculative preconnect ever reached the network service)
+   plus a client cookie enumeration that never answered.
+
+4. **A `uchar.h` shim to translate the headers.** CEF's
    `cef_string_types.h` guards `#include <uchar.h>` behind
    `#ifdef __clang__` + `__has_include`, precisely because the header
    only exists with Xcode 14.3+. Zig's translate-c (Aro) does not
@@ -32,7 +58,7 @@ documentation:
    the two typedefs CEF uses, on the CEF translation's include path
    only.
 
-3. **An app bundle. This is not packaging — it is a hard runtime
+5. **An app bundle. This is not packaging — it is a hard runtime
    requirement.** The loose `zig-out/bin/sketerm-webengine` CANNOT run:
    Chromium resolves `icudtl.dat` through the framework BUNDLE, which
    it can only locate from a bundled main executable, so an unbundled
@@ -41,7 +67,7 @@ documentation:
    `zig-out/sketerm-webengine.app`, assembled by `dist/macos-bundle.sh`
    as part of `zig build web`.
 
-4. **A separate helper `.app` for child processes.** macOS will not let
+6. **A helper `.app` for child processes at all.** macOS will not let
    CEF launch renderer/GPU/network children by re-executing the browser
    binary the way Linux does; you get
    `GPU process launch failed: error_code=1003` on a loop and then a
@@ -122,50 +148,83 @@ the more conventional one and would remove the `install_name_tool` step.
   its frame buffer stayed empty. `size == 0` now means
   "create, do not size".
 
-## The open failure
+## The load stall, and the run-loop findings under it (resolved 2026-08-20)
 
-`smoke-web` stage 2, `no load-finished after navigate`. What is known:
+"No load-finished after navigate" was TWO stacked bugs, and chasing
+them produced a measured map of how the CEF message pump behaves under
+our poll loop. All of it was measured on this hardware; keep the map,
+because every wrong turn below is one someone will propose again.
 
-- The handshake completes, so the socket, framing and capability
-  negotiation all work.
-- The browser is created and its frame buffer is allocated and
-  announced (stage 2 gets past `waitBufferAfter`).
-- All child processes spawn and stay up: GPU, network, storage, utility
-  and a renderer. No crash reports are generated, and the helper does
-  not exit — it simply never reports the load finishing.
+The two actual bugs:
 
-What has been ruled out:
+1. **No renderer could ever launch** — the missing
+   "Helper (Renderer).app" variant (requirement 2 above). Every
+   navigation died pre-commit with ERR_ABORTED; `on_loading_state_change`
+   still fired 1→0, which is why it looked like a load that "completed
+   without finishing". Diagnosed by `on_render_process_terminated`
+   status 4 (TS_LAUNCH_FAILED) code 1003, and by `ps` never showing a
+   `--type=renderer` child.
+2. **The cookie store could never initialize** — the Keychain wedge
+   (requirement 3 above). With renderers fixed, every data: URL worked
+   and every http(s) URL hung: CEF holds each request on a cookie load
+   whose backing store was waiting forever on `SecKeychain*`.
+   Diagnosed by a netlog that showed only a speculative preconnect, a
+   `visit_url_cookies` enumeration that never answered, and the absence
+   of any `Default/Cookies` file.
 
-- **Not** the missing `NSApplication`. `src/web/mac_app.m` adds one
-  implementing `CefAppProtocol` (CEF contract for any macOS embedder,
-  so it is kept), and the stall is **unchanged** with and without it.
-- **Not** the shm sizing bug above — that was a different, earlier
-  failure (the helper closed the socket) and is fixed.
+The pump-flavor matrix (measured, in case anyone proposes changing it):
 
-Next things to try, in order:
+- **Default NSApp pump + honest `[NSApp isRunning]`** — what ships.
+  While the cookie wedge existed, a nested `base::RunLoop` bootstrapped
+  `[NSApp run]` and the helper froze (main thread parked in
+  `-[NSApplication run]`, captured in a `sample` stack). With the real
+  bugs fixed there is nothing left to wedge on, and this flavor passes
+  the whole suite including the `view_max_fps` pacing stage.
+- **Overriding `isRunning` to YES** — routes every UI-thread run loop
+  through the pull-events branch of `MessagePumpNSApplication::DoRun`.
+  Loads unaffected, but `view_max_fps 30` measured ~10 paints/s
+  (UI-thread delayed tasks themselves ticked a clean 33ms — the loss is
+  in the capture pipeline). Do not re-add it.
+- **`external_message_pump = 1`** — CEF's MessagePumpExternal
+  TIME-SLICES nested runs (10ms, `Quit()` is a no-op), and the same
+  network loads stalled again. Also breaks the pacing cap the same way.
+  Do not flip it on as a "fix".
 
-1. Get CEF's own log out of the rig. `LOGSEVERITY_WARNING` produces no
-   file when nothing warns, and the rig `rm -rf`s its temp dir through
-   `/bin/rm` on failure, so the usual tricks do not survive. Run the
-   bundled helper by hand with `--enable-logging --v=1` and a cache dir
-   you control, and drive it with a minimal client.
-2. Check whether the renderer ever commits a document — a Chromium
-   renderer that starts but cannot host a frame would look exactly like
-   this from outside.
-3. Compare against a windowed (non-OSR) browser on the same helper: if
-   a windowed load finishes, the problem is in the OSR path
-   specifically rather than in navigation.
-4. Only after the above: revisit `external_message_pump`. It is
-   deliberately 0 and the entire "no lock, no atomic, no queue" threading
-   invariant in `cefhost.zig` rests on that, so changing it is a design
-   change, not a fix to try casually.
+Two changes from that investigation DID ship:
+
+- **The CFRunLoop lifeline timer** (`sketerm_web_add_iterate_timer` in
+  `mac_app.m`, registered by `server.run` on macOS): one NON-BLOCKING
+  server iteration per 5ms, on the MAIN run loop in common modes, with
+  a re-entrancy guard (`Server.in_step`). While the poll loop runs it
+  is a cheap duplicate; if any future nested loop swallows the thread
+  the way the cookie wedge did, the helper keeps serving its socket
+  instead of freezing. Same thread always — the single-threaded
+  invariant holds.
+- **`SKETERM_WEB_LOG=verbose|info`** raises `settings.log_severity`
+  (which otherwise beats any `--log-severity` on the command line);
+  pair with `--v=1` for VLOGs. This is the tap that made every
+  diagnosis above possible.
+
+Two macOS-only behaviours surfaced once loads worked:
+
+- **Permission prompts REACH the client here.** On Linux the alloy
+  windowless browser denies internally and `on_show_permission_prompt`
+  never runs; on macOS it runs, so smoke-web stage 22g is a real
+  allow/deny round trip on this platform (and still the
+  engine-denies pin on Linux). The handler had a latent use-after-free
+  ONLY reachable here: `Continue()` dismisses the prompt REENTRANTLY
+  (`on_dismiss_permission_prompt` runs inside the cont call), so
+  `resolvePerm` now takes the slot before continuing and owns the one
+  release.
+- **`ev_permission` for geolocation arrives without any OS location
+  service involvement** — the deny path is fully client-controlled.
 
 ## Building it
 
 ```bash
 zig build fetch-cef      # macosarm64 minimal tarball, checksum-pinned
 zig build web            # -> zig-out/sketerm-webengine.app
-zig build smoke-web      # drives the .app (stage 2 fails, see above)
+zig build smoke-web      # drives the .app (all stages pass)
 ```
 
 `dist/macos-bundle.sh <out> <exe> <cef-release-dir> [--copy]` builds the
