@@ -134,6 +134,14 @@ fn reap(pid: c.pid_t, sig: c_int, grace_ms: u32) void {
 /// not `daemon_pid`) — so it and every session worker it forks outlive
 /// the harness. `sweepRuntimeDir` is the fence that makes "everything
 /// this run started is gone" true regardless of who started it.
+///
+/// That fence is why this rig leaked on macOS for so long: it, and the
+/// startup sweep, were both `if (os != .linux) return`, so on Darwin
+/// NOTHING caught the autostarted daemon and every run left one wedged
+/// behind. `platform.listPids`/`environOfPid` give both sweeps a real
+/// Darwin implementation. Note that `platform.dieWithParent` is still a
+/// no-op there and cannot be otherwise (see its doc comment) — the
+/// sweeps, not PDEATHSIG, are what hold on macOS.
 fn teardown() void {
     dkTeardown();
     themeTeardown();
@@ -223,24 +231,6 @@ fn pidGone(pid: c.pid_t) bool {
     return std.posix.errno(rc) == .SRCH;
 }
 
-/// Read `/proc/<pid>/environ` into `buf`. Null when it is unreadable —
-/// a process we cannot read cannot be ours, so it is never a target.
-fn readEnviron(pid: c.pid_t, buf: []u8) ?[]u8 {
-    var path_buf: [64:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/environ", .{pid}) catch return null;
-    const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC);
-    if (fd < 0) return null;
-    defer _ = c.close(fd);
-    var used: usize = 0;
-    while (used < buf.len) {
-        const n = c.read(fd, buf.ptr + used, buf.len - used);
-        if (n <= 0) break;
-        used += @intCast(n);
-    }
-    if (used == 0) return null;
-    return buf[0..used];
-}
-
 /// Kill, BY EXACT PID, every live process whose environment names `dir`
 /// — the isolated runtime dir of one smoke-e2e run. Nothing is ever
 /// matched by process NAME: `dir` embeds the owning harness's pid, so a
@@ -250,24 +240,20 @@ fn readEnviron(pid: c.pid_t, buf: []u8) ?[]u8 {
 /// Two rounds, because killing a broker can let a worker fork one more
 /// child before it dies. Returns how many processes were killed.
 fn sweepRuntimeDir(dir: []const u8) usize {
-    if (builtin.os.tag != .linux) return 0;
     const self = c.getpid();
     var killed: usize = 0;
     var round: usize = 0;
     while (round < 3) : (round += 1) {
         var hits: usize = 0;
-        const d = c.opendir("/proc") orelse return killed;
-        while (c.readdir(d)) |ent| {
-            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
-            const pid = std.fmt.parseInt(c.pid_t, name, 10) catch continue;
-            if (pid == self) continue;
+        var pid_buf: [16384]c.pid_t = undefined;
+        for (platform.listPids(&pid_buf)) |pid| {
+            if (pid == self or pid <= 0) continue;
             var env_buf: [64 * 1024]u8 = undefined;
-            const env = readEnviron(pid, &env_buf) orelse continue;
+            const env = platform.environOfPid(pid, &env_buf) orelse continue;
             if (!hasPathToken(env, dir)) continue;
             _ = c.kill(pid, c.SIGKILL);
             hits += 1;
         }
-        _ = c.closedir(d);
         killed += hits;
         if (hits == 0) break;
         // Give the kernel a moment to deliver, then look again: a
@@ -291,17 +277,13 @@ fn sweepRuntimeDir(dir: []const u8) usize {
 /// running. A leftover is only swept when its OWNING harness pid is
 /// gone, so two concurrent smoke-e2e runs never touch each other.
 fn sweepStaleRuns() void {
-    if (builtin.os.tag != .linux) return;
     const self = c.getpid();
-    const d = c.opendir("/proc") orelse return;
-    defer _ = c.closedir(d);
     var swept: usize = 0;
-    while (c.readdir(d)) |ent| {
-        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
-        const pid = std.fmt.parseInt(c.pid_t, name, 10) catch continue;
-        if (pid == self) continue;
+    var pid_buf: [16384]c.pid_t = undefined;
+    for (platform.listPids(&pid_buf)) |pid| {
+        if (pid == self or pid <= 0) continue;
         var env_buf: [64 * 1024]u8 = undefined;
-        const env = readEnviron(pid, &env_buf) orelse continue;
+        const env = platform.environOfPid(pid, &env_buf) orelse continue;
         const at = std.mem.indexOf(u8, env, RT_PREFIX) orelse continue;
         var end = at + RT_PREFIX.len;
         while (end < env.len and std.ascii.isDigit(env[end])) end += 1;
@@ -406,16 +388,6 @@ fn failMsg(msg: []const u8) u8 {
     _ = c.fprintf(platform.stderr(), "smoke-e2e: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
     teardown();
     return 1;
-}
-
-/// Die with the harness. `teardown` covers every ordinary exit, but a
-/// SIGKILLed harness would otherwise orphan a daemon and a GUI holding
-/// an isolated runtime dir — and nothing may ever kill those by name.
-/// Linux-only (`prctl(PR_SET_PDEATHSIG)`), called in the forked child.
-fn dieWithParent() void {
-    if (builtin.os.tag != .linux) return;
-    const PR_SET_PDEATHSIG: c_long = 1;
-    _ = c.syscall(@intFromEnum(std.os.linux.SYS.prctl), PR_SET_PDEATHSIG, @as(c_long, c.SIGKILL));
 }
 
 /// Progress line (the stages are slow; a silent run is unreadable).
@@ -538,7 +510,7 @@ pub fn main() u8 {
     const mux_pid = c.fork();
     if (mux_pid < 0) return fail("mux fork");
     if (mux_pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
         _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -624,7 +596,7 @@ pub fn main() u8 {
             return fail("remote mux fork");
         }
         if (rmt_pid == 0) {
-            dieWithParent();
+            platform.dieWithParent();
             for (0..5) |i| {
                 if (c.dup2(asset_fd, REMOTE_PANEL_ASSET_FD + @as(c_int, @intCast(i))) < 0) c._exit(126);
             }
@@ -678,7 +650,7 @@ pub fn main() u8 {
     const pid = c.fork();
     if (pid < 0) return fail("fork");
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e", 1);
         if (have_wl) {
             // The ONLY display this child can reach is sketerm's own
@@ -3448,7 +3420,7 @@ fn restoreStage(
     const pid = c.fork();
     if (pid < 0) return "fork for the restore GUI failed";
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e.restore", 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
@@ -3789,7 +3761,7 @@ fn viewerMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const
     const pid = c.fork();
     if (pid < 0) return "fork for the viewer failed";
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         // Its own app id: `sketerm view` registers a viewer identity,
         // and it must not join the terminal instance already running.
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2eview", 1);
@@ -3988,7 +3960,7 @@ fn castPlaybackStage(
     const pid = c.fork();
     if (pid < 0) return "fork for sketerm play failed";
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         // Its own app id: it must not join the terminal instance
         // already running in this display session.
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2ecast", 1);
@@ -4331,7 +4303,7 @@ fn viewerCastStage(
     const pid = c.fork();
     if (pid < 0) return "fork for the viewer failed";
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         // Its own app id: it must not join any instance already
         // running in this display session.
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2evcast", 1);
@@ -4580,7 +4552,7 @@ fn launchRenameFiles(
     const pid = c.fork();
     if (pid < 0) return null;
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         _ = c.setenv("SKETERM_APP_ID", app_id.ptr, 1);
         if (verify_scope.len > 0)
             _ = c.setenv("SKETERM_VERIFY_INLINE_RENAME_TEARDOWN", verify_scope.ptr, 1)
@@ -4859,7 +4831,7 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
     const pid = c.fork();
     if (pid < 0) return "fork for the files window failed";
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         // Its own app id (files mode appends its .files suffix), so it
         // never joins the terminal instance in this session.
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2eql", 1);
@@ -6701,7 +6673,7 @@ const McpChild = struct {
         const pid = c.fork();
         if (pid < 0) return null;
         if (pid == 0) {
-            dieWithParent();
+            platform.dieWithParent();
             _ = c.dup2(in_pipe[0], 0);
             _ = c.dup2(out_pipe[1], 1);
             _ = c.close(in_pipe[0]);
@@ -8454,7 +8426,7 @@ fn themeSingletonStage(
     const pid = c.fork();
     if (pid < 0) return "fork for the theme GUI failed";
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e.theme", 1);
         _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
@@ -9944,7 +9916,7 @@ fn deadKeyStage(allocator: std.mem.Allocator, rt: []const u8, mux_sock: []const 
     const pid = c.fork();
     if (pid < 0) return "fork for the Belgian GUI failed";
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e.deadkey", 1);
         _ = c.setenv("WAYLAND_DISPLAY", &wl_z, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);

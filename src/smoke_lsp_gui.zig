@@ -111,11 +111,6 @@ fn fail(comptime fmt: []const u8, args: anytype) u8 {
     return 1;
 }
 
-fn dieWithParent() void {
-    if (builtin.os.tag != .linux) return;
-    const PR_SET_PDEATHSIG: c_long = 1;
-    _ = c.syscall(@intFromEnum(std.os.linux.SYS.prctl), PR_SET_PDEATHSIG, @as(c_long, c.SIGKILL));
-}
 
 const CliResult = struct { code: u8, out: []u8 };
 
@@ -608,7 +603,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     const mux_pid = c.fork();
     if (mux_pid < 0) return fail("mux fork", .{});
     if (mux_pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
         _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -641,7 +636,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         const rmt_pid = c.fork();
         if (rmt_pid < 0) return fail("remote mux fork", .{});
         if (rmt_pid == 0) {
-            dieWithParent();
+            platform.dieWithParent();
             _ = c.setenv("XDG_RUNTIME_DIR", rrt.ptr, 1);
             _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
             _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
@@ -715,7 +710,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     const pid = c.fork();
     if (pid < 0) return fail("fork", .{});
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.lspsmoke", 1);
         _ = c.setenv("WAYLAND_DISPLAY", &wl_z, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);

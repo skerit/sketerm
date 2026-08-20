@@ -32,11 +32,6 @@ var g_alloc: std.mem.Allocator = undefined;
 var g_mux_sock: []const u8 = "";
 var display_ready = false;
 
-fn dieWithParent() void {
-    if (builtin.os.tag != .linux) return;
-    const PR_SET_PDEATHSIG: c_long = 1;
-    _ = c.syscall(@intFromEnum(std.os.linux.SYS.prctl), PR_SET_PDEATHSIG, @as(c_long, c.SIGKILL));
-}
 
 fn reap(pid: c.pid_t, sig: c_int, grace_ms: u32) void {
     if (pid <= 0) return;
@@ -160,7 +155,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const mux_pid = c.fork();
     if (mux_pid < 0) return fail("mux fork");
     if (mux_pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         const margv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", "--broker", null };
         _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&margv)));
         c._exit(127);
@@ -198,7 +193,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const pid = c.fork();
     if (pid < 0) return fail("gui fork");
     if (pid == 0) {
-        dieWithParent();
+        platform.dieWithParent();
         _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.webmeasure", 1);
         _ = c.setenv("WAYLAND_DISPLAY", &wl_z, 1);
         _ = c.setenv("GDK_BACKEND", "wayland", 1);
