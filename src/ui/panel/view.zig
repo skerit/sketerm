@@ -1582,6 +1582,8 @@ test "classMask maps names to Doc.CLASSES bit positions" {
 }
 
 test "a poisoned PanelView makes the face trampolines bail" {
+    canary.expected_by_test = true;
+    defer canary.expected_by_test = false;
     // No GTK: prepareDestroyCb only touches plain fields, and the
     // poisoned call must not even get that far.
     var view = PanelView{
@@ -1606,6 +1608,8 @@ test "a poisoned PanelView makes the face trampolines bail" {
 }
 
 test "a poisoned CompCtx makes freeCompCtx bail instead of double-freeing" {
+    canary.expected_by_test = true;
+    defer canary.expected_by_test = false;
     const a = std.testing.allocator;
     const ctx = try a.create(PanelView.CompCtx);
     ctx.* = .{ .allocator = a, .view = null, .id = try a.dupe(u8, "btn") };

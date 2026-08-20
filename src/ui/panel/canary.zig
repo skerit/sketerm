@@ -33,6 +33,15 @@ const std = @import("std");
 /// a plausible pointer, length or ASCII run.
 pub const DEAD: u32 = 0xDEADFACE;
 
+/// True only while a test is DELIBERATELY poisoning a context to
+/// prove the guard fires. It suppresses the stderr line alone —
+/// `trips` still counts and the tests assert on it — so a green
+/// `zig build test` run prints zero "canary tripped" lines. Before
+/// this flag, the ten expected test trips were indistinguishable
+/// from a live use-after-free and got investigated as one
+/// (2026-08-20). Production code must never set it.
+pub var expected_by_test: bool = false;
+
 /// How many stale contexts have been caught this process. Bumped only
 /// from the GTK main thread (every guarded callback is a GTK
 /// callback), so a plain global is enough; tests read it to prove the
@@ -71,6 +80,7 @@ pub fn poison(p: anytype) void {
 
 fn trip(name: []const u8, got: u32) void {
     trips +%= 1;
+    if (expected_by_test) return;
     std.debug.print(
         "sketerm: panel canary tripped: stale {s} context (magic 0x{X:0>8}) — callback bailed. " ++
             "Its owner freed it while a widget still had it as signal user-data.\n",
@@ -87,6 +97,8 @@ const Probe = struct {
 };
 
 test "live() accepts a live context and rejects a poisoned one" {
+    expected_by_test = true;
+    defer expected_by_test = false;
     var p = Probe{};
     const before = trips;
     try std.testing.expect(live(Probe, @ptrCast(&p)) == &p);
@@ -105,6 +117,8 @@ test "live() rejects null user-data without counting a trip" {
 }
 
 test "alive() mirrors live() for typed pointers" {
+    expected_by_test = true;
+    defer expected_by_test = false;
     var p = Probe{};
     try std.testing.expect(alive(&p));
     poison(&p);
@@ -112,6 +126,8 @@ test "alive() mirrors live() for typed pointers" {
 }
 
 test "a garbage magic word is caught too" {
+    expected_by_test = true;
+    defer expected_by_test = false;
     // The realistic case: the block was reused and overwritten by
     // something unrelated, so it is neither MAGIC nor DEAD.
     var p = Probe{};

@@ -757,6 +757,8 @@ fn freeCtx(user: ?*anyopaque) callconv(.c) void {
 }
 
 test "a poisoned picker Ctx makes freeCtx bail instead of double-freeing" {
+    canary.expected_by_test = true;
+    defer canary.expected_by_test = false;
     const a = std.testing.allocator;
     const ctx = try a.create(Ctx);
     ctx.* = .{
@@ -787,6 +789,8 @@ test "a poisoned picker Ctx makes freeCtx bail instead of double-freeing" {
 }
 
 test "a poisoned DeleteCtx is not destroyed twice" {
+    canary.expected_by_test = true;
+    defer canary.expected_by_test = false;
     const a = std.testing.allocator;
     var dctx = DeleteCtx{
         .allocator = a,
@@ -807,6 +811,8 @@ test "delete dialog context retains no raw Window across choose" {
 }
 
 test "async delete response after owner teardown touches no GTK state" {
+    canary.expected_by_test = true;
+    defer canary.expected_by_test = false;
     var dctx = DeleteCtx{
         .allocator = std.testing.allocator,
         .handle = undefined,

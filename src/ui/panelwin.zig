@@ -135,6 +135,8 @@ pub const PanelWindow = struct {
 };
 
 test "a poisoned PanelWindow makes finalize bail instead of double-freeing" {
+    canary.expected_by_test = true;
+    defer canary.expected_by_test = false;
     const a = std.testing.allocator;
     const self = try a.create(PanelWindow);
     // `view` and `window` are never reached: the guard is the first
@@ -150,6 +152,8 @@ test "a poisoned PanelWindow makes finalize bail instead of double-freeing" {
 }
 
 test "a poisoned PanelWindow does not run the ::destroy handler" {
+    canary.expected_by_test = true;
+    defer canary.expected_by_test = false;
     var self = PanelWindow{ .allocator = std.testing.allocator, .window = undefined, .view = undefined };
     canary.poison(&self);
     const before = canary.trips;
