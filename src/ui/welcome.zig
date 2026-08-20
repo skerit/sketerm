@@ -590,10 +590,8 @@ pub fn open(window: *Window) void {
 
 /// Startup hook: show the tour the first time this user runs sketerm.
 ///
-/// Reopening it later needs `SKETERM_WELCOME=1` today. A palette
-/// action would be the better door, but the action vocabulary lives in
-/// `ui/action.zig` + `ui/input.zig` + `ui/commandcat.zig` + the menus,
-/// none of which this change owns.
+/// Reopening it later goes through the `welcome_open` action (palette
+/// "Welcome Tour", window menu) or `SKETERM_WELCOME=1`.
 pub fn openIfFirstRun(window: *Window) void {
     if (!shouldShow()) return;
     open(window);
