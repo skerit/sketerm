@@ -1793,10 +1793,26 @@ pub const Window = struct {
             logActionError("browser action-exec", err);
     }
 
+    /// Open a path with the HOST's desktop opener. Which opener that is
+    /// can only be decided on the host: `host` may be a Mac (`open`) or
+    /// a Linux box (`xdg-open`), and so may this machine, so the choice
+    /// cannot be made from our own `builtin.os.tag`. Hardcoding
+    /// `xdg-open` made this menu item do nothing at all, silently,
+    /// against every macOS host including localhost.
+    ///
+    /// The last branch exists so a host with NEITHER opener says so on
+    /// stderr and exits non-zero, rather than looking like a success.
+    const host_open_sh =
+        \\if command -v xdg-open >/dev/null 2>&1; then exec xdg-open "$1"; fi
+        \\if command -v open >/dev/null 2>&1; then exec open "$1"; fi
+        \\echo "sketerm: no xdg-open or open on this host" >&2
+        \\exit 127
+    ;
+
     fn browserHostOpenCb(ctx: *anyopaque, host: []const u8, path: []const u8) void {
         const self: *Window = @ptrCast(@alignCast(ctx));
         const h: ?[]const u8 = if (host.len > 0) host else null;
-        const argv = [_][]const u8{ "xdg-open", path };
+        const argv = [_][]const u8{ "/bin/sh", "-c", host_open_sh, "sketerm-open", path };
         self.launchRemoteAppSession(h, &argv, false) catch |err|
             logActionError("browser open-on-host", err);
     }
