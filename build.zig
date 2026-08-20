@@ -1029,11 +1029,18 @@ pub fn build(b: *std.Build) void {
         .target = b.graph.host,
         .optimize = .Debug,
     });
+    // Same trade as `test_llvm` above, but this helper is built for the
+    // HOST, so it is the host that must support the self-hosted backend
+    // — not the target. On aarch64-macOS `-fno-llvm` dies with SIGKILL,
+    // which reds out `test`, `test-core` and `test-web` before a single
+    // test runs.
+    const lint_self_hosted = b.graph.host.result.os.tag == .linux and
+        b.graph.host.result.cpu.arch == .x86_64;
     const lint_errdefer_exe = b.addExecutable(.{
         .name = "sketerm-lint-errdefer",
         .root_module = lint_errdefer_mod,
-        .use_llvm = false,
-        .use_lld = false,
+        .use_llvm = !lint_self_hosted,
+        .use_lld = if (lint_self_hosted) false else b.graph.host.result.os.tag == .linux,
     });
     const lint_errdefer_self = b.addRunArtifact(lint_errdefer_exe);
     lint_errdefer_self.addArg("--self-check");
