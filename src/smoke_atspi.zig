@@ -34,8 +34,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
-const display_cli = @import("mux/display.zig");
 const appdrive = @import("ipc/appdrive.zig");
+const ctlsock = @import("smoke/ctlsock.zig");
 const A11yHub = @import("mux/a11yhub.zig").Hub;
 
 const DISPLAY_SESSION = "a11y-display";
@@ -94,39 +94,10 @@ fn say(msg: []const u8) void {
 }
 
 
-const CliResult = struct { code: u8, out: []u8 };
-
-/// Run the real `sketerm-mux display` CLI in-process, stdout captured.
-fn runDisplayCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResult {
-    var pfds: [2]c_int = undefined;
-    if (c.pipe(&pfds) != 0) return .{ .code = 1, .out = allocator.dupe(u8, "") catch &.{} };
-    const saved = c.dup(1);
-    _ = c.dup2(pfds[1], 1);
-    _ = c.close(pfds[1]);
-    const code = display_cli.run(allocator, argv);
-    _ = c.fflush(platform.stdout());
-    _ = c.dup2(saved, 1);
-    _ = c.close(saved);
-    var out: std.ArrayList(u8) = .empty;
-    while (true) {
-        var buf: [4096]u8 = undefined;
-        const n = c.read(pfds[0], &buf, buf.len);
-        if (n <= 0) break;
-        out.appendSlice(allocator, buf[0..@intCast(n)]) catch break;
-    }
-    _ = c.close(pfds[0]);
-    return .{ .code = code, .out = out.toOwnedSlice(allocator) catch &.{} };
-}
-
-const CreateReply = struct {
-    session: []const u8 = "",
-    environment: struct {
-        WAYLAND_DISPLAY: []const u8 = "",
-        XDG_RUNTIME_DIR: []const u8 = "",
-        PULSE_SERVER: []const u8 = "",
-        LIBGL_ALWAYS_SOFTWARE: []const u8 = "",
-    } = .{},
-};
+const smokecli = @import("smoke/displaycli.zig");
+const CliResult = smokecli.CliResult;
+const CreateReply = smokecli.CreateReply;
+const runDisplayCli = smokecli.runDisplayCli;
 
 /// The bus/registry binaries this smoke depends on. Absent = SKIP, not
 /// FAIL: a11y infrastructure is an optional install on minimal hosts.
@@ -1366,38 +1337,10 @@ fn awaitText(allocator: std.mem.Allocator, id: []const u8, want: []const u8, car
     return "the editor's Text/CaretOffset never matched what was typed";
 }
 
-/// One connect → one request line → one response line on the GUI's
-/// control socket. Pumps the display viewer first (this process is the
-/// compositor brain; starving it stalls the GUI's frame handling).
+/// One connect -> one request line -> one response line on the GUI's
+/// control socket, pumping the display viewer first.
 fn roundtrip(allocator: std.mem.Allocator, sock_path: [:0]const u8, line: []const u8) ?[]u8 {
-    if (drive) |app| app.drain();
-    const client = c.g_socket_client_new();
-    defer c.g_object_unref(client);
-    const addr = c.g_unix_socket_address_new(sock_path.ptr);
-    defer c.g_object_unref(addr);
-    var gerr: [*c]c.GError = null;
-    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
-    if (conn == null) {
-        if (gerr != null) c.g_error_free(gerr);
-        return null;
-    }
-    defer c.g_object_unref(conn);
-    const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
-    var written: c.gsize = 0;
-    if (c.g_output_stream_write_all(out_stream, line.ptr, line.len, &written, null, &gerr) == 0) {
-        if (gerr != null) c.g_error_free(gerr);
-        return null;
-    }
-    const din = c.g_data_input_stream_new(c.g_io_stream_get_input_stream(@ptrCast(conn)));
-    defer c.g_object_unref(din);
-    var rlen: c.gsize = 0;
-    const resp = c.g_data_input_stream_read_line(din, &rlen, null, &gerr);
-    if (resp == null) {
-        if (gerr != null) c.g_error_free(gerr);
-        return null;
-    }
-    defer c.g_free(resp);
-    return allocator.dupe(u8, resp[0..rlen]) catch null;
+    return ctlsock.roundtrip(allocator, drive, sock_path, line);
 }
 
 // ======================================================================

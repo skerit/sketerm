@@ -20,7 +20,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
-const display_cli = @import("mux/display.zig");
 const appdrive = @import("ipc/appdrive.zig");
 
 const SESSION = "web-measure";
@@ -72,38 +71,10 @@ fn fail(msg: []const u8) u8 {
     return 1;
 }
 
-const CliResult = struct { code: u8, out: []u8 };
-
-fn runDisplayCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResult {
-    var pfds: [2]c_int = undefined;
-    if (c.pipe(&pfds) != 0) return .{ .code = 1, .out = allocator.dupe(u8, "") catch &.{} };
-    const saved = c.dup(1);
-    _ = c.dup2(pfds[1], 1);
-    _ = c.close(pfds[1]);
-    const code = display_cli.run(allocator, argv);
-    _ = c.fflush(platform.stdout());
-    _ = c.dup2(saved, 1);
-    _ = c.close(saved);
-    var out: std.ArrayList(u8) = .empty;
-    while (true) {
-        var buf: [4096]u8 = undefined;
-        const n = c.read(pfds[0], &buf, buf.len);
-        if (n <= 0) break;
-        out.appendSlice(allocator, buf[0..@intCast(n)]) catch break;
-    }
-    _ = c.close(pfds[0]);
-    return .{ .code = code, .out = out.toOwnedSlice(allocator) catch &.{} };
-}
-
-const CreateReply = struct {
-    session: []const u8 = "",
-    environment: struct {
-        WAYLAND_DISPLAY: []const u8 = "",
-        XDG_RUNTIME_DIR: []const u8 = "",
-        PULSE_SERVER: []const u8 = "",
-        LIBGL_ALWAYS_SOFTWARE: []const u8 = "",
-    } = .{},
-};
+const smokecli = @import("smoke/displaycli.zig");
+const CliResult = smokecli.CliResult;
+const CreateReply = smokecli.CreateReply;
+const runDisplayCli = smokecli.runDisplayCli;
 
 pub fn main(init: std.process.Init.Minimal) u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};

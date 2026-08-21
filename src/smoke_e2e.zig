@@ -26,8 +26,8 @@ const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
 const protocol = @import("ipc/protocol.zig");
 const version = @import("version.zig");
-const display_cli = @import("mux/display.zig");
 const appdrive = @import("ipc/appdrive.zig");
+const ctlsock = @import("smoke/ctlsock.zig");
 const muxclient = @import("mux/client.zig");
 const muxwire = @import("mux/wire.zig");
 const panel_assets = @import("ui/panel/assets.zig");
@@ -398,71 +398,24 @@ fn say(msg: []const u8) void {
     _ = c.fflush(platform.stdout());
 }
 
-const CliResult = struct { code: u8, out: []u8 };
-
-/// Run the real `sketerm-mux display` CLI in-process with stdout
-/// captured — the harness parses exactly the bytes an external caller
-/// would, instead of re-deriving socket paths (which CLAUDE.md forbids:
-/// `wl-*` naming differs between monolith and broker mode).
-fn runDisplayCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResult {
-    var pfds: [2]c_int = undefined;
-    if (c.pipe(&pfds) != 0) return .{ .code = 1, .out = allocator.dupe(u8, "") catch &.{} };
-    const saved = c.dup(1);
-    _ = c.dup2(pfds[1], 1);
-    _ = c.close(pfds[1]);
-    const code = display_cli.run(allocator, argv);
-    _ = c.fflush(platform.stdout());
-    _ = c.dup2(saved, 1);
-    _ = c.close(saved);
-
-    var out: std.ArrayList(u8) = .empty;
-    while (true) {
-        var buf: [4096]u8 = undefined;
-        const n = c.read(pfds[0], &buf, buf.len);
-        if (n <= 0) break;
-        out.appendSlice(allocator, buf[0..@intCast(n)]) catch break;
-    }
-    _ = c.close(pfds[0]);
-    return .{ .code = code, .out = out.toOwnedSlice(allocator) catch &.{} };
-}
+const smokecli = @import("smoke/displaycli.zig");
+const CliResult = smokecli.CliResult;
+const CreateReply = smokecli.CreateReply;
+const runDisplayCli = smokecli.runDisplayCli;
 
 /// Run the real `sketerm cli` in-process with stdout captured — the
 /// same bytes a shell would see. The CLI leaks its request payloads on
 /// purpose (the real process exits right after), so it runs against an
-/// arena the caller drops.
+/// arena the caller drops. Not in the shared harness: this rig is the
+/// only one that drives the client entry point.
 fn runCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResult {
-    var pfds: [2]c_int = undefined;
-    if (c.pipe(&pfds) != 0) return .{ .code = 1, .out = allocator.dupe(u8, "") catch &.{} };
-    const saved = c.dup(1);
-    _ = c.dup2(pfds[1], 1);
-    _ = c.close(pfds[1]);
+    const cap = smokecli.Capture.begin() orelse
+        return .{ .code = 1, .out = allocator.dupe(u8, "") catch &.{} };
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     const code = @import("ipc/client.zig").run(arena_state.allocator(), argv);
     arena_state.deinit();
-    _ = c.fflush(platform.stdout());
-    _ = c.dup2(saved, 1);
-    _ = c.close(saved);
-
-    var out: std.ArrayList(u8) = .empty;
-    while (true) {
-        var buf: [4096]u8 = undefined;
-        const n = c.read(pfds[0], &buf, buf.len);
-        if (n <= 0) break;
-        out.appendSlice(allocator, buf[0..@intCast(n)]) catch break;
-    }
-    _ = c.close(pfds[0]);
-    return .{ .code = code, .out = out.toOwnedSlice(allocator) catch &.{} };
+    return .{ .code = code, .out = cap.finish(allocator) };
 }
-
-const CreateReply = struct {
-    session: []const u8 = "",
-    environment: struct {
-        WAYLAND_DISPLAY: []const u8 = "",
-        XDG_RUNTIME_DIR: []const u8 = "",
-        PULSE_SERVER: []const u8 = "",
-        LIBGL_ALWAYS_SOFTWARE: []const u8 = "",
-    } = .{},
-};
 
 pub fn main() u8 {
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
@@ -10311,38 +10264,8 @@ fn parseNumAfter(text: []const u8, key: []const u8) ?u32 {
     return if (any) v else null;
 }
 
-/// One connect → one request line → one response line. Caller frees.
-///
-/// Also pumps the display-session viewer: this process IS the
-/// compositor brain for the GUI's toplevel, so an IPC stage that never
-/// pumps would starve configure/frame handling for its whole duration.
+/// One connect -> one request line -> one response line. Caller frees,
+/// and the display-session viewer is pumped first.
 fn roundtrip(allocator: std.mem.Allocator, sock_path: [:0]const u8, line: []const u8) ?[]u8 {
-    if (drive) |app| app.drain();
-    const client = c.g_socket_client_new();
-    defer c.g_object_unref(client);
-    const addr = c.g_unix_socket_address_new(sock_path.ptr);
-    defer c.g_object_unref(addr);
-    var gerr: [*c]c.GError = null;
-    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
-    if (conn == null) {
-        if (gerr != null) c.g_error_free(gerr);
-        return null;
-    }
-    defer c.g_object_unref(conn);
-    const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
-    var written: c.gsize = 0;
-    if (c.g_output_stream_write_all(out_stream, line.ptr, line.len, &written, null, &gerr) == 0) {
-        if (gerr != null) c.g_error_free(gerr);
-        return null;
-    }
-    const din = c.g_data_input_stream_new(c.g_io_stream_get_input_stream(@ptrCast(conn)));
-    defer c.g_object_unref(din);
-    var rlen: c.gsize = 0;
-    const resp = c.g_data_input_stream_read_line(din, &rlen, null, &gerr);
-    if (resp == null) {
-        if (gerr != null) c.g_error_free(gerr);
-        return null;
-    }
-    defer c.g_free(resp);
-    return allocator.dupe(u8, resp[0..rlen]) catch null;
+    return ctlsock.roundtrip(allocator, drive, sock_path, line);
 }

@@ -38,7 +38,6 @@ const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
 const appdrive = @import("ipc/appdrive.zig");
-const display_cli = @import("mux/display.zig");
 const proc = @import("lsp/proc.zig");
 
 const TTL = "240";
@@ -112,35 +111,10 @@ fn fail(comptime fmt: []const u8, args: anytype) u8 {
 }
 
 
-const CliResult = struct { code: u8, out: []u8 };
-
-fn runDisplayCli(allocator: std.mem.Allocator, argv: []const []const u8) CliResult {
-    var pfds: [2]c_int = undefined;
-    if (c.pipe(&pfds) != 0) return .{ .code = 1, .out = allocator.dupe(u8, "") catch &.{} };
-    const saved = c.dup(1);
-    _ = c.dup2(pfds[1], 1);
-    _ = c.close(pfds[1]);
-    const code = display_cli.run(allocator, argv);
-    _ = c.fflush(platform.stdout());
-    _ = c.dup2(saved, 1);
-    _ = c.close(saved);
-    var out: std.ArrayList(u8) = .empty;
-    while (true) {
-        var buf: [4096]u8 = undefined;
-        const n = c.read(pfds[0], &buf, buf.len);
-        if (n <= 0) break;
-        out.appendSlice(allocator, buf[0..@intCast(n)]) catch break;
-    }
-    _ = c.close(pfds[0]);
-    return .{ .code = code, .out = out.toOwnedSlice(allocator) catch &.{} };
-}
-
-const CreateReply = struct {
-    session: []const u8 = "",
-    environment: struct {
-        WAYLAND_DISPLAY: []const u8 = "",
-    } = .{},
-};
+const smokecli = @import("smoke/displaycli.zig");
+const CliResult = smokecli.CliResult;
+const CreateReply = smokecli.CreateReply;
+const runDisplayCli = smokecli.runDisplayCli;
 
 fn writeFile(path: [*:0]const u8, bytes: []const u8) bool {
     const f = c.fopen(path, "wb") orelse return false;
