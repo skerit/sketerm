@@ -9,10 +9,8 @@
 //! No display server required.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("epoxy/egl.h");
-    @cInclude("epoxy/gl.h");
-});
+const c = @import("c.zig").c;
+const eglboot = @import("smoke/eglboot.zig");
 const ImagePass = @import("render/image_pass.zig").ImagePass;
 const ImageStore = @import("grid/image_store.zig").Store;
 
@@ -25,81 +23,32 @@ pub fn main() !u8 {
     const allocator = gpa.allocator();
 
     // 1. EGL surfaceless context.
-    const display = blk: {
-        // Mesa-specific platform — no DISPLAY needed.
-        const eglGetPlatformDisplayEXT_addr = c.eglGetProcAddress("eglGetPlatformDisplayEXT");
-        if (eglGetPlatformDisplayEXT_addr) |p| {
-            const fn_ptr: *const fn (c_uint, ?*anyopaque, ?[*]const c.EGLint) callconv(.c) c.EGLDisplay = @ptrCast(@alignCast(p));
-            const PLATFORM_SURFACELESS_MESA: c_uint = 0x31DD;
-            const d = fn_ptr(PLATFORM_SURFACELESS_MESA, null, null);
-            if (d != null and d != c.EGL_NO_DISPLAY) break :blk d;
+    const egl = eglboot.surfaceless(.gles3) catch |e| {
+        switch (e) {
+            error.NoDisplay => std.debug.print("smoke-image: eglGetDisplay failed\n", .{}),
+            error.Init => std.debug.print("smoke-image: eglInitialize failed\n", .{}),
+            error.BindApi => std.debug.print("smoke-image: eglBindAPI failed\n", .{}),
+            error.ChooseConfig => std.debug.print("smoke-image: eglChooseConfig failed\n", .{}),
+            error.CreateContext => std.debug.print(
+                "smoke-image: eglCreateContext failed (err 0x{x})\n",
+                .{eglboot.lastError()},
+            ),
+            error.MakeCurrent => std.debug.print(
+                "smoke-image: eglMakeCurrent failed (err 0x{x})\n",
+                .{eglboot.lastError()},
+            ),
         }
-        break :blk c.eglGetDisplay(c.EGL_DEFAULT_DISPLAY);
+        return 1;
     };
-    if (display == c.EGL_NO_DISPLAY) {
-        std.debug.print("smoke-image: eglGetDisplay failed\n", .{});
-        return 1;
-    }
-    var major: c.EGLint = 0;
-    var minor: c.EGLint = 0;
-    if (c.eglInitialize(display, &major, &minor) == c.EGL_FALSE) {
-        std.debug.print("smoke-image: eglInitialize failed\n", .{});
-        return 1;
-    }
-    std.debug.print("smoke-image: EGL {d}.{d} on {s}\n", .{ major, minor, c.eglQueryString(display, c.EGL_VENDOR) });
-
-    if (c.eglBindAPI(c.EGL_OPENGL_ES_API) == c.EGL_FALSE) {
-        std.debug.print("smoke-image: eglBindAPI failed\n", .{});
-        return 1;
-    }
-
-    const cfg_attribs = [_]c.EGLint{
-        c.EGL_RED_SIZE,           8,
-        c.EGL_GREEN_SIZE,         8,
-        c.EGL_BLUE_SIZE,          8,
-        c.EGL_ALPHA_SIZE,         8,
-        c.EGL_RENDERABLE_TYPE,    c.EGL_OPENGL_ES3_BIT,
-        c.EGL_SURFACE_TYPE,       c.EGL_PBUFFER_BIT,
-        c.EGL_NONE,
-    };
-    var cfg: c.EGLConfig = null;
-    var n_cfg: c.EGLint = 0;
-    if (c.eglChooseConfig(display, &cfg_attribs, &cfg, 1, &n_cfg) == c.EGL_FALSE or n_cfg < 1) {
-        std.debug.print("smoke-image: eglChooseConfig failed\n", .{});
-        return 1;
-    }
-
-    const ctx_attribs = [_]c.EGLint{
-        c.EGL_CONTEXT_MAJOR_VERSION, 3,
-        c.EGL_CONTEXT_MINOR_VERSION, 0,
-        c.EGL_NONE,
-    };
-    const ctx = c.eglCreateContext(display, cfg, c.EGL_NO_CONTEXT, &ctx_attribs);
-    if (ctx == c.EGL_NO_CONTEXT) {
-        std.debug.print("smoke-image: eglCreateContext failed (err 0x{x})\n", .{c.eglGetError()});
-        return 1;
-    }
-    if (c.eglMakeCurrent(display, c.EGL_NO_SURFACE, c.EGL_NO_SURFACE, ctx) == c.EGL_FALSE) {
-        std.debug.print("smoke-image: eglMakeCurrent failed (err 0x{x})\n", .{c.eglGetError()});
-        return 1;
-    }
+    std.debug.print("smoke-image: EGL {d}.{d} on {s}\n", .{ egl.major, egl.minor, egl.vendor() });
 
     std.debug.print("smoke-image: GL_VERSION={s}\n", .{c.glGetString(c.GL_VERSION)});
 
     // 2. Offscreen framebuffer.
-    var fbo: c_uint = 0;
-    var rbo: c_uint = 0;
-    c.glGenFramebuffers(1, &fbo);
-    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
-    c.glGenRenderbuffers(1, &rbo);
-    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
-    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, W, H);
-    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
-    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
+    _ = eglboot.offscreenRgba8(W, H) catch {
         std.debug.print("smoke-image: framebuffer incomplete\n", .{});
         return 1;
-    }
-    c.glViewport(0, 0, W, H);
+    };
     c.glClearColor(0, 0, 0, 1);
     c.glClear(c.GL_COLOR_BUFFER_BIT);
 

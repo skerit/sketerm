@@ -18,9 +18,7 @@ const shader_pass = @import("render/shader_pass.zig");
 const editor_pass = @import("render/editor_pass.zig");
 const blend = @import("render/blend.zig");
 
-const c_egl = @cImport({
-    @cInclude("epoxy/egl.h");
-});
+const eglboot = @import("smoke/eglboot.zig");
 
 const crt_glsl = @embedFile("crt_glsl");
 
@@ -29,58 +27,20 @@ pub fn main() !u8 {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const display = blk: {
-        const get_platform = c_egl.eglGetProcAddress("eglGetPlatformDisplayEXT");
-        if (get_platform) |p| {
-            const fn_ptr: *const fn (c_uint, ?*anyopaque, ?[*]const c_egl.EGLint) callconv(.c) c_egl.EGLDisplay = @ptrCast(@alignCast(p));
-            const PLATFORM_SURFACELESS_MESA: c_uint = 0x31DD;
-            const d = fn_ptr(PLATFORM_SURFACELESS_MESA, null, null);
-            if (d != null and d != c_egl.EGL_NO_DISPLAY) break :blk d;
+    // Desktop GL, not GLES — this is the whole point. Every step but
+    // the last is a SKIP: a host without desktop-GL EGL cannot answer
+    // the question this rig asks, and must not fail the build for it.
+    _ = eglboot.surfaceless(.gl33_core) catch |e| {
+        switch (e) {
+            error.NoDisplay => std.debug.print("smoke-gl-core: no EGL display — SKIP\n", .{}),
+            error.Init => std.debug.print("smoke-gl-core: eglInitialize failed — SKIP\n", .{}),
+            error.BindApi => std.debug.print("smoke-gl-core: no desktop-GL EGL support — SKIP\n", .{}),
+            error.ChooseConfig => std.debug.print("smoke-gl-core: no desktop-GL config — SKIP\n", .{}),
+            error.CreateContext => std.debug.print("smoke-gl-core: 3.3 core context failed — SKIP\n", .{}),
+            error.MakeCurrent => return 1,
         }
-        break :blk c_egl.eglGetDisplay(c_egl.EGL_DEFAULT_DISPLAY);
+        return 0;
     };
-    if (display == c_egl.EGL_NO_DISPLAY) {
-        std.debug.print("smoke-gl-core: no EGL display — SKIP\n", .{});
-        return 0;
-    }
-    var major: c_egl.EGLint = 0;
-    var minor: c_egl.EGLint = 0;
-    if (c_egl.eglInitialize(display, &major, &minor) == c_egl.EGL_FALSE) {
-        std.debug.print("smoke-gl-core: eglInitialize failed — SKIP\n", .{});
-        return 0;
-    }
-    // Desktop GL, not GLES — this is the whole point.
-    if (c_egl.eglBindAPI(c_egl.EGL_OPENGL_API) == c_egl.EGL_FALSE) {
-        std.debug.print("smoke-gl-core: no desktop-GL EGL support — SKIP\n", .{});
-        return 0;
-    }
-    const cfg_attribs = [_]c_egl.EGLint{
-        c_egl.EGL_RED_SIZE,        8,
-        c_egl.EGL_GREEN_SIZE,      8,
-        c_egl.EGL_BLUE_SIZE,       8,
-        c_egl.EGL_ALPHA_SIZE,      8,
-        c_egl.EGL_RENDERABLE_TYPE, c_egl.EGL_OPENGL_BIT,
-        c_egl.EGL_SURFACE_TYPE,    c_egl.EGL_PBUFFER_BIT,
-        c_egl.EGL_NONE,
-    };
-    var cfg: c_egl.EGLConfig = null;
-    var n_cfg: c_egl.EGLint = 0;
-    if (c_egl.eglChooseConfig(display, &cfg_attribs, &cfg, 1, &n_cfg) == c_egl.EGL_FALSE or n_cfg < 1) {
-        std.debug.print("smoke-gl-core: no desktop-GL config — SKIP\n", .{});
-        return 0;
-    }
-    const ctx_attribs = [_]c_egl.EGLint{
-        c_egl.EGL_CONTEXT_MAJOR_VERSION,       3,
-        c_egl.EGL_CONTEXT_MINOR_VERSION,       3,
-        c_egl.EGL_CONTEXT_OPENGL_PROFILE_MASK, c_egl.EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
-        c_egl.EGL_NONE,
-    };
-    const ctx = c_egl.eglCreateContext(display, cfg, c_egl.EGL_NO_CONTEXT, &ctx_attribs);
-    if (ctx == c_egl.EGL_NO_CONTEXT) {
-        std.debug.print("smoke-gl-core: 3.3 core context failed — SKIP\n", .{});
-        return 0;
-    }
-    if (c_egl.eglMakeCurrent(display, c_egl.EGL_NO_SURFACE, c_egl.EGL_NO_SURFACE, ctx) == c_egl.EGL_FALSE) return 1;
 
     std.debug.print("smoke-gl-core: GL_VERSION={s}\n", .{c.glGetString(c.GL_VERSION)});
     gl.api = .gl_core;

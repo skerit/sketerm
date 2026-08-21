@@ -37,9 +37,7 @@ const reload = @import("editor/reload.zig");
 const lsp_smoke = @import("smoke_editor_lsp.zig");
 const lspStage = lsp_smoke.stage;
 
-const c_egl = @cImport({
-    @cInclude("epoxy/egl.h");
-});
+const eglboot = @import("smoke/eglboot.zig");
 
 const W: c_int = 880;
 const H: c_int = 560;
@@ -324,53 +322,17 @@ pub fn main() !u8 {
     const allocator = gpa.allocator();
 
     // --- EGL surfaceless context (same pattern as smoke-cell) ---
-    const display = blk: {
-        const getPlatformDisplay = c_egl.eglGetProcAddress("eglGetPlatformDisplayEXT");
-        if (getPlatformDisplay) |p| {
-            const fn_ptr: *const fn (c_uint, ?*anyopaque, ?[*]const c_egl.EGLint) callconv(.c) c_egl.EGLDisplay = @ptrCast(@alignCast(p));
-            const PLATFORM_SURFACELESS_MESA: c_uint = 0x31DD;
-            const d = fn_ptr(PLATFORM_SURFACELESS_MESA, null, null);
-            if (d != null and d != c_egl.EGL_NO_DISPLAY) break :blk d;
-        }
-        break :blk c_egl.eglGetDisplay(c_egl.EGL_DEFAULT_DISPLAY);
-    };
-    if (display == c_egl.EGL_NO_DISPLAY) {
-        std.debug.print("smoke-editor: eglGetDisplay failed\n", .{});
+    _ = eglboot.surfaceless(.gles3) catch |e| {
+        if (e == error.NoDisplay) std.debug.print("smoke-editor: eglGetDisplay failed\n", .{});
         return 1;
-    }
-    var maj: c_egl.EGLint = 0;
-    var min: c_egl.EGLint = 0;
-    if (c_egl.eglInitialize(display, &maj, &min) == c_egl.EGL_FALSE) return 1;
-    if (c_egl.eglBindAPI(c_egl.EGL_OPENGL_ES_API) == c_egl.EGL_FALSE) return 1;
-    const cfg_attribs = [_]c_egl.EGLint{
-        c_egl.EGL_RED_SIZE, 8, c_egl.EGL_GREEN_SIZE, 8, c_egl.EGL_BLUE_SIZE, 8, c_egl.EGL_ALPHA_SIZE, 8,
-        c_egl.EGL_RENDERABLE_TYPE, c_egl.EGL_OPENGL_ES3_BIT,
-        c_egl.EGL_SURFACE_TYPE, c_egl.EGL_PBUFFER_BIT,
-        c_egl.EGL_NONE,
     };
-    var cfg: c_egl.EGLConfig = null;
-    var n_cfg: c_egl.EGLint = 0;
-    if (c_egl.eglChooseConfig(display, &cfg_attribs, &cfg, 1, &n_cfg) == c_egl.EGL_FALSE or n_cfg < 1) return 1;
-    const ctx_attribs = [_]c_egl.EGLint{ c_egl.EGL_CONTEXT_MAJOR_VERSION, 3, c_egl.EGL_CONTEXT_MINOR_VERSION, 0, c_egl.EGL_NONE };
-    const ctx = c_egl.eglCreateContext(display, cfg, c_egl.EGL_NO_CONTEXT, &ctx_attribs);
-    if (ctx == c_egl.EGL_NO_CONTEXT) return 1;
-    if (c_egl.eglMakeCurrent(display, c_egl.EGL_NO_SURFACE, c_egl.EGL_NO_SURFACE, ctx) == c_egl.EGL_FALSE) return 1;
     std.debug.print("smoke-editor: GL_VERSION={s}\n", .{c.glGetString(c.GL_VERSION)});
 
     // --- Offscreen framebuffer ---
-    var fbo: c_uint = 0;
-    var rbo: c_uint = 0;
-    c.glGenFramebuffers(1, &fbo);
-    c.glBindFramebuffer(c.GL_FRAMEBUFFER, fbo);
-    c.glGenRenderbuffers(1, &rbo);
-    c.glBindRenderbuffer(c.GL_RENDERBUFFER, rbo);
-    c.glRenderbufferStorage(c.GL_RENDERBUFFER, c.GL_RGBA8, W, H);
-    c.glFramebufferRenderbuffer(c.GL_FRAMEBUFFER, c.GL_COLOR_ATTACHMENT0, c.GL_RENDERBUFFER, rbo);
-    if (c.glCheckFramebufferStatus(c.GL_FRAMEBUFFER) != c.GL_FRAMEBUFFER_COMPLETE) {
+    _ = eglboot.offscreenRgba8(W, H) catch {
         std.debug.print("smoke-editor: framebuffer incomplete\n", .{});
         return 1;
-    }
-    c.glViewport(0, 0, W, H);
+    };
     c.glClearColor(0.09, 0.09, 0.12, 1.0);
     c.glClear(c.GL_COLOR_BUFFER_BIT);
 
