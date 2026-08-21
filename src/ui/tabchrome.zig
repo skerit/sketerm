@@ -5,6 +5,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const menuchrome = @import("menuchrome.zig");
 const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
 const Window = winmod.Window;
@@ -88,17 +89,7 @@ pub fn onTabContextMenu(ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWid
 
 /// Icon+label button row that runs a window method on the selected tab.
 pub fn addTabMenuAction(self: *Window, popover: *c.GtkWidget, list: *c.GtkWidget, page: *c.AdwTabPage, label: [*:0]const u8, icon: [*:0]const u8, action: TabMenuAction) void {
-    const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-    const img = c.gtk_image_new_from_icon_name(icon);
-    const lbl = c.gtk_label_new(label);
-    c.gtk_label_set_xalign(@ptrCast(lbl), 0.0);
-    c.gtk_widget_set_hexpand(lbl, 1);
-    c.gtk_box_append(@ptrCast(row), img);
-    c.gtk_box_append(@ptrCast(row), lbl);
-
-    const btn = c.gtk_button_new();
-    c.gtk_button_set_child(@ptrCast(btn), row);
-    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
+    const btn = menuchrome.makeRow(icon, label, false);
     const actx = self.allocator.create(TabMenuActionCtx) catch return;
     actx.* = .{ .allocator = self.allocator, .window = self, .popover = popover, .page = page, .action = action };
     _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onTabMenuActionClicked), @ptrCast(actx), @ptrCast(cast.destroyCtx(TabMenuActionCtx)), c.G_CONNECT_DEFAULT);

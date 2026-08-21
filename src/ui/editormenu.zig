@@ -12,6 +12,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const menuchrome = @import("menuchrome.zig");
 const editorview = @import("editorview.zig");
 const EditorView = editorview.EditorView;
 const ETab = editorview.ETab;
@@ -171,11 +172,8 @@ const ClickCtx = struct {
     lsp_widgets: [N_LSP_WIDGETS]?*c.GtkWidget = @splat(null),
 };
 
-const HoverCtx = struct {
-    allocator: std.mem.Allocator,
-    cctx: *ClickCtx,
-    sub: ?*c.GtkWidget,
-};
+/// Hover behaviour for this menu's rows; see `ui/menuchrome.zig`.
+const Hover = menuchrome.Hover(ClickCtx);
 
 /// Attach the context menu to the editor canvas. `widget` is the GL
 /// area; teardown rides the click gesture's destroy-notify, which
@@ -226,9 +224,9 @@ pub fn attach(view: *EditorView, widget: *c.GtkWidget, allocator: std.mem.Alloca
                 prev_sep = sep;
             },
             .bind => |b| {
-                const btn = makeRow(b.icon, b.label, false);
+                const btn = menuchrome.makeRow(b.icon, b.label, false);
                 c.gtk_actionable_set_action_name(@ptrCast(btn), b.detailed);
-                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
+                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&menuchrome.onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
                 c.gtk_box_append(@ptrCast(list), btn);
                 if (b.lsp_only) {
                     if (!lsp_sep_taken) {
@@ -241,11 +239,11 @@ pub fn attach(view: *EditorView, widget: *c.GtkWidget, allocator: std.mem.Alloca
                     cctx.lsp_widgets[n_lsp] = btn;
                     n_lsp += 1;
                 }
-                try addHover(allocator, btn, cctx, null);
+                try Hover.attach(allocator, btn, cctx, null);
                 if (!b.lsp_only) prev_sep = null;
             },
             .submenu => |s| {
-                const btn = makeRow(s.icon, s.label, true);
+                const btn = menuchrome.makeRow(s.icon, s.label, true);
                 const sub_pop = c.gtk_popover_new();
                 c.gtk_widget_set_parent(sub_pop, btn);
                 c.gtk_popover_set_has_arrow(@ptrCast(sub_pop), 0);
@@ -253,94 +251,24 @@ pub fn attach(view: *EditorView, widget: *c.GtkWidget, allocator: std.mem.Alloca
                 c.gtk_popover_set_position(@ptrCast(sub_pop), c.GTK_POS_RIGHT);
                 const sub_list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
                 for (s.items) |b| {
-                    const child = makeRow(b.icon, b.label, false);
+                    const child = menuchrome.makeRow(b.icon, b.label, false);
                     c.gtk_actionable_set_action_name(@ptrCast(child), b.detailed);
-                    _ = c.g_signal_connect_data(child, "clicked", @ptrCast(&onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
+                    _ = c.g_signal_connect_data(child, "clicked", @ptrCast(&menuchrome.onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
                     c.gtk_box_append(@ptrCast(sub_list), child);
                 }
                 c.gtk_popover_set_child(@ptrCast(sub_pop), sub_list);
-                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onSubParentClicked), @ptrCast(sub_pop), null, c.G_CONNECT_DEFAULT);
+                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&menuchrome.onSubParentClicked), @ptrCast(sub_pop), null, c.G_CONNECT_DEFAULT);
                 c.gtk_box_append(@ptrCast(list), btn);
                 cctx.subs[n_sub] = sub_pop;
                 n_sub += 1;
-                try addHover(allocator, btn, cctx, sub_pop);
+                try Hover.attach(allocator, btn, cctx, sub_pop);
                 prev_sep = null;
             },
         }
     }
     _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onPopoverClosed), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
-    // Scroller for the same popover-minimum-size reason ui/menu.zig
-    // documents: a bare box's minimum height can exceed what the
-    // compositor grants and GTK then popdowns the menu on map.
-    const scroller = c.gtk_scrolled_window_new();
-    c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-    c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(scroller), 1);
-    c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(scroller), 1);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroller), list);
-    c.gtk_popover_set_child(@ptrCast(popover), scroller);
-
-    const click = c.gtk_gesture_click_new();
-    c.gtk_gesture_single_set_button(@ptrCast(click), 3);
-    _ = c.g_signal_connect_data(
-        click,
-        "pressed",
-        @ptrCast(&onRightClick),
-        @ptrCast(cctx),
-        @ptrCast(&freeClickCtx),
-        c.G_CONNECT_DEFAULT,
-    );
-    c.gtk_widget_add_controller(widget, @ptrCast(click));
-}
-
-fn makeRow(icon: [*:0]const u8, label: [*:0]const u8, arrow: bool) *c.GtkWidget {
-    const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-    const img = c.gtk_image_new_from_icon_name(icon);
-    const lbl = c.gtk_label_new(label);
-    c.gtk_label_set_xalign(@ptrCast(lbl), 0.0);
-    c.gtk_widget_set_hexpand(lbl, 1);
-    c.gtk_box_append(@ptrCast(row), img);
-    c.gtk_box_append(@ptrCast(row), lbl);
-    if (arrow) {
-        c.gtk_box_append(@ptrCast(row), c.gtk_image_new_from_icon_name("pan-end-symbolic"));
-    }
-    const btn = c.gtk_button_new();
-    c.gtk_button_set_child(@ptrCast(btn), row);
-    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-    return btn.?;
-}
-
-fn addHover(allocator: std.mem.Allocator, btn: *c.GtkWidget, cctx: *ClickCtx, sub: ?*c.GtkWidget) !void {
-    const hctx = try allocator.create(HoverCtx);
-    hctx.* = .{ .allocator = allocator, .cctx = cctx, .sub = sub };
-    const motion = c.gtk_event_controller_motion_new();
-    _ = c.g_signal_connect_data(
-        motion,
-        "enter",
-        @ptrCast(&onRowEnter),
-        @ptrCast(hctx),
-        @ptrCast(cast.destroyCtx(HoverCtx)),
-        c.G_CONNECT_DEFAULT,
-    );
-    c.gtk_widget_add_controller(btn, motion);
-}
-
-fn onRowEnter(_: *c.GtkEventControllerMotion, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-    const hctx = cast.userData(HoverCtx, user);
-    for (hctx.cctx.subs) |maybe_sub| {
-        const sub = maybe_sub orelse continue;
-        if (hctx.sub == sub) continue;
-        if (c.gtk_widget_get_visible(sub) != 0) c.gtk_popover_popdown(@ptrCast(sub));
-    }
-    if (hctx.sub) |sub| {
-        if (c.gtk_widget_get_visible(sub) == 0) c.gtk_popover_popup(@ptrCast(sub));
-    }
-}
-
-fn onSubParentClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const sub: *c.GtkWidget = @ptrCast(@alignCast(u));
-        if (c.gtk_widget_get_visible(sub) == 0) c.gtk_popover_popup(@ptrCast(sub));
-    }
+    menuchrome.setPopoverList(popover, list);
+    menuchrome.attachRightClick(widget, &onRightClick, cctx, menuchrome.destroyMenuCtx(ClickCtx));
 }
 
 fn onPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
@@ -354,42 +282,6 @@ fn onPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
 fn onActivate(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
     const slot = cast.userData(ActionSlot, user);
     slot.view.menuAction(slot.action);
-}
-
-fn onItemClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const pop: *c.GtkWidget = @ptrCast(@alignCast(u));
-        c.gtk_popover_popdown(@ptrCast(pop));
-    }
-}
-
-fn freeClickCtx(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const ctx: *ClickCtx = @ptrCast(@alignCast(u));
-        // Parented popovers must be unparented before the GL area
-        // finalizes (same rule as ui/menu.zig); this notify fires when
-        // the click controller is dropped, i.e. at widget destruction.
-        for (ctx.subs) |maybe_sub| {
-            const sub = maybe_sub orelse continue;
-            if (c.gtk_widget_get_parent(sub) != null) {
-                c.gtk_widget_unparent(sub);
-            }
-        }
-        if (c.gtk_widget_get_parent(ctx.popover) != null) {
-            c.gtk_widget_unparent(ctx.popover);
-        }
-        ctx.allocator.destroy(ctx);
-    }
-}
-
-fn setGroupVisible(group: *c.GSimpleActionGroup, action: [*:0]const u8, widgets: []const ?*c.GtkWidget) void {
-    var show = false;
-    if (c.g_action_map_lookup_action(@ptrCast(group), action)) |act| {
-        show = c.g_action_get_enabled(@ptrCast(act)) != 0;
-    }
-    for (widgets) |maybe_w| {
-        if (maybe_w) |w| c.gtk_widget_set_visible(w, @intFromBool(show));
-    }
 }
 
 fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
@@ -406,7 +298,7 @@ fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaq
     // Claim before popup: without it the release event dismisses the
     // popover the frame it maps (ui/menu.zig documents the race).
     _ = c.gtk_gesture_set_state(@ptrCast(@alignCast(g)), c.GTK_EVENT_SEQUENCE_CLAIMED);
-    setGroupVisible(ctx.group, "goto-def", &ctx.lsp_widgets);
+    menuchrome.setGroupVisible(ctx.group, "goto-def", &ctx.lsp_widgets);
     for (ctx.subs) |maybe_sub| {
         const sub = maybe_sub orelse continue;
         if (c.gtk_widget_get_visible(sub) != 0) c.gtk_popover_popdown(@ptrCast(sub));

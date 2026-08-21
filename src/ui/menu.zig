@@ -9,6 +9,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const menuchrome = @import("menuchrome.zig");
 
 pub const Action = enum {
     copy,
@@ -307,8 +308,9 @@ pub fn iconFor(action: Action) [*:0]const u8 {
 /// Widget data key under which a menu-bearing widget publishes its
 /// ClickCtx, so `popupAt` can reach it from the keyboard path. The
 /// data is NOT owned here (no GDestroyNotify): the click gesture's
-/// `freeClickCtx` is the single owner, and the gesture dies with the
-/// widget, so the key can never outlive the pointer it holds.
+/// destroy-notify (`menuchrome.destroyMenuCtx`) is the single owner,
+/// and the gesture dies with the widget, so the key can never outlive
+/// the pointer it holds.
 const CTX_KEY = "sketerm-term-menu";
 
 const ClickCtx = struct {
@@ -341,14 +343,6 @@ const ClickCtx = struct {
     /// Submenu child rows (upload / download) shown only when the
     /// pre-popup hook found a remote-host session.
     host_widgets: [N_HOST_WIDGETS]?*c.GtkWidget = @splat(null),
-};
-
-/// Per-top-level-row hover context: entering any row pops down every
-/// submenu except this row's own (if any), which pops up.
-const HoverCtx = struct {
-    allocator: std.mem.Allocator,
-    cctx: *ClickCtx,
-    sub: ?*c.GtkWidget,
 };
 
 pub fn attach(
@@ -448,9 +442,9 @@ pub fn attachWithPrePopup(
                 prev_sep = sep;
             },
             .bind => |b| {
-                const btn = makeRow(b.icon, b.label, false);
+                const btn = menuchrome.makeRow(b.icon, b.label, false);
                 c.gtk_actionable_set_action_name(@ptrCast(btn), b.detailed);
-                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
+                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&menuchrome.onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
                 c.gtk_box_append(@ptrCast(list), btn);
                 if (b.link_only) {
                     cctx.link_widgets[n_link] = btn;
@@ -460,12 +454,12 @@ pub fn attachWithPrePopup(
                     cctx.web_widgets[n_web] = btn;
                     n_web += 1;
                 }
-                try addHover(allocator, btn, cctx, null);
+                try Hover.attach(allocator, btn, cctx, null);
                 prev_was_link = b.link_only;
                 prev_was_web = b.web_only;
             },
             .submenu => |s| {
-                const btn = makeRow(s.icon, s.label, true);
+                const btn = menuchrome.makeRow(s.icon, s.label, true);
                 const sub_pop = c.gtk_popover_new();
                 c.gtk_widget_set_parent(sub_pop, btn);
                 c.gtk_popover_set_has_arrow(@ptrCast(sub_pop), 0);
@@ -473,9 +467,9 @@ pub fn attachWithPrePopup(
                 c.gtk_popover_set_position(@ptrCast(sub_pop), c.GTK_POS_RIGHT);
                 const sub_list = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
                 for (s.items) |b| {
-                    const child = makeRow(b.icon, b.label, false);
+                    const child = menuchrome.makeRow(b.icon, b.label, false);
                     c.gtk_actionable_set_action_name(@ptrCast(child), b.detailed);
-                    _ = c.g_signal_connect_data(child, "clicked", @ptrCast(&onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
+                    _ = c.g_signal_connect_data(child, "clicked", @ptrCast(&menuchrome.onItemClicked), @ptrCast(popover), null, c.G_CONNECT_DEFAULT);
                     c.gtk_box_append(@ptrCast(sub_list), child);
                     if (b.host_only) {
                         cctx.host_widgets[n_host] = child;
@@ -486,7 +480,7 @@ pub fn attachWithPrePopup(
                 }
                 c.gtk_popover_set_child(@ptrCast(sub_pop), sub_list);
                 // Click also opens the submenu (keyboard / touch path).
-                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onSubParentClicked), @ptrCast(sub_pop), null, c.G_CONNECT_DEFAULT);
+                _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&menuchrome.onSubParentClicked), @ptrCast(sub_pop), null, c.G_CONNECT_DEFAULT);
                 c.gtk_box_append(@ptrCast(list), btn);
                 cctx.subs[n_sub] = sub_pop;
                 n_sub += 1;
@@ -500,7 +494,7 @@ pub fn attachWithPrePopup(
                     cctx.remote_widgets[n_remote] = btn;
                     n_remote += 1;
                 }
-                try addHover(allocator, btn, cctx, sub_pop);
+                try Hover.attach(allocator, btn, cctx, sub_pop);
                 prev_was_link = false;
                 prev_was_web = false;
             },
@@ -509,33 +503,8 @@ pub fn attachWithPrePopup(
     }
     // Any open submenu pops down with the main menu.
     _ = c.g_signal_connect_data(popover, "closed", @ptrCast(&onPopoverClosed), @ptrCast(cctx), null, c.G_CONNECT_DEFAULT);
-    // Wrap the list in a scroller with natural-height propagation.
-    // Not for scrolling per se: GTK4 silently popdowns an autohide
-    // popover whose MINIMUM size doesn't fit the space the compositor
-    // grants (gtkpopover.c gtk_popover_native_layout →
-    // is_acceptable_size). A bare GtkBox's minimum is the full list,
-    // so right-clicking mid-window — where neither half fits ~15
-    // rows — made the menu vanish the frame it mapped. The scroller
-    // makes the minimum tiny (menu scrolls when constrained) while
-    // natural height keeps the usual full-size rendering.
-    const scroller = c.gtk_scrolled_window_new();
-    c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-    c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(scroller), 1);
-    c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(scroller), 1);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroller), list);
-    c.gtk_popover_set_child(@ptrCast(popover), scroller);
-
-    const click = c.gtk_gesture_click_new();
-    c.gtk_gesture_single_set_button(@ptrCast(click), 3);
-    _ = c.g_signal_connect_data(
-        click,
-        "pressed",
-        @ptrCast(&onRightClick),
-        @ptrCast(cctx),
-        @ptrCast(&freeClickCtx),
-        c.G_CONNECT_DEFAULT,
-    );
-    c.gtk_widget_add_controller(widget, @ptrCast(click));
+    menuchrome.setPopoverList(popover, list);
+    menuchrome.attachRightClick(widget, &onRightClick, cctx, menuchrome.destroyMenuCtx(ClickCtx));
     // Published last, once every field is filled: the keyboard path
     // (`popupAt`) resolves the same context through this key.
     c.g_object_set_data(@ptrCast(@alignCast(widget)), CTX_KEY, @ptrCast(cctx));
@@ -628,61 +597,8 @@ test "menu: conditional-row buckets are sized for the rows that use them" {
     try std.testing.expectEqual(@as(usize, 1), rec_stop);
 }
 
-/// Build one flat icon+label menu-row button. `arrow` appends the
-/// submenu chevron at the trailing edge.
-fn makeRow(icon: [*:0]const u8, label: [*:0]const u8, arrow: bool) *c.GtkWidget {
-    const row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 8);
-    const img = c.gtk_image_new_from_icon_name(icon);
-    const lbl = c.gtk_label_new(label);
-    c.gtk_label_set_xalign(@ptrCast(lbl), 0.0);
-    c.gtk_widget_set_hexpand(lbl, 1);
-    c.gtk_box_append(@ptrCast(row), img);
-    c.gtk_box_append(@ptrCast(row), lbl);
-    if (arrow) {
-        c.gtk_box_append(@ptrCast(row), c.gtk_image_new_from_icon_name("pan-end-symbolic"));
-    }
-    const btn = c.gtk_button_new();
-    c.gtk_button_set_child(@ptrCast(btn), row);
-    c.gtk_button_set_has_frame(@ptrCast(btn), 0);
-    return btn;
-}
-
-/// Attach the hover controller that gives top-level rows classic
-/// menu behaviour: entering a row closes sibling submenus and opens
-/// this row's own (if it has one).
-fn addHover(allocator: std.mem.Allocator, btn: *c.GtkWidget, cctx: *ClickCtx, sub: ?*c.GtkWidget) !void {
-    const hctx = try allocator.create(HoverCtx);
-    hctx.* = .{ .allocator = allocator, .cctx = cctx, .sub = sub };
-    const motion = c.gtk_event_controller_motion_new();
-    _ = c.g_signal_connect_data(
-        motion,
-        "enter",
-        @ptrCast(&onRowEnter),
-        @ptrCast(hctx),
-        @ptrCast(cast.destroyCtx(HoverCtx)),
-        c.G_CONNECT_DEFAULT,
-    );
-    c.gtk_widget_add_controller(btn, motion);
-}
-
-fn onRowEnter(_: *c.GtkEventControllerMotion, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
-    const hctx = cast.userData(HoverCtx, user);
-    for (hctx.cctx.subs) |maybe_sub| {
-        const sub = maybe_sub orelse continue;
-        if (hctx.sub == sub) continue;
-        if (c.gtk_widget_get_visible(sub) != 0) c.gtk_popover_popdown(@ptrCast(sub));
-    }
-    if (hctx.sub) |sub| {
-        if (c.gtk_widget_get_visible(sub) == 0) c.gtk_popover_popup(@ptrCast(sub));
-    }
-}
-
-fn onSubParentClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const sub: *c.GtkWidget = @ptrCast(@alignCast(u));
-        if (c.gtk_widget_get_visible(sub) == 0) c.gtk_popover_popup(@ptrCast(sub));
-    }
-}
+/// Hover behaviour for this menu's rows; see `ui/menuchrome.zig`.
+const Hover = menuchrome.Hover(ClickCtx);
 
 fn onPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(ClickCtx, user);
@@ -726,53 +642,6 @@ fn onActivate(_: *c.GSimpleAction, _: ?*c.GVariant, user: ?*anyopaque) callconv(
     slot.sink(slot.sink_ctx, slot.action);
 }
 
-/// Dismiss the popover after a row is clicked. The button's action-name
-/// fires the "term.*" action as part of the same click; this just makes
-/// the menu close like a menu. `user` is the popover widget (a child of
-/// it, so it never outlives it — no destroy-notify needed).
-fn onItemClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const pop: *c.GtkWidget = @ptrCast(@alignCast(u));
-        c.gtk_popover_popdown(@ptrCast(pop));
-    }
-}
-
-fn freeClickCtx(user: ?*anyopaque) callconv(.c) void {
-    if (user) |u| {
-        const ctx: *ClickCtx = @ptrCast(@alignCast(u));
-        // Pop popovers added via gtk_widget_set_parent must be
-        // explicitly unparented before the host widget finalizes,
-        // otherwise GTK warns "Finalizing GtkGLArea, but it still
-        // has children left". This destroy-notify fires when the
-        // click controller is removed from the widget — i.e. on
-        // widget destruction — making it the right hook. Submenu
-        // popovers (parented to row buttons) go first for the same
-        // reason.
-        for (ctx.subs) |maybe_sub| {
-            const sub = maybe_sub orelse continue;
-            if (c.gtk_widget_get_parent(sub) != null) {
-                c.gtk_widget_unparent(sub);
-            }
-        }
-        if (c.gtk_widget_get_parent(ctx.popover) != null) {
-            c.gtk_widget_unparent(ctx.popover);
-        }
-        ctx.allocator.destroy(ctx);
-    }
-}
-
-/// Show/hide a group of conditional rows to match `action`'s enabled
-/// state (set per-pane by the pre-popup hook).
-fn setGroupVisible(group: *c.GSimpleActionGroup, action: [*:0]const u8, widgets: []const ?*c.GtkWidget) void {
-    var show = false;
-    if (c.g_action_map_lookup_action(@ptrCast(group), action)) |act| {
-        show = c.g_action_get_enabled(@ptrCast(act)) != 0;
-    }
-    for (widgets) |maybe_w| {
-        if (maybe_w) |w| c.gtk_widget_set_visible(w, @intFromBool(show));
-    }
-}
-
 fn onRightClick(g: *c.GtkGestureClick, _: c_int, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(ClickCtx, user);
     if (ctx.pre_popup_fn) |f| {
@@ -806,12 +675,12 @@ fn showAtPrepared(ctx: *ClickCtx, x: f64, y: f64) bool {
     //   - Session submenu (detach/rename/kill) → durable session.
     //   - Link rows (open/copy) → a link under the click.
     //   - File-transfer rows (upload/download) → a remote-host session.
-    setGroupVisible(ctx.group, "mux-detach", &ctx.remote_widgets);
-    setGroupVisible(ctx.group, "copy-link", &ctx.link_widgets);
-    setGroupVisible(ctx.group, "show-web", &ctx.web_widgets);
-    setGroupVisible(ctx.group, "upload-file", &ctx.host_widgets);
-    setGroupVisible(ctx.group, "record-session", &ctx.rec_start_widgets);
-    setGroupVisible(ctx.group, "record-stop", &ctx.rec_stop_widgets);
+    menuchrome.setGroupVisible(ctx.group, "mux-detach", &ctx.remote_widgets);
+    menuchrome.setGroupVisible(ctx.group, "copy-link", &ctx.link_widgets);
+    menuchrome.setGroupVisible(ctx.group, "show-web", &ctx.web_widgets);
+    menuchrome.setGroupVisible(ctx.group, "upload-file", &ctx.host_widgets);
+    menuchrome.setGroupVisible(ctx.group, "record-session", &ctx.rec_start_widgets);
+    menuchrome.setGroupVisible(ctx.group, "record-stop", &ctx.rec_stop_widgets);
     // Fresh popup: no submenu open.
     for (ctx.subs) |maybe_sub| {
         const sub = maybe_sub orelse continue;
