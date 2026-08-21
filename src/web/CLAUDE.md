@@ -774,6 +774,35 @@ site-data panel wants have no browser-process API at all. Both are
 reported to the client in `EvSitedataDone.detail` rather than papered
 over, and both are measured, not assumed:
 
+- **A context's jar is an IMMEDIATE child of `root_cache_path`.** CEF's
+  chrome runtime resolves `CefRequestContextSettings.cache_path`
+  through Chrome's `ProfileManager`, which only accepts a profile
+  directory whose PARENT is the user-data dir. The nested
+  `{profile_dir}/contexts/{key}` this used to build was refused with a
+  bare `ERROR:chrome_browser_context.cc:116 Cannot create profile at
+  path` — a LOG LINE, not a failure return — so every named container
+  quietly ran with no profile of its own. Nothing above the log said
+  so; it was found by writing a cookie in a container and looking for
+  it afterwards.
+- **`contextForSpawn` hands out an ADD-REF'd reference.**
+  `create_browser_sync` wraps the `cef_request_context_t*` with
+  `CefRequestContextCToCpp::Wrap`, which TAKES ownership (CToCpp
+  wrappers transfer, they never add — the same rule `visit_url_cookies`
+  documents below). Passing the registry's own reference therefore
+  freed the context after the FIRST browser, and the second view in the
+  same container segfaulted the helper on a freed vtable.
+- **The headless MCP client now points `--cache-dir` at a DURABLE
+  store**, not at its volatile instance dir: `$XDG_STATE_HOME/sketerm/
+  web-profiles/<instance-key>/` (`src/ipc/webprofiles.zig`). No helper
+  code changed — CEF simply requires a persistent context's
+  `cache_path` to be a child of `root_cache_path`, so the jars can only
+  live under the helper's own cache dir. That client refuses a named
+  profile outright unless BOTH `contexts` and `contexts-fail-closed`
+  are advertised, because with only the first an unknown context
+  silently resolves through the shared jar. Context 0 stays an
+  in-memory jar in both modes (`settings.cache_path` is never set), so
+  without a profile nothing about a browsing session survives the
+  helper.
 - **There is no per-origin cache clear.** `cef_request_context_t` has
   exactly one cache verb, `clear_http_cache`, and it drops the WHOLE
   context. A view in a container therefore loses only that container's

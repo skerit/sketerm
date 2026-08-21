@@ -1071,9 +1071,19 @@ pub const Host = struct {
     /// by, and a silent fall back to direct traffic is exactly the
     /// privacy failure the create-time check was added to remove. Every
     /// browser creation for a client view resolves its context here.
+    ///
+    /// The returned reference is ADD-REF'd: `create_browser_sync` wraps
+    /// the pointer with `CefRequestContextCToCpp::Wrap`, which TAKES
+    /// ownership (CEF's CToCpp wrappers transfer, they never add), so
+    /// handing it the registry's own reference freed the context after
+    /// the FIRST browser and the second view in the same container
+    /// crashed the helper on a freed vtable. Callers pass the result
+    /// straight to a create_browser call and must not release it.
     fn contextForSpawn(self: *Host, v: *const View) error{ContextGone}!?*cef.cef_request_context_t {
         if (v.context == 0) return null;
-        return self.lookupContext(v.context) orelse error.ContextGone;
+        const rc = self.lookupContext(v.context) orelse return error.ContextGone;
+        if (rc.base.base.add_ref) |add| add(&rc.base.base);
+        return rc;
     }
 
     /// Mint a per-tab identity context (its own cookie jar / cache),
@@ -1087,15 +1097,22 @@ pub const Host = struct {
 
         var settings = std.mem.zeroes(cef.cef_request_context_settings_t);
         settings.size = @sizeOf(cef.cef_request_context_settings_t);
-        // Persistent context: a distinct cache dir UNDER the profile dir
-        // (CEF requires cache_path to be a subdir of root_cache_path),
-        // keyed by the sanitized name so cookies follow a named
+        // Persistent context: a distinct cache dir under the profile
+        // dir, keyed by the sanitized name so cookies follow a named
         // container across helper restarts. Ephemeral leaves it empty.
+        //
+        // It must be an IMMEDIATE child of `root_cache_path`. CEF's
+        // chrome runtime resolves a context cache_path through Chrome's
+        // ProfileManager, which only accepts a profile directory whose
+        // parent IS the user-data dir; a nested `contexts/<key>` was
+        // refused with "Cannot create profile at path" (an ERROR log,
+        // no failure return), and every container silently ran without
+        // its own profile.
         var path_buf: [1024]u8 = undefined;
         var name_buf: [256]u8 = undefined;
         if (req.ephemeral == 0 and self.profile_dir.len != 0) {
             const dir_key = sanitizeContextName(req.name, req.id, &name_buf);
-            const path = std.fmt.bufPrint(&path_buf, "{s}/contexts/{s}", .{ self.profile_dir, dir_key }) catch return;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ self.profile_dir, dir_key }) catch return;
             setStr(path, &settings.cache_path);
         }
         defer cef.cef_string_utf16_clear(&settings.cache_path);

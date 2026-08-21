@@ -5,7 +5,7 @@
 //! ## Why a store at all
 //!
 //! The browser helper derives a persistent context's on-disk jar from
-//! `{profile_dir}/contexts/{sanitized_name}-{id}` (src/web/cefhost.zig),
+//! `{profile_dir}/{sanitized_name}-{id}` (src/web/cefhost.zig),
 //! where `id` is the CLIENT-allocated `context_create.id`. The id is
 //! therefore half the path: re-minting ids across MCP restarts would
 //! silently hand a profile an EMPTY jar, so the ids have to be
@@ -19,11 +19,19 @@
 //!
 //! ```
 //! $XDG_STATE_HOME/sketerm/web-profiles/<instance-key>/
-//! ├── lock            # flock'd for the engine's lifetime, holds the owner pid
-//! ├── profiles.json   # {"v":1,"next_id":N,"profiles":[...]}
-//! └── contexts/
-//!     └── work-3/     # helper-created; our charset is a subset of its sanitizer's
+//! ├── lock              # flock'd for the engine's lifetime, holds the owner pid
+//! ├── profiles.json     # {"v":1,"next_id":N,"profiles":[...]}
+//! ├── profile-work-3/   # helper-created jar; our charset ⊂ its sanitizer's
+//! └── Default/ Local State/ ...   # CEF's own installation data
 //! ```
+//!
+//! A jar is an IMMEDIATE child of the root, not tucked under a
+//! `contexts/` subdirectory: CEF resolves a context `cache_path`
+//! through Chrome's ProfileManager, which only accepts a profile
+//! directory whose parent IS the user-data dir. It therefore shares the
+//! directory with CEF's own files, which is why every jar carries the
+//! `profile-` prefix — `sweepOrphans` deletes directories, and it must
+//! be incapable of claiming one of CEF's.
 //!
 //! `<instance-key>` is the MCP instance name (`--name work`) else
 //! `anon`. It is deliberately NOT the GUI's own web cache: two CEF
@@ -55,6 +63,13 @@ pub const MAX_NAME: usize = 64;
 /// collide with a persisted one — a persisted id would otherwise be
 /// able to grow into an id an in-memory jar already answers to.
 pub const EPHEMERAL_BASE: u32 = 0x4000_0000;
+
+/// Prefix every jar directory carries, and the first part of the name
+/// published as `context_create.name` (which the helper uses as the
+/// JAR KEY, never as a display string). It exists so an orphan sweep
+/// over a directory shared with CEF's own data can never claim
+/// anything but ours.
+pub const JAR_PREFIX = "profile-";
 
 /// Names reserved because they NAME the absence of a profile in the
 /// tools' own vocabulary; accepting them would make `profile:"default"`
@@ -94,7 +109,7 @@ pub const OpenError = error{ NoStateDir, Locked, PathTooLong, Io, OutOfMemory };
 pub const Error = error{ Io, BadName, OutOfMemory };
 
 /// Longest `<root>` that still leaves the helper's 1024-byte path
-/// buffer room for `/contexts/<name>-<id>`.
+/// buffer room for `/profile-<name>-<id>`.
 const PATH_BUDGET: usize = 1024;
 
 fn rmTree(path: []const u8) void {
@@ -176,7 +191,7 @@ pub const Store = struct {
     lock_fd: c_int = -1,
     entries: std.ArrayList(Entry) = .empty,
     next_id: u32 = 1,
-    /// The contexts/ listing could not be read after profiles.json was
+    /// The root listing could not be read after profiles.json was
     /// found unusable: minting an id could collide with a jar we cannot
     /// see, so every operation refuses instead.
     degraded: bool = false,
@@ -195,20 +210,16 @@ pub const Store = struct {
         const root = std.fmt.allocPrint(gpa, "{s}/sketerm/web-profiles/{s}", .{ base, key }) catch
             return error.OutOfMemory;
         errdefer gpa.free(root);
-        // The helper builds `{root}/contexts/{name}-{id}` into a
+        // The helper builds `{root}/profile-{name}-{id}` into a
         // 1024-byte buffer; refuse loudly here rather than letting
         // contextCreate silently drop the cache path (which would fall
         // back to the SHARED jar — the exact thing profiles must never do).
-        if (root.len + "/contexts/".len + MAX_NAME + 12 >= PATH_BUDGET) return error.PathTooLong;
+        if (root.len + 1 + JAR_PREFIX.len + MAX_NAME + 12 >= PATH_BUDGET) return error.PathTooLong;
 
         pathz.makeDirs(root, 0o700) catch |err| return switch (err) {
             error.PathTooLong => error.PathTooLong,
             error.MkdirFailed => error.Io,
         };
-        var contexts_buf: [4096]u8 = undefined;
-        const contexts = std.fmt.bufPrint(&contexts_buf, "{s}/contexts", .{root}) catch return error.PathTooLong;
-        pathz.makeDirs(contexts, 0o700) catch return error.Io;
-
         var lock_buf: [4096:0]u8 = undefined;
         const lock_path = std.fmt.bufPrintZ(&lock_buf, "{s}/lock", .{root}) catch return error.PathTooLong;
         const fd = c.open(lock_path.ptr, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c_uint, 0o600));
@@ -262,8 +273,15 @@ pub const Store = struct {
     /// Absolute path of a profile's jar directory (the helper creates
     /// it; this is how the tools can report and erase it).
     pub fn jarPath(self: *const Store, buf: *[4096]u8, e: Entry) ![]const u8 {
-        return std.fmt.bufPrint(buf, "{s}/contexts/{s}-{d}", .{ self.root, e.name, e.id }) catch
+        return std.fmt.bufPrint(buf, "{s}/" ++ JAR_PREFIX ++ "{s}-{d}", .{ self.root, e.name, e.id }) catch
             error.Io;
+    }
+
+    /// What goes on the wire as `context_create.name`: the helper
+    /// sanitizes it and appends `-{id}` to build the jar directory, so
+    /// this string IS half the on-disk path.
+    pub fn jarKey(buf: *[MAX_NAME + JAR_PREFIX.len]u8, name: []const u8) []const u8 {
+        return std.fmt.bufPrint(buf, JAR_PREFIX ++ "{s}", .{name}) catch JAR_PREFIX;
     }
 
     pub fn find(self: *const Store, name: []const u8) ?Entry {
@@ -300,7 +318,7 @@ pub const Store = struct {
     }
 
     /// The next free id: past every live entry AND past every directory
-    /// already sitting in contexts/, so a partially-recovered store can
+    /// already sitting on disk, so a partially-recovered store can
     /// never hand profile A the jar profile B left behind.
     fn mintId(self: *Store) u32 {
         var id = self.next_id;
@@ -318,7 +336,7 @@ pub const Store = struct {
 
     fn jarDirExistsForId(self: *const Store, id: u32) bool {
         var buf: [4096:0]u8 = undefined;
-        const dir_z = std.fmt.bufPrintZ(&buf, "{s}/contexts", .{self.root}) catch return false;
+        const dir_z = std.fmt.bufPrintZ(&buf, "{s}", .{self.root}) catch return false;
         const dir = c.opendir(dir_z.ptr) orelse return false;
         defer _ = c.closedir(dir);
         while (c.readdir(dir)) |ent| {
@@ -367,12 +385,12 @@ pub const Store = struct {
         return self.entries.items;
     }
 
-    /// Delete `contexts/*` directories no entry claims — the SIGKILL
+    /// Delete `profile-*` directories no entry claims — the SIGKILL
     /// window between a retire's save and its rmtree.
     pub fn sweepOrphans(self: *Store) void {
         if (self.degraded) return;
         var buf: [4096:0]u8 = undefined;
-        const dir_z = std.fmt.bufPrintZ(&buf, "{s}/contexts", .{self.root}) catch return;
+        const dir_z = std.fmt.bufPrintZ(&buf, "{s}", .{self.root}) catch return;
         const dir = c.opendir(dir_z.ptr) orelse return;
         // Collect first: unlinking while the DIR stream is open is
         // implementation-defined.
@@ -390,7 +408,7 @@ pub const Store = struct {
                 if (e.id == split.id and std.mem.eql(u8, e.name, split.name)) claimed = true;
             }
             if (claimed) continue;
-            const path = std.fmt.allocPrint(self.gpa, "{s}/contexts/{s}", .{ self.root, name }) catch continue;
+            const path = std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ self.root, name }) catch continue;
             doomed.append(self.gpa, path) catch {
                 self.gpa.free(path);
                 continue;
@@ -462,12 +480,12 @@ pub const Store = struct {
         if (self.next_id == 0) self.next_id = 1;
     }
 
-    /// Reconstruct the table from `contexts/<name>-<id>` directories.
+    /// Reconstruct the table from the `profile-<name>-<id>` directories.
     fn rebuild(self: *Store) void {
         for (self.entries.items) |e| self.gpa.free(e.name);
         self.entries.clearRetainingCapacity();
         var buf: [4096:0]u8 = undefined;
-        const dir_z = std.fmt.bufPrintZ(&buf, "{s}/contexts", .{self.root}) catch {
+        const dir_z = std.fmt.bufPrintZ(&buf, "{s}", .{self.root}) catch {
             self.degraded = true;
             return;
         };
@@ -505,9 +523,11 @@ pub const Store = struct {
 
 const JarDir = struct { name: []const u8, id: u32 };
 
-/// Split a `contexts/` entry back into the (name, id) it was built
+/// Split a jar directory back into the (name, id) it was built
 /// from. Anything that does not parse is not ours and is left alone.
-fn splitJarDir(dir_name: []const u8) ?JarDir {
+fn splitJarDir(raw: []const u8) ?JarDir {
+    if (!std.mem.startsWith(u8, raw, JAR_PREFIX)) return null;
+    const dir_name = raw[JAR_PREFIX.len..];
     const dash = std.mem.lastIndexOfScalar(u8, dir_name, '-') orelse return null;
     if (dash == 0 or dash + 1 >= dir_name.len) return null;
     const id = std.fmt.parseInt(u32, dir_name[dash + 1 ..], 10) catch return null;
@@ -561,7 +581,7 @@ fn dirExists(path: []const u8) bool {
 
 fn makeJar(store: *const Store, name: []const u8, id: u32) !void {
     var buf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrint(&buf, "{s}/contexts/{s}-{d}", .{ store.root, name, id });
+    const p = try std.fmt.bufPrint(&buf, "{s}/" ++ JAR_PREFIX ++ "{s}-{d}", .{ store.root, name, id });
     try pathz.makeDirs(p, 0o700);
 }
 
@@ -607,7 +627,7 @@ test "a profile's id survives the store being closed and reopened" {
     // And the jar path is the (name, id) pair, verbatim.
     var buf: [4096]u8 = undefined;
     const jar = try second.jarPath(&buf, second.find("work").?);
-    try std.testing.expect(std.mem.endsWith(u8, jar, "/contexts/work-1"));
+    try std.testing.expect(std.mem.endsWith(u8, jar, "/profile-work-1"));
 
     try std.testing.expectError(error.BadName, second.ensure("default"));
 }
@@ -697,7 +717,7 @@ test "orphan jars left by a crash are swept at open" {
     // did not go with it.
     try makeJar(&store, "gone", 99);
     var orphan_buf: [4096]u8 = undefined;
-    const orphan = try gpa.dupe(u8, try std.fmt.bufPrint(&orphan_buf, "{s}/contexts/gone-99", .{store.root}));
+    const orphan = try gpa.dupe(u8, try std.fmt.bufPrint(&orphan_buf, "{s}/" ++ JAR_PREFIX ++ "gone-99", .{store.root}));
     defer gpa.free(orphan);
     var kept_buf: [4096]u8 = undefined;
     const kept_path = try gpa.dupe(u8, try store.jarPath(&kept_buf, store.find("work").?));
@@ -712,13 +732,20 @@ test "orphan jars left by a crash are swept at open" {
 
 test "splitJarDir only claims directories this store could have made" {
     const t = std.testing;
-    try t.expectEqual(@as(u32, 3), splitJarDir("work-3").?.id);
-    try t.expectEqualStrings("work", splitJarDir("work-3").?.name);
-    try t.expectEqualStrings("a-b", splitJarDir("a-b-7").?.name);
-    try t.expect(splitJarDir("noid") == null);
-    try t.expect(splitJarDir("-7") == null);
-    try t.expect(splitJarDir("work-0") == null);
-    try t.expect(splitJarDir("Work-3") == null);
+    try t.expectEqual(@as(u32, 3), splitJarDir("profile-work-3").?.id);
+    try t.expectEqualStrings("work", splitJarDir("profile-work-3").?.name);
+    try t.expectEqualStrings("a-b", splitJarDir("profile-a-b-7").?.name);
+    try t.expect(splitJarDir("profile-noid") == null);
+    try t.expect(splitJarDir("profile--7") == null);
+    try t.expect(splitJarDir("profile-work-0") == null);
+    try t.expect(splitJarDir("profile-Work-3") == null);
     // Ephemeral ids never touch disk, so a dir claiming one is not ours.
-    try t.expect(splitJarDir("work-1073741824") == null);
+    try t.expect(splitJarDir("profile-work-1073741824") == null);
+    // The jar root is shared with CEF's own data: without the prefix an
+    // orphan sweep could delete a Chromium directory.
+    try t.expect(splitJarDir("work-3") == null);
+    try t.expect(splitJarDir("Default") == null);
+    try t.expect(splitJarDir("Local State") == null);
+    try t.expect(splitJarDir("component_crx_cache") == null);
+    try t.expect(splitJarDir("hyphen-data") == null);
 }

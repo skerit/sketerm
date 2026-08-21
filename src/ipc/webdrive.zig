@@ -75,6 +75,12 @@ pub const DEFAULT_H: u16 = 800;
 /// startup (re-exec, zygote) dominates; matches the GUI's 150x100ms.
 const SPAWN_WAIT_MS: i64 = 15_000;
 
+/// How long teardown waits for the helper to exit on its own after its
+/// socket closes, before signalling. That self-exit runs `cef_shutdown`,
+/// which is the only thing that flushes a persistent profile's cookies;
+/// CEF usually takes a few hundred ms.
+const GRACEFUL_EXIT_MS: u32 = 4_000;
+
 /// Deadline for one bounded send. The helper drains its socket in its
 /// poll loop; a peer that takes longer than this is wedged.
 const SEND_TIMEOUT_MS: i64 = 5_000;
@@ -369,16 +375,33 @@ pub const Engine = struct {
     pub fn deinit(self: *Engine) void {
         self.dropConnection();
         if (self.pid > 0) {
-            _ = c.kill(self.pid, c.SIGTERM);
-            var tries: u32 = 0;
             var status: c_int = 0;
-            while (tries < 40) : (tries += 1) {
-                if (c.waitpid(self.pid, &status, c.WNOHANG) == self.pid) break;
-                _ = c.usleep(50_000);
+            // Let the helper exit ON ITS OWN first. The closed socket is
+            // its exit signal, and the clean path it then runs (close
+            // every browser, `cef_shutdown`) is what FLUSHES a profile's
+            // cookies to disk. Signalling here instead cost every named
+            // profile the session that had just been written into it —
+            // the jar was durable and always came back empty.
+            var tries: u32 = 0;
+            var reaped = false;
+            while (tries < GRACEFUL_EXIT_MS / 20) : (tries += 1) {
+                if (c.waitpid(self.pid, &status, c.WNOHANG) == self.pid) {
+                    reaped = true;
+                    break;
+                }
+                _ = c.usleep(20_000);
             }
-            if (tries >= 40) {
-                _ = c.kill(self.pid, c.SIGKILL);
-                _ = c.waitpid(self.pid, &status, 0);
+            if (!reaped) {
+                _ = c.kill(self.pid, c.SIGTERM);
+                tries = 0;
+                while (tries < 40) : (tries += 1) {
+                    if (c.waitpid(self.pid, &status, c.WNOHANG) == self.pid) break;
+                    _ = c.usleep(50_000);
+                }
+                if (tries >= 40) {
+                    _ = c.kill(self.pid, c.SIGKILL);
+                    _ = c.waitpid(self.pid, &status, 0);
+                }
             }
             self.pid = -1;
         }
@@ -936,10 +959,12 @@ pub const Engine = struct {
                     error.BadName => error.InvalidName,
                     error.Io, error.OutOfMemory => error.StoreIo,
                 };
+                var key_buf: [webprofiles.MAX_NAME + webprofiles.JAR_PREFIX.len]u8 = undefined;
+                const key = webprofiles.Store.jarKey(&key_buf, name);
                 for (self.live.items) |*ctx| {
                     if (ctx.ephemeral or !std.mem.eql(u8, ctx.name, name)) continue;
                     if (ctx.published_gen != self.helper_gen) {
-                        self.send(publishFrame(ctx.id, name)) catch return error.StoreIo;
+                        self.send(publishFrame(ctx.id, key)) catch return error.StoreIo;
                         ctx.published_gen = self.helper_gen;
                     }
                     ctx.views += 1;
@@ -948,7 +973,7 @@ pub const Engine = struct {
                 }
                 const owned = self.gpa.dupe(u8, name) catch return error.StoreIo;
                 errdefer self.gpa.free(owned);
-                self.send(publishFrame(id, name)) catch return error.StoreIo;
+                self.send(publishFrame(id, key)) catch return error.StoreIo;
                 self.live.append(self.gpa, .{
                     .id = id,
                     .name = owned,
@@ -963,9 +988,10 @@ pub const Engine = struct {
     }
 
     /// The name is the JAR KEY the helper builds its cache path from —
-    /// never a display string (there is none here).
-    fn publishFrame(id: u32, name: []const u8) proto.ContextCreate {
-        return .{ .id = id, .ephemeral = 0, .name = name, .proxy = "" };
+    /// never a display string (there is none here), which is why it
+    /// carries `webprofiles.JAR_PREFIX`.
+    fn publishFrame(id: u32, key: []const u8) proto.ContextCreate {
+        return .{ .id = id, .ephemeral = 0, .name = key, .proxy = "" };
     }
 
     /// One fewer view in `id`. A persistent context is KEPT published
@@ -1985,7 +2011,7 @@ test "a named open publishes its context BEFORE the view, and republishes the sa
         const cc = try proto.decode(proto.ContextCreate, first.payload);
         try std.testing.expectEqual(id, cc.id);
         try std.testing.expectEqual(@as(u8, 0), cc.ephemeral);
-        try std.testing.expectEqualStrings("work", cc.name);
+        try std.testing.expectEqualStrings("profile-work", cc.name);
         try std.testing.expectEqualStrings("", cc.proxy);
         const second = (try reader.next()).?;
         try std.testing.expectEqual(proto.Tag.view_create_url, second.tag);
