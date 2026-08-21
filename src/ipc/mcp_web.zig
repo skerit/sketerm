@@ -50,9 +50,15 @@ const DEFAULT_TIMEOUT_MS: i64 = 15_000;
 /// immediate, slow enough that a long wait is not a busy loop.
 const POLL_MS: u32 = 40;
 
-/// Characters of an eval result returned inline; the rest is paged with
-/// `web_expand [0]`, the same affordance snapshots use for long text.
+/// Characters of an eval result returned inline by default; the rest is
+/// paged with `web_expand [0]`, the same affordance snapshots use for
+/// long text. `max_chars` raises it per call, up to EVAL_INLINE_MAX
+/// (the same ceiling as web_expand's `len`): two adapters each burned a
+/// live-run cycle on a 50-row list that silently came back as paged
+/// text, so the limit is now stated in the tool description AND
+/// movable by the caller.
 const EVAL_INLINE_CHARS: usize = 6000;
+const EVAL_INLINE_MAX: usize = 60_000;
 
 /// The one page-authored-data warning, on results that carry page
 /// CONTENT. The bridge is authenticated (a page cannot forge a reply),
@@ -944,9 +950,16 @@ fn openResult(
     snap_err: ?[]const u8,
     policy: ?*const webdrive.NetPolicy,
     policy_source: []const u8,
+    open_views: usize,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
+    // The hygiene nudge: views opened for a quick check and never
+    // closed outlive the turn that needed them. web_close already
+    // reports `remaining`; this is its open-side twin.
+    try res.fact("open_views", open_views);
+    if (open_views > 1)
+        try res.textf("{d} web views are now open, this one included (web_tabs lists them; web_close drops the ones you are done with)", .{open_views});
     if (mode == .headless) {
         try res.fact("profile", v.profile);
         try res.fact("profile_kind", v.profile_kind);
@@ -1240,18 +1253,22 @@ fn evalResult(
     mode: Mode,
     v: View,
     payload: []const u8,
+    inline_limit: usize,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
     try res.fact("evaluated", true);
-    if (payload.len > EVAL_INLINE_CHARS) {
+    try res.fact("inline_limit", inline_limit);
+    if (payload.len > inline_limit) {
         // As a STRING, deliberately: a raw JSON value cut in half would
-        // make the structured lane unparseable.
-        const cut = payload[0..EVAL_INLINE_CHARS];
+        // make the structured lane unparseable. `value` is ABSENT here,
+        // so the flags below are the only structural sign of the cut.
+        const cut = payload[0..inline_limit];
         try res.fact("value_text", cut);
         try res.fact("truncated", true);
         try res.fact("total_chars", payload.len);
-        try res.textf("result cut at {d} of {d} chars; page the rest with web_expand id=0", .{ EVAL_INLINE_CHARS, payload.len });
+        try res.fact("pages", (payload.len + 7999) / 8000);
+        try res.textf("result TRUNCATED: {d} of {d} chars inline (no 'value'; 'value_text' is a prefix). Page the rest with web_expand id=0, or re-run with max_chars up to {d}, or strict:true to get an error instead of a prefix", .{ inline_limit, payload.len, EVAL_INLINE_MAX });
         try section(&res, "result", cut);
     } else {
         // Machine data: verbatim JSON where it IS JSON, a plain string
@@ -1525,8 +1542,12 @@ pub fn webTool(
         const wanted_blank = if (url) |u| isBlankDoc(u) else true;
         var v: View = .{ .pane = new_handle };
         var settled = url == null;
+        // How many views exist now that this one does: the polled list
+        // when it answered, else the pre-open count plus this view.
+        var open_views: usize = (if (views) |vs| vs.views.len else 0) + 1;
         while (drv.now() < deadline) {
             if (try listViews(drv, arena)) |vs| {
+                open_views = vs.views.len;
                 if (viewFor(vs, new_handle)) |found| {
                     v = found;
                     // The helper refused the identity context. There is
@@ -1602,6 +1623,7 @@ pub fn webTool(
             snap_err,
             echo_policy,
             policy_source,
+            open_views,
         );
     }
 
@@ -1827,6 +1849,12 @@ pub fn webTool(
             return mcp.errRes(arena, .invalid_args, "web_eval needs 'code'");
         const want_await = mcp.argBool(args, "await");
         const budget = timeoutOf(args, 10_000);
+        const inline_limit: usize = @intCast(std.math.clamp(
+            mcp.argInt(args, "max_chars") orelse @as(i64, EVAL_INLINE_CHARS),
+            1,
+            @as(i64, EVAL_INLINE_MAX),
+        ));
+        const strict = mcp.argBool(args, "strict");
         switch (try runOp(drv, arena, view.pane, .{
             .op = "eval",
             .data = code,
@@ -1848,7 +1876,17 @@ pub fn webTool(
                     try std.fmt.allocPrint(arena, "the page threw: {s}", .{r.payload})
                 else
                     "the evaluation failed with no description");
-                return evalResult(arena, drv.mode(), view, r.payload);
+                // strict: the caller wants the VALUE or nothing. A cut
+                // prefix would hand back a string where a list was —
+                // exactly the silent shape change strict exists to
+                // refuse. The length rides the message so the retry can
+                // size max_chars (or narrow the code) without guessing.
+                if (strict and r.payload.len > inline_limit) return mcp.errRes(
+                    arena,
+                    .invalid_args,
+                    try std.fmt.allocPrint(arena, "result too large for strict inline return: {d} chars, limit {d} (max_chars raises it up to {d}; or drop strict:true to page it with web_expand id=0; or return less from the code)", .{ r.payload.len, inline_limit, EVAL_INLINE_MAX }),
+                );
+                return evalResult(arena, drv.mode(), view, r.payload, inline_limit);
             },
         }
     }
@@ -2634,10 +2672,11 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
         .document = 1,
         .revision = 4,
         .tree = tree,
-    }, null, null, "none");
+    }, null, null, "none", 1);
     const parsed = try mcp.expectToolResultShape(arena, "web_open", settled);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(sc.get("settled").?.bool);
+    try t.expectEqual(@as(i64, 1), sc.get("open_views").?.integer);
     try t.expectEqual(@as(i64, 1), sc.get("document").?.integer);
     try t.expectEqual(@as(i64, 4), sc.get("revision").?.integer);
     // Same both-lanes rule as term output: programmatic clients get the
@@ -2654,10 +2693,11 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
 
     // Unsettled + an ignored 'where': one short line each, and the
     // ignored placement is also a machine fact.
-    const rough = try openResult(arena, .headless, EXAMPLE, false, true, null, "the page did not answer a first snapshot in time", null, "none");
+    const rough = try openResult(arena, .headless, EXAMPLE, false, true, null, "the page did not answer a first snapshot in time", null, "none", 3);
     const rp = try mcp.expectToolResultShape(arena, "web_open", rough);
     const rsc = rp.object.get("structuredContent").?.object;
     try t.expect(!rsc.get("settled").?.bool);
+    try t.expectEqual(@as(i64, 3), rsc.get("open_views").?.integer);
     try t.expect(rsc.get("where_ignored").?.bool);
     try t.expect(rsc.get("snapshot") == null);
     const rtext = rp.object.get("content").?.array.items[0].object.get("text").?.string;
@@ -2665,6 +2705,10 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
     try t.expect(std.mem.indexOf(u8, rtext, "'where' was ignored") != null);
     // No page content arrived, so no trust line is spent on it.
     try t.expect(std.mem.indexOf(u8, rtext, TRUST_LINE) == null);
+    // The count nudges only once there is something to clean up: a
+    // single view says nothing, three say so in the text lane too.
+    try t.expect(std.mem.indexOf(u8, text, "web views are now open") == null);
+    try t.expect(std.mem.indexOf(u8, rtext, "3 web views are now open") != null);
 }
 
 test "web_snapshot: kind/document/revision structured, unchanged said once" {
@@ -2772,7 +2816,7 @@ test "web_eval: a JSON value stays JSON in structuredContent, a long one is page
     const arena = arena_state.allocator();
     const t = std.testing;
 
-    const num = try evalResult(arena, .headless, EXAMPLE, "42");
+    const num = try evalResult(arena, .headless, EXAMPLE, "42", EVAL_INLINE_CHARS);
     const np = try mcp.expectToolResultShape(arena, "web_eval", num);
     const nsc = np.object.get("structuredContent").?.object;
     try t.expect(nsc.get("evaluated").?.bool);
@@ -2789,18 +2833,27 @@ test "web_eval: a JSON value stays JSON in structuredContent, a long one is page
     // affordance.
     const big = try arena.alloc(u8, EVAL_INLINE_CHARS + 100);
     @memset(big, 'x');
-    const cut = try evalResult(arena, .headless, EXAMPLE, big);
+    const cut = try evalResult(arena, .headless, EXAMPLE, big, EVAL_INLINE_CHARS);
     const cp = try mcp.expectToolResultShape(arena, "web_eval", cut);
     const csc = cp.object.get("structuredContent").?.object;
     try t.expect(csc.get("truncated").?.bool);
     try t.expectEqual(@as(i64, EVAL_INLINE_CHARS + 100), csc.get("total_chars").?.integer);
+    try t.expectEqual(@as(i64, EVAL_INLINE_CHARS), csc.get("inline_limit").?.integer);
+    try t.expectEqual(@as(i64, 1), csc.get("pages").?.integer);
     try t.expectEqual(@as(usize, EVAL_INLINE_CHARS), csc.get("value_text").?.string.len);
     try t.expect(csc.get("value") == null);
-    try t.expect(std.mem.indexOf(
-        u8,
-        cp.object.get("content").?.array.items[0].object.get("text").?.string,
-        "web_expand id=0",
-    ) != null);
+    const ctext = cp.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, ctext, "web_expand id=0") != null);
+    try t.expect(std.mem.indexOf(u8, ctext, "TRUNCATED") != null);
+
+    // A raised max_chars keeps the same payload whole: real JSON again,
+    // no truncation flags.
+    const whole = try evalResult(arena, .headless, EXAMPLE, try std.fmt.allocPrint(arena, "\"{s}\"", .{big}), EVAL_INLINE_CHARS + 200);
+    const wsc = (try mcp.expectToolResultShape(arena, "web_eval", whole)).object.get("structuredContent").?.object;
+    try t.expect(wsc.get("truncated") == null);
+    try t.expect(wsc.get("value_text") == null);
+    try t.expectEqual(@as(usize, EVAL_INLINE_CHARS + 100), wsc.get("value").?.string.len);
+    try t.expectEqual(@as(i64, EVAL_INLINE_CHARS + 200), wsc.get("inline_limit").?.integer);
 }
 
 test "web_scroll: before/after are structured positions and 'moved' is derived" {
@@ -3133,7 +3186,7 @@ test "web_open and web_tabs carry the identity a view lives in" {
     in_profile.profile = "work";
     in_profile.profile_kind = "named";
     in_profile.context = 3;
-    const opened = try openResult(arena, .headless, in_profile, true, false, null, null, null, "none");
+    const opened = try openResult(arena, .headless, in_profile, true, false, null, null, null, "none", 1);
     const op = try mcp.expectToolResultShape(arena, "web_open", opened);
     const osc = op.object.get("structuredContent").?.object;
     try t.expectEqualStrings("work", osc.get("profile").?.string);
@@ -3146,7 +3199,7 @@ test "web_open and web_tabs carry the identity a view lives in" {
     ) != null);
 
     // The default jar spends no words and no keys beyond the honest ones.
-    const plain = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none");
+    const plain = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none", 1);
     const psc = (try mcp.expectToolResultShape(arena, "web_open", plain)).object.get("structuredContent").?.object;
     try t.expectEqualStrings("", psc.get("profile").?.string);
     try t.expectEqualStrings("default", psc.get("profile_kind").?.string);
