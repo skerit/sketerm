@@ -201,11 +201,7 @@ fn ensureDir(path: []const u8) !void {
     }
 }
 
-fn nowMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.REALTIME, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
-}
+const wallMs = @import("../util/clock.zig").wallMs;
 
 fn randomToken() u64 {
     var buf: [8]u8 = undefined;
@@ -299,7 +295,7 @@ pub const Handle = struct {
         h.version = VERSION;
         h.content_len = content.len;
         h.content_hash = std.hash.Wyhash.hash(0xc0ffee, content);
-        h.updated_ms = nowMs();
+        h.updated_ms = wallMs();
         h.pid = @intCast(c.getpid());
 
         var out: std.Io.Writer.Allocating = .init(self.alloc);
@@ -600,7 +596,7 @@ pub fn remove(alloc: Allocator, key: []const u8) !void {
 pub fn prune(alloc: Allocator, max_age_ms: i64) !usize {
     const entries = try list(alloc);
     defer freeEntries(alloc, entries);
-    const cutoff = nowMs() - max_age_ms;
+    const cutoff = wallMs() - max_age_ms;
     var removed: usize = 0;
     for (entries) |e| {
         if (e.header.updated_ms >= cutoff) continue;

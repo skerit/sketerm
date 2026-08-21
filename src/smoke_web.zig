@@ -422,17 +422,9 @@ fn pass(comptime msg: []const u8) void {
     say("smoke-web: PASS " ++ msg);
 }
 
-fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("util/clock.zig").nowMs;
 
-fn nowUs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1_000_000 + @divTrunc(ts.tv_nsec, 1_000);
-}
+const nowUs = @import("util/clock.zig").nowUs;
 
 /// `rm -rf` by subprocess: the cache dir is a Chromium profile, and a
 /// hand-rolled recursive unlink buys nothing in a test rig.

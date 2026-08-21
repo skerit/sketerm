@@ -117,9 +117,7 @@ fn plural(buf: []u8, n: i64, unit: []const u8) []const u8 {
     }) catch "a while ago";
 }
 
-fn wallMs() i64 {
-    return @as(i64, @intCast(c.time(null))) * 1000;
-}
+const wallMs = @import("../util/clock.zig").wallMs;
 
 // ── window construction ─────────────────────────────────────────
 

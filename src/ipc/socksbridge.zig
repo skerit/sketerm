@@ -884,16 +884,10 @@ fn testWakeupFailure() !platform.Wakeup {
 fn testRunAndStop(bridge: *Bridge) !void {
     const thread = try std.Thread.spawn(.{}, Bridge.run, .{bridge});
     _ = c.usleep(20_000);
-    const start = testNowMs();
+    const start = clock.nowMs();
     bridge.requestStop();
     thread.join();
-    try std.testing.expect(testNowMs() - start < 1_000);
-}
-
-fn testNowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+    try std.testing.expect(clock.nowMs() - start < 1_000);
 }
 
 const TestMuxPair = struct {
@@ -953,10 +947,10 @@ fn testWriteAll(fd: c_int, data: []const u8) !void {
 }
 
 fn testReadExactFor(fd: c_int, out: []u8, timeout_ms: i64) !void {
-    const deadline = testNowMs() + timeout_ms;
+    const deadline = clock.nowMs() + timeout_ms;
     var off: usize = 0;
     while (off < out.len) {
-        const left = deadline - testNowMs();
+        const left = deadline - clock.nowMs();
         if (left <= 0) return error.Timeout;
         var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
         const polled = c.poll(&pfd, 1, @intCast(left));
@@ -973,9 +967,9 @@ fn testReadExactFor(fd: c_int, out: []u8, timeout_ms: i64) !void {
 }
 
 fn testExpectEofFor(fd: c_int, timeout_ms: i64) !void {
-    const deadline = testNowMs() + timeout_ms;
+    const deadline = clock.nowMs() + timeout_ms;
     while (true) {
-        const left = deadline - testNowMs();
+        const left = deadline - clock.nowMs();
         if (left <= 0) return error.Timeout;
         var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
         const polled = c.poll(&pfd, 1, @intCast(left));
@@ -1292,15 +1286,15 @@ test "egress close interrupts the published mux endpoint" {
     defer if (!closed) egress.close();
     const thread = try testSpawnJoinable(egress);
     defer thread.join();
-    const deadline = testNowMs() + 1_000;
-    while (egress.cancel.fd.load(.acquire) < 0 and testNowMs() < deadline)
+    const deadline = clock.nowMs() + 1_000;
+    while (egress.cancel.fd.load(.acquire) < 0 and clock.nowMs() < deadline)
         _ = c.usleep(1_000);
     try t.expect(egress.cancel.fd.load(.acquire) >= 0);
 
-    const start = testNowMs();
+    const start = clock.nowMs();
     egress.close();
     closed = true;
-    try t.expect(testNowMs() - start < 1_000);
+    try t.expect(clock.nowMs() - start < 1_000);
     var byte: u8 = 0;
     try t.expectEqual(@as(isize, 0), c.read(pair[1], &byte, 1));
 }
@@ -1312,7 +1306,7 @@ var test_connect_until = std.atomic.Value(i64).init(0);
 
 fn testBlockingConnect(_: std.mem.Allocator, _: ?[]const u8) ?client.Conn {
     test_connect_entered.store(true, .release);
-    while (testNowMs() < test_connect_until.load(.acquire)) _ = c.usleep(2_000);
+    while (clock.nowMs() < test_connect_until.load(.acquire)) _ = c.usleep(2_000);
     return null;
 }
 
@@ -1324,12 +1318,12 @@ test "closing an egress parked in its connect does not wait for the connect" {
     const egress = Egress.create(t.allocator, "test", testBlockingConnect) orelse
         return error.TestUnexpectedResult;
     test_connect_entered.store(false, .release);
-    test_connect_until.store(testNowMs() + 800, .release);
+    test_connect_until.store(clock.nowMs() + 800, .release);
     const thread = try testSpawnJoinable(egress);
     defer thread.join();
     while (!test_connect_entered.load(.acquire)) _ = c.usleep(1_000);
 
-    const start = testNowMs();
+    const start = clock.nowMs();
     egress.close();
-    try t.expect(testNowMs() - start < 300);
+    try t.expect(clock.nowMs() - start < 300);
 }

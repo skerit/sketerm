@@ -26,6 +26,7 @@ const builtin = @import("builtin");
 const c = @import("cbindings");
 const proto = @import("protocol.zig");
 const cefhost = @import("cefhost.zig");
+const clock = @import("../util/clock.zig");
 
 /// Poll timeout while at least one view exists — CEF wants to be
 /// pumped at roughly frame rate. With no view there is nothing to
@@ -350,7 +351,7 @@ pub const Server = struct {
         // client, reproduced ~1 in 2 focused smoke runs). An explicit
         // client flush_req has no such window in practice — a client
         // exists to send one only after pages loaded.
-        self.last_flush_ms = cefhost.nowMs();
+        self.last_flush_ms = clock.nowMs();
         self.host = cefhost.Host.init(self.gpa, &self.out);
         self.host.profile_dir = self.profile_dir;
         self.host.router = .{
@@ -413,10 +414,10 @@ pub const Server = struct {
         // reported `on_before_close`, bounded, then drain the tail.
         self.host.destroyAll();
         cefhost.filterSubShutdown(&self.host);
-        const deadline = cefhost.nowMs() + drain_deadline_ms;
-        while ((cefhost.openBrowsers() > 0 or cefhost.filterSubBusy(&self.host)) and cefhost.nowMs() < deadline) {
+        const deadline = clock.nowMs() + drain_deadline_ms;
+        while ((cefhost.openBrowsers() > 0 or cefhost.filterSubBusy(&self.host)) and clock.nowMs() < deadline) {
             cefhost.pump();
-            self.host.watchdog(cefhost.nowMs());
+            self.host.watchdog(clock.nowMs());
             _ = c.usleep(2_000);
         }
     }
@@ -488,8 +489,8 @@ pub const Server = struct {
     /// True when a client connected; false when the window elapsed and
     /// the engine should drain and exit.
     fn lingerForClient(self: *Server) bool {
-        const deadline = cefhost.nowMs() + self.linger_ms;
-        while (cefhost.nowMs() < deadline) {
+        const deadline = clock.nowMs() + self.linger_ms;
+        while (clock.nowMs() < deadline) {
             var pfd = c.struct_pollfd{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 };
             const n = c.poll(@ptrCast(&pfd), 1, idle_timeout_ms);
             const poll_errno = errno();
@@ -582,7 +583,7 @@ pub const Server = struct {
         }
         // Nothing paints without a begin frame: keep a floor under every
         // visible view in case a client stopped asking for them.
-        self.host.watchdog(cefhost.nowMs());
+        self.host.watchdog(clock.nowMs());
         // An extension that asked to restart itself is restarted HERE,
         // never inside the call that asked: `runtime.reload` destroys
         // the very background page whose script is mid-call.
@@ -591,7 +592,7 @@ pub const Server = struct {
         // the command reaches the background renderer in the same
         // message-loop turn that will carry its answer back.
         self.host.webrequestPump();
-        self.host.semanticPump(cefhost.nowMs());
+        self.host.semanticPump(clock.nowMs());
         // CEF callbacks queue outbound frames, so pump BEFORE flushing.
         cefhost.pump();
         // A decision may have arrived in that pump; retire timeouts and
@@ -612,7 +613,7 @@ pub const Server = struct {
         // ~30s Chromium commit window forever (Phase 0 measured cookies
         // lost to a kill inside it). Cheap when nothing is persistent —
         // flushProfileStores no-ops with zero flushable managers.
-        const flush_now = cefhost.nowMs();
+        const flush_now = clock.nowMs();
         if (flush_now - self.last_flush_ms >= flush_interval_ms) {
             self.last_flush_ms = flush_now;
             self.host.flushProfileStores(0, 0);

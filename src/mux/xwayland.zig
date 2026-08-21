@@ -607,11 +607,7 @@ fn executableOnPath(name: []const u8) bool {
     return false;
 }
 
-fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
 test "xwayland authority record is accepted by xauth layout parser" {
     var bytes: [64]u8 = undefined;

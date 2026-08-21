@@ -11,7 +11,7 @@ const Res = mcp.Res;
 const errRes = mcp.errRes;
 const appStopText = mcp.appStopText;
 const LogLineJ = mcp.LogLineJ;
-const wallNowMs = mcp.wallNowMs;
+const wallMs = @import("../util/clock.zig").wallMs;
 const LogReplyJ = mcp.LogReplyJ;
 const logStashTail = mcp.logStashTail;
 const findWordRun = mcp.findWordRun;
@@ -45,7 +45,7 @@ const screenshotCaption = mcp.screenshotCaption;
 const a11yFetch = mcp.a11yFetch;
 const firstToplevelId = mcp.firstToplevelId;
 const argBool = mcp.argBool;
-const monoMs = mcp.monoMs;
+const nowMs = @import("../util/clock.zig").nowMs;
 const numArray = mcp.numArray;
 const applyDebugWrap = mcp.applyDebugWrap;
 const argStr = mcp.argStr;
@@ -266,8 +266,8 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         };
         const wait_for = argStr(args, "wait_for") orelse "window";
         if (eql(u8, wait_for, "exit")) {
-            const deadline = monoMs() + wait_ms;
-            while (!app.exited and monoMs() < deadline) _ = app.pumpOnce(50);
+            const deadline = nowMs() + wait_ms;
+            while (!app.exited and nowMs() < deadline) _ = app.pumpOnce(50);
         } else {
             _ = app.waitFirstWindow(wait_ms);
         }
@@ -734,7 +734,7 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             .ignore_unknown_fields = true,
         }) catch return appErr(arena, "malformed log reply");
         const r = parsed.value;
-        const now_wall: i64 = wallNowMs();
+        const now_wall: i64 = wallMs();
 
         if (line_id != 0) {
             // One line in full — the post-exit stash may return the whole
@@ -982,9 +982,9 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             }
             var offsets: std.ArrayList(i64) = .empty;
             defer offsets.deinit(arena);
-            const t0 = monoMs();
+            const t0 = nowMs();
             var first: ?appdrive.App.Shot = null;
-            while (monoMs() - t0 < burst_ms and pngs.items.len < count) {
+            while (nowMs() - t0 < burst_ms and pngs.items.len < count) {
                 if (pngs.items.len > 0) {
                     _ = app.pumpOnce(25);
                     if (app.peekDiffPct(win_id, region) < min_pct) {
@@ -997,7 +997,7 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
                     mcp.app_state.allocator.free(shot.png);
                     break;
                 };
-                offsets.append(arena, monoMs() - t0) catch break;
+                offsets.append(arena, nowMs() - t0) catch break;
                 if (first == null) first = shot;
                 if (app.exited) break;
             }
@@ -1245,7 +1245,7 @@ fn waitLog(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) !
     // happened resolves immediately; from_id skips history when the
     // caller specifically needs a NEW occurrence.
     var from: u64 = @intCast(@max(argInt(args, "from_id") orelse 0, 0));
-    const t0 = monoMs();
+    const t0 = nowMs();
     const deadline = t0 + timeout_ms;
     var scanned: usize = 0;
     var newest: u64 = 0;
@@ -1256,7 +1256,7 @@ fn waitLog(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) !
                 scanned += 1;
                 newest = l.id;
                 if (!m.matches(l.text)) continue;
-                const elapsed = monoMs() - t0;
+                const elapsed = nowMs() - t0;
                 const wid = firstToplevelId(app);
                 const frame = app.frameCount(wid);
                 var res = Res.init(arena);
@@ -1295,12 +1295,12 @@ fn waitLog(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) !
             return appStateErr(arena, app, .conflict, try std.fmt.allocPrint(
                 arena,
                 "the app exited before any log line matched \"{s}\" ({d} line(s) scanned in {d}ms)",
-                .{ pat, scanned, monoMs() - t0 },
+                .{ pat, scanned, nowMs() - t0 },
             ));
         }
         if (Watchdog.fired.load(.acquire))
             return errRes(arena, .timeout, "app_wait_log aborted by the MCP hard timeout");
-        if (monoMs() >= deadline) break;
+        if (nowMs() >= deadline) break;
         // Pumped sleep: keeps frames/exit flowing while we wait.
         _ = app.pumpOnce(200);
     }
@@ -1664,7 +1664,7 @@ pub fn runActionSteps(
             const btn: u32 = @intCast(argInt(wv, "button") orelse 1);
             const region = regionFrom(wv);
             const wid = win_step orelse firstToplevelId(app);
-            const deadline = monoMs() + timeout_ms;
+            const deadline = nowMs() + timeout_ms;
             var found: ?FoundMatch = null;
             while (true) {
                 switch (try findInWindow(arena, app, wid, region, needle, min_score, 1)) {
@@ -1673,7 +1673,7 @@ pub fn runActionSteps(
                     },
                     .err => {}, // window not rendered yet — keep waiting
                 }
-                if (found != null or app.exited or app.presentationGone() or monoMs() >= deadline) break;
+                if (found != null or app.exited or app.presentationGone() or nowMs() >= deadline) break;
                 _ = app.pumpOnce(50);
             }
             if (probeAppStop(app, 1_000)) |stop| {
@@ -1724,7 +1724,7 @@ pub fn runActionSteps(
             const psm: i32 = @intCast(argInt(wv, "psm") orelse 6);
             const lang = argStr(wv, "lang") orelse "eng";
             const wid = win_step orelse firstToplevelId(app);
-            const deadline = monoMs() + timeout_ms;
+            const deadline = nowMs() + timeout_ms;
             var seen: ?OcrOut = null;
             var fatal: ?[]const u8 = null;
             while (true) {
@@ -1738,7 +1738,7 @@ pub fn runActionSteps(
                         if (!std.mem.startsWith(u8, e, "no rendered")) fatal = e;
                     },
                 }
-                if (seen != null or fatal != null or app.exited or app.presentationGone() or monoMs() >= deadline) break;
+                if (seen != null or fatal != null or app.exited or app.presentationGone() or nowMs() >= deadline) break;
                 _ = app.waitIdle(std.math.maxInt(i32), 300); // pumped sleep between OCR passes
             }
             if (probeAppStop(app, 1_000)) |stop| {
@@ -1989,7 +1989,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         if (role == null and name_sub == null)
             return errRes(arena, .invalid_args, "app_wait_for_element requires 'role' and/or 'name'");
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, mcp.WAIT_CAP_MS);
-        const deadline = monoMs() + timeout_ms;
+        const deadline = nowMs() + timeout_ms;
         while (true) {
             switch (a11yFetch(arena, app, 5_000)) {
                 .tree => |t| if (a11yFindMatch(t, role, name_sub)) |node| {
@@ -2006,7 +2006,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
                 return appStateErr(arena, app, .conflict, "the app exited while waiting for an element");
             if (Watchdog.fired.load(.acquire))
                 return errRes(arena, .timeout, "element wait aborted by the MCP hard timeout");
-            if (monoMs() >= deadline) {
+            if (nowMs() >= deadline) {
                 // Distinguish "not there yet" from "this app has no
                 // accessible tree at all" — the second never resolves,
                 // so waiting again is pure waste.
@@ -2110,7 +2110,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         // app busy inside its draw path reads as "settled (no new
         // frames)" identically to a wedged one.
         const frames_before = app.frameCount(wid);
-        const t0 = monoMs();
+        const t0 = nowMs();
         var res = Res.init(arena);
         var outcome: []const u8 = undefined;
         var mode: []const u8 = "idle";
@@ -2124,7 +2124,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             if (wid == 0) return errRes(arena, .not_found, "no rendered window yet (min_frames needs one)");
             if (app.waitFrameAfter(wid, frames_before + want - 1, timeout_ms)) {
                 settled_ok = true;
-                outcome = try std.fmt.allocPrint(arena, "committed {d} new frame(s) within {d}ms", .{ want, monoMs() - t0 });
+                outcome = try std.fmt.allocPrint(arena, "committed {d} new frame(s) within {d}ms", .{ want, nowMs() - t0 });
             } else {
                 // Falling short is USUALLY arithmetic, not a fault: an
                 // app at 12fps cannot deliver 1400 frames in 115s no
@@ -2134,7 +2134,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
                 // worst possible reflex, because the same message is
                 // how a real freeze announces itself. Only ZERO frames
                 // is a liveness claim now.
-                outcome = try shortFramesVerdict(arena, wid, app.frameCount(wid) - frames_before, want, monoMs() - t0, timeout_ms);
+                outcome = try shortFramesVerdict(arena, wid, app.frameCount(wid) - frames_before, want, nowMs() - t0, timeout_ms);
             }
         } else if (argFloat(args, "change_pct")) |pct| {
             // Visual quiescence: frames may keep committing (a game
@@ -2172,10 +2172,10 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         try res.fact("frames_before", frames_before);
         try res.fact("frames_committed", delta);
         try res.fact("frame_now", app.frameCount(wid));
-        try res.fact("waited_ms", monoMs() - t0);
+        try res.fact("waited_ms", nowMs() - t0);
         try res.text(outcome);
         try res.textf("observed: window {d} committed {d} frame(s) during the {d}ms wait (now at frame {d})", .{
-            wid, delta, monoMs() - t0, app.frameCount(wid),
+            wid, delta, nowMs() - t0, app.frameCount(wid),
         });
         try addAppSummary(&res, arena, app);
         return res.finish();
@@ -2247,11 +2247,9 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             else => return errRes(arena, .conflict, "recording produced no frames"),
         };
         defer mcp.app_state.allocator.free(result.data);
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
         const ext = if (result.webm) "webm" else "gif";
         const path = argStr(args, "path") orelse
-            try std.fmt.allocPrint(arena, "/tmp/sketerm-rec-{d}-{d}.{s}", .{ c.getpid(), ts.tv_sec, ext });
+            try std.fmt.allocPrint(arena, "/tmp/sketerm-rec-{d}-{d}.{s}", .{ c.getpid(), @divTrunc(wallMs(), 1000), ext });
         saveRecording(path, result.data) catch |err| return errRes(
             arena,
             .io_failed,
@@ -2297,7 +2295,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         const lang = argStr(args, "lang") orelse "eng";
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 15_000, 0, mcp.WAIT_CAP_MS);
         const do_click = argBool(args, "click");
-        const deadline = monoMs() + timeout_ms;
+        const deadline = nowMs() + timeout_ms;
         var seen: ?OcrOut = null;
         var last_text: []const u8 = "";
         while (true) {
@@ -2310,7 +2308,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
                     if (!std.mem.startsWith(u8, e, "no rendered")) return ocrErr(arena, e);
                 },
             }
-            if (seen != null or app.exited or monoMs() >= deadline) break;
+            if (seen != null or app.exited or nowMs() >= deadline) break;
             _ = app.waitIdle(std.math.maxInt(i32), 300); // pumped sleep between OCR passes
         }
         const o = seen orelse {
@@ -2409,7 +2407,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, mcp.WAIT_CAP_MS);
         const do_click = argBool(args, "click");
         const btn: u32 = @intCast(argInt(args, "button") orelse 1);
-        const deadline = monoMs() + timeout_ms;
+        const deadline = nowMs() + timeout_ms;
         var found: ?FoundMatch = null;
         while (true) {
             switch (try findInWindow(arena, app, wid, region, needle, min_score, 1)) {
@@ -2418,7 +2416,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
                 },
                 .err => {}, // window not rendered yet — keep waiting
             }
-            if (found != null or app.exited or monoMs() >= deadline) break;
+            if (found != null or app.exited or nowMs() >= deadline) break;
             _ = app.pumpOnce(50);
         }
         const m = found orelse return errRes(arena, .timeout, try std.fmt.allocPrint(
@@ -2684,7 +2682,7 @@ fn hoverMap(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) 
     const map = try arena.alloc(f64, probes);
     @memset(map, 0);
     var hits: usize = 0;
-    const t0 = monoMs();
+    const t0 = nowMs();
     var stopped = false;
     var r: usize = 0;
     outer: while (r < rows) : (r += 1) {
@@ -2716,13 +2714,13 @@ fn hoverMap(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) 
     try res.fact("cols", cols);
     try res.fact("rows", rows);
     try res.fact("probes", probes);
-    try res.fact("elapsed_ms", monoMs() - t0);
+    try res.fact("elapsed_ms", nowMs() - t0);
     try res.fact("settle_ms", settle_ms);
     try res.fact("min_change_pct", min_pct);
     try res.fact("stopped_early", stopped);
     try res.fact("hits", hits);
     try res.textf("hover map of window {d} over ({d},{d}) {d}x{d}: {d}x{d} grid, {d} probes in {d}ms ({d}ms settle, threshold {d:.2}%)", .{
-        wid, region.x, region.y, region.w, region.h, cols, rows, probes, monoMs() - t0, settle_ms, min_pct,
+        wid, region.x, region.y, region.w, region.h, cols, rows, probes, nowMs() - t0, settle_ms, min_pct,
     });
     if (stopped) try res.text("the sweep STOPPED EARLY (the app exited or the window vanished) — the map below is partial");
 

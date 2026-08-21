@@ -27,7 +27,7 @@ const AttachReq = dmod.AttachReq;
 const WorkerReady = dmod.WorkerReady;
 const WorkerMeta = dmod.WorkerMeta;
 const WorkerPush = dmod.WorkerPush;
-const nowMs = dmod.nowMs;
+const nowMs = @import("../util/clock.zig").nowMs;
 const cwdOfPid = dmod.cwdOfPid;
 const pathZ = @import("../util/pathz.zig").pathZ;
 const version = @import("../version.zig");
@@ -35,7 +35,7 @@ const cast_rec = @import("cast.zig");
 const opuscodec = @import("opuscodec.zig");
 const build_options = @import("build_options");
 const wsproto = @import("../winstream/proto.zig");
-const wallMs = dmod.wallMs;
+const wallMs = @import("../util/clock.zig").wallMs;
 const webstore = @import("webstore.zig");
 const webprofiles = @import("../ipc/webprofiles.zig");
 const webfindbin = @import("../web/findbin.zig");
@@ -312,7 +312,7 @@ pub fn addPassedClient(self: *Daemon, fd: c_int, req: PassedClient) void {
         self.queueAttachIdentity(cl, s);
     self.queueSnapshot(cl, s);
     // Cast playback auto-starts once its first viewer arrives.
-    self.castOnAttach(s, dmod.nowMs());
+    self.castOnAttach(s, nowMs());
     if (req.winstream_channels and s.winstream != null) self.openWinstreamChan(s, cl);
     if (req.native_state_max >= wire.LEGACY_NATIVE_STATE_VERSION or req.audio_channels) self.replayNativeChannels(cl, s);
     self.refreshVideoGates();

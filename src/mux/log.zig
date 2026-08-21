@@ -17,6 +17,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const diag = @import("../util/diag.zig");
+const clock = @import("../util/clock.zig");
 
 /// One-generation rotation: at open, a file past this moves to
 /// <path>.old so the log can't grow unbounded across months.
@@ -91,10 +92,10 @@ pub fn debug(comptime fmt: []const u8, args: anytype) void {
 fn emit(level: u8, comptime fmt: []const u8, args: anytype) void {
     if (g.fd < 0) return;
     var line: [1024]u8 = undefined;
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+    const wall = clock.wallMs();
+    var secs: c.time_t = @intCast(@divTrunc(wall, 1000));
     var tm: c.struct_tm = undefined;
-    _ = c.localtime_r(&ts.tv_sec, &tm);
+    _ = c.localtime_r(&secs, &tm);
     const head = std.fmt.bufPrint(
         &line,
         "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} [{d}] {c} ",
@@ -105,7 +106,7 @@ fn emit(level: u8, comptime fmt: []const u8, args: anytype) void {
             @as(u32, @intCast(tm.tm_hour)),
             @as(u32, @intCast(tm.tm_min)),
             @as(u32, @intCast(tm.tm_sec)),
-            @as(u32, @intCast(@divTrunc(ts.tv_nsec, 1_000_000))),
+            @as(u32, @intCast(@mod(wall, 1000))),
             c.getpid(),
             level,
         },

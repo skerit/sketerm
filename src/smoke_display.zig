@@ -597,11 +597,7 @@ fn pumpFor(vs: []*Viewer, ms: i64) void {
     }
 }
 
-fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("util/clock.zig").nowMs;
 
 fn childAlive(pid: c.pid_t) bool {
     var st: c_int = 0;

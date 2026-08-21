@@ -295,18 +295,12 @@ const Stats = struct {
         return self.on;
     }
 
-    fn nowNs() u64 {
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-        return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
-    }
-
     fn note(self: *Stats, ns: u64, payload: usize) void {
         self.frames += 1;
         self.ns_total += ns;
         if (ns > self.ns_max) self.ns_max = ns;
         self.bytes += payload;
-        const now = nowNs();
+        const now = clock.nowNs();
         if (self.window_start_ns == 0) {
             self.window_start_ns = now;
             return;
@@ -4866,12 +4860,6 @@ pub const WebFace = struct {
     var g_ax_off_until_ms: i64 = 0;
     const ax_reprobe_ms: i64 = 30_000;
 
-    fn axNowMs() i64 {
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-        return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-    }
-
     const AxJob = struct {
         gpa: std.mem.Allocator,
         /// Identity token; dereferenced only after it matches a live
@@ -4899,7 +4887,7 @@ pub const WebFace = struct {
         // A forced-off override needs no probe and no worker at all.
         if (a11ydetect.override()) |o| {
             if (!o.enabled()) return;
-        } else if (axNowMs() < g_ax_off_until_ms) return;
+        } else if (clock.nowMs() < g_ax_off_until_ms) return;
         if (self.ax_proj != null) {
             // A fresh helper connection knows nothing of the earlier
             // enable; the projection itself survives helper restarts.
@@ -4976,7 +4964,7 @@ pub const WebFace = struct {
             // No reader (or the bus refused us): back off so minting
             // views does not spawn a probe thread apiece, but let the
             // window expire so a reader started later is still found.
-            if (!job.reason.enabled()) g_ax_off_until_ms = axNowMs() + ax_reprobe_ms;
+            if (!job.reason.enabled()) g_ax_off_until_ms = clock.nowMs() + ax_reprobe_ms;
             job.discard();
             return 0;
         }
@@ -5427,7 +5415,7 @@ pub const WebFace = struct {
         };
         if (self.widgets_dead) return;
         const stats = g_stats.enabled();
-        const t0 = if (stats) Stats.nowNs() else 0;
+        const t0 = if (stats) clock.nowNs() else 0;
 
         // Geometry changes retire the whole pool: a cached import is the
         // old size, and the ids start over.
@@ -5458,7 +5446,7 @@ pub const WebFace = struct {
         self.presentTexture(t, logicalOf(f.w, self.sent_scale), logicalOf(f.h, self.sent_scale), false);
         if (stats) {
             g_stats.gpu_imports += 1;
-            g_stats.note(Stats.nowNs() - t0, 0);
+            g_stats.note(clock.nowNs() - t0, 0);
         }
         self.notePaint();
         self.clearStatus();
@@ -5587,7 +5575,7 @@ pub const WebFace = struct {
         const m = self.map orelse return;
         if (self.buf_w == 0 or self.buf_h == 0) return;
         const stats = g_stats.enabled();
-        const t0 = if (stats) Stats.nowNs() else 0;
+        const t0 = if (stats) clock.nowNs() else 0;
 
         var uploaded: usize = 0;
         var region: ?*c.cairo_region_t = null;
@@ -5634,7 +5622,7 @@ pub const WebFace = struct {
         self.probeMapping(m);
         self.notePaint();
         self.clearStatus();
-        if (stats) g_stats.note(Stats.nowNs() - t0, uploaded);
+        if (stats) g_stats.note(clock.nowNs() - t0, uploaded);
     }
 
     pub fn onTitle(self: *WebFace, title: []const u8) void {

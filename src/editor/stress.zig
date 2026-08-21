@@ -26,11 +26,7 @@ const Document = doc_mod.Document;
 const tr = @import("transaction.zig");
 const uni = @import("unicode.zig");
 
-fn nowNs() i128 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
-}
+const nowNs = @import("../util/clock.zig").nowNs;
 
 /// Fails with the measured duration when `ns` exceeds `budget_ms`.
 fn expectUnder(label: []const u8, ns: i128, budget_ms: u32) !void {

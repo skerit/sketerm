@@ -41,6 +41,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const dbus = @import("../mux/dbus.zig");
 const webproj = @import("webproj.zig");
+const clock = @import("../util/clock.zig");
 
 /// Total wall-clock budget. A desktop whose a11y bus needs longer than
 /// this to answer is treated as absent rather than stalling a browser
@@ -93,7 +94,7 @@ pub fn detect(gpa: std.mem.Allocator) Reason {
 }
 
 fn probe(gpa: std.mem.Allocator) !Reason {
-    const deadline = webproj.nowMs() + PROBE_BUDGET_MS;
+    const deadline = clock.nowMs() + PROBE_BUDGET_MS;
     var path_buf: [256]u8 = undefined;
     const env = c.getenv("DBUS_SESSION_BUS_ADDRESS") orelse return .unavailable;
     const sess = webproj.parseUnixPath(std.mem.sliceTo(env, 0), &path_buf) orelse

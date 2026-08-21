@@ -21,7 +21,7 @@ const wire = @import("wire.zig");
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
 const Client = dmod.Client;
-const nowMs = dmod.nowMs;
+const nowMs = @import("../util/clock.zig").nowMs;
 
 /// Cap on one debugger job's captured output. A `thread apply all bt
 /// full` on a 200-thread JVM runs to megabytes of locals; the head is

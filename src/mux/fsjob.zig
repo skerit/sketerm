@@ -147,11 +147,7 @@ fn matchCapOf(spec: Spec) usize {
     return @intCast(@min(spec.max_matches, MAX_MATCHES_CEILING));
 }
 
-/// Wall-clock milliseconds. Relative-time predicates compare against
-/// file mtimes, which are wall clock, so they cannot use nowMs().
-fn wallMs() i64 {
-    return @as(i64, c.time(null)) * 1000;
-}
+const wallMs = @import("../util/clock.zig").wallMs;
 
 // ── progress emission ───────────────────────────────────────────
 

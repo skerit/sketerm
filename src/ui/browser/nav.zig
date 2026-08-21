@@ -1329,7 +1329,7 @@ fn fillJumpList(ctx: *JumpCtx, filter: []const u8) void {
     while (c.gtk_list_box_get_row_at_index(lb, 0)) |row|
         c.gtk_list_box_remove(lb, @ptrCast(@alignCast(row)));
     var idx: [JUMP_ROWS]usize = undefined;
-    const ranked = places_mod.frecencyRank(ctx.view.frecency.items, filter, nowMsWall(), &idx);
+    const ranked = places_mod.frecencyRank(ctx.view.frecency.items, filter, wallMs(), &idx);
     for (ranked) |i| {
         const spec = ctx.view.frecency.items[i].spec;
         var z: [4300:0]u8 = undefined;
@@ -1343,11 +1343,7 @@ fn fillJumpList(ctx: *JumpCtx, filter: []const u8) void {
     }
 }
 
-fn nowMsWall() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
-}
+const wallMs = @import("../../util/clock.zig").wallMs;
 
 fn onJumpChanged(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(JumpCtx, user);

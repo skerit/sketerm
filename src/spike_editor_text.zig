@@ -49,11 +49,7 @@ const LINES = [_][]const u8{
     "final line: hit-testing maps pixels back to bytes.",
 };
 
-fn nowNs() u64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
-}
+const nowNs = @import("util/clock.zig").nowNs;
 
 /// One positioned glyph quad, in pixel coordinates (y-down).
 const PGlyph = struct {

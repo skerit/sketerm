@@ -8,6 +8,7 @@
 //! broker/worker naming details.
 
 const std = @import("std");
+const nowMs = @import("../util/clock.zig").nowMs;
 const c = @import("../c.zig").c;
 const client = @import("client.zig");
 const daemon = @import("daemon.zig");
@@ -1083,9 +1084,7 @@ fn runCommand(allocator: std.mem.Allocator, a_in: Args) u8 {
             break;
         }
         if (loadRunSignal() != 0) {
-            var ts: c.struct_timespec = undefined;
-            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-            const now = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+            const now = nowMs();
             if (signal_deadline == 0) signal_deadline = now + 5000;
             if (!sent_kill and now >= signal_deadline) {
                 if (c.kill(-pid, c.SIGKILL) < 0) _ = c.kill(pid, c.SIGKILL);

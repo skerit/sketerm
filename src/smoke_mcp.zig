@@ -59,11 +59,7 @@ fn fail(comptime msg: []const u8) noreturn {
     std.process.exit(1);
 }
 
-fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("util/clock.zig").nowMs;
 
 /// A running `sketerm mcp` subprocess plus its stdio pipes.
 const Mcp = struct {

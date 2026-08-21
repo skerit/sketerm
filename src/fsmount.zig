@@ -291,7 +291,7 @@ pub const Mount = struct {
 
     fn retryQueuedPin(self: *Mount, index: usize) void {
         const pin = &self.pin_queue.items[index];
-        pin.retry_at_ms = monotonicNowMs() + pin.retry_delay_ms;
+        pin.retry_at_ms = nowMs() + pin.retry_delay_ms;
         pin.retry_delay_ms = @min(pin.retry_delay_ms * 2, 60_000);
     }
 
@@ -381,17 +381,9 @@ fn setFuseTime(sec: *u64, nsec: *u32, ms: i64) void {
     nsec.* = @intCast(@mod(nonneg, 1000) * 1_000_000);
 }
 
-fn realNowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
-    return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
-}
+const wallMs = @import("util/clock.zig").wallMs;
 
-fn monotonicNowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.tv_sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.tv_nsec)), 1_000_000);
-}
+const nowMs = @import("util/clock.zig").nowMs;
 
 fn fuseTimeMs(sec: u64, nsec: u32) ?i64 {
     if (nsec >= std.time.ns_per_s) return null;
@@ -621,7 +613,7 @@ fn processDeltas(m: *Mount) void {
 
 fn servicePinnedCache(m: *Mount) void {
     if (m.pin_queue.items.len == 0) return;
-    const now = monotonicNowMs();
+    const now = nowMs();
     var index: ?usize = null;
     for (m.pin_queue.items, 0..) |pin, i| {
         if (pin.retry_at_ms <= now) {
@@ -669,7 +661,7 @@ fn servicePinnedCache(m: *Mount) void {
 
 fn pinPollTimeout(m: *const Mount) c_int {
     if (m.pin_queue.items.len == 0) return -1;
-    const now = monotonicNowMs();
+    const now = nowMs();
     var delay: i64 = std.math.maxInt(c_int);
     for (m.pin_queue.items) |pin| delay = @min(delay, @max(pin.retry_at_ms - now, 0));
     return @intCast(delay);
@@ -1036,7 +1028,7 @@ fn dispatch(m: *Mount, req: []align(8) u8) void {
                     if (in.valid & c.FATTR_GID != 0) in.gid else null,
                 ) catch |err| return replyErr(fd, u, errnoOf(err, m.fs.lastErr()));
             if (in.valid & (c.FATTR_ATIME | c.FATTR_MTIME | c.FATTR_ATIME_NOW | c.FATTR_MTIME_NOW) != 0) {
-                const now = realNowMs();
+                const now = wallMs();
                 const atime: ?i64 = if (in.valid & c.FATTR_ATIME_NOW != 0)
                     now
                 else if (in.valid & c.FATTR_ATIME != 0)

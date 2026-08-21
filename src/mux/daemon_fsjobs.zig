@@ -16,8 +16,8 @@ const Client = dmod.Client;
 const Session = dmod.Session;
 const FsJob = dmod.FsJob;
 const FsOpReq = @import("daemon_serve.zig").FsOpReq;
-const nowMs = dmod.nowMs;
-const wallMs = dmod.wallMs;
+const nowMs = @import("../util/clock.zig").nowMs;
+const wallMs = @import("../util/clock.zig").wallMs;
 const fsReplyErr = @import("daemon_serve.zig").fsReplyErr;
 
 // ── subprocess file jobs (copy / delete_tree / hash) ────────────

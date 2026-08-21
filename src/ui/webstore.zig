@@ -62,9 +62,7 @@ const Store = struct {
 
 var g_store: Store = .{};
 
-fn nowMs() i64 {
-    return @divTrunc(c.g_get_monotonic_time(), 1000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
 /// Bring the connection up (or report why not). False = degrade
 /// silently, exactly like a store-less daemon.

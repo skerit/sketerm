@@ -174,11 +174,7 @@ pub fn signalName(sig: c_int) []const u8 {
     };
 }
 
-fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("clock.zig").nowMs;
 
 /// $XDG_STATE_HOME/sketerm/crash.log (fallback ~/.local/state/...) -
 /// deliberately beside the daemon's mux.log so a post-mortem has both

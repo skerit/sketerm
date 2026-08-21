@@ -390,9 +390,7 @@ fn rangesEql(a: []const Range, b: []const Range) bool {
     return true;
 }
 
-fn nowMs() i64 {
-    return @divTrunc(c.g_get_monotonic_time(), 1000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
 fn classInitTerm(klass: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
     const wc: *c.GtkWidgetClass = @ptrCast(@alignCast(klass));

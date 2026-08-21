@@ -264,10 +264,9 @@ const McpLog = struct {
         _ = c.mkdir(dir_z.ptr, 0o700); // parent must exist; fopen below is the real check
         // Each session logs into its own datetime-named subfolder so
         // traces and screenshots of separate runs never interleave.
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+        var secs: c.time_t = @intCast(@divTrunc(clock.wallMs(), 1000));
         var tm: c.struct_tm = undefined;
-        _ = c.localtime_r(&ts.tv_sec, &tm);
+        _ = c.localtime_r(&secs, &tm);
         const sub = std.fmt.bufPrintZ(&z, "{s}/{d:0>4}{d:0>2}{d:0>2}-{d:0>2}{d:0>2}{d:0>2}", .{
             dir_arg,
             @as(u32, @intCast(@as(i64, tm.tm_year) + 1900)),
@@ -297,11 +296,11 @@ const McpLog = struct {
     }
 
     fn stamp(buf: *[40]u8) []const u8 {
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
+        const wall = clock.wallMs();
+        var secs: c.time_t = @intCast(@divTrunc(wall, 1000));
         var tm: c.struct_tm = undefined;
-        _ = c.localtime_r(&ts.tv_sec, &tm);
-        const ms: u32 = @intCast(@divTrunc(ts.tv_nsec, 1_000_000));
+        _ = c.localtime_r(&secs, &tm);
+        const ms: u32 = @intCast(@mod(wall, 1000));
         return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}", .{
             @as(u32, @intCast(@as(i64, tm.tm_year) + 1900)), @as(u32, @intCast(tm.tm_mon + 1)),
             @as(u32, @intCast(tm.tm_mday)),                  @as(u32, @intCast(tm.tm_hour)),
@@ -522,7 +521,7 @@ pub const Watchdog = struct {
             if (pfd >= 0) addFd(pfd);
         }
         fired.store(false, .release);
-        started_ms = monoMs();
+        started_ms = clock.nowMs();
     }
 
     fn addFd(fd: c_int) void {
@@ -548,7 +547,7 @@ pub const Watchdog = struct {
             var ts = c.struct_timespec{ .tv_sec = 1, .tv_nsec = 0 };
             _ = c.nanosleep(&ts, null);
             _ = c.pthread_mutex_lock(&mu);
-            const overdue = started_ms != 0 and !fired.load(.acquire) and monoMs() - started_ms > hard_ms;
+            const overdue = started_ms != 0 and !fired.load(.acquire) and clock.nowMs() - started_ms > hard_ms;
             if (overdue) {
                 fired.store(true, .release);
                 for (fds[0..fd_count]) |fd| _ = c.shutdown(fd, c.SHUT_RDWR);
@@ -985,7 +984,7 @@ const RealBackend = struct {
 
     fn pollUntil(fd: c_int, events: c_short, deadline_ms: i64) !void {
         while (true) {
-            const remain = deadline_ms - monoMs();
+            const remain = deadline_ms - clock.nowMs();
             if (remain <= 0) return error.Timeout;
             var pfd = c.struct_pollfd{ .fd = fd, .events = events, .revents = 0 };
             const rc = c.poll(&pfd, 1, @intCast(@min(remain, 100)));
@@ -999,8 +998,8 @@ const RealBackend = struct {
     /// Millisecond-deadline direct GUI exchange used by ui_wait_event.
     fn talkFor(ctx: *anyopaque, allocator: std.mem.Allocator, line: []const u8, timeout_ms: i64) DirectTalkResult {
         const self: *RealBackend = @ptrCast(@alignCast(ctx));
-        const deadline = monoMs() + @max(timeout_ms, 0);
-        if (deadline - monoMs() <= 0) return directFailure(error.Timeout, false);
+        const deadline = clock.nowMs() + @max(timeout_ms, 0);
+        if (deadline - clock.nowMs() <= 0) return directFailure(error.Timeout, false);
         const fd = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
         if (fd < 0) return directFailure(error.SocketFailed, false);
         defer _ = c.close(fd);
@@ -1010,7 +1009,7 @@ const RealBackend = struct {
         var addr: c.struct_sockaddr_un = undefined;
         @import("../mux/daemon.zig").fillSockaddrUn(&addr, self.sock_path) catch |err|
             return directFailure(err, false);
-        if (deadline - monoMs() <= 0) return directFailure(error.Timeout, false);
+        if (deadline - clock.nowMs() <= 0) return directFailure(error.Timeout, false);
         const connected = c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un));
         if (connected != 0) {
             const e = std.posix.errno(connected);
@@ -1028,7 +1027,7 @@ const RealBackend = struct {
         defer allocator.free(request);
         var sent: usize = 0;
         while (sent < request.len) {
-            if (deadline - monoMs() <= 0) return directFailure(error.Timeout, sent > 0);
+            if (deadline - clock.nowMs() <= 0) return directFailure(error.Timeout, sent > 0);
             const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
                 c.send(fd, request.ptr + sent, request.len - sent, c.MSG_NOSIGNAL)
             else
@@ -1790,12 +1789,12 @@ test "watchdog fs cancellation follows a replacement connection during one call"
     defer canceler.join();
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
-    const start = monoMs();
+    const start = clock.nowMs();
     try t.expectError(
         fsdrive.Error.NotConnected,
         state.fs.?.statPath(arena_state.allocator(), "/tmp/watchdog-no-reply"),
     );
-    try t.expect(monoMs() - start < 500);
+    try t.expect(clock.nowMs() - start < 500);
     try t.expectEqual(@as(c_int, -1), Watchdog.fs_fd.fd.load(.acquire));
 
     state.drop();
@@ -2864,10 +2863,10 @@ pub const PostInputWait = struct {
             .settle_ms = settle_ms,
             .min_pct = min_pct,
             .region = regionFrom(args),
-            .t0 = monoMs(),
+            .t0 = clock.nowMs(),
             .frame_at_input = app.frameCount(win_id),
             .last_commit_before = app.lastCommitMs(win_id),
-            .injected_at = monoMs(),
+            .injected_at = clock.nowMs(),
         };
     }
 
@@ -2908,7 +2907,7 @@ pub const PostInputWait = struct {
         }
         if (app.waitChangeSince(win_id, &self.ref.?, self.timeout_ms, self.min_pct, self.region)) {
             self.repainted = true;
-            const elapsed = monoMs() - self.t0;
+            const elapsed = clock.nowMs() - self.t0;
             if (self.settle_ms > 0) {
                 const remain = @max(self.timeout_ms - elapsed, 500);
                 _ = if (self.min_pct > 0)
@@ -3052,16 +3051,6 @@ pub fn numArray(v: std.json.Value, comptime n: usize) ?[n]f64 {
     return out;
 }
 
-pub const monoMs = clock.nowMs;
-
-/// Wall-clock ms, matching the daemon's log-line timestamps. Full ms
-/// precision — a seconds-truncated "now" makes fresh lines look like
-/// they are from the future ("-0.5s ago").
-pub fn wallNowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
 
 /// One app_actions screenshot: draws (and consumes) the pending step
 /// marks, stores the PNG, writes the report line. Returns false when
@@ -3128,7 +3117,7 @@ pub const Journal = struct {
         const gop = map.getOrPut(a, app_id) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         const copy = a.dupe(u8, step_json) catch return;
-        gop.value_ptr.append(a, .{ .step = copy, .t = monoMs() }) catch {
+        gop.value_ptr.append(a, .{ .step = copy, .t = clock.nowMs() }) catch {
             a.free(copy);
             return;
         };
@@ -6351,7 +6340,7 @@ test "a no-repaint verdict names the app when it had already stopped painting" {
     // The window was painting a moment before the input: a dry wait is
     // genuinely ambiguous (dead area vs an app that reacts silently),
     // and must still say so.
-    fixture.app.windows.items[0].last_commit_ms = monoMs() - 100;
+    fixture.app.windows.items[0].last_commit_ms = clock.nowMs() - 100;
     var live = PostInputWait.begin(args, fixture.app, 1, false);
     const live_note = try live.finish(arena, fixture.app, 1);
     try t.expect(std.mem.indexOf(u8, live_note, "dead area") != null);
@@ -6361,7 +6350,7 @@ test "a no-repaint verdict names the app when it had already stopped painting" {
     // The window had been silent for 10s BEFORE the input. This input
     // cannot have caused that, and the first evidence of a hang must
     // not read as a click that missed.
-    fixture.app.windows.items[0].last_commit_ms = monoMs() - 10_000;
+    fixture.app.windows.items[0].last_commit_ms = clock.nowMs() - 10_000;
     var hung = PostInputWait.begin(args, fixture.app, 1, false);
     try t.expect(hung.quietBeforeMs() >= APP_QUIET_HANG_MS);
     const hung_note = try hung.finish(arena, fixture.app, 1);

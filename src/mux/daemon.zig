@@ -58,23 +58,14 @@ const Event = @import("../parser/event.zig").Event;
 const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
 
-/// Wall-clock epoch milliseconds — ONLY for log-line timestamps that a
-/// client renders as "how long ago"; everything scheduling-related
-/// stays on the monotonic clock below.
-pub fn wallMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+/// Wall clock — ONLY for log-line timestamps a client renders as "how
+/// long ago"; everything scheduling-related stays on `nowMs`.
+const wallMs = @import("../util/clock.zig").wallMs;
 
-/// Monotonic milliseconds — the daemon's own clock. Idle durations are
-/// computed daemon-side (never as a client-vs-daemon timestamp diff) so a
-/// remote client whose clock differs still sees the right age.
-pub fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @intCast(ts.tv_sec * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
-}
+/// The daemon's own clock. Idle durations are computed daemon-side
+/// (never as a client-vs-daemon timestamp diff) so a remote client whose
+/// clock differs still sees the right age.
+const nowMs = @import("../util/clock.zig").nowMs;
 
 /// The working directory of a session's child via `/proc/<pid>/cwd`. The
 /// daemon owns the PID, so this is authoritative even when the shell never
@@ -4864,9 +4855,7 @@ pub const Daemon = struct {
     /// Pump every live window-stream session: frames toward the
     /// attached client, bounded by the poll cadence.
     fn pumpWinstreams(self: *Daemon) void {
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-        const now_ms: u64 = @intCast(ts.tv_sec * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
+        const now_ms: u64 = @intCast(nowMs());
         for (self.channels.items) |ch| {
             if (ch.dead or ch.native != null) continue;
             const chs = ch.session orelse continue;

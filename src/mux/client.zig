@@ -54,24 +54,21 @@ pub const RemoteSpec = struct {
     }
 };
 
-fn monotonicMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
+const wallMs = @import("../util/clock.zig").wallMs;
 
 /// Reap a bootstrap SSH that should exit immediately after announcing.
 fn reapBootstrapChild(pid: c.pid_t) void {
     var status: c_int = 0;
-    var deadline = monotonicMs() + 500;
-    while (monotonicMs() < deadline) {
+    var deadline = nowMs() + 500;
+    while (nowMs() < deadline) {
         const r = c.waitpid(pid, &status, c.WNOHANG);
         if (r == pid or (r < 0 and std.posix.errno(r) != .INTR)) return;
         _ = c.usleep(10_000);
     }
     _ = c.kill(pid, c.SIGTERM);
-    deadline = monotonicMs() + 250;
-    while (monotonicMs() < deadline) {
+    deadline = nowMs() + 250;
+    while (nowMs() < deadline) {
         const r = c.waitpid(pid, &status, c.WNOHANG);
         if (r == pid or (r < 0 and std.posix.errno(r) != .INTR)) return;
         _ = c.usleep(10_000);
@@ -150,10 +147,8 @@ fn udpMemoDown(host: []const u8) bool {
     const path = udpMemoPath(&buf, host) orelse return false;
     var st: c.struct_stat = undefined;
     if (c.stat(path.ptr, &st) != 0) return false;
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
     const mtime = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
-    return @as(i64, ts.tv_sec) - @as(i64, mtime) <= UDP_MEMO_TTL_S;
+    return @divTrunc(wallMs(), 1000) - @as(i64, mtime) <= UDP_MEMO_TTL_S;
 }
 
 fn udpMemoMark(host: []const u8) void {
@@ -805,7 +800,7 @@ pub const Conn = struct {
         var buf: [8192]u8 = undefined;
         var len: usize = 0;
         while (len < buf.len) {
-            const remain = deadline - monotonicMs();
+            const remain = deadline - nowMs();
             if (remain <= 0) break;
             var pfd = c.struct_pollfd{ .fd = pipe_fds[0], .events = c.POLLIN, .revents = 0 };
             const pr = c.poll(&pfd, 1, @intCast(@min(remain, 250)));
@@ -848,7 +843,7 @@ pub const Conn = struct {
         //    full bootstrap and handshake timeout.
         var resolved_buf: [256]u8 = undefined;
         var udp_host: []const u8 = if (std.mem.indexOfScalar(u8, host, '@')) |at| host[at + 1 ..] else host;
-        if (resolveSshConfig(host, &resolved_buf, monotonicMs() + timeout_ms)) |target| {
+        if (resolveSshConfig(host, &resolved_buf, nowMs() + timeout_ms)) |target| {
             if (target.proxied) return error.UdpProxiedHost;
             udp_host = target.hostname;
         }
@@ -864,7 +859,7 @@ pub const Conn = struct {
         } else null;
         // The bootstrap budget starts AFTER deployment: an upload on
         // first contact must not eat the announcement deadline.
-        const deadline = monotonicMs() + timeout_ms;
+        const deadline = nowMs() + timeout_ms;
 
         // 0.5. Bind the transport's UDP socket EARLY, so its port can
         //      ride the punch line to the remote (below) and the very
@@ -1002,7 +997,7 @@ pub const Conn = struct {
         var line_len: usize = 0;
         var announce: ?[]const u8 = null;
         outer: while (line_len < line_buf.len) {
-            const remain = deadline - monotonicMs();
+            const remain = deadline - nowMs();
             if (remain <= 0) break;
             var pfd = c.struct_pollfd{ .fd = pipe_fds[0], .events = c.POLLIN, .revents = 0 };
             const pr = c.poll(&pfd, 1, @intCast(@min(remain, 250)));
@@ -1085,7 +1080,7 @@ pub const Conn = struct {
         // thing that distinguishes filtered/NAT-mapped UDP for the
         // fallback message.
         conn.sendHello() catch return error.UdpBridgeUnreachable;
-        const remain = deadline - monotonicMs();
+        const remain = deadline - nowMs();
         if (remain <= 0) return error.UdpBridgeUnreachable;
         const w = conn.recvExpectFor(&.{.welcome}, remain) catch return error.UdpBridgeUnreachable;
         defer w.deinit(allocator);
@@ -1116,10 +1111,10 @@ pub const Conn = struct {
     pub fn connectUdpTicket(allocator: std.mem.Allocator, host: []const u8, ticket: UdpTicket) !Conn {
         const bare = RemoteSpec.parse(host).host;
         if (!validSshHost(bare)) return error.BadPath;
-        const deadline = monotonicMs() + 10_000;
+        const deadline = nowMs() + 10_000;
         var resolved_buf: [256]u8 = undefined;
         var udp_host: []const u8 = if (std.mem.indexOfScalar(u8, bare, '@')) |at| bare[at + 1 ..] else bare;
-        if (resolveSshConfig(bare, &resolved_buf, monotonicMs() + 3_000)) |target| {
+        if (resolveSshConfig(bare, &resolved_buf, nowMs() + 3_000)) |target| {
             if (!target.proxied) udp_host = target.hostname;
         }
         var port_buf: [8]u8 = undefined;
@@ -1245,9 +1240,9 @@ pub const Conn = struct {
         // Bound the welcome wait so a stalled banner surfaces as a
         // retryable error instead of hanging the blocking read forever.
         conn.sendHello() catch return error.SshTransportFailed;
-        const deadline = monotonicMs() + timeout_ms;
+        const deadline = nowMs() + timeout_ms;
         try waitReadable(conn.fd, deadline);
-        const remain = deadline - monotonicMs();
+        const remain = deadline - nowMs();
         if (remain <= 0) return error.SshTransportFailed;
         const w = conn.recvExpectFor(&.{.welcome}, remain) catch return error.SshTransportFailed;
         defer w.deinit(allocator);
@@ -1280,7 +1275,7 @@ pub const Conn = struct {
     fn waitReadable(fd: c_int, deadline: i64) !void {
         var pfd = [_]c.struct_pollfd{.{ .fd = fd, .events = c.POLLIN, .revents = 0 }};
         while (true) {
-            const remain = deadline - monotonicMs();
+            const remain = deadline - nowMs();
             if (remain <= 0) return error.SshTransportFailed;
             const r = c.poll(&pfd, 1, @intCast(remain));
             if (r > 0) return;
@@ -1362,10 +1357,10 @@ pub const Conn = struct {
     fn flushQueuedUntil(self: *Conn, deadline_ms: i64) !void {
         while (true) {
             if (self.wbuf.items.len == 0) return;
-            if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
+            if (deadline_ms - nowMs() <= 0) return error.Timeout;
             try self.flushQueued();
             if (self.wbuf.items.len == 0) return;
-            const remain = deadline_ms - monotonicMs();
+            const remain = deadline_ms - nowMs();
             if (remain <= 0) return error.Timeout;
             var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLOUT, .revents = 0 };
             const r = c.poll(&pfd, 1, @intCast(@min(remain, 100)));
@@ -1415,7 +1410,7 @@ pub const Conn = struct {
     }
 
     fn queueFrameUntil(self: *Conn, ftype: wire.FrameType, payload: []const u8, deadline_ms: i64) !void {
-        if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
+        if (deadline_ms - nowMs() <= 0) return error.Timeout;
         if (self.proto == 0 and ftype != .hello and ftype != .list and
             !(self.panel_rpc > 0 and (ftype == .attach or ftype == .detach or
                 ftype == .panel_request or ftype == .panel_reply)))
@@ -1425,7 +1420,7 @@ pub const Conn = struct {
     }
 
     fn queueJsonUntil(self: *Conn, ftype: wire.FrameType, value: anytype, deadline_ms: i64) !void {
-        if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
+        if (deadline_ms - nowMs() <= 0) return error.Timeout;
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
         try std.json.Stringify.value(value, .{}, &aw.writer);
@@ -1460,7 +1455,7 @@ pub const Conn = struct {
     pub fn sendPanelRequestUntil(self: *Conn, id: u64, json: []const u8, deadline_ms: i64) !void {
         if (self.panel_rpc == 0) return error.PanelRpcUnsupported;
         if (self.wbuf.items.len != 0) return error.PanelSendPreDelivery;
-        if (deadline_ms - monotonicMs() <= 0) return error.PanelSendPreDelivery;
+        if (deadline_ms - nowMs() <= 0) return error.PanelSendPreDelivery;
 
         // Build the complete frame before touching the socket. Size and
         // allocation failures are therefore provably safe to report as
@@ -1474,7 +1469,7 @@ pub const Conn = struct {
 
         var sent: usize = 0;
         while (sent < frame.items.len) {
-            if (deadline_ms - monotonicMs() <= 0)
+            if (deadline_ms - nowMs() <= 0)
                 return if (sent == 0) error.PanelSendPreDelivery else error.PanelSendUncertain;
             const n = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
                 c.send(self.fd, frame.items.ptr + sent, frame.items.len - sent, c.MSG_NOSIGNAL)
@@ -1488,7 +1483,7 @@ pub const Conn = struct {
             if (e == .INTR) continue;
             if (e != .AGAIN)
                 return if (sent == 0) error.PanelSendPreDelivery else error.PanelSendUncertain;
-            const remain = deadline_ms - monotonicMs();
+            const remain = deadline_ms - nowMs();
             if (remain <= 0)
                 return if (sent == 0) error.PanelSendPreDelivery else error.PanelSendUncertain;
             var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLOUT, .revents = 0 };
@@ -1623,14 +1618,14 @@ pub const Conn = struct {
     pub fn recvGuiAttachFor(self: *Conn, timeout_ms: i64) !GuiAttachResult {
         const identity_first = self.attach_identity_pending;
         self.attach_identity_pending = false;
-        const deadline = monotonicMs() + timeout_ms;
+        const deadline = nowMs() + timeout_ms;
         if (!identity_first)
-            return .{ .snapshot = try self.recvExpectFor(&.{.snapshot}, @max(deadline - monotonicMs(), 1)) };
-        const meta = try self.recvExpectFor(&.{.session_meta}, @max(deadline - monotonicMs(), 1));
+            return .{ .snapshot = try self.recvExpectFor(&.{.snapshot}, @max(deadline - nowMs(), 1)) };
+        const meta = try self.recvExpectFor(&.{.session_meta}, @max(deadline - nowMs(), 1));
         defer meta.deinit(self.allocator);
         const identity = try AttachIdentity.parse(self.allocator, meta.payload);
         return .{
-            .snapshot = try self.recvExpectFor(&.{.snapshot}, @max(deadline - monotonicMs(), 1)),
+            .snapshot = try self.recvExpectFor(&.{.snapshot}, @max(deadline - nowMs(), 1)),
             .identity = identity,
         };
     }
@@ -1649,13 +1644,10 @@ pub const Conn = struct {
     /// frame arrived within `timeout_ms` (partial bytes stay buffered
     /// — inspect `pendingPartial` for a useful diagnostic).
     pub fn recvFrameFor(self: *Conn, timeout_ms: i64) !OwnedFrame {
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-        const deadline = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000) + timeout_ms;
+        const deadline = nowMs() + timeout_ms;
         while (true) {
             if (try self.takeFrame()) |owned| return owned;
-            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-            const remain = deadline - (@as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
+            const remain = deadline - nowMs();
             if (remain <= 0) return error.Timeout;
             var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
             const pr = c.poll(&pfd, 1, @intCast(@min(remain, 100)));
@@ -1678,15 +1670,12 @@ pub const Conn = struct {
     /// a slow link keeps the wait alive as long as it keeps moving.
     /// `cap_ms` hard-bounds the whole wait (no-hang invariant).
     pub fn recvFrameProgressive(self: *Conn, idle_ms: i64, cap_ms: i64) !OwnedFrame {
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-        var now = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+        var now = nowMs();
         const cap_deadline = now + cap_ms;
         var idle_deadline = now + idle_ms;
         while (true) {
             if (try self.takeFrame()) |owned| return owned;
-            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-            now = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
+            now = nowMs();
             const remain = @min(idle_deadline, cap_deadline) - now;
             if (remain <= 0) return error.Timeout;
             var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
@@ -1702,8 +1691,7 @@ pub const Conn = struct {
                 return error.Disconnected;
             }
             try self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]);
-            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-            idle_deadline = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000) + idle_ms;
+            idle_deadline = nowMs() + idle_ms;
         }
     }
 
@@ -1717,12 +1705,9 @@ pub const Conn = struct {
     /// Deadline-aware `recvExpect`; error.Timeout applies to the WHOLE
     /// wait, however many unrelated frames arrive meanwhile.
     pub fn recvExpectFor(self: *Conn, want: []const wire.FrameType, timeout_ms: i64) !OwnedFrame {
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-        const deadline = @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000) + timeout_ms;
+        const deadline = nowMs() + timeout_ms;
         while (true) {
-            _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-            const remain = deadline - (@as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000));
+            const remain = deadline - nowMs();
             if (remain <= 0) return error.Timeout;
             const f = try self.recvFrameFor(remain);
             for (want) |w| {
@@ -1870,7 +1855,7 @@ pub fn connectPanelRequesterUntilExpected(
     deadline_ms: i64,
     active_fd: ?*FdCancel,
 ) !Conn {
-    if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
+    if (deadline_ms - nowMs() <= 0) return error.Timeout;
     const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
     if (fd < 0) return error.SocketFailed;
     var fd_owned = true;
@@ -1885,14 +1870,14 @@ pub fn connectPanelRequesterUntilExpected(
         return error.NonBlockingFailed;
     var addr: c.struct_sockaddr_un = undefined;
     try sockpath.fillSockaddrUn(&addr, sock_path);
-    if (deadline_ms - monotonicMs() <= 0) return error.Timeout;
+    if (deadline_ms - nowMs() <= 0) return error.Timeout;
     const rc = c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un));
     if (rc != 0) {
         const connect_errno = std.posix.errno(rc);
         if (connect_errno != .INPROGRESS and connect_errno != .AGAIN and connect_errno != .ALREADY)
             return error.ConnectFailed;
         while (true) {
-            const remain = deadline_ms - monotonicMs();
+            const remain = deadline_ms - nowMs();
             if (remain <= 0) return error.Timeout;
             var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
             const polled = c.poll(&pfd, 1, @intCast(@min(remain, 100)));
@@ -1912,7 +1897,7 @@ pub fn connectPanelRequesterUntilExpected(
     fd_owned = false;
     errdefer conn.deinit();
     try conn.queueHelloUntil(deadline_ms);
-    var remain = deadline_ms - monotonicMs();
+    var remain = deadline_ms - nowMs();
     if (remain <= 0) return error.Timeout;
     const welcome = try conn.recvExpectFor(&.{.welcome}, remain);
     defer welcome.deinit(allocator);
@@ -1930,7 +1915,7 @@ pub fn connectPanelRequesterUntilExpected(
         .panel_only = true,
         .panel_rpc = wire.PANEL_RPC_VERSION,
     }, deadline_ms);
-    remain = deadline_ms - monotonicMs();
+    remain = deadline_ms - nowMs();
     if (remain <= 0) return error.Timeout;
     const ok = conn.recvExpectFor(&.{.ok}, remain) catch |err|
         return classifyPanelRequesterAttachError(&conn, err);
@@ -2006,7 +1991,7 @@ pub fn connectPanelRequester(allocator: std.mem.Allocator, sock_path: []const u8
     var active: FdCancel = .{};
     // The connect helper releases the slot itself; this local exists
     // only because these callers have no watchdog to hand it.
-    return connectPanelRequesterUntil(allocator, sock_path, session, monotonicMs() + @max(timeout_ms, 0), &active);
+    return connectPanelRequesterUntil(allocator, sock_path, session, nowMs() + @max(timeout_ms, 0), &active);
 }
 
 test "panel requester connect, hello, and attach share one absolute deadline" {
@@ -2037,12 +2022,12 @@ test "panel requester connect, hello, and attach share one absolute deadline" {
     const thread = try std.Thread.spawn(.{}, Stall.run, .{Stall{ .fd = listener }});
     defer thread.join();
     var active: FdCancel = .{};
-    const start = monotonicMs();
+    const start = nowMs();
     try t.expectError(
         error.Timeout,
         connectPanelRequesterUntil(t.allocator, path, "session", start + 75, &active),
     );
-    try t.expect(monotonicMs() - start < 500);
+    try t.expect(nowMs() - start < 500);
     try t.expectEqual(@as(c_int, -1), active.fd.load(.acquire));
 }
 
@@ -2062,7 +2047,7 @@ test "a panel connect that lost the stop race is cancelled before it dials" {
     defer _ = c.close(listener);
     try t.expectError(
         error.Canceled,
-        connectPanelRequesterUntil(t.allocator, path, "session", monotonicMs() + 5_000, &active),
+        connectPanelRequesterUntil(t.allocator, path, "session", nowMs() + 5_000, &active),
     );
     try t.expectEqual(@as(c_int, -1), active.fd.load(.acquire));
 }
@@ -2072,7 +2057,7 @@ test "expired panel deadlines cannot connect flush or send initial bytes" {
     var active: FdCancel = .{};
     try t.expectError(
         error.Timeout,
-        connectPanelRequesterUntil(t.allocator, "/tmp/expired-panel.sock", "session", monotonicMs() - 1, &active),
+        connectPanelRequesterUntil(t.allocator, "/tmp/expired-panel.sock", "session", nowMs() - 1, &active),
     );
     try t.expectEqual(@as(c_int, -1), active.fd.load(.acquire));
 
@@ -2088,14 +2073,14 @@ test "expired panel deadlines cannot connect flush or send initial bytes" {
     conn.setNonBlocking();
 
     try wire.appendFrame(&conn.wbuf, t.allocator, .hello, "queued-before-expiry");
-    try t.expectError(error.Timeout, conn.flushQueuedUntil(monotonicMs() - 1));
+    try t.expectError(error.Timeout, conn.flushQueuedUntil(nowMs() - 1));
     var pfd = c.struct_pollfd{ .fd = pair[1], .events = c.POLLIN, .revents = 0 };
     try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
     conn.wbuf.clearRetainingCapacity();
 
     try t.expectError(
         error.PanelSendPreDelivery,
-        conn.sendPanelRequestUntil(7, "{\"cmd\":\"panel-events\"}", monotonicMs() - 1),
+        conn.sendPanelRequestUntil(7, "{\"cmd\":\"panel-events\"}", nowMs() - 1),
     );
     pfd.revents = 0;
     try t.expectEqual(@as(c_int, 0), c.poll(&pfd, 1, 0));
@@ -2155,7 +2140,7 @@ test "panel-only attach rejects missing empty and truncated immutable origin met
         var active: FdCancel = .{};
         try t.expectError(
             error.MalformedPanelAttachMetadata,
-            connectPanelRequesterUntil(t.allocator, path, "requested-alias", monotonicMs() + 2_000, &active),
+            connectPanelRequesterUntil(t.allocator, path, "requested-alias", nowMs() + 2_000, &active),
         );
         thread.join();
         try t.expectEqual(@as(c_int, -1), active.fd.load(.acquire));
@@ -2182,7 +2167,7 @@ test "panel-only attach reports a valid unexpected origin id as an identity mism
             path,
             "reused",
             "10000000000000000000000000000001",
-            monotonicMs() + 2_000,
+            nowMs() + 2_000,
             &active,
         ),
     );
@@ -2211,7 +2196,7 @@ test "panel-only attach returns a typed no-such-session error" {
             path,
             "gone",
             "10000000000000000000000000000001",
-            monotonicMs() + 2_000,
+            nowMs() + 2_000,
             &active,
         ),
     );
@@ -2483,7 +2468,7 @@ test "ssh config resolution spawns ssh and reads back the hostname" {
     defer _ = c.unsetenv("SKETERM_SSH");
 
     var buf: [256]u8 = undefined;
-    const target = Conn.resolveSshConfig("some-alias", &buf, monotonicMs() + 5_000) orelse
+    const target = Conn.resolveSshConfig("some-alias", &buf, nowMs() + 5_000) orelse
         return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("10.1.2.3", target.hostname);
     try std.testing.expect(!target.proxied);

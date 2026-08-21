@@ -316,11 +316,7 @@ const HL_SRC =
     \\
 ;
 
-fn nowNs() u64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
-}
+const nowNs = @import("util/clock.zig").nowNs;
 
 pub fn main() !u8 {
     var gpa: std.heap.DebugAllocator(.{}) = .{};

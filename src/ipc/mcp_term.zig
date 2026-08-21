@@ -19,7 +19,7 @@ const appErr = mcp.appErr;
 const recordAuxTerm = mcp.recordAuxTerm;
 const recordRegisteredTerm = mcp.recordRegisteredTerm;
 const tailLines = mcp.tailLines;
-const monoMs = mcp.monoMs;
+const nowMs = @import("../util/clock.zig").nowMs;
 const shellquote = mcp.shellquote;
 
 // ── headless terminal tools (shell sessions on the private daemon) ─
@@ -357,8 +357,8 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         // screen sits behind an auth prompt, because the assistant
         // needs the reply back to answer it.
         if (host != null and remote_integration and !t.scanShellAnnounce()) {
-            const announce_deadline = monoMs() + 8_000;
-            while (!t.scanShellAnnounce() and monoMs() < announce_deadline and !t.exited) {
+            const announce_deadline = nowMs() + 8_000;
+            while (!t.scanShellAnnounce() and nowMs() < announce_deadline and !t.exited) {
                 if (termdrive.looksInteractive(termLastLine(arena, t))) break;
                 _ = t.waitIdle(150, 400);
             }
@@ -606,7 +606,7 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             }
             // The token wait spends from the same budget as the
             // completion wait, so the call never outlives timeout_ms.
-            const started = monoMs();
+            const started = nowMs();
             const token_res = t.commandToken(@min(timeout_ms, 10_000)) catch return mcp.errRes(arena, .unavailable, "command completion unavailable (terminal exited?)");
             const token = switch (token_res) {
                 .unsupported => return commandCompletionResult(arena, .{ .state = .unsupported }, false, null, null, "shell integration is unavailable for this shell; command was not sent and no exit status was fabricated"),
@@ -617,7 +617,7 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
             t.sendText(line) catch return mcp.errRes(arena, .conflict, "send failed (terminal exited?)");
             t.trackCommand(token);
-            const result = t.waitCommand(token, @max(0, timeout_ms - (monoMs() - started)));
+            const result = t.waitCommand(token, @max(0, timeout_ms - (nowMs() - started)));
 
             var owned_output: ?[]u8 = null;
             defer if (owned_output) |text| mcp.term_state.allocator.free(text);
@@ -1215,7 +1215,7 @@ pub fn spawnForwardTerm(arena: std.mem.Allocator, host: []const u8, lp: u16, rh:
 }
 
 pub fn waitForwardReady(arena: std.mem.Allocator, t: *termdrive.Term, lp: u16, timeout_ms: i64) !union(enum) { ready, err: []const u8 } {
-    const deadline = monoMs() + timeout_ms;
+    const deadline = nowMs() + timeout_ms;
     while (true) {
         t.drain();
         if (t.exited) {
@@ -1227,7 +1227,7 @@ pub fn waitForwardReady(arena: std.mem.Allocator, t: *termdrive.Term, lp: u16, t
             return .{ .err = try std.fmt.allocPrint(arena, "ssh exited (status {d}) before the forward came up:\n{s}", .{ t.exit_status, tail }) };
         }
         if (tcpListening(lp, 300)) return .ready;
-        if (monoMs() >= deadline) {
+        if (nowMs() >= deadline) {
             const tail = blk: {
                 const text = t.readScreen(false) catch break :blk "";
                 defer mcp.term_state.allocator.free(text);

@@ -17,9 +17,7 @@ const fsdrive = @import("../ipc/fsdrive.zig");
 const viewer = @import("viewer.zig");
 const t = std.testing;
 
-fn nowMs() i64 {
-    return @import("../util/clock.zig").nowMs();
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
 /// Bytes fetched per window; two `MAX_READ` requests, so a demuxer that
 /// walks a file linearly costs one round trip per megabyte pair.

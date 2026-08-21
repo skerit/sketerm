@@ -21,6 +21,7 @@ const classicmenu = @import("classicmenu.zig");
 const iconload = @import("../iconload.zig");
 const sidewidgets = @import("sidewidgets.zig");
 const cast = @import("../../util/cast.zig");
+const clock = @import("../../util/clock.zig");
 const fsserve = @import("../../mux/fsserve.zig");
 const mounts = @import("../../util/mounts.zig");
 const HostConn = @import("types.zig").HostConn;
@@ -1983,9 +1984,7 @@ pub fn bookmarkCurrent(self: *BrowserView) void {
 
 pub fn recordRecentSpec(self: *BrowserView, spec: []const u8) void {
     places_mod.recordRecent(self.allocator, &self.recent, spec, places_mod.RECENT_CAP);
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
-    const now_ms = @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
+    const now_ms = clock.wallMs();
     places_mod.recordVisit(self.allocator, &self.frecency, spec, now_ms, places_mod.FRECENCY_CAP);
     // Debounced: navigation is a per-click path and the whole places
     // file (bookmarks, labels, 200 frecency entries, section order) is

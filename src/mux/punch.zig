@@ -61,11 +61,7 @@ pub fn clientEndpoint(ssh_connection: []const u8, port: u16) ?Endpoint {
     return .{ .ip = ip, .port = port };
 }
 
-fn monotonicMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
 /// Bounded single-line read: first '\n'-terminated line within
 /// `timeout_ms`, or null on EOF/timeout/overflow. New clients send
@@ -74,10 +70,10 @@ fn monotonicMs() i64 {
 /// client's ssh dies right after the announcement and the resulting
 /// EOF ends the wait early rather than costing the full timeout.
 pub fn readLine(fd: c_int, timeout_ms: i64, buf: []u8) ?[]const u8 {
-    const deadline = monotonicMs() + timeout_ms;
+    const deadline = nowMs() + timeout_ms;
     var len: usize = 0;
     while (len < buf.len) {
-        const remain = deadline - monotonicMs();
+        const remain = deadline - nowMs();
         if (remain <= 0) return null;
         var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
         const pr = c.poll(&pfd, 1, @intCast(@min(remain, 250)));
@@ -140,7 +136,7 @@ test "readLine returns a buffered line immediately and null on EOF" {
     const line = readLine(fds[0], 1_000, &buf) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("SKETERM-PUNCH 5000", line);
     // Drained + writer closed: the next read hits EOF, not the timeout.
-    const start = monotonicMs();
+    const start = nowMs();
     try std.testing.expect(readLine(fds[0], 5_000, &buf) == null);
-    try std.testing.expect(monotonicMs() - start < 1_000);
+    try std.testing.expect(nowMs() - start < 1_000);
 }

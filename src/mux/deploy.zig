@@ -69,10 +69,8 @@ fn deployMemoFresh(host: []const u8, hash: []const u8) bool {
     const path = deployMemoPath(&buf, host, hash) orelse return false;
     var st: c.struct_stat = undefined;
     if (c.stat(path.ptr, &st) != 0) return false;
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
     const mtime = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
-    return @as(i64, ts.tv_sec) - @as(i64, mtime) <= DEPLOY_MEMO_TTL_S;
+    return @divTrunc(wallMs(), 1000) - @as(i64, mtime) <= DEPLOY_MEMO_TTL_S;
 }
 
 fn deployMemoStamp(host: []const u8, hash: []const u8) void {
@@ -289,15 +287,12 @@ fn ensureUsing(
     return .{ .allocator = allocator, .path = remote_path };
 }
 
-fn monotonicMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
+const wallMs = @import("../util/clock.zig").wallMs;
 
 fn reapChild(pid: c.pid_t, deadline: i64) ?u8 {
     var status: c_int = 0;
-    while (monotonicMs() < deadline) {
+    while (nowMs() < deadline) {
         const got = c.waitpid(pid, &status, c.WNOHANG);
         if (got == pid) return if (c.WIFEXITED(status)) @intCast(c.WEXITSTATUS(status)) else 255;
         if (got < 0 and std.posix.errno(got) != .INTR) return null;
@@ -321,7 +316,7 @@ fn reapChild(pid: c.pid_t, deadline: i64) ?u8 {
 fn sendBytes(fd: c_int, bytes: []const u8, deadline: i64) bool {
     var off: usize = 0;
     while (off < bytes.len) {
-        if (monotonicMs() >= deadline) return false;
+        if (nowMs() >= deadline) return false;
         const wrote = if (comptime @hasDecl(c, "MSG_NOSIGNAL"))
             c.send(fd, bytes.ptr + off, bytes.len - off, c.MSG_NOSIGNAL)
         else
@@ -400,7 +395,7 @@ fn runSshCommand(_: ?*anyopaque, ssh_bin: [*:0]const u8, host: []const u8, comma
     }
     _ = c.close(devnull);
     _ = c.close(pair[1]);
-    const deadline = monotonicMs() + SSH_TIMEOUT_MS;
+    const deadline = nowMs() + SSH_TIMEOUT_MS;
     if (comptime platform.is_macos) {
         var one: c_int = 1;
         _ = c.setsockopt(pair[0], c.SOL_SOCKET, c.SO_NOSIGPIPE, &one, @sizeOf(c_int));

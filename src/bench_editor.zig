@@ -16,11 +16,7 @@ const doc_mod = @import("editor/document.zig");
 const Document = doc_mod.Document;
 const tr = @import("editor/transaction.zig");
 
-fn nowNs() i128 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
-}
+const nowNs = @import("util/clock.zig").nowNs;
 
 fn ms(ns: i128) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;

@@ -1015,9 +1015,7 @@ fn statMtimeSecs(st: c.struct_stat) i64 {
 }
 
 fn wallSecs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
-    return @intCast(ts.tv_sec);
+    return @divTrunc(@import("../../util/clock.zig").wallMs(), 1000);
 }
 
 test "panel assets collect unique image paths and enforce the operation cap" {

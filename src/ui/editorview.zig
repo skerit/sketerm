@@ -5083,9 +5083,7 @@ pub const EditorView = struct {
     /// "4 minutes ago" for the banner. Wall clock, because that is what
     /// the record carries and what the user recognises.
     fn agoText(updated_ms: i64) []const u8 {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(.REALTIME, &ts);
-        const now: i64 = @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+        const now: i64 = clock.wallMs();
         const delta = @max(0, now - updated_ms);
         const mins = @divTrunc(delta, 60_000);
         if (mins < 1) return "moments ago";

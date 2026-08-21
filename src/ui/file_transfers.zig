@@ -27,6 +27,7 @@ const xferqueue = @import("../filebrowser/xferqueue.zig");
 const pathz = @import("../util/pathz.zig");
 const cast = @import("../util/cast.zig");
 const nowMs = @import("../util/clock.zig").nowMs;
+const wallMs = @import("../util/clock.zig").wallMs;
 
 pub const NotifyFn = *const fn (ctx: *anyopaque, text: []const u8) void;
 const Subscriber = struct { ctx: *anyopaque, callback: NotifyFn };
@@ -947,9 +948,7 @@ pub const Service = struct {
         // Wall-clock based so records minted by DIFFERENT processes
         // still order against each other; the counter breaks ties
         // inside one millisecond.
-        var ts: c.struct_timespec = undefined;
-        _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
-        const ms: u64 = @as(u64, @intCast(ts.tv_sec)) * 1000 + @as(u64, @intCast(@divTrunc(ts.tv_nsec, 1_000_000)));
+        const ms: u64 = @intCast(wallMs());
         self.order_seq = (self.order_seq + 1) % 1000;
         return ms * 1000 + self.order_seq;
     }

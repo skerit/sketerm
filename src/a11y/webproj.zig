@@ -75,11 +75,7 @@ const REGISTRY_DEST = "org.a11y.atspi.Registry";
 /// Total wall-clock budget for connect+auth+Embed.
 const CONNECT_BUDGET_MS: i64 = 10_000;
 
-pub fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(ts.tv_nsec, 1_000_000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
 /// What a projected `DoAction` asks its owner to perform. Deliberately
 /// a POINT rather than a node id: the owner talks to an engine that

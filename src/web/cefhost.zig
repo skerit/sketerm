@@ -377,27 +377,13 @@ fn latTrace() bool {
 
 fn latStamp(tag: []const u8) void {
     if (!latTrace()) return;
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    const ms = @as(f64, @floatFromInt(ts.tv_sec)) * 1000.0 + @as(f64, @floatFromInt(ts.tv_nsec)) / 1e6;
+    const ms = @as(f64, @floatFromInt(@import("../util/clock.zig").nowNs())) / 1e6;
     std.debug.print("hostlat: {s} {d:.2}\n", .{ tag, ms });
 }
 
-/// Monotonic milliseconds (`std.time.milliTimestamp` is gone in 0.16).
-pub fn nowMs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000_000);
-}
+const nowMs = @import("../util/clock.zig").nowMs;
 
-/// Microsecond monotonic clock — the blocking-webRequest round trip is
-/// measured in hundreds of microseconds, so milliseconds would quantise
-/// the whole distribution away.
-pub fn nowUs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
-    return @as(i64, ts.tv_sec) * 1_000_000 + @divTrunc(@as(i64, ts.tv_nsec), 1_000);
-}
+const nowUs = @import("../util/clock.zig").nowUs;
 
 /// Physical pixels for `logical` at `scale_x1000`, per the protocol's
 /// scale contract: `ceil(logical * scale)`, never 0.
