@@ -24,6 +24,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const render_kick = @import("../util/render_kick.zig");
+const listdialog = @import("listdialog.zig");
 const panelstore = @import("../ipc/panelstore.zig");
 const mux_daemon = @import("../mux/daemon.zig");
 const panelhost = @import("panelhost.zig");
@@ -253,11 +254,26 @@ fn openFor(window: *Window, pane: ?*Pane) void {
     };
     handle.* = .{ .allocator = allocator, .ctx = ctx };
 
-    const dialog = c.adw_dialog_new();
-    c.adw_dialog_set_title(dialog, "Open Saved Panel");
-    c.adw_dialog_set_content_width(dialog, 560);
-    c.adw_dialog_set_content_height(dialog, 420);
-    ctx.dialog = @ptrCast(@alignCast(dialog));
+    // Which session's panels these are: several assistants share one
+    // sketerm, so "these are mine" has to be visible.
+    var head_buf: [160]u8 = undefined;
+    const head = std.fmt.bufPrintZ(&head_buf, "Panels saved for local session {s}", .{session}) catch
+        "Panels saved in this session";
+
+    const ld = listdialog.build(.{
+        .title = "Open Saved Panel",
+        .width = 560,
+        .height = 420,
+        .header = head.ptr,
+    });
+    const dialog = ld.dialog;
+    const root = ld.root;
+    const listbox = ld.listbox;
+    ctx.dialog = dialog;
+    ctx.listbox = listbox;
+
+    // The dialog owns the context: the "closed" handler's destroy-notify
+    // is its single free (CLAUDE.md mechanism 1).
     _ = c.g_signal_connect_data(
         dialog,
         "closed",
@@ -266,36 +282,6 @@ fn openFor(window: *Window, pane: ?*Pane) void {
         @ptrCast(&freeCtx),
         c.G_CONNECT_DEFAULT,
     );
-
-    const root = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-    c.gtk_widget_set_margin_start(root, 12);
-    c.gtk_widget_set_margin_end(root, 12);
-    c.gtk_widget_set_margin_top(root, 12);
-    c.gtk_widget_set_margin_bottom(root, 12);
-
-    // Which session's panels these are: several assistants share one
-    // sketerm, so "these are mine" has to be visible.
-    {
-        var head_buf: [160]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&head_buf, "Panels saved for local session {s}", .{session}) catch
-            "Panels saved in this session";
-        const label = c.gtk_label_new(text.ptr);
-        c.gtk_label_set_xalign(@ptrCast(label), 0);
-        c.gtk_widget_add_css_class(label, "dim-label");
-        c.gtk_widget_set_margin_bottom(label, 8);
-        c.gtk_box_append(@ptrCast(root), label);
-    }
-
-    const scrolled = c.gtk_scrolled_window_new();
-    c.gtk_widget_set_vexpand(scrolled, 1);
-    c.gtk_scrolled_window_set_policy(@ptrCast(@alignCast(scrolled)), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-
-    const listbox = c.gtk_list_box_new();
-    c.gtk_list_box_set_selection_mode(@ptrCast(@alignCast(listbox)), c.GTK_SELECTION_BROWSE);
-    c.gtk_widget_add_css_class(listbox, "boxed-list");
-    c.gtk_scrolled_window_set_child(@ptrCast(@alignCast(scrolled)), listbox);
-    c.gtk_box_append(@ptrCast(root), scrolled);
-    ctx.listbox = listbox;
 
     _ = c.g_signal_connect_data(
         listbox,

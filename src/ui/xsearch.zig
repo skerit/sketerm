@@ -7,6 +7,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const listdialog = @import("listdialog.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const window_mod = @import("window.zig");
 const Window = window_mod.Window;
@@ -41,12 +42,22 @@ pub fn open(window: *Window) !void {
         .listbox = undefined,
     };
 
-    const dialog = c.adw_dialog_new();
-    c.adw_dialog_set_title(dialog, "Search All Sessions");
-    c.adw_dialog_set_content_width(dialog, 700);
-    c.adw_dialog_set_content_height(dialog, 480);
-    ctx.dialog = @ptrCast(@alignCast(dialog));
+    const ld = listdialog.build(.{
+        .title = "Search All Sessions",
+        .width = 700,
+        .height = 480,
+        .search_placeholder = "Search scrollback of every session (Enter)…",
+    });
+    const dialog = ld.dialog;
+    const root = ld.root;
+    const search = ld.search.?;
+    const listbox = ld.listbox;
+    ctx.dialog = dialog;
+    ctx.search_entry = search;
+    ctx.listbox = listbox;
 
+    // The dialog owns the context: the "closed" handler's destroy-notify
+    // is its single free (CLAUDE.md mechanism 1).
     _ = c.g_signal_connect_data(
         dialog,
         "closed",
@@ -55,30 +66,6 @@ pub fn open(window: *Window) !void {
         @ptrCast(&freeCtx),
         c.G_CONNECT_DEFAULT,
     );
-
-    const root = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-    c.gtk_widget_set_margin_start(root, 12);
-    c.gtk_widget_set_margin_end(root, 12);
-    c.gtk_widget_set_margin_top(root, 12);
-    c.gtk_widget_set_margin_bottom(root, 12);
-
-    const search = c.gtk_search_entry_new();
-    c.gtk_widget_set_hexpand(search, 1);
-    c.gtk_search_entry_set_placeholder_text(@ptrCast(@alignCast(search)), "Search scrollback of every session (Enter)…");
-    c.gtk_widget_set_margin_bottom(search, 8);
-    c.gtk_box_append(@ptrCast(root), search);
-    ctx.search_entry = search;
-
-    const scrolled = c.gtk_scrolled_window_new();
-    c.gtk_widget_set_vexpand(scrolled, 1);
-    c.gtk_scrolled_window_set_policy(@ptrCast(@alignCast(scrolled)), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-
-    const listbox = c.gtk_list_box_new();
-    c.gtk_list_box_set_selection_mode(@ptrCast(@alignCast(listbox)), c.GTK_SELECTION_BROWSE);
-    c.gtk_widget_add_css_class(listbox, "boxed-list");
-    c.gtk_scrolled_window_set_child(@ptrCast(@alignCast(scrolled)), listbox);
-    c.gtk_box_append(@ptrCast(root), scrolled);
-    ctx.listbox = listbox;
 
     // Enter in the entry runs the search (deliberately NOT
     // search-changed: a server-side sweep per keystroke is too heavy).
