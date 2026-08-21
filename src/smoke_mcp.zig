@@ -30,6 +30,24 @@ fn say(msg: []const u8) void {
 /// brokers alive until the host rebooted.
 var g_rt: ?[]const u8 = null;
 
+/// The browser helper the real-engine stages run, from `--web-bin`.
+///
+/// build.zig passes the artifact it just built, so the stage can never
+/// measure a STALE `zig-out/bin/sketerm-webengine` against a freshly
+/// built client: a mid-refactor helper left there reads as a live
+/// protocol failure — every semantic op timing out while load and title
+/// events keep arriving — and the smoke blames the wrong side. Null
+/// when the smoke binary is run by hand; the install path is then the
+/// fallback.
+var g_web_bin: ?[*:0]const u8 = null;
+
+/// The helper to drive, or null when none is built.
+fn resolveWebBin(buf: *[4096:0]u8) ?[*:0]const u8 {
+    if (g_web_bin) |p| return if (c.access(p, c.X_OK) == 0) p else null;
+    const p = c.realpath("zig-out/bin/sketerm-webengine", buf) orelse return null;
+    return if (c.access(p, c.X_OK) == 0) p else null;
+}
+
 fn fail(comptime msg: []const u8) noreturn {
     say("smoke-mcp: FAIL " ++ msg);
     if (g_rt) |rt| {
@@ -533,6 +551,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (std.mem.eql(u8, std.mem.span(a), "--socket") and i + 1 < init.args.vector.len)
                 return fakeWebengine(allocator, std.mem.span(init.args.vector[i + 1]));
         }
+    }
+
+    // `--web-bin <path>`: the helper THIS build produced, handed over by
+    // build.zig. Without it the stages fall back to the installed
+    // `zig-out/bin/sketerm-webengine`.
+    for (init.args.vector, 0..) |a, i| {
+        if (std.mem.eql(u8, std.mem.span(a), "--web-bin") and i + 1 < init.args.vector.len)
+            g_web_bin = init.args.vector[i + 1];
     }
 
     // Isolated runtime dir so nothing touches the user's real daemon.
@@ -1963,11 +1989,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // silent pass.
     {
         var bin_buf: [4096:0]u8 = undefined;
-        const web_bin = c.realpath("zig-out/bin/sketerm-webengine", &bin_buf);
-        if (web_bin == null or c.access("zig-out/bin/sketerm-webengine", c.X_OK) != 0) {
+        const web_bin = resolveWebBin(&bin_buf);
+        if (web_bin == null) {
             say("smoke-mcp: SKIP web stage (sketerm-webengine not built; `zig build web`)");
         } else {
-            _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+            _ = c.setenv("SKETERM_WEB_BIN", web_bin.?, 1);
             defer _ = c.unsetenv("SKETERM_WEB_BIN");
             webStage(allocator, exe, rt);
             say("smoke-mcp: headless web tools ok");
@@ -3483,8 +3509,7 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
 /// Run only the optional browser stage for focused E2E validation.
 fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u8 {
     var bin_buf: [4096:0]u8 = undefined;
-    const web_bin = c.realpath("zig-out/bin/sketerm-webengine", &bin_buf);
-    if (web_bin == null or c.access("zig-out/bin/sketerm-webengine", c.X_OK) != 0)
+    const web_bin = resolveWebBin(&bin_buf) orelse
         fail("sketerm-webengine not built for --web-only");
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);

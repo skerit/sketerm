@@ -1107,7 +1107,7 @@ pub fn build(b: *std.Build) void {
     // step, the binary distribution is never downloaded unless the fetch
     // step is asked for by name, and the CEF headers are only translated
     // when that distribution is already on disk.
-    addCef(b, target, optimize, strip, use_lld, core_cbindings_mod, mux_exe, &test_roots.step, &lint_errdefer.step);
+    addCef(b, target, optimize, strip, use_lld, core_cbindings_mod, mux_exe, smoke_mcp_run, &test_roots.step, &lint_errdefer.step);
 }
 
 /// Pinned CEF binary distribution ("minimal" distro). SINGLE source of
@@ -1170,6 +1170,7 @@ fn addCef(
     use_lld: bool,
     core_cbindings_mod: *std.Build.Module,
     mux_exe: *std.Build.Step.Compile,
+    smoke_mcp_run: *std.Build.Step.Run,
     test_roots: *std.Build.Step,
     lint_errdefer: *std.Build.Step,
 ) void {
@@ -1562,6 +1563,19 @@ fn addCef(
     // fetch would put a download in everybody's test run.
     smoke_web_run.addArg(ubo_xpi);
     smoke_web_step.dependOn(&smoke_web_run.step);
+
+    // smoke-mcp's real-engine stage runs the helper this build produced,
+    // never whatever `zig-out/bin/sketerm-webengine` happens to hold: a
+    // stale artifact there (a mid-refactor `zig build web`, an older
+    // checkout) reads as a live protocol failure — every semantic op
+    // timing out while load and title events still arrive — and the
+    // smoke blames the client. Without CEF this function returns early
+    // and the stage stays a clean SKIP.
+    smoke_mcp_run.addArg("--web-bin");
+    if (is_mac_cef) {
+        smoke_mcp_run.addArg(b.getInstallPath(.prefix, "sketerm-webengine.app/Contents/MacOS/sketerm-webengine"));
+        smoke_mcp_run.step.dependOn(&mac_bundle.step);
+    } else smoke_mcp_run.addArtifactArg(web_exe);
 
     // Blocking-webRequest latency benchmark — `zig build bench-webreq`.
     // Same shape as the smoke rig (a real helper on a private short
