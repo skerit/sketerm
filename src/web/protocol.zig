@@ -193,13 +193,25 @@ pub const CAP_WEBEXT_TRANSACTION = "webext-transaction";
 pub const CAP_MULTI_CLIENT = "multi-client";
 
 /// Per-connection id window under `multi-client`: connection k owns
-/// client-minted view/context ids translated into globals by adding
+/// client-minted view ids translated into globals by adding
 /// `k * CONN_ID_WINDOW`, so two clients both minting id 1 never
 /// collide. Client-minted ids must stay below the window; ids at or
 /// above `DEVTOOLS_VIEW_BASE` are engine-minted and pass through
 /// untranslated. Wire-adjacent for the same reason MAX_POLICY_VIEWS
 /// is: both sides size their refusals from it.
 pub const CONN_ID_WINDOW: u32 = 0x0010_0000;
+
+/// The context id space is PARTITIONED, not windowed: ids below this
+/// line are persisted profile ids allocated by ONE store per engine
+/// (the broker's, or the single flock holder's), so they form a SHARED
+/// namespace — two connections publishing the same persisted id mean
+/// the same identity context, which is exactly how two clients share a
+/// named profile's live session. Ids at or above it are ephemeral,
+/// minted client-locally and translated per connection like view ids.
+/// `webprofiles.EPHEMERAL_BASE` derives from this constant; the jar
+/// directory `profile-<name>-<id>` carries the persisted id verbatim,
+/// which is why it must never be window-shifted.
+pub const EPHEMERAL_CTX_BASE: u32 = 0x4000_0000;
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.

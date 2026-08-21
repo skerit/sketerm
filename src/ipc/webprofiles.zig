@@ -61,8 +61,12 @@ pub const MAX_NAME: usize = 64;
 
 /// Ephemeral (throwaway) context ids start here, so they can never
 /// collide with a persisted one — a persisted id would otherwise be
-/// able to grow into an id an in-memory jar already answers to.
-pub const EPHEMERAL_BASE: u32 = 0x4000_0000;
+/// able to grow into an id an in-memory jar already answers to. The
+/// value is protocol.zig's `EPHEMERAL_CTX_BASE`: the partition is wire
+/// semantics now (persisted ids below the line are a SHARED namespace
+/// across a multi-client helper's connections; ephemerals above it are
+/// per-connection), so the wire is the declaring home.
+pub const EPHEMERAL_BASE: u32 = @import("../web/protocol.zig").EPHEMERAL_CTX_BASE;
 
 /// Prefix every jar directory carries, and the first part of the name
 /// published as `context_create.name` (which the helper uses as the

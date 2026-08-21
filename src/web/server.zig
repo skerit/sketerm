@@ -213,13 +213,17 @@ const Conn = struct {
         return self.base() + id;
     }
 
-    /// Client context id -> engine-global id. Contexts have no
-    /// engine-minted range, so everything nonzero is translated;
-    /// persistent ids are small, ephemeral ones sit above the client's
-    /// EPHEMERAL_BASE, and both fit the window sum without overflow.
+    /// Client context id -> engine-global id. The context space is
+    /// PARTITIONED (proto.EPHEMERAL_CTX_BASE), not windowed like views:
+    /// persisted profile ids pass through UNTRANSLATED because they are
+    /// allocated by one store per engine and form a shared namespace —
+    /// two connections naming the same persisted id share the identity
+    /// context (and its live session) deliberately. Ephemeral ids are
+    /// client-local and get the window, each connection owning
+    /// [base+EPHEMERAL_CTX_BASE, base+EPHEMERAL_CTX_BASE+WINDOW).
     fn mapCtx(self: *const Conn, id: u32) !u32 {
-        if (id == 0) return 0;
-        if (id >= 0x8000_0000) return error.ContextIdPastWindow;
+        if (id < proto.EPHEMERAL_CTX_BASE) return id;
+        if (id >= proto.EPHEMERAL_CTX_BASE + proto.CONN_ID_WINDOW) return error.ContextIdPastWindow;
         return self.base() + id;
     }
 };

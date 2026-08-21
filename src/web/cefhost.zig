@@ -1187,7 +1187,15 @@ pub const Host = struct {
             .id = req.id,
             .rc = rc,
             .ephemeral = req.ephemeral != 0,
-            .owner = self.dispatch_conn,
+            // A persisted context (id below the partition line) is
+            // ENGINE-GLOBAL: its id came from the one profile store
+            // this engine serves, other connections may name it to
+            // share the live session, and owner 0 keeps `dropConn`
+            // from destroying it when its first publisher leaves.
+            .owner = if (req.ephemeral == 0 and req.id < proto.EPHEMERAL_CTX_BASE)
+                0
+            else
+                self.dispatch_conn,
         }) catch {
             if (pref != null) self.proxy_prefs.pop().?.releaseAll();
             release(&rc.base.base);
@@ -1197,13 +1205,14 @@ pub const Host = struct {
 
     /// The id the OWNING CLIENT minted for an engine-global context id.
     ///
-    /// The engine's context space is windowed per connection, but a
-    /// persistent jar directory is named by the id the CLIENT persisted
-    /// (`profile-<name>-<id>`, which its own store reconstructs from the
-    /// directory names). Keying the directory on the global id instead
-    /// would move a named profile's cookies into a fresh, empty jar
-    /// every time the client reconnects on another window — and leave
-    /// the old one an orphan its store then sweeps away.
+    /// Persisted ids now cross the wire untranslated (the shared
+    /// namespace), so this is normally the identity — but it stays as
+    /// the belt for any windowed id reaching a jar path: the persistent
+    /// jar directory is named by the id the STORE persisted
+    /// (`profile-<name>-<id>`, reconstructed from directory names), and
+    /// keying it on a window-shifted id would move a named profile's
+    /// cookies into a fresh, empty jar and leave the old one an orphan
+    /// the store then sweeps away.
     fn ownerCtxId(self: *const Host, id: u32) u32 {
         const base = self.dispatch_conn *| proto.CONN_ID_WINDOW;
         return if (id >= base) id - base else id;
@@ -1553,6 +1562,11 @@ pub const Host = struct {
         while (true) {
             var ctx_id: u32 = 0;
             for (self.contexts.items) |ctx| {
+                // Persisted contexts carry owner 0 (engine-global, the
+                // shared-profile namespace) and survive any one
+                // client's exit; the engine's own teardown releases
+                // them, and that exit path (`cef_shutdown`) is what
+                // flushes their jars.
                 if (ctx.owner == conn_id) {
                     ctx_id = ctx.id;
                     break;
@@ -1560,6 +1574,28 @@ pub const Host = struct {
             }
             if (ctx_id == 0) break;
             self.contextDestroy(ctx_id);
+        }
+        // Bare policy slots: `net_policy_set` before `view_create`
+        // reserves a slot the view sweep above cannot see (no view
+        // exists). Without this, a client that policied ids it never
+        // opened would pin slots from the shared MAX_POLICY_VIEWS pool
+        // until engine exit.
+        const base = conn_id *| proto.CONN_ID_WINDOW;
+        var slot_ids: [proto.MAX_POLICY_VIEWS]u32 = undefined;
+        var n: usize = 0;
+        {
+            g_int.acquire();
+            defer g_int.release();
+            for (&g_int.slots) |*s| {
+                if (!s.used) continue;
+                if (s.view_id < base or s.view_id >= base + proto.CONN_ID_WINDOW) continue;
+                slot_ids[n] = s.view_id;
+                n += 1;
+            }
+        }
+        for (slot_ids[0..n]) |vid| {
+            if (self.findAny(vid) != null) continue;
+            interceptUnregister(self.gpa, vid);
         }
     }
 
@@ -6578,7 +6614,10 @@ pub const Host = struct {
             }
         }
         if (@hasField(@TypeOf(value), "context")) {
-            if (v2.context != 0) v2.context -= base;
+            // Only ephemeral context ids are windowed; persisted ones
+            // are the shared namespace and cross the wire verbatim
+            // (subtracting base would underflow them).
+            if (v2.context >= proto.EPHEMERAL_CTX_BASE) v2.context -= base;
         }
         return v2;
     }
