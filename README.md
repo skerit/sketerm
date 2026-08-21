@@ -1,198 +1,220 @@
 # sketerm
 
-A native GTK4 terminal emulator for Linux, written in Zig from
-scratch.
+A native GTK4 terminal emulator for Linux, written in Zig from scratch,
+that grew a session daemon, remote and headless GUI-app display, a file
+manager, a text editor, a browser, and an MCP server so AI assistants
+can drive all of it.
 
-Built around a feature set that no single existing terminal
-emulator satisfies: full image-protocol support (Sixel + Kitty +
-iTerm2), real xdg_popup context menus with first-class
-split/tab/rename actions, stable group-named tabs, layout
-persistence — without being Electron, without being a
-multiplexer-in-a-terminal, and without being VTE-based (which on
-current Arch lacks OSC 52).
+No vendored terminal core, no wrapper crates: the VT parser, screen
+model, glyph atlas and GL renderer are all in-tree. Full image-protocol
+support (Sixel, Kitty graphics, iTerm2), real xdg_popup context menus,
+tree-style tabs, splits, layout persistence, durable sessions that
+survive a GUI restart -- without being Electron, without being a
+multiplexer-in-a-terminal, and without being VTE-based.
 
 ## Philosophy
 
-Own the stack. Read existing implementations closely —
-understand the algorithms — then reimplement cleanly in our own
-code. No vendored terminal cores, no wrapper crates around other
-people's emulator libraries. The escape-sequence specs are public,
-the image-protocol specs are public, and Paul Williams documented
-the state machine forty years ago. There is no magic here, only
-craft.
+Own the stack. Read existing implementations closely, understand the
+algorithms, then reimplement cleanly in our own code. The escape-sequence
+specs are public, the image-protocol specs are public, and Paul Williams
+documented the state machine forty years ago. There is no magic here,
+only craft.
 
-External dependencies are limited to system C libraries every
-Linux terminal depends on:
+External dependencies are system C libraries:
 
-- `gtk4` + `libadwaita` — windowing, tabs, splits, popover menus
-- `freetype` + `harfbuzz` — glyph rasterization + text shaping
-- OpenGL ES + `libepoxy` — grid rendering
-- `lua` — plugin scripting (post-v1)
-- `glib` — event loop (ships with gtk)
+- `gtk4` + `libadwaita` -- windowing, tabs, splits, popover menus
+- `freetype2` + `harfbuzz` + `fontconfig` + `fribidi` -- glyphs, shaping, bidi
+- OpenGL ES via `libepoxy` -- grid, cell, image and shader passes
+- `libvpx` -- VP9/WebM app-window recording (GUI only)
+- `cef` -- OPTIONAL, linked only by the browser helper `sketerm-webengine`
+- `tesseract` -- OPTIONAL, OCR for the MCP `app_read_text`/`app_wait_text` tools
 
-## Status
+Vendored: `stb_image`/`stb_image_write`/`msf_gif` (image + GIF encode) and
+a Tree-sitter runtime with generated grammars (editor highlighting,
+compiled into the GUI only). The session daemon links **libc only**.
 
-**v0 in progress.** Most of M0-M9 prototyped over a single autonomous
-build session. See `git log --oneline` for what's landed.
+## What ships
 
-### What works
-- **M0** — `zig build` (Zig 0.16.x; ReleaseFast default to dodge
-  gcc 15's `.sframe` linker incompatibility); GTK4/libadwaita
-  window opens.
-- **M0.5** — GL spike: `GtkGLArea` + `set_use_es(TRUE)` + share
-  groups verified (PASS via Mesa llvmpipe; NVIDIA EGL fails on
-  this hardware → falls through to software renderer).
-- **M1** — PTY spawn/poll/read in worker thread; SPSC ring with
-  `drain_pending` coalescing; main-thread drain via
-  `g_main_context_invoke`.
-- **M2** — `Cell` (`extern struct`, 8 B), `StylePool`, `Screen`
-  with active + alternate buffers and 10k scrollback. Apply for
-  Print, CR/LF/BS/TAB, cursor moves, erase, scroll, modes (1049,
-  7, 6, 2004, 1004, 25), full SGR with truecolor, DECSCUSR.
-  Resize preserves content + pushes to scrollback.
-- **M3** — FreeType atlas (R8 page, shelf-pack), GL ES 3.0 grid
-  shader (textured quads, two-pass bg+glyph), `GtkGLArea` pane,
-  cursor with shape variants + 500 ms blink.
-- **M4** — Keyboard (xterm encoding, `modifyOtherKeys=1`), paste
-  with bracketed-paste-mode awareness, resize → `TIOCSWINSZ`,
-  selection (mouse drag → `Ctrl+Shift+C` copy via `GdkClipboard`),
-  IME via `GtkIMMulticontext` (fcitx5 / ibus).
-- **M5** — OSC 0/2 title, OSC 7 cwd, OSC 8 hyperlinks (storage:
-  `Cell.reserved` holds u8 id, `Screen.links` maps id → URI),
-  OSC 52 clipboard set, DSR (`CSI 6 n`), CSI 14t/18t/19t size
-  reports, DECSET 1004 focus reporting.
-- **M6** — `AdwTabView` tabs with sticky titles, `GtkPopoverMenu`
-  right-click menu (Copy/Paste/Split/Tab/Close), tab rename via
-  popover with entry, keyboard shortcuts.
-- **M7** — splits via `GtkPaned`, nestable. `Ctrl+Shift+D` /
-  `Ctrl+Shift+R` for horizontal/vertical. `close_pane` collapses
-  the parent paned (or closes the tab if last pane).
-- **M8** — JSON layout save (v2 schema) on shutdown to
-  `$XDG_STATE_HOME/sketerm/last.json`. Each tab carries a
-  recursive Tree (pane | split). `--restore` and
-  `--layout <path>` rebuild the full split topology including
-  the GtkPaned hierarchy.
-- **M9** — Sixel decoder (RGB color regs, RLE, raster attrs, HLS
-  fallback). Kitty graphics APC parser (transmit/place/delete,
-  RGBA). iTerm2 OSC 1337 with full PNG decode via vendored
-  `stb_image.h`. `ImageStore` + `ImagePass` upload RGBA pixels
-  to GL textures and draw them as quads after the grid pass —
-  **end-to-end image rendering through the GL pipeline.**
+Three binaries:
 
-### What's still missing (post-checkpoint)
-  surface (tooltip on hover, click-to-open via `xdg-open`) not yet.
-- **OSC 8 in selection** — link IDs stored, hover tooltip works,
-  Ctrl+click opens; selection-extract preserves text but not the
-  underlying URI.
-- **Selection in scrollback** — model accepts negative rows but
-  the mouse-drag handler hasn't been taught to map screen →
-  scrollback coords.
-- **IME preedit positioning** — commit signal works; preedit
-  display at the cursor position not wired.
-- **Font fallback** — single face; missing glyphs render as tofu.
-- **Pane focus highlight** — focused pane is not visually
-  distinguished beyond what GTK4 provides on the underlying GLArea.
+- **`sketerm`** -- the GUI, plus the `cli`, `mcp`, `mux`, `ssh`, `run`,
+  `app`, `files`, `edit`, `web`, `view`, `play`, `mount`, `portal` and
+  `doctor` subcommands (`sketerm --help` lists them all). `sketerm-files`,
+  `sketerm-editor`, `sketerm-viewer` and `sketerm-web` are argv0 identity
+  hardlinks of the same binary: each mode is its own desktop application
+  with its own app id, icon and taskbar entry.
+- **`sketerm-mux`** -- the session daemon. Every terminal, local or
+  remote, is a session it owns; the GUI is always a client. It also hosts
+  headless Wayland displays, forwarded GUI apps, the file service, and
+  the broker that keeps everything alive across GUI restarts.
+  `zig build mux-portable` produces a static-musl build to scp onto a
+  server.
+- **`sketerm-webengine`** -- the optional CEF browser helper, kept in its
+  own process for crash isolation. Without it the browser face says so
+  and everything else keeps working.
 
-### Tests
-46/46 passing across:
-- VT parser state machine (CSI/OSC/DCS/APC + ESC final)
-- UTF-8 reassembly
-- Cell / StylePool / Screen apply paths
-- Selection rect normalization
-- SPSC ring
-- Sixel decode (color def, RLE, raster attrs, all-on/partial)
-- iTerm2 PNG dimension extraction
-- Kitty command parsing
-- Layout JSON round-trip
+## Features
 
-Headless smoke: `zig build spike-shell` runs bash through the full
-PTY → parser → screen pipeline and dumps the grid. Confirmed
-sixel + Kitty image events fire end-to-end (`got image 1: 6x6 …`,
-`got image 2: 2x2 …`).
+**Terminal.** Truecolor SGR with all line decorations, Sixel + Kitty +
+iTerm2 images rendered through the GL pipeline, OSC 8 hyperlinks, OSC 52
+clipboard, Kitty keyboard protocol, bracketed paste, focus reporting,
+OSC 133 prompt marks (jump between prompts), scrollback search with
+regex and smart-case, hint mode, copy mode, cell and background shaders
+with presets, bidi/complex-script shaping, IME through GtkIMMulticontext,
+dead keys, and a `sketerm-256color` terminfo.
 
-GL spike: `zig build spike-gl` opens a `GtkGLArea`, queries driver
-info, draws a clear, and reports realize / render flags.
+**Workspace.** Tabs with sticky titles, colours and pins, a tree-style
+tab sidebar, nestable splits with zoom, a command palette, layouts saved
+as JSON and restored with `--restore`/`--layout`, a Quake-mode
+`--toggle`, per-profile settings bundles, live config reload, and a
+preferences dialog.
 
-## Build & run
+**Sessions and remote.** Terminals are daemon sessions that survive a
+GUI crash or restart (`sketerm mux` picks them up). `sketerm ssh <host>`
+opens a durable remote shell on the host's own daemon with automatic
+reattach; transport is encrypted roaming UDP with hole punching when
+reachable and SSH otherwise. `sketerm mount` FUSE-mounts a remote host's
+files; `sketerm app <host> <cmd>` runs a GUI app on another machine and
+renders its windows here.
+
+**Headless GUI.** `sketerm run <cmd>` runs a GUI app against a private
+Wayland display with no screen at all (the Xvfb replacement, rootless
+X11 via Xwayland when installed); `sketerm-mux display create` makes
+persistent ones. Apps can be screenshotted, driven, recorded and
+inspected over AT-SPI from the MCP tools or from Zig.
+
+**File manager, editor, viewer, browser.** `sketerm files` is a file
+manager (local or `host:/path`, every file operation goes through the
+daemon) that can also be the default `inode/directory` handler.
+`sketerm edit` is a text editor with Tree-sitter highlighting, multiple
+carets, a project layer and a Language Server Protocol client.
+`sketerm view` shows images, `sketerm play` plays asciicast recordings,
+`sketerm web` is a Chromium-based browser (via CEF) with a reader mode
+and a built-in ad filter. Every one of these also works as a *face* on
+a pane inside a terminal window (`--here`/`--tab`).
+
+**MCP server.** `sketerm mcp` is a Model Context Protocol server on stdio
+with 118 tools in eight groups (`panes app term files net browser ui
+core`): read and type into terminals, run commands and wait for them,
+launch and drive GUI apps headlessly with screenshots, pixel diffs,
+hover maps and backtraces, transfer files and forward ports over SSH,
+browse the web headlessly in named cookie-jar profiles under an
+enforced network policy, and render native panels from a declarative
+document. A per-connection tool policy narrows what each assistant gets;
+`capabilities` is the preflight that names every capability the server
+has. See `docs/mcp.md`.
+
+**Portal.** `sketerm portal` is an opt-in xdg-desktop-portal FileChooser
+backend, so any portal-using app gets the native sketerm picker
+(`docs/portal.md`).
+
+## Build, install, run
+
+Zig **0.16** is required. The default optimize mode is `ReleaseFast`
+(`Debug` does not link on Arch + gcc 15). `zig build --help` lists every
+step with a description.
 
 ```bash
-zig build              # Release-safe binary at zig-out/bin/sketerm
-zig-out/bin/sketerm    # opens a tab in the default $SHELL
-zig-out/bin/sketerm --restore   # rebuilds last.json layout
-zig-out/bin/sketerm --help
+zig build                      # GUI + daemon into zig-out/bin
+zig build mux                  # sketerm-mux only (no GTK needed)
+zig build mux-portable         # static-musl daemon for remote hosts
+zig build fetch-cef && zig build web   # the optional browser helper
+
+zig-out/bin/sketerm            # opens a tab in $SHELL
+zig-out/bin/sketerm --restore  # rebuild the last saved layout
+zig-out/bin/sketerm doctor     # daemon/version/socket/terminfo check
 ```
 
-## Keybindings (built-in)
+To install, `cd dist && ./install.sh`: Arch-compatible hosts go through
+the PKGBUILD (`makepkg -sif`), dpkg hosts get a `.deb`, anything else a
+plain prefix install. `--mux-only` builds just the daemon, `--deps`
+installs build dependencies, `--no-install` only builds the package.
+Five desktop entries and icons are installed (terminal, files, editor,
+viewer, browser).
 
-| Shortcut          | Action                |
-|-------------------|-----------------------|
-| `Ctrl+Shift+T`    | New tab               |
-| `Ctrl+Shift+W`    | Close tab / pane      |
-| `Ctrl+Tab`        | Next tab              |
-| `Ctrl+Shift+Tab`  | Previous tab          |
-| `Ctrl+Shift+D`    | Split horizontal      |
-| `Ctrl+Shift+R`    | Split vertical        |
-| `Ctrl+Shift+C`    | Copy selection        |
-| `Ctrl+Shift+V`    | Paste                 |
-| Right-click       | Context menu          |
-| Mouse wheel       | Scrollback (10k lines)|
+Config lives at `~/.config/sketerm/config.conf` (see `data/sample.conf`
+and `docs/config.md`); saving it applies immediately.
+
+## Keybindings (built-in, all rebindable)
+
+| Shortcut               | Action                             |
+|------------------------|------------------------------------|
+| `Ctrl+Shift+T` / `W`   | New tab / close tab or pane        |
+| `Ctrl+Tab`, `Alt+1..9` | Next tab, jump to tab N            |
+| `Ctrl+Shift+D` / `R`   | Split horizontal / vertical        |
+| `Ctrl+Shift+Left/Right`| Cycle focus between panes          |
+| `Ctrl+Shift+C` / `V`   | Copy / paste                       |
+| `Ctrl+Shift+F`         | Scrollback search                  |
+| `Ctrl+Shift+E`         | Hint mode                          |
+| `Ctrl+Shift+P`         | Command palette                    |
+| `Ctrl+Shift+Up/Down`   | Previous / next prompt             |
+| `Ctrl+Shift+Z`         | Re-open last closed tab            |
+| `Ctrl+Shift+S`         | Save layout                        |
+| `Ctrl+Shift+Alt+B`     | Tree-style tab sidebar             |
+| `Ctrl+=` / `-` / `0`   | Font size                          |
+| `Ctrl+,`               | Preferences                        |
+
+`sketerm --help` prints the full list; `keybind.<action>` in the config
+rebinds any of them (`docs/config.md`).
+
+## Tests
+
+```bash
+zig build test        # unit tests (GUI build)
+zig build test-core   # GTK-free subset, same deps as sketerm-mux
+zig build smoke-e2e   # real GUI on sketerm's own compositor, no X
+zig build smoke-mux   # daemon end to end; also smoke-mcp, smoke-fs,
+                      # smoke-web, smoke-broker, smoke-lsp-gui, ...
+```
+
+GUI tests run on sketerm's own headless Wayland display, never under
+Xvfb. See `docs/testing.md`.
 
 ## Documentation
 
 **Start here**
-- [Plan](docs/plan.md) — goals, non-goals, v1 hard requirements,
-  success criteria
-- [Architecture](docs/architecture.md) — module layout, data flow,
-  design decisions
-- [Milestones](docs/milestones.md) — phased execution plan
+- [Architecture](docs/architecture.md) -- module tree, data flow, design decisions
+- [Config](docs/config.md) -- complete `config.conf` reference
+- [Remote sessions](docs/REMOTE.md) -- `sketerm-mux`, SSH/UDP transports, reattach
+- [MCP tools](docs/mcp.md) -- the assistant-facing tool set
+- [Headless displays](docs/display.md) -- `sketerm run` and persistent displays
 
 **Deep-dives**
-- [GPU / GL](docs/gpu.md) — `GtkGLArea` lifecycle, context share
-  groups, fractional scaling, driver notes
-- [Images](docs/images.md) — unified placement model for Sixel,
-  Kitty, iTerm2
-- [Layout persistence](docs/layout.md) — save/restore design,
-  trust model
-- [Lifecycle](docs/lifecycle.md) — PTY spawn, workers, signals,
-  teardown
-- [Config](docs/config.md) — complete `config.conf` key reference:
-  profiles vs app-level keys, prefix families, reload semantics
-- [Testing](docs/testing.md) — parser fixtures, record/replay,
-  differential diffing, fuzzing, benchmarks
-- [MCP tools](docs/mcp.md) — command completion vs output-idle waits
+- [mux design](docs/mux-design.md) -- durable panes and remote domains
+- [GPU / GL](docs/gpu.md) -- `GtkGLArea` lifecycle, share groups, scaling
+- [Images](docs/images.md) -- unified placement model for Sixel, Kitty, iTerm2
+- [Layout persistence](docs/layout.md) -- save/restore, trust model
+- [Lifecycle](docs/lifecycle.md) -- spawn, signals, teardown
+- [Editor commands](docs/editor-commands.md), [Project layer](docs/project.md), [LSP](docs/lsp.md)
+- [Portal](docs/portal.md) -- the FileChooser backend
+- [macOS](docs/macos.md) -- the in-progress port
+- [Testing](docs/testing.md) -- fixtures, record/replay, smoke rigs
 
 **Reference**
-- [Protocols](docs/protocols.md) — escape sequences supported
-- [References](docs/references.md) — specs and study targets
-- [Risks](docs/risks.md) — risks and mitigations
+- [Protocols](docs/protocols.md) -- escape sequences supported
+- [References](docs/references.md) -- specs and study targets
+- [SESSION](docs/SESSION.md) -- running log of what has landed
 
 ## Shell integration
 
-**zsh and fish are integrated automatically** — sketerm injects the
-script at spawn (disable with `shell_integration = off` in the
-config). bash users source `data/shell-integration/sketerm.bash`
-from their `.bashrc`. The integration enables:
-
-- **OSC 7 cwd reporting** so layout save remembers each pane's
-  directory, and `Ctrl+Shift+T` / `Ctrl+Shift+D` inherit it.
-- **OSC 133 prompt marks** so `Ctrl+Shift+Up/Down` jumps between
-  prompts in scrollback.
-- **`sketerm_copy`** helper — pipe text through it to set the
-  local clipboard via OSC 52, even over SSH.
-
-Each script self-skips when `$TERM_PROGRAM` is not `sketerm`, so
+zsh, fish and bash are integrated automatically: sketerm injects the
+scripts under `data/shell-integration/` at spawn (`shell_integration =
+off` disables it). The integration enables OSC 7 cwd reporting (layouts
+remember each pane's directory; new tabs and splits inherit it), OSC 133
+prompt marks (prompt jumping, `copy_command_output`), and the
+`sketerm_copy` helper that sets the local clipboard via OSC 52 even over
+SSH. Each script self-skips when `$TERM_PROGRAM` is not `sketerm`, so
 sourcing unconditionally is safe.
 
 ## License
 
-GPL-3.0-or-later (see `LICENSE`). Selling copies is permitted —
-what the GPL forbids is closed-source redistribution: anyone who
-distributes sketerm (modified or not) must provide the source under
-the same terms.
+GPL-3.0-or-later (see `LICENSE`). Selling copies is permitted; what the
+GPL forbids is closed-source redistribution: anyone who distributes
+sketerm (modified or not) must provide the source under the same terms.
 
 Shader presets under `data/shaders/` carry per-file licenses (MIT,
-public domain, GPL — see `data/shaders/README`); all are compatible
-with the GPL-3 core.
+public domain, GPL; see `data/shaders/README`); all are compatible with
+the GPL-3 core.
 
 The vendored Tree-sitter runtime and grammars under `vendor/tree-sitter/`
 (editor syntax highlighting) are MIT, with an ICU-derived unicode

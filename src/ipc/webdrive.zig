@@ -251,6 +251,33 @@ pub const View = struct {
 
 pub const State = enum { idle, ready, unavailable };
 
+/// Who started the engine this client talks to. THE vocabulary behind
+/// the `web_engine_owner` capability fact: `capabilities` names the
+/// member, consumers must never have to fingerprint it from side
+/// effects (the broker lane was inferred through profile behaviour
+/// once; this is the answer to that).
+pub const Owner = enum {
+    /// Not connected to any engine yet.
+    none,
+    /// The mux broker spawned it (`web_op engine_open`): linger
+    /// lifecycle, survives this client's exit and restart.
+    broker,
+    /// This process forked it; it exits with its last client.
+    self_spawned,
+    /// A live engine another client of this instance started; its
+    /// lifecycle is whoever started it.
+    adopted,
+
+    pub fn name(self: Owner) []const u8 {
+        return switch (self) {
+            .none => "none",
+            .broker => "broker",
+            .self_spawned => "self",
+            .adopted => "adopted",
+        };
+    }
+};
+
 /// The Wayland-hosting mux session the helper renders into, plus the
 /// daemon connection that created it (kept for the origin-fenced
 /// destroy at teardown).
@@ -483,6 +510,7 @@ pub const Engine = struct {
     /// doomed session + spawn per tool call.
     session_blocked: bool = false,
     state: State = .idle,
+    owner: Owner = .none,
     /// Why `state == .unavailable`. Static strings only.
     reason: []const u8 = "",
     /// False for "not installed", where a retry can only fail the same
@@ -683,6 +711,7 @@ pub const Engine = struct {
         self.gpa.free(self.dir);
         self.gpa.free(self.client_name);
         self.state = .idle;
+        self.owner = .none;
     }
 
     fn clearContexts(self: *Engine) void {
@@ -940,6 +969,7 @@ pub const Engine = struct {
         self.cap_multi_client = false;
         self.removePresence();
         self.state = .unavailable;
+        self.owner = .none;
         self.reason = LOST_MSG;
         self.retryable = true;
     }
@@ -985,7 +1015,7 @@ pub const Engine = struct {
         // deadline turns that into a described failure, after which
         // one spawn attempt gets its own try below.
         if (self.tryConnect(sock)) |fd| {
-            if (self.adopt(fd)) return true;
+            if (self.adopt(fd, .adopted)) return true;
             if (self.state == .unavailable and self.retryable) self.state = .idle;
         }
 
@@ -1067,7 +1097,18 @@ pub const Engine = struct {
                 return self.failStart("the broker's browser engine did not bind its socket in time");
             _ = c.usleep(100_000);
         };
-        return self.adopt(fd);
+        return self.adopt(fd, .broker);
+    }
+
+    /// Whether the NEXT engine start would go through the broker lane
+    /// (daemon advertises `web_engine`, broker store open, env hatch
+    /// not set). Answers `capabilities` before any view exists; once an
+    /// engine is up, `owner` is the fact.
+    pub fn brokerLaneAvailable(self: *Engine) bool {
+        if (!brokerEngineWanted()) return false;
+        self.openStore();
+        if (self.remote) |*r| return r.engineSupported();
+        return false;
     }
 
     /// One spawn + connect + handshake attempt. On success the engine
@@ -1126,17 +1167,19 @@ pub const Engine = struct {
             }
             _ = c.usleep(100_000);
         };
-        return self.handshake(fd, true);
+        return self.handshake(fd, .self_spawned);
     }
 
     /// Hello/ack on an established helper connection, shared by the
     /// spawn path and adoption. `spawned` scopes the child-only work:
     /// killing it on a failed handshake, and writing the presence file
     /// (only the client that owns the pid can record it truthfully).
-    fn handshake(self: *Engine, fd: c_int, spawned: bool) bool {
+    fn handshake(self: *Engine, fd: c_int, owner: Owner) bool {
+        const spawned = owner == .self_spawned;
         self.fd = fd;
         _ = c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK);
         self.state = .ready;
+        self.owner = owner;
 
         self.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = self.client_name }) catch {
             self.lost();
@@ -1166,8 +1209,8 @@ pub const Engine = struct {
     /// Join a helper another client of this instance spawned. No child
     /// pid: teardown just closes the socket, and the helper exits with
     /// its LAST client (Phase 1's contract).
-    fn adopt(self: *Engine, fd: c_int) bool {
-        return self.handshake(fd, false);
+    fn adopt(self: *Engine, fd: c_int, owner: Owner) bool {
+        return self.handshake(fd, owner);
     }
 
     fn failStart(self: *Engine, reason: []const u8) bool {

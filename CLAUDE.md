@@ -101,6 +101,9 @@ it is loaded, because breaking one is how each was learned:
   - Never always-stream native frames toward MCP clients — the backlog cap is
     what stopped screenshots lagging whole screens on busy apps.
   - Socket discovery in `resolveSocket` must skip `mux.sock`.
+  - A new server-side capability (lane, backend, mode, optional dep) is
+    a `capabilities` fact in the SAME commit, schema included; consumers
+    must never have to fingerprint behaviour.
 
 - **`src/mux/CLAUDE.md`** — the session daemon, wire protocol, transports,
   Wayland app forwarding, audio, external displays.

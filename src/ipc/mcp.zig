@@ -3740,6 +3740,18 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
         else if (profiles.reason.len > 0)
             try res.textf("named browsing profiles are unavailable: {s}", .{profiles.reason});
     }
+    // Engine lifecycle, as a FACT: a consumer once had to infer "is the
+    // engine broker-owned" from profile side effects. Every capability
+    // the server gains is reported here from day one.
+    if (web_ok and !srv_gui_socket) {
+        const eng = @import("mcp_web.zig").engineCapability();
+        try res.fact("web_engine_broker", eng.broker_lane);
+        try res.fact("web_engine_owner", eng.owner.name());
+        if (eng.broker_lane)
+            try res.textf("browser engine lifecycle: broker-owned (the mux daemon spawns sketerm-webengine and keeps it through client restarts; owner now: {s})", .{eng.owner.name()})
+        else
+            try res.textf("browser engine lifecycle: client-spawned (exits with its last client; owner now: {s})", .{eng.owner.name()});
+    }
     if (helper == null)
         try res.text("sketerm-webengine is not installed next to the sketerm binary — the web_* tools have nothing to drive, in any mode (build it with: zig build fetch-cef && zig build web)")
     else if (std.mem.eql(u8, web_backend, "none"))

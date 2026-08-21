@@ -787,6 +787,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             std.mem.indexOf(u8, caps, "\"headless_terminals\":true") == null or
             std.mem.indexOf(u8, caps, "\"ocr\":") == null)
             fail("capabilities report incomplete");
+        // A server with a browser backend names the engine's lifecycle
+        // and owner as facts; consumers must never infer either.
+        if (std.mem.indexOf(u8, caps, "\"web\":true") != null and
+            (std.mem.indexOf(u8, caps, "\"web_engine_broker\":") == null or
+                std.mem.indexOf(u8, caps, "\"web_engine_owner\":\"") == null))
+            fail("capabilities has a web backend but no web_engine_broker/web_engine_owner facts");
 
         // ── file_* tools (fsdrive against the private daemon) ─────
         {

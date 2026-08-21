@@ -460,7 +460,15 @@ scope cannot be validated returns the identity failure instead of entering a
 reusable namespace. `ui_save` without a document also needs a live transport
 to read the current document back.
 
-`capabilities` reports `gui_socket`, `panels`, and `panels_store`
+`capabilities` is where every server-side capability is announced --
+a consumer never has to probe for one. Browser facts: `web` /
+`web_backend` (gui, session, headless, none), `web_profiles` (named
+cookie jars work), `web_engine_broker` (the mux daemon spawns and keeps
+the browser engine across this server's restarts, versus a
+client-spawned engine that exits with its last client) and
+`web_engine_owner` (who started the engine in use now: `none` before
+the first view, `broker`, `self`, or `adopted` for a live engine another
+client of the instance started). It reports `gui_socket`, `panels`, and `panels_store`
 independently, with structured `panel_transport` and `panel_store` states.
 It is a preflight: it probes the relay under a short deadline of its own and
 writes nothing. `panels_store: true` means the store SCOPE resolves (an exact

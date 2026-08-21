@@ -230,6 +230,12 @@ pub const Remote = struct {
         return .{ .sock = reply.sock, .pid = reply.pid, .spawned = reply.spawned };
     }
 
+    /// Daemon advertises `web_engine` (it will answer engine_open).
+    pub fn engineSupported(self: *Remote) bool {
+        const cn = self.ensureConn() catch return false;
+        return cn.web_engine;
+    }
+
     fn dropConn(self: *Remote) void {
         if (self.conn) |*cn| {
             cn.deinit();

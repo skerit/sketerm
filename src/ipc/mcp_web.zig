@@ -155,6 +155,15 @@ pub fn profileCapability(arena: std.mem.Allocator) struct {
     };
 }
 
+/// The engine-lifecycle half of the preflight: whether the broker lane
+/// is available (the daemon would spawn and keep the engine), and who
+/// owns the engine this server is connected to right now.
+pub fn engineCapability() struct { broker_lane: bool, owner: webdrive.Owner } {
+    if (mcp.guiSocketAttached()) return .{ .broker_lane = false, .owner = .none };
+    const e = headlessEngine() orelse return .{ .broker_lane = false, .owner = .none };
+    return .{ .broker_lane = e.brokerLaneAvailable(), .owner = e.owner };
+}
+
 /// Kill and reap the owned helper; part of server teardown (stdin EOF
 /// and SIGTERM both).
 pub fn shutdownHeadless() void {
@@ -3378,4 +3387,27 @@ test "GUI mode refuses a policy outright: the tabs are the user's" {
     const out = try openView(drv, arena, "https://site.example/", "tab", 800, 600, .default, &pol);
     try t.expectEqual(mcp.ErrCode.unavailable, out.err.code);
     try t.expect(std.mem.indexOf(u8, out.err.text, "headless-only") != null);
+}
+
+test "capabilities schema: web_engine_owner enum is webdrive.Owner, drift-tested" {
+    // The schema's enum is a copy of the vocabulary; this is the test
+    // that makes adding an Owner member without the schema a failure.
+    const t = std.testing;
+    const mcp_tools = @import("mcp_tools.zig");
+    const tool = for (mcp_tools.TOOLS) |tool| {
+        if (std.mem.eql(u8, tool.name, "capabilities")) break tool;
+    } else return error.MissingCapabilitiesTool;
+    const schema = tool.output_schema.?;
+    const key = "\"web_engine_owner\":{\"type\":\"string\",\"enum\":[";
+    const start = (std.mem.indexOf(u8, schema, key) orelse return error.MissingOwnerEnum) + key.len;
+    const end = std.mem.indexOfPos(u8, schema, start, "]") orelse return error.MissingOwnerEnum;
+    const listed = schema[start..end];
+    var n: usize = 0;
+    for (std.enums.values(webdrive.Owner)) |o| {
+        const quoted = try std.fmt.allocPrint(t.allocator, "\"{s}\"", .{o.name()});
+        defer t.allocator.free(quoted);
+        try t.expect(std.mem.indexOf(u8, listed, quoted) != null);
+        n += 1;
+    }
+    try t.expectEqual(n, std.mem.count(u8, listed, "\"") / 2);
 }
