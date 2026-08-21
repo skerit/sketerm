@@ -1186,8 +1186,9 @@ pub fn imagesResult(arena: std.mem.Allocator, caption: []const u8, pngs: []const
 
 /// Like imagesResult, with an optional per-image tag list (parallel
 /// to `pngs`) for the --log trace filenames.
-/// Emits NO structuredContent: app_actions still splices one on via
-/// withActionStatus, and a second key would collide.
+/// Caption-only: a caller that has FACTS to report builds a `Res` and
+/// calls `finishWithImages` itself (these helpers are the plain
+/// "here is a picture" shape).
 pub fn imagesResultTagged(arena: std.mem.Allocator, caption: []const u8, pngs: []const []const u8, tags: ?[]const []const u8) ?[]const u8 {
     var r = Res.init(arena);
     if (caption.len != 0) r.text(caption) catch return null;
@@ -1333,6 +1334,12 @@ pub const Res = struct {
         return self.finishWithImages(&.{}, null);
     }
 
+    /// The accumulated facts as one JSON object — for a builder that
+    /// produces an ELEMENT (one app in a list) rather than a result.
+    pub fn structuredJson(self: *Res) ![]const u8 {
+        return std.fmt.allocPrint(self.arena, "{{{s}}}", .{self.sc.written()});
+    }
+
     /// finish plus inline PNG content blocks after the text block.
     /// `tags` (parallel to `pngs`) names the --log trace files.
     pub fn finishWithImages(self: *Res, pngs: []const []const u8, tags: ?[]const []const u8) ![]const u8 {
@@ -1361,33 +1368,6 @@ pub const Res = struct {
         return aw.written();
     }
 };
-
-pub const ActionStatus = union(enum) {
-    completed,
-    failed,
-    app_exited: struct { step: usize, stop: AppStop },
-};
-
-/// Add a machine-readable batch status without changing MCP content blocks.
-pub fn withActionStatus(arena: std.mem.Allocator, result: []const u8, status: ActionStatus) ?[]const u8 {
-    if (result.len == 0 or result[result.len - 1] != '}') return null;
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    w.writeAll(result[0 .. result.len - 1]) catch return null;
-    w.writeAll(",\"structuredContent\":{\"status\":") catch return null;
-    switch (status) {
-        .completed => w.writeAll("\"completed\"") catch return null,
-        .failed => w.writeAll("\"failed\"") catch return null,
-        .app_exited => |x| {
-            w.print("\"app_exited\",\"step\":{d},\"reason\":\"{s}\"", .{ x.step, x.stop.reasonName() }) catch return null;
-            if (x.stop.exit_status) |code| w.print(",\"exit_status\":{d}", .{code}) catch return null;
-            if (x.stop.signal) |sig| w.print(",\"signal\":{d},\"signal_name\":\"{s}\"", .{ sig, signalName(sig) }) catch return null;
-            w.writeAll(",\"remaining_steps_skipped\":true") catch return null;
-        },
-    }
-    w.writeAll("}}") catch return null;
-    return aw.written();
-}
 
 // ── Tools ─────────────────────────────────────────────────────────
 //
@@ -2114,7 +2094,7 @@ pub fn appIdOf(app: *appdrive.App) u32 {
 }
 
 /// Human name for the common fatal signals (exit_status = -signo).
-fn signalName(signo: i32) []const u8 {
+pub fn signalName(signo: i32) []const u8 {
     return switch (signo) {
         1 => "SIGHUP",
         2 => "SIGINT",
@@ -2199,7 +2179,7 @@ pub const AppStop = struct {
     exit_status: ?i32 = null,
     signal: ?i32 = null,
 
-    fn reasonName(self: AppStop) []const u8 {
+    pub fn reasonName(self: AppStop) []const u8 {
         return switch (self.reason) {
             .process_exit => "process_exit",
             .client_disconnected => "client_disconnected",
@@ -2418,51 +2398,91 @@ pub fn tailLines(text: []const u8, n: usize) []const u8 {
     return text[0..end];
 }
 
-/// JSON summary of an app's windows (arena-owned).
-pub fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.print("{{\"app\":{d},\"session\":", .{appIdOf(app)});
-    try std.json.Stringify.value(app.name, .{}, w);
+/// THE app-state vocabulary, in both lanes: `appFacts` writes the
+/// machine facts into a `Res`, `appSummaryText` renders the same story
+/// as prose. Every app tool that reports on its app calls
+/// `addAppSummary` (both) — nothing spells an app fact by hand.
+///
+/// The two halves are deliberately one function pair: an exit reported
+/// in structuredContent but missing from the text (or the reverse) is
+/// the failure mode that made the old JSON-in-text summary safe.
+pub fn appFacts(res: *Res, arena: std.mem.Allocator, app: *appdrive.App, with_windows: bool) !void {
+    try res.fact("app", appIdOf(app));
+    try res.fact("session", app.name);
     // The daemon-host pid: a debugger handle (`gdb -p`). For a string
     // command this is the wrapping /bin/sh, not the app itself.
-    if (app.pid != 0 and !app.exited) try w.print(",\"pid\":{d}", .{app.pid});
+    if (app.pid != 0 and !app.exited) try res.fact("pid", app.pid);
     const inferred_signal = debuggerSignal(app.log_buf.items);
-    var crash_written = false;
+    var crashed = false;
+    try res.fact("exited", app.exited);
     if (app.exited) {
-        try w.print(",\"exited\":true,\"exit_status\":{d}", .{app.exit_status});
+        try res.fact("exit_status", app.exit_status);
         // decodeStatus convention: negative = killed by that signal.
         if (app.exit_status < 0) {
-            try w.print(",\"signaled\":true,\"signal\":{d},\"signal_name\":\"{s}\"", .{ -app.exit_status, signalName(-app.exit_status) });
-            if (crashSignal(-app.exit_status)) {
-                try w.writeAll(",\"crashed\":true");
-                crash_written = true;
-            }
+            try res.fact("signaled", true);
+            try res.fact("signal", -app.exit_status);
+            try res.fact("signal_name", signalName(-app.exit_status));
+            crashed = crashSignal(-app.exit_status);
         } else if (app.exit_status >= 129 and app.exit_status <= 128 + 31) {
             // A string `command` runs under /bin/sh, which reports a
             // child killed by signal N as exit 128+N.
-            try w.print(",\"likely_signal\":{d},\"likely_signal_name\":\"{s}\",\"exit_status_note\":\"exit {d} = 128+{d}: shell-wrapped commands report signal deaths this way\"", .{
-                app.exit_status - 128, signalName(app.exit_status - 128),
-                app.exit_status,       app.exit_status - 128,
-            });
-            if (crashSignal(app.exit_status - 128)) {
-                try w.writeAll(",\"crashed\":true");
-                crash_written = true;
-            }
+            try res.fact("likely_signal", app.exit_status - 128);
+            try res.fact("likely_signal_name", signalName(app.exit_status - 128));
+            try res.fact("exit_status_note", try std.fmt.allocPrint(
+                arena,
+                "exit {d} = 128+{d}: shell-wrapped commands report signal deaths this way",
+                .{ app.exit_status, app.exit_status - 128 },
+            ));
+            crashed = crashSignal(app.exit_status - 128);
         }
     } else if (app.presentation_gone) |reason| {
-        try w.print(",\"app_gone\":true,\"disconnect_reason\":\"{s}\"", .{@tagName(reason)});
+        try res.fact("app_gone", true);
+        try res.fact("disconnect_reason", @tagName(reason));
     }
     if (inferred_signal) |sig| {
-        try w.print(",\"debugger_caught_signal\":true,\"inferior_signal\":{d},\"inferior_signal_name\":\"{s}\"", .{ sig, signalName(sig) });
-        if (crashSignal(sig) and !crash_written) try w.writeAll(",\"crashed\":true");
+        try res.fact("debugger_caught_signal", true);
+        try res.fact("inferior_signal", sig);
+        try res.fact("inferior_signal_name", signalName(sig));
+        if (crashSignal(sig)) crashed = true;
         // A debug wrapper survives the fault it catches and exits 0, so
         // the raw exit_status above describes GDB/valgrind, not the
         // app. Reading that as a clean exit is the whole trap.
-        if (app.exited and app.exit_status >= 0)
-            try w.print(",\"exit_status_is_wrapper\":true,\"exit_status_note\":\"exit_status {d} belongs to the DEBUG WRAPPER, which survived the fault; the app itself died on {s} (signal {d}) — inferior_signal is authoritative here\"", .{ app.exit_status, signalName(sig), sig });
+        if (app.exited and app.exit_status >= 0) {
+            try res.fact("exit_status_is_wrapper", true);
+            try res.fact("exit_status_note", try std.fmt.allocPrint(
+                arena,
+                "exit_status {d} belongs to the DEBUG WRAPPER, which survived the fault; the app itself died on {s} (signal {d}) — inferior_signal is authoritative here",
+                .{ app.exit_status, signalName(sig), sig },
+            ));
+        }
     }
-    try w.writeAll(",\"windows\":[");
+    if (crashed) try res.fact("crashed", true);
+    if (with_windows) {
+        try res.raw("windows", try windowsJson(arena, app));
+        const primary_id = firstToplevelId(app);
+        if (primary_id != 0) try res.fact("primary_window", primary_id);
+    }
+    // An app that died is otherwise a dead end — inline what it
+    // printed so one call shows WHY. The log-ring stash (pushed by
+    // the daemon ahead of `.exit`) is preferred: escape-free FULL
+    // lines, never wrapped at the grid width, includes scrolled-off
+    // output. The rendered-grid tail is only the fallback.
+    if (app.exited or app.presentationGone()) {
+        if (recentOutput(arena, app)) |out| {
+            try res.fact("recent_output", out.text);
+            try res.fact("recent_output_source", out.source);
+        }
+        if (std.mem.indexOf(u8, app.log_buf.items, "Sanitizer") != null or
+            std.mem.indexOf(u8, app.log_buf.items, "runtime error:") != null)
+            try res.fact("sanitizer_report", true);
+    }
+}
+
+/// The window array of `appFacts`, as verbatim JSON.
+fn windowsJson(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("[");
     var first = true;
     const primary_id = firstToplevelId(app);
     for (app.windows.items) |win| {
@@ -2485,31 +2505,67 @@ pub fn appSummary(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
         try w.writeAll("}");
     }
     try w.writeAll("]");
-    // An app that died is otherwise a dead end — inline what it
-    // printed so one call shows WHY. The log-ring stash (pushed by
-    // the daemon ahead of `.exit`) is preferred: escape-free FULL
-    // lines, never wrapped at the grid width, includes scrolled-off
-    // output. The rendered-grid tail is only the fallback.
-    if (app.exited or app.presentationGone()) {
-        if (logStashTail(arena, app, 15)) |tail_text| {
-            try w.writeAll(",\"recent_output\":");
-            try std.json.Stringify.value(tail_text, .{}, w);
-            try w.writeAll(",\"recent_output_source\":\"app_log (indexed; read more/older lines with the app_log tool)\"");
-        } else if (app.output(false)) |text| {
-            defer app_state.allocator.free(text);
-            try w.writeAll(",\"recent_output\":");
-            try std.json.Stringify.value(tailLines(text, 25), .{}, w);
-        } else |_| {}
-        if (std.mem.indexOf(u8, app.log_buf.items, "Sanitizer") != null or
-            std.mem.indexOf(u8, app.log_buf.items, "runtime error:") != null)
-            try w.writeAll(",\"sanitizer_report\":true,\"sanitizer_note\":\"a sanitizer wrote a report to stderr — read it in full with app_log\"");
-        // A gdb wrapper exits 0 after catching the fault; the log
-        // headline is the real story.
-        if (inferred_signal != null)
-            try w.writeAll(",\"debugger_note\":\"the debug wrapper caught a fatal signal — backtrace in app_log\"");
-    }
-    try w.writeAll("}");
     return aw.written();
+}
+
+const RecentOutput = struct { text: []const u8, source: []const u8 };
+
+/// What a dead app last printed: the indexed log stash if the daemon
+/// pushed one, else the rendered grid tail.
+fn recentOutput(arena: std.mem.Allocator, app: *appdrive.App) ?RecentOutput {
+    if (logStashTail(arena, app, 15)) |tail_text|
+        return .{ .text = tail_text, .source = "app_log" };
+    const text = app.output(false) catch return null;
+    defer app_state.allocator.free(text);
+    const tail = tailLines(text, 25);
+    if (tail.len == 0) return null;
+    return .{ .text = arena.dupe(u8, tail) catch return null, .source = "terminal_grid" };
+}
+
+/// Prose half of `appFacts`: identity, exit/disconnect verdict, the
+/// window list, and (for a dead app) what it last printed — the
+/// payload behind a `--- recent output ---` divider.
+pub fn appSummaryText(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("app {d} ({s})", .{ appIdOf(app), app.name });
+    if (app.pid != 0 and !app.exited) try w.print(" pid {d}", .{app.pid});
+    if (app.exited) {
+        try w.print(" EXITED, status {d}{s}", .{ app.exit_status, try exitSuffix(arena, app.exit_status) });
+    } else if (app.presentation_gone) |reason| {
+        try w.print(" GONE from the compositor ({s})", .{@tagName(reason)});
+    }
+    if (debuggerSignal(app.log_buf.items)) |sig| {
+        try w.print("\nthe debug wrapper caught {s} (signal {d}) — backtrace in app_log", .{ signalName(sig), sig });
+        if (app.exited and app.exit_status >= 0)
+            try w.writeAll("; the exit status above belongs to the WRAPPER, not the app");
+    }
+    if (std.mem.indexOf(u8, app.log_buf.items, "Sanitizer") != null or
+        std.mem.indexOf(u8, app.log_buf.items, "runtime error:") != null)
+        try w.writeAll("\na sanitizer wrote a report to stderr — read it in full with app_log");
+    const primary_id = firstToplevelId(app);
+    var shown: usize = 0;
+    for (app.windows.items) |win| {
+        if (win.frames == 0) continue;
+        shown += 1;
+        try w.print("\nwindow {d}: {d}x{d} scale {d} frame {d}", .{ win.id, win.w, win.h, win.scale, win.frames });
+        if (win.id == primary_id) try w.writeAll(" primary");
+        if (win.popup) try w.writeAll(" popup");
+        if (win.title) |t| try w.print(" title={s}", .{t});
+    }
+    if (shown == 0) try w.writeAll("\nno rendered window");
+    if (app.exited or app.presentationGone()) {
+        if (recentOutput(arena, app)) |out|
+            try w.print("\n--- recent output ({s}) ---\n{s}", .{ out.source, out.text });
+    }
+    return aw.written();
+}
+
+/// Both lanes of the app state at once — the one call every app tool
+/// makes to report on its app.
+pub fn addAppSummary(res: *Res, arena: std.mem.Allocator, app: *appdrive.App) !void {
+    try appFacts(res, arena, app, true);
+    try res.text(try appSummaryText(arena, app));
 }
 
 pub fn appErr(arena: std.mem.Allocator, msg: []const u8) ![]const u8 {
@@ -2517,9 +2573,9 @@ pub fn appErr(arena: std.mem.Allocator, msg: []const u8) ![]const u8 {
 }
 
 /// Screenshot caption: window identity + how to map image coordinates
-/// back to app_click surface coordinates (crop origin + scale).
-/// `extra` (a summary, or "") is prepended on its own line.
-pub fn screenshotCaption(arena: std.mem.Allocator, app: *appdrive.App, win_id: u32, shot: appdrive.App.Shot, extra: []const u8) ![]const u8 {
+/// back to app_click surface coordinates (crop origin + scale). One
+/// line; anything else a caller wants to say is its own text line.
+pub fn screenshotCaption(arena: std.mem.Allocator, app: *appdrive.App, win_id: u32, shot: appdrive.App.Shot) ![]const u8 {
     const win = app.winById(win_id) orelse return error.OutOfMemory;
     const coord_note = if (shot.scale == 1.0 and shot.ox == 0 and shot.oy == 0)
         try std.fmt.allocPrint(arena, "coordinates for app_click are this image's pixel coordinates", .{})
@@ -2537,10 +2593,8 @@ pub fn screenshotCaption(arena: std.mem.Allocator, app: *appdrive.App, win_id: u
         );
     return std.fmt.allocPrint(
         arena,
-        "{s}{s}window {d}: {d}x{d} (scale {d}) frame {d}{s}{s} — {s}{s}",
+        "window {d}: {d}x{d} (scale {d}) frame {d}{s}{s} — {s}{s}",
         .{
-            extra,
-            if (extra.len > 0) "\n" else "",
             win.id,
             win.w,
             win.h,
@@ -2885,9 +2939,32 @@ pub const PostInputWait = struct {
     }
 };
 
+/// Facts + one prose line for a captured window frame: what the image
+/// shows and how to map its pixels back to app_click coordinates.
+/// The caller owns the `window` fact (it already has one on every input
+/// path, and a key written twice is a broken JSON object).
+pub fn addShotFacts(
+    res: *Res,
+    arena: std.mem.Allocator,
+    app: *appdrive.App,
+    win_id: u32,
+    shot: appdrive.App.Shot,
+) !void {
+    try res.fact("frame", shot.frame);
+    try res.fact("image_w", shot.img_w);
+    try res.fact("image_h", shot.img_h);
+    try res.fact("image_scale", shot.scale);
+    if (shot.ox != 0 or shot.oy != 0) {
+        try res.fact("crop_x", shot.ox);
+        try res.fact("crop_y", shot.oy);
+    }
+    try res.text(try screenshotCaption(arena, app, win_id, shot));
+}
+
 /// Shared tail for app_key/app_type/app_drag/app_scroll: finish the
 /// post-input wait, then answer with a screenshot (when asked) or a
-/// text result carrying the repaint note.
+/// text result carrying the repaint note. `res` already holds the
+/// tool's own facts; the common input facts are added here.
 pub fn inputResult(
     arena: std.mem.Allocator,
     app: *appdrive.App,
@@ -2895,36 +2972,40 @@ pub fn inputResult(
     win_id: u32,
     piw: *PostInputWait,
     desc: []const u8,
+    res: *Res,
 ) ![]const u8 {
-    var note = try piw.finish(arena, app, win_id);
+    const note = try piw.finish(arena, app, win_id);
+    try res.fact("window", win_id);
     // Every input hands back the frame counter it acted at — the only
     // way a later capture can be asserted (not assumed) newer.
-    if (piw.stop == null)
-        note = try std.fmt.allocPrint(arena, "{s}{s}{s}{s}", .{ note, piw.frameNote(arena, app, win_id), logDeltaNote(arena, app, args), macroNudge(arena, app) });
+    try res.fact("frame_at_input", piw.frame_at_input);
+    try res.fact("frame_now", app.frameCount(win_id));
+    try res.fact("repainted", piw.repainted);
+    try res.textf("{s}{s}", .{ desc, note });
     if (piw.stop != null) {
         // Skip the screenshot attempt (it would fail as "no pixels
         // yet?" and mask the crash) — report the exit with full detail.
-        const summary = try appSummary(arena, app);
-        const msg = try std.fmt.allocPrint(arena, "{s}{s}\n{s}", .{ desc, note, summary });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        try addAppSummary(res, arena, app);
+        return res.finish();
     }
+    const frame_note = piw.frameNote(arena, app, win_id);
+    if (frame_note.len > 0) try res.text(frame_note);
+    const delta = logDeltaNote(arena, app, args);
+    if (delta.len > 0) try res.text(delta);
+    const nudge = macroNudge(arena, app);
+    if (nudge.len > 0) try res.text(nudge);
     if (argBool(args, "screenshot") and win_id != 0) {
         const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 1568, 0, 8192));
         const shot = app.screenshotPng(win_id, max_px, null, 1) catch {
-            const msg = try std.fmt.allocPrint(arena, "{s}{s}, but the post-input screenshot failed (no pixels yet?)", .{ desc, note });
-            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+            try res.fact("screenshot_failed", true);
+            try res.text("the post-input screenshot failed (no pixels yet?)");
+            return res.finish();
         };
         defer app_state.allocator.free(shot.png);
-        const extra = try std.fmt.allocPrint(arena, "{s}{s}", .{ desc, note });
-        const caption = try screenshotCaption(arena, app, win_id, shot, extra);
-        return imageResult(arena, caption, shot.png) orelse error.OutOfMemory;
+        try addShotFacts(res, arena, app, win_id, shot);
+        return res.finishWithImages(&.{shot.png}, null);
     }
-    if (note.len > 0) {
-        const msg = try std.fmt.allocPrint(arena, "{s}{s}", .{ desc, note });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
-    }
-    const msg = try std.fmt.allocPrint(arena, "{s}", .{desc});
-    return toolResult(arena, msg, false) orelse error.OutOfMemory;
+    return res.finish();
 }
 
 /// Fixed-length array of numbers out of a JSON value ([x,y], …).
@@ -5564,13 +5645,22 @@ test "app_actions stops structurally when a click crashes the app" {
     const root = try parseTestValue(arena,
         \\{"actions":[{"click":[0,0],"screenshot":true},{"screenshot":true}]}
     );
-    const result = try @import("mcp_app.zig").runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, 1, false, "");
-    try t.expect(std.mem.indexOf(u8, result, "app EXITED") != null);
-    try t.expect(std.mem.indexOf(u8, result, "SIGSEGV") != null);
-    try t.expect(std.mem.indexOf(u8, result, "\"status\":\"app_exited\"") != null);
-    try t.expect(std.mem.indexOf(u8, result, "\"step\":1") != null);
-    try t.expect(std.mem.indexOf(u8, result, "no pixels yet") == null);
-    try t.expect(std.mem.indexOf(u8, result, "all 2 steps completed") == null);
+    const result = try @import("mcp_app.zig").runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, 1, false, null);
+    const parsed = try expectToolResultShape(arena, "app_actions", result);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("app_exited", sc.get("status").?.string);
+    try t.expectEqual(@as(i64, 1), sc.get("step").?.integer);
+    try t.expectEqual(@as(i64, 11), sc.get("signal").?.integer);
+    try t.expectEqualStrings("SIGSEGV", sc.get("signal_name").?.string);
+    try t.expect(sc.get("remaining_steps_skipped").?.bool);
+    // A step failure is never a tool error, and the transcript still
+    // tells the story in prose.
+    try t.expect(parsed.object.get("isError") == null);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "app EXITED") != null);
+    try t.expect(std.mem.indexOf(u8, text, "SIGSEGV") != null);
+    try t.expect(std.mem.indexOf(u8, text, "no pixels yet") == null);
+    try t.expect(std.mem.indexOf(u8, text, "all 2 steps completed") == null);
 }
 
 test "app_actions reports clean exit status and skips later steps" {
@@ -5587,11 +5677,16 @@ test "app_actions reports clean exit status and skips later steps" {
     const root = try parseTestValue(arena,
         \\{"actions":[{"wait_idle":{"quiet_ms":500,"timeout_ms":1000}},{"key":"enter"}]}
     );
-    const result = try @import("mcp_app.zig").runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, 1, false, "");
-    try t.expect(std.mem.indexOf(u8, result, "app exited during wait_idle (status 0)") != null);
-    try t.expect(std.mem.indexOf(u8, result, "\"status\":\"app_exited\"") != null);
-    try t.expect(std.mem.indexOf(u8, result, "\"exit_status\":0") != null);
-    try t.expect(std.mem.indexOf(u8, result, "pressed") == null);
+    const result = try @import("mcp_app.zig").runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, 1, false, null);
+    const parsed = try expectToolResultShape(arena, "app_actions", result);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("app_exited", sc.get("status").?.string);
+    try t.expectEqual(@as(i64, 0), sc.get("exit_status").?.integer);
+    try t.expectEqual(@as(i64, 2), sc.get("steps_total").?.integer);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "app exited during wait_idle (status 0)") != null);
+    // The second step never ran.
+    try t.expect(std.mem.indexOf(u8, text, "pressed") == null);
 }
 
 test "app_actions keeps a live frozen app distinct from exit" {
@@ -5606,10 +5701,21 @@ test "app_actions keeps a live frozen app distinct from exit" {
     const root = try parseTestValue(arena,
         \\{"actions":[{"wait_idle":{"quiet_ms":500,"timeout_ms":100,"required":true}}]}
     );
-    const result = try @import("mcp_app.zig").runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, 1, false, "");
-    try t.expect(std.mem.indexOf(u8, result, "wait_idle did not settle before timeout") != null);
-    try t.expect(std.mem.indexOf(u8, result, "\"status\":\"failed\"") != null);
-    try t.expect(std.mem.indexOf(u8, result, "app_exited") == null);
+    const result = try @import("mcp_app.zig").runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, 1, false, null);
+    const parsed = try expectToolResultShape(arena, "app_actions", result);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("failed", sc.get("status").?.string);
+    try t.expectEqual(@as(i64, 1), sc.get("step").?.integer);
+    // The failing step's own words are the reason — no exit is claimed.
+    try t.expect(std.mem.indexOf(u8, sc.get("reason").?.string, "wait_idle did not settle") != null);
+    try t.expect(sc.get("exit_status") == null);
+    try t.expect(sc.get("signal") == null);
+    // One outcome, marked not-ok.
+    const steps_out = sc.get("steps").?.array.items;
+    try t.expectEqual(@as(usize, 1), steps_out.len);
+    try t.expect(!steps_out[0].object.get("ok").?.bool);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "wait_idle did not settle before timeout") != null);
 }
 
 test "app_actions treats debugger client loss as inferior exit" {
@@ -5625,11 +5731,17 @@ test "app_actions treats debugger client loss as inferior exit" {
     try fixture.app.log_buf.appendSlice(t.allocator, "{\"lines\":[{\"text\":\"Program received signal SIGSEGV, Segmentation fault.\"}]}");
 
     const root = try parseTestValue(arena, "{\"actions\":[{\"wait_idle\":{\"timeout_ms\":100}},{\"screenshot\":true}]}");
-    const result = try @import("mcp_app.zig").runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, null, false, "");
-    try t.expect(std.mem.indexOf(u8, result, "SIGSEGV") != null);
-    try t.expect(std.mem.indexOf(u8, result, "\"reason\":\"client_disconnected\"") != null);
-    try t.expect(std.mem.indexOf(u8, result, "\"status\":\"app_exited\"") != null);
-    try t.expect(std.mem.indexOf(u8, result, "no rendered window") == null);
+    const result = try @import("mcp_app.zig").runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, null, false, null);
+    const parsed = try expectToolResultShape(arena, "app_actions", result);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("app_exited", sc.get("status").?.string);
+    try t.expectEqualStrings("client_disconnected", sc.get("reason").?.string);
+    try t.expectEqual(@as(i64, 11), sc.get("signal").?.integer);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "SIGSEGV") != null);
+    // The batch stopped at step 1, so the screenshot step never ran and
+    // never complained about the missing window.
+    try t.expect(std.mem.indexOf(u8, text, "no rendered window to screenshot") == null);
 }
 
 test "PostInputWait reports a click-triggered process crash" {
@@ -5735,10 +5847,97 @@ test "app_click reports a crash during its held click" {
     const sender = try std.Thread.spawn(.{}, DelayedExit.send, .{DelayedExit{ .fd = fixture.peer, .status = -11 }});
     defer sender.join();
     const result = try @import("mcp_app.zig").appTool(arena, "app_click", args);
-    try t.expect(std.mem.indexOf(u8, result, "app EXITED") != null);
-    try t.expect(std.mem.indexOf(u8, result, "SIGSEGV") != null);
-    try t.expect(std.mem.indexOf(u8, result, "click failed") == null);
-    try t.expect(std.mem.indexOf(u8, result, "no pixels yet") == null);
+    const parsed = try expectToolResultShape(arena, "app_click", result);
+    const sc = parsed.object.get("structuredContent").?.object;
+    // The click's own facts survive the crash it triggered, and the
+    // app's death is reported as app state, not as a click failure.
+    try t.expectEqual(@as(i64, 1), sc.get("window").?.integer);
+    try t.expect(sc.get("exited").?.bool);
+    try t.expectEqual(@as(i64, 11), sc.get("signal").?.integer);
+    try t.expect(sc.get("crashed").?.bool);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "app EXITED") != null);
+    try t.expect(std.mem.indexOf(u8, text, "SIGSEGV") != null);
+    try t.expect(std.mem.indexOf(u8, text, "click failed") == null);
+    try t.expect(std.mem.indexOf(u8, text, "no pixels yet") == null);
+}
+
+test "app tools speak both lanes: windows, wait, pointer and the roster" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    app_state.ready = true;
+    try app_state.apps.put(t.allocator, 1, fixture.app);
+    defer {
+        Journal.deinitAll();
+        LogDelta.deinitAll();
+        MacroNudge.deinitAll();
+        _ = app_state.apps.fetchSwapRemove(1);
+        app_state.apps.deinit(t.allocator);
+        app_state.apps = .empty;
+        app_state.ready = false;
+    }
+    const app_tools = @import("mcp_app.zig");
+
+    // 1. app_windows: the window list is a fact, the prose names it.
+    const windows = try app_tools.appTool(arena, "app_windows", try parseTestValue(arena, "{\"app\":1}"));
+    const wparsed = try expectToolResultShape(arena, "app_windows", windows);
+    const wsc = wparsed.object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 1), wsc.get("app").?.integer);
+    try t.expect(!wsc.get("exited").?.bool);
+    try t.expectEqual(@as(usize, 1), wsc.get("windows").?.array.items.len);
+    try t.expectEqual(@as(i64, 1), wsc.get("windows").?.array.items[0].object.get("window").?.integer);
+    try t.expectEqual(@as(i64, 1), wsc.get("primary_window").?.integer);
+    const wtext = wparsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, wtext, "window 1: 1x1") != null);
+
+    // 2. app_wait: the verdict is a fact (mode + settled), and the
+    //    frame arithmetic that used to hide in prose is machine data.
+    const waited = try app_tools.appTool(arena, "app_wait", try parseTestValue(arena, "{\"app\":1,\"quiet_ms\":10,\"timeout_ms\":200}"));
+    const waparsed = try expectToolResultShape(arena, "app_wait", waited);
+    const wasc = waparsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("idle", wasc.get("mode").?.string);
+    try t.expect(wasc.get("settled").?.bool);
+    try t.expectEqual(@as(i64, 0), wasc.get("frames_committed").?.integer);
+    try t.expectEqual(@as(i64, 1), wasc.get("window").?.integer);
+
+    // 3. app_mouse_move with no coordinates is a QUERY, and says so
+    //    rather than pretending it moved anything.
+    const ptr = try app_tools.appTool(arena, "app_mouse_move", try parseTestValue(arena, "{\"app\":1}"));
+    const pparsed = try expectToolResultShape(arena, "app_mouse_move", ptr);
+    const psc = pparsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("query", psc.get("mode").?.string);
+    try t.expect(!psc.get("tracked").?.bool);
+
+    // 4. list_apps: one entry per session, plus a count.
+    const listed = try app_tools.appTool(arena, "list_apps", try parseTestValue(arena, "{}"));
+    const lparsed = try expectToolResultShape(arena, "list_apps", listed);
+    const lsc = lparsed.object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 1), lsc.get("count").?.integer);
+    try t.expectEqual(@as(i64, 1), lsc.get("apps").?.array.items[0].object.get("app").?.integer);
+
+    // 5. An unknown app id is a typed not_found, never a bare failure.
+    const missing = try app_tools.appTool(arena, "app_windows", try parseTestValue(arena, "{\"app\":99}"));
+    const mparsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, missing, .{});
+    try t.expect(mparsed.object.get("isError").?.bool);
+    try t.expectEqualStrings("not_found", mparsed.object.get("structuredContent").?.object.get("error").?.object.get("code").?.string);
+}
+
+test "the no-JSON text rule is scoped to a result's own prose" {
+    const t = std.testing;
+    // Prose only: the whole lane is checked.
+    try t.expectEqualStrings("window 1: 1x1", textProse("window 1: 1x1"));
+    // A payload behind a divider is exempt — screen text, transcripts
+    // and log lines legitimately carry braces.
+    try t.expectEqualStrings("2 line(s)", textProse("2 line(s)\n--- log ---\n1 {\"a\":1}\n2 }{"));
+    // So is a blank-line separated payload.
+    try t.expectEqualStrings("header", textProse("header\n\n{\"raw\":true}"));
+    // A result that is nothing but a payload has no prose to check.
+    try t.expectEqualStrings("", textProse("--- steps ---\nstep 1: {ok}"));
 }
 
 test "app_actions wait_image reports exit instead of template timeout" {
@@ -5762,10 +5961,12 @@ test "app_actions wait_image reports exit instead of template timeout" {
     const root = try parseTestValue(arena, json);
     const sender = try std.Thread.spawn(.{}, DelayedExit.send, .{DelayedExit{ .fd = fixture.peer, .status = -11 }});
     defer sender.join();
-    const result = try @import("mcp_app.zig").runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, null, false, "");
-    try t.expect(std.mem.indexOf(u8, result, "app EXITED during wait_image") != null);
-    try t.expect(std.mem.indexOf(u8, result, "template") == null or std.mem.indexOf(u8, result, "not found") == null);
-    try t.expect(std.mem.indexOf(u8, result, "\"status\":\"app_exited\"") != null);
+    const result = try @import("mcp_app.zig").runActionSteps(arena, fixture.app, root.object.get("actions").?.array.items, null, false, null);
+    const parsed = try expectToolResultShape(arena, "app_actions", result);
+    try t.expectEqualStrings("app_exited", parsed.object.get("structuredContent").?.object.get("status").?.string);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "app EXITED during wait_image") != null);
+    try t.expect(std.mem.indexOf(u8, text, "template") == null or std.mem.indexOf(u8, text, "not found") == null);
 }
 
 test "initialize / tools list / unknown method" {
@@ -7941,8 +8142,24 @@ test "errRes: uniform shape, code tag, retryable fact" {
 /// Test helper: assert a migrated tool result speaks BOTH lanes and
 /// that its structuredContent matches the tool's declared outputSchema
 /// — every `required` key present, no key the schema does not declare.
-/// The text lane must be non-empty, newline-escaped (NDJSON) and free
-/// of JSON syntax.
+/// The text lane must be non-empty and newline-escaped (NDJSON).
+///
+/// The no-JSON rule is scoped to the result's OWN prose — everything
+/// before the first payload divider (a `--- name ---` line) or blank
+/// line. A legitimate payload (screen text, a step transcript, OCR
+/// output, an app's own log) may contain braces, and refusing those
+/// would push real content out of the lane that exists to carry it.
+/// The prose head of a text lane: everything before the first payload
+/// divider (`--- name ---`) or blank line. THE scope of the no-JSON
+/// rule — see expectToolResultShape.
+pub fn textProse(text: []const u8) []const u8 {
+    var end = text.len;
+    if (std.mem.indexOf(u8, text, "\n--- ")) |at| end = @min(end, at);
+    if (std.mem.indexOf(u8, text, "\n\n")) |at| end = @min(end, at);
+    if (std.mem.startsWith(u8, text, "--- ")) return "";
+    return text[0..end];
+}
+
 pub fn expectToolResultShape(arena: std.mem.Allocator, tool: []const u8, result: []const u8) !std.json.Value {
     const t = std.testing;
     try t.expect(std.mem.indexOfScalar(u8, result, '\n') == null);
@@ -7951,8 +8168,9 @@ pub fn expectToolResultShape(arena: std.mem.Allocator, tool: []const u8, result:
     const content = obj.get("content") orelse return error.NoContentBlock;
     const text = content.array.items[0].object.get("text").?.string;
     try t.expect(text.len > 0);
-    if (std.mem.indexOfScalar(u8, text, '{') != null) {
-        std.debug.print("{s}: JSON syntax in the text lane: {s}\n", .{ tool, text });
+    const prose = textProse(text);
+    if (std.mem.indexOfScalar(u8, prose, '{') != null) {
+        std.debug.print("{s}: JSON syntax in the text lane's prose: {s}\n", .{ tool, prose });
         return error.JsonInTextLane;
     }
     const sc = (obj.get("structuredContent") orelse return error.NoStructuredContent).object;

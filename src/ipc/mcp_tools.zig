@@ -52,6 +52,23 @@ pub const ToolDef = struct {
     output_schema: ?[]const u8 = null,
 };
 
+/// The app-state facts `mcp.appFacts` writes, declared ONCE: every app
+/// tool that reports on its app emits this same set, so its schema
+/// splices this fragment in rather than restating (and drifting from)
+/// it. Same for a captured frame (`addShotFacts`) and the common input
+/// facts (`inputResult`).
+const APP_STATE_PROPS =
+    \\"app":{"type":"integer"},"session":{"type":"string"},"pid":{"type":"integer"},"exited":{"type":"boolean"},"exit_status":{"type":"integer"},"signaled":{"type":"boolean"},"signal":{"type":"integer"},"signal_name":{"type":"string"},"likely_signal":{"type":"integer"},"likely_signal_name":{"type":"string"},"exit_status_note":{"type":"string"},"app_gone":{"type":"boolean"},"disconnect_reason":{"type":"string"},"debugger_caught_signal":{"type":"boolean"},"inferior_signal":{"type":"integer"},"inferior_signal_name":{"type":"string"},"exit_status_is_wrapper":{"type":"boolean"},"crashed":{"type":"boolean"},"windows":{"type":"array","items":{"type":"object"}},"primary_window":{"type":"integer"},"recent_output":{"type":"string"},"recent_output_source":{"type":"string"},"sanitizer_report":{"type":"boolean"}
+;
+
+const SHOT_PROPS =
+    \\"frame":{"type":"integer"},"image_w":{"type":"integer"},"image_h":{"type":"integer"},"image_scale":{"type":"number"},"crop_x":{"type":"integer"},"crop_y":{"type":"integer"}
+;
+
+const INPUT_PROPS =
+    \\"window":{"type":"integer"},"frame_at_input":{"type":"integer"},"frame_now":{"type":"integer"},"repainted":{"type":"boolean"},"screenshot_failed":{"type":"boolean"}
+;
+
 pub const TOOLS = [_]ToolDef{
     // ── panes: the running GUI's tabs and panes ────────────────────
     .{
@@ -209,6 +226,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"host":{"type":"string","description":"SSH host (user@box); omit = local"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"apps\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"count\":{\"type\":\"integer\"},\"host\":{\"type\":\"string\"}" ++ "},\"required\":[\"apps\",\"count\"]}",
     },
     .{
         .name = "launch_app",
@@ -220,6 +238,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"command":{"description":"argv array (preferred) or a shell command string","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"args":{"type":"array","items":{"type":"string"},"description":"Extra argv entries appended after command. With a string command, the command then runs as the bare EXECUTABLE (argv[0], NOT shell-parsed)."},"host":{"type":"string","description":"SSH host (user@box) to run on; omit = local daemon"},"cwd":{"type":"string","description":"Working directory for the app"},"env":{"type":"object","description":"Extra environment variables, e.g. {\"FOO\":\"1\"}","additionalProperties":{"type":"string"}},"wait_for":{"type":"string","enum":["window","exit"],"description":"What to wait for before replying: first window (default) or process exit (short-lived/CLI runs)"},"wait_ms":{"type":"integer","description":"Max wait (default 10000)"},"stable_ms":{"type":"integer","description":"How long painting must quiesce before the inline screenshot is captured (default 500, 0 = capture immediately; bounded at 4x this value so a continuously-animating app can't stall the launch reply)"},"size":{"type":"string","description":"Virtual output mode as \"WxH\" pixels (default 1920x1080, max 16384 per side / 64 megapixels): the SCREEN the session compositor advertises to the app, for DPI/layout tests — not a window size. An older remote daemon ignores it; the reply warns when the requested size was not applied."},"cols":{"type":"integer"},"rows":{"type":"integer"},"layout":{"type":"string","description":"Session keyboard layout: us (default), gb, fr, be, de"},"gpu":{"type":"boolean","description":"Render on the host's real GPU via linux-dmabuf instead of software GL. Needs a driver whose linear buffers allow CPU mmap."},"audio":{"type":"string","enum":["forward","none"],"description":"forward (default): PULSE_SERVER points at sketerm's per-session audio sink, which paces playback in real time (samples are discarded unless a GUI viewer is attached). none: no PULSE_SERVER, so the app falls back to its own dummy/null audio driver."},"audio_path":{"type":"string","description":"Capture the app's audio to WAV at this absolute path base ON THE DAEMON'S HOST (first stream: <base>.wav, later streams: <base>-N.wav; a trailing .wav in the base is stripped). Playback pacing is unaffected — this tees the PCM the sink consumes, so you can verify the app actually produced sound. Incompatible with audio:\"none\"."},"debug":{"type":"string","enum":["gdb","valgrind"],"description":"Run the app under a debug wrapper: gdb (batch mode — on a crash ALL threads' backtraces, thread list and registers land in app_log; nuisance signals like SIGPIPE and glibc's thread signals are passed through so a threaded app's real fault is what gets caught) or valgrind (report in app_log at exit). The reported pid is the wrapper's, and so is exit_status: a crash under gdb still exits 0, which is why the app's real fate is reported separately as inferior_signal/crashed with an exit_status_note."},"gdb_commands":{"type":"array","items":{"type":"string"},"description":"With debug:\"gdb\" only: extra gdb commands executed AT THE CRASH POINT after the automatic bt full + info registers (e.g. [\"frame 3\",\"p *ctx\",\"x/8xw $rcx\",\"info locals\"]); their output lands in app_log with the backtrace, so one crashing run captures the state you'd otherwise relaunch for. Commands run in order and may switch frames."}},"required":["command"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ SHOT_PROPS ++ "," ++ "\"settled\":{\"type\":\"boolean\"},\"window\":{\"type\":\"integer\"},\"requested_output_applied\":{\"type\":\"boolean\"},\"audio_capture\":{\"type\":\"string\"}" ++ "},\"required\":[\"app\",\"session\",\"exited\",\"windows\"]}",
     },
     .{
         .name = "list_apps",
@@ -231,6 +250,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"apps\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"count\":{\"type\":\"integer\"}" ++ "},\"required\":[\"apps\",\"count\"]}",
     },
     .{
         .name = "app_windows",
@@ -242,6 +262,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "},\"required\":[\"app\",\"session\",\"exited\",\"windows\"]}",
     },
     .{
         .name = "screenshot_app",
@@ -253,6 +274,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"max_px":{"type":"integer","description":"Bound on the longest image dimension (default 1568, 0 = full size)"},"region":{"type":"object","description":"Crop to a sub-rectangle in surface pixels. Also SCOPES change detection: stats_only's diff_pct is measured inside this rect only, and with min_change_pct set, wait_change/stable_ms/burst gate on changes inside it — assert 'did THIS area change' without eyeballing images","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer","description":"Nearest-neighbor integer upscale (1-32) — crop a small region and zoom to inspect pixels"},"wait_change":{"type":"boolean","description":"Wait until the window content changed since the last screenshot before capturing. Combine with min_change_pct to ignore trivial repaints (a software cursor)."},"stable_ms":{"type":"integer","description":"Capture only after the window committed no new frame for this long (settle-then-capture). With min_change_pct set, frames changing less than that % don't reset the timer (VISUAL settle — works on continuously-animating apps)."},"stats_only":{"type":"boolean","description":"Return {changed, diff_pct, resized, w, h, frames} instead of an image"},"burst":{"type":"integer","description":"Capture up to N distinct frames (2-8) over burst_ms"},"burst_ms":{"type":"integer","description":"Burst time window (default 5000)"},"min_change_pct":{"type":"number","description":"Pixel-change threshold (%): burst frames must differ this much from the previous one (default 1.0), and when set it also gates wait_change and turns stable_ms into a visual settle (default 0 = any repaint counts)"},"min_frame":{"type":"integer","description":"Block until this window's frame counter EXCEEDS this value, then capture; error (no image) if it never does within timeout_ms. Pass the frame number an input tool reported to guarantee post-input pixels."},"timeout_ms":{"type":"integer","description":"Bound for min_frame/wait_change/stable_ms (default 10000, max 120000 — larger values are clamped, since the server aborts any tool call well before that)"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ SHOT_PROPS ++ "," ++ "\"window\":{\"type\":\"integer\"},\"settled\":{\"type\":\"boolean\"},\"changed\":{\"type\":\"boolean\"},\"diff_pct\":{\"type\":\"number\"},\"resized\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"},\"h\":{\"type\":\"integer\"},\"frames\":{\"type\":\"integer\"},\"diff_scope\":{\"type\":\"string\"},\"burst\":{\"type\":\"integer\"},\"burst_offsets_ms\":{\"type\":\"array\"},\"min_change_pct\":{\"type\":\"number\"}" ++ "},\"required\":[\"window\"]}",
     },
     .{
         .name = "get_app_state",
@@ -264,6 +286,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"max_px":{"type":"integer"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"zoom":{"type":"integer"},"wait_change":{"type":"boolean"},"stable_ms":{"type":"integer"},"stats_only":{"type":"boolean"},"burst":{"type":"integer"},"burst_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"timeout_ms":{"type":"integer"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ SHOT_PROPS ++ "," ++ "\"window\":{\"type\":\"integer\"},\"settled\":{\"type\":\"boolean\"},\"changed\":{\"type\":\"boolean\"},\"diff_pct\":{\"type\":\"number\"},\"resized\":{\"type\":\"boolean\"},\"w\":{\"type\":\"integer\"},\"h\":{\"type\":\"integer\"},\"frames\":{\"type\":\"integer\"},\"diff_scope\":{\"type\":\"string\"},\"burst\":{\"type\":\"integer\"},\"burst_offsets_ms\":{\"type\":\"array\"},\"min_change_pct\":{\"type\":\"number\"}" ++ "},\"required\":[\"app\",\"window\"]}",
     },
     .{
         .name = "app_output",
@@ -275,6 +298,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"scrollback":{"type":"boolean"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"app\":{\"type\":\"integer\"},\"exited\":{\"type\":\"boolean\"},\"exit_status\":{\"type\":\"integer\"},\"source\":{\"type\":\"string\"},\"output\":{\"type\":\"string\"}" ++ "},\"required\":[\"app\",\"exited\",\"source\",\"output\"]}",
     },
     .{
         .name = "app_log",
@@ -286,6 +310,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"tail":{"type":"integer","description":"Last N lines (default 60, max 500). With a pattern, this caps how many MATCHES are shown; the search always scans the widest window the ring serves."},"from_id":{"type":"integer","description":"Return lines starting at this id instead of the tail"},"id":{"type":"integer","description":"Return ONE line in full; for a marker line also returns the stashed screenshot"},"pattern":{"type":"string","description":"Show only lines matching this pattern (regex subset: . [] * + ? ^ $ |; no groups). Zero matches is reported as such, never as an unfiltered tail."},"grep":{"type":"string","description":"Alias for 'pattern'."},"ignore_case":{"type":"boolean","description":"Case-insensitive matching (default true)"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"app\":{\"type\":\"integer\"},\"stale\":{\"type\":\"boolean\"},\"line_id\":{\"type\":\"integer\"},\"age_ms\":{\"type\":\"integer\"},\"marker\":{\"type\":\"boolean\"},\"truncated\":{\"type\":\"boolean\"},\"text\":{\"type\":\"string\"},\"marker_screenshot\":{\"type\":\"boolean\"},\"screenshot_shared_from\":{\"type\":\"integer\"},\"scanned\":{\"type\":\"integer\"},\"shown\":{\"type\":\"integer\"},\"next_id\":{\"type\":\"integer\"},\"dropped\":{\"type\":\"integer\"},\"markers_dropped\":{\"type\":\"integer\"},\"pattern\":{\"type\":\"string\"},\"matched\":{\"type\":\"integer\"},\"lines\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"source\":{\"type\":\"string\"},\"output\":{\"type\":\"string\"}" ++ "},\"required\":[\"app\"]}",
     },
     .{
         .name = "app_wait_log",
@@ -297,6 +322,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"pattern":{"type":"string","description":"Regex subset (. [] * + ? ^ $ |; no groups) matched against each log line"},"grep":{"type":"string","description":"Alias for 'pattern'."},"ignore_case":{"type":"boolean","description":"Case-insensitive matching (default true)"},"from_id":{"type":"integer","description":"Only consider lines with an id >= this (skip history; the reply of a timed-out wait tells you which id to resume from)"},"timeout_ms":{"type":"integer","description":"Max wait (default 30000, max 120000)"},"screenshot":{"type":"boolean","description":"Also capture the app window at the moment the line matched"}},"required":["pattern"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ SHOT_PROPS ++ "," ++ "\"app\":{\"type\":\"integer\"},\"matched\":{\"type\":\"boolean\"},\"timed_out\":{\"type\":\"boolean\"},\"pattern\":{\"type\":\"string\"},\"line_id\":{\"type\":\"integer\"},\"marker\":{\"type\":\"boolean\"},\"text\":{\"type\":\"string\"},\"elapsed_ms\":{\"type\":\"integer\"},\"scanned\":{\"type\":\"integer\"},\"window\":{\"type\":\"integer\"},\"frame_at_match\":{\"type\":\"integer\"}" ++ "},\"required\":[\"app\",\"matched\",\"pattern\"]}",
     },
     .{
         .name = "app_click",
@@ -308,6 +334,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"button":{"type":"integer"},"hold_ms":{"type":"integer","description":"How long the button stays down between press and release, ms (%HOLD_DEF%; max 10000). Long values drive press-and-hold repeat controls."},"count":{"type":"integer","description":"Clicks in quick succession, ~80ms apart: 2 = double-click, 3 = triple (default 1)"},"retry":{"type":"integer","description":"If no qualifying repaint arrives within timeout_ms, click again, up to this many EXTRA attempts (%RETRY_DEF%; max 5). Pair with min_change_pct on animating apps, or the first attempt always looks alive."},"mark":{"type":"boolean","description":"Crosshair-marked post-click screenshot (DEFAULT true; false = no image unless screenshot is set)"},"screenshot":{"type":"boolean","description":"Return the post-click frame without the marker"},"wait_change":{"type":"boolean","description":"Wait for a post-click frame commit before returning (defaults ON when an image is returned; false = capture immediately)"},"settle_ms":{"type":"integer","description":"After the first post-click frame, wait until repainting pauses this long before capturing (%SETTLE_DEF%; 0 = capture the first frame)"},"min_change_pct":{"type":"number","description":"Only frames changing at least this % of pixels count as change — REQUIRED for a meaningful dead/live verdict on continuously-animating apps. Deliberately per-call only (never an env default): it decides the VERDICT, not a timing bound."},"region":{"type":"object","description":"Scope min_change_pct's pixel diffing to this rect (surface pixels) — assert that THIS area (a viewport, a status bar) repainted, ignoring changes elsewhere","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"timeout_ms":{"type":"integer","description":"Bound for the post-click wait (%TIMEOUT_DEF%; raised to at least 5000 when wait_change/settle_ms is explicit)"},"max_px":{"type":"integer","description":"Bound on the screenshot's longest dimension (default 1568)"},"move_first":{"type":"boolean","description":"Send a separate pointer motion to x,y and pause briefly BEFORE pressing, so hover-armed widgets see the position on an earlier frame"},"include_log_delta":{"type":"boolean","description":"Also report the log lines the app printed since the PREVIOUS input call on this app (the first call only sets the baseline). Collapses the click -> look -> app_log -> diff loop into one call."}},"required":["window","x","y"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ SHOT_PROPS ++ "," ++ "\"window\":{\"type\":\"integer\"},\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"},\"button\":{\"type\":\"integer\"},\"count\":{\"type\":\"integer\"},\"hold_ms\":{\"type\":\"integer\"},\"attempts\":{\"type\":\"integer\"},\"repainted\":{\"type\":\"boolean\"},\"frame_at_input\":{\"type\":\"integer\"},\"frame_now\":{\"type\":\"integer\"},\"screenshot_failed\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"window\",\"x\",\"y\",\"button\",\"repainted\"]}",
     },
     .{
         .name = "app_actions",
@@ -319,6 +346,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Default window for all steps"},"actions":{"type":"array","items":{"type":"object"}}},"required":["actions"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"macro\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"},\"steps_total\":{\"type\":\"integer\"},\"steps_run\":{\"type\":\"integer\"},\"step\":{\"type\":\"integer\"},\"remaining_steps_skipped\":{\"type\":\"boolean\"},\"reason\":{\"type\":\"string\"},\"exit_status\":{\"type\":\"integer\"},\"signal\":{\"type\":\"integer\"},\"signal_name\":{\"type\":\"string\"},\"steps\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"screenshots\":{\"type\":\"integer\"}" ++ "},\"required\":[\"status\",\"steps_total\",\"steps_run\",\"steps\"]}",
     },
     .{
         .name = "app_mouse_move",
@@ -330,6 +358,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = window under the pointer, else first toplevel)"},"x":{"type":"number","description":"Absolute surface x (with y)"},"y":{"type":"number"},"dx":{"type":"number","description":"Relative delta x (with dy; exclusive with x/y)"},"dy":{"type":"number"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"mode\":{\"type\":\"string\"},\"tracked\":{\"type\":\"boolean\"},\"window\":{\"type\":\"integer\"},\"x\":{\"type\":\"number\"},\"y\":{\"type\":\"number\"}" ++ "},\"required\":[\"mode\",\"tracked\"]}",
     },
     .{
         .name = "app_perform_action",
@@ -341,6 +370,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"index":{"type":"integer","description":"Action index (default 0 = the default action)"}},"required":["element"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"element\":{\"type\":\"string\"},\"index\":{\"type\":\"integer\"},\"performed\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"element\",\"index\",\"performed\"]}",
     },
     .{
         .name = "app_set_value",
@@ -352,6 +382,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"element":{"type":"string"},"text":{"type":"string"},"value":{"type":"number"}},"required":["element"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"element\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\"},\"set\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"element\",\"kind\",\"set\"]}",
     },
     .{
         .name = "app_wait_for_element",
@@ -363,6 +394,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"role":{"type":"integer","description":"AT-SPI role number (e.g. 42 push-button)"},"name":{"type":"string","description":"Name substring, case-insensitive"},"timeout_ms":{"type":"integer","description":"Default 10000"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"found\":{\"type\":\"boolean\"},\"element\":{\"type\":\"object\"}" ++ "},\"required\":[\"found\",\"element\"]}",
     },
     .{
         .name = "app_drag",
@@ -374,6 +406,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x1":{"type":"integer"},"y1":{"type":"integer"},"x2":{"type":"integer"},"y2":{"type":"integer"},"button":{"type":"integer"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"region":{"type":"object","description":"Scope min_change_pct's pixel diffing to this rect (surface pixels) — assert that THIS area repainted, ignoring changes elsewhere","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"},"include_log_delta":{"type":"boolean","description":"Also report the log lines the app printed since the PREVIOUS input call on this app (the first call only sets the baseline). Collapses the input -> look -> app_log -> diff loop into one call."}},"required":["window","x1","y1","x2","y2"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ SHOT_PROPS ++ "," ++ INPUT_PROPS ++ "," ++ "\"x1\":{\"type\":\"integer\"},\"y1\":{\"type\":\"integer\"},\"x2\":{\"type\":\"integer\"},\"y2\":{\"type\":\"integer\"},\"button\":{\"type\":\"integer\"}" ++ "},\"required\":[\"window\",\"repainted\"]}",
     },
     .{
         .name = "app_type",
@@ -385,6 +418,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"text":{"type":"string"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"region":{"type":"object","description":"Scope min_change_pct's pixel diffing to this rect (surface pixels) — assert that THIS area repainted, ignoring changes elsewhere","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"},"include_log_delta":{"type":"boolean","description":"Also report the log lines the app printed since the PREVIOUS input call on this app (the first call only sets the baseline). Collapses the input -> look -> app_log -> diff loop into one call."}},"required":["text"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ SHOT_PROPS ++ "," ++ INPUT_PROPS ++ "," ++ "\"chars\":{\"type\":\"integer\"}" ++ "},\"required\":[\"window\",\"chars\",\"repainted\"]}",
     },
     .{
         .name = "app_clipboard_get",
@@ -396,6 +430,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"bytes\":{\"type\":\"integer\"},\"text\":{\"type\":\"string\"}" ++ "},\"required\":[\"bytes\",\"text\"]}",
     },
     .{
         .name = "app_clipboard_set",
@@ -407,6 +442,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"text":{"type":"string"},"paste":{"type":"boolean"},"window":{"type":"integer"}},"required":["text"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"bytes\":{\"type\":\"integer\"},\"pasted\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"bytes\",\"pasted\"]}",
     },
     .{
         .name = "app_key",
@@ -418,6 +454,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"keys":{"type":"string"},"hold_ms":{"type":"integer","description":"Hold each chord's key down this long before releasing, ms (default 0 = tap; max 10000)"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"region":{"type":"object","description":"Scope min_change_pct's pixel diffing to this rect (surface pixels) — assert that THIS area repainted, ignoring changes elsewhere","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"},"include_log_delta":{"type":"boolean","description":"Also report the log lines the app printed since the PREVIOUS input call on this app (the first call only sets the baseline). Collapses the input -> look -> app_log -> diff loop into one call."}},"required":["keys"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ SHOT_PROPS ++ "," ++ INPUT_PROPS ++ "," ++ "\"keys\":{\"type\":\"string\"},\"hold_ms\":{\"type\":\"integer\"}" ++ "},\"required\":[\"window\",\"keys\",\"repainted\"]}",
     },
     .{
         .name = "app_scroll",
@@ -429,6 +466,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"x":{"type":"integer"},"y":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"},"screenshot":{"type":"boolean"},"wait_change":{"type":"boolean"},"settle_ms":{"type":"integer"},"min_change_pct":{"type":"number"},"region":{"type":"object","description":"Scope min_change_pct's pixel diffing to this rect (surface pixels) — assert that THIS area repainted, ignoring changes elsewhere","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"timeout_ms":{"type":"integer"},"max_px":{"type":"integer"},"include_log_delta":{"type":"boolean","description":"Also report the log lines the app printed since the PREVIOUS input call on this app (the first call only sets the baseline). Collapses the input -> look -> app_log -> diff loop into one call."}},"required":["window"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ SHOT_PROPS ++ "," ++ INPUT_PROPS ++ "," ++ "\"dx\":{\"type\":\"integer\"},\"dy\":{\"type\":\"integer\"},\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"}" ++ "},\"required\":[\"window\",\"dx\",\"dy\",\"repainted\"]}",
     },
     .{
         .name = "app_resize",
@@ -440,6 +478,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["window","w","h"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"window\":{\"type\":\"integer\"},\"w\":{\"type\":\"integer\"},\"h\":{\"type\":\"integer\"}" ++ "},\"required\":[\"window\",\"w\",\"h\"]}",
     },
     .{
         .name = "app_wait",
@@ -451,6 +490,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window whose frames are counted / diffed (omit = the PRIMARY toplevel: the most recently painted non-popup window)"},"quiet_ms":{"type":"integer"},"min_frames":{"type":"integer","description":"Wait until the window commits this many NEW frames, then return. Liveness for continuously-animating apps: succeeds only if the app is really painting."},"timeout_ms":{"type":"integer","description":"Max wait (default 10000, max 120000)"},"change_pct":{"type":"number","description":"Settle when frames change less than this % of pixels (e.g. 2). Omit = strict no-new-frames quiescence"},"region":{"type":"object","description":"Scope change_pct's pixel diffing to this rect (surface pixels)","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ "\"window\":{\"type\":\"integer\"},\"mode\":{\"type\":\"string\"},\"settled\":{\"type\":\"boolean\"},\"frames_before\":{\"type\":\"integer\"},\"frames_committed\":{\"type\":\"integer\"},\"frame_now\":{\"type\":\"integer\"},\"waited_ms\":{\"type\":\"integer\"}" ++ "},\"required\":[\"window\",\"mode\",\"settled\",\"frames_committed\"]}",
     },
     .{
         .name = "app_watch",
@@ -462,6 +502,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window to watch (omit = the PRIMARY toplevel)"},"duration_ms":{"type":"integer","description":"How long to watch (default 10000, max 120000). Make this longer than the latency you suspect."},"min_change_pct":{"type":"number","description":"A commit counts as a change when it differs from the previously recorded one by at least this % of pixels (default 2). Lower it to catch small updates; raise it above a game's idle animation."},"max_events":{"type":"integer","description":"Cap on timeline entries (default 16, max 64). Overflow is reported, never silently dropped."},"thumbnails":{"type":"integer","description":"Inline a PNG of the first N change points (default 3, max 8)"},"max_px":{"type":"integer","description":"Longest side of each thumbnail (default 640)"},"region":{"type":"object","description":"Gauge change inside this rect only (surface pixels)","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ "\"window\":{\"type\":\"integer\"},\"elapsed_ms\":{\"type\":\"integer\"},\"frames\":{\"type\":\"integer\"},\"frame_first\":{\"type\":\"integer\"},\"frame_last\":{\"type\":\"integer\"},\"frame_at_start\":{\"type\":\"integer\"},\"min_change_pct\":{\"type\":\"number\"},\"truncated\":{\"type\":\"boolean\"},\"exited_during_watch\":{\"type\":\"boolean\"},\"events\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"thumbnails\":{\"type\":\"integer\"}" ++ "},\"required\":[\"window\",\"elapsed_ms\",\"frames\",\"events\"]}",
     },
     // Sweeps the pointer across the window: input injection, not a read.
     .{
@@ -474,6 +515,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"cols":{"type":"integer","description":"Grid columns (default 12, max 40)"},"rows":{"type":"integer","description":"Grid rows (default 9, max 40)"},"settle_ms":{"type":"integer","description":"How long to wait for a repaint after each move (default 120). Total time is roughly cols*rows*settle_ms."},"min_change_pct":{"type":"number","description":"Pixels that must differ for a cell to count as responding (default 0.05 — hover highlights are small)"},"region":{"type":"object","description":"Sweep only this rect (surface pixels); omit = the whole window","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ "\"window\":{\"type\":\"integer\"},\"region\":{\"type\":\"object\"},\"cols\":{\"type\":\"integer\"},\"rows\":{\"type\":\"integer\"},\"probes\":{\"type\":\"integer\"},\"elapsed_ms\":{\"type\":\"integer\"},\"settle_ms\":{\"type\":\"integer\"},\"min_change_pct\":{\"type\":\"number\"},\"stopped_early\":{\"type\":\"boolean\"},\"hits\":{\"type\":\"integer\"},\"cells\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}" ++ "},\"required\":[\"window\",\"cols\",\"rows\",\"probes\",\"hits\",\"cells\"]}",
     },
     // Attaches a debugger to a live process; can wedge or kill it.
     .{
@@ -486,6 +528,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer","description":"How long the debugger may take (default 20000, max 100000). A big process with many threads needs longer; a partial dump is returned rather than nothing if it overruns."}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ APP_STATE_PROPS ++ "," ++ "\"debugger_pid\":{\"type\":\"integer\"},\"debugger\":{\"type\":\"string\"},\"took_ms\":{\"type\":\"integer\"},\"timed_out\":{\"type\":\"boolean\"},\"truncated\":{\"type\":\"boolean\"},\"backtrace\":{\"type\":\"string\"}" ++ "},\"required\":[\"debugger_pid\",\"debugger\",\"backtrace\"]}",
     },
     .{
         .name = "app_a11y_tree",
@@ -497,6 +540,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{\"bare\":{\"type\":\"boolean\"},\"tree\":{\"type\":\"object\"}},\"required\":[\"bare\",\"tree\"]}",
     },
     .{
         .name = "app_record_start",
@@ -508,6 +552,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"format":{"type":"string","enum":["webm","gif"],"description":"Default webm"},"max_px":{"type":"integer","description":"Bound on the longest dimension (default 1280 webm / 800 gif)"},"fps":{"type":"integer","description":"Cap the capture rate (frames/second, 1-60; default = every committed frame)"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"window\":{\"type\":\"integer\"},\"format\":{\"type\":\"string\"},\"max_px\":{\"type\":\"integer\"},\"fps\":{\"type\":\"integer\"},\"recording\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"window\",\"format\",\"recording\"]}",
     },
     .{
         .name = "app_record_stop",
@@ -519,6 +564,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"path":{"type":"string","description":"Output path (extension set automatically if omitted)"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"path\":{\"type\":\"string\"},\"format\":{\"type\":\"string\"},\"frames\":{\"type\":\"integer\"},\"bytes\":{\"type\":\"integer\"}" ++ "},\"required\":[\"path\",\"format\",\"frames\",\"bytes\"]}",
     },
     .{
         .name = "app_read_text",
@@ -530,6 +576,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer","description":"Window id (omit = the PRIMARY toplevel)"},"region":{"type":"object","description":"Read only this sub-rectangle (surface pixels)","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"scale":{"type":"integer","description":"Integer pre-upscale for tiny bitmap fonts (1-8; 0/omit = auto)"},"psm":{"type":"integer","description":"Tesseract page segmentation: 6 uniform text block (default, dialogs), 11 sparse scattered labels, 7 single line, 3 full auto"},"lang":{"type":"string","description":"Language code(s), default eng (e.g. \"eng+deu\")"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"window\":{\"type\":\"integer\"},\"ocr_scale\":{\"type\":\"integer\"},\"words\":{\"type\":\"integer\"},\"text\":{\"type\":\"string\"},\"boxes\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}" ++ "},\"required\":[\"window\",\"text\",\"boxes\"]}",
     },
     .{
         .name = "app_wait_text",
@@ -541,6 +588,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"text":{"type":"string"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"timeout_ms":{"type":"integer","description":"Default 15000"},"click":{"type":"boolean","description":"Click the matched text's center once found"},"scale":{"type":"integer"},"psm":{"type":"integer"},"lang":{"type":"string"}},"required":["text"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"found\":{\"type\":\"boolean\"},\"window\":{\"type\":\"integer\"},\"text\":{\"type\":\"string\"},\"match\":{\"type\":\"object\"},\"clicked\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"found\",\"window\",\"clicked\"]}",
     },
     .{
         .name = "app_template_save",
@@ -552,6 +600,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"name":{"type":"string"},"app":{"type":"integer"},"window":{"type":"integer"},"region":{"type":"object","description":"Crop rectangle in surface pixels (required when capturing from a window)","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}},"required":["w","h"]},"image_b64":{"type":"string","description":"Inline PNG instead of capturing from a window"}},"required":["name"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"name\":{\"type\":\"string\"},\"w\":{\"type\":\"integer\"},\"h\":{\"type\":\"integer\"},\"source\":{\"type\":\"string\"},\"bytes\":{\"type\":\"integer\"}" ++ "},\"required\":[\"name\",\"w\",\"h\"]}",
     },
     .{
         .name = "app_templates",
@@ -563,6 +612,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"delete":{"type":"string","description":"Template name to delete"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"templates\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"count\":{\"type\":\"integer\"},\"deleted\":{\"type\":\"string\"}" ++ "}}",
     },
     .{
         .name = "app_find_image",
@@ -574,6 +624,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"template":{"type":"string","description":"A saved template name"},"image_b64":{"type":"string","description":"Inline PNG instead of a saved template"},"region":{"type":"object","description":"Search only this sub-rectangle","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"min_score":{"type":"number"},"max_matches":{"type":"integer"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"template\":{\"type\":\"string\"},\"template_w\":{\"type\":\"integer\"},\"template_h\":{\"type\":\"integer\"},\"window\":{\"type\":\"integer\"},\"count\":{\"type\":\"integer\"},\"matches\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}" ++ "},\"required\":[\"template\",\"window\",\"count\",\"matches\"]}",
     },
     .{
         .name = "app_wait_image",
@@ -585,6 +636,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"},"template":{"type":"string"},"image_b64":{"type":"string"},"region":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"w":{"type":"integer"},"h":{"type":"integer"}}},"min_score":{"type":"number"},"timeout_ms":{"type":"integer","description":"Default 10000"},"click":{"type":"boolean"},"button":{"type":"integer"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"found\":{\"type\":\"boolean\"},\"template\":{\"type\":\"string\"},\"window\":{\"type\":\"integer\"},\"x\":{\"type\":\"integer\"},\"y\":{\"type\":\"integer\"},\"cx\":{\"type\":\"integer\"},\"cy\":{\"type\":\"integer\"},\"score\":{\"type\":\"number\"},\"clicked\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"found\",\"window\",\"clicked\"]}",
     },
     .{
         .name = "app_macro_save",
@@ -596,6 +648,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"name":{"type":"string"},"app":{"type":"integer","description":"Journal source app (omit with explicit actions)"},"last_steps":{"type":"integer","description":"Save only the last N journal steps"},"actions":{"type":"array","items":{"type":"object"},"description":"Explicit step list instead of the journal"}},"required":["name"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"name\":{\"type\":\"string\"},\"steps\":{\"type\":\"integer\"},\"from_journal\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"name\",\"steps\",\"from_journal\"]}",
     },
     .{
         .name = "app_macro_run",
@@ -607,6 +660,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"name":{"type":"string"},"window":{"type":"integer","description":"Default window for all steps"}},"required":["name"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"macro\":{\"type\":\"string\"},\"status\":{\"type\":\"string\"},\"steps_total\":{\"type\":\"integer\"},\"steps_run\":{\"type\":\"integer\"},\"step\":{\"type\":\"integer\"},\"remaining_steps_skipped\":{\"type\":\"boolean\"},\"reason\":{\"type\":\"string\"},\"exit_status\":{\"type\":\"integer\"},\"signal\":{\"type\":\"integer\"},\"signal_name\":{\"type\":\"string\"},\"steps\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"screenshots\":{\"type\":\"integer\"}" ++ "},\"required\":[\"status\",\"steps_total\",\"steps_run\",\"steps\"]}",
     },
     .{
         .name = "app_macros",
@@ -618,6 +672,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"delete":{"type":"string"},"show":{"type":"string"},"journal":{"type":"boolean"},"app":{"type":"integer"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"macros\":{\"type\":\"array\"},\"count\":{\"type\":\"integer\"},\"deleted\":{\"type\":\"string\"},\"macro\":{\"type\":\"string\"},\"steps\":{\"type\":\"integer\"},\"actions\":{\"type\":\"object\"},\"app\":{\"type\":\"integer\"},\"recorded_steps\":{\"type\":\"integer\"},\"journal\":{\"type\":\"array\"}" ++ "}}",
     },
     .{
         .name = "close_app_window",
@@ -629,6 +684,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"},"window":{"type":"integer"}},"required":["window"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"window\":{\"type\":\"integer\"},\"close_requested\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"window\",\"close_requested\"]}",
     },
     .{
         .name = "close_app",
@@ -640,6 +696,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"app":{"type":"integer"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"app\":{\"type\":\"integer\"},\"outcome\":{\"type\":\"string\"},\"was_exited\":{\"type\":\"boolean\"},\"exit_status\":{\"type\":\"integer\"}" ++ "},\"required\":[\"app\",\"outcome\",\"was_exited\"]}",
     },
 
     // ── term: headless daemon-owned terminals ──────────────────────
@@ -1576,6 +1633,21 @@ test "every tool is uniquely named, described and grouped" {
     }
     try testing.expect(find("capabilities") != null);
     try testing.expect(find("no_such_tool") == null);
+}
+
+test "every migrated group declares an output schema for all of its tools" {
+    // Wave 3 migrates group by group; a group listed here is DONE, and
+    // a new tool added to it without a structured result fails this.
+    const migrated = [_]Group{ .term, .browser, .app };
+    for (TOOLS) |t| {
+        for (migrated) |g| {
+            if (t.group != g) continue;
+            if (t.output_schema == null) {
+                std.debug.print("{s} ({s}) declares no output schema\n", .{ t.name, @tagName(t.group) });
+                return error.MissingOutputSchema;
+            }
+        }
+    }
 }
 
 test "a declared output schema is emitted last" {

@@ -1312,14 +1312,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // the panel origin. Inspect it while alive so a fast /bin/true cannot
         // make the isolation assertion pass after all state has disappeared.
         const app = m.callTool("launch_app", "{\"command\":[\"/bin/sh\",\"-c\",\"sleep 30\"],\"wait_for\":\"exit\",\"wait_ms\":100,\"stable_ms\":0}");
-        if (std.mem.indexOf(u8, app, "\\\"app\\\":1") == null or
-            std.mem.indexOf(u8, app, "\\\"pid\\\"") == null or
-            std.mem.indexOf(u8, app, "\\\"exited\\\":true") != null)
+        // The app facts live in structuredContent now; the text lane
+        // carries the same story as prose.
+        if (std.mem.indexOf(u8, app, "\"structuredContent\":{") == null or
+            std.mem.indexOf(u8, app, "\"app\":1") == null or
+            std.mem.indexOf(u8, app, "\"pid\":") == null or
+            std.mem.indexOf(u8, app, "\"exited\":false") == null)
             fail("long-lived private launch_app probe was not alive");
+        if (std.mem.indexOf(u8, app, "app 1 (") == null)
+            fail("launch_app text lane did not name the app session");
         const live_apps = m.callTool("list_apps", "{}");
-        if (std.mem.indexOf(u8, live_apps, "\\\"app\\\":1") == null or
-            std.mem.indexOf(u8, live_apps, "\\\"pid\\\"") == null or
-            std.mem.indexOf(u8, live_apps, "\\\"exited\\\":true") != null)
+        if (std.mem.indexOf(u8, live_apps, "\"app\":1") == null or
+            std.mem.indexOf(u8, live_apps, "\"pid\":") == null or
+            std.mem.indexOf(u8, live_apps, "\"count\":1") == null or
+            std.mem.indexOf(u8, live_apps, "\"exited\":false") == null)
             fail("list_apps could not inspect the private app while alive");
         var private_buf: [512]u8 = undefined;
         const private_sock = std.fmt.bufPrint(&private_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ rt, m.pid }) catch unreachable;
@@ -1327,7 +1333,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (sessionCount(allocator, &owner) != 1)
             fail("app tool leaked its session onto the panel origin daemon");
         const closed_app = m.callTool("close_app", "{\"app\":1}");
-        if (std.mem.indexOf(u8, closed_app, "isError") != null)
+        if (std.mem.indexOf(u8, closed_app, "isError") != null or
+            std.mem.indexOf(u8, closed_app, "\"outcome\":\"acknowledged\"") == null)
             fail("long-lived private app cleanup failed");
 
         // Losing the GUI is reported honestly and nothing is delivered: with

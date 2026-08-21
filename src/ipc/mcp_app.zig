@@ -7,15 +7,12 @@ const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const appdrive = @import("appdrive.zig");
 const mcp = @import("mcp.zig");
-const imageResultTagged = mcp.imageResultTagged;
+const Res = mcp.Res;
+const errRes = mcp.errRes;
 const appStopText = mcp.appStopText;
-const imagesResult = mcp.imagesResult;
 const LogLineJ = mcp.LogLineJ;
 const wallNowMs = mcp.wallNowMs;
-const withActionStatus = mcp.withActionStatus;
-const ActionStatus = mcp.ActionStatus;
 const LogReplyJ = mcp.LogReplyJ;
-const imagesResultTagged = mcp.imagesResultTagged;
 const logStashTail = mcp.logStashTail;
 const findWordRun = mcp.findWordRun;
 const needsLiveApp = mcp.needsLiveApp;
@@ -38,13 +35,14 @@ const Watchdog = mcp.Watchdog;
 const actionsCapture = mcp.actionsCapture;
 const mcpassets = mcp.mcpassets;
 const a11yNodeSummary = mcp.a11yNodeSummary;
-const imageResult = mcp.imageResult;
+const addAppSummary = mcp.addAppSummary;
+const appSummaryText = mcp.appSummaryText;
+const addShotFacts = mcp.addShotFacts;
 const regionFrom = mcp.regionFrom;
 const Tuning = mcp.Tuning;
 const a11yFindMatch = mcp.a11yFindMatch;
 const screenshotCaption = mcp.screenshotCaption;
 const a11yFetch = mcp.a11yFetch;
-const appSummary = mcp.appSummary;
 const firstToplevelId = mcp.firstToplevelId;
 const argBool = mcp.argBool;
 const monoMs = mcp.monoMs;
@@ -57,7 +55,6 @@ const journalStep = mcp.journalStep;
 const probeAppStop = mcp.probeAppStop;
 const buildLaunchArgv = mcp.buildLaunchArgv;
 const marks_mod = mcp.marks_mod;
-const toolResult = mcp.toolResult;
 const AppStop = mcp.AppStop;
 const appErr = mcp.appErr;
 const argFloat = mcp.argFloat;
@@ -68,17 +65,114 @@ fn saveRecording(path: []const u8, bytes: []const u8) atomicwrite.Error!void {
     try atomicwrite.writeFile(path, bytes, 0o600);
 }
 
+/// An OCR failure, typed: a missing engine is a subsystem that is not
+/// there, an unrendered window is a target that is not there yet.
+fn ocrErr(arena: std.mem.Allocator, msg: []const u8) ![]const u8 {
+    if (std.mem.startsWith(u8, msg, "no rendered")) return errRes(arena, .not_found, msg);
+    return errRes(arena, .unavailable, msg);
+}
+
+/// The word boxes of an OCR pass, as verbatim JSON (each with the
+/// centre a click wants).
+fn wordBoxesJson(arena: std.mem.Allocator, o: OcrOut) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("[");
+    for (o.words, 0..) |wd, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print("{{\"text\":{f},\"x\":{d},\"y\":{d},\"w\":{d},\"h\":{d},\"cx\":{d},\"cy\":{d},\"conf\":{d:.0}}}", .{
+            std.json.fmt(wd.text, .{}), wd.x,            wd.y,    wd.w, wd.h,
+            wd.x + wd.w / 2,            wd.y + wd.h / 2, wd.conf,
+        });
+    }
+    try w.writeAll("]");
+    return aw.written();
+}
+
+/// One a11y node as a text line: the id a caller acts on, its role and
+/// name. The full node (every attribute) rides structuredContent.
+fn a11yNodeLine(arena: std.mem.Allocator, node: std.json.Value) ![]const u8 {
+    if (node != .object) return "(malformed node)";
+    const id = if (node.object.get("id")) |v| (if (v == .string) v.string else "") else "";
+    const role: i64 = if (node.object.get("role")) |v| (if (v == .integer) v.integer else -1) else -1;
+    const nm = if (node.object.get("name")) |v| (if (v == .string) v.string else "") else "";
+    return std.fmt.allocPrint(arena, "{s} role {d}{s}{s}", .{
+        id, role, if (nm.len > 0) " " else "", nm,
+    });
+}
+
+/// Indented outline of an a11y subtree — the text-lane rendering of a
+/// payload that used to be raw JSON.
+fn a11yOutline(arena: std.mem.Allocator, w: *std.Io.Writer, node: std.json.Value, depth: u32) !void {
+    if (node != .object) return;
+    try w.writeAll("\n");
+    var i: u32 = 0;
+    while (i < depth) : (i += 1) try w.writeAll("  ");
+    try w.writeAll(try a11yNodeLine(arena, node));
+    if (node.object.get("children")) |kids| {
+        if (kids == .array) for (kids.array.items) |k| try a11yOutline(arena, w, k, depth + 1);
+    }
+}
+
+/// THE reader for a stored macro's `{"actions":[...]}` shape (shared by
+/// app_macros show and app_macro_run). Null = not that shape, empty, or
+/// past the 200-step replay cap.
+fn macroSteps(arena: std.mem.Allocator, bytes: []const u8) ?[]const std.json.Value {
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch return null;
+    if (parsed != .object) return null;
+    const av = parsed.object.get("actions") orelse return null;
+    if (av != .array) return null;
+    if (av.array.items.len == 0 or av.array.items.len > 200) return null;
+    return av.array.items;
+}
+
+/// The facts every app_click reply carries, in one place: the same set
+/// on the landed, crashed and retried paths.
+fn clickFacts(
+    res: *Res,
+    win_id: u32,
+    x: i64,
+    y: i64,
+    button: u32,
+    count: u32,
+    hold_ms: i64,
+    attempts: i64,
+    repainted: bool,
+) !void {
+    try res.fact("window", win_id);
+    try res.fact("x", x);
+    try res.fact("y", y);
+    try res.fact("button", button);
+    try res.fact("count", count);
+    try res.fact("hold_ms", hold_ms);
+    try res.fact("attempts", attempts);
+    try res.fact("repainted", repainted);
+}
+
+/// An error result that still tells the story: the typed code plus the
+/// app's own state (exit status, signal, what it last printed) in the
+/// message. `appErr` cannot carry facts, and an app that DIED while a
+/// tool waited on it is exactly when those facts matter most.
+fn appStateErr(
+    arena: std.mem.Allocator,
+    app: *appdrive.App,
+    code: mcp.ErrCode,
+    msg: []const u8,
+) ![]const u8 {
+    return errRes(arena, code, try std.fmt.allocPrint(arena, "{s}\n{s}", .{ msg, try appSummaryText(arena, app) }));
+}
+
 pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
     if (!mcp.app_state.ready)
-        return appErr(arena, "app tools unavailable (server not fully started)");
+        return errRes(arena, .unavailable, "app tools unavailable (server not fully started)");
 
     if (eql(u8, name, "launch_app")) {
         var argv: std.ArrayList([]const u8) = .empty;
         defer argv.deinit(arena);
         const built = switch (try buildLaunchArgv(arena, &argv, args)) {
             .ok => |b| b,
-            .err => |msg| return appErr(arena, msg),
+            .err => |msg| return errRes(arena, .invalid_args, msg),
         };
         // Chromium-family binaries default to X11 and die in the
         // Wayland-only session; inject the ozone flag unless the
@@ -93,22 +187,22 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             }
             if (!has_ozone) {
                 try argv.insert(arena, 1, "--ozone-platform=wayland");
-                browser_note = "\n(auto-added --ozone-platform=wayland: Chromium-family app in a Wayland-only session)";
+                browser_note = "auto-added --ozone-platform=wayland: Chromium-family app in a Wayland-only session";
             }
         }
         const debug_note = switch (try applyDebugWrap(arena, &argv, args)) {
             .note => |n| n,
-            .err => |e| return appErr(arena, e),
+            .err => |e| return errRes(arena, .invalid_args, e),
         };
         const audio_mode = argStr(args, "audio") orelse "forward";
         if (!eql(u8, audio_mode, "forward") and !eql(u8, audio_mode, "none"))
-            return appErr(arena, "'audio' must be \"forward\" or \"none\"");
+            return errRes(arena, .invalid_args, "'audio' must be \"forward\" or \"none\"");
         const audio_path = argStr(args, "audio_path");
         if (audio_path) |ap| {
             if (eql(u8, audio_mode, "none"))
-                return appErr(arena, "'audio_path' needs the sink: drop audio:\"none\"");
+                return errRes(arena, .invalid_args, "'audio_path' needs the sink: drop audio:\"none\"");
             if (ap.len == 0 or ap[0] != '/')
-                return appErr(arena, "'audio_path' must be an absolute path (it lands on the daemon's host)");
+                return errRes(arena, .invalid_args, "'audio_path' must be an absolute path (it lands on the daemon's host)");
         }
         const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 80, 10, 500));
         const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 24, 4, 300));
@@ -117,7 +211,7 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         var out_h: u32 = 0;
         if (argStr(args, "size")) |sz| {
             const dims = @import("../mux/display.zig").parseSize(sz) orelse
-                return appErr(arena, "'size' must be \"WxH\" pixels (1..16384 per side, at most 64 megapixels), e.g. \"3840x2160\"");
+                return errRes(arena, .invalid_args, "'size' must be \"WxH\" pixels (1..16384 per side, at most 64 megapixels), e.g. \"3840x2160\"");
             out_w = dims[0];
             out_h = dims[1];
         }
@@ -126,11 +220,11 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         var user_set_ozone_hint = false;
         if (args == .object) {
             if (args.object.get("env")) |e| {
-                if (e != .object) return appErr(arena, "'env' must be an object of KEY: \"value\" strings");
+                if (e != .object) return errRes(arena, .invalid_args, "'env' must be an object of KEY: \"value\" strings");
                 var it = e.object.iterator();
                 while (it.next()) |entry| {
                     if (entry.value_ptr.* != .string)
-                        return appErr(arena, "'env' values must be strings");
+                        return errRes(arena, .invalid_args, "'env' values must be strings");
                     if (std.mem.eql(u8, entry.key_ptr.*, "ELECTRON_OZONE_PLATFORM_HINT")) user_set_ozone_hint = true;
                     try env_list.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.string }));
                 }
@@ -153,18 +247,17 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             .env = env_list.items,
             .output_width = out_w,
             .output_height = out_h,
-        }) catch |err|
-            return appErr(arena, switch (err) {
-                appdrive.Error.SpawnFailed => blk: {
-                    const why = appdrive.lastLaunchErr();
-                    break :blk if (why.len > 0)
-                        try std.fmt.allocPrint(arena, "spawn failed — {s}", .{why})
-                    else
-                        "spawn failed (mux daemon unreachable or spawn refused)";
-                },
-                appdrive.Error.BadLayout => "unknown keyboard layout (available: us, gb, fr, be, de)",
-                else => "launch failed",
-            });
+        }) catch |err| switch (err) {
+            appdrive.Error.SpawnFailed => {
+                const why = appdrive.lastLaunchErr();
+                return errRes(arena, .unavailable, if (why.len > 0)
+                    try std.fmt.allocPrint(arena, "spawn failed — {s}", .{why})
+                else
+                    "spawn failed (mux daemon unreachable or spawn refused)");
+            },
+            appdrive.Error.BadLayout => return errRes(arena, .invalid_args, "unknown keyboard layout (available: us, gb, fr, be, de)"),
+            else => return appErr(arena, "launch failed"),
+        };
         const id = mcp.app_state.next_id;
         mcp.app_state.next_id += 1;
         mcp.app_state.apps.put(mcp.app_state.allocator, id, app) catch {
@@ -193,18 +286,22 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         var settled = true;
         if (shot_win != 0 and stable_ms > 0 and !app.exited)
             settled = app.waitVisualSettle(shot_win, stable_ms, @max(stable_ms * 4, 2000), 0, null);
-        var summary = try appSummary(arena, app);
+
+        var res = Res.init(arena);
+        try addAppSummary(&res, arena, app);
         if (out_w != 0 and (app.output_width != out_w or app.output_height != out_h)) {
-            summary = if (app.output_width == 0)
-                try std.fmt.allocPrint(arena, "{s}\nWARNING: the daemon did not confirm the requested {d}x{d} output (older daemon — 'size' was likely ignored, the screen stays 1920x1080)", .{ summary, out_w, out_h })
+            try res.fact("requested_output_applied", false);
+            if (app.output_width == 0)
+                try res.textf("WARNING: the daemon did not confirm the requested {d}x{d} output (older daemon — 'size' was likely ignored, the screen stays 1920x1080)", .{ out_w, out_h })
             else
-                try std.fmt.allocPrint(arena, "{s}\nWARNING: requested {d}x{d} output but the daemon applied {d}x{d}", .{ summary, out_w, out_h, app.output_width, app.output_height });
+                try res.textf("WARNING: requested {d}x{d} output but the daemon applied {d}x{d}", .{ out_w, out_h, app.output_width, app.output_height });
         }
-        if (browser_note.len > 0) summary = try std.fmt.allocPrint(arena, "{s}{s}", .{ summary, browser_note });
-        if (debug_note.len > 0) summary = try std.fmt.allocPrint(arena, "{s}{s}", .{ summary, debug_note });
+        if (browser_note.len > 0) try res.text(browser_note);
+        if (debug_note.len > 0) try res.text(std.mem.trimStart(u8, debug_note, "\n"));
         if (audio_path) |ap| {
             const stem = if (std.mem.endsWith(u8, ap, ".wav")) ap[0 .. ap.len - 4] else ap;
-            summary = try std.fmt.allocPrint(arena, "{s}\naudio capture: {s}.wav on the daemon host (later streams: {s}-N.wav; finalized when the stream or app closes)", .{ summary, stem, stem });
+            try res.fact("audio_capture", try std.fmt.allocPrint(arena, "{s}.wav", .{stem}));
+            try res.textf("audio capture: {s}.wav on the daemon host (later streams: {s}-N.wav; finalized when the stream or app closes)", .{ stem, stem });
         }
         // Launch-and-look is THE common case: when a window rendered,
         // fold the first screenshot into the launch reply.
@@ -214,27 +311,46 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
                 if (win.id == shot_win) shot_frames = win.frames;
             }
             if (!settled)
-                summary = try std.fmt.allocPrint(arena, "{s}\n(inline screenshot: window was STILL REPAINTING after the {d}ms settle wait — it may be mid-paint or the app animates continuously; screenshot_app with stable_ms/min_frame gets settled pixels)", .{ summary, stable_ms })
+                try res.textf("inline screenshot: window was STILL REPAINTING after the {d}ms settle wait — it may be mid-paint or the app animates continuously; screenshot_app with stable_ms/min_frame gets settled pixels", .{stable_ms})
             else if (shot_frames <= 1)
-                summary = try std.fmt.allocPrint(arena, "{s}\n(inline screenshot is the window's FIRST committed frame and may precede the app's real paint — screenshot_app with stable_ms gets settled content)", .{summary});
+                try res.text("inline screenshot is the window's FIRST committed frame and may precede the app's real paint — screenshot_app with stable_ms gets settled content");
             if (app.screenshotPng(shot_win, 1568, null, 1)) |shot| {
                 defer mcp.app_state.allocator.free(shot.png);
-                const caption = try screenshotCaption(arena, app, shot_win, shot, summary);
-                if (imageResult(arena, caption, shot.png)) |r| return r;
+                try res.fact("settled", settled);
+                try res.fact("window", shot_win);
+                try addShotFacts(&res, arena, app, shot_win, shot);
+                return res.finishWithImages(&.{shot.png}, null);
             } else |_| {}
         }
-        return toolResult(arena, summary, false) orelse error.OutOfMemory;
+        return res.finish();
     }
     if (eql(u8, name, "list_installed_apps")) {
-        const listing = appdrive.listInstalledApps(mcp.app_state.allocator, argStr(args, "host"), mcp.app_state.mux_sock) catch |err|
-            return appErr(arena, switch (err) {
-                appdrive.Error.SpawnFailed => "cannot reach the daemon (is sketerm-mux running / host reachable?)",
-                else => "app discovery failed",
-            });
+        const listing = appdrive.listInstalledApps(mcp.app_state.allocator, argStr(args, "host"), mcp.app_state.mux_sock) catch |err| switch (err) {
+            appdrive.Error.SpawnFailed => return errRes(arena, .unavailable, "cannot reach the daemon (is sketerm-mux running / host reachable?)"),
+            appdrive.Error.Timeout => return errRes(arena, .timeout, "the daemon did not answer the app-discovery request in time"),
+            else => return appErr(arena, "app discovery failed"),
+        };
         defer mcp.app_state.allocator.free(listing);
-        return toolResult(arena, listing, false) orelse error.OutOfMemory;
+        const Listing = struct {
+            apps: []const struct { name: []const u8 = "", exec: []const u8 = "", icon: []const u8 = "" } = &.{},
+            @"error": []const u8 = "",
+        };
+        const parsed = std.json.parseFromSliceLeaky(Listing, arena, listing, .{ .ignore_unknown_fields = true }) catch
+            return appErr(arena, "malformed app listing from the daemon");
+        if (parsed.@"error".len > 0 and parsed.apps.len == 0)
+            return errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "app discovery failed on the daemon host: {s}", .{parsed.@"error"}));
+        var res = Res.init(arena);
+        try res.fact("apps", parsed.apps);
+        try res.field("count", parsed.apps.len);
+        if (argStr(args, "host")) |h| try res.field("host", h);
+        if (parsed.apps.len > 0) {
+            try res.text("--- installed apps (name: command) ---");
+            for (parsed.apps) |a| try res.textf("{s}: {s}", .{ a.name, a.exec });
+        }
+        return res.finish();
     }
     if (eql(u8, name, "list_apps")) {
+        var res = Res.init(arena);
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         try w.writeAll("[");
@@ -243,134 +359,193 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             app.drain();
             if (!first) try w.writeAll(",");
             first = false;
-            try w.writeAll(try appSummary(arena, app));
+            var one = Res.init(arena);
+            try mcp.appFacts(&one, arena, app, true);
+            try w.writeAll(try one.structuredJson());
+            try res.text(try appSummaryText(arena, app));
         }
         try w.writeAll("]");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        try res.raw("apps", aw.written());
+        try res.fact("count", mcp.app_state.apps.count());
+        if (mcp.app_state.apps.count() == 0)
+            try res.text("no app sessions (launch one with launch_app)");
+        return res.finish();
     }
 
     if (eql(u8, name, "app_templates")) {
         if (argStr(args, "delete")) |del| {
-            mcpassets.delete(mcp.app_state.allocator, .template, del) catch |err| return appErr(arena, switch (err) {
-                mcpassets.Error.NotFound => "no such template",
-                mcpassets.Error.BadName => "invalid template name",
-                else => "delete failed",
-            });
-            return toolResult(arena, "template deleted", false) orelse error.OutOfMemory;
+            mcpassets.delete(mcp.app_state.allocator, .template, del) catch |err| switch (err) {
+                mcpassets.Error.NotFound => return errRes(arena, .not_found, "no such template"),
+                mcpassets.Error.BadName => return errRes(arena, .invalid_args, "invalid template name"),
+                else => return errRes(arena, .io_failed, "delete failed"),
+            };
+            var res = Res.init(arena);
+            try res.field("deleted", del);
+            return res.finish();
         }
         const names = mcpassets.list(mcp.app_state.allocator, .template) catch
-            return appErr(arena, "listing templates failed");
+            return errRes(arena, .io_failed, "listing templates failed");
         defer {
             for (names) |nm| mcp.app_state.allocator.free(nm);
             mcp.app_state.allocator.free(names);
         }
+        var res = Res.init(arena);
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         try w.writeAll("[");
         for (names, 0..) |nm, i| {
             if (i > 0) try w.writeAll(",");
-            var dims: []const u8 = "";
+            var dw: u32 = 0;
+            var dh: u32 = 0;
             if (mcpassets.load(arena, .template, nm)) |bytes| {
                 if (png_util.decodeRgba(arena, bytes)) |dec| {
                     arena.free(dec.rgba);
-                    dims = try std.fmt.allocPrint(arena, ",\"w\":{d},\"h\":{d}", .{ dec.w, dec.h });
+                    dw = dec.w;
+                    dh = dec.h;
                 } else |_| {}
             } else |_| {}
-            try w.print("{{\"name\":{f}{s}}}", .{ std.json.fmt(nm, .{}), dims });
+            if (dw != 0) {
+                try w.print("{{\"name\":{f},\"w\":{d},\"h\":{d}}}", .{ std.json.fmt(nm, .{}), dw, dh });
+                try res.textf("{s} ({d}x{d})", .{ nm, dw, dh });
+            } else {
+                try w.print("{{\"name\":{f}}}", .{std.json.fmt(nm, .{})});
+                try res.textf("{s} (size unreadable)", .{nm});
+            }
         }
         try w.writeAll("]");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        try res.raw("templates", aw.written());
+        try res.fact("count", names.len);
+        if (names.len == 0) try res.text("no saved templates (save one with app_template_save)");
+        return res.finish();
     }
     if (eql(u8, name, "app_template_save")) {
-        const tname = argStr(args, "name") orelse return appErr(arena, "app_template_save requires 'name'");
+        const tname = argStr(args, "name") orelse return errRes(arena, .invalid_args, "app_template_save requires 'name'");
         if (!mcpassets.validName(tname))
-            return appErr(arena, "invalid template name (letters, digits, . _ - only, max 64)");
+            return errRes(arena, .invalid_args, "invalid template name (letters, digits, . _ - only, max 64)");
         var png_bytes: []const u8 = undefined;
         var dw: u32 = 0;
         var dh: u32 = 0;
+        var source: []const u8 = "inline";
         if (argStr(args, "image_b64")) |b64| {
             const decoder = std.base64.standard.Decoder;
-            const max = decoder.calcSizeForSlice(b64) catch return appErr(arena, "image_b64 is not valid base64");
+            const max = decoder.calcSizeForSlice(b64) catch return errRes(arena, .invalid_args, "image_b64 is not valid base64");
             const raw = try arena.alloc(u8, max);
-            decoder.decode(raw, b64) catch return appErr(arena, "image_b64 is not valid base64");
+            decoder.decode(raw, b64) catch return errRes(arena, .invalid_args, "image_b64 is not valid base64");
             const dec = png_util.decodeRgba(arena, raw) catch
-                return appErr(arena, "image_b64 does not decode as an image");
+                return errRes(arena, .invalid_args, "image_b64 does not decode as an image");
             arena.free(dec.rgba);
             dw = dec.w;
             dh = dec.h;
             png_bytes = raw;
         } else {
+            source = "capture";
             const capp = appFromArgs(args) orelse
-                return appErr(arena, "pass 'app' (capture from its window) or 'image_b64' (inline PNG)");
+                return errRes(arena, .invalid_args, "pass 'app' (capture from its window) or 'image_b64' (inline PNG)");
             capp.drain();
             const region = regionFrom(args) orelse
-                return appErr(arena, "capturing needs 'region' {x,y,w,h} — crop JUST the distinctive UI element (a whole window makes a useless template)");
+                return errRes(arena, .invalid_args, "capturing needs 'region' {x,y,w,h} — crop JUST the distinctive UI element (a whole window makes a useless template)");
             const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(capp);
-            if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+            if (wid == 0) return errRes(arena, .not_found, "no rendered window yet (try app_wait first)");
             const shot = capp.snapshotRgba(wid, region) catch
-                return appErr(arena, "no rendered pixels in that window (yet?)");
+                return errRes(arena, .not_found, "no rendered pixels in that window (yet?)");
             defer mcp.app_state.allocator.free(shot.px);
             dw = shot.w;
             dh = shot.h;
             png_bytes = png_util.encodeRgba(arena, shot.px, shot.w, shot.h) catch return error.OutOfMemory;
         }
-        mcpassets.save(mcp.app_state.allocator, .template, tname, png_bytes) catch |err| return appErr(arena, switch (err) {
-            mcpassets.Error.TooBig => "template too large (8 MB cap)",
-            else => "saving the template failed (state dir not writable?)",
-        });
-        const msg = try std.fmt.allocPrint(arena, "template \"{s}\" saved ({d}x{d}) — match it with app_find_image / app_wait_image or the wait_image / click_image action steps", .{ tname, dw, dh });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        mcpassets.save(mcp.app_state.allocator, .template, tname, png_bytes) catch |err| switch (err) {
+            mcpassets.Error.TooBig => return errRes(arena, .invalid_args, "template too large (8 MB cap)"),
+            else => return errRes(arena, .io_failed, "saving the template failed (state dir not writable?)"),
+        };
+        var res = Res.init(arena);
+        try res.field("name", tname);
+        try res.field("w", dw);
+        try res.field("h", dh);
+        try res.field("source", source);
+        try res.fact("bytes", png_bytes.len);
+        return res.finish();
     }
     if (eql(u8, name, "app_macros")) {
         if (argStr(args, "delete")) |del| {
-            mcpassets.delete(mcp.app_state.allocator, .macro, del) catch |err| return appErr(arena, switch (err) {
-                mcpassets.Error.NotFound => "no such macro",
-                mcpassets.Error.BadName => "invalid macro name",
-                else => "delete failed",
-            });
-            return toolResult(arena, "macro deleted", false) orelse error.OutOfMemory;
+            mcpassets.delete(mcp.app_state.allocator, .macro, del) catch |err| switch (err) {
+                mcpassets.Error.NotFound => return errRes(arena, .not_found, "no such macro"),
+                mcpassets.Error.BadName => return errRes(arena, .invalid_args, "invalid macro name"),
+                else => return errRes(arena, .io_failed, "delete failed"),
+            };
+            var res = Res.init(arena);
+            try res.field("deleted", del);
+            return res.finish();
         }
         if (argStr(args, "show")) |nm| {
-            const bytes = mcpassets.load(arena, .macro, nm) catch |err| return appErr(arena, switch (err) {
-                mcpassets.Error.NotFound => "no such macro",
-                mcpassets.Error.BadName => "invalid macro name",
+            const bytes = mcpassets.load(arena, .macro, nm) catch |err| switch (err) {
+                mcpassets.Error.NotFound => return errRes(arena, .not_found, "no such macro"),
+                mcpassets.Error.BadName => return errRes(arena, .invalid_args, "invalid macro name"),
                 mcpassets.Error.OutOfMemory => return error.OutOfMemory,
-                else => "macro load failed",
-            });
-            return toolResult(arena, bytes, false) orelse error.OutOfMemory;
+                else => return errRes(arena, .io_failed, "macro load failed"),
+            };
+            var res = Res.init(arena);
+            try res.field("macro", nm);
+            if (macroSteps(arena, bytes)) |sv| {
+                try res.field("steps", sv.len);
+                try res.raw("actions", bytes);
+                try res.text("--- steps ---");
+                for (sv, 0..) |st, i| {
+                    var jw: std.Io.Writer.Allocating = .init(arena);
+                    try std.json.Stringify.value(st, .{}, &jw.writer);
+                    try res.textf("{d}. {s}", .{ i + 1, jw.written() });
+                }
+            } else {
+                try res.text("the stored macro is not the expected {actions:[...]} shape — inspect it with app_macros show");
+            }
+            return res.finish();
         }
         if (argBool(args, "journal")) {
             const capp = appFromArgs(args) orelse
-                return appErr(arena, "the journal view needs 'app' (recorded steps are per app)");
+                return errRes(arena, .invalid_args, "the journal view needs 'app' (recorded steps are per app)");
             const entries = Journal.entriesOf(appIdOf(capp));
+            var res = Res.init(arena);
+            try res.fact("app", appIdOf(capp));
+            try res.field("recorded_steps", entries.len);
             var aw: std.Io.Writer.Allocating = .init(arena);
             const w = &aw.writer;
-            try w.print("{d} recorded input step(s), oldest first (save the tail with app_macro_save last_steps:N):\n", .{entries.len});
+            try w.writeAll("[");
             for (entries, 0..) |e, i| {
-                try w.print("{d}. {s}\n", .{ i + 1, e.step });
+                if (i > 0) try w.writeAll(",");
+                try w.writeAll(e.step);
             }
-            return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+            try w.writeAll("]");
+            try res.raw("journal", aw.written());
+            if (entries.len > 0) {
+                try res.text("--- recorded input steps, oldest first (save the tail with app_macro_save last_steps:N) ---");
+                for (entries, 0..) |e, i| try res.textf("{d}. {s}", .{ i + 1, e.step });
+            }
+            return res.finish();
         }
         const names = mcpassets.list(mcp.app_state.allocator, .macro) catch
-            return appErr(arena, "listing macros failed");
+            return errRes(arena, .io_failed, "listing macros failed");
         defer {
             for (names) |nm| mcp.app_state.allocator.free(nm);
             mcp.app_state.allocator.free(names);
         }
+        var res = Res.init(arena);
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         try w.writeAll("[");
         for (names, 0..) |nm, i| {
             if (i > 0) try w.writeAll(",");
             try w.print("{f}", .{std.json.fmt(nm, .{})});
+            try res.text(nm);
         }
         try w.writeAll("]");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        try res.raw("macros", aw.written());
+        try res.fact("count", names.len);
+        if (names.len == 0) try res.text("no saved macros (record one with app_macro_save)");
+        return res.finish();
     }
     if (eql(u8, name, "app_macro_save")) {
-        const mname = argStr(args, "name") orelse return appErr(arena, "app_macro_save requires 'name'");
+        const mname = argStr(args, "name") orelse return errRes(arena, .invalid_args, "app_macro_save requires 'name'");
         if (!mcpassets.validName(mname))
-            return appErr(arena, "invalid macro name (letters, digits, . _ - only, max 64)");
+            return errRes(arena, .invalid_args, "invalid macro name (letters, digits, . _ - only, max 64)");
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         try w.writeAll("{\"actions\":[");
@@ -379,10 +554,10 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         if (args == .object and args.object.get("actions") != null) {
             const av = args.object.get("actions").?;
             if (av != .array or av.array.items.len == 0)
-                return appErr(arena, "'actions' must be a non-empty array of step objects");
-            if (av.array.items.len > 200) return appErr(arena, "too many steps (max 200)");
+                return errRes(arena, .invalid_args, "'actions' must be a non-empty array of step objects");
+            if (av.array.items.len > 200) return errRes(arena, .invalid_args, "too many steps (max 200)");
             for (av.array.items, 0..) |st, i| {
-                if (st != .object) return appErr(arena, "each action step must be an object");
+                if (st != .object) return errRes(arena, .invalid_args, "each action step must be an object");
                 if (i > 0) try w.writeAll(",");
                 std.json.Stringify.value(st, .{}, w) catch return error.OutOfMemory;
             }
@@ -390,13 +565,13 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         } else {
             from_journal = true;
             const capp = appFromArgs(args) orelse
-                return appErr(arena, "recording from the journal needs 'app' (or pass explicit 'actions')");
+                return errRes(arena, .invalid_args, "recording from the journal needs 'app' (or pass explicit 'actions')");
             const entries = Journal.entriesOf(appIdOf(capp));
             if (entries.len == 0)
-                return appErr(arena, "no recorded input steps for this app yet — drive it (app_click / app_key / app_actions / ...), then save");
+                return errRes(arena, .not_found, "no recorded input steps for this app yet — drive it (app_click / app_key / app_actions / ...), then save");
             var take: usize = entries.len;
             if (argInt(args, "last_steps")) |ls| {
-                if (ls <= 0) return appErr(arena, "'last_steps' must be positive");
+                if (ls <= 0) return errRes(arena, .invalid_args, "'last_steps' must be positive");
                 take = @min(take, @as(usize, @intCast(ls)));
             }
             var first = true;
@@ -417,19 +592,21 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             }
         }
         try w.writeAll("]}");
-        mcpassets.save(mcp.app_state.allocator, .macro, mname, aw.written()) catch |err| return appErr(arena, switch (err) {
-            mcpassets.Error.TooBig => "macro too large",
-            else => "saving the macro failed (state dir not writable?)",
-        });
-        const msg = try std.fmt.allocPrint(arena, "macro \"{s}\" saved ({d} step(s){s}) — replay with app_macro_run, inspect with app_macros show", .{
-            mname, count, if (from_journal) ", wait gaps preserved" else "",
-        });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        mcpassets.save(mcp.app_state.allocator, .macro, mname, aw.written()) catch |err| switch (err) {
+            mcpassets.Error.TooBig => return errRes(arena, .invalid_args, "macro too large"),
+            else => return errRes(arena, .io_failed, "saving the macro failed (state dir not writable?)"),
+        };
+        var res = Res.init(arena);
+        try res.field("name", mname);
+        try res.field("steps", count);
+        try res.field("from_journal", from_journal);
+        if (from_journal) try res.text("think-time between recorded inputs was preserved as wait steps");
+        return res.finish();
     }
 
     const app = switch (mcp.appSelect(arena, args)) {
         .app => |a| a,
-        .err => |e| return appErr(arena, e),
+        .err => |e| return errRes(arena, .not_found, e),
     };
     // Catch up to the LIVE frame before any observation or input
     // baseline. The 100ms-boxed drain() only chewed part of a between-
@@ -447,44 +624,55 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
     // idempotent.
     if ((app.exited or app.presentationGone()) and needsLiveApp(name)) {
         _ = probeAppStop(app, 1_000);
-        const summary = try appSummary(arena, app);
-        const msg = try std.fmt.allocPrint(arena, "the app has exited or disconnected - {s} needs a running app\n{s}", .{ name, summary });
-        return toolResult(arena, msg, true) orelse error.OutOfMemory;
+        return appStateErr(arena, app, .conflict, try std.fmt.allocPrint(
+            arena,
+            "the app has exited or disconnected - {s} needs a running app",
+            .{name},
+        ));
     }
 
     if (eql(u8, name, "app_windows")) {
-        const summary = try appSummary(arena, app);
-        return toolResult(arena, summary, false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try addAppSummary(&res, arena, app);
+        return res.finish();
     }
     if (eql(u8, name, "app_output")) {
-        const text = app.output(argBool(args, "scrollback")) catch |err| return appErr(arena, switch (err) {
-            appdrive.Error.Desynced => "this app's terminal mirror lost sync with the session and could not be rebuilt, so its content is stale; use app_log, which is served daemon-side",
-            else => "no terminal mirror for this app (output unavailable)",
-        });
+        const text = app.output(argBool(args, "scrollback")) catch |err| switch (err) {
+            appdrive.Error.Desynced => return errRes(arena, .unavailable, "this app's terminal mirror lost sync with the session and could not be rebuilt, so its content is stale; use app_log, which is served daemon-side"),
+            else => return errRes(arena, .unavailable, "no terminal mirror for this app (output unavailable)"),
+        };
         defer mcp.app_state.allocator.free(text);
-        var msg: []const u8 = try arena.dupe(u8, text);
+        var res = Res.init(arena);
+        try res.fact("app", appIdOf(app));
+        try res.fact("exited", app.exited);
+        if (app.exited) {
+            try res.fact("exit_status", app.exit_status);
+            try res.textf("app exited, status {d}{s}", .{ app.exit_status, try exitSuffix(arena, app.exit_status) });
+        }
+        var body: []const u8 = try arena.dupe(u8, text);
+        var source: []const u8 = "terminal_grid";
         if (std.mem.trim(u8, text, " \n\t\r").len == 0) {
             // A blank grid mirror does not mean "no output" — the log
             // ring (app_log) is the source of truth for line output.
             // Only the post-exit stash is served here; a live app's
             // log_buf may hold a stale earlier log_get reply.
             if (if (app.exited) logStashTail(arena, app, 25) else null) |tail_text| {
-                msg = try std.fmt.allocPrint(arena, "(terminal grid mirror is blank — serving the last lines from the log ring instead; app_log is the source of truth for line output)\n{s}", .{tail_text});
+                source = "log_ring";
+                body = tail_text;
+                try res.text("the terminal grid mirror is blank — serving the last lines from the log ring instead; app_log is the source of truth for line output");
             } else {
-                msg = if (argBool(args, "scrollback"))
-                    "(the app has written nothing to its stdout/stderr PTY — GUI apps often print little; stderr redirected elsewhere by the app itself is not visible here. app_log is the indexed view of the same PTY)"
+                source = "empty";
+                body = "";
+                try res.text(if (argBool(args, "scrollback"))
+                    "the app has written nothing to its stdout/stderr PTY — GUI apps often print little; stderr redirected elsewhere by the app itself is not visible here. app_log is the indexed view of the same PTY"
                 else
-                    "(no output on the visible terminal grid — pass scrollback:true for scrolled-off history, or use app_log for indexed lines)";
+                    "no output on the visible terminal grid — pass scrollback:true for scrolled-off history, or use app_log for indexed lines");
             }
         }
-        if (app.exited) {
-            msg = try std.fmt.allocPrint(arena, "[app exited, status {d}{s}]\n{s}", .{
-                app.exit_status,
-                try exitSuffix(arena, app.exit_status),
-                msg,
-            });
-        }
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        try res.fact("source", source);
+        try res.fact("output", body);
+        if (body.len > 0) try res.textf("--- output ({s}) ---\n{s}", .{ source, body });
+        return res.finish();
     }
     if (eql(u8, name, "app_wait_log")) return waitLog(arena, app, args);
     if (eql(u8, name, "app_log")) {
@@ -493,7 +681,7 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         const filter: ?mcp.pattern.Matcher = switch (mcp.logFilterFrom(arena, args)) {
             .none => null,
             .m => |m| m,
-            .err => |e| return appErr(arena, e),
+            .err => |e| return errRes(arena, .invalid_args, e),
         };
         // Filtering scans the widest window the ring serves, then
         // reports how many lines were SCANNED vs matched — `tail` caps
@@ -516,29 +704,32 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
                 for (app.windows.items) |w| frames += w.frames;
                 if (app.output(false)) |grid| {
                     defer mcp.app_state.allocator.free(grid);
-                    const msg = try std.fmt.allocPrint(
-                        arena,
-                        "[log path timed out even over a fresh daemon connection (app alive: {}, windows: {d}, frames committed: {d}) — serving the PTY grid mirror instead; NO line ids, wrapped at the grid width]\n{s}",
-                        .{ !app.exited, app.windows.items.len, frames, grid },
+                    var res = Res.init(arena);
+                    try res.fact("app", appIdOf(app));
+                    try res.fact("source", "terminal_grid");
+                    try res.fact("output", grid);
+                    try res.textf(
+                        "the log path timed out even over a fresh daemon connection (app alive: {}, windows: {d}, frames committed: {d}) — serving the PTY grid mirror instead; NO line ids, wrapped at the grid width",
+                        .{ !app.exited, app.windows.items.len, frames },
                     );
-                    return toolResult(arena, msg, false) orelse error.OutOfMemory;
+                    try res.textf("--- terminal grid ---\n{s}", .{grid});
+                    return res.finish();
                 } else |_| {}
-                const msg = try std.fmt.allocPrint(
+                return errRes(arena, .timeout, try std.fmt.allocPrint(
                     arena,
                     "the daemon's log reply did not arrive within 5s, a fresh side connection also failed, and no grid mirror is available (app alive: {}, windows: {d}, frames committed: {d})",
                     .{ !app.exited, app.windows.items.len, frames },
-                );
-                return appErr(arena, msg);
+                ));
             },
-            else => return appErr(arena, if (app.exited)
-                "the app exited and its log stash is empty — no output was captured before exit (a known app id, distinct from 'unknown app')"
+            else => return if (app.exited)
+                errRes(arena, .not_found, "the app exited and its log stash is empty — no output was captured before exit (a known app id, distinct from 'unknown app')")
             else
-                "log unavailable: the connection to the app's daemon was lost"),
+                errRes(arena, .unavailable, "log unavailable: the connection to the app's daemon was lost"),
         };
         const reply = fetch.json;
         defer mcp.app_state.allocator.free(reply);
         if (fetch.stale and line_id != 0)
-            return appErr(arena, "the daemon's log reply did not arrive within 5s; only a stale cached snapshot is available, which cannot answer a single-line fetch honestly — retry in a moment");
+            return errRes(arena, .timeout, "the daemon's log reply did not arrive within 5s; only a stale cached snapshot is available, which cannot answer a single-line fetch honestly — retry in a moment");
         const parsed = std.json.parseFromSlice(LogReplyJ, arena, reply, .{
             .ignore_unknown_fields = true,
         }) catch return appErr(arena, "malformed log reply");
@@ -553,37 +744,51 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
                 if (l.id == line_id) found = l;
             }
             const l = found orelse
-                return appErr(arena, "line not available (dropped from the ring, never emitted, or beyond the post-exit stash)");
+                return errRes(arena, .not_found, "line not available (dropped from the ring, never emitted, or beyond the post-exit stash)");
             const age_s = @as(f64, @floatFromInt(now_wall - l.t)) / 1000.0;
+            var res = Res.init(arena);
+            try res.fact("app", appIdOf(app));
+            try res.fact("line_id", l.id);
+            try res.fact("age_ms", now_wall - l.t);
+            try res.fact("marker", l.marker);
+            try res.fact("truncated", l.truncated);
+            try res.fact("text", l.text);
             if (l.marker) {
                 if (app.markerImage(line_id)) |img| {
-                    const note = if (img.shared_from != 0)
-                        try std.fmt.allocPrint(arena, " — window at that instant below (frame unchanged since marker {d}; screenshot shared)", .{img.shared_from})
-                    else
-                        " — window at that instant below";
-                    const cap = try std.fmt.allocPrint(arena, "marker line {d} ({d:.1}s ago): '{s}'{s}", .{
-                        l.id, age_s, l.text, note,
+                    try res.fact("marker_screenshot", true);
+                    if (img.shared_from != 0) try res.fact("screenshot_shared_from", img.shared_from);
+                    try res.textf("marker line {d} ({d:.1}s ago): '{s}' — window at that instant below{s}", .{
+                        l.id, age_s, l.text,
+                        if (img.shared_from != 0)
+                            try std.fmt.allocPrint(arena, " (frame unchanged since marker {d}; screenshot shared)", .{img.shared_from})
+                        else
+                            "",
                     });
-                    if (imageResult(arena, cap, img.png)) |res| return res;
+                    return res.finishWithImages(&.{img.png}, null);
                 }
-                const cap = try std.fmt.allocPrint(
-                    arena,
+                try res.fact("marker_screenshot", false);
+                try res.textf(
                     "marker line {d} ({d:.1}s ago): '{s}' (no screenshot was stashed: no rendered window at the time, or the marker aged out)",
                     .{ l.id, age_s, l.text },
                 );
-                return toolResult(arena, cap, false) orelse error.OutOfMemory;
+                return res.finish();
             }
-            const msg = try std.fmt.allocPrint(arena, "line {d} ({d:.1}s ago{s}):\n{s}", .{
-                l.id,                                                          age_s,
-                if (l.truncated) ", was longer than the 4KB line cap" else "", l.text,
+            try res.textf("line {d}, {d:.1}s ago{s}", .{
+                l.id,
+                age_s,
+                if (l.truncated) ", was longer than the 4KB line cap" else "",
             });
-            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+            try res.textf("--- line ---\n{s}", .{l.text});
+            return res.finish();
         }
 
+        var res = Res.init(arena);
+        try res.fact("app", appIdOf(app));
+        try res.fact("stale", fetch.stale);
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         if (fetch.stale)
-            try w.writeAll("[STALE: the daemon's fresh log reply was still queued behind streamed frame data after 5s — serving the last cached snapshot instead; retry app_log for current lines]\n");
+            try res.text("STALE: the daemon's fresh log reply was still queued behind streamed frame data after 5s — serving the last cached snapshot instead; retry app_log for current lines");
         // A filter narrows what is PRINTED; the scanned window is
         // reported alongside so "0 matches" can never be mistaken for
         // the plain tail. Silently serving unmatched lines (the old
@@ -604,23 +809,31 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             try shown.appendSlice(arena, r.lines);
         }
         const lines = shown.items;
+        const pat = argStr(args, "pattern") orelse argStr(args, "grep") orelse "";
+        try res.fact("scanned", r.lines.len);
+        try res.fact("shown", lines.len);
+        try res.fact("next_id", r.next_id);
+        try res.fact("dropped", r.dropped);
+        try res.fact("markers_dropped", r.markers_dropped);
+        if (filter != null) {
+            try res.fact("pattern", pat);
+            try res.fact("matched", matched);
+        }
         if (filter != null and lines.len == 0) {
-            try w.print(
+            try res.textf(
                 "0 of {d} scanned line(s) match \"{s}\" (ids {d}..{d}). NOTHING is shown — this is not a tail: the pattern simply has not appeared yet. Wait for it with app_wait_log.",
                 .{
                     r.lines.len,
-                    argStr(args, "pattern") orelse argStr(args, "grep") orelse "",
+                    pat,
                     if (r.lines.len > 0) r.lines[0].id else 0,
                     if (r.lines.len > 0) r.lines[r.lines.len - 1].id else 0,
                 },
             );
         } else if (lines.len == 0) {
-            try w.writeAll("(log empty — the app has not printed any complete line yet)");
+            try res.text("log empty — the app has not printed any complete line yet");
         } else {
             if (filter != null) {
-                try w.print("{d} of {d} scanned line(s) match \"{s}\"", .{
-                    matched, r.lines.len, argStr(args, "pattern") orelse argStr(args, "grep") orelse "",
-                });
+                try w.print("{d} of {d} scanned line(s) match \"{s}\"", .{ matched, r.lines.len, pat });
                 if (matched > lines.len) try w.print(" (newest {d} shown)", .{lines.len});
                 try w.writeAll("; ");
             }
@@ -629,24 +842,29 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             });
             if (r.dropped > 0) try w.print(", {d} oldest dropped by the ring cap", .{r.dropped});
             if (r.markers_dropped > 0) try w.print(", {d} markers rate-limited", .{r.markers_dropped});
-            try w.writeAll(" — [+] = shortened, fetch in full with {\"id\":N}\n");
+            try w.writeAll(" — [+] = shortened, fetch one in full by its id");
+            try res.text(aw.written());
+            aw.clearRetainingCapacity();
+            try w.writeAll("--- log ---");
             for (lines) |l| {
                 const age_s = @as(f64, @floatFromInt(now_wall - l.t)) / 1000.0;
                 if (l.marker) {
                     const has_shot = app.markerImage(l.id) != null;
-                    try w.print("{d} [-{d:.1}s] [marker '{s}'{s}]\n", .{
+                    try w.print("\n{d} [-{d:.1}s] [marker '{s}'{s}]", .{
                         l.id, age_s, l.text,
-                        if (has_shot) " — screenshot stashed, view it via {\"id\":this line's id}" else "",
+                        if (has_shot) " — screenshot stashed, fetch it by this line's id" else "",
                     });
                 } else {
-                    try w.print("{d} [-{d:.1}s] {s}{s}\n", .{
+                    try w.print("\n{d} [-{d:.1}s] {s}{s}", .{
                         l.id,                                     age_s, l.text,
                         if (l.cut or l.truncated) " [+]" else "",
                     });
                 }
             }
+            try res.text(aw.written());
         }
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        try res.fact("lines", lines);
+        return res.finish();
     }
     if (eql(u8, name, "screenshot_app") or eql(u8, name, "get_app_state")) {
         var win_id: u32 = 0;
@@ -658,12 +876,9 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         if (win_id == 0) {
             // "No window" and "the app died" are different answers —
             // report the exit (status, signal, output) when it applies.
-            if (app.exited) {
-                const summary = try appSummary(arena, app);
-                const msg = try std.fmt.allocPrint(arena, "the app has exited — no window to screenshot\n{s}", .{summary});
-                return toolResult(arena, msg, true) orelse error.OutOfMemory;
-            }
-            return appErr(arena, "no rendered window yet (try app_wait first)");
+            if (app.exited)
+                return appStateErr(arena, app, .conflict, "the app has exited — no window to screenshot");
+            return errRes(arena, .not_found, "no rendered window yet (try app_wait first)");
         }
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, mcp.WAIT_CAP_MS);
         // min_change_pct also thresholds wait_change/stable_ms so
@@ -680,7 +895,7 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             const want: u64 = @intCast(@max(mf, 0));
             if (!app.waitFrameAfter(win_id, want, timeout_ms)) {
                 const have = app.frameCount(win_id);
-                return appErr(arena, try std.fmt.allocPrint(
+                return errRes(arena, .timeout, try std.fmt.allocPrint(
                     arena,
                     "window {d} committed no frame past {d} within {d}ms — it is still at frame {d}{s}. Nothing was captured (a stale image is worse than an error here).",
                     .{ win_id, want, timeout_ms, have, if (app.exited) "; the app has EXITED" else "" },
@@ -693,8 +908,9 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         var region: ?appdrive.App.Region = null;
         if (args == .object) {
             if (args.object.get("region")) |rv| {
-                region = mcp.regionOf(rv) orelse return appErr(
+                region = mcp.regionOf(rv) orelse return errRes(
                     arena,
+                    .invalid_args,
                     "'region' must be an OBJECT with integer x, y, w, h — e.g. region:{\"x\":0,\"y\":330,\"w\":145,\"h\":150} (a bare [x,y,w,h] array is accepted too). w and h must be > 0 and x/y non-negative.",
                 );
             }
@@ -706,12 +922,12 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             // Block (bounded) until the window commits a frame newer
             // than its last screenshot — "did my click do anything".
             if (!app.waitWindowChange(win_id, timeout_ms, wait_min_pct, diff_region))
-                return appErr(arena, if (diff_region != null)
+                return errRes(arena, .timeout, if (diff_region != null)
                     "the region's content did not change before the timeout"
                 else
                     "window content did not change before the timeout");
         }
-        var settle_note: []const u8 = "";
+        var res = Res.init(arena);
         if (argInt(args, "stable_ms")) |sm| {
             // Settle-then-capture: wait until the window stops
             // repainting before shooting (composes with wait_change:
@@ -723,21 +939,31 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
                 app.waitVisualSettle(win_id, sm, timeout_ms, wait_min_pct, diff_region)
             else
                 app.waitWindowSettle(win_id, sm, timeout_ms);
+            try res.fact("settled", settled);
             if (!settled)
-                settle_note = "\n[note: frames were still arriving at timeout_ms — captured anyway]";
+                try res.text("frames were still arriving at timeout_ms — captured anyway");
         }
         if (argBool(args, "stats_only")) {
             // Cheap change probe: no PNG, just "did it change and how
             // much" vs whatever the caller last saw. With a region the
             // diff_pct is computed inside that rect only.
             const st = app.diffStats(win_id, region) catch
-                return appErr(arena, "no such window / no pixels yet");
-            const msg = try std.fmt.allocPrint(
-                arena,
-                "{{\"changed\":{},\"diff_pct\":{d:.2},\"resized\":{},\"w\":{d},\"h\":{d},\"frames\":{d}{s}}}{s}",
-                .{ st.changed, st.diff_pct, st.resized, st.w, st.h, st.frames, if (region != null) ",\"diff_scope\":\"region\"" else "", settle_note },
-            );
-            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+                return errRes(arena, .not_found, "no such window / no pixels yet");
+            try res.fact("window", win_id);
+            try res.fact("changed", st.changed);
+            try res.fact("diff_pct", st.diff_pct);
+            try res.fact("resized", st.resized);
+            try res.fact("w", st.w);
+            try res.fact("h", st.h);
+            try res.fact("frames", st.frames);
+            try res.fact("diff_scope", if (region != null) "region" else "window");
+            try res.textf("window {d}: {s} {d:.2}% of the {s} since your last look ({d}x{d}, frame {d}){s}", .{
+                win_id,                          if (st.changed) "changed" else "unchanged,",
+                st.diff_pct,                     if (region != null) "region" else "window",
+                st.w,                            st.h,
+                st.frames,                       if (st.resized) ", window RESIZED" else "",
+            });
+            return res.finish();
         }
         const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 1568, 0, 8192));
         const zoom: u32 = @intCast(std.math.clamp(argInt(args, "zoom") orelse 1, 1, 32));
@@ -776,7 +1002,7 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
                 if (app.exited) break;
             }
             const fshot = first orelse
-                return appErr(arena, "no such window / no pixels yet (a region must lie inside the window)");
+                return errRes(arena, .not_found, "no such window / no pixels yet (a region must lie inside the window)");
             var ob: std.ArrayList(u8) = .empty;
             defer ob.deinit(arena);
             for (offsets.items, 0..) |o, i| {
@@ -784,32 +1010,33 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
                 const s = std.fmt.bufPrint(&nb, "{s}{d}ms", .{ if (i > 0) ", " else "", o }) catch break;
                 try ob.appendSlice(arena, s);
             }
-            const extra: []const u8 = if (eql(u8, name, "get_app_state")) try appSummary(arena, app) else "";
-            const base_caption = try screenshotCaption(arena, app, win_id, fshot, extra);
-            const caption = try std.fmt.allocPrint(arena, "{s}\nburst: {d} frame(s) captured at [{s}] (each >= {d:.1}% changed from the previous){s}", .{
-                base_caption, pngs.items.len, ob.items, min_pct, settle_note,
+            if (eql(u8, name, "get_app_state")) try addAppSummary(&res, arena, app);
+            try res.fact("window", win_id);
+            try res.fact("burst", pngs.items.len);
+            try res.fact("burst_offsets_ms", offsets.items);
+            try res.fact("min_change_pct", min_pct);
+            try addShotFacts(&res, arena, app, win_id, fshot);
+            try res.textf("burst: {d} frame(s) captured at [{s}] (each >= {d:.1}% changed from the previous)", .{
+                pngs.items.len, ob.items, min_pct,
             });
-            return imagesResult(arena, caption, pngs.items) orelse error.OutOfMemory;
+            return res.finishWithImages(pngs.items, null);
         };
 
         const shot = app.screenshotPng(win_id, max_px, region, zoom) catch
-            return appErr(arena, "no such window / no pixels yet (a region must lie inside the window)");
+            return errRes(arena, .not_found, "no such window / no pixels yet (a region must lie inside the window)");
         defer mcp.app_state.allocator.free(shot.png);
-        const extra: []const u8 = if (eql(u8, name, "get_app_state")) try appSummary(arena, app) else "";
-        const base_caption = try screenshotCaption(arena, app, win_id, shot, extra);
-        const caption = if (settle_note.len > 0)
-            try std.fmt.allocPrint(arena, "{s}{s}", .{ base_caption, settle_note })
-        else
-            base_caption;
-        return imageResult(arena, caption, shot.png) orelse error.OutOfMemory;
+        if (eql(u8, name, "get_app_state")) try addAppSummary(&res, arena, app);
+        try res.fact("window", win_id);
+        try addShotFacts(&res, arena, app, win_id, shot);
+        return res.finishWithImages(&.{shot.png}, null);
     }
     if (eql(u8, name, "app_drag")) {
         const win_id: u32 = @intCast(argInt(args, "window") orelse
-            return appErr(arena, "app_drag requires 'window'"));
-        const x1 = argInt(args, "x1") orelse return appErr(arena, "app_drag requires x1,y1,x2,y2");
-        const y1 = argInt(args, "y1") orelse return appErr(arena, "app_drag requires x1,y1,x2,y2");
-        const x2 = argInt(args, "x2") orelse return appErr(arena, "app_drag requires x1,y1,x2,y2");
-        const y2 = argInt(args, "y2") orelse return appErr(arena, "app_drag requires x1,y1,x2,y2");
+            return errRes(arena, .invalid_args, "app_drag requires 'window'"));
+        const x1 = argInt(args, "x1") orelse return errRes(arena, .invalid_args, "app_drag requires x1,y1,x2,y2");
+        const y1 = argInt(args, "y1") orelse return errRes(arena, .invalid_args, "app_drag requires x1,y1,x2,y2");
+        const x2 = argInt(args, "x2") orelse return errRes(arena, .invalid_args, "app_drag requires x1,y1,x2,y2");
+        const y2 = argInt(args, "y2") orelse return errRes(arena, .invalid_args, "app_drag requires x1,y1,x2,y2");
         const button: u32 = @intCast(argInt(args, "button") orelse 1);
         var piw = PostInputWait.begin(args, app, win_id, argBool(args, "screenshot"));
         app.drag(
@@ -819,39 +1046,57 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             @floatFromInt(x2),
             @floatFromInt(y2),
             button,
-        ) catch return appErr(arena, "drag failed (bad window?)");
+        ) catch return errRes(arena, .not_found, "drag failed (bad window?)");
         journalStep(app, "{{\"drag\":[{d},{d},{d},{d}],\"button\":{d},\"window\":{d}}}", .{ x1, y1, x2, y2, button, win_id });
+        var res = Res.init(arena);
+        try res.fact("x1", x1);
+        try res.fact("y1", y1);
+        try res.fact("x2", x2);
+        try res.fact("y2", y2);
+        try res.fact("button", button);
         const desc = try std.fmt.allocPrint(arena, "dragged ({d},{d}) -> ({d},{d}) button {d}", .{ x1, y1, x2, y2, button });
-        return inputResult(arena, app, args, win_id, &piw, desc);
+        return inputResult(arena, app, args, win_id, &piw, desc, &res);
     }
     if (eql(u8, name, "app_clipboard_get")) {
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 3_000;
-        const bytes = app.getClipboard(timeout_ms) catch |err| return appErr(arena, switch (err) {
-            appdrive.Error.NoClipboard => "the app has not announced a clipboard selection (copy something in it first)",
-            appdrive.Error.Timeout => "app did not deliver clipboard data in time",
-            else => "clipboard fetch failed",
-        });
+        const bytes = app.getClipboard(timeout_ms) catch |err| switch (err) {
+            appdrive.Error.NoClipboard => return errRes(arena, .not_found, "the app has not announced a clipboard selection (copy something in it first)"),
+            appdrive.Error.Timeout => return errRes(arena, .timeout, "app did not deliver clipboard data in time"),
+            else => return appErr(arena, "clipboard fetch failed"),
+        };
         defer mcp.app_state.allocator.free(bytes);
         const copy = try arena.dupe(u8, bytes);
-        return toolResult(arena, copy, false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("bytes", copy.len);
+        try res.fact("text", copy);
+        try res.textf("clipboard: {d} byte(s)", .{copy.len});
+        if (copy.len > 0) try res.textf("--- clipboard ---\n{s}", .{copy});
+        return res.finish();
     }
     if (eql(u8, name, "app_clipboard_set")) {
         const text = argStr(args, "text") orelse
-            return appErr(arena, "app_clipboard_set requires 'text'");
+            return errRes(arena, .invalid_args, "app_clipboard_set requires 'text'");
         app.setClipboard(text) catch return appErr(arena, "clipboard set failed");
-        if (argBool(args, "paste")) {
+        const pasted = argBool(args, "paste");
+        if (pasted) {
             const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
-            app.pressKey(win, "ctrl+v") catch return appErr(arena, "paste keystroke failed (no window?)");
+            app.pressKey(win, "ctrl+v") catch return errRes(arena, .not_found, "paste keystroke failed (no window?)");
             _ = app.waitIdle(200, 2_000);
         }
-        return toolResult(arena, "ok (the app sees this as the host clipboard)", false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("bytes", text.len);
+        try res.fact("pasted", pasted);
+        try res.textf("clipboard set ({d} byte(s)){s} — the app sees this as the host clipboard", .{
+            text.len, if (pasted) ", pasted with ctrl+v" else "",
+        });
+        return res.finish();
     }
     if (eql(u8, name, "app_click")) {
         const button: u32 = @intCast(argInt(args, "button") orelse 1);
         const win_id: u32 = @intCast(argInt(args, "window") orelse
-            return appErr(arena, "app_click requires 'window' and x/y. To target a widget by name/role use app_perform_action (coordinate-free)."));
-        const x = argInt(args, "x") orelse return appErr(arena, "app_click requires 'x'");
-        const y = argInt(args, "y") orelse return appErr(arena, "app_click requires 'y'");
+            return errRes(arena, .invalid_args, "app_click requires 'window' and x/y. To target a widget by name/role use app_perform_action (coordinate-free)."));
+        const x = argInt(args, "x") orelse return errRes(arena, .invalid_args, "app_click requires 'x'");
+        const y = argInt(args, "y") orelse return errRes(arena, .invalid_args, "app_click requires 'y'");
         const hold_ms: i64 = std.math.clamp(argInt(args, "hold_ms") orelse Tuning.hold_ms.value, 0, 10_000);
         const count: u32 = @intCast(std.math.clamp(argInt(args, "count") orelse 1, 1, 3));
         const retries: i64 = std.math.clamp(argInt(args, "retry") orelse Tuning.click_retry.value, 0, 5);
@@ -881,12 +1126,13 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             }
             app.clickEx(win_id, @floatFromInt(x), @floatFromInt(y), button, hold_ms, count) catch {
                 if (probeAppStop(app, 1_000)) |stop| {
-                    const detail = try appStopText(arena, stop, "the click");
-                    const summary = try appSummary(arena, app);
-                    const msg = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d} - {s}\n{s}", .{ x, y, button, detail, summary });
-                    return toolResult(arena, msg, false) orelse error.OutOfMemory;
+                    var res = Res.init(arena);
+                    try clickFacts(&res, win_id, x, y, button, count, hold_ms, 1, false);
+                    try res.textf("clicked ({d},{d}) button {d} - {s}", .{ x, y, button, try appStopText(arena, stop, "the click") });
+                    try addAppSummary(&res, arena, app);
+                    return res.finish();
                 }
-                return appErr(arena, "click failed (bad window?)");
+                return errRes(arena, .not_found, "click failed (bad window?)");
             };
             attempts += 1;
             note = try piw.finish(arena, app, win_id);
@@ -906,34 +1152,37 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             if (piw.quietBeforeMs() >= mcp.APP_QUIET_HANG_MS) break;
         }
         journalStep(app, "{{\"click\":[{d},{d}],\"button\":{d},\"window\":{d},\"hold_ms\":{d},\"count\":{d}}}", .{ x, y, button, win_id, hold_ms, count });
-        if (stopped != null) {
-            // Don't attempt the screenshot — it fails as "no pixels
-            // yet?" and masks the crash the click just triggered.
-            const summary = try appSummary(arena, app);
-            const msg = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}\n{s}", .{ x, y, button, note, summary });
-            return toolResult(arena, msg, false) orelse error.OutOfMemory;
-        }
-        // Built once, after the retries: the log delta consumes the
-        // lines it reports, so computing it per attempt would hand the
-        // caller only whatever the LAST press happened to print.
-        note = try std.fmt.allocPrint(arena, "{s} [window {d} frame {d} at input, {d} now — pass min_frame:{d} to screenshot_app for a provably post-click capture]{s}{s}", .{
-            note,
-            win_id,
-            frame_at_input orelse 0,
-            app.frameCount(win_id),
-            frame_at_input orelse 0,
-            mcp.logDeltaNote(arena, app, args),
-            mcp.macroNudge(arena, app),
-        });
-        if (attempts > 1) {
-            note = try std.fmt.allocPrint(arena, " — auto-retried: {d} attempts, earlier clicks produced no qualifying repaint{s}", .{ attempts, note });
-        }
+        var res = Res.init(arena);
+        try clickFacts(&res, win_id, x, y, button, count, hold_ms, attempts, repainted);
+        try res.fact("frame_at_input", frame_at_input orelse 0);
+        try res.fact("frame_now", app.frameCount(win_id));
         const qual: []const u8 = if (count > 1)
             try std.fmt.allocPrint(arena, " x{d} ({s}, held {d}ms each)", .{ count, if (count == 2) "double-click" else "triple-click", hold_ms })
         else if (hold_ms > 0)
             try std.fmt.allocPrint(arena, " (held {d}ms)", .{hold_ms})
         else
             "";
+        if (stopped != null) {
+            // Don't attempt the screenshot — it fails as "no pixels
+            // yet?" and masks the crash the click just triggered.
+            try res.textf("clicked ({d},{d}) button {d}{s}{s}", .{ x, y, button, qual, note });
+            try addAppSummary(&res, arena, app);
+            return res.finish();
+        }
+        try res.textf("clicked ({d},{d}) button {d}{s}{s}", .{ x, y, button, qual, note });
+        if (attempts > 1)
+            try res.textf("auto-retried: {d} attempts, earlier clicks produced no qualifying repaint", .{attempts});
+        try res.textf(
+            "window {d} frame {d} at input, {d} now — pass min_frame:{d} to screenshot_app for a provably post-click capture",
+            .{ win_id, frame_at_input orelse 0, app.frameCount(win_id), frame_at_input orelse 0 },
+        );
+        // Built once, after the retries: the log delta consumes the
+        // lines it reports, so computing it per attempt would hand the
+        // caller only whatever the LAST press happened to print.
+        const delta = mcp.logDeltaNote(arena, app, args);
+        if (delta.len > 0) try res.text(std.mem.trimStart(u8, delta, "\n"));
+        const nudge = mcp.macroNudge(arena, app);
+        if (nudge.len > 0) try res.text(std.mem.trimStart(u8, nudge, "\n"));
         if (want_shot) {
             // Post-click frame, optionally with the click point drawn
             // in — one call shows where the click landed AND what the
@@ -942,39 +1191,33 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             // and the caption says explicitly when it never did.
             const annot = [_]marks_mod.Mark{.{ .x = @floatFromInt(x), .y = @floatFromInt(y) }};
             const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse 1568, 0, 8192));
-            const shot = app.screenshotPngMarked(win_id, max_px, null, 1, if (want_mark) &annot else &.{}) catch
+            const shot = app.screenshotPngMarked(win_id, max_px, null, 1, if (want_mark) &annot else &.{}) catch {
                 if (probeAppStop(app, 1_000)) |stop| {
-                    const detail = try appStopText(arena, stop, "the post-click capture");
-                    const summary = try appSummary(arena, app);
-                    const msg = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d} - {s}\n{s}", .{ x, y, button, detail, summary });
-                    return toolResult(arena, msg, false) orelse error.OutOfMemory;
-                } else return toolResult(arena, "clicked, but the post-click screenshot failed (no pixels yet?)", false) orelse error.OutOfMemory;
+                    try res.textf("{s}", .{try appStopText(arena, stop, "the post-click capture")});
+                    try addAppSummary(&res, arena, app);
+                    return res.finish();
+                }
+                try res.fact("screenshot_failed", true);
+                try res.text("the post-click screenshot failed (no pixels yet?)");
+                return res.finish();
+            };
             defer mcp.app_state.allocator.free(shot.png);
-            const extra = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}{s}{s}", .{
-                x, y, button, qual, note,
-                if (want_mark)
-                    " — the red crosshair marks the click point on the post-click frame. Coordinates are delivered to the app verbatim; a pointer-LOCKED app tracks its own cursor from relative deltas, so its internal cursor can differ (calibrate with app_mouse_move dx/dy)."
-                else
-                    "",
-            });
-            const caption = try screenshotCaption(arena, app, win_id, shot, extra);
-            return imageResultTagged(arena, caption, shot.png, "click") orelse error.OutOfMemory;
+            if (want_mark)
+                try res.text("the red crosshair marks the click point on the post-click frame. Coordinates are delivered to the app verbatim; a pointer-LOCKED app tracks its own cursor from relative deltas, so its internal cursor can differ (calibrate with app_mouse_move dx/dy).");
+            try addShotFacts(&res, arena, app, win_id, shot);
+            return res.finishWithImages(&.{shot.png}, &.{"click"});
         }
-        if (note.len > 0 or qual.len > 0) {
-            const msg = try std.fmt.allocPrint(arena, "clicked ({d},{d}) button {d}{s}{s}", .{ x, y, button, qual, note });
-            return toolResult(arena, msg, false) orelse error.OutOfMemory;
-        }
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        return res.finish();
     }
     if (eql(u8, name, "app_actions")) {
         const actions_v = (if (args == .object) args.object.get("actions") else null) orelse
-            return appErr(arena, "app_actions requires 'actions' (an array of step objects)");
-        if (actions_v != .array) return appErr(arena, "'actions' must be an array of step objects");
+            return errRes(arena, .invalid_args, "app_actions requires 'actions' (an array of step objects)");
+        if (actions_v != .array) return errRes(arena, .invalid_args, "'actions' must be an array of step objects");
         const steps = actions_v.array.items;
-        if (steps.len == 0) return appErr(arena, "'actions' is empty");
-        if (steps.len > 32) return appErr(arena, "too many steps (max 32)");
+        if (steps.len == 0) return errRes(arena, .invalid_args, "'actions' is empty");
+        if (steps.len > 32) return errRes(arena, .invalid_args, "too many steps (max 32)");
         const win_arg: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
-        return runActionSteps(arena, app, steps, win_arg, true, "");
+        return runActionSteps(arena, app, steps, win_arg, true, null);
     }
     return appToolTail(arena, name, args, app);
 }
@@ -992,9 +1235,9 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
 /// escape (app_log): it stashes the frame at the exact instant.
 fn waitLog(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) ![]const u8 {
     const m = switch (mcp.logFilterFrom(arena, args)) {
-        .none => return appErr(arena, "app_wait_log requires 'pattern' (the log-line pattern to wait for)"),
+        .none => return errRes(arena, .invalid_args, "app_wait_log requires 'pattern' (the log-line pattern to wait for)"),
         .m => |mm| mm,
-        .err => |e| return appErr(arena, e),
+        .err => |e| return errRes(arena, .invalid_args, e),
     };
     const pat = argStr(args, "pattern") orelse argStr(args, "grep") orelse "";
     const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, mcp.WAIT_CAP_MS);
@@ -1016,19 +1259,31 @@ fn waitLog(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) !
                 const elapsed = monoMs() - t0;
                 const wid = firstToplevelId(app);
                 const frame = app.frameCount(wid);
-                const head = try std.fmt.allocPrint(
-                    arena,
-                    "matched \"{s}\" after {d}ms — log line {d}{s}:\n{s}\n(window {d} is at frame {d}; screenshot_app min_frame:{d} guarantees pixels committed after this line)",
-                    .{ pat, elapsed, l.id, if (l.marker) " [marker]" else "", l.text, wid, frame, frame },
+                var res = Res.init(arena);
+                try res.fact("app", appIdOf(app));
+                try res.fact("matched", true);
+                try res.fact("timed_out", false);
+                try res.fact("pattern", pat);
+                try res.fact("line_id", l.id);
+                try res.fact("marker", l.marker);
+                try res.fact("text", l.text);
+                try res.fact("elapsed_ms", elapsed);
+                try res.fact("scanned", scanned);
+                try res.fact("window", wid);
+                try res.fact("frame_at_match", frame);
+                try res.textf(
+                    "matched \"{s}\" after {d}ms — log line {d}{s}; window {d} is at frame {d}, so screenshot_app min_frame:{d} guarantees pixels committed after this line",
+                    .{ pat, elapsed, l.id, if (l.marker) " [marker]" else "", wid, frame, frame },
                 );
+                try res.textf("--- line ---\n{s}", .{l.text});
                 if (argBool(args, "screenshot") and wid != 0) {
                     if (app.screenshotPng(wid, 1568, null, 1)) |shot| {
                         defer mcp.app_state.allocator.free(shot.png);
-                        const caption = try screenshotCaption(arena, app, wid, shot, head);
-                        if (imageResult(arena, caption, shot.png)) |res| return res;
+                        try addShotFacts(&res, arena, app, wid, shot);
+                        return res.finishWithImages(&.{shot.png}, null);
                     } else |_| {}
                 }
-                return toolResult(arena, head, false) orelse error.OutOfMemory;
+                return res.finish();
             }
             // Follow forward: the next fetch starts past everything
             // seen, so a long-running wait costs one small round trip
@@ -1037,44 +1292,59 @@ fn waitLog(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) !
         }
         if (app.exited or app.presentationGone()) {
             _ = probeAppStop(app, 500);
-            const summary = try appSummary(arena, app);
-            const msg = try std.fmt.allocPrint(
+            return appStateErr(arena, app, .conflict, try std.fmt.allocPrint(
                 arena,
-                "the app exited before any log line matched \"{s}\" ({d} line(s) scanned in {d}ms)\n{s}",
-                .{ pat, scanned, monoMs() - t0, summary },
-            );
-            return toolResult(arena, msg, true) orelse error.OutOfMemory;
+                "the app exited before any log line matched \"{s}\" ({d} line(s) scanned in {d}ms)",
+                .{ pat, scanned, monoMs() - t0 },
+            ));
         }
         if (Watchdog.fired.load(.acquire))
-            return appErr(arena, "app_wait_log aborted by the MCP hard timeout");
+            return errRes(arena, .timeout, "app_wait_log aborted by the MCP hard timeout");
         if (monoMs() >= deadline) break;
         // Pumped sleep: keeps frames/exit flowing while we wait.
         _ = app.pumpOnce(200);
     }
-    const msg = try std.fmt.allocPrint(
+    return errRes(arena, .timeout, try std.fmt.allocPrint(
         arena,
         "no log line matched \"{s}\" within {d}ms ({d} line(s) scanned, newest id {d}). The app is still running — re-run with from_id:{d} to continue from here.",
         .{ pat, timeout_ms, scanned, newest, newest },
-    );
-    return toolResult(arena, msg, true) orelse error.OutOfMemory;
+    ));
 }
+
+/// One executed step, as the result's `steps` array reports it.
+const StepOutcome = struct {
+    step: usize,
+    ok: bool,
+    /// The step's own transcript line, without its "step N: " prefix.
+    note: []const u8,
+};
 
 /// Execute an ordered batch of action steps against `app` — the
 /// app_actions vocabulary, shared with macro replay (app_macro_run).
-/// `record` journals each successful step for app_macro_save; `intro`
-/// is written ahead of the per-step report.
+/// `record` journals each successful step for app_macro_save; `macro`
+/// names the replayed macro (null = a direct app_actions call).
+///
+/// A step FAILURE is not a tool error: the batch ran, and `status`
+/// ("completed" / "failed" / "app_exited") is the machine truth beside
+/// the step transcript in the text lane.
 pub fn runActionSteps(
     arena: std.mem.Allocator,
     app: *appdrive.App,
     steps: []const std.json.Value,
     win_arg: ?u32,
     record: bool,
-    intro: []const u8,
+    macro: ?[]const u8,
 ) ![]const u8 {
     const MAX_SHOTS = 8;
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
+    var outcomes: std.ArrayList(StepOutcome) = .empty;
+    defer outcomes.deinit(arena);
+    // Where in the transcript the CURRENT step's line begins, so an
+    // outcome's note is the exact text that step produced.
+    var cur_step: usize = 0;
+    var cur_start: usize = 0;
     var pngs: std.ArrayList([]const u8) = .empty;
     defer {
         for (pngs.items) |p| mcp.app_state.allocator.free(p);
@@ -1091,9 +1361,11 @@ pub fn runActionSteps(
     // one annotated image, each labelled with its step number.
     var pending_marks: std.ArrayList(marks_mod.Mark) = .empty;
     defer pending_marks.deinit(arena);
-    if (intro.len > 0) try w.writeAll(intro);
+    if (macro) |mname| try w.print("replaying macro \"{s}\" ({d} steps)\n", .{ mname, steps.len });
     for (steps, 0..) |st, idx| {
         const n = idx + 1;
+        cur_step = n;
+        cur_start = aw.written().len;
         if (probeAppStop(app, 1_000)) |stop| {
             try reportActionStop(arena, w, n, "the batch", stop);
             app_stop = stop;
@@ -1343,6 +1615,7 @@ pub fn runActionSteps(
             }
             if (pngs.items.len >= MAX_SHOTS) {
                 try w.print("step {d}: screenshot SKIPPED (max {d} per call)\n", .{ n, MAX_SHOTS });
+                try outcomes.append(arena, stepOutcome(cur_step, true, aw.written()[cur_start..]));
                 continue;
             }
             var max_px: u32 = 1568;
@@ -1366,6 +1639,7 @@ pub fn runActionSteps(
                 stopped = true;
                 break;
             }
+            try outcomes.append(arena, stepOutcome(cur_step, true, aw.written()[cur_start..]));
             continue;
         } else if (st.object.get("wait_image") != null or st.object.get("click_image") != null) {
             const is_wait = st.object.get("wait_image") != null;
@@ -1543,6 +1817,7 @@ pub fn runActionSteps(
                 }
             }
         }
+        try outcomes.append(arena, stepOutcome(cur_step, true, aw.written()[cur_start..]));
         // Journal the step VERBATIM once it succeeded (pure
         // screenshot steps `continue`d above and are not steps a
         // macro needs to repeat).
@@ -1552,6 +1827,10 @@ pub fn runActionSteps(
             Journal.record(appIdOf(app), jw.written());
         }
     }
+    // The step that stopped the batch produced the last transcript
+    // line; record it as the failing outcome.
+    if (stopped and cur_step != 0)
+        try outcomes.append(arena, stepOutcome(cur_step, false, aw.written()[cur_start..]));
     // `mark` without any screenshot still yields an image: capture
     // the final state with the leftover marks drawn in.
     if (!stopped and pending_marks.items.len > 0 and pngs.items.len < MAX_SHOTS) {
@@ -1560,18 +1839,50 @@ pub fn runActionSteps(
             _ = try actionsCapture(arena, app, w, &pngs, &shot_tags, &pending_marks, wid, 1568, "end of batch");
     }
     if (!stopped) try w.print("all {d} steps completed\n", .{steps.len});
-    if (app_stop != null or app.exited or app.presentationGone()) try w.writeAll(try appSummary(arena, app));
-    const base = if (pngs.items.len > 0)
-        imagesResultTagged(arena, aw.written(), pngs.items, shot_tags.items) orelse return error.OutOfMemory
-    else
-        toolResult(arena, aw.written(), false) orelse return error.OutOfMemory;
-    const status: ActionStatus = if (app_stop) |stop|
-        .{ .app_exited = .{ .step = stop_step, .stop = stop } }
-    else if (stopped)
-        .failed
-    else
-        .completed;
-    return withActionStatus(arena, base, status) orelse error.OutOfMemory;
+
+    var res = Res.init(arena);
+    if (macro) |mname| try res.fact("macro", mname);
+    // The batch RAN: a failed step is a fact, never a tool error.
+    const status: []const u8 = if (app_stop != null) "app_exited" else if (stopped) "failed" else "completed";
+    try res.fact("status", status);
+    try res.textf("{s}: {d} of {d} step(s) ran", .{ status, outcomes.items.len, steps.len });
+    try res.fact("steps_total", steps.len);
+    try res.fact("steps_run", outcomes.items.len);
+    if (stopped) {
+        try res.fact("step", if (app_stop != null) stop_step else cur_step);
+        try res.fact("remaining_steps_skipped", true);
+    }
+    if (app_stop) |stop| {
+        try res.fact("reason", stop.reasonName());
+        if (stop.exit_status) |code| try res.fact("exit_status", code);
+        if (stop.signal) |sig| {
+            try res.fact("signal", sig);
+            try res.fact("signal_name", mcp.signalName(sig));
+        }
+    } else if (stopped and outcomes.items.len > 0) {
+        try res.fact("reason", outcomes.items[outcomes.items.len - 1].note);
+    }
+    try res.fact("steps", outcomes.items);
+    if (pngs.items.len > 0) try res.fact("screenshots", pngs.items.len);
+    if (app_stop != null or app.exited or app.presentationGone())
+        try res.text(try appSummaryText(arena, app));
+    try res.textf("--- steps ---\n{s}", .{std.mem.trimEnd(u8, aw.written(), "\n")});
+    if (pngs.items.len > 0) return res.finishWithImages(pngs.items, shot_tags.items);
+    return res.finish();
+}
+
+/// One outcome from a step's transcript slice: the "step N: " prefix
+/// and the trailing newline belong to the transcript, not to the fact.
+fn stepOutcome(step: usize, ok: bool, line: []const u8) StepOutcome {
+    var note = std.mem.trimEnd(u8, line, "\n");
+    if (std.mem.indexOf(u8, note, ": ")) |at| {
+        if (std.mem.startsWith(u8, note, "step ")) note = note[at + 2 ..];
+    }
+    // "ERROR" is what the transcript shouts; `ok` already carries it.
+    for ([_][]const u8{ "ERROR — ", "ERROR - " }) |prefix| {
+        if (std.mem.startsWith(u8, note, prefix)) note = note[prefix.len ..];
+    }
+    return .{ .step = step, .ok = ok, .note = note };
 }
 
 /// Continuation of appTool (split around the step engine so
@@ -1583,17 +1894,24 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         const has_abs = argFloat(args, "x") != null and argFloat(args, "y") != null;
         const has_rel = argFloat(args, "dx") != null or argFloat(args, "dy") != null;
         if (has_abs and has_rel)
-            return appErr(arena, "pass x/y (absolute) OR dx/dy (relative), not both");
+            return errRes(arena, .invalid_args, "pass x/y (absolute) OR dx/dy (relative), not both");
+        var res = Res.init(arena);
         var pos: appdrive.App.PtrPos = undefined;
         if (has_abs) {
+            try res.fact("mode", "absolute");
             pos = app.moveMouse(win, argFloat(args, "x").?, argFloat(args, "y").?) catch
-                return appErr(arena, "move failed (bad window?)");
+                return errRes(arena, .not_found, "move failed (bad window?)");
         } else if (has_rel) {
+            try res.fact("mode", "relative");
             pos = app.moveMouseRel(win, argFloat(args, "dx") orelse 0, argFloat(args, "dy") orelse 0) catch
-                return appErr(arena, "move failed (bad window?)");
+                return errRes(arena, .not_found, "move failed (bad window?)");
         } else {
-            pos = app.pointerPos() orelse
-                return toolResult(arena, "no pointer position tracked yet (nothing moved/clicked in this app)", false) orelse error.OutOfMemory;
+            try res.fact("mode", "query");
+            pos = app.pointerPos() orelse {
+                try res.fact("tracked", false);
+                try res.text("no pointer position tracked yet (nothing moved/clicked in this app)");
+                return res.finish();
+            };
         }
         if (has_abs or has_rel) _ = app.waitIdle(100, 1_000);
         if (has_abs) {
@@ -1601,77 +1919,93 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         } else if (has_rel) {
             journalStep(app, "{{\"move_rel\":[{d:.0},{d:.0}]}}", .{ argFloat(args, "dx") orelse 0, argFloat(args, "dy") orelse 0 });
         }
-        const msg = try std.fmt.allocPrint(arena, "{{\"window\":{d},\"x\":{d:.0},\"y\":{d:.0}}}", .{ pos.win, pos.x, pos.y });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        try res.fact("tracked", true);
+        try res.fact("window", pos.win);
+        try res.fact("x", pos.x);
+        try res.fact("y", pos.y);
+        try res.textf("pointer at ({d:.0},{d:.0}) in window {d}", .{ pos.x, pos.y, pos.win });
+        return res.finish();
     }
     if (eql(u8, name, "app_perform_action")) {
         const elem_id = argStr(args, "element") orelse
-            return appErr(arena, "app_perform_action requires 'element' (an id from app_a11y_tree)");
+            return errRes(arena, .invalid_args, "app_perform_action requires 'element' (an id from app_a11y_tree)");
         const index: i64 = argInt(args, "index") orelse 0;
         const payload = try std.fmt.allocPrint(arena, "{{\"op\":\"action\",\"id\":{f},\"index\":{d}}}", .{
             std.json.fmt(elem_id, .{}),
             index,
         });
         const reply = app.a11yOp(payload, argInt(args, "timeout_ms") orelse 5_000) catch
-            return appErr(arena, "a11y action failed (daemon unreachable?)");
+            return errRes(arena, .unavailable, "a11y action failed (daemon unreachable?)");
         defer mcp.app_state.allocator.free(reply);
         if (std.mem.indexOf(u8, reply, "\"ok\"") == null)
-            return appErr(arena, try arena.dupe(u8, reply));
+            return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "the accessibility layer refused the action: {s}", .{reply}));
         _ = app.waitIdle(200, 2_000);
-        return toolResult(arena, "action performed", false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("element", elem_id);
+        try res.fact("index", index);
+        try res.fact("performed", true);
+        try res.textf("performed action {d} on {s}", .{ index, elem_id });
+        return res.finish();
     }
     if (eql(u8, name, "app_set_value")) {
         const elem_id = argStr(args, "element") orelse
-            return appErr(arena, "app_set_value requires 'element' (an id from app_a11y_tree)");
+            return errRes(arena, .invalid_args, "app_set_value requires 'element' (an id from app_a11y_tree)");
         var payload: []const u8 = undefined;
+        var kind: []const u8 = "text";
         if (argStr(args, "text")) |text| {
             payload = try std.fmt.allocPrint(arena, "{{\"op\":\"set_text\",\"id\":{f},\"text\":{f}}}", .{
                 std.json.fmt(elem_id, .{}),
                 std.json.fmt(text, .{}),
             });
         } else if (args == .object and args.object.get("value") != null) {
+            kind = "value";
             const v = args.object.get("value").?;
             const num: f64 = switch (v) {
                 .integer => |iv| @floatFromInt(iv),
                 .float => |fl| fl,
-                else => return appErr(arena, "'value' must be a number"),
+                else => return errRes(arena, .invalid_args, "'value' must be a number"),
             };
             payload = try std.fmt.allocPrint(arena, "{{\"op\":\"set_value\",\"id\":{f},\"value\":{d}}}", .{
                 std.json.fmt(elem_id, .{}),
                 num,
             });
-        } else return appErr(arena, "app_set_value requires 'text' (text fields) or 'value' (sliders/spinners)");
+        } else return errRes(arena, .invalid_args, "app_set_value requires 'text' (text fields) or 'value' (sliders/spinners)");
         const reply = app.a11yOp(payload, argInt(args, "timeout_ms") orelse 5_000) catch
-            return appErr(arena, "a11y set failed (daemon unreachable?)");
+            return errRes(arena, .unavailable, "a11y set failed (daemon unreachable?)");
         defer mcp.app_state.allocator.free(reply);
         if (std.mem.indexOf(u8, reply, "\"ok\"") == null)
-            return appErr(arena, try arena.dupe(u8, reply));
+            return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "the accessibility layer refused the write: {s}", .{reply}));
         _ = app.waitIdle(200, 2_000);
-        return toolResult(arena, "value set", false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("element", elem_id);
+        try res.fact("kind", kind);
+        try res.fact("set", true);
+        try res.textf("set the {s} of {s}", .{ kind, elem_id });
+        return res.finish();
     }
     if (eql(u8, name, "app_wait_for_element")) {
         const role: ?i64 = argInt(args, "role");
         const name_sub = argStr(args, "name");
         if (role == null and name_sub == null)
-            return appErr(arena, "app_wait_for_element requires 'role' and/or 'name'");
+            return errRes(arena, .invalid_args, "app_wait_for_element requires 'role' and/or 'name'");
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, mcp.WAIT_CAP_MS);
         const deadline = monoMs() + timeout_ms;
         while (true) {
             switch (a11yFetch(arena, app, 5_000)) {
                 .tree => |t| if (a11yFindMatch(t, role, name_sub)) |node| {
-                    const summary = try a11yNodeSummary(arena, node);
-                    return toolResult(arena, summary, false) orelse error.OutOfMemory;
+                    var res = Res.init(arena);
+                    try res.fact("found", true);
+                    try res.raw("element", try a11yNodeSummary(arena, node));
+                    try res.text(try a11yNodeLine(arena, node));
+                    return res.finish();
                 },
                 .err => {}, // tree not up yet — keep polling
             }
             app.drain();
-            if (app.exited) {
-                const summary = try appSummary(arena, app);
-                const msg = try std.fmt.allocPrint(arena, "the app exited while waiting for an element\n{s}", .{summary});
-                return toolResult(arena, msg, true) orelse error.OutOfMemory;
-            }
+            if (app.exited)
+                return appStateErr(arena, app, .conflict, "the app exited while waiting for an element");
             if (Watchdog.fired.load(.acquire))
-                return appErr(arena, "element wait aborted by the MCP hard timeout");
+                return errRes(arena, .timeout, "element wait aborted by the MCP hard timeout");
             if (monoMs() >= deadline) {
                 // Distinguish "not there yet" from "this app has no
                 // accessible tree at all" — the second never resolves,
@@ -1680,74 +2014,89 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
                     defer mcp.app_state.allocator.free(raw);
                     const copy = try arena.dupe(u8, raw);
                     if (mcp.a11yTreeIsBare(arena, copy))
-                        return appErr(arena, "this app publishes NO accessibility tree at all (only the desktop registry is on the bus), so no element will ever appear here — raw SDL/OpenGL/framebuffer apps and games have no toolkit to publish one. Drive it with screenshot_app + app_click, or app_wait_image with a saved template.");
+                        return errRes(arena, .unavailable, "this app publishes NO accessibility tree at all (only the desktop registry is on the bus), so no element will ever appear here — raw SDL/OpenGL/framebuffer apps and games have no toolkit to publish one. Drive it with screenshot_app + app_click, or app_wait_image with a saved template.");
                 } else |_| {}
-                return appErr(arena, "element did not appear before the timeout");
+                return errRes(arena, .timeout, "element did not appear before the timeout");
             }
             var ts = c.struct_timespec{ .tv_sec = 0, .tv_nsec = 300 * 1000 * 1000 };
             _ = c.nanosleep(&ts, null);
         }
     }
     if (eql(u8, name, "app_type")) {
-        const text = argStr(args, "text") orelse return appErr(arena, "app_type requires 'text'");
+        const text = argStr(args, "text") orelse return errRes(arena, .invalid_args, "app_type requires 'text'");
         const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
         const wait_win: u32 = win orelse firstToplevelId(app);
         var piw = PostInputWait.begin(args, app, wait_win, argBool(args, "screenshot"));
-        app.typeText(win, text) catch |err| return appErr(arena, switch (err) {
-            appdrive.Error.BadKey => "text contains a character outside the us keymap",
-            else => "type failed (no window?)",
-        });
+        app.typeText(win, text) catch |err| switch (err) {
+            appdrive.Error.BadKey => return errRes(arena, .invalid_args, "text contains a character outside the us keymap"),
+            else => return errRes(arena, .not_found, "type failed (no window?)"),
+        };
         journalStepJson(app, arena, "type", text, "");
+        var res = Res.init(arena);
+        try res.fact("chars", text.len);
         const desc = try std.fmt.allocPrint(arena, "typed {d} chars", .{text.len});
-        return inputResult(arena, app, args, wait_win, &piw, desc);
+        return inputResult(arena, app, args, wait_win, &piw, desc, &res);
     }
     if (eql(u8, name, "app_key")) {
-        const keys = argStr(args, "keys") orelse return appErr(arena, "app_key requires 'keys'");
+        const keys = argStr(args, "keys") orelse return errRes(arena, .invalid_args, "app_key requires 'keys'");
         const win: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
         const wait_win: u32 = win orelse firstToplevelId(app);
         const hold_ms: i64 = std.math.clamp(argInt(args, "hold_ms") orelse 0, 0, 10_000);
         var piw = PostInputWait.begin(args, app, wait_win, argBool(args, "screenshot"));
         var it = std.mem.tokenizeScalar(u8, keys, ' ');
         while (it.next()) |spec| {
-            app.pressKeyHold(win, spec, hold_ms) catch |err| return appErr(arena, switch (err) {
-                appdrive.Error.BadKey => "unknown key chord",
-                else => "key press failed (no window?)",
-            });
+            app.pressKeyHold(win, spec, hold_ms) catch |err| switch (err) {
+                appdrive.Error.BadKey => return errRes(arena, .invalid_args, "unknown key chord"),
+                else => return errRes(arena, .not_found, "key press failed (no window?)"),
+            };
         }
         const extra: []const u8 = if (hold_ms > 0)
             try std.fmt.allocPrint(arena, ",\"hold_ms\":{d}", .{hold_ms})
         else
             "";
         journalStepJson(app, arena, "key", keys, extra);
+        var res = Res.init(arena);
+        try res.fact("keys", keys);
+        try res.fact("hold_ms", hold_ms);
         const desc = if (hold_ms > 0)
             try std.fmt.allocPrint(arena, "pressed (each held {d}ms): {s}", .{ hold_ms, keys })
         else
             try std.fmt.allocPrint(arena, "pressed: {s}", .{keys});
-        return inputResult(arena, app, args, wait_win, &piw, desc);
+        return inputResult(arena, app, args, wait_win, &piw, desc, &res);
     }
     if (eql(u8, name, "app_scroll")) {
         const win_id: u32 = @intCast(argInt(args, "window") orelse
-            return appErr(arena, "app_scroll requires 'window'"));
+            return errRes(arena, .invalid_args, "app_scroll requires 'window'"));
         const x = argInt(args, "x") orelse 10;
         const y = argInt(args, "y") orelse 10;
         const dx = argInt(args, "dx") orelse 0;
         const dy = argInt(args, "dy") orelse 0;
         var piw = PostInputWait.begin(args, app, win_id, argBool(args, "screenshot"));
         app.scroll(win_id, @floatFromInt(x), @floatFromInt(y), @floatFromInt(dx), @floatFromInt(dy)) catch
-            return appErr(arena, "scroll failed (bad window?)");
+            return errRes(arena, .not_found, "scroll failed (bad window?)");
         journalStep(app, "{{\"scroll\":[{d},{d}],\"at\":[{d},{d}],\"window\":{d}}}", .{ dx, dy, x, y, win_id });
+        var res = Res.init(arena);
+        try res.fact("dx", dx);
+        try res.fact("dy", dy);
+        try res.fact("x", x);
+        try res.fact("y", y);
         const desc = try std.fmt.allocPrint(arena, "scrolled ({d},{d}) at ({d},{d})", .{ dx, dy, x, y });
-        return inputResult(arena, app, args, win_id, &piw, desc);
+        return inputResult(arena, app, args, win_id, &piw, desc, &res);
     }
     if (eql(u8, name, "app_resize")) {
         const win_id: u32 = @intCast(argInt(args, "window") orelse
-            return appErr(arena, "app_resize requires 'window'"));
-        const w = argInt(args, "w") orelse return appErr(arena, "app_resize requires 'w'");
-        const h = argInt(args, "h") orelse return appErr(arena, "app_resize requires 'h'");
+            return errRes(arena, .invalid_args, "app_resize requires 'window'"));
+        const w = argInt(args, "w") orelse return errRes(arena, .invalid_args, "app_resize requires 'w'");
+        const h = argInt(args, "h") orelse return errRes(arena, .invalid_args, "app_resize requires 'h'");
         app.resizeWindow(win_id, @intCast(w), @intCast(h)) catch
-            return appErr(arena, "resize failed (bad window?)");
+            return errRes(arena, .not_found, "resize failed (bad window?)");
         _ = app.waitIdle(300, 3_000);
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("window", win_id);
+        try res.fact("w", w);
+        try res.fact("h", h);
+        try res.textf("asked window {d} to resize to {d}x{d} (the app decides)", .{ win_id, w, h });
+        return res.finish();
     }
     if (eql(u8, name, "app_wait")) {
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
@@ -1762,14 +2111,19 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         // frames)" identically to a wedged one.
         const frames_before = app.frameCount(wid);
         const t0 = monoMs();
+        var res = Res.init(arena);
         var outcome: []const u8 = undefined;
+        var mode: []const u8 = "idle";
+        var settled_ok = false;
         if (argInt(args, "min_frames")) |mf| {
             // Liveness by COMMIT COUNT: the only wait that means
             // anything on an app which never visually quiesces, and the
             // honest opposite of settling on a static frame.
+            mode = "min_frames";
             const want: u64 = @intCast(@max(mf, 1));
-            if (wid == 0) return appErr(arena, "no rendered window yet (min_frames needs one)");
+            if (wid == 0) return errRes(arena, .not_found, "no rendered window yet (min_frames needs one)");
             if (app.waitFrameAfter(wid, frames_before + want - 1, timeout_ms)) {
+                settled_ok = true;
                 outcome = try std.fmt.allocPrint(arena, "committed {d} new frame(s) within {d}ms", .{ want, monoMs() - t0 });
             } else {
                 // Falling short is USUALLY arithmetic, not a fault: an
@@ -1786,15 +2140,18 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             // Visual quiescence: frames may keep committing (a game
             // always renders) — settle when they stop CHANGING much.
             // A region scopes the percentage to that rect.
-            if (wid == 0) return appErr(arena, "no rendered window yet (change_pct needs one)");
-            outcome = if (app.waitVisualSettle(wid, quiet_ms, timeout_ms, pct, regionFrom(args)))
+            mode = "visual_settle";
+            if (wid == 0) return errRes(arena, .not_found, "no rendered window yet (change_pct needs one)");
+            settled_ok = app.waitVisualSettle(wid, quiet_ms, timeout_ms, pct, regionFrom(args));
+            outcome = if (settled_ok)
                 try std.fmt.allocPrint(arena, "settled (frames changed <{d:.1}% of pixels for {d}ms)", .{ pct, quiet_ms })
             else
                 // NOT an error: for a game or a video this is the
                 // expected steady state, so it must not read as failure.
                 try std.fmt.allocPrint(arena, "ALIVE AND ANIMATING, never quiesced: frames kept changing >{d:.1}% of pixels for the whole {d}ms. This is the normal state for a game/video and is not a failure — to synchronise on something real, wait on the app's own log (app_wait_log) or on a frame count (min_frames)", .{ pct, timeout_ms });
         } else {
-            outcome = if (app.waitIdle(quiet_ms, timeout_ms))
+            settled_ok = app.waitIdle(quiet_ms, timeout_ms);
+            outcome = if (settled_ok)
                 try std.fmt.allocPrint(arena, "settled (no new frames for {d}ms). NOTE: no commits is not the same as no work — an app busy inside its draw path, or one showing a static splash, settles here instantly; use min_frames for liveness", .{quiet_ms})
             else
                 "ALIVE AND RENDERING, never quiesced: new frames kept arriving for the whole timeout. This is normal for a continuously-animating app, not a failure — pass change_pct (e.g. 2) for VISUAL quiescence, min_frames for liveness, or app_wait_log to synchronise on an actual event";
@@ -1803,47 +2160,63 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         // The settle waits return "settled" on exit — say what really
         // happened, with the signal, instead of a bogus quiet verdict.
         if (app.exited) {
+            settled_ok = false;
             outcome = if (was_exited)
                 "the app has already exited (details below)"
             else
                 try std.fmt.allocPrint(arena, "app EXITED during the wait (status {d}{s}) — backtrace/report in app_log", .{ app.exit_status, try exitSuffix(arena, app.exit_status) });
         }
-        const summary = try appSummary(arena, app);
-        const msg = try std.fmt.allocPrint(arena, "{s}\nobserved: window {d} committed {d} frame(s) during the {d}ms wait (now at frame {d})\n{s}", .{
-            outcome, wid, delta, monoMs() - t0, app.frameCount(wid), summary,
+        try res.fact("window", wid);
+        try res.fact("mode", mode);
+        try res.fact("settled", settled_ok);
+        try res.fact("frames_before", frames_before);
+        try res.fact("frames_committed", delta);
+        try res.fact("frame_now", app.frameCount(wid));
+        try res.fact("waited_ms", monoMs() - t0);
+        try res.text(outcome);
+        try res.textf("observed: window {d} committed {d} frame(s) during the {d}ms wait (now at frame {d})", .{
+            wid, delta, monoMs() - t0, app.frameCount(wid),
         });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        try addAppSummary(&res, arena, app);
+        return res.finish();
     }
     if (eql(u8, name, "app_watch")) return appWatch(arena, app, args);
     if (eql(u8, name, "app_hover_map")) return hoverMap(arena, app, args);
     if (eql(u8, name, "app_backtrace")) return appBacktrace(arena, app, args);
     if (eql(u8, name, "app_a11y_tree")) {
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 5_000, 0, mcp.WAIT_CAP_MS);
-        const tree = app.a11yTree(timeout_ms) catch |err| return appErr(arena, switch (err) {
-            appdrive.Error.Timeout => "timed out reading the accessibility tree",
-            else => "accessibility read failed",
-        });
+        const tree = app.a11yTree(timeout_ms) catch |err| switch (err) {
+            appdrive.Error.Timeout => return errRes(arena, .timeout, "timed out reading the accessibility tree"),
+            else => return errRes(arena, .unavailable, "accessibility read failed"),
+        };
         defer mcp.app_state.allocator.free(tree);
         const copy = try arena.dupe(u8, tree);
+        var res = Res.init(arena);
+        const bare = mcp.a11yTreeIsBare(arena, copy);
+        try res.fact("bare", bare);
+        try res.raw("tree", copy);
         // "The app published nothing" and "you asked too early" look
         // identical in the raw JSON — both are a registry root with a
         // couple of desktop services under it. Say which one it is:
         // steering the caller toward the coordinate-free path when that
         // path does not exist for this app costs whole turns.
-        if (mcp.a11yTreeIsBare(arena, copy)) {
-            const msg = try std.fmt.allocPrint(arena,
-                \\NO ACCESSIBLE TREE: this app publishes no widgets on the a11y bus — the tree holds only the desktop registry and background services, with nothing below them. Raw SDL / OpenGL / framebuffer apps and games have no toolkit to publish one, so this will not appear later and waiting longer will not help. app_perform_action and app_set_value cannot drive this app; use screenshot_app + app_click coordinates instead, and app_template_save / app_find_image / app_wait_image to locate elements without hardcoding pixels. (If the app IS a GTK/Qt program, it may still be starting: retry once after app_wait.)
-                \\{s}
-            , .{copy});
-            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        if (bare) {
+            try res.text("NO ACCESSIBLE TREE: this app publishes no widgets on the a11y bus — the tree holds only the desktop registry and background services, with nothing below them. Raw SDL / OpenGL / framebuffer apps and games have no toolkit to publish one, so this will not appear later and waiting longer will not help. app_perform_action and app_set_value cannot drive this app; use screenshot_app + app_click coordinates instead, and app_template_save / app_find_image / app_wait_image to locate elements without hardcoding pixels. (If the app IS a GTK/Qt program, it may still be starting: retry once after app_wait.)");
+            return res.finish();
         }
-        // Prepend the AT-SPI role legend so the assistant can read
-        // numeric roles without a lookup.
-        const msg = try std.fmt.allocPrint(arena,
-            \\AT-SPI tree. Each node has an "id" — pass it to app_perform_action (press/activate/toggle a widget) or app_set_value (write a text field/slider) to drive the app WITHOUT coordinates; that is the reliable path. Roles (common): 8 checkbox, 14 dialog/frame, 18 filler, 25 label, 28 menu, 29 menubar, 30 menuitem, 34 canvas, 35 page-tab, 37 panel, 42 push-button, 43 radiobutton, 44 root/desktop, 46 scrollbar, 60 table, 62 text, 71 toolbar, 74 tree, 75 application, 84 entry. Note: "rect" is unreliable for headless apps (no screen position), so prefer perform_action/set_value over pixel clicks.
-            \\{s}
-        , .{copy});
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        // An indented outline, not the raw JSON: the ids and roles a
+        // caller acts on, one node per line. The full tree stays in
+        // structuredContent for anything that wants every attribute.
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, copy, .{}) catch
+            return appErr(arena, "malformed accessibility reply");
+        try res.text("AT-SPI tree. Each node's id drives app_perform_action (press/activate/toggle) or app_set_value (write a text field/slider) WITHOUT coordinates; that is the reliable path. Roles (common): 8 checkbox, 14 dialog/frame, 18 filler, 25 label, 28 menu, 29 menubar, 30 menuitem, 34 canvas, 35 page-tab, 37 panel, 42 push-button, 43 radiobutton, 44 root/desktop, 46 scrollbar, 60 table, 62 text, 71 toolbar, 74 tree, 75 application, 84 entry. rect is unreliable for headless apps (no screen position), so prefer perform_action/set_value over pixel clicks.");
+        var ow: std.Io.Writer.Allocating = .init(arena);
+        try ow.writer.writeAll("--- tree ---");
+        if (parsed == .object) {
+            if (parsed.object.get("tree")) |root| try a11yOutline(arena, &ow.writer, root, 0);
+        }
+        try res.text(ow.written());
+        return res.finish();
     }
     if (eql(u8, name, "app_record_start")) {
         var win_id: u32 = 0;
@@ -1852,64 +2225,72 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         } else {
             win_id = firstToplevelId(app);
         }
-        if (win_id == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        if (win_id == 0) return errRes(arena, .not_found, "no rendered window yet (try app_wait first)");
         // WebM/VP9 is the default (smaller, higher quality); format:"gif"
         // for the animated GIF.
         const want_gif = if (argStr(args, "format")) |fmt| std.mem.eql(u8, fmt, "gif") else false;
         const max_px: u32 = @intCast(std.math.clamp(argInt(args, "max_px") orelse (if (want_gif) @as(i64, 800) else 1280), 0, 4096));
         const fps: u32 = @intCast(std.math.clamp(argInt(args, "fps") orelse 0, 0, 60));
-        app.recordStart(win_id, max_px, !want_gif, fps) catch return appErr(arena, "no such window");
-        return toolResult(arena, "recording — frames are captured while other app tools run (click/type/wait); call app_record_stop to finish", false) orelse error.OutOfMemory;
+        app.recordStart(win_id, max_px, !want_gif, fps) catch return errRes(arena, .not_found, "no such window");
+        var res = Res.init(arena);
+        try res.fact("window", win_id);
+        try res.fact("format", if (want_gif) "gif" else "webm");
+        try res.fact("max_px", max_px);
+        try res.fact("fps", fps);
+        try res.fact("recording", true);
+        try res.text("recording — frames are captured while other app tools run (click/type/wait); call app_record_stop to finish");
+        return res.finish();
     }
     if (eql(u8, name, "app_record_stop")) {
-        const result = app.recordStop() catch |err| return appErr(arena, switch (err) {
-            appdrive.Error.NotRecording => "no recording in progress (app_record_start first)",
-            else => "recording produced no frames",
-        });
+        const result = app.recordStop() catch |err| switch (err) {
+            appdrive.Error.NotRecording => return errRes(arena, .conflict, "no recording in progress (app_record_start first)"),
+            else => return errRes(arena, .conflict, "recording produced no frames"),
+        };
         defer mcp.app_state.allocator.free(result.data);
         var ts: c.struct_timespec = undefined;
         _ = c.clock_gettime(c.CLOCK_REALTIME, &ts);
         const ext = if (result.webm) "webm" else "gif";
         const path = argStr(args, "path") orelse
             try std.fmt.allocPrint(arena, "/tmp/sketerm-rec-{d}-{d}.{s}", .{ c.getpid(), ts.tv_sec, ext });
-        saveRecording(path, result.data) catch |err| {
-            const msg = try std.fmt.allocPrint(arena, "cannot save the recording: {s}", .{@errorName(err)});
-            return appErr(arena, msg);
-        };
-        const msg = try std.fmt.allocPrint(arena, "saved {d} frames ({d} KiB {s}) to {s}", .{ result.frames, result.data.len / 1024, ext, path });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        saveRecording(path, result.data) catch |err| return errRes(
+            arena,
+            .io_failed,
+            try std.fmt.allocPrint(arena, "cannot save the recording: {s}", .{@errorName(err)}),
+        );
+        var res = Res.init(arena);
+        try res.fact("path", path);
+        try res.fact("format", ext);
+        try res.fact("frames", result.frames);
+        try res.fact("bytes", result.data.len);
+        try res.textf("saved {d} frames ({d} KiB {s}) to {s}", .{ result.frames, result.data.len / 1024, ext, path });
+        return res.finish();
     }
     if (eql(u8, name, "app_read_text")) {
         const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
-        if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        if (wid == 0) return errRes(arena, .not_found, "no rendered window yet (try app_wait first)");
         const region = regionFrom(args);
         const scale: u32 = @intCast(std.math.clamp(argInt(args, "scale") orelse 0, 0, 8));
         const psm: i32 = @intCast(std.math.clamp(argInt(args, "psm") orelse 6, 0, 13));
         const lang = argStr(args, "lang") orelse "eng";
         switch (try ocrWindow(arena, app, wid, region, scale, psm, lang)) {
-            .err => |e| return appErr(arena, e),
+            .err => |e| return ocrErr(arena, e),
             .out => |o| {
-                var aw: std.Io.Writer.Allocating = .init(arena);
-                const w = &aw.writer;
-                try w.print("{{\"window\":{d},\"ocr_scale\":{d},\"text\":", .{ wid, o.scale });
-                try std.json.Stringify.value(o.text, .{}, w);
-                try w.writeAll(",\"words\":[");
-                for (o.words, 0..) |wd, i| {
-                    if (i > 0) try w.writeAll(",");
-                    try w.print("{{\"text\":{f},\"x\":{d},\"y\":{d},\"w\":{d},\"h\":{d},\"cx\":{d},\"cy\":{d},\"conf\":{d:.0}}}", .{
-                        std.json.fmt(wd.text, .{}), wd.x,            wd.y,    wd.w, wd.h,
-                        wd.x + wd.w / 2,            wd.y + wd.h / 2, wd.conf,
-                    });
-                }
-                try w.writeAll("]}");
-                return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+                var res = Res.init(arena);
+                try res.fact("window", wid);
+                try res.fact("ocr_scale", o.scale);
+                try res.fact("words", o.words.len);
+                try res.fact("text", o.text);
+                try res.raw("boxes", try wordBoxesJson(arena, o));
+                try res.textf("OCR of window {d} at scale {d}: {d} word box(es)", .{ wid, o.scale, o.words.len });
+                try res.textf("--- ocr text ---\n{s}", .{o.text});
+                return res.finish();
             },
         }
     }
     if (eql(u8, name, "app_wait_text")) {
-        const query = argStr(args, "text") orelse return appErr(arena, "app_wait_text requires 'text'");
+        const query = argStr(args, "text") orelse return errRes(arena, .invalid_args, "app_wait_text requires 'text'");
         const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
-        if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        if (wid == 0) return errRes(arena, .not_found, "no rendered window yet (try app_wait first)");
         const region = regionFrom(args);
         const scale: u32 = @intCast(std.math.clamp(argInt(args, "scale") orelse 0, 0, 8));
         const psm: i32 = @intCast(std.math.clamp(argInt(args, "psm") orelse 6, 0, 13));
@@ -1926,7 +2307,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
                     if (std.ascii.indexOfIgnoreCase(o.text, query) != null) seen = o;
                 },
                 .err => |e| {
-                    if (!std.mem.startsWith(u8, e, "no rendered")) return appErr(arena, e);
+                    if (!std.mem.startsWith(u8, e, "no rendered")) return ocrErr(arena, e);
                 },
             }
             if (seen != null or app.exited or monoMs() >= deadline) break;
@@ -1934,19 +2315,26 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         }
         const o = seen orelse {
             const tail = if (last_text.len > 500) last_text[last_text.len - 500 ..] else last_text;
-            const msg = try std.fmt.allocPrint(arena, "text \"{s}\" not visible before timeout; last OCR read:\n{s}", .{ query, tail });
-            return toolResult(arena, msg, true) orelse error.OutOfMemory;
+            return errRes(arena, .timeout, try std.fmt.allocPrint(
+                arena,
+                "text \"{s}\" not visible before timeout; last OCR read:\n--- last ocr read ---\n{s}",
+                .{ query, tail },
+            ));
         };
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        try w.print("{{\"found\":true,\"window\":{d}", .{wid});
+        var res = Res.init(arena);
+        try res.fact("found", true);
+        try res.fact("window", wid);
+        try res.fact("text", query);
         if (findWordRun(o.words, query)) |box| {
-            try w.print(",\"match\":{{\"x\":{d},\"y\":{d},\"w\":{d},\"h\":{d},\"cx\":{d},\"cy\":{d}}}", .{
-                box.x, box.y, box.w, box.h, box.x + box.w / 2, box.y + box.h / 2,
-            });
+            try res.raw("match", try std.fmt.allocPrint(
+                arena,
+                "{{\"x\":{d},\"y\":{d},\"w\":{d},\"h\":{d},\"cx\":{d},\"cy\":{d}}}",
+                .{ box.x, box.y, box.w, box.h, box.x + box.w / 2, box.y + box.h / 2 },
+            ));
+            var clicked = false;
             if (do_click) {
                 clickTuned(app, wid, @floatFromInt(box.x + box.w / 2), @floatFromInt(box.y + box.h / 2), 1) catch
-                    return appErr(arena, "text found but the click failed (bad window?)");
+                    return errRes(arena, .not_found, "text found but the click failed (bad window?)");
                 _ = app.waitIdle(100, 1_000);
                 // Journal as a replayable wait_text step (the macro
                 // form of "wait for this label, then click it").
@@ -1958,49 +2346,64 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
                     jwr.writeAll(",\"click\":true}}") catch return error.OutOfMemory;
                     Journal.record(appIdOf(app), jw.written());
                 }
-                try w.writeAll(",\"clicked\":true");
+                clicked = true;
             }
-        } else if (do_click) {
-            try w.writeAll(",\"match\":null,\"clicked\":false,\"note\":\"text visible but OCR gave no clickable word box\"");
+            try res.fact("clicked", clicked);
+            try res.textf("\"{s}\" is visible in window {d} at ({d},{d}) {d}x{d}, centre ({d},{d}){s}", .{
+                query, wid, box.x, box.y, box.w, box.h, box.x + box.w / 2, box.y + box.h / 2,
+                if (clicked) " — clicked it" else "",
+            });
         } else {
-            try w.writeAll(",\"match\":null");
+            try res.fact("clicked", false);
+            try res.textf("\"{s}\" is visible in window {d}{s}", .{
+                query, wid,
+                if (do_click) ", but OCR gave no clickable word box for it" else "",
+            });
         }
-        try w.writeAll("}");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        return res.finish();
     }
     if (eql(u8, name, "app_find_image")) {
         const needle = switch (try resolveNeedle(arena, args)) {
             .needle => |nd| nd,
-            .err => |e| return appErr(arena, e),
+            .err => |e| return errRes(arena, .invalid_args, e),
         };
         const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
-        if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        if (wid == 0) return errRes(arena, .not_found, "no rendered window yet (try app_wait first)");
         const min_score = argFloat(args, "min_score") orelse 0.9;
         const max_matches: usize = @intCast(std.math.clamp(argInt(args, "max_matches") orelse 8, 1, 32));
         switch (try findInWindow(arena, app, wid, regionFrom(args), needle, min_score, max_matches)) {
-            .err => |e| return appErr(arena, e),
+            .err => |e| return errRes(arena, .not_found, e),
             .matches => |ms| {
+                var res = Res.init(arena);
+                try res.fact("template", needle.name);
+                try res.fact("template_w", needle.w);
+                try res.fact("template_h", needle.h);
+                try res.fact("window", wid);
+                try res.fact("count", ms.len);
+                try res.textf("template \"{s}\" ({d}x{d}): {d} match(es) in window {d}", .{
+                    needle.name, needle.w, needle.h, ms.len, wid,
+                });
                 var aw: std.Io.Writer.Allocating = .init(arena);
                 const w = &aw.writer;
-                try w.print("{{\"template\":{f},\"template_w\":{d},\"template_h\":{d},\"window\":{d},\"matches\":[", .{
-                    std.json.fmt(needle.name, .{}), needle.w, needle.h, wid,
-                });
+                try w.writeAll("[");
                 for (ms, 0..) |m, i| {
                     if (i > 0) try w.writeAll(",");
                     try w.print("{{\"x\":{d},\"y\":{d},\"cx\":{d},\"cy\":{d},\"score\":{d:.3}}}", .{ m.x, m.y, m.cx, m.cy, m.score });
+                    try res.textf("({d},{d}) centre ({d},{d}) score {d:.3}", .{ m.x, m.y, m.cx, m.cy, m.score });
                 }
-                try w.writeAll("]}");
-                return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+                try w.writeAll("]");
+                try res.raw("matches", aw.written());
+                return res.finish();
             },
         }
     }
     if (eql(u8, name, "app_wait_image")) {
         const needle = switch (try resolveNeedle(arena, args)) {
             .needle => |nd| nd,
-            .err => |e| return appErr(arena, e),
+            .err => |e| return errRes(arena, .invalid_args, e),
         };
         const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
-        if (wid == 0) return appErr(arena, "no rendered window yet (try app_wait first)");
+        if (wid == 0) return errRes(arena, .not_found, "no rendered window yet (try app_wait first)");
         const region = regionFrom(args);
         const min_score = argFloat(args, "min_score") orelse 0.9;
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, mcp.WAIT_CAP_MS);
@@ -2018,14 +2421,15 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             if (found != null or app.exited or monoMs() >= deadline) break;
             _ = app.pumpOnce(50);
         }
-        const m = found orelse {
-            const msg = try std.fmt.allocPrint(arena, "template \"{s}\" did not appear before timeout", .{needle.name});
-            return toolResult(arena, msg, true) orelse error.OutOfMemory;
-        };
+        const m = found orelse return errRes(arena, .timeout, try std.fmt.allocPrint(
+            arena,
+            "template \"{s}\" did not appear before timeout",
+            .{needle.name},
+        ));
         var clicked = false;
         if (do_click) {
             clickTuned(app, wid, @floatFromInt(m.cx), @floatFromInt(m.cy), btn) catch
-                return appErr(arena, "template matched but the click failed (bad window?)");
+                return errRes(arena, .not_found, "template matched but the click failed (bad window?)");
             _ = app.waitIdle(100, 1_000);
             clicked = true;
             // Journal as a replayable step (named templates only —
@@ -2033,34 +2437,44 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             if (!std.mem.eql(u8, needle.name, "(inline)"))
                 journalStep(app, "{{\"wait_image\":{{\"template\":\"{s}\",\"click\":true,\"min_score\":{d:.2}}}}}", .{ needle.name, min_score });
         }
-        const msg = try std.fmt.allocPrint(arena, "{{\"found\":true,\"window\":{d},\"x\":{d},\"y\":{d},\"cx\":{d},\"cy\":{d},\"score\":{d:.3},\"clicked\":{}}}", .{
-            wid, m.x, m.y, m.cx, m.cy, m.score, clicked,
+        var res = Res.init(arena);
+        try res.fact("found", true);
+        try res.fact("template", needle.name);
+        try res.fact("window", wid);
+        try res.fact("x", m.x);
+        try res.fact("y", m.y);
+        try res.fact("cx", m.cx);
+        try res.fact("cy", m.cy);
+        try res.fact("score", m.score);
+        try res.fact("clicked", clicked);
+        try res.textf("template \"{s}\" matched at ({d},{d}) centre ({d},{d}) score {d:.3} in window {d}{s}", .{
+            needle.name, m.x, m.y, m.cx, m.cy, m.score, wid,
+            if (clicked) " — clicked its centre" else "",
         });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        return res.finish();
     }
     if (eql(u8, name, "app_macro_run")) {
-        const mname = argStr(args, "name") orelse return appErr(arena, "app_macro_run requires 'name'");
-        const bytes = mcpassets.load(arena, .macro, mname) catch |err| return appErr(arena, switch (err) {
-            mcpassets.Error.NotFound => try std.fmt.allocPrint(arena, "no saved macro \"{s}\" (list with app_macros)", .{mname}),
-            mcpassets.Error.BadName => "invalid macro name",
+        const mname = argStr(args, "name") orelse return errRes(arena, .invalid_args, "app_macro_run requires 'name'");
+        const bytes = mcpassets.load(arena, .macro, mname) catch |err| switch (err) {
+            mcpassets.Error.NotFound => return errRes(arena, .not_found, try std.fmt.allocPrint(arena, "no saved macro \"{s}\" (list with app_macros)", .{mname})),
+            mcpassets.Error.BadName => return errRes(arena, .invalid_args, "invalid macro name"),
             mcpassets.Error.OutOfMemory => return error.OutOfMemory,
-            else => "macro load failed",
-        });
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch
-            return appErr(arena, "stored macro is not valid JSON");
-        if (parsed != .object) return appErr(arena, "stored macro is malformed (want {\"actions\":[...]})");
-        const av = parsed.object.get("actions") orelse return appErr(arena, "stored macro has no 'actions'");
-        if (av != .array or av.array.items.len == 0) return appErr(arena, "stored macro has no steps");
-        if (av.array.items.len > 200) return appErr(arena, "macro too long (max 200 steps)");
+            else => return errRes(arena, .io_failed, "macro load failed"),
+        };
+        const steps = macroSteps(arena, bytes) orelse
+            return appErr(arena, "the stored macro is not replayable: it needs an actions array of 1 to 200 step objects");
         const win_arg: ?u32 = if (argInt(args, "window")) |v| @intCast(v) else null;
-        const intro = try std.fmt.allocPrint(arena, "replaying macro \"{s}\" ({d} steps)\n", .{ mname, av.array.items.len });
-        return runActionSteps(arena, app, av.array.items, win_arg, false, intro);
+        return runActionSteps(arena, app, steps, win_arg, false, mname);
     }
     if (eql(u8, name, "close_app_window")) {
         const win_id: u32 = @intCast(argInt(args, "window") orelse
-            return appErr(arena, "close_app_window requires 'window'"));
-        app.closeWindow(win_id) catch return appErr(arena, "close failed (bad window?)");
-        return toolResult(arena, "close requested (the app decides)", false) orelse error.OutOfMemory;
+            return errRes(arena, .invalid_args, "close_app_window requires 'window'"));
+        app.closeWindow(win_id) catch return errRes(arena, .not_found, "close failed (bad window?)");
+        var res = Res.init(arena);
+        try res.fact("window", win_id);
+        try res.fact("close_requested", true);
+        try res.textf("asked window {d} to close (the app decides)", .{win_id});
+        return res.finish();
     }
     if (eql(u8, name, "close_app")) {
         // Idempotent: closing an already-dead app is a no-op success.
@@ -2083,7 +2497,16 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             .acknowledged => "app session killed — the daemon signalled the child's whole process group and reaped it; no descendant processes remain",
             .unconfirmed => "app session closed locally, but the daemon did not acknowledge the kill within 5s — the process MAY still be running; check with list_apps or on the daemon host",
         };
-        return toolResult(arena, msg, outcome == .unconfirmed) orelse error.OutOfMemory;
+        // An unacknowledged kill is a real failure: the process may
+        // still be running, so it stays an error result.
+        if (outcome == .unconfirmed) return errRes(arena, .timeout, msg);
+        var res = Res.init(arena);
+        try res.fact("app", id);
+        try res.fact("outcome", @tagName(outcome));
+        try res.fact("was_exited", was_exited);
+        if (was_exited) try res.fact("exit_status", status);
+        try res.text(msg);
+        return res.finish();
     }
     return mcp.errRes(arena, .unknown_tool, "unknown tool");
 }
@@ -2100,7 +2523,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
 /// measurement.
 fn appWatch(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) ![]const u8 {
     const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
-    if (wid == 0) return appErr(arena, "no rendered window yet — nothing to watch");
+    if (wid == 0) return errRes(arena, .not_found, "no rendered window yet — nothing to watch");
     const duration_ms: i64 = std.math.clamp(argInt(args, "duration_ms") orelse 10_000, 200, mcp.WAIT_CAP_MS);
     const min_pct = argFloat(args, "min_change_pct") orelse 2.0;
     const max_events: usize = @intCast(std.math.clamp(argInt(args, "max_events") orelse 16, 1, 64));
@@ -2112,52 +2535,64 @@ fn appWatch(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) 
     // replay as a burst of "changes" that happened before the watch.
     _ = app.drainLive(CATCHUP_MS);
     const frame_at_start = app.frameCount(wid);
-    var res = app.watchChanges(wid, duration_ms, min_pct, region, max_events, thumbs) catch |err|
-        return appErr(arena, switch (err) {
-            appdrive.Error.NoSuchWindow => "no such window (or it has not painted a frame yet)",
-            else => "watch failed",
-        });
-    defer res.deinit(mcp.app_state.allocator);
+    var watch = app.watchChanges(wid, duration_ms, min_pct, region, max_events, thumbs) catch |err| switch (err) {
+        appdrive.Error.NoSuchWindow => return errRes(arena, .not_found, "no such window (or it has not painted a frame yet)"),
+        else => return appErr(arena, "watch failed"),
+    };
+    defer watch.deinit(mcp.app_state.allocator);
 
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.print("watched window {d} for {d}ms{s} — it committed {d} frame(s) (frame {d} -> {d})\n", .{
+    var res = Res.init(arena);
+    try res.fact("window", wid);
+    try res.fact("elapsed_ms", watch.elapsed_ms);
+    try res.fact("frames", watch.frames);
+    try res.fact("frame_first", watch.frame_first);
+    try res.fact("frame_last", watch.frame_last);
+    try res.fact("frame_at_start", frame_at_start);
+    try res.fact("min_change_pct", min_pct);
+    try res.fact("truncated", watch.truncated);
+    try res.fact("exited_during_watch", watch.exited);
+    var ew: std.Io.Writer.Allocating = .init(arena);
+    try ew.writer.writeAll("[");
+    for (watch.events, 0..) |e, i| {
+        if (i > 0) try ew.writer.writeAll(",");
+        try ew.writer.print("{{\"at_ms\":{d},\"pct\":{d:.2},\"frame\":{d}}}", .{ e.at_ms, e.pct, e.frame });
+    }
+    try ew.writer.writeAll("]");
+    try res.raw("events", ew.written());
+
+    try res.textf("watched window {d} for {d}ms{s} — it committed {d} frame(s) (frame {d} -> {d})", .{
         wid,
-        res.elapsed_ms,
+        watch.elapsed_ms,
         if (region != null) ", change gauged inside the given region" else "",
-        res.frames,
-        res.frame_first,
-        res.frame_last,
+        watch.frames,
+        watch.frame_first,
+        watch.frame_last,
     });
-    if (res.events.len == 0) {
-        if (res.frames == 0) {
-            try w.print(
-                "NO frames at all: the window did not paint once in {d}ms. For an idle event-driven app that is normal (nothing asked it to redraw); for one that should be animating, or one you just sent input to, it is the signature of a hang — app_backtrace shows where the process is.\n",
-                .{res.elapsed_ms},
+    if (watch.events.len == 0) {
+        if (watch.frames == 0) {
+            try res.textf(
+                "NO frames at all: the window did not paint once in {d}ms. For an idle event-driven app that is normal (nothing asked it to redraw); for one that should be animating, or one you just sent input to, it is the signature of a hang — app_backtrace shows where the process is.",
+                .{watch.elapsed_ms},
             );
         } else {
-            try w.print(
-                "NO change of {d:.1}% or more happened at any point. The window IS painting, so this is a real observation and not a missed sample: the content simply never changed materially. Lower min_change_pct to catch smaller updates.\n",
+            try res.textf(
+                "NO change of {d:.1}% or more happened at any point. The window IS painting, so this is a real observation and not a missed sample: the content simply never changed materially. Lower min_change_pct to catch smaller updates.",
                 .{min_pct},
             );
         }
     } else {
-        try w.print("timeline (each entry is measured against the previous one, threshold {d:.1}%):\n", .{min_pct});
-        for (res.events, 0..) |e, i| {
-            try w.print("  [{d}] t={d}ms  changed {d:.1}% of pixels  (frame {d})\n", .{ i + 1, e.at_ms, e.pct, e.frame });
-        }
-        if (res.truncated)
-            try w.print("(timeline capped at {d} entries — more changes occurred; raise max_events or raise min_change_pct)\n", .{max_events});
-        if (res.events.len == 1) {
-            try w.print(
-                "ONE change, at t={d}ms. A screenshot taken before that moment would have shown nothing happening — that delay is the action's real latency.\n",
-                .{res.events[0].at_ms},
+        if (watch.truncated)
+            try res.textf("timeline capped at {d} entries — more changes occurred; raise max_events or raise min_change_pct", .{max_events});
+        if (watch.events.len == 1) {
+            try res.textf(
+                "ONE change, at t={d}ms. A screenshot taken before that moment would have shown nothing happening — that delay is the action's real latency.",
+                .{watch.events[0].at_ms},
             );
         }
     }
-    if (res.exited) try w.writeAll("the app EXITED during the watch (details below)\n");
-    try w.print("pass min_frame:{d} to screenshot_app for a capture provably newer than the start of this watch\n", .{frame_at_start});
-    try w.writeAll(try appSummary(arena, app));
+    if (watch.exited) try res.text("the app EXITED during the watch (details below)");
+    try res.textf("pass min_frame:{d} to screenshot_app for a capture provably newer than the start of this watch", .{frame_at_start});
+    try addAppSummary(&res, arena, app);
 
     // Thumbnails: encoded AFTER the watch, from stashed pixels, so PNG
     // encoding never perturbs the sampling it is describing.
@@ -2166,15 +2601,23 @@ fn appWatch(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) 
         for (pngs.items) |p| mcp.app_state.allocator.free(p);
         pngs.deinit(arena);
     }
-    for (res.events) |e| {
+    for (watch.events) |e| {
         if (e.px.len == 0) continue;
         const shot = app.encodePixelsPng(e.px, e.w, e.h, e.format, e.frame, max_px, region, 1, &.{}) catch continue;
         try pngs.append(arena, shot.png);
     }
-    if (pngs.items.len == 0)
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
-    try w.print("({d} thumbnail(s) below, in timeline order)", .{pngs.items.len});
-    return imagesResult(arena, aw.written(), pngs.items) orelse error.OutOfMemory;
+    if (watch.events.len > 0) {
+        var tw: std.Io.Writer.Allocating = .init(arena);
+        try tw.writer.print("--- timeline (each entry measured against the previous, threshold {d:.1}%) ---", .{min_pct});
+        for (watch.events, 0..) |e, i| {
+            try tw.writer.print("\n[{d}] t={d}ms changed {d:.1}% of pixels (frame {d})", .{ i + 1, e.at_ms, e.pct, e.frame });
+        }
+        try res.text(tw.written());
+    }
+    if (pngs.items.len == 0) return res.finish();
+    try res.fact("thumbnails", pngs.items.len);
+    try res.textf("{d} thumbnail(s) below, in timeline order", .{pngs.items.len});
+    return res.finishWithImages(pngs.items, null);
 }
 
 /// app_hover_map: sweep the pointer over a grid and report which cells
@@ -2187,21 +2630,21 @@ fn appWatch(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) 
 /// other verdict here is built on, applied to hover.
 fn hoverMap(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) ![]const u8 {
     const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
-    if (wid == 0) return appErr(arena, "no rendered window yet");
-    const dims = app.windowSize(wid) orelse return appErr(arena, "no such window (or it has not painted yet)");
+    if (wid == 0) return errRes(arena, .not_found, "no rendered window yet");
+    const dims = app.windowSize(wid) orelse return errRes(arena, .not_found, "no such window (or it has not painted yet)");
     const region: appdrive.App.Region = regionFrom(args) orelse .{
         .x = 0,
         .y = 0,
         .w = @intCast(@max(dims.w, 0)),
         .h = @intCast(@max(dims.h, 0)),
     };
-    if (region.w == 0 or region.h == 0) return appErr(arena, "empty region");
+    if (region.w == 0 or region.h == 0) return errRes(arena, .invalid_args, "empty region");
     const cols: usize = @intCast(std.math.clamp(argInt(args, "cols") orelse 12, 2, 40));
     const rows: usize = @intCast(std.math.clamp(argInt(args, "rows") orelse 9, 2, 40));
     const probes = cols * rows;
     const MAX_PROBES = 600;
     if (probes > MAX_PROBES)
-        return appErr(arena, "cols*rows exceeds 600 probes — narrow the region or use a coarser grid, then re-sweep the interesting part");
+        return errRes(arena, .invalid_args, "cols*rows exceeds 600 probes — narrow the region or use a coarser grid, then re-sweep the interesting part");
     const settle_ms: i64 = std.math.clamp(argInt(args, "settle_ms") orelse 120, 20, 2_000);
     const min_pct = argFloat(args, "min_change_pct") orelse 0.05;
     // Every probe can burn its full settle, so the worst case is the
@@ -2209,7 +2652,7 @@ fn hoverMap(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) 
     // call watchdog will cut off half-finished.
     const worst_ms = @as(i64, @intCast(probes)) * settle_ms;
     if (worst_ms > mcp.WAIT_CAP_MS) {
-        return appErr(arena, try std.fmt.allocPrint(
+        return errRes(arena, .invalid_args, try std.fmt.allocPrint(
             arena,
             "{d} probes at {d}ms each is up to {d}ms, over the {d}ms cap on a single call. Use a coarser grid, a smaller settle_ms, or sweep a region at a time.",
             .{ probes, settle_ms, worst_ms, mcp.WAIT_CAP_MS },
@@ -2223,12 +2666,12 @@ fn hoverMap(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) 
     var self_changes: usize = 0;
     var control: usize = 0;
     while (control < 3) : (control += 1) {
-        var ref = app.frameRef(wid, true) orelse return appErr(arena, "no such window");
+        var ref = app.frameRef(wid, true) orelse return errRes(arena, .not_found, "no such window");
         defer ref.deinit(mcp.app_state.allocator);
         if (app.waitChangeSince(wid, &ref, settle_ms, min_pct, null)) self_changes += 1;
     }
     if (self_changes >= 2) {
-        return appErr(arena, try std.fmt.allocPrint(
+        return errRes(arena, .conflict, try std.fmt.allocPrint(
             arena,
             "this window repaints by itself ({d} of 3 control samples changed by {d:.2}% with the pointer held still), so a hover map cannot separate the app's own animation from a hover response. Raise min_change_pct above the animation's amplitude (measure it with app_watch) or scope the sweep to a still region.",
             .{ self_changes, min_pct },
@@ -2267,28 +2710,63 @@ fn hoverMap(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) 
     }
     if (restore) |p| _ = app.moveMouse(p.win, p.x, p.y) catch {};
 
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.print("hover map of window {d} over ({d},{d}) {d}x{d}: {d}x{d} grid, {d} probes in {d}ms ({d}ms settle, threshold {d:.2}%)\n", .{
+    var res = Res.init(arena);
+    try res.fact("window", wid);
+    try res.raw("region", try std.fmt.allocPrint(arena, "{{\"x\":{d},\"y\":{d},\"w\":{d},\"h\":{d}}}", .{ region.x, region.y, region.w, region.h }));
+    try res.fact("cols", cols);
+    try res.fact("rows", rows);
+    try res.fact("probes", probes);
+    try res.fact("elapsed_ms", monoMs() - t0);
+    try res.fact("settle_ms", settle_ms);
+    try res.fact("min_change_pct", min_pct);
+    try res.fact("stopped_early", stopped);
+    try res.fact("hits", hits);
+    try res.textf("hover map of window {d} over ({d},{d}) {d}x{d}: {d}x{d} grid, {d} probes in {d}ms ({d}ms settle, threshold {d:.2}%)", .{
         wid, region.x, region.y, region.w, region.h, cols, rows, probes, monoMs() - t0, settle_ms, min_pct,
     });
-    if (stopped) try w.writeAll("the sweep STOPPED EARLY (the app exited or the window vanished) — the map below is partial\n");
+    if (stopped) try res.text("the sweep STOPPED EARLY (the app exited or the window vanished) — the map below is partial");
+
+    // The responding cells, with the surface coordinates a click wants.
+    var cw: std.Io.Writer.Allocating = .init(arena);
+    try cw.writer.writeAll("[");
+    var first_hit = true;
     r = 0;
     while (r < rows) : (r += 1) {
-        try w.writeAll("  ");
         var col: usize = 0;
         while (col < cols) : (col += 1) {
-            try w.writeByte(if (map[r * cols + col] > 0) '#' else '.');
+            const pct = map[r * cols + col];
+            if (pct <= 0) continue;
+            const px = @as(f64, @floatFromInt(region.x)) + (@as(f64, @floatFromInt(col)) + 0.5) * cell_w;
+            const py = @as(f64, @floatFromInt(region.y)) + (@as(f64, @floatFromInt(r)) + 0.5) * cell_h;
+            if (!first_hit) try cw.writer.writeAll(",");
+            first_hit = false;
+            try cw.writer.print("{{\"x\":{d},\"y\":{d},\"pct\":{d:.2}}}", .{
+                @as(i64, @intFromFloat(px)), @as(i64, @intFromFloat(py)), pct,
+            });
         }
-        try w.writeByte('\n');
     }
+    try cw.writer.writeAll("]");
+    try res.raw("cells", cw.written());
+
     if (hits == 0) {
-        try w.print(
-            "NO cell produced a repaint. This app may simply not draw hover feedback — that is common for framebuffer games, and it does NOT mean nothing there is clickable. Lower min_change_pct, or fall back to app_read_text / app_find_image.\n",
-            .{},
-        );
+        try res.text("NO cell produced a repaint. This app may simply not draw hover feedback — that is common for framebuffer games, and it does NOT mean nothing there is clickable. Lower min_change_pct, or fall back to app_read_text / app_find_image.");
     } else {
-        try w.print("{d} cell(s) responded to hover, click centres in surface coordinates:\n", .{hits});
+        try res.textf("{d} cell(s) responded to hover. A cell is one grid step wide, so the centres below are approximate — re-sweep a promising area with a region + finer grid to localise it.", .{hits});
+    }
+    try addAppSummary(&res, arena, app);
+
+    var mw: std.Io.Writer.Allocating = .init(arena);
+    try mw.writer.writeAll("--- map (# = responded to hover) ---");
+    r = 0;
+    while (r < rows) : (r += 1) {
+        try mw.writer.writeAll("\n");
+        var col: usize = 0;
+        while (col < cols) : (col += 1) {
+            try mw.writer.writeByte(if (map[r * cols + col] > 0) '#' else '.');
+        }
+    }
+    if (hits > 0) {
+        try mw.writer.writeAll("\nclick centres in surface coordinates:");
         r = 0;
         while (r < rows) : (r += 1) {
             var col: usize = 0;
@@ -2297,13 +2775,12 @@ fn hoverMap(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Value) 
                 if (pct <= 0) continue;
                 const px = @as(f64, @floatFromInt(region.x)) + (@as(f64, @floatFromInt(col)) + 0.5) * cell_w;
                 const py = @as(f64, @floatFromInt(region.y)) + (@as(f64, @floatFromInt(r)) + 0.5) * cell_h;
-                try w.print("  ({d},{d})  {d:.2}%\n", .{ @as(i64, @intFromFloat(px)), @as(i64, @intFromFloat(py)), pct });
+                try mw.writer.print("\n({d},{d})  {d:.2}%", .{ @as(i64, @intFromFloat(px)), @as(i64, @intFromFloat(py)), pct });
             }
         }
-        try w.writeAll("A cell is one grid step wide, so these are approximate centres — re-sweep a promising area with a region + finer grid to localise it.\n");
     }
-    try w.writeAll(try appSummary(arena, app));
-    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    try res.text(mw.written());
+    return res.finish();
 }
 
 /// app_backtrace: what a crash gets for free and a hang never did.
@@ -2317,11 +2794,10 @@ fn appBacktrace(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Val
     // Outlast the daemon-side deadline: the reply to a timed-out
     // debugger is still a reply, and giving up first would throw away
     // the partial dump it carries.
-    const raw = app.debugBacktrace(debugger_ms, debugger_ms + 10_000) catch |err|
-        return appErr(arena, switch (err) {
-            appdrive.Error.Timeout => "the daemon did not answer the debug request in time",
-            else => "debug request failed (app gone?)",
-        });
+    const raw = app.debugBacktrace(debugger_ms, debugger_ms + 10_000) catch |err| switch (err) {
+        appdrive.Error.Timeout => return errRes(arena, .timeout, "the daemon did not answer the debug request in time"),
+        else => return errRes(arena, .unavailable, "debug request failed (app gone?)"),
+    };
     defer mcp.app_state.allocator.free(raw);
 
     const Reply = struct {
@@ -2339,23 +2815,25 @@ fn appBacktrace(arena: std.mem.Allocator, app: *appdrive.App, args: std.json.Val
     defer parsed.deinit();
     const rep = parsed.value;
     if (rep.@"error".len > 0 and rep.text.len == 0)
-        return appErr(arena, try std.fmt.allocPrint(arena, "no backtrace: {s}", .{rep.@"error"}));
+        return errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "no backtrace: {s}", .{rep.@"error"}));
 
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
+    var res = Res.init(arena);
+    try res.fact("debugger_pid", rep.pid);
+    try res.fact("debugger", rep.tool);
+    try res.fact("took_ms", rep.took_ms);
+    try res.fact("timed_out", rep.timed_out);
+    try res.fact("truncated", rep.truncated);
+    try res.fact("backtrace", rep.text);
     if (rep.timed_out) {
-        try w.print("PARTIAL: {s}\n", .{rep.@"error"});
+        try res.textf("PARTIAL: {s}", .{rep.@"error"});
     } else {
-        try w.print("{s} attached to pid {d} on the daemon host and reported in {d}ms.\n", .{ rep.tool, rep.pid, rep.took_ms });
+        try res.textf("{s} attached to pid {d} on the daemon host and reported in {d}ms.", .{ rep.tool, rep.pid, rep.took_ms });
     }
-    try w.writeAll("The app was STOPPED while this was taken and has been resumed; wall-clock timings across this call are not meaningful.\n");
-    if (rep.truncated) try w.writeAll("(output truncated at the daemon's cap — the head is retained)\n");
-    try w.writeAll("---\n");
-    try w.writeAll(rep.text);
-    if (!std.mem.endsWith(u8, rep.text, "\n")) try w.writeByte('\n');
-    try w.writeAll("---\n");
-    try w.writeAll(try appSummary(arena, app));
-    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    try res.text("The app was STOPPED while this was taken and has been resumed; wall-clock timings across this call are not meaningful.");
+    if (rep.truncated) try res.text("output truncated at the daemon's cap — the head is retained");
+    try addAppSummary(&res, arena, app);
+    try res.textf("--- backtrace ---\n{s}", .{std.mem.trimEnd(u8, rep.text, "\n")});
+    return res.finish();
 }
 
 /// Verdict for a `min_frames` wait that fell short.

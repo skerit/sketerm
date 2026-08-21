@@ -184,9 +184,15 @@ table tests are the two places to relax as the wave progresses.
   checks. smoke_mcp.zig's 117 escaped-key assertions are updated with the
   module that migrates each tool.
 - Every migrated tool's result must round out to: parseable result JSON,
-  a non-empty text block containing no `{`, and structuredContent
-  matching its declared outputSchema (a test-side JSON-shape check, not a
-  full validator).
+  a non-empty text block whose PROSE contains no `{`, and
+  structuredContent matching its declared outputSchema (a test-side
+  JSON-shape check, not a full validator). "Prose" is scoped:
+  everything before the first payload divider (a `--- name ---` line,
+  the convention every wave uses to introduce a payload) or the first
+  blank line. Screen text, step transcripts, OCR reads, a11y trees and
+  an app's own log legitimately contain braces; the rule stays strict on
+  the result's own sentences, which is where JSON-in-text was the
+  problem.
 - `zig build test` and `zig build test-core` green after every wave;
   `zig build smoke-mcp` green at the end of Phase 3.
 
