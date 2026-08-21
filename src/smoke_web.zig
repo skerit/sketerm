@@ -856,6 +856,20 @@ const Client = struct {
     ack_filter_subscribe: bool = false,
     ack_webext_action: bool = false,
     ack_webext_transaction: bool = false,
+    ack_multi_client: bool = false,
+
+    /// Last `ev_net_policy` observed (the multi-client budget stage),
+    /// plus a pinned probe: dirty policy status streams one frame per
+    /// view, so "the last event" is not "the answer to my question" —
+    /// a stage asks about ONE view by setting `pol_probe_view` first.
+    pol_seq: u32 = 0,
+    pol_view: u32 = 0,
+    pol_serial: u32 = 0,
+    pol_active: u8 = 0xff,
+    pol_probe_view: u32 = 0,
+    pol_probe_seq: u32 = 0,
+    pol_probe_active: u8 = 0xff,
+    pol_probe_serial: u32 = 0,
 
     action_seq: u32 = 0,
     action_view: u32 = 0,
@@ -929,6 +943,9 @@ const Client = struct {
 
     title: [1024]u8 = @splat(0),
     title_len: usize = 0,
+    /// View id the last `ev_title` named — under multi-client this must
+    /// arrive in the CLIENT's namespace, so the stage asserts on it.
+    title_view: u32 = 0,
 
     popup_view: u32 = 0,
     /// Gesture flag of the LAST popup request seen; the whole point of
@@ -1373,6 +1390,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.ack_filter_subscribe = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_ACTION)) self.ack_webext_action = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TRANSACTION)) self.ack_webext_transaction = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.ack_multi_client = true;
                 }
             },
             .frame_inline => {
@@ -1658,8 +1676,21 @@ const Client = struct {
             },
             .ev_title => {
                 const t = proto.decode(proto.EvTitle, frame.payload) catch fail("ev_title decode");
+                self.title_view = t.view;
                 self.title_len = @min(t.title.len, self.title.len);
                 @memcpy(self.title[0..self.title_len], t.title[0..self.title_len]);
+            },
+            .ev_net_policy => {
+                const p = proto.decode(proto.EvNetPolicy, frame.payload) catch fail("ev_net_policy decode");
+                self.pol_seq += 1;
+                self.pol_view = p.view;
+                self.pol_serial = p.serial;
+                self.pol_active = p.active;
+                if (p.view == self.pol_probe_view) {
+                    self.pol_probe_seq += 1;
+                    self.pol_probe_active = p.active;
+                    self.pol_probe_serial = p.serial;
+                }
             },
             .ev_popup_request => {
                 const p = proto.decode(proto.EvPopupRequest, frame.payload) catch fail("ev_popup_request decode");
@@ -4962,6 +4993,180 @@ fn runFilterSubscriptionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: [
 /// not die.
 fn sigNoop(_: c_int) callconv(.c) void {}
 
+/// Multi-client serving (capability "multi-client"): two connections on
+/// one engine, colliding client view ids kept apart, view-scoped events
+/// routed to their owner only, a wedged reader costing nobody else, the
+/// shared policy budget refusing fail-closed, the engine surviving one
+/// client's death and exiting with the last.
+fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/mc.sock", .{dir}) catch fail("mc sock path");
+    var cache_buf: [96]u8 = undefined;
+    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/mc-cache", .{dir}) catch fail("mc cache path");
+    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
+    g_pid = pid;
+
+    const alpha_page = "data:text/html,<html><head><title>mc:alpha</title></head><body>alpha</body></html>";
+    const beta_page = "data:text/html,<html><head><title>mc:beta</title></head><body>beta</body></html>";
+    const gamma_page = "data:text/html,<html><head><title>mc:gamma</title></head><body>gamma</body></html>";
+
+    // ── mc1: two clients, both greeted ────────────────────────────
+    var a = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    a.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-mc-a" });
+    {
+        const d = nowMs() + 15_000;
+        while (a.ack_proto == 0 and nowMs() < d) a.pump(100);
+    }
+    if (a.ack_proto != proto.PROTO_VERSION) fail("stage mc1: client A got no hello_ack");
+    if (!a.ack_multi_client) fail("stage mc1: hello_ack lacks the multi-client capability");
+    var b = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    b.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-mc-b" });
+    {
+        const d = nowMs() + 15_000;
+        while (b.ack_proto == 0 and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (b.ack_proto != proto.PROTO_VERSION) fail("stage mc1: client B got no hello_ack (second client refused)");
+    pass("stage mc1 two clients greeted on one engine");
+
+    // ── mc2: colliding view ids, own pages, own events ────────────
+    // BOTH clients mint view id 1. Each must get its own page and see
+    // its title event under ITS id — the namespace round trip.
+    a.send(proto.ViewCreate{ .view = 1, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+    a.have_view = true;
+    b.send(proto.ViewCreate{ .view = 1, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+    b.have_view = true;
+    a.send(proto.Navigate{ .view = 1, .url = alpha_page });
+    b.send(proto.Navigate{ .view = 1, .url = beta_page });
+    {
+        const d = nowMs() + 30_000;
+        while (nowMs() < d) {
+            a.pump(20);
+            b.pump(20);
+            if (std.mem.startsWith(u8, a.titleSlice(), "mc:alpha") and
+                std.mem.startsWith(u8, b.titleSlice(), "mc:beta")) break;
+        }
+    }
+    if (!std.mem.startsWith(u8, a.titleSlice(), "mc:alpha")) fail("stage mc2: client A never saw its own page title");
+    if (!std.mem.startsWith(u8, b.titleSlice(), "mc:beta")) fail("stage mc2: client B never saw its own page title");
+    if (a.title_view != 1) fail("stage mc2: client A's title event was not translated back to view 1");
+    if (b.title_view != 1) fail("stage mc2: client B's title event was not translated back to view 1");
+    if (std.mem.startsWith(u8, a.titleSlice(), "mc:beta")) fail("stage mc2: client A received client B's page");
+    pass("stage mc2 colliding view ids stay separate (events in each owner's namespace)");
+
+    // ── mc3: shared policy budget refuses fail-closed ─────────────
+    // Two real views hold two intercept slots; policy frames may
+    // precede their view_create, so bare ids fill the rest of the
+    // 32-slot pool without paying for 30 browsers. The 33rd policied
+    // id must be REFUSED (active=0), never left unpoliced.
+    const empty_hosts: []const []const u8 = &.{};
+    var idx: u32 = 0;
+    while (idx < 15) : (idx += 1) {
+        a.send(proto.NetPolicySet{
+            .view = 100 + idx,
+            .serial = 1000 + idx,
+            .flags = 0,
+            .block_types = 0,
+            .allow_schemes = 0x3,
+            .max_requests = 10,
+            .max_bytes = 1024 * 1024,
+            .max_navigations = 1,
+            .deadline_ms = 60_000,
+            .allow_top = empty_hosts,
+            .allow_sub = empty_hosts,
+        });
+        b.send(proto.NetPolicySet{
+            .view = 100 + idx,
+            .serial = 2000 + idx,
+            .flags = 0,
+            .block_types = 0,
+            .allow_schemes = 0x3,
+            .max_requests = 10,
+            .max_bytes = 1024 * 1024,
+            .max_navigations = 1,
+            .deadline_ms = 60_000,
+            .allow_top = empty_hosts,
+            .allow_sub = empty_hosts,
+        });
+    }
+    // Probe one slot per client: both sides' policies must be ACTIVE
+    // (the pool is shared fairly). The success path also streams dirty
+    // ev_net_policy status for every fresh slot, so each wait matches
+    // on the VIEW it asked about, never on "any policy event".
+    {
+        const d = nowMs() + 10_000;
+        a.pol_probe_view = 100;
+        a.send(proto.NetPolicyReq{ .view = 100 });
+        while (a.pol_probe_seq == 0 and nowMs() < d) {
+            a.pump(50);
+            b.pump(0);
+        }
+        if (a.pol_probe_seq == 0 or a.pol_probe_active != 1) fail("stage mc3: client A's policy slot is not active");
+        b.pol_probe_view = 100;
+        b.send(proto.NetPolicyReq{ .view = 100 });
+        while (b.pol_probe_seq == 0 and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+        if (b.pol_probe_seq == 0 or b.pol_probe_active != 1) fail("stage mc3: client B's policy slot is not active");
+    }
+    {
+        b.pol_probe_view = 900;
+        b.pol_probe_seq = 0;
+        b.pol_probe_active = 0xff;
+        b.send(proto.NetPolicySet{
+            .view = 900,
+            .serial = 3000,
+            .flags = 0,
+            .block_types = 0,
+            .allow_schemes = 0x3,
+            .max_requests = 10,
+            .max_bytes = 1024 * 1024,
+            .max_navigations = 1,
+            .deadline_ms = 60_000,
+            .allow_top = empty_hosts,
+            .allow_sub = empty_hosts,
+        });
+        const d = nowMs() + 10_000;
+        while (b.pol_probe_seq == 0 and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+        if (b.pol_probe_seq == 0 or b.pol_probe_serial != 3000) fail("stage mc3: no answer for the 33rd policied view");
+        if (b.pol_probe_active != 0) fail("stage mc3: the 33rd policied view was not refused (budget not fail-closed)");
+    }
+    pass("stage mc3 shared policy budget refuses fail-closed across clients");
+
+    // ── mc4: a wedged client stalls nobody ────────────────────────
+    // A stops reading entirely; B must still complete a full
+    // navigate-and-title round trip well inside its budget.
+    b.send(proto.Navigate{ .view = 1, .url = gamma_page });
+    if (!b.waitTitle("mc:gamma", 20_000)) fail("stage mc4: client B's round trip stalled behind a non-reading client A");
+    pass("stage mc4 a non-reading client does not stall the others");
+
+    // ── mc5: engine survives A's death, exits with B's ────────────
+    a.have_view = false;
+    a.deinit();
+    // The engine must NOT exit: B is still there. Give the reap a
+    // moment, then prove both liveness and B's continued service.
+    _ = c.usleep(300_000);
+    {
+        var status: c_int = 0;
+        if (c.waitpid(pid, &status, c.WNOHANG) == pid) {
+            g_pid = -1;
+            fail("stage mc5: the engine exited with the FIRST client instead of the last");
+        }
+    }
+    b.send(proto.Navigate{ .view = 1, .url = beta_page });
+    if (!b.waitTitle("mc:beta", 20_000)) fail("stage mc5: client B lost service when client A died");
+    b.have_view = false;
+    b.deinit();
+    reapHelperTolerant(pid, "stage mc5 last-client exit", 30_000);
+    pass("stage mc5 engine survived one client's death and exited with the last");
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, &sigNoop);
     const argv = init.args.vector;
@@ -7435,6 +7640,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ── Stage 35: real MV2 extensions ─────────────────────────────
     runShapeStage(gpa, exe, dir);
     runUboStage(gpa, exe, dir, ubo_xpi);
+    // ── Stage mc: multi-client serving ────────────────────────────
+    runMultiClientStage(gpa, exe, dir);
 
     cleanup();
     if (gpa_state.deinit() == .leak) {

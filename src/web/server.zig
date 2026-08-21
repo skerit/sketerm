@@ -1,5 +1,5 @@
-//! Unix-socket server for the browser helper: one listener, one client,
-//! one poll loop that also drives CEF.
+//! Unix-socket server for the browser helper: one listener, N clients,
+//! one poll loop that also drives CEF (capability "multi-client").
 //!
 //! SINGLE-THREADED BY CONSTRUCTION. `cef_do_message_loop_work()` is
 //! called from this loop, and CEF is initialized with
@@ -7,7 +7,16 @@
 //! every CEF callback (paint, title, load, popup) runs INSIDE that call
 //! — on this thread, between two poll iterations. Nothing in
 //! sketerm-web is therefore locked, atomic, or handed across threads,
-//! and introducing a thread would break all of it at once.
+//! and introducing a thread would break all of it at once. Multi-client
+//! is MORE DESCRIPTORS ON THIS LOOP, never a thread.
+//!
+//! Each connection keeps its own inbound buffer, its own outbox, its
+//! own handshake state, and its own view/context id namespace: client
+//! ids are translated into globals by adding the connection's
+//! `proto.CONN_ID_WINDOW` multiple on the way in and subtracting it on
+//! the way out, so two clients both minting view 1 never meet. The
+//! engine exits when the LAST client disconnects — the only path to
+//! `cef_shutdown`, which is what flushes persistent cookie jars.
 //!
 //! No CEF type appears here: the loop talks to `cefhost` and moves
 //! `protocol` frames.
@@ -45,11 +54,33 @@ fn readWreqSpin() void {
 }
 
 /// Wall-clock budget for CEF to finish closing every browser after the
-/// client goes away. `close_browser` is asynchronous renderer IPC —
+/// last client goes away. `close_browser` is asynchronous renderer IPC —
 /// iterations alone are not time — and `cef_shutdown` with a live
 /// browser hangs the process, so the drain waits for
 /// `cefhost.openBrowsers() == 0` under this cap.
 const drain_deadline_ms: i64 = 5_000;
+
+/// Concurrent connections the poll array carries. A connect past this
+/// is accepted and immediately closed — fail-closed, like every other
+/// exhausted budget on this wire.
+const max_conns = 32;
+
+/// Bytes a connection may leave undelivered before it is declared
+/// wedged and cut off. Protocol frames cannot be dropped one by one
+/// (a client misses a `frame_buffer` and paints garbage forever), so
+/// the flood discipline here is the daemon's other half: bound the
+/// buffer, and when a reader has clearly stopped, disconnect it rather
+/// than stall CEF's pump or starve the clients that still read. Paint
+/// traffic — the only unbounded producer — is already dropped per
+/// connection by `max_frame_backlog`, so this cap is the belt.
+const max_conn_backlog_bytes: usize = 64 * 1024 * 1024;
+
+/// Highest connection id the window arithmetic can namespace:
+/// `id * CONN_ID_WINDOW` must stay below `DEVTOOLS_VIEW_BASE`. Ids are
+/// never reused, so this is a lifetime budget per engine, not a
+/// concurrency limit; an engine that served this many connections
+/// refuses further ones.
+const max_conn_id: u32 = proto.DEVTOOLS_VIEW_BASE / proto.CONN_ID_WINDOW - 1;
 
 /// Capabilities this helper normally advertises. `frames-shm` is here
 /// even in GPU mode: the engine drops back to software compositing on
@@ -89,6 +120,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_FILTER_SUBSCRIBE,
     proto.CAP_READER_IDS,
     proto.CAP_SEMANTIC_REQUEST_IDS,
+    proto.CAP_MULTI_CLIENT,
 };
 
 /// Test-only negotiation seam for exercising an older helper client path.
@@ -143,16 +175,66 @@ extern fn sketerm_web_remove_iterate_timer() void;
 /// inside whatever run loop currently owns the main thread.
 fn timerStep(ctx: ?*anyopaque) callconv(.c) void {
     const self: *Server = @ptrCast(@alignCast(ctx orelse return));
-    if (self.client_fd < 0) return;
+    if (self.conns.items.len == 0) return;
     self.step_nonblocking = true;
     defer self.step_nonblocking = false;
     self.step();
 }
 
+/// One client connection: its socket, buffers, handshake state and id
+/// namespace. Heap-allocated for pointer stability — the host routes
+/// events straight into `out` between poll iterations.
+const Conn = struct {
+    /// Never-reused connection id; `base = id * CONN_ID_WINDOW` is the
+    /// view/context id window this connection owns.
+    id: u32,
+    fd: c_int,
+    in: std.ArrayList(u8) = .empty,
+    out: proto.Outbox,
+    /// Set once this connection's `hello` is answered.
+    greeted: bool = false,
+    /// This connection asked for inline frames (or spawn forced them).
+    inline_mode: bool = false,
+    /// Marked by a read/flush failure; reaped at the end of the step.
+    dead: bool = false,
+
+    fn base(self: *const Conn) u32 {
+        return self.id * proto.CONN_ID_WINDOW;
+    }
+
+    /// Client view id -> engine-global id. Zero stays zero (the
+    /// engine-global pseudo view), engine-minted inspector ids pass
+    /// through (the ownership check in `cefhost.find` is their guard),
+    /// a client-minted id past the window is a protocol violation.
+    fn mapView(self: *const Conn, id: u32) !u32 {
+        if (id == 0) return 0;
+        if (id >= proto.DEVTOOLS_VIEW_BASE) return id;
+        if (id >= proto.CONN_ID_WINDOW) return error.ViewIdPastWindow;
+        return self.base() + id;
+    }
+
+    /// Client context id -> engine-global id. Contexts have no
+    /// engine-minted range, so everything nonzero is translated;
+    /// persistent ids are small, ephemeral ones sit above the client's
+    /// EPHEMERAL_BASE, and both fit the window sum without overflow.
+    fn mapCtx(self: *const Conn, id: u32) !u32 {
+        if (id == 0) return 0;
+        if (id >= 0x8000_0000) return error.ContextIdPastWindow;
+        return self.base() + id;
+    }
+};
+
 pub const Server = struct {
     gpa: std.mem.Allocator,
     listen_fd: c_int = -1,
-    client_fd: c_int = -1,
+    conns: std.ArrayList(*Conn) = .empty,
+    /// Next connection id; ids are NEVER reused (a reused id would let
+    /// a new client inherit routing meant for a dead one).
+    next_conn_id: u32 = 1,
+    /// A first client connected at least once — the run loop's reason
+    /// to exist; when the last connection then leaves, the engine
+    /// drains and exits.
+    served: bool = false,
     /// True while `step` is on the stack. On macOS one iteration can
     /// re-enter through the CFRunLoop lifeline timer (see run()); the
     /// guard makes that a no-op instead of a recursive drain.
@@ -161,14 +243,13 @@ pub const Server = struct {
     /// it runs INSIDE an AppKit run loop that has its own schedule.
     step_nonblocking: bool = false,
     path: []const u8,
-    in: std.ArrayList(u8) = .empty,
+    /// Legacy single-outbox target for a Host with no router; run()
+    /// installs the router, so nothing lands here in practice.
     out: proto.Outbox,
     host: cefhost.Host = undefined,
     /// Root cache dir (the `--cache-dir`), under which per-context caches
     /// are minted; handed to the host before `run`.
     profile_dir: []const u8 = "",
-    /// Set once the client's `hello` is answered.
-    greeted: bool = false,
     /// `--frames-inline`: inline frame mode forced from spawn (the
     /// remote-helper launch shape — the daemon bridges the socket over
     /// the mux wire, where no descriptor can travel).
@@ -176,22 +257,37 @@ pub const Server = struct {
     /// `--socket-fd`: the client connection was handed to us pre-made
     /// (a socketpair from the spawning daemon); no listen/accept.
     preset_fd: bool = false,
+    /// Adopted descriptor waiting for run() to mint its Conn.
+    preset_client: c_int = -1,
 
     pub fn init(gpa: std.mem.Allocator, path: []const u8) Server {
         return .{ .gpa = gpa, .path = path, .out = proto.Outbox.init(gpa) };
     }
 
     pub fn deinit(self: *Server) void {
-        self.in.deinit(self.gpa);
+        while (self.conns.pop()) |cn| self.freeConn(cn);
+        self.conns.deinit(self.gpa);
         // Undelivered messages may still carry a memfd; nobody else
         // will close them.
-        while (self.out.front()) |m| {
-            for (m.fdSlice()) |fd| _ = c.close(fd);
-            self.out.advance(m.bytes.len);
-        }
+        drainOutboxFds(&self.out);
         self.out.deinit();
-        if (self.client_fd >= 0) _ = c.close(self.client_fd);
+        if (self.preset_client >= 0) _ = c.close(self.preset_client);
         if (self.listen_fd >= 0) _ = c.close(self.listen_fd);
+    }
+
+    fn drainOutboxFds(out: *proto.Outbox) void {
+        while (out.front()) |m| {
+            for (m.fdSlice()) |fd| _ = c.close(fd);
+            out.advance(m.bytes.len);
+        }
+    }
+
+    fn freeConn(self: *Server, cn: *Conn) void {
+        cn.in.deinit(self.gpa);
+        drainOutboxFds(&cn.out);
+        cn.out.deinit();
+        if (cn.fd >= 0) _ = c.close(cn.fd);
+        self.gpa.destroy(cn);
     }
 
     /// Bind and listen. The path must be short: sockaddr_un caps at
@@ -213,15 +309,23 @@ pub const Server = struct {
         self.listen_fd = fd;
         _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
         if (c.bind(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return error.BindFailed;
-        if (c.listen(fd, 1) != 0) return error.ListenFailed;
+        if (c.listen(fd, 8) != 0) return error.ListenFailed;
     }
 
-    /// Accept the single client, serve it until it disconnects, then
-    /// tear every view down. Returns when the client is gone.
+    /// Serve clients until the last one disconnects, then tear every
+    /// view down. Later clients may join and leave freely; only the
+    /// count reaching zero ends the engine.
     pub fn run(self: *Server) !void {
         readWreqSpin();
         self.host = cefhost.Host.init(self.gpa, &self.out);
         self.host.profile_dir = self.profile_dir;
+        self.host.router = .{
+            .ctx = self,
+            .route = routerRoute,
+            .count = routerCount,
+            .at = routerAt,
+            .mapView = routerMapView,
+        };
         if (self.force_inline) self.host.setInlineMode(true);
         defer self.host.deinit();
         self.host.install();
@@ -248,8 +352,13 @@ pub const Server = struct {
             sketerm_web_remove_iterate_timer();
         };
 
-        if (!self.preset_fd) try self.accept();
-        while (self.client_fd >= 0) {
+        if (self.preset_client >= 0) {
+            _ = self.addConn(self.preset_client);
+            self.preset_client = -1;
+        } else {
+            try self.acceptFirst();
+        }
+        while (self.conns.items.len > 0) {
             self.step();
         }
         // Let CEF finish closing the browsers before the caller shuts
@@ -273,13 +382,39 @@ pub const Server = struct {
     pub fn adoptClientFd(self: *Server, fd: c_int) void {
         _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
         _ = c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK);
-        self.client_fd = fd;
+        self.preset_client = fd;
         self.preset_fd = true;
     }
 
-    /// Wait for the client, pumping CEF meanwhile (it has nothing to do
-    /// yet, but a stalled loop is a habit worth not forming).
-    fn accept(self: *Server) !void {
+    fn addConn(self: *Server, fd: c_int) ?*Conn {
+        if (self.conns.items.len >= max_conns or self.next_conn_id > max_conn_id) {
+            _ = c.close(fd);
+            return null;
+        }
+        const cn = self.gpa.create(Conn) catch {
+            _ = c.close(fd);
+            return null;
+        };
+        cn.* = .{
+            .id = self.next_conn_id,
+            .fd = fd,
+            .out = proto.Outbox.init(self.gpa),
+            .inline_mode = self.force_inline,
+        };
+        self.next_conn_id += 1;
+        self.conns.append(self.gpa, cn) catch {
+            cn.out.deinit();
+            self.gpa.destroy(cn);
+            _ = c.close(fd);
+            return null;
+        };
+        self.served = true;
+        return cn;
+    }
+
+    /// Wait for the first client, pumping CEF meanwhile (it has nothing
+    /// to do yet, but a stalled loop is a habit worth not forming).
+    fn acceptFirst(self: *Server) !void {
         while (true) {
             var pfd = c.struct_pollfd{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 };
             const n = c.poll(@ptrCast(&pfd), 1, idle_timeout_ms);
@@ -299,39 +434,53 @@ pub const Server = struct {
                 return error.PollFailed;
             }
             if (n == 0) continue;
-            const fd = c.accept(self.listen_fd, null, null);
-            if (fd < 0) {
-                if (errno() == c.EINTR or errno() == c.EAGAIN) continue;
-                return error.AcceptFailed;
-            }
-            _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
-            _ = c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK);
-            self.client_fd = fd;
-            return;
+            if (self.acceptOne()) return;
         }
     }
 
-    /// One loop iteration: poll, drain the socket, pump CEF, flush.
+    /// Accept one pending connection, non-fatally.
+    fn acceptOne(self: *Server) bool {
+        const fd = c.accept(self.listen_fd, null, null);
+        if (fd < 0) return false;
+        _ = c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC);
+        _ = c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK);
+        return self.addConn(fd) != null;
+    }
+
+    /// One loop iteration: poll everything, drain sockets, pump CEF,
+    /// flush every connection, reap the dead.
     fn step(self: *Server) void {
         if (self.in_step) return;
         self.in_step = true;
         defer self.in_step = false;
-        // Two descriptors: the client, and the browser helper's own
-        // blocking-webRequest wake pipe. A request HELD on CEF's IO
-        // thread is a page that has stopped loading, and the decision
-        // can only be dispatched from this thread — waiting out a 5ms
-        // poll that was already running would put that entire 5ms on
-        // the critical path of every held subresource. The wake byte
-        // ends the poll the instant a hold appears.
-        var pfds: [2]c.struct_pollfd = .{
-            .{
-                .fd = self.client_fd,
-                .events = @as(c_short, c.POLLIN) | (if (self.out.empty()) @as(c_short, 0) else @as(c_short, c.POLLOUT)),
+        // Descriptors: the listener (new clients may join a running
+        // engine), the browser helper's blocking-webRequest wake pipe
+        // (a request HELD on CEF's IO thread is a page that has stopped
+        // loading, and the decision can only be dispatched from this
+        // thread — the wake byte ends the poll the instant a hold
+        // appears), then one per connection.
+        var pfds: [2 + max_conns]c.struct_pollfd = undefined;
+        var n_pfds: usize = 0;
+        const listen_idx: ?usize = if (self.listen_fd >= 0) blk: {
+            pfds[n_pfds] = .{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 };
+            n_pfds += 1;
+            break :blk n_pfds - 1;
+        } else null;
+        const wake_idx: ?usize = if (cefhost.webrequestWakeFd() >= 0) blk: {
+            pfds[n_pfds] = .{ .fd = cefhost.webrequestWakeFd(), .events = c.POLLIN, .revents = 0 };
+            n_pfds += 1;
+            break :blk n_pfds - 1;
+        } else null;
+        _ = wake_idx;
+        const conn_base = n_pfds;
+        for (self.conns.items) |cn| {
+            pfds[n_pfds] = .{
+                .fd = cn.fd,
+                .events = @as(c_short, c.POLLIN) | (if (cn.out.empty()) @as(c_short, 0) else @as(c_short, c.POLLOUT)),
                 .revents = 0,
-            },
-            .{ .fd = cefhost.webrequestWakeFd(), .events = c.POLLIN, .revents = 0 },
-        };
-        const nfds: c.nfds_t = if (pfds[1].fd >= 0) 2 else 1;
+            };
+            n_pfds += 1;
+        }
         const timeout: c_int = if (self.step_nonblocking)
             0
         else if (cefhost.webrequestBusy())
@@ -342,24 +491,33 @@ pub const Server = struct {
             busy_timeout_ms
         else
             idle_timeout_ms;
-        const n = c.poll(&pfds, nfds, timeout);
-        const pfd = pfds[0];
-        if (n < 0 and errno() != c.EINTR) {
-            self.disconnect();
+        const n = c.poll(&pfds, @intCast(n_pfds), timeout);
+        const poll_errno = errno();
+        if (n < 0 and poll_errno != c.EINTR) {
+            // The poll set itself failed; nothing per-connection can be
+            // decided from it. Drop everyone rather than spin forever.
+            for (self.conns.items) |cn| cn.dead = true;
+            self.reap();
             return;
         }
         if (n > 0) {
-            if (pfd.revents & (c.POLLERR | c.POLLNVAL) != 0) {
-                self.disconnect();
-                return;
+            if (listen_idx) |li| {
+                if (pfds[li].revents & c.POLLIN != 0) _ = self.acceptOne();
             }
-            if (pfd.revents & c.POLLIN != 0 and !self.readIn()) {
-                self.disconnect();
-                return;
+            for (self.conns.items, 0..) |cn, i| {
+                const pfd = pfds[conn_base + i];
+                if (pfd.fd != cn.fd) continue; // list changed under an accept
+                if (pfd.revents & (c.POLLERR | c.POLLNVAL) != 0) {
+                    cn.dead = true;
+                    continue;
+                }
+                if (pfd.revents & c.POLLIN != 0 and !self.readIn(cn)) {
+                    cn.dead = true;
+                }
             }
         }
         // Nothing paints without a begin frame: keep a floor under every
-        // visible view in case the client stopped asking for them.
+        // visible view in case a client stopped asking for them.
         self.host.watchdog(cefhost.nowMs());
         // An extension that asked to restart itself is restarted HERE,
         // never inside the call that asked: `runtime.reload` destroys
@@ -386,20 +544,76 @@ pub const Server = struct {
         // Inline mode: ship damage the paint-time flush held back while
         // the outbox was backed up (union-and-flush backpressure).
         self.host.flushInline();
-        if (!self.flush()) self.disconnect();
+        for (self.conns.items) |cn| {
+            if (cn.dead) continue;
+            if (!self.flushConn(cn)) {
+                cn.dead = true;
+                continue;
+            }
+            // The wedge cut-off: a reader that stopped consuming would
+            // otherwise grow this queue without bound (see
+            // max_conn_backlog_bytes). One wedged client must cost only
+            // itself.
+            if (cn.out.bytes > max_conn_backlog_bytes) cn.dead = true;
+        }
+        self.reap();
     }
 
-    fn disconnect(self: *Server) void {
-        if (self.client_fd >= 0) _ = c.close(self.client_fd);
-        self.client_fd = -1;
+    /// Remove dead connections: close the socket, destroy the views and
+    /// contexts they own, free their queues. The engine itself stays up
+    /// for whoever remains; run() notices an empty list.
+    fn reap(self: *Server) void {
+        var i: usize = 0;
+        while (i < self.conns.items.len) {
+            const cn = self.conns.items[i];
+            if (!cn.dead) {
+                i += 1;
+                continue;
+            }
+            _ = self.conns.orderedRemove(i);
+            self.host.dropConn(cn.id);
+            self.freeConn(cn);
+        }
+    }
+
+    // -- host routing (cefhost.Router) ---------------------------------
+
+    fn routerRoute(ctx: *anyopaque, conn_id: u32) ?*proto.Outbox {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        for (self.conns.items) |cn| {
+            if (cn.id == conn_id and !cn.dead) return &cn.out;
+        }
+        return null;
+    }
+
+    fn routerCount(ctx: *anyopaque) usize {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        return self.conns.items.len;
+    }
+
+    fn routerAt(ctx: *anyopaque, i: usize) ?*proto.Outbox {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        if (i >= self.conns.items.len) return null;
+        const cn = self.conns.items[i];
+        if (cn.dead) return null;
+        return &cn.out;
+    }
+
+    fn routerMapView(ctx: *anyopaque, conn_id: u32, id: u32) u32 {
+        const self: *Server = @ptrCast(@alignCast(ctx));
+        for (self.conns.items) |cn| {
+            if (cn.id != conn_id) continue;
+            return cn.mapView(id) catch 0;
+        }
+        return 0;
     }
 
     /// Read what is available and dispatch complete frames. Returns
     /// false on EOF or a fatal socket/protocol error.
-    fn readIn(self: *Server) bool {
+    fn readIn(self: *Server, cn: *Conn) bool {
         var buf: [64 * 1024]u8 = undefined;
         while (true) {
-            const n = c.read(self.client_fd, &buf, buf.len);
+            const n = c.read(cn.fd, &buf, buf.len);
             if (n == 0) return false;
             if (n < 0) {
                 const e = errno();
@@ -407,29 +621,64 @@ pub const Server = struct {
                 if (e == c.EINTR) continue;
                 return false;
             }
-            self.in.appendSlice(self.gpa, buf[0..@intCast(n)]) catch return false;
+            cn.in.appendSlice(self.gpa, buf[0..@intCast(n)]) catch return false;
             if (@as(usize, @intCast(n)) < buf.len) break;
         }
 
-        var reader = proto.Reader.init(self.in.items);
+        var reader = proto.Reader.init(cn.in.items);
         while (true) {
             const frame = (reader.next() catch return false) orelse break;
-            self.dispatch(frame) catch return false;
+            self.dispatch(cn, frame) catch return false;
         }
         const used = reader.consumed();
         if (used != 0) {
-            const rest = self.in.items.len - used;
-            std.mem.copyForwards(u8, self.in.items[0..rest], self.in.items[used..]);
-            self.in.shrinkRetainingCapacity(rest);
+            const rest = cn.in.items.len - used;
+            std.mem.copyForwards(u8, cn.in.items[0..rest], cn.in.items[used..]);
+            cn.in.shrinkRetainingCapacity(rest);
         }
         return true;
     }
 
-    fn dispatch(self: *Server, frame: proto.Frame) !void {
+    /// Decode `T` and translate its client-namespace ids into the
+    /// engine's global namespace — the socket-edge half of
+    /// multi-client, so `cefhost` keeps thinking in one id space.
+    fn dec(cn: *Conn, comptime T: type, payload: []const u8) !T {
+        var req = try proto.decode(T, payload);
+        try xlateIn(cn, T, &req);
+        return req;
+    }
+
+    /// The inbound field vocabulary carrying client-minted ids: `view`
+    /// and `popup_view` name views, `context` and the context frames'
+    /// `id` name identity contexts. A new inbound frame naming a view
+    /// or context under a FIFTH field name must be added here or its
+    /// ids arrive untranslated (and, for a view, then fail `find`'s
+    /// ownership check rather than touch a foreign view).
+    fn xlateIn(cn: *Conn, comptime T: type, req: *T) !void {
+        if (T == proto.ContextCreate or T == proto.ContextDestroy) {
+            req.id = try cn.mapCtx(req.id);
+            return;
+        }
+        inline for (.{ "view", "popup_view" }) |f| {
+            if (@hasField(T, f)) @field(req, f) = try cn.mapView(@field(req, f));
+        }
+        if (@hasField(T, "context")) req.context = try cn.mapCtx(req.context);
+    }
+
+    fn dispatch(self: *Server, cn: *Conn, frame: proto.Frame) !void {
         // Nothing but the handshake is served before it: a client that
         // skipped `hello` has not agreed a protocol version, so acting
         // on its frames would be guessing.
-        if (!self.greeted and frame.tag != .hello) return;
+        if (!cn.greeted and frame.tag != .hello) return;
+        // Everything the host does inside this dispatch is on behalf of
+        // this connection: view creation stamps the owner, `find`
+        // refuses foreign views, viewless replies route back here.
+        self.host.dispatch_conn = cn.id;
+        self.host.dispatch_inline = cn.inline_mode;
+        defer {
+            self.host.dispatch_conn = 0;
+            self.host.dispatch_inline = false;
+        }
         switch (frame.tag) {
             .hello => {
                 const req = try proto.decode(proto.Hello, frame.payload);
@@ -442,113 +691,135 @@ pub const Server = struct {
                     caps.add(cap);
                 }
                 if (cefhost.isAccelerated()) caps.add(proto.CAP_FRAMES_DMABUF);
-                try self.out.post(proto.HelloAck{
+                try cn.out.post(proto.HelloAck{
                     .proto = proto.PROTO_VERSION,
                     .engine_name = cefhost.engineName(),
                     .engine_version = cefhost.engineVersion(),
                     .caps = caps.slice(),
                 }, null);
-                self.greeted = true;
+                cn.greeted = true;
             },
-            .context_create => self.host.contextCreate(try proto.decode(proto.ContextCreate, frame.payload)),
-            .context_destroy => self.host.contextDestroy((try proto.decode(proto.ContextDestroy, frame.payload)).id),
-            .view_create => try self.host.createView(try proto.decode(proto.ViewCreate, frame.payload)),
-            .view_create_url => try self.host.createViewUrl(try proto.decode(proto.ViewCreateUrl, frame.payload)),
-            .view_destroy => self.host.destroyView((try proto.decode(proto.ViewDestroy, frame.payload)).view),
-            .view_discard => self.host.discardView((try proto.decode(proto.ViewDiscard, frame.payload)).view),
-            .view_resize => try self.host.resizeView(try proto.decode(proto.ViewResize, frame.payload)),
-            .view_show => self.host.showView((try proto.decode(proto.ViewShow, frame.payload)).view, true),
-            .view_hide => self.host.showView((try proto.decode(proto.ViewHide, frame.payload)).view, false),
-            .view_max_fps => self.host.setMaxFps(try proto.decode(proto.ViewMaxFps, frame.payload)),
-            .cert_decision => self.host.certDecision(try proto.decode(proto.CertDecision, frame.payload)),
-            .permission_decision => self.host.permissionDecision(try proto.decode(proto.PermissionDecision, frame.payload)),
-            .navigate => self.host.navigate(try proto.decode(proto.Navigate, frame.payload)),
-            .nav_action => self.host.navAction(try proto.decode(proto.NavAction, frame.payload)),
-            .find => self.host.findInPage(try proto.decode(proto.Find, frame.payload)),
-            .find_stop => self.host.findStop(try proto.decode(proto.FindStop, frame.payload)),
-            .set_zoom => self.host.setZoom(try proto.decode(proto.SetZoom, frame.payload)),
-            .input_pointer => self.host.pointer(try proto.decode(proto.InputPointer, frame.payload)),
-            .input_scroll => self.host.scroll(try proto.decode(proto.InputScroll, frame.payload)),
-            .input_key => self.host.key(try proto.decode(proto.InputKey, frame.payload)),
-            .input_ime => self.host.ime(try proto.decode(proto.InputIme, frame.payload)),
-            .input_focus => self.host.focus(try proto.decode(proto.InputFocus, frame.payload)),
+            .context_create => self.host.contextCreate(try dec(cn, proto.ContextCreate, frame.payload)),
+            .context_destroy => self.host.contextDestroy((try dec(cn, proto.ContextDestroy, frame.payload)).id),
+            .view_create => try self.host.createView(try dec(cn, proto.ViewCreate, frame.payload)),
+            .view_create_url => try self.host.createViewUrl(try dec(cn, proto.ViewCreateUrl, frame.payload)),
+            .view_destroy => self.host.destroyView((try dec(cn, proto.ViewDestroy, frame.payload)).view),
+            .view_discard => self.host.discardView((try dec(cn, proto.ViewDiscard, frame.payload)).view),
+            .view_resize => try self.host.resizeView(try dec(cn, proto.ViewResize, frame.payload)),
+            .view_show => self.host.showView((try dec(cn, proto.ViewShow, frame.payload)).view, true),
+            .view_hide => self.host.showView((try dec(cn, proto.ViewHide, frame.payload)).view, false),
+            .view_max_fps => self.host.setMaxFps(try dec(cn, proto.ViewMaxFps, frame.payload)),
+            .cert_decision => self.host.certDecision(try dec(cn, proto.CertDecision, frame.payload)),
+            .permission_decision => self.host.permissionDecision(try dec(cn, proto.PermissionDecision, frame.payload)),
+            .navigate => self.host.navigate(try dec(cn, proto.Navigate, frame.payload)),
+            .nav_action => self.host.navAction(try dec(cn, proto.NavAction, frame.payload)),
+            .find => self.host.findInPage(try dec(cn, proto.Find, frame.payload)),
+            .find_stop => self.host.findStop(try dec(cn, proto.FindStop, frame.payload)),
+            .set_zoom => self.host.setZoom(try dec(cn, proto.SetZoom, frame.payload)),
+            .input_pointer => self.host.pointer(try dec(cn, proto.InputPointer, frame.payload)),
+            .input_scroll => self.host.scroll(try dec(cn, proto.InputScroll, frame.payload)),
+            .input_key => self.host.key(try dec(cn, proto.InputKey, frame.payload)),
+            .input_ime => self.host.ime(try dec(cn, proto.InputIme, frame.payload)),
+            .input_focus => self.host.focus(try dec(cn, proto.InputFocus, frame.payload)),
             // v1 accepts the release for symmetry but keeps no per-buffer
             // state: one memfd per view, replaced on resize.
-            .frame_release => _ = try proto.decode(proto.FrameRelease, frame.payload),
-            .frame_request => self.host.beginFrame(try proto.decode(proto.FrameRequest, frame.payload)),
+            .frame_release => _ = try dec(cn, proto.FrameRelease, frame.payload),
+            .frame_request => self.host.beginFrame(try dec(cn, proto.FrameRequest, frame.payload)),
             .frame_mode => {
                 const req = try proto.decode(proto.FrameMode, frame.payload);
-                self.host.setInlineMode(req.mode == proto.frame_mode_inline);
+                // Per-connection, latching (an anonymous buffer is
+                // never announced, so there is no way back): this
+                // connection's views go inline, nobody else's do.
+                if (req.mode == proto.frame_mode_inline) {
+                    cn.inline_mode = true;
+                    self.host.latchInlineForConn(cn.id);
+                }
             },
-            .sem_snapshot_req => try self.host.semSnapshot(try proto.decode(proto.SemSnapshotReq, frame.payload)),
-            .sem_act => try self.host.semAct(try proto.decode(proto.SemAction, frame.payload)),
-            .sem_expand => try self.host.semExpand(try proto.decode(proto.SemExpand, frame.payload)),
-            .sem_query => try self.host.semQuery(try proto.decode(proto.SemQueryReq, frame.payload)),
-            .sem_read => try self.host.semRead(try proto.decode(proto.SemRead, frame.payload)),
-            .sem_read_ids => try self.host.semReadIds(try proto.decode(proto.SemReadIds, frame.payload)),
-            .sem_act_guarded => try self.host.semActGuarded(try proto.decode(proto.SemActGuarded, frame.payload)),
-            .sem_request => try self.host.semRequest(try proto.decode(proto.SemRequest, frame.payload)),
-            .sem_eval => try self.host.semEval(try proto.decode(proto.SemEval, frame.payload)),
-            .intercept_set => self.host.interceptSet(try proto.decode(proto.InterceptSet, frame.payload)),
+            .sem_snapshot_req => try self.host.semSnapshot(try dec(cn, proto.SemSnapshotReq, frame.payload)),
+            .sem_act => try self.host.semAct(try dec(cn, proto.SemAction, frame.payload)),
+            .sem_expand => try self.host.semExpand(try dec(cn, proto.SemExpand, frame.payload)),
+            .sem_query => try self.host.semQuery(try dec(cn, proto.SemQueryReq, frame.payload)),
+            .sem_read => try self.host.semRead(try dec(cn, proto.SemRead, frame.payload)),
+            .sem_read_ids => try self.host.semReadIds(try dec(cn, proto.SemReadIds, frame.payload)),
+            .sem_act_guarded => try self.host.semActGuarded(try dec(cn, proto.SemActGuarded, frame.payload)),
+            .sem_request => try self.host.semRequest(try dec(cn, proto.SemRequest, frame.payload)),
+            .sem_eval => try self.host.semEval(try dec(cn, proto.SemEval, frame.payload)),
+            .intercept_set => self.host.interceptSet(try dec(cn, proto.InterceptSet, frame.payload)),
             .intercept_lists => {
+                // Process-global filter lists: deliberately UNTRANSLATED
+                // and last-writer-wins across connections in Phase 1,
+                // like the userscript/webext family below. Whether these
+                // become per-connection overlays or broker-owned truth
+                // is Phase 4's decision, made deliberately, not here.
                 const req = try proto.InterceptLists.decodeAlloc(frame.payload, self.gpa);
                 defer self.gpa.free(req.paths);
                 self.host.interceptLists(req);
             },
             .intercept_subscribe => {
-                const req = try proto.InterceptSubscribe.decodeAlloc(frame.payload, self.gpa);
+                var req = try proto.InterceptSubscribe.decodeAlloc(frame.payload, self.gpa);
                 defer self.gpa.free(req.urls);
+                try xlateIn(cn, proto.InterceptSubscribe, &req);
                 self.host.interceptSubscribe(req);
             },
-            .intercept_status_req => self.host.interceptStatus(try proto.decode(proto.InterceptStatusReq, frame.payload)),
-            .intercept_log_req => self.host.interceptLog(try proto.decode(proto.InterceptLogReq, frame.payload)),
+            .intercept_status_req => self.host.interceptStatus(try dec(cn, proto.InterceptStatusReq, frame.payload)),
+            .intercept_log_req => self.host.interceptLog(try dec(cn, proto.InterceptLogReq, frame.payload)),
             .net_policy_set => {
-                const req = try proto.NetPolicySet.decodeAlloc(frame.payload, self.gpa);
+                var req = try proto.NetPolicySet.decodeAlloc(frame.payload, self.gpa);
                 defer self.gpa.free(req.allow_top);
                 defer self.gpa.free(req.allow_sub);
+                try xlateIn(cn, proto.NetPolicySet, &req);
                 self.host.netPolicySet(req);
             },
-            .net_policy_req => self.host.netPolicyStatus(try proto.decode(proto.NetPolicyReq, frame.payload)),
-            .net_log_req => self.host.netLog(try proto.decode(proto.NetLogReq, frame.payload)),
-            .download_decide => self.host.downloadDecide(try proto.decode(proto.DownloadDecide, frame.payload)),
-            .download_cancel => self.host.downloadCancel(try proto.decode(proto.DownloadCancel, frame.payload)),
-            .a11y_enable => self.host.a11yEnable(try proto.decode(proto.A11yEnable, frame.payload)),
+            .net_policy_req => self.host.netPolicyStatus(try dec(cn, proto.NetPolicyReq, frame.payload)),
+            .net_log_req => self.host.netLog(try dec(cn, proto.NetLogReq, frame.payload)),
+            .download_decide => self.host.downloadDecide(try dec(cn, proto.DownloadDecide, frame.payload)),
+            .download_cancel => self.host.downloadCancel(try dec(cn, proto.DownloadCancel, frame.payload)),
+            .a11y_enable => self.host.a11yEnable(try dec(cn, proto.A11yEnable, frame.payload)),
             .us_script_set => {
+                // Process-global, last-writer-wins: see .intercept_lists.
                 const req = try proto.UsScriptSet.decodeAlloc(frame.payload, self.gpa);
                 defer self.gpa.free(req.scripts);
                 self.host.usScriptSet(req);
             },
             .us_style_set => {
+                // Process-global, last-writer-wins: see .intercept_lists.
                 const req = try proto.UsStyleSet.decodeAlloc(frame.payload, self.gpa);
                 defer self.gpa.free(req.styles);
                 self.host.usStyleSet(req);
             },
-            .scroll_to => self.host.scrollTo(try proto.decode(proto.ScrollTo, frame.payload)),
-            .devtools_show => try self.host.devtoolsShow(try proto.decode(proto.DevToolsShow, frame.payload)),
-            .print_pdf => self.host.printPdf(try proto.decode(proto.PrintPdf, frame.payload)),
-            .cookies_req => self.host.cookiesReq(try proto.decode(proto.CookiesReq, frame.payload)),
-            .cookie_delete => self.host.cookieDelete(try proto.decode(proto.CookieDelete, frame.payload)),
-            .cookies_clear => self.host.cookiesClear(try proto.decode(proto.CookiesClear, frame.payload)),
-            .sitedata_clear => self.host.sitedataClear(try proto.decode(proto.SitedataClear, frame.payload)),
-            .webext_set => self.host.webextSet(try proto.decode(proto.WebextSet, frame.payload)),
-            .webext_install_prepare => self.host.webextInstallPrepare(try proto.decode(proto.WebextInstallPrepare, frame.payload)),
-            .webext_install_commit => self.host.webextInstallCommit(try proto.decode(proto.WebextInstallCommit, frame.payload)),
-            .webext_remove => self.host.webextRemove((try proto.decode(proto.WebextRemove, frame.payload)).id),
+            .scroll_to => self.host.scrollTo(try dec(cn, proto.ScrollTo, frame.payload)),
+            .devtools_show => try self.host.devtoolsShow(try dec(cn, proto.DevToolsShow, frame.payload)),
+            .print_pdf => self.host.printPdf(try dec(cn, proto.PrintPdf, frame.payload)),
+            .cookies_req => self.host.cookiesReq(try dec(cn, proto.CookiesReq, frame.payload)),
+            .cookie_delete => self.host.cookieDelete(try dec(cn, proto.CookieDelete, frame.payload)),
+            .cookies_clear => self.host.cookiesClear(try dec(cn, proto.CookiesClear, frame.payload)),
+            .sitedata_clear => self.host.sitedataClear(try dec(cn, proto.SitedataClear, frame.payload)),
+            // The webext family is process-global (one extension
+            // registry, one action set), last-writer-wins: see
+            // .intercept_lists. webext_tabs embeds view ids inside its
+            // JSON, which the edge cannot reach — the host translates
+            // them at parse time via Router.mapView instead.
+            .webext_set => self.host.webextSet(try dec(cn, proto.WebextSet, frame.payload)),
+            .webext_install_prepare => self.host.webextInstallPrepare(try dec(cn, proto.WebextInstallPrepare, frame.payload)),
+            .webext_install_commit => self.host.webextInstallCommit(try dec(cn, proto.WebextInstallCommit, frame.payload)),
+            .webext_remove => self.host.webextRemove((try dec(cn, proto.WebextRemove, frame.payload)).id),
             .webext_list_req => self.host.webextList(),
             .webext_wreq_stats_req => self.host.webrequestStats(),
             .webext_tabs => self.host.webextTabs((try proto.decode(proto.WebextTabs, frame.payload)).tabs_json),
-            .webext_action_activate => self.host.webextActionActivate(try proto.decode(proto.WebextActionActivate, frame.payload)),
-            .webext_open_popup_result => self.host.webextOpenPopupResult(try proto.decode(proto.WebextOpenPopupResult, frame.payload)),
+            .webext_action_activate => self.host.webextActionActivate(try dec(cn, proto.WebextActionActivate, frame.payload)),
+            .webext_open_popup_result => self.host.webextOpenPopupResult(try dec(cn, proto.WebextOpenPopupResult, frame.payload)),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},
         }
     }
 
-    /// Push queued messages. Returns false when the socket died.
-    fn flush(self: *Server) bool {
-        while (self.out.front()) |m| {
-            const n = self.sendMsg(m);
+    /// Push one connection's queued messages. Returns false when its
+    /// socket died.
+    fn flushConn(self: *Server, cn: *Conn) bool {
+        _ = self;
+        while (cn.out.front()) |m| {
+            const n = sendMsg(cn.fd, m);
             if (n < 0) {
                 const e = errno();
                 if (e == c.EAGAIN or e == c.EWOULDBLOCK) return true;
@@ -556,7 +827,7 @@ pub const Server = struct {
                 return false;
             }
             for (m.fdSlice()) |fd| _ = c.close(fd);
-            self.out.advance(@intCast(n));
+            cn.out.advance(@intCast(n));
         }
         return true;
     }
@@ -566,7 +837,7 @@ pub const Server = struct {
     /// They must travel as ONE control message: several SCM_RIGHTS
     /// headers on one sendmsg is not portable and a receiver reading a
     /// single cmsg would drop the rest on the floor.
-    fn sendMsg(self: *Server, m: proto.Message) isize {
+    fn sendMsg(fd: c_int, m: proto.Message) isize {
         var iov = c.struct_iovec{
             .iov_base = @constCast(m.bytes.ptr),
             .iov_len = m.bytes.len,
@@ -587,7 +858,7 @@ pub const Server = struct {
             mh.msg_control = &cbuf;
             mh.msg_controllen = @intCast(std.mem.alignForward(usize, hdr_size + payload, 8));
         }
-        return c.sendmsg(self.client_fd, &mh, 0);
+        return c.sendmsg(fd, &mh, 0);
     }
 };
 

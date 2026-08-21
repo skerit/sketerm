@@ -184,6 +184,22 @@ pub const CAP_WEBEXT_ACTION = "webext-action";
 /// The helper validates and quiesces an extension before the GUI swaps its
 /// staged package, then returns a correlated result after loading the commit.
 pub const CAP_WEBEXT_TRANSACTION = "webext-transaction";
+/// The helper serves several concurrent clients on one socket: each
+/// connection keeps its own view/context id namespace and its own
+/// outbound queue, view-scoped events reach only the connection that
+/// owns the view, and the engine exits when the LAST client leaves.
+/// Without this capability the helper serves exactly one client and
+/// exits when it disconnects.
+pub const CAP_MULTI_CLIENT = "multi-client";
+
+/// Per-connection id window under `multi-client`: connection k owns
+/// client-minted view/context ids translated into globals by adding
+/// `k * CONN_ID_WINDOW`, so two clients both minting id 1 never
+/// collide. Client-minted ids must stay below the window; ids at or
+/// above `DEVTOOLS_VIEW_BASE` are engine-minted and pass through
+/// untranslated. Wire-adjacent for the same reason MAX_POLICY_VIEWS
+/// is: both sides size their refusals from it.
+pub const CONN_ID_WINDOW: u32 = 0x0010_0000;
 
 /// Refuse to buffer a frame larger than this; a peer claiming more is
 /// desynchronised, not ambitious.
@@ -3080,6 +3096,10 @@ pub const Outbox = struct {
     queue: std.ArrayList(Message) = .empty,
     head: usize = 0,
     sent: usize = 0,
+    /// Bytes of every queued-but-undelivered message, the wedged-client
+    /// signal: frames cannot be dropped mid-protocol, so a reader that
+    /// stopped consuming is cut off on this number instead.
+    bytes: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator) Outbox {
         return .{ .gpa = gpa };
@@ -3105,6 +3125,7 @@ pub const Outbox = struct {
         var m = Message{ .bytes = try buf.toOwnedSlice(self.gpa), .nfds = @intCast(fds.len) };
         for (fds, 0..) |f, i| m.fds[i] = f;
         try self.queue.append(self.gpa, m);
+        self.bytes += m.bytes.len;
     }
 
     pub fn empty(self: *const Outbox) bool {
@@ -3137,6 +3158,7 @@ pub const Outbox = struct {
         const m = self.queue.items[self.head];
         self.sent += n;
         if (self.sent < m.bytes.len) return;
+        self.bytes -= m.bytes.len;
         self.gpa.free(m.bytes);
         self.sent = 0;
         self.head += 1;

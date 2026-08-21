@@ -407,6 +407,17 @@ fn physicalOf(logical: u16, scale_x1000: u16) u16 {
 /// One protocol view: a windowless browser plus its shared frame buffer.
 pub const View = struct {
     id: u32,
+    /// Connection that created the view (multi-client serving); 0 when
+    /// the host runs without a router (unit tests, legacy single
+    /// client). Owner-scoped: every view-carrying event routes to this
+    /// connection only, and `find` refuses the view to any OTHER
+    /// dispatching connection.
+    owner: u32 = 0,
+    /// The owning connection asked for inline frames (`frame_mode`),
+    /// per-connection where `Host.inline_mode` is the process-wide
+    /// `--frames-inline` force. Latching like the global flag: never
+    /// turned back off (an anonymous buffer was never announced).
+    inline_view: bool = false,
     /// Latest scroll offset Chromium reported, and the last pair
     /// actually posted — the difference is what the throttle owes the
     /// client, so a scroll that STOPS still gets its resting position
@@ -775,9 +786,43 @@ const ProxyPref = struct {
 /// A single instance per process, reachable from the C callbacks
 /// through `g_host` — CEF handlers take no user-data pointer, and the
 /// single-threaded loop makes a global sound here.
+/// Multi-client routing seam, provided by the server that owns the
+/// connections. The host resolves an owning connection's outbound
+/// queue through it; when unset (unit tests, the pre-multi-client
+/// single-client shape) every post lands in `Host.out`.
+pub const Router = struct {
+    ctx: *anyopaque,
+    /// Outbox of connection `conn_id`, or null when that connection is
+    /// gone — the post is then dropped, exactly like a dead socket.
+    route: *const fn (ctx: *anyopaque, conn_id: u32) ?*proto.Outbox,
+    /// Live connection count + indexed access, for the rare broadcast
+    /// (viewless event with no dispatching connection).
+    count: *const fn (ctx: *anyopaque) usize,
+    at: *const fn (ctx: *anyopaque, i: usize) ?*proto.Outbox,
+    /// Client-namespace view id -> engine-global id for `conn_id`, 0
+    /// when invalid. The edge translates every TOP-LEVEL frame; this
+    /// exists for the one place a view id hides INSIDE a payload the
+    /// edge cannot see — `sem_request`'s wrapped inner frame.
+    mapView: *const fn (ctx: *anyopaque, conn_id: u32, id: u32) u32,
+};
+
+/// A resolved outbound target: where to post, and the id-window base
+/// to subtract so the frame carries the CLIENT's namespace again.
+const RouteTo = struct { out: *proto.Outbox, base: u32 };
+
 pub const Host = struct {
     gpa: std.mem.Allocator,
     out: *proto.Outbox,
+    /// Multi-client routing; null = single-outbox legacy behaviour.
+    router: ?Router = null,
+    /// Connection whose inbound frame is being dispatched (0 = none:
+    /// a CEF callback, a flush, a drain). Set by the server around
+    /// `dispatch`, consumed by `find`'s ownership check, view creation
+    /// stamping, and viewless-post routing.
+    dispatch_conn: u32 = 0,
+    /// The dispatching connection's inline-frame latch, stamped onto
+    /// views it creates.
+    dispatch_inline: bool = false,
     views: std.ArrayList(*View) = .empty,
     /// The view a create_browser_sync call is currently building, for
     /// the callbacks CEF fires BEFORE it returns the browser pointer.
@@ -1015,6 +1060,8 @@ pub const Host = struct {
         id: u32,
         rc: *cef.cef_request_context_t,
         ephemeral: bool,
+        /// Creating connection (multi-client), 0 without a router.
+        owner: u32 = 0,
     };
 
     pub fn init(gpa: std.mem.Allocator, out: *proto.Outbox) Host {
@@ -1140,6 +1187,7 @@ pub const Host = struct {
             .id = req.id,
             .rc = rc,
             .ephemeral = req.ephemeral != 0,
+            .owner = self.dispatch_conn,
         }) catch {
             if (pref != null) self.proxy_prefs.pop().?.releaseAll();
             release(&rc.base.base);
@@ -1177,7 +1225,21 @@ pub const Host = struct {
         installHandlers();
     }
 
+    /// View lookup, and the multi-client ownership chokepoint: while a
+    /// connection's frame is being dispatched, another connection's
+    /// view does not exist. Regular ids cannot cross namespaces (the
+    /// server's window arithmetic keeps them apart); this check is the
+    /// belt for engine-minted ids (inspectors), which pass the edge
+    /// untranslated.
     pub fn find(self: *Host, id: u32) ?*View {
+        const v = self.findAny(id) orelse return null;
+        if (self.dispatch_conn != 0 and v.owner != 0 and v.owner != self.dispatch_conn) return null;
+        return v;
+    }
+
+    /// Lookup without the ownership check — for the host's own routing
+    /// and cleanup, never for dispatching a client's frame.
+    fn findAny(self: *Host, id: u32) ?*View {
         for (self.views.items) |v| {
             if (v.id == id) return v;
         }
@@ -1247,6 +1309,8 @@ pub const Host = struct {
         const lh = @max(req.h, 1);
         v.* = .{
             .id = req.view,
+            .owner = self.dispatch_conn,
+            .inline_view = self.dispatch_inline,
             .w = lw,
             .h = lh,
             .scale_x1000 = scale,
@@ -1372,13 +1436,14 @@ pub const Host = struct {
     }
 
     fn announceBufferSystem(_: ?*anyopaque, self: *Host, v: *View, fd: c_int) !void {
-        try self.out.post(proto.FrameBuffer{
+        const r = self.routeFor(v.id) orelse return error.OwnerGone;
+        try r.out.post(toClientIds(proto.FrameBuffer{
             .view = v.id,
             .buf_id = v.buf_id,
             .w = v.pw,
             .h = v.ph,
             .stride = v.stride(),
-        }, fd);
+        }, r.base), fd);
     }
 
     /// Enumerated exits for everything that could wait on `id` forever.
@@ -1448,6 +1513,40 @@ pub const Host = struct {
     pub fn destroyAll(self: *Host) void {
         self.adopting = null;
         while (self.views.pop()) |v| self.freeView(v);
+    }
+
+    /// One connection is gone: destroy ITS views and contexts, leave
+    /// everyone else's alone. The engine keeps running for the clients
+    /// that remain; the last connection leaving is the server's cue to
+    /// exit through the ordinary destroyAll + drain path — the ONLY
+    /// path that reaches `cef_shutdown`, which is what flushes a
+    /// persistent profile's cookie jar to disk.
+    pub fn dropConn(self: *Host, conn_id: u32) void {
+        if (conn_id == 0) return;
+        // destroyView mutates the list (and closes popup/inspector
+        // dependents itself), so collect ids first and re-check each.
+        while (true) {
+            var target: u32 = 0;
+            for (self.views.items) |v| {
+                if (v.owner == conn_id) {
+                    target = v.id;
+                    break;
+                }
+            }
+            if (target == 0) break;
+            self.destroyView(target);
+        }
+        while (true) {
+            var ctx_id: u32 = 0;
+            for (self.contexts.items) |ctx| {
+                if (ctx.owner == conn_id) {
+                    ctx_id = ctx.id;
+                    break;
+                }
+            }
+            if (ctx_id == 0) break;
+            self.contextDestroy(ctx_id);
+        }
     }
 
     /// `view_discard`: destroy the browser, keep the view.
@@ -2033,7 +2132,7 @@ pub const Host = struct {
             v.map = &.{};
         }
         const size: usize = v.stride() * @as(usize, v.ph);
-        if (self.inline_mode) {
+        if (self.viewInline(v)) {
             // Inline mode: the buffer is helper-private (the client gets
             // pixels in-band), so an anonymous mapping replaces the
             // memfd and nothing is announced — the first frame_inline
@@ -2797,12 +2896,28 @@ pub const Host = struct {
         self.inline_mode = true;
     }
 
+    /// Latch inline mode onto every view a connection owns — the
+    /// per-connection `frame_mode`, where `setInlineMode` is the
+    /// process-wide spawn force. Buffers allocated afterwards are
+    /// anonymous; existing announced memfds keep painting until their
+    /// next reallocation, same as the global latch always behaved.
+    pub fn latchInlineForConn(self: *Host, conn_id: u32) void {
+        for (self.views.items) |v| {
+            if (v.owner == conn_id) v.inline_view = true;
+        }
+    }
+
+    fn viewInline(self: *const Host, v: *const View) bool {
+        return self.inline_mode or v.inline_view;
+    }
+
     /// Post accumulated inline damage for every view — the drain-side
     /// half of the union-and-flush backpressure. Called once per poll
     /// iteration, like `flushInterceptStatus`.
     pub fn flushInline(self: *Host) void {
-        if (!self.inline_mode) return;
-        for (self.views.items) |v| self.flushInlineView(v);
+        for (self.views.items) |v| {
+            if (self.viewInline(v)) self.flushInlineView(v);
+        }
     }
 
     /// Encode `v.inline_dirty` (if any) into banded `frame_inline`
@@ -2814,7 +2929,11 @@ pub const Host = struct {
             v.inline_dirty = null;
             return;
         }
-        if (self.out.pending() >= max_frame_backlog) return;
+        const route = self.routeFor(v.id) orelse {
+            v.inline_dirty = null;
+            return;
+        };
+        if (route.out.pending() >= max_frame_backlog) return;
         const stride: usize = v.stride();
         // Clamp against the live buffer: a dirty rect can predate a
         // resize by one poll iteration.
@@ -3395,7 +3514,9 @@ pub const Host = struct {
             const o = item.object;
             incoming.append(self.gpa, .{
                 .id = jsonU32(o, "id"),
-                .view = jsonU32(o, "view"),
+                // The tabs JSON names views in the SENDER's namespace;
+                // the edge cannot see into it, so translate at parse.
+                .view = self.mapDispatchView(jsonU32(o, "view")),
                 .window_id = jsonU32(o, "windowId"),
                 .index = jsonU32(o, "index"),
                 .active = jsonBool(o, "active"),
@@ -3554,6 +3675,11 @@ pub const Host = struct {
         const scale: u16 = if (req.scale_x1000 == 0) 1000 else req.scale_x1000;
         v.* = .{
             .id = req.popup_view,
+            // Hand-built (not registerView), so the multi-client owner
+            // stamp must be applied here too or the popup's frames are
+            // routed to nobody.
+            .owner = self.dispatch_conn,
+            .inline_view = self.dispatch_inline,
             .w = @max(req.w, 1),
             .h = @max(req.h, 1),
             .scale_x1000 = scale,
@@ -5637,20 +5763,39 @@ pub const Host = struct {
     /// Dispatch one request-id envelope through the existing semantic
     /// handlers. The inner payload is byte-for-byte the legacy frame's
     /// payload; only the outer tags are append-only additions.
+    /// A view id the dispatching CLIENT encoded inside an opaque
+    /// payload — where the socket edge could not translate it. Maps it
+    /// into the engine's namespace through the router; identity without
+    /// one, or outside a dispatch.
+    fn mapDispatchView(self: *Host, id: u32) u32 {
+        const rt = self.router orelse return id;
+        if (self.dispatch_conn == 0) return id;
+        return rt.mapView(rt.ctx, self.dispatch_conn, id);
+    }
+
+    /// The inner frame of a `sem_request` was encoded by the CLIENT, so
+    /// its view id is in the client's namespace — the socket edge only
+    /// translates top-level frames. Map it here, through the router.
+    fn innerReq(self: *Host, comptime T: type, payload: []const u8) !T {
+        var req = try proto.decode(T, payload);
+        req.view = self.mapDispatchView(req.view);
+        return req;
+    }
+
     pub fn semRequest(self: *Host, req: proto.SemRequest) !void {
         if (req.request == 0) return;
         const old_request = self.active_sem_request;
         self.active_sem_request = req.request;
         defer self.active_sem_request = old_request;
         switch (@as(proto.Tag, @enumFromInt(req.kind))) {
-            .sem_snapshot_req => try self.semSnapshot(try proto.decode(proto.SemSnapshotReq, req.payload.s)),
-            .sem_act => try self.semAct(try proto.decode(proto.SemAction, req.payload.s)),
-            .sem_expand => try self.semExpand(try proto.decode(proto.SemExpand, req.payload.s)),
-            .sem_query => try self.semQuery(try proto.decode(proto.SemQueryReq, req.payload.s)),
-            .sem_read => try self.semRead(try proto.decode(proto.SemRead, req.payload.s)),
-            .sem_read_ids => try self.semReadIds(try proto.decode(proto.SemReadIds, req.payload.s)),
-            .sem_act_guarded => try self.semActGuarded(try proto.decode(proto.SemActGuarded, req.payload.s)),
-            .sem_eval => try self.semEval(try proto.decode(proto.SemEval, req.payload.s)),
+            .sem_snapshot_req => try self.semSnapshot(try self.innerReq(proto.SemSnapshotReq, req.payload.s)),
+            .sem_act => try self.semAct(try self.innerReq(proto.SemAction, req.payload.s)),
+            .sem_expand => try self.semExpand(try self.innerReq(proto.SemExpand, req.payload.s)),
+            .sem_query => try self.semQuery(try self.innerReq(proto.SemQueryReq, req.payload.s)),
+            .sem_read => try self.semRead(try self.innerReq(proto.SemRead, req.payload.s)),
+            .sem_read_ids => try self.semReadIds(try self.innerReq(proto.SemReadIds, req.payload.s)),
+            .sem_act_guarded => try self.semActGuarded(try self.innerReq(proto.SemActGuarded, req.payload.s)),
+            .sem_eval => try self.semEval(try self.innerReq(proto.SemEval, req.payload.s)),
             else => {},
         }
     }
@@ -6373,22 +6518,106 @@ pub const Host = struct {
 
     // -- outbound ------------------------------------------------------
 
+    /// Resolve where an event about `view_id` goes and which id-window
+    /// base to strip so the frame reads in the owner's namespace again.
+    /// Null = the owning connection is gone; drop the event, exactly as
+    /// a dead socket would have.
+    fn routeFor(self: *Host, view_id: u32) ?RouteTo {
+        const rt = self.router orelse return .{ .out = self.out, .base = 0 };
+        if (view_id == 0) {
+            // A view-0 (engine-global) event answers the dispatching
+            // connection when there is one.
+            if (self.dispatch_conn != 0) {
+                const out = rt.route(rt.ctx, self.dispatch_conn) orelse return null;
+                return .{ .out = out, .base = 0 };
+            }
+            return null;
+        }
+        // Engine-minted ids (inspectors) carry no window; the owner is
+        // on the view record. Client-minted ids encode it.
+        const owner = if (view_id >= proto.DEVTOOLS_VIEW_BASE)
+            (self.findAny(view_id) orelse return null).owner
+        else
+            view_id / proto.CONN_ID_WINDOW;
+        const out = rt.route(rt.ctx, owner) orelse return null;
+        return .{
+            .out = out,
+            .base = if (view_id >= proto.DEVTOOLS_VIEW_BASE) 0 else owner * proto.CONN_ID_WINDOW,
+        };
+    }
+
+    /// Rewrite a frame's ids from the engine's global namespace into
+    /// the owning connection's, per `routeFor`'s base. Every field
+    /// carrying a client-minted view id is named here — `view`,
+    /// `owner_view`, `popup_view` — plus the context id; a new frame
+    /// field naming a view under a FOURTH name must be added or its
+    /// events reach the client untranslated. Engine-minted ids
+    /// (inspectors) pass through on purpose: the client learned them
+    /// untranslated.
+    fn toClientIds(value: anytype, base: u32) @TypeOf(value) {
+        var v2 = value;
+        if (base == 0) return v2;
+        inline for (.{ "view", "owner_view", "popup_view" }) |f| {
+            if (@hasField(@TypeOf(value), f)) {
+                const id = @field(v2, f);
+                if (id != 0 and id < proto.DEVTOOLS_VIEW_BASE) @field(v2, f) = id - base;
+            }
+        }
+        if (@hasField(@TypeOf(value), "context")) {
+            if (v2.context != 0) v2.context -= base;
+        }
+        return v2;
+    }
+
+    /// The view id a frame is routed by: `view`, else `owner_view`
+    /// (the webext popup family), else null (viewless).
+    fn routeKeyOf(value: anytype) ?u32 {
+        const T = @TypeOf(value);
+        if (@hasField(T, "view")) return @field(value, "view");
+        if (@hasField(T, "owner_view")) return @field(value, "owner_view");
+        return null;
+    }
+
     /// Post an event, dropping it if the outbox is out of memory: a
     /// missed event must never take the helper down.
     fn post(self: *Host, value: anytype) void {
         const T = @TypeOf(value);
-        if (self.active_sem_request != 0 and semanticResult(T)) {
-            var payload: std.ArrayList(u8) = .empty;
-            defer payload.deinit(self.gpa);
-            proto.encodePayload(self.gpa, &payload, value) catch return;
-            self.out.post(proto.SemResult{
-                .request = self.active_sem_request,
-                .kind = @intFromEnum(T.tag),
-                .payload = .{ .s = payload.items },
-            }, null) catch {};
+        if (comptime (@hasField(T, "view") or @hasField(T, "owner_view"))) {
+            const r = self.routeFor(routeKeyOf(value).?) orelse return;
+            const v2 = toClientIds(value, r.base);
+            if (self.active_sem_request != 0 and semanticResult(T)) {
+                var payload: std.ArrayList(u8) = .empty;
+                defer payload.deinit(self.gpa);
+                proto.encodePayload(self.gpa, &payload, v2) catch return;
+                r.out.post(proto.SemResult{
+                    .request = self.active_sem_request,
+                    .kind = @intFromEnum(T.tag),
+                    .payload = .{ .s = payload.items },
+                }, null) catch {};
+                return;
+            }
+            r.out.post(v2, null) catch {};
             return;
         }
-        self.out.post(value, null) catch {};
+        // Viewless frame: answer the dispatching connection, else
+        // broadcast — the viewless family is engine-global state
+        // (webext registry, filter lists), which in Phase 1 keeps its
+        // last-writer-wins semantics, so every client observing every
+        // change is the coherent reading. The per-connection-overlay
+        // question is Phase 4's, decided deliberately, not here.
+        const rt = self.router orelse {
+            self.out.post(value, null) catch {};
+            return;
+        };
+        if (self.dispatch_conn != 0) {
+            if (rt.route(rt.ctx, self.dispatch_conn)) |out| out.post(value, null) catch {};
+            return;
+        }
+        var i: usize = 0;
+        const n = rt.count(rt.ctx);
+        while (i < n) : (i += 1) {
+            if (rt.at(rt.ctx, i)) |out| out.post(value, null) catch {};
+        }
     }
 
     /// Post a GPU frame with its plane descriptors, or drop it.
@@ -6400,11 +6629,15 @@ pub const Host = struct {
     /// the same time. A dropped frame costs nothing — the next one is a
     /// full buffer, not a delta.
     fn postDmabuf(self: *Host, value: proto.FrameDmabuf, fds: []const i32) void {
-        if (self.out.pending() >= max_frame_backlog) {
+        const r = self.routeFor(value.view) orelse {
+            for (fds) |fd| _ = c.close(fd);
+            return;
+        };
+        if (r.out.pending() >= max_frame_backlog) {
             for (fds) |fd| _ = c.close(fd);
             return;
         }
-        self.out.postFds(value, fds) catch {
+        r.out.postFds(toClientIds(value, r.base), fds) catch {
             for (fds) |fd| _ = c.close(fd);
         };
     }
@@ -10982,7 +11215,7 @@ fn onPaint(
     v.buf_unpainted = false;
     latStamp("paint");
     v.gen +%= 1;
-    if (host.inline_mode) {
+    if (host.viewInline(v)) {
         // Union rather than queue: a slow bridge coalesces bursts into
         // one damage rect instead of growing the outbox without bound.
         for (list[0..n]) |r| unionDirty(v, r);
