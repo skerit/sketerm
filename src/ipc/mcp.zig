@@ -49,7 +49,9 @@ const MCP_HELP =
     \\or touch your real sessions or windows. The private daemon and
     \\its apps are torn down when the MCP server exits.
     \\  --durable      keep the private daemon (and its apps) running
-    \\                 across MCP restarts (instance name "default")
+    \\                 across MCP restarts as the instance named
+    \\                 "default" (exactly `--name default`): a later
+    \\                 `sketerm mcp --durable` finds it again
     \\  --name NAME    named durable instance; a later `sketerm mcp
     \\                 --name NAME` reconnects to the same daemon. A
     \\                 private daemon left with no apps and no clients
@@ -218,9 +220,18 @@ pub const Opts = struct {
             }
         }
         if (o.shared and (o.durable or o.name != null)) return error.SharedConflict;
+        // A durable instance is found again by NAME. Without one the dir
+        // would be `mcp-tmp-<pid>`, which no later run can name and which
+        // the startup orphan sweep reaps as soon as this pid is gone --
+        // i.e. the exact opposite of durable.
+        if (o.durable and o.name == null) o.name = DURABLE_DEFAULT_NAME;
         return o;
     }
 };
+
+/// Instance name of `--durable` without `--name` (documented in MCP_HELP
+/// since the flag shipped).
+pub const DURABLE_DEFAULT_NAME = "default";
 
 fn validInstanceName(n: []const u8) bool {
     if (n.len == 0 or n.len > 48) return false;
@@ -8276,9 +8287,17 @@ test "mcp flag parsing: isolation modes" {
     const named = try Opts.parse(&.{ "--name", "agent-1" });
     try t.expect(named.durable);
     try t.expectEqualStrings("agent-1", named.name.?);
-    // --durable alone (unnamed durable instance).
+    // --durable alone IS the instance named "default": a durable
+    // instance is looked up by name, so an unnamed one would land in a
+    // mcp-tmp-<pid> dir nothing can find again and the startup sweep
+    // reaps. An explicit --name after --durable still wins.
     const dur = try Opts.parse(&.{"--durable"});
-    try t.expect(dur.durable and dur.name == null);
+    try t.expect(dur.durable);
+    try t.expectEqualStrings(DURABLE_DEFAULT_NAME, dur.name.?);
+    const dur_named = try Opts.parse(&.{ "--durable", "--name", "agent-2" });
+    try t.expectEqualStrings("agent-2", dur_named.name.?);
+    const named_dur = try Opts.parse(&.{ "--name", "agent-3", "--durable" });
+    try t.expectEqualStrings("agent-3", named_dur.name.?);
     // --shared excludes isolation flags.
     try t.expectError(error.SharedConflict, Opts.parse(&.{ "--shared", "--durable" }));
     try t.expectError(error.SharedConflict, Opts.parse(&.{ "--shared", "--name", "x" }));
@@ -8299,6 +8318,49 @@ test "mcp flag parsing: isolation modes" {
     try t.expectError(error.BadName, Opts.parse(&.{ "--name", "a/b" }));
     try t.expectError(error.BadName, Opts.parse(&.{ "--name", "" }));
     try t.expectError(error.UnknownFlag, Opts.parse(&.{"--bogus"}));
+}
+
+test "mcp isolation dir: durable is named, ephemeral is pid-based" {
+    const t = std.testing;
+    const allocator = t.allocator;
+
+    const saved = if (c.getenv("XDG_RUNTIME_DIR")) |v|
+        try allocator.dupe(u8, std.mem.span(@as([*:0]const u8, @ptrCast(v))))
+    else
+        null;
+    defer if (saved) |s| allocator.free(s);
+    var root_buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrintZ(&root_buf, "/tmp/sk-mcp-iso-{d}", .{c.getpid()});
+    _ = c.mkdir(root.ptr, 0o700);
+    _ = c.setenv("XDG_RUNTIME_DIR", root.ptr, 1);
+    defer {
+        if (saved) |s| {
+            var z: [4096]u8 = undefined;
+            if (std.fmt.bufPrintZ(&z, "{s}", .{s})) |sz| {
+                _ = c.setenv("XDG_RUNTIME_DIR", sz.ptr, 1);
+            } else |_| {}
+        } else _ = c.unsetenv("XDG_RUNTIME_DIR");
+        var cmd: [256]u8 = undefined;
+        if (std.fmt.bufPrintZ(&cmd, "rm -rf -- '{s}'", .{root})) |cz| _ = c.system(cz.ptr) else |_| {}
+    }
+
+    // `--durable` alone must land in a dir a later run can find again.
+    const dur = try Opts.parse(&.{"--durable"});
+    var iso = setupIsolation(allocator, dur.name, dur.durable).?;
+    defer iso.deinit(allocator);
+    try t.expect(iso.durable);
+    try t.expect(std.mem.endsWith(u8, iso.dir, "/sketerm/mcp-default"));
+    try t.expect(std.mem.endsWith(u8, iso.sock, "/sketerm/mcp-default/mux.sock"));
+    // ... and must NOT be swept as an orphan the way mcp-tmp-<pid> is.
+    try t.expect(std.mem.indexOf(u8, iso.dir, "mcp-tmp-") == null);
+
+    // The default (ephemeral) instance keeps its pid-based dir.
+    const def = try Opts.parse(&.{});
+    var eph = setupIsolation(allocator, def.name, def.durable).?;
+    defer eph.deinit(allocator);
+    try t.expect(!eph.durable);
+    var want: [64]u8 = undefined;
+    try t.expect(std.mem.endsWith(u8, eph.dir, try std.fmt.bufPrint(&want, "/mcp-tmp-{d}", .{c.getpid()})));
 }
 
 test "mcp log: entries and screenshot files land in the dir" {

@@ -960,6 +960,32 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: named durable daemon survives restart ok");
     }
 
+    // ── Stage 2b: bare --durable is the instance named "default" ──
+    // It used to fall through to the pid-based mcp-tmp-<pid> dir, which
+    // no later run can name and the startup sweep reaps.
+    {
+        var m = Mcp.spawn(allocator, exe, &.{"--durable"});
+        m.initialize();
+        const open = m.callTool("term_open", "{\"command\":[\"/bin/sh\"]}");
+        if (std.mem.indexOf(u8, open, "opened headless terminal") == null) fail("bare --durable term_open failed");
+        var dir_buf: [512]u8 = undefined;
+        const dir = std.fmt.bufPrint(&dir_buf, "{s}/sketerm/mcp-default", .{rt}) catch unreachable;
+        if (!fileExists(dir)) fail("bare --durable did not use the mcp-default instance dir");
+        var tmp_buf: [512]u8 = undefined;
+        const tmp_dir = std.fmt.bufPrint(&tmp_buf, "{s}/sketerm/mcp-tmp-{d}", .{ rt, m.pid }) catch unreachable;
+        if (fileExists(tmp_dir)) fail("bare --durable used an ephemeral pid dir");
+        m.closeStdinWait();
+        _ = c.usleep(500_000);
+        if (!fileExists(dir)) fail("bare --durable instance dir removed (should persist)");
+        // A second bare --durable finds the same instance again.
+        var m2 = Mcp.spawn(allocator, exe, &.{"--durable"});
+        m2.initialize();
+        const run = m2.callTool("term_open", "{\"command\":[\"/bin/sh\"]}");
+        if (std.mem.indexOf(u8, run, "opened headless terminal") == null) fail("reconnected bare --durable term_open failed");
+        m2.closeStdinWait();
+        say("smoke-mcp: bare --durable is the \"default\" instance ok");
+    }
+
     // ── Stage 3: tool exposure policy (SKETERM_MCP_TOOLS) ─────────
     // Filtering tools/list is presentation; the load-bearing half is
     // that tools/call refuses a withheld tool a client learned about
