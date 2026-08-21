@@ -557,6 +557,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused headless browsing profiles ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBPOLICY_ONLY") != null) {
+        webPolicyFakeStage(allocator, exe, rt);
+        say("smoke-mcp: focused network policy (fake helper) ok");
+        return 0;
+    }
 
     // ── Stage 1: ephemeral isolation + headless terminal ──────────
     {
@@ -1930,6 +1935,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     webProfileFakeStage(allocator, exe, rt);
     say("smoke-mcp: headless browsing profiles (fake helper) ok");
 
+    // ── enforced network policy (no CEF needed) ────────────────────
+    webPolicyFakeStage(allocator, exe, rt);
+    say("smoke-mcp: enforced network policy (fake helper) ok");
+
     // ── web_* headless: isolated mode, NO GUI, no --shared ─────────
     //
     // The regression this guards: the web tools once hard-failed with
@@ -1948,6 +1957,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             defer _ = c.unsetenv("SKETERM_WEB_BIN");
             webStage(allocator, exe, rt);
             say("smoke-mcp: headless web tools ok");
+            webPolicyStage(allocator, exe, rt);
+            say("smoke-mcp: enforced network policy (real CEF) ok");
         }
     }
 
@@ -2077,6 +2088,144 @@ const TinyHttp = struct {
         }
         if (self.thread) |t| t.detach();
         self.thread = null;
+    }
+};
+
+/// Route-aware loopback fixture for the ENFORCED-policy stage. Every
+/// path keeps a HIT COUNTER: "the server was never touched" is the
+/// proof standard here — a page error alone proves nothing about
+/// whether the request left the process.
+const PolicyHttp = struct {
+    fd: c_int = -1,
+    port: u16 = 0,
+
+    const PATHS = [_][]const u8{
+        "/doc",         "/doc2",        "/offsite-page",  "/img.png",        "/imgs",
+        "/blocked.png", "/sub.js",      "/redir-offsite", "/offsite-target", "/many",
+        "/r0",          "/r1",          "/r2",            "/r3",             "/r4",
+        "/r5",          "/r6",          "/r7",            "/r8",             "/r9",
+        "/slow",        "/favicon.ico",
+    };
+    var hits: [PATHS.len]std.atomic.Value(u32) = @splat(std.atomic.Value(u32).init(0));
+
+    fn idx(path: []const u8) ?usize {
+        for (PATHS, 0..) |p, i| {
+            if (std.mem.eql(u8, p, path)) return i;
+        }
+        return null;
+    }
+
+    fn hitsFor(path: []const u8) u32 {
+        return hits[idx(path).?].load(.acquire);
+    }
+
+    fn start() ?PolicyHttp {
+        for (&hits) |*h| h.store(0, .release);
+        var self = PolicyHttp{};
+        self.fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        if (self.fd < 0) return null;
+        var one: c_int = 1;
+        _ = c.setsockopt(self.fd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
+        var sa = std.mem.zeroes(c.struct_sockaddr_in);
+        sa.sin_family = c.AF_INET;
+        sa.sin_port = 0;
+        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
+        if (c.bind(self.fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or
+            c.listen(self.fd, 32) != 0)
+        {
+            _ = c.close(self.fd);
+            return null;
+        }
+        var got = std.mem.zeroes(c.struct_sockaddr_in);
+        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+        if (c.getsockname(self.fd, @ptrCast(&got), &glen) != 0) {
+            _ = c.close(self.fd);
+            return null;
+        }
+        self.port = std.mem.bigToNative(u16, got.sin_port);
+        const t = std.Thread.spawn(.{}, acceptLoop, .{ self.fd, self.port }) catch {
+            _ = c.close(self.fd);
+            return null;
+        };
+        t.detach();
+        return self;
+    }
+
+    fn acceptLoop(lfd: c_int, port: u16) void {
+        while (true) {
+            const cfd = c.accept(lfd, null, null);
+            if (cfd < 0) return;
+            // A thread per connection: /slow must not starve the
+            // browser's parallel subresource fetches.
+            const t = std.Thread.spawn(.{}, serveOne, .{ cfd, port }) catch {
+                _ = c.close(cfd);
+                continue;
+            };
+            t.detach();
+        }
+    }
+
+    fn serveOne(cfd: c_int, port: u16) void {
+        defer _ = c.close(cfd);
+        var req: [4096]u8 = undefined;
+        const n = c.read(cfd, &req, req.len);
+        if (n <= 0) return;
+        const line = req[0..@intCast(n)];
+        const sp1 = std.mem.indexOfScalar(u8, line, ' ') orelse return;
+        const rest = line[sp1 + 1 ..];
+        const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse return;
+        var path = rest[0..sp2];
+        if (std.mem.indexOfScalar(u8, path, '?')) |q| path = path[0..q];
+        if (idx(path)) |i| _ = hits[i].fetchAdd(1, .acq_rel);
+
+        var body_buf: [2048]u8 = undefined;
+        var body: []const u8 = "<html><title>policy</title><body>ok</body></html>";
+        var ctype: []const u8 = "text/html";
+        var status: []const u8 = "200 OK";
+        var location_buf: [128]u8 = undefined;
+        var location: []const u8 = "";
+        if (std.mem.eql(u8, path, "/offsite-page")) {
+            // The img lives on ANOTHER HOST (localhost vs 127.0.0.1 —
+            // same machine, different host STRING, which is all a host
+            // allow-list can see); the script is same-host.
+            body = std.fmt.bufPrint(&body_buf, "<html><title>offsite sub</title><body><img src=\"http://localhost:{d}/img.png\"><script src=\"/sub.js\"></script><p>SUBHOST-PAGE</p></body></html>", .{port}) catch return;
+        } else if (std.mem.eql(u8, path, "/imgs")) {
+            body = "<html><title>imgs</title><body><img src=\"/blocked.png\"><p>TYPEBLOCK-PAGE</p></body></html>";
+        } else if (std.mem.eql(u8, path, "/many")) {
+            body = "<html><title>many</title><body>" ++
+                "<img src=\"/r0\"><img src=\"/r1\"><img src=\"/r2\"><img src=\"/r3\"><img src=\"/r4\">" ++
+                "<img src=\"/r5\"><img src=\"/r6\"><img src=\"/r7\"><img src=\"/r8\"><img src=\"/r9\">" ++
+                "<p>MANY-PAGE</p></body></html>";
+        } else if (std.mem.eql(u8, path, "/redir-offsite")) {
+            status = "302 Found";
+            location = std.fmt.bufPrint(&location_buf, "http://localhost:{d}/offsite-target", .{port}) catch return;
+            body = "";
+        } else if (std.mem.eql(u8, path, "/slow")) {
+            // Long enough for a 1500ms deadline to latch mid-load.
+            _ = c.usleep(4_000_000);
+        } else if (std.mem.endsWith(u8, path, ".png") or std.mem.startsWith(u8, path, "/r")) {
+            ctype = "image/png";
+            body = "\x89PNG-not-really";
+        } else if (std.mem.eql(u8, path, "/sub.js")) {
+            ctype = "text/javascript";
+            body = "window.SUB_OK=1;";
+        }
+
+        var head: [512]u8 = undefined;
+        const hdr = if (location.len > 0)
+            std.fmt.bufPrint(&head, "HTTP/1.1 {s}\r\nLocation: {s}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", .{ status, location }) catch return
+        else
+            std.fmt.bufPrint(&head, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", .{ status, ctype, body.len }) catch return;
+        _ = c.send(cfd, hdr.ptr, hdr.len, c.MSG_NOSIGNAL);
+        if (body.len > 0) _ = c.send(cfd, body.ptr, body.len, c.MSG_NOSIGNAL);
+    }
+
+    fn deinit(self: *PolicyHttp) void {
+        if (self.fd >= 0) {
+            _ = c.shutdown(self.fd, c.SHUT_RDWR);
+            _ = c.close(self.fd);
+            self.fd = -1;
+        }
     }
 };
 
@@ -2420,6 +2569,166 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     legacy.closeStdinWait();
 }
 
+/// Real-CEF proof of the ENFORCED network policy: every assertion here
+/// is a server-side HIT COUNTER, because the whole point is that a
+/// refused request never touches a socket.
+fn webPolicyStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    _ = rt;
+    var http = PolicyHttp.start() orelse fail("could not bind the loopback policy fixture");
+    defer http.deinit();
+    var args_buf: [2048]u8 = undefined;
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+
+    // (17) The private-address default: 127.0.0.1 is refused BEFORE the
+    // socket is touched, even though the host is allow-listed.
+    {
+        m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/doc\",\"timeout_ms\":4000,\"policy\":{{\"allow_hosts\":[\"127.0.0.1\"]}}}}", .{http.port}) catch unreachable);
+        const opened = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, opened, "\"isError\":true") != null)
+            fail("a policied web_open failed outright (the view should open; its LOAD is refused)");
+        if (std.mem.indexOf(u8, opened, "\"settled\":false") == null)
+            fail("a private-refused document still settled");
+        if (PolicyHttp.hitsFor("/doc") != 0)
+            fail("the private-address refusal happened AFTER the socket was touched");
+        const pol = m.callTool("web_policy", "{}");
+        if (std.mem.indexOf(u8, pol, "\"private_address\":") == null)
+            fail("web_policy does not count the private-address refusal");
+        _ = m.callTool("web_close", "{}");
+    }
+
+    // (18) Host allow-list, both halves: an allowed document with a
+    // same-host script, an offsite (localhost) image cancelled before
+    // the wire — and a disallowed DOCUMENT refused as its own verdict.
+    {
+        m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/offsite-page\",\"timeout_ms\":8000,\"policy\":{{\"allow_hosts\":[\"127.0.0.1\"],\"allow_private_addresses\":true}}}}", .{http.port}) catch unreachable);
+        const opened = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, opened, "\"isError\":true") != null)
+            fail("the allow-listed document did not open");
+        if (std.mem.indexOf(u8, opened, "SUBHOST-PAGE") == null)
+            fail("the offsite-sub page did not render");
+        if (PolicyHttp.hitsFor("/offsite-page") != 1 or PolicyHttp.hitsFor("/sub.js") != 1)
+            fail("the allowed document/script did not reach the server exactly once");
+        if (PolicyHttp.hitsFor("/img.png") != 0)
+            fail("the offsite subresource reached the server (sub_host must cancel pre-wire)");
+        const net = m.callTool("web_network", "{}");
+        if (std.mem.indexOf(u8, net, "\"reason\":\"sub_host\"") == null)
+            fail("web_network does not name the sub_host refusal");
+        _ = m.callTool("web_close", "{}");
+
+        // The disallowed initial url: the DOCUMENT request itself
+        // carries a policy verdict (the install won the create race).
+        m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://localhost:{d}/doc2\",\"timeout_ms\":4000,\"policy\":{{\"allow_hosts\":[\"127.0.0.1\"],\"allow_private_addresses\":true}}}}", .{http.port}) catch unreachable);
+        _ = m.recvLine(60_000);
+        if (PolicyHttp.hitsFor("/doc2") != 0)
+            fail("a disallowed initial document still reached the server");
+        const pol = m.callTool("web_policy", "{}");
+        if (std.mem.indexOf(u8, pol, "\"top_host\":") == null)
+            fail("web_policy does not count the top_host refusal");
+        _ = m.callTool("web_close", "{}");
+    }
+
+    // (19) Resource-type blocking: the same-host image never leaves.
+    {
+        m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/imgs\",\"timeout_ms\":8000,\"policy\":{{\"allow_hosts\":[\"127.0.0.1\"],\"allow_private_addresses\":true,\"block_types\":[\"image\"]}}}}", .{http.port}) catch unreachable);
+        const opened = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, opened, "TYPEBLOCK-PAGE") == null)
+            fail("the type-block page did not render");
+        if (PolicyHttp.hitsFor("/imgs") != 1) fail("the type-block document did not load exactly once");
+        if (PolicyHttp.hitsFor("/blocked.png") != 0)
+            fail("a blocked resource TYPE still reached the server");
+        const net = m.callTool("web_network", "{}");
+        if (std.mem.indexOf(u8, net, "\"reason\":\"resource_type\"") == null)
+            fail("web_network does not name the resource_type refusal");
+        _ = m.callTool("web_close", "{}");
+    }
+
+    // (20) A 302 to a disallowed host: the target is never fetched.
+    // Step-0 measurement: CEF re-enters on_before_resource_load for the
+    // redirected request (same request id), so the ordinary gate IS the
+    // redirect defence — this stage is what holds that measurement true.
+    {
+        m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/redir-offsite\",\"timeout_ms\":4000,\"policy\":{{\"allow_hosts\":[\"127.0.0.1\"],\"allow_private_addresses\":true}}}}", .{http.port}) catch unreachable);
+        _ = m.recvLine(60_000);
+        if (PolicyHttp.hitsFor("/redir-offsite") != 1)
+            fail("the redirecting document did not load exactly once");
+        if (PolicyHttp.hitsFor("/offsite-target") != 0)
+            fail("a redirect to a disallowed host reached the server");
+        const net = m.callTool("web_network", "{}");
+        if (std.mem.indexOf(u8, net, "\"reason\":\"redirect_host\"") == null)
+            fail("web_network does not name the redirect_host refusal");
+        _ = m.callTool("web_close", "{}");
+    }
+
+    // (21) The request cap: exactly 3 requests leave the process (the
+    // document included — favicon probes and subresources compete for
+    // the remaining 2), then everything latches and navigation refuses.
+    {
+        m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/many\",\"timeout_ms\":8000,\"policy\":{{\"allow_hosts\":[\"127.0.0.1\"],\"allow_private_addresses\":true,\"max_requests\":3}}}}", .{http.port}) catch unreachable);
+        _ = m.recvLine(60_000);
+        var sub_hits: u32 = 0;
+        for ([_][]const u8{ "/r0", "/r1", "/r2", "/r3", "/r4", "/r5", "/r6", "/r7", "/r8", "/r9" }) |p|
+            sub_hits += PolicyHttp.hitsFor(p);
+        // The favicon is deliberately OUTSIDE this sum: the browser-path
+        // favicon request is denied (the log proves it), but CEF's
+        // favicon fetcher ALSO probes through a browserless URLRequest,
+        // which is the documented unpoliced slot-less path (measured
+        // here: exactly one /favicon.ico hit despite the denial).
+        const total = PolicyHttp.hitsFor("/many") + sub_hits;
+        if (PolicyHttp.hitsFor("/many") != 1) fail("the capped document did not load exactly once");
+        if (total > 3) {
+            std.debug.print("smoke-mcp: request-cap counters: many={d} subs={d} favicon={d}\n", .{
+                PolicyHttp.hitsFor("/many"), sub_hits, PolicyHttp.hitsFor("/favicon.ico"),
+            });
+            fail("more requests reached the server than max_requests allows");
+        }
+        const pol = m.callTool("web_policy", "{}");
+        if (std.mem.indexOf(u8, pol, "\"exhausted_reason\":\"request_cap\"") == null or
+            std.mem.indexOf(u8, pol, "\"requests\":3") == null)
+            fail("web_policy does not report the latched request cap");
+        const nav = m.callTool("web_navigate", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/doc\"}}", .{http.port}) catch unreachable);
+        if (std.mem.indexOf(u8, nav, "\"code\":\"refused\"") == null)
+            fail("an exhausted view still navigates");
+        // Reads keep answering, loudly.
+        const shot = m.callTool("web_snapshot", "{}");
+        if (std.mem.indexOf(u8, shot, "\"policy_exhausted\":true") == null)
+            fail("a read on the exhausted view does not carry the exhausted fact");
+        _ = m.callTool("web_close", "{}");
+    }
+
+    // (22) The deadline: latched by the sweep mid-load, one stop_load,
+    // and the accounting says so.
+    {
+        m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/slow\",\"timeout_ms\":4000,\"policy\":{{\"allow_hosts\":[\"127.0.0.1\"],\"allow_private_addresses\":true,\"deadline_ms\":1500}}}}", .{http.port}) catch unreachable);
+        _ = m.recvLine(60_000);
+        if (PolicyHttp.hitsFor("/slow") != 1) fail("the slow document was never requested");
+        const pol = m.callTool("web_policy", "{}");
+        if (std.mem.indexOf(u8, pol, "\"exhausted_reason\":\"deadline\"") == null)
+            fail("web_policy does not report the latched deadline");
+        _ = m.callTool("web_close", "{}");
+    }
+    m.closeStdinWait();
+
+    // (23) The capability kill-switch: a helper started without
+    // net-policy refuses a policied open outright, minting nothing.
+    {
+        _ = c.setenv("SKETERM_WEB_DISABLE_NET_POLICY", "1", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_DISABLE_NET_POLICY");
+        var suppressed = Mcp.spawn(allocator, exe, &.{});
+        suppressed.initialize();
+        suppressed.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"http://127.0.0.1:{d}/doc\",\"policy\":{{\"allow_hosts\":[\"127.0.0.1\"],\"allow_private_addresses\":true}}}}", .{http.port}) catch unreachable);
+        const refused = suppressed.recvLine(60_000);
+        if (std.mem.indexOf(u8, refused, "\"isError\":true") == null or
+            std.mem.indexOf(u8, refused, "net-policy capability") == null)
+            fail("a helper without net-policy did not refuse the policied open");
+        const tabs = suppressed.callTool("web_tabs", "{}");
+        if (std.mem.indexOf(u8, tabs, "\"count\":0") == null)
+            fail("the suppressed-capability refusal still minted a view");
+        suppressed.closeStdinWait();
+    }
+}
+
 /// Read a small file fully; empty slice when missing/unreadable.
 fn readSmall(path: []const u8, buf: []u8) []const u8 {
     var z: [4096:0]u8 = undefined;
@@ -2494,6 +2803,10 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
     defer out.deinit(allocator);
     var url_buf: [2048]u8 = undefined;
     var url_len: usize = 0;
+    // The last received policy per view (tiny: the stages open few).
+    var pol_views: [8]u32 = @splat(0);
+    var pol_serials: [8]u32 = @splat(0);
+    var pol_n: usize = 0;
     while (true) {
         var tmp: [65536]u8 = undefined;
         const n = c.read(fd, &tmp, tmp.len);
@@ -2508,14 +2821,56 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
                     // fake is an old helper, which is exactly what the
                     // fail-closed regression guard needs.
                     const with_contexts = c.getenv("SKETERM_FAKE_WEB_CONTEXTS") != null;
+                    const with_policy = c.getenv("SKETERM_FAKE_WEB_POLICY") != null;
                     const base = [_][]const u8{ webproto.CAP_FRAMES_SHM, webproto.CAP_SEMANTIC, webproto.CAP_VIEW_CREATE_URL };
                     const ctx = base ++ [_][]const u8{ webproto.CAP_CONTEXTS, webproto.CAP_CONTEXTS_FAIL_CLOSED };
-                    const caps: []const []const u8 = if (with_contexts) &ctx else &base;
+                    const pol = base ++ [_][]const u8{webproto.CAP_NET_POLICY};
+                    const both = ctx ++ [_][]const u8{webproto.CAP_NET_POLICY};
+                    const caps: []const []const u8 = if (with_contexts and with_policy)
+                        &both
+                    else if (with_contexts)
+                        &ctx
+                    else if (with_policy)
+                        &pol
+                    else
+                        &base;
                     webproto.encode(allocator, &out, webproto.HelloAck{
                         .proto = webproto.PROTO_VERSION,
                         .engine_name = "fake",
                         .engine_version = "0",
                         .caps = caps,
+                    }) catch return 1;
+                },
+                .net_policy_set => {
+                    const req = webproto.NetPolicySet.decodeAlloc(frame.payload, allocator) catch return 1;
+                    defer allocator.free(req.allow_top);
+                    defer allocator.free(req.allow_sub);
+                    fakeFrameLog("net_policy_set view={d} serial={d} top={d} max_requests={d}\n", .{
+                        req.view, req.serial, req.allow_top.len, req.max_requests,
+                    });
+                    if (pol_n < pol_views.len) {
+                        pol_views[pol_n] = req.view;
+                        pol_serials[pol_n] = req.serial;
+                        pol_n += 1;
+                    }
+                },
+                .net_policy_req => {
+                    const req = webproto.decode(webproto.NetPolicyReq, frame.payload) catch return 1;
+                    var serial: u32 = 0;
+                    for (pol_views[0..pol_n], pol_serials[0..pol_n]) |v, s| {
+                        if (v == req.view) serial = s;
+                    }
+                    const exhausted = c.getenv("SKETERM_FAKE_WEB_POLICY_EXHAUST") != null;
+                    webproto.encode(allocator, &out, webproto.EvNetPolicy{
+                        .view = req.view,
+                        .serial = serial,
+                        .active = if (serial != 0) 1 else 0,
+                        .exhausted = if (exhausted) @intFromEnum(webproto.NetReason.request_cap) else 0,
+                        .requests = if (exhausted) 5 else 1,
+                        .bytes = 100,
+                        .navigations = 1,
+                        .ms_left = 0,
+                        .denied = @splat(0),
                     }) catch return 1;
                 },
                 .context_create => {
@@ -2553,6 +2908,28 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
                             .state = @intFromEnum(webproto.LoadState.finished),
                             .url = url_buf[0..url_len],
                         }) catch return 1;
+                        // A policied view under the exhaust switch
+                        // latches immediately: the client's settle pump
+                        // sees the event with no extra round trip.
+                        if (c.getenv("SKETERM_FAKE_WEB_POLICY_EXHAUST") != null) {
+                            var serial: u32 = 0;
+                            for (pol_views[0..pol_n], pol_serials[0..pol_n]) |v, s| {
+                                if (v == req.view) serial = s;
+                            }
+                            if (serial != 0) {
+                                webproto.encode(allocator, &out, webproto.EvNetPolicy{
+                                    .view = req.view,
+                                    .serial = serial,
+                                    .active = 1,
+                                    .exhausted = @intFromEnum(webproto.NetReason.request_cap),
+                                    .requests = 5,
+                                    .bytes = 100,
+                                    .navigations = 1,
+                                    .ms_left = 0,
+                                    .denied = @splat(0),
+                                }) catch return 1;
+                            }
+                        }
                     }
                 },
                 .sem_snapshot_req => {
@@ -2895,6 +3272,150 @@ fn webProfileFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
     }
 }
 
+/// CEF-free proof of the ENFORCED network-policy lane: the exact wire
+/// order, the capability-less fail-closed refusal, and the exhausted
+/// contract (traffic refused, reads loud). Same fake-helper setup as
+/// `webProfileFakeStage`.
+fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var self_buf: [4096:0]u8 = undefined;
+    const self_len = c.readlink("/proc/self/exe", &self_buf, self_buf.len - 1);
+    if (self_len <= 0) fail("cannot resolve the smoke binary path");
+    self_buf[@intCast(self_len)] = 0;
+    _ = c.setenv("SKETERM_WEB_BIN", &self_buf, 1);
+    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    _ = c.setenv("SKETERM_FAKE_WEBENGINE", "1", 1);
+    defer _ = c.unsetenv("SKETERM_FAKE_WEBENGINE");
+    _ = c.setenv("SKETERM_WEB_SESSION", "0", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_SESSION");
+
+    var file_buf: [64 * 1024]u8 = undefined;
+
+    // (14) Fail closed: a helper without the capability refuses a
+    // policied open and leaves ZERO views — an unpoliced fallback would
+    // look like success here.
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"policy\":{\"allow_hosts\":[\"smoke.invalid\"]}}");
+        const refused = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, refused, "\"isError\":true") == null or
+            std.mem.indexOf(u8, refused, "\"code\":\"unavailable\"") == null or
+            std.mem.indexOf(u8, refused, "net-policy capability") == null)
+            fail("a helper without net-policy did not refuse a policied open");
+        const tabs = m.callTool("web_tabs", "{}");
+        if (std.mem.indexOf(u8, tabs, "\"count\":0") == null)
+            fail("a refused policy still minted a view (the fail-closed regression)");
+        // A malformed policy is a caller error, before any helper talk.
+        const bad = m.callTool("web_open", "{\"url\":\"https://smoke.invalid/\",\"policy\":{\"allow_hosts\":[\"*\"]}}");
+        if (std.mem.indexOf(u8, bad, "\"code\":\"invalid_args\"") == null)
+            fail("web_open accepted a wildcard host entry");
+        m.closeStdinWait();
+    }
+
+    _ = c.setenv("SKETERM_FAKE_WEB_POLICY", "1", 1);
+    defer _ = c.unsetenv("SKETERM_FAKE_WEB_POLICY");
+    var frames_buf: [512]u8 = undefined;
+    const frames = std.fmt.bufPrintZ(&frames_buf, "{s}/fake-web-policy-frames.txt", .{rt}) catch unreachable;
+    _ = c.unlink(frames.ptr);
+    _ = c.setenv("SKETERM_FAKE_WEB_FRAMES", frames.ptr, 1);
+    defer _ = c.unsetenv("SKETERM_FAKE_WEB_FRAMES");
+
+    // (15) With the capability: net_policy_set travels STRICTLY before
+    // the view_create_url naming the same view (there is no ack; frame
+    // order is the entire install-before-first-request guarantee).
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"policy\":{\"allow_hosts\":[\"smoke.invalid\"],\"max_requests\":5}}");
+        const opened = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, opened, "\"isError\":true") != null)
+            fail("a policied web_open failed against the policy-capable fake");
+        if (std.mem.indexOf(u8, opened, "\"policy_active\":true") == null or
+            std.mem.indexOf(u8, opened, "\"policy_source\":\"call\"") == null or
+            std.mem.indexOf(u8, opened, "\"max_requests\":5") == null)
+            fail("web_open does not echo the enforced policy");
+        const log = readSmall(frames, &file_buf);
+        const ps = std.mem.indexOf(u8, log, "net_policy_set view=1") orelse
+            fail("no net_policy_set reached the helper");
+        const vc = std.mem.indexOf(u8, log, "view_create_url view=1") orelse
+            fail("no view_create_url reached the helper");
+        if (ps > vc) fail("the view was created before its policy was installed");
+        if (std.mem.indexOf(u8, log, "top=1 max_requests=5") == null)
+            fail("the policy frame does not carry the declared limits");
+
+        // web_policy freshens from the helper and reports the source.
+        const pol = m.callTool("web_policy", "{}");
+        if (std.mem.indexOf(u8, pol, "\"policy_active\":true") == null or
+            std.mem.indexOf(u8, pol, "\"policy_source\":\"call\"") == null or
+            std.mem.indexOf(u8, pol, "\"durable\":false") == null)
+            fail("web_policy does not report the live policy");
+        m.closeStdinWait();
+    }
+
+    // (16) Exhaustion: traffic tools are REFUSED with the budget named,
+    // read tools still answer carrying the exhausted facts.
+    {
+        _ = c.setenv("SKETERM_FAKE_WEB_POLICY_EXHAUST", "1", 1);
+        defer _ = c.unsetenv("SKETERM_FAKE_WEB_POLICY_EXHAUST");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"policy\":{\"allow_hosts\":[\"smoke.invalid\"],\"max_requests\":5}}");
+        if (std.mem.indexOf(u8, m.recvLine(60_000), "\"isError\":true") != null)
+            fail("the exhaust fixture could not open its view");
+        const nav = m.callTool("web_navigate", "{\"url\":\"https://smoke.invalid/next\"}");
+        if (std.mem.indexOf(u8, nav, "\"code\":\"refused\"") == null or
+            std.mem.indexOf(u8, nav, "request_cap") == null)
+            fail("an exhausted view still navigates");
+        const shot = m.callTool("web_snapshot", "{}");
+        if (std.mem.indexOf(u8, shot, "\"isError\":true") != null)
+            fail("an exhausted view refused a READ tool");
+        if (std.mem.indexOf(u8, shot, "\"policy_exhausted\":true") == null or
+            std.mem.indexOf(u8, shot, "\"policy_exhausted_reason\":\"request_cap\"") == null)
+            fail("a read on an exhausted view does not carry the exhausted facts");
+        const pol = m.callTool("web_policy", "{}");
+        if (std.mem.indexOf(u8, pol, "\"exhausted\":true") == null or
+            std.mem.indexOf(u8, pol, "\"exhausted_reason\":\"request_cap\"") == null)
+            fail("web_policy does not report the latched budget");
+        m.closeStdinWait();
+    }
+
+    // A profile SESSION DEFAULT applies to its own web_open only, and
+    // web_policy_set refuses a pure loosening on a live view.
+    {
+        _ = c.setenv("SKETERM_FAKE_WEB_CONTEXTS", "1", 1);
+        defer _ = c.unsetenv("SKETERM_FAKE_WEB_CONTEXTS");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const set = m.callTool("web_policy_set", "{\"profile\":\"work\",\"policy\":{\"allow_hosts\":[\"smoke.invalid\"],\"max_requests\":9}}");
+        if (std.mem.indexOf(u8, set, "\"policy_source\":\"profile_default\"") == null or
+            std.mem.indexOf(u8, set, "\"durable\":false") == null)
+            fail("web_policy_set did not register the profile default");
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"profile\":\"work\"}");
+        const opened = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, opened, "\"policy_source\":\"profile_default\"") == null or
+            std.mem.indexOf(u8, opened, "\"max_requests\":9") == null)
+            fail("the profile default did not ride its web_open");
+        const loosen = m.callTool("web_policy_set", "{\"policy\":{\"max_requests\":5000}}");
+        if (std.mem.indexOf(u8, loosen, "\"code\":\"refused\"") == null or
+            std.mem.indexOf(u8, loosen, "LOOSEN") == null)
+            fail("web_policy_set applied (or silently ignored) a pure loosening");
+        const tighten = m.callTool("web_policy_set", "{\"policy\":{\"max_requests\":3}}");
+        if (std.mem.indexOf(u8, tighten, "\"tightened\":[\"max_requests\"]") == null)
+            fail("web_policy_set did not tighten the live view's budget");
+        // The re-sent, tightened policy is on the wire with a new
+        // serial. The send is fire-and-forget (no ack by design), so
+        // give the helper a bounded moment to log it.
+        var tries: u32 = 0;
+        while (tries < 100) : (tries += 1) {
+            if (std.mem.indexOf(u8, readSmall(frames, &file_buf), "max_requests=3") != null) break;
+            _ = c.usleep(20_000);
+        }
+        if (tries >= 100)
+            fail("the tightened policy never reached the helper");
+        m.closeStdinWait();
+    }
+}
+
 /// Run only the optional browser stage for focused E2E validation.
 fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u8 {
     var bin_buf: [4096:0]u8 = undefined;
@@ -2910,5 +3431,7 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     defer killDaemonsUnderRt(rt, allocator);
     webStage(allocator, exe, rt);
     say("smoke-mcp: focused headless web tools ok");
+    webPolicyStage(allocator, exe, rt);
+    say("smoke-mcp: focused enforced network policy ok");
     return 0;
 }

@@ -419,17 +419,41 @@ allow_private_addresses:true except stage 17):
     SKETERM_WEB_DISABLE_READER_IDS) => policied web_open refused, no
     view.
 
-## Flagged uncertainties (verify, do not assume)
+## Flagged uncertainties — MEASURED (2026-08-21, implementation)
 
-- Whether on_before_resource_load fires again for a server redirect in
-  CEF 151/NetworkService (Step 0 measures; design correct either way
-  but the PRIMARY defence differs).
-- Whether sketerm-blocked:// produces ERR_UNKNOWN_URL_SCHEME rather
-  than being normalised (measure; fallback `data:,`).
-- Timing of the first main-frame request vs interceptRegister: comments
-  assert onAfterCreated runs inside create_browser_sync; the
-  find-or-create install makes the policy present before either. One
-  smoke assertion (stage 18) covers it.
-- profiles.json/policy interaction: do NOT persist; if durability is
-  wanted later, the corrupt-rebuild path needs a "policy unknown =>
-  refuse policied opens" flag first.
+- Redirect re-entry: MEASURED YES on the pinned CEF 151. A 302 target
+  appears as its own gate entry (entries are only written in
+  on_before_resource_load), and the request IDENTIFIER survives the
+  chain (the final status completed the FIRST entry). Consequence
+  implemented: the ordinary host gate IS the redirect defence,
+  `on_resource_redirect` is NOT registered at all, and a redirect hop
+  is detected in the gate as "the ring already holds a live entry with
+  this request id", which is what names a denial `redirect_host`.
+- sketerm-blocked:// rewrite: MOOT (no redirect callback exists any
+  more). Measured anyway: a direct navigation to the unregistered
+  scheme fails without navigating (done, status 0).
+- First-main-frame-request timing: holds. The policy slot is
+  found-or-created by `net_policy_set` BEFORE the view exists, and
+  smoke stage 18 proves a disallowed INITIAL document is refused with
+  zero server hits.
+- profiles.json/policy interaction: NOT persisted, as recommended;
+  `web_policy` reports `durable:false`.
+
+## Deviations shipped
+
+- `about:` is ALWAYS allowed (early return in `decide`), not a scheme
+  mask bit: it is a view's own blank document and refusing it breaks
+  view creation.
+- `block_ads` is client-side sugar over the existing per-view
+  `intercept_set` shield switch (no wire change); `interceptSet` was
+  additionally taught find-or-create so a pre-create toggle sticks
+  (the silent-drop bug the plan named).
+- MEASURED v1 LIMITATION, seen live in smoke stage 21: CEF's favicon
+  fetcher issues a browserless URLRequest BESIDE the browser-path
+  favicon request. The browser-path request is denied and logged;
+  the browserless probe is the documented unpoliced slot-less lane
+  (edge 11) and does reach the network. The per-context resource
+  request handler remains the follow-up that would close it.
+- `web_policy_set` covers both roles (profile session default + live
+  tighten); a pure loosening returns `.refused` naming every ignored
+  field, exactly as edge 17 demanded.

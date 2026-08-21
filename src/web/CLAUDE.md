@@ -803,6 +803,43 @@ over, and both are measured, not assumed:
   in-memory jar in both modes (`settings.cache_path` is never set), so
   without a profile nothing about a browsing session survives the
   helper.
+**Enforced network policy (0x86 block, capability `net-policy`).** The
+pure decision half lives in `src/web/netpolicy.zig` (std-only, both
+test roots); the gate runs it inline in `on_before_resource_load`, so a
+refusal cancels a request BEFORE any socket is touched. Enforcement
+order on that path is filter engine -> policy -> extension webRequest:
+a filter or policy cancel is final and an extension is never asked.
+Facts that bound the design, each measured:
+
+- **CEF re-enters `on_before_resource_load` for a server redirect**,
+  with the request IDENTIFIER unchanged across the chain (the
+  completion callback matches the FIRST ring entry). The ordinary host
+  gate therefore IS the redirect defence — no `on_resource_redirect`
+  handler exists — and "a live ring entry already carries this id" is
+  what names a denial `redirect_host`.
+- **Response-side ceilings are real:** headers cannot be held
+  (`on_resource_response` has no callback) and a body cannot be
+  pre-empted, so `max_bytes` is accounted in
+  `on_resource_load_complete` and means "the response that CROSSES the
+  cap completes; the NEXT request is refused". The `deadline_ms` sweep
+  (`flushNetPolicy`, once per poll) issues one `stop_load` for a load
+  already streaming past its deadline.
+- **Slot-less traffic is unpoliced** (service workers, `cef_urlrequest`
+  — and, measured live: CEF's favicon fetcher probes through a
+  browserless URLRequest BESIDE the browser-path favicon request the
+  gate correctly denies). The per-context
+  `cef_request_context_handler_t::get_resource_request_handler` is the
+  follow-up that would close this lane.
+- **Private-address refusal is LITERAL only** (loopback/RFC1918/
+  link-local/ULA text, `localhost`/`*.local`/`*.internal`): no
+  resolver runs on this path, so a hostname that merely RESOLVES to a
+  private address passes the address check — the positive host
+  allow-list is the real defence, and the tool description says so.
+- The policy install is `net_policy_set` BEFORE the `view_create*`
+  naming the view (frame order is the guarantee; there is no ack); the
+  slot is found-or-created so the pre-create frame sticks — the same
+  fix `intercept_set` needed for a pre-create shield toggle.
+
 - **There is no per-origin cache clear.** `cef_request_context_t` has
   exactly one cache verb, `clear_http_cache`, and it drops the WHOLE
   context. A view in a container therefore loses only that container's
