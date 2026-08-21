@@ -169,6 +169,27 @@ const Mcp = struct {
 var scratch: [1 << 20]u8 = undefined;
 var scratch_len: usize = 0;
 
+/// THE isolation vocabulary: every variable that would point a child
+/// spawned here at the developer's OWN running sketerm. Mcp.spawn
+/// execv's, so the child inherits this process's environment — an
+/// entry missing from this list is a real daemon leaking into a smoke
+/// run. $SKETERM_MUX_SOCKET is the trap: it holds an ABSOLUTE path, so
+/// resetting $XDG_RUNTIME_DIR cannot redirect it and it must be unset
+/// by name (a reachable daemon there answered the ui stage's
+/// "no origin" probe with a live session refusal instead).
+fn clearInheritedOrigin() void {
+    for ([_][*:0]const u8{
+        "SKETERM_SOCKET",
+        "SKETERM_PANE_ID",
+        "SKETERM_MUX_SOCKET",
+        // The panel stage's SESSIONLESS calls must really have no
+        // session: run from inside a sketerm pane, the inherited
+        // $SKETERM_SESSION would scope them to that pane instead.
+        "SKETERM_SESSION",
+        "SKETERM_SESSION_ORIGIN_ID",
+    }) |key| _ = c.unsetenv(key);
+}
+
 fn fileExists(path: []const u8) bool {
     var z: [4096]u8 = undefined;
     const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return false;
@@ -517,15 +538,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const home = std.fmt.bufPrintZ(&home_buf, "{s}/home", .{rt}) catch return 1;
     _ = c.mkdir(home.ptr, 0o700);
     _ = c.setenv("HOME", home.ptr, 1);
-    // App/GUI socket auto-discovery must not find anything; keep the
-    // env clean.
-    _ = c.unsetenv("SKETERM_SOCKET");
-    _ = c.unsetenv("SKETERM_PANE_ID");
-    // ...and the panel stage's SESSIONLESS calls must really have no
-    // session: run from inside a sketerm pane, the inherited
-    // $SKETERM_SESSION would scope them to that pane instead.
-    _ = c.unsetenv("SKETERM_SESSION");
-    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+    clearInheritedOrigin();
     defer killDaemonsUnderRt(rt, allocator);
 
     const exe = "zig-out/bin/sketerm";
@@ -673,9 +686,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         // ── capabilities preflight ────────────────────────────────
         const caps = m.callTool("capabilities", "{}");
-        if (std.mem.indexOf(u8, caps, "\\\"mode\\\":\\\"isolated\\\"") == null or
-            std.mem.indexOf(u8, caps, "\\\"headless_terminals\\\":true") == null or
-            std.mem.indexOf(u8, caps, "\\\"ocr\\\":") == null)
+        if (std.mem.indexOf(u8, caps, "\"mode\":\"isolated\"") == null or
+            std.mem.indexOf(u8, caps, "\"headless_terminals\":true") == null or
+            std.mem.indexOf(u8, caps, "\"ocr\":") == null)
             fail("capabilities report incomplete");
 
         // ── file_* tools (fsdrive against the private daemon) ─────
@@ -696,9 +709,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (std.mem.indexOf(u8, cp, "done: 14 bytes") == null) fail("file_copy job failed");
             const h1 = m.callTool("file_hash", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/a.txt\"}}", .{fsd}) catch unreachable);
             const h2 = m.callTool("file_hash", std.fmt.bufPrint(&jb, "{{\"path\":\"{s}/b.txt\"}}", .{fsd}) catch unreachable);
-            const hx1 = std.mem.indexOf(u8, h1, "sha256=") orelse fail("file_hash missing digest");
-            const hx2 = std.mem.indexOf(u8, h2, "sha256=") orelse fail("file_hash missing digest 2");
-            if (!std.mem.eql(u8, h1[hx1 + 7 .. hx1 + 71], h2[hx2 + 7 .. hx2 + 71]))
+            // The digest is a machine fact now; the text lane repeats it.
+            const key = "\"sha256\":\"";
+            const hx1 = std.mem.indexOf(u8, h1, key) orelse fail("file_hash missing digest");
+            const hx2 = std.mem.indexOf(u8, h2, key) orelse fail("file_hash missing digest 2");
+            if (!std.mem.eql(u8, h1[hx1 + key.len .. hx1 + key.len + 64], h2[hx2 + key.len .. hx2 + key.len + 64]))
                 fail("copy hash mismatch");
             const jl = m.callTool("file_jobs", "{}");
             if (std.mem.indexOf(u8, jl, "copy done") == null) fail("file_jobs missing the finished copy");
@@ -712,8 +727,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         // ── new_tab falls back to a headless terminal (no GUI) ────
         const nt = m.callTool("new_tab", "{}");
-        if (std.mem.indexOf(u8, nt, "\\\"headless\\\":true") == null or
-            std.mem.indexOf(u8, nt, "\\\"term\\\":") == null)
+        if (std.mem.indexOf(u8, nt, "\"headless\":true") == null or
+            std.mem.indexOf(u8, nt, "\"term\":") == null)
             fail("new_tab did not fall back to a headless terminal");
 
         // ── term_exec: sentinel-based structured exec ─────────────
@@ -921,12 +936,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         // capabilities explains the policy from inside the session.
         const caps = m.callTool("capabilities", "{}");
-        if (std.mem.indexOf(u8, caps, "\\\"tool_policy\\\"") == null or
+        if (std.mem.indexOf(u8, caps, "\"tool_policy\"") == null or
             std.mem.indexOf(u8, caps, "app:ro, term_list") == null or
             std.mem.indexOf(u8, caps, "SKETERM_MCP_TOOLS") == null or
-            std.mem.indexOf(u8, caps, "\\\"groups_suppressed\\\"") == null or
-            std.mem.indexOf(u8, caps, "\\\"panes\\\"") == null or
-            std.mem.indexOf(u8, caps, "\\\"files\\\"") == null)
+            std.mem.indexOf(u8, caps, "\"groups_suppressed\"") == null or
+            std.mem.indexOf(u8, caps, "\"panes\"") == null or
+            std.mem.indexOf(u8, caps, "\"files\"") == null)
             fail("capabilities does not report the active tool policy");
         m.closeStdinWait();
         say("smoke-mcp: tool exposure policy ok");
@@ -1053,7 +1068,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         const panels = m.callTool("ui_panels", "{\"session\":\"smoke ui\"}");
         if (std.mem.indexOf(u8, panels, "Epoch 41") == null or
-            std.mem.indexOf(u8, panels, "\\\"live\\\":null") == null or
+            std.mem.indexOf(u8, panels, "\"live\":null") == null or
             std.mem.indexOf(u8, panels, "origin mux daemon") == null)
             fail("ui_panels did not separate the saved list from the unavailable live list");
         const other = m.callTool("ui_panels", "{\"session\":\"someone-else\"}");
@@ -1067,12 +1082,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("ui_save accepted (or silently mangled) an invalid document");
 
         const caps = m.callTool("capabilities", "{}");
-        if (std.mem.indexOf(u8, caps, "\\\"panels\\\":false") == null or
-            std.mem.indexOf(u8, caps, "\\\"panels_store\\\":true") == null or
-            std.mem.indexOf(u8, caps, "\\\"scope\\\":\\\"sessionless\\\"") == null or
-            std.mem.indexOf(u8, caps, "\\\"state\\\":\\\"no_session_origin\\\"") == null or
-            std.mem.indexOf(u8, caps, "\\\"gui_socket\\\":false") == null or
-            std.mem.indexOf(u8, caps, "\\\"ui\\\"") == null)
+        if (std.mem.indexOf(u8, caps, "\"panels\":false") == null or
+            std.mem.indexOf(u8, caps, "\"panels_store\":true") == null or
+            std.mem.indexOf(u8, caps, "\"scope\":\"sessionless\"") == null or
+            std.mem.indexOf(u8, caps, "\"state\":\"no_session_origin\"") == null or
+            std.mem.indexOf(u8, caps, "\"gui_socket\":false") == null or
+            std.mem.indexOf(u8, caps, "\"ui\"") == null)
             fail("capabilities does not report panel availability + the ui group");
 
         const deleted = m.callTool("ui_delete", "{\"name\":\"vsr\",\"session\":\"smoke ui\"}");
@@ -1130,11 +1145,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         replyPanel(&presenter, cap_call, "{\"ok\":true,\"panels\":[]}");
         cap_call.deinit(allocator);
         const caps = m.recvLine(15_000);
-        if (std.mem.indexOf(u8, caps, "\\\"panels\\\":true") == null or
-            std.mem.indexOf(u8, caps, "\\\"panels_store\\\":true") == null or
-            std.mem.indexOf(u8, caps, "\\\"scope\\\":\\\"origin\\\"") == null or
-            std.mem.indexOf(u8, caps, "\\\"gui_socket\\\":false") == null or
-            std.mem.indexOf(u8, caps, "\\\"selected\\\":\\\"mux_relay\\\"") == null or
+        if (std.mem.indexOf(u8, caps, "\"panels\":true") == null or
+            std.mem.indexOf(u8, caps, "\"panels_store\":true") == null or
+            std.mem.indexOf(u8, caps, "\"scope\":\"origin\"") == null or
+            std.mem.indexOf(u8, caps, "\"gui_socket\":false") == null or
+            std.mem.indexOf(u8, caps, "\"selected\":\"mux_relay\"") == null or
             std.mem.indexOf(u8, caps, "SKETERM_MUX_SOCKET") == null)
             fail("capabilities did not separate relay panels from gui_socket");
 
@@ -1172,8 +1187,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.chmod(cap_dir_path.ptr, 0o700);
         if (std.mem.indexOf(u8, refused, "isError") == null or
             std.mem.indexOf(u8, refused, "PermissionDenied") == null or
-            std.mem.indexOf(u8, refused, "\\\"mutation_may_have_applied\\\":false") == null or
-            std.mem.indexOf(u8, refused, "\\\"resend_safe\\\":true") == null)
+            std.mem.indexOf(u8, refused, "mutation_may_have_applied=false") == null or
+            std.mem.indexOf(u8, refused, "resend_safe=true") == null)
             fail("an unwritable panel store was not reported by the write itself");
 
         // Default isolated MCP, no --shared and no --socket: ui_show must
@@ -1188,7 +1203,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         show_call.deinit(allocator);
         const shown = m.recvLine(15_000);
         if (std.mem.indexOf(u8, shown, "isError") != null or
-            std.mem.indexOf(u8, shown, "\\\"panel_id\\\":41") == null)
+            std.mem.indexOf(u8, shown, "\"panel_id\":41") == null)
             fail("relayed ui_show did not return the presenter result");
 
         // Both mixed live/store operations use the same chosen relay.
@@ -1200,7 +1215,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         list_call.deinit(allocator);
         const listed_live = m.recvLine(15_000);
         if (std.mem.indexOf(u8, listed_live, "relayed") == null or
-            std.mem.indexOf(u8, listed_live, "\\\"live\\\":[") == null)
+            std.mem.indexOf(u8, listed_live, "\"live\":[") == null)
             fail("ui_panels did not return the relayed live inventory");
 
         m.sendTool("ui_save", "{\"name\":\"relayed\",\"panel_id\":41}");
@@ -1211,7 +1226,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         get_call.deinit(allocator);
         const saved_live = m.recvLine(15_000);
         if (std.mem.indexOf(u8, saved_live, "isError") != null or
-            std.mem.indexOf(u8, saved_live, "\\\"saved\\\":\\\"relayed\\\"") == null)
+            std.mem.indexOf(u8, saved_live, "\"saved\":\"relayed\"") == null)
             fail("ui_save without document did not persist the relayed live document");
         var origin_saved_buf: [1024]u8 = undefined;
         const origin_saved = std.fmt.bufPrint(&origin_saved_buf, "{s}/relayed.json", .{capability_dir}) catch
@@ -1233,7 +1248,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         replyPanel(&presenter, renamed_call, "{\"ok\":true,\"panel_id\":42}");
         renamed_call.deinit(allocator);
         const renamed_show = m.recvLine(15_000);
-        if (std.mem.indexOf(u8, renamed_show, "\\\"panel_id\\\":42") == null or
+        if (std.mem.indexOf(u8, renamed_show, "\"panel_id\":42") == null or
             std.mem.indexOf(u8, renamed_show, "isError") != null)
             fail("renamed session could not show its saved panel");
 
@@ -1247,8 +1262,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         replyPanel(&presenter, poll2, "{\"ok\":true,\"events\":[{\"component\":\"t\",\"kind\":\"click\",\"value\":\"ok\",\"ts\":42}],\"dropped\":0}");
         poll2.deinit(allocator);
         const waited = m.recvLine(15_000);
-        if (std.mem.indexOf(u8, waited, "\\\"value\\\":\\\"ok\\\"") == null or
-            std.mem.indexOf(u8, waited, "\\\"dropped\\\":1") == null)
+        if (std.mem.indexOf(u8, waited, "\"value\":\"ok\"") == null or
+            std.mem.indexOf(u8, waited, "\"dropped\":1") == null)
             fail("repeated relayed ui_wait_event polls lost state");
 
         // The daemon can correlate an envelope whose opaque JSON is invalid;
@@ -1277,7 +1292,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.indexOf(u8, missing_result, "isError") == null or
             std.mem.indexOf(u8, missing_result, "mutation may have applied") == null or
             std.mem.indexOf(u8, missing_result, "NOT resent automatically") == null or
-            std.mem.indexOf(u8, missing_result, "\\\"showing\\\":true") != null)
+            std.mem.indexOf(u8, missing_result, "\"showing\":true") != null)
             fail("missing panel_id presenter success was not rejected as uncertain delivery");
 
         // Zero is invalid for the same operation-specific field.
@@ -1291,7 +1306,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.indexOf(u8, zero_result, "isError") == null or
             std.mem.indexOf(u8, zero_result, "mutation may have applied") == null or
             std.mem.indexOf(u8, zero_result, "NOT resent automatically") == null or
-            std.mem.indexOf(u8, zero_result, "\\\"showing\\\":true") != null)
+            std.mem.indexOf(u8, zero_result, "\"showing\":true") != null)
             fail("panel_id 0 presenter success was not rejected as uncertain delivery");
 
         // The invalid reply retired both daemon presenter and MCP pool entry;
@@ -1305,7 +1320,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         replyPanel(&presenter, recovered_call, "{\"ok\":true,\"panel_id\":43}");
         recovered_call.deinit(allocator);
         const recovered = m.recvLine(15_000);
-        if (std.mem.indexOf(u8, recovered, "\\\"panel_id\\\":43") == null)
+        if (std.mem.indexOf(u8, recovered, "\"panel_id\":43") == null)
             fail("fresh pooled panel relay did not recover");
 
         // A real long-lived app tool still starts the MCP private daemon, not
@@ -1350,10 +1365,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("missing GUI was not reported honestly");
         // The store half must stay usable throughout.
         const absent_caps = m.callTool("capabilities", "{}");
-        if (std.mem.indexOf(u8, absent_caps, "\\\"state\\\":\\\"no_compatible_gui\\\"") == null or
-            std.mem.indexOf(u8, absent_caps, "\\\"panels\\\":false") == null or
-            std.mem.indexOf(u8, absent_caps, "\\\"panels_store\\\":true") == null or
-            std.mem.indexOf(u8, absent_caps, "\\\"scope\\\":\\\"origin\\\"") == null)
+        if (std.mem.indexOf(u8, absent_caps, "\"state\":\"no_compatible_gui\"") == null or
+            std.mem.indexOf(u8, absent_caps, "\"panels\":false") == null or
+            std.mem.indexOf(u8, absent_caps, "\"panels_store\":true") == null or
+            std.mem.indexOf(u8, absent_caps, "\"scope\":\"origin\"") == null)
             fail("capabilities did not report the panel transport honestly after the GUI left");
 
         // Restarting the GUI is an ordinary thing to do. A NEW GUI process
@@ -1367,7 +1382,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         replyPanel(&restarted, restart_call, "{\"ok\":true,\"panel_id\":51}");
         restart_call.deinit(allocator);
         const rebound = m.recvLine(15_000);
-        if (std.mem.indexOf(u8, rebound, "\\\"panel_id\\\":51") == null)
+        if (std.mem.indexOf(u8, rebound, "\"panel_id\":51") == null)
             fail("the panel requester did not reach a restarted GUI");
         // Leave exactly one presenter for the stages below, which each attach
         // their own and rely on being the only compatible candidate.
@@ -1405,7 +1420,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.usleep(300_000);
 
         const no_viewer_caps = m.callTool("capabilities", "{}");
-        if (std.mem.indexOf(u8, no_viewer_caps, "\\\"panels\\\":false") == null or
+        if (std.mem.indexOf(u8, no_viewer_caps, "\"panels\":false") == null or
             std.mem.indexOf(u8, no_viewer_caps, "no_compatible_gui") == null)
             fail("capabilities hid the missing compatible GUI");
 
@@ -1470,8 +1485,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("missing exact origin was autostarted, redirected, or poorly reported");
         const caps = m.callTool("capabilities", "{}");
         if (std.mem.indexOf(u8, caps, "origin_unreachable") == null or
-            std.mem.indexOf(u8, caps, "\\\"panels_store\\\":false") == null or
-            std.mem.indexOf(u8, caps, "\\\"scope\\\":\\\"unavailable\\\"") == null or
+            std.mem.indexOf(u8, caps, "\"panels_store\":false") == null or
+            std.mem.indexOf(u8, caps, "\"scope\":\"unavailable\"") == null or
             std.mem.indexOf(u8, caps, "refusing to downgrade") == null)
             fail("capabilities hid the missing origin daemon");
         const store_only = m.callTool("ui_save", "{\"name\":\"must-not-downgrade\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"x\"}}}}");
@@ -1528,7 +1543,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const exact_result = exact.recvLine(15_000);
         if (std.mem.indexOf(u8, fallback_sent, "\"cmd\":\"panel-show\"") == null or
             std.mem.indexOf(u8, fallback_sent, "\"session\":\"legacy\"") == null or
-            std.mem.indexOf(u8, exact_result, "\\\"panel_id\\\":76") == null or
+            std.mem.indexOf(u8, exact_result, "\"panel_id\":76") == null or
             std.mem.indexOf(u8, exact_result, "isError") != null)
             fail("unsupported exact origin did not recover through the explicit direct GUI socket");
         exact.closeStdinWait();
@@ -1550,7 +1565,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.indexOf(u8, sent, "\"cmd\":\"panel-show\"") == null)
             fail("explicit direct socket did not receive panel-show");
         const result = direct.recvLine(15_000);
-        if (std.mem.indexOf(u8, result, "\\\"panel_id\\\":77") == null or std.mem.indexOf(u8, result, "isError") != null) {
+        if (std.mem.indexOf(u8, result, "\"panel_id\":77") == null or std.mem.indexOf(u8, result, "isError") != null) {
             std.debug.print("smoke-mcp: explicit direct result: {s}\n", .{result});
             fail("explicit direct transport did not return its result");
         }
@@ -1596,7 +1611,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const result = m.recvLine(15_000);
         if (std.mem.indexOf(u8, sent, "\"cmd\":\"panel-show\"") == null or
             std.mem.indexOf(u8, sent, "\"session\":\"mixed-version\"") == null or
-            std.mem.indexOf(u8, result, "\\\"panel_id\\\":78") == null or
+            std.mem.indexOf(u8, result, "\"panel_id\":78") == null or
             std.mem.indexOf(u8, result, "isError") != null)
             fail("current daemon with only a legacy GUI did not use explicit direct fallback");
         expectNoPanelCall(&legacy_viewer, 250);
@@ -1663,7 +1678,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         replyPanel(&exact_presenter, exact_call, "{\"ok\":true,\"panel_id\":81}");
         exact_call.deinit(allocator);
         const exact_reply = exact_mcp.recvLine(15_000);
-        if (std.mem.indexOf(u8, exact_reply, "\\\"panel_id\\\":81") == null)
+        if (std.mem.indexOf(u8, exact_reply, "\"panel_id\":81") == null)
             fail("exact same-name daemon did not answer the panel call");
         const exact_saved = exact_mcp.callTool("ui_save", "{\"name\":\"same-name\",\"document\":{\"title\":\"Exact origin\",\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"exact\"}}}}");
         if (std.mem.indexOf(u8, exact_saved, "isError") != null)
@@ -1695,7 +1710,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         replyPanel(&default_presenter, default_call, "{\"ok\":true,\"panel_id\":82}");
         default_call.deinit(allocator);
         const default_reply = compat.recvLine(15_000);
-        if (std.mem.indexOf(u8, default_reply, "\\\"panel_id\\\":82") == null)
+        if (std.mem.indexOf(u8, default_reply, "\"panel_id\":82") == null)
             fail("canonical-default panel relay failed");
         const default_saved = compat.callTool("ui_save", "{\"name\":\"same-name\",\"document\":{\"title\":\"Default origin\",\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"default\"}}}}");
         if (std.mem.indexOf(u8, default_saved, "isError") != null)
@@ -1738,7 +1753,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         discovered_cap_call.deinit(allocator);
         const discovered_caps = discovered.recvLine(15_000);
         if (std.mem.indexOf(u8, discovered_caps, "default_socket_connect_only") == null or
-            std.mem.indexOf(u8, discovered_caps, "\\\"gui_socket_source\\\":\\\"discovered\\\"") == null)
+            std.mem.indexOf(u8, discovered_caps, "\"gui_socket_source\":\"discovered\"") == null)
             fail("capabilities confused discovered GUI and default panel transports");
         discovered.sendTool("ui_show", "{\"name\":\"discovered\",\"document\":{\"root\":\"t\",\"components\":{\"t\":{\"type\":\"text\",\"text\":\"must-use-default\"}}}}");
         const discovered_show = recvPanelCall(allocator, &default_presenter, 15_000);
@@ -1747,7 +1762,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         replyPanel(&default_presenter, discovered_show, "{\"ok\":true,\"panel_id\":83}");
         discovered_show.deinit(allocator);
         const discovered_show_reply = discovered.recvLine(15_000);
-        if (std.mem.indexOf(u8, discovered_show_reply, "\\\"panel_id\\\":83") == null)
+        if (std.mem.indexOf(u8, discovered_show_reply, "\"panel_id\":83") == null)
             fail("session mutation did not complete through canonical panel relay");
         discovered_gui.expectNoConnection(250);
         discovered.closeStdinWait();
@@ -1816,7 +1831,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("ui_show_files did not send an image_compare document over panel-show");
         const cmp_reply = m.recvLine(15_000);
         if (std.mem.indexOf(u8, cmp_reply, "isError") != null or
-            std.mem.indexOf(u8, cmp_reply, "\\\"panel_id\\\":4") == null or
+            std.mem.indexOf(u8, cmp_reply, "\"panel_id\":4") == null or
             std.mem.indexOf(u8, cmp_reply, "image_compare") == null)
             fail("ui_show_files did not report the shown compare panel");
 
@@ -1894,7 +1909,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             !std.mem.eql(u8, max_parsed.value.document.?, max_doc))
             fail("maximum direct panel document changed across GUI IPC");
         const max_result = m.recvLine(30_000);
-        if (std.mem.indexOf(u8, max_result, "\\\"panel_id\\\":7") == null or
+        if (std.mem.indexOf(u8, max_result, "\"panel_id\":7") == null or
             std.mem.indexOf(u8, max_result, "isError") != null)
             fail("maximum direct panel request did not complete");
 
@@ -2002,8 +2017,8 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // capabilities must say the tools work HERE, headlessly — the old
     // report steered assistants to --shared / launch_app instead.
     const caps = m.callTool("capabilities", "{}");
-    if (std.mem.indexOf(u8, caps, "\\\"web\\\":true") == null or
-        std.mem.indexOf(u8, caps, "\\\"web_backend\\\":\\\"headless\\\"") == null)
+    if (std.mem.indexOf(u8, caps, "\"web\":true") == null or
+        std.mem.indexOf(u8, caps, "\"web_backend\":\"headless\"") == null)
         fail("capabilities does not report the headless web backend");
 
     // web_open: spawns the helper lazily, loads the page, returns a
@@ -2033,8 +2048,8 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // reporting must name it.
     {
         const caps_open = m.callTool("capabilities", "{}");
-        if (std.mem.indexOf(u8, caps_open, "\\\"web_backend\\\":\\\"session\\\"") != null) {
-            if (std.mem.indexOf(u8, caps_open, "\\\"web_session\\\":\\\"web-") == null)
+        if (std.mem.indexOf(u8, caps_open, "\"web_backend\":\"session\"") != null) {
+            if (std.mem.indexOf(u8, caps_open, "\"web_session\":\"web-") == null)
                 fail("session web backend reported without a session name");
             var wj_buf: [8192]u8 = undefined;
             const wj = readSmall(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable, &wj_buf);
@@ -2348,8 +2363,8 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
             fail("web_open's snapshot did not come from the fake helper");
 
         const caps = m.callTool("capabilities", "{}");
-        if (std.mem.indexOf(u8, caps, "\\\"web_backend\\\":\\\"session\\\"") == null or
-            std.mem.indexOf(u8, caps, "\\\"web_session\\\":\\\"web-") == null)
+        if (std.mem.indexOf(u8, caps, "\"web_backend\":\"session\"") == null or
+            std.mem.indexOf(u8, caps, "\"web_session\":\"web-") == null)
             fail("capabilities does not report the watchable web session");
 
         const pj = readSmall(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable, &file_buf);
@@ -2412,7 +2427,7 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
         if (std.mem.indexOf(u8, opened, "isError") != null)
             fail("web_open failed with the session opted out");
         const caps = m.callTool("capabilities", "{}");
-        if (std.mem.indexOf(u8, caps, "\\\"web_backend\\\":\\\"headless\\\"") == null)
+        if (std.mem.indexOf(u8, caps, "\"web_backend\":\"headless\"") == null)
             fail("opt-out did not fall back to the plain headless backend");
         const pj = readSmall(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable, &file_buf);
         if (std.mem.indexOf(u8, pj, "\"session\"") != null)
@@ -2430,9 +2445,7 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
     _ = c.setenv("HOME", rt.ptr, 1);
-    _ = c.unsetenv("SKETERM_SOCKET");
-    _ = c.unsetenv("SKETERM_SESSION");
-    _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+    clearInheritedOrigin();
     _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
     _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
     defer killDaemonsUnderRt(rt, allocator);
