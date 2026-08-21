@@ -27,6 +27,7 @@ const dmabuf = @import("dmabuf.zig");
 const pipe = @import("pipe.zig");
 const pixcodec = @import("pixcodec.zig");
 const vcodec = @import("vcodec.zig");
+const diag = @import("../util/diag.zig");
 const build_options = @import("build_options");
 const native_endian = @import("builtin").cpu.arch.endian();
 
@@ -1594,7 +1595,7 @@ pub const Compositor = struct {
                     Error.OutOfMemory => return err,
                     else => {
                         const iname = if (self.objects.get(hdr.object)) |i| i.name else "?";
-                        std.debug.print("wlhost: protocol error on {s}#{d} opcode {d}\n", .{ iname, hdr.object, hdr.opcode });
+                        diag.print("wlhost: protocol error on {s}#{d} opcode {d}\n", .{ iname, hdr.object, hdr.opcode });
                         try self.fatal(hdr.object, "protocol error");
                     },
                 };

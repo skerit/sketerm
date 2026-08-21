@@ -23,6 +23,7 @@ const action = @import("action.zig");
 const reply = @import("reply.zig");
 const atomicwrite = @import("../../util/atomicwrite.zig");
 const pathz = @import("../../util/pathz.zig");
+const diag = @import("../../util/diag.zig");
 const clock = @import("../../util/clock.zig");
 
 /// The session's language tag, for `i18n` locale negotiation. POSIX
@@ -163,7 +164,7 @@ pub const Host = struct {
             if (!e.store_dirty or now_ms < e.store_due_ms) continue;
             const s = &(e.store orelse continue);
             self.persistStore(e, s) catch |err| {
-                std.debug.print(
+                diag.print(
                     "sketerm-webengine: storage.local write failed for {s}: {s}\n",
                     .{ e.id, @errorName(err) },
                 );

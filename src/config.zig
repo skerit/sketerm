@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 const lsp_servers = @import("lsp/servers.zig");
 const filtersub = @import("web/filtersub.zig");
 const atomicwrite = @import("util/atomicwrite.zig");
+const diag = @import("util/diag.zig");
 pub const titlefmt = @import("util/titlefmt.zig");
 
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
@@ -34,7 +35,7 @@ pub const LspServer = lsp_servers.Server;
 /// Single-line config-load warning to stderr. Centralised so the
 /// "sketerm: config: ..." prefix stays consistent across the parser.
 fn warnConfig(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("sketerm: config: " ++ fmt ++ "\n", args);
+    diag.print("sketerm: config: " ++ fmt ++ "\n", args);
 }
 
 /// Same as warnConfig but tags the source line number — used for
@@ -44,8 +45,8 @@ fn warnConfig(comptime fmt: []const u8, args: anytype) void {
 fn warnConfigAt(lineno: usize, comptime fmt: []const u8, args: anytype) void {
     var prefix_buf: [64]u8 = undefined;
     const prefix = std.fmt.bufPrint(&prefix_buf, "sketerm: config:{d}: ", .{lineno}) catch "sketerm: config: ";
-    std.debug.print("{s}", .{prefix});
-    std.debug.print(fmt ++ "\n", args);
+    diag.print("{s}", .{prefix});
+    diag.print(fmt ++ "\n", args);
 }
 
 pub const CursorShape = enum { block, underline, bar };
@@ -2649,16 +2650,16 @@ fn parseTitleTemplate(
     value: []const u8,
     fallback: []const u8,
 ) ![]const u8 {
-    var diag: titlefmt.Diag = .{};
-    titlefmt.validate(value, &diag) catch |err| {
+    var tdiag: titlefmt.Diag = .{};
+    titlefmt.validate(value, &tdiag) catch |err| {
         switch (err) {
             error.UnknownPlaceholder => warnConfig(
                 "{s}: unknown placeholder '{s}' (valid: {s}) - using the default",
-                .{ key, diag.name, titlefmt.field_list },
+                .{ key, tdiag.name, titlefmt.field_list },
             ),
             error.UnterminatedPlaceholder => warnConfig(
                 "{s}: unterminated '{{{{' at offset {d} - using the default",
-                .{ key, diag.offset },
+                .{ key, tdiag.offset },
             ),
         }
         return fallback;

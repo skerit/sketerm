@@ -25,6 +25,7 @@ const predict_mod = @import("mux/predict.zig");
 const cell_mod = @import("grid/cell.zig");
 const profile_util = @import("util/profile.zig");
 const clock = @import("util/clock.zig");
+const diag = @import("util/diag.zig");
 
 fn nextReconnectDelay(delay_ms: u32) u32 {
     return @min(delay_ms * 2, 30_000);
@@ -897,7 +898,7 @@ pub const Terminal = struct {
         // identity omits it; say that, since restarting it is the fix.
         if (!@import("mux/daemon.zig").validSessionOriginId(remote.origin_id)) {
             self.notifyConnectionState(.unavailable, 0);
-            std.debug.print(
+            diag.print(
                 "sketerm: mux session '{s}': {s}; this daemon reports no session lifetime id, " ++
                     "so reattaching cannot prove it is the same session - restart sketerm-mux to reconnect\n",
                 .{ remote.session, reason },
@@ -905,7 +906,7 @@ pub const Terminal = struct {
             self.remoteClosed("daemon predates session lifetime identity; reattach cannot be proven safe", true);
             return;
         }
-        std.debug.print("sketerm: mux session '{s}': {s}; reconnecting\n", .{ remote.session, reason });
+        diag.print("sketerm: mux session '{s}': {s}; reconnecting\n", .{ remote.session, reason });
         self.notifyConnectionState(.lost, 0);
         self.startReconnectAttempt();
     }
@@ -1071,7 +1072,7 @@ pub const Terminal = struct {
         if (!remote.awaitingReconnect()) return 0;
         if (job.session_missing or job.identity_mismatch) {
             self.notifyConnectionState(.unavailable, 0);
-            std.debug.print("sketerm: mux session '{s}': {s}\n", .{
+            diag.print("sketerm: mux session '{s}': {s}\n", .{
                 remote.session,
                 if (job.identity_mismatch) "lifetime identity changed; refusing same-name replacement" else "no longer available",
             });
@@ -1093,7 +1094,7 @@ pub const Terminal = struct {
         remote.retry_delay_ms = 1000;
         if (!self.installReattachedConn(remote, job)) return 0;
         self.notifyConnectionState(.connected, 0);
-        std.debug.print("sketerm: mux session '{s}': reattached over {s}\n", .{ remote.session, @tagName(remote.conn.transport) });
+        diag.print("sketerm: mux session '{s}': reattached over {s}\n", .{ remote.session, @tagName(remote.conn.transport) });
         return 0;
     }
 
@@ -1153,7 +1154,7 @@ pub const Terminal = struct {
         remote.conn.queueFrame(.detach, "") catch {};
         remote.conn.deinit();
         if (!self.installReattachedConn(remote, job)) return 0;
-        std.debug.print("sketerm: mux session '{s}': upgraded to UDP\n", .{remote.session});
+        diag.print("sketerm: mux session '{s}': upgraded to UDP\n", .{remote.session});
         return 0;
     }
 
@@ -1344,7 +1345,7 @@ pub const Terminal = struct {
     /// something else resizes it, and stderr is invisible in a GUI — so
     /// this goes out through the notification sink as well.
     fn reportRemoteError(self: *Terminal, info: RemoteError) void {
-        std.debug.print("sketerm: mux rejected {s}: {s}\n", .{ info.request, info.message });
+        diag.print("sketerm: mux rejected {s}: {s}\n", .{ info.request, info.message });
         if (self.on_notification) |f| f(self.user_ctx, .{
             .id = "sketerm-mux-error",
             .title = "Session request refused",
@@ -1447,14 +1448,14 @@ pub const Terminal = struct {
                     return;
                 }
                 if (remote.pending_record != 0) {
-                    std.debug.print("sketerm: session record request rejected: {s}\n", .{info.message});
+                    diag.print("sketerm: session record request rejected: {s}\n", .{info.message});
                     remote.pending_record = 0;
                     self.recording = false;
                     if (self.on_recording_changed) |f| f(self.user_ctx, false);
                     return;
                 }
                 if (remote.pending_rename) |pending| {
-                    std.debug.print("sketerm: mux rename of '{s}' rejected: {s}\n", .{ remote.session, info.message });
+                    diag.print("sketerm: mux rename of '{s}' rejected: {s}\n", .{ remote.session, info.message });
                     self.allocator.free(pending);
                     remote.pending_rename = null;
                 }
@@ -1728,7 +1729,7 @@ pub const Terminal = struct {
             self.screen.child_exited = true; // → pane fires exit_action
         }
         self.screen.dirty = true;
-        std.debug.print("sketerm: mux session '{s}': {s}{s}\n", .{ remote.session, reason, if (crashed) " (crashed)" else "" });
+        diag.print("sketerm: mux session '{s}': {s}{s}\n", .{ remote.session, reason, if (crashed) " (crashed)" else "" });
         if (self.on_render_request) |f| f(self.user_ctx);
     }
 
@@ -2418,9 +2419,9 @@ pub const Terminal = struct {
         if (was == self.has_control) return;
         const session = if (self.remote) |r| r.session else "?";
         if (self.has_control) {
-            std.debug.print("sketerm: session '{s}': this window now controls the app\n", .{session});
+            diag.print("sketerm: session '{s}': this window now controls the app\n", .{session});
         } else {
-            std.debug.print(
+            diag.print(
                 "sketerm: session '{s}': VIEW ONLY — '{s}' controls the app ({d} viewers). Input from this window is ignored.\n",
                 .{ session, self.control_holder[0..self.control_holder_len], parsed.value.viewers },
             );

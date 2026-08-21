@@ -13,6 +13,7 @@ const client = @import("client.zig");
 const daemon = @import("daemon.zig");
 const wire = @import("wire.zig");
 const platform = @import("../util/platform.zig");
+const diag = @import("../util/diag.zig");
 const wlcomp = @import("../wlhost/compositor.zig");
 const xwayland = @import("xwayland.zig");
 
@@ -156,6 +157,7 @@ const Args = struct {
 fn sigNoop(_: c_int) callconv(.c) void {}
 
 fn errPrint(comptime fmt: []const u8, args: anytype) void {
+    if (!diag.enabled) return;
     var buf: [1024]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "sketerm-mux display: " ++ fmt ++ "\n", args) catch return;
     _ = c.write(2, msg.ptr, msg.len);

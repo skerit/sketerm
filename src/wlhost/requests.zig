@@ -8,6 +8,7 @@ const wire = @import("wire.zig");
 const protocol = @import("protocol.zig");
 const dmabuf = @import("dmabuf.zig");
 const pipe = @import("pipe.zig");
+const diag = @import("../util/diag.zig");
 const cmod = @import("compositor.zig");
 const Compositor = cmod.Compositor;
 const Error = cmod.Error;
@@ -83,7 +84,7 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
             !self.lenient and ver > self.dmabufVersion())
             return Error.Protocol;
         if (!std.mem.eql(u8, g.iface.name, iname) or ver == 0 or ver > g.version) {
-            std.debug.print("wlhost: bad bind {s} v{d} (advertised {s} v{d})\n", .{ iname, ver, g.iface.name, g.version });
+            diag.print("wlhost: bad bind {s} v{d} (advertised {s} v{d})\n", .{ iname, ver, g.iface.name, g.version });
             return Error.Protocol;
         }
         try self.register(id, g.iface);

@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const diag = @import("../util/diag.zig");
 
 /// One-generation rotation: at open, a file past this moves to
 /// <path>.old so the log can't grow unbounded across months.
@@ -72,7 +73,7 @@ pub fn inheritedFd() c_int {
 
 /// Anomalies: stderr + file.
 pub fn warn(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("sketerm-mux: " ++ fmt ++ "\n", args);
+    diag.print("sketerm-mux: " ++ fmt ++ "\n", args);
     emit('W', fmt, args);
 }
 
