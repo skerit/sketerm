@@ -213,22 +213,12 @@ pub fn webAccessible(patterns: []const []const u8, path: []const u8) bool {
     return false;
 }
 
-/// `*` matches any run of characters INCLUDING `/` — MV2's
+/// `*` matches any run of characters INCLUDING `/` -- MV2's
 /// `web_accessible_resources` globs are path globs, not shell globs.
-fn globMatch(pat: []const u8, s: []const u8) bool {
-    if (pat.len == 0) return s.len == 0;
-    const star = std.mem.indexOfScalar(u8, pat, '*') orelse return std.mem.eql(u8, pat, s);
-    const head = pat[0..star];
-    const tail = pat[star + 1 ..];
-    if (!std.mem.startsWith(u8, s, head)) return false;
-    const rest = s[head.len..];
-    if (tail.len == 0) return true;
-    var i: usize = 0;
-    while (i <= rest.len) : (i += 1) {
-        if (globMatch(tail, rest[i..])) return true;
-    }
-    return false;
-}
+/// The shared matcher is iterative, so a manifest full of stars costs
+/// pattern*path steps instead of the exponential blowup the recursive
+/// version here had.
+const globMatch = @import("../../util/glob.zig").matchPath;
 
 // ─── tests ──────────────────────────────────────────────────────────
 

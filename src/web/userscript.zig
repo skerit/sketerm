@@ -180,31 +180,7 @@ pub fn matchPattern(pattern: []const u8, url: []const u8) bool {
 /// `*`-glob over the whole string (the `@include` and match-path
 /// semantics; `@include` additionally case-folds nothing — URLs are
 /// matched as given, like Violentmonkey).
-pub fn globMatch(glob: []const u8, s: []const u8) bool {
-    var g: usize = 0;
-    var i: usize = 0;
-    var star_g: ?usize = null;
-    var star_i: usize = 0;
-    while (true) {
-        if (g == glob.len) {
-            if (i == s.len) return true;
-        } else if (glob[g] == '*') {
-            star_g = g;
-            star_i = i;
-            g += 1;
-            continue;
-        } else if (i < s.len and glob[g] == s[i]) {
-            g += 1;
-            i += 1;
-            continue;
-        }
-        const sg = star_g orelse return false;
-        star_i += 1;
-        if (star_i > s.len) return false;
-        g = sg + 1;
-        i = star_i;
-    }
-}
+pub const globMatch = @import("../util/glob.zig").matchPath;
 
 // ---------------------------------------------------------------------
 // Tests

@@ -195,35 +195,8 @@ pub fn typedAction(mode: Mode, kind: TypedKind, trailing_slash: bool) TypedActio
 // -- filter matching ---------------------------------------------
 
 /// Case-insensitive glob match with `*` (any run) and `?` (any one
-/// byte); every other byte is literal. Iterative single-star
-/// backtracking, so a pattern full of stars stays linear.
-pub fn globMatch(pattern: []const u8, name: []const u8) bool {
-    var p: usize = 0;
-    var n: usize = 0;
-    var star_p: ?usize = null;
-    var star_n: usize = 0;
-    while (n < name.len) {
-        if (p < pattern.len and pattern[p] == '*') {
-            star_p = p;
-            star_n = n;
-            p += 1;
-        } else if (p < pattern.len and (pattern[p] == '?' or
-            std.ascii.toLower(pattern[p]) == std.ascii.toLower(name[n])))
-        {
-            p += 1;
-            n += 1;
-        } else if (star_p) |sp| {
-            // Backtrack: let the last '*' swallow one more byte.
-            star_n += 1;
-            p = sp + 1;
-            n = star_n;
-        } else {
-            return false;
-        }
-    }
-    while (p < pattern.len and pattern[p] == '*') p += 1;
-    return p == pattern.len;
-}
+/// byte); every other byte is literal.
+const globMatch = @import("../util/glob.zig").matchName;
 
 /// Whether `name` (a basename), whose guessed mimetype is `mime`
 /// ("" when unknown), passes `filter`. Globs and mimetypes are OR'd:

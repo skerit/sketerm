@@ -18,6 +18,8 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+/// Case-insensitive `*`/`?` name glob (same shape as the file-color rules).
+const globMatch = @import("../util/glob.zig").matchName;
 const pathz = @import("../util/pathz.zig");
 const profile = @import("../util/profile.zig");
 
@@ -77,32 +79,6 @@ pub const Rules = struct {
         return null;
     }
 };
-
-/// Case-insensitive `*`/`?` glob (same shape as the file-color rules).
-pub fn globMatch(pattern: []const u8, name: []const u8) bool {
-    var p: usize = 0;
-    var n: usize = 0;
-    var star: ?usize = null;
-    var mark: usize = 0;
-    while (n < name.len) {
-        if (p < pattern.len and (pattern[p] == '?' or
-            std.ascii.toLower(pattern[p]) == std.ascii.toLower(name[n])))
-        {
-            p += 1;
-            n += 1;
-        } else if (p < pattern.len and pattern[p] == '*') {
-            star = p;
-            mark = n;
-            p += 1;
-        } else if (star) |s| {
-            p = s + 1;
-            mark += 1;
-            n = mark;
-        } else return false;
-    }
-    while (p < pattern.len and pattern[p] == '*') p += 1;
-    return p == pattern.len;
-}
 
 pub fn configPath(buf: []u8) ?[]const u8 {
     if (profile.getenv("XDG_CONFIG_HOME")) |xc|

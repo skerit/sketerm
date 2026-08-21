@@ -4407,31 +4407,8 @@ pub fn nameMatches(pattern: []const u8, name: []const u8) bool {
     return globMatch(pattern, name);
 }
 
-fn globMatch(pattern: []const u8, name: []const u8) bool {
-    // Iterative *-backtracking matcher, ASCII case-folded.
-    var p: usize = 0;
-    var n: usize = 0;
-    var star_p: ?usize = null;
-    var star_n: usize = 0;
-    while (n < name.len) {
-        if (p < pattern.len and (pattern[p] == '?' or
-            std.ascii.toLower(pattern[p]) == std.ascii.toLower(name[n])))
-        {
-            p += 1;
-            n += 1;
-        } else if (p < pattern.len and pattern[p] == '*') {
-            star_p = p;
-            star_n = n;
-            p += 1;
-        } else if (star_p) |sp| {
-            p = sp + 1;
-            star_n += 1;
-            n = star_n;
-        } else return false;
-    }
-    while (p < pattern.len and pattern[p] == '*') p += 1;
-    return p == pattern.len;
-}
+/// Iterative *-backtracking matcher, ASCII case-folded, `?` a wildcard.
+const globMatch = @import("../util/glob.zig").matchName;
 
 const SearchState = struct {
     matches: usize = 0,

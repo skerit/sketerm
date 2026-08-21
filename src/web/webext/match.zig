@@ -238,30 +238,7 @@ fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
 /// including empty). This is the match-pattern path glob, not a full
 /// regex. Iterative backtracking so it never recurses on adversarial
 /// input.
-pub fn globMatch(pattern: []const u8, text: []const u8) bool {
-    var p: usize = 0;
-    var ti: usize = 0;
-    var star: ?usize = null;
-    var star_t: usize = 0;
-    while (ti < text.len) {
-        if (p < pattern.len and pattern[p] == '*') {
-            star = p;
-            star_t = ti;
-            p += 1;
-        } else if (p < pattern.len and pattern[p] == text[ti]) {
-            p += 1;
-            ti += 1;
-        } else if (star) |s| {
-            p = s + 1;
-            star_t += 1;
-            ti = star_t;
-        } else {
-            return false;
-        }
-    }
-    while (p < pattern.len and pattern[p] == '*') p += 1;
-    return p == pattern.len;
-}
+pub const globMatch = @import("../../util/glob.zig").matchPath;
 
 /// A set of include/exclude patterns, the shape a content_scripts entry
 /// carries (`matches` / `exclude_matches`). Owns its patterns.

@@ -12,6 +12,7 @@ comptime {
     _ = @import("util/percent.zig");
     _ = @import("util/suggest.zig");
     _ = @import("util/pattern.zig");
+    _ = @import("util/glob.zig");
     _ = @import("util/pathz.zig");
     _ = @import("util/atomicwrite.zig");
     _ = @import("util/filehash.zig");
