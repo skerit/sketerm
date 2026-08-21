@@ -363,17 +363,7 @@ fn watchPane(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, sessio
     };
     defer c.g_regex_unref(regex);
 
-    const client = c.g_socket_client_new();
-    defer c.g_object_unref(client);
-    const addr = c.g_unix_socket_address_new(sock_path.ptr);
-    defer c.g_object_unref(addr);
-    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
-    if (conn == null) {
-        const msg: [*c]const u8 = if (gerr != null) gerr.*.message else "unknown";
-        _ = c.fprintf(platform.stderr(), "sketerm cli: connect failed: %s\n", msg);
-        if (gerr != null) c.g_error_free(gerr);
-        return 1;
-    }
+    const conn = connectCtl(sock_path) orelse return 1;
     defer c.g_object_unref(conn);
     const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
     const din = c.g_data_input_stream_new(c.g_io_stream_get_input_stream(@ptrCast(conn)));
@@ -449,18 +439,8 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, session
     defer allocator.free(sock_path);
     const humantype = @import("../util/humantype.zig");
 
-    const client = c.g_socket_client_new();
-    defer c.g_object_unref(client);
-    const addr = c.g_unix_socket_address_new(sock_path.ptr);
-    defer c.g_object_unref(addr);
     var gerr: [*c]c.GError = null;
-    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
-    if (conn == null) {
-        const msg: [*c]const u8 = if (gerr != null) gerr.*.message else "unknown";
-        _ = c.fprintf(platform.stderr(), "sketerm cli: connect failed: %s\n", msg);
-        if (gerr != null) c.g_error_free(gerr);
-        return 1;
-    }
+    const conn = connectCtl(sock_path) orelse return 1;
     defer c.g_object_unref(conn);
     const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
     const din = c.g_data_input_stream_new(c.g_io_stream_get_input_stream(@ptrCast(conn)));
@@ -598,6 +578,24 @@ pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
     return found;
 }
 
+/// Connect to a control socket, reporting a refusal the way every
+/// `sketerm cli` path reports it. Caller unrefs the connection.
+fn connectCtl(sock_path: [:0]const u8) ?*c.GSocketConnection {
+    const client = c.g_socket_client_new();
+    defer c.g_object_unref(client);
+    const addr = c.g_unix_socket_address_new(sock_path.ptr);
+    defer c.g_object_unref(addr);
+    var gerr: [*c]c.GError = null;
+    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
+    if (conn == null) {
+        const msg: [*c]const u8 = if (gerr != null) gerr.*.message else "unknown";
+        _ = c.fprintf(platform.stderr(), "sketerm cli: connect failed: %s\n", msg);
+        if (gerr != null) c.g_error_free(gerr);
+        return null;
+    }
+    return conn;
+}
+
 /// True when a Unix socket path has a listener accepting connections.
 /// A stale file from a crashed instance refuses the connect.
 pub fn socketAlive(path_z: [:0]const u8) bool {
@@ -626,19 +624,8 @@ fn talk(allocator: std.mem.Allocator, sock_path: [:0]u8, req: protocol.Request, 
     aw.writer.writeAll("\n") catch return 1;
     const line = aw.written();
 
-    const client = c.g_socket_client_new();
-    defer c.g_object_unref(client);
-    const addr = c.g_unix_socket_address_new(sock_path.ptr);
-    defer c.g_object_unref(addr);
-
     var gerr: [*c]c.GError = null;
-    const conn = c.g_socket_client_connect(client, @ptrCast(@alignCast(addr)), null, &gerr);
-    if (conn == null) {
-        const msg: [*c]const u8 = if (gerr != null) gerr.*.message else "unknown";
-        _ = c.fprintf(platform.stderr(), "sketerm cli: connect failed: %s\n", msg);
-        if (gerr != null) c.g_error_free(gerr);
-        return 1;
-    }
+    const conn = connectCtl(sock_path) orelse return 1;
     defer c.g_object_unref(conn);
 
     const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
