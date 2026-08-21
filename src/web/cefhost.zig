@@ -1159,7 +1159,7 @@ pub const Host = struct {
         var path_buf: [1024]u8 = undefined;
         var name_buf: [256]u8 = undefined;
         if (req.ephemeral == 0 and self.profile_dir.len != 0) {
-            const dir_key = sanitizeContextName(req.name, req.id, &name_buf);
+            const dir_key = sanitizeContextName(req.name, self.ownerCtxId(req.id), &name_buf);
             const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ self.profile_dir, dir_key }) catch return;
             setStr(path, &settings.cache_path);
         }
@@ -1193,6 +1193,20 @@ pub const Host = struct {
             release(&rc.base.base);
             return;
         };
+    }
+
+    /// The id the OWNING CLIENT minted for an engine-global context id.
+    ///
+    /// The engine's context space is windowed per connection, but a
+    /// persistent jar directory is named by the id the CLIENT persisted
+    /// (`profile-<name>-<id>`, which its own store reconstructs from the
+    /// directory names). Keying the directory on the global id instead
+    /// would move a named profile's cookies into a fresh, empty jar
+    /// every time the client reconnects on another window — and leave
+    /// the old one an orphan its store then sweeps away.
+    fn ownerCtxId(self: *const Host, id: u32) u32 {
+        const base = self.dispatch_conn *| proto.CONN_ID_WINDOW;
+        return if (id >= base) id - base else id;
     }
 
     /// Drop our reference to a context. Live browsers on it keep their
@@ -7025,6 +7039,40 @@ test "a destroyed context releases the proxy value graph it retained" {
     host.contextDestroy(6);
     try std.testing.expectEqual(@as(usize, 6), Fake.released);
     try std.testing.expectEqual(@as(usize, 0), host.proxy_prefs.items.len);
+}
+
+test "a persistent jar directory is named by the id its OWNER minted" {
+    // Multi-client windows the engine's context ids per connection, but
+    // the jar directory is the CLIENT's durable profile store's own
+    // `profile-<name>-<id>`: keyed on the global id instead, a client
+    // that reconnects on another window would land in a fresh, empty
+    // jar and orphan the one holding its cookies.
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+    var buf: [256]u8 = undefined;
+
+    host.dispatch_conn = 3;
+    try std.testing.expectEqual(@as(u32, 4), host.ownerCtxId(3 * proto.CONN_ID_WINDOW + 4));
+    try std.testing.expectEqualStrings(
+        "profile-work-4",
+        sanitizeContextName("profile-work", host.ownerCtxId(3 * proto.CONN_ID_WINDOW + 4), &buf),
+    );
+
+    // Another connection, same profile: the same directory.
+    host.dispatch_conn = 7;
+    try std.testing.expectEqualStrings(
+        "profile-work-4",
+        sanitizeContextName("profile-work", host.ownerCtxId(7 * proto.CONN_ID_WINDOW + 4), &buf),
+    );
+
+    // A frame dispatched outside any connection carries an untranslated
+    // id, and an id below its window is left alone rather than wrapped.
+    host.dispatch_conn = 0;
+    try std.testing.expectEqual(@as(u32, 4), host.ownerCtxId(4));
+    host.dispatch_conn = 9;
+    try std.testing.expectEqual(@as(u32, 4), host.ownerCtxId(4));
 }
 
 test "a popup whose owner's container vanished is refused before the engine call" {
