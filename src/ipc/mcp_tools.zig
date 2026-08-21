@@ -65,6 +65,12 @@ const SHOT_PROPS =
     \\"frame":{"type":"integer"},"image_w":{"type":"integer"},"image_h":{"type":"integer"},"image_scale":{"type":"number"},"crop_x":{"type":"integer"},"crop_y":{"type":"integer"}
 ;
 
+/// The screen-info vocabulary `mcp.addScreenFacts` writes, declared
+/// ONCE: read_screen and run_command both report a pane's grid.
+const SCREEN_PROPS =
+    \\"rows":{"type":"integer"},"cols":{"type":"integer"},"cursor_row":{"type":"integer"},"cursor_col":{"type":"integer"},"alt_screen":{"type":"boolean"},"view_offset":{"type":"integer"},"app_cursor_keys":{"type":"boolean"},"sync_output":{"type":"boolean"},"title":{"type":"string"},"seq":{"type":"integer"},"scrollback":{"type":"integer"}
+;
+
 const INPUT_PROPS =
     \\"window":{"type":"integer"},"frame_at_input":{"type":"integer"},"frame_now":{"type":"integer"},"repainted":{"type":"boolean"},"screenshot_failed":{"type":"boolean"}
 ;
@@ -81,6 +87,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"terminals\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"count\":{\"type\":\"integer\"},\"tabs\":{\"type\":\"integer\"}" ++ "},\"required\":[\"terminals\",\"count\",\"tabs\"]}",
     },
     .{
         .name = "read_screen",
@@ -92,6 +99,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"scrollback":{"type":"integer","description":"Also include up to N scrollback lines"},"last_command":{"type":"boolean","description":"Return only the last completed command's output + exit code"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ SCREEN_PROPS ++ "," ++ "\"pane\":{\"type\":\"integer\"},\"text\":{\"type\":\"string\"},\"last_command\":{\"type\":\"boolean\"},\"exit_status\":{\"type\":\"integer\"},\"output\":{\"type\":\"string\"}" ++ "}}",
     },
     .{
         .name = "screenshot_pane",
@@ -103,6 +111,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"bytes\":{\"type\":\"integer\"},\"width\":{\"type\":\"integer\"},\"height\":{\"type\":\"integer\"}" ++ "},\"required\":[\"bytes\"]}",
     },
     .{
         .name = "record_pane_start",
@@ -114,6 +123,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"},"path":{"type":"string","description":"Absolute output path ending in .cast"}},"required":["path"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"path\":{\"type\":\"string\"},\"recording\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"path\",\"recording\"]}",
     },
     .{
         .name = "record_pane_stop",
@@ -125,6 +135,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer","description":"Pane id (omit = focused pane)"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"recording\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"recording\"]}",
     },
     .{
         .name = "send_text",
@@ -136,6 +147,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean","description":"Press Enter after the text"}},"required":["text"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"bytes\":{\"type\":\"integer\"},\"enter\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"bytes\",\"enter\"]}",
     },
     .{
         .name = "send_keys",
@@ -147,6 +159,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"keys\":{\"type\":\"string\"},\"sent\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"keys\",\"sent\"]}",
     },
     .{
         .name = "run_command",
@@ -158,6 +171,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max output-idle wait (default 15000)"},"quiet_ms":{"type":"integer","description":"No-output window that counts as idle (default 400)"},"output_only":{"type":"boolean","description":"Return just a completed command zone and exit code instead of the whole screen"}},"required":["command"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ SCREEN_PROPS ++ "," ++ "\"pane\":{\"type\":\"integer\"},\"command\":{\"type\":\"string\"},\"source\":{\"type\":\"string\"},\"settled\":{\"type\":\"boolean\"},\"timed_out\":{\"type\":\"boolean\"},\"exit_status\":{\"type\":\"integer\"},\"output\":{\"type\":\"string\"}" ++ "},\"required\":[\"command\",\"source\",\"settled\",\"timed_out\",\"output\"]}",
     },
     .{
         .name = "wait_idle",
@@ -169,6 +183,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"timeout_ms":{"type":"integer"},"quiet_ms":{"type":"integer"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"settled\":{\"type\":\"boolean\"},\"timed_out\":{\"type\":\"boolean\"},\"timeout_ms\":{\"type\":\"integer\"},\"quiet_ms\":{\"type\":\"integer\"}" ++ "},\"required\":[\"settled\",\"timed_out\"]}",
     },
     .{
         .name = "new_tab",
@@ -180,6 +195,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"cwd":{"type":"string"},"title":{"type":"string"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"headless\":{\"type\":\"boolean\"},\"tab\":{\"type\":\"integer\"},\"pane\":{\"type\":\"integer\"},\"term\":{\"type\":\"integer\"}" ++ "},\"required\":[\"headless\"]}",
     },
     .{
         .name = "split_pane",
@@ -191,6 +207,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"direction":{"type":"string","enum":["h","v"]}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"direction\":{\"type\":\"string\"},\"split_from\":{\"type\":\"integer\"}" ++ "},\"required\":[\"pane\",\"direction\"]}",
     },
     .{
         .name = "focus_pane",
@@ -202,6 +219,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"focused\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"pane\",\"focused\"]}",
     },
     .{
         .name = "close_pane",
@@ -213,6 +231,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"}},"required":["pane"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"closed\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"pane\",\"closed\"]}",
     },
 
     // ── app: forwarded Wayland applications ────────────────────────
@@ -983,6 +1002,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string","description":"Absolute directory path"}},"required":["path"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"path\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\"},\"truncated\":{\"type\":\"boolean\"},\"entries\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}" ++ "},\"required\":[\"path\",\"count\",\"truncated\",\"entries\"]}",
     },
     .{
         .name = "file_stat",
@@ -994,6 +1014,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"path\":{\"type\":\"string\"},\"kind\":{\"type\":\"string\"},\"size\":{\"type\":\"integer\"},\"mode\":{\"type\":\"integer\"},\"uid\":{\"type\":\"integer\"},\"gid\":{\"type\":\"integer\"},\"mtime_ms\":{\"type\":\"integer\"},\"target\":{\"type\":\"string\"},\"target_is_dir\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"path\",\"kind\",\"size\"]}",
     },
     .{
         .name = "file_read",
@@ -1005,6 +1026,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","description":"Byte offset (default 0)"},"length":{"type":"integer","description":"Max bytes (default 262144, cap 2097152)"}},"required":["path"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"path\":{\"type\":\"string\"},\"size\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},\"bytes\":{\"type\":\"integer\"},\"eof\":{\"type\":\"boolean\"},\"more\":{\"type\":\"boolean\"},\"binary\":{\"type\":\"boolean\"},\"base64\":{\"type\":\"string\"}" ++ "},\"required\":[\"path\",\"size\",\"offset\",\"bytes\",\"eof\",\"more\",\"binary\"]}",
     },
     .{
         .name = "file_write",
@@ -1016,6 +1038,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"},"append":{"type":"boolean"}},"required":["path","content"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"path\":{\"type\":\"string\"},\"bytes\":{\"type\":\"integer\"},\"append\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"path\",\"bytes\",\"append\"]}",
     },
     .{
         .name = "file_mkdir",
@@ -1027,6 +1050,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"path\":{\"type\":\"string\"},\"created\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"path\",\"created\"]}",
     },
     .{
         .name = "file_rename",
@@ -1038,6 +1062,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"from":{"type":"string"},"to":{"type":"string"}},"required":["from","to"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"from\":{\"type\":\"string\"},\"to\":{\"type\":\"string\"},\"renamed\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"from\",\"to\",\"renamed\"]}",
     },
     .{
         .name = "file_delete",
@@ -1049,6 +1074,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"path\":{\"type\":\"string\"},\"deleted\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"path\",\"deleted\"]}",
     },
     .{
         .name = "file_copy",
@@ -1060,6 +1086,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"src":{"type":"string"},"dst":{"type":"string"},"resume":{"type":"boolean","description":"Continue from a previous interrupted copy's staged partial (content-verified)"},"wait":{"type":"boolean","description":"Wait for completion (default true; false returns the job id immediately)"},"timeout_ms":{"type":"integer","description":"Wait bound (default 60000, max 120000)"}},"required":["src","dst"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"op\":{\"type\":\"string\"},\"job\":{\"type\":\"integer\"},\"status\":{\"type\":\"string\"},\"timed_out\":{\"type\":\"boolean\"},\"bytes\":{\"type\":\"integer\"},\"resumed_from\":{\"type\":\"integer\"},\"sha256\":{\"type\":\"string\"}" ++ "},\"required\":[\"op\",\"job\",\"status\"]}",
     },
     .{
         .name = "file_delete_tree",
@@ -1071,6 +1098,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string"},"wait":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["path"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"op\":{\"type\":\"string\"},\"job\":{\"type\":\"integer\"},\"status\":{\"type\":\"string\"},\"timed_out\":{\"type\":\"boolean\"},\"bytes\":{\"type\":\"integer\"},\"resumed_from\":{\"type\":\"integer\"},\"sha256\":{\"type\":\"string\"}" ++ "},\"required\":[\"op\",\"job\",\"status\"]}",
     },
     .{
         .name = "file_hash",
@@ -1082,6 +1110,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["path"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"op\":{\"type\":\"string\"},\"job\":{\"type\":\"integer\"},\"status\":{\"type\":\"string\"},\"timed_out\":{\"type\":\"boolean\"},\"bytes\":{\"type\":\"integer\"},\"resumed_from\":{\"type\":\"integer\"},\"sha256\":{\"type\":\"string\"}" ++ "},\"required\":[\"op\",\"job\",\"status\"]}",
     },
     .{
         .name = "file_extract",
@@ -1093,6 +1122,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"archive":{"type":"string"},"destination":{"type":"string"},"wait":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["archive","destination"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"op\":{\"type\":\"string\"},\"job\":{\"type\":\"integer\"},\"status\":{\"type\":\"string\"},\"timed_out\":{\"type\":\"boolean\"},\"bytes\":{\"type\":\"integer\"},\"resumed_from\":{\"type\":\"integer\"},\"sha256\":{\"type\":\"string\"}" ++ "},\"required\":[\"op\",\"job\",\"status\"]}",
     },
     .{
         .name = "file_archive_create",
@@ -1104,6 +1134,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"source":{"type":"string"},"archive":{"type":"string"},"wait":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["source","archive"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"op\":{\"type\":\"string\"},\"job\":{\"type\":\"integer\"},\"status\":{\"type\":\"string\"},\"timed_out\":{\"type\":\"boolean\"},\"bytes\":{\"type\":\"integer\"},\"resumed_from\":{\"type\":\"integer\"},\"sha256\":{\"type\":\"string\"}" ++ "},\"required\":[\"op\",\"job\",\"status\"]}",
     },
     .{
         .name = "file_trash",
@@ -1115,6 +1146,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string"},"wait":{"type":"boolean"},"timeout_ms":{"type":"integer"}},"required":["path"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"op\":{\"type\":\"string\"},\"job\":{\"type\":\"integer\"},\"status\":{\"type\":\"string\"},\"timed_out\":{\"type\":\"boolean\"},\"bytes\":{\"type\":\"integer\"},\"resumed_from\":{\"type\":\"integer\"},\"sha256\":{\"type\":\"string\"}" ++ "},\"required\":[\"op\",\"job\",\"status\"]}",
     },
     .{
         .name = "file_chmod",
@@ -1126,6 +1158,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string"},"mode":{"type":"integer"}},"required":["path","mode"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"path\":{\"type\":\"string\"},\"mode\":{\"type\":\"integer\"}" ++ "},\"required\":[\"path\",\"mode\"]}",
     },
     .{
         .name = "file_truncate",
@@ -1137,6 +1170,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"path":{"type":"string"},"size":{"type":"integer"}},"required":["path","size"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"path\":{\"type\":\"string\"},\"size\":{\"type\":\"integer\"}" ++ "},\"required\":[\"path\",\"size\"]}",
     },
     .{
         .name = "file_media_info",
@@ -1148,6 +1182,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"Absolute file paths (max 128 per call)"}},"required":["paths"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"count\":{\"type\":\"integer\"},\"files\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}" ++ "},\"required\":[\"count\",\"files\"]}",
     },
     .{
         .name = "file_jobs",
@@ -1159,6 +1194,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"count\":{\"type\":\"integer\"},\"jobs\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}}" ++ "},\"required\":[\"count\",\"jobs\"]}",
     },
     .{
         .name = "file_job",
@@ -1170,6 +1206,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"job":{"type":"integer"},"action":{"type":"string","enum":["cancel","pause","resume"]}},"required":["job","action"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"job\":{\"type\":\"integer\"},\"action\":{\"type\":\"string\"},\"sent\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"job\",\"action\",\"sent\"]}",
     },
 
     // ── ui: agent-authored panels ──────────────────────────────────
@@ -1183,6 +1220,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"name":{"type":"string","description":"Panel name, unique per session. Re-using it replaces that panel's document in place."},"document":{"description":"The panel document (a JSON object, or a JSON string). Mutually exclusive with 'load'."},"load":{"type":"string","description":"Show a document saved earlier with ui_save, by its saved name. Mutually exclusive with 'document'."},"target":{"type":"string","enum":["pane","tab","window"],"description":"Where it goes: 'tab' (default) = a new tab in the user's window; 'pane' = takes over the calling pane (its shell comes back when the panel closes); 'window' = a standalone panel window."},"session":{"type":"string","description":"Session to scope the panel to (default $SKETERM_SESSION). Panels are invisible to other sessions."}},"required":["name"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"panel_id\":{\"type\":\"integer\"},\"name\":{\"type\":\"string\"},\"session\":{\"type\":[\"string\",\"null\"]},\"target\":{\"type\":\"string\"},\"showing\":{\"type\":\"boolean\"},\"assets\":{\"type\":\"array\"},\"asset_failures\":{\"type\":\"integer\"}" ++ "},\"required\":[\"panel_id\",\"name\",\"showing\"]}",
     },
     // A document generator over the same show path; still shows.
     .{
@@ -1195,6 +1233,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"files":{"type":"array","description":"1..64 images: {\"path\":\"/abs/path.png\",\"caption\":\"...\"} objects, or plain absolute-path strings. Caption defaults to the basename.","items":{}},"name":{"type":"string","description":"Panel name, unique per session. Default \"files\"; re-using it replaces that panel in place."},"title":{"type":"string","description":"Panel title. When given it is also drawn as a heading above the images."},"compare":{"type":"boolean","description":"Two files only: draw the A/B comparison slider instead of stacking them. The captions become the side labels."},"target":{"type":"string","enum":["pane","tab","window"],"description":"Same as ui_show: 'tab' (default), 'pane' (takes over the calling pane), 'window'."},"session":{"type":"string","description":"Session to scope the panel to (default $SKETERM_SESSION)."}},"required":["files"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"panel_id\":{\"type\":\"integer\"},\"name\":{\"type\":\"string\"},\"session\":{\"type\":[\"string\",\"null\"]},\"target\":{\"type\":\"string\"},\"showing\":{\"type\":\"boolean\"},\"files\":{\"type\":\"integer\"},\"layout\":{\"type\":\"string\"},\"unreadable\":{\"type\":\"array\"},\"assets\":{\"type\":\"array\"},\"asset_failures\":{\"type\":\"integer\"}" ++ "},\"required\":[\"panel_id\",\"name\",\"showing\",\"files\",\"layout\"]}",
     },
     .{
         .name = "ui_patch",
@@ -1206,6 +1245,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"patch":{"description":"JSON array of ops (or a JSON string of one)"},"session":{"type":"string"}},"required":["patch"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"panel_id\":{\"type\":\"integer\"},\"patched\":{\"type\":\"boolean\"},\"assets\":{\"type\":\"array\"},\"asset_failures\":{\"type\":\"integer\"}" ++ "},\"required\":[\"panel_id\",\"patched\"]}",
     },
     // Waits for the user; changes nothing.
     .{
@@ -1218,6 +1258,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"timeout_ms":{"type":"integer","description":"Wait budget, default 30000, clamped to 120000"},"session":{"type":"string"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"panel_id\":{\"type\":\"integer\"},\"waited_ms\":{\"type\":\"integer\"},\"dropped\":{\"type\":\"integer\"},\"events\":{\"type\":\"array\",\"items\":{\"type\":\"object\"}},\"count\":{\"type\":\"integer\"},\"timed_out\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"panel_id\",\"waited_ms\",\"events\",\"count\",\"timed_out\",\"dropped\"]}",
     },
     .{
         .name = "ui_panels",
@@ -1229,6 +1270,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"session":{"type":"string","description":"Default $SKETERM_SESSION"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"session\":{\"type\":[\"string\",\"null\"]},\"live\":{\"type\":[\"array\",\"null\"]},\"live_error\":{\"type\":\"string\"},\"live_count\":{\"type\":\"integer\"},\"saved\":{\"type\":[\"array\",\"null\"]},\"saved_error\":{\"type\":\"string\"},\"saved_count\":{\"type\":\"integer\"}" ++ "},\"required\":[\"session\",\"live\",\"saved\"]}",
     },
     // Writes a document into the user's state dir.
     .{
@@ -1241,6 +1283,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"name":{"type":"string","description":"Saved name, 1..64 chars of [A-Za-z0-9._-]"},"document":{"description":"Document to save (object or JSON string). Omit to save the LIVE panel of that name, read back from the GUI as it is right now."},"panel_id":{"type":"integer","description":"Address the live panel by handle instead of by 'name' when omitting 'document'; it is still saved under 'name'."},"session":{"type":"string"}},"required":["name"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"saved\":{\"type\":\"string\"},\"session\":{\"type\":[\"string\",\"null\"]},\"bytes\":{\"type\":\"integer\"}" ++ "},\"required\":[\"saved\",\"bytes\"]}",
     },
     .{
         .name = "ui_close",
@@ -1252,6 +1295,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"name":{"type":"string","description":"Panel name (in 'session')"},"panel_id":{"type":"integer","description":"Handle from ui_show, instead of 'name'"},"session":{"type":"string"}}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"panel_id\":{\"type\":\"integer\"},\"closed\":{\"type\":\"boolean\"}" ++ "},\"required\":[\"panel_id\",\"closed\"]}",
     },
     // Unlinks a saved document.
     .{
@@ -1264,6 +1308,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"name":{"type":"string","description":"Saved panel name to delete"},"session":{"type":"string"}},"required":["name"]}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"deleted\":{\"type\":\"string\"},\"session\":{\"type\":[\"string\",\"null\"]}" ++ "},\"required\":[\"deleted\"]}",
     },
 
     // ── core: never filtered ───────────────────────────────────────
@@ -1277,6 +1322,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{}}
         ,
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"mode\":{\"type\":\"string\"},\"headless_gui\":{\"type\":\"boolean\"},\"gui_socket\":{\"type\":\"boolean\"},\"gui_socket_source\":{\"type\":\"string\"},\"headless_terminals\":{\"type\":\"boolean\"},\"transfers_and_forwards\":{\"type\":\"boolean\"},\"panels\":{\"type\":\"boolean\"},\"panels_store\":{\"type\":\"boolean\"},\"panel_store\":{\"type\":\"object\"},\"panel_transport\":{\"type\":\"object\"},\"ocr\":{\"type\":\"boolean\"},\"web_helper\":{\"type\":[\"string\",\"null\"]},\"web\":{\"type\":\"boolean\"},\"web_backend\":{\"type\":\"string\"},\"web_session\":{\"type\":\"string\"},\"ssh\":{\"type\":\"boolean\"},\"scp\":{\"type\":\"boolean\"},\"terminal_recordings\":{\"type\":[\"string\",\"null\"]},\"input_tuning\":{\"type\":\"object\"},\"tool_policy\":{\"type\":\"object\"},\"session_lifetime\":{\"type\":\"string\"},\"open_terms\":{\"type\":\"integer\"},\"open_apps\":{\"type\":\"integer\"},\"open_forwards\":{\"type\":\"integer\"}" ++ "},\"required\":[\"mode\",\"headless_gui\",\"gui_socket\",\"panels\",\"panels_store\",\"web\",\"web_backend\",\"tool_policy\",\"session_lifetime\"]}",
     },
 
     // ── browser: CDP automation ────────────────────────────────────
@@ -1596,14 +1642,12 @@ test "the generated tool list is well-formed, newline-free JSON" {
         const schema = item.object.get("inputSchema") orelse return error.MissingSchema;
         try testing.expect(schema == .object);
         try testing.expect(schema.object.get("properties") != null);
-        // An output schema is optional while wave 3 migrates module by
-        // module; when a tool declares one it is emitted, last.
-        try testing.expectEqual(t.output_schema == null, item.object.get("outputSchema") == null);
-        if (t.output_schema != null) {
-            const out = item.object.get("outputSchema").?;
-            try testing.expect(out == .object);
-            try testing.expect(out.object.get("properties") != null);
-        }
+        // Wave 3 is complete: EVERY tool declares a structured
+        // result, and it is emitted last.
+        try testing.expect(t.output_schema != null);
+        const out = item.object.get("outputSchema") orelse return error.MissingOutputSchema;
+        try testing.expect(out == .object);
+        try testing.expect(out.object.get("properties") != null);
     }
 }
 
@@ -1617,13 +1661,11 @@ test "every tool is uniquely named, described and grouped" {
         try seen.put(testing.allocator, t.name, {});
         // inputSchema is a real object with a properties map.
         try testing.expect(std.mem.indexOf(u8, t.input_schema, "\"properties\"") != null);
-        // Wave 3 fills output schemas in module by module: either is
-        // allowed, but a declared one must be a JSON object with
-        // properties.
-        if (t.output_schema) |os| {
-            try testing.expect(std.mem.startsWith(u8, os, "{\"type\":\"object\""));
-            try testing.expect(std.mem.indexOf(u8, os, "\"properties\"") != null);
-        }
+        // Every tool declares a structured result, and it is a JSON
+        // object with a properties map.
+        const os = t.output_schema orelse return error.MissingOutputSchema;
+        try testing.expect(std.mem.startsWith(u8, os, "{\"type\":\"object\""));
+        try testing.expect(std.mem.indexOf(u8, os, "\"properties\"") != null);
         try testing.expectEqualStrings(@tagName(t.group), t.group.name());
         // A tool named like a group would make a policy term ambiguous;
         // the comptime guard above refuses it, this states the rule.
@@ -1635,19 +1677,20 @@ test "every tool is uniquely named, described and grouped" {
     try testing.expect(find("no_such_tool") == null);
 }
 
-test "every migrated group declares an output schema for all of its tools" {
-    // Wave 3 migrates group by group; a group listed here is DONE, and
-    // a new tool added to it without a structured result fails this.
-    const migrated = [_]Group{ .term, .browser, .app };
+test "every tool of every group declares an output schema" {
+    // Wave 3 is SHIPPED: the structured-result migration covers the
+    // whole vocabulary, so this walks all 112 tools rather than a
+    // migrated subset. A new tool without a structured result fails
+    // here, whatever group it joins.
+    var checked: usize = 0;
     for (TOOLS) |t| {
-        for (migrated) |g| {
-            if (t.group != g) continue;
-            if (t.output_schema == null) {
-                std.debug.print("{s} ({s}) declares no output schema\n", .{ t.name, @tagName(t.group) });
-                return error.MissingOutputSchema;
-            }
+        if (t.output_schema == null) {
+            std.debug.print("{s} ({s}) declares no output schema\n", .{ t.name, @tagName(t.group) });
+            return error.MissingOutputSchema;
         }
+        checked += 1;
     }
+    try testing.expectEqual(TOOLS.len, checked);
 }
 
 test "a declared output schema is emitted last" {

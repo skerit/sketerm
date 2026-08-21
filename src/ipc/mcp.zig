@@ -1165,47 +1165,17 @@ fn rpcError(arena: std.mem.Allocator, id: std.json.Value, code: i32, msg: []cons
     return aw.written();
 }
 
-/// Wrap a PNG (+ a text caption) as an MCP tool result with an
-/// inline image content block. base64 emits no newlines, so the
-/// NDJSON framing is safe.
-pub fn imageResult(arena: std.mem.Allocator, caption: []const u8, png_bytes: []const u8) ?[]const u8 {
-    return imageResultTagged(arena, caption, png_bytes, "");
-}
-
-/// Like imageResult, but the --log trace file gets a "-tag" filename
-/// suffix (img-<pid>-NNNN-click.png) so shot kinds sort apart.
-pub fn imageResultTagged(arena: std.mem.Allocator, caption: []const u8, png_bytes: []const u8, tag: []const u8) ?[]const u8 {
-    return imagesResultTagged(arena, caption, &.{png_bytes}, &.{tag});
-}
-
-/// Multi-image tool result: one caption text block, then every PNG as
-/// its own inline image content block (burst capture).
-pub fn imagesResult(arena: std.mem.Allocator, caption: []const u8, pngs: []const []const u8) ?[]const u8 {
-    return imagesResultTagged(arena, caption, pngs, null);
-}
-
-/// Like imagesResult, with an optional per-image tag list (parallel
-/// to `pngs`) for the --log trace filenames.
-/// Caption-only: a caller that has FACTS to report builds a `Res` and
-/// calls `finishWithImages` itself (these helpers are the plain
-/// "here is a picture" shape).
-pub fn imagesResultTagged(arena: std.mem.Allocator, caption: []const u8, pngs: []const []const u8, tags: ?[]const []const u8) ?[]const u8 {
-    var r = Res.init(arena);
-    if (caption.len != 0) r.text(caption) catch return null;
-    return r.finishWithImages(pngs, tags) catch null;
-}
-
-/// Wrap plain text as an MCP tool result: {"content":[{"type":"text",...}]}.
-/// The error path routes through errRes so every failure carries the
-/// uniform structured error shape.
-pub fn toolResult(arena: std.mem.Allocator, text: []const u8, is_error: bool) ?[]const u8 {
-    if (is_error) return errRes(arena, .failed, text) catch null;
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":") catch return null;
-    std.json.Stringify.value(text, .{}, w) catch return null;
-    w.writeAll("}]}") catch return null;
-    return aw.written();
+/// PNG dimensions from the IHDR chunk, which every PNG opens with.
+/// THE image-metadata read: every tool that returns pixels reports
+/// width/height from here rather than re-parsing the header.
+pub fn pngSize(bytes: []const u8) ?struct { w: u32, h: u32 } {
+    if (bytes.len < 24) return null;
+    if (!std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return null;
+    if (!std.mem.eql(u8, bytes[12..16], "IHDR")) return null;
+    return .{
+        .w = std.mem.readInt(u32, bytes[16..20], .big),
+        .h = std.mem.readInt(u32, bytes[20..24], .big),
+    };
 }
 
 /// THE tool-failure vocabulary: every isError result names one of
@@ -1607,8 +1577,16 @@ fn waitIdle(arena: std.mem.Allocator, backend: Backend, pane: ?u32, timeout_ms: 
     }
 }
 
-/// Read screen text + metadata as one human/assistant-readable blob.
-fn readScreenText(arena: std.mem.Allocator, backend: Backend, pane: ?u32, scrollback: u32) ![]const u8 {
+/// A pane's rendered grid plus the metadata the GUI reports about it.
+const ScreenRead = struct {
+    /// The `screen` object of the GUI's screen-info reply.
+    info: std.json.Value,
+    text: []const u8,
+    scrollback: u32,
+};
+
+/// Read a pane's screen text and its grid metadata.
+fn readScreen(arena: std.mem.Allocator, backend: Backend, pane: ?u32, scrollback: u32) !ScreenRead {
     const info = try ipcParsed(arena, backend, .{ .cmd = "screen-info", .pane = pane });
     if (!info.ok) return error.NoSuchPane;
     const text_reply = try ipcParsed(arena, backend, .{ .cmd = "get-text", .pane = pane, .scrollback = scrollback });
@@ -1617,15 +1595,39 @@ fn readScreenText(arena: std.mem.Allocator, backend: Backend, pane: ?u32, scroll
         (if (t == .string) t.string else "")
     else
         "");
+    return .{
+        .info = info.value.object.get("screen") orelse .null,
+        .text = text,
+        .scrollback = scrollback,
+    };
+}
 
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    const screen = info.value.object.get("screen").?;
-    try w.writeAll("screen: ");
-    try std.json.Stringify.value(screen, .{}, w);
-    try w.writeAll("\n---\n");
-    try w.writeAll(text);
-    return aw.written();
+/// The screen-info vocabulary, written into a result ONCE: every pane
+/// tool that reports on a grid emits this same set.
+fn addScreenFacts(res: *Res, screen: ScreenRead) !void {
+    const rows = objInt(screen.info, "rows");
+    const cols = objInt(screen.info, "cols");
+    try res.fact("rows", rows);
+    try res.fact("cols", cols);
+    try res.fact("cursor_row", objInt(screen.info, "cursor_row"));
+    try res.fact("cursor_col", objInt(screen.info, "cursor_col"));
+    try res.fact("alt_screen", objBool(screen.info, "alt_screen"));
+    try res.fact("view_offset", objInt(screen.info, "view_offset"));
+    try res.fact("app_cursor_keys", objBool(screen.info, "app_cursor_keys"));
+    try res.fact("sync_output", objBool(screen.info, "sync_output"));
+    try res.fact("title", objStr(screen.info, "title"));
+    try res.fact("seq", objInt(screen.info, "seq"));
+    if (screen.scrollback > 0) try res.fact("scrollback", screen.scrollback);
+    const title = objStr(screen.info, "title");
+    try res.textf("{d}x{d} grid, cursor at row {d} col {d}{s}{s}{s}", .{
+        cols,
+        rows,
+        objInt(screen.info, "cursor_row"),
+        objInt(screen.info, "cursor_col"),
+        if (objBool(screen.info, "alt_screen")) ", alt screen" else "",
+        if (title.len > 0) ", title " else "",
+        title,
+    });
 }
 
 // ── forwarded-app tools (headless GUI apps via the mux daemon) ────
@@ -3549,18 +3551,36 @@ fn webHelperPath(arena: std.mem.Allocator) ?[]const u8 {
     return findExecutable(arena, "sketerm-webengine");
 }
 
+/// The preflight: what this server can actually do right now. Facts
+/// only in structuredContent — every `*_hint` prose field this used to
+/// carry either states something the tool's own description already
+/// says, or is a SITUATIONAL note, which is one line of the text lane.
 fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
+    var res = Res.init(arena);
     // headless_gui is what launch_app actually depends on (the mux
     // daemon), and it is effectively always true. gui_socket was once
-    // reported bare and read as "no GUI here", steering assistants
-    // back to Xvfb — hence the explicit hints on both fields.
-    try w.print("{{\"mode\":\"{s}\",\"headless_gui\":{},\"headless_gui_hint\":\"launch_app runs GUI (Wayland) apps headlessly against the mux daemon — no display, X server or sketerm window needed; this is independent of gui_socket\",\"gui_socket\":{},\"gui_socket_source\":\"{s}\",\"gui_socket_hint\":\"whether a direct sketerm GUI control socket is attached (used by GUI-targeting terminal tools and sessionless panels); false does NOT mean headless GUI apps or mux-relayed panels are unavailable\",\"headless_terminals\":{},\"transfers_and_forwards\":{}", .{
-        srv_mode, app_state.ready, srv_gui_socket, @tagName(srv_gui_socket_source), term_state.mux_sock != null, term_state.mux_sock != null,
+    // read as "no GUI here", steering assistants back to Xvfb — the
+    // two are independent, which the text lane says in one line.
+    const headless_terms = term_state.mux_sock != null;
+    try res.fact("mode", srv_mode);
+    try res.fact("headless_gui", app_state.ready);
+    try res.fact("gui_socket", srv_gui_socket);
+    try res.fact("gui_socket_source", @tagName(srv_gui_socket_source));
+    try res.fact("headless_terminals", headless_terms);
+    try res.fact("transfers_and_forwards", headless_terms);
+    try res.textf("mode {s}: headless GUI apps {s}, headless terminals {s}, transfers/forwards {s}", .{
+        srv_mode,
+        yesNo(app_state.ready),
+        yesNo(headless_terms),
+        yesNo(headless_terms),
+    });
+    try res.textf("direct GUI control socket: {s} ({s}) — independent of headless GUI apps and of relayed panels", .{
+        yesNo(srv_gui_socket),
+        @tagName(srv_gui_socket_source),
     });
     if (!std.mem.eql(u8, srv_mode, "shared"))
-        try w.writeAll(",\"mode_hint\":\"this server talks to its own PRIVATE mux daemon: sessions here are invisible to the user's `sketerm mux list` / `sketerm app`, and apps started there are invisible here (run with --shared to join the user's daemon)\"");
+        try res.text("this server talks to its own PRIVATE mux daemon: sessions here are invisible to the user's `sketerm mux list` / `sketerm app`, and apps started there are invisible here (run with --shared to join the user's daemon)");
+
     // Panel delivery is independent of gui_socket: an isolated MCP can
     // relay to the GUI attached to its inherited origin session.
     const panel_session = panelstore.resolveSession(.absent);
@@ -3612,122 +3632,173 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
         "no_session_origin"
     else
         "unavailable";
-    try w.print(",\"panels\":{},\"panels_store\":{},\"panel_store\":{{\"state\":\"{s}\",\"scope\":\"{s}\"", .{
-        panels_ready,
-        panel_store_ready,
+    try res.fact("panels", panels_ready);
+    try res.fact("panels_store", panel_store_ready);
+    {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.print("{{\"state\":\"{s}\",\"scope\":\"{s}\"", .{
+            if (panel_store_ready) "ready" else "unavailable",
+            panel_store_scope_name,
+        });
+        if (!panel_store_ready) {
+            try w.writeAll(",\"error\":");
+            try std.json.Stringify.value(panel_store.err, .{}, w);
+            try w.writeAll(",\"reason\":\"identity_validation_failed\"");
+        }
+        try w.writeAll("}");
+        try res.raw("panel_store", aw.written());
+    }
+    {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("{\"selected\":");
+        try std.json.Stringify.value(panel_transport.selected(), .{}, w);
+        try w.writeAll(",\"source\":");
+        try std.json.Stringify.value(panel_transport.source(), .{}, w);
+        try w.writeAll(",\"state\":");
+        try std.json.Stringify.value(panel_state_name, .{}, w);
+        try w.writeAll(",\"session\":");
+        try std.json.Stringify.value(panel_session, .{}, w);
+        if (!panels_ready) {
+            try w.writeAll(",\"error\":");
+            try std.json.Stringify.value(panel_reply.err, .{}, w);
+        }
+        try w.writeAll("}");
+        try res.raw("panel_transport", aw.written());
+    }
+    try res.textf("panels: live {s} ({s}, transport {s}), saved {s} (scope {s})", .{
+        if (panels_ready) "ready" else "unavailable",
+        panel_state_name,
+        panel_transport.selected(),
         if (panel_store_ready) "ready" else "unavailable",
         panel_store_scope_name,
     });
-    if (!panel_store_ready) {
-        try w.writeAll(",\"error\":");
-        try std.json.Stringify.value(panel_store.err, .{}, w);
-        try w.writeAll(",\"reason\":\"identity_validation_failed\"");
-    }
-    try w.writeAll("},\"panel_transport\":{\"selected\":");
-    try std.json.Stringify.value(panel_transport.selected(), .{}, w);
-    try w.writeAll(",\"source\":");
-    try std.json.Stringify.value(panel_transport.source(), .{}, w);
-    try w.writeAll(",\"state\":");
-    try std.json.Stringify.value(panel_state_name, .{}, w);
-    try w.writeAll(",\"session\":");
-    try std.json.Stringify.value(panel_session, .{}, w);
-    if (!panels_ready) {
-        try w.writeAll(",\"error\":");
-        try std.json.Stringify.value(panel_reply.err, .{}, w);
-    }
-    try w.writeAll("}");
-    try w.writeAll(if (panels_ready)
-        ",\"panels_hint\":\"live ui_* calls are routed to the GUI attached to this panel session; remote image paths are hydrated over the same mux attachment before presentation; gui_socket is independent and only describes direct GUI control IPC\""
-    else
-        ",\"panels_hint\":\"live ui_* calls need either an origin session relay (SKETERM_SESSION plus SKETERM_MUX_SOCKET, or the connect-only default daemon fallback) or an explicit direct GUI socket. Store-only ui_save/ui_panels/ui_delete are available only when panels_store is true; panel_store reports their independently validated state.\"");
-    try w.writeAll(if (panel_store_ready)
-        ",\"panel_store_hint\":\"saved-panel persistence has a resolved scope: exact origins key on daemon socket plus session lifetime id, and direct/default/sessionless callers use their compatibility scopes. A filesystem that refuses the write is reported by ui_save itself\""
-    else
-        ",\"panel_store_hint\":\"saved-panel persistence is unavailable because the exact origin identity could not be resolved; ui_save/ui_delete return the same failure and ui_panels reports saved_error. Exact origins never downgrade to reusable session storage\"");
+    if (!panels_ready)
+        try res.text("live ui_* calls need either an origin session relay (SKETERM_SESSION plus SKETERM_MUX_SOCKET, or the connect-only default daemon fallback) or an explicit direct GUI socket. Store-only ui_save/ui_panels/ui_delete stay available while panels_store is true");
+    if (!panel_store_ready)
+        try res.text("saved-panel persistence is unavailable because the exact origin identity could not be resolved; ui_save/ui_delete return the same failure and ui_panels reports saved_error. Exact origins never downgrade to reusable session storage");
+
     const ocr_ok = ocr.available();
-    try w.print(",\"ocr\":{}", .{ocr_ok});
-    if (!ocr_ok) try w.writeAll(",\"ocr_hint\":\"app_read_text/app_wait_text need libtesseract — install tesseract + tesseract-data-eng on THIS machine\"");
-    if (webHelperPath(arena)) |wp| {
-        try w.writeAll(",\"web_helper\":");
-        try std.json.Stringify.value(wp, .{}, w);
-        if (srv_gui_socket) {
-            try w.writeAll(",\"web\":true,\"web_backend\":\"gui\",\"web_hint\":\"the web_* tools drive the sketerm GUI's OWN browser views (the tabs the user sees); the handle is the pane id\"");
-        } else if (std.mem.eql(u8, srv_mode, "shared")) {
-            try w.writeAll(",\"web\":false,\"web_backend\":\"none\",\"web_hint\":\"--shared mode drives the user's GUI, but no GUI control socket was found; start the sketerm GUI (or run without --shared, where the web_* tools work headlessly with no GUI at all)\"");
-        } else if (@import("mcp_web.zig").sessionInfo()) |ws| {
-            try w.writeAll(",\"web\":true,\"web_backend\":\"session\",\"web_session\":");
-            try std.json.Stringify.value(ws, .{}, w);
-            try w.writeAll(",\"web_hint\":\"the web_* tools drive this server's own sketerm-webengine (software raster; the handle is a headless view id, not a pane), which runs attached to the named Wayland app session on this instance's private daemon — web.json next to the helper socket names it too. A human can attach a viewer to that session (Session Overview, or sketerm mux with the instance's sock: path) to follow along; today that carries the session's page AUDIO and its lifetime, while browser views stay windowless\"");
-        } else {
-            try w.writeAll(",\"web\":true,\"web_backend\":\"headless\",\"web_hint\":\"the web_* tools work RIGHT NOW with no GUI: this server runs its own sketerm-webengine (software raster, spawned on first use — it then attaches to a watchable Wayland app session on the private daemon when it can, and capabilities reports web_backend session with the session name). web_open makes a view; the handle is a headless view id, not a pane. Do not launch_app a browser for web work\"");
-        }
-    } else {
-        try w.writeAll(",\"web_helper\":null,\"web\":false,\"web_backend\":\"none\",\"web_hint\":\"sketerm-webengine is not installed next to the sketerm binary — the web_* tools have nothing to drive, in any mode (build it with: zig build fetch-cef && zig build web)\"");
-    }
-    try w.print(",\"ssh\":{},\"scp\":{}", .{ findExecutable(arena, "ssh") != null, findExecutable(arena, "scp") != null });
+    try res.fact("ocr", ocr_ok);
+    if (!ocr_ok)
+        try res.text("app_read_text/app_wait_text need libtesseract — install tesseract + tesseract-data-eng on THIS machine");
+
+    const helper = webHelperPath(arena);
+    const web_backend: []const u8 = if (helper == null)
+        "none"
+    else if (srv_gui_socket)
+        "gui"
+    else if (std.mem.eql(u8, srv_mode, "shared"))
+        "none"
+    else if (@import("mcp_web.zig").sessionInfo() != null)
+        "session"
+    else
+        "headless";
+    const web_ok = helper != null and !std.mem.eql(u8, web_backend, "none");
+    if (helper) |wp| try res.fact("web_helper", wp) else try res.raw("web_helper", "null");
+    try res.fact("web", web_ok);
+    try res.fact("web_backend", web_backend);
+    if (@import("mcp_web.zig").sessionInfo()) |ws| try res.fact("web_session", ws);
+    if (helper == null)
+        try res.text("sketerm-webengine is not installed next to the sketerm binary — the web_* tools have nothing to drive, in any mode (build it with: zig build fetch-cef && zig build web)")
+    else if (std.mem.eql(u8, web_backend, "none"))
+        try res.text("--shared mode drives the user's GUI, but no GUI control socket was found; start the sketerm GUI (or run without --shared, where the web_* tools work headlessly with no GUI at all)")
+    else
+        try res.textf("web: {s} backend", .{web_backend});
+
+    try res.fact("ssh", findExecutable(arena, "ssh") != null);
+    try res.fact("scp", findExecutable(arena, "scp") != null);
     if (rec_state.enabled) {
-        try w.writeAll(",\"terminal_recordings\":");
-        if (recDir()) |d| try std.json.Stringify.value(d, .{}, w) else try w.writeAll("null");
-        try w.writeAll(",\"recordings_hint\":\"every headless terminal is auto-recorded as an asciicast v2 .cast file there (replay with asciinema play)\"");
-    } else {
-        try w.writeAll(",\"terminal_recordings\":null");
-    }
+        if (recDir()) |d| try res.fact("terminal_recordings", d) else try res.raw("terminal_recordings", "null");
+        try res.text("every headless terminal is auto-recorded as an asciicast v2 .cast file there (replay with asciinema play)");
+    } else try res.raw("terminal_recordings", "null");
+
     // Effective input-timing defaults, with any env override marked —
     // config-set defaults must never be invisible state.
-    try w.writeAll(",\"input_tuning\":{");
-    var any_override = false;
-    for (Tuning.all(), 0..) |item, i| {
-        if (i > 0) try w.writeAll(",");
-        try w.print("\"{s}\":{{\"value\":{d},\"built_in\":{d},\"overridden\":{}}}", .{ item.name, item.value, item.built_in, item.overridden });
-        if (item.overridden) any_override = true;
+    {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("{");
+        var any_override = false;
+        for (Tuning.all(), 0..) |item, i| {
+            if (i > 0) try w.writeAll(",");
+            try w.print("\"{s}\":{{\"value\":{d},\"built_in\":{d},\"overridden\":{}}}", .{ item.name, item.value, item.built_in, item.overridden });
+            if (item.overridden) any_override = true;
+        }
+        try w.writeAll("}");
+        try res.raw("input_tuning", aw.written());
+        if (any_override)
+            try res.text("some input-timing defaults were overridden via SKETERM_MCP_* env (project .mcp.json); the tools/list descriptions already state the effective values");
     }
-    try w.writeAll("}");
-    if (any_override) try w.writeAll(",\"input_tuning_hint\":\"values marked overridden were set via SKETERM_MCP_* env (project .mcp.json); the tools/list descriptions already state these effective defaults\"");
+
     // Tool exposure. A missing tool must be explicable from inside the
     // session: without this an assistant reads a filtered tools/list as
     // "sketerm cannot do that" and goes looking for workarounds.
-    try w.writeAll(",\"tool_policy\":{\"spec\":");
-    try std.json.Stringify.value(policy.spec, .{}, w);
-    try w.print(",\"source\":\"{s}\",\"restricted\":{},\"groups_available\":[", .{ policy_source, !policy.isUnrestricted() });
-    var first = true;
-    for (std.enums.values(mcpfilter.Group)) |g| {
-        var any = false;
-        for (mcpfilter.TOOL_META) |m| {
-            if (m.group == g and policy.allowsMeta(m)) {
-                any = true;
-                break;
+    {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        try w.writeAll("{\"spec\":");
+        try std.json.Stringify.value(policy.spec, .{}, w);
+        try w.print(",\"source\":\"{s}\",\"restricted\":{},\"groups_available\":[", .{ policy_source, !policy.isUnrestricted() });
+        var first = true;
+        for (std.enums.values(mcpfilter.Group)) |g| {
+            var any = false;
+            for (mcpfilter.TOOL_META) |m| {
+                if (m.group == g and policy.allowsMeta(m)) {
+                    any = true;
+                    break;
+                }
+            }
+            if (!any) continue;
+            if (!first) try w.writeAll(",");
+            first = false;
+            try std.json.Stringify.value(g.name(), .{}, w);
+        }
+        try w.writeAll("],\"groups_suppressed\":[");
+        var sup_buf: [std.enums.values(mcpfilter.Group).len]mcpfilter.Group = undefined;
+        const suppressed = mcpfilter.suppressedGroups(policy, &sup_buf);
+        for (suppressed, 0..) |g, i| {
+            if (i > 0) try w.writeAll(",");
+            try std.json.Stringify.value(g.name(), .{}, w);
+        }
+        try w.writeAll("]}");
+        try res.raw("tool_policy", aw.written());
+        if (!policy.isUnrestricted()) {
+            try res.textf("tool policy {s} (from {s}) restricts this connection; withheld tools are absent from tools/list AND refused by tools/call. A withheld tool is not a missing capability — ask the user to restart the server with --tools/--profile or $SKETERM_MCP_TOOLS", .{ policy.spec, policy_source });
+            if (suppressed.len > 0) {
+                var sw: std.Io.Writer.Allocating = .init(arena);
+                for (suppressed, 0..) |g, i| {
+                    if (i > 0) try sw.writer.writeAll(", ");
+                    try sw.writer.writeAll(g.name());
+                }
+                try res.textf("suppressed groups: {s}", .{sw.written()});
             }
         }
-        if (!any) continue;
-        if (!first) try w.writeAll(",");
-        first = false;
-        try std.json.Stringify.value(g.name(), .{}, w);
     }
-    try w.writeAll("],\"groups_suppressed\":[");
-    var sup_buf: [std.enums.values(mcpfilter.Group).len]mcpfilter.Group = undefined;
-    const suppressed = mcpfilter.suppressedGroups(policy, &sup_buf);
-    for (suppressed, 0..) |g, i| {
-        if (i > 0) try w.writeAll(",");
-        try std.json.Stringify.value(g.name(), .{}, w);
-    }
-    try w.writeAll("]");
-    if (!policy.isUnrestricted())
-        try w.writeAll(",\"hint\":\"the operator restricted this connection's tools; withheld tools are absent from tools/list AND refused by tools/call. Groups: panes, app, term, files, net, browser, ui, core (core is always on). A withheld tool is not a missing capability — ask the user to restart the server with --tools/--profile or $SKETERM_MCP_TOOLS if you need one.\"");
-    try w.writeAll("}");
+
     // App/terminal sessions have no idle timeout; what ends them is
     // this server's own lifetime in isolated mode. Saying so removes a
     // whole class of "the app exited with status 0 for no reason".
-    try w.writeAll(",\"session_lifetime\":");
+    try res.fact("session_lifetime", srv_mode);
     if (std.mem.eql(u8, srv_mode, "shared"))
-        try w.writeAll("\"shared mode: sessions live on the user's own daemon and outlive this server; nothing here times them out\"")
+        try res.text("session lifetime: sessions live on the user's own daemon and outlive this server; nothing here times them out")
     else if (std.mem.eql(u8, srv_mode, "isolated"))
-        try w.writeAll("\"isolated mode: the private daemon and EVERY app/terminal on it are torn down when this MCP server exits. There is no idle timeout — an app that 'exited on its own' between sessions was killed by that teardown. Use --durable/--name for sessions that survive restarts.\"")
+        try res.text("session lifetime: the private daemon and EVERY app/terminal on it are torn down when this MCP server exits. There is no idle timeout — an app that 'exited on its own' between sessions was killed by that teardown. Use --durable/--name for sessions that survive restarts")
     else
-        try w.writeAll("\"named instance: the daemon and its sessions survive this server's restarts and are reattached on reconnect; there is no idle timeout\"");
-    try w.print(",\"open_terms\":{d},\"open_apps\":{d},\"open_forwards\":{d}}}", .{
+        try res.text("session lifetime: the daemon and its sessions survive this server's restarts and are reattached on reconnect; there is no idle timeout");
+
+    try res.fact("open_terms", term_state.terms.count());
+    try res.fact("open_apps", app_state.apps.count());
+    try res.fact("open_forwards", forward_state.forwards.count());
+    try res.textf("open: {d} terminal(s), {d} app(s), {d} forward(s)", .{
         term_state.terms.count(), app_state.apps.count(), forward_state.forwards.count(),
     });
-    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    return res.finish();
+}
+
+fn yesNo(v: bool) []const u8 {
+    return if (v) "yes" else "no";
 }
 
 // ── file_* tools (fsdrive against the app daemon) ─────────────────
@@ -3749,138 +3820,242 @@ fn fsEntryLine(w: *std.Io.Writer, e: fsdrive.Entry) !void {
     try w.writeAll("\n");
 }
 
+/// An fsdrive error as one of the shared codes. The daemon's own
+/// message is the only place a missing path is visible, so a refused
+/// op is classified from it.
+pub fn fsErrCode(err: fsdrive.Error, detail: []const u8) ErrCode {
+    return switch (err) {
+        fsdrive.Error.NotConnected => .unavailable,
+        fsdrive.Error.Timeout => .timeout,
+        fsdrive.Error.BadRequest => .invalid_args,
+        fsdrive.Error.Conflict => .conflict,
+        fsdrive.Error.OutOfMemory, fsdrive.Error.BadReply => .io_failed,
+        fsdrive.Error.FsOpFailed => if (std.mem.indexOf(u8, detail, "No such file") != null or
+            std.mem.indexOf(u8, detail, "not found") != null or
+            std.mem.indexOf(u8, detail, "ENOENT") != null) .not_found else .io_failed,
+    };
+}
+
 /// Describe an fsdrive failure. Captures the daemon's error string
 /// BEFORE dropping a dead connection (the Fs would dangle after).
 fn fsFail(arena: std.mem.Allocator, fs: *fsdrive.Fs, what: []const u8, err: fsdrive.Error) ![]const u8 {
     if (err == fsdrive.Error.NotConnected) {
         fs_state.drop();
-        return appErr(arena, "daemon connection lost (reconnects on the next file_* call)");
+        return errRes(arena, .unavailable, "daemon connection lost (reconnects on the next file_* call)");
     }
+    const detail = fs.lastErr();
     const msg = std.fmt.allocPrint(arena, "{s} failed: {s} ({s})", .{
-        what, fs.lastErr(), @errorName(err),
+        what, detail, @errorName(err),
     }) catch return error.OutOfMemory;
+    const code = fsErrCode(err, detail);
     // A send timeout may have left half a frame on the stream. Preserve the
     // timeout verdict, but retire that connection before the next request.
     if (!fs.usable()) fs_state.drop();
-    return toolResult(arena, msg, true) orelse error.OutOfMemory;
+    return errRes(arena, code, msg);
 }
 
 /// Wait for a job's terminal event and render the outcome. A timeout
-/// is HONEST: the job keeps running daemon-side and the reply says so.
+/// is HONEST: the job keeps running daemon-side, and that is a FACT
+/// (`status: running`, `timed_out`), never a tool error.
 fn fsAwaitJob(arena: std.mem.Allocator, fs: *fsdrive.Fs, job: u64, opname: []const u8, timeout_ms: i64) ![]const u8 {
     const end = fs.waitJobEnd(job, timeout_ms) catch |err| switch (err) {
         fsdrive.Error.Timeout => {
-            const msg = std.fmt.allocPrint(arena, "{s} job {d} still running after {d}ms — it continues in the background (file_jobs to check, file_job to cancel)", .{ opname, job, timeout_ms }) catch return error.OutOfMemory;
-            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+            var res = Res.init(arena);
+            try res.fact("op", opname);
+            try res.fact("job", job);
+            try res.field("status", @as([]const u8, "running"));
+            try res.fact("timed_out", true);
+            try res.textf("{s} job {d} is still running after {d}ms — it continues in the background (file_jobs to check, file_job to cancel)", .{ opname, job, timeout_ms });
+            return res.finish();
         },
         else => return fsFail(arena, fs, opname, err),
     };
-    if (end.ok) {
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        w.print("{s} job {d} done: {d} bytes", .{ opname, job, end.bytes_done }) catch return error.OutOfMemory;
-        if (end.resumed_from > 0) w.print(", resumed from {d} (partial verified by hash)", .{end.resumed_from}) catch return error.OutOfMemory;
-        if (end.has_hash) w.print(", sha256={s}", .{end.hash[0..]}) catch return error.OutOfMemory;
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    if (!end.ok) {
+        const msg = std.fmt.allocPrint(arena, "{s} job {d} {s}: {s}", .{
+            opname, job, if (end.canceled) "canceled" else "FAILED", end.messageText(),
+        }) catch return error.OutOfMemory;
+        return errRes(arena, if (end.canceled) .conflict else .io_failed, msg);
     }
-    const msg = std.fmt.allocPrint(arena, "{s} job {d} {s}: {s}", .{
-        opname, job, if (end.canceled) "canceled" else "FAILED", end.messageText(),
-    }) catch return error.OutOfMemory;
-    return toolResult(arena, msg, true) orelse error.OutOfMemory;
+    var res = Res.init(arena);
+    try res.fact("op", opname);
+    try res.fact("job", job);
+    try res.field("status", @as([]const u8, "done"));
+    try res.fact("timed_out", false);
+    try res.fact("bytes", end.bytes_done);
+    if (end.resumed_from > 0) try res.fact("resumed_from", end.resumed_from);
+    if (end.has_hash) try res.fact("sha256", end.hash[0..]);
+    try res.textf("{s} job {d} done: {d} bytes", .{ opname, job, end.bytes_done });
+    if (end.resumed_from > 0) try res.textf("resumed from {d} (partial verified by hash)", .{end.resumed_from});
+    if (end.has_hash) try res.textf("sha256 {s}", .{end.hash[0..]});
+    return res.finish();
+}
+
+/// One directory entry as machine facts. Same vocabulary as the text
+/// table `fsEntryLine` writes, so a listing cannot say two things.
+fn fsEntryJson(w: *std.Io.Writer, e: fsdrive.Entry) !void {
+    try w.writeAll("{\"name\":");
+    try std.json.Stringify.value(e.name, .{}, w);
+    try w.print(",\"kind\":\"{s}\",\"size\":{d},\"mode\":{d},\"mtime_ms\":{d},\"uid\":{d},\"gid\":{d}", .{
+        e.kind, e.size, e.mode, e.mtime_ms, e.uid, e.gid,
+    });
+    if (e.target) |t| {
+        try w.writeAll(",\"target\":");
+        try std.json.Stringify.value(t, .{}, w);
+        try w.print(",\"target_is_dir\":{}", .{e.tdir});
+    }
+    try w.writeAll("}");
 }
 
 fn fsTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
     const fs = fs_state.get() orelse
-        return appErr(arena, "cannot reach the mux daemon for file tools");
+        return errRes(arena, .unavailable, "cannot reach the mux daemon for file tools");
 
     if (eql(u8, name, "file_list")) {
-        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
         var l = fs.list(path) catch |err| return fsFail(arena, fs, "list", err);
         defer l.deinit();
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        w.print("{s} — {d} entries{s}\n", .{
+        var entries: std.Io.Writer.Allocating = .init(arena);
+        var table: std.Io.Writer.Allocating = .init(arena);
+        try entries.writer.writeAll("[");
+        for (l.entries, 0..) |e, i| {
+            if (i > 0) try entries.writer.writeAll(",");
+            try fsEntryJson(&entries.writer, e);
+            try fsEntryLine(&table.writer, e);
+        }
+        try entries.writer.writeAll("]");
+        var res = Res.init(arena);
+        try res.fact("path", l.path);
+        try res.fact("count", l.entries.len);
+        try res.fact("truncated", l.truncated);
+        try res.raw("entries", entries.written());
+        try res.textf("{s}: {d} entries{s}", .{
             l.path, l.entries.len, if (l.truncated) " (TRUNCATED at the listing cap)" else "",
-        }) catch return error.OutOfMemory;
-        for (l.entries) |e| fsEntryLine(w, e) catch return error.OutOfMemory;
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        });
+        if (l.entries.len > 0) try res.textf("--- entries ---\n{s}", .{table.written()});
+        return res.finish();
     }
     if (eql(u8, name, "file_stat")) {
-        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
         const e = fs.statPath(arena, path) catch |err| return fsFail(arena, fs, "stat", err);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
+        var res = Res.init(arena);
+        try res.fact("path", path);
+        try res.fact("kind", e.kind);
+        try res.fact("size", e.size);
+        try res.fact("mode", e.mode);
+        try res.fact("uid", e.uid);
+        try res.fact("gid", e.gid);
+        try res.fact("mtime_ms", e.mtime_ms);
+        if (e.target) |t| {
+            try res.fact("target", t);
+            try res.fact("target_is_dir", e.tdir);
+        }
         var tb: [32]u8 = undefined;
-        w.print("{s}: {s}, {d} bytes, mode {o:0>4}, uid {d} gid {d}, mtime {s}", .{
+        try res.textf("{s}: {s}, {d} bytes, mode {o:0>4}, uid {d} gid {d}, mtime {s}", .{
             path, e.kind, e.size, e.mode, e.uid, e.gid, fsFmtTime(&tb, e.mtime_ms),
-        }) catch return error.OutOfMemory;
-        if (e.target) |t| w.print(", -> {s}{s}", .{ t, if (e.tdir) " (dir)" else "" }) catch return error.OutOfMemory;
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        });
+        if (e.target) |t| try res.textf("-> {s}{s}", .{ t, if (e.tdir) " (dir)" else "" });
+        return res.finish();
     }
     if (eql(u8, name, "file_read")) {
-        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
         const off: u64 = @intCast(@max(0, argInt(args, "offset") orelse 0));
         const want: u32 = @intCast(std.math.clamp(argInt(args, "length") orelse 262_144, 1, 2_097_152));
         var data: std.ArrayList(u8) = .empty;
         defer data.deinit(arena);
         const info = fs.read(path, off, want, &data) catch |err| return fsFail(arena, fs, "read", err);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        w.print("# {s} (size {d}, read {d} bytes at offset {d}{s})\n", .{
-            path, info.size, data.items.len, off, if (info.eof) ", eof" else ", MORE remains",
-        }) catch return error.OutOfMemory;
-        if (std.unicode.utf8ValidateSlice(data.items) and std.mem.indexOfScalar(u8, data.items, 0) == null) {
-            w.writeAll(data.items) catch return error.OutOfMemory;
+        const textual = std.unicode.utf8ValidateSlice(data.items) and
+            std.mem.indexOfScalar(u8, data.items, 0) == null;
+        var res = Res.init(arena);
+        try res.fact("path", path);
+        try res.fact("size", info.size);
+        try res.fact("offset", off);
+        try res.fact("bytes", data.items.len);
+        try res.fact("eof", info.eof);
+        try res.fact("more", !info.eof);
+        try res.fact("binary", !textual);
+        try res.textf("{s}: read {d} of {d} bytes at offset {d}, {s}", .{
+            path, data.items.len, info.size, off, if (info.eof) "eof" else "MORE remains",
+        });
+        if (textual) {
+            // Text content is the payload the text lane exists for;
+            // duplicating it into structuredContent would double a
+            // multi-megabyte read for no reader.
+            try res.textf("--- content ---\n{s}", .{data.items});
         } else {
-            w.writeAll("# binary content, base64:\n") catch return error.OutOfMemory;
+            // Bytes are machine data, not prose: the base64 belongs in
+            // the structured lane, and the text lane just says so.
             const enc = std.base64.standard.Encoder;
             const b64 = arena.alloc(u8, enc.calcSize(data.items.len)) catch return error.OutOfMemory;
-            w.writeAll(enc.encode(b64, data.items)) catch return error.OutOfMemory;
+            try res.fact("base64", enc.encode(b64, data.items));
+            try res.text("binary content: the bytes are base64 in structuredContent.base64");
         }
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        return res.finish();
     }
     if (eql(u8, name, "file_write")) {
-        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
-        const content = argStr(args, "content") orelse return appErr(arena, "missing content");
+        const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
+        const content = argStr(args, "content") orelse return errRes(arena, .invalid_args, "missing content");
         const append = argBool(args, "append");
         const n = fs.write(path, 0, content, .{
             .create = true,
             .truncate = !append,
             .append = append,
         }) catch |err| return fsFail(arena, fs, "write", err);
-        const msg = std.fmt.allocPrint(arena, "{s}: {d} bytes {s}", .{
-            path, n, if (append) "appended" else "written",
-        }) catch return error.OutOfMemory;
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("path", path);
+        try res.fact("bytes", n);
+        try res.fact("append", append);
+        try res.textf("{s}: {d} bytes {s}", .{ path, n, if (append) "appended" else "written" });
+        return res.finish();
     }
     if (eql(u8, name, "file_mkdir")) {
-        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
         fs.mkdir(path) catch |err| return fsFail(arena, fs, "mkdir", err);
-        return toolResult(arena, "created", false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("path", path);
+        try res.fact("created", true);
+        try res.textf("{s}: created", .{path});
+        return res.finish();
     }
     if (eql(u8, name, "file_rename")) {
-        const from = argStr(args, "from") orelse return appErr(arena, "missing from");
-        const to = argStr(args, "to") orelse return appErr(arena, "missing to");
+        const from = argStr(args, "from") orelse return errRes(arena, .invalid_args, "missing from");
+        const to = argStr(args, "to") orelse return errRes(arena, .invalid_args, "missing to");
         fs.rename(from, to) catch |err| return fsFail(arena, fs, "rename", err);
-        return toolResult(arena, "renamed", false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("from", from);
+        try res.fact("to", to);
+        try res.fact("renamed", true);
+        try res.textf("renamed {s} to {s}", .{ from, to });
+        return res.finish();
     }
     if (eql(u8, name, "file_delete")) {
-        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
         fs.deletePath(path) catch |err| return fsFail(arena, fs, "delete", err);
-        return toolResult(arena, "deleted", false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("path", path);
+        try res.fact("deleted", true);
+        try res.textf("{s}: deleted", .{path});
+        return res.finish();
     }
     if (eql(u8, name, "file_chmod")) {
-        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
         const mode: u32 = @intCast(std.math.clamp(argInt(args, "mode") orelse -1, 0, 0o7777));
         fs.chmod(path, mode) catch |err| return fsFail(arena, fs, "chmod", err);
-        return toolResult(arena, "permissions changed", false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("path", path);
+        try res.fact("mode", mode);
+        try res.textf("{s}: mode {o:0>4}", .{ path, mode });
+        return res.finish();
     }
     if (eql(u8, name, "file_truncate")) {
-        const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+        const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
         const size: u64 = @intCast(@max(0, argInt(args, "size") orelse 0));
         fs.truncate(path, size) catch |err| return fsFail(arena, fs, "truncate", err);
-        return toolResult(arena, "size changed", false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("path", path);
+        try res.fact("size", size);
+        try res.textf("{s}: size now {d}", .{ path, size });
+        return res.finish();
     }
     if (eql(u8, name, "file_copy") or eql(u8, name, "file_delete_tree") or eql(u8, name, "file_hash") or
         eql(u8, name, "file_extract") or eql(u8, name, "file_archive_create") or eql(u8, name, "file_trash"))
@@ -3889,96 +4064,149 @@ fn fsTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]c
         var job: u64 = 0;
         var opname: []const u8 = "";
         if (eql(u8, name, "file_copy")) {
-            const src = argStr(args, "src") orelse return appErr(arena, "missing src");
-            const dst = argStr(args, "dst") orelse return appErr(arena, "missing dst");
+            const src = argStr(args, "src") orelse return errRes(arena, .invalid_args, "missing src");
+            const dst = argStr(args, "dst") orelse return errRes(arena, .invalid_args, "missing dst");
             job = fs.startCopy(src, dst, argBool(args, "resume")) catch |err| return fsFail(arena, fs, "copy", err);
             opname = "copy";
         } else if (eql(u8, name, "file_delete_tree")) {
-            const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+            const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
             job = fs.startDeleteTree(path) catch |err| return fsFail(arena, fs, "delete_tree", err);
             opname = "delete_tree";
         } else if (eql(u8, name, "file_extract")) {
-            const archive = argStr(args, "archive") orelse return appErr(arena, "missing archive");
-            const destination = argStr(args, "destination") orelse return appErr(arena, "missing destination");
+            const archive = argStr(args, "archive") orelse return errRes(arena, .invalid_args, "missing archive");
+            const destination = argStr(args, "destination") orelse return errRes(arena, .invalid_args, "missing destination");
             job = fs.startExtract(archive, destination) catch |err| return fsFail(arena, fs, "extract", err);
             opname = "extract";
         } else if (eql(u8, name, "file_archive_create")) {
-            const source = argStr(args, "source") orelse return appErr(arena, "missing source");
-            const archive = argStr(args, "archive") orelse return appErr(arena, "missing archive");
+            const source = argStr(args, "source") orelse return errRes(arena, .invalid_args, "missing source");
+            const archive = argStr(args, "archive") orelse return errRes(arena, .invalid_args, "missing archive");
             job = fs.startArchiveCreate(source, archive) catch |err| return fsFail(arena, fs, "archive_create", err);
             opname = "archive_create";
         } else if (eql(u8, name, "file_trash")) {
-            const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+            const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
             job = fs.startTrash(path) catch |err| return fsFail(arena, fs, "trash", err);
             opname = "trash";
         } else {
-            const path = argStr(args, "path") orelse return appErr(arena, "missing path");
+            const path = argStr(args, "path") orelse return errRes(arena, .invalid_args, "missing path");
             job = fs.startHash(path) catch |err| return fsFail(arena, fs, "hash", err);
             opname = "hash";
         }
         const wait = if (args == .object and args.object.get("wait") != null) argBool(args, "wait") else true;
         if (!wait) {
-            const msg = std.fmt.allocPrint(arena, "{s} job {d} started (file_jobs to check)", .{ opname, job }) catch return error.OutOfMemory;
-            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+            var res = Res.init(arena);
+            try res.fact("op", opname);
+            try res.field("job", job);
+            try res.field("status", @as([]const u8, "started"));
+            try res.textf("{s} job {d} started (file_jobs to check)", .{ opname, job });
+            return res.finish();
         }
         return fsAwaitJob(arena, fs, job, opname, timeout);
     }
     if (eql(u8, name, "file_media_info")) {
         const list_v = if (args == .object) args.object.get("paths") else null;
-        if (list_v == null or list_v.? != .array) return appErr(arena, "file_media_info needs a 'paths' array");
+        if (list_v == null or list_v.? != .array) return errRes(arena, .invalid_args, "file_media_info needs a 'paths' array");
         const items = list_v.?.array.items;
-        if (items.len == 0) return appErr(arena, "file_media_info needs at least one path");
+        if (items.len == 0) return errRes(arena, .invalid_args, "file_media_info needs at least one path");
         if (items.len > fsdrive.MEDIA_BATCH_MAX) {
             const msg = std.fmt.allocPrint(arena, "file_media_info takes at most {d} paths per call", .{fsdrive.MEDIA_BATCH_MAX}) catch return error.OutOfMemory;
-            return appErr(arena, msg);
+            return errRes(arena, .invalid_args, msg);
         }
         var paths: std.ArrayList([]const u8) = .empty;
         for (items) |item| {
             if (item != .string or item.string.len == 0 or item.string[0] != '/')
-                return appErr(arena, "every file_media_info path must be absolute");
+                return errRes(arena, .invalid_args, "every file_media_info path must be absolute");
             paths.append(arena, item.string) catch return error.OutOfMemory;
         }
         // "/" plus absolute names: the daemon resolves absolute entries
         // as-is, so one call can span directories.
         const rows = fs.mediaMeta(arena, "/", paths.items, 30_000) catch |err|
             return fsFail(arena, fs, "media_info", err);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        w.print("{d} files\n", .{rows.len}) catch return error.OutOfMemory;
-        for (rows) |r| {
-            w.print("{s} [{s}]{s}\n", .{
-                r.path, r.kind, if (r.cached) " (cached)" else "",
-            }) catch return error.OutOfMemory;
-            if (r.note.len > 0) w.print("  skipped: {s}\n", .{r.note}) catch return error.OutOfMemory;
-            for (r.fields) |f| w.print("  {s}={s}\n", .{ f.k, f.v }) catch return error.OutOfMemory;
+        var files: std.Io.Writer.Allocating = .init(arena);
+        var table: std.Io.Writer.Allocating = .init(arena);
+        const jw = &files.writer;
+        const tw = &table.writer;
+        try jw.writeAll("[");
+        for (rows, 0..) |r, i| {
+            if (i > 0) try jw.writeAll(",");
+            try jw.writeAll("{\"path\":");
+            try std.json.Stringify.value(r.path, .{}, jw);
+            try jw.print(",\"kind\":\"{s}\",\"cached\":{}", .{ r.kind, r.cached });
+            if (r.note.len > 0) {
+                try jw.writeAll(",\"note\":");
+                try std.json.Stringify.value(r.note, .{}, jw);
+            }
+            try jw.writeAll(",\"fields\":{");
+            for (r.fields, 0..) |f, fi| {
+                if (fi > 0) try jw.writeAll(",");
+                try std.json.Stringify.value(f.k, .{}, jw);
+                try jw.writeAll(":");
+                try std.json.Stringify.value(f.v, .{}, jw);
+            }
+            try jw.writeAll("}}");
+
+            try tw.print("{s} [{s}]{s}\n", .{ r.path, r.kind, if (r.cached) " (cached)" else "" });
+            if (r.note.len > 0) try tw.print("  skipped: {s}\n", .{r.note});
+            for (r.fields) |f| try tw.print("  {s}={s}\n", .{ f.k, f.v });
         }
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        try jw.writeAll("]");
+        var res = Res.init(arena);
+        try res.fact("count", rows.len);
+        try res.raw("files", files.written());
+        try res.textf("{d} file(s)", .{rows.len});
+        if (rows.len > 0) try res.textf("--- media ---\n{s}", .{table.written()});
+        return res.finish();
     }
     if (eql(u8, name, "file_jobs")) {
         const rows = fs.jobList(arena) catch |err| return fsFail(arena, fs, "job_list", err);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        if (rows.len == 0) {
-            w.writeAll("no file jobs") catch return error.OutOfMemory;
-        } else for (rows) |row| {
-            w.print("job {d}: {s} {s} {d}/{d} bytes\n", .{ row.job, row.op, row.state, row.done, row.total }) catch return error.OutOfMemory;
+        var jobs: std.Io.Writer.Allocating = .init(arena);
+        var table: std.Io.Writer.Allocating = .init(arena);
+        const jw = &jobs.writer;
+        const tw = &table.writer;
+        try jw.writeAll("[");
+        for (rows, 0..) |row, i| {
+            if (i > 0) try jw.writeAll(",");
+            try jw.print("{{\"job\":{d},\"op\":", .{row.job});
+            try std.json.Stringify.value(row.op, .{}, jw);
+            try jw.writeAll(",\"state\":");
+            try std.json.Stringify.value(row.state, .{}, jw);
+            try jw.print(",\"done\":{d},\"total\":{d},\"src\":", .{ row.done, row.total });
+            try std.json.Stringify.value(row.src, .{}, jw);
+            try jw.writeAll(",\"dst\":");
+            try std.json.Stringify.value(row.dst, .{}, jw);
+            try jw.writeAll(",\"message\":");
+            try std.json.Stringify.value(row.message, .{}, jw);
+            try jw.writeAll("}");
+            if (i > 0) try tw.writeAll("\n");
+            try tw.print("job {d}: {s} {s} {d}/{d} bytes", .{ row.job, row.op, row.state, row.done, row.total });
         }
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        try jw.writeAll("]");
+        var res = Res.init(arena);
+        try res.fact("count", rows.len);
+        try res.raw("jobs", jobs.written());
+        if (rows.len == 0)
+            try res.text("no file jobs")
+        else
+            try res.textf("{d} file job(s)\n--- jobs ---\n{s}", .{ rows.len, table.written() });
+        return res.finish();
     }
     if (eql(u8, name, "file_job")) {
         const job: u64 = @intCast(@max(0, argInt(args, "job") orelse 0));
-        const action = argStr(args, "action") orelse return appErr(arena, "missing action");
+        const action = argStr(args, "action") orelse return errRes(arena, .invalid_args, "missing action");
         if (eql(u8, action, "cancel")) {
             fs.jobCancel(job) catch |err| return fsFail(arena, fs, "job_cancel", err);
         } else if (eql(u8, action, "pause")) {
             fs.jobPause(job) catch |err| return fsFail(arena, fs, "job_pause", err);
         } else if (eql(u8, action, "resume")) {
             fs.jobResume(job) catch |err| return fsFail(arena, fs, "job_resume", err);
-        } else return appErr(arena, "action must be cancel|pause|resume");
-        const msg = std.fmt.allocPrint(arena, "job {d}: {s} sent", .{ job, action }) catch return error.OutOfMemory;
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        } else return errRes(arena, .invalid_args, "action must be cancel|pause|resume");
+        var res = Res.init(arena);
+        try res.fact("job", job);
+        try res.fact("action", action);
+        try res.fact("sent", true);
+        try res.textf("job {d}: {s} sent", .{ job, action });
+        return res.finish();
     }
-    return appErr(arena, "unknown file tool");
+    return errRes(arena, .unknown_tool, "unknown file tool");
 }
 
 // ── ui_*: agent-authored UI panels ────────────────────────────────
@@ -4526,6 +4754,104 @@ fn directFailureMessage(arena: std.mem.Allocator, command: []const u8, failure: 
     ) catch "the direct GUI reply was lost after delivery became uncertain; the request was not retried";
 }
 
+/// A failed panel round trip as a typed error. The message is the
+/// transport's own (it names the exact origin, session and phase);
+/// only the CODE is derived here, from the delivery phase and the
+/// vocabulary `relayFailure`/`UI_NEEDS_TRANSPORT` speak.
+fn uiFailCode(reply: IpcReply) ErrCode {
+    return switch (reply.delivery) {
+        .pre_delivery => .unavailable,
+        .uncertain_delivery => .io_failed,
+        .ordinary => if (std.mem.indexOf(u8, reply.err, "no longer present") != null or
+            std.mem.indexOf(u8, reply.err, "no such") != null or
+            std.mem.indexOf(u8, reply.err, "not live") != null)
+            .not_found
+        else if (std.mem.indexOf(u8, reply.err, "no live panel transport") != null or
+            std.mem.indexOf(u8, reply.err, "unavailable") != null or
+            std.mem.indexOf(u8, reply.err, "no compatible GUI") != null or
+            std.mem.indexOf(u8, reply.err, "does not support panel relay") != null)
+            .unavailable
+        else
+            .failed,
+    };
+}
+
+fn uiTransportErr(arena: std.mem.Allocator, reply: IpcReply) ![]const u8 {
+    return errRes(arena, uiFailCode(reply), reply.err);
+}
+
+/// The one shape `ui_wait_event` answers with, whether it timed out or
+/// carried interactions: the events are machine facts, and the text
+/// lane is one line per interaction. A timeout is a FACT, never a tool
+/// error — the panel is still showing.
+fn uiEventsResult(
+    arena: std.mem.Allocator,
+    panel_id: u32,
+    waited_ms: i64,
+    events: ?std.json.Value,
+    dropped: i64,
+    timeout_ms: i64,
+) ![]const u8 {
+    var res = Res.init(arena);
+    try res.fact("panel_id", panel_id);
+    try res.fact("waited_ms", waited_ms);
+    try res.fact("dropped", dropped);
+
+    const items: []const std.json.Value = if (events) |e|
+        (if (e == .array) e.array.items else &.{})
+    else
+        &.{};
+    if (events) |e| {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        try std.json.Stringify.value(e, .{}, &aw.writer);
+        try res.raw("events", aw.written());
+    } else try res.raw("events", "[]");
+    try res.fact("count", items.len);
+    try res.fact("timed_out", items.len == 0);
+
+    if (items.len == 0)
+        try res.textf("no interaction within {d}ms — the panel is still showing; wait again or ui_patch it", .{timeout_ms})
+    else
+        try res.textf("{d} interaction(s) after {d}ms", .{ items.len, waited_ms });
+    if (dropped > 0)
+        try res.textf("the panel's event queue overflowed and {d} OLDER interaction(s) were discarded; this reply is not the complete history", .{dropped});
+    if (items.len > 0) {
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        for (items, 0..) |ev, i| {
+            if (i > 0) try w.writeAll("\n");
+            try w.print("{d} {s} {s}", .{ objInt(ev, "seq"), objStr(ev, "kind"), objStr(ev, "component") });
+            const v = if (ev == .object) ev.object.get("value") else null;
+            if (v) |value| switch (value) {
+                .null => {},
+                .string => |sv| try w.print(" = {s}", .{sv}),
+                .bool => |bv| try w.print(" = {}", .{bv}),
+                .integer => |iv| try w.print(" = {d}", .{iv}),
+                .float => |fv| try w.print(" = {d}", .{fv}),
+                else => {},
+            };
+        }
+        try res.textf("--- events ---\n{s}", .{aw.written()});
+    }
+    return res.finish();
+}
+
+/// A panel that could not be ADDRESSED: a bad handle is the caller's
+/// argument, an unknown name is a missing panel, and anything else
+/// came from the transport that answered the lookup.
+fn uiResolveErr(arena: std.mem.Allocator, target: UiResolved) ![]const u8 {
+    const code: ErrCode = if (std.mem.indexOf(u8, target.err, "panel_id must be") != null or
+        std.mem.indexOf(u8, target.err, "address the panel by") != null)
+        .invalid_args
+    else if (std.mem.indexOf(u8, target.err, "no LIVE panel named") != null)
+        .not_found
+    else if (std.mem.indexOf(u8, target.err, "deadline expired") != null)
+        .timeout
+    else
+        uiFailCode(.{ .ok = false, .value = .null, .err = target.err });
+    return errRes(arena, code, target.err);
+}
+
 /// An argument that may be given either as a JSON value (the natural
 /// way for an assistant to write a document) or as a JSON string (the
 /// way the control socket carries it). Returns the raw JSON text.
@@ -4625,16 +4951,24 @@ fn uiLiveDocument(
     return .{ .json = dv.string };
 }
 
-fn writeUiAssetReport(w: *std.Io.Writer, reply: IpcReply) !void {
+/// The remote-image hydration report the GUI attaches to a panel
+/// mutation: facts in structuredContent, and ONE situational text line
+/// when something failed (a placeholder the user will see).
+fn addUiAssetFacts(res: *Res, arena: std.mem.Allocator, reply: IpcReply) !void {
+    if (reply.value != .object) return;
     const report = reply.value.object.get("assets") orelse return;
     if (report != .array) return;
-    try w.writeAll(",\"assets\":");
-    try std.json.Stringify.value(report, .{}, w);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(report, .{}, &aw.writer);
+    try res.raw("assets", aw.written());
     const failures = reply.value.object.get("asset_failures");
-    if (failures != null and failures.? == .integer)
-        try w.print(",\"asset_failures\":{d}", .{failures.?.integer});
-    if (failures != null and failures.? == .integer and failures.?.integer > 0)
-        try w.writeAll(",\"asset_warning\":\"one or more remote images could not be hydrated; the native panel shows explicit placeholders and each failed logical path is reported in assets\"");
+    if (failures == null or failures.? != .integer) return;
+    try res.fact("asset_failures", failures.?.integer);
+    if (failures.?.integer > 0)
+        try res.textf(
+            "{d} remote image(s) could not be hydrated; the panel shows explicit placeholders and each failed logical path is listed in assets",
+            .{failures.?.integer},
+        );
 }
 
 /// panelstore failure → the store's own diagnostic (which names the
@@ -4655,7 +4989,17 @@ fn uiStoreErr(
     };
     const msg = std.fmt.allocPrint(arena, "{s}: {s}{s}", .{ what, detail, hint }) catch
         return error.OutOfMemory;
-    return appErr(arena, msg);
+    return errRes(arena, uiStoreErrCode(err), msg);
+}
+
+/// A panelstore refusal as one of the shared codes.
+fn uiStoreErrCode(err: panelstore.Error) ErrCode {
+    return switch (err) {
+        error.NotFound => .not_found,
+        error.Invalid => .invalid_args,
+        error.TooMany => .conflict,
+        else => .io_failed,
+    };
 }
 
 fn uiStoreMutationErr(
@@ -4672,44 +5016,39 @@ fn uiStoreMutationErr(
         error.TooMany => " — delete one with ui_delete",
         else => "",
     };
-    const message = std.fmt.allocPrint(arena, "{s}: {s}{s}", .{ what, detail, hint }) catch
-        return error.OutOfMemory;
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.writeAll("{\"error\":");
-    try std.json.Stringify.value(message, .{}, w);
-    try w.writeAll(",\"error_code\":");
-    try std.json.Stringify.value(@errorName(err), .{}, w);
     // Store mutations are staged then renamed, so a failure never leaves a
-    // partial document: it either happened or it did not.
-    try w.writeAll(",\"failure_class\":\"pre_commit\",\"mutation_state\":\"not_applied\",\"mutation_may_have_applied\":false,\"committed\":false,\"resend_safe\":true");
-    try w.writeAll(",\"mutation\":");
-    try std.json.Stringify.value(mutation, .{}, w);
-    try w.writeAll(",\"recoverable_state_preserved\":true}");
-    return toolResult(arena, aw.written(), true) orelse error.OutOfMemory;
+    // partial document: it either happened or it did not. That verdict is
+    // stated the way every other panel failure states it — as prose the
+    // assistant reads, in the same key=value spelling.
+    const message = std.fmt.allocPrint(
+        arena,
+        "{s}: {s}{s} ({s}); mutation={s}, failure_class=pre_commit, mutation_state=not_applied, mutation_may_have_applied=false, committed=false, resend_safe=true",
+        .{ what, detail, hint, @errorName(err), mutation },
+    ) catch return error.OutOfMemory;
+    return errRes(arena, uiStoreErrCode(err), message);
 }
 
 fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
     const session = uiSession(args) catch
-        return appErr(arena, "'session' must be a string when present; omit it to use SKETERM_SESSION, or pass an explicit empty string for sessionless scope");
+        return errRes(arena, .invalid_args, "'session' must be a string when present; omit it to use SKETERM_SESSION, or pass an explicit empty string for sessionless scope");
     var transport = UiTransport.init(arena, backend, session);
     defer transport.deinit();
 
     if (eql(u8, name, "ui_show")) {
         const panel_name = argStr(args, "name") orelse
-            return appErr(arena, "ui_show requires 'name' (the panel's identity in this session)");
+            return errRes(arena, .invalid_args, "ui_show requires 'name' (the panel's identity in this session)");
         const inline_doc = try uiJsonArg(arena, args, "document");
         const load_name = argStr(args, "load");
         if (inline_doc != null and load_name != null)
-            return appErr(arena, "pass either 'document' (an inline document) or 'load' (a saved one), not both");
+            return errRes(arena, .invalid_args, "pass either 'document' (an inline document) or 'load' (a saved one), not both");
 
         var diag = paneldoc.Diag{};
         const document = inline_doc orelse blk: {
             const saved = load_name orelse
-                return appErr(arena, "ui_show requires 'document' (the panel to render) or 'load' (the name of a document saved with ui_save)");
+                return errRes(arena, .invalid_args, "ui_show requires 'document' (the panel to render) or 'load' (the name of a document saved with ui_save)");
             const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
-            if (store.err.len > 0) return appErr(arena, store.err);
+            if (store.err.len > 0) return errRes(arena, .unavailable, store.err);
             break :blk panelstore.loadJsonScoped(arena, store.scope, saved, &diag) catch |err|
                 return uiStoreErr(arena, err, &diag, "ui_show could not load the saved panel");
         };
@@ -4725,22 +5064,22 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         // A rejected document answers with doc.Diag's own message,
         // VERBATIM: it names the offending component id, and that text
         // is how the assistant fixes what it wrote.
-        if (!reply.ok) return appErr(arena, reply.err);
+        if (!reply.ok) return uiTransportErr(arena, reply);
 
         const pid = reply.value.object.get("panel_id");
         const id: i64 = if (pid) |p| (if (p == .integer) p.integer else 0) else 0;
 
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        try w.print("{{\"panel_id\":{d},\"name\":", .{id});
-        try std.json.Stringify.value(panel_name, .{}, w);
-        try w.writeAll(",\"session\":");
-        try std.json.Stringify.value(session, .{}, w);
-        try w.writeAll(",\"target\":");
-        try std.json.Stringify.value(target, .{}, w);
-        try writeUiAssetReport(w, reply);
-        try w.writeAll(",\"showing\":true,\"note\":\"the panel is on the user's screen; ui_wait_event returns their interactions, ui_patch updates it in place\"}");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("panel_id", id);
+        try res.fact("name", panel_name);
+        try res.fact("session", session);
+        try res.fact("target", target);
+        try res.fact("showing", true);
+        try res.textf("showing panel {s} (id {d}) in session {s} as {s}", .{
+            panel_name, id, panelstore.sessionLabel(session), target,
+        });
+        try addUiAssetFacts(&res, arena, reply);
+        return res.finish();
     }
 
     // A document GENERATOR over the exact path ui_show uses: it builds
@@ -4751,9 +5090,9 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         const files_v = if (args == .object) args.object.get("files") else null;
         const items = blk: {
             const v = files_v orelse
-                return appErr(arena, "ui_show_files requires 'files': a list of absolute image paths, or {path, caption} objects");
+                return errRes(arena, .invalid_args, "ui_show_files requires 'files': a list of absolute image paths, or {path, caption} objects");
             if (v != .array or v.array.items.len == 0)
-                return appErr(arena, "'files' must be a NON-EMPTY array of absolute image paths (or {path, caption} objects)");
+                return errRes(arena, .invalid_args, "'files' must be a NON-EMPTY array of absolute image paths (or {path, caption} objects)");
             break :blk v.array.items;
         };
         if (items.len > UI_FILES_MAX) {
@@ -4762,7 +5101,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                 "ui_show_files shows at most {d} files at once and got {d} — show a subset (the user can be sent the next batch by re-calling with the same 'name'), or author a paged panel with ui_show.",
                 .{ UI_FILES_MAX, items.len },
             ) catch return error.OutOfMemory;
-            return appErr(arena, msg);
+            return errRes(arena, .invalid_args, msg);
         }
         const compare = argBool(args, "compare");
         if (compare and items.len != 2) {
@@ -4771,7 +5110,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                 "compare:true draws ONE A/B slider between exactly two images, and 'files' has {d}. Pass exactly two files, or drop 'compare' to stack them as separate images.",
                 .{items.len},
             ) catch return error.OutOfMemory;
-            return appErr(arena, msg);
+            return errRes(arena, .invalid_args, msg);
         }
 
         const files = arena.alloc(UiFile, items.len) catch return error.OutOfMemory;
@@ -4783,12 +5122,12 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                     const pv = o.get("path") orelse {
                         const msg = std.fmt.allocPrint(arena, "files[{d}] has no \"path\"", .{i}) catch
                             return error.OutOfMemory;
-                        return appErr(arena, msg);
+                        return errRes(arena, .invalid_args, msg);
                     };
                     if (pv != .string) {
                         const msg = std.fmt.allocPrint(arena, "files[{d}].path must be a string", .{i}) catch
                             return error.OutOfMemory;
-                        return appErr(arena, msg);
+                        return errRes(arena, .invalid_args, msg);
                     }
                     break :pblk pv.string;
                 },
@@ -4798,7 +5137,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                         "files[{d}] must be an absolute path string or a {{path, caption}} object",
                         .{i},
                     ) catch return error.OutOfMemory;
-                    return appErr(arena, msg);
+                    return errRes(arena, .invalid_args, msg);
                 },
             };
             if (!paneldoc.validImagePath(path)) {
@@ -4807,7 +5146,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                     "files[{d}]: \"{s}\" must be an ABSOLUTE path with no \"..\" segment and no control characters (panels are persisted and re-opened later, so paths are constrained structurally)",
                     .{ i, path },
                 ) catch return error.OutOfMemory;
-                return appErr(arena, msg);
+                return errRes(arena, .invalid_args, msg);
             }
             var caption: []const u8 = std.fs.path.basename(path);
             if (item == .object) {
@@ -4815,7 +5154,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                     if (cv != .string) {
                         const msg = std.fmt.allocPrint(arena, "files[{d}].caption must be a string", .{i}) catch
                             return error.OutOfMemory;
-                        return appErr(arena, msg);
+                        return errRes(arena, .invalid_args, msg);
                     }
                     caption = cv.string;
                 }
@@ -4826,7 +5165,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                     "files[{d}].caption is longer than {d} characters",
                     .{ i, paneldoc.MAX_TEXT },
                 ) catch return error.OutOfMemory;
-                return appErr(arena, msg);
+                return errRes(arena, .invalid_args, msg);
             }
             files[i] = .{ .path = path, .caption = caption };
 
@@ -4855,7 +5194,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                 }
                 try w.print(" {s}", .{p});
             }
-            return appErr(arena, aw.written());
+            return errRes(arena, .invalid_args, aw.written());
         }
 
         const title = argStr(args, "title") orelse "";
@@ -4871,7 +5210,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                 "ui_show_files built a document its own parser rejected ({s}: {s}) — that is a sketerm bug; ui_show with a hand-written document still works",
                 .{ @errorName(err), gen_diag.msg() },
             ) catch return error.OutOfMemory;
-            return appErr(arena, msg);
+            return errRes(arena, .invalid_args, msg);
         };
         checked.deinit();
 
@@ -4884,52 +5223,51 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
             .target = target,
             .document = document,
         });
-        if (!reply.ok) return appErr(arena, reply.err);
+        if (!reply.ok) return uiTransportErr(arena, reply);
         const pid = reply.value.object.get("panel_id");
         const id: i64 = if (pid) |p| (if (p == .integer) p.integer else 0) else 0;
 
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        try w.print("{{\"panel_id\":{d},\"name\":", .{id});
-        try std.json.Stringify.value(panel_name, .{}, w);
-        try w.writeAll(",\"session\":");
-        try std.json.Stringify.value(session, .{}, w);
-        try w.writeAll(",\"target\":");
-        try std.json.Stringify.value(target, .{}, w);
-        try w.print(",\"files\":{d},\"layout\":\"{s}\",\"showing\":true", .{
-            files.len,
-            if (compare) "image_compare" else "stacked_images",
+        const layout: []const u8 = if (compare) "image_compare" else "stacked_images";
+        var res = Res.init(arena);
+        try res.fact("panel_id", id);
+        try res.fact("name", panel_name);
+        try res.fact("session", session);
+        try res.fact("target", target);
+        try res.fact("files", files.len);
+        try res.fact("layout", layout);
+        try res.fact("showing", true);
+        try res.textf("showing {d} image(s) as {s} in panel {s} (id {d})", .{
+            files.len, layout, panel_name, id,
         });
-        try writeUiAssetReport(w, reply);
         if (unreadable.items.len > 0) {
-            try w.writeAll(",\"unreadable\":");
-            try std.json.Stringify.value(unreadable.items, .{}, w);
-            try w.print(
-                ",\"unreadable_note\":\"{d} of {d} file(s) could not be read; they are drawn as an explicit placeholder in the panel, the rest render normally\"",
+            try res.fact("unreadable", unreadable.items);
+            try res.textf(
+                "{d} of {d} file(s) could not be read; they are drawn as an explicit placeholder in the panel, the rest render normally",
                 .{ unreadable.items.len, files.len },
             );
         }
-        try w.writeAll(",\"note\":\"the panel is on the user's screen; re-call with the same 'name' to replace it in place, or ui_patch/ui_save/ui_close it like any other panel\"}");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        try addUiAssetFacts(&res, arena, reply);
+        return res.finish();
     }
 
     if (eql(u8, name, "ui_patch")) {
         const patch = (try uiJsonArg(arena, args, "patch")) orelse
-            return appErr(arena, "ui_patch requires 'patch' (a JSON array of ops)");
+            return errRes(arena, .invalid_args, "ui_patch requires 'patch' (a JSON array of ops)");
         const target = uiResolve(arena, &transport, args, session);
-        if (target.err.len > 0) return appErr(arena, target.err);
+        if (target.err.len > 0) return uiResolveErr(arena, target);
         const reply = uiTalk(&transport, .{
             .cmd = "panel-patch",
             .panel_id = target.id,
             .patch = patch,
             .session = uiWireSession(session),
         });
-        if (!reply.ok) return appErr(arena, reply.err);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        try aw.writer.print("{{\"panel_id\":{d},\"patched\":true", .{target.id});
-        try writeUiAssetReport(&aw.writer, reply);
-        try aw.writer.writeByte('}');
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        if (!reply.ok) return uiTransportErr(arena, reply);
+        var res = Res.init(arena);
+        try res.fact("panel_id", target.id);
+        try res.fact("patched", true);
+        try res.textf("patched panel {d}", .{target.id});
+        try addUiAssetFacts(&res, arena, reply);
+        return res.finish();
     }
 
     if (eql(u8, name, "ui_wait_event")) {
@@ -4940,7 +5278,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         const start = backend.nowMs(backend.ctx);
         const deadline = start + timeout_ms;
         const target = uiResolveFor(arena, &transport, args, session, deadline - backend.nowMs(backend.ctx));
-        if (target.err.len > 0) return appErr(arena, target.err);
+        if (target.err.len > 0) return uiResolveErr(arena, target);
 
         // The GUI answers panel-events immediately (it runs on the main
         // loop and must never block), so the WAIT is ours: poll until
@@ -4949,11 +5287,8 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
         while (true) {
             const before_poll = backend.nowMs(backend.ctx);
             const remain = deadline - before_poll;
-            if (remain <= 0) {
-                var aw: std.Io.Writer.Allocating = .init(arena);
-                try aw.writer.print("{{\"panel_id\":{d},\"waited_ms\":{d},\"events\":[],\"dropped\":{d},\"timed_out\":true,\"note\":\"no interaction within {d}ms — the panel is still showing; wait again or ui_patch it\"}}", .{ target.id, before_poll - start, dropped_total, timeout_ms });
-                return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
-            }
+            if (remain <= 0)
+                return uiEventsResult(arena, target.id, before_poll - start, null, dropped_total, timeout_ms);
             const reply = transport.talkFor(.{
                 .cmd = "panel-events",
                 .panel_id = target.id,
@@ -4966,7 +5301,7 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                         "the panel-events request may have drained queued interactions before its reply was lost ({s}). Events may have been drained; failure_class=uncertain_delivery, events_may_have_been_drained=true, resend_safe=false. The poll was NOT retried automatically",
                         .{reply.err},
                     ) catch return error.OutOfMemory;
-                    return appErr(arena, msg);
+                    return errRes(arena, .io_failed, msg);
                 }
                 if (reply.delivery == .pre_delivery) {
                     const msg = std.fmt.allocPrint(
@@ -4974,14 +5309,14 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                         "the panel-events poll was unavailable before presenter delivery ({s}); failure_class=pre_delivery, events_may_have_been_drained=false, resend_safe=true. The panel's open/closed state and queued events are UNKNOWN; retry when a compatible GUI is attached",
                         .{reply.err},
                     ) catch return error.OutOfMemory;
-                    return appErr(arena, msg);
+                    return errRes(arena, .unavailable, msg);
                 }
                 const msg = std.fmt.allocPrint(
                     arena,
                     "the GUI presenter confirmed that this panel is not live ({s}); it may have been closed by the user or the id may never have existed",
                     .{reply.err},
                 ) catch return error.OutOfMemory;
-                return appErr(arena, msg);
+                return errRes(arena, .not_found, msg);
             }
             if (reply.value.object.get("dropped")) |d| {
                 if (d == .integer) dropped_total += d.integer;
@@ -4989,19 +5324,8 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
             const evs = reply.value.object.get("events");
             const count: usize = if (evs) |e| (if (e == .array) e.array.items.len else 0) else 0;
             const elapsed = backend.nowMs(backend.ctx) - start;
-            if (count > 0 or elapsed >= timeout_ms) {
-                var aw: std.Io.Writer.Allocating = .init(arena);
-                const w = &aw.writer;
-                try w.print("{{\"panel_id\":{d},\"waited_ms\":{d},\"events\":", .{ target.id, elapsed });
-                if (count > 0) try std.json.Stringify.value(evs.?, .{}, w) else try w.writeAll("[]");
-                try w.print(",\"dropped\":{d}", .{dropped_total});
-                if (count == 0)
-                    try w.print(",\"timed_out\":true,\"note\":\"no interaction within {d}ms — the panel is still showing; wait again or ui_patch it\"", .{timeout_ms});
-                if (dropped_total > 0)
-                    try w.print(",\"dropped_note\":\"the panel's event queue overflowed and {d} OLDER interaction(s) were discarded; this reply is not the complete history\"", .{dropped_total});
-                try w.writeAll("}");
-                return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
-            }
+            if (count > 0 or elapsed >= timeout_ms)
+                return uiEventsResult(arena, target.id, elapsed, if (count > 0) evs.? else null, dropped_total, timeout_ms);
             const sleep_remain = deadline - backend.nowMs(backend.ctx);
             if (sleep_remain > 0)
                 backend.sleepMs(backend.ctx, @intCast(@min(@as(i64, UI_POLL_MS), sleep_remain)));
@@ -5009,30 +5333,43 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
     }
 
     if (eql(u8, name, "ui_panels")) {
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        try w.writeAll("{\"session\":");
-        try std.json.Stringify.value(session, .{}, w);
+        var res = Res.init(arena);
+        try res.fact("session", session);
+        var text: std.Io.Writer.Allocating = .init(arena);
+        const tw = &text.writer;
 
-        try w.writeAll(",\"live\":");
         const reply = uiTalk(&transport, .{ .cmd = "panel-list", .session = uiWireSession(session) });
         if (!reply.ok) {
-            try w.writeAll("null,\"live_note\":");
-            try std.json.Stringify.value(reply.err, .{}, w);
+            try res.raw("live", "null");
+            try res.fact("live_error", reply.err);
+            try res.textf("live: unavailable ({s})", .{reply.err});
         } else {
             const panels = reply.value.object.get("panels");
+            const items: []const std.json.Value =
+                if (panels != null and panels.? == .array) panels.?.array.items else &.{};
+            var aw: std.Io.Writer.Allocating = .init(arena);
             if (panels != null and panels.? == .array)
-                try std.json.Stringify.value(panels.?, .{}, w)
+                try std.json.Stringify.value(panels.?, .{}, &aw.writer)
             else
-                try w.writeAll("[]");
+                try aw.writer.writeAll("[]");
+            try res.raw("live", aw.written());
+            try res.fact("live_count", items.len);
+            try res.textf("live: {d} panel(s)", .{items.len});
+            for (items) |p| {
+                try tw.print("\nlive {d} {s}", .{ objInt(p, "panel_id"), objStr(p, "name") });
+                const title = objStr(p, "title");
+                if (title.len > 0) try tw.print("  {s}", .{title});
+            }
         }
 
-        try w.writeAll(",\"saved\":");
         const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
         if (store.err.len > 0) {
-            try w.writeAll("null,\"saved_error\":");
-            try std.json.Stringify.value(store.err, .{}, w);
+            try res.raw("saved", "null");
+            try res.fact("saved_error", store.err);
+            try res.textf("saved: unavailable ({s})", .{store.err});
         } else if (panelstore.listScoped(arena, store.scope)) |entries| {
+            var aw: std.Io.Writer.Allocating = .init(arena);
+            const w = &aw.writer;
             try w.writeAll("[");
             for (entries, 0..) |e, i| {
                 if (i > 0) try w.writeAll(",");
@@ -5041,91 +5378,105 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
                 try w.writeAll(",\"title\":");
                 try std.json.Stringify.value(e.title, .{}, w);
                 try w.print(",\"bytes\":{d},\"mtime\":{d},\"parses\":{}}}", .{ e.bytes, e.mtime, e.ok });
+                try tw.print("\nsaved {s}  {d} bytes", .{ e.name, e.bytes });
+                if (e.title.len > 0) try tw.print("  {s}", .{e.title});
+                if (!e.ok) try tw.writeAll("  (does NOT parse)");
             }
             try w.writeAll("]");
+            try res.raw("saved", aw.written());
+            try res.fact("saved_count", entries.len);
+            try res.textf("saved: {d} document(s)", .{entries.len});
         } else |err| {
-            try w.writeAll("null,\"saved_error\":");
-            try std.json.Stringify.value(@errorName(err), .{}, w);
+            try res.raw("saved", "null");
+            try res.fact("saved_error", @errorName(err));
+            try res.textf("saved: unavailable ({s})", .{@errorName(err)});
         }
-        try w.writeAll(",\"note\":\"live = on screen now (ui_close closes one); saved = stored documents (ui_show load=<name> shows one, ui_delete removes one permanently)\"}");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        if (text.written().len > 0) try res.textf("--- panels ---{s}", .{text.written()});
+        return res.finish();
     }
 
     if (eql(u8, name, "ui_save")) {
         const panel_name = argStr(args, "name") orelse
-            return appErr(arena, "ui_save requires 'name' (what to save it as)");
+            return errRes(arena, .invalid_args, "ui_save requires 'name' (what to save it as)");
         var diag = paneldoc.Diag{};
         // No document: read the LIVE one back from the GUI. That works
         // for ANY panel on screen — including one another process
         // showed — because the GUI's registry is the only copy.
         const document = (try uiJsonArg(arena, args, "document")) orelse blk: {
-            if (transport.mode == .none) return appErr(arena, UI_SAVE_NEEDS_TRANSPORT);
+            if (transport.mode == .none) return errRes(arena, .unavailable, UI_SAVE_NEEDS_TRANSPORT);
             const target = uiResolve(arena, &transport, args, session);
-            if (target.err.len > 0) return appErr(arena, target.err);
+            if (target.err.len > 0) return uiResolveErr(arena, target);
             const live = uiLiveDocument(&transport, target.id, session);
-            if (live.err.len > 0) return appErr(arena, live.err);
+            if (live.err.len > 0) return errRes(arena, .unavailable, live.err);
             break :blk live.json;
         };
         const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
-        if (store.err.len > 0) return appErr(arena, store.err);
+        if (store.err.len > 0) return errRes(arena, .unavailable, store.err);
         const canonical_bytes = panelstore.saveJsonScoped(arena, store.scope, panel_name, document, &diag) catch |err|
             return uiStoreMutationErr(arena, err, &diag, "ui_save refused to store the panel", "save");
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        try w.writeAll("{\"saved\":");
-        try std.json.Stringify.value(panel_name, .{}, w);
-        try w.writeAll(",\"session\":");
-        try std.json.Stringify.value(session, .{}, w);
-        try w.print(",\"bytes\":{d},\"note\":\"stored on disk; bytes is the canonical JSON length actually stored. Show it again with ui_show load=<name>. Nothing on screen changed.\"}}", .{canonical_bytes});
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("saved", panel_name);
+        try res.fact("session", session);
+        try res.fact("bytes", canonical_bytes);
+        try res.textf("saved {s} in session {s}: {d} canonical bytes on disk", .{
+            panel_name, panelstore.sessionLabel(session), canonical_bytes,
+        });
+        return res.finish();
     }
 
     if (eql(u8, name, "ui_close")) {
         const target = uiResolve(arena, &transport, args, session);
-        if (target.err.len > 0) return appErr(arena, target.err);
+        if (target.err.len > 0) return uiResolveErr(arena, target);
         const reply = uiTalk(&transport, .{
             .cmd = "panel-close",
             .panel_id = target.id,
             .session = uiWireSession(session),
         });
-        if (!reply.ok) return appErr(arena, reply.err);
-        const msg = std.fmt.allocPrint(
-            arena,
-            "{{\"panel_id\":{d},\"closed\":true,\"note\":\"removed from the screen; any document saved under this name is untouched (ui_delete is what removes that)\"}}",
-            .{target.id},
-        ) catch return error.OutOfMemory;
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        if (!reply.ok) return uiTransportErr(arena, reply);
+        var res = Res.init(arena);
+        try res.fact("panel_id", target.id);
+        try res.fact("closed", true);
+        try res.textf("closed panel {d}", .{target.id});
+        return res.finish();
     }
 
     if (eql(u8, name, "ui_delete")) {
         const panel_name = argStr(args, "name") orelse
-            return appErr(arena, "ui_delete requires 'name' (the SAVED panel to delete)");
+            return errRes(arena, .invalid_args, "ui_delete requires 'name' (the SAVED panel to delete)");
         var diag = paneldoc.Diag{};
         const store = uiStoreScope(&transport, UI_RELAY_CALL_MS);
-        if (store.err.len > 0) return appErr(arena, store.err);
+        if (store.err.len > 0) return errRes(arena, .unavailable, store.err);
         panelstore.deleteScoped(arena, store.scope, panel_name, &diag) catch |err|
             return uiStoreMutationErr(arena, err, &diag, "ui_delete could not delete the saved panel", "delete");
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        try w.writeAll("{\"deleted\":");
-        try std.json.Stringify.value(panel_name, .{}, w);
-        try w.writeAll(",\"session\":");
-        try std.json.Stringify.value(session, .{}, w);
-        try w.writeAll(",\"note\":\"the SAVED document is gone for good. A panel of that name still on screen keeps rendering until ui_close.\"}");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try res.fact("deleted", panel_name);
+        try res.fact("session", session);
+        try res.textf("deleted the saved document {s} in session {s}", .{
+            panel_name, panelstore.sessionLabel(session),
+        });
+        return res.finish();
     }
 
-    return appErr(arena, "unknown ui tool");
+    return errRes(arena, .unknown_tool, "unknown ui tool");
 }
 
 /// Screenshot one GUI pane. The GUI renders the PNG to a temp file (its
 /// control protocol is line-JSON), which is read back and returned as an
 /// inline image. Shared by `screenshot_pane` and `web_screenshot`.
-pub fn paneScreenshot(arena: std.mem.Allocator, backend: Backend, pane: ?u32, caption: []const u8) ![]const u8 {
-    return switch (try paneScreenshotPng(arena, backend, pane)) {
-        .err => |e| errRes(arena, .io_failed, e),
-        .png => |bytes| imageResult(arena, caption, bytes) orelse error.OutOfMemory,
+pub fn paneScreenshot(arena: std.mem.Allocator, backend: Backend, pane: ?u32) ![]const u8 {
+    const png = switch (try paneScreenshotPng(arena, backend, pane)) {
+        .err => |e| return errRes(arena, .io_failed, e),
+        .png => |bytes| bytes,
     };
+    var res = Res.init(arena);
+    try addPane(&res, pane);
+    try res.fact("bytes", png.len);
+    if (pngSize(png)) |s| {
+        try res.fact("width", s.w);
+        try res.fact("height", s.h);
+        try res.textf("terminal pane screenshot, {d}x{d}", .{ s.w, s.h });
+    } else try res.text("terminal pane screenshot");
+    return res.finishWithImages(&.{png}, &.{"pane"});
 }
 
 /// The bytes half of `paneScreenshot`: a caller that wants to build its
@@ -5186,76 +5537,104 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
     const pane = paneFromArgs(args);
 
     if (eql(u8, name, "list_terminals")) {
-        const resp = try ipc(arena, backend, .{ .cmd = "list" });
-        return toolResult(arena, resp, false) orelse error.OutOfMemory;
+        const reply = try ipcParsed(arena, backend, .{ .cmd = "list" });
+        if (!reply.ok) return paneIpcErr(arena, reply.err);
+        return listTerminalsResult(arena, reply.value);
     }
     if (eql(u8, name, "screenshot_pane")) {
-        return paneScreenshot(arena, backend, pane, "terminal pane screenshot");
+        return paneScreenshot(arena, backend, pane);
     }
     if (eql(u8, name, "record_pane_start")) {
         const path = argStr(args, "path") orelse
-            return toolResult(arena, "record_pane_start requires 'path' (absolute .cast output)", true) orelse error.OutOfMemory;
+            return errRes(arena, .invalid_args, "record_pane_start requires 'path' (absolute .cast output)");
         const reply = try ipcParsed(arena, backend, .{ .cmd = "record-start", .pane = pane, .data = path });
-        if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
-        return toolResult(arena, "recording started (asciicast v2; stop with record_pane_stop)", false) orelse error.OutOfMemory;
+        if (!reply.ok) return paneIpcErr(arena, reply.err);
+        var res = Res.init(arena);
+        try addPane(&res, pane);
+        try res.field("path", path);
+        try res.fact("recording", true);
+        try res.text("recording started (asciicast v2; stop with record_pane_stop)");
+        return res.finish();
     }
     if (eql(u8, name, "record_pane_stop")) {
         const reply = try ipcParsed(arena, backend, .{ .cmd = "record-stop", .pane = pane });
-        if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
-        return toolResult(arena, "recording stopped", false) orelse error.OutOfMemory;
+        if (!reply.ok) return paneIpcErr(arena, reply.err);
+        var res = Res.init(arena);
+        try addPane(&res, pane);
+        try res.fact("recording", false);
+        try res.text("recording stopped");
+        return res.finish();
     }
     if (eql(u8, name, "read_screen")) {
         if (argBool(args, "last_command")) {
             const reply = try ipcParsed(arena, backend, .{ .cmd = "get-text", .pane = pane, .last_command = true });
-            if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
+            if (!reply.ok) return paneIpcErr(arena, reply.err);
             const last = reply.value.object.get("last") orelse
-                return toolResult(arena, "malformed reply", true) orelse error.OutOfMemory;
+                return errRes(arena, .io_failed, "malformed reply");
             const text = (if (last == .object) last.object.get("text") else null) orelse std.json.Value{ .string = "" };
             const exit = (if (last == .object) last.object.get("exit") else null) orelse std.json.Value{ .integer = 0 };
-            const blob = try std.fmt.allocPrint(arena, "exit: {d}\n---\n{s}", .{
-                if (exit == .integer) exit.integer else 0,
-                if (text == .string) text.string else "",
-            });
-            return toolResult(arena, blob, false) orelse error.OutOfMemory;
+            const out: []const u8 = if (text == .string) text.string else "";
+            var res = Res.init(arena);
+            try addPane(&res, pane);
+            try res.fact("last_command", true);
+            try res.field("exit_status", if (exit == .integer) exit.integer else 0);
+            try res.fact("output", out);
+            try res.textf("--- command ---\n{s}", .{out});
+            return res.finish();
         }
         const sb: u32 = if (argInt(args, "scrollback")) |s|
             (if (s > 0) @intCast(@min(s, 100_000)) else 0)
         else
             0;
-        const blob = readScreenText(arena, backend, pane, sb) catch |err| switch (err) {
-            error.NoSuchPane => return toolResult(arena, "no such pane", true) orelse error.OutOfMemory,
+        const screen = readScreen(arena, backend, pane, sb) catch |err| switch (err) {
+            error.NoSuchPane => return errRes(arena, .not_found, "no such pane"),
             else => return err,
         };
-        return toolResult(arena, blob, false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try addPane(&res, pane);
+        try addScreenFacts(&res, screen);
+        try res.fact("text", screen.text);
+        try res.textf("--- screen ---\n{s}", .{screen.text});
+        return res.finish();
     }
     if (eql(u8, name, "send_text")) {
         const text = argStr(args, "text") orelse
-            return toolResult(arena, "send_text requires 'text'", true) orelse error.OutOfMemory;
-        const data = if (argBool(args, "enter"))
+            return errRes(arena, .invalid_args, "send_text requires 'text'");
+        const enter = argBool(args, "enter");
+        const data = if (enter)
             try std.fmt.allocPrint(arena, "{s}\r", .{text})
         else
             text;
         const reply = try ipcParsed(arena, backend, .{ .cmd = "send-text", .pane = pane, .data = data });
-        if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        if (!reply.ok) return paneIpcErr(arena, reply.err);
+        var res = Res.init(arena);
+        try addPane(&res, pane);
+        try res.fact("bytes", text.len);
+        try res.fact("enter", enter);
+        try res.textf("typed {d} byte(s){s}", .{ text.len, if (enter) " and pressed Enter" else "" });
+        return res.finish();
     }
     if (eql(u8, name, "send_keys")) {
         const keys = argStr(args, "keys") orelse
-            return toolResult(arena, "send_keys requires 'keys'", true) orelse error.OutOfMemory;
+            return errRes(arena, .invalid_args, "send_keys requires 'keys'");
         const reply = try ipcParsed(arena, backend, .{ .cmd = "send-keys", .pane = pane, .data = keys });
-        if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        if (!reply.ok) return paneIpcErr(arena, reply.err);
+        var res = Res.init(arena);
+        try addPane(&res, pane);
+        try res.field("keys", keys);
+        try res.fact("sent", true);
+        return res.finish();
     }
     if (eql(u8, name, "run_command")) {
         const command = argStr(args, "command") orelse
-            return toolResult(arena, "run_command requires 'command'", true) orelse error.OutOfMemory;
+            return errRes(arena, .invalid_args, "run_command requires 'command'");
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 15_000;
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
         const data = try std.fmt.allocPrint(arena, "{s}\r", .{command});
         const send = try ipcParsed(arena, backend, .{ .cmd = "send-text", .pane = pane, .data = data });
-        if (!send.ok) return toolResult(arena, send.err, true) orelse error.OutOfMemory;
+        if (!send.ok) return paneIpcErr(arena, send.err);
         const settled = waitIdle(arena, backend, pane, timeout_ms, quiet_ms) catch |err| switch (err) {
-            error.NoSuchPane => return toolResult(arena, "no such pane", true) orelse error.OutOfMemory,
+            error.NoSuchPane => return errRes(arena, .not_found, "no such pane"),
             else => return err,
         };
         const want_output_only = argBool(args, "output_only");
@@ -5270,67 +5649,204 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
                     if (last == .object) {
                         const text = (last.object.get("text") orelse std.json.Value{ .string = "" });
                         const exit = (last.object.get("exit") orelse std.json.Value{ .integer = 0 });
-                        const blob = try std.fmt.allocPrint(arena, "{s}exit: {d}\n---\n{s}", .{
-                            if (settled) "" else "[still producing output after timeout]\n",
-                            if (exit == .integer) exit.integer else 0,
-                            if (text == .string) text.string else "",
-                        });
-                        return toolResult(arena, blob, false) orelse error.OutOfMemory;
+                        const out: []const u8 = if (text == .string) text.string else "";
+                        var res = Res.init(arena);
+                        try addPane(&res, pane);
+                        try res.fact("command", command);
+                        try res.fact("source", @as([]const u8, "command_zone"));
+                        try res.fact("settled", settled);
+                        try res.fact("timed_out", !settled);
+                        try res.field("exit_status", if (exit == .integer) exit.integer else 0);
+                        try res.fact("output", out);
+                        if (!settled) try res.text("still producing output after the timeout");
+                        try res.textf("--- output ---\n{s}", .{out});
+                        return res.finish();
                     }
                 }
             }
         }
-        var blob = try readScreenText(arena, backend, pane, 0);
-        if (want_output_only) {
-            blob = try std.fmt.allocPrint(arena, "[output_only unavailable: no completed OSC 133 command zone — shell integration is inactive in this pane (unsupported shell, or the command emitted no marks); returning the rendered screen]\n{s}", .{blob});
-        }
-        if (!settled) {
-            blob = try std.fmt.allocPrint(arena, "[still producing output after timeout]\n{s}", .{blob});
-        }
-        return toolResult(arena, blob, false) orelse error.OutOfMemory;
+        const screen = try readScreen(arena, backend, pane, 0);
+        var res = Res.init(arena);
+        try addPane(&res, pane);
+        try res.fact("command", command);
+        try res.fact("source", @as([]const u8, "screen"));
+        try res.fact("settled", settled);
+        try res.fact("timed_out", !settled);
+        try addScreenFacts(&res, screen);
+        try res.fact("output", screen.text);
+        if (want_output_only)
+            try res.text("output_only was unavailable: no completed OSC 133 command zone — shell integration is inactive in this pane (unsupported shell, or the command emitted no marks), so this is the rendered screen");
+        if (!settled) try res.text("still producing output after the timeout");
+        try res.textf("--- screen ---\n{s}", .{screen.text});
+        return res.finish();
     }
     if (eql(u8, name, "wait_idle")) {
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 15_000;
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
         const settled = waitIdle(arena, backend, pane, timeout_ms, quiet_ms) catch |err| switch (err) {
-            error.NoSuchPane => return toolResult(arena, "no such pane", true) orelse error.OutOfMemory,
+            error.NoSuchPane => return errRes(arena, .not_found, "no such pane"),
             else => return err,
         };
-        return toolResult(arena, if (settled) "settled" else "timeout: still producing output", false) orelse error.OutOfMemory;
+        var res = Res.init(arena);
+        try addPane(&res, pane);
+        try res.fact("settled", settled);
+        try res.fact("timed_out", !settled);
+        try res.fact("timeout_ms", timeout_ms);
+        try res.fact("quiet_ms", quiet_ms);
+        try res.text(if (settled) "settled" else "timeout: still producing output");
+        return res.finish();
     }
     if (eql(u8, name, "new_tab")) {
-        const resp = ipc(arena, backend, .{ .cmd = "new-tab", .cwd = argStr(args, "cwd"), .title = argStr(args, "title") }) catch |err| {
+        const reply = ipcParsed(arena, backend, .{ .cmd = "new-tab", .cwd = argStr(args, "cwd"), .title = argStr(args, "title") }) catch |err| {
             // No GUI reachable: fall back to a headless terminal so the
             // caller can keep working instead of dead-ending.
             if (term_state.mux_sock != null) {
                 const id = @import("mcp_term.zig").spawnRegisteredTerm(null, 120, 40) catch
-                    return appErr(arena, "no GUI socket, and the headless fallback failed too (mux daemon unreachable?)");
+                    return errRes(arena, .unavailable, "no GUI socket, and the headless fallback failed too (mux daemon unreachable?)");
                 const t = term_state.terms.get(id).?;
                 _ = t.waitIdle(250, 3_000);
-                const msg = try std.fmt.allocPrint(arena, "{{\"headless\":true,\"term\":{d},\"note\":\"no GUI is running — opened headless terminal {d} instead; drive it with term_run/term_exec/term_read (term ids, not pane ids)\"}}", .{ id, id });
-                return toolResult(arena, msg, false) orelse error.OutOfMemory;
+                var res = Res.init(arena);
+                try res.fact("headless", true);
+                try res.field("term", id);
+                try res.textf("no GUI is running — opened headless terminal {d} instead; drive it with term_run/term_exec/term_read (term ids, not pane ids)", .{id});
+                return res.finish();
             }
             return err;
         };
-        return toolResult(arena, resp, false) orelse error.OutOfMemory;
+        if (!reply.ok) return paneIpcErr(arena, reply.err);
+        const created = reply.value.object.get("created");
+        var res = Res.init(arena);
+        try res.fact("headless", false);
+        try res.field("tab", objInt(created, "tab"));
+        try res.field("pane", objInt(created, "pane"));
+        return res.finish();
     }
     if (eql(u8, name, "split_pane")) {
-        const resp = try ipc(arena, backend, .{ .cmd = "split", .pane = pane, .direction = argStr(args, "direction") });
-        return toolResult(arena, resp, false) orelse error.OutOfMemory;
+        const direction = argStr(args, "direction") orelse "h";
+        const reply = try ipcParsed(arena, backend, .{ .cmd = "split", .pane = pane, .direction = direction });
+        if (!reply.ok) return paneIpcErr(arena, reply.err);
+        var res = Res.init(arena);
+        try res.field("pane", objInt(reply.value.object.get("created"), "pane"));
+        try res.fact("direction", direction);
+        if (pane) |p| try res.fact("split_from", p);
+        try res.text(if (std.mem.eql(u8, direction, "v")) "stacked below the source pane" else "placed beside the source pane");
+        return res.finish();
     }
     if (eql(u8, name, "focus_pane")) {
-        if (pane == null) return toolResult(arena, "focus_pane requires 'pane'", true) orelse error.OutOfMemory;
+        if (pane == null) return errRes(arena, .invalid_args, "focus_pane requires 'pane'");
         const reply = try ipcParsed(arena, backend, .{ .cmd = "focus", .pane = pane });
-        if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        if (!reply.ok) return paneIpcErr(arena, reply.err);
+        var res = Res.init(arena);
+        try res.field("pane", pane.?);
+        try res.fact("focused", true);
+        return res.finish();
     }
     if (eql(u8, name, "close_pane")) {
-        if (pane == null) return toolResult(arena, "close_pane requires 'pane'", true) orelse error.OutOfMemory;
+        if (pane == null) return errRes(arena, .invalid_args, "close_pane requires 'pane'");
         const reply = try ipcParsed(arena, backend, .{ .cmd = "close-pane", .pane = pane });
-        if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        if (!reply.ok) return paneIpcErr(arena, reply.err);
+        var res = Res.init(arena);
+        try res.field("pane", pane.?);
+        try res.fact("closed", true);
+        return res.finish();
     }
     return errRes(arena, .unknown_tool, "unknown tool");
+}
+
+/// A GUI IPC refusal as a typed error: an unknown address is
+/// `not_found`, anything else is the transport/GUI failing.
+fn paneIpcErr(arena: std.mem.Allocator, msg: []const u8) ![]const u8 {
+    const missing = std.mem.indexOf(u8, msg, "no such") != null;
+    return errRes(arena, if (missing) .not_found else .io_failed, msg);
+}
+
+/// `pane` is a fact only when the caller addressed one: an omitted
+/// pane means "the focused one", and inventing an id would be a lie.
+fn addPane(res: *Res, pane: ?u32) !void {
+    if (pane) |p| try res.fact("pane", p);
+}
+
+fn objInt(v: ?std.json.Value, key: []const u8) i64 {
+    const o = v orelse return 0;
+    if (o != .object) return 0;
+    const x = o.object.get(key) orelse return 0;
+    return if (x == .integer) x.integer else 0;
+}
+
+fn objStr(v: std.json.Value, key: []const u8) []const u8 {
+    if (v != .object) return "";
+    const x = v.object.get(key) orelse return "";
+    return if (x == .string) x.string else "";
+}
+
+fn objBool(v: std.json.Value, key: []const u8) bool {
+    if (v != .object) return false;
+    const x = v.object.get(key) orelse return false;
+    return x == .bool and x.bool;
+}
+
+/// The GUI's `list` reply (tabs, each with its panes) restructured into
+/// the flat, addressable `terminals` array plus a one-line-per-pane
+/// listing. Pure so the shape is testable without a GUI.
+pub fn listTerminalsResult(arena: std.mem.Allocator, reply: std.json.Value) ![]const u8 {
+    var res = Res.init(arena);
+    var sc: std.Io.Writer.Allocating = .init(arena);
+    var text: std.Io.Writer.Allocating = .init(arena);
+    const jw = &sc.writer;
+    const tw = &text.writer;
+    try jw.writeAll("[");
+
+    var panes: usize = 0;
+    var tabs: usize = 0;
+    const tabs_v = if (reply == .object) reply.object.get("tabs") else null;
+    if (tabs_v != null and tabs_v.? == .array) {
+        for (tabs_v.?.array.items) |tab| {
+            if (tab != .object) continue;
+            tabs += 1;
+            const tab_id = objInt(tab, "id");
+            const tab_title = objStr(tab, "title");
+            const window = objInt(tab, "window");
+            const selected = objBool(tab, "selected");
+            const pane_list = tab.object.get("panes") orelse continue;
+            if (pane_list != .array) continue;
+            for (pane_list.array.items) |p| {
+                if (p != .object) continue;
+                if (panes > 0) try jw.writeAll(",");
+                panes += 1;
+                const id = objInt(p, "id");
+                const title = objStr(p, "title");
+                const cwd = objStr(p, "cwd");
+                const rows = objInt(p, "rows");
+                const cols = objInt(p, "cols");
+                const focused = objBool(p, "focused");
+                const zoomed = objBool(p, "zoomed");
+                try jw.print("{{\"pane\":{d},\"tab\":{d},\"window\":{d},\"rows\":{d},\"cols\":{d},\"focused\":{},\"zoomed\":{},\"tab_selected\":{},\"title\":", .{
+                    id, tab_id, window, rows, cols, focused, zoomed, selected,
+                });
+                try std.json.Stringify.value(title, .{}, jw);
+                try jw.writeAll(",\"tab_title\":");
+                try std.json.Stringify.value(tab_title, .{}, jw);
+                try jw.writeAll(",\"cwd\":");
+                try std.json.Stringify.value(cwd, .{}, jw);
+                try jw.writeAll("}");
+
+                if (text.written().len != 0) try tw.writeAll("\n");
+                try tw.print("pane {d}  tab {d}  {d}x{d}", .{ id, tab_id, cols, rows });
+                if (focused) try tw.writeAll("  focused");
+                if (zoomed) try tw.writeAll("  zoomed");
+                if (title.len > 0) try tw.print("  {s}", .{title});
+                if (cwd.len > 0) try tw.print("  [{s}]", .{cwd});
+            }
+        }
+    }
+    try jw.writeAll("]");
+
+    try res.raw("terminals", sc.written());
+    try res.fact("count", panes);
+    try res.fact("tabs", tabs);
+    try res.textf("{d} pane(s) in {d} tab(s)", .{ panes, tabs });
+    if (panes > 0) try res.textf("--- panes ---\n{s}", .{text.written()});
+    return res.finish();
 }
 
 // ── Tests ─────────────────────────────────────────────────────────
@@ -6065,10 +6581,13 @@ test "every tool declaration is well-formed at the table level" {
         // A schema without a properties map advertises a tool no client
         // can call with arguments.
         try std.testing.expect(std.mem.indexOf(u8, t.input_schema, "\"properties\"") != null);
-        // Wave 3 adds output schemas per module: a tool may or may not
-        // have one yet, but a declared one is a JSON object.
-        if (t.output_schema) |os|
-            try std.testing.expect(std.mem.indexOf(u8, os, "\"properties\"") != null);
+        // Wave 3 is SHIPPED: every tool declares a structured result,
+        // and it is a JSON object with a properties map.
+        const os = t.output_schema orelse {
+            std.debug.print("'{s}' declares no output schema\n", .{t.name});
+            return error.MissingOutputSchema;
+        };
+        try std.testing.expect(std.mem.indexOf(u8, os, "\"properties\"") != null);
         // The policy layer sees exactly the same tools.
         try std.testing.expect(mcpfilter.lookup(t.name) != null);
     }
@@ -6134,7 +6653,11 @@ test "tools/call send_keys routes to IPC send-keys" {
     const resp = handleMessage(arena, fake.backend(),
         \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send_keys","arguments":{"pane":4,"keys":"ctrl+c enter"}}}
     ).?;
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\"text\":\"ok\"") != null);
+    const parsed = try expectToolResultShape(arena, "send_keys", try rpcToolResult(arena, resp));
+    const sc = parsed.object.get("structuredContent").?.object;
+    try std.testing.expectEqualStrings("ctrl+c enter", sc.get("keys").?.string);
+    try std.testing.expect(sc.get("sent").?.bool);
+    try std.testing.expectEqual(@as(i64, 4), sc.get("pane").?.integer);
     try std.testing.expectEqual(@as(usize, 1), fake.requests.items.len);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"cmd\":\"send-keys\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"pane\":4") != null);
@@ -6257,8 +6780,14 @@ test "ui_show sends the document to the GUI, and ui_save reads the live one back
     const resp = handleMessage(arena, fake.backend(),
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_show","arguments":{"name":"train","session":"s1","document":{"title":"Epoch 41","root":"ok","components":{"ok":{"type":"button","text":"Approve","action":"approve"}}}}}}
     ).?;
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\\\"panel_id\\\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "isError") == null);
+    {
+        const shape = try expectToolResultShape(arena, "ui_show", try rpcToolResult(arena, resp));
+        const sc = shape.object.get("structuredContent").?.object;
+        try std.testing.expectEqual(@as(i64, 7), sc.get("panel_id").?.integer);
+        try std.testing.expectEqualStrings("train", sc.get("name").?.string);
+        try std.testing.expect(sc.get("showing").?.bool);
+    }
     // The document travelled as the control socket's JSON string, and
     // the target defaulted to a tab.
     const req = fake.requests.items[0];
@@ -6274,6 +6803,10 @@ test "ui_show sends the document to the GUI, and ui_save reads the live one back
         \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_patch","arguments":{"name":"train","session":"s1","patch":[{"op":"title","value":"Epoch 42"}]}}}
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, patched, "isError") == null);
+    {
+        const shape = try expectToolResultShape(arena, "ui_patch", try rpcToolResult(arena, patched));
+        try std.testing.expect(shape.object.get("structuredContent").?.object.get("patched").?.bool);
+    }
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[2], "\"cmd\":\"panel-patch\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[2], "\"panel_id\":7") != null);
     // Exactly one list + one patch: no extra round-trip to learn a name.
@@ -6371,8 +6904,8 @@ test "ui_save reports the canonical byte count actually stored" {
 
     const stored = try panelstore.loadJsonScoped(arena, .sessionless, "canonical", null);
     try t.expect(stored.len < authored.len);
-    const byte_field = try std.fmt.allocPrint(arena, "\\\"bytes\\\":{d}", .{stored.len});
-    try t.expect(std.mem.indexOf(u8, response, byte_field) != null);
+    const shape = try expectToolResultShape(arena, "ui_save", try rpcToolResult(arena, response));
+    try t.expectEqual(@as(i64, @intCast(stored.len)), shape.object.get("structuredContent").?.object.get("bytes").?.integer);
 }
 
 test "ui_save without a document needs a live panel transport" {
@@ -6416,7 +6949,10 @@ test "an explicit empty ui session overrides SKETERM_SESSION for live and saved 
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_show","arguments":{"name":"sessionless","session":"","document":{"root":"t","components":{"t":{"type":"text","text":"x"}}}}}}
     ).?;
     try std.testing.expect(std.mem.indexOf(u8, shown, "isError") == null);
-    try std.testing.expect(std.mem.indexOf(u8, shown, "\\\"session\\\":null") != null);
+    {
+        const shape = try expectToolResultShape(arena, "ui_show", try rpcToolResult(arena, shown));
+        try std.testing.expectEqual(std.json.Value{ .null = {} }, shape.object.get("structuredContent").?.object.get("session").?);
+    }
     try std.testing.expectEqual(@as(usize, 1), fake.requests.items.len);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"session\":\"\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "environment-session") == null);
@@ -6533,7 +7069,7 @@ test "ui presenter protocol shapes cannot fabricate panel success" {
         try std.testing.expect(std.mem.indexOf(u8, response, "isError") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "delivery is uncertain") != null);
         try std.testing.expect(std.mem.indexOf(u8, response, "NOT resent") != null);
-        try std.testing.expect(std.mem.indexOf(u8, response, "\\\"showing\\\":true") == null);
+        try std.testing.expect(std.mem.indexOf(u8, response, "showing") == null);
     }
 }
 
@@ -6637,8 +7173,13 @@ test "ui_show_files shows an image set in one call, through the ui_show path" {
     , .{ dir, dir });
     const resp = handleMessage(arena, fake.backend(), req_cmp).?;
     try std.testing.expect(std.mem.indexOf(u8, resp, "isError") == null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\\\"panel_id\\\":9") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "image_compare") != null);
+    {
+        const shape = try expectToolResultShape(arena, "ui_show_files", try rpcToolResult(arena, resp));
+        const sc = shape.object.get("structuredContent").?.object;
+        try std.testing.expectEqual(@as(i64, 9), sc.get("panel_id").?.integer);
+        try std.testing.expectEqualStrings("image_compare", sc.get("layout").?.string);
+        try std.testing.expectEqual(@as(i64, 2), sc.get("files").?.integer);
+    }
     // It went out over the SAME panel-show the hand-authored path uses,
     // under the default name, as an image_compare document.
     const sent = fake.requests.items[0];
@@ -6657,9 +7198,14 @@ test "ui_show_files shows an image set in one call, through the ui_show path" {
     , .{ dir, dir });
     const resp2 = handleMessage(arena, fake.backend(), req_stack).?;
     try std.testing.expect(std.mem.indexOf(u8, resp2, "isError") == null);
-    try std.testing.expect(std.mem.indexOf(u8, resp2, "stacked_images") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp2, "unreadable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp2, "ghost.png") != null);
+    {
+        const shape = try expectToolResultShape(arena, "ui_show_files", try rpcToolResult(arena, resp2));
+        const sc = shape.object.get("structuredContent").?.object;
+        try std.testing.expectEqualStrings("stacked_images", sc.get("layout").?.string);
+        const unreadable = sc.get("unreadable").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), unreadable.len);
+        try std.testing.expect(std.mem.endsWith(u8, unreadable[0].string, "ghost.png"));
+    }
     const sent2 = fake.requests.items[1];
     try std.testing.expect(std.mem.indexOf(u8, sent2, "\"name\":\"preview\"") != null);
     // Bare strings caption themselves with the basename, and no title
@@ -7345,10 +7891,19 @@ test "ui_wait_event polls instead of blocking the GUI, and reports drops" {
     ).?;
     try std.testing.expectEqual(@as(usize, 3), fake.requests.items.len);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"cmd\":\"panel-events\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "approve") != null);
-    // The drop counter seen on an earlier poll is not lost.
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\\\"dropped\\\":2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "dropped_note") != null);
+    {
+        const shape = try expectToolResultShape(arena, "ui_wait_event", try rpcToolResult(arena, resp));
+        const sc = shape.object.get("structuredContent").?.object;
+        const evs = sc.get("events").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), evs.len);
+        try std.testing.expectEqualStrings("approve", evs[0].object.get("value").?.string);
+        // The drop counter seen on an earlier poll is not lost.
+        try std.testing.expectEqual(@as(i64, 2), sc.get("dropped").?.integer);
+        try std.testing.expect(!sc.get("timed_out").?.bool);
+        const text = shape.object.get("content").?.array.items[0].object.get("text").?.string;
+        try std.testing.expect(std.mem.indexOf(u8, text, "OLDER interaction(s) were discarded") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "click ok = approve") != null);
+    }
     // Two poll ticks were slept, not spun.
     try std.testing.expectEqual(@as(i64, 2 * UI_POLL_MS), fake.clock_ms);
     try std.testing.expectEqualSlices(i64, &.{ 5000, 4900, 4800 }, fake.timeouts.items);
@@ -7369,9 +7924,15 @@ test "ui_wait_event times out honestly and clamps the budget" {
     const resp = handleMessage(arena, fake.backend(),
         \\{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"timeout_ms":250}}}
     ).?;
-    try std.testing.expect(std.mem.indexOf(u8, resp, "timed_out") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "still showing") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "isError") == null);
+    {
+        const shape = try expectToolResultShape(arena, "ui_wait_event", try rpcToolResult(arena, resp));
+        const sc = shape.object.get("structuredContent").?.object;
+        try std.testing.expect(sc.get("timed_out").?.bool);
+        try std.testing.expectEqual(@as(usize, 0), sc.get("events").?.array.items.len);
+        const text = shape.object.get("content").?.array.items[0].object.get("text").?.string;
+        try std.testing.expect(std.mem.indexOf(u8, text, "still showing") != null);
+    }
     try std.testing.expectEqualSlices(i64, &.{ 250, 150, 50 }, fake.timeouts.items);
 
     // A wait longer than the watchdog allows is clamped, not promised.
@@ -7381,7 +7942,11 @@ test "ui_wait_event times out honestly and clamps the budget" {
     const clamped = handleMessage(arena, fake2.backend(),
         \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ui_wait_event","arguments":{"panel_id":7,"timeout_ms":999999}}}
     ).?;
-    try std.testing.expect(std.mem.indexOf(u8, clamped, "\\\"change\\\"") != null);
+    {
+        const shape = try expectToolResultShape(arena, "ui_wait_event", try rpcToolResult(arena, clamped));
+        const evs = shape.object.get("structuredContent").?.object.get("events").?.array.items;
+        try std.testing.expectEqualStrings("change", evs[0].object.get("kind").?.string);
+    }
 
     // A panel that went away ends the wait at once, and says so.
     var bufs3: [1][]const u8 = @splat("{\"ok\":false,\"error\":\"no such panel\"}");
@@ -7459,8 +8024,13 @@ test "ui_* tools need live transport while store-only behavior remains" {
     const listed = handleMessage(arena, fake.backend(),
         \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"ui_panels","arguments":{"session":"s2"}}}
     ).?;
-    try std.testing.expect(std.mem.indexOf(u8, listed, "\\\"live\\\":null") != null);
-    try std.testing.expect(std.mem.indexOf(u8, listed, "panel transport") != null);
+    {
+        const shape = try expectToolResultShape(arena, "ui_panels", try rpcToolResult(arena, listed));
+        const sc = shape.object.get("structuredContent").?.object;
+        try std.testing.expectEqual(std.json.Value{ .null = {} }, sc.get("live").?);
+        try std.testing.expect(std.mem.indexOf(u8, sc.get("live_error").?.string, "panel transport") != null);
+        try std.testing.expectEqual(@as(usize, 1), sc.get("saved").?.array.items.len);
+    }
     try std.testing.expect(std.mem.indexOf(u8, listed, "kept") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "Kept") != null);
 
@@ -7585,8 +8155,14 @@ test "read_screen last_command extracts the OSC 133 zone" {
     const resp = handleMessage(arena, fake.backend(),
         \\{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"read_screen","arguments":{"pane":2,"last_command":true}}}
     ).?;
-    try std.testing.expect(std.mem.indexOf(u8, resp, "exit: 3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "hi\\n") != null);
+    const parsed = try expectToolResultShape(arena, "read_screen", try rpcToolResult(arena, resp));
+    const sc = parsed.object.get("structuredContent").?.object;
+    try std.testing.expectEqual(@as(i64, 3), sc.get("exit_status").?.integer);
+    try std.testing.expect(sc.get("last_command").?.bool);
+    try std.testing.expectEqualStrings("hi\n", sc.get("output").?.string);
+    // The output rides the text lane behind its payload divider.
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try std.testing.expectEqualStrings("exit_status: 3\n--- command ---\nhi\n", text);
     try std.testing.expectEqual(@as(usize, 1), fake.requests.items.len);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"last_command\":true") != null);
 }
@@ -7617,11 +8193,19 @@ test "run_command settles via seq polling" {
     const resp = handleMessage(arena, fake.backend(),
         \\{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"run_command","arguments":{"pane":1,"command":"echo hi","quiet_ms":100,"timeout_ms":5000}}}
     ).?;
-    try std.testing.expect(std.mem.indexOf(u8, resp, "echo hi") != null);
-    // The screen metadata rides inside the JSON text value, so its
-    // quotes arrive escaped.
-    try std.testing.expect(std.mem.indexOf(u8, resp, "\\\"seq\\\":7") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "timeout") == null);
+    const parsed = try expectToolResultShape(arena, "run_command", try rpcToolResult(arena, resp));
+    const sc = parsed.object.get("structuredContent").?.object;
+    try std.testing.expectEqualStrings("echo hi", sc.get("command").?.string);
+    try std.testing.expectEqualStrings("screen", sc.get("source").?.string);
+    try std.testing.expect(sc.get("settled").?.bool);
+    try std.testing.expect(!sc.get("timed_out").?.bool);
+    // The screen metadata is a FACT now, not text inside a text value.
+    try std.testing.expectEqual(@as(i64, 7), sc.get("seq").?.integer);
+    try std.testing.expectEqual(@as(i64, 80), sc.get("cols").?.integer);
+    try std.testing.expectEqualStrings("$ echo hi\nhi\n", sc.get("output").?.string);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try std.testing.expect(std.mem.indexOf(u8, text, "--- screen ---\n$ echo hi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, textProse(text), "timeout") == null);
     // First request was the send-text with a trailing CR.
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "\"cmd\":\"send-text\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.requests.items[0], "echo hi\\r") != null);
@@ -8160,6 +8744,16 @@ pub fn textProse(text: []const u8) []const u8 {
     return text[0..end];
 }
 
+/// Test helper: the `result` object of a JSON-RPC reply, re-serialized
+/// so `expectToolResultShape` can check it exactly as a client sees it.
+pub fn rpcToolResult(arena: std.mem.Allocator, rpc: []const u8) ![]const u8 {
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, rpc, .{});
+    const result = parsed.object.get("result") orelse return error.NoRpcResult;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(result, .{}, &aw.writer);
+    return aw.written();
+}
+
 pub fn expectToolResultShape(arena: std.mem.Allocator, tool: []const u8, result: []const u8) !std.json.Value {
     const t = std.testing;
     try t.expect(std.mem.indexOfScalar(u8, result, '\n') == null);
@@ -8262,4 +8856,108 @@ test "commandCompletionResult: a refused send stays a soft failure" {
     const rparsed = try expectToolResultShape(arena, "term_run", running);
     try t.expect(rparsed.object.get("isError") == null);
     try t.expect(rparsed.object.get("structuredContent").?.object.get("timed_out").?.bool);
+}
+
+test "list_terminals flattens the GUI's tabs into addressable panes" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const reply = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"ok":true,"tabs":[
+        \\{"id":1,"window":3,"title":"shell","selected":true,"panes":[
+        \\{"id":4,"title":"zsh","cwd":"/home/u","pid":0,"rows":24,"cols":80,"focused":true,"zoomed":false},
+        \\{"id":5,"title":"logs","cwd":"/var/log","pid":0,"rows":12,"cols":80,"focused":false,"zoomed":true}]},
+        \\{"id":2,"window":3,"title":"docs","selected":false,"panes":[]}]}
+    , .{});
+
+    const out = try listTerminalsResult(arena, reply);
+    const parsed = try expectToolResultShape(arena, "list_terminals", out);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 2), sc.get("count").?.integer);
+    try t.expectEqual(@as(i64, 2), sc.get("tabs").?.integer);
+    const terms = sc.get("terminals").?.array.items;
+    try t.expectEqual(@as(usize, 2), terms.len);
+    try t.expectEqual(@as(i64, 4), terms[0].object.get("pane").?.integer);
+    try t.expectEqual(@as(i64, 1), terms[0].object.get("tab").?.integer);
+    try t.expectEqual(@as(i64, 3), terms[0].object.get("window").?.integer);
+    try t.expect(terms[0].object.get("focused").?.bool);
+    try t.expect(terms[1].object.get("zoomed").?.bool);
+    try t.expectEqualStrings("/var/log", terms[1].object.get("cwd").?.string);
+    // Tab-level identity rides every pane, so nothing is lost by
+    // flattening — and the text lane is one line per pane.
+    try t.expectEqualStrings("shell", terms[1].object.get("tab_title").?.string);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.startsWith(u8, text, "2 pane(s) in 2 tab(s)"));
+    try t.expect(std.mem.indexOf(u8, text, "pane 4  tab 1  80x24  focused  zsh  [/home/u]") != null);
+    try t.expect(std.mem.indexOf(u8, text, "pane 5  tab 1  80x12  zoomed  logs  [/var/log]") != null);
+
+    // A GUI with nothing open answers the same shape, not an error.
+    const empty = try listTerminalsResult(arena, try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"ok\":true,\"tabs\":[]}", .{}));
+    const eparsed = try expectToolResultShape(arena, "list_terminals", empty);
+    try t.expectEqual(@as(i64, 0), eparsed.object.get("structuredContent").?.object.get("count").?.integer);
+}
+
+test "fs failures carry the code their cause deserves" {
+    const t = std.testing;
+    try t.expectEqual(ErrCode.unavailable, fsErrCode(fsdrive.Error.NotConnected, ""));
+    try t.expectEqual(ErrCode.timeout, fsErrCode(fsdrive.Error.Timeout, ""));
+    try t.expectEqual(ErrCode.invalid_args, fsErrCode(fsdrive.Error.BadRequest, ""));
+    try t.expectEqual(ErrCode.conflict, fsErrCode(fsdrive.Error.Conflict, ""));
+    // Only the daemon's own message distinguishes a missing path from
+    // any other refusal.
+    try t.expectEqual(ErrCode.not_found, fsErrCode(fsdrive.Error.FsOpFailed, "open: No such file or directory"));
+    try t.expectEqual(ErrCode.io_failed, fsErrCode(fsdrive.Error.FsOpFailed, "permission denied"));
+    try t.expect(!ErrCode.not_found.retryable());
+    try t.expect(ErrCode.timeout.retryable());
+}
+
+test "panel failures are typed by delivery phase, then by what they say" {
+    const t = std.testing;
+    const pre = IpcReply{ .ok = false, .value = .null, .err = "x", .delivery = .pre_delivery };
+    try t.expectEqual(ErrCode.unavailable, uiFailCode(pre));
+    const uncertain = IpcReply{ .ok = false, .value = .null, .err = "x", .delivery = .uncertain_delivery };
+    try t.expectEqual(ErrCode.io_failed, uiFailCode(uncertain));
+    const gone = IpcReply{ .ok = false, .value = .null, .err = "origin session s is no longer present on its exact daemon" };
+    try t.expectEqual(ErrCode.not_found, uiFailCode(gone));
+    const nogui = IpcReply{ .ok = false, .value = .null, .err = "no compatible GUI is attached to origin session s" };
+    try t.expectEqual(ErrCode.unavailable, uiFailCode(nogui));
+    const odd = IpcReply{ .ok = false, .value = .null, .err = "the presenter said something new" };
+    try t.expectEqual(ErrCode.failed, uiFailCode(odd));
+
+    // Addressing is the CALLER's fault or a missing panel, never io.
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const bad = try uiResolveErr(arena, .{ .err = "panel_id must be a positive integer (the handle ui_show returned)" });
+    try t.expect(std.mem.indexOf(u8, bad, "\"code\":\"invalid_args\"") != null);
+    const missing = try uiResolveErr(arena, .{ .err = "no LIVE panel named \"train\" in session s1" });
+    try t.expect(std.mem.indexOf(u8, missing, "\"code\":\"not_found\"") != null);
+}
+
+test "ui_wait_event's one result shape: timeout and events, both isError:false" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const idle = try uiEventsResult(arena, 7, 250, null, 0, 250);
+    const iparsed = try expectToolResultShape(arena, "ui_wait_event", idle);
+    try t.expect(iparsed.object.get("isError") == null);
+    const isc = iparsed.object.get("structuredContent").?.object;
+    try t.expect(isc.get("timed_out").?.bool);
+    try t.expectEqual(@as(usize, 0), isc.get("events").?.array.items.len);
+
+    const evs = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\[{"seq":4,"component":"amount","kind":"change","value":12.5,"ts":9}]
+    , .{});
+    const got = try uiEventsResult(arena, 7, 90, evs, 3, 5000);
+    const parsed = try expectToolResultShape(arena, "ui_wait_event", got);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expect(!sc.get("timed_out").?.bool);
+    try t.expectEqual(@as(i64, 1), sc.get("count").?.integer);
+    try t.expectEqual(@as(i64, 3), sc.get("dropped").?.integer);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "--- events ---\n4 change amount = 12.5") != null);
 }

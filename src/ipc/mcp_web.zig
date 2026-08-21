@@ -1148,22 +1148,11 @@ fn networkResult(
     return res.finish();
 }
 
-/// PNG dimensions from the IHDR chunk, which every PNG opens with.
-fn pngSize(bytes: []const u8) ?struct { w: u32, h: u32 } {
-    if (bytes.len < 24) return null;
-    if (!std.mem.eql(u8, bytes[0..8], "\x89PNG\r\n\x1a\n")) return null;
-    if (!std.mem.eql(u8, bytes[12..16], "IHDR")) return null;
-    return .{
-        .w = std.mem.readInt(u32, bytes[16..20], .big),
-        .h = std.mem.readInt(u32, bytes[20..24], .big),
-    };
-}
-
 fn screenshotResult(arena: std.mem.Allocator, mode: Mode, v: View, png: []const u8) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
     try res.fact("bytes", png.len);
-    const size = pngSize(png);
+    const size = mcp.pngSize(png);
     if (size) |s| {
         try res.fact("width", s.w);
         try res.fact("height", s.h);
@@ -2210,7 +2199,7 @@ test "web_screenshot: image block plus structured pixel facts" {
     const opaque_shot = try screenshotResult(arena, .gui, EXAMPLE, "not a png at all");
     const osc = (try mcp.expectToolResultShape(arena, "web_screenshot", opaque_shot)).object.get("structuredContent").?.object;
     try t.expect(osc.get("width") == null);
-    try t.expect(pngSize("short") == null);
+    try t.expect(mcp.pngSize("short") == null);
 }
 
 test "web_wait / web_expand / web_query shapes" {

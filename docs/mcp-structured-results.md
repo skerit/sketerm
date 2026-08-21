@@ -1,7 +1,9 @@
 # MCP structured results — design (2026-08-21)
 
-Status: BINDING for the structured-results migration. Read fully before
-touching `src/ipc/mcp*.zig`.
+Status: BINDING for the structured-results migration. Waves 1-3 are
+SHIPPED (2026-08-21): all 112 tools speak both lanes and declare an
+`output_schema`. Read fully before touching `src/ipc/mcp*.zig` — this
+is the contract a NEW tool has to meet, not a plan.
 
 ## Goal
 
@@ -157,11 +159,15 @@ narrowed array from `TOOL_JSON`; `renderedToolsJson` filters first, then
 substitutes the `%..._DEF%` tokens. Generation was proven byte-identical
 to the deleted literal before the literal went away.
 
-To give a tool a structured result in wave 3: add
-`.output_schema = \\{"type":"object","properties":{...}}` to its entry
-(a multiline literal, no escaping) — nothing else moves, and the
-`output_schema == null` assertions in mcp_tools.zig's and mcp.zig's
-table tests are the two places to relax as the wave progresses.
+A tool's structured result is DECLARED on its entry:
+`.output_schema = \\{"type":"object","properties":{...}}` (a multiline
+literal, no escaping). It is no longer optional — three tests
+(`mcp_tools.zig`'s two table tests and mcp.zig's
+"every tool declaration is well-formed at the table level") refuse an
+entry without one, so a new tool cannot ship JSON-in-text by omission.
+Property sets several tools share are spliced comptime instead of
+restated: `APP_STATE_PROPS` (appFacts), `SHOT_PROPS` (addShotFacts),
+`INPUT_PROPS` (inputResult), `SCREEN_PROPS` (addScreenFacts).
 
 ## Text-lane style rules
 
@@ -179,11 +185,14 @@ table tests are the two places to relax as the wave progresses.
 
 ## Testing rules for the migration
 
-- Unit tests move from escaped-key assertions (`\"state\":`) to either
-  unescaped `"structuredContent":{...` key checks or text-lane substring
-  checks. smoke_mcp.zig's 117 escaped-key assertions are updated with the
-  module that migrates each tool.
-- Every migrated tool's result must round out to: parseable result JSON,
+- Unit tests assert through `mcp.expectToolResultShape` (plus
+  `mcp.rpcToolResult` when the reply is a whole JSON-RPC envelope)
+  rather than by matching escaped keys inside the text value. Every
+  escaped-key assertion is gone from both mcp.zig's tests and
+  smoke_mcp.zig; the one remaining escaped-quote run in smoke_mcp.zig is a panel
+  DOCUMENT the fake presenter replies with, which is legitimately a
+  JSON string on the wire.
+- Every tool's result must round out to: parseable result JSON,
   a non-empty text block whose PROSE contains no `{`, and
   structuredContent matching its declared outputSchema (a test-side
   JSON-shape check, not a full validator). "Prose" is scoped:
@@ -202,10 +211,51 @@ table tests are the two places to relax as the wave progresses.
    `toolResult`/`appErr`/image helpers on top, unit tests). No tool
    behaviour changes yet beyond error results gaining structuredContent.
 2. Wave 2: `mcp_tools.zig` table, generated tools/list + filter.
-3. Wave 3: per-module migration (term -> web -> app -> core file/ui/panes/
-   capabilities), sequential, each adding outputSchemas + updating its
-   tests + its smoke stages.
-4. Wave 4: full `zig build smoke-mcp` + live client check.
+3. Wave 3: per-module migration (term -> web -> app -> core file/ui/
+   panes/capabilities), sequential, each adding outputSchemas +
+   updating its tests + its smoke stages. SHIPPED. Notes from the
+   final wave (3d):
+   - `list_terminals` no longer passes the GUI's `list` reply through
+     verbatim: `listTerminalsResult` (pure, testable without a GUI)
+     FLATTENS tabs into an addressable `terminals[]`, each entry
+     carrying its own tab/window identity, so nothing is lost by the
+     flattening and the text lane is one line per pane.
+   - `file_read` splits by CONTENT: text content stays in the text
+     lane behind `--- content ---` (duplicating a multi-megabyte read
+     into structuredContent would serve no reader), while binary
+     content is machine data and its base64 is a `base64` FACT, with
+     the text lane reduced to the header plus one line saying where
+     the bytes are. `binary` is a fact either way.
+   - `capabilities` lost every `*_hint` prose field: the facts are
+     structured and the explanations are the text lane's summary
+     lines (the ones that are situational) or already live in a tool
+     description (the ones that are static).
+   - The caption-only `imageResult`/`imagesResult*` helpers are gone —
+     the last caller (`screenshot_pane`) builds a `Res` and calls
+     `finishWithImages`. `pngSize` moved to mcp.zig as the shared
+     image-metadata read.
+   - Panel failures are typed from their delivery PHASE first
+     (`uiFailCode`), then from the vocabulary `relayFailure` speaks;
+     addressing failures are typed by `uiResolveErr`. The pre-commit
+     store-mutation verdict is prose in the message now
+     (`mutation_may_have_applied=false, resend_safe=true`), spelled
+     the same way every other panel failure spells it.
+4. Wave 4: live client check against Claude Code / OpenCode. The full
+   `zig build smoke-mcp` is green (all stages, web included).
+
+## Smoke isolation (fixed in wave 3d)
+
+`smoke_mcp.zig` spawns the server with `execv`, so the child inherits
+this process's environment. The ui stage's "no origin daemon" probe
+was answered by the DEVELOPER's real daemon because
+`$SKETERM_MUX_SOCKET` — an ABSOLUTE path, immune to resetting
+`$XDG_RUNTIME_DIR` — was never unset. `clearInheritedOrigin()` is now
+the ONE declaring home for that list (`SKETERM_SOCKET`,
+`SKETERM_PANE_ID`, `SKETERM_MUX_SOCKET`, `SKETERM_SESSION`,
+`SKETERM_SESSION_ORIGIN_ID`), called by both the main run and
+`webOnly`. The product was behaving correctly: an inherited exact
+origin is the documented contract, so this was a test defect, not an
+origin-discovery bug.
 
 Later phases (profiles/contexts for headless views, web_close, network
 policy, the Java SDK) build on this and are specced separately.
