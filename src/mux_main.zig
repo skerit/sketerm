@@ -33,6 +33,10 @@ const HELP =
     \\attached; SIGTERM shuts down (and kills the sessions).
     \\--idle-exit SECS makes the daemon exit by itself once it has held
     \\no session and no client for that long (private MCP instances).
+    \\$SKETERM_MUX_LIFETIME_FD=N names an inherited pipe read end; the
+    \\daemon (and every worker it forks) shuts down when it hits EOF,
+    \\i.e. when the process holding the write end is gone. Test rigs
+    \\set it so nothing they start outlives them.
     \\
     \\--proxy bridges stdin/stdout to the daemon socket, starting the
     \\daemon if needed. This is the SSH transport: the sketerm GUI
@@ -170,12 +174,21 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         daemon.defaultSocketPath(allocator) catch return 1;
     defer allocator.free(path);
 
+    // Resolved BEFORE the socket is bound: a refused fence must not leave
+    // a half-started instance squatting the path.
+    const lifetime = @import("util/lifetime.zig");
+    const lifetime_fd = lifetime.inherited() catch {
+        std.debug.print("sketerm-mux: {s} names a descriptor this process does not hold; refusing to start unfenced\n", .{lifetime.ENV});
+        return 2;
+    };
+
     const d = daemon.Daemon.init(allocator, path) catch |err| {
         std.debug.print("sketerm-mux: bind {s} failed: {s}\n", .{ path, @errorName(err) });
         return 1;
     };
     d.is_broker = broker_mode;
     d.idle_exit_ms = idle_exit_ms;
+    d.lifetime_fd = lifetime_fd;
     // The autostart knob travelled in OUR environment; the shells and
     // apps this daemon spawns must not carry it on to daemons THEY start.
     _ = c.unsetenv(@import("mux/client.zig").Conn.IDLE_EXIT_ENV);

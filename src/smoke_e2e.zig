@@ -481,6 +481,11 @@ pub fn main() u8 {
     // regression. Sweep before anything of ours exists.
     sweepStaleRuns();
     installTeardownSignals();
+    // The lifetime fence is the one mechanism the signal handlers, `fail`
+    // and the environment sweep all back up: every daemon this run starts
+    // or AUTOSTARTS (the GUI's replacement broker, the fake-ssh remote)
+    // inherits it and shuts down when this process is gone, however it went.
+    if (!@import("util/lifetime.zig").arm()) return fail("lifetime fence");
 
     // Every mutable path and the daemon itself are private to this smoke.
     // A protocol bump must never classify the user's live daemon as stale

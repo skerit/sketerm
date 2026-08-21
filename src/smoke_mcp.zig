@@ -11,6 +11,7 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const pathz = @import("util/pathz.zig");
+const lifetime = @import("util/lifetime.zig");
 const muxclient = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const panelstore = @import("ipc/panelstore.zig");
@@ -566,6 +567,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.eql(u8, std.mem.span(a), "--web-bin") and i + 1 < init.args.vector.len)
             g_web_bin = init.args.vector[i + 1];
     }
+
+    // Every daemon below this process -- the ones `sketerm mcp` autostarts,
+    // named/durable ones included, and their workers -- dies with it, by
+    // whatever exit path. `fail`'s kill sweep is the orderly version; the
+    // fence is what holds for SIGKILL, a panic, or ctrl-C.
+    if (!lifetime.arm()) fail("lifetime fence");
 
     // Isolated runtime dir so nothing touches the user's real daemon.
     var rt_buf: [256]u8 = undefined;

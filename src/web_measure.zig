@@ -141,6 +141,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
+    // The private broker and everything it forks die with this process,
+    // by any exit path.
+    if (!@import("util/lifetime.zig").arm()) return fail("lifetime fence");
+
     // Isolated everything, like smoke-e2e.
     var rt_buf: [128:0]u8 = undefined;
     const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/sk-webm-{d}", .{c.getpid()}) catch return 1;

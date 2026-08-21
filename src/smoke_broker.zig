@@ -15,6 +15,7 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const daemon_mod = @import("mux/daemon.zig");
+const lifetime = @import("util/lifetime.zig");
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const snapshot = @import("mux/snapshot.zig");
@@ -212,6 +213,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // ticket stage's listener/bridge children need a real mux binary.
     if (init.args.vector.len > 1)
         _ = c.setenv("SKETERM_MUX_BIN", init.args.vector[1], 1);
+    // The forked broker below is a real process with no exec and no
+    // PDEATHSIG; `fail` exits past every kill. The fence is what retires
+    // it (and its workers) when this harness is gone, by any exit path.
+    if (!lifetime.arm()) fail("lifetime fence");
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
@@ -226,9 +231,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (bpid < 0) fail("fork broker");
     if (bpid == 0) {
         // Broker child: a real process that forks one worker per session.
+        // No exec, so it inherited the fence's WRITE end too: drop it, or
+        // this child would keep its own fence alive.
+        lifetime.dropWriteEnd();
         const child_alloc = std.heap.page_allocator;
         const d = daemon_mod.Daemon.init(child_alloc, sock_path) catch c._exit(3);
         d.is_broker = true;
+        d.lifetime_fd = lifetime.inherited() catch c._exit(3);
         d.run() catch {};
         c._exit(0);
     }

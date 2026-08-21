@@ -51,6 +51,7 @@ const lsp_servers = @import("../lsp/servers.zig");
 const webfindbin = @import("../web/findbin.zig");
 const shell_util = @import("shell.zig");
 const platform = @import("../util/platform.zig");
+const lifetime = @import("../util/lifetime.zig");
 const Pty = @import("../pty.zig").Pty;
 const Parser = @import("../parser/vt.zig").Parser;
 const Event = @import("../parser/event.zig").Event;
@@ -1121,6 +1122,36 @@ test "daemon startup recovers a refused stale socket" {
     const daemon = try Daemon.init(t.allocator, path);
     daemon.deinit();
     try t.expect(c.access(path.ptr, c.F_OK) != 0);
+}
+
+test "a closed lifetime fence stops the daemon on the next tick" {
+    const t = std.testing;
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-fence-{d}.sock", .{c.getpid()});
+    var lock_buf: [280:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    _ = c.unlink(path.ptr);
+    _ = c.unlink(lock_path.ptr);
+    defer {
+        _ = c.unlink(path.ptr);
+        _ = c.unlink(lock_path.ptr);
+    }
+    var d = try Daemon.init(t.allocator, path);
+    defer d.deinit();
+
+    var fds: [2]c_int = undefined;
+    try t.expect(c.pipe(&fds) == 0);
+    defer _ = c.close(fds[0]);
+    d.lifetime_fd = fds[0];
+
+    // Writer alive: the fence is quiet and the daemon keeps running.
+    try d.tick(10);
+    try t.expect(d.running);
+
+    // The owner dying closes the last writer: one tick and it is over.
+    _ = c.close(fds[1]);
+    try d.tick(1000);
+    try t.expect(!d.running);
 }
 
 test "--idle-exit retires a daemon holding nothing; 0 never does" {
@@ -2382,6 +2413,11 @@ pub const Daemon = struct {
     idle_exit_ms: i64 = 0,
     /// When the current client-less, session-less stretch began; 0 = not idle.
     idle_since_ms: i64 = 0,
+    /// Lifetime fence (`lifetime.ENV`, inherited by workers): the read end
+    /// of a pipe whose writer is the owning test harness. EOF = the owner
+    /// is gone by whatever path, and `running` clears. -1 = unfenced,
+    /// the per-user daemon's permanent state.
+    lifetime_fd: c_int = -1,
     /// Process-isolation mode (Firefox-style). A WORKER process owns exactly
     /// one session and has `control_fd` >= 0 (a socketpair to the broker)
     /// instead of a listen socket — new clients arrive as passed fds, not via
@@ -2821,6 +2857,10 @@ pub const Daemon = struct {
         // rename/metadata). -1 in broker/monolith → ignored by poll.
         const control_idx = fds.items.len;
         try fds.append(self.allocator, .{ .fd = self.control_fd, .events = c.POLLIN, .revents = 0 });
+        // Lifetime fence: EOF means the owning harness is gone. -1 when
+        // unfenced → ignored by poll.
+        const lifetime_idx = fds.items.len;
+        try fds.append(self.allocator, .{ .fd = self.lifetime_fd, .events = c.POLLIN, .revents = 0 });
         // Shared inotify fd for fs directory views (-1 until the first
         // open_view → ignored by poll).
         const fs_idx = fds.items.len;
@@ -2960,6 +3000,10 @@ pub const Daemon = struct {
         if (self.listen_fd >= 0 and fds.items[0].revents & c.POLLIN != 0) self.acceptClient();
         if (self.control_fd >= 0 and fds.items[control_idx].revents & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0)
             self.workerOnControl();
+        if (self.lifetime_fd >= 0 and lifetime.tripped(self.lifetime_fd, fds.items[lifetime_idx].revents)) {
+            log.info("lifetime fence closed: the owning process is gone; shutting down", .{});
+            self.running = false;
+        }
         if (self.fs_watch.fd >= 0 and fds.items[fs_idx].revents & c.POLLIN != 0)
             self.fsWatchReadable();
 

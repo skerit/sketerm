@@ -5428,6 +5428,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     const exe = argv[1];
     if (c.access(exe, c.X_OK) != 0) fail("sketerm-web binary is not executable");
+    // Stage 32's private mux daemon (and anything it forks) shuts down
+    // when this process is gone, by any exit path; `cleanup` is the
+    // orderly version.
+    if (!@import("util/lifetime.zig").arm()) fail("lifetime fence");
     // argv[3] is stage 35b's real-extension fixture: a PATH that may
     // legitimately not exist (the stage then reports itself skipped).
     const ubo_xpi: []const u8 = if (argv.len > 3) std.mem.span(argv[3]) else "";

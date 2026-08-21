@@ -18,6 +18,7 @@ comptime {
     _ = @import("util/shellquote.zig");
     _ = @import("util/humantype.zig");
     _ = @import("util/platform.zig");
+    _ = @import("util/lifetime.zig");
     _ = @import("util/clock.zig");
     _ = @import("util/fdcancel.zig");
     // browser helper protocol + keymap: pure std, no CEF — the helper

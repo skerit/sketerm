@@ -157,6 +157,10 @@ pub fn main() u8 {
         return 0;
     }
 
+    // Every daemon below this process shuts down when it is gone, by any
+    // exit path; PDEATHSIG on the broker child is the SIGKILL backstop.
+    if (!@import("util/lifetime.zig").arm()) return fail("lifetime fence");
+
     // Every mutable path and the daemon itself are private to this smoke.
     var rt_buf: [256]u8 = undefined;
     const rt = std.fmt.bufPrintZ(&rt_buf, "/tmp/sketerm-a11y-{d}", .{c.getpid()}) catch return fail("runtime path");

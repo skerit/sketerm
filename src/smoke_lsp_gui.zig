@@ -515,6 +515,10 @@ pub fn main() u8 {
         return 0;
     }
 
+    // Both legs' daemons (local broker, fake-ssh remote, their workers)
+    // shut down when this process is gone, by any exit path.
+    if (!@import("util/lifetime.zig").arm()) return fail("lifetime fence", .{});
+
     // Leg 1: a LOCAL document served by a locally spawned server.
     const local_rc = runLeg(allocator, false);
     if (local_rc != 0) return local_rc;

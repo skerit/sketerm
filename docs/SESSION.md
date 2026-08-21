@@ -19150,3 +19150,28 @@ DIFFERENT rows, so a stale frame re-reads instead of handing the drag
 a wrong rectangle) and gains SKETERM_SMOKE_E2E_SIDEBAR_DRAG_ONLY=1.
 Verified 3/3 under a 40-spinner load that failed 3/3 before, plus
 quiet. Pointer-grab drags (paned dividers) keep plain drag().
+
+## 2026-08-21: test daemons die with their harness (lifetime fence)
+
+Twelve `sketerm-mux --broker` processes from a consumer's morning IT
+runs (sketerm-java's PageApiIT, `sketerm mcp --name skjava-it-*`) were
+still alive at night, and the audit of this repo's own rigs found the
+same shape: smoke-broker's forked in-process broker leaked on `fail()`,
+a panic or SIGKILL; smoke-mcp's named-instance daemons leaked on every
+path that skipped its kill sweep; the exec'd brokers of smoke-e2e,
+smoke-atspi, smoke-lsp-gui and web-measure were covered by PDEATHSIG
+on Linux only, and never the daemon a GUI under test autostarts.
+
+`src/util/lifetime.zig` is the one owning mechanism: the harness arms
+a pipe, publishes the inheritable read end as $SKETERM_MUX_LIFETIME_FD
+and keeps the CLOEXEC write end. `sketerm-mux` (mux_main) resolves the
+variable before binding, refuses to start unfenced when it names a
+descriptor it does not hold, and `Daemon.tick` polls the fd alongside
+the control channel: EOF clears `running` (clean shutdown, workers get
+'K' and also poll the inherited fd themselves). Seven harnesses arm it
+at the top of main; smoke-broker's forked broker drops the write end
+and takes the fence. Proven by killing running harnesses by exact pid:
+smoke-mcp SIGKILL 0.58s / SIGINT 0.68s to broker + two workers + shells
+gone; smoke-broker SIGKILL 3.2s to the forked broker, its workers, the
+display keeper and the private a11y bus gone; a bare broker whose fence
+writer dies logs "lifetime fence closed" and exits within 10ms.
