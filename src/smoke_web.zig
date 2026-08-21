@@ -535,6 +535,13 @@ const ProxyProbe = struct {
         const r = readRequest(afd, &acc, &acc_len) orelse return;
         switch (r.addr) {
             .domain => |d| {
+                // Chromium itself phones home through a fresh context
+                // (component/service fetches to google.com and friends)
+                // and can win the race for the FIRST slot. The rig only
+                // ever navigates to `.example` hosts, so anything else
+                // is engine noise: refuse the tunnel unrecorded and
+                // keep the slot for the test's own navigation.
+                if (!std.mem.endsWith(u8, d, ".example")) return;
                 self.host_len = @min(d.len, self.host.len);
                 @memcpy(self.host[0..self.host_len], d[0..self.host_len]);
                 self.atyp_domain = true;
@@ -6685,7 +6692,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // Chromium's multiple-download gating out of the picture.
         cl.navigate(download_page);
         const offer1 = cl.dl_offer_seq;
-        cl.clickCenter();
+        // Retried like the stage-6 popup click: a page whose first
+        // compositor frame has not landed yet swallows the click, and
+        // under load one click plus a settle is a race; five are not.
+        {
+            var tries: u8 = 0;
+            while (tries < 5 and cl.dl_offer_seq == offer1) : (tries += 1) {
+                cl.clickCenter();
+                _ = cl.drive(400, 120);
+            }
+        }
         if (!cl.waitSeq(&cl.dl_offer_seq, offer1, 20_000))
             fail("stage 22j downloads: no second offer after a reload");
         const second_id = cl.dl_id;
