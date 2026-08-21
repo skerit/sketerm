@@ -1885,7 +1885,7 @@ fn closeTool(drv: Driver, arena: std.mem.Allocator, views: ?Views, handle: ?u32)
             return closeResult(arena, .gui, view.pane, if (vs.views.len > 0) vs.views.len - 1 else 0, 0, "", false);
         },
         .headless => |e| {
-            const released = view.profile.len == 0 and std.mem.eql(u8, view.profile_kind, "ephemeral");
+            const released = std.mem.eql(u8, view.profile_kind, "ephemeral");
             const profile = try arena.dupe(u8, view.profile);
             e.closeView(view.pane);
             return closeResult(arena, .headless, view.pane, e.views.items.len, e.current, profile, released);
