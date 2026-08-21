@@ -51,6 +51,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
+const tcpserver = @import("smoke/tcpserver.zig");
+const unixsock = @import("smoke/unixsock.zig");
 const proto = @import("web/protocol.zig");
 const zpool = @import("wlhost/zpool.zig");
 const mux_wire = @import("mux/wire.zig");
@@ -454,54 +456,22 @@ fn removeTree(path: [*:0]const u8) void {
 /// page load itself fails — the assertion is only that the CONNECT was
 /// seen through the proxy.
 const ProxyProbe = struct {
-    fd: c_int = -1,
-    port: u16 = 0,
-    thread: ?std.Thread = null,
-    stop: std.atomic.Value(bool) = .init(false),
+    lis: tcpserver.Listener = .{ .backlog = 16, .poll_ms = 200 },
     got: std.atomic.Value(bool) = .init(false),
     host: [256]u8 = @splat(0),
     host_len: usize = 0,
     atyp_domain: bool = false,
 
     fn start(self: *ProxyProbe) bool {
-        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-        if (lfd < 0) return false;
-        var one: c_int = 1;
-        _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
-        var sa = std.mem.zeroes(c.struct_sockaddr_in);
-        sa.sin_family = c.AF_INET;
-        sa.sin_port = std.mem.nativeToBig(u16, 0);
-        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
-        if (c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or c.listen(lfd, 16) != 0) {
-            _ = c.close(lfd);
-            return false;
-        }
-        var got = std.mem.zeroes(c.struct_sockaddr_in);
-        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-        if (c.getsockname(lfd, @ptrCast(&got), &glen) != 0) {
-            _ = c.close(lfd);
-            return false;
-        }
-        self.fd = lfd;
-        self.port = std.mem.bigToNative(u16, got.sin_port);
-        self.thread = std.Thread.spawn(.{}, ProxyProbe.serve, .{self}) catch {
-            _ = c.close(lfd);
-            self.fd = -1;
-            return false;
-        };
-        return true;
+        return self.lis.start(self, &onConn);
     }
 
-    fn serve(self: *ProxyProbe) void {
-        while (!self.stop.load(.acquire)) {
-            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
-            if (c.poll(@ptrCast(&pfd), 1, 200) <= 0) continue;
-            const afd = c.accept(self.fd, null, null);
-            if (afd < 0) continue;
-            self.handle(afd);
-            _ = c.close(afd);
-        }
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *ProxyProbe = @ptrCast(@alignCast(ctx.?));
+        self.handle(afd);
+        return false;
     }
+
 
     fn handle(self: *ProxyProbe, afd: c_int) void {
         // Record only the FIRST CONNECT: a browser may open several
@@ -584,11 +554,7 @@ const ProxyProbe = struct {
     }
 
     fn shutdown(self: *ProxyProbe) void {
-        self.stop.store(true, .release);
-        if (self.thread) |t| t.join();
-        self.thread = null;
-        if (self.fd >= 0) _ = c.close(self.fd);
-        self.fd = -1;
+        self.lis.deinit();
     }
 };
 
@@ -605,10 +571,7 @@ const ProxyProbe = struct {
 /// stage 33 supplies its own. It answers on its own thread and is
 /// stopped by `shutdown`.
 const HttpProbe = struct {
-    fd: c_int = -1,
-    port: u16 = 0,
-    thread: ?std.Thread = null,
-    stop: std.atomic.Value(bool) = .init(false),
+    lis: tcpserver.Listener = .{ .backlog = 16, .poll_ms = 200 },
     /// Requests answered, so a stage can tell "the engine never asked"
     /// apart from "the engine asked and the cookie did not stick".
     served: std.atomic.Value(u32) = .init(0),
@@ -636,54 +599,27 @@ const HttpProbe = struct {
         "document.title=\"cookie:\"+document.cookie;</script></body></html>";
 
     fn start(self: *HttpProbe) bool {
-        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-        if (lfd < 0) return false;
-        var one: c_int = 1;
-        _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
-        var sa = std.mem.zeroes(c.struct_sockaddr_in);
-        sa.sin_family = c.AF_INET;
-        sa.sin_port = std.mem.nativeToBig(u16, 0);
-        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
-        if (c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or c.listen(lfd, 16) != 0) {
-            _ = c.close(lfd);
-            return false;
-        }
-        var got = std.mem.zeroes(c.struct_sockaddr_in);
-        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-        if (c.getsockname(lfd, @ptrCast(&got), &glen) != 0) {
-            _ = c.close(lfd);
-            return false;
-        }
-        self.fd = lfd;
-        self.port = std.mem.bigToNative(u16, got.sin_port);
-        self.thread = std.Thread.spawn(.{}, HttpProbe.serve, .{self}) catch {
-            _ = c.close(lfd);
-            self.fd = -1;
-            return false;
-        };
-        return true;
+        return self.lis.start(self, &onConn);
     }
 
-    fn serve(self: *HttpProbe) void {
-        while (!self.stop.load(.acquire)) {
-            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
-            if (c.poll(@ptrCast(&pfd), 1, 200) <= 0) continue;
-            const afd = c.accept(self.fd, null, null);
-            if (afd < 0) continue;
-            if (self.filter_router) {
-                _ = self.workers.fetchAdd(1, .release);
-                const t = std.Thread.spawn(.{}, HttpProbe.handleAndClose, .{ self, afd }) catch {
-                    _ = self.workers.fetchSub(1, .release);
-                    _ = c.close(afd);
-                    continue;
-                };
-                t.detach();
-                continue;
-            }
-            self.handle(afd);
-            _ = c.close(afd);
+    /// Stage 39 needs concurrency (a slow list must not block the page),
+    /// so the router mode hands the fd to a detached worker and keeps it
+    /// open; the one-document mode answers inline.
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *HttpProbe = @ptrCast(@alignCast(ctx.?));
+        if (self.filter_router) {
+            _ = self.workers.fetchAdd(1, .release);
+            const t = std.Thread.spawn(.{}, HttpProbe.handleAndClose, .{ self, afd }) catch {
+                _ = self.workers.fetchSub(1, .release);
+                return false;
+            };
+            t.detach();
+            return true;
         }
+        self.handle(afd);
+        return false;
     }
+
 
     fn handleAndClose(self: *HttpProbe, afd: c_int) void {
         defer _ = self.workers.fetchSub(1, .release);
@@ -703,14 +639,7 @@ const HttpProbe = struct {
             self.handleFilter(afd, raw);
             return;
         }
-        var head: [256]u8 = undefined;
-        const hdr = std.fmt.bufPrint(
-            &head,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-            .{self.body.len},
-        ) catch return;
-        _ = c.write(afd, hdr.ptr, hdr.len);
-        _ = c.write(afd, self.body.ptr, self.body.len);
+        tcpserver.respondOk(afd, "text/html", self.body, "");
         _ = self.served.fetchAdd(1, .release);
     }
 
@@ -809,14 +738,7 @@ const HttpProbe = struct {
         "</script></body></html>";
 
     fn shutdown(self: *HttpProbe) void {
-        self.stop.store(true, .release);
-        if (self.fd >= 0) {
-            _ = c.shutdown(self.fd, c.SHUT_RDWR);
-            _ = c.close(self.fd);
-            self.fd = -1;
-        }
-        if (self.thread) |t| t.join();
-        self.thread = null;
+        self.lis.deinit();
         const deadline = nowMs() + 2_000;
         while (self.workers.load(.acquire) != 0 and nowMs() < deadline) _ = c.usleep(10_000);
         if (self.workers.load(.acquire) != 0) fail("HTTP probe workers did not stop");
@@ -2184,22 +2106,12 @@ fn axLineState(log: []const u8, needle: []const u8) ?u64 {
 
 /// Connect to the helper's socket, retrying while it starts CEF up.
 fn connectWithRetry(path: [*:0]const u8, path_len: usize) c_int {
-    var addr = std.mem.zeroes(c.struct_sockaddr_un);
-    addr.sun_family = c.AF_UNIX;
-    if (path_len + 1 > @sizeOf(@TypeOf(addr.sun_path))) fail("socket path too long");
-    @memcpy(addr.sun_path[0..path_len], path[0..path_len]);
-
-    const deadline = nowMs() + 60_000;
-    while (nowMs() < deadline) {
-        var status: c_int = 0;
-        if (c.waitpid(g_pid, &status, c.WNOHANG) == g_pid) fail("helper exited before it listened");
-        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
-        if (fd < 0) fail("socket");
-        if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0) return fd;
-        _ = c.close(fd);
-        _ = c.usleep(100_000);
-    }
-    fail("timed out connecting to the helper");
+    return unixsock.connectWithRetry(path, path_len, g_pid, 60_000) catch |e| switch (e) {
+        error.PathTooLong => fail("socket path too long"),
+        error.Socket => fail("socket"),
+        error.PeerExited => fail("helper exited before it listened"),
+        error.Timeout => fail("timed out connecting to the helper"),
+    };
 }
 
 /// Fork+exec one helper. `extra` is a single additional argv entry (the
@@ -2841,57 +2753,25 @@ fn writeFixture(ext_dir: []const u8) bool {
 /// a page) and one of the properties under test is which of them the
 /// browser actually asked for.
 const WreqServer = struct {
-    fd: c_int = -1,
-    port: u16 = 0,
+    lis: tcpserver.Listener = .{ .backlog = 64, .poll_ms = 100 },
     page_a: []const u8 = "",
     page_b: []const u8 = "",
     page_c: []const u8 = "",
-    thread: ?std.Thread = null,
-    stop: std.atomic.Value(bool) = .init(false),
     /// Set if `/blockme` was ever requested — a CANCEL must mean the
     /// request never reached the network, not merely that the page saw
     /// an error.
     blockme_hits: std.atomic.Value(u32) = .init(0),
 
     fn start(self: *WreqServer) bool {
-        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-        if (lfd < 0) return false;
-        var one: c_int = 1;
-        _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
-        var sa = std.mem.zeroes(c.struct_sockaddr_in);
-        sa.sin_family = c.AF_INET;
-        sa.sin_port = std.mem.nativeToBig(u16, 0);
-        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
-        if (c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or c.listen(lfd, 64) != 0) {
-            _ = c.close(lfd);
-            return false;
-        }
-        var got = std.mem.zeroes(c.struct_sockaddr_in);
-        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-        if (c.getsockname(lfd, @ptrCast(&got), &glen) != 0) {
-            _ = c.close(lfd);
-            return false;
-        }
-        self.fd = lfd;
-        self.port = std.mem.bigToNative(u16, got.sin_port);
-        self.thread = std.Thread.spawn(.{}, WreqServer.serve, .{self}) catch {
-            _ = c.close(lfd);
-            self.fd = -1;
-            return false;
-        };
-        return true;
+        return self.lis.start(self, &onConn);
     }
 
-    fn serve(self: *WreqServer) void {
-        while (!self.stop.load(.acquire)) {
-            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
-            if (c.poll(@ptrCast(&pfd), 1, 100) <= 0) continue;
-            const afd = c.accept(self.fd, null, null);
-            if (afd < 0) continue;
-            self.handle(afd);
-            _ = c.close(afd);
-        }
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *WreqServer = @ptrCast(@alignCast(ctx.?));
+        self.handle(afd);
+        return false;
     }
+
 
     fn handle(self: *WreqServer, afd: c_int) void {
         var req: [8192]u8 = undefined;
@@ -2928,22 +2808,11 @@ const WreqServer = struct {
             body = body_buf[0..w.end];
         }
 
-        var head: [256]u8 = undefined;
-        const hdr = std.fmt.bufPrint(
-            &head,
-            "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nX-Stage: 34\r\nConnection: close\r\n\r\n",
-            .{ ctype, body.len },
-        ) catch return;
-        _ = c.write(afd, hdr.ptr, hdr.len);
-        _ = c.write(afd, body.ptr, body.len);
+        tcpserver.respondOk(afd, ctype, body, tcpserver.CORS ++ "X-Stage: 34\r\n");
     }
 
     fn deinit(self: *WreqServer) void {
-        self.stop.store(true, .release);
-        if (self.thread) |t| t.join();
-        self.thread = null;
-        if (self.fd >= 0) _ = c.close(self.fd);
-        self.fd = -1;
+        self.lis.deinit();
     }
 };
 
@@ -3051,16 +2920,16 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
     var pa_buf: [2048]u8 = undefined;
     var pb_buf: [1024]u8 = undefined;
     var pc_buf: [1024]u8 = undefined;
-    srv.page_a = wqPageA(&pa_buf, srv.port);
-    srv.page_b = wqPageHang(&pb_buf, srv.port, "/hangme", "wq-b");
-    srv.page_c = wqPageHang(&pc_buf, srv.port, "/slowme", "wq-c");
+    srv.page_a = wqPageA(&pa_buf, srv.lis.port);
+    srv.page_b = wqPageHang(&pb_buf, srv.lis.port, "/hangme", "wq-b");
+    srv.page_c = wqPageHang(&pc_buf, srv.lis.port, "/slowme", "wq-c");
 
     var url_a: [96]u8 = undefined;
     var url_b: [96]u8 = undefined;
     var url_c: [96]u8 = undefined;
-    const page_a = std.fmt.bufPrint(&url_a, "http://127.0.0.1:{d}/pa", .{srv.port}) catch fail("url");
-    const page_b = std.fmt.bufPrint(&url_b, "http://127.0.0.1:{d}/pb", .{srv.port}) catch fail("url");
-    const page_c = std.fmt.bufPrint(&url_c, "http://127.0.0.1:{d}/pc", .{srv.port}) catch fail("url");
+    const page_a = std.fmt.bufPrint(&url_a, "http://127.0.0.1:{d}/pa", .{srv.lis.port}) catch fail("url");
+    const page_b = std.fmt.bufPrint(&url_b, "http://127.0.0.1:{d}/pb", .{srv.lis.port}) catch fail("url");
+    const page_c = std.fmt.bufPrint(&url_c, "http://127.0.0.1:{d}/pc", .{srv.lis.port}) catch fail("url");
 
     const ext_id = "wreqfixture01";
 
@@ -3261,7 +3130,7 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     if (!srv.start()) fail("stage 33 webext: loopback HTTP server would not start");
     defer srv.shutdown();
     var page_buf: [96]u8 = undefined;
-    const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/p", .{srv.port}) catch fail("webext url");
+    const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/p", .{srv.lis.port}) catch fail("webext url");
 
     const ext_id = "smokefixture01";
 
@@ -3634,7 +3503,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     if (!hostile_srv.start()) fail("stage 40: hostile-origin HTTP server would not start");
     defer hostile_srv.shutdown();
     var page_buf: [96]u8 = undefined;
-    const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/p", .{srv.port}) catch fail("stage 40 page url");
+    const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/p", .{srv.lis.port}) catch fail("stage 40 page url");
 
     var sock_buf: [96]u8 = undefined;
     const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ac.sock", .{dir}) catch fail("stage 40 socket path");
@@ -3949,7 +3818,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     // handler served the nonce-bearing body.
     var same_http_buf: [2048]u8 = undefined;
     const same_http = std.fmt.bufPrint(&same_http_buf,
-        "http://{s}:{d}/p", .{ origin_host, hostile_srv.port }) catch fail("stage 40 same-host HTTP URL");
+        "http://{s}:{d}/p", .{ origin_host, hostile_srv.lis.port }) catch fail("stage 40 same-host HTTP URL");
     const scheme_view: u32 = 44;
     load_before = cl.load_seq;
     cl.send(proto.ViewCreateUrl{ .view = scheme_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0, .url = same_http });
@@ -4109,12 +3978,9 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
 /// "blocked" means the network never saw it rather than merely that the
 /// page reported an error.
 const UboServer = struct {
-    fd: c_int = -1,
-    port: u16 = 0,
+    lis: tcpserver.Listener = .{ .backlog = 64, .poll_ms = 100 },
     page: []const u8 = "",
     frame: []const u8 = "",
-    thread: ?std.Thread = null,
-    stop: std.atomic.Value(bool) = .init(false),
     /// `/adspop.js` — matched by a generic path rule in uBO's OWN
     /// bundled `assets/ublock/filters.min.txt`, which is always enabled
     /// and needs no download. A rule with a `$domain=` option could
@@ -4125,44 +3991,15 @@ const UboServer = struct {
     ok_hits: std.atomic.Value(u32) = .init(0),
 
     fn start(self: *UboServer) bool {
-        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-        if (lfd < 0) return false;
-        var one: c_int = 1;
-        _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
-        var sa = std.mem.zeroes(c.struct_sockaddr_in);
-        sa.sin_family = c.AF_INET;
-        sa.sin_port = std.mem.nativeToBig(u16, 0);
-        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
-        if (c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or c.listen(lfd, 64) != 0) {
-            _ = c.close(lfd);
-            return false;
-        }
-        var got = std.mem.zeroes(c.struct_sockaddr_in);
-        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-        if (c.getsockname(lfd, @ptrCast(&got), &glen) != 0) {
-            _ = c.close(lfd);
-            return false;
-        }
-        self.fd = lfd;
-        self.port = std.mem.bigToNative(u16, got.sin_port);
-        self.thread = std.Thread.spawn(.{}, UboServer.serve, .{self}) catch {
-            _ = c.close(lfd);
-            self.fd = -1;
-            return false;
-        };
-        return true;
+        return self.lis.start(self, &onConn);
     }
 
-    fn serve(self: *UboServer) void {
-        while (!self.stop.load(.acquire)) {
-            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
-            if (c.poll(@ptrCast(&pfd), 1, 100) <= 0) continue;
-            const afd = c.accept(self.fd, null, null);
-            if (afd < 0) continue;
-            self.handle(afd);
-            _ = c.close(afd);
-        }
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *UboServer = @ptrCast(@alignCast(ctx.?));
+        self.handle(afd);
+        return false;
     }
+
 
     fn handle(self: *UboServer, afd: c_int) void {
         var req: [8192]u8 = undefined;
@@ -4190,22 +4027,11 @@ const UboServer = struct {
             ctype = "text/javascript";
         }
 
-        var head: [256]u8 = undefined;
-        const hdr = std.fmt.bufPrint(
-            &head,
-            "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
-            .{ ctype, body.len },
-        ) catch return;
-        _ = c.write(afd, hdr.ptr, hdr.len);
-        _ = c.write(afd, body.ptr, body.len);
+        tcpserver.respondOk(afd, ctype, body, tcpserver.CORS);
     }
 
     fn deinit(self: *UboServer) void {
-        self.stop.store(true, .release);
-        if (self.thread) |t| t.join();
-        self.thread = null;
-        if (self.fd >= 0) _ = c.close(self.fd);
-        self.fd = -1;
+        self.lis.deinit();
     }
 };
 
@@ -4409,10 +4235,10 @@ fn runShapeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) vo
     if (!srv.start()) fail("stage 35a: loopback HTTP server would not start");
     defer srv.deinit();
     var page_body: [512]u8 = undefined;
-    srv.page = shapePage(&page_body, srv.port);
+    srv.page = shapePage(&page_body, srv.lis.port);
     srv.frame = shape_frame;
     var url_buf: [96]u8 = undefined;
-    const page_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/p", .{srv.port}) catch fail("url");
+    const page_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/p", .{srv.lis.port}) catch fail("url");
 
     var sock_buf: [96]u8 = undefined;
     const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sh.sock", .{dir}) catch fail("stage 35a sock");
@@ -4559,10 +4385,10 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
     if (!srv.start()) fail("stage 35b: loopback HTTP server would not start");
     defer srv.deinit();
     var page_body: [1024]u8 = undefined;
-    srv.page = uboPage(&page_body, srv.port);
+    srv.page = uboPage(&page_body, srv.lis.port);
     srv.frame = shape_frame;
     var url_buf: [96]u8 = undefined;
-    const page_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/p", .{srv.port}) catch fail("url");
+    const page_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/p", .{srv.lis.port}) catch fail("url");
 
     var sock_buf: [96]u8 = undefined;
     const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ub.sock", .{dir}) catch fail("stage 35b sock");
@@ -4889,11 +4715,11 @@ fn runFilterSubscriptionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: [
     defer http.shutdown();
 
     var list_buf: [96]u8 = undefined;
-    const list_url = std.fmt.bufPrint(&list_buf, "http://127.0.0.1:{d}/list.txt", .{http.port}) catch fail("stage 39 list url");
+    const list_url = std.fmt.bufPrint(&list_buf, "http://127.0.0.1:{d}/list.txt", .{http.lis.port}) catch fail("stage 39 list url");
     var page_buf: [96]u8 = undefined;
-    const page_base = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/page", .{http.port}) catch fail("stage 39 page url");
+    const page_base = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/page", .{http.lis.port}) catch fail("stage 39 page url");
     var slow_buf: [96]u8 = undefined;
-    const slow_url = std.fmt.bufPrint(&slow_buf, "http://127.0.0.1:{d}/slow.txt", .{http.port}) catch fail("stage 39 slow url");
+    const slow_url = std.fmt.bufPrint(&slow_buf, "http://127.0.0.1:{d}/slow.txt", .{http.lis.port}) catch fail("stage 39 slow url");
 
     var cache_name_buf: [filtersub.MAX_NAME]u8 = undefined;
     const cache_name = filtersub.cacheName(list_url, &cache_name_buf) catch fail("stage 39 cache name");
@@ -5257,9 +5083,9 @@ fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
     if (!http.start()) fail("stage fl: could not start the loopback http probe");
     defer http.shutdown();
     var set_buf: [72]u8 = undefined;
-    const set_url = std.fmt.bufPrint(&set_buf, "http://127.0.0.1:{d}/?set", .{http.port}) catch unreachable;
+    const set_url = std.fmt.bufPrint(&set_buf, "http://127.0.0.1:{d}/?set", .{http.lis.port}) catch unreachable;
     var plain_buf: [72]u8 = undefined;
-    const plain_url = std.fmt.bufPrint(&plain_buf, "http://127.0.0.1:{d}/?plain", .{http.port}) catch unreachable;
+    const plain_url = std.fmt.bufPrint(&plain_buf, "http://127.0.0.1:{d}/?plain", .{http.lis.port}) catch unreachable;
 
     const ctx_id: u32 = 5;
 
@@ -7190,7 +7016,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!http.start()) fail("stage 31 site data: could not start the loopback http probe");
         defer http.shutdown();
         var url_buf: [64]u8 = undefined;
-        const site_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+        const site_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{http.lis.port}) catch unreachable;
 
         cl.send(proto.ViewCreate{
             .view = sitedata_view_id,
@@ -7455,7 +7281,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (!probe.start()) fail("stage 26 egress: could not start the in-process SOCKS5 probe");
             defer probe.shutdown();
             var proxy_buf: [64]u8 = undefined;
-            const proxy_url = std.fmt.bufPrint(&proxy_buf, "socks5://127.0.0.1:{d}", .{probe.port}) catch unreachable;
+            const proxy_url = std.fmt.bufPrint(&proxy_buf, "socks5://127.0.0.1:{d}", .{probe.lis.port}) catch unreachable;
             ec.send(proto.ContextCreate{ .id = 10, .ephemeral = 1, .name = "egress-a", .proxy = proxy_url });
             ec.send(proto.ViewCreate{ .view = egress_view_a, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 10 });
             ec.send(proto.Navigate{ .view = egress_view_a, .url = "http://cookie-a.example/" });
@@ -7482,8 +7308,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             defer probe_b.shutdown();
             var buf_a: [64]u8 = undefined;
             var buf_b: [64]u8 = undefined;
-            const url_a = std.fmt.bufPrint(&buf_a, "socks5://127.0.0.1:{d}", .{probe_a.port}) catch unreachable;
-            const url_b = std.fmt.bufPrint(&buf_b, "socks5://127.0.0.1:{d}", .{probe_b.port}) catch unreachable;
+            const url_a = std.fmt.bufPrint(&buf_a, "socks5://127.0.0.1:{d}", .{probe_a.lis.port}) catch unreachable;
+            const url_b = std.fmt.bufPrint(&buf_b, "socks5://127.0.0.1:{d}", .{probe_b.lis.port}) catch unreachable;
             ec.send(proto.ContextCreate{ .id = 11, .ephemeral = 1, .name = "iso-a", .proxy = url_a });
             ec.send(proto.ContextCreate{ .id = 12, .ephemeral = 1, .name = "iso-b", .proxy = url_b });
             ec.send(proto.ViewCreate{ .view = egress_view_b, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 11 });
@@ -7617,11 +7443,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (!http.start()) fail("stage 37 jars: could not start the loopback http probe");
         defer http.shutdown();
         var base_buf: [64]u8 = undefined;
-        const base_url = std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+        const base_url = std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}/", .{http.lis.port}) catch unreachable;
         var set_buf: [72]u8 = undefined;
-        const set_url = std.fmt.bufPrint(&set_buf, "http://127.0.0.1:{d}/?set", .{http.port}) catch unreachable;
+        const set_url = std.fmt.bufPrint(&set_buf, "http://127.0.0.1:{d}/?set", .{http.lis.port}) catch unreachable;
         var plain_buf: [72]u8 = undefined;
-        const plain_url = std.fmt.bufPrint(&plain_buf, "http://127.0.0.1:{d}/?plain", .{http.port}) catch unreachable;
+        const plain_url = std.fmt.bufPrint(&plain_buf, "http://127.0.0.1:{d}/?plain", .{http.lis.port}) catch unreachable;
 
         jc.send(proto.ContextCreate{ .id = 20, .ephemeral = 1, .name = "jar-a", .proxy = "" });
         jc.send(proto.ContextCreate{ .id = 21, .ephemeral = 1, .name = "jar-b", .proxy = "" });

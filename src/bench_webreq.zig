@@ -31,6 +31,8 @@
 
 const std = @import("std");
 const c = @import("cbindings");
+const tcpserver = @import("smoke/tcpserver.zig");
+const unixsock = @import("smoke/unixsock.zig");
 const proto = @import("web/protocol.zig");
 
 const view_id: u32 = 1;
@@ -67,81 +69,34 @@ const nowMs = @import("util/clock.zig").nowMs;
 // ---------------------------------------------------------------------
 
 const HttpServer = struct {
-    fd: c_int = -1,
-    port: u16 = 0,
+    lis: tcpserver.Listener = .{ .backlog = 128, .poll_ms = 100 },
     page: []const u8 = "",
-    thread: ?std.Thread = null,
-    stop: std.atomic.Value(bool) = .init(false),
     served: std.atomic.Value(u32) = .init(0),
 
     fn start(self: *HttpServer) bool {
-        const lfd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-        if (lfd < 0) return false;
-        var one: c_int = 1;
-        _ = c.setsockopt(lfd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
-        var sa = std.mem.zeroes(c.struct_sockaddr_in);
-        sa.sin_family = c.AF_INET;
-        sa.sin_port = std.mem.nativeToBig(u16, 0);
-        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
-        if (c.bind(lfd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or c.listen(lfd, 128) != 0) {
-            _ = c.close(lfd);
-            return false;
-        }
-        var got = std.mem.zeroes(c.struct_sockaddr_in);
-        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
-        if (c.getsockname(lfd, @ptrCast(&got), &glen) != 0) {
-            _ = c.close(lfd);
-            return false;
-        }
-        self.fd = lfd;
-        self.port = std.mem.bigToNative(u16, got.sin_port);
-        self.thread = std.Thread.spawn(.{}, HttpServer.serve, .{self}) catch {
-            _ = c.close(lfd);
-            self.fd = -1;
-            return false;
-        };
-        return true;
+        return self.lis.start(self, &onConn);
     }
 
-    fn serve(self: *HttpServer) void {
-        while (!self.stop.load(.acquire)) {
-            var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
-            if (c.poll(@ptrCast(&pfd), 1, 100) <= 0) continue;
-            const afd = c.accept(self.fd, null, null);
-            if (afd < 0) continue;
-            self.handle(afd);
-            _ = c.close(afd);
-        }
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *HttpServer = @ptrCast(@alignCast(ctx.?));
+        self.handle(afd);
+        return false;
     }
 
     fn handle(self: *HttpServer, afd: c_int) void {
         var req: [4096]u8 = undefined;
-        var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
-        if (c.poll(@ptrCast(&pfd), 1, 2000) <= 0) return;
-        const n = c.read(afd, &req, req.len);
-        if (n <= 0) return;
-        const line = req[0..@intCast(n)];
+        const line = tcpserver.readRequest(afd, &req, 2000);
+        if (line.len == 0) return;
         // `/r/<i>` is a subresource; anything else is the page.
         const is_sub = std.mem.indexOf(u8, line, "GET /r/") != null;
         const body: []const u8 = if (is_sub) "x" else self.page;
         const ctype: []const u8 = if (is_sub) "text/plain" else "text/html";
-        var head: [256]u8 = undefined;
-        const hdr = std.fmt.bufPrint(
-            &head,
-            "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
-            .{ ctype, body.len },
-        ) catch return;
-        _ = c.write(afd, hdr.ptr, hdr.len);
-        _ = c.write(afd, body.ptr, body.len);
+        tcpserver.respondOk(afd, ctype, body, tcpserver.CORS);
         _ = self.served.fetchAdd(1, .release);
     }
 
     fn deinit(self: *HttpServer) void {
-        self.stop.store(true, .release);
-        if (self.thread) |t| t.join();
-        self.thread = null;
-        if (self.fd >= 0) _ = c.close(self.fd);
-        self.fd = -1;
+        self.lis.deinit();
     }
 };
 
@@ -438,21 +393,12 @@ fn parseTitle(title: []const u8) ?Result {
 }
 
 fn connectWithRetry(path: [*:0]const u8, path_len: usize) c_int {
-    var addr = std.mem.zeroes(c.struct_sockaddr_un);
-    addr.sun_family = c.AF_UNIX;
-    if (path_len + 1 > @sizeOf(@TypeOf(addr.sun_path))) fail("socket path too long");
-    @memcpy(addr.sun_path[0..path_len], path[0..path_len]);
-    const deadline = nowMs() + 60_000;
-    while (nowMs() < deadline) {
-        var status: c_int = 0;
-        if (c.waitpid(g_pid, &status, c.WNOHANG) == g_pid) fail("helper exited before it listened");
-        const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
-        if (fd < 0) fail("socket");
-        if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0) return fd;
-        _ = c.close(fd);
-        _ = c.usleep(100_000);
-    }
-    fail("timed out connecting to the helper");
+    return unixsock.connectWithRetry(path, path_len, g_pid, 60_000) catch |e| switch (e) {
+        error.PathTooLong => fail("socket path too long"),
+        error.Socket => fail("socket"),
+        error.PeerExited => fail("helper exited before it listened"),
+        error.Timeout => fail("timed out connecting to the helper"),
+    };
 }
 
 fn spawnHelper(exe: [*:0]const u8, sock: [*:0]const u8, cache: [*:0]const u8) c.pid_t {
@@ -623,9 +569,9 @@ pub fn main(init: std.process.Init.Minimal) void {
     var page_buf: [4096]u8 = undefined;
     if (!srv.start()) fail("loopback HTTP server would not start");
     defer srv.deinit();
-    srv.page = buildPage(&page_buf, srv.port);
+    srv.page = buildPage(&page_buf, srv.lis.port);
     var url_buf: [96]u8 = undefined;
-    const page_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/page", .{srv.port}) catch fail("url");
+    const page_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/page", .{srv.lis.port}) catch fail("url");
 
     std.debug.print(
         "bench-webreq: {d} sequential same-origin fetches per scenario, fresh helper each time\n",

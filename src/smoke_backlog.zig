@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const sendWithFd = @import("smoke/unixsock.zig").sendWithFd;
 const daemon_mod = @import("mux/daemon.zig");
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
@@ -36,24 +37,6 @@ fn commitNeedle() [8]u8 {
     return buf;
 }
 
-/// sendmsg with one SCM_RIGHTS fd attached (64-bit glibc/musl layout).
-fn sendWithFd(sock: c_int, bytes: []const u8, fd: c_int) !void {
-    var iov = c.struct_iovec{ .iov_base = @constCast(bytes.ptr), .iov_len = bytes.len };
-    var cbuf: [32]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([32]u8);
-    const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
-    const cmsg: *c.struct_cmsghdr = @ptrCast(&cbuf);
-    cmsg.cmsg_len = @intCast(hdr_size + @sizeOf(c_int));
-    cmsg.cmsg_level = c.SOL_SOCKET;
-    cmsg.cmsg_type = c.SCM_RIGHTS;
-    @memcpy(cbuf[hdr_size..][0..@sizeOf(c_int)], std.mem.asBytes(&fd));
-    var mh = std.mem.zeroes(c.struct_msghdr);
-    mh.msg_iov = @ptrCast(&iov);
-    mh.msg_iovlen = 1;
-    mh.msg_control = &cbuf;
-    const cmsg_align: usize = if (@import("builtin").os.tag == .macos) 4 else 8;
-    mh.msg_controllen = @intCast(std.mem.alignForward(usize, hdr_size + @sizeOf(c_int), cmsg_align));
-    if (c.sendmsg(sock, &mh, 0) != @as(isize, @intCast(bytes.len))) return error.SendFailed;
-}
 
 /// App-side processing barrier: send wl_display.get_registry(new_id)
 /// and wait for an event ADDRESSED TO that registry (its globals) —

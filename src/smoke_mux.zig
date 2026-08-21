@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const sendWithFd = @import("smoke/unixsock.zig").sendWithFd;
 const daemon_mod = @import("mux/daemon.zig");
 const client_mod = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
@@ -1954,29 +1955,6 @@ fn recvWithFd(sock: c_int) ?struct { fd: c_int, obj: u32 = 0, opcode: u16 = 0 } 
     return .{ .fd = -1, .obj = obj, .opcode = opcode };
 }
 
-/// sendmsg with one SCM_RIGHTS fd attached (CMSG_* macros don't
-/// translate; layout per 64-bit glibc/musl: 16-byte header, data
-/// follows, space padded to 8).
-fn sendWithFd(sock: c_int, bytes: []const u8, fd: c_int) !void {
-    var iov = c.struct_iovec{ .iov_base = @constCast(bytes.ptr), .iov_len = bytes.len };
-    var cbuf: [32]u8 align(@alignOf(c.struct_cmsghdr)) = std.mem.zeroes([32]u8);
-    const hdr_size: usize = @sizeOf(c.struct_cmsghdr);
-    const cmsg: *c.struct_cmsghdr = @ptrCast(&cbuf);
-    cmsg.cmsg_len = @intCast(hdr_size + @sizeOf(c_int));
-    cmsg.cmsg_level = c.SOL_SOCKET;
-    cmsg.cmsg_type = c.SCM_RIGHTS;
-    @memcpy(cbuf[hdr_size..][0..@sizeOf(c_int)], std.mem.asBytes(&fd));
-    var mh = std.mem.zeroes(c.struct_msghdr);
-    mh.msg_iov = @ptrCast(&iov);
-    mh.msg_iovlen = 1;
-    mh.msg_control = &cbuf;
-    // CMSG_SPACE(sizeof(int)): cmsg alignment is 8 on Linux (16-byte
-    // header), 4 on Darwin (12-byte header, and XNU rejects a
-    // controllen that overshoots the aligned length).
-    const cmsg_align: usize = if (@import("builtin").os.tag == .macos) 4 else 8;
-    mh.msg_controllen = @intCast(std.mem.alignForward(usize, hdr_size + @sizeOf(c_int), cmsg_align));
-    if (c.sendmsg(sock, &mh, 0) != @as(isize, @intCast(bytes.len))) return error.SendFailed;
-}
 
 fn daemonMain(d: *daemon_mod.Daemon) void {
     d.run() catch |err| {
