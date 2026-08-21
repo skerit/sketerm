@@ -26,7 +26,7 @@ compiler-specific failure.
 - `std.process.argsAlloc`/`argsWithAllocator` are gone: `pub fn main(init: std.process.Init.Minimal)` + `init.args.vector` (see `main.zig`, `mux_main.zig`).
 - `std.time.milliTimestamp`, `std.crypto.random`, `std.meta.intToEnum` are gone. Use `src/util/clock.zig` (`nowMs`/`nowUs`/`nowNs` monotonic, `wallMs` wall — the ONE home for that arithmetic, importable from both dependency sets), `c.getentropy`, `std.enums.fromInt`.
 - File IO via libc (`c.fopen`/`c.open`) — `std.fs.cwd()` is gone (see `config.zig`).
-- `std.Thread` has **no `Mutex`/`Condition`** (they moved behind an `Io` instance). Cross-thread state uses the repo's atomic spinlock pattern; `src/ui/panel/events.zig` documents why. A condvar would need `pthread.h`, which is deliberately absent from `vendor/cimport_core.h` — adding it (musl-clean) is the right fix if a core-side module ever truly needs one, rather than more spinlocks.
+- `std.Thread` has **no `Mutex`/`Condition`** (they moved behind an `Io` instance). Cross-thread state uses the repo's one spinlock, `src/util/spinlock.zig`, whose docblock documents why (and what a spinlock must never be held across). A condvar would need `pthread.h`, which is deliberately absent from `vendor/cimport_core.h` — adding it (musl-clean) is the right fix if a core-side module ever truly needs one, rather than more spinlocks.
 - ArrayLists are unmanaged: `.empty`, `list.append(allocator, x)`.
 - `std.Io.Writer.Allocating` for JSON stringify targets. `@abs(i64)` returns `u64`.
 - `std.process.Child.run` is gone. Inside `build.zig` use `b.run` / `b.runAllowFail` (configure-time subprocesses, e.g. the git describe embed).

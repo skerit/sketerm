@@ -22,6 +22,7 @@ comptime {
     _ = @import("util/platform.zig");
     _ = @import("util/lifetime.zig");
     _ = @import("util/clock.zig");
+    _ = @import("util/spinlock.zig");
     _ = @import("util/fdcancel.zig");
     // browser helper protocol + keymap: pure std, no CEF — the helper
     // itself is opt-in (`zig build web`) but its wire format and key

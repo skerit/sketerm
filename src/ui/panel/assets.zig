@@ -1,6 +1,7 @@
 //! Remote panel image collection, resolution, and GUI-host cache storage.
 
 const std = @import("std");
+const SpinLock = @import("../../util/spinlock.zig").SpinLock;
 const c = @import("../../c.zig").c;
 const build_options = @import("build_options");
 const pathz = @import("../../util/pathz.zig");
@@ -53,7 +54,7 @@ pub const ProcessPreparedBudgetError = error{
 
 /// Thread-safe aggregate used by prepared-image leases.
 pub const ProcessPreparedBudget = struct {
-    guard: std.atomic.Value(bool) = .init(false),
+    guard: SpinLock = .{},
     pixels: u64 = 0,
     bytes: u64 = 0,
     max_pixels: u64,
@@ -64,12 +65,11 @@ pub const ProcessPreparedBudget = struct {
     }
 
     fn lock(self: *ProcessPreparedBudget) void {
-        while (self.guard.cmpxchgWeak(false, true, .acquire, .monotonic) != null)
-            std.atomic.spinLoopHint();
+        self.guard.lock();
     }
 
     fn unlock(self: *ProcessPreparedBudget) void {
-        self.guard.store(false, .release);
+        self.guard.unlock();
     }
 
     pub fn reserve(self: *ProcessPreparedBudget, info: PreparedInfo) ProcessPreparedBudgetError!void {

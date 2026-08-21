@@ -35,6 +35,7 @@
 //! them but the JSON strings and the two secrets (see `Secret`).
 
 const std = @import("std");
+const SpinLock = @import("../util/spinlock.zig").SpinLock;
 const builtin = @import("builtin");
 const cef = @import("cef");
 const c = @import("cbindings");
@@ -8085,20 +8086,18 @@ const ISlot = struct {
 };
 
 const Intercept = struct {
-    lock: std.atomic.Value(u8) = .init(0),
+    lock: SpinLock = .{},
     engine: ?*filter.Engine = null,
     global_enabled: bool = true,
     rules: u32 = 0,
     slots: [MAX_ISLOTS]ISlot = @splat(.{}),
 
     fn acquire(self: *Intercept) void {
-        while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
+        self.lock.lock();
     }
 
     fn release(self: *Intercept) void {
-        self.lock.store(0, .release);
+        self.lock.unlock();
     }
 };
 
@@ -8896,7 +8895,7 @@ const WStat = struct {
 };
 
 const WreqState = struct {
-    lock: std.atomic.Value(u8) = .init(0),
+    lock: SpinLock = .{},
     /// Read WITHOUT the lock on the request path so a helper with no
     /// blocking extension pays one relaxed load per request.
     outstanding: std.atomic.Value(u32) = .init(0),
@@ -8906,12 +8905,10 @@ const WreqState = struct {
     stats: [webrequest.MAX_PUBLISHED]WStat = @splat(.{}),
 
     fn acquire(self: *WreqState) void {
-        while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
+        self.lock.lock();
     }
     fn release(self: *WreqState) void {
-        self.lock.store(0, .release);
+        self.lock.unlock();
     }
 };
 

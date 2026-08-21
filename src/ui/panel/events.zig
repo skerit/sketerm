@@ -1,14 +1,13 @@
 //! Bounded, thread-safe event queue between a rendered panel and the
 //! MCP layer.
 //!
-//! Pure Zig + libc (`util/clock.zig`, `nanosleep`), NO GTK/GLib —
+//! Pure Zig + libc (`util/clock.zig`, `nanosleep`), NO GTK/GLib -
 //! lives in both test roots. Events are flat fixed-size structs so
 //! `push` can never fail and never allocates (it runs inside GTK
-//! signal handlers). Zig 0.16 has no std mutex/condvar (std.Io.Mutex
-//! wants an Io instance) and the core cimport set has no pthread.h,
-//! so synchronization is the repo's spinlock pattern (see
-//! image_decoder.zig) — every critical section here is a few dozen
-//! instructions, which is exactly what a spinlock is for.
+//! signal handlers). Synchronization is `util/spinlock.zig`, whose
+//! docblock is where the "why a spinlock and not a Mutex" rationale
+//! lives; every critical section here is a few dozen instructions
+//! over the fixed ring, which is exactly what a spinlock is for.
 //!
 //! Threading contract for the next agent (`ui_wait_event`):
 //! - `push` is called on the GTK main thread by the renderer.
@@ -30,6 +29,7 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const clock = @import("../../util/clock.zig");
+const SpinLock = @import("../../util/spinlock.zig").SpinLock;
 
 /// Longest component id (mirrored by doc.zig's id validation).
 pub const MAX_ID: usize = 64;
@@ -108,7 +108,7 @@ fn sleepBriefly() void {
 }
 
 pub const Queue = struct {
-    lock: std.atomic.Value(u8) = .init(0),
+    lock: SpinLock = .{},
     ring: [CAP]Event = undefined,
     head: usize = 0,
     count: usize = 0,
@@ -128,13 +128,11 @@ pub const Queue = struct {
     }
 
     fn acquire(self: *Queue) void {
-        while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
+        self.lock.lock();
     }
 
     fn release(self: *Queue) void {
-        self.lock.store(0, .release);
+        self.lock.unlock();
     }
 
     /// Append (never fails). Consecutive `.change` events from the

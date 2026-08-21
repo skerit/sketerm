@@ -14,6 +14,7 @@
 //! Pure std: no CEF, no GTK, in both test roots.
 
 const std = @import("std");
+const SpinLock = @import("../../util/spinlock.zig").SpinLock;
 const manifest = @import("manifest.zig");
 
 pub const MAX_ORIGINS = 16;
@@ -74,20 +75,18 @@ pub const Slot = struct {
     }
 };
 
-pub var lock: std.atomic.Value(u8) = .init(0);
+pub var lock: SpinLock = .{};
 pub var slots: [MAX_ORIGINS]Slot = @splat(.{});
 /// Non-zero when any origin is published, so the IO thread can refuse a
 /// request without taking the lock at all.
 pub var any: std.atomic.Value(bool) = .init(false);
 
 pub fn acquire() void {
-    while (lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-        std.atomic.spinLoopHint();
-    }
+    lock.lock();
 }
 
 pub fn release() void {
-    lock.store(0, .release);
+    lock.unlock();
 }
 
 fn refreshAnyLocked() void {

@@ -22,6 +22,7 @@
 //! point of targeting the Firefox surface.
 
 const std = @import("std");
+const SpinLock = @import("../../util/spinlock.zig").SpinLock;
 const manifest = @import("manifest.zig");
 const match = @import("match.zig");
 
@@ -275,7 +276,7 @@ pub const Slot = struct {
     }
 };
 
-pub var lock: std.atomic.Value(u8) = .init(0);
+pub var lock: SpinLock = .{};
 pub var slots: [MAX_PUBLISHED]Slot = @splat(.{});
 
 /// Set whenever ANY published extension has at least one listener, so
@@ -286,13 +287,11 @@ pub var slots: [MAX_PUBLISHED]Slot = @splat(.{});
 pub var any_listeners: std.atomic.Value(bool) = .init(false);
 
 pub fn acquire() void {
-    while (lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-        std.atomic.spinLoopHint();
-    }
+    lock.lock();
 }
 
 pub fn release() void {
-    lock.store(0, .release);
+    lock.unlock();
 }
 
 /// Recompute `any_listeners`. Call under the lock after any mutation.

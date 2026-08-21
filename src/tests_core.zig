@@ -198,6 +198,7 @@ comptime {
     _ = @import("shim_drift_test.zig");
     _ = @import("util/churn.zig");
     _ = @import("util/clock.zig");
+    _ = @import("util/spinlock.zig");
     // browser helper protocol + keymap: pure std, no CEF — the helper
     // itself is opt-in (`zig build web`) but its wire format and key
     // mapping are testable everywhere.
