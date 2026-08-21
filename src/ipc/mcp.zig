@@ -152,7 +152,7 @@ const DirectTalkFailure = struct {
     delivery: enum { pre_delivery, uncertain_delivery },
 };
 
-const DirectTalkResult = union(enum) {
+pub const DirectTalkResult = union(enum) {
     reply: []u8,
     failure: DirectTalkFailure,
 };
@@ -3700,6 +3700,18 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     try res.fact("web", web_ok);
     try res.fact("web_backend", web_backend);
     if (@import("mcp_web.zig").sessionInfo()) |ws| try res.fact("web_session", ws);
+    // The discoverability half of fail-closed: without this, a
+    // web_open that refuses a profile reads as a bug rather than as a
+    // capability this server does not have.
+    {
+        const profiles = @import("mcp_web.zig").profileCapability(arena);
+        try res.fact("web_profiles", profiles.available);
+        if (profiles.store.len > 0) try res.fact("web_profile_store", profiles.store);
+        if (profiles.available)
+            try res.text("named browsing profiles are available (web_open profile:\"name\"); each keeps its own cookie jar across MCP restarts")
+        else if (profiles.reason.len > 0)
+            try res.textf("named browsing profiles are unavailable: {s}", .{profiles.reason});
+    }
     if (helper == null)
         try res.text("sketerm-webengine is not installed next to the sketerm binary — the web_* tools have nothing to drive, in any mode (build it with: zig build fetch-cef && zig build web)")
     else if (std.mem.eql(u8, web_backend, "none"))

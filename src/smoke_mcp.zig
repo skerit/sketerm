@@ -552,6 +552,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: focused watchable web session ok");
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBPROFILE_ONLY") != null) {
+        webProfileFakeStage(allocator, exe, rt);
+        say("smoke-mcp: focused headless browsing profiles ok");
+        return 0;
+    }
 
     // ── Stage 1: ephemeral isolation + headless terminal ──────────
     {
@@ -1921,6 +1926,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     webSessionFakeStage(allocator, exe, rt);
     say("smoke-mcp: watchable web session plumbing ok");
 
+    // ── headless browsing profiles (no CEF needed) ─────────────────
+    webProfileFakeStage(allocator, exe, rt);
+    say("smoke-mcp: headless browsing profiles (fake helper) ok");
+
     // ── web_* headless: isolated mode, NO GUI, no --shared ─────────
     //
     // The regression this guards: the web tools once hard-failed with
@@ -1990,6 +1999,86 @@ fn readerIdBefore(hay: []const u8, needle: []const u8) ?u32 {
     }
     return if (any) value else null;
 }
+
+/// A one-page loopback HTTP server, purely so the profile checks have a
+/// real ORIGIN to test with.
+///
+/// `file://` cannot carry cookies at all in Chromium — `document.cookie`
+/// there is a silent no-op — so an isolation test written against the
+/// smoke page's file URL would pass on an engine that isolates nothing.
+const TinyHttp = struct {
+    fd: c_int = -1,
+    port: u16 = 0,
+    thread: ?std.Thread = null,
+
+    const BODY =
+        "<html><head><title>Profile Origin</title></head><body>" ++
+        "<h1>PROFILE-ORIGIN</h1><p id=p>cookie probe page</p></body></html>";
+
+    fn start() ?TinyHttp {
+        var self = TinyHttp{};
+        self.fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        if (self.fd < 0) return null;
+        var one: c_int = 1;
+        _ = c.setsockopt(self.fd, c.SOL_SOCKET, c.SO_REUSEADDR, &one, @sizeOf(c_int));
+        var sa = std.mem.zeroes(c.struct_sockaddr_in);
+        sa.sin_family = c.AF_INET;
+        sa.sin_port = 0;
+        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
+        if (c.bind(self.fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0 or
+            c.listen(self.fd, 16) != 0)
+        {
+            _ = c.close(self.fd);
+            return null;
+        }
+        var got = std.mem.zeroes(c.struct_sockaddr_in);
+        var glen: c.socklen_t = @sizeOf(c.struct_sockaddr_in);
+        if (c.getsockname(self.fd, @ptrCast(&got), &glen) != 0) {
+            _ = c.close(self.fd);
+            return null;
+        }
+        self.port = std.mem.bigToNative(u16, got.sin_port);
+        return self;
+    }
+
+    fn spawn(self: *TinyHttp) void {
+        self.thread = std.Thread.spawn(.{}, serve, .{self}) catch null;
+    }
+
+    /// One connection at a time is plenty: the browser asks for one
+    /// document per view. Ends when `deinit` closes the listener.
+    fn serve(self: *TinyHttp) void {
+        while (true) {
+            const cfd = c.accept(self.fd, null, null);
+            if (cfd < 0) return;
+            var req: [4096]u8 = undefined;
+            _ = c.read(cfd, &req, req.len);
+            var head: [256]u8 = undefined;
+            const hdr = std.fmt.bufPrint(
+                &head,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                .{BODY.len},
+            ) catch return;
+            // MSG_NOSIGNAL, never write(2): the browser closes a
+            // connection it already has the bytes for (favicon probes
+            // especially), and the SIGPIPE that follows would kill the
+            // smoke process rather than this one request.
+            _ = c.send(cfd, hdr.ptr, hdr.len, c.MSG_NOSIGNAL);
+            _ = c.send(cfd, BODY.ptr, BODY.len, c.MSG_NOSIGNAL);
+            _ = c.close(cfd);
+        }
+    }
+
+    fn deinit(self: *TinyHttp) void {
+        if (self.fd >= 0) {
+            _ = c.shutdown(self.fd, c.SHUT_RDWR);
+            _ = c.close(self.fd);
+            self.fd = -1;
+        }
+        if (self.thread) |t| t.detach();
+        self.thread = null;
+    }
+};
 
 /// Isolated `sketerm mcp` (no GUI, no --shared) driving a real page
 /// end to end through the headless web backend.
@@ -2175,10 +2264,138 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
         std.mem.indexOf(u8, tabs, "\"view\":1") == null)
         fail("web_tabs does not list the headless view");
 
+    // ── named profiles against REAL CEF ─────────────────────────────
+    //
+    // The one thing only a real engine can prove: that an isolated
+    // identity context actually keeps its cookies, on disk, across a
+    // web_close AND across a whole MCP server restart.
+    const COOKIE = "document.cookie='smoke=inprofile; max-age=86400; path=/'";
+    var jar_buf: [512]u8 = undefined;
+    var jar_id: []const u8 = "";
+    // file:// carries no cookies in Chromium, so the isolation checks
+    // need a real origin or they would pass against an engine that
+    // isolates nothing.
+    var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the profile checks");
+    defer http.deinit();
+    http.spawn();
+    var origin_buf: [64]u8 = undefined;
+    const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+    {
+        m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"smoke\"}}", .{origin}) catch unreachable);
+        const opened_p = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, opened_p, "isError") != null) {
+            // A CEF build without the contexts capability must REFUSE,
+            // never silently share the jar; that is still a pass for
+            // the fail-closed contract, but the rest cannot run.
+            if (std.mem.indexOf(u8, opened_p, "\"code\":\"unavailable\"") == null)
+                fail("web_open with a profile failed for a reason other than a missing capability");
+            say("smoke-mcp: SKIP real-CEF profile checks (this helper advertises no identity contexts; the refusal was correct)");
+        } else {
+            if (std.mem.indexOf(u8, opened_p, "\"profile\":\"smoke\"") == null or
+                std.mem.indexOf(u8, opened_p, "\"profile_kind\":\"named\"") == null)
+                fail("web_open did not report the profile its view lives in");
+            const wrote = m.callTool("web_eval", "{\"code\":\"" ++ COOKIE ++ "\"}");
+            if (std.mem.indexOf(u8, wrote, "isError") != null) fail("could not write a cookie in the profile view");
+
+            // The jar is a real directory named {profile}-{id} under the
+            // durable store — the id is half the path, which is why it
+            // has to be persisted at all.
+            const listed = m.callTool("web_profiles", "{}");
+            // Scoped to OUR row: the store is shared with the fake
+            // stage's profiles, so the first "context" in the reply is
+            // not necessarily this one's.
+            const row = std.mem.indexOf(u8, listed, "\"name\":\"smoke\"") orelse
+                fail("web_profiles does not list the profile just opened");
+            const idx = row + (std.mem.indexOf(u8, listed[row..], "\"context\":") orelse
+                fail("web_profiles reports no context id"));
+            const after_idx = listed[idx + "\"context\":".len ..];
+            const end = std.mem.indexOfAny(u8, after_idx, ",}") orelse fail("malformed web_profiles reply");
+            jar_id = std.fmt.bufPrint(&jar_buf, "{s}", .{after_idx[0..end]}) catch unreachable;
+            var jar_path_buf: [1024]u8 = undefined;
+            const jar = std.fmt.bufPrint(&jar_path_buf, "{s}/sketerm/web-profiles/anon/profile-smoke-{s}", .{ rt, jar_id }) catch unreachable;
+            if (!fileExists(jar)) fail("the profile's cookie jar directory does not exist on disk");
+
+            // Close and reopen the SAME profile: the cookie survives.
+            const closed = m.callTool("web_close", "{}");
+            if (std.mem.indexOf(u8, closed, "\"profile\":\"smoke\"") == null or
+                std.mem.indexOf(u8, closed, "\"profile_released\":false") == null)
+                fail("web_close did not report that a named profile keeps its storage");
+            m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"smoke\"}}", .{origin}) catch unreachable);
+            if (std.mem.indexOf(u8, m.recvLine(60_000), "isError") != null) fail("could not reopen the profile");
+            const reread = m.callTool("web_eval", "{\"code\":\"document.cookie\"}");
+            if (std.mem.indexOf(u8, reread, "smoke=inprofile") == null)
+                fail("the profile's cookie did not survive web_close (its jar is not persistent)");
+
+            // Isolation: the DEFAULT jar has never seen that cookie.
+            m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\"}}", .{origin}) catch unreachable);
+            if (std.mem.indexOf(u8, m.recvLine(60_000), "isError") != null) fail("could not open a default-jar view");
+            const plain = m.callTool("web_eval", "{\"code\":\"document.cookie\"}");
+            if (std.mem.indexOf(u8, plain, "smoke=inprofile") != null)
+                fail("a profile's cookie leaked into the shared default jar");
+
+            // An ephemeral identity is isolated too, and goes away with
+            // its view.
+            m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"ephemeral\":true}}", .{origin}) catch unreachable);
+            const eph = m.recvLine(60_000);
+            if (std.mem.indexOf(u8, eph, "isError") != null) fail("could not open an ephemeral view");
+            if (std.mem.indexOf(u8, eph, "\"profile_kind\":\"ephemeral\"") == null)
+                fail("web_open did not report the ephemeral identity");
+            const eph_cookie = m.callTool("web_eval", "{\"code\":\"document.cookie\"}");
+            if (std.mem.indexOf(u8, eph_cookie, "smoke=inprofile") != null)
+                fail("a profile's cookie leaked into an ephemeral identity");
+            const eph_closed = m.callTool("web_close", "{}");
+            if (std.mem.indexOf(u8, eph_closed, "\"profile_released\":true") == null)
+                fail("closing the last ephemeral view did not destroy its identity");
+
+            // Reset is refused while the profile is open...
+            const busy = m.callTool("web_profile_reset", "{\"profile\":\"smoke\"}");
+            if (std.mem.indexOf(u8, busy, "\"code\":\"conflict\"") == null)
+                fail("web_profile_reset erased a profile that was in use");
+        }
+    }
+
     m.closeStdinWait();
     // Ephemeral teardown must have reaped the helper's instance dir.
     if (fileExists(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}", .{ rt, m.pid }) catch unreachable))
         fail("instance dir (with the web helper's socket) survived teardown");
+    // ...but the DURABLE store outlives it: that is the whole point.
+    if (jar_id.len > 0) {
+        var jar_path_buf: [1024]u8 = undefined;
+        const jar = std.fmt.bufPrint(&jar_path_buf, "{s}/sketerm/web-profiles/anon/profile-smoke-{s}", .{ rt, jar_id }) catch unreachable;
+        if (!fileExists(jar)) fail("the profile store did not survive the MCP server it was created by");
+
+        // A WHOLE NEW SERVER, a whole new browser process: the cookie
+        // is still there. Only the durable path can do this.
+        var restarted = Mcp.spawn(allocator, exe, &.{});
+        restarted.initialize();
+        restarted.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"smoke\"}}", .{origin}) catch unreachable);
+        if (std.mem.indexOf(u8, restarted.recvLine(60_000), "isError") != null)
+            fail("a restarted MCP server could not reopen the profile");
+        const survived = restarted.callTool("web_eval", "{\"code\":\"document.cookie\"}");
+        if (std.mem.indexOf(u8, survived, "smoke=inprofile") == null)
+            fail("the profile's cookie did not survive an MCP server restart");
+
+        // Reset, then a fresh jar: a NEW id, and no cookie.
+        _ = restarted.callTool("web_close", "{}");
+        const reset = restarted.callTool("web_profile_reset", "{\"profile\":\"smoke\"}");
+        if (std.mem.indexOf(u8, reset, "\"deleted\":true") == null)
+            fail("web_profile_reset did not erase the freed profile");
+        if (fileExists(jar)) fail("web_profile_reset left the old jar directory behind");
+        restarted.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"smoke\"}}", .{origin}) catch unreachable);
+        if (std.mem.indexOf(u8, restarted.recvLine(60_000), "isError") != null)
+            fail("could not reopen the profile after a reset");
+        const empty = restarted.callTool("web_eval", "{\"code\":\"document.cookie\"}");
+        if (std.mem.indexOf(u8, empty, "smoke=inprofile") != null)
+            fail("a reset profile still serves its old cookies");
+        const relisted = restarted.callTool("web_profiles", "{}");
+        const row = std.mem.indexOf(u8, relisted, "\"name\":\"smoke\"") orelse
+            fail("web_profiles lost the profile after a reset + reopen");
+        var old_buf: [64]u8 = undefined;
+        const old_ctx = std.fmt.bufPrint(&old_buf, "\"context\":{s},", .{jar_id}) catch unreachable;
+        if (std.mem.indexOf(u8, relisted[row..], old_ctx) != null)
+            fail("a reset profile kept its old context id (its jar path would be the old one)");
+        restarted.closeStdinWait();
+    }
 
     // Suppress only the capability advertisement to emulate an older
     // helper: the MCP adapter must choose sem_read and keep JSON-shaped
@@ -2224,6 +2441,19 @@ fn listSessionsRaw(allocator: std.mem.Allocator, sock: []const u8, buf: []u8) []
     const n = @min(frame.payload.len, buf.len);
     @memcpy(buf[0..n], frame.payload[0..n]);
     return buf[0..n];
+}
+
+/// Append one line to `$SKETERM_FAKE_WEB_FRAMES`, the fake helper's
+/// record of what the client actually put on the wire. Context
+/// publication has no ack, so the FRAMES are the only evidence that the
+/// right id was sent, in the right order, to the right helper.
+fn fakeFrameLog(comptime fmt: []const u8, args: anytype) void {
+    const path = c.getenv("SKETERM_FAKE_WEB_FRAMES") orelse return;
+    const f = c.fopen(path, "a") orelse return;
+    defer _ = c.fclose(f);
+    var line: [4096]u8 = undefined;
+    const s = std.fmt.bufPrint(&line, fmt, args) catch return;
+    _ = c.fwrite(s.ptr, 1, s.len, f);
 }
 
 /// A minimal `sketerm-webengine` stand-in speaking protocol v1: dumps
@@ -2274,29 +2504,56 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
             out.clearRetainingCapacity();
             switch (frame.tag) {
                 .hello => {
+                    // Identity contexts are OPT-IN here: the default
+                    // fake is an old helper, which is exactly what the
+                    // fail-closed regression guard needs.
+                    const with_contexts = c.getenv("SKETERM_FAKE_WEB_CONTEXTS") != null;
+                    const base = [_][]const u8{ webproto.CAP_FRAMES_SHM, webproto.CAP_SEMANTIC, webproto.CAP_VIEW_CREATE_URL };
+                    const ctx = base ++ [_][]const u8{ webproto.CAP_CONTEXTS, webproto.CAP_CONTEXTS_FAIL_CLOSED };
+                    const caps: []const []const u8 = if (with_contexts) &ctx else &base;
                     webproto.encode(allocator, &out, webproto.HelloAck{
                         .proto = webproto.PROTO_VERSION,
                         .engine_name = "fake",
                         .engine_version = "0",
-                        .caps = &.{ webproto.CAP_FRAMES_SHM, webproto.CAP_SEMANTIC, webproto.CAP_VIEW_CREATE_URL },
+                        .caps = caps,
                     }) catch return 1;
+                },
+                .context_create => {
+                    const req = webproto.decode(webproto.ContextCreate, frame.payload) catch return 1;
+                    fakeFrameLog("context_create id={d} ephemeral={d} name={s}\n", .{ req.id, req.ephemeral, req.name });
+                },
+                .context_destroy => {
+                    const req = webproto.decode(webproto.ContextDestroy, frame.payload) catch return 1;
+                    fakeFrameLog("context_destroy id={d}\n", .{req.id});
                 },
                 .view_create_url => {
                     const req = webproto.decode(webproto.ViewCreateUrl, frame.payload) catch return 1;
-                    url_len = @min(req.url.len, url_buf.len);
-                    @memcpy(url_buf[0..url_len], req.url[0..url_len]);
-                    webproto.encode(allocator, &out, webproto.EvNavState{
-                        .view = req.view,
-                        .can_back = 0,
-                        .can_fwd = 0,
-                        .loading = 0,
-                        .url = url_buf[0..url_len],
-                    }) catch return 1;
-                    webproto.encode(allocator, &out, webproto.EvLoad{
-                        .view = req.view,
-                        .state = @intFromEnum(webproto.LoadState.finished),
-                        .url = url_buf[0..url_len],
-                    }) catch return 1;
+                    fakeFrameLog("view_create_url view={d} context={d}\n", .{ req.view, req.context });
+                    // The one negative signal a context request has:
+                    // the view never comes up, and the client must
+                    // report that instead of navigating anywhere.
+                    if (req.context != 0 and c.getenv("SKETERM_FAKE_WEB_CONTEXT_FAIL") != null) {
+                        webproto.encode(allocator, &out, webproto.EvViewCreateFailed{
+                            .view = req.view,
+                            .context = req.context,
+                            .reason = "requested browser context does not exist",
+                        }) catch return 1;
+                    } else {
+                        url_len = @min(req.url.len, url_buf.len);
+                        @memcpy(url_buf[0..url_len], req.url[0..url_len]);
+                        webproto.encode(allocator, &out, webproto.EvNavState{
+                            .view = req.view,
+                            .can_back = 0,
+                            .can_fwd = 0,
+                            .loading = 0,
+                            .url = url_buf[0..url_len],
+                        }) catch return 1;
+                        webproto.encode(allocator, &out, webproto.EvLoad{
+                            .view = req.view,
+                            .state = @intFromEnum(webproto.LoadState.finished),
+                            .url = url_buf[0..url_len],
+                        }) catch return 1;
+                    }
                 },
                 .sem_snapshot_req => {
                     const req = webproto.decode(webproto.SemSnapshotReq, frame.payload) catch return 1;
@@ -2432,6 +2689,208 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
         const pj = readSmall(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable, &file_buf);
         if (std.mem.indexOf(u8, pj, "\"session\"") != null)
             fail("opt-out still advertised a session in web.json");
+        m.closeStdinWait();
+    }
+}
+
+/// CEF-free proof of the headless PROFILE lane. The fake helper stands
+/// in for sketerm-webengine, so this runs everywhere and guards the
+/// parts a real-CEF stage cannot see: the exact frames the client puts
+/// on the wire, and what happens with a helper that lacks the caps.
+///
+/// Must run with the same `SKETERM_WEB_BIN`/`SKETERM_FAKE_WEBENGINE`
+/// setup `webSessionFakeStage` establishes.
+fn webProfileFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var self_buf: [4096:0]u8 = undefined;
+    const self_len = c.readlink("/proc/self/exe", &self_buf, self_buf.len - 1);
+    if (self_len <= 0) fail("cannot resolve the smoke binary path");
+    self_buf[@intCast(self_len)] = 0;
+    _ = c.setenv("SKETERM_WEB_BIN", &self_buf, 1);
+    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    _ = c.setenv("SKETERM_FAKE_WEBENGINE", "1", 1);
+    defer _ = c.unsetenv("SKETERM_FAKE_WEBENGINE");
+    // A session would add a Wayland compositor to every spawn here and
+    // proves nothing about profiles.
+    _ = c.setenv("SKETERM_WEB_SESSION", "0", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_SESSION");
+
+    var probe_buf: [512]u8 = undefined;
+    var file_buf: [64 * 1024]u8 = undefined;
+
+    // (a) The fail-closed regression guard: an old helper (no context
+    // caps) must REFUSE a profile and leave ZERO views behind. A
+    // fallback to the shared jar would look like success here.
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"profile\":\"work\"}");
+        const refused = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, refused, "\"isError\":true") == null or
+            std.mem.indexOf(u8, refused, "\"code\":\"unavailable\"") == null)
+            fail("a helper without the context caps did not refuse a profile");
+        if (std.mem.indexOf(u8, refused, "no fallback to the shared cookie jar") == null)
+            fail("the profile refusal does not state that nothing was opened");
+        const tabs = m.callTool("web_tabs", "{}");
+        if (std.mem.indexOf(u8, tabs, "\"count\":0") == null)
+            fail("a refused profile still minted a view (the fail-closed regression)");
+        // The same server must still open a NORMAL view: only the
+        // profile is unavailable, not the browser.
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/plain\"}");
+        if (std.mem.indexOf(u8, m.recvLine(60_000), "\"isError\":true") != null)
+            fail("a capless helper refused a plain web_open too");
+        // profile+ephemeral together is a caller error, not a helper one.
+        const both = m.callTool("web_open", "{\"profile\":\"work\",\"ephemeral\":true}");
+        if (std.mem.indexOf(u8, both, "\"code\":\"invalid_args\"") == null)
+            fail("web_open accepted 'profile' and ephemeral:true together");
+        m.closeStdinWait();
+    }
+
+    _ = c.setenv("SKETERM_FAKE_WEB_CONTEXTS", "1", 1);
+    defer _ = c.unsetenv("SKETERM_FAKE_WEB_CONTEXTS");
+    var frames_buf: [512]u8 = undefined;
+    const frames = std.fmt.bufPrintZ(&frames_buf, "{s}/fake-web-frames.txt", .{rt}) catch unreachable;
+    _ = c.unlink(frames.ptr);
+    _ = c.setenv("SKETERM_FAKE_WEB_FRAMES", frames.ptr, 1);
+    defer _ = c.unsetenv("SKETERM_FAKE_WEB_FRAMES");
+
+    // (b) With the caps, the context is published BEFORE the view that
+    // names it, the id is persisted, and a WHOLE MCP RESTART re-sends
+    // the SAME id — which is the only reason a profile's cookies are
+    // still there afterwards.
+    var first_id_buf: [32]u8 = undefined;
+    var first_id: []const u8 = "";
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"profile\":\"work\"}");
+        const opened = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, opened, "\"isError\":true") != null)
+            fail("web_open with a profile failed against the context-capable fake");
+        if (std.mem.indexOf(u8, opened, "\"profile\":\"work\"") == null or
+            std.mem.indexOf(u8, opened, "\"profile_kind\":\"named\"") == null)
+            fail("web_open did not report the identity its view lives in");
+
+        const log = readSmall(frames, &file_buf);
+        const cc = std.mem.indexOf(u8, log, "context_create id=") orelse
+            fail("no context_create reached the helper");
+        const vc = std.mem.indexOf(u8, log, "view_create_url view=") orelse
+            fail("no view_create_url reached the helper");
+        // Frame ORDER is the whole contract: context_create has no ack.
+        if (cc > vc) fail("the view was created before its identity context");
+        if (std.mem.indexOf(u8, log, "ephemeral=0 name=profile-work") == null)
+            fail("the published context is not the named persistent one");
+        const id_start = cc + "context_create id=".len;
+        const id_end = std.mem.indexOfScalar(u8, log[id_start..], ' ') orelse fail("malformed frame log");
+        first_id = std.fmt.bufPrint(&first_id_buf, "{s}", .{log[id_start .. id_start + id_end]}) catch unreachable;
+        // The view really carries that context, not 0 (the shared jar).
+        if (std.mem.indexOf(u8, log[vc..], "context=0\n") != null)
+            fail("the profile view was created in the SHARED default jar");
+
+        // The store is where the docs say it is, and holds that id.
+        const store = std.fmt.bufPrint(&probe_buf, "{s}/sketerm/web-profiles/anon/profiles.json", .{rt}) catch unreachable;
+        const json = readSmall(store, &file_buf);
+        if (std.mem.indexOf(u8, json, "\"name\":\"work\"") == null)
+            fail("the profile was not persisted to profiles.json");
+
+        const listed = m.callTool("web_profiles", "{}");
+        if (std.mem.indexOf(u8, listed, "\"name\":\"work\"") == null or
+            std.mem.indexOf(u8, listed, "\"contexts_supported\":true") == null)
+            fail("web_profiles does not list the profile it just opened");
+        if (std.mem.indexOf(u8, listed, "web-profiles/anon") == null)
+            fail("web_profiles does not report where the storage lives");
+
+        // capabilities is the discoverability half of fail-closed.
+        const caps = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, caps, "\"web_profiles\":true") == null or
+            std.mem.indexOf(u8, caps, "\"web_profile_store\":") == null)
+            fail("capabilities does not advertise browser profiles");
+
+        // (e) web_close removes the view and RE-HOMES current.
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/second\"}");
+        _ = m.recvLine(60_000);
+        const closed = m.callTool("web_close", "{}");
+        if (std.mem.indexOf(u8, closed, "\"closed\":2") == null or
+            std.mem.indexOf(u8, closed, "\"current\":1") == null)
+            fail("web_close did not close the current view and re-home 'current'");
+        const after = m.callTool("web_tabs", "{}");
+        if (std.mem.indexOf(u8, after, "\"count\":1") == null or
+            std.mem.indexOf(u8, after, "\"view\":2") != null)
+            fail("the closed view is still listed");
+        m.closeStdinWait();
+    }
+
+    // The restart half of (b): a brand-new server, a brand-new helper,
+    // and the SAME persisted id back on the wire.
+    {
+        _ = c.unlink(frames.ptr);
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"profile\":\"work\"}");
+        if (std.mem.indexOf(u8, m.recvLine(60_000), "\"isError\":true") != null)
+            fail("the restarted server could not reopen the profile");
+        const log = readSmall(frames, &file_buf);
+        var want_buf: [64]u8 = undefined;
+        const want = std.fmt.bufPrint(&want_buf, "context_create id={s} ephemeral=0 name=profile-work", .{first_id}) catch unreachable;
+        if (std.mem.indexOf(u8, log, want) == null)
+            fail("a restarted MCP server minted a NEW context id for the same profile (its jar would be empty)");
+
+        // Reset is refused while a view uses it, and works once free.
+        const busy = m.callTool("web_profile_reset", "{\"profile\":\"work\"}");
+        if (std.mem.indexOf(u8, busy, "\"code\":\"conflict\"") == null)
+            fail("web_profile_reset erased a profile that was in use");
+        _ = m.callTool("web_close", "{}");
+        const reset = m.callTool("web_profile_reset", "{\"profile\":\"work\"}");
+        if (std.mem.indexOf(u8, reset, "\"deleted\":true") == null)
+            fail("web_profile_reset did not erase the freed profile");
+        const gone = m.callTool("web_profile_reset", "{\"profile\":\"work\"}");
+        if (std.mem.indexOf(u8, gone, "\"code\":\"not_found\"") == null)
+            fail("resetting an unknown profile is not a not_found");
+        m.closeStdinWait();
+    }
+
+    // (d) Two servers, one instance key: the second cannot take the
+    // store, says who has it, and still browses without a profile.
+    {
+        var owner = Mcp.spawn(allocator, exe, &.{});
+        owner.initialize();
+        owner.sendTool("web_open", "{\"url\":\"https://smoke.invalid/owner\",\"profile\":\"work\"}");
+        if (std.mem.indexOf(u8, owner.recvLine(60_000), "\"isError\":true") != null)
+            fail("the store owner could not open its profile");
+
+        var second = Mcp.spawn(allocator, exe, &.{});
+        second.initialize();
+        second.sendTool("web_open", "{\"url\":\"https://smoke.invalid/second\",\"profile\":\"work\"}");
+        const refused = second.recvLine(60_000);
+        if (std.mem.indexOf(u8, refused, "\"isError\":true") == null)
+            fail("a second MCP server shared the browser profile store");
+        if (std.mem.indexOf(u8, refused, "owns the browser profile store") == null or
+            std.mem.indexOf(u8, refused, "--name") == null)
+            fail("the store-lock refusal does not name the owner or the way out");
+        second.sendTool("web_open", "{\"url\":\"https://smoke.invalid/plain\"}");
+        if (std.mem.indexOf(u8, second.recvLine(60_000), "\"isError\":true") != null)
+            fail("a locked-out server lost its ordinary web tools too");
+        second.closeStdinWait();
+        owner.closeStdinWait();
+    }
+
+    // (c) The helper answers ev_view_create_failed: the ONLY negative
+    // signal a context request has. Nothing may be left behind, and
+    // nothing may have been loaded in the shared jar.
+    {
+        _ = c.setenv("SKETERM_FAKE_WEB_CONTEXT_FAIL", "1", 1);
+        defer _ = c.unsetenv("SKETERM_FAKE_WEB_CONTEXT_FAIL");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"profile\":\"fails\"}");
+        const failed = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, failed, "\"isError\":true") == null or
+            std.mem.indexOf(u8, failed, "refused the identity context") == null)
+            fail("a helper-refused context did not surface as an error");
+        if (std.mem.indexOf(u8, failed, "NO page was loaded in the shared cookie jar") == null)
+            fail("the context-refusal error does not say the shared jar was untouched");
+        const tabs = m.callTool("web_tabs", "{}");
+        if (std.mem.indexOf(u8, tabs, "\"count\":0") == null)
+            fail("the view survived its context's refusal");
         m.closeStdinWait();
     }
 }

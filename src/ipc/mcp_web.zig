@@ -125,6 +125,26 @@ pub fn sessionInfo() ?[]const u8 {
     return null;
 }
 
+/// What `capabilities` reports about named browsing profiles. Never
+/// spawns the helper: the store alone answers before one exists, and a
+/// helper without the context caps answers for itself once it does.
+pub fn profileCapability(arena: std.mem.Allocator) struct {
+    available: bool,
+    store: []const u8,
+    reason: []const u8,
+} {
+    if (mcp.guiSocketAttached())
+        return .{ .available = false, .store = "", .reason = GUI_PROFILE_REFUSAL };
+    const e = headlessEngine() orelse
+        return .{ .available = false, .store = "", .reason = "this server has no headless browser backend configured" };
+    const store = e.profileStorePath() orelse "";
+    return .{
+        .available = e.profilesAvailable(),
+        .store = arena.dupe(u8, store) catch "",
+        .reason = e.profileUnavailableReason(),
+    };
+}
+
 /// Kill and reap the owned helper; part of server teardown (stdin EOF
 /// and SIGTERM both).
 pub fn shutdownHeadless() void {
@@ -171,6 +191,17 @@ const View = struct {
     /// is false before the requested navigation starts as well as after
     /// it ends.
     load_seq: u32 = 0,
+    /// Named persistent profile the view lives in; empty otherwise.
+    /// Headless only — the GUI's identity containers are the user's own
+    /// and are not reported through these tools yet.
+    profile: []const u8 = "",
+    /// "default" (the shared jar), "named" or "ephemeral".
+    profile_kind: []const u8 = "default",
+    /// Engine identity-context id; 0 = the shared default jar.
+    context: u32 = 0,
+    /// Set when the helper refused to create the view because its
+    /// identity context was unavailable.
+    create_failed: []const u8 = "",
 };
 
 const Views = struct {
@@ -325,6 +356,15 @@ fn listViews(drv: Driver, arena: std.mem.Allocator) !?Views {
                     .focused = v.id == e.current,
                     .visible = false,
                     .load_seq = v.load_seq,
+                    .profile = if (v.profile) |p| try arena.dupe(u8, p) else "",
+                    .profile_kind = if (v.ephemeral_ctx)
+                        "ephemeral"
+                    else if (v.profile != null)
+                        "named"
+                    else
+                        "default",
+                    .context = v.context,
+                    .create_failed = if (v.create_failed) |f| try arena.dupe(u8, f) else "",
                 });
             }
             return Views{
@@ -535,7 +575,41 @@ fn runOpGui(backend: mcp.Backend, arena: std.mem.Allocator, pane: u32, op: Op, b
 
 const OpenOutcome = union(enum) { opened: u32, err: Fail };
 
-fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16) !OpenOutcome {
+/// The GUI has its own identity containers — user-visible, coloured,
+/// named things in the browser UI. Minting one from an MCP call would
+/// surprise the person looking at the window, so profiles stay a
+/// headless-only feature and say so.
+const GUI_PROFILE_REFUSAL =
+    "a sketerm GUI is attached, so web_open drives the user's real tabs; named profiles are a headless-only feature (the GUI has its own identity containers, which the user owns). Run this MCP server without --shared/--socket to get profiles.";
+
+/// THE profile-error vocabulary: every `webdrive.ProfileError` with the
+/// sentence a caller reads and the typed code the result carries.
+fn profileFail(arena: std.mem.Allocator, e: *webdrive.Engine, name: []const u8, err: anyerror) !Fail {
+    return switch (err) {
+        error.ContextsUnsupported => fail(.unavailable, "this browser helper does not advertise isolated identity contexts (capabilities 'contexts' + 'contexts-fail-closed'), so a profile cannot be isolated. Nothing was opened: there is deliberately no fallback to the shared cookie jar."),
+        error.StoreUnavailable => fail(.unavailable, try std.fmt.allocPrint(
+            arena,
+            "browser profiles are unavailable: {s}",
+            .{if (e.store_reason.len > 0) e.store_reason else "the profile store could not be opened"},
+        )),
+        error.InvalidName => fail(.invalid_args, try std.fmt.allocPrint(
+            arena,
+            "'{s}' is not a usable profile name: use 1-64 characters of a-z, 0-9, '_' or '-' ('default' and 'none' are reserved)",
+            .{name},
+        )),
+        error.NoProfile => fail(.not_found, try std.fmt.allocPrint(
+            arena,
+            "no profile named '{s}' (web_profiles lists them)",
+            .{name},
+        )),
+        error.InUse => fail(.conflict, ""), // the caller names the views
+        error.StoreIo => fail(.io_failed, "the browser profile store could not be written (check permissions on XDG_STATE_HOME/sketerm)"),
+        else => headlessFail(arena, e, err),
+    };
+}
+
+fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec) !OpenOutcome {
+    if (drv == .gui and spec != .default) return .{ .err = fail(.invalid_args, GUI_PROFILE_REFUSAL) };
     switch (drv) {
         .gui => |backend| {
             const opened = mcp.ipcParsed(arena, backend, .{
@@ -552,8 +626,10 @@ fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []co
             return .{ .opened = @intCast(if (pv == .integer) pv.integer else 0) };
         },
         .headless => |e| {
-            const v = e.openView(url orelse "", w, h) catch |err|
-                return .{ .err = try headlessFail(arena, e, err) };
+            const v = e.openViewIn(url orelse "", w, h, spec) catch |err| {
+                const name: []const u8 = if (spec == .named) spec.named else "";
+                return .{ .err = try profileFail(arena, e, name, err) };
+            };
             return .{ .opened = v.id };
         },
     }
@@ -762,6 +838,13 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
         try std.json.Stringify.value(v.title, .{}, w);
         try w.print(",\"loading\":{},\"can_back\":{},\"can_fwd\":{}", .{ v.loading, v.can_back, v.can_fwd });
         if (mode == .gui) try w.print(",\"focused\":{},\"visible\":{}", .{ v.focused, v.visible });
+        // GUI mode omits both: its containers are the user's own, and
+        // `web-list` does not report them (yet).
+        if (mode == .headless) {
+            try w.writeAll(",\"profile\":");
+            try std.json.Stringify.value(v.profile, .{}, w);
+            try w.print(",\"profile_kind\":\"{s}\",\"context\":{d}", .{ v.profile_kind, v.context });
+        }
         try w.print(",\"current\":{}}}", .{v.focused});
     }
     try w.writeAll("]");
@@ -774,7 +857,7 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
     for (vs.views) |v| {
         const title = try clip(arena, v.title, TITLE_MAX);
         const url = try clip(arena, v.url, URL_MAX);
-        try res.textf("{s} {s} {d}: {s}{s}{s}{s}{s}", .{
+        try res.textf("{s} {s} {d}: {s}{s}{s}{s}{s}{s}{s}{s}", .{
             if (v.focused) "*" else " ",
             handleKey(mode),
             v.pane,
@@ -783,6 +866,11 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             if (title.len > 0) "\" - " else "",
             if (url.len > 0) url else "(blank document)",
             if (v.loading) " (loading)" else "",
+            // Only when the view is NOT in the shared jar: the default
+            // is the overwhelming case and needs no word per line.
+            if (v.profile.len > 0) " [profile " else if (std.mem.eql(u8, v.profile_kind, "ephemeral")) " [ephemeral identity]" else "",
+            if (v.profile.len > 0) v.profile else "",
+            if (v.profile.len > 0) "]" else "",
         });
     }
     if (vs.views.len > 0) try res.text("* = the view a web_* call with no 'pane' addresses");
@@ -804,6 +892,15 @@ fn openResult(
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
+    if (mode == .headless) {
+        try res.fact("profile", v.profile);
+        try res.fact("profile_kind", v.profile_kind);
+        try res.fact("context", v.context);
+        if (v.profile.len > 0)
+            try res.textf("profile: {s} (its own cookie jar; logins here survive web_close and MCP restarts)", .{v.profile})
+        else if (std.mem.eql(u8, v.profile_kind, "ephemeral"))
+            try res.text("profile: a fresh throwaway identity, destroyed with this view");
+    }
     try res.field("settled", settled);
     if (!settled)
         try res.text("the page had not finished loading inside the timeout; this describes the view at that moment - call web_snapshot for the settled page");
@@ -823,6 +920,91 @@ fn openResult(
         try section(&res, "snapshot", s.tree);
         try res.text(TRUST_LINE);
     }
+    return res.finish();
+}
+
+fn closeResult(
+    arena: std.mem.Allocator,
+    mode: Mode,
+    closed: u32,
+    remaining: usize,
+    current: u32,
+    profile: []const u8,
+    profile_released: bool,
+) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try res.fact("backend", @tagName(mode));
+    try res.fact("closed", closed);
+    try res.fact("remaining", remaining);
+    try res.fact("current", current);
+    if (profile.len > 0) try res.fact("profile", profile);
+    try res.fact("profile_released", profile_released);
+    try res.textf("closed {s} {d}; {d} left", .{ handleKey(mode), closed, remaining });
+    if (current != 0)
+        try res.textf("a web_* call with no '{s}' now addresses {s} {d}", .{ handleKey(mode), handleKey(mode), current })
+    else
+        try res.text("no web views are left; web_open makes one");
+    if (profile.len > 0)
+        try res.textf("profile '{s}' keeps its storage (web_profile_reset erases it)", .{profile});
+    if (profile_released)
+        try res.text("its throwaway identity went with it: cookies, storage and cache are gone");
+    return res.finish();
+}
+
+/// One profile as `web_profiles` reports it. Kept as its own shape so
+/// the builder is pure — no engine, no store, no helper.
+const ProfileRow = struct {
+    name: []const u8,
+    context: u32,
+    views: u32,
+    last_used_ms: i64,
+    live: bool,
+};
+
+fn profilesResult(
+    arena: std.mem.Allocator,
+    rows: []const ProfileRow,
+    store: []const u8,
+    contexts_supported: bool,
+    unavailable_reason: []const u8,
+) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("[");
+    for (rows, 0..) |p, i| {
+        if (i != 0) try w.writeAll(",");
+        try w.writeAll("{\"name\":");
+        try std.json.Stringify.value(p.name, .{}, w);
+        try w.print(",\"context\":{d},\"views\":{d},\"last_used_ms\":{d},\"live\":{}}}", .{
+            p.context, p.views, p.last_used_ms, p.live,
+        });
+    }
+    try w.writeAll("]");
+    try res.raw("profiles", aw.written());
+    if (store.len > 0) try res.fact("store", store);
+    try res.fact("contexts_supported", contexts_supported);
+    if (unavailable_reason.len > 0) try res.fact("unavailable_reason", unavailable_reason);
+
+    if (rows.len == 0)
+        try res.text("no browser profiles yet: web_open with profile:\"name\" creates one")
+    else
+        try res.textf("{d} browser profiles", .{rows.len});
+    for (rows) |p| {
+        try res.textf("{s}: {d} open views{s}", .{ p.name, p.views, if (p.live) ", live in the running browser" else "" });
+    }
+    if (store.len > 0) try res.textf("stored in {s}", .{store});
+    if (unavailable_reason.len > 0) try res.text(unavailable_reason);
+    return res.finish();
+}
+
+fn profileResetResult(arena: std.mem.Allocator, profile: []const u8, retired: u32) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try res.fact("profile", profile);
+    try res.fact("deleted", true);
+    try res.fact("retired_context", retired);
+    try res.textf("erased profile '{s}': cookies, logins and cache are gone", .{profile});
+    try res.text("the name stays usable; the next web_open with it starts from an empty, freshly allocated jar");
     return res.finish();
 }
 
@@ -1224,7 +1406,20 @@ pub fn webTool(
         const where = mcp.argStr(args, "where") orelse "tab";
         const vw: u16 = @intCast(std.math.clamp(mcp.argInt(args, "width") orelse webdrive.DEFAULT_W, 320, 3840));
         const vh: u16 = @intCast(std.math.clamp(mcp.argInt(args, "height") orelse webdrive.DEFAULT_H, 240, 2160));
-        const new_handle: u32 = switch (try openView(drv, arena, url, where, vw, vh)) {
+        const profile = mcp.argStr(args, "profile");
+        const want_ephemeral = mcp.argBool(args, "ephemeral");
+        // The two are opposite answers to the same question ("which
+        // identity"); guessing one would be guessing whether the caller
+        // wanted the cookies kept.
+        if (profile != null and want_ephemeral)
+            return mcp.errRes(arena, .invalid_args, "web_open takes either 'profile' (a named persistent identity) or ephemeral:true (a throwaway one), not both");
+        const spec: webdrive.ProfileSpec = if (profile) |p|
+            .{ .named = p }
+        else if (want_ephemeral)
+            .ephemeral
+        else
+            .default;
+        const new_handle: u32 = switch (try openView(drv, arena, url, where, vw, vh, spec)) {
             .err => |e| return failRes(arena, e),
             .opened => |p| p,
         };
@@ -1244,6 +1439,22 @@ pub fn webTool(
             if (try listViews(drv, arena)) |vs| {
                 if (viewFor(vs, new_handle)) |found| {
                     v = found;
+                    // The helper refused the identity context. There is
+                    // no ack for context_create, so this event is the
+                    // ONLY way that failure becomes visible — and the
+                    // view must go, un-navigated, rather than fall back
+                    // into the shared jar.
+                    if (found.create_failed.len > 0) {
+                        if (drv == .headless) drv.headless.closeView(new_handle);
+                        return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(
+                            arena,
+                            "the browser helper refused the identity context for {s} ({s}); nothing was opened and NO page was loaded in the shared cookie jar",
+                            .{
+                                if (profile) |p| try std.fmt.allocPrint(arena, "profile '{s}'", .{p}) else "the requested throwaway identity",
+                                found.create_failed,
+                            },
+                        ));
+                    }
                     // A view created blank has load_seq 0 to start
                     // with; anything it has already finished by the
                     // first poll is a load this call caused.
@@ -1287,6 +1498,13 @@ pub fn webTool(
             snap_err,
         );
     }
+
+    // web_close resolves its own handle (it must answer for a view it
+    // is about to remove), and the profile tools work with zero views —
+    // both therefore sit ABOVE the "addresses an existing view" cut.
+    if (eql(u8, name, "web_close")) return closeTool(drv, arena, views, handle_u);
+    if (eql(u8, name, "web_profiles")) return profilesTool(drv, arena);
+    if (eql(u8, name, "web_profile_reset")) return profileResetTool(drv, arena, args);
 
     // Everything below addresses an existing view.
     const vs = views orelse return helperErr(drv, arena, views);
@@ -1544,6 +1762,73 @@ pub fn webTool(
     }
 
     return mcp.errRes(arena, .unknown_tool, "unknown web tool");
+}
+
+/// Close one web view. GUI-attached this is the user's PANE, which is
+/// exactly what `close_pane` does — the GUI handle IS the pane id, and
+/// the GUI grants no page-granular close verb yet.
+fn closeTool(drv: Driver, arena: std.mem.Allocator, views: ?Views, handle: ?u32) ![]const u8 {
+    const vs = views orelse return helperErr(drv, arena, views);
+    const view = viewFor(vs, handle) orelse return helperErr(drv, arena, views);
+    switch (drv) {
+        .gui => |backend| {
+            const reply = mcp.ipcParsed(arena, backend, .{
+                .cmd = "close-pane",
+                .pane = view.pane,
+            }) catch |e| return failRes(arena, try guiUnreachable(arena, e));
+            if (!reply.ok) return failRes(arena, fail(.failed, reply.err));
+            // The GUI owns what is focused afterwards; asking it again
+            // would race the pane teardown it just started.
+            return closeResult(arena, .gui, view.pane, if (vs.views.len > 0) vs.views.len - 1 else 0, 0, "", false);
+        },
+        .headless => |e| {
+            const released = view.profile.len == 0 and std.mem.eql(u8, view.profile_kind, "ephemeral");
+            const profile = try arena.dupe(u8, view.profile);
+            e.closeView(view.pane);
+            return closeResult(arena, .headless, view.pane, e.views.items.len, e.current, profile, released);
+        },
+    }
+}
+
+fn profilesTool(drv: Driver, arena: std.mem.Allocator) ![]const u8 {
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, GUI_PROFILE_REFUSAL),
+        .headless => |eng| eng,
+    };
+    const listed = try e.profileList(arena);
+    var rows = try arena.alloc(ProfileRow, listed.len);
+    for (listed, 0..) |p, i| rows[i] = .{
+        .name = p.name,
+        .context = p.id,
+        .views = p.views,
+        .last_used_ms = p.last_used_ms,
+        .live = p.live,
+    };
+    return profilesResult(
+        arena,
+        rows,
+        e.profileStorePath() orelse "",
+        e.profilesAvailable(),
+        e.profileUnavailableReason(),
+    );
+}
+
+fn profileResetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value) ![]const u8 {
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, GUI_PROFILE_REFUSAL),
+        .headless => |eng| eng,
+    };
+    const name = mcp.argStr(args, "profile") orelse
+        return mcp.errRes(arena, .invalid_args, "web_profile_reset needs 'profile' (web_profiles lists them)");
+    const retired = e.resetProfile(name) catch |err| {
+        if (err == error.InUse) return mcp.errRes(arena, .conflict, try std.fmt.allocPrint(
+            arena,
+            "profile '{s}' is in use by {d} open web view(s); close them with web_close first",
+            .{ name, e.profileViewCount(name) },
+        ));
+        return failRes(arena, try profileFail(arena, e, name, err));
+    };
+    return profileResetResult(arena, name, retired);
 }
 
 /// One eval that reports where the page is scrolled to, so "nothing
@@ -2269,6 +2554,202 @@ test "a helper failure carries its typed code, not just prose" {
     try t.expect(std.mem.indexOf(u8, res, "\"isError\":true") != null);
 }
 
+/// A GUI backend that would EXPLODE if anything actually talked to it:
+/// every assertion below is about a refusal that happens before the
+/// socket is reached.
+fn unusedBackend() mcp.Backend {
+    const S = struct {
+        var ctx: u8 = 0;
+        fn talk(_: *anyopaque, _: std.mem.Allocator, _: []const u8) anyerror![]u8 {
+            return error.TestUnexpectedResult;
+        }
+        fn talkFor(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: i64) mcp.DirectTalkResult {
+            return .{ .failure = .{ .err = error.TestUnexpectedResult, .delivery = .pre_delivery } };
+        }
+        fn sleepMs(_: *anyopaque, _: u32) void {}
+        fn nowMs(_: *anyopaque) i64 {
+            return 0;
+        }
+    };
+    return .{
+        .ctx = @ptrCast(&S.ctx),
+        .talk = S.talk,
+        .talkFor = S.talkFor,
+        .sleepMs = S.sleepMs,
+        .nowMs = S.nowMs,
+    };
+}
+
+test "a GUI-attached server refuses profiles before it opens anything" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    const drv = Driver{ .gui = unusedBackend() };
+    // Named AND ephemeral: both are identity requests the GUI's own
+    // containers already answer, so both are refused here.
+    for ([_]webdrive.ProfileSpec{ .{ .named = "work" }, .ephemeral }) |spec| {
+        const out = try openView(drv, arena, "https://example.com/", "tab", 800, 600, spec);
+        try t.expectEqual(mcp.ErrCode.invalid_args, out.err.code);
+        try t.expect(std.mem.indexOf(u8, out.err.text, "headless-only") != null);
+    }
+    // The default identity still goes through to the (exploding) GUI,
+    // proving the refusal is about the profile and nothing else.
+    const plain = try openView(drv, arena, "https://example.com/", "tab", 800, 600, .default);
+    try t.expectEqual(mcp.ErrCode.unavailable, plain.err.code);
+}
+
+test "the profile-error vocabulary types each refusal" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var engine = webdrive.Engine{
+        .gpa = arena,
+        .dir = @constCast(""),
+        .client_name = @constCast(""),
+        .store_reason = "another sketerm mcp process (pid 4242) owns the browser profile store",
+    };
+    // A helper without the caps is UNAVAILABLE, and the sentence has to
+    // say that nothing was opened — that is the fail-closed promise.
+    const caps = try profileFail(arena, &engine, "work", error.ContextsUnsupported);
+    try t.expectEqual(mcp.ErrCode.unavailable, caps.code);
+    try t.expect(std.mem.indexOf(u8, caps.text, "no fallback to the shared cookie jar") != null);
+
+    const locked = try profileFail(arena, &engine, "work", error.StoreUnavailable);
+    try t.expectEqual(mcp.ErrCode.unavailable, locked.code);
+    try t.expect(std.mem.indexOf(u8, locked.text, "pid 4242") != null);
+
+    const bad = try profileFail(arena, &engine, "Not A Name", error.InvalidName);
+    try t.expectEqual(mcp.ErrCode.invalid_args, bad.code);
+    try t.expect(std.mem.indexOf(u8, bad.text, "Not A Name") != null);
+
+    try t.expectEqual(mcp.ErrCode.not_found, (try profileFail(arena, &engine, "gone", error.NoProfile)).code);
+    try t.expectEqual(mcp.ErrCode.io_failed, (try profileFail(arena, &engine, "work", error.StoreIo)).code);
+    // Anything that is not a profile error still routes to the helper
+    // vocabulary rather than becoming a bare "failed".
+    try t.expectEqual(mcp.ErrCode.not_found, (try profileFail(arena, &engine, "", error.NoView)).code);
+}
+
+test "web_close / web_profiles / web_profile_reset result shapes" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    // A named profile's close keeps its storage and says so.
+    const named = try closeResult(arena, .headless, 3, 1, 2, "work", false);
+    const np = try mcp.expectToolResultShape(arena, "web_close", named);
+    const nsc = np.object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 3), nsc.get("closed").?.integer);
+    try t.expectEqual(@as(i64, 1), nsc.get("remaining").?.integer);
+    try t.expectEqual(@as(i64, 2), nsc.get("current").?.integer);
+    try t.expectEqualStrings("work", nsc.get("profile").?.string);
+    try t.expect(!nsc.get("profile_released").?.bool);
+    const ntext = np.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, ntext, "closed view 3; 1 left") != null);
+    try t.expect(std.mem.indexOf(u8, ntext, "keeps its storage") != null);
+
+    // The last ephemeral view takes its identity with it, and the reply
+    // states what a handle-less call now means (nothing).
+    const last = try closeResult(arena, .headless, 1, 0, 0, "", true);
+    const lp = try mcp.expectToolResultShape(arena, "web_close", last);
+    try t.expect(lp.object.get("structuredContent").?.object.get("profile_released").?.bool);
+    try t.expect(std.mem.indexOf(
+        u8,
+        lp.object.get("content").?.array.items[0].object.get("text").?.string,
+        "no web views are left",
+    ) != null);
+
+    const listed = try profilesResult(arena, &.{
+        .{ .name = "work", .context = 3, .views = 1, .last_used_ms = 1700, .live = true },
+        .{ .name = "shop", .context = 4, .views = 0, .last_used_ms = 1600, .live = false },
+    }, "/state/sketerm/web-profiles/anon", true, "");
+    const pp = try mcp.expectToolResultShape(arena, "web_profiles", listed);
+    const psc = pp.object.get("structuredContent").?.object;
+    try t.expect(psc.get("contexts_supported").?.bool);
+    try t.expectEqualStrings("/state/sketerm/web-profiles/anon", psc.get("store").?.string);
+    const rows = psc.get("profiles").?.array.items;
+    try t.expectEqual(@as(usize, 2), rows.len);
+    try t.expectEqualStrings("work", rows[0].object.get("name").?.string);
+    try t.expectEqual(@as(i64, 3), rows[0].object.get("context").?.integer);
+    try t.expect(rows[0].object.get("live").?.bool);
+    try t.expect(!rows[1].object.get("live").?.bool);
+    try t.expect(psc.get("unavailable_reason") == null);
+
+    // Unavailable is not an ERROR here: listing what exists still works,
+    // and the reason is what tells a caller why web_open would refuse.
+    const empty = try profilesResult(arena, &.{}, "", false, "this browser helper does not advertise isolated identity contexts");
+    const ep = try mcp.expectToolResultShape(arena, "web_profiles", empty);
+    try t.expect(!ep.object.get("structuredContent").?.object.get("contexts_supported").?.bool);
+    try t.expect(std.mem.indexOf(
+        u8,
+        ep.object.get("content").?.array.items[0].object.get("text").?.string,
+        "no browser profiles yet",
+    ) != null);
+
+    const reset = try profileResetResult(arena, "work", 3);
+    const rp = try mcp.expectToolResultShape(arena, "web_profile_reset", reset);
+    const rsc = rp.object.get("structuredContent").?.object;
+    try t.expect(rsc.get("deleted").?.bool);
+    try t.expectEqual(@as(i64, 3), rsc.get("retired_context").?.integer);
+    try t.expect(std.mem.indexOf(
+        u8,
+        rp.object.get("content").?.array.items[0].object.get("text").?.string,
+        "freshly allocated jar",
+    ) != null);
+}
+
+test "web_open and web_tabs carry the identity a view lives in" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var in_profile = EXAMPLE;
+    in_profile.profile = "work";
+    in_profile.profile_kind = "named";
+    in_profile.context = 3;
+    const opened = try openResult(arena, .headless, in_profile, true, false, null, null);
+    const op = try mcp.expectToolResultShape(arena, "web_open", opened);
+    const osc = op.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("work", osc.get("profile").?.string);
+    try t.expectEqualStrings("named", osc.get("profile_kind").?.string);
+    try t.expectEqual(@as(i64, 3), osc.get("context").?.integer);
+    try t.expect(std.mem.indexOf(
+        u8,
+        op.object.get("content").?.array.items[0].object.get("text").?.string,
+        "profile: work",
+    ) != null);
+
+    // The default jar spends no words and no keys beyond the honest ones.
+    const plain = try openResult(arena, .headless, EXAMPLE, true, false, null, null);
+    const psc = (try mcp.expectToolResultShape(arena, "web_open", plain)).object.get("structuredContent").?.object;
+    try t.expectEqualStrings("", psc.get("profile").?.string);
+    try t.expectEqualStrings("default", psc.get("profile_kind").?.string);
+    try t.expectEqual(@as(i64, 0), psc.get("context").?.integer);
+
+    const eph = View{ .pane = 5, .url = "https://x.test/", .profile_kind = "ephemeral", .context = 0x4000_0000 };
+    const tabs = try tabsResult(arena, .headless, .{ .views = &.{ in_profile, eph }, .helper = "ready" });
+    const tp = try mcp.expectToolResultShape(arena, "web_tabs", tabs);
+    const tviews = tp.object.get("structuredContent").?.object.get("views").?.array.items;
+    try t.expectEqualStrings("work", tviews[0].object.get("profile").?.string);
+    try t.expectEqualStrings("ephemeral", tviews[1].object.get("profile_kind").?.string);
+    const ttext = tp.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, ttext, "[profile work]") != null);
+    try t.expect(std.mem.indexOf(u8, ttext, "[ephemeral identity]") != null);
+
+    // GUI mode reports neither: its containers belong to the user and
+    // `web-list` does not describe them.
+    const gui = try tabsResult(arena, .gui, .{ .views = &.{in_profile}, .helper = "ready" });
+    const gviews = (try mcp.expectToolResultShape(arena, "web_tabs", gui))
+        .object.get("structuredContent").?.object.get("views").?.array.items;
+    try t.expect(gviews[0].object.get("profile") == null);
+    try t.expect(gviews[0].object.get("context") == null);
+}
+
 test "every tool this module serves declares an output schema" {
     // The dispatcher routes every web_* name here, so a tool added
     // without a schema fails here rather than silently shipping a
@@ -2283,5 +2764,5 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 13), seen);
+    try std.testing.expectEqual(@as(usize, 16), seen);
 }

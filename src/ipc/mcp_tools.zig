@@ -1322,7 +1322,7 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{}}
         ,
-        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"mode\":{\"type\":\"string\"},\"headless_gui\":{\"type\":\"boolean\"},\"gui_socket\":{\"type\":\"boolean\"},\"gui_socket_source\":{\"type\":\"string\"},\"headless_terminals\":{\"type\":\"boolean\"},\"transfers_and_forwards\":{\"type\":\"boolean\"},\"panels\":{\"type\":\"boolean\"},\"panels_store\":{\"type\":\"boolean\"},\"panel_store\":{\"type\":\"object\"},\"panel_transport\":{\"type\":\"object\"},\"ocr\":{\"type\":\"boolean\"},\"web_helper\":{\"type\":[\"string\",\"null\"]},\"web\":{\"type\":\"boolean\"},\"web_backend\":{\"type\":\"string\"},\"web_session\":{\"type\":\"string\"},\"ssh\":{\"type\":\"boolean\"},\"scp\":{\"type\":\"boolean\"},\"terminal_recordings\":{\"type\":[\"string\",\"null\"]},\"input_tuning\":{\"type\":\"object\"},\"tool_policy\":{\"type\":\"object\"},\"session_lifetime\":{\"type\":\"string\"},\"open_terms\":{\"type\":\"integer\"},\"open_apps\":{\"type\":\"integer\"},\"open_forwards\":{\"type\":\"integer\"}" ++ "},\"required\":[\"mode\",\"headless_gui\",\"gui_socket\",\"panels\",\"panels_store\",\"web\",\"web_backend\",\"tool_policy\",\"session_lifetime\"]}",
+        .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"mode\":{\"type\":\"string\"},\"headless_gui\":{\"type\":\"boolean\"},\"gui_socket\":{\"type\":\"boolean\"},\"gui_socket_source\":{\"type\":\"string\"},\"headless_terminals\":{\"type\":\"boolean\"},\"transfers_and_forwards\":{\"type\":\"boolean\"},\"panels\":{\"type\":\"boolean\"},\"panels_store\":{\"type\":\"boolean\"},\"panel_store\":{\"type\":\"object\"},\"panel_transport\":{\"type\":\"object\"},\"ocr\":{\"type\":\"boolean\"},\"web_helper\":{\"type\":[\"string\",\"null\"]},\"web\":{\"type\":\"boolean\"},\"web_backend\":{\"type\":\"string\"},\"web_session\":{\"type\":\"string\"},\"web_profiles\":{\"type\":\"boolean\"},\"web_profile_store\":{\"type\":\"string\"},\"ssh\":{\"type\":\"boolean\"},\"scp\":{\"type\":\"boolean\"},\"terminal_recordings\":{\"type\":[\"string\",\"null\"]},\"input_tuning\":{\"type\":\"object\"},\"tool_policy\":{\"type\":\"object\"},\"session_lifetime\":{\"type\":\"string\"},\"open_terms\":{\"type\":\"integer\"},\"open_apps\":{\"type\":\"integer\"},\"open_forwards\":{\"type\":\"integer\"}" ++ "},\"required\":[\"mode\",\"headless_gui\",\"gui_socket\",\"panels\",\"panels_store\",\"web\",\"web_backend\",\"tool_policy\",\"session_lifetime\"]}",
     },
 
     // ── browser: CDP automation ────────────────────────────────────
@@ -1337,7 +1337,7 @@ pub const TOOLS = [_]ToolDef{
         \\{"type":"object","properties":{}}
         ,
         .output_schema =
-        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"count":{"type":"integer"},"helper":{"type":"string","description":"Browser-helper state: ready, idle, unavailable"},"helper_reason":{"type":"string"},"views":{"type":"array","items":{"type":"object","properties":{"pane":{"type":"integer"},"view":{"type":"integer"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"can_back":{"type":"boolean"},"can_fwd":{"type":"boolean"},"focused":{"type":"boolean"},"visible":{"type":"boolean"},"current":{"type":"boolean"}},"required":["url","title","loading","current"]}}},"required":["backend","count","helper","views"]}
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"count":{"type":"integer"},"helper":{"type":"string","description":"Browser-helper state: ready, idle, unavailable"},"helper_reason":{"type":"string"},"views":{"type":"array","items":{"type":"object","properties":{"pane":{"type":"integer"},"view":{"type":"integer"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"can_back":{"type":"boolean"},"can_fwd":{"type":"boolean"},"focused":{"type":"boolean"},"visible":{"type":"boolean"},"profile":{"type":"string"},"profile_kind":{"type":"string","enum":["default","named","ephemeral"]},"context":{"type":"integer"},"current":{"type":"boolean"}},"required":["url","title","loading","current"]}}},"required":["backend","count","helper","views"]}
         ,
     },
     .{
@@ -1348,10 +1348,52 @@ pub const TOOLS = [_]ToolDef{
         \\Open a NEW web view and return its handle plus a FIRST SNAPSHOT of the requested page, once THAT navigation has settled. It never reuses or navigates an existing view — use web_navigate for that — and the new view becomes the default target of later web_* calls that omit 'pane'. Works with or WITHOUT a GUI: GUI-attached it opens a real tab the user sees (handle = pane id; where: "tab" default, "split", "window"); with no GUI it creates a headless view in the server's own browser engine (handle = view id; 'where' has no effect and width/height size the viewport, default 1280x800). Needs only the sketerm-webengine helper (capabilities reports web/web_backend). The snapshot is for finding things to ACT on; web_read gives the article text for a fraction of the tokens.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"url":{"type":"string","description":"Address to open; omit for a blank tab"},"where":{"type":"string","enum":["tab","split","window"]},"width":{"type":"integer","description":"Headless viewport width, default 1280 (ignored with a GUI)"},"height":{"type":"integer","description":"Headless viewport height, default 800 (ignored with a GUI)"},"timeout_ms":{"type":"integer","description":"Budget for the load to settle, default 20000"}}}
+        \\{"type":"object","properties":{"url":{"type":"string","description":"Address to open; omit for a blank tab"},"where":{"type":"string","enum":["tab","split","window"]},"width":{"type":"integer","description":"Headless viewport width, default 1280 (ignored with a GUI)"},"height":{"type":"integer","description":"Headless viewport height, default 800 (ignored with a GUI)"},"timeout_ms":{"type":"integer","description":"Budget for the load to settle, default 20000"},"profile":{"type":"string","description":"Named persistent browsing identity: its own cookie jar and cache, isolated from every other profile and from the default one. Cookies/logins survive this view, MCP restarts and helper crashes (SESSION cookies do not - they die with the browser process). [a-z0-9_-], max 64 chars, not 'default'/'none'. Headless only; refused with a GUI attached. Refused (nothing is opened) if the browser helper cannot provide an isolated context - there is no fallback to the shared jar."},"ephemeral":{"type":"boolean","description":"Open in a FRESH throwaway identity (in-memory jar, incognito-shaped), destroyed with the view. Cannot be combined with 'profile'."}}}
         ,
         .output_schema =
-        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer","description":"View handle in GUI mode (a real pane id)"},"view":{"type":"integer","description":"View handle in headless mode (a helper view id)"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"settled":{"type":"boolean","description":"The requested navigation finished inside the timeout"},"where_ignored":{"type":"boolean","description":"Headless: 'where' has no placement to apply"},"document":{"type":"integer","description":"Per-document counter; 1 means the view has only ever held THIS page"},"revision":{"type":"integer"},"snapshot":{"type":"string","description":"The semantic tree, same text as the content block"},"snapshot_error":{"type":"string"}},"required":["backend","origin","url","title","loading","settled"]}
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer","description":"View handle in GUI mode (a real pane id)"},"view":{"type":"integer","description":"View handle in headless mode (a helper view id)"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"settled":{"type":"boolean","description":"The requested navigation finished inside the timeout"},"where_ignored":{"type":"boolean","description":"Headless: 'where' has no placement to apply"},"document":{"type":"integer","description":"Per-document counter; 1 means the view has only ever held THIS page"},"revision":{"type":"integer"},"snapshot":{"type":"string","description":"The semantic tree, same text as the content block"},"snapshot_error":{"type":"string"},"profile":{"type":"string"},"profile_kind":{"type":"string","enum":["default","named","ephemeral"]},"context":{"type":"integer","description":"Engine identity-context id; 0 = the shared default jar"}},"required":["backend","origin","url","title","loading","settled"]}
+        ,
+    },
+    .{
+        .name = "web_close",
+        .group = .browser,
+        .mutates = true,
+        .description =
+        \\Close a web view. Headless: destroys the helper view and, if it was the last user of an ephemeral identity, that identity too (a named profile's storage is KEPT - use web_profile_reset to erase it). With a GUI attached this closes the user's PANE, exactly like close_pane, and is destructive. Omitting 'pane' closes the CURRENT view (web_tabs marks it); the reply says which view a later handle-less call then addresses.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"pane":{"type":"integer","description":"View handle from web_tabs/web_open; omit for the current view"},"view":{"type":"integer","description":"Synonym for 'pane'"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"closed":{"type":"integer"},"remaining":{"type":"integer"},"current":{"type":"integer","description":"View a later handle-less call now addresses; 0 = none left"},"profile":{"type":"string"},"profile_released":{"type":"boolean","description":"true when this was the last view of an ephemeral identity, which was destroyed with it"}},"required":["backend","closed","remaining","current"]}
+        ,
+    },
+    .{
+        .name = "web_profiles",
+        .group = .browser,
+        .mutates = false,
+        .description =
+        \\List the named persistent browsing profiles this server can open web views in (web_open profile:"name"), where their storage lives, and how many views currently use each. A profile is created by opening a view in it, not by a separate call. Headless only: with a GUI attached the browser's identity containers belong to the user.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"profiles":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"context":{"type":"integer"},"views":{"type":"integer"},"last_used_ms":{"type":"integer"},"live":{"type":"boolean","description":"published to the running browser helper"}},"required":["name","context","views"]}},"store":{"type":"string","description":"Directory the profiles' cookies and caches live in"},"contexts_supported":{"type":"boolean"},"unavailable_reason":{"type":"string"}},"required":["profiles","contexts_supported"]}
+        ,
+    },
+    .{
+        .name = "web_profile_reset",
+        .group = .browser,
+        .mutates = true,
+        .description =
+        \\Erase a named profile's storage: cookies, logins, cache. Irreversible. Refused while any web view is using the profile - close them with web_close first. The name stays usable; the next web_open with it starts from an empty, freshly allocated jar.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"profile":{"type":"string","description":"Profile name from web_profiles"}},"required":["profile"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"profile":{"type":"string"},"deleted":{"type":"boolean"},"retired_context":{"type":"integer","description":"The identity-context id that was erased; the next use of this name gets a new one"}},"required":["profile","deleted"]}
         ,
     },
     .{
