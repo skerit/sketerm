@@ -184,6 +184,7 @@ comptime {
     _ = @import("ipc/termdrive.zig");
     _ = @import("ipc/appdrive.zig");
     _ = @import("ipc/webdrive.zig");
+    _ = @import("ipc/webprofiles.zig");
     _ = @import("ipc/mcp.zig");
     _ = @import("ipc/mcp_app.zig");
     _ = @import("ipc/mcp_term.zig");

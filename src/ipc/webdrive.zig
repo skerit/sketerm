@@ -63,6 +63,7 @@ const findbin = @import("../web/findbin.zig");
 const png = @import("../util/png.zig");
 const quarantine = @import("../web/quarantine.zig");
 const clock = @import("../util/clock.zig");
+const webprofiles = @import("webprofiles.zig");
 
 /// Default logical size a headless view is created at. There is no
 /// allocation to inherit one from, and pages lay out sanely at a
@@ -127,6 +128,18 @@ pub const View = struct {
     id: u32,
     w: u16,
     h: u16,
+    /// Identity context this view lives in; 0 = the shared default jar
+    /// (in-memory, dies with the helper).
+    context: u32 = 0,
+    /// Named persistent profile, when the view was opened in one; owned.
+    profile: ?[]u8 = null,
+    /// The context is a throwaway one, destroyed with the last view
+    /// using it.
+    ephemeral_ctx: bool = false,
+    /// The helper refused to create this view because its context was
+    /// unavailable (`ev_view_create_failed`, the ONLY creation-failure
+    /// signal — `context_create` has no ack). Owned.
+    create_failed: ?[]u8 = null,
     url: ?[]u8 = null,
     title: ?[]u8 = null,
     loading: bool = false,
@@ -190,6 +203,8 @@ pub const View = struct {
     fn deinit(self: *View, gpa: std.mem.Allocator) void {
         if (self.url) |u| gpa.free(u);
         if (self.title) |t| gpa.free(t);
+        if (self.profile) |p| gpa.free(p);
+        if (self.create_failed) |f| gpa.free(f);
         if (self.last_eval) |e| gpa.free(e);
         self.reader_guards.deinit(gpa);
         if (self.net_log) |e| gpa.free(e);
@@ -222,10 +237,43 @@ const SessionEnv = struct {
     active: bool = false,
 };
 
+/// Which identity a view is opened in. `.default` is byte-for-byte
+/// today's behaviour: context 0, the helper's shared in-memory jar.
+pub const ProfileSpec = union(enum) { default, named: []const u8, ephemeral };
+
+/// Every way a profile request can be refused BEFORE anything is
+/// opened. There is deliberately no shared-jar fallback: a caller that
+/// asked for an isolated identity and silently got the shared one would
+/// be leaking a login into it.
+pub const ProfileError = error{
+    ContextsUnsupported,
+    StoreUnavailable,
+    InvalidName,
+    StoreIo,
+    InUse,
+    NoProfile,
+};
+
+/// One identity context PUBLISHED to the running helper.
+const LiveCtx = struct {
+    id: u32,
+    /// Profile name for a persistent context; empty for an ephemeral
+    /// one. Owned when non-empty.
+    name: []u8,
+    ephemeral: bool,
+    /// Helper generation this was last `context_create`d into; a helper
+    /// restart makes it stale and the next open republishes the SAME id.
+    published_gen: u32 = 0,
+    views: u32 = 0,
+};
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     /// Directory holding the helper socket and its cache; owned.
     dir: []u8,
+    /// MCP instance name (`--name work`), which keys the profile store
+    /// root; owned, null for an anonymous instance.
+    instance: ?[]u8 = null,
     /// Hello identity ("sketerm-mcp" or "sketerm-mcp:<instance>"), so
     /// helper logs and a future viewer can attribute the session to an
     /// assistant rather than an anonymous client. Owned.
@@ -268,7 +316,32 @@ pub const Engine = struct {
     cap_view_url: bool = false,
     /// The helper runs the in-process content-blocking filter engine.
     cap_intercept: bool = false,
+    /// The helper accepts identity contexts...
+    cap_contexts: bool = false,
+    /// ...and REFUSES a view whose context does not exist rather than
+    /// silently resolving it through the shared jar. Profiles require
+    /// both: without the second one a refused context is invisible.
+    cap_contexts_fail_closed: bool = false,
     next_sem_request: u32 = 1,
+
+    /// Durable profile store; null when it could not be taken (see
+    /// `store_reason`). Opened lazily, ONCE per engine — a store that
+    /// appeared after the helper already started with the volatile
+    /// cache dir would name jars the running helper cannot reach.
+    store: ?webprofiles.Store = null,
+    store_tried: bool = false,
+    /// Why there is no store. Static strings, or one arena-free owned
+    /// sentence for the lock case; owned when `store_reason_owned`.
+    store_reason: []const u8 = "",
+    store_reason_owned: bool = false,
+    /// Contexts published to the CURRENT helper.
+    live: std.ArrayList(LiveCtx) = .empty,
+    /// Ephemeral ids live above every persisted one, so the two spaces
+    /// can never meet.
+    next_eph: u32 = webprofiles.EPHEMERAL_BASE,
+    /// Bumped by every successful helper start, so "was this context
+    /// published to the helper that is running NOW" is derivable.
+    helper_gen: u32 = 0,
 
     pub fn init(gpa: std.mem.Allocator, dir: []const u8, instance: ?[]const u8, mux_sock: ?[]const u8) !Engine {
         const owned_dir = try gpa.dupe(u8, dir);
@@ -278,8 +351,16 @@ pub const Engine = struct {
         else
             try gpa.dupe(u8, "sketerm-mcp");
         errdefer gpa.free(name);
+        const owned_instance: ?[]u8 = if (instance) |n| try gpa.dupe(u8, n) else null;
+        errdefer if (owned_instance) |n| gpa.free(n);
         const owned_sock: ?[]u8 = if (mux_sock) |sck| try gpa.dupe(u8, sck) else null;
-        return .{ .gpa = gpa, .dir = owned_dir, .client_name = name, .mux_sock = owned_sock };
+        return .{
+            .gpa = gpa,
+            .dir = owned_dir,
+            .instance = owned_instance,
+            .client_name = name,
+            .mux_sock = owned_sock,
+        };
     }
 
     /// Kill and reap the helper; safe to call from a signal-driven
@@ -313,9 +394,71 @@ pub const Engine = struct {
         self.views.deinit(self.gpa);
         self.in.deinit(self.gpa);
         self.rx_fds.deinit(self.gpa);
+        // Persistent contexts are deliberately NEVER destroyed at
+        // shutdown: killing the helper flushes their jars, while racing
+        // a context_destroy against the kill risks a half-written one.
+        self.clearContexts();
+        self.live.deinit(self.gpa);
+        // The flock goes only after the helper is reaped, or a
+        // successor could take the root while CEF still holds it open.
+        if (self.store) |*s| {
+            s.deinit();
+            self.store = null;
+        }
+        self.clearStoreReason();
+        if (self.instance) |n| self.gpa.free(n);
+        self.instance = null;
         self.gpa.free(self.dir);
         self.gpa.free(self.client_name);
         self.state = .idle;
+    }
+
+    fn clearContexts(self: *Engine) void {
+        for (self.live.items) |ctx| {
+            if (ctx.name.len > 0) self.gpa.free(ctx.name);
+        }
+        self.live.clearRetainingCapacity();
+    }
+
+    fn clearStoreReason(self: *Engine) void {
+        if (self.store_reason_owned) self.gpa.free(@constCast(self.store_reason));
+        self.store_reason = "";
+        self.store_reason_owned = false;
+    }
+
+    fn setStoreReason(self: *Engine, reason: []const u8, owned: bool) void {
+        self.clearStoreReason();
+        self.store_reason = reason;
+        self.store_reason_owned = owned;
+    }
+
+    /// Take the durable profile store, once. Failure is not fatal: the
+    /// engine keeps its volatile cache dir and every profile request is
+    /// refused with `store_reason`.
+    fn openStore(self: *Engine) void {
+        if (self.store_tried) return;
+        self.store_tried = true;
+        var holder: c.pid_t = 0;
+        self.store = webprofiles.Store.open(self.gpa, self.instance, &holder) catch |err| {
+            switch (err) {
+                error.Locked => {
+                    const msg = std.fmt.allocPrint(
+                        self.gpa,
+                        "another sketerm mcp process (pid {d}) owns the browser profile store; run this one with --name <something> to give it a store of its own",
+                        .{holder},
+                    ) catch {
+                        self.setStoreReason("another sketerm mcp process owns the browser profile store; run this one with --name <something>", false);
+                        return;
+                    };
+                    self.setStoreReason(msg, true);
+                },
+                error.NoStateDir => self.setStoreReason("no state directory to keep browser profiles in (neither XDG_STATE_HOME nor HOME is set)", false),
+                error.PathTooLong => self.setStoreReason("the browser profile store path is too long for the browser helper's cache-path limit (use a shorter XDG_STATE_HOME)", false),
+                error.Io, error.OutOfMemory => self.setStoreReason("the browser profile store could not be created (check permissions on XDG_STATE_HOME/sketerm)", false),
+            }
+            return;
+        };
+        self.clearStoreReason();
     }
 
     /// Name of the live watchable Wayland session the helper was
@@ -460,12 +603,18 @@ pub const Engine = struct {
             self.pid = -1;
         }
         self.clearViews();
+        // Every published context died with the helper. Persistent ids
+        // are safe in the store, so the next open republishes the SAME
+        // id and lands in the SAME jar; ephemeral ones are simply gone.
+        self.clearContexts();
         self.cap_shm = false;
         self.cap_semantic = false;
         self.cap_reader_ids = false;
         self.cap_semantic_request_ids = false;
         self.cap_view_url = false;
         self.cap_intercept = false;
+        self.cap_contexts = false;
+        self.cap_contexts_fail_closed = false;
         self.removePresence();
         self.state = .unavailable;
         self.reason = LOST_MSG;
@@ -476,6 +625,10 @@ pub const Engine = struct {
     /// binary or a helper that never binds leaves `.unavailable` with
     /// `reason` set, and the caller reports that instead of hanging.
     pub fn ensure(self: *Engine) bool {
+        // Before anything else, and exactly once: the store root IS the
+        // helper's --cache-dir, so the decision has to be made before a
+        // helper exists and must never change under a running one.
+        self.openStore();
         if (self.state == .ready) {
             // A helper that died between calls reads as EOF here.
             if (!self.readAvailable()) return self.state == .ready;
@@ -500,8 +653,16 @@ pub const Engine = struct {
         var sock_z: [108:0]u8 = undefined;
         const sock = std.fmt.bufPrintZ(&sock_z, "{s}/web.sock", .{self.dir}) catch
             return self.failStart("helper socket path exceeds the unix socket limit (use a shorter runtime dir)");
+        // The helper's --cache-dir IS its `root_cache_path`, and CEF
+        // demands every persistent context's jar be a child of it — so
+        // the durable profile store root has to BE that dir. Without a
+        // store the old volatile dir stays, and profiles stay refused.
         var cache_z: [4096:0]u8 = undefined;
-        _ = std.fmt.bufPrintZ(&cache_z, "{s}/web-cache", .{self.dir}) catch return self.failStart("helper cache path too long");
+        if (self.store) |*s| {
+            _ = std.fmt.bufPrintZ(&cache_z, "{s}", .{s.root}) catch return self.failStart("helper cache path too long");
+        } else {
+            _ = std.fmt.bufPrintZ(&cache_z, "{s}/web-cache", .{self.dir}) catch return self.failStart("helper cache path too long");
+        }
 
         // Watchable session first (best effort); the helper is then
         // started as that session's Wayland client.
@@ -599,7 +760,11 @@ pub const Engine = struct {
             }
             self.pumpOnce(50);
         }
-        if (self.state == .ready) self.writePresence();
+        if (self.state == .ready) {
+            self.helper_gen +%= 1;
+            if (self.helper_gen == 0) self.helper_gen = 1;
+            self.writePresence();
+        }
         return self.state == .ready;
     }
 
@@ -656,10 +821,46 @@ pub const Engine = struct {
     /// create-then-navigate fallback (older helper) mints about:blank
     /// first, which is what `load_seq` lets a settle see past.
     pub fn openView(self: *Engine, url: []const u8, w: u16, h: u16) !*View {
+        return self.openViewIn(url, w, h, .default);
+    }
+
+    /// As `openView`, in a chosen identity.
+    ///
+    /// FAIL CLOSED: every profile check runs BEFORE a view is minted or
+    /// a single frame is written, so a refusal leaves nothing behind and
+    /// — crucially — never loads the requested page into the shared jar.
+    pub fn openViewIn(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec) !*View {
         if (!self.ensure()) return error.Unavailable;
+
+        var ctx_id: u32 = 0;
+        var ctx_ephemeral = false;
+        var profile_name: []const u8 = "";
+        if (spec != .default) {
+            // Both caps, or nothing: with CAP_CONTEXTS alone an old
+            // helper resolves an unknown context through the SHARED jar
+            // and never says so.
+            if (!self.cap_contexts or !self.cap_contexts_fail_closed) return error.ContextsUnsupported;
+            if (spec == .named) profile_name = spec.named;
+            const pick = try self.resolveContext(spec);
+            ctx_id = pick.id;
+            ctx_ephemeral = pick.ephemeral;
+        }
+        errdefer self.releaseContext(ctx_id);
+
         const v = try self.gpa.create(View);
-        errdefer self.gpa.destroy(v);
-        v.* = .{ .id = self.next_view, .w = w, .h = h };
+        // Covers both halves: before the append it just destroys the
+        // view, after it also unlinks it from `views` (a bare destroy
+        // there would leave a dangling pointer in the list).
+        errdefer self.abandonView(v);
+        const owned_profile: ?[]u8 = if (profile_name.len > 0) try self.gpa.dupe(u8, profile_name) else null;
+        v.* = .{
+            .id = self.next_view,
+            .w = w,
+            .h = h,
+            .context = ctx_id,
+            .profile = owned_profile,
+            .ephemeral_ctx = ctx_ephemeral,
+        };
         self.next_view += 1;
         try self.views.append(self.gpa, v);
         if (url.len > 0 and self.cap_view_url) {
@@ -668,7 +869,7 @@ pub const Engine = struct {
                 .w = w,
                 .h = h,
                 .scale_x1000 = 1000,
-                .context = 0,
+                .context = ctx_id,
                 .url = url,
             }) catch return error.Unavailable;
         } else {
@@ -677,7 +878,7 @@ pub const Engine = struct {
                 .w = w,
                 .h = h,
                 .scale_x1000 = 1000,
-                .context = 0,
+                .context = ctx_id,
             }) catch return error.Unavailable;
         }
         // A hidden view is never painted; headless views are always
@@ -690,17 +891,221 @@ pub const Engine = struct {
         return v;
     }
 
+    /// Drop a half-built view, whether or not it reached `views`.
+    fn abandonView(self: *Engine, v: *View) void {
+        for (self.views.items, 0..) |item, i| {
+            if (item != v) continue;
+            _ = self.views.orderedRemove(i);
+            break;
+        }
+        v.deinit(self.gpa);
+        self.gpa.destroy(v);
+    }
+
+    const CtxPick = struct { id: u32, ephemeral: bool };
+
+    /// The context id a view must be created with, publishing it to the
+    /// helper first when needed. Frame ORDER on the one stream is what
+    /// guarantees the helper handles `context_create` before the
+    /// `view_create` naming it — there is no ack to wait for.
+    fn resolveContext(self: *Engine, spec: ProfileSpec) ProfileError!CtxPick {
+        switch (spec) {
+            .default => return .{ .id = 0, .ephemeral = false },
+            .ephemeral => {
+                const id = self.next_eph;
+                self.send(proto.ContextCreate{
+                    .id = id,
+                    .ephemeral = 1,
+                    .name = "",
+                    .proxy = "",
+                }) catch return error.StoreIo;
+                self.live.append(self.gpa, .{
+                    .id = id,
+                    .name = &.{},
+                    .ephemeral = true,
+                    .published_gen = self.helper_gen,
+                    .views = 1,
+                }) catch return error.StoreIo;
+                self.next_eph += 1;
+                return .{ .id = id, .ephemeral = true };
+            },
+            .named => |name| {
+                if (!webprofiles.validName(name)) return error.InvalidName;
+                const store = if (self.store) |*s| s else return error.StoreUnavailable;
+                const id = store.ensure(name) catch |err| return switch (err) {
+                    error.BadName => error.InvalidName,
+                    error.Io, error.OutOfMemory => error.StoreIo,
+                };
+                for (self.live.items) |*ctx| {
+                    if (ctx.ephemeral or !std.mem.eql(u8, ctx.name, name)) continue;
+                    if (ctx.published_gen != self.helper_gen) {
+                        self.send(publishFrame(ctx.id, name)) catch return error.StoreIo;
+                        ctx.published_gen = self.helper_gen;
+                    }
+                    ctx.views += 1;
+                    store.touch(name, clock.nowMs());
+                    return .{ .id = ctx.id, .ephemeral = false };
+                }
+                const owned = self.gpa.dupe(u8, name) catch return error.StoreIo;
+                errdefer self.gpa.free(owned);
+                self.send(publishFrame(id, name)) catch return error.StoreIo;
+                self.live.append(self.gpa, .{
+                    .id = id,
+                    .name = owned,
+                    .ephemeral = false,
+                    .published_gen = self.helper_gen,
+                    .views = 1,
+                }) catch return error.StoreIo;
+                store.touch(name, clock.nowMs());
+                return .{ .id = id, .ephemeral = false };
+            },
+        }
+    }
+
+    /// The name is the JAR KEY the helper builds its cache path from —
+    /// never a display string (there is none here).
+    fn publishFrame(id: u32, name: []const u8) proto.ContextCreate {
+        return .{ .id = id, .ephemeral = 0, .name = name, .proxy = "" };
+    }
+
+    /// One fewer view in `id`. A persistent context is KEPT published
+    /// (a later web_open on the same profile must not pay a re-create);
+    /// an ephemeral one dies with its last view, jar and all.
+    fn releaseContext(self: *Engine, id: u32) void {
+        if (id == 0) return;
+        for (self.live.items, 0..) |*ctx, i| {
+            if (ctx.id != id) continue;
+            if (ctx.views > 0) ctx.views -= 1;
+            if (ctx.views == 0 and ctx.ephemeral) {
+                if (self.state == .ready) self.send(proto.ContextDestroy{ .id = id }) catch {};
+                const dead = self.live.orderedRemove(i);
+                if (dead.name.len > 0) self.gpa.free(dead.name);
+            }
+            return;
+        }
+    }
+
     pub fn closeView(self: *Engine, id: u32) void {
         for (self.views.items, 0..) |v, i| {
             if (v.id != id) continue;
             if (self.state == .ready) self.send(proto.ViewDestroy{ .view = id }) catch {};
+            const context = v.context;
             v.deinit(self.gpa);
             self.gpa.destroy(v);
             _ = self.views.orderedRemove(i);
+            self.releaseContext(context);
             if (self.current == id)
                 self.current = if (self.views.items.len > 0) self.views.items[self.views.items.len - 1].id else 0;
             return;
         }
+    }
+
+    // ---- profiles ----------------------------------------------------
+
+    /// One profile as the tools report it.
+    pub const ProfileInfo = struct {
+        name: []const u8,
+        id: u32,
+        views: u32,
+        created_ms: i64,
+        last_used_ms: i64,
+        /// Published to the browser helper that is running right now.
+        live: bool,
+    };
+
+    /// Whether this helper CAN serve profiles. Only meaningful once the
+    /// handshake happened: before that the caps are simply unknown.
+    pub fn contextsSupported(self: *const Engine) bool {
+        return self.cap_contexts and self.cap_contexts_fail_closed;
+    }
+
+    /// Can a profile be opened at all? Deliberately does NOT spawn the
+    /// helper (the same rule listing follows): with no helper yet, the
+    /// store alone decides, and `openViewIn` still fails closed if the
+    /// helper turns out to lack the caps.
+    pub fn profilesAvailable(self: *Engine) bool {
+        self.openStore();
+        if (self.store == null) return false;
+        if (self.state == .ready) return self.contextsSupported();
+        return true;
+    }
+
+    /// The sentence explaining a false `profilesAvailable`.
+    pub fn profileUnavailableReason(self: *Engine) []const u8 {
+        self.openStore();
+        if (self.store == null)
+            return if (self.store_reason.len > 0) self.store_reason else "the browser profile store is unavailable";
+        if (self.state == .ready and !self.contextsSupported())
+            return "this browser helper does not advertise isolated identity contexts (capabilities 'contexts' + 'contexts-fail-closed'); named profiles are refused rather than silently sharing the default cookie jar";
+        return "";
+    }
+
+    /// Where the profiles' cookies and caches live; null when there is
+    /// no store.
+    pub fn profileStorePath(self: *Engine) ?[]const u8 {
+        self.openStore();
+        if (self.store) |*s| return s.root;
+        return null;
+    }
+
+    /// Every known profile, store ∪ live. Never spawns the helper.
+    pub fn profileList(self: *Engine, arena: std.mem.Allocator) ![]ProfileInfo {
+        self.openStore();
+        var out: std.ArrayList(ProfileInfo) = .empty;
+        const store = if (self.store) |*s| s else return out.items;
+        for (store.list()) |e| {
+            var views: u32 = 0;
+            var live = false;
+            for (self.live.items) |ctx| {
+                if (ctx.ephemeral or !std.mem.eql(u8, ctx.name, e.name)) continue;
+                views = ctx.views;
+                live = ctx.published_gen == self.helper_gen and self.state == .ready;
+            }
+            try out.append(arena, .{
+                .name = try arena.dupe(u8, e.name),
+                .id = e.id,
+                .views = views,
+                .created_ms = e.created_ms,
+                .last_used_ms = e.last_used_ms,
+                .live = live,
+            });
+        }
+        return out.items;
+    }
+
+    /// How many open views are using `name` right now.
+    pub fn profileViewCount(self: *const Engine, name: []const u8) u32 {
+        var n: u32 = 0;
+        for (self.views.items) |v| {
+            const p = v.profile orelse continue;
+            if (std.mem.eql(u8, p, name)) n += 1;
+        }
+        return n;
+    }
+
+    /// Erase a profile's storage and RETIRE its id, so the next use
+    /// starts from a freshly allocated jar directory — a partially
+    /// failed removal can then never resurface as this profile's
+    /// cookies.
+    /// @return the context id that was retired.
+    pub fn resetProfile(self: *Engine, name: []const u8) ProfileError!u32 {
+        if (!webprofiles.validName(name)) return error.InvalidName;
+        self.openStore();
+        const store = if (self.store) |*s| s else return error.StoreUnavailable;
+        if (self.profileViewCount(name) > 0) return error.InUse;
+        const entry = store.find(name) orelse return error.NoProfile;
+        for (self.live.items, 0..) |ctx, i| {
+            if (ctx.ephemeral or !std.mem.eql(u8, ctx.name, name)) continue;
+            if (self.state == .ready) self.send(proto.ContextDestroy{ .id = ctx.id }) catch {};
+            const dead = self.live.orderedRemove(i);
+            if (dead.name.len > 0) self.gpa.free(dead.name);
+            break;
+        }
+        _ = store.retire(name) catch |err| return switch (err) {
+            error.BadName => error.InvalidName,
+            error.Io, error.OutOfMemory => error.StoreIo,
+        };
+        return entry.id;
     }
 
     pub fn navigate(self: *Engine, id: u32, url: []const u8) !void {
@@ -1127,6 +1532,8 @@ pub const Engine = struct {
                 self.cap_semantic_request_ids = false;
                 self.cap_view_url = false;
                 self.cap_intercept = false;
+                self.cap_contexts = false;
+                self.cap_contexts_fail_closed = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.cap_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.cap_semantic = true;
@@ -1134,6 +1541,8 @@ pub const Engine = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.cap_intercept = true;
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.cap_contexts_fail_closed = true;
                 }
             },
             .frame_buffer => {
@@ -1195,6 +1604,16 @@ pub const Engine = struct {
                     }
                     if (ev.url.len > 0) self.setOwned(&v.url, ev.url);
                 }
+            },
+            .ev_view_create_failed => {
+                // The ONLY negative signal a context request produces:
+                // `context_create` has no ack, so a view that never
+                // came up is how a bad context becomes visible at all.
+                const ev = proto.decode(proto.EvViewCreateFailed, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| self.setOwned(&v.create_failed, if (ev.reason.len > 0)
+                    ev.reason
+                else
+                    "the browser helper refused the view's identity context");
             },
             .ev_crashed => {
                 const ev = proto.decode(proto.EvCrashed, frame.payload) catch return;
@@ -1410,6 +1829,325 @@ test "wait cleanup tolerates a view destroyed while the operation ran" {
     eng.closeView(1);
     eng.finishWait(1, ki, 9, true);
     try std.testing.expectEqual(@as(usize, 0), eng.views.items.len);
+}
+
+// ── profiles: an engine socketpaired to a decodable "helper" ──────
+//
+// The tests above inspect engine STATE; these have to inspect the
+// FRAMES, because context publication has no ack and its correctness IS
+// the byte order on the wire.
+
+const Pair = struct {
+    eng: Engine,
+    peer: c_int = -1,
+    tmpl: [64]u8 = undefined,
+    saved_state: ?[]const u8 = null,
+    saved_buf: [4096]u8 = undefined,
+
+    fn init(gpa: std.mem.Allocator) !Pair {
+        var self = Pair{ .eng = undefined };
+        @memcpy(self.tmpl[0.."/tmp/sketerm-webdrive-XXXXXX".len], "/tmp/sketerm-webdrive-XXXXXX");
+        self.tmpl["/tmp/sketerm-webdrive-XXXXXX".len] = 0;
+        const made = c.mkdtemp(@ptrCast(&self.tmpl)) orelse return error.SkipZigTest;
+        _ = made;
+        if (c.getenv("XDG_STATE_HOME")) |old| {
+            const s = std.mem.span(@as([*:0]const u8, @ptrCast(old)));
+            @memcpy(self.saved_buf[0..s.len], s);
+            self.saved_buf[s.len] = 0;
+            self.saved_state = self.saved_buf[0..s.len];
+        }
+        _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.tmpl), 1);
+
+        var fds: [2]c_int = undefined;
+        if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
+        self.eng = try Engine.init(gpa, "/tmp/webdrive-test", "unit", null);
+        self.eng.fd = fds[0];
+        // Exactly what startHelper does to the real socket: `ensure`
+        // drains the fd on every call, and a blocking one would park
+        // there forever with no helper to answer.
+        _ = c.fcntl(self.eng.fd, c.F_SETFL, c.O_NONBLOCK);
+        self.peer = fds[1];
+        self.handshake(true, true);
+        return self;
+    }
+
+    /// A fresh socket + handshake, as a restarted helper would be:
+    /// `lost` closed the old fd, so nothing could be sent over it.
+    fn reconnect(self: *Pair) void {
+        var fds: [2]c_int = undefined;
+        if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return;
+        if (self.peer >= 0) _ = c.close(self.peer);
+        if (self.eng.fd >= 0) _ = c.close(self.eng.fd);
+        self.eng.fd = fds[0];
+        _ = c.fcntl(self.eng.fd, c.F_SETFL, c.O_NONBLOCK);
+        self.peer = fds[1];
+        self.handshake(true, true);
+    }
+
+    /// The scratch state dir, read off THIS copy of the struct (the
+    /// mkdtemp result pointed into init's own stack frame).
+    fn stateDir(self: *Pair) []const u8 {
+        return std.mem.span(@as([*:0]const u8, @ptrCast(&self.tmpl)));
+    }
+
+    /// Bring the engine to `.ready` as a fresh helper generation would.
+    fn handshake(self: *Pair, contexts: bool, fail_closed: bool) void {
+        self.eng.state = .ready;
+        self.eng.helper_gen +%= 1;
+        self.eng.cap_semantic = true;
+        self.eng.cap_view_url = true;
+        self.eng.cap_contexts = contexts;
+        self.eng.cap_contexts_fail_closed = fail_closed;
+    }
+
+    fn deinit(self: *Pair) void {
+        self.eng.deinit();
+        if (self.peer >= 0) _ = c.close(self.peer);
+        if (self.saved_state != null) {
+            _ = c.setenv("XDG_STATE_HOME", @ptrCast(&self.saved_buf), 1);
+        } else {
+            _ = c.unsetenv("XDG_STATE_HOME");
+        }
+        webprofiles.rmTreeForTest(self.stateDir());
+    }
+
+    /// Everything the engine has written since the last drain. MSG_DONTWAIT
+    /// rather than an O_NONBLOCK fd: "nothing was written" is an ANSWER
+    /// these tests assert, so the read must never be able to block.
+    fn drain(self: *Pair, buf: []u8) []const u8 {
+        const n = c.recv(self.peer, buf.ptr, buf.len, c.MSG_DONTWAIT);
+        return if (n <= 0) buf[0..0] else buf[0..@intCast(n)];
+    }
+};
+
+/// The frame tags the engine emitted, in order.
+fn tagsOf(bytes: []const u8, out: []proto.Tag) []const proto.Tag {
+    var reader = proto.Reader.init(bytes);
+    var n: usize = 0;
+    while (n < out.len) {
+        const frame = (reader.next() catch break) orelse break;
+        out[n] = frame.tag;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "a profile is refused, opening nothing, unless BOTH context caps are advertised" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var buf: [8192]u8 = undefined;
+
+    // No contexts at all: an old helper (and the smoke fake).
+    p.eng.cap_contexts = false;
+    p.eng.cap_contexts_fail_closed = false;
+    try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }));
+    try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .ephemeral));
+
+    // CAP_CONTEXTS alone is WORSE than none: such a helper resolves an
+    // unknown context through the shared jar and never says so.
+    p.eng.cap_contexts = true;
+    try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }));
+
+    // Fail closed means exactly this: no view, and not one byte on the
+    // wire — the requested page never touched the shared cookie jar.
+    try std.testing.expectEqual(@as(usize, 0), p.eng.views.items.len);
+    try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
+
+    // An invalid name is refused on its own, after the caps pass.
+    p.eng.cap_contexts_fail_closed = true;
+    try std.testing.expectError(error.InvalidName, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "Default Jar" }));
+    try std.testing.expectError(error.InvalidName, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "default" }));
+    try std.testing.expectEqual(@as(usize, 0), p.eng.views.items.len);
+    try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
+}
+
+test "a named open publishes its context BEFORE the view, and republishes the same id after a helper restart" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var buf: [8192]u8 = undefined;
+
+    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    const id = v.context;
+    try std.testing.expect(id != 0);
+    try std.testing.expect(id < webprofiles.EPHEMERAL_BASE);
+    try std.testing.expectEqualStrings("work", v.profile.?);
+    try std.testing.expect(!v.ephemeral_ctx);
+
+    {
+        const bytes = p.drain(&buf);
+        var reader = proto.Reader.init(bytes);
+        // Order IS the contract: no ack exists, so the helper must see
+        // context_create first simply because it arrived first.
+        const first = (try reader.next()).?;
+        try std.testing.expectEqual(proto.Tag.context_create, first.tag);
+        const cc = try proto.decode(proto.ContextCreate, first.payload);
+        try std.testing.expectEqual(id, cc.id);
+        try std.testing.expectEqual(@as(u8, 0), cc.ephemeral);
+        try std.testing.expectEqualStrings("work", cc.name);
+        try std.testing.expectEqualStrings("", cc.proxy);
+        const second = (try reader.next()).?;
+        try std.testing.expectEqual(proto.Tag.view_create_url, second.tag);
+        const vc = try proto.decode(proto.ViewCreateUrl, second.payload);
+        try std.testing.expectEqual(id, vc.context);
+    }
+
+    // A SECOND view in the same profile costs no re-create.
+    const v2 = try p.eng.openViewIn("https://y.test/", 800, 600, .{ .named = "work" });
+    try std.testing.expectEqual(id, v2.context);
+    {
+        var tag_buf: [8]proto.Tag = undefined;
+        const tags = tagsOf(p.drain(&buf), &tag_buf);
+        try std.testing.expectEqual(@as(usize, 2), tags.len);
+        try std.testing.expectEqual(proto.Tag.view_create_url, tags[0]);
+    }
+
+    // The helper crashed: views and published contexts are gone, but
+    // the PERSISTED id is not — the same jar comes back.
+    p.eng.lost();
+    try std.testing.expectEqual(@as(usize, 0), p.eng.views.items.len);
+    try std.testing.expectEqual(@as(usize, 0), p.eng.live.items.len);
+    p.reconnect();
+    const after = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    try std.testing.expectEqual(id, after.context);
+    {
+        const bytes = p.drain(&buf);
+        var reader = proto.Reader.init(bytes);
+        const first = (try reader.next()).?;
+        try std.testing.expectEqual(proto.Tag.context_create, first.tag);
+        try std.testing.expectEqual(id, (try proto.decode(proto.ContextCreate, first.payload)).id);
+    }
+}
+
+test "ephemeral contexts get their own id space and die with their last view" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var buf: [8192]u8 = undefined;
+
+    const a = try p.eng.openViewIn("https://a.test/", 800, 600, .ephemeral);
+    const b = try p.eng.openViewIn("https://b.test/", 800, 600, .ephemeral);
+    try std.testing.expect(a.context != b.context);
+    try std.testing.expect(a.context >= webprofiles.EPHEMERAL_BASE);
+    try std.testing.expect(b.context >= webprofiles.EPHEMERAL_BASE);
+    try std.testing.expect(a.profile == null and a.ephemeral_ctx);
+    // A throwaway identity is never persisted: the store stays empty.
+    try std.testing.expectEqual(@as(usize, 0), p.eng.store.?.list().len);
+    _ = p.drain(&buf);
+
+    // Closing one ephemeral view destroys exactly ITS context.
+    p.eng.closeView(a.id);
+    {
+        var tag_buf: [8]proto.Tag = undefined;
+        const tags = tagsOf(p.drain(&buf), &tag_buf);
+        try std.testing.expectEqual(@as(usize, 2), tags.len);
+        try std.testing.expectEqual(proto.Tag.view_destroy, tags[0]);
+        try std.testing.expectEqual(proto.Tag.context_destroy, tags[1]);
+    }
+
+    // A NAMED profile's close destroys no context: its storage is the
+    // point, and a later open must not pay a re-create.
+    const named = try p.eng.openViewIn("https://n.test/", 800, 600, .{ .named = "work" });
+    _ = p.drain(&buf);
+    p.eng.closeView(named.id);
+    {
+        var tag_buf: [8]proto.Tag = undefined;
+        const tags = tagsOf(p.drain(&buf), &tag_buf);
+        try std.testing.expectEqual(@as(usize, 1), tags.len);
+        try std.testing.expectEqual(proto.Tag.view_destroy, tags[0]);
+    }
+    try std.testing.expectEqual(@as(u32, 0), p.eng.profileViewCount("work"));
+}
+
+test "ev_view_create_failed marks the view and its close rolls the context back" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var buf: [8192]u8 = undefined;
+
+    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    _ = p.drain(&buf);
+    try std.testing.expect(v.create_failed == null);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    try proto.encodePayload(gpa, &payload, proto.EvViewCreateFailed{
+        .view = v.id,
+        .context = v.context,
+        .reason = "requested browser context does not exist",
+    });
+    p.eng.dispatch(.{ .tag = .ev_view_create_failed, .payload = payload.items });
+    try std.testing.expectEqualStrings("requested browser context does not exist", v.create_failed.?);
+
+    // The tool closes the doomed view; the refcount must go back to 0
+    // or the profile would look permanently in use.
+    p.eng.closeView(v.id);
+    try std.testing.expectEqual(@as(u32, 0), p.eng.profileViewCount("work"));
+    for (p.eng.live.items) |ctx| {
+        if (std.mem.eql(u8, ctx.name, "work")) try std.testing.expectEqual(@as(u32, 0), ctx.views);
+    }
+}
+
+test "resetProfile refuses a profile in use and retires its id when free" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var buf: [8192]u8 = undefined;
+
+    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    const id = v.context;
+    _ = p.drain(&buf);
+    try std.testing.expectError(error.InUse, p.eng.resetProfile("work"));
+    try std.testing.expectError(error.NoProfile, p.eng.resetProfile("never-used"));
+    try std.testing.expectError(error.InvalidName, p.eng.resetProfile("Bad Name"));
+
+    p.eng.closeView(v.id);
+    _ = p.drain(&buf);
+    try std.testing.expectEqual(id, try p.eng.resetProfile("work"));
+    {
+        var tag_buf: [8]proto.Tag = undefined;
+        const tags = tagsOf(p.drain(&buf), &tag_buf);
+        try std.testing.expectEqual(@as(usize, 1), tags.len);
+        try std.testing.expectEqual(proto.Tag.context_destroy, tags[0]);
+    }
+
+    // The name stays usable and comes back on a DIFFERENT id, so a
+    // half-failed erase can never resurface as this profile's cookies.
+    const fresh = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    try std.testing.expect(fresh.context != id);
+}
+
+test "profile listing reports store and live state without spawning a helper" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var buf: [8192]u8 = undefined;
+
+    try std.testing.expectEqual(@as(usize, 0), (try p.eng.profileList(arena)).len);
+    try std.testing.expect(p.eng.profilesAvailable());
+    try std.testing.expectEqualStrings("", p.eng.profileUnavailableReason());
+    try std.testing.expect(p.eng.profileStorePath() != null);
+
+    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    _ = p.drain(&buf);
+    const listed = try p.eng.profileList(arena);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("work", listed[0].name);
+    try std.testing.expectEqual(@as(u32, 1), listed[0].views);
+    try std.testing.expect(listed[0].live);
+    try std.testing.expect(listed[0].last_used_ms != 0);
+
+    p.eng.closeView(v.id);
+    try std.testing.expectEqual(@as(u32, 0), (try p.eng.profileList(arena))[0].views);
+
+    // A helper without the caps makes profiles unavailable, and SAYS so.
+    p.eng.cap_contexts_fail_closed = false;
+    try std.testing.expect(!p.eng.profilesAvailable());
+    try std.testing.expect(std.mem.indexOf(u8, p.eng.profileUnavailableReason(), "contexts-fail-closed") != null);
 }
 
 test "the current view is the last one touched, not the oldest" {

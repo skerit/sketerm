@@ -112,6 +112,7 @@ comptime {
     _ = @import("ipc/protocol.zig");
     _ = @import("ipc/termdrive.zig");
     _ = @import("ipc/webdrive.zig");
+    _ = @import("ipc/webprofiles.zig");
     _ = @import("ipc/xkblayout.zig");
     // ui/panel data layer: under ui/ by home. canary/doc/events are GTK-free by
     // contract; assets.zig is GTK-free by BUILD GATE — its gdk-pixbuf work sits
