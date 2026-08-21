@@ -298,6 +298,44 @@ pub const NetPolicy = struct {
     deadline_ms: u32 = 0,
 };
 
+/// A policy as a CLIENT WROTE it: every field remembers whether it was
+/// supplied. `effective()` fills the open-time defaults for a fresh
+/// policy; `tightenViewPolicy` reads presence directly, so an omitted
+/// field can never be mistaken for a request to tighten to its default
+/// (the way a bare `NetPolicy{}` once reset a live view's schemes to
+/// http+https and its allow_private to off). Host lists and block_types
+/// keep "empty = nothing said" — an empty allow-list could not mean
+/// anything else at tighten time, and there is no type to un-block.
+pub const NetPolicyPatch = struct {
+    allow_top: []const []const u8 = &.{},
+    allow_sub: []const []const u8 = &.{},
+    block_types: u16 = 0,
+    allow_schemes: ?u16 = null,
+    allow_private: ?bool = null,
+    block_ads: ?bool = null,
+    max_requests: ?u32 = null,
+    max_bytes: ?u64 = null,
+    max_navigations: ?u32 = null,
+    deadline_ms: ?u32 = null,
+
+    /// The full policy a fresh view or a profile default gets from this
+    /// patch: omitted fields take `NetPolicy`'s defaults.
+    pub fn effective(self: NetPolicyPatch) NetPolicy {
+        return .{
+            .allow_top = self.allow_top,
+            .allow_sub = self.allow_sub,
+            .block_types = self.block_types,
+            .allow_schemes = self.allow_schemes orelse netpolicy.default_schemes,
+            .allow_private = self.allow_private orelse false,
+            .block_ads = self.block_ads,
+            .max_requests = self.max_requests orelse 0,
+            .max_bytes = self.max_bytes orelse 0,
+            .max_navigations = self.max_navigations orelse 0,
+            .deadline_ms = self.deadline_ms orelse 0,
+        };
+    }
+};
+
 /// Every way a POLICIED open can be refused before anything opens.
 /// Same fail-closed contract as `ProfileError`: no unpoliced fallback.
 pub const NetPolicyError = error{
@@ -1334,7 +1372,8 @@ pub const Engine = struct {
     /// shrink, budgets only lower, type blocks only grow, allow_private
     /// only turn off. Monotone, so "did the old policy still apply to
     /// the requests in flight" is never a question a caller has to ask.
-    pub fn tightenViewPolicy(self: *Engine, view_id: u32, incoming: *const NetPolicy) !TightenReport {
+    /// A field the patch does not carry is left exactly as it was.
+    pub fn tightenViewPolicy(self: *Engine, view_id: u32, incoming: *const NetPolicyPatch) !TightenReport {
         const v = self.findView(view_id) orelse return error.NoView;
         const old = if (v.pol) |*p| p else return error.NoPolicy;
         var report = TightenReport{};
@@ -1375,19 +1414,21 @@ pub const Engine = struct {
             next.block_types = old.block_types | incoming.block_types;
             report.tight("block_types");
         }
-        if (incoming.allow_schemes != 0 and incoming.allow_schemes != old.allow_schemes) {
-            const narrowed = old.allow_schemes & incoming.allow_schemes;
+        if (incoming.allow_schemes) |want| {
+            const narrowed = old.allow_schemes & want;
             if (narrowed != old.allow_schemes) {
                 next.allow_schemes = narrowed;
                 report.tight("allow_schemes");
             }
-            if (incoming.allow_schemes & ~old.allow_schemes != 0) report.ign("allow_schemes");
+            if (want & ~old.allow_schemes != 0) report.ign("allow_schemes");
         }
-        if (old.allow_private and !incoming.allow_private) {
-            next.allow_private = false;
-            report.tight("allow_private_addresses");
-        } else if (!old.allow_private and incoming.allow_private) {
-            report.ign("allow_private_addresses");
+        if (incoming.allow_private) |want| {
+            if (old.allow_private and !want) {
+                next.allow_private = false;
+                report.tight("allow_private_addresses");
+            } else if (!old.allow_private and want) {
+                report.ign("allow_private_addresses");
+            }
         }
         tightenBudget(u32, old.max_requests, incoming.max_requests, &next.max_requests, &report, "max_requests");
         tightenBudget(u64, old.max_bytes, incoming.max_bytes, &next.max_bytes, &report, "max_bytes");
@@ -1419,13 +1460,15 @@ pub const Engine = struct {
         return report;
     }
 
-    fn tightenBudget(comptime T: type, old: T, incoming: T, out: *T, report: *TightenReport, name: []const u8) void {
-        if (incoming == 0) return;
-        if (old == 0 or incoming < old) {
-            out.* = incoming;
+    /// An omitted budget is untouched; an explicit 0 asks for "unbounded",
+    /// which on a bounded view is a loosening and is named as such.
+    fn tightenBudget(comptime T: type, old: T, incoming: ?T, out: *T, report: *TightenReport, name: []const u8) void {
+        const want = incoming orelse return;
+        if (want != 0 and (old == 0 or want < old)) {
+            out.* = want;
             report.tight(name);
-        } else if (incoming > old) {
-            report.ign(name);
+        } else if (want == 0 or want > old) {
+            if (old != 0 or want != 0) report.ign(name);
         }
     }
 
@@ -2710,7 +2753,7 @@ test "a live policy only tightens: loosenings are named and never sent" {
 
     // Pure loosening: more hosts, higher budget. Nothing may move and
     // nothing may be sent.
-    const looser = NetPolicy{
+    const looser = NetPolicyPatch{
         .allow_top = &.{ "site.example", "cdn.example", "extra.example" },
         .max_requests = 5000,
     };
@@ -2723,7 +2766,7 @@ test "a live policy only tightens: loosenings are named and never sent" {
 
     // A real tighten: fewer hosts, lower budget — re-sent with a new
     // serial, and the mixed-in loosening is still named.
-    const tighter = NetPolicy{
+    const tighter = NetPolicyPatch{
         .allow_top = &.{"site.example"},
         .max_requests = 10,
         .max_bytes = 5000, // looser: ignored
@@ -2744,6 +2787,126 @@ test "a live policy only tightens: loosenings are named and never sent" {
     defer gpa.free(set.allow_sub);
     try std.testing.expectEqual(v.pol_serial, set.serial);
     try std.testing.expectEqual(@as(usize, 1), set.allow_top.len);
+}
+
+test "a partial tighten leaves every omitted field exactly as it was" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.cap_net_policy = true;
+    var buf: [16384]u8 = undefined;
+
+    const all_schemes = netpolicy.default_schemes | netpolicy.schemeBit("ws").? | netpolicy.schemeBit("wss").?;
+    const pol = NetPolicy{
+        .allow_top = &.{"site.example"},
+        .allow_schemes = all_schemes,
+        .allow_private = true,
+        .max_requests = 100,
+        .max_bytes = 1000,
+    };
+    const v = try p.eng.openViewIn("https://site.example/", 800, 600, .default, &pol);
+    _ = p.drain(&buf);
+
+    // Only max_requests is said: schemes and private access must survive.
+    const r = try p.eng.tightenViewPolicy(v.id, &.{ .max_requests = 10 });
+    try std.testing.expectEqual(@as(usize, 1), r.n_tightened);
+    try std.testing.expectEqualStrings("max_requests", r.tightened[0]);
+    try std.testing.expectEqual(@as(usize, 0), r.n_ignored);
+    try std.testing.expectEqual(all_schemes, v.pol.?.allow_schemes);
+    try std.testing.expect(v.pol.?.allow_private);
+    try std.testing.expectEqual(@as(u32, 10), v.pol.?.max_requests);
+    try std.testing.expectEqual(@as(u64, 1000), v.pol.?.max_bytes);
+    try std.testing.expectEqual(@as(usize, 1), v.pol.?.allow_top.len);
+
+    // The frame that went out carries the untouched fields too.
+    const bytes = p.drain(&buf);
+    var reader = proto.Reader.init(bytes);
+    const frame = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.net_policy_set, frame.tag);
+    const set = try proto.NetPolicySet.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(set.allow_top);
+    defer gpa.free(set.allow_sub);
+    try std.testing.expectEqual(all_schemes, set.allow_schemes);
+    try std.testing.expect(set.flags & proto.NetPolicySet.flag_allow_private != 0);
+
+    // An empty patch moves nothing and sends nothing.
+    const r0 = try p.eng.tightenViewPolicy(v.id, &.{});
+    try std.testing.expectEqual(@as(usize, 0), r0.n_tightened);
+    try std.testing.expectEqual(@as(usize, 0), r0.n_ignored);
+    try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
+}
+
+test "explicit scheme and private-address fields still tighten, and widen attempts are named" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.cap_net_policy = true;
+    var buf: [16384]u8 = undefined;
+
+    const ws = netpolicy.schemeBit("ws").?;
+    const pol = NetPolicy{
+        .allow_top = &.{"site.example"},
+        .allow_schemes = netpolicy.default_schemes | ws,
+        .allow_private = true,
+        .max_requests = 100,
+    };
+    const v = try p.eng.openViewIn("https://site.example/", 800, 600, .default, &pol);
+    _ = p.drain(&buf);
+
+    // Explicit shrink of schemes, explicit private off: both tighten.
+    const r1 = try p.eng.tightenViewPolicy(v.id, &.{
+        .allow_schemes = netpolicy.default_schemes,
+        .allow_private = false,
+    });
+    try std.testing.expectEqual(@as(usize, 2), r1.n_tightened);
+    try std.testing.expectEqual(@as(usize, 0), r1.n_ignored);
+    try std.testing.expectEqual(netpolicy.default_schemes, v.pol.?.allow_schemes);
+    try std.testing.expect(!v.pol.?.allow_private);
+    try std.testing.expectEqual(@as(u32, 100), v.pol.?.max_requests);
+    _ = p.drain(&buf);
+
+    // Every widening at once: more hosts, a scheme back, private back on,
+    // a higher budget, an "unbounded" budget. All named, nothing moves,
+    // nothing is sent.
+    const r2 = try p.eng.tightenViewPolicy(v.id, &.{
+        .allow_top = &.{ "site.example", "extra.example" },
+        .allow_schemes = netpolicy.default_schemes | ws,
+        .allow_private = true,
+        .max_requests = 500,
+        .max_bytes = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 0), r2.n_tightened);
+    const want_ignored = [_][]const u8{ "allow_hosts", "allow_schemes", "allow_private_addresses", "max_requests" };
+    try std.testing.expectEqual(want_ignored.len, r2.n_ignored);
+    for (want_ignored) |name| {
+        var found = false;
+        for (r2.ignored[0..r2.n_ignored]) |n| {
+            if (std.mem.eql(u8, n, name)) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
+    try std.testing.expectEqual(netpolicy.default_schemes, v.pol.?.allow_schemes);
+    try std.testing.expect(!v.pol.?.allow_private);
+    try std.testing.expectEqual(@as(u32, 100), v.pol.?.max_requests);
+
+    // Explicit 0 on a BOUNDED budget is a loosening and is named.
+    const r3 = try p.eng.tightenViewPolicy(v.id, &.{ .max_requests = 0 });
+    try std.testing.expectEqual(@as(usize, 0), r3.n_tightened);
+    try std.testing.expectEqual(@as(usize, 1), r3.n_ignored);
+    try std.testing.expectEqualStrings("max_requests", r3.ignored[0]);
+}
+
+test "NetPolicyPatch.effective fills open-time defaults only for omitted fields" {
+    const empty = (NetPolicyPatch{}).effective();
+    try std.testing.expectEqual(netpolicy.default_schemes, empty.allow_schemes);
+    try std.testing.expect(!empty.allow_private);
+    try std.testing.expectEqual(@as(u32, 0), empty.max_requests);
+    const ws = netpolicy.schemeBit("ws").?;
+    const said = (NetPolicyPatch{ .allow_schemes = ws, .allow_private = true, .max_bytes = 7 }).effective();
+    try std.testing.expectEqual(ws, said.allow_schemes);
+    try std.testing.expect(said.allow_private);
+    try std.testing.expectEqual(@as(u64, 7), said.max_bytes);
 }
 
 test "a profile's session-default policy rides its web_open, and only its own" {

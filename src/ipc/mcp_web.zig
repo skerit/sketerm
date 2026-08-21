@@ -1474,7 +1474,7 @@ pub fn webTool(
         var policy: ?webdrive.NetPolicy = switch (try parsePolicy(arena, args)) {
             .none => null,
             .err => |f| return failRes(arena, f),
-            .policy => |p| p,
+            .policy => |p| p.effective(),
         };
         var policy_source: []const u8 = "none";
         if (policy != null) {
@@ -1944,12 +1944,13 @@ fn profileResetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value)
 const GUI_POLICY_REFUSAL =
     "a sketerm GUI is attached, so web tools drive the user's real tabs; enforced network policy is a headless-only feature (web_network toggles the GUI's content blocking). Run this MCP server without --shared/--socket for policies.";
 
-const PolicyParse = union(enum) { none, policy: webdrive.NetPolicy, err: Fail };
+const PolicyParse = union(enum) { none, policy: webdrive.NetPolicyPatch, err: Fail };
 
 /// Parse `web_open`'s / `web_policy_set`'s `policy` object into the
-/// client value. Slices land in the arena. Fail closed on every
-/// unknown name — a typo must never become a silently-narrower or
-/// silently-wider policy.
+/// client PATCH: presence survives, so a live-view tighten leaves
+/// omitted fields alone while `effective()` gives an open its defaults.
+/// Slices land in the arena. Fail closed on every unknown name — a typo
+/// must never become a silently-narrower or silently-wider policy.
 fn parsePolicy(arena: std.mem.Allocator, args: std.json.Value) !PolicyParse {
     if (args != .object) return .none;
     const pv = args.object.get("policy") orelse return .none;
@@ -1957,7 +1958,7 @@ fn parsePolicy(arena: std.mem.Allocator, args: std.json.Value) !PolicyParse {
     if (pv != .object) return .{ .err = fail(.invalid_args, "'policy' must be an object") };
     const o = pv.object;
 
-    var p = webdrive.NetPolicy{};
+    var p = webdrive.NetPolicyPatch{};
     switch (try parseHostList(arena, o, "allow_hosts")) {
         .ok => |hosts| p.allow_top = hosts,
         .err => |e| return .{ .err = e },
@@ -1998,12 +1999,12 @@ fn parsePolicy(arena: std.mem.Allocator, args: std.json.Value) !PolicyParse {
     inline for (.{ "max_requests", "max_navigations", "deadline_ms" }) |name| {
         if (o.get(name)) |n| {
             if (n != .integer or n.integer < 0) return .{ .err = fail(.invalid_args, "policy." ++ name ++ " must be a non-negative integer") };
-            @field(p, name) = @intCast(@min(n.integer, std.math.maxInt(u32)));
+            @field(p, name) = @as(u32, @intCast(@min(n.integer, std.math.maxInt(u32))));
         }
     }
     if (o.get("max_bytes")) |n| {
         if (n != .integer or n.integer < 0) return .{ .err = fail(.invalid_args, "policy.max_bytes must be a non-negative integer") };
-        p.max_bytes = @intCast(n.integer);
+        p.max_bytes = @as(u64, @intCast(n.integer));
     }
     return .{ .policy = p };
 }
@@ -2172,11 +2173,12 @@ fn policySetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vi
     if (mcp.argStr(args, "profile")) |name| {
         if (!webprofiles.validName(name))
             return mcp.errRes(arena, .invalid_args, "'profile' must be a usable profile name (1-64 of a-z, 0-9, '_', '-')");
-        try e.setProfilePolicy(name, &parsed);
+        const full = parsed.effective();
+        try e.setProfilePolicy(name, &full);
         var res = mcp.Res.init(arena);
         try res.fact("profile", name);
         try res.fact("policy_source", "profile_default");
-        try res.raw("policy", try policyJson(arena, &parsed));
+        try res.raw("policy", try policyJson(arena, &full));
         try res.fact("durable", false);
         try res.textf("registered the session-default policy for profile '{s}' (in-memory: it lasts until this MCP server exits, deliberately — a durable copy could be silently lost by a store rebuild)", .{name});
         return res.finish();
@@ -3197,14 +3199,27 @@ test "parsePolicy fails closed on every unknown name, wildcard and port" {
     }
 
     // Upper case folds rather than refuses; names/masks land as sent.
-    const ok_args = try std.json.parseFromSliceLeaky(std.json.Value, arena,
-        "{\"policy\":{\"allow_hosts\":[\"Site.Example\"],\"block_types\":[\"image\",\"media\"],\"allow_schemes\":[\"https\"],\"max_requests\":9,\"deadline_ms\":1500}}", .{});
+    const ok_args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"policy\":{\"allow_hosts\":[\"Site.Example\"],\"block_types\":[\"image\",\"media\"],\"allow_schemes\":[\"https\"],\"max_requests\":9,\"deadline_ms\":1500}}", .{});
     const ok = try parsePolicy(arena, ok_args);
     try t.expect(ok == .policy);
     try t.expectEqualStrings("site.example", ok.policy.allow_top[0]);
     try t.expectEqual(netpolicy.typeBit("image").? | netpolicy.typeBit("media").?, ok.policy.block_types);
-    try t.expectEqual(netpolicy.schemeBit("https").?, ok.policy.allow_schemes);
-    try t.expectEqual(@as(u32, 9), ok.policy.max_requests);
+    try t.expectEqual(netpolicy.schemeBit("https").?, ok.policy.allow_schemes.?);
+    try t.expectEqual(@as(u32, 9), ok.policy.max_requests.?);
+    try t.expect(ok.policy.allow_private == null);
+    try t.expect(ok.policy.max_bytes == null);
+
+    // Presence survives: an update naming only a budget says nothing
+    // about schemes or private addresses, and effective() fills the
+    // open-time defaults for exactly those.
+    const partial_args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"policy\":{\"max_requests\":3}}", .{});
+    const partial = try parsePolicy(arena, partial_args);
+    try t.expect(partial.policy.allow_schemes == null);
+    try t.expect(partial.policy.allow_private == null);
+    const eff = partial.policy.effective();
+    try t.expectEqual(netpolicy.default_schemes, eff.allow_schemes);
+    try t.expect(!eff.allow_private);
+    try t.expectEqual(@as(u32, 3), eff.max_requests);
 
     // No policy key at all is simply none — never an error.
     const none_args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"url\":\"https://x.test\"}", .{});

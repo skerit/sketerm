@@ -15,6 +15,7 @@ const wire = @import("mux/wire.zig");
 const panelstore = @import("ipc/panelstore.zig");
 const protocol = @import("ipc/protocol.zig");
 const webproto = @import("web/protocol.zig");
+const netpolicy = @import("web/netpolicy.zig");
 const version = @import("version.zig");
 
 fn say(msg: []const u8) void {
@@ -2845,8 +2846,10 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
                     const req = webproto.NetPolicySet.decodeAlloc(frame.payload, allocator) catch return 1;
                     defer allocator.free(req.allow_top);
                     defer allocator.free(req.allow_sub);
-                    fakeFrameLog("net_policy_set view={d} serial={d} top={d} max_requests={d}\n", .{
-                        req.view, req.serial, req.allow_top.len, req.max_requests,
+                    fakeFrameLog("net_policy_set view={d} serial={d} top={d} max_requests={d} schemes={d} private={d}\n", .{
+                        req.view,          req.serial,
+                        req.allow_top.len, req.max_requests,
+                        req.allow_schemes, @intFromBool(req.flags & webproto.NetPolicySet.flag_allow_private != 0),
                     });
                     if (pol_n < pol_views.len) {
                         pol_views[pol_n] = req.view;
@@ -3412,6 +3415,51 @@ fn webPolicyFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []co
         }
         if (tries >= 100)
             fail("the tightened policy never reached the helper");
+        m.closeStdinWait();
+    }
+
+    // web_policy_set is a PATCH: a live view allowing ws/wss and private
+    // addresses keeps both when only max_requests is tightened — the
+    // response names just the budget, and the re-sent wire policy still
+    // carries the wider scheme mask and the private flag. Explicitly
+    // saying the fields then tightens them; asking for them back is
+    // refused by name.
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const ws_mask: u16 = netpolicy.default_schemes | netpolicy.schemeBit("ws").? | netpolicy.schemeBit("wss").?;
+        m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/p\",\"policy\":{\"allow_hosts\":[\"smoke.invalid\"],\"allow_schemes\":[\"http\",\"https\",\"ws\",\"wss\"],\"allow_private_addresses\":true,\"max_requests\":50}}");
+        const opened = m.recvLine(60_000);
+        if (std.mem.indexOf(u8, opened, "\"policy_source\":\"call\"") == null)
+            fail("the wide policied open did not report its policy");
+        const partial = m.callTool("web_policy_set", "{\"policy\":{\"max_requests\":4}}");
+        if (std.mem.indexOf(u8, partial, "\"tightened\":[\"max_requests\"]") == null)
+            fail("a budget-only web_policy_set did not tighten exactly the budget");
+        if (std.mem.indexOf(u8, partial, "\"ws\"") == null or std.mem.indexOf(u8, partial, "\"wss\"") == null or
+            std.mem.indexOf(u8, partial, "\"allow_private_addresses\":true") == null)
+            fail("a budget-only web_policy_set reset schemes or allow_private_addresses (the partial-update regression)");
+        var want_buf: [96]u8 = undefined;
+        const want = std.fmt.bufPrint(&want_buf, "max_requests=4 schemes={d} private=1", .{ws_mask}) catch unreachable;
+        var tries: u32 = 0;
+        while (tries < 100) : (tries += 1) {
+            if (std.mem.indexOf(u8, readSmall(frames, &file_buf), want) != null) break;
+            _ = c.usleep(20_000);
+        }
+        if (tries >= 100)
+            fail("the re-sent policy on the wire lost the untouched schemes/private fields");
+        const explicit = m.callTool("web_policy_set", "{\"policy\":{\"allow_schemes\":[\"https\"],\"allow_private_addresses\":false}}");
+        if (std.mem.indexOf(u8, explicit, "allow_schemes") == null or
+            std.mem.indexOf(u8, explicit, "allow_private_addresses") == null or
+            std.mem.indexOf(u8, explicit, "\"ws\"") != null or
+            std.mem.indexOf(u8, explicit, "\"allow_private_addresses\":false") == null)
+            fail("explicit scheme/private fields did not tighten");
+        const widen = m.callTool("web_policy_set", "{\"policy\":{\"allow_schemes\":[\"https\",\"ws\"],\"allow_private_addresses\":true,\"allow_hosts\":[\"smoke.invalid\",\"other.invalid\"],\"max_requests\":400}}");
+        if (std.mem.indexOf(u8, widen, "\"code\":\"refused\"") == null or
+            std.mem.indexOf(u8, widen, "allow_schemes") == null or
+            std.mem.indexOf(u8, widen, "allow_private_addresses") == null or
+            std.mem.indexOf(u8, widen, "allow_hosts") == null or
+            std.mem.indexOf(u8, widen, "max_requests") == null)
+            fail("a widening web_policy_set was not refused naming every field");
         m.closeStdinWait();
     }
 }
