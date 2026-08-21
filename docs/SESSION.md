@@ -1,5 +1,36 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-21: test scratch leaks closed; private MCP daemons retire themselves
+
+A day of suite runs had left ~1060 `/tmp/sketerm-*` directories and
+53 orphan `sketerm-mux --broker` processes on the dev box. Two causes:
+unit tests minting `mkdtemp` dirs with no removal (fsserve, fsjob,
+pathz, deploy, crashlog; `config.zig` TRIED, but its `defer rmdir`
+ran before `defer unlink`), and `smoke-mcp`'s `fail()` exiting through
+`std.process.exit`, which skips the `defer killDaemonsUnderRt` -- every
+failed run kept its five brokers. `pathz.removeTree` + `pathz.TempDir`
+are now the one tree remover / scratch dir (the fifth hand-copied
+`rmTree` is gone: daemon, webprofiles, panel/assets, webstore,
+panelstore all point at it; it lstat's before opendir so a symlink to
+a directory is unlinked, never emptied, and collects names before
+unlinking so readdir cannot skip entries). `fail()` retires the daemons
+and names the kept dir; a PASS removes it. The long-red
+`environOfPid fails closed` test is green: a full buffer is probed
+with one more read and a truncated block returns null.
+
+`sketerm mcp --name <n>` accumulated one idle broker per name forever
+(a consumer minting an instance per data source hit it). Private
+instance daemons now take `--idle-exit 120` (muxclient appends it when
+`SKETERM_MUX_IDLE_EXIT` is set, which `sketerm mcp` does for isolated
+instances only and only for an explicitly addressed socket; the daemon
+scrubs the variable so its shells never pass it on): no session
+(broker: no worker) and no client for two minutes -> exit. Durable
+instances lose nothing -- apps are sessions, profiles live under
+`$XDG_STATE_HOME`, the next tool call autostarts a fresh broker.
+`src/ipc/CLAUDE.md` also now states that one named instance serves ONE
+`sketerm mcp` process at a time for the web tools (profile store flock,
+shared `web.sock`).
+
 ## 2026-08-20: macOS is a working target — browser, Command keys, honest suites
 
 The CEF browser now works on macOS: `smoke-web` is fully green. The

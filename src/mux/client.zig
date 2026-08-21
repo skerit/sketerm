@@ -363,6 +363,11 @@ pub const Conn = struct {
         return connectLocalAutostartAt(allocator, null);
     }
 
+    /// Whole seconds; when set in the autostarting process, every PRIVATE
+    /// instance daemon it spawns gets `--idle-exit N`. `sketerm mcp` sets
+    /// it; the per-user daemon (default socket) never takes it.
+    pub const IDLE_EXIT_ENV = "SKETERM_MUX_IDLE_EXIT";
+
     /// Like `connectLocalAutostart`, but against `sock_path` when given —
     /// a PRIVATE daemon instance (its aux sockets live next to the socket),
     /// used by `sketerm mcp` isolation. null = the shared per-user daemon.
@@ -388,6 +393,19 @@ pub const Conn = struct {
             (std.fmt.bufPrintZ(&sock_z_buf, "{s}", .{path}) catch return error.BadPath).ptr
         else
             null;
+        // Validated here so a bad value costs nothing in the child: the
+        // daemon is started WITHOUT the flag rather than not at all. Only
+        // an explicitly addressed instance socket takes it -- the
+        // per-user daemon (default path) must never retire itself, even
+        // when autostarted from inside an MCP-spawned shell that
+        // inherited the knob.
+        const idle_exit: ?[*:0]const u8 = blk: {
+            if (sock_path == null) break :blk null;
+            const v = c.getenv(IDLE_EXIT_ENV) orelse break :blk null;
+            const s = std.mem.span(@as([*:0]const u8, @ptrCast(v)));
+            _ = std.fmt.parseInt(u32, s, 10) catch break :blk null;
+            break :blk @ptrCast(v);
+        };
         const pid = c.fork();
         if (pid == 0) {
             _ = c.setsid();
@@ -407,7 +425,7 @@ pub const Conn = struct {
             }
             var bin_buf: [4096:0]u8 = undefined;
             const bin = findMuxBinary(&bin_buf);
-            var argv: [5:null]?[*:0]const u8 = .{ bin, null, null, null, null };
+            var argv: [7:null]?[*:0]const u8 = .{ bin, null, null, null, null, null, null };
             var n: usize = 1;
             if (use_broker) {
                 argv[n] = "--broker";
@@ -416,6 +434,11 @@ pub const Conn = struct {
             if (sock_z) |z| {
                 argv[n] = "--socket";
                 argv[n + 1] = z;
+                n += 2;
+            }
+            if (idle_exit) |secs| {
+                argv[n] = "--idle-exit";
+                argv[n + 1] = secs;
             }
             _ = c.execvp(bin, @ptrCast(@constCast(&argv)));
             c._exit(127);

@@ -51,7 +51,11 @@ const MCP_HELP =
     \\  --durable      keep the private daemon (and its apps) running
     \\                 across MCP restarts (instance name "default")
     \\  --name NAME    named durable instance; a later `sketerm mcp
-    \\                 --name NAME` reconnects to the same daemon
+    \\                 --name NAME` reconnects to the same daemon. A
+    \\                 private daemon left with no apps and no clients
+    \\                 for 2 minutes exits by itself (nothing is lost:
+    \\                 profiles live in $XDG_STATE_HOME, the next tool
+    \\                 call starts a fresh one)
     \\  --shared       OPT-IN to the user's real per-user daemon and
     \\                 running GUI (pre-isolation behavior): terminal
     \\                 tools drive live panes, apps share the daemon
@@ -360,6 +364,10 @@ const McpLog = struct {
 };
 
 var mcp_log: ?McpLog = null;
+
+/// Seconds an isolated instance's daemon may sit with no sessions and
+/// no clients before it exits on its own (see `setupIsolation`'s caller).
+const ISOLATED_IDLE_EXIT_SECS = "120";
 
 /// The private daemon instance of an isolated (non `--shared`) run.
 const Isolation = struct {
@@ -692,6 +700,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             _ = c.fputs("sketerm mcp: cannot create isolated runtime dir\n", platform.stderr());
             return 1;
         };
+        // A private daemon with no sessions and no clients is nobody's:
+        // let it retire itself (muxclient passes this to every daemon it
+        // autostarts from this process). A durable instance still keeps
+        // its apps -- the count is of SESSIONS, and the next tool call
+        // simply autostarts a fresh broker. Without it every `--name`
+        // ever used left an idle broker behind until reboot.
+        _ = c.setenv(muxclient.Conn.IDLE_EXIT_ENV, ISOLATED_IDLE_EXIT_SECS, 1);
     }
     defer if (iso) |*i| i.deinit(allocator);
 

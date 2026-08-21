@@ -20,7 +20,7 @@ const sig_ign = &sigNoop;
 const HELP =
     \\sketerm-mux — sketerm session daemon (durable panes)
     \\
-    \\Usage: sketerm-mux [--socket PATH]
+    \\Usage: sketerm-mux [--socket PATH] [--idle-exit SECS]
     \\       sketerm-mux --proxy
     \\       sketerm-mux --udp-listen [--udp-port LO:HI]
     \\       sketerm-mux display <create|run|inspect|list|destroy> ...
@@ -31,6 +31,8 @@ const HELP =
     \\`sketerm mux ...`) connect over the socket to spawn, attach,
     \\and control sessions. Shells keep running while no client is
     \\attached; SIGTERM shuts down (and kills the sessions).
+    \\--idle-exit SECS makes the daemon exit by itself once it has held
+    \\no session and no client for that long (private MCP instances).
     \\
     \\--proxy bridges stdin/stdout to the daemon socket, starting the
     \\daemon if needed. This is the SSH transport: the sketerm GUI
@@ -61,6 +63,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     var sock_path: ?[]const u8 = null;
     var broker_mode = false;
+    var idle_exit_ms: i64 = 0;
     const argv = init.args.vector;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -72,6 +75,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             // Process-isolation mode: hold no sessions; fork one worker per
             // session and hand client fds to workers (Firefox-style).
             broker_mode = true;
+        } else if (std.mem.eql(u8, a, "--idle-exit") and i + 1 < argv.len) {
+            // Exit once no session and no client has existed for this many
+            // seconds. Opt-in: a per-user daemon lives client-less for days
+            // by design; an MCP instance's private daemon should not.
+            i += 1;
+            const secs = std.fmt.parseInt(u32, std.mem.span(argv[i]), 10) catch {
+                std.debug.print("sketerm-mux: bad --idle-exit '{s}' (want whole seconds)\n", .{std.mem.span(argv[i])});
+                return 2;
+            };
+            idle_exit_ms = @as(i64, secs) * 1000;
         } else if (std.mem.eql(u8, a, "--job")) {
             // Internal: file-job helper (spawned by the daemon; spec on
             // stdin, JSON-lines progress on stdout). One process per
@@ -162,6 +175,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         return 1;
     };
     d.is_broker = broker_mode;
+    d.idle_exit_ms = idle_exit_ms;
+    // The autostart knob travelled in OUR environment; the shells and
+    // apps this daemon spawns must not carry it on to daemons THEY start.
+    _ = c.unsetenv(@import("mux/client.zig").Conn.IDLE_EXIT_ENV);
     defer d.deinit();
     g_daemon = d;
 

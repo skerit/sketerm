@@ -1123,6 +1123,54 @@ test "daemon startup recovers a refused stale socket" {
     try t.expect(c.access(path.ptr, c.F_OK) != 0);
 }
 
+test "--idle-exit retires a daemon holding nothing; 0 never does" {
+    const t = std.testing;
+    var path_buf: [256:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-daemon-idle-{d}.sock", .{c.getpid()});
+    var lock_buf: [280:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    _ = c.unlink(path.ptr);
+    _ = c.unlink(lock_path.ptr);
+    defer {
+        _ = c.unlink(path.ptr);
+        _ = c.unlink(lock_path.ptr);
+    }
+    var d = try Daemon.init(t.allocator, path);
+    defer d.deinit();
+
+    // Default: client-less forever (`reap` is the per-tick sweep the
+    // check rides on).
+    d.reap();
+    _ = c.usleep(5_000);
+    d.reap();
+    try t.expect(d.running);
+    try t.expectEqual(@as(i64, 0), d.idle_since_ms);
+
+    // Armed: the first idle tick starts the clock, a later one past the
+    // budget clears `running`. Broker mode counts workers the same way.
+    d.idle_exit_ms = 1;
+    d.is_broker = true;
+    d.reap();
+    try t.expect(d.running);
+    try t.expect(d.idle_since_ms != 0);
+    _ = c.usleep(5_000);
+    d.reap();
+    try t.expect(!d.running);
+
+    // Something held resets the clock rather than letting it run on.
+    d.running = true;
+    d.idle_since_ms = nowMs() - 10_000;
+    d.is_broker = false;
+    var a_client = try t.allocator.create(Client);
+    a_client.* = .{ .fd = -1, .allocator = t.allocator, .id = 1 };
+    try d.clients.append(t.allocator, a_client);
+    d.reap();
+    try t.expect(d.running);
+    try t.expectEqual(@as(i64, 0), d.idle_since_ms);
+    _ = d.clients.pop();
+    a_client.deinit();
+}
+
 test "lsp_open resolves the root remotely, bridges stdio bytes, and reaps on close" {
     const t = std.testing;
     const muxclient = @import("client.zig");
@@ -2327,6 +2375,13 @@ pub const Daemon = struct {
     /// path-safety reason as next_wl_id).
     next_rt_id: u32 = 1,
     running: bool = true,
+    /// Opt-in self-retirement (`--idle-exit N`): once no session (broker:
+    /// no worker) and no client has existed for this long, `running`
+    /// clears. 0 = live client-less forever, the per-user daemon's
+    /// whole point. Workers ignore it; their one session rules them.
+    idle_exit_ms: i64 = 0,
+    /// When the current client-less, session-less stretch began; 0 = not idle.
+    idle_since_ms: i64 = 0,
     /// Process-isolation mode (Firefox-style). A WORKER process owns exactly
     /// one session and has `control_fd` >= 0 (a socketpair to the broker)
     /// instead of a listen socket — new clients arrive as passed fds, not via
@@ -6161,6 +6216,29 @@ pub const Daemon = struct {
                 continue;
             }
             i += 1;
+        }
+        self.idleExitCheck();
+    }
+
+    /// `--idle-exit`: retire a daemon that has held nothing for anyone
+    /// long enough. Counts are taken AFTER the reaps above, so a session
+    /// exiting and its viewer leaving in the same tick start the clock
+    /// together.
+    fn idleExitCheck(self: *Daemon) void {
+        if (self.idle_exit_ms <= 0 or self.isWorker()) return;
+        const held = if (self.is_broker) self.workers.items.len else self.sessions.items.len;
+        if (held > 0 or self.clients.items.len > 0) {
+            self.idle_since_ms = 0;
+            return;
+        }
+        const now = nowMs();
+        if (self.idle_since_ms == 0) {
+            self.idle_since_ms = now;
+            return;
+        }
+        if (now - self.idle_since_ms >= self.idle_exit_ms) {
+            log.info("idle for {d}s with no sessions or clients; exiting (--idle-exit)", .{@divTrunc(self.idle_exit_ms, 1000)});
+            self.running = false;
         }
     }
 };
