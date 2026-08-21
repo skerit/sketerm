@@ -53,6 +53,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const dbus = @import("../mux/dbus.zig");
+const dbusconn = @import("../mux/dbusconn.zig");
 const axtree = @import("../web/axtree.zig");
 const proto = @import("../web/protocol.zig");
 
@@ -202,7 +203,7 @@ pub const Proj = struct {
         var a11y_path: []const u8 = "";
 
         if (c.getenv("AT_SPI_BUS_ADDRESS")) |env| {
-            a11y_path = parseUnixPath(std.mem.sliceTo(env, 0), &a11y_path_buf) orelse
+            a11y_path = dbusconn.parseUnixPath(std.mem.sliceTo(env, 0), &a11y_path_buf) orelse
                 return error.BadBusAddress;
         } else {
             var sess_buf: [256]u8 = undefined;
@@ -210,10 +211,10 @@ pub const Proj = struct {
                 p
             else blk: {
                 const env = c.getenv("DBUS_SESSION_BUS_ADDRESS") orelse return error.NoSessionBus;
-                break :blk parseUnixPath(std.mem.sliceTo(env, 0), &sess_buf) orelse
+                break :blk dbusconn.parseUnixPath(std.mem.sliceTo(env, 0), &sess_buf) orelse
                     return error.BadBusAddress;
             };
-            const sfd = try busConnect(sess_path);
+            const sfd = try dbusconn.busConnect(sess_path);
             defer _ = c.close(sfd);
             var sess = Proj{
                 .gpa = self.gpa,
@@ -233,10 +234,10 @@ pub const Proj = struct {
             defer self.gpa.free(reply.body);
             var rd = dbus.Reader.init(reply.body);
             const addr = try rd.string();
-            a11y_path = parseUnixPath(addr, &a11y_path_buf) orelse return error.BadBusAddress;
+            a11y_path = dbusconn.parseUnixPath(addr, &a11y_path_buf) orelse return error.BadBusAddress;
         }
 
-        self.fd = try busConnect(a11y_path);
+        self.fd = try dbusconn.busConnect(a11y_path);
         errdefer {
             _ = c.close(self.fd);
             self.fd = -1;
@@ -248,35 +249,8 @@ pub const Proj = struct {
 
     /// SASL EXTERNAL + Hello, recording our unique name.
     fn authAndHello(self: *Proj, deadline: i64) !void {
-        try self.writeAll(&.{0}, deadline);
-        var line: [128]u8 = undefined;
-        var n: usize = 0;
-        const head = "AUTH EXTERNAL ";
-        @memcpy(line[0..head.len], head);
-        n = head.len;
-        var idbuf: [32]u8 = undefined;
-        const dec = try std.fmt.bufPrint(&idbuf, "{d}", .{c.getuid()});
-        for (dec) |ch| {
-            _ = std.fmt.bufPrint(line[n..], "{x:0>2}", .{ch}) catch return error.Auth;
-            n += 2;
-        }
-        @memcpy(line[n..][0..2], "\r\n");
-        n += 2;
-        try self.writeAll(line[0..n], deadline);
-        var buf: [256]u8 = undefined;
-        try waitFd(self.fd, c.POLLIN, deadline);
-        const got = c.read(self.fd, &buf, buf.len);
-        if (got <= 0) return error.Auth;
-        if (!std.mem.startsWith(u8, buf[0..@intCast(got)], "OK")) return error.AuthRejected;
-        try self.writeAll("BEGIN\r\n", deadline);
-
-        const reply = try self.callBlocking(.{
-            .mtype = .method_call,
-            .path = "/org/freedesktop/DBus",
-            .interface = "org.freedesktop.DBus",
-            .member = "Hello",
-            .destination = "org.freedesktop.DBus",
-        }, deadline);
+        try dbusconn.authExternal(self.fd, deadline);
+        const reply = try self.callBlocking(dbusconn.hello_call, deadline);
         defer self.gpa.free(reply.body);
         var rd = dbus.Reader.init(reply.body);
         const name = try rd.string();
@@ -350,7 +324,7 @@ pub const Proj = struct {
     /// loop; the GUI instead watches `fd` and calls `step` directly.
     pub fn serveSlice(self: *Proj, timeout_ms: i64) bool {
         if (self.fd < 0) return false;
-        waitFd(self.fd, c.POLLIN, nowMs() + timeout_ms) catch |err| switch (err) {
+        dbusconn.waitFd(self.fd, c.POLLIN, nowMs() + timeout_ms) catch |err| switch (err) {
             error.Timeout => return true,
             else => return false,
         };
@@ -386,7 +360,7 @@ pub const Proj = struct {
                 _ = self.dispatch(m);
                 self.rbuf.replaceRange(self.gpa, 0, got.consumed, &.{}) catch return error.OutOfMemory;
             }
-            try waitFd(self.fd, c.POLLIN, deadline);
+            try dbusconn.waitFd(self.fd, c.POLLIN, deadline);
             var tmp: [16384]u8 = undefined;
             const n = c.read(self.fd, &tmp, tmp.len);
             if (n > 0) {
@@ -401,21 +375,7 @@ pub const Proj = struct {
     }
 
     fn writeAll(self: *Proj, bytes: []const u8, deadline: i64) !void {
-        var off: usize = 0;
-        while (off < bytes.len) {
-            const n = c.write(self.fd, bytes[off..].ptr, bytes.len - off);
-            if (n > 0) {
-                off += @intCast(n);
-                continue;
-            }
-            const e = std.posix.errno(n);
-            if (e == .INTR) continue;
-            if (e == .AGAIN) {
-                try waitFd(self.fd, c.POLLOUT, deadline);
-                continue;
-            }
-            return error.Write;
-        }
+        return dbusconn.writeAll(self.fd, bytes, deadline);
     }
 
     // ── event emission ───────────────────────────────────────────────
@@ -1702,41 +1662,6 @@ fn roleNumber(n: *const axtree.Node) u32 {
     return 85; // SECTION: unknown roles present as generic nodes
 }
 
-// ── plumbing ─────────────────────────────────────────────────────────
-
-pub fn busConnect(path: []const u8) !c_int {
-    const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
-    if (fd < 0) return error.Socket;
-    errdefer _ = c.close(fd);
-    var addr: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
-    addr.sun_family = c.AF_UNIX;
-    const dst = std.mem.asBytes(&addr.sun_path);
-    if (path.len == 0 or path.len >= dst.len) return error.BadPath;
-    if (path[0] == '@') {
-        dst[0] = 0; // abstract namespace
-        @memcpy(dst[1..path.len], path[1..]);
-    } else {
-        @memcpy(dst[0..path.len], path);
-    }
-    if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return error.Connect;
-    const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
-    if (fl >= 0) _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
-    return fd;
-}
-
-pub fn waitFd(fd: c_int, events: c_short, deadline: i64) !void {
-    while (true) {
-        const left: c_int = @intCast(@max(0, @min(deadline - nowMs(), std.math.maxInt(c_int))));
-        if (left == 0) return error.Timeout;
-        var pfd = c.struct_pollfd{ .fd = fd, .events = events, .revents = 0 };
-        const rc = c.poll(&pfd, 1, left);
-        if (rc > 0 and pfd.revents & events != 0) return;
-        if (rc < 0 and std.posix.errno(rc) == .INTR) continue;
-        if (rc == 0) return error.Timeout;
-        return error.Closed;
-    }
-}
-
 // ── tests ────────────────────────────────────────────────────────────
 
 const t = std.testing;
@@ -1822,30 +1747,4 @@ test "node paths round-trip through the AT-SPI prefix" {
     try t.expectEqualStrings(PATH_PREFIX ++ "42", nodePath(&buf, 42));
     try t.expectEqual(@as(?usize, 1), indexOfId(&.{ 7, 9, 11 }, 9));
     try t.expectEqual(@as(?usize, null), indexOfId(&.{ 7, 9, 11 }, 8));
-}
-
-/// "unix:path=/x" or "unix:abstract=x" -> a connectable path ('@'
-/// marks abstract, matching `busConnect`), copied into `buf`.
-pub fn parseUnixPath(addr: []const u8, buf: []u8) ?[]const u8 {
-    var seg = std.mem.splitScalar(u8, addr, ';');
-    while (seg.next()) |part| {
-        if (!std.mem.startsWith(u8, part, "unix:")) continue;
-        var kv = std.mem.splitScalar(u8, part["unix:".len..], ',');
-        while (kv.next()) |pair| {
-            if (std.mem.startsWith(u8, pair, "path=")) {
-                const p = pair["path=".len..];
-                if (p.len > buf.len) return null;
-                @memcpy(buf[0..p.len], p);
-                return buf[0..p.len];
-            }
-            if (std.mem.startsWith(u8, pair, "abstract=")) {
-                const p = pair["abstract=".len..];
-                if (p.len + 1 > buf.len) return null;
-                buf[0] = '@';
-                @memcpy(buf[1 .. 1 + p.len], p);
-                return buf[0 .. 1 + p.len];
-            }
-        }
-    }
-    return null;
 }

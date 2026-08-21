@@ -142,6 +142,7 @@ comptime {
     _ = @import("mux/cast.zig");
     _ = @import("mux/cast_play.zig");
     _ = @import("mux/dbus.zig");
+    _ = @import("mux/dbusconn.zig");
     _ = @import("mux/desktop.zig");
     _ = @import("mux/deploy.zig");
     _ = @import("mux/display.zig");

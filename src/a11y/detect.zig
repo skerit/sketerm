@@ -40,8 +40,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const dbus = @import("../mux/dbus.zig");
-const webproj = @import("webproj.zig");
-const clock = @import("../util/clock.zig");
+const dbusconn = @import("../mux/dbusconn.zig");
+const nowMs = @import("../util/clock.zig").nowMs;
 
 /// Total wall-clock budget. A desktop whose a11y bus needs longer than
 /// this to answer is treated as absent rather than stalling a browser
@@ -94,13 +94,13 @@ pub fn detect(gpa: std.mem.Allocator) Reason {
 }
 
 fn probe(gpa: std.mem.Allocator) !Reason {
-    const deadline = clock.nowMs() + PROBE_BUDGET_MS;
+    const deadline = nowMs() + PROBE_BUDGET_MS;
     var path_buf: [256]u8 = undefined;
     const env = c.getenv("DBUS_SESSION_BUS_ADDRESS") orelse return .unavailable;
-    const sess = webproj.parseUnixPath(std.mem.sliceTo(env, 0), &path_buf) orelse
+    const sess = dbusconn.parseUnixPath(std.mem.sliceTo(env, 0), &path_buf) orelse
         return .unavailable;
 
-    var conn = Conn{ .gpa = gpa, .fd = try webproj.busConnect(sess) };
+    var conn = Conn{ .gpa = gpa, .fd = try dbusconn.busConnect(sess) };
     defer conn.deinit();
     try conn.authAndHello(deadline);
 
@@ -134,37 +134,8 @@ const Conn = struct {
     }
 
     fn authAndHello(self: *Conn, deadline: i64) !void {
-        try self.writeAll(&.{0}, deadline);
-        var line: [128]u8 = undefined;
-        const head = "AUTH EXTERNAL ";
-        @memcpy(line[0..head.len], head);
-        var n: usize = head.len;
-        var idbuf: [32]u8 = undefined;
-        // SASL EXTERNAL wants the uid as DECIMAL ascii, then each of
-        // those bytes hex-encoded (1000 -> "1000" -> "31303030").
-        const dec = try std.fmt.bufPrint(&idbuf, "{d}", .{c.getuid()});
-        for (dec) |ch| {
-            _ = std.fmt.bufPrint(line[n..], "{x:0>2}", .{ch}) catch return error.Auth;
-            n += 2;
-        }
-        @memcpy(line[n..][0..2], "\r\n");
-        n += 2;
-        try self.writeAll(line[0..n], deadline);
-
-        var buf: [256]u8 = undefined;
-        try webproj.waitFd(self.fd, c.POLLIN, deadline);
-        const got = c.read(self.fd, &buf, buf.len);
-        if (got <= 0) return error.Auth;
-        if (!std.mem.startsWith(u8, buf[0..@intCast(got)], "OK")) return error.AuthRejected;
-        try self.writeAll("BEGIN\r\n", deadline);
-
-        const reply = try self.call(.{
-            .mtype = .method_call,
-            .path = "/org/freedesktop/DBus",
-            .interface = "org.freedesktop.DBus",
-            .member = "Hello",
-            .destination = "org.freedesktop.DBus",
-        }, deadline);
+        try dbusconn.authExternal(self.fd, deadline);
+        const reply = try self.call(dbusconn.hello_call, deadline);
         self.gpa.free(reply.body);
     }
 
@@ -236,7 +207,7 @@ const Conn = struct {
                 self.rbuf.replaceRange(self.gpa, 0, got.consumed, &.{}) catch {};
                 return copy;
             }
-            try webproj.waitFd(self.fd, c.POLLIN, deadline);
+            try dbusconn.waitFd(self.fd, c.POLLIN, deadline);
             var tmp: [4096]u8 = undefined;
             const n = c.read(self.fd, &tmp, tmp.len);
             if (n > 0) {
@@ -251,21 +222,7 @@ const Conn = struct {
     }
 
     fn writeAll(self: *Conn, bytes: []const u8, deadline: i64) !void {
-        var off: usize = 0;
-        while (off < bytes.len) {
-            const n = c.write(self.fd, bytes[off..].ptr, bytes.len - off);
-            if (n > 0) {
-                off += @intCast(n);
-                continue;
-            }
-            const e = std.posix.errno(n);
-            if (e == .INTR) continue;
-            if (e == .AGAIN) {
-                try webproj.waitFd(self.fd, c.POLLOUT, deadline);
-                continue;
-            }
-            return error.Write;
-        }
+        return dbusconn.writeAll(self.fd, bytes, deadline);
     }
 };
 

@@ -12,6 +12,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const dbus = @import("dbus.zig");
+const dbusconn = @import("dbusconn.zig");
 
 const nowMs = @import("../util/clock.zig").nowMs;
 
@@ -171,7 +172,8 @@ pub const Hub = struct {
         defer a.free(ga.body);
         var gr = dbus.Reader.init(ga.body);
         const a11y_addr = gr.string() catch return false;
-        const a11y_path = parseUnixPath(a11y_addr) orelse return false;
+        var a11y_path_buf: [256]u8 = undefined;
+        const a11y_path = dbusconn.parseUnixPath(a11y_addr, &a11y_path_buf) orelse return false;
         var bus = Conn.connect(a, a11y_path) catch return false;
         defer bus.deinit();
         bus.authAndHello() catch return false;
@@ -299,7 +301,8 @@ pub const Hub = struct {
         defer allocator.free(ga.body);
         var gr = dbus.Reader.init(ga.body);
         const a11y_addr = gr.string() catch return null;
-        const a11y_path = parseUnixPath(a11y_addr) orelse return null;
+        var a11y_path_buf: [256]u8 = undefined;
+        const a11y_path = dbusconn.parseUnixPath(a11y_addr, &a11y_path_buf) orelse return null;
 
         var bus = Conn.connect(allocator, a11y_path) catch return null;
         bus.authAndHello() catch {
@@ -668,29 +671,6 @@ fn setStatus(allocator: std.mem.Allocator, conn: *Conn, prop: []const u8, val: b
     allocator.free(r.body);
 }
 
-/// "unix:path=/x,guid=..." or ",abstract=..." → connect target
-/// ('@'-prefixed for the abstract namespace). Returned slice points
-/// into `addr` unless abstract (then it's a static-buf copy — the
-/// caller connects immediately, before the buf is reused).
-fn parseUnixPath(addr: []const u8) ?[]const u8 {
-    var seg = std.mem.splitScalar(u8, addr, ';');
-    const first = seg.next() orelse return null;
-    if (!std.mem.startsWith(u8, first, "unix:")) return null;
-    var kv = std.mem.splitScalar(u8, first["unix:".len..], ',');
-    while (kv.next()) |pair| {
-        if (std.mem.startsWith(u8, pair, "path=")) return pair["path=".len..];
-        if (std.mem.startsWith(u8, pair, "abstract=")) {
-            abstract_buf[0] = '@';
-            const v = pair["abstract=".len..];
-            if (v.len + 1 > abstract_buf.len) return null;
-            @memcpy(abstract_buf[1 .. 1 + v.len], v);
-            return abstract_buf[0 .. 1 + v.len];
-        }
-    }
-    return null;
-}
-var abstract_buf: [256]u8 = undefined;
-
 // ── D-Bus client over a Unix socket (c.zig sockets) ─────────────
 
 const Conn = struct {
@@ -704,22 +684,7 @@ const Conn = struct {
     deadline_ms: i64,
 
     fn connect(allocator: std.mem.Allocator, path: []const u8) !Conn {
-        const fd = @import("../util/platform.zig").socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
-        if (fd < 0) return error.Socket;
-        errdefer _ = c.close(fd);
-        var addr: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
-        addr.sun_family = c.AF_UNIX;
-        const dst = std.mem.asBytes(&addr.sun_path);
-        if (path.len == 0 or path.len >= dst.len) return error.BadPath;
-        if (path[0] == '@') {
-            dst[0] = 0; // abstract namespace
-            @memcpy(dst[1..path.len], path[1..]);
-        } else {
-            @memcpy(dst[0..path.len], path);
-        }
-        if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return error.Connect;
-        const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
-        if (fl >= 0) _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+        const fd = try dbusconn.busConnect(path);
         // Budget sized for a full MAX_NODES tree walk (thousands of local
         // D-Bus round trips) on a healthy bus, while still bounding how
         // long a wedged peer can stall the daemon poll loop.
@@ -732,66 +697,18 @@ const Conn = struct {
     }
 
     fn waitFd(self: *Conn, events: c_short, deadline: i64) !void {
-        while (true) {
-            const left: c_int = @intCast(@max(0, @min(deadline - nowMs(), std.math.maxInt(c_int))));
-            if (left == 0) return error.Timeout;
-            var pfd = c.struct_pollfd{ .fd = self.fd, .events = events, .revents = 0 };
-            const rc = c.poll(&pfd, 1, left);
-            if (rc > 0 and pfd.revents & events != 0) return;
-            if (rc < 0 and std.posix.errno(rc) == .INTR) continue;
-            if (rc == 0) return error.Timeout;
-            return error.Closed;
-        }
+        return dbusconn.waitFd(self.fd, events, deadline);
     }
 
     fn writeAll(self: *Conn, bytes: []const u8) !void {
-        const deadline = self.deadline_ms;
-        var off: usize = 0;
-        while (off < bytes.len) {
-            const n = c.write(self.fd, bytes[off..].ptr, bytes.len - off);
-            if (n > 0) {
-                off += @intCast(n);
-                continue;
-            }
-            const e = std.posix.errno(n);
-            if (e == .INTR) continue;
-            if (e == .AGAIN) {
-                try self.waitFd(c.POLLOUT, deadline);
-                continue;
-            }
-            return error.Write;
-        }
+        return dbusconn.writeAll(self.fd, bytes, self.deadline_ms);
     }
 
     /// SASL EXTERNAL auth (uid as decimal, hex-encoded) + BEGIN, then
     /// the org.freedesktop.DBus.Hello handshake.
     fn authAndHello(self: *Conn) !void {
-        try self.writeAll(&.{0});
-        var line: std.ArrayList(u8) = .empty;
-        defer line.deinit(self.allocator);
-        try line.appendSlice(self.allocator, "AUTH EXTERNAL ");
-        var idbuf: [32]u8 = undefined;
-        const dec = try std.fmt.bufPrint(&idbuf, "{d}", .{c.getuid()});
-        for (dec) |ch| {
-            var h: [2]u8 = undefined;
-            _ = std.fmt.bufPrint(&h, "{x:0>2}", .{ch}) catch unreachable;
-            try line.appendSlice(self.allocator, &h);
-        }
-        try line.appendSlice(self.allocator, "\r\n");
-        try self.writeAll(line.items);
-        var buf: [256]u8 = undefined;
-        try self.waitFd(c.POLLIN, self.deadline_ms);
-        const n = c.read(self.fd, &buf, buf.len);
-        if (n <= 0) return error.AuthRead;
-        if (!std.mem.startsWith(u8, buf[0..@intCast(n)], "OK")) return error.AuthRejected;
-        try self.writeAll("BEGIN\r\n");
-        const r = try self.call(.{
-            .mtype = .method_call,
-            .path = "/org/freedesktop/DBus",
-            .interface = "org.freedesktop.DBus",
-            .member = "Hello",
-            .destination = "org.freedesktop.DBus",
-        });
+        try dbusconn.authExternal(self.fd, self.deadline_ms);
+        const r = try self.call(dbusconn.hello_call);
         self.allocator.free(r.body);
     }
 
@@ -1102,12 +1019,4 @@ test "AT-SPI AccessibleId is not promoted to a desktop app id" {
     try appendAccessibleId(&out, a, "QApplication");
     try std.testing.expectEqualStrings(",\"accessible_id\":\"QApplication\"", out.items);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\"app_id\"") == null);
-}
-
-test "parseUnixPath extracts path and abstract forms" {
-    try std.testing.expectEqualStrings("/run/x", parseUnixPath("unix:path=/run/x,guid=ab").?);
-    const abs = parseUnixPath("unix:abstract=/tmp/dbus-XYZ,guid=1").?;
-    try std.testing.expect(abs[0] == '@');
-    try std.testing.expectEqualStrings("/tmp/dbus-XYZ", abs[1..]);
-    try std.testing.expect(parseUnixPath("tcp:host=x") == null);
 }
