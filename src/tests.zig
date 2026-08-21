@@ -73,6 +73,8 @@ comptime {
     _ = @import("util/content.zig");
     _ = @import("util/yuv.zig");
     _ = @import("shim_drift_test.zig");
+    _ = @import("panelvocab.zig");
+    _ = @import("panelvocab_drift_test.zig");
     _ = @import("mux/predict.zig");
     _ = @import("mux/deploy.zig");
     _ = @import("mux/kitty_inline.zig");

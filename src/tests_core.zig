@@ -196,6 +196,8 @@ comptime {
     _ = @import("remoteapp.zig");
     _ = @import("shader_preset.zig");
     _ = @import("shim_drift_test.zig");
+    _ = @import("panelvocab.zig");
+    _ = @import("panelvocab_drift_test.zig");
     _ = @import("util/churn.zig");
     _ = @import("util/clock.zig");
     _ = @import("util/spinlock.zig");

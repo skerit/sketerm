@@ -29,16 +29,18 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const clock = @import("../../util/clock.zig");
+const vocab = @import("../../panelvocab.zig");
 const SpinLock = @import("../../util/spinlock.zig").SpinLock;
 
-/// Longest component id (mirrored by doc.zig's id validation).
-pub const MAX_ID: usize = 64;
+/// Longest component id. Declared once in `panelvocab.zig`, because
+/// the daemon's presenter validator bounds the same ids.
+pub const MAX_ID: usize = vocab.MAX_ID;
 /// Longest text payload an event carries. This accommodates submitted
 /// text_input values without allocating in GTK signal handlers.
-pub const MAX_TEXT: usize = 4096;
+pub const MAX_TEXT: usize = vocab.MAX_TEXT;
 /// Existing short interaction values (button actions and select
 /// options) retain their original bound.
-pub const MAX_SHORT_TEXT: usize = 128;
+pub const MAX_SHORT_TEXT: usize = vocab.MAX_SHORT_TEXT;
 /// Ring capacity. Full queue drops the OLDEST event (the consumer
 /// prefers fresh interactions over stale ones) and counts the drop.
 pub const CAP: usize = 64;
@@ -48,7 +50,7 @@ pub const CAP: usize = 64;
 /// that need instant delivery.
 const POLL_NS: c_long = 10 * std.time.ns_per_ms;
 
-pub const Kind = enum { click, change, submit };
+pub const Kind = vocab.Kind;
 
 pub const Value = union(enum) {
     none: void,

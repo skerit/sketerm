@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const wire = @import("wire.zig");
+const vocab = @import("../panelvocab.zig");
 
 pub const EventEpoch = wire.SessionOriginId;
 pub const validEventEpoch = wire.validSessionOriginId;
@@ -108,23 +109,23 @@ pub fn validateReliableEventsRequest(
         return error.EventEpochMismatch;
 }
 
-fn validComponentId(id: []const u8) bool {
-    if (id.len == 0 or id.len > 64) return false;
-    switch (id[0]) {
-        'a'...'z', 'A'...'Z', '0'...'9', '_' => {},
-        else => return false,
-    }
-    for (id) |ch| switch (ch) {
-        'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.' => {},
-        else => return false,
-    };
-    return true;
+/// The component-id rule, its bound, the text bound and the kind set
+/// are the panel WIRE contract: the GUI presenter bounds exactly the
+/// same ids. They therefore have one declaring home, `panelvocab.zig`,
+/// and are re-exported here rather than restated -- a second copy is
+/// how the daemon came to accept ids the GUI rejects.
+pub const MAX_COMPONENT_ID = vocab.MAX_ID;
+pub const MAX_EVENT_TEXT = vocab.MAX_TEXT;
+pub const validComponentId = vocab.validId;
+
+pub fn validEventKind(kind: []const u8) bool {
+    return vocab.kindFromName(kind) != null;
 }
 
 fn validEventValue(value: std.json.Value) bool {
     return switch (value) {
         .null, .bool, .integer, .float => true,
-        .string => |text| text.len <= 4096,
+        .string => |text| text.len <= MAX_EVENT_TEXT,
         else => false,
     };
 }
@@ -143,10 +144,7 @@ fn validateReliableEvents(events: std.json.Array, cursor: u64) !void {
         const component = event.object.get("component") orelse return error.MissingEventComponent;
         if (component != .string or !validComponentId(component.string)) return error.InvalidEventComponent;
         const kind = event.object.get("kind") orelse return error.MissingEventKind;
-        if (kind != .string or
-            (!std.mem.eql(u8, kind.string, "click") and
-                !std.mem.eql(u8, kind.string, "change") and
-                !std.mem.eql(u8, kind.string, "submit"))) return error.InvalidEventKind;
+        if (kind != .string or !validEventKind(kind.string)) return error.InvalidEventKind;
         const event_value = event.object.get("value") orelse return error.MissingEventValue;
         if (!validEventValue(event_value)) return error.InvalidEventValue;
         const timestamp = event.object.get("ts") orelse return error.MissingEventTimestamp;

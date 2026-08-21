@@ -27,18 +27,19 @@
 const std = @import("std");
 
 pub const events = @import("events.zig");
+const vocab = @import("../../panelvocab.zig");
 
 // ─── limits ─────────────────────────────────────────────────────
 
 pub const MAX_COMPONENTS: usize = 512;
 pub const MAX_CHILDREN: usize = 128;
-pub const MAX_TEXT: usize = 4096;
+pub const MAX_TEXT: usize = vocab.MAX_TEXT;
 pub const MAX_PATH: usize = 1024;
-pub const MAX_ID: usize = events.MAX_ID; // 64
+pub const MAX_ID: usize = vocab.MAX_ID;
 pub const MAX_OPTIONS: usize = 64;
 /// Select options and button actions ride in fixed-size event
 /// payloads and retain their original compact bound.
-pub const MAX_OPTION: usize = events.MAX_SHORT_TEXT; // 128
+pub const MAX_OPTION: usize = vocab.MAX_SHORT_TEXT;
 pub const MAX_CLASSES: usize = 8;
 pub const MAX_DATA_KEYS: usize = 64;
 pub const MAX_DEPTH: usize = 32;
@@ -187,18 +188,9 @@ pub const DataValue = union(enum) {
 
 // ─── validation helpers ─────────────────────────────────────────
 
-pub fn validId(id: []const u8) bool {
-    if (id.len == 0 or id.len > MAX_ID) return false;
-    switch (id[0]) {
-        'a'...'z', 'A'...'Z', '0'...'9', '_' => {},
-        else => return false,
-    }
-    for (id) |ch| switch (ch) {
-        'a'...'z', 'A'...'Z', '0'...'9', '_', '-', '.' => {},
-        else => return false,
-    };
-    return true;
-}
+/// The id rule has ONE home, shared with the daemon's presenter
+/// validator; see `src/panelvocab.zig`.
+pub const validId = vocab.validId;
 
 pub fn validClass(name: []const u8) bool {
     for (CLASSES) |cl| {
