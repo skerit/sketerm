@@ -1025,7 +1025,13 @@ pub const BrowserView = struct {
 
     /// The Window whose widget tree hosts this browser face (null
     /// before attach or after teardown).
+    ///
+    /// The `widgets_dead` guard is not decoration: nothing refs
+    /// `root_box` (the pane's wrapper box holds its only reference),
+    /// so once the widgets are gone the pointer is dangling while the
+    /// view itself lives on until the pane's deferred deinit.
     pub fn ownerWindow(self: *BrowserView) ?*@import("../window.zig").Window {
+        if (self.widgets_dead) return null;
         return facehost.windowOf(self.root_box);
     }
 
