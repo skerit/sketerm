@@ -21,7 +21,6 @@ const recordRegisteredTerm = mcp.recordRegisteredTerm;
 const tailLines = mcp.tailLines;
 const monoMs = mcp.monoMs;
 const shellquote = mcp.shellquote;
-const toolResult = mcp.toolResult;
 
 // ── headless terminal tools (shell sessions on the private daemon) ─
 
@@ -76,57 +75,100 @@ pub fn termLastLine(arena: std.mem.Allocator, t: *termdrive.Term) []const u8 {
 /// the tracker id. `output_file` (optional, absolute, local) receives
 /// the FULL untruncated output; the inline payload then keeps a tail.
 pub fn execResultJson(arena: std.mem.Allocator, r: termdrive.ExecOutcome, t: *termdrive.Term, output_file: ?[]const u8) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.print("{{\"completed\":{},\"exit_status\":", .{r.completed});
-    if (r.exit_status) |st| try w.print("{d}", .{st}) else try w.writeAll("null");
-    try w.print(",\"timed_out\":{},\"truncated\":{},\"shell_died\":{}", .{ r.timed_out, r.truncated, r.shell_died });
+    // The live rendered screen: an interactive dialog (apt's
+    // needrestart, a password ask) must be VISIBLE in the reply, never
+    // hidden behind a bare timeout.
+    var screen_tail: ?[]const u8 = null;
     if (r.pending) {
-        try w.writeAll(",\"pending\":true");
-        if (r.tracker) |nonce| try w.print(",\"tracker\":\"{s}\"", .{nonce});
-        try w.print(",\"alt_screen\":{},\"output_idle_ms\":{d},\"interactive_prompt\":{}", .{ r.alt_screen, r.idle_ms, r.interactive_hint });
-        // The live rendered screen: an interactive dialog (apt's
-        // needrestart, a password ask) must be VISIBLE in the reply,
-        // never hidden behind a bare timeout.
         if (t.readScreen(false)) |screen_text| {
             defer mcp.term_state.allocator.free(screen_text);
-            try w.writeAll(",\"screen\":");
-            try std.json.Stringify.value(tailLines(screen_text, 20), .{}, w);
+            screen_tail = try arena.dupe(u8, tailLines(screen_text, 20));
         } else |_| {}
+    }
+    return execResult(arena, r, screen_tail, output_file);
+}
+
+/// The terminal-free half of execResultJson: everything the reply says
+/// about an outcome, given the screen tail already read.
+pub fn execResult(arena: std.mem.Allocator, r: termdrive.ExecOutcome, screen_tail: ?[]const u8, output_file: ?[]const u8) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try res.fact("completed", r.completed);
+    try res.fact("exit_status", r.exit_status);
+    try res.fact("timed_out", r.timed_out);
+    try res.fact("truncated", r.truncated);
+    try res.fact("shell_died", r.shell_died);
+    try res.fact("pending", r.pending);
+    if (r.completed) {
+        if (r.exit_status) |st|
+            try res.textf("exit {d}", .{st})
+        else
+            try res.text("completed, exit status unknown");
+    } else if (r.pending) {
+        try res.text(if (r.interactive_hint)
+            "still running and apparently WAITING FOR INPUT (see the screen below)"
+        else
+            "still running");
+    } else if (r.timed_out) {
+        try res.text("timed out with no completion marker");
+    }
+    if (r.pending) {
+        if (r.tracker) |nonce| {
+            const tok: []const u8 = &nonce;
+            try res.fact("tracker", tok);
+            try res.textf("tracker: {s}", .{tok});
+        }
+        try res.fact("alt_screen", r.alt_screen);
+        try res.fact("output_idle_ms", r.idle_ms);
+        try res.fact("interactive_prompt", r.interactive_hint);
+        try res.textf("alt_screen: {}, output_idle_ms: {d}", .{ r.alt_screen, r.idle_ms });
+        if (screen_tail) |tail| try res.fact("screen", tail);
     }
     var file_note: ?[]const u8 = null;
     var inline_out: []const u8 = r.output;
     var inline_cap: usize = 200_000;
     if (output_file) |path| {
         if (path.len == 0 or path[0] != '/') {
-            file_note = "output_file must be an absolute local path — ignored, full output inline";
+            file_note = "output_file must be an absolute local path - ignored, full output inline";
         } else if (writeFileBytes(path, r.output)) {
-            try w.writeAll(",\"output_file\":");
-            try std.json.Stringify.value(path, .{}, w);
-            try w.print(",\"output_bytes\":{d}", .{r.output.len});
+            try res.fact("output_file", path);
+            try res.fact("output_bytes", r.output.len);
+            try res.textf("output_file: {s} ({d} bytes)", .{ path, r.output.len });
             inline_cap = 2_000;
         } else {
-            file_note = "output_file could not be written (dir missing / not writable?) — full output inline";
+            file_note = "output_file could not be written (dir missing / not writable?) - full output inline";
         }
     }
     if (inline_out.len > inline_cap) {
-        try w.print(",\"output_dropped_chars\":{d}", .{inline_out.len - inline_cap});
+        try res.fact("output_dropped_chars", inline_out.len - inline_cap);
+        try res.textf("(dropped {d} leading chars)", .{inline_out.len - inline_cap});
         inline_out = inline_out[inline_out.len - inline_cap ..];
     }
-    try w.writeAll(",\"output\":");
-    try std.json.Stringify.value(inline_out, .{}, w);
+    try res.fact("output", inline_out);
     if (file_note) |n| {
-        try w.writeAll(",\"output_file_note\":");
-        try std.json.Stringify.value(n, .{}, w);
+        try res.fact("output_file_note", n);
+        try res.text(n);
     }
-    if (r.pending and r.interactive_hint) {
-        try w.writeAll(",\"reason\":\"the command appears to be WAITING FOR INPUT (see screen) — answer it with term_send_text/term_send_keys; the tracker stays attached and term_exec_wait picks up the completion afterwards\"");
-    } else if (r.pending) {
-        try w.writeAll(",\"reason\":\"still running — continue with term_exec_wait (do not resend); the tracker survives client-side timeouts and aborts\"");
+    const reason: ?[]const u8 = if (r.shell_died)
+        "the shell/connection died before the command finished"
+    else if (r.pending and r.interactive_hint)
+        "the command appears to be WAITING FOR INPUT (see screen) - answer it with term_send_text/term_send_keys; the tracker stays attached and term_exec_wait picks up the completion afterwards"
+    else if (r.pending)
+        "still running - continue with term_exec_wait (do not resend); the tracker survives client-side timeouts and aborts"
+    else
+        null;
+    if (reason) |n| {
+        try res.fact("reason", n);
+        try res.text(n);
     }
-    if (r.shell_died) try w.writeAll(",\"reason\":\"the shell/connection died before the command finished\"");
-    try w.writeAll("}");
-    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    if (r.pending) {
+        if (screen_tail) |tail| {
+            try res.text("--- screen ---");
+            try res.text(tail);
+        }
+    }
+    try res.text("--- output ---");
+    try res.text(inline_out);
+    return res.finish();
 }
 
 /// A safe interpreter name/path for term_exec's `shell` option: it is
@@ -189,7 +231,7 @@ test "term output files are created private and keep the user's mode" {
 pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
     if (mcp.term_state.mux_sock == null)
-        return appErr(arena, "headless terminal tools need isolated mode; in --shared mode use the GUI-backed terminal tools (list_terminals, run_command, ...)");
+        return mcp.errRes(arena, .unavailable, "headless terminal tools need isolated mode; in --shared mode use the GUI-backed terminal tools (list_terminals, run_command, ...)");
 
     if (eql(u8, name, "term_open")) {
         const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));
@@ -203,7 +245,7 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
                 .array => {
                     const items = try arena.alloc([]const u8, cmd.array.items.len);
                     for (cmd.array.items, 0..) |item, i| {
-                        if (item != .string) return appErr(arena, "command array must be strings");
+                        if (item != .string) return mcp.errRes(arena, .invalid_args, "command array must be strings");
                         items[i] = item.string;
                     }
                     if (items.len > 0) cmd_array = items;
@@ -223,7 +265,7 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         } else true;
         const transport = argStr(args, "transport") orelse "auto";
         if (!eql(u8, transport, "auto") and !eql(u8, transport, "mux") and !eql(u8, transport, "ssh"))
-            return appErr(arena, "transport must be 'auto', 'mux' or 'ssh'");
+            return mcp.errRes(arena, .invalid_args, "transport must be 'auto', 'mux' or 'ssh'");
 
         var remote_integration = false;
         var via_mux = false;
@@ -262,7 +304,7 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             id = spawnRegisteredRemoteTerm(host.?, margv, cols, rows) catch {
                 remote_integration = false;
                 if (eql(u8, transport, "mux"))
-                    return appErr(arena, "no reachable sketerm-mux daemon on the remote host (needs key/agent auth and sketerm-mux in the remote PATH; transport 'auto' would fall back to plain ssh)");
+                    return mcp.errRes(arena, .unavailable, "no reachable sketerm-mux daemon on the remote host (needs key/agent auth and sketerm-mux in the remote PATH; transport 'auto' would fall back to plain ssh)");
                 break :mux;
             };
             via_mux = true;
@@ -298,7 +340,7 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             }
             const argv: ?[]const []const u8 = if (argv_store.items.len > 0) argv_store.items else null;
             id = spawnRegisteredTerm(argv, cols, rows) catch |err| switch (err) {
-                error.SpawnFailed => return appErr(arena, "spawn failed (mux daemon unreachable?)"),
+                error.SpawnFailed => return mcp.errRes(arena, .unavailable, "spawn failed (mux daemon unreachable?)"),
                 else => return err,
             };
         }
@@ -347,18 +389,30 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             try std.fmt.allocPrint(arena, "\nrecording: {s} (asciicast v2, replayable with asciinema)", .{p})
         else
             "";
-        const msg = try std.fmt.allocPrint(arena, "opened headless terminal {d} ({d}x{d}{s}){s}{s}", .{ id, cols, rows, shell_note, where, rec_note });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        var res = mcp.Res.init(arena);
+        try res.fact("term", id);
+        try res.fact("cols", cols);
+        try res.fact("rows", rows);
+        try res.fact("transport", if (via_mux) "sketerm-mux" else if (host != null) "ssh" else "local");
+        if (host) |h| try res.fact("host", h);
+        if (t.shell_name) |sn| try res.fact("shell", sn);
+        try res.fact("integration", t.integration);
+        if (mcp.rec_state.casts.get(id)) |p| try res.fact("recording", p);
+        try res.textf("opened headless terminal {d} ({d}x{d}{s}){s}{s}", .{ id, cols, rows, shell_note, where, rec_note });
+        return res.finish();
     }
     if (eql(u8, name, "term_list")) {
+        var res = mcp.Res.init(arena);
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         try w.writeAll("[");
         var first = true;
+        var count: usize = 0;
         var it = mcp.term_state.terms.iterator();
         while (it.next()) |e| {
             if (!first) try w.writeAll(",");
             first = false;
+            count += 1;
             const t = e.value_ptr.*;
             t.drain();
             _ = t.scanShellAnnounce();
@@ -385,53 +439,85 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
                 try std.json.Stringify.value(p, .{}, w);
             }
             try w.writeAll("}");
+
+            // One compact human line per terminal, same facts, no JSON.
+            try res.textf("term {d}: {s}", .{ e.key_ptr.*, if (t.exited) "exited" else "running" });
+            if (t.exited and t.exit_status_known) try res.textf("  exit_status: {d}", .{t.exit_status});
+            if (t.shell_name) |sn|
+                try res.textf("  shell: {s}, integration: {}", .{ sn, t.integration });
+            if (t.remote_host) |rh| try res.textf("  host: {s} (sketerm-mux)", .{rh});
+            if (t.hasPendingCommand()) try res.text("  pending_command: true");
+            if (t.hasPendingExec()) try res.text("  pending_exec: true");
+            if (last.len > 0) try res.textf("  last line: {s}", .{last});
+            if (mcp.rec_state.casts.get(e.key_ptr.*)) |p| try res.textf("  recording: {s}", .{p});
         }
         try w.writeAll("]");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        try res.raw("terms", aw.written());
+        try res.fact("count", count);
+        if (count == 0) try res.text("no headless terminals are open");
+        return res.finish();
     }
 
     const t = termFromArgs(args) orelse
-        return appErr(arena, "no such terminal (pass 'term' id, or omit it when only one is open)");
+        return mcp.errRes(arena, .not_found, "no such terminal (pass 'term' id, or omit it when only one is open)");
+    const term_id = termIdOf(t);
 
     if (eql(u8, name, "term_send_text")) {
-        const text = argStr(args, "text") orelse return appErr(arena, "term_send_text requires 'text'");
-        const data = if (argBool(args, "enter"))
+        const text = argStr(args, "text") orelse return mcp.errRes(arena, .invalid_args, "term_send_text requires 'text'");
+        const enter = argBool(args, "enter");
+        const data = if (enter)
             try std.fmt.allocPrint(arena, "{s}\r", .{text})
         else
             text;
-        t.sendText(data) catch return appErr(arena, "send failed (terminal exited?)");
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        t.sendText(data) catch return mcp.errRes(arena, .conflict, "send failed (terminal exited?)");
+        var res = mcp.Res.init(arena);
+        try res.fact("term", term_id);
+        try res.fact("bytes", data.len);
+        try res.fact("enter", enter);
+        try res.textf("sent {d} bytes to terminal {d}{s}", .{ data.len, term_id, if (enter) " (enter pressed)" else "" });
+        return res.finish();
     }
     if (eql(u8, name, "term_send_keys")) {
-        const keychords = argStr(args, "keys") orelse return appErr(arena, "term_send_keys requires 'keys'");
-        t.sendKeys(keychords) catch |err| return appErr(arena, switch (err) {
-            termdrive.Error.BadKey => "unknown key chord",
-            else => "send failed (terminal exited?)",
-        });
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        const keychords = argStr(args, "keys") orelse return mcp.errRes(arena, .invalid_args, "term_send_keys requires 'keys'");
+        t.sendKeys(keychords) catch |err| return switch (err) {
+            termdrive.Error.BadKey => mcp.errRes(arena, .invalid_args, "unknown key chord"),
+            else => mcp.errRes(arena, .conflict, "send failed (terminal exited?)"),
+        };
+        var res = mcp.Res.init(arena);
+        try res.fact("term", term_id);
+        try res.fact("keys", keychords);
+        try res.textf("sent keys {s} to terminal {d}", .{ keychords, term_id });
+        return res.finish();
     }
     if (eql(u8, name, "term_read")) {
         t.drain();
         const sb = argBool(args, "scrollback");
-        const text = t.readScreen(sb) catch |err| return appErr(arena, switch (err) {
-            termdrive.Error.Desynced => "this terminal's mirror lost sync with the session and could not be rebuilt; its content is stale. Close it (term_close) and open a new one",
-            else => "read failed (terminal exited?)",
-        });
+        const text = t.readScreen(sb) catch |err| return switch (err) {
+            termdrive.Error.Desynced => mcp.errRes(arena, .conflict, "this terminal's mirror lost sync with the session and could not be rebuilt; its content is stale. Close it (term_close) and open a new one"),
+            else => mcp.errRes(arena, .conflict, "read failed (terminal exited?)"),
+        };
         defer mcp.term_state.allocator.free(text);
+        var res = mcp.Res.init(arena);
+        try res.fact("term", term_id);
+        try res.fact("exited", t.exited);
+        try res.fact("scrollback", sb);
+        try res.fact("screen", text);
         if (t.exited) {
             // Make an exited terminal's state unambiguous: the final
             // rendered frame plus the real exit status, so a stale
             // progress line (scp "1%") cannot be mistaken for truth.
-            const msg = if (t.exit_status_known)
-                try std.fmt.allocPrint(arena, "[process exited with status {d} — final rendered screen below]\n{s}", .{ t.exit_status, text })
-            else
-                try std.fmt.allocPrint(arena, "[process exited (status unknown) — final rendered screen below]\n{s}", .{text});
-            return toolResult(arena, msg, false) orelse error.OutOfMemory;
+            if (t.exit_status_known) {
+                try res.fact("exit_status", t.exit_status);
+                try res.textf("[process exited with status {d} - final rendered screen below]", .{t.exit_status});
+            } else {
+                try res.text("[process exited (status unknown) - final rendered screen below]");
+            }
         }
-        return toolResult(arena, try arena.dupe(u8, text), false) orelse error.OutOfMemory;
+        try res.text(text);
+        return res.finish();
     }
     if (eql(u8, name, "term_exec")) {
-        const cmd = argStr(args, "command") orelse return appErr(arena, "term_exec requires 'command'");
+        const cmd = argStr(args, "command") orelse return mcp.errRes(arena, .invalid_args, "term_exec requires 'command'");
         // Clamped below the 150s watchdog: one blocked call must never
         // wedge the single-threaded loop long enough to starve
         // term_list/term_read or trip the connection-aborting cap.
@@ -446,64 +532,71 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         } else true;
         const noninteractive = argBool(args, "noninteractive");
         if (noninteractive and !subshell)
-            return appErr(arena, "'noninteractive' needs the default isolated transport (drop subshell:false)");
+            return mcp.errRes(arena, .invalid_args, "'noninteractive' needs the default isolated transport (drop subshell:false)");
         const shell = argStr(args, "shell");
         if (shell) |sh| {
             if (!subshell)
-                return appErr(arena, "'shell' needs the default isolated transport (drop subshell:false)");
+                return mcp.errRes(arena, .invalid_args, "'shell' needs the default isolated transport (drop subshell:false)");
             if (!validShellName(sh))
-                return appErr(arena, "invalid 'shell' (a command name or absolute path: letters, digits, . _ - / only)");
+                return mcp.errRes(arena, .invalid_args, "invalid 'shell' (a command name or absolute path: letters, digits, . _ - / only)");
         }
         if (t.hasPendingExec()) {
             // A previously timed-out exec may have finished since;
             // resolve it silently so the new send is accepted.
             if (t.waitExecResult(0)) |r0| mcp.term_state.allocator.free(r0.output);
             if (t.hasPendingExec())
-                return appErr(arena, "a previous term_exec is still running in this terminal; continue it with term_exec_wait (or interrupt with term_send_keys ctrl+c)");
+                return mcp.errRes(arena, .conflict, "a previous term_exec is still running in this terminal; continue it with term_exec_wait (or interrupt with term_send_keys ctrl+c)");
         }
         if (t.hasPendingCommand())
-            return appErr(arena, "a term_run wait_for=command command is still tracked; resolve it with term_wait_command first");
-        const r = t.execCommand(cmd, subshell, noninteractive, shell, timeout_ms) catch |err| return appErr(arena, switch (err) {
-            termdrive.Error.NotConnected => "terminal exited",
-            else => "exec failed",
-        });
+            return mcp.errRes(arena, .conflict, "a term_run wait_for=command command is still tracked; resolve it with term_wait_command first");
+        const r = t.execCommand(cmd, subshell, noninteractive, shell, timeout_ms) catch |err| return switch (err) {
+            termdrive.Error.NotConnected => mcp.errRes(arena, .conflict, "terminal exited"),
+            else => appErr(arena, "exec failed"),
+        };
         defer mcp.term_state.allocator.free(r.output);
         return execResultJson(arena, r, t, argStr(args, "output_file"));
     }
     if (eql(u8, name, "term_exec_wait")) {
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         const r = t.waitExecResult(timeout_ms) orelse
-            return appErr(arena, "no pending term_exec in this terminal");
+            return mcp.errRes(arena, .not_found, "no pending term_exec in this terminal");
         defer mcp.term_state.allocator.free(r.output);
         return execResultJson(arena, r, t, argStr(args, "output_file"));
     }
     if (eql(u8, name, "term_wait_exit")) {
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         const exited = t.waitExit(timeout_ms);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const w = &aw.writer;
-        try w.print("{{\"exited\":{}", .{exited});
-        if (exited and t.exit_status_known) try w.print(",\"exit_status\":{d}", .{t.exit_status});
-        if (!exited) try w.writeAll(",\"timed_out\":true");
         const tail = blk: {
             const text = t.readScreen(false) catch break :blk "";
             defer mcp.term_state.allocator.free(text);
             break :blk try arena.dupe(u8, tailLines(text, 8));
         };
-        if (tail.len > 0) {
-            try w.writeAll(",\"screen_tail\":");
-            try std.json.Stringify.value(tail, .{}, w);
+        var res = mcp.Res.init(arena);
+        try res.fact("term", term_id);
+        try res.fact("exited", exited);
+        try res.fact("timed_out", !exited);
+        if (exited and t.exit_status_known) {
+            try res.fact("exit_status", t.exit_status);
+            try res.textf("terminal {d} exited with status {d}", .{ term_id, t.exit_status });
+        } else if (exited) {
+            try res.textf("terminal {d} exited (status unknown)", .{term_id});
+        } else {
+            try res.textf("terminal {d} still running at timeout", .{term_id});
         }
-        try w.writeAll("}");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        if (tail.len > 0) {
+            try res.fact("screen_tail", tail);
+            try res.text("--- screen tail ---");
+            try res.text(tail);
+        }
+        return res.finish();
     }
     if (eql(u8, name, "term_run")) {
-        const cmd = argStr(args, "command") orelse return appErr(arena, "term_run requires 'command'");
+        const cmd = argStr(args, "command") orelse return mcp.errRes(arena, .invalid_args, "term_run requires 'command'");
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         const wait_for = argStr(args, "wait_for") orelse "idle";
         if (!eql(u8, wait_for, "idle") and !eql(u8, wait_for, "command"))
-            return appErr(arena, "wait_for must be 'idle' or 'command'");
+            return mcp.errRes(arena, .invalid_args, "wait_for must be 'idle' or 'command'");
         if (eql(u8, wait_for, "command")) {
             // A tracked command may have completed since its timeout:
             // one short drain clears it so the new send is accepted.
@@ -514,7 +607,7 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             // The token wait spends from the same budget as the
             // completion wait, so the call never outlives timeout_ms.
             const started = monoMs();
-            const token_res = t.commandToken(@min(timeout_ms, 10_000)) catch return appErr(arena, "command completion unavailable (terminal exited?)");
+            const token_res = t.commandToken(@min(timeout_ms, 10_000)) catch return mcp.errRes(arena, .unavailable, "command completion unavailable (terminal exited?)");
             const token = switch (token_res) {
                 .unsupported => return commandCompletionResult(arena, .{ .state = .unsupported }, false, null, null, "shell integration is unavailable for this shell; command was not sent and no exit status was fabricated"),
                 .not_ready => return commandCompletionResult(arena, .{ .state = .unsupported, .timed_out = true }, false, null, null, "shell integration is injected but no prompt mark has arrived yet (shell still starting, ssh auth still pending, an unsupported remote shell, or rc files broke the injection); command was not sent — retry shortly, or use term_exec"),
@@ -522,7 +615,7 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
                 .token => |tok| tok,
             };
             const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
-            t.sendText(line) catch return appErr(arena, "send failed (terminal exited?)");
+            t.sendText(line) catch return mcp.errRes(arena, .conflict, "send failed (terminal exited?)");
             t.trackCommand(token);
             const result = t.waitCommand(token, @max(0, timeout_ms - (monoMs() - started)));
 
@@ -550,7 +643,7 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         // reported by term_wait_command as the tracked command's exit.
         if (t.hasPendingCommand()) _ = t.waitPendingCommand(0);
         if (t.hasPendingCommand())
-            return appErr(arena, "a command-mode command is still being tracked; resolve it with term_wait_command before running another command, or its exit status would be misattributed");
+            return mcp.errRes(arena, .conflict, "a command-mode command is still being tracked; resolve it with term_wait_command before running another command, or its exit status would be misattributed");
         // Honesty over silent queueing: when integration shows an
         // open command zone, the typed line goes to the RUNNING
         // program's stdin (or sits queued by the shell), not to a new
@@ -558,8 +651,14 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         // read as "executed".
         const busy_before = t.integration and t.foregroundRunning();
         const line = try std.fmt.allocPrint(arena, "{s}\r", .{cmd});
-        t.sendText(line) catch return appErr(arena, "send failed (terminal exited?)");
+        t.sendText(line) catch return mcp.errRes(arena, .conflict, "send failed (terminal exited?)");
         const settled = t.waitIdle(quiet_ms, timeout_ms);
+        var res = mcp.Res.init(arena);
+        try res.fact("term", term_id);
+        try res.fact("wait_for", "idle");
+        try res.fact("command_sent", true);
+        try res.fact("settled", settled);
+        try res.fact("went_to_foreground_stdin", busy_before);
         var note: []const u8 = if (settled) "" else "\n[note: output still flowing at timeout]";
         if (busy_before)
             note = try std.fmt.allocPrint(arena, "{s}\n[note: a foreground command was already running when this text was sent — it went to that program's stdin, or the shell queued it as pending input; it did NOT start as a new shell command. Wait with term_wait_idle, or interrupt with term_send_keys ctrl+c]", .{note});
@@ -570,23 +669,30 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             // never a silent shape change.
             if (t.lastCommand() catch null) |lc| {
                 defer mcp.term_state.allocator.free(lc.text);
-                const msg = try std.fmt.allocPrint(arena, "exit: {d}\n---\n{s}{s}", .{ lc.exit, lc.text, note });
-                return toolResult(arena, msg, false) orelse error.OutOfMemory;
+                try res.fact("output_kind", "command");
+                try res.fact("exit_status", lc.exit);
+                try res.fact("output", lc.text);
+                try res.textf("exit: {d}", .{lc.exit});
+                try res.text("---");
+                try res.textf("{s}{s}", .{ lc.text, note });
+                return res.finish();
             }
         }
         const text = t.readScreen(false) catch return appErr(arena, "read failed");
         defer mcp.term_state.allocator.free(text);
-        const fallback_note = if (want_output_only)
-            "[output_only unavailable: no completed OSC 133 command zone — shell integration is inactive in this terminal (unsupported shell, or the command emitted no marks); returning the rendered screen]\n"
-        else
-            "";
-        const msg = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ fallback_note, text, note });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        try res.fact("output_kind", "screen");
+        try res.fact("output", text);
+        if (want_output_only) {
+            try res.fact("output_only_unavailable", true);
+            try res.text("[output_only unavailable: no completed OSC 133 command zone — shell integration is inactive in this terminal (unsupported shell, or the command emitted no marks); returning the rendered screen]");
+        }
+        try res.textf("{s}{s}", .{ text, note });
+        return res.finish();
     }
     if (eql(u8, name, "term_wait_command")) {
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 30_000, 0, 120_000);
         const result = t.waitPendingCommand(timeout_ms) orelse
-            return appErr(arena, "no timed-out command is being tracked");
+            return mcp.errRes(arena, .not_found, "no timed-out command is being tracked");
         var owned_output: ?[]u8 = null;
         defer if (owned_output) |text| mcp.term_state.allocator.free(text);
         var output_kind: []const u8 = "screen";
@@ -610,24 +716,38 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         const settled = t.waitIdle(quiet_ms, timeout_ms);
         // Prompt-aware verdict when integration can tell: "quiet
         // because sleeping" must not masquerade as "done".
-        const msg = if (!settled and t.isDesynced())
+        const desynced = !settled and t.isDesynced();
+        const foreground = settled and t.integration and t.foregroundRunning();
+        const msg = if (desynced)
             "NOT idle: this terminal's mirror lost sync with the session and could not be rebuilt, so quiescence cannot be observed. Close it (term_close) and open a new one"
         else if (!settled)
             "still active at timeout"
-        else if (t.integration and t.foregroundRunning())
+        else if (foreground)
             "idle, but a foreground command is still RUNNING (output is quiet, not finished)"
         else if (t.integration)
             "idle at shell prompt"
         else
             "idle";
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        var res = mcp.Res.init(arena);
+        try res.fact("term", term_id);
+        try res.fact("idle", settled);
+        try res.fact("timed_out", !settled);
+        try res.fact("desynced", desynced);
+        try res.fact("foreground_running", foreground);
+        try res.text(msg);
+        return res.finish();
     }
     if (eql(u8, name, "term_resize")) {
         const cols: u16 = @intCast(std.math.clamp(argInt(args, "cols") orelse 120, 10, 500));
         const rows: u16 = @intCast(std.math.clamp(argInt(args, "rows") orelse 40, 4, 300));
-        t.resize(cols, rows) catch return appErr(arena, "resize failed (terminal exited?)");
+        t.resize(cols, rows) catch return mcp.errRes(arena, .conflict, "resize failed (terminal exited?)");
         _ = t.waitIdle(200, 2_000);
-        return toolResult(arena, "ok", false) orelse error.OutOfMemory;
+        var res = mcp.Res.init(arena);
+        try res.fact("term", term_id);
+        try res.fact("cols", cols);
+        try res.fact("rows", rows);
+        try res.textf("terminal {d} resized to {d}x{d}", .{ term_id, cols, rows });
+        return res.finish();
     }
     if (eql(u8, name, "term_close")) {
         const id = termIdOf(t);
@@ -636,7 +756,11 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         // The daemon finalizes the cast with the session; keep the
         // path out of future term_list output.
         if (mcp.rec_state.casts.fetchSwapRemove(id)) |kv| mcp.rec_state.allocator.free(kv.value);
-        return toolResult(arena, "terminal closed", false) orelse error.OutOfMemory;
+        var res = mcp.Res.init(arena);
+        try res.fact("term", id);
+        try res.fact("closed", true);
+        try res.textf("terminal {d} closed", .{id});
+        return res.finish();
     }
     return mcp.errRes(arena, .unknown_tool, "unknown tool");
 }
@@ -836,24 +960,32 @@ pub fn findHex64(text: []const u8) ?[]const u8 {
 }
 
 pub fn xferOk(arena: std.mem.Allocator, direction: []const u8, path: []const u8, bytes: ?u64, sha: []const u8) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.print("{{\"ok\":true,\"direction\":\"{s}\",\"path\":", .{direction});
-    try std.json.Stringify.value(path, .{}, w);
-    if (bytes) |b| try w.print(",\"bytes\":{d}", .{b});
-    try w.print(",\"sha256\":\"{s}\",\"verified\":true,\"atomic\":true}}", .{sha});
-    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    var res = mcp.Res.init(arena);
+    try res.fact("direction", direction);
+    try res.fact("path", path);
+    try res.fact("bytes", bytes);
+    try res.fact("sha256", sha);
+    // Both are invariants of this code path: the transfer only reaches
+    // here after a checksum match and an atomic rename/move.
+    try res.fact("verified", true);
+    try res.fact("atomic", true);
+    if (bytes) |b|
+        try res.textf("{s} ok: {s} ({d} bytes), sha256 verified, moved atomically", .{ direction, path, b })
+    else
+        try res.textf("{s} ok: {s}, sha256 verified, moved atomically", .{ direction, path });
+    try res.textf("sha256: {s}", .{sha});
+    return res.finish();
 }
 
 pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value) ![]const u8 {
     const eql = std.mem.eql;
     if (mcp.term_state.mux_sock == null)
-        return appErr(arena, "file transfer / port forward tools need isolated mode (they run over private headless terminals)");
+        return mcp.errRes(arena, .unavailable, "file transfer / port forward tools need isolated mode (they run over private headless terminals)");
 
     if (eql(u8, name, "upload_file") or eql(u8, name, "download_file")) {
         const upload = eql(u8, name, "upload_file");
-        const local = argStr(args, "local_path") orelse return appErr(arena, "requires 'local_path'");
-        const remote = argStr(args, "remote_path") orelse return appErr(arena, "requires 'remote_path'");
+        const local = argStr(args, "local_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'local_path'");
+        const remote = argStr(args, "remote_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'remote_path'");
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 120_000;
         const host = argStr(args, "host");
 
@@ -862,22 +994,22 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             const dst = if (upload) remote else local;
             switch (try localCopyAtomic(arena, src, dst)) {
                 .ok => |r| return xferOk(arena, if (upload) "upload" else "download", dst, r.bytes, &r.sha),
-                .err => |e| return appErr(arena, e),
+                .err => |e| return mcp.errRes(arena, .io_failed, e),
             }
         }
         const h = host.?;
 
         if (upload) {
-            const local_sha = sha256File(local) orelse return appErr(arena, "cannot read/hash the local file");
+            const local_sha = sha256File(local) orelse return mcp.errRes(arena, .io_failed, "cannot read/hash the local file");
             const bytes = fileSize(local);
             const tmp = try stagedPartPath(arena, remote);
             const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, tmp });
             switch (try runArgvTerm(arena, &.{ "scp", "-q", "-o", "BatchMode=yes", local, spec }, timeout_ms)) {
-                .err => |e| return appErr(arena, e),
+                .err => |e| return mcp.errRes(arena, .unavailable, e),
                 .run => |r| {
-                    if (!r.exited) return appErr(arena, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
+                    if (!r.exited) return mcp.errRes(arena, .timeout, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
                     if (!r.status_known or r.status != 0)
-                        return appErr(arena, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
+                        return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
                 },
             }
             // Checksum + optional caller validation + atomic move in
@@ -903,17 +1035,17 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
                 .{ try quoted(arena, tmp), try quoted(arena, remote), local_sha, verify_layer },
             );
             switch (try runArgvTerm(arena, &.{ "ssh", "-o", "BatchMode=yes", h, try remoteShLine(arena, script) }, 60_000)) {
-                .err => |e| return appErr(arena, e),
+                .err => |e| return mcp.errRes(arena, .unavailable, e),
                 .run => |r| {
                     if (std.mem.indexOf(u8, r.output, "SK_MOVED") != null)
                         return xferOk(arena, "upload", remote, bytes, &local_sha);
                     if (std.mem.indexOf(u8, r.output, "SK_VERIFYFAIL") != null)
-                        return appErr(arena, try std.fmt.allocPrint(arena, "verify_command rejected the staged file — upload discarded, destination untouched:\n{s}", .{r.output}));
+                        return mcp.errRes(arena, .refused, try std.fmt.allocPrint(arena, "verify_command rejected the staged file — upload discarded, destination untouched:\n{s}", .{r.output}));
                     if (std.mem.indexOf(u8, r.output, "SK_MVFAIL") != null)
-                        return appErr(arena, "checksum verified but the atomic move failed on the remote (target dir not writable?)");
+                        return mcp.errRes(arena, .io_failed, "checksum verified but the atomic move failed on the remote (target dir not writable?)");
                     if (std.mem.indexOf(u8, r.output, "SK_SHA:fail") != null)
-                        return appErr(arena, "remote has no usable sha256sum — cannot verify; file left absent (partial removed)");
-                    return appErr(arena, try std.fmt.allocPrint(arena, "remote checksum mismatch — corrupt transfer discarded:\n{s}", .{r.output}));
+                        return mcp.errRes(arena, .unavailable, "remote has no usable sha256sum — cannot verify; file left absent (partial removed)");
+                    return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "remote checksum mismatch — corrupt transfer discarded:\n{s}", .{r.output}));
                 },
             }
         }
@@ -922,56 +1054,56 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         const part = try stagedPartPath(arena, local);
         const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, remote });
         switch (try runArgvTerm(arena, &.{ "scp", "-q", "-o", "BatchMode=yes", spec, part }, timeout_ms)) {
-            .err => |e| return appErr(arena, e),
+            .err => |e| return mcp.errRes(arena, .unavailable, e),
             .run => |r| {
-                if (!r.exited) return appErr(arena, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
+                if (!r.exited) return mcp.errRes(arena, .timeout, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
                 if (!r.status_known or r.status != 0)
-                    return appErr(arena, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
+                    return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "scp failed (status {d}):\n{s}", .{ r.status, r.output }));
             },
         }
-        const part_sha = sha256File(part) orelse return appErr(arena, "downloaded file vanished before hashing");
+        const part_sha = sha256File(part) orelse return mcp.errRes(arena, .io_failed, "downloaded file vanished before hashing");
         const bytes = fileSize(part);
         const script = try std.fmt.allocPrint(arena, "sha256sum {s} 2>/dev/null | cut -c1-64\n", .{try quoted(arena, remote)});
         switch (try runArgvTerm(arena, &.{ "ssh", "-o", "BatchMode=yes", h, try remoteShLine(arena, script) }, 30_000)) {
-            .err => |e| return appErr(arena, e),
+            .err => |e| return mcp.errRes(arena, .unavailable, e),
             .run => |r| {
                 const remote_sha = findHex64(r.output) orelse
-                    return appErr(arena, try std.fmt.allocPrint(arena, "remote sha256sum gave no hash — cannot verify (partial kept at {s}):\n{s}", .{ part, r.output }));
+                    return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "remote sha256sum gave no hash — cannot verify (partial kept at {s}):\n{s}", .{ part, r.output }));
                 if (!std.mem.eql(u8, remote_sha, &part_sha)) {
                     var pbuf: [4096]u8 = undefined;
                     if (std.fmt.bufPrintZ(&pbuf, "{s}", .{part})) |pz| _ = c.unlink(pz.ptr) else |_| {}
-                    return appErr(arena, "checksum mismatch — corrupt download discarded");
+                    return mcp.errRes(arena, .io_failed, "checksum mismatch — corrupt download discarded");
                 }
             },
         }
         var pbuf: [4096]u8 = undefined;
         var dbuf: [4096]u8 = undefined;
-        const part_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{part}) catch return appErr(arena, "path too long");
-        const local_z = std.fmt.bufPrintZ(&dbuf, "{s}", .{local}) catch return appErr(arena, "path too long");
+        const part_z = std.fmt.bufPrintZ(&pbuf, "{s}", .{part}) catch return mcp.errRes(arena, .invalid_args, "path too long");
+        const local_z = std.fmt.bufPrintZ(&dbuf, "{s}", .{local}) catch return mcp.errRes(arena, .invalid_args, "path too long");
         if (c.rename(part_z.ptr, local_z.ptr) != 0)
-            return appErr(arena, "atomic rename into place failed");
+            return mcp.errRes(arena, .io_failed, "atomic rename into place failed");
         return xferOk(arena, "download", local, bytes, &part_sha);
     }
 
     if (eql(u8, name, "port_forward_open")) {
-        const h = argStr(args, "host") orelse return appErr(arena, "port_forward_open requires 'host'");
-        const rp_i = argInt(args, "remote_port") orelse return appErr(arena, "port_forward_open requires 'remote_port'");
-        if (rp_i < 1 or rp_i > 65535) return appErr(arena, "remote_port out of range");
+        const h = argStr(args, "host") orelse return mcp.errRes(arena, .invalid_args, "port_forward_open requires 'host'");
+        const rp_i = argInt(args, "remote_port") orelse return mcp.errRes(arena, .invalid_args, "port_forward_open requires 'remote_port'");
+        if (rp_i < 1 or rp_i > 65535) return mcp.errRes(arena, .invalid_args, "remote_port out of range");
         const rp: u16 = @intCast(rp_i);
         const rh = argStr(args, "remote_host") orelse "127.0.0.1";
         const lp: u16 = if (argInt(args, "local_port")) |v| blk: {
-            if (v < 1 or v > 65535) return appErr(arena, "local_port out of range");
+            if (v < 1 or v > 65535) return mcp.errRes(arena, .invalid_args, "local_port out of range");
             break :blk @intCast(v);
-        } else pickFreePort() orelse return appErr(arena, "could not pick a free local port");
+        } else pickFreePort() orelse return mcp.errRes(arena, .unavailable, "could not pick a free local port");
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 20_000;
 
         const t = spawnForwardTerm(arena, h, lp, rh, rp) catch
-            return appErr(arena, "spawn failed (mux daemon unreachable?)");
+            return mcp.errRes(arena, .unavailable, "spawn failed (mux daemon unreachable?)");
         switch (try waitForwardReady(arena, t, lp, timeout_ms)) {
             .ready => {},
             .err => |e| {
                 t.deinit();
-                return appErr(arena, e);
+                return mcp.errRes(arena, .unavailable, e);
             },
         }
         const a = mcp.forward_state.allocator;
@@ -992,24 +1124,36 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             t.deinit();
             return error.OutOfMemory;
         };
-        const msg = try std.fmt.allocPrint(arena, "{{\"forward\":{d},\"local_port\":{d},\"remote\":\"{s}:{d}\",\"host\":\"{s}\",\"listening\":true}}", .{ f.id, lp, rh, rp, h });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        var res = mcp.Res.init(arena);
+        try res.fact("forward", f.id);
+        try res.fact("local_port", lp);
+        try res.fact("host", h);
+        try res.fact("remote_host", rh);
+        try res.fact("remote_port", rp);
+        try res.fact("listening", true);
+        try res.textf("forward {d}: 127.0.0.1:{d} -> {s} ({s}:{d}), listening", .{ f.id, lp, h, rh, rp });
+        return res.finish();
     }
     if (eql(u8, name, "port_forward_list")) {
+        var res = mcp.Res.init(arena);
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         try w.writeAll("[");
         for (mcp.forward_state.forwards.values(), 0..) |f, i| {
             if (i > 0) try w.writeAll(",");
             f.term.drain();
-            try w.print("{{\"forward\":{d},\"host\":\"{s}\",\"local_port\":{d},\"remote\":\"{s}:{d}\",\"alive\":{},\"reconnects\":{d}}}", .{ f.id, f.host, f.local_port, f.remote_host, f.remote_port, !f.term.exited, f.reconnects });
+            try w.print("{{\"forward\":{d},\"host\":\"{s}\",\"local_port\":{d},\"remote_host\":\"{s}\",\"remote_port\":{d},\"alive\":{},\"reconnects\":{d}}}", .{ f.id, f.host, f.local_port, f.remote_host, f.remote_port, !f.term.exited, f.reconnects });
+            try res.textf("forward {d}: 127.0.0.1:{d} -> {s} ({s}:{d}), alive: {}, reconnects: {d}", .{ f.id, f.local_port, f.host, f.remote_host, f.remote_port, !f.term.exited, f.reconnects });
         }
         try w.writeAll("]");
-        return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+        try res.raw("forwards", aw.written());
+        try res.fact("count", mcp.forward_state.forwards.count());
+        if (mcp.forward_state.forwards.count() == 0) try res.text("no port forwards are open");
+        return res.finish();
     }
 
     const f = forwardFromArgs(args) orelse
-        return appErr(arena, "no such forward (pass 'forward' from port_forward_open, or omit it when only one is open)");
+        return mcp.errRes(arena, .not_found, "no such forward (pass 'forward' from port_forward_open, or omit it when only one is open)");
 
     if (eql(u8, name, "port_forward_check")) {
         f.term.drain();
@@ -1018,7 +1162,7 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             // The ssh process died (network blip, sshd restart):
             // respawn the same spec — this IS the reconnect behavior.
             const nt = spawnForwardTerm(arena, f.host, f.local_port, f.remote_host, f.remote_port) catch
-                return appErr(arena, "forward is dead and respawn failed (mux daemon unreachable?)");
+                return mcp.errRes(arena, .unavailable, "forward is dead and respawn failed (mux daemon unreachable?)");
             switch (try waitForwardReady(arena, nt, f.local_port, argInt(args, "timeout_ms") orelse 20_000)) {
                 .ready => {
                     f.term.deinit();
@@ -1028,17 +1172,28 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
                 },
                 .err => |e| {
                     nt.deinit();
-                    return appErr(arena, try std.fmt.allocPrint(arena, "forward is dead and the reconnect failed: {s}", .{e}));
+                    return mcp.errRes(arena, .unavailable, try std.fmt.allocPrint(arena, "forward is dead and the reconnect failed: {s}", .{e}));
                 },
             }
         }
         const listening = tcpListening(f.local_port, 2_000);
-        const msg = try std.fmt.allocPrint(arena, "{{\"forward\":{d},\"alive\":{},\"listening\":{},\"reconnected\":{},\"local_port\":{d}}}", .{ f.id, !f.term.exited, listening, reconnected, f.local_port });
-        return toolResult(arena, msg, false) orelse error.OutOfMemory;
+        var res = mcp.Res.init(arena);
+        try res.fact("forward", f.id);
+        try res.fact("alive", !f.term.exited);
+        try res.fact("listening", listening);
+        try res.fact("reconnected", reconnected);
+        try res.fact("local_port", f.local_port);
+        try res.textf("forward {d} on 127.0.0.1:{d}: alive: {}, listening: {}{s}", .{ f.id, f.local_port, !f.term.exited, listening, if (reconnected) ", reconnected" else "" });
+        return res.finish();
     }
     if (eql(u8, name, "port_forward_close")) {
+        const closed_id = f.id;
         mcp.forward_state.removeOne(f);
-        return toolResult(arena, "forward closed", false) orelse error.OutOfMemory;
+        var res = mcp.Res.init(arena);
+        try res.fact("forward", closed_id);
+        try res.fact("closed", true);
+        try res.textf("forward {d} closed", .{closed_id});
+        return res.finish();
     }
     return mcp.errRes(arena, .unknown_tool, "unknown tool");
 }
@@ -1081,5 +1236,141 @@ pub fn waitForwardReady(arena: std.mem.Allocator, t: *termdrive.Term, lp: u16, t
             return .{ .err = try std.fmt.allocPrint(arena, "the local forward port never started listening within the timeout (auth failure? host unreachable?):\n{s}", .{tail}) };
         }
         _ = t.pumpOnce(200);
+    }
+}
+
+test "term_exec result: exec facts structured, exit header + output in the text lane" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const out = try execResult(arena, .{
+        .completed = true,
+        .exit_status = 1,
+        .output = @constCast("EXEC-STRUCT\n"),
+    }, null, null);
+    const parsed = try mcp.expectToolResultShape(arena, "term_exec", out);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expect(sc.get("completed").?.bool);
+    try t.expectEqual(@as(i64, 1), sc.get("exit_status").?.integer);
+    try t.expect(!sc.get("pending").?.bool);
+    try t.expectEqualStrings("EXEC-STRUCT\n", sc.get("output").?.string);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expectEqualStrings("exit 1\n--- output ---\nEXEC-STRUCT\n", text);
+}
+
+test "term_exec_wait result: a pending command shows tracker, screen and reason without JSON" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const out = try execResult(arena, .{
+        .completed = false,
+        .pending = true,
+        .tracker = "abcdef012345".*,
+        .interactive_hint = true,
+        .idle_ms = 900,
+        .output = @constCast("Continue? [y/N] "),
+    }, "Continue? [y/N] ", null);
+    const parsed = try mcp.expectToolResultShape(arena, "term_exec_wait", out);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expect(sc.get("pending").?.bool);
+    try t.expect(sc.get("interactive_prompt").?.bool);
+    try t.expectEqualStrings("abcdef012345", sc.get("tracker").?.string);
+    try t.expectEqualStrings("Continue? [y/N] ", sc.get("screen").?.string);
+    try t.expectEqual(@as(i64, 900), sc.get("output_idle_ms").?.integer);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "WAITING FOR INPUT") != null);
+    try t.expect(std.mem.indexOf(u8, text, "--- screen ---") != null);
+    try t.expect(std.mem.indexOf(u8, text, "term_exec_wait picks up the completion") != null);
+    // A pending exec is a soft failure: the outcome is a fact.
+    try t.expect(parsed.object.get("isError") == null);
+}
+
+test "term_exec result: output_file writes the full output and reports it" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tmpl = "/tmp/sketerm-exec-res-XXXXXX".*;
+    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
+    defer _ = c.rmdir(dir);
+    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    const path = try std.fmt.allocPrint(arena, "{s}/out.txt", .{base});
+    var path_z_buf: [512:0]u8 = undefined;
+    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    defer _ = c.unlink(path_z.ptr);
+
+    const out = try execResult(arena, .{
+        .completed = true,
+        .exit_status = 0,
+        .output = @constCast("payload"),
+    }, null, path);
+    const parsed = try mcp.expectToolResultShape(arena, "term_exec", out);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings(path, sc.get("output_file").?.string);
+    try t.expectEqual(@as(i64, 7), sc.get("output_bytes").?.integer);
+
+    // A relative output_file is refused in the reply, not silently dropped.
+    const rel = try execResult(arena, .{
+        .completed = true,
+        .exit_status = 0,
+        .output = @constCast("payload"),
+    }, null, "relative.txt");
+    const rparsed = try mcp.expectToolResultShape(arena, "term_exec", rel);
+    try t.expect(rparsed.object.get("structuredContent").?.object.get("output_file") == null);
+    try t.expect(std.mem.indexOf(
+        u8,
+        rparsed.object.get("content").?.array.items[0].object.get("text").?.string,
+        "must be an absolute local path",
+    ) != null);
+}
+
+test "upload_file result: transfer facts structured, one prose line" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const sha = "a" ** 64;
+    const up = try xferOk(arena, "upload", "/srv/app.service", 16, sha);
+    const parsed = try mcp.expectToolResultShape(arena, "upload_file", up);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("upload", sc.get("direction").?.string);
+    try t.expectEqualStrings("/srv/app.service", sc.get("path").?.string);
+    try t.expectEqual(@as(i64, 16), sc.get("bytes").?.integer);
+    try t.expectEqualStrings(sha, sc.get("sha256").?.string);
+    try t.expect(sc.get("verified").?.bool);
+    try t.expect(sc.get("atomic").?.bool);
+    // No "ok" field survives: isError carries success now.
+    try t.expect(sc.get("ok") == null);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "upload ok: /srv/app.service (16 bytes)") != null);
+
+    // Unknown size still satisfies the schema (bytes is nullable).
+    const down = try xferOk(arena, "download", "/tmp/x.bin", null, sha);
+    const dparsed = try mcp.expectToolResultShape(arena, "download_file", down);
+    try t.expectEqual(std.json.Value{ .null = {} }, dparsed.object.get("structuredContent").?.object.get("bytes").?);
+}
+
+test "every tool this module serves declares an output schema" {
+    // The dispatcher routes term_*, upload/download and port_forward_*
+    // here; wave 3a gave all of them structured results, so a new tool
+    // added to this module without a schema fails here rather than
+    // silently shipping a text-only result.
+    const mcp_tools = @import("mcp_tools.zig");
+    for (mcp_tools.TOOLS) |tool| {
+        const mine = std.mem.startsWith(u8, tool.name, "term_") or
+            std.mem.startsWith(u8, tool.name, "port_forward_") or
+            std.mem.eql(u8, tool.name, "upload_file") or
+            std.mem.eql(u8, tool.name, "download_file");
+        if (!mine) continue;
+        if (tool.output_schema == null) {
+            std.debug.print("{s} has no output schema\n", .{tool.name});
+            return error.MissingOutputSchema;
+        }
     }
 }

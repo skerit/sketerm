@@ -653,6 +653,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"command":{"description":"argv array or shell string to run instead of the login shell (optional; with 'host' a string is the remote command)","anyOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}]},"host":{"type":"string","description":"SSH destination (user@box): opens ssh -tt with ServerAlive keepalives. Auth prompts appear on the screen — answer with term_send_text."},"integration":{"type":"boolean","description":"Default true: with 'host', bootstrap OSC 133 shell integration into the remote bash/zsh. false = plain remote login shell, nothing injected."},"transport":{"type":"string","enum":["auto","mux","ssh"],"description":"Default auto (use the remote sketerm-mux daemon when reachable, else plain ssh). mux = require the daemon (error instead of falling back); ssh = never probe for it. Normally leave unset."},"cols":{"type":"integer"},"rows":{"type":"integer"}}}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"term":{"type":"integer"},"cols":{"type":"integer"},"rows":{"type":"integer"},"transport":{"type":"string","enum":["local","ssh","sketerm-mux"]},"host":{"type":"string"},"shell":{"type":"string","description":"Detected session shell; absent until the session announces it"},"integration":{"type":"boolean","description":"OSC 133 shell integration is active"},"recording":{"type":"string","description":"Path of the automatic asciicast"}},"required":["term","cols","rows","transport","integration"]}
+        ,
     },
     .{
         .name = "term_list",
@@ -663,6 +666,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"terms":{"type":"array","items":{"type":"object","properties":{"term":{"type":"integer"},"exited":{"type":"boolean"},"shell":{"type":"string"},"integration":{"type":"boolean"},"transport":{"type":"string"},"host":{"type":"string"},"exit_status":{"type":"integer"},"pending_command":{"type":"boolean"},"pending_exec":{"type":"boolean"},"last_line":{"type":"string"},"recording":{"type":"string"}},"required":["term","exited"]}},"count":{"type":"integer"}},"required":["terms","count"]}
         ,
     },
     .{
@@ -675,6 +681,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"wait_for":{"type":"string","enum":["idle","command"],"description":"idle (default) waits for output quiescence; command waits for actual shell-command completion"},"quiet_ms":{"type":"integer","description":"Idle mode only: no-output window (default 400)"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the command's output instead of the whole screen"}},"required":["command"]}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"term":{"type":"integer"},"wait_for":{"type":"string","enum":["idle"],"description":"Idle mode only; command mode reports state/completion_source instead"},"command_sent":{"type":"boolean"},"settled":{"type":"boolean","description":"Idle mode: output went quiet before the timeout"},"went_to_foreground_stdin":{"type":"boolean","description":"Idle mode: a foreground command was already running, so the text was NOT a new shell command"},"output_kind":{"type":"string","enum":["screen","command"]},"output":{"type":"string"},"exit_status":{"type":["integer","null"]},"output_only_unavailable":{"type":"boolean","description":"output_only was asked for but no OSC 133 command zone had completed"},"state":{"type":"string","enum":["unsupported","running","completed","unknown"]},"timed_out":{"type":"boolean"},"completion_source":{"type":"string","enum":["none","shell_integration","process_tracking"]},"reason":{"type":"string"}},"required":["command_sent"]}
+        ,
     },
     .{
         .name = "term_send_text",
@@ -685,6 +694,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"text":{"type":"string"},"enter":{"type":"boolean"}},"required":["text"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"term":{"type":"integer"},"bytes":{"type":"integer","description":"Bytes written, including the appended carriage return"},"enter":{"type":"boolean"}},"required":["term","bytes","enter"]}
         ,
     },
     .{
@@ -697,6 +709,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"keys":{"type":"string"}},"required":["keys"]}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"term":{"type":"integer"},"keys":{"type":"string"}},"required":["term","keys"]}
+        ,
     },
     .{
         .name = "term_read",
@@ -707,6 +722,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"scrollback":{"type":"boolean"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"term":{"type":"integer"},"exited":{"type":"boolean"},"scrollback":{"type":"boolean"},"screen":{"type":"string"},"exit_status":{"type":"integer","description":"Only when the process exited with a known status"}},"required":["term","exited","scrollback","screen"]}
         ,
     },
     .{
@@ -719,6 +737,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"quiet_ms":{"type":"integer"},"timeout_ms":{"type":"integer"}}}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"term":{"type":"integer"},"idle":{"type":"boolean"},"timed_out":{"type":"boolean"},"desynced":{"type":"boolean","description":"The mirror lost sync: quiescence cannot be observed"},"foreground_running":{"type":"boolean","description":"Idle but a foreground command is still running"}},"required":["term","idle","timed_out","desynced","foreground_running"]}
+        ,
     },
     .{
         .name = "term_wait_command",
@@ -729,6 +750,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"},"output_only":{"type":"boolean","description":"Return just the completed command's output instead of the whole screen"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"state":{"type":"string","enum":["unsupported","running","completed","unknown"],"description":"unsupported = shell integration missing, nothing was sent"},"command_sent":{"type":"boolean","description":"false means the command was refused and never typed"},"exit_status":{"type":["integer","null"],"description":"Negative = killed by that signal number"},"timed_out":{"type":"boolean"},"completion_source":{"type":"string","enum":["none","shell_integration","process_tracking"]},"output_kind":{"type":"string","enum":["screen","command"]},"output":{"type":"string"},"reason":{"type":"string"}},"required":["state","command_sent","exit_status","timed_out","completion_source"]}
         ,
     },
     .{
@@ -741,6 +765,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"cols":{"type":"integer"},"rows":{"type":"integer"}}}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"term":{"type":"integer"},"cols":{"type":"integer"},"rows":{"type":"integer"}},"required":["term","cols","rows"]}
+        ,
     },
     .{
         .name = "term_close",
@@ -751,6 +778,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"term":{"type":"integer"},"closed":{"type":"boolean"}},"required":["term","closed"]}
         ,
     },
     .{
@@ -763,6 +793,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"command":{"type":"string"},"subshell":{"type":"boolean","description":"Default true (isolated, dialect-independent). false = run in the session shell itself: state persists, POSIX shells only"},"noninteractive":{"type":"boolean","description":"Export DEBIAN_FRONTEND=noninteractive + debconf/needrestart/apt-listchanges equivalents for THIS command only (package-manager runs that must not prompt). Needs the default isolated transport."},"output_file":{"type":"string","description":"Write the FULL untruncated output to this absolute LOCAL path; the inline reply keeps a short tail (large diagnostic dumps)"},"timeout_ms":{"type":"integer","description":"Default 30000, clamped to 120000 — for longer commands keep calling term_exec_wait"},"shell":{"type":"string","description":"Interpreter for the command file (e.g. bash for pipefail/array semantics; default sh). Needs the default isolated transport. The command travels inside a temp script, never on a process command line (ps/pgrep stay clean)"}},"required":["command"]}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"completed":{"type":"boolean"},"exit_status":{"type":["integer","null"]},"timed_out":{"type":"boolean"},"truncated":{"type":"boolean","description":"The begin marker scrolled out: output is a tail"},"shell_died":{"type":"boolean"},"pending":{"type":"boolean","description":"Still running; term_exec_wait reattaches to the tracker"},"tracker":{"type":"string"},"alt_screen":{"type":"boolean"},"output_idle_ms":{"type":"integer"},"interactive_prompt":{"type":"boolean","description":"The command looks like it is waiting for input"},"screen":{"type":"string","description":"Live screen tail, pending replies only"},"output":{"type":"string"},"output_file":{"type":"string"},"output_bytes":{"type":"integer"},"output_dropped_chars":{"type":"integer","description":"Leading characters dropped from the inline output"},"output_file_note":{"type":"string"},"reason":{"type":"string"}},"required":["completed","exit_status","timed_out","truncated","shell_died","pending","output"]}
+        ,
     },
     .{
         .name = "term_exec_wait",
@@ -774,6 +807,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000, clamped to 120000"},"output_file":{"type":"string","description":"Write the full output to this absolute local path on completion"}}}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"completed":{"type":"boolean"},"exit_status":{"type":["integer","null"]},"timed_out":{"type":"boolean"},"truncated":{"type":"boolean","description":"The begin marker scrolled out: output is a tail"},"shell_died":{"type":"boolean"},"pending":{"type":"boolean","description":"Still running; term_exec_wait reattaches to the tracker"},"tracker":{"type":"string"},"alt_screen":{"type":"boolean"},"output_idle_ms":{"type":"integer"},"interactive_prompt":{"type":"boolean","description":"The command looks like it is waiting for input"},"screen":{"type":"string","description":"Live screen tail, pending replies only"},"output":{"type":"string"},"output_file":{"type":"string"},"output_bytes":{"type":"integer"},"output_dropped_chars":{"type":"integer","description":"Leading characters dropped from the inline output"},"output_file_note":{"type":"string"},"reason":{"type":"string"}},"required":["completed","exit_status","timed_out","truncated","shell_died","pending","output"]}
+        ,
     },
     .{
         .name = "term_wait_exit",
@@ -784,6 +820,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"term":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Default 30000"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"term":{"type":"integer"},"exited":{"type":"boolean"},"timed_out":{"type":"boolean"},"exit_status":{"type":"integer"},"screen_tail":{"type":"string"}},"required":["term","exited","timed_out"]}
         ,
     },
 
@@ -798,6 +837,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box); omit = local copy"},"local_path":{"type":"string"},"remote_path":{"type":"string","description":"Destination path (on the host, or locally when host is omitted)"},"verify_command":{"type":"string","description":"Remote validation run against the staged file before the atomic move; {} substitutes the staged path"},"timeout_ms":{"type":"integer","description":"scp budget, default 120000"}},"required":["local_path","remote_path"]}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"direction":{"type":"string","enum":["upload","download"]},"path":{"type":"string","description":"Final destination path"},"bytes":{"type":["integer","null"]},"sha256":{"type":"string"},"verified":{"type":"boolean","description":"Always true: an unverified transfer is an error result"},"atomic":{"type":"boolean"}},"required":["direction","path","bytes","sha256","verified","atomic"]}
+        ,
     },
     // Writes the copy into the local filesystem.
     .{
@@ -809,6 +851,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"host":{"type":"string"},"remote_path":{"type":"string","description":"Source path on the host"},"local_path":{"type":"string","description":"Destination path here"},"timeout_ms":{"type":"integer","description":"Default 120000"}},"required":["local_path","remote_path"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"direction":{"type":"string","enum":["upload","download"]},"path":{"type":"string","description":"Final destination path"},"bytes":{"type":["integer","null"]},"sha256":{"type":"string"},"verified":{"type":"boolean","description":"Always true: an unverified transfer is an error result"},"atomic":{"type":"boolean"}},"required":["direction","path","bytes","sha256","verified","atomic"]}
         ,
     },
 
@@ -823,6 +868,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box)"},"remote_port":{"type":"integer","description":"Port on the remote side"},"remote_host":{"type":"string","description":"Remote-side connect address (default 127.0.0.1)"},"local_port":{"type":"integer","description":"Local listen port (omit = auto-pick a free one; the reply tells you which)"},"timeout_ms":{"type":"integer","description":"Readiness budget, default 20000"}},"required":["host","remote_port"]}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"forward":{"type":"integer"},"local_port":{"type":"integer"},"host":{"type":"string"},"remote_host":{"type":"string"},"remote_port":{"type":"integer"},"listening":{"type":"boolean"}},"required":["forward","local_port","host","remote_host","remote_port","listening"]}
+        ,
     },
     .{
         .name = "port_forward_list",
@@ -833,6 +881,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"forwards":{"type":"array","items":{"type":"object","properties":{"forward":{"type":"integer"},"host":{"type":"string"},"local_port":{"type":"integer"},"remote_host":{"type":"string"},"remote_port":{"type":"integer"},"alive":{"type":"boolean"},"reconnects":{"type":"integer"}},"required":["forward","host","local_port","remote_host","remote_port","alive","reconnects"]}},"count":{"type":"integer"}},"required":["forwards","count"]}
         ,
     },
     .{
@@ -845,6 +896,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"forward":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Reconnect readiness budget, default 20000"}}}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"forward":{"type":"integer"},"alive":{"type":"boolean"},"listening":{"type":"boolean"},"reconnected":{"type":"boolean","description":"The ssh had died and was respawned on the same local port"},"local_port":{"type":"integer"}},"required":["forward","alive","listening","reconnected","local_port"]}
+        ,
     },
     .{
         .name = "port_forward_close",
@@ -855,6 +909,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"forward":{"type":"integer"}},"required":["forward"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"forward":{"type":"integer"},"closed":{"type":"boolean"}},"required":["forward","closed"]}
         ,
     },
 
@@ -1443,9 +1500,14 @@ test "the generated tool list is well-formed, newline-free JSON" {
         const schema = item.object.get("inputSchema") orelse return error.MissingSchema;
         try testing.expect(schema == .object);
         try testing.expect(schema.object.get("properties") != null);
-        // No tool declares an output schema yet; when one does, it must
-        // be the LAST key of the object.
+        // An output schema is optional while wave 3 migrates module by
+        // module; when a tool declares one it is emitted, last.
         try testing.expectEqual(t.output_schema == null, item.object.get("outputSchema") == null);
+        if (t.output_schema != null) {
+            const out = item.object.get("outputSchema").?;
+            try testing.expect(out == .object);
+            try testing.expect(out.object.get("properties") != null);
+        }
     }
 }
 
@@ -1459,8 +1521,13 @@ test "every tool is uniquely named, described and grouped" {
         try seen.put(testing.allocator, t.name, {});
         // inputSchema is a real object with a properties map.
         try testing.expect(std.mem.indexOf(u8, t.input_schema, "\"properties\"") != null);
-        // Wave 2 ships no output schemas; wave 3 fills them in.
-        try testing.expect(t.output_schema == null);
+        // Wave 3 fills output schemas in module by module: either is
+        // allowed, but a declared one must be a JSON object with
+        // properties.
+        if (t.output_schema) |os| {
+            try testing.expect(std.mem.startsWith(u8, os, "{\"type\":\"object\""));
+            try testing.expect(std.mem.indexOf(u8, os, "\"properties\"") != null);
+        }
         try testing.expectEqualStrings(@tagName(t.group), t.group.name());
         // A tool named like a group would make a policy term ambiguous;
         // the comptime guard above refuses it, this states the rule.

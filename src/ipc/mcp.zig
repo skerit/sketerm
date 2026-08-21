@@ -1977,28 +1977,35 @@ pub fn commandCompletionResult(
     output_kind: ?[]const u8,
     reason: ?[]const u8,
 ) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.writeAll("{\"state\":");
-    try std.json.Stringify.value(@tagName(result.state), .{}, w);
-    try w.print(",\"command_sent\":{},\"exit_status\":", .{command_sent});
-    if (result.exit_status) |status| try w.print("{d}", .{status}) else try w.writeAll("null");
-    try w.print(",\"timed_out\":{},\"completion_source\":", .{result.timed_out});
-    try std.json.Stringify.value(@tagName(result.source), .{}, w);
-    if (output_kind) |kind| {
-        try w.writeAll(",\"output_kind\":");
-        try std.json.Stringify.value(kind, .{}, w);
+    var r = Res.init(arena);
+    try r.fact("state", @tagName(result.state));
+    try r.fact("command_sent", command_sent);
+    try r.fact("exit_status", result.exit_status);
+    try r.fact("timed_out", result.timed_out);
+    try r.fact("completion_source", @tagName(result.source));
+    // A soft failure (running/unsupported/timed out) is a FACT here,
+    // not a tool error: isError stays false and the text lane says so.
+    if (result.exit_status) |status| {
+        try r.textf("{s}: exit {d} ({s})", .{ @tagName(result.state), status, @tagName(result.source) });
+    } else {
+        try r.textf("{s}{s} ({s})", .{
+            @tagName(result.state),
+            if (result.timed_out) ", timed out" else "",
+            @tagName(result.source),
+        });
     }
-    if (output) |text| {
-        try w.writeAll(",\"output\":");
-        try std.json.Stringify.value(text, .{}, w);
-    }
+    if (!command_sent) try r.text("the command was NOT sent");
     if (reason) |text| {
-        try w.writeAll(",\"reason\":");
-        try std.json.Stringify.value(text, .{}, w);
+        try r.fact("reason", text);
+        try r.text(text);
     }
-    try w.writeAll("}");
-    return toolResult(arena, aw.written(), false) orelse error.OutOfMemory;
+    if (output_kind) |kind| try r.fact("output_kind", kind);
+    if (output) |text| {
+        try r.fact("output", text);
+        try r.textf("--- {s} ---", .{output_kind orelse "output"});
+        try r.text(text);
+    }
+    return r.finish();
 }
 
 /// Reconnect a durable instance to app sessions still running on its
@@ -5843,8 +5850,10 @@ test "every tool declaration is well-formed at the table level" {
         // A schema without a properties map advertises a tool no client
         // can call with arguments.
         try std.testing.expect(std.mem.indexOf(u8, t.input_schema, "\"properties\"") != null);
-        // Wave 2 declares no output schemas; wave 3 adds them per module.
-        try std.testing.expect(t.output_schema == null);
+        // Wave 3 adds output schemas per module: a tool may or may not
+        // have one yet, but a declared one is a JSON object.
+        if (t.output_schema) |os|
+            try std.testing.expect(std.mem.indexOf(u8, os, "\"properties\"") != null);
         // The policy layer sees exactly the same tools.
         try std.testing.expect(mcpfilter.lookup(t.name) != null);
     }
@@ -7913,4 +7922,112 @@ test "errRes: uniform shape, code tag, retryable fact" {
     const ae = try appErr(arena, "boom");
     try t.expect(std.mem.indexOf(u8, ae, "\"code\":\"failed\"") != null);
     try t.expect(std.mem.indexOf(u8, ae, "\"isError\":true") != null);
+}
+
+/// Test helper: assert a migrated tool result speaks BOTH lanes and
+/// that its structuredContent matches the tool's declared outputSchema
+/// — every `required` key present, no key the schema does not declare.
+/// The text lane must be non-empty, newline-escaped (NDJSON) and free
+/// of JSON syntax.
+pub fn expectToolResultShape(arena: std.mem.Allocator, tool: []const u8, result: []const u8) !std.json.Value {
+    const t = std.testing;
+    try t.expect(std.mem.indexOfScalar(u8, result, '\n') == null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, result, .{});
+    const obj = parsed.object;
+    const content = obj.get("content") orelse return error.NoContentBlock;
+    const text = content.array.items[0].object.get("text").?.string;
+    try t.expect(text.len > 0);
+    if (std.mem.indexOfScalar(u8, text, '{') != null) {
+        std.debug.print("{s}: JSON syntax in the text lane: {s}\n", .{ tool, text });
+        return error.JsonInTextLane;
+    }
+    const sc = (obj.get("structuredContent") orelse return error.NoStructuredContent).object;
+
+    const def = mcp_tools.find(tool) orelse return error.UnknownTool;
+    const schema_text = def.output_schema orelse return error.NoOutputSchema;
+    const schema = (try std.json.parseFromSliceLeaky(std.json.Value, arena, schema_text, .{})).object;
+    if (schema.get("required")) |req| {
+        for (req.array.items) |key| {
+            if (sc.get(key.string) == null) {
+                std.debug.print("{s}: structuredContent lacks required '{s}'\n", .{ tool, key.string });
+                return error.MissingRequiredField;
+            }
+        }
+    }
+    const props = schema.get("properties").?.object;
+    var it = sc.iterator();
+    while (it.next()) |e| {
+        if (props.get(e.key_ptr.*) == null) {
+            std.debug.print("{s}: structuredContent key '{s}' is not in the output schema\n", .{ tool, e.key_ptr.* });
+            return error.UndeclaredField;
+        }
+    }
+    return parsed;
+}
+
+test "commandCompletionResult: facts in structuredContent, compact prose in the text lane" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const done = try commandCompletionResult(
+        arena,
+        .{ .state = .completed, .exit_status = 0, .source = .shell_integration },
+        true,
+        "hello world",
+        "command",
+        null,
+    );
+    const parsed = try expectToolResultShape(arena, "term_wait_command", done);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("completed", sc.get("state").?.string);
+    try t.expect(sc.get("command_sent").?.bool);
+    try t.expectEqual(@as(i64, 0), sc.get("exit_status").?.integer);
+    try t.expect(!sc.get("timed_out").?.bool);
+    try t.expectEqualStrings("shell_integration", sc.get("completion_source").?.string);
+    try t.expectEqualStrings("hello world", sc.get("output").?.string);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expectEqualStrings("completed: exit 0 (shell_integration)\n--- command ---\nhello world", text);
+    // Soft outcomes are facts, never tool errors.
+    try t.expect(parsed.object.get("isError") == null);
+}
+
+test "commandCompletionResult: a refused send stays a soft failure" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const refused = try commandCompletionResult(
+        arena,
+        .{ .state = .unsupported },
+        false,
+        null,
+        null,
+        "shell integration is unavailable for this shell",
+    );
+    const parsed = try expectToolResultShape(arena, "term_wait_command", refused);
+    const obj = parsed.object;
+    try t.expect(obj.get("isError") == null);
+    const sc = obj.get("structuredContent").?.object;
+    try t.expectEqualStrings("unsupported", sc.get("state").?.string);
+    try t.expect(!sc.get("command_sent").?.bool);
+    try t.expectEqual(std.json.Value{ .null = {} }, sc.get("exit_status").?);
+    const text = obj.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "the command was NOT sent") != null);
+    try t.expect(std.mem.indexOf(u8, text, "shell integration is unavailable") != null);
+
+    // A timed-out still-running command: also isError:false.
+    const running = try commandCompletionResult(
+        arena,
+        .{ .state = .running, .timed_out = true },
+        true,
+        "partial output",
+        "screen",
+        "timeout expired while the command was still running",
+    );
+    const rparsed = try expectToolResultShape(arena, "term_run", running);
+    try t.expect(rparsed.object.get("isError") == null);
+    try t.expect(rparsed.object.get("structuredContent").?.object.get("timed_out").?.bool);
 }

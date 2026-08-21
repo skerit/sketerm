@@ -557,8 +557,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("doctor emitted color while stdout was not a terminal");
 
         const tools = m.callTool("term_list", "{}"); // any term tool proves routing
-        if (std.mem.indexOf(u8, tools, "error") != null and std.mem.indexOf(u8, tools, "[]") == null)
-            fail("term_list did not return a list");
+        if (std.mem.indexOf(u8, tools, "\"terms\":[]") == null or
+            std.mem.indexOf(u8, tools, "\"count\":0") == null)
+            fail("term_list did not return an empty structured list");
 
         const open = m.callTool("term_open", "{\"command\":[\"/bin/bash\"],\"cols\":80,\"rows\":24}");
         if (std.mem.indexOf(u8, open, "opened headless terminal") == null) fail("term_open failed");
@@ -592,7 +593,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const idle_run = m.callTool("term_run", "{\"command\":\"sleep 1.5 >/dev/null 2>&1\",\"quiet_ms\":100,\"timeout_ms\":3000}");
         if (std.mem.indexOf(u8, idle_run, "output_only unavailable") != null) fail("plain idle-mode term_run changed output shape");
         const idle_probe = m.callTool("term_run", "{\"command\":\"echo MUST-NOT-RUN-IDLE\",\"wait_for\":\"command\"}");
-        if (std.mem.indexOf(u8, idle_probe, "\\\"command_sent\\\":false") == null or
+        if (std.mem.indexOf(u8, idle_probe, "\"command_sent\":false") == null or
             std.mem.indexOf(u8, idle_probe, "outside command mode") == null)
         {
             std.debug.print("DEBUG idle_run: {s}\n", .{idle_run});
@@ -604,45 +605,45 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.usleep(1_600_000);
 
         const silent_ok = m.callTool("term_run", "{\"command\":\"sleep 0.1 >/dev/null 2>&1\",\"wait_for\":\"command\",\"output_only\":true}");
-        if (std.mem.indexOf(u8, silent_ok, "\\\"state\\\":\\\"completed") == null or
-            std.mem.indexOf(u8, silent_ok, "\\\"exit_status\\\":0") == null or
+        if (std.mem.indexOf(u8, silent_ok, "\"state\":\"completed") == null or
+            std.mem.indexOf(u8, silent_ok, "\"exit_status\":0") == null or
             std.mem.indexOf(u8, silent_ok, "shell_integration") == null)
             fail("silent successful command did not complete via OSC 133");
 
         const status_124 = m.callTool("term_run", "{\"command\":\"timeout 0.1 sh -c 'sleep 1' >/dev/null 2>&1\",\"wait_for\":\"command\",\"output_only\":true}");
-        if (std.mem.indexOf(u8, status_124, "\\\"exit_status\\\":124") == null)
+        if (std.mem.indexOf(u8, status_124, "\"exit_status\":124") == null)
             fail("silent timeout command did not return status 124");
 
         const delayed = m.callTool("term_run", "{\"command\":\"sleep 0.2; printf 'MCP-DELAYED-OUTPUT\\\\n'\",\"wait_for\":\"command\",\"output_only\":true}");
         if (std.mem.indexOf(u8, delayed, "MCP-DELAYED-OUTPUT") == null or
-            std.mem.indexOf(u8, delayed, "\\\"state\\\":\\\"completed") == null)
+            std.mem.indexOf(u8, delayed, "\"state\":\"completed") == null)
             fail("command completion missed delayed output");
 
         const command_timeout = m.callTool("term_run", "{\"command\":\"sleep 0.6 >/dev/null 2>&1\",\"wait_for\":\"command\",\"timeout_ms\":100}");
-        if (std.mem.indexOf(u8, command_timeout, "\\\"state\\\":\\\"running") == null or
-            std.mem.indexOf(u8, command_timeout, "\\\"timed_out\\\":true") == null or
-            std.mem.indexOf(u8, command_timeout, "\\\"completion_source\\\":\\\"none") == null)
+        if (std.mem.indexOf(u8, command_timeout, "\"state\":\"running") == null or
+            std.mem.indexOf(u8, command_timeout, "\"timed_out\":true") == null or
+            std.mem.indexOf(u8, command_timeout, "\"completion_source\":\"none") == null)
             fail("command timeout did not report a still-running command");
         const duplicate = m.callTool("term_run", "{\"command\":\"echo MUST-NOT-BE-SENT\",\"wait_for\":\"command\"}");
         if (std.mem.indexOf(u8, duplicate, "term_wait_command") == null or
-            std.mem.indexOf(u8, duplicate, "\\\"command_sent\\\":false") == null)
+            std.mem.indexOf(u8, duplicate, "\"command_sent\":false") == null)
             fail("second command was not rejected while completion remained pending");
         _ = c.usleep(650_000);
         const waited = m.callTool("term_wait_command", "{\"timeout_ms\":1000,\"output_only\":true}");
-        if (std.mem.indexOf(u8, waited, "\\\"state\\\":\\\"completed") == null or
-            std.mem.indexOf(u8, waited, "\\\"exit_status\\\":0") == null)
+        if (std.mem.indexOf(u8, waited, "\"state\":\"completed") == null or
+            std.mem.indexOf(u8, waited, "\"exit_status\":0") == null)
             fail("term_wait_command did not finish a timed-out command");
 
         const no_integration = m.callTool("term_open", "{\"command\":[\"/bin/sh\"]}");
         if (std.mem.indexOf(u8, no_integration, "opened headless terminal 2") == null) fail("plain sh terminal failed");
         const unsupported = m.callTool("term_run", "{\"term\":2,\"command\":\"echo MUST-NOT-RUN\",\"wait_for\":\"command\"}");
-        if (std.mem.indexOf(u8, unsupported, "\\\"state\\\":\\\"unsupported") == null or
-            std.mem.indexOf(u8, unsupported, "\\\"command_sent\\\":false") == null or
-            std.mem.indexOf(u8, unsupported, "\\\"exit_status\\\":null") == null)
+        if (std.mem.indexOf(u8, unsupported, "\"state\":\"unsupported") == null or
+            std.mem.indexOf(u8, unsupported, "\"command_sent\":false") == null or
+            std.mem.indexOf(u8, unsupported, "\"exit_status\":null") == null)
             fail("shell-integration absence was not reported safely");
 
         const signaled = m.callTool("term_run", "{\"term\":1,\"command\":\"exec sh -c 'kill -TERM $$'\",\"wait_for\":\"command\",\"timeout_ms\":3000}");
-        if (std.mem.indexOf(u8, signaled, "\\\"exit_status\\\":-15") == null or
+        if (std.mem.indexOf(u8, signaled, "\"exit_status\":-15") == null or
             std.mem.indexOf(u8, signaled, "process_tracking") == null)
             fail("signal-killed command did not use tracked process status");
 
@@ -652,8 +653,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const fresh = m.callTool("term_open", "{\"command\":[\"/bin/bash\"],\"cols\":80,\"rows\":24}");
         if (std.mem.indexOf(u8, fresh, "opened headless terminal 3") == null) fail("fresh bash terminal failed");
         const fresh_run = m.callTool("term_run", "{\"term\":3,\"command\":\"true\",\"wait_for\":\"command\"}");
-        if (std.mem.indexOf(u8, fresh_run, "\\\"state\\\":\\\"completed") == null or
-            std.mem.indexOf(u8, fresh_run, "\\\"exit_status\\\":0") == null)
+        if (std.mem.indexOf(u8, fresh_run, "\"state\":\"completed") == null or
+            std.mem.indexOf(u8, fresh_run, "\"exit_status\":0") == null)
             fail("command mode raced the first prompt mark on a fresh terminal");
 
         // A foreground command started in idle mode must block a
@@ -661,13 +662,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // rejection must not send the command.
         _ = m.callTool("term_run", "{\"term\":3,\"command\":\"sleep 0.5 >/dev/null 2>&1\",\"quiet_ms\":100,\"timeout_ms\":2000}");
         const busy = m.callTool("term_run", "{\"term\":3,\"command\":\"echo MUST-NOT-BE-SENT-BUSY\",\"wait_for\":\"command\"}");
-        if (std.mem.indexOf(u8, busy, "\\\"command_sent\\\":false") == null or
+        if (std.mem.indexOf(u8, busy, "\"command_sent\":false") == null or
             std.mem.indexOf(u8, busy, "outside command mode") == null)
             fail("busy shell did not reject a command-mode send");
         _ = c.usleep(600_000);
         const after_busy = m.callTool("term_run", "{\"term\":3,\"command\":\"echo BUSY-CLEARED\",\"wait_for\":\"command\",\"output_only\":true}");
         if (std.mem.indexOf(u8, after_busy, "BUSY-CLEARED") == null or
-            std.mem.indexOf(u8, after_busy, "\\\"state\\\":\\\"completed") == null)
+            std.mem.indexOf(u8, after_busy, "\"state\":\"completed") == null)
             fail("command mode did not recover once the busy command finished");
 
         // ── capabilities preflight ────────────────────────────────
@@ -717,14 +718,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         // ── term_exec: sentinel-based structured exec ─────────────
         const ex1 = m.callTool("term_exec", "{\"term\":3,\"command\":\"echo EXEC-STRUCT; false\"}");
-        if (std.mem.indexOf(u8, ex1, "\\\"completed\\\":true") == null or
-            std.mem.indexOf(u8, ex1, "\\\"exit_status\\\":1") == null or
+        if (std.mem.indexOf(u8, ex1, "\"completed\":true") == null or
+            std.mem.indexOf(u8, ex1, "\"exit_status\":1") == null or
             std.mem.indexOf(u8, ex1, "EXEC-STRUCT") == null)
             fail("term_exec did not return structured output + status");
         // Works without shell integration too (plain /bin/sh, term 2).
         const ex2 = m.callTool("term_exec", "{\"term\":2,\"command\":\"echo SH-EXEC-OK\"}");
-        if (std.mem.indexOf(u8, ex2, "\\\"completed\\\":true") == null or
-            std.mem.indexOf(u8, ex2, "\\\"exit_status\\\":0") == null or
+        if (std.mem.indexOf(u8, ex2, "\"completed\":true") == null or
+            std.mem.indexOf(u8, ex2, "\"exit_status\":0") == null or
             std.mem.indexOf(u8, ex2, "SH-EXEC-OK") == null)
             fail("term_exec failed on an integration-less shell");
         // subshell=true keeps state out of the session.
@@ -737,8 +738,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // connection).
         _ = m.callTool("term_exec", "{\"term\":3,\"command\":\"set -e\",\"subshell\":false}");
         const under_e = m.callTool("term_exec", "{\"term\":3,\"command\":\"false\",\"subshell\":false}");
-        if (std.mem.indexOf(u8, under_e, "\\\"completed\\\":true") == null or
-            std.mem.indexOf(u8, under_e, "\\\"exit_status\\\":1") == null)
+        if (std.mem.indexOf(u8, under_e, "\"completed\":true") == null or
+            std.mem.indexOf(u8, under_e, "\"exit_status\":1") == null)
             fail("failing command under set -e did not report status 1");
         const survived = m.callTool("term_exec", "{\"term\":3,\"command\":\"echo STILL-ALIVE\",\"subshell\":false}");
         if (std.mem.indexOf(u8, survived, "STILL-ALIVE") == null)
@@ -754,26 +755,26 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // + interactive_prompt, the tracker survives, an answer via
         // term_send_text completes it, and term_exec_wait reattaches.
         const blocked = m.callTool("term_exec", "{\"term\":3,\"command\":\"printf 'Continue? [y/N] '; read ans; echo GOT:$ans\",\"timeout_ms\":15000}");
-        if (std.mem.indexOf(u8, blocked, "\\\"pending\\\":true") == null or
-            std.mem.indexOf(u8, blocked, "\\\"interactive_prompt\\\":true") == null or
-            std.mem.indexOf(u8, blocked, "\\\"tracker\\\":\\\"") == null or
-            std.mem.indexOf(u8, blocked, "\\\"screen\\\":\\\"") == null or
+        if (std.mem.indexOf(u8, blocked, "\"pending\":true") == null or
+            std.mem.indexOf(u8, blocked, "\"interactive_prompt\":true") == null or
+            std.mem.indexOf(u8, blocked, "\"tracker\":\"") == null or
+            std.mem.indexOf(u8, blocked, "\"screen\":\"") == null or
             std.mem.indexOf(u8, blocked, "Continue?") == null)
             fail("blocked interactive command did not surface pending state + screen");
-        if (std.mem.indexOf(u8, blocked, "\\\"timed_out\\\":true") != null)
+        if (std.mem.indexOf(u8, blocked, "\"timed_out\":true") != null)
             fail("interactive early-return was misreported as a timeout");
         _ = m.callTool("term_send_text", "{\"term\":3,\"text\":\"y\",\"enter\":true}");
         const resumed = m.callTool("term_exec_wait", "{\"term\":3,\"timeout_ms\":10000}");
-        if (std.mem.indexOf(u8, resumed, "\\\"completed\\\":true") == null or
-            std.mem.indexOf(u8, resumed, "\\\"exit_status\\\":0") == null or
+        if (std.mem.indexOf(u8, resumed, "\"completed\":true") == null or
+            std.mem.indexOf(u8, resumed, "\"exit_status\":0") == null or
             std.mem.indexOf(u8, resumed, "GOT:y") == null)
             fail("term_exec_wait did not resume the answered command");
         // output_file: full output to a local file, tail inline.
         var of_buf: [640]u8 = undefined;
         const of_args = std.fmt.bufPrint(&of_buf, "{{\"term\":3,\"command\":\"seq 1 500\",\"output_file\":\"{s}/exec-out.txt\"}}", .{rt}) catch unreachable;
         const filed = m.callTool("term_exec", of_args);
-        if (std.mem.indexOf(u8, filed, "\\\"output_file\\\":") == null or
-            std.mem.indexOf(u8, filed, "\\\"output_bytes\\\":") == null)
+        if (std.mem.indexOf(u8, filed, "\"output_file\":") == null or
+            std.mem.indexOf(u8, filed, "\"output_bytes\":") == null)
             fail("term_exec output_file was not honored");
         var of_path_buf: [512]u8 = undefined;
         const of_path = std.fmt.bufPrint(&of_path_buf, "{s}/exec-out.txt", .{rt}) catch unreachable;
@@ -790,19 +791,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // argv — only the grep that searches for it matches itself,
         // so the count is exactly 1 (the old sh -c transport made 2+).
         const psq = m.callTool("term_exec", "{\"term\":3,\"command\":\"ps -eo args | grep -c SK_PS_CANARY_42\",\"timeout_ms\":15000}");
-        if (std.mem.indexOf(u8, psq, "\\\"exit_status\\\":0") == null or
-            std.mem.indexOf(u8, psq, "\\\"output\\\":\\\"1\\\\n") == null)
+        if (std.mem.indexOf(u8, psq, "\"exit_status\":0") == null or
+            std.mem.indexOf(u8, psq, "\"output\":\"1\\n") == null)
             fail("the exec transport leaked the command onto a process command line (ps saw it)");
 
         // ── term_wait_exit: real process exit, not output idle ────
         const t4 = m.callTool("term_open", "{\"command\":[\"sh\",\"-c\",\"sleep 0.3; exit 7\"]}");
         if (std.mem.indexOf(u8, t4, "opened headless terminal") == null) fail("short-lived term_open failed");
         const wexit = m.callTool("term_wait_exit", "{\"term\":5,\"timeout_ms\":5000}");
-        if (std.mem.indexOf(u8, wexit, "\\\"exited\\\":true") == null or
-            std.mem.indexOf(u8, wexit, "\\\"exit_status\\\":7") == null)
+        if (std.mem.indexOf(u8, wexit, "\"exited\":true") == null or
+            std.mem.indexOf(u8, wexit, "\"exit_status\":7") == null)
             fail("term_wait_exit missed the real exit status");
         const listing = m.callTool("term_list", "{}");
-        if (std.mem.indexOf(u8, listing, "\\\"exit_status\\\":7") == null)
+        if (std.mem.indexOf(u8, listing, "\"exit_status\":7") == null)
             fail("term_list does not show the exit status");
         const post_read = m.callTool("term_read", "{\"term\":5}");
         if (std.mem.indexOf(u8, post_read, "process exited with status 7") == null)
@@ -819,9 +820,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var xargs_buf: [1200]u8 = undefined;
         const xargs = std.fmt.bufPrint(&xargs_buf, "{{\"local_path\":\"{s}\",\"remote_path\":\"{s}\"}}", .{ xsrc, xdst }) catch unreachable;
         const up = m.callTool("upload_file", xargs);
-        if (std.mem.indexOf(u8, up, "\\\"ok\\\":true") == null or
-            std.mem.indexOf(u8, up, "\\\"verified\\\":true") == null or
-            std.mem.indexOf(u8, up, "\\\"atomic\\\":true") == null)
+        if (std.mem.indexOf(u8, up, "\"direction\":\"upload\"") == null or
+            std.mem.indexOf(u8, up, "\"verified\":true") == null or
+            std.mem.indexOf(u8, up, "\"atomic\":true") == null)
             fail("local upload_file did not verify");
         if (!fileExists(xdst)) fail("upload_file destination missing");
 
@@ -1414,7 +1415,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .cols = @as(u16, 80),
         }) catch fail("reincarnated origin session spawn send");
         (owner.recvExpectFor(&.{.ok}, 5_000) catch fail("reincarnated origin session spawn reply")).deinit(allocator);
-        var fenced_active: std.atomic.Value(c_int) = .init(-1);
+        var fenced_active: muxclient.FdCancel = .{};
         if (muxclient.connectPanelRequesterUntilExpected(
             allocator,
             origin_sock,
