@@ -426,8 +426,18 @@ fn onSkipClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     goTo(ctx, ctx.last);
 }
 
+/// AdwCarousel (1.5+) allocates a page its NATURAL width unless it
+/// expands, and a status page of wrapping labels measures very narrow:
+/// without this every page sat side by side at ~150px. Pages must
+/// hexpand to take the carousel's full width.
+fn pageWidget(status: *c.GtkWidget) *c.GtkWidget {
+    c.gtk_widget_set_hexpand(status, 1);
+    c.gtk_widget_set_vexpand(status, 1);
+    return status;
+}
+
 fn buildTourPage(p: Page) *c.GtkWidget {
-    const status = c.adw_status_page_new();
+    const status = pageWidget(c.adw_status_page_new());
     c.adw_status_page_set_icon_name(@ptrCast(status), p.icon);
     c.adw_status_page_set_title(@ptrCast(status), p.title);
     c.adw_status_page_set_description(@ptrCast(status), p.body);
@@ -443,7 +453,7 @@ fn buildTourPage(p: Page) *c.GtkWidget {
 }
 
 fn buildPermissionPage(ctx: *Ctx) *c.GtkWidget {
-    const status = c.adw_status_page_new();
+    const status = pageWidget(c.adw_status_page_new());
     ctx.perm_status = @ptrCast(@alignCast(status));
 
     const box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 12);
@@ -491,7 +501,7 @@ pub fn open(window: *Window) void {
     };
     c.adw_dialog_set_title(dialog, "Welcome to sketerm");
     c.adw_dialog_set_content_width(dialog, 620);
-    c.adw_dialog_set_content_height(dialog, 520);
+    c.adw_dialog_set_content_height(dialog, 640);
 
     const carousel = c.adw_carousel_new();
     c.gtk_widget_set_vexpand(carousel, 1);
