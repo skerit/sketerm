@@ -422,7 +422,6 @@ fn shutdownDaemonAt(allocator: std.mem.Allocator, sock: []const u8) void {
 /// is gone — a SIGKILLed server can't run its own teardown, so every
 /// startup sweeps for orphans. Named (durable) instances are kept.
 fn sweepStaleEphemeral(allocator: std.mem.Allocator) void {
-    const muxdaemon = @import("../mux/daemon.zig");
     const rt = platform.runtimeDir();
     var base_buf: [4096]u8 = undefined;
     const base = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm", .{rt}) catch return;
@@ -439,7 +438,7 @@ fn sweepStaleEphemeral(allocator: std.mem.Allocator) void {
         const sock = std.fmt.bufPrint(&path_buf, "{s}/{s}/mux.sock", .{ base, name }) catch continue;
         shutdownDaemonAt(allocator, sock);
         const dir = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ base, name }) catch continue;
-        muxdaemon.removeTreeBestEffort(dir);
+        @import("../util/pathz.zig").removeTree(dir);
     }
 }
 
@@ -892,7 +891,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     if (iso) |i| {
         if (!i.durable) {
             shutdownDaemonAt(allocator, i.sock);
-            @import("../mux/daemon.zig").removeTreeBestEffort(i.dir);
+            @import("../util/pathz.zig").removeTree(i.dir);
         }
     }
     return 0;

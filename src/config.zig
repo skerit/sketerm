@@ -3719,8 +3719,9 @@ test "config: loadFromPath refuses an unreadable file instead of returning defau
     const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
     var path_buf: [512:0]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&path_buf, "{s}/config.conf", .{base});
-    defer _ = c.unlink(path.ptr);
+    // Defers unwind in reverse: the file must go before its directory.
     defer _ = c.rmdir(dir);
+    defer _ = c.unlink(path.ptr);
     {
         const fp = c.fopen(path.ptr, "wb") orelse return error.SkipZigTest;
         defer _ = c.fclose(fp);
@@ -5077,8 +5078,9 @@ test "config: the prefs save path keeps platform sections and flattens this plat
     const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
     var path_buf: [512:0]u8 = undefined;
     const path = try std.fmt.bufPrintZ(&path_buf, "{s}/config.conf", .{base});
-    defer _ = c.unlink(path.ptr);
+    // Defers unwind in reverse: the file must go before its directory.
     defer _ = c.rmdir(dir);
+    defer _ = c.unlink(path.ptr);
 
     var body_buf: [512]u8 = undefined;
     const body = try std.fmt.bufPrint(&body_buf,

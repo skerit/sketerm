@@ -46,6 +46,7 @@ const Window = winmod.Window;
 const remotectl = @import("remotectl.zig");
 const Doc = @import("panel/doc.zig");
 const assets = @import("panel/assets.zig");
+const pathz = @import("../util/pathz.zig");
 const canary = @import("panel/canary.zig");
 const events = @import("panel/events.zig");
 const PanelView = @import("panel/view.zig").PanelView;
@@ -4040,8 +4041,8 @@ test "panel cache decode runs off-caller and teardown discards its prepared resu
     const usage_before = assets.processPreparedUsage();
     var root_buf: [160]u8 = undefined;
     const root = try std.fmt.bufPrint(&root_buf, "/tmp/sketerm-panel-decode-worker-{d}", .{c.getpid()});
-    assets.removeTreeBestEffort(root);
-    defer assets.removeTreeBestEffort(root);
+    pathz.removeTree(root);
+    defer pathz.removeTree(root);
 
     const rgba = [_]u8{ 0x20, 0x80, 0xff, 0xff } ** (8 * 8);
     const encoded = try @import("../util/png.zig").encodeRgba(a, &rgba, 8, 8);

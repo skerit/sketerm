@@ -542,7 +542,7 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     _ = c.setenv("XDG_STATE_HOME", rt.ptr, 1);
     _ = c.unsetenv("SKETERM_SOCKET");
     _ = c.unsetenv("SKETERM_SSH");
-    defer @import("mux/daemon.zig").removeTreeBestEffort(rt);
+    defer @import("util/pathz.zig").removeTree(rt);
     // Isolated XDG_CONFIG_HOME races pango/fontconfig into heap
     // corruption unless the cache is warmed first (memory:
     // isolated-xdg-fontconfig-crash).

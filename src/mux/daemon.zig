@@ -303,7 +303,7 @@ pub const Session = struct {
         }
         if (self.audio_capture_base) |p| self.allocator.free(p);
         if (self.runtime_dir_path) |p| {
-            removeTreeBestEffort(p);
+            pathz.removeTree(p);
             self.allocator.free(p);
         }
         if (self.a11y) |*h| h.deinit();
@@ -872,33 +872,9 @@ test "hello-less clients default to the protocol-4 envelope with the legacy snap
     try std.testing.expect(!cl.winstream_channels);
 }
 
-const pathZ = @import("../util/pathz.zig").pathZ;
+const pathz = @import("../util/pathz.zig");
+const pathZ = pathz.pathZ;
 
-/// Recursively remove `path` and everything under it, best-effort:
-/// every failure is ignored (the dir lives on a tmpfs runtime dir that
-/// the OS reclaims at logout anyway). Used to tear down an isolated
-/// session's private XDG_RUNTIME_DIR, which apps fill with sockets and
-/// the odd subdir (dbus-1/, pulse/) we don't track individually.
-pub fn removeTreeBestEffort(path: []const u8) void {
-    var z_buf: [4096]u8 = undefined;
-    const zpath = pathZ(&z_buf, path) catch return;
-    if (c.opendir(zpath)) |dir| {
-        while (c.readdir(dir)) |ent| {
-            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
-            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            var child_buf: [4096]u8 = undefined;
-            const child = std.fmt.bufPrintZ(&child_buf, "{s}/{s}", .{ path, name }) catch continue;
-            // unlinkat fails on a directory (EISDIR/EPERM) → recurse,
-            // then drop the now-empty dir with AT_REMOVEDIR.
-            if (c.unlinkat(c.AT_FDCWD, child.ptr, 0) != 0) {
-                removeTreeBestEffort(child);
-                _ = c.unlinkat(c.AT_FDCWD, child.ptr, c.AT_REMOVEDIR);
-            }
-        }
-        _ = c.closedir(dir);
-    }
-    _ = c.rmdir(zpath);
-}
 
 /// One tunneled byte stream, bridged to clients as chan_* frames:
 /// a Wayland app connection (`native` set) or a window-stream session

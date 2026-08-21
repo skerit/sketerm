@@ -6317,12 +6317,9 @@ test "CopyOpts maps the wire strings, defaulting to merge + overwrite" {
 
 test "uniqueInDir walks past every name already on disk" {
     const t = std.testing;
-    var dbuf: [64]u8 = undefined;
-    const tmpl0 = "/tmp/sketerm-fsjob-uniq-XXXXXX";
-    @memcpy(dbuf[0..tmpl0.len], tmpl0);
-    dbuf[tmpl0.len] = 0;
-    const made = c.mkdtemp(@ptrCast(&dbuf)) orelse return error.SkipZigTest;
-    const dir = std.mem.span(@as([*:0]u8, @ptrCast(made)));
+    const td = pathz.TempDir.make("fsjob-uniq") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
     var buf: [512]u8 = undefined;
     // Nothing taken yet.
     try t.expectEqualStrings("a.txt-copy", uniqueInDir(dir, "a.txt", &buf).?);
@@ -6338,12 +6335,9 @@ test "uniqueInDir walks past every name already on disk" {
 
 test "copyOneFile resumes only on matching prefix hash" {
     const t = std.testing;
-    var dbuf: [64]u8 = undefined;
-    const tmpl = "/tmp/sketerm-fsjob-XXXXXX";
-    @memcpy(dbuf[0..tmpl.len], tmpl);
-    dbuf[tmpl.len] = 0;
-    const dirp = c.mkdtemp(@ptrCast(&dbuf)) orelse return error.SkipZigTest;
-    const dir = std.mem.span(@as([*:0]u8, @ptrCast(dirp)));
+    const td = pathz.TempDir.make("fsjob") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     var src_buf: [4096]u8 = undefined;
     var sw = std.Io.Writer.fixed(&src_buf);
@@ -6427,11 +6421,9 @@ test "media cache: newest record for a key wins" {
 
 test "media cache read keeps the newest lines and drops a partial record" {
     const t = std.testing;
-    var dbuf: [64]u8 = undefined;
-    const tmpl = "/tmp/sketerm-fsjob-mm-XXXXXX";
-    @memcpy(dbuf[0..tmpl.len], tmpl);
-    dbuf[tmpl.len] = 0;
-    const dir = std.mem.span(@as([*:0]u8, @ptrCast(c.mkdtemp(@ptrCast(&dbuf)) orelse return error.SkipZigTest)));
+    const td = pathz.TempDir.make("fsjob-mm") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
     var pbuf: [4096]u8 = undefined;
     const path = try std.fmt.bufPrint(&pbuf, "{s}/lines", .{dir});
     {

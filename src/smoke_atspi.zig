@@ -169,7 +169,7 @@ pub fn main() u8 {
     // process this smoke spawns (dbus-daemon → at-spi-bus-launcher →
     // registryd) inherits this and stays on the private one.
     _ = c.setenv("ATSPI_DBUS_IMPLEMENTATION", "dbus-daemon", 1);
-    defer @import("mux/daemon.zig").removeTreeBestEffort(rt);
+    defer @import("util/pathz.zig").removeTree(rt);
 
     // A fresh XDG_CONFIG_HOME changes fontconfig's cache key; warming it
     // single-threaded here keeps concurrent cache rebuilds from racing

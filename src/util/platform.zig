@@ -522,6 +522,13 @@ pub fn environOfPid(pid: c.pid_t, buf: []u8) ?[]u8 {
         used += @intCast(n);
     }
     if (used == 0) return null;
+    if (used == buf.len) {
+        // Full buffer: either the block ends exactly here or it does
+        // not fit. A partial block must never be returned -- a
+        // substring search would misread it as "not my process".
+        var probe: [1]u8 = undefined;
+        if (c.read(fd, &probe, 1) > 0) return null;
+    }
     return buf[0..used];
 }
 

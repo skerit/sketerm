@@ -66,7 +66,7 @@ fn cleanupTmpRoots(failed: bool) void {
         if (c.getenv("SKETERM_SMOKE_FS_KEEP")) |_| return;
     }
     for (0..tmp_root_count) |i|
-        daemon_mod.removeTreeBestEffort(tmp_roots[i][0..tmp_root_lens[i]]);
+        pathz.removeTree(tmp_roots[i][0..tmp_root_lens[i]]);
 }
 
 fn daemonMain(d: *daemon_mod.Daemon) void {
@@ -3115,8 +3115,8 @@ fn crossStage(
             const tree_tail = std.fmt.bufPrint(&tree_tail_buf, "{s}/zz-tail.bin", .{tree_src}) catch unreachable;
             writePattern(tree_tail, 16 << 20, 0x6f);
             const tree_dst = std.fmt.bufPrint(&tree_paths[2], "/dev/shm/sketerm-smoke-fs-xdev-tree-{d}", .{c.getpid()}) catch unreachable;
-            daemon_mod.removeTreeBestEffort(tree_dst);
-            defer daemon_mod.removeTreeBestEffort(tree_dst);
+            pathz.removeTree(tree_dst);
+            defer pathz.removeTree(tree_dst);
             const tree_job = fs.startCrossCopyTokenOpts("", tree_src, "", tree_dst, true, "xdev-tree-attempt-1", .{
                 .delete_src = true,
                 .no_replace = true,
@@ -3156,8 +3156,8 @@ fn crossStage(
             const stale_tail = std.fmt.bufPrint(&stale_tail_buf, "{s}/zz-tail.bin", .{stale_src}) catch unreachable;
             writePattern(stale_tail, 8 << 20, 0x72);
             const stale_dst = std.fmt.bufPrint(&stale_paths[2], "/dev/shm/sketerm-smoke-fs-xdev-stale-{d}", .{c.getpid()}) catch unreachable;
-            daemon_mod.removeTreeBestEffort(stale_dst);
-            defer daemon_mod.removeTreeBestEffort(stale_dst);
+            pathz.removeTree(stale_dst);
+            defer pathz.removeTree(stale_dst);
             const stale_job = fs.startCrossCopyTokenOpts("", stale_src, "", stale_dst, true, "xdev-stale-attempt-1", .{
                 .delete_src = true,
                 .no_replace = true,
@@ -3193,7 +3193,7 @@ fn crossStage(
                 var parsed = parsed_value;
                 defer parsed.deinit();
                 if (parsed.value.destination_stage.len > 0)
-                    daemon_mod.removeTreeBestEffort(parsed.value.destination_stage);
+                    pathz.removeTree(parsed.value.destination_stage);
             } else |_| {}
         }
     }

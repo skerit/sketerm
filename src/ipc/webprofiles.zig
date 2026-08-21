@@ -112,32 +112,7 @@ pub const Error = error{ Io, BadName, OutOfMemory };
 /// buffer room for `/profile-<name>-<id>`.
 const PATH_BUDGET: usize = 1024;
 
-fn rmTree(path: []const u8) void {
-    var z_buf: [4096]u8 = undefined;
-    const zpath = pathz.pathZ(&z_buf, path) catch return;
-    if (c.opendir(zpath)) |dir| {
-        while (c.readdir(dir)) |ent| {
-            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
-            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            var child_buf: [4096]u8 = undefined;
-            const child = std.fmt.bufPrintZ(&child_buf, "{s}/{s}", .{ path, name }) catch continue;
-            // unlinkat refuses a directory (EISDIR/EPERM): recurse, then
-            // drop the emptied dir with AT_REMOVEDIR.
-            if (c.unlinkat(c.AT_FDCWD, child.ptr, 0) != 0) {
-                rmTree(child);
-                _ = c.unlinkat(c.AT_FDCWD, child.ptr, c.AT_REMOVEDIR);
-            }
-        }
-        _ = c.closedir(dir);
-    }
-    _ = c.rmdir(zpath);
-}
 
-/// Recursive removal for the sibling modules' test scratch dirs; the
-/// production callers go through `Store.retire`.
-pub fn rmTreeForTest(path: []const u8) void {
-    rmTree(path);
-}
 
 /// `$XDG_STATE_HOME`, else `$HOME/.local/state`.
 fn stateBase(buf: *[4096]u8) ?[]const u8 {
@@ -373,7 +348,7 @@ pub const Store = struct {
             // orphan dir, which sweepOrphans collects. The reverse order
             // would leave an entry pointing at nothing.
             const saved = self.save();
-            if (jar.len > 0) rmTree(jar);
+            if (jar.len > 0) pathz.removeTree(jar);
             self.gpa.free(e.name);
             try saved;
             return true;
@@ -415,7 +390,7 @@ pub const Store = struct {
             };
         }
         _ = c.closedir(dir);
-        for (doomed.items) |p| rmTree(p);
+        for (doomed.items) |p| pathz.removeTree(p);
     }
 
     fn save(self: *Store) Error!void {
@@ -568,7 +543,7 @@ const ScratchState = struct {
         } else {
             _ = c.unsetenv("XDG_STATE_HOME");
         }
-        rmTree(self.dir);
+        pathz.removeTree(self.dir);
     }
 };
 

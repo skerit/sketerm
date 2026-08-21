@@ -446,7 +446,7 @@ fn claimCacheNamespace(root: []const u8, pid: c.pid_t) !c_int {
     if (fd < 0) return error.OwnerClaimFailed;
     errdefer {
         _ = c.close(fd);
-        rmTree(root);
+        pathz.removeTree(root);
     }
     if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) return error.OwnerClaimFailed;
     var metadata_buf: [96]u8 = undefined;
@@ -939,7 +939,7 @@ fn cleanupProcessNamespaces(parent: []const u8, current_root: []const u8) void {
                 _ = c.close(fd);
                 continue;
             }
-            rmTree(std.mem.span(owner_path.ptr));
+            pathz.removeTree(std.mem.span(owner_path.ptr));
             _ = c.close(fd);
             pruned += 1;
         }
@@ -1020,36 +1020,6 @@ fn wallSecs() i64 {
     return @intCast(ts.tv_sec);
 }
 
-fn rmTree(path: []const u8) void {
-    var path_buf: [4096]u8 = undefined;
-    const z = pathz.pathZ(&path_buf, path) catch return;
-    var st: c.struct_stat = undefined;
-    if (c.lstat(z, &st) != 0) return;
-    if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
-        const dir = c.opendir(z) orelse return;
-        const allocator = std.heap.page_allocator;
-        var children: std.ArrayList([]u8) = .empty;
-        while (c.readdir(dir)) |ent| {
-            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
-            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            const child = std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, name }) catch continue;
-            children.append(allocator, child) catch allocator.free(child);
-        }
-        _ = c.closedir(dir);
-        for (children.items) |child| {
-            rmTree(child);
-            allocator.free(child);
-        }
-        children.deinit(allocator);
-    }
-    if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) _ = c.rmdir(z) else _ = c.unlink(z);
-}
-
-/// Remove a cache test namespace recursively on a best-effort basis.
-pub fn removeTreeBestEffort(path: []const u8) void {
-    rmTree(path);
-}
-
 test "panel assets collect unique image paths and enforce the operation cap" {
     const testing = std.testing;
     const source =
@@ -1105,8 +1075,8 @@ test "panel resolver maps logical paths without changing document serialization"
     const testing = std.testing;
     var root_buf: [160]u8 = undefined;
     const root = try std.fmt.bufPrint(&root_buf, "/tmp/sketerm-panel-assets-resolver-{d}", .{c.getpid()});
-    rmTree(root);
-    defer rmTree(root);
+    pathz.removeTree(root);
+    defer pathz.removeTree(root);
     var cache = try Cache.initAt(testing.allocator, root);
     defer cache.deinit();
 
@@ -1139,8 +1109,8 @@ test "panel cache verifies content, stages atomically, and refreshes a reused lo
     const testing = std.testing;
     var root_buf: [160]u8 = undefined;
     const root = try std.fmt.bufPrint(&root_buf, "/tmp/sketerm-panel-assets-store-{d}", .{c.getpid()});
-    rmTree(root);
-    defer rmTree(root);
+    pathz.removeTree(root);
+    defer pathz.removeTree(root);
 
     var first = try storeWithOptions(testing.allocator, root, "red pixels", &.{}, .{}, true);
     defer first.deinit();
@@ -1199,8 +1169,8 @@ test "panel cache bounds pruning and protects leased blobs" {
     const testing = std.testing;
     var root_buf: [160]u8 = undefined;
     const root = try std.fmt.bufPrint(&root_buf, "/tmp/sketerm-panel-assets-limit-{d}", .{c.getpid()});
-    rmTree(root);
-    defer rmTree(root);
+    pathz.removeTree(root);
+    defer pathz.removeTree(root);
     const limits = CacheLimits{ .max_bytes = 64, .max_blobs = 1, .partial_stale_secs = 0 };
 
     var first = try storeWithOptions(testing.allocator, root, "first", &.{}, limits, true);
@@ -1252,8 +1222,8 @@ test "panel cache removes dead owners and protects live PID-reuse namespaces" {
     const a = std.testing.allocator;
     var base_buf: [160]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, "/tmp/sketerm-panel-assets-siblings-{d}", .{c.getpid()});
-    rmTree(base);
-    defer rmTree(base);
+    pathz.removeTree(base);
+    defer pathz.removeTree(base);
     const pid = c.getpid();
     const dead_owner = "dddddddddddddddddddddddddddddddd";
     const live_owner = "11111111111111111111111111111111";

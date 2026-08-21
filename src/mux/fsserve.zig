@@ -1013,13 +1013,6 @@ pub const EventIter = struct {
 
 // ── tests ───────────────────────────────────────────────────────
 
-fn mkTmpDir(buf: *[64]u8) ?[]const u8 {
-    const tmpl = "/tmp/sketerm-fsserve-XXXXXX";
-    @memcpy(buf[0..tmpl.len], tmpl);
-    buf[tmpl.len] = 0;
-    const p = c.mkdtemp(@ptrCast(buf)) orelse return null;
-    return std.mem.span(@as([*:0]u8, @ptrCast(p)));
-}
 
 fn touch(dir: []const u8, name: []const u8, content: []const u8) !void {
     var z: [4096]u8 = undefined;
@@ -1057,8 +1050,9 @@ test "parseUserDir expands $HOME, strips quotes, and ignores comments" {
 
 test "templatesDir reads user-dirs.dirs and falls back to $HOME/Templates" {
     const t = std.testing;
-    var dbuf: [64]u8 = undefined;
-    const dir = mkTmpDir(&dbuf) orelse return error.SkipZigTest;
+    const td = pathz.TempDir.make("fsserve") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
     var buf: [4096]u8 = undefined;
     // No user-dirs.dirs yet: the freedesktop default.
     try t.expectEqualStrings("/home/u/Templates", templatesDir("/home/u", dir, &buf));
@@ -1083,8 +1077,9 @@ test "listDir: rich entries, dirs-first ci sort, symlink target" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var dbuf: [64]u8 = undefined;
-    const dir = mkTmpDir(&dbuf) orelse return error.SkipZigTest;
+    const td = pathz.TempDir.make("fsserve") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     try touch(dir, "Beta.txt", "12345");
     try touch(dir, "alpha.txt", "");
@@ -1125,8 +1120,9 @@ test "readNames: sorted cheap phase with the same filters" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var dbuf: [64]u8 = undefined;
-    const dir = mkTmpDir(&dbuf) orelse return error.SkipZigTest;
+    const td = pathz.TempDir.make("fsserve") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
     try touch(dir, "Beta.txt", "");
     try touch(dir, "alpha.txt", "");
     var z: [4096]u8 = undefined;
@@ -1146,8 +1142,9 @@ test "readNames: sorted cheap phase with the same filters" {
 test "listDir: entry cap sets truncated" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
-    var dbuf: [64]u8 = undefined;
-    const dir = mkTmpDir(&dbuf) orelse return error.SkipZigTest;
+    const td = pathz.TempDir.make("fsserve") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
     var i: usize = 0;
     var nb: [16]u8 = undefined;
     while (i < 10) : (i += 1) {
@@ -1164,8 +1161,9 @@ test "listDirAttrsWhy names why the open failed" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var dbuf: [64]u8 = undefined;
-    const dir = mkTmpDir(&dbuf) orelse return error.SkipZigTest;
+    const td = pathz.TempDir.make("fsserve") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     // Absent: the reason a browser must be able to print instead of
     // rendering an empty listing.
@@ -1209,8 +1207,9 @@ test "listDirAttrsWhy names why the open failed" {
 
 test "watcher: create + delete surface as parsed events" {
     if (comptime !is_linux) return error.SkipZigTest;
-    var dbuf: [64]u8 = undefined;
-    const dir = mkTmpDir(&dbuf) orelse return error.SkipZigTest;
+    const td = pathz.TempDir.make("fsserve") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     var w: Watcher = .{};
     defer w.deinit();

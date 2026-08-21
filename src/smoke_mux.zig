@@ -1988,7 +1988,7 @@ fn daemonMain(d: *daemon_mod.Daemon) void {
 /// private XDG_RUNTIME_DIR with the inherited D-Bus session bus dropped,
 /// and that dir — contents and all — must be recursively removed when
 /// the session dies. Exercises spawnSession's isolation path and the
-/// removeTreeBestEffort recursion.
+/// removeTree recursion.
 fn isolatedStage(allocator: std.mem.Allocator, sock_path: []const u8) void {
     const pathZ = @import("util/pathz.zig").pathZ;
     // Seed a bogus session bus so "dropped" is observable, not merely

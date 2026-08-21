@@ -274,7 +274,7 @@ fn sweepRuntimeDir(dir: []const u8) usize {
 ///
 /// Keyed on the process environment rather than on the leftover
 /// directory, because the worst orphan — an autostarted replacement
-/// daemon — outlives the directory: the previous run's `removeTreeBestEffort`
+/// daemon — outlives the directory: the previous run's `removeTree`
 /// deletes the tree while the daemon bound to a socket inside it keeps
 /// running. A leftover is only swept when its OWNING harness pid is
 /// gone, so two concurrent smoke-e2e runs never touch each other.
@@ -310,7 +310,7 @@ fn sweepStaleRuns() void {
         if (owner == self or !pidGone(owner)) continue;
         var path_buf: [256]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "/tmp/{s}", .{name}) catch continue;
-        @import("mux/daemon.zig").removeTreeBestEffort(path);
+        @import("util/pathz.zig").removeTree(path);
     }
     if (swept > 0) reportSwept(swept);
 }
@@ -335,7 +335,7 @@ fn onFatalSignal(sig: c_int) callconv(.c) void {
     if (g_rt.len > 0) {
         var z: [256:0]u8 = undefined;
         if (std.fmt.bufPrintZ(&z, "{s}", .{g_rt})) |p| {
-            @import("mux/daemon.zig").removeTreeBestEffort(p);
+            @import("util/pathz.zig").removeTree(p);
         } else |_| {}
     }
     c._exit(1);
@@ -494,7 +494,7 @@ pub fn main() u8 {
     _ = c.setenv("XDG_CACHE_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_DATA_HOME", rt.ptr, 1);
     _ = c.unsetenv("SKETERM_SOCKET");
-    defer @import("mux/daemon.zig").removeTreeBestEffort(rt);
+    defer @import("util/pathz.zig").removeTree(rt);
 
     const have_web_action = c.access("zig-out/bin/sketerm-webengine", c.X_OK) == 0;
     if (have_web_action and !prepareWebActionFixture(allocator, rt))

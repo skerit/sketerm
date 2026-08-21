@@ -706,42 +706,12 @@ const Scratch = struct {
     }
 
     fn deinit(self: *Scratch) void {
-        rmTree(self.path());
+        pathz.removeTree(self.path());
         _ = c.unsetenv("XDG_STATE_HOME");
         self.* = undefined;
     }
 };
 
-/// Best-effort recursive delete, for the test scratch dirs only. Names
-/// are collected BEFORE anything is unlinked: deleting during readdir
-/// skips entries, which quietly left half the scratch tree behind.
-fn rmTree(path: []const u8) void {
-    var zbuf: [4096]u8 = undefined;
-    const z = pathz.pathZ(&zbuf, path) catch return;
-    if (c.opendir(z)) |d| {
-        const a = std.heap.page_allocator;
-        var kids: std.ArrayList([]u8) = .empty;
-        defer {
-            for (kids.items) |k| a.free(k);
-            kids.deinit(a);
-        }
-        while (c.readdir(d)) |ent| {
-            const fname = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
-            if (std.mem.eql(u8, fname, ".") or std.mem.eql(u8, fname, "..")) continue;
-            const child = std.fmt.allocPrint(a, "{s}/{s}", .{ path, fname }) catch continue;
-            kids.append(a, child) catch a.free(child);
-        }
-        _ = c.closedir(d);
-        for (kids.items) |child| rmTree(child);
-    }
-    var st: c.struct_stat = undefined;
-    if (c.stat(z, &st) != 0) return;
-    if (st.st_mode & c.S_IFDIR != 0) {
-        _ = c.rmdir(z);
-    } else {
-        _ = c.unlink(z);
-    }
-}
 
 test "panel names are validated; sessions are only length-checked" {
     try t.expect(validName("vsr-compare"));

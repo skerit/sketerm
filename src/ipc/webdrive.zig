@@ -54,6 +54,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
+const pathz = @import("../util/pathz.zig");
 const muxclient = @import("../mux/client.zig");
 const display = @import("../mux/display.zig");
 const proto = @import("../web/protocol.zig");
@@ -2344,7 +2345,7 @@ const Pair = struct {
         } else {
             _ = c.unsetenv("XDG_STATE_HOME");
         }
-        webprofiles.rmTreeForTest(self.stateDir());
+        pathz.removeTree(self.stateDir());
     }
 
     /// Everything the engine has written since the last drain. MSG_DONTWAIT

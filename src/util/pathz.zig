@@ -64,6 +64,71 @@ pub fn makeParentDirs(path: []const u8) Error!void {
     };
 }
 
+/// Remove `path` and everything under it, best effort: failures are
+/// ignored and a plain file or symlink is unlinked rather than descended.
+/// Names are collected BEFORE anything is unlinked: deleting during
+/// readdir skips entries and quietly leaves half the tree behind.
+pub fn removeTree(path: []const u8) void {
+    var z_buf: [4096]u8 = undefined;
+    const zpath = pathZ(&z_buf, path) catch return;
+    // lstat BEFORE opendir: opendir follows a symlink, and a link to a
+    // directory must be unlinked, never emptied.
+    var st: c.struct_stat = undefined;
+    if (c.lstat(zpath, &st) != 0) return;
+    const is_dir = (st.st_mode & c.S_IFMT) == c.S_IFDIR;
+    if (!is_dir) {
+        _ = c.unlink(zpath);
+        return;
+    }
+    if (c.opendir(zpath)) |dir| {
+        const a = std.heap.page_allocator;
+        var kids: std.ArrayList([]u8) = .empty;
+        defer {
+            for (kids.items) |k| a.free(k);
+            kids.deinit(a);
+        }
+        while (c.readdir(dir)) |ent| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            const child = std.fmt.allocPrint(a, "{s}/{s}", .{ path, name }) catch continue;
+            kids.append(a, child) catch a.free(child);
+        }
+        _ = c.closedir(dir);
+        for (kids.items) |child| removeTree(child);
+    }
+    _ = c.rmdir(zpath);
+}
+
+/// A `mkdtemp` scratch directory for tests, removed whole by `remove`.
+/// Tests that forget the `defer td.remove()` leave one per run in /tmp.
+pub const TempDir = struct {
+    buf: [64:0]u8 = undefined,
+    len: usize = 0,
+
+    /// @return null when mkdtemp fails (callers `return error.SkipZigTest`).
+    pub fn make(comptime stem: []const u8) ?TempDir {
+        const tmpl = "/tmp/sketerm-" ++ stem ++ "-XXXXXX";
+        var self = TempDir{};
+        @memcpy(self.buf[0..tmpl.len], tmpl);
+        self.buf[tmpl.len] = 0;
+        if (c.mkdtemp(@ptrCast(&self.buf)) == null) return null;
+        self.len = tmpl.len;
+        return self;
+    }
+
+    pub fn path(self: *const TempDir) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    pub fn pathZ(self: *const TempDir) [*:0]const u8 {
+        return @ptrCast(&self.buf);
+    }
+
+    pub fn remove(self: *const TempDir) void {
+        removeTree(self.path());
+    }
+};
+
 test "pathZ round-trips and rejects oversize" {
     var buf: [4096]u8 = undefined;
     const z = try pathZ(&buf, "/tmp/x");
@@ -73,9 +138,9 @@ test "pathZ round-trips and rejects oversize" {
 }
 
 test "makeParentDirs creates nested dirs" {
-    var tmpl = "/tmp/sketerm-pathz-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    const td = TempDir.make("pathz") orelse return error.SkipZigTest;
+    defer td.remove();
+    const base = td.path();
     var buf: [4096]u8 = undefined;
     var w = std.Io.Writer.fixed(&buf);
     try w.print("{s}/a/b/c/file", .{base});
@@ -89,9 +154,9 @@ test "makeParentDirs creates nested dirs" {
 }
 
 test "makeDirs is idempotent and reports an uncreatable component" {
-    var tmpl = "/tmp/sketerm-mkdirs-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
+    const td = TempDir.make("mkdirs") orelse return error.SkipZigTest;
+    defer td.remove();
+    const base = td.path();
     var buf: [4096]u8 = undefined;
     const nested = try std.fmt.bufPrint(&buf, "{s}/a/b/c", .{base});
     try makeDirs(nested, 0o700);
@@ -103,4 +168,36 @@ test "makeDirs is idempotent and reports an uncreatable component" {
 
     try std.testing.expectError(error.MkdirFailed, makeDirs("", 0o700));
     try std.testing.expectError(error.MkdirFailed, makeDirs("/proc/definitely/not/creatable", 0o700));
+}
+
+test "removeTree takes a nested tree, a lone file and a missing path in stride" {
+    const td = TempDir.make("rmtree") orelse return error.SkipZigTest;
+    var buf: [4096]u8 = undefined;
+    const nested = try std.fmt.bufPrint(&buf, "{s}/a/b/c", .{td.path()});
+    try makeDirs(nested, 0o700);
+    var fbuf: [4096:0]u8 = undefined;
+    const file = try std.fmt.bufPrintZ(&fbuf, "{s}/a/b/c/f", .{td.path()});
+    const fp = c.fopen(file.ptr, "wb") orelse return error.SkipZigTest;
+    _ = c.fclose(fp);
+    var z_buf: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    // A file path is unlinked, not descended.
+    removeTree(file);
+    try std.testing.expect(c.stat(file.ptr, &st) != 0);
+    // A symlink to a directory OUTSIDE the tree is unlinked, never
+    // followed: the target keeps its contents.
+    const keep = TempDir.make("rmtree-keep") orelse return error.SkipZigTest;
+    defer keep.remove();
+    var kbuf: [4096:0]u8 = undefined;
+    const kept = try std.fmt.bufPrintZ(&kbuf, "{s}/kept", .{keep.path()});
+    const kf = c.fopen(kept.ptr, "wb") orelse return error.SkipZigTest;
+    _ = c.fclose(kf);
+    var lbuf: [4096:0]u8 = undefined;
+    const link = try std.fmt.bufPrintZ(&lbuf, "{s}/a/link", .{td.path()});
+    try std.testing.expect(c.symlink(keep.pathZ(), link.ptr) == 0);
+    td.remove();
+    try std.testing.expect(c.stat(try pathZ(&z_buf, td.path()), &st) != 0);
+    try std.testing.expect(c.stat(kept.ptr, &st) == 0);
+    // Already gone: a no-op, not a crash.
+    td.remove();
 }

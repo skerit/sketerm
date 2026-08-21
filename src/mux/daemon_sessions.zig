@@ -9,6 +9,7 @@ const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const wire = @import("wire.zig");
 const platform = @import("../util/platform.zig");
+const pathz = @import("../util/pathz.zig");
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
 const Client = dmod.Client;
@@ -25,7 +26,6 @@ const nowMs = dmod.nowMs;
 const shell_util = @import("shell.zig");
 const wssource = @import("../winstream/source.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
-const removeTreeBestEffort = dmod.removeTreeBestEffort;
 const SessionInfo = dmod.SessionInfo;
 const RenameReq = dmod.RenameReq;
 const SessionOriginId = dmod.SessionOriginId;
@@ -708,7 +708,7 @@ test "new workers close every broker descriptor and release stale listeners" {
     var dir_buf: [128]u8 = undefined;
     const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sketerm-worker-fds-{d}", .{c.getpid()});
     _ = c.mkdir(dir.ptr, 0o700);
-    defer dmod.removeTreeBestEffort(dir);
+    defer pathz.removeTree(dir);
     var path_buf: [160]u8 = undefined;
     const socket_path = try std.fmt.bufPrint(&path_buf, "{s}/mux.sock", .{dir});
     const broker = try Daemon.init(a, socket_path);
@@ -1432,7 +1432,7 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     defer if (rt_dir_z) |z| allocator.free(z);
     var rt_dir_owned: ?[]u8 = null;
     errdefer if (rt_dir_owned) |p| {
-        removeTreeBestEffort(p);
+        pathz.removeTree(p);
         allocator.free(p);
     };
     if (req.isolated) {

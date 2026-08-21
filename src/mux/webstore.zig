@@ -1360,29 +1360,11 @@ pub const WebStore = struct {
 
 // ── tests ───────────────────────────────────────────────────────
 
-fn testDir(buf: *[64]u8) ?[]const u8 {
-    const template = "/tmp/sk-webstore-XXXXXX";
-    @memcpy(buf[0..template.len], template);
-    buf[template.len] = 0;
-    const p = c.mkdtemp(@ptrCast(buf)) orelse return null;
-    return std.mem.span(@as([*:0]u8, @ptrCast(p)));
-}
-
-fn rmTree(dir: []const u8) void {
-    var pb: [4096:0]u8 = undefined;
-    for ([_][]const u8{ "history.jsonl", "bookmarks.json", "sites.json", "userscripts.json", "userstyles.json", "containers.json" }) |f| {
-        const p = std.fmt.bufPrintZ(&pb, "{s}/{s}", .{ dir, f }) catch continue;
-        _ = c.unlink(p.ptr);
-    }
-    const d = std.fmt.bufPrintZ(&pb, "{s}", .{dir}) catch return;
-    _ = c.rmdir(d.ptr);
-}
-
 test "webstore durable files preserve mode, old bytes, concurrency, and cleanup" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
     var path_buf: [4096]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/bookmarks.json", .{dir});
     var path_z_buf: [4096]u8 = undefined;
@@ -1445,9 +1427,9 @@ test "webstore: originOf extracts and lowercases scheme+host" {
 
 test "webstore: history visits round-trip across a reload" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     {
         var store = try WebStore.init(t.allocator, dir);
@@ -1471,9 +1453,9 @@ test "webstore: history visits round-trip across a reload" {
 
 test "webstore: query ranks prefix and frecency, bounds results" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
     var store = try WebStore.init(t.allocator, dir);
     defer store.deinit();
 
@@ -1508,9 +1490,9 @@ test "webstore: query ranks prefix and frecency, bounds results" {
 
 test "webstore: delete and clear persist across reload" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     {
         var store = try WebStore.init(t.allocator, dir);
@@ -1534,9 +1516,9 @@ test "webstore: delete and clear persist across reload" {
 
 test "webstore: compaction rewrites the log without losing counts" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     {
         var store = try WebStore.init(t.allocator, dir);
@@ -1558,9 +1540,9 @@ test "webstore: compaction rewrites the log without losing counts" {
 
 test "webstore: bookmarks keep order, folders and updates across reload" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     var first: u64 = 0;
     {
@@ -1592,9 +1574,9 @@ test "webstore: bookmarks keep order, folders and updates across reload" {
 
 test "webstore: userscripts add/enable/remove survive reload" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     const src = "// ==UserScript==\n// @name A\n// ==/UserScript==\nx();";
     var first: u64 = 0;
@@ -1628,9 +1610,9 @@ test "webstore: userscripts add/enable/remove survive reload" {
 
 test "webstore: userstyles set/replace/delete survive reload" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     {
         var store = try WebStore.init(t.allocator, dir);
@@ -1662,9 +1644,9 @@ test "webstore: userstyles set/replace/delete survive reload" {
 
 test "webstore: site settings merge, clear and survive reload" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     {
         var store = try WebStore.init(t.allocator, dir);
@@ -1696,9 +1678,9 @@ test "webstore: site settings merge, clear and survive reload" {
 
 test "webstore: containers keep ids, jar keys and colours across reload" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     var work: u32 = 0;
     {
@@ -1738,9 +1720,9 @@ test "webstore: containers keep ids, jar keys and colours across reload" {
 
 test "webstore: a container refuses both egress and remote host" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
     var store = try WebStore.init(t.allocator, dir);
     defer store.deinit();
 
@@ -1755,9 +1737,9 @@ test "webstore: a container refuses both egress and remote host" {
 
 test "webstore: site assignment is exact, clears, and dies with its container" {
     const t = std.testing;
-    var db: [64]u8 = undefined;
-    const dir = testDir(&db) orelse return error.SkipZigTest;
-    defer rmTree(dir);
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
 
     var work: u32 = 0;
     {

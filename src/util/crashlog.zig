@@ -265,6 +265,7 @@ test "crashlog: the log path resolves under XDG_STATE_HOME and opens" {
     var dir_buf: [256]u8 = undefined;
     const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sketerm-crashlog-test-{d}", .{c.getpid()});
     _ = c.mkdir(dir.ptr, 0o700);
+    defer @import("pathz.zig").removeTree(dir);
     _ = c.setenv("XDG_STATE_HOME", dir.ptr, 1);
     var buf: [4096]u8 = undefined;
     const path = defaultPath(&buf) orelse return error.NoPath;
@@ -272,9 +273,6 @@ test "crashlog: the log path resolves under XDG_STATE_HOME and opens" {
     const fd = openLog(path);
     try t.expect(fd >= 0);
     _ = c.close(fd);
-    var z: [4096]u8 = undefined;
-    const pz = try std.fmt.bufPrintZ(&z, "{s}", .{path});
-    _ = c.unlink(pz.ptr);
 }
 
 test "crashlog: set truncates an oversized breadcrumb instead of overflowing" {

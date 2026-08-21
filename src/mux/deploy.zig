@@ -531,6 +531,7 @@ test "check and upload run through a real sh with the payload on stdin" {
     var home_buf: [128:0]u8 = undefined;
     const home = std.fmt.bufPrintZ(&home_buf, "/tmp/sketerm-deploy-home-{d}", .{c.getpid()}) catch unreachable;
     _ = c.mkdir(home.ptr, 0o700);
+    defer @import("../util/pathz.zig").removeTree(home);
     var ssh_buf: [160:0]u8 = undefined;
     const ssh = std.fmt.bufPrintZ(&ssh_buf, "{s}/fake-ssh", .{home}) catch unreachable;
     var script_buf: [320:0]u8 = undefined;
@@ -579,8 +580,6 @@ test "check and upload run through a real sh with the payload on stdin" {
     const mismatched = Artifact{ .path = "/bin/true", .arch = other, .hash = hash };
     try std.testing.expect(ensureUsing(std.testing.allocator, "box", ssh.ptr, mismatched, .{ .run = runSshCommand }) == null);
 
-    _ = c.unlink(deployed.ptr);
-    _ = c.unlink(ssh.ptr);
 }
 
 test "deployment leaves unsupported hosts and failed checks untouched" {

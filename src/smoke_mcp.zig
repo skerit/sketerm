@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const pathz = @import("util/pathz.zig");
 const muxclient = @import("mux/client.zig");
 const wire = @import("mux/wire.zig");
 const panelstore = @import("ipc/panelstore.zig");
@@ -23,8 +24,19 @@ fn say(msg: []const u8) void {
     _ = c.write(2, "\n", 1);
 }
 
+/// The isolated runtime dir of this run, once main has minted it: the
+/// handle `fail` needs to retire the daemons `exit` would otherwise
+/// skip every `defer` for. Every failed run used to leave its five
+/// brokers alive until the host rebooted.
+var g_rt: ?[]const u8 = null;
+
 fn fail(comptime msg: []const u8) noreturn {
     say("smoke-mcp: FAIL " ++ msg);
+    if (g_rt) |rt| {
+        killDaemonsUnderRt(rt, std.heap.page_allocator);
+        say("smoke-mcp: runtime dir kept for inspection:");
+        say(rt);
+    }
     std.process.exit(1);
 }
 
@@ -540,6 +552,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.mkdir(home.ptr, 0o700);
     _ = c.setenv("HOME", home.ptr, 1);
     clearInheritedOrigin();
+    g_rt = rt;
     defer killDaemonsUnderRt(rt, allocator);
 
     const exe = "zig-out/bin/sketerm";
@@ -1963,9 +1976,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
-    // Retire the durable daemon we started.
+    // Retire the durable daemon we started, then the dir: a passing run
+    // leaves nothing in /tmp (a failing one keeps it, see `fail`).
     killDaemonsUnderRt(rt, allocator);
     _ = c.usleep(500_000);
+    g_rt = null;
+    pathz.removeTree(rt);
 
     say("smoke-mcp: PASS");
     return 0;
@@ -3476,10 +3492,14 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     clearInheritedOrigin();
     _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
     _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
-    defer killDaemonsUnderRt(rt, allocator);
+    g_rt = rt;
     webStage(allocator, exe, rt);
     say("smoke-mcp: focused headless web tools ok");
     webPolicyStage(allocator, exe, rt);
     say("smoke-mcp: focused enforced network policy ok");
+    killDaemonsUnderRt(rt, allocator);
+    _ = c.usleep(500_000);
+    g_rt = null;
+    pathz.removeTree(rt);
     return 0;
 }
