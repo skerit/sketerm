@@ -199,6 +199,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const widgetshot = @import("widgetshot.zig");
+const facehost = @import("facehost.zig");
 const platform = @import("../util/platform.zig");
 const input = @import("input.zig");
 const toolbtn = @import("toolbtn.zig");
@@ -6257,8 +6258,7 @@ pub const WebFace = struct {
     /// through it. Null once the widgets are dead.
     pub fn ownerWindow(self: *WebFace) ?*@import("window.zig").Window {
         if (self.widgets_dead) return null;
-        const root = c.gtk_widget_get_root(self.root_box) orelse return null;
-        return @import("remotectl.zig").windowFromGtk(@ptrCast(@alignCast(root)));
+        return facehost.windowOf(self.root_box);
     }
 
     pub fn popupScale(self: *WebFace) u16 {

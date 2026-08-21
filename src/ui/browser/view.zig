@@ -75,6 +75,7 @@ const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const selmod = @import("selection.zig");
 const tabsmod = @import("tabs.zig");
 const tabhost_mod = @import("../tabhost.zig");
+const facehost = @import("../facehost.zig");
 const templates_mod = @import("templates.zig");
 const viewsmod = @import("views.zig");
 const cast = @import("../../util/cast.zig");
@@ -1025,8 +1026,7 @@ pub const BrowserView = struct {
     /// The Window whose widget tree hosts this browser face (null
     /// before attach or after teardown).
     pub fn ownerWindow(self: *BrowserView) ?*@import("../window.zig").Window {
-        const root = c.gtk_widget_get_root(self.root_box) orelse return null;
-        return @import("../remotectl.zig").windowFromGtk(@ptrCast(@alignCast(root)));
+        return facehost.windowOf(self.root_box);
     }
 
     fn destroyCb(ctx: *anyopaque) void {
@@ -1564,11 +1564,9 @@ pub const BrowserView = struct {
     }
 
     fn buildUi(self: *BrowserView) void {
-        const vbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-        c.gtk_widget_set_hexpand(vbox, 1);
-        c.gtk_widget_set_vexpand(vbox, 1);
+        const vbox = facehost.newRootBox();
 
-        installCss(vbox.?);
+        installCss(vbox);
 
         // Nemo's shape: a flat icon-only nav cluster on the left, the
         // path control filling the middle, a flat icon-only tool
@@ -1822,16 +1820,7 @@ pub const BrowserView = struct {
     /// divergence would restore the wrong layout.
     fn hostReorderedCb(ctx: ?*anyopaque, page: *c.GtkWidget, new_index: usize) void {
         const self: *BrowserView = @ptrCast(@alignCast(ctx.?));
-        for (self.tabs.items, 0..) |t, i| {
-            if (t.page != page) continue;
-            const moved = self.tabs.orderedRemove(i);
-            // Capacity survives the remove, so the insert cannot fail;
-            // the fallback append only exists to satisfy the API.
-            self.tabs.insert(self.allocator, @min(new_index, self.tabs.items.len), moved) catch {
-                self.tabs.append(self.allocator, moved) catch {};
-            };
-            return;
-        }
+        facehost.reorderTabs(*BTab, self.allocator, &self.tabs, page, new_index);
     }
 
     /// The browser's widgets are gone: nothing deferred may touch them

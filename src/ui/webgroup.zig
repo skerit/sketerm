@@ -44,6 +44,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const facehost = @import("facehost.zig");
 const classicmenu = @import("browser/classicmenu.zig");
 const clipboard = @import("clipboard.zig");
 const tabhost = @import("tabhost.zig");
@@ -369,8 +370,7 @@ pub const Group = struct {
 
     pub fn ownerWindow(self: *Group) ?*@import("window.zig").Window {
         if (self.widgets_dead) return null;
-        const root = c.gtk_widget_get_root(self.host.widget()) orelse return null;
-        return @import("remotectl.zig").windowFromGtk(@ptrCast(@alignCast(root)));
+        return facehost.windowOf(self.host.widget());
     }
 
     fn notifyWindow(self: *Group) void {

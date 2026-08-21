@@ -88,6 +88,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
+const facehost = @import("facehost.zig");
 const gl_mod = @import("../render/gl.zig");
 const atlas_mod = @import("../render/atlas.zig");
 const Atlas = atlas_mod.Atlas;
@@ -2242,8 +2243,7 @@ pub const EditorView = struct {
     /// The Window whose widget tree hosts this face.
     pub fn ownerWindow(self: *EditorView) ?*@import("window.zig").Window {
         if (self.widgets_dead) return null;
-        const root = c.gtk_widget_get_root(self.root_box) orelse return null;
-        return @import("remotectl.zig").windowFromGtk(@ptrCast(@alignCast(root)));
+        return facehost.windowOf(self.root_box);
     }
 
     /// Unsaved tabs (window-close veto + reporting).
@@ -2258,9 +2258,7 @@ pub const EditorView = struct {
     // ---- UI construction --------------------------------------------
 
     fn buildUi(self: *EditorView) void {
-        const vbox = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-        c.gtk_widget_set_hexpand(vbox, 1);
-        c.gtk_widget_set_vexpand(vbox, 1);
+        const vbox = facehost.newRootBox();
 
         // Toolbar: open/save/save-as on the left, the way back to the
         // shell on the right. Flat icon buttons, browser-toolbar style.
@@ -2732,16 +2730,7 @@ pub const EditorView = struct {
     /// order would restore the session with the wrong tab order.
     fn hostReorderedCb(ctx: ?*anyopaque, page: *c.GtkWidget, new_index: usize) void {
         const self: *EditorView = @ptrCast(@alignCast(ctx.?));
-        for (self.tabs.items, 0..) |t, i| {
-            if (t.page != page) continue;
-            const moved = self.tabs.orderedRemove(i);
-            // Capacity survives the remove, so the insert cannot fail;
-            // the fallback append only exists to satisfy the API.
-            self.tabs.insert(self.allocator, @min(new_index, self.tabs.items.len), moved) catch {
-                self.tabs.append(self.allocator, moved) catch {};
-            };
-            return;
-        }
+        facehost.reorderTabs(*ETab, self.allocator, &self.tabs, page, new_index);
     }
 
     fn onSwitchPage(_: *c.GtkNotebook, page: *c.GtkWidget, _: c.guint, user: ?*anyopaque) callconv(.c) void {
