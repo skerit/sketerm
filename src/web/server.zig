@@ -47,6 +47,14 @@ const wreq_timeout_ms: c_int = 1;
 /// `zig build bench-webreq` reports both numbers.
 var wreq_spin: bool = false;
 
+/// `SKETERM_WEB_DEBUG_CONNS=1`: say WHY a connection is being cut.
+var debug_conns: bool = false;
+
+fn connNote(comptime why: []const u8, id: u32) void {
+    if (!debug_conns) return;
+    std.debug.print("sketerm-web: conn {d} cut: " ++ why ++ "\n", .{id});
+}
+
 fn readWreqSpin() void {
     const v = c.getenv("SKETERM_WEB_WREQ_SPIN") orelse return;
     const s = std.mem.span(v);
@@ -59,6 +67,12 @@ fn readWreqSpin() void {
 /// browser hangs the process, so the drain waits for
 /// `cefhost.openBrowsers() == 0` under this cap.
 const drain_deadline_ms: i64 = 5_000;
+
+/// Cadence of the engine's own persistent-jar flush (see step()).
+/// Chromium's cookie commit timer is ~30s and localStorage's LevelDB
+/// log lands within ~15s; this halves the worst-case loss window of an
+/// uncleanly-killed long-lived engine to ~20s of tail.
+const flush_interval_ms: i64 = 20_000;
 
 /// Concurrent connections the poll array carries. A connect past this
 /// is accepted and immediately closed — fail-closed, like every other
@@ -112,6 +126,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_CONTEXTS_FAIL_CLOSED,
     proto.CAP_USERSCRIPTS,
     proto.CAP_SITEDATA,
+    proto.CAP_FLUSH,
     proto.CAP_FRAMES_INLINE,
     proto.CAP_WEBEXT,
     proto.CAP_WEBEXT_TABS,
@@ -263,6 +278,13 @@ pub const Server = struct {
     preset_fd: bool = false,
     /// Adopted descriptor waiting for run() to mint its Conn.
     preset_client: c_int = -1,
+    /// `--linger-ms`: after the LAST client disconnects, keep listening
+    /// this long for the next one before draining and exiting. 0 keeps
+    /// the exit-with-last-client shape; a preset-fd engine (no
+    /// listener) cannot linger regardless.
+    linger_ms: i64 = 0,
+    /// Monotonic ms of the last periodic jar flush (see step()).
+    last_flush_ms: i64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, path: []const u8) Server {
         return .{ .gpa = gpa, .path = path, .out = proto.Outbox.init(gpa) };
@@ -321,6 +343,14 @@ pub const Server = struct {
     /// count reaching zero ends the engine.
     pub fn run(self: *Server) !void {
         readWreqSpin();
+        debug_conns = c.getenv("SKETERM_WEB_DEBUG_CONNS") != null;
+        // The first PERIODIC jar flush waits a full interval: a flush
+        // issued while CEF's cookie storage is still initializing
+        // intermittently crashed the engine (ECONNRESET for every
+        // client, reproduced ~1 in 2 focused smoke runs). An explicit
+        // client flush_req has no such window in practice — a client
+        // exists to send one only after pages loaded.
+        self.last_flush_ms = cefhost.nowMs();
         self.host = cefhost.Host.init(self.gpa, &self.out);
         self.host.profile_dir = self.profile_dir;
         self.host.router = .{
@@ -362,8 +392,19 @@ pub const Server = struct {
         } else {
             try self.acceptFirst();
         }
-        while (self.conns.items.len > 0) {
-            self.step();
+        while (true) {
+            while (self.conns.items.len > 0) {
+                self.step();
+            }
+            if (self.linger_ms <= 0 or self.listen_fd < 0) break;
+            // Broker-owned lifecycle: the last client left, but the
+            // engine lingers for the next one. Views died with their
+            // connections; the persistent CONTEXTS (and their live
+            // cookie jars) are what survives — flush them to disk now,
+            // since the graceful drain below is deferred and a crash
+            // during the linger would otherwise lose the tail.
+            self.host.flushProfileStores(0, 0);
+            if (!self.lingerForClient()) break;
         }
         // Let CEF finish closing the browsers before the caller shuts
         // it down; close_browser is asynchronous, and a browser with
@@ -442,6 +483,23 @@ pub const Server = struct {
         }
     }
 
+    /// Wait out the linger window for a successor client, pumping CEF
+    /// (its flush callbacks and background work still need the loop).
+    /// True when a client connected; false when the window elapsed and
+    /// the engine should drain and exit.
+    fn lingerForClient(self: *Server) bool {
+        const deadline = cefhost.nowMs() + self.linger_ms;
+        while (cefhost.nowMs() < deadline) {
+            var pfd = c.struct_pollfd{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 };
+            const n = c.poll(@ptrCast(&pfd), 1, idle_timeout_ms);
+            const poll_errno = errno();
+            cefhost.pump();
+            if (n < 0 and poll_errno != c.EINTR) return false;
+            if (n > 0 and self.acceptOne()) return true;
+        }
+        return false;
+    }
+
     /// Accept one pending connection, non-fatally.
     fn acceptOne(self: *Server) bool {
         const fd = c.accept(self.listen_fd, null, null);
@@ -512,10 +570,12 @@ pub const Server = struct {
                 const pfd = pfds[conn_base + i];
                 if (pfd.fd != cn.fd) continue; // list changed under an accept
                 if (pfd.revents & (c.POLLERR | c.POLLNVAL) != 0) {
+                    connNote("POLLERR/POLLNVAL", cn.id);
                     cn.dead = true;
                     continue;
                 }
                 if (pfd.revents & c.POLLIN != 0 and !self.readIn(cn)) {
+                    connNote("read failed or protocol violation", cn.id);
                     cn.dead = true;
                 }
             }
@@ -548,9 +608,19 @@ pub const Server = struct {
         // Inline mode: ship damage the paint-time flush held back while
         // the outbox was backed up (union-and-flush backpressure).
         self.host.flushInline();
+        // Periodic jar flush: a long-lived engine must not sit on the
+        // ~30s Chromium commit window forever (Phase 0 measured cookies
+        // lost to a kill inside it). Cheap when nothing is persistent —
+        // flushProfileStores no-ops with zero flushable managers.
+        const flush_now = cefhost.nowMs();
+        if (flush_now - self.last_flush_ms >= flush_interval_ms) {
+            self.last_flush_ms = flush_now;
+            self.host.flushProfileStores(0, 0);
+        }
         for (self.conns.items) |cn| {
             if (cn.dead) continue;
             if (!self.flushConn(cn)) {
+                connNote("flush failed", cn.id);
                 cn.dead = true;
                 continue;
             }
@@ -558,7 +628,10 @@ pub const Server = struct {
             // otherwise grow this queue without bound (see
             // max_conn_backlog_bytes). One wedged client must cost only
             // itself.
-            if (cn.out.bytes > max_conn_backlog_bytes) cn.dead = true;
+            if (cn.out.bytes > max_conn_backlog_bytes) {
+                connNote("backlog cut-off", cn.id);
+                cn.dead = true;
+            }
         }
         self.reap();
     }
@@ -631,8 +704,15 @@ pub const Server = struct {
 
         var reader = proto.Reader.init(cn.in.items);
         while (true) {
-            const frame = (reader.next() catch return false) orelse break;
-            self.dispatch(cn, frame) catch return false;
+            const frame = (reader.next() catch {
+                connNote("malformed frame", cn.id);
+                return false;
+            }) orelse break;
+            self.dispatch(cn, frame) catch {
+                if (debug_conns)
+                    std.debug.print("sketerm-web: conn {d} dispatch error on tag 0x{x}\n", .{ cn.id, @intFromEnum(frame.tag) });
+                return false;
+            };
         }
         const used = reader.consumed();
         if (used != 0) {
@@ -794,6 +874,10 @@ pub const Server = struct {
             .scroll_to => self.host.scrollTo(try dec(cn, proto.ScrollTo, frame.payload)),
             .devtools_show => try self.host.devtoolsShow(try dec(cn, proto.DevToolsShow, frame.payload)),
             .print_pdf => self.host.printPdf(try dec(cn, proto.PrintPdf, frame.payload)),
+            .flush_req => {
+                const f = try proto.decode(proto.FlushReq, frame.payload);
+                self.host.flushProfileStores(f.token, cn.id);
+            },
             .cookies_req => self.host.cookiesReq(try dec(cn, proto.CookiesReq, frame.payload)),
             .cookie_delete => self.host.cookieDelete(try dec(cn, proto.CookieDelete, frame.payload)),
             .cookies_clear => self.host.cookiesClear(try dec(cn, proto.CookiesClear, frame.payload)),

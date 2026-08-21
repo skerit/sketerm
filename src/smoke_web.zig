@@ -864,6 +864,10 @@ const Client = struct {
     ack_webext_action: bool = false,
     ack_webext_transaction: bool = false,
     ack_multi_client: bool = false,
+    ack_flush: bool = false,
+    /// Bumped per `ev_flushed`; the token it carried.
+    flushed_seq: u32 = 0,
+    last_flush_token: u32 = 0,
 
     /// Last `ev_net_policy` observed (the multi-client budget stage),
     /// plus a pinned probe: dirty policy status streams one frame per
@@ -1317,6 +1321,16 @@ const Client = struct {
                 self.fd = -1;
                 return false;
             }
+            std.debug.print("smoke-web: recvmsg errno {d} on client fd {d}\n", .{ e, self.fd });
+            if (g_pid > 0) {
+                var st: c_int = 0;
+                const r = c.waitpid(g_pid, &st, c.WNOHANG);
+                if (r == g_pid) {
+                    std.debug.print("smoke-web: helper pid {d} exited, status 0x{x} (signal {d})\n", .{ g_pid, st, st & 0x7f });
+                } else {
+                    std.debug.print("smoke-web: helper pid {d} still alive after the reset\n", .{g_pid});
+                }
+            }
             fail("recvmsg");
         }
         self.harvestFds(&cbuf, @intCast(mh.msg_controllen));
@@ -1398,7 +1412,13 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_ACTION)) self.ack_webext_action = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TRANSACTION)) self.ack_webext_transaction = true;
                     if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.ack_multi_client = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_FLUSH)) self.ack_flush = true;
                 }
+            },
+            .ev_flushed => {
+                const f = proto.decode(proto.EvFlushed, frame.payload) catch fail("ev_flushed decode");
+                self.last_flush_token = f.token;
+                self.flushed_seq += 1;
             },
             .frame_inline => {
                 const fi = proto.FrameInline.decodeAlloc(frame.payload, self.gpa) catch fail("frame_inline decode");
@@ -5174,6 +5194,231 @@ fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
     pass("stage mc5 engine survived one client's death and exited with the last");
 }
 
+/// Spawn a helper with an explicit argv tail — the flush/linger stages
+/// need three extra tokens (`--ozone-platform=headless --linger-ms N`),
+/// which outgrows spawnHelper's two optional slots.
+fn spawnHelperArgs(exe: [*:0]const u8, sock: [*:0]const u8, cache: [*:0]const u8, tail: []const [*:0]const u8) c.pid_t {
+    const pid = c.fork();
+    if (pid < 0) fail("fork");
+    if (pid != 0) return pid;
+    _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
+    var vec: [12:null]?[*:0]const u8 = @splat(null);
+    var n: usize = 0;
+    for ([_][*:0]const u8{ exe, "--socket", sock, "--cache-dir", cache }) |a| {
+        vec[n] = a;
+        n += 1;
+    }
+    for (tail) |a| {
+        vec[n] = a;
+        n += 1;
+    }
+    _ = c.execv(exe, @ptrCast(@constCast(&vec)));
+    c._exit(127);
+    unreachable;
+}
+
+/// View 1 in `ctx_id`, navigated to `url`, waiting for a title with
+/// `prefix` — with ONE retry when the engine answers
+/// `ev_view_create_failed` instead. A predecessor SIGKILLed mid-write
+/// can leave the profile in recovery and CEF then refuses the FIRST
+/// browser transiently (reproduced ~1 in 3 focused runs); the refusal
+/// is described and a single retry succeeds, which is exactly the
+/// contract this helper pins.
+fn openInProfile(cl: *Client, ctx_id: u32, url: []const u8, prefix: []const u8, comptime what: []const u8) void {
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        const fail_seq = cl.view_create_fail_seq;
+        cl.send(proto.ViewCreate{ .view = 1, .w = 320, .h = 240, .scale_x1000 = 1000, .context = ctx_id });
+        cl.have_view = true;
+        cl.send(proto.Navigate{ .view = 1, .url = url });
+        const d = nowMs() + 20_000;
+        var refused = false;
+        while (nowMs() < d) {
+            cl.pump(50);
+            if (std.mem.startsWith(u8, cl.titleSlice(), prefix)) return;
+            if (cl.view_create_fail_seq != fail_seq) {
+                refused = true;
+                break;
+            }
+        }
+        if (!refused) fail(what ++ ": the page never reached its title");
+        if (attempt >= 1) fail(what ++ ": browser create refused twice (bring-up not deterministic)");
+        std.debug.print("smoke-web: NOTE {s}: browser create refused (\"{s}\"), retrying once\n", .{ what, cl.view_create_fail_reason[0..cl.view_create_fail_reason_len] });
+        cl.have_view = false;
+        _ = c.usleep(1_000_000);
+    }
+}
+
+/// Flush + linger (capabilities "flush-store" and `--linger-ms`, the
+/// broker-owned lifecycle): an explicit flush makes a persistent jar
+/// survive a kill -9 INSIDE Chromium's ~30s commit window; a lingering
+/// engine survives its last client, serves a successor the same live
+/// jar, and its TTL reap is the graceful drain (proven by the cookie
+/// being on disk afterwards with no explicit flush in between).
+fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/fl.sock", .{dir}) catch fail("fl sock path");
+    var cache_buf: [96]u8 = undefined;
+    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/fl-cache", .{dir}) catch fail("fl cache path");
+
+    var http = HttpProbe{ .body = jar_page };
+    if (!http.start()) fail("stage fl: could not start the loopback http probe");
+    defer http.shutdown();
+    var set_buf: [72]u8 = undefined;
+    const set_url = std.fmt.bufPrint(&set_buf, "http://127.0.0.1:{d}/?set", .{http.port}) catch unreachable;
+    var plain_buf: [72]u8 = undefined;
+    const plain_url = std.fmt.bufPrint(&plain_buf, "http://127.0.0.1:{d}/?plain", .{http.port}) catch unreachable;
+
+    const ctx_id: u32 = 5;
+
+    // ── fl1: explicit flush beats kill -9 ─────────────────────────
+    {
+        const pid = spawnHelperArgs(exe, sock.ptr, cache.ptr, &.{"--ozone-platform=headless"});
+        g_pid = pid;
+        var a = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        a.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-fl-a" });
+        {
+            const d = nowMs() + 15_000;
+            while (a.ack_proto == 0 and nowMs() < d) a.pump(100);
+        }
+        if (a.ack_proto != proto.PROTO_VERSION) fail("stage fl1: no hello_ack");
+        if (!a.ack_flush) fail("stage fl1: hello_ack lacks the flush-store capability");
+        a.send(proto.ContextCreate{ .id = ctx_id, .ephemeral = 0, .name = "flushdemo", .proxy = "" });
+        openInProfile(&a, ctx_id, set_url, "jarA:", "stage fl1");
+        if (std.mem.indexOf(u8, a.titleSlice(), jar_cookie) == null)
+            fail("stage fl1: the persistent context could not store its cookie");
+
+        const seq = a.flushed_seq;
+        a.send(proto.FlushReq{ .token = 77 });
+        if (!a.waitSeq(&a.flushed_seq, seq, 15_000)) fail("stage fl1: flush_req was never answered");
+        if (a.last_flush_token != 77) fail("stage fl1: ev_flushed carried the wrong token");
+
+        // The kill lands seconds after the write — squarely inside the
+        // ~30s window Phase 0 measured cookies being LOST in without a
+        // flush. Survival here is the flush frame working.
+        _ = c.kill(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = c.waitpid(pid, &status, 0);
+        g_pid = -1;
+        a.have_view = false;
+        a.teardown_allow_close = true;
+        a.deinit();
+    }
+    pass("stage fl1 explicit flush answered, engine killed -9 inside the commit window");
+
+    // ── fl2: the flushed jar came back from disk ──────────────────
+    {
+        const pid = spawnHelperArgs(exe, sock.ptr, cache.ptr, &.{"--ozone-platform=headless"});
+        g_pid = pid;
+        var b = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        b.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-fl-b" });
+        {
+            const d = nowMs() + 15_000;
+            while (b.ack_proto == 0 and nowMs() < d) b.pump(100);
+        }
+        if (b.ack_proto != proto.PROTO_VERSION) fail("stage fl2: no hello_ack");
+        b.send(proto.ContextCreate{ .id = ctx_id, .ephemeral = 0, .name = "flushdemo", .proxy = "" });
+        openInProfile(&b, ctx_id, plain_url, "jarB:", "stage fl2");
+        if (std.mem.indexOf(u8, b.titleSlice(), jar_cookie) == null) {
+            std.debug.print("smoke-web: post-kill title was \"{s}\"\n", .{b.titleSlice()});
+            fail("stage fl2: the flushed cookie did not survive kill -9 (flush_store did not reach disk)");
+        }
+        b.have_view = false;
+        b.deinit();
+        reapHelperTolerant(pid, "stage fl2 teardown", 30_000);
+    }
+    pass("stage fl2 the flushed cookie survived kill -9");
+
+    // ── fl3: linger — the engine outlives its last client ─────────
+    const lingered: c.pid_t = blk: {
+        const pid = spawnHelperArgs(exe, sock.ptr, cache.ptr, &.{ "--ozone-platform=headless", "--linger-ms", "6000" });
+        g_pid = pid;
+        var a = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        a.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-fl-c" });
+        {
+            const d = nowMs() + 15_000;
+            while (a.ack_proto == 0 and nowMs() < d) a.pump(100);
+        }
+        if (a.ack_proto != proto.PROTO_VERSION) fail("stage fl3: no hello_ack");
+        a.send(proto.ContextCreate{ .id = ctx_id, .ephemeral = 0, .name = "flushdemo", .proxy = "" });
+        openInProfile(&a, ctx_id, set_url, "jarA:", "stage fl3");
+        a.have_view = false;
+        a.teardown_allow_close = true;
+        a.deinit();
+
+        // Last client gone; a lingering engine must NOT exit.
+        _ = c.usleep(700_000);
+        var status: c_int = 0;
+        if (c.waitpid(pid, &status, c.WNOHANG) == pid) {
+            g_pid = -1;
+            fail("stage fl3: the engine exited with its last client despite --linger-ms");
+        }
+
+        // A successor inside the window gets the same LIVE jar.
+        var b = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        b.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-fl-d" });
+        {
+            const d = nowMs() + 15_000;
+            while (b.ack_proto == 0 and nowMs() < d) b.pump(100);
+        }
+        if (b.ack_proto != proto.PROTO_VERSION) fail("stage fl3: the lingering engine refused a successor client");
+        b.send(proto.ContextCreate{ .id = ctx_id, .ephemeral = 0, .name = "flushdemo", .proxy = "" });
+        openInProfile(&b, ctx_id, plain_url, "jarB:", "stage fl3 successor");
+        if (std.mem.indexOf(u8, b.titleSlice(), jar_cookie) == null)
+            fail("stage fl3: the successor did not see the lingering engine's live jar");
+        b.have_view = false;
+        b.teardown_allow_close = true;
+        b.deinit();
+        break :blk pid;
+    };
+    pass("stage fl3 the engine lingered past its last client and served a successor the same jar");
+
+    // ── fl4: the TTL reap is graceful and flushes ─────────────────
+    // Nobody reconnects; the engine must exit ON ITS OWN within the
+    // linger window plus the drain budget, through the clean path.
+    {
+        // Linger window (6s) + the server's 5s drain budget + slack.
+        const deadline = nowMs() + 6_000 + 5_000 + 10_000;
+        var status: c_int = 0;
+        var reaped = false;
+        while (nowMs() < deadline) {
+            if (c.waitpid(lingered, &status, c.WNOHANG) == lingered) {
+                reaped = true;
+                break;
+            }
+            _ = c.usleep(100_000);
+        }
+        g_pid = -1;
+        if (!reaped) {
+            _ = c.kill(lingered, c.SIGKILL);
+            _ = c.waitpid(lingered, &status, 0);
+            fail("stage fl4: the lingering engine never reaped itself after its TTL");
+        }
+        if (status & 0x7f != 0)
+            std.debug.print("smoke-web: NOTE stage fl4: TTL reap exited on signal {d} (CEF shutdown artifact)\n", .{status & 0x7f});
+
+        // The reap ran cef_shutdown (or the entry flush): fl3's cookie
+        // must be on disk with no explicit flush ever sent for it.
+        const pid = spawnHelperArgs(exe, sock.ptr, cache.ptr, &.{"--ozone-platform=headless"});
+        g_pid = pid;
+        var d2 = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        d2.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-fl-e" });
+        {
+            const d = nowMs() + 15_000;
+            while (d2.ack_proto == 0 and nowMs() < d) d2.pump(100);
+        }
+        if (d2.ack_proto != proto.PROTO_VERSION) fail("stage fl4: no hello_ack after the TTL reap");
+        d2.send(proto.ContextCreate{ .id = ctx_id, .ephemeral = 0, .name = "flushdemo", .proxy = "" });
+        openInProfile(&d2, ctx_id, plain_url, "jarB:", "stage fl4");
+        if (std.mem.indexOf(u8, d2.titleSlice(), jar_cookie) == null)
+            fail("stage fl4: the TTL reap lost the jar (the reap was not the graceful path)");
+        d2.have_view = false;
+        d2.deinit();
+        reapHelperTolerant(pid, "stage fl4 teardown", 30_000);
+    }
+    pass("stage fl4 the TTL reap was graceful: the jar survived with no explicit flush");
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, &sigNoop);
     const argv = init.args.vector;
@@ -5197,6 +5442,20 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     @memcpy(g_dir[0..tmpl.len], tmpl);
     if (c.mkdtemp(@ptrCast(&g_dir)) == null) fail("mkdtemp");
     const dir = std.mem.span(@as([*:0]const u8, @ptrCast(&g_dir)));
+
+    // Focused run for the flush/linger family (iterating on a late
+    // stage without paying the ~35 before it), the
+    // SKETERM_SMOKE_MCP_WEBSHARED_ONLY precedent.
+    if (c.getenv("SKETERM_SMOKE_WEB_FL_ONLY") != null) {
+        runFlushLingerStage(gpa, exe, dir);
+        cleanup();
+        if (gpa_state.deinit() == .leak) {
+            say("smoke-web: FAIL leaked memory (see GPA report above)");
+            return 1;
+        }
+        say("smoke-web: PASS (fl only)");
+        return 0;
+    }
 
     var sock_buf: [96]u8 = undefined;
     const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/w.sock", .{dir}) catch fail("socket path");
@@ -7658,6 +7917,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     runUboStage(gpa, exe, dir, ubo_xpi);
     // ── Stage mc: multi-client serving ────────────────────────────
     runMultiClientStage(gpa, exe, dir);
+    // ── Stage fl: flush + linger (broker-owned lifecycle) ─────────
+    runFlushLingerStage(gpa, exe, dir);
 
     cleanup();
     if (gpa_state.deinit() == .leak) {

@@ -153,6 +153,12 @@ const FrameMap = []align(std.heap.page_size_min) u8;
 /// Wraps fallible browser-spawn calls so CEF-gated tests can inject failures without starting the engine.
 const BrowserSpawnOps = struct {
     ctx: ?*anyopaque = null,
+    /// Times a refused browser create is retried (pumping CEF between
+    /// attempts) before the DESCRIBED refusal is posted. Non-zero only
+    /// for the system ops: the transient being absorbed is CEF's
+    /// profile recovery after a predecessor's SIGKILL, which injected
+    /// test ops do not have.
+    create_retries: u32 = 0,
     create_browser: *const fn (?*anyopaque, *Host, *View, []const u8) ?*cef.cef_browser_t = Host.createBrowserSystem,
     create_memfd: *const fn (?*anyopaque) ?c_int = Host.createMemfdSystem,
     truncate: *const fn (?*anyopaque, c_int, usize) bool = Host.truncateSystem,
@@ -160,7 +166,7 @@ const BrowserSpawnOps = struct {
     announce: *const fn (?*anyopaque, *Host, *View, c_int) anyerror!void = Host.announceBufferSystem,
 };
 
-const system_browser_spawn_ops: BrowserSpawnOps = .{};
+const system_browser_spawn_ops: BrowserSpawnOps = .{ .create_retries = 5 };
 
 /// Cap on damage rects forwarded per paint; beyond it a single
 /// full-view rect is cheaper than the bookkeeping.
@@ -867,6 +873,14 @@ pub const Host = struct {
     /// id; id 0 is the shared default (a null request context) and never
     /// appears here.
     contexts: std.ArrayList(Ctx) = .empty,
+    /// In-flight `flush_req` bookkeeping: completions arrive through ONE
+    /// anonymous static callback, so each is charged to the OLDEST entry
+    /// — conservative (a later flush completing means the stores are at
+    /// least as fresh), and per-request state without a per-request CEF
+    /// object. Entries with `conn == 0` are the engine's own periodic
+    /// flushes: tracked so their completions cannot release a client's
+    /// pending answer early, but answered to nobody.
+    pending_flushes: std.ArrayList(PendingFlush) = .empty,
     /// CEF's preference manager can keep the supplied value graph beyond
     /// `set_preference` (nothing in `cef_preference_capi.h` promises a
     /// copy), so the graph is retained. It is keyed by context id and
@@ -1064,6 +1078,8 @@ pub const Host = struct {
         owner: u32 = 0,
     };
 
+    const PendingFlush = struct { token: u32, conn: u32, outstanding: u32 };
+
     pub fn init(gpa: std.mem.Allocator, out: *proto.Outbox) Host {
         return .{ .gpa = gpa, .out = out, .webext = webexthost.Host.init(gpa) };
     }
@@ -1087,6 +1103,7 @@ pub const Host = struct {
         self.downloads.deinit(self.gpa);
         for (self.contexts.items) |ctx| release(&ctx.rc.base.base);
         self.contexts.deinit(self.gpa);
+        self.pending_flushes.deinit(self.gpa);
         for (self.proxy_prefs.items) |pref| pref.releaseAll();
         self.proxy_prefs.deinit(self.gpa);
         self.us_scripts.deinit(self.gpa);
@@ -1320,7 +1337,36 @@ pub const Host = struct {
         // registerView transferred ownership to Host.views. From here on
         // every failure leaves cleanup to that owner, never to spawnBrowser.
         errdefer self.destroyView(v.id);
-        try self.spawnBrowserWith(v, initial_url, ops);
+        // CEF refuses a browser TRANSIENTLY while a persistent profile a
+        // SIGKILLed predecessor held is still in recovery (reproduced in
+        // every third focused smoke run once engines began surviving
+        // kills). Deterministic bring-up is this engine's contract now:
+        // pump CEF and retry briefly, and only a refusal that outlasts
+        // the budget becomes a DESCRIBED failure — never a cut
+        // connection, which blamed the client with a bare ECONNRESET.
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            const spawned: bool = if (self.spawnBrowserWith(v, initial_url, ops)) |_| true else |err| switch (err) {
+                error.BrowserCreateFailed => false,
+                else => return err,
+            };
+            if (spawned) return;
+            if (attempt >= ops.create_retries) break;
+            var pumps: u32 = 0;
+            while (pumps < 10) : (pumps += 1) {
+                pump();
+                _ = c.usleep(30_000);
+            }
+        }
+        std.debug.print("sketerm-web: browser create failed for view {d} (context {d}) after retries\n", .{ v.id, v.context });
+        const view_id = v.id;
+        const ctx_id = v.context;
+        self.destroyView(view_id);
+        self.post(proto.EvViewCreateFailed{
+            .view = view_id,
+            .context = ctx_id,
+            .reason = "the engine could not create a browser (transient engine condition; retry)",
+        });
     }
 
     /// Construct a view and transfer ownership only after it is in the list.
@@ -1915,6 +1961,62 @@ pub const Host = struct {
         const get = rc.get_cookie_manager orelse return null;
         const mgr: ?*cef.cef_cookie_manager_t = get(rc, null);
         return mgr;
+    }
+
+    /// Force every persistent jar to disk (`flush_req`, and the engine's
+    /// own periodic cadence with `conn == 0`). Chromium commits cookies
+    /// on a ~30s timer and `cef_shutdown` is otherwise the only forced
+    /// flush — a long-lived engine needs this to close the loss window.
+    /// The GLOBAL context is included: with a durable store root, its
+    /// shared jar is persistent too.
+    pub fn flushProfileStores(self: *Host, token: u32, conn: u32) void {
+        var outstanding: u32 = 0;
+        const global: ?*cef.cef_cookie_manager_t = cef.cef_cookie_manager_get_global_manager(null);
+        if (global) |mgr| {
+            defer release(&mgr.base);
+            if (flushOne(mgr)) outstanding += 1;
+        }
+        for (self.contexts.items) |ctx| {
+            if (ctx.ephemeral) continue;
+            const get = ctx.rc.get_cookie_manager orelse continue;
+            const mgr: *cef.cef_cookie_manager_t = get(ctx.rc, null) orelse continue;
+            defer release(&mgr.base);
+            if (flushOne(mgr)) outstanding += 1;
+        }
+        if (outstanding == 0) {
+            // Nothing flushable IS completion; an unanswered flush_req
+            // would read as a wedged engine.
+            if (conn != 0) self.postFlushed(token, conn);
+            return;
+        }
+        self.pending_flushes.append(self.gpa, .{ .token = token, .conn = conn, .outstanding = outstanding }) catch {
+            // Cannot track the completions: answer now rather than
+            // never. The flushes themselves are already running.
+            if (conn != 0) self.postFlushed(token, conn);
+        };
+    }
+
+    fn flushOne(mgr: *cef.cef_cookie_manager_t) bool {
+        const fs = mgr.flush_store orelse return false;
+        return fs(mgr, &flush_callback) != 0;
+    }
+
+    /// One anonymous flush completion (see `pending_flushes`).
+    fn flushCompleted(self: *Host) void {
+        if (self.pending_flushes.items.len == 0) return;
+        const p = &self.pending_flushes.items[0];
+        if (p.outstanding > 0) p.outstanding -= 1;
+        if (p.outstanding == 0) {
+            const done = self.pending_flushes.orderedRemove(0);
+            if (done.conn != 0) self.postFlushed(done.token, done.conn);
+        }
+    }
+
+    fn postFlushed(self: *Host, token: u32, conn: u32) void {
+        const prev = self.dispatch_conn;
+        self.dispatch_conn = conn;
+        defer self.dispatch_conn = prev;
+        self.post(proto.EvFlushed{ .token = token });
     }
 
     /// The url a 0xC8-block request is scoped to: what it named, or the
@@ -6846,7 +6948,6 @@ test "view construction allocation failures preserve prior views" {
 test "view construction system failures release one owned view" {
     const Case = struct { failure: ViewConstructionTest.Failure, inline_mode: bool = false };
     const cases = [_]Case{
-        .{ .failure = .browser },
         .{ .failure = .memfd },
         .{ .failure = .truncate },
         .{ .failure = .map },
@@ -6875,6 +6976,37 @@ test "view construction system failures release one owned view" {
         try std.testing.expect(host.find(52) == null);
         try injected.expectReleased();
     }
+}
+
+test "a refused browser create is a DESCRIBED failure, never an error or a kept view" {
+    // The engine absorbs CEF's transient refusals itself (retry budget
+    // on the SYSTEM ops); a refusal that outlasts the budget posts
+    // `ev_view_create_failed` and destroys the registered view — it
+    // does NOT error, which used to cut the whole connection with a
+    // bare ECONNRESET for an engine-side condition.
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    defer ViewConstructionTest.closeOutboxFds(&out);
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+
+    const prior = try host.registerView(ViewConstructionTest.req(51, 0));
+    var injected = ViewConstructionTest{ .failure = .browser, .seed_semantic = true };
+    var spawn_ops = injected.ops();
+    try host.createViewAtWith(ViewConstructionTest.req(52, 0), "", &spawn_ops);
+
+    try std.testing.expectEqual(@as(usize, 1), host.viewCount());
+    try std.testing.expect(host.find(51) == prior);
+    try std.testing.expect(host.find(52) == null);
+    var saw_refusal = false;
+    while (out.front()) |m| {
+        var reader = proto.Reader.init(m.bytes);
+        while (reader.next() catch null) |frame| {
+            if (frame.tag == .ev_view_create_failed) saw_refusal = true;
+        }
+        out.advance(m.bytes.len);
+    }
+    try std.testing.expect(saw_refusal);
 }
 
 test "a failed revival leaves findWake with no view to hand back" {
@@ -10204,6 +10336,15 @@ var v8_handler: cef.cef_v8_handler_t = undefined;
 /// callback correlates the answer (see `Host.onPrintDone`).
 var pdf_callback: cef.cef_pdf_print_callback_t = undefined;
 
+/// The jar-flush completion callback: same static-lifetime reasoning as
+/// `pdf_callback`; per-request state lives in `Host.pending_flushes`.
+var flush_callback: cef.cef_completion_callback_t = undefined;
+
+fn onFlushComplete(_: [*c]cef.cef_completion_callback_t) callconv(.c) void {
+    const host = g_host orelse return;
+    host.flushCompleted();
+}
+
 /// Milliseconds until CEF next wants `pump()`; -1 = nothing scheduled.
 var pump_delay_ms: i64 = -1;
 
@@ -10351,6 +10492,10 @@ fn installHandlers() void {
     pdf_callback = std.mem.zeroes(cef.cef_pdf_print_callback_t);
     pdf_callback.base = staticBase(cef.cef_pdf_print_callback_t);
     pdf_callback.on_pdf_print_finished = onPdfPrintFinished;
+
+    flush_callback = std.mem.zeroes(cef.cef_completion_callback_t);
+    flush_callback.base = staticBase(cef.cef_completion_callback_t);
+    flush_callback.on_complete = onFlushComplete;
 
     find_handler = std.mem.zeroes(cef.cef_find_handler_t);
     find_handler.base = staticBase(cef.cef_find_handler_t);

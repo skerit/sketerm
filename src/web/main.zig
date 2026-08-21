@@ -31,12 +31,14 @@ const server = @import("server.zig");
 const pathz = @import("../util/pathz.zig");
 
 const USAGE =
-    \\sketerm-web --socket PATH [--cache-dir PATH]
+    \\sketerm-web --socket PATH [--cache-dir PATH] [--linger-ms N]
     \\           (--socket-fd N and --frames-inline are the daemon's
     \\            remote-helper launch shape)
     \\
-    \\Browser helper for sketerm. Listens on PATH for one client (the
-    \\sketerm GUI) and exits when that client disconnects.
+    \\Browser helper for sketerm. Listens on PATH, serves any number of
+    \\clients, and exits when the last one disconnects — or, with
+    \\--linger-ms N, keeps listening that long for the next client
+    \\first (the broker-owned lifecycle).
     \\
 ;
 
@@ -88,6 +90,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var cache_dir: ?[]const u8 = null;
     var socket_fd: c_int = -1;
     var frames_inline = false;
+    var linger_ms: i64 = 0;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = std.mem.span(argv[i]);
@@ -112,6 +115,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, a, "--cache-dir") and i + 1 < argv.len) {
             i += 1;
             cache_dir = copyArg(&cache_buf, std.mem.span(argv[i]));
+        } else if (std.mem.eql(u8, a, "--linger-ms") and i + 1 < argv.len) {
+            // Broker-owned lifecycle: survive the LAST client's exit
+            // and keep listening this long for the next one, then run
+            // the normal graceful drain (`cef_shutdown` — the jar
+            // flush) and exit. 0 keeps the exit-with-last-client shape.
+            i += 1;
+            linger_ms = std.fmt.parseInt(i64, std.mem.span(argv[i]), 10) catch 0;
         } else if (std.mem.eql(u8, a, "--keep")) {
             // Defensive: a daemon that ever spawns /proc/self/exe as a
             // session keeper must not get a browser helper instead.
@@ -170,6 +180,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var srv = server.Server.init(gpa, sock);
         srv.profile_dir = cache;
         srv.force_inline = frames_inline;
+        srv.linger_ms = linger_ms;
         defer srv.deinit();
         if (socket_fd >= 0) {
             srv.adoptClientFd(socket_fd);

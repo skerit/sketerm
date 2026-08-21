@@ -133,6 +133,11 @@ pub const CAP_CONTEXTS_FAIL_CLOSED = "contexts-fail-closed";
 /// panel that never renders them.
 pub const CAP_SITEDATA = "sitedata";
 
+/// The helper answers `flush_req` with `ev_flushed` after forcing every
+/// persistent context's cookies/storage to disk, and flushes them on a
+/// periodic cadence of its own while it lingers past its last client.
+pub const CAP_FLUSH = "flush-store";
+
 /// The helper reports `ev_scroll` and accepts `scroll_to` (0xC2 block),
 /// which is what lets session restore put a page back where it was.
 pub const CAP_SCROLL = "scroll";
@@ -348,6 +353,8 @@ pub const Tag = enum(u8) {
     cookies_clear = 0xCB,
     sitedata_clear = 0xCC,
     ev_sitedata_done = 0xCD,
+    flush_req = 0xCE,
+    ev_flushed = 0xCF,
     // 0xD0-0xD7: inline (in-band) frame family, capability
     // "frames-inline" — the historically reserved remote-helper block.
     frame_mode = 0xD0,
@@ -2665,6 +2672,23 @@ pub const EvSitedataDone = struct {
     detail: []const u8,
 };
 
+/// Force every persistent context's cookie jar and storage to disk NOW
+/// (capability "flush-store"). Chromium otherwise commits cookies on a
+/// ~30s cadence and localStorage within ~15s, so a long-lived engine
+/// that dies uncleanly loses that window; an explicit flush closes it
+/// before an intentional reap or after a login worth keeping. Answered
+/// by `ev_flushed` with the same token once the engine's flush
+/// callbacks have all completed.
+pub const FlushReq = struct {
+    pub const tag: Tag = .flush_req;
+    token: u32,
+};
+
+pub const EvFlushed = struct {
+    pub const tag: Tag = .ev_flushed;
+    token: u32,
+};
+
 // -- WebExtensions (0xB0 block, capability "webext") ------------------
 //
 // The GUI owns the extension FILES (it installs an unpacked dir or an
@@ -3781,6 +3805,8 @@ test "round-trip: site-data request frames" {
     });
     try roundTrip(EvSitedataDone, .{ .view = 7, .req = 7, .ok = 1, .kind = @intFromEnum(SitedataKind.sitedata_clear), .removed = 3, .detail = "cache-whole-context" });
     try roundTrip(EvSitedataDone, .{ .view = 7, .req = 5, .ok = 0, .kind = @intFromEnum(SitedataKind.cookie_delete), .removed = 0, .detail = "" });
+    try roundTrip(FlushReq, .{ .token = 41 });
+    try roundTrip(EvFlushed, .{ .token = 41 });
 }
 
 test "round-trip: ev_cookies entry list carries metadata, never values" {
