@@ -591,19 +591,29 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (c.access(exe, c.X_OK) != 0) fail("zig-out/bin/sketerm missing (build first)");
     _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
     defer _ = c.unsetenv("SKETERM_MUX_BIN");
-    if (c.getenv("SKETERM_SMOKE_MCP_WEB_ONLY") != null)
+    if (c.getenv("SKETERM_SMOKE_MCP_WEB_ONLY") != null) {
+        // The client-spawn lane (sessions); see the full run's note.
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
         return webOnly(allocator, exe, rt);
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBSESSION_ONLY") != null) {
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
         webSessionFakeStage(allocator, exe, rt);
         say("smoke-mcp: focused watchable web session ok");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBPROFILE_ONLY") != null) {
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
         webProfileFakeStage(allocator, exe, rt);
         say("smoke-mcp: focused headless browsing profiles ok");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBPOLICY_ONLY") != null) {
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
         webPolicyFakeStage(allocator, exe, rt);
         say("smoke-mcp: focused network policy (fake helper) ok");
         return 0;
@@ -618,6 +628,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer _ = c.unsetenv("SKETERM_WEB_BIN");
         webSharedProfileStage(allocator, exe, rt);
         say("smoke-mcp: focused shared-profile stage ok");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBENGINE_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse {
+            say("smoke-mcp: SKIP focused engine-lifecycle stage (sketerm-webengine not built)");
+            return 0;
+        };
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        webEngineLifecycleStage(allocator, exe, rt);
+        say("smoke-mcp: focused engine-lifecycle stage ok");
         return 0;
     }
 
@@ -2011,6 +2033,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         say("smoke-mcp: ui_show_files ok");
     }
 
+    // The four client-spawn-lane stages below assert what THAT lane
+    // provides (the watchable Wayland session above all), so they pin
+    // the escape hatch rather than the default broker lane — which the
+    // shared-profile and engine-lifecycle stages cover.
+    _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+
     // ── watchable web session plumbing (no CEF needed) ─────────────
     webSessionFakeStage(allocator, exe, rt);
     say("smoke-mcp: watchable web session plumbing ok");
@@ -2043,8 +2071,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             say("smoke-mcp: headless web tools ok");
             webPolicyStage(allocator, exe, rt);
             say("smoke-mcp: enforced network policy (real CEF) ok");
+            _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
             webSharedProfileStage(allocator, exe, rt);
             say("smoke-mcp: broker-owned shared profiles (real CEF) ok");
+            webEngineLifecycleStage(allocator, exe, rt);
+            say("smoke-mcp: broker-owned engine lifecycle (real CEF) ok");
         }
     }
 
@@ -2865,6 +2896,11 @@ fn fakeFrameLog(comptime fmt: []const u8, args: anytype) void {
 /// reads it back from the SAME live context; A's exit costs B nothing;
 /// the store flock is held by the daemon, not by either client.
 fn webSharedProfileStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    // The broker spawns the engine with this linger (Phase 3); the
+    // stage's tail waits out the TTL reap rather than an
+    // exit-with-last-client that no longer happens.
+    _ = c.setenv("SKETERM_WEB_LINGER_MS", "3000", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_LINGER_MS");
     var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the shared-profile stage");
     defer http.deinit();
     http.spawn();
@@ -2919,26 +2955,122 @@ fn webSharedProfileStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [
     if (countPrimaryWebengines(allocator, rt) != 1)
         fail("the engine did not survive client A's exit");
 
-    // B leaves; the engine exits with its LAST client (that exit runs
-    // cef_shutdown, which is what flushes the jar).
+    // B leaves; the broker-owned engine LINGERS past its last client
+    // (Phase 3) and then reaps ITSELF through the graceful drain (the
+    // path that runs cef_shutdown and flushes the jar).
     b.closeStdinWait();
+    _ = c.usleep(700_000);
+    if (countPrimaryWebengines(allocator, rt) != 1)
+        fail("the broker-owned engine did not linger past its last client");
     var tries: u32 = 0;
-    while (tries < 200) : (tries += 1) {
+    while (tries < 400) : (tries += 1) {
         if (countPrimaryWebengines(allocator, rt) == 0) break;
         _ = c.usleep(50_000);
     }
-    if (tries >= 200) fail("the engine outlived its last client");
+    if (tries >= 400) fail("the lingering engine never reaped itself after its TTL");
+}
+
+/// Phase 3, the broker-owned engine LIFECYCLE across client
+/// GENERATIONS: a cookie written by one MCP client survives into a
+/// client that starts after the first has fully exited (same live
+/// engine, warm start), and survives the engine's own TTL reap onto
+/// disk (read back by a third generation's fresh engine).
+fn webEngineLifecycleStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    _ = c.setenv("SKETERM_WEB_LINGER_MS", "4000", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_LINGER_MS");
+    var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the engine-lifecycle stage");
+    defer http.deinit();
+    http.spawn();
+    var origin_buf: [64]u8 = undefined;
+    const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+    var args_buf: [1024]u8 = undefined;
+
+    // Generation A: cold engine, write the cookie, leave.
+    var a = Mcp.spawn(allocator, exe, &.{ "--name", "smokeengine" });
+    a.initialize();
+    const cold_t0 = nowMs();
+    a.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"keep\"}}", .{origin}) catch unreachable);
+    if (std.mem.indexOf(u8, a.recvLine(60_000), "isError") != null)
+        fail("generation A could not open its profile");
+    const cold_ms = nowMs() - cold_t0;
+    if (std.mem.indexOf(u8, a.callTool("web_eval", "{\"code\":\"document.cookie='gen=alpha; max-age=86400; path=/'; document.cookie\"}"), "gen=alpha") == null)
+        fail("generation A could not write its cookie");
+    const engine_a = primaryWebenginePid(allocator, rt);
+    if (engine_a == 0) fail("no engine serving generation A");
+    a.closeStdinWait();
+
+    // The engine outlives the whole CLIENT GENERATION.
+    _ = c.usleep(700_000);
+    if (primaryWebenginePid(allocator, rt) != engine_a)
+        fail("the engine did not survive generation A's exit");
+
+    // Generation B: same engine (warm), same live jar.
+    var b = Mcp.spawn(allocator, exe, &.{ "--name", "smokeengine" });
+    b.initialize();
+    const warm_t0 = nowMs();
+    b.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"keep\"}}", .{origin}) catch unreachable);
+    if (std.mem.indexOf(u8, b.recvLine(60_000), "isError") != null)
+        fail("generation B could not open the surviving profile");
+    const warm_ms = nowMs() - warm_t0;
+    if (primaryWebenginePid(allocator, rt) != engine_a)
+        fail("generation B was served by a different engine (no warm adoption)");
+    if (std.mem.indexOf(u8, b.callTool("web_eval", "{\"code\":\"document.cookie\"}"), "gen=alpha") == null)
+        fail("generation B does not see generation A's live session");
+    var lat_buf: [128]u8 = undefined;
+    say(std.fmt.bufPrint(&lat_buf, "smoke-mcp: [phase3] web_open cold {d}ms, warm {d}ms", .{ cold_ms, warm_ms }) catch "smoke-mcp: [phase3] latency printed");
+    b.closeStdinWait();
+
+    // Nobody comes back: TTL reap (graceful by construction).
+    var tries: u32 = 0;
+    while (tries < 400) : (tries += 1) {
+        if (countPrimaryWebengines(allocator, rt) == 0) break;
+        _ = c.usleep(50_000);
+    }
+    if (tries >= 400) fail("the engine never reaped itself after its TTL");
+
+    // Generation C: fresh engine, the cookie CAME BACK FROM DISK — the
+    // reap was the graceful flushing path.
+    var cgen = Mcp.spawn(allocator, exe, &.{ "--name", "smokeengine" });
+    cgen.initialize();
+    cgen.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"keep\"}}", .{origin}) catch unreachable);
+    if (std.mem.indexOf(u8, cgen.recvLine(60_000), "isError") != null)
+        fail("generation C could not reopen the profile");
+    if (std.mem.indexOf(u8, cgen.callTool("web_eval", "{\"code\":\"document.cookie\"}"), "gen=alpha") == null)
+        fail("the TTL reap lost the jar: generation C read no cookie from disk");
+    cgen.closeStdinWait();
+    tries = 0;
+    while (tries < 400) : (tries += 1) {
+        if (countPrimaryWebengines(allocator, rt) == 0) break;
+        _ = c.usleep(50_000);
+    }
+    if (tries >= 400) fail("generation C's engine never reaped itself");
+}
+
+/// Pid of the single primary webengine under `rt`, or 0.
+fn primaryWebenginePid(allocator: std.mem.Allocator, rt: []const u8) c.pid_t {
+    var pid: c.pid_t = 0;
+    var count: usize = 0;
+    scanPrimaryWebengines(allocator, rt, &pid, &count);
+    return if (count == 1) pid else 0;
 }
 
 /// Primary webengine processes under `rt`: cmdline names the binary
 /// AND `--socket` (CEF's zygote/renderer subprocesses carry --type=
 /// and must not count).
 fn countPrimaryWebengines(allocator: std.mem.Allocator, rt: []const u8) usize {
-    const d = c.opendir("/proc") orelse return 0;
+    var pid: c.pid_t = 0;
+    var count: usize = 0;
+    scanPrimaryWebengines(allocator, rt, &pid, &count);
+    return count;
+}
+
+fn scanPrimaryWebengines(allocator: std.mem.Allocator, rt: []const u8, first_pid: *c.pid_t, count_out: *usize) void {
+    first_pid.* = 0;
+    count_out.* = 0;
+    const d = c.opendir("/proc") orelse return;
     defer _ = c.closedir(d);
     var needle_buf: [4096]u8 = undefined;
-    const needle = std.fmt.bufPrint(&needle_buf, "XDG_RUNTIME_DIR={s}", .{rt}) catch return 0;
-    var count: usize = 0;
+    const needle = std.fmt.bufPrint(&needle_buf, "XDG_RUNTIME_DIR={s}", .{rt}) catch return;
     while (c.readdir(d)) |ent| {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
         if (name.len == 0 or name[0] < '0' or name[0] > '9') continue;
@@ -2973,9 +3105,11 @@ fn countPrimaryWebengines(allocator: std.mem.Allocator, rt: []const u8) usize {
             }
         }
         if (std.mem.indexOf(u8, env_data.items, needle) == null) continue;
-        count += 1;
+        if (count_out.* == 0) {
+            first_pid.* = std.fmt.parseInt(c.pid_t, name, 10) catch 0;
+        }
+        count_out.* += 1;
     }
-    return count;
 }
 
 fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {

@@ -958,6 +958,21 @@ pub const Engine = struct {
             if (self.state == .unavailable and self.retryable) self.state = .idle;
         }
 
+        // Broker-owned engine (Phase 3): with a broker-side store, ask
+        // THE BROKER to spawn the engine (linger lifecycle, one owner,
+        // presence file included) and adopt it — the client never
+        // spawns. Any refusal falls through to the local spawn below,
+        // which is exactly the Phase 2 shape. What the broker lane
+        // deliberately does NOT provide is the watchable Wayland
+        // session (the engine must outlive every client, and the
+        // session env was minted per client); SKETERM_WEB_BROKER_ENGINE=0
+        // is the escape hatch back to the client-spawn lane, session
+        // included — the SKETERM_NO_BROKER precedent.
+        if (self.remote != null and brokerEngineWanted()) {
+            if (self.brokerEngine(sock)) return true;
+            if (self.state == .unavailable and self.retryable) self.state = .idle;
+        }
+
         var bin_buf: [4096:0]u8 = undefined;
         const bin = findbin.find(&bin_buf) orelse {
             self.state = .unavailable;
@@ -993,6 +1008,35 @@ pub const Engine = struct {
             return self.startHelper(bin, sock, &sock_z, &cache_z);
         }
         return false;
+    }
+
+    fn brokerEngineWanted() bool {
+        const v = c.getenv("SKETERM_WEB_BROKER_ENGINE") orelse return true;
+        const s = std.mem.span(@as([*:0]const u8, @ptrCast(v)));
+        return !(std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "no"));
+    }
+
+    /// Ask the broker for its engine (web_op engine_open) and adopt it.
+    /// The broker replies before the engine binds — CEF startup is
+    /// seconds and must not block the daemon's loop — so the connect
+    /// wait lives HERE, without a waitpid (the pid is the broker's
+    /// child, not ours).
+    fn brokerEngine(self: *Engine, sock: [:0]const u8) bool {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const info = self.remote.?.engineOpen(arena_state.allocator()) catch return false;
+        // The broker's engine listens where every sibling expects it
+        // (this instance dir); a different path would mean a confused
+        // daemon and adopting it would bind views to the wrong root.
+        if (!std.mem.eql(u8, info.sock, sock)) return false;
+        const deadline = clock.nowMs() + SPAWN_WAIT_MS;
+        const fd: c_int = while (true) {
+            if (self.tryConnect(sock)) |fd| break fd;
+            if (clock.nowMs() >= deadline)
+                return self.failStart("the broker's browser engine did not bind its socket in time");
+            _ = c.usleep(100_000);
+        };
+        return self.adopt(fd);
     }
 
     /// One spawn + connect + handshake attempt. On success the engine

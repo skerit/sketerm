@@ -317,6 +317,12 @@ pub const Conn = struct {
     /// store. Absent = the client falls back to taking the flock
     /// itself, i.e. exactly the old single-owner behavior.
     web_profiles: bool = false,
+    /// Daemon serves `web_op engine_open` (welcome capability): the
+    /// broker spawns and owns the instance's browser ENGINE (linger
+    /// lifecycle) and answers with its listening socket path; the
+    /// daemon never relays web bytes. Absent = the client spawns the
+    /// helper itself, i.e. the Phase 2 shape.
+    web_engine: bool = false,
     /// Daemon answers `stream_open` (welcome capability): it can open an
     /// arbitrary-host TCP stream with DNS resolved on the daemon host.
     /// Absent = never send the frame; an old daemon's generic `.err`
@@ -514,6 +520,7 @@ pub const Conn = struct {
         self.cast_playback = false;
         self.web_store = false;
         self.web_profiles = false;
+        self.web_engine = false;
         self.stream_open = false;
         self.web_helper = false;
         self.panel_rpc = 0;
@@ -536,6 +543,7 @@ pub const Conn = struct {
             cast_playback: bool = false,
             web_store: bool = false,
             web_profiles: bool = false,
+            web_engine: bool = false,
             stream_open: bool = false,
             web_helper: bool = false,
             panel_rpc: u8 = 0,
@@ -563,6 +571,7 @@ pub const Conn = struct {
             self.cast_playback = parsed.value.cast_playback;
             self.web_store = parsed.value.web_store;
             self.web_profiles = parsed.value.web_profiles;
+            self.web_engine = parsed.value.web_engine;
             self.stream_open = parsed.value.stream_open;
             self.web_helper = parsed.value.web_helper;
             self.panel_rpc = @min(parsed.value.panel_rpc, wire.PANEL_RPC_VERSION);

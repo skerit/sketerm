@@ -2434,11 +2434,26 @@ pub const Daemon = struct {
     /// N of them can share one profile namespace. Broker/monolith only;
     /// workers refuse the ops (daemon_serve.handleWebProfileOp).
     web_profile_stores: std.ArrayList(NamedProfileStore) = .empty,
+    /// Browser engines this broker SPAWNED (web_op engine_open). The
+    /// engine reaps ITSELF through its linger TTL; this list exists to
+    /// answer "is one already running", to waitpid the child once it
+    /// has exited, and to hand successors the socket path. Never
+    /// killed at daemon teardown: a lingering engine keeps serving its
+    /// clients without the broker (it is reparented and self-reaps).
+    web_engines: std.ArrayList(WebEngine) = .empty,
 
     pub const NamedProfileStore = struct {
         /// Owned copy of the instance key the client sent.
         key: []u8,
         store: @import("../ipc/webprofiles.zig").Store,
+    };
+
+    pub const WebEngine = struct {
+        /// Owned instance key.
+        key: []u8,
+        pid: c.pid_t,
+        /// Owned listening-socket path.
+        sock: []u8,
     };
 
     const SocketPathState = enum { live, stale, unknown };
@@ -2657,6 +2672,17 @@ pub const Daemon = struct {
             self.allocator.free(nps.key);
         }
         self.web_profile_stores.deinit(self.allocator);
+        // Engines are NOT killed: a lingering engine serves its clients
+        // without the broker and self-reaps on its TTL (init adopts and
+        // reaps the pid once this process is gone). Only collect the
+        // already-exited.
+        for (self.web_engines.items) |e| {
+            var st: c_int = 0;
+            _ = c.waitpid(e.pid, &st, c.WNOHANG);
+            self.allocator.free(e.key);
+            self.allocator.free(e.sock);
+        }
+        self.web_engines.deinit(self.allocator);
         for (self.clients.items) |cl| cl.deinit();
         self.clients.deinit(self.allocator);
         for (self.sessions.items) |s| s.deinit();

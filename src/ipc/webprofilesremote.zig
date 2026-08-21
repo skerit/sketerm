@@ -191,6 +191,45 @@ pub const Remote = struct {
         return .{ .removed = reply.removed, .id = reply.id };
     }
 
+    pub const EngineInfo = struct {
+        /// The engine's listening socket path, in `arena`.
+        sock: []const u8,
+        /// Engine pid as the daemon knows it; 0 for an engine the
+        /// daemon only probed (a predecessor broker's, still lingering).
+        pid: c.pid_t,
+        /// True when this call caused the spawn — the caller owns the
+        /// bind wait (CEF startup is seconds).
+        spawned: bool,
+    };
+
+    /// Ask the daemon for its broker-owned engine (spawn-if-absent,
+    /// linger lifecycle). `error.Unsupported` against a daemon without
+    /// the `web_engine` capability — the caller then spawns the helper
+    /// itself, i.e. the Phase 2 shape.
+    pub fn engineOpen(self: *Remote, arena: std.mem.Allocator) error{ Unsupported, Io }!EngineInfo {
+        {
+            const cn = self.ensureConn() catch |err| return switch (err) {
+                error.Unsupported => error.Unsupported,
+                else => error.Io,
+            };
+            if (!cn.web_engine) return error.Unsupported;
+        }
+        const Reply = struct {
+            req: u32 = 0,
+            ok: bool = false,
+            sock: []const u8 = "",
+            pid: c.pid_t = 0,
+            spawned: bool = false,
+            @"error": []const u8 = "",
+        };
+        const reply = self.opWithRetry(Reply, arena, .{
+            .op = "engine_open",
+            .instance = self.instance,
+        }) catch return error.Io;
+        if (!reply.ok or reply.sock.len == 0) return error.Io;
+        return .{ .sock = reply.sock, .pid = reply.pid, .spawned = reply.spawned };
+    }
+
     fn dropConn(self: *Remote) void {
         if (self.conn) |*cn| {
             cn.deinit();
