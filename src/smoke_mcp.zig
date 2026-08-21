@@ -1955,7 +1955,9 @@ fn nodeIdBefore(hay: []const u8, needle: []const u8) ?u32 {
 fn readerIdBefore(hay: []const u8, needle: []const u8) ?u32 {
     const at = std.mem.lastIndexOf(u8, hay, needle) orelse return null;
     const before = hay[0..at];
-    const key = "\\\"id\\\":";
+    // The entity list rides structuredContent now, so its keys are
+    // ordinary JSON in the NDJSON line rather than an escaped string.
+    const key = "\"id\":";
     const id_at = std.mem.lastIndexOf(u8, before, key) orelse return null;
     var i = id_at + key.len;
     var value: u32 = 0;
@@ -2003,8 +2005,8 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"file://{s}\"}}", .{page_path}) catch unreachable);
     const opened = m.recvLine(60_000);
     if (std.mem.indexOf(u8, opened, "isError") != null) fail("web_open failed headlessly (the NoGuiSocket regression)");
-    if (std.mem.indexOf(u8, opened, "\\\"view\\\":1") == null)
-        fail("web_open did not hand back a headless view handle");
+    if (std.mem.indexOf(u8, opened, "\"view\":1") == null)
+        fail("web_open did not hand back a headless view handle in structuredContent");
     if (std.mem.indexOf(u8, opened, "PressMe") == null or std.mem.indexOf(u8, opened, "BEFORECLICK") == null)
         fail("web_open's first snapshot is missing the page's nodes");
     const btn = nodeIdBefore(opened, "PressMe") orelse fail("cannot read the button's node id from the snapshot");
@@ -2040,7 +2042,7 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // web_act: a trusted click, whose reply carries the DELTA showing
     // the paragraph the click mutated.
     const acted = m.callTool("web_act", std.fmt.bufPrint(&args_buf, "{{\"id\":{d},\"action\":\"click\"}}", .{btn}) catch unreachable);
-    if (std.mem.indexOf(u8, acted, "\\\"acted\\\":true") == null)
+    if (std.mem.indexOf(u8, acted, "\"acted\":true") == null)
         fail("web_act click did not act");
     if (std.mem.indexOf(u8, acted, "AFTERCLICK") == null)
         fail("web_act's delta does not show the mutated paragraph");
@@ -2048,11 +2050,11 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // Mutate via eval, then prove a FOLLOW-UP web_snapshot returns a
     // delta containing exactly the changed node.
     const evald = m.callTool("web_eval", "{\"code\":\"document.getElementById('p').textContent='EVALMUTATION'; 40+2\"}");
-    if (std.mem.indexOf(u8, evald, "\\\"evaluated\\\":true") == null or
-        std.mem.indexOf(u8, evald, "42") == null)
-        fail("web_eval did not run in the page");
+    if (std.mem.indexOf(u8, evald, "\"evaluated\":true") == null or
+        std.mem.indexOf(u8, evald, "\"value\":42") == null)
+        fail("web_eval did not run in the page, or its value is not machine-readable");
     const snap = m.callTool("web_snapshot", "{}");
-    if (std.mem.indexOf(u8, snap, "\\\"kind\\\":\\\"delta\\\"") == null or
+    if (std.mem.indexOf(u8, snap, "\"kind\":\"delta\"") == null or
         std.mem.indexOf(u8, snap, "EVALMUTATION") == null)
         fail("the follow-up snapshot's delta does not carry the changed node");
 
@@ -2060,12 +2062,13 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     const read = m.callTool("web_read", "{}");
     if (std.mem.indexOf(u8, read, "HEADLESS-READ-MARKER") == null)
         fail("web_read did not extract the article text");
-    if (std.mem.indexOf(u8, read, "\\\"entities\\\"") == null)
+    if (std.mem.indexOf(u8, read, "\"entities\":[") == null or
+        std.mem.indexOf(u8, read, "\"reader_ids\":true") == null)
         fail("web_read did not return the negotiated reader entity envelope");
     const reader_id = readerIdBefore(read, "Activate Reader Target") orelse
         fail("web_read did not make its reader link addressable");
     const reader_act = m.callTool("web_act", std.fmt.bufPrint(&args_buf, "{{\"id\":{d},\"action\":\"click\"}}", .{reader_id}) catch unreachable);
-    if (std.mem.indexOf(u8, reader_act, "\\\"acted\\\":true") == null)
+    if (std.mem.indexOf(u8, reader_act, "\"acted\":true") == null)
         fail("web_act did not accept the fresh reader entity id");
     const reader_title = m.callTool("web_eval", "{\"code\":\"document.title\"}");
     if (std.mem.indexOf(u8, reader_title, "reader:mcp:true") == null)
@@ -2084,10 +2087,13 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // web_screenshot: a real PNG from the helper's software frame
     // (base64 "iVBOR..." is the PNG magic).
     const shot = m.callTool("web_screenshot", "{}");
-    if (std.mem.indexOf(u8, shot, "\\\"image\\\"") == null and std.mem.indexOf(u8, shot, "\"image\"") == null)
+    if (std.mem.indexOf(u8, shot, "\"type\":\"image\"") == null)
         fail("web_screenshot returned no image block");
     if (std.mem.indexOf(u8, shot, "iVBOR") == null)
         fail("web_screenshot's payload is not a PNG");
+    // The pixel facts ride the machine lane beside the image block.
+    if (std.mem.indexOf(u8, shot, "\"width\":") == null or std.mem.indexOf(u8, shot, "\"height\":") == null)
+        fail("web_screenshot did not report its pixel size in structuredContent");
 
     // The web_open settle regression: a page that takes SECONDS to
     // finish loading must still come back as ITSELF. The blocking
@@ -2111,7 +2117,7 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"file://{s}\"}}", .{slow_path}) catch unreachable);
     const slow = m.recvLine(60_000);
     if (std.mem.indexOf(u8, slow, "isError") != null) fail("web_open on a slow page failed");
-    if (std.mem.indexOf(u8, slow, "\\\"settled\\\":true") == null)
+    if (std.mem.indexOf(u8, slow, "\"settled\":true") == null)
         fail("web_open reported the slow page as unsettled");
     if (std.mem.indexOf(u8, slow, "SLOWMARKER") == null)
         fail("web_open's first snapshot is not the requested page (the about:blank settle race)");
@@ -2119,32 +2125,32 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
         fail("web_open answered with a blank document");
     // doc 1: the view has only ever held THIS page, so no blank
     // document was created for it at all (the view_create_url path).
-    if (std.mem.indexOf(u8, slow, "\\\"document\\\":1") == null)
+    if (std.mem.indexOf(u8, slow, "\"document\":1") == null)
         fail("the slow page is not the view's FIRST document (a blank one was minted first)");
 
     // Two views exist now, and the newest is what a handle-less call
     // means: web_tabs must SAY so rather than leaving it to be guessed.
     const tabs2 = m.callTool("web_tabs", "{}");
-    if (std.mem.indexOf(u8, tabs2, "\\\"view\\\":2") == null)
+    if (std.mem.indexOf(u8, tabs2, "\"view\":2") == null)
         fail("web_tabs does not list the second headless view");
-    if (std.mem.indexOf(u8, tabs2, "\\\"current\\\":true") == null)
+    if (std.mem.indexOf(u8, tabs2, "\"current\":true") == null)
         fail("web_tabs does not mark the current view");
-    if (std.mem.indexOf(u8, tabs2, "current_view") == null)
-        fail("web_tabs does not explain which view a handle-less call addresses");
+    if (std.mem.indexOf(u8, tabs2, "* = the view a web_* call with no 'pane' addresses") == null)
+        fail("web_tabs does not say which view a handle-less call addresses");
     // Addressing the FIRST view explicitly makes it current again.
     const back1 = m.callTool("web_read", "{\"pane\":1}");
     if (std.mem.indexOf(u8, back1, "HEADLESS-READ-MARKER") == null)
         fail("web_read against an explicit handle did not reach that view");
     const tabs3 = m.callTool("web_tabs", "{}");
-    const cur_at = std.mem.indexOf(u8, tabs3, "\\\"current\\\":true") orelse
+    const cur_at = std.mem.indexOf(u8, tabs3, "\"current\":true") orelse
         fail("web_tabs stopped marking a current view");
-    if (std.mem.lastIndexOf(u8, tabs3[0..cur_at], "\\\"view\\\":1") == null)
+    if (std.mem.lastIndexOf(u8, tabs3[0..cur_at], "\"view\":1") == null)
         fail("an explicit handle did not become the current view");
 
     // web_tabs names the backend and the handle kind honestly.
     const tabs = m.callTool("web_tabs", "{}");
-    if (std.mem.indexOf(u8, tabs, "\\\"backend\\\":\\\"headless\\\"") == null or
-        std.mem.indexOf(u8, tabs, "\\\"view\\\":1") == null)
+    if (std.mem.indexOf(u8, tabs, "\"backend\":\"headless\"") == null or
+        std.mem.indexOf(u8, tabs, "\"view\":1") == null)
         fail("web_tabs does not list the headless view");
 
     m.closeStdinWait();
@@ -2169,7 +2175,8 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     if (std.mem.indexOf(u8, legacy_read, "HEADLESS-READ-MARKER") == null or
         std.mem.indexOf(u8, legacy_read, "lacks the reader-ids capability") == null)
         fail("web_read did not report the negotiated old-helper fallback");
-    if (std.mem.indexOf(u8, legacy_read, "\\\"entities\\\"") != null)
+    if (std.mem.indexOf(u8, legacy_read, "\"entities\":") != null or
+        std.mem.indexOf(u8, legacy_read, "\"reader_ids\":false") == null)
         fail("the old-helper fallback fabricated rich reader entities");
     legacy.closeStdinWait();
 }

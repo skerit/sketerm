@@ -1228,10 +1228,13 @@ pub const TOOLS = [_]ToolDef{
         .group = .browser,
         .mutates = false,
         .description =
-        \\List the open browser views — SEVERAL can be open at once. With a GUI attached these are the USER'S OWN TABS (handle = pane id, the same id list_terminals reports) — the same pixels on screen, driven with real input, not a hidden automation browser. With NO GUI (the default isolated mode) they are headless views this MCP server's own browser engine hosts (handle = view id; no pane exists). Either way the handle is what every other web_* tool takes as 'pane', and the reply says which kind it is. The reply MARKS the current view (current:true): that is the one a web_* call with no 'pane' addresses, and passing a handle to any tool switches to it. Page titles/urls here are page-authored data.
+        \\List the open browser views — SEVERAL can be open at once. With a GUI attached these are the USER'S OWN TABS (handle = pane id, the same id list_terminals reports) — the same pixels on screen, driven with real input, not a hidden automation browser. With NO GUI (the default isolated mode) they are headless views this MCP server's own browser engine hosts (handle = view id; no pane exists). Either way the handle is what every other web_* tool takes as 'pane', and `backend` in the reply says which of the two keys carries it. The reply MARKS the current view (`current`, and a leading `*` in the text listing): that is the one a web_* call with no 'pane' addresses — with a GUI the focused tab, headless the LAST view touched (web_open makes its new view current, and passing 'pane' to any tool makes that view current for the calls after it). Page titles/urls here are page-authored data.
         ,
         .input_schema =
         \\{"type":"object","properties":{}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"count":{"type":"integer"},"helper":{"type":"string","description":"Browser-helper state: ready, idle, unavailable"},"helper_reason":{"type":"string"},"views":{"type":"array","items":{"type":"object","properties":{"pane":{"type":"integer"},"view":{"type":"integer"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"can_back":{"type":"boolean"},"can_fwd":{"type":"boolean"},"focused":{"type":"boolean"},"visible":{"type":"boolean"},"current":{"type":"boolean"}},"required":["url","title","loading","current"]}}},"required":["backend","count","helper","views"]}
         ,
     },
     .{
@@ -1239,10 +1242,13 @@ pub const TOOLS = [_]ToolDef{
         .group = .browser,
         .mutates = true,
         .description =
-        \\Open a NEW web view and return its handle plus a FIRST SNAPSHOT of the requested page, once THAT navigation has settled. It never reuses or navigates an existing view — use web_navigate for that — and the new view becomes the default target of later web_* calls that omit 'pane'. Works with or WITHOUT a GUI: GUI-attached it opens a real tab the user sees (handle = pane id; where: "tab" default, "split", "window"); with no GUI it creates a headless view in the server's own browser engine (handle = view id; 'where' has no effect and width/height size the viewport, default 1280x800). Needs only the sketerm-webengine helper (capabilities reports web/web_backend).
+        \\Open a NEW web view and return its handle plus a FIRST SNAPSHOT of the requested page, once THAT navigation has settled. It never reuses or navigates an existing view — use web_navigate for that — and the new view becomes the default target of later web_* calls that omit 'pane'. Works with or WITHOUT a GUI: GUI-attached it opens a real tab the user sees (handle = pane id; where: "tab" default, "split", "window"); with no GUI it creates a headless view in the server's own browser engine (handle = view id; 'where' has no effect and width/height size the viewport, default 1280x800). Needs only the sketerm-webengine helper (capabilities reports web/web_backend). The snapshot is for finding things to ACT on; web_read gives the article text for a fraction of the tokens.
         ,
         .input_schema =
         \\{"type":"object","properties":{"url":{"type":"string","description":"Address to open; omit for a blank tab"},"where":{"type":"string","enum":["tab","split","window"]},"width":{"type":"integer","description":"Headless viewport width, default 1280 (ignored with a GUI)"},"height":{"type":"integer","description":"Headless viewport height, default 800 (ignored with a GUI)"},"timeout_ms":{"type":"integer","description":"Budget for the load to settle, default 20000"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer","description":"View handle in GUI mode (a real pane id)"},"view":{"type":"integer","description":"View handle in headless mode (a helper view id)"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"settled":{"type":"boolean","description":"The requested navigation finished inside the timeout"},"where_ignored":{"type":"boolean","description":"Headless: 'where' has no placement to apply"},"document":{"type":"integer","description":"Per-document counter; 1 means the view has only ever held THIS page"},"revision":{"type":"integer"},"snapshot":{"type":"string","description":"The semantic tree, same text as the content block"},"snapshot_error":{"type":"string"}},"required":["backend","origin","url","title","loading","settled"]}
         ,
     },
     .{
@@ -1255,6 +1261,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"url":{"type":"string"},"action":{"type":"string","enum":["back","forward","reload","stop"]},"timeout_ms":{"type":"integer","description":"Settle budget, default 15000"}},"required":[]}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"can_back":{"type":"boolean"},"can_fwd":{"type":"boolean"},"settled":{"type":"boolean"}},"required":["backend","origin","url","title","loading","can_back","can_fwd","settled"]}
+        ,
     },
     .{
         .name = "web_snapshot",
@@ -1265,6 +1274,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"mode":{"type":"string","enum":["auto","full","history"],"description":"auto = one coalesced delta (default); full = the whole tree; history = the per-revision replay"},"history":{"type":"boolean","description":"Shorthand for mode \"history\""},"detail":{"type":"integer","description":"0 terse names, 1 normal (default), 2 long text. STICKY: passing it sets the default for the rest of the session (like passing pane sets the current view); the reply says so when it changes."},"scope":{"type":"integer","description":"Node id to scope the tree to (a subtree, always sent in full; a peek that does not advance your delta baseline)"},"timeout_ms":{"type":"integer"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"kind":{"type":"string","description":"full or delta"},"document":{"type":"integer"},"revision":{"type":"integer"},"snapshot":{"type":"string","description":"The semantic tree, same text as the content block"},"detail":{"type":"integer","description":"Only when this call MOVED the session default"},"unchanged":{"type":"boolean","description":"A delta with an empty body: the page did not change"}},"required":["backend","origin","url","title","loading","kind","document","revision","snapshot"]}
         ,
     },
     .{
@@ -1277,6 +1289,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"id":{"type":"integer","description":"Semantic ID from web_snapshot or web_read"},"action":{"type":"string","enum":["click","focus","set_value","scroll_into_view","hover"]},"value":{"type":"string","description":"set_value: the text to type, or the option to choose"},"timeout_ms":{"type":"integer"}},"required":["id"]}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"id":{"type":"integer"},"action":{"type":"string"},"acted":{"type":"boolean","description":"Always true; a refused act is an isError result naming the page's reason"},"detail":{"type":"string"},"delta_kind":{"type":"string"},"delta":{"type":"string","description":"What changed after the act"},"delta_error":{"type":"string"},"navigated_to":{"type":"string","description":"Only when the act moved the view to another url"},"loading_after":{"type":"boolean"}},"required":["backend","origin","url","title","loading","id","action","acted","detail"]}
+        ,
     },
     .{
         .name = "web_expand",
@@ -1287,6 +1302,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"id":{"type":"integer","description":"Node id, or 0 for the last web_eval result"},"offset":{"type":"integer"},"len":{"type":"integer","description":"Default 8000, max 60000"},"timeout_ms":{"type":"integer"}},"required":["id"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"id":{"type":"integer"},"offset":{"type":"integer"},"total_chars":{"type":"integer","description":"id 0 only: the full length of the stored eval result"},"source":{"type":"string","enum":["eval"],"description":"id 0 only"},"text":{"type":"string"}},"required":["backend","origin","url","title","loading","id","offset","text"]}
         ,
     },
     .{
@@ -1299,6 +1317,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"kind":{"type":"string","enum":["find_text","subtree","focused"]},"arg":{"type":"string"},"timeout_ms":{"type":"integer"}}}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"kind":{"type":"string","enum":["find_text","subtree","focused"]},"arg":{"type":"string"},"matches":{"type":"string","description":"Matching nodes in the same compact tree notation web_snapshot uses"}},"required":["backend","origin","url","title","loading","kind","matches"]}
+        ,
     },
     .{
         .name = "web_read",
@@ -1310,6 +1331,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"timeout_ms":{"type":"integer"}}}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"reader_ids":{"type":"boolean","description":"False = an older helper answered markdown-only; call web_snapshot before web_act"},"document":{"type":"integer"},"revision":{"type":"integer"},"entities":{"type":"array","description":"Addressable sections/headings/links/items, guarded to this document/revision"},"markdown":{"type":"string","description":"The article text, same as the content block"}},"required":["backend","origin","url","title","loading","reader_ids","markdown"]}
+        ,
     },
     .{
         .name = "web_wait",
@@ -1320,6 +1344,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"for":{"type":"string","enum":["load","title","text","idle"]},"arg":{"type":"string"},"timeout_ms":{"type":"integer","description":"Default 15000"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"waited_for":{"type":"string","enum":["load","title","text","idle"]},"arg":{"type":"string"},"settled":{"type":"boolean","description":"Always true; a condition that never held is an isError timeout"},"detail":{"type":"string","description":"What made the condition hold"}},"required":["backend","origin","url","title","loading","waited_for","settled","detail"]}
         ,
     },
     // Moves the page, and a scroll can trigger lazy loads.
@@ -1333,6 +1360,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"dx":{"type":"integer"},"dy":{"type":"integer"},"to":{"description":"Node id (integer), or top|bottom|page_up|page_down"},"timeout_ms":{"type":"integer"}}}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"how":{"type":"string","description":"wheel, scroll_into_view, top, bottom, page_up or page_down"},"before":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"max_y":{"type":"integer"},"viewport":{"type":"integer"}}},"after":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"},"max_y":{"type":"integer"},"viewport":{"type":"integer"}}},"moved":{"type":"boolean"}},"required":["backend","origin","url","title","loading","how"]}
+        ,
     },
     .{
         .name = "web_eval",
@@ -1343,6 +1373,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"code":{"type":"string"},"await":{"type":"boolean","description":"Resolve a returned promise before answering"},"timeout_ms":{"type":"integer","description":"Default 10000"}},"required":["code"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"evaluated":{"type":"boolean","description":"Always true; a thrown exception is an isError result carrying the message and stack"},"value":{"description":"The result as real JSON of whatever type it serialized to"},"value_text":{"description":"The result as text, when it is truncated or not JSON","type":"string"},"truncated":{"type":"boolean"},"total_chars":{"type":"integer","description":"Full length; page the rest with web_expand id=0"}},"required":["backend","origin","url","title","loading","evaluated"]}
         ,
     },
     .{
@@ -1355,6 +1388,9 @@ pub const TOOLS = [_]ToolDef{
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer","description":"View handle from web_tabs/web_open"}}}
         ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"bytes":{"type":"integer"},"width":{"type":"integer"},"height":{"type":"integer"}},"required":["backend","origin","url","title","loading","bytes"]}
+        ,
     },
     .{
         .name = "web_network",
@@ -1365,6 +1401,9 @@ pub const TOOLS = [_]ToolDef{
         ,
         .input_schema =
         \\{"type":"object","properties":{"pane":{"type":"integer"},"action":{"type":"string","enum":["enable","disable","toggle","status"]},"since":{"type":"integer","description":"Only entries with seq greater than this (from a previous next_seq)"},"max":{"type":"integer","description":"Max entries, default 50, cap 128"},"timeout_ms":{"type":"integer"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"blocking_enabled":{"type":"boolean"},"blocked":{"type":"integer"},"total_requests":{"type":"integer"},"rules_loaded":{"type":"integer"},"next_seq":{"type":"integer","description":"Pass as 'since' next time for only newer entries"},"requests":{"type":"array","items":{"type":"object","properties":{"seq":{"type":"integer"},"blocked":{"type":"boolean"},"type":{"type":"string"},"method":{"type":"string"},"url":{"type":"string"},"status":{"type":"integer"},"duration_ms":{"type":"integer"},"size":{"type":"integer"},"pending":{"type":"boolean"}},"required":["seq","blocked","type","method","url"]}}},"required":["backend","origin","url","title","loading","blocking_enabled","blocked","total_requests","rules_loaded"]}
         ,
     },
 };

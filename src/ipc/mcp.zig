@@ -5041,11 +5041,25 @@ fn uiTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: st
 /// control protocol is line-JSON), which is read back and returned as an
 /// inline image. Shared by `screenshot_pane` and `web_screenshot`.
 pub fn paneScreenshot(arena: std.mem.Allocator, backend: Backend, pane: ?u32, caption: []const u8) ![]const u8 {
+    return switch (try paneScreenshotPng(arena, backend, pane)) {
+        .err => |e| errRes(arena, .io_failed, e),
+        .png => |bytes| imageResult(arena, caption, bytes) orelse error.OutOfMemory,
+    };
+}
+
+/// The bytes half of `paneScreenshot`: a caller that wants to build its
+/// own two-lane result around the image needs the PNG, not a finished
+/// content block.
+pub fn paneScreenshotPng(
+    arena: std.mem.Allocator,
+    backend: Backend,
+    pane: ?u32,
+) !union(enum) { png: []const u8, err: []const u8 } {
     const path_z = std.fmt.allocPrint(arena, "/tmp/sketerm-shot-{d}-{d}.png\x00", .{ c.getpid(), backend.nowMs(backend.ctx) }) catch return error.OutOfMemory;
     const path = path_z[0 .. path_z.len - 1];
     const reply = try ipcParsed(arena, backend, .{ .cmd = "screenshot", .pane = pane, .data = path });
-    if (!reply.ok) return toolResult(arena, reply.err, true) orelse error.OutOfMemory;
-    const f = c.fopen(path_z.ptr, "rb") orelse return appErr(arena, "screenshot file vanished");
+    if (!reply.ok) return .{ .err = reply.err };
+    const f = c.fopen(path_z.ptr, "rb") orelse return .{ .err = "screenshot file vanished" };
     defer _ = c.fclose(f);
     _ = c.fseek(f, 0, c.SEEK_END);
     const len: usize = @intCast(@max(0, c.ftell(f)));
@@ -5053,8 +5067,8 @@ pub fn paneScreenshot(arena: std.mem.Allocator, backend: Backend, pane: ?u32, ca
     const buf = arena.alloc(u8, len) catch return error.OutOfMemory;
     const rd = c.fread(buf.ptr, 1, len, f);
     _ = c.unlink(path_z.ptr);
-    if (rd != len) return appErr(arena, "short read of screenshot");
-    return imageResult(arena, caption, buf) orelse error.OutOfMemory;
+    if (rd != len) return .{ .err = "short read of screenshot" };
+    return .{ .png = buf };
 }
 
 fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: std.json.Value) ![]const u8 {
