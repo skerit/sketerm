@@ -3835,6 +3835,12 @@ fn fsEntryLine(w: *std.Io.Writer, e: fsdrive.Entry) !void {
 /// An fsdrive error as one of the shared codes. The daemon's own
 /// message is the only place a missing path is visible, so a refused
 /// op is classified from it.
+///
+/// `NOENT` is the spelling that actually arrives: the daemon reports
+/// failures as bare errno TAGS (`fsserve.errnoName` -> "NOENT",
+/// "ACCES"), not as strerror prose. Matching only "ENOENT" therefore
+/// typed every missing file as `io_failed`, which is RETRYABLE — so a
+/// client retried a path that will never exist.
 pub fn fsErrCode(err: fsdrive.Error, detail: []const u8) ErrCode {
     return switch (err) {
         fsdrive.Error.NotConnected => .unavailable,
@@ -3842,9 +3848,10 @@ pub fn fsErrCode(err: fsdrive.Error, detail: []const u8) ErrCode {
         fsdrive.Error.BadRequest => .invalid_args,
         fsdrive.Error.Conflict => .conflict,
         fsdrive.Error.OutOfMemory, fsdrive.Error.BadReply => .io_failed,
+        // "NOENT" also matches the "ENOENT" spelling, which contains it.
         fsdrive.Error.FsOpFailed => if (std.mem.indexOf(u8, detail, "No such file") != null or
             std.mem.indexOf(u8, detail, "not found") != null or
-            std.mem.indexOf(u8, detail, "ENOENT") != null) .not_found else .io_failed,
+            std.mem.indexOf(u8, detail, "NOENT") != null) .not_found else .io_failed,
     };
 }
 
@@ -8920,6 +8927,10 @@ test "fs failures carry the code their cause deserves" {
     // Only the daemon's own message distinguishes a missing path from
     // any other refusal.
     try t.expectEqual(ErrCode.not_found, fsErrCode(fsdrive.Error.FsOpFailed, "open: No such file or directory"));
+    // The spelling the daemon actually sends: a bare errno tag.
+    try t.expectEqual(ErrCode.not_found, fsErrCode(fsdrive.Error.FsOpFailed, "NOENT"));
+    try t.expectEqual(ErrCode.not_found, fsErrCode(fsdrive.Error.FsOpFailed, "ENOENT"));
+    try t.expectEqual(ErrCode.io_failed, fsErrCode(fsdrive.Error.FsOpFailed, "ACCES"));
     try t.expectEqual(ErrCode.io_failed, fsErrCode(fsdrive.Error.FsOpFailed, "permission denied"));
     try t.expect(!ErrCode.not_found.retryable());
     try t.expect(ErrCode.timeout.retryable());
