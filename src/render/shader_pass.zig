@@ -508,42 +508,15 @@ pub const ShaderPass = struct {
     }
 
     pub fn releaseGL(self: *ShaderPass) void {
-        if (self.program != 0) c.glDeleteProgram(self.program);
-        if (self.dim_program != 0) c.glDeleteProgram(self.dim_program);
-        if (self.vao != 0) {
-            var v = self.vao;
-            c.glDeleteVertexArrays(1, &v);
-        }
-        if (self.vbo != 0) {
-            var b = self.vbo;
-            c.glDeleteBuffers(1, &b);
-        }
-        if (self.fbo != 0) {
-            var f = self.fbo;
-            c.glDeleteFramebuffers(1, &f);
-        }
-        if (self.tex != 0) {
-            var t = self.tex;
-            c.glDeleteTextures(1, &t);
-        }
-        for (self.fb_tex) |t| {
-            if (t != 0) {
-                var tt = t;
-                c.glDeleteTextures(1, &tt);
-            }
-        }
-        for (self.fb_fbo) |f| {
-            if (f != 0) {
-                var ff = f;
-                c.glDeleteFramebuffers(1, &ff);
-            }
-        }
-        for (self.lut_tex) |t| {
-            if (t != 0) {
-                var tt = t;
-                c.glDeleteTextures(1, &tt);
-            }
-        }
+        gl.deleteProgram(&self.program);
+        gl.deleteProgram(&self.dim_program);
+        gl.deleteVertexArray(&self.vao);
+        gl.deleteBuffer(&self.vbo);
+        gl.deleteFramebuffer(&self.fbo);
+        gl.deleteTexture(&self.tex);
+        for (&self.fb_tex) |*t| gl.deleteTexture(t);
+        for (&self.fb_fbo) |*f| gl.deleteFramebuffer(f);
+        for (&self.lut_tex) |*t| gl.deleteTexture(t);
         self.forgetGL();
     }
 
@@ -639,9 +612,9 @@ pub const ShaderPass = struct {
         c.glBindVertexArray(self.vao);
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
         c.glBufferData(c.GL_ARRAY_BUFFER, quad.len * @sizeOf(f32), &quad, c.GL_STATIC_DRAW);
-        const a_pos: c_uint = @intCast(c.glGetAttribLocation(program, "a_pos"));
-        c.glEnableVertexAttribArray(a_pos);
-        c.glVertexAttribPointer(a_pos, 2, c.GL_FLOAT, c.GL_FALSE, 0, null);
+        gl.bindAttribs(program, 0, &.{
+            .{ .name = "a_pos", .count = 2 },
+        }, false);
         c.glBindVertexArray(0);
     }
 

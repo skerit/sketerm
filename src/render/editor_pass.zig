@@ -292,10 +292,9 @@ pub const Frame = struct {
 
 pub const EditorPass = struct {
     program: c_uint = 0,
-    vaos: [3]c_uint = .{ 0, 0, 0 },
-    vbos: [3]c_uint = .{ 0, 0, 0 },
-    vbo_caps: [3]usize = .{ 0, 0, 0 },
-    vbo_slot: u8 = 0,
+    /// Rotating triple VAO/VBO set. `gl.TripleBuf` documents why
+    /// three slots (Mesa's implicit CPU<->GPU sync on buffer reuse).
+    tri: gl.TripleBuf = .{},
     u_screen_px: c_int = -1,
     u_atlas: c_int = -1,
     u_kind: c_int = -1,
@@ -335,10 +334,7 @@ pub const EditorPass = struct {
     /// lived in is gone (GtkGLArea re-realize). realize() rebuilds.
     pub fn forgetGL(self: *EditorPass) void {
         self.program = 0;
-        @memset(&self.vaos, 0);
-        @memset(&self.vbos, 0);
-        @memset(&self.vbo_caps, 0);
-        self.vbo_slot = 0;
+        self.tri.forget();
         self.u_screen_px = -1;
         self.u_atlas = -1;
         self.u_kind = -1;
@@ -349,9 +345,8 @@ pub const EditorPass = struct {
     /// glDelete every owned resource under a still-current context,
     /// then forget. Call from the pane's unrealize handler.
     pub fn releaseGL(self: *EditorPass) void {
-        if (self.program != 0) c.glDeleteProgram(self.program);
-        c.glDeleteVertexArrays(3, &self.vaos[0]);
-        c.glDeleteBuffers(3, &self.vbos[0]);
+        gl.deleteProgram(&self.program);
+        self.tri.release();
         self.forgetGL();
     }
 
@@ -365,37 +360,20 @@ pub const EditorPass = struct {
         self.u_kind = c.glGetUniformLocation(self.program, "u_kind");
         self.u_default_bg = c.glGetUniformLocation(self.program, "u_default_bg");
         self.u_blend_mode = c.glGetUniformLocation(self.program, "u_blend_mode");
-        c.glGenVertexArrays(3, &self.vaos[0]);
-        c.glGenBuffers(3, &self.vbos[0]);
-        for (0..3) |i| {
-            c.glBindVertexArray(self.vaos[i]);
-            c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbos[i]);
-            self.bindVertexAttribs();
-        }
-        c.glBindVertexArray(0);
+        self.tri.realize(self.program, @sizeOf(Instance), &ATTRIBS);
     }
 
-    fn bindVertexAttribs(self: *EditorPass) void {
-        const stride: c_int = @sizeOf(Instance);
-        const fields = [_]struct { name: [:0]const u8, off: usize, count: c_int }{
-            .{ .name = "a_xy", .off = @offsetOf(Instance, "xy"), .count = 2 },
-            .{ .name = "a_size", .off = @offsetOf(Instance, "size"), .count = 2 },
-            .{ .name = "a_color", .off = @offsetOf(Instance, "color"), .count = 4 },
-            .{ .name = "a_uv0", .off = @offsetOf(Instance, "uv0"), .count = 2 },
-            .{ .name = "a_uv1", .off = @offsetOf(Instance, "uv1"), .count = 2 },
-            .{ .name = "a_layer", .off = @offsetOf(Instance, "layer"), .count = 1 },
-            .{ .name = "a_kind", .off = @offsetOf(Instance, "kind"), .count = 1 },
-            .{ .name = "a_colored", .off = @offsetOf(Instance, "colored"), .count = 1 },
-        };
-        for (fields) |f| {
-            const loc = c.glGetAttribLocation(self.program, f.name.ptr);
-            if (loc < 0) continue;
-            const idx: c_uint = @intCast(loc);
-            c.glEnableVertexAttribArray(idx);
-            c.glVertexAttribPointer(idx, f.count, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(f.off));
-            c.glVertexAttribDivisor(idx, 1);
-        }
-    }
+    /// Per-instance vertex attribute layout; must match `Instance`.
+    const ATTRIBS = [_]gl.Attrib{
+        .{ .name = "a_xy", .off = @offsetOf(Instance, "xy"), .count = 2 },
+        .{ .name = "a_size", .off = @offsetOf(Instance, "size"), .count = 2 },
+        .{ .name = "a_color", .off = @offsetOf(Instance, "color"), .count = 4 },
+        .{ .name = "a_uv0", .off = @offsetOf(Instance, "uv0"), .count = 2 },
+        .{ .name = "a_uv1", .off = @offsetOf(Instance, "uv1"), .count = 2 },
+        .{ .name = "a_layer", .off = @offsetOf(Instance, "layer"), .count = 1 },
+        .{ .name = "a_kind", .off = @offsetOf(Instance, "kind"), .count = 1 },
+        .{ .name = "a_colored", .off = @offsetOf(Instance, "colored"), .count = 1 },
+    };
 
     // ---- frame building ----------------------------------------------
 
@@ -990,32 +968,7 @@ pub const EditorPass = struct {
     // ---- upload + draw ------------------------------------------------
 
     fn upload(self: *EditorPass) void {
-        const total_bytes: usize = self.instances.items.len * @sizeOf(Instance);
-        if (total_bytes == 0 or self.vbos[0] == 0) return;
-        self.vbo_slot = (self.vbo_slot + 1) % 3;
-        const slot: usize = self.vbo_slot;
-        c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbos[slot]);
-        if (self.vbo_caps[slot] < total_bytes) {
-            c.glBufferData(c.GL_ARRAY_BUFFER, @intCast(total_bytes), null, c.GL_STREAM_DRAW);
-            self.vbo_caps[slot] = total_bytes;
-        }
-        const flags: c.GLbitfield = c.GL_MAP_WRITE_BIT |
-            c.GL_MAP_INVALIDATE_BUFFER_BIT |
-            c.GL_MAP_UNSYNCHRONIZED_BIT;
-        const ptr_raw = c.glMapBufferRange(c.GL_ARRAY_BUFFER, 0, @intCast(total_bytes), flags);
-        if (ptr_raw != null) {
-            const dst: [*]u8 = @ptrCast(ptr_raw);
-            const src: [*]const u8 = @ptrCast(self.instances.items.ptr);
-            @memcpy(dst[0..total_bytes], src[0..total_bytes]);
-            _ = c.glUnmapBuffer(c.GL_ARRAY_BUFFER);
-        } else {
-            c.glBufferData(
-                c.GL_ARRAY_BUFFER,
-                @intCast(total_bytes),
-                self.instances.items.ptr,
-                c.GL_STREAM_DRAW,
-            );
-        }
+        _ = self.tri.upload(std.mem.sliceAsBytes(self.instances.items));
     }
 
     /// Upload the built instance list and issue the three kind draws.
@@ -1029,7 +982,7 @@ pub const EditorPass = struct {
         c.glUniform1i(self.u_atlas, 0);
         c.glUniform4fv(self.u_default_bg, 1, &self.default_bg);
         c.glUniform1i(self.u_blend_mode, @intFromEnum(self.blend_mode));
-        c.glBindVertexArray(self.vaos[self.vbo_slot]);
+        c.glBindVertexArray(self.tri.vao());
         c.glEnable(c.GL_BLEND);
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
         const n: c_int = @intCast(self.instances.items.len);

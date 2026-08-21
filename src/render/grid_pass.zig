@@ -401,17 +401,9 @@ pub const GridPass = struct {
     /// this, every closed pane leaks one program + VAO + VBO into the
     /// window's shared GL context.
     pub fn releaseGL(self: *GridPass) void {
-        if (self.program != 0) {
-            c.glDeleteProgram(self.program);
-        }
-        if (self.vao != 0) {
-            var v = self.vao;
-            c.glDeleteVertexArrays(1, &v);
-        }
-        if (self.vbo != 0) {
-            var b = self.vbo;
-            c.glDeleteBuffers(1, &b);
-        }
+        gl.deleteProgram(&self.program);
+        gl.deleteVertexArray(&self.vao);
+        gl.deleteBuffer(&self.vbo);
         self.forgetGL();
     }
 
@@ -435,30 +427,25 @@ pub const GridPass = struct {
         c.glGenBuffers(1, &self.vbo);
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
 
-        const stride: c_int = @sizeOf(Vertex);
-        const fields = [_]struct { name: [*:0]const u8, off: usize, count: c_int }{
-            .{ .name = "a_pos", .off = @offsetOf(Vertex, "pos"), .count = 2 },
-            .{ .name = "a_uv", .off = @offsetOf(Vertex, "uv"), .count = 3 },
-            .{ .name = "a_color", .off = @offsetOf(Vertex, "color"), .count = 4 },
-            .{ .name = "a_is_glyph", .off = @offsetOf(Vertex, "is_glyph"), .count = 1 },
-            .{ .name = "a_dim", .off = @offsetOf(Vertex, "dim"), .count = 1 },
-            .{ .name = "a_italic", .off = @offsetOf(Vertex, "italic"), .count = 1 },
-            .{ .name = "a_bold", .off = @offsetOf(Vertex, "bold"), .count = 1 },
-            .{ .name = "a_baseline_y", .off = @offsetOf(Vertex, "baseline_y"), .count = 1 },
-            .{ .name = "a_colored", .off = @offsetOf(Vertex, "colored"), .count = 1 },
-            .{ .name = "a_bg", .off = @offsetOf(Vertex, "bg"), .count = 3 },
-            .{ .name = "a_curly", .off = @offsetOf(Vertex, "curly"), .count = 3 },
-        };
-        for (fields) |f| {
-            const loc = c.glGetAttribLocation(self.program, f.name);
-            if (loc < 0) continue;
-            const idx: c_uint = @intCast(loc);
-            c.glEnableVertexAttribArray(idx);
-            c.glVertexAttribPointer(idx, f.count, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(f.off));
-        }
+        gl.bindAttribs(self.program, @sizeOf(Vertex), &ATTRIBS, false);
 
         c.glBindVertexArray(0);
     }
+
+    /// Per-vertex attribute layout; must match `Vertex`.
+    const ATTRIBS = [_]gl.Attrib{
+        .{ .name = "a_pos", .off = @offsetOf(Vertex, "pos"), .count = 2 },
+        .{ .name = "a_uv", .off = @offsetOf(Vertex, "uv"), .count = 3 },
+        .{ .name = "a_color", .off = @offsetOf(Vertex, "color"), .count = 4 },
+        .{ .name = "a_is_glyph", .off = @offsetOf(Vertex, "is_glyph"), .count = 1 },
+        .{ .name = "a_dim", .off = @offsetOf(Vertex, "dim"), .count = 1 },
+        .{ .name = "a_italic", .off = @offsetOf(Vertex, "italic"), .count = 1 },
+        .{ .name = "a_bold", .off = @offsetOf(Vertex, "bold"), .count = 1 },
+        .{ .name = "a_baseline_y", .off = @offsetOf(Vertex, "baseline_y"), .count = 1 },
+        .{ .name = "a_colored", .off = @offsetOf(Vertex, "colored"), .count = 1 },
+        .{ .name = "a_bg", .off = @offsetOf(Vertex, "bg"), .count = 3 },
+        .{ .name = "a_curly", .off = @offsetOf(Vertex, "curly"), .count = 3 },
+    };
 
     /// Build the vertex buffer for the current screen state.
     /// `focused` adds a thin accent border at the pane edges.

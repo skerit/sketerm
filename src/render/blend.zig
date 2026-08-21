@@ -181,23 +181,11 @@ pub const LinearTarget = struct {
     /// Delete GL objects — the caller must have the owning context
     /// current.
     pub fn releaseGL(self: *LinearTarget) void {
-        if (self.fbo != 0) {
-            var f = self.fbo;
-            c.glDeleteFramebuffers(1, &f);
-        }
-        if (self.tex != 0) {
-            var t = self.tex;
-            c.glDeleteTextures(1, &t);
-        }
-        if (self.vbo != 0) {
-            var b = self.vbo;
-            c.glDeleteBuffers(1, &b);
-        }
-        if (self.vao != 0) {
-            var v = self.vao;
-            c.glDeleteVertexArrays(1, &v);
-        }
-        if (self.program != 0) c.glDeleteProgram(self.program);
+        gl.deleteFramebuffer(&self.fbo);
+        gl.deleteTexture(&self.tex);
+        gl.deleteBuffer(&self.vbo);
+        gl.deleteVertexArray(&self.vao);
+        gl.deleteProgram(&self.program);
         self.forgetGL();
     }
 
@@ -214,12 +202,9 @@ pub const LinearTarget = struct {
         c.glBindVertexArray(self.vao);
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
         c.glBufferData(c.GL_ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, c.GL_STATIC_DRAW);
-        const loc = c.glGetAttribLocation(self.program, "a_pos");
-        if (loc >= 0) {
-            const l: c_uint = @intCast(loc);
-            c.glEnableVertexAttribArray(l);
-            c.glVertexAttribPointer(l, 2, c.GL_FLOAT, c.GL_FALSE, 0, null);
-        }
+        gl.bindAttribs(self.program, 0, &.{
+            .{ .name = "a_pos", .count = 2 },
+        }, false);
         c.glBindVertexArray(0);
         return true;
     }

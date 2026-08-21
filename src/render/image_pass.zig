@@ -79,17 +79,9 @@ pub const ImagePass = struct {
     /// signal is the last opportunity. Without this, every closed
     /// pane leaks 1 program + 1 VAO + 1 VBO into the shared context.
     pub fn releaseGL(self: *ImagePass) void {
-        if (self.program != 0) {
-            c.glDeleteProgram(self.program);
-        }
-        if (self.vao != 0) {
-            var v = self.vao;
-            c.glDeleteVertexArrays(1, &v);
-        }
-        if (self.vbo != 0) {
-            var b = self.vbo;
-            c.glDeleteBuffers(1, &b);
-        }
+        gl.deleteProgram(&self.program);
+        gl.deleteVertexArray(&self.vao);
+        gl.deleteBuffer(&self.vbo);
         self.forgetGL();
     }
 
@@ -108,18 +100,10 @@ pub const ImagePass = struct {
         c.glGenBuffers(1, &self.vbo);
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
 
-        const stride: c_int = @sizeOf(Vertex);
-        const fields = [_]struct { name: [*:0]const u8, off: usize, count: c_int }{
+        gl.bindAttribs(self.program, @sizeOf(Vertex), &.{
             .{ .name = "a_pos", .off = @offsetOf(Vertex, "pos"), .count = 2 },
             .{ .name = "a_uv", .off = @offsetOf(Vertex, "uv"), .count = 2 },
-        };
-        for (fields) |f| {
-            const loc = c.glGetAttribLocation(self.program, f.name);
-            if (loc < 0) continue;
-            const idx: c_uint = @intCast(loc);
-            c.glEnableVertexAttribArray(idx);
-            c.glVertexAttribPointer(idx, f.count, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(f.off));
-        }
+        }, false);
         c.glBindVertexArray(0);
     }
 

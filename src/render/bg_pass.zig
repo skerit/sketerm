@@ -113,19 +113,10 @@ pub const BgPass = struct {
     }
 
     pub fn releaseGL(self: *BgPass) void {
-        if (self.program != 0) c.glDeleteProgram(self.program);
-        if (self.vao != 0) {
-            var v = self.vao;
-            c.glDeleteVertexArrays(1, &v);
-        }
-        if (self.vbo != 0) {
-            var b = self.vbo;
-            c.glDeleteBuffers(1, &b);
-        }
-        if (self.tex != 0) {
-            var t = self.tex;
-            c.glDeleteTextures(1, &t);
-        }
+        gl.deleteProgram(&self.program);
+        gl.deleteVertexArray(&self.vao);
+        gl.deleteBuffer(&self.vbo);
+        gl.deleteTexture(&self.tex);
         self.forgetGL();
     }
 
@@ -148,12 +139,9 @@ pub const BgPass = struct {
         c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbo);
         const quad = [_]f32{ -1, -1, 1, -1, -1, 1, 1, -1, 1, 1, -1, 1 };
         c.glBufferData(c.GL_ARRAY_BUFFER, @sizeOf(@TypeOf(quad)), &quad, c.GL_STATIC_DRAW);
-        const a_pos_loc = c.glGetAttribLocation(self.program, "a_pos");
-        if (a_pos_loc >= 0) {
-            const a_pos: c_uint = @intCast(a_pos_loc);
-            c.glEnableVertexAttribArray(a_pos);
-            c.glVertexAttribPointer(a_pos, 2, c.GL_FLOAT, c.GL_FALSE, 2 * @sizeOf(f32), null);
-        }
+        gl.bindAttribs(self.program, 2 * @sizeOf(f32), &.{
+            .{ .name = "a_pos", .count = 2 },
+        }, false);
         c.glBindVertexArray(0);
     }
 

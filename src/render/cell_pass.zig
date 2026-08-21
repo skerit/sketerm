@@ -255,26 +255,9 @@ pub const FRAG_SRC = blend.GLSL_HELPERS ++ style_util.DECO_GLSL ++ std.fmt.compt
 
 pub const CellPass = struct {
     program: c_uint = 0,
-    /// Three rotating VAO/VBO pairs. Frame N writes to (and draws
-    /// from) slot (N mod 3); the next frame advances. By the time
-    /// the CPU cycles back to a slot, the GPU finished reading it
-    /// ~3 frames ago, so `glBufferData` on it never hits Mesa's
-    /// implicit CPU↔GPU sync. The single-VBO orphan-and-upload
-    /// alternative was stalling the main thread 5-8 ms per frame
-    /// during heavy htop activity (freezing GTK chrome dispatch on
-    /// the same surface). Kitty / Alacritty use the same approach.
-    /// Each VAO records its OWN VBO binding for vertex attributes,
-    /// so we configure each VAO once at realize and just bind the
-    /// right VAO at draw time — no per-frame attrib re-binding.
-    vaos: [3]c_uint = .{ 0, 0, 0 },
-    vbos: [3]c_uint = .{ 0, 0, 0 },
-    /// Allocated storage size per slot, in bytes. Tracked separately
-    /// so the first visit to each slot does an actual `glBufferData`
-    /// (allocate) and subsequent visits use map+invalidate (reuse).
-    vbo_caps: [3]usize = .{ 0, 0, 0 },
-    /// Slot used by the most recent upload + draw. The next render
-    /// advances to `(slot + 1) % 3` before uploading.
-    vbo_slot: u8 = 0,
+    /// Rotating triple VAO/VBO set. `gl.TripleBuf` documents why
+    /// three slots (Mesa's implicit CPU<->GPU sync on buffer reuse).
+    tri: gl.TripleBuf = .{},
     u_screen_px: c_int = -1,
     u_atlas: c_int = -1,
     u_kind: c_int = -1,
@@ -379,10 +362,7 @@ pub const CellPass = struct {
 
     pub fn forgetGL(self: *CellPass) void {
         self.program = 0;
-        @memset(&self.vaos, 0);
-        @memset(&self.vbos, 0);
-        @memset(&self.vbo_caps, 0);
-        self.vbo_slot = 0;
+        self.tri.forget();
         self.u_screen_px = -1;
         self.u_atlas = -1;
         self.u_kind = -1;
@@ -399,13 +379,8 @@ pub const CellPass = struct {
     /// signal is the last opportunity. Without this, every closed
     /// pane leaks 1 program + 3 VAOs + 3 VBOs into the shared context.
     pub fn releaseGL(self: *CellPass) void {
-        if (self.program != 0) {
-            c.glDeleteProgram(self.program);
-        }
-        // 3 VAOs + 3 VBOs from the rotating slots, all in flat arrays.
-        // glDelete* tolerates id == 0, so we can pass the whole array.
-        c.glDeleteVertexArrays(3, &self.vaos[0]);
-        c.glDeleteBuffers(3, &self.vbos[0]);
+        gl.deleteProgram(&self.program);
+        self.tri.release();
         self.forgetGL();
     }
 
@@ -421,52 +396,28 @@ pub const CellPass = struct {
         self.u_blend_mode = c.glGetUniformLocation(self.program, "u_blend_mode");
 
         // Three independent VAO+VBO pairs, each pre-configured with
-        // the same vertex attribute layout. We rotate slots per frame
-        // (see `uploadDirtyRows`) to dodge Mesa's implicit CPU↔GPU
-        // sync on buffer reuse.
-        c.glGenVertexArrays(3, &self.vaos[0]);
-        c.glGenBuffers(3, &self.vbos[0]);
-        for (0..3) |i| {
-            c.glBindVertexArray(self.vaos[i]);
-            c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbos[i]);
-            self.bindVertexAttribs();
-        }
-        c.glBindVertexArray(0);
+        // the same vertex attribute layout (gl.TripleBuf).
+        self.tri.realize(self.program, @sizeOf(Instance), &ATTRIBS);
     }
 
-    /// (Re)set per-instance vertex attribute pointers against the
-    /// currently-bound VBO. Must be called at realize-time AND every
-    /// time the underlying VBO is recreated (the VAO records buffer
-    /// names per attribute — recreating without re-binding leaves
-    /// attributes pointing at the freed buffer → SIGSEGV on draw).
-    fn bindVertexAttribs(self: *CellPass) void {
-        const stride: c_int = @sizeOf(Instance);
-        const fields = [_]struct { name: [:0]const u8, off: usize, count: c_int }{
-            .{ .name = "a_cell_xy", .off = @offsetOf(Instance, "cell_xy"), .count = 2 },
-            .{ .name = "a_cell_size", .off = @offsetOf(Instance, "cell_size"), .count = 2 },
-            .{ .name = "a_bg", .off = @offsetOf(Instance, "bg"), .count = 4 },
-            .{ .name = "a_fg", .off = @offsetOf(Instance, "fg"), .count = 4 },
-            .{ .name = "a_glyph_xy", .off = @offsetOf(Instance, "glyph_xy"), .count = 2 },
-            .{ .name = "a_glyph_size", .off = @offsetOf(Instance, "glyph_size"), .count = 2 },
-            .{ .name = "a_glyph_uv0", .off = @offsetOf(Instance, "glyph_uv0"), .count = 2 },
-            .{ .name = "a_glyph_uv1", .off = @offsetOf(Instance, "glyph_uv1"), .count = 2 },
-            .{ .name = "a_glyph_layer", .off = @offsetOf(Instance, "glyph_layer"), .count = 1 },
-            .{ .name = "a_has_glyph", .off = @offsetOf(Instance, "has_glyph"), .count = 1 },
-            .{ .name = "a_deco", .off = @offsetOf(Instance, "deco"), .count = 1 },
-            .{ .name = "a_italic", .off = @offsetOf(Instance, "italic"), .count = 1 },
-            .{ .name = "a_bold", .off = @offsetOf(Instance, "bold"), .count = 1 },
-            .{ .name = "a_colored", .off = @offsetOf(Instance, "colored"), .count = 1 },
-            .{ .name = "a_deco_color", .off = @offsetOf(Instance, "deco_color"), .count = 4 },
-        };
-        for (fields) |f| {
-            const loc = c.glGetAttribLocation(self.program, f.name.ptr);
-            if (loc < 0) continue;
-            const idx: c_uint = @intCast(loc);
-            c.glEnableVertexAttribArray(idx);
-            c.glVertexAttribPointer(idx, f.count, c.GL_FLOAT, c.GL_FALSE, stride, @ptrFromInt(f.off));
-            c.glVertexAttribDivisor(idx, 1);
-        }
-    }
+    /// Per-instance vertex attribute layout; must match `Instance`.
+    const ATTRIBS = [_]gl.Attrib{
+        .{ .name = "a_cell_xy", .off = @offsetOf(Instance, "cell_xy"), .count = 2 },
+        .{ .name = "a_cell_size", .off = @offsetOf(Instance, "cell_size"), .count = 2 },
+        .{ .name = "a_bg", .off = @offsetOf(Instance, "bg"), .count = 4 },
+        .{ .name = "a_fg", .off = @offsetOf(Instance, "fg"), .count = 4 },
+        .{ .name = "a_glyph_xy", .off = @offsetOf(Instance, "glyph_xy"), .count = 2 },
+        .{ .name = "a_glyph_size", .off = @offsetOf(Instance, "glyph_size"), .count = 2 },
+        .{ .name = "a_glyph_uv0", .off = @offsetOf(Instance, "glyph_uv0"), .count = 2 },
+        .{ .name = "a_glyph_uv1", .off = @offsetOf(Instance, "glyph_uv1"), .count = 2 },
+        .{ .name = "a_glyph_layer", .off = @offsetOf(Instance, "glyph_layer"), .count = 1 },
+        .{ .name = "a_has_glyph", .off = @offsetOf(Instance, "has_glyph"), .count = 1 },
+        .{ .name = "a_deco", .off = @offsetOf(Instance, "deco"), .count = 1 },
+        .{ .name = "a_italic", .off = @offsetOf(Instance, "italic"), .count = 1 },
+        .{ .name = "a_bold", .off = @offsetOf(Instance, "bold"), .count = 1 },
+        .{ .name = "a_colored", .off = @offsetOf(Instance, "colored"), .count = 1 },
+        .{ .name = "a_deco_color", .off = @offsetOf(Instance, "deco_color"), .count = 4 },
+    };
 
     /// Re-allocate the instance buffer when grid size changes.
     fn ensureCapacity(self: *CellPass, rows: u16, cols: u16) !void {
@@ -837,50 +788,9 @@ pub const CellPass = struct {
     }
 
     fn uploadDirtyRows(self: *CellPass) !void {
-        if (self.vbos[0] == 0) return;
-        const total_bytes: usize = self.instances.items.len * @sizeOf(Instance);
-        if (total_bytes == 0) return;
-
-        // Advance to the next slot. With 3 slots and our render rate,
-        // the GPU is long done with whatever was in this slot.
-        self.vbo_slot = (self.vbo_slot + 1) % 3;
-        const slot: usize = self.vbo_slot;
-
-        c.glBindBuffer(c.GL_ARRAY_BUFFER, self.vbos[slot]);
-
-        // Allocate storage on the very first visit to each slot —
-        // subsequent calls reuse it via map+invalidate.
-        if (self.vbo_caps[slot] < total_bytes) {
-            c.glBufferData(c.GL_ARRAY_BUFFER, @intCast(total_bytes), null, c.GL_STREAM_DRAW);
-            self.vbo_caps[slot] = total_bytes;
-        }
-
-        // glMapBufferRange + INVALIDATE_BUFFER_BIT + UNSYNCHRONIZED_BIT
-        // is the documented fastest streaming-upload path. INVALIDATE
-        // tells the driver we don't need the existing contents (so it
-        // won't preserve them); UNSYNCHRONIZED tells it not to wait
-        // for pending GPU work referencing the buffer (we guarantee
-        // that with the slot rotation above). With both flags Mesa
-        // hands us a fresh memory region without any client-server
-        // round-trip.
-        const flags: c.GLbitfield = c.GL_MAP_WRITE_BIT |
-            c.GL_MAP_INVALIDATE_BUFFER_BIT |
-            c.GL_MAP_UNSYNCHRONIZED_BIT;
-        const ptr_raw = c.glMapBufferRange(c.GL_ARRAY_BUFFER, 0, @intCast(total_bytes), flags);
-        if (ptr_raw != null) {
-            const dst: [*]u8 = @ptrCast(ptr_raw);
-            const src: [*]const u8 = @ptrCast(self.instances.items.ptr);
-            @memcpy(dst[0..total_bytes], src[0..total_bytes]);
-            _ = c.glUnmapBuffer(c.GL_ARRAY_BUFFER);
-        } else {
-            // Fallback if mapping fails for any reason — full re-upload.
-            c.glBufferData(
-                c.GL_ARRAY_BUFFER,
-                @intCast(total_bytes),
-                self.instances.items.ptr,
-                c.GL_STREAM_DRAW,
-            );
-        }
+        // Row flags stay set when nothing was uploaded (unrealized /
+        // empty), so the rows retry on the next frame.
+        if (!self.tri.upload(std.mem.sliceAsBytes(self.instances.items))) return;
         for (self.row_needs_upload.items) |*r| r.* = false;
     }
 
@@ -904,7 +814,7 @@ pub const CellPass = struct {
         c.glUniform1i(self.u_atlas, 0);
 
         // Bind the VAO that matches the slot the upload just wrote.
-        c.glBindVertexArray(self.vaos[self.vbo_slot]);
+        c.glBindVertexArray(self.tri.vao());
         c.glEnable(c.GL_BLEND);
         c.glBlendFunc(c.GL_SRC_ALPHA, c.GL_ONE_MINUS_SRC_ALPHA);
 
