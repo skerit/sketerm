@@ -333,18 +333,18 @@ fn audioStage(allocator: std.mem.Allocator, sock_path: []const u8, session_name:
     defer descriptors.deinit(a);
     if (descriptors.payload.len < 4 or std.mem.readInt(u32, descriptors.payload[0..4], .little) != channel.id)
         fail("audio: descriptors arrived on the wrong channel");
-    const opened = pulse.peelUnit(descriptors.payload[4..]) orelse fail("audio: missing open descriptor");
+    const opened = (pulse.peelUnit(descriptors.payload[4..]) catch fail("audio: missing open descriptor")) orelse fail("audio: missing open descriptor");
     if (opened.tag != .open) fail("audio: first replayed unit was not open");
-    const metadata = pulse.peelUnit(descriptors.payload[4 + opened.consumed ..]) orelse fail("audio: missing metadata descriptor");
+    const metadata = (pulse.peelUnit(descriptors.payload[4 + opened.consumed ..]) catch fail("audio: missing metadata descriptor")) orelse fail("audio: missing metadata descriptor");
     if (metadata.tag != .metadata) fail("audio: metadata did not follow open");
-    const cork = pulse.peelUnit(descriptors.payload[4 + opened.consumed + metadata.consumed ..]) orelse fail("audio: missing cork descriptor");
+    const cork = (pulse.peelUnit(descriptors.payload[4 + opened.consumed + metadata.consumed ..]) catch fail("audio: missing cork descriptor")) orelse fail("audio: missing cork descriptor");
     if (cork.tag != .cork or cork.payload.len < 5 or cork.payload[4] != 0) fail("audio: initial cork state was not replayed");
 
     paDataSend(fd, a, 0, "\x01\x02\x03\x04");
     const pcm = viewer.recvExpectFor(&.{.chan_data}, 15_000) catch fail("audio: subscribed viewer did not receive PCM");
     defer pcm.deinit(a);
     if (pcm.payload.len < 4) fail("audio: malformed PCM channel data");
-    const pcm_unit = pulse.peelUnit(pcm.payload[4..]) orelse fail("audio: malformed PCM unit");
+    const pcm_unit = (pulse.peelUnit(pcm.payload[4..]) catch fail("audio: malformed PCM unit")) orelse fail("audio: malformed PCM unit");
     if (pcm_unit.tag != .pcm) fail("audio: PCM overtook stream descriptors");
 
     // Reattaching on the same subscribed connection keeps audio_ok set.
@@ -359,11 +359,11 @@ fn audioStage(allocator: std.mem.Allocator, sock_path: []const u8, session_name:
     if (reopened_channel.id != channel.id or reopened_channel.kind != .audio) fail("audio: wrong reattached audio channel");
     reopened.deinit(a);
     const replayed = viewer.recvExpectFor(&.{.chan_data}, 15_000) catch fail("audio: subscribed reattach descriptors were overtaken");
-    const replayed_unit = if (replayed.payload.len >= 4) pulse.peelUnit(replayed.payload[4..]) else null;
+    const replayed_unit = if (replayed.payload.len >= 4) pulse.peelUnit(replayed.payload[4..]) catch null else null;
     if (replayed_unit == null or replayed_unit.?.tag != .open) fail("audio: subscribed reattach did not replay descriptors first");
     replayed.deinit(a);
     const replayed_pcm = viewer.recvExpectFor(&.{.chan_data}, 15_000) catch fail("audio: PCM missing after subscribed reattach descriptors");
-    const replayed_pcm_unit = if (replayed_pcm.payload.len >= 4) pulse.peelUnit(replayed_pcm.payload[4..]) else null;
+    const replayed_pcm_unit = if (replayed_pcm.payload.len >= 4) pulse.peelUnit(replayed_pcm.payload[4..]) catch null else null;
     if (replayed_pcm_unit == null or replayed_pcm_unit.?.tag != .pcm) fail("audio: subscribed reattach descriptor order was malformed");
     replayed_pcm.deinit(a);
 

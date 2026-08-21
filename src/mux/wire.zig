@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const Event = @import("../parser/event.zig").Event;
+const framing = @import("../util/framing.zig");
 
 /// Version 2 adds the byte-channel frame envelope. Individual channel
 /// kinds remain gated until the profile that defined their payload.
@@ -452,7 +453,14 @@ pub fn decodeChanId(payload: []const u8) ?u32 {
     return std.mem.readInt(u32, payload[0..4], .little);
 }
 
-pub const MAX_FRAME = 16 << 20; // images can be chunky; bound anyway
+/// Images can be chunky; bound anyway. The shared default, so the
+/// wayland pipe and the audio units cannot silently disagree with it.
+pub const MAX_FRAME = framing.max_frame;
+
+/// u32 length (counting the type byte) + u8 frame type.
+pub const header_size = framing.header_size;
+
+const Framing = framing.Framing(FrameType, MAX_FRAME);
 
 /// Independent capability version for panel RPC; it does not alter the
 /// terminal snapshot/event profile selected by PROTO_VERSION.
@@ -784,13 +792,7 @@ pub fn applyEventFrame(
 /// Write one frame (type + payload) to a buffer: u32 len, u8 type,
 /// payload. `len` covers type + payload.
 pub fn appendFrame(out: *std.ArrayList(u8), allocator: std.mem.Allocator, ftype: FrameType, payload: []const u8) !void {
-    const start = out.items.len;
-    errdefer out.shrinkRetainingCapacity(start);
-    var hdr: [5]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len + 1), .little);
-    hdr[4] = @intFromEnum(ftype);
-    try out.appendSlice(allocator, &hdr);
-    try out.appendSlice(allocator, payload);
+    try Framing.append(out, allocator, ftype, payload);
 }
 
 /// Parsed frame view into the input buffer (payload not copied).
@@ -802,17 +804,10 @@ pub const Frame = struct {
 /// Try to split one frame off `bytes`. Returns null when incomplete.
 /// On success, `consumed` is the total size to drop from the stream.
 pub fn peelFrame(bytes: []const u8) error{ TooLong, Malformed }!?struct { frame: Frame, consumed: usize } {
-    if (bytes.len < 5) return null;
-    const len = std.mem.readInt(u32, bytes[0..4], .little);
-    if (len == 0) return error.Malformed;
-    if (len > MAX_FRAME) return error.TooLong;
-    if (bytes.len < 4 + len) return null;
+    const p = (try Framing.peel(bytes)) orelse return null;
     return .{
-        .frame = .{
-            .ftype = @enumFromInt(bytes[4]),
-            .payload = bytes[5 .. 4 + len],
-        },
-        .consumed = 4 + len,
+        .frame = .{ .ftype = p.tag, .payload = p.payload },
+        .consumed = p.consumed,
     };
 }
 
@@ -821,7 +816,7 @@ pub fn peelFrame(bytes: []const u8) error{ TooLong, Malformed }!?struct { frame:
 /// complete frame — only useful for "stuck at N of M" diagnostics.
 pub fn partialInfo(bytes: []const u8) ?struct { expected: usize, have: usize } {
     if (bytes.len == 0) return null;
-    if (bytes.len < 5) return .{ .expected = 5, .have = bytes.len };
+    if (bytes.len < header_size) return .{ .expected = header_size, .have = bytes.len };
     const len = std.mem.readInt(u32, bytes[0..4], .little);
     if (bytes.len >= 4 + @as(usize, len)) return null; // complete
     return .{ .expected = 4 + @as(usize, len), .have = bytes.len };
@@ -1449,3 +1444,27 @@ pub const SessionInfo = struct {
     viewers: u32 = 0,
     controller: []const u8 = "",
 };
+
+test "frame header bytes are the frozen 5-byte layout" {
+    // Hand-written, NOT derived from the encoder: this is the wire
+    // format, and moving the framing into util/framing.zig must not
+    // have moved a single byte.
+    const t = std.testing;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t.allocator);
+
+    try appendFrame(&out, t.allocator, .input, "hi");
+    try t.expectEqualSlices(u8, &.{
+        0x03, 0x00, 0x00, 0x00, // u32 LE length, counting the type byte
+        0x04, // FrameType.input
+        'h', 'i',
+    }, out.items);
+
+    // An empty payload is length 1, and peels back identically.
+    out.clearRetainingCapacity();
+    try appendFrame(&out, t.allocator, .detach, "");
+    try t.expectEqualSlices(u8, &.{ 0x01, 0x00, 0x00, 0x00, 0x06 }, out.items);
+    const p = (try peelFrame(out.items)).?;
+    try t.expectEqual(FrameType.detach, p.frame.ftype);
+    try t.expectEqual(@as(usize, header_size), p.consumed);
+}

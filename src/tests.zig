@@ -15,6 +15,7 @@ comptime {
     _ = @import("util/pathz.zig");
     _ = @import("util/atomicwrite.zig");
     _ = @import("util/filehash.zig");
+    _ = @import("util/framing.zig");
     _ = @import("util/shellquote.zig");
     _ = @import("util/humantype.zig");
     _ = @import("util/platform.zig");

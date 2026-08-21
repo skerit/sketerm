@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const zpool = @import("../wlhost/zpool.zig");
+const framing = @import("../util/framing.zig");
 const pixcodec = @import("../wlhost/pixcodec.zig");
 
 pub const Tag = enum(u8) {
@@ -64,31 +65,27 @@ pub const Tag = enum(u8) {
     _,
 };
 
-pub const header_size = 5;
-pub const max_unit = 64 << 20; // 5K BGRA window ≈ 59 MB; bound anyway
+pub const header_size = framing.header_size;
+/// Deliberately LARGER than framing.max_frame: a 5K BGRA window
+/// is about 59 MB and arrives as one unit.
+pub const max_unit = 64 << 20;
 
 pub const Unit = struct {
     tag: Tag,
     payload: []const u8,
 };
 
+const Framing = framing.Framing(Tag, max_unit);
+
 pub fn appendUnit(out: *std.ArrayList(u8), allocator: std.mem.Allocator, tag: Tag, payload: []const u8) !void {
-    var hdr: [header_size]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len + 1), .little);
-    hdr[4] = @intFromEnum(tag);
-    try out.appendSlice(allocator, &hdr);
-    try out.appendSlice(allocator, payload);
+    try Framing.append(out, allocator, tag, payload);
 }
 
 pub fn peelUnit(bytes: []const u8) error{ Malformed, TooLong }!?struct { unit: Unit, consumed: usize } {
-    if (bytes.len < header_size) return null;
-    const len = std.mem.readInt(u32, bytes[0..4], .little);
-    if (len == 0) return error.Malformed;
-    if (len > max_unit) return error.TooLong;
-    if (bytes.len < 4 + len) return null;
+    const p = (try Framing.peel(bytes)) orelse return null;
     return .{
-        .unit = .{ .tag = @enumFromInt(bytes[4]), .payload = bytes[5 .. 4 + len] },
-        .consumed = 4 + len,
+        .unit = .{ .tag = p.tag, .payload = p.payload },
+        .consumed = p.consumed,
     };
 }
 
@@ -98,8 +95,7 @@ pub const WinOpen = struct { win: u32, w: i32, h: i32, title: []const u8 };
 
 pub fn appendWinOpen(out: *std.ArrayList(u8), a: std.mem.Allocator, v: WinOpen) !void {
     var hdr: [header_size + 12]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(12 + v.title.len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.win_open);
+    Framing.writeHeader(hdr[0..header_size], Tag.win_open, 12 + v.title.len);
     std.mem.writeInt(u32, hdr[5..9], v.win, .little);
     std.mem.writeInt(i32, hdr[9..13], v.w, .little);
     std.mem.writeInt(i32, hdr[13..17], v.h, .little);
@@ -121,8 +117,7 @@ pub const Frame = struct { win: u32, w: i32, h: i32, pixels: []const u8 };
 
 pub fn appendFrame(out: *std.ArrayList(u8), a: std.mem.Allocator, v: Frame) !void {
     var hdr: [header_size + 12]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(12 + v.pixels.len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.win_frame);
+    Framing.writeHeader(hdr[0..header_size], Tag.win_frame, 12 + v.pixels.len);
     std.mem.writeInt(u32, hdr[5..9], v.win, .little);
     std.mem.writeInt(i32, hdr[9..13], v.w, .little);
     std.mem.writeInt(i32, hdr[13..17], v.h, .little);
@@ -150,8 +145,7 @@ pub const FrameZ = struct { win: u32, w: i32, h: i32, raw_len: u32, z: []const u
 
 pub fn appendFrameZ(out: *std.ArrayList(u8), a: std.mem.Allocator, v: FrameZ) !void {
     var hdr: [header_size + 16]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(16 + v.z.len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.win_frame_z);
+    Framing.writeHeader(hdr[0..header_size], Tag.win_frame_z, 16 + v.z.len);
     std.mem.writeInt(u32, hdr[5..9], v.win, .little);
     std.mem.writeInt(i32, hdr[9..13], v.w, .little);
     std.mem.writeInt(i32, hdr[13..17], v.h, .little);
@@ -227,8 +221,7 @@ pub fn appendWinFrameC(out: *std.ArrayList(u8), a: std.mem.Allocator, win: u32, 
     const row_stride: u32 = @intCast(@as(i64, w) * 4);
     const payload_len = 12 + pixcodec.body_header + enc.bytes.len;
     var hdr: [header_size + 12]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(payload_len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.win_frame_c);
+    Framing.writeHeader(hdr[0..header_size], Tag.win_frame_c, payload_len);
     std.mem.writeInt(u32, hdr[5..9], win, .little);
     std.mem.writeInt(i32, hdr[9..13], w, .little);
     std.mem.writeInt(i32, hdr[13..17], h, .little);
@@ -272,8 +265,7 @@ pub fn decodeFrameC(payload: []const u8, scratch: *std.ArrayList(u8), scratch_a:
 pub fn appendWinPatchC(out: *std.ArrayList(u8), a: std.mem.Allocator, win: u32, x: i32, y: i32, w: i32, h: i32, enc: pixcodec.Encoded) !void {
     const payload_len = 20 + pixcodec.body_header + enc.bytes.len;
     var hdr: [header_size + 20]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(payload_len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.win_patch_c);
+    Framing.writeHeader(hdr[0..header_size], Tag.win_patch_c, payload_len);
     std.mem.writeInt(u32, hdr[5..9], win, .little);
     std.mem.writeInt(i32, hdr[9..13], x, .little);
     std.mem.writeInt(i32, hdr[13..17], y, .little);
@@ -319,8 +311,7 @@ pub fn decodePatchC(payload: []const u8, scratch: *std.ArrayList(u8), scratch_a:
 /// wlhost/vcodec.zig tile (appendTile output) carrying the rect + codec.
 pub fn appendWinVtile(out: *std.ArrayList(u8), a: std.mem.Allocator, win: u32, blob: []const u8) !void {
     var hdr: [header_size + 4]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(4 + blob.len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.win_vtile);
+    Framing.writeHeader(hdr[0..header_size], Tag.win_vtile, 4 + blob.len);
     std.mem.writeInt(u32, hdr[5..9], win, .little);
     try out.appendSlice(a, &hdr);
     try out.appendSlice(a, blob);
@@ -352,8 +343,7 @@ pub fn appendWinDrag(
     const n: u16 = @intCast(@min(rects.len, max_drag_rects));
     const body_len = 10 + @as(usize, n) * 8;
     var hdr: [header_size + 10]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(body_len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.win_drag);
+    Framing.writeHeader(hdr[0..header_size], Tag.win_drag, body_len);
     std.mem.writeInt(u32, hdr[5..9], win, .little);
     std.mem.writeInt(i16, hdr[9..11], ref_w, .little);
     std.mem.writeInt(i16, hdr[11..13], ref_h, .little);
@@ -657,4 +647,31 @@ test "appendFrameMaybeZ ↔ decodeFrameAny round-trips both forms" {
     try appendFrameZ(&bad, a, .{ .win = 1, .w = -1, .h = 1, .raw_len = 4, .z = "\x00" });
     const neg = (try peelUnit(bad.items)).?;
     try t.expectEqual(@as(?Frame, null), try decodeFrameAny(neg.unit.tag, neg.unit.payload, &scratch, a));
+}
+
+test "winstream unit header bytes are the frozen 5-byte layout" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t.allocator);
+
+    try appendUnit(&out, t.allocator, .close_req, "\x01\x00\x00\x00");
+    try t.expectEqualSlices(u8, &.{
+        0x05, 0x00, 0x00, 0x00,
+        0x12, // Tag.close_req
+        0x01, 0x00, 0x00, 0x00,
+    }, out.items);
+
+    out.clearRetainingCapacity();
+    try appendWinOpen(&out, t.allocator, .{ .win = 1, .w = 2, .h = 3, .title = "T" });
+    try t.expectEqualSlices(u8, &.{
+        0x0e, 0x00, 0x00, 0x00, // 12 prefix + 1 title byte + tag
+        0x01, // Tag.win_open
+        0x01, 0x00, 0x00, 0x00,
+        0x02, 0x00, 0x00, 0x00,
+        0x03, 0x00, 0x00, 0x00,
+        'T',
+    }, out.items);
+
+    try t.expectEqual(@as(usize, 5), header_size);
+    // Deliberately larger than the shared default; see the decl.
+    try t.expectEqual(@as(usize, 64 << 20), max_unit);
 }

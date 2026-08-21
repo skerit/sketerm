@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const opuscodec = @import("opuscodec.zig");
+const framing = @import("../util/framing.zig");
 
 pub const Error = error{ Protocol, OutOfMemory };
 
@@ -84,8 +85,14 @@ const CONTROL_CHANNEL: u32 = 0xffff_ffff;
 const INVALID_INDEX: u32 = 0xffff_ffff;
 const COOKIE_LEN = 256;
 const DESC_SIZE = 20;
-/// Sanity bound on one frame (pstream's own limit is 16 MB).
-const MAX_FRAME = 16 << 20;
+/// Sanity bound on one frame (pstream's own limit is 16 MB). The
+/// shared default, so this cannot drift from mux/wire.zig's.
+const MAX_FRAME = framing.max_frame;
+
+/// u32 length (counting the tag byte) + u8 unit tag.
+const header_size = framing.header_size;
+
+const Framing = framing.Framing(UnitTag, MAX_FRAME);
 
 // ── audio units (daemon ↔ viewer, inside an `audio` channel) ────
 // Same length-prefixed shape as wlhost/pipe units (u32 len LE, u8
@@ -186,23 +193,19 @@ pub fn decodeMetadata(payload: []const u8) ?struct { stream: u32, info: AudioInf
 }
 
 pub fn appendUnit(out: *std.ArrayList(u8), a: std.mem.Allocator, tag: UnitTag, payload: []const u8) !void {
-    var hdr: [5]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len + 1), .little);
-    hdr[4] = @intFromEnum(tag);
-    try out.appendSlice(a, &hdr);
-    try out.appendSlice(a, payload);
+    try Framing.append(out, a, tag, payload);
 }
 
-pub fn peelUnit(bytes: []const u8) ?struct { tag: UnitTag, payload: []const u8, consumed: usize } {
-    if (bytes.len < 5) return null;
-    const len = std.mem.readInt(u32, bytes[0..4], .little);
-    if (len == 0 or len > MAX_FRAME) return null;
-    if (bytes.len < 4 + len) return null;
-    return .{
-        .tag = @enumFromInt(bytes[4]),
-        .payload = bytes[5 .. 4 + len],
-        .consumed = 4 + len,
-    };
+/// Split one audio unit off `bytes`; null when incomplete.
+///
+/// A zero or over-bound length is `error.Malformed`/`error.TooLong`,
+/// like every other framed stream here. It used to collapse both into
+/// null, which made a corrupt length indistinguishable from "the rest
+/// is still in flight" and silently truncated the unit stream at the
+/// first bad byte with nothing logged.
+pub fn peelUnit(bytes: []const u8) error{ Malformed, TooLong }!?struct { tag: UnitTag, payload: []const u8, consumed: usize } {
+    const p = (try Framing.peel(bytes)) orelse return null;
+    return .{ .tag = p.tag, .payload = p.payload, .consumed = p.consumed };
 }
 
 // ── tagstruct writer (big-endian) ───────────────────────────────
@@ -1492,16 +1495,16 @@ test "audio metadata proplists are bounded, inherited and encoded" {
     stream_meta = .{};
     try srv.appendStreamDescriptor(&srv.units, 7, srv.streams.getPtr(7).?);
 
-    const opened = peelUnit(srv.units.items).?;
+    const opened = (try peelUnit(srv.units.items)).?;
     try t_.expectEqual(UnitTag.open, opened.tag);
-    const meta = peelUnit(srv.units.items[opened.consumed..]).?;
+    const meta = (try peelUnit(srv.units.items[opened.consumed..])).?;
     try t_.expectEqual(UnitTag.metadata, meta.tag);
     const decoded = decodeMetadata(meta.payload).?;
     try t_.expectEqual(@as(u32, 7), decoded.stream);
     try t_.expectEqualStrings("Firefox", decoded.info.application);
     try t_.expectEqualStrings("A very important call", decoded.info.media);
     try t_.expectEqual(@as(u32, 321), decoded.info.pid);
-    const cork = peelUnit(srv.units.items[opened.consumed + meta.consumed ..]).?;
+    const cork = (try peelUnit(srv.units.items[opened.consumed + meta.consumed ..])).?;
     try t_.expectEqual(UnitTag.cork, cork.tag);
     try t_.expectEqual(@as(u8, 1), cork.payload[4]);
 }
@@ -1678,7 +1681,7 @@ test "auth + client name + create stream + pcm flows to units" {
         srv.clearOut();
     }
     { // open unit went out
-        const u = peelUnit(srv.takeUnits()).?;
+        const u = (try peelUnit(srv.takeUnits())).?;
         try t_.expectEqual(UnitTag.open, u.tag);
         try t_.expectEqual(@as(u32, 48000), std.mem.readInt(u32, u.payload[6..10], .little));
         srv.clearUnits();
@@ -1695,7 +1698,7 @@ test "auth + client name + create stream + pcm flows to units" {
         try srv.feed(frame.items);
     }
     {
-        const u = peelUnit(srv.takeUnits()).?;
+        const u = (try peelUnit(srv.takeUnits())).?;
         try t_.expectEqual(UnitTag.pcm, u.tag);
         try t_.expectEqual(@as(u32, 0), std.mem.readInt(u32, u.payload[0..4], .little));
         try t_.expectEqualStrings("\x01\x02\x03\x04\x05\x06\x07\x08", u.payload[4..]);
@@ -2026,4 +2029,38 @@ test "server/sink/source/stat replies parse fully (SDL crash regression)" {
         srv.clearOut();
     }
     try t_.expect(!srv.dead);
+}
+
+test "audio unit header bytes are the frozen 5-byte layout" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t_.allocator);
+
+    try appendUnit(&out, t_.allocator, .pcm, "\x07\x00\x00\x00ab");
+    try t_.expectEqualSlices(u8, &.{
+        0x07, 0x00, 0x00, 0x00, // 6 payload bytes + tag
+        0x02, // UnitTag.pcm
+        0x07, 0x00, 0x00, 0x00, 'a', 'b',
+    }, out.items);
+
+    const p = (try peelUnit(out.items)).?;
+    try t_.expectEqual(UnitTag.pcm, p.tag);
+    try t_.expectEqual(out.items.len, p.consumed);
+    try t_.expectEqual(@as(usize, 5), header_size);
+    try t_.expectEqual(@as(usize, 16 << 20), MAX_FRAME);
+}
+
+test "audio units report a corrupt length instead of looking incomplete" {
+    // This used to be `null`, i.e. indistinguishable from "more bytes
+    // are on the way" -- the reader silently truncated its stream.
+    var over = [_]u8{ 0, 0, 0, 0, @intFromEnum(UnitTag.pcm) };
+    std.mem.writeInt(u32, over[0..4], MAX_FRAME + 1, .little);
+    try t_.expectError(error.TooLong, peelUnit(&over));
+
+    const zero = [_]u8{ 0, 0, 0, 0, @intFromEnum(UnitTag.pcm) };
+    try t_.expectError(error.Malformed, peelUnit(&zero));
+
+    // Genuinely incomplete is still null.
+    var short = [_]u8{ 0, 0, 0, 0, @intFromEnum(UnitTag.pcm) };
+    std.mem.writeInt(u32, short[0..4], 9, .little);
+    try t_.expect((try peelUnit(&short)) == null);
 }

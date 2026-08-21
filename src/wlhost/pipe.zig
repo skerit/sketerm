@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const pixcodec = @import("pixcodec.zig");
+const framing = @import("../util/framing.zig");
 
 pub const Tag = enum(u8) {
     /// Raw Wayland message, both directions.
@@ -156,27 +157,24 @@ pub const Tag = enum(u8) {
     _,
 };
 
-pub const header_size = 5;
+pub const header_size = framing.header_size;
 
 pub const Unit = struct {
     tag: Tag,
     payload: []const u8,
 };
 
+const Framing = framing.Framing(Tag, max_unit);
+
 /// Append one unit. Payload must fit u32 minus the tag byte.
 pub fn appendUnit(out: *std.ArrayList(u8), allocator: std.mem.Allocator, tag: Tag, payload: []const u8) !void {
-    var hdr: [header_size]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len + 1), .little);
-    hdr[4] = @intFromEnum(tag);
-    try out.appendSlice(allocator, &hdr);
-    try out.appendSlice(allocator, payload);
+    try Framing.append(out, allocator, tag, payload);
 }
 
 /// Convenience: unit whose payload starts with ids/sizes then bytes.
 pub fn appendPoolUpdate(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pool: u32, offset: u32, bytes: []const u8) !void {
     var hdr: [header_size + 8]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(8 + bytes.len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.pool_update);
+    Framing.writeHeader(hdr[0..header_size], Tag.pool_update, 8 + bytes.len);
     std.mem.writeInt(u32, hdr[5..9], pool, .little);
     std.mem.writeInt(u32, hdr[9..13], offset, .little);
     try out.appendSlice(allocator, &hdr);
@@ -186,8 +184,7 @@ pub fn appendPoolUpdate(out: *std.ArrayList(u8), allocator: std.mem.Allocator, p
 /// Deflated pool update; `raw_len` is the inflated size.
 pub fn appendPoolUpdateZ(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pool: u32, offset: u32, raw_len: u32, z: []const u8) !void {
     var hdr: [header_size + 12]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(12 + z.len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.pool_update_z);
+    Framing.writeHeader(hdr[0..header_size], Tag.pool_update_z, 12 + z.len);
     std.mem.writeInt(u32, hdr[5..9], pool, .little);
     std.mem.writeInt(u32, hdr[9..13], offset, .little);
     std.mem.writeInt(u32, hdr[13..17], raw_len, .little);
@@ -209,8 +206,7 @@ pub fn appendPoolUpdateC(
 ) !void {
     const payload_len = 8 + pixcodec.body_header + enc.bytes.len;
     var hdr: [header_size + 8]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(payload_len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.pool_update_c);
+    Framing.writeHeader(hdr[0..header_size], Tag.pool_update_c, payload_len);
     std.mem.writeInt(u32, hdr[5..9], pool, .little);
     std.mem.writeInt(u32, hdr[9..13], offset, .little);
     try out.appendSlice(allocator, &hdr);
@@ -235,8 +231,7 @@ pub fn decodePoolUpdateC(payload: []const u8) ?PoolUpdateC {
 pub fn appendPoolVtile(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pool: u32, offset: u32, row_stride: u32, blob: []const u8) !void {
     const payload_len = 12 + blob.len;
     var hdr: [header_size + 12]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(payload_len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.pool_vtile);
+    Framing.writeHeader(hdr[0..header_size], Tag.pool_vtile, payload_len);
     std.mem.writeInt(u32, hdr[5..9], pool, .little);
     std.mem.writeInt(u32, hdr[9..13], offset, .little);
     std.mem.writeInt(u32, hdr[13..17], row_stride, .little);
@@ -307,8 +302,7 @@ pub fn appendPoolUpdateS(
 ) !void {
     const payload_len = 12 + pixcodec.body_header + enc.bytes.len;
     var hdr: [header_size + 12]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(payload_len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.pool_update_s);
+    Framing.writeHeader(hdr[0..header_size], Tag.pool_update_s, payload_len);
     std.mem.writeInt(u64, hdr[5..13], serial, .little);
     std.mem.writeInt(u32, hdr[13..17], offset, .little);
     try out.appendSlice(allocator, &hdr);
@@ -395,8 +389,7 @@ pub fn appendSeatMods(out: *std.ArrayList(u8), a: std.mem.Allocator, depressed: 
 /// Host data dropped onto surface `sid` at surface-local (x, y).
 pub fn appendHostDrop(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32, x: f64, y: f64, mime: []const u8, data: []const u8) !void {
     var hdr: [header_size + 24]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(24 + mime.len + data.len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.host_drop);
+    Framing.writeHeader(hdr[0..header_size], Tag.host_drop, 24 + mime.len + data.len);
     std.mem.writeInt(u32, hdr[5..9], sid, .little);
     std.mem.writeInt(u64, hdr[9..17], @bitCast(x), .little);
     std.mem.writeInt(u64, hdr[17..25], @bitCast(y), .little);
@@ -418,8 +411,7 @@ pub fn appendConfigure(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32, 
 
 pub fn appendToplevelIcon(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u32, kind: u8, bytes: []const u8) !void {
     var hdr: [header_size + 5]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(5 + bytes.len + 1), .little);
-    hdr[4] = @intFromEnum(Tag.toplevel_icon);
+    Framing.writeHeader(hdr[0..header_size], Tag.toplevel_icon, 5 + bytes.len);
     std.mem.writeInt(u32, hdr[5..9], sid, .little);
     hdr[9] = kind;
     try out.appendSlice(a, &hdr);
@@ -442,22 +434,17 @@ pub fn appendForeignParent(out: *std.ArrayList(u8), a: std.mem.Allocator, sid: u
     try appendUnit(out, a, .foreign_parent, &pl);
 }
 
-pub const max_unit = 16 << 20; // matches mux MAX_FRAME; sanity bound
+/// The shared default bound; it is the SAME declaration mux/wire.zig
+/// uses for MAX_FRAME, so the two can no longer drift apart.
+pub const max_unit = framing.max_frame;
 
 /// Split one unit off `bytes`; null when incomplete. `consumed` is
 /// what to drop from the stream.
 pub fn peelUnit(bytes: []const u8) error{ Malformed, TooLong }!?struct { unit: Unit, consumed: usize } {
-    if (bytes.len < header_size) return null;
-    const len = std.mem.readInt(u32, bytes[0..4], .little);
-    if (len == 0) return error.Malformed;
-    if (len > max_unit) return error.TooLong;
-    if (bytes.len < 4 + len) return null;
+    const p = (try Framing.peel(bytes)) orelse return null;
     return .{
-        .unit = .{
-            .tag = @enumFromInt(bytes[4]),
-            .payload = bytes[5 .. 4 + len],
-        },
-        .consumed = 4 + len,
+        .unit = .{ .tag = p.tag, .payload = p.payload },
+        .consumed = p.consumed,
     };
 }
 
@@ -596,4 +583,32 @@ test "unknown tags peel cleanly for forward compat" {
 test "zero-length unit is malformed" {
     const zero = [_]u8{ 0, 0, 0, 0, 0 };
     try t.expectError(error.Malformed, peelUnit(&zero));
+}
+
+test "unit header bytes are the frozen 5-byte layout" {
+    // Hand-written expected bytes; the shared framing must not have
+    // shifted the wl pipe's wire format.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t.allocator);
+
+    try appendUnit(&out, t.allocator, .wl_msg, "abcd");
+    try t.expectEqualSlices(u8, &.{
+        0x05, 0x00, 0x00, 0x00,
+        0x01, // Tag.wl_msg
+        'a', 'b', 'c', 'd',
+    }, out.items);
+
+    // A fused header + fixed-prefix helper writes the same header.
+    out.clearRetainingCapacity();
+    try appendPoolUpdate(&out, t.allocator, 0x11223344, 0x55667788, "xy");
+    try t.expectEqualSlices(u8, &.{
+        0x0b, 0x00, 0x00, 0x00, // 8 prefix + 2 bytes + tag
+        0x03, // Tag.pool_update
+        0x44, 0x33, 0x22, 0x11,
+        0x88, 0x77, 0x66, 0x55,
+        'x', 'y',
+    }, out.items);
+
+    try t.expectEqual(@as(usize, 5), header_size);
+    try t.expectEqual(@as(usize, 16 << 20), max_unit);
 }

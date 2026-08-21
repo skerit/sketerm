@@ -236,6 +236,7 @@ comptime {
     _ = @import("util/content.zig");
     _ = @import("util/crashlog.zig");
     _ = @import("util/filehash.zig");
+    _ = @import("util/framing.zig");
     _ = @import("util/fdcancel.zig");
     _ = @import("util/humantype.zig");
     _ = @import("util/imagecodec.zig");

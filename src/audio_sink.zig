@@ -169,7 +169,12 @@ pub const AudioSink = struct {
     /// One chan_data payload from the daemon.
     pub fn feed(self: *AudioSink, bytes: []const u8) void {
         var pos: usize = 0;
-        while (pulse.peelUnit(bytes[pos..])) |p| {
+        while (pulse.peelUnit(bytes[pos..]) catch |err| {
+            // A bad length never becomes valid: stop consuming this
+            // payload. Already-decoded voices keep playing.
+            std.log.warn("audio: malformed unit stream at byte {d} ({s})", .{ pos, @errorName(err) });
+            return;
+        }) |p| {
             self.unit(p.tag, p.payload);
             pos += p.consumed;
         }

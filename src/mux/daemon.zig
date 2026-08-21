@@ -3456,7 +3456,10 @@ pub const Daemon = struct {
         const s = ch.session.?;
         const base = s.audio_capture_base orelse return;
         var pos: usize = 0;
-        while (pulse.peelUnit(bytes[pos..])) |p| {
+        while (pulse.peelUnit(bytes[pos..]) catch |err| {
+            log.warn("audio capture: malformed unit stream ({s}); rest of this payload dropped", .{@errorName(err)});
+            return;
+        }) |p| {
             pos += p.consumed;
             switch (p.tag) {
                 .open => {
@@ -3508,7 +3511,12 @@ pub const Daemon = struct {
         const srv = ch.pa.?;
         srv.now_ms = nowMs();
         var pos: usize = 0;
-        while (pulse.peelUnit(bytes[pos..])) |p| {
+        while (pulse.peelUnit(bytes[pos..]) catch |err| {
+            // Viewer-supplied bytes: a corrupt length is that client's
+            // bug, not a partial read. Stop, do not spin.
+            log.warn("audio: viewer sent a malformed unit stream ({s})", .{@errorName(err)});
+            return;
+        }) |p| {
             if (p.tag == .subscribe) {
                 cl.audio_ok = true;
                 srv.has_viewer = true;
