@@ -3171,3 +3171,113 @@ test "every tool this module serves declares an output schema" {
     }
     try std.testing.expectEqual(@as(usize, 18), seen);
 }
+
+test "parsePolicy fails closed on every unknown name, wildcard and port" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    const cases = [_]struct { json: []const u8, needle: []const u8 }{
+        .{ .json = "{\"policy\":{\"allow_hosts\":[\"*\"]}}", .needle = "allow-all" },
+        .{ .json = "{\"policy\":{\"allow_hosts\":[\"site.example:8080\"]}}", .needle = "no scheme, no port" },
+        .{ .json = "{\"policy\":{\"allow_hosts\":[\"https://site.example\"]}}", .needle = "host entry" },
+        .{ .json = "{\"policy\":{\"block_types\":[\"imgae\"]}}", .needle = "not a resource class" },
+        .{ .json = "{\"policy\":{\"allow_schemes\":[\"gopher\"]}}", .needle = "not an allowable scheme" },
+        .{ .json = "{\"policy\":{\"allow_schemes\":[]}}", .needle = "must not be empty" },
+        .{ .json = "{\"policy\":{\"max_requests\":-1}}", .needle = "non-negative" },
+        .{ .json = "{\"policy\":\"tight\"}", .needle = "must be an object" },
+    };
+    for (cases) |case| {
+        const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, case.json, .{});
+        const parsed = try parsePolicy(arena, args);
+        try t.expect(parsed == .err);
+        try t.expectEqual(mcp.ErrCode.invalid_args, parsed.err.code);
+        try t.expect(std.mem.indexOf(u8, parsed.err.text, case.needle) != null);
+    }
+
+    // Upper case folds rather than refuses; names/masks land as sent.
+    const ok_args = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        "{\"policy\":{\"allow_hosts\":[\"Site.Example\"],\"block_types\":[\"image\",\"media\"],\"allow_schemes\":[\"https\"],\"max_requests\":9,\"deadline_ms\":1500}}", .{});
+    const ok = try parsePolicy(arena, ok_args);
+    try t.expect(ok == .policy);
+    try t.expectEqualStrings("site.example", ok.policy.allow_top[0]);
+    try t.expectEqual(netpolicy.typeBit("image").? | netpolicy.typeBit("media").?, ok.policy.block_types);
+    try t.expectEqual(netpolicy.schemeBit("https").?, ok.policy.allow_schemes);
+    try t.expectEqual(@as(u32, 9), ok.policy.max_requests);
+
+    // No policy key at all is simply none — never an error.
+    const none_args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"url\":\"https://x.test\"}", .{});
+    try t.expect((try parsePolicy(arena, none_args)) == .none);
+}
+
+test "an exhausted view refuses new traffic while its reads stay loud" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var v = EXAMPLE;
+    v.policy_active = true;
+    v.policy_exhausted = "request_cap";
+    v.policy_requests = 500;
+    v.policy_bytes = 3_100_000;
+    v.policy_navigations = 2;
+
+    // The gate: a typed, non-retryable refusal naming the numbers.
+    const gate = (try policyGate(arena, v)).?;
+    try t.expectEqual(mcp.ErrCode.refused, gate.code);
+    try t.expect(std.mem.indexOf(u8, gate.text, "request_cap") != null);
+    try t.expect(std.mem.indexOf(u8, gate.text, "500 requests") != null);
+    try t.expect((try policyGate(arena, EXAMPLE)) == null);
+
+    // A read result still answers, carrying the facts and one line.
+    const shot = try snapshotResult(arena, .headless, v, "full", .{ .document = 1, .revision = 2, .tree = "[1] document" }, null, false);
+    const parsed = try mcp.expectToolResultShape(arena, "web_snapshot", shot);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expect(sc.get("policy_exhausted").?.bool);
+    try t.expectEqualStrings("request_cap", sc.get("policy_exhausted_reason").?.string);
+}
+
+test "web_policy reports the live accounting against its declared schema" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var fresh = webdrive.View{ .id = 12, .w = 800, .h = 600 };
+    fresh.pol = .{ .allow_top = &.{"example.com"}, .max_requests = 100 };
+    fresh.pol_serial = 3;
+    fresh.pol_active = true;
+    fresh.pol_requests = 42;
+    fresh.pol_bytes = 9000;
+    fresh.pol_navigations = 1;
+    fresh.pol_exhausted = @intFromEnum(web_proto.NetReason.request_cap);
+    fresh.pol_denied[@intFromEnum(web_proto.NetReason.sub_host)] = 5;
+
+    const out = try policyViewResult(arena, EXAMPLE, &fresh);
+    const parsed = try mcp.expectToolResultShape(arena, "web_policy", out);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expect(sc.get("policy_active").?.bool);
+    try t.expectEqual(@as(i64, 42), sc.get("requests").?.integer);
+    try t.expect(sc.get("exhausted").?.bool);
+    try t.expectEqualStrings("request_cap", sc.get("exhausted_reason").?.string);
+    try t.expectEqual(@as(i64, 5), sc.get("denied").?.object.get("sub_host").?.integer);
+    try t.expectEqualStrings("call", sc.get("policy_source").?.string);
+    const pol = sc.get("policy").?.object;
+    try t.expectEqualStrings("example.com", pol.get("allow_hosts").?.array.items[0].string);
+    try t.expect(!sc.get("durable").?.bool);
+}
+
+test "GUI mode refuses a policy outright: the tabs are the user's" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    const pol = webdrive.NetPolicy{ .allow_top = &.{"site.example"} };
+    const drv = Driver{ .gui = unusedBackend() };
+    const out = try openView(drv, arena, "https://site.example/", "tab", 800, 600, .default, &pol);
+    try t.expectEqual(mcp.ErrCode.unavailable, out.err.code);
+    try t.expect(std.mem.indexOf(u8, out.err.text, "headless-only") != null);
+}

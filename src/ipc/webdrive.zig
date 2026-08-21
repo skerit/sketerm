@@ -2577,3 +2577,200 @@ test "the current view is the last one touched, not the oldest" {
     eng.closeView(2);
     try std.testing.expectEqual(@as(u32, 0), eng.current);
 }
+
+test "a policied open is refused, opening nothing, without the net-policy capability" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var buf: [8192]u8 = undefined;
+
+    const pol = NetPolicy{ .allow_top = &.{"site.example"}, .max_requests = 10 };
+    try std.testing.expect(!p.eng.cap_net_policy);
+    try std.testing.expectError(error.PolicyUnsupported, p.eng.openViewIn("https://site.example/", 800, 600, .default, &pol));
+    // Fail closed: no view, and not one byte on the wire — the page was
+    // never loaded unpoliced.
+    try std.testing.expectEqual(@as(usize, 0), p.eng.views.items.len);
+    try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
+}
+
+test "net_policy_set travels strictly before view_create_url, naming the same view" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.cap_net_policy = true;
+    var buf: [16384]u8 = undefined;
+
+    const pol = NetPolicy{ .allow_top = &.{"site.example"}, .max_requests = 5, .block_ads = true };
+    const v = try p.eng.openViewIn("https://site.example/", 800, 600, .default, &pol);
+    try std.testing.expect(v.pol != null);
+    try std.testing.expect(v.pol_serial != 0);
+
+    const bytes = p.drain(&buf);
+    var reader = proto.Reader.init(bytes);
+    // Frame order IS the install-before-first-request guarantee.
+    const f1 = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.net_policy_set, f1.tag);
+    const set = try proto.NetPolicySet.decodeAlloc(f1.payload, gpa);
+    defer gpa.free(set.allow_top);
+    defer gpa.free(set.allow_sub);
+    try std.testing.expectEqual(v.id, set.view);
+    try std.testing.expectEqual(v.pol_serial, set.serial);
+    try std.testing.expectEqual(@as(u32, 5), set.max_requests);
+    try std.testing.expectEqualStrings("site.example", set.allow_top[0]);
+    // block_ads:true rides the EXISTING per-view shield switch.
+    const f2 = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.intercept_set, f2.tag);
+    const f3 = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.view_create_url, f3.tag);
+    const create = try proto.decode(proto.ViewCreateUrl, f3.payload);
+    try std.testing.expectEqual(v.id, create.view);
+}
+
+test "ev_net_policy: a stale serial is ignored, the live one updates, active=0 fails the install" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.cap_net_policy = true;
+    var buf: [16384]u8 = undefined;
+
+    const pol = NetPolicy{ .allow_top = &.{"site.example"} };
+    const v = try p.eng.openViewIn("https://site.example/", 800, 600, .default, &pol);
+    _ = p.drain(&buf);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    var denied: [proto.NREASONS]u32 = @splat(0);
+    denied[@intFromEnum(proto.NetReason.sub_host)] = 3;
+    // A stale serial (an earlier policy's echo) must change nothing.
+    try proto.encodePayload(gpa, &payload, proto.EvNetPolicy{
+        .view = v.id,
+        .serial = v.pol_serial + 100,
+        .active = 1,
+        .exhausted = @intFromEnum(proto.NetReason.request_cap),
+        .requests = 99,
+        .bytes = 9,
+        .navigations = 9,
+        .ms_left = 0,
+        .denied = denied,
+    });
+    p.eng.dispatch(.{ .tag = .ev_net_policy, .payload = payload.items });
+    try std.testing.expectEqual(@as(u32, 0), v.pol_requests);
+    try std.testing.expectEqual(@as(u8, 0), v.pol_exhausted);
+
+    payload.clearRetainingCapacity();
+    try proto.encodePayload(gpa, &payload, proto.EvNetPolicy{
+        .view = v.id,
+        .serial = v.pol_serial,
+        .active = 1,
+        .exhausted = @intFromEnum(proto.NetReason.request_cap),
+        .requests = 42,
+        .bytes = 1234,
+        .navigations = 2,
+        .ms_left = 0,
+        .denied = denied,
+    });
+    p.eng.dispatch(.{ .tag = .ev_net_policy, .payload = payload.items });
+    try std.testing.expectEqual(@as(u32, 42), v.pol_requests);
+    try std.testing.expectEqual(@as(u64, 1234), v.pol_bytes);
+    try std.testing.expectEqual(@intFromEnum(proto.NetReason.request_cap), v.pol_exhausted);
+    try std.testing.expectEqual(@as(u32, 3), v.pol_denied[@intFromEnum(proto.NetReason.sub_host)]);
+
+    // active=0 for OUR serial: the helper could not hold the policy.
+    payload.clearRetainingCapacity();
+    try proto.encodePayload(gpa, &payload, proto.EvNetPolicy{
+        .view = v.id,
+        .serial = v.pol_serial,
+        .active = 0,
+        .exhausted = 0,
+        .requests = 0,
+        .bytes = 0,
+        .navigations = 0,
+        .ms_left = 0,
+        .denied = @splat(0),
+    });
+    p.eng.dispatch(.{ .tag = .ev_net_policy, .payload = payload.items });
+    try std.testing.expect(v.pol_install_failed);
+}
+
+test "a live policy only tightens: loosenings are named and never sent" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.cap_net_policy = true;
+    var buf: [16384]u8 = undefined;
+
+    const pol = NetPolicy{
+        .allow_top = &.{ "site.example", "cdn.example" },
+        .max_requests = 100,
+        .max_bytes = 1000,
+    };
+    const v = try p.eng.openViewIn("https://site.example/", 800, 600, .default, &pol);
+    _ = p.drain(&buf);
+    const first_serial = v.pol_serial;
+
+    // Pure loosening: more hosts, higher budget. Nothing may move and
+    // nothing may be sent.
+    const looser = NetPolicy{
+        .allow_top = &.{ "site.example", "cdn.example", "extra.example" },
+        .max_requests = 5000,
+    };
+    const r1 = try p.eng.tightenViewPolicy(v.id, &looser);
+    try std.testing.expectEqual(@as(usize, 0), r1.n_tightened);
+    try std.testing.expect(r1.n_ignored >= 2);
+    try std.testing.expectEqual(first_serial, v.pol_serial);
+    try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
+    try std.testing.expectEqual(@as(usize, 2), v.pol.?.allow_top.len);
+
+    // A real tighten: fewer hosts, lower budget — re-sent with a new
+    // serial, and the mixed-in loosening is still named.
+    const tighter = NetPolicy{
+        .allow_top = &.{"site.example"},
+        .max_requests = 10,
+        .max_bytes = 5000, // looser: ignored
+    };
+    const r2 = try p.eng.tightenViewPolicy(v.id, &tighter);
+    try std.testing.expect(r2.n_tightened >= 2);
+    try std.testing.expect(r2.n_ignored >= 1);
+    try std.testing.expect(v.pol_serial != first_serial);
+    try std.testing.expectEqual(@as(usize, 1), v.pol.?.allow_top.len);
+    try std.testing.expectEqual(@as(u32, 10), v.pol.?.max_requests);
+    try std.testing.expectEqual(@as(u64, 1000), v.pol.?.max_bytes);
+    const bytes = p.drain(&buf);
+    var reader = proto.Reader.init(bytes);
+    const frame = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.net_policy_set, frame.tag);
+    const set = try proto.NetPolicySet.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(set.allow_top);
+    defer gpa.free(set.allow_sub);
+    try std.testing.expectEqual(v.pol_serial, set.serial);
+    try std.testing.expectEqual(@as(usize, 1), set.allow_top.len);
+}
+
+test "a profile's session-default policy rides its web_open, and only its own" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.cap_net_policy = true;
+    var buf: [16384]u8 = undefined;
+
+    const pol = NetPolicy{ .allow_top = &.{"site.example"}, .max_requests = 7 };
+    try p.eng.setProfilePolicy("work", &pol);
+    try std.testing.expect(p.eng.profilePolicy("work") != null);
+
+    const v = try p.eng.openViewIn("https://site.example/", 800, 600, .{ .named = "work" }, null);
+    try std.testing.expect(v.pol != null);
+    try std.testing.expectEqual(@as(u32, 7), v.pol.?.max_requests);
+    const bytes = p.drain(&buf);
+    var tags: [8]proto.Tag = undefined;
+    const seen = tagsOf(bytes, &tags);
+    // context_create (the profile) first, then the policy, then the view.
+    try std.testing.expectEqual(proto.Tag.context_create, seen[0]);
+    try std.testing.expectEqual(proto.Tag.net_policy_set, seen[1]);
+    try std.testing.expectEqual(proto.Tag.view_create_url, seen[2]);
+
+    // A different profile (and the default jar) stays unpoliced.
+    const other = try p.eng.openViewIn("https://site.example/", 800, 600, .{ .named = "personal" }, null);
+    try std.testing.expect(other.pol == null);
+    const plain = try p.eng.openViewIn("https://site.example/", 800, 600, .default, null);
+    try std.testing.expect(plain.pol == null);
+}
