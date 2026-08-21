@@ -59,6 +59,15 @@ pub const CAP_CONTEXT_MENU = "context-menu";
 /// to the client — the client only configures, polls the bounded
 /// request log, and receives coalesced per-view counters.
 pub const CAP_INTERCEPT = "intercept";
+/// The helper enforces per-view network POLICY (0x86 block): host
+/// allow-lists, scheme/type masks, private-address refusal and budgets
+/// (requests/bytes/navigations/deadline), decided inline in
+/// `on_before_resource_load` before a request leaves the process. A
+/// `net_policy_set` must arrive BEFORE the `view_create*` naming the
+/// view (frame order is the guarantee; there is no ack) — a client on a
+/// helper without this capability REFUSES a policied open rather than
+/// opening an unpoliced view.
+pub const CAP_NET_POLICY = "net-policy";
 /// The helper reports certificate errors as `ev_cert_error` and waits
 /// for a `cert_decision` instead of failing the load. A client without
 /// it sees only the generic `ev_load_error` an older helper produced,
@@ -257,6 +266,11 @@ pub const Tag = enum(u8) {
     intercept_status = 0x83,
     intercept_log_req = 0x84,
     intercept_log = 0x85,
+    net_policy_set = 0x86,
+    net_policy_req = 0x87,
+    ev_net_policy = 0x88,
+    net_log_req = 0x89,
+    net_log = 0x8A,
     context_create = 0x90,
     context_destroy = 0x91,
     ev_view_create_failed = 0x92,
@@ -1885,17 +1899,7 @@ pub const InterceptLog = struct {
         try putU32(gpa, out, self.view);
         try putU32(gpa, out, self.next_seq);
         try putU16(gpa, out, @intCast(self.entries.len));
-        for (self.entries) |e| {
-            try putU32(gpa, out, e.seq);
-            try putU8(gpa, out, e.blocked);
-            try putU8(gpa, out, e.rtype);
-            try putU8(gpa, out, e.done);
-            try putU16(gpa, out, e.status);
-            try putU32(gpa, out, e.dur_ms);
-            try putU32(gpa, out, e.size);
-            try putStr(gpa, out, e.method);
-            try putStr(gpa, out, e.url);
-        }
+        for (self.entries) |e| try putNetEntry(gpa, out, e);
     }
 
     /// Caller owns the returned `entries` slice (strings borrow from
@@ -1907,20 +1911,36 @@ pub const InterceptLog = struct {
         const n = try cur.readU16();
         const entries = try gpa.alloc(NetEntry, n);
         errdefer gpa.free(entries);
-        for (entries) |*e| {
-            e.seq = try cur.readU32();
-            e.blocked = try cur.readU8();
-            e.rtype = try cur.readU8();
-            e.done = try cur.readU8();
-            e.status = try cur.readU16();
-            e.dur_ms = try cur.readU32();
-            e.size = try cur.readU32();
-            e.method = try cur.readStr();
-            e.url = try cur.readStr();
-        }
+        for (entries) |*e| e.* = try readNetEntry(&cur);
         return .{ .view = view, .next_seq = next_seq, .entries = entries };
     }
 };
+
+fn putNetEntry(gpa: std.mem.Allocator, out: *std.ArrayList(u8), e: NetEntry) !void {
+    try putU32(gpa, out, e.seq);
+    try putU8(gpa, out, e.blocked);
+    try putU8(gpa, out, e.rtype);
+    try putU8(gpa, out, e.done);
+    try putU16(gpa, out, e.status);
+    try putU32(gpa, out, e.dur_ms);
+    try putU32(gpa, out, e.size);
+    try putStr(gpa, out, e.method);
+    try putStr(gpa, out, e.url);
+}
+
+fn readNetEntry(cur: *Cur) !NetEntry {
+    var e: NetEntry = undefined;
+    e.seq = try cur.readU32();
+    e.blocked = try cur.readU8();
+    e.rtype = try cur.readU8();
+    e.done = try cur.readU8();
+    e.status = try cur.readU16();
+    e.dur_ms = try cur.readU32();
+    e.size = try cur.readU32();
+    e.method = try cur.readStr();
+    e.url = try cur.readStr();
+    return e;
+}
 
 /// Render log entries as one newline-free JSON object — the shared
 /// presentation both clients (the GUI face's `web-network` command and
@@ -1934,31 +1954,270 @@ pub fn netLogJson(gpa: std.mem.Allocator, next_seq: u32, entries: []const NetEnt
     try w.print("{{\"next_seq\":{d},\"entries\":[", .{next_seq});
     for (entries, 0..) |e, i| {
         if (i != 0) try w.writeByte(',');
-        const rt: NetResource = @enumFromInt(e.rtype);
-        const rt_name = switch (rt) {
-            .other, .document, .subdocument, .stylesheet, .script, .image, .font, .xhr, .media, .websocket, .ping => @tagName(rt),
-            _ => "other",
-        };
-        try w.print("{{\"seq\":{d},\"blocked\":{s},\"type\":\"{s}\",\"method\":", .{
-            e.seq,
-            if (e.blocked != 0) "true" else "false",
-            rt_name,
-        });
-        try std.json.Stringify.value(e.method, .{}, w);
-        try w.writeAll(",\"url\":");
-        try std.json.Stringify.value(e.url, .{}, w);
-        if (e.blocked == 0) {
-            if (e.done != 0) {
-                try w.print(",\"status\":{d},\"duration_ms\":{d},\"size\":{d}", .{ e.status, e.dur_ms, e.size });
-            } else {
-                try w.writeAll(",\"pending\":true");
-            }
-        }
-        try w.writeByte('}');
+        // The legacy frame carries no reason byte; the only thing that
+        // could block one of its entries is the filter engine.
+        try writeNetEntryJson(w, e, if (e.blocked != 0) .filter_list else .none);
     }
     try w.writeAll("]}");
     return aw.toOwnedSlice();
 }
+
+/// `netLogJson` over reason-carrying entries (the `net_log` frame).
+pub fn netLogJson2(gpa: std.mem.Allocator, next_seq: u32, entries: []const NetEntry2) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    const w = &aw.writer;
+    try w.print("{{\"next_seq\":{d},\"entries\":[", .{next_seq});
+    for (entries, 0..) |e, i| {
+        if (i != 0) try w.writeByte(',');
+        try writeNetEntryJson(w, e.entry, @enumFromInt(e.reason));
+    }
+    try w.writeAll("]}");
+    return aw.toOwnedSlice();
+}
+
+fn writeNetEntryJson(w: *std.Io.Writer, e: NetEntry, reason: NetReason) !void {
+    const rt: NetResource = @enumFromInt(e.rtype);
+    const rt_name = switch (rt) {
+        .other, .document, .subdocument, .stylesheet, .script, .image, .font, .xhr, .media, .websocket, .ping => @tagName(rt),
+        _ => "other",
+    };
+    try w.print("{{\"seq\":{d},\"blocked\":{s},\"type\":\"{s}\",\"method\":", .{
+        e.seq,
+        if (e.blocked != 0) "true" else "false",
+        rt_name,
+    });
+    try std.json.Stringify.value(e.method, .{}, w);
+    try w.writeAll(",\"url\":");
+    try std.json.Stringify.value(e.url, .{}, w);
+    if (e.blocked == 0) {
+        if (e.done != 0) {
+            try w.print(",\"status\":{d},\"duration_ms\":{d},\"size\":{d}", .{ e.status, e.dur_ms, e.size });
+        } else {
+            try w.writeAll(",\"pending\":true");
+        }
+    } else {
+        try w.print(",\"reason\":\"{s}\"", .{reasonName(reason)});
+    }
+    try w.writeByte('}');
+}
+
+// -- per-view network policy (0x86 block, capability "net-policy") ----
+
+/// Why a request was refused (or which budget latched). A wire byte AND
+/// the name `web_network`/`web_policy` render — ONE vocabulary, so a
+/// second naming cannot drift.
+pub const NetReason = enum(u8) {
+    none = 0,
+    /// The EasyList-subset filter engine cancelled it (the pre-policy
+    /// `blocked` flag's only meaning).
+    filter_list = 1,
+    top_host = 2,
+    sub_host = 3,
+    resource_type = 4,
+    private_address = 5,
+    scheme = 6,
+    /// A server redirect's target failed the host test. Detected in the
+    /// SAME pre-request gate: CEF re-enters `on_before_resource_load`
+    /// for the redirected request with the request identifier UNCHANGED
+    /// (measured on CEF 151), so a denied request whose id is already in
+    /// the ring is a redirect hop.
+    redirect_host = 7,
+    request_cap = 8,
+    byte_cap = 9,
+    nav_cap = 10,
+    deadline = 11,
+    _,
+};
+
+/// Reasons a `denied` counter array carries, indexed by `NetReason`.
+pub const NREASONS = 12;
+
+pub fn reasonName(r: NetReason) []const u8 {
+    return switch (r) {
+        .none, .filter_list, .top_host, .sub_host, .resource_type, .private_address, .scheme, .redirect_host, .request_cap, .byte_cap, .nav_cap, .deadline => @tagName(r),
+        _ => "unknown",
+    };
+}
+
+/// Helper slots that can hold a policy (and a log ring). A client must
+/// refuse a POLICIED open past this many concurrent views rather than
+/// open an unpoliced one; an unpoliced view past it merely loses its
+/// log, as before.
+pub const MAX_POLICY_VIEWS = 32;
+
+/// Install (or replace) the enforced policy for a view. Sent BEFORE the
+/// `view_create*` naming the view — frame order on the one stream is
+/// the guarantee it applies from the view's very first request; there
+/// is no ack. `serial` stamps every `ev_net_policy` answering for it.
+pub const NetPolicySet = struct {
+    pub const tag: Tag = .net_policy_set;
+    pub const flag_allow_private: u32 = 1;
+
+    view: u32,
+    serial: u32,
+    flags: u32,
+    /// `filter.RType`-indexed bit mask of resource classes to refuse.
+    block_types: u16,
+    /// `netpolicy.Scheme`-indexed bit mask of schemes to allow.
+    allow_schemes: u16,
+    max_requests: u32,
+    max_bytes: u64,
+    max_navigations: u32,
+    deadline_ms: u32,
+    allow_top: []const []const u8,
+    allow_sub: []const []const u8,
+
+    /// Host lists clamp at u16 (the client validates a far lower cap);
+    /// a silent `@intCast` wrap would send a short count and a payload
+    /// the reader walks off the end of.
+    pub fn encodeTo(self: NetPolicySet, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.serial);
+        try putU32(gpa, out, self.flags);
+        try putU16(gpa, out, self.block_types);
+        try putU16(gpa, out, self.allow_schemes);
+        try putU32(gpa, out, self.max_requests);
+        try putU64(gpa, out, self.max_bytes);
+        try putU32(gpa, out, self.max_navigations);
+        try putU32(gpa, out, self.deadline_ms);
+        const nt: u16 = @intCast(@min(self.allow_top.len, std.math.maxInt(u16)));
+        try putU16(gpa, out, nt);
+        for (self.allow_top[0..nt]) |h| try putStr(gpa, out, h);
+        const ns: u16 = @intCast(@min(self.allow_sub.len, std.math.maxInt(u16)));
+        try putU16(gpa, out, ns);
+        for (self.allow_sub[0..ns]) |h| try putStr(gpa, out, h);
+    }
+
+    /// Caller frees BOTH returned slices (strings borrow from
+    /// `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !NetPolicySet {
+        var cur = Cur{ .buf = payload };
+        var out: NetPolicySet = undefined;
+        out.view = try cur.readU32();
+        out.serial = try cur.readU32();
+        out.flags = try cur.readU32();
+        out.block_types = try cur.readU16();
+        out.allow_schemes = try cur.readU16();
+        out.max_requests = try cur.readU32();
+        out.max_bytes = try cur.readU64();
+        out.max_navigations = try cur.readU32();
+        out.deadline_ms = try cur.readU32();
+        const nt = try cur.readU16();
+        const top = try gpa.alloc([]const u8, nt);
+        errdefer gpa.free(top);
+        for (top) |*h| h.* = try cur.readStr();
+        const ns = try cur.readU16();
+        const sub = try gpa.alloc([]const u8, ns);
+        errdefer gpa.free(sub);
+        for (sub) |*h| h.* = try cur.readStr();
+        out.allow_top = top;
+        out.allow_sub = sub;
+        return out;
+    }
+};
+
+/// Ask for one `ev_net_policy` for `view`.
+pub const NetPolicyReq = struct {
+    pub const tag: Tag = .net_policy_req;
+    view: u32,
+};
+
+/// Per-view policy accounting. Answered on `net_policy_req` AND pushed
+/// coalesced when it changes (at most one frame per view per poll
+/// iteration, like `intercept_status`).
+pub const EvNetPolicy = struct {
+    pub const tag: Tag = .ev_net_policy;
+    view: u32,
+    serial: u32,
+    active: u8,
+    /// `NetReason` byte; nonzero once a budget latched.
+    exhausted: u8,
+    requests: u32,
+    bytes: u64,
+    navigations: u32,
+    /// Milliseconds left of `deadline_ms`; 0 when none is set OR when
+    /// it ran out (`exhausted` disambiguates).
+    ms_left: u32,
+    denied: [NREASONS]u32,
+
+    pub fn encodeTo(self: EvNetPolicy, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.serial);
+        try putU8(gpa, out, self.active);
+        try putU8(gpa, out, self.exhausted);
+        try putU32(gpa, out, self.requests);
+        try putU64(gpa, out, self.bytes);
+        try putU32(gpa, out, self.navigations);
+        try putU32(gpa, out, self.ms_left);
+        for (self.denied) |d| try putU32(gpa, out, d);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !EvNetPolicy {
+        var cur = Cur{ .buf = payload };
+        var out: EvNetPolicy = undefined;
+        out.view = try cur.readU32();
+        out.serial = try cur.readU32();
+        out.active = try cur.readU8();
+        out.exhausted = try cur.readU8();
+        out.requests = try cur.readU32();
+        out.bytes = try cur.readU64();
+        out.navigations = try cur.readU32();
+        out.ms_left = try cur.readU32();
+        for (&out.denied) |*d| d.* = try cur.readU32();
+        return out;
+    }
+};
+
+/// Pull reason-carrying log entries, exactly like `intercept_log_req`.
+pub const NetLogReq = struct {
+    pub const tag: Tag = .net_log_req;
+    view: u32,
+    since: u32,
+    max: u16,
+};
+
+/// `NetEntry` plus the refusal reason. A NEW entry shape rather than a
+/// grown `NetEntry`: `InterceptLog` decodes positionally with no
+/// per-entry length, so a trailing byte there would corrupt an older
+/// peer. The old pair stays for the GUI face.
+pub const NetEntry2 = struct {
+    entry: NetEntry,
+    reason: u8,
+};
+
+pub const NetLog = struct {
+    pub const tag: Tag = .net_log;
+    view: u32,
+    next_seq: u32,
+    entries: []const NetEntry2,
+
+    pub fn encodeTo(self: NetLog, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.view);
+        try putU32(gpa, out, self.next_seq);
+        try putU16(gpa, out, @intCast(self.entries.len));
+        for (self.entries) |e| {
+            try putNetEntry(gpa, out, e.entry);
+            try putU8(gpa, out, e.reason);
+        }
+    }
+
+    /// Caller owns the returned `entries` slice (strings borrow from
+    /// `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !NetLog {
+        var cur = Cur{ .buf = payload };
+        const view = try cur.readU32();
+        const next_seq = try cur.readU32();
+        const n = try cur.readU16();
+        const entries = try gpa.alloc(NetEntry2, n);
+        errdefer gpa.free(entries);
+        for (entries) |*e| {
+            e.entry = try readNetEntry(&cur);
+            e.reason = try cur.readU8();
+        }
+        return .{ .view = view, .next_seq = next_seq, .entries = entries };
+    }
+};
 
 // -- devtools (0xA2 block, capability "devtools") ---------------------
 
@@ -3571,6 +3830,97 @@ test "netLogJson is one newline-free JSON object" {
     // An unknown wire type byte renders as "other", not a crash.
     try std.testing.expectEqualStrings("other", arr[2].object.get("type").?.string);
     try std.testing.expectEqual(@as(i64, 404), arr[2].object.get("status").?.integer);
+}
+
+test "round-trip: net-policy frames" {
+    const gpa = std.testing.allocator;
+
+    // A full host-list round trip, at the wire's practical width.
+    var names: [64][]const u8 = undefined;
+    var name_bufs: [64][16]u8 = undefined;
+    for (&names, 0..) |*n, i| n.* = try std.fmt.bufPrint(&name_bufs[i], "h{d}.example", .{i});
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    try encode(gpa, &buf, NetPolicySet{
+        .view = 9,
+        .serial = 3,
+        .flags = NetPolicySet.flag_allow_private,
+        .block_types = 1 << @intFromEnum(NetResource.image),
+        .allow_schemes = 0b11,
+        .max_requests = 500,
+        .max_bytes = 10 << 20,
+        .max_navigations = 4,
+        .deadline_ms = 30_000,
+        .allow_top = names[0..64],
+        .allow_sub = names[0..2],
+    });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.net_policy_set, frame.tag);
+    const got = try NetPolicySet.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.allow_top);
+    defer gpa.free(got.allow_sub);
+    try std.testing.expectEqual(@as(usize, 64), got.allow_top.len);
+    try std.testing.expectEqualStrings("h63.example", got.allow_top[63]);
+    try std.testing.expectEqual(@as(usize, 2), got.allow_sub.len);
+    try std.testing.expectEqual(@as(u64, 10 << 20), got.max_bytes);
+    try std.testing.expect(got.flags & NetPolicySet.flag_allow_private != 0);
+
+    try roundTrip(NetPolicyReq, .{ .view = 9 });
+    try roundTrip(NetLogReq, .{ .view = 9, .since = 7, .max = 50 });
+
+    var denied: [NREASONS]u32 = @splat(0);
+    denied[@intFromEnum(NetReason.sub_host)] = 5;
+    denied[@intFromEnum(NetReason.request_cap)] = 2;
+    var buf2: std.ArrayList(u8) = .empty;
+    defer buf2.deinit(gpa);
+    try encode(gpa, &buf2, EvNetPolicy{
+        .view = 9,
+        .serial = 3,
+        .active = 1,
+        .exhausted = @intFromEnum(NetReason.request_cap),
+        .requests = 500,
+        .bytes = 123_456,
+        .navigations = 2,
+        .ms_left = 0,
+        .denied = denied,
+    });
+    var r2 = Reader.init(buf2.items);
+    const f2 = (try r2.next()).?;
+    try std.testing.expectEqual(Tag.ev_net_policy, f2.tag);
+    const ev = try decode(EvNetPolicy, f2.payload);
+    try std.testing.expectEqual(@as(u32, 5), ev.denied[@intFromEnum(NetReason.sub_host)]);
+    try std.testing.expectEqual(@intFromEnum(NetReason.request_cap), ev.exhausted);
+    try std.testing.expectEqual(@as(u64, 123_456), ev.bytes);
+}
+
+test "round-trip: net_log carries the reason the old frame cannot" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const entries = [_]NetEntry2{
+        .{ .entry = .{ .seq = 1, .blocked = 1, .rtype = @intFromEnum(NetResource.xhr), .done = 1, .status = 0, .dur_ms = 0, .size = 0, .method = "GET", .url = "https://other.example/x" }, .reason = @intFromEnum(NetReason.sub_host) },
+        .{ .entry = .{ .seq = 2, .blocked = 0, .rtype = @intFromEnum(NetResource.document), .done = 1, .status = 200, .dur_ms = 9, .size = 512, .method = "GET", .url = "https://site.example/" }, .reason = @intFromEnum(NetReason.none) },
+    };
+    try encode(gpa, &buf, NetLog{ .view = 4, .next_seq = 3, .entries = &entries });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.net_log, frame.tag);
+    const got = try NetLog.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.entries);
+    try std.testing.expectEqual(@as(usize, 2), got.entries.len);
+    try std.testing.expectEqual(@intFromEnum(NetReason.sub_host), got.entries[0].reason);
+    try std.testing.expectEqualStrings("https://site.example/", got.entries[1].entry.url);
+
+    // The one JSON renderer names the reason; a lifted legacy entry can
+    // only ever say filter_list.
+    const json = try netLogJson2(gpa, 3, &entries);
+    defer gpa.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"reason\":\"sub_host\"") != null);
+    const legacy = [_]NetEntry{entries[0].entry};
+    const lifted = try netLogJson(gpa, 2, &legacy);
+    defer gpa.free(lifted);
+    try std.testing.expect(std.mem.indexOf(u8, lifted, "\"reason\":\"filter_list\"") != null);
 }
 
 test "round-trip: devtools and print-to-pdf frames" {

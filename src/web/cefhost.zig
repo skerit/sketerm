@@ -49,6 +49,7 @@ const semantic = @import("semantic.zig");
 const semnav = @import("semnav.zig");
 const filter = @import("filter.zig");
 const filtersub = @import("filtersub.zig");
+const netpolicy = @import("netpolicy.zig");
 const pathz = @import("../util/pathz.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
 const userscript = @import("userscript.zig");
@@ -2225,23 +2226,23 @@ pub const Host = struct {
     /// Enable/disable blocking, globally (`view` 0) or per view. The
     /// filter lists stay loaded; only the verdict is gated.
     pub fn interceptSet(self: *Host, req: proto.InterceptSet) void {
-        _ = self;
-        g_int.acquire();
-        defer g_int.release();
         if (req.view == 0) {
+            g_int.acquire();
+            defer g_int.release();
             g_int.global_enabled = req.enabled != 0;
             for (&g_int.slots) |*s| {
                 if (s.used) s.dirty = true;
             }
             return;
         }
-        for (&g_int.slots) |*s| {
-            if (s.used and s.view_id == req.view) {
-                s.enabled = req.enabled != 0;
-                s.dirty = true;
-                return;
-            }
-        }
+        // Find-or-create: a per-view toggle sent BEFORE the
+        // `view_create` naming the view (the ordering every policied
+        // open relies on) used to be dropped silently here.
+        const s = interceptSlotFor(self.gpa, req.view) orelse return;
+        g_int.acquire();
+        defer g_int.release();
+        s.enabled = req.enabled != 0;
+        s.dirty = true;
     }
 
     /// Reload the filter set from the seed list, the config filters
@@ -2360,6 +2361,177 @@ pub const Host = struct {
             }
         }
         self.post(proto.InterceptLog{ .view = req.view, .next_seq = next_seq, .entries = snap[0..n] });
+    }
+
+    // -- enforced network policy (0x86 block) --------------------------
+
+    /// Install (or replace) a view's enforced policy. MAIN thread; the
+    /// slot is found-or-created so the frame can precede the
+    /// `view_create` naming the view. When no slot is free (the
+    /// MAX_POLICY_VIEWS ceiling) an `active=0` event is posted — the
+    /// client refuses the open on its own count, this is the belt.
+    pub fn netPolicySet(self: *Host, req: proto.NetPolicySet) void {
+        const pol = netpolicy.Policy.build(self.gpa, req) catch return;
+        const s = interceptSlotFor(self.gpa, req.view) orelse {
+            pol.deinit(self.gpa);
+            self.post(proto.EvNetPolicy{
+                .view = req.view,
+                .serial = req.serial,
+                .active = 0,
+                .exhausted = 0,
+                .requests = 0,
+                .bytes = 0,
+                .navigations = 0,
+                .ms_left = 0,
+                .denied = @splat(0),
+            });
+            return;
+        };
+        var old: ?*netpolicy.Policy = null;
+        {
+            g_int.acquire();
+            defer g_int.release();
+            old = s.pol;
+            s.pol = pol;
+            s.pc = .{ .started_ms = nowMs() };
+            s.pol_dirty = true;
+            s.deadline_stopped = false;
+        }
+        if (old) |o| o.deinit(self.gpa);
+    }
+
+    pub fn netPolicyStatus(self: *Host, req: proto.NetPolicyReq) void {
+        self.post(netPolicyFrame(req.view));
+    }
+
+    /// Answer a reason-carrying log pull; the `intercept_log` shape
+    /// with the policy verdict per entry.
+    pub fn netLog(self: *Host, req: proto.NetLogReq) void {
+        var snap: [NLOG]proto.NetEntry2 = undefined;
+        var url_store: [NLOG][LOG_URL_MAX]u8 = undefined;
+        var method_store: [NLOG][8]u8 = undefined;
+        var n: usize = 0;
+        var next_seq: u32 = req.since;
+        const cap: usize = @min(@as(usize, if (req.max == 0) NLOG else req.max), NLOG);
+        {
+            g_int.acquire();
+            defer g_int.release();
+            for (&g_int.slots) |*s| {
+                if (!s.used or s.view_id != req.view) continue;
+                next_seq = s.next_seq;
+                const ring = s.ring orelse break;
+                for (ring) |*e| {
+                    if (e.seq == 0 or e.seq <= req.since) continue;
+                    if (n >= cap) {
+                        var oldest: usize = 0;
+                        for (snap[0..n], 0..) |se, i| {
+                            if (se.entry.seq < snap[oldest].entry.seq) oldest = i;
+                        }
+                        if (e.seq <= snap[oldest].entry.seq) continue;
+                        fillEntry(&snap[oldest].entry, &url_store[oldest], &method_store[oldest], e);
+                        snap[oldest].reason = e.reason;
+                        continue;
+                    }
+                    fillEntry(&snap[n].entry, &url_store[n], &method_store[n], e);
+                    snap[n].reason = e.reason;
+                    n += 1;
+                }
+                break;
+            }
+        }
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            var j = i;
+            while (j > 0 and snap[j - 1].entry.seq > snap[j].entry.seq) : (j -= 1) {
+                const tmp = snap[j];
+                snap[j] = snap[j - 1];
+                snap[j - 1] = tmp;
+            }
+        }
+        self.post(proto.NetLog{ .view = req.view, .next_seq = next_seq, .entries = snap[0..n] });
+    }
+
+    fn netPolicyFrame(view_id: u32) proto.EvNetPolicy {
+        g_int.acquire();
+        defer g_int.release();
+        var out = proto.EvNetPolicy{
+            .view = view_id,
+            .serial = 0,
+            .active = 0,
+            .exhausted = 0,
+            .requests = 0,
+            .bytes = 0,
+            .navigations = 0,
+            .ms_left = 0,
+            .denied = @splat(0),
+        };
+        for (&g_int.slots) |*s| {
+            if (!s.used or s.view_id != view_id) continue;
+            const pol = s.pol orelse break;
+            out.serial = pol.serial;
+            out.active = 1;
+            out.exhausted = @intFromEnum(s.pc.exhausted);
+            out.requests = s.pc.requests;
+            out.bytes = s.pc.bytes;
+            out.navigations = s.pc.navigations;
+            out.ms_left = if (pol.deadline_ms == 0)
+                0
+            else
+                @intCast(std.math.clamp(@as(i64, pol.deadline_ms) - (nowMs() - s.pc.started_ms), 0, std.math.maxInt(u32)));
+            out.denied = s.pc.denied;
+            break;
+        }
+        return out;
+    }
+
+    /// The deadline sweep + coalesced accounting push. Called once per
+    /// poll iteration next to `flushInterceptStatus`. A view whose
+    /// deadline ran out gets ONE `stop_load` (an in-flight streaming
+    /// body is invisible to the pre-request gate).
+    pub fn flushNetPolicy(self: *Host) void {
+        var pending: [MAX_ISLOTS]proto.EvNetPolicy = undefined;
+        var stops: [MAX_ISLOTS]u32 = undefined;
+        var n: usize = 0;
+        var nstops: usize = 0;
+        const now = nowMs();
+        {
+            g_int.acquire();
+            defer g_int.release();
+            for (&g_int.slots) |*s| {
+                if (!s.used) continue;
+                const pol = s.pol orelse continue;
+                if (pol.deadline_ms != 0 and now - s.pc.started_ms >= pol.deadline_ms and !s.deadline_stopped) {
+                    if (s.pc.exhausted == .none) s.pc.exhausted = .deadline;
+                    s.deadline_stopped = true;
+                    s.pol_dirty = true;
+                    stops[nstops] = s.view_id;
+                    nstops += 1;
+                }
+                if (!s.pol_dirty) continue;
+                s.pol_dirty = false;
+                pending[n] = .{
+                    .view = s.view_id,
+                    .serial = pol.serial,
+                    .active = 1,
+                    .exhausted = @intFromEnum(s.pc.exhausted),
+                    .requests = s.pc.requests,
+                    .bytes = s.pc.bytes,
+                    .navigations = s.pc.navigations,
+                    .ms_left = if (pol.deadline_ms == 0)
+                        0
+                    else
+                        @intCast(std.math.clamp(@as(i64, pol.deadline_ms) - (now - s.pc.started_ms), 0, std.math.maxInt(u32))),
+                    .denied = s.pc.denied,
+                };
+                n += 1;
+            }
+        }
+        for (stops[0..nstops]) |view_id| {
+            const v = self.find(view_id) orelse continue;
+            const b = v.browser orelse continue;
+            if (b.stop_load) |f| f(b);
+        }
+        for (pending[0..n]) |ev| self.post(ev);
     }
 
     /// Push a coalesced `intercept_status` for every view whose
@@ -3292,10 +3464,9 @@ pub const Host = struct {
             w.writeAll(",\"badge\":") catch return null;
             jsonStr(w, a.badge) catch return null;
             w.print(",\"badgeTextColor\":[{d},{d},{d},{d}],\"badgeBackgroundColor\":[{d},{d},{d},{d}],\"enabled\":{s},\"popup\":{s}}}", .{
-                a.badge_text_color.r, a.badge_text_color.g, a.badge_text_color.b, a.badge_text_color.a,
-                a.badge_background_color.r, a.badge_background_color.g, a.badge_background_color.b, a.badge_background_color.a,
-                if (a.enabled) "true" else "false",
-                if (a.popup.len != 0) "true" else "false",
+                a.badge_text_color.r,               a.badge_text_color.g,                      a.badge_text_color.b,       a.badge_text_color.a,
+                a.badge_background_color.r,         a.badge_background_color.g,                a.badge_background_color.b, a.badge_background_color.a,
+                if (a.enabled) "true" else "false", if (a.popup.len != 0) "true" else "false",
             }) catch return null;
         }
         w.writeByte(']') catch return null;
@@ -3452,7 +3623,12 @@ pub const Host = struct {
         self.pending = v;
         defer self.pending = null;
         const browser = cef.cef_browser_host_create_browser_sync(
-            &winfo, &client, &url, &settings, null, rc,
+            &winfo,
+            &client,
+            &url,
+            &settings,
+            null,
+            rc,
         );
         if (browser == null) return error.BrowserCreateFailed;
         v.browser = browser;
@@ -7417,8 +7593,10 @@ const seed_filter_list =
 const NLOG = 128;
 
 /// Concurrent views the registry can track. A view past the cap still
-/// gets verdicts (global engine + global enable), just no log/badge.
-const MAX_ISLOTS = 32;
+/// gets verdicts (global engine + global enable), just no log/badge —
+/// and can hold no POLICY, which is why the client refuses a policied
+/// open past it (the constant is wire-adjacent and lives in protocol).
+const MAX_ISLOTS = proto.MAX_POLICY_VIEWS;
 
 /// Longest URL kept in a log entry; the tail is truncated, the
 /// VERDICT always sees the full url.
@@ -7434,6 +7612,8 @@ const LogEntry = struct {
     rtype: u8 = 0,
     blocked: bool = false,
     done: bool = false,
+    /// `proto.NetReason` byte; nonzero only on blocked entries.
+    reason: u8 = 0,
     method_len: u8 = 0,
     method: [8]u8 = @splat(0),
     url_len: u16 = 0,
@@ -7454,6 +7634,16 @@ const ISlot = struct {
     next_seq: u32 = 1,
     widx: usize = 0,
     ring: ?*[NLOG]LogEntry = null,
+    /// Enforced policy, or null (the common case: one branch on the hot
+    /// path and nothing else). Swapped whole by the MAIN thread under
+    /// the lock, freed outside it, like the filter engine.
+    pol: ?*netpolicy.Policy = null,
+    /// Live accounting for `pol`; IO-thread-mutated under the lock.
+    pc: netpolicy.Counters = .{},
+    /// Accounting changed since the last pushed `ev_net_policy`.
+    pol_dirty: bool = false,
+    /// The deadline sweep already issued its one `stop_load`.
+    deadline_stopped: bool = false,
 };
 
 const Intercept = struct {
@@ -7490,7 +7680,14 @@ fn interceptRegister(gpa: std.mem.Allocator, view_id: u32, cef_id: c_int) void {
     var free_slot: ?*ISlot = null;
     for (&g_int.slots) |*s| {
         if (s.used and s.view_id == view_id) {
+            // Adopt a slot minted by a pre-create `net_policy_set` /
+            // `intercept_set`: attach the missing ring instead of
+            // leaving the view logless.
             s.cef_id = cef_id;
+            if (s.ring == null) {
+                s.ring = ring;
+                keep = true;
+            }
             return;
         }
         if (!s.used and free_slot == null) free_slot = s;
@@ -7500,21 +7697,54 @@ fn interceptRegister(gpa: std.mem.Allocator, view_id: u32, cef_id: c_int) void {
     keep = true;
 }
 
+/// MAIN thread. The slot for `view_id`, found or created (ring
+/// included, `cef_id` 0 until `interceptRegister` attributes it). Slot
+/// lifecycle is main-thread-only — the IO thread only ever READS the
+/// table — so the returned pointer stays valid; mutate its fields under
+/// the lock.
+fn interceptSlotFor(gpa: std.mem.Allocator, view_id: u32) ?*ISlot {
+    {
+        g_int.acquire();
+        defer g_int.release();
+        for (&g_int.slots) |*s| {
+            if (s.used and s.view_id == view_id) return s;
+        }
+    }
+    const ring = gpa.create([NLOG]LogEntry) catch return null;
+    ring.* = @splat(.{});
+    var keep = false;
+    defer if (!keep) gpa.destroy(ring);
+    g_int.acquire();
+    defer g_int.release();
+    var free_slot: ?*ISlot = null;
+    for (&g_int.slots) |*s| {
+        if (s.used and s.view_id == view_id) return s;
+        if (!s.used and free_slot == null) free_slot = s;
+    }
+    const s = free_slot orelse return null;
+    s.* = .{ .used = true, .cef_id = 0, .view_id = view_id, .ring = ring };
+    keep = true;
+    return s;
+}
+
 fn interceptUnregister(gpa: std.mem.Allocator, view_id: u32) void {
     var ring: ?*[NLOG]LogEntry = null;
+    var pol: ?*netpolicy.Policy = null;
     {
         g_int.acquire();
         defer g_int.release();
         for (&g_int.slots) |*s| {
             if (!s.used or s.view_id != view_id) continue;
             ring = s.ring;
+            pol = s.pol;
             s.* = .{};
             break;
         }
     }
-    // Freed OUTSIDE the lock: nobody can reach it any more, and the IO
-    // thread re-resolves its slot on every callback.
+    // Freed OUTSIDE the lock: nobody can reach them any more, and the
+    // IO thread re-resolves its slot on every callback.
     if (ring) |r| gpa.destroy(r);
+    if (pol) |p| p.deinit(gpa);
 }
 
 /// Read one file whole (bounded); caller frees.
@@ -7634,18 +7864,23 @@ pub fn interceptDeinit(gpa: std.mem.Allocator) void {
     // that owns its callback.
     webrequestDeinit();
     var old: ?*filter.Engine = null;
+    var pols: [MAX_ISLOTS]?*netpolicy.Policy = @splat(null);
     {
         g_int.acquire();
         defer g_int.release();
         old = g_int.engine;
         g_int.engine = null;
         g_int.rules = 0;
-        for (&g_int.slots) |*s| {
+        for (&g_int.slots, 0..) |*s, i| {
             if (s.used) {
                 if (s.ring) |r| gpa.destroy(r);
+                pols[i] = s.pol;
                 s.* = .{};
             }
         }
+    }
+    for (pols) |p| {
+        if (p) |pol| pol.deinit(gpa);
     }
     if (old) |o| {
         o.deinit();
@@ -7803,6 +8038,46 @@ fn onBeforeResourceLoad(
                 verdict = eng.match(.{ .url = url, .host = host, .doc_host = doc_host, .rtype = rtype });
             }
         }
+        // PRECEDENCE, step 2: the enforced POLICY. Runs only past the
+        // filter (a filter cancel is final and keeps its own reason)
+        // and never for a slotless request (service workers /
+        // urlrequest traffic — documented unpoliced, matching the
+        // filter's own exemption above).
+        var pol_reason: proto.NetReason = .none;
+        if (!verdict) {
+            if (slot) |s| {
+                if (s.pol) |pol| {
+                    const is_top = rtype == .document;
+                    // CEF keeps the request identifier across a server
+                    // redirect chain (measured on CEF 151): a live ring
+                    // entry with this id means this request IS the
+                    // redirected re-issue.
+                    var is_hop = false;
+                    if (s.ring) |ring| {
+                        for (ring) |*e| {
+                            if (e.seq != 0 and e.req_id == req_id and !e.done) {
+                                is_hop = true;
+                                break;
+                            }
+                        }
+                    }
+                    pol_reason = netpolicy.decide(pol, &s.pc, .{
+                        .host = host,
+                        .scheme = netpolicy.schemeOf(url),
+                        .rtype = rtype,
+                        .is_top = is_top,
+                        .is_redirect_hop = is_hop,
+                    }, now);
+                    if (pol_reason == .none) {
+                        netpolicy.commit(&s.pc, is_top);
+                    } else {
+                        netpolicy.deny(&s.pc, pol_reason);
+                        verdict = true;
+                    }
+                    s.pol_dirty = true;
+                }
+            }
+        }
         if (slot) |s| {
             s.total +%= 1;
             if (verdict) s.blocked +%= 1;
@@ -7818,6 +8093,12 @@ fn onBeforeResourceLoad(
                     .blocked = verdict,
                     // A blocked entry never completes; it is final now.
                     .done = verdict,
+                    .reason = if (pol_reason != .none)
+                        @intFromEnum(pol_reason)
+                    else if (verdict)
+                        @intFromEnum(proto.NetReason.filter_list)
+                    else
+                        0,
                 };
                 s.next_seq +%= 1;
                 if (s.next_seq == 0) s.next_seq = 1;
@@ -7828,9 +8109,10 @@ fn onBeforeResourceLoad(
             }
         }
     }
-    // PRECEDENCE, step 1: the native engine's cancel is FINAL. An
-    // extension is never asked about a request the built-in blocker
-    // already refused, and never asked at all while the shield is off.
+    // PRECEDENCE, step 1: the native engine's cancel is FINAL, and a
+    // policy denial is equally final. An extension is never asked about
+    // a request either already refused, and never asked at all while
+    // the shield is off.
     if (verdict) return cef.RV_CANCEL;
     if (!shield_on) return cef.RV_CONTINUE;
 
@@ -7995,6 +8277,16 @@ fn onResourceLoadComplete(
     defer g_int.release();
     for (&g_int.slots) |*s| {
         if (!s.used or s.cef_id != cef_id) continue;
+        // Byte budget: accounted at completion (the only place the
+        // engine reports a size), so a response that CROSSES the cap
+        // completes and the NEXT request is what gets refused. The
+        // schema says so; no CEF callback can pre-empt a body.
+        if (s.pol) |pol| {
+            s.pc.bytes +|= @intCast(@max(received, 0));
+            if (pol.max_bytes != 0 and s.pc.bytes >= pol.max_bytes and s.pc.exhausted == .none)
+                s.pc.exhausted = .byte_cap;
+            s.pol_dirty = true;
+        }
         const ring = s.ring orelse return;
         for (ring) |*e| {
             if (e.seq == 0 or e.req_id != req_id or e.done) continue;

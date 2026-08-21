@@ -114,6 +114,9 @@ comptime {
     _ = @import("ipc/webdrive.zig");
     _ = @import("ipc/webprofiles.zig");
     _ = @import("ipc/xkblayout.zig");
+    // Enforced network policy: std-only decision half of the web
+    // helper's request gate, shared with the GUI-side client.
+    _ = @import("web/netpolicy.zig");
     // ui/panel data layer: under ui/ by home. canary/doc/events are GTK-free by
     // contract; assets.zig is GTK-free by BUILD GATE — its gdk-pixbuf work sits
     // behind `comptime build_options.glib`, and the test that needs it returns

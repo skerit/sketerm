@@ -64,6 +64,7 @@ const png = @import("../util/png.zig");
 const quarantine = @import("../web/quarantine.zig");
 const clock = @import("../util/clock.zig");
 const webprofiles = @import("webprofiles.zig");
+const netpolicy = @import("../web/netpolicy.zig");
 
 /// Default logical size a headless view is created at. There is no
 /// allocation to inherit one from, and pages lay out sanely at a
@@ -206,12 +207,30 @@ pub const View = struct {
     net_log: ?[]u8 = null,
     net_log_waiting: bool = false,
 
+    // Enforced network policy (capability "net-policy"). The policy the
+    // view was opened with (owned strings) plus the accounting mirror
+    // `ev_net_policy` keeps fresh.
+    pol: ?NetPolicy = null,
+    pol_serial: u32 = 0,
+    pol_active: bool = false,
+    /// The helper answered `active=0` for our serial: the install was
+    /// refused (its slot table is full). The open must fail closed.
+    pol_install_failed: bool = false,
+    /// `proto.NetReason` byte; nonzero once a budget latched.
+    pol_exhausted: u8 = 0,
+    pol_requests: u32 = 0,
+    pol_bytes: u64 = 0,
+    pol_navigations: u32 = 0,
+    pol_ms_left: u32 = 0,
+    pol_denied: [proto.NREASONS]u32 = @splat(0),
+
     fn deinit(self: *View, gpa: std.mem.Allocator) void {
         if (self.url) |u| gpa.free(u);
         if (self.title) |t| gpa.free(t);
         if (self.profile) |p| gpa.free(p);
         if (self.create_failed) |f| gpa.free(f);
         if (self.last_eval) |e| gpa.free(e);
+        if (self.pol) |*p| freePolicy(gpa, p);
         self.reader_guards.deinit(gpa);
         if (self.net_log) |e| gpa.free(e);
         if (self.buf_fd >= 0) _ = c.close(self.buf_fd);
@@ -259,6 +278,69 @@ pub const ProfileError = error{
     InUse,
     NoProfile,
 };
+
+/// An ENFORCED network policy as the client speaks it: what `web_open`
+/// parsed, what a profile default stores, and what `net_policy_set`
+/// serializes. Field semantics live in `web/netpolicy.zig` (the
+/// decision home); this is the transportable value.
+pub const NetPolicy = struct {
+    allow_top: []const []const u8 = &.{},
+    allow_sub: []const []const u8 = &.{},
+    block_types: u16 = 0,
+    allow_schemes: u16 = netpolicy.default_schemes,
+    allow_private: bool = false,
+    /// Tri-state sugar over the EasyList shield's per-view switch:
+    /// null leaves it alone (it defaults ON process-wide).
+    block_ads: ?bool = null,
+    max_requests: u32 = 0,
+    max_bytes: u64 = 0,
+    max_navigations: u32 = 0,
+    deadline_ms: u32 = 0,
+};
+
+/// Every way a POLICIED open can be refused before anything opens.
+/// Same fail-closed contract as `ProfileError`: no unpoliced fallback.
+pub const NetPolicyError = error{
+    PolicyUnsupported,
+    PolicyTooManyViews,
+    NoPolicy,
+};
+
+/// Deep-copy a policy so a stored one outlives its caller's arena.
+fn dupePolicy(gpa: std.mem.Allocator, p: NetPolicy) !NetPolicy {
+    var out = p;
+    out.allow_top = try dupeHostList(gpa, p.allow_top);
+    errdefer freeHostList(gpa, out.allow_top);
+    out.allow_sub = try dupeHostList(gpa, p.allow_sub);
+    return out;
+}
+
+fn freePolicy(gpa: std.mem.Allocator, p: *NetPolicy) void {
+    freeHostList(gpa, p.allow_top);
+    freeHostList(gpa, p.allow_sub);
+    p.allow_top = &.{};
+    p.allow_sub = &.{};
+}
+
+fn dupeHostList(gpa: std.mem.Allocator, hosts: []const []const u8) ![]const []const u8 {
+    if (hosts.len == 0) return &.{};
+    const out = try gpa.alloc([]const u8, hosts.len);
+    var n: usize = 0;
+    errdefer {
+        for (out[0..n]) |h| gpa.free(h);
+        gpa.free(out);
+    }
+    for (hosts) |h| {
+        out[n] = try gpa.dupe(u8, h);
+        n += 1;
+    }
+    return out;
+}
+
+fn freeHostList(gpa: std.mem.Allocator, hosts: []const []const u8) void {
+    for (hosts) |h| gpa.free(h);
+    if (hosts.len > 0) gpa.free(hosts);
+}
 
 /// One identity context PUBLISHED to the running helper.
 const LiveCtx = struct {
@@ -328,7 +410,18 @@ pub const Engine = struct {
     /// silently resolving it through the shared jar. Profiles require
     /// both: without the second one a refused context is invisible.
     cap_contexts_fail_closed: bool = false,
+    /// The helper enforces per-view network policy (0x86 block).
+    cap_net_policy: bool = false,
     next_sem_request: u32 = 1,
+    /// Stamps every `net_policy_set`; `ev_net_policy` echoes it so a
+    /// stale event for a replaced policy is ignorable.
+    next_policy_serial: u32 = 1,
+    /// Session defaults per profile NAME, applied by `openViewIn` when
+    /// the caller names the profile and passes no explicit policy.
+    /// Deliberately NOT persisted: the store's corrupt-rebuild path
+    /// would otherwise be a silent-loosening hole. Keys and host lists
+    /// owned.
+    profile_policy: std.StringHashMapUnmanaged(NetPolicy) = .empty,
 
     /// Durable profile store; null when it could not be taken (see
     /// `store_reason`). Opened lazily, ONCE per engine — a store that
@@ -422,6 +515,12 @@ pub const Engine = struct {
         // a context_destroy against the kill risks a half-written one.
         self.clearContexts();
         self.live.deinit(self.gpa);
+        var pit = self.profile_policy.iterator();
+        while (pit.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            freePolicy(self.gpa, entry.value_ptr);
+        }
+        self.profile_policy.deinit(self.gpa);
         // The flock goes only after the helper is reaped, or a
         // successor could take the root while CEF still holds it open.
         if (self.store) |*s| {
@@ -638,6 +737,7 @@ pub const Engine = struct {
         self.cap_intercept = false;
         self.cap_contexts = false;
         self.cap_contexts_fail_closed = false;
+        self.cap_net_policy = false;
         self.removePresence();
         self.state = .unavailable;
         self.reason = LOST_MSG;
@@ -844,16 +944,30 @@ pub const Engine = struct {
     /// create-then-navigate fallback (older helper) mints about:blank
     /// first, which is what `load_seq` lets a settle see past.
     pub fn openView(self: *Engine, url: []const u8, w: u16, h: u16) !*View {
-        return self.openViewIn(url, w, h, .default);
+        return self.openViewIn(url, w, h, .default, null);
     }
 
-    /// As `openView`, in a chosen identity.
+    /// As `openView`, in a chosen identity, optionally POLICIED.
     ///
-    /// FAIL CLOSED: every profile check runs BEFORE a view is minted or
-    /// a single frame is written, so a refusal leaves nothing behind and
-    /// — crucially — never loads the requested page into the shared jar.
-    pub fn openViewIn(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec) !*View {
+    /// FAIL CLOSED: every profile and policy check runs BEFORE a view is
+    /// minted or a single frame is written, so a refusal leaves nothing
+    /// behind and — crucially — never loads the requested page into the
+    /// shared jar, and never loads it UNPOLICED.
+    pub fn openViewIn(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy) !*View {
         if (!self.ensure()) return error.Unavailable;
+
+        // The effective policy: the explicit one, else the profile's
+        // session default when the open names a profile.
+        var policy: ?*const NetPolicy = policy_arg;
+        if (policy == null and spec == .named) {
+            if (self.profile_policy.getPtr(spec.named)) |p| policy = p;
+        }
+        if (policy != null) {
+            if (!self.cap_net_policy) return error.PolicyUnsupported;
+            // The helper can hold this many policies; past it a policied
+            // view would silently run unpoliced, so refuse instead.
+            if (self.views.items.len >= proto.MAX_POLICY_VIEWS) return error.PolicyTooManyViews;
+        }
 
         var ctx_id: u32 = 0;
         var ctx_ephemeral = false;
@@ -870,6 +984,21 @@ pub const Engine = struct {
         }
         errdefer self.releaseContext(ctx_id);
 
+        // Own the policy copy BEFORE any frame is sent, so an OOM here
+        // cannot leave the helper holding a policy for a view that
+        // never arrives.
+        var owned_pol: ?NetPolicy = if (policy) |p| try dupePolicy(self.gpa, p.*) else null;
+        errdefer if (owned_pol) |*p| freePolicy(self.gpa, p);
+        var pol_serial: u32 = 0;
+        if (policy) |p| {
+            pol_serial = self.next_policy_serial;
+            self.next_policy_serial += 1;
+            self.send(policyFrame(self.next_view, pol_serial, p)) catch return error.Unavailable;
+            if (p.block_ads) |on| {
+                self.send(proto.InterceptSet{ .view = self.next_view, .enabled = if (on) 1 else 0 }) catch return error.Unavailable;
+            }
+        }
+
         const v = try self.gpa.create(View);
         // Covers both halves: before the append it just destroys the
         // view, after it also unlinks it from `views` (a bare destroy
@@ -883,7 +1012,13 @@ pub const Engine = struct {
             .context = ctx_id,
             .profile = owned_profile,
             .ephemeral_ctx = ctx_ephemeral,
+            .pol = owned_pol,
+            .pol_serial = pol_serial,
+            .pol_active = policy != null,
         };
+        // Ownership moved into the view; the errdefer above must not
+        // double-free through the local.
+        owned_pol = null;
         self.next_view += 1;
         try self.views.append(self.gpa, v);
         if (url.len > 0 and self.cap_view_url) {
@@ -985,6 +1120,22 @@ pub const Engine = struct {
                 return .{ .id = id, .ephemeral = false };
             },
         }
+    }
+
+    fn policyFrame(view_id: u32, serial: u32, p: *const NetPolicy) proto.NetPolicySet {
+        return .{
+            .view = view_id,
+            .serial = serial,
+            .flags = if (p.allow_private) proto.NetPolicySet.flag_allow_private else 0,
+            .block_types = p.block_types,
+            .allow_schemes = p.allow_schemes,
+            .max_requests = p.max_requests,
+            .max_bytes = p.max_bytes,
+            .max_navigations = p.max_navigations,
+            .deadline_ms = p.deadline_ms,
+            .allow_top = p.allow_top,
+            .allow_sub = p.allow_sub,
+        };
     }
 
     /// The name is the JAR KEY the helper builds its cache path from —
@@ -1134,6 +1285,186 @@ pub const Engine = struct {
         return entry.id;
     }
 
+    // ---- enforced network policy ------------------------------------
+
+    /// Register (replace) the session-default policy for a profile
+    /// name. In-memory only, BY DESIGN: persisting it would let the
+    /// store's corrupt-rebuild path silently loosen a profile.
+    pub fn setProfilePolicy(self: *Engine, name: []const u8, p: *const NetPolicy) !void {
+        const owned = try dupePolicy(self.gpa, p.*);
+        errdefer {
+            var tmp = owned;
+            freePolicy(self.gpa, &tmp);
+        }
+        const gop = try self.profile_policy.getOrPut(self.gpa, name);
+        if (gop.found_existing) {
+            freePolicy(self.gpa, gop.value_ptr);
+        } else {
+            gop.key_ptr.* = try self.gpa.dupe(u8, name);
+        }
+        gop.value_ptr.* = owned;
+    }
+
+    pub fn profilePolicy(self: *Engine, name: []const u8) ?*const NetPolicy {
+        return self.profile_policy.getPtr(name);
+    }
+
+    /// Which fields a tighten request actually moved, and which were
+    /// silently-dangerous loosenings it REFUSED to apply (the caller
+    /// reports both; an SDK must never mistake "ignored" for
+    /// "applied").
+    pub const TightenReport = struct {
+        tightened: [10][]const u8 = undefined,
+        n_tightened: usize = 0,
+        ignored: [10][]const u8 = undefined,
+        n_ignored: usize = 0,
+
+        fn tight(self: *TightenReport, name: []const u8) void {
+            self.tightened[self.n_tightened] = name;
+            self.n_tightened += 1;
+        }
+
+        fn ign(self: *TightenReport, name: []const u8) void {
+            self.ignored[self.n_ignored] = name;
+            self.n_ignored += 1;
+        }
+    };
+
+    /// TIGHTEN-ONLY policy update for a live view: host sets can only
+    /// shrink, budgets only lower, type blocks only grow, allow_private
+    /// only turn off. Monotone, so "did the old policy still apply to
+    /// the requests in flight" is never a question a caller has to ask.
+    pub fn tightenViewPolicy(self: *Engine, view_id: u32, incoming: *const NetPolicy) !TightenReport {
+        const v = self.findView(view_id) orelse return error.NoView;
+        const old = if (v.pol) |*p| p else return error.NoPolicy;
+        var report = TightenReport{};
+        var next = try dupePolicy(self.gpa, old.*);
+        errdefer freePolicy(self.gpa, &next);
+
+        if (incoming.allow_top.len > 0) {
+            var extra = false;
+            for (incoming.allow_top) |h| {
+                if (!hostListed(old.allow_top, h)) extra = true;
+            }
+            if (extra) report.ign("allow_hosts");
+            const kept = try intersectHosts(self.gpa, old.allow_top, incoming.allow_top);
+            if (kept.len < old.allow_top.len) {
+                freeHostList(self.gpa, next.allow_top);
+                next.allow_top = kept;
+                report.tight("allow_hosts");
+            } else {
+                freeHostList(self.gpa, kept);
+            }
+        }
+        if (incoming.allow_sub.len > 0) {
+            var extra = false;
+            for (incoming.allow_sub) |h| {
+                if (!hostListed(old.allow_sub, h)) extra = true;
+            }
+            if (extra) report.ign("allow_subresource_hosts");
+            const kept = try intersectHosts(self.gpa, old.allow_sub, incoming.allow_sub);
+            if (kept.len < old.allow_sub.len) {
+                freeHostList(self.gpa, next.allow_sub);
+                next.allow_sub = kept;
+                report.tight("allow_subresource_hosts");
+            } else {
+                freeHostList(self.gpa, kept);
+            }
+        }
+        if (incoming.block_types & ~old.block_types != 0) {
+            next.block_types = old.block_types | incoming.block_types;
+            report.tight("block_types");
+        }
+        if (incoming.allow_schemes != 0 and incoming.allow_schemes != old.allow_schemes) {
+            const narrowed = old.allow_schemes & incoming.allow_schemes;
+            if (narrowed != old.allow_schemes) {
+                next.allow_schemes = narrowed;
+                report.tight("allow_schemes");
+            }
+            if (incoming.allow_schemes & ~old.allow_schemes != 0) report.ign("allow_schemes");
+        }
+        if (old.allow_private and !incoming.allow_private) {
+            next.allow_private = false;
+            report.tight("allow_private_addresses");
+        } else if (!old.allow_private and incoming.allow_private) {
+            report.ign("allow_private_addresses");
+        }
+        tightenBudget(u32, old.max_requests, incoming.max_requests, &next.max_requests, &report, "max_requests");
+        tightenBudget(u64, old.max_bytes, incoming.max_bytes, &next.max_bytes, &report, "max_bytes");
+        tightenBudget(u32, old.max_navigations, incoming.max_navigations, &next.max_navigations, &report, "max_navigations");
+        tightenBudget(u32, old.deadline_ms, incoming.deadline_ms, &next.deadline_ms, &report, "deadline_ms");
+        if (incoming.block_ads) |on| {
+            if (on) {
+                next.block_ads = true;
+                report.tight("block_ads");
+                if (self.state == .ready) self.send(proto.InterceptSet{ .view = view_id, .enabled = 1 }) catch {};
+            } else {
+                report.ign("block_ads");
+            }
+        }
+
+        if (report.n_tightened == 0) {
+            freePolicy(self.gpa, &next);
+            return report;
+        }
+        const serial = self.next_policy_serial;
+        self.next_policy_serial += 1;
+        self.send(policyFrame(view_id, serial, &next)) catch {
+            freePolicy(self.gpa, &next);
+            return error.Unavailable;
+        };
+        freePolicy(self.gpa, &v.pol.?);
+        v.pol = next;
+        v.pol_serial = serial;
+        return report;
+    }
+
+    fn tightenBudget(comptime T: type, old: T, incoming: T, out: *T, report: *TightenReport, name: []const u8) void {
+        if (incoming == 0) return;
+        if (old == 0 or incoming < old) {
+            out.* = incoming;
+            report.tight(name);
+        } else if (incoming > old) {
+            report.ign(name);
+        }
+    }
+
+    fn hostListed(hosts: []const []const u8, host: []const u8) bool {
+        for (hosts) |h| {
+            if (std.mem.eql(u8, h, host)) return true;
+        }
+        return false;
+    }
+
+    /// Owned list of `old` entries that also appear in `incoming`.
+    fn intersectHosts(gpa: std.mem.Allocator, old: []const []const u8, incoming: []const []const u8) ![]const []const u8 {
+        var out: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (out.items) |h| gpa.free(h);
+            out.deinit(gpa);
+        }
+        for (old) |h| {
+            if (hostListed(incoming, h)) try out.append(gpa, try gpa.dupe(u8, h));
+        }
+        return try out.toOwnedSlice(gpa);
+    }
+
+    /// Freshen a view's policy accounting (one req + bounded pump).
+    pub fn netPolicyStatus(self: *Engine, id: u32, budget_ms: i64) !*View {
+        if (!self.ensure()) return error.Unavailable;
+        if (self.findView(id) == null) return error.NoView;
+        if (self.cap_net_policy) {
+            self.send(proto.NetPolicyReq{ .view = id }) catch return error.Unavailable;
+            const deadline = clock.nowMs() + @max(budget_ms, 100);
+            while (clock.nowMs() < deadline) {
+                if (self.state != .ready) return error.Unavailable;
+                self.pumpOnce(40);
+                break;
+            }
+        }
+        return self.findView(id) orelse error.NoView;
+    }
+
     pub fn navigate(self: *Engine, id: u32, url: []const u8) !void {
         if (!self.ensure()) return error.Unavailable;
         if (self.findView(id) == null) return error.NoView;
@@ -1216,7 +1547,13 @@ pub const Engine = struct {
             v.net_log = null;
         }
         v.net_log_waiting = true;
-        self.send(proto.InterceptLogReq{ .view = id, .since = since, .max = max }) catch return error.Unavailable;
+        // The reason-carrying lane when the helper has it; the legacy
+        // frame otherwise. Both park the same JSON shape on the view.
+        if (self.cap_net_policy) {
+            self.send(proto.NetLogReq{ .view = id, .since = since, .max = max }) catch return error.Unavailable;
+        } else {
+            self.send(proto.InterceptLogReq{ .view = id, .since = since, .max = max }) catch return error.Unavailable;
+        }
         const deadline = clock.nowMs() + @max(budget_ms, 100);
         while (clock.nowMs() < deadline) {
             if (self.findView(id)) |vv| {
@@ -1560,6 +1897,7 @@ pub const Engine = struct {
                 self.cap_intercept = false;
                 self.cap_contexts = false;
                 self.cap_contexts_fail_closed = false;
+                self.cap_net_policy = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.cap_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.cap_semantic = true;
@@ -1569,6 +1907,7 @@ pub const Engine = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.cap_contexts_fail_closed = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_NET_POLICY)) self.cap_net_policy = true;
                 }
             },
             .frame_buffer => {
@@ -1683,6 +2022,34 @@ pub const Engine = struct {
                 if (v.net_log) |old| self.gpa.free(old);
                 v.net_log = json;
                 v.net_log_waiting = false;
+            },
+            .net_log => {
+                const ev = proto.NetLog.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(ev.entries);
+                const v = self.findView(ev.view) orelse return;
+                v.net_next_seq = ev.next_seq;
+                const json = proto.netLogJson2(self.gpa, ev.next_seq, ev.entries) catch return;
+                if (v.net_log) |old| self.gpa.free(old);
+                v.net_log = json;
+                v.net_log_waiting = false;
+            },
+            .ev_net_policy => {
+                const ev = proto.decode(proto.EvNetPolicy, frame.payload) catch return;
+                const v = self.findView(ev.view) orelse return;
+                // A stale serial answers for a policy this view no
+                // longer runs; ignore it.
+                if (v.pol_serial == 0 or ev.serial != v.pol_serial) return;
+                if (ev.active == 0) {
+                    v.pol_install_failed = true;
+                    return;
+                }
+                v.pol_active = true;
+                v.pol_exhausted = ev.exhausted;
+                v.pol_requests = ev.requests;
+                v.pol_bytes = ev.bytes;
+                v.pol_navigations = ev.navigations;
+                v.pol_ms_left = ev.ms_left;
+                v.pol_denied = ev.denied;
             },
             else => {},
         }
@@ -1967,13 +2334,13 @@ test "a profile is refused, opening nothing, unless BOTH context caps are advert
     // No contexts at all: an old helper (and the smoke fake).
     p.eng.cap_contexts = false;
     p.eng.cap_contexts_fail_closed = false;
-    try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }));
-    try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .ephemeral));
+    try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }, null));
+    try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .ephemeral, null));
 
     // CAP_CONTEXTS alone is WORSE than none: such a helper resolves an
     // unknown context through the shared jar and never says so.
     p.eng.cap_contexts = true;
-    try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }));
+    try std.testing.expectError(error.ContextsUnsupported, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }, null));
 
     // Fail closed means exactly this: no view, and not one byte on the
     // wire — the requested page never touched the shared cookie jar.
@@ -1982,8 +2349,8 @@ test "a profile is refused, opening nothing, unless BOTH context caps are advert
 
     // An invalid name is refused on its own, after the caps pass.
     p.eng.cap_contexts_fail_closed = true;
-    try std.testing.expectError(error.InvalidName, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "Default Jar" }));
-    try std.testing.expectError(error.InvalidName, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "default" }));
+    try std.testing.expectError(error.InvalidName, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "Default Jar" }, null));
+    try std.testing.expectError(error.InvalidName, p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "default" }, null));
     try std.testing.expectEqual(@as(usize, 0), p.eng.views.items.len);
     try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
 }
@@ -1994,7 +2361,7 @@ test "a named open publishes its context BEFORE the view, and republishes the sa
     defer p.deinit();
     var buf: [8192]u8 = undefined;
 
-    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }, null);
     const id = v.context;
     try std.testing.expect(id != 0);
     try std.testing.expect(id < webprofiles.EPHEMERAL_BASE);
@@ -2020,7 +2387,7 @@ test "a named open publishes its context BEFORE the view, and republishes the sa
     }
 
     // A SECOND view in the same profile costs no re-create.
-    const v2 = try p.eng.openViewIn("https://y.test/", 800, 600, .{ .named = "work" });
+    const v2 = try p.eng.openViewIn("https://y.test/", 800, 600, .{ .named = "work" }, null);
     try std.testing.expectEqual(id, v2.context);
     {
         var tag_buf: [8]proto.Tag = undefined;
@@ -2035,7 +2402,7 @@ test "a named open publishes its context BEFORE the view, and republishes the sa
     try std.testing.expectEqual(@as(usize, 0), p.eng.views.items.len);
     try std.testing.expectEqual(@as(usize, 0), p.eng.live.items.len);
     p.reconnect();
-    const after = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    const after = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }, null);
     try std.testing.expectEqual(id, after.context);
     {
         const bytes = p.drain(&buf);
@@ -2052,8 +2419,8 @@ test "ephemeral contexts get their own id space and die with their last view" {
     defer p.deinit();
     var buf: [8192]u8 = undefined;
 
-    const a = try p.eng.openViewIn("https://a.test/", 800, 600, .ephemeral);
-    const b = try p.eng.openViewIn("https://b.test/", 800, 600, .ephemeral);
+    const a = try p.eng.openViewIn("https://a.test/", 800, 600, .ephemeral, null);
+    const b = try p.eng.openViewIn("https://b.test/", 800, 600, .ephemeral, null);
     try std.testing.expect(a.context != b.context);
     try std.testing.expect(a.context >= webprofiles.EPHEMERAL_BASE);
     try std.testing.expect(b.context >= webprofiles.EPHEMERAL_BASE);
@@ -2074,7 +2441,7 @@ test "ephemeral contexts get their own id space and die with their last view" {
 
     // A NAMED profile's close destroys no context: its storage is the
     // point, and a later open must not pay a re-create.
-    const named = try p.eng.openViewIn("https://n.test/", 800, 600, .{ .named = "work" });
+    const named = try p.eng.openViewIn("https://n.test/", 800, 600, .{ .named = "work" }, null);
     _ = p.drain(&buf);
     p.eng.closeView(named.id);
     {
@@ -2092,7 +2459,7 @@ test "ev_view_create_failed marks the view and its close rolls the context back"
     defer p.deinit();
     var buf: [8192]u8 = undefined;
 
-    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }, null);
     _ = p.drain(&buf);
     try std.testing.expect(v.create_failed == null);
 
@@ -2121,7 +2488,7 @@ test "resetProfile refuses a profile in use and retires its id when free" {
     defer p.deinit();
     var buf: [8192]u8 = undefined;
 
-    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }, null);
     const id = v.context;
     _ = p.drain(&buf);
     try std.testing.expectError(error.InUse, p.eng.resetProfile("work"));
@@ -2140,7 +2507,7 @@ test "resetProfile refuses a profile in use and retires its id when free" {
 
     // The name stays usable and comes back on a DIFFERENT id, so a
     // half-failed erase can never resurface as this profile's cookies.
-    const fresh = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    const fresh = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }, null);
     try std.testing.expect(fresh.context != id);
 }
 
@@ -2158,7 +2525,7 @@ test "profile listing reports store and live state without spawning a helper" {
     try std.testing.expectEqualStrings("", p.eng.profileUnavailableReason());
     try std.testing.expect(p.eng.profileStorePath() != null);
 
-    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" });
+    const v = try p.eng.openViewIn("https://x.test/", 800, 600, .{ .named = "work" }, null);
     _ = p.drain(&buf);
     const listed = try p.eng.profileList(arena);
     try std.testing.expectEqual(@as(usize, 1), listed.len);

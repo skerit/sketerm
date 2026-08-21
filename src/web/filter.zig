@@ -57,7 +57,7 @@ pub const RType = enum(u8) {
     websocket = 9,
     ping = 10,
 
-    fn bit(self: RType) u16 {
+    pub fn bit(self: RType) u16 {
         return @as(u16, 1) << @as(u4, @intCast(@intFromEnum(self)));
     }
 };

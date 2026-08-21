@@ -34,6 +34,10 @@ const mcp = @import("mcp.zig");
 const protocol = @import("protocol.zig");
 const webdrive = @import("webdrive.zig");
 const web_proto = @import("../web/protocol.zig");
+const netpolicy = @import("../web/netpolicy.zig");
+const filter = @import("../web/filter.zig");
+const urlhost = @import("../web/urlhost.zig");
+const webprofiles = @import("webprofiles.zig");
 const reader_model = @import("../web/reader.zig");
 const clock = @import("../util/clock.zig");
 
@@ -202,6 +206,16 @@ const View = struct {
     /// Set when the helper refused to create the view because its
     /// identity context was unavailable.
     create_failed: []const u8 = "",
+    /// Enforced network policy (headless only). `policy_exhausted` is
+    /// the latched `NetReason` NAME, "" while budgets hold.
+    policy_active: bool = false,
+    policy_serial: u32 = 0,
+    policy_install_failed: bool = false,
+    policy_exhausted: []const u8 = "",
+    policy_requests: u32 = 0,
+    policy_bytes: u64 = 0,
+    policy_navigations: u32 = 0,
+    policy_ms_left: u32 = 0,
 };
 
 const Views = struct {
@@ -365,6 +379,17 @@ fn listViews(drv: Driver, arena: std.mem.Allocator) !?Views {
                         "default",
                     .context = v.context,
                     .create_failed = if (v.create_failed) |f| try arena.dupe(u8, f) else "",
+                    .policy_active = v.pol_active,
+                    .policy_serial = v.pol_serial,
+                    .policy_install_failed = v.pol_install_failed,
+                    .policy_exhausted = if (v.pol_exhausted != 0)
+                        web_proto.reasonName(@enumFromInt(v.pol_exhausted))
+                    else
+                        "",
+                    .policy_requests = v.pol_requests,
+                    .policy_bytes = v.pol_bytes,
+                    .policy_navigations = v.pol_navigations,
+                    .policy_ms_left = v.pol_ms_left,
                 });
             }
             return Views{
@@ -608,8 +633,9 @@ fn profileFail(arena: std.mem.Allocator, e: *webdrive.Engine, name: []const u8, 
     };
 }
 
-fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec) !OpenOutcome {
+fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []const u8, w: u16, h: u16, spec: webdrive.ProfileSpec, policy: ?*const webdrive.NetPolicy) !OpenOutcome {
     if (drv == .gui and spec != .default) return .{ .err = fail(.invalid_args, GUI_PROFILE_REFUSAL) };
+    if (drv == .gui and policy != null) return .{ .err = fail(.unavailable, GUI_POLICY_REFUSAL) };
     switch (drv) {
         .gui => |backend| {
             const opened = mcp.ipcParsed(arena, backend, .{
@@ -626,9 +652,17 @@ fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []co
             return .{ .opened = @intCast(if (pv == .integer) pv.integer else 0) };
         },
         .headless => |e| {
-            const v = e.openViewIn(url orelse "", w, h, spec) catch |err| {
+            const v = e.openViewIn(url orelse "", w, h, spec, policy) catch |err| {
                 const name: []const u8 = if (spec == .named) spec.named else "";
-                return .{ .err = try profileFail(arena, e, name, err) };
+                return .{ .err = switch (err) {
+                    error.PolicyUnsupported => fail(.unavailable, "this browser helper does not advertise the net-policy capability, so the requested policy cannot be ENFORCED. Nothing was opened: there is deliberately no unpoliced fallback."),
+                    error.PolicyTooManyViews => fail(.conflict, try std.fmt.allocPrint(
+                        arena,
+                        "too many concurrent web views for another POLICIED one (the helper can enforce {d}); close one with web_close first — an unpoliced open past the cap is refused rather than silently unenforced",
+                        .{web_proto.MAX_POLICY_VIEWS},
+                    )),
+                    else => try profileFail(arena, e, name, err),
+                } };
             };
             return .{ .opened = v.id };
         },
@@ -787,6 +821,12 @@ fn head(res: *mcp.Res, arena: std.mem.Allocator, mode: Mode, v: View) !void {
     try res.fact("url", v.url);
     try res.fact("title", v.title);
     try res.fact("loading", v.loading);
+    // A caller must never be handed a policied page with no signal that
+    // its budgets latched — read-only tools keep answering, loudly.
+    if (v.policy_exhausted.len > 0) {
+        try res.fact("policy_exhausted", true);
+        try res.fact("policy_exhausted_reason", v.policy_exhausted);
+    }
     const title = try clip(arena, v.title, TITLE_MAX);
     const url = try clip(arena, v.url, URL_MAX);
     const busy: []const u8 = if (v.loading) " (loading)" else "";
@@ -806,6 +846,8 @@ fn head(res: *mcp.Res, arena: std.mem.Allocator, mode: Mode, v: View) !void {
             busy,
         });
     }
+    if (v.policy_exhausted.len > 0)
+        try res.textf("network policy exhausted ({s}): reads still answer, new traffic is refused (web_policy has the accounting)", .{v.policy_exhausted});
 }
 
 /// A payload section: a `--- name ---` rule, then the raw text.
@@ -844,6 +886,7 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             try w.writeAll(",\"profile\":");
             try std.json.Stringify.value(v.profile, .{}, w);
             try w.print(",\"profile_kind\":\"{s}\",\"context\":{d}", .{ v.profile_kind, v.context });
+            if (v.policy_active) try w.print(",\"policy_active\":true,\"policy_exhausted\":{}", .{v.policy_exhausted.len > 0});
         }
         try w.print(",\"current\":{}}}", .{v.focused});
     }
@@ -889,6 +932,8 @@ fn openResult(
     where_ignored: bool,
     snap: ?Snap,
     snap_err: ?[]const u8,
+    policy: ?*const webdrive.NetPolicy,
+    policy_source: []const u8,
 ) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
@@ -900,6 +945,13 @@ fn openResult(
             try res.textf("profile: {s} (its own cookie jar; logins here survive web_close and MCP restarts)", .{v.profile})
         else if (std.mem.eql(u8, v.profile_kind, "ephemeral"))
             try res.text("profile: a fresh throwaway identity, destroyed with this view");
+        try res.fact("policy_active", policy != null);
+        try res.fact("policy_source", policy_source);
+        if (policy) |p| {
+            try res.fact("policy_serial", v.policy_serial);
+            try res.raw("policy", try policyJson(arena, p));
+            try res.textf("policy: enforced from the first request ({s}; web_policy reports the accounting)", .{policy_source});
+        }
     }
     try res.field("settled", settled);
     if (!settled)
@@ -1231,7 +1283,7 @@ fn scrollResult(
         const moved = b.x != a.x or b.y != a.y;
         try res.fact("moved", moved);
         try res.textf("{s}: y {d} -> {d} of {d}, x {d} -> {d}{s}", .{
-            how, b.y, a.y, a.max_y, b.x, a.x,
+            how,                                                                                            b.y, a.y, a.max_y, b.x, a.x,
             if (moved) "" else " (nothing moved: already at the end, or a scroll container the page owns)",
         });
     } else {
@@ -1419,7 +1471,35 @@ pub fn webTool(
             .ephemeral
         else
             .default;
-        const new_handle: u32 = switch (try openView(drv, arena, url, where, vw, vh, spec)) {
+        var policy: ?webdrive.NetPolicy = switch (try parsePolicy(arena, args)) {
+            .none => null,
+            .err => |f| return failRes(arena, f),
+            .policy => |p| p,
+        };
+        var policy_source: []const u8 = "none";
+        if (policy != null) {
+            policy_source = "call";
+            if (drv == .gui) return mcp.errRes(arena, .unavailable, GUI_POLICY_REFUSAL);
+            if (policy.?.allow_top.len == 0) {
+                // Empty allow-list defaults to the host of `url`; with
+                // no url there is nothing to default to and a policy
+                // allowing nothing that is then navigated anywhere is a
+                // trap.
+                const u = url orelse
+                    return mcp.errRes(arena, .invalid_args, "policy.allow_hosts is empty and web_open has no 'url' to take the host from; name the allowed hosts");
+                const host = urlhost.hostOf(u, urlhost.filtering);
+                if (host.len > 0) {
+                    const hosts = try arena.alloc([]const u8, 1);
+                    hosts[0] = try std.ascii.allocLowerString(arena, host);
+                    policy.?.allow_top = hosts;
+                }
+                // A hostless url (data:) keeps the empty list: every
+                // hosted request is refused, scheme rules still apply.
+            }
+        } else if (drv == .headless and profile != null) {
+            if (drv.headless.profilePolicy(profile.?) != null) policy_source = "profile_default";
+        }
+        const new_handle: u32 = switch (try openView(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null)) {
             .err => |e| return failRes(arena, e),
             .opened => |p| p,
         };
@@ -1455,6 +1535,14 @@ pub fn webTool(
                             },
                         ));
                     }
+                    // The helper answered active=0 for our policy
+                    // serial: it could not HOLD the policy (its slot
+                    // table filled). The view must go rather than run
+                    // unpoliced.
+                    if (found.policy_install_failed) {
+                        if (drv == .headless) drv.headless.closeView(new_handle);
+                        return mcp.errRes(arena, .conflict, "the browser helper could not hold the requested network policy (its policy table is full); the view was closed un-navigated — close other views with web_close and retry");
+                    }
                     // A view created blank has load_seq 0 to start
                     // with; anything it has already finished by the
                     // first poll is a load this call caused.
@@ -1488,6 +1576,12 @@ pub fn webTool(
                 }
             },
         }
+        const echo_policy: ?*const webdrive.NetPolicy = if (policy) |*p|
+            p
+        else if (drv == .headless and std.mem.eql(u8, policy_source, "profile_default"))
+            drv.headless.profilePolicy(profile.?)
+        else
+            null;
         return openResult(
             arena,
             drv.mode(),
@@ -1496,6 +1590,8 @@ pub fn webTool(
             drv == .headless and !eql(u8, where, "tab"),
             snap,
             snap_err,
+            echo_policy,
+            policy_source,
         );
     }
 
@@ -1505,6 +1601,8 @@ pub fn webTool(
     if (eql(u8, name, "web_close")) return closeTool(drv, arena, views, handle_u);
     if (eql(u8, name, "web_profiles")) return profilesTool(drv, arena);
     if (eql(u8, name, "web_profile_reset")) return profileResetTool(drv, arena, args);
+    if (eql(u8, name, "web_policy")) return policyTool(drv, arena, args, views, handle_u);
+    if (eql(u8, name, "web_policy_set")) return policySetTool(drv, arena, args, views, handle_u);
 
     // Everything below addresses an existing view.
     const vs = views orelse return helperErr(drv, arena, views);
@@ -1514,6 +1612,7 @@ pub fn webTool(
     if (drv == .headless) drv.headless.setCurrent(view.pane);
 
     if (eql(u8, name, "web_navigate")) {
+        if (try policyGate(arena, view)) |f| return failRes(arena, f);
         const url = mcp.argStr(args, "url");
         const action = mcp.argStr(args, "action");
         if (url == null and action == null)
@@ -1582,6 +1681,7 @@ pub fn webTool(
     }
 
     if (eql(u8, name, "web_act")) {
+        if (try policyGate(arena, view)) |f| return failRes(arena, f);
         const id = mcp.argInt(args, "id") orelse
             return mcp.errRes(arena, .invalid_args, "web_act needs 'id' (a node id from web_snapshot or web_read)");
         const action = mcp.argStr(args, "action") orelse "click";
@@ -1710,6 +1810,9 @@ pub fn webTool(
     }
 
     if (eql(u8, name, "web_eval")) {
+        // Script can fetch(): running it on an exhausted view would be
+        // an unmetered side door.
+        if (try policyGate(arena, view)) |f| return failRes(arena, f);
         const code = mcp.argStr(args, "code") orelse
             return mcp.errRes(arena, .invalid_args, "web_eval needs 'code'");
         const want_await = mcp.argBool(args, "await");
@@ -1829,6 +1932,303 @@ fn profileResetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value)
         return failRes(arena, try profileFail(arena, e, name, err));
     };
     return profileResetResult(arena, name, retired);
+}
+
+// ---------------------------------------------------------------------
+// Enforced network policy (headless only)
+// ---------------------------------------------------------------------
+
+/// The GUI drives the user's real tabs; silently policing a person's
+/// browsing from an MCP call would be wrong (`web_network` is the GUI
+/// equivalent for the shield toggle).
+const GUI_POLICY_REFUSAL =
+    "a sketerm GUI is attached, so web tools drive the user's real tabs; enforced network policy is a headless-only feature (web_network toggles the GUI's content blocking). Run this MCP server without --shared/--socket for policies.";
+
+const PolicyParse = union(enum) { none, policy: webdrive.NetPolicy, err: Fail };
+
+/// Parse `web_open`'s / `web_policy_set`'s `policy` object into the
+/// client value. Slices land in the arena. Fail closed on every
+/// unknown name — a typo must never become a silently-narrower or
+/// silently-wider policy.
+fn parsePolicy(arena: std.mem.Allocator, args: std.json.Value) !PolicyParse {
+    if (args != .object) return .none;
+    const pv = args.object.get("policy") orelse return .none;
+    if (pv == .null) return .none;
+    if (pv != .object) return .{ .err = fail(.invalid_args, "'policy' must be an object") };
+    const o = pv.object;
+
+    var p = webdrive.NetPolicy{};
+    switch (try parseHostList(arena, o, "allow_hosts")) {
+        .ok => |hosts| p.allow_top = hosts,
+        .err => |e| return .{ .err = e },
+    }
+    switch (try parseHostList(arena, o, "allow_subresource_hosts")) {
+        .ok => |hosts| p.allow_sub = hosts,
+        .err => |e| return .{ .err = e },
+    }
+    if (o.get("block_types")) |bt| {
+        if (bt != .array) return .{ .err = fail(.invalid_args, "policy.block_types must be an array of resource-class names") };
+        for (bt.array.items) |item| {
+            if (item != .string) return .{ .err = fail(.invalid_args, "policy.block_types entries must be strings") };
+            const bit = netpolicy.typeBit(item.string) orelse
+                return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "'{s}' is not a resource class (other|document|subdocument|stylesheet|script|image|font|xhr|media|websocket|ping)", .{item.string})) };
+            p.block_types |= bit;
+        }
+    }
+    if (o.get("allow_schemes")) |as| {
+        if (as != .array) return .{ .err = fail(.invalid_args, "policy.allow_schemes must be an array of scheme names") };
+        var mask: u16 = 0;
+        for (as.array.items) |item| {
+            if (item != .string) return .{ .err = fail(.invalid_args, "policy.allow_schemes entries must be strings") };
+            const bit = netpolicy.schemeBit(item.string) orelse
+                return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "'{s}' is not an allowable scheme (http|https|ws|wss|file|data|blob)", .{item.string})) };
+            mask |= bit;
+        }
+        if (mask == 0) return .{ .err = fail(.invalid_args, "policy.allow_schemes must not be empty (omit it for the http+https default)") };
+        p.allow_schemes = mask;
+    }
+    if (o.get("allow_private_addresses")) |b| {
+        if (b != .bool) return .{ .err = fail(.invalid_args, "policy.allow_private_addresses must be a boolean") };
+        p.allow_private = b.bool;
+    }
+    if (o.get("block_ads")) |b| {
+        if (b != .bool) return .{ .err = fail(.invalid_args, "policy.block_ads must be a boolean") };
+        p.block_ads = b.bool;
+    }
+    inline for (.{ "max_requests", "max_navigations", "deadline_ms" }) |name| {
+        if (o.get(name)) |n| {
+            if (n != .integer or n.integer < 0) return .{ .err = fail(.invalid_args, "policy." ++ name ++ " must be a non-negative integer") };
+            @field(p, name) = @intCast(@min(n.integer, std.math.maxInt(u32)));
+        }
+    }
+    if (o.get("max_bytes")) |n| {
+        if (n != .integer or n.integer < 0) return .{ .err = fail(.invalid_args, "policy.max_bytes must be a non-negative integer") };
+        p.max_bytes = @intCast(n.integer);
+    }
+    return .{ .policy = p };
+}
+
+const HostListParse = union(enum) { ok: []const []const u8, err: Fail };
+
+fn parseHostList(arena: std.mem.Allocator, o: std.json.ObjectMap, key: []const u8) !HostListParse {
+    const hv = o.get(key) orelse return .{ .ok = &.{} };
+    if (hv != .array) return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "policy.{s} must be an array of host names", .{key})) };
+    const items = hv.array.items;
+    if (items.len > netpolicy.MAX_HOSTS)
+        return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "policy.{s} lists {d} hosts; the cap is {d} (never silently truncated)", .{ key, items.len, netpolicy.MAX_HOSTS })) };
+    const hosts = try arena.alloc([]const u8, items.len);
+    for (items, 0..) |item, i| {
+        if (item != .string)
+            return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "policy.{s} entries must be strings", .{key})) };
+        const folded = try std.ascii.allocLowerString(arena, item.string);
+        if (!netpolicy.validHostEntry(folded))
+            return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "'{s}' is not a usable host entry: bare lower-case host names or IP literals only — no '*' (write no policy instead of an allow-all one), no scheme, no port, no path", .{item.string})) };
+        hosts[i] = folded;
+    }
+    return .{ .ok = hosts };
+}
+
+/// The policy echo every policied result carries: names, not masks.
+fn policyJson(arena: std.mem.Allocator, p: *const webdrive.NetPolicy) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("{\"allow_hosts\":");
+    try hostListJson(w, p.allow_top);
+    try w.writeAll(",\"allow_subresource_hosts\":");
+    try hostListJson(w, p.allow_sub);
+    try w.writeAll(",\"block_types\":[");
+    var first = true;
+    inline for (std.meta.fields(filter.RType)) |f| {
+        if (p.block_types & (@as(filter.RType, @enumFromInt(f.value))).bit() != 0) {
+            if (!first) try w.writeByte(',');
+            try w.print("\"{s}\"", .{f.name});
+            first = false;
+        }
+    }
+    try w.writeAll("],\"allow_schemes\":[");
+    first = true;
+    inline for (std.meta.fields(netpolicy.Scheme)) |f| {
+        if (p.allow_schemes & (@as(netpolicy.Scheme, @enumFromInt(f.value))).bit() != 0) {
+            if (!first) try w.writeByte(',');
+            try w.print("\"{s}\"", .{f.name});
+            first = false;
+        }
+    }
+    try w.print("],\"allow_private_addresses\":{}", .{p.allow_private});
+    if (p.block_ads) |on| try w.print(",\"block_ads\":{}", .{on});
+    try w.print(",\"max_requests\":{d},\"max_bytes\":{d},\"max_navigations\":{d},\"deadline_ms\":{d}}}", .{
+        p.max_requests, p.max_bytes, p.max_navigations, p.deadline_ms,
+    });
+    return aw.written();
+}
+
+fn hostListJson(w: *std.Io.Writer, hosts: []const []const u8) !void {
+    try w.writeByte('[');
+    for (hosts, 0..) |h, i| {
+        if (i != 0) try w.writeByte(',');
+        try std.json.Stringify.value(h, .{}, w);
+    }
+    try w.writeByte(']');
+}
+
+/// The refusal every traffic-causing tool answers on a view whose
+/// budgets latched. Numbers ride the sentence (the uniform error shape
+/// carries no extra facts); `web_policy` is the machine-readable half.
+fn policyGate(arena: std.mem.Allocator, v: View) !?Fail {
+    if (v.policy_exhausted.len == 0) return null;
+    return fail(.refused, try std.fmt.allocPrint(
+        arena,
+        "network policy exhausted for view {d} ({s}) after {d} requests / {d} bytes / {d} navigations; no new traffic will be allowed. Read tools still answer; open a new view with a fresh policy, or call web_policy for the full accounting",
+        .{ v.pane, v.policy_exhausted, v.policy_requests, v.policy_bytes, v.policy_navigations },
+    ));
+}
+
+/// `web_policy`: report a live view's policy + accounting, or a
+/// profile's session default.
+fn policyTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, views: ?Views, handle: ?u32) ![]const u8 {
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, GUI_POLICY_REFUSAL),
+        .headless => |eng| eng,
+    };
+    if (mcp.argStr(args, "profile")) |name| {
+        const p = e.profilePolicy(name) orelse
+            return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(arena, "profile '{s}' has no session-default policy (web_policy_set registers one)", .{name}));
+        var res = mcp.Res.init(arena);
+        try res.fact("backend", "headless");
+        try res.fact("policy_active", true);
+        try res.fact("policy_source", "profile_default");
+        try res.raw("policy", try policyJson(arena, p));
+        try res.fact("durable", false);
+        try res.textf("profile '{s}' session-default policy (in-memory; applied by web_open profile:\"{s}\" when no explicit policy rides the call)", .{ name, name });
+        return res.finish();
+    }
+    const vs = views orelse return helperErr(drv, arena, views);
+    const listed = viewFor(vs, handle) orelse return helperErr(drv, arena, views);
+    const fresh = e.netPolicyStatus(listed.pane, 500) catch |err|
+        return failRes(arena, try headlessFail(arena, e, err));
+    return policyViewResult(arena, listed, fresh);
+}
+
+/// Pure builder over the freshened engine view (unit-testable).
+fn policyViewResult(arena: std.mem.Allocator, listed: View, fresh: *const webdrive.View) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    var v = listed;
+    v.policy_exhausted = if (fresh.pol_exhausted != 0)
+        web_proto.reasonName(@enumFromInt(fresh.pol_exhausted))
+    else
+        "";
+    try head(&res, arena, .headless, v);
+    try res.fact("policy_active", fresh.pol_active);
+    try res.fact("policy_source", if (fresh.pol != null) "call" else "none");
+    try res.fact("policy_serial", fresh.pol_serial);
+    if (fresh.pol) |*p| try res.raw("policy", try policyJson(arena, p));
+    try res.fact("requests", fresh.pol_requests);
+    try res.fact("bytes", fresh.pol_bytes);
+    try res.fact("navigations", fresh.pol_navigations);
+    try res.fact("ms_left", fresh.pol_ms_left);
+    try res.fact("exhausted", fresh.pol_exhausted != 0);
+    try res.fact("exhausted_reason", if (fresh.pol_exhausted != 0)
+        web_proto.reasonName(@enumFromInt(fresh.pol_exhausted))
+    else
+        "none");
+    try res.fact("durable", false);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeByte('{');
+    var first = true;
+    for (fresh.pol_denied, 0..) |count, i| {
+        if (count == 0) continue;
+        if (!first) try w.writeByte(',');
+        try w.print("\"{s}\":{d}", .{ web_proto.reasonName(@enumFromInt(@as(u8, @intCast(i)))), count });
+        first = false;
+    }
+    try w.writeByte('}');
+    try res.raw("denied", aw.written());
+    if (!fresh.pol_active) {
+        try res.text("no policy is installed on this view (web_open's 'policy' object installs one at open)");
+    } else {
+        try res.textf("{d} requests, {d} bytes, {d} navigations{s}", .{
+            fresh.pol_requests,
+            fresh.pol_bytes,
+            fresh.pol_navigations,
+            if (fresh.pol_exhausted != 0) "" else " (budgets holding)",
+        });
+    }
+    return res.finish();
+}
+
+/// `web_policy_set`: register a profile session default, or TIGHTEN a
+/// live view's policy.
+fn policySetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, views: ?Views, handle: ?u32) ![]const u8 {
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, GUI_POLICY_REFUSAL),
+        .headless => |eng| eng,
+    };
+    const parsed = switch (try parsePolicy(arena, args)) {
+        .none => return mcp.errRes(arena, .invalid_args, "web_policy_set needs a 'policy' object"),
+        .err => |f| return failRes(arena, f),
+        .policy => |p| p,
+    };
+    if (mcp.argStr(args, "profile")) |name| {
+        if (!webprofiles.validName(name))
+            return mcp.errRes(arena, .invalid_args, "'profile' must be a usable profile name (1-64 of a-z, 0-9, '_', '-')");
+        try e.setProfilePolicy(name, &parsed);
+        var res = mcp.Res.init(arena);
+        try res.fact("profile", name);
+        try res.fact("policy_source", "profile_default");
+        try res.raw("policy", try policyJson(arena, &parsed));
+        try res.fact("durable", false);
+        try res.textf("registered the session-default policy for profile '{s}' (in-memory: it lasts until this MCP server exits, deliberately — a durable copy could be silently lost by a store rebuild)", .{name});
+        return res.finish();
+    }
+    const vs = views orelse return helperErr(drv, arena, views);
+    const view = viewFor(vs, handle) orelse return helperErr(drv, arena, views);
+    const report = e.tightenViewPolicy(view.pane, &parsed) catch |err| return switch (err) {
+        error.NoPolicy => mcp.errRes(arena, .conflict, "this view runs no policy; one can only be installed at web_open, never added to a live view (its earlier requests would predate it)"),
+        else => failRes(arena, try headlessFail(arena, e, err)),
+    };
+    if (report.n_tightened == 0 and report.n_ignored > 0) {
+        return mcp.errRes(arena, .refused, try std.fmt.allocPrint(
+            arena,
+            "every requested change would LOOSEN the live policy ({s}), and a live policy can only tighten; open a new view for a wider one",
+            .{try joinNames(arena, report.ignored[0..report.n_ignored])},
+        ));
+    }
+    const fresh = e.findView(view.pane) orelse return helperErr(drv, arena, views);
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, .headless, view);
+    try res.fact("policy_serial", fresh.pol_serial);
+    if (fresh.pol) |*p| try res.raw("policy", try policyJson(arena, p));
+    try res.raw("tightened", try nameListJson(arena, report.tightened[0..report.n_tightened]));
+    try res.raw("ignored", try nameListJson(arena, report.ignored[0..report.n_ignored]));
+    if (report.n_tightened > 0)
+        try res.textf("tightened: {s}", .{try joinNames(arena, report.tightened[0..report.n_tightened])});
+    if (report.n_ignored > 0)
+        try res.textf("IGNORED as loosenings: {s}", .{try joinNames(arena, report.ignored[0..report.n_ignored])});
+    if (report.n_tightened == 0)
+        try res.text("nothing changed (the requested values were no tighter than the live ones)");
+    return res.finish();
+}
+
+fn joinNames(arena: std.mem.Allocator, names: []const []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    for (names, 0..) |n, i| {
+        if (i != 0) try aw.writer.writeAll(", ");
+        try aw.writer.writeAll(n);
+    }
+    return aw.written();
+}
+
+fn nameListJson(arena: std.mem.Allocator, names: []const []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeByte('[');
+    for (names, 0..) |n, i| {
+        if (i != 0) try w.writeByte(',');
+        try std.json.Stringify.value(n, .{}, w);
+    }
+    try w.writeByte(']');
+    return aw.written();
 }
 
 /// One eval that reports where the page is scrolled to, so "nothing
@@ -2013,6 +2413,11 @@ fn networkTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view
 fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
     const what = mcp.argStr(args, "for") orelse "load";
     const arg = mcp.argStr(args, "arg") orelse "";
+    // Waiting for a load that policy will refuse would just burn the
+    // whole timeout; the other waits read state that already exists.
+    if (std.mem.eql(u8, what, "load")) {
+        if (try policyGate(arena, view)) |f| return failRes(arena, f);
+    }
     const budget = timeoutOf(args, 15_000);
     const deadline = drv.now() + budget;
 
@@ -2213,7 +2618,7 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
         .document = 1,
         .revision = 4,
         .tree = tree,
-    }, null);
+    }, null, null, "none");
     const parsed = try mcp.expectToolResultShape(arena, "web_open", settled);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expect(sc.get("settled").?.bool);
@@ -2233,7 +2638,7 @@ test "web_open: the snapshot rides both lanes, situational notes only in text" {
 
     // Unsettled + an ignored 'where': one short line each, and the
     // ignored placement is also a machine fact.
-    const rough = try openResult(arena, .headless, EXAMPLE, false, true, null, "the page did not answer a first snapshot in time");
+    const rough = try openResult(arena, .headless, EXAMPLE, false, true, null, "the page did not answer a first snapshot in time", null, "none");
     const rp = try mcp.expectToolResultShape(arena, "web_open", rough);
     const rsc = rp.object.get("structuredContent").?.object;
     try t.expect(!rsc.get("settled").?.bool);
@@ -2590,13 +2995,13 @@ test "a GUI-attached server refuses profiles before it opens anything" {
     // Named AND ephemeral: both are identity requests the GUI's own
     // containers already answer, so both are refused here.
     for ([_]webdrive.ProfileSpec{ .{ .named = "work" }, .ephemeral }) |spec| {
-        const out = try openView(drv, arena, "https://example.com/", "tab", 800, 600, spec);
+        const out = try openView(drv, arena, "https://example.com/", "tab", 800, 600, spec, null);
         try t.expectEqual(mcp.ErrCode.invalid_args, out.err.code);
         try t.expect(std.mem.indexOf(u8, out.err.text, "headless-only") != null);
     }
     // The default identity still goes through to the (exploding) GUI,
     // proving the refusal is about the profile and nothing else.
-    const plain = try openView(drv, arena, "https://example.com/", "tab", 800, 600, .default);
+    const plain = try openView(drv, arena, "https://example.com/", "tab", 800, 600, .default, null);
     try t.expectEqual(mcp.ErrCode.unavailable, plain.err.code);
 }
 
@@ -2712,7 +3117,7 @@ test "web_open and web_tabs carry the identity a view lives in" {
     in_profile.profile = "work";
     in_profile.profile_kind = "named";
     in_profile.context = 3;
-    const opened = try openResult(arena, .headless, in_profile, true, false, null, null);
+    const opened = try openResult(arena, .headless, in_profile, true, false, null, null, null, "none");
     const op = try mcp.expectToolResultShape(arena, "web_open", opened);
     const osc = op.object.get("structuredContent").?.object;
     try t.expectEqualStrings("work", osc.get("profile").?.string);
@@ -2725,7 +3130,7 @@ test "web_open and web_tabs carry the identity a view lives in" {
     ) != null);
 
     // The default jar spends no words and no keys beyond the honest ones.
-    const plain = try openResult(arena, .headless, EXAMPLE, true, false, null, null);
+    const plain = try openResult(arena, .headless, EXAMPLE, true, false, null, null, null, "none");
     const psc = (try mcp.expectToolResultShape(arena, "web_open", plain)).object.get("structuredContent").?.object;
     try t.expectEqualStrings("", psc.get("profile").?.string);
     try t.expectEqualStrings("default", psc.get("profile_kind").?.string);
@@ -2764,5 +3169,5 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 16), seen);
+    try std.testing.expectEqual(@as(usize, 18), seen);
 }

@@ -68,6 +68,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_ZOOM,
     proto.CAP_CONTEXT_MENU,
     proto.CAP_INTERCEPT,
+    proto.CAP_NET_POLICY,
     proto.CAP_TLS,
     proto.CAP_PERMISSIONS,
     proto.CAP_SCROLL,
@@ -97,6 +98,10 @@ fn advertiseReaderIds() bool {
 
 fn advertiseSemanticRequestIds() bool {
     return c.getenv("SKETERM_WEB_DISABLE_SEMANTIC_REQUEST_IDS") == null;
+}
+
+fn advertiseNetPolicy() bool {
+    return c.getenv("SKETERM_WEB_DISABLE_NET_POLICY") == null;
 }
 
 /// Bounded builder for the `hello_ack` capability set. Its capacity is
@@ -374,6 +379,7 @@ pub const Server = struct {
         // `intercept_status` per view per iteration, however many
         // requests the IO thread logged in between.
         self.host.flushInterceptStatus();
+        self.host.flushNetPolicy();
         // Same coalescing for download progress: at most one
         // `ev_download_progress` per download per iteration.
         self.host.flushDownloadProgress();
@@ -432,6 +438,7 @@ pub const Server = struct {
                 for (&unconditional_caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS) and !advertiseReaderIds()) continue;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS) and !advertiseSemanticRequestIds()) continue;
+                    if (std.mem.eql(u8, cap, proto.CAP_NET_POLICY) and !advertiseNetPolicy()) continue;
                     caps.add(cap);
                 }
                 if (cefhost.isAccelerated()) caps.add(proto.CAP_FRAMES_DMABUF);
@@ -495,6 +502,14 @@ pub const Server = struct {
             },
             .intercept_status_req => self.host.interceptStatus(try proto.decode(proto.InterceptStatusReq, frame.payload)),
             .intercept_log_req => self.host.interceptLog(try proto.decode(proto.InterceptLogReq, frame.payload)),
+            .net_policy_set => {
+                const req = try proto.NetPolicySet.decodeAlloc(frame.payload, self.gpa);
+                defer self.gpa.free(req.allow_top);
+                defer self.gpa.free(req.allow_sub);
+                self.host.netPolicySet(req);
+            },
+            .net_policy_req => self.host.netPolicyStatus(try proto.decode(proto.NetPolicyReq, frame.payload)),
+            .net_log_req => self.host.netLog(try proto.decode(proto.NetLogReq, frame.payload)),
             .download_decide => self.host.downloadDecide(try proto.decode(proto.DownloadDecide, frame.payload)),
             .download_cancel => self.host.downloadCancel(try proto.decode(proto.DownloadCancel, frame.payload)),
             .a11y_enable => self.host.a11yEnable(try proto.decode(proto.A11yEnable, frame.payload)),
