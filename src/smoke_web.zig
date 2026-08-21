@@ -657,7 +657,7 @@ const HttpProbe = struct {
         }
         if (std.mem.indexOf(u8, raw, "GET /slow.txt") != null) {
             _ = self.slow_hits.fetchAdd(1, .release);
-            while (!self.stop.load(.acquire)) _ = c.usleep(20_000);
+            while (!self.lis.stop.load(.acquire)) _ = c.usleep(20_000);
             _ = self.slow_hits.fetchSub(1, .release);
             return;
         }

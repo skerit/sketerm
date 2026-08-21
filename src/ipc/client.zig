@@ -439,7 +439,6 @@ fn typeText(allocator: std.mem.Allocator, sock_path: [:0]u8, pane: ?u32, session
     defer allocator.free(sock_path);
     const humantype = @import("../util/humantype.zig");
 
-    var gerr: [*c]c.GError = null;
     const conn = connectCtl(sock_path) orelse return 1;
     defer c.g_object_unref(conn);
     const out_stream = c.g_io_stream_get_output_stream(@ptrCast(conn));
