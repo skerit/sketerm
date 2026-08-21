@@ -306,18 +306,24 @@ pub const NetPolicy = struct {
     deadline_ms: u32 = 0,
 };
 
-/// A policy as a CLIENT WROTE it: every field remembers whether it was
-/// supplied. `effective()` fills the open-time defaults for a fresh
-/// policy; `tightenViewPolicy` reads presence directly, so an omitted
-/// field can never be mistaken for a request to tighten to its default
-/// (the way a bare `NetPolicy{}` once reset a live view's schemes to
-/// http+https and its allow_private to off). Host lists and block_types
-/// keep "empty = nothing said" — an empty allow-list could not mean
-/// anything else at tighten time, and there is no type to un-block.
+/// A policy as a CLIENT WROTE it: EVERY field remembers whether it was
+/// supplied (null = not said). `effective()` fills the open-time defaults
+/// for a fresh policy; `tightenViewPolicy` reads presence directly, so an
+/// omitted field can never be mistaken for a request to tighten to its
+/// default (the way a bare `NetPolicy{}` once reset a live view's schemes
+/// to http+https and its allow_private to off). The shape is pinned at
+/// comptime against `NetPolicy`: one field per policy field, same name,
+/// optional-wrapped, defaulting to null — so a policy field added without
+/// its patch counterpart, or a patch field written "empty = absent"
+/// style, is a compile error rather than a silently dropped field.
+/// Consequence for host lists: a PRESENT empty list means what it says.
+/// At open time `effective()` hands web_open an empty allow-list and it
+/// defaults to the url's host as before; at tighten time it narrows the
+/// view to NO hosts, the one monotone reading there is.
 pub const NetPolicyPatch = struct {
-    allow_top: []const []const u8 = &.{},
-    allow_sub: []const []const u8 = &.{},
-    block_types: u16 = 0,
+    allow_top: ?[]const []const u8 = null,
+    allow_sub: ?[]const []const u8 = null,
+    block_types: ?u16 = null,
     allow_schemes: ?u16 = null,
     allow_private: ?bool = null,
     block_ads: ?bool = null,
@@ -326,21 +332,46 @@ pub const NetPolicyPatch = struct {
     max_navigations: ?u32 = null,
     deadline_ms: ?u32 = null,
 
+    comptime {
+        assertMirrorsPolicy();
+    }
+
+    /// Build-time drift gate: the patch has exactly `NetPolicy`'s field
+    /// set, each wrapped in `?` (a policy field that is ALREADY optional,
+    /// like `block_ads`, keeps its type: its null already means "leave
+    /// alone"), and each defaulting to null. A patch field that is not
+    /// optional would be the "empty = nothing said" special case this
+    /// type exists to remove, so it fails the build.
+    fn assertMirrorsPolicy() void {
+        const policy_fields = std.meta.fields(NetPolicy);
+        const patch_fields = std.meta.fields(NetPolicyPatch);
+        if (policy_fields.len != patch_fields.len)
+            @compileError("NetPolicyPatch must carry exactly NetPolicy's fields (a patch field without a policy counterpart is never applied)");
+        inline for (policy_fields) |pf| {
+            if (!@hasField(NetPolicyPatch, pf.name))
+                @compileError("NetPolicy." ++ pf.name ++ " has no NetPolicyPatch counterpart: effective() would silently drop it on the web_open path");
+            const want: type = if (@typeInfo(pf.type) == .optional) pf.type else ?pf.type;
+            const got: type = @FieldType(NetPolicyPatch, pf.name);
+            if (got != want)
+                @compileError("NetPolicyPatch." ++ pf.name ++ " must be " ++ @typeName(want) ++ " (null = not said), found " ++ @typeName(got));
+        }
+        inline for (patch_fields) |qf| {
+            const dflt = qf.defaultValue() orelse
+                @compileError("NetPolicyPatch." ++ qf.name ++ " needs a null default");
+            if (dflt != null)
+                @compileError("NetPolicyPatch." ++ qf.name ++ " must default to null: an omitted field says nothing");
+        }
+    }
+
     /// The full policy a fresh view or a profile default gets from this
-    /// patch: omitted fields take `NetPolicy`'s defaults.
+    /// patch: said fields copy over, omitted fields keep `NetPolicy`'s
+    /// defaults. Generic over the fields, so it cannot drift.
     pub fn effective(self: NetPolicyPatch) NetPolicy {
-        return .{
-            .allow_top = self.allow_top,
-            .allow_sub = self.allow_sub,
-            .block_types = self.block_types,
-            .allow_schemes = self.allow_schemes orelse netpolicy.default_schemes,
-            .allow_private = self.allow_private orelse false,
-            .block_ads = self.block_ads,
-            .max_requests = self.max_requests orelse 0,
-            .max_bytes = self.max_bytes orelse 0,
-            .max_navigations = self.max_navigations orelse 0,
-            .deadline_ms = self.deadline_ms orelse 0,
-        };
+        var out = NetPolicy{};
+        inline for (std.meta.fields(NetPolicy)) |f| {
+            if (@field(self, f.name)) |v| @field(out, f.name) = v;
+        }
+        return out;
     }
 };
 
@@ -1629,39 +1660,13 @@ pub const Engine = struct {
         var next = try dupePolicy(self.gpa, old.*);
         errdefer freePolicy(self.gpa, &next);
 
-        if (incoming.allow_top.len > 0) {
-            var extra = false;
-            for (incoming.allow_top) |h| {
-                if (!hostListed(old.allow_top, h)) extra = true;
+        try self.tightenHosts(old.allow_top, incoming.allow_top, &next.allow_top, &report, "allow_hosts");
+        try self.tightenHosts(old.allow_sub, incoming.allow_sub, &next.allow_sub, &report, "allow_subresource_hosts");
+        if (incoming.block_types) |want| {
+            if (want & ~old.block_types != 0) {
+                next.block_types = old.block_types | want;
+                report.tight("block_types");
             }
-            if (extra) report.ign("allow_hosts");
-            const kept = try intersectHosts(self.gpa, old.allow_top, incoming.allow_top);
-            if (kept.len < old.allow_top.len) {
-                freeHostList(self.gpa, next.allow_top);
-                next.allow_top = kept;
-                report.tight("allow_hosts");
-            } else {
-                freeHostList(self.gpa, kept);
-            }
-        }
-        if (incoming.allow_sub.len > 0) {
-            var extra = false;
-            for (incoming.allow_sub) |h| {
-                if (!hostListed(old.allow_sub, h)) extra = true;
-            }
-            if (extra) report.ign("allow_subresource_hosts");
-            const kept = try intersectHosts(self.gpa, old.allow_sub, incoming.allow_sub);
-            if (kept.len < old.allow_sub.len) {
-                freeHostList(self.gpa, next.allow_sub);
-                next.allow_sub = kept;
-                report.tight("allow_subresource_hosts");
-            } else {
-                freeHostList(self.gpa, kept);
-            }
-        }
-        if (incoming.block_types & ~old.block_types != 0) {
-            next.block_types = old.block_types | incoming.block_types;
-            report.tight("block_types");
         }
         if (incoming.allow_schemes) |want| {
             const narrowed = old.allow_schemes & want;
@@ -1707,6 +1712,26 @@ pub const Engine = struct {
         v.pol = next;
         v.pol_serial = serial;
         return report;
+    }
+
+    /// An omitted host list is untouched; a present one INTERSECTS (an
+    /// explicit empty list narrows to no hosts), and any host it names
+    /// beyond the old list is a loosening named under `name`.
+    fn tightenHosts(self: *Engine, old: []const []const u8, incoming: ?[]const []const u8, out: *[]const []const u8, report: *TightenReport, name: []const u8) !void {
+        const want = incoming orelse return;
+        var extra = false;
+        for (want) |h| {
+            if (!hostListed(old, h)) extra = true;
+        }
+        if (extra) report.ign(name);
+        const kept = try intersectHosts(self.gpa, old, want);
+        if (kept.len < old.len) {
+            freeHostList(self.gpa, out.*);
+            out.* = kept;
+            report.tight(name);
+        } else {
+            freeHostList(self.gpa, kept);
+        }
     }
 
     /// An omitted budget is untouched; an explicit 0 asks for "unbounded",
@@ -3157,6 +3182,97 @@ test "NetPolicyPatch.effective fills open-time defaults only for omitted fields"
     try std.testing.expectEqual(ws, said.allow_schemes);
     try std.testing.expect(said.allow_private);
     try std.testing.expectEqual(@as(u64, 7), said.max_bytes);
+}
+
+test "NetPolicyPatch.effective carries every said field, checked field by field" {
+    // Every value differs from NetPolicy's default, so a field that
+    // effective() failed to copy would read back as the default.
+    const full = NetPolicyPatch{
+        .allow_top = &.{"a.example"},
+        .allow_sub = &.{"b.example"},
+        .block_types = netpolicy.typeBit("image").?,
+        .allow_schemes = netpolicy.schemeBit("wss").?,
+        .allow_private = true,
+        .block_ads = false,
+        .max_requests = 11,
+        .max_bytes = 22,
+        .max_navigations = 33,
+        .deadline_ms = 44,
+    };
+    const eff = full.effective();
+    inline for (std.meta.fields(NetPolicy)) |f| {
+        const want = @field(full, f.name).?;
+        const got = @field(eff, f.name);
+        if (@typeInfo(f.type) == .optional) {
+            try std.testing.expectEqual(want, got.?);
+        } else if (@typeInfo(f.type) == .pointer) {
+            try std.testing.expectEqual(want.len, got.len);
+            try std.testing.expectEqualStrings(want[0], got[0]);
+        } else {
+            try std.testing.expectEqual(want, got);
+        }
+    }
+
+    // A fully-null patch is byte-for-byte NetPolicy's defaults.
+    const none = (NetPolicyPatch{}).effective();
+    const dflt = NetPolicy{};
+    inline for (std.meta.fields(NetPolicy)) |f| {
+        if (@typeInfo(f.type) == .pointer) {
+            try std.testing.expectEqual(@as(usize, 0), @field(none, f.name).len);
+        } else {
+            try std.testing.expectEqual(@field(dflt, f.name), @field(none, f.name));
+        }
+    }
+}
+
+test "a present empty host list narrows a live view to no hosts; an absent one is untouched" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    p.eng.cap_net_policy = true;
+    var buf: [16384]u8 = undefined;
+
+    const pol = NetPolicy{
+        .allow_top = &.{ "site.example", "cdn.example" },
+        .allow_sub = &.{"static.example"},
+        .block_types = netpolicy.typeBit("image").?,
+    };
+    const v = try p.eng.openViewIn("https://site.example/", 800, 600, .default, &pol);
+    _ = p.drain(&buf);
+
+    // Absent lists and an explicit empty block_types move nothing.
+    const r0 = try p.eng.tightenViewPolicy(v.id, &.{ .block_types = 0 });
+    try std.testing.expectEqual(@as(usize, 0), r0.n_tightened);
+    try std.testing.expectEqual(@as(usize, 0), r0.n_ignored);
+    try std.testing.expectEqual(@as(usize, 2), v.pol.?.allow_top.len);
+    try std.testing.expectEqual(@as(usize, 1), v.pol.?.allow_sub.len);
+    try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
+
+    // An explicit empty top-level list is the literal tighten: no hosts.
+    // The subresource list was not said and survives.
+    const r1 = try p.eng.tightenViewPolicy(v.id, &.{ .allow_top = &.{} });
+    try std.testing.expectEqual(@as(usize, 1), r1.n_tightened);
+    try std.testing.expectEqualStrings("allow_hosts", r1.tightened[0]);
+    try std.testing.expectEqual(@as(usize, 0), r1.n_ignored);
+    try std.testing.expectEqual(@as(usize, 0), v.pol.?.allow_top.len);
+    try std.testing.expectEqual(@as(usize, 1), v.pol.?.allow_sub.len);
+    try std.testing.expectEqual(netpolicy.typeBit("image").?, v.pol.?.block_types);
+
+    const bytes = p.drain(&buf);
+    var reader = proto.Reader.init(bytes);
+    const frame = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.net_policy_set, frame.tag);
+    const set = try proto.NetPolicySet.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(set.allow_top);
+    defer gpa.free(set.allow_sub);
+    try std.testing.expectEqual(@as(usize, 0), set.allow_top.len);
+    try std.testing.expectEqual(@as(usize, 1), set.allow_sub.len);
+
+    // Already empty: saying it again changes nothing and sends nothing.
+    const r2 = try p.eng.tightenViewPolicy(v.id, &.{ .allow_top = &.{} });
+    try std.testing.expectEqual(@as(usize, 0), r2.n_tightened);
+    try std.testing.expectEqual(@as(usize, 0), r2.n_ignored);
+    try std.testing.expectEqual(@as(usize, 0), p.drain(&buf).len);
 }
 
 test "a profile's session-default policy rides its web_open, and only its own" {

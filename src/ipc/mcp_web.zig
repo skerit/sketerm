@@ -1979,12 +1979,14 @@ fn parsePolicy(arena: std.mem.Allocator, args: std.json.Value) !PolicyParse {
     }
     if (o.get("block_types")) |bt| {
         if (bt != .array) return .{ .err = fail(.invalid_args, "policy.block_types must be an array of resource-class names") };
+        var mask: u16 = 0;
         for (bt.array.items) |item| {
             if (item != .string) return .{ .err = fail(.invalid_args, "policy.block_types entries must be strings") };
             const bit = netpolicy.typeBit(item.string) orelse
                 return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "'{s}' is not a resource class (other|document|subdocument|stylesheet|script|image|font|xhr|media|websocket|ping)", .{item.string})) };
-            p.block_types |= bit;
+            mask |= bit;
         }
+        p.block_types = mask;
     }
     if (o.get("allow_schemes")) |as| {
         if (as != .array) return .{ .err = fail(.invalid_args, "policy.allow_schemes must be an array of scheme names") };
@@ -2019,10 +2021,12 @@ fn parsePolicy(arena: std.mem.Allocator, args: std.json.Value) !PolicyParse {
     return .{ .policy = p };
 }
 
-const HostListParse = union(enum) { ok: []const []const u8, err: Fail };
+/// `.ok = null` is an absent key; a present empty array is `.ok = &.{}`,
+/// and the patch keeps that distinction.
+const HostListParse = union(enum) { ok: ?[]const []const u8, err: Fail };
 
 fn parseHostList(arena: std.mem.Allocator, o: std.json.ObjectMap, key: []const u8) !HostListParse {
-    const hv = o.get(key) orelse return .{ .ok = &.{} };
+    const hv = o.get(key) orelse return .{ .ok = null };
     if (hv != .array) return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(arena, "policy.{s} must be an array of host names", .{key})) };
     const items = hv.array.items;
     if (items.len > netpolicy.MAX_HOSTS)
@@ -3212,24 +3216,40 @@ test "parsePolicy fails closed on every unknown name, wildcard and port" {
     const ok_args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"policy\":{\"allow_hosts\":[\"Site.Example\"],\"block_types\":[\"image\",\"media\"],\"allow_schemes\":[\"https\"],\"max_requests\":9,\"deadline_ms\":1500}}", .{});
     const ok = try parsePolicy(arena, ok_args);
     try t.expect(ok == .policy);
-    try t.expectEqualStrings("site.example", ok.policy.allow_top[0]);
-    try t.expectEqual(netpolicy.typeBit("image").? | netpolicy.typeBit("media").?, ok.policy.block_types);
+    try t.expectEqualStrings("site.example", ok.policy.allow_top.?[0]);
+    try t.expect(ok.policy.allow_sub == null);
+    try t.expectEqual(netpolicy.typeBit("image").? | netpolicy.typeBit("media").?, ok.policy.block_types.?);
     try t.expectEqual(netpolicy.schemeBit("https").?, ok.policy.allow_schemes.?);
     try t.expectEqual(@as(u32, 9), ok.policy.max_requests.?);
     try t.expect(ok.policy.allow_private == null);
     try t.expect(ok.policy.max_bytes == null);
 
     // Presence survives: an update naming only a budget says nothing
-    // about schemes or private addresses, and effective() fills the
-    // open-time defaults for exactly those.
+    // about hosts, types, schemes or private addresses, and effective()
+    // fills the open-time defaults for exactly those.
     const partial_args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"policy\":{\"max_requests\":3}}", .{});
     const partial = try parsePolicy(arena, partial_args);
+    try t.expect(partial.policy.allow_top == null);
+    try t.expect(partial.policy.allow_sub == null);
+    try t.expect(partial.policy.block_types == null);
     try t.expect(partial.policy.allow_schemes == null);
     try t.expect(partial.policy.allow_private == null);
     const eff = partial.policy.effective();
+    try t.expectEqual(@as(usize, 0), eff.allow_top.len);
+    try t.expectEqual(@as(u16, 0), eff.block_types);
     try t.expectEqual(netpolicy.default_schemes, eff.allow_schemes);
     try t.expect(!eff.allow_private);
     try t.expectEqual(@as(u32, 3), eff.max_requests);
+
+    // A PRESENT empty list is distinct from an absent one: the patch
+    // carries it (tighten reads it as "no hosts"), and effective() hands
+    // web_open the empty list it defaults from the url.
+    const empty_args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"policy\":{\"allow_hosts\":[],\"block_types\":[]}}", .{});
+    const empty = try parsePolicy(arena, empty_args);
+    try t.expect(empty.policy.allow_top != null);
+    try t.expectEqual(@as(usize, 0), empty.policy.allow_top.?.len);
+    try t.expectEqual(@as(u16, 0), empty.policy.block_types.?);
+    try t.expectEqual(@as(usize, 0), empty.policy.effective().allow_top.len);
 
     // No policy key at all is simply none — never an error.
     const none_args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"url\":\"https://x.test\"}", .{});
