@@ -503,9 +503,12 @@ pub const Watchdog = struct {
         }
         for (forward_state.forwards.values()) |f| addFd(f.term.conn.fd);
         {
-            // The headless web helper's socket, when one is up.
+            // The headless web helper's socket, when one is up — and
+            // the broker-profile connection beside it.
             const wfd = @import("mcp_web.zig").watchdogFd();
             if (wfd >= 0) addFd(wfd);
+            const pfd = @import("mcp_web.zig").watchdogMuxFd();
+            if (pfd >= 0) addFd(pfd);
         }
         fired.store(false, .release);
         started_ms = monoMs();

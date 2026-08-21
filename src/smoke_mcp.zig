@@ -98,6 +98,12 @@ const Mcp = struct {
         }
         _ = c.close(in_pipe[0]);
         _ = c.close(out_pipe[1]);
+        // CLOEXEC on our ends: a LATER Mcp.spawn's child must not
+        // inherit this child's stdin write end, or closing it here
+        // never reaches EOF while the sibling lives — exactly the
+        // two-concurrent-clients shape the shared-profile stage runs.
+        _ = c.fcntl(in_pipe[1], c.F_SETFD, c.FD_CLOEXEC);
+        _ = c.fcntl(out_pipe[0], c.F_SETFD, c.FD_CLOEXEC);
         return .{ .pid = pid, .to_child = in_pipe[1], .from_child = out_pipe[0], .allocator = allocator };
     }
 
@@ -600,6 +606,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (c.getenv("SKETERM_SMOKE_MCP_WEBPOLICY_ONLY") != null) {
         webPolicyFakeStage(allocator, exe, rt);
         say("smoke-mcp: focused network policy (fake helper) ok");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBSHARED_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse {
+            say("smoke-mcp: SKIP focused shared-profile stage (sketerm-webengine not built)");
+            return 0;
+        };
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        webSharedProfileStage(allocator, exe, rt);
+        say("smoke-mcp: focused shared-profile stage ok");
         return 0;
     }
 
@@ -1999,6 +2017,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             say("smoke-mcp: headless web tools ok");
             webPolicyStage(allocator, exe, rt);
             say("smoke-mcp: enforced network policy (real CEF) ok");
+            webSharedProfileStage(allocator, exe, rt);
+            say("smoke-mcp: broker-owned shared profiles (real CEF) ok");
         }
     }
 
@@ -2813,6 +2833,125 @@ fn fakeFrameLog(comptime fmt: []const u8, args: anytype) void {
 /// serves just enough (nav events + a full snapshot) for `web_open` to
 /// settle. `SKETERM_FAKE_WEB_EXIT=1` = die on startup instead, the
 /// broken-CEF shape the session fallback must absorb.
+/// Two NAMED MCP servers, one instance, one engine, one broker-owned
+/// profile store: the Phase 2 acceptance. Client A writes a cookie in
+/// named profile "shared"; client B — connected AT THE SAME TIME —
+/// reads it back from the SAME live context; A's exit costs B nothing;
+/// the store flock is held by the daemon, not by either client.
+fn webSharedProfileStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the shared-profile stage");
+    defer http.deinit();
+    http.spawn();
+    var origin_buf: [64]u8 = undefined;
+    const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
+    var args_buf: [1024]u8 = undefined;
+
+    var a = Mcp.spawn(allocator, exe, &.{ "--name", "smokeshared" });
+    a.initialize();
+    a.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"shared\"}}", .{origin}) catch unreachable);
+    if (std.mem.indexOf(u8, a.recvLine(60_000), "isError") != null)
+        fail("client A could not open a named profile on a named instance");
+    if (std.mem.indexOf(u8, a.callTool("web_eval", "{\"code\":\"document.cookie='shared=acrossclients; max-age=86400; path=/'; document.cookie\"}"), "shared=acrossclients") == null)
+        fail("client A could not write the profile cookie");
+
+    // The store flock belongs to the DAEMON: its lock file names a pid
+    // that is neither client and is a live sketerm-mux.
+    {
+        var lock_buf: [512]u8 = undefined;
+        var content: [8192]u8 = undefined;
+        const lock_path = std.fmt.bufPrint(&lock_buf, "{s}/sketerm/web-profiles/smokeshared/lock", .{rt}) catch unreachable;
+        const text = std.mem.trim(u8, readSmall(lock_path, &content), " \t\r\n");
+        const holder = std.fmt.parseInt(c.pid_t, text, 10) catch fail("the profile store lock file does not name a pid");
+        if (holder == a.pid) fail("the profile store flock is held by client A, not the broker");
+        var comm_buf: [256]u8 = undefined;
+        var comm_data: [8192]u8 = undefined;
+        const comm_path = std.fmt.bufPrint(&comm_buf, "/proc/{d}/comm", .{holder}) catch unreachable;
+        if (std.mem.indexOf(u8, readSmall(comm_path, &comm_data), "sketerm-mux") == null)
+            fail("the profile store flock holder is not the mux daemon");
+    }
+
+    // Client B, SAME instance, while A is live: profiles must work (the
+    // old shape refused the second client outright) and the cookie must
+    // be visible — same store, same id, same LIVE engine context.
+    var b = Mcp.spawn(allocator, exe, &.{ "--name", "smokeshared" });
+    b.initialize();
+    b.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"profile\":\"shared\"}}", .{origin}) catch unreachable);
+    if (std.mem.indexOf(u8, b.recvLine(60_000), "isError") != null)
+        fail("client B was refused a named profile while A holds one (the pre-broker single-owner behavior)");
+    if (std.mem.indexOf(u8, b.callTool("web_eval", "{\"code\":\"document.cookie\"}"), "shared=acrossclients") == null)
+        fail("client B does not see A's cookie: the named profile is not one shared live context");
+
+    // One engine serves both: exactly one primary sketerm-webengine
+    // (the --socket owner; CEF's own subprocesses carry --type=).
+    if (countPrimaryWebengines(allocator, rt) != 1)
+        fail("the two clients are not sharing one webengine process");
+
+    // A leaves; B keeps its live session AND the engine.
+    a.closeStdinWait();
+    if (std.mem.indexOf(u8, b.callTool("web_eval", "{\"code\":\"document.cookie\"}"), "shared=acrossclients") == null)
+        fail("client A's exit broke client B's live profile context");
+    if (countPrimaryWebengines(allocator, rt) != 1)
+        fail("the engine did not survive client A's exit");
+
+    // B leaves; the engine exits with its LAST client (that exit runs
+    // cef_shutdown, which is what flushes the jar).
+    b.closeStdinWait();
+    var tries: u32 = 0;
+    while (tries < 200) : (tries += 1) {
+        if (countPrimaryWebengines(allocator, rt) == 0) break;
+        _ = c.usleep(50_000);
+    }
+    if (tries >= 200) fail("the engine outlived its last client");
+}
+
+/// Primary webengine processes under `rt`: cmdline names the binary
+/// AND `--socket` (CEF's zygote/renderer subprocesses carry --type=
+/// and must not count).
+fn countPrimaryWebengines(allocator: std.mem.Allocator, rt: []const u8) usize {
+    const d = c.opendir("/proc") orelse return 0;
+    defer _ = c.closedir(d);
+    var needle_buf: [4096]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "XDG_RUNTIME_DIR={s}", .{rt}) catch return 0;
+    var count: usize = 0;
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (name.len == 0 or name[0] < '0' or name[0] > '9') continue;
+        var path_buf: [256]u8 = undefined;
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(allocator);
+        {
+            const path = std.fmt.bufPrintZ(&path_buf, "/proc/{s}/cmdline", .{name}) catch continue;
+            const f = c.fopen(path.ptr, "rb") orelse continue;
+            defer _ = c.fclose(f);
+            var tmp: [4096]u8 = undefined;
+            while (true) {
+                const n = c.fread(&tmp, 1, tmp.len, f);
+                if (n == 0) break;
+                data.appendSlice(allocator, tmp[0..n]) catch break;
+            }
+        }
+        if (std.mem.indexOf(u8, data.items, "sketerm-webengine") == null) continue;
+        if (std.mem.indexOf(u8, data.items, "--socket") == null) continue;
+        if (std.mem.indexOf(u8, data.items, "--type=") != null) continue;
+        var env_data: std.ArrayList(u8) = .empty;
+        defer env_data.deinit(allocator);
+        {
+            const path = std.fmt.bufPrintZ(&path_buf, "/proc/{s}/environ", .{name}) catch continue;
+            const f = c.fopen(path.ptr, "rb") orelse continue;
+            defer _ = c.fclose(f);
+            var tmp: [4096]u8 = undefined;
+            while (true) {
+                const n = c.fread(&tmp, 1, tmp.len, f);
+                if (n == 0) break;
+                env_data.appendSlice(allocator, tmp[0..n]) catch break;
+            }
+        }
+        if (std.mem.indexOf(u8, env_data.items, needle) == null) continue;
+        count += 1;
+    }
+    return count;
+}
+
 fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
     if (c.getenv("SKETERM_FAKE_WEB_ENV")) |out_path| {
         const f = c.fopen(out_path, "w");

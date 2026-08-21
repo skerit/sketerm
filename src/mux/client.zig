@@ -311,6 +311,12 @@ pub const Conn = struct {
     /// and per-site settings stored on the daemon's host. Absent =
     /// never send the frame; the client degrades to no persistence.
     web_store: bool = false,
+    /// Daemon serves the web_op PROFILE ops (welcome capability): the
+    /// headless browser-profile store's flock and id allocation live in
+    /// the broker, so several MCP clients of one instance share one
+    /// store. Absent = the client falls back to taking the flock
+    /// itself, i.e. exactly the old single-owner behavior.
+    web_profiles: bool = false,
     /// Daemon answers `stream_open` (welcome capability): it can open an
     /// arbitrary-host TCP stream with DNS resolved on the daemon host.
     /// Absent = never send the frame; an old daemon's generic `.err`
@@ -507,6 +513,7 @@ pub const Conn = struct {
         self.lsp_support = false;
         self.cast_playback = false;
         self.web_store = false;
+        self.web_profiles = false;
         self.stream_open = false;
         self.web_helper = false;
         self.panel_rpc = 0;
@@ -528,6 +535,7 @@ pub const Conn = struct {
             lsp: bool = false,
             cast_playback: bool = false,
             web_store: bool = false,
+            web_profiles: bool = false,
             stream_open: bool = false,
             web_helper: bool = false,
             panel_rpc: u8 = 0,
@@ -554,6 +562,7 @@ pub const Conn = struct {
             self.lsp_support = parsed.value.lsp;
             self.cast_playback = parsed.value.cast_playback;
             self.web_store = parsed.value.web_store;
+            self.web_profiles = parsed.value.web_profiles;
             self.stream_open = parsed.value.stream_open;
             self.web_helper = parsed.value.web_helper;
             self.panel_rpc = @min(parsed.value.panel_rpc, wire.PANEL_RPC_VERSION);

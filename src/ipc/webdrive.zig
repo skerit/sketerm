@@ -65,6 +65,7 @@ const png = @import("../util/png.zig");
 const quarantine = @import("../web/quarantine.zig");
 const clock = @import("../util/clock.zig");
 const webprofiles = @import("webprofiles.zig");
+const webremote = @import("webprofilesremote.zig");
 const netpolicy = @import("../web/netpolicy.zig");
 
 /// Default logical size a headless view is created at. There is no
@@ -76,6 +77,12 @@ pub const DEFAULT_H: u16 = 800;
 /// How long a freshly spawned helper gets to bind its socket. CEF's
 /// startup (re-exec, zygote) dominates; matches the GUI's 150x100ms.
 const SPAWN_WAIT_MS: i64 = 15_000;
+
+/// How long `ensure` waits for a SIBLING client's in-flight spawn
+/// (the `web.lock` flock) before proceeding without it. Must exceed a
+/// worst-case spawn + handshake so the second client adopts the first
+/// one's helper instead of racing it.
+const SPAWN_LOCK_WAIT_MS: i64 = 30_000;
 
 /// How long teardown waits for the helper to exit on its own after its
 /// socket closes, before signalling. That self-exit runs `cef_shutdown`,
@@ -394,6 +401,37 @@ const LiveCtx = struct {
     views: u32 = 0,
 };
 
+/// Serializes one instance dir's [probe -> spawn -> bind -> greet]
+/// window across sibling MCP clients, via an flock on `<dir>/web.lock`.
+/// Best-effort by design: failure to take it reverts to the old racy
+/// behavior (worst case: a doubled spawn), never to a refusal.
+const SpawnLock = struct {
+    fd: c_int = -1,
+
+    fn take(dir: []const u8) SpawnLock {
+        var z: [4096:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&z, "{s}/web.lock", .{dir}) catch return .{};
+        const fd = c.open(p.ptr, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c_uint, 0o600));
+        if (fd < 0) return .{};
+        const deadline = clock.nowMs() + SPAWN_LOCK_WAIT_MS;
+        while (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) {
+            if (clock.nowMs() >= deadline) {
+                _ = c.close(fd);
+                return .{};
+            }
+            _ = c.usleep(50_000);
+        }
+        return .{ .fd = fd };
+    }
+
+    fn release(self: *SpawnLock) void {
+        if (self.fd >= 0) {
+            _ = c.close(self.fd);
+            self.fd = -1;
+        }
+    }
+};
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     /// Directory holding the helper socket and its cache; owned.
@@ -451,6 +489,11 @@ pub const Engine = struct {
     cap_contexts_fail_closed: bool = false,
     /// The helper enforces per-view network policy (0x86 block).
     cap_net_policy: bool = false,
+    /// The helper serves several concurrent clients (Phase 1). Gates
+    /// teardown: a multi-client helper that has not exited by the
+    /// grace deadline is serving someone else (or mid-flush) and must
+    /// be ABANDONED, never signalled.
+    cap_multi_client: bool = false,
     next_sem_request: u32 = 1,
     /// Stamps every `net_policy_set`; `ev_net_policy` echoes it so a
     /// stale event for a replaced policy is ignorable.
@@ -466,7 +509,13 @@ pub const Engine = struct {
     /// `store_reason`). Opened lazily, ONCE per engine — a store that
     /// appeared after the helper already started with the volatile
     /// cache dir would name jars the running helper cannot reach.
+    /// The LOCAL fallback: `remote` (the broker-owned store) is tried
+    /// first for named instances and wins when the daemon serves it.
     store: ?webprofiles.Store = null,
+    /// Broker-owned profile store, the normal path for a NAMED
+    /// instance: the daemon holds the flock and allocates ids, so N
+    /// concurrent clients of one instance all get working profiles.
+    remote: ?webremote.Remote = null,
     store_tried: bool = false,
     /// Why there is no store. Static strings, or one arena-free owned
     /// sentence for the lock case; owned when `store_reason_owned`.
@@ -506,6 +555,23 @@ pub const Engine = struct {
     /// process's socket closes).
     pub fn deinit(self: *Engine) void {
         self.dropConnection();
+        if (self.pid > 0 and self.cap_multi_client and self.remote != null) {
+            // Broker-owned store + multi-client helper: the helper
+            // exits (and flushes jars via `cef_shutdown`) with its LAST
+            // client on its own, whether or not this process waits —
+            // and while ANOTHER client is connected it must not be
+            // waited for, let alone signalled. Nothing here depends on
+            // the exit either: the flock is the daemon's, so no
+            // successor can take the CEF root early. One immediate reap
+            // attempt for the already-exited case; otherwise init reaps
+            // it after this process is gone.
+            var status: c_int = 0;
+            if (c.waitpid(self.pid, &status, c.WNOHANG) != self.pid) {
+                const note = "sketerm mcp: leaving the multi-client browser helper to exit with its last client\n";
+                _ = c.write(2, note, note.len);
+            }
+            self.pid = -1;
+        }
         if (self.pid > 0) {
             var status: c_int = 0;
             // Let the helper exit ON ITS OWN first. The closed socket is
@@ -513,7 +579,10 @@ pub const Engine = struct {
             // every browser, `cef_shutdown`) is what FLUSHES a profile's
             // cookies to disk. Signalling here instead cost every named
             // profile the session that had just been written into it —
-            // the jar was durable and always came back empty.
+            // the jar was durable and always came back empty. (With a
+            // LOCAL flock this wait is also the release-order guard: the
+            // flock must not free while CEF still holds the root, or the
+            // next client opens a colliding, silently-empty store.)
             var tries: u32 = 0;
             var reaped = false;
             while (tries < GRACEFUL_EXIT_MS / 20) : (tries += 1) {
@@ -539,8 +608,15 @@ pub const Engine = struct {
         }
         self.removePresence();
         // After the helper: its Wayland connection must be gone before
-        // the session's socket goes away under it.
-        self.teardownSession(true);
+        // the session's socket goes away under it. EXCEPT under the
+        // shared (broker-store, multi-client) shape, where the helper
+        // may outlive this client to serve its siblings: destroying the
+        // session would yank the compositor from under THEIR engine —
+        // and the destroy round trip blocks on the live client anyway.
+        // Dropping our connection without destroy hands the session to
+        // the daemon's own liveness rule: it reaps once no Wayland
+        // client (i.e. the helper) remains.
+        self.teardownSession(!(self.cap_multi_client and self.remote != null));
         if (self.mux_sock) |sck| {
             self.gpa.free(sck);
             self.mux_sock = null;
@@ -560,6 +636,10 @@ pub const Engine = struct {
             freePolicy(self.gpa, entry.value_ptr);
         }
         self.profile_policy.deinit(self.gpa);
+        if (self.remote) |*r| {
+            r.deinit();
+            self.remote = null;
+        }
         // The flock goes only after the helper is reaped, or a
         // successor could take the root while CEF still holds it open.
         if (self.store) |*s| {
@@ -599,6 +679,30 @@ pub const Engine = struct {
     fn openStore(self: *Engine) void {
         if (self.store_tried) return;
         self.store_tried = true;
+        // Broker-owned store first, NAMED instances only: the named
+        // instance's daemon is durable, so it is the one process that
+        // can hold the flock across every client's lifetime — which is
+        // what lets a SECOND concurrent client keep working profiles.
+        // An anonymous instance's daemon is private and ephemeral
+        // (idle-exit), so parking the shared "anon" root's flock there
+        // would only DELAY the next anonymous client; anon keeps the
+        // local flock exactly as before.
+        if (self.instance != null and self.mux_sock != null) {
+            var reason_buf: [192]u8 = undefined;
+            var reason_len: usize = 0;
+            if (webremote.Remote.open(self.gpa, self.mux_sock.?, self.instance.?, &reason_buf, &reason_len)) |rem| {
+                self.remote = rem;
+                self.clearStoreReason();
+                return;
+            } else |err| switch (err) {
+                // No capability (old daemon) or no daemon answer: the
+                // local flock below IS the old behavior, refusal
+                // sentences included. A daemon-side refusal also falls
+                // through — the local attempt reproduces the same
+                // condition (Locked/Io) with the richer local message.
+                error.Unsupported, error.Refused, error.Io, error.OutOfMemory => {},
+            }
+        }
         var holder: c.pid_t = 0;
         self.store = webprofiles.Store.open(self.gpa, self.instance, &holder) catch |err| {
             switch (err) {
@@ -620,6 +724,31 @@ pub const Engine = struct {
             return;
         };
         self.clearStoreReason();
+    }
+
+    /// A profile store is usable, broker-owned or local.
+    fn hasStore(self: *Engine) bool {
+        return self.remote != null or self.store != null;
+    }
+
+    /// The store root (the helper's `--cache-dir`); null without one.
+    fn storeRoot(self: *Engine) ?[]const u8 {
+        if (self.remote) |*r| return r.root;
+        if (self.store) |*s| return s.root;
+        return null;
+    }
+
+    /// The persisted id `name` must be opened with, whichever side
+    /// allocates it.
+    fn storeEnsure(self: *Engine, name: []const u8) webprofiles.Error!u32 {
+        if (self.remote) |*r| return r.ensure(name);
+        if (self.store) |*s| return s.ensure(name);
+        return error.Io;
+    }
+
+    fn storeTouch(self: *Engine, name: []const u8) void {
+        if (self.remote) |*r| return r.touch(name);
+        if (self.store) |*s| s.touch(name, clock.nowMs());
     }
 
     /// Name of the live watchable Wayland session the helper was
@@ -777,6 +906,7 @@ pub const Engine = struct {
         self.cap_contexts = false;
         self.cap_contexts_fail_closed = false;
         self.cap_net_policy = false;
+        self.cap_multi_client = false;
         self.removePresence();
         self.state = .unavailable;
         self.reason = LOST_MSG;
@@ -801,6 +931,33 @@ pub const Engine = struct {
             self.state = .idle;
         }
 
+        var dir_z: [4096:0]u8 = undefined;
+        const dz = std.fmt.bufPrintZ(&dir_z, "{s}", .{self.dir}) catch return self.failStart("helper directory path too long");
+        _ = c.mkdir(dz.ptr, 0o700);
+        var sock_z: [108:0]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_z, "{s}/web.sock", .{self.dir}) catch
+            return self.failStart("helper socket path exceeds the unix socket limit (use a shorter runtime dir)");
+
+        // Serialize [probe -> spawn -> bind] against SIBLING clients of
+        // this instance dir: without it, two clients finding no helper
+        // both spawn, and the second's unlink() yanks the socket from
+        // under the first's bind. Best-effort — an unobtainable lock
+        // degrades to the old racy behavior, never to a refusal.
+        var spawn_lock = SpawnLock.take(self.dir);
+        defer spawn_lock.release();
+
+        // Adopt a live helper before spawning one: with the broker
+        // owning the profile store, a SECOND client of a named
+        // instance is the expected shape, and the multi-client helper
+        // serves each on its own connection. A stale/single-client
+        // helper accepts but never answers the handshake; the ack
+        // deadline turns that into a described failure, after which
+        // one spawn attempt gets its own try below.
+        if (self.tryConnect(sock)) |fd| {
+            if (self.adopt(fd)) return true;
+            if (self.state == .unavailable and self.retryable) self.state = .idle;
+        }
+
         var bin_buf: [4096:0]u8 = undefined;
         const bin = findbin.find(&bin_buf) orelse {
             self.state = .unavailable;
@@ -808,20 +965,13 @@ pub const Engine = struct {
             self.retryable = false;
             return false;
         };
-
-        var dir_z: [4096:0]u8 = undefined;
-        const dz = std.fmt.bufPrintZ(&dir_z, "{s}", .{self.dir}) catch return self.failStart("helper directory path too long");
-        _ = c.mkdir(dz.ptr, 0o700);
-        var sock_z: [108:0]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_z, "{s}/web.sock", .{self.dir}) catch
-            return self.failStart("helper socket path exceeds the unix socket limit (use a shorter runtime dir)");
         // The helper's --cache-dir IS its `root_cache_path`, and CEF
         // demands every persistent context's jar be a child of it — so
         // the durable profile store root has to BE that dir. Without a
         // store the old volatile dir stays, and profiles stay refused.
         var cache_z: [4096:0]u8 = undefined;
-        if (self.store) |*s| {
-            _ = std.fmt.bufPrintZ(&cache_z, "{s}", .{s.root}) catch return self.failStart("helper cache path too long");
+        if (self.storeRoot()) |root| {
+            _ = std.fmt.bufPrintZ(&cache_z, "{s}", .{root}) catch return self.failStart("helper cache path too long");
         } else {
             _ = std.fmt.bufPrintZ(&cache_z, "{s}/web-cache", .{self.dir}) catch return self.failStart("helper cache path too long");
         }
@@ -901,6 +1051,14 @@ pub const Engine = struct {
             }
             _ = c.usleep(100_000);
         };
+        return self.handshake(fd, true);
+    }
+
+    /// Hello/ack on an established helper connection, shared by the
+    /// spawn path and adoption. `spawned` scopes the child-only work:
+    /// killing it on a failed handshake, and writing the presence file
+    /// (only the client that owns the pid can record it truthfully).
+    fn handshake(self: *Engine, fd: c_int, spawned: bool) bool {
         self.fd = fd;
         _ = c.fcntl(fd, c.F_SETFL, c.O_NONBLOCK);
         self.state = .ready;
@@ -915,7 +1073,7 @@ pub const Engine = struct {
         const ack_deadline = clock.nowMs() + 10_000;
         while (self.state == .ready and !self.cap_semantic and !self.cap_shm) {
             if (clock.nowMs() >= ack_deadline) {
-                self.killChild();
+                if (spawned) self.killChild();
                 self.lost();
                 self.reason = "the browser helper never answered the protocol handshake";
                 return false;
@@ -925,9 +1083,16 @@ pub const Engine = struct {
         if (self.state == .ready) {
             self.helper_gen +%= 1;
             if (self.helper_gen == 0) self.helper_gen = 1;
-            self.writePresence();
+            if (spawned) self.writePresence();
         }
         return self.state == .ready;
+    }
+
+    /// Join a helper another client of this instance spawned. No child
+    /// pid: teardown just closes the socket, and the helper exits with
+    /// its LAST client (Phase 1's contract).
+    fn adopt(self: *Engine, fd: c_int) bool {
+        return self.handshake(fd, false);
     }
 
     fn failStart(self: *Engine, reason: []const u8) bool {
@@ -1128,8 +1293,8 @@ pub const Engine = struct {
             },
             .named => |name| {
                 if (!webprofiles.validName(name)) return error.InvalidName;
-                const store = if (self.store) |*s| s else return error.StoreUnavailable;
-                const id = store.ensure(name) catch |err| return switch (err) {
+                if (!self.hasStore()) return error.StoreUnavailable;
+                const id = self.storeEnsure(name) catch |err| return switch (err) {
                     error.BadName => error.InvalidName,
                     error.Io, error.OutOfMemory => error.StoreIo,
                 };
@@ -1142,7 +1307,7 @@ pub const Engine = struct {
                         ctx.published_gen = self.helper_gen;
                     }
                     ctx.views += 1;
-                    store.touch(name, clock.nowMs());
+                    self.storeTouch(name);
                     return .{ .id = ctx.id, .ephemeral = false };
                 }
                 const owned = self.gpa.dupe(u8, name) catch return error.StoreIo;
@@ -1155,7 +1320,7 @@ pub const Engine = struct {
                     .published_gen = self.helper_gen,
                     .views = 1,
                 }) catch return error.StoreIo;
-                store.touch(name, clock.nowMs());
+                self.storeTouch(name);
                 return .{ .id = id, .ephemeral = false };
             },
         }
@@ -1241,7 +1406,7 @@ pub const Engine = struct {
     /// helper turns out to lack the caps.
     pub fn profilesAvailable(self: *Engine) bool {
         self.openStore();
-        if (self.store == null) return false;
+        if (!self.hasStore()) return false;
         if (self.state == .ready) return self.contextsSupported();
         return true;
     }
@@ -1249,7 +1414,7 @@ pub const Engine = struct {
     /// The sentence explaining a false `profilesAvailable`.
     pub fn profileUnavailableReason(self: *Engine) []const u8 {
         self.openStore();
-        if (self.store == null)
+        if (!self.hasStore())
             return if (self.store_reason.len > 0) self.store_reason else "the browser profile store is unavailable";
         if (self.state == .ready and !self.contextsSupported())
             return "this browser helper does not advertise isolated identity contexts (capabilities 'contexts' + 'contexts-fail-closed'); named profiles are refused rather than silently sharing the default cookie jar";
@@ -1260,33 +1425,52 @@ pub const Engine = struct {
     /// no store.
     pub fn profileStorePath(self: *Engine) ?[]const u8 {
         self.openStore();
-        if (self.store) |*s| return s.root;
-        return null;
+        return self.storeRoot();
     }
 
     /// Every known profile, store ∪ live. Never spawns the helper.
     pub fn profileList(self: *Engine, arena: std.mem.Allocator) ![]ProfileInfo {
         self.openStore();
         var out: std.ArrayList(ProfileInfo) = .empty;
+        if (self.remote) |*r| {
+            const rows = r.entries(arena) catch return out.items;
+            for (rows) |e| try self.appendProfileInfo(&out, arena, e.name, e.id, e.created_ms, e.last_used_ms);
+            return out.items;
+        }
         const store = if (self.store) |*s| s else return out.items;
         for (store.list()) |e| {
-            var views: u32 = 0;
-            var live = false;
-            for (self.live.items) |ctx| {
-                if (ctx.ephemeral or !std.mem.eql(u8, ctx.name, e.name)) continue;
-                views = ctx.views;
-                live = ctx.published_gen == self.helper_gen and self.state == .ready;
-            }
-            try out.append(arena, .{
-                .name = try arena.dupe(u8, e.name),
-                .id = e.id,
-                .views = views,
-                .created_ms = e.created_ms,
-                .last_used_ms = e.last_used_ms,
-                .live = live,
-            });
+            try self.appendProfileInfo(&out, arena, e.name, e.id, e.created_ms, e.last_used_ms);
         }
         return out.items;
+    }
+
+    /// One store row merged with this CLIENT's live view/publish state.
+    /// Another client's views in the same profile are not visible here
+    /// — the row still lists, only `views`/`live` are local truth.
+    fn appendProfileInfo(
+        self: *Engine,
+        out: *std.ArrayList(ProfileInfo),
+        arena: std.mem.Allocator,
+        name: []const u8,
+        id: u32,
+        created_ms: i64,
+        last_used_ms: i64,
+    ) !void {
+        var views: u32 = 0;
+        var live = false;
+        for (self.live.items) |ctx| {
+            if (ctx.ephemeral or !std.mem.eql(u8, ctx.name, name)) continue;
+            views = ctx.views;
+            live = ctx.published_gen == self.helper_gen and self.state == .ready;
+        }
+        try out.append(arena, .{
+            .name = try arena.dupe(u8, name),
+            .id = id,
+            .views = views,
+            .created_ms = created_ms,
+            .last_used_ms = last_used_ms,
+            .live = live,
+        });
     }
 
     /// How many open views are using `name` right now.
@@ -1307,21 +1491,41 @@ pub const Engine = struct {
     pub fn resetProfile(self: *Engine, name: []const u8) ProfileError!u32 {
         if (!webprofiles.validName(name)) return error.InvalidName;
         self.openStore();
-        const store = if (self.store) |*s| s else return error.StoreUnavailable;
+        if (!self.hasStore()) return error.StoreUnavailable;
+        // Local truth only: another client's views in this profile are
+        // invisible here, so a cross-client reset is best-effort — the
+        // engine keeps a destroyed context alive for existing browsers
+        // (contextDestroy's documented semantics) and CEF recreates a
+        // removed jar directory on demand.
         if (self.profileViewCount(name) > 0) return error.InUse;
-        const entry = store.find(name) orelse return error.NoProfile;
-        for (self.live.items, 0..) |ctx, i| {
-            if (ctx.ephemeral or !std.mem.eql(u8, ctx.name, name)) continue;
-            if (self.state == .ready) self.send(proto.ContextDestroy{ .id = ctx.id }) catch {};
-            const dead = self.live.orderedRemove(i);
-            if (dead.name.len > 0) self.gpa.free(dead.name);
-            break;
+        if (self.remote) |*r| {
+            self.dropLiveCtx(name);
+            const res = r.retire(name) catch |err| return switch (err) {
+                error.BadName => error.InvalidName,
+                error.Io, error.OutOfMemory => error.StoreIo,
+            };
+            if (!res.removed) return error.NoProfile;
+            return res.id;
         }
+        const store = &self.store.?;
+        const entry = store.find(name) orelse return error.NoProfile;
+        self.dropLiveCtx(name);
         _ = store.retire(name) catch |err| return switch (err) {
             error.BadName => error.InvalidName,
             error.Io, error.OutOfMemory => error.StoreIo,
         };
         return entry.id;
+    }
+
+    /// Unpublish this client's live context for `name`, if any.
+    fn dropLiveCtx(self: *Engine, name: []const u8) void {
+        for (self.live.items, 0..) |ctx, i| {
+            if (ctx.ephemeral or !std.mem.eql(u8, ctx.name, name)) continue;
+            if (self.state == .ready) self.send(proto.ContextDestroy{ .id = ctx.id }) catch {};
+            const dead = self.live.orderedRemove(i);
+            if (dead.name.len > 0) self.gpa.free(dead.name);
+            return;
+        }
     }
 
     // ---- enforced network policy ------------------------------------
@@ -1952,6 +2156,7 @@ pub const Engine = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.cap_contexts_fail_closed = true;
                     if (std.mem.eql(u8, cap, proto.CAP_NET_POLICY)) self.cap_net_policy = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.cap_multi_client = true;
                 }
             },
             .frame_buffer => {

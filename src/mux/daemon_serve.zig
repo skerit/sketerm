@@ -37,6 +37,7 @@ const build_options = @import("build_options");
 const wsproto = @import("../winstream/proto.zig");
 const wallMs = dmod.wallMs;
 const webstore = @import("webstore.zig");
+const webprofiles = @import("../ipc/webprofiles.zig");
 
 // ── broker ↔ worker control channel (process isolation) ─────────
 //
@@ -924,6 +925,13 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // the unknown frame, misattributable on a multiplexed
                 // connection.
                 .web_store = true,
+                // Broker-owned headless browser-profile stores (the
+                // web_op profile_* family). Capability, same reasoning
+                // as web_store — and its ABSENCE is what makes a new
+                // client fall back to taking the store flock itself
+                // against an old daemon, i.e. the exact pre-existing
+                // single-owner behavior.
+                .web_profiles = true,
                 // Arbitrary-host TCP egress with remote DNS
                 // (stream_open/stream_reply). Capability, same reasoning
                 // as lsp: an old daemon would `.err` on the unknown
@@ -3245,6 +3253,11 @@ pub fn fsWatchReadable(self: *Daemon) void {
 pub const WebOpReq = struct {
     req: u32 = 0,
     op: []const u8 = "",
+    /// profile_* ops: the MCP instance key whose store the op names
+    /// ("" = the anonymous store). Client-sent, same-user trust domain
+    /// (the store root is 0700); the daemon's own socket already scopes
+    /// which clients can reach it at all.
+    instance: []const u8 = "",
     url: []const u8 = "",
     title: []const u8 = "",
     /// history_query search text ("" = overall top entries).
@@ -3317,6 +3330,10 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
     };
     defer parsed.deinit();
     const r = parsed.value;
+    // The profile family has its own store (per instance, flock-held);
+    // routing it first keeps the history/bookmark store untouched for
+    // clients that only ever do profile work.
+    if (std.mem.startsWith(u8, r.op, "profile_")) return handleWebProfileOp(self, cl, r);
     const store = webStore(self) orelse return webReplyErr(cl, r.req, "web store unavailable");
 
     if (std.mem.eql(u8, r.op, "history_add")) {
@@ -3466,5 +3483,105 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
     } else {
         webReplyErr(cl, r.req, "unknown web op");
+    }
+}
+
+// === Broker-owned browser-profile stores (web_op profile_*) =========
+// The headless browser-profile store (jars + profiles.json + the
+// exclusivity flock) is owned by THIS daemon rather than by any one
+// MCP client, so N concurrent clients of one instance all resolve the
+// same (name -> id) table and the second is no longer refused with
+// "another sketerm mcp process owns the browser profile store". The
+// flock is held for the daemon's lifetime; a client asks for ids and
+// receives the store ROOT path to hand the helper as --cache-dir
+// (same host by construction — this daemon spawned next to its
+// clients' instance dir).
+
+/// The store for `instance`, opened on first use and kept. On refusal
+/// the reason is written to `err_out` and null returned.
+fn webProfileStore(self: *Daemon, instance: []const u8, err_out: *[]const u8) ?*webprofiles.Store {
+    if (self.isWorker()) {
+        // A worker only ever owns fds passed to it AFTER attach; the
+        // store must live in the one process that outlives clients.
+        err_out.* = "browser profile ops are served by the broker, not a session worker";
+        return null;
+    }
+    for (self.web_profile_stores.items) |*nps| {
+        if (std.mem.eql(u8, nps.key, instance)) return &nps.store;
+    }
+    var holder: c.pid_t = 0;
+    const inst: ?[]const u8 = if (instance.len == 0) null else instance;
+    const store = webprofiles.Store.open(self.allocator, inst, &holder) catch |err| {
+        err_out.* = switch (err) {
+            // Another PROCESS holds this root (an old-build MCP client
+            // flocking it itself, or a second daemon addressed at the
+            // same instance key). The client's fallback path then shows
+            // its own refusal sentence naming the pid.
+            error.Locked => "the browser profile store is owned by another process",
+            error.NoStateDir => "no state directory to keep browser profiles in (neither XDG_STATE_HOME nor HOME is set)",
+            error.PathTooLong => "the browser profile store path is too long for the browser helper's cache-path limit (use a shorter XDG_STATE_HOME)",
+            error.Io, error.OutOfMemory => "the browser profile store could not be created (check permissions on XDG_STATE_HOME/sketerm)",
+        };
+        return null;
+    };
+    const key = self.allocator.dupe(u8, instance) catch {
+        var dead = store;
+        dead.deinit();
+        err_out.* = "out of memory";
+        return null;
+    };
+    self.web_profile_stores.append(self.allocator, .{ .key = key, .store = store }) catch {
+        self.allocator.free(key);
+        var dead = store;
+        dead.deinit();
+        err_out.* = "out of memory";
+        return null;
+    };
+    return &self.web_profile_stores.items[self.web_profile_stores.items.len - 1].store;
+}
+
+fn handleWebProfileOp(self: *Daemon, cl: *Client, r: WebOpReq) void {
+    var why: []const u8 = "";
+    const store = webProfileStore(self, r.instance, &why) orelse
+        return webReplyErr(cl, r.req, why);
+
+    if (std.mem.eql(u8, r.op, "profile_open")) {
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .root = store.root });
+    } else if (std.mem.eql(u8, r.op, "profile_ensure")) {
+        const id = store.ensure(r.name) catch |err| return webReplyErr(cl, r.req, switch (err) {
+            error.BadName => "invalid profile name",
+            error.Io, error.OutOfMemory => "the browser profile store could not be written",
+        });
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .id = id, .root = store.root });
+    } else if (std.mem.eql(u8, r.op, "profile_list")) {
+        const Row = struct { name: []const u8, id: u32, created_ms: i64, last_used_ms: i64 };
+        var rows: std.ArrayList(Row) = .empty;
+        defer rows.deinit(self.allocator);
+        for (store.list()) |e| {
+            rows.append(self.allocator, .{
+                .name = e.name,
+                .id = e.id,
+                .created_ms = e.created_ms,
+                .last_used_ms = e.last_used_ms,
+            }) catch return webReplyErr(cl, r.req, "out of memory");
+        }
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .root = store.root, .profiles = rows.items });
+    } else if (std.mem.eql(u8, r.op, "profile_touch")) {
+        store.touch(r.name, wallMs());
+        cl.queueJson(.web_reply, .{ .req = r.req, .ok = true });
+    } else if (std.mem.eql(u8, r.op, "profile_retire")) {
+        const prior = store.find(r.name);
+        const removed = store.retire(r.name) catch |err| return webReplyErr(cl, r.req, switch (err) {
+            error.BadName => "invalid profile name",
+            error.Io, error.OutOfMemory => "the browser profile store could not be written",
+        });
+        cl.queueJson(.web_reply, .{
+            .req = r.req,
+            .ok = true,
+            .removed = removed,
+            .id = if (prior) |e| e.id else 0,
+        });
+    } else {
+        webReplyErr(cl, r.req, "unknown web profile op");
     }
 }

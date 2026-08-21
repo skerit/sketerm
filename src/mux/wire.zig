@@ -214,6 +214,17 @@ pub const FrameType = enum(u8) {
     /// daemons whose welcome advertises `web_store:true` — an older
     /// daemon would answer `.err`, misattributable on a multiplexed
     /// connection.
+    ///
+    /// The profile ops (profile_open/profile_ensure/profile_list/
+    /// profile_touch/profile_retire, each with `instance` and answered
+    /// by `web_reply`) ride the same frame but are gated on the
+    /// SEPARATE `web_profiles` welcome capability: they move the
+    /// headless browser-profile store's flock and id allocation into
+    /// the daemon, so N concurrent MCP clients of one instance share
+    /// one store instead of the second being refused. Served ONLY by
+    /// the broker (or a monolith daemon) — a worker answers with a
+    /// described error, because the store is process-exclusive and the
+    /// broker is the process that outlives every client.
     web_op = 32,
     /// Open a TCP stream to an ARBITRARY host:port FROM the daemon's
     /// host, with the hostname resolved at the daemon's end (remote

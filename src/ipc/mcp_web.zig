@@ -164,6 +164,16 @@ pub fn watchdogFd() c_int {
     return -1;
 }
 
+/// The broker-profile connection's fd (when the engine went through
+/// the daemon-owned store), so the central watchdog can abort a
+/// wedged profile round trip like any other mux connection.
+pub fn watchdogMuxFd() c_int {
+    if (g_engine) |*e| {
+        if (e.remote) |*r| return r.watchdogFd();
+    }
+    return -1;
+}
+
 fn headlessEngine() ?*webdrive.Engine {
     if (g_engine == null) {
         const alloc = g_headless_alloc orelse return null;

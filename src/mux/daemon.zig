@@ -2427,6 +2427,19 @@ pub const Daemon = struct {
     /// Lazily-opened web store (history/bookmarks/site settings) under
     /// $XDG_STATE_HOME/sketerm/web — see daemon_serve.handleWebOp.
     web_store: ?@import("webstore.zig").WebStore = null,
+    /// Headless browser-profile stores this daemon OWNS, one per
+    /// instance key, opened on the first web_op profile op naming that
+    /// key and held (flock included) for the daemon's lifetime — the
+    /// whole point: the store's owner must outlive every MCP client so
+    /// N of them can share one profile namespace. Broker/monolith only;
+    /// workers refuse the ops (daemon_serve.handleWebProfileOp).
+    web_profile_stores: std.ArrayList(NamedProfileStore) = .empty,
+
+    pub const NamedProfileStore = struct {
+        /// Owned copy of the instance key the client sent.
+        key: []u8,
+        store: @import("../ipc/webprofiles.zig").Store,
+    };
 
     const SocketPathState = enum { live, stale, unknown };
 
@@ -2639,6 +2652,11 @@ pub const Daemon = struct {
         if (self.dmabuf_importer) |*importer| importer.deinit();
         self.dmabuf_capabilities.deinit(self.allocator);
         if (self.web_store) |*ws| ws.deinit();
+        for (self.web_profile_stores.items) |*nps| {
+            nps.store.deinit();
+            self.allocator.free(nps.key);
+        }
+        self.web_profile_stores.deinit(self.allocator);
         for (self.clients.items) |cl| cl.deinit();
         self.clients.deinit(self.allocator);
         for (self.sessions.items) |s| s.deinit();
