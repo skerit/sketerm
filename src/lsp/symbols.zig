@@ -15,6 +15,7 @@ const Document = @import("../editor/document.zig").Document;
 const outline_mod = @import("../editor/outline.zig");
 const Outline = outline_mod.Outline;
 const pos = @import("position.zig");
+const jsonnum = @import("../util/jsonnum.zig");
 
 pub const Error = error{Stale} || std.mem.Allocator.Error;
 
@@ -87,13 +88,7 @@ fn strOf(v: ?std.json.Value) ?[]const u8 {
     };
 }
 
-fn intOf(v: ?std.json.Value) ?i64 {
-    const val = v orelse return null;
-    return switch (val) {
-        .integer => |i| i,
-        else => null,
-    };
-}
+const intOf = jsonnum.intOf;
 
 const testing = std.testing;
 const tr = @import("../editor/transaction.zig");

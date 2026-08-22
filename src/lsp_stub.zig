@@ -49,6 +49,8 @@
 const std = @import("std");
 const c = @import("c.zig").c;
 const rpc = @import("lsp/rpc.zig");
+const strz = @import("util/strz.zig");
+const jsonnum = @import("util/jsonnum.zig");
 
 var doc_text: std.ArrayList(u8) = .empty;
 var doc_uri: std.ArrayList(u8) = .empty;
@@ -395,10 +397,7 @@ fn wordAt(offset: usize) struct { start: usize, end: usize } {
     return .{ .start = s, .end = e };
 }
 
-fn isWordy(ch: u8) bool {
-    return (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
-        (ch >= '0' and ch <= '9') or ch == '_' or ch >= 0x80;
-}
+const isWordy = strz.isWordByte;
 
 fn replyHover(id: i64, params: std.json.Value) void {
     const off = offsetOf(objGet(params, "position") orelse .null);
@@ -870,18 +869,6 @@ fn strOf(v: ?std.json.Value) ?[]const u8 {
     };
 }
 
-fn intOf(v: ?std.json.Value) usize {
-    const val = v orelse return 0;
-    return switch (val) {
-        .integer => |i| if (i < 0) 0 else @intCast(i),
-        else => 0,
-    };
-}
+const intOf = jsonnum.countOf;
 
-fn versionOf(v: ?std.json.Value) ?i64 {
-    const value = v orelse return null;
-    return switch (value) {
-        .integer => |i| i,
-        else => null,
-    };
-}
+const versionOf = jsonnum.intOf;

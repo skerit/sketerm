@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const Rope = @import("../editor/rope.zig").Rope;
+const jsonnum = @import("../util/jsonnum.zig");
 
 /// `positionEncoding` values sketerm speaks. UTF-16 is the protocol
 /// default and the only one a pre-3.17 server understands.
@@ -177,14 +178,7 @@ pub fn parseRange(v: std.json.Value) Range {
     };
 }
 
-fn jsonU32(v: ?std.json.Value) u32 {
-    const val = v orelse return 0;
-    return switch (val) {
-        .integer => |i| if (i < 0) 0 else if (i > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(i),
-        .float => |f| if (f < 0) 0 else @intFromFloat(@min(f, @as(f64, std.math.maxInt(u32)))),
-        else => 0,
-    };
-}
+const jsonU32 = jsonnum.u32Of;
 
 // ======================================================================
 // Tests

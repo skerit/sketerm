@@ -21,6 +21,7 @@ const Allocator = std.mem.Allocator;
 const Document = @import("document.zig").Document;
 const tr = @import("transaction.zig");
 const sel_mod = @import("selection.zig");
+const strz = @import("../util/strz.zig");
 const Selection = sel_mod.Selection;
 const SelectionSet = sel_mod.SelectionSet;
 const vm = @import("view_model.zig");
@@ -168,10 +169,7 @@ fn isWs(b: u8) bool {
     return b == ' ' or b == '\t';
 }
 
-fn isWordByte(b: u8) bool {
-    return (b >= 'a' and b <= 'z') or (b >= 'A' and b <= 'Z') or
-        (b >= '0' and b <= '9') or b == '_' or b >= 0x80;
-}
+const isWordByte = strz.isWordByte;
 
 /// Content end (newline excluded) of `line`.
 fn lineEndOf(doc: *const Document, line: usize) usize {

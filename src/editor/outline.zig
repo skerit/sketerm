@@ -32,6 +32,7 @@ const std = @import("std");
 const Document = @import("document.zig").Document;
 const tr = @import("transaction.zig");
 const syntax = @import("syntax.zig");
+const strz = @import("../util/strz.zig");
 
 /// LSP `SymbolKind` folded onto what an outline can usefully show. The
 /// numbering is ours; `fromLsp` does the translation.
@@ -420,12 +421,7 @@ fn kindFor(spec: LangSpec, type_name: []const u8) ?Kind {
     return null;
 }
 
-fn containsStr(list: []const []const u8, needle: []const u8) bool {
-    for (list) |s| {
-        if (std.mem.eql(u8, s, needle)) return true;
-    }
-    return false;
-}
+const containsStr = strz.contains;
 
 /// The container declaration a wrapper node initialises, if any.
 fn containerChild(spec: LangSpec, node: syntax.TreeNode) ?syntax.TreeNode {
