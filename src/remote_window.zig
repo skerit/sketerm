@@ -243,6 +243,192 @@ pub fn blitRect(dst: []u8, dst_w: i32, dst_h: i32, src: []const u8, x: i32, y: i
     }
 }
 
+// ---- window collection, overview hash, opaque-resize --------------
+//
+// Both backends keep their windows in an `AutoHashMapUnmanaged(u32,
+// *Win)` and answer the same three questions about them: how many are
+// open, what does the switcher show, and has the overview changed.
+// The `Win` structs differ (the Wayland one carries a compositor
+// brain's worth of state, the winstream one a pixel backing), so the
+// shared code below is generic over that type and reaches into it
+// only through `Ops`. Adding a field the switcher shows is then one
+// edit here plus one accessor per backend, instead of two loops that
+// drift.
+
+/// One open remote-app window as a picker/switcher sees it. ONE shape
+/// for both backends: `id` is whatever handle the backend names the
+/// window by (a Wayland surface id, a winstream window id), and the
+/// Wayland-only facts are absent rather than forked into a second
+/// struct -- a winstream window is always floating and ships no app
+/// identity, so `embedded` is false and `app_id` empty there.
+/// Each `paintable` is a new reference the caller must unref.
+pub const WinInfo = struct {
+    id: u32,
+    title: [*:0]const u8,
+    app_id: []const u8 = "",
+    embedded: bool = false,
+    paintable: ?*c.GdkPaintable,
+};
+
+/// What the shared collection code needs to know about a backend's
+/// window struct. The two optional accessors are the Wayland-only
+/// concepts: leave them null and the backend behaves exactly as it did
+/// before it had them (no app_id and no embedding in the info, and
+/// neither hashed into the overview).
+pub fn Ops(comptime Win: type) type {
+    return struct {
+        /// The backend's handle for this window.
+        idOf: *const fn (*Win) u32,
+        /// The GtkWindow, for its title.
+        windowOf: *const fn (*Win) *c.GtkWindow,
+        /// Widget the live preview paintable wraps. NOT always the
+        /// picture: the Wayland side wraps the OVERLAY so popups and
+        /// subsurfaces are captured with the toplevel.
+        previewOf: *const fn (*Win) *c.GtkWidget,
+        /// The app's Wayland app_id, or null when it has none yet.
+        appIdOf: ?*const fn (*Win) ?[]const u8 = null,
+        /// Whether the window currently renders inside a pane.
+        embeddedOf: ?*const fn (*Win) bool = null,
+    };
+}
+
+fn titleOf(window: *c.GtkWindow) [*:0]const u8 {
+    return if (c.gtk_window_get_title(window)) |t| t else "";
+}
+
+/// Snapshot of a backend's open windows (caller frees the slice and
+/// unrefs every paintable). An allocation failure mid-way unrefs what
+/// it already took rather than leaking the paintables.
+pub fn windowInfos(
+    comptime Win: type,
+    comptime ops: Ops(Win),
+    allocator: std.mem.Allocator,
+    windows: *const std.AutoHashMapUnmanaged(u32, *Win),
+) []WinInfo {
+    var out: std.ArrayList(WinInfo) = .empty;
+    var it = windows.valueIterator();
+    while (it.next()) |w| {
+        const win = w.*;
+        const paintable: ?*c.GdkPaintable = @ptrCast(c.gtk_widget_paintable_new(ops.previewOf(win)));
+        out.append(allocator, .{
+            .id = ops.idOf(win),
+            .title = titleOf(ops.windowOf(win)),
+            .app_id = if (ops.appIdOf) |f| (f(win) orelse "") else "",
+            .embedded = if (ops.embeddedOf) |f| f(win) else false,
+            .paintable = paintable,
+        }) catch {
+            if (paintable) |value| c.g_object_unref(value);
+            break;
+        };
+    }
+    return out.toOwnedSlice(allocator) catch {
+        for (out.items) |info| if (info.paintable) |value| c.g_object_unref(value);
+        out.deinit(allocator);
+        return &.{};
+    };
+}
+
+/// Stable overview metadata hash: id, the backend's own facts, title.
+/// Pixel commits deliberately do not count, so a redrawing app does
+/// not churn the switcher. A backend without app_id / embedding hashes
+/// neither -- exactly what it hashed before it shared this code.
+pub fn overviewHash(
+    comptime Win: type,
+    comptime ops: Ops(Win),
+    seed: u64,
+    windows: *const std.AutoHashMapUnmanaged(u32, *Win),
+) u64 {
+    var hash = seed;
+    var it = windows.valueIterator();
+    while (it.next()) |w| {
+        const win = w.*;
+        const id = ops.idOf(win);
+        hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&id));
+        if (ops.embeddedOf) |f| {
+            const embedded = f(win);
+            hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&embedded));
+        }
+        if (ops.appIdOf) |f| {
+            if (f(win)) |app_id| hash = std.hash.Wyhash.hash(hash, app_id);
+        }
+        hash = std.hash.Wyhash.hash(hash, std.mem.span(titleOf(ops.windowOf(win))));
+    }
+    return hash;
+}
+
+/// GDK keycode -> evdev code, the units both backends send input in.
+/// Null below 8 (GDK's X11-inherited offset leaves no evdev code).
+pub fn evdevCode(gdk_keycode: c_uint) ?u32 {
+    if (gdk_keycode < 8) return null;
+    return @intCast(gdk_keycode - 8);
+}
+
+/// macOS opaque-resize workaround, one per remote-app window.
+///
+/// A non-opaque NSWindow only composites the region its backing was
+/// last painted into, so a growing window leaves the new area
+/// transparent until the app repaints it. The window is made opaque
+/// (CSS class `opaque-resize`, see `ensureTransparentCss`) for the
+/// duration of a resize and reverts ~400ms after it settles, so at
+/// rest the app's own transparency (rounded corners, translucent
+/// terminals) is preserved.
+///
+/// Lifetime: no liveness fence is needed because the timer's user
+/// data is this struct, embedded in the backend's heap `Win`, and
+/// every teardown path calls `cancel()` before that `Win` is freed.
+/// Nothing else may hold it.
+pub const OpaqueResize = struct {
+    /// The pending revert (0 = none).
+    settle_id: c_uint = 0,
+    /// The window the CSS class goes on. Null until `init`.
+    window: ?*c.GtkWindow = null,
+    /// Optional "not yet" predicate: while it answers true the revert
+    /// keeps deferring instead of firing. The Wayland backend holds
+    /// the window opaque while the pointer sits in a resize-edge band,
+    /// because toggling opacity DURING a macOS interactive resize
+    /// disrupts its event session (the mouse-up gets lost, leaving the
+    /// resize stuck).
+    hold: ?*const fn (ctx: ?*anyopaque) bool = null,
+    hold_ctx: ?*anyopaque = null,
+
+    /// Milliseconds of quiet before the window goes transparent again.
+    const settle_ms: c_uint = 400;
+
+    pub fn init(window: *c.GtkWindow, hold: ?*const fn (ctx: ?*anyopaque) bool, hold_ctx: ?*anyopaque) OpaqueResize {
+        return .{ .window = window, .hold = hold, .hold_ctx = hold_ctx };
+    }
+
+    /// Go opaque now and (re)start the settle timer. Idempotent.
+    pub fn arm(self: *OpaqueResize) void {
+        const window = self.window orelse return;
+        c.gtk_widget_add_css_class(@ptrCast(window), "opaque-resize");
+        if (self.settle_id != 0) _ = c.g_source_remove(self.settle_id);
+        self.settle_id = c.g_timeout_add(settle_ms, @ptrCast(&revertCb), self);
+    }
+
+    /// Drop the pending revert (window teardown). The CSS class is
+    /// left alone -- the window is going away with it.
+    pub fn cancel(self: *OpaqueResize) void {
+        if (self.settle_id != 0) {
+            _ = c.g_source_remove(self.settle_id);
+            self.settle_id = 0;
+        }
+    }
+
+    fn revertCb(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *OpaqueResize = @ptrCast(@alignCast(user.?));
+        self.settle_id = 0;
+        if (self.hold) |f| {
+            if (f(self.hold_ctx)) {
+                self.settle_id = c.g_timeout_add(settle_ms, @ptrCast(&revertCb), self);
+                return 0;
+            }
+        }
+        if (self.window) |window| c.gtk_widget_remove_css_class(@ptrCast(window), "opaque-resize");
+        return 0;
+    }
+};
+
 test "blitRect places a rect and clips out-of-bounds" {
     // 4x3 BGRA backing, zeroed.
     var dst = [_]u8{0} ** (4 * 3 * 4);

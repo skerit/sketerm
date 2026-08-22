@@ -282,10 +282,11 @@ pub const AppHost = struct {
         /// The last press was forwarded to the app (not consumed as a
         /// host-window resize) — so its release is forwarded too.
         fwd_press: bool = false,
-        /// macOS only: debounce timer that reverts the window to
-        /// transparent after a resize settles (0 = inactive). See
-        /// armOpaqueResize.
-        opaque_settle_id: c_uint = 0,
+        /// macOS only: keeps the window opaque while it is being
+        /// resized (shared with the winstream backend). Its hold
+        /// predicate is `stillOnEdge` below, so opacity never flips
+        /// mid-drag.
+        opaque_resize: rw.OpaqueResize = .{},
         /// Rendered inside the pane's embed box instead of a floating
         /// window. The GtkWindow still exists (hidden, childless) so
         /// window-based code paths stay valid; pop-out re-childs and
@@ -458,8 +459,8 @@ pub const AppHost = struct {
             // *during* a macOS interactive resize disrupts its event
             // session (the mouse-up gets lost, leaving the resize stuck).
             // While hovering an edge the revert keeps deferring (see
-            // opaqueRevertCb), so it stays stable through the whole drag.
-            if (builtin.os.tag == .macos and edge != 0) self.armOpaqueResize();
+            // OpaqueResize.hold), so it stays stable through the whole drag.
+            if (builtin.os.tag == .macos and edge != 0) self.opaque_resize.arm();
         }
 
         /// Widget → surface coordinates. The picture shows the displayed
@@ -499,40 +500,14 @@ pub const AppHost = struct {
             return out;
         }
 
-        /// macOS: a non-opaque NSWindow only composites the region its
-        /// backing was last painted into, so a growing window clips the
-        /// new area. Make the window opaque for the duration of a resize
-        /// (the grown region then composites), reverting to transparent
-        /// ~400ms after it settles — the grown region stays painted, and
-        /// at rest the app's own transparency (rounded corners,
-        /// translucent terminals) is preserved. Idempotent per tick.
-        fn armOpaqueResize(self: *Win) void {
-            c.gtk_widget_add_css_class(@ptrCast(self.window), "opaque-resize");
-            if (self.opaque_settle_id != 0) _ = c.g_source_remove(self.opaque_settle_id);
-            self.opaque_settle_id = c.g_timeout_add(400, @ptrCast(&opaqueRevertCb), self);
-        }
-
-        fn cancelOpaqueResize(self: *Win) void {
-            if (self.opaque_settle_id != 0) {
-                _ = c.g_source_remove(self.opaque_settle_id);
-                self.opaque_settle_id = 0;
-            }
+        /// The revert keeps deferring while the pointer sits on a
+        /// resize edge: a drag may be mid-flight or about to start, and
+        /// flipping opacity during a macOS interactive resize loses the
+        /// mouse-up, leaving the resize stuck.
+        fn stillOnEdge(ctx: ?*anyopaque) bool {
+            return cast.userData(Win, ctx).hover_edge != 0;
         }
     };
-
-    fn opaqueRevertCb(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const win = cast.userData(Win, user);
-        win.opaque_settle_id = 0;
-        // Still on a resize edge (a drag may be mid-flight, or about to
-        // start) — keep opaque and check again later, so opacity never
-        // flips during the macOS resize session.
-        if (win.hover_edge != 0) {
-            win.opaque_settle_id = c.g_timeout_add(400, @ptrCast(&opaqueRevertCb), win);
-            return 0;
-        }
-        c.gtk_widget_remove_css_class(@ptrCast(win.window), "opaque-resize");
-        return 0;
-    }
 
     /// Stamp the compositor clock (frame-callback and input event
     /// timestamps) from the GLib monotonic clock.
@@ -632,7 +607,7 @@ pub const AppHost = struct {
                 if (self.embed_box) |box| c.gtk_box_remove(@ptrCast(box), w.*.overlay);
             }
             // Break the close-request link before gtk teardown.
-            w.*.cancelOpaqueResize();
+            w.*.opaque_resize.cancel();
             if (w.*.app_id) |aid| self.allocator.free(aid);
             if (w.*.icon_tex) |tex| c.g_object_unref(tex);
             // Before gtk_window_destroy below: severing the IM
@@ -943,17 +918,42 @@ pub const AppHost = struct {
         return self.windows.count();
     }
 
+    /// How `remote_window.zig` reads a forwarded window. All five
+    /// accessors are filled: this backend is the one with an app
+    /// identity and an embedded mode.
+    const win_ops: rw.Ops(Win) = .{
+        .idOf = struct {
+            fn f(win: *Win) u32 {
+                return win.surface;
+            }
+        }.f,
+        .windowOf = struct {
+            fn f(win: *Win) *c.GtkWindow {
+                return win.window;
+            }
+        }.f,
+        // The OVERLAY, not the picture: a preview must include the
+        // popups and subsurfaces drawn on top of the toplevel.
+        .previewOf = struct {
+            fn f(win: *Win) *c.GtkWidget {
+                return win.overlay;
+            }
+        }.f,
+        .appIdOf = struct {
+            fn f(win: *Win) ?[]const u8 {
+                return win.app_id;
+            }
+        }.f,
+        .embeddedOf = struct {
+            fn f(win: *Win) bool {
+                return win.embedded;
+            }
+        }.f,
+    };
+
     /// Stable overview metadata hash; pixel commits deliberately do not count.
     pub fn overviewHash(self: *AppHost, seed: u64) u64 {
-        var hash = seed;
-        var it = self.windows.valueIterator();
-        while (it.next()) |win| {
-            hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&win.*.surface));
-            hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&win.*.embedded));
-            if (win.*.app_id) |app_id| hash = std.hash.Wyhash.hash(hash, app_id);
-            if (c.gtk_window_get_title(win.*.window)) |title| hash = std.hash.Wyhash.hash(hash, std.mem.span(title));
-        }
-        return hash;
+        return rw.overviewHash(Win, win_ops, seed, &self.windows);
     }
 
     pub fn presentAll(self: *AppHost) void {
@@ -963,40 +963,13 @@ pub const AppHost = struct {
         }
     }
 
-    /// One open window as a picker/switcher sees it; each paintable must be unrefed.
-    pub const WinInfo = struct {
-        surface: u32,
-        title: [*:0]const u8,
-        app_id: []const u8,
-        embedded: bool,
-        paintable: ?*c.GdkPaintable,
-    };
+    /// One open window as a picker/switcher sees it -- the one shape
+    /// both remote-app backends report; each paintable must be unrefed.
+    pub const WinInfo = rw.WinInfo;
 
     /// Snapshot of the open windows (caller frees the slice).
     pub fn windowInfos(self: *AppHost, allocator: std.mem.Allocator) []WinInfo {
-        var out: std.ArrayList(WinInfo) = .empty;
-        var it = self.windows.valueIterator();
-        while (it.next()) |w| {
-            const paintable: ?*c.GdkPaintable = @ptrCast(c.gtk_widget_paintable_new(w.*.overlay));
-            const t = c.gtk_window_get_title(w.*.window);
-            out.append(allocator, .{
-                .surface = w.*.surface,
-                .title = if (t) |tt| tt else "",
-                .app_id = if (w.*.app_id) |id| id else "",
-                .embedded = w.*.embedded,
-                // WidgetPaintable follows later invalidations and captures
-                // popup/subsurface children in the toplevel overlay.
-                .paintable = paintable,
-            }) catch {
-                if (paintable) |value| c.g_object_unref(value);
-                break;
-            };
-        }
-        return out.toOwnedSlice(allocator) catch {
-            for (out.items) |info| if (info.paintable) |value| c.g_object_unref(value);
-            out.deinit(allocator);
-            return &.{};
-        };
+        return rw.windowInfos(Win, win_ops, allocator, &self.windows);
     }
 
     /// Raise ONE floating window (switcher activate). Embedded
@@ -1432,7 +1405,7 @@ pub const AppHost = struct {
         win.rec.abort();
         if (win.app_id) |aid| self.allocator.free(aid);
         if (win.icon_tex) |tex| c.g_object_unref(tex);
-        win.cancelOpaqueResize();
+        win.opaque_resize.cancel();
         _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
         c.gtk_window_destroy(win.window);
         self.allocator.destroy(win);
@@ -1465,7 +1438,14 @@ pub const AppHost = struct {
         };
         const window = widgets.window;
         const picture = widgets.picture;
-        win.* = .{ .host = self, .surface = surface, .window = window, .overlay = widgets.overlay, .picture = picture };
+        win.* = .{
+            .host = self,
+            .surface = surface,
+            .window = window,
+            .overlay = widgets.overlay,
+            .picture = picture,
+            .opaque_resize = rw.OpaqueResize.init(window, Win.stillOnEdge, win),
+        };
         self.windows.put(self.allocator, surface, win) catch {
             c.gtk_window_destroy(window);
             self.allocator.destroy(win);
@@ -1888,8 +1868,8 @@ pub const AppHost = struct {
         // GDK's low modifier bits are the X11/xkb mod order the
         // pc105/us keymap uses (shift, lock, ctrl, mod1…).
         win.host.seatMods(@as(u32, @intCast(state)) & 0xff, 0, 0, 0);
-        if (keycode >= 8)
-            win.host.seatKey(@intCast(keycode - 8), pressed);
+        if (rw.evdevCode(keycode)) |key|
+            win.host.seatKey(key, pressed);
         win.host.flushHost();
     }
 
@@ -2421,7 +2401,7 @@ pub const AppHost = struct {
         // Before the maximize early-return so it also covers maximize:
         // keep the window opaque while it grows (else macOS clips the
         // new area), reverting after the resize settles.
-        if (builtin.os.tag == .macos) win.armOpaqueResize();
+        if (builtin.os.tag == .macos) win.opaque_resize.arm();
         var st = winStates(win);
         // Maximize/fullscreen sizing is driven from onComputeSize (the
         // allocation isn't settled here). This handler owns the normal

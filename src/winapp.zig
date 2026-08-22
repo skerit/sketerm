@@ -46,9 +46,9 @@ pub const WsHost = struct {
         /// frames at a new resolution; we resize the window to match.
         w: i32 = 0,
         h: i32 = 0,
-        /// Pending revert of the macOS opaque-resize workaround (0 =
-        /// none). See armOpaqueResize.
-        opaque_settle_id: c_uint = 0,
+        /// macOS opaque-resize workaround (shared with the Wayland
+        /// backend); inert on every other platform.
+        opaque_resize: rw.OpaqueResize = .{},
 
         /// Draggable (title-bar) rects measured by the remote daemon's
         /// Accessibility hit-test (proto win_drag), in the window's point
@@ -105,25 +105,6 @@ pub const WsHost = struct {
                 if (x >= bx and x < bx + bw and y >= by and y < by + bh) return true;
             }
             return false;
-        }
-
-        /// macOS: a non-opaque NSWindow only composites the region its
-        /// backing was last painted into, so a growing window leaves the
-        /// new area transparent until the app repaints it. Make the
-        /// window opaque for the duration of a resize (the grown region
-        /// then composites), reverting ~400ms after it settles. Mirrors
-        /// wlapp.zig's armOpaqueResize for the winstream path.
-        fn armOpaqueResize(win: *Win) void {
-            c.gtk_widget_add_css_class(@ptrCast(win.window), "opaque-resize");
-            if (win.opaque_settle_id != 0) _ = c.g_source_remove(win.opaque_settle_id);
-            win.opaque_settle_id = c.g_timeout_add(400, @ptrCast(&opaqueRevertCb), win);
-        }
-
-        fn cancelOpaqueResize(win: *Win) void {
-            if (win.opaque_settle_id != 0) {
-                _ = c.g_source_remove(win.opaque_settle_id);
-                win.opaque_settle_id = 0;
-            }
         }
 
         /// Queue a pointer unit for this window and flush. `detail`
@@ -216,7 +197,7 @@ pub const WsHost = struct {
     pub fn destroy(self: *WsHost) void {
         var it = self.windows.valueIterator();
         while (it.next()) |w| {
-            w.*.cancelOpaqueResize();
+            w.*.opaque_resize.cancel();
             w.*.rec.abort();
             self.allocator.free(w.*.drag_rects);
             w.*.backing.deinit(self.allocator);
@@ -233,32 +214,35 @@ pub const WsHost = struct {
         self.allocator.destroy(self);
     }
 
-    pub const WinInfo = struct {
-        id: u32,
-        title: [*:0]const u8,
-        paintable: ?*c.GdkPaintable,
+    /// A streamed window as the switcher sees it -- the same shape the
+    /// Wayland backend reports, with the Wayland-only fields left at
+    /// their defaults (a streamed window is always floating and ships
+    /// no app identity).
+    pub const WinInfo = rw.WinInfo;
+
+    /// How `remote_window.zig` reads a streamed window. No app_id and
+    /// no embedding accessor: this backend has neither concept.
+    const win_ops: rw.Ops(Win) = .{
+        .idOf = struct {
+            fn f(win: *Win) u32 {
+                return win.id;
+            }
+        }.f,
+        .windowOf = struct {
+            fn f(win: *Win) *c.GtkWindow {
+                return win.window;
+            }
+        }.f,
+        .previewOf = struct {
+            fn f(win: *Win) *c.GtkWidget {
+                return win.picture;
+            }
+        }.f,
     };
 
     /// Snapshot of open streamed windows; each paintable must be unrefed.
     pub fn windowInfos(self: *WsHost, allocator: std.mem.Allocator) []WinInfo {
-        var out: std.ArrayList(WinInfo) = .empty;
-        var it = self.windows.valueIterator();
-        while (it.next()) |w| {
-            const paintable: ?*c.GdkPaintable = @ptrCast(c.gtk_widget_paintable_new(w.*.picture));
-            out.append(allocator, .{
-                .id = w.*.id,
-                .title = if (c.gtk_window_get_title(w.*.window)) |title| title else "",
-                .paintable = paintable,
-            }) catch {
-                if (paintable) |value| c.g_object_unref(value);
-                break;
-            };
-        }
-        return out.toOwnedSlice(allocator) catch {
-            for (out.items) |info| if (info.paintable) |value| c.g_object_unref(value);
-            out.deinit(allocator);
-            return &.{};
-        };
+        return rw.windowInfos(Win, win_ops, allocator, &self.windows);
     }
 
     pub fn presentWindow(self: *WsHost, id: u32) void {
@@ -272,13 +256,7 @@ pub const WsHost = struct {
 
     /// Stable overview metadata hash; pixel commits deliberately do not count.
     pub fn overviewHash(self: *const WsHost, seed: u64) u64 {
-        var hash = seed;
-        var it = self.windows.valueIterator();
-        while (it.next()) |win| {
-            hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&win.*.id));
-            if (c.gtk_window_get_title(win.*.window)) |title| hash = std.hash.Wyhash.hash(hash, std.mem.span(title));
-        }
-        return hash;
+        return rw.overviewHash(Win, win_ops, seed, &self.windows);
     }
 
     pub fn takeOut(self: *WsHost) []const u8 {
@@ -356,7 +334,7 @@ pub const WsHost = struct {
                 const id = std.mem.readInt(u32, u.payload[0..4], .little);
                 const win = self.windows.get(id) orelse return;
                 _ = self.windows.remove(id);
-                win.cancelOpaqueResize();
+                win.opaque_resize.cancel();
                 win.rec.abort();
                 self.allocator.free(win.drag_rects);
                 win.backing.deinit(self.allocator);
@@ -408,7 +386,7 @@ pub const WsHost = struct {
                 win.w = w;
                 win.h = h;
                 c.gtk_window_set_default_size(win.window, w, h);
-                if (builtin.os.tag == .macos) win.armOpaqueResize();
+                if (builtin.os.tag == .macos) win.opaque_resize.arm();
             }
             return win;
         }
@@ -424,7 +402,15 @@ pub const WsHost = struct {
         };
         const window = widgets.window;
         const picture = widgets.picture;
-        win.* = .{ .host = self, .id = id, .window = window, .picture = picture, .w = w, .h = h };
+        win.* = .{
+            .host = self,
+            .id = id,
+            .window = window,
+            .picture = picture,
+            .w = w,
+            .h = h,
+            .opaque_resize = rw.OpaqueResize.init(window, null, null),
+        };
         self.windows.put(self.allocator, id, win) catch {
             c.gtk_window_destroy(window);
             self.allocator.destroy(win);
@@ -459,13 +445,6 @@ pub const WsHost = struct {
 
     fn flush(self: *WsHost) void {
         if (self.on_flush) |f| f(self.flush_ctx);
-    }
-
-    fn opaqueRevertCb(user: ?*anyopaque) callconv(.c) c.gboolean {
-        const win = cast.userData(Win, user);
-        win.opaque_settle_id = 0;
-        c.gtk_widget_remove_css_class(@ptrCast(win.window), "opaque-resize");
-        return 0;
     }
 
     fn onCloseRequest(_: ?*c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gboolean {
@@ -559,11 +538,11 @@ pub const WsHost = struct {
     }
 
     fn onKeyPress(_: ?*c.GtkEventControllerKey, _: c_uint, keycode: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) c.gboolean {
-        if (keycode >= 8) cast.userData(Win, user).sendKey(keycode - 8, true, state);
+        if (rw.evdevCode(keycode)) |key| cast.userData(Win, user).sendKey(key, true, state);
         return 1;
     }
 
     fn onKeyRelease(_: ?*c.GtkEventControllerKey, _: c_uint, keycode: c_uint, state: c.GdkModifierType, user: ?*anyopaque) callconv(.c) void {
-        if (keycode >= 8) cast.userData(Win, user).sendKey(keycode - 8, false, state);
+        if (rw.evdevCode(keycode)) |key| cast.userData(Win, user).sendKey(key, false, state);
     }
 };

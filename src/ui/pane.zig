@@ -2096,7 +2096,7 @@ fn rebuildTitlebarApps(self: *Pane) void {
                         .allocator = self.allocator,
                         .pane = self,
                         .host = @ptrCast(na.host),
-                        .surface = info.surface,
+                        .surface = info.id,
                     };
                     _ = c.g_signal_connect_data(
                         btn,

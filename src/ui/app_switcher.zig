@@ -503,9 +503,9 @@ fn addApplicationRows(self: *Switcher, term: *Terminal, pane: ?*Pane) usize {
             const entry = appendRow(self, .applications, if (title.len > 0) title else app_id, subtitle, info.paintable, "application-x-executable-symbolic", false) orelse continue;
             entry.kind = .native_window;
             entry.native_host = native.host;
-            entry.surface = info.surface;
+            entry.surface = info.id;
             entry.pane = if (info.embedded) pane else null;
-            setIdentity(self, entry, "native:{d}\x00{d}\x00{d}", .{ @intFromPtr(term), native.id, info.surface });
+            setIdentity(self, entry, "native:{d}\x00{d}\x00{d}", .{ @intFromPtr(term), native.id, info.id });
             count += 1;
         }
     }
