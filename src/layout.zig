@@ -175,14 +175,58 @@ pub fn defaultLayoutPath(allocator: std.mem.Allocator) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/sketerm-default.json", .{});
 }
 
+/// Arena + private directory for the save/load round-trip tests.
+///
+/// `a` points into the struct, so this is initialised IN PLACE
+/// (`var rt: RoundTrip = undefined; rt.init()`) and never copied.
+const RoundTrip = struct {
+    arena: std.heap.ArenaAllocator,
+    tmp_dir: std.testing.TmpDir,
+    a: std.mem.Allocator,
+
+    fn init(self: *RoundTrip) void {
+        self.arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        self.a = self.arena.allocator();
+        self.tmp_dir = std.testing.tmpDir(.{});
+    }
+
+    fn deinit(self: *RoundTrip) void {
+        self.tmp_dir.cleanup();
+        self.arena.deinit();
+    }
+
+    fn at(self: *RoundTrip, comptime leaf: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(self.a, ".zig-cache/tmp/{s}/" ++ leaf, .{&self.tmp_dir.sub_path});
+    }
+
+    /// Save `layout` to `leaf` and load it straight back; caller deinits.
+    fn cycle(self: *RoundTrip, comptime leaf: []const u8, layout: Layout) !std.json.Parsed(Layout) {
+        const path = try self.at(leaf);
+        try save(self.a, layout, path);
+        return load(self.a, path);
+    }
+
+    /// Load a hand-written file, for the older-schema cases.
+    ///
+    /// Zig 0.16's std.fs APIs want an Io we do not have here, so the
+    /// bytes go out through libc exactly as the copies did.
+    fn loadRaw(self: *RoundTrip, comptime leaf: []const u8, json: []const u8) !std.json.Parsed(Layout) {
+        const path = try self.at(leaf);
+        var fp_z: [4096]u8 = undefined;
+        if (path.len >= fp_z.len) return error.PathTooLong;
+        @memcpy(fp_z[0..path.len], path);
+        fp_z[path.len] = 0;
+        const fp = c.fopen(@ptrCast(&fp_z), "wb") orelse return error.WriteFailed;
+        _ = c.fwrite(json.ptr, 1, json.len, fp);
+        _ = c.fclose(fp);
+        return load(self.a, path);
+    }
+};
+
 test "round trip preserves editor pane state" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
-    const file_path = try std.fmt.allocPrint(a, "{s}/editor.json", .{real_path});
+    var rt: RoundTrip = undefined;
+    rt.init();
+    defer rt.deinit();
 
     const cmd = [_][]const u8{"sh"};
     const files = [_]editor_model.FileState{
@@ -194,8 +238,7 @@ test "round trip preserves editor pane state" {
         .command = &cmd,
         .editor = .{ .files = &files, .active = 1 },
     } } }};
-    try save(a, Layout{ .tabs = &tabs }, file_path);
-    const parsed = try load(a, file_path);
+    const parsed = try rt.cycle("editor.json", Layout{ .tabs = &tabs });
     defer parsed.deinit();
     const state = parsed.value.tabs[0].tree.pane.editor.?;
     try std.testing.expectEqual(@as(u64, 1), state.active);
@@ -205,15 +248,9 @@ test "round trip preserves editor pane state" {
 }
 
 test "round trip with split tree" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-
-    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
-    const file_path = try std.fmt.allocPrint(a, "{s}/lay.json", .{real_path});
+    var rt: RoundTrip = undefined;
+    rt.init();
+    defer rt.deinit();
 
     const cmd1 = [_][]const u8{ "bash", "-l" };
     const cmd2 = [_][]const u8{ "nvim", "." };
@@ -230,9 +267,7 @@ test "round trip with split tree" {
         .{ .title = "single", .tree = .{ .pane = .{ .cwd = "/var", .command = &cmd1 } } },
     };
     const layout = Layout{ .tabs = &tabs };
-    try save(a, layout, file_path);
-
-    const parsed = try load(a, file_path);
+    const parsed = try rt.cycle("lay.json", layout);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u32, 2), parsed.value.version);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.tabs.len);
@@ -247,14 +282,9 @@ test "round trip with split tree" {
 }
 
 test "round trip preserves PaneSpec.profile" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
-    const file_path = try std.fmt.allocPrint(a, "{s}/profile.json", .{real_path});
+    var rt: RoundTrip = undefined;
+    rt.init();
+    defer rt.deinit();
 
     const cmd = [_][]const u8{ "bash", "-l" };
     var tabs = [_]TabSpec{
@@ -264,9 +294,7 @@ test "round trip preserves PaneSpec.profile" {
             .profile = "ssh-prod",
         } } },
     };
-    try save(a, .{ .tabs = &tabs }, file_path);
-
-    const parsed = try load(a, file_path);
+    const parsed = try rt.cycle("profile.json", .{ .tabs = &tabs });
     defer parsed.deinit();
     switch (parsed.value.tabs[0].tree) {
         .pane => |p| try std.testing.expectEqualStrings("ssh-prod", p.profile),
@@ -275,14 +303,9 @@ test "round trip preserves PaneSpec.profile" {
 }
 
 test "round trip preserves TabSpec.pinned" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
-    const file_path = try std.fmt.allocPrint(a, "{s}/pinned.json", .{real_path});
+    var rt: RoundTrip = undefined;
+    rt.init();
+    defer rt.deinit();
 
     const cmd = [_][]const u8{"bash"};
     var tabs = [_]TabSpec{
@@ -295,9 +318,7 @@ test "round trip preserves TabSpec.pinned" {
             .command = &cmd,
         } } }, // pinned defaults to false
     };
-    try save(a, .{ .tabs = &tabs }, file_path);
-
-    const parsed = try load(a, file_path);
+    const parsed = try rt.cycle("pinned.json", .{ .tabs = &tabs });
     defer parsed.deinit();
     try std.testing.expectEqual(true, parsed.value.tabs[0].pinned);
     try std.testing.expectEqual(false, parsed.value.tabs[1].pinned);
@@ -305,14 +326,9 @@ test "round trip preserves TabSpec.pinned" {
 }
 
 test "round trip preserves per-tab effect toggles, defaults on old files" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
-    const file_path = try std.fmt.allocPrint(a, "{s}/fx.json", .{real_path});
+    var rt: RoundTrip = undefined;
+    rt.init();
+    defer rt.deinit();
 
     const cmd = [_][]const u8{"bash"};
     var tabs = [_]TabSpec{
@@ -321,9 +337,7 @@ test "round trip preserves per-tab effect toggles, defaults on old files" {
         // Defaults.
         .{ .title = "plain", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } } },
     };
-    try save(a, .{ .tabs = &tabs }, file_path);
-
-    const parsed = try load(a, file_path);
+    const parsed = try rt.cycle("fx.json", .{ .tabs = &tabs });
     defer parsed.deinit();
     try std.testing.expectEqual(false, parsed.value.tabs[0].show_activity);
     try std.testing.expectEqual(true, parsed.value.tabs[0].warn_inactive);
@@ -334,14 +348,9 @@ test "round trip preserves per-tab effect toggles, defaults on old files" {
 }
 
 test "round trip preserves tab-tree nesting; old files load flat" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
-    const file_path = try std.fmt.allocPrint(a, "{s}/tree.json", .{real_path});
+    var rt: RoundTrip = undefined;
+    rt.init();
+    defer rt.deinit();
 
     const cmd = [_][]const u8{"sh"};
     var tabs = [_]TabSpec{
@@ -349,9 +358,7 @@ test "round trip preserves tab-tree nesting; old files load flat" {
         .{ .title = "child", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } }, .tree_parent = 0 },
         .{ .title = "root2", .tree = .{ .pane = .{ .cwd = "/", .command = &cmd } } },
     };
-    try save(a, .{ .tabs = &tabs }, file_path);
-
-    const parsed = try load(a, file_path);
+    const parsed = try rt.cycle("tree.json", .{ .tabs = &tabs });
     defer parsed.deinit();
     try std.testing.expectEqual(@as(?u32, null), parsed.value.tabs[0].tree_parent);
     try std.testing.expectEqual(true, parsed.value.tabs[0].collapsed);
@@ -366,29 +373,16 @@ test "round trip preserves tab-tree nesting; old files load flat" {
         \\    "tree": { "pane": { "cwd": "/", "command": ["sh"] } } }
         \\] }
     ;
-    const old_path = try std.fmt.allocPrint(a, "{s}/oldtree.json", .{real_path});
-    var fp_z: [4096]u8 = undefined;
-    if (old_path.len >= fp_z.len) return error.PathTooLong;
-    @memcpy(fp_z[0..old_path.len], old_path);
-    fp_z[old_path.len] = 0;
-    const fp = c.fopen(@ptrCast(&fp_z), "wb") orelse return error.WriteFailed;
-    _ = c.fwrite(old_json.ptr, 1, old_json.len, fp);
-    _ = c.fclose(fp);
-    const old_parsed = try load(a, old_path);
+    const old_parsed = try rt.loadRaw("oldtree.json", old_json);
     defer old_parsed.deinit();
     try std.testing.expectEqual(@as(?u32, null), old_parsed.value.tabs[0].tree_parent);
     try std.testing.expectEqual(false, old_parsed.value.tabs[0].collapsed);
 }
 
 test "load tolerates older JSON without profile / pinned fields" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
-    const file_path = try std.fmt.allocPrint(a, "{s}/old.json", .{real_path});
+    var rt: RoundTrip = undefined;
+    rt.init();
+    defer rt.deinit();
 
     // Hand-write a minimal v2 layout missing the new fields. Should
     // still parse via ignore_unknown_fields semantics (strictly a
@@ -399,17 +393,7 @@ test "load tolerates older JSON without profile / pinned fields" {
         \\    "tree": { "pane": { "cwd": "/", "command": ["sh"] } } }
         \\] }
     ;
-    // Write the hand-crafted JSON via libc — Zig 0.16's std.fs APIs
-    // require an Io we don't have here.
-    var fp_z: [4096]u8 = undefined;
-    if (file_path.len >= fp_z.len) return error.PathTooLong;
-    @memcpy(fp_z[0..file_path.len], file_path);
-    fp_z[file_path.len] = 0;
-    const fp = c.fopen(@ptrCast(&fp_z), "wb") orelse return error.WriteFailed;
-    _ = c.fwrite(old_json.ptr, 1, old_json.len, fp);
-    _ = c.fclose(fp);
-
-    const parsed = try load(a, file_path);
+    const parsed = try rt.loadRaw("old.json", old_json);
     defer parsed.deinit();
     try std.testing.expectEqual(false, parsed.value.tabs[0].pinned);
     // Pre-title_locked file: null means "treat as renamed" on restore.
@@ -421,13 +405,9 @@ test "load tolerates older JSON without profile / pinned fields" {
 }
 
 test "round trip preserves web pane state" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
-    const file_path = try std.fmt.allocPrint(a, "{s}/web.json", .{real_path});
+    var rt: RoundTrip = undefined;
+    rt.init();
+    defer rt.deinit();
 
     const cmd = [_][]const u8{"sh"};
     const kids = [_]Tree{
@@ -443,9 +423,7 @@ test "round trip preserves web pane state" {
         .ratio = 0.5,
         .children = &kids,
     } } }};
-    try save(a, .{ .tabs = &tabs }, file_path);
-
-    const parsed = try load(a, file_path);
+    const parsed = try rt.cycle("web.json", .{ .tabs = &tabs });
     defer parsed.deinit();
     const restored = parsed.value.tabs[0].tree.split.children;
     const left = restored[0].pane.web.?;
@@ -457,14 +435,9 @@ test "round trip preserves web pane state" {
 }
 
 test "load tolerates a layout written before the web field" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
-    const file_path = try std.fmt.allocPrint(a, "{s}/preweb.json", .{real_path});
+    var rt: RoundTrip = undefined;
+    rt.init();
+    defer rt.deinit();
 
     // No "web" key at all, and a "zoom" key the schema never had —
     // an old file must load, and an unknown field must not fail it.
@@ -474,28 +447,16 @@ test "load tolerates a layout written before the web field" {
         \\      "cwd": "/", "command": ["sh"], "zoom": 3 } } }
         \\] }
     ;
-    var fp_z: [4096]u8 = undefined;
-    if (file_path.len >= fp_z.len) return error.PathTooLong;
-    @memcpy(fp_z[0..file_path.len], file_path);
-    fp_z[file_path.len] = 0;
-    const fp = c.fopen(@ptrCast(&fp_z), "wb") orelse return error.WriteFailed;
-    _ = c.fwrite(old_json.ptr, 1, old_json.len, fp);
-    _ = c.fclose(fp);
-
-    const parsed = try load(a, file_path);
+    const parsed = try rt.loadRaw("preweb.json", old_json);
     defer parsed.deinit();
     // No web face is restored for a pane that never had one.
     try std.testing.expect(parsed.value.tabs[0].tree.pane.web == null);
 }
 
 test "round trip preserves full browser pane state" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    const real_path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{&tmp_dir.sub_path});
-    const file_path = try std.fmt.allocPrint(a, "{s}/browser.json", .{real_path});
+    var rt: RoundTrip = undefined;
+    rt.init();
+    defer rt.deinit();
     const refs = [_]browser_model.FileRef{.{ .host = "box", .path = "/old" }};
     const btabs = [_]browser_model.TabState{.{
         .location = .{ .host = "box", .path = "/work" },
@@ -510,8 +471,7 @@ test "round trip preserves full browser pane state" {
         .command = &cmd,
         .browser = .{ .tabs = &btabs },
     } } }};
-    try save(a, .{ .tabs = &tabs }, file_path);
-    const parsed = try load(a, file_path);
+    const parsed = try rt.cycle("browser.json", .{ .tabs = &tabs });
     defer parsed.deinit();
     const state = parsed.value.tabs[0].tree.pane.browser.?;
     try std.testing.expectEqual(browser_model.ViewMode.miller, state.tabs[0].view);
