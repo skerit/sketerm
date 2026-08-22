@@ -1816,6 +1816,103 @@ pub const Screen = struct {
         return &self.scrollback.items[(self.scrollback_head + idx) % len];
     }
 
+    /// Shared cell-run emitter for the four text extractors: OSC 8
+    /// link-run bracketing plus rune and combining-cluster UTF-8
+    /// output. Every extractor differs only in which rows and column
+    /// spans it feeds here and how it decides on newlines.
+    const TextRun = struct {
+        screen: *const Screen,
+        allocator: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        /// Currently open OSC 8 link, 0 = none.
+        open_link_id: u8 = 0,
+
+        /// Emits cells [lo, hi) of display row `row`; `links` turns
+        /// OSC 8 markdown emission on (extractRowRange wants plain text).
+        fn emitRow(self: *TextRun, row: i32, cells: []const Cell, lo: usize, hi: usize, links: bool) !void {
+            var col: usize = lo;
+            while (col < hi) : (col += 1) {
+                const cell = cells[col];
+                // Skip wide-char continuation cells (right half of a
+                // 2-column glyph). Their rune is 0 by design.
+                if (cell.flags & 0b0000_0010 != 0) continue;
+
+                if (links) {
+                    // Run boundaries are link_id changes.
+                    const has_link = (cell.flags & 0b0000_0100) != 0;
+                    const cell_link_id: u8 = if (has_link) cell.reserved else 0;
+                    if (cell_link_id != self.open_link_id) {
+                        try self.closeLink(true);
+                        if (cell_link_id != 0) try self.out.append(self.allocator, '[');
+                        self.open_link_id = cell_link_id;
+                    }
+                }
+
+                const cp = cell.rune;
+                if (cp == 0) {
+                    try self.out.append(self.allocator, ' ');
+                } else if (cp < 0x80) {
+                    try self.out.append(self.allocator, @intCast(cp));
+                } else {
+                    var ub: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
+                    try self.out.appendSlice(self.allocator, ub[0..n]);
+                }
+                // Append any extending codepoints attached to this
+                // cell (combining marks, ZWJ continuations, skin-
+                // tone modifiers -- stored at print time).
+                if (row >= 0 and row < @as(i32, @intCast(self.screen.rows))) {
+                    const cluster = self.screen.clusterAt(@intCast(row), @intCast(col));
+                    for (cluster) |ext_cp| {
+                        var eb: [4]u8 = undefined;
+                        const en = std.unicode.utf8Encode(@intCast(ext_cp), &eb) catch continue;
+                        try self.out.appendSlice(self.allocator, eb[0..en]);
+                    }
+                }
+            }
+        }
+
+        /// Closes an open link run. `angle_escape` picks the markdown
+        /// angle-bracket URI form when the URI contains the one char
+        /// that would break the plain `(uri)` form; it is false at
+        /// end-of-extraction only because that is what the three
+        /// link-aware extractors have always emitted there.
+        fn closeLink(self: *TextRun, angle_escape: bool) !void {
+            if (self.open_link_id == 0) return;
+            const a = self.allocator;
+            if (self.screen.linkUri(self.open_link_id)) |uri| {
+                try self.out.append(a, ']');
+                try self.out.append(a, '(');
+                const need_angle = angle_escape and std.mem.indexOfScalar(u8, uri, ')') != null;
+                if (need_angle) try self.out.append(a, '<');
+                try self.out.appendSlice(a, uri);
+                if (need_angle) try self.out.append(a, '>');
+                try self.out.append(a, ')');
+            } else {
+                try self.out.append(a, ']');
+            }
+            self.open_link_id = 0;
+        }
+
+        /// Closes any link still open when the extraction ends.
+        fn finish(self: *TextRun) !void {
+            try self.closeLink(false);
+        }
+    };
+
+    /// Trailing index after dropping blank (rune == 0) cells.
+    fn trimBlankTail(cells: []const Cell, hi_in: usize) usize {
+        var hi = hi_in;
+        while (hi > 0 and cells[hi - 1].rune == 0) hi -= 1;
+        return hi;
+    }
+
+    /// True when the row after `row` is a soft-wrap continuation, i.e.
+    /// the two rows are one logical line and no newline separates them.
+    fn nextRowContinues(self: *const Screen, row: i32) bool {
+        return if (self.lineAt(row + 1)) |l| l.continues_above else false;
+    }
+
     /// Extract selection text (UTF-8). Coordinates are *display*
     /// rows: 0..rows-1 reference active screen, negative values
     /// reference scrollback (-1 = bottom-most scrollback line).
@@ -1827,12 +1924,11 @@ pub const Screen = struct {
 
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
+        var run: TextRun = .{ .screen = self, .allocator = allocator, .out = &out };
 
         const is_rect = sel.mode == .rectangular;
         const rect_lo: i32 = @min(r.top_col, r.bot_col);
         const rect_hi: i32 = @max(r.top_col, r.bot_col);
-
-        var open_link_id: u8 = 0; // currently open OSC 8 link, 0 = none
 
         var row = r.top_row;
         while (row <= r.bot_row) : (row += 1) {
@@ -1844,91 +1940,21 @@ pub const Screen = struct {
             const hi_clamped = @min(hi, line_cells.len);
             if (lo >= hi_clamped) continue;
 
-            // Trim trailing blank cells on this line span — but not
+            // Trim trailing blank cells on this line span -- but not
             // in rectangular mode where each row must keep its full
             // width so columns stay aligned in the output.
-            var actual_hi = hi_clamped;
-            if (!is_rect) {
-                while (actual_hi > lo and line_cells[actual_hi - 1].rune == 0) actual_hi -= 1;
-            }
+            const actual_hi = if (is_rect) hi_clamped else @max(lo, trimBlankTail(line_cells, hi_clamped));
 
-            var col: usize = lo;
-            while (col < actual_hi) : (col += 1) {
-                const cell = line_cells[col];
-                // Skip wide-char continuation cells (right half of a
-                // 2-column glyph). Their rune is 0 by design.
-                if (cell.flags & 0b0000_0010 != 0) continue;
+            try run.emitRow(row, line_cells, lo, actual_hi, true);
 
-                // OSC 8 link state machine: emit `[` on open, `](uri)`
-                // on close. Run boundaries are link_id changes.
-                const has_link = (cell.flags & 0b0000_0100) != 0;
-                const cell_link_id: u8 = if (has_link) cell.reserved else 0;
-                if (cell_link_id != open_link_id) {
-                    if (open_link_id != 0) {
-                        if (self.linkUri(open_link_id)) |uri| {
-                            try out.append(allocator, ']');
-                            try out.append(allocator, '(');
-                            // Markdown angle-bracket form for URIs that
-                            // would break the plain (uri) form. Closing
-                            // paren is the only unsafe char here.
-                            const need_angle = std.mem.indexOfScalar(u8, uri, ')') != null;
-                            if (need_angle) try out.append(allocator, '<');
-                            try out.appendSlice(allocator, uri);
-                            if (need_angle) try out.append(allocator, '>');
-                            try out.append(allocator, ')');
-                        } else {
-                            try out.append(allocator, ']');
-                        }
-                    }
-                    if (cell_link_id != 0) try out.append(allocator, '[');
-                    open_link_id = cell_link_id;
-                }
-
-                const cp = cell.rune;
-                if (cp == 0) {
-                    try out.append(allocator, ' ');
-                } else if (cp < 0x80) {
-                    try out.append(allocator, @intCast(cp));
-                } else {
-                    var ub: [4]u8 = undefined;
-                    const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
-                    try out.appendSlice(allocator, ub[0..n]);
-                }
-                // Append any extending codepoints attached to this
-                // cell (combining marks, ZWJ continuations, skin-
-                // tone modifiers — stored at print time).
-                if (row >= 0 and row < @as(i32, @intCast(self.rows))) {
-                    const cluster = self.clusterAt(@intCast(row), @intCast(col));
-                    for (cluster) |ext_cp| {
-                        var eb: [4]u8 = undefined;
-                        const en = std.unicode.utf8Encode(@intCast(ext_cp), &eb) catch continue;
-                        try out.appendSlice(allocator, eb[0..en]);
-                    }
-                }
-            }
             if (row != r.bot_row) {
-                if (is_rect) {
-                    // Rectangular: each row is independent.
-                    try out.append(allocator, '\n');
-                } else {
-                    // Suppress the newline if the next row is a
-                    // soft-wrap continuation — we want one logical line.
-                    const next_continues = if (self.lineAt(row + 1)) |l| l.continues_above else false;
-                    if (!next_continues) try out.append(allocator, '\n');
-                }
+                // Rectangular: each row is independent. Otherwise
+                // suppress the newline if the next row is a soft-wrap
+                // continuation -- we want one logical line.
+                if (is_rect or !self.nextRowContinues(row)) try out.append(allocator, '\n');
             }
         }
-        // Close any link still open at end of selection.
-        if (open_link_id != 0) {
-            if (self.linkUri(open_link_id)) |uri| {
-                try out.append(allocator, ']');
-                try out.append(allocator, '(');
-                try out.appendSlice(allocator, uri);
-                try out.append(allocator, ')');
-            } else {
-                try out.append(allocator, ']');
-            }
-        }
+        try run.finish();
         return try out.toOwnedSlice(allocator);
     }
 
@@ -1940,77 +1966,19 @@ pub const Screen = struct {
     pub fn extractScreen(self: *const Screen, allocator: std.mem.Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
+        var run: TextRun = .{ .screen = self, .allocator = allocator, .out = &out };
 
         const view_off: i32 = @intCast(@min(self.view_offset, self.scrollbackCount()));
-        var open_link_id: u8 = 0;
 
         var r: i32 = 0;
         while (r < @as(i32, @intCast(self.rows))) : (r += 1) {
             const logical_row: i32 = r - view_off;
-            const line_cells = self.lineCellsAt(logical_row) orelse {
-                try out.append(allocator, '\n');
-                continue;
-            };
-            // Trim trailing blanks (rune == 0) so we don't pad with spaces.
-            var hi: usize = line_cells.len;
-            while (hi > 0 and line_cells[hi - 1].rune == 0) hi -= 1;
-
-            var col: usize = 0;
-            while (col < hi) : (col += 1) {
-                const cell = line_cells[col];
-                if (cell.flags & 0b0000_0010 != 0) continue; // wide-char tail
-
-                const has_link = (cell.flags & 0b0000_0100) != 0;
-                const cell_link_id: u8 = if (has_link) cell.reserved else 0;
-                if (cell_link_id != open_link_id) {
-                    if (open_link_id != 0) {
-                        if (self.linkUri(open_link_id)) |uri| {
-                            try out.append(allocator, ']');
-                            try out.append(allocator, '(');
-                            const need_angle = std.mem.indexOfScalar(u8, uri, ')') != null;
-                            if (need_angle) try out.append(allocator, '<');
-                            try out.appendSlice(allocator, uri);
-                            if (need_angle) try out.append(allocator, '>');
-                            try out.append(allocator, ')');
-                        } else {
-                            try out.append(allocator, ']');
-                        }
-                    }
-                    if (cell_link_id != 0) try out.append(allocator, '[');
-                    open_link_id = cell_link_id;
-                }
-
-                const cp = cell.rune;
-                if (cp == 0) {
-                    try out.append(allocator, ' ');
-                } else if (cp < 0x80) {
-                    try out.append(allocator, @intCast(cp));
-                } else {
-                    var ub: [4]u8 = undefined;
-                    const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
-                    try out.appendSlice(allocator, ub[0..n]);
-                }
-                if (logical_row >= 0 and logical_row < @as(i32, @intCast(self.rows))) {
-                    const cluster = self.clusterAt(@intCast(logical_row), @intCast(col));
-                    for (cluster) |ext_cp| {
-                        var eb: [4]u8 = undefined;
-                        const en = std.unicode.utf8Encode(@intCast(ext_cp), &eb) catch continue;
-                        try out.appendSlice(allocator, eb[0..en]);
-                    }
-                }
+            if (self.lineCellsAt(logical_row)) |line_cells| {
+                try run.emitRow(logical_row, line_cells, 0, trimBlankTail(line_cells, line_cells.len), true);
             }
             try out.append(allocator, '\n');
         }
-        if (open_link_id != 0) {
-            if (self.linkUri(open_link_id)) |uri| {
-                try out.append(allocator, ']');
-                try out.append(allocator, '(');
-                try out.appendSlice(allocator, uri);
-                try out.append(allocator, ')');
-            } else {
-                try out.append(allocator, ']');
-            }
-        }
+        try run.finish();
         return try out.toOwnedSlice(allocator);
     }
 
@@ -2044,42 +2012,14 @@ pub const Screen = struct {
     pub fn extractRowRange(self: *const Screen, allocator: std.mem.Allocator, start: i32, end_excl: i32) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
+        var run: TextRun = .{ .screen = self, .allocator = allocator, .out = &out };
 
         var r: i32 = start;
         while (r < end_excl) : (r += 1) {
-            const joins_next = blk: {
-                if (r + 1 >= end_excl) break :blk false;
-                break :blk if (self.lineAt(r + 1)) |l| l.continues_above else false;
-            };
-            const line_cells = self.lineCellsAt(r) orelse {
-                if (!joins_next) try out.append(allocator, '\n');
-                continue;
-            };
-            var hi: usize = line_cells.len;
-            while (hi > 0 and line_cells[hi - 1].rune == 0) hi -= 1;
-
-            var col: usize = 0;
-            while (col < hi) : (col += 1) {
-                const cell = line_cells[col];
-                if (cell.flags & 0b0000_0010 != 0) continue; // wide tail
-                const cp = cell.rune;
-                if (cp == 0) {
-                    try out.append(allocator, ' ');
-                } else if (cp < 0x80) {
-                    try out.append(allocator, @intCast(cp));
-                } else {
-                    var ub: [4]u8 = undefined;
-                    const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
-                    try out.appendSlice(allocator, ub[0..n]);
-                }
-                if (r >= 0 and r < @as(i32, @intCast(self.rows))) {
-                    const cluster = self.clusterAt(@intCast(r), @intCast(col));
-                    for (cluster) |ext_cp| {
-                        var eb: [4]u8 = undefined;
-                        const en = std.unicode.utf8Encode(@intCast(ext_cp), &eb) catch continue;
-                        try out.appendSlice(allocator, eb[0..en]);
-                    }
-                }
+            // A continuation past the requested end still ends the range.
+            const joins_next = r + 1 < end_excl and self.nextRowContinues(r);
+            if (self.lineCellsAt(r)) |line_cells| {
+                try run.emitRow(r, line_cells, 0, trimBlankTail(line_cells, line_cells.len), false);
             }
             if (!joins_next) try out.append(allocator, '\n');
         }
@@ -2095,82 +2035,21 @@ pub const Screen = struct {
     pub fn extractScrollback(self: *const Screen, allocator: std.mem.Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
+        var run: TextRun = .{ .screen = self, .allocator = allocator, .out = &out };
 
         const sb_count: i32 = @intCast(self.scrollbackCount());
         const rows_i: i32 = @intCast(self.rows);
-        var open_link_id: u8 = 0;
 
         var r: i32 = -sb_count;
         while (r < rows_i) : (r += 1) {
-            const line_cells = self.lineCellsAt(r) orelse {
-                // Soft-wrap-aware: blank rows still emit '\n' unless
-                // the NEXT row is a continuation (rare for missing
-                // rows but match the trimming convention).
-                const next_continues = if (self.lineAt(r + 1)) |l| l.continues_above else false;
-                if (!next_continues) try out.append(allocator, '\n');
-                continue;
-            };
-            var hi: usize = line_cells.len;
-            while (hi > 0 and line_cells[hi - 1].rune == 0) hi -= 1;
-
-            var col: usize = 0;
-            while (col < hi) : (col += 1) {
-                const cell = line_cells[col];
-                if (cell.flags & 0b0000_0010 != 0) continue;
-
-                const has_link = (cell.flags & 0b0000_0100) != 0;
-                const cell_link_id: u8 = if (has_link) cell.reserved else 0;
-                if (cell_link_id != open_link_id) {
-                    if (open_link_id != 0) {
-                        if (self.linkUri(open_link_id)) |uri| {
-                            try out.append(allocator, ']');
-                            try out.append(allocator, '(');
-                            const need_angle = std.mem.indexOfScalar(u8, uri, ')') != null;
-                            if (need_angle) try out.append(allocator, '<');
-                            try out.appendSlice(allocator, uri);
-                            if (need_angle) try out.append(allocator, '>');
-                            try out.append(allocator, ')');
-                        } else {
-                            try out.append(allocator, ']');
-                        }
-                    }
-                    if (cell_link_id != 0) try out.append(allocator, '[');
-                    open_link_id = cell_link_id;
-                }
-
-                const cp = cell.rune;
-                if (cp == 0) {
-                    try out.append(allocator, ' ');
-                } else if (cp < 0x80) {
-                    try out.append(allocator, @intCast(cp));
-                } else {
-                    var ub: [4]u8 = undefined;
-                    const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
-                    try out.appendSlice(allocator, ub[0..n]);
-                }
-                if (r >= 0 and r < rows_i) {
-                    const cluster = self.clusterAt(@intCast(r), @intCast(col));
-                    for (cluster) |ext_cp| {
-                        var eb: [4]u8 = undefined;
-                        const en = std.unicode.utf8Encode(@intCast(ext_cp), &eb) catch continue;
-                        try out.appendSlice(allocator, eb[0..en]);
-                    }
-                }
+            if (self.lineCellsAt(r)) |line_cells| {
+                try run.emitRow(r, line_cells, 0, trimBlankTail(line_cells, line_cells.len), true);
             }
             // Suppress newline when next row is a soft-wrap continuation.
-            const next_continues = if (self.lineAt(r + 1)) |l| l.continues_above else false;
-            if (!next_continues) try out.append(allocator, '\n');
+            // Missing rows follow the same convention.
+            if (!self.nextRowContinues(r)) try out.append(allocator, '\n');
         }
-        if (open_link_id != 0) {
-            if (self.linkUri(open_link_id)) |uri| {
-                try out.append(allocator, ']');
-                try out.append(allocator, '(');
-                try out.appendSlice(allocator, uri);
-                try out.append(allocator, ')');
-            } else {
-                try out.append(allocator, ']');
-            }
-        }
+        try run.finish();
         return try out.toOwnedSlice(allocator);
     }
 
@@ -7386,7 +7265,7 @@ test "OSC 4 sets palette index, OSC 104 resets it" {
     try std.testing.expectEqual(palette_default_256[1], s.palette[1]);
 }
 
-test "OSC 4 query returns palette entry as rgb spec" {
+test "OSC color queries report 16-bit rgb specs" {
     const TestSink = struct {
         var captured: [128]u8 = undefined;
         var captured_len: usize = 0;
@@ -7396,97 +7275,60 @@ test "OSC 4 query returns palette entry as rgb spec" {
             captured_len += n;
         }
     };
-    TestSink.captured_len = 0;
 
-    var pool = try Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
-    defer s.deinit();
-    s.sink = .{ .on_write_pty = TestSink.write };
-
-    // Set palette[1] = #ff8000, then query it back.
-    s.onOsc("4;1;rgb:ff/80/00");
-    s.onOsc("4;1;?");
-    const got = TestSink.captured[0..TestSink.captured_len];
-    // Format: ESC ]4;1;rgb:ffff/8080/0000 ST  (each byte duplicated → 16-bit).
-    try std.testing.expectEqualStrings("\x1b]4;1;rgb:ffff/8080/0000\x1b\\", got);
-}
-
-test "OSC 10 query returns default_fg as 16-bit rgb" {
-    const TestSink = struct {
-        var captured: [128]u8 = undefined;
-        var captured_len: usize = 0;
-        fn write(_: ?*anyopaque, bytes: []const u8) void {
-            const n = @min(bytes.len, captured.len - captured_len);
-            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
-            captured_len += n;
-        }
+    // Each byte is duplicated into the high half, so 0xff -> 0xffff,
+    // 0x80 -> 0x8080, 0x00 -> 0x0000.
+    const cases = [_]struct {
+        name: []const u8,
+        setup: []const []const u8,
+        query: []const u8,
+        want: []const u8,
+    }{
+        .{
+            .name = "OSC 4 returns the palette entry",
+            .setup = &.{"4;1;rgb:ff/80/00"},
+            .query = "4;1;?",
+            .want = "\x1b]4;1;rgb:ffff/8080/0000\x1b\\",
+        },
+        .{
+            .name = "OSC 10 returns default_fg",
+            .setup = &.{"10;rgb:ff/00/80"},
+            .query = "10;?",
+            .want = "\x1b]10;rgb:ffff/0000/8080\x1b\\",
+        },
+        .{
+            .name = "OSC 11 returns default_bg",
+            .setup = &.{"11;rgb:00/00/00"},
+            .query = "11;?",
+            .want = "\x1b]11;rgb:0000/0000/0000\x1b\\",
+        },
+        .{
+            // Cursor left at its sentinel (alpha 0 means "use fg"), so
+            // the OSC 12 query must report fg rather than a cursor color.
+            .name = "OSC 12 falls back to default_fg at the cursor sentinel",
+            .setup = &.{ "10;rgb:80/40/20", "112" },
+            .query = "12;?",
+            .want = "\x1b]12;rgb:8080/4040/2020\x1b\\",
+        },
     };
-    TestSink.captured_len = 0;
 
-    var pool = try Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
-    defer s.deinit();
-    s.sink = .{ .on_write_pty = TestSink.write };
+    for (cases) |case| {
+        TestSink.captured_len = 0;
 
-    // Set default_fg to a known value, then query.
-    s.onOsc("10;rgb:ff/00/80");
-    s.onOsc("10;?");
-    const got = TestSink.captured[0..TestSink.captured_len];
-    // 0xff → 65535, 0x00 → 0, 0x80 → 32896 = 0x8080.
-    try std.testing.expectEqualStrings("\x1b]10;rgb:ffff/0000/8080\x1b\\", got);
-}
+        var pool = try Pool.init(std.testing.allocator);
+        defer pool.deinit();
+        var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
+        defer s.deinit();
+        s.sink = .{ .on_write_pty = TestSink.write };
 
-test "OSC 11 query returns default_bg" {
-    const TestSink = struct {
-        var captured: [128]u8 = undefined;
-        var captured_len: usize = 0;
-        fn write(_: ?*anyopaque, bytes: []const u8) void {
-            const n = @min(bytes.len, captured.len - captured_len);
-            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
-            captured_len += n;
-        }
-    };
-    TestSink.captured_len = 0;
-
-    var pool = try Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
-    defer s.deinit();
-    s.sink = .{ .on_write_pty = TestSink.write };
-
-    s.onOsc("11;rgb:00/00/00");
-    s.onOsc("11;?");
-    const got = TestSink.captured[0..TestSink.captured_len];
-    try std.testing.expectEqualStrings("\x1b]11;rgb:0000/0000/0000\x1b\\", got);
-}
-
-test "OSC 12 query falls back to default_fg when cursor sentinel set" {
-    const TestSink = struct {
-        var captured: [128]u8 = undefined;
-        var captured_len: usize = 0;
-        fn write(_: ?*anyopaque, bytes: []const u8) void {
-            const n = @min(bytes.len, captured.len - captured_len);
-            @memcpy(captured[captured_len .. captured_len + n], bytes[0..n]);
-            captured_len += n;
-        }
-    };
-    TestSink.captured_len = 0;
-
-    var pool = try Pool.init(std.testing.allocator);
-    defer pool.deinit();
-    var s = try Screen.init(std.testing.allocator, &pool, 5, 1);
-    defer s.deinit();
-    s.sink = .{ .on_write_pty = TestSink.write };
-
-    // Lock fg to a known value; cursor stays at sentinel (alpha=0
-    // means "use fg"), so OSC 12 query should report fg.
-    s.onOsc("10;rgb:80/40/20");
-    s.onOsc("112"); // reset cursor to sentinel
-    s.onOsc("12;?");
-    const got = TestSink.captured[0..TestSink.captured_len];
-    try std.testing.expectEqualStrings("\x1b]12;rgb:8080/4040/2020\x1b\\", got);
+        for (case.setup) |osc| s.onOsc(osc);
+        s.onOsc(case.query);
+        const got = TestSink.captured[0..TestSink.captured_len];
+        std.testing.expectEqualStrings(case.want, got) catch |err| {
+            std.debug.print("case: {s}\n", .{case.name});
+            return err;
+        };
+    }
 }
 
 test "OSC 11 sets default_bg, OSC 111 resets" {
