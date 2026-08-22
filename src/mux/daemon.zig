@@ -1736,7 +1736,7 @@ pub const Native = struct {
     /// encodes the WHOLE surface as one H.264 tile and emits a pool_vtile,
     /// returning true so the caller skips the lossless path. Any failure
     /// (odd dims, encoder open, mirror too small) returns false → lossless.
-    fn videoCommit(nv: *Native, units: *std.ArrayList(u8), a: std.mem.Allocator, cm: anytype, mirror: PoolMirror, y0: i64, y1: i64) !bool {
+    pub fn videoCommit(nv: *Native, units: *std.ArrayList(u8), a: std.mem.Allocator, cm: anytype, mirror: PoolMirror, y0: i64, y1: i64) !bool {
         if (!nv.wants_video) return false; // no client can decode video yet
         const w = cm.info.width;
         const h = cm.info.height;
