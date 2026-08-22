@@ -1307,12 +1307,7 @@ pub fn validateColr1(allocator: std.mem.Allocator, data: []const u8) ?RegisterEr
 
 const testing = std.testing;
 
-fn b64(allocator: std.mem.Allocator, data: []const u8) ![]u8 {
-    const enc = std.base64.standard.Encoder;
-    const out = try allocator.alloc(u8, enc.calcSize(data.len));
-    _ = enc.encode(out, data);
-    return out;
-}
+const b64 = @import("../util/b64.zig").encodeAlloc;
 
 fn parseFmt(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !Result {
     const body = try std.fmt.allocPrint(allocator, fmt, args);

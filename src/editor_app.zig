@@ -6,6 +6,7 @@
 //! application identity built the same way.
 
 const std = @import("std");
+const invocation = @import("util/invocation.zig");
 const entry = @import("filebrowser/entry.zig");
 const paths = @import("filebrowser/paths.zig");
 
@@ -58,14 +59,7 @@ pub const Request = struct {
 
 /// Index of the first editor argument, or null for another entry point.
 pub fn invocationStart(args: []const []const u8) ?usize {
-    if (args.len == 0) return null;
-    const base = if (std.mem.lastIndexOfScalar(u8, args[0], '/')) |slash|
-        args[0][slash + 1 ..]
-    else
-        args[0];
-    if (std.mem.eql(u8, base, BINARY_NAME)) return 1;
-    if (args.len > 1 and (std.mem.eql(u8, args[1], "edit") or std.mem.eql(u8, args[1], "editor"))) return 2;
-    return null;
+    return invocation.start(args, BINARY_NAME, &.{ "edit", "editor" });
 }
 
 /// Parse a `--line` value: `N` or `N:col`, both 1-based. Strict —

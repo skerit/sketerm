@@ -1964,6 +1964,25 @@ fn panelIdentitySupport(allocator: std.mem.Allocator, payload: []const u8) !Pane
     return .unsupported;
 }
 
+test "validPortRange accepts only two all-digit halves around one colon" {
+    const t = std.testing;
+    try t.expect(Conn.validPortRange("1:1"));
+    try t.expect(Conn.validPortRange("0:65535"));
+    try t.expect(Conn.validPortRange("40000:40100"));
+    // Digits only: the range is passed to a remote listener, never parsed here.
+    try t.expect(Conn.validPortRange("99999999:1"));
+    // No colon, an empty half on either side, or a second colon.
+    try t.expect(!Conn.validPortRange(""));
+    try t.expect(!Conn.validPortRange("40000"));
+    try t.expect(!Conn.validPortRange(":40000"));
+    try t.expect(!Conn.validPortRange("40000:"));
+    try t.expect(!Conn.validPortRange("1:2:3"));
+    // Anything non-digit in either half.
+    try t.expect(!Conn.validPortRange("40000:4x100"));
+    try t.expect(!Conn.validPortRange("-1:5"));
+    try t.expect(!Conn.validPortRange("4 0:50"));
+}
+
 test "panel identity support requires a valid positive capability classification" {
     const t = std.testing;
     try t.expectEqual(

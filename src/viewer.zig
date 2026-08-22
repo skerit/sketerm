@@ -5,6 +5,7 @@ const c = @import("c.zig").c;
 const entry = @import("filebrowser/entry.zig");
 const paths = @import("filebrowser/paths.zig");
 const platform = @import("util/platform.zig");
+const invocation = @import("util/invocation.zig");
 
 pub const ID_SUFFIX = ".viewer";
 pub const APP_NAME = "Sketerm Viewer";
@@ -177,14 +178,7 @@ fn consumeManifest(allocator: std.mem.Allocator, path: []const u8) !Batch {
 
 /// Index of the first viewer argument, or null for another entry point.
 pub fn invocationStart(args: []const []const u8) ?usize {
-    if (args.len == 0) return null;
-    const base = if (std.mem.lastIndexOfScalar(u8, args[0], '/')) |slash|
-        args[0][slash + 1 ..]
-    else
-        args[0];
-    if (std.mem.eql(u8, base, BINARY_NAME)) return 1;
-    if (args.len > 1 and (std.mem.eql(u8, args[1], "view") or std.mem.eql(u8, args[1], "viewer"))) return 2;
-    return null;
+    return invocation.start(args, BINARY_NAME, &.{ "view", "viewer" });
 }
 
 /// Canonicalize all positional viewer arguments into host-qualified specs.

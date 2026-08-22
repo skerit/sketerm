@@ -899,12 +899,7 @@ pub const Manager = struct {
     }
 };
 
-fn testBase64(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const encoder = std.base64.standard.Encoder;
-    const out = try allocator.alloc(u8, encoder.calcSize(bytes.len));
-    _ = encoder.encode(out, bytes);
-    return out;
-}
+const testBase64 = @import("../util/b64.zig").encodeAlloc;
 
 fn testZlibBase64(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     const compressed_buf = try allocator.alloc(u8, bytes.len + 128);

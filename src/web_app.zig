@@ -10,8 +10,13 @@
 //! face in a terminal window.
 
 const std = @import("std");
+const invocation = @import("util/invocation.zig");
 
 pub const ID_SUFFIX = ".web";
+/// The identity hardlink's name, like `sketerm-files`. The CEF helper
+/// is `sketerm-webengine`, so this name is free -- and basename
+/// matching is what keeps the two apart.
+pub const BINARY_NAME = "sketerm-web";
 pub const APP_NAME = "Sketerm Web";
 
 pub const Request = struct {
@@ -39,19 +44,7 @@ pub const Request = struct {
 /// the `sketerm-web` identity hardlink (argv0) and the subcommand
 /// word. The CEF helper is `sketerm-webengine` so this name is free.
 pub fn invocationStart(args: []const []const u8) ?usize {
-    if (args.len > 0 and invokedAsWeb(args[0])) return 1;
-    if (args.len > 1 and std.mem.eql(u8, args[1], "web")) return 2;
-    return null;
-}
-
-/// Whether argv0 is the `sketerm-web` identity hardlink (exact
-/// basename, like the file manager's `sketerm-files`).
-fn invokedAsWeb(argv0: []const u8) bool {
-    const base = if (std.mem.lastIndexOfScalar(u8, argv0, '/')) |s|
-        argv0[s + 1 ..]
-    else
-        argv0;
-    return std.mem.eql(u8, base, "sketerm-web");
+    return invocation.start(args, BINARY_NAME, &.{"web"});
 }
 
 /// Collect the addresses of a `sketerm web ...` invocation, or null
