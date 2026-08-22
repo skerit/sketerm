@@ -526,18 +526,18 @@ pub const Hub = struct {
         pub fn next(self: *EventWatch, timeout_ms: i64) ?Event {
             const deadline = nowMs() + timeout_ms;
             while (true) {
-                while (dbus.unmarshal(self.conn.rbuf.items) catch return null) |got| {
+                while (dbus.unmarshal(self.conn.client.rbuf.items) catch return null) |got| {
                     const m = got.msg;
                     var ev: ?Event = null;
                     if (m.mtype == .signal) ev = decodeEvent(m);
-                    self.conn.rbuf.replaceRange(self.allocator, 0, got.consumed, &.{}) catch return null;
+                    self.conn.client.rbuf.replaceRange(self.allocator, 0, got.consumed, &.{}) catch return null;
                     if (ev) |e| return e;
                 }
                 self.conn.waitFd(c.POLLIN, deadline) catch return null;
                 var tmp: [8192]u8 = undefined;
-                const n = c.read(self.conn.fd, &tmp, tmp.len);
+                const n = c.read(self.conn.client.fd, &tmp, tmp.len);
                 if (n > 0) {
-                    self.conn.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch return null;
+                    self.conn.client.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]) catch return null;
                     continue;
                 }
                 if (n == 0) return null;
@@ -674,80 +674,40 @@ fn setStatus(allocator: std.mem.Allocator, conn: *Conn, prop: []const u8, val: b
 // ── D-Bus client over a Unix socket (c.zig sockets) ─────────────
 
 const Conn = struct {
-    fd: c_int,
-    serial: u32 = 1,
-    rbuf: std.ArrayList(u8) = .empty,
-    allocator: std.mem.Allocator,
+    client: dbusconn.Client,
     /// Total budget for this connection/operation, not a fresh timeout per
     /// tree node. A peer replying just before every per-call timeout must
-    /// not monopolize the daemon for MAX_NODES × timeout.
+    /// not monopolize the daemon for MAX_NODES x timeout.
     deadline_ms: i64,
 
     fn connect(allocator: std.mem.Allocator, path: []const u8) !Conn {
-        const fd = try dbusconn.busConnect(path);
         // Budget sized for a full MAX_NODES tree walk (thousands of local
         // D-Bus round trips) on a healthy bus, while still bounding how
         // long a wedged peer can stall the daemon poll loop.
-        return .{ .fd = fd, .allocator = allocator, .deadline_ms = nowMs() + 30_000 };
+        return .{
+            .client = try dbusconn.Client.connect(allocator, path),
+            .deadline_ms = nowMs() + 30_000,
+        };
     }
 
     fn deinit(self: *Conn) void {
-        _ = c.close(self.fd);
-        self.rbuf.deinit(self.allocator);
+        self.client.deinit();
     }
 
     fn waitFd(self: *Conn, events: c_short, deadline: i64) !void {
-        return dbusconn.waitFd(self.fd, events, deadline);
-    }
-
-    fn writeAll(self: *Conn, bytes: []const u8) !void {
-        return dbusconn.writeAll(self.fd, bytes, self.deadline_ms);
+        return dbusconn.waitFd(self.client.fd, events, deadline);
     }
 
     /// SASL EXTERNAL auth (uid as decimal, hex-encoded) + BEGIN, then
     /// the org.freedesktop.DBus.Hello handshake.
     fn authAndHello(self: *Conn) !void {
-        try dbusconn.authExternal(self.fd, self.deadline_ms);
-        const r = try self.call(dbusconn.hello_call);
-        self.allocator.free(r.body);
+        return self.client.authAndHello(self.deadline_ms);
     }
 
     /// Send one method call, return the matching reply (body is
     /// caller-owned). Signals / unrelated replies are discarded.
     fn call(self: *Conn, msg_in: dbus.Message) !dbus.Message {
-        var msg = msg_in;
-        msg.serial = self.serial;
-        self.serial += 1;
-        const bytes = try dbus.marshal(self.allocator, msg);
-        defer self.allocator.free(bytes);
-        try self.writeAll(bytes);
-
-        const deadline = self.deadline_ms;
-        while (true) {
-            while (dbus.unmarshal(self.rbuf.items) catch return error.Proto) |got| {
-                const m = got.msg;
-                const matched = m.reply_serial != null and m.reply_serial.? == msg.serial;
-                if (matched and m.mtype == .error_reply) {
-                    try self.rbuf.replaceRange(self.allocator, 0, got.consumed, &.{});
-                    return error.DbusError;
-                }
-                if (matched) {
-                    const body = try self.allocator.dupe(u8, m.body);
-                    var copy = m;
-                    copy.body = body;
-                    try self.rbuf.replaceRange(self.allocator, 0, got.consumed, &.{});
-                    return copy;
-                }
-                try self.rbuf.replaceRange(self.allocator, 0, got.consumed, &.{});
-            }
-            try self.waitFd(c.POLLIN, deadline);
-            var tmp: [16384]u8 = undefined;
-            const n = c.read(self.fd, &tmp, tmp.len);
-            if (n < 0 and std.posix.errno(n) == .INTR) continue;
-            if (n < 0 and std.posix.errno(n) == .AGAIN) continue;
-            if (n <= 0) return error.Closed;
-            try self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]);
-        }
+        return self.client.call(msg_in, self.deadline_ms);
     }
 };
 

@@ -15,10 +15,11 @@
 //! GUI-side; libc + `util/platform.zig` + `util/clock.zig` is all this
 //! needs, so the daemon's ELF dependency invariant is unaffected.
 //!
-//! What is deliberately NOT here: the request/reply loop. `webproj`
-//! must keep ANSWERING incoming method calls while it waits for its
-//! own reply (it is a server too) while the other two simply discard
-//! unrelated traffic, so `call` stays with each consumer.
+//! `Client` at the bottom adds the plain request/reply loop for the
+//! two consumers that simply discard unrelated traffic. `webproj` is
+//! deliberately NOT one of them: it must keep ANSWERING incoming
+//! method calls while it waits for its own reply (it is a server too),
+//! so its loop stays its own.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -168,6 +169,90 @@ pub fn authExternal(fd: c_int, deadline: i64) !void {
     if (!std.mem.startsWith(u8, buf[0..@intCast(got)], "OK")) return error.AuthRejected;
     try writeAll(fd, "BEGIN\r\n", deadline);
 }
+
+/// A blocking request/reply D-Bus client: the socket, the serial
+/// counter, the read buffer and the reply loop that discards unrelated
+/// traffic. `a11y/detect.zig` and `mux/a11yhub.zig` embed one and add
+/// their own domain calls on top.
+///
+/// `a11y/webproj.zig` deliberately does NOT use this. It must keep
+/// ANSWERING incoming method calls while awaiting its own reply,
+/// because the registry introspects the plug during Embed and a
+/// reader blocked on one serial deadlocks the handshake.
+pub const Client = struct {
+    allocator: std.mem.Allocator,
+    fd: c_int,
+    serial: u32 = 1,
+    rbuf: std.ArrayList(u8) = .empty,
+
+    pub fn connect(allocator: std.mem.Allocator, path: []const u8) !Client {
+        return .{ .allocator = allocator, .fd = try busConnect(path) };
+    }
+
+    pub fn deinit(self: *Client) void {
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.fd = -1;
+        self.rbuf.deinit(self.allocator);
+    }
+
+    pub fn writeAllTo(self: *Client, bytes: []const u8, deadline: i64) !void {
+        return writeAll(self.fd, bytes, deadline);
+    }
+
+    /// SASL EXTERNAL auth + BEGIN, then the `Hello` round trip whose
+    /// reply body (our unique name) nobody here needs.
+    pub fn authAndHello(self: *Client, deadline: i64) !void {
+        try authExternal(self.fd, deadline);
+        const r = try self.call(hello_call, deadline);
+        self.allocator.free(r.body);
+    }
+
+    /// Send one method call and return its reply, whose body is
+    /// caller-owned. Signals and replies to other serials are dropped.
+    /// An error reply is `error.DbusError`, a malformed stream
+    /// `error.Proto`; both consumers treat every failure the same way.
+    pub fn call(self: *Client, msg_in: dbus.Message, deadline: i64) !dbus.Message {
+        var msg = msg_in;
+        msg.serial = self.serial;
+        self.serial += 1;
+        const bytes = try dbus.marshal(self.allocator, msg);
+        defer self.allocator.free(bytes);
+        try self.writeAllTo(bytes, deadline);
+
+        while (true) {
+            while (dbus.unmarshal(self.rbuf.items) catch return error.Proto) |got| {
+                const m = got.msg;
+                const matched = m.reply_serial != null and m.reply_serial.? == msg.serial;
+                // The consumed prefix goes either way; only a match
+                // returns, so an unrelated frame just falls through.
+                if (!matched) {
+                    try self.rbuf.replaceRange(self.allocator, 0, got.consumed, &.{});
+                    continue;
+                }
+                if (m.mtype == .error_reply) {
+                    try self.rbuf.replaceRange(self.allocator, 0, got.consumed, &.{});
+                    return error.DbusError;
+                }
+                const body = try self.allocator.dupe(u8, m.body);
+                var copy = m;
+                copy.body = body;
+                try self.rbuf.replaceRange(self.allocator, 0, got.consumed, &.{});
+                return copy;
+            }
+            try waitFd(self.fd, c.POLLIN, deadline);
+            var tmp: [16384]u8 = undefined;
+            const n = c.read(self.fd, &tmp, tmp.len);
+            if (n > 0) {
+                try self.rbuf.appendSlice(self.allocator, tmp[0..@intCast(n)]);
+                continue;
+            }
+            if (n == 0) return error.Closed;
+            const e = std.posix.errno(n);
+            if (e == .INTR or e == .AGAIN) continue;
+            return error.Closed;
+        }
+    }
+};
 
 // -- tests -----------------------------------------------------------
 

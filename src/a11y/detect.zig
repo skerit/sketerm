@@ -100,7 +100,7 @@ fn probe(gpa: std.mem.Allocator) !Reason {
     const sess = dbusconn.parseUnixPath(std.mem.sliceTo(env, 0), &path_buf) orelse
         return .unavailable;
 
-    var conn = Conn{ .gpa = gpa, .fd = try dbusconn.busConnect(sess) };
+    var conn = Conn{ .client = try dbusconn.Client.connect(gpa, sess) };
     defer conn.deinit();
     try conn.authAndHello(deadline);
 
@@ -118,32 +118,27 @@ fn probe(gpa: std.mem.Allocator) !Reason {
     return .disabled;
 }
 
-/// A minimal blocking D-Bus client. Deliberately not the one in
-/// `webproj.Proj`: that one must keep ANSWERING calls while it waits
-/// (it is a server too), and this one has nothing to serve.
+/// The a11y-status probe's domain calls on top of the shared blocking
+/// client. Deliberately not `webproj.Proj`'s client: that one must keep
+/// ANSWERING calls while it waits (it is a server too), and this one has
+/// nothing to serve.
 const Conn = struct {
-    gpa: std.mem.Allocator,
-    fd: c_int,
-    serial: u32 = 1,
-    rbuf: std.ArrayList(u8) = .empty,
+    client: dbusconn.Client,
 
     fn deinit(self: *Conn) void {
-        if (self.fd >= 0) _ = c.close(self.fd);
-        self.fd = -1;
-        self.rbuf.deinit(self.gpa);
+        self.client.deinit();
     }
 
     fn authAndHello(self: *Conn, deadline: i64) !void {
-        try dbusconn.authExternal(self.fd, deadline);
-        const reply = try self.call(dbusconn.hello_call, deadline);
-        self.gpa.free(reply.body);
+        return self.client.authAndHello(deadline);
     }
 
     fn nameHasOwner(self: *Conn, name: []const u8, deadline: i64) !bool {
-        var bw = dbus.Writer.init(self.gpa);
+        const gpa = self.client.allocator;
+        var bw = dbus.Writer.init(gpa);
         defer bw.deinit();
         try bw.putString(name);
-        const r = try self.call(.{
+        const r = try self.client.call(.{
             .mtype = .method_call,
             .path = "/org/freedesktop/DBus",
             .interface = "org.freedesktop.DBus",
@@ -152,7 +147,7 @@ const Conn = struct {
             .signature = "s",
             .body = bw.buf.items,
         }, deadline);
-        defer self.gpa.free(r.body);
+        defer gpa.free(r.body);
         var rd = dbus.Reader.init(r.body);
         return (rd.u32v() catch 0) != 0;
     }
@@ -161,11 +156,12 @@ const Conn = struct {
     /// absent or not a boolean — an older bus without it must read as
     /// "unknown", never as "on".
     fn statusBool(self: *Conn, prop: []const u8, deadline: i64) !?bool {
-        var bw = dbus.Writer.init(self.gpa);
+        const gpa = self.client.allocator;
+        var bw = dbus.Writer.init(gpa);
         defer bw.deinit();
         try bw.putString("org.a11y.Status");
         try bw.putString(prop);
-        const r = try self.call(.{
+        const r = try self.client.call(.{
             .mtype = .method_call,
             .path = "/org/a11y/bus",
             .interface = "org.freedesktop.DBus.Properties",
@@ -174,55 +170,11 @@ const Conn = struct {
             .signature = "ss",
             .body = bw.buf.items,
         }, deadline);
-        defer self.gpa.free(r.body);
+        defer gpa.free(r.body);
         var rd = dbus.Reader.init(r.body);
         const vsig = rd.sig() catch return null;
         if (vsig.len != 1 or vsig[0] != 'b') return null;
         return (rd.u32v() catch return null) != 0;
-    }
-
-    fn call(self: *Conn, msg_in: dbus.Message, deadline: i64) !dbus.Message {
-        var msg = msg_in;
-        msg.serial = self.serial;
-        self.serial += 1;
-        const bytes = try dbus.marshal(self.gpa, msg);
-        defer self.gpa.free(bytes);
-        try self.writeAll(bytes, deadline);
-        while (true) {
-            while (try dbus.unmarshal(self.rbuf.items)) |got| {
-                const m = got.msg;
-                const matched = m.reply_serial != null and m.reply_serial.? == msg.serial;
-                if (!matched) {
-                    self.rbuf.replaceRange(self.gpa, 0, got.consumed, &.{}) catch
-                        return error.OutOfMemory;
-                    continue;
-                }
-                if (m.mtype == .error_reply) {
-                    self.rbuf.replaceRange(self.gpa, 0, got.consumed, &.{}) catch {};
-                    return error.DbusError;
-                }
-                const body = try self.gpa.dupe(u8, m.body);
-                var copy = m;
-                copy.body = body;
-                self.rbuf.replaceRange(self.gpa, 0, got.consumed, &.{}) catch {};
-                return copy;
-            }
-            try dbusconn.waitFd(self.fd, c.POLLIN, deadline);
-            var tmp: [4096]u8 = undefined;
-            const n = c.read(self.fd, &tmp, tmp.len);
-            if (n > 0) {
-                try self.rbuf.appendSlice(self.gpa, tmp[0..@intCast(n)]);
-                continue;
-            }
-            if (n == 0) return error.Closed;
-            const e = std.posix.errno(n);
-            if (e == .INTR or e == .AGAIN) continue;
-            return error.Closed;
-        }
-    }
-
-    fn writeAll(self: *Conn, bytes: []const u8, deadline: i64) !void {
-        return dbusconn.writeAll(self.fd, bytes, deadline);
     }
 };
 
