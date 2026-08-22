@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const readFile = @import("../util/readfile.zig").sized;
 
 pub const Kind = enum(u8) { other = 0, png = 1, svg = 2 };
 
@@ -191,22 +192,6 @@ fn iconSuffixes(name: []const u8) []const []const u8 {
         &.{ ".png", ".svg", ".svgz" };
 }
 
-fn readFile(a: std.mem.Allocator, path: [:0]const u8, max: usize) !?[]u8 {
-    const f = c.fopen(path.ptr, "rb") orelse return null;
-    defer _ = c.fclose(f);
-    _ = c.fseek(f, 0, c.SEEK_END);
-    const sz = c.ftell(f);
-    if (sz <= 0 or @as(usize, @intCast(sz)) > max) return null;
-    _ = c.fseek(f, 0, c.SEEK_SET);
-    const buf = try a.alloc(u8, @intCast(sz));
-    errdefer a.free(buf);
-    const rd = c.fread(buf.ptr, 1, buf.len, f);
-    if (rd != buf.len) {
-        a.free(buf);
-        return null;
-    }
-    return buf;
-}
 
 // ─── tests ──────────────────────────────────────────────────────
 

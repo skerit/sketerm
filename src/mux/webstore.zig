@@ -17,6 +17,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
+const readfile = @import("../util/readfile.zig");
 
 /// Hard cap on live history entries; compaction prunes oldest-by-visit.
 pub const MAX_HISTORY: usize = 50_000;
@@ -78,28 +79,9 @@ pub fn defaultDirAlloc(allocator: std.mem.Allocator) ![]u8 {
     return allocator.dupe(u8, "/tmp/sketerm-web");
 }
 
-/// Whole small file into memory; null when absent/unreadable.
-fn readFileAlloc(allocator: std.mem.Allocator, path: []const u8, cap: usize) ?[]u8 {
-    return readFileAllocE(allocator, path, cap) catch null;
-}
-
-/// Error-returning so the `errdefer` runs; as a `?[]u8` body it did not.
-fn readFileAllocE(allocator: std.mem.Allocator, path: []const u8, cap: usize) ![]u8 {
-    var z: [4096]u8 = undefined;
-    const p = try pathz.pathZ(&z, path);
-    const fp = c.fopen(p, "rb") orelse return error.OpenFailed;
-    defer _ = c.fclose(fp);
-    var list: std.ArrayList(u8) = .empty;
-    errdefer list.deinit(allocator);
-    var buf: [16 * 1024]u8 = undefined;
-    while (true) {
-        const n = c.fread(&buf, 1, buf.len, fp);
-        if (n == 0) break;
-        try list.appendSlice(allocator, buf[0..n]);
-        if (list.items.len > cap) return error.StreamTooLong;
-    }
-    return list.toOwnedSlice(allocator);
-}
+/// Whole small file into memory; null when absent/unreadable. Each
+/// call site states its own cap -- it is what bounds a hostile file.
+const readFileAlloc = readfile.capped;
 
 /// Durable whole-file replacement for daemon-owned browser state.
 fn writeDurableFile(dir: []const u8, path: []const u8, bytes: []const u8) !void {

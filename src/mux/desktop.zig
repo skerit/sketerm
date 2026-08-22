@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const readfile = @import("../util/readfile.zig");
 
 /// Zig 0.16 has no std.fmt.allocPrintZ; build a NUL-terminated string.
 fn allocPrintZ(a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]u8 {
@@ -200,21 +201,13 @@ pub fn freeEntries(a: std.mem.Allocator, entries: []Entry) void {
     a.free(entries);
 }
 
+/// A .desktop entry is a few hundred bytes of ini; a megabyte is
+/// already absurd, and the cap is what bounds the scan of a hostile
+/// applications directory.
+const ENTRY_MAX_BYTES = 1 << 20;
+
 fn readFile(a: std.mem.Allocator, path: [:0]const u8) !?[]u8 {
-    const f = c.fopen(path.ptr, "rb") orelse return null;
-    defer _ = c.fclose(f);
-    _ = c.fseek(f, 0, c.SEEK_END);
-    const sz = c.ftell(f);
-    if (sz <= 0 or sz > (1 << 20)) return null;
-    _ = c.fseek(f, 0, c.SEEK_SET);
-    const buf = try a.alloc(u8, @intCast(sz));
-    errdefer a.free(buf);
-    const rd = c.fread(buf.ptr, 1, buf.len, f);
-    if (rd != buf.len) {
-        a.free(buf);
-        return null;
-    }
-    return buf;
+    return readfile.sized(a, path, ENTRY_MAX_BYTES);
 }
 
 // ─── tests ──────────────────────────────────────────────────────

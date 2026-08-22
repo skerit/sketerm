@@ -16,6 +16,7 @@ const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
 const keys = @import("keys.zig");
 const launch_cleanup = @import("launch_cleanup.zig");
+const readfile = @import("../util/readfile.zig");
 
 const nowMs = @import("../util/clock.zig").nowMs;
 
@@ -315,28 +316,13 @@ pub fn buildBootstrapScript(
     , .{ nonce, nonce, nonce, bash_script, nonce, nonce, zsh_env, nonce, nonce, zsh_script, nonce });
 }
 
-/// Read a whole file (bounded), libc IO like the rest of this module.
-fn readScriptFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
-    return readScriptFileAlloc(allocator, path) catch null;
-}
+/// Cap on one shell-integration script: they are a few KB of shipped
+/// text, and this is what stops a doctored one exhausting memory.
+const SCRIPT_MAX_BYTES = 256 * 1024;
 
-/// Error-returning so the `errdefer` runs. As a `?[]u8` body the final
-/// `toOwnedSlice(allocator) catch null` leaked the whole file.
-fn readScriptFileAlloc(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var pbuf: [4096]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&pbuf, "{s}", .{path});
-    const f = c.fopen(path_z.ptr, "rb") orelse return error.OpenFailed;
-    defer _ = c.fclose(f);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(allocator);
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const n = c.fread(&buf, 1, buf.len, f);
-        if (n == 0) break;
-        try out.appendSlice(allocator, buf[0..n]);
-        if (out.items.len > 256 * 1024) return error.StreamTooLong;
-    }
-    return out.toOwnedSlice(allocator);
+/// Read a whole shipped shell-integration script, bounded.
+fn readScriptFile(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
+    return readfile.capped(allocator, path, SCRIPT_MAX_BYTES);
 }
 
 fn buildBootstrapVia(allocator: std.mem.Allocator, comptime wrapped: bool) ?[]u8 {

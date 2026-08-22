@@ -14,7 +14,9 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const kitty = @import("../parser/kitty_image.zig");
-const pathZ = @import("../util/pathz.zig").pathZ;
+const pathz = @import("../util/pathz.zig");
+const pathZ = pathz.pathZ;
+const readfile = @import("../util/readfile.zig");
 
 /// Raw-bytes cap. The whole rewritten APC must fit a wire EVENTS
 /// frame (16 MB cap) alongside the rest of the drain batch; base64
@@ -59,31 +61,16 @@ pub fn rewrite(allocator: std.mem.Allocator, apc_bytes: []const u8) ?[]u8 {
     // The spec makes the terminal responsible for cleanup of
     // tempfiles and shm objects; the daemon is the terminal here.
     if (cmd.medium == 't' or cmd.medium == 's') {
-        var del_buf: [4096]u8 = undefined;
-        if (pathZ(&del_buf, path)) |p| {
-            _ = c.unlink(p);
-        } else |_| {}
+        pathz.unlinkPath(path);
     }
 
     return buildInlineApc(allocator, apc_bytes, data) catch null;
 }
 
+/// Bounded whole-file read; a 0-byte or unsizeable source is a miss,
+/// exactly as before -- there is no inlineable image in one.
 fn readFileCapped(allocator: std.mem.Allocator, path: []const u8) ?[]u8 {
-    var z_buf: [4096]u8 = undefined;
-    const p = pathZ(&z_buf, path) catch return null;
-    const fp = c.fopen(p, "rb") orelse return null;
-    defer _ = c.fclose(fp);
-    if (c.fseek(fp, 0, c.SEEK_END) != 0) return null;
-    const size_long = c.ftell(fp);
-    if (size_long <= 0 or size_long > MAX_RAW_BYTES) return null;
-    if (c.fseek(fp, 0, c.SEEK_SET) != 0) return null;
-    const size: usize = @intCast(size_long);
-    const out = allocator.alloc(u8, size) catch return null;
-    if (c.fread(out.ptr, 1, size, fp) != size) {
-        allocator.free(out);
-        return null;
-    }
-    return out;
+    return readfile.sizedOrNull(allocator, path, MAX_RAW_BYTES);
 }
 
 /// New APC: original control keys minus `t=`, plus `t=d`, payload
@@ -119,12 +106,7 @@ fn buildInlineApc(allocator: std.mem.Allocator, original: []const u8, data: []co
 
 const testing = std.testing;
 
-fn b64Alloc(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const enc = std.base64.standard.Encoder;
-    const out = try allocator.alloc(u8, enc.calcSize(bytes.len));
-    _ = enc.encode(out, bytes);
-    return out;
-}
+const b64Alloc = @import("../util/b64.zig").encodeAlloc;
 
 fn mkTempWith(contents: []const u8) ![]u8 {
     var tmpl = "/tmp/sketerm-kitty-XXXXXX".*;

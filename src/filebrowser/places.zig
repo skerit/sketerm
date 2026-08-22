@@ -7,8 +7,12 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
-const pathz = @import("../util/pathz.zig");
+const readfile = @import("../util/readfile.zig");
 const profile = @import("../util/profile.zig");
+
+/// Cap on this state file. Past it there is no usable record to read,
+/// and the cap is what stops a doctored one exhausting memory.
+const STATE_MAX_BYTES = 256 * 1024;
 
 pub const RECENT_CAP = 12;
 
@@ -197,16 +201,7 @@ pub fn load(allocator: std.mem.Allocator) ?std.json.Parsed(Places) {
 }
 
 fn loadFromPath(allocator: std.mem.Allocator, path: []const u8) ?std.json.Parsed(Places) {
-    var pbuf: [4096]u8 = undefined;
-    const fp = c.fopen(pathz.pathZ(&pbuf, path) catch return null, "rb") orelse return null;
-    defer _ = c.fclose(fp);
-    var bytes: [256 * 1024]u8 = undefined;
-    const n = c.fread(&bytes, 1, bytes.len, fp);
-    if (n == 0) return null;
-    return std.json.parseFromSlice(Places, allocator, bytes[0..n], .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    }) catch null;
+    return readfile.json(Places, allocator, path, STATE_MAX_BYTES);
 }
 
 pub fn save(allocator: std.mem.Allocator, p: Places) !void {
@@ -218,11 +213,7 @@ pub fn save(allocator: std.mem.Allocator, p: Places) !void {
 /// The app owns this file, so its mode is FORCED: a copy an older build
 /// created 0644 must be narrowed, not preserved forever.
 fn saveToPath(allocator: std.mem.Allocator, path: []const u8, p: Places) !void {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    defer out.deinit();
-    try std.json.Stringify.value(p, .{}, &out.writer);
-    try pathz.makeParentDirs(path);
-    try atomicwrite.writeFileExact(path, out.written(), 0o600);
+    try atomicwrite.writeJsonExact(allocator, path, p, 0o600);
 }
 
 /// Front-insert `spec` into an owned-string list, deduping and

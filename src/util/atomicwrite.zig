@@ -119,6 +119,20 @@ pub fn writeFileExact(path: []const u8, bytes: []const u8, mode: u32) Error!void
     return writeFileWithOps(&ops, path, bytes, mode, .durable, .exact);
 }
 
+/// JSON-serialize `value` and atomically replace `path` with exactly
+/// `mode`, creating the parent directories first.
+///
+/// The mode is FORCED rather than preserved: these are files the app
+/// owns outright, so a copy an older build created 0644 must be
+/// narrowed, not kept permissive forever.
+pub fn writeJsonExact(allocator: std.mem.Allocator, path: []const u8, value: anytype, mode: u32) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    try @import("pathz.zig").makeParentDirs(path);
+    try writeFileExact(path, out.written(), mode);
+}
+
 /// Atomically replace a rebuildable cache file without forcing it to stable storage.
 pub fn writeCacheFile(path: []const u8, bytes: []const u8, mode: u32) Error!void {
     var ops: PosixOps = .{};
