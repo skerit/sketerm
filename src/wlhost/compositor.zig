@@ -6978,57 +6978,104 @@ test "v6 state_sync serializes legacy pending LINEAR dmabuf params" {
     try t.expectEqual(dmabuf.DRM_FORMAT_MOD_LINEAR, params.planes[0].?.modifier);
 }
 
+/// registry + wl_compositor(3) + wl_shm(4) + xdg_wm_base(5): the id
+/// layout every shm-pool test below builds on.
+fn shmSetup(comp: *Compositor) !void {
+    try getRegistry(comp);
+    try bindGlobal(comp, 1, "wl_compositor", 4, 3);
+    try bindGlobal(comp, 2, "wl_shm", 1, 4);
+    try bindGlobal(comp, 5, "xdg_wm_base", 2, 5);
+}
+
+/// surface 6 -> xdg_surface 7 -> toplevel 8 -> the initial commit.
+fn shmToplevel(comp: *Compositor) !void {
+    var buf: [96]u8 = undefined;
+    var b = wire.Builder.init(&buf, 3, 0); // wl_compositor.create_surface
+    b.putNewId(6);
+    try req(comp, try b.finish());
+    b = wire.Builder.init(&buf, 5, 2); // xdg_wm_base.get_xdg_surface
+    b.putNewId(7);
+    b.putObject(6);
+    try req(comp, try b.finish());
+    b = wire.Builder.init(&buf, 7, 1); // xdg_surface.get_toplevel
+    b.putNewId(8);
+    try req(comp, try b.finish());
+    b = wire.Builder.init(&buf, 6, 6); // wl_surface.commit
+    try req(comp, try b.finish());
+}
+
+/// wl_shm.create_pool(id, fd, size) on the shm bound as object 4.
+fn createPool(comp: *Compositor, id: u32, size: i32) !void {
+    var buf: [96]u8 = undefined;
+    var b = wire.Builder.init(&buf, 4, 0);
+    b.putNewId(id);
+    b.putInt(size);
+    try req(comp, try b.finish());
+}
+
+/// wl_shm_pool.create_buffer(id, offset 0, w x h, stride, xrgb8888).
+fn createBuffer(comp: *Compositor, pool: u32, id: u32, w: i32, h: i32, stride: i32) !void {
+    var buf: [96]u8 = undefined;
+    var b = wire.Builder.init(&buf, pool, 0);
+    b.putNewId(id);
+    b.putInt(0);
+    b.putInt(w);
+    b.putInt(h);
+    b.putInt(stride);
+    b.putUint(1);
+    try req(comp, try b.finish());
+}
+
+/// wl_shm_pool.destroy(pool).
+fn destroyPool(comp: *Compositor, pool: u32) !void {
+    var buf: [16]u8 = undefined;
+    var b = wire.Builder.init(&buf, pool, 1);
+    try req(comp, try b.finish());
+}
+
+/// wl_buffer.destroy(buffer).
+fn destroyBuffer(comp: *Compositor, buffer: u32) !void {
+    var buf: [16]u8 = undefined;
+    var b = wire.Builder.init(&buf, buffer, 0);
+    try req(comp, try b.finish());
+}
+
+/// wl_surface.attach(buffer, 0, 0) + commit, on surface 6.
+fn attachCommit(comp: *Compositor, buffer: u32) !void {
+    var buf: [96]u8 = undefined;
+    var b = wire.Builder.init(&buf, 6, 1);
+    b.putObject(buffer);
+    b.putInt(0);
+    b.putInt(0);
+    try req(comp, try b.finish());
+    b = wire.Builder.init(&buf, 6, 6);
+    try req(comp, try b.finish());
+}
+
 test "shm pool bytes reclaim only after pool destroy AND last buffer destroy" {
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
     defer comp.deinit();
-    var buf: [96]u8 = undefined;
 
     try getRegistry(&comp);
     try bindGlobal(&comp, 2, "wl_shm", 1, 4);
-    { // create_pool(9, fd, 16)
-        var b = wire.Builder.init(&buf, 4, 0);
-        b.putNewId(9);
-        b.putInt(16);
-        try req(&comp, try b.finish());
-    }
-    { // create_buffer(10, 0, 2x2, stride 8, xrgb)
-        var b = wire.Builder.init(&buf, 9, 0);
-        b.putNewId(10);
-        b.putInt(0);
-        b.putInt(2);
-        b.putInt(2);
-        b.putInt(8);
-        b.putUint(1);
-        try req(&comp, try b.finish());
-    }
+    try createPool(&comp, 9, 16);
+    try createBuffer(&comp, 9, 10, 2, 2, 8);
     try t.expectEqual(@as(u32, 1), comp.pools.get(9).?.buffers);
 
-    { // wl_shm_pool.destroy(9) — buffer 10 still references the bytes
-        var b = wire.Builder.init(&buf, 9, 1);
-        try req(&comp, try b.finish());
-    }
+    // wl_shm_pool.destroy(9) — buffer 10 still references the bytes.
+    try destroyPool(&comp, 9);
     try t.expect(comp.pools.get(9) != null);
     try t.expect(comp.pools.get(9).?.destroyed);
 
-    { // wl_buffer.destroy(10) — last reference: bytes reclaim
-        var b = wire.Builder.init(&buf, 10, 0);
-        try req(&comp, try b.finish());
-    }
+    // wl_buffer.destroy(10) — last reference: bytes reclaim.
+    try destroyBuffer(&comp, 10);
     try t.expect(comp.pools.get(9) == null);
 
     // Reverse order: destroying a buffer-less pool reclaims at once.
-    { // create_pool(11, fd, 16)
-        var b = wire.Builder.init(&buf, 4, 0);
-        b.putNewId(11);
-        b.putInt(16);
-        try req(&comp, try b.finish());
-    }
+    try createPool(&comp, 11, 16);
     try t.expect(comp.pools.get(11) != null);
-    { // destroy(11)
-        var b = wire.Builder.init(&buf, 11, 1);
-        try req(&comp, try b.finish());
-    }
+    try destroyPool(&comp, 11);
     try t.expect(comp.pools.get(11) == null);
     try t.expect(!comp.dead);
 }
@@ -7037,54 +7084,19 @@ test "recycled pool id: old buffer's destroy must not reclaim the new incarnatio
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
     defer comp.deinit();
-    var buf: [96]u8 = undefined;
 
-    try getRegistry(&comp);
-    try bindGlobal(&comp, 1, "wl_compositor", 4, 3);
-    try bindGlobal(&comp, 2, "wl_shm", 1, 4);
-    try bindGlobal(&comp, 5, "xdg_wm_base", 2, 5);
+    try shmSetup(&comp);
 
-    { // create_surface(6), get_xdg_surface(7), get_toplevel(8), map
-        var b = wire.Builder.init(&buf, 3, 0);
-        b.putNewId(6);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 5, 2);
-        b.putNewId(7);
-        b.putObject(6);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 7, 1);
-        b.putNewId(8);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 6, 6); // initial commit
-        try req(&comp, try b.finish());
-    }
+    try shmToplevel(&comp);
 
     // Probe pool (id 9) + probe buffer 10; pool destroyed at once —
     // Vulkan WSI's format probing. Buffer 10 stays alive.
-    { // create_pool(9, fd, 16)
-        var b = wire.Builder.init(&buf, 4, 0);
-        b.putNewId(9);
-        b.putInt(16);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 9, 0); // create_buffer(10, 2x2)
-        b.putNewId(10);
-        b.putInt(0);
-        b.putInt(2);
-        b.putInt(2);
-        b.putInt(8);
-        b.putUint(1);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 9, 1); // pool destroy
-        try req(&comp, try b.finish());
-    }
+    try createPool(&comp, 9, 16);
+    try createBuffer(&comp, 9, 10, 2, 2, 8);
+    try destroyPool(&comp, 9);
 
     // Client recycles id 9 for the real 4x4 swapchain pool.
-    { // create_pool(9, fd, 64) — recycled id
-        var b = wire.Builder.init(&buf, 4, 0);
-        b.putNewId(9);
-        b.putInt(64);
-        try req(&comp, try b.finish());
-    }
+    try createPool(&comp, 9, 64); // recycled id
     try t.expectEqual(@as(usize, 1), comp.orphan_pools.count());
     { // pool bytes via side-band update
         var unit: std.ArrayList(u8) = .empty;
@@ -7094,67 +7106,33 @@ test "recycled pool id: old buffer's destroy must not reclaim the new incarnatio
         try pipe.appendPoolUpdate(&unit, t.allocator, 9, 0, &px);
         try comp.feed(unit.items);
     }
-    { // create_buffer(11, 4x4), pool destroy — swapchain steady state
-        var b = wire.Builder.init(&buf, 9, 0);
-        b.putNewId(11);
-        b.putInt(0);
-        b.putInt(4);
-        b.putInt(4);
-        b.putInt(16);
-        b.putUint(1);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 9, 1);
-        try req(&comp, try b.finish());
-    }
+    // Swapchain steady state: buffer 11, pool destroyed.
+    try createBuffer(&comp, 9, 11, 4, 4, 16);
+    try destroyPool(&comp, 9);
 
     // THE regression: destroying the probe buffer released the NEW
     // pool's refcount (same id) and reclaimed the swapchain bytes,
     // so baobab's first frame silently vanished.
-    { // wl_buffer.destroy(10)
-        var b = wire.Builder.init(&buf, 10, 0);
-        try req(&comp, try b.finish());
-    }
+    try destroyBuffer(&comp, 10);
     try t.expectEqual(@as(usize, 0), comp.orphan_pools.count());
     try t.expect(comp.pools.get(9) != null);
     try t.expectEqual(@as(usize, 64), comp.pools.get(9).?.bytes.items.len);
 
-    { // attach(11) + commit → the frame MUST reach the view
-        var b = wire.Builder.init(&buf, 6, 1);
-        b.putObject(11);
-        b.putInt(0);
-        b.putInt(0);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 6, 6);
-        try req(&comp, try b.finish());
-    }
+    // Attach 11 + commit: the frame MUST reach the view.
+    try attachCommit(&comp, 11);
     try t.expectEqual(@as(usize, 1), tv.frames);
     try t.expectEqual(@as(i32, 4), tv.last_w);
     try t.expectEqual(@as(u8, 200), tv.last_pixels[0]);
 
     // state_sync v4: the still-live buffer 11 binds to the replayed
     // pool; a buffer referencing a displaced incarnation must not.
-    { // fresh orphan-referencing buffer: pool 12 + buffer 13, pool
-        // destroyed, id 12 recycled — buffer 13 now references the
-        // orphaned incarnation.
-        var b = wire.Builder.init(&buf, 4, 0);
-        b.putNewId(12);
-        b.putInt(16);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 12, 0);
-        b.putNewId(13);
-        b.putInt(0);
-        b.putInt(2);
-        b.putInt(2);
-        b.putInt(8);
-        b.putUint(1);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 12, 1);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 4, 0);
-        b.putNewId(12);
-        b.putInt(16);
-        try req(&comp, try b.finish());
-    }
+    // Fresh orphan-referencing buffer: pool 12 + buffer 13, pool
+    // destroyed, id 12 recycled — buffer 13 now references the
+    // orphaned incarnation.
+    try createPool(&comp, 12, 16);
+    try createBuffer(&comp, 12, 13, 2, 2, 8);
+    try destroyPool(&comp, 12);
+    try createPool(&comp, 12, 16);
     const blob = try comp.serializeState(t.allocator);
     defer t.allocator.free(blob);
 
@@ -7186,33 +7164,13 @@ test "orphaned pool incarnation: serial adoption + pool_update_s keep a displace
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
     defer comp.deinit();
-    var buf: [96]u8 = undefined;
 
-    try getRegistry(&comp);
-    try bindGlobal(&comp, 1, "wl_compositor", 4, 3);
-    try bindGlobal(&comp, 2, "wl_shm", 1, 4);
-    try bindGlobal(&comp, 5, "xdg_wm_base", 2, 5);
+    try shmSetup(&comp);
 
-    { // surface 6 → xdg_surface 7 → toplevel 8, initial commit
-        var b = wire.Builder.init(&buf, 3, 0);
-        b.putNewId(6);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 5, 2);
-        b.putNewId(7);
-        b.putObject(6);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 7, 1);
-        b.putNewId(8);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 6, 6);
-        try req(&comp, try b.finish());
-    }
+    try shmToplevel(&comp);
 
-    { // create_pool(9, 64) — then ADOPT the daemon's serial (7000)
-        var b = wire.Builder.init(&buf, 4, 0);
-        b.putNewId(9);
-        b.putInt(64);
-        try req(&comp, try b.finish());
+    try createPool(&comp, 9, 64);
+    { // ADOPT the daemon's serial (7000)
         var unit: std.ArrayList(u8) = .empty;
         defer unit.deinit(t.allocator);
         try pipe.appendPoolSerial(&unit, t.allocator, 9, 7000);
@@ -7220,25 +7178,14 @@ test "orphaned pool incarnation: serial adoption + pool_update_s keep a displace
     }
     try t.expectEqual(@as(u64, 7000), comp.pools.get(9).?.serial);
 
-    { // create_buffer(10, 4x4) — inherits the adopted serial
-        var b = wire.Builder.init(&buf, 9, 0);
-        b.putNewId(10);
-        b.putInt(0);
-        b.putInt(4);
-        b.putInt(4);
-        b.putInt(16);
-        b.putUint(1);
-        try req(&comp, try b.finish());
-    }
+    // create_buffer(10, 4x4) — inherits the adopted serial.
+    try createBuffer(&comp, 9, 10, 4, 4, 16);
     try t.expectEqual(@as(u64, 7000), comp.buffers.get(10).?.pool_serial);
 
-    { // destroy pool 9, recycle its id (DirectDraw mode switch)
-        var b = wire.Builder.init(&buf, 9, 1);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 4, 0);
-        b.putNewId(9);
-        b.putInt(64);
-        try req(&comp, try b.finish());
+    // Destroy pool 9 and recycle its id (DirectDraw mode switch).
+    try destroyPool(&comp, 9);
+    try createPool(&comp, 9, 64);
+    {
         var unit: std.ArrayList(u8) = .empty;
         defer unit.deinit(t.allocator);
         try pipe.appendPoolSerial(&unit, t.allocator, 9, 7001);
@@ -7258,15 +7205,8 @@ test "orphaned pool incarnation: serial adoption + pool_update_s keep a displace
     }
     try t.expectEqual(@as(u8, 40), comp.orphan_pools.get(7000).?.bytes.items[0]);
 
-    { // attach the displaced buffer + commit → frame with the bytes
-        var b = wire.Builder.init(&buf, 6, 1);
-        b.putObject(10);
-        b.putInt(0);
-        b.putInt(0);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 6, 6);
-        try req(&comp, try b.finish());
-    }
+    // Attach the displaced buffer + commit: a frame with its bytes.
+    try attachCommit(&comp, 10);
     try t.expectEqual(@as(usize, 1), tv.frames);
     try t.expectEqual(@as(u8, 40), tv.last_pixels[0]);
 
@@ -7287,47 +7227,15 @@ test "pool_orphan replay: v5 state_sync binds a displaced buffer to the replayed
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
     defer comp.deinit();
-    var buf: [96]u8 = undefined;
 
-    try getRegistry(&comp);
-    try bindGlobal(&comp, 1, "wl_compositor", 4, 3);
-    try bindGlobal(&comp, 2, "wl_shm", 1, 4);
-    try bindGlobal(&comp, 5, "xdg_wm_base", 2, 5);
+    try shmSetup(&comp);
 
-    { // surface 6 → toplevel 8, mapped
-        var b = wire.Builder.init(&buf, 3, 0);
-        b.putNewId(6);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 5, 2);
-        b.putNewId(7);
-        b.putObject(6);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 7, 1);
-        b.putNewId(8);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 6, 6);
-        try req(&comp, try b.finish());
-    }
-    { // pool 9 (serial 1) + buffer 10, pool destroyed, id recycled
-        var b = wire.Builder.init(&buf, 4, 0);
-        b.putNewId(9);
-        b.putInt(64);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 9, 0);
-        b.putNewId(10);
-        b.putInt(0);
-        b.putInt(4);
-        b.putInt(4);
-        b.putInt(16);
-        b.putUint(1);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 9, 1);
-        try req(&comp, try b.finish());
-        b = wire.Builder.init(&buf, 4, 0);
-        b.putNewId(9);
-        b.putInt(64);
-        try req(&comp, try b.finish());
-    }
+    try shmToplevel(&comp);
+    // Pool 9 + buffer 10, pool destroyed, id recycled.
+    try createPool(&comp, 9, 64);
+    try createBuffer(&comp, 9, 10, 4, 4, 16);
+    try destroyPool(&comp, 9);
+    try createPool(&comp, 9, 64);
     const orphan_serial = comp.buffers.get(10).?.pool_serial;
     try t.expect(comp.orphan_pools.get(orphan_serial) != null);
 
@@ -7357,15 +7265,7 @@ test "pool_orphan replay: v5 state_sync binds a displaced buffer to the replayed
     // included), and a commit renders ITS bytes.
     try t.expectEqual(orphan_serial, replica.buffers.get(10).?.pool_serial);
     try t.expectEqual(@as(u32, 1), replica.orphan_pools.get(orphan_serial).?.buffers);
-    {
-        var b = wire.Builder.init(&buf, 6, 1);
-        b.putObject(10);
-        b.putInt(0);
-        b.putInt(0);
-        try req(&replica, try b.finish());
-        b = wire.Builder.init(&buf, 6, 6);
-        try req(&replica, try b.finish());
-    }
+    try attachCommit(&replica, 10);
     try t.expectEqual(@as(usize, 1), rv.frames);
     try t.expectEqual(@as(u8, 90), rv.last_pixels[0]);
 }
