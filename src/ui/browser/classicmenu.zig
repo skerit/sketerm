@@ -25,6 +25,7 @@ const std = @import("std");
 const c = @import("../../c.zig").c;
 const iconload = @import("../iconload.zig");
 const cssutil = @import("../cssutil.zig");
+const menuchrome = @import("../menuchrome.zig");
 const cast = @import("../../util/cast.zig");
 
 /// The legacy menu-handler shape, called with a null button.
@@ -193,13 +194,12 @@ pub const Root = struct {
 };
 
 /// Rows scroll rather than overflow the screen on very long menus.
+/// The scroller itself is `menuchrome`'s, for the popover-minimum-size
+/// reason documented there; `cap` and the content back-pointer are what
+/// this menu adds on top (see `stabilizeScroll`).
 fn wrapScroll(box: *c.GtkWidget, cap: c_int) *c.GtkWidget {
-    const sw = c.gtk_scrolled_window_new().?;
-    c.gtk_scrolled_window_set_policy(@ptrCast(sw), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-    c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(sw), 1);
-    c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(sw), 1);
+    const sw = menuchrome.newPopoverScroller(box);
     c.gtk_scrolled_window_set_max_content_height(@ptrCast(sw), cap);
-    c.gtk_scrolled_window_set_child(@ptrCast(sw), box);
     c.g_object_set_data(@ptrCast(@alignCast(sw)), CONTENT_KEY, @ptrCast(box));
     return sw;
 }

@@ -38,9 +38,9 @@ pub fn makeRow(icon: [*:0]const u8, label: [*:0]const u8, arrow: bool) *c.GtkWid
     return btn.?;
 }
 
-/// Put a built row `list` into `popover` through a scroller with natural
-/// size propagation. THE reason this wrapper exists, and why no menu may
-/// set a bare box as its popover child:
+/// Wrap a built row `list` in the scroller every popover menu body must
+/// have. THE reason this wrapper exists, and why no menu may set a bare
+/// box as its popover child:
 ///
 /// GTK4 silently pops down an autohide popover whose MINIMUM size does
 /// not fit the space the compositor grants it (gtkpopover.c
@@ -50,13 +50,21 @@ pub fn makeRow(icon: [*:0]const u8, label: [*:0]const u8, arrow: bool) *c.GtkWid
 /// frame it mapped. The scroller makes the minimum tiny (the menu
 /// scrolls when constrained) while natural height/width propagation
 /// keeps the usual full-size rendering when there IS room.
-pub fn setPopoverList(popover: *c.GtkWidget, list: *c.GtkWidget) void {
-    const scroller = c.gtk_scrolled_window_new();
+///
+/// Callers that need the scroller afterwards (a height cap, a post-map
+/// remeasure) use this; `setPopoverList` is the one-liner for the rest.
+pub fn newPopoverScroller(list: *c.GtkWidget) *c.GtkWidget {
+    const scroller = c.gtk_scrolled_window_new().?;
     c.gtk_scrolled_window_set_policy(@ptrCast(scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
     c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(scroller), 1);
     c.gtk_scrolled_window_set_propagate_natural_width(@ptrCast(scroller), 1);
     c.gtk_scrolled_window_set_child(@ptrCast(scroller), list);
-    c.gtk_popover_set_child(@ptrCast(popover), scroller);
+    return scroller;
+}
+
+/// Put a built row `list` into `popover` through `newPopoverScroller`.
+pub fn setPopoverList(popover: *c.GtkWidget, list: *c.GtkWidget) void {
+    c.gtk_popover_set_child(@ptrCast(popover), newPopoverScroller(list));
 }
 
 /// Signature of a menu's right-click handler ("pressed" on a
