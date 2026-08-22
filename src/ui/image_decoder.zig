@@ -4,6 +4,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const cast = @import("../util/cast.zig");
+const SpinLock = @import("../util/spinlock.zig").SpinLock;
 
 pub const Backend = enum { glycin, gdk_pixbuf };
 
@@ -90,7 +91,7 @@ extern fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
 extern fn dlclose(handle: ?*anyopaque) c_int;
 const RTLD_LAZY: c_int = 1;
 
-var load_lock = std.atomic.Value(u8).init(0);
+var load_lock: SpinLock = .init;
 var load_attempted = false;
 var loaded_api: ?Api = null;
 
@@ -128,8 +129,8 @@ fn loadApi() ?Api {
 }
 
 fn api() ?Api {
-    while (load_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {}
-    defer load_lock.store(0, .release);
+    load_lock.lock();
+    defer load_lock.unlock();
     if (!load_attempted) {
         loaded_api = loadApi();
         load_attempted = true;

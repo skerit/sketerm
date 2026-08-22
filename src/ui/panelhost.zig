@@ -1612,6 +1612,12 @@ fn protectedCacheHashes(cache: *assets.Cache, allocator: std.mem.Allocator) ![][
     return hashes.toOwnedSlice(allocator);
 }
 
+/// Deliberately NOT `util/spinlock.zig`: this guard is held across the
+/// atomic cache write and the full image decode that follows (the
+/// decoded file must not be reclaimed by a concurrent store), so a
+/// waiter backs off with `usleep` instead of burning a core. A busy
+/// spin here would be a regression, and the right fix if this ever
+/// needs more is a real condvar, not a longer spin.
 fn runCacheJob(job: *CacheJob) void {
     while (cache_store_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null)
         _ = c.usleep(1_000);

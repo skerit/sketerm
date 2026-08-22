@@ -2,6 +2,7 @@
 //! Neither codec becomes an ELF dependency of the mux daemon.
 
 const std = @import("std");
+const SpinLock = @import("spinlock.zig").SpinLock;
 
 pub const Codec = enum { jxl, webp };
 pub const Encoded = struct { codec: Codec, bytes: []u8 };
@@ -123,9 +124,9 @@ const RTLD_LAZY: c_int = 1;
 var load_attempted = false;
 var jxl_api: ?JxlApi = null;
 var webp_api: ?WebpApi = null;
-/// Spinlock (Zig 0.16 std.Thread has no Mutex; this module keeps no
-/// libc module dependency). Contention is a first-probe race only.
-var load_lock = std.atomic.Value(u8).init(0);
+/// The tree's one spinlock (Zig 0.16 std.Thread has no Mutex).
+/// Contention is a first-probe race only.
+var load_lock: SpinLock = .init;
 
 fn sym(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
     // dlsym returns *anyopaque (align 1); function pointers have a
@@ -210,8 +211,8 @@ const Apis = struct { jxl: ?JxlApi, webp: ?WebpApi };
 /// callers (GUI main thread + thumb worker) never read a mid-store
 /// global. A failed dlopen re-probe costs microseconds per call.
 fn ensureLoaded() Apis {
-    while (load_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {}
-    defer load_lock.store(0, .release);
+    load_lock.lock();
+    defer load_lock.unlock();
     if (!load_attempted or (jxl_api == null and webp_api == null)) {
         jxl_api = loadJxl();
         webp_api = loadWebp();
