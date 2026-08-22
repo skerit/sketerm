@@ -436,6 +436,42 @@ const FaultOps = struct {
     }
 };
 
+/// A private temp dir plus one path inside it, both removed by `deinit`.
+///
+/// Every test here needs the same fixture, and the slices point into the
+/// struct: initialise it in place (`var tmp: TempFile = undefined; try
+/// tmp.init(...)`), never by value out of a function.
+const TempFile = struct {
+    tmpl: [96:0]u8,
+    path_buf: [512]u8,
+    path_z_buf: [512:0]u8,
+    base: [:0]const u8,
+    path: []const u8,
+    path_z: [:0]const u8,
+
+    /// Returns SkipZigTest when /tmp is unusable, as the copies each did.
+    fn init(self: *@This(), comptime tag: []const u8, comptime leaf: []const u8) !void {
+        const template = "/tmp/sketerm-" ++ tag ++ "-XXXXXX";
+        comptime std.debug.assert(template.len < 96);
+        @memcpy(self.tmpl[0..template.len], template);
+        self.tmpl[template.len] = 0;
+        _ = c.mkdtemp(&self.tmpl) orelse return error.SkipZigTest;
+        self.base = std.mem.span(@as([*:0]const u8, &self.tmpl));
+        self.path = try std.fmt.bufPrint(&self.path_buf, "{s}/" ++ leaf, .{self.base});
+        self.path_z = try std.fmt.bufPrintZ(&self.path_z_buf, "{s}", .{self.path});
+    }
+
+    fn deinit(self: *@This()) void {
+        _ = c.unlink(self.path_z.ptr);
+        _ = c.rmdir(self.base.ptr);
+    }
+
+    /// Name a second file in the same dir; the caller owns `buf`.
+    fn sibling(self: *const @This(), buf: []u8, comptime leaf: []const u8) ![]const u8 {
+        return std.fmt.bufPrint(buf, "{s}/" ++ leaf, .{self.base});
+    }
+};
+
 fn readTestFile(path: []const u8, buf: []u8) ![]const u8 {
     var path_buf: [MAX_PATH:0]u8 = undefined;
     const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
@@ -476,15 +512,10 @@ const FailingFileWriter = struct {
 
 test "writeSerialized preserves the old file across every pre-install failure" {
     const t = std.testing;
-    var tmpl = "/tmp/sketerm-serialized-fail-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
-    defer _ = c.unlink(path_z.ptr);
+    var tmp: TempFile = undefined;
+    try tmp.init("serialized-fail", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
     try writeFile(path, "old-valid", 0o600);
 
     const fixture: SerializedFixture = .{ .bytes = "new-valid" };
@@ -557,16 +588,10 @@ test "writeSerialized preserves the old file across every pre-install failure" {
 }
 
 test "writeFile completes short writes and syncs the parent" {
-    var tmpl = "/tmp/sketerm-atomicwrite-short-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    defer {
-        var z: [512:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&z, "{s}", .{path})) |p| _ = c.unlink(p.ptr) else |_| {}
-    }
+    var tmp: TempFile = undefined;
+    try tmp.init("short", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
 
     var ops: FaultOps = .{ .short_write = 3 };
     try writeFileWithOps(&ops, path, "complete short write", 0o600, .durable, .preserve_existing);
@@ -576,15 +601,10 @@ test "writeFile completes short writes and syncs the parent" {
 }
 
 test "writeCacheFile keeps atomic install checks but deliberately skips syncs" {
-    var tmpl = "/tmp/sketerm-atomicwrite-cache-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/cache.bin", .{base});
-    var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
-    defer _ = c.unlink(path_z.ptr);
+    var tmp: TempFile = undefined;
+    try tmp.init("cache", "cache.bin");
+    defer tmp.deinit();
+    const path = tmp.path;
 
     try writeFile(path, "old-public-cache", 0o644);
     var ops: FaultOps = .{ .short_write = 2, .fail_data_sync = true };
@@ -594,21 +614,15 @@ test "writeCacheFile keeps atomic install checks but deliberately skips syncs" {
     try std.testing.expectEqual(@as(usize, 0), ops.data_syncs);
     try std.testing.expectEqual(@as(usize, 0), ops.parent_syncs);
     var st: c.struct_stat = undefined;
-    try std.testing.expect(c.lstat(path_z.ptr, &st) == 0);
+    try std.testing.expect(c.lstat(tmp.path_z.ptr, &st) == 0);
     try std.testing.expectEqual(@as(c.mode_t, 0o600), @as(c.mode_t, @intCast(st.st_mode & 0o777)));
 }
 
 test "write and data-sync failures preserve the old file and clean the stage" {
-    var tmpl = "/tmp/sketerm-atomicwrite-disk-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    defer {
-        var z: [512:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&z, "{s}", .{path})) |p| _ = c.unlink(p.ptr) else |_| {}
-    }
+    var tmp: TempFile = undefined;
+    try tmp.init("disk", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
     try writeFile(path, "old-valid", 0o600);
 
     var write_ops: FaultOps = .{ .short_write = 2, .fail_write_after = 4 };
@@ -634,15 +648,10 @@ test "every staged name a writer produces is recognised as one" {
     try t.expect(!std.mem.eql(u8, first, second));
 
     // A real install must be sweepable by name too, not just a built one.
-    var tmpl = "/tmp/sketerm-atomicwrite-stagename-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
-    defer _ = c.unlink(path_z.ptr);
+    var tmp: TempFile = undefined;
+    try tmp.init("stagename", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
     var ops: FaultOps = .{ .fail_rename = true };
     try t.expectError(error.RenameFailed, writeFileWithOps(&ops, path, "x", 0o600, .durable, .exact));
     const staged = ops.lastStage();
@@ -659,15 +668,10 @@ test "every staged name a writer produces is recognised as one" {
 }
 
 test "an interrupted data sync is retried and a stalled write is not misclassified" {
-    var tmpl = "/tmp/sketerm-atomicwrite-eintr-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
-    defer _ = c.unlink(path_z.ptr);
+    var tmp: TempFile = undefined;
+    try tmp.init("eintr", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
 
     var eintr_ops: FaultOps = .{ .eintr_data_syncs = 2 };
     try writeFileWithOps(&eintr_ops, path, "survives a signal", 0o600, .durable, .preserve_existing);
@@ -678,7 +682,7 @@ test "an interrupted data sync is retried and a stalled write is not misclassifi
     // The destination's lstat leaves ENOENT in errno; a write that returns
     // zero must not be reported through it as though the path were missing.
     var missing_buf: [512]u8 = undefined;
-    const missing = try std.fmt.bufPrint(&missing_buf, "{s}/fresh.json", .{base});
+    const missing = try tmp.sibling(&missing_buf, "fresh.json");
     var stall_ops: FaultOps = .{ .short_write = 0 };
     try std.testing.expectError(error.WriteFailed, writeFileWithOps(
         &stall_ops,
@@ -693,15 +697,10 @@ test "an interrupted data sync is retried and a stalled write is not misclassifi
 }
 
 test "a failed parent sync reports the committed replacement as saved" {
-    var tmpl = "/tmp/sketerm-atomicwrite-dirsync-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
-    defer _ = c.unlink(path_z.ptr);
+    var tmp: TempFile = undefined;
+    try tmp.init("dirsync", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
     try writeFile(path, "old-valid", 0o600);
 
     // A directory fsync that fails (FUSE, NFS) must not be laundered into a
@@ -717,16 +716,10 @@ test "a failed parent sync reports the committed replacement as saved" {
 }
 
 test "a stale exclusive stage is bypassed without deleting it" {
-    var tmpl = "/tmp/sketerm-atomicwrite-stale-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    defer {
-        var z: [512:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&z, "{s}", .{path})) |p| _ = c.unlink(p.ptr) else |_| {}
-    }
+    var tmp: TempFile = undefined;
+    try tmp.init("stale", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
 
     var ops: FaultOps = .{ .collide_once = true };
     try writeFileWithOps(&ops, path, "new", 0o600, .durable, .preserve_existing);
@@ -738,16 +731,10 @@ test "a stale exclusive stage is bypassed without deleting it" {
 }
 
 test "rename failure preserves the old file and removes its stage" {
-    var tmpl = "/tmp/sketerm-atomicwrite-rename-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    defer {
-        var z: [512:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&z, "{s}", .{path})) |p| _ = c.unlink(p.ptr) else |_| {}
-    }
+    var tmp: TempFile = undefined;
+    try tmp.init("rename", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
     try writeFile(path, "old-valid", 0o600);
 
     var ops: FaultOps = .{ .fail_rename = true };
@@ -759,58 +746,43 @@ test "rename failure preserves the old file and removes its stage" {
 }
 
 test "writeFile creates restrictive files and preserves replacement mode" {
-    var tmpl = "/tmp/sketerm-atomicwrite-mode-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
-    defer _ = c.unlink(path_z.ptr);
+    var tmp: TempFile = undefined;
+    try tmp.init("mode", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
 
     try writeFile(path, "first", 0o600);
     var st: c.struct_stat = undefined;
-    try std.testing.expect(c.lstat(path_z.ptr, &st) == 0);
+    try std.testing.expect(c.lstat(tmp.path_z.ptr, &st) == 0);
     try std.testing.expectEqual(@as(c.mode_t, 0o600), @as(c.mode_t, @intCast(st.st_mode & 0o777)));
-    try std.testing.expect(c.chmod(path_z.ptr, @as(c.mode_t, 0o640)) == 0);
+    try std.testing.expect(c.chmod(tmp.path_z.ptr, @as(c.mode_t, 0o640)) == 0);
     try writeFile(path, "second-and-longer", 0o600);
-    try std.testing.expect(c.lstat(path_z.ptr, &st) == 0);
+    try std.testing.expect(c.lstat(tmp.path_z.ptr, &st) == 0);
     try std.testing.expectEqual(@as(c.mode_t, 0o640), @as(c.mode_t, @intCast(st.st_mode & 0o777)));
     var got: [64]u8 = undefined;
     try std.testing.expectEqualStrings("second-and-longer", try readTestFile(path, &got));
 }
 
 test "writeFileExact replaces an existing file with the requested mode" {
-    var tmpl = "/tmp/sketerm-atomicwrite-exact-mode-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
-    defer _ = c.unlink(path_z.ptr);
+    var tmp: TempFile = undefined;
+    try tmp.init("exact-mode", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
 
     try writeFile(path, "public", 0o644);
     try writeFileExact(path, "private", 0o600);
     var st: c.struct_stat = undefined;
-    try std.testing.expect(c.lstat(path_z.ptr, &st) == 0);
+    try std.testing.expect(c.lstat(tmp.path_z.ptr, &st) == 0);
     try std.testing.expectEqual(@as(c.mode_t, 0o600), @as(c.mode_t, @intCast(st.st_mode & 0o777)));
     var got: [16]u8 = undefined;
     try std.testing.expectEqualStrings("private", try readTestFile(path, &got));
 }
 
 test "concurrent writers install one complete value without stage collisions" {
-    var tmpl = "/tmp/sketerm-atomicwrite-concurrent-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
-    defer _ = c.unlink(path_z.ptr);
+    var tmp: TempFile = undefined;
+    try tmp.init("concurrent", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
 
     const a = try std.testing.allocator.alloc(u8, 256 * 1024);
     defer std.testing.allocator.free(a);
@@ -854,18 +826,14 @@ test "writeFile refuses an unopenable destination" {
 }
 
 test "deleteFile removes a file durably and reports absence" {
-    var tmpl = "/tmp/sketerm-atomicwrite-delete-XXXXXX".*;
-    const dir = c.mkdtemp(&tmpl) orelse return error.SkipZigTest;
-    defer _ = c.rmdir(dir);
-    const base = std.mem.span(@as([*:0]u8, @ptrCast(dir)));
-    var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/state.json", .{base});
-    var path_z_buf: [512:0]u8 = undefined;
-    const path_z = try std.fmt.bufPrintZ(&path_z_buf, "{s}", .{path});
+    var tmp: TempFile = undefined;
+    try tmp.init("delete", "state.json");
+    defer tmp.deinit();
+    const path = tmp.path;
 
     try writeFile(path, "state", 0o600);
     try deleteFile(path);
     var st: c.struct_stat = undefined;
-    try std.testing.expect(c.lstat(path_z.ptr, &st) != 0);
+    try std.testing.expect(c.lstat(tmp.path_z.ptr, &st) != 0);
     try std.testing.expectError(error.NotFound, deleteFile(path));
 }
