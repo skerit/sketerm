@@ -83,7 +83,12 @@ pub fn onTabContextMenu(ctx: ?*anyopaque, page: *c.AdwTabPage, anchor: *c.GtkWid
     c.gtk_box_append(@ptrCast(list), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
     addTabMenuAction(self, popover, list, page, "Close Tab", "window-close-symbolic", .close);
 
-    c.gtk_popover_set_child(@ptrCast(popover), list);
+    // Measured on Adwaita/GTK 4.22: this box's minimum height EQUALS its
+    // natural (366px with every conditional row, 430px once popover
+    // chrome is added) because no child of a button box can shrink. A
+    // window under ~500px tall therefore cannot grant it, and GTK pops
+    // the menu down the frame it maps. The scroller is the fix.
+    menuchrome.setPopoverList(popover.?, list.?);
     c.gtk_popover_popup(@ptrCast(popover));
 }
 
