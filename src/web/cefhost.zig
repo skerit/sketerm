@@ -5451,7 +5451,19 @@ pub const Host = struct {
         // onBeforeSendHeaders fires on the new load.
         const go_second = !cancel and !redirected and event == .before_request and want_sh;
 
+        // The second phase's header snapshot is built HERE, against the
+        // reference we took above, and only COPIED under the lock:
+        // `get_header_map` re-enters Chromium and allocates, which no
+        // spinlock may be held across. Same stash-then-copy shape as
+        // the hold in `onBeforeResourceLoad`.
+        var hdr_buf: [HOLD_HDR_MAX]u8 = undefined;
+        var hdr_len: u16 = 0;
+        if (go_second) {
+            if (req) |r| hdr_len = wreqHeadersJson(r, &hdr_buf);
+        }
+
         var cb: ?*cef.cef_callback_t = null;
+        var hreq: ?*cef.cef_request_t = null;
         {
             g_wreq.acquire();
             defer g_wreq.release();
@@ -5467,17 +5479,20 @@ pub const Host = struct {
                 h.event = .before_send_headers;
                 h.dispatched = false;
                 h.want_request_headers = true;
-                if (h.hdr_len == 0) {
-                    if (h.req) |r| h.hdr_len = wreqHeadersJson(r, &h.hdr);
+                if (h.hdr_len == 0 and hdr_len != 0) {
+                    @memcpy(h.hdr[0..hdr_len], hdr_buf[0..hdr_len]);
+                    h.hdr_len = hdr_len;
                 }
                 return;
             }
             cb = h.cb;
-            const hreq = h.req;
+            hreq = h.req;
             h.* = .{};
             _ = g_wreq.outstanding.fetchSub(1, .release);
-            if (hreq) |r| release(&r.base);
         }
+        // The hold's own request reference is dropped OUTSIDE the lock:
+        // it can be the last one, and the destructor is CEF code.
+        if (hreq) |r| release(&r.base);
         if (cb) |x| {
             if (cancel) {
                 if (x.cancel) |f| f(x);
