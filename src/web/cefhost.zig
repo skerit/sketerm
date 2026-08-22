@@ -8103,6 +8103,13 @@ const ISlot = struct {
 const Intercept = struct {
     lock: SpinLock = .{},
     engine: ?*filter.Engine = null,
+    /// IO-thread matches in flight against `engine` OUTSIDE the lock
+    /// (`pinEngine`/`unpinEngine`). A match is a linear scan over tens
+    /// of thousands of rules, far too long for a spinlock the main
+    /// thread spins on, so the reader pins the engine and walks it
+    /// unlocked; `retireEngine` waits for the pins to drain before
+    /// freeing a swapped-out engine.
+    readers: u32 = 0,
     global_enabled: bool = true,
     rules: u32 = 0,
     slots: [MAX_ISLOTS]ISlot = @splat(.{}),
@@ -8113,6 +8120,45 @@ const Intercept = struct {
 
     fn release(self: *Intercept) void {
         self.lock.unlock();
+    }
+
+    /// The slot registered for a CEF browser id. Under the lock.
+    fn slotByCef(self: *Intercept, cef_id: c_int) ?*ISlot {
+        for (&self.slots) |*s| {
+            if (s.used and s.cef_id == cef_id) return s;
+        }
+        return null;
+    }
+
+    /// Under the lock: the current engine, pinned so that a concurrent
+    /// swap cannot free it until `unpinEngine`.
+    fn pinEngine(self: *Intercept) ?*filter.Engine {
+        const e = self.engine orelse return null;
+        self.readers += 1;
+        return e;
+    }
+
+    /// Takes the lock itself; never call while holding it.
+    fn unpinEngine(self: *Intercept) void {
+        self.acquire();
+        defer self.release();
+        self.readers -= 1;
+    }
+
+    /// Free an engine taken out of `engine` once no pinned reader can
+    /// still be walking it. NOT under the lock: it waits for the IO
+    /// thread's in-flight matches, which is bounded CPU work, and the
+    /// wait must not block those readers' own `unpinEngine`.
+    fn retireEngine(self: *Intercept, gpa: std.mem.Allocator, old: *filter.Engine) void {
+        while (true) {
+            self.acquire();
+            const busy = self.readers != 0;
+            self.release();
+            if (!busy) break;
+            std.atomic.spinLoopHint();
+        }
+        old.deinit();
+        gpa.destroy(old);
     }
 };
 
@@ -8294,10 +8340,7 @@ fn interceptReload(gpa: std.mem.Allocator, extra_paths: []const []const u8) bool
             if (s.used) s.dirty = true;
         }
     }
-    if (old) |o| {
-        o.deinit();
-        gpa.destroy(o);
-    }
+    if (old) |o| g_int.retireEngine(gpa, o);
     return true;
 }
 
@@ -8334,10 +8377,7 @@ pub fn interceptDeinit(gpa: std.mem.Allocator) void {
     for (pols) |p| {
         if (p) |pol| pol.deinit(gpa);
     }
-    if (old) |o| {
-        o.deinit();
-        gpa.destroy(o);
-    }
+    if (old) |o| g_int.retireEngine(gpa, o);
 }
 
 /// Whether the shield allows cosmetic hiding for `view_id`: global
@@ -8472,24 +8512,28 @@ fn onBeforeResourceLoad(
     var verdict = false;
     var shield_on = true;
     var view_id: u32 = 0;
+    // The filter match runs OUTSIDE the lock against a pinned engine:
+    // it is a linear scan over every generic rule, and the main thread
+    // would spin for the whole of it. The slot is looked up again for
+    // the policy + log step below, since a view can be unregistered in
+    // between and a pointer into the table must not be carried across.
+    var eng: ?*filter.Engine = null;
     {
         g_int.acquire();
         defer g_int.release();
-        var slot: ?*ISlot = null;
-        for (&g_int.slots) |*s| {
-            if (s.used and s.cef_id == cef_id) {
-                slot = s;
-                break;
-            }
-        }
+        const slot = g_int.slotByCef(cef_id);
         if (slot) |s| view_id = s.view_id;
-        const enabled = g_int.global_enabled and (if (slot) |s| s.enabled else true);
-        shield_on = enabled;
-        if (enabled and host.len > 0) {
-            if (g_int.engine) |eng| {
-                verdict = eng.match(.{ .url = url, .host = host, .doc_host = doc_host, .rtype = rtype });
-            }
-        }
+        shield_on = g_int.global_enabled and (if (slot) |s| s.enabled else true);
+        if (shield_on and host.len > 0) eng = g_int.pinEngine();
+    }
+    if (eng) |e| {
+        verdict = e.match(.{ .url = url, .host = host, .doc_host = doc_host, .rtype = rtype });
+        g_int.unpinEngine();
+    }
+    {
+        g_int.acquire();
+        defer g_int.release();
+        const slot = g_int.slotByCef(cef_id);
         // PRECEDENCE, step 2: the enforced POLICY. Runs only past the
         // filter (a filter cancel is final and keeps its own reason)
         // and never for a slotless request (service workers /
