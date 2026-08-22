@@ -4,106 +4,13 @@
 //! "receive + decode" half of the path independently of rendering.
 
 const std = @import("std");
-const Parser = @import("../parser/vt.zig").Parser;
-const Event = @import("../parser/event.zig").Event;
-const Screen = @import("screen.zig").Screen;
-const Pool = @import("style_pool.zig").Pool;
-
-const Capture = struct {
-    /// Most recent image event copied into here. Owns rgba.
-    width: u32 = 0,
-    height: u32 = 0,
-    rgba: ?[]u8 = null,
-    image_id: u32 = 0,
-    placement_id: u32 = 0,
-    z_index: i32 = 0,
-    fired: bool = false,
-    cells_wide: u32 = 0,
-    cells_high: u32 = 0,
-    animation_changes: usize = 0,
-    allocator: std.mem.Allocator,
-
-    fn deinit(self: *Capture) void {
-        if (self.rgba) |b| self.allocator.free(b);
-    }
-
-    fn sink(ctx: ?*anyopaque, ev: Screen.ImageEvent) void {
-        const self: *Capture = @ptrCast(@alignCast(ctx.?));
-        self.fired = true;
-        self.width = ev.width;
-        self.height = ev.height;
-        self.image_id = ev.image_id;
-        self.placement_id = ev.placement_id;
-        self.z_index = ev.z_index;
-        self.cells_wide = ev.cells_wide;
-        self.cells_high = ev.cells_high;
-        if (self.rgba) |b| self.allocator.free(b);
-        self.rgba = self.allocator.dupe(u8, ev.rgba) catch null;
-    }
-
-    fn animation(ctx: ?*anyopaque) void {
-        const self: *Capture = @ptrCast(@alignCast(ctx.?));
-        self.animation_changes += 1;
-    }
-};
-
-const Harness = struct {
-    /// Heap-allocated; Screen.pool borrows it. Storing Pool by value
-    /// would dangle through the move out of init().
-    pool: *Pool,
-    screen: *Screen,
-    parser: Parser,
-    capture: *Capture,
-    allocator: std.mem.Allocator,
-
-    fn init(a: std.mem.Allocator, cols: u16, rows: u16) !Harness {
-        const pool_ptr = try a.create(Pool);
-        errdefer a.destroy(pool_ptr);
-        pool_ptr.* = try Pool.init(a);
-        errdefer pool_ptr.deinit();
-        const screen = try Screen.init(a, pool_ptr, cols, rows);
-        errdefer screen.deinit();
-        const cap = try a.create(Capture);
-        cap.* = .{ .allocator = a };
-        screen.sink = .{
-            .ctx = @ptrCast(cap),
-            .on_image = Capture.sink,
-            .on_image_animation = Capture.animation,
-        };
-        return .{
-            .pool = pool_ptr,
-            .screen = screen,
-            .parser = Parser.init(a),
-            .capture = cap,
-            .allocator = a,
-        };
-    }
-
-    fn deinit(self: *Harness) void {
-        self.capture.deinit();
-        self.allocator.destroy(self.capture);
-        self.screen.deinit();
-        self.pool.deinit();
-        self.allocator.destroy(self.pool);
-        self.parser.deinit();
-    }
-
-    fn emit(user: ?*anyopaque, ev: Event) void {
-        const self: *Harness = @ptrCast(@alignCast(user.?));
-        var mut = ev;
-        self.screen.apply(ev);
-        mut.deinit(self.allocator);
-    }
-
-    fn feed(self: *Harness, bytes: []const u8) void {
-        self.parser.advance(bytes, emit, @ptrCast(self));
-    }
-};
+const Harness = @import("../parser/test_harness.zig").Harness;
 
 // 1×1 RGBA red, kitty graphics, single-chunk a=T f=32.
 test "kitty f=32 single-chunk transmit_and_place fires sink" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // 1×1 RGBA = 4 bytes. base64 encoded.
     const rgba = [_]u8{ 0xFF, 0x00, 0x00, 0xFF };
@@ -114,18 +21,19 @@ test "kitty f=32 single-chunk transmit_and_place fires sink" {
     const seq = try std.fmt.bufPrint(&seq_buf, "\x1b_Gi=42,a=T,f=32,s=1,v=1;{s}\x1b\\", .{b64});
     h.feed(seq);
 
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.width);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.height);
-    try std.testing.expectEqual(@as(u32, 42), h.capture.image_id);
-    try std.testing.expectEqual(@as(usize, 4), h.capture.rgba.?.len);
-    try std.testing.expectEqual(@as(u8, 0xFF), h.capture.rgba.?[0]);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 1), h.image.width);
+    try std.testing.expectEqual(@as(u32, 1), h.image.height);
+    try std.testing.expectEqual(@as(u32, 42), h.image.image_id);
+    try std.testing.expectEqual(@as(usize, 4), h.image.rgba.?.len);
+    try std.testing.expectEqual(@as(u8, 0xFF), h.image.rgba.?[0]);
 }
 
 // f=24 (RGB) is expanded to RGBA inside the manager.
 test "kitty f=24 single-chunk RGB fires sink with RGBA" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // 2×1 RGB: red, green
     const rgb = [_]u8{ 0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00 };
@@ -136,19 +44,20 @@ test "kitty f=24 single-chunk RGB fires sink with RGBA" {
     const seq = try std.fmt.bufPrint(&seq_buf, "\x1b_Gi=7,a=T,f=24,s=2,v=1;{s}\x1b\\", .{b64});
     h.feed(seq);
 
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 2), h.capture.width);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.height);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 2), h.image.width);
+    try std.testing.expectEqual(@as(u32, 1), h.image.height);
     // 2 pixels × 4 bytes = 8 bytes of RGBA.
-    try std.testing.expectEqual(@as(usize, 8), h.capture.rgba.?.len);
-    try std.testing.expectEqual(@as(u8, 0xFF), h.capture.rgba.?[3]); // alpha
-    try std.testing.expectEqual(@as(u8, 0xFF), h.capture.rgba.?[7]);
+    try std.testing.expectEqual(@as(usize, 8), h.image.rgba.?.len);
+    try std.testing.expectEqual(@as(u8, 0xFF), h.image.rgba.?[3]); // alpha
+    try std.testing.expectEqual(@as(u8, 0xFF), h.image.rgba.?[7]);
 }
 
 // f=100 (PNG) — uses a real well-formed 1×1 PNG.
 test "kitty f=100 PNG single-chunk fires sink" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // 1×1 RGB red PNG (correct CRCs).
     const png = [_]u8{
@@ -173,17 +82,18 @@ test "kitty f=100 PNG single-chunk fires sink" {
     const seq = try std.fmt.bufPrint(&seq_buf, "\x1b_Gi=99,a=T,f=100,m=0;{s}\x1b\\", .{b64});
     h.feed(seq);
 
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.width);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.height);
-    try std.testing.expectEqual(@as(u32, 99), h.capture.image_id);
-    try std.testing.expectEqual(@as(usize, 4), h.capture.rgba.?.len);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 1), h.image.width);
+    try std.testing.expectEqual(@as(u32, 1), h.image.height);
+    try std.testing.expectEqual(@as(u32, 99), h.image.image_id);
+    try std.testing.expectEqual(@as(usize, 4), h.image.rgba.?.len);
 }
 
 // Multi-chunk PNG split across two escapes.
 test "kitty f=100 PNG multi-chunk fires sink only after final chunk" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     const png = [_]u8{
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
@@ -206,18 +116,19 @@ test "kitty f=100 PNG multi-chunk fires sink only after final chunk" {
     const seq2 = try std.fmt.bufPrint(&s2, "\x1b_Gi=11,m=0;{s}\x1b\\", .{b64[mid..]});
 
     h.feed(seq1);
-    try std.testing.expect(!h.capture.fired); // shouldn't fire yet
+    try std.testing.expect(!h.image.fired); // shouldn't fire yet
 
     h.feed(seq2);
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.width);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.height);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 1), h.image.width);
+    try std.testing.expectEqual(@as(u32, 1), h.image.height);
 }
 
 // a=t (transmit only) stores image; a=p later places it.
 test "kitty a=t then a=p places previously-transmitted image" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     const rgba = [_]u8{ 0xFF, 0x00, 0xFF, 0xFF };
     var b64_buf: [16]u8 = undefined;
@@ -229,29 +140,30 @@ test "kitty a=t then a=p places previously-transmitted image" {
     const place = try std.fmt.bufPrint(&s2, "\x1b_Gi=5,a=p\x1b\\", .{});
 
     h.feed(tx);
-    try std.testing.expect(!h.capture.fired); // a=t alone doesn't fire on_image
+    try std.testing.expect(!h.image.fired); // a=t alone doesn't fire on_image
     try std.testing.expect(h.screen.kitty_images.get(5) != null);
 
     h.feed(place);
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.width);
-    try std.testing.expectEqual(@as(u32, 5), h.capture.image_id);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 1), h.image.width);
+    try std.testing.expectEqual(@as(u32, 5), h.image.image_id);
 
     // Appending the second frame turns the stored image into active
     // playback and must notify the render host before its first tick.
     var frame_buf: [128]u8 = undefined;
     const frame = try std.fmt.bufPrint(&frame_buf, "\x1b_Gi=5,a=f,f=32,s=1,v=1;{s}\x1b\\", .{b64});
     h.feed(frame);
-    try std.testing.expectEqual(@as(usize, 1), h.capture.animation_changes);
+    try std.testing.expectEqual(@as(usize, 1), h.image.animation_changes);
 
     h.feed("\x1b_Gi=5,a=a,c=1\x1b\\");
-    try std.testing.expectEqual(@as(usize, 2), h.capture.animation_changes);
+    try std.testing.expectEqual(@as(usize, 2), h.image.animation_changes);
 }
 
 // Sixel via DCS — should also fire the same on_image sink.
 test "sixel DCS payload fires sink" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // Minimal sixel: P 0;0;0 q  " 1;1;2;2  #0;2;100;100;100  !2~  - !2~  ST
     // 2×2 image filled with white. DCS introducer is `P` (0x90) but we
@@ -259,9 +171,9 @@ test "sixel DCS payload fires sink" {
     const sx = "\x1bPq\"1;1;2;2#0;2;100;100;100!2~-!2~\x1b\\";
     h.feed(sx);
 
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expect(h.capture.width >= 2);
-    try std.testing.expect(h.capture.height >= 1);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expect(h.image.width >= 2);
+    try std.testing.expect(h.image.height >= 1);
 }
 
 // DCS P2 = 0 (and its omitted-parameter default) means "pixels the
@@ -271,14 +183,15 @@ test "sixel DCS payload fires sink" {
 test "sixel P2=0 paints the current background behind the image" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // SGR 48;2;0;0;255 = blue background, then a 2x6 sixel whose right
     // column is never painted.
     h.feed("\x1b[48;2;0;0;255m\x1bP0;0;0q#1;2;100;0;0#1~?\x1b\\");
 
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 2), h.capture.width);
-    const px = h.capture.rgba.?;
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 2), h.image.width);
+    const px = h.image.rgba.?;
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, px[0..4]);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255 }, px[4..8]);
 }
@@ -286,11 +199,12 @@ test "sixel P2=0 paints the current background behind the image" {
 test "sixel P2=1 leaves unpainted pixels transparent" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     h.feed("\x1b[48;2;0;0;255m\x1bP0;1;0q#1;2;100;0;0#1~?\x1b\\");
 
-    try std.testing.expect(h.capture.fired);
-    const px = h.capture.rgba.?;
+    try std.testing.expect(h.image.fired);
+    const px = h.image.rgba.?;
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, px[0..4]);
     try std.testing.expectEqual(@as(u8, 0), px[7]); // alpha
 }
@@ -298,11 +212,12 @@ test "sixel P2=1 leaves unpainted pixels transparent" {
 test "sixel P2=2 behaves like P2=0" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     h.feed("\x1b[48;5;46m\x1bP0;2;0q#1;2;100;0;0#1~?\x1b\\");
 
-    try std.testing.expect(h.capture.fired);
-    const px = h.capture.rgba.?;
+    try std.testing.expect(h.image.fired);
+    const px = h.image.rgba.?;
     try std.testing.expectEqual(@as(u8, 255), px[7]); // opaque fill
     // Palette index 46 resolved through the screen's 256-colour table.
     try std.testing.expectEqualSlices(u8, px[4..7], &h.screen.palette[46]);
@@ -311,39 +226,42 @@ test "sixel P2=2 behaves like P2=0" {
 test "sixel background select with a default background stays transparent" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // No SGR background: the "current background" is whatever the pane
     // paints, which alpha 0 reproduces exactly.
     h.feed("\x1bP0;0;0q#1;2;100;0;0#1~?\x1b\\");
 
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u8, 0), h.capture.rgba.?[7]);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u8, 0), h.image.rgba.?[7]);
 }
 
 test "sixel P1 aspect ratio scales, and a raster attribute overrides it" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // P1 = 2 -> 5:1, no raster attribute: 6 sixel rows -> 30 pixels.
     h.feed("\x1bP2;1;0q#1;2;100;0;0#1~\x1b\\");
-    try std.testing.expectEqual(@as(u32, 30), h.capture.height);
+    try std.testing.expectEqual(@as(u32, 30), h.image.height);
 
     // Same P1, but the body states 1:1 — the raster attribute wins.
     h.feed("\x1bP2;1;0q\"1;1;1;6#1;2;100;0;0#1~\x1b\\");
-    try std.testing.expectEqual(@as(u32, 6), h.capture.height);
+    try std.testing.expectEqual(@as(u32, 6), h.image.height);
 }
 
 test "sixel P3 is ignored" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     h.feed("\x1bP7;1;0q\"1;1;2;6#1;2;100;0;0#1~?\x1b\\");
-    const w = h.capture.width;
-    const height = h.capture.height;
+    const w = h.image.width;
+    const height = h.image.height;
     // A wildly different P3 changes nothing about the decode.
     h.feed("\x1bP7;1;9999q\"1;1;2;6#1;2;100;0;0#1~?\x1b\\");
-    try std.testing.expectEqual(w, h.capture.width);
-    try std.testing.expectEqual(height, h.capture.height);
+    try std.testing.expectEqual(w, h.image.width);
+    try std.testing.expectEqual(height, h.image.height);
 }
 
 // EmberGlyph pattern: multi-chunk transmit where continuation chunks
@@ -352,6 +270,7 @@ test "sixel P3 is ignored" {
 test "kitty multi-chunk: continuation chunks may omit i=" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // 4×4 RGBA, 64 bytes — long enough to exercise chunking.
     var rgba: [64]u8 = undefined;
@@ -371,16 +290,16 @@ test "kitty multi-chunk: continuation chunks may omit i=" {
     const place = try std.fmt.bufPrint(&s3, "\x1b_Ga=p,i=77,p=1,c=2,r=2,C=1\x1b\\", .{});
 
     h.feed(tx1);
-    try std.testing.expect(!h.capture.fired); // mid-transfer
+    try std.testing.expect(!h.image.fired); // mid-transfer
     h.feed(tx2);
-    try std.testing.expect(!h.capture.fired); // a=t alone, no place
+    try std.testing.expect(!h.image.fired); // a=t alone, no place
     try std.testing.expect(h.screen.kitty_images.get(77) != null);
     h.feed(place);
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 77), h.capture.image_id);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 77), h.image.image_id);
     // Placement parameters should propagate.
-    try std.testing.expectEqual(@as(u32, 2), h.capture.cells_wide);
-    try std.testing.expectEqual(@as(u32, 2), h.capture.cells_high);
+    try std.testing.expectEqual(@as(u32, 2), h.image.cells_wide);
+    try std.testing.expectEqual(@as(u32, 2), h.image.cells_high);
 }
 
 // Ensure cells_wide / cells_high arrive in the sink event so the
@@ -388,15 +307,16 @@ test "kitty multi-chunk: continuation chunks may omit i=" {
 test "kitty a=T,c=W,r=H propagates cell scale to sink" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
     const rgba = [_]u8{ 0xFF, 0x00, 0x00, 0xFF };
     var b64_buf: [16]u8 = undefined;
     const b64 = std.base64.standard.Encoder.encode(&b64_buf, &rgba);
     var seq_buf: [128]u8 = undefined;
     const seq = try std.fmt.bufPrint(&seq_buf, "\x1b_Gi=88,a=T,f=32,s=1,v=1,c=8,r=4;{s}\x1b\\", .{b64});
     h.feed(seq);
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 8), h.capture.cells_wide);
-    try std.testing.expectEqual(@as(u32, 4), h.capture.cells_high);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 8), h.image.cells_wide);
+    try std.testing.expectEqual(@as(u32, 4), h.image.cells_high);
 }
 
 // EmberGlyph regression: every frame the renderer sends
@@ -408,6 +328,7 @@ test "kitty a=T,c=W,r=H propagates cell scale to sink" {
 test "kitty d=a (lowercase) keeps source data — re-place succeeds" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // Transmit only.
     const rgba = [_]u8{ 0x12, 0x34, 0x56, 0xFF };
@@ -421,11 +342,11 @@ test "kitty d=a (lowercase) keeps source data — re-place succeeds" {
     // First place — should fire sink.
     const place = "\x1b_Gi=42,a=p\x1b\\";
     h.feed(place);
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 42), h.capture.image_id);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 42), h.image.image_id);
 
     // Reset capture flag.
-    h.capture.fired = false;
+    h.image.fired = false;
 
     // Lowercase `d=a` — delete all visible placements. Source data
     // for image 42 must remain so the re-place works.
@@ -434,13 +355,14 @@ test "kitty d=a (lowercase) keeps source data — re-place succeeds" {
 
     // Re-place — should fire again.
     h.feed(place);
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 42), h.capture.image_id);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 42), h.image.image_id);
 }
 
 test "kitty d=A (uppercase) drops source data — re-place becomes a no-op" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     const rgba = [_]u8{ 0x12, 0x34, 0x56, 0xFF };
     var b64_buf: [16]u8 = undefined;
@@ -449,7 +371,7 @@ test "kitty d=A (uppercase) drops source data — re-place becomes a no-op" {
     const tx = try std.fmt.bufPrint(&s1, "\x1b_Gi=42,a=t,f=32,s=1,v=1;{s}\x1b\\", .{b64});
     h.feed(tx);
     h.feed("\x1b_Gi=42,a=p\x1b\\");
-    h.capture.fired = false;
+    h.image.fired = false;
 
     // Uppercase A — also frees source data.
     h.feed("\x1b_Ga=d,d=A,q=2;\x1b\\");
@@ -457,13 +379,14 @@ test "kitty d=A (uppercase) drops source data — re-place becomes a no-op" {
 
     // Re-place — Manager has nothing to place; sink does NOT fire.
     h.feed("\x1b_Gi=42,a=p\x1b\\");
-    try std.testing.expect(!h.capture.fired);
+    try std.testing.expect(!h.image.fired);
 }
 
 // iTerm2 OSC 1337 inline image — small PNG.
 test "iterm2 OSC 1337 PNG fires sink" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     const png = [_]u8{
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
@@ -483,9 +406,9 @@ test "iterm2 OSC 1337 PNG fires sink" {
     const seq = try std.fmt.bufPrint(&seq_buf, "\x1b]1337;File=name=t.png;inline=1:{s}\x1b\\", .{b64});
     h.feed(seq);
 
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.width);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.height);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 1), h.image.width);
+    try std.testing.expectEqual(@as(u32, 1), h.image.height);
 }
 
 /// A 4x2 truecolour PNG — a 2:1 aspect, so a sizing request that keeps
@@ -505,7 +428,7 @@ const png_4x2 = [_]u8{
 fn feedIterm(h: *Harness, attrs: []const u8) !void {
     h.screen.cell_pixel_w = 8;
     h.screen.cell_pixel_h = 16;
-    h.capture.fired = false;
+    h.image.fired = false;
     var b64_buf: [256]u8 = undefined;
     const b64 = std.base64.standard.Encoder.encode(&b64_buf, &png_4x2);
     var seq_buf: [512]u8 = undefined;
@@ -516,63 +439,67 @@ fn feedIterm(h: *Harness, attrs: []const u8) !void {
 test "iterm2 sizing: every unit form reaches the placement as cells" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // Bare number = cells. 4 cells = 32px wide, so 16px = 1 cell high.
     try feedIterm(&h, "inline=1;width=4");
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 4), h.capture.width); // intrinsic
-    try std.testing.expectEqual(@as(u32, 4), h.capture.cells_wide);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.cells_high);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 4), h.image.width); // intrinsic
+    try std.testing.expectEqual(@as(u32, 4), h.image.cells_wide);
+    try std.testing.expectEqual(@as(u32, 1), h.image.cells_high);
 
     // Pixels: 64px = 8 cells, 32px = 2 cells.
     try feedIterm(&h, "inline=1;width=64px");
-    try std.testing.expectEqual(@as(u32, 8), h.capture.cells_wide);
-    try std.testing.expectEqual(@as(u32, 2), h.capture.cells_high);
+    try std.testing.expectEqual(@as(u32, 8), h.image.cells_wide);
+    try std.testing.expectEqual(@as(u32, 2), h.image.cells_high);
 
     // Percent of the window: 50% of 640px = 320px = 40 cells.
     try feedIterm(&h, "inline=1;width=50%");
-    try std.testing.expectEqual(@as(u32, 40), h.capture.cells_wide);
-    try std.testing.expectEqual(@as(u32, 10), h.capture.cells_high);
+    try std.testing.expectEqual(@as(u32, 40), h.image.cells_wide);
+    try std.testing.expectEqual(@as(u32, 10), h.image.cells_high);
 
     // Explicit auto on both axes is native size — no scaling at all.
     try feedIterm(&h, "inline=1;width=auto;height=auto");
-    try std.testing.expectEqual(@as(u32, 0), h.capture.cells_wide);
-    try std.testing.expectEqual(@as(u32, 0), h.capture.cells_high);
+    try std.testing.expectEqual(@as(u32, 0), h.image.cells_wide);
+    try std.testing.expectEqual(@as(u32, 0), h.image.cells_high);
 }
 
 test "iterm2 sizing: preserveAspectRatio decides fit vs stretch" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // Box 8x8 cells = 64x128px. The 2:1 image fits as 64x32px = 8x2.
     try feedIterm(&h, "inline=1;width=8;height=8");
-    try std.testing.expectEqual(@as(u32, 8), h.capture.cells_wide);
-    try std.testing.expectEqual(@as(u32, 2), h.capture.cells_high);
+    try std.testing.expectEqual(@as(u32, 8), h.image.cells_wide);
+    try std.testing.expectEqual(@as(u32, 2), h.image.cells_high);
 
     // Same box, aspect waived: it fills the box exactly.
     try feedIterm(&h, "inline=1;width=8;height=8;preserveAspectRatio=0");
-    try std.testing.expectEqual(@as(u32, 8), h.capture.cells_wide);
-    try std.testing.expectEqual(@as(u32, 8), h.capture.cells_high);
+    try std.testing.expectEqual(@as(u32, 8), h.image.cells_wide);
+    try std.testing.expectEqual(@as(u32, 8), h.image.cells_high);
 }
 
 test "iterm2 sizing: no size attributes still means native pixels" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
     try feedIterm(&h, "inline=1;name=dC5wbmc=");
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u32, 0), h.capture.cells_wide);
-    try std.testing.expectEqual(@as(u32, 0), h.capture.cells_high);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u32, 0), h.image.cells_wide);
+    try std.testing.expectEqual(@as(u32, 0), h.image.cells_high);
 }
 
 test "iterm2: inline=0 is a file transfer, not a placement" {
     var h = try Harness.init(std.testing.allocator, 80, 24);
     defer h.deinit();
+    h.arm();
     // The protocol's default is inline=0, so an omitted key must be
     // dropped just the same as an explicit one.
     try feedIterm(&h, "inline=0;width=4");
-    try std.testing.expect(!h.capture.fired);
+    try std.testing.expect(!h.image.fired);
     try feedIterm(&h, "name=dC5wbmc=;size=81");
-    try std.testing.expect(!h.capture.fired);
+    try std.testing.expect(!h.image.fired);
 }
 
 // Append a codepoint's UTF-8 to an ArrayList — placeholder + diacritic
@@ -590,6 +517,7 @@ test "kitty unicode placeholder tiles the image" {
     const a = std.testing.allocator;
     var h = try Harness.init(a, 80, 24);
     defer h.deinit();
+    h.arm();
 
     // 2×2 RGBA: (0,0)=red (1,0)=green (0,1)=blue (1,1)=white.
     const rgba = [_]u8{
@@ -604,7 +532,7 @@ test "kitty unicode placeholder tiles the image" {
     const tx = try std.fmt.bufPrint(&tx_buf, "\x1b_Gi=5,a=T,U=1,f=32,s=2,v=2,c=2,r=2;{s}\x1b\\", .{b64});
     h.feed(tx);
     // Virtual placement does NOT draw at the cursor.
-    try std.testing.expect(!h.capture.fired);
+    try std.testing.expect(!h.image.fired);
     try std.testing.expect(h.screen.kitty_images.get(5) != null);
 
     // fg = palette 5 (the image id), then U+10EEEE + row(0) + col(0)
@@ -618,16 +546,16 @@ test "kitty unicode placeholder tiles the image" {
     try seq.append(a, '\n');
     h.feed(seq.items);
 
-    try std.testing.expect(h.capture.fired);
+    try std.testing.expect(h.image.fired);
     // tile_w = 2/2 = 1, tile_h = 1 → single pixel.
-    try std.testing.expectEqual(@as(u32, 1), h.capture.width);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.height);
-    try std.testing.expectEqual(@as(u32, 5), h.capture.image_id);
-    try std.testing.expectEqual(@as(u32, 1), h.capture.cells_wide);
+    try std.testing.expectEqual(@as(u32, 1), h.image.width);
+    try std.testing.expectEqual(@as(u32, 1), h.image.height);
+    try std.testing.expectEqual(@as(u32, 5), h.image.image_id);
+    try std.testing.expectEqual(@as(u32, 1), h.image.cells_wide);
     // Top-left tile is the red pixel.
-    try std.testing.expectEqual(@as(u8, 0xFF), h.capture.rgba.?[0]);
-    try std.testing.expectEqual(@as(u8, 0x00), h.capture.rgba.?[1]);
-    try std.testing.expectEqual(@as(u8, 0x00), h.capture.rgba.?[2]);
+    try std.testing.expectEqual(@as(u8, 0xFF), h.image.rgba.?[0]);
+    try std.testing.expectEqual(@as(u8, 0x00), h.image.rgba.?[1]);
+    try std.testing.expectEqual(@as(u8, 0x00), h.image.rgba.?[2]);
 }
 
 // Column auto-increment: a second placeholder cell to the right with
@@ -636,6 +564,7 @@ test "kitty unicode placeholder auto-increments the column" {
     const a = std.testing.allocator;
     var h = try Harness.init(a, 80, 24);
     defer h.deinit();
+    h.arm();
 
     const rgba = [_]u8{
         0xFF, 0x00, 0x00, 0xFF, 0x00, 0xFF, 0x00, 0xFF,
@@ -661,8 +590,8 @@ test "kitty unicode placeholder auto-increments the column" {
     h.feed(seq.items);
 
     // The last tile emitted is image column 1 = the green pixel.
-    try std.testing.expect(h.capture.fired);
-    try std.testing.expectEqual(@as(u8, 0x00), h.capture.rgba.?[0]);
-    try std.testing.expectEqual(@as(u8, 0xFF), h.capture.rgba.?[1]);
-    try std.testing.expectEqual(@as(u8, 0x00), h.capture.rgba.?[2]);
+    try std.testing.expect(h.image.fired);
+    try std.testing.expectEqual(@as(u8, 0x00), h.image.rgba.?[0]);
+    try std.testing.expectEqual(@as(u8, 0xFF), h.image.rgba.?[1]);
+    try std.testing.expectEqual(@as(u8, 0x00), h.image.rgba.?[2]);
 }

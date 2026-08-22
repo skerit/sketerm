@@ -18,9 +18,7 @@ test "screen.py: insert_characters shifts right + pads with blanks" {
     h.feed("abcde\x1b[H"); // cursor home
     h.feed("\x1b[C"); // CUF 1 → col 1
     h.feed("\x1b[2@"); // ICH 2
-    const r = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r);
-    try std.testing.expectEqualStrings("a  bc", r);
+    try h.expectLine(0, "a  bc");
 }
 
 test "screen.py: insert_characters with huge n empties row" {
@@ -29,9 +27,7 @@ test "screen.py: insert_characters with huge n empties row" {
     h.arm();
     h.feed("abcde\x1b[H");
     h.feed("\x1b[20@");
-    const r = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r);
-    try std.testing.expectEqualStrings("", r);
+    try h.expectLine(0, "");
 }
 
 test "screen.py: delete_characters shifts remainder left" {
@@ -41,9 +37,7 @@ test "screen.py: delete_characters shifts remainder left" {
     h.feed("abcde\x1b[H");
     h.feed("\x1b[C"); // col 1
     h.feed("\x1b[2P");
-    const r = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r);
-    try std.testing.expectEqualStrings("ade", r);
+    try h.expectLine(0, "ade");
 }
 
 test "screen.py: erase_characters fills with blanks (preserves trailing)" {
@@ -53,9 +47,7 @@ test "screen.py: erase_characters fills with blanks (preserves trailing)" {
     h.feed("abcde\x1b[H");
     h.feed("\x1b[C"); // col 1
     h.feed("\x1b[2X");
-    const r = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r);
-    try std.testing.expectEqualStrings("a  de", r);
+    try h.expectLine(0, "a  de");
 }
 
 test "screen.py: erase_in_line modes 0/1/2" {
@@ -65,9 +57,7 @@ test "screen.py: erase_in_line modes 0/1/2" {
         defer h.deinit();
         h.arm();
         h.feed("abcde\x1b[H\x1b[C\x1b[K");
-        const r = try h.line(std.testing.allocator, 0);
-        defer std.testing.allocator.free(r);
-        try std.testing.expectEqualStrings("a", r);
+        try h.expectLine(0, "a");
     }
     // Mode 1: start → cursor (inclusive).
     {
@@ -75,9 +65,7 @@ test "screen.py: erase_in_line modes 0/1/2" {
         defer h.deinit();
         h.arm();
         h.feed("abcde\x1b[H\x1b[C\x1b[C\x1b[1K");
-        const r = try h.line(std.testing.allocator, 0);
-        defer std.testing.allocator.free(r);
-        try std.testing.expectEqualStrings("   de", r);
+        try h.expectLine(0, "   de");
     }
     // Mode 2: whole line.
     {
@@ -85,9 +73,7 @@ test "screen.py: erase_in_line modes 0/1/2" {
         defer h.deinit();
         h.arm();
         h.feed("abcde\x1b[2K");
-        const r = try h.line(std.testing.allocator, 0);
-        defer std.testing.allocator.free(r);
-        try std.testing.expectEqualStrings("", r);
+        try h.expectLine(0, "");
     }
 }
 
@@ -104,15 +90,9 @@ test "screen.py: ED 0 erases cursor → end-of-screen" {
     }
     h.feed("\x1b[2;3H"); // row 1 col 2
     h.feed("\x1b[J"); // ED 0
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("12345", r0);
-    const r1 = try h.line(std.testing.allocator, 1);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("12", r1);
-    const r2 = try h.line(std.testing.allocator, 2);
-    defer std.testing.allocator.free(r2);
-    try std.testing.expectEqualStrings("", r2);
+    try h.expectLine(0, "12345");
+    try h.expectLine(1, "12");
+    try h.expectLine(2, "");
 }
 
 test "screen.py: ED 1 erases start → cursor" {
@@ -126,15 +106,9 @@ test "screen.py: ED 1 erases start → cursor" {
     }
     h.feed("\x1b[2;3H");
     h.feed("\x1b[1J");
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("", r0);
-    const r1 = try h.line(std.testing.allocator, 1);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("   45", r1);
-    const r2 = try h.line(std.testing.allocator, 2);
-    defer std.testing.allocator.free(r2);
-    try std.testing.expectEqualStrings("12345", r2);
+    try h.expectLine(0, "");
+    try h.expectLine(1, "   45");
+    try h.expectLine(2, "12345");
 }
 
 test "screen.py: ED 2 erases entire screen" {
@@ -145,9 +119,7 @@ test "screen.py: ED 2 erases entire screen" {
     h.feed("\x1b[2J");
     var r: u16 = 0;
     while (r < 3) : (r += 1) {
-        const s = try h.line(std.testing.allocator, r);
-        defer std.testing.allocator.free(s);
-        try std.testing.expectEqualStrings("", s);
+        try h.expectLine(r, "");
     }
 }
 
@@ -163,11 +135,9 @@ test "screen.py: cursor_up clamps + cursor_forward + CHA" {
         if (i < 4) h.feed("\r\n");
     }
     h.feed("\x1b[2A"); // CUU 2 from (4,4) → row 2
-    try std.testing.expectEqual(@as(u16, 2), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 4), h.screen.col);
+    try h.expectCursor(2, 4);
     h.feed("\x1b[F"); // CPL 1 → row 1 col 0
-    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 0), h.screen.col);
+    try h.expectCursor(1, 0);
     h.feed("\x1b[3C"); // CUF 3
     try std.testing.expectEqual(@as(u16, 3), h.screen.col);
     h.feed("\x1b[3G"); // CHA col 3 → 1-indexed → col 2
@@ -176,8 +146,7 @@ test "screen.py: cursor_up clamps + cursor_forward + CHA" {
     h.feed("\x1b[B"); // CUD 1
     try std.testing.expectEqual(@as(u16, 2), h.screen.row);
     h.feed("\x1b[5E"); // CNL 5 (wraps to last row)
-    try std.testing.expectEqual(@as(u16, 4), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 0), h.screen.col);
+    try h.expectCursor(4, 0);
 }
 
 test "screen.py: ESC D (IND) line feed; ESC M (RI) reverse" {
@@ -191,14 +160,10 @@ test "screen.py: ESC D (IND) line feed; ESC M (RI) reverse" {
     }
     // After draws, cursor at (4, 5). IND scrolls.
     h.feed("\x1bD");
-    const r4 = try h.line(std.testing.allocator, 4);
-    defer std.testing.allocator.free(r4);
-    try std.testing.expectEqualStrings("", r4);
+    try h.expectLine(4, "");
     // RI from row 0 also scrolls down (clears row 0).
     h.feed("12345\x1b[H\x1bM");
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("", r0);
+    try h.expectLine(0, "");
 }
 
 // ── test_backspace ────────────────────────────────────────────────
@@ -209,8 +174,7 @@ test "screen.py: backspace at col 0 doesn't move past margin" {
     h.arm();
     h.feed("abcde"); // cursor wraps logically at right edge
     h.feed("f"); // forces wrap → row 1, col 1
-    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 1), h.screen.col);
+    try h.expectCursor(1, 1);
     h.feed("\x1b[100D"); // CUB huge → clamp to col 0
     try std.testing.expectEqual(@as(u16, 0), h.screen.col);
     try std.testing.expectEqual(@as(u16, 1), h.screen.row);
@@ -335,12 +299,8 @@ test "screen.py: resize preserves content (truncate/pad mode)" {
     h.arm();
     h.feed("abcde\r\n12345");
     try h.screen.resize(7, 3);
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("abcde", r0);
-    const r1 = try h.line(std.testing.allocator, 1);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("12345", r1);
+    try h.expectLine(0, "abcde");
+    try h.expectLine(1, "12345");
 }
 
 test "screen.py: resize clamps cursor inside new bounds" {
@@ -433,9 +393,7 @@ test "parser.py: REP repeats last printed glyph" {
     defer h.deinit();
     h.arm();
     h.feed("x\x1b[7b"); // print x, REP 7 → x repeated 7 more
-    const r = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r);
-    try std.testing.expectEqualStrings("xxxxxxxx", r);
+    try h.expectLine(0, "xxxxxxxx");
 }
 
 test "parser.py: REP without prior print is a no-op" {
@@ -443,9 +401,7 @@ test "parser.py: REP without prior print is a no-op" {
     defer h.deinit();
     h.arm();
     h.feed("\x1b[5b"); // no last-printed → nothing
-    const r = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r);
-    try std.testing.expectEqualStrings("", r);
+    try h.expectLine(0, "");
 }
 
 test "parser.py: REP after a TAB is a no-op (TAB isn't a glyph)" {
@@ -467,9 +423,7 @@ test "parser.py: PM (ESC ^ ... ESC \\) is silently consumed" {
     defer h.deinit();
     h.arm();
     h.feed("a\x1b^+\\+\x1b\\b");
-    const r = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r);
-    try std.testing.expectEqualStrings("ab", r);
+    try h.expectLine(0, "ab");
 }
 
 test "parser.py: APC with unrecognized command consumed silently" {
@@ -477,9 +431,7 @@ test "parser.py: APC with unrecognized command consumed silently" {
     defer h.deinit();
     h.arm();
     h.feed("a\x1b_+\\+\x1b\\b");
-    const r = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r);
-    try std.testing.expectEqualStrings("ab", r);
+    try h.expectLine(0, "ab");
 }
 
 // ── test_bottom_margin / test_top_and_bottom_margin (DECSTBM) ─────
@@ -505,18 +457,10 @@ test "screen.py: DECSTBM bottom-margin scroll" {
     }
     // Row 5 (outside region) should still hold whatever was there
     // when we last touched it. Inside-region rows show '4','5','6','7'.
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("4", r0);
-    const r1 = try h.line(std.testing.allocator, 1);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("5", r1);
-    const r2 = try h.line(std.testing.allocator, 2);
-    defer std.testing.allocator.free(r2);
-    try std.testing.expectEqualStrings("6", r2);
-    const r3 = try h.line(std.testing.allocator, 3);
-    defer std.testing.allocator.free(r3);
-    try std.testing.expectEqualStrings("7", r3);
+    try h.expectLine(0, "4");
+    try h.expectLine(1, "5");
+    try h.expectLine(2, "6");
+    try h.expectLine(3, "7");
 }
 
 // ── test_osc_52 (more thorough, from screen.py) ───────────────────

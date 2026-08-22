@@ -13,6 +13,22 @@ const Event = @import("event.zig").Event;
 pub const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
 
+/// The last image event the screen emitted, plus the animation ticks.
+/// Filled in by `arm`, for the image-pipeline tests.
+pub const ImageCapture = struct {
+    fired: bool = false,
+    width: u32 = 0,
+    height: u32 = 0,
+    /// Owned by the Harness.
+    rgba: ?[]u8 = null,
+    image_id: u32 = 0,
+    placement_id: u32 = 0,
+    z_index: i32 = 0,
+    cells_wide: u32 = 0,
+    cells_high: u32 = 0,
+    animation_changes: usize = 0,
+};
+
 pub const Harness = struct {
     /// Heap-allocated. Screen.pool is a borrowed pointer; storing
     /// Pool by value here would have its address change when Harness
@@ -29,6 +45,10 @@ pub const Harness = struct {
     wtc: std.ArrayList(u8) = .empty,
     /// Captured OSC titles (set by OSC 0/2).
     titles: std.ArrayList([]u8) = .empty,
+    /// Captured OSC 52 clipboard writes.
+    clipboard: std.ArrayList(u8) = .empty,
+    /// Most recent image event.
+    image: ImageCapture = .{},
 
     pub fn init(a: std.mem.Allocator, cols: u16, rows: u16) !Harness {
         const pool_ptr = try a.create(Pool);
@@ -47,6 +67,8 @@ pub const Harness = struct {
 
     pub fn deinit(self: *Harness) void {
         self.wtc.deinit(self.allocator);
+        self.clipboard.deinit(self.allocator);
+        if (self.image.rgba) |b| self.allocator.free(b);
         for (self.titles.items) |t| self.allocator.free(t);
         self.titles.deinit(self.allocator);
         self.screen.deinit();
@@ -66,11 +88,38 @@ pub const Harness = struct {
         self.titles.append(self.allocator, dup) catch self.allocator.free(dup);
     }
 
+    fn captureClipboard(ctx: ?*anyopaque, text: []const u8) void {
+        const self: *Harness = @ptrCast(@alignCast(ctx.?));
+        self.clipboard.appendSlice(self.allocator, text) catch {};
+    }
+
+    fn captureImage(ctx: ?*anyopaque, ev: Screen.ImageEvent) void {
+        const self: *Harness = @ptrCast(@alignCast(ctx.?));
+        self.image.fired = true;
+        self.image.width = ev.width;
+        self.image.height = ev.height;
+        self.image.image_id = ev.image_id;
+        self.image.placement_id = ev.placement_id;
+        self.image.z_index = ev.z_index;
+        self.image.cells_wide = ev.cells_wide;
+        self.image.cells_high = ev.cells_high;
+        if (self.image.rgba) |b| self.allocator.free(b);
+        self.image.rgba = self.allocator.dupe(u8, ev.rgba) catch null;
+    }
+
+    fn captureImageAnimation(ctx: ?*anyopaque) void {
+        const self: *Harness = @ptrCast(@alignCast(ctx.?));
+        self.image.animation_changes += 1;
+    }
+
     pub fn arm(self: *Harness) void {
         self.screen.sink = .{
             .ctx = @ptrCast(self),
             .on_write_pty = captureWriteBytes,
             .on_title = captureTitle,
+            .on_clipboard_set = captureClipboard,
+            .on_image = captureImage,
+            .on_image_animation = captureImageAnimation,
         };
     }
 
@@ -83,6 +132,46 @@ pub const Harness = struct {
 
     pub fn feed(self: *Harness, bytes: []const u8) void {
         self.parser.advance(bytes, emit, @ptrCast(self));
+    }
+
+    /// Assert a row's trimmed UTF-8 contents.
+    ///
+    /// The three-line allocate/free/compare dance this replaces was
+    /// written out ~50 times across the conformance suites, often
+    /// inside a block that existed only to scope the `defer`.
+    pub fn expectLine(self: *Harness, row: u16, expected: []const u8) !void {
+        const got = try self.line(self.allocator, row);
+        defer self.allocator.free(got);
+        try std.testing.expectEqualStrings(expected, got);
+    }
+
+    /// Feed an OSC 52 clipboard write carrying `raw`, base64-encoded here.
+    pub fn feedOsc52(self: *Harness, raw: []const u8) !void {
+        const enc = std.base64.standard.Encoder;
+        const buf = try self.allocator.alloc(u8, enc.calcSize(raw.len));
+        defer self.allocator.free(buf);
+        const seq = try std.fmt.allocPrint(self.allocator, "\x1b]52;c;{s}\x07", .{enc.encode(buf, raw)});
+        defer self.allocator.free(seq);
+        self.feed(seq);
+    }
+
+    /// Start a normal selection at one cell and extend it to another.
+    pub fn select(self: *Harness, from_row: u16, from_col: u16, to_row: u16, to_col: u16) void {
+        self.screen.selection.start(from_row, from_col, .normal);
+        self.screen.selection.extend(to_row, to_col);
+    }
+
+    /// Assert the text the current selection extracts to.
+    pub fn expectSelection(self: *Harness, expected: []const u8) !void {
+        const out = try self.screen.extractSelection(self.allocator);
+        defer self.allocator.free(out);
+        try std.testing.expectEqualStrings(expected, out);
+    }
+
+    /// Assert the cursor's row and column together.
+    pub fn expectCursor(self: *Harness, row: u16, col: u16) !void {
+        try std.testing.expectEqual(row, self.screen.row);
+        try std.testing.expectEqual(col, self.screen.col);
     }
 
     /// UTF-8 encoded row contents, with trailing blanks trimmed.

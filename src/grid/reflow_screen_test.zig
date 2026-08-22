@@ -64,19 +64,11 @@ test "reflow: widening rejoins soft-wrapped logical line" {
     h.arm();
     // "hellowor" wraps in 5-col screen: row0="hello", row1="wor"
     h.feed("hellowor");
-    {
-        const r0 = try h.line(std.testing.allocator, 0);
-        defer std.testing.allocator.free(r0);
-        try std.testing.expectEqualStrings("hello", r0);
-        const r1 = try h.line(std.testing.allocator, 1);
-        defer std.testing.allocator.free(r1);
-        try std.testing.expectEqualStrings("wor", r1);
-    }
+    try h.expectLine(0, "hello");
+    try h.expectLine(1, "wor");
     // Widen to 10 cols — should rejoin into a single row.
     try h.screen.resize(10, 4);
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("hellowor", r0);
+    try h.expectLine(0, "hellowor");
 }
 
 test "reflow: narrowing splits a long line into multiple rows" {
@@ -85,12 +77,8 @@ test "reflow: narrowing splits a long line into multiple rows" {
     h.arm();
     h.feed("hellowor");
     try h.screen.resize(5, 4);
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("hello", r0);
-    const r1 = try h.line(std.testing.allocator, 1);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("wor", r1);
+    try h.expectLine(0, "hello");
+    try h.expectLine(1, "wor");
 }
 
 test "reflow: trimming preserves a wide pair in the final old columns" {
@@ -104,9 +92,7 @@ test "reflow: trimming preserves a wide pair in the final old columns" {
     try expectWidePair(h.screen, 0, 2, 0x754C);
     try expectAllWidePairsValid(h.screen);
 
-    const line = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(line);
-    try std.testing.expectEqualStrings("ab\xe7\x95\x8c", line);
+    try h.expectLine(0, "ab\xe7\x95\x8c");
 }
 
 test "reflow: a wide glyph moves when only one column remains" {
@@ -141,15 +127,13 @@ test "reflow: wide pair honors exact and off-by-one boundaries" {
     try expectWidePair(h.screen, 0, 2, 0x754C);
     try std.testing.expectEqual(@as(u32, 'c'), h.screen.line(1).cells[0].rune);
     try std.testing.expect(h.screen.line(1).continues_above);
-    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 1), h.screen.col);
+    try h.expectCursor(1, 1);
 
     try h.screen.resize(3, 6);
     try std.testing.expectEqual(@as(u32, 0), h.screen.line(0).cells[2].rune);
     try expectWidePair(h.screen, 1, 0, 0x754C);
     try std.testing.expectEqual(@as(u32, 'c'), h.screen.line(1).cells[2].rune);
-    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 2), h.screen.col);
+    try h.expectCursor(1, 2);
 
     try h.screen.resize(5, 6);
     try expectWidePair(h.screen, 0, 2, 0x754C);
@@ -183,15 +167,9 @@ test "reflow: separate logical lines stay separate" {
     h.arm();
     h.feed("foo\r\nbar\r\nbaz");
     try h.screen.resize(20, 4);
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("foo", r0);
-    const r1 = try h.line(std.testing.allocator, 1);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("bar", r1);
-    const r2 = try h.line(std.testing.allocator, 2);
-    defer std.testing.allocator.free(r2);
-    try std.testing.expectEqualStrings("baz", r2);
+    try h.expectLine(0, "foo");
+    try h.expectLine(1, "bar");
+    try h.expectLine(2, "baz");
 }
 
 test "reflow: widening rejoins scrollback content too" {
@@ -235,13 +213,11 @@ test "reflow: cursor follows its logical position on widen" {
     defer h.deinit();
     h.arm();
     h.feed("hellowor"); // cursor at row 1 col 3 (after 'r')
-    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 3), h.screen.col);
+    try h.expectCursor(1, 3);
     try h.screen.resize(10, 4);
     // After widening, cursor should be at row 0 col 8 (after the 'r'
     // in "hellowor").
-    try std.testing.expectEqual(@as(u16, 0), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 8), h.screen.col);
+    try h.expectCursor(0, 8);
 }
 
 test "reflow: cursor follows its logical position on narrow" {
@@ -251,8 +227,7 @@ test "reflow: cursor follows its logical position on narrow" {
     h.feed("hellowor"); // cursor at row 0 col 8
     try h.screen.resize(5, 4);
     // After narrowing, cursor should be at row 1 col 3.
-    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 3), h.screen.col);
+    try h.expectCursor(1, 3);
 }
 
 test "reflow: rows-only resize doesn't reflow content" {
@@ -262,12 +237,8 @@ test "reflow: rows-only resize doesn't reflow content" {
     h.feed("hellowor");
     try h.screen.resize(5, 6);
     // Same content, just more rows now.
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("hello", r0);
-    const r1 = try h.line(std.testing.allocator, 1);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("wor", r1);
+    try h.expectLine(0, "hello");
+    try h.expectLine(1, "wor");
 }
 
 test "reflow: alt screen does NOT reflow" {
@@ -280,12 +251,8 @@ test "reflow: alt screen does NOT reflow" {
     // Alt screen truncates/pads — content stays at original width
     // (each row is just widened to 10 cols with trailing blanks),
     // soft-wrap is NOT rejoined.
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("hello", r0);
-    const r1 = try h.line(std.testing.allocator, 1);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("wor", r1);
+    try h.expectLine(0, "hello");
+    try h.expectLine(1, "wor");
 }
 
 test "reflow: scrollback past 65535 rows keeps cursor and clusters placed" {
@@ -315,16 +282,14 @@ test "reflow: scrollback past 65535 rows keeps cursor and clusters placed" {
 
     // "hellowor" wraps to rows 0-1; the combining acute attaches to 'r'.
     h.feed("hellowor\xcc\x81");
-    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 3), h.screen.col);
+    try h.expectCursor(1, 3);
     try std.testing.expectEqual(@as(usize, 1), h.screen.clusterAt(1, 2).len);
 
     try h.screen.resize(10, 4);
 
     // The blanks stay their own logical lines, so the rejoined
     // "hellowor" is the last of sb_lines + 1 rows: active row 3.
-    try std.testing.expectEqual(@as(u16, 3), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 8), h.screen.col);
+    try h.expectCursor(3, 8);
     try std.testing.expectEqual(@as(u32, 'r'), h.screen.cellAt(3, 7).rune);
     try std.testing.expectEqual(@as(usize, 1), h.screen.clusterAt(3, 7).len);
 }

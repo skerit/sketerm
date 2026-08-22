@@ -12,11 +12,8 @@ test "selection_as_text: linear forward selection" {
     defer h.deinit();
     h.arm();
     h.feed("01234\r\n56789\r\nabcde");
-    h.screen.selection.start(0, 0, .normal);
-    h.screen.selection.extend(2, 5);
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("01234\n56789\nabcde", out);
+    h.select(0, 0, 2, 5);
+    try h.expectSelection("01234\n56789\nabcde");
 }
 
 test "selection_as_text: backward selection (start > end) normalizes" {
@@ -24,11 +21,8 @@ test "selection_as_text: backward selection (start > end) normalizes" {
     defer h.deinit();
     h.arm();
     h.feed("01234\r\n56789\r\nabcde");
-    h.screen.selection.start(2, 5, .normal);
-    h.screen.selection.extend(0, 0);
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("01234\n56789\nabcde", out);
+    h.select(2, 5, 0, 0);
+    try h.expectSelection("01234\n56789\nabcde");
 }
 
 test "selection_as_text: partial first row + partial last row" {
@@ -36,12 +30,9 @@ test "selection_as_text: partial first row + partial last row" {
     defer h.deinit();
     h.arm();
     h.feed("0123456789\r\nabcdefghij");
-    h.screen.selection.start(0, 5, .normal);
-    h.screen.selection.extend(1, 5);
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
+    h.select(0, 5, 1, 5);
     // Cols [5..end] from row 0 = "56789", cols [0..5) from row 1 = "abcde".
-    try std.testing.expectEqualStrings("56789\nabcde", out);
+    try h.expectSelection("56789\nabcde");
 }
 
 test "selection_as_text: empty selection returns empty string" {
@@ -49,9 +40,7 @@ test "selection_as_text: empty selection returns empty string" {
     defer h.deinit();
     h.arm();
     h.feed("hello");
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("", out);
+    try h.expectSelection("");
 }
 
 test "selection_as_text: spans wrapped (soft-wrap) row, no spurious newline" {
@@ -59,11 +48,8 @@ test "selection_as_text: spans wrapped (soft-wrap) row, no spurious newline" {
     defer h.deinit();
     h.arm();
     h.feed("hellowor"); // wraps: row0='hello', row1='wor'
-    h.screen.selection.start(0, 0, .normal);
-    h.screen.selection.extend(1, 4);
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("hellowor", out);
+    h.select(0, 0, 1, 4);
+    try h.expectSelection("hellowor");
 }
 
 test "selection_as_text: skips wide-char continuation cells" {
@@ -72,11 +58,8 @@ test "selection_as_text: skips wide-char continuation cells" {
     h.arm();
     // 'a' + '中' (wide, takes 2 cols) + 'b'
     h.feed("a\xe4\xb8\xadb");
-    h.screen.selection.start(0, 0, .normal);
-    h.screen.selection.extend(0, 4);
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("a\xe4\xb8\xadb", out);
+    h.select(0, 0, 0, 4);
+    try h.expectSelection("a\xe4\xb8\xadb");
 }
 
 test "selection_as_text: trailing blanks trimmed within row" {
@@ -84,11 +67,8 @@ test "selection_as_text: trailing blanks trimmed within row" {
     defer h.deinit();
     h.arm();
     h.feed("abc"); // remaining 7 cells empty
-    h.screen.selection.start(0, 0, .normal);
-    h.screen.selection.extend(0, 10);
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("abc", out);
+    h.select(0, 0, 0, 10);
+    try h.expectSelection("abc");
 }
 
 test "selection rect single cell" {
@@ -96,11 +76,8 @@ test "selection rect single cell" {
     defer h.deinit();
     h.arm();
     h.feed("hello");
-    h.screen.selection.start(0, 2, .normal);
-    h.screen.selection.extend(0, 3);
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("l", out);
+    h.select(0, 2, 0, 3);
+    try h.expectSelection("l");
 }
 
 test "selection: combining mark stays attached to base" {
@@ -109,11 +86,8 @@ test "selection: combining mark stays attached to base" {
     h.arm();
     // 'a' + U+0301 (combining acute accent)
     h.feed("a\xcc\x81b");
-    h.screen.selection.start(0, 0, .normal);
-    h.screen.selection.extend(0, 2);
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("a\xcc\x81b", out);
+    h.select(0, 0, 0, 2);
+    try h.expectSelection("a\xcc\x81b");
 }
 
 test "selection: variation selector + emoji round-trips" {
@@ -122,11 +96,8 @@ test "selection: variation selector + emoji round-trips" {
     h.arm();
     // '*' + VS-16 (U+FE0F)
     h.feed("*\xef\xb8\x8f");
-    h.screen.selection.start(0, 0, .normal);
-    h.screen.selection.extend(0, 1);
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
-    try std.testing.expectEqualStrings("*\xef\xb8\x8f", out);
+    h.select(0, 0, 0, 1);
+    try h.expectSelection("*\xef\xb8\x8f");
 }
 
 test "selection: ZWJ sequence preserved (man + ZWJ)" {
@@ -135,10 +106,7 @@ test "selection: ZWJ sequence preserved (man + ZWJ)" {
     h.arm();
     // 👨 (U+1F468, wide) + ZWJ (U+200D — extending, attaches)
     h.feed("\xf0\x9f\x91\xa8\xe2\x80\x8d");
-    h.screen.selection.start(0, 0, .normal);
-    h.screen.selection.extend(0, 2);
-    const out = try h.screen.extractSelection(std.testing.allocator);
-    defer std.testing.allocator.free(out);
+    h.select(0, 0, 0, 2);
     // Cluster contains the man emoji plus the ZWJ as an extension.
-    try std.testing.expectEqualStrings("\xf0\x9f\x91\xa8\xe2\x80\x8d", out);
+    try h.expectSelection("\xf0\x9f\x91\xa8\xe2\x80\x8d");
 }

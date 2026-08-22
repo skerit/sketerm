@@ -65,9 +65,7 @@ test "wezterm c1.rs test_ind: ESC D advances row, scrolls at bottom" {
     h.feed("\x1bD"); // at bottom — IND scrolls; row stays 3.
     try std.testing.expectEqual(@as(u16, 3), h.screen.row);
     // After the scroll, "a\nb\n" → "b\n\n\n".
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("b", r0);
+    try h.expectLine(0, "b");
 }
 
 test "wezterm c1.rs test_nel: ESC E acts as CR + LF" {
@@ -78,8 +76,7 @@ test "wezterm c1.rs test_nel: ESC E acts as CR + LF" {
     try std.testing.expectEqual(@as(u16, 0), h.screen.col);
     try std.testing.expectEqual(@as(u16, 2), h.screen.row);
     h.feed("\x1bE");
-    try std.testing.expectEqual(@as(u16, 3), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 0), h.screen.col);
+    try h.expectCursor(3, 0);
 }
 
 test "wezterm c1.rs test_hts: ESC H sets a tab stop" {
@@ -109,12 +106,8 @@ test "wezterm c1.rs test_ri: ESC M reverse line feed; scrolls at top" {
     try std.testing.expectEqual(@as(u16, 0), h.screen.row);
     h.feed("\x1bM");
     try std.testing.expectEqual(@as(u16, 0), h.screen.row);
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("", r0);
-    const r1 = try h.line(std.testing.allocator, 1);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("a", r1);
+    try h.expectLine(0, "");
+    try h.expectLine(1, "a");
 }
 
 // ── csi.rs ────────────────────────────────────────────────────────
@@ -137,9 +130,7 @@ test "wezterm csi.rs test_rep: REP (CSI b) repeats prior glyph" {
     // wezterm test_rep does cup(1, 0) which is (col=1, row=0); CSI
     // is row;col 1-indexed → "\x1b[1;2H".
     h.feed("h\x1b[1;2H\x1b[2ba");
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("hhha", r0);
+    try h.expectLine(0, "hhha");
 }
 
 test "wezterm csi.rs test_irm: IRM (CSI 4 h) inserts" {
@@ -147,9 +138,7 @@ test "wezterm csi.rs test_irm: IRM (CSI 4 h) inserts" {
     defer h.deinit();
     h.arm();
     h.feed("foo\x1b[1;1H\x1b[4hBAR");
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("BARfoo", r0);
+    try h.expectLine(0, "BARfoo");
 }
 
 test "wezterm csi.rs test_ich: ICH (CSI @) shifts right" {
@@ -159,9 +148,7 @@ test "wezterm csi.rs test_ich: ICH (CSI @) shifts right" {
     h.feed("hey!wat?"); // wraps: row0='hey!', row1='wat?'
     h.feed("\x1b[1;2H"); // row 0 col 1
     h.feed("\x1b[2@");
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("h  e", r0);
+    try h.expectLine(0, "h  e");
 }
 
 test "wezterm csi.rs test_ech: ECH (CSI X) blanks without shift" {
@@ -171,9 +158,7 @@ test "wezterm csi.rs test_ech: ECH (CSI X) blanks without shift" {
     h.feed("hey!wat?");
     h.feed("\x1b[1;2H");
     h.feed("\x1b[2X");
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("h  !", r0);
+    try h.expectLine(0, "h  !");
 }
 
 test "wezterm csi.rs test_dch: DCH (CSI P) shifts left" {
@@ -182,9 +167,7 @@ test "wezterm csi.rs test_dch: DCH (CSI P) shifts left" {
     h.arm();
     h.feed("hello world\x1b[1;2H");
     h.feed("\x1b[P"); // DCH 1
-    const r1 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("hllo world", r1);
+    try h.expectLine(0, "hllo world");
 }
 
 test "wezterm csi.rs test_cup: CUP clamps to last cell" {
@@ -192,11 +175,9 @@ test "wezterm csi.rs test_cup: CUP clamps to last cell" {
     defer h.deinit();
     h.arm();
     h.feed("\x1b[2;2H");
-    try std.testing.expectEqual(@as(u16, 1), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 1), h.screen.col);
+    try h.expectCursor(1, 1);
     h.feed("\x1b[500;500H");
-    try std.testing.expectEqual(@as(u16, 4), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 2), h.screen.col);
+    try h.expectCursor(4, 2);
 }
 
 test "wezterm csi.rs test_dl: DL (CSI M) deletes lines" {
@@ -206,12 +187,8 @@ test "wezterm csi.rs test_dl: DL (CSI M) deletes lines" {
     h.feed("a\r\nb\r\nc");
     h.feed("\x1b[2;1H"); // row 1 col 0
     h.feed("\x1b[M"); // DL 1
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("a", r0);
-    const r1 = try h.line(std.testing.allocator, 1);
-    defer std.testing.allocator.free(r1);
-    try std.testing.expectEqualStrings("c", r1);
+    try h.expectLine(0, "a");
+    try h.expectLine(1, "c");
 }
 
 test "wezterm csi.rs test_cha: CHA (CSI G) absolute column" {

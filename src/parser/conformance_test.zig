@@ -16,32 +16,16 @@ test "kitty parser.py: simple parsing — text wraps, CR/LF, UTF-8" {
     h.arm();
 
     h.feed("12");
-    {
-        const s = try h.line(std.testing.allocator, 0);
-        defer std.testing.allocator.free(s);
-        try std.testing.expectEqualStrings("12", s);
-    }
+    try h.expectLine(0, "12");
     try std.testing.expectEqual(@as(u16, 2), h.screen.col);
 
     h.feed("3456");
-    {
-        const r0 = try h.line(std.testing.allocator, 0);
-        defer std.testing.allocator.free(r0);
-        try std.testing.expectEqualStrings("12345", r0);
-        const r1 = try h.line(std.testing.allocator, 1);
-        defer std.testing.allocator.free(r1);
-        try std.testing.expectEqualStrings("6", r1);
-    }
+    try h.expectLine(0, "12345");
+    try h.expectLine(1, "6");
 
     h.feed("\n123\n\r45");
-    {
-        const r2 = try h.line(std.testing.allocator, 2);
-        defer std.testing.allocator.free(r2);
-        try std.testing.expectEqualStrings(" 123", r2);
-        const r3 = try h.line(std.testing.allocator, 3);
-        defer std.testing.allocator.free(r3);
-        try std.testing.expectEqualStrings("45", r3);
-    }
+    try h.expectLine(2, " 123");
+    try h.expectLine(3, "45");
 }
 
 test "kitty parser.py: CSI ICH (CSI @) with various param shapes" {
@@ -51,9 +35,7 @@ test "kitty parser.py: CSI ICH (CSI @) with various param shapes" {
     h.feed("abcde");
     h.feed("\x1b[H");
     h.feed("x\x1b[2@y");
-    const r = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r);
-    try std.testing.expectEqualStrings("xy bc", r);
+    try h.expectLine(0, "xy bc");
 }
 
 test "kitty parser.py: CSI CUP edge cases" {
@@ -61,20 +43,15 @@ test "kitty parser.py: CSI CUP edge cases" {
     defer h.deinit();
     h.arm();
     h.feed("\x1b[H");
-    try std.testing.expectEqual(@as(u16, 0), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 0), h.screen.col);
+    try h.expectCursor(0, 0);
     h.feed("\x1b[4H");
-    try std.testing.expectEqual(@as(u16, 3), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 0), h.screen.col);
+    try h.expectCursor(3, 0);
     h.feed("\x1b[3;2H");
-    try std.testing.expectEqual(@as(u16, 2), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 1), h.screen.col);
+    try h.expectCursor(2, 1);
     h.feed("\x1b[00000000003;0000000000000002H");
-    try std.testing.expectEqual(@as(u16, 2), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 1), h.screen.col);
+    try h.expectCursor(2, 1);
     h.feed("\x1b[999;999H");
-    try std.testing.expectEqual(@as(u16, 23), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 79), h.screen.col);
+    try h.expectCursor(23, 79);
 }
 
 test "kitty parser.py: DSR 5n + 6n responses" {
@@ -97,9 +74,7 @@ test "wezterm csi.rs issue 789: DCH shifts remaining left" {
     defer h.deinit();
     h.arm();
     h.feed("\x1b[40m\x1b[Kfoo\x1b[H\x1b[2P");
-    const r = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r);
-    try std.testing.expectEqualStrings("o", r);
+    try h.expectLine(0, "o");
 }
 
 test "kitty parser.py: SGR truecolor parses both 38;2 and 38:2 forms" {
@@ -151,8 +126,7 @@ test "kitty parser.py: ESC c (RIS) resets cursor + style" {
     h.arm();
     h.feed("hello\x1b[H\x1b[31m");
     h.feed("\x1bc");
-    try std.testing.expectEqual(@as(u16, 0), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 0), h.screen.col);
+    try h.expectCursor(0, 0);
     try std.testing.expectEqual(@as(u16, 0), h.screen.cur_style);
 }
 
@@ -161,8 +135,7 @@ test "kitty parser.py: C1 controls (8-bit) handled as printable" {
     defer h.deinit();
     h.arm();
     h.feed("\x84\x85\x88\x8d\x8e\x8f\x90\x96\x97\x98\x9a\x9b\x9c\x9d\x9e\x9f");
-    try std.testing.expectEqual(@as(u16, 0), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 0), h.screen.col);
+    try h.expectCursor(0, 0);
 }
 
 test "kitty parser.py: incomplete UTF-8 split across feed() calls" {
@@ -186,16 +159,11 @@ test "OSC payload with UTF-8 bytes containing 0x9C is not truncated" {
     h.arm();
     h.feed("\x1b]0;\xE2\x9C\xB3 Claude Code\x07");
     // Nothing printed: cursor untouched, row empty.
-    try std.testing.expectEqual(@as(u16, 0), h.screen.row);
-    try std.testing.expectEqual(@as(u16, 0), h.screen.col);
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("", r0);
+    try h.expectCursor(0, 0);
+    try h.expectLine(0, "");
     // Ground state: following text prints normally.
     h.feed("ok");
-    const r0b = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0b);
-    try std.testing.expectEqualStrings("ok", r0b);
+    try h.expectLine(0, "ok");
 }
 
 test "OSC with ESC backslash terminator still dispatches cleanly" {
@@ -203,7 +171,5 @@ test "OSC with ESC backslash terminator still dispatches cleanly" {
     defer h.deinit();
     h.arm();
     h.feed("\x1b]2;title \xE2\x9C\x93 done\x1b\\after");
-    const r0 = try h.line(std.testing.allocator, 0);
-    defer std.testing.allocator.free(r0);
-    try std.testing.expectEqualStrings("after", r0);
+    try h.expectLine(0, "after");
 }
