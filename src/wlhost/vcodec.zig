@@ -484,6 +484,64 @@ const AvDec = struct {
 
 const t = std.testing;
 
+/// Side of the square tile every backend test encodes.
+const TILE = 64;
+const TilePixels = [TILE * TILE * 4]u8;
+
+/// A smooth grayscale gradient: neutral chroma and low frequency, so a
+/// lossy 4:2:0 round-trip stays close and a range/matrix mismatch (full
+/// vs video) blows the MAE bound instead of hiding in the noise.
+fn grayGradient(px: *TilePixels) void {
+    for (0..TILE) |yy| for (0..TILE) |xx| {
+        const o = (yy * TILE + xx) * 4;
+        const v: u8 = @truncate(40 + xx + yy);
+        px[o] = v;
+        px[o + 1] = v;
+        px[o + 2] = v;
+        px[o + 3] = 0xff;
+    };
+}
+
+/// A per-channel ramp, for the encode-only tests that never compare pixels.
+fn colorRamp(px: *TilePixels) void {
+    for (0..TILE) |yy| for (0..TILE) |xx| {
+        const o = (yy * TILE + xx) * 4;
+        px[o + 0] = @truncate(xx * 3);
+        px[o + 1] = @truncate(yy * 3);
+        px[o + 2] = @truncate((xx + yy) * 2);
+        px[o + 3] = 0xff;
+    };
+}
+
+/// Mean absolute error over RGB between a source tile and a decoded one,
+/// asserting on the way that the decode forced alpha opaque when
+/// `require_opaque` (the AV1 case deliberately does not check it).
+fn rgbMae(src: *const TilePixels, dst: *const TilePixels, comptime require_opaque: bool) !f64 {
+    var sum: u64 = 0;
+    for (0..TILE * TILE) |i| {
+        inline for (.{ 0, 1, 2 }) |ch| {
+            const dv: i32 = @as(i32, src[i * 4 + ch]) - @as(i32, dst[i * 4 + ch]);
+            sum += @abs(dv);
+        }
+        if (require_opaque) try t.expectEqual(@as(u8, 0xff), dst[i * 4 + 3]);
+    }
+    return @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(TILE * TILE * 3));
+}
+
+/// The wire tile a whole-frame encode of `TILE` x `TILE` produces.
+fn wholeTile(codec: Codec, r: EncodeResult) Tile {
+    return .{
+        .codec = codec,
+        .keyframe = r.keyframe,
+        .x = 0,
+        .y = 0,
+        .w = TILE,
+        .h = TILE,
+        .seq = 0,
+        .payload = r.bytes,
+    };
+}
+
 test "tile wire round-trips and peels across split points" {
     const a = t.allocator;
     var out: std.ArrayList(u8) = .empty;
@@ -567,29 +625,20 @@ test "stub encoder rejects a pixel buffer that isn't w*h*4" {
 
 test "x264 backend encodes a keyframe Annex-B stream (when libx264 linked)" {
     if (!have_video) return error.SkipZigTest;
-    const a = t.allocator;
-    const w = 64;
-    const h = 64;
-    var enc = try Encoder.initX264(a, w, h, 30);
+    var enc = try Encoder.initX264(t.allocator, TILE, TILE, 30);
     defer enc.deinit();
     try t.expectEqual(Codec.h264, enc.codec());
 
-    var px: [w * h * 4]u8 = undefined;
-    for (0..h) |yy| for (0..w) |xx| {
-        const o = (yy * w + xx) * 4;
-        px[o + 0] = @truncate(xx * 3);
-        px[o + 1] = @truncate(yy * 3);
-        px[o + 2] = @truncate((xx + yy) * 2);
-        px[o + 3] = 0xff;
-    };
-    const r = try enc.encodeTile(w, h, &px, true);
+    var px: TilePixels = undefined;
+    colorRamp(&px);
+    const r = try enc.encodeTile(TILE, TILE, &px, true);
     try t.expect(r.keyframe);
     // Real Annex-B H.264 begins with a start code (00 00 00 01 / 00 00 01).
     try t.expect(r.bytes.len >= 4);
     try t.expectEqual(@as(u8, 0), r.bytes[0]);
     try t.expectEqual(@as(u8, 0), r.bytes[1]);
     // A second frame (non-forced) still encodes without error.
-    const r2 = try enc.encodeTile(w, h, &px, false);
+    const r2 = try enc.encodeTile(TILE, TILE, &px, false);
     try t.expect(r2.bytes.len > 0);
 
     // Wrong tile size is rejected.
@@ -598,63 +647,33 @@ test "x264 backend encodes a keyframe Annex-B stream (when libx264 linked)" {
 
 test "x264 encode → avcodec decode round-trips a frame (-Dvideo)" {
     if (!have_video) return error.SkipZigTest;
-    const a = t.allocator;
-    const w = 64;
-    const h = 64;
-    var enc = try Encoder.initX264(a, w, h, 30);
+    var enc = try Encoder.initX264(t.allocator, TILE, TILE, 30);
     defer enc.deinit();
-    var dec = try Decoder.initAvcodec(a, w, h, .h264);
+    var dec = try Decoder.initAvcodec(t.allocator, TILE, TILE, .h264);
     defer dec.deinit();
     try t.expectEqual(Codec.h264, enc.codec());
 
-    // Smooth grayscale gradient: neutral chroma + low frequency, so the
-    // lossy 4:2:0 H.264 round-trip stays close.
-    var px: [w * h * 4]u8 = undefined;
-    for (0..h) |yy| for (0..w) |xx| {
-        const o = (yy * w + xx) * 4;
-        const v: u8 = @truncate(40 + xx + yy);
-        px[o] = v;
-        px[o + 1] = v;
-        px[o + 2] = v;
-        px[o + 3] = 0xff;
-    };
-    const r = try enc.encodeTile(w, h, &px, true);
+    var px: TilePixels = undefined;
+    grayGradient(&px);
+    const r = try enc.encodeTile(TILE, TILE, &px, true);
     try t.expect(r.keyframe);
 
-    var dst: [w * h * 4]u8 = undefined;
-    try dec.decodeTile(.{ .codec = enc.codec(), .keyframe = r.keyframe, .x = 0, .y = 0, .w = w, .h = h, .seq = 0, .payload = r.bytes }, &dst);
+    var dst: TilePixels = undefined;
+    try dec.decodeTile(wholeTile(enc.codec(), r), &dst);
 
     // Lossy → compare by mean absolute error over RGB; alpha forced opaque.
-    var sum: u64 = 0;
-    for (0..w * h) |i| {
-        inline for (.{ 0, 1, 2 }) |ch| {
-            const dv: i32 = @as(i32, px[i * 4 + ch]) - @as(i32, dst[i * 4 + ch]);
-            sum += @abs(dv);
-        }
-        try t.expectEqual(@as(u8, 0xff), dst[i * 4 + 3]);
-    }
-    const mae = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(w * h * 3));
-    try t.expect(mae < 15.0);
+    try t.expect(try rgbMae(&px, &dst, true) < 15.0);
 }
 
 test "VideoToolbox backend encodes an Annex-B H.264 keyframe (when vtenc linked)" {
     if (!have_vtenc) return error.SkipZigTest;
-    const a = t.allocator;
-    const w = 64;
-    const h = 64;
-    var enc = try Encoder.initVtoolbox(a, w, h, 30);
+    var enc = try Encoder.initVtoolbox(t.allocator, TILE, TILE, 30);
     defer enc.deinit();
     try t.expectEqual(Codec.h264, enc.codec());
 
-    var px: [w * h * 4]u8 = undefined;
-    for (0..h) |yy| for (0..w) |xx| {
-        const o = (yy * w + xx) * 4;
-        px[o + 0] = @truncate(xx * 3);
-        px[o + 1] = @truncate(yy * 3);
-        px[o + 2] = @truncate((xx + yy) * 2);
-        px[o + 3] = 0xff;
-    };
-    const r = try enc.encodeTile(w, h, &px, true);
+    var px: TilePixels = undefined;
+    colorRamp(&px);
+    const r = try enc.encodeTile(TILE, TILE, &px, true);
     try t.expect(r.keyframe);
     // Annex-B: a start code (00 00 00 01) leads the stream.
     try t.expect(r.bytes.len >= 4);
@@ -663,7 +682,7 @@ test "VideoToolbox backend encodes an Annex-B H.264 keyframe (when vtenc linked)
     try t.expectEqual(@as(u8, 0), r.bytes[2]);
     try t.expectEqual(@as(u8, 1), r.bytes[3]);
     // A follow-up frame still encodes without error.
-    const r2 = try enc.encodeTile(w, h, &px, false);
+    const r2 = try enc.encodeTile(TILE, TILE, &px, false);
     try t.expect(r2.bytes.len > 0);
     // Wrong tile size is rejected.
     try t.expectError(Error.SizeMismatch, enc.encodeTile(32, 32, &px, false));
@@ -671,77 +690,37 @@ test "VideoToolbox backend encodes an Annex-B H.264 keyframe (when vtenc linked)
 
 test "VideoToolbox encode → avcodec decode round-trips a frame (vtenc + -Dvideo)" {
     if (!have_vtenc or !have_video) return error.SkipZigTest;
-    const a = t.allocator;
-    const w = 64;
-    const h = 64;
-    var enc = try Encoder.initVtoolbox(a, w, h, 30);
+    var enc = try Encoder.initVtoolbox(t.allocator, TILE, TILE, 30);
     defer enc.deinit();
-    var dec = try Decoder.initAvcodec(a, w, h, .h264);
+    var dec = try Decoder.initAvcodec(t.allocator, TILE, TILE, .h264);
     defer dec.deinit();
     try t.expectEqual(Codec.h264, enc.codec());
 
-    // Smooth grayscale gradient — lossy 4:2:0 H.264 stays close, and a
-    // range/matrix mismatch (full vs video) would blow the MAE bound.
-    var px: [w * h * 4]u8 = undefined;
-    for (0..h) |yy| for (0..w) |xx| {
-        const o = (yy * w + xx) * 4;
-        const v: u8 = @truncate(40 + xx + yy);
-        px[o] = v;
-        px[o + 1] = v;
-        px[o + 2] = v;
-        px[o + 3] = 0xff;
-    };
-    const r = try enc.encodeTile(w, h, &px, true);
+    var px: TilePixels = undefined;
+    grayGradient(&px);
+    const r = try enc.encodeTile(TILE, TILE, &px, true);
     try t.expect(r.keyframe);
 
-    var dst: [w * h * 4]u8 = undefined;
-    try dec.decodeTile(.{ .codec = enc.codec(), .keyframe = r.keyframe, .x = 0, .y = 0, .w = w, .h = h, .seq = 0, .payload = r.bytes }, &dst);
-
-    var sum: u64 = 0;
-    for (0..w * h) |i| {
-        inline for (.{ 0, 1, 2 }) |ch| {
-            const dv: i32 = @as(i32, px[i * 4 + ch]) - @as(i32, dst[i * 4 + ch]);
-            sum += @abs(dv);
-        }
-        try t.expectEqual(@as(u8, 0xff), dst[i * 4 + 3]);
-    }
-    const mae = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(w * h * 3));
-    try t.expect(mae < 15.0);
+    var dst: TilePixels = undefined;
+    try dec.decodeTile(wholeTile(enc.codec(), r), &dst);
+    try t.expect(try rgbMae(&px, &dst, true) < 15.0);
 }
 
 test "AV1 (libsvtav1) encode → avcodec decode round-trips a frame (-Dvideo)" {
     if (!have_video) return error.SkipZigTest;
-    const a = t.allocator;
-    const w = 64;
-    const h = 64;
-    var enc = try Encoder.initAv1(a, w, h, 30);
+    var enc = try Encoder.initAv1(t.allocator, TILE, TILE, 30);
     defer enc.deinit();
-    var dec = try Decoder.initAvcodec(a, w, h, .av1);
+    var dec = try Decoder.initAvcodec(t.allocator, TILE, TILE, .av1);
     defer dec.deinit();
     try t.expectEqual(Codec.av1, enc.codec());
 
-    var px: [w * h * 4]u8 = undefined;
-    for (0..h) |yy| for (0..w) |xx| {
-        const o = (yy * w + xx) * 4;
-        const v: u8 = @truncate(40 + xx + yy);
-        px[o] = v;
-        px[o + 1] = v;
-        px[o + 2] = v;
-        px[o + 3] = 0xff;
-    };
-    const r = try enc.encodeTile(w, h, &px, true);
+    var px: TilePixels = undefined;
+    grayGradient(&px);
+    const r = try enc.encodeTile(TILE, TILE, &px, true);
     try t.expect(r.keyframe);
 
-    var dst: [w * h * 4]u8 = undefined;
-    try dec.decodeTile(.{ .codec = enc.codec(), .keyframe = r.keyframe, .x = 0, .y = 0, .w = w, .h = h, .seq = 0, .payload = r.bytes }, &dst);
-
-    var sum: u64 = 0;
-    for (0..w * h) |i| {
-        inline for (.{ 0, 1, 2 }) |ch| {
-            const dv: i32 = @as(i32, px[i * 4 + ch]) - @as(i32, dst[i * 4 + ch]);
-            sum += @abs(dv);
-        }
-    }
-    const mae = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(w * h * 3));
-    try t.expect(mae < 20.0); // AV1 4:2:0 lossy; grayscale stays close
+    var dst: TilePixels = undefined;
+    try dec.decodeTile(wholeTile(enc.codec(), r), &dst);
+    // AV1 4:2:0 lossy; grayscale stays close.
+    try t.expect(try rgbMae(&px, &dst, false) < 20.0);
 }
