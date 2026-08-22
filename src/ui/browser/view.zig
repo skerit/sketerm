@@ -740,6 +740,7 @@ pub const BrowserView = struct {
     pub const retryCopyJob = @import("jobs.zig").retryCopyJob;
     pub const dropSupersededRetryRows = @import("jobs.zig").dropSupersededRetryRows;
     pub const cancelPendingRetries = @import("jobs.zig").cancelPendingRetries;
+    pub const cancelRetryTimer = @import("jobs.zig").cancelRetryTimer;
     pub const cancelScheduledRetry = @import("jobs.zig").cancelScheduledRetry;
     pub const startDaemonJob = @import("jobs.zig").startDaemonJob;
     pub const startDaemonJobResumable = @import("jobs.zig").startDaemonJobResumable;
@@ -1044,8 +1045,35 @@ pub const BrowserView = struct {
         const self: *BrowserView = @ptrCast(@alignCast(ctx));
         self.verifyInlineRenameTeardown(null, "view");
         self.cancelInlineRename(null);
+        self.fenceWidgets();
+    }
+
+    /// The widget tree is gone or about to go: fence every deferred
+    /// callback that would write into it. Idempotent and frees
+    /// nothing -- the view lives on until the pane's deferred deinit.
+    ///
+    /// Most view-owned sources carry their own `widgets_dead` check;
+    /// the ones cancelled outright are those whose callbacks do not
+    /// (retry timer and jobs tick end in `renderJobs`, the tab-switch
+    /// idle writes `hidden_toggle`, the completion debounce reads
+    /// `path_entry`). Cancelling at the owner is CLAUDE.md mechanism
+    /// 2: the view outlives its widgets, and this is the one choke
+    /// point both the root's ::destroy and the pane's prepare-destroy
+    /// reach.
+    fn fenceWidgets(self: *BrowserView) void {
         self.widgets_dead = true;
         self.severPreviewAnimation();
+        if (self.bar_idle_src != 0) {
+            _ = c.g_source_remove(self.bar_idle_src);
+            self.bar_idle_src = 0;
+        }
+        if (self.switch_idle != 0) {
+            _ = c.g_source_remove(self.switch_idle);
+            self.switch_idle = 0;
+        }
+        self.cancelRetryTimer();
+        self.jobs_panel.cancelTick();
+        self.cancelPathCompletion();
     }
 
     fn focusCb(ctx: *anyopaque) void {
@@ -1834,13 +1862,8 @@ pub const BrowserView = struct {
     /// deinit, so this cannot free anything -- it only fences.
     fn onRootDestroy(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(BrowserView, user);
-        self.widgets_dead = true;
         self.root_destroyed = true;
-        self.severPreviewAnimation();
-        if (self.bar_idle_src != 0) {
-            _ = c.g_source_remove(self.bar_idle_src);
-            self.bar_idle_src = 0;
-        }
+        self.fenceWidgets();
     }
 
     // -- responsive toolbar ------------------------------------------

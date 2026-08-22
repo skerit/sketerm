@@ -271,11 +271,17 @@ pub const Panel = struct {
     scroll_restore: c.guint = 0,
     scroll_state: ?ScrollState = null,
 
-    pub fn deinit(self: *Panel, allocator: std.mem.Allocator) void {
+    /// Disarm the rate/stall tick. Idempotent, and the one to call when
+    /// the widget tree dies: `onTick` renders into `jobs_box`.
+    pub fn cancelTick(self: *Panel) void {
         if (self.tick != 0) {
             _ = c.g_source_remove(self.tick);
             self.tick = 0;
         }
+    }
+
+    pub fn deinit(self: *Panel, allocator: std.mem.Allocator) void {
+        self.cancelTick();
         if (self.scroll_restore != 0) {
             _ = c.g_source_remove(self.scroll_restore);
             self.scroll_restore = 0;

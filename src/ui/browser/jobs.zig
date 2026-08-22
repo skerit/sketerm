@@ -651,12 +651,19 @@ fn earliest(current: ?i64, candidate: i64) i64 {
     return if (current) |cur| @min(cur, candidate) else candidate;
 }
 
-/// Arm one view timer at the earliest individual retry deadline.
-pub fn armRetryTimer(self: *BrowserView) void {
+/// Disarm the view's retry timer. Idempotent; also the widget fence:
+/// `onRetryTimer` ends in `renderJobs`, which writes `jobs_box`, so the
+/// source must go when the widget tree does, not only at deinit.
+pub fn cancelRetryTimer(self: *BrowserView) void {
     if (self.retry_timer != 0) {
         _ = c.g_source_remove(self.retry_timer);
         self.retry_timer = 0;
     }
+}
+
+/// Arm one view timer at the earliest individual retry deadline.
+pub fn armRetryTimer(self: *BrowserView) void {
+    self.cancelRetryTimer();
     const now = nowMs();
     var due: ?i64 = null;
     for (self.retry_pending.items) |retry| {
@@ -805,10 +812,7 @@ fn scheduleCopyRetry(self: *BrowserView, row: *JobRow) bool {
 
 /// Drop everything waiting on the retry timer (view teardown).
 pub fn cancelPendingRetries(self: *BrowserView) void {
-    if (self.retry_timer != 0) {
-        _ = c.g_source_remove(self.retry_timer);
-        self.retry_timer = 0;
-    }
+    self.cancelRetryTimer();
     for (self.retry_pending.items) |retry| retry.destroy(self.allocator);
     self.retry_pending.deinit(self.allocator);
     self.retry_pending = .empty;
