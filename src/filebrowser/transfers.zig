@@ -226,7 +226,7 @@ pub const Handle = struct {
         if (pathz.pathZ(&z, self.lock_path)) |p| {
             if (c.unlink(p) != 0 and std.posix.errno(-1) != .NOENT) removed = false;
         } else |_| removed = false;
-        if (sync_parent and !syncParentDir(self.json_path)) removed = false;
+        if (sync_parent and !pathz.fsyncParent(self.json_path)) removed = false;
         self.release();
         return removed;
     }
@@ -245,15 +245,6 @@ pub const Handle = struct {
         self.written_hash = h;
     }
 };
-
-fn syncParentDir(path: []const u8) bool {
-    const parent = std.fs.path.dirname(path) orelse return true;
-    var z: [4096]u8 = undefined;
-    const fd = c.open(pathz.pathZ(&z, parent) catch return false, c.O_RDONLY | c.O_DIRECTORY);
-    if (fd < 0) return false;
-    defer _ = c.close(fd);
-    return c.fsync(fd) == 0;
-}
 
 fn writeFileAtomic(allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !void {
     const temp = try std.fmt.allocPrint(allocator, "{s}.tmp-{d}", .{ path, c.getpid() });

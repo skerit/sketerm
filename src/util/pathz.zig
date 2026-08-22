@@ -99,6 +99,51 @@ pub fn removeTree(path: []const u8) void {
     _ = c.rmdir(zpath);
 }
 
+/// Unlink `path`, ignoring every failure (already gone, permissions,
+/// oversize path). For the "drop the file we own" call sites, where
+/// nothing can be done about a failure and nothing wants to know.
+pub fn unlinkPath(path: []const u8) void {
+    var z: [4096]u8 = undefined;
+    if (pathZ(&z, path)) |p| {
+        _ = c.unlink(p);
+    } else |_| {}
+}
+
+/// Force `path`'s DIRECTORY entry to stable storage, so a crash cannot
+/// lose a rename or unlink that already returned.
+///
+/// A path with no directory component names an entry in the current
+/// directory, so that is what gets synced: the two hand-rolled copies
+/// this replaced disagreed there (one claimed success without syncing
+/// anything, the other reported failure), and both were wrong about
+/// the same case.
+/// @return false when the parent could not be opened or fsynced.
+pub fn fsyncParent(path: []const u8) bool {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    var z: [4096]u8 = undefined;
+    const dfd = c.open(pathZ(&z, parent) catch return false, c.O_RDONLY | c.O_DIRECTORY);
+    if (dfd < 0) return false;
+    defer _ = c.close(dfd);
+    return c.fsync(dfd) == 0;
+}
+
+/// Whether `name` resolves to an executable through `$PATH`.
+///
+/// Empty `$PATH` entries are SKIPPED rather than read as ".": every
+/// caller is probing for an optional helper binary, and picking one up
+/// out of the current directory is not what any of them mean.
+pub fn executableOnPath(name: []const u8) bool {
+    const path_env = c.getenv("PATH") orelse return false;
+    var it = std.mem.splitScalar(u8, std.mem.span(@as([*:0]const u8, @ptrCast(path_env))), ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        var z: [4096:0]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&z, "{s}/{s}", .{ dir, name }) catch continue;
+        if (c.access(p.ptr, c.X_OK) == 0) return true;
+    }
+    return false;
+}
+
 /// A `mkdtemp` scratch directory for tests, removed whole by `remove`.
 /// Tests that forget the `defer td.remove()` leave one per run in /tmp.
 pub const TempDir = struct {
@@ -200,4 +245,75 @@ test "removeTree takes a nested tree, a lone file and a missing path in stride" 
     try std.testing.expect(c.stat(kept.ptr, &st) == 0);
     // Already gone: a no-op, not a crash.
     td.remove();
+}
+
+test "unlinkPath drops a file and shrugs at a missing one" {
+    const td = TempDir.make("unlinkp") orelse return error.SkipZigTest;
+    defer td.remove();
+    var buf: [4096:0]u8 = undefined;
+    const file = try std.fmt.bufPrintZ(&buf, "{s}/gone", .{td.path()});
+    const fp = c.fopen(file.ptr, "wb") orelse return error.SkipZigTest;
+    _ = c.fclose(fp);
+    var st: c.struct_stat = undefined;
+    try std.testing.expect(c.stat(file.ptr, &st) == 0);
+    unlinkPath(file);
+    try std.testing.expect(c.stat(file.ptr, &st) != 0);
+    // Absent path, oversize path and a directory: all silent.
+    unlinkPath(file);
+    unlinkPath(&([_]u8{'a'} ** 5000));
+    unlinkPath(td.path());
+    try std.testing.expect(c.stat(td.pathZ(), &st) == 0);
+}
+
+test "fsyncParent syncs a real parent and reports an unopenable one" {
+    const td = TempDir.make("fsyncp") orelse return error.SkipZigTest;
+    defer td.remove();
+    var buf: [4096]u8 = undefined;
+    const file = try std.fmt.bufPrint(&buf, "{s}/f", .{td.path()});
+    try std.testing.expect(fsyncParent(file));
+    // No directory component: the current directory is the parent.
+    try std.testing.expect(fsyncParent("f"));
+    try std.testing.expect(!fsyncParent("/definitely/not/a/directory/f"));
+}
+
+test "executableOnPath finds a real binary and misses a made-up one" {
+    const saved = c.getenv("PATH");
+    var saved_copy: [4096:0]u8 = undefined;
+    var saved_len: usize = 0;
+    if (saved) |p| {
+        const span = std.mem.span(@as([*:0]const u8, @ptrCast(p)));
+        if (span.len >= saved_copy.len) return error.SkipZigTest;
+        @memcpy(saved_copy[0..span.len], span);
+        saved_len = span.len;
+    }
+    saved_copy[saved_len] = 0;
+    defer if (saved != null) {
+        _ = c.setenv("PATH", &saved_copy, 1);
+    } else {
+        _ = c.unsetenv("PATH");
+    };
+
+    const td = TempDir.make("onpath") orelse return error.SkipZigTest;
+    defer td.remove();
+    var buf: [4096:0]u8 = undefined;
+    const bin = try std.fmt.bufPrintZ(&buf, "{s}/sketerm-fake-tool", .{td.path()});
+    const fp = c.fopen(bin.ptr, "wb") orelse return error.SkipZigTest;
+    _ = c.fclose(fp);
+    try std.testing.expect(c.chmod(bin.ptr, 0o755) == 0);
+
+    // An empty entry and a trailing colon are both skipped, never read
+    // as the current directory.
+    var path_buf: [4096:0]u8 = undefined;
+    const path_env = try std.fmt.bufPrintZ(&path_buf, "::{s}:", .{td.path()});
+    try std.testing.expect(c.setenv("PATH", path_env.ptr, 1) == 0);
+    try std.testing.expect(executableOnPath("sketerm-fake-tool"));
+    try std.testing.expect(!executableOnPath("sketerm-no-such-tool"));
+
+    // Non-executable file on PATH is not a hit.
+    try std.testing.expect(c.chmod(bin.ptr, 0o644) == 0);
+    try std.testing.expect(!executableOnPath("sketerm-fake-tool"));
+
+    // Empty PATH: nothing resolves, and "." is not consulted.
+    try std.testing.expect(c.setenv("PATH", "", 1) == 0);
+    try std.testing.expect(!executableOnPath("sketerm-fake-tool"));
 }

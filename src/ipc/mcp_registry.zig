@@ -8,6 +8,9 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const atomicwrite = @import("../util/atomicwrite.zig");
+const pathz = @import("../util/pathz.zig");
+const pathZ = pathz.pathZ;
+const unlinkPath = pathz.unlinkPath;
 
 pub const Mode = enum {
     isolated,
@@ -86,7 +89,7 @@ pub const Lease = struct {
 
         var z: [4096]u8 = undefined;
         const lock_z = try pathZ(&z, lock_path);
-        const fd = c.open(lock_z.ptr, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c.mode_t, 0o600));
+        const fd = c.open(lock_z, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c.mode_t, 0o600));
         if (fd < 0) return error.LockOpenFailed;
         errdefer _ = c.close(fd);
         if (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) return error.LockHeld;
@@ -117,13 +120,12 @@ pub const Lease = struct {
     }
 
     pub fn deinit(self: *Lease) void {
-        var z: [4096]u8 = undefined;
-        if (pathZ(&z, self.record_path)) |path| _ = c.unlink(path.ptr) else |_| {}
+        unlinkPath(self.record_path);
         if (self.fd >= 0) {
             _ = c.close(self.fd);
             self.fd = -1;
         }
-        if (pathZ(&z, self.lock_path)) |path| _ = c.unlink(path.ptr) else |_| {}
+        unlinkPath(self.lock_path);
         self.allocator.free(self.record_path);
         self.allocator.free(self.lock_path);
     }
@@ -177,7 +179,7 @@ fn scanRegistered(allocator: std.mem.Allocator, out: *std.ArrayList(Entry)) !voi
     const dir = registryDirStatic();
     if (dir.len == 0) return;
     var z: [4096]u8 = undefined;
-    const dp = c.opendir((try pathZ(&z, dir)).ptr) orelse return;
+    const dp = c.opendir(try pathZ(&z, dir)) orelse return;
     defer _ = c.closedir(dp);
     while (c.readdir(dp)) |de| {
         const name = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
@@ -246,7 +248,7 @@ const LockState = enum { active, stale, unknown };
 fn lockState(lock_path: []const u8) LockState {
     var z: [4096]u8 = undefined;
     const path = pathZ(&z, lock_path) catch return .unknown;
-    const fd = c.open(path.ptr, c.O_RDWR | c.O_CLOEXEC);
+    const fd = c.open(path, c.O_RDWR | c.O_CLOEXEC);
     if (fd < 0) return .stale;
     defer _ = c.close(fd);
     const rc = c.flock(fd, c.LOCK_EX | c.LOCK_NB);
@@ -262,7 +264,7 @@ fn lockState(lock_path: []const u8) LockState {
 
 fn readEntry(allocator: std.mem.Allocator, record_path: []const u8) ?Entry {
     var z: [4096]u8 = undefined;
-    const fp = c.fopen((pathZ(&z, record_path) catch return null).ptr, "rb") orelse return null;
+    const fp = c.fopen(pathZ(&z, record_path) catch return null, "rb") orelse return null;
     defer _ = c.fclose(fp);
     var buf: [16 * 1024]u8 = undefined;
     const n = c.fread(&buf, 1, buf.len, fp);
@@ -299,15 +301,6 @@ fn containsPid(entries: []const Entry, pid: c.pid_t) bool {
     return false;
 }
 
-fn pathZ(buf: *[4096]u8, path: []const u8) ![:0]const u8 {
-    return std.fmt.bufPrintZ(buf, "{s}", .{path}) catch error.PathTooLong;
-}
-
-fn unlinkPath(path: []const u8) void {
-    var z: [4096]u8 = undefined;
-    if (pathZ(&z, path)) |p| _ = c.unlink(p.ptr) else |_| {}
-}
-
 const ScopedRuntime = struct {
     allocator: std.mem.Allocator,
     saved: ?[]u8,
@@ -320,8 +313,8 @@ const ScopedRuntime = struct {
             null;
         const path = try std.fmt.allocPrint(allocator, "/tmp/sketerm-mcp-registry-{d}-{s}", .{ c.getpid(), suffix });
         var z: [4096]u8 = undefined;
-        _ = c.mkdir((try pathZ(&z, path)).ptr, 0o700);
-        _ = c.setenv("XDG_RUNTIME_DIR", (try pathZ(&z, path)).ptr, 1);
+        _ = c.mkdir(try pathZ(&z, path), 0o700);
+        _ = c.setenv("XDG_RUNTIME_DIR", try pathZ(&z, path), 1);
         return .{ .allocator = allocator, .saved = saved, .path = path };
     }
 
@@ -329,14 +322,13 @@ const ScopedRuntime = struct {
         var z: [4096]u8 = undefined;
         if (self.saved) |saved| {
             if (pathZ(&z, saved)) |saved_z| {
-                _ = c.setenv("XDG_RUNTIME_DIR", saved_z.ptr, 1);
+                _ = c.setenv("XDG_RUNTIME_DIR", saved_z, 1);
             } else |_| {}
             self.allocator.free(saved);
         } else {
             _ = c.unsetenv("XDG_RUNTIME_DIR");
         }
-        var cmd_buf: [4200]u8 = undefined;
-        if (std.fmt.bufPrintZ(&cmd_buf, "rm -rf -- '{s}'", .{self.path})) |cmd| _ = c.system(cmd.ptr) else |_| {}
+        pathz.removeTree(self.path);
         self.allocator.free(self.path);
     }
 };

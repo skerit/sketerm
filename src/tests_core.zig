@@ -253,6 +253,10 @@ comptime {
     _ = @import("util/mounts.zig");
     _ = @import("util/ocr.zig");
     _ = @import("util/pathz.zig");
+    _ = @import("util/readfile.zig");
+    _ = @import("util/fdio.zig");
+    _ = @import("util/b64.zig");
+    _ = @import("util/invocation.zig");
     _ = @import("util/atomicwrite.zig");
     _ = @import("util/pattern.zig");
     _ = @import("util/percent.zig");

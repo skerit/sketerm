@@ -14,6 +14,10 @@ comptime {
     _ = @import("util/pattern.zig");
     _ = @import("util/glob.zig");
     _ = @import("util/pathz.zig");
+    _ = @import("util/readfile.zig");
+    _ = @import("util/fdio.zig");
+    _ = @import("util/b64.zig");
+    _ = @import("util/invocation.zig");
     _ = @import("util/atomicwrite.zig");
     _ = @import("util/filehash.zig");
     _ = @import("util/framing.zig");

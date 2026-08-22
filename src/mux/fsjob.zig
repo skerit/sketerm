@@ -765,17 +765,7 @@ fn captureArgv(argv: []const ?[*:0]const u8, out: []u8) usize {
 
 /// PATH lookup with an execute check. Both probes are optional on the
 /// host, so a missing binary must degrade silently, never error.
-fn binaryExists(name: []const u8) bool {
-    const path_env = c.getenv("PATH") orelse return false;
-    var it = std.mem.splitScalar(u8, std.mem.span(@as([*:0]const u8, @ptrCast(path_env))), ':');
-    while (it.next()) |dir| {
-        if (dir.len == 0) continue;
-        var z: [4096:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&z, "{s}/{s}", .{ dir, name }) catch continue;
-        if (c.access(p.ptr, c.X_OK) == 0) return true;
-    }
-    return false;
-}
+const binaryExists = pathz.executableOnPath;
 
 /// ffprobe entry selection used by the properties dialog's media info.
 const FFPROBE_PREVIEW_ENTRIES = "format=duration:format_tags=title,artist,album";
@@ -5035,14 +5025,7 @@ fn statOf(path: []const u8, st: *c.struct_stat, follow: bool) bool {
     return (if (follow) c.stat(p, st) else c.lstat(p, st)) == 0;
 }
 
-fn fsyncParent(path: []const u8) bool {
-    const parent = std.fs.path.dirname(path) orelse return false;
-    var z: [4096]u8 = undefined;
-    const dfd = c.open(pathz.pathZ(&z, parent) catch return false, c.O_RDONLY | c.O_DIRECTORY);
-    if (dfd < 0) return false;
-    defer _ = c.close(dfd);
-    return c.fsync(dfd) == 0;
-}
+const fsyncParent = pathz.fsyncParent;
 
 fn runCopy(allocator: std.mem.Allocator, spec: Spec) u8 {
     if (spec.dst.len == 0) return emitError("copy needs dst");

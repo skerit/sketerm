@@ -19,7 +19,9 @@ const Client = dmod.Client;
 const Session = dmod.Session;
 const SpawnReq = dmod.SpawnReq;
 const nowMs = @import("../util/clock.zig").nowMs;
-const pathZ = @import("../util/pathz.zig").pathZ;
+const pathz = @import("../util/pathz.zig");
+const pathZ = pathz.pathZ;
+const unlinkPath = pathz.unlinkPath;
 const Pool = @import("../grid/style_pool.zig").Pool;
 const Screen = @import("../grid/screen.zig").Screen;
 const Parser = @import("../parser/vt.zig").Parser;
@@ -684,13 +686,6 @@ fn writeTempCast(a: std.mem.Allocator, contents: []const u8) ![]u8 {
     if (c.write(fd, contents.ptr, contents.len) != @as(isize, @intCast(contents.len)))
         return error.TempFailed;
     return a.dupe(u8, std.mem.span(@as([*:0]u8, @ptrCast(&tmpl))));
-}
-
-fn unlinkPath(path: []const u8) void {
-    var z: [4096]u8 = undefined;
-    if (pathZ(&z, path)) |p| {
-        _ = c.unlink(p);
-    } else |_| {}
 }
 
 fn spawnCast(d: *Daemon, path: []const u8, name: []const u8) !*Session {

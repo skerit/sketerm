@@ -8,7 +8,11 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
-const pathZ = @import("../util/pathz.zig").pathZ;
+const pathz = @import("../util/pathz.zig");
+const pathZ = pathz.pathZ;
+const unlinkOwned = pathz.unlinkPath;
+const executableOnPath = pathz.executableOnPath;
+const writeAll = @import("../util/fdio.zig").writeAll;
 const log = @import("log.zig");
 
 const X11_DIR = "/tmp/.X11-unix";
@@ -574,38 +578,12 @@ fn putBe16(buf: []u8, pos: *usize, value: u16) void {
     pos.* += 2;
 }
 
-fn writeAll(fd: c_int, bytes: []const u8) bool {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = c.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n < 0 and std.posix.errno(n) == .INTR) continue;
-        if (n <= 0) return false;
-        off += @intCast(n);
-    }
-    return true;
-}
 
 fn clearCloexec(fd: c_int) void {
     const flags = c.fcntl(fd, c.F_GETFD);
     if (flags >= 0) _ = c.fcntl(fd, c.F_SETFD, flags & ~c.FD_CLOEXEC);
 }
 
-fn unlinkOwned(path: []const u8) void {
-    var zbuf: [4096:0]u8 = undefined;
-    if (pathZ(&zbuf, path)) |z| _ = c.unlink(z) else |_| {}
-}
-
-fn executableOnPath(name: []const u8) bool {
-    const path_ptr = c.getenv("PATH") orelse return false;
-    var it = std.mem.splitScalar(u8, std.mem.span(path_ptr), ':');
-    while (it.next()) |dir| {
-        if (dir.len == 0) continue;
-        var buf: [4096:0]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch continue;
-        if (c.access(path.ptr, c.X_OK) == 0) return true;
-    }
-    return false;
-}
 
 const nowMs = @import("../util/clock.zig").nowMs;
 

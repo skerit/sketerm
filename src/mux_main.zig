@@ -277,19 +277,7 @@ fn runProxy(allocator: std.mem.Allocator) u8 {
     }
 }
 
-fn writeFull(fd: c_int, bytes: []const u8) bool {
-    const cc = @import("c.zig").c;
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = cc.write(fd, bytes.ptr + off, bytes.len - off);
-        if (n <= 0) {
-            if (n < 0 and std.posix.errno(n) == .INTR) continue;
-            return false;
-        }
-        off += @intCast(n);
-    }
-    return true;
-}
+const writeFull = @import("util/fdio.zig").writeAll;
 
 // ── UDP transport (mosh-style) ──────────────────────────────────
 
