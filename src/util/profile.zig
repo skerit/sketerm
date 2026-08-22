@@ -57,15 +57,11 @@ pub fn milliTimestamp() i64 {
     return @intCast(@divTrunc(nanoTimestamp(), std.time.ns_per_ms));
 }
 
-/// Zig 0.16 removed `std.posix.getenv`. We link libc, so just delegate
-/// to the C runtime. Returns the same `?[]const u8` shape the old API
-/// had so the existing `if (… getenv(name)) |v| …` patterns still work.
-pub fn getenv(name: [*:0]const u8) ?[]const u8 {
-    const c = @import("../c.zig").c;
-    const raw = c.getenv(name);
-    if (raw == null) return null;
-    return std.mem.span(raw);
-}
+/// The raw environment reader, re-exported here because this module's
+/// name is where the tree's `getenv` call sites already point.
+/// `util/env.zig` is the implementation and also has the variant that
+/// folds an empty value into null.
+pub const getenv = @import("env.zig").get;
 
 pub fn init() void {
     const c = @import("../c.zig").c;

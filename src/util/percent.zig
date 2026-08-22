@@ -33,6 +33,17 @@ pub fn encodeQueryInto(out: []u8, s: []const u8) ?[]const u8 {
     return out[0..w];
 }
 
+/// A byte a file:// URI keeps literal: the RFC 3986 unreserved set
+/// (ALPHA / DIGIT / `-._~`) plus the path separator. Everything else,
+/// UTF-8 bytes included, is %XX-escaped -- which is what
+/// `g_filename_to_uri` does, so thumbnail keys hash identically.
+pub fn isFileUriByte(b: u8) bool {
+    return std.ascii.isAlphanumeric(b) or switch (b) {
+        '-', '.', '_', '~', '/' => true,
+        else => false,
+    };
+}
+
 pub fn decode(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var out = try allocator.alloc(u8, s.len);
     errdefer allocator.free(out);
@@ -97,4 +108,15 @@ test "encodeQueryInto reports a too-small buffer" {
     var tiny: [2]u8 = undefined;
     try std.testing.expect(encodeQueryInto(&tiny, "abc") == null);
     try std.testing.expect(encodeQueryInto(&tiny, "&") == null);
+}
+
+test "isFileUriByte covers the unreserved set plus the separator" {
+    const t = std.testing;
+    for ("abzABZ059-._~/") |b| try t.expect(isFileUriByte(b));
+    // The reserved and unsafe bytes on either boundary of the ranges.
+    for ("%+ ?#&=:@,;'\"<>[]{}|\\^`\t\n") |b| try t.expect(!isFileUriByte(b));
+    try t.expect(!isFileUriByte(0));
+    try t.expect(!isFileUriByte(0x7f));
+    try t.expect(!isFileUriByte(0x80));
+    try t.expect(!isFileUriByte(0xff));
 }

@@ -59,6 +59,20 @@ pub fn wallMs() i64 {
     return sec * 1000 + @divTrunc(nsec, 1_000_000);
 }
 
+/// `YYYY-MM-DD HH:MM` in LOCAL time for `ms` epoch milliseconds,
+/// written into `buf` without a trailing NUL.
+///
+/// @return null when `ms` has no local representation, so each caller
+/// keeps its own placeholder (the file browser shows an empty cell,
+/// the MCP listing a "?").
+pub fn localStamp(buf: []u8, ms: i64) ?[]const u8 {
+    var t: c.time_t = @intCast(@divTrunc(ms, 1000));
+    var tm: c.struct_tm = undefined;
+    if (c.localtime_r(&t, &tm) == null) return null;
+    const n = c.strftime(buf.ptr, buf.len, "%Y-%m-%d %H:%M", &tm);
+    return buf[0..n];
+}
+
 test "nowMs is monotonic and reads as milliseconds" {
     const t = std.testing;
     const a = nowMs();
@@ -91,4 +105,23 @@ test "wallMs reads as epoch milliseconds" {
     // The wall clock may step, but two reads a few instructions apart
     // still have to land in the same window.
     try t.expect(@abs(wallMs() - now) < 60_000);
+}
+
+test "localStamp writes a fixed-width local timestamp" {
+    const t = std.testing;
+    var buf: [40]u8 = undefined;
+    // The exact value is timezone dependent; the shape is not.
+    const s = localStamp(&buf, 1_000_000_000_000).?;
+    try t.expectEqual(@as(usize, 16), s.len);
+    try t.expectEqual(@as(u8, '-'), s[4]);
+    try t.expectEqual(@as(u8, '-'), s[7]);
+    try t.expectEqual(@as(u8, ' '), s[10]);
+    try t.expectEqual(@as(u8, ':'), s[13]);
+    for ([_]usize{ 0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15 }) |i| {
+        try t.expect(s[i] >= '0' and s[i] <= '9');
+    }
+    // strftime writes nothing it cannot terminate: a buffer too small
+    // for the whole stamp yields an empty slice, never a partial one.
+    var tiny: [4]u8 = undefined;
+    try t.expectEqual(@as(usize, 0), localStamp(&tiny, 1_000_000_000_000).?.len);
 }
