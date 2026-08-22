@@ -342,18 +342,28 @@ pub fn overviewHash(
     var it = windows.valueIterator();
     while (it.next()) |w| {
         const win = w.*;
-        const id = ops.idOf(win);
-        hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&id));
-        if (ops.embeddedOf) |f| {
-            const embedded = f(win);
-            hash = std.hash.Wyhash.hash(hash, std.mem.asBytes(&embedded));
-        }
-        if (ops.appIdOf) |f| {
-            if (f(win)) |app_id| hash = std.hash.Wyhash.hash(hash, app_id);
-        }
-        hash = std.hash.Wyhash.hash(hash, std.mem.span(titleOf(ops.windowOf(win))));
+        hash = hashWindow(
+            hash,
+            ops.idOf(win),
+            if (ops.embeddedOf) |f| f(win) else null,
+            if (ops.appIdOf) |f| f(win) else null,
+            std.mem.span(titleOf(ops.windowOf(win))),
+        );
     }
     return hash;
+}
+
+/// Fold ONE window's overview facts into `hash`, in the fixed order
+/// id -> embedded -> app_id -> title. A null `embedded` / `app_id` is
+/// a backend that has no such concept and contributes NOTHING (not an
+/// empty string, not a false), which is what keeps the winstream hash
+/// byte-identical to the loop it had before this was shared. Pure, so
+/// the composition is pinned by a test with no window in sight.
+pub fn hashWindow(hash: u64, id: u32, embedded: ?bool, app_id: ?[]const u8, title: []const u8) u64 {
+    var h = std.hash.Wyhash.hash(hash, std.mem.asBytes(&id));
+    if (embedded) |e| h = std.hash.Wyhash.hash(h, std.mem.asBytes(&e));
+    if (app_id) |a| h = std.hash.Wyhash.hash(h, a);
+    return std.hash.Wyhash.hash(h, title);
 }
 
 /// GDK keycode -> evdev code, the units both backends send input in.
@@ -428,6 +438,45 @@ pub const OpaqueResize = struct {
         return 0;
     }
 };
+
+test "overview hash: the winstream fields, in the order winstream hashed them" {
+    // What WsHost.overviewHash did before remote_window owned it: the
+    // window id, then the title, and nothing else.
+    const want = std.hash.Wyhash.hash(
+        std.hash.Wyhash.hash(7, std.mem.asBytes(&@as(u32, 42))),
+        "Calculator",
+    );
+    try std.testing.expectEqual(want, hashWindow(7, 42, null, null, "Calculator"));
+}
+
+test "overview hash: the wayland fields, in the order wlapp hashed them" {
+    // What AppHost.overviewHash did: surface, embedded, app_id, title.
+    var h = std.hash.Wyhash.hash(7, std.mem.asBytes(&@as(u32, 42)));
+    h = std.hash.Wyhash.hash(h, std.mem.asBytes(&true));
+    h = std.hash.Wyhash.hash(h, "org.gnome.Calculator");
+    h = std.hash.Wyhash.hash(h, "Calculator");
+    try std.testing.expectEqual(h, hashWindow(7, 42, true, "org.gnome.Calculator", "Calculator"));
+}
+
+test "overview hash: an absent field is not an empty one" {
+    // A backend without app_id must not hash "" -- that would be a
+    // different hash from the loop it replaced, and a window that
+    // LOSES its app_id must not read the same as one that never had
+    // one.
+    try std.testing.expect(hashWindow(1, 5, null, null, "t") != hashWindow(1, 5, null, "", "t"));
+    try std.testing.expect(hashWindow(1, 5, null, null, "t") != hashWindow(1, 5, false, null, "t"));
+    // Every fact still moves the hash.
+    try std.testing.expect(hashWindow(1, 5, true, "a", "t") != hashWindow(1, 6, true, "a", "t"));
+    try std.testing.expect(hashWindow(1, 5, true, "a", "t") != hashWindow(1, 5, false, "a", "t"));
+    try std.testing.expect(hashWindow(1, 5, true, "a", "t") != hashWindow(1, 5, true, "b", "t"));
+    try std.testing.expect(hashWindow(1, 5, true, "a", "t") != hashWindow(1, 5, true, "a", "u"));
+}
+
+test "evdevCode: GDK's offset, and nothing below it" {
+    try std.testing.expect(evdevCode(7) == null);
+    try std.testing.expectEqual(@as(u32, 0), evdevCode(8).?);
+    try std.testing.expectEqual(@as(u32, 18), evdevCode(26).?);
+}
 
 test "blitRect places a rect and clips out-of-bounds" {
     // 4x3 BGRA backing, zeroed.
