@@ -310,6 +310,7 @@ comptime {
     _ = @import("winstream/source.zig");
     _ = @import("winstream/keymap.zig");
     _ = @import("remote_window.zig");
+    _ = @import("remote_menu.zig");
     _ = @import("terminal.zig");
     _ = @import("audio_sink.zig");
     _ = @import("editor/rope.zig");

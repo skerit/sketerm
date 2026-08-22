@@ -14,7 +14,7 @@ const proto = @import("winstream/proto.zig");
 const rw = @import("remote_window.zig");
 const vcodec = @import("wlhost/vcodec.zig");
 const build_options = @import("build_options");
-const wlapp = @import("wlapp.zig");
+const rmenu = @import("remote_menu.zig");
 
 pub const WsHost = struct {
     allocator: std.mem.Allocator,
@@ -81,8 +81,8 @@ pub const WsHost = struct {
         backing: std.ArrayList(u8) = .empty,
         /// Active recording of this window (host menu): GIF or WebM.
         /// Same state and same start/stop/save rules as the Wayland
-        /// backend — wlapp.WindowRec is shared, not copied.
-        rec: wlapp.WindowRec = .{},
+        /// backend — rmenu.WindowRec is shared, not copied.
+        rec: rmenu.WindowRec = .{},
         /// Lazily-created video decoder for win_vtile updates, recreated
         /// on a dimension/codec change (build_options.video).
         vdec: ?vcodec.Decoder = null,
@@ -153,18 +153,18 @@ pub const WsHost = struct {
         }
 
         /// Ctrl+right-click host menu: the winstream backend's half of
-        /// the shared host-menu contract (wlapp.popupHostMenu). No
+        /// the shared host-menu contract (rmenu.popupHostMenu). No
         /// pop-out / show-in-tab rows: a streamed window is always a
         /// floating toplevel, there is no embedded mode to leave.
         fn showHostMenu(win: *Win, x: f64, y: f64) void {
-            var plan_buf: [wlapp.MAX_HOST_MENU_ROWS]wlapp.HostMenuItem = undefined;
+            var plan_buf: [rmenu.MAX_HOST_MENU_ROWS]rmenu.HostMenuItem = undefined;
             // `embedded` / `can_embed` stay false: a streamed window is
             // always a floating toplevel, there is no embedded mode to
             // leave. `hostMenuPlan` therefore never yields the two
             // embedding rows here — pinned by a unit test in wlapp.zig,
             // since the skip below would otherwise drop them silently.
-            const plan = wlapp.hostMenuPlan(.{ .recording = win.rec.active() }, &plan_buf);
-            var rows: [wlapp.MAX_HOST_MENU_ROWS]wlapp.HostMenuRow = undefined;
+            const plan = rmenu.hostMenuPlan(.{ .recording = win.rec.active() }, &plan_buf);
+            var rows: [rmenu.MAX_HOST_MENU_ROWS]rmenu.HostMenuRow = undefined;
             var n: usize = 0;
             for (plan) |item| {
                 const cb = switch (item) {
@@ -174,27 +174,27 @@ pub const WsHost = struct {
                     .pop_out, .show_in_tab => continue,
                     .close => &onMenuClose,
                 };
-                rows[n] = .{ .label = wlapp.hostMenuLabel(item), .cb = cb, .ctx = win };
+                rows[n] = .{ .label = rmenu.hostMenuLabel(item), .cb = cb, .ctx = win };
                 n += 1;
             }
-            wlapp.popupHostMenu(win.picture, x, y, rows[0..n]);
+            rmenu.popupHostMenu(win.picture, x, y, rows[0..n]);
         }
 
         fn onMenuScreenshot(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             const win = cast.userData(Win, user);
-            wlapp.popdownHostMenu(btn);
-            wlapp.screenshotPicture(win.host.allocator, win.window, win.picture);
+            rmenu.popdownHostMenu(btn);
+            rmenu.screenshotPicture(win.host.allocator, win.window, win.picture);
         }
 
         fn onMenuRecordGif(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             const win = cast.userData(Win, user);
-            wlapp.popdownHostMenu(btn);
+            rmenu.popdownHostMenu(btn);
             win.rec.toggle(win.host.allocator, win.window, .gif);
         }
 
         fn onMenuRecordWebm(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             const win = cast.userData(Win, user);
-            wlapp.popdownHostMenu(btn);
+            rmenu.popdownHostMenu(btn);
             win.rec.toggle(win.host.allocator, win.window, .webm);
         }
 
@@ -202,7 +202,7 @@ pub const WsHost = struct {
         /// manager's close button sends (onCloseRequest).
         fn onMenuClose(btn: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
             const win = cast.userData(Win, user);
-            wlapp.popdownHostMenu(btn);
+            rmenu.popdownHostMenu(btn);
             c.gtk_window_close(win.window);
         }
     };
