@@ -60,76 +60,55 @@ test "cursorKey app mode (DECCKM=on): plain → ESC O X" {
     }
 }
 
-test "cursorKey shift only → ESC [ 1 ; 2 X" {
-    var buf: [16]u8 = undefined;
-    const n = input.cursorKey(&buf, '[', 'A', true, false, false);
-    try std.testing.expectEqualStrings("\x1b[1;2A", buf[0..n]);
+/// One modifier-encoding case: the key handed to the encoder, the three
+/// modifier flags, and the exact bytes it must produce.
+const ModCase = struct {
+    key: u8,
+    shift: bool = false,
+    alt: bool = false,
+    ctrl: bool = false,
+    want: []const u8,
+};
+
+/// Run one encoder over its cases, naming the row that fails.
+fn expectMods(cases: []const ModCase, comptime encode: fn ([]u8, u8, bool, bool, bool) usize) !void {
+    for (cases) |row| {
+        var buf: [16]u8 = undefined;
+        const n = encode(&buf, row.key, row.shift, row.alt, row.ctrl);
+        errdefer std.debug.print("failing case: key {d}, want \"{s}\"\n", .{ row.key, row.want });
+        try std.testing.expectEqualStrings(row.want, buf[0..n]);
+    }
 }
 
-test "cursorKey alt only → ESC [ 1 ; 3 X" {
-    var buf: [16]u8 = undefined;
-    const n = input.cursorKey(&buf, '[', 'A', false, true, false);
-    try std.testing.expectEqualStrings("\x1b[1;3A", buf[0..n]);
+test "cursorKey modifier columns" {
+    try expectMods(&.{
+        .{ .key = 'A', .shift = true, .want = "\x1b[1;2A" },
+        .{ .key = 'A', .alt = true, .want = "\x1b[1;3A" },
+        .{ .key = 'D', .ctrl = true, .want = "\x1b[1;5D" },
+        .{ .key = 'D', .shift = true, .ctrl = true, .want = "\x1b[1;6D" },
+        .{ .key = 'D', .shift = true, .alt = true, .ctrl = true, .want = "\x1b[1;8D" },
+    }, struct {
+        fn f(buf: []u8, key: u8, shift: bool, alt: bool, ctrl: bool) usize {
+            return input.cursorKey(buf, '[', key, shift, alt, ctrl);
+        }
+    }.f);
 }
 
-test "cursorKey ctrl only → ESC [ 1 ; 5 X" {
-    var buf: [16]u8 = undefined;
-    const n = input.cursorKey(&buf, '[', 'D', false, false, true);
-    try std.testing.expectEqualStrings("\x1b[1;5D", buf[0..n]);
+test "tildeKey modifier columns" {
+    try expectMods(&.{
+        .{ .key = 5, .want = "\x1b[5~" }, // PgUp
+        .{ .key = 6, .shift = true, .want = "\x1b[6;2~" }, // PgDn
+        .{ .key = 15, .ctrl = true, .want = "\x1b[15;5~" }, // F5
+        .{ .key = 2, .shift = true, .alt = true, .want = "\x1b[2;4~" }, // Insert
+    }, input.tildeKey);
 }
 
-test "cursorKey ctrl+shift → ESC [ 1 ; 6 X" {
-    var buf: [16]u8 = undefined;
-    const n = input.cursorKey(&buf, '[', 'D', true, false, true);
-    try std.testing.expectEqualStrings("\x1b[1;6D", buf[0..n]);
-}
-
-test "cursorKey ctrl+alt+shift → ESC [ 1 ; 8 X" {
-    var buf: [16]u8 = undefined;
-    const n = input.cursorKey(&buf, '[', 'D', true, true, true);
-    try std.testing.expectEqualStrings("\x1b[1;8D", buf[0..n]);
-}
-
-test "tildeKey plain (PgUp = 5)" {
-    var buf: [16]u8 = undefined;
-    const n = input.tildeKey(&buf, 5, false, false, false);
-    try std.testing.expectEqualStrings("\x1b[5~", buf[0..n]);
-}
-
-test "tildeKey with shift (PgDn = 6)" {
-    var buf: [16]u8 = undefined;
-    const n = input.tildeKey(&buf, 6, true, false, false);
-    try std.testing.expectEqualStrings("\x1b[6;2~", buf[0..n]);
-}
-
-test "tildeKey F5 (15) ctrl" {
-    var buf: [16]u8 = undefined;
-    const n = input.tildeKey(&buf, 15, false, false, true);
-    try std.testing.expectEqualStrings("\x1b[15;5~", buf[0..n]);
-}
-
-test "tildeKey Insert (2) alt+shift" {
-    var buf: [16]u8 = undefined;
-    const n = input.tildeKey(&buf, 2, true, true, false);
-    try std.testing.expectEqualStrings("\x1b[2;4~", buf[0..n]);
-}
-
-test "ssoKey F1 plain → ESC O P" {
-    var buf: [16]u8 = undefined;
-    const n = input.ssoKey(&buf, 'P', false, false, false);
-    try std.testing.expectEqualStrings("\x1bOP", buf[0..n]);
-}
-
-test "ssoKey F4 ctrl → ESC [ 1 ; 5 S" {
-    var buf: [16]u8 = undefined;
-    const n = input.ssoKey(&buf, 'S', false, false, true);
-    try std.testing.expectEqualStrings("\x1b[1;5S", buf[0..n]);
-}
-
-test "ssoKey F2 shift+alt → ESC [ 1 ; 4 Q" {
-    var buf: [16]u8 = undefined;
-    const n = input.ssoKey(&buf, 'Q', true, true, false);
-    try std.testing.expectEqualStrings("\x1b[1;4Q", buf[0..n]);
+test "ssoKey modifier columns" {
+    try expectMods(&.{
+        .{ .key = 'P', .want = "\x1bOP" }, // F1
+        .{ .key = 'S', .ctrl = true, .want = "\x1b[1;5S" }, // F4
+        .{ .key = 'Q', .shift = true, .alt = true, .want = "\x1b[1;4Q" }, // F2
+    }, input.ssoKey);
 }
 
 // ── Kitty keyboard protocol ───────────────────────────────────────
