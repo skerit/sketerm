@@ -12,6 +12,7 @@
 //! resize regrows the buffer and marks every row dirty.
 
 const std = @import("std");
+const cell_mod = @import("../grid/cell.zig");
 const c = @import("../c.zig").c;
 const gl = @import("gl.zig");
 const atlas_mod = @import("atlas.zig");
@@ -596,7 +597,7 @@ pub const CellPass = struct {
         var cached_bold: f32 = 0;
         while (col < cells.len) : (col += 1) {
             const cell = cells[col];
-            const is_wide = (cell.flags & 0b0000_0001) != 0;
+            const is_wide = (cell.flags & cell_mod.FLAG_WIDE_LEFT) != 0;
             const cell_w_count: f32 = if (is_wide) 2.0 else 1.0;
             const cx: f32 = pad + @as(f32, @floatFromInt(col)) * cw * x_scale;
             const cell_w: f32 = cw * cell_w_count * x_scale;
@@ -633,7 +634,7 @@ pub const CellPass = struct {
             // Per-codepoint glyph (will be overridden by ligature shaping
             // below if applicable). Bold pulls a real bold glyph from the
             // atlas (bold face or outline-embolden) — no shader fakery.
-            if (cell.rune != 0 and cell.rune != ' ' and (cell.flags & 0b0000_0010) == 0) {
+            if (cell.rune != 0 and cell.rune != ' ' and (cell.flags & cell_mod.FLAG_WIDE_CONT) == 0) {
                 const g = atlas.lookupGlyph(glossary, cell.rune, cached_bold > 0.5, cached_attr_italic, cached_fg) catch continue;
                 if (g.w > 0 and g.h > 0) {
                     const gx: f32 = cx + @as(f32, @floatFromInt(g.bearing_x)) * x_scale;
@@ -683,7 +684,7 @@ pub const CellPass = struct {
         const n: u16 = @intCast(cells.len);
         while (col < n) {
             const cell = cells[col];
-            const printable = cell.rune > 0x20 and cell.rune < 0x7F and (cell.flags & 0b0000_0010) == 0;
+            const printable = cell.rune > 0x20 and cell.rune < 0x7F and (cell.flags & cell_mod.FLAG_WIDE_CONT) == 0;
             if (!printable) {
                 col += 1;
                 continue;
@@ -693,7 +694,7 @@ pub const CellPass = struct {
             while (col < n) : (col += 1) {
                 const c2 = cells[col];
                 if (c2.rune <= 0x20 or c2.rune >= 0x7F) break;
-                if ((c2.flags & 0b0000_0010) != 0) break;
+                if ((c2.flags & cell_mod.FLAG_WIDE_CONT) != 0) break;
                 if (c2.style_ref != run_style) break;
             }
             const run_len = col - run_start;

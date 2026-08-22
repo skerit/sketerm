@@ -9,6 +9,7 @@
 //! draws the overlays from `Screen.hints_overlay`.
 
 const std = @import("std");
+const cell_mod = @import("../grid/cell.zig");
 const c = @import("../c.zig").c;
 const Screen = @import("../grid/screen.zig").Screen;
 const Cell = @import("../grid/cell.zig").Cell;
@@ -177,7 +178,7 @@ fn scanRowRules(
     var col_of: std.ArrayList(u16) = .empty;
     defer col_of.deinit(allocator);
     for (cells, 0..) |cl, i| {
-        if (cl.flags & 0b0000_0010 != 0) continue; // wide continuation
+        if (cl.flags & cell_mod.FLAG_WIDE_CONT != 0) continue; // wide continuation
         const cp: u32 = if (cl.rune == 0) ' ' else cl.rune;
         var ub: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(@intCast(cp), &ub) catch continue;
@@ -241,13 +242,13 @@ fn scanRowAll(
     {
         var col: usize = 0;
         while (col < cells.len) {
-            if ((cells[col].flags & 0b0000_0100) == 0 or cells[col].reserved == 0) {
+            if ((cells[col].flags & cell_mod.FLAG_HAS_LINK) == 0 or cells[col].reserved == 0) {
                 col += 1;
                 continue;
             }
             const id = cells[col].reserved;
             const start = col;
-            while (col < cells.len and (cells[col].flags & 0b0000_0100) != 0 and cells[col].reserved == id) : (col += 1) {}
+            while (col < cells.len and (cells[col].flags & cell_mod.FLAG_HAS_LINK) != 0 and cells[col].reserved == id) : (col += 1) {}
             if (screen.linkUri(id)) |uri| {
                 try out.append(allocator, .{
                     .row = row,
@@ -362,7 +363,7 @@ fn extractCells(allocator: std.mem.Allocator, cells: []const Cell) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     for (cells) |cl| {
-        if (cl.flags & 0b0000_0010 != 0) continue; // wide continuation
+        if (cl.flags & cell_mod.FLAG_WIDE_CONT != 0) continue; // wide continuation
         if (cl.rune == 0) continue;
         var ub: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(@intCast(cl.rune), &ub) catch continue;

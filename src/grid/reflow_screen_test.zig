@@ -5,11 +5,12 @@
 //! soft-wrapped text correctly.
 
 const std = @import("std");
+const cell_mod = @import("cell.zig");
 const Harness = @import("../parser/test_harness.zig").Harness;
 const Screen = @import("screen.zig").Screen;
 
-const wide_left: u8 = 0b0000_0001;
-const wide_cont: u8 = 0b0000_0010;
+const wide_left: u8 = cell_mod.FLAG_WIDE_LEFT;
+const wide_cont: u8 = cell_mod.FLAG_WIDE_CONT;
 
 fn expectLineWidePairsValid(cells: []const @import("cell.zig").Cell) !void {
     for (cells, 0..) |cell, col| {

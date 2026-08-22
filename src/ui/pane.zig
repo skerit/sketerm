@@ -8,6 +8,7 @@
 //! split-pane tree participation.
 
 const std = @import("std");
+const cell_mod = @import("../grid/cell.zig");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const TerminalSurface = @import("terminal_surface.zig").TerminalSurface;
@@ -2493,7 +2494,7 @@ fn paneMenuPrePopup(ctx: ?*anyopaque, group: *c.GSimpleActionGroup, x: f64, y: f
             }
             if (logical_col < cells.len) {
                 const c_cell = cells[logical_col];
-                if (c_cell.flags & 0b0000_0100 != 0) {
+                if (c_cell.flags & cell_mod.FLAG_HAS_LINK != 0) {
                     if (screen.linkUri(c_cell.reserved)) |uri| {
                         if (self.allocator.dupe(u8, uri)) |copy| {
                             self.menu_link_uri = copy;
@@ -2660,7 +2661,7 @@ fn onMotion(g: *c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) c
         const c_row: u16 = @intCast(cell.row);
         const c_col: u16 = @intCast(cell.col);
         const cell_data = screen.cellAt(c_row, c_col);
-        if (cell_data.flags & 0b0000_0100 != 0) {
+        if (cell_data.flags & cell_mod.FLAG_HAS_LINK != 0) {
             if (screen.linkUri(cell_data.reserved)) |uri| {
                 self.setLinkTooltip(uri);
                 over_link = true;
@@ -3041,7 +3042,7 @@ fn onDragEnd(g: *c.GtkGestureDrag, dx: f64, dy: f64, user: ?*anyopaque) callconv
     const cell_data = screen.cellAt(@intCast(cell.row), @intCast(cell.col));
 
     // OSC 8 hyperlink — preferred path when the cell carries one.
-    if (cell_data.flags & 0b0000_0100 != 0) {
+    if (cell_data.flags & cell_mod.FLAG_HAS_LINK != 0) {
         if (screen.linkUri(cell_data.reserved)) |uri| {
             launchUri(uri);
             return;

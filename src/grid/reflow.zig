@@ -25,6 +25,7 @@
 //! those coordinates with the same position helpers used for the cursor.
 
 const std = @import("std");
+const cell_mod = @import("cell.zig");
 const Cell = @import("cell.zig").Cell;
 const Line = @import("line.zig").Line;
 
@@ -38,8 +39,8 @@ pub const Logical = struct {
     fully_filled: bool = false,
 };
 
-const wide_left: u8 = 0b0000_0001;
-const wide_cont: u8 = 0b0000_0010;
+const wide_left: u8 = cell_mod.FLAG_WIDE_LEFT;
+const wide_cont: u8 = cell_mod.FLAG_WIDE_CONT;
 
 fn isWideLeft(cell: Cell) bool {
     return cell.flags & (wide_left | wide_cont) == wide_left;

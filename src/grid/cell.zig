@@ -44,6 +44,19 @@ pub const Flags = packed struct(u8) {
     _pad: u3 = 0,
 };
 
+/// Raw `Cell.flags` masks, derived from `Flags` so the two cannot drift;
+/// callers that mask the u8 directly use these, never a bit literal.
+pub const FLAG_WIDE_LEFT: u8 = flagsToU8(.{ .is_wide_left = true });
+pub const FLAG_WIDE_CONT: u8 = flagsToU8(.{ .is_wide_cont = true });
+pub const FLAG_HAS_LINK: u8 = flagsToU8(.{ .has_link = true });
+pub const FLAG_HAS_IMAGE: u8 = flagsToU8(.{ .has_image = true });
+pub const FLAG_IS_CLUSTER: u8 = flagsToU8(.{ .is_cluster = true });
+
+comptime {
+    std.debug.assert(FLAG_WIDE_LEFT == 1 and FLAG_WIDE_CONT == 2 and FLAG_HAS_LINK == 4);
+    std.debug.assert(FLAG_HAS_IMAGE == 8 and FLAG_IS_CLUSTER == 16);
+}
+
 pub fn flagsFromU8(v: u8) Flags {
     return @bitCast(v);
 }

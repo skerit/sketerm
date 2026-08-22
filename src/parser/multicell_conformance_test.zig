@@ -12,6 +12,7 @@
 //!   in our isWide table (it's ignored as a separate codepoint).
 
 const std = @import("std");
+const cell_mod = @import("../grid/cell.zig");
 const Harness = @import("test_harness.zig").Harness;
 
 test "screen.py: wide CJK char takes 2 columns" {
@@ -23,10 +24,10 @@ test "screen.py: wide CJK char takes 2 columns" {
     // First cell holds the codepoint, second is the continuation.
     const c0 = h.screen.cellAt(0, 0);
     try std.testing.expectEqual(@as(u32, 0x4E2D), c0.rune);
-    try std.testing.expect(c0.flags & 0b0000_0001 != 0); // is_wide_left
+    try std.testing.expect(c0.flags & cell_mod.FLAG_WIDE_LEFT != 0); // is_wide_left
     const c1 = h.screen.cellAt(0, 1);
     try std.testing.expectEqual(@as(u32, 0), c1.rune);
-    try std.testing.expect(c1.flags & 0b0000_0010 != 0); // is_wide_cont
+    try std.testing.expect(c1.flags & cell_mod.FLAG_WIDE_CONT != 0); // is_wide_cont
 }
 
 test "screen.py: emoji skin tone — modifier attaches, cursor at width 2" {

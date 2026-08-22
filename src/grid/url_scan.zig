@@ -6,6 +6,7 @@
 //! hover for plain-text URLs that the shell didn't wrap in OSC 8.
 
 const std = @import("std");
+const cell_mod = @import("cell.zig");
 const Cell = @import("cell.zig").Cell;
 
 pub const Match = struct {
@@ -19,7 +20,7 @@ pub const Match = struct {
 /// `out` buffer receives matches; returns the count written.
 /// Caller sizes `out` (typical: 8 matches per row is plenty).
 ///
-/// Cells whose `flags & 0b0000_0100 != 0` already carry an OSC 8
+/// Cells whose `flags & cell_mod.FLAG_HAS_LINK != 0` already carry an OSC 8
 /// hyperlink — skip those ranges so we don't double-decorate.
 pub fn scanRow(cells: []const Cell, out: []Match) usize {
     var n: usize = 0;
@@ -33,7 +34,7 @@ pub fn scanRow(cells: []const Cell, out: []Match) usize {
         }
         // Skip into-OSC-8 hyperlink runs entirely — leave them to the
         // explicit-link rendering path.
-        if ((cells[col].flags & 0b0000_0100) != 0) {
+        if ((cells[col].flags & cell_mod.FLAG_HAS_LINK) != 0) {
             col += 1;
             continue;
         }
@@ -150,7 +151,7 @@ test "scanRow: skips OSC 8 cells" {
     const cells = try cellsFromAscii(ally, "http://a.b/c");
     defer ally.free(cells);
     // Mark the whole range as already OSC-8 linked.
-    for (cells) |*ce| ce.flags |= 0b0000_0100;
+    for (cells) |*ce| ce.flags |= cell_mod.FLAG_HAS_LINK;
 
     var matches: [4]Match = undefined;
     const n = scanRow(cells, &matches);

@@ -13,6 +13,7 @@
 //! regression shows up in.
 
 const std = @import("std");
+const cell_mod = @import("grid/cell.zig");
 const Parser = @import("parser/vt.zig").Parser;
 const Event = @import("parser/event.zig").Event;
 const Screen = @import("grid/screen.zig").Screen;
@@ -96,7 +97,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
         var col: u16 = 0;
         while (col < cols) : (col += 1) {
             const cell = screen.cellAt(r, col);
-            if (cell.flags & 0b0000_0010 != 0) {
+            if (cell.flags & cell_mod.FLAG_WIDE_CONT != 0) {
                 line_buf[len] = '_';
                 len += 1;
             } else if (cell.rune == 0) {

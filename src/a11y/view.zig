@@ -11,12 +11,13 @@
 //! the UTF-8 bytes for the actual contents.
 
 const std = @import("std");
+const cell_mod = @import("../grid/cell.zig");
 const Screen = @import("../grid/screen.zig").Screen;
 const Cell = @import("../grid/cell.zig").Cell;
 
 /// Cell flag bits (mirrors the grid's `Cell.flags`).
-const FLAG_WIDE: u8 = 0b0000_0001;
-const FLAG_WIDE_CONT: u8 = 0b0000_0010;
+const FLAG_WIDE: u8 = cell_mod.FLAG_WIDE_LEFT;
+const FLAG_WIDE_CONT: u8 = cell_mod.FLAG_WIDE_CONT;
 
 pub const Snapshot = struct {
     allocator: std.mem.Allocator,

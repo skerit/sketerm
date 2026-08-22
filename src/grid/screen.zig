@@ -7,6 +7,7 @@
 //!   - Scrollback stub (in-place capacity, no eviction yet).
 
 const std = @import("std");
+const cell_mod = @import("cell.zig");
 const Cell = @import("cell.zig").Cell;
 const Flags = @import("cell.zig").Flags;
 const flagsToU8 = @import("cell.zig").flagsToU8;
@@ -1059,13 +1060,13 @@ pub const Screen = struct {
     pub fn splitWidePair(self: *Screen, ln: *Line, col: u16) void {
         if (col >= self.cols) return;
         const f = ln.cells[col].flags;
-        if (f & 0b0000_0001 != 0) { // wide-left
+        if (f & cell_mod.FLAG_WIDE_LEFT != 0) { // wide-left
             ln.cells[col] = .{};
-            if (col + 1 < self.cols and (ln.cells[col + 1].flags & 0b0000_0010) != 0)
+            if (col + 1 < self.cols and (ln.cells[col + 1].flags & cell_mod.FLAG_WIDE_CONT) != 0)
                 ln.cells[col + 1] = .{};
-        } else if (f & 0b0000_0010 != 0) { // wide continuation
+        } else if (f & cell_mod.FLAG_WIDE_CONT != 0) { // wide continuation
             ln.cells[col] = .{};
-            if (col > 0 and (ln.cells[col - 1].flags & 0b0000_0001) != 0)
+            if (col > 0 and (ln.cells[col - 1].flags & cell_mod.FLAG_WIDE_LEFT) != 0)
                 ln.cells[col - 1] = .{};
         }
     }
@@ -1555,7 +1556,7 @@ pub const Screen = struct {
                     const active_row = destination.row - sb_rows;
                     if (active_row < new_rows) {
                         const cell = new_active[active_row].cells[destination.col];
-                        if (cell.rune != 0 and cell.flags & 0b0000_0010 == 0) {
+                        if (cell.rune != 0 and cell.flags & cell_mod.FLAG_WIDE_CONT == 0) {
                             key = cellKey(@intCast(active_row), destination.col);
                         }
                     }
@@ -1835,11 +1836,11 @@ pub const Screen = struct {
                 const cell = cells[col];
                 // Skip wide-char continuation cells (right half of a
                 // 2-column glyph). Their rune is 0 by design.
-                if (cell.flags & 0b0000_0010 != 0) continue;
+                if (cell.flags & cell_mod.FLAG_WIDE_CONT != 0) continue;
 
                 if (links) {
                     // Run boundaries are link_id changes.
-                    const has_link = (cell.flags & 0b0000_0100) != 0;
+                    const has_link = (cell.flags & cell_mod.FLAG_HAS_LINK) != 0;
                     const cell_link_id: u8 = if (has_link) cell.reserved else 0;
                     if (cell_link_id != self.open_link_id) {
                         try self.closeLink(true);
@@ -3720,7 +3721,7 @@ pub const Screen = struct {
         if (self.ph_pending != null) self.flushPlaceholder();
         const total: u16 = @intCast(bytes.len);
         const link_id = self.current_link_id;
-        const flags: u8 = if (link_id != 0) 0b0000_0100 else 0;
+        const flags: u8 = if (link_id != 0) cell_mod.FLAG_HAS_LINK else 0;
         const style = self.cur_style;
         var i: u16 = 0;
         while (i < total) {
@@ -3867,8 +3868,8 @@ pub const Screen = struct {
         self.splitWidePair(ln, self.col);
         if (width == 2) self.splitWidePair(ln, self.col + 1);
 
-        var flags: u8 = if (self.current_link_id != 0) 0b0000_0100 else 0;
-        if (width == 2) flags |= 0b0000_0001; // is_wide_left
+        var flags: u8 = if (self.current_link_id != 0) cell_mod.FLAG_HAS_LINK else 0;
+        if (width == 2) flags |= cell_mod.FLAG_WIDE_LEFT; // is_wide_left
         ln.cells[self.col] = .{
             .rune = cp,
             .style_ref = self.cur_style,
@@ -3880,7 +3881,7 @@ pub const Screen = struct {
             ln.cells[self.col + 1] = .{
                 .rune = 0,
                 .style_ref = self.cur_style,
-                .flags = 0b0000_0010,
+                .flags = cell_mod.FLAG_WIDE_CONT,
                 .reserved = self.current_link_id,
             };
         }
@@ -4311,7 +4312,7 @@ pub const Screen = struct {
         for (self.buf()) |ln| {
             for (ln.cells) |cell| {
                 // Skip wide-char continuation cells.
-                if (cell.flags & 0b0000_0010 != 0) continue;
+                if (cell.flags & cell_mod.FLAG_WIDE_CONT != 0) continue;
                 if (cell.rune == 0) {
                     try w.writeByte(' ');
                 } else if (cell.rune < 128) {
@@ -4345,8 +4346,8 @@ fn renderLineForSearch(
     var col: u32 = 0;
     while (col < cells.len) : (col += 1) {
         const cell = cells[col];
-        if (cell.flags & 0b0000_0010 != 0) continue; // wide-cont
-        const is_wide = (cell.flags & 0b0000_0001) != 0;
+        if (cell.flags & cell_mod.FLAG_WIDE_CONT != 0) continue; // wide-cont
+        const is_wide = (cell.flags & cell_mod.FLAG_WIDE_LEFT) != 0;
         const w: u8 = if (is_wide) 2 else 1;
         const cp: u32 = if (cell.rune == 0) ' ' else cell.rune;
         var enc: [4]u8 = undefined;
@@ -4925,7 +4926,7 @@ fn prepareScrollFailureScreen(screen: *Screen, scenario: ScrollFailureScenario) 
     const uri = try screen.allocator.dupe(u8, "https://scroll.test");
     errdefer screen.allocator.free(uri);
     try screen.links.put(1, uri);
-    screen.active[2].cells[0].flags |= 0b0000_0100;
+    screen.active[2].cells[0].flags |= cell_mod.FLAG_HAS_LINK;
     screen.active[2].cells[0].reserved = 1;
 
     if (scenario == .full_ring) {
@@ -5426,7 +5427,7 @@ test "wide CJK takes 2 columns and marks continuation" {
     try std.testing.expectEqual(@as(u32, 0x4E2D), s.cellAt(0, 0).rune);
     try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 1).rune);
     // Continuation flag bit 1 (is_wide_cont) set.
-    try std.testing.expect(s.cellAt(0, 1).flags & 0b10 != 0);
+    try std.testing.expect(s.cellAt(0, 1).flags & cell_mod.FLAG_WIDE_CONT != 0);
     try std.testing.expectEqual(@as(u16, 2), s.col);
 }
 
@@ -5440,7 +5441,7 @@ test "wide-char wraps at right edge" {
     // Now at col=2; '中' would need 2 cols → wraps to next line.
     s.printCp(0x4E2D);
     try std.testing.expectEqual(@as(u32, 0x4E2D), s.cellAt(1, 0).rune);
-    try std.testing.expect(s.cellAt(1, 1).flags & 0b10 != 0);
+    try std.testing.expect(s.cellAt(1, 1).flags & cell_mod.FLAG_WIDE_CONT != 0);
 }
 
 test "resize preserves active rows" {
@@ -8141,8 +8142,8 @@ test "narrow overwrite of wide-left blanks the continuation cell" {
     var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
     defer s.deinit();
     s.printCp(0x4E2D); // CJK, occupies cols 0-1
-    try std.testing.expect(s.cellAt(0, 0).flags & 0b0000_0001 != 0);
-    try std.testing.expect(s.cellAt(0, 1).flags & 0b0000_0010 != 0);
+    try std.testing.expect(s.cellAt(0, 0).flags & cell_mod.FLAG_WIDE_LEFT != 0);
+    try std.testing.expect(s.cellAt(0, 1).flags & cell_mod.FLAG_WIDE_CONT != 0);
     s.row = 0;
     s.col = 0;
     s.printCp('a');

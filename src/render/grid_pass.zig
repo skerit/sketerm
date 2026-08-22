@@ -12,6 +12,7 @@
 //! cell grid: cursor + selection + a bell flash is at most ~50 quads.
 
 const std = @import("std");
+const cell_mod = @import("../grid/cell.zig");
 const c = @import("../c.zig").c;
 const gl = @import("gl.zig");
 const atlas_mod = @import("atlas.zig");
@@ -940,7 +941,7 @@ pub const GridPass = struct {
             const fg = if (screen.cursor_color[3] > 0) screen.cursor_color else self.default_fg;
             const block_alpha: f32 = 0.85;
             const at = if (!screen.use_alt) screen.active[screen.row].cells[screen.col] else screen.alt.?[screen.row].cells[screen.col];
-            const cur_cw: f32 = if (at.flags & 0b0000_0001 != 0) cw * 2.0 else cw;
+            const cur_cw: f32 = if (at.flags & cell_mod.FLAG_WIDE_LEFT != 0) cw * 2.0 else cw;
 
             if (focused) {
                 switch (screen.cursor_shape) {
@@ -1222,7 +1223,7 @@ pub const GridPass = struct {
         ch: f32,
         x_scale: f32,
     ) !void {
-        if ((cell.flags & 0b0000_0010) != 0) return; // wide continuation
+        if ((cell.flags & cell_mod.FLAG_WIDE_CONT) != 0) return; // wide continuation
         const style = pool.get(cell.style_ref);
         const a = style.attrs;
         const has_line = a.underline or a.double_underline or a.curly_underline;
@@ -1239,7 +1240,7 @@ pub const GridPass = struct {
             else => self.resolveColor(style.underline_color, true),
         };
 
-        const is_wide = (cell.flags & 0b0000_0001) != 0;
+        const is_wide = (cell.flags & cell_mod.FLAG_WIDE_LEFT) != 0;
         const x: f32 = self.pad + @as(f32, @floatFromInt(visual_col)) * cw * x_scale;
         const w: f32 = cw * x_scale * (if (is_wide) @as(f32, 2.0) else 1.0);
         // Every rect comes from the shared geometry in style.zig, the
@@ -1294,7 +1295,7 @@ pub const GridPass = struct {
         const cols: u16 = @intCast(cells.len);
         while (col < cols) {
             const cell = cells[col];
-            if ((cell.flags & 0b0000_0010) != 0 or cell.rune == 0 or cell.rune == ' ') {
+            if ((cell.flags & cell_mod.FLAG_WIDE_CONT) != 0 or cell.rune == 0 or cell.rune == ' ') {
                 col += 1;
                 continue;
             }
@@ -1379,7 +1380,7 @@ pub const GridPass = struct {
 
         for (indices, 0..) |logical, visual| {
             const cell = cells[logical];
-            if ((cell.flags & 0b0000_0010) != 0 or cell.rune == 0 or cell.rune == ' ') continue;
+            if ((cell.flags & cell_mod.FLAG_WIDE_CONT) != 0 or cell.rune == 0 or cell.rune == ' ') continue;
             const style = pool.get(cell.style_ref);
             var fg_color = if (style.attrs.reverse) style.bg else style.fg;
             if (style.attrs.bold and self.allow_bold and self.bold_is_bright) {

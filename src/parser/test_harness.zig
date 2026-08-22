@@ -8,6 +8,7 @@
 //! response sequences). Mirrors Kitty's `parse_bytes_dump` pattern.
 
 const std = @import("std");
+const cell_mod = @import("../grid/cell.zig");
 const Parser = @import("vt.zig").Parser;
 const Event = @import("event.zig").Event;
 pub const Screen = @import("../grid/screen.zig").Screen;
@@ -183,7 +184,7 @@ pub const Harness = struct {
         var hi: usize = cells.len;
         while (hi > 0 and (cells[hi - 1].rune == 0 or cells[hi - 1].rune == ' ')) hi -= 1;
         for (cells[0..hi]) |cell| {
-            if (cell.flags & 0b0000_0010 != 0) continue; // wide-cont
+            if (cell.flags & cell_mod.FLAG_WIDE_CONT != 0) continue; // wide-cont
             const cp = if (cell.rune == 0) ' ' else cell.rune;
             if (cp < 0x80) {
                 try out.append(allocator, @intCast(cp));

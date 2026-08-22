@@ -6,6 +6,7 @@
 //! VT52, DECCOLM).
 
 const std = @import("std");
+const cell_mod = @import("../grid/cell.zig");
 const Harness = @import("test_harness.zig").Harness;
 const version = @import("../version.zig");
 
@@ -323,13 +324,13 @@ test "screen.py: OSC 8 stamps link_id on cells" {
     var col: u16 = 0;
     while (col < 4) : (col += 1) {
         const cell = h.screen.cellAt(0, col);
-        try std.testing.expect(cell.flags & 0b0000_0100 != 0); // has link
+        try std.testing.expect(cell.flags & cell_mod.FLAG_HAS_LINK != 0); // has link
         try std.testing.expect(cell.reserved != 0);
     }
     // After end-link, no link on subsequent cells.
     h.feed("X");
     const c = h.screen.cellAt(0, 4);
-    try std.testing.expect(c.flags & 0b0000_0100 == 0);
+    try std.testing.expect(c.flags & cell_mod.FLAG_HAS_LINK == 0);
 }
 
 // ── test_charsets (DEC special graphics) ──────────────────────────
@@ -383,7 +384,7 @@ test "parser.py: OSC 8 malformed (no second ;) ignored" {
     h.feed("\x1b]8moo\x07X");
     // No link should be active; the 'X' has no link flag.
     const c = h.screen.cellAt(0, 0);
-    try std.testing.expect(c.flags & 0b0000_0100 == 0);
+    try std.testing.expect(c.flags & cell_mod.FLAG_HAS_LINK == 0);
 }
 
 // ── test_csi_code_rep (REP) ───────────────────────────────────────
