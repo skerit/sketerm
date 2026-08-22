@@ -187,7 +187,10 @@ pub const Pane = struct {
     /// fd watch must never outlive the pane.
     browser_widget: ?*c.GtkWidget = null,
     browser_ctx: ?*anyopaque = null,
-    browser_prepare_destroy: ?*const fn (*anyopaque) void = null,
+    /// Same `widgets_dead` contract as `editor_prepare_destroy`: the
+    /// last-resort call from `Pane.deinit` arrives after GTK finalized
+    /// the subtree, and the face must be told rather than infer it.
+    browser_prepare_destroy: ?*const fn (*anyopaque, widgets_dead: bool) void = null,
     browser_deinit: ?*const fn (*anyopaque) void = null,
     /// Put GTK focus inside the browser face (its listing). Called
     /// whenever that face becomes the visible one.
@@ -880,7 +883,7 @@ pub const Pane = struct {
         self: *Pane,
         face: *c.GtkWidget,
         ctx: *anyopaque,
-        prepare_destroy_cb: *const fn (*anyopaque) void,
+        prepare_destroy_cb: *const fn (*anyopaque, widgets_dead: bool) void,
         deinit_cb: *const fn (*anyopaque) void,
         focus_cb: *const fn (*anyopaque) void,
     ) void {
@@ -966,7 +969,7 @@ pub const Pane = struct {
         self.editor_prev_face = .terminal;
         self.clearFaceTitle();
         if (ctx) |browser_ctx| {
-            if (prepare_destroy_cb) |cb| cb(browser_ctx);
+            if (prepare_destroy_cb) |cb| cb(browser_ctx, self.widgets_dead);
         }
         if (face) |bw| {
             // After the widget tree's destroy these pointers are no

@@ -1041,8 +1041,15 @@ pub const BrowserView = struct {
         self.deinit();
     }
 
-    fn prepareDestroyCb(ctx: *anyopaque) void {
+    /// `widgets_dead` is the pane's verdict on its subtree. On the
+    /// ordinary path (severFaces) it is false and the root's ::destroy
+    /// fires later, during gtk_box_remove; on the last-resort path
+    /// from `Pane.deinit` it is true and GTK has finalized everything,
+    /// so the flag has to be honoured BEFORE the inline-rename cancel,
+    /// which otherwise writes its label and box.
+    fn prepareDestroyCb(ctx: *anyopaque, widgets_dead: bool) void {
         const self: *BrowserView = @ptrCast(@alignCast(ctx));
+        if (widgets_dead) self.widgets_dead = true;
         self.verifyInlineRenameTeardown(null, "view");
         self.cancelInlineRename(null);
         self.fenceWidgets();
