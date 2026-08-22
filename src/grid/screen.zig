@@ -1843,7 +1843,7 @@ pub const Screen = struct {
                     const has_link = (cell.flags & cell_mod.FLAG_HAS_LINK) != 0;
                     const cell_link_id: u8 = if (has_link) cell.reserved else 0;
                     if (cell_link_id != self.open_link_id) {
-                        try self.closeLink(true);
+                        try self.closeLink();
                         if (cell_link_id != 0) try self.out.append(self.allocator, '[');
                         self.open_link_id = cell_link_id;
                     }
@@ -1873,18 +1873,16 @@ pub const Screen = struct {
             }
         }
 
-        /// Closes an open link run. `angle_escape` picks the markdown
-        /// angle-bracket URI form when the URI contains the one char
-        /// that would break the plain `(uri)` form; it is false at
-        /// end-of-extraction only because that is what the three
-        /// link-aware extractors have always emitted there.
-        fn closeLink(self: *TextRun, angle_escape: bool) !void {
+        /// Closes an open link run, using the markdown angle-bracket
+        /// URI form when the URI contains the one char that would break
+        /// the plain `(uri)` form.
+        fn closeLink(self: *TextRun) !void {
             if (self.open_link_id == 0) return;
             const a = self.allocator;
             if (self.screen.linkUri(self.open_link_id)) |uri| {
                 try self.out.append(a, ']');
                 try self.out.append(a, '(');
-                const need_angle = angle_escape and std.mem.indexOfScalar(u8, uri, ')') != null;
+                const need_angle = std.mem.indexOfScalar(u8, uri, ')') != null;
                 if (need_angle) try self.out.append(a, '<');
                 try self.out.appendSlice(a, uri);
                 if (need_angle) try self.out.append(a, '>');
@@ -1897,7 +1895,7 @@ pub const Screen = struct {
 
         /// Closes any link still open when the extraction ends.
         fn finish(self: *TextRun) !void {
-            try self.closeLink(false);
+            try self.closeLink();
         }
     };
 
@@ -7778,6 +7776,32 @@ test "extractSelection emits OSC 8 as markdown link" {
     const text = try s.extractSelection(std.testing.allocator);
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("[link](https://example.com) tail", text);
+}
+
+test "extractSelection angle-escapes a ')' URI whether the link closes mid-run or at the end" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 30, 1);
+    defer s.deinit();
+
+    s.onOsc("8;;https://example.com/a_(b)");
+    for ("link") |b| s.printCp(b);
+    s.onOsc("8;;");
+    for (" tail") |b| s.printCp(b);
+
+    // Mid-run close: the plain-text tail follows the link.
+    s.selection.start(0, 0, .normal);
+    s.selection.extend(0, 9);
+    const mid = try s.extractSelection(std.testing.allocator);
+    defer std.testing.allocator.free(mid);
+    try std.testing.expectEqualStrings("[link](<https://example.com/a_(b)>) tail", mid);
+
+    // End-of-extraction close: the selection's last cell is linked.
+    s.selection.start(0, 0, .normal);
+    s.selection.extend(0, 4);
+    const end = try s.extractSelection(std.testing.allocator);
+    defer std.testing.allocator.free(end);
+    try std.testing.expectEqualStrings("[link](<https://example.com/a_(b)>)", end);
 }
 
 /// `CSI > flags u`, the sequence every kitty-protocol application
