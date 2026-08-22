@@ -25,6 +25,7 @@ const cast = @import("util/cast.zig");
 const picker = @import("ui/picker.zig");
 const fpicker = @import("filebrowser/picker.zig");
 const pathZ = @import("util/pathz.zig").pathZ;
+const clock = @import("util/clock.zig");
 
 /// Pending "where do I put this blob?" pick. The encoded bytes are
 /// captured before the picker opens, so they outlive the app window.
@@ -264,22 +265,18 @@ pub const WindowRec = struct {
         return self.gif != null or self.webm != null;
     }
 
-    pub fn nowMs() i64 {
-        return @divTrunc(c.g_get_monotonic_time(), 1000);
-    }
-
     /// Feed one presented frame (wl_shm-style format code: 0 =
     /// premultiplied BGRA, 1 = BGRX). No-op when not recording.
     pub fn addFrame(self: *WindowRec, pixels: []const u8, w: u32, h: u32, format: u32) void {
-        if (self.gif) |*r| r.addShmFrame(pixels, w, h, format, nowMs()) catch {};
-        if (self.webm) |*r| r.addShmFrame(pixels, w, h, format, nowMs()) catch {};
+        if (self.gif) |*r| r.addShmFrame(pixels, w, h, format, clock.nowMs()) catch {};
+        if (self.webm) |*r| r.addShmFrame(pixels, w, h, format, clock.nowMs()) catch {};
     }
 
     /// Toggle: a running recording of EITHER kind stops and offers to
     /// save; otherwise `kind` starts.
     pub fn toggle(self: *WindowRec, allocator: std.mem.Allocator, parent: ?*c.GtkWindow, kind: Kind) void {
         if (self.gif) |*r| {
-            const blob = r.finish(nowMs()) catch {
+            const blob = r.finish(clock.nowMs()) catch {
                 self.gif = null;
                 return;
             };
@@ -290,7 +287,7 @@ pub const WindowRec = struct {
             return;
         }
         if (self.webm) |*r| {
-            const blob = r.finish(nowMs()) catch {
+            const blob = r.finish(clock.nowMs()) catch {
                 self.webm = null;
                 return;
             };
