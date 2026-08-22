@@ -7,6 +7,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const crashlog = @import("../util/crashlog.zig");
+const strz = @import("../util/strz.zig");
 const layout_mod = @import("../layout.zig");
 const Terminal = @import("../terminal.zig").Terminal;
 const Pane = @import("pane.zig").Pane;
@@ -167,11 +168,7 @@ pub fn sessionShown(self: *Window, name: []const u8, host: ?[]const u8) bool {
     return false;
 }
 
-pub fn hostEql(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
-}
+pub const hostEql = strz.eqOpt;
 
 /// Bulk handoff: attach every non-exited session on `host` that
 /// this window isn't already showing. Terminal sessions become

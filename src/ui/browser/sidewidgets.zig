@@ -12,6 +12,7 @@
 const std = @import("std");
 const c = @import("../../c.zig").c;
 const places_mod = @import("../../filebrowser/places.zig");
+const strz = @import("../../util/strz.zig");
 
 const BrowserView = @import("view.zig").BrowserView;
 const places_ui = @import("places.zig");
@@ -364,16 +365,9 @@ fn appendWidgetRow(self: *BrowserView, section: *Section, w: *const Widget, inde
     c.gtk_list_box_append(self.places_list, row);
 }
 
-fn labelZ(text: []const u8, buf: *[512:0]u8) [*:0]const u8 {
-    const n = @min(text.len, buf.len - 1);
-    @memcpy(buf[0..n], text[0..n]);
-    buf[n] = 0;
-    return buf;
-}
-
 fn buildTitle(w: *const Widget) ?*c.GtkWidget {
     var z: [512:0]u8 = undefined;
-    const lab = c.gtk_label_new(labelZ(w.text, &z));
+    const lab = c.gtk_label_new(strz.copyZ(&z, w.text));
     c.gtk_label_set_xalign(@ptrCast(lab), 0);
     c.gtk_label_set_ellipsize(@ptrCast(lab), c.PANGO_ELLIPSIZE_END);
     c.gtk_widget_add_css_class(lab, "heading");
@@ -385,7 +379,7 @@ fn buildTitle(w: *const Widget) ?*c.GtkWidget {
 
 fn buildText(w: *const Widget) ?*c.GtkWidget {
     var z: [512:0]u8 = undefined;
-    const lab = c.gtk_label_new(labelZ(w.text, &z));
+    const lab = c.gtk_label_new(strz.copyZ(&z, w.text));
     c.gtk_label_set_xalign(@ptrCast(lab), 0);
     c.gtk_label_set_wrap(@ptrCast(lab), 1);
     c.gtk_widget_add_css_class(lab, "dim-label");
@@ -422,7 +416,7 @@ fn buildCommand(self: *BrowserView, section: *Section, w: *const Widget, index: 
 fn appendCaption(vbox: *c.GtkWidget, text: []const u8) void {
     if (text.len == 0) return;
     var z: [512:0]u8 = undefined;
-    const cap = c.gtk_label_new(labelZ(text, &z));
+    const cap = c.gtk_label_new(strz.copyZ(&z, text));
     c.gtk_label_set_xalign(@ptrCast(cap), 0);
     c.gtk_widget_add_css_class(cap, "dim-label");
     c.gtk_widget_add_css_class(cap, "caption");

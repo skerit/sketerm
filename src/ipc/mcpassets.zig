@@ -36,11 +36,8 @@ pub const Kind = enum {
 /// text. Anything bigger is a mistake, not an asset.
 pub const MAX_BYTES: usize = 8 << 20;
 
-fn getenv(name: [*:0]const u8) ?[]const u8 {
-    const v = c.getenv(name) orelse return null;
-    const s = std.mem.span(@as([*:0]const u8, @ptrCast(v)));
-    return if (s.len == 0) null else s;
-}
+/// An empty variable reads as unset, like a missing one.
+const getenv = @import("../util/env.zig").nonEmpty;
 
 /// Asset names are file names: short, no separators, no dotfiles.
 pub fn validName(name: []const u8) bool {

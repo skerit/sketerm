@@ -46,11 +46,8 @@ pub const Origin = struct {
     }
 };
 
-fn getenv(name: [*:0]const u8) ?[]const u8 {
-    const value = c.getenv(name) orelse return null;
-    const span = std.mem.span(@as([*:0]const u8, @ptrCast(value)));
-    return if (span.len == 0) null else span;
-}
+/// An empty variable reads as unset, like a missing one.
+const getenv = @import("../util/env.zig").nonEmpty;
 
 pub fn hasEnvironmentSocket() bool {
     return getenv("SKETERM_MUX_SOCKET") != null;

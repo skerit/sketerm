@@ -464,11 +464,8 @@ fn claimCacheNamespace(root: []const u8, pid: c.pid_t) !c_int {
     return fd;
 }
 
-fn getenv(name: [*:0]const u8) ?[]const u8 {
-    const value = c.getenv(name) orelse return null;
-    const bytes = std.mem.span(@as([*:0]const u8, @ptrCast(value)));
-    return if (bytes.len == 0) null else bytes;
-}
+/// An empty variable reads as unset, like a missing one.
+const getenv = @import("../../util/env.zig").nonEmpty;
 
 pub const Resolution = struct {
     logical: []u8,

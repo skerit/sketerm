@@ -3844,12 +3844,10 @@ fn yesNo(v: bool) []const u8 {
 
 // ── file_* tools (fsdrive against the app daemon) ─────────────────
 
+/// An entry's mtime for a listing line: "?" when it has no local
+/// representation, since a blank would misalign the columns.
 fn fsFmtTime(buf: []u8, ms: i64) []const u8 {
-    var t: c.time_t = @intCast(@divTrunc(ms, 1000));
-    var tm: c.struct_tm = undefined;
-    if (c.localtime_r(&t, &tm) == null) return "?";
-    const n = c.strftime(buf.ptr, buf.len, "%Y-%m-%d %H:%M", &tm);
-    return buf[0..n];
+    return clock.localStamp(buf, ms) orelse "?";
 }
 
 fn fsEntryLine(w: *std.Io.Writer, e: fsdrive.Entry) !void {

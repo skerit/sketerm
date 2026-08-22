@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 const model = @import("model.zig");
 const mounts = @import("../util/mounts.zig");
+const strz = @import("../util/strz.zig");
 
 /// A parsed location spec. Bare "/path" keeps the CURRENT host
 /// (current = local when there is no current tab); "local:/path"
@@ -127,11 +128,9 @@ pub fn mountBypass(p: []const u8, out: *BypassHit) bool {
     return true;
 }
 
-pub fn hostEq(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
-}
+/// Host identity comparison: an unset host is "local", and equal to
+/// nothing but another unset host.
+pub const hostEq = strz.eqOpt;
 
 /// The browser host identity for a terminal session's host string.
 /// Transport prefixes are stripped so the spec reads `host:/path` and

@@ -2,6 +2,8 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const strz = @import("../util/strz.zig");
+const clock = @import("../util/clock.zig");
 
 /// A readable, deterministic color for a tag set.
 pub fn tagColorHex(tags: []const u8) []const u8 {
@@ -15,12 +17,7 @@ pub fn tagColorHex(tags: []const u8) []const u8 {
 }
 
 /// Truncating copy into a sentinel buffer of any size (`*[N:0]u8`).
-pub fn copyZN(buf: anytype, text: []const u8) [*:0]const u8 {
-    const n = @min(text.len, buf.len - 1);
-    @memcpy(buf[0..n], text[0..n]);
-    buf[n] = 0;
-    return @ptrCast(buf);
-}
+pub const copyZN = strz.copyZ;
 
 /// Truncating copy into a 256-byte sentinel buffer for GTK label text.
 /// Callers with a differently sized buffer use copyZN; this signature
@@ -140,12 +137,12 @@ pub fn listingStatus(state: ListingState) []const u8 {
     };
 }
 
+/// A file's mtime as `YYYY-MM-DD HH:MM` in local time; an empty
+/// string when it has no local representation (the cell just stays
+/// blank rather than showing a placeholder).
 pub fn fmtTimeZ(buf: *[40:0]u8, ms: i64) [*:0]const u8 {
-    var t: c.time_t = @intCast(@divTrunc(ms, 1000));
-    var tm: c.struct_tm = undefined;
-    if (c.localtime_r(&t, &tm) == null) return "";
-    const n = c.strftime(buf, buf.len - 1, "%Y-%m-%d %H:%M", &tm);
-    buf[n] = 0;
+    const s = clock.localStamp(buf[0 .. buf.len - 1], ms) orelse return "";
+    buf[s.len] = 0;
     return @ptrCast(buf);
 }
 

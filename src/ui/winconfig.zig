@@ -7,6 +7,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const render_kick = @import("../util/render_kick.zig");
+const strz = @import("../util/strz.zig");
 const Config = @import("../config.zig").Config;
 const Pane = @import("pane.zig").Pane;
 const winmod = @import("window.zig");
@@ -1522,11 +1523,7 @@ pub fn freePresetButtonCtx(user: ?*anyopaque) callconv(.c) void {
     ctx.allocator.destroy(ctx);
 }
 
-pub fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return std.mem.eql(u8, a.?, b.?);
-}
+pub const eqOptStr = strz.eqOpt;
 
 pub fn prefsApplyCallback(win_ptr: *anyopaque, new_cfg: *const Config) void {
     const win: *Window = @ptrCast(@alignCast(win_ptr));
@@ -1547,17 +1544,8 @@ pub fn mapCursorShape(shape: @import("../config.zig").CursorShape, blink: bool) 
     };
 }
 
-/// Path the prefs dialog persists to. Honours XDG; falls back to
-/// ~/.config/sketerm/config.conf. Caller frees.
-pub fn resolveConfigSavePath(allocator: std.mem.Allocator) ![]u8 {
-    if (@import("../util/profile.zig").getenv("XDG_CONFIG_HOME")) |x| {
-        return std.fmt.allocPrint(allocator, "{s}/sketerm/config.conf", .{x});
-    }
-    if (@import("../util/profile.zig").getenv("HOME")) |home| {
-        return std.fmt.allocPrint(allocator, "{s}/.config/sketerm/config.conf", .{home});
-    }
-    return error.NoConfigPath;
-}
+/// Path the prefs dialog persists to: the same one the loader reads.
+pub const resolveConfigSavePath = @import("../config.zig").resolveConfigPath;
 
 test "palette apply resets custom ANSI colors to built-in defaults" {
     var screen_palette = palette_default_256;

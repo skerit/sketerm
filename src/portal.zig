@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const fpicker = @import("filebrowser/picker.zig");
+const percent = @import("util/percent.zig");
 
 /// Portal response codes (org.freedesktop.impl.portal.Request).
 pub const RESPONSE_OK: u32 = 0;
@@ -191,12 +192,7 @@ pub fn localPath(spec: []const u8) ?[]const u8 {
 
 // -- file:// URI encoding ----------------------------------------
 
-fn uriByteOk(b: u8) bool {
-    return std.ascii.isAlphanumeric(b) or switch (b) {
-        '-', '.', '_', '~', '/' => true,
-        else => false,
-    };
-}
+const uriByteOk = percent.isFileUriByte;
 
 /// Percent-encode an absolute local path as a file:// URI (RFC 3986
 /// unreserved + '/' kept literal; everything else, UTF-8 bytes

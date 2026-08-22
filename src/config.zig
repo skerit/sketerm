@@ -1504,7 +1504,7 @@ pub const Config = struct {
         const resolved: ?[]u8 = if (override_path) |p|
             allocator.dupe(u8, p) catch null
         else
-            resolveConfigPath(allocator);
+            resolveConfigPath(allocator) catch null;
         if (resolved) |path| {
             defer allocator.free(path);
             if (loadFromPath(allocator, path)) |cfg| {
@@ -1745,11 +1745,7 @@ pub const Config = struct {
         return a != null and eqColor(a.?, b);
     }
 
-    fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
-        if (a == null and b == null) return true;
-        if (a == null or b == null) return false;
-        return std.mem.eql(u8, a.?, b.?);
-    }
+    const eqOptStr = @import("util/strz.zig").eqOpt;
 
     pub fn serialise(self: *const Config, w: *std.Io.Writer) !void {
         try w.writeAll("# sketerm config (auto-saved by Preferences dialog)\n");
@@ -2334,15 +2330,19 @@ fn writePalette16(w: *std.Io.Writer, key: []const u8, pal: [16][3]u8) !void {
 
 const makeParentDirs = @import("util/pathz.zig").makeParentDirs;
 
+/// The config file this user reads and the Preferences dialog writes:
+/// $XDG_CONFIG_HOME/sketerm/config.conf, else ~/.config/sketerm/config.conf.
 /// Allocates the path; caller frees.
-fn resolveConfigPath(allocator: std.mem.Allocator) ?[]u8 {
-    if (@import("util/profile.zig").getenv("XDG_CONFIG_HOME")) |x| {
-        return std.fmt.allocPrint(allocator, "{s}/sketerm/config.conf", .{x}) catch null;
+/// @return error.NoConfigPath when neither variable is set.
+pub fn resolveConfigPath(allocator: std.mem.Allocator) ![]u8 {
+    const env = @import("util/env.zig");
+    if (env.get("XDG_CONFIG_HOME")) |x| {
+        return std.fmt.allocPrint(allocator, "{s}/sketerm/config.conf", .{x});
     }
-    if (@import("util/profile.zig").getenv("HOME")) |home| {
-        return std.fmt.allocPrint(allocator, "{s}/.config/sketerm/config.conf", .{home}) catch null;
+    if (env.get("HOME")) |home| {
+        return std.fmt.allocPrint(allocator, "{s}/.config/sketerm/config.conf", .{home});
     }
-    return null;
+    return error.NoConfigPath;
 }
 
 fn parseInto(cfg: *Config, body: []const u8) !void {

@@ -16,6 +16,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
+const percent = @import("../util/percent.zig");
 
 pub const Tier = enum { normal, large, x_large };
 
@@ -27,14 +28,7 @@ fn tierName(tier: Tier) []const u8 {
     };
 }
 
-/// RFC 3986 unreserved set plus '/'; everything else is %XX-encoded
-/// (matches g_filename_to_uri for ASCII and UTF-8 paths).
-fn isUriSafe(ch: u8) bool {
-    return std.ascii.isAlphanumeric(ch) or switch (ch) {
-        '-', '.', '_', '~', '/' => true,
-        else => false,
-    };
-}
+const isUriSafe = percent.isFileUriByte;
 
 /// Write the file:// URI for an absolute POSIX path.
 pub fn fileUri(path: []const u8, buf: []u8) ?[]const u8 {

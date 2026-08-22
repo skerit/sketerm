@@ -11,6 +11,7 @@ const BrowserView = @import("view.zig").BrowserView;
 const HostConn = @import("types.zig").HostConn;
 const WireJobEv = @import("types.zig").WireJobEv;
 const cast = @import("../../util/cast.zig");
+const strz = @import("../../util/strz.zig");
 
 const STATE_QDATA = "sketerm-disk-usage-state";
 const ROW_QDATA = "sketerm-disk-usage-row";
@@ -149,12 +150,7 @@ fn withinRoot(root: []const u8, path: []const u8) bool {
     return path.len == root.len or root.len == 1 or path[root.len] == '/';
 }
 
-fn zText(buf: []u8, text: []const u8) [*:0]const u8 {
-    const n = @min(buf.len - 1, text.len);
-    @memcpy(buf[0..n], text[0..n]);
-    buf[n] = 0;
-    return @ptrCast(buf.ptr);
-}
+const zText = strz.copyZ;
 
 /// A header button. Framed (this bar is a header, not flat chrome),
 /// but through the shared helper so an icon name the theme cannot

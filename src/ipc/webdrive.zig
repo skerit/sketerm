@@ -55,6 +55,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const pathz = @import("../util/pathz.zig");
+const strz = @import("../util/strz.zig");
 const muxclient = @import("../mux/client.zig");
 const display = @import("../mux/display.zig");
 const proto = @import("../web/protocol.zig");
@@ -1789,12 +1790,7 @@ pub const Engine = struct {
         }
     }
 
-    fn hostListed(hosts: []const []const u8, host: []const u8) bool {
-        for (hosts) |h| {
-            if (std.mem.eql(u8, h, host)) return true;
-        }
-        return false;
-    }
+    const hostListed = strz.contains;
 
     /// Owned list of `old` entries that also appear in `incoming`.
     fn intersectHosts(gpa: std.mem.Allocator, old: []const []const u8, incoming: []const []const u8) ![]const []const u8 {
