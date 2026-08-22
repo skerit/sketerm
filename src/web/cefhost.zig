@@ -8360,6 +8360,7 @@ pub fn interceptDeinit(gpa: std.mem.Allocator) void {
     webrequestDeinit();
     var old: ?*filter.Engine = null;
     var pols: [MAX_ISLOTS]?*netpolicy.Policy = @splat(null);
+    var rings: [MAX_ISLOTS]?*[NLOG]LogEntry = @splat(null);
     {
         g_int.acquire();
         defer g_int.release();
@@ -8368,11 +8369,17 @@ pub fn interceptDeinit(gpa: std.mem.Allocator) void {
         g_int.rules = 0;
         for (&g_int.slots, 0..) |*s, i| {
             if (s.used) {
-                if (s.ring) |r| gpa.destroy(r);
+                rings[i] = s.ring;
                 pols[i] = s.pol;
                 s.* = .{};
             }
         }
+    }
+    // Detached under the lock, freed outside it: an allocator call is
+    // not spinlock work, and nothing can reach a ring once its slot
+    // is cleared.
+    for (rings) |r| {
+        if (r) |ring| gpa.destroy(ring);
     }
     for (pols) |p| {
         if (p) |pol| pol.deinit(gpa);
