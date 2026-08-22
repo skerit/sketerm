@@ -399,7 +399,17 @@ const Popup = struct {
         self.map = null;
         const owner = self.owner;
         if (owner.popup == self) owner.popup = null;
-        if (c.gtk_widget_get_parent(self.widget) != null) c.gtk_widget_unparent(self.widget);
+        if (c.gtk_widget_get_parent(self.widget)) |anchor| {
+            // GTK only MOVES the window's focus out of a hidden popover
+            // on the next frame's after-paint phase; unparenting before
+            // that frame leaves `gtk_window_get_focus` pointing at a
+            // widget with no root, so nothing (focusedPane, a remote
+            // `web-open split`) can resolve the pane the popup sat on.
+            // Hand focus to the anchor now, the same rule the context
+            // menu popover applies.
+            @import("menu.zig").returnFocusTo(anchor, self.widget);
+            c.gtk_widget_unparent(self.widget);
+        }
         c.g_object_unref(@as(?*anyopaque, @ptrCast(self.widget)));
         owner.allocator.destroy(self);
     }

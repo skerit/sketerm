@@ -1571,8 +1571,17 @@ pub const Window = struct {
 
     /// Split the focused pane and give the new pane a web face.
     pub fn newWebSplit(self: *Window, orient: c_uint) !void {
+        const source = self.focusedPane() orelse return error.SplitFailed;
+        try self.newWebSplitOn(source, orient);
+    }
+
+    /// Split a SPECIFIC pane and give the new pane a web face. Remote
+    /// callers (`web-open` where=split) name the pane, or resolve one
+    /// deterministically, rather than trusting wherever GTK focus sits
+    /// at the moment a socket request lands.
+    pub fn newWebSplitOn(self: *Window, source: *Pane, orient: c_uint) !void {
         const before = self.panes.items.len;
-        try self.splitFocused(orient);
+        try self.splitPane(source, orient);
         if (self.panes.items.len <= before) return error.SplitFailed;
         const pane = self.panes.items[self.panes.items.len - 1];
         _ = @import("webface.zig").WebFace.attach(self.allocator, pane, null) catch |err| {
@@ -2590,8 +2599,7 @@ pub const Window = struct {
         // gtk_window_get_focus returns the inner GLArea. Match against
         // p.surface.area, then operate on p.widget() (== the wrapper) for
         // reparenting.
-        const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
-        const focused_pane = self.paneForWidget(focus) orelse return;
+        const focused_pane = self.focusedPane() orelse return;
         try self.splitPane(focused_pane, orientation);
     }
 
@@ -3019,8 +3027,15 @@ pub const Window = struct {
         c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
     }
 
+    /// The pane keyboard focus sits in, or null when there is none. A
+    /// focus widget GTK has not yet moved out of an unparented subtree
+    /// (a popover torn down before the after-paint focus move) has no
+    /// root and belongs to no pane; it is reported as no focus rather
+    /// than walked, so callers fall back instead of silently doing
+    /// nothing.
     pub fn focusedPane(self: *Window) ?*Pane {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return null;
+        if (c.gtk_widget_get_root(focus) == null) return null;
         return self.paneForWidget(focus);
     }
 

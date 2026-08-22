@@ -737,6 +737,32 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_WEB_ACTION_ONLY") != null) {
+        const app = drive orelse return fail("focused browser-action smoke has no display driver");
+        if (!have_web_action) return fail("focused browser-action smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
+        // The full rig reaches this stage with the toplevel holding the
+        // seat keyboard (the real-input stage put it there) and the
+        // helper already warm (the tree-sidebar stage opened a web tab).
+        // Native toolbar actions are only PRESENTED on a focused window,
+        // so give the toplevel focus the way a desktop would and warm
+        // the helper the same way before the stage proper.
+        if (app.windows.items.len == 0) return fail("focused browser-action smoke lost its window");
+        app.focusWindow(app.windows.items[0].id) catch return fail("focused browser-action smoke could not focus the window");
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"web-open\",\"target\":\"tab\"}\n")) |r| allocator.free(r) else
+            return fail("focused browser-action smoke could not warm the browser helper");
+        var warm_tries: u32 = 0;
+        while (warm_tries < 600) : (warm_tries += 1) {
+            const list = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse continue;
+            defer allocator.free(list);
+            if (std.mem.indexOf(u8, list, "\"helper\":\"ready\"") != null) break;
+            _ = app.pumpOnce(100);
+        } else return fail("focused browser-action smoke: the browser helper never became ready");
+        _ = app.waitIdle(300, 8_000);
+        if (webActionGuiStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("browser action: focused WebGroup icon, popup, split and window stage passed");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_EDITOR_ATLAS_ONLY") != null) {
         const app = drive orelse return fail("focused editor atlas smoke has no display driver");
         const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"new-editor-tab\"}\n") orelse
@@ -2969,7 +2995,17 @@ fn webActionGuiStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0
             if (findToolbarColor(app, win_id, .blue) != null) break;
         }
         _ = app.pumpOnce(100);
-    } else return "the browser action never appeared in the real GTK toolbar";
+    } else {
+        if (roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n")) |l| {
+            defer allocator.free(l);
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: web-list at failure: %.*s\n", @as(c_int, @intCast(@min(l.len, 1500))), l.ptr);
+        }
+        if (app.screenshotPng(win_id, 1024, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("/tmp/sketerm-e2e-webaction-fail.png", shot.png);
+        } else |_| {}
+        return "the browser action never appeared in the real GTK toolbar";
+    }
 
     web_helper_pid = helperPidOf(child_pid) orelse return "the browser helper pid could not be identified exactly";
     const blue = findToolbarColor(app, win_id, .blue) orelse return "the first page did not show its blue per-tab action icon";
@@ -8910,14 +8946,18 @@ fn listPaneIds(resp: []const u8, out: []u32) usize {
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, resp, from, "\"id\":")) |at| {
         from = at + 5;
-        // A tab object also carries "id"; only pane objects are
-        // followed by "title" then "cwd".
+        // A tab object also carries "id" (followed by "window"); only
+        // pane objects are followed by "title" and then carry "cwd"
+        // before the next object's id. The title is the shell's cwd
+        // prompt, so its length is unbounded: a fixed byte window after
+        // the id silently listed NO panes from a deep worktree checkout.
         const rest = resp[from..];
         const stop = std.mem.indexOfAny(u8, rest, ",}") orelse break;
         const id = std.fmt.parseInt(u32, rest[0..stop], 10) catch continue;
         const tail = rest[stop..];
         if (!std.mem.startsWith(u8, tail, ",\"title\"")) continue;
-        if (std.mem.indexOf(u8, tail[0..@min(tail.len, 80)], "\"cwd\"") == null) continue;
+        const next_id = std.mem.indexOf(u8, tail, "\"id\":") orelse tail.len;
+        if (std.mem.indexOf(u8, tail[0..next_id], "\"cwd\"") == null) continue;
         if (n < out.len) {
             out[n] = id;
             n += 1;

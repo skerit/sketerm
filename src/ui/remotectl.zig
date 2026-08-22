@@ -991,7 +991,10 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
 
     if (eql(u8, req.cmd, "web-open")) {
         const where = req.target orelse "tab";
-        const win = activeOrSelf(self);
+        // A named pane pins the window: splitting it from another
+        // window's tree would desync that window's model.
+        const named = reqPaneExact(self, req);
+        const win = if (named) |p| ownerWindow(self, p) else activeOrSelf(self);
         var host = win;
         const before = win.panes.items.len;
         if (req.container) |ctn| {
@@ -999,7 +1002,15 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
                 return ipc_protocol.writeErr(out, allocator, "no such container (web-container creates one)");
             try win.newWebTabInContainer(ctn, null);
         } else if (eql(u8, where, "split")) {
-            try win.newWebSplit(c.GTK_ORIENTATION_HORIZONTAL);
+            // The pane the caller named, else the one the user is
+            // looking at. `splitFocused` is wrong here: focus is
+            // whatever GTK last settled on (a just-closed popover, the
+            // sidebar, nothing at all), and "split" then did nothing.
+            const source = named orelse
+                win.focusedPane() orelse
+                win.selectedTabPane() orelse
+                return ipc_protocol.writeErr(out, allocator, "no pane to split");
+            try win.newWebSplitOn(source, c.GTK_ORIENTATION_HORIZONTAL);
         } else if (eql(u8, where, "window")) {
             host = try win.openWebWindow(&.{});
         } else {
