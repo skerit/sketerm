@@ -791,6 +791,30 @@ over, and both are measured, not assumed:
   documents below). Passing the registry's own reference therefore
   freed the context after the FIRST browser, and the second view in the
   same container segfaulted the helper on a freed vtable.
+- **CEF 151 cannot combine shared storage with per-context proxy
+  routing — this is why a browser route is a whole helper INSTANCE per
+  route, not a context inside one profile.**
+  `CefRequestContext::CreateContext(other, handler)` returns a distinct C
+  API object for which `IsSharingWith(other)` is true, but `IsSame(other)`
+  is ALSO true: the two contexts share the preference manager, so a proxy
+  set on one reroutes BOTH. Measured with two real SOCKS5 tunnels: after
+  installing the second context's proxy, every request — the first
+  context's included — traversed that one proxy, and the first context's
+  proxy saw nothing at all. There is therefore no way to give two
+  storage-sharing contexts two different egress routes, and a route gets
+  its own helper process with its own profile and a plain fixed-server
+  proxy instead. The probe frames that measured this were removed; they
+  live on the `spike/cef-routing-experiments` branch.
+- **A malformed proxy preference is NOT protected by `pac_mandatory`.**
+  Of the two PAC forms, only `{mode:"pac_script", pac_url:"data:..."}`
+  works: it routes per-URL and fails CLOSED when the proxy is
+  unreachable. The INLINE `{mode:"pac_script", pac_script:"..."}` key is
+  a silent fail-OPEN — `set_preference` RETURNS SUCCESS, Chromium logs
+  `Proxy settings request PAC script but do not specify its URL. Falling
+  back to direct connection.`, and traffic goes DIRECT despite
+  `pac_mandatory:true`. A caller that builds a proxy preference must
+  validate its own shape; a success return from `set_preference` proves
+  nothing about whether the traffic is actually proxied.
 - **The headless MCP client now points `--cache-dir` at a DURABLE
   store**, not at its volatile instance dir: `$XDG_STATE_HOME/sketerm/
   web-profiles/<instance-key>/` (`src/ipc/webprofiles.zig`). No helper
@@ -874,6 +898,66 @@ Cookie VALUES never cross the wire: `ev_cookies` carries names, scopes,
 flags and the value's LENGTH. smoke-web stage 31 asserts the value byte
 string is absent from the frame, so a future "just add the value, it is
 convenient" change fails there.
+
+## Cookie synchronisation across helper instances (0xE0 block, capability "cookie-sync")
+
+A browser ROUTE is a whole helper INSTANCE with its own profile (the
+measurement two sections up is why). That buys routing correctness by
+construction — a Tor instance has no direct path — and costs a shared
+identity, because separate profiles mean separate cookie jars. This block
+buys the identity back. The GUI subscribes each client with
+`cookie_sync_enable` and fans every observed change out to the others;
+the helper never talks to another helper.
+
+Four facts, each measured, each load-bearing:
+
+- **`can_save_cookie` sees `Set-Cookie` RESPONSE HEADERS AND NOTHING
+  ELSE.** A `document.cookie` write never touches the network stack, so
+  there is no resource request to filter and the filter never fires;
+  neither does anything see a script-side DELETE, since no response
+  header carries a removal. Measured by running smoke-web stage 42 with
+  the reconcile pushed out to 600s: the header phase still passed and the
+  script phase failed with "a document.cookie write reached NEITHER
+  observer". A header-only implementation therefore loses every
+  JS-set token and every logout, silently. Both observers are required.
+- **The reconcile is the other half.** A periodic `visit_all_cookies`
+  walk per context, diffed against a shadow of last-known state
+  (`SKETERM_WEB_COOKIE_SYNC_MS`, default 3s). Header writes are still
+  emitted immediately and folded into the same shadow, so the walk does
+  not re-emit them.
+- **Loop prevention is STRUCTURAL, not a timing window.** An apply marks
+  the identity `pending` BEFORE the engine call and settles the shadow in
+  the engine's completion callback, so a reconcile landing between the
+  two skips that identity — neither ordering of the two async events can
+  emit a spurious change. Two normalisations the engine forces: the
+  shadow is keyed on the DOTLESS domain (`set_cookie` with a non-empty
+  domain reads back with a leading dot, so 140 applies looked like 140
+  removals plus 140 adds), and a settled apply sets a one-shot `adopt`
+  flag so the engine's own rewriting is learned silently. Measured: 283
+  forwarded changes before, 1 after, then zero.
+- **Two engine limits that read as bugs in our code.** Chromium CLAMPS a
+  cookie expiry to 400 days, so a far-future date comes back as
+  today+400d and looks like a dropped expiry; and `set_cookie`
+  re-stamps `creation`/`last_access`, so those two do not survive a round
+  trip. Everything that matters does: value, `Secure`, `HttpOnly`,
+  `SameSite`, priority, path, domain, expiry and persistence.
+
+Deletion goes through `delete_cookies(url, name)` — the NAMED form,
+because the url-only form spares domain cookies, which is exactly how a
+logout fails to propagate. `cookie_dump_req` is PAGED (`SYNC_DUMP_PAGE`
+128 cookies or `SYNC_DUMP_PAGE_BYTES` 512KB, whichever first) so a large
+jar seeds a new instance without one enormous frame; the cursor is an
+index into the engine's visit order, so a write between pages can shift
+the tail by one — it is a seed the change stream then keeps current, not
+a transactional snapshot. A value over 4096 bytes is skipped by the
+IO-thread mailbox (fixed buffers; nothing allocates on CEF's IO thread)
+and picked up by the reconcile instead — late, never truncated.
+
+Nothing streams before `cookie_sync_enable`, and `cookie_sync_enable{0}`
+stops both the walk and the IO-thread observer: the reconcile is linear
+in jar size per pass, so a client that subscribes and never unsubscribes
+pays it forever. smoke-web stage 42 is the proof, across two real
+helpers with separate `--cache-dir`s.
 
 ## Build and packaging
 

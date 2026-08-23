@@ -235,6 +235,7 @@ const axtree = @import("../web/axtree.zig");
 const webproj = @import("../a11y/webproj.zig");
 const a11ydetect = @import("../a11y/detect.zig");
 const webremote = @import("webremote.zig");
+const webroute = @import("../web/route.zig");
 const webgroup = @import("webgroup.zig");
 const Pane = @import("pane.zig").Pane;
 const Window = @import("window.zig").Window;
@@ -586,6 +587,19 @@ pub const Client = struct {
     /// SCM_RIGHTS descriptor ever needs to cross.
     host: [256]u8 = undefined,
     host_len: usize = 0,
+    /// The route this instance realizes. One helper process per route is
+    /// what makes routing correct by construction (see `src/web/route.zig`):
+    /// this instance's profile and proxy are the route's, so it has no path
+    /// to any other one. Stored as kind + lengths rather than a `Spec` with
+    /// slices, so the struct holds no pointers into itself.
+    route_kind: webroute.Kind = .direct,
+    route_host: [256]u8 = undefined,
+    route_host_len: usize = 0,
+    route_endpoint: [64]u8 = undefined,
+    route_endpoint_len: usize = 0,
+    /// Cached `--cache-dir`, minted with the socket path.
+    cache_dir: [128:0]u8 = undefined,
+    cache_dir_len: usize = 0,
     bridge: ?*webremote.Bridge = null,
     /// Storage for a formatted (non-static) unavailable reason; stable
     /// because clients are never freed.
@@ -680,6 +694,16 @@ pub const Client = struct {
         return self.host[0..self.host_len];
     }
 
+    /// This client's route. A `route: Spec` field would hold slices into
+    /// `self`; this rebuilds them instead.
+    pub fn routeSpec(self: *const Client) webroute.Spec {
+        return .{
+            .kind = self.route_kind,
+            .host = self.route_host[0..self.route_host_len],
+            .endpoint = self.route_endpoint[0..self.route_endpoint_len],
+        };
+    }
+
     pub fn isRemote(self: *const Client) bool {
         return self.host_len != 0;
     }
@@ -720,6 +744,15 @@ pub const Client = struct {
         path_z[path.len] = 0;
         _ = c.unlink(&path_z);
 
+        // Derived (and its directories created) in the PARENT: a failure
+        // here must fail the client with a message, not leave a forked
+        // child to exit 127 silently. Null = the default route, which
+        // keeps the helper's own HOME-derived profile.
+        const cache_dir: ?[:0]const u8 = if (self.routeSpec().isDirect()) null else self.makeCacheDir() orelse {
+            self.fail("No usable state directory for this route's browser profile.");
+            return;
+        };
+
         const pid = c.fork();
         if (pid == 0) {
             // stdin/stdout to /dev/null so the helper can never wedge a
@@ -731,7 +764,10 @@ pub const Client = struct {
                 _ = c.dup2(devnull, 1);
                 if (devnull > 2) _ = c.close(devnull);
             }
-            var argv: [4:null]?[*:0]const u8 = .{ bin, "--socket", &path_z, null };
+            var argv: [6:null]?[*:0]const u8 = if (cache_dir) |cd|
+                .{ bin, "--socket", &path_z, "--cache-dir", cd.ptr, null }
+            else
+                .{ bin, "--socket", &path_z, null, null, null };
             _ = c.execv(bin, @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
@@ -863,12 +899,57 @@ pub const Client = struct {
         var dir_buf: [96:0]u8 = undefined;
         const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return null;
         _ = c.mkdir(dir.ptr, 0o700);
-        const p = std.fmt.bufPrint(&self.sock_path, "{s}/{s}{d}.sock", .{
-            dir,
-            @import("../ipc/server.zig").WEB_SOCKET_PREFIX,
-            c.getpid(),
-        }) catch return null;
+        var slug_buf: [64]u8 = undefined;
+        const slug = self.routeSpec().slug(&slug_buf) orelse return null;
+        // The default route keeps the historical path so an upgrade does
+        // not strand the existing profile (and its logins) behind a new
+        // name. Every other route gets its own socket AND its own
+        // `--cache-dir`: two CEF processes sharing a root_cache_path is
+        // measured-fatal (`cef_initialize` fails, "Opening in existing
+        // browser session"), so a collision here would break the browser.
+        const p = if (self.routeSpec().isDirect())
+            std.fmt.bufPrint(&self.sock_path, "{s}/{s}{d}.sock", .{
+                dir,
+                @import("../ipc/server.zig").WEB_SOCKET_PREFIX,
+                c.getpid(),
+            }) catch return null
+        else
+            std.fmt.bufPrint(&self.sock_path, "{s}/{s}{d}-{s}.sock", .{
+                dir,
+                @import("../ipc/server.zig").WEB_SOCKET_PREFIX,
+                c.getpid(),
+                slug,
+            }) catch return null;
         self.sock_len = p.len;
+        return p;
+    }
+
+    /// This route's durable profile directory, or null for the default
+    /// route (which keeps the helper's own HOME-derived default).
+    ///
+    /// It is DURABLE, not per-pid: a route's cookies and logins must
+    /// survive a GUI restart the way the default profile does.
+    fn makeCacheDir(self: *Client) ?[:0]const u8 {
+        if (self.routeSpec().isDirect()) return null;
+        var slug_buf: [64]u8 = undefined;
+        const slug = self.routeSpec().slug(&slug_buf) orelse return null;
+        // Same derivation layout.zig and webprofiles.zig use.
+        var state_buf: [96]u8 = undefined;
+        const state = if (@import("../util/profile.zig").getenv("XDG_STATE_HOME")) |xs|
+            std.fmt.bufPrint(&state_buf, "{s}", .{xs}) catch return null
+        else if (@import("../util/profile.zig").getenv("HOME")) |home|
+            std.fmt.bufPrint(&state_buf, "{s}/.local/state", .{home}) catch return null
+        else
+            return null;
+        var base_buf: [128:0]u8 = undefined;
+        const base = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm", .{state}) catch return null;
+        _ = c.mkdir(base.ptr, 0o700);
+        var routes_buf: [128:0]u8 = undefined;
+        const routes = std.fmt.bufPrintZ(&routes_buf, "{s}/web-routes", .{base}) catch return null;
+        _ = c.mkdir(routes.ptr, 0o700);
+        const p = std.fmt.bufPrintZ(&self.cache_dir, "{s}/{s}", .{ routes, slug }) catch return null;
+        _ = c.mkdir(p.ptr, 0o700);
+        self.cache_dir_len = p.len;
         return p;
     }
 
@@ -1512,28 +1593,59 @@ pub fn client() *Client {
 /// Per-host remote helper clients, minted on first use and — like the
 /// local one — NEVER freed: that immortality is the liveness fence for
 /// every non-widget callback that carries a Client pointer.
-var g_remote_clients: std.ArrayList(*Client) = .empty;
+var g_aux_clients: std.ArrayList(*Client) = .empty;
 
 /// The client serving `host` ("" = the local one), created on demand.
 /// Null only on allocation failure or an over-long host string.
-pub fn clientForHost(gpa: std.mem.Allocator, host: []const u8) ?*Client {
-    if (host.len == 0) return &g_client;
-    for (g_remote_clients.items) |cl| {
-        if (std.mem.eql(u8, cl.hostSlice(), host)) return cl;
+/// The helper instance realizing `spec`, spawning it on first use.
+///
+/// One instance per route is the whole mechanism: stock CEF gives a
+/// profile exactly one proxy, so a tab's route can only be honoured by
+/// putting the tab in a process configured for it. Instances are keyed by
+/// the FULL spec, so `mux:box` and a remote helper on `box` are correctly
+/// different instances.
+///
+/// An invalid spec returns null rather than an instance. That matters:
+/// a `.tor` route with no endpoint would configure NO proxy, and its
+/// instance would browse direct while claiming to be Tor.
+pub fn clientForRoute(gpa: std.mem.Allocator, spec: webroute.Spec) ?*Client {
+    if (spec.isDirect()) return &g_client;
+    if (!spec.valid()) return null;
+    for (g_aux_clients.items) |cl| {
+        if (cl.routeSpec().eql(spec)) return cl;
     }
     const cl = gpa.create(Client) catch return null;
     cl.* = .{};
-    if (host.len > cl.host.len) {
+    if (spec.host.len > cl.route_host.len or spec.endpoint.len > cl.route_endpoint.len) {
         gpa.destroy(cl);
         return null;
     }
-    @memcpy(cl.host[0..host.len], host);
-    cl.host_len = host.len;
-    g_remote_clients.append(gpa, cl) catch {
+    cl.route_kind = spec.kind;
+    @memcpy(cl.route_host[0..spec.host.len], spec.host);
+    cl.route_host_len = spec.host.len;
+    @memcpy(cl.route_endpoint[0..spec.endpoint.len], spec.endpoint);
+    cl.route_endpoint_len = spec.endpoint.len;
+    // `host_len` is what `isRemote` keys on, so only a remote-helper
+    // placement sets it; a tor/mux route runs a LOCAL helper whose
+    // traffic is proxied.
+    if (spec.kind == .remote_browser) {
+        if (spec.host.len > cl.host.len) {
+            gpa.destroy(cl);
+            return null;
+        }
+        @memcpy(cl.host[0..spec.host.len], spec.host);
+        cl.host_len = spec.host.len;
+    }
+    g_aux_clients.append(gpa, cl) catch {
         gpa.destroy(cl);
         return null;
     };
     return cl;
+}
+
+pub fn clientForHost(gpa: std.mem.Allocator, host: []const u8) ?*Client {
+    if (host.len == 0) return &g_client;
+    return clientForRoute(gpa, .{ .kind = .remote_browser, .host = host });
 }
 
 /// The client a face in `container` belongs on: a container with a
@@ -1557,7 +1669,7 @@ fn clientForContainer(gpa: std.mem.Allocator, container: u32) *Client {
 /// wins that lookup by order.
 fn findFaceGlobal(view: u32) ?*WebFace {
     if (g_client.findFace(view)) |f| return f;
-    for (g_remote_clients.items) |cl| {
+    for (g_aux_clients.items) |cl| {
         if (cl.findFace(view)) |f| return f;
     }
     return null;
@@ -1838,7 +1950,7 @@ fn createContainerAtWith(gpa: std.mem.Allocator, spec: ContainerSpec, make_egres
     // Publish to every live helper at once; a helper that starts later
     // gets the whole set replayed by `publishContexts` on connect.
     publishOne(client(), &g_containers.items[g_containers.items.len - 1]);
-    for (g_remote_clients.items) |cl| publishOne(cl, &g_containers.items[g_containers.items.len - 1]);
+    for (g_aux_clients.items) |cl| publishOne(cl, &g_containers.items[g_containers.items.len - 1]);
     return id;
 }
 
@@ -1867,7 +1979,7 @@ pub fn destroyContainer(gpa: std.mem.Allocator, id: u32) bool {
     for (g_containers.items, 0..) |*ctn, i| {
         if (ctn.id != id) continue;
         if (client().state == .ready) client().post(proto.ContextDestroy{ .id = id });
-        for (g_remote_clients.items) |cl| {
+        for (g_aux_clients.items) |cl| {
             if (cl.state == .ready) cl.post(proto.ContextDestroy{ .id = id });
         }
         if (ctn.egress) |eg| {
@@ -2030,7 +2142,7 @@ pub fn setFilterSubscriptions(gpa: std.mem.Allocator, urls: []const []const u8, 
     g_sub_gpa = gpa;
     g_sub_hours = hours;
     publishFilterSubs(&g_client);
-    for (g_remote_clients.items) |cl| publishFilterSubs(cl);
+    for (g_aux_clients.items) |cl| publishFilterSubs(cl);
 }
 
 fn publishFilterSubs(cl: *Client) void {
@@ -2061,9 +2173,9 @@ fn syncActionPresentation(cl: *Client) void {
 fn flushTabs(_: ?*anyopaque) callconv(.c) c.gboolean {
     g_tabs_dirty = false;
     syncActionPresentation(&g_client);
-    for (g_remote_clients.items) |cl| syncActionPresentation(cl);
+    for (g_aux_clients.items) |cl| syncActionPresentation(cl);
     publishTabs(&g_client);
-    for (g_remote_clients.items) |cl| publishTabs(cl);
+    for (g_aux_clients.items) |cl| publishTabs(cl);
     return 0;
 }
 
@@ -2279,10 +2391,10 @@ fn markContainersReady(gpa: std.mem.Allocator) void {
     if (g_containers_loaded) return;
     g_containers_loaded = true;
     publishContexts(client());
-    for (g_remote_clients.items) |cl| publishContexts(cl);
+    for (g_aux_clients.items) |cl| publishContexts(cl);
     rehomeContainerFaces(gpa);
     for (client().faces.items) |f| f.ensureView();
-    for (g_remote_clients.items) |cl| {
+    for (g_aux_clients.items) |cl| {
         for (cl.faces.items) |f| f.ensureView();
     }
 }
@@ -8647,4 +8759,61 @@ test "normalizeUrl percent-encodes searches on the configured engine" {
         "https://duckduckgo.com/?q=two%20words",
         normalizeUrl(&buf, "two words").?,
     );
+}
+
+
+test "one helper instance per route, keyed on the whole spec" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    defer {
+        for (g_aux_clients.items) |cl| gpa.destroy(cl);
+        g_aux_clients.deinit(gpa);
+        g_aux_clients = .empty;
+    }
+
+    // Direct is the process's own client, never a spawned instance.
+    try t.expect(clientForRoute(gpa, .{}) == &g_client);
+    try t.expectEqual(@as(usize, 0), g_aux_clients.items.len);
+
+    const tor = webroute.Spec{ .kind = .tor, .endpoint = "127.0.0.1:9050" };
+    const a = clientForRoute(gpa, tor).?;
+    try t.expect(a != &g_client);
+    // Same route resolves to the SAME instance: two Tor tabs share one
+    // process and therefore one profile.
+    try t.expect(clientForRoute(gpa, tor).? == a);
+    try t.expectEqual(@as(usize, 1), g_aux_clients.items.len);
+
+    // A different endpoint is a different route and a different instance.
+    const b = clientForRoute(gpa, .{ .kind = .tor, .endpoint = "127.0.0.1:9150" }).?;
+    try t.expect(b != a);
+
+    // Mux egress to a host and a remote helper ON that host are distinct.
+    const egress = clientForRoute(gpa, .{ .kind = .mux, .host = "box" }).?;
+    const remote = clientForRoute(gpa, .{ .kind = .remote_browser, .host = "box" }).?;
+    try t.expect(egress != remote);
+    // Only the remote-helper placement is "remote"; a mux route is a
+    // LOCAL helper whose traffic is proxied.
+    try t.expect(!egress.isRemote());
+    try t.expect(remote.isRemote());
+    // clientForHost is the same registry, so it must not double-spawn.
+    try t.expect(clientForHost(gpa, "box").? == remote);
+
+    // The route survives the round trip through the client's buffers.
+    try t.expect(a.routeSpec().eql(tor));
+
+    // An invalid route gets NO instance: a Tor spec with no endpoint
+    // would configure no proxy and browse direct under a Tor label.
+    try t.expect(clientForRoute(gpa, .{ .kind = .tor }) == null);
+    try t.expect(clientForRoute(gpa, .{ .kind = .mux }) == null);
+}
+
+test "routes that differ get different profile directories" {
+    const t = std.testing;
+    // Two CEF processes sharing a root_cache_path is measured-fatal, so
+    // distinct routes must never derive the same slug.
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    const tor = (webroute.Spec{ .kind = .tor, .endpoint = "127.0.0.1:9050" }).slug(&a).?;
+    const mux = (webroute.Spec{ .kind = .mux, .host = "box" }).slug(&b).?;
+    try t.expect(!std.mem.eql(u8, tor, mux));
 }
