@@ -303,6 +303,8 @@ pub const Terminal = struct {
         host: ?[]u8 = null,
         /// UDP firewall range copied from Config for reconnect attempts.
         port_range: []u8 = &.{},
+        /// Numeric Tor SOCKS endpoint copied from Config for reconnects.
+        tor_socks_endpoint: []u8 = &.{},
         /// Preserve a read-only attach across reconnects.
         read_only: bool = false,
         /// Preserve an acquired/requested controller lease across transport
@@ -434,6 +436,7 @@ pub const Terminal = struct {
         generation: u64,
         host: ?[]u8,
         port_range: []u8,
+        tor_socks_endpoint: []u8,
         session: []u8,
         origin_id: []u8,
         pending_rename: ?[]u8,
@@ -452,6 +455,7 @@ pub const Terminal = struct {
             if (self.snapshot) |snapshot| a.free(snapshot);
             if (self.host) |host| a.free(host);
             if (self.port_range.len > 0) a.free(self.port_range);
+            a.free(self.tor_socks_endpoint);
             a.free(self.session);
             if (self.origin_id.len > 0) a.free(self.origin_id);
             if (self.pending_rename) |name| a.free(name);
@@ -583,6 +587,7 @@ pub const Terminal = struct {
         initial_identity: mux_client.AttachIdentity,
         host: ?[]const u8,
         port_range: []const u8,
+        tor_socks_endpoint: []const u8,
         read_only: bool,
         want_control: bool,
     ) !*Terminal {
@@ -617,6 +622,8 @@ pub const Terminal = struct {
         errdefer if (host_owned) |h| allocator.free(h);
         const port_range_owned: []u8 = if (port_range.len > 0) try allocator.dupe(u8, port_range) else &.{};
         errdefer if (port_range_owned.len > 0) allocator.free(port_range_owned);
+        const tor_socks_endpoint_owned = try allocator.dupe(u8, tor_socks_endpoint);
+        errdefer allocator.free(tor_socks_endpoint_owned);
         remote.* = .{
             .conn = conn,
             .session = session_owned,
@@ -624,6 +631,7 @@ pub const Terminal = struct {
             .origin_id = origin_id_owned,
             .host = host_owned,
             .port_range = port_range_owned,
+            .tor_socks_endpoint = tor_socks_endpoint_owned,
             .read_only = read_only,
             .force_control = want_control,
             .event_seq = envelope.seq,
@@ -970,7 +978,15 @@ pub const Terminal = struct {
             a.destroy(job);
             return null;
         } else &.{};
+        const tor_socks_endpoint = a.dupe(u8, remote.tor_socks_endpoint) catch {
+            if (port_range.len > 0) a.free(port_range);
+            if (host) |h| a.free(h);
+            a.free(session);
+            a.destroy(job);
+            return null;
+        };
         const origin_id: []u8 = if (remote.origin_id.len > 0) a.dupe(u8, remote.origin_id) catch {
+            a.free(tor_socks_endpoint);
             if (port_range.len > 0) a.free(port_range);
             if (host) |h| a.free(h);
             a.free(session);
@@ -979,6 +995,7 @@ pub const Terminal = struct {
         } else &.{};
         const pending_rename: ?[]u8 = if (remote.pending_rename) |name| a.dupe(u8, name) catch {
             if (origin_id.len > 0) a.free(origin_id);
+            a.free(tor_socks_endpoint);
             if (port_range.len > 0) a.free(port_range);
             if (host) |h| a.free(h);
             a.free(session);
@@ -990,6 +1007,7 @@ pub const Terminal = struct {
             .generation = remote.reconnect_generation,
             .host = host,
             .port_range = port_range,
+            .tor_socks_endpoint = tor_socks_endpoint,
             .session = session,
             .origin_id = origin_id,
             .pending_rename = pending_rename,
@@ -1038,7 +1056,10 @@ pub const Terminal = struct {
     fn reconnectConnect(a: std.mem.Allocator, job: *const ReconnectJob) !mux_client.Conn {
         const host = job.host orelse return mux_client.Conn.connectLocalAutostart(a);
         if (std.mem.startsWith(u8, host, "sock:")) return mux_client.Conn.connectProbed(a, host[5..]);
-        return mux_client.Conn.connectRemote(a, host, if (job.port_range.len > 0) job.port_range else null);
+        return mux_client.Conn.connectRemote(a, host, .{
+            .udp_port_range = if (job.port_range.len > 0) job.port_range else null,
+            .tor_socks_endpoint = job.tor_socks_endpoint,
+        });
     }
 
     fn reconnectAttach(conn: *mux_client.Conn, session: []const u8, origin_id: []const u8, read_only: bool, control: bool) !mux_client.Conn.OwnedFrame {
@@ -3228,6 +3249,7 @@ pub const Terminal = struct {
             if (remote.connected) remote.conn.deinit();
             if (remote.host) |h| self.allocator.free(h);
             if (remote.port_range.len > 0) self.allocator.free(remote.port_range);
+            self.allocator.free(remote.tor_socks_endpoint);
             if (remote.pending_rename) |p| self.allocator.free(p);
             self.allocator.free(remote.session);
             self.allocator.free(remote.origin_name);

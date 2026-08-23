@@ -136,7 +136,8 @@ pub const hostEq = strz.eqOpt;
 /// Transport prefixes are stripped so the spec reads `host:/path` and
 /// shares its connection with a typed `host:` location (bare = auto
 /// transport, which reuses SSH multiplexing where available); a
-/// `sock:` session's filesystem is the local one.
+/// `sock:` session's filesystem is local; forced Tor remains prefixed so a
+/// derived file-browser connection cannot downgrade to auto transport.
 pub fn browserHost(host: ?[]const u8) ?[]const u8 {
     const h = host orelse return null;
     if (std.mem.startsWith(u8, h, "sock:")) return null;
@@ -535,6 +536,7 @@ test "browserHost strips transport prefixes and localizes sock sessions" {
     try t.expectEqualStrings("dalaran", browserHost("dalaran").?);
     try t.expectEqualStrings("dalaran", browserHost("ssh:dalaran").?);
     try t.expectEqualStrings("me@dalaran", browserHost("udp:me@dalaran").?);
+    try t.expectEqualStrings("tor:me@dalaran", browserHost("tor:me@dalaran").?);
 }
 
 test "unescapeMnt decodes /proc/mounts octal escapes" {

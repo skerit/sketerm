@@ -1138,12 +1138,20 @@ fn startAllFetches(self: *Switcher) void {
     self.updateStatus();
 }
 
-/// A bare user@host suitable for UDP ticket minting; null for the
-/// local daemon and `sock:` instances.
+/// A bare user@host suitable for UDP ticket minting; null for local,
+/// `sock:`, and every forced non-UDP transport.
 fn bareRemoteHost(host: ?[]const u8) ?[]const u8 {
     const value = host orelse return null;
     if (std.mem.startsWith(u8, value, "sock:")) return null;
+    if (!mux_client.udpTicketEligible(value)) return null;
     return mux_client.RemoteSpec.parse(value).host;
+}
+
+test "app switcher never mints UDP tickets for a forced transport" {
+    try std.testing.expect(bareRemoteHost("tor:work-alias") == null);
+    try std.testing.expect(bareRemoteHost("ssh:work-alias") == null);
+    try std.testing.expectEqualStrings("work-alias", bareRemoteHost("udp:work-alias").?);
+    try std.testing.expectEqualStrings("work-alias", bareRemoteHost("work-alias").?);
 }
 
 /// Submit a list poll (`kill_session` null) or a session stop. Stops are

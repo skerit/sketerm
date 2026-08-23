@@ -8,6 +8,7 @@ const wire = @import("wire.zig");
 const sockpath = @import("sockpath.zig");
 const deploy = @import("deploy.zig");
 const rudp = @import("rudp.zig");
+const sshroute = @import("sshroute.zig");
 /// The one publish/stop/release mechanism for interrupting a blocking
 /// socket from another thread; re-exported so SDK consumers can declare
 /// the slot these connect helpers take.
@@ -40,18 +41,13 @@ pub fn parseUdpTicketReply(allocator: std.mem.Allocator, payload: []const u8) ?U
     return ticket;
 }
 
-pub const Transport = enum { local, ssh, udp };
-pub const RemoteMode = enum { auto, ssh, udp };
+pub const Transport = enum { local, ssh, udp, tor };
+pub const RemoteMode = sshroute.Mode;
+pub const RemoteSpec = sshroute.RemoteSpec;
 
-pub const RemoteSpec = struct {
-    host: []const u8,
-    mode: RemoteMode,
-
-    pub fn parse(spec: []const u8) RemoteSpec {
-        if (std.mem.startsWith(u8, spec, "udp:")) return .{ .host = spec[4..], .mode = .udp };
-        if (std.mem.startsWith(u8, spec, "ssh:")) return .{ .host = spec[4..], .mode = .ssh };
-        return .{ .host = spec, .mode = .auto };
-    }
+pub const ConnectOptions = struct {
+    udp_port_range: ?[]const u8 = null,
+    tor_socks_endpoint: []const u8 = @import("socks5_client.zig").DEFAULT_ENDPOINT,
 };
 
 const nowMs = @import("../util/clock.zig").nowMs;
@@ -101,6 +97,21 @@ pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
     return "sketerm-mux";
 }
 
+/// Whether a remote spec may mint or consume a UDP ticket.
+///
+/// A ticket IS a transport choice: riding one dials the daemon over UDP
+/// directly. Every caller used to strip the mode prefix before asking,
+/// so a forced `ssh:` spec silently left its chosen transport and a
+/// forced `tor:` spec would have left Tor entirely. The check lives here,
+/// on the two functions that mint and consume, so a new call site cannot
+/// forget it.
+pub fn udpTicketEligible(spec: []const u8) bool {
+    return switch (RemoteSpec.parse(spec).mode) {
+        .auto, .udp => true,
+        .ssh, .tor => false,
+    };
+}
+
 /// Consume a spawn-time brokered ticket from $SKETERM_UDP_TICKET
 /// ("<host> <port> <keyhex>") when it names `host`. Single-use: the
 /// variable is cleared on a match — the remote listener serves
@@ -108,6 +119,7 @@ pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
 /// timeout on it. Main-thread only (getenv/unsetenv are not
 /// thread-safe against each other).
 pub fn takeTicketFromEnv(host: []const u8) ?UdpTicket {
+    if (!udpTicketEligible(host)) return null;
     const raw = c.getenv("SKETERM_UDP_TICKET") orelse return null;
     const s = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
     var it = std.mem.tokenizeScalar(u8, s, ' ');
@@ -661,15 +673,15 @@ pub const Conn = struct {
     /// helper process (mount, cross-copy job) re-burning the probe
     /// budget the GUI already spent. The memo expires, so UDP gets
     /// retried once the network may have changed.
-    pub fn connectRemote(allocator: std.mem.Allocator, spec: []const u8, port_range: ?[]const u8) !Conn {
+    pub fn connectRemote(allocator: std.mem.Allocator, spec: []const u8, options: ConnectOptions) !Conn {
         if (std.mem.startsWith(u8, spec, "sock:")) return connectProbed(allocator, spec[5..]);
         const remote = RemoteSpec.parse(spec);
         if (remote.mode == .auto and udpMemoDown(remote.host)) {
-            var conn = try connectSsh(allocator, remote.host);
+            var conn = try connectSshRoute(allocator, remote.host, .direct, options.tor_socks_endpoint);
             conn.udp_error = error.UdpRecentlyUnavailable;
             return conn;
         }
-        const conn = try connectRemoteUsing(allocator, spec, port_range, connectUdpAuto, connectUdp, connectSshWithRange);
+        const conn = try connectRemoteUsing(allocator, spec, options, connectUdpAuto, connectUdpForced, connectSshDirect, connectSshTor);
         if (conn.transport == .udp) {
             udpMemoClear(remote.host);
         } else if (remote.mode == .auto and conn.udp_error != null) {
@@ -678,31 +690,41 @@ pub const Conn = struct {
         return conn;
     }
 
-    const RemoteConnector = *const fn (std.mem.Allocator, []const u8, ?[]const u8) anyerror!Conn;
+    const RemoteConnector = *const fn (std.mem.Allocator, []const u8, ConnectOptions) anyerror!Conn;
 
-    fn connectSshWithRange(allocator: std.mem.Allocator, host: []const u8, _: ?[]const u8) !Conn {
-        return connectSsh(allocator, host);
+    fn connectSshDirect(allocator: std.mem.Allocator, host: []const u8, options: ConnectOptions) !Conn {
+        return connectSshRoute(allocator, host, .direct, options.tor_socks_endpoint);
     }
 
-    fn connectUdpAuto(allocator: std.mem.Allocator, host: []const u8, port_range: ?[]const u8) !Conn {
-        return connectUdpFor(allocator, host, port_range, 6_000);
+    fn connectSshTor(allocator: std.mem.Allocator, host: []const u8, options: ConnectOptions) !Conn {
+        return connectSshRoute(allocator, host, .tor, options.tor_socks_endpoint);
+    }
+
+    fn connectUdpAuto(allocator: std.mem.Allocator, host: []const u8, options: ConnectOptions) !Conn {
+        return connectUdpFor(allocator, host, options.udp_port_range, 6_000);
+    }
+
+    fn connectUdpForced(allocator: std.mem.Allocator, host: []const u8, options: ConnectOptions) !Conn {
+        return connectUdp(allocator, host, options.udp_port_range);
     }
 
     fn connectRemoteUsing(
         allocator: std.mem.Allocator,
         spec: []const u8,
-        port_range: ?[]const u8,
+        options: ConnectOptions,
         auto_udp_connect: RemoteConnector,
         forced_udp_connect: RemoteConnector,
         ssh_connect: RemoteConnector,
+        tor_connect: RemoteConnector,
     ) !Conn {
         const remote = RemoteSpec.parse(spec);
         if (!validSshHost(remote.host)) return error.BadPath;
         return switch (remote.mode) {
-            .udp => forced_udp_connect(allocator, remote.host, port_range),
-            .ssh => ssh_connect(allocator, remote.host, port_range),
-            .auto => auto_udp_connect(allocator, remote.host, port_range) catch |udp_err| blk: {
-                var conn = try ssh_connect(allocator, remote.host, port_range);
+            .udp => forced_udp_connect(allocator, remote.host, options),
+            .ssh => ssh_connect(allocator, remote.host, options),
+            .tor => tor_connect(allocator, remote.host, options),
+            .auto => auto_udp_connect(allocator, remote.host, options) catch |udp_err| blk: {
+                var conn = try ssh_connect(allocator, remote.host, options);
                 conn.udp_error = udp_err;
                 break :blk conn;
             },
@@ -848,7 +870,9 @@ pub const Conn = struct {
             udp_host = target.hostname;
         }
 
-        var prepared = deploy.prepare(allocator, host);
+        const deploy_plan = sshroute.Plan.init(host, .direct, @import("socks5_client.zig").DEFAULT_ENDPOINT) catch
+            return error.BadPath;
+        var prepared = deploy.prepare(allocator, &deploy_plan);
         defer if (prepared) |*p| p.deinit();
         var command_buf: [4300:0]u8 = undefined;
         const prepared_command: ?[:0]const u8 = if (prepared) |p| blk: {
@@ -1109,6 +1133,7 @@ pub const Conn = struct {
     /// rides this path, so a NATed remote costs one bounded failure;
     /// callers fall back to the normal transports.
     pub fn connectUdpTicket(allocator: std.mem.Allocator, host: []const u8, ticket: UdpTicket) !Conn {
+        if (!udpTicketEligible(host)) return error.BadPath;
         const bare = RemoteSpec.parse(host).host;
         if (!validSshHost(bare)) return error.BadPath;
         const deadline = nowMs() + 10_000;
@@ -1138,8 +1163,24 @@ pub const Conn = struct {
     /// (BatchMode fails instead of prompting on the protocol pipe).
     /// $SKETERM_SSH overrides the ssh binary (tests fake a remote).
     pub fn connectSsh(allocator: std.mem.Allocator, host: []const u8) !Conn {
+        return connectSshWithEndpoint(allocator, host, @import("socks5_client.zig").DEFAULT_ENDPOINT);
+    }
+
+    /// Route-aware SSH connect; `tor:` is forced and never downgrades.
+    pub fn connectSshWithEndpoint(allocator: std.mem.Allocator, spec: []const u8, tor_endpoint: []const u8) !Conn {
+        const remote = RemoteSpec.parse(spec);
+        const route: sshroute.Route = switch (remote.mode) {
+            .auto, .ssh => .direct,
+            .tor => .tor,
+            .udp => return error.BadPath,
+        };
+        return connectSshRoute(allocator, remote.host, route, tor_endpoint);
+    }
+
+    fn connectSshRoute(allocator: std.mem.Allocator, host: []const u8, route: sshroute.Route, tor_endpoint: []const u8) !Conn {
         if (!validSshHost(host)) return error.BadPath;
-        var prepared = deploy.prepare(allocator, host);
+        const plan = sshroute.Plan.init(host, route, tor_endpoint) catch return error.BadPath;
+        var prepared = deploy.prepare(allocator, &plan);
         defer if (prepared) |*p| p.deinit();
         // `sketerm app` opens TWO connections moments apart (the CLI to
         // spawn the session, then the GUI to attach). When the remote
@@ -1158,9 +1199,9 @@ pub const Conn = struct {
             // demote every remaining attempt to fast "command not
             // found" failures.
             if (prepared) |p| {
-                if (connectSshOnceUsing(allocator, host, p.path, 20_000)) |conn| return conn else |_| {}
+                if (connectSshOnceUsing(allocator, &plan, p.path, 20_000)) |conn| return conn else |_| {}
             }
-            if (connectSshOnceUsing(allocator, host, null, 20_000)) |conn| {
+            if (connectSshOnceUsing(allocator, &plan, null, 20_000)) |conn| {
                 return conn;
             } else |err| {
                 if (attempt + 1 >= 3) return err;
@@ -1173,18 +1214,29 @@ pub const Conn = struct {
     /// callers that must not pay connectSsh's 3x retry inline (e.g.
     /// termdrive's transparent reattach inside a drain path).
     pub fn connectSshOnce(allocator: std.mem.Allocator, host: []const u8) !Conn {
-        if (!validSshHost(host)) return error.BadPath;
+        return connectSshOnceWithEndpoint(allocator, host, @import("socks5_client.zig").DEFAULT_ENDPOINT);
+    }
+
+    pub fn connectSshOnceWithEndpoint(allocator: std.mem.Allocator, spec: []const u8, tor_endpoint: []const u8) !Conn {
+        const remote = RemoteSpec.parse(spec);
+        const route: sshroute.Route = switch (remote.mode) {
+            .auto, .ssh => .direct,
+            .tor => .tor,
+            .udp => return error.BadPath,
+        };
+        if (!validSshHost(remote.host)) return error.BadPath;
+        const plan = sshroute.Plan.init(remote.host, route, tor_endpoint) catch return error.BadPath;
         var prepared = deploy.localPath(allocator);
         defer if (prepared) |*p| p.deinit();
         if (prepared) |p| {
-            if (connectSshOnceUsing(allocator, host, p.path, 5_000)) |conn| return conn else |_| {}
+            if (connectSshOnceUsing(allocator, &plan, p.path, 5_000)) |conn| return conn else |_| {}
         }
-        return connectSshOnceUsing(allocator, host, null, 15_000);
+        return connectSshOnceUsing(allocator, &plan, null, 15_000);
     }
 
-    fn connectSshOnceUsing(allocator: std.mem.Allocator, host: []const u8, remote_mux: ?[]const u8, timeout_ms: c_int) !Conn {
+    fn connectSshOnceUsing(allocator: std.mem.Allocator, plan: *const sshroute.Plan, remote_mux: ?[]const u8, timeout_ms: c_int) !Conn {
         var host_z_buf: [256:0]u8 = undefined;
-        const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{host}) catch return error.BadPath;
+        const host_z = std.fmt.bufPrintZ(&host_z_buf, "{s}", .{plan.destination}) catch return error.BadPath;
         const ssh_env = c.getenv("SKETERM_SSH");
         const ssh_bin: [*:0]const u8 = if (ssh_env != null) ssh_env else "ssh";
 
@@ -1195,42 +1247,27 @@ pub const Conn = struct {
         // exits so the GUI's attach a beat later rides the same master
         // (instant — no second banner exchange). %C is a fixed-length
         // hash, so the socket path stays well under the sun_path limit.
-        const mux = ssh_env == null and deploy.canMultiplex();
-        var argv_buf: [16]?[*:0]const u8 = undefined;
+        var route_args = plan.args(ssh_env == null and deploy.canMultiplex()) catch return error.BadPath;
+        var argv_buf: [32:null]?[*:0]const u8 = .{null} ** 32;
         var n: usize = 0;
-        const push = struct {
-            fn f(buf: *[16]?[*:0]const u8, i: *usize, v: ?[*:0]const u8) void {
-                buf[i.*] = v;
-                i.* += 1;
-            }
-        }.f;
-        push(&argv_buf, &n, ssh_bin);
-        push(&argv_buf, &n, "-T");
-        // The proxy channel carries the mux binary protocol — never X11.
-        // `-x` disables X11 forwarding so a user's `ForwardX11 yes` config
-        // can't print "X11 forwarding request failed" onto the terminal
-        // (and can't perturb the protocol pipe).
-        push(&argv_buf, &n, "-x");
-        push(&argv_buf, &n, "-o");
-        push(&argv_buf, &n, "BatchMode=yes");
-        if (mux) {
-            push(&argv_buf, &n, "-o");
-            push(&argv_buf, &n, "ControlMaster=auto");
-            push(&argv_buf, &n, "-o");
-            push(&argv_buf, &n, "ControlPath=~/.ssh/sketerm-%C");
-            push(&argv_buf, &n, "-o");
-            push(&argv_buf, &n, "ControlPersist=120");
-        }
-        push(&argv_buf, &n, host_z.ptr);
+        argv_buf[n] = ssh_bin;
+        n += 1;
+        route_args.append(&argv_buf, &n) catch return error.BadPath;
+        // Room for destination + up to two command words + the sentinel.
+        if (n + 4 > argv_buf.len) return error.BadPath;
+        argv_buf[n] = host_z.ptr;
+        n += 1;
         var command_buf: [4300:0]u8 = undefined;
         if (remote_mux) |path| {
             const command = std.fmt.bufPrintZ(&command_buf, "exec \"{s}\" --proxy", .{path}) catch return error.BadPath;
-            push(&argv_buf, &n, command.ptr);
+            argv_buf[n] = command.ptr;
+            n += 1;
         } else {
-            push(&argv_buf, &n, "sketerm-mux");
-            push(&argv_buf, &n, "--proxy");
+            argv_buf[n] = "sketerm-mux";
+            argv_buf[n + 1] = "--proxy";
+            n += 2;
         }
-        push(&argv_buf, &n, null);
+        argv_buf[n] = null;
 
         var conn = try spawnOverSocketpair(allocator, ssh_bin, @ptrCast(&argv_buf));
         errdefer conn.deinit();
@@ -1247,7 +1284,7 @@ pub const Conn = struct {
         const w = conn.recvExpectFor(&.{.welcome}, remain) catch return error.SshTransportFailed;
         defer w.deinit(allocator);
         conn.applyWelcome(allocator, w.payload);
-        conn.transport = .ssh;
+        conn.transport = if (plan.route == .tor) .tor else .ssh;
         return conn;
     }
 
@@ -2385,27 +2422,30 @@ test "remote transport specs default to auto and preserve forced modes" {
     const ssh = RemoteSpec.parse("ssh:user@box");
     try t.expectEqual(RemoteMode.ssh, ssh.mode);
     try t.expectEqualStrings("user@box", ssh.host);
+    const tor = RemoteSpec.parse("tor:work-alias");
+    try t.expectEqual(RemoteMode.tor, tor.mode);
+    try t.expectEqualStrings("work-alias", tor.host);
 }
 
-fn fakeUdpSuccess(allocator: std.mem.Allocator, host: []const u8, _: ?[]const u8) !Conn {
+fn fakeUdpSuccess(allocator: std.mem.Allocator, host: []const u8, _: ConnectOptions) !Conn {
     if (!std.mem.eql(u8, host, "box")) return error.BadPath;
     return .{ .allocator = allocator, .fd = -1, .transport = .udp };
 }
 
-fn fakeUdpFailure(_: std.mem.Allocator, _: []const u8, _: ?[]const u8) !Conn {
+fn fakeUdpFailure(_: std.mem.Allocator, _: []const u8, _: ConnectOptions) !Conn {
     return error.SshTransportFailed;
 }
 
-fn fakeSshSuccess(allocator: std.mem.Allocator, host: []const u8, _: ?[]const u8) !Conn {
+fn fakeSshSuccess(allocator: std.mem.Allocator, host: []const u8, _: ConnectOptions) !Conn {
     if (!std.mem.eql(u8, host, "box")) return error.BadPath;
     return .{ .allocator = allocator, .fd = -1, .transport = .ssh };
 }
 
 test "automatic remote transport prefers UDP and falls back to SSH" {
     const t = std.testing;
-    const udp = try Conn.connectRemoteUsing(t.allocator, "box", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess);
+    const udp = try Conn.connectRemoteUsing(t.allocator, "box", .{}, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess, fakeSshSuccess);
     try t.expectEqual(Transport.udp, udp.transport);
-    const ssh = try Conn.connectRemoteUsing(t.allocator, "box", null, fakeUdpFailure, fakeUdpFailure, fakeSshSuccess);
+    const ssh = try Conn.connectRemoteUsing(t.allocator, "box", .{}, fakeUdpFailure, fakeUdpFailure, fakeSshSuccess, fakeSshSuccess);
     try t.expectEqual(Transport.ssh, ssh.transport);
 }
 
@@ -2413,22 +2453,64 @@ test "explicit remote transport never falls back" {
     const t = std.testing;
     try t.expectError(
         error.SshTransportFailed,
-        Conn.connectRemoteUsing(t.allocator, "udp:box", null, fakeUdpFailure, fakeUdpFailure, fakeSshSuccess),
+        Conn.connectRemoteUsing(t.allocator, "udp:box", .{}, fakeUdpFailure, fakeUdpFailure, fakeSshSuccess, fakeSshSuccess),
     );
-    const ssh = try Conn.connectRemoteUsing(t.allocator, "ssh:box", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess);
+    const ssh = try Conn.connectRemoteUsing(t.allocator, "ssh:box", .{}, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess, fakeSshSuccess);
     try t.expectEqual(Transport.ssh, ssh.transport);
+}
+
+test "forced Tor transport never probes UDP or falls back to direct SSH" {
+    const t = std.testing;
+    const Counters = struct {
+        var udp: usize = 0;
+        var ssh: usize = 0;
+        var tor: usize = 0;
+
+        fn udpFn(_: std.mem.Allocator, _: []const u8, _: ConnectOptions) !Conn {
+            udp += 1;
+            return error.TestUnexpectedResult;
+        }
+
+        fn sshFn(_: std.mem.Allocator, _: []const u8, _: ConnectOptions) !Conn {
+            ssh += 1;
+            return error.TestUnexpectedResult;
+        }
+
+        fn torFn(allocator: std.mem.Allocator, host: []const u8, options: ConnectOptions) !Conn {
+            tor += 1;
+            try t.expectEqualStrings("work-alias", host);
+            try t.expectEqualStrings("127.0.0.1:9150", options.tor_socks_endpoint);
+            return .{ .allocator = allocator, .fd = -1, .transport = .tor };
+        }
+    };
+    Counters.udp = 0;
+    Counters.ssh = 0;
+    Counters.tor = 0;
+    const conn = try Conn.connectRemoteUsing(
+        t.allocator,
+        "tor:work-alias",
+        .{ .tor_socks_endpoint = "127.0.0.1:9150" },
+        Counters.udpFn,
+        Counters.udpFn,
+        Counters.sshFn,
+        Counters.torFn,
+    );
+    try t.expectEqual(Transport.tor, conn.transport);
+    try t.expectEqual(@as(usize, 0), Counters.udp);
+    try t.expectEqual(@as(usize, 0), Counters.ssh);
+    try t.expectEqual(@as(usize, 1), Counters.tor);
 }
 
 test "auto fallback records why UDP was not used" {
     const t = std.testing;
-    const ssh = try Conn.connectRemoteUsing(t.allocator, "box", null, fakeUdpFailure, fakeUdpFailure, fakeSshSuccess);
+    const ssh = try Conn.connectRemoteUsing(t.allocator, "box", .{}, fakeUdpFailure, fakeUdpFailure, fakeSshSuccess, fakeSshSuccess);
     try t.expectEqual(Transport.ssh, ssh.transport);
     try t.expectEqual(@as(?anyerror, error.SshTransportFailed), ssh.udp_error);
 
     // A UDP connection and a forced transport must not claim a cause.
-    const udp = try Conn.connectRemoteUsing(t.allocator, "box", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess);
+    const udp = try Conn.connectRemoteUsing(t.allocator, "box", .{}, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess, fakeSshSuccess);
     try t.expectEqual(@as(?anyerror, null), udp.udp_error);
-    const forced = try Conn.connectRemoteUsing(t.allocator, "ssh:box", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess);
+    const forced = try Conn.connectRemoteUsing(t.allocator, "ssh:box", .{}, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess, fakeSshSuccess);
     try t.expectEqual(@as(?anyerror, null), forced.udp_error);
 }
 
@@ -2537,10 +2619,38 @@ test "ssh -G output without a hostname yields no target" {
     try std.testing.expect(Conn.parseSshConfigOutput("user root\nport 22\n", &buf) == null);
 }
 
+test "UDP tickets are refused for every forced non-UDP transport" {
+    const t = std.testing;
+    try t.expect(udpTicketEligible("box"));
+    try t.expect(udpTicketEligible("udp:box"));
+    // Both of these used to strip their prefix and ride the ticket anyway.
+    try t.expect(!udpTicketEligible("ssh:box"));
+    try t.expect(!udpTicketEligible("tor:box"));
+
+    _ = c.setenv("SKETERM_UDP_TICKET", "box 40000 " ++ ("ab" ** rudp.KEY_LEN), 1);
+    defer _ = c.unsetenv("SKETERM_UDP_TICKET");
+    try t.expect(takeTicketFromEnv("ssh:box") == null);
+    try t.expect(takeTicketFromEnv("tor:box") == null);
+    // Still present for an eligible spec: the refusals above consumed nothing.
+    try t.expect(takeTicketFromEnv("box") != null);
+}
+
+test "a ticket connection refuses a forced non-UDP spec" {
+    const ticket = UdpTicket{ .port = 40000, .key = @splat('a') };
+    try std.testing.expectError(
+        error.BadPath,
+        Conn.connectUdpTicket(std.testing.allocator, "tor:box", ticket),
+    );
+    try std.testing.expectError(
+        error.BadPath,
+        Conn.connectUdpTicket(std.testing.allocator, "ssh:box", ticket),
+    );
+}
+
 test "remote transports reject option-shaped hosts" {
     try std.testing.expectError(
         error.BadPath,
-        Conn.connectRemoteUsing(std.testing.allocator, "-oProxyCommand=bad", null, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess),
+        Conn.connectRemoteUsing(std.testing.allocator, "-oProxyCommand=bad", .{}, fakeUdpSuccess, fakeUdpSuccess, fakeSshSuccess, fakeSshSuccess),
     );
 }
 

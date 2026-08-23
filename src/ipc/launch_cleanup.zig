@@ -3,6 +3,7 @@
 const std = @import("std");
 const muxclient = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
+const muxconnect = @import("muxconnect.zig");
 
 pub const Reconnect = struct {
     ctx: *anyopaque,
@@ -114,7 +115,7 @@ pub const Guard = struct {
             return custom.connect(custom.ctx, allocator);
         return switch (self.endpoint.target) {
             .local => |sock| muxclient.Conn.connectLocalAutostartAt(allocator, sock),
-            .remote => |host| muxclient.Conn.connectSshOnce(allocator, host),
+            .remote => |host| muxconnect.connectSshOnce(allocator, host),
         };
     }
 };

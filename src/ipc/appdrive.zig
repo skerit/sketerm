@@ -22,6 +22,7 @@ const evkeys = @import("evkeys.zig");
 const xkblayout = @import("xkblayout.zig");
 const keymaps = @import("../wlhost/keymaps.zig");
 const launch_cleanup = @import("launch_cleanup.zig");
+const muxconnect = @import("muxconnect.zig");
 
 const nowMs = @import("../util/clock.zig").nowMs;
 
@@ -84,7 +85,7 @@ fn setStepErr(step: []const u8, conn: *muxclient.Conn, err: anyerror) void {
 /// semantics: caller frees with allocator.free).
 pub fn listInstalledApps(allocator: std.mem.Allocator, host: ?[]const u8, local_sock: ?[]const u8) Error![]u8 {
     var conn = blk: {
-        if (host) |h| break :blk muxclient.Conn.connectSsh(allocator, h) catch return Error.SpawnFailed;
+        if (host) |h| break :blk muxconnect.connectSsh(allocator, h) catch return Error.SpawnFailed;
         break :blk muxclient.Conn.connectLocalAutostartAt(allocator, local_sock) catch return Error.SpawnFailed;
     };
     defer conn.deinit();
@@ -601,7 +602,7 @@ pub const App = struct {
         var layout: ?xkblayout.Layout = xkblayout.parse(allocator, blob) catch null;
         errdefer if (layout) |*l| l.deinit(allocator);
         var conn = blk: {
-            if (opts.host) |h| break :blk muxclient.Conn.connectSsh(allocator, h) catch |err| {
+            if (opts.host) |h| break :blk muxconnect.connectSsh(allocator, h) catch |err| {
                 setLaunchErr("ssh connect to {s}: {s}", .{ h, @errorName(err) });
                 return Error.SpawnFailed;
             };
@@ -926,7 +927,7 @@ pub const App = struct {
         const a = self.allocator;
         const deadline = nowMs() + 10_000;
         var conn = blk: {
-            if (self.ssh_host) |h| break :blk muxclient.Conn.connectSsh(a, h) catch return;
+            if (self.ssh_host) |h| break :blk muxconnect.connectSsh(a, h) catch return;
             break :blk muxclient.Conn.connectLocalAutostartAt(a, self.local_sock) catch return;
         };
         defer conn.deinit();
@@ -1435,7 +1436,7 @@ pub const App = struct {
         const a = self.allocator;
         const deadline = nowMs() + timeout_ms;
         var conn = blk: {
-            if (self.ssh_host) |h| break :blk muxclient.Conn.connectSsh(a, h) catch return Error.NotConnected;
+            if (self.ssh_host) |h| break :blk muxconnect.connectSsh(a, h) catch return Error.NotConnected;
             break :blk muxclient.Conn.connectLocalAutostartAt(a, self.local_sock) catch return Error.NotConnected;
         };
         defer conn.deinit();

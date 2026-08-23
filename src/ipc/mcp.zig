@@ -3750,6 +3750,8 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
 
     try res.fact("ssh", findExecutable(arena, "ssh") != null);
     try res.fact("scp", findExecutable(arena, "scp") != null);
+    try res.fact("mux_tor", true);
+    try res.text("mux Tor transport: supported via tor:<ssh-alias>; forced SOCKS5 remote DNS, with no UDP or direct fallback");
     if (rec_state.enabled) {
         if (recDir()) |d| try res.fact("terminal_recordings", d) else try res.raw("terminal_recordings", "null");
         try res.text("every headless terminal is auto-recorded as an asciicast v2 .cast file there (replay with asciinema play)");

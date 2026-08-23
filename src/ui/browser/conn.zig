@@ -41,6 +41,8 @@ pub const ConnectCtx = struct {
     /// worker cannot touch the config arena, which may be swapped
     /// by a reload while the connect is in flight.
     port_range: []u8 = &.{},
+    /// Owned numeric Tor proxy endpoint for the same config-arena reason.
+    tor_socks_endpoint: []u8 = &.{},
     /// Brokered UDP connection ticket (env from the spawning GUI, or
     /// minted in-process over a live terminal connection). The worker
     /// tries it first and falls back to the normal transports.
@@ -107,20 +109,30 @@ pub fn hostConnFor(self: *BrowserView, host: ?[]const u8) ?*HostConn {
     if (cfg.udpRange()) |range| {
         ctx.port_range = self.allocator.dupe(u8, range) catch &.{};
     }
+    ctx.tor_socks_endpoint = self.allocator.dupe(u8, cfg.mux_tor_socks_endpoint) catch {
+        if (ctx.port_range.len > 0) self.allocator.free(ctx.port_range);
+        self.allocator.free(ctx.host);
+        self.allocator.destroy(ctx);
+        hc.state = .dead;
+        self.setStatus("cannot allocate remote route");
+        return hc;
+    };
     // Connection-ticket brokering: reach a UDP host's daemon over a
     // pre-minted single-use listener instead of a fresh ssh bootstrap.
     // A spawned files process gets its ticket from the GUI via env; a
     // browser pane inside the terminal GUI mints one over a live UDP
     // terminal connection to the same host (async — the worker thread
     // starts when the mint resolves, ticket or not).
-    if (muxclient.takeTicketFromEnv(ctx.host)) |ticket| {
-        ctx.ticket = ticket;
-    } else if (self.ownerWindow()) |win| {
-        const remotectl = @import("../remotectl.zig");
-        const bare = muxclient.RemoteSpec.parse(ctx.host).host;
-        if (remotectl.mintUdpTicket(win, bare, @ptrCast(ctx), onMintForConnect)) {
-            self.setStatusFmt("connecting to {s}…", .{host.?});
-            return hc;
+    const remote_spec = muxclient.RemoteSpec.parse(ctx.host);
+    if (muxclient.udpTicketEligible(ctx.host)) {
+        if (muxclient.takeTicketFromEnv(ctx.host)) |ticket| {
+            ctx.ticket = ticket;
+        } else if (self.ownerWindow()) |win| {
+            const remotectl = @import("../remotectl.zig");
+            if (remotectl.mintUdpTicket(win, remote_spec.host, @ptrCast(ctx), onMintForConnect)) {
+                self.setStatusFmt("connecting to {s}…", .{host.?});
+                return hc;
+            }
         }
     }
     startConnectThread(ctx);
@@ -138,6 +150,7 @@ fn onMintForConnect(user: ?*anyopaque, ticket: ?muxclient.UdpTicket) void {
     const allocator = ctx.allocator;
     if (hc.orphaned) {
         if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
+        if (ctx.tor_socks_endpoint.len > 0) allocator.free(ctx.tor_socks_endpoint);
         allocator.free(ctx.host);
         allocator.destroy(ctx);
         if (hc.host) |h| allocator.free(h);
@@ -147,6 +160,7 @@ fn onMintForConnect(user: ?*anyopaque, ticket: ?muxclient.UdpTicket) void {
     if (hc.view.widgets_dead) {
         hc.state = .dead;
         if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
+        if (ctx.tor_socks_endpoint.len > 0) allocator.free(ctx.tor_socks_endpoint);
         allocator.free(ctx.host);
         allocator.destroy(ctx);
         return;
@@ -169,6 +183,7 @@ fn startConnectThread(ctx: *ConnectCtx) void {
         const why = std.fmt.bufPrint(&buf, "cannot connect to {s}", .{hc.label()}) catch "cannot connect";
         view.failPendingListings(hc, why);
         if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
+        if (ctx.tor_socks_endpoint.len > 0) allocator.free(ctx.tor_socks_endpoint);
         allocator.free(ctx.host);
         allocator.destroy(ctx);
         return;
@@ -190,7 +205,7 @@ pub fn connectThreadMain(ctx: *ConnectCtx) void {
     const result = muxclient.Conn.connectRemote(
         alloc,
         ctx.host,
-        if (ctx.port_range.len > 0) ctx.port_range else null,
+        connectOptions(ctx),
     );
     if (result) |conn| {
         ctx.result = upgradeReconnect(alloc, ctx, conn);
@@ -212,7 +227,7 @@ fn upgradeReconnect(alloc: std.mem.Allocator, ctx: *ConnectCtx, conn: muxclient.
     if (muxclient.Conn.connectRemote(
         alloc,
         ctx.host,
-        if (ctx.port_range.len > 0) ctx.port_range else null,
+        connectOptions(ctx),
     )) |fresh| {
         return fresh;
     } else |_| {
@@ -226,6 +241,7 @@ pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     const allocator = ctx.allocator;
     defer {
         if (ctx.port_range.len > 0) allocator.free(ctx.port_range);
+        if (ctx.tor_socks_endpoint.len > 0) allocator.free(ctx.tor_socks_endpoint);
         allocator.free(ctx.host);
         allocator.destroy(ctx);
     }
@@ -277,6 +293,13 @@ pub fn onConnectIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
         view.failPendingListings(hc, why);
     }
     return 0;
+}
+
+fn connectOptions(ctx: *const ConnectCtx) muxclient.ConnectOptions {
+    return .{
+        .udp_port_range = if (ctx.port_range.len > 0) ctx.port_range else null,
+        .tor_socks_endpoint = ctx.tor_socks_endpoint,
+    };
 }
 
 /// Refuse every in-flight listing on `hc`, recording `reason` where

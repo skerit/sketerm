@@ -15,6 +15,7 @@ const lsp_servers = @import("lsp/servers.zig");
 const filtersub = @import("web/filtersub.zig");
 const atomicwrite = @import("util/atomicwrite.zig");
 const diag = @import("util/diag.zig");
+const socks5_client = @import("mux/socks5_client.zig");
 pub const titlefmt = @import("util/titlefmt.zig");
 
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
@@ -655,14 +656,18 @@ pub const Profile = struct {
 /// `[domain.<name>]` sections — named remote mux endpoints, so the
 /// palette / `sketerm mux <name>` can offer "new tab on devbox"
 /// without retyping hosts.
-pub const DomainTransport = enum { auto, ssh, udp };
+pub const DomainTransport = enum { auto, ssh, udp, tor };
 
 pub const Domain = struct {
     name: []const u8,
     /// SSH endpoint, "host" or "user@host". Empty = section ignored.
     host: []const u8 = "",
-    /// Auto probes roaming UDP first and falls back to SSH.
+    /// Auto probes roaming UDP first and falls back to SSH; Tor is forced SSH
+    /// through the configured SOCKS5 endpoint with no direct fallback.
     transport: DomainTransport = .auto,
+    /// Parse-time only: the `host` value carried a `tor:` prefix, so a
+    /// conflicting `transport` key in the same section is an error.
+    host_forced_tor: bool = false,
 
     /// Allocate the transport-prefixed host string the durable-tab
     /// plumbing speaks (bare = auto, "udp:"/"ssh:" = forced).
@@ -671,6 +676,7 @@ pub const Domain = struct {
             .auto => allocator.dupe(u8, self.host),
             .ssh => std.fmt.allocPrint(allocator, "ssh:{s}", .{self.host}),
             .udp => std.fmt.allocPrint(allocator, "udp:{s}", .{self.host}),
+            .tor => std.fmt.allocPrint(allocator, "tor:{s}", .{self.host}),
         };
     }
 };
@@ -848,6 +854,9 @@ pub const Config = struct {
     /// bootstrap (mosh-style; firewalls usually need a pinned range
     /// like "60000:61000"). Empty = ephemeral port.
     mux_udp_port_range: []const u8 = "",
+    /// Numeric SOCKS5 endpoint used by forced `tor:` mux routes. Numeric-only
+    /// ensures resolving the proxy itself can never leak through local DNS.
+    mux_tor_socks_endpoint: []const u8 = socks5_client.DEFAULT_ENDPOINT,
     /// Smart copy: when no selection is active, Ctrl+Shift+C
     /// forwards as Ctrl+C (interrupt) instead of being a no-op.
     smart_copy: bool = true,
@@ -1363,6 +1372,13 @@ pub const Config = struct {
         return if (self.mux_udp_port_range.len > 0) self.mux_udp_port_range else null;
     }
 
+    pub fn muxConnectOptions(self: *const Config) @import("mux/client.zig").ConnectOptions {
+        return .{
+            .udp_port_range = self.udpRange(),
+            .tor_socks_endpoint = self.mux_tor_socks_endpoint,
+        };
+    }
+
     /// Deep-copy every heap-backed field (strings, keybinds, profiles)
     /// into `arena`. The returned copy carries NO arena of its own —
     /// the caller's arena owns the memory. Use this to decouple a
@@ -1406,6 +1422,7 @@ pub const Config = struct {
         out.app_keyboard_layout = try arena.dupe(u8, self.app_keyboard_layout);
         out.gpu_apps = try arena.dupe(u8, self.gpu_apps);
         out.mux_udp_port_range = try arena.dupe(u8, self.mux_udp_port_range);
+        out.mux_tor_socks_endpoint = try arena.dupe(u8, self.mux_tor_socks_endpoint);
         out.default_profile = try arena.dupe(u8, self.default_profile);
         out.editor_theme = try arena.dupe(u8, self.editor_theme);
         out.editor_project_markers = try arena.dupe(u8, self.editor_project_markers);
@@ -1810,6 +1827,8 @@ pub const Config = struct {
         if (self.gpu_apps.len > 0) try w.print("gpu_apps = {s}\n", .{self.gpu_apps});
         if (self.mux_udp_port_range.len > 0)
             try w.print("mux_udp_port_range = {s}\n", .{self.mux_udp_port_range});
+        if (!std.mem.eql(u8, self.mux_tor_socks_endpoint, socks5_client.DEFAULT_ENDPOINT))
+            try w.print("mux_tor_socks_endpoint = {s}\n", .{self.mux_tor_socks_endpoint});
 
         // File browser.
         if (self.files_default_view != .details)
@@ -2036,7 +2055,16 @@ pub const Config = struct {
 
         for (self.domains.items) |dom| {
             try w.print("\n[domain.{s}]\n", .{dom.name});
-            if (dom.host.len > 0) try w.print("host = {s}\n", .{dom.host});
+            if (dom.host.len > 0) {
+                // The prefix is deliberately redundant with transport=tor:
+                // old versions preserve host but reject the new enum. The
+                // leading '-' then trips their option-shaped-host guard, so a
+                // save there remains fail-closed and a new version recovers it.
+                if (dom.transport == .tor)
+                    try w.print("host = -tor:{s}\n", .{dom.host})
+                else
+                    try w.print("host = {s}\n", .{dom.host});
+            }
             if (dom.transport != .auto) try w.print("transport = {s}\n", .{@tagName(dom.transport)});
         }
 
@@ -2609,14 +2637,35 @@ fn applyMcpKv(prof: *McpProfile, arena: std.mem.Allocator, key: []const u8, valu
 
 fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     if (std.mem.eql(u8, key, "host")) {
-        dom.host = try arena.dupe(u8, value);
+        const tor_prefix_len: usize = if (std.mem.startsWith(u8, value, "-tor:"))
+            5
+        else if (std.mem.startsWith(u8, value, "tor:"))
+            4
+        else
+            0;
+        if (tor_prefix_len != 0) {
+            if (value.len == tor_prefix_len) return error.BadTransport;
+            dom.host = try arena.dupe(u8, value[tor_prefix_len..]);
+            dom.transport = .tor;
+            dom.host_forced_tor = true;
+        } else {
+            dom.host = try arena.dupe(u8, value);
+        }
     } else if (std.mem.eql(u8, key, "transport")) {
+        // A `tor:`-prefixed host is a forced route, so a later `transport`
+        // key may not quietly demote it: last-writer-wins here would turn
+        // `host = tor:h` + `transport = udp` into a direct UDP dial.
         if (std.mem.eql(u8, value, "auto")) {
+            if (dom.host_forced_tor) return error.BadTransport;
             dom.transport = .auto;
         } else if (std.mem.eql(u8, value, "ssh")) {
+            if (dom.host_forced_tor) return error.BadTransport;
             dom.transport = .ssh;
         } else if (std.mem.eql(u8, value, "udp")) {
+            if (dom.host_forced_tor) return error.BadTransport;
             dom.transport = .udp;
+        } else if (std.mem.eql(u8, value, "tor")) {
+            dom.transport = .tor;
         } else return error.BadTransport;
     } else return error.UnknownKey;
 }
@@ -2998,6 +3047,9 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         const hi = try std.fmt.parseInt(u16, value[colon + 1 ..], 10);
         if (lo == 0 or hi < lo) return error.BadPortRange;
         cfg.mux_udp_port_range = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "mux_tor_socks_endpoint")) {
+        _ = socks5_client.Endpoint.parse(value) catch return error.BadTorSocksEndpoint;
+        cfg.mux_tor_socks_endpoint = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "exit_action")) {
         if (std.mem.eql(u8, value, "close")) cfg.exit_action = .close
         else if (std.mem.eql(u8, value, "restart")) cfg.exit_action = .restart
@@ -4210,6 +4262,8 @@ test "config: later keybind for same action overrides earlier" {
 
 test "config: [domain.name] sections parse, resolve, round-trip" {
     const body =
+        \\mux_tor_socks_endpoint = 127.0.0.1:9150
+        \\
         \\[domain.devbox]
         \\host = skerit@192.168.1.2
         \\transport = udp
@@ -4221,15 +4275,21 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
         \\host = old.example.com
         \\transport = ssh
         \\
+        \\[domain.onion]
+        \\host = hidden-service.invalid
+        \\transport = tor
+        \\
     ;
     var cfg = try Config.loadFromBytes(std.testing.allocator, body);
     defer cfg.deinit();
 
-    try std.testing.expectEqual(@as(usize, 3), cfg.domains.items.len);
+    try std.testing.expectEqual(@as(usize, 4), cfg.domains.items.len);
+    try std.testing.expectEqualStrings("127.0.0.1:9150", cfg.mux_tor_socks_endpoint);
     try std.testing.expectEqualStrings("skerit@192.168.1.2", cfg.domains.items[0].host);
     try std.testing.expectEqual(.udp, cfg.domains.items[0].transport);
     try std.testing.expectEqual(.auto, cfg.domains.items[1].transport);
     try std.testing.expectEqual(.ssh, cfg.domains.items[2].transport);
+    try std.testing.expectEqual(.tor, cfg.domains.items[3].transport);
 
     const spec = cfg.resolveDomain("devbox", std.testing.allocator).?;
     defer std.testing.allocator.free(spec);
@@ -4240,6 +4300,9 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
     const spec3 = cfg.resolveDomain("legacy", std.testing.allocator).?;
     defer std.testing.allocator.free(spec3);
     try std.testing.expectEqualStrings("ssh:old.example.com", spec3);
+    const spec4 = cfg.resolveDomain("onion", std.testing.allocator).?;
+    defer std.testing.allocator.free(spec4);
+    try std.testing.expectEqualStrings("tor:hidden-service.invalid", spec4);
     try std.testing.expect(cfg.resolveDomain("nope", std.testing.allocator) == null);
 
     // Round-trip via serialise.
@@ -4248,11 +4311,54 @@ test "config: [domain.name] sections parse, resolve, round-trip" {
     try cfg.serialise(&w);
     var cfg2 = try Config.loadFromBytes(std.testing.allocator, w.buffered());
     defer cfg2.deinit();
-    try std.testing.expectEqual(@as(usize, 3), cfg2.domains.items.len);
+    try std.testing.expectEqual(@as(usize, 4), cfg2.domains.items.len);
     try std.testing.expectEqual(.udp, cfg2.domains.items[0].transport);
     try std.testing.expectEqual(.auto, cfg2.domains.items[1].transport);
     try std.testing.expectEqual(.ssh, cfg2.domains.items[2].transport);
+    try std.testing.expectEqual(.tor, cfg2.domains.items[3].transport);
     try std.testing.expectEqualStrings("build.example.com", cfg2.domains.items[1].host);
+    try std.testing.expectEqualStrings("127.0.0.1:9150", cfg2.mux_tor_socks_endpoint);
+
+    // A pre-Tor binary ignores `transport = tor` but preserves this host
+    // line when it serializes. The new parser must recover the forced route.
+    var downgraded = try Config.loadFromBytes(std.testing.allocator, "[domain.onion]\nhost = -tor:hidden-service.invalid\n");
+    defer downgraded.deinit();
+    try std.testing.expectEqual(.tor, downgraded.domains.items[0].transport);
+    try std.testing.expectEqualStrings("hidden-service.invalid", downgraded.domains.items[0].host);
+}
+
+test "config: a conflicting transport key cannot demote a tor: host" {
+    // The key parser records a diagnostic and skips a rejected value, so
+    // refusing the demotion leaves the forced route in place instead of
+    // last-writer-wins turning `host = tor:h` into a direct UDP dial.
+    var demote_udp = try Config.loadFromBytes(std.testing.allocator, "[domain.x]\nhost = tor:h\ntransport = udp\n");
+    defer demote_udp.deinit();
+    try std.testing.expectEqual(.tor, demote_udp.domains.items[0].transport);
+    try std.testing.expectEqualStrings("h", demote_udp.domains.items[0].host);
+
+    var demote_auto = try Config.loadFromBytes(std.testing.allocator, "[domain.x]\nhost = -tor:h\ntransport = auto\n");
+    defer demote_auto.deinit();
+    try std.testing.expectEqual(.tor, demote_auto.domains.items[0].transport);
+
+    // The redundant-but-agreeing pair the serializer itself writes is fine.
+    var ok = try Config.loadFromBytes(std.testing.allocator, "[domain.x]\nhost = -tor:h\ntransport = tor\n");
+    defer ok.deinit();
+    try std.testing.expectEqual(.tor, ok.domains.items[0].transport);
+    try std.testing.expectEqualStrings("h", ok.domains.items[0].host);
+
+    // A plain host still honours every transport key.
+    var plain = try Config.loadFromBytes(std.testing.allocator, "[domain.x]\nhost = h\ntransport = udp\n");
+    defer plain.deinit();
+    try std.testing.expectEqual(.udp, plain.domains.items[0].transport);
+}
+
+test "config: Tor SOCKS endpoint rejects names and zero ports" {
+    var named = try Config.loadFromBytes(std.testing.allocator, "mux_tor_socks_endpoint = localhost:9050\n");
+    defer named.deinit();
+    try std.testing.expectEqualStrings(socks5_client.DEFAULT_ENDPOINT, named.mux_tor_socks_endpoint);
+    var zero = try Config.loadFromBytes(std.testing.allocator, "mux_tor_socks_endpoint = 127.0.0.1:0\n");
+    defer zero.deinit();
+    try std.testing.expectEqualStrings(socks5_client.DEFAULT_ENDPOINT, zero.mux_tor_socks_endpoint);
 }
 
 test "config: [mcp.name] sections parse and round-trip" {

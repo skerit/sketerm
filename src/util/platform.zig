@@ -13,6 +13,18 @@ const c = @import("../c.zig").c;
 pub const is_linux = builtin.os.tag == .linux;
 pub const is_macos = builtin.os.tag == .macos;
 
+extern fn _NSGetEnviron() [*c][*c][*c]u8;
+
+/// Empty the process environment without depending on Darwin's missing clearenv declaration.
+pub fn clearEnvironment() void {
+    if (is_linux) {
+        _ = c.clearenv();
+    } else {
+        const slot = _NSGetEnviron();
+        if (slot != null and slot[0] != null) slot[0][0] = null;
+    }
+}
+
 /// Clears libc's thread-local errno before an API whose sentinel is ambiguous.
 pub fn clearErrno() void {
     if (is_linux)
