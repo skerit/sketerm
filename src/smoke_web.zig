@@ -91,6 +91,40 @@ const sitedata_view_id: u32 = 8;
 /// The cookie stage 31's page sets from its own script.
 const cookie_probe = "sk_probe";
 const cookie_probe_value = "abcd1234";
+
+/// Stage 41 (cross-instance cookie sync). Two names, because the two
+/// OBSERVERS in the helper cover different writes and the stage has to
+/// be able to say which one carried which: `sync_hdr_cookie` arrives on
+/// a `Set-Cookie` response header, `sync_js_cookie` is written by
+/// `document.cookie` and no header ever mentions it.
+const sync_hdr_cookie = "sk_sync_hdr";
+const sync_hdr_value = "hdr-value-9f3a";
+const sync_js_cookie = "sk_sync_js";
+const sync_js_value = "js-value-71c2";
+/// The synthetic cookie the attribute round trip is measured on: it
+/// carries every attribute at a NON-DEFAULT value, so a silently
+/// dropped one cannot be mistaken for a default.
+const sync_attr_cookie = "sk_sync_attr";
+const sync_attr_value = "attr-value-5d10";
+const sync_attr_url = "https://sync-attr.example/deep/path";
+const sync_attr_domain = "sync-attr.example";
+const sync_attr_path = "/deep/path";
+/// MEASURED (CEF 151 / Chromium): a cookie expiry is CLAMPED to 400
+/// days from now, per Chromium's `kMaxCookieExpirationTime` — a 2100
+/// date came back as today plus 400 days, which read as "the expiry
+/// was dropped" until it was looked at. The stage therefore asks for
+/// 30 days, well inside the cap, so the assertion measures OUR round
+/// trip and not the engine's policy.
+fn syncAttrExpiresMs() u64 {
+    const ms = @import("util/clock.zig").wallMs();
+    const base: u64 = if (ms <= 0) 0 else @intCast(ms);
+    return base + 30 * 24 * 60 * 60 * 1000;
+}
+/// Cookies applied to prove the dump PAGES rather than truncating.
+const sync_bulk_count: u32 = 140;
+const sync_bulk_url = "https://sync-bulk.example/";
+const sync_view_a: u32 = 42;
+
 /// Stage-26/27 views, each in its own identity context.
 const egress_view_a: u32 = 5;
 const egress_view_b: u32 = 6;
@@ -393,6 +427,12 @@ fn cleanup() void {
         _ = c.waitpid(g_pid, &status, 0);
         g_pid = -1;
     }
+    if (g_pid_b > 0) {
+        _ = c.kill(g_pid_b, c.SIGKILL);
+        var status: c_int = 0;
+        _ = c.waitpid(g_pid_b, &status, 0);
+        g_pid_b = -1;
+    }
     if (g_mux_pid > 0) {
         _ = c.kill(g_mux_pid, c.SIGKILL);
         var status: c_int = 0;
@@ -461,6 +501,13 @@ const ProxyProbe = struct {
     host: [256]u8 = @splat(0),
     host_len: usize = 0,
     atyp_domain: bool = false,
+    port: u16 = 0,
+    /// Nonzero relays matching CONNECTs to this loopback HTTP port.
+    tunnel_port: u16 = 0,
+    route_a: std.atomic.Value(bool) = .init(false),
+    route_b: std.atomic.Value(bool) = .init(false),
+    request_probe: [2048]u8 = @splat(0),
+    request_probe_len: usize = 0,
 
     fn start(self: *ProxyProbe) bool {
         return self.lis.start(self, &onConn);
@@ -479,7 +526,7 @@ const ProxyProbe = struct {
         // and a later one overwriting the record would race the reader.
         // A later connection is simply refused a no-auth handshake so it
         // closes without disturbing the recorded host.
-        if (self.got.load(.acquire)) {
+        if (self.tunnel_port == 0 and self.got.load(.acquire)) {
             const mr0 = socks5.methodReply(false);
             _ = c.write(afd, &mr0, mr0.len);
             return;
@@ -495,6 +542,8 @@ const ProxyProbe = struct {
         acc_len -= g.consumed;
         // Request.
         const r = readRequest(afd, &acc, &acc_len) orelse return;
+        if (r.cmd != .connect) return;
+        if (self.tunnel_port != 0 and r.port != self.tunnel_port) return;
         switch (r.addr) {
             .domain => |d| {
                 // Chromium itself phones home through a fresh context
@@ -515,9 +564,97 @@ const ProxyProbe = struct {
             },
             .ipv6 => {},
         }
+        self.port = r.port;
         self.got.store(true, .release);
+        if (self.tunnel_port != 0) {
+            const upstream = connectLoopback(self.tunnel_port) orelse {
+                const failed = socks5.connectReply(.host_unreachable);
+                _ = c.write(afd, &failed, failed.len);
+                return;
+            };
+            defer _ = c.close(upstream);
+            const rep = socks5.connectReply(.ok);
+            if (!writeAll(afd, &rep)) return;
+            const initial = acc[r.consumed..acc_len];
+            self.relay(afd, upstream, initial);
+            return;
+        }
         const rep = socks5.connectReply(.ok);
         _ = c.write(afd, &rep, rep.len);
+    }
+
+    fn connectLoopback(port: u16) ?c_int {
+        const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
+        if (fd < 0) return null;
+        var sa = std.mem.zeroes(c.struct_sockaddr_in);
+        sa.sin_family = c.AF_INET;
+        sa.sin_port = std.mem.nativeToBig(u16, port);
+        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
+        if (c.connect(fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0) {
+            _ = c.close(fd);
+            return null;
+        }
+        return fd;
+    }
+
+    fn writeAll(fd: c_int, bytes: []const u8) bool {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const n = c.write(fd, bytes.ptr + off, bytes.len - off);
+            if (n < 0 and std.c._errno().* == c.EINTR) continue;
+            if (n <= 0) return false;
+            off += @intCast(n);
+        }
+        return true;
+    }
+
+    fn noteRequest(self: *ProxyProbe, bytes: []const u8) void {
+        const take = @min(bytes.len, self.request_probe.len - self.request_probe_len);
+        if (take != 0) {
+            @memcpy(self.request_probe[self.request_probe_len..][0..take], bytes[0..take]);
+            self.request_probe_len += take;
+        }
+        const seen = self.request_probe[0..self.request_probe_len];
+        if (std.mem.indexOf(u8, seen, "route-a") != null) self.route_a.store(true, .release);
+        if (std.mem.indexOf(u8, seen, "route-b") != null) self.route_b.store(true, .release);
+    }
+
+    fn relay(self: *ProxyProbe, client: c_int, upstream: c_int, initial: []const u8) void {
+        if (initial.len != 0) {
+            self.noteRequest(initial);
+            if (!writeAll(upstream, initial)) return;
+        }
+        var client_open = true;
+        var upstream_open = true;
+        const deadline = nowMs() + 15_000;
+        var buf: [16 * 1024]u8 = undefined;
+        while ((client_open or upstream_open) and nowMs() < deadline) {
+            var pfds = [_]c.struct_pollfd{
+                .{ .fd = client, .events = if (client_open) c.POLLIN else 0, .revents = 0 },
+                .{ .fd = upstream, .events = if (upstream_open) c.POLLIN else 0, .revents = 0 },
+            };
+            if (c.poll(@ptrCast(&pfds), pfds.len, 200) <= 0) continue;
+            if (client_open and pfds[0].revents != 0) {
+                const n = c.read(client, &buf, buf.len);
+                if (n <= 0) {
+                    client_open = false;
+                    _ = c.shutdown(upstream, c.SHUT_WR);
+                } else {
+                    const bytes = buf[0..@intCast(n)];
+                    self.noteRequest(bytes);
+                    if (!writeAll(upstream, bytes)) client_open = false;
+                }
+            }
+            if (upstream_open and pfds[1].revents != 0) {
+                const n = c.read(upstream, &buf, buf.len);
+                if (n <= 0) {
+                    upstream_open = false;
+                    _ = c.shutdown(client, c.SHUT_WR);
+                } else if (!writeAll(client, buf[0..@intCast(n)])) {
+                    upstream_open = false;
+                }
+            }
+        }
     }
 
     fn fill(afd: c_int, acc: *[1024]u8, acc_len: *usize) bool {
@@ -580,6 +717,8 @@ const HttpProbe = struct {
     /// Stage 39 turns the otherwise one-document probe into a tiny
     /// filter-list/resource router.
     filter_router: bool = false,
+    /// Stage 41 turns it into the cookie-sync fixture router.
+    cookie_router: bool = false,
     filter_mode: std.atomic.Value(u8) = .init(@intFromEnum(FilterMode.good)),
     list_hits: std.atomic.Value(u32) = .init(0),
     blocked_hits: std.atomic.Value(u32) = .init(0),
@@ -627,6 +766,50 @@ const HttpProbe = struct {
         _ = c.close(afd);
     }
 
+    /// Stage 41 needs three DISTINGUISHABLE documents plus one real
+    /// `Set-Cookie` response header — the only way to exercise the
+    /// header observer and the script observer against the same origin.
+    fn handleCookieSync(self: *HttpProbe, afd: c_int, raw: []const u8) void {
+        _ = self.served.fetchAdd(1, .release);
+        if (std.mem.indexOf(u8, raw, "GET /hdr") != null) {
+            tcpserver.respondOk(afd, "text/html", hdr_page, hdr_set_cookie);
+            return;
+        }
+        if (std.mem.indexOf(u8, raw, "GET /js") != null) {
+            tcpserver.respondOk(afd, "text/html", js_page, "");
+            return;
+        }
+        if (std.mem.indexOf(u8, raw, "GET /del") != null) {
+            tcpserver.respondOk(afd, "text/html", del_page, "");
+            return;
+        }
+        tcpserver.respondOk(afd, "text/html", "<html><head><title>ck:ready</title></head><body>ck</body></html>", "");
+    }
+
+    /// HttpOnly so the round trip has something a page could never
+    /// forge back, SameSite=Strict and a real Max-Age so a dropped
+    /// attribute is visible rather than merely wrong.
+    const hdr_set_cookie =
+        "Set-Cookie: " ++ sync_hdr_cookie ++ "=" ++ sync_hdr_value ++
+        "; Path=/; Max-Age=86400; HttpOnly; SameSite=Strict\r\n";
+
+    const hdr_page =
+        "<html><head><title>hdr:ok</title></head><body>hdr</body></html>";
+
+    /// A `document.cookie` write: no response header carries it, which
+    /// is exactly the coverage gap stage 41 measures.
+    const js_page =
+        "<html><head><title>js:wait</title></head><body>js<script>" ++
+        "document.cookie=\"" ++ sync_js_cookie ++ "=" ++ sync_js_value ++
+        "; path=/; max-age=86400; SameSite=Lax\";" ++
+        "document.title=\"js:\"+document.cookie;</script></body></html>";
+
+    /// The script-side deletion: an expiry in the past.
+    const del_page =
+        "<html><head><title>del:wait</title></head><body>del<script>" ++
+        "document.cookie=\"" ++ sync_js_cookie ++ "=; path=/; max-age=0\";" ++
+        "document.title=\"del:[\"+document.cookie+\"]\";</script></body></html>";
+
     fn handle(self: *HttpProbe, afd: c_int) void {
         // Read whatever the request is and ignore it: one document
         // answers every path, which is all these stages need.
@@ -637,6 +820,10 @@ const HttpProbe = struct {
         const raw = if (n > 0) buf[0..@intCast(n)] else "";
         if (self.filter_router) {
             self.handleFilter(afd, raw);
+            return;
+        }
+        if (self.cookie_router) {
+            self.handleCookieSync(afd, raw);
             return;
         }
         tcpserver.respondOk(afd, "text/html", self.body, "");
@@ -742,6 +929,130 @@ const HttpProbe = struct {
         const deadline = nowMs() + 2_000;
         while (self.workers.load(.acquire) != 0 and nowMs() < deadline) _ = c.usleep(10_000);
         if (self.workers.load(.acquire) != 0) fail("HTTP probe workers did not stop");
+    }
+};
+
+/// One cookie the way stage 41 has to hold it: OWNED bytes, because a
+/// change observed on instance A is applied to instance B several
+/// frames later and the decode borrowed from a buffer long since
+/// reused.
+const CkCookie = struct {
+    name: [128]u8 = @splat(0),
+    name_len: usize = 0,
+    value: [256]u8 = @splat(0),
+    value_len: usize = 0,
+    domain: [128]u8 = @splat(0),
+    domain_len: usize = 0,
+    path: [128]u8 = @splat(0),
+    path_len: usize = 0,
+    url: [256]u8 = @splat(0),
+    url_len: usize = 0,
+    context: u32 = 0,
+    cause: u8 = 0,
+    removed: u8 = 0,
+    flags: u8 = 0,
+    same_site: u8 = 0,
+    priority: u8 = 0,
+    creation_ms: u64 = 0,
+    last_access_ms: u64 = 0,
+    expires_ms: u64 = 0,
+
+    fn put(dst: []u8, len: *usize, src: []const u8) void {
+        const n = @min(dst.len, src.len);
+        @memcpy(dst[0..n], src[0..n]);
+        len.* = n;
+    }
+
+    fn fill(self: *CkCookie, ck: proto.SyncCookie) void {
+        put(&self.name, &self.name_len, ck.name);
+        put(&self.value, &self.value_len, ck.value);
+        put(&self.domain, &self.domain_len, ck.domain);
+        put(&self.path, &self.path_len, ck.path);
+        self.flags = ck.flags;
+        self.same_site = ck.same_site;
+        self.priority = ck.priority;
+        self.creation_ms = ck.creation_ms;
+        self.last_access_ms = ck.last_access_ms;
+        self.expires_ms = ck.expires_ms;
+    }
+
+    fn nameSlice(self: *const CkCookie) []const u8 {
+        return self.name[0..self.name_len];
+    }
+    fn valueSlice(self: *const CkCookie) []const u8 {
+        return self.value[0..self.value_len];
+    }
+    fn urlSlice(self: *const CkCookie) []const u8 {
+        return self.url[0..self.url_len];
+    }
+
+    fn wire(self: *const CkCookie) proto.SyncCookie {
+        return .{
+            .name = self.name[0..self.name_len],
+            .value = self.value[0..self.value_len],
+            .domain = self.domain[0..self.domain_len],
+            .path = self.path[0..self.path_len],
+            .flags = self.flags,
+            .same_site = self.same_site,
+            .priority = self.priority,
+            .creation_ms = self.creation_ms,
+            .last_access_ms = self.last_access_ms,
+            .expires_ms = self.expires_ms,
+        };
+    }
+};
+
+/// Stage 41's per-connection cookie-sync state. HEAP-allocated and
+/// attached only by that stage: every other stage would otherwise carry
+/// a quarter of a megabyte of buffers it never reads.
+const CkState = struct {
+    /// Every `ev_cookie_change` this connection ever received, in
+    /// order. `seq` keeps counting past the ring so a "did it stop
+    /// growing?" assertion is exact even if the ring wrapped.
+    q: [96]CkCookie = @splat(.{}),
+    head: usize = 0,
+    seq: u32 = 0,
+    apply_seq: u32 = 0,
+    apply_req: u32 = 0,
+    apply_ok: u8 = 0,
+    apply_reason: [64]u8 = @splat(0),
+    apply_reason_len: usize = 0,
+    dump_seq: u32 = 0,
+    dump_req: u32 = 0,
+    dump_ok: u8 = 0,
+    dump_cursor: u32 = 0,
+    dump_next: u32 = 0,
+    dump_more: u8 = 0,
+    dump_total: u32 = 0,
+    dump: [256]CkCookie = @splat(.{}),
+    dump_n: usize = 0,
+
+    /// The most recent change carrying `name`, or null.
+    fn lastChange(self: *const CkState, name: []const u8) ?*const CkCookie {
+        var i = self.head;
+        var n: usize = 0;
+        while (n < self.q.len) : (n += 1) {
+            i = if (i == 0) self.q.len - 1 else i - 1;
+            if (self.q[i].name_len == 0) continue;
+            if (std.mem.eql(u8, self.q[i].nameSlice(), name)) return &self.q[i];
+        }
+        return null;
+    }
+
+    /// How many changes ever named `name` (the ping-pong counter).
+    fn countChanges(self: *const CkState, name: []const u8) u32 {
+        var n: u32 = 0;
+        for (&self.q) |*e| {
+            if (e.name_len != 0 and std.mem.eql(u8, e.nameSlice(), name)) n += 1;
+        }
+        return n;
+    }
+
+    fn dumpFind(self: *const CkState, name: []const u8) ?*const CkCookie {
+        for (self.dump[0..self.dump_n]) |*e| {
+            if (std.mem.eql(u8, e.nameSlice(), name)) return e;
+        }
+        return null;
     }
 };
 
@@ -1018,6 +1329,9 @@ const Client = struct {
     ack_a11y: bool = false,
     ack_a11y_caret: bool = false,
     ack_sitedata: bool = false,
+    ack_cookie_sync: bool = false,
+    /// Stage 41 only; null everywhere else.
+    ck: ?*CkState = null,
     /// Cookies + site data. `cookie_names` is the last enumeration
     /// rendered one name per line, so an assertion can grep it; the
     /// counters are the last frame's.
@@ -1319,6 +1633,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.ack_contexts_fail_closed = true;
                     if (std.mem.eql(u8, cap, proto.CAP_USERSCRIPTS)) self.ack_userscripts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SITEDATA)) self.ack_sitedata = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_COOKIE_SYNC)) self.ack_cookie_sync = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_INLINE)) self.ack_frames_inline = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT)) self.ack_webext = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TABS)) self.ack_webext_tabs = true;
@@ -1416,6 +1731,46 @@ const Client = struct {
                         self.cookie_flags = e.flags;
                         self.cookie_value_len = e.value_len;
                     }
+                }
+            },
+            .ev_cookie_change => {
+                const ev = proto.decode(proto.EvCookieChange, frame.payload) catch fail("ev_cookie_change decode");
+                const st = self.ck orelse return;
+                st.seq += 1;
+                var e: CkCookie = .{};
+                e.fill(ev.cookie);
+                e.context = ev.context;
+                e.cause = ev.cause;
+                e.removed = ev.removed;
+                CkCookie.put(&e.url, &e.url_len, ev.url);
+                st.q[st.head] = e;
+                st.head = (st.head + 1) % st.q.len;
+            },
+            .ev_cookie_apply_done => {
+                const ev = proto.decode(proto.EvCookieApplyDone, frame.payload) catch fail("ev_cookie_apply_done decode");
+                const st = self.ck orelse return;
+                st.apply_seq += 1;
+                st.apply_req = ev.req;
+                st.apply_ok = ev.ok;
+                st.apply_reason_len = @min(ev.reason.len, st.apply_reason.len);
+                @memcpy(st.apply_reason[0..st.apply_reason_len], ev.reason[0..st.apply_reason_len]);
+            },
+            .ev_cookie_dump => {
+                const ev = proto.EvCookieDump.decodeAlloc(frame.payload, self.gpa) catch fail("ev_cookie_dump decode");
+                defer self.gpa.free(ev.cookies);
+                const st = self.ck orelse return;
+                st.dump_seq += 1;
+                st.dump_req = ev.req;
+                st.dump_ok = ev.ok;
+                st.dump_cursor = ev.cursor;
+                st.dump_next = ev.next_cursor;
+                st.dump_more = ev.more;
+                st.dump_total = ev.total;
+                st.dump_n = @min(ev.cookies.len, st.dump.len);
+                for (ev.cookies[0..st.dump_n], 0..) |ck, i| {
+                    st.dump[i] = .{};
+                    st.dump[i].fill(ck);
+                    st.dump[i].context = ev.context;
                 }
             },
             .ev_sitedata_done => {
@@ -5237,6 +5592,486 @@ fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
     pass("stage fl4 the TTL reap was graceful: the jar survived with no explicit flush");
 }
 
+// ── Stage 42: cross-instance cookie synchronisation ─────────────────
+//
+// TWO REAL HELPERS with SEPARATE `--cache-dir`s, i.e. two profiles and
+// two jars — the shape sketerm runs when it puts one helper on each
+// network route. This rig plays the part the GUI will play: it
+// subscribes to both, and forwards a change observed on one as a
+// `cookie_apply` to the other.
+//
+// What it measures, in order:
+//   a. a `Set-Cookie` RESPONSE HEADER in A reaches B with every
+//      attribute intact, HttpOnly included;
+//   b. a `document.cookie` write in A reaches B — and WHICH observer
+//      carried it, printed either way, because that is the coverage
+//      question this feature turns on;
+//   c. a script-side deletion reaches B;
+//   d. with forwarding turned on in BOTH directions, the traffic
+//      CONVERGES instead of ping-ponging;
+//   e. an HttpOnly cookie is still HttpOnly after the round trip, and
+//      so is every other attribute, measured on a synthetic cookie
+//      that sets each one to a non-default value;
+//   f. the dump PAGES a jar bigger than one page instead of truncating
+//      it or building one enormous frame.
+/// The second helper of stage 42, killed by EXACT pid like the first.
+var g_pid_b: c.pid_t = -1;
+
+fn pumpBoth(a: *Client, b: *Client, ms: c_int) void {
+    a.pump(ms);
+    b.pump(0);
+}
+
+/// Pump both connections until `pred` or the deadline.
+fn waitBoth(a: *Client, b: *Client, timeout_ms: i64, ctx: anytype, pred: *const fn (@TypeOf(ctx)) bool) bool {
+    const deadline = nowMs() + timeout_ms;
+    while (true) {
+        if (pred(ctx)) return true;
+        if (nowMs() > deadline) return false;
+        pumpBoth(a, b, 25);
+    }
+}
+
+/// Hand one observed change to the other instance and wait for the
+/// correlated answer. Returns false when the apply was refused.
+fn forwardChange(from: *Client, to: *Client, ck: *const CkCookie, req: u32) bool {
+    const st = to.ck.?;
+    const seq = st.apply_seq;
+    to.send(proto.CookieApply{
+        .req = req,
+        .context = 0,
+        .remove = ck.removed,
+        .url = ck.urlSlice(),
+        .cookie = ck.wire(),
+    });
+    const Ctx = struct { st: *CkState, seq: u32 };
+    var wc = Ctx{ .st = st, .seq = seq };
+    const ok = waitBoth(from, to, 15_000, &wc, struct {
+        fn f(x: *Ctx) bool {
+            return x.st.apply_seq > x.seq;
+        }
+    }.f);
+    if (!ok) return false;
+    if (st.apply_req != req) fail("stage 42: ev_cookie_apply_done echoed the wrong request id");
+    return st.apply_ok != 0;
+}
+
+/// One full dump of a context, following the cursor to the end.
+/// Returns the number of PAGES it took, so the paging assertion has
+/// something to check besides the contents.
+fn dumpAll(a: *Client, b: *Client, target: *Client, req_base: u32, out: *std.ArrayList(CkCookie), gpa: std.mem.Allocator) u32 {
+    const st = target.ck.?;
+    out.clearRetainingCapacity();
+    var cursor: u32 = 0;
+    var pages: u32 = 0;
+    while (true) {
+        const seq = st.dump_seq;
+        target.send(proto.CookieDumpReq{ .req = req_base + pages, .context = 0, .cursor = cursor });
+        const Ctx = struct { st: *CkState, seq: u32 };
+        var wc = Ctx{ .st = st, .seq = seq };
+        if (!waitBoth(a, b, 15_000, &wc, struct {
+            fn f(x: *Ctx) bool {
+                return x.st.dump_seq > x.seq;
+            }
+        }.f)) fail("stage 42: a cookie_dump_req was never answered");
+        if (st.dump_ok == 0) fail("stage 42: the cookie store could not be dumped");
+        pages += 1;
+        for (st.dump[0..st.dump_n]) |e| out.append(gpa, e) catch fail("stage 42: dump out of memory");
+        if (st.dump_more == 0) break;
+        if (st.dump_next == cursor) fail("stage 42: the dump cursor did not advance but claimed more");
+        cursor = st.dump_next;
+        if (pages > 64) fail("stage 42: the dump never terminated");
+    }
+    return pages;
+}
+
+fn findCookie(list: []const CkCookie, name: []const u8) ?*const CkCookie {
+    for (list) |*e| {
+        if (std.mem.eql(u8, e.nameSlice(), name)) return e;
+    }
+    return null;
+}
+
+fn runCookieSyncStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var sock_a_buf: [96]u8 = undefined;
+    var sock_b_buf: [96]u8 = undefined;
+    const sock_a = std.fmt.bufPrintZ(&sock_a_buf, "{s}/cka.sock", .{dir}) catch fail("stage 42 socket path");
+    const sock_b = std.fmt.bufPrintZ(&sock_b_buf, "{s}/ckb.sock", .{dir}) catch fail("stage 42 socket path");
+    var cache_a_buf: [128]u8 = undefined;
+    var cache_b_buf: [128]u8 = undefined;
+    // SEPARATE profile directories: two jars is the whole premise.
+    const cache_a = std.fmt.bufPrintZ(&cache_a_buf, "{s}/cache-cka", .{dir}) catch fail("stage 42 cache path");
+    const cache_b = std.fmt.bufPrintZ(&cache_b_buf, "{s}/cache-ckb", .{dir}) catch fail("stage 42 cache path");
+
+    // 1500ms rather than the 3s default: fast enough that the whole
+    // stage runs in seconds, slow enough that a Set-Cookie header is
+    // reliably attributed to the HEADER observer instead of racing the
+    // reconcile that would also have found it. `SKETERM_SMOKE_CK_MS`
+    // pushes it out of the way entirely, which is how the coverage
+    // measurement in 42b was taken: with the reconcile at 600s, 42a
+    // still passes and 42b finds NOTHING, which is the proof that
+    // `can_save_cookie` sees response headers and not script writes.
+    _ = c.setenv("SKETERM_WEB_COOKIE_SYNC_MS", c.getenv("SKETERM_SMOKE_CK_MS") orelse "1500", 1);
+    const pid_a = spawnHelperArgs(exe, sock_a.ptr, cache_a.ptr, &.{"--ozone-platform=headless"});
+    g_pid = pid_a;
+    const pid_b = spawnHelperArgs(exe, sock_b.ptr, cache_b.ptr, &.{"--ozone-platform=headless"});
+    g_pid_b = pid_b;
+    _ = c.unsetenv("SKETERM_WEB_COOKIE_SYNC_MS");
+
+    var st_a = gpa.create(CkState) catch fail("stage 42: out of memory");
+    defer gpa.destroy(st_a);
+    var st_b = gpa.create(CkState) catch fail("stage 42: out of memory");
+    defer gpa.destroy(st_b);
+    st_a.* = .{};
+    st_b.* = .{};
+
+    var a = Client{ .gpa = gpa, .fd = connectWithRetry(sock_a.ptr, sock_a.len), .ck = st_a };
+    // connectWithRetry watches g_pid; B is up by now or never.
+    var b = Client{ .gpa = gpa, .fd = connectWithRetry(sock_b.ptr, sock_b.len), .ck = st_b };
+
+    a.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-cksync-a" });
+    b.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-cksync-b" });
+    {
+        const d = nowMs() + 25_000;
+        while ((a.ack_proto == 0 or b.ack_proto == 0) and nowMs() < d) pumpBoth(&a, &b, 100);
+    }
+    if (a.ack_proto != proto.PROTO_VERSION or b.ack_proto != proto.PROTO_VERSION)
+        fail("stage 42 cookie sync: one of the two helpers never answered hello");
+    if (!a.ack_cookie_sync or !b.ack_cookie_sync)
+        fail("stage 42 cookie sync: hello_ack lacks the cookie-sync capability");
+
+    var http = HttpProbe{ .cookie_router = true };
+    if (!http.start()) fail("stage 42 cookie sync: could not start the loopback HTTP probe");
+    defer http.shutdown();
+
+    a.send(proto.CookieSyncEnable{ .enable = 1 });
+    b.send(proto.CookieSyncEnable{ .enable = 1 });
+    a.send(proto.ViewCreate{ .view = sync_view_a, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+    a.have_view = true;
+
+    // ── 41a: a Set-Cookie response header in A ────────────────────
+    var url_buf: [96]u8 = undefined;
+    const hdr_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/hdr", .{http.lis.port}) catch unreachable;
+    a.send(proto.Navigate{ .view = sync_view_a, .url = hdr_url });
+    if (!waitBoth(&a, &b, 25_000, st_a, struct {
+        fn f(x: *CkState) bool {
+            return x.lastChange(sync_hdr_cookie) != null;
+        }
+    }.f)) fail("stage 42a: instance A never observed its own Set-Cookie header");
+    const hdr_change = st_a.lastChange(sync_hdr_cookie).?;
+    if (hdr_change.cause != @intFromEnum(proto.CookieCause.response_header)) {
+        std.debug.print("smoke-web: stage 42a cause was {d}\n", .{hdr_change.cause});
+        fail("stage 42a: a Set-Cookie header was not attributed to the header observer");
+    }
+    if (!std.mem.eql(u8, hdr_change.valueSlice(), sync_hdr_value))
+        fail("stage 42a: the observed value is not what the header set");
+    if (hdr_change.flags & proto.cookie_httponly == 0)
+        fail("stage 42a: HttpOnly was lost on the way out of the engine");
+    if (hdr_change.same_site != @intFromEnum(proto.SameSite.strict))
+        fail("stage 42a: SameSite=Strict was lost on the way out of the engine");
+    if (hdr_change.expires_ms == 0 or hdr_change.flags & proto.cookie_session != 0)
+        fail("stage 42a: a Max-Age cookie was observed as a session cookie");
+    if (!forwardChange(&a, &b, hdr_change, 4101))
+        fail("stage 42a: instance B refused the forwarded header cookie");
+
+    var got: std.ArrayList(CkCookie) = .empty;
+    defer got.deinit(gpa);
+    _ = dumpAll(&a, &b, &b, 4110, &got, gpa);
+    const in_b = findCookie(got.items, sync_hdr_cookie) orelse
+        fail("stage 42a: the header cookie never reached instance B's jar");
+    if (!std.mem.eql(u8, in_b.valueSlice(), sync_hdr_value))
+        fail("stage 42a: the value changed crossing between instances");
+    // (e): the security-relevant attributes, on the far side.
+    if (in_b.flags & proto.cookie_httponly == 0)
+        fail("stage 42e: an HttpOnly cookie stopped being HttpOnly after the round trip");
+    if (in_b.same_site != @intFromEnum(proto.SameSite.strict))
+        fail("stage 42e: SameSite=Strict was dropped in the round trip");
+    if (in_b.expires_ms != hdr_change.expires_ms)
+        fail("stage 42e: the expiry changed in the round trip (a persistent cookie would become a session cookie)");
+    pass("stage 42a Set-Cookie header observed in A, applied to B with value, HttpOnly, SameSite and expiry intact");
+
+    // ── 41b: document.cookie, and WHICH observer sees it ──────────
+    //
+    // This is the measurement the feature turns on. `can_save_cookie`
+    // is a filter on cookies carried BY REQUESTS; a `document.cookie`
+    // write never touches the network stack, so the expectation is
+    // that only the reconcile sees it. Whatever actually happens is
+    // reported rather than assumed.
+    const js_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/js", .{http.lis.port}) catch unreachable;
+    a.send(proto.Navigate{ .view = sync_view_a, .url = js_url });
+    if (!waitBoth(&a, &b, 25_000, st_a, struct {
+        fn f(x: *CkState) bool {
+            return x.lastChange(sync_js_cookie) != null;
+        }
+    }.f)) fail("stage 42b: a document.cookie write reached NEITHER observer — the JS gap is not covered");
+    const js_change = st_a.lastChange(sync_js_cookie).?;
+    switch (@as(proto.CookieCause, @enumFromInt(js_change.cause))) {
+        .response_header => say("smoke-web: stage 42b MEASURED: can_save_cookie DOES fire for document.cookie on this CEF"),
+        .reconcile => say("smoke-web: stage 42b MEASURED: can_save_cookie does NOT fire for document.cookie; the reconcile covered it"),
+        else => fail("stage 42b: the change arrived under an unknown cause"),
+    }
+    if (!std.mem.eql(u8, js_change.valueSlice(), sync_js_value))
+        fail("stage 42b: the script-set value was not observed correctly");
+    if (!forwardChange(&a, &b, js_change, 4102))
+        fail("stage 42b: instance B refused the forwarded script-set cookie");
+    _ = dumpAll(&a, &b, &b, 4120, &got, gpa);
+    if (findCookie(got.items, sync_js_cookie) == null)
+        fail("stage 42b: the script-set cookie never reached instance B's jar");
+    pass("stage 42b document.cookie write in A reached B");
+
+    // ── 41c: deletion propagates ──────────────────────────────────
+    const del_seq = st_a.seq;
+    const del_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/del", .{http.lis.port}) catch unreachable;
+    a.send(proto.Navigate{ .view = sync_view_a, .url = del_url });
+    const DelCtx = struct { st: *CkState, from: u32 };
+    var dc = DelCtx{ .st = st_a, .from = del_seq };
+    if (!waitBoth(&a, &b, 25_000, &dc, struct {
+        fn f(x: *DelCtx) bool {
+            if (x.st.seq <= x.from) return false;
+            const e = x.st.lastChange(sync_js_cookie) orelse return false;
+            return e.removed != 0;
+        }
+    }.f)) fail("stage 42c: a script-side deletion was never observed (no observer covers deletion)");
+    const del_change = st_a.lastChange(sync_js_cookie).?;
+    if (del_change.cause != @intFromEnum(proto.CookieCause.reconcile))
+        say("smoke-web: stage 42c NOTE: the deletion was attributed to the header observer");
+    if (!forwardChange(&a, &b, del_change, 4103))
+        fail("stage 42c: instance B refused the forwarded deletion");
+    _ = dumpAll(&a, &b, &b, 4130, &got, gpa);
+    if (findCookie(got.items, sync_js_cookie) != null)
+        fail("stage 42c: the deleted cookie is still in instance B's jar");
+    pass("stage 42c a script-side deletion in A removed the cookie in B");
+
+    // ── 41e: every attribute, at a non-default value ──────────────
+    //
+    // Applied rather than served, because the attribute matrix needs a
+    // Secure cookie and an https origin — which a loopback HTTP
+    // fixture cannot provide and which no engine will store off one.
+    const expires = syncAttrExpiresMs();
+    const attr = proto.SyncCookie{
+        .name = sync_attr_cookie,
+        .value = sync_attr_value,
+        .domain = sync_attr_domain,
+        .path = sync_attr_path,
+        .flags = proto.cookie_secure | proto.cookie_httponly,
+        .same_site = @intFromEnum(proto.SameSite.strict),
+        .priority = @intFromEnum(proto.CookiePriority.high),
+        .creation_ms = 1_600_000_000_000,
+        .last_access_ms = 1_600_000_100_000,
+        .expires_ms = expires,
+    };
+    {
+        const seq = st_b.apply_seq;
+        b.send(proto.CookieApply{
+            .req = 4104,
+            .context = 0,
+            .remove = 0,
+            .url = sync_attr_url,
+            .cookie = attr,
+        });
+        const Ctx = struct { st: *CkState, seq: u32 };
+        var wc = Ctx{ .st = st_b, .seq = seq };
+        if (!waitBoth(&a, &b, 15_000, &wc, struct {
+            fn f(x: *Ctx) bool {
+                return x.st.apply_seq > x.seq;
+            }
+        }.f)) fail("stage 42e: the attribute-matrix apply was never answered");
+        if (st_b.apply_ok == 0) {
+            std.debug.print("smoke-web: stage 42e apply said \"{s}\"\n", .{st_b.apply_reason[0..st_b.apply_reason_len]});
+            fail("stage 42e: the engine refused a fully-specified cookie");
+        }
+    }
+    _ = dumpAll(&a, &b, &b, 4140, &got, gpa);
+    const back = findCookie(got.items, sync_attr_cookie) orelse
+        fail("stage 42e: the fully-specified cookie is not in the jar it was written to");
+    var lost: [512]u8 = undefined;
+    var lost_len: usize = 0;
+    const note = struct {
+        fn f(buf: []u8, len: *usize, what: []const u8) void {
+            if (len.* + what.len + 1 > buf.len) return;
+            if (len.* != 0) {
+                buf[len.*] = ',';
+                len.* += 1;
+            }
+            @memcpy(buf[len.*..][0..what.len], what);
+            len.* += what.len;
+        }
+    }.f;
+    if (!std.mem.eql(u8, back.valueSlice(), sync_attr_value)) note(&lost, &lost_len, "value");
+    if (back.flags & proto.cookie_secure == 0) note(&lost, &lost_len, "secure");
+    if (back.flags & proto.cookie_httponly == 0) note(&lost, &lost_len, "httponly");
+    if (back.same_site != @intFromEnum(proto.SameSite.strict)) note(&lost, &lost_len, "samesite");
+    if (back.priority != @intFromEnum(proto.CookiePriority.high)) note(&lost, &lost_len, "priority");
+    if (back.expires_ms != expires) note(&lost, &lost_len, "expires");
+    if (back.flags & proto.cookie_session != 0) note(&lost, &lost_len, "persistence");
+    if (!std.mem.eql(u8, back.path[0..back.path_len], sync_attr_path)) note(&lost, &lost_len, "path");
+    if (std.mem.indexOf(u8, back.domain[0..back.domain_len], sync_attr_domain) == null) note(&lost, &lost_len, "domain");
+    if (lost_len != 0) {
+        std.debug.print(
+            "smoke-web: stage 42e attributes NOT preserved: {s} (asked expiry {d}, got {d})\n",
+            .{ lost[0..lost_len], expires, back.expires_ms },
+        );
+        fail("stage 42e: an attribute did not survive apply -> jar -> dump");
+    }
+    // `creation` and `last_access` are engine-populated on write; the
+    // wire carries them, the engine does not honour them, and that is
+    // reported rather than asserted either way.
+    if (back.creation_ms != attr.creation_ms)
+        say("smoke-web: stage 42e NOTE: the engine re-stamps creation on set_cookie (wire value not honoured)");
+    pass("stage 42e value, Secure, HttpOnly, SameSite, priority, path, domain and expiry all survive apply -> jar -> dump");
+
+    // ── 41f: the dump PAGES a big jar ─────────────────────────────
+    {
+        var i: u32 = 0;
+        var last_seq = st_b.apply_seq;
+        while (i < sync_bulk_count) : (i += 1) {
+            var nbuf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&nbuf, "sk_bulk_{d}", .{i}) catch unreachable;
+            b.send(proto.CookieApply{
+                .req = 4200 + i,
+                .context = 0,
+                .remove = 0,
+                .url = sync_bulk_url,
+                .cookie = .{
+                    .name = name,
+                    .value = "bulk",
+                    .domain = "sync-bulk.example",
+                    .path = "/",
+                    .flags = 0,
+                    .same_site = @intFromEnum(proto.SameSite.lax),
+                    .priority = @intFromEnum(proto.CookiePriority.medium),
+                    .creation_ms = 0,
+                    .last_access_ms = 0,
+                    .expires_ms = expires,
+                },
+            });
+            pumpBoth(&a, &b, 0);
+        }
+        const Ctx = struct { st: *CkState, want: u32 };
+        var wc = Ctx{ .st = st_b, .want = last_seq + sync_bulk_count };
+        if (!waitBoth(&a, &b, 60_000, &wc, struct {
+            fn f(x: *Ctx) bool {
+                return x.st.apply_seq >= x.want;
+            }
+        }.f)) fail("stage 42f: not every bulk apply was answered");
+        last_seq = st_b.apply_seq;
+    }
+    const pages = dumpAll(&a, &b, &b, 4400, &got, gpa);
+    if (pages < 2) {
+        std.debug.print("smoke-web: stage 42f dumped {d} cookies in {d} page(s)\n", .{ got.items.len, pages });
+        fail("stage 42f: a jar past one page was not paged");
+    }
+    if (got.items.len < sync_bulk_count)
+        fail("stage 42f: the paged dump lost cookies");
+    {
+        var missing: u32 = 0;
+        var i: u32 = 0;
+        while (i < sync_bulk_count) : (i += 1) {
+            var nbuf: [64]u8 = undefined;
+            const name = std.fmt.bufPrint(&nbuf, "sk_bulk_{d}", .{i}) catch unreachable;
+            if (findCookie(got.items, name) == null) missing += 1;
+        }
+        if (missing != 0) {
+            std.debug.print("smoke-web: stage 42f {d} of {d} bulk cookies missing\n", .{ missing, sync_bulk_count });
+            fail("stage 42f: the paged dump did not carry every cookie");
+        }
+    }
+    pass("stage 42f a jar past one page dumps in bounded pages, losing nothing");
+
+    // ── 41d: no ping-pong ─────────────────────────────────────────
+    //
+    // Forwarding is turned on in BOTH directions now, which is the
+    // production fan-out and the only shape a loop can appear in. A
+    // ping-pong is UNBOUNDED GROWTH, so the assertion is that the
+    // traffic stops: whatever settles in the first window must not
+    // grow in the second.
+    {
+        // Seed REAL traffic first, or "it converged" would be a
+        // statement about a rig that never sent anything: A writes the
+        // script cookie again, which A observes, the rig forwards, B
+        // applies — the exact cycle a loop would live in.
+        const again_url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/js", .{http.lis.port}) catch unreachable;
+        a.send(proto.Navigate{ .view = sync_view_a, .url = again_url });
+
+        var forwarded: u32 = 0;
+        var seen_a = st_a.seq;
+        var seen_b = st_b.seq;
+        const window_ms: i64 = 2_500;
+
+        var round: u32 = 0;
+        var first_window: u32 = 0;
+        while (round < 2) : (round += 1) {
+            const deadline = nowMs() + window_ms;
+            var in_window: u32 = 0;
+            while (nowMs() < deadline) {
+                pumpBoth(&a, &b, 25);
+                while (st_a.seq > seen_a) {
+                    seen_a += 1;
+                    const idx = (st_a.head + st_a.q.len - 1) % st_a.q.len;
+                    const e = st_a.q[idx];
+                    b.send(proto.CookieApply{
+                        .req = 4600 + forwarded,
+                        .context = 0,
+                        .remove = e.removed,
+                        .url = e.urlSlice(),
+                        .cookie = e.wire(),
+                    });
+                    forwarded += 1;
+                    in_window += 1;
+                }
+                while (st_b.seq > seen_b) {
+                    seen_b += 1;
+                    const idx = (st_b.head + st_b.q.len - 1) % st_b.q.len;
+                    const e = st_b.q[idx];
+                    a.send(proto.CookieApply{
+                        .req = 4800 + forwarded,
+                        .context = 0,
+                        .remove = e.removed,
+                        .url = e.urlSlice(),
+                        .cookie = e.wire(),
+                    });
+                    forwarded += 1;
+                    in_window += 1;
+                }
+            }
+            if (round == 0) {
+                first_window = in_window;
+                if (in_window == 0)
+                    fail("stage 42d: nothing was forwarded at all — the convergence assertion would be vacuous");
+            } else if (in_window != 0) {
+                std.debug.print(
+                    "smoke-web: stage 42d forwarded {d} then {d} changes in consecutive {d}ms windows\n",
+                    .{ first_window, in_window, window_ms },
+                );
+                fail("stage 42d: cookie changes kept arriving with both directions forwarding — that is a ping-pong");
+            }
+        }
+        std.debug.print(
+            "smoke-web: stage 42d MEASURED: {d} change(s) forwarded in the first {d}ms window, 0 in the second\n",
+            .{ first_window, window_ms },
+        );
+    }
+    pass("stage 42d applying a synced cookie does not re-emit it (bidirectional forwarding converges)");
+
+    // ── teardown ──────────────────────────────────────────────────
+    a.send(proto.CookieSyncEnable{ .enable = 0 });
+    b.send(proto.CookieSyncEnable{ .enable = 0 });
+    a.send(proto.ViewDestroy{ .view = sync_view_a });
+    a.have_view = false;
+    a.teardown_allow_close = true;
+    b.teardown_allow_close = true;
+    {
+        const d = nowMs() + 2_000;
+        while (nowMs() < d) pumpBoth(&a, &b, 50);
+    }
+    a.deinit();
+    b.deinit();
+    reapHelperTolerant(pid_a, "stage 42 teardown A", 30_000);
+    g_pid = -1;
+    reapHelperTolerant(pid_b, "stage 42 teardown B", 30_000);
+    g_pid_b = -1;
+}
+
 pub fn main(init: std.process.Init.Minimal) u8 {
     _ = c.signal(c.SIGPIPE, &sigNoop);
     const argv = init.args.vector;
@@ -5276,6 +6111,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         }
         say("smoke-web: PASS (fl only)");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_WEB_COOKIE_SYNC_ONLY") != null) {
+        runCookieSyncStage(gpa, exe, dir);
+        cleanup();
+        if (gpa_state.deinit() == .leak) {
+            say("smoke-web: FAIL leaked memory (see GPA report above)");
+            return 1;
+        }
+        say("smoke-web: PASS (cookie sync only)");
         return 0;
     }
 
@@ -7741,6 +8586,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     runMultiClientStage(gpa, exe, dir);
     // ── Stage fl: flush + linger (broker-owned lifecycle) ─────────
     runFlushLingerStage(gpa, exe, dir);
+    // ── Stage 42: cross-instance cookie sync (two real helpers) ───
+    runCookieSyncStage(gpa, exe, dir);
 
     cleanup();
     if (gpa_state.deinit() == .leak) {

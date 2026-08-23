@@ -137,6 +137,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_READER_IDS,
     proto.CAP_SEMANTIC_REQUEST_IDS,
     proto.CAP_MULTI_CLIENT,
+    proto.CAP_COOKIE_SYNC,
 };
 
 /// Test-only negotiation seam for exercising an older helper client path.
@@ -160,6 +161,7 @@ fn advertiseNetPolicy() bool {
 /// `ncaps`, which three parallel branches each had to merge by hand.
 const CapList = struct {
     const capacity = blk: {
+        @setEvalBranchQuota(20_000);
         var n: usize = 0;
         for (@typeInfo(proto).@"struct".decls) |d| {
             if (std.mem.startsWith(u8, d.name, "CAP_")) n += 1;
@@ -593,6 +595,10 @@ pub const Server = struct {
         // message-loop turn that will carry its answer back.
         self.host.webrequestPump();
         self.host.semanticPump(clock.nowMs());
+        // Cookie sync: fold what CEF's IO thread saw into the shadow
+        // and run the periodic jar reconcile. A no-op — one branch —
+        // while no connection has subscribed.
+        self.host.cookieSyncPump(clock.nowMs());
         // CEF callbacks queue outbound frames, so pump BEFORE flushing.
         cefhost.pump();
         // A decision may have arrived in that pump; retire timeouts and
@@ -879,6 +885,18 @@ pub const Server = struct {
                 const f = try proto.decode(proto.FlushReq, frame.payload);
                 self.host.flushProfileStores(f.token, cn.id);
             },
+            // Cookie sync (0xE0). Per-CONNECTION, unlike the
+            // process-global families above: the subscription is what
+            // decides whose socket cookie VALUES cross, so it cannot
+            // be last-writer-wins. `cookie_apply` / `cookie_dump_req`
+            // carry a `context` and are translated by `xlateIn` like
+            // every other context-naming frame.
+            .cookie_sync_enable => {
+                const req = try proto.decode(proto.CookieSyncEnable, frame.payload);
+                self.host.cookieSyncEnable(cn.id, req.enable != 0);
+            },
+            .cookie_apply => self.host.cookieApply(try dec(cn, proto.CookieApply, frame.payload)),
+            .cookie_dump_req => self.host.cookieDump(try dec(cn, proto.CookieDumpReq, frame.payload)),
             .cookies_req => self.host.cookiesReq(try dec(cn, proto.CookiesReq, frame.payload)),
             .cookie_delete => self.host.cookieDelete(try dec(cn, proto.CookieDelete, frame.payload)),
             .cookies_clear => self.host.cookiesClear(try dec(cn, proto.CookiesClear, frame.payload)),

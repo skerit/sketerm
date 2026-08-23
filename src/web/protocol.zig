@@ -197,6 +197,28 @@ pub const CAP_WEBEXT_TRANSACTION = "webext-transaction";
 /// exits when it disconnects.
 pub const CAP_MULTI_CLIENT = "multi-client";
 
+/// Cross-instance cookie SYNCHRONISATION (0xE0 block).
+///
+/// sketerm runs one helper process per network route, each with its
+/// own profile directory and therefore its own cookie jar. A login
+/// must nevertheless follow the user between routes, so one helper
+/// OBSERVES its jar changing and the client fans the change out to the
+/// others, which APPLY it.
+///
+/// This is the one block on this wire that carries cookie VALUES, and
+/// it is a deliberate contrast with the 0xC8 `sitedata` block, which
+/// never does: a site-data PANEL needs names and scopes, while a jar
+/// REPLICA is worthless without the value. The value is why the
+/// capability is separate and why nothing streams before
+/// `cookie_sync_enable` — a client that does not synchronise jars
+/// never has a cookie value cross its socket.
+///
+/// Three verbs plus one event: subscribe (`cookie_sync_enable` ->
+/// `ev_cookie_change`), apply one cookie (`cookie_apply` ->
+/// `ev_cookie_apply_done`), and seed a fresh instance from a running
+/// one (`cookie_dump_req` -> paged `ev_cookie_dump`).
+pub const CAP_COOKIE_SYNC = "cookie-sync";
+
 /// Per-connection id window under `multi-client`: connection k owns
 /// client-minted view ids translated into globals by adding
 /// `k * CONN_ID_WINDOW`, so two clients both minting id 1 never
@@ -359,6 +381,17 @@ pub const Tag = enum(u8) {
     // "frames-inline" — the historically reserved remote-helper block.
     frame_mode = 0xD0,
     frame_inline = 0xD1,
+    // 0xE0-0xE7: cross-instance cookie synchronisation, capability
+    // "cookie-sync". A fresh block rather than a 0xC8 continuation:
+    // 0xC6/0xC7 are the only gaps left in the 0xC0 block and the
+    // family needs six, and these frames carry cookie VALUES while
+    // every 0xC8 frame deliberately does not.
+    cookie_sync_enable = 0xE0,
+    ev_cookie_change = 0xE1,
+    cookie_apply = 0xE2,
+    ev_cookie_apply_done = 0xE3,
+    cookie_dump_req = 0xE4,
+    ev_cookie_dump = 0xE5,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -2689,6 +2722,272 @@ pub const EvFlushed = struct {
     token: u32,
 };
 
+// -- cross-instance cookie sync (0xE0 block, capability "cookie-sync")
+
+/// Cookies one `ev_cookie_dump` page carries. The seed of a big jar is
+/// PAGED rather than capped: a client keeps asking with the cursor the
+/// previous page handed back until `more` is 0, so nothing is silently
+/// missing and no single frame approaches `MAX_FRAME`.
+pub const SYNC_DUMP_PAGE: usize = 128;
+
+/// Byte budget for one page's cookie records. Reached before
+/// `SYNC_DUMP_PAGE` when the jar holds large values, so a page is
+/// bounded in BOTH dimensions; the cursor makes an early cut free.
+pub const SYNC_DUMP_PAGE_BYTES: usize = 512 * 1024;
+
+/// `SyncCookie.priority`. CEF counts -1/0/1, every other engine counts
+/// something else; the wire counts up from zero like every other enum
+/// here.
+pub const CookiePriority = enum(u8) { low = 0, medium = 1, high = 2, _ };
+
+/// Why a change was observed, so a client can tell a header-driven
+/// write from one only the reconcile could see. Purely informational —
+/// applying a change never depends on it.
+pub const CookieCause = enum(u8) {
+    /// A `Set-Cookie` response header, seen as it was saved.
+    response_header = 0,
+    /// The jar was found to differ from the last reconcile: a
+    /// `document.cookie` / `CookieStore` write, or any other change no
+    /// response header carried.
+    reconcile = 1,
+    _,
+};
+
+/// One cookie, WITH its value and every attribute needed to recreate
+/// it byte-for-byte in another instance's jar (see `CAP_COOKIE_SYNC`
+/// for why this block carries values and `CookieEntry` does not).
+///
+/// `creation_ms` / `last_access_ms` are carried because a faithful
+/// replica keeps them, but they are NOT part of what makes a cookie
+/// "changed": `last_access_ms` moves on every request the cookie is
+/// sent with, so diffing on it would emit a change per page load
+/// forever. `flags`/`same_site`/`priority`/`expires_ms`/`value` are.
+pub const SyncCookie = struct {
+    name: []const u8,
+    value: []const u8,
+    domain: []const u8,
+    path: []const u8,
+    /// `cookie_*` bits, the same ones `CookieEntry.flags` uses.
+    flags: u8,
+    /// A `SameSite` value.
+    same_site: u8,
+    /// A `CookiePriority` value.
+    priority: u8,
+    /// Milliseconds since the Unix epoch; 0 when unknown.
+    creation_ms: u64,
+    last_access_ms: u64,
+    /// 0 when `cookie_session` is set. A cookie whose expiry is in the
+    /// PAST is a deletion, and `ev_cookie_change` says so in `removed`
+    /// rather than making every client rediscover it.
+    expires_ms: u64,
+
+    fn encodeTo(self: SyncCookie, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putStr(gpa, out, self.name);
+        try putStr(gpa, out, self.value);
+        try putStr(gpa, out, self.domain);
+        try putStr(gpa, out, self.path);
+        try putU8(gpa, out, self.flags);
+        try putU8(gpa, out, self.same_site);
+        try putU8(gpa, out, self.priority);
+        try putU64(gpa, out, self.creation_ms);
+        try putU64(gpa, out, self.last_access_ms);
+        try putU64(gpa, out, self.expires_ms);
+    }
+
+    fn readFrom(cur: *Cur) !SyncCookie {
+        var ck: SyncCookie = undefined;
+        ck.name = try cur.readStr();
+        ck.value = try cur.readStr();
+        ck.domain = try cur.readStr();
+        ck.path = try cur.readStr();
+        ck.flags = try cur.readU8();
+        ck.same_site = try cur.readU8();
+        ck.priority = try cur.readU8();
+        ck.creation_ms = try cur.readU64();
+        ck.last_access_ms = try cur.readU64();
+        ck.expires_ms = try cur.readU64();
+        return ck;
+    }
+};
+
+/// Subscribe this CONNECTION to cookie-change events. Nothing streams
+/// before it, for the same reason the a11y stream waits to be asked:
+/// observing a jar costs a periodic full walk of it, and cookie values
+/// must not cross a socket that never asked for them. Disabling stops
+/// the stream and the walk again.
+pub const CookieSyncEnable = struct {
+    pub const tag: Tag = .cookie_sync_enable;
+    enable: u8,
+};
+
+/// One observed jar change in the helper's own instance. `context` is
+/// the identity context whose jar changed (0 = the shared jar). `url`
+/// is the request url the write came with for a response header, and
+/// a reconstructed `scheme://domain path` for a reconciled one — it is
+/// what `cookie_apply` wants back as its own `url`.
+pub const EvCookieChange = struct {
+    pub const tag: Tag = .ev_cookie_change;
+    context: u32,
+    /// A `CookieCause` value.
+    cause: u8,
+    /// 1 when the cookie is GONE (deleted, or expired in the past).
+    /// Its `cookie` fields still identify what to remove.
+    removed: u8,
+    url: []const u8,
+    cookie: SyncCookie,
+
+    pub fn encodeTo(self: EvCookieChange, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.context);
+        try putU8(gpa, out, self.cause);
+        try putU8(gpa, out, self.removed);
+        try putStr(gpa, out, self.url);
+        try self.cookie.encodeTo(gpa, out);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !EvCookieChange {
+        var cur = Cur{ .buf = payload };
+        const context = try cur.readU32();
+        const cause = try cur.readU8();
+        const removed = try cur.readU8();
+        const url = try cur.readStr();
+        return .{
+            .context = context,
+            .cause = cause,
+            .removed = removed,
+            .url = url,
+            .cookie = try SyncCookie.readFrom(&cur),
+        };
+    }
+};
+
+/// Write one cookie into `context`'s jar, or remove it when `remove`
+/// is 1. Answered by `ev_cookie_apply_done` with the same `req`.
+///
+/// A cookie applied this way must NOT come back as an
+/// `ev_cookie_change`, or two instances ping-pong forever. That is
+/// structural in the helper, not a suppression window: the reconcile
+/// emits on a DIFF against its shadow of the jar, and an apply updates
+/// that shadow as part of writing the jar, so there is no diff left to
+/// emit. Nothing here has to be timed.
+pub const CookieApply = struct {
+    pub const tag: Tag = .cookie_apply;
+    req: u32,
+    context: u32,
+    remove: u8,
+    url: []const u8,
+    cookie: SyncCookie,
+
+    pub fn encodeTo(self: CookieApply, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.req);
+        try putU32(gpa, out, self.context);
+        try putU8(gpa, out, self.remove);
+        try putStr(gpa, out, self.url);
+        try self.cookie.encodeTo(gpa, out);
+    }
+
+    pub fn decodeFrom(payload: []const u8) !CookieApply {
+        var cur = Cur{ .buf = payload };
+        const req = try cur.readU32();
+        const context = try cur.readU32();
+        const remove = try cur.readU8();
+        const url = try cur.readStr();
+        return .{
+            .req = req,
+            .context = context,
+            .remove = remove,
+            .url = url,
+            .cookie = try SyncCookie.readFrom(&cur),
+        };
+    }
+};
+
+/// The correlated answer to one `cookie_apply`. `reason` is empty on
+/// success and a short machine-readable token otherwise
+/// (`no-context`, `bad-url`, `engine-refused`, `set-failed`) — a
+/// silently dropped cookie is a login that does not follow the user,
+/// so every apply is answered exactly once.
+pub const EvCookieApplyDone = struct {
+    pub const tag: Tag = .ev_cookie_apply_done;
+    req: u32,
+    context: u32,
+    ok: u8,
+    reason: []const u8,
+};
+
+/// Ask for a page of every cookie in `context`'s jar, so a helper that
+/// just started can seed itself from a running one. `cursor` is 0 for
+/// the first page and afterwards whatever the previous page's
+/// `next_cursor` said.
+pub const CookieDumpReq = struct {
+    pub const tag: Tag = .cookie_dump_req;
+    req: u32,
+    context: u32,
+    cursor: u32,
+};
+
+/// One page of a jar dump.
+///
+/// `total` counts the whole jar as this walk saw it, so a client can
+/// show progress; it is not a promise that the jar held still. The
+/// cursor is an INDEX into the engine's own visit order (longest path,
+/// then earliest creation), so a cookie written between two pages can
+/// shift the tail by one — a seed is a starting point that the change
+/// stream then keeps current, never a transactional snapshot, and
+/// saying so here is cheaper than a snapshot nothing can provide.
+pub const EvCookieDump = struct {
+    pub const tag: Tag = .ev_cookie_dump;
+    req: u32,
+    context: u32,
+    /// 0 when the cookie store could not be reached at all.
+    ok: u8,
+    /// The cursor this page answers.
+    cursor: u32,
+    /// Pass this as the next request's `cursor` while `more` is 1.
+    next_cursor: u32,
+    more: u8,
+    total: u32,
+    cookies: []const SyncCookie,
+
+    pub fn encodeTo(self: EvCookieDump, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+        try putU32(gpa, out, self.req);
+        try putU32(gpa, out, self.context);
+        try putU8(gpa, out, self.ok);
+        try putU32(gpa, out, self.cursor);
+        try putU32(gpa, out, self.next_cursor);
+        try putU8(gpa, out, self.more);
+        try putU32(gpa, out, self.total);
+        try putU16(gpa, out, @intCast(self.cookies.len));
+        for (self.cookies) |ck| try ck.encodeTo(gpa, out);
+    }
+
+    /// Caller owns the returned `cookies` slice (strings borrow from
+    /// `payload`).
+    pub fn decodeAlloc(payload: []const u8, gpa: std.mem.Allocator) !EvCookieDump {
+        var cur = Cur{ .buf = payload };
+        const req = try cur.readU32();
+        const context = try cur.readU32();
+        const ok = try cur.readU8();
+        const cursor = try cur.readU32();
+        const next_cursor = try cur.readU32();
+        const more = try cur.readU8();
+        const total = try cur.readU32();
+        const n = try cur.readU16();
+        const cookies = try gpa.alloc(SyncCookie, n);
+        errdefer gpa.free(cookies);
+        for (cookies) |*ck| ck.* = try SyncCookie.readFrom(&cur);
+        return .{
+            .req = req,
+            .context = context,
+            .ok = ok,
+            .cursor = cursor,
+            .next_cursor = next_cursor,
+            .more = more,
+            .total = total,
+            .cookies = cookies,
+        };
+    }
+};
+
 // -- WebExtensions (0xB0 block, capability "webext") ------------------
 //
 // The GUI owns the extension FILES (it installs an unpacked dir or an
@@ -3789,6 +4088,150 @@ test "round-trip: intercept_log entry list" {
     try std.testing.expectEqual(@as(u8, 1), got.entries[0].blocked);
     try std.testing.expectEqualStrings("https://site.example/app.js", got.entries[1].url);
     try std.testing.expectEqual(@as(u16, 200), got.entries[1].status);
+}
+
+test "round-trip: cookie sync carries every attribute, values included" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+
+    const ck = SyncCookie{
+        .name = "sid",
+        .value = "s3cr3t-value",
+        .domain = ".site.example",
+        .path = "/app",
+        .flags = cookie_secure | cookie_httponly | cookie_domain_scoped,
+        .same_site = @intFromEnum(SameSite.strict),
+        .priority = @intFromEnum(CookiePriority.high),
+        .creation_ms = 1_700_000_000_000,
+        .last_access_ms = 1_700_000_500_000,
+        .expires_ms = 1_800_000_000_000,
+    };
+
+    try encode(gpa, &buf, EvCookieChange{
+        .context = 0,
+        .cause = @intFromEnum(CookieCause.response_header),
+        .removed = 0,
+        .url = "https://site.example/app/login",
+        .cookie = ck,
+    });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.ev_cookie_change, frame.tag);
+    const got = try decode(EvCookieChange, frame.payload);
+    try std.testing.expectEqualStrings("https://site.example/app/login", got.url);
+    try std.testing.expectEqual(@as(u8, 0), got.removed);
+    // Every attribute survives: a dropped HttpOnly or SameSite is a
+    // security regression, a dropped expiry turns a persistent cookie
+    // into a session one.
+    try std.testing.expectEqualStrings("sid", got.cookie.name);
+    try std.testing.expectEqualStrings("s3cr3t-value", got.cookie.value);
+    try std.testing.expectEqualStrings(".site.example", got.cookie.domain);
+    try std.testing.expectEqualStrings("/app", got.cookie.path);
+    try std.testing.expect(got.cookie.flags & cookie_secure != 0);
+    try std.testing.expect(got.cookie.flags & cookie_httponly != 0);
+    try std.testing.expect(got.cookie.flags & cookie_domain_scoped != 0);
+    try std.testing.expect(got.cookie.flags & cookie_session == 0);
+    try std.testing.expectEqual(@intFromEnum(SameSite.strict), got.cookie.same_site);
+    try std.testing.expectEqual(@intFromEnum(CookiePriority.high), got.cookie.priority);
+    try std.testing.expectEqual(@as(u64, 1_700_000_000_000), got.cookie.creation_ms);
+    try std.testing.expectEqual(@as(u64, 1_700_000_500_000), got.cookie.last_access_ms);
+    try std.testing.expectEqual(@as(u64, 1_800_000_000_000), got.cookie.expires_ms);
+
+    // The apply direction is the same record with a target context.
+    buf.clearRetainingCapacity();
+    try encode(gpa, &buf, CookieApply{
+        .req = 91,
+        .context = EPHEMERAL_CTX_BASE + 3,
+        .remove = 1,
+        .url = "https://site.example/app",
+        .cookie = ck,
+    });
+    var r2 = Reader.init(buf.items);
+    const f2 = (try r2.next()).?;
+    const ap = try decode(CookieApply, f2.payload);
+    try std.testing.expectEqual(@as(u32, 91), ap.req);
+    try std.testing.expectEqual(EPHEMERAL_CTX_BASE + 3, ap.context);
+    try std.testing.expectEqual(@as(u8, 1), ap.remove);
+    try std.testing.expectEqualStrings("s3cr3t-value", ap.cookie.value);
+
+    try roundTrip(CookieSyncEnable, .{ .enable = 1 });
+    try roundTrip(CookieDumpReq, .{ .req = 4, .context = 0, .cursor = 128 });
+    try roundTrip(EvCookieApplyDone, .{ .req = 91, .context = 0, .ok = 0, .reason = "engine-refused" });
+    try roundTrip(EvCookieApplyDone, .{ .req = 92, .context = 0, .ok = 1, .reason = "" });
+}
+
+test "round-trip: cookie dump pages and reports its own bound" {
+    const gpa = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(gpa);
+    const cookies = [_]SyncCookie{
+        .{
+            .name = "a",
+            .value = "1",
+            .domain = "site.example",
+            .path = "/",
+            .flags = 0,
+            .same_site = @intFromEnum(SameSite.lax),
+            .priority = @intFromEnum(CookiePriority.medium),
+            .creation_ms = 7,
+            .last_access_ms = 8,
+            .expires_ms = 0,
+        },
+        .{
+            .name = "b",
+            .value = "",
+            .domain = ".site.example",
+            .path = "/x",
+            .flags = cookie_session | cookie_domain_scoped,
+            .same_site = @intFromEnum(SameSite.unspecified),
+            .priority = @intFromEnum(CookiePriority.low),
+            .creation_ms = 0,
+            .last_access_ms = 0,
+            .expires_ms = 0,
+        },
+    };
+    try encode(gpa, &buf, EvCookieDump{
+        .req = 5,
+        .context = 0,
+        .ok = 1,
+        .cursor = 0,
+        .next_cursor = 2,
+        .more = 1,
+        .total = 300,
+        .cookies = &cookies,
+    });
+    var r = Reader.init(buf.items);
+    const frame = (try r.next()).?;
+    try std.testing.expectEqual(Tag.ev_cookie_dump, frame.tag);
+    const got = try EvCookieDump.decodeAlloc(frame.payload, gpa);
+    defer gpa.free(got.cookies);
+    try std.testing.expectEqual(@as(u32, 300), got.total);
+    try std.testing.expectEqual(@as(u8, 1), got.more);
+    try std.testing.expectEqual(@as(u32, 2), got.next_cursor);
+    try std.testing.expectEqual(@as(usize, 2), got.cookies.len);
+    try std.testing.expectEqualStrings("a", got.cookies[0].name);
+    try std.testing.expectEqualStrings("", got.cookies[1].value);
+    try std.testing.expect(got.cookies[1].flags & cookie_session != 0);
+
+    // An empty final page is a valid frame: it is how a dump ENDS.
+    buf.clearRetainingCapacity();
+    try encode(gpa, &buf, EvCookieDump{
+        .req = 5,
+        .context = 0,
+        .ok = 1,
+        .cursor = 300,
+        .next_cursor = 300,
+        .more = 0,
+        .total = 300,
+        .cookies = &.{},
+    });
+    var r2 = Reader.init(buf.items);
+    const f2 = (try r2.next()).?;
+    const last = try EvCookieDump.decodeAlloc(f2.payload, gpa);
+    defer gpa.free(last.cookies);
+    try std.testing.expectEqual(@as(usize, 0), last.cookies.len);
+    try std.testing.expectEqual(@as(u8, 0), last.more);
 }
 
 test "round-trip: site-data request frames" {
