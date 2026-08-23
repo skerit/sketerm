@@ -856,7 +856,7 @@ fn linkThread(data: ?*anyopaque) callconv(.c) ?*anyopaque {
     run: {
         var config = Config.load(a);
         defer config.deinit();
-        const conn = muxclient.Conn.connectRemote(a, job.host, config.udpRange()) catch break :run;
+        const conn = muxclient.Conn.connectRemote(a, job.host, config.muxConnectOptions()) catch break :run;
         job.conn = conn;
         job.ok = true;
         job.lsp = conn.lsp_support;

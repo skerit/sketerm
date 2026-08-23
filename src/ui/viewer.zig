@@ -225,7 +225,7 @@ pub fn connectFs(host: ?[]const u8) !fsdrive.Fs {
     const conn = if (host) |remote| blk: {
         var config = Config.load(allocator);
         defer config.deinit();
-        break :blk try muxclient.Conn.connectRemote(allocator, remote, config.udpRange());
+        break :blk try muxclient.Conn.connectRemote(allocator, remote, config.muxConnectOptions());
     } else try muxclient.Conn.connectLocalAutostart(allocator);
     return fsdrive.Fs.initConn(allocator, conn);
 }

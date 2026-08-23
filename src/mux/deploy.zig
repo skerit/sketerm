@@ -19,6 +19,7 @@ const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
 const filehash = @import("../util/filehash.zig");
+const sshroute = @import("sshroute.zig");
 
 const CHECK_MISSING: u8 = 66;
 const CHECK_UNSUPPORTED: u8 = 65;
@@ -44,7 +45,7 @@ pub const Prepared = struct {
 
 const Runner = struct {
     ctx: ?*anyopaque = null,
-    run: *const fn (?*anyopaque, [*:0]const u8, []const u8, [:0]const u8, ?[]const u8) u8,
+    run: *const fn (?*anyopaque, *const sshroute.Plan, [*:0]const u8, [:0]const u8, ?[]const u8) u8,
 };
 
 /// How long a verified remote deployment is trusted before it is
@@ -52,8 +53,10 @@ const Runner = struct {
 /// used to pay the check round trip on every single dial.
 const DEPLOY_MEMO_TTL_S: i64 = 600;
 
-fn deployMemoPath(buf: []u8, host: []const u8, hash: []const u8) ?[:0]const u8 {
-    const h = std.hash.Wyhash.hash(0, host);
+fn deployMemoPath(buf: []u8, plan: *const sshroute.Plan, hash: []const u8) ?[:0]const u8 {
+    var route_buf: [1024]u8 = undefined;
+    const route_key = plan.memoKey(&route_buf) orelse return null;
+    const h = std.hash.Wyhash.hash(0, route_key);
     const tail = hash[0..@min(hash.len, 16)];
     if (c.getenv("XDG_CACHE_HOME")) |raw| {
         const base = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
@@ -64,18 +67,18 @@ fn deployMemoPath(buf: []u8, host: []const u8, hash: []const u8) ?[:0]const u8 {
     return std.fmt.bufPrintZ(buf, "{s}/.cache/sketerm/mux/deployed-{x:0>16}-{s}", .{ home, h, tail }) catch null;
 }
 
-fn deployMemoFresh(host: []const u8, hash: []const u8) bool {
+fn deployMemoFresh(plan: *const sshroute.Plan, hash: []const u8) bool {
     var buf: [4096]u8 = undefined;
-    const path = deployMemoPath(&buf, host, hash) orelse return false;
+    const path = deployMemoPath(&buf, plan, hash) orelse return false;
     var st: c.struct_stat = undefined;
     if (c.stat(path.ptr, &st) != 0) return false;
     const mtime = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim.tv_sec else st.st_mtimespec.tv_sec;
     return @divTrunc(wallMs(), 1000) - @as(i64, mtime) <= DEPLOY_MEMO_TTL_S;
 }
 
-fn deployMemoStamp(host: []const u8, hash: []const u8) void {
+fn deployMemoStamp(plan: *const sshroute.Plan, hash: []const u8) void {
     var buf: [4096]u8 = undefined;
-    const path = deployMemoPath(&buf, host, hash) orelse return;
+    const path = deployMemoPath(&buf, plan, hash) orelse return;
     if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| {
         var dir_buf: [4096:0]u8 = undefined;
         if (std.fmt.bufPrintZ(&dir_buf, "{s}", .{path[0..slash]})) |dir| {
@@ -95,7 +98,7 @@ fn deployMemoStamp(host: []const u8, hash: []const u8) void {
 }
 
 /// Ensure the matching portable mux exists remotely; null preserves PATH fallback.
-pub fn prepare(allocator: std.mem.Allocator, host: []const u8) ?Prepared {
+pub fn prepare(allocator: std.mem.Allocator, plan: *const sshroute.Plan) ?Prepared {
     // Existing test/transport wrappers expect only the historical proxy argv.
     // An explicit artifact opts a wrapper into deployment testing or use.
     if (c.getenv("SKETERM_SSH") != null and c.getenv("SKETERM_MUX_PORTABLE") == null) return null;
@@ -106,7 +109,7 @@ pub fn prepare(allocator: std.mem.Allocator, host: []const u8) ?Prepared {
     // A recent verified deploy of this exact artifact skips the ssh
     // check leg entirely (content-addressed path, so a stale memo can
     // only name a binary that once passed its own --help probe).
-    if (deployMemoFresh(host, &artifact.hash.hex)) {
+    if (deployMemoFresh(plan, &artifact.hash.hex)) {
         const remote_path = std.fmt.allocPrintSentinel(
             allocator,
             "$HOME/.cache/sketerm/mux/sketerm-mux-{s}",
@@ -117,8 +120,8 @@ pub fn prepare(allocator: std.mem.Allocator, host: []const u8) ?Prepared {
     }
     const ssh_env = c.getenv("SKETERM_SSH");
     const ssh_bin: [*:0]const u8 = if (ssh_env) |p| p else "ssh";
-    const prepared = ensureUsing(allocator, host, ssh_bin, artifact, .{ .run = runSshCommand });
-    if (prepared != null) deployMemoStamp(host, &artifact.hash.hex);
+    const prepared = ensureUsing(allocator, plan, ssh_bin, artifact, .{ .run = runSshCommand });
+    if (prepared != null) deployMemoStamp(plan, &artifact.hash.hex);
     return prepared;
 }
 
@@ -205,7 +208,7 @@ fn elfArch(header: []const u8) ?Arch {
 
 fn ensureUsing(
     allocator: std.mem.Allocator,
-    host: []const u8,
+    plan: *const sshroute.Plan,
     ssh_bin: [*:0]const u8,
     artifact: Artifact,
     runner: Runner,
@@ -261,7 +264,7 @@ fn ensureUsing(
     ) catch return null;
     defer allocator.free(check);
 
-    const checked = runner.run(runner.ctx, ssh_bin, host, check, null);
+    const checked = runner.run(runner.ctx, plan, ssh_bin, check, null);
     if (checked == 0) {
         keep_remote_path = true;
         return .{ .allocator = allocator, .path = remote_path };
@@ -282,7 +285,7 @@ fn ensureUsing(
         0,
     ) catch return null;
     defer allocator.free(upload_word);
-    if (runner.run(runner.ctx, ssh_bin, host, upload_word, artifact.path) != 0) return null;
+    if (runner.run(runner.ctx, plan, ssh_bin, upload_word, artifact.path) != 0) return null;
     keep_remote_path = true;
     return .{ .allocator = allocator, .path = remote_path };
 }
@@ -335,9 +338,11 @@ fn sendBytes(fd: c_int, bytes: []const u8, deadline: i64) bool {
     return true;
 }
 
-fn runSshCommand(_: ?*anyopaque, ssh_bin: [*:0]const u8, host: []const u8, command: [:0]const u8, input_path: ?[]const u8) u8 {
+fn runSshCommand(_: ?*anyopaque, plan: *const sshroute.Plan, ssh_bin: [*:0]const u8, command: [:0]const u8, input_path: ?[]const u8) u8 {
     var host_buf: [256:0]u8 = undefined;
-    const host_z = std.fmt.bufPrintZ(&host_buf, "{s}", .{host}) catch return 255;
+    const host_z = std.fmt.bufPrintZ(&host_buf, "{s}", .{plan.destination}) catch return 255;
+    const custom = c.getenv("SKETERM_SSH") != null;
+    var route_args = plan.args(!custom and canMultiplex()) catch return 255;
     var pair: [2]c_int = undefined;
     if (platform.socketpairCloexec(&pair) != 0) return 255;
     const devnull = c.open("/dev/null", c.O_WRONLY | c.O_CLOEXEC);
@@ -346,29 +351,15 @@ fn runSshCommand(_: ?*anyopaque, ssh_bin: [*:0]const u8, host: []const u8, comma
         _ = c.close(pair[1]);
         return 255;
     }
-
-    const custom = c.getenv("SKETERM_SSH") != null;
-    var argv: [16:null]?[*:0]const u8 = .{null} ** 16;
+    var argv: [32:null]?[*:0]const u8 = .{null} ** 32;
     var n: usize = 0;
     argv[n] = ssh_bin;
     n += 1;
-    argv[n] = "-T";
-    n += 1;
-    argv[n] = "-x";
-    n += 1;
-    argv[n] = "-o";
-    n += 1;
-    argv[n] = "BatchMode=yes";
-    n += 1;
-    if (!custom and canMultiplex()) {
-        argv[n] = "-o";
-        argv[n + 1] = "ControlMaster=auto";
-        argv[n + 2] = "-o";
-        argv[n + 3] = "ControlPath=~/.ssh/sketerm-%C";
-        argv[n + 4] = "-o";
-        argv[n + 5] = "ControlPersist=120";
-        n += 6;
-    }
+    route_args.append(&argv, &n) catch return 255;
+    // `append` bounds itself; the destination and command slots below do
+    // not, so keep the room for them a checked fact rather than a count
+    // someone re-derives after adding another `-o` pair.
+    if (n + 3 > argv.len) return 255;
     // Either way the remote command is a SINGLE word — nothing for any
     // login shell dialect to misparse. Without a payload it is `sh`
     // and `command` is the script ridden in on stdin; with a payload
@@ -447,14 +438,17 @@ fn runSshCommand(_: ?*anyopaque, ssh_bin: [*:0]const u8, host: []const u8, comma
 const FakeRunner = struct {
     statuses: [2]u8,
     expected_arch_case: []const u8 = "",
+    expected_route: ?sshroute.Route = null,
     calls: usize = 0,
     uploads: usize = 0,
     upload_script_ok: bool = false,
     check_script_ok: bool = false,
     arch_guard_ok: bool = false,
+    route_ok: bool = true,
 
-    fn run(raw: ?*anyopaque, _: [*:0]const u8, _: []const u8, command: [:0]const u8, input: ?[]const u8) u8 {
+    fn run(raw: ?*anyopaque, plan: *const sshroute.Plan, _: [*:0]const u8, command: [:0]const u8, input: ?[]const u8) u8 {
         const self: *FakeRunner = @ptrCast(@alignCast(raw.?));
+        if (self.expected_route) |route| self.route_ok = self.route_ok and plan.route == route;
         if (input != null) {
             self.uploads += 1;
             // The upload command must be ONE bare word (dialect-proof)
@@ -484,9 +478,14 @@ fn fakeArtifact(fill: u8) Artifact {
     };
 }
 
+fn testPlan(host: []const u8) sshroute.Plan {
+    return sshroute.Plan.init(host, .direct, @import("socks5_client.zig").DEFAULT_ENDPOINT) catch unreachable;
+}
+
 test "deployment reuses a current content-addressed mux" {
     var fake = FakeRunner{ .statuses = .{ 0, 0 } };
-    var result = ensureUsing(std.testing.allocator, "box", "ssh", fakeArtifact('a'), .{ .ctx = &fake, .run = FakeRunner.run }).?;
+    const plan = testPlan("box");
+    var result = ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('a'), .{ .ctx = &fake, .run = FakeRunner.run }).?;
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(@as(usize, 0), fake.uploads);
@@ -495,12 +494,23 @@ test "deployment reuses a current content-addressed mux" {
 
 test "deployment uploads an absent or stale mux" {
     var fake = FakeRunner{ .statuses = .{ CHECK_MISSING, 0 } };
-    var result = ensureUsing(std.testing.allocator, "box", "ssh", fakeArtifact('b'), .{ .ctx = &fake, .run = FakeRunner.run }).?;
+    const plan = testPlan("box");
+    var result = ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('b'), .{ .ctx = &fake, .run = FakeRunner.run }).?;
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.uploads);
     try std.testing.expect(fake.upload_script_ok);
     try std.testing.expect(fake.check_script_ok);
+}
+
+test "Tor deployment keeps check and upload on the forced route" {
+    var fake = FakeRunner{ .statuses = .{ CHECK_MISSING, 0 }, .expected_route = .tor };
+    const plan = sshroute.Plan.init("work-alias", .tor, "127.0.0.1:9150") catch unreachable;
+    var result = ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('7'), .{ .ctx = &fake, .run = FakeRunner.run }).?;
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expect(fake.route_ok);
+    try std.testing.expect(fake.upload_script_ok);
 }
 
 test "check and upload run through a real sh with the payload on stdin" {
@@ -549,7 +559,8 @@ test "check and upload run through a real sh with the payload on stdin" {
 
     // Round 1: check misses and stages the uploader, upload streams
     // the raw payload into it and publishes.
-    var first = ensureUsing(std.testing.allocator, "box", ssh.ptr, artifact, .{ .run = runSshCommand }) orelse
+    const plan = testPlan("box");
+    var first = ensureUsing(std.testing.allocator, &plan, ssh.ptr, artifact, .{ .run = runSshCommand }) orelse
         return error.TestUnexpectedResult;
     first.deinit();
     var deployed_buf: [256:0]u8 = undefined;
@@ -565,7 +576,7 @@ test "check and upload run through a real sh with the payload on stdin" {
 
     // Round 2: the check recognizes the deployed copy — no re-upload
     // (proven by mtime staying put would race; size+success suffices).
-    var second = ensureUsing(std.testing.allocator, "box", ssh.ptr, artifact, .{ .run = runSshCommand }) orelse
+    var second = ensureUsing(std.testing.allocator, &plan, ssh.ptr, artifact, .{ .run = runSshCommand }) orelse
         return error.TestUnexpectedResult;
     second.deinit();
 
@@ -573,22 +584,23 @@ test "check and upload run through a real sh with the payload on stdin" {
     // before any payload flows.
     const other: Arch = if (arch == .x86_64) .aarch64 else .x86_64;
     const mismatched = Artifact{ .path = "/bin/true", .arch = other, .hash = hash };
-    try std.testing.expect(ensureUsing(std.testing.allocator, "box", ssh.ptr, mismatched, .{ .run = runSshCommand }) == null);
-
+    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, ssh.ptr, mismatched, .{ .run = runSshCommand }) == null);
 }
 
 test "deployment leaves unsupported hosts and failed checks untouched" {
+    const plan = testPlan("box");
     var unsupported = FakeRunner{ .statuses = .{ CHECK_UNSUPPORTED, 0 } };
-    try std.testing.expect(ensureUsing(std.testing.allocator, "box", "ssh", fakeArtifact('c'), .{ .ctx = &unsupported, .run = FakeRunner.run }) == null);
+    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('c'), .{ .ctx = &unsupported, .run = FakeRunner.run }) == null);
     try std.testing.expectEqual(@as(usize, 1), unsupported.calls);
     var failed = FakeRunner{ .statuses = .{ 255, 0 } };
-    try std.testing.expect(ensureUsing(std.testing.allocator, "box", "ssh", fakeArtifact('d'), .{ .ctx = &failed, .run = FakeRunner.run }) == null);
+    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('d'), .{ .ctx = &failed, .run = FakeRunner.run }) == null);
     try std.testing.expectEqual(@as(usize, 1), failed.calls);
 }
 
 test "deployment falls back when an upload fails" {
+    const plan = testPlan("box");
     var fake = FakeRunner{ .statuses = .{ CHECK_MISSING, 74 } };
-    try std.testing.expect(ensureUsing(std.testing.allocator, "box", "ssh", fakeArtifact('e'), .{ .ctx = &fake, .run = FakeRunner.run }) == null);
+    try std.testing.expect(ensureUsing(std.testing.allocator, &plan, "ssh", fakeArtifact('e'), .{ .ctx = &fake, .run = FakeRunner.run }) == null);
     try std.testing.expectEqual(@as(usize, 2), fake.calls);
     try std.testing.expectEqual(@as(usize, 1), fake.uploads);
 }
@@ -611,7 +623,8 @@ test "deployment accepts supported portable ELF architectures" {
             .statuses = .{ 0, 0 },
             .expected_arch_case = case.remote_names,
         };
-        var result = ensureUsing(std.testing.allocator, "box", "ssh", .{
+        const plan = testPlan("box");
+        var result = ensureUsing(std.testing.allocator, &plan, "ssh", .{
             .path = "/tmp/mux-portable",
             .arch = arch,
             .hash = .{ .hex = [_]u8{'f'} ** 64, .size = 1234 },

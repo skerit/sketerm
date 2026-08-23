@@ -34,7 +34,7 @@ pub fn muxConnect(self: *Window, host: ?[]const u8) !@import("../mux/client.zig"
         }
         const remote = mux_client.RemoteSpec.parse(h);
         if (remote.mode == .auto) return mux_client.Conn.connectSsh(self.allocator, remote.host);
-        return mux_client.Conn.connectRemote(self.allocator, h, self.config.udpRange());
+        return mux_client.Conn.connectRemote(self.allocator, h, self.config.muxConnectOptions());
     }
     return mux_client.Conn.connectLocalAutostart(self.allocator);
 }
@@ -243,6 +243,7 @@ pub fn attachMuxApp(
             identity,
             host,
             self.config.mux_udp_port_range,
+            self.config.mux_tor_socks_endpoint,
             read_only,
             want_control,
         );
@@ -443,6 +444,7 @@ pub fn makeRemotePaneFromSnap(
             identity,
             host,
             self.config.mux_udp_port_range,
+            self.config.mux_tor_socks_endpoint,
             read_only,
             want_control,
         );
@@ -558,6 +560,7 @@ pub const MuxRestoreJob = struct {
     session: []u8,
     host: []u8,
     port_range: []u8,
+    tor_socks_endpoint: []u8,
     kb_layout: []u8,
     remote_shell: []u8,
     term: []u8,
@@ -577,6 +580,7 @@ pub const MuxRestoreJob = struct {
         job.allocator.free(job.session);
         job.allocator.free(job.host);
         job.allocator.free(job.port_range);
+        job.allocator.free(job.tor_socks_endpoint);
         job.allocator.free(job.kb_layout);
         job.allocator.free(job.remote_shell);
         job.allocator.free(job.term);
@@ -600,16 +604,24 @@ pub fn startMuxRestoreJob(self: *Window, pane: *Pane, spec: layout_mod.PaneSpec)
         a.free(host);
         return;
     };
+    const tor_socks_endpoint = a.dupe(u8, self.config.mux_tor_socks_endpoint) catch {
+        a.free(session);
+        a.free(host);
+        a.free(port_range);
+        return;
+    };
     const kb_layout = a.dupe(u8, self.config.app_keyboard_layout) catch {
         a.free(session);
         a.free(host);
         a.free(port_range);
+        a.free(tor_socks_endpoint);
         return;
     };
     const remote_shell = a.dupe(u8, settings.shell orelse "") catch {
         a.free(session);
         a.free(host);
         a.free(port_range);
+        a.free(tor_socks_endpoint);
         a.free(kb_layout);
         return;
     };
@@ -617,6 +629,7 @@ pub fn startMuxRestoreJob(self: *Window, pane: *Pane, spec: layout_mod.PaneSpec)
         a.free(session);
         a.free(host);
         a.free(port_range);
+        a.free(tor_socks_endpoint);
         a.free(kb_layout);
         a.free(remote_shell);
         return;
@@ -625,6 +638,7 @@ pub fn startMuxRestoreJob(self: *Window, pane: *Pane, spec: layout_mod.PaneSpec)
         a.free(session);
         a.free(host);
         a.free(port_range);
+        a.free(tor_socks_endpoint);
         a.free(kb_layout);
         a.free(remote_shell);
         a.free(term);
@@ -634,6 +648,7 @@ pub fn startMuxRestoreJob(self: *Window, pane: *Pane, spec: layout_mod.PaneSpec)
         a.free(session);
         a.free(host);
         a.free(port_range);
+        a.free(tor_socks_endpoint);
         a.free(kb_layout);
         a.free(remote_shell);
         a.free(term);
@@ -647,6 +662,7 @@ pub fn startMuxRestoreJob(self: *Window, pane: *Pane, spec: layout_mod.PaneSpec)
         .session = session,
         .host = host,
         .port_range = port_range,
+        .tor_socks_endpoint = tor_socks_endpoint,
         .kb_layout = kb_layout,
         .remote_shell = remote_shell,
         .term = term,
@@ -703,7 +719,10 @@ pub fn muxRestoreConnect(job: *MuxRestoreJob) !void {
     var conn = try mux_client.Conn.connectRemote(
         job.allocator,
         job.host,
-        if (job.port_range.len > 0) job.port_range else null,
+        .{
+            .udp_port_range = if (job.port_range.len > 0) job.port_range else null,
+            .tor_socks_endpoint = job.tor_socks_endpoint,
+        },
     );
     errdefer conn.deinit();
 

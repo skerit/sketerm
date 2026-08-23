@@ -35,6 +35,7 @@ comptime {
     // itself is opt-in (`zig build web`) but its wire format and key
     // mapping are testable everywhere.
     _ = @import("web/protocol.zig");
+    _ = @import("web/route.zig");
     _ = @import("web/ozone.zig");
     _ = @import("web/keymap.zig");
     _ = @import("web/semantic.zig");
@@ -84,6 +85,8 @@ comptime {
     _ = @import("panelvocab_drift_test.zig");
     _ = @import("mux/predict.zig");
     _ = @import("mux/deploy.zig");
+    _ = @import("mux/socks5_client.zig");
+    _ = @import("mux/sshroute.zig");
     _ = @import("mux/kitty_inline.zig");
     _ = @import("parser/event.zig");
     _ = @import("parser/vt.zig");

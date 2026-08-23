@@ -2165,7 +2165,7 @@ fn connectHostFs(allocator: std.mem.Allocator, host: []const u8) !fsdrive.Fs {
         // copy journaled at submission time.
         var cfg = @import("../config.zig").Config.load(allocator);
         defer cfg.deinit();
-        break :blk try muxclient.Conn.connectRemote(allocator, host, cfg.udpRange());
+        break :blk try muxclient.Conn.connectRemote(allocator, host, cfg.muxConnectOptions());
     };
     return fsdrive.Fs.initConn(allocator, conn);
 }

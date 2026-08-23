@@ -7,7 +7,7 @@
 //! renders each window locally. There is therefore one hard
 //! requirement: a sketerm window must already be open on this desktop.
 //!
-//! Transports mirror `sketerm mux`: automatic UDP with SSH fallback;
+//! Transports mirror `sketerm mux`: automatic UDP with SSH fallback or forced Tor;
 //! `-u` forces roaming UDP. `$SKETERM_SSH` overrides the ssh binary (tests fake
 //! a remote host); key/agent auth is required (BatchMode — no password
 //! prompts on a non-tty pipe).
@@ -58,7 +58,7 @@ const USAGE =
     \\  sketerm app -i archdev pcmanfm
     \\
     \\<domain> names from config.conf `[domain.<name>]` sections work
-    \\(transport defaults to auto; ssh/udp can be forced per domain).
+    \\(transport defaults to auto; ssh/udp/tor can be forced per domain).
     \\
 ;
 
@@ -120,7 +120,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
 
     // Spawn an app-kind session on the host's daemon and hand it to
     // the running GUI, whose compositor brain renders the windows.
-    return runNativeApp(allocator, host_spec, parsed.command, cfg.udpRange(), parsed.isolated, parsed.gpu, parsed.headless, cfg.app_keyboard_layout);
+    return runNativeApp(allocator, host_spec, parsed.command, cfg.muxConnectOptions(), parsed.isolated, parsed.gpu, parsed.headless, cfg.app_keyboard_layout);
 }
 
 /// The session runs whether or not a viewer renders it; say so
@@ -189,14 +189,14 @@ fn runNativeApp(
     allocator: std.mem.Allocator,
     host_spec: []const u8,
     command: []const []const u8,
-    port_range: ?[]const u8,
+    connect_options: mux_client.ConnectOptions,
     isolated: bool,
     gpu: bool,
     headless: bool,
     kb_layout: []const u8,
 ) u8 {
     const remote = mux_client.RemoteSpec.parse(host_spec);
-    var conn = mux_client.Conn.connectRemote(allocator, host_spec, port_range) catch {
+    var conn = mux_client.Conn.connectRemote(allocator, host_spec, connect_options) catch {
         errMsg("could not reach {s} using {s} transport policy (key/agent auth + sketerm-mux required there)", .{ remote.host, @tagName(remote.mode) });
         return 1;
     };

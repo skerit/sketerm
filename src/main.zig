@@ -314,6 +314,17 @@ fn upgradeLocalDaemon(allocator: std.mem.Allocator) void {
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
+    const argv = init.args.vector;
+    // Internal OpenSSH ProxyCommand. It is intentionally absent from help;
+    // dispatch before application initialization, then discard the environment.
+    if (argv.len == 5 and std.mem.eql(u8, std.mem.span(argv[1]), "--internal-socks5-connect")) {
+        return @import("mux/socks5_client.zig").serve(
+            std.mem.span(argv[2]),
+            std.mem.span(argv[3]),
+            std.mem.span(argv[4]),
+        );
+    }
+
     var gpa_state: std.heap.DebugAllocator(.{}) = .{};
     defer _ = gpa_state.deinit();
     const allocator = gpa_state.allocator();
@@ -330,8 +341,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // user gets output even with no display. Everything else is
     // forwarded to the primary instance via "command-line" so a
     // second `sketerm --toggle` invocation reaches the running app.
-    const argv = init.args.vector;
-
     // `sketerm cli ...` is the remote-control client: pure socket
     // talk, never enters GApplication (no display, no D-Bus
     // round-trip to the primary instance).
@@ -438,6 +447,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var host_buf: [300]u8 = undefined;
         const host: []const u8 = if (use_udp) blk: {
             const remote = @import("mux/client.zig").RemoteSpec.parse(host_raw);
+            // `-u` may not override a transport the spec already forced.
+            // A `[domain.x] transport = tor` entry resolves to `tor:host`,
+            // and rewriting that to `udp:host` would dial the real host
+            // directly over UDP with no proxy at all.
+            if (remote.mode == .tor or remote.mode == .ssh) {
+                _ = c.fprintf(platform.stderr(), "sketerm ssh: -u conflicts with the forced transport of '%.*s'\n", @as(c_int, @intCast(host_raw.len)), host_raw.ptr);
+                return 2;
+            }
             break :blk std.fmt.bufPrint(&host_buf, "udp:{s}", .{remote.host}) catch return 2;
         } else host_raw;
         const ssh_args = [_][]const u8{ host, "new" };

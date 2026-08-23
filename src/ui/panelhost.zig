@@ -391,6 +391,7 @@ const PanelOpenSessionJob = struct {
     /// local daemon; a custom local daemon retains its source "sock:" spec.
     host: ?[]u8,
     port_range: []u8,
+    tor_socks_endpoint: []u8,
     /// Cross-thread cancellation; see PanelTabJob.cancel.
     cancel: mux_client.FdCancel = .{},
     conn: ?mux_client.Conn = null,
@@ -420,6 +421,7 @@ const PanelOpenSessionJob = struct {
         if (self.socket) |socket| self.allocator.free(socket);
         if (self.host) |host| self.allocator.free(host);
         if (self.port_range.len > 0) self.allocator.free(self.port_range);
+        self.allocator.free(self.tor_socks_endpoint);
         self.allocator.destroy(self);
     }
 };
@@ -2162,6 +2164,8 @@ fn startPanelOpenSession(
     else
         &.{};
     errdefer if (port_range.len > 0) a.free(port_range);
+    const tor_socks_endpoint = try a.dupe(u8, remote.tor_socks_endpoint);
+    errdefer a.free(tor_socks_endpoint);
     const session_copy = try a.dupe(u8, target_session);
     errdefer a.free(session_copy);
     const job = try a.create(PanelOpenSessionJob);
@@ -2180,6 +2184,7 @@ fn startPanelOpenSession(
         .socket = socket,
         .host = host,
         .port_range = port_range,
+        .tor_socks_endpoint = tor_socks_endpoint,
     };
     try panel_open_session_jobs.append(a, job);
     errdefer _ = panel_open_session_jobs.pop();
@@ -2210,7 +2215,10 @@ fn panelOpenSessionConnect(job: *PanelOpenSessionJob) !void {
         try mux_client.Conn.connectRemote(
             job.allocator,
             job.host orelse return error.MissingSourceTransport,
-            if (job.port_range.len > 0) job.port_range else null,
+            .{
+                .udp_port_range = if (job.port_range.len > 0) job.port_range else null,
+                .tor_socks_endpoint = job.tor_socks_endpoint,
+            },
         );
     errdefer conn.deinit();
     // publish also settles the stop-before-publish window: a teardown

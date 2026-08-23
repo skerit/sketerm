@@ -118,7 +118,22 @@ pub const CastPlayerBox = struct {
         const snap = conn.recvExpect(&.{.snapshot}) catch return error.AttachFailed;
         defer snap.deinit(allocator);
 
-        const terminal = try Terminal.initRemote(allocator, conn, name, snap.payload, .{}, loc.host, "", false, false);
+        // Scoped: initRemote dupes the endpoint into the Terminal, and a
+        // `tor:` cast host must reconnect through the CONFIGURED proxy.
+        var route_cfg = Config.load(allocator);
+        defer route_cfg.deinit();
+        const terminal = try Terminal.initRemote(
+            allocator,
+            conn,
+            name,
+            snap.payload,
+            .{},
+            loc.host,
+            "",
+            route_cfg.mux_tor_socks_endpoint,
+            false,
+            false,
+        );
         conn_owned = false; // moved into the Terminal
         errdefer terminal.deinit();
         if (terminal.remote) |r| r.ephemeral = true; // destroying the box kills the session

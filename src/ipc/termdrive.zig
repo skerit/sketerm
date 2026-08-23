@@ -16,6 +16,7 @@ const Screen = @import("../grid/screen.zig").Screen;
 const Pool = @import("../grid/style_pool.zig").Pool;
 const keys = @import("keys.zig");
 const launch_cleanup = @import("launch_cleanup.zig");
+const muxconnect = @import("muxconnect.zig");
 const readfile = @import("../util/readfile.zig");
 
 const nowMs = @import("../util/clock.zig").nowMs;
@@ -610,7 +611,7 @@ pub const Term = struct {
         cols: u16,
         rows: u16,
     ) Error!*Term {
-        var conn = muxclient.Conn.connectSsh(allocator, host) catch return Error.SpawnFailed;
+        var conn = muxconnect.connectSsh(allocator, host) catch return Error.SpawnFailed;
         errdefer conn.deinit();
         // connectSsh already proved hello → welcome; just bound reads.
         conn.setNonBlocking();
@@ -839,7 +840,7 @@ pub const Term = struct {
             return;
         }
         self.reattach_spent = true;
-        var conn = muxclient.Conn.connectSshOnce(self.allocator, host) catch {
+        var conn = muxconnect.connectSshOnce(self.allocator, host) catch {
             self.exited = true;
             return;
         };

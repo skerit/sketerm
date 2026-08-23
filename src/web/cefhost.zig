@@ -875,6 +875,36 @@ pub const Host = struct {
     /// the context that could still be reading it, not the process.
     proxy_prefs: std.ArrayList(ProxyPref) = .empty,
 
+    // -- cross-instance cookie sync (capability "cookie-sync") --------
+    //
+    // Nothing here runs until a connection subscribes: `g_cksync.on` is
+    // the IO thread's fast path out of `can_save_cookie`, and an empty
+    // `cookie_sync_conns` is the main thread's fast path out of the
+    // reconcile. A helper nobody asked to synchronise pays one relaxed
+    // atomic load per saved cookie and nothing else.
+
+    /// Connections subscribed via `cookie_sync_enable`. Ids, not
+    /// outboxes: a connection can die between subscribing and the next
+    /// reconcile, and the router answers null for it then.
+    cookie_sync_conns: std.ArrayList(u32) = .empty,
+    /// Last-known state of every jar this helper synchronises, keyed by
+    /// (context, domain, path, name). The reconcile emits on a DIFF
+    /// against it, which is also what makes loop prevention structural:
+    /// an applied cookie updates the shadow as part of writing the jar,
+    /// so there is no diff left to emit for it.
+    cookie_shadow: std.ArrayList(CookieShadow) = .empty,
+    /// Monotonic ms of the last reconcile pass.
+    cookie_reconcile_ms: i64 = 0,
+    /// Reconcile visits outstanding (one per context). A second round
+    /// must not start while any of them is still walking, or the same
+    /// jar is diffed twice against a shadow one of them is mid-update.
+    cookie_reconcile_busy: u32 = 0,
+    /// The shadow has never been filled for at least one context. The
+    /// FIRST reconcile of a context is SILENT — it learns the jar
+    /// rather than replaying every cookie already in it as a change,
+    /// the same reason `a11y/webproj.zig`'s first publish is silent.
+    cookie_shadow_seeded: std.ArrayList(u32) = .empty,
+
     /// WebExtensions host: the loaded-extension registry, storage and
     /// browser.* dispatch. Content-script injection and background-page
     /// hosting are driven from here through the existing semantic bridge.
@@ -1091,6 +1121,10 @@ pub const Host = struct {
         for (self.contexts.items) |ctx| release(&ctx.rc.base.base);
         self.contexts.deinit(self.gpa);
         self.pending_flushes.deinit(self.gpa);
+        self.cookie_sync_conns.deinit(self.gpa);
+        for (self.cookie_shadow.items) |*sh| sh.free(self.gpa);
+        self.cookie_shadow.deinit(self.gpa);
+        self.cookie_shadow_seeded.deinit(self.gpa);
         for (self.proxy_prefs.items) |pref| pref.releaseAll();
         self.proxy_prefs.deinit(self.gpa);
         self.us_scripts.deinit(self.gpa);
@@ -1145,7 +1179,19 @@ pub const Host = struct {
     /// gets an EMPTY cache path — CEF's in-memory incognito store, wiped
     /// with the context, so nothing has to be scrubbed off disk.
     pub fn contextCreate(self: *Host, req: proto.ContextCreate) void {
-        if (req.id == 0 or self.lookupContext(req.id) != null) return;
+        if (req.id == 0) return;
+        if (self.lookupContext(req.id)) |live_rc| {
+            // SPIKE(pac): re-apply a PAC preference to a LIVE context so
+            // the stage can measure runtime replacement.
+            if (std.mem.startsWith(u8, req.proxy, "spike-pac-")) {
+                if (applyProxy(live_rc, req.proxy)) |p| {
+                    var pp = p;
+                    pp.context = req.id;
+                    self.proxy_prefs.append(self.gpa, pp) catch pp.releaseAll();
+                } else std.debug.print("SPIKE(pac): runtime replacement REFUSED\n", .{});
+            }
+            return;
+        }
 
         var settings = std.mem.zeroes(cef.cef_request_context_settings_t);
         settings.size = @sizeOf(cef.cef_request_context_settings_t);
@@ -1207,6 +1253,115 @@ pub const Host = struct {
         };
     }
 
+    /// Create a correlated fixed-proxy context that shares the source's storage.
+    pub fn contextCreateShared(self: *Host, req: proto.ContextCreateShared) void {
+        if (req.id < proto.EPHEMERAL_CTX_BASE) {
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "routing context id is outside the ephemeral partition" });
+            return;
+        }
+        if (req.proxy.len == 0) {
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "a fixed proxy is required" });
+            return;
+        }
+        if (req.share_with == 0) {
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "the global request context cannot be used as a distinct storage-sharing source" });
+            return;
+        }
+        if (self.lookupContext(req.id) != null) {
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "routing context id already exists" });
+            return;
+        }
+
+        var source_ephemeral = false;
+        const source: *cef.cef_request_context_t = blk: {
+            for (self.contexts.items) |ctx| {
+                if (ctx.id != req.share_with) continue;
+                source_ephemeral = ctx.ephemeral;
+                if (ctx.rc.base.base.add_ref) |add| add(&ctx.rc.base.base);
+                break :blk ctx.rc;
+            }
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "storage-sharing source context does not exist" });
+            return;
+        };
+
+        // CEF's CToCpp wrapper consumes the source reference, just like the
+        // request-context argument to create_browser_sync.
+        const rc: *cef.cef_request_context_t = cef.cef_request_context_cef_create_context_shared(source, null) orelse {
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "the engine refused the shared request context" });
+            return;
+        };
+
+        // Ask the engine, rather than inferring from the constructor used. The
+        // relation callbacks also consume their `other` reference.
+        const inspect_source: *cef.cef_request_context_t = blk: {
+            const other = self.lookupContext(req.share_with) orelse {
+                release(&rc.base.base);
+                self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "storage-sharing source context disappeared" });
+                return;
+            };
+            if (other.base.base.add_ref) |add| add(&other.base.base);
+            break :blk other;
+        };
+        defer release(&inspect_source.base.base);
+
+        const same_fn = rc.is_same orelse {
+            release(&rc.base.base);
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "the engine cannot verify request-context identity" });
+            return;
+        };
+        if (inspect_source.base.base.add_ref) |add| add(&inspect_source.base.base);
+        const same = same_fn(rc, inspect_source) != 0;
+        const sharing_fn = rc.is_sharing_with orelse {
+            release(&rc.base.base);
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "the engine cannot verify shared storage" });
+            return;
+        };
+        if (inspect_source.base.base.add_ref) |add| add(&inspect_source.base.base);
+        const sharing = sharing_fn(rc, inspect_source) != 0;
+        if (rc == inspect_source or !sharing) {
+            release(&rc.base.base);
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "the engine did not create a distinct shared-storage context" });
+            return;
+        }
+        // Measured on CEF 151: CreateContext(other) returns a distinct C API
+        // object but IsSame(other) is true, and setting proxy B makes BOTH
+        // contexts route through B. Refuse that shape before mutating either
+        // preference manager. The smoke-only override runs the destructive
+        // probe that pins the ceiling; production never sets it.
+        if (same and c.getenv("SKETERM_WEB_PROBE_SHARED_PROXY") == null) {
+            release(&rc.base.base);
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "the engine shares proxy preferences with the storage context" });
+            return;
+        }
+
+        var pref = applyProxy(rc, req.proxy) orelse {
+            release(&rc.base.base);
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "proxy preference was refused" });
+            return;
+        };
+        pref.context = req.id;
+        self.proxy_prefs.append(self.gpa, pref) catch {
+            pref.releaseAll();
+            release(&rc.base.base);
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "could not retain the proxy preference" });
+            return;
+        };
+
+        registerExtSchemeOn(rc);
+        self.contexts.append(self.gpa, .{
+            .id = req.id,
+            .rc = rc,
+            .ephemeral = source_ephemeral,
+            .owner = self.dispatch_conn,
+        }) catch {
+            self.proxy_prefs.pop().?.releaseAll();
+            release(&rc.base.base);
+            self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 0, .reason = "could not register the routing context" });
+            return;
+        };
+        self.post(proto.EvContextCreateShared{ .req = req.req, .ok = 1, .reason = "" });
+    }
+
     /// The id the OWNING CLIENT minted for an engine-global context id.
     ///
     /// Persisted ids now cross the wire untranslated (the shared
@@ -1232,6 +1387,10 @@ pub const Host = struct {
             release(&ctx.rc.base.base);
             _ = self.contexts.swapRemove(i);
             self.releaseProxyPrefs(id);
+            // Its jar died with it: keeping shadow entries would make
+            // the next reconcile of a REUSED id emit deletions for
+            // cookies nothing ever had.
+            self.cookieSyncForgetContext(id);
             return;
         }
     }
@@ -1579,6 +1738,7 @@ pub const Host = struct {
     /// persistent profile's cookie jar to disk.
     pub fn dropConn(self: *Host, conn_id: u32) void {
         if (conn_id == 0) return;
+        self.cookieSyncDropConn(conn_id);
         // destroyView mutates the list (and closes popup/inspector
         // dependents itself), so collect ids first and re-check each.
         while (true) {
@@ -2137,6 +2297,364 @@ pub const Host = struct {
             .kind = @intFromEnum(proto.SitedataKind.sitedata_clear),
             .removed = 0,
             .detail = detail_buf[0..detail_len],
+        });
+    }
+
+    // -- cross-instance cookie sync (capability "cookie-sync") --------
+
+    /// Subscribe or unsubscribe one connection. Idempotent both ways.
+    /// The IO-thread observer is armed by the FIRST subscriber and
+    /// disarmed by the last, so an unsubscribed helper is back to one
+    /// relaxed load per saved cookie.
+    pub fn cookieSyncEnable(self: *Host, conn: u32, enable: bool) void {
+        var i: usize = 0;
+        while (i < self.cookie_sync_conns.items.len) : (i += 1) {
+            if (self.cookie_sync_conns.items[i] != conn) continue;
+            if (!enable) _ = self.cookie_sync_conns.orderedRemove(i);
+            self.cookieSyncArm();
+            return;
+        }
+        if (enable) self.cookie_sync_conns.append(self.gpa, conn) catch {};
+        self.cookieSyncArm();
+    }
+
+    /// Drop a dead connection's subscription (called from `dropConn`).
+    pub fn cookieSyncDropConn(self: *Host, conn: u32) void {
+        self.cookieSyncEnable(conn, false);
+    }
+
+    fn cookieSyncArm(self: *Host) void {
+        const on = self.cookie_sync_conns.items.len != 0;
+        g_cksync.on.store(on, .release);
+        if (on) return;
+        // Nobody is listening: the shadow is stale the moment the walk
+        // stops, so it is dropped rather than kept and trusted later.
+        for (self.cookie_shadow.items) |*sh| sh.free(self.gpa);
+        self.cookie_shadow.clearRetainingCapacity();
+        self.cookie_shadow_seeded.clearRetainingCapacity();
+        g_cksync.drain();
+    }
+
+    fn cookieSyncOn(self: *const Host) bool {
+        return self.cookie_sync_conns.items.len != 0;
+    }
+
+    /// Post one cookie-sync frame to ONE connection, translating the
+    /// context id back into that connection's namespace. `Host.post`
+    /// cannot do this: it only rewrites ids on VIEW-routed frames, and
+    /// every frame in this block is viewless.
+    fn postSyncTo(self: *Host, conn: u32, value: anytype) void {
+        const rt = self.router orelse {
+            self.out.post(value, null) catch {};
+            return;
+        };
+        const out = rt.route(rt.ctx, conn) orelse return;
+        var v2 = value;
+        // Persisted context ids are a shared namespace and cross
+        // verbatim; only ephemeral ones are windowed per connection.
+        if (v2.context >= proto.EPHEMERAL_CTX_BASE) v2.context -= conn * proto.CONN_ID_WINDOW;
+        out.post(v2, null) catch {};
+    }
+
+    /// Fan one change out to every subscriber.
+    fn postSyncAll(self: *Host, value: anytype) void {
+        if (self.router == null) {
+            self.out.post(value, null) catch {};
+            return;
+        }
+        for (self.cookie_sync_conns.items) |conn| self.postSyncTo(conn, value);
+    }
+
+    /// The cookie manager for a CONTEXT id, WITH a reference held.
+    /// Context 0 is the engine's global jar — which, with a durable
+    /// `--cache-dir`, is the per-route profile this whole block exists
+    /// to replicate.
+    fn cookieManagerForContext(self: *Host, id: u32) ?*cef.cef_cookie_manager_t {
+        if (id == 0) return cef.cef_cookie_manager_get_global_manager(null);
+        const rc = self.lookupContext(id) orelse return null;
+        const get = rc.get_cookie_manager orelse return null;
+        return get(rc, null);
+    }
+
+    /// Every context this helper synchronises: the shared jar plus each
+    /// live identity context.
+    fn cookieSyncContexts(self: *Host, buf: []u32) []u32 {
+        var n: usize = 0;
+        buf[n] = 0;
+        n += 1;
+        for (self.contexts.items) |ctx| {
+            if (n >= buf.len) break;
+            buf[n] = ctx.id;
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
+    /// One turn of the cookie-sync machinery, called from the server
+    /// loop: drain what the IO thread saw, then reconcile on cadence.
+    pub fn cookieSyncPump(self: *Host, now: i64) void {
+        if (!self.cookieSyncOn()) return;
+        self.drainSavedCookies();
+        if (self.cookie_reconcile_busy != 0) return;
+        if (now - self.cookie_reconcile_ms < cookieReconcileMs()) return;
+        self.cookie_reconcile_ms = now;
+        var ctx_buf: [64]u32 = undefined;
+        const ctxs = self.cookieSyncContexts(&ctx_buf);
+        for (ctxs) |id| {
+            const mgr = self.cookieManagerForContext(id) orelse continue;
+            defer release(&mgr.base);
+            if (SyncVisitJob.start(self.gpa, mgr, .{
+                .mode = .reconcile,
+                .context = id,
+                .conn = 0,
+                .req = 0,
+                .cursor = 0,
+            })) |_| self.cookie_reconcile_busy += 1;
+        }
+    }
+
+    /// MAIN THREAD. Fold everything `can_save_cookie` recorded into the
+    /// shadow and emit it. A response-header write is emitted from HERE
+    /// rather than waiting for the next reconcile so a login propagates
+    /// in milliseconds, and folding it into the shadow at the same time
+    /// is what stops the reconcile emitting it a second time.
+    fn drainSavedCookies(self: *Host) void {
+        var rec: CkRec = undefined;
+        while (g_cksync.take(&rec)) {
+            // The IO thread could only record the VIEW; the context is
+            // main-thread state.
+            const context = if (rec.view_id == 0) 0 else blk: {
+                const v = self.findAny(rec.view_id) orelse break :blk 0;
+                break :blk v.context;
+            };
+            const ck = proto.SyncCookie{
+                .name = rec.slice(&rec.name, rec.name_len),
+                .value = rec.slice(&rec.value, rec.value_len),
+                .domain = rec.slice(&rec.domain, rec.domain_len),
+                .path = rec.slice(&rec.path, rec.path_len),
+                .flags = rec.flags,
+                .same_site = rec.same_site,
+                .priority = rec.priority,
+                .creation_ms = rec.creation_ms,
+                .last_access_ms = rec.last_access_ms,
+                .expires_ms = rec.expires_ms,
+            };
+            // A Set-Cookie whose expiry is already past IS a deletion;
+            // saying so beats making every client rediscover it.
+            const removed = ck.expires_ms != 0 and ck.expires_ms <= wallMsNow();
+            self.noteCookie(context, ck, removed, .response_header, rec.slice(&rec.url, rec.url_len));
+        }
+    }
+
+    /// Fold one observation into the shadow and emit it when it is
+    /// genuinely new. THE one place a change reaches the wire.
+    ///
+    /// An identity with an apply in flight is skipped outright: the jar
+    /// and the shadow disagree until the engine's completion callback
+    /// lands, and emitting that disagreement is exactly the ping-pong
+    /// this block must not have.
+    fn noteCookie(
+        self: *Host,
+        context: u32,
+        ck: proto.SyncCookie,
+        removed: bool,
+        cause: proto.CookieCause,
+        url: []const u8,
+    ) void {
+        const idh = CookieShadow.identity(context, ck.domain, ck.path, ck.name);
+        const sh = self.shadowFind(idh, context, ck.domain, ck.path, ck.name);
+        const vh = CookieShadow.valueHash(ck);
+        if (sh) |entry| {
+            if (entry.pending) return;
+            if (removed) {
+                entry.free(self.gpa);
+                self.shadowRemove(entry);
+            } else {
+                if (entry.hash == vh) return;
+                entry.hash = vh;
+                entry.seen = true;
+            }
+        } else {
+            if (removed) return; // never seen it, nothing to forget
+            const entry = self.shadowInsert(idh, context, ck) orelse return;
+            entry.hash = vh;
+        }
+        self.postSyncAll(proto.EvCookieChange{
+            .context = context,
+            .cause = @intFromEnum(cause),
+            .removed = if (removed) 1 else 0,
+            .url = url,
+            .cookie = ck,
+        });
+    }
+
+    fn shadowFind(
+        self: *Host,
+        idh: u64,
+        context: u32,
+        domain: []const u8,
+        path: []const u8,
+        name: []const u8,
+    ) ?*CookieShadow {
+        for (self.cookie_shadow.items) |*sh| {
+            if (sh.id_hash != idh or sh.context != context) continue;
+            // The hash is a PREFILTER, never the identity: a collision
+            // would otherwise silently replicate the wrong cookie.
+            if (!std.mem.eql(u8, CookieShadow.normDomain(sh.domain), CookieShadow.normDomain(domain))) continue;
+            if (!std.mem.eql(u8, sh.path, path)) continue;
+            if (!std.mem.eql(u8, sh.name, name)) continue;
+            return sh;
+        }
+        return null;
+    }
+
+    fn shadowInsert(self: *Host, idh: u64, context: u32, ck: proto.SyncCookie) ?*CookieShadow {
+        const entry = CookieShadow.init(self.gpa, idh, context, ck) orelse return null;
+        self.cookie_shadow.append(self.gpa, entry) catch {
+            var tmp = entry;
+            tmp.free(self.gpa);
+            return null;
+        };
+        return &self.cookie_shadow.items[self.cookie_shadow.items.len - 1];
+    }
+
+    fn shadowRemove(self: *Host, entry: *CookieShadow) void {
+        const base = self.cookie_shadow.items.ptr;
+        const idx = (@intFromPtr(entry) - @intFromPtr(base)) / @sizeOf(CookieShadow);
+        _ = self.cookie_shadow.orderedRemove(idx);
+    }
+
+    /// Drop every shadow entry for a context (its jar went away with
+    /// it, so remembering its cookies would resurrect them).
+    pub fn cookieSyncForgetContext(self: *Host, context: u32) void {
+        var i: usize = 0;
+        while (i < self.cookie_shadow.items.len) {
+            if (self.cookie_shadow.items[i].context != context) {
+                i += 1;
+                continue;
+            }
+            self.cookie_shadow.items[i].free(self.gpa);
+            _ = self.cookie_shadow.orderedRemove(i);
+        }
+        var j: usize = 0;
+        while (j < self.cookie_shadow_seeded.items.len) {
+            if (self.cookie_shadow_seeded.items[j] == context) {
+                _ = self.cookie_shadow_seeded.orderedRemove(j);
+                continue;
+            }
+            j += 1;
+        }
+    }
+
+    fn shadowSeeded(self: *Host, context: u32) bool {
+        for (self.cookie_shadow_seeded.items) |id| {
+            if (id == context) return true;
+        }
+        return false;
+    }
+
+    fn markShadowSeeded(self: *Host, context: u32) void {
+        if (self.shadowSeeded(context)) return;
+        self.cookie_shadow_seeded.append(self.gpa, context) catch {};
+    }
+
+    /// Write (or remove) one cookie in another instance's stead.
+    ///
+    /// LOOP PREVENTION, structurally: the identity is marked pending
+    /// BEFORE the engine call and its shadow entry is settled to the
+    /// applied value in the completion callback. A reconcile between
+    /// the two skips the identity entirely, so neither ordering of the
+    /// two asynchronous events can produce a spurious change — and once
+    /// settled, the shadow already equals the jar, so the diff is empty.
+    pub fn cookieApply(self: *Host, req: proto.CookieApply) void {
+        const conn = self.dispatch_conn;
+        if (req.url.len == 0 or originSlice(req.url).len == 0)
+            return self.postApplyDone(conn, req.req, req.context, false, "bad-url");
+        const mgr = self.cookieManagerForContext(req.context) orelse
+            return self.postApplyDone(conn, req.req, req.context, false, "no-context");
+        defer release(&mgr.base);
+
+        const idh = CookieShadow.identity(req.context, req.cookie.domain, req.cookie.path, req.cookie.name);
+        var entry = self.shadowFind(idh, req.context, req.cookie.domain, req.cookie.path, req.cookie.name);
+        if (entry == null and req.remove == 0) {
+            entry = self.shadowInsert(idh, req.context, req.cookie);
+        }
+        if (entry) |e| {
+            e.pending = true;
+            e.pending_remove = req.remove != 0;
+            e.pending_hash = CookieShadow.valueHash(req.cookie);
+        }
+
+        const started = if (req.remove != 0)
+            CookieApplyJob.startDelete(self.gpa, mgr, req, conn, idh)
+        else
+            CookieApplyJob.startSet(self.gpa, mgr, req, conn, idh);
+        if (started == null) {
+            self.settleApply(idh, req.context, req.cookie, false);
+            self.postApplyDone(conn, req.req, req.context, false, "engine-refused");
+        }
+    }
+
+    /// Land an apply's outcome on the shadow and clear the pending
+    /// mark. Called from the engine's completion callback, and from the
+    /// refusal path above so a failed apply never leaves an identity
+    /// permanently skipped by the reconcile.
+    fn settleApply(self: *Host, idh: u64, context: u32, ck: proto.SyncCookie, ok: bool) void {
+        const entry = self.shadowFind(idh, context, ck.domain, ck.path, ck.name) orelse return;
+        if (!entry.pending) return;
+        entry.pending = false;
+        if (!ok) {
+            // The jar is whatever it was; let the next reconcile decide.
+            if (entry.hash == 0) {
+                entry.free(self.gpa);
+                self.shadowRemove(entry);
+            }
+            return;
+        }
+        if (entry.pending_remove) {
+            entry.free(self.gpa);
+            self.shadowRemove(entry);
+            return;
+        }
+        entry.hash = entry.pending_hash;
+        entry.adopt = true;
+        entry.seen = true;
+    }
+
+    fn postApplyDone(self: *Host, conn: u32, req: u32, context: u32, ok: bool, reason: []const u8) void {
+        self.postSyncTo(conn, proto.EvCookieApplyDone{
+            .req = req,
+            .context = context,
+            .ok = if (ok) 1 else 0,
+            .reason = reason,
+        });
+    }
+
+    /// Seed a fresh instance: one PAGE of a context's whole jar.
+    pub fn cookieDump(self: *Host, req: proto.CookieDumpReq) void {
+        const conn = self.dispatch_conn;
+        const mgr = self.cookieManagerForContext(req.context) orelse
+            return self.postDumpFail(conn, req);
+        defer release(&mgr.base);
+        if (SyncVisitJob.start(self.gpa, mgr, .{
+            .mode = .dump,
+            .context = req.context,
+            .conn = conn,
+            .req = req.req,
+            .cursor = req.cursor,
+        }) == null) self.postDumpFail(conn, req);
+    }
+
+    fn postDumpFail(self: *Host, conn: u32, req: proto.CookieDumpReq) void {
+        self.postSyncTo(conn, proto.EvCookieDump{
+            .req = req.req,
+            .context = req.context,
+            .ok = 0,
+            .cursor = req.cursor,
+            .next_cursor = req.cursor,
+            .more = 0,
+            .total = 0,
+            .cookies = &.{},
         });
     }
 
@@ -7531,6 +8049,902 @@ const CookieJob = struct {
     }
 };
 
+// ---------------------------------------------------------------------
+// Cross-instance cookie sync (capability "cookie-sync")
+// ---------------------------------------------------------------------
+//
+// sketerm runs one helper per network route, each with its own profile
+// and therefore its own jar. This block is what makes a login follow
+// the user between them: OBSERVE one jar changing, hand the change to
+// the client, APPLY what the client hands back.
+//
+// TWO OBSERVERS, BECAUSE ONE IS NOT ENOUGH — measured on CEF 151.3.16
+// (smoke-web stage 41 is the standing proof, and reports both halves):
+//
+//   - `cef_cookie_access_filter_t::can_save_cookie` fires per
+//     `Set-Cookie` RESPONSE HEADER, on the IO thread, with the parsed
+//     cookie and the request. It is immediate and exact, and it is the
+//     ONLY thing that sees a header write.
+//   - It does NOT fire for `document.cookie`, nor for a `CookieStore`
+//     write. Both bypass the network stack entirely — there is no
+//     resource request to filter — so a script-set session cookie is
+//     invisible to it. That is not a bug to work around but the shape
+//     of the API: it filters cookie ACCESS BY REQUESTS.
+//
+// So the header filter is the fast path and a periodic full walk
+// (`visit_all_cookies`, diffed against a shadow) is the complete one.
+// The walk also covers deletion, which no header observer can see at
+// all: a `document.cookie` expiry, a `CookieStore.delete`, and the
+// engine's own eviction all reach the wire as a diff.
+//
+// The two feed ONE funnel (`Host.noteCookie`), which is also where
+// loop prevention lives — see `Host.cookieApply`.
+
+/// How often the reconcile walks each jar. Deliberately slow: it is
+/// the completeness net under an immediate header path, not the
+/// primary mechanism, and a walk of every jar is real UI-thread work.
+/// `SKETERM_WEB_COOKIE_SYNC_MS` overrides it (smoke-web runs it fast).
+const cookie_reconcile_default_ms: i64 = 3_000;
+
+fn cookieReconcileMs() i64 {
+    const v = c.getenv("SKETERM_WEB_COOKIE_SYNC_MS") orelse return cookie_reconcile_default_ms;
+    const n = std.fmt.parseInt(i64, std.mem.span(v), 10) catch return cookie_reconcile_default_ms;
+    return if (n <= 0) cookie_reconcile_default_ms else n;
+}
+
+/// Wall-clock milliseconds, for comparing against a cookie's expiry
+/// (which is an absolute date, not a monotonic instant).
+fn wallMsNow() u64 {
+    const ms = @import("../util/clock.zig").wallMs();
+    return if (ms <= 0) 0 else @intCast(ms);
+}
+
+/// Last-known state of ONE cookie in ONE jar.
+const CookieShadow = struct {
+    context: u32,
+    /// Prefilter over (context, domain, path, name); the strings below
+    /// are the actual identity, always compared before a match counts.
+    id_hash: u64,
+    domain: []u8,
+    path: []u8,
+    name: []u8,
+    /// `valueHash` of what the jar last held. Never includes creation
+    /// or last-access: `last_access` moves on every request the cookie
+    /// is sent with, and diffing on it would emit a change per page
+    /// load forever.
+    hash: u64 = 0,
+    /// Marked by the current reconcile walk; an unmarked entry at the
+    /// end of a walk is a cookie that left the jar.
+    seen: bool = false,
+    /// A `cookie_apply` is in flight for this identity. The jar and
+    /// this entry disagree until the engine's completion callback
+    /// lands, and emitting that disagreement is the ping-pong.
+    pending: bool = false,
+    pending_remove: bool = false,
+    pending_hash: u64 = 0,
+    /// An apply just settled on this identity: the NEXT reconcile that
+    /// finds the jar disagreeing with `hash` adopts what the jar says
+    /// WITHOUT emitting it. The engine normalises what it stores
+    /// (a domain cookie gains its dot, an expiry past Chromium's
+    /// 400-day cap is clamped), and reporting its normalisation back
+    /// to the client as a change is a whole fan-out of frames saying
+    /// nothing — 140 of them, measured, before this existed.
+    adopt: bool = false,
+
+    /// A cookie's domain WITHOUT its leading dot.
+    ///
+    /// MEASURED: `set_cookie` with a non-empty `domain` makes a DOMAIN
+    /// cookie, which the jar then reports back with a leading dot —
+    /// so an applied `site.example` reads back as `.site.example`. Key
+    /// the shadow on the dotless form or every applied cookie looks
+    /// like one identity leaving the jar and another arriving, which
+    /// is a removal AND an add emitted for a cookie nothing changed.
+    /// The dot itself is not lost: it travels as
+    /// `cookie_domain_scoped` and is part of the VALUE hash.
+    fn normDomain(domain: []const u8) []const u8 {
+        return if (domain.len != 0 and domain[0] == '.') domain[1..] else domain;
+    }
+
+    fn identity(context: u32, domain: []const u8, path: []const u8, name: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0x0c00_c1e5);
+        h.update(std.mem.asBytes(&context));
+        h.update(normDomain(domain));
+        h.update(&[_]u8{0});
+        h.update(path);
+        h.update(&[_]u8{0});
+        h.update(name);
+        return h.final();
+    }
+
+    fn valueHash(ck: proto.SyncCookie) u64 {
+        var h = std.hash.Wyhash.init(0x5a17_ed_ba11);
+        h.update(ck.value);
+        h.update(&[_]u8{ ck.flags, ck.same_site, ck.priority });
+        h.update(std.mem.asBytes(&ck.expires_ms));
+        // Never zero: `settleApply` reads a zero hash as "this entry
+        // was minted by the apply itself and never observed".
+        const v = h.final();
+        return if (v == 0) 1 else v;
+    }
+
+    fn init(gpa: std.mem.Allocator, idh: u64, context: u32, ck: proto.SyncCookie) ?CookieShadow {
+        const d = gpa.dupe(u8, ck.domain) catch return null;
+        const p = gpa.dupe(u8, ck.path) catch {
+            gpa.free(d);
+            return null;
+        };
+        const n = gpa.dupe(u8, ck.name) catch {
+            gpa.free(d);
+            gpa.free(p);
+            return null;
+        };
+        return .{ .context = context, .id_hash = idh, .domain = d, .path = p, .name = n };
+    }
+
+    fn free(self: *CookieShadow, gpa: std.mem.Allocator) void {
+        gpa.free(self.domain);
+        gpa.free(self.path);
+        gpa.free(self.name);
+    }
+};
+
+/// Bytes a recorded cookie value may carry across the IO-thread
+/// mailbox. RFC 6265 recommends 4096 per cookie including the name and
+/// attributes, and Chromium enforces that; a longer one is DROPPED
+/// from the mailbox rather than truncated, because half a session
+/// token is a login that silently does not work. The reconcile — which
+/// allocates and has no such cap — carries it instead.
+const CK_VALUE_MAX = 4096;
+const CK_NAME_MAX = 512;
+const CK_URL_MAX = 1024;
+
+/// One cookie the IO thread saw being saved. FIXED SIZE by design:
+/// nothing allocates on CEF's IO thread here, exactly as the intercept
+/// log and the webRequest hold table do not.
+const CkRec = struct {
+    used: bool = false,
+    view_id: u32 = 0,
+    name: [CK_NAME_MAX]u8 = undefined,
+    name_len: usize = 0,
+    value: [CK_VALUE_MAX]u8 = undefined,
+    value_len: usize = 0,
+    domain: [CK_NAME_MAX]u8 = undefined,
+    domain_len: usize = 0,
+    path: [CK_NAME_MAX]u8 = undefined,
+    path_len: usize = 0,
+    url: [CK_URL_MAX]u8 = undefined,
+    url_len: usize = 0,
+    flags: u8 = 0,
+    same_site: u8 = 0,
+    priority: u8 = 0,
+    creation_ms: u64 = 0,
+    last_access_ms: u64 = 0,
+    expires_ms: u64 = 0,
+
+    fn slice(_: *const CkRec, buf: []const u8, len: usize) []const u8 {
+        return buf[0..len];
+    }
+};
+
+/// The IO thread -> main thread mailbox for saved cookies.
+///
+/// No wake pipe: unlike a HELD webRequest (a page that has stopped
+/// loading until we answer), an observed cookie is not blocking
+/// anything. The server pumps every 5ms with a view open, and paying
+/// for a descriptor plus a write per Set-Cookie to shave that would be
+/// spending real cost on a path that has no deadline.
+const CookieObs = struct {
+    lock: SpinLock = .{},
+    /// Read WITHOUT the lock on the IO thread's fast path: with nobody
+    /// subscribed, `can_save_cookie` is one relaxed load and a return.
+    on: std.atomic.Value(bool) = .init(false),
+    recs: [64]CkRec = @splat(.{}),
+    /// Cookies the mailbox had no room for. They are not lost to the
+    /// SYNC — the reconcile finds them — only to the fast path.
+    dropped: u32 = 0,
+
+    /// IO THREAD.
+    fn put(self: *CookieObs, rec: *const CkRec) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.recs) |*r| {
+            if (r.used) continue;
+            r.* = rec.*;
+            r.used = true;
+            return;
+        }
+        self.dropped +%= 1;
+    }
+
+    /// MAIN THREAD. False when the mailbox is empty.
+    fn take(self: *CookieObs, out: *CkRec) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.recs) |*r| {
+            if (!r.used) continue;
+            out.* = r.*;
+            r.used = false;
+            return true;
+        }
+        return false;
+    }
+
+    fn drain(self: *CookieObs) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        for (&self.recs) |*r| r.used = false;
+        self.dropped = 0;
+    }
+};
+
+var g_cksync: CookieObs = .{};
+
+/// The one cookie access filter, handed out per resource request while
+/// somebody is synchronising. A process-lifetime static like every
+/// other handler here: it carries no per-request state.
+var cookie_access_filter: cef.cef_cookie_access_filter_t = undefined;
+
+/// IO THREAD. Never blocks a cookie and never alters one — this is an
+/// OBSERVER. `can_send_cookie` is implemented purely so the interface
+/// is complete; a filter that answered only half of it would be one
+/// CEF version away from a surprise.
+fn onCanSendCookie(
+    _: [*c]cef.cef_cookie_access_filter_t,
+    _: [*c]cef.cef_browser_t,
+    _: [*c]cef.cef_frame_t,
+    _: [*c]cef.cef_request_t,
+    _: [*c]const cef.cef_cookie_t,
+) callconv(.c) c_int {
+    return 1;
+}
+
+/// IO THREAD. Record one `Set-Cookie` and ALWAYS allow the save.
+fn onCanSaveCookie(
+    _: [*c]cef.cef_cookie_access_filter_t,
+    browser: [*c]cef.cef_browser_t,
+    _: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
+    _: [*c]cef.cef_response_t,
+    cookie: [*c]const cef.cef_cookie_t,
+) callconv(.c) c_int {
+    if (!g_cksync.on.load(.acquire)) return 1;
+    const ck: *const cef.cef_cookie_t = cookie orelse return 1;
+
+    var rec: CkRec = .{};
+    var name = Utf8.init(&ck.name);
+    defer name.free();
+    var value = Utf8.init(&ck.value);
+    defer value.free();
+    var domain = Utf8.init(&ck.domain);
+    defer domain.free();
+    var path = Utf8.init(&ck.path);
+    defer path.free();
+    // A value past the mailbox's cap is left to the reconcile rather
+    // than truncated: half a session token is worse than a late one.
+    if (value.slice().len > CK_VALUE_MAX) return 1;
+    if (!copyInto(&rec.name, &rec.name_len, name.slice())) return 1;
+    if (!copyInto(&rec.value, &rec.value_len, value.slice())) return 1;
+    if (!copyInto(&rec.domain, &rec.domain_len, domain.slice())) return 1;
+    if (!copyInto(&rec.path, &rec.path_len, path.slice())) return 1;
+
+    if (request != null) {
+        const req: *cef.cef_request_t = @ptrCast(request);
+        if (req.get_url) |gu| {
+            var url_raw: [CK_URL_MAX]u8 = undefined;
+            const u = userfreeInto(gu(req), &url_raw);
+            _ = copyInto(&rec.url, &rec.url_len, u);
+        }
+    }
+    // Resolving a browser to its CONTEXT is main-thread state; the view
+    // id is all the IO thread may learn, exactly as in the intercept
+    // path, and `drainSavedCookies` finishes the join.
+    if (browser != null) {
+        const b: *cef.cef_browser_t = @ptrCast(browser);
+        if (b.get_identifier) |gi| {
+            const cef_id = gi(b);
+            g_int.acquire();
+            defer g_int.release();
+            if (g_int.slotByCef(cef_id)) |slot| rec.view_id = slot.view_id;
+        }
+    }
+
+    rec.flags = 0;
+    if (ck.secure != 0) rec.flags |= proto.cookie_secure;
+    if (ck.httponly != 0) rec.flags |= proto.cookie_httponly;
+    if (ck.has_expires == 0) rec.flags |= proto.cookie_session;
+    if (rec.domain_len != 0 and rec.domain[0] == '.') rec.flags |= proto.cookie_domain_scoped;
+    rec.same_site = sameSiteOf(ck.same_site);
+    rec.priority = priorityOf(ck.priority);
+    rec.creation_ms = baseTimeMs(ck.creation);
+    rec.last_access_ms = baseTimeMs(ck.last_access);
+    rec.expires_ms = if (ck.has_expires != 0) baseTimeMs(ck.expires) else 0;
+
+    g_cksync.put(&rec);
+    return 1;
+}
+
+fn copyInto(buf: []u8, len: *usize, src: []const u8) bool {
+    if (src.len > buf.len) return false;
+    @memcpy(buf[0..src.len], src);
+    len.* = src.len;
+    return true;
+}
+
+/// IO THREAD. Null while nobody synchronises, so an unsubscribed
+/// helper never even constructs the filter path.
+fn onGetCookieAccessFilter(
+    _: [*c]cef.cef_resource_request_handler_t,
+    _: [*c]cef.cef_browser_t,
+    _: [*c]cef.cef_frame_t,
+    _: [*c]cef.cef_request_t,
+) callconv(.c) [*c]cef.cef_cookie_access_filter_t {
+    if (!g_cksync.on.load(.acquire)) return null;
+    return &cookie_access_filter;
+}
+
+/// CEF's cookie priority (-1/0/1) -> the wire's (0/1/2). Comparisons
+/// rather than a switch for `sameSiteOf`'s reason: translate-c gives
+/// the enum type a different signedness from its constants.
+fn priorityOf(v: cef.cef_cookie_priority_t) u8 {
+    const T = cef.cef_cookie_priority_t;
+    if (v == @as(T, @intCast(cef.CEF_COOKIE_PRIORITY_LOW))) return @intFromEnum(proto.CookiePriority.low);
+    if (v == @as(T, @intCast(cef.CEF_COOKIE_PRIORITY_HIGH))) return @intFromEnum(proto.CookiePriority.high);
+    return @intFromEnum(proto.CookiePriority.medium);
+}
+
+fn cefPriorityOf(v: u8) cef.cef_cookie_priority_t {
+    const T = cef.cef_cookie_priority_t;
+    return switch (@as(proto.CookiePriority, @enumFromInt(v))) {
+        .low => @as(T, @intCast(cef.CEF_COOKIE_PRIORITY_LOW)),
+        .high => @as(T, @intCast(cef.CEF_COOKIE_PRIORITY_HIGH)),
+        else => @as(T, @intCast(cef.CEF_COOKIE_PRIORITY_MEDIUM)),
+    };
+}
+
+fn cefSameSiteOf(v: u8) cef.cef_cookie_same_site_t {
+    const T = cef.cef_cookie_same_site_t;
+    return switch (@as(proto.SameSite, @enumFromInt(v))) {
+        .none => @as(T, @intCast(cef.CEF_COOKIE_SAME_SITE_NO_RESTRICTION)),
+        .lax => @as(T, @intCast(cef.CEF_COOKIE_SAME_SITE_LAX_MODE)),
+        .strict => @as(T, @intCast(cef.CEF_COOKIE_SAME_SITE_STRICT_MODE)),
+        else => @as(T, @intCast(cef.CEF_COOKIE_SAME_SITE_UNSPECIFIED)),
+    };
+}
+
+/// Unix epoch milliseconds -> a CEF base time (microseconds since the
+/// Windows epoch). The exact inverse of `baseTimeMs`, so an expiry
+/// survives a round trip through the wire and back into a jar.
+fn msToBaseTime(ms: u64) cef.cef_basetime_t {
+    const win_to_unix_us: i64 = 11_644_473_600 * std.time.us_per_s;
+    var bt = std.mem.zeroes(cef.cef_basetime_t);
+    bt.val = @as(i64, @intCast(ms)) * 1000 + win_to_unix_us;
+    return bt;
+}
+
+/// Fill a `cef_cookie_t` from a wire record. The strings are OWNED by
+/// the returned struct and must be cleared with `freeCefCookie`.
+fn toCefCookie(ck: proto.SyncCookie) cef.cef_cookie_t {
+    var out = std.mem.zeroes(cef.cef_cookie_t);
+    out.size = @sizeOf(cef.cef_cookie_t);
+    setStr(ck.name, &out.name);
+    setStr(ck.value, &out.value);
+    setStr(ck.domain, &out.domain);
+    setStr(ck.path, &out.path);
+    out.secure = if (ck.flags & proto.cookie_secure != 0) 1 else 0;
+    out.httponly = if (ck.flags & proto.cookie_httponly != 0) 1 else 0;
+    out.same_site = cefSameSiteOf(ck.same_site);
+    out.priority = cefPriorityOf(ck.priority);
+    if (ck.creation_ms != 0) out.creation = msToBaseTime(ck.creation_ms);
+    if (ck.last_access_ms != 0) out.last_access = msToBaseTime(ck.last_access_ms);
+    // A dropped expiry silently turns a persistent cookie into a
+    // session cookie, which is the whole login gone at the next
+    // restart; `has_expires` and `expires` travel together or not at
+    // all.
+    if (ck.expires_ms != 0 and ck.flags & proto.cookie_session == 0) {
+        out.has_expires = 1;
+        out.expires = msToBaseTime(ck.expires_ms);
+    }
+    return out;
+}
+
+fn freeCefCookie(ck: *cef.cef_cookie_t) void {
+    cef.cef_string_utf16_clear(&ck.name);
+    cef.cef_string_utf16_clear(&ck.value);
+    cef.cef_string_utf16_clear(&ck.domain);
+    cef.cef_string_utf16_clear(&ck.path);
+}
+
+/// One `visit_all_cookies` walk: the periodic reconcile, or one page
+/// of a client's jar dump. Same refcount rule as `CookieJob` and for
+/// the same reason — the visit takes ownership of the reference, and
+/// the LAST release is both "the walk is over" and the free, so the
+/// answer is composed there and nowhere else.
+const SyncVisitJob = struct {
+    /// FIRST FIELD: CEF is handed `&job.visitor`.
+    visitor: cef.cef_cookie_visitor_t,
+    refs: std.atomic.Value(u32),
+    gpa: std.mem.Allocator,
+    mode: Mode,
+    context: u32,
+    /// Dump only: the connection to answer and its request id.
+    conn: u32,
+    req: u32,
+    /// Dump only: the index this page starts at, and where it ended.
+    cursor: u32,
+    next_cursor: u32 = 0,
+    /// Cookies the walk saw, whether or not this page carried them.
+    total: u32 = 0,
+    more: bool = false,
+    accessible: bool = true,
+    /// Owned copies of everything the answer needs; the visitor's
+    /// `cef_cookie_t` is only valid for the duration of one call.
+    strings: std.ArrayList(u8) = .empty,
+    recs: std.ArrayList(Rec) = .empty,
+    bytes: usize = 0,
+
+    const Mode = enum { reconcile, dump };
+    const Span = struct { off: u32, len: u32 };
+
+    const Rec = struct {
+        name: Span,
+        value: Span,
+        domain: Span,
+        path: Span,
+        flags: u8,
+        same_site: u8,
+        priority: u8,
+        creation_ms: u64,
+        last_access_ms: u64,
+        expires_ms: u64,
+    };
+
+    const Opts = struct {
+        mode: Mode,
+        context: u32,
+        conn: u32,
+        req: u32,
+        cursor: u32,
+    };
+
+    fn start(gpa: std.mem.Allocator, mgr: *cef.cef_cookie_manager_t, opts: Opts) ?void {
+        const visit = mgr.visit_all_cookies orelse return null;
+        const job = gpa.create(SyncVisitJob) catch return null;
+        job.* = .{
+            .visitor = .{ .base = SyncJobRef.base(), .visit = syncJobVisit },
+            .refs = .init(2),
+            .gpa = gpa,
+            .mode = opts.mode,
+            .context = opts.context,
+            .conn = opts.conn,
+            .req = opts.req,
+            .cursor = opts.cursor,
+            .next_cursor = opts.cursor,
+        };
+        // Two references for `CookieJob.start`'s reason: the call
+        // CONSUMES one and may drop it before returning.
+        if (visit(mgr, &job.visitor) == 0) job.accessible = false;
+        _ = SyncJobRef.release(&job.visitor.base);
+        return {};
+    }
+
+    fn record(self: *SyncVisitJob, cookie: *const cef.cef_cookie_t) void {
+        var name = Utf8.init(&cookie.name);
+        defer name.free();
+        var value = Utf8.init(&cookie.value);
+        defer value.free();
+        var domain = Utf8.init(&cookie.domain);
+        defer domain.free();
+        var path = Utf8.init(&cookie.path);
+        defer path.free();
+
+        const n = self.intern(name.slice()) orelse return;
+        const v = self.intern(value.slice()) orelse return;
+        const d = self.intern(domain.slice()) orelse return;
+        const p = self.intern(path.slice()) orelse return;
+
+        var flags: u8 = 0;
+        if (cookie.secure != 0) flags |= proto.cookie_secure;
+        if (cookie.httponly != 0) flags |= proto.cookie_httponly;
+        if (cookie.has_expires == 0) flags |= proto.cookie_session;
+        if (domain.slice().len != 0 and domain.slice()[0] == '.') flags |= proto.cookie_domain_scoped;
+
+        self.recs.append(self.gpa, .{
+            .name = n,
+            .value = v,
+            .domain = d,
+            .path = p,
+            .flags = flags,
+            .same_site = sameSiteOf(cookie.same_site),
+            .priority = priorityOf(cookie.priority),
+            .creation_ms = baseTimeMs(cookie.creation),
+            .last_access_ms = baseTimeMs(cookie.last_access),
+            .expires_ms = if (cookie.has_expires != 0) baseTimeMs(cookie.expires) else 0,
+        }) catch {};
+        self.bytes += name.slice().len + value.slice().len + domain.slice().len + path.slice().len + 40;
+    }
+
+    fn intern(self: *SyncVisitJob, s: []const u8) ?Span {
+        const off: u32 = @intCast(self.strings.items.len);
+        self.strings.appendSlice(self.gpa, s) catch return null;
+        return .{ .off = off, .len = @intCast(s.len) };
+    }
+
+    fn str(self: *const SyncVisitJob, sp: Span) []const u8 {
+        return self.strings.items[sp.off..][0..sp.len];
+    }
+
+    fn cookieAt(self: *const SyncVisitJob, r: Rec) proto.SyncCookie {
+        return .{
+            .name = self.str(r.name),
+            .value = self.str(r.value),
+            .domain = self.str(r.domain),
+            .path = self.str(r.path),
+            .flags = r.flags,
+            .same_site = r.same_site,
+            .priority = r.priority,
+            .creation_ms = r.creation_ms,
+            .last_access_ms = r.last_access_ms,
+            .expires_ms = r.expires_ms,
+        };
+    }
+
+    /// A synthetic url for a reconciled cookie: the scheme its `secure`
+    /// flag implies, the domain without its leading dot, and its path.
+    /// It is what a client hands back as `cookie_apply.url`, so it has
+    /// to be a url the ENGINE will accept for that (domain, path).
+    fn urlFor(r: Rec, self: *const SyncVisitJob, buf: []u8) []const u8 {
+        const dom_raw = self.str(r.domain);
+        const dom = if (dom_raw.len != 0 and dom_raw[0] == '.') dom_raw[1..] else dom_raw;
+        const scheme = if (r.flags & proto.cookie_secure != 0) "https://" else "http://";
+        const path = self.str(r.path);
+        return std.fmt.bufPrint(buf, "{s}{s}{s}", .{ scheme, dom, path }) catch "";
+    }
+
+    fn finish(self: *SyncVisitJob) void {
+        const host = g_host orelse return;
+        switch (self.mode) {
+            .reconcile => self.finishReconcile(host),
+            .dump => self.finishDump(host),
+        }
+    }
+
+    /// Diff the walk against the shadow: emit what is new or changed,
+    /// then emit a removal for every shadow entry the walk did not see.
+    ///
+    /// THE FIRST WALK OF A CONTEXT IS SILENT. A helper that just
+    /// subscribed would otherwise replay its entire existing jar as
+    /// "changes", which is noise at best and, with two instances
+    /// subscribing at once, a burst of mutual applies at worst. The
+    /// seed path for a new instance is `cookie_dump_req`, which is
+    /// explicit, paged and asked for.
+    fn finishReconcile(self: *SyncVisitJob, host: *Host) void {
+        if (host.cookie_reconcile_busy > 0) host.cookie_reconcile_busy -= 1;
+        if (!self.accessible) return;
+        if (!host.cookieSyncOn()) return;
+        const seeding = !host.shadowSeeded(self.context);
+
+        for (host.cookie_shadow.items) |*sh| {
+            if (sh.context == self.context) sh.seen = false;
+        }
+        var url_buf: [1024]u8 = undefined;
+        for (self.recs.items) |r| {
+            const ck = self.cookieAt(r);
+            const idh = CookieShadow.identity(self.context, ck.domain, ck.path, ck.name);
+            if (host.shadowFind(idh, self.context, ck.domain, ck.path, ck.name)) |sh| {
+                sh.seen = true;
+                if (sh.pending) continue;
+                const vh = CookieShadow.valueHash(ck);
+                if (sh.hash == vh) {
+                    sh.adopt = false;
+                    continue;
+                }
+                sh.hash = vh;
+                if (sh.adopt) {
+                    // The engine's own normalisation of what we just
+                    // applied, not news. Adopt it once and go quiet.
+                    sh.adopt = false;
+                    continue;
+                }
+                if (seeding) continue;
+                host.postSyncAll(proto.EvCookieChange{
+                    .context = self.context,
+                    .cause = @intFromEnum(proto.CookieCause.reconcile),
+                    .removed = 0,
+                    .url = urlFor(r, self, &url_buf),
+                    .cookie = ck,
+                });
+                continue;
+            }
+            const sh = host.shadowInsert(idh, self.context, ck) orelse continue;
+            sh.hash = CookieShadow.valueHash(ck);
+            sh.seen = true;
+            if (seeding) continue;
+            host.postSyncAll(proto.EvCookieChange{
+                .context = self.context,
+                .cause = @intFromEnum(proto.CookieCause.reconcile),
+                .removed = 0,
+                .url = urlFor(r, self, &url_buf),
+                .cookie = ck,
+            });
+        }
+
+        // Everything the walk did not see is gone from the jar. This is
+        // the ONLY observer that can see a deletion at all: no response
+        // header carries `document.cookie = "...; max-age=0"`.
+        var i: usize = 0;
+        while (i < host.cookie_shadow.items.len) {
+            const sh = &host.cookie_shadow.items[i];
+            if (sh.context != self.context or sh.seen or sh.pending) {
+                i += 1;
+                continue;
+            }
+            if (!seeding) {
+                const scheme = "https://";
+                const dom = if (sh.domain.len != 0 and sh.domain[0] == '.') sh.domain[1..] else sh.domain;
+                const url = std.fmt.bufPrint(&url_buf, "{s}{s}{s}", .{ scheme, dom, sh.path }) catch "";
+                host.postSyncAll(proto.EvCookieChange{
+                    .context = self.context,
+                    .cause = @intFromEnum(proto.CookieCause.reconcile),
+                    .removed = 1,
+                    .url = url,
+                    .cookie = .{
+                        .name = sh.name,
+                        .value = "",
+                        .domain = sh.domain,
+                        .path = sh.path,
+                        .flags = 0,
+                        .same_site = 0,
+                        .priority = @intFromEnum(proto.CookiePriority.medium),
+                        .creation_ms = 0,
+                        .last_access_ms = 0,
+                        .expires_ms = 0,
+                    },
+                });
+            }
+            sh.free(host.gpa);
+            _ = host.cookie_shadow.orderedRemove(i);
+        }
+        host.markShadowSeeded(self.context);
+    }
+
+    fn finishDump(self: *SyncVisitJob, host: *Host) void {
+        const start_at: usize = self.cursor;
+        var page: std.ArrayList(proto.SyncCookie) = .empty;
+        defer page.deinit(self.gpa);
+        var bytes: usize = 0;
+        var idx: usize = start_at;
+        var more = false;
+        while (idx < self.recs.items.len) : (idx += 1) {
+            if (page.items.len >= proto.SYNC_DUMP_PAGE or bytes >= proto.SYNC_DUMP_PAGE_BYTES) {
+                more = true;
+                break;
+            }
+            const r = self.recs.items[idx];
+            const ck = self.cookieAt(r);
+            page.append(self.gpa, ck) catch {
+                more = true;
+                break;
+            };
+            bytes += ck.name.len + ck.value.len + ck.domain.len + ck.path.len + 40;
+        }
+        host.postSyncTo(self.conn, proto.EvCookieDump{
+            .req = self.req,
+            .context = self.context,
+            .ok = if (self.accessible) 1 else 0,
+            .cursor = self.cursor,
+            .next_cursor = @intCast(idx),
+            .more = if (more) 1 else 0,
+            .total = @intCast(self.recs.items.len),
+            .cookies = page.items,
+        });
+    }
+
+    fn destroyOwned(self: *SyncVisitJob) void {
+        self.finish();
+        const gpa = self.gpa;
+        self.strings.deinit(gpa);
+        self.recs.deinit(gpa);
+        gpa.destroy(self);
+    }
+};
+
+const SyncJobRef = HeapRef(SyncVisitJob, "visitor");
+
+fn syncJobVisit(
+    self_: [*c]cef.cef_cookie_visitor_t,
+    cookie: [*c]const cef.cef_cookie_t,
+    _: c_int,
+    _: c_int,
+    delete_cookie: [*c]c_int,
+) callconv(.c) c_int {
+    if (self_ == null or cookie == null) return 0;
+    const vis: *cef.cef_cookie_visitor_t = @ptrCast(self_);
+    const job: *SyncVisitJob = @fieldParentPtr("visitor", vis);
+    if (delete_cookie != null) delete_cookie.* = 0;
+    job.total += 1;
+    job.record(@ptrCast(cookie));
+    return 1;
+}
+
+/// One `cookie_apply` in flight. Refcounted for `CookieJob`'s reason:
+/// `set_cookie` / `delete_cookies` take ownership of the callback
+/// reference and may drop it before returning.
+///
+/// The completion is what SETTLES the shadow, which is why the apply
+/// carries the identity hash and a copy of the cookie's identity
+/// strings rather than a pointer into the frame it came from.
+const CookieApplyJob = struct {
+    cb: Cb,
+    refs: std.atomic.Value(u32),
+    gpa: std.mem.Allocator,
+    conn: u32,
+    req: u32,
+    context: u32,
+    remove: bool,
+    id_hash: u64,
+    /// name / domain / path, concatenated; the spans below index it.
+    ident: []u8,
+    name_len: usize,
+    domain_len: usize,
+    path_len: usize,
+    ok: bool = false,
+    answered: bool = false,
+
+    /// `set_cookie` and `delete_cookies` take DIFFERENT callback
+    /// interfaces. They are laid out as a union of the two first
+    /// fields so one job type serves both without a second struct;
+    /// only the arm named by `remove` is ever handed to CEF.
+    const Cb = extern union {
+        set: cef.cef_set_cookie_callback_t,
+        del: cef.cef_delete_cookies_callback_t,
+
+        comptime {
+            // `HeapRef.base` stamps `base.size = @sizeOf(Cb)` and the
+            // ENGINE validates the size of the interface it was given.
+            // The two callbacks are the same shape today (a base plus
+            // one function pointer); if a CEF version ever changes one,
+            // this fails to compile instead of handing the engine a
+            // struct whose size is a lie.
+            std.debug.assert(@sizeOf(cef.cef_set_cookie_callback_t) == @sizeOf(cef.cef_delete_cookies_callback_t));
+        }
+    };
+
+    fn nameOf(self: *const CookieApplyJob) []const u8 {
+        return self.ident[0..self.name_len];
+    }
+    fn domainOf(self: *const CookieApplyJob) []const u8 {
+        return self.ident[self.name_len..][0..self.domain_len];
+    }
+    fn pathOf(self: *const CookieApplyJob) []const u8 {
+        return self.ident[self.name_len + self.domain_len ..][0..self.path_len];
+    }
+
+    fn create(gpa: std.mem.Allocator, req: proto.CookieApply, conn: u32, idh: u64) ?*CookieApplyJob {
+        const job = gpa.create(CookieApplyJob) catch return null;
+        const total = req.cookie.name.len + req.cookie.domain.len + req.cookie.path.len;
+        const ident = gpa.alloc(u8, total) catch {
+            gpa.destroy(job);
+            return null;
+        };
+        @memcpy(ident[0..req.cookie.name.len], req.cookie.name);
+        @memcpy(ident[req.cookie.name.len..][0..req.cookie.domain.len], req.cookie.domain);
+        @memcpy(ident[req.cookie.name.len + req.cookie.domain.len ..][0..req.cookie.path.len], req.cookie.path);
+        job.* = .{
+            .cb = undefined,
+            .refs = .init(2),
+            .gpa = gpa,
+            .conn = conn,
+            .req = req.req,
+            .context = req.context,
+            .remove = req.remove != 0,
+            .id_hash = idh,
+            .ident = ident,
+            .name_len = req.cookie.name.len,
+            .domain_len = req.cookie.domain.len,
+            .path_len = req.cookie.path.len,
+        };
+        return job;
+    }
+
+    fn startSet(
+        gpa: std.mem.Allocator,
+        mgr: *cef.cef_cookie_manager_t,
+        req: proto.CookieApply,
+        conn: u32,
+        idh: u64,
+    ) ?void {
+        const set = mgr.set_cookie orelse return null;
+        const job = create(gpa, req, conn, idh) orelse return null;
+        job.cb.set = .{ .base = ApplyRef.base(), .on_complete = onSetCookieComplete };
+
+        var ck = toCefCookie(req.cookie);
+        defer freeCefCookie(&ck);
+        var u = std.mem.zeroes(cef.cef_string_t);
+        setStr(req.url, &u);
+        defer cef.cef_string_utf16_clear(&u);
+        if (set(mgr, &u, &ck, @ptrCast(&job.cb.set)) == 0) {
+            // The engine refused OUTRIGHT (a malformed url or a value
+            // carrying a disallowed character). Its callback may never
+            // run, so the second reference is what answers.
+            job.ok = false;
+        }
+        _ = ApplyRef.release(@ptrCast(&job.cb.set.base));
+        return {};
+    }
+
+    fn startDelete(
+        gpa: std.mem.Allocator,
+        mgr: *cef.cef_cookie_manager_t,
+        req: proto.CookieApply,
+        conn: u32,
+        idh: u64,
+    ) ?void {
+        // NAMED deletion, not the url-only form: with both a url and a
+        // name, CEF deletes host AND domain cookies matching both.
+        // The url-only form deliberately spares domain cookies, which
+        // is exactly how a logout fails to propagate.
+        const del = mgr.delete_cookies orelse return null;
+        const job = create(gpa, req, conn, idh) orelse return null;
+        job.cb.del = .{ .base = ApplyRef.base(), .on_complete = onDeleteCookiesComplete };
+
+        var u = std.mem.zeroes(cef.cef_string_t);
+        setStr(req.url, &u);
+        defer cef.cef_string_utf16_clear(&u);
+        var n = std.mem.zeroes(cef.cef_string_t);
+        setStr(req.cookie.name, &n);
+        defer cef.cef_string_utf16_clear(&n);
+        if (del(mgr, &u, &n, @ptrCast(&job.cb.del)) == 0) job.ok = false;
+        _ = ApplyRef.release(@ptrCast(&job.cb.del.base));
+        return {};
+    }
+
+    /// The LAST release: settle the shadow and answer. Both happen
+    /// here and nowhere else, so every apply is answered exactly once
+    /// on every path — the engine's callback, or its refusal.
+    fn destroyOwned(self: *CookieApplyJob) void {
+        if (g_host) |host| {
+            host.settleApply(self.id_hash, self.context, .{
+                .name = self.nameOf(),
+                .value = "",
+                .domain = self.domainOf(),
+                .path = self.pathOf(),
+                .flags = 0,
+                .same_site = 0,
+                .priority = 0,
+                .creation_ms = 0,
+                .last_access_ms = 0,
+                .expires_ms = 0,
+            }, self.ok);
+            host.postApplyDone(
+                self.conn,
+                self.req,
+                self.context,
+                self.ok,
+                if (self.ok) "" else "set-failed",
+            );
+        }
+        const gpa = self.gpa;
+        gpa.free(self.ident);
+        gpa.destroy(self);
+    }
+};
+
+const ApplyRef = HeapRef(CookieApplyJob, "cb");
+
+fn onSetCookieComplete(self_: [*c]cef.cef_set_cookie_callback_t, success: c_int) callconv(.c) void {
+    if (self_ == null) return;
+    const job: *CookieApplyJob = @fieldParentPtr("cb", @as(*CookieApplyJob.Cb, @ptrCast(@alignCast(self_))));
+    job.ok = success != 0;
+}
+
+fn onDeleteCookiesComplete(self_: [*c]cef.cef_delete_cookies_callback_t, num_deleted: c_int) callconv(.c) void {
+    if (self_ == null) return;
+    const job: *CookieApplyJob = @fieldParentPtr("cb", @as(*CookieApplyJob.Cb, @ptrCast(@alignCast(self_))));
+    // A logout that deleted nothing because the cookie was already
+    // gone is a SUCCESS: the instances agree, which is the whole point.
+    job.ok = num_deleted >= 0;
+}
+
 /// CEF's SameSite enum -> the wire's engine-agnostic one. Written as
 /// comparisons rather than a switch because translate-c gives the enum
 /// TYPE a different signedness from its CONSTANTS.
@@ -9503,6 +10917,60 @@ fn sanitizeContextName(name: []const u8, id: u32, buf: *[256]u8) []const u8 {
     return buf[0 .. n + tail.len];
 }
 
+// ---- SPIKE(pac): temporary, remove with the spike smoke stage. -------
+/// Set `proxy = {mode:"pac_script", <key>:<payload>, pac_mandatory:true}`
+/// on a request context's preference manager and REPORT what CEF said.
+fn applyPacPref(rc: *cef.cef_request_context_t, comptime key: []const u8, payload: []const u8) ?ProxyPref {
+    const dict: *cef.cef_dictionary_value_t = cef.cef_dictionary_value_create() orelse return null;
+    var keep_dict = false;
+    defer if (!keep_dict) release(&dict.base);
+
+    var mode_key = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&mode_key);
+    var mode_value = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&mode_value);
+    setStr("mode", &mode_key);
+    setStr("pac_script", &mode_value);
+    if ((dict.set_string orelse return null)(dict, &mode_key, &mode_value) == 0) return null;
+
+    var pac_key = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&pac_key);
+    var pac_value = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&pac_value);
+    setStr(key, &pac_key);
+    setStr(payload, &pac_value);
+    if ((dict.set_string orelse return null)(dict, &pac_key, &pac_value) == 0) return null;
+
+    var mand_key = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&mand_key);
+    setStr("pac_mandatory", &mand_key);
+    if ((dict.set_bool orelse return null)(dict, &mand_key, 1) == 0) return null;
+
+    const val: *cef.cef_value_t = cef.cef_value_create() orelse return null;
+    var keep_value = false;
+    defer if (!keep_value) release(&val.base);
+    if ((val.set_dictionary orelse return null)(val, dict) == 0) return null;
+
+    var pref_key = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&pref_key);
+    setStr("proxy", &pref_key);
+    var err = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&err);
+    const base: *cef.cef_preference_manager_t = &rc.base;
+    const ok = (base.set_preference orelse return null)(base, &pref_key, val, &err);
+    if (ok == 0) {
+        var e = Utf8.init(&err);
+        defer e.free();
+        std.debug.print("SPIKE(pac): form \"{s}\" REFUSED: \"{s}\"\n", .{ key, e.slice() });
+        return null;
+    }
+    std.debug.print("SPIKE(pac): form \"{s}\" ACCEPTED ({d} bytes)\n", .{ key, payload.len });
+    keep_dict = true;
+    keep_value = true;
+    return .{ .context = 0, .dict = dict, .value = val };
+}
+// ---- end SPIKE(pac) --------------------------------------------------
+
 /// Point a request context at a fixed-server proxy, exactly as the
 /// browser spike proved: `set_preference("proxy", {mode:"fixed_servers",
 /// server:<url>})` on the context's base preference manager. A socks5
@@ -9512,6 +10980,15 @@ fn sanitizeContextName(name: []const u8, id: u32, buf: *[256]u8) []const u8 {
 fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) ?ProxyPref {
     // Deterministic smoke seam for the otherwise engine-controlled refusal.
     if (c.getenv("SKETERM_WEB_FAIL_PROXY") != null) return null;
+
+    // ---- SPIKE(pac): temporary PAC-preference experiment. -------------
+    // Two candidate forms of the `pac_script` proxy mode, selected by a
+    // prefix on the wire proxy string so no new frame was needed.
+    if (std.mem.startsWith(u8, proxy_url, "spike-pac-url:"))
+        return applyPacPref(rc, "pac_url", proxy_url["spike-pac-url:".len..]);
+    if (std.mem.startsWith(u8, proxy_url, "spike-pac-inline:"))
+        return applyPacPref(rc, "pac_script", proxy_url["spike-pac-inline:".len..]);
+    // ---- end SPIKE(pac) ----------------------------------------------
 
     const dict: *cef.cef_dictionary_value_t = cef.cef_dictionary_value_create() orelse return null;
     var keep_dict = false;
@@ -9531,6 +11008,16 @@ fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) ?ProxyPref 
     setStr("server", &server_key);
     setStr(proxy_url, &server_value);
     if ((dict.set_string orelse return null)(dict, &server_key, &server_value) == 0) return null;
+
+    // Chromium otherwise bypasses localhost implicitly. Tor/egress routing is
+    // fail-closed only when loopback destinations traverse the fixed proxy too.
+    var bypass_key = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&bypass_key);
+    var bypass_value = std.mem.zeroes(cef.cef_string_t);
+    defer cef.cef_string_utf16_clear(&bypass_value);
+    setStr("bypass_list", &bypass_key);
+    setStr("<-loopback>", &bypass_value);
+    if ((dict.set_string orelse return null)(dict, &bypass_key, &bypass_value) == 0) return null;
 
     const val: *cef.cef_value_t = cef.cef_value_create() orelse return null;
     var keep_value = false;
@@ -10521,6 +12008,9 @@ fn installHandlers() void {
 
     resource_request_handler = std.mem.zeroes(cef.cef_resource_request_handler_t);
     resource_request_handler.base = staticBase(cef.cef_resource_request_handler_t);
+    // Cookie sync: the filter is handed out only while a client
+    // subscribed (see onGetCookieAccessFilter).
+    resource_request_handler.get_cookie_access_filter = onGetCookieAccessFilter;
     resource_request_handler.on_before_resource_load = onBeforeResourceLoad;
     resource_request_handler.on_resource_response = onResourceResponse;
     resource_request_handler.on_resource_load_complete = onResourceLoadComplete;
@@ -10541,6 +12031,11 @@ fn installHandlers() void {
     pdf_callback = std.mem.zeroes(cef.cef_pdf_print_callback_t);
     pdf_callback.base = staticBase(cef.cef_pdf_print_callback_t);
     pdf_callback.on_pdf_print_finished = onPdfPrintFinished;
+
+    cookie_access_filter = std.mem.zeroes(cef.cef_cookie_access_filter_t);
+    cookie_access_filter.base = staticBase(cef.cef_cookie_access_filter_t);
+    cookie_access_filter.can_send_cookie = onCanSendCookie;
+    cookie_access_filter.can_save_cookie = onCanSaveCookie;
 
     flush_callback = std.mem.zeroes(cef.cef_completion_callback_t);
     flush_callback.base = staticBase(cef.cef_completion_callback_t);

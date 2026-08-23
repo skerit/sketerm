@@ -21,6 +21,8 @@ const recordRegisteredTerm = mcp.recordRegisteredTerm;
 const tailLines = mcp.tailLines;
 const nowMs = @import("../util/clock.zig").nowMs;
 const shellquote = mcp.shellquote;
+const sshroute = @import("../mux/sshroute.zig");
+const Config = @import("../config.zig").Config;
 
 // ── headless terminal tools (shell sessions on the private daemon) ─
 
@@ -321,7 +323,10 @@ pub fn termTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
                     "-o",  "ServerAliveInterval=15",
                     "-o",  "ServerAliveCountMax=4",
                 });
-                try argv_store.append(arena, h);
+                // A forced route must survive the fall out of the mux path.
+                const dest = appendRoute(arena, &argv_store, h, false) catch
+                    return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
+                try argv_store.append(arena, dest);
             }
             if (cmd_string) |s| {
                 if (host != null) {
@@ -885,6 +890,29 @@ pub fn tcpListening(port: u16, timeout_ms: i64) bool {
 /// headless terminal, wait for its exit, and hand back status + the
 /// rendered output. `.output` is arena-owned.
 pub const ArgvRun = struct { exited: bool, status: i32, status_known: bool, output: []const u8 };
+/// Append the route options for `host` and return its bare SSH destination.
+///
+/// `term_open`'s plain-ssh fallback, both transfer directions and the port
+/// forwarder each build their own ssh/scp argv, so a `tor:` host reached any
+/// of those ways would otherwise hand the literal prefixed alias to the
+/// resolver instead of staying on the forced route. Options are duped into
+/// `arena`: the Tor ProxyCommand lives inside the stack-local `Args`.
+fn appendRoute(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList([]const u8),
+    host: []const u8,
+    ssh_flags: bool,
+) ![]const u8 {
+    const remote = sshroute.RemoteSpec.parse(host);
+    if (remote.mode != .tor) return host;
+    var cfg = Config.load(arena);
+    defer cfg.deinit();
+    const plan = try sshroute.Plan.init(remote.host, .tor, cfg.mux_tor_socks_endpoint);
+    var args = try plan.args(false);
+    try args.appendSlices(arena, out, ssh_flags);
+    return try arena.dupe(u8, remote.host);
+}
+
 pub fn runArgvTerm(arena: std.mem.Allocator, argv: []const []const u8, timeout_ms: i64) !union(enum) { run: ArgvRun, err: []const u8 } {
     const t = termdrive.Term.spawn(mcp.term_state.allocator, argv, 120, 30, mcp.term_state.mux_sock) catch
         return .{ .err = "spawn failed (mux daemon unreachable?)" };
@@ -1003,8 +1031,14 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             const local_sha = sha256File(local) orelse return mcp.errRes(arena, .io_failed, "cannot read/hash the local file");
             const bytes = fileSize(local);
             const tmp = try stagedPartPath(arena, remote);
-            const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, tmp });
-            switch (try runArgvTerm(arena, &.{ "scp", "-q", "-o", "BatchMode=yes", local, spec }, timeout_ms)) {
+            var scp_argv: std.ArrayList([]const u8) = .empty;
+            defer scp_argv.deinit(arena);
+            try scp_argv.appendSlice(arena, &.{ "scp", "-q", "-o", "BatchMode=yes" });
+            const dest = appendRoute(arena, &scp_argv, h, false) catch
+                return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
+            const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ dest, tmp });
+            try scp_argv.appendSlice(arena, &.{ local, spec });
+            switch (try runArgvTerm(arena, scp_argv.items, timeout_ms)) {
                 .err => |e| return mcp.errRes(arena, .unavailable, e),
                 .run => |r| {
                     if (!r.exited) return mcp.errRes(arena, .timeout, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
@@ -1034,7 +1068,13 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
                 "SK_TMP={s}\nSK_DST={s}\nsha=$(sha256sum \"$SK_TMP\" 2>/dev/null | cut -c1-64) || sha=fail\nif [ \"$sha\" = \"{s}\" ]; then {s}; else echo \"SK_SHA:$sha\"; rm -f \"$SK_TMP\"; fi\n",
                 .{ try quoted(arena, tmp), try quoted(arena, remote), local_sha, verify_layer },
             );
-            switch (try runArgvTerm(arena, &.{ "ssh", "-o", "BatchMode=yes", h, try remoteShLine(arena, script) }, 60_000)) {
+            var move_argv: std.ArrayList([]const u8) = .empty;
+            defer move_argv.deinit(arena);
+            try move_argv.appendSlice(arena, &.{ "ssh", "-o", "BatchMode=yes" });
+            const move_dest = appendRoute(arena, &move_argv, h, false) catch
+                return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
+            try move_argv.appendSlice(arena, &.{ move_dest, try remoteShLine(arena, script) });
+            switch (try runArgvTerm(arena, move_argv.items, 60_000)) {
                 .err => |e| return mcp.errRes(arena, .unavailable, e),
                 .run => |r| {
                     if (std.mem.indexOf(u8, r.output, "SK_MOVED") != null)
@@ -1052,8 +1092,14 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
 
         // download
         const part = try stagedPartPath(arena, local);
-        const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ h, remote });
-        switch (try runArgvTerm(arena, &.{ "scp", "-q", "-o", "BatchMode=yes", spec, part }, timeout_ms)) {
+        var dl_argv: std.ArrayList([]const u8) = .empty;
+        defer dl_argv.deinit(arena);
+        try dl_argv.appendSlice(arena, &.{ "scp", "-q", "-o", "BatchMode=yes" });
+        const dl_dest = appendRoute(arena, &dl_argv, h, false) catch
+            return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
+        const spec = try std.fmt.allocPrint(arena, "{s}:{s}", .{ dl_dest, remote });
+        try dl_argv.appendSlice(arena, &.{ spec, part });
+        switch (try runArgvTerm(arena, dl_argv.items, timeout_ms)) {
             .err => |e| return mcp.errRes(arena, .unavailable, e),
             .run => |r| {
                 if (!r.exited) return mcp.errRes(arena, .timeout, "scp still running at timeout; the transfer terminal was killed — retry with a larger timeout_ms");
@@ -1200,16 +1246,20 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
 
 pub fn spawnForwardTerm(arena: std.mem.Allocator, host: []const u8, lp: u16, rh: []const u8, rp: u16) !*termdrive.Term {
     const bindspec = try std.fmt.allocPrint(arena, "127.0.0.1:{d}:{s}:{d}", .{ lp, rh, rp });
-    const argv = [_][]const u8{
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(arena);
+    try argv.appendSlice(arena, &.{
         "ssh",                      "-N",
         "-T",                       "-o",
         "BatchMode=yes",            "-o",
         "ExitOnForwardFailure=yes", "-o",
         "ServerAliveInterval=15",   "-o",
-        "ServerAliveCountMax=4",    "-L",
-        bindspec,                   host,
-    };
-    const t = termdrive.Term.spawn(mcp.term_state.allocator, &argv, 120, 30, mcp.term_state.mux_sock) catch return error.SpawnFailed;
+        "ServerAliveCountMax=4",
+    });
+    // A forward reconnect must stay on the route its host asked for.
+    const dest = appendRoute(arena, &argv, host, false) catch return error.SpawnFailed;
+    try argv.appendSlice(arena, &.{ "-L", bindspec, dest });
+    const t = termdrive.Term.spawn(mcp.term_state.allocator, argv.items, 120, 30, mcp.term_state.mux_sock) catch return error.SpawnFailed;
     recordAuxTerm(t, "forward");
     return t;
 }

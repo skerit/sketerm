@@ -69,6 +69,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var broker_mode = false;
     var idle_exit_ms: i64 = 0;
     const argv = init.args.vector;
+    // Cross-host daemon jobs can originate Tor-routed SSH themselves, so the
+    // libc-only binary must expose the same hidden ProxyCommand entry point.
+    if (argv.len == 5 and std.mem.eql(u8, std.mem.span(argv[1]), "--internal-socks5-connect")) {
+        return @import("mux/socks5_client.zig").serve(
+            std.mem.span(argv[2]),
+            std.mem.span(argv[3]),
+            std.mem.span(argv[4]),
+        );
+    }
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = std.mem.span(argv[i]);

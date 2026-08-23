@@ -117,6 +117,7 @@ comptime {
     // Enforced network policy: std-only decision half of the web
     // helper's request gate, shared with the GUI-side client.
     _ = @import("web/netpolicy.zig");
+    _ = @import("web/route.zig");
     // ui/panel data layer: under ui/ by home. canary/doc/events are GTK-free by
     // contract; assets.zig is GTK-free by BUILD GATE — its gdk-pixbuf work sits
     // behind `comptime build_options.glib`, and the test that needs it returns
@@ -145,6 +146,8 @@ comptime {
     _ = @import("mux/dbusconn.zig");
     _ = @import("mux/desktop.zig");
     _ = @import("mux/deploy.zig");
+    _ = @import("mux/socks5_client.zig");
+    _ = @import("mux/sshroute.zig");
     _ = @import("mux/display.zig");
     _ = @import("mux/dmabuf_egl.zig");
     _ = @import("mux/drmdev.zig");

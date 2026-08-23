@@ -62,8 +62,8 @@ const MUX_HELP =
     \\
     \\`sketerm ssh <host>` = `sketerm mux <host> new` — open a
     \\remote shell that survives disconnects (key auth required).
-    \\Bare hosts select transport automatically; udp:<host> and
-    \\ssh:<host> force one transport.
+    \\Bare hosts select transport automatically; udp:<host>, ssh:<host>,
+    \\and tor:<host> force one transport. Tor never falls back direct.
     \\
 ;
 
@@ -874,7 +874,7 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
         var cfg = @import("../config.zig").Config.load(allocator);
         defer cfg.deinit();
         const remote = mux_client.RemoteSpec.parse(h);
-        const conn = mux_client.Conn.connectRemote(allocator, h, cfg.udpRange()) catch {
+        const conn = mux_client.Conn.connectRemote(allocator, h, cfg.muxConnectOptions()) catch {
             const mode_name = @tagName(remote.mode);
             // No portable artifact = this install cannot deploy the daemon
             // for the user (a Linux architecture the packaging has no musl

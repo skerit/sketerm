@@ -1917,6 +1917,10 @@ pub const Window = struct {
         if (spec != null) blk: {
             const pane = self.focusedPane() orelse break :blk;
             const remote = pane.terminal.remote orelse break :blk;
+            // Gate on the ORIGINAL spec: browserHost strips `ssh:`/`udp:`
+            // for connection sharing, so it cannot answer "may this
+            // transport ride a ticket".
+            if (!@import("../mux/client.zig").udpTicketEligible(remote.host orelse "")) break :blk;
             const bare = @import("../filebrowser/paths.zig").browserHost(remote.host) orelse break :blk;
             const launch = self.allocator.create(FilesLaunch) catch break :blk;
             launch.* = .{

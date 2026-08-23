@@ -791,6 +791,16 @@ over, and both are measured, not assumed:
   documents below). Passing the registry's own reference therefore
   freed the context after the FIRST browser, and the second view in the
   same container segfaulted the helper on a freed vtable.
+- **CEF 151 cannot combine shared storage with per-context proxy routing.**
+  `context_create_shared` (0x93, capability `contexts-shared-storage`) calls
+  `CefRequestContext::CreateContext(other, handler)` and has a correlated
+  `ev_context_create_shared` result. The returned C API object is distinct and
+  `IsSharingWith(other)` is true, but `IsSame(other)` is also true. Focused
+  smoke-web stage 27b proves the consequence with two real SOCKS5 tunnels: A
+  writes a cookie, B reads it, then both `route-a` and `route-b` traverse B's
+  proxy while A's proxy sees neither. Production therefore rejects this engine
+  shape before setting the new preference or registering the context; the
+  `SKETERM_WEB_PROBE_SHARED_PROXY=1` override exists only for that smoke probe.
 - **The headless MCP client now points `--cache-dir` at a DURABLE
   store**, not at its volatile instance dir: `$XDG_STATE_HOME/sketerm/
   web-profiles/<instance-key>/` (`src/ipc/webprofiles.zig`). No helper
