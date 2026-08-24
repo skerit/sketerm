@@ -39,6 +39,7 @@ const filter = @import("../web/filter.zig");
 const urlhost = @import("../web/urlhost.zig");
 const webprofiles = @import("webprofiles.zig");
 const reader_model = @import("../web/reader.zig");
+const webkeys = @import("../web/webkeys.zig");
 const clock = @import("../util/clock.zig");
 
 /// Default budget for one semantic round trip. Clamped to
@@ -1166,6 +1167,71 @@ const ActAfter = struct {
     note: ?[]const u8 = null,
 };
 
+/// What CHANGED after an input: give the caller the delta rather than
+/// making it ask. The delta must not RACE a navigation the input
+/// started - the old document's delta after a paginating click reads
+/// as "the click did nothing" and has been filed as a product bug.
+/// Watch the view briefly: a started LOAD is settled (bounded) before
+/// the delta is read, and a same-document route change (history API)
+/// gets a longer grace for the new route's content to render, plus an
+/// explicit warning it may still be arriving. Shared by web_act and
+/// web_key - a keystroke can navigate exactly like a click.
+fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.json.Value) !ActAfter {
+    var after = ActAfter{};
+    const pre_url = view.url;
+    const pre_seq = view.load_seq;
+    var nav_hard = false;
+    var nav_soft = false;
+    var waited: u32 = 0;
+    while (waited < 300) : (waited += 100) {
+        drv.sleep(100);
+        const vs1 = (try listViews(drv, arena)) orelse break;
+        const cur = viewFor(vs1, view.pane) orelse break;
+        if (cur.loading or cur.load_seq != pre_seq) {
+            nav_hard = true;
+            break;
+        }
+        if (!std.mem.eql(u8, cur.url, pre_url)) {
+            nav_soft = true;
+            break;
+        }
+    }
+    if (nav_hard) {
+        const deadline = drv.now() + @min(timeoutOf(args, DEFAULT_TIMEOUT_MS), 10_000);
+        while (drv.now() < deadline) {
+            drv.sleep(100);
+            const vs1 = (try listViews(drv, arena)) orelse break;
+            const cur = viewFor(vs1, view.pane) orelse break;
+            if (!cur.loading and cur.load_seq != pre_seq) break;
+        }
+    } else if (nav_soft) {
+        drv.sleep(900);
+        after.note = "the url changed without a page load (client-side route); the delta below is what had rendered ~1s after the act - if it looks incomplete, the route's data was still arriving: call web_snapshot again";
+    }
+    switch (try runOp(drv, arena, view.pane, .{
+        .op = "snapshot",
+        .mode = "auto",
+        .detail = 1,
+    }, 5000)) {
+        .err => |e| after.delta_error = e.text,
+        .done => |d| {
+            if (d.timed_out) {
+                after.delta_error = "no follow-up snapshot arrived within 5s";
+            } else {
+                after.delta_kind = d.snapshot_kind;
+                after.delta = d.payload;
+            }
+        },
+    }
+    if (try listViews(drv, arena)) |vs2| {
+        if (viewFor(vs2, view.pane)) |a| {
+            if (!std.mem.eql(u8, a.url, view.url)) after.navigated_to = a.url;
+            after.loading_after = a.loading;
+        }
+    }
+    return after;
+}
+
 fn actResult(
     arena: std.mem.Allocator,
     mode: Mode,
@@ -1185,6 +1251,13 @@ fn actResult(
         try res.textf("{s} on {d}: {s}", .{ action, id, detail })
     else
         try res.textf("{s} on {d}: acted", .{ action, id });
+    try renderAfter(&res, arena, after);
+    return res.finish();
+}
+
+/// The shared post-input tail: navigation outcome, caveat, and the
+/// auto-delta, rendered identically for web_act and web_key.
+fn renderAfter(res: *mcp.Res, arena: std.mem.Allocator, after: ActAfter) !void {
     if (after.navigated_to) |u| {
         try res.fact("navigated_to", u);
         try res.textf("navigated to {s}", .{try clip(arena, u, URL_MAX)});
@@ -1199,10 +1272,9 @@ fn actResult(
     if (after.delta) |d| {
         try res.fact("delta_kind", after.delta_kind orelse "");
         try res.fact("delta", d);
-        try section(&res, "delta", d);
+        try section(res, "delta", d);
         try res.text(TRUST_LINE);
     }
-    return res.finish();
 }
 
 fn expandResult(
@@ -1804,7 +1876,7 @@ pub fn webTool(
         if (!eql(u8, snap_want, "none")) {
             switch (try runOp(drv, arena, view.pane, .{
                 .op = "snapshot",
-                .mode = if (eql(u8, snap_want, "full")) "full" else "auto",
+                .mode = if (std.mem.eql(u8, snap_want, "full")) "full" else "auto",
                 .detail = 1,
             }, 5000)) {
                 .err => |e| nav_snap_err = e.text,
@@ -1915,68 +1987,7 @@ pub fn webTool(
                 else
                     "the page refused the action");
 
-                // What CHANGED is the useful half of an act: give the
-                // caller the delta rather than making it ask. The delta
-                // must not RACE a navigation the act started - the old
-                // document's delta after a paginating click reads as
-                // "the click did nothing" and has been filed as a
-                // product bug. Watch the view briefly: a started LOAD
-                // is settled before the delta is read, and a
-                // same-document route change (history API) gets a
-                // longer grace for the new route's content to render,
-                // plus an explicit warning it may still be arriving.
-                var after = ActAfter{};
-                const pre_url = view.url;
-                const pre_seq = view.load_seq;
-                var nav_hard = false;
-                var nav_soft = false;
-                var waited: u32 = 0;
-                while (waited < 300) : (waited += 100) {
-                    drv.sleep(100);
-                    const vs1 = (try listViews(drv, arena)) orelse break;
-                    const cur = viewFor(vs1, view.pane) orelse break;
-                    if (cur.loading or cur.load_seq != pre_seq) {
-                        nav_hard = true;
-                        break;
-                    }
-                    if (!std.mem.eql(u8, cur.url, pre_url)) {
-                        nav_soft = true;
-                        break;
-                    }
-                }
-                if (nav_hard) {
-                    const deadline = drv.now() + @min(timeoutOf(args, DEFAULT_TIMEOUT_MS), 10_000);
-                    while (drv.now() < deadline) {
-                        drv.sleep(100);
-                        const vs1 = (try listViews(drv, arena)) orelse break;
-                        const cur = viewFor(vs1, view.pane) orelse break;
-                        if (!cur.loading and cur.load_seq != pre_seq) break;
-                    }
-                } else if (nav_soft) {
-                    drv.sleep(900);
-                    after.note = "the url changed without a page load (client-side route); the delta below is what had rendered ~1s after the act - if it looks incomplete, the route's data was still arriving: call web_snapshot again";
-                }
-                switch (try runOp(drv, arena, view.pane, .{
-                    .op = "snapshot",
-                    .mode = "auto",
-                    .detail = 1,
-                }, 5000)) {
-                    .err => |e| after.delta_error = e.text,
-                    .done => |d| {
-                        if (d.timed_out) {
-                            after.delta_error = "no follow-up snapshot arrived within 5s";
-                        } else {
-                            after.delta_kind = d.snapshot_kind;
-                            after.delta = d.payload;
-                        }
-                    },
-                }
-                if (try listViews(drv, arena)) |vs2| {
-                    if (viewFor(vs2, view.pane)) |a| {
-                        if (!std.mem.eql(u8, a.url, view.url)) after.navigated_to = a.url;
-                        after.loading_after = a.loading;
-                    }
-                }
+                const after = try settleAndDelta(drv, arena, view, args);
                 return actResult(arena, drv.mode(), view, id_v, action, r.payload, after);
             },
         }
@@ -2108,6 +2119,9 @@ pub fn webTool(
     }
 
     if (eql(u8, name, "web_scroll")) return scrollTool(drv, arena, args, view);
+    if (eql(u8, name, "web_key")) return keyTool(drv, arena, args, view);
+    if (eql(u8, name, "web_resize")) return resizeTool(drv, arena, args, view);
+    if (eql(u8, name, "web_console")) return consoleTool(drv, arena, args, view);
     if (eql(u8, name, "web_wait")) return waitTool(drv, arena, args, view);
     if (eql(u8, name, "web_network")) return networkTool(drv, arena, args, view);
 
@@ -2576,6 +2590,139 @@ fn scrollTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
     drv.sleep(250);
     const after = try scrollProbe(drv, arena, view);
     return scrollResult(arena, drv.mode(), view, how, parsePos(arena, before), parsePos(arena, after));
+}
+
+const GUI_ONLY_HEADLESS =
+    "this tool drives the server's own headless browser engine; a GUI is attached, so the view is the user's real pane (keyboard and size belong to the GUI there). Run this MCP server without --shared/--socket for a headless view";
+
+/// Named trusted key input: the same `input_key` frames a GUI
+/// keystroke rides, so Tab order, Escape and Enter are testable.
+fn keyTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    if (try policyGate(arena, view)) |f| return failRes(arena, f);
+    const keys = mcp.argStr(args, "keys") orelse
+        return mcp.errRes(arena, .invalid_args, "web_key needs 'keys': space-separated chords, e.g. \"Tab Tab Enter\", \"Escape\", \"ctrl+a\"");
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, GUI_ONLY_HEADLESS),
+        .headless => |e| e,
+    };
+    var chords: [64]webkeys.Chord = undefined;
+    const n = webkeys.parseKeys(keys, &chords) catch |err| return mcp.errRes(arena, .invalid_args, switch (err) {
+        error.UnknownKey => "web_key: unknown key (named keys: Enter Tab Escape Backspace Delete Insert Home End PageUp PageDown Up Down Left Right Space F1-F12; anything else must be a single character)",
+        error.UnknownModifier => "web_key: unknown modifier (ctrl, shift, alt, meta)",
+        error.EmptyChord => "web_key: 'keys' names no key",
+    });
+    e.focusView(view.pane) catch |err| return failRes(arena, try headlessFail(arena, e, err));
+    for (chords[0..n]) |*ch| {
+        e.sendKey(view.pane, ch.keysym, ch.mods, ch.textSlice()) catch |err|
+            return failRes(arena, try headlessFail(arena, e, err));
+        // A human-ish gap so pages polling between events see each key.
+        drv.sleep(30);
+    }
+    const after = try settleAndDelta(drv, arena, view, args);
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, drv.mode(), view);
+    try res.fact("keys", keys);
+    try res.fact("count", n);
+    try res.textf("sent {d} key chord(s): {s}", .{ n, try clip(arena, keys, 200) });
+    try renderAfter(&res, arena, after);
+    return res.finish();
+}
+
+/// In-place viewport resize: media queries and layout re-evaluate,
+/// the document and its semantic ids survive.
+fn resizeTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, GUI_ONLY_HEADLESS),
+        .headless => |e| e,
+    };
+    const w: u16 = @intCast(std.math.clamp(mcp.argInt(args, "width") orelse
+        return mcp.errRes(arena, .invalid_args, "web_resize needs 'width' and 'height'"), 320, 3840));
+    const h: u16 = @intCast(std.math.clamp(mcp.argInt(args, "height") orelse
+        return mcp.errRes(arena, .invalid_args, "web_resize needs 'width' and 'height'"), 240, 2160));
+    e.resize(view.pane, w, h) catch |err| return failRes(arena, try headlessFail(arena, e, err));
+    // Let the engine relayout before anything reads the page.
+    drv.sleep(250);
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, drv.mode(), view);
+    try res.fact("width", w);
+    try res.fact("height", h);
+    try res.textf("viewport is now {d}x{d}; same document, semantic ids survive (geometry changed - re-snapshot before pixel-precise work)", .{ w, h });
+    const snap_want = mcp.argStr(args, "snapshot") orelse "none";
+    if (std.mem.eql(u8, snap_want, "delta") or std.mem.eql(u8, snap_want, "full")) {
+        switch (try runOp(drv, arena, view.pane, .{
+            .op = "snapshot",
+            .mode = if (std.mem.eql(u8, snap_want, "full")) "full" else "auto",
+            .detail = 1,
+        }, 5000)) {
+            .err => |er| try res.textf("snapshot_error: {s}", .{er.text}),
+            .done => |r| {
+                if (r.timed_out) {
+                    try res.text("snapshot_error: the page did not answer in time (call web_snapshot)");
+                } else {
+                    try res.fact("kind", r.snapshot_kind);
+                    try res.fact("document", r.doc_gen);
+                    try res.fact("revision", r.rev);
+                    try res.fact("snapshot", r.payload);
+                    try section(&res, "snapshot", r.payload);
+                    try res.text(TRUST_LINE);
+                }
+            },
+        }
+    } else if (!std.mem.eql(u8, snap_want, "none")) {
+        return mcp.errRes(arena, .invalid_args, "web_resize 'snapshot' must be none|delta|full");
+    }
+    return res.finish();
+}
+
+fn consoleLevelName(level: u8) []const u8 {
+    return switch (level) {
+        0, 2 => "log",
+        1 => "debug",
+        3 => "warn",
+        4 => "error",
+        else => "fatal",
+    };
+}
+
+/// The page's console output, mirrored since the view opened.
+fn consoleTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    const e = switch (drv) {
+        .gui => return mcp.errRes(arena, .unavailable, GUI_ONLY_HEADLESS),
+        .headless => |e| e,
+    };
+    const since: u32 = @intCast(@max(mcp.argInt(args, "since") orelse 0, 0));
+    const max: usize = @intCast(std.math.clamp(mcp.argInt(args, "max") orelse 100, 1, webdrive.CONSOLE_CAP));
+    // Pump briefly so a line the page just logged is in the mirror.
+    drv.sleep(50);
+    const tail = e.consoleTail(view.pane, since) catch |err| return failRes(arena, try headlessFail(arena, e, err));
+    const lines = if (tail.lines.len > max) tail.lines[tail.lines.len - max ..] else tail.lines;
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, drv.mode(), view);
+    try res.fact("count", lines.len);
+    try res.fact("dropped", tail.dropped);
+    try res.fact("last_id", if (lines.len > 0) lines[lines.len - 1].id else since);
+    if (lines.len == 0) {
+        // An empty answer is a MEASUREMENT: the mirror has covered the
+        // view since it opened, so nothing matched means nothing was
+        // logged (in this id range), not "unknown".
+        if (since == 0 and tail.dropped == 0)
+            try res.text("the page has logged nothing to the console since this view opened")
+        else
+            try res.textf("no console lines after id {d} ({d} oldest lines were dropped by the {d}-line mirror)", .{ since, tail.dropped, webdrive.CONSOLE_CAP });
+        return res.finish();
+    }
+    var body: std.Io.Writer.Allocating = .init(arena);
+    for (lines) |line| {
+        try body.writer.print("[{d}] {s}: {s}\n", .{ line.id, consoleLevelName(line.level), line.text });
+    }
+    try res.textf("{d} console line(s){s}; pass since:{d} next time for only newer ones", .{
+        lines.len,
+        if (tail.dropped > 0) " (oldest were dropped by the bounded mirror)" else "",
+        lines[lines.len - 1].id,
+    });
+    try section(&res, "console", body.written());
+    try res.text(TRUST_LINE);
+    return res.finish();
 }
 
 const NetCounters = struct { enabled: bool, blocked: i64, total: i64, rules: i64 };
@@ -3463,7 +3610,7 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 18), seen);
+    try std.testing.expectEqual(@as(usize, 21), seen);
 }
 
 test "parsePolicy fails closed on every unknown name, wildcard and port" {

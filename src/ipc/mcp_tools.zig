@@ -1538,6 +1538,48 @@ pub const TOOLS = [_]ToolDef{
         ,
     },
     .{
+        .name = "web_key",
+        .group = .browser,
+        .mutates = true,
+        .description =
+        \\Send named key chords to a web view as TRUSTED key events (the same input path a real keystroke rides), so Tab order, Escape-to-dismiss and Enter-to-submit are testable. 'keys' is space-separated chords: named keys (Enter Tab Escape Backspace Delete Insert Home End PageUp PageDown Up Down Left Right Space F1-F12), single characters, and ctrl/shift/alt/meta modifiers ("Tab Tab Enter", "ctrl+a", "shift+Tab"). For typing text into a field prefer web_act set_value. The reply carries the same settled auto-delta as web_act, so a keystroke that navigated or changed the page is visible. Headless backend only (capabilities reports web_backend); with a GUI attached the pane owns the keyboard. Omitting 'pane' means the CURRENT view.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"pane":{"type":"integer"},"keys":{"type":"string","description":"Space-separated chords, e.g. \"Tab Tab Enter\" or \"ctrl+a\""},"timeout_ms":{"type":"integer"}},"required":["keys"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"policy_exhausted":{"type":"boolean","description":"A network-policy budget latched: reads still answer, new traffic is refused"},"policy_exhausted_reason":{"type":"string"},"keys":{"type":"string"},"count":{"type":"integer","description":"Chords actually sent"},"navigated_to":{"type":"string"},"loading_after":{"type":"boolean"},"delta_kind":{"type":"string"},"delta":{"type":"string","description":"What changed after the keys"},"delta_error":{"type":"string"}},"required":["backend","origin","url","title","loading","keys","count"]}
+        ,
+    },
+    .{
+        .name = "web_resize",
+        .group = .browser,
+        .mutates = true,
+        .description =
+        \\Resize a web view's viewport IN PLACE (width x height, logical px). The document and its semantic ids survive - testing several viewports is one view resized N times, not N views with fresh ids. Media queries and layout re-evaluate; re-snapshot (or pass snapshot:"delta") before pixel-precise work. Headless backend only (a GUI view's size is its pane's size). Omitting 'pane' means the CURRENT view.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"pane":{"type":"integer"},"width":{"type":"integer","description":"320-3840"},"height":{"type":"integer","description":"240-2160"},"snapshot":{"type":"string","enum":["none","delta","full"],"description":"Default none: append a snapshot of the relaid-out page"}},"required":["width","height"]}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"policy_exhausted":{"type":"boolean","description":"A network-policy budget latched: reads still answer, new traffic is refused"},"policy_exhausted_reason":{"type":"string"},"width":{"type":"integer"},"height":{"type":"integer"},"kind":{"type":"string"},"document":{"type":"integer"},"revision":{"type":"integer"},"snapshot":{"type":"string"}},"required":["backend","origin","url","title","loading","width","height"]}
+        ,
+    },
+    .{
+        .name = "web_console",
+        .group = .browser,
+        .mutates = false,
+        .description =
+        \\The page's console output (console.log/warn/error, uncaught exceptions as the engine reports them), mirrored per view since it opened - the blind spot behind "no console error column". Bounded drop-oldest mirror; ids increase, so pass 'since' (the previous reply's last_id) to read only newer lines. An empty answer with dropped:0 means the page logged NOTHING since the view opened - a measurement, not an unknown. Headless backend only. Omitting 'pane' means the CURRENT view.
+        ,
+        .input_schema =
+        \\{"type":"object","properties":{"pane":{"type":"integer"},"since":{"type":"integer","description":"Only lines with id > since (default 0 = everything still held)"},"max":{"type":"integer","description":"Most recent N lines, default 100"}}}
+        ,
+        .output_schema =
+        \\{"type":"object","properties":{"backend":{"type":"string","enum":["gui","headless"]},"pane":{"type":"integer"},"view":{"type":"integer"},"origin":{"type":"string"},"url":{"type":"string"},"title":{"type":"string"},"loading":{"type":"boolean"},"policy_exhausted":{"type":"boolean","description":"A network-policy budget latched: reads still answer, new traffic is refused"},"policy_exhausted_reason":{"type":"string"},"count":{"type":"integer"},"dropped":{"type":"integer","description":"Oldest lines the bounded mirror discarded"},"last_id":{"type":"integer","description":"Pass as 'since' next time"}},"required":["backend","origin","url","title","loading","count","dropped","last_id"]}
+        ,
+    },
+    .{
         .name = "web_eval",
         .group = .browser,
         .mutates = true,

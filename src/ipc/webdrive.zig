@@ -233,7 +233,16 @@ pub const View = struct {
     pol_ms_left: u32 = 0,
     pol_denied: [proto.NREASONS]u32 = @splat(0),
 
+    /// Bounded mirror of the page's `ev_console` stream, so a tool can
+    /// answer "what did the page log" after the fact. Drop-oldest; ids
+    /// keep increasing so a reader can page with `since`.
+    console: std.ArrayList(ConsoleLine) = .empty,
+    console_next_id: u32 = 1,
+    console_dropped: u32 = 0,
+
     fn deinit(self: *View, gpa: std.mem.Allocator) void {
+        for (self.console.items) |line| gpa.free(line.text);
+        self.console.deinit(gpa);
         if (self.url) |u| gpa.free(u);
         if (self.title) |t| gpa.free(t);
         if (self.profile) |p| gpa.free(p);
@@ -249,6 +258,12 @@ pub const View = struct {
         }
     }
 };
+
+pub const ConsoleLine = struct { id: u32, level: u8, text: []u8 };
+
+/// Console mirror bounds: entries kept per view, bytes kept per line.
+pub const CONSOLE_CAP = 200;
+pub const CONSOLE_LINE_MAX = 512;
 
 pub const State = enum { idle, ready, unavailable };
 
@@ -1850,6 +1865,75 @@ pub const Engine = struct {
         }) catch return error.Unavailable;
     }
 
+    /// Mirror one `ev_console` line into the view's bounded ring.
+    fn pushConsole(self: *Engine, v: *View, level: u8, msg: []const u8) void {
+        const text = self.gpa.dupe(u8, msg[0..@min(msg.len, CONSOLE_LINE_MAX)]) catch return;
+        v.console.append(self.gpa, .{ .id = v.console_next_id, .level = level, .text = text }) catch {
+            self.gpa.free(text);
+            return;
+        };
+        v.console_next_id +%= 1;
+        if (v.console.items.len > CONSOLE_CAP) {
+            const old = v.console.orderedRemove(0);
+            self.gpa.free(old.text);
+            v.console_dropped += 1;
+        }
+    }
+
+    /// The mirrored console lines with id > `since` (0 = everything
+    /// still held). Slices borrow the ring: consume before pumping.
+    pub fn consoleTail(self: *Engine, id: u32, since: u32) !struct { lines: []const ConsoleLine, dropped: u32, next: u32 } {
+        const v = self.findView(id) orelse return error.NoView;
+        var start: usize = 0;
+        for (v.console.items, 0..) |line, i| {
+            if (line.id > since) break;
+            start = i + 1;
+        }
+        return .{ .lines = v.console.items[start..], .dropped = v.console_dropped, .next = v.console_next_id };
+    }
+
+    /// Focus + a trusted key chord (down with text, then up) through
+    /// the ordinary input path - the same frames a GUI keystroke rides.
+    pub fn sendKey(self: *Engine, id: u32, keysym: u32, mods: u32, text: []const u8) !void {
+        if (!self.ensure()) return error.Unavailable;
+        if (self.findView(id) == null) return error.NoView;
+        self.awaitFirstPaint(id, 5_000);
+        self.send(proto.InputKey{
+            .view = id,
+            .kind = @intFromEnum(proto.KeyKind.down),
+            .keyval = keysym,
+            .keycode = 0,
+            .mods = mods,
+            .text = text,
+        }) catch return error.Unavailable;
+        self.send(proto.InputKey{
+            .view = id,
+            .kind = @intFromEnum(proto.KeyKind.up),
+            .keyval = keysym,
+            .keycode = 0,
+            .mods = mods,
+            .text = "",
+        }) catch return error.Unavailable;
+    }
+
+    /// Tell the engine the view has keyboard focus; keys are dropped
+    /// into the void without it (a GUI sends this on focus-in).
+    pub fn focusView(self: *Engine, id: u32) !void {
+        if (!self.ensure()) return error.Unavailable;
+        if (self.findView(id) == null) return error.NoView;
+        self.send(proto.InputFocus{ .view = id, .focused = 1 }) catch return error.Unavailable;
+    }
+
+    /// Resize the viewport in place; node geometry and media queries
+    /// re-evaluate, ids survive (same document, same tree).
+    pub fn resize(self: *Engine, id: u32, w: u16, h: u16) !void {
+        if (!self.ensure()) return error.Unavailable;
+        const v = self.findView(id) orelse return error.NoView;
+        self.send(proto.ViewResize{ .view = id, .w = w, .h = h, .scale_x1000 = 1000 }) catch return error.Unavailable;
+        v.w = w;
+        v.h = h;
+    }
+
     /// The full text of the last eval result on `id`, if any.
     pub fn lastEval(self: *Engine, id: u32) ?[]const u8 {
         const v = self.findView(id) orelse return null;
@@ -2337,6 +2421,10 @@ pub const Engine = struct {
                 else
                     "the browser helper refused the view's identity context");
             },
+            .ev_console => {
+                const ev = proto.decode(proto.EvConsole, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| self.pushConsole(v, ev.level, ev.msg);
+            },
             .ev_crashed => {
                 const ev = proto.decode(proto.EvCrashed, frame.payload) catch return;
                 if (self.findView(ev.view)) |v| {
@@ -2473,6 +2561,37 @@ pub const Engine = struct {
 // ---------------------------------------------------------------------
 // Tests (pure bookkeeping; no helper is spawned)
 // ---------------------------------------------------------------------
+
+test "console mirror: bounded, drop-oldest, paged by id" {
+    const gpa = std.testing.allocator;
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
+    defer {
+        eng.state = .idle;
+        eng.deinit();
+    }
+    const v = try gpa.create(View);
+    v.* = .{ .id = 1, .w = 100, .h = 100 };
+    try eng.views.append(gpa, v);
+
+    var i: usize = 0;
+    while (i < CONSOLE_CAP + 5) : (i += 1) eng.pushConsole(v, 2, "line");
+    const tail = try eng.consoleTail(1, 0);
+    try std.testing.expectEqual(@as(usize, CONSOLE_CAP), tail.lines.len);
+    try std.testing.expectEqual(@as(u32, 5), tail.dropped);
+    // The oldest retained id is 6: 1..5 were dropped.
+    try std.testing.expectEqual(@as(u32, 6), tail.lines[0].id);
+    const page = try eng.consoleTail(1, tail.lines[tail.lines.len - 1].id - 2);
+    try std.testing.expectEqual(@as(usize, 2), page.lines.len);
+    const drained = try eng.consoleTail(1, tail.next - 1);
+    try std.testing.expectEqual(@as(usize, 0), drained.lines.len);
+    try std.testing.expectError(error.NoView, eng.consoleTail(9, 0));
+
+    // A line past the byte bound is truncated, never refused.
+    var big: [CONSOLE_LINE_MAX + 100]u8 = @splat('x');
+    eng.pushConsole(v, 3, &big);
+    const last = try eng.consoleTail(1, 0);
+    try std.testing.expectEqual(@as(usize, CONSOLE_LINE_MAX), last.lines[last.lines.len - 1].text.len);
+}
 
 test "a snapshot reply is exactly the helper's coalesced answer; strays are dropped" {
     const gpa = std.testing.allocator;

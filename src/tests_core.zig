@@ -212,6 +212,7 @@ comptime {
     // mapping are testable everywhere.
     _ = @import("web/protocol.zig");
     _ = @import("web/cefargs.zig");
+    _ = @import("web/webkeys.zig");
     _ = @import("web/ozone.zig");
     _ = @import("web/keymap.zig");
     _ = @import("web/semantic.zig");
