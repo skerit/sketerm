@@ -817,19 +817,46 @@
     try {
       el.dispatchEvent(new Event("change", { bubbles: true }));
     } catch (e) {}
-    send({ op: "ack", req: req, ok: 1, msg: String(el.value === undefined ? "" : el.value) });
+    // Report the value that LANDED, read after typing. A framework that
+    // re-created the control mid-typing leaves `el` detached reading ""
+    // while the keystrokes went to its successor - the focused element
+    // is then the honest thing to read, and the replacement itself is
+    // worth reporting (it is how input-recreation bugs surface).
+    var read = el;
+    var note = "";
+    if (!el.isConnected) {
+      var live = document.activeElement;
+      if (live && live.value !== undefined) {
+        read = live;
+        note = "the control was replaced while typing; this is its successor's value";
+      } else {
+        note = "the control was replaced while typing and nothing holds focus";
+      }
+    }
+    send({ op: "ack", req: req, ok: 1, msg: String(read.value === undefined ? "" : read.value), note: note });
   }
 
   function act(req, eid, action) {
     var el = elFor(eid);
     if (!el) return send({ op: "ack", req: req, ok: 0, msg: "unknown id" });
+    var msg = action;
     try {
-      if (action === "focus") el.focus();
-      else if (action === "scroll") el.scrollIntoView({ block: "center", inline: "center" });
+      if (action === "focus") {
+        el.focus();
+        msg = document.activeElement === el ? "focused" : "focus() ran, but the element did not take focus";
+      } else if (action === "scroll") {
+        // Say whether anything MOVED: "scroll" alone cannot distinguish
+        // an element already in view from one brought into it.
+        var before = el.getBoundingClientRect();
+        el.scrollIntoView({ block: "center", inline: "center" });
+        var after = el.getBoundingClientRect();
+        var moved = Math.round(Math.abs(after.top - before.top) + Math.abs(after.left - before.left));
+        msg = moved > 0 ? "scrolled into view (moved " + moved + "px)" : "already in view (nothing moved)";
+      }
     } catch (e) {
       return send({ op: "ack", req: req, ok: 0, msg: String(e) });
     }
-    send({ op: "ack", req: req, ok: 1, msg: action });
+    send({ op: "ack", req: req, ok: 1, msg: msg });
   }
 
   function expand(req, eid, off, len) {
@@ -1091,14 +1118,56 @@
     });
   }
 
-  function evaluate(req, code, wantAwait, timeout) {
+  // Requests that reached evaluate() at all, so `evalprobe` can tell a
+  // CSP-spliced script that failed to PARSE (the whole command script
+  // died and nothing ran) from one that ran and will answer. Plain
+  // object keyed by req; pruned wholesale so it stays bounded.
+  var evalSeen = {};
+  var evalSeenCount = 0;
+
+  function evaluate(req, code, wantAwait, timeout, fn) {
+    evalSeen[req] = 1;
+    if (++evalSeenCount > 256) {
+      evalSeen = {};
+      evalSeen[req] = 1;
+      evalSeenCount = 1;
+    }
     var v;
-    try {
-      // Indirect eval: global scope, so `var` declarations and function
-      // hoisting behave the way a console user expects.
-      v = (0, eval)(code);
-    } catch (e) {
-      return sendEvalErr(req, e, "thrown while evaluating");
+    if (typeof fn === "function") {
+      // The CSP lane: the code was compiled as part of the command
+      // script, so eval() never runs.
+      try {
+        v = fn();
+      } catch (e0) {
+        return sendEvalErr(req, e0, "thrown while evaluating");
+      }
+    } else {
+      try {
+        // Indirect eval: global scope, so `var` declarations and function
+        // hoisting behave the way a console user expects.
+        v = (0, eval)(code);
+      } catch (e) {
+        // A CSP that lacks 'unsafe-eval' rejects the STRING, not the
+        // code: flag it so the browser process can re-send the code
+        // spliced into the command script, which CSP does not govern.
+        var cspish = false;
+        try {
+          cspish = e instanceof EvalError || /Content Security Policy/i.test(String((e && e.message) || e));
+        } catch (e2) {}
+        if (cspish) {
+          // The spliced retry reuses this req id: unmark it so the
+          // probe judges THAT attempt, not this one.
+          delete evalSeen[req];
+          return send({
+            op: "eval",
+            req: req,
+            ok: 0,
+            csp: 1,
+            json: evalJson({ error: "eval() is blocked by this page's Content Security Policy" })
+          });
+        }
+        return sendEvalErr(req, e, "thrown while evaluating");
+      }
     }
     if (!wantAwait || !v || typeof v.then !== "function") return sendEvalOk(req, v);
     var done = false;
@@ -2088,10 +2157,18 @@
   function handle(json, navgen) {
     if (typeof navgen === "number" && navgen > 0) NAVGEN = navgen;
     var m;
-    try {
-      m = parseJson(json);
-    } catch (e) {
-      return;
+    // An object command is the CSP lane: code the browser process could
+    // not ship as data (eval() is blocked) arrives pre-compiled as a
+    // function literal inside the command script itself. Same authority
+    // as the string form; a page that found the slot gains nothing new.
+    if (json !== null && typeof json === "object") {
+      m = json;
+    } else {
+      try {
+        m = parseJson(json);
+      } catch (e) {
+        return;
+      }
     }
     switch (m.op) {
       case "snapshot":
@@ -2126,7 +2203,19 @@
         controlState(m.req, m.eid);
         break;
       case "eval":
-        evaluate(m.req, String(m.code || ""), !!m.await, m.timeout || 10000);
+        evaluate(m.req, String(m.code || ""), !!m.await, m.timeout || 10000, m.fn);
+        break;
+      case "evalprobe":
+        // Sent right after a CSP-spliced eval: scripts run in order, so
+        // a request evaluate() never saw means the spliced script did
+        // not PARSE - under CSP only a single expression can be
+        // compiled this way, and a statement list dies silently.
+        if (!evalSeen[m.req])
+          sendEvalErr(
+            m.req,
+            new Error("the code did not compile as one expression"),
+            "this page's CSP blocks eval(), so only a single JavaScript EXPRESSION can run; wrap statements in (()=>{ ... })() (with await:true if it returns a promise)"
+          );
         break;
       case "ext-inject":
         extInject(m);

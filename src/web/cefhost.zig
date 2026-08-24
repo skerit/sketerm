@@ -701,10 +701,17 @@ const Pending = struct {
     mode: u8 = 0,
     detail: u8 = 0,
     scope: u32 = 0,
-    /// Owned copy of a `sem_act` argument (the text to type).
+    /// Owned copy of a `sem_act` argument (the text to type), or of an
+    /// `eval` request's code so a CSP refusal can re-send it spliced.
     arg: []u8 = &.{},
     off: u32 = 0,
     guard: u64 = 0,
+    /// Eval-only: the await flag and timeout travel with the code so
+    /// the CSP re-send is byte-equivalent, and `eval_retried` makes the
+    /// fallback single-shot.
+    eval_await: bool = false,
+    eval_timeout_ms: u32 = 0,
+    eval_retried: bool = false,
 
     const Kind = enum {
         snapshot,
@@ -6529,17 +6536,60 @@ pub const Host = struct {
             self.post(proto.SemEvalResult{ .view = v.id, .ok = 0, .json = .{ .s = "{\"error\":\"semantic evaluation unavailable while the page is navigating\"}" } });
             return;
         }
-        const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .eval });
+        // The code is kept with the request: a page whose CSP blocks
+        // eval() answers with a `csp` marker, and the retry re-sends
+        // these same bytes spliced into the command script instead.
+        const code_copy = self.gpa.dupe(u8, req.code.s) catch return;
+        const want_await = req.flags & proto.eval_flag_await != 0;
+        const timeout: u32 = @min(req.timeout_ms, 120_000);
+        const rid = self.pushPending(v, .{
+            .req = nextReq(v),
+            .kind = .eval,
+            .arg = code_copy,
+            .eval_await = want_await,
+            .eval_timeout_ms = timeout,
+        }) catch {
+            self.gpa.free(code_copy);
+            return;
+        };
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
         cmd.writer.print("{{\"op\":\"eval\",\"req\":{d},\"await\":{s},\"timeout\":{d},\"code\":", .{
             rid,
-            if (req.flags & proto.eval_flag_await != 0) "true" else "false",
-            @min(req.timeout_ms, 120_000),
+            if (want_await) "true" else "false",
+            timeout,
         }) catch return;
         jsonStr(&cmd.writer, req.code.s) catch return;
         cmd.writer.writeByte('}') catch return;
         self.sendScript(v, cmd.written());
+    }
+
+    /// The CSP lane of `sem_eval`: the code compiled INTO the command
+    /// script as a function literal, which `execute_java_script` runs
+    /// regardless of the page's CSP - only eval()-of-a-string is
+    /// governed. Restricted to a single expression by construction; the
+    /// `evalprobe` sent right behind it turns a parse failure (the
+    /// whole script dies, nothing replies) into a clear answer instead
+    /// of a 120s timeout.
+    fn sendEvalSpliced(self: *Host, v: *View, rid: u32, code: []const u8, want_await: bool, timeout: u32) void {
+        if (!sem_secret.ok) return;
+        const b = v.browser orelse return;
+        const gf = b.get_main_frame orelse return;
+        const frame: *cef.cef_frame_t = gf(b) orelse return;
+        defer release(&frame.base);
+        const slot: []const u8 = &sem_secret.slot;
+        var script: std.Io.Writer.Allocating = .init(self.gpa);
+        defer script.deinit();
+        script.writer.print(
+            "window[\"{s}\"]&&window[\"{s}\"](({{\"op\":\"eval\",\"req\":{d},\"await\":{s},\"timeout\":{d},\"fn\":function(){{return(\n",
+            .{ slot, slot, rid, if (want_await) "true" else "false", timeout },
+        ) catch return;
+        script.writer.writeAll(code) catch return;
+        script.writer.print("\n)}}}}),{d})", .{v.sem_nav.generation}) catch return;
+        runJs(frame, script.written());
+        var probe: [64]u8 = undefined;
+        const cmd = std.fmt.bufPrint(&probe, "{{\"op\":\"evalprobe\",\"req\":{d}}}", .{rid}) catch return;
+        self.sendScriptToFrameGen(frame, cmd, v.sem_nav.generation);
     }
 
     pub fn semRead(self: *Host, req: proto.SemRead) !void {
@@ -6689,9 +6739,22 @@ pub const Host = struct {
         } else if (std.mem.eql(u8, op, "optrect")) {
             self.onOptionRect(v, &p, json);
         } else if (std.mem.eql(u8, op, "eval")) {
-            const E = struct { ok: u8 = 0, json: []const u8 = "" };
+            const E = struct { ok: u8 = 0, csp: u8 = 0, json: []const u8 = "" };
             const e = std.json.parseFromSlice(E, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
             defer e.deinit();
+            // eval() refused by the page's CSP: re-send the same code
+            // spliced into the command script (single-shot), and only
+            // answer the client from THAT attempt.
+            if (e.value.ok == 0 and e.value.csp == 1 and !p.eval_retried and p.arg.len > 0) {
+                var again = p;
+                again.eval_retried = true;
+                const code = again.arg;
+                if (self.pushPending(v, again)) |_| {
+                    p.arg = &.{}; // the re-queued copy owns the code now
+                    self.sendEvalSpliced(v, again.req, code, again.eval_await, again.eval_timeout_ms);
+                    return;
+                } else |_| {}
+            }
             const rewritten = self.rewriteNodeRefs(v, e.value.json) catch null;
             defer if (rewritten) |r| self.gpa.free(r);
             self.post(proto.SemEvalResult{
@@ -6702,14 +6765,20 @@ pub const Host = struct {
         } else if (std.mem.eql(u8, op, "setvalue")) {
             self.onSetValue(v, &p, json);
         } else if (std.mem.eql(u8, op, "ack")) {
-            const Ack = struct { ok: u8 = 0, msg: []const u8 = "" };
+            const Ack = struct { ok: u8 = 0, msg: []const u8 = "", note: []const u8 = "" };
             const a = std.json.parseFromSlice(Ack, self.gpa, json, .{ .ignore_unknown_fields = true }) catch return;
             defer a.deinit();
             var buf: [512]u8 = undefined;
             const msg = switch (p.kind) {
-                .commit => std.fmt.bufPrint(&buf, "set-value ok, value=\"{s}\"", .{
-                    a.value.msg[0..@min(a.value.msg.len, 128)],
-                }) catch a.value.msg,
+                .commit => if (a.value.note.len > 0)
+                    std.fmt.bufPrint(&buf, "set-value ok, value=\"{s}\" ({s})", .{
+                        a.value.msg[0..@min(a.value.msg.len, 128)],
+                        a.value.note[0..@min(a.value.note.len, 160)],
+                    }) catch a.value.msg
+                else
+                    std.fmt.bufPrint(&buf, "set-value ok, value=\"{s}\"", .{
+                        a.value.msg[0..@min(a.value.msg.len, 128)],
+                    }) catch a.value.msg,
                 .choose_done => std.fmt.bufPrint(
                     &buf,
                     "custom dropdown: clicked option \"{s}\" (trusted); control now \"{s}\"",
@@ -6891,16 +6960,23 @@ pub const Host = struct {
         const pt = viewPoint(v, r.value.x, r.value.y);
         var ev = cef.cef_mouse_event_t{ .x = pt.x, .y = pt.y, .modifiers = 0 };
         withHostArgs(v, sendMove, .{ &ev, @as(c_int, 0) });
-        var buf: [128]u8 = undefined;
+        // Echo WHAT the id resolved to, not only where the pointer
+        // went: a mis-resolved id is invisible in bare coordinates.
+        var target_buf: [140]u8 = undefined;
+        const target: []const u8 = if (v.sem.describe(p.sid)) |d|
+            std.fmt.bufPrint(&target_buf, "on {s} \"{s}\" ", .{ d.role, d.name[0..@min(d.name.len, 96)] }) catch ""
+        else
+            "";
+        var buf: [256]u8 = undefined;
         if (p.kind == .hover) {
-            const msg = std.fmt.bufPrint(&buf, "hover at {d},{d}", .{ r.value.x, r.value.y }) catch "hover";
+            const msg = std.fmt.bufPrint(&buf, "hover {s}at {d},{d}", .{ target, r.value.x, r.value.y }) catch "hover";
             self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 1, .msg = msg });
             return;
         }
         withHostArgs(v, setFocus, .{@as(c_int, 1)});
         withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
         withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 1), @as(c_int, 1) });
-        const msg = std.fmt.bufPrint(&buf, "click at {d},{d}", .{ r.value.x, r.value.y }) catch "click";
+        const msg = std.fmt.bufPrint(&buf, "click {s}at {d},{d}", .{ target, r.value.x, r.value.y }) catch "click";
         self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 1, .msg = msg });
     }
 

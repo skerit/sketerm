@@ -252,6 +252,16 @@ pub const View = struct {
         return 0;
     }
 
+    /// Role and name behind `sid`, so an action result can say WHAT it
+    /// resolved to rather than only where it clicked. Slices borrow the
+    /// live tree: use before the next apply.
+    pub fn describe(self: *const View, sid: u32) ?struct { role: []const u8, name: []const u8 } {
+        for (self.nodes.items) |n| {
+            if (n.sid == sid) return .{ .role = n.role, .name = n.name };
+        }
+        return null;
+    }
+
     /// Stable id of an engine-local id, or 0 when unseen.
     pub fn sidFor(self: *const View, eid: u32) u32 {
         for (self.nodes.items) |n| {
