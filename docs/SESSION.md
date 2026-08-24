@@ -19224,3 +19224,27 @@ value. Deliberately NOT done: cookie VALUE reads (stage 31 pins that
 values never cross the wire), unchanged-subtree elision and
 cross-document deltas (worthwhile but format-affecting, need a design
 pass), web_key/web_resize/console capture (new engine plumbing).
+
+## 2026-08-24: web_key, web_resize, web_console (headless web views)
+
+The three "missing tools" from the same feedback round, all client-side
+(the wire already carried input_key, view_resize and ev_console):
+
+- web_key sends named chords ("Tab Tab Enter", "ctrl+a", "shift+Tab")
+  as TRUSTED key events - src/web/webkeys.zig is the pure name->keysym
+  parser (both test roots), the helper's keymap.zig already maps every
+  named keysym. The reply carries the same settled auto-delta as
+  web_act (settleAndDelta is now shared), so Enter-that-navigated is
+  visible. Keyboard journeys (Tab order, Escape, Enter) stop being
+  untestable.
+- web_resize changes the viewport IN PLACE: same document, ids
+  survive, media queries re-evaluate; optional snapshot:delta shows
+  the relayout. Four viewports = one view resized four times.
+- web_console answers "what did the page log": webdrive mirrors the
+  helper's ev_console stream per view (bounded 200-line drop-oldest
+  ring, ids paged via since); an empty answer with dropped:0 is a
+  measurement ("the page logged nothing"), not an unknown.
+
+All three are headless-backend-only and their descriptions say so (a
+GUI view's keyboard and size belong to the pane); the GUI backend
+answers with a described refusal, never a guess.
