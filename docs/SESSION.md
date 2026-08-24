@@ -19175,3 +19175,52 @@ smoke-mcp SIGKILL 0.58s / SIGINT 0.68s to broker + two workers + shells
 gone; smoke-broker SIGKILL 3.2s to the forked broker, its workers, the
 display keeper and the private a11y bus gone; a bare broker whose fence
 writer dies logs "lifetime fence closed" and exits within 10ms.
+
+## 2026-08-24: browser-helper SPA crash workaround; web-tool feedback round
+
+The CEF 151.3.18 build crashes the whole helper on every client-side
+(soft) navigation: Chromium's ReadAnythingSoftNavigationObserver calls
+the crash-only TabInterface::GetFromContents on Alloy windowless
+WebContents (fixed upstream in CEF 151.3.23). The helper now coalesces
+every --disable-features into one switch that always carries
+ImmersiveReadAnything (src/web/cefargs.zig, pure + unit-tested in both
+roots); smoke-web stage 3b reproduces the crash with a trusted
+pushState route click and pins the survival.
+
+A consumer's structured feedback on the MCP web tools then drove a
+correctness-and-cost pass, each item reproduced before it was fixed:
+
+- web_eval under a CSP without 'unsafe-eval': the bridge's eval() is
+  refused by the page's policy, so the helper re-sends the code
+  compiled INTO the command script (a function literal - CSP does not
+  govern execute_java_script), single-shot, with an evalprobe behind it
+  that turns a parse failure into "only one EXPRESSION can run" instead
+  of a 120s timeout. Expressions (async IIFEs included) now answer on
+  hardened sites.
+- web_scroll to:top/bottom was a silent no-op everywhere: the position
+  probe's eval envelope {"value":{...}} was parsed as the position
+  itself (all-defaults = 0->0), and a refused scrollTo eval was
+  discarded. Both fixed; refusals now surface.
+- web_act raced navigations: the fixed 250ms-then-snapshot delta could
+  describe the OLD page after a click that navigated (filed once as a
+  product pagination bug). It now watches the view: a started load is
+  settled (bounded) before the delta, a same-document route change
+  gets a ~1s grace plus an explicit note that content may still be
+  arriving.
+- Action results echo what the id RESOLVED to: "click on link 'X' at
+  x,y" (semantic.View.describe), scroll_into_view reports the moved
+  distance or "already in view", and set-value always reports the
+  LANDED value - following focus to the successor when a framework
+  re-created the input mid-typing, and saying so.
+- Turn folds: web_open takes snapshot:"none" (view-only opens stop
+  paying ~2k tokens for a discarded tree), web_navigate takes
+  snapshot:"delta"|"full" (folds the follow-up tree into the reply),
+  and web_act acts by accessible 'name' (+role/nth) so the
+  find_text->act two-step is one call.
+
+smoke-web stage 3c serves a CSP page and pins the spliced eval lane,
+the statement refusal, the click echo and the replaced-input landed
+value. Deliberately NOT done: cookie VALUE reads (stage 31 pins that
+values never cross the wire), unchanged-subtree elision and
+cross-document deltas (worthwhile but format-affecting, need a design
+pass), web_key/web_resize/console capture (new engine plumbing).
