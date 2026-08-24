@@ -177,6 +177,22 @@ const spa_page =
     "document.getElementById('app').replaceWith(next);" ++
     "document.title='spa:trusted='+e.isTrusted+':'+location.pathname;" ++
     "});</script></body></html>";
+/// Served with a CSP that lacks 'unsafe-eval': the spliced-eval lane,
+/// the act echoes and the landed-value read all prove out here. The
+/// input replaces itself on the first keystroke, the way a framework
+/// re-render does, so the commit read must follow focus to the
+/// successor and say the control was replaced.
+const csp_eval_page =
+    "<!doctype html><html><head><title>csp-fix</title></head><body>" ++
+    "<a href=\"#x\">CSP Link</a>" ++
+    "<input aria-label=\"vfield\" id=f>" ++
+    "<script>var swapped=false;" ++
+    "document.getElementById('f').addEventListener('input',function(e){" ++
+    "if(swapped)return;swapped=true;" ++
+    "var el=e.target;var c=el.cloneNode(true);el.replaceWith(c);c.focus();});" ++
+    "</script></body></html>";
+const csp_header =
+    "Content-Security-Policy: script-src 'self' 'unsafe-inline'; object-src 'none'\r\n";
 const input_page =
     "data:text/html,<body><input%20id=i%20autofocus%20" ++
     "oninput=%22document.title='typed:'+this.value%22></body>";
@@ -730,6 +746,8 @@ const HttpProbe = struct {
     served: std.atomic.Value(u32) = .init(0),
     /// The document served to every request.
     body: []const u8 = page,
+    /// Extra response headers ("Name: v\r\n" each), e.g. a CSP.
+    extra_headers: []const u8 = "",
     /// Stage 39 turns the otherwise one-document probe into a tiny
     /// filter-list/resource router.
     filter_router: bool = false,
@@ -841,7 +859,7 @@ const HttpProbe = struct {
             self.handleCookieSync(afd, raw);
             return;
         }
-        tcpserver.respondOk(afd, "text/html", self.body, "");
+        tcpserver.respondOk(afd, "text/html", self.body, self.extra_headers);
         _ = self.served.fetchAdd(1, .release);
     }
 
@@ -6217,6 +6235,74 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         http.shutdown();
     }
     pass("stage 3b trusted SPA soft navigation");
+
+    // ── Stage 3c: CSP without unsafe-eval - the spliced lane ───────
+    // eval() of a string dies under `script-src` with no 'unsafe-eval';
+    // the helper re-sends the code compiled INTO the command script, so
+    // an EXPRESSION still answers and a statement list gets a described
+    // refusal instead of a 120s timeout. The same page proves the act
+    // echoes (what a click resolved to) and the landed-value read after
+    // a framework-style input recreation.
+    {
+        var http = HttpProbe{ .body = csp_eval_page, .extra_headers = csp_header };
+        if (!http.start()) fail("stage 3c CSP: HTTP fixture did not start");
+        var url_buf: [128]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{http.lis.port}) catch fail("stage 3c CSP url");
+        cl.navigate(url);
+        cl.resetSem();
+        cl.snapshot(@intFromEnum(proto.SnapMode.full), 1);
+        if (!cl.waitSem("link \"CSP Link\"", 20_000)) fail("stage 3c CSP: no snapshot of the fixture");
+
+        const two = cl.evalWait("1+1", false, 20_000);
+        if (std.mem.indexOf(u8, two, "\"value\":2") == null) {
+            std.debug.print("smoke-web: CSP eval said {s}\n", .{two});
+            fail("stage 3c CSP: an expression did not evaluate under CSP");
+        }
+        const dom = cl.evalWait("document.querySelectorAll('a').length", false, 20_000);
+        if (std.mem.indexOf(u8, dom, "\"value\":1") == null)
+            fail("stage 3c CSP: a DOM-reading expression did not evaluate under CSP");
+        const stmt = cl.evalWait("var x = 3; x + 1", false, 20_000);
+        if (std.mem.indexOf(u8, stmt, "one expression") == null) {
+            std.debug.print("smoke-web: CSP statement eval said {s}\n", .{stmt});
+            fail("stage 3c CSP: a statement list did not get the described expression-only refusal");
+        }
+
+        const link_id = cl.idOfLine("link \"CSP Link\"") orelse fail("stage 3c CSP: no id for the link");
+        {
+            const seq = cl.act_seq;
+            cl.send(proto.SemAction{
+                .view = view_id,
+                .id = link_id,
+                .action = @intFromEnum(proto.SemAct.click),
+                .arg = "",
+            });
+            if (!cl.waitSeq(&cl.act_seq, seq, 20_000) or cl.act_ok != 1) fail("stage 3c CSP: click failed");
+            const msg = cl.act_msg[0..cl.act_msg_len];
+            if (std.mem.indexOf(u8, msg, "on link \"CSP Link\"") == null) {
+                std.debug.print("smoke-web: click said \"{s}\"\n", .{msg});
+                fail("stage 3c CSP: the click result did not echo what the id resolved to");
+            }
+        }
+
+        const field_id = cl.idOfLine("textbox \"vfield\"") orelse fail("stage 3c CSP: no id for the input");
+        {
+            const seq = cl.act_seq;
+            cl.send(proto.SemAction{
+                .view = view_id,
+                .id = field_id,
+                .action = @intFromEnum(proto.SemAct.set_value),
+                .arg = "abcdef",
+            });
+            if (!cl.waitSeq(&cl.act_seq, seq, 20_000)) fail("stage 3c CSP: no set_value result");
+            const msg = cl.act_msg[0..cl.act_msg_len];
+            if (cl.act_ok != 1 or std.mem.indexOf(u8, msg, "replaced while typing") == null) {
+                std.debug.print("smoke-web: set_value said \"{s}\"\n", .{msg});
+                fail("stage 3c CSP: a recreated input did not report the replacement with its landed value");
+            }
+        }
+        http.shutdown();
+    }
+    pass("stage 3c CSP spliced eval, act echoes, landed value");
 
     // ── Stage 4: keyboard text entry ──────────────────────────────
     cl.navigate(input_page);
