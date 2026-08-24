@@ -1092,13 +1092,32 @@ fn profileResetResult(arena: std.mem.Allocator, profile: []const u8, retired: u3
     return res.finish();
 }
 
-fn navigateResult(arena: std.mem.Allocator, mode: Mode, v: View) ![]const u8 {
+fn navigateResult(
+    arena: std.mem.Allocator,
+    mode: Mode,
+    v: View,
+    snap: ?Snap,
+    snap_kind: []const u8,
+    snap_err: ?[]const u8,
+) ![]const u8 {
     var res = mcp.Res.init(arena);
     try head(&res, arena, mode, v);
     try res.fact("can_back", v.can_back);
     try res.fact("can_fwd", v.can_fwd);
     try res.fact("settled", !v.loading);
     try res.textf("settled: {}, can_back: {}, can_fwd: {}", .{ !v.loading, v.can_back, v.can_fwd });
+    if (snap_err) |e| {
+        try res.fact("snapshot_error", e);
+        try res.textf("snapshot_error: {s}", .{e});
+    }
+    if (snap) |s| {
+        try res.fact("kind", snap_kind);
+        try res.fact("document", s.document);
+        try res.fact("revision", s.revision);
+        try res.fact("snapshot", s.tree);
+        try section(&res, "snapshot", s.tree);
+        try res.text(TRUST_LINE);
+    }
     return res.finish();
 }
 
@@ -1142,6 +1161,9 @@ const ActAfter = struct {
     delta_error: ?[]const u8 = null,
     navigated_to: ?[]const u8 = null,
     loading_after: ?bool = null,
+    /// A caveat about the delta itself (a soft navigation whose content
+    /// may still be rendering), surfaced as text AND a fact.
+    note: ?[]const u8 = null,
 };
 
 fn actResult(
@@ -1168,6 +1190,8 @@ fn actResult(
         try res.textf("navigated to {s}", .{try clip(arena, u, URL_MAX)});
     }
     if (after.loading_after) |l| try res.fact("loading_after", l);
+    // Text lane only: a caveat is prose, not a machine fact.
+    if (after.note) |n| try res.textf("note: {s}", .{n});
     if (after.delta_error) |e| {
         try res.fact("delta_error", e);
         try res.textf("delta_error: {s}", .{e});
@@ -1297,7 +1321,79 @@ fn evalResult(
 const ScrollPos = struct { x: i64 = 0, y: i64 = 0, max_y: i64 = 0, viewport: i64 = 0 };
 
 fn parsePos(arena: std.mem.Allocator, json: []const u8) ?ScrollPos {
-    return std.json.parseFromSliceLeaky(ScrollPos, arena, json, .{ .ignore_unknown_fields = true }) catch null;
+    // The probe answer is an EVAL result, so the position object sits
+    // inside the `{"value":{...}}` envelope; parsing the envelope as
+    // the position itself "succeeds" as all-defaults and reports 0->0
+    // on every page, which is how a real scroll read as a no-op.
+    // `value` must default to null: this std.json leaves a MISSING
+    // non-defaulted struct field undefined instead of erroring, so an
+    // error payload would otherwise "parse" into garbage coordinates.
+    const Env = struct { value: ?ScrollPos = null };
+    const env = std.json.parseFromSliceLeaky(Env, arena, json, .{ .ignore_unknown_fields = true }) catch return null;
+    return env.value;
+}
+
+/// Resolve act-by-name against a find_text reply's match lines
+/// ("[id] role \"name\" ..."). This parses OUR OWN renderer's output
+/// rather than extending the wire with a structured find - deliberate,
+/// unit-tested coupling: a format change surfaces as "no element
+/// matching" with the seen lines echoed, never as acting on the wrong
+/// node. Exact name matches (case-insensitive) outrank substring ones;
+/// `nth` indexes the survivors.
+fn pickNamedMatch(payload: []const u8, role: ?[]const u8, wanted: []const u8, nth: usize) ?i64 {
+    const Cand = struct { id: i64, exact: bool };
+    var cands: [128]Cand = undefined;
+    var n_cands: usize = 0;
+    var any_exact = false;
+    var lines = std.mem.splitScalar(u8, payload, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trimStart(u8, raw, " ");
+        if (line.len < 3 or line[0] != '[') continue;
+        const close = std.mem.indexOfScalar(u8, line, ']') orelse continue;
+        const id = std.fmt.parseInt(i64, line[1..close], 10) catch continue;
+        var rest = std.mem.trimStart(u8, line[close + 1 ..], " ");
+        const role_end = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+        const line_role = rest[0..role_end];
+        if (role) |r| {
+            if (!std.ascii.eqlIgnoreCase(line_role, r)) continue;
+        }
+        rest = rest[role_end..];
+        var cand_name: []const u8 = "";
+        if (std.mem.indexOfScalar(u8, rest, '"')) |q0| {
+            if (std.mem.lastIndexOfScalar(u8, rest, '"')) |q1| {
+                if (q1 > q0) cand_name = rest[q0 + 1 .. q1];
+            }
+        }
+        if (cand_name.len == 0) continue;
+        if (std.ascii.indexOfIgnoreCase(cand_name, wanted) == null) continue;
+        const exact = std.ascii.eqlIgnoreCase(cand_name, wanted);
+        if (exact) any_exact = true;
+        if (n_cands == cands.len) break;
+        cands[n_cands] = .{ .id = id, .exact = exact };
+        n_cands += 1;
+    }
+    var seen: usize = 0;
+    for (cands[0..n_cands]) |c| {
+        if (any_exact and !c.exact) continue;
+        if (seen == nth) return c.id;
+        seen += 1;
+    }
+    return null;
+}
+
+test "pickNamedMatch prefers exact names and honors role and nth" {
+    const payload =
+        "query find \"Delete\" 4 matches\n" ++
+        "[12] button \"Delete\"\n" ++
+        "[15] link \"Delete account\" {2 children}\n" ++
+        "[19] button \"Delete\" (disabled)\n" ++
+        "[22] text \"Deleted yesterday\"\n";
+    try std.testing.expectEqual(@as(?i64, 12), pickNamedMatch(payload, null, "Delete", 0));
+    try std.testing.expectEqual(@as(?i64, 19), pickNamedMatch(payload, null, "Delete", 1));
+    try std.testing.expectEqual(@as(?i64, 15), pickNamedMatch(payload, "link", "delete", 0));
+    try std.testing.expectEqual(@as(?i64, null), pickNamedMatch(payload, "textbox", "Delete", 0));
+    try std.testing.expectEqual(@as(?i64, null), pickNamedMatch(payload, null, "Delete", 5));
+    try std.testing.expectEqual(@as(?i64, null), pickNamedMatch("no matches\n", null, "Delete", 0));
 }
 
 fn scrollResult(
@@ -1597,6 +1693,25 @@ pub fn webTool(
         const remaining = @max(deadline - drv.now(), 2000);
         var snap: ?Snap = null;
         var snap_err: ?[]const u8 = null;
+        // `snapshot:"none"` skips the tree for opens that only need a
+        // view (a screenshot, a viewport): the full tree of a page the
+        // caller will not read is the single most expensive part of
+        // this reply.
+        const snap_want = mcp.argStr(args, "snapshot") orelse "full";
+        if (!(eql(u8, snap_want, "full") or eql(u8, snap_want, "none")))
+            return mcp.errRes(arena, .invalid_args, "web_open 'snapshot' must be \"full\" (default) or \"none\"");
+        if (eql(u8, snap_want, "none")) return openResult(
+            arena,
+            drv.mode(),
+            v,
+            settled,
+            drv == .headless and !eql(u8, where, "tab"),
+            null,
+            "skipped by request (snapshot:\"none\"); call web_snapshot when you need the tree",
+            if (policy) |*p| p else if (drv == .headless and std.mem.eql(u8, policy_source, "profile_default")) drv.headless.profilePolicy(profile.?) else null,
+            policy_source,
+            open_views,
+        );
         switch (try runOp(drv, arena, new_handle, .{
             .op = "snapshot",
             .mode = "full",
@@ -1677,7 +1792,33 @@ pub fn webTool(
             if (was_loading or url == null) break;
             if (!std.mem.eql(u8, found.url, view.url)) break;
         }
-        return navigateResult(arena, drv.mode(), settled);
+        // `snapshot:"delta"|"full"` folds the follow-up tree the caller
+        // was about to ask for into THIS reply; the default stays
+        // "none" (the historical shape).
+        const snap_want = mcp.argStr(args, "snapshot") orelse "none";
+        if (!(eql(u8, snap_want, "none") or eql(u8, snap_want, "delta") or eql(u8, snap_want, "full")))
+            return mcp.errRes(arena, .invalid_args, "web_navigate 'snapshot' must be none|delta|full");
+        var nav_snap: ?Snap = null;
+        var nav_snap_kind: []const u8 = "";
+        var nav_snap_err: ?[]const u8 = null;
+        if (!eql(u8, snap_want, "none")) {
+            switch (try runOp(drv, arena, view.pane, .{
+                .op = "snapshot",
+                .mode = if (eql(u8, snap_want, "full")) "full" else "auto",
+                .detail = 1,
+            }, 5000)) {
+                .err => |e| nav_snap_err = e.text,
+                .done => |r| {
+                    if (r.timed_out) {
+                        nav_snap_err = "the page did not answer the requested snapshot in time (call web_snapshot)";
+                    } else {
+                        nav_snap = .{ .document = r.doc_gen, .revision = r.rev, .tree = r.payload };
+                        nav_snap_kind = r.snapshot_kind;
+                    }
+                },
+            }
+        }
+        return navigateResult(arena, drv.mode(), settled, nav_snap, nav_snap_kind, nav_snap_err);
     }
 
     if (eql(u8, name, "web_snapshot")) {
@@ -1723,14 +1864,43 @@ pub fn webTool(
 
     if (eql(u8, name, "web_act")) {
         if (try policyGate(arena, view)) |f| return failRes(arena, f);
-        const id = mcp.argInt(args, "id") orelse
-            return mcp.errRes(arena, .invalid_args, "web_act needs 'id' (a node id from web_snapshot or web_read)");
+        var id = mcp.argInt(args, "id");
+        // Act by accessible name: the find_text -> act two-step folded
+        // into one call, which also sidesteps acting on a stale id.
+        if (id == null) {
+            const want_name = mcp.argStr(args, "name") orelse
+                return mcp.errRes(arena, .invalid_args, "web_act needs 'id' (a node id from web_snapshot or web_read) or 'name' (the accessible name to act on, with optional 'role' and 'nth')");
+            switch (try runOp(drv, arena, view.pane, .{
+                .op = "query",
+                .action = "find_text",
+                .data = want_name,
+            }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
+                .err => |e| return failRes(arena, e),
+                .done => |r| {
+                    if (r.timed_out) return mcp.errRes(arena, .timeout, "the page did not answer the name lookup in time");
+                    const nth: usize = @intCast(@max(mcp.argInt(args, "nth") orelse 0, 0));
+                    id = pickNamedMatch(r.payload, mcp.argStr(args, "role"), want_name, nth) orelse
+                        return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(
+                            arena,
+                            "no{s}{s} element matching \"{s}\" (nth {d}) is on the page; the lookup saw:\n{s}",
+                            .{
+                                if (mcp.argStr(args, "role") != null) " " else "",
+                                mcp.argStr(args, "role") orelse "",
+                                want_name,
+                                nth,
+                                r.payload[0..@min(r.payload.len, 1500)],
+                            },
+                        ));
+                },
+            }
+        }
+        const id_v: i64 = id.?;
         const action = mcp.argStr(args, "action") orelse "click";
         const value = mcp.argStr(args, "value");
         switch (try runOp(drv, arena, view.pane, .{
             .op = "act",
             .action = action,
-            .node = @intCast(@max(id, 0)),
+            .node = @intCast(@max(id_v, 0)),
             .data = value,
         }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
             .err => |e| return failRes(arena, e),
@@ -1746,9 +1916,46 @@ pub fn webTool(
                     "the page refused the action");
 
                 // What CHANGED is the useful half of an act: give the
-                // caller the delta rather than making it ask.
+                // caller the delta rather than making it ask. The delta
+                // must not RACE a navigation the act started - the old
+                // document's delta after a paginating click reads as
+                // "the click did nothing" and has been filed as a
+                // product bug. Watch the view briefly: a started LOAD
+                // is settled before the delta is read, and a
+                // same-document route change (history API) gets a
+                // longer grace for the new route's content to render,
+                // plus an explicit warning it may still be arriving.
                 var after = ActAfter{};
-                drv.sleep(250);
+                const pre_url = view.url;
+                const pre_seq = view.load_seq;
+                var nav_hard = false;
+                var nav_soft = false;
+                var waited: u32 = 0;
+                while (waited < 300) : (waited += 100) {
+                    drv.sleep(100);
+                    const vs1 = (try listViews(drv, arena)) orelse break;
+                    const cur = viewFor(vs1, view.pane) orelse break;
+                    if (cur.loading or cur.load_seq != pre_seq) {
+                        nav_hard = true;
+                        break;
+                    }
+                    if (!std.mem.eql(u8, cur.url, pre_url)) {
+                        nav_soft = true;
+                        break;
+                    }
+                }
+                if (nav_hard) {
+                    const deadline = drv.now() + @min(timeoutOf(args, DEFAULT_TIMEOUT_MS), 10_000);
+                    while (drv.now() < deadline) {
+                        drv.sleep(100);
+                        const vs1 = (try listViews(drv, arena)) orelse break;
+                        const cur = viewFor(vs1, view.pane) orelse break;
+                        if (!cur.loading and cur.load_seq != pre_seq) break;
+                    }
+                } else if (nav_soft) {
+                    drv.sleep(900);
+                    after.note = "the url changed without a page load (client-side route); the delta below is what had rendered ~1s after the act - if it looks incomplete, the route's data was still arriving: call web_snapshot again";
+                }
                 switch (try runOp(drv, arena, view.pane, .{
                     .op = "snapshot",
                     .mode = "auto",
@@ -1770,7 +1977,7 @@ pub fn webTool(
                         after.loading_after = a.loading;
                     }
                 }
-                return actResult(arena, drv.mode(), view, id, action, r.payload, after);
+                return actResult(arena, drv.mode(), view, id_v, action, r.payload, after);
             },
         }
     }
@@ -2349,7 +2556,10 @@ fn scrollTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
             .timeout_ms = 4000,
         }, 6000)) {
             .err => |e| return failRes(arena, e),
-            .done => {},
+            // A refused scroll must SAY so: swallowing this is how a
+            // CSP-blocked scrollTo read as "nothing happened, no error".
+            .done => |r| if (!r.ok and !r.timed_out)
+                return mcp.errRes(arena, .failed, r.payload),
         }
         how = t;
     } else {
@@ -2602,7 +2812,7 @@ test "every web result opens with the view header and names its backend" {
     const arena = arena_state.allocator();
     const t = std.testing;
 
-    const headless = try navigateResult(arena, .headless, EXAMPLE);
+    const headless = try navigateResult(arena, .headless, EXAMPLE, null, "", null);
     const hp = try mcp.expectToolResultShape(arena, "web_navigate", headless);
     const hsc = hp.object.get("structuredContent").?.object;
     try t.expectEqualStrings("headless", hsc.get("backend").?.string);
@@ -2617,14 +2827,14 @@ test "every web result opens with the view header and names its backend" {
     );
 
     // GUI mode names the handle for what it IS there.
-    const gui = try navigateResult(arena, .gui, EXAMPLE);
+    const gui = try navigateResult(arena, .gui, EXAMPLE, null, "", null);
     const gsc = (try mcp.expectToolResultShape(arena, "web_navigate", gui)).object.get("structuredContent").?.object;
     try t.expectEqualStrings("gui", gsc.get("backend").?.string);
     try t.expectEqual(@as(i64, 12), gsc.get("pane").?.integer);
     try t.expect(gsc.get("view") == null);
 
     // A blank view says so instead of rendering an empty header.
-    const blank = try navigateResult(arena, .headless, .{ .pane = 3 });
+    const blank = try navigateResult(arena, .headless, .{ .pane = 3 }, null, "", null);
     const btext = (try mcp.expectToolResultShape(arena, "web_navigate", blank))
         .object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.startsWith(u8, btext, "view 3: (blank document)"));
@@ -2871,8 +3081,14 @@ test "web_scroll: before/after are structured positions and 'moved' is derived" 
     const arena = arena_state.allocator();
     const t = std.testing;
 
-    const before = parsePos(arena, "{\"x\":0,\"y\":0,\"max_y\":4200,\"viewport\":800}").?;
-    const after = parsePos(arena, "{\"x\":0,\"y\":720,\"max_y\":4200,\"viewport\":800}").?;
+    // The probe reply is an EVAL result: positions arrive inside the
+    // {"value":{...}} envelope.
+    const before = parsePos(arena, "{\"value\":{\"x\":0,\"y\":0,\"max_y\":4200,\"viewport\":800}}").?;
+    const after = parsePos(arena, "{\"value\":{\"x\":0,\"y\":720,\"max_y\":4200,\"viewport\":800}}").?;
+    // A bare position (no envelope) and an error payload are both "no
+    // position", never garbage coordinates.
+    try t.expect(parsePos(arena, "{\"x\":0,\"y\":720,\"max_y\":4200,\"viewport\":800}") == null);
+    try t.expect(parsePos(arena, "{\"error\":\"eval refused\"}") == null);
     const out = try scrollResult(arena, .headless, EXAMPLE, "page_down", before, after);
     const parsed = try mcp.expectToolResultShape(arena, "web_scroll", out);
     const sc = parsed.object.get("structuredContent").?.object;
