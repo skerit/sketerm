@@ -25,6 +25,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("cbindings");
 const build_options = @import("build_options");
+const cefargs = @import("cefargs.zig");
 const cefhost = @import("cefhost.zig");
 const ozone = @import("ozone.zig");
 const server = @import("server.zig");
@@ -137,8 +138,32 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // initialized by whichever runs first, and switches missing there
     // are silently ignored (a browser process that keeps its GPU
     // process paints EMPTY frames in windowless mode).
+    var disable_cap = cefargs.disable_features_prefix.len + cefargs.read_anything_feature.len + 2;
+    for (argv) |a| {
+        const value = cefargs.disableFeaturesValue(std.mem.span(a)) orelse continue;
+        const extra = std.math.add(usize, value.len, 1) catch {
+            std.debug.print("sketerm-web: --disable-features is too large\n", .{});
+            return 1;
+        };
+        disable_cap = std.math.add(usize, disable_cap, extra) catch {
+            std.debug.print("sketerm-web: --disable-features is too large\n", .{});
+            return 1;
+        };
+    }
+    const disable_storage = std.heap.c_allocator.alloc(u8, disable_cap) catch {
+        std.debug.print("sketerm-web: cannot allocate CEF arguments\n", .{});
+        return 1;
+    };
+    defer std.heap.c_allocator.free(disable_storage);
+    var disable_builder = cefargs.Builder.init(disable_storage) catch return 1;
+    for (argv) |a| {
+        const value = cefargs.disableFeaturesValue(std.mem.span(a)) orelse continue;
+        disable_builder.add(value) catch return 1;
+    }
+    const disable_features = disable_builder.finish() catch return 1;
+
     var argv_buf: [64][*c]u8 = undefined;
-    const cef_argv = buildCefArgv(argv, &argv_buf);
+    const cef_argv = buildCefArgv(argv, disable_features, &argv_buf);
 
     // (5) CEF subprocess passthrough (renderer, gpu, zygote, ...).
     if (cefhost.executeProcess(@intCast(cef_argv.len), cef_argv.ptr)) |code| return code;
@@ -213,10 +238,10 @@ fn reexecPreloaded(argv: []const [*:0]const u8) void {
     _ = c.execv(path.ptr, @ptrCast(&vec));
 }
 
-/// The argv handed to CEF: ours plus the ozone platform switch when the
-/// caller did not already supply one. Written into `buf` (no allocator:
-/// this runs before one exists) and truncated rather than overflowed,
-/// since Chromium ignores what it never sees anyway.
+/// The argv handed to CEF: ours plus compatibility and platform switches.
+/// Existing disable-features values are replaced by `disable_features`,
+/// which coalesces them so Chromium's last-switch-wins parser loses none.
+/// The pointer list is truncated rather than overflowed.
 ///
 /// THE OZONE PLATFORM IS THE WHOLE GPU DECISION, and it is a runtime one
 /// because the helper must keep working with no display at all (headless
@@ -248,13 +273,18 @@ fn reexecPreloaded(argv: []const [*:0]const u8) void {
 ///
 /// `--disable-gpu` and an explicit `--ozone-platform=` are passed
 /// through untouched: that is how the smoke rig pins a mode.
-fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
+fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, buf: *[64][*c]u8) [][*c]u8 {
     var n: usize = 0;
     for (argv) |a| {
-        if (n == buf.len) break;
-        buf[n] = @constCast(@ptrCast(a));
+        if (cefargs.disableFeaturesValue(std.mem.span(a)) != null) continue;
+        // The compatibility switch is mandatory, so reserve its slot
+        // when an unusually large command line reaches this fixed list.
+        if (n + 1 >= buf.len) break;
+        buf[n] = @ptrCast(@constCast(a));
         n += 1;
     }
+    buf[n] = @ptrCast(disable_features.ptr);
+    n += 1;
     // macOS has no ozone at all — Chromium uses its own windowing
     // layer, and `--ozone-platform=` is simply not a switch there. The
     // GPU decision the rest of this function makes is likewise moot:
@@ -285,7 +315,7 @@ fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
             if (std.mem.eql(u8, std.mem.span(@as([*:0]const u8, @ptrCast(a))), "--use-mock-keychain")) have = true;
         }
         if (!have and n < buf.len) {
-            buf[n] = @constCast(@ptrCast("--use-mock-keychain"));
+            buf[n] = @ptrCast(@constCast("--use-mock-keychain"));
             n += 1;
         }
         return buf[0..n];
@@ -301,7 +331,7 @@ fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
     var explicit: ?[]const u8 = null;
     for (argv) |a| {
         const s = std.mem.span(a);
-        if (std.mem.startsWith(u8, s, "--ozone-platform=")) explicit = s["--ozone-platform=".len ..];
+        if (std.mem.startsWith(u8, s, "--ozone-platform=")) explicit = s["--ozone-platform=".len..];
     }
     const override: ?[]const u8 = if (c.getenv("SKETERM_WEB_OZONE")) |o| std.mem.span(o) else null;
     const choice = blk: {
@@ -318,12 +348,12 @@ fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
         else
             "--ozone-platform=headless";
         if (n < buf.len) {
-            buf[n] = @constCast(@ptrCast(want));
+            buf[n] = @ptrCast(@constCast(want));
             n += 1;
         }
     }
     if (choice.disable_gpu and n < buf.len) {
-        buf[n] = @constCast(@ptrCast("--disable-gpu"));
+        buf[n] = @ptrCast(@constCast("--disable-gpu"));
         n += 1;
     }
     // Subpixel (LCD) text AA. MEASURED on the software (headless-ozone)
@@ -336,7 +366,7 @@ fn buildCefArgv(argv: []const [*:0]const u8, buf: *[64][*c]u8) [][*c]u8 {
     // subpixel AA; harmless where it does nothing, and the background
     // is opaque either way.
     if (n < buf.len) {
-        buf[n] = @constCast(@ptrCast("--enable-lcd-text"));
+        buf[n] = @ptrCast(@constCast("--enable-lcd-text"));
         n += 1;
     }
     // Only a real ozone platform ever produces a GPU process here, and
