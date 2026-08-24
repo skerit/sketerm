@@ -160,6 +160,23 @@ const click_page =
     "onclick=\"document.title='result:trusted='+event.isTrusted+" ++
     "'%20x='+event.clientX+'%20y='+event.clientY+'%20detail='+event.detail\">" ++
     "</button></body></html>";
+
+/// A same-document route transition shaped like a client-side app: a
+/// trusted link click changes history and replaces enough visible DOM for
+/// Chromium's soft-navigation heuristic to report it.
+const spa_page =
+    "<!doctype html><html><head><title>spa:start</title></head><body>" ++
+    "<nav><a id=learn href=/learn>Learn SPA Route</a></nav>" ++
+    "<main id=app><h1>SPA Start</h1><p>Initial route content.</p></main>" ++
+    "<script>learn.addEventListener('click',function(e){e.preventDefault();" ++
+    "history.pushState({},'',this.href);" ++
+    "var next=document.createElement('main');next.id='app';" ++
+    "var h=document.createElement('h1');h.textContent='SPA Destination';next.appendChild(h);" ++
+    "for(var i=0;i<120;i++){var p=document.createElement('p');" ++
+    "p.textContent='Destination route content row '+i;next.appendChild(p)}" ++
+    "document.getElementById('app').replaceWith(next);" ++
+    "document.title='spa:trusted='+e.isTrusted+':'+location.pathname;" ++
+    "});</script></body></html>";
 const input_page =
     "data:text/html,<body><input%20id=i%20autofocus%20" ++
     "oninput=%22document.title='typed:'+this.value%22></body>";
@@ -519,7 +536,6 @@ const ProxyProbe = struct {
         return false;
     }
 
-
     fn handle(self: *ProxyProbe, afd: c_int) void {
         // Record only the FIRST CONNECT: a browser may open several
         // connections (retries after the tunnel closes, sub-resources),
@@ -758,7 +774,6 @@ const HttpProbe = struct {
         self.handle(afd);
         return false;
     }
-
 
     fn handleAndClose(self: *HttpProbe, afd: c_int) void {
         defer _ = self.workers.fetchSub(1, .release);
@@ -2497,8 +2512,8 @@ fn spawnHelper(
     if (pid != 0) return pid;
     if (no_gpu) _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
     for ([_][*:0]const u8{
-        "http_proxy",  "https_proxy",  "all_proxy",  "ftp_proxy",  "no_proxy",
-        "HTTP_PROXY",  "HTTPS_PROXY",  "ALL_PROXY",  "FTP_PROXY",  "NO_PROXY",
+        "http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "no_proxy",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "NO_PROXY",
     }) |name| _ = c.unsetenv(name);
     var vec: [10:null]?[*:0]const u8 = @splat(null);
     var n: usize = 0;
@@ -3126,7 +3141,6 @@ const WreqServer = struct {
         self.handle(afd);
         return false;
     }
-
 
     fn handle(self: *WreqServer, afd: c_int) void {
         var req: [8192]u8 = undefined;
@@ -3802,8 +3816,7 @@ fn waitExtPopupState(cl: *Client, popup_view: u32, state: u8, timeout_ms: i64) b
 
 fn waitCapRuns(cl: *Client, runs: u32, timeout_ms: i64) bool {
     var code_buf: [192]u8 = undefined;
-    const code = std.fmt.bufPrint(&code_buf,
-        "!!window.__sketermCapProbe&&window.__sketermCapProbe.runs>={d}", .{runs}) catch return false;
+    const code = std.fmt.bufPrint(&code_buf, "!!window.__sketermCapProbe&&window.__sketermCapProbe.runs>={d}", .{runs}) catch return false;
     const deadline = nowMs() + timeout_ms;
     while (nowMs() < deadline) {
         const result = cl.evalWaitView(view_id, code, false, 5000);
@@ -3815,9 +3828,7 @@ fn waitCapRuns(cl: *Client, runs: u32, timeout_ms: i64) bool {
 
 fn staleApiRejects(cl: *Client, api_index: u32, timeout_ms: i64) bool {
     var code_buf: [512]u8 = undefined;
-    const code = std.fmt.bufPrint(&code_buf,
-        "(async()=>{{try{{await window.__sketermCapProbe.apis[{d}].storage.local.get(null);return 'STALE_RESOLVED'}}catch(e){{return 'STALE_REJECTED:'+String(e)}}}})()",
-        .{api_index}) catch return false;
+    const code = std.fmt.bufPrint(&code_buf, "(async()=>{{try{{await window.__sketermCapProbe.apis[{d}].storage.local.get(null);return 'STALE_RESOLVED'}}catch(e){{return 'STALE_REJECTED:'+String(e)}}}})()", .{api_index}) catch return false;
     const result = cl.evalWaitView(view_id, code, true, timeout_ms);
     return std.mem.indexOf(u8, result, "STALE_REJECTED:Error: extension context") != null;
 }
@@ -3970,8 +3981,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     cl.send(proto.WebextSet{ .id = "action@sketerm.test", .dir = popup_dir, .enabled = 1 });
     if (!waitCapRuns(&cl, 3, 15_000)) fail("stage 40: re-enabling an extension did not mint a new capability");
 
-    const reload_start = cl.evalWaitView(view_id,
-        "window.__sketermCapProbe.apis[2].runtime.reload().catch(function(){});'reload-started'", false, 10_000);
+    const reload_start = cl.evalWaitView(view_id, "window.__sketermCapProbe.apis[2].runtime.reload().catch(function(){});'reload-started'", false, 10_000);
     if (std.mem.indexOf(u8, reload_start, "reload-started") == null or !waitCapRuns(&cl, 4, 15_000) or
         !staleApiRejects(&cl, 2, 10_000))
         fail("stage 40: runtime.reload did not rotate and revoke the old extension capability");
@@ -4123,7 +4133,8 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     pass("stage 40c missing popup asset fails visibly without creating a view");
 
     var fetch_buf: [512]u8 = undefined;
-    const fetch_probe = std.fmt.bufPrint(&fetch_buf,
+    const fetch_probe = std.fmt.bufPrint(
+        &fetch_buf,
         "(async()=>{{try{{let r=await fetch('sketerm-extension://{s}/__sketerm-extapi.js');return [r.status,await r.text()]}}catch(e){{return [0,String(e)]}}}})()",
         .{origin_host},
     ) catch fail("stage 40 fetch probe");
@@ -4172,8 +4183,7 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     // load-bearing: a fetch can be hidden by CORS even if the scheme
     // handler served the nonce-bearing body.
     var same_http_buf: [2048]u8 = undefined;
-    const same_http = std.fmt.bufPrint(&same_http_buf,
-        "http://{s}:{d}/p", .{ origin_host, hostile_srv.lis.port }) catch fail("stage 40 same-host HTTP URL");
+    const same_http = std.fmt.bufPrint(&same_http_buf, "http://{s}:{d}/p", .{ origin_host, hostile_srv.lis.port }) catch fail("stage 40 same-host HTTP URL");
     const scheme_view: u32 = 44;
     load_before = cl.load_seq;
     cl.send(proto.ViewCreateUrl{ .view = scheme_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0, .url = same_http });
@@ -4354,7 +4364,6 @@ const UboServer = struct {
         self.handle(afd);
         return false;
     }
-
 
     fn handle(self: *UboServer, afd: c_int) void {
         var req: [8192]u8 = undefined;
@@ -6172,6 +6181,42 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         fail("stage 3 click: no trusted click reported by the page");
     }
     pass("stage 3 trusted click");
+
+    // ── Stage 3b: a trusted SPA route change keeps the helper alive ─
+    // CEF 151.3.18 crashes in ReadAnythingSoftNavigationObserver after
+    // this transition unless ImmersiveReadAnything is disabled: Alloy
+    // windowless WebContents has no Chrome TabInterface, but that
+    // observer used the crash-only GetFromContents accessor.
+    {
+        var http = HttpProbe{ .body = spa_page };
+        if (!http.start()) fail("stage 3b SPA: HTTP fixture did not start");
+        var url_buf: [128]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/", .{http.lis.port}) catch fail("stage 3b SPA url");
+        cl.navigate(url);
+        cl.resetSem();
+        cl.snapshot(@intFromEnum(proto.SnapMode.full), 1);
+        const learn_id = cl.idOfLine("link \"Learn SPA Route\"") orelse {
+            std.debug.print("smoke-web: stage 3b snapshot was:\n{s}\n", .{cl.semLog()});
+            fail("stage 3b SPA: route link was absent from the semantic tree");
+        };
+        const acted = cl.act_seq;
+        cl.send(proto.SemAction{
+            .view = view_id,
+            .id = learn_id,
+            .action = @intFromEnum(proto.SemAct.click),
+            .arg = "",
+        });
+        if (!cl.waitSeq(&cl.act_seq, acted, 20_000) or cl.act_ok != 1)
+            fail("stage 3b SPA: trusted semantic click failed");
+        if (!cl.waitTitle("spa:trusted=true:/learn", 15_000))
+            fail("stage 3b SPA: the trusted route transition did not finish");
+        _ = cl.drive(2_000, 120);
+        const path = cl.evalWait("location.pathname", false, 15_000);
+        if (std.mem.indexOf(u8, path, "/learn") == null)
+            fail("stage 3b SPA: helper survived but lost the soft-navigation route");
+        http.shutdown();
+    }
+    pass("stage 3b trusted SPA soft navigation");
 
     // ── Stage 4: keyboard text entry ──────────────────────────────
     cl.navigate(input_page);
