@@ -1,5 +1,76 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-27: web deltas stop re-sending a page the model already saw
+
+A 250-call QA session against a zenit-cms admin panel spent more than
+half its tokens on `web_act`/`web_snapshot` deltas that repeated the
+sidebar, banner and table it had already been sent. Two mechanisms lost
+node identity in `src/web/semantic.zig`: stable ids were looked up in
+the LIVE tree only, so an element a modal made inert (`aria-hidden`)
+left the walk, lost its id, and came back renumbered -- Escape on a
+confirmation re-sent the whole page as `-` plus `+` (the same 70-node
+sidebar was numbered `[30..99]`, `[2555..2624]`, `[2767..2836]`, ...
+across the session); and the previous document was a carry candidate
+for the FIRST walk of a new document only, so an app that renders its
+shell a moment after the context is created had nothing to carry from.
+
+Both are fixed at the differ. `View.eid_sids` binds engine ids to
+stable ids for the document's lifetime (the page side already keyed
+them on the element in a WeakMap), with a first-in-document-order rule
+when two walk nodes end up claiming one id. `View.prev` keeps the
+previous document's tree as a carry pool for every walk of the new one.
+The consumed base keeps entries for nodes that left (`present = false`,
+purged a document later or past 20k), so a node that returns unchanged
+is one `restored unchanged: [id] role (N nodes)` line and one that
+returns changed is `~ ... (restored)`; removals fold to subtree roots
+with a descendant count; a superseded document is `previous document
+dropped (N nodes)`; and the full-restatement fallback compares delta
+LINES against the tree instead of counting every removed node, so a
+page that hid behind a dialog stays a delta. A scoped snapshot now
+ADVANCES the base for that subtree (`consumeScoped`), which is what
+lets `web_act`/`web_key` take `scope` (the follow-up delta is that
+subtree, never more) and `web_act` take `within` (a name lookup bounded
+to one container, so `nth: 8` on "More actions" cannot land on a
+look-alike elsewhere on the page).
+
+Two more found on the live panel: `web_wait idle` polled with `auto`
+snapshots and so CONSUMED the base behind the client's back (the next
+real snapshot then said `unchanged` on a page that had just changed);
+it now polls with the new non-consuming `SnapMode.peek`. And a name
+lookup before any walk of a document answered "no snapshot yet", so
+act-by-name right after `web_open snapshot:"none"` cost a snapshot
+turn; the helper now solicits one walk for such a query.
+
+MCP-side: `detail` is per call, never sticky (a one-off terse peek used
+to change every later snapshot silently); tree payloads over 32k chars
+are cut at a line and flagged `snapshot_truncated`/`delta_truncated`
+with the total line count instead of the whole reply failing; and
+`web_console` carries its lines as a `lines` FACT -- the harness that
+found all this renders only the structured lane, so `count: 60` with
+no lines was every console call of that session. `web_read` renders
+tables (pipe tables, first row as header, 100-row cap), `<dl>`s and
+form controls (`- label: value`, `- [x] Enabled`), descends open shadow
+roots, and a `<label>` wrapping a `<select>` no longer names the field
+after its options -- an admin list page used to read as its heading
+alone. ARIA tables (`role=table/grid` built from divs, which is how
+plumage renders every zenit-cms list: there is no `<table>` on the
+Hosts page at all) render the same way, rows and cells found by role
+through open shadow roots.
+
+Also found by the smoke suite along the way: `set_value`'s commit read
+raced the trusted keystrokes it followed (the keys are queued input,
+the commit is a renderer IPC), so once in a while it reported a
+connected control reading "" with no note. The commit now carries the
+typed text and waits, bounded, for it to land.
+
+Proof: six new `semantic.zig` unit tests (modal restore, restored
+change, folded removal, superseded document plus late shell carry,
+scoped consume, duplicate-id resolution), `mcp_web.zig` tests for the
+bound and `within`, smoke-web stage 11b (a real page, a real modal, the
+nav link keeps its id and the close reply says `restored unchanged:`)
+and stage 12's table/form assertions; then the original reproducer and
+the live panel through a freshly built `sketerm mcp`.
+
 ## 2026-08-27: remote video plays the original when the link carries it
 
 Opening a video on a NAS from the file manager (Space -> Viewer) pegged
