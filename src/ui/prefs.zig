@@ -1605,6 +1605,40 @@ fn filesPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     addSwitchRow(@ptrCast(@alignCast(danger_group)), ctx, "Confirm permanent delete", "Ask before Shift+Delete / Delete Permanently. Moving to trash never asks (it is undoable).", &ctx.cfg.files_confirm_delete, applyOnly);
     addSwitchRow(@ptrCast(@alignCast(danger_group)), ctx, "Verify copies", "Hash-compare every copied file against its source before it is installed. Slower (each file is read twice), but a bad disk or interrupted write can never install silently.", &ctx.cfg.files_verify_copy, applyOnly);
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(danger_group)));
+
+    const viewer_group = c.adw_preferences_group_new();
+    c.adw_preferences_group_set_title(@ptrCast(@alignCast(viewer_group)), "Viewer");
+    addRemoteVideoRow(@ptrCast(@alignCast(viewer_group)), ctx);
+    c.adw_preferences_page_add(page, @ptrCast(@alignCast(viewer_group)));
+}
+
+fn addRemoteVideoRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
+    const items = c.gtk_string_list_new(&[_:null]?[*:0]const u8{ "Automatic (measure the link)", "Play the original over the link", "Transcode on the host" });
+    const row = c.adw_combo_row_new();
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Remote video");
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Automatic plays the original when the link carries its bitrate with headroom (no host CPU) and asks the host for a 1280-wide H.264 preview only when it does not. T in the Viewer switches the current item.");
+    c.adw_combo_row_set_model(@ptrCast(@alignCast(row)), @ptrCast(@alignCast(items)));
+    c.g_object_unref(items);
+    const initial: c_uint = switch (ctx.cfg.files_remote_video) {
+        .auto => 0,
+        .direct => 1,
+        .transcode => 2,
+    };
+    c.adw_combo_row_set_selected(@ptrCast(@alignCast(row)), initial);
+    const cctx = ctx.allocator.create(ComboCtx) catch return;
+    cctx.* = .{ .allocator = ctx.allocator, .parent = ctx, .on_change = remoteVideoSelected };
+    _ = c.g_signal_connect_data(row, "notify::selected", @ptrCast(&comboChanged), @ptrCast(cctx), @ptrCast(cast.destroyCtx(ComboCtx)), c.G_CONNECT_DEFAULT);
+    c.adw_preferences_group_add(group, @ptrCast(@alignCast(row)));
+}
+
+fn remoteVideoSelected(ctx: *Ctx, idx: c_uint) void {
+    ctx.cfg.files_remote_video = switch (idx) {
+        0 => .auto,
+        1 => .direct,
+        2 => .transcode,
+        else => .auto,
+    };
+    ctx.ev();
 }
 
 fn addFilesViewRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {

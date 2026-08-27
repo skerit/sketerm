@@ -604,9 +604,21 @@ pub const ViewerWindow = struct {
     /// Where the current (transcoded) segment starts in the source; the
     /// bar shows offset + stream timestamp.
     video_offset_ms: u64 = 0,
-    /// The current item was opened in transcode mode (a time seek is a
-    /// restart, unless the stream reports it fell back to raw).
-    video_transcode: bool = false,
+    /// Config default for remote video (`files_remote_video`), read
+    /// once per window like the keybindings.
+    remote_video: remotestream.Policy = .auto,
+    /// A route the user picked in this window (menu / T) overriding
+    /// the config default; sticks across items until the window closes.
+    video_forced: ?remotestream.Policy = null,
+    /// The policy the current stream was opened with.
+    video_policy: remotestream.Policy = .direct,
+    /// The current item already fell back from direct to transcode
+    /// once (a second failure shows the poster instead of looping).
+    video_retried: bool = false,
+    /// A native seek to run once a re-opened DIRECT stream is prepared
+    /// (a route switch keeps the position; a transcode restarts at the
+    /// offset itself).
+    video_pending_seek_ms: u64 = 0,
     /// 200ms position push into the transport bar (0 = none).
     video_tick: c.guint = 0,
     options: Options,
@@ -866,6 +878,7 @@ pub const ViewerWindow = struct {
         {
             var config = Config.load(allocator);
             defer config.deinit();
+            self.remote_video = config.files_remote_video;
             var list: std.ArrayList(input.Binding) = .empty;
             input.rebuildBindings(&list, allocator, config.keybinds.items);
             self.bindings = list.toOwnedSlice(allocator) catch blk: {
@@ -993,39 +1006,53 @@ pub const ViewerWindow = struct {
         self.content = .image;
     }
 
+    /// The policy a remote item opens with: audio always streams as-is
+    /// (its bitrate is the whole point), video follows the window's
+    /// override or the config default.
+    fn remotePolicy(self: *const ViewerWindow, resource: model.Resource) remotestream.Policy {
+        if (!paths.isVideoName(resource.name())) return .direct;
+        return self.video_forced orelse self.remote_video;
+    }
+
+    /// Whether the current item is a remote video, i.e. has a route to
+    /// show and to switch.
+    fn videoIsRemote(self: *ViewerWindow) bool {
+        if (self.content != .video) return false;
+        const resource = self.current() orelse return false;
+        return resource.host != null and paths.isVideoName(resource.name());
+    }
+
     /// Play a video/audio resource in place. A LOCAL file is a plain
     /// GtkMediaFile; a remote one streams through the daemon
-    /// (`remotestream.zig`: a transcoded spool for video, range reads
-    /// for audio). Playback failure (missing GStreamer plugins,
-    /// unreadable file) falls back to the daemon poster so the item
-    /// still shows something.
+    /// (`remotestream.zig`: the original over the link, or a host
+    /// transcode, by policy). Playback failure (missing GStreamer
+    /// plugins, unreadable file) falls back to the daemon poster so the
+    /// item still shows something.
     fn showVideo(self: *ViewerWindow, resource: model.Resource) void {
         self.target.cancel();
         self.setMetadata(if (paths.isVideoName(resource.name())) "Video" else "Audio");
-        self.video_transcode = resource.host != null and paths.isVideoName(resource.name());
+        self.video_retried = false;
         var buf: [600:0]u8 = undefined;
         const text = std.fmt.bufPrintZ(&buf, "Opening {s}...", .{resource.name()}) catch "Opening...";
         c.gtk_label_set_text(self.status, text.ptr);
         self.canvas.setAccessible(resource.name(), "Playing", false);
-        self.startVideoStream(resource, 0);
+        self.startVideoStream(resource, self.remotePolicy(resource), 0);
     }
 
     /// Open (or, on a time seek, re-open) the media stream for
     /// `resource` from `start_ms`. Only a transcoded remote stream
     /// honours a nonzero start; the others start at 0 and seek natively.
-    fn startVideoStream(self: *ViewerWindow, resource: model.Resource, start_ms: u64) void {
+    fn startVideoStream(self: *ViewerWindow, resource: model.Resource, policy: remotestream.Policy, start_ms: u64) void {
         self.releaseVideoStream();
         self.video_offset_ms = start_ms;
+        self.video_policy = policy;
         const stream: *c.GtkMediaStream = blk: {
             if (resource.host == null) {
                 var z: [4096:0]u8 = undefined;
                 const path_z = std.fmt.bufPrintZ(&z, "{s}", .{resource.path}) catch break :blk null;
                 break :blk c.gtk_media_file_new_for_filename(path_z.ptr);
             }
-            // Video is transcoded on the host to a cheap preview; audio
-            // streams as-is (its bitrate is the whole point).
-            const mode: remotestream.Mode = if (self.video_transcode) .transcode else .raw;
-            const remote = remotestream.new(resource.host, resource.path, mode, start_ms) orelse break :blk null;
+            const remote = remotestream.new(resource.host, resource.path, policy, start_ms) orelse break :blk null;
             self.video_input = remote;
             break :blk c.gtk_media_file_new_for_input_stream(remote);
         } orelse {
@@ -1043,18 +1070,35 @@ pub const ViewerWindow = struct {
         self.syncVideoBar();
     }
 
+    /// The remote stream's settled route, null for a local file or
+    /// before its first touch decided it.
+    fn videoRoute(self: *ViewerWindow) ?remotestream.Route {
+        if (self.content != .video) return null;
+        const vin = self.video_input orelse return null;
+        const d = remotestream.decision(vin) orelse return null;
+        return d.route;
+    }
+
     /// Whether a seek on the current item must restart the host encode.
     fn videoSeeksByRestart(self: *ViewerWindow) bool {
-        if (!self.video_transcode) return false;
-        const vin = self.video_input orelse return false;
-        // Before the stream is touched the mode is still the requested
-        // one; after, the stream says whether the transcode engaged.
-        const stream = switch (self.content) {
-            .video => |st| st,
-            else => return false,
-        };
-        if (c.gtk_media_stream_is_prepared(stream) == 0) return true;
-        return remotestream.isTranscoded(vin);
+        return (self.videoRoute() orelse return false) == .transcode;
+    }
+
+    /// Re-open the current remote video on `policy` from where it is,
+    /// for the menu rows and T. A transcode restarts at the offset; a
+    /// direct stream seeks natively once prepared.
+    fn switchVideoRoute(self: *ViewerWindow, policy: remotestream.Policy) void {
+        if (!self.videoIsRemote()) return;
+        const resource = self.current() orelse return;
+        const position = self.videoPositionMs();
+        self.video_forced = policy;
+        self.video_retried = false;
+        self.video_pending_seek_ms = if (policy == .direct) position else 0;
+        c.gtk_label_set_text(self.status, switch (policy) {
+            .direct => "Playing the original over the link...",
+            else => "Transcoding on the host...",
+        });
+        self.startVideoStream(resource, policy, if (policy == .direct) 0 else position);
     }
 
     /// Absolute time seek in source ms.
@@ -1067,7 +1111,7 @@ pub const ViewerWindow = struct {
         if (self.videoDurationMs()) |d| target = @min(target, d);
         if (self.videoSeeksByRestart()) {
             const resource = self.current() orelse return;
-            self.startVideoStream(resource, target);
+            self.startVideoStream(resource, self.video_policy, target);
             return;
         }
         if (c.gtk_media_stream_is_seekable(stream) == 0) return;
@@ -1098,6 +1142,24 @@ pub const ViewerWindow = struct {
         const ts = c.gtk_media_stream_get_timestamp(stream);
         const local: u64 = if (ts > 0) @intCast(@divTrunc(ts, 1000)) else 0;
         return self.video_offset_ms + local;
+    }
+
+    /// "  direct, link 940 Mbit/s" / "  transcoded on host (vaapi)" for
+    /// the status line; empty for a local file or an undecided stream.
+    fn videoRouteText(self: *ViewerWindow, buf: []u8) []const u8 {
+        if (!self.videoIsRemote()) return "";
+        const vin = self.video_input orelse return "";
+        const d = remotestream.decision(vin) orelse return "";
+        return switch (d.route) {
+            .direct => if (d.link_kbps > 0)
+                std.fmt.bufPrint(buf, "  original over the link ({d}.{d} Mbit/s, file {d}.{d} Mbit/s)", .{
+                    d.link_kbps / 1000,    (d.link_kbps % 1000) / 100,
+                    d.bitrate_kbps / 1000, (d.bitrate_kbps % 1000) / 100,
+                }) catch ""
+            else
+                "  original over the link",
+            .transcode => std.fmt.bufPrint(buf, "  transcoded on the host ({s})", .{d.encoderName()}) catch "  transcoded on the host",
+        };
     }
 
     fn syncVideoBar(self: *ViewerWindow) void {
@@ -1360,6 +1422,14 @@ fn onBurgerClicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     c.gtk_widget_add_css_class(info, "dim-label");
     m.custom(info);
     appendVerbRows(m.section(), self);
+    if (self.videoIsRemote()) {
+        // The playback route of a remote video, checked per what the
+        // stream settled on; picking one re-opens it in place (T too).
+        const route = self.videoRoute();
+        const rs = m.section();
+        rs.check("Play the original over the link", route != null and route.? == .direct, @as(classicmenu.Handler, &onRouteDirect), @ptrCast(self));
+        rs.check("Transcode on the host", route != null and route.? == .transcode, @as(classicmenu.Handler, &onRouteTranscode), @ptrCast(self));
+    }
     appmenu.appendHelp(m, self.allocator, @ptrCast(@alignCast(self.window)), .viewer);
     _ = root.popup(
         anchor,
@@ -1760,6 +1830,14 @@ fn srcVideoToggle(ctx: ?*anyopaque) void {
     self.syncVideoBar();
 }
 
+fn onRouteDirect(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    cast.userData(ViewerWindow, user).switchVideoRoute(.direct);
+}
+
+fn onRouteTranscode(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+    cast.userData(ViewerWindow, user).switchVideoRoute(.transcode);
+}
+
 fn srcVideoRestart(ctx: ?*anyopaque) void {
     cast.userData(ViewerWindow, ctx).seekVideoTo(0);
 }
@@ -1798,6 +1876,18 @@ fn onVideoError(stream: *c.GtkMediaStream, _: ?*c.GParamSpec, user: ?*anyopaque)
     const err = c.gtk_media_stream_get_error(stream);
     const reason: []const u8 = if (err != null and err.*.message != null) std.mem.span(err.*.message) else "unknown error";
     var buf: [512:0]u8 = undefined;
+    // The original over the link is the local decoder's to refuse (no
+    // plugin for the codec, a container it cannot demux): the host
+    // transcode is the rung below, tried once before giving up.
+    if (self.videoIsRemote() and !self.video_retried and (self.videoRoute() orelse .direct) == .direct) {
+        const resource = self.current() orelse return;
+        const position = self.videoPositionMs();
+        self.video_retried = true;
+        const text = std.fmt.bufPrintZ(&buf, "Local playback failed ({s}); transcoding on the host", .{reason}) catch "Local playback failed; transcoding on the host";
+        c.gtk_label_set_text(self.status, text.ptr);
+        self.startVideoStream(resource, .transcode, position);
+        return;
+    }
     const text = std.fmt.bufPrintZ(&buf, "Playback failed: {s}; showing the poster", .{reason}) catch "Playback failed; showing the poster";
     self.closeVideo();
     if (self.current()) |resource| self.showPoster(resource);
@@ -1811,15 +1901,21 @@ fn onVideoPrepared(stream: *c.GtkMediaStream, _: ?*c.GParamSpec, user: ?*anyopaq
         else => return,
     }
     if (c.gtk_media_stream_is_prepared(stream) == 0) return;
+    if (self.video_pending_seek_ms > 0 and c.gtk_media_stream_is_seekable(stream) != 0) {
+        c.gtk_media_stream_seek(stream, @intCast(self.video_pending_seek_ms * 1000));
+    }
+    self.video_pending_seek_ms = 0;
     self.syncVideoBar();
     const resource = self.current() orelse return;
     const duration_ms: u64 = self.videoDurationMs() orelse 0;
-    var buf: [600:0]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&buf, "{s}  {d}:{d:0>2}{s}", .{
+    var route_buf: [96]u8 = undefined;
+    var buf: [700:0]u8 = undefined;
+    const text = std.fmt.bufPrintZ(&buf, "{s}  {d}:{d:0>2}{s}{s}", .{
         resource.name(),
         duration_ms / 60_000,
         (duration_ms / 1000) % 60,
         if (c.gtk_media_stream_has_video(stream) != 0) "" else "  audio only",
+        self.videoRouteText(&route_buf),
     }) catch "Playing";
     c.gtk_label_set_text(self.status, text.ptr);
 }
@@ -2095,6 +2191,10 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
                 c.GDK_KEY_less => self.video_bar.seekRelative(-30_000),
                 c.GDK_KEY_greater => self.video_bar.seekRelative(30_000),
                 c.GDK_KEY_r, c.GDK_KEY_R => self.seekVideoTo(0),
+                c.GDK_KEY_t, c.GDK_KEY_T => if (self.videoIsRemote())
+                    self.switchVideoRoute(if ((self.videoRoute() orelse .direct) == .direct) .transcode else .direct)
+                else
+                    return 0,
                 c.GDK_KEY_F11 => toggleFullscreen(self),
                 c.GDK_KEY_Escape => if (self.fullscreen) toggleFullscreen(self) else return 0,
                 else => return 0,

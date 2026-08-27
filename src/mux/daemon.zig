@@ -2115,6 +2115,14 @@ pub const FsJob = struct {
     exit_status: i64 = 0,
     /// preview_stream: the source's duration, once the helper probed it.
     duration_ms: u64 = 0,
+    /// preview_stream: which encoder the helper settled on (sticky,
+    /// forwarded on every event), the furthest byte the reader has
+    /// fetched from the spool, and whether the encoder is SIGSTOPped
+    /// for running too far ahead of it (daemon_fsjobs.spoolThrottle).
+    encoder: [16]u8 = undefined,
+    encoder_len: usize = 0,
+    spool_read_pos: u64 = 0,
+    throttled: bool = false,
     /// Entry the helper is working on RIGHT NOW, and how far through
     /// its entry count it is. The helper puts the path on the wire
     /// only when it changes, so this is sticky between updates.

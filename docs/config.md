@@ -663,6 +663,7 @@ window's tab tree otherwise, including while the sidebar is hidden.
 | `files_show_hidden` | bool | `false` | |
 | `files_confirm_delete` | bool | `true` | Ask before a permanent delete. |
 | `files_verify_copy` | bool | `false` | Hash-compare each copied file against its source before the copy installs. |
+| `files_remote_video` | enum | `auto` | `auto`, `direct`, `transcode`. How the Viewer plays a video on a remote host. `auto` times the first megabyte against the file's bitrate (ffprobe on the host) and plays the ORIGINAL through the local decoder when the link carries it with headroom, asking the host to transcode only when it does not; `direct` always streams the original; `transcode` always encodes a 1280-wide H.264 preview on the host. A direct play the local decoder rejects retries as a transcode; T in the Viewer toggles the current item. |
 
 ### Text editor (behaviour)
 

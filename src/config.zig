@@ -756,6 +756,12 @@ pub const QuakeEdge = enum { top, bottom, left, right };
 /// ViewMode; config keeps its own enum so the parser has no UI dep).
 pub const FilesView = enum { details, compact, icons, miller };
 
+/// How the Viewer plays a video that lives on a remote host. `auto`
+/// measures the link against the file's bitrate and plays the original
+/// when it fits (decoding locally, zero host CPU), transcoding on the
+/// host only when it does not; the other two force one rung.
+pub const RemoteVideo = enum { auto, direct, transcode };
+
 /// One `shader_param.<name>` override. Defined here (not in the
 /// render graph) so the mux side can import config.zig; the shader
 /// passes import it FROM config.
@@ -920,6 +926,9 @@ pub const Config = struct {
     /// Hash-compare every copied file against its source before the
     /// copy installs (same-host daemon copy jobs).
     files_verify_copy: bool = false,
+    /// Viewer playback of remote video: measured (auto), always the
+    /// original over the link (direct), always a host transcode.
+    files_remote_video: RemoteVideo = .auto,
 
     // Text editor. These are EDITING BEHAVIOUR, not pane appearance:
     // the same person wants the same indentation and the same wrap
@@ -1836,6 +1845,8 @@ pub const Config = struct {
         if (self.files_show_hidden) try w.writeAll("files_show_hidden = true\n");
         if (!self.files_confirm_delete) try w.writeAll("files_confirm_delete = false\n");
         if (self.files_verify_copy) try w.writeAll("files_verify_copy = true\n");
+        if (self.files_remote_video != .auto)
+            try w.print("files_remote_video = {s}\n", .{@tagName(self.files_remote_video)});
 
         // Text editor.
         if (self.editor_tab_width != 4) try w.print("editor_tab_width = {d}\n", .{self.editor_tab_width});
@@ -3076,6 +3087,8 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
         cfg.files_confirm_delete = try parseBool(value);
     } else if (std.mem.eql(u8, key, "files_verify_copy")) {
         cfg.files_verify_copy = try parseBool(value);
+    } else if (std.mem.eql(u8, key, "files_remote_video")) {
+        cfg.files_remote_video = std.meta.stringToEnum(RemoteVideo, value) orelse return error.BadRemoteVideo;
     } else if (std.mem.eql(u8, key, "editor_tab_width")) {
         const w = try parseU16(value);
         if (w == 0 or w > 16) return error.BadEditorTabWidth;

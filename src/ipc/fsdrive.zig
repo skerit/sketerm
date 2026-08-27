@@ -284,8 +284,10 @@ pub const JobEvent = struct {
     /// command's exit status (both on the done event).
     rejected: u64 = 0,
     exit_status: i64 = 0,
-    /// preview_stream: the source's total duration (0 = unknown).
+    /// preview_stream: the source's total duration (0 = unknown) and
+    /// the encoder the host settled on ("x264" / "vaapi").
     duration_ms: u64 = 0,
+    encoder: []const u8 = "",
     /// Progress detail: the entry in flight (sticky daemon-side, so
     /// present on every event once the job has named one) plus the
     /// entry counters of a tree operation.
@@ -491,6 +493,7 @@ pub const Fs = struct {
             rejected: u64 = 0,
             exit_status: i64 = 0,
             duration_ms: u64 = 0,
+            encoder: []const u8 = "",
             file: []const u8 = "",
             files_done: u64 = 0,
             files_total: u64 = 0,
@@ -544,6 +547,7 @@ pub const Fs = struct {
             .rejected = parsed.rejected,
             .exit_status = parsed.exit_status,
             .duration_ms = parsed.duration_ms,
+            .encoder = parsed.encoder,
             .file = parsed.file,
             .files_done = parsed.files_done,
             .files_total = parsed.files_total,

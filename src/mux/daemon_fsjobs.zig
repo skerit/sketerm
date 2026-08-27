@@ -1219,6 +1219,78 @@ pub fn fsJobOp(self: *Daemon, cl: *Client, r: FsOpReq) void {
     }
 }
 
+/// Spool-lead thresholds (bytes the encoder may be ahead of the reader).
+/// A `pub var` so the smoke rig can shrink them to something a short
+/// clip reaches; at the defaults a CRF-28 1280-wide preview holds one
+/// to two minutes of lead before the encoder is stopped.
+pub const SpoolLead = struct { stop: u64, cont: u64 };
+pub var spool_lead: SpoolLead = .{ .stop = 12 << 20, .cont = 4 << 20 };
+
+pub const SpoolSignal = enum { stop, cont };
+
+/// Whether the encoder should be stopped or continued given how far
+/// the spool is ahead of the reader. Hysteresis: stop past `stop`,
+/// continue only once the reader has caught up to within `cont`.
+pub fn spoolThrottleStep(written: u64, read_pos: u64, throttled: bool, lead: SpoolLead) ?SpoolSignal {
+    const ahead = written -| read_pos;
+    if (!throttled and ahead > lead.stop) return .stop;
+    if (throttled and ahead < lead.cont) return .cont;
+    return null;
+}
+
+/// Throttle a preview_stream encoder behind its reader: it is pointless
+/// to burn the host's CPU encoding two hours of film for a viewer that
+/// is thirty seconds in (or paused). The helper's progress events carry
+/// the spool size (`job.done`), `spoolNoteRead` the reader's position;
+/// the group is SIGSTOPped past the lead and SIGCONTed once the reader
+/// closes in. A stopped helper emits no progress, so the only wake-up
+/// is a read -- and a client that stops reading leaves it idle, which
+/// is the point. Client death still kills a stopped group (SIGKILL).
+pub fn spoolThrottle(job: *FsJob) void {
+    if (job.pid <= 0) return;
+    if (job.finished()) return spoolRelease(job);
+    if (job.state == .paused) return;
+    const signal = spoolThrottleStep(job.done, job.spool_read_pos, job.throttled, spool_lead) orelse return;
+    switch (signal) {
+        .stop => _ = c.kill(-job.pid, c.SIGSTOP),
+        .cont => _ = c.kill(-job.pid, c.SIGCONT),
+    }
+    job.throttled = signal == .stop;
+}
+
+/// Let a throttled group run, unconditionally.
+fn spoolRelease(job: *FsJob) void {
+    if (!job.throttled or job.pid <= 0) return;
+    _ = c.kill(-job.pid, c.SIGCONT);
+    job.throttled = false;
+}
+
+/// A client read `[.., end)` of a file under the spool prefix: if it is
+/// a live preview spool, advance its reader position and reconsider
+/// the throttle.
+pub fn spoolNoteRead(self: *Daemon, path: []const u8, end: u64) void {
+    for (self.fs_jobs.items) |job| {
+        if (job.op != .preview_stream or job.finished()) continue;
+        if (!std.mem.eql(u8, job.done_path[0..job.done_path_len], path)) continue;
+        if (end > job.spool_read_pos) job.spool_read_pos = end;
+        spoolThrottle(job);
+        return;
+    }
+}
+
+test "spoolThrottleStep: stop past the lead, continue once caught up, hysteresis between" {
+    const t = std.testing;
+    const lead: SpoolLead = .{ .stop = 100, .cont = 40 };
+    try t.expectEqual(@as(?SpoolSignal, null), spoolThrottleStep(50, 0, false, lead));
+    try t.expectEqual(@as(?SpoolSignal, .stop), spoolThrottleStep(101, 0, false, lead));
+    // Inside the band nothing changes in either state.
+    try t.expectEqual(@as(?SpoolSignal, null), spoolThrottleStep(101, 30, true, lead));
+    try t.expectEqual(@as(?SpoolSignal, null), spoolThrottleStep(150, 100, false, lead));
+    try t.expectEqual(@as(?SpoolSignal, .cont), spoolThrottleStep(150, 120, true, lead));
+    // A reader ahead of the writer (impossible, but a saturating sub) continues.
+    try t.expectEqual(@as(?SpoolSignal, .cont), spoolThrottleStep(10, 50, true, lead));
+}
+
 /// When a job's scratch asset may go: now if nobody owns it, after the
 /// TTL for a one-shot preview, and for a playback spool only once its
 /// owner disconnects (the client-death sweep turns a positive stamp
@@ -1272,6 +1344,7 @@ pub fn fsJobEmit(self: *Daemon, job: *FsJob, ev: []const u8) void {
         .rejected = job.rejected,
         .exit_status = job.exit_status,
         .duration_ms = job.duration_ms,
+        .encoder = job.encoder[0..job.encoder_len],
         .path = job.done_path[0..job.done_path_len],
         .keep = job.done_kept,
         .kind = job.err_kind[0..job.err_kind_len],
@@ -1330,6 +1403,8 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         rejected: u64 = 0,
         exit_status: i64 = 0,
         duration_ms: u64 = 0,
+        /// preview_stream: the encoder in use ("x264" / "vaapi").
+        encoder: []const u8 = "",
         /// Progress detail: the entry in flight (present only when
         /// it CHANGED — the helper does not repeat it) and the
         /// entry counters for tree operations.
@@ -1463,6 +1538,17 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
     }
     if (e.resumed_from > 0) job.resumed_from = e.resumed_from;
     if (e.duration_ms > 0) job.duration_ms = e.duration_ms;
+    if (e.encoder.len > 0) {
+        job.encoder_len = @min(e.encoder.len, job.encoder.len);
+        @memcpy(job.encoder[0..job.encoder_len], e.encoder[0..job.encoder_len]);
+    }
+    if (job.op == .preview_stream) {
+        // Any line that is not progress (done, error) ends the encode: a
+        // group stopped between its last progress line and its exit
+        // would otherwise never close its stdout, and the job would sit
+        // finished-but-unreaped with its spool on disk forever.
+        if (std.mem.eql(u8, e.ev, "progress")) spoolThrottle(job) else spoolRelease(job);
+    }
     if (e.files_done > job.files_done) job.files_done = e.files_done;
     if (e.files_total > job.files_total) job.files_total = e.files_total;
     if (fsjournal.phaseRank(e.phase) > fsjournal.phaseRank(job.phase[0..job.phase_len])) job.setPhase(e.phase);

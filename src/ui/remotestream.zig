@@ -1,15 +1,20 @@
 //! A `GFileInputStream` over the daemon, so GtkMediaFile can play a REMOTE
 //! file: `giostreamsrc` reads, seeks and sizes it from the GStreamer
-//! streaming thread. Two modes. `.transcode` (video) asks the remote daemon
-//! for a `preview_stream` job -- a capped-width, low-bitrate fragmented
-//! MP4 spool that grows while ffmpeg encodes -- and reads that sequentially
-//! (non-seekable, size unknown: push mode), so a 4K original never crosses
-//! the link; a host without ffmpeg falls back to `.raw` transparently. `.raw`
-//! (audio, or the fallback) is seekable range reads of the original with a
-//! read-ahead window so a demuxer's small reads do not each cost a round
-//! trip. The connection is made lazily on the streaming thread (never the
-//! GUI's -- a remote connect can block on SSH), and every failure surfaces
-//! as a `G_IO_ERROR` the media stream reports instead of a hang.
+//! streaming thread. Two routes, the Jellyfin ladder minus remux. `.direct`
+//! is seekable range reads of the ORIGINAL with a read-ahead window (a
+//! demuxer's small reads do not each cost a round trip); the local
+//! GStreamer decodes, the host serves bytes and nothing else. `.transcode`
+//! asks the remote daemon for a `preview_stream` job -- a capped-width,
+//! low-bitrate fragmented MP4 spool that grows while ffmpeg encodes -- and
+//! reads that sequentially (non-seekable, size unknown: push mode), so a
+//! 4K original never crosses a link that cannot carry it. Which route a
+//! `.auto` policy takes is DECIDED HERE, on the streaming thread, from two
+//! measurements: the file's bitrate (the host's ffprobe, via media_meta)
+//! and the link's throughput (the first megabyte, timed). A host without
+//! ffmpeg falls back to `.direct` transparently. The connection is made
+//! lazily on the streaming thread (never the GUI's -- a remote connect can
+//! block on SSH), and every failure surfaces as a `G_IO_ERROR` the media
+//! stream reports instead of a hang.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -18,16 +23,85 @@ const viewer = @import("viewer.zig");
 const t = std.testing;
 
 const nowMs = @import("../util/clock.zig").nowMs;
+const nowUs = @import("../util/clock.zig").nowUs;
 
 /// Bytes fetched per window; two `MAX_READ` requests, so a demuxer that
 /// walks a file linearly costs one round trip per megabyte pair.
 pub const READ_AHEAD: usize = 4 << 20;
 
-pub const Mode = enum { raw, transcode };
+/// What the caller asks for. `.auto` measures; the others force a rung.
+/// The config key `files_remote_video` IS this vocabulary (declared
+/// core-side, since config compiles into the daemon).
+pub const Policy = @import("../config.zig").RemoteVideo;
+
+/// What the stream settled on.
+pub const Route = enum { direct, transcode };
+
+/// The link must carry the file's bitrate with this much to spare
+/// before the original is played over it: a link exactly at the
+/// bitrate stalls on every burst.
+const LINK_HEADROOM_PCT: u64 = 150;
+
+/// How much of the original the `.auto` measurement reads (and keeps,
+/// as the first window, when the decision is direct). Half a `MAX_READ`:
+/// enough to average out per-request latency on a LAN, cheap enough to
+/// throw away on a 20 Mbit/s link (400ms).
+const LINK_SAMPLE_BYTES: usize = 1 << 20;
 
 /// How long a transcoded read waits for the spool to grow before it is
-/// a failure rather than a stall (progress events arrive every 250ms).
+/// a failure rather than a stall (progress events arrive every 250ms
+/// while the encoder runs; a stopped encoder is woken by our reads).
 const SPOOL_WAIT_MS: i64 = 30_000;
+
+/// Direct play needs a link with headroom over the bitrate; an unknown
+/// bitrate (no ffprobe on the host) or an unmeasurable link gets the
+/// original, since a host that cannot probe cannot transcode either and
+/// the local decoder is the one that can say no.
+pub fn chooseRoute(bitrate_kbps: ?u64, link_kbps: ?u64) Route {
+    const bitrate = bitrate_kbps orelse return .direct;
+    const link = link_kbps orelse return .direct;
+    if (bitrate == 0) return .direct;
+    const need = std.math.mulWide(u64, bitrate, LINK_HEADROOM_PCT) / 100;
+    return if (link >= need) .direct else .transcode;
+}
+
+/// Throughput of `bytes` moved in `elapsed_us`, in kbit/s; a sub-
+/// millisecond sample counts as one millisecond so a tiny file over a
+/// LAN cannot divide by zero into infinity.
+pub fn throughputKbps(bytes: u64, elapsed_us: i64) u64 {
+    const us: u64 = @intCast(@max(elapsed_us, 1000));
+    return @intCast(std.math.mulWide(u64, bytes, 8 * 1000) / us);
+}
+
+/// The bitrate media_meta reports, or one derived from size and
+/// duration when the container carries no bit_rate; null with neither.
+pub fn bitrateFromMeta(bitrate_kbps: ?[]const u8, duration_ms: ?[]const u8, size: u64) ?u64 {
+    if (bitrate_kbps) |text| {
+        if (std.fmt.parseInt(u64, text, 10)) |kbps| {
+            if (kbps > 0) return kbps;
+        } else |_| {}
+    }
+    const dur_text = duration_ms orelse return null;
+    const dur = std.fmt.parseInt(u64, dur_text, 10) catch return null;
+    if (dur == 0) return null;
+    return @intCast(std.math.mulWide(u64, size, 8) / dur);
+}
+
+/// What the stream decided, for the GUI's status line and its menu.
+pub const Decision = struct {
+    route: Route,
+    /// Measured link throughput (0 = not measured: a forced policy).
+    link_kbps: u64,
+    /// The source bitrate the host reported (0 = unknown).
+    bitrate_kbps: u64,
+    /// `.transcode`: the host's encoder name ("x264" / "vaapi").
+    encoder: [16]u8,
+    encoder_len: usize,
+
+    pub fn encoderName(self: *const Decision) []const u8 {
+        return self.encoder[0..self.encoder_len];
+    }
+};
 
 /// The transport-free core: a position, a window of bytes and the read
 /// policy, testable without a daemon.
@@ -70,14 +144,20 @@ const Backend = struct {
     allocator: std.mem.Allocator,
     host: ?[]u8,
     path: []u8,
-    mode: Mode,
+    policy: Policy,
     /// `.transcode`: encode from this offset (the viewer's time seek).
     start_ms: u64 = 0,
     /// `.transcode`: the source duration the host probed (0 = unknown),
     /// written on the streaming thread, read by the GUI's transport bar.
     duration_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// `.transcode` actually engaged (vs. fell back to raw), for the GUI.
-    transcoded: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// The decision, published for the GUI thread: `route_state` is 0
+    /// until decided, else 1 + @intFromEnum(route), stored with release
+    /// AFTER the other fields so an acquire load of it sees them whole.
+    route_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    link_kbps: u64 = 0,
+    bitrate_kbps: u64 = 0,
+    encoder: [16]u8 = undefined,
+    encoder_len: usize = 0,
     fs: ?fsdrive.Fs = null,
     /// `.transcode`: the job and its spool; `spool_done` once the encode
     /// finished, after which a short read is a real EOF.
@@ -115,32 +195,78 @@ const Backend = struct {
         };
         self.fs = fs;
         self.win.size = info.size;
-        if (self.mode == .transcode) self.startTranscode();
+        try self.decide();
     }
 
-    /// Ask the host to transcode; on any refusal before the spool is
-    /// named (no ffmpeg there, unsupported file) degrade to raw range
-    /// reads of the original rather than fail playback outright.
-    fn startTranscode(self: *Backend) void {
-        const fs = &self.fs.?;
-        const job = fs.startPreviewStream(self.path, self.start_ms) catch {
-            self.mode = .raw;
-            return;
+    /// Settle the route. A forced policy skips the measurements; `.auto`
+    /// probes the bitrate on the host and times the first megabyte over
+    /// the link, which stays as the first window when the answer is
+    /// direct. A transcode the host refuses becomes direct.
+    fn decide(self: *Backend) error{Failed}!void {
+        var route: Route = switch (self.policy) {
+            .direct => .direct,
+            .transcode => .transcode,
+            .auto => blk: {
+                self.bitrate_kbps = self.probeBitrate() orelse 0;
+                self.link_kbps = try self.measureLink() orelse 0;
+                break :blk chooseRoute(
+                    if (self.bitrate_kbps > 0) self.bitrate_kbps else null,
+                    if (self.link_kbps > 0) self.link_kbps else null,
+                );
+            },
         };
+        if (route == .transcode and !self.startTranscode()) route = .direct;
+        self.route_state.store(1 + @as(u8, @intFromEnum(route)), .release);
+    }
+
+    /// The host's ffprobe via media_meta (daemon-cached per file), so a
+    /// re-open of the same video costs no second probe.
+    fn probeBitrate(self: *Backend) ?u64 {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const dir = std.fs.path.dirname(self.path) orelse "/";
+        const names = [_][]const u8{std.fs.path.basename(self.path)};
+        const results = self.fs.?.mediaMeta(arena.allocator(), dir, &names, 15_000) catch return null;
+        if (results.len == 0) return null;
+        return bitrateFromMeta(results[0].get("media.bitrate_kbps"), results[0].get("media.duration_ms"), self.win.size);
+    }
+
+    /// Time the first sample of the original; it becomes the window at
+    /// offset 0 so a direct decision has already read its first bytes.
+    fn measureLink(self: *Backend) error{Failed}!?u64 {
+        const want: usize = @intCast(@min(self.win.size, LINK_SAMPLE_BYTES));
+        if (want == 0) return null;
+        const started = nowUs();
+        try self.fetchInto(self.path, 0, want);
+        const elapsed = nowUs() - started;
+        return throughputKbps(self.buf.items.len, elapsed);
+    }
+
+    /// Ask the host to transcode; false on any refusal before the spool
+    /// is named (no ffmpeg there, unsupported file), so the caller can
+    /// degrade to the original rather than fail playback outright.
+    fn startTranscode(self: *Backend) bool {
+        const fs = &self.fs.?;
+        const job = fs.startPreviewStream(self.path, self.start_ms) catch return false;
         var deadline_tries: usize = 0;
         while (deadline_tries < 4) : (deadline_tries += 1) {
             var ev = (fs.waitJobEvent(job, 15_000) catch null) orelse continue;
             defer ev.deinit();
             if (std.mem.eql(u8, ev.ev, "progress") and ev.path.len > 0) {
-                self.spool = self.allocator.dupe(u8, ev.path) catch break;
+                self.spool = self.allocator.dupe(u8, ev.path) catch return false;
                 self.job = job;
                 self.duration_ms.store(ev.duration_ms, .release);
-                self.transcoded.store(true, .release);
-                return;
+                self.encoder_len = @min(ev.encoder.len, self.encoder.len);
+                @memcpy(self.encoder[0..self.encoder_len], ev.encoder[0..self.encoder_len]);
+                // Whatever the measurement read of the original is not
+                // the spool: the window restarts at the spool's byte 0.
+                self.win = .{ .size = 0 };
+                self.buf.clearRetainingCapacity();
+                return true;
             }
-            if (ev.terminal()) break;
+            if (ev.terminal()) return false;
         }
-        self.mode = .raw;
+        return false;
     }
 
     /// Wait for the encode to add bytes past `pos`; false once the
@@ -163,6 +289,26 @@ const Backend = struct {
         return self.fail("host transcode stalled", .{});
     }
 
+    /// Fetch `[off, off + len)` of `source` into the window (a short
+    /// result is EOF or, for a spool, the encoder's current edge).
+    fn fetchInto(self: *Backend, source: []const u8, off: u64, len: usize) error{Failed}!void {
+        self.win.bytes = &.{};
+        self.buf.clearRetainingCapacity();
+        var got: usize = 0;
+        while (got < len) {
+            const before = self.buf.items.len;
+            const want: u32 = @intCast(@min(len - got, fsdrive.fsserve.MAX_READ));
+            const info = self.fs.?.read(source, off + got, want, &self.buf) catch |e|
+                return self.fail("read failed at {d}: {s}", .{ off + got, @errorName(e) });
+            const received = self.buf.items.len - before;
+            if (received == 0) break;
+            got += received;
+            if (info.eof) break;
+        }
+        self.win.start = off;
+        self.win.bytes = self.buf.items;
+    }
+
     /// Fill the window from `pos`; false at EOF. A transcoded spool
     /// has no known size: read what is there, and when that is nothing
     /// wait for the encoder to add more.
@@ -174,22 +320,8 @@ const Backend = struct {
             else
                 self.win.nextFetch();
             if (fetch.len == 0) return false;
-            self.win.bytes = &.{};
-            self.buf.clearRetainingCapacity();
-            var got: usize = 0;
-            while (got < fetch.len) {
-                const before = self.buf.items.len;
-                const want: u32 = @intCast(@min(fetch.len - got, fsdrive.fsserve.MAX_READ));
-                const info = self.fs.?.read(source, fetch.off + got, want, &self.buf) catch |e|
-                    return self.fail("read failed at {d}: {s}", .{ fetch.off + got, @errorName(e) });
-                const received = self.buf.items.len - before;
-                if (received == 0) break;
-                got += received;
-                if (info.eof) break;
-            }
-            self.win.start = fetch.off;
-            self.win.bytes = self.buf.items;
-            if (got > 0) return true;
+            try self.fetchInto(source, fetch.off, fetch.len);
+            if (self.buf.items.len > 0) return true;
             if (self.spool == null) return false;
             if (!try self.awaitSpoolGrowth()) return false;
         }
@@ -342,29 +474,38 @@ fn finalize(object: [*c]c.GObject) callconv(.c) void {
     if (parent_class) |pc| if (pc.finalize) |f| f(object);
 }
 
-/// The transcoded source's duration in ms (0 = not known yet, or a raw
-/// stream), safe from any thread.
+/// The transcoded source's duration in ms (0 = not known yet, or a
+/// direct stream), safe from any thread.
 pub fn durationMs(stream: *c.GInputStream) u64 {
     const backend = instanceOf(stream).backend orelse return 0;
     return backend.duration_ms.load(.acquire);
 }
 
-/// Whether this stream is (still) a transcoded spool: false before the
-/// first touch and after a fallback to raw range reads.
-pub fn isTranscoded(stream: *c.GInputStream) bool {
-    const backend = instanceOf(stream).backend orelse return false;
-    return backend.transcoded.load(.acquire);
+/// What the stream settled on, null until its first touch decided it.
+/// Safe from any thread: `route_state` is the release fence over the
+/// other fields.
+pub fn decision(stream: *c.GInputStream) ?Decision {
+    const backend = instanceOf(stream).backend orelse return null;
+    const state = backend.route_state.load(.acquire);
+    if (state == 0) return null;
+    return .{
+        .route = @enumFromInt(state - 1),
+        .link_kbps = backend.link_kbps,
+        .bitrate_kbps = backend.bitrate_kbps,
+        .encoder = backend.encoder,
+        .encoder_len = backend.encoder_len,
+    };
 }
 
 /// A new stream for `path` on `host` (null = the local daemon). Nothing
 /// connects until GStreamer first touches it. `start_ms` is where a
-/// `.transcode` encode begins. Caller owns one reference.
-pub fn new(host: ?[]const u8, path: []const u8, mode: Mode, start_ms: u64) ?*c.GInputStream {
+/// transcode encode begins. Caller owns one reference.
+pub fn new(host: ?[]const u8, path: []const u8, policy: Policy, start_ms: u64) ?*c.GInputStream {
     const allocator = std.heap.c_allocator;
     const backend = allocator.create(Backend) catch return null;
     backend.* = .{
         .allocator = allocator,
-        .mode = mode,
+        .policy = policy,
         .start_ms = start_ms,
         .host = if (host) |h| (allocator.dupe(u8, h) catch {
             allocator.destroy(backend);
@@ -383,6 +524,30 @@ pub fn new(host: ?[]const u8, path: []const u8, mode: Mode, start_ms: u64) ?*c.G
     const inst: *Instance = @ptrCast(@alignCast(obj));
     inst.backend = backend;
     return @ptrCast(@alignCast(obj));
+}
+
+test "chooseRoute: direct with headroom, transcode without, direct when nothing is known" {
+    // 20 Mbit/s file on a gigabit LAN: direct. Same file on 25 Mbit/s: not 1.5x, transcode.
+    try t.expectEqual(Route.direct, chooseRoute(20_000, 900_000));
+    try t.expectEqual(Route.transcode, chooseRoute(20_000, 25_000));
+    try t.expectEqual(Route.direct, chooseRoute(20_000, 30_000));
+    try t.expectEqual(Route.direct, chooseRoute(null, 1_000));
+    try t.expectEqual(Route.direct, chooseRoute(20_000, null));
+    try t.expectEqual(Route.direct, chooseRoute(0, 1));
+}
+
+test "throughputKbps: bits per millisecond, floored at one millisecond" {
+    try t.expectEqual(@as(u64, 8_000), throughputKbps(1_000_000, 1_000_000));
+    try t.expectEqual(@as(u64, 8_000_000), throughputKbps(1_000_000, 10));
+    try t.expectEqual(@as(u64, 0), throughputKbps(0, 5_000));
+}
+
+test "bitrateFromMeta: reported bitrate wins, else size over duration, else nothing" {
+    try t.expectEqual(@as(?u64, 4_500), bitrateFromMeta("4500", "1000", 999));
+    try t.expectEqual(@as(?u64, 8_000), bitrateFromMeta(null, "1000", 1_000_000));
+    try t.expectEqual(@as(?u64, 8_000), bitrateFromMeta("N/A", "1000", 1_000_000));
+    try t.expectEqual(@as(?u64, null), bitrateFromMeta(null, null, 1_000_000));
+    try t.expectEqual(@as(?u64, null), bitrateFromMeta("0", "0", 1_000_000));
 }
 
 test "Window serves cached bytes, moves on a miss and clamps the fetch to the file" {

@@ -709,6 +709,26 @@ fn archiveMembersSafe(archive: []const u8) bool {
     return safe and c.WIFEXITED(st) and c.WEXITSTATUS(st) == 0;
 }
 
+/// `runArgv` with the child's stdout/stderr discarded: for probes whose
+/// expected failure output is noise in the daemon log.
+fn runArgvQuiet(argv: []const ?[*:0]const u8) bool {
+    const pid = c.fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        const null_fd = c.open("/dev/null", c.O_RDWR);
+        if (null_fd >= 0) {
+            _ = c.dup2(null_fd, 1);
+            _ = c.dup2(null_fd, 2);
+            _ = c.close(null_fd);
+        }
+        _ = c.execvp(argv[0].?, @ptrCast(@constCast(argv.ptr)));
+        c._exit(127);
+    }
+    var st: c_int = 0;
+    while (c.waitpid(pid, &st, 0) < 0 and std.posix.errno(@as(c_int, -1)) == .INTR) {}
+    return c.WIFEXITED(st) and c.WEXITSTATUS(st) == 0;
+}
+
 fn runArgv(argv: []const ?[*:0]const u8) bool {
     const pid = c.fork();
     if (pid < 0) return false;
@@ -970,13 +990,109 @@ fn runPreviewTransport(allocator: std.mem.Allocator, spec: Spec) u8 {
     return 0;
 }
 
+/// Where preview spools live; the daemon recognises reads of them by
+/// this prefix to throttle the encoder behind the reader.
+pub const SPOOL_PREFIX = "/tmp/.sketerm-preview-";
+
+/// Bytes a spool must hold before it is announced to the client: past
+/// the fragmented-MP4 header (a few hundred bytes of ftyp + empty
+/// moov) and into the first fragment, so a hardware encoder that fails
+/// before producing one can be replaced by software into the SAME
+/// spool without the client having read a header that no longer
+/// matches.
+const SPOOL_ANNOUNCE_BYTES: u64 = 16 * 1024;
+
+/// Preview keyframe cadence in seconds. `frag_keyframe` closes a
+/// fragment at every keyframe, and the player cannot start before the
+/// first fragment lands, so this is the start-up latency of a
+/// transcode (x264's default 250-frame GOP made it ten seconds).
+const PREVIEW_GOP_SECONDS = "2";
+
+pub const PreviewEncoder = enum {
+    x264,
+    vaapi,
+
+    pub fn name(self: PreviewEncoder) []const u8 {
+        return @tagName(self);
+    }
+};
+
+const VAAPI_DEVICE = "/dev/dri/renderD128";
+
+/// The host can encode H.264 on its GPU: the render node is usable AND
+/// a one-frame test encode goes through (a present-but-broken driver
+/// is common; `-encoders` listing h264_vaapi proves nothing).
+fn vaapiUsable() bool {
+    if (c.access(VAAPI_DEVICE, c.R_OK | c.W_OK) != 0) return false;
+    const argv = [_:null]?[*:0]const u8{
+        "ffmpeg", "-nostdin",   "-v",         "error",     "-vaapi_device",     VAAPI_DEVICE,
+        "-f",     "lavfi",      "-i",         "color=c=black:s=64x64:r=1", "-frames:v", "1",
+        "-vf",    "format=nv12,hwupload", "-c:v", "h264_vaapi", "-f",           "null",
+        "-",      null,
+    };
+    return runArgvQuiet(&argv);
+}
+
+/// The encode command for one spool. Both encoders share the input
+/// seek, the stream maps, the width cap, the keyframe cadence, the
+/// audio and the fragmented-MP4 muxing; they differ in the video
+/// filter tail and the codec block.
+fn previewStreamArgv(buf: *[64]?[*:0]const u8, encoder: PreviewEncoder, ss: [*:0]const u8, source: [*:0]const u8, out: [*:0]const u8) [:null]?[*:0]const u8 {
+    var n: usize = 0;
+    const push = struct {
+        fn f(b: *[64]?[*:0]const u8, i: *usize, args: []const [*:0]const u8) void {
+            for (args) |a| {
+                b[i.*] = a;
+                i.* += 1;
+            }
+        }
+    }.f;
+    push(buf, &n, &.{ "ffmpeg", "-nostdin", "-y", "-v", "error" });
+    if (encoder == .vaapi) push(buf, &n, &.{ "-vaapi_device", VAAPI_DEVICE });
+    push(buf, &n, &.{ "-ss", ss, "-i", source, "-map", "0:v:0", "-map", "0:a:0?" });
+    switch (encoder) {
+        .x264 => push(buf, &n, &.{
+            "-vf",      PREVIEW_STREAM_VF, "-c:v",     "libx264", "-preset",   "ultrafast",
+            "-tune",    "zerolatency",     "-crf",     "28",      "-maxrate",  "2500k",
+            "-bufsize", "5000k",           "-pix_fmt", "yuv420p", "-sc_threshold", "0",
+        }),
+        .vaapi => push(buf, &n, &.{
+            "-vf", PREVIEW_STREAM_VF ++ ",format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", "26", "-bf", "0",
+        }),
+    }
+    push(buf, &n, &.{
+        "-force_key_frames", "expr:gte(t,n_forced*" ++ PREVIEW_GOP_SECONDS ++ ")",
+        "-c:a",              "aac",                                                "-b:a",      "128k",
+        "-ac",               "2",                                                  "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f",                "mp4",                                                out,
+    });
+    buf[n] = null;
+    return buf[0..n :null];
+}
+
+fn spawnArgv(argv: [:null]?[*:0]const u8) c.pid_t {
+    const pid = c.fork();
+    if (pid == 0) {
+        _ = c.execvp(argv[0].?, @ptrCast(@constCast(argv.ptr)));
+        c._exit(127);
+    }
+    return pid;
+}
+
+fn fileSize(path: [*:0]const u8) u64 {
+    var st: c.struct_stat = undefined;
+    return if (c.stat(path, &st) == 0 and st.st_size > 0) @intCast(st.st_size) else 0;
+}
+
 /// Cheap remote playback: transcode a video into a low-bitrate,
 /// capped-width fragmented MP4 spool under /tmp, growing while the
 /// viewer plays it. Registered as an `asset` (the daemon unlinks it once
 /// the job dies or the client goes), and its path rides the first
-/// progress event so the viewer can start reading before the encode is
-/// done. ffmpeg runs in this helper's process group, so a client that
-/// disconnects kills the encode with the helper.
+/// progress event -- sent once the first fragment exists -- so the viewer
+/// starts reading as soon as there is something playable. ffmpeg runs in
+/// this helper's process group, so a client that disconnects kills the
+/// encode with the helper, and the daemon SIGSTOPs the group when the
+/// spool runs far ahead of the reader.
 fn runPreviewStream(spec: Spec) u8 {
     var source_z: [4096:0]u8 = undefined;
     const source = std.fmt.bufPrintZ(&source_z, "{s}", .{spec.src}) catch return emitError("preview path too long");
@@ -990,7 +1106,7 @@ fn runPreviewStream(spec: Spec) u8 {
         std.mem.writeInt(u64, &random, (@as(u64, @intCast(c.getpid())) << 32) ^ @as(u32, @intCast(ts.tv_nsec)), .little);
     }
     var out_z: [4096:0]u8 = undefined;
-    const out = std.fmt.bufPrintZ(&out_z, "/tmp/.sketerm-preview-{x}.mp4", .{std.mem.readInt(u64, &random, .little)}) catch
+    const out = std.fmt.bufPrintZ(&out_z, SPOOL_PREFIX ++ "{x}.mp4", .{std.mem.readInt(u64, &random, .little)}) catch
         return emitError("spool path too long");
     // Create it ourselves (exclusive, private) so the name is claimed
     // and registered before ffmpeg starts writing.
@@ -1005,53 +1121,82 @@ fn runPreviewStream(spec: Spec) u8 {
     // before -i) lands on the keyframe at or before it, cheaply.
     var ss_buf: [32:0]u8 = undefined;
     const ss = std.fmt.bufPrintZ(&ss_buf, "{d}.{d:0>3}", .{ spec.start_ms / 1000, spec.start_ms % 1000 }) catch unreachable;
-    const argv = [_:null]?[*:0]const u8{
-        "ffmpeg",         "-nostdin",   "-y",              "-v",                     "error",
-        "-ss",            ss.ptr,       "-i",              source.ptr,               "-map",
-        "0:v:0",          "-map",
-        "0:a:0?",         "-vf",        PREVIEW_STREAM_VF, "-c:v",                   "libx264",
-        "-preset",        "ultrafast",  "-tune",           "zerolatency",            "-crf",
-        "28",             "-maxrate",   "2500k",           "-bufsize",               "5000k",
-        "-pix_fmt",       "yuv420p",    "-c:a",            "aac",                    "-b:a",
-        "128k",           "-ac",        "2",               "-movflags",              "frag_keyframe+empty_moov+default_base_moof",
-        "-f",             "mp4",        out.ptr,           null,
-    };
-    const pid = c.fork();
+    const total: u64 = @intCast(st.st_size);
+    var encoder: PreviewEncoder = if (vaapiUsable()) .vaapi else .x264;
+    var argv_buf: [64]?[*:0]const u8 = undefined;
+    var pid = spawnArgv(previewStreamArgv(&argv_buf, encoder, ss.ptr, source.ptr, out.ptr));
     if (pid < 0) {
         _ = c.unlink(out.ptr);
         return emitErrno("fork");
     }
-    if (pid == 0) {
-        _ = c.execvp(argv[0].?, @ptrCast(@constCast(&argv)));
-        c._exit(127);
-    }
-    // The viewer starts reading here; every later progress event
-    // repeats the path and reports the spool's growth.
-    emit(.{ .ev = "progress", .path = out, .done = @as(u64, 0), .total = @as(u64, @intCast(st.st_size)), .duration_ms = duration_ms });
+    var announced = false;
     var status: c_int = 0;
     while (true) {
         const rc = c.waitpid(pid, &status, c.WNOHANG);
-        if (rc == pid) break;
         if (rc < 0 and std.posix.errno(rc) != .INTR) {
             _ = c.kill(pid, c.SIGKILL);
             return emitErrno("waitpid");
         }
+        const exited = rc == pid;
+        const ok = exited and c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0;
+        const written = fileSize(out.ptr);
+        if (!announced) {
+            if (exited and !ok and encoder == .vaapi) {
+                // The GPU path refused this file before the client saw
+                // a byte: redo it in software into the same spool.
+                encoder = .x264;
+                const tfd = c.open(out.ptr, c.O_WRONLY | c.O_TRUNC | c.O_CLOEXEC);
+                if (tfd >= 0) _ = c.close(tfd);
+                pid = spawnArgv(previewStreamArgv(&argv_buf, encoder, ss.ptr, source.ptr, out.ptr));
+                if (pid < 0) return emitErrno("fork");
+                continue;
+            }
+            if (!exited and written <= SPOOL_ANNOUNCE_BYTES) {
+                var ts: c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = 50 * std.time.ns_per_ms };
+                _ = c.nanosleep(&ts, null);
+                continue;
+            }
+            announced = true;
+        }
+        // The viewer starts reading at the first of these; every later
+        // one repeats the path and reports the spool's growth.
+        emit(.{ .ev = "progress", .path = out, .done = written, .total = total, .duration_ms = duration_ms, .encoder = encoder.name() });
+        if (exited) {
+            if (!ok) return emitError("ffmpeg could not transcode this file");
+            break;
+        }
         var ts: c.struct_timespec = .{ .tv_sec = 0, .tv_nsec = 250 * std.time.ns_per_ms };
         _ = c.nanosleep(&ts, null);
-        var spool_st: c.struct_stat = undefined;
-        const written: u64 = if (c.stat(out.ptr, &spool_st) == 0) @intCast(spool_st.st_size) else 0;
-        emit(.{ .ev = "progress", .path = out, .done = written, .total = @as(u64, @intCast(st.st_size)), .duration_ms = duration_ms });
     }
-    if (!(c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0)) return emitError("ffmpeg could not transcode this file");
-    var spool_st: c.struct_stat = undefined;
-    const written: u64 = if (c.stat(out.ptr, &spool_st) == 0) @intCast(spool_st.st_size) else 0;
-    emit(.{ .ev = "done", .path = out, .done = written, .total = written });
+    const written = fileSize(out.ptr);
+    emit(.{ .ev = "done", .path = out, .done = written, .total = written, .encoder = encoder.name() });
     return 0;
 }
 
 /// Width capped at 1280 (never upscaled), height follows the aspect and
 /// stays even for yuv420p.
 const PREVIEW_STREAM_VF = "scale=w='min(1280,iw)':h=-2";
+
+test "previewStreamArgv: both encoders share the cadence, the audio and the fragmented muxing" {
+    const t = std.testing;
+    var buf: [64]?[*:0]const u8 = undefined;
+    inline for (.{ PreviewEncoder.x264, PreviewEncoder.vaapi }) |enc| {
+        const argv = previewStreamArgv(&buf, enc, "1.500", "/v/in.mkv", "/tmp/out.mp4");
+        var joined: [2048]u8 = undefined;
+        var w = std.Io.Writer.fixed(&joined);
+        for (argv) |a| w.print("{s} ", .{a.?}) catch unreachable;
+        const line = w.buffered();
+        try t.expect(std.mem.indexOf(u8, line, "-ss 1.500 -i /v/in.mkv ") != null);
+        try t.expect(std.mem.indexOf(u8, line, "-force_key_frames expr:gte(t,n_forced*2) ") != null);
+        try t.expect(std.mem.indexOf(u8, line, "frag_keyframe+empty_moov+default_base_moof") != null);
+        try t.expect(std.mem.indexOf(u8, line, "-c:a aac ") != null);
+        try t.expect(std.mem.endsWith(u8, line, "-f mp4 /tmp/out.mp4 "));
+        try t.expectEqual(enc == .vaapi, std.mem.indexOf(u8, line, "h264_vaapi") != null);
+        try t.expectEqual(enc == .vaapi, std.mem.indexOf(u8, line, "-vaapi_device") != null);
+        try t.expectEqual(enc == .x264, std.mem.indexOf(u8, line, "libx264") != null);
+        try t.expectEqual(argv.len, std.mem.count(u8, line, " "));
+    }
+}
 
 /// The container duration in ms via ffprobe; 0 when unknown (no
 /// ffprobe, or a stream without one), which the viewer shows as an

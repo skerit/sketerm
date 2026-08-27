@@ -11,6 +11,8 @@ const log = @import("log.zig");
 const wire = @import("wire.zig");
 const platform = @import("../util/platform.zig");
 const fsserve = @import("fsserve.zig");
+const fsjob = @import("fsjob.zig");
+const daemon_fsjobs = @import("daemon_fsjobs.zig");
 const pulse = @import("pulse.zig");
 const snapshot = @import("snapshot.zig");
 const dmod = @import("daemon.zig");
@@ -2908,6 +2910,7 @@ pub fn fsRead(self: *Daemon, cl: *Client, r: FsOpReq) void {
     // the mtime/ino below themselves — panel asset hydration does exactly
     // that in Terminal.handleRemoteFileReply.
     cl.queueFrame(.fs_data, buf[0 .. 12 + got]);
+    if (std.mem.startsWith(u8, r.path, fsjob.SPOOL_PREFIX)) daemon_fsjobs.spoolNoteRead(self, r.path, r.off + got);
     cl.queueJson(.fs_reply, .{
         .req = r.req,
         .ok = true,

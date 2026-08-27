@@ -2,14 +2,19 @@
 //! A private daemon thread plays the "remote host"; the viewer's
 //! `remotestream` GObject is driven the way GStreamer's `giostreamsrc`
 //! drives it (GIO read / seek / query_info from a non-GUI thread), for
-//! BOTH modes: `.transcode` (the daemon's `preview_stream` job encodes a
+//! every route: `.transcode` (the daemon's `preview_stream` job encodes a
 //! cheap fragmented MP4 spool that is read while it grows, non-seekable,
-//! and must decode cleanly) and `.raw` (seekable range reads that must
-//! equal the original byte for byte). SKIPs without ffmpeg.
+//! fragments every two seconds, and must decode cleanly), `.direct`
+//! (seekable range reads that must equal the original byte for byte),
+//! and `.auto` over a local socket (a measured link that dwarfs the
+//! bitrate, so the original). Plus the daemon's spool throttle: with the
+//! lead shrunk to test size, an idle reader stops the encoder and a
+//! resumed one finishes the stream. SKIPs without ffmpeg.
 
 const std = @import("std");
 const c = @import("c.zig").c;
 const daemon_mod = @import("mux/daemon.zig");
+const daemon_fsjobs = @import("mux/daemon_fsjobs.zig");
 const fsjob = @import("mux/fsjob.zig");
 const remotestream = @import("ui/remotestream.zig");
 
@@ -64,6 +69,48 @@ fn countSpools() usize {
         if (std.mem.startsWith(u8, name, ".sketerm-preview-") and std.mem.endsWith(u8, name, ".mp4")) n += 1;
     }
     return n;
+}
+
+fn fileSize(path: []const u8) u64 {
+    var z: [4096:0]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return 0;
+    var st: c.struct_stat = undefined;
+    return if (c.stat(p.ptr, &st) == 0 and st.st_size > 0) @intCast(st.st_size) else 0;
+}
+
+fn sleepMs(ms: i64) void {
+    var ts: c.struct_timespec = .{ .tv_sec = @intCast(@divTrunc(ms, 1000)), .tv_nsec = @intCast(@rem(ms, 1000) * std.time.ns_per_ms) };
+    _ = c.nanosleep(&ts, null);
+}
+
+/// The newest preview spool under /tmp once more than `before` exist
+/// (other sketerm instances may own older ones).
+fn spoolPath(allocator: std.mem.Allocator, before: usize) ?[]u8 {
+    var tries: usize = 0;
+    while (tries < 100) : (tries += 1) {
+        if (countSpools() > before) break;
+        sleepMs(50);
+    }
+    const dp = c.opendir("/tmp") orelse return null;
+    defer _ = c.closedir(dp);
+    var newest: ?[]u8 = null;
+    var newest_mtime: i64 = 0;
+    while (c.readdir(dp)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (!std.mem.startsWith(u8, name, ".sketerm-preview-") or !std.mem.endsWith(u8, name, ".mp4")) continue;
+        var z: [4096:0]u8 = undefined;
+        const full = std.fmt.bufPrintZ(&z, "/tmp/{s}", .{name}) catch continue;
+        var st: c.struct_stat = undefined;
+        if (c.stat(full.ptr, &st) != 0) continue;
+        const ts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+        const mtime: i64 = @as(i64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(i64, @intCast(ts.tv_nsec));
+        if (newest == null or mtime > newest_mtime) {
+            if (newest) |old| allocator.free(old);
+            newest = allocator.dupe(u8, full) catch return null;
+            newest_mtime = mtime;
+        }
+    }
+    return newest;
 }
 
 fn writeFile(path: [*:0]const u8, bytes: []const u8) void {
@@ -143,7 +190,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer allocator.free(bytes);
         if (bytes.len < 1024) fail("transcode spool too small");
         if (!std.mem.eql(u8, bytes[4..8], "ftyp")) fail("spool is not an MP4");
-        if (std.mem.indexOf(u8, bytes, "moof") == null) fail("spool is not fragmented (no moof)");
+        // Two-second keyframe cadence: a 3s clip yields fragments at 0
+        // and 2s, so the player can start after two seconds of encode
+        // rather than x264's default ten.
+        if (std.mem.count(u8, bytes, "moof") < 2) fail("spool has fewer than two fragments (keyframe cadence)");
         // Decodable end to end: what the viewer will hand GStreamer.
         var spool_copy_buf: [160:0]u8 = undefined;
         const spool_copy = std.fmt.bufPrintZ(&spool_copy_buf, "{s}/spool.mp4", .{dir}) catch unreachable;
@@ -153,7 +203,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const full_len = bytes.len;
         const dur = remotestream.durationMs(stream);
         if (dur < 2_500 or dur > 3_500) fail("transcode stream did not report the source duration (~3000ms)");
-        if (!remotestream.isTranscoded(stream)) fail("transcode stream must report itself transcoded");
+        const td = remotestream.decision(stream) orelse fail("transcode stream must publish its decision");
+        if (td.route != .transcode) fail("transcode stream must report the transcode route");
+        if (td.encoderName().len == 0) fail("transcode stream must name the host encoder");
+        std.debug.print("smoke-stream: host encoder is {s}\n", .{td.encoderName()});
 
         // A time seek is a fresh encode from the offset: shorter output,
         // still a decodable fragmented MP4, same duration report.
@@ -169,16 +222,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         std.debug.print("smoke-stream: PASS seek (encode from 2000ms: {d} bytes, decodes, duration {d}ms)\n", .{ tail_bytes.len, dur });
     }
 
-    // ── raw mode: seekable, sized, byte-identical ────────────────
+    // ── direct route: seekable, sized, byte-identical ────────────
     {
-        const stream = remotestream.new(host, std.mem.span(clip.ptr), .raw, 0) orelse fail("new raw stream");
+        const stream = remotestream.new(host, std.mem.span(clip.ptr), .direct, 0) orelse fail("new direct stream");
         defer c.g_object_unref(@ptrCast(stream));
         const file_stream: *c.GFileInputStream = @ptrCast(stream);
-        if (c.g_seekable_can_seek(@ptrCast(stream)) == 0) fail("raw stream must be seekable");
+        if (c.g_seekable_can_seek(@ptrCast(stream)) == 0) fail("direct stream must be seekable");
         var err: [*c]c.GError = null;
         const info = c.g_file_input_stream_query_info(file_stream, "standard::size", null, &err) orelse fail("raw query_info");
         defer c.g_object_unref(info);
-        if (@as(u64, @intCast(c.g_file_info_get_size(info))) != clip_size) fail("raw size mismatch");
+        if (@as(u64, @intCast(c.g_file_info_get_size(info))) != clip_size) fail("direct size mismatch");
         const original = blk: {
             const f = c.fopen(clip.ptr, "rb") orelse fail("open fixture");
             defer _ = c.fclose(f);
@@ -187,9 +240,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             break :blk buf;
         };
         defer allocator.free(original);
-        const bytes = readAllStream(allocator, stream) catch fail("raw read");
+        const bytes = readAllStream(allocator, stream) catch fail("direct read");
         defer allocator.free(bytes);
-        if (!std.mem.eql(u8, bytes, original)) fail("raw stream differs from the file");
+        if (!std.mem.eql(u8, bytes, original)) fail("direct stream differs from the file");
         // Seek from the end (how qtdemux finds a trailing moov), then re-read.
         if (c.g_seekable_seek(@ptrCast(stream), -100, c.G_SEEK_END, null, &err) == 0) fail("seek end");
         if (@as(u64, @intCast(c.g_seekable_tell(@ptrCast(stream)))) != clip_size - 100) fail("tell after seek");
@@ -201,7 +254,59 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var head: [64]u8 = undefined;
         const n = c.g_input_stream_read(stream, &head, head.len, null, &err);
         if (n != 64 or !std.mem.eql(u8, head[0..64], original[10..74])) fail("read after seek set");
-        std.debug.print("smoke-stream: PASS raw (sized, seekable, byte-identical)\n", .{});
+        std.debug.print("smoke-stream: PASS direct (sized, seekable, byte-identical)\n", .{});
+
+        // ── auto route over a local socket: measured, and the original ──
+        const auto = remotestream.new(host, std.mem.span(clip.ptr), .auto, 0) orelse fail("new auto stream");
+        defer c.g_object_unref(@ptrCast(auto));
+        if (c.g_seekable_can_seek(@ptrCast(auto)) == 0) fail("auto stream over a local socket must be seekable (direct)");
+        const ad = remotestream.decision(auto) orelse fail("auto stream must publish its decision");
+        if (ad.route != .direct) fail("auto route over a local socket must be direct");
+        if (ad.link_kbps == 0) fail("auto route must have measured the link");
+        if (ad.bitrate_kbps == 0) fail("auto route must know the source bitrate (ffprobe on the host)");
+        const auto_bytes = readAllStream(allocator, auto) catch fail("auto read");
+        defer allocator.free(auto_bytes);
+        if (!std.mem.eql(u8, auto_bytes, original)) fail("auto (direct) stream differs from the file");
+        std.debug.print("smoke-stream: PASS auto (link {d} Mbit/s vs file {d} kbit/s -> direct)\n", .{ ad.link_kbps / 1000, ad.bitrate_kbps });
+    }
+
+    // ── spool throttle: an idle reader stops the encoder ─────────
+    {
+        // A longer clip, so the encode outlives the check; lead shrunk to
+        // what its spool reaches within the first progress events.
+        var long_buf: [160:0]u8 = undefined;
+        const long_clip = std.fmt.bufPrintZ(&long_buf, "{s}/long.mp4", .{dir}) catch unreachable;
+        if (!run(&[_:null]?[*:0]const u8{
+            "ffmpeg", "-nostdin", "-y",       "-v",       "error", "-f",   "lavfi", "-i", "testsrc=size=1920x1080:rate=30:duration=40",
+            "-c:v",   "libx264",  "-preset",  "ultrafast", "-pix_fmt", "yuv420p", long_clip.ptr, null,
+        })) fail("long fixture ffmpeg");
+        daemon_fsjobs.spool_lead = .{ .stop = 256 * 1024, .cont = 64 * 1024 };
+        defer daemon_fsjobs.spool_lead = .{ .stop = 12 << 20, .cont = 4 << 20 };
+        const stream = remotestream.new(host, std.mem.span(long_clip.ptr), .transcode, 0) orelse fail("new throttled stream");
+        defer c.g_object_unref(@ptrCast(stream));
+        var head: [4096]u8 = undefined;
+        var err: [*c]c.GError = null;
+        if (c.g_input_stream_read(stream, &head, head.len, null, &err) <= 0) fail("throttled head read");
+        const spool = spoolPath(allocator, spools_before) orelse fail("cannot find the throttled spool");
+        defer allocator.free(spool);
+        // Idle reader: the encoder runs past the lead and is stopped;
+        // the spool then stops growing while the encode is far from done.
+        var frozen = false;
+        var attempt: usize = 0;
+        while (attempt < 20 and !frozen) : (attempt += 1) {
+            const a = fileSize(spool);
+            sleepMs(500);
+            const b = fileSize(spool);
+            frozen = a == b and a > 0;
+        }
+        if (!frozen) fail("encoder kept writing with an idle reader (throttle did not stop it)");
+        const frozen_at = fileSize(spool);
+        // Resumed reader: reads advance the daemon's reader position,
+        // the encoder continues and the stream completes.
+        const rest = readAllStream(allocator, stream) catch fail("throttled tail read");
+        defer allocator.free(rest);
+        if (rest.len + head.len <= frozen_at) fail("throttled stream ended at the frozen size (encoder never resumed)");
+        std.debug.print("smoke-stream: PASS throttle (frozen at {d} bytes with an idle reader, {d} bytes after resume)\n", .{ frozen_at, rest.len + head.len });
     }
 
     // Dropping the streams closed their connections; the daemon must
