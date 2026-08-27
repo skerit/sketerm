@@ -1,5 +1,67 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-27: remote video plays the original when the link carries it
+
+Opening a video on a NAS from the file manager (Space -> Viewer) pegged
+the NAS CPU and showed a spinner for a minute: `viewer.zig` hardcoded
+"remote + video extension = host transcode", and the transcode was
+x264 software at the default 250-frame GOP, so the first fragment (and
+therefore the first frame) arrived after ten seconds of source had been
+encoded, at whatever speed a NAS decodes 4K HEVC in software. On a LAN
+that is the wrong rung of the ladder entirely: sshfs + VLC won because
+it moves bytes and decodes on the desktop.
+
+The Viewer now decides per file, Jellyfin-style. `remotestream.zig`
+takes a `Policy` (`auto` / `direct` / `transcode`; the config key
+`files_remote_video` IS that enum, declared core-side) and settles a
+`Route` on the streaming thread: `.auto` asks the host's media_meta
+(ffprobe, daemon-cached) for the bitrate, times the first megabyte of
+the original over the link, and plays the ORIGINAL through the local
+GStreamer when the link carries the bitrate with 1.5x headroom -- zero
+host CPU, the sample already being the first read-ahead window -- or
+asks for a host transcode when it does not. An unknown bitrate or an
+unmeasurable link means direct; a host without ffmpeg degrades to
+direct; a direct play the local decoder rejects (`notify::error`, e.g.
+no plugin for the codec) retries ONCE as a transcode before the poster.
+The status line names the route and the numbers ("original over the
+link (940.0 Mbit/s, file 22.3 Mbit/s)" / "transcoded on the host
+(vaapi)"), the hamburger has two check rows for it and T toggles the
+current item in place, keeping the position (a direct re-open seeks
+natively once prepared; a transcode restarts at the offset). The
+override sticks for the window; Preferences > Files > Viewer sets the
+default. `Mode.raw` was renamed `Route.direct`: "raw" invited the
+reading "uncompressed frames over the wire", which it never was.
+
+The transcode rung itself, for the links that need it: keyframes are
+forced every two seconds (`-force_key_frames`, so `frag_keyframe`
+closes a fragment every two seconds and playback starts after two
+seconds of encode, not ten); the helper probes VAAPI with a one-frame
+test encode and uses `h264_vaapi` when it works, falling back to x264
+if the GPU path fails before the first fragment -- the spool is only
+announced to the client (first progress event) once it holds more than
+the header, so the fallback rewrites the same spool with nobody having
+read a mismatched moov; the encoder name rides every event (`encoder`
+on the job wire). And the DAEMON throttles the encoder behind the
+reader: `fsRead` of a path under the spool prefix records the reader's
+position on the job, each progress line compares it with the spool
+size, and the helper's process group is SIGSTOPped once it is 12MB
+ahead and SIGCONTed (by the next read) when the reader is within 4MB.
+A paused viewer therefore idles the host instead of encoding the whole
+film; a client that dies still gets its stopped group SIGKILLed. Any
+non-progress line (done, error) releases the group -- a stop landing
+between the helper's last progress line and its exit had left one
+finished job unreaped with its spool on disk, which the smoke caught.
+
+`zig build smoke-stream` now also proves the auto route over a local
+socket (measured link, direct, byte-identical), the two-fragment
+cadence on a 3s clip, and the throttle with the lead shrunk to test
+size (`daemon_fsjobs.spool_lead`): an idle reader freezes a 40s
+encode's spool, a resumed one finishes the stream, and the spool is
+gone once the client goes. Not done: the remux rung (`-c copy` for a
+container the local demuxer lacks) -- without linking GStreamer the GUI
+cannot tell a missing demuxer from a missing decoder, and the error
+fallback lands on transcode for both, which plays.
+
 ## 2026-08-21: test scratch leaks closed; private MCP daemons retire themselves
 
 A day of suite runs had left ~1060 `/tmp/sketerm-*` directories and
