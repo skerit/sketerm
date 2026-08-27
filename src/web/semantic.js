@@ -245,14 +245,29 @@
   function fieldLabel(el) {
     if (el.id) {
       var lab = document.querySelector('label[for="' + cssEscape(el.id) + '"]');
-      if (lab) return textOf(lab);
+      if (lab) return labelText(lab);
     }
     var p = el.parentElement;
     while (p) {
-      if (p.tagName === "LABEL") return textOf(p);
+      if (p.tagName === "LABEL") return labelText(p);
       p = p.parentElement;
     }
     return "";
+  }
+
+  // A label's text WITHOUT the control it wraps: `<label>Tier
+  // <select><option>Free<option>Pro</select></label>` names the field
+  // "Tier", not "Tier FreePro".
+  var CONTROL_TAG = { INPUT: 1, SELECT: 1, TEXTAREA: 1, BUTTON: 1 };
+
+  function labelText(lab) {
+    var out = "";
+    for (var i = 0; i < lab.childNodes.length; i++) {
+      var n = lab.childNodes[i];
+      if (n.nodeType === 3) out += n.nodeValue;
+      else if (n.nodeType === 1 && !CONTROL_TAG[n.tagName]) out += " " + labelText(n) + " ";
+    }
+    return out.replace(/\s+/g, " ").trim();
   }
 
   function cssEscape(s) {
@@ -811,29 +826,41 @@
     send({ op: "setvalue", req: req, ok: 1, typeable: 0, msg: "" });
   }
 
-  function commitValue(req, eid) {
+  // The helper queues the keystrokes as trusted input and sends this
+  // command right after; the two race, and this script can run BEFORE
+  // the keys land (a connected control reading "" and no note, seen
+  // once in a hundred smoke runs). `want` is what was typed: the read
+  // waits, bounded, until it shows up in the value, then reports.
+  function commitValue(req, eid, want) {
     var el = elFor(eid);
     if (!el) return send({ op: "ack", req: req, ok: 0, msg: "unknown id" });
-    try {
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-    } catch (e) {}
-    // Report the value that LANDED, read after typing. A framework that
-    // re-created the control mid-typing leaves `el` detached reading ""
-    // while the keystrokes went to its successor - the focused element
-    // is then the honest thing to read, and the replacement itself is
-    // worth reporting (it is how input-recreation bugs surface).
-    var read = el;
-    var note = "";
-    if (!el.isConnected) {
-      var live = document.activeElement;
-      if (live && live.value !== undefined) {
-        read = live;
-        note = "the control was replaced while typing; this is its successor's value";
-      } else {
-        note = "the control was replaced while typing and nothing holds focus";
+    var deadline = Date.now() + 1500;
+    function attempt() {
+      // Report the value that LANDED, read after typing. A framework
+      // that re-created the control mid-typing leaves `el` detached
+      // reading "" while the keystrokes went to its successor - the
+      // focused element is then the honest thing to read, and the
+      // replacement itself is worth reporting (it is how
+      // input-recreation bugs surface).
+      var read = el;
+      var note = "";
+      if (!el.isConnected) {
+        var live = document.activeElement;
+        if (live && live.value !== undefined) {
+          read = live;
+          note = "the control was replaced while typing; this is its successor's value";
+        } else {
+          note = "the control was replaced while typing and nothing holds focus";
+        }
       }
+      var value = String(read.value === undefined ? (read.isContentEditable ? read.textContent : "") : read.value);
+      if (want && value.indexOf(want) < 0 && Date.now() < deadline) return setTimeout(attempt, 40);
+      try {
+        read.dispatchEvent(new Event("change", { bubbles: true }));
+      } catch (e) {}
+      send({ op: "ack", req: req, ok: 1, msg: value, note: note });
     }
-    send({ op: "ack", req: req, ok: 1, msg: String(read.value === undefined ? "" : read.value), note: note });
+    attempt();
   }
 
   function act(req, eid, action) {
@@ -972,10 +999,147 @@
         out.push("---");
       } else if (t === "IMG") {
         out.push("![" + (n.getAttribute("alt") || "") + "](" + (n.getAttribute("src") || "") + ")");
+      } else if (t === "TABLE" || TABLE_ROLES[roleAttr(n)]) {
+        table(n, out, entities);
+      } else if (t === "DL") {
+        definitions(n, out, entities);
+      } else if (t === "INPUT" || t === "SELECT" || t === "TEXTAREA") {
+        var fl = fieldLine(n);
+        if (fl) out.push(fl);
       } else {
+        // A custom element keeps its content in an open shadow root
+        // (a <pl-table>'s rows live there); the walk descends, so the
+        // reader must too, or an admin page reads as its heading alone.
+        if (n.shadowRoot && n.shadowRoot.children) markdown(n.shadowRoot, depth + 1, out, entities);
         markdown(n, depth + 1, out, entities);
       }
     }
+  }
+
+  // -- tables and forms: what an admin page is made of -------------
+  //
+  // Reader mode used to reduce a list page to its heading, because
+  // everything on it is a <table> or a form control and neither had a
+  // markdown rendering. A table becomes a pipe table (first row as the
+  // header), a <dl> a "term: definition" list, and a control a
+  // "label: value" line -- so web_read stays the cheap tool on the
+  // pages an agent actually spends its time on.
+
+  var TABLE_ROWS = 100;
+  // An ARIA table (a `role=table`/`grid` built from divs, the way a
+  // component library renders a list) has no <tr>/<td>; its rows and
+  // cells are found by role, through open shadow roots, stopping at a
+  // nested table so its rows stay its own.
+  var TABLE_ROLES = { table: 1, grid: 1, treegrid: 1 };
+  var ROW_ROLE = { row: 1 };
+  var CELL_ROLES = { cell: 1, gridcell: 1, columnheader: 1, rowheader: 1 };
+
+  function roleAttr(el) {
+    var r = el.getAttribute ? el.getAttribute("role") : null;
+    return r ? r.toLowerCase().split(/\s+/)[0] : "";
+  }
+
+  function isTableEl(el) {
+    return el.tagName === "TABLE" || !!TABLE_ROLES[roleAttr(el)];
+  }
+
+  // Descendants matching `want` (by tag set or role set), through open
+  // shadow roots, not descending into a match or a nested table.
+  function collectParts(root, isMatch, out, depth) {
+    if (depth > 32 || out.length >= 4000) return;
+    var kids = root.children || [];
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (hidden(k)) continue;
+      if (isMatch(k)) {
+        out.push(k);
+        continue;
+      }
+      if (isTableEl(k)) continue;
+      if (k.shadowRoot && k.shadowRoot.children) collectParts(k.shadowRoot, isMatch, out, depth + 1);
+      collectParts(k, isMatch, out, depth + 1);
+    }
+  }
+
+  function isRow(el) {
+    return el.tagName === "TR" || !!ROW_ROLE[roleAttr(el)];
+  }
+
+  function isCell(el) {
+    return el.tagName === "TD" || el.tagName === "TH" || !!CELL_ROLES[roleAttr(el)];
+  }
+
+  function tableRows(tbl) {
+    var out = [];
+    if (tbl.shadowRoot && tbl.shadowRoot.children) collectParts(tbl.shadowRoot, isRow, out, 0);
+    collectParts(tbl, isRow, out, 0);
+    return out;
+  }
+
+  function rowCells(row) {
+    var out = [];
+    if (row.shadowRoot && row.shadowRoot.children) collectParts(row.shadowRoot, isCell, out, 0);
+    collectParts(row, isCell, out, 0);
+    return out;
+  }
+
+  function cellText(cell, entities) {
+    return inline(cell, entities).replace(/\s+/g, " ").replace(/\|/g, "\\|").trim();
+  }
+
+  function table(tbl, out, entities) {
+    var rows = tableRows(tbl);
+    if (!rows.length) return;
+    var lines = [];
+    var caption = tbl.tagName === "TABLE" ? tbl.caption : null;
+    if (caption && textOf(caption)) lines.push("**" + textOf(caption) + "**");
+    else if (aria(tbl, "aria-label")) lines.push("**" + aria(tbl, "aria-label").trim() + "**");
+    var headerDone = false;
+    var shown = 0;
+    for (var r = 0; r < rows.length && shown < TABLE_ROWS; r++) {
+      var cells = rowCells(rows[r]);
+      var vals = [];
+      for (var c = 0; c < cells.length; c++) vals.push(cellText(cells[c], entities));
+      if (!vals.length) continue;
+      lines.push("| " + vals.join(" | ") + " |");
+      shown++;
+      if (!headerDone) {
+        var sep = "|";
+        for (var k = 0; k < vals.length; k++) sep += " --- |";
+        lines.push(sep);
+        headerDone = true;
+      }
+    }
+    if (rows.length > shown) lines.push("| ... and " + (rows.length - shown) + " more rows |");
+    out.push(lines.join("\n"));
+  }
+
+  function definitions(dl, out, entities) {
+    var lines = [];
+    var term = "";
+    for (var i = 0; i < dl.children.length; i++) {
+      var n = dl.children[i];
+      if (hidden(n)) continue;
+      if (n.tagName === "DT") term = inline(n, entities).trim();
+      else if (n.tagName === "DD") lines.push("- " + (term ? term + ": " : "") + inline(n, entities).trim());
+    }
+    if (lines.length) out.push(lines.join("\n"));
+  }
+
+  function fieldLine(el) {
+    var role = roleOf(el);
+    if (!role) return "";
+    var name = nameOf(el, role);
+    if (el.tagName === "INPUT") {
+      var t = (el.getAttribute("type") || "text").toLowerCase();
+      if (t === "submit" || t === "button" || t === "reset" || t === "image" || t === "file") return "";
+      if (t === "checkbox" || t === "radio") return "- [" + (el.checked ? "x" : " ") + "] " + (name || role);
+    }
+    var v = valueOf(el);
+    if (el.tagName === "SELECT" && el.selectedIndex >= 0 && el.options[el.selectedIndex]) {
+      v = textOf(el.options[el.selectedIndex]) || v;
+    }
+    return "- " + (name || role) + ": " + (v ? v : "(empty)");
   }
 
   function read(req, withIds) {
@@ -2188,7 +2352,7 @@
         setValue(m.req, m.eid, m.arg || "");
         break;
       case "commit":
-        commitValue(m.req, m.eid);
+        commitValue(m.req, m.eid, m.want || "");
         break;
       case "expand":
         expand(m.req, m.eid, m.off || 0, m.len || 4096);

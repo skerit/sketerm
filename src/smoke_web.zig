@@ -284,11 +284,31 @@ const shared_nav =
 const nav_page_a = "data:text/html,<html><body>" ++ shared_nav ++ "<h1>Alpha Page</h1></body></html>";
 const nav_page_b = "data:text/html,<html><body>" ++ shared_nav ++ "<h1>Beta Page</h1></body></html>";
 
+/// A page whose confirmation dialog makes everything else inert
+/// (aria-hidden), the way a modal does: the walk stops listing the
+/// page while the dialog is up and lists it again afterwards.
+const modal_page =
+    "data:text/html,<html><head><title>Hosts</title></head><body>" ++
+    "<nav id=n><a href=%23a>Dashboard</a><a href=%23b>Hosts</a><a href=%23c>Settings</a></nav>" ++
+    "<main id=m><h1>Hosts</h1><button>Delete</button></main>" ++
+    "<div id=dlg role=alertdialog aria-label=Confirm style=display:none><p>Delete this host?</p>" ++
+    "<button>Cancel</button><button>Confirm</button></div>" ++
+    "<script>function openDlg(){n.setAttribute('aria-hidden','true');m.setAttribute('aria-hidden','true');" ++
+    "dlg.style.display='block';}function closeDlg(){n.removeAttribute('aria-hidden');" ++
+    "m.removeAttribute('aria-hidden');dlg.style.display='none';}</script></body></html>";
+
 const article_page =
     "data:text/html,<html><head><title>Journal</title></head><body>" ++
     "<nav><a href=%23x>Nav One</a><a href=%23y>Nav Two</a></nav>" ++
     "<article><h1>Article Heading</h1><p>" ++ long_text ++ "</p>" ++
-    "<p>A second paragraph so the extractor has real text density.</p></article>" ++
+    "<p>A second paragraph so the extractor has real text density.</p>" ++
+    "<table><tr><th>Name</th><th>Type</th></tr><tr><td>local</td><td>Docker</td></tr>" ++
+    "<tr><td>remote</td><td>SSH</td></tr></table>" ++
+    "<label>Owner <input value=jelle></label>" ++
+    "<label>Tier <select><option>Free</option><option selected>Pro</option></select></label>" ++
+    "<label><input type=checkbox checked> Enabled</label>" ++
+    "<div role=table aria-label=Fleet><div role=row><span role=columnheader>Host</span></div>" ++
+    "<div role=row><span role=cell>aria cell</span></div></div></article>" ++
     "</body></html>";
 
 /// Rich reader proof: the only actionable node returned by reader mode
@@ -6485,6 +6505,56 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     }
     pass("stage 11 cross-navigation id carrying");
 
+    // ── Stage 11b: a modal hides the page; closing it restores ids ─
+    // The differ binds ids to the element for the document's lifetime,
+    // so the chrome that a modal made inert comes back under its old
+    // ids and is summarised on one line instead of re-sent in full.
+    cl.navigate(modal_page);
+    // A query BEFORE any walk of this document solicits one instead of
+    // answering "no snapshot yet": act-by-name right after an open with
+    // the first snapshot skipped must not cost a snapshot turn.
+    {
+        const seq = cl.query_seq;
+        cl.send(proto.SemQueryReq{ .view = view_id, .kind = @intFromEnum(proto.SemQuery.find_text), .arg = "Hosts" });
+        if (!cl.waitSeq(&cl.query_seq, seq, 20_000)) fail("stage 11b modal: no sem_query_result before the first walk");
+        if (std.mem.indexOf(u8, cl.queryPayload(), "link \"Hosts\"") == null) {
+            std.debug.print("smoke-web: query result was:\n{s}\n", .{cl.queryPayload()});
+            fail("stage 11b modal: a query before the first walk did not solicit one");
+        }
+    }
+    cl.resetSem();
+    cl.snapshot(@intFromEnum(proto.SnapMode.full), 1);
+    if (!cl.waitSem("link \"Hosts\"", 20_000)) fail("stage 11b modal: no snapshot of the page");
+    const hosts_link = cl.idOfLine("link \"Hosts\"") orelse fail("stage 11b modal: no id for the nav link");
+    _ = cl.evalWait("openDlg(); 1", false, 20_000);
+    cl.resetSem();
+    cl.snapshot(@intFromEnum(proto.SnapMode.auto), 1);
+    if (!cl.waitSem("alertdialog", 20_000)) fail("stage 11b modal: the dialog never appeared in a snapshot");
+    if (std.mem.indexOf(u8, cl.semLog(), "link \"Hosts\"") != null) fail("stage 11b modal: inert chrome was still listed");
+    _ = cl.evalWait("closeDlg(); 1", false, 20_000);
+    // A peek in between (what web_wait polls with) must not consume
+    // the base: the restore is still owed to the next real snapshot.
+    cl.resetSem();
+    cl.snapshot(@intFromEnum(proto.SnapMode.peek), 1);
+    if (std.mem.indexOf(u8, cl.semLog(), "restored") != null or std.mem.indexOf(u8, cl.semLog(), "[") != null)
+        fail("stage 11b modal: a peek snapshot carried tree content");
+    cl.resetSem();
+    cl.snapshot(@intFromEnum(proto.SnapMode.auto), 1);
+    if (!cl.waitSem("restored unchanged:", 20_000)) {
+        std.debug.print("smoke-web: post-close payload was:\n{s}\n", .{cl.semLog()});
+        fail("stage 11b modal: closing the dialog did not report the page as restored");
+    }
+    if (std.mem.indexOf(u8, cl.semLog(), "+ [") != null) fail("stage 11b modal: restored chrome was re-sent as additions");
+    if (std.mem.indexOf(u8, cl.semLog(), "- [") == null) fail("stage 11b modal: the dialog's removal was not reported");
+    cl.resetSem();
+    cl.snapshot(@intFromEnum(proto.SnapMode.full), 1);
+    if (!cl.waitSem("link \"Hosts\"", 20_000)) fail("stage 11b modal: no snapshot after the dialog closed");
+    {
+        const after = cl.idOfLine("link \"Hosts\"") orelse fail("stage 11b modal: no id after the dialog closed");
+        if (after != hosts_link) fail("stage 11b modal: the nav link did not keep its id across the modal");
+    }
+    pass("stage 11b modal hide/restore");
+
     // ── Stage 12: reader-mode extraction ───────────────────────────
     cl.navigate(article_page);
     {
@@ -6498,6 +6568,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
         if (std.mem.indexOf(u8, markdown, "second paragraph") == null) {
             fail("stage 12 sem_read: the article body is missing from the markdown");
+        }
+        // Tables and form controls are what an admin page is made of;
+        // reader mode used to reduce such a page to its heading.
+        if (std.mem.indexOf(u8, markdown, "| Name | Type |\n| --- | --- |\n| local | Docker |\n| remote | SSH |") == null) {
+            std.debug.print("smoke-web: markdown was:\n{s}\n", .{markdown});
+            fail("stage 12 sem_read: the table is missing from the markdown");
+        }
+        // A component library's list is an ARIA table built from divs.
+        if (std.mem.indexOf(u8, markdown, "**Fleet**\n| Host |\n| --- |\n| aria cell |") == null) {
+            std.debug.print("smoke-web: markdown was:\n{s}\n", .{markdown});
+            fail("stage 12 sem_read: the ARIA table is missing from the markdown");
+        }
+        if (std.mem.indexOf(u8, markdown, "- Owner: jelle") == null or
+            std.mem.indexOf(u8, markdown, "- Tier: Pro") == null or
+            std.mem.indexOf(u8, markdown, "- [x] Enabled") == null)
+        {
+            std.debug.print("smoke-web: markdown was:\n{s}\n", .{markdown});
+            fail("stage 12 sem_read: form controls are missing from the markdown");
         }
     }
     pass("stage 12 sem_read");

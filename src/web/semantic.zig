@@ -162,15 +162,25 @@ const Node = struct {
     guard: []u8,
 };
 
-/// A node as the CLIENT last received it: just enough to diff against
-/// and to describe a removal.
+/// A node as the CLIENT last received it: enough to diff against, to
+/// describe a removal, and to recognise a node that LEFT the tree and
+/// came back unchanged (`present` false = seen earlier, gone since).
 const BaseNode = struct {
     sid: u32,
+    parent_sid: u32,
     role: []u8,
     name: []u8,
     value: []u8,
     states: []u8,
+    present: bool,
+    /// Document generation the node was last present in; absent
+    /// entries older than the previous document are purged.
+    doc_gen: u32,
 };
+
+/// Absent base entries kept for a long-lived document before the
+/// oldest are dropped; past this a restored node reads as added.
+const ABSENT_CAP = 20_000;
 
 /// Parse a walk emitted by the injected script.
 pub fn parseTree(gpa: std.mem.Allocator, json: []const u8) !std.json.Parsed(InTree) {
@@ -188,6 +198,19 @@ pub const View = struct {
     doc_token: u32 = 0,
     url: []u8 = &.{},
     has_tree: bool = false,
+    /// Engine-local id -> stable id for the CURRENT document, kept for
+    /// the document's lifetime rather than only while the node is in
+    /// the tree: an element a modal makes inert (aria-hidden) leaves
+    /// the walk and comes back as the same element, and must keep its
+    /// id instead of reading as removed-then-added.
+    eid_sids: std.AutoHashMap(u32, u32),
+    /// The PREVIOUS document's final tree, kept as carry candidates for
+    /// every walk of the new document (not only its first): an app
+    /// that renders its shell a moment after the context is created
+    /// has nothing else to carry from. `prev_used` marks claimed nodes
+    /// so two look-alikes cannot inherit one id.
+    prev: std.ArrayList(Node) = .empty,
+    prev_used: []bool = &.{},
 
     /// The tree as last CONSUMED (sent to the client); the diff base.
     base: std.ArrayList(BaseNode) = .empty,
@@ -199,17 +222,27 @@ pub const View = struct {
     hist: std.ArrayList(u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) View {
-        return .{ .gpa = gpa };
+        return .{ .gpa = gpa, .eid_sids = std.AutoHashMap(u32, u32).init(gpa) };
     }
 
     pub fn deinit(self: *View) void {
         for (self.nodes.items) |*n| self.freeNode(n);
         self.nodes.deinit(self.gpa);
+        self.dropPrev();
+        self.eid_sids.deinit();
         for (self.base.items) |*b| self.freeBase(b);
         self.base.deinit(self.gpa);
         self.hist.deinit(self.gpa);
         if (self.url.len != 0) self.gpa.free(self.url);
         self.url = &.{};
+    }
+
+    fn dropPrev(self: *View) void {
+        for (self.prev.items) |*n| self.freeNode(n);
+        self.prev.deinit(self.gpa);
+        self.prev = .empty;
+        if (self.prev_used.len != 0) self.gpa.free(self.prev_used);
+        self.prev_used = &.{};
     }
 
     /// Forget the current document without reusing its stable ids or
@@ -359,24 +392,51 @@ pub const View = struct {
         const fps = try arena.alloc(u64, n);
         try fingerprints(arena, in.nodes, parents, fps);
 
+        // A new document retires the live tree into the carry pool: the
+        // old document's nodes stay pairable for every walk of the new
+        // one, and its engine-id bindings are meaningless now.
+        if (new_doc and self.has_tree) {
+            self.dropPrev();
+            self.prev = self.nodes;
+            self.nodes = .empty;
+            self.prev_used = try self.gpa.alloc(bool, self.prev.items.len);
+            @memset(self.prev_used, false);
+            self.eid_sids.clearRetainingCapacity();
+        }
+        // What the delta is computed against: the tree the client's
+        // ids currently name (the pool, on the first walk of a new
+        // document).
+        const old_nodes: []const Node = if (new_doc) self.prev.items else self.nodes.items;
+
         // Stable-id assignment.
         const sids = try arena.alloc(u32, n);
         @memset(sids, 0);
         var carried: usize = 0;
         if (!new_doc) {
-            for (in.nodes, 0..) |nd, i| sids[i] = self.sidFor(nd.id);
+            for (in.nodes, 0..) |nd, i| sids[i] = self.eid_sids.get(nd.id) orelse 0;
             // Fresh DOM nodes with old content: a re-render of the same
             // rows must keep their ids (anchored, so it cannot pair a
             // node into a different part of the page).
             if (self.has_tree) _ = try self.carryIntraDoc(arena, in.nodes, parents, fps, sids);
-        } else if (self.has_tree) {
+        }
+        if (self.prev.items.len != 0) {
             carried = try self.carrySubtrees(arena, in.nodes, parents, fps, sids);
+        }
+        // One id names one element per walk. A hidden element whose id
+        // was meanwhile carried to a re-rendered look-alike, then both
+        // show up together: the first in document order keeps the id.
+        var claimed = std.AutoHashMap(u32, void).init(arena);
+        for (sids) |*s| {
+            if (s.* == 0) continue;
+            const gop = try claimed.getOrPut(s.*);
+            if (gop.found_existing) s.* = 0;
         }
         for (sids) |*s| {
             if (s.* != 0) continue;
             s.* = self.next_sid;
             self.next_sid += 1;
         }
+        for (in.nodes, 0..) |nd, i| try self.eid_sids.put(nd.id, sids[i]);
 
         // Delta records, captured against the OLD live tree before it
         // goes.
@@ -386,13 +446,16 @@ pub const View = struct {
         var carry_lo: u32 = 0;
         var carry_hi: u32 = 0;
 
+        var old_by_sid = std.AutoHashMap(u32, usize).init(arena);
+        for (old_nodes, 0..) |o, j| try old_by_sid.put(o.sid, j);
+
         for (in.nodes, 0..) |nd, i| {
-            const old = self.findSid(sids[i]);
-            if (old == null) {
+            const oj = old_by_sid.get(sids[i]);
+            if (oj == null) {
                 try added.append(arena, i);
                 continue;
             }
-            const o = old.?;
+            const o = old_nodes[oj.?];
             if (new_doc) {
                 if (carry_lo == 0 or sids[i] < carry_lo) carry_lo = sids[i];
                 if (sids[i] > carry_hi) carry_hi = sids[i];
@@ -404,15 +467,8 @@ pub const View = struct {
             ch.states = !std.mem.eql(u8, o.states, nd.states);
             if (ch.role or ch.name or ch.value or ch.states) try changed.append(arena, ch);
         }
-        for (self.nodes.items) |o| {
-            var still = false;
-            for (sids) |s| {
-                if (s == o.sid) {
-                    still = true;
-                    break;
-                }
-            }
-            if (still) continue;
+        for (old_nodes) |o| {
+            if (claimed.contains(o.sid)) continue;
             try removed.append(arena, .{
                 .sid = o.sid,
                 .role = try arena.dupe(u8, o.role),
@@ -511,40 +567,154 @@ pub const View = struct {
         };
     }
 
-    /// Deep-copy the live tree into the base and drop the replay: the
+    /// Advance the base to the live tree and drop the replay: the
     /// client is now up to date with everything before this point.
+    /// Entries for nodes that LEFT the tree are kept (marked absent)
+    /// so a node that comes back unchanged is recognised as restored
+    /// rather than re-sent; they are purged once a document older than
+    /// the previous one, or past `ABSENT_CAP`.
     fn commitBase(self: *View) !void {
-        for (self.base.items) |*b| self.freeBase(b);
-        self.base.clearRetainingCapacity();
-        try self.base.ensureTotalCapacity(self.gpa, self.nodes.items.len);
-        for (self.nodes.items) |nd| {
-            const role = try self.gpa.dupe(u8, nd.role);
-            errdefer self.gpa.free(role);
-            const name = try self.gpa.dupe(u8, nd.name);
-            errdefer self.gpa.free(name);
-            const value = try self.gpa.dupe(u8, nd.value);
-            errdefer self.gpa.free(value);
-            const states = try self.gpa.dupe(u8, nd.states);
-            self.base.appendAssumeCapacity(.{
-                .sid = nd.sid,
-                .role = role,
-                .name = name,
-                .value = value,
-                .states = states,
-            });
-        }
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        var index = try self.baseIndex(arena_state.allocator());
+        for (self.base.items) |*b| b.present = false;
+        for (self.nodes.items) |nd| try self.upsertBase(&index, nd);
+        try self.purgeAbsent();
         self.base_rev = self.rev;
         self.base_doc_gen = self.doc_gen;
         self.base_ok = true;
         self.hist.clearRetainingCapacity();
     }
 
+    /// sid -> position in `base`, so a commit is linear in the tree.
+    fn baseIndex(self: *const View, arena: std.mem.Allocator) !std.AutoHashMap(u32, usize) {
+        var index = std.AutoHashMap(u32, usize).init(arena);
+        for (self.base.items, 0..) |b, i| try index.put(b.sid, i);
+        return index;
+    }
+
+    fn upsertBase(self: *View, index: *std.AutoHashMap(u32, usize), nd: Node) !void {
+        const role = try self.gpa.dupe(u8, nd.role);
+        errdefer self.gpa.free(role);
+        const name = try self.gpa.dupe(u8, nd.name);
+        errdefer self.gpa.free(name);
+        const value = try self.gpa.dupe(u8, nd.value);
+        errdefer self.gpa.free(value);
+        const states = try self.gpa.dupe(u8, nd.states);
+        errdefer self.gpa.free(states);
+        const entry = BaseNode{
+            .sid = nd.sid,
+            .parent_sid = nd.parent_sid,
+            .role = role,
+            .name = name,
+            .value = value,
+            .states = states,
+            .present = true,
+            .doc_gen = self.doc_gen,
+        };
+        if (index.get(nd.sid)) |i| {
+            self.freeBase(&self.base.items[i]);
+            self.base.items[i] = entry;
+            return;
+        }
+        try index.put(nd.sid, self.base.items.len);
+        try self.base.append(self.gpa, entry);
+    }
+
+    fn purgeAbsent(self: *View) !void {
+        var absent: usize = 0;
+        for (self.base.items) |b| {
+            if (!b.present) absent += 1;
+        }
+        var keep: std.ArrayList(BaseNode) = .empty;
+        errdefer keep.deinit(self.gpa);
+        try keep.ensureTotalCapacity(self.gpa, self.base.items.len);
+        // The list is in first-seen order, so dropping from the front
+        // drops the oldest absent entries first.
+        var over = absent -| ABSENT_CAP;
+        for (self.base.items) |*b| {
+            const stale = !b.present and b.doc_gen + 1 < self.doc_gen;
+            if (stale or (!b.present and over > 0)) {
+                if (!stale) over -= 1;
+                self.freeBase(b);
+                continue;
+            }
+            keep.appendAssumeCapacity(b.*);
+        }
+        self.base.deinit(self.gpa);
+        self.base = keep;
+    }
+
+    /// A scoped snapshot: the subtree under `root_sid` rendered in
+    /// full, and the base advanced for THAT subtree only — the caller
+    /// saw those nodes, not the rest of the page, so a later delta
+    /// still reports everything outside it. Unknown root: the whole
+    /// tree, consumed.
+    pub fn consumeScoped(self: *View, root_sid: u32) ![]u8 {
+        const root = self.findSid(root_sid) orelse {
+            const up = try self.consume(.full);
+            return up.text;
+        };
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var out: std.Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        const w = &out.writer;
+        try w.print("doc {d} rev {d} url {s} scope [{d}]\n", .{ self.doc_gen, self.rev, self.url, root_sid });
+        var in_scope = std.AutoHashMap(u32, void).init(arena);
+        for (self.nodes.items) |nd| {
+            if (nd.sid != root_sid and !self.descends(nd, root_sid)) continue;
+            try in_scope.put(nd.sid, {});
+            try w.splatByteAll(' ', @as(usize, nd.depth -| root.depth) * 2);
+            try writeNodeLine(w, nd);
+            try w.writeByte('\n');
+        }
+        // Base nodes that sat under the root (by the base's own parent
+        // chain) and are no longer live in the subtree are absent now.
+        var base_by_sid = try self.baseIndex(arena);
+        for (self.base.items) |*b| {
+            if (!b.present or in_scope.contains(b.sid)) continue;
+            var cur = b.parent_sid;
+            var guard: usize = 0;
+            while (cur != 0 and guard < 512) : (guard += 1) {
+                if (cur == root_sid) {
+                    b.present = false;
+                    break;
+                }
+                const bi = base_by_sid.get(cur) orelse break;
+                cur = self.base.items[bi].parent_sid;
+            }
+        }
+        for (self.nodes.items) |nd| {
+            if (in_scope.contains(nd.sid)) try self.upsertBase(&base_by_sid, nd);
+        }
+        // `base_ok` is left alone: a first-ever consume that is scoped
+        // has not shown the rest of the page, and the next unscoped
+        // snapshot restates it in full through that gate.
+        return self.gpa.dupe(u8, out.written());
+    }
+
     const Coalesced = struct { text: []u8, changes: usize, carried: usize, full: bool };
+
+    /// Whether the client's copy of a node still describes the live one.
+    fn sameContent(b: BaseNode, nd: Node) bool {
+        return std.mem.eql(u8, b.role, nd.role) and std.mem.eql(u8, b.name, nd.name) and
+            std.mem.eql(u8, b.value, nd.value) and std.mem.eql(u8, b.states, nd.states);
+    }
 
     /// One delta from the base straight to the live tree. Falls back to
     /// a full restatement (`full = true`, text still owned) when a
-    /// document change carried too little or the delta would rival the
-    /// tree itself.
+    /// document change carried too little or the delta would not be
+    /// shorter than the tree itself.
+    ///
+    /// A node the client saw earlier, then lost (a modal made it
+    /// inert, a route hid it), then got back UNCHANGED is not re-sent:
+    /// its subtree root is named on one `restored unchanged:` line.
+    /// Removals are folded to subtree roots with a descendant count,
+    /// and a superseded document's nodes to a single count — the
+    /// client is never handed a page it has already left.
     fn renderCoalesced(self: *View) !Coalesced {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -552,17 +722,20 @@ pub const View = struct {
 
         var base_by_sid = std.AutoHashMap(u32, usize).init(arena);
         for (self.base.items, 0..) |b, i| try base_by_sid.put(b.sid, i);
-        var live_sids = std.AutoHashMap(u32, void).init(arena);
-        for (self.nodes.items) |nd| try live_sids.put(nd.sid, {});
+        var live_by_sid = std.AutoHashMap(u32, usize).init(arena);
+        for (self.nodes.items, 0..) |nd, i| try live_by_sid.put(nd.sid, i);
 
+        const Cls = enum { add, same, mod, restored, restored_mod };
+        const n = self.nodes.items.len;
+        const cls = try arena.alloc(Cls, n);
         var adds: usize = 0;
         var mods: usize = 0;
-        var gone: usize = 0;
         var shared: usize = 0;
         var carry_lo: u32 = 0;
         var carry_hi: u32 = 0;
-        for (self.nodes.items) |nd| {
+        for (self.nodes.items, 0..) |nd, i| {
             const bi = base_by_sid.get(nd.sid) orelse {
+                cls[i] = .add;
                 adds += 1;
                 continue;
             };
@@ -570,22 +743,70 @@ pub const View = struct {
             if (carry_lo == 0 or nd.sid < carry_lo) carry_lo = nd.sid;
             if (nd.sid > carry_hi) carry_hi = nd.sid;
             const b = self.base.items[bi];
-            if (!std.mem.eql(u8, b.role, nd.role) or !std.mem.eql(u8, b.name, nd.name) or
-                !std.mem.eql(u8, b.value, nd.value) or !std.mem.eql(u8, b.states, nd.states))
-            {
-                mods += 1;
+            const same = sameContent(b, nd);
+            if (b.present) {
+                cls[i] = if (same) .same else .mod;
+            } else {
+                cls[i] = if (same) .restored else .restored_mod;
             }
-        }
-        for (self.base.items) |b| {
-            if (!live_sids.contains(b.sid)) gone += 1;
+            if (!same) mods += 1;
         }
 
-        const n = self.nodes.items.len;
-        const changes = adds + mods + gone;
+        // Removals: base nodes that were present and are not live,
+        // folded to the roots of removed subtrees.
+        var gone_set = std.AutoHashMap(u32, void).init(arena);
+        for (self.base.items) |b| {
+            if (b.present and !live_by_sid.contains(b.sid)) try gone_set.put(b.sid, {});
+        }
+        var gone_desc = std.AutoHashMap(u32, usize).init(arena); // root sid -> descendants
+        var gone_total: usize = 0;
+        for (self.base.items) |b| {
+            if (!gone_set.contains(b.sid)) continue;
+            gone_total += 1;
+            var root = b.sid;
+            var cur = b.parent_sid;
+            var guard: usize = 0;
+            while (cur != 0 and gone_set.contains(cur) and guard < 512) : (guard += 1) {
+                root = cur;
+                const pi = base_by_sid.get(cur) orelse break;
+                cur = self.base.items[pi].parent_sid;
+            }
+            const gop = try gone_desc.getOrPut(root);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            if (root != b.sid) gop.value_ptr.* += 1;
+        }
+        const gone_roots = gone_desc.count();
+
+        // Restored-unchanged subtrees, rooted where the live parent is
+        // not itself restored unchanged.
+        var restored_desc = std.AutoHashMap(u32, usize).init(arena);
+        for (self.nodes.items, 0..) |nd, i| {
+            if (cls[i] != .restored) continue;
+            var root = nd.sid;
+            var cur = nd.parent_sid;
+            var guard: usize = 0;
+            while (cur != 0 and guard < 512) : (guard += 1) {
+                const pi = live_by_sid.get(cur) orelse break;
+                if (cls[pi] != .restored) break;
+                root = cur;
+                cur = self.nodes.items[pi].parent_sid;
+            }
+            const gop = try restored_desc.getOrPut(root);
+            if (!gop.found_existing) gop.value_ptr.* = 0;
+            if (root != nd.sid) gop.value_ptr.* += 1;
+        }
+        const restored_roots = restored_desc.count();
+
+        // Full only when the delta would not be SHORTER than the tree.
+        // There is deliberately no carry-ratio rule here any more: a new
+        // document that carried only its chrome still saves every one
+        // of those lines, and a delta never re-sends a carried node.
         const doc_moved = self.doc_gen != self.base_doc_gen;
-        if (doc_moved and shared * carry_full_den < n * carry_full_num)
-            return .{ .text = try self.renderFull(), .changes = changes, .carried = shared, .full = true };
-        if (n != 0 and changes >= n)
+        const changes = adds + mods + gone_roots;
+        var delta_lines = adds + mods;
+        delta_lines += if (doc_moved) @intFromBool(gone_total != 0) else gone_roots;
+        delta_lines += @intFromBool(restored_roots != 0);
+        if (n != 0 and delta_lines >= n)
             return .{ .text = try self.renderFull(), .changes = changes, .carried = shared, .full = true };
 
         var out: std.Io.Writer.Allocating = .init(self.gpa);
@@ -595,36 +816,67 @@ pub const View = struct {
         if (doc_moved and shared != 0) {
             try w.print("carried [{d}..{d}] {d} nodes\n", .{ carry_lo, carry_hi, shared });
         }
+        if (doc_moved and gone_total != 0) {
+            try w.print("previous document dropped ({d} nodes)\n", .{gone_total});
+        }
+        if (restored_roots != 0) {
+            try w.writeAll("restored unchanged:");
+            var first = true;
+            for (self.nodes.items) |nd| {
+                const desc = restored_desc.get(nd.sid) orelse continue;
+                try w.writeAll(if (first) " " else ", ");
+                first = false;
+                try w.print("[{d}] {s}", .{ nd.sid, nd.role });
+                if (nd.name.len != 0) try w.print(" \"{s}\"", .{nd.name});
+                try w.print(" ({d} nodes)", .{desc + 1});
+            }
+            try w.writeByte('\n');
+        }
+        // Added nodes nest under an added parent by indentation, the
+        // way the full tree does; `under` names only a parent the client
+        // already has, once per run of siblings.
         var last_parent: u32 = 0;
-        for (self.nodes.items) |nd| {
-            if (base_by_sid.contains(nd.sid)) continue;
-            if (nd.parent_sid != 0 and nd.parent_sid != last_parent) {
-                if (self.findSid(nd.parent_sid)) |p| {
+        var add_indent = std.AutoHashMap(u32, usize).init(arena);
+        for (self.nodes.items, 0..) |nd, i| {
+            if (cls[i] != .add) continue;
+            var indent: usize = 0;
+            const parent_added = if (live_by_sid.get(nd.parent_sid)) |pi| cls[pi] == .add else false;
+            if (parent_added) {
+                indent = (add_indent.get(nd.parent_sid) orelse 0) + 2;
+            } else if (nd.parent_sid != 0 and nd.parent_sid != last_parent) {
+                if (live_by_sid.get(nd.parent_sid)) |pi| {
+                    const p = self.nodes.items[pi];
                     try w.print("under [{d}] {s} \"{s}\"\n", .{ p.sid, p.role, p.name });
                 }
                 last_parent = nd.parent_sid;
             }
+            try add_indent.put(nd.sid, indent);
             try w.writeAll("+ ");
+            try w.splatByteAll(' ', indent);
             try writeNodeLine(w, nd);
             try w.writeByte('\n');
         }
-        for (self.base.items) |b| {
-            if (live_sids.contains(b.sid)) continue;
-            try w.print("- [{d}] {s} \"{s}\"\n", .{ b.sid, b.role, b.name });
+        if (!doc_moved) {
+            for (self.base.items) |b| {
+                const desc = gone_desc.get(b.sid) orelse continue;
+                try w.print("- [{d}] {s} \"{s}\"", .{ b.sid, b.role, b.name });
+                if (desc != 0) try w.print(" (+{d} descendants)", .{desc});
+                try w.writeByte('\n');
+            }
         }
-        for (self.nodes.items) |nd| {
-            const bi = base_by_sid.get(nd.sid) orelse continue;
-            const b = self.base.items[bi];
+        for (self.nodes.items, 0..) |nd, i| {
+            if (cls[i] != .mod and cls[i] != .restored_mod) continue;
+            const b = self.base.items[base_by_sid.get(nd.sid).?];
             const d_role = !std.mem.eql(u8, b.role, nd.role);
             const d_name = !std.mem.eql(u8, b.name, nd.name);
             const d_value = !std.mem.eql(u8, b.value, nd.value);
             const d_states = !std.mem.eql(u8, b.states, nd.states);
-            if (!d_role and !d_name and !d_value and !d_states) continue;
             try w.print("~ [{d}] {s} \"{s}\"", .{ nd.sid, nd.role, nd.name });
             if (d_role) try w.print(" role={s}", .{nd.role});
             if (d_name) try w.print(" name=\"{s}\"", .{nd.name});
             if (d_value) try w.print(" value=\"{s}\"", .{nd.value});
             if (d_states) try w.print(" states=({s})", .{nd.states});
+            if (cls[i] == .restored_mod) try w.writeAll(" (restored)");
             try w.writeByte('\n');
         }
         return .{
@@ -685,38 +937,29 @@ pub const View = struct {
         return out;
     }
 
-    /// Index of the old (live) node carrying `sid`, or null.
-    fn oldIndexOfSid(self: *const View, sid: u32) ?usize {
-        for (self.nodes.items, 0..) |o, j| {
-            if (o.sid == sid) return j;
-        }
-        return null;
-    }
-
-    /// Parent indices and child lists of the OLD live tree, in document
+    /// Parent indices and child lists of an OLD tree, in document
     /// order; shared by both carry passes.
-    fn oldChildLists(self: *const View, arena: std.mem.Allocator) ![][]const usize {
-        const m = self.nodes.items.len;
+    fn oldChildLists(arena: std.mem.Allocator, old: []const Node) ![][]const usize {
+        const m = old.len;
+        var by_sid = std.AutoHashMap(u32, usize).init(arena);
+        for (old, 0..) |o, j| try by_sid.put(o.sid, j);
         const old_parents = try arena.alloc(usize, m);
-        for (self.nodes.items, 0..) |o, i| {
+        for (old, 0..) |o, i| {
             old_parents[i] = m;
             if (o.parent_sid == 0) continue;
-            for (self.nodes.items, 0..) |p, j| {
-                if (p.sid == o.parent_sid) {
-                    old_parents[i] = j;
-                    break;
-                }
-            }
+            if (by_sid.get(o.parent_sid)) |j| old_parents[i] = j;
         }
         return childLists(arena, m, old_parents, m);
     }
 
-    /// Carry stable ids onto identical subtrees of a NEW document.
+    /// Carry stable ids onto identical subtrees of a NEW document, from
+    /// the previous document's pool.
     ///
     /// Matching is by fingerprint and top-down: the first (outermost)
-    /// unused old node with the same fingerprint wins, and its children
+    /// unused pool node with the same fingerprint wins, and its children
     /// pair positionally — equal fingerprints mean equal subtrees, so
-    /// the pairing cannot drift. Returns the number of nodes carried.
+    /// the pairing cannot drift. A claimed pool node stays claimed for
+    /// the pool's lifetime. Returns the number of nodes carried.
     fn carrySubtrees(
         self: *View,
         arena: std.mem.Allocator,
@@ -726,24 +969,23 @@ pub const View = struct {
         sids: []u32,
     ) !usize {
         const n = nodes.len;
-        const m = self.nodes.items.len;
-        const used = try arena.alloc(bool, m);
-        @memset(used, false);
+        const old = self.prev.items;
+        const used = self.prev_used;
 
         const new_kids = try childLists(arena, n, parents, n);
-        const old_kids = try self.oldChildLists(arena);
+        const old_kids = try oldChildLists(arena, old);
 
         var carried: usize = 0;
         for (0..n) |i| {
             if (sids[i] != 0) continue;
             var match: ?usize = null;
-            for (0..m) |j| {
-                if (used[j] or self.nodes.items[j].fp != fps[i]) continue;
+            for (0..old.len) |j| {
+                if (used[j] or old[j].fp != fps[i]) continue;
                 match = j;
                 break;
             }
             const j = match orelse continue;
-            carried += self.pair(i, j, sids, used, new_kids, old_kids);
+            carried += pair(old, i, j, sids, used, new_kids, old_kids);
         }
         return carried;
     }
@@ -768,32 +1010,31 @@ pub const View = struct {
         sids: []u32,
     ) !usize {
         const n = nodes.len;
-        const m = self.nodes.items.len;
+        const old = self.nodes.items;
+        const m = old.len;
         if (m == 0) return 0;
         const used = try arena.alloc(bool, m);
         @memset(used, false);
+        var old_by_sid = std.AutoHashMap(u32, usize).init(arena);
+        for (old, 0..) |o, j| try old_by_sid.put(o.sid, j);
         // An old node whose engine id survived is spoken for.
-        for (self.nodes.items, 0..) |o, j| {
-            for (sids) |s| {
-                if (s != 0 and s == o.sid) {
-                    used[j] = true;
-                    break;
-                }
-            }
+        for (sids) |s| {
+            if (s == 0) continue;
+            if (old_by_sid.get(s)) |j| used[j] = true;
         }
 
         const new_kids = try childLists(arena, n, parents, n);
-        const old_kids = try self.oldChildLists(arena);
+        const old_kids = try oldChildLists(arena, old);
 
         var carried: usize = 0;
         for (0..n) |i| {
             if (sids[i] != 0) continue;
             const pi = parents[i];
             if (pi >= n or sids[pi] == 0) continue; // anchor required
-            const oj = self.oldIndexOfSid(sids[pi]) orelse continue;
+            const oj = old_by_sid.get(sids[pi]) orelse continue;
             for (old_kids[oj]) |cand| {
-                if (used[cand] or self.nodes.items[cand].fp != fps[i]) continue;
-                carried += self.pair(i, cand, sids, used, new_kids, old_kids);
+                if (used[cand] or old[cand].fp != fps[i]) continue;
+                carried += pair(old, i, cand, sids, used, new_kids, old_kids);
                 break;
             }
         }
@@ -801,7 +1042,7 @@ pub const View = struct {
     }
 
     fn pair(
-        self: *View,
+        old: []const Node,
         i: usize,
         j: usize,
         sids: []u32,
@@ -809,14 +1050,14 @@ pub const View = struct {
         new_kids: []const []const usize,
         old_kids: []const []const usize,
     ) usize {
-        sids[i] = self.nodes.items[j].sid;
+        sids[i] = old[j].sid;
         used[j] = true;
         var carried: usize = 1;
         const nk = new_kids[i];
         const ok = old_kids[j];
         const shared = @min(nk.len, ok.len);
         for (0..shared) |k| {
-            carried += self.pair(nk[k], ok[k], sids, used, new_kids, old_kids);
+            carried += pair(old, nk[k], ok[k], sids, used, new_kids, old_kids);
         }
         return carried;
     }
@@ -831,27 +1072,6 @@ pub const View = struct {
         try w.print("doc {d} rev {d} url {s}\n", .{ self.doc_gen, self.rev, self.url });
         for (self.nodes.items) |nd| {
             try w.splatByteAll(' ', @as(usize, nd.depth) * 2);
-            try writeNodeLine(w, nd);
-            try w.writeByte('\n');
-        }
-        return self.gpa.dupe(u8, out.written());
-    }
-
-    /// A full snapshot restricted to one subtree.
-    ///
-    /// The shadow tree stays WHOLE either way — a scoped request only
-    /// narrows what is rendered and deliberately does NOT advance the
-    /// consumed base (the caller saw one subtree, not the page), so ids
-    /// and later deltas keep meaning the same thing.
-    pub fn renderScoped(self: *const View, root_sid: u32) ![]u8 {
-        const root = self.findSid(root_sid) orelse return self.renderFull();
-        var out: std.Io.Writer.Allocating = .init(self.gpa);
-        defer out.deinit();
-        const w = &out.writer;
-        try w.print("doc {d} rev {d} url {s} scope [{d}]\n", .{ self.doc_gen, self.rev, self.url, root_sid });
-        for (self.nodes.items) |nd| {
-            if (nd.sid != root_sid and !self.descends(nd, root_sid)) continue;
-            try w.splatByteAll(' ', @as(usize, nd.depth -| root.depth) * 2);
             try writeNodeLine(w, nd);
             try w.writeByte('\n');
         }
@@ -1731,4 +1951,302 @@ test "the history buffer bounds itself with an overflow marker" {
     defer gpa.free(hist.text);
     try std.testing.expect(std.mem.endsWith(u8, hist.text, HISTORY_OVERFLOW));
     try std.testing.expect(hist.text.len <= MAX_HISTORY + HISTORY_OVERFLOW.len);
+}
+
+test "a modal hiding the page keeps ids; closing it restores them unlisted" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+
+    const page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Hosts" },
+        .{ .id = 2, .parent = 1, .role = "banner", .name = "" },
+        .{ .id = 3, .parent = 2, .role = "button", .name = "Account" },
+        .{ .id = 4, .parent = 1, .role = "navigation", .name = "Main" },
+        .{ .id = 5, .parent = 4, .role = "link", .name = "Sites" },
+        .{ .id = 6, .parent = 4, .role = "link", .name = "Hosts" },
+        .{ .id = 7, .parent = 1, .role = "main", .name = "" },
+        .{ .id = 8, .parent = 7, .role = "button", .name = "Delete" },
+    };
+    var up = try applyConsume(&v, tree(7, "http://x/", &page), .auto);
+    gpa.free(up.text);
+    const nav = v.sidFor(4);
+    const del = v.sidFor(8);
+
+    // The dialog opens and everything else goes aria-hidden: the walk
+    // no longer lists it, and the engine ids of the hidden elements
+    // survive (WeakMap on the page side).
+    const modal = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Hosts" },
+        .{ .id = 9, .parent = 1, .role = "alertdialog", .name = "Confirm" },
+        .{ .id = 10, .parent = 9, .role = "button", .name = "Cancel", .states = "focused" },
+        .{ .id = 11, .parent = 9, .role = "button", .name = "Confirm" },
+    };
+    up = try applyConsume(&v, tree(7, "http://x/", &modal), .auto);
+    gpa.free(up.text);
+    try std.testing.expectEqual(Kind.full, up.kind);
+    const dlg = v.sidFor(9);
+
+    // Escape: the same elements come back under their old ids, and
+    // the client is told so on one line instead of being re-sent the
+    // whole page. The dialog's removal is folded to its root.
+    up = try applyConsume(&v, tree(7, "http://x/", &page), .auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.delta, up.kind);
+    try std.testing.expectEqual(nav, v.sidFor(4));
+    try std.testing.expectEqual(del, v.sidFor(8));
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "+ [") == null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "restored unchanged:") != null);
+    var buf: [64]u8 = undefined;
+    const nav_line = try std.fmt.bufPrint(&buf, "[{d}] navigation \"Main\" (3 nodes)", .{nav});
+    try std.testing.expect(std.mem.indexOf(u8, up.text, nav_line) != null);
+    var buf2: [64]u8 = undefined;
+    const gone_line = try std.fmt.bufPrint(&buf2, "- [{d}] alertdialog \"Confirm\" (+2 descendants)\n", .{dlg});
+    try std.testing.expect(std.mem.indexOf(u8, up.text, gone_line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "Cancel") == null);
+    try std.testing.expectEqual(@as(usize, 1), up.changes);
+}
+
+test "a node that returns changed is reported as a restored change" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "region", .name = "panel" },
+        .{ .id = 3, .parent = 2, .role = "textbox", .name = "Name", .value = "old" },
+        .{ .id = 4, .parent = 2, .role = "button", .name = "Save" },
+    };
+    var up = try applyConsume(&v, tree(7, "http://x/", &page), .auto);
+    gpa.free(up.text);
+    const box = v.sidFor(3);
+    const hidden_page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+    };
+    up = try applyConsume(&v, tree(7, "http://x/", &hidden_page), .auto);
+    gpa.free(up.text);
+    const back = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "region", .name = "panel" },
+        .{ .id = 3, .parent = 2, .role = "textbox", .name = "Name", .value = "new" },
+        .{ .id = 4, .parent = 2, .role = "button", .name = "Save" },
+    };
+    up = try applyConsume(&v, tree(7, "http://x/", &back), .auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.delta, up.kind);
+    try std.testing.expectEqual(box, v.sidFor(3));
+    var buf: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "~ [{d}] textbox \"Name\" value=\"new\" (restored)\n", .{box});
+    try std.testing.expect(std.mem.indexOf(u8, up.text, line) != null);
+    // The region and the Save button came back unchanged, as one line.
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "restored unchanged: [") != null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "+ [") == null);
+}
+
+test "a removed subtree is folded to its root" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "heading", .name = "keep" },
+        .{ .id = 3, .parent = 1, .role = "table", .name = "" },
+        .{ .id = 4, .parent = 3, .role = "row", .name = "" },
+        .{ .id = 5, .parent = 4, .role = "cell", .name = "a" },
+        .{ .id = 6, .parent = 4, .role = "cell", .name = "b" },
+        .{ .id = 7, .parent = 3, .role = "row", .name = "" },
+        .{ .id = 8, .parent = 7, .role = "cell", .name = "c" },
+    };
+    var up = try applyConsume(&v, tree(7, "http://x/", &page), .auto);
+    gpa.free(up.text);
+    const table = v.sidFor(3);
+    const smaller = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "heading", .name = "keep" },
+        .{ .id = 9, .parent = 1, .role = "paragraph", .name = "empty" },
+    };
+    up = try applyConsume(&v, tree(7, "http://x/", &smaller), .auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.delta, up.kind);
+    var buf: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "- [{d}] table \"\" (+5 descendants)\n", .{table});
+    try std.testing.expect(std.mem.indexOf(u8, up.text, line) != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, up.text, "- ["));
+    try std.testing.expectEqual(@as(usize, 2), up.changes);
+}
+
+test "a navigation summarises the superseded document and carries a late shell" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const page1 = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "One" },
+        .{ .id = 2, .parent = 1, .role = "navigation", .name = "Site" },
+        .{ .id = 3, .parent = 2, .role = "link", .name = "Home" },
+        .{ .id = 4, .parent = 2, .role = "link", .name = "Docs" },
+        .{ .id = 5, .parent = 2, .role = "link", .name = "About" },
+        .{ .id = 6, .parent = 1, .role = "paragraph", .name = "page one" },
+        .{ .id = 7, .parent = 1, .role = "paragraph", .name = "more one" },
+    };
+    var up = try applyConsume(&v, tree(11, "http://x/1", &page1), .auto);
+    gpa.free(up.text);
+    const nav = v.sidFor(2);
+    const home = v.sidFor(3);
+
+    // The new document's first walk is the bare shell (a client-side
+    // app that has not rendered yet); nothing carries, nothing is sent.
+    const bare = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Two" },
+    };
+    try v.apply(tree(12, "http://x/2", &bare));
+    // Its second walk renders the same nav plus new content: the nav
+    // still carries from the previous document's pool.
+    const page2 = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Two" },
+        .{ .id = 2, .parent = 1, .role = "navigation", .name = "Site" },
+        .{ .id = 3, .parent = 2, .role = "link", .name = "Home" },
+        .{ .id = 4, .parent = 2, .role = "link", .name = "Docs" },
+        .{ .id = 5, .parent = 2, .role = "link", .name = "About" },
+        .{ .id = 6, .parent = 1, .role = "paragraph", .name = "page two" },
+    };
+    up = try applyConsume(&v, tree(12, "http://x/2", &page2), .auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.delta, up.kind);
+    try std.testing.expectEqual(nav, v.sidFor(2));
+    try std.testing.expectEqual(home, v.sidFor(3));
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "carried [") != null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "previous document dropped (3 nodes)\n") != null);
+    // The old paragraphs are not itemised, the nav is not re-sent.
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "- [") == null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "Home") == null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "page two") != null);
+}
+
+test "a scoped consume advances the base for that subtree only" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "region", .name = "left" },
+        .{ .id = 3, .parent = 2, .role = "button", .name = "L1" },
+        .{ .id = 4, .parent = 1, .role = "region", .name = "right" },
+        .{ .id = 5, .parent = 4, .role = "button", .name = "R1" },
+    };
+    var up = try applyConsume(&v, tree(7, "http://x/", &page), .auto);
+    gpa.free(up.text);
+    const left = v.sidFor(2);
+    // Both regions gain a child; only the left one is peeked at.
+    const grown = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "region", .name = "left" },
+        .{ .id = 3, .parent = 2, .role = "button", .name = "L1" },
+        .{ .id = 6, .parent = 2, .role = "button", .name = "L2" },
+        .{ .id = 4, .parent = 1, .role = "region", .name = "right" },
+        .{ .id = 5, .parent = 4, .role = "button", .name = "R1" },
+        .{ .id = 7, .parent = 4, .role = "button", .name = "R2" },
+    };
+    try v.apply(tree(7, "http://x/", &grown));
+    const scoped = try v.consumeScoped(left);
+    defer gpa.free(scoped);
+    try std.testing.expect(std.mem.indexOf(u8, scoped, "L2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scoped, "R2") == null);
+    // The next unscoped delta owes the caller R2 but not L2.
+    up = try v.consume(.auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.delta, up.kind);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "R2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "L2") == null);
+}
+
+test "a hidden element returning beside its carried look-alike keeps one id each" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "list", .name = "" },
+        .{ .id = 3, .parent = 2, .role = "listitem", .name = "row" },
+    };
+    const up = try applyConsume(&v, tree(7, "http://x/", &page), .auto);
+    gpa.free(up.text);
+    const row = v.sidFor(3);
+    // Row 3 hides while a re-rendered identical row 9 appears: 9
+    // inherits the id through the anchored intra-document carry.
+    const swapped = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "list", .name = "" },
+        .{ .id = 9, .parent = 2, .role = "listitem", .name = "row" },
+    };
+    try v.apply(tree(7, "http://x/", &swapped));
+    try std.testing.expectEqual(row, v.sidFor(9));
+    // Then 3 comes back next to 9: both bind to the same id, so the
+    // first in document order keeps it and the other is fresh.
+    const both = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "list", .name = "" },
+        .{ .id = 9, .parent = 2, .role = "listitem", .name = "row" },
+        .{ .id = 3, .parent = 2, .role = "listitem", .name = "row" },
+    };
+    try v.apply(tree(7, "http://x/", &both));
+    try std.testing.expectEqual(row, v.sidFor(9));
+    try std.testing.expect(v.sidFor(3) != 0 and v.sidFor(3) != row);
+    try std.testing.expectEqual(@as(u32, 9), v.eidFor(row));
+}
+
+test "added subtrees nest by indentation instead of repeating under lines" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "main", .name = "" },
+    };
+    var up = try applyConsume(&v, tree(7, "http://x/", &page), .auto);
+    gpa.free(up.text);
+    const main_sid = v.sidFor(2);
+    const grown = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Demo" },
+        .{ .id = 2, .parent = 1, .role = "main", .name = "" },
+        .{ .id = 3, .parent = 2, .role = "table", .name = "" },
+        .{ .id = 4, .parent = 3, .role = "row", .name = "" },
+        .{ .id = 5, .parent = 4, .role = "cell", .name = "a" },
+        .{ .id = 6, .parent = 3, .role = "row", .name = "" },
+        .{ .id = 7, .parent = 6, .role = "cell", .name = "b" },
+    };
+    up = try applyConsume(&v, tree(7, "http://x/", &grown), .auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.delta, up.kind);
+    var buf: [256]u8 = undefined;
+    const want = try std.fmt.bufPrint(&buf,
+        \\delta rev 1->2
+        \\under [{d}] main ""
+        \\+ [{d}] table {{2 children}}
+        \\+   [{d}] row {{1 children}}
+        \\+     [{d}] cell "a"
+        \\+   [{d}] row {{1 children}}
+        \\+     [{d}] cell "b"
+        \\
+    , .{ main_sid, v.sidFor(3), v.sidFor(4), v.sidFor(5), v.sidFor(6), v.sidFor(7) });
+    try std.testing.expectEqualStrings(want, up.text);
+}
+
+test "scoped consumes alone never make an unscoped delta claim unchanged" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const page = [_]InNode{
+        .{ .id = 1, .parent = 0, .role = "document", .name = "Sign in" },
+        .{ .id = 2, .parent = 1, .role = "form", .name = "" },
+        .{ .id = 3, .parent = 2, .role = "textbox", .name = "Email" },
+        .{ .id = 4, .parent = 2, .role = "button", .name = "Sign in" },
+    };
+    try v.apply(tree(7, "http://x/", &page));
+    const scoped = try v.consumeScoped(v.sidFor(3));
+    defer gpa.free(scoped);
+    try std.testing.expect(!v.base_ok);
+    const up = try v.consume(.auto);
+    defer gpa.free(up.text);
+    try std.testing.expectEqual(Kind.full, up.kind);
+    try std.testing.expect(std.mem.indexOf(u8, up.text, "Sign in") != null);
 }

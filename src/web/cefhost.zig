@@ -720,6 +720,11 @@ const Pending = struct {
         /// because scrolling moves every rect without one DOM mutation.
         /// `arg` holds the "<vw> <vh>" viewport string.
         hints,
+        /// A `sem_query` that arrived before any walk (a view opened
+        /// with the first snapshot skipped, then act-by-name): it
+        /// solicits one walk and answers from the live tree, without
+        /// consuming the base. `mode` is the query kind.
+        query,
         click,
         hover,
         act,
@@ -6111,7 +6116,7 @@ pub const Host = struct {
                 .kind = @intFromEnum(proto.SnapKind.full),
                 .payload = .{ .s = msg },
             }),
-            .hints => self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = msg } }),
+            .hints, .query => self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = msg } }),
             .click, .hover, .act, .set_value, .commit, .guarded_act, .choose_pick, .choose_done => self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = msg }),
             .expand => self.post(proto.SemExpandResult{ .view = v.id, .id = p.sid, .off = p.off, .text = msg }),
             .read => self.post(proto.SemReadResult{ .view = v.id, .markdown = .{ .s = msg } }),
@@ -6135,7 +6140,7 @@ pub const Host = struct {
         v.sem_observing = false;
         for (v.pending.items) |*p| {
             switch (p.kind) {
-                .snapshot, .hints, .read, .read_ids => {
+                .snapshot, .hints, .query, .read, .read_ids => {
                     p.rearm = true;
                     p.nav_gen = v.sem_nav.generation;
                     p.req = nextReq(v);
@@ -6513,6 +6518,23 @@ pub const Host = struct {
             self.sendScript(v, cmd);
             return;
         }
+        if (!v.sem.has_tree) {
+            // No walk has happened yet (the view was opened with its
+            // first snapshot skipped): solicit one and answer from it,
+            // so act-by-name does not cost the caller a snapshot turn.
+            const arg = try self.gpa.dupe(u8, req.arg);
+            errdefer self.gpa.free(arg);
+            const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .query, .mode = req.kind, .rearm = v.sem_nav.loading, .arg = arg });
+            if (v.sem_nav.loading) return;
+            var buf: [96]u8 = undefined;
+            const cmd = std.fmt.bufPrint(
+                &buf,
+                "{{\"op\":\"snapshot\",\"req\":{d},\"detail\":{d}}}",
+                .{ rid, v.sem_detail },
+            ) catch return;
+            self.sendScript(v, cmd);
+            return;
+        }
         const text = v.sem.query(req.kind, req.arg) catch return;
         defer self.gpa.free(text);
         self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = text } });
@@ -6646,7 +6668,7 @@ pub const Host = struct {
             if (!p.rearm or p.nav_gen != v.sem_nav.generation) continue;
             p.rearm = false;
             const cmd = switch (p.kind) {
-                .snapshot, .hints => std.fmt.bufPrint(
+                .snapshot, .hints, .query => std.fmt.bufPrint(
                     &buf,
                     "{{\"op\":\"snapshot\",\"req\":{d},\"detail\":{d}}}",
                     .{ p.req, if (p.kind == .snapshot) p.detail else v.sem_detail },
@@ -6859,6 +6881,13 @@ pub const Host = struct {
             return;
         }
 
+        if (p.kind == .query) {
+            const text = v.sem.query(p.mode, p.arg) catch return;
+            defer self.gpa.free(text);
+            self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = text } });
+            return;
+        }
+
         if (p.kind == .hints) {
             // Link hints: the walk just folded, so the live tree's rects
             // are current. Renders from the live tree and does NOT
@@ -6876,10 +6905,10 @@ pub const Host = struct {
         }
 
         if (p.scope != 0) {
-            // A scoped snapshot is a peek at one subtree: rendered in
-            // full, and deliberately NOT consuming the base (the caller
-            // did not see the rest of the page).
-            const scoped = v.sem.renderScoped(p.scope) catch return;
+            // A scoped snapshot is one subtree rendered in full; it
+            // advances the base for THAT subtree only (the caller did
+            // not see the rest of the page).
+            const scoped = v.sem.consumeScoped(p.scope) catch return;
             defer self.gpa.free(scoped);
             self.post(proto.SemSnapshot{
                 .view = v.id,
@@ -6887,6 +6916,18 @@ pub const Host = struct {
                 .rev = v.sem.rev,
                 .kind = @intFromEnum(proto.SnapKind.full),
                 .payload = .{ .s = scoped },
+            });
+            return;
+        }
+        if (p.mode == @intFromEnum(proto.SnapMode.peek)) {
+            // A probe: the walk folded into the live tree, the answer
+            // is the revision, and the base is untouched.
+            self.post(proto.SemSnapshot{
+                .view = v.id,
+                .doc_gen = v.sem.doc_gen,
+                .rev = v.sem.rev,
+                .kind = @intFromEnum(proto.SnapKind.delta),
+                .payload = .{ .s = "" },
             });
             return;
         }
@@ -7138,9 +7179,15 @@ pub const Host = struct {
         typeText(v, p.arg);
         const eid = v.sem.eidFor(p.sid);
         const rid = self.pushPending(v, .{ .req = nextReq(v), .kind = .commit, .sid = p.sid, .guarded = p.guarded }) catch return;
-        var buf: [128]u8 = undefined;
-        const cmd = std.fmt.bufPrint(&buf, "{{\"op\":\"commit\",\"req\":{d},\"eid\":{d}}}", .{ rid, eid }) catch return;
-        self.sendScript(v, cmd);
+        // The keystrokes are queued input and this script is an IPC to
+        // the renderer: they race. `want` lets the commit read wait
+        // (bounded) for the typed text to land before reporting.
+        var cmd: std.Io.Writer.Allocating = .init(self.gpa);
+        defer cmd.deinit();
+        cmd.writer.print("{{\"op\":\"commit\",\"req\":{d},\"eid\":{d},\"want\":", .{ rid, eid }) catch return;
+        jsonStr(&cmd.writer, p.arg) catch return;
+        cmd.writer.writeByte('}') catch return;
+        self.sendScript(v, cmd.written());
     }
 
     // -- outbound ------------------------------------------------------

@@ -78,43 +78,82 @@ var g_headless_dir: ?[]const u8 = null;
 var g_headless_instance: ?[]const u8 = null;
 var g_headless_mux_sock: ?[]const u8 = null;
 
-/// Session default verbosity for `web_snapshot` (0 terse / 1 normal /
-/// 2 long text). Passing `detail` on a call CHANGES it, exactly the way
-/// passing `pane` changes which view is current — one sticky default
-/// per session rather than a second tool to set it, and the reply says
-/// so when it moves, or a caller could not tell that a later call
-/// inherited an earlier one's verbosity.
-var g_detail: u32 = DETAIL_DEFAULT;
+/// Verbosity of one `web_snapshot` (0 terse / 1 normal / 2 long text).
+/// Per CALL, never remembered: a sticky default set by a one-off terse
+/// peek silently changed every later snapshot mid-batch, which reads
+/// as the tool ignoring you.
 const DETAIL_DEFAULT: u32 = 1;
 
-/// Resolve the detail for one call and update the session default when
-/// the caller named one.
-fn detailFor(args: std.json.Value) struct { detail: u32, changed: bool } {
-    const d = mcp.argInt(args, "detail") orelse return .{ .detail = g_detail, .changed = false };
-    const want: u32 = @intCast(std.math.clamp(d, 0, 2));
-    const changed = want != g_detail;
-    g_detail = want;
-    return .{ .detail = want, .changed = changed };
+fn detailFor(args: std.json.Value) u32 {
+    const d = mcp.argInt(args, "detail") orelse return DETAIL_DEFAULT;
+    return @intCast(std.math.clamp(d, 0, 2));
 }
 
-test "detail is per-request and sticky for the session" {
-    g_detail = DETAIL_DEFAULT;
-    defer g_detail = DETAIL_DEFAULT;
-    // No argument: the default, and it does not move.
+test "detail is per-request and never sticks" {
     const none = std.json.Value{ .null = {} };
-    try std.testing.expectEqual(@as(u32, 1), detailFor(none).detail);
-    try std.testing.expectEqual(false, detailFor(none).changed);
+    try std.testing.expectEqual(@as(u32, 1), detailFor(none));
     // An out-of-range request clamps rather than being refused.
-    g_detail = DETAIL_DEFAULT;
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"detail\":7}", .{});
     defer parsed.deinit();
-    const first = detailFor(parsed.value);
-    try std.testing.expectEqual(@as(u32, 2), first.detail);
-    try std.testing.expectEqual(true, first.changed);
-    // It stuck: a later call with no argument inherits it, and asking
-    // for the same value again is not reported as a change.
-    try std.testing.expectEqual(@as(u32, 2), detailFor(none).detail);
-    try std.testing.expectEqual(false, detailFor(parsed.value).changed);
+    try std.testing.expectEqual(@as(u32, 2), detailFor(parsed.value));
+    try std.testing.expectEqual(@as(u32, 1), detailFor(none));
+}
+
+/// Characters of a semantic tree (snapshot or delta) returned inline.
+/// Past it the text is cut at a line boundary and the reply SAYS so
+/// (`<name>_truncated`, `<name>_total_lines`) instead of growing past
+/// what a client will hand to a model: a 100k-character act reply used
+/// to fail as a whole, taking the act's own confirmation with it.
+const TREE_INLINE_CHARS: usize = 32_000;
+
+/// Emit a tree payload as fact + text section, bounded.
+fn treeSection(res: *mcp.Res, arena: std.mem.Allocator, name: []const u8, text: []const u8) !void {
+    const total_lines = std.mem.count(u8, std.mem.trimEnd(u8, text, "\n"), "\n") + 1;
+    if (text.len <= TREE_INLINE_CHARS) {
+        try res.fact(name, text);
+        try section(res, name, text);
+        return;
+    }
+    var cut = TREE_INLINE_CHARS;
+    if (std.mem.lastIndexOfScalar(u8, text[0..cut], '\n')) |nl| cut = nl + 1;
+    const kept_lines = std.mem.count(u8, text[0..cut], "\n");
+    const note = try std.fmt.allocPrint(
+        arena,
+        "... truncated: {d} of {d} lines shown ({d} chars total). Narrow it: web_snapshot scope:<id> for one subtree, web_query subtree/find_text, or web_act scope:<id> to bound the next act's delta.\n",
+        .{ kept_lines, total_lines, text.len },
+    );
+    const bounded = try std.mem.concat(arena, u8, &.{ text[0..cut], note });
+    try res.fact(name, bounded);
+    try res.fact(try std.fmt.allocPrint(arena, "{s}_truncated", .{name}), true);
+    try res.fact(try std.fmt.allocPrint(arena, "{s}_total_lines", .{name}), total_lines);
+    try section(res, name, bounded);
+}
+
+test "treeSection bounds a tree at a line boundary and says so" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var big: std.Io.Writer.Allocating = .init(arena);
+    var i: usize = 0;
+    while (i < 3000) : (i += 1) try big.writer.print("[{d}] cell \"row {d} some text\"\n", .{ i, i });
+    var res = mcp.Res.init(arena);
+    try treeSection(&res, arena, "delta", big.written());
+    const out = try res.finish();
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, out, .{});
+    const sc = parsed.object.get("structuredContent").?.object;
+    try std.testing.expect(sc.get("delta_truncated").?.bool);
+    try std.testing.expectEqual(@as(i64, 3000), sc.get("delta_total_lines").?.integer);
+    const d = sc.get("delta").?.string;
+    try std.testing.expect(d.len < TREE_INLINE_CHARS + 400);
+    try std.testing.expect(std.mem.indexOf(u8, d, "... truncated:") != null);
+    // Cut on a line boundary: the last kept line is whole.
+    const before_note = d[0..std.mem.indexOf(u8, d, "... truncated:").?];
+    try std.testing.expect(std.mem.endsWith(u8, before_note, "\"\n"));
+
+    var small = mcp.Res.init(arena);
+    try treeSection(&small, arena, "snapshot", "[1] document\n");
+    const so = try std.json.parseFromSliceLeaky(std.json.Value, arena, try small.finish(), .{});
+    try std.testing.expect(so.object.get("structuredContent").?.object.get("snapshot_truncated") == null);
 }
 
 /// Arm the headless fallback. `dir`/`instance`/`mux_sock` must outlive
@@ -502,6 +541,8 @@ fn runOp(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, timeout_ms:
                         @intFromEnum(web_proto.SnapMode.full)
                     else if (eql(u8, m, "history"))
                         @intFromEnum(web_proto.SnapMode.history)
+                    else if (eql(u8, m, "peek"))
+                        @intFromEnum(web_proto.SnapMode.peek)
                     else
                         @intFromEnum(web_proto.SnapMode.auto))
                 else
@@ -1000,9 +1041,8 @@ fn openResult(
     if (snap) |s| {
         try res.fact("document", s.document);
         try res.fact("revision", s.revision);
-        try res.fact("snapshot", s.tree);
         try res.textf("document {d}, revision {d}", .{ s.document, s.revision });
-        try section(&res, "snapshot", s.tree);
+        try treeSection(&res, arena, "snapshot", s.tree);
         try res.text(TRUST_LINE);
     }
     return res.finish();
@@ -1115,8 +1155,7 @@ fn navigateResult(
         try res.fact("kind", snap_kind);
         try res.fact("document", s.document);
         try res.fact("revision", s.revision);
-        try res.fact("snapshot", s.tree);
-        try section(&res, "snapshot", s.tree);
+        try treeSection(&res, arena, "snapshot", s.tree);
         try res.text(TRUST_LINE);
     }
     return res.finish();
@@ -1136,13 +1175,10 @@ fn snapshotResult(
     try res.fact("kind", kind);
     try res.fact("document", s.document);
     try res.fact("revision", s.revision);
-    try res.fact("snapshot", s.tree);
     try res.textf("{s} snapshot, document {d}, revision {d}", .{ kind, s.document, s.revision });
-    // A sticky default that moved silently would make a later,
-    // argument-free call look like it ignored you.
     if (detail) |d| {
         try res.fact("detail", d);
-        try res.textf("detail: {d} (now this session's default)", .{d});
+        try res.textf("detail: {d} (this call only)", .{d});
     }
     // A delta whose body is only its header means the page has not
     // changed. Saying so beats handing back an almost-empty tree that
@@ -1151,7 +1187,7 @@ fn snapshotResult(
         try res.fact("unchanged", true);
         try res.text("nothing changed since your last snapshot; pass mode full for the whole tree");
     }
-    try section(&res, "snapshot", s.tree);
+    try treeSection(&res, arena, "snapshot", s.tree);
     try res.text(TRUST_LINE);
     return res.finish();
 }
@@ -1165,7 +1201,15 @@ const ActAfter = struct {
     /// A caveat about the delta itself (a soft navigation whose content
     /// may still be rendering), surfaced as text AND a fact.
     note: ?[]const u8 = null,
+    /// The subtree the follow-up was bounded to (`scope` on the call).
+    scope: ?u32 = null,
 };
+
+/// `scope` on web_act/web_key: bound the follow-up tree to one subtree.
+fn scopeArg(args: std.json.Value) ?u32 {
+    const s = mcp.argInt(args, "scope") orelse return null;
+    return if (s > 0) @intCast(s) else null;
+}
 
 /// What CHANGED after an input: give the caller the delta rather than
 /// making it ask. The delta must not RACE a navigation the input
@@ -1177,7 +1221,7 @@ const ActAfter = struct {
 /// explicit warning it may still be arriving. Shared by web_act and
 /// web_key - a keystroke can navigate exactly like a click.
 fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.json.Value) !ActAfter {
-    var after = ActAfter{};
+    var after = ActAfter{ .scope = scopeArg(args) };
     const pre_url = view.url;
     const pre_seq = view.load_seq;
     var nav_hard = false;
@@ -1208,10 +1252,14 @@ fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.j
         drv.sleep(900);
         after.note = "the url changed without a page load (client-side route); the delta below is what had rendered ~1s after the act - if it looks incomplete, the route's data was still arriving: call web_snapshot again";
     }
+    // A scoped follow-up is that subtree in full (advancing the base
+    // for it only), so a click on a row menu can never return more
+    // than the menu.
     switch (try runOp(drv, arena, view.pane, .{
         .op = "snapshot",
         .mode = "auto",
         .detail = 1,
+        .node = after.scope,
     }, 5000)) {
         .err => |e| after.delta_error = e.text,
         .done => |d| {
@@ -1271,8 +1319,8 @@ fn renderAfter(res: *mcp.Res, arena: std.mem.Allocator, after: ActAfter) !void {
     }
     if (after.delta) |d| {
         try res.fact("delta_kind", after.delta_kind orelse "");
-        try res.fact("delta", d);
-        try section(res, "delta", d);
+        if (after.scope) |sc| try res.fact("scope", sc);
+        try treeSection(res, arena, "delta", d);
         try res.text(TRUST_LINE);
     }
 }
@@ -1413,10 +1461,11 @@ fn parsePos(arena: std.mem.Allocator, json: []const u8) ?ScrollPos {
 /// node. Exact name matches (case-insensitive) outrank substring ones;
 /// `nth` indexes the survivors.
 fn pickNamedMatch(payload: []const u8, role: ?[]const u8, wanted: []const u8, nth: usize) ?i64 {
-    const Cand = struct { id: i64, exact: bool };
+    const Cand = struct { id: i64, exact: bool, interactive: bool };
     var cands: [128]Cand = undefined;
     var n_cands: usize = 0;
     var any_exact = false;
+    var any_interactive = false;
     var lines = std.mem.splitScalar(u8, payload, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trimStart(u8, raw, " ");
@@ -1441,16 +1490,100 @@ fn pickNamedMatch(payload: []const u8, role: ?[]const u8, wanted: []const u8, nt
         const exact = std.ascii.eqlIgnoreCase(cand_name, wanted);
         if (exact) any_exact = true;
         if (n_cands == cands.len) break;
-        cands[n_cands] = .{ .id = id, .exact = exact };
+        cands[n_cands] = .{ .id = id, .exact = exact, .interactive = interactiveRole(line_role) };
         n_cands += 1;
+    }
+    // Exact names first; then, with no role asked for, the CONTROL over
+    // the container that merely contains it — a table cell named
+    // "Delete" precedes its own button in document order, and acting on
+    // the cell is never what the caller meant.
+    for (cands[0..n_cands]) |c| {
+        if ((!any_exact or c.exact) and c.interactive) any_interactive = true;
     }
     var seen: usize = 0;
     for (cands[0..n_cands]) |c| {
         if (any_exact and !c.exact) continue;
+        if (role == null and any_interactive and !c.interactive) continue;
         if (seen == nth) return c.id;
         seen += 1;
     }
     return null;
+}
+
+/// Roles a user acts on, as opposed to containers and text that merely
+/// carry the same accessible name.
+fn interactiveRole(role: []const u8) bool {
+    const roles = [_][]const u8{
+        "button",     "link",             "textbox",       "checkbox", "radio", "combobox", "listbox",
+        "menuitem",   "menuitemcheckbox", "menuitemradio", "option",   "tab",   "switch",   "slider",
+        "spinbutton", "searchbox",        "treeitem",      "summary",
+    };
+    for (roles) |r| {
+        if (std.ascii.eqlIgnoreCase(role, r)) return true;
+    }
+    return false;
+}
+
+/// Keep only the find_text match lines whose id also appears in a
+/// subtree reply, so act-by-name can be bounded to one container.
+fn withinFilter(arena: std.mem.Allocator, matches: []const u8, subtree: []const u8) ![]const u8 {
+    var ids = std.AutoHashMap(i64, void).init(arena);
+    var sub_lines = std.mem.splitScalar(u8, subtree, '\n');
+    while (sub_lines.next()) |raw| {
+        if (lineId(raw)) |id| try ids.put(id, {});
+    }
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var lines = std.mem.splitScalar(u8, matches, '\n');
+    while (lines.next()) |raw| {
+        const id = lineId(raw) orelse {
+            try out.writer.writeAll(raw);
+            try out.writer.writeByte('\n');
+            continue;
+        };
+        if (!ids.contains(id)) continue;
+        try out.writer.writeAll(raw);
+        try out.writer.writeByte('\n');
+    }
+    return out.written();
+}
+
+/// The `[id]` a tree line starts with, if it is a node line.
+fn lineId(raw: []const u8) ?i64 {
+    const line = std.mem.trimStart(u8, raw, " ");
+    if (line.len < 3 or line[0] != '[') return null;
+    const close = std.mem.indexOfScalar(u8, line, ']') orelse return null;
+    return std.fmt.parseInt(i64, line[1..close], 10) catch null;
+}
+
+test "withinFilter keeps only matches inside the subtree" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const matches =
+        "query find \"More actions\" 3 matches\n" ++
+        "[12] button \"More actions\"\n" ++
+        "[40] button \"More actions\"\n" ++
+        "[71] button \"More actions\"\n";
+    const subtree =
+        "query subtree [38]\n" ++
+        "[38] row {2 children}\n" ++
+        "  [39] cell \"remote\"\n" ++
+        "  [40] button \"More actions\"\n";
+    const pool = try withinFilter(arena, matches, subtree);
+    try std.testing.expectEqual(@as(?i64, 40), pickNamedMatch(pool, "button", "More actions", 0));
+    try std.testing.expectEqual(@as(?i64, null), pickNamedMatch(pool, "button", "More actions", 1));
+}
+
+test "pickNamedMatch prefers a control over a container of the same name" {
+    const payload =
+        "query find \"Delete\" 3 matches\n" ++
+        "[28] cell \"Delete\" {1 children}\n" ++
+        "[29] button \"Delete\"\n" ++
+        "[33] cell \"Delete\" {1 children}\n";
+    try std.testing.expectEqual(@as(?i64, 29), pickNamedMatch(payload, null, "Delete", 0));
+    // nth indexes the controls, and an explicit role still wins.
+    try std.testing.expectEqual(@as(?i64, null), pickNamedMatch(payload, null, "Delete", 1));
+    try std.testing.expectEqual(@as(?i64, 33), pickNamedMatch(payload, "cell", "Delete", 1));
 }
 
 test "pickNamedMatch prefers exact names and honors role and nth" {
@@ -1901,12 +2034,8 @@ pub fn webTool(
             "history"
         else
             mcp.argStr(args, "mode") orelse "auto";
-        const det = detailFor(args);
-        const detail: u32 = det.detail;
-        const scope: ?u32 = blk: {
-            const s = mcp.argInt(args, "scope") orelse break :blk null;
-            break :blk if (s > 0) @intCast(s) else null;
-        };
+        const detail: u32 = detailFor(args);
+        const scope: ?u32 = scopeArg(args);
         switch (try runOp(drv, arena, view.pane, .{
             .op = "snapshot",
             .mode = mode,
@@ -1926,7 +2055,7 @@ pub fn webTool(
                     view,
                     r.snapshot_kind,
                     .{ .document = r.doc_gen, .revision = r.rev, .tree = r.payload },
-                    if (det.changed) detail else null,
+                    if (mcp.argInt(args, "detail") != null) detail else null,
                     std.mem.eql(u8, r.snapshot_kind, "delta") and
                         std.mem.count(u8, std.mem.trimEnd(u8, r.payload, "\n"), "\n") == 0,
                 );
@@ -1942,28 +2071,66 @@ pub fn webTool(
         if (id == null) {
             const want_name = mcp.argStr(args, "name") orelse
                 return mcp.errRes(arena, .invalid_args, "web_act needs 'id' (a node id from web_snapshot or web_read) or 'name' (the accessible name to act on, with optional 'role' and 'nth')");
-            switch (try runOp(drv, arena, view.pane, .{
-                .op = "query",
-                .action = "find_text",
-                .data = want_name,
-            }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
-                .err => |e| return failRes(arena, e),
-                .done => |r| {
-                    if (r.timed_out) return mcp.errRes(arena, .timeout, "the page did not answer the name lookup in time");
-                    const nth: usize = @intCast(@max(mcp.argInt(args, "nth") orelse 0, 0));
-                    id = pickNamedMatch(r.payload, mcp.argStr(args, "role"), want_name, nth) orelse
-                        return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(
+            // The lookup reads the live tree. Right after a navigation
+            // that tree can be an EARLY walk of a page still rendering
+            // client-side, so a miss is retried ONCE after a fresh walk
+            // (a peek: nothing consumed) and a short grace, before it
+            // is reported as absent — one turn instead of two.
+            var attempt: usize = 0;
+            while (true) : (attempt += 1) {
+                if (attempt == 1) {
+                    drv.sleep(400);
+                    switch (try runOp(drv, arena, view.pane, .{ .op = "snapshot", .mode = "peek", .detail = 0 }, 5000)) {
+                        .err => |e| return failRes(arena, e),
+                        .done => {},
+                    }
+                }
+                switch (try runOp(drv, arena, view.pane, .{
+                    .op = "query",
+                    .action = "find_text",
+                    .data = want_name,
+                }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
+                    .err => |e| return failRes(arena, e),
+                    .done => |r| {
+                        if (r.timed_out) return mcp.errRes(arena, .timeout, "the page did not answer the name lookup in time");
+                        const nth: usize = @intCast(@max(mcp.argInt(args, "nth") orelse 0, 0));
+                        // `within`: only matches inside that subtree count,
+                        // so `nth` indexes the row you meant rather than
+                        // every look-alike on the page.
+                        var pool: []const u8 = r.payload;
+                        if (mcp.argInt(args, "within")) |w| {
+                            const within_id = try std.fmt.allocPrint(arena, "{d}", .{w});
+                            switch (try runOp(drv, arena, view.pane, .{
+                                .op = "query",
+                                .action = "subtree",
+                                .data = within_id,
+                            }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
+                                .err => |e| return failRes(arena, e),
+                                .done => |sub| {
+                                    if (sub.timed_out) return mcp.errRes(arena, .timeout, "the page did not answer the subtree lookup in time");
+                                    if (std.mem.indexOf(u8, sub.payload, "unknown id") != null)
+                                        return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(arena, "'within' names no node on the page: [{d}]", .{w}));
+                                    pool = try withinFilter(arena, r.payload, sub.payload);
+                                },
+                            }
+                        }
+                        id = pickNamedMatch(pool, mcp.argStr(args, "role"), want_name, nth);
+                        if (id == null and attempt == 0) continue;
+                        if (id == null) return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(
                             arena,
-                            "no{s}{s} element matching \"{s}\" (nth {d}) is on the page; the lookup saw:\n{s}",
+                            "no{s}{s} element matching \"{s}\" (nth {d}){s} is on the page (looked twice, the second time after a fresh walk); the lookup saw:\n{s}",
                             .{
                                 if (mcp.argStr(args, "role") != null) " " else "",
                                 mcp.argStr(args, "role") orelse "",
                                 want_name,
                                 nth,
-                                r.payload[0..@min(r.payload.len, 1500)],
+                                if (mcp.argInt(args, "within") != null) " within that subtree" else "",
+                                pool[0..@min(pool.len, 1500)],
                             },
                         ));
-                },
+                        break;
+                    },
+                }
             }
         }
         const id_v: i64 = id.?;
@@ -2662,8 +2829,7 @@ fn resizeTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
                     try res.fact("kind", r.snapshot_kind);
                     try res.fact("document", r.doc_gen);
                     try res.fact("revision", r.rev);
-                    try res.fact("snapshot", r.payload);
-                    try section(&res, "snapshot", r.payload);
+                    try treeSection(&res, arena, "snapshot", r.payload);
                     try res.text(TRUST_LINE);
                 }
             },
@@ -2720,6 +2886,9 @@ fn consoleTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view
         if (tail.dropped > 0) " (oldest were dropped by the bounded mirror)" else "",
         lines[lines.len - 1].id,
     });
+    // The lines are a FACT too: a client that renders only the
+    // structured lane otherwise sees a count and no output at all.
+    try res.fact("lines", body.written());
     try section(&res, "console", body.written());
     try res.text(TRUST_LINE);
     return res.finish();
@@ -2843,10 +3012,12 @@ fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: V
 
     // `text` and `idle` are answered from the semantic tree, which the
     // helper only keeps updated once a snapshot has been asked for.
+    // PEEK, never auto: a wait that consumed the base would silently
+    // eat the delta the caller's next snapshot is owed.
     if (std.mem.eql(u8, what, "text") or std.mem.eql(u8, what, "idle")) {
         switch (try runOp(drv, arena, view.pane, .{
             .op = "snapshot",
-            .mode = "auto",
+            .mode = "peek",
             .detail = 1,
         }, @min(budget, 8000))) {
             .err => |e| return failRes(arena, e),
@@ -2887,7 +3058,7 @@ fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: V
         } else if (std.mem.eql(u8, what, "idle")) {
             switch (try runOp(drv, arena, view.pane, .{
                 .op = "snapshot",
-                .mode = "auto",
+                .mode = "peek",
                 .detail = 0,
             }, 5000)) {
                 .err => |e| return failRes(arena, e),
@@ -3106,7 +3277,7 @@ test "web_snapshot: kind/document/revision structured, unchanged said once" {
     try t.expectEqual(@as(i64, 2), dsc.get("detail").?.integer);
     const dtext = dp.object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, dtext, "delta snapshot, document 2, revision 10") != null);
-    try t.expect(std.mem.indexOf(u8, dtext, "detail: 2 (now this session's default)") != null);
+    try t.expect(std.mem.indexOf(u8, dtext, "detail: 2 (this call only)") != null);
     try t.expect(std.mem.indexOf(u8, dtext, "nothing changed since your last snapshot") != null);
 }
 

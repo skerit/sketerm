@@ -466,8 +466,10 @@ pub const Text = struct { s: []const u8 };
 /// churn cancels out. `full` restates the whole tree. `history` opts
 /// back into the per-revision replay of every fold since the last
 /// consume (bounded helper-side), for debugging pages whose changes
-/// appear and vanish between snapshots.
-pub const SnapMode = enum(u8) { auto = 0, full = 1, history = 2, _ };
+/// appear and vanish between snapshots. `peek` folds a fresh walk and
+/// answers with the revision ONLY — nothing is consumed, so a wait that
+/// polls the page cannot silently eat the delta the client is owed.
+pub const SnapMode = enum(u8) { auto = 0, full = 1, history = 2, peek = 3, _ };
 
 /// `sem_snapshot_req` detail byte.
 pub const SnapDetail = enum(u8) { minimal = 0, normal = 1, full_text = 2, _ };

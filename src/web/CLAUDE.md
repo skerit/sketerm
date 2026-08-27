@@ -1072,6 +1072,52 @@ H.264/AAC) while the distro build enables them.
   Intra-document id carry (fingerprint match anchored to a matched
   parent) is what keeps a re-rendered identical row's id stable; the
   parent anchor is the safety property, do not loosen it.
+  - **Ids are bound to the ELEMENT for the document's lifetime**
+    (`View.eid_sids`), not to membership of the walk. A modal that makes
+    the page inert (`aria-hidden`) removes every node from the walk and
+    hands them back later; before this they came back renumbered and a
+    700-line page was re-sent as `-` plus `+` for a Escape keypress
+    (measured 2026-08-27 against a zenit-cms panel: more than half of a
+    250-call session's tokens). The consumed base likewise KEEPS entries
+    for nodes that left (`present = false`, purged a document later or
+    past `ABSENT_CAP`), so a node that returns unchanged is one
+    `restored unchanged: [id] role (N nodes)` line, never re-listed;
+    one that returns changed is a `~ ... (restored)`. Removals fold to
+    subtree roots (`- [id] role "name" (+N descendants)`) and a
+    superseded document to `previous document dropped (N nodes)`. The
+    full-restatement fallback compares delta LINES against tree size,
+    so a page that hid behind a dialog stays a delta; the old "under a
+    quarter carried -> full" ratio rule is gone, because a delta never
+    re-sends a carried node and so is never longer than the tree (the
+    1580-line Settings page with only its chrome carried came back
+    full under it).
+  - **`SnapMode.peek` (3) folds a walk and answers the revision ONLY,
+    consuming nothing.** It is what `web_wait` polls with: its idle
+    poll used `auto` and silently ate the delta the caller's next
+    snapshot was owed, which read as `unchanged` on a page that had
+    just changed. A `sem_query` that arrives before any walk of the
+    document solicits one (`Pending.Kind.query`) instead of answering
+    "no snapshot yet", so act-by-name right after `web_open
+    snapshot:"none"` costs no extra turn.
+  - **The previous document's tree is a carry POOL for every walk of
+    the new one** (`View.prev`), not only the first: a client-rendered
+    shell that appears a moment after the context is created would
+    otherwise have nothing to carry from. A claimed pool node stays
+    claimed (`prev_used`); one id that two walk nodes end up claiming
+    (a hidden element returning beside the look-alike that carried its
+    id) is kept by the first in document order and the other minted.
+  - **A scoped snapshot ADVANCES the base for that subtree only**
+    (`consumeScoped`): the caller saw those nodes, so the next unscoped
+    delta owes them nothing and everything outside the subtree still.
+    `web_act`/`web_key` take `scope` for the follow-up delta and
+    `web_act` takes `within` to bound a name lookup; both exist so a
+    click on a row menu can never return more than the menu.
+  - **`set_value`'s commit carries `want`, the typed text.** The keys
+    are queued trusted input and the commit is a renderer IPC, so the
+    commit script can run before the keys land; `commitValue` waits
+    (bounded, 1.5s) until the value contains `want`. Without it stage
+    3c failed about once in a hundred runs with a connected control
+    reading "".
 - **Truncation is VISIBLE, as a `more` node.** A list-ish container
   (`LIST_TAGS` by tag, or an aria list/grid/tree role) past `LIST_CAP`
   children describes its first 50 and then emits one node with role
