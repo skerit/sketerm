@@ -3723,6 +3723,15 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     {
         const profiles = @import("mcp_web.zig").profileCapability(arena);
         try res.fact("web_profiles", profiles.available);
+        // Certificate errors are FACTS on every web result, and a
+        // headless view answers them itself (fail closed, fingerprint
+        // opt-in). A consumer must not have to hang once to learn that.
+        try res.fact("web_cert_facts", true);
+        try res.fact("web_accept_cert", !srv_gui_socket);
+        try res.text(if (srv_gui_socket)
+            "certificate errors: the user's interstitial decides; results carry cert facts while a load is held"
+        else
+            "certificate errors fail closed in headless views and are reported as cert facts; web_open accept_cert trusts one fingerprint for one view");
         if (profiles.store.len > 0) try res.fact("web_profile_store", profiles.store);
         if (profiles.available)
             try res.text("named browsing profiles are available (web_open profile:\"name\"); each keeps its own cookie jar across MCP restarts")

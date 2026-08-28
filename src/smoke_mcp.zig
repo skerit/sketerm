@@ -19,6 +19,7 @@ const protocol = @import("ipc/protocol.zig");
 const webproto = @import("web/protocol.zig");
 const netpolicy = @import("web/netpolicy.zig");
 const version = @import("version.zig");
+const smoke_tls = @import("smoke_tls.zig");
 
 fn say(msg: []const u8) void {
     _ = c.write(2, msg.ptr, msg.len);
@@ -2360,6 +2361,93 @@ const PolicyHttp = struct {
 
 /// Isolated `sketerm mcp` (no GUI, no --shared) driving a real page
 /// end to end through the headless web backend.
+/// The 64-hex fingerprint a refusal reported, or null.
+fn fingerprintOf(reply: []const u8) ?[]const u8 {
+    const key = "\"fingerprint\":\"";
+    const at = std.mem.indexOf(u8, reply, key) orelse return null;
+    const start = at + key.len;
+    if (reply.len < start + 64) return null;
+    return reply[start .. start + 64];
+}
+
+/// The `"view":N` handle in a reply's structuredContent, or 0.
+fn viewHandleOf(reply: []const u8) u32 {
+    const key = "\"view\":";
+    const at = std.mem.indexOf(u8, reply, key) orelse return 0;
+    var i = at + key.len;
+    var v: u32 = 0;
+    while (i < reply.len and reply[i] >= '0' and reply[i] <= '9') : (i += 1) v = v * 10 + (reply[i] - '0');
+    return v;
+}
+
+/// A self-signed loopback server: the open that used to HANG. The
+/// headless client dropped `ev_cert_error`, so the helper held the
+/// request forever and web_open sat on `loading:true` for its whole
+/// timeout with no reason (a router's own certificate, in the field).
+/// Now the hold is answered at once, fail closed: the reply comes back
+/// in seconds carrying the verdict and fingerprint, web_wait refuses
+/// instead of timing out, and naming that fingerprint loads the page.
+fn certStage(m: *Mcp, rt: []const u8) void {
+    var dir_buf: [512]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/tls", .{rt}) catch unreachable;
+    _ = c.mkdir(dir.ptr, 0o700);
+    if (!smoke_tls.writeFile(dir, "index.html", "<html><head><title>Bad Cert Page</title></head><body><p>BADCERT-MARKER</p></body></html>"))
+        fail("cannot write the tls page");
+    const server = smoke_tls.start(dir) orelse {
+        say("smoke-mcp: SKIP refused-certificate stage (no usable openssl s_server on this host)");
+        return;
+    };
+    defer server.stop();
+    var url_buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/index.html", .{server.port}) catch unreachable;
+    var args_buf: [1024]u8 = undefined;
+
+    // Nobody opted in: refused, promptly, with the way out named.
+    const t0 = nowMs();
+    m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\"}}", .{url}) catch unreachable);
+    const refused = m.recvLine(40_000);
+    const took = nowMs() - t0;
+    if (std.mem.indexOf(u8, refused, "isError") != null) fail("web_open on a self-signed host errored instead of reporting the refusal");
+    if (std.mem.indexOf(u8, refused, "\"settled\":false") == null) fail("web_open reported a refused certificate as settled");
+    if (std.mem.indexOf(u8, refused, "\"cert\":{\"state\":\"refused\"") == null) fail("web_open did not report the refused certificate as a fact");
+    if (std.mem.indexOf(u8, refused, "certificate REFUSED on 127.0.0.1") == null) fail("web_open's text does not say the certificate was refused");
+    if (std.mem.indexOf(u8, refused, "\"load_error\":{") == null) fail("the refusal's load failure is not reported");
+    if (took > 15_000) fail("web_open sat on the held certificate instead of answering it (the hang is back)");
+    const fp = fingerprintOf(refused) orelse fail("the refusal carries no fingerprint");
+    const refused_view = viewHandleOf(refused);
+    if (refused_view == 0) fail("the refused open minted no view handle");
+
+    // web_wait for the load: an error now, not a 15s timeout.
+    const t1 = nowMs();
+    const waited = m.callTool("web_wait", "{\"for\":\"load\",\"timeout_ms\":14000}");
+    if (std.mem.indexOf(u8, waited, "isError") == null or std.mem.indexOf(u8, waited, "REFUSED") == null)
+        fail("web_wait for:load on a refused certificate did not refuse");
+    if (nowMs() - t1 > 5_000) fail("web_wait burned its timeout on a load that could never arrive");
+
+    // A string that cannot be a fingerprint is refused at the call.
+    const bad = m.callTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"accept_cert\":\"nope\"}}", .{url}) catch unreachable);
+    if (std.mem.indexOf(u8, bad, "isError") == null or std.mem.indexOf(u8, bad, "invalid_args") == null)
+        fail("a malformed accept_cert was not refused");
+
+    // Naming exactly that certificate loads the page, and the reply
+    // says what the page stands on.
+    m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"accept_cert\":\"{s}\"}}", .{ url, fp }) catch unreachable);
+    const accepted = m.recvLine(40_000);
+    if (std.mem.indexOf(u8, accepted, "isError") != null) fail("web_open with the right accept_cert failed");
+    if (std.mem.indexOf(u8, accepted, "\"settled\":true") == null) fail("web_open with accept_cert did not settle");
+    if (std.mem.indexOf(u8, accepted, "\"cert\":{\"state\":\"accepted\"") == null) {
+        say(accepted);
+        fail("the accepted certificate is not reported as a fact");
+    }
+    if (std.mem.indexOf(u8, accepted, "BADCERT-MARKER") == null) fail("the accepted open's snapshot is not the page");
+    const accepted_view = viewHandleOf(accepted);
+
+    var close_buf: [64]u8 = undefined;
+    _ = m.callTool("web_close", std.fmt.bufPrint(&close_buf, "{{\"pane\":{d}}}", .{accepted_view}) catch unreachable);
+    _ = m.callTool("web_close", std.fmt.bufPrint(&close_buf, "{{\"pane\":{d}}}", .{refused_view}) catch unreachable);
+    say("smoke-mcp: refused-certificate stage ok");
+}
+
 fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
     // A local page with a button that mutates a paragraph: enough for
     // snapshot ids, a trusted click, the delta and reader extraction.
@@ -2631,6 +2719,8 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
                 fail("web_profile_reset erased a profile that was in use");
         }
     }
+
+    certStage(&m, rt);
 
     m.closeStdinWait();
     // Ephemeral teardown must have reaped the helper's instance dir.

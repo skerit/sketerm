@@ -33,6 +33,7 @@ const std = @import("std");
 const mcp = @import("mcp.zig");
 const protocol = @import("protocol.zig");
 const webdrive = @import("webdrive.zig");
+const navfault = @import("../web/navfault.zig");
 const web_proto = @import("../web/protocol.zig");
 const netpolicy = @import("../web/netpolicy.zig");
 const filter = @import("../web/filter.zig");
@@ -281,7 +282,45 @@ const View = struct {
     policy_bytes: u64 = 0,
     policy_navigations: u32 = 0,
     policy_ms_left: u32 = 0,
+    /// Certificate verdict on the current navigation (`ev_cert_error`);
+    /// null when none was raised. GUI: "pending" while the user's
+    /// interstitial waits. Headless: "refused" (the default, fail
+    /// closed) or "accepted" (`accept_cert` matched), never pending.
+    cert: ?CertState = null,
+    /// The last main-frame load failure, cleared by the next started
+    /// load. A refused certificate produces one too.
+    load_error: ?LoadErrState = null,
+
+    /// The requested navigation cannot arrive: a certificate the
+    /// caller did not accept, or a load that already failed. Polling
+    /// for a settle past this point only burns the timeout.
+    fn loadBlocked(self: View) bool {
+        if (self.cert) |ce| if (!std.mem.eql(u8, ce.state, "accepted")) return true;
+        return self.load_error != null;
+    }
 };
+
+/// The JSON shapes both backends report (`navfault`), parsed from the
+/// GUI's `web-list` and copied from the headless engine's records.
+const CertState = navfault.CertWire;
+const LoadErrState = navfault.LoadErrWire;
+
+fn dupeCert(arena: std.mem.Allocator, w: CertState) !CertState {
+    return .{
+        .state = try arena.dupe(u8, w.state),
+        .code = w.code,
+        .url = try arena.dupe(u8, w.url),
+        .host = try arena.dupe(u8, w.host),
+        .msg = try arena.dupe(u8, w.msg),
+        .subject = try arena.dupe(u8, w.subject),
+        .issuer = try arena.dupe(u8, w.issuer),
+        .fingerprint = try arena.dupe(u8, w.fingerprint),
+    };
+}
+
+fn dupeLoadErr(arena: std.mem.Allocator, w: LoadErrState) !LoadErrState {
+    return .{ .code = w.code, .url = try arena.dupe(u8, w.url), .msg = try arena.dupe(u8, w.msg) };
+}
 
 const Views = struct {
     views: []const View = &.{},
@@ -455,6 +494,8 @@ fn listViews(drv: Driver, arena: std.mem.Allocator) !?Views {
                     .policy_bytes = v.pol_bytes,
                     .policy_navigations = v.pol_navigations,
                     .policy_ms_left = v.pol_ms_left,
+                    .cert = if (v.cert) |*rec| try dupeCert(arena, rec.wire()) else null,
+                    .load_error = if (v.load_error) |*rec| try dupeLoadErr(arena, rec.wire()) else null,
                 });
             }
             return Views{
@@ -915,6 +956,37 @@ fn head(res: *mcp.Res, arena: std.mem.Allocator, mode: Mode, v: View) !void {
     }
     if (v.policy_exhausted.len > 0)
         try res.textf("network policy exhausted ({s}): reads still answer, new traffic is refused (web_policy has the accounting)", .{v.policy_exhausted});
+    // A load that is HELD or FAILED must be stated on every reply, or
+    // "loading" reads as slow instead of stuck (a self-signed router
+    // once cost a whole session of guessing).
+    if (v.cert) |ce| {
+        try res.raw("cert", try certJson(arena, ce));
+        const subject = if (ce.subject.len > 0) ce.subject else "(unknown)";
+        const issuer = if (ce.issuer.len > 0) ce.issuer else "(unknown)";
+        const host = if (ce.host.len > 0) ce.host else ce.url;
+        if (std.mem.eql(u8, ce.state, "pending"))
+            try res.textf("certificate error on {s}: {s} - the load is HELD until the user answers the interstitial in that pane; no tool here can answer it", .{ host, ce.msg })
+        else if (std.mem.eql(u8, ce.state, "accepted"))
+            try res.textf("certificate on {s} accepted by fingerprint for this view ({s}; sha256 {s})", .{ host, ce.msg, ce.fingerprint })
+        else
+            try res.textf("certificate REFUSED on {s}: {s}; issued to {s} by {s}; sha256 {s}. The load failed closed. To trust exactly this certificate, web_open again with accept_cert set to that fingerprint", .{ host, ce.msg, subject, issuer, if (ce.fingerprint.len > 0) ce.fingerprint else "(unavailable)" });
+    }
+    if (v.load_error) |le| {
+        try res.raw("load_error", try loadErrJson(arena, le));
+        try res.textf("load failed: {s} ({d}) for {s}", .{ le.msg, le.code, if (le.url.len > 0) le.url else v.url });
+    }
+}
+
+fn certJson(arena: std.mem.Allocator, ce: CertState) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(ce, .{}, &aw.writer);
+    return aw.written();
+}
+
+fn loadErrJson(arena: std.mem.Allocator, le: LoadErrState) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(le, .{}, &aw.writer);
+    return aw.written();
 }
 
 /// A payload section: a `--- name ---` rule, then the raw text.
@@ -946,6 +1018,14 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
         try w.writeAll(",\"title\":");
         try std.json.Stringify.value(v.title, .{}, w);
         try w.print(",\"loading\":{},\"can_back\":{},\"can_fwd\":{}", .{ v.loading, v.can_back, v.can_fwd });
+        if (v.cert) |ce| {
+            try w.writeAll(",\"cert\":");
+            try w.writeAll(try certJson(arena, ce));
+        }
+        if (v.load_error) |le| {
+            try w.writeAll(",\"load_error\":");
+            try w.writeAll(try loadErrJson(arena, le));
+        }
         if (mode == .gui) try w.print(",\"focused\":{},\"visible\":{}", .{ v.focused, v.visible });
         // GUI mode omits both: its containers are the user's own, and
         // `web-list` does not report them (yet).
@@ -975,7 +1055,7 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
             if (title.len > 0) title else "",
             if (title.len > 0) "\" - " else "",
             if (url.len > 0) url else "(blank document)",
-            if (v.loading) " (loading)" else "",
+            try loadMark(arena, v),
             // Only when the view is NOT in the shared jar: the default
             // is the overwhelming case and needs no word per line.
             if (v.profile.len > 0) " [profile " else if (std.mem.eql(u8, v.profile_kind, "ephemeral")) " [ephemeral identity]" else "",
@@ -985,6 +1065,17 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
     }
     if (vs.views.len > 0) try res.text("* = the view a web_* call with no 'pane' addresses");
     return res.finish();
+}
+
+/// The per-line load marker in the tabs listing: a held or failed load
+/// must be visible in the one place that lists every view.
+fn loadMark(arena: std.mem.Allocator, v: View) ![]const u8 {
+    if (v.cert) |ce| {
+        if (std.mem.eql(u8, ce.state, "pending")) return " (HELD on a certificate error)";
+        if (std.mem.eql(u8, ce.state, "refused")) return try std.fmt.allocPrint(arena, " (certificate REFUSED: {s})", .{ce.msg});
+    }
+    if (v.load_error) |le| return try std.fmt.allocPrint(arena, " (load failed: {s})", .{le.msg});
+    return if (v.loading) " (loading)" else "";
 }
 
 /// What a snapshot round trip produced, once the timeout/error cases
@@ -1028,7 +1119,9 @@ fn openResult(
         }
     }
     try res.field("settled", settled);
-    if (!settled)
+    if (!settled and v.loadBlocked())
+        try res.text("the requested page did not load (the certificate or load error above says why); nothing was snapshotted")
+    else if (!settled)
         try res.text("the page had not finished loading inside the timeout; this describes the view at that moment - call web_snapshot for the settled page");
     if (where_ignored) {
         try res.fact("where_ignored", true);
@@ -1836,9 +1929,24 @@ pub fn webTool(
         } else if (drv == .headless and profile != null) {
             if (drv.headless.profilePolicy(profile.?) != null) policy_source = "profile_default";
         }
+        // `accept_cert`: one fingerprint this view may proceed on. The
+        // GUI answers certificate errors through the user's own
+        // interstitial, so there it is a category error, not ignored.
+        const accept_cert = mcp.argStr(args, "accept_cert");
+        if (accept_cert) |fp| {
+            if (drv == .gui) return mcp.errRes(arena, .invalid_args, "accept_cert is headless only: with a GUI attached the user answers certificate errors in the pane's interstitial");
+            if (!navfault.validFingerprint(fp)) return mcp.errRes(arena, .invalid_args, "accept_cert must be the certificate's SHA-256 as 64 hex digits (the 'cert.fingerprint' a refused open reported)");
+        }
         const new_handle: u32 = switch (try openView(drv, arena, url, where, vw, vh, spec, if (policy) |*p| p else null)) {
             .err => |e| return failRes(arena, e),
             .opened => |p| p,
+        };
+        // Before the first pump: the hold this navigation raises must
+        // be answered against it.
+        if (accept_cert) |fp| drv.headless.setAcceptCert(new_handle, fp) catch |e| switch (e) {
+            error.NoView => return mcp.errRes(arena, .io_failed, "the view vanished before its certificate rule could be set"),
+            error.InvalidFingerprint => unreachable,
+            else => return mcp.errRes(arena, .io_failed, "could not record accept_cert on the new view"),
         };
 
         // Settle: a fresh view needs the helper handshake plus the
@@ -1884,6 +1992,10 @@ pub fn webTool(
                         if (drv == .headless) drv.headless.closeView(new_handle);
                         return mcp.errRes(arena, .conflict, "the browser helper could not hold the requested network policy (its policy table is full); the view was closed un-navigated — close other views with web_close and retry");
                     }
+                    // A held certificate or a failed load: the page is
+                    // not coming, and the reply must say so NOW rather
+                    // than after the whole timeout with "not settled".
+                    if (found.loadBlocked()) break;
                     // A view created blank has load_seq 0 to start
                     // with; anything it has already finished by the
                     // first poll is a load this call caused.
@@ -1898,6 +2010,14 @@ pub fn webTool(
         const remaining = @max(deadline - drv.now(), 2000);
         var snap: ?Snap = null;
         var snap_err: ?[]const u8 = null;
+        if (v.loadBlocked()) {
+            // Whatever document the view holds is the engine's error
+            // page or the blank one; a tree of it reads as "the page
+            // is empty", which is the wrong conclusion.
+            snap_err = "skipped: the requested page did not load";
+            const echo: ?*const webdrive.NetPolicy = if (policy) |*p| p else if (drv == .headless and std.mem.eql(u8, policy_source, "profile_default")) drv.headless.profilePolicy(profile.?) else null;
+            return openResult(arena, drv.mode(), v, false, drv == .headless and !eql(u8, where, "tab"), null, snap_err, echo, policy_source, open_views);
+        }
         // `snapshot:"none"` skips the tree for opens that only need a
         // view (a screenshot, a viewport): the full tree of a page the
         // caller will not read is the single most expensive part of
@@ -1990,6 +2110,7 @@ pub fn webTool(
             const now = try listViews(drv, arena) orelse break;
             const found = viewFor(now, view.pane) orelse break;
             settled = found;
+            if (found.loadBlocked()) break;
             if (found.loading) {
                 was_loading = true;
                 continue;
@@ -3034,6 +3155,18 @@ fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: V
                 if (viewFor(vs, view.pane)) |v| {
                     last = v;
                     if (std.mem.eql(u8, what, "load")) {
+                        // A load that cannot arrive is an error now,
+                        // not a timeout later.
+                        if (v.cert) |ce| if (!std.mem.eql(u8, ce.state, "accepted"))
+                            return mcp.errRes(arena, .refused, try std.fmt.allocPrint(arena, "the load is {s} on a certificate error for {s}: {s} (sha256 {s}); {s}", .{
+                                if (std.mem.eql(u8, ce.state, "pending")) "HELD" else "REFUSED",
+                                if (ce.host.len > 0) ce.host else ce.url,
+                                ce.msg,
+                                if (ce.fingerprint.len > 0) ce.fingerprint else "unavailable",
+                                if (std.mem.eql(u8, ce.state, "pending")) "only the user can answer the interstitial in that pane" else "web_open again with accept_cert set to that fingerprint to trust exactly this certificate",
+                            }));
+                        if (v.load_error) |le|
+                            return mcp.errRes(arena, .io_failed, try std.fmt.allocPrint(arena, "the load failed: {s} ({d}) for {s}", .{ le.msg, le.code, if (le.url.len > 0) le.url else v.url }));
                         if (!v.loading and v.url.len > 0) return waitResult(arena, drv.mode(), v, what, arg, "the view reports no load in flight");
                     } else if (arg.len == 0) {
                         if (v.title.len > 0) return waitResult(arena, drv.mode(), v, what, arg, "the page has a title");
@@ -3196,6 +3329,65 @@ test "web_tabs: views are structured, the text lane marks the current one" {
     try t.expectEqual(@as(i64, 12), gviews[0].object.get("pane").?.integer);
     try t.expectEqual(@as(i64, 12), gviews[0].object.get("view").?.integer);
     try t.expect(gviews[0].object.get("visible") != null);
+}
+
+test "a refused certificate is a fact and a sentence on every result, and web_open says the page did not load" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var v = EXAMPLE;
+    v.url = "https://10.47.0.1/";
+    v.title = "";
+    v.cert = .{
+        .state = "refused",
+        .code = -202,
+        .url = "https://10.47.0.1/",
+        .host = "10.47.0.1",
+        .msg = "CERT_AUTHORITY_INVALID",
+        .subject = "CN=fritz.box",
+        .issuer = "CN=fritz.box",
+        .fingerprint = "ab" ** 32,
+    };
+    v.load_error = .{ .code = -202, .url = "https://10.47.0.1/", .msg = "ERR_CERT_AUTHORITY_INVALID" };
+    try t.expect(v.loadBlocked());
+
+    const opened = try openResult(arena, .headless, v, false, false, null, "skipped: the requested page did not load", null, "none", 1);
+    const parsed = try mcp.expectToolResultShape(arena, "web_open", opened);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expect(!sc.get("settled").?.bool);
+    const cert = sc.get("cert").?.object;
+    try t.expectEqualStrings("refused", cert.get("state").?.string);
+    try t.expectEqualStrings("ab" ** 32, cert.get("fingerprint").?.string);
+    try t.expectEqual(@as(i64, -202), sc.get("load_error").?.object.get("code").?.integer);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "certificate REFUSED on 10.47.0.1: CERT_AUTHORITY_INVALID") != null);
+    try t.expect(std.mem.indexOf(u8, text, "accept_cert") != null);
+    try t.expect(std.mem.indexOf(u8, text, "did not load") != null);
+    try t.expect(std.mem.indexOf(u8, text, "inside the timeout") == null);
+
+    // The tabs listing marks it on the view's own line.
+    const tabs = try tabsResult(arena, .headless, .{ .views = &.{v}, .helper = "ready" });
+    const tp = try mcp.expectToolResultShape(arena, "web_tabs", tabs);
+    const ttext = tp.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, ttext, "(certificate REFUSED: CERT_AUTHORITY_INVALID)") != null);
+    const row = tp.object.get("structuredContent").?.object.get("views").?.array.items[0].object;
+    try t.expectEqualStrings("refused", row.get("cert").?.object.get("state").?.string);
+
+    // A GUI hold reads as HELD, with the way out named.
+    v.cert.?.state = "pending";
+    v.load_error = null;
+    const held = try navigateResult(arena, .gui, v, null, "", null);
+    const htext = (try mcp.expectToolResultShape(arena, "web_navigate", held)).object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, htext, "HELD until the user answers the interstitial") != null);
+
+    // An accepted one is not blocking and says what the page stands on.
+    v.cert.?.state = "accepted";
+    try t.expect(!v.loadBlocked());
+    const ok = try navigateResult(arena, .headless, v, null, "", null);
+    const otext = (try mcp.expectToolResultShape(arena, "web_navigate", ok)).object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, otext, "accepted by fingerprint") != null);
 }
 
 test "web_open: the snapshot rides both lanes, situational notes only in text" {

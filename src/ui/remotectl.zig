@@ -902,6 +902,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
 
 const webface = @import("webface.zig");
 const web_proto = @import("../web/protocol.zig");
+const navfault = @import("../web/navfault.zig");
 
 /// One web view, as `web-list` reports it. The handle is the PANE id,
 /// so it addresses the same thing `list` does.
@@ -919,6 +920,9 @@ const WebViewInfo = struct {
     /// navigation needs it: `loading:false` is also true in the gap
     /// between asking for a page and the engine starting it.
     load_seq: u32,
+    /// Why a load is held or failed (`navfault`); absent when neither.
+    cert: ?navfault.CertWire,
+    load_error: ?navfault.LoadErrWire,
 };
 
 fn webFaceOf(self: *Window, req: ipc_protocol.Request) ?*webface.WebFace {
@@ -957,6 +961,8 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
                         .focused = focused == p and cur == face,
                         .visible = p.webFaceVisible() and cur == face,
                         .load_seq = face.load_seq,
+                        .cert = if (face.cert_rec) |*rec| rec.wire() else null,
+                        .load_error = if (face.load_error_rec) |*rec| rec.wire() else null,
                     });
                 }
             }

@@ -59,6 +59,7 @@ const strz = @import("../util/strz.zig");
 const muxclient = @import("../mux/client.zig");
 const display = @import("../mux/display.zig");
 const proto = @import("../web/protocol.zig");
+const navfault = @import("../web/navfault.zig");
 const reader_model = @import("../web/reader.zig");
 const reader_guards = @import("../web/reader_guards.zig");
 const findbin = @import("../web/findbin.zig");
@@ -240,9 +241,28 @@ pub const View = struct {
     console_next_id: u32 = 1,
     console_dropped: u32 = 0,
 
+    /// The certificate verdict on this view's current navigation
+    /// (`ev_cert_error`). This driver ANSWERS the hold itself, so a view
+    /// here is never "pending": it is refused (the default, fail closed)
+    /// or accepted (`accept_fingerprint` matched). Cleared by the next
+    /// started load, except an accepted one on the same host, which is
+    /// what the loaded page stands on and must keep saying so.
+    cert: ?navfault.CertRec = null,
+    /// The last main-frame load failure (`ev_load_error`), cleared by
+    /// the next started load. A refused certificate produces one too,
+    /// so `cert` explains it.
+    load_error: ?navfault.LoadErrRec = null,
+    /// SHA-256 (lowercase hex) of the ONE certificate this view may
+    /// proceed on. Every other certificate error is refused; nothing is
+    /// remembered engine-side either (`proto.CertDecision`). Owned.
+    accept_fingerprint: ?[]u8 = null,
+
     fn deinit(self: *View, gpa: std.mem.Allocator) void {
         for (self.console.items) |line| gpa.free(line.text);
         self.console.deinit(gpa);
+        if (self.cert) |*rec| rec.free(gpa);
+        if (self.load_error) |*rec| rec.free(gpa);
+        if (self.accept_fingerprint) |f| gpa.free(f);
         if (self.url) |u| gpa.free(u);
         if (self.title) |t| gpa.free(t);
         if (self.profile) |p| gpa.free(p);
@@ -260,6 +280,7 @@ pub const View = struct {
 };
 
 pub const ConsoleLine = struct { id: u32, level: u8, text: []u8 };
+
 
 /// Console mirror bounds: entries kept per view, bytes kept per line.
 pub const CONSOLE_CAP = 200;
@@ -1842,6 +1863,24 @@ pub const Engine = struct {
         self.send(proto.Navigate{ .view = id, .url = url }) catch return error.Unavailable;
     }
 
+    /// The one rule for when the records stop describing the view.
+    fn loadStarted(self: *Engine, v: *View, url: []const u8) void {
+        navfault.loadStarted(self.gpa, &v.cert, &v.load_error, url);
+    }
+
+    /// Let ONE certificate through on this view, by fingerprint. Set
+    /// right after `openViewIn` and before the first pump, so the hold
+    /// the navigation raises is answered against it; it stays for the
+    /// view's life, so a later navigation to the same device is not a
+    /// second interstitial.
+    pub fn setAcceptCert(self: *Engine, id: u32, fingerprint: []const u8) !void {
+        const v = self.findView(id) orelse return error.NoView;
+        if (!navfault.validFingerprint(fingerprint)) return error.InvalidFingerprint;
+        const lowered = try std.ascii.allocLowerString(self.gpa, fingerprint);
+        if (v.accept_fingerprint) |old| self.gpa.free(old);
+        v.accept_fingerprint = lowered;
+    }
+
     pub fn navAction(self: *Engine, id: u32, action: proto.NavAct) !void {
         if (!self.ensure()) return error.Unavailable;
         const v = self.findView(id) orelse return error.NoView;
@@ -2401,6 +2440,7 @@ pub const Engine = struct {
                         @intFromEnum(proto.LoadState.started) => {
                             v.loading = true;
                             v.reader_guards.invalidate();
+                            self.loadStarted(v, if (ev.url.len > 0) ev.url else (v.url orelse ""));
                         },
                         @intFromEnum(proto.LoadState.finished), @intFromEnum(proto.LoadState.failed) => {
                             v.loading = false;
@@ -2409,6 +2449,28 @@ pub const Engine = struct {
                         else => {},
                     }
                     if (ev.url.len > 0) self.setOwned(&v.url, ev.url);
+                }
+            },
+            .ev_load_error => {
+                const ev = proto.decode(proto.EvLoadError, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| {
+                    if (v.load_error) |*old| old.free(self.gpa);
+                    v.load_error = navfault.LoadErrRec.init(self.gpa, ev) catch null;
+                }
+            },
+            .ev_cert_error => {
+                // The helper HOLDS the request until this is answered
+                // and nobody else is here to answer it: a headless
+                // client that dropped the event left every self-signed
+                // device hanging forever with `loading:true`. Fail
+                // closed unless the caller named THIS certificate.
+                const ev = proto.decode(proto.EvCertError, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| {
+                    const accept = v.accept_fingerprint != null and ev.fingerprint.len > 0 and
+                        std.ascii.eqlIgnoreCase(v.accept_fingerprint.?, ev.fingerprint);
+                    if (v.cert) |*old| old.free(self.gpa);
+                    v.cert = navfault.CertRec.init(self.gpa, ev, if (accept) .accepted else .refused) catch null;
+                    self.send(proto.CertDecision{ .view = ev.view, .proceed = if (accept) 1 else 0 }) catch {};
                 }
             },
             .ev_view_create_failed => {
@@ -2956,6 +3018,108 @@ test "ev_view_create_failed marks the view and its close rolls the context back"
     for (p.eng.live.items) |ctx| {
         if (std.mem.eql(u8, ctx.name, "work")) try std.testing.expectEqual(@as(u32, 0), ctx.views);
     }
+}
+
+/// The first frame of tag `tag` in `bytes`, decoded.
+fn frameOf(comptime T: type, bytes: []const u8) ?T {
+    var reader = proto.Reader.init(bytes);
+    while ((reader.next() catch null)) |frame| {
+        if (frame.tag == T.tag) return proto.decode(T, frame.payload) catch null;
+    }
+    return null;
+}
+
+test "ev_cert_error is answered: refused by default, accepted only for the named fingerprint" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var buf: [8192]u8 = undefined;
+
+    const v = try p.eng.openViewIn("https://10.0.0.1/", 800, 600, .default, null);
+    _ = p.drain(&buf);
+    const fp = "ab" ** 32;
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    try proto.encodePayload(gpa, &payload, proto.EvCertError{
+        .view = v.id,
+        .code = -202,
+        .url = "https://10.0.0.1/",
+        .host = "10.0.0.1",
+        .msg = "CERT_AUTHORITY_INVALID",
+        .subject = "CN=fritz.box",
+        .issuer = "CN=fritz.box",
+        .fingerprint = fp,
+    });
+
+    // Nobody opted in: the hold is REFUSED at once (a dropped event
+    // used to leave the load hanging forever) and the verdict recorded.
+    p.eng.dispatch(.{ .tag = .ev_cert_error, .payload = payload.items });
+    try std.testing.expect(v.cert.?.verdict == .refused);
+    try std.testing.expectEqualStrings("CERT_AUTHORITY_INVALID", v.cert.?.msg);
+    try std.testing.expectEqualStrings(fp, v.cert.?.fingerprint);
+    const refused = frameOf(proto.CertDecision, p.drain(&buf)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 0), refused.proceed);
+
+    // The engine then fails the load; both records explain it.
+    var err_payload: std.ArrayList(u8) = .empty;
+    defer err_payload.deinit(gpa);
+    try proto.encodePayload(gpa, &err_payload, proto.EvLoadError{
+        .view = v.id,
+        .code = -202,
+        .url = "https://10.0.0.1/",
+        .msg = "ERR_CERT_AUTHORITY_INVALID",
+    });
+    p.eng.dispatch(.{ .tag = .ev_load_error, .payload = err_payload.items });
+    try std.testing.expectEqual(@as(i32, -202), v.load_error.?.code);
+
+    // Opting in names ONE certificate, case-insensitively; a string
+    // that cannot be a fingerprint is refused at the call.
+    try std.testing.expectError(error.InvalidFingerprint, p.eng.setAcceptCert(v.id, "abc"));
+    try p.eng.setAcceptCert(v.id, "AB" ** 32);
+    p.eng.dispatch(.{ .tag = .ev_cert_error, .payload = payload.items });
+    try std.testing.expect(v.cert.?.verdict == .accepted);
+    const accepted = frameOf(proto.CertDecision, p.drain(&buf)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 1), accepted.proceed);
+
+    // A started load on the same host keeps the accepted verdict (the
+    // page stands on it) and drops the stale failure; another host
+    // drops the verdict too.
+    var load_payload: std.ArrayList(u8) = .empty;
+    defer load_payload.deinit(gpa);
+    try proto.encodePayload(gpa, &load_payload, proto.EvLoad{
+        .view = v.id,
+        .state = @intFromEnum(proto.LoadState.started),
+        .url = "https://10.0.0.1/login",
+    });
+    p.eng.dispatch(.{ .tag = .ev_load, .payload = load_payload.items });
+    try std.testing.expect(v.cert != null and v.cert.?.verdict == .accepted);
+    try std.testing.expect(v.load_error == null);
+    load_payload.clearRetainingCapacity();
+    try proto.encodePayload(gpa, &load_payload, proto.EvLoad{
+        .view = v.id,
+        .state = @intFromEnum(proto.LoadState.started),
+        .url = "https://other.test/",
+    });
+    p.eng.dispatch(.{ .tag = .ev_load, .payload = load_payload.items });
+    try std.testing.expect(v.cert == null);
+
+    // A different certificate on the opted-in view is still refused.
+    var other: std.ArrayList(u8) = .empty;
+    defer other.deinit(gpa);
+    try proto.encodePayload(gpa, &other, proto.EvCertError{
+        .view = v.id,
+        .code = -201,
+        .url = "https://other.test/",
+        .host = "other.test",
+        .msg = "CERT_DATE_INVALID",
+        .subject = "",
+        .issuer = "",
+        .fingerprint = "cd" ** 32,
+    });
+    p.eng.dispatch(.{ .tag = .ev_cert_error, .payload = other.items });
+    try std.testing.expect(v.cert.?.verdict == .refused);
+    const again = frameOf(proto.CertDecision, p.drain(&buf)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u8, 0), again.proceed);
 }
 
 test "resetProfile refuses a profile in use and retires its id when free" {

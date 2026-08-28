@@ -51,6 +51,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
+const smoke_tls = @import("smoke_tls.zig");
 const tcpserver = @import("smoke/tcpserver.zig");
 const unixsock = @import("smoke/unixsock.zig");
 const proto = @import("web/protocol.zig");
@@ -2627,120 +2628,6 @@ fn writeFile(dir: []const u8, name: []const u8, body: []const u8) bool {
     return c.write(fd, body.ptr, body.len) == @as(isize, @intCast(body.len));
 }
 
-/// One openssl process serving HTTPS with a throwaway self-signed
-/// certificate, or null when the host cannot provide one.
-const BadCertServer = struct {
-    pid: c.pid_t,
-    port: u16,
-};
-
-/// Run `openssl` to completion with `args` (argv[0] included). True on
-/// a clean exit.
-fn runOpenssl(args: []const ?[*:0]const u8) bool {
-    const pid = c.fork();
-    if (pid < 0) return false;
-    if (pid == 0) {
-        // stdin from /dev/null: an `openssl req` missing a switch
-        // PROMPTS, and a prompting child would hang the whole rig.
-        const devnull = c.open("/dev/null", c.O_RDWR);
-        if (devnull >= 0) {
-            _ = c.dup2(devnull, 0);
-            _ = c.dup2(devnull, 1);
-            _ = c.dup2(devnull, 2);
-        }
-        var vec: [20:null]?[*:0]const u8 = @splat(null);
-        if (args.len >= vec.len) c._exit(127);
-        for (args, 0..) |a, i| vec[i] = a;
-        _ = c.execvp("openssl", @ptrCast(@constCast(&vec)));
-        c._exit(127);
-    }
-    var status: c_int = 0;
-    if (c.waitpid(pid, &status, 0) != pid) return false;
-    return status == 0;
-}
-
-/// Mint a self-signed certificate in `dir` and serve it on a loopback
-/// port. Null means "not available here" — a missing openssl, a port
-/// that never came up — and the caller SKIPS rather than fails.
-fn startBadCertServer(dir: []const u8) ?BadCertServer {
-    var key_buf: [128]u8 = undefined;
-    const key = std.fmt.bufPrintZ(&key_buf, "{s}/k.pem", .{dir}) catch return null;
-    var crt_buf: [128]u8 = undefined;
-    const crt = std.fmt.bufPrintZ(&crt_buf, "{s}/c.pem", .{dir}) catch return null;
-    // `-subj` is not optional: without it `req` prompts for a subject.
-    if (!runOpenssl(&[_]?[*:0]const u8{
-        "openssl", "req",    "-x509", "-newkey",       "rsa:2048",
-        "-keyout", key.ptr,  "-out",  crt.ptr,         "-days",
-        "1",       "-nodes", "-subj", "/CN=localhost",
-    })) return null;
-
-    // A port derived from the pid keeps two concurrent rigs apart
-    // without a discovery protocol; a busy one simply fails to serve
-    // and the stage skips.
-    const port: u16 = @intCast(20000 + @mod(c.getpid(), 20000));
-    var port_buf: [16]u8 = undefined;
-    const port_z = std.fmt.bufPrintZ(&port_buf, "{d}", .{port}) catch return null;
-
-    // The document the two stages load. It has to be a REAL file
-    // served over TLS, because a permission prompt needs a secure
-    // context and a `data:` url is not one.
-    if (!writeFile(dir, "geo.html", geo_page)) return null;
-
-    const pid = c.fork();
-    if (pid < 0) return null;
-    if (pid == 0) {
-        const devnull = c.open("/dev/null", c.O_RDWR);
-        if (devnull >= 0) {
-            _ = c.dup2(devnull, 0);
-            _ = c.dup2(devnull, 1);
-            _ = c.dup2(devnull, 2);
-        }
-        // `-WWW` serves files relative to the CWD, which is how the
-        // page above reaches the engine over https.
-        var dir_z: [128:0]u8 = @splat(0);
-        if (dir.len >= dir_z.len) c._exit(127);
-        @memcpy(dir_z[0..dir.len], dir);
-        if (c.chdir(&dir_z) != 0) c._exit(127);
-        var vec: [12:null]?[*:0]const u8 = @splat(null);
-        vec[0] = "openssl";
-        vec[1] = "s_server";
-        vec[2] = "-key";
-        vec[3] = key.ptr;
-        vec[4] = "-cert";
-        vec[5] = crt.ptr;
-        vec[6] = "-accept";
-        vec[7] = port_z.ptr;
-        vec[8] = "-WWW";
-        vec[9] = "-quiet";
-        _ = c.execvp("openssl", @ptrCast(@constCast(&vec)));
-        c._exit(127);
-    }
-    // Wait for the port to accept, which is also how a dead openssl
-    // (missing binary, busy port) is noticed.
-    const deadline = nowMs() + 5000;
-    while (nowMs() < deadline) {
-        var status: c_int = 0;
-        if (c.waitpid(pid, &status, c.WNOHANG) == pid) return null;
-        if (probePort(port)) return .{ .pid = pid, .port = port };
-        _ = c.usleep(100_000);
-    }
-    _ = c.kill(pid, c.SIGKILL);
-    var status: c_int = 0;
-    _ = c.waitpid(pid, &status, 0);
-    return null;
-}
-
-fn probePort(port: u16) bool {
-    const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-    if (fd < 0) return false;
-    defer _ = c.close(fd);
-    var addr = std.mem.zeroes(c.struct_sockaddr_in);
-    addr.sin_family = c.AF_INET;
-    addr.sin_port = std.mem.nativeToBig(u16, port);
-    addr.sin_addr.s_addr = std.mem.nativeToBig(u32, 0x7f000001);
-    return c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_in)) == 0;
-}
-
 /// A counter plus the value it must pass: what every wait in the
 /// certificate stage is actually watching (Zig has no closures, so the
 /// baseline has to travel with the predicate).
@@ -2765,15 +2652,15 @@ fn driveUntil(cl: *Client, timeout_ms: i64, ctx: anytype, comptime pred: fn (@Ty
 /// nobody, which is what makes "error again, then allow" the only
 /// ordering that tests both answers.
 fn certStage(cl: *Client, dir: []const u8) void {
-    const server = startBadCertServer(dir) orelse {
+    // The document the two stages load. It has to be a REAL file
+    // served over TLS, because a permission prompt needs a secure
+    // context and a `data:` url is not one.
+    if (!writeFile(dir, "geo.html", geo_page)) fail("cannot write geo.html");
+    const server = smoke_tls.start(dir) orelse {
         say("smoke-web: SKIP stage 22f bad certificate (no usable openssl s_server on this host)");
         return;
     };
-    defer {
-        _ = c.kill(server.pid, c.SIGKILL);
-        var status: c_int = 0;
-        _ = c.waitpid(server.pid, &status, 0);
-    }
+    defer server.stop();
 
     var url_buf: [64]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "https://127.0.0.1:{d}/geo.html", .{server.port}) catch
@@ -4238,12 +4125,8 @@ fn runActionStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
     // Repeat with HTTPS against the rig's self-signed loopback server.
     // The document uses the extension HOST itself; accepting its cert for
     // this request must not grant the extension origin's privileges.
-    if (startBadCertServer(dir)) |server| {
-        defer {
-            _ = c.kill(server.pid, c.SIGKILL);
-            var status: c_int = 0;
-            _ = c.waitpid(server.pid, &status, 0);
-        }
+    if (smoke_tls.start(dir)) |server| {
+        defer server.stop();
         var same_https_buf: [256]u8 = undefined;
         const same_https = std.fmt.bufPrint(&same_https_buf, "https://{s}:{d}/origin.html", .{ origin_host, server.port }) catch
             fail("stage 40 same-host HTTPS URL");

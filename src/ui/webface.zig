@@ -230,6 +230,7 @@ const webframe = @import("webframe.zig");
 const secrets = @import("secrets.zig");
 const suggest = @import("../util/suggest.zig");
 const urlhost = @import("../web/urlhost.zig");
+const navfault = @import("../web/navfault.zig");
 const omnibox = @import("omnibox.zig");
 const axtree = @import("../web/axtree.zig");
 const webproj = @import("../a11y/webproj.zig");
@@ -3006,6 +3007,12 @@ pub const WebFace = struct {
     /// error the cancellation produces is not also shown as a failure
     /// (the interstitial already said what happened).
     cert_cancelled: bool = false,
+    /// What the interstitial asks about (verdict `pending`) or last
+    /// answered, and the last main-frame failure: `web-list` reports
+    /// both, so a remote caller learns WHY a load is held instead of
+    /// watching `loading:true` forever. Shared rule: `navfault`.
+    cert_rec: ?navfault.CertRec = null,
+    load_error_rec: ?navfault.LoadErrRec = null,
     /// Permission prompts the helper is holding for this view, oldest
     /// first; the banner shows `[0]`. Bounded by the helper, which holds
     /// at most four per view.
@@ -3468,6 +3475,8 @@ pub const WebFace = struct {
         self.cancelHints();
         self.hints_items.deinit(self.allocator);
         if (self.pending_url) |u| self.allocator.free(u);
+        if (self.cert_rec) |*rec| rec.free(self.allocator);
+        if (self.load_error_rec) |*rec| rec.free(self.allocator);
         if (self.url) |u| self.allocator.free(u);
         if (self.title) |t| self.allocator.free(t);
         // The helper cancels whatever it still holds for a destroyed
@@ -6019,6 +6028,7 @@ pub const WebFace = struct {
         // A document changing state is about to paint.
         self.promote();
         if (ev.state == @intFromEnum(proto.LoadState.started)) {
+            navfault.loadStarted(self.allocator, &self.cert_rec, &self.load_error_rec, ev.url);
             self.cancelHints();
             self.invalidateReaderGuards();
             self.crashed = false;
@@ -6054,6 +6064,8 @@ pub const WebFace = struct {
     }
 
     pub fn onLoadError(self: *WebFace, ev: proto.EvLoadError) void {
+        if (self.load_error_rec) |*old| old.free(self.allocator);
+        self.load_error_rec = navfault.LoadErrRec.init(self.allocator, ev) catch null;
         // A request this face is asking about, or just cancelled from
         // the interstitial, fails by design: the interstitial is the
         // explanation, and the generic overlay on top of it would only
@@ -6085,6 +6097,8 @@ pub const WebFace = struct {
     pub fn onCertError(self: *WebFace, ev: proto.EvCertError) void {
         self.cert_pending = true;
         self.cert_cancelled = false;
+        if (self.cert_rec) |*old| old.free(self.allocator);
+        self.cert_rec = navfault.CertRec.init(self.allocator, ev, .pending) catch null;
         if (self.widgets_dead) return;
         // The generic status overlay would otherwise sit on top of the
         // interstitial saying the same thing in weaker words.
@@ -6117,6 +6131,7 @@ pub const WebFace = struct {
         if (!self.cert_pending) return;
         self.cert_pending = false;
         self.cert_cancelled = !proceed;
+        if (self.cert_rec) |*rec| rec.verdict = if (proceed) .accepted else .refused;
         // A helper without the capability never sent the event, so it
         // can only be a decision for a request nobody holds.
         if (self.cl.has_tls) self.cl.post(proto.CertDecision{
