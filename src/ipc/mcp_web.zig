@@ -3204,6 +3204,11 @@ fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: V
     var last: View = view;
     var last_rev: i64 = -1;
     var quiet_since = drv.now();
+    // How often the tree moved while an idle wait watched it: a page
+    // that polls never idles, and the timeout must say that rather than
+    // read as "slow".
+    var rev_changes: u32 = 0;
+    const started = drv.now();
     while (true) {
         if (std.mem.eql(u8, what, "load") or std.mem.eql(u8, what, "title")) {
             if (try listViews(drv, arena)) |vs| {
@@ -3253,6 +3258,7 @@ fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: V
                 .done => |r| {
                     if (!r.timed_out) {
                         if (r.rev != last_rev) {
+                            if (last_rev != -1) rev_changes += 1;
                             last_rev = r.rev;
                             quiet_since = drv.now();
                         } else if (drv.now() - quiet_since >= 600) {
@@ -3269,6 +3275,14 @@ fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: V
     }
     // A condition that never held is an ERROR, not a settled result the
     // caller has to re-read to notice.
+    if (std.mem.eql(u8, what, "idle") and rev_changes > 0) {
+        const secs = @max(@divTrunc(drv.now() - started, 1000), 1);
+        return mcp.errRes(arena, .timeout, try std.fmt.allocPrint(
+            arena,
+            "web_wait for idle never held: the DOM changed {d} times in {d}s (about every {d}ms) - this page updates itself continuously (polling, a clock, an animation), so it never idles; wait for:\"text\" with the content you expect instead, or act directly",
+            .{ rev_changes, secs, @divTrunc((drv.now() - started), @as(i64, rev_changes)) },
+        ));
+    }
     return mcp.errRes(arena, .timeout, if (arg.len > 0)
         try std.fmt.allocPrint(arena, "web_wait for {s} \"{s}\" never held inside the timeout", .{ what, arg })
     else
