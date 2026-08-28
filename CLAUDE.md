@@ -104,6 +104,10 @@ it is loaded, because breaking one is how each was learned:
   - A new server-side capability (lane, backend, mode, optional dep) is
     a `capabilities` fact in the SAME commit, schema included; consumers
     must never have to fingerprint behaviour.
+  - A held certificate error is ANSWERED by every client: headless fails
+    closed (`accept_cert` opts one fingerprint in), the GUI asks its user,
+    and both report it as a `cert` fact. A dropped `ev_cert_error` is a
+    load that hangs forever.
 
 - **`src/mux/CLAUDE.md`** — the session daemon, wire protocol, transports,
   Wayland app forwarding, audio, external displays.

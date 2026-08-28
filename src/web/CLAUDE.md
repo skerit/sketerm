@@ -1118,6 +1118,52 @@ H.264/AAC) while the distro build enables them.
     (bounded, 1.5s) until the value contains `want`. Without it stage
     3c failed about once in a hundred runs with a connected control
     reading "".
+- **Repeated siblings are ROWS, without any role on the page.**
+  A grid built from divs (FRITZ!OS: 688 divs, zero `<tr>`, no role)
+  reached the walk as transparent containers and the reader as
+  NOTHING — the one thing on the page was invisible to both readers,
+  and the only path to a row's control was an `nth` index over 58
+  identical buttons. `semantic.js repeatedRows` recognises >= 3
+  siblings sharing a structural signature (tag + classes + child tags;
+  a majority of the container, or >= 8) as rows: the container is
+  emitted as `list` (so `LIST_CAP` applies), each row as `row` named by
+  its cell texts joined with ` / ` (`rowLabel`), and the reader renders
+  them as a pipe table (`rowsTable`). The reader also emits a bare
+  block's OWN text as a paragraph — but only for a block with no
+  structure inside (`hasStructure`: controls, tables, lists,
+  headings): a `<label>Owner <input></label>` flattened to a paragraph
+  loses its `Owner: jelle` line (stage 12 caught exactly that). Rows
+  are what `within_text`, the echo context and the intra-document
+  carry lean on: a row's name is the distinctive parent anchor
+  identical buttons never had.
+- **`within_text` is resolved HERE, from the live tree**
+  (`View.queryWithinText`, `SemQuery.within_text`, a JSON `{text, name,
+  role}` argument): each candidate's anchor is its nearest
+  ancestor-or-self whose subtree text contains `text`; the smallest
+  anchor wins; two different anchors of that size are `ambiguous` and
+  said so. No row role is needed for it, rows only make the anchors
+  small. `SemQuery.form` lists `FORM_ROLES` controls with value, states
+  and their `describeContext` row. Both kinds are named through
+  `SemQuery.fromName` — the one place the kind vocabulary is parsed,
+  for both backends.
+- **An action echo names the ROW** (`describeContext`, roles in
+  `CONTEXT_ROLES`): `click on button "Edit" in row "PC-5 / LAN 5 /
+  10.47.1.30 / Edit" at x,y`. With N identical controls the target
+  alone was the identical string for the wrong row and the right one.
+  An eval element result carries the same as `context`. And an
+  "unknown id" says WHICH kind (`unknownReason`): never issued, a
+  truncation marker, the previous document, or an element the page
+  replaced since it was listed — the last is what a long-polling admin
+  page does between an eval and the act.
+- **The browser's idle re-arms a stuck semantic load.**
+  `sem_nav.loading` is set by a main-frame `OnLoadStart` and cleared
+  ONLY by `semRearm` (main-frame `OnLoadEnd`), a stop, or a crash; a
+  navigation shape that starts without ending left every action refused
+  as "navigating" while `web_tabs` said `loading:false`.
+  `OnLoadingStateChange(false)` fires after every load-end/error, so
+  `semnav.State.stuckLoading` there (loading, and not an explicit
+  navigation still awaiting its start) re-arms. The four refusal
+  strings name `web_navigate action:stop` as the way out.
 - **Truncation is VISIBLE, as a `more` node.** A list-ish container
   (`LIST_TAGS` by tag, or an aria list/grid/tree role) past `LIST_CAP`
   children describes its first 50 and then emits one node with role

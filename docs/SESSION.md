@@ -1,5 +1,83 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-28: the web tools on a router's admin UI
+
+A session that set two DHCP reservations on a FRITZ!Box with the
+`web_*` tools succeeded, and its post-mortem listed everything that
+made it harder than it should have been. Each item was checked against
+the code before anything was changed (`docs/proposal-web-admin-ui.md`,
+untracked); three turned out to be bugs, the rest gaps.
+
+**The https open hung because a certificate hold was never answered.**
+The helper holds a request with a bad certificate until a
+`cert_decision` arrives (`cefhost.zig onCertificateError`). The GUI
+raises its interstitial for the user; the headless driver
+(`ipc/webdrive.zig`) simply did not dispatch `ev_cert_error` — nor
+`ev_load_error` — so a self-signed device left `web_open` on
+`loading:true` for its whole timeout with no reason anywhere. Both
+records now live in `src/web/navfault.zig`, shared by the headless
+driver and the GUI face (`WebFace.cert_rec`/`load_error_rec`, reported
+over `web-list`): every web result carries `cert` and `load_error`
+facts, `web_open`/`web_navigate`/`web_wait for:"load"` stop polling a
+load that cannot arrive, and headless FAILS CLOSED the moment the
+event lands unless `web_open accept_cert:"<sha256>"` named that exact
+fingerprint for that view. `capabilities` reports `web_cert_facts` and
+`web_accept_cert`. smoke-mcp gained a refused-certificate stage on a
+loopback openssl server (`src/smoke_tls.zig`, extracted from
+smoke-web's certificate stages); it found the second bug on its first
+run — the accepted verdict vanished because a fresh view's load-start
+event carries an EMPTY url, and "unknown host" read as "different
+host" (`navfault.loadStarted`).
+
+**The reader dropped the page.** `semantic.js markdown()` rendered
+headings, paragraphs, lists, tables and controls, and a `<div>` with
+text fell into a branch that recursed and emitted nothing — FRITZ!OS
+is 688 divs and zero `<tr>`, so `web_read` returned the intro
+paragraph and nothing else. A bare block's own text is a paragraph
+now, guarded by `hasStructure` (a `<label>Owner <input></label>`
+flattened to a paragraph lost its control line; smoke-web stage 12
+caught that within the hour).
+
+**Repeated siblings are rows.** `repeatedRows` recognises >= 3
+siblings sharing a structural signature as the rows of a list: the
+snapshot emits them as `row` under a `list` (so the 50-row cap
+applies), named by their cell texts (`PC-5 / LAN 5 / 10.47.1.30 /
+Edit`), and the reader tabulates them. smoke-web stage 12b is a
+six-row div grid in the FRITZ shape; its first run found that the
+densest div on such a page IS the list, so the region itself goes
+through `markdownNode` instead of straight to its children.
+
+**Acting on one of N identical controls.** The dangerous move in the
+session was `web_act {name:"Edit", nth:12}` with the index computed
+from a DOM query, and the echo for the wrong row (`click on button
+"Edit" at 1163,467`) was the identical string as for the right one.
+`web_act within_text:"10.47.1.106"` now resolves on the helper from
+the live tree (`SemQuery.within_text`, `semantic.zig
+queryWithinText`): each candidate's anchor is its nearest
+ancestor-or-self whose subtree contains the text, the smallest anchor
+wins, and two different anchors of that size — `10.47.1.3` inside
+`10.47.1.30`, the exact substring near-miss from the session — are
+refused as ambiguous with the places listed. The echo names the row
+(`describeContext`, `CONTEXT_ROLES`), an eval element result carries
+the same `context`, and "unknown id" says which kind it is
+(`unknownReason`: never issued / truncation marker / previous document
+/ replaced since listed — the last being what a long-polling page does
+between an eval and the act).
+
+**Smaller gaps.** `sem_nav.loading` could stick (a main-frame
+load-start with no load-end left every action refused as "navigating"
+while `web_tabs` said `loading:false`); the browser's own
+`OnLoadingStateChange(false)` fires after every load-end/error and now
+re-arms a stuck one (`semnav.State.stuckLoading`), and the refusals
+name `web_navigate action:stop`. `settleAndDelta` peeks the semantic
+revision while it watches for a navigation and waits (bounded) for the
+tree to hold still, so an XHR-rendered grid lands in the act's delta.
+`web_query kind:"form"` lists every control with value, states and
+row (`SemQuery.form`). `web_eval body:` wraps statements in an IIFE.
+`SemQuery.fromName` is the one place the query-kind vocabulary is
+parsed, for both backends. The ToolSearch prefix problem was Claude
+Code's, not ours.
+
 ## 2026-08-27: web deltas stop re-sending a page the model already saw
 
 A 250-call QA session against a zenit-cms admin panel spent more than
