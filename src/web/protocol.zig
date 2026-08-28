@@ -498,7 +498,38 @@ pub const SemAct = enum(u8) {
 /// the tab-separated format of `semantic.View.renderHints`; the walk
 /// folds into the live tree and deliberately does NOT advance the
 /// consumed base.
-pub const SemQuery = enum(u8) { find_text = 0, subtree = 1, focused = 2, visible = 3, _ };
+/// `within_text` (capability-free: an older helper answers an unknown
+/// kind with the find_text arm, whose header a client can tell apart)
+/// takes a JSON `{text, name, role}` argument and answers the
+/// candidates named `name` under the smallest node whose subtree also
+/// contains `text` — "the Edit button in the row that says 10.47.1.106".
+pub const SemQuery = enum(u8) {
+    find_text = 0,
+    subtree = 1,
+    focused = 2,
+    visible = 3,
+    within_text = 4,
+    /// Every form control in the live tree (optionally under the node
+    /// id in the argument) with its value and states: what Apply would
+    /// submit, without a DOM script.
+    form = 5,
+    _,
+
+    /// The kinds a client may name in a request, read off this enum so
+    /// a new kind is one edit here. `visible` is the hints walk and
+    /// stays behind its own tool.
+    pub fn fromName(name: []const u8) ?SemQuery {
+        const qk = std.meta.stringToEnum(SemQuery, name) orelse return null;
+        return if (qk == .visible) null else qk;
+    }
+};
+
+test "SemQuery.fromName reads the enum and withholds the hints walk" {
+    try std.testing.expectEqual(SemQuery.find_text, SemQuery.fromName("find_text").?);
+    try std.testing.expectEqual(SemQuery.within_text, SemQuery.fromName("within_text").?);
+    try std.testing.expect(SemQuery.fromName("visible") == null);
+    try std.testing.expect(SemQuery.fromName("bogus") == null);
+}
 
 // ---------------------------------------------------------------------
 // Frame payload types. Field ORDER is the wire order; every type carries

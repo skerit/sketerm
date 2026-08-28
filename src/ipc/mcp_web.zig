@@ -615,14 +615,7 @@ fn runOp(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, timeout_ms:
                 req.len = op.length;
             } else if (eql(u8, op.op, "query")) {
                 req.kind = .query;
-                const kind = op.action orelse "find_text";
-                const qk: web_proto.SemQuery = if (eql(u8, kind, "find_text"))
-                    .find_text
-                else if (eql(u8, kind, "subtree"))
-                    .subtree
-                else if (eql(u8, kind, "focused"))
-                    .focused
-                else
+                const qk = web_proto.SemQuery.fromName(op.action orelse "find_text") orelse
                     return .{ .err = fail(.invalid_args, "unknown query kind") };
                 req.action = @intFromEnum(qk);
                 req.arg = op.data orelse "";
@@ -1320,8 +1313,18 @@ fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.j
     var nav_hard = false;
     var nav_soft = false;
     var waited: u32 = 0;
-    while (waited < 300) : (waited += 100) {
+    // 300ms for a navigation to show. Then, while the tree is still
+    // churning (rows arriving over XHR after a tab click), up to 1.5s
+    // more for it to hold still: the delta below was otherwise a
+    // photograph of the moment BEFORE the content the click asked for
+    // arrived, and read as "the click did nothing". PEEK, never auto:
+    // the delta is still owed to the snapshot below.
+    var last_rev: i64 = -1;
+    var quiet_since = drv.now();
+    const churn_deadline = drv.now() + 1500;
+    while (true) {
         drv.sleep(100);
+        waited += 100;
         const vs1 = (try listViews(drv, arena)) orelse break;
         const cur = viewFor(vs1, view.pane) orelse break;
         if (cur.loading or cur.load_seq != pre_seq) {
@@ -1330,6 +1333,18 @@ fn settleAndDelta(drv: Driver, arena: std.mem.Allocator, view: View, args: std.j
         }
         if (!std.mem.eql(u8, cur.url, pre_url)) {
             nav_soft = true;
+            break;
+        }
+        switch (try runOp(drv, arena, view.pane, .{ .op = "snapshot", .mode = "peek", .detail = 0 }, 2000)) {
+            .err => break,
+            .done => |r| if (!r.timed_out and r.rev != last_rev) {
+                last_rev = r.rev;
+                quiet_since = drv.now();
+            },
+        }
+        if (waited >= 300 and drv.now() - quiet_since >= 200) break;
+        if (drv.now() >= churn_deadline) {
+            after.note = "the page was still changing 1.5s after the act (content still arriving?); the delta below is what had rendered by then - if it looks incomplete, call web_snapshot again";
             break;
         }
     }
@@ -2197,6 +2212,21 @@ pub fn webTool(
             // client-side, so a miss is retried ONCE after a fresh walk
             // (a peek: nothing consumed) and a short grace, before it
             // is reported as absent — one turn instead of two.
+            // `within_text`: the candidates under the smallest node that
+            // also contains that text — "the Edit in the row that says
+            // 10.47.1.106" — computed helper-side from the live tree,
+            // and REFUSED when the text sits in two such places rather
+            // than guessed (a substring near-miss is exactly how the
+            // wrong device's Edit button got opened in the field).
+            const within_text = mcp.argStr(args, "within_text");
+            if (within_text != null and mcp.argInt(args, "within") != null)
+                return mcp.errRes(arena, .invalid_args, "web_act takes 'within' (a node id) or 'within_text' (a row's text), not both");
+            const q_action: []const u8 = if (within_text != null) "within_text" else "find_text";
+            const q_data: []const u8 = if (within_text) |wt| blk: {
+                var aw: std.Io.Writer.Allocating = .init(arena);
+                try std.json.Stringify.value(.{ .text = wt, .name = want_name, .role = mcp.argStr(args, "role") orelse "" }, .{}, &aw.writer);
+                break :blk aw.written();
+            } else want_name;
             var attempt: usize = 0;
             while (true) : (attempt += 1) {
                 if (attempt == 1) {
@@ -2208,18 +2238,35 @@ pub fn webTool(
                 }
                 switch (try runOp(drv, arena, view.pane, .{
                     .op = "query",
-                    .action = "find_text",
-                    .data = want_name,
+                    .action = q_action,
+                    .data = q_data,
                 }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
                     .err => |e| return failRes(arena, e),
                     .done => |r| {
                         if (r.timed_out) return mcp.errRes(arena, .timeout, "the page did not answer the name lookup in time");
                         const nth: usize = @intCast(@max(mcp.argInt(args, "nth") orelse 0, 0));
-                        // `within`: only matches inside that subtree count,
-                        // so `nth` indexes the row you meant rather than
-                        // every look-alike on the page.
                         var pool: []const u8 = r.payload;
-                        if (mcp.argInt(args, "within")) |w| {
+                        if (within_text) |wt| {
+                            if (!std.mem.startsWith(u8, r.payload, "query within"))
+                                return mcp.errRes(arena, .unavailable, "the browser helper predates within_text; pass within:<row id> from web_snapshot instead");
+                            if (std.mem.indexOf(u8, r.payload, "ambiguous") != null)
+                                return mcp.errRes(arena, .conflict, try std.fmt.allocPrint(
+                                    arena,
+                                    "within_text \"{s}\" is in more than one place on the page; refusing to guess. Add more of that row's text (or use within:<id> with the row's id from web_snapshot). The places:\n{s}",
+                                    .{ wt, r.payload[0..@min(r.payload.len, 1500)] },
+                                ));
+                            if (std.mem.indexOf(u8, r.payload, "0 matches") != null or std.mem.indexOf(u8, r.payload, "no candidate") != null) {
+                                if (attempt == 0) continue;
+                                return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(
+                                    arena,
+                                    "nothing to act on for within_text \"{s}\" (looked twice, the second time after a fresh walk): {s}",
+                                    .{ wt, std.mem.trimEnd(u8, r.payload[0..@min(r.payload.len, 600)], "\n") },
+                                ));
+                            }
+                        } else if (mcp.argInt(args, "within")) |w| {
+                            // `within`: only matches inside that subtree count,
+                            // so `nth` indexes the row you meant rather than
+                            // every look-alike on the page.
                             const within_id = try std.fmt.allocPrint(arena, "{d}", .{w});
                             switch (try runOp(drv, arena, view.pane, .{
                                 .op = "query",
@@ -2245,7 +2292,7 @@ pub fn webTool(
                                 mcp.argStr(args, "role") orelse "",
                                 want_name,
                                 nth,
-                                if (mcp.argInt(args, "within") != null) " within that subtree" else "",
+                                if (mcp.argInt(args, "within") != null) " within that subtree" else if (within_text != null) " in that row" else "",
                                 pool[0..@min(pool.len, 1500)],
                             },
                         ));
@@ -2360,8 +2407,16 @@ pub fn webTool(
         // Script can fetch(): running it on an exhausted view would be
         // an unmetered side door.
         if (try policyGate(arena, view)) |f| return failRes(arena, f);
-        const code = mcp.argStr(args, "code") orelse
-            return mcp.errRes(arena, .invalid_args, "web_eval needs 'code'");
+        // `body` is a statement list; the page's CSP forbids eval() of
+        // a string and the bridge compiles a single EXPRESSION, so the
+        // wrapper that makes statements an expression lives here rather
+        // than in every caller's head.
+        const code: []const u8 = if (mcp.argStr(args, "body")) |body| blk: {
+            if (mcp.argStr(args, "code") != null)
+                return mcp.errRes(arena, .invalid_args, "web_eval takes 'code' (an expression) or 'body' (statements), not both");
+            break :blk try std.fmt.allocPrint(arena, "(() => {{\n{s}\n}})()", .{body});
+        } else mcp.argStr(args, "code") orelse
+            return mcp.errRes(arena, .invalid_args, "web_eval needs 'code' (an expression) or 'body' (statements, wrapped in a function for you)");
         const want_await = mcp.argBool(args, "await");
         const budget = timeoutOf(args, 10_000);
         const inline_limit: usize = @intCast(std.math.clamp(

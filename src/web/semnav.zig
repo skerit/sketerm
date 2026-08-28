@@ -31,6 +31,17 @@ pub const State = struct {
         self.stop_requested = false;
     }
 
+    /// The BROWSER says it finished loading (its state-change callback
+    /// fires after every load-end/error), yet no main-frame load-end
+    /// re-armed this: the semantic side is stuck in "navigating" and
+    /// every action would be refused for the page's life. True means
+    /// the caller must re-arm now. An explicit navigation still waiting
+    /// for its load-start is not stuck; the browser's idle then belongs
+    /// to the previous document.
+    pub fn stuckLoading(self: *const State) bool {
+        return self.loading and !self.waiting_load_start;
+    }
+
     pub fn requestStop(self: *State) void {
         self.stop_requested = true;
     }
@@ -53,6 +64,19 @@ test "explicit and page-driven load starts advance exactly once" {
     try std.testing.expect(!state.takeExpectedLoadStart());
     state.start(false);
     try std.testing.expect(state.generation != explicit_generation);
+}
+
+test "a browser idle with no load-end is a stuck semantic load, unless a start is still expected" {
+    var state = State{};
+    try std.testing.expect(!state.stuckLoading());
+    state.start(false);
+    try std.testing.expect(state.stuckLoading());
+    state.rearmed();
+    try std.testing.expect(!state.stuckLoading());
+    state.start(true);
+    try std.testing.expect(!state.stuckLoading());
+    try std.testing.expect(state.takeExpectedLoadStart());
+    try std.testing.expect(state.stuckLoading());
 }
 
 test "stop and rearm clear every loading edge" {

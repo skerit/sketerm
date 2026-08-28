@@ -6370,12 +6370,12 @@ pub const Host = struct {
             return;
         }
         if (v.sem_nav.loading) {
-            self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = "semantic action unavailable while the page is navigating" });
+            self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = "semantic action unavailable while the page is navigating (web_navigate action:stop clears a stuck one)" });
             return;
         }
         const eid = v.sem.eidFor(req.id);
         if (eid == 0) {
-            self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = "unknown id" });
+            self.post(proto.SemActResult{ .view = v.id, .id = req.id, .ok = 0, .msg = v.sem.unknownReason(req.id) });
             return;
         }
         var buf: [512]u8 = undefined;
@@ -6465,7 +6465,7 @@ pub const Host = struct {
             return;
         }
         if (v.sem_nav.loading) {
-            self.post(proto.SemExpandResult{ .view = v.id, .id = req.id, .off = req.off, .text = "semantic expansion unavailable while the page is navigating" });
+            self.post(proto.SemExpandResult{ .view = v.id, .id = req.id, .off = req.off, .text = "semantic expansion unavailable while the page is navigating (web_navigate action:stop clears a stuck one)" });
             return;
         }
         const eid = v.sem.eidFor(req.id);
@@ -6501,7 +6501,7 @@ pub const Host = struct {
             return;
         }
         if (v.sem_nav.loading and req.kind != @intFromEnum(proto.SemQuery.visible)) {
-            self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "semantic query unavailable while the page is navigating" } });
+            self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "semantic query unavailable while the page is navigating (web_navigate action:stop clears a stuck one)" } });
             return;
         }
         if (req.kind == @intFromEnum(proto.SemQuery.visible)) {
@@ -6555,7 +6555,7 @@ pub const Host = struct {
             return;
         }
         if (v.sem_nav.loading) {
-            self.post(proto.SemEvalResult{ .view = v.id, .ok = 0, .json = .{ .s = "{\"error\":\"semantic evaluation unavailable while the page is navigating\"}" } });
+            self.post(proto.SemEvalResult{ .view = v.id, .ok = 0, .json = .{ .s = "{\"error\":\"semantic evaluation unavailable while the page is navigating (web_navigate action:stop clears a stuck one)\"}" } });
             return;
         }
         // The code is kept with the request: a page whose CSP blocks
@@ -7008,16 +7008,23 @@ pub const Host = struct {
             std.fmt.bufPrint(&target_buf, "on {s} \"{s}\" ", .{ d.role, d.name[0..@min(d.name.len, 96)] }) catch ""
         else
             "";
-        var buf: [256]u8 = undefined;
+        // ...and WHERE: with N identical "Edit" buttons the target alone
+        // is the same string for the wrong row and the right one.
+        var ctx_buf: [160]u8 = undefined;
+        const ctx: []const u8 = if (v.sem.describeContext(p.sid)) |cx|
+            std.fmt.bufPrint(&ctx_buf, "in {s} \"{s}\" ", .{ cx.role, cx.name[0..@min(cx.name.len, 120)] }) catch ""
+        else
+            "";
+        var buf: [400]u8 = undefined;
         if (p.kind == .hover) {
-            const msg = std.fmt.bufPrint(&buf, "hover {s}at {d},{d}", .{ target, r.value.x, r.value.y }) catch "hover";
+            const msg = std.fmt.bufPrint(&buf, "hover {s}{s}at {d},{d}", .{ target, ctx, r.value.x, r.value.y }) catch "hover";
             self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 1, .msg = msg });
             return;
         }
         withHostArgs(v, setFocus, .{@as(c_int, 1)});
         withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 0), @as(c_int, 1) });
         withHostArgs(v, sendClick, .{ &ev, cef.MBT_LEFT, @as(c_int, 1), @as(c_int, 1) });
-        const msg = std.fmt.bufPrint(&buf, "click {s}at {d},{d}", .{ target, r.value.x, r.value.y }) catch "click";
+        const msg = std.fmt.bufPrint(&buf, "click {s}{s}at {d},{d}", .{ target, ctx, r.value.x, r.value.y }) catch "click";
         self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 1, .msg = msg });
     }
 
@@ -7104,6 +7111,13 @@ pub const Host = struct {
                         "note",
                         .{ .string = "this element is not in the current snapshot; take a web_snapshot to act on it" },
                     );
+                    // The row it sits in, so a caller can fall back to
+                    // web_act within_text instead of an index when the
+                    // page re-renders the element before the act.
+                    if (sid != 0) if (v.sem.describeContext(sid)) |cx| {
+                        const ctx = try std.fmt.allocPrint(arena, "{s} \"{s}\"", .{ cx.role, cx.name });
+                        try obj.put(arena, "context", .{ .string = ctx });
+                    };
                     return;
                 }
                 var it = obj.iterator();
@@ -13287,6 +13301,12 @@ fn onLoadingStateChange(
         .loading = if (is_loading != 0) 1 else 0,
         .url = v.url,
     });
+    // This fires AFTER every load-end/error. A semantic side still in
+    // "navigating" here saw a main-frame load-start with no matching
+    // end, and would refuse every action while the client's view list
+    // says loading:false (seen on a router's post-login page). The
+    // browser's word wins: re-arm now.
+    if (is_loading == 0 and v.sem_nav.stuckLoading()) host.semRearm(v);
 }
 
 fn onLoadStart(

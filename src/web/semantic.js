@@ -87,6 +87,9 @@
   var nextId = 1;
   var nextLinkGuard = 1;
   var byId = new Map(); // rebuilt by every walk: stale nodes drop out
+  // Elements the current walk recognised as ROWS of a repeated-sibling
+  // list (see `repeatedRows`); rebuilt per walk like `byId`.
+  var rowEls = new WeakSet();
   var detail = 1;
   var observer = null;
   var quiesce = null;
@@ -295,6 +298,7 @@
     var title = el.getAttribute && el.getAttribute("title");
     if (title && title.trim()) return title.trim();
     if (role === "document") return (document.title || "").trim();
+    if (role === "row" && rowEls.has(el)) return rowLabel(el);
     if (TEXTY[role]) return textOf(el);
     // Last resort for custom widgets (a div with role=combobox, a
     // menu item, a switch): its own short text is what a user reads
@@ -377,11 +381,95 @@
     return false;
   }
 
+  // -- repeated rows ----------------------------------------------------
+  //
+  // A grid built from divs (a router's device list: 59 identical
+  // `div.flexRow` siblings, zero <tr>, no role anywhere) reached the
+  // walk as transparent containers and the reader as nothing at all:
+  // the one thing on the page was invisible to both. Siblings sharing a
+  // structural signature ARE that page's rows. Naming them lets the
+  // snapshot list them (role `row` under a `list`, so the list cap
+  // applies), the reader tabulate them, an action echo say which row it
+  // acted in, and `within_text` scope a lookup to one of them.
+
+  var ROW_MIN = 3;
+
+  // tag + classes + the first child tags: what "the same kind of block"
+  // means to a template that stamped these out.
+  function sigOf(el) {
+    var cls = el.classList ? Array.prototype.slice.call(el.classList).sort().join(".") : "";
+    var s = el.tagName + "." + cls + ">";
+    var kids = el.children;
+    var n = Math.min(kids.length, 8);
+    for (var i = 0; i < n; i++) s += kids[i].tagName + ",";
+    return s;
+  }
+
+  // The row elements of `el` when its element children repeat, else
+  // null. A majority of the children, or a run long enough to be a
+  // list on its own: three matching blocks among twenty mixed ones are
+  // layout, not rows.
+  function repeatedRows(el) {
+    var kids = el.children;
+    if (!kids || kids.length < ROW_MIN) return null;
+    var counts = {};
+    var sigs = [];
+    var live = 0;
+    for (var i = 0; i < kids.length; i++) {
+      var k = kids[i];
+      if (SKIP_TAG[k.tagName] || hidden(k)) {
+        sigs.push(null);
+        continue;
+      }
+      live++;
+      var sg = sigOf(k);
+      sigs.push(sg);
+      counts[sg] = (counts[sg] || 0) + 1;
+    }
+    var best = null;
+    var bestN = 0;
+    for (var key in counts) {
+      if (counts[key] > bestN) {
+        bestN = counts[key];
+        best = key;
+      }
+    }
+    if (bestN < ROW_MIN) return null;
+    if (bestN * 2 < live && bestN < 8) return null;
+    var rows = [];
+    for (var j = 0; j < kids.length; j++) {
+      if (sigs[j] === best && textOf(kids[j])) rows.push(kids[j]);
+    }
+    return rows.length >= ROW_MIN ? rows : null;
+  }
+
+  // The visible text pieces of a row in order: its cells, whatever
+  // elements they are made of.
+  function leafTexts(el, out, depth) {
+    if (depth > 12 || out.length >= 32) return out;
+    var kids = el.children;
+    if (!kids.length || ownText(el)) {
+      var t = textOf(el);
+      if (t) out.push(t);
+      return out;
+    }
+    for (var i = 0; i < kids.length; i++) {
+      if (SKIP_TAG[kids[i].tagName] || hidden(kids[i])) continue;
+      leafTexts(kids[i], out, depth + 1);
+    }
+    return out;
+  }
+
+  function rowLabel(el) {
+    return leafTexts(el, [], 0).join(" / ");
+  }
+
   // -- the walk -------------------------------------------------------
 
   function walkTree(rootEl) {
     var out = [];
     byId = new Map();
+    rowEls = new WeakSet();
     var clamp = CLAMP[detail] || CLAMP[1];
 
     function emit(el, role, parent) {
@@ -495,7 +583,17 @@
       if (SKIP_TAG[el.tagName]) return;
       if (hidden(el)) return;
       var role = roleOf(el);
-      if (role === "generic" && ownText(el)) role = "text";
+      if (role === "generic" && rowEls.has(el)) {
+        role = "row";
+      } else if (role === "generic" && ownText(el)) {
+        role = "text";
+      } else if (role === "generic") {
+        var rows = repeatedRows(el);
+        if (rows) {
+          for (var ri = 0; ri < rows.length; ri++) rowEls.add(rows[ri]);
+          role = "list";
+        }
+      }
       if (!role || role === "generic") {
         // Transparent container: its children attach to the nearest
         // emitted ancestor, which is what keeps the tree compact.
@@ -974,45 +1072,59 @@
 
   function markdown(el, depth, out, entities) {
     if (depth > 24) return;
-    for (var i = 0; i < el.children.length; i++) {
-      var n = el.children[i];
-      var t = n.tagName;
-      if (SKIP_TAG[t] || hidden(n)) continue;
-      if (/^H[1-6]$/.test(t)) {
-        readerEntity(n, "heading", entities);
-        out.push(new Array(+t[1] + 1).join("#") + " " + inline(n, entities).trim());
-      } else if (t === "P") {
-        var p = inline(n, entities).trim();
-        if (p) out.push(p);
-      } else if (t === "PRE") {
-        out.push("```\n" + (n.textContent || "").replace(/\s+$/, "") + "\n```");
-      } else if (t === "BLOCKQUOTE") {
-        out.push("> " + inline(n, entities).trim());
-      } else if (t === "UL" || t === "OL") {
-        var items = n.children;
-        for (var k = 0; k < items.length; k++) {
-          if (items[k].tagName !== "LI") continue;
-          readerEntity(items[k], "item", entities);
-          out.push((t === "OL" ? k + 1 + ". " : "- ") + inline(items[k], entities).trim());
-        }
-      } else if (t === "HR") {
-        out.push("---");
-      } else if (t === "IMG") {
-        out.push("![" + (n.getAttribute("alt") || "") + "](" + (n.getAttribute("src") || "") + ")");
-      } else if (t === "TABLE" || TABLE_ROLES[roleAttr(n)]) {
-        table(n, out, entities);
-      } else if (t === "DL") {
-        definitions(n, out, entities);
-      } else if (t === "INPUT" || t === "SELECT" || t === "TEXTAREA") {
-        var fl = fieldLine(n);
-        if (fl) out.push(fl);
-      } else {
-        // A custom element keeps its content in an open shadow root
-        // (a <pl-table>'s rows live there); the walk descends, so the
-        // reader must too, or an admin page reads as its heading alone.
-        if (n.shadowRoot && n.shadowRoot.children) markdown(n.shadowRoot, depth + 1, out, entities);
-        markdown(n, depth + 1, out, entities);
+    for (var i = 0; i < el.children.length; i++) markdownNode(el.children[i], depth, out, entities);
+  }
+
+  // One element. The region `read` picks can itself be the row
+  // container (the densest div on a device list IS the list), so the
+  // region goes through here too rather than straight to its children.
+  function markdownNode(n, depth, out, entities) {
+    var t = n.tagName;
+    if (SKIP_TAG[t] || hidden(n)) return;
+    if (/^H[1-6]$/.test(t)) {
+      readerEntity(n, "heading", entities);
+      out.push(new Array(+t[1] + 1).join("#") + " " + inline(n, entities).trim());
+    } else if (t === "P") {
+      var p = inline(n, entities).trim();
+      if (p) out.push(p);
+    } else if (t === "PRE") {
+      out.push("```\n" + (n.textContent || "").replace(/\s+$/, "") + "\n```");
+    } else if (t === "BLOCKQUOTE") {
+      out.push("> " + inline(n, entities).trim());
+    } else if (t === "UL" || t === "OL") {
+      var items = n.children;
+      for (var k = 0; k < items.length; k++) {
+        if (items[k].tagName !== "LI") continue;
+        readerEntity(items[k], "item", entities);
+        out.push((t === "OL" ? k + 1 + ". " : "- ") + inline(items[k], entities).trim());
       }
+    } else if (t === "HR") {
+      out.push("---");
+    } else if (t === "IMG") {
+      out.push("![" + (n.getAttribute("alt") || "") + "](" + (n.getAttribute("src") || "") + ")");
+    } else if (t === "TABLE" || TABLE_ROLES[roleAttr(n)]) {
+      table(n, out, entities);
+    } else if (t === "DL") {
+      definitions(n, out, entities);
+    } else if (t === "INPUT" || t === "SELECT" || t === "TEXTAREA") {
+      var fl = fieldLine(n);
+      if (fl) out.push(fl);
+    } else if (!hasStructure(n) && repeatedRows(n)) {
+      rowsBlock(n, repeatedRows(n), depth, out, entities);
+    } else if (!hasStructure(n) && ownText(n)) {
+      // A block that carries text of its own is a paragraph, whatever
+      // its tag: an admin page is divs and spans, and dropping every
+      // one of them read the page as its heading alone. A block that
+      // also holds controls or other blocks is walked instead, so a
+      // <label>Owner <input></label> keeps its "Owner: jelle" line.
+      var own = inline(n, entities).trim();
+      if (own) out.push(own);
+    } else {
+      // A custom element keeps its content in an open shadow root
+      // (a <pl-table>'s rows live there); the walk descends, so the
+      // reader must too, or an admin page reads as its heading alone.
+      if (n.shadowRoot && n.shadowRoot.children) markdown(n.shadowRoot, depth + 1, out, entities);
+      markdown(n, depth + 1, out, entities);
     }
   }
 
@@ -1114,6 +1226,62 @@
     out.push(lines.join("\n"));
   }
 
+  // Descendants the markdown walk renders on their own (controls,
+  // blocks, tables): a container holding one is walked, never
+  // flattened to a paragraph or a table row.
+  var STRUCTURE_SEL = "input,select,textarea,table,ul,ol,dl,h1,h2,h3,h4,h5,h6,p,pre,blockquote,[role=table],[role=grid],[role=treegrid]";
+
+  function hasStructure(el) {
+    try {
+      return !!el.querySelector(STRUCTURE_SEL);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // A row container in document order: the rows become ONE table where
+  // the first of them stands, and the children that are not rows (a
+  // header line, a count) render as themselves rather than vanish.
+  function rowsBlock(el, rows, depth, out, entities) {
+    var isRow = new Set(rows);
+    var tabled = false;
+    for (var i = 0; i < el.children.length; i++) {
+      var k = el.children[i];
+      if (isRow.has(k)) {
+        if (!tabled) rowsTable(rows, out, entities);
+        tabled = true;
+        continue;
+      }
+      markdownNode(k, depth + 1, out, entities);
+    }
+  }
+
+  // Repeated div rows as a pipe table, cells being each row's text
+  // pieces; the first row is the header, as `table` treats a <tr>.
+  function rowsTable(rows, out, entities) {
+    var lines = [];
+    var width = 0;
+    var shown = 0;
+    for (var r = 0; r < rows.length && shown < TABLE_ROWS; r++) {
+      var cells = leafTexts(rows[r], [], 0);
+      if (!cells.length) continue;
+      if (cells.length > 16) cells = cells.slice(0, 16);
+      readerEntity(rows[r], "item", entities);
+      var vals = [];
+      for (var k = 0; k < cells.length; k++) vals.push(cells[k].replace(/\|/g, "\\|"));
+      lines.push("| " + vals.join(" | ") + " |");
+      shown++;
+      if (!width) {
+        width = vals.length;
+        var sep = "|";
+        for (var q = 0; q < width; q++) sep += " --- |";
+        lines.push(sep);
+      }
+    }
+    if (rows.length > shown) lines.push("| ... and " + (rows.length - shown) + " more rows |");
+    if (lines.length) out.push(lines.join("\n"));
+  }
+
   function definitions(dl, out, entities) {
     var lines = [];
     var term = "";
@@ -1151,7 +1319,7 @@
     var title = (document.title || "").trim();
     if (title) out.push("# " + title);
     if (withIds && /^(ARTICLE|MAIN|SECTION)$/.test(region.tagName || "")) readerEntity(region, "section", entities);
-    markdown(region, 0, out, entities);
+    markdownNode(region, 0, out, entities);
     var reply = { op: "markdown", req: req, url: String(location.href), md: out.join("\n\n") + "\n" };
     if (withIds) {
       reply.doc = DOC;

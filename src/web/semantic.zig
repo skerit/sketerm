@@ -1191,6 +1191,8 @@ pub const View = struct {
                 }
                 if (emitted == 0) try w.writeAll("no nodes\n");
             },
+            4 => try self.queryWithinText(w, arg),
+            5 => try self.queryForm(w, arg),
             2 => {
                 try w.writeAll("query focused\n");
                 var found = false;
@@ -1217,6 +1219,175 @@ pub const View = struct {
             },
         }
         return self.gpa.dupe(u8, out.written());
+    }
+
+    const WithinArgs = struct { text: []const u8 = "", name: []const u8 = "", role: []const u8 = "" };
+
+    /// `within_text`: the candidates named `name` (role optional) that
+    /// sit under the SMALLEST node whose subtree text contains `text`
+    /// along with them — the Edit button "in the row that says
+    /// 10.47.1.106" — with no row role needed anywhere. For every
+    /// candidate the nearest ancestor-or-self containing the text is
+    /// its anchor; the candidates whose anchor is the smallest win.
+    /// Two DIFFERENT anchors of that same size (the text in two rows,
+    /// or "10.47.1.3" inside "10.47.1.30") are ambiguous, and the
+    /// answer says so instead of picking one.
+    fn queryWithinText(self: *const View, w: *std.Io.Writer, arg: []const u8) !void {
+        const parsed = std.json.parseFromSlice(WithinArgs, self.gpa, arg, .{ .ignore_unknown_fields = true }) catch {
+            try w.writeAll("query within: bad arguments\n");
+            return;
+        };
+        defer parsed.deinit();
+        const a = parsed.value;
+        const nodes = self.nodes.items;
+        var idx = std.AutoHashMap(u32, usize).init(self.gpa);
+        defer idx.deinit();
+        for (nodes, 0..) |nd, i| try idx.put(nd.sid, i);
+        const has = try self.gpa.alloc(bool, nodes.len);
+        defer self.gpa.free(has);
+        const size = try self.gpa.alloc(u32, nodes.len);
+        defer self.gpa.free(size);
+        for (nodes, 0..) |nd, i| {
+            has[i] = containsFold(nd.name, a.text) or containsFold(nd.value, a.text);
+            size[i] = 1;
+        }
+        // Document order lists children after their parent, so one
+        // reverse pass folds each subtree into its parent.
+        var i = nodes.len;
+        var anywhere = false;
+        while (i > 0) {
+            i -= 1;
+            if (has[i]) anywhere = true;
+            if (nodes[i].parent_sid == 0) continue;
+            const p = idx.get(nodes[i].parent_sid) orelse continue;
+            if (has[i]) has[p] = true;
+            size[p] += size[i];
+        }
+        if (!anywhere) {
+            try w.print("query within \"{s}\" 0 matches: that text is nowhere on the page\n", .{a.text});
+            return;
+        }
+        const Cand = struct { index: usize, anchor: usize };
+        var cands: std.ArrayList(Cand) = .empty;
+        defer cands.deinit(self.gpa);
+        var best_size: u32 = std.math.maxInt(u32);
+        var best_anchor: ?usize = null;
+        var tie = false;
+        for (nodes, 0..) |nd, ci| {
+            if (!containsFold(nd.name, a.name)) continue;
+            if (a.role.len > 0 and !std.ascii.eqlIgnoreCase(nd.role, a.role)) continue;
+            var cur = ci;
+            var guard: usize = 0;
+            var found: ?usize = null;
+            while (guard < 512) : (guard += 1) {
+                if (has[cur]) {
+                    found = cur;
+                    break;
+                }
+                if (nodes[cur].parent_sid == 0) break;
+                cur = idx.get(nodes[cur].parent_sid) orelse break;
+            }
+            const anchor = found orelse continue;
+            try cands.append(self.gpa, .{ .index = ci, .anchor = anchor });
+            if (size[anchor] < best_size) {
+                best_size = size[anchor];
+                best_anchor = anchor;
+                tie = false;
+            } else if (size[anchor] == best_size and best_anchor != null and anchor != best_anchor.?) {
+                tie = true;
+            }
+        }
+        if (cands.items.len == 0) {
+            try w.print("query within \"{s}\" no candidate named \"{s}\"\n", .{ a.text, a.name });
+            return;
+        }
+        if (tie) {
+            try w.print("query within \"{s}\" ambiguous: the text sits in more than one place at the same depth\n", .{a.text});
+            var listed: usize = 0;
+            var seen_anchor: ?usize = null;
+            for (cands.items) |cd| {
+                if (size[cd.anchor] != best_size) continue;
+                if (seen_anchor != null and seen_anchor.? == cd.anchor) continue;
+                seen_anchor = cd.anchor;
+                try w.writeAll("  in ");
+                try writeNodeLine(w, nodes[cd.anchor]);
+                try w.writeByte('\n');
+                listed += 1;
+                if (listed >= 8) break;
+            }
+            return;
+        }
+        const anchor_nd = nodes[best_anchor.?];
+        var hits: usize = 0;
+        for (cands.items) |cd| {
+            if (cd.anchor != best_anchor.?) continue;
+            hits += 1;
+        }
+        try w.print("query within \"{s}\" anchor [{d}] {s} \"{s}\" {d} matches\n", .{ a.text, anchor_nd.sid, anchor_nd.role, anchor_nd.name, hits });
+        for (cands.items) |cd| {
+            if (cd.anchor != best_anchor.?) continue;
+            try writeNodeLine(w, nodes[cd.index]);
+            try w.writeByte('\n');
+        }
+    }
+
+    /// `form`: every control with its value and states, each with the
+    /// row or group it sits in, under `arg` (a node id) or the whole
+    /// tree. What a caller wants to read before clicking Apply on
+    /// somebody's router; hand-rolled twice as a DOM script before this.
+    fn queryForm(self: *const View, w: *std.Io.Writer, arg: []const u8) !void {
+        const root_sid = std.fmt.parseInt(u32, std.mem.trim(u8, arg, " \t"), 10) catch 0;
+        if (root_sid != 0 and self.findSid(root_sid) == null) {
+            try w.print("query form [{d}] unknown id\n", .{root_sid});
+            return;
+        }
+        var body: std.Io.Writer.Allocating = .init(self.gpa);
+        defer body.deinit();
+        var n_controls: usize = 0;
+        for (self.nodes.items) |nd| {
+            if (!isFormRole(nd.role)) continue;
+            if (root_sid != 0 and nd.sid != root_sid and !self.descends(nd, root_sid)) continue;
+            try writeNodeLine(&body.writer, nd);
+            if (self.describeContext(nd.sid)) |cx| try body.writer.print("  in {s} \"{s}\"", .{ cx.role, cx.name });
+            try body.writer.writeByte('\n');
+            n_controls += 1;
+        }
+        if (root_sid != 0)
+            try w.print("query form [{d}] {d} controls\n", .{ root_sid, n_controls })
+        else
+            try w.print("query form {d} controls\n", .{n_controls});
+        try w.writeAll(body.written());
+    }
+
+    /// The nearest NAMED ancestor of `sid` with a context role, for an
+    /// action echo: two identical buttons in two rows must read
+    /// differently, and bare coordinates cannot do that. Null at the
+    /// document, or when no ancestor on the way up carries a name.
+    pub fn describeContext(self: *const View, sid: u32) ?struct { role: []const u8, name: []const u8 } {
+        var cur = (self.findSid(sid) orelse return null).parent_sid;
+        var guard: usize = 0;
+        while (cur != 0 and guard < 512) : (guard += 1) {
+            const p = self.findSid(cur) orelse return null;
+            if (isContextRole(p.role) and p.name.len > 0) return .{ .role = p.role, .name = p.name };
+            cur = p.parent_sid;
+        }
+        return null;
+    }
+
+    /// Why `eidFor` answered 0: each case wants a different next move,
+    /// and a bare "unknown id" reads as "you made that number up" when
+    /// the page simply re-rendered the row between two calls.
+    pub fn unknownReason(self: *const View, sid: u32) []const u8 {
+        if (sid == 0 or sid >= self.next_sid) return "unknown id: never issued for this view";
+        if (self.findSid(sid)) |nd| {
+            if (std.mem.eql(u8, nd.role, "more")) return "unknown id: a truncation marker, nothing to act on (scope the snapshot to the container to list the rest)";
+        }
+        for (self.base.items) |b| {
+            if (b.sid != sid) continue;
+            if (b.doc_gen < self.doc_gen) return "unknown id: it belonged to the previous document; take a web_snapshot of this page and use its ids";
+            return "unknown id: the element left the page since it was listed (re-rendered or removed); take a web_snapshot and act on the fresh id, or use web_act name/within_text";
+        }
+        return "unknown id: not in the live tree (the page replaced that element since it was listed); take a web_snapshot and act on the fresh id, or use web_act name/within_text";
     }
 
     fn descends(self: *const View, nd: Node, root_sid: u32) bool {
@@ -1341,6 +1512,36 @@ fn hasState(states: []const u8, want: []const u8) bool {
 }
 
 /// ASCII case-insensitive substring test; an empty needle matches.
+/// Roles that name the thing a control belongs to: the ancestor an
+/// action echo and an eval element result cite. The ONE declaring home.
+pub const CONTEXT_ROLES = [_][]const u8{
+    "row", "listitem", "treeitem", "option", "menuitem", "tab",
+    "dialog", "alertdialog", "group", "region", "article", "form",
+    "navigation", "menu", "tabpanel", "listbox", "figure",
+};
+
+/// Roles that carry a value a form submits. The ONE declaring home for
+/// the `form` query.
+pub const FORM_ROLES = [_][]const u8{
+    "textbox",  "searchbox", "checkbox", "radio",      "combobox",   "listbox",
+    "switch",   "slider",    "spinbutton", "colorpicker", "option",   "menuitemcheckbox",
+    "menuitemradio",
+};
+
+pub fn isFormRole(role: []const u8) bool {
+    for (FORM_ROLES) |r| {
+        if (std.mem.eql(u8, role, r)) return true;
+    }
+    return false;
+}
+
+pub fn isContextRole(role: []const u8) bool {
+    for (CONTEXT_ROLES) |r| {
+        if (std.mem.eql(u8, role, r)) return true;
+    }
+    return false;
+}
+
 fn containsFold(hay: []const u8, needle: []const u8) bool {
     if (needle.len == 0) return true;
     if (needle.len > hay.len) return false;
@@ -1687,6 +1888,114 @@ test "queries read the live tree" {
     const focused = try v.query(2, "");
     defer gpa.free(focused);
     try std.testing.expect(std.mem.indexOf(u8, focused, "textbox \"Name\"") != null);
+}
+
+test "within_text finds the control in the row that carries the text, or says why not" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    try v.apply(tree(3, "http://x/", &.{
+        .{ .id = 1, .role = "document", .name = "Devices" },
+        .{ .id = 2, .parent = 1, .role = "heading", .name = "10.47.1.3 is the gateway" },
+        .{ .id = 10, .parent = 1, .role = "list", .name = "" },
+        .{ .id = 11, .parent = 10, .role = "row", .name = "PC-3 / LAN 3 / 10.47.1.3 / Edit" },
+        .{ .id = 12, .parent = 11, .role = "text", .name = "10.47.1.3" },
+        .{ .id = 13, .parent = 11, .role = "button", .name = "Edit" },
+        .{ .id = 21, .parent = 10, .role = "row", .name = "PC-5 / LAN 5 / 10.47.1.30 / Edit" },
+        .{ .id = 22, .parent = 21, .role = "text", .name = "10.47.1.30" },
+        .{ .id = 23, .parent = 21, .role = "button", .name = "Edit" },
+        .{ .id = 31, .parent = 10, .role = "row", .name = "PC-7 / LAN 7 / 10.47.1.7 / Edit" },
+        .{ .id = 32, .parent = 31, .role = "text", .name = "10.47.1.7" },
+        .{ .id = 33, .parent = 31, .role = "button", .name = "Edit" },
+    }));
+    // Unique: only the row that says 10.47.1.30 anchors an Edit.
+    const one = try v.query(4, "{\"text\":\"10.47.1.30\",\"name\":\"Edit\",\"role\":\"button\"}");
+    defer gpa.free(one);
+    var want: [96]u8 = undefined;
+    const head = try std.fmt.bufPrint(&want, "anchor [{d}] row \"PC-5 / LAN 5 / 10.47.1.30 / Edit\" 1 matches\n[{d}] button \"Edit\"\n", .{ v.sidFor(21), v.sidFor(23) });
+    try std.testing.expect(std.mem.indexOf(u8, one, head) != null);
+    // "10.47.1.3" is also inside "10.47.1.30": two rows of equal size
+    // tie, and the heading (a larger anchor: the document) loses.
+    const amb = try v.query(4, "{\"text\":\"10.47.1.3\",\"name\":\"Edit\"}");
+    defer gpa.free(amb);
+    try std.testing.expect(std.mem.indexOf(u8, amb, "ambiguous") != null);
+    try std.testing.expect(std.mem.indexOf(u8, amb, "PC-3 / LAN 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, amb, "PC-5 / LAN 5") != null);
+    // Text that exists but has no control of that name under it: the
+    // document anchors it, and the answer names the document. With no
+    // role the rows (named "... / Edit") are candidates beside their
+    // buttons; the client's interactive preference sorts that out.
+    const doc = try v.query(4, "{\"text\":\"gateway\",\"name\":\"Edit\"}");
+    defer gpa.free(doc);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "anchor [1] document") != null);
+    try std.testing.expect(std.mem.indexOf(u8, doc, "6 matches") != null);
+    const typed = try v.query(4, "{\"text\":\"gateway\",\"name\":\"Edit\",\"role\":\"button\"}");
+    defer gpa.free(typed);
+    try std.testing.expect(std.mem.indexOf(u8, typed, "3 matches") != null);
+    const none = try v.query(4, "{\"text\":\"absent\",\"name\":\"Edit\"}");
+    defer gpa.free(none);
+    try std.testing.expect(std.mem.indexOf(u8, none, "0 matches") != null);
+    const noname = try v.query(4, "{\"text\":\"10.47.1.7\",\"name\":\"Delete\"}");
+    defer gpa.free(noname);
+    try std.testing.expect(std.mem.indexOf(u8, noname, "no candidate named \"Delete\"") != null);
+
+    // The echo context: the row, not the list.
+    const ctx = v.describeContext(v.sidFor(33)) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("row", ctx.role);
+    try std.testing.expectEqualStrings("PC-7 / LAN 7 / 10.47.1.7 / Edit", ctx.name);
+    try std.testing.expect(v.describeContext(v.sidFor(2)) == null);
+}
+
+test "the form query lists every control with its value, states and row" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    try v.apply(tree(3, "http://x/", &.{
+        .{ .id = 1, .role = "document", .name = "Edit device" },
+        .{ .id = 2, .parent = 1, .role = "form", .name = "Device" },
+        .{ .id = 3, .parent = 2, .role = "textbox", .name = "Name", .value = "PC-10-47-1-106" },
+        .{ .id = 4, .parent = 2, .role = "checkbox", .name = "Always assign the same IPv4 address", .states = "checked" },
+        .{ .id = 5, .parent = 2, .role = "button", .name = "Apply" },
+        .{ .id = 6, .parent = 1, .role = "textbox", .name = "Search", .value = "" },
+    }));
+    const all = try v.query(5, "");
+    defer gpa.free(all);
+    try std.testing.expect(std.mem.startsWith(u8, all, "query form 3 controls\n"));
+    var want: [160]u8 = undefined;
+    const line = try std.fmt.bufPrint(&want, "[{d}] checkbox \"Always assign the same IPv4 address\" (checked)  in form \"Device\"\n", .{v.sidFor(4)});
+    try std.testing.expect(std.mem.indexOf(u8, all, line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "value=\"PC-10-47-1-106\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "button") == null);
+    var arg: [16]u8 = undefined;
+    const scoped = try v.query(5, try std.fmt.bufPrint(&arg, "{d}", .{v.sidFor(2)}));
+    defer gpa.free(scoped);
+    try std.testing.expect(std.mem.indexOf(u8, scoped, "2 controls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, scoped, "Search") == null);
+    const bad = try v.query(5, "424242");
+    defer gpa.free(bad);
+    try std.testing.expect(std.mem.indexOf(u8, bad, "unknown id") != null);
+}
+
+test "unknownReason tells a never-issued id from one the page dropped" {
+    const gpa = std.testing.allocator;
+    var v = View.init(gpa);
+    defer v.deinit();
+    const up = try applyConsume(&v, tree(3, "http://x/", &.{
+        .{ .id = 1, .role = "document", .name = "D" },
+        .{ .id = 2, .parent = 1, .role = "button", .name = "Edit" },
+    }), .auto);
+    gpa.free(up.text);
+    const gone = v.sidFor(2);
+    try std.testing.expect(std.mem.indexOf(u8, v.unknownReason(9999), "never issued") != null);
+    // The page re-rendered the button as a NEW element: the old id is
+    // no longer live, and the reason says it left.
+    const up2 = try applyConsume(&v, tree(3, "http://x/", &.{
+        .{ .id = 1, .role = "document", .name = "D" },
+        .{ .id = 5, .parent = 1, .role = "button", .name = "Save" },
+    }), .auto);
+    gpa.free(up2.text);
+    try std.testing.expectEqual(@as(u32, 0), v.eidFor(gone));
+    try std.testing.expect(std.mem.indexOf(u8, v.unknownReason(gone), "left the page") != null);
 }
 
 test "a walk parses from the injected script's JSON" {

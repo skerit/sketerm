@@ -312,6 +312,20 @@ const article_page =
     "<div role=row><span role=cell>aria cell</span></div></div></article>" ++
     "</body></html>";
 
+/// A div grid, the shape of a router's device list: no <table>, no role,
+/// six identical rows with an Edit each. Row 5's address CONTAINS row
+/// 3's, the near-miss that opened the wrong device in the field.
+const grid_page =
+    "data:text/html,<html><head><title>Grid</title></head><body><h1>Devices</h1>" ++
+    "<div id=list><div class=hint>Six devices are known</div>" ++
+    "<div class=r><div class=c>PC-1</div><div class=c>LAN 1</div><div class=c>10.47.1.1</div><div class=c><button onclick=\"document.title='edit:1'\">Edit</button></div></div>" ++
+    "<div class=r><div class=c>PC-2</div><div class=c>LAN 2</div><div class=c>10.47.1.2</div><div class=c><button onclick=\"document.title='edit:2'\">Edit</button></div></div>" ++
+    "<div class=r><div class=c>PC-3</div><div class=c>LAN 3</div><div class=c>10.47.1.3</div><div class=c><button onclick=\"document.title='edit:3'\">Edit</button></div></div>" ++
+    "<div class=r><div class=c>PC-4</div><div class=c>LAN 4</div><div class=c>10.47.1.4</div><div class=c><button onclick=\"document.title='edit:4'\">Edit</button></div></div>" ++
+    "<div class=r><div class=c>PC-5</div><div class=c>LAN 5</div><div class=c>10.47.1.30</div><div class=c><button onclick=\"document.title='edit:5'\">Edit</button></div></div>" ++
+    "<div class=r><div class=c>PC-6</div><div class=c>LAN 6</div><div class=c>10.47.1.6</div><div class=c><button onclick=\"document.title='edit:6'\">Edit</button></div></div>" ++
+    "</div><div class=note><span>Footer text in a span</span></div></body></html>";
+
 /// Rich reader proof: the only actionable node returned by reader mode
 /// changes the title on a trusted click. Its sibling mutation button is
 /// outside <article>, so it never appears as a reader entity.
@@ -6471,7 +6485,106 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 12 sem_read: form controls are missing from the markdown");
         }
     }
+    // The form query: what Apply would submit, from the live tree, with
+    // values and states, no DOM script.
+    {
+        cl.resetSem();
+        cl.snapshot(@intFromEnum(proto.SnapMode.full), 1);
+        if (!cl.waitSem("textbox \"Owner\"", 20_000)) fail("stage 12 form: no snapshot of the article page");
+        const seq = cl.query_seq;
+        cl.send(proto.SemQueryReq{ .view = view_id, .kind = @intFromEnum(proto.SemQuery.form), .arg = "" });
+        if (!cl.waitSeq(&cl.query_seq, seq, 20_000)) fail("stage 12 form: no form query result");
+        const payload = cl.queryPayload();
+        if (std.mem.indexOf(u8, payload, "textbox \"Owner\" value=\"jelle\"") == null or
+            std.mem.indexOf(u8, payload, "checkbox \"Enabled\" (checked)") == null or
+            std.mem.indexOf(u8, payload, "combobox \"Tier\"") == null)
+        {
+            std.debug.print("smoke-web: form query result was:\n{s}\n", .{payload});
+            fail("stage 12 form: the controls are not listed with their values and states");
+        }
+    }
     pass("stage 12 sem_read");
+
+    // ── Stage 12b: a div grid — rows, reader table, within_text, echo ──
+    // FRITZ!OS shape: 688 divs, zero <tr>, no roles. Both readers were
+    // blind to the one thing on the page, and the only way to a row's
+    // Edit was an nth index over identical buttons.
+    cl.navigate(grid_page);
+    cl.resetSem();
+    cl.snapshot(@intFromEnum(proto.SnapMode.full), 1);
+    if (!cl.waitSem("row \"PC-3 / LAN 3 / 10.47.1.3 / Edit\"", 20_000)) {
+        std.debug.print("smoke-web: grid snapshot was:\n{s}\n", .{cl.semLog()});
+        fail("stage 12b grid: repeated div siblings were not listed as rows");
+    }
+    if (std.mem.indexOf(u8, cl.semLog(), "] list {6 children}") == null and std.mem.indexOf(u8, cl.semLog(), "] list ") == null)
+        fail("stage 12b grid: the rows' container is not a list");
+    {
+        const seq = cl.md_seq;
+        cl.send(proto.SemRead{ .view = view_id });
+        if (!cl.waitSeq(&cl.md_seq, seq, 20_000)) fail("stage 12b grid: no sem_read_result");
+        const markdown = cl.md[0..cl.md_len];
+        if (std.mem.indexOf(u8, markdown, "| PC-3 | LAN 3 | 10.47.1.3 | Edit |") == null or
+            std.mem.indexOf(u8, markdown, "| PC-1 | LAN 1 | 10.47.1.1 | Edit |\n| --- | --- | --- | --- |") == null)
+        {
+            std.debug.print("smoke-web: markdown was:\n{s}\n", .{markdown});
+            fail("stage 12b grid: the div rows are not a table in the markdown");
+        }
+        // A bare div with text beside the rows is a paragraph, not
+        // nothing (the footer OUTSIDE the densest region is dropped by
+        // the reader's region choice, deliberately).
+        if (std.mem.indexOf(u8, markdown, "Six devices are known") == null) {
+            std.debug.print("smoke-web: markdown was:\n{s}\n", .{markdown});
+            fail("stage 12b grid: leaf div text is missing from the markdown");
+        }
+    }
+    // within_text: the Edit in the row that says 10.47.1.30, and ONLY
+    // that one; "10.47.1.3" is in two rows and must be refused.
+    var edit5: u32 = 0;
+    {
+        const seq = cl.query_seq;
+        cl.send(proto.SemQueryReq{ .view = view_id, .kind = @intFromEnum(proto.SemQuery.within_text), .arg = "{\"text\":\"10.47.1.30\",\"name\":\"Edit\",\"role\":\"button\"}" });
+        if (!cl.waitSeq(&cl.query_seq, seq, 20_000)) fail("stage 12b grid: no within_text result");
+        const payload = cl.queryPayload();
+        if (std.mem.indexOf(u8, payload, "anchor [") == null or std.mem.indexOf(u8, payload, "row \"PC-5 / LAN 5 / 10.47.1.30 / Edit\" 1 matches") == null) {
+            std.debug.print("smoke-web: within_text result was:\n{s}\n", .{payload});
+            fail("stage 12b grid: within_text did not anchor on the one row carrying the text");
+        }
+        const line = std.mem.indexOf(u8, payload, "] button \"Edit\"") orelse fail("stage 12b grid: no Edit candidate line");
+        const open = std.mem.lastIndexOfScalar(u8, payload[0..line], '[') orelse fail("stage 12b grid: malformed candidate line");
+        edit5 = std.fmt.parseInt(u32, payload[open + 1 .. line], 10) catch fail("stage 12b grid: candidate id did not parse");
+    }
+    {
+        const seq = cl.query_seq;
+        cl.send(proto.SemQueryReq{ .view = view_id, .kind = @intFromEnum(proto.SemQuery.within_text), .arg = "{\"text\":\"10.47.1.3\",\"name\":\"Edit\"}" });
+        if (!cl.waitSeq(&cl.query_seq, seq, 20_000)) fail("stage 12b grid: no second within_text result");
+        if (std.mem.indexOf(u8, cl.queryPayload(), "ambiguous") == null) {
+            std.debug.print("smoke-web: within_text result was:\n{s}\n", .{cl.queryPayload()});
+            fail("stage 12b grid: a substring shared by two rows was not refused as ambiguous");
+        }
+    }
+    // The click lands in row 5 and the echo SAYS row 5.
+    {
+        const seq = cl.act_seq;
+        cl.send(proto.SemAction{ .view = view_id, .id = edit5, .action = @intFromEnum(proto.SemAct.click), .arg = "" });
+        if (!cl.waitSeq(&cl.act_seq, seq, 20_000) or cl.act_ok != 1) fail("stage 12b grid: click on the row's Edit failed");
+        const msg = cl.act_msg[0..cl.act_msg_len];
+        if (std.mem.indexOf(u8, msg, "in row \"PC-5 / LAN 5 / 10.47.1.30 / Edit\"") == null) {
+            std.debug.print("smoke-web: click said \"{s}\"\n", .{msg});
+            fail("stage 12b grid: the click echo does not name the row");
+        }
+        if (!cl.waitTitle("edit:5", 20_000)) fail("stage 12b grid: the click did not land on row 5's Edit");
+    }
+    // An id nobody issued is refused with a reason, not a bare "unknown id".
+    {
+        const seq = cl.act_seq;
+        cl.send(proto.SemAction{ .view = view_id, .id = 900_000, .action = @intFromEnum(proto.SemAct.click), .arg = "" });
+        if (!cl.waitSeq(&cl.act_seq, seq, 20_000) or cl.act_ok != 0) fail("stage 12b grid: a bogus id was acted on");
+        if (std.mem.indexOf(u8, cl.act_msg[0..cl.act_msg_len], "never issued") == null) {
+            std.debug.print("smoke-web: bogus act said \"{s}\"\n", .{cl.act_msg[0..cl.act_msg_len]});
+            fail("stage 12b grid: the unknown-id refusal does not say why");
+        }
+    }
+    pass("stage 12b div grid");
 
     // ── Stage 41: reader ids activate one exact, fresh entity ──────
     cl.navigate(reader_ids_page);
