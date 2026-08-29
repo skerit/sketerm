@@ -16,6 +16,7 @@ const filtersub = @import("web/filtersub.zig");
 const atomicwrite = @import("util/atomicwrite.zig");
 const diag = @import("util/diag.zig");
 const socks5_client = @import("mux/socks5_client.zig");
+const webroute = @import("web/route.zig");
 pub const titlefmt = @import("util/titlefmt.zig");
 
 pub const MAX_FILE_BYTES: usize = 64 * 1024;
@@ -1226,6 +1227,11 @@ pub const Config = struct {
     /// http(s) URL containing `{q}`. App-level, like the popup policy:
     /// one helper client, one engine.
     web_search_engine: []const u8 = default_web_search_engine,
+    /// Default network route for new browser tabs whose container has no
+    /// route of its own: `direct` | `tor` | `via:<host>` | `on:<host>`
+    /// (`web/route.zig`). Tor dials `mux_tor_socks_endpoint`. App-level,
+    /// like the other browser keys.
+    web_route: []const u8 = "direct",
 
     /// Colour space glyph coverage is blended in (see TextBlending).
     /// App-level, like every other rendering flag: it changes the GL
@@ -1426,6 +1432,7 @@ pub const Config = struct {
         }
         out.background_image = try arena.dupe(u8, self.background_image);
         out.web_search_engine = try arena.dupe(u8, self.web_search_engine);
+        out.web_route = try arena.dupe(u8, self.web_route);
         out.word_chars = try arena.dupe(u8, self.word_chars);
         out.gtk_theme = try arena.dupe(u8, self.gtk_theme);
         out.app_keyboard_layout = try arena.dupe(u8, self.app_keyboard_layout);
@@ -1809,6 +1816,8 @@ pub const Config = struct {
         });
         if (!std.mem.eql(u8, self.web_search_engine, default_web_search_engine))
             try w.print("web_search_engine = {s}\n", .{self.web_search_engine});
+        if (!std.mem.eql(u8, self.web_route, "direct"))
+            try w.print("web_route = {s}\n", .{self.web_route});
 
         // Bell.
         if (!self.shell_integration) try w.writeAll("shell_integration = off\n");
@@ -3001,6 +3010,12 @@ fn applyKv(cfg: *Config, arena: std.mem.Allocator, key: []const u8, value: []con
                 std.mem.startsWith(u8, value, "http://")))
             return error.BadWebSearchEngine;
         cfg.web_search_engine = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "web_route")) {
+        // Validated by SHAPE here (the Tor endpoint may itself be a
+        // later line); an unparseable route is a bad line, never a
+        // silent downgrade to direct.
+        if (!webroute.Spec.validText(value)) return error.BadWebRoute;
+        cfg.web_route = try arena.dupe(u8, value);
     } else if (std.mem.eql(u8, key, "graphics_offload")) {
         cfg.graphics_offload = try parseBool(value);
     } else if (std.mem.eql(u8, key, "shell_integration")) {

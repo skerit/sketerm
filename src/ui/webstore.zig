@@ -456,8 +456,7 @@ pub fn containerAdd(
     name: []const u8,
     jar: []const u8,
     color: [3]u8,
-    egress_host: []const u8,
-    remote_host: []const u8,
+    route: []const u8,
     ctx: ?*anyopaque,
     cb: Callback,
 ) bool {
@@ -467,20 +466,19 @@ pub fn containerAdd(
         .name = name,
         .jar = jar,
         .color = packRgb(color),
-        .egress_host = egress_host,
-        .remote_host = remote_host,
+        .route = route,
     });
 }
 
-/// Rename / recolour / re-route. A null field is left alone; "" clears
-/// a host. The jar key and the id can never change.
+/// Rename / recolour / re-route. A null field is left alone; "" as the
+/// route clears it to direct. `route` is `web/route.zig` text. The jar
+/// key and the id can never change.
 pub fn containerUpdate(
     gpa: std.mem.Allocator,
     id: u32,
     name: ?[]const u8,
     color: ?[3]u8,
-    egress_host: ?[]const u8,
-    remote_host: ?[]const u8,
+    route: ?[]const u8,
     ctx: ?*anyopaque,
     cb: Callback,
 ) bool {
@@ -490,8 +488,7 @@ pub fn containerUpdate(
         .container = id,
         .name = name orelse "",
         .color = if (color) |rgb| packRgb(rgb) else null,
-        .egress_host = egress_host,
-        .remote_host = remote_host,
+        .route = route,
     });
 }
 
@@ -712,8 +709,8 @@ pub const ContainerEntry = struct {
     name: []const u8 = "",
     jar: []const u8 = "",
     color: [3]u8 = .{ 0, 0, 0 },
-    egress_host: []const u8 = "",
-    remote_host: []const u8 = "",
+    /// `web/route.zig` text; "" = direct.
+    route: []const u8 = "",
 };
 
 pub const ContainerSiteEntry = struct {
@@ -755,7 +752,7 @@ test "webstore: container_list reply parses containers and site rules" {
     const payload =
         \\{"req":3,"ok":true,
         \\ "containers":[{"id":7,"name":"Employer","jar":"Work","color":[59,130,246],
-        \\                "egress_host":"","remote_host":""}],
+        \\                "route":"via:gate.example"}],
         \\ "sites":[{"host":"example.com","container":7}]}
     ;
     const rep = parseContainers(arena.allocator(), payload);
@@ -767,6 +764,7 @@ test "webstore: container_list reply parses containers and site rules" {
     try t.expectEqualStrings("Employer", rep.containers[0].name);
     try t.expectEqualStrings("Work", rep.containers[0].jar);
     try t.expectEqual(@as(u8, 130), rep.containers[0].color[1]);
+    try t.expectEqualStrings("via:gate.example", rep.containers[0].route);
     try t.expectEqual(@as(usize, 1), rep.sites.len);
     try t.expectEqualStrings("example.com", rep.sites[0].host);
     try t.expectEqual(@as(u32, 7), rep.sites[0].container);

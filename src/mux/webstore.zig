@@ -14,6 +14,7 @@
 //! test roots.
 
 const std = @import("std");
+const webroute = @import("../web/route.zig");
 const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const pathz = @import("../util/pathz.zig");
@@ -32,6 +33,34 @@ pub const MAX_SOURCE: usize = 2 << 20;
 pub const MAX_CONTAINER_NAME: usize = 128;
 /// Bound on an egress / remote-helper host and on a site-rule host.
 pub const MAX_HOST: usize = 256;
+
+/// Longest stored route text: the grammar's prefix plus a host.
+const MAX_ROUTE: usize = webroute.MAX_HOST + 8;
+
+/// A stored route must be in the grammar and short; "" is direct.
+fn routeOk(text: []const u8) bool {
+    if (text.len > MAX_ROUTE) return false;
+    return text.len == 0 or webroute.Spec.validText(text);
+}
+
+/// The route a loaded record means. A pre-route file carried
+/// `egress_host` / `remote_host` instead; those spell `via:` and `on:`
+/// now, and a file that claims both, or an unparseable route, is
+/// refused rather than resolved one way.
+fn migratedRoute(buf: []u8, dto: anytype) ?[]const u8 {
+    if (dto.route.len != 0) {
+        if (dto.egress_host.len != 0 or dto.remote_host.len != 0) return null;
+        return if (routeOk(dto.route)) dto.route else null;
+    }
+    if (dto.egress_host.len != 0 and dto.remote_host.len != 0) return null;
+    const text = if (dto.egress_host.len != 0)
+        std.fmt.bufPrint(buf, "via:{s}", .{dto.egress_host}) catch return null
+    else if (dto.remote_host.len != 0)
+        std.fmt.bufPrint(buf, "on:{s}", .{dto.remote_host}) catch return null
+    else
+        "";
+    return if (routeOk(text)) text else null;
+}
 
 /// The `scheme://host[:port]` prefix of `url`, lowercased into `buf`.
 /// Null for URLs with no authority (about:, data:, mailto:) or when
@@ -198,10 +227,11 @@ pub const Container = struct {
     /// Split from `name` precisely so a rename keeps the cookies.
     jar: []u8,
     color: [3]u8,
-    /// Egress host ("" = direct); mutually exclusive with `remote_host`.
-    egress_host: []u8,
-    /// Remote-helper host ("" = local); see `webface.Container`.
-    remote_host: []u8,
+    /// Default route for tabs opened in this container, in
+    /// `web/route.zig`'s text grammar (`direct` | `tor` | `via:<host>`
+    /// | `on:<host>`); "" = direct. Validated by shape only: the Tor
+    /// endpoint is a machine setting, not the container's.
+    route: []u8,
 };
 
 /// "Always open this host in container X".
@@ -216,8 +246,8 @@ pub const ContainerSite = struct {
 pub const ContainerUpdate = struct {
     name: ?[]const u8 = null,
     color: ?[3]u8 = null,
-    egress_host: ?[]const u8 = null,
-    remote_host: ?[]const u8 = null,
+    /// "" clears back to direct.
+    route: ?[]const u8 = null,
 };
 
 pub const WebStore = struct {
@@ -1077,6 +1107,9 @@ pub const WebStore = struct {
         /// 0xRRGGBB. A u32 rather than a 3-element array so a truncated
         /// or over-long array in a hand-edited file cannot half-parse.
         color: u32 = 0,
+        route: []const u8 = "",
+        /// Pre-route files spelled the two host-bound routes as two
+        /// fields; read for migration, never written again.
         egress_host: []const u8 = "",
         remote_host: []const u8 = "",
     };
@@ -1098,12 +1131,15 @@ pub const WebStore = struct {
         for (parsed.value.containers) |ctn| {
             if (ctn.name.len == 0 or ctn.name.len > MAX_CONTAINER_NAME) continue;
             if (ctn.jar.len > MAX_CONTAINER_NAME) continue;
-            if (ctn.egress_host.len > MAX_HOST or ctn.remote_host.len > MAX_HOST) continue;
-            // Egress and remote-helper are mutually exclusive (see
-            // `Container.remote_host`); a file claiming both is refused
-            // rather than silently resolved one way.
-            if (ctn.egress_host.len != 0 and ctn.remote_host.len != 0) continue;
-            const rec = self.dupeContainer(ctn) orelse continue;
+            var route_buf: [MAX_ROUTE]u8 = undefined;
+            const route = migratedRoute(&route_buf, ctn) orelse continue;
+            const rec = self.dupeContainer(.{
+                .id = ctn.id,
+                .name = ctn.name,
+                .jar = ctn.jar,
+                .color = ctn.color,
+                .route = route,
+            }) orelse continue;
             if (rec.id >= self.next_container_id) self.next_container_id = rec.id + 1;
             self.containers.append(self.allocator, rec) catch {
                 self.freeContainer(rec);
@@ -1129,15 +1165,9 @@ pub const WebStore = struct {
             self.allocator.free(name);
             return null;
         };
-        const eg = self.allocator.dupe(u8, dto.egress_host) catch {
+        const route = self.allocator.dupe(u8, dto.route) catch {
             self.allocator.free(name);
             self.allocator.free(jar);
-            return null;
-        };
-        const rh = self.allocator.dupe(u8, dto.remote_host) catch {
-            self.allocator.free(name);
-            self.allocator.free(jar);
-            self.allocator.free(eg);
             return null;
         };
         return .{
@@ -1149,16 +1179,14 @@ pub const WebStore = struct {
                 @truncate(dto.color >> 8),
                 @truncate(dto.color),
             },
-            .egress_host = eg,
-            .remote_host = rh,
+            .route = route,
         };
     }
 
     fn freeContainer(self: *WebStore, ctn: Container) void {
         self.allocator.free(ctn.name);
         self.allocator.free(ctn.jar);
-        self.allocator.free(ctn.egress_host);
-        self.allocator.free(ctn.remote_host);
+        self.allocator.free(ctn.route);
     }
 
     fn saveContainers(self: *WebStore) !void {
@@ -1170,8 +1198,7 @@ pub const WebStore = struct {
             .jar = ctn.jar,
             .color = (@as(u32, ctn.color[0]) << 16) |
                 (@as(u32, ctn.color[1]) << 8) | @as(u32, ctn.color[2]),
-            .egress_host = ctn.egress_host,
-            .remote_host = ctn.remote_host,
+            .route = ctn.route,
         };
         var sdtos = try self.allocator.alloc(ContainerSiteDto, self.container_sites.items.len);
         defer self.allocator.free(sdtos);
@@ -1208,21 +1235,18 @@ pub const WebStore = struct {
         name: []const u8,
         jar: []const u8,
         color: [3]u8,
-        egress_host: []const u8,
-        remote_host: []const u8,
+        route: []const u8,
     ) !u32 {
         if (name.len == 0 or name.len > MAX_CONTAINER_NAME) return error.BadContainer;
         if (jar.len > MAX_CONTAINER_NAME) return error.BadContainer;
-        if (egress_host.len > MAX_HOST or remote_host.len > MAX_HOST) return error.BadContainer;
-        if (egress_host.len != 0 and remote_host.len != 0) return error.BadContainer;
+        if (!routeOk(route)) return error.BadContainer;
         const rec = self.dupeContainer(.{
             .id = self.next_container_id,
             .name = name,
             .jar = if (jar.len != 0) jar else name,
             .color = (@as(u32, color[0]) << 16) |
                 (@as(u32, color[1]) << 8) | @as(u32, color[2]),
-            .egress_host = egress_host,
-            .remote_host = remote_host,
+            .route = route,
         }) orelse return error.OutOfMemory;
         errdefer self.freeContainer(rec);
         try self.containers.append(self.allocator, rec);
@@ -1247,15 +1271,9 @@ pub const WebStore = struct {
         if (upd.name) |n| {
             if (n.len == 0 or n.len > MAX_CONTAINER_NAME) return error.BadContainer;
         }
-        if (upd.egress_host) |h| {
-            if (h.len > MAX_HOST) return error.BadContainer;
+        if (upd.route) |r| {
+            if (!routeOk(r)) return error.BadContainer;
         }
-        if (upd.remote_host) |h| {
-            if (h.len > MAX_HOST) return error.BadContainer;
-        }
-        const next_eg = upd.egress_host orelse ctn.egress_host;
-        const next_rh = upd.remote_host orelse ctn.remote_host;
-        if (next_eg.len != 0 and next_rh.len != 0) return error.BadContainer;
 
         if (upd.name) |n| {
             const dup = try self.allocator.dupe(u8, n);
@@ -1263,15 +1281,10 @@ pub const WebStore = struct {
             ctn.name = dup;
         }
         if (upd.color) |rgb| ctn.color = rgb;
-        if (upd.egress_host) |h| {
-            const dup = try self.allocator.dupe(u8, h);
-            self.allocator.free(ctn.egress_host);
-            ctn.egress_host = dup;
-        }
-        if (upd.remote_host) |h| {
-            const dup = try self.allocator.dupe(u8, h);
-            self.allocator.free(ctn.remote_host);
-            ctn.remote_host = dup;
+        if (upd.route) |r| {
+            const dup = try self.allocator.dupe(u8, r);
+            self.allocator.free(ctn.route);
+            ctn.route = dup;
         }
         try self.saveContainers();
         return true;
@@ -1668,8 +1681,8 @@ test "webstore: containers keep ids, jar keys and colours across reload" {
     {
         var store = try WebStore.init(t.allocator, dir);
         defer store.deinit();
-        work = try store.containerAdd("Work", "", .{ 0x3b, 0x82, 0xf6 }, "", "");
-        _ = try store.containerAdd("Shopping", "", .{ 0x22, 0xc5, 0x5e }, "gate.example", "");
+        work = try store.containerAdd("Work", "", .{ 0x3b, 0x82, 0xf6 }, "");
+        _ = try store.containerAdd("Shopping", "", .{ 0x22, 0xc5, 0x5e }, "via:gate.example");
         try t.expect(work != 0);
     }
     {
@@ -1682,7 +1695,7 @@ test "webstore: containers keep ids, jar keys and colours across reload" {
         try t.expectEqualStrings("Work", c0.name);
         try t.expectEqualStrings("Work", c0.jar);
         try t.expectEqual(@as(u8, 0x3b), c0.color[0]);
-        try t.expectEqualStrings("gate.example", store.containers.items[1].egress_host);
+        try t.expectEqualStrings("via:gate.example", store.containers.items[1].route);
 
         // Renaming keeps the jar key, which is what keeps the cookies.
         try t.expect(try store.containerUpdate(work, .{ .name = "Employer", .color = .{ 1, 2, 3 } }));
@@ -1696,11 +1709,11 @@ test "webstore: containers keep ids, jar keys and colours across reload" {
     // Ids never recycle, even after a removal.
     try t.expect(try store.containerRemove(work));
     try t.expect(store.containerFind(work) == null);
-    const fresh = try store.containerAdd("Later", "", .{ 0, 0, 0 }, "", "");
+    const fresh = try store.containerAdd("Later", "", .{ 0, 0, 0 }, "");
     try t.expect(fresh > work);
 }
 
-test "webstore: a container refuses both egress and remote host" {
+test "webstore: a container's route must be in the grammar" {
     const t = std.testing;
     const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
     defer td.remove();
@@ -1708,13 +1721,43 @@ test "webstore: a container refuses both egress and remote host" {
     var store = try WebStore.init(t.allocator, dir);
     defer store.deinit();
 
-    try t.expectError(error.BadContainer, store.containerAdd("Both", "", .{ 0, 0, 0 }, "a.example", "b.example"));
-    const id = try store.containerAdd("Egress", "", .{ 0, 0, 0 }, "a.example", "");
-    // The exclusion also holds against an UPDATE that would create the
-    // combination one field at a time.
-    try t.expectError(error.BadContainer, store.containerUpdate(id, .{ .remote_host = "b.example" }));
-    try t.expect(try store.containerUpdate(id, .{ .egress_host = "" }));
-    try t.expect(try store.containerUpdate(id, .{ .remote_host = "b.example" }));
+    try t.expectError(error.BadContainer, store.containerAdd("Bad", "", .{ 0, 0, 0 }, "proxy:a.example"));
+    try t.expectError(error.BadContainer, store.containerAdd("Bad", "", .{ 0, 0, 0 }, "via:"));
+    const id = try store.containerAdd("Egress", "", .{ 0, 0, 0 }, "via:a.example");
+    try t.expectError(error.BadContainer, store.containerUpdate(id, .{ .route = "on:" }));
+    try t.expect(try store.containerUpdate(id, .{ .route = "" }));
+    try t.expect(try store.containerUpdate(id, .{ .route = "on:b.example" }));
+    try t.expect(try store.containerUpdate(id, .{ .route = "tor" }));
+    try t.expectEqualStrings("tor", store.containerFind(id).?.route);
+}
+
+test "webstore: pre-route container files migrate their host fields" {
+    const t = std.testing;
+    const td = pathz.TempDir.make("webstore") orelse return error.SkipZigTest;
+    defer td.remove();
+    const dir = td.path();
+    var pb: [4096]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&pb, "{s}/containers.json", .{dir}) catch return error.SkipZigTest;
+    const legacy =
+        \\{"next_id":4,"containers":[
+        \\ {"id":1,"name":"Work","jar":"Work","color":0,"egress_host":"gate.example","remote_host":""},
+        \\ {"id":2,"name":"Far","jar":"Far","color":0,"egress_host":"","remote_host":"box"},
+        \\ {"id":3,"name":"Both","jar":"Both","color":0,"egress_host":"a","remote_host":"b"}],
+        \\ "sites":[]}
+    ;
+    {
+        const f = c.fopen(path.ptr, "w") orelse return error.SkipZigTest;
+        _ = c.fwrite(legacy.ptr, 1, legacy.len, f);
+        _ = c.fclose(f);
+    }
+    var store = try WebStore.init(t.allocator, dir);
+    defer store.deinit();
+    // The two single-host records come back as routes; the one that
+    // claimed both is refused, exactly as the old loader refused it.
+    try t.expectEqual(@as(usize, 2), store.containers.items.len);
+    try t.expectEqualStrings("via:gate.example", store.containerFind(1).?.route);
+    try t.expectEqualStrings("on:box", store.containerFind(2).?.route);
+    try t.expect(store.containerFind(3) == null);
 }
 
 test "webstore: site assignment is exact, clears, and dies with its container" {
@@ -1727,7 +1770,7 @@ test "webstore: site assignment is exact, clears, and dies with its container" {
     {
         var store = try WebStore.init(t.allocator, dir);
         defer store.deinit();
-        work = try store.containerAdd("Work", "", .{ 0, 0, 0 }, "", "");
+        work = try store.containerAdd("Work", "", .{ 0, 0, 0 }, "");
         try store.containerSiteSet("Example.COM", work);
         // An unknown container must not become a silent default-jar rule.
         try t.expectError(error.NoSuchContainer, store.containerSiteSet("other.example", 4242));

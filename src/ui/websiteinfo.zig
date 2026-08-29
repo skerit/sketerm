@@ -30,6 +30,7 @@ const cssutil = @import("cssutil.zig");
 const proto = @import("../web/protocol.zig");
 const webstore = @import("webstore.zig");
 const webface = @import("webface.zig");
+const webroute = @import("../web/route.zig");
 
 /// Widest the popover gets; a cookie name longer than this ellipsizes
 /// rather than pushing the toolbar's popover off the screen.
@@ -81,6 +82,11 @@ pub const Tls = enum {
 /// the call.
 pub const State = struct {
     origin: []const u8,
+    /// This tab's network route, shown and editable in the popover.
+    route: webroute.Spec = .{},
+    /// The route can be changed here (false for an inspector view,
+    /// which presents somebody else's view and cannot move).
+    route_movable: bool = true,
     tls: Tls,
     blocking: bool,
     blocked: u32,
@@ -131,6 +137,14 @@ pub const SiteInfo = struct {
     parented: bool = false,
 
     origin_label: *c.GtkWidget,
+    /// The route dropdown and its host entry. The entry is sensitive
+    /// only for the two host-bound routes; "Apply" moves the tab.
+    route_row: *c.GtkWidget,
+    route_drop: *c.GtkWidget,
+    route_host: *c.GtkWidget,
+    /// True while `refresh` sets the dropdown, so our own write does not
+    /// fire the change handler and re-narrow the entry.
+    route_syncing: bool = false,
     tls_icon: *c.GtkWidget,
     tls_label: *c.GtkWidget,
     block_switch: *c.GtkWidget,
@@ -179,6 +193,25 @@ pub const SiteInfo = struct {
         c.gtk_widget_set_hexpand(tls_label, 1);
         c.gtk_box_append(@ptrCast(tls_row), tls_label);
         c.gtk_box_append(@ptrCast(box), tls_row);
+
+        appendSeparator(box);
+
+        // Where this tab's traffic leaves. A route is a whole browser
+        // instance (`web/route.zig`); picking one here moves the tab.
+        const route_title = c.gtk_label_new("Route").?;
+        c.gtk_label_set_xalign(@ptrCast(route_title), 0);
+        c.gtk_widget_add_css_class(route_title, "heading");
+        c.gtk_box_append(@ptrCast(box), route_title);
+        const route_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6).?;
+        const route_drop = c.gtk_drop_down_new_from_strings(@ptrCast(&route_names)).?;
+        c.gtk_box_append(@ptrCast(route_row), route_drop);
+        const route_host = c.gtk_entry_new().?;
+        c.gtk_entry_set_placeholder_text(@ptrCast(route_host), "host");
+        c.gtk_widget_set_hexpand(route_host, 1);
+        c.gtk_box_append(@ptrCast(route_row), route_host);
+        const route_apply = c.gtk_button_new_with_label("Apply").?;
+        c.gtk_box_append(@ptrCast(route_row), route_apply);
+        c.gtk_box_append(@ptrCast(box), route_row);
 
         appendSeparator(box);
 
@@ -255,6 +288,9 @@ pub const SiteInfo = struct {
             .popover = pop,
             .anchor = anchor,
             .origin_label = origin_label,
+            .route_row = route_row,
+            .route_drop = route_drop,
+            .route_host = route_host,
             .tls_icon = tls_icon,
             .tls_label = tls_label,
             .block_switch = block_switch,
@@ -276,6 +312,9 @@ pub const SiteInfo = struct {
         _ = c.g_signal_connect_data(block_switch, "state-set", @ptrCast(&onBlockSwitch), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(clear_cookies, "clicked", @ptrCast(&onClearCookies), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         _ = c.g_signal_connect_data(clear_data, "clicked", @ptrCast(&onClearData), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(route_drop, "notify::selected", @ptrCast(&onRouteChanged), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(route_host, "activate", @ptrCast(&onRouteApply), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(route_apply, "clicked", @ptrCast(&onRouteApply), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
         c.gtk_widget_set_parent(pop, anchor);
         self.parented = true;
@@ -313,6 +352,21 @@ pub const SiteInfo = struct {
 
         c.gtk_image_set_from_icon_name(@ptrCast(self.tls_icon), st.tls.icon());
         c.gtk_label_set_text(@ptrCast(self.tls_label), st.tls.text());
+
+        self.route_syncing = true;
+        const sel: c_uint = switch (st.route.kind) {
+            .direct => 0,
+            .tor => 1,
+            .mux => 2,
+            .remote_browser => 3,
+        };
+        c.gtk_drop_down_set_selected(@ptrCast(self.route_drop), sel);
+        var hz: [webroute.MAX_HOST + 1:0]u8 = undefined;
+        const hb = std.fmt.bufPrintZ(&hz, "{s}", .{st.route.host[0..@min(st.route.host.len, webroute.MAX_HOST)]}) catch "";
+        c.gtk_editable_set_text(@ptrCast(self.route_host), hb.ptr);
+        c.gtk_widget_set_sensitive(self.route_host, if (sel == 2 or sel == 3) 1 else 0);
+        c.gtk_widget_set_sensitive(self.route_row, if (st.route_movable) 1 else 0);
+        self.route_syncing = false;
 
         self.syncing = true;
         c.gtk_switch_set_active(@ptrCast(self.block_switch), if (st.blocking) 1 else 0);
@@ -454,7 +508,51 @@ pub const SiteInfo = struct {
     }
 };
 
+/// Route dropdown order == the switch in `refresh` / `onRouteApply`.
+const route_names = [_:null]?[*:0]const u8{
+    "Direct",
+    "Tor",
+    "Via server",
+    "Browser runs on",
+};
+
 // ── row / button handlers ───────────────────────────────────────────
+
+fn onRouteChanged(_: *c.GtkWidget, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(SiteInfo, user);
+    if (self.route_syncing) return;
+    const sel = c.gtk_drop_down_get_selected(@ptrCast(self.route_drop));
+    c.gtk_widget_set_sensitive(self.route_host, if (sel == 2 or sel == 3) 1 else 0);
+    // Direct and Tor need no host, so choosing them applies at once;
+    // the host-bound ones wait for Apply (or Enter in the entry).
+    if (sel == 0 or sel == 1) applyRoute(self);
+}
+
+fn onRouteApply(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+    applyRoute(cast.userData(SiteInfo, user));
+}
+
+fn applyRoute(self: *SiteInfo) void {
+    const face = webface.faceByView(self.view) orelse return;
+    const sel = c.gtk_drop_down_get_selected(@ptrCast(self.route_drop));
+    const host = std.mem.span(c.gtk_editable_get_text(@ptrCast(self.route_host)));
+    const spec: webroute.Spec = switch (sel) {
+        0 => .{},
+        1 => .{ .kind = .tor, .endpoint = webface.torEndpoint() },
+        2 => .{ .kind = .mux, .host = host },
+        else => .{ .kind = .remote_browser, .host = host },
+    };
+    face.setRoute(spec) catch |err| {
+        const msg: [*:0]const u8 = switch (err) {
+            error.InvalidRoute => if (sel == 2 or sel == 3) "That route needs a host." else "That route is not valid.",
+            error.AttachedView => "This kind of tab cannot change its route.",
+            error.RouteUnavailable => "That route could not be started.",
+        };
+        c.gtk_label_set_text(@ptrCast(self.cookie_status), msg);
+        return;
+    };
+    c.gtk_popover_popdown(@ptrCast(self.popover));
+}
 
 fn onResetPerm(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(RowCtx, user);

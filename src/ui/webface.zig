@@ -219,6 +219,7 @@ const webhistory = @import("webhistory.zig");
 const webuserscripts = @import("webuserscripts.zig");
 const socksbridge = @import("../ipc/socksbridge.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
+const socks5_client = @import("../mux/socks5_client.zig");
 const clipboard = @import("clipboard.zig");
 const webreader = @import("webreader.zig");
 const fpicker = @import("../filebrowser/picker.zig");
@@ -392,6 +393,39 @@ var g_max_fps: u16 = 0;
 /// Push the configured cap (0 = follow the display) into every live
 /// face. Called from `applyConfigChange` and at window construction, the
 /// same shape as `imhost.setPreference`.
+/// The machine-wide Tor SOCKS5 endpoint and the default route text,
+/// both from config (`mux_tor_socks_endpoint`, `web_route`). Stored as
+/// bytes so config arenas can be swapped underneath; every route that
+/// says `tor` resolves through `torEndpoint` at the moment it is used.
+var g_tor_endpoint: [64]u8 = undefined;
+var g_tor_endpoint_len: usize = 0;
+var g_default_route: [webroute.MAX_HOST + 8]u8 = undefined;
+var g_default_route_len: usize = 0;
+
+pub fn setRouteDefaults(route_text: []const u8, tor_endpoint: []const u8) void {
+    const n = @min(tor_endpoint.len, g_tor_endpoint.len);
+    @memcpy(g_tor_endpoint[0..n], tor_endpoint[0..n]);
+    g_tor_endpoint_len = n;
+    const m = @min(route_text.len, g_default_route.len);
+    @memcpy(g_default_route[0..m], route_text[0..m]);
+    g_default_route_len = m;
+}
+
+/// SOCKS5 `host:port` a `tor` route dials; the config default when
+/// nothing was applied yet.
+pub fn torEndpoint() []const u8 {
+    if (g_tor_endpoint_len == 0) return socks5_client.DEFAULT_ENDPOINT;
+    return g_tor_endpoint[0..g_tor_endpoint_len];
+}
+
+/// `web_route`: what a new tab uses when its container has no route of
+/// its own. Text that no longer parses (a Tor endpoint that stopped
+/// being valid) is direct here rather than nothing: the config loader
+/// already refused the unparseable spelling.
+pub fn defaultRoute() webroute.Spec {
+    return webroute.Spec.parse(g_default_route[0..g_default_route_len], torEndpoint()) orelse .{};
+}
+
 pub fn setMaxFps(fps: u16) void {
     g_max_fps = fps;
     for (g_client.faces.items) |f| {
@@ -602,6 +636,12 @@ pub const Client = struct {
     cache_dir: [128:0]u8 = undefined,
     cache_dir_len: usize = 0,
     bridge: ?*webremote.Bridge = null,
+    /// The loopback SOCKS5 -> mux bridge a `.mux` route instance's
+    /// proxy points at. Created on the first `ensure`, kept across
+    /// helper restarts (its port is baked into the helper's argv only
+    /// per spawn, so a restart re-reads it), never freed: clients are
+    /// immortal.
+    egress: ?*socksbridge.Egress = null,
     /// Storage for a formatted (non-static) unavailable reason; stable
     /// because clients are never freed.
     reason_buf: [256]u8 = undefined,
@@ -690,6 +730,38 @@ pub const Client = struct {
     cap_reader_ids: bool = false,
     /// Semantic requests/results carry a client-minted operation id.
     cap_semantic_request_ids: bool = false,
+    /// The helper observes its jars and applies foreign changes (the
+    /// 0xE0 block). What re-shares one identity across the route
+    /// instances; see `cookieSyncOnReady`.
+    cap_cookie_sync: bool = false,
+    /// `cookie_sync_enable` was posted on the CURRENT connection.
+    sync_enabled: bool = false,
+
+    /// The proxy this instance's helper is spawned with, or null for a
+    /// direct instance. A `.mux` route binds its bridge here, so the
+    /// port is known before the helper's argv is built; a bridge that
+    /// cannot bind fails the client rather than spawning a direct
+    /// helper under a routed name.
+    fn instanceProxy(self: *Client, buf: []u8) error{BridgeFailed}!?[]const u8 {
+        const spec = self.routeSpec();
+        switch (spec.kind) {
+            .direct, .remote_browser => return null,
+            .tor => return spec.proxyUrl(buf),
+            .mux => {
+                if (self.egress == null) {
+                    const eg = socksbridge.Egress.create(self.gpa, spec.host, mux_cli.muxConnect) orelse
+                        return error.BridgeFailed;
+                    if (!eg.spawn()) {
+                        eg.close();
+                        return error.BridgeFailed;
+                    }
+                    self.egress = eg;
+                }
+                return std.fmt.bufPrint(buf, "socks5://127.0.0.1:{d}", .{self.egress.?.port()}) catch
+                    return error.BridgeFailed;
+            },
+        }
+    }
 
     fn hostSlice(self: *const Client) []const u8 {
         return self.host[0..self.host_len];
@@ -753,6 +825,24 @@ pub const Client = struct {
             self.fail("No usable state directory for this route's browser profile.");
             return;
         };
+        // The route's proxy, applied by the helper to its GLOBAL request
+        // context and to every container context it mints, so no view of
+        // this instance has a direct path. Null for a direct instance.
+        var proxy_z: [96:0]u8 = undefined;
+        const proxy: ?[:0]const u8 = blk: {
+            var pbuf: [80]u8 = undefined;
+            const url = (self.instanceProxy(&pbuf) catch {
+                self.fail("Could not start the egress bridge for this route (the mux host is unreachable or the loopback listener would not bind).");
+                return;
+            }) orelse break :blk null;
+            if (url.len + 1 > proxy_z.len) {
+                self.fail("The route's proxy url is too long.");
+                return;
+            }
+            @memcpy(proxy_z[0..url.len], url);
+            proxy_z[url.len] = 0;
+            break :blk proxy_z[0..url.len :0];
+        };
 
         const pid = c.fork();
         if (pid == 0) {
@@ -765,10 +855,18 @@ pub const Client = struct {
                 _ = c.dup2(devnull, 1);
                 if (devnull > 2) _ = c.close(devnull);
             }
-            var argv: [6:null]?[*:0]const u8 = if (cache_dir) |cd|
-                .{ bin, "--socket", &path_z, "--cache-dir", cd.ptr, null }
-            else
-                .{ bin, "--socket", &path_z, null, null, null };
+            var argv: [8:null]?[*:0]const u8 = .{ bin, "--socket", &path_z, null, null, null, null, null };
+            var n: usize = 3;
+            if (cache_dir) |cd| {
+                argv[n] = "--cache-dir";
+                argv[n + 1] = cd.ptr;
+                n += 2;
+            }
+            if (proxy) |pr| {
+                argv[n] = "--proxy";
+                argv[n + 1] = pr.ptr;
+                n += 2;
+            }
             _ = c.execv(bin, @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
@@ -867,6 +965,8 @@ pub const Client = struct {
         self.cap_discard = false;
         self.cap_contexts = false;
         self.cap_contexts_fail_closed = false;
+        self.cap_cookie_sync = false;
+        self.sync_enabled = false;
         self.hello_done = false;
         self.cap_frames_inline = false;
         self.cap_filter_subscribe = false;
@@ -1280,6 +1380,8 @@ pub const Client = struct {
                 self.cap_webext_tabs = false;
                 self.cap_webext_action = false;
                 self.cap_webext_transaction = false;
+                self.cap_cookie_sync = false;
+                self.sync_enabled = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_DISCARD)) self.cap_discard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_TLS)) self.has_tls = true;
@@ -1302,6 +1404,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_FILTER_SUBSCRIBE)) self.cap_filter_subscribe = true;
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_COOKIE_SYNC)) self.cap_cookie_sync = true;
                 }
                 // A remote helper without inline frames would keep
                 // posting memfd frames whose descriptors the bridge
@@ -1323,6 +1426,9 @@ pub const Client = struct {
                 // Seed the helper with the stored user content before
                 // the faces' first navigations get far.
                 self.refreshUserContent();
+                // One identity across every route instance: subscribe
+                // the peers and seed this jar from the default one.
+                cookieSyncOnReady(self);
                 // The capability was unknown until this reply, so this
                 // is the first point the configured set can be sent.
                 publishFilterSubs(self);
@@ -1514,6 +1620,15 @@ pub const Client = struct {
                     self.post(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" });
                 }
             },
+            .ev_cookie_change => {
+                const ev = proto.EvCookieChange.decodeFrom(frame.payload) catch return;
+                onCookieChange(self, ev);
+            },
+            .ev_cookie_dump => {
+                const ev = proto.EvCookieDump.decodeAlloc(frame.payload, self.gpa) catch return;
+                defer self.gpa.free(ev.cookies);
+                onCookieDump(self, ev);
+            },
             .ev_cookies => {
                 const ev = proto.EvCookies.decodeAlloc(frame.payload, self.gpa) catch return;
                 defer self.gpa.free(ev.entries);
@@ -1649,17 +1764,19 @@ pub fn clientForHost(gpa: std.mem.Allocator, host: []const u8) ?*Client {
     return clientForRoute(gpa, .{ .kind = .remote_browser, .host = host });
 }
 
-/// The client a face in `container` belongs on: a container with a
-/// remote host gets that host's client, everything else the local one.
-fn clientForContainer(gpa: std.mem.Allocator, container: u32) *Client {
+/// The route a NEW tab in `container` takes: the container's own
+/// default route when it has one, else `web_route`. A container the
+/// registry does not know yet (the stored list has not landed) counts
+/// as routeless here; `rehomeContainerFaces` corrects such a face when
+/// the list arrives.
+pub fn routeForContainer(container: u32) webroute.Spec {
     if (container != 0) {
         if (findContainer(container)) |ctn| {
-            if (ctn.remote_host.len != 0) {
-                if (clientForHost(gpa, ctn.remote_host)) |cl| return cl;
-            }
+            const r = ctn.route();
+            if (!r.isDirect()) return r;
         }
     }
-    return &g_client;
+    return defaultRoute();
 }
 
 /// Resolve a view id across every client — for widget callbacks whose
@@ -1724,34 +1841,24 @@ pub const Container = struct {
     jar: []u8,
     color: [3]u8,
     ephemeral: bool,
-    /// Fixed-server proxy url published to the helper ("" = direct). For
-    /// an egress container this is `socks5://127.0.0.1:<bridge port>`.
-    proxy: []u8,
-    /// Egress host this container routes through ("" = none), shown in
-    /// the UI.
-    egress_host: []u8,
-    /// Remote-helper host ("" = local): faces in this container run on
-    /// a `sketerm-webengine` spawned by THAT host's mux daemon, frames
-    /// inline over the wire — the browser IS there rather than proxied
-    /// through there.
-    ///
-    /// **Still mutually exclusive with `egress_host`**, re-examined
-    /// 2026-08-12 and kept, because the conflict is an address-space
-    /// one rather than a policy choice: an egress container's proxy is
-    /// `socks5://127.0.0.1:<port>`, a listener in THIS process, so the
-    /// url only means anything on the machine the GUI runs on. Handing
-    /// it to a helper on another host would point that host's Chromium
-    /// at its OWN loopback — nothing there, or worse, something
-    /// unrelated. `publishOne` therefore strips the proxy for a remote
-    /// client, which is exactly why the pair cannot be expressed.
-    /// Lifting it needs the bridge reachable from the helper's host (a
-    /// reverse tunnel, or running the SOCKS listener daemon-side); that
-    /// is a transport feature, not a flag, so the exclusion stands and
-    /// the UI refuses the combination rather than silently dropping one
-    /// half.
-    remote_host: []u8,
-    /// The live SOCKS5->mux bridge for an egress container, else null.
-    egress: ?*socksbridge.Egress = null,
+    /// The DEFAULT route of tabs opened in this container (a tab may
+    /// override it through `WebFace.setRoute`). A route is realized as
+    /// a whole helper instance (`clientForRoute`), never as a proxy on
+    /// this container's context: stock CEF gives a profile one proxy,
+    /// and a per-context proxy would be lost the moment the tab moved
+    /// to a Tor instance. The Tor endpoint is not stored per container;
+    /// `route()` resolves it from config at use.
+    route_kind: webroute.Kind,
+    /// Owned host for `.mux` / `.remote_browser`; "" otherwise.
+    route_host: []u8,
+
+    pub fn route(self: *const Container) webroute.Spec {
+        return switch (self.route_kind) {
+            .direct => .{},
+            .tor => .{ .kind = .tor, .endpoint = torEndpoint() },
+            .mux, .remote_browser => .{ .kind = self.route_kind, .host = self.route_host },
+        };
+    }
 };
 
 var g_containers: std.ArrayList(Container) = .empty;
@@ -1771,14 +1878,6 @@ pub fn findContainer(id: u32) ?*Container {
     return null;
 }
 
-const EgressSupport = enum { waiting, ready, unsupported };
-
-fn egressSupport(hello_done: bool, contexts: bool, fail_closed: bool) EgressSupport {
-    if (!hello_done) return .waiting;
-    if (!contexts or !fail_closed) return .unsupported;
-    return .ready;
-}
-
 /// Accent color of a container, or null for the default context.
 pub fn containerColor(id: u32) ?[3]u8 {
     if (id == 0) return null;
@@ -1786,44 +1885,18 @@ pub fn containerColor(id: u32) ?[3]u8 {
     return null;
 }
 
-/// Create a container. `egress_host` empty = local/direct; non-empty
-/// spins a loopback SOCKS5 bridge that relays over the mux daemon to
-/// that host (remote DNS), and the container's proxy points at it.
-/// Returns the new id (0 on allocation failure).
+/// Create a session-local container whose tabs default to `route`.
+/// Returns the new id (0 on allocation failure or an invalid route).
 pub fn createContainer(
     gpa: std.mem.Allocator,
     name: []const u8,
     ephemeral: bool,
-    egress_host: []const u8,
-) u32 {
-    return createContainerFull(gpa, name, ephemeral, egress_host, "");
-}
-
-/// Container whose views RUN on `remote_host`: the helper is spawned by
-/// that host's mux daemon (`web_helper_open`) and its frames arrive
-/// inline over the wire — pages render, resolve and store cookies THERE.
-/// The stronger sibling of an egress container, which only proxies.
-pub fn createRemoteContainer(
-    gpa: std.mem.Allocator,
-    name: []const u8,
-    ephemeral: bool,
-    remote_host: []const u8,
-) u32 {
-    return createContainerFull(gpa, name, ephemeral, "", remote_host);
-}
-
-fn createContainerFull(
-    gpa: std.mem.Allocator,
-    name: []const u8,
-    ephemeral: bool,
-    egress_host: []const u8,
-    remote_host: []const u8,
+    route: webroute.Spec,
 ) u32 {
     return createContainerAt(gpa, .{
         .name = name,
         .ephemeral = ephemeral,
-        .egress_host = egress_host,
-        .remote_host = remote_host,
+        .route = route,
     });
 }
 
@@ -1836,22 +1909,15 @@ pub const ContainerSpec = struct {
     jar: []const u8 = "",
     color: ?[3]u8 = null,
     ephemeral: bool = false,
-    egress_host: []const u8 = "",
-    remote_host: []const u8 = "",
+    /// Default route; only its kind and host are kept (a Tor endpoint
+    /// is config, not identity).
+    route: webroute.Spec = .{},
 };
 
-const EgressFactory = *const fn (std.mem.Allocator, []const u8) ?*socksbridge.Egress;
-
-fn createEgress(gpa: std.mem.Allocator, host: []const u8) ?*socksbridge.Egress {
-    return socksbridge.Egress.create(gpa, host, mux_cli.muxConnect);
-}
-
 pub fn createContainerAt(gpa: std.mem.Allocator, spec: ContainerSpec) u32 {
-    return createContainerAtWith(gpa, spec, createEgress);
-}
-
-fn createContainerAtWith(gpa: std.mem.Allocator, spec: ContainerSpec, make_egress: EgressFactory) u32 {
-    if (spec.egress_host.len != 0 and spec.remote_host.len != 0) return 0;
+    // A route that cannot be realized must not become a container that
+    // LOOKS routed: refuse it here, where the caller can say so.
+    if (!spec.route.valid()) return 0;
     // Ephemeral containers are minted here and never stored, so their
     // ids come from a DISJOINT high range: the daemon store counts up
     // from 1, and an incognito tab opened before the stored registry
@@ -1871,58 +1937,15 @@ fn createContainerAtWith(gpa: std.mem.Allocator, spec: ContainerSpec, make_egres
         container_palette[(g_containers.items.len) % (container_palette.len - 1)];
     const name = spec.name;
     const ephemeral = spec.ephemeral;
-    const egress_host = spec.egress_host;
-    const remote_host = spec.remote_host;
 
     const name_owned = gpa.dupe(u8, name) catch return 0;
     const jar_owned = gpa.dupe(u8, if (spec.jar.len != 0) spec.jar else name) catch {
         gpa.free(name_owned);
         return 0;
     };
-    const host_owned = gpa.dupe(u8, egress_host) catch {
+    const host_owned = gpa.dupe(u8, spec.route.host) catch {
         gpa.free(name_owned);
         gpa.free(jar_owned);
-        return 0;
-    };
-    const remote_owned = gpa.dupe(u8, remote_host) catch {
-        gpa.free(name_owned);
-        gpa.free(jar_owned);
-        gpa.free(host_owned);
-        return 0;
-    };
-    var egress: ?*socksbridge.Egress = null;
-    const proxy_owned: []u8 = if (egress_host.len != 0) blk: {
-        const eg = make_egress(gpa, egress_host) orelse {
-            gpa.free(name_owned);
-            gpa.free(jar_owned);
-            gpa.free(host_owned);
-            gpa.free(remote_owned);
-            return 0;
-        };
-        const proxy = std.fmt.allocPrint(gpa, "socks5://127.0.0.1:{d}", .{eg.port()}) catch {
-            eg.close();
-            gpa.free(name_owned);
-            gpa.free(jar_owned);
-            gpa.free(host_owned);
-            gpa.free(remote_owned);
-            return 0;
-        };
-        if (proxy.len == 0 or !eg.spawn()) {
-            eg.close();
-            gpa.free(proxy);
-            gpa.free(name_owned);
-            gpa.free(jar_owned);
-            gpa.free(host_owned);
-            gpa.free(remote_owned);
-            return 0;
-        }
-        egress = eg;
-        break :blk proxy;
-    } else gpa.dupe(u8, "") catch {
-        gpa.free(name_owned);
-        gpa.free(jar_owned);
-        gpa.free(host_owned);
-        gpa.free(remote_owned);
         return 0;
     };
 
@@ -1932,19 +1955,12 @@ fn createContainerAtWith(gpa: std.mem.Allocator, spec: ContainerSpec, make_egres
         .jar = jar_owned,
         .color = color,
         .ephemeral = ephemeral,
-        .proxy = proxy_owned,
-        .egress_host = host_owned,
-        .remote_host = remote_owned,
-        .egress = egress,
+        .route_kind = spec.route.kind,
+        .route_host = host_owned,
     }) catch {
-        if (egress) |eg| {
-            eg.close();
-        }
         gpa.free(name_owned);
         gpa.free(jar_owned);
         gpa.free(host_owned);
-        gpa.free(remote_owned);
-        gpa.free(proxy_owned);
         return 0;
     };
     if (!ephemeral and id >= g_next_container_id) g_next_container_id = id + 1;
@@ -1983,15 +1999,10 @@ pub fn destroyContainer(gpa: std.mem.Allocator, id: u32) bool {
         for (g_aux_clients.items) |cl| {
             if (cl.state == .ready) cl.post(proto.ContextDestroy{ .id = id });
         }
-        if (ctn.egress) |eg| {
-            eg.close();
-        }
         const dead = g_containers.orderedRemove(i);
         gpa.free(dead.name);
         gpa.free(dead.jar);
-        gpa.free(dead.proxy);
-        gpa.free(dead.egress_host);
-        gpa.free(dead.remote_host);
+        gpa.free(dead.route_host);
         // Sweep the per-site rules too, exactly as the daemon store
         // does. Leaving them behind kept routing new tabs for those
         // hosts into a destroyed identity: the helper silently falls
@@ -2010,7 +2021,7 @@ pub fn destroyContainer(gpa: std.mem.Allocator, id: u32) bool {
 
 /// One-shot incognito preset: a throwaway ephemeral container.
 pub fn createIncognito(gpa: std.mem.Allocator) u32 {
-    return createContainer(gpa, "Incognito", true, "");
+    return createContainer(gpa, "Incognito", true, .{});
 }
 
 fn publishOne(cl: *Client, ctn: *const Container) void {
@@ -2022,11 +2033,11 @@ fn publishOne(cl: *Client, ctn: *const Container) void {
         // engine's on-disk cache path, so it must not move when the
         // user renames the container.
         .name = ctn.jar,
-        // An egress proxy url names a LOOPBACK bridge port of THIS
-        // machine; on a remote helper that loopback is the remote host's
-        // own, so the proxy is stripped there (a remote container's
-        // egress IS the remote host).
-        .proxy = if (cl.isRemote()) "" else ctn.proxy,
+        // Never a per-context proxy: the ROUTE is the helper instance
+        // the view lives in (`clientForRoute`), whose `--proxy` covers
+        // every context it mints. A context proxy here would follow the
+        // container into a Tor instance and re-route it out of Tor.
+        .proxy = "",
     });
 }
 
@@ -2253,30 +2264,61 @@ test "containerForUrl falls back when no rule names the host" {
     try t.expectEqual(@as(u32, 9), containerForUrl("about:blank", 9));
 }
 
-test "egress containers are not registered without a bridge" {
+test "a container with an invalid route is refused, not registered direct" {
     const t = std.testing;
-    const Stub = struct {
-        fn create(_: std.mem.Allocator, _: []const u8) ?*socksbridge.Egress {
-            return null;
-        }
-    };
     const before = g_containers.items.len;
-    const id = createContainerAtWith(t.allocator, .{
+    // A host-kind route with no host, and a Tor route with no endpoint.
+    try t.expectEqual(@as(u32, 0), createContainerAt(t.allocator, .{
         .id = 0x7fff_ff00,
         .name = "unreachable",
         .ephemeral = true,
-        .egress_host = "missing.example",
-    }, Stub.create);
-    try t.expectEqual(@as(u32, 0), id);
+        .route = .{ .kind = .mux },
+    }));
+    try t.expectEqual(@as(u32, 0), createContainerAt(t.allocator, .{
+        .id = 0x7fff_ff01,
+        .name = "notor",
+        .ephemeral = true,
+        .route = .{ .kind = .tor },
+    }));
     try t.expectEqual(before, g_containers.items.len);
 }
 
-test "egress waits for strict helper context support" {
+test "a container's route is the default for its tabs and resolves Tor from config" {
     const t = std.testing;
-    try t.expectEqual(EgressSupport.waiting, egressSupport(false, false, false));
-    try t.expectEqual(EgressSupport.unsupported, egressSupport(true, false, false));
-    try t.expectEqual(EgressSupport.unsupported, egressSupport(true, true, false));
-    try t.expectEqual(EgressSupport.ready, egressSupport(true, true, true));
+    // A Container VALUE, not a registry entry: the registry is a global
+    // ArrayList that a test could only grow, never free.
+    var host_buf = [_]u8{ 'g', 'a', 't', 'e' };
+    const onion = Container{
+        .id = 0x7fff_ff02,
+        .name = &.{},
+        .jar = &.{},
+        .color = .{ 0, 0, 0 },
+        .ephemeral = true,
+        .route_kind = .tor,
+        .route_host = &.{},
+    };
+    setRouteDefaults("direct", "127.0.0.1:9050");
+    try t.expectEqual(webroute.Kind.tor, onion.route().kind);
+    try t.expectEqualStrings("127.0.0.1:9050", onion.route().endpoint);
+    // The endpoint follows config, not the container.
+    setRouteDefaults("direct", "127.0.0.1:9150");
+    try t.expectEqualStrings("127.0.0.1:9150", onion.route().endpoint);
+    const via = Container{
+        .id = 0x7fff_ff03,
+        .name = &.{},
+        .jar = &.{},
+        .color = .{ 0, 0, 0 },
+        .ephemeral = true,
+        .route_kind = .mux,
+        .route_host = &host_buf,
+    };
+    try t.expectEqualStrings("gate", via.route().host);
+    // A routeless container (or none) falls back to `web_route`.
+    setRouteDefaults("via:gate", "127.0.0.1:9050");
+    try t.expectEqual(webroute.Kind.mux, routeForContainer(0).kind);
+    try t.expectEqualStrings("gate", routeForContainer(0).host);
+    setRouteDefaults("direct", "127.0.0.1:9050");
+    try t.expect(routeForContainer(0).isDirect());
 }
 
 /// Container a url should open in. An explicit per-site rule BEATS the
@@ -2368,13 +2410,19 @@ fn onContainerList(_: ?*anyopaque, ok: bool, payload: []const u8) void {
     for (rep.containers) |stored| {
         if (stored.id == 0 or stored.name.len == 0) continue;
         // Adopt the STORED id: it is the engine's jar path component.
+        // A stored route the grammar refuses (a Tor endpoint that is no
+        // longer valid) keeps the container OUT of the registry rather
+        // than adopting it as direct under a routed name.
+        const route = webroute.Spec.parse(stored.route, torEndpoint()) orelse {
+            std.debug.print("sketerm: container '{s}' has an unusable route '{s}'; not loaded\n", .{ stored.name, stored.route });
+            continue;
+        };
         _ = createContainerAt(gpa, .{
             .id = stored.id,
             .name = stored.name,
             .jar = stored.jar,
             .color = stored.color,
-            .egress_host = stored.egress_host,
-            .remote_host = stored.remote_host,
+            .route = route,
         });
     }
     for (rep.sites) |rule| {
@@ -2400,32 +2448,33 @@ fn markContainersReady(gpa: std.mem.Allocator) void {
     }
 }
 
-/// Move container-bound faces onto the Client their container names,
-/// now that the registry says which one that is.
+/// Move container-bound faces onto the instance their container's
+/// route names, now that the registry says which one that is.
 ///
-/// `attachOpts` picks a face's Client at ATTACH time via
-/// `clientForContainer`, and a `--restore` runs the whole layout build
+/// `attachOpts` picks a face's route at ATTACH time via
+/// `routeForContainer`, and a `--restore` runs the whole layout build
 /// synchronously BEFORE the stored registry lands — so `findContainer`
-/// returned null and every container-bound face fell back to the LOCAL
-/// helper. A container with a `remote_host` then browsed on this
-/// machine while the tab wore the container's name and colour: wrong
-/// egress, no error anywhere. Faces that already adopted a live view
-/// are left alone; only ones still waiting on the gate can move.
+/// returned null and every container-bound face took the default
+/// route. A container routed elsewhere then browsed directly while the
+/// tab wore the container's name and colour: wrong egress, no error
+/// anywhere. Faces that already adopted a live view, and faces whose
+/// route the user chose explicitly, are left alone.
 fn rehomeContainerFaces(gpa: std.mem.Allocator) void {
-    // Collect first: re-homing mutates both clients' face lists.
+    // Collect first: re-homing mutates the clients' face lists.
     var moving: std.ArrayList(*WebFace) = .empty;
     defer moving.deinit(gpa);
     for (g_client.faces.items) |f| {
-        if (f.container == 0 or f.attached or f.widgets_dead or f.view_live) continue;
-        const ctn = findContainer(f.container) orelse continue;
-        if (ctn.remote_host.len == 0) continue;
+        if (f.container == 0 or f.attached or f.widgets_dead or f.view_live or f.route_explicit) continue;
+        if (findContainer(f.container) == null) continue;
         moving.append(gpa, f) catch return;
     }
     for (moving.items) |f| {
         // Resolved here rather than in the scan above: this is what
-        // CREATES the per-host client, and doing that while walking
+        // CREATES the route's client, and doing that while walking
         // `g_client.faces` would be a side effect mid-iteration.
-        const want = clientForContainer(gpa, f.container);
+        const spec = routeForContainer(f.container);
+        const want = clientForRoute(gpa, spec) orelse continue;
+        if (!f.storeRoute(spec)) continue;
         if (want == f.cl) continue;
         f.cl.unregister(f);
         f.cl = want;
@@ -2442,14 +2491,13 @@ const PendingCreate = struct {
     ctx: ?*anyopaque,
     cb: ?ContainerCreated,
     name: []u8,
-    egress_host: []u8,
-    remote_host: []u8,
+    /// `web/route.zig` text, as the store keeps it.
+    route: []u8,
     color: [3]u8,
 
     fn free(self: *PendingCreate) void {
         self.allocator.free(self.name);
-        self.allocator.free(self.egress_host);
-        self.allocator.free(self.remote_host);
+        self.allocator.free(self.route);
         self.allocator.destroy(self);
     }
 };
@@ -2497,19 +2545,20 @@ fn forgetPendingCreate(p: *PendingCreate) bool {
 /// therefore only exists once the reply lands, which is why this is
 /// asynchronous where `createContainer` is not.
 ///
-/// `egress_host` and `remote_host` are mutually exclusive (see
-/// `Container.remote_host`); passing both is refused outright.
+/// `route` is `web/route.zig` text (`direct` | `tor` | `via:<host>` |
+/// `on:<host>`); an unparseable one is refused outright.
 pub fn createStoredContainer(
     gpa: std.mem.Allocator,
     name: []const u8,
     color: [3]u8,
-    egress_host: []const u8,
-    remote_host: []const u8,
+    route: []const u8,
     ctx: ?*anyopaque,
     cb: ?ContainerCreated,
 ) bool {
     if (name.len == 0) return false;
-    if (egress_host.len != 0 and remote_host.len != 0) return false;
+    // The store validates the shape too; refusing here keeps a bad
+    // spelling from costing a round trip and a dangling pending.
+    if (route.len != 0 and !webroute.Spec.validText(route)) return false;
     const p = gpa.create(PendingCreate) catch return false;
     p.* = .{
         .allocator = gpa,
@@ -2520,14 +2569,8 @@ pub fn createStoredContainer(
             gpa.destroy(p);
             return false;
         },
-        .egress_host = gpa.dupe(u8, egress_host) catch {
+        .route = gpa.dupe(u8, route) catch {
             gpa.free(p.name);
-            gpa.destroy(p);
-            return false;
-        },
-        .remote_host = gpa.dupe(u8, remote_host) catch {
-            gpa.free(p.name);
-            gpa.free(p.egress_host);
             gpa.destroy(p);
             return false;
         },
@@ -2539,7 +2582,7 @@ pub fn createStoredContainer(
         return false;
     };
     // The jar key starts equal to the name and never moves again.
-    if (!webstore.containerAdd(gpa, name, name, color, egress_host, remote_host, @ptrCast(p), &onContainerAdded)) {
+    if (!webstore.containerAdd(gpa, name, name, color, route, @ptrCast(p), &onContainerAdded)) {
         // A false return ALSO covers "the store connection died inside
         // the send", where `failPending` already ran `onContainerAdded`
         // — which forgot and freed `p`. Freeing again here was a double
@@ -2569,8 +2612,7 @@ fn onContainerAdded(user: ?*anyopaque, ok: bool, payload: []const u8) void {
             .name = p.name,
             .jar = p.name,
             .color = p.color,
-            .egress_host = p.egress_host,
-            .remote_host = p.remote_host,
+            .route = webroute.Spec.parse(p.route, torEndpoint()) orelse .{ .kind = .mux },
         });
         // The daemon write happened first so it could mint the stable id.
         // If local setup cannot make the corresponding live container,
@@ -2579,6 +2621,171 @@ fn onContainerAdded(user: ?*anyopaque, ok: bool, payload: []const u8) void {
         if (id == 0) _ = webstore.containerRemove(gpa, stored_id, null, &onStoreAck);
     }
     if (p.cb) |cb| cb(p.ctx, id);
+}
+
+// ---------------------------------------------------------------------
+// Cookie synchronisation across route instances (protocol 0xE0 block)
+// ---------------------------------------------------------------------
+//
+// A route is a whole helper process with its own profile, so the same
+// container is a different cookie jar in every instance. This block
+// buys the identity back: every LOCAL instance that advertises
+// "cookie-sync" is subscribed once a second instance exists, each
+// observed change is applied to every other peer, and a freshly started
+// instance is seeded from the default one, jar by jar. Remote-browser
+// instances are deliberately not peers: their jar lives on the remote
+// host, and cookie VALUES crossing to another machine is a decision
+// nobody made by picking "browser runs on".
+
+const SeedJob = struct {
+    /// The `cookie_dump_req` id outstanding on the default instance.
+    req: u32,
+    /// The instance the dumped page is applied to.
+    target: *Client,
+    context: u32,
+};
+
+var g_seed_jobs: std.ArrayList(SeedJob) = .empty;
+var g_sync_req: u32 = 1;
+
+fn nextSyncReq() u32 {
+    const r = g_sync_req;
+    g_sync_req +%= 1;
+    if (g_sync_req == 0) g_sync_req = 1;
+    return r;
+}
+
+/// A subscribed-or-subscribable sync participant.
+fn isSyncPeer(cl: *const Client) bool {
+    return !cl.isRemote() and cl.state == .ready and cl.hello_done and cl.cap_cookie_sync;
+}
+
+fn syncPeerCount() usize {
+    var n: usize = 0;
+    if (isSyncPeer(&g_client)) n += 1;
+    for (g_aux_clients.items) |cl| {
+        if (isSyncPeer(cl)) n += 1;
+    }
+    return n;
+}
+
+fn enableSyncOn(cl: *Client) void {
+    if (cl.sync_enabled or !isSyncPeer(cl)) return;
+    cl.post(proto.CookieSyncEnable{ .enable = 1 });
+    cl.sync_enabled = true;
+}
+
+/// An instance finished its handshake: with two or more peers alive
+/// every one of them is subscribed (the first stays unsubscribed while
+/// alone, since observing costs a periodic walk of every jar), and a
+/// non-default instance is seeded from the default one.
+fn cookieSyncOnReady(cl: *Client) void {
+    if (!isSyncPeer(cl)) return;
+    if (syncPeerCount() < 2) return;
+    enableSyncOn(&g_client);
+    for (g_aux_clients.items) |peer| enableSyncOn(peer);
+    if (cl == &g_client or !isSyncPeer(&g_client)) return;
+    // Seed: the shared jar plus every container jar the registry
+    // publishes to both instances.
+    requestSeed(cl, 0);
+    for (g_containers.items) |*ctn| requestSeed(cl, ctn.id);
+}
+
+fn requestSeed(target: *Client, context: u32) void {
+    const req = nextSyncReq();
+    g_seed_jobs.append(g_client.gpa, .{ .req = req, .target = target, .context = context }) catch return;
+    g_client.post(proto.CookieDumpReq{ .req = req, .context = context, .cursor = 0 });
+}
+
+/// A jar changed in `src`: replay it into every other peer. The helper
+/// settles its own shadow on apply, so nothing here loops.
+fn onCookieChange(src: *Client, ev: proto.EvCookieChange) void {
+    applyToPeers(src, ev.context, ev.removed, ev.url, ev.cookie);
+}
+
+fn applyToPeers(src: ?*Client, context: u32, remove: u8, url: []const u8, cookie: proto.SyncCookie) void {
+    if (src != &g_client and isSyncPeer(&g_client)) applyTo(&g_client, context, remove, url, cookie);
+    for (g_aux_clients.items) |peer| {
+        if (peer == src or !isSyncPeer(peer)) continue;
+        applyTo(peer, context, remove, url, cookie);
+    }
+}
+
+fn applyTo(cl: *Client, context: u32, remove: u8, url: []const u8, cookie: proto.SyncCookie) void {
+    cl.post(proto.CookieApply{
+        .req = nextSyncReq(),
+        .context = context,
+        .remove = remove,
+        .url = url,
+        .cookie = cookie,
+    });
+}
+
+/// One page of a seed dump landed on the default instance: apply it to
+/// the job's target and ask for the next page while there is one.
+fn onCookieDump(src: *Client, ev: proto.EvCookieDump) void {
+    if (src != &g_client) return;
+    var idx: ?usize = null;
+    for (g_seed_jobs.items, 0..) |job, i| {
+        if (job.req == ev.req) {
+            idx = i;
+            break;
+        }
+    }
+    const i = idx orelse return;
+    const job = g_seed_jobs.items[i];
+    if (ev.ok == 0 or !isSyncPeer(job.target)) {
+        _ = g_seed_jobs.swapRemove(i);
+        return;
+    }
+    for (ev.cookies) |ck| {
+        var ubuf: [1024]u8 = undefined;
+        const url = cookieUrl(&ubuf, ck) orelse continue;
+        applyTo(job.target, job.context, 0, url, ck);
+    }
+    if (ev.more != 0) {
+        const req = nextSyncReq();
+        g_seed_jobs.items[i].req = req;
+        g_client.post(proto.CookieDumpReq{ .req = req, .context = job.context, .cursor = ev.next_cursor });
+    } else {
+        _ = g_seed_jobs.swapRemove(i);
+    }
+}
+
+/// The url a dumped cookie is applied under: its domain (dot-less) and
+/// path, on https for a Secure cookie. `cookie_apply` needs a url the
+/// engine will accept the cookie for, and a dump carries none.
+fn cookieUrl(buf: []u8, ck: proto.SyncCookie) ?[]const u8 {
+    const domain = std.mem.trimStart(u8, ck.domain, ".");
+    if (domain.len == 0) return null;
+    const path = if (ck.path.len != 0 and ck.path[0] == '/') ck.path else "/";
+    const scheme: []const u8 = if (ck.flags & proto.cookie_secure != 0) "https" else "http";
+    return std.fmt.bufPrint(buf, "{s}://{s}{s}", .{ scheme, domain, path }) catch null;
+}
+
+test "a dumped cookie is applied under the url its attributes imply" {
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    const base = proto.SyncCookie{
+        .name = "sid",
+        .value = "v",
+        .domain = ".example.com",
+        .path = "/app",
+        .flags = proto.cookie_secure,
+        .same_site = 0,
+        .priority = 1,
+        .creation_ms = 0,
+        .last_access_ms = 0,
+        .expires_ms = 0,
+    };
+    try t.expectEqualStrings("https://example.com/app", cookieUrl(&buf, base).?);
+    var plain = base;
+    plain.flags = 0;
+    plain.path = "";
+    try t.expectEqualStrings("http://example.com/", cookieUrl(&buf, plain).?);
+    var nodomain = base;
+    nodomain.domain = "";
+    try t.expect(cookieUrl(&buf, nodomain) == null);
 }
 
 // ---------------------------------------------------------------------
@@ -2833,6 +3040,23 @@ pub const WebFace = struct {
     /// helper fixes it at `view_create`. Kept across helper restarts so
     /// a rebuilt view lands back in the same container.
     container: u32 = 0,
+    /// The route this tab's traffic takes, realized by `cl` (one helper
+    /// instance per route). Kind plus copies of the host/endpoint, so
+    /// the face holds no slice into a config arena or a container that
+    /// may be renamed or removed under it.
+    route_kind: webroute.Kind = .direct,
+    route_host: [webroute.MAX_HOST]u8 = undefined,
+    route_host_len: usize = 0,
+    route_endpoint: [64]u8 = undefined,
+    route_endpoint_len: usize = 0,
+    /// The user (or an MCP caller) chose this tab's route; the
+    /// container's default no longer applies to it.
+    route_explicit: bool = false,
+    /// Dim "via Tor" / "via box" text beside the site button; hidden on
+    /// a direct route. The padlock alone cannot say where traffic
+    /// leaves, and a silently wrong route is the failure routes exist
+    /// to prevent.
+    route_label: *c.GtkWidget = undefined,
     /// True once `view_create` was sent on the CURRENT connection.
     view_live: bool = false,
     /// This face PRESENTS a view somebody else created (the inspector
@@ -2849,7 +3073,6 @@ pub const WebFace = struct {
     fwd_btn: *c.GtkWidget = undefined,
     reload_btn: *c.GtkWidget = undefined,
     reader_btn: *c.GtkWidget = undefined,
-    shell_btn: *c.GtkWidget = undefined,
     /// The toolbar hamburger; also the anchor its menu pops under.
     burger_btn: *c.GtkWidget = undefined,
     entry: *c.GtkWidget = undefined,
@@ -3118,7 +3341,11 @@ pub const WebFace = struct {
     /// or 0 when there is none. Refreshed from the store on every
     /// committed navigation, so it reflects what other windows did too.
     bookmark_id: u64 = 0,
-    star_btn: *c.GtkWidget = undefined,
+    /// The bookmark star lives INSIDE the address entry as its
+    /// secondary icon; this fallback button exists only when the theme
+    /// chain cannot draw either star icon, so the control is never an
+    /// invisible pixel.
+    star_btn: ?*c.GtkWidget = null,
     /// This origin's stored popup override; `.inherit` follows the
     /// app-level `web_popup_policy`.
     site_popup: enum { inherit, allow, block } = .inherit,
@@ -3269,7 +3496,17 @@ pub const WebFace = struct {
         if (opts.existing_view == 0)
             self.omni = omnibox.Omnibox.create(allocator, self, self.entry) catch null;
 
-        const cl = opts.on_client orelse clientForContainer(allocator, opts.container);
+        // The tab's route: its container's default, else `web_route`,
+        // realized by one helper instance per route. A route the client
+        // registry cannot mint (out of memory, an over-long host) falls
+        // back to the direct instance and SAYS so.
+        const spec = routeForContainer(opts.container);
+        _ = self.storeRoute(spec);
+        const cl = opts.on_client orelse (clientForRoute(allocator, spec) orelse blk: {
+            _ = self.storeRoute(.{});
+            self.setStatus("This tab's route could not be started; browsing directly instead.", false);
+            break :blk &g_client;
+        });
         self.cl = cl;
         cl.ensure(allocator);
         if (opts.existing_view != 0) {
@@ -3825,6 +4062,8 @@ pub const WebFace = struct {
         }
         info.refresh(.{
             .origin = origin,
+            .route = self.routeSpec(),
+            .route_movable = !self.attached,
             .tls = self.tlsState(),
             .blocking = self.net_enabled,
             .blocked = self.net_blocked,
@@ -3847,13 +4086,34 @@ pub const WebFace = struct {
     fn updateSiteButton(self: *WebFace) void {
         if (self.widgets_dead) return;
         const tls = self.tlsState();
-        const icon: [*:0]const u8 = switch (tls) {
+        const tls_icon: [*:0]const u8 = switch (tls) {
             .none => "text-x-generic-symbolic",
             .insecure => "channel-insecure-symbolic",
             .secure => "channel-secure-symbolic",
             .exception => "dialog-warning-symbolic",
         };
-        toolbtn.setIcon(self.site_btn, self.bar, icon, "Site");
+        // A routed tab shows WHERE its traffic leaves before it shows
+        // how the connection reads: the route is the fact a user must
+        // not have to open anything to learn.
+        const route = self.routeSpec();
+        var dbuf: [webroute.MAX_HOST + 16]u8 = undefined;
+        const desc = route.describe(&dbuf);
+        if (route.icon()) |ri| {
+            var tz: [webroute.MAX_HOST + 16]u8 = undefined;
+            toolbtn.setIcon(self.site_btn, self.bar, ri, (std.fmt.bufPrintZ(&tz, "{s}", .{desc}) catch @as([:0]const u8, "Route")).ptr);
+        } else {
+            toolbtn.setIcon(self.site_btn, self.bar, tls_icon, "Site");
+        }
+        var lz: [webroute.MAX_HOST + 16]u8 = undefined;
+        const label = std.fmt.bufPrintZ(&lz, "{s}", .{desc}) catch "";
+        c.gtk_label_set_text(@ptrCast(self.route_label), label.ptr);
+        c.gtk_widget_set_visible(self.route_label, if (desc.len != 0) 1 else 0);
+        var tip: [webroute.MAX_HOST + 96]u8 = undefined;
+        const t = if (desc.len != 0)
+            std.fmt.bufPrintZ(&tip, "Site information, permissions and stored data. This tab browses {s}.", .{desc}) catch "Site information"
+        else
+            std.fmt.bufPrintZ(&tip, "Site information, permissions and stored data", .{}) catch "Site information";
+        c.gtk_widget_set_tooltip_text(self.site_btn, t.ptr);
         self.refreshSiteInfo(false);
     }
 
@@ -4639,6 +4899,14 @@ pub const WebFace = struct {
             self,
         );
         self.track(self.site_btn);
+        // Where this tab's traffic leaves, spelled out beside the
+        // padlock and hidden on a direct route (`updateSiteButton`).
+        self.route_label = c.gtk_label_new("").?;
+        c.gtk_widget_add_css_class(self.route_label, "dim-label");
+        c.gtk_widget_set_margin_end(self.route_label, 4);
+        c.gtk_widget_set_visible(self.route_label, 0);
+        self.track(self.route_label);
+        c.gtk_box_append(@ptrCast(bar), self.route_label);
 
         self.entry = c.gtk_entry_new();
         c.gtk_widget_set_hexpand(self.entry, 1);
@@ -4654,12 +4922,20 @@ pub const WebFace = struct {
         self.track(self.entry);
         c.gtk_box_append(@ptrCast(bar), self.entry);
 
-        // Bookmark star. A plain button, not a toggle: its pressed
-        // look would have to be driven from an async store reply, and
-        // a toggle that flips itself back a moment later reads as a
-        // bug. The ICON carries the state instead.
-        self.star_btn = toolbtn.barButton(bar, "sketerm-non-starred-symbolic", "Bookmark", "Bookmark this page", &onStar, self);
-        self.track(self.star_btn);
+        // Bookmark star, INSIDE the address entry as its secondary icon
+        // (the place every browser keeps it). Not a toggle: its pressed
+        // look would have to be driven from an async store reply, and a
+        // toggle that flips itself back a moment later reads as a bug.
+        // The ICON carries the state. A theme chain that cannot draw
+        // either star gets a labelled bar button instead, never an
+        // invisible entry icon.
+        if (toolbtn.iconAvailable("sketerm-starred-symbolic") and toolbtn.iconAvailable("sketerm-non-starred-symbolic")) {
+            c.gtk_entry_set_icon_activatable(@ptrCast(self.entry), c.GTK_ENTRY_ICON_SECONDARY, 1);
+            _ = c.g_signal_connect_data(@ptrCast(self.entry), "icon-press", @ptrCast(&onEntryIconPress), self, null, 0);
+        } else {
+            self.star_btn = toolbtn.barButton(bar, "sketerm-non-starred-symbolic", "Bookmark", "Bookmark this page", &onStar, self);
+            self.track(self.star_btn.?);
+        }
 
         self.action_box = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0).?;
         c.gtk_widget_set_visible(self.action_box, 0);
@@ -4694,12 +4970,9 @@ pub const WebFace = struct {
         self.track(self.shield_btn);
         c.gtk_box_append(@ptrCast(bar), self.shield_btn);
 
-        // `sketerm-terminal-symbolic` is one of our own bundled icons,
-        // but it goes through the fallback like every other name: a
-        // theme chain that cannot draw it must not leave the way out
-        // of the browser as an invisible button.
-        self.shell_btn = toolbtn.barButton(bar, "sketerm-terminal-symbolic", "Shell", "Show this pane's shell", &onShowShell, self);
-        self.track(self.shell_btn);
+        // The way back to the pane's shell is a menu row plus the
+        // `toggle_web_face` chord, not a toolbar button: it is a
+        // once-per-session action and the toolbar is for the page.
 
         // The hamburger is END-MOST on every sketerm toolbar. Its menu
         // is built fresh per open (every row's sensitivity depends on
@@ -5040,8 +5313,8 @@ pub const WebFace = struct {
         const job = cast.userData(AxJob, user);
         const gpa = job.gpa;
         defer gpa.destroy(job);
-        // Resolve GLOBALLY. A face bound to a container with a
-        // `remote_host` lives on a per-host Client, not on `g_client`,
+        // Resolve GLOBALLY. A face on a non-direct ROUTE lives on that
+        // route's Client, not on `g_client`,
         // so scanning only the local client never found it: the
         // connected projection was discarded and `ax_connecting` stayed
         // true forever, permanently disabling accessibility for that
@@ -5201,6 +5474,74 @@ pub const WebFace = struct {
     // ---- client callbacks ------------------------------------------
 
     /// A helper connection came up (first start, or after a Reload).
+    /// This tab's route, rebuilt from the face's own copies.
+    pub fn routeSpec(self: *const WebFace) webroute.Spec {
+        return .{
+            .kind = self.route_kind,
+            .host = self.route_host[0..self.route_host_len],
+            .endpoint = self.route_endpoint[0..self.route_endpoint_len],
+        };
+    }
+
+    /// Copy `spec` into the face. False when a field does not fit,
+    /// leaving the old route in place.
+    fn storeRoute(self: *WebFace, spec: webroute.Spec) bool {
+        if (spec.host.len > self.route_host.len or spec.endpoint.len > self.route_endpoint.len) return false;
+        self.route_kind = spec.kind;
+        @memcpy(self.route_host[0..spec.host.len], spec.host);
+        self.route_host_len = spec.host.len;
+        @memcpy(self.route_endpoint[0..spec.endpoint.len], spec.endpoint);
+        self.route_endpoint_len = spec.endpoint.len;
+        return true;
+    }
+
+    pub const RouteError = error{ InvalidRoute, AttachedView, RouteUnavailable };
+
+    /// Move this tab onto `spec`'s helper instance: the current page is
+    /// reloaded there, the old view is destroyed, and everything the
+    /// tab is besides its traffic (container identity through cookie
+    /// sync, bookmarks, history, the pane) stays. The route then sticks
+    /// to the tab for its lifetime, across navigations and helper
+    /// restarts. An inspector view cannot move (it presents somebody
+    /// else's view); an invalid spec is refused rather than downgraded.
+    pub fn setRoute(self: *WebFace, spec: webroute.Spec) RouteError!void {
+        if (!spec.valid()) return error.InvalidRoute;
+        if (self.attached) return error.AttachedView;
+        const want = clientForRoute(self.allocator, spec) orelse return error.RouteUnavailable;
+        const same_client = want == self.cl;
+        if (!self.storeRoute(spec)) return error.InvalidRoute;
+        self.route_explicit = true;
+        self.updateSiteButton();
+        if (same_client) return;
+        // Leave the old instance: the view there is torn down like a
+        // closed tab, and the new instance mints a fresh id so nothing
+        // in flight on the old socket can be mistaken for the new view.
+        const old = self.cl;
+        if (self.view_live) old.post(proto.ViewDestroy{ .view = self.view });
+        self.cancelHints();
+        self.abandonAutoOps(true);
+        self.reader_guards.resetEpoch();
+        self.exitReader();
+        self.clearPermPrompts();
+        self.dropMap();
+        if (self.actions) |a| a.helperGone();
+        old.unregister(self);
+        self.view_live = false;
+        self.view = g_next_view;
+        g_next_view += 1;
+        self.sent_w = 0;
+        self.sent_h = 0;
+        self.cl = want;
+        if (self.actions) |a| a.bindView(self.view, self.cl);
+        want.register(self);
+        want.ensure(self.allocator);
+        switch (want.state) {
+            .ready => self.onClientReady(),
+            .unavailable => self.onHelperUnavailable(want.reason, want.reason_retryable),
+            else => self.setStatus("Starting the browser helper for this route...", false),
+        }
+    }
+
     pub fn onClientReady(self: *WebFace) void {
         // Nothing in flight can be answered by a helper that just came
         // up: drop the requests so their kinds are usable again.
@@ -5279,29 +5620,9 @@ pub const WebFace = struct {
         // `markContainersReady` kicks every waiter.
         if (self.container != 0) {
             if (!g_containers_loaded) return;
-            const ctn = findContainer(self.container) orelse {
+            if (findContainer(self.container) == null) {
                 self.setStatus("Browser view creation failed: the requested container is unavailable.", false);
                 return;
-            };
-            if (ctn.egress_host.len != 0) {
-                switch (egressSupport(cl.hello_done, cl.cap_contexts, cl.cap_contexts_fail_closed)) {
-                    .waiting => return,
-                    .unsupported => {
-                        self.setStatus("Browser view creation failed: this helper cannot enforce fail-closed egress.", false);
-                        return;
-                    },
-                    .ready => {},
-                }
-                // Creation guarantees both, but keep the policy at the
-                // last boundary before view_create as well: a damaged
-                // registry must not turn an egress face into a direct one.
-                if (ctn.proxy.len == 0 or ctn.egress == null) {
-                    self.setStatus("Browser view creation failed: the egress bridge is unavailable.", true);
-                    return;
-                }
-                // Ordered immediately before view_create. This also makes
-                // Reload retry a context whose first proxy setup was refused.
-                publishOne(cl, ctn);
             }
         }
         // THE FIRST BUFFER MUST ALREADY BE THE RIGHT SIZE. The area's
@@ -5991,23 +6312,30 @@ pub const WebFace = struct {
     fn updateStar(self: *WebFace) void {
         if (self.widgets_dead) return;
         const on = self.bookmark_id != 0;
-        toolbtn.setIcon(
-            self.star_btn,
-            self.bar,
-            if (on) "sketerm-starred-symbolic" else "sketerm-non-starred-symbolic",
-            if (on) "Bookmarked" else "Bookmark",
-        );
-        c.gtk_widget_set_tooltip_text(
-            self.star_btn,
-            if (on) "Remove this page from bookmarks" else "Bookmark this page",
-        );
+        const icon: [*:0]const u8 = if (on) "sketerm-starred-symbolic" else "sketerm-non-starred-symbolic";
+        const tip: [*:0]const u8 = if (on) "Remove this page from bookmarks" else "Bookmark this page";
+        if (self.star_btn) |btn| {
+            toolbtn.setIcon(btn, self.bar, icon, if (on) "Bookmarked" else "Bookmark");
+            c.gtk_widget_set_tooltip_text(btn, tip);
+            return;
+        }
+        c.gtk_entry_set_icon_from_icon_name(@ptrCast(self.entry), c.GTK_ENTRY_ICON_SECONDARY, icon);
+        c.gtk_entry_set_icon_tooltip_text(@ptrCast(self.entry), c.GTK_ENTRY_ICON_SECONDARY, tip);
+    }
+
+    fn onEntryIconPress(_: *c.GtkEntry, pos: c.GtkEntryIconPosition, user: ?*anyopaque) callconv(.c) void {
+        if (pos != c.GTK_ENTRY_ICON_SECONDARY) return;
+        cast.userData(WebFace, user).toggleBookmark();
+    }
+
+    fn onStar(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).toggleBookmark();
     }
 
     /// Star: add the current page, or remove the bookmark it already
     /// has. The reply-driven refresh is what learns the new id, so the
     /// star is only ever as wrong as one round trip.
-    fn onStar(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(WebFace, user);
+    pub fn toggleBookmark(self: *WebFace) void {
         if (self.bookmark_id != 0) {
             webstore.bookmarkRemove(self.allocator, self.bookmark_id);
             self.bookmark_id = 0;
@@ -7134,8 +7462,7 @@ pub const WebFace = struct {
     }
 
     fn onMenuBookmark(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        const face = cast.userData(MenuCtx, user).face;
-        onStar(face.star_btn, @ptrCast(face));
+        cast.userData(MenuCtx, user).face.toggleBookmark();
     }
 
     /// Store (or clear) this origin's popup override and apply it at
@@ -7313,8 +7640,9 @@ pub const WebFace = struct {
                 asg.item(classicmenu.escapeLabel(ctn.name, &abuf), &onMenuAssignSite, rc);
             }
         }
+        var shell_buf: [96]u8 = undefined;
         tabs.itemIconEnabled(
-            "Show This Pane's Shell",
+            self.shellRowLabel(&shell_buf),
             .{ .name = "sketerm-terminal-symbolic" },
             self.pane != null,
             &onMenuShell,
@@ -7359,8 +7687,24 @@ pub const WebFace = struct {
     }
 
     fn onMenuShell(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
-        const face = cast.userData(MenuCtx, user).face;
-        onShowShell(face.shell_btn, @ptrCast(face));
+        cast.userData(MenuCtx, user).face.showShell();
+    }
+
+    /// The menu row's text for "show the shell", carrying the chord the
+    /// pane's binding table has for `toggle_web_face` when one is bound
+    /// (there is no default), so the row teaches the shortcut.
+    fn shellRowLabel(self: *WebFace, buf: []u8) [*:0]const u8 {
+        const base = "Show This Pane's Shell";
+        const pane = self.pane orelse return base;
+        const ictx = pane.input_ctx orelse return base;
+        for (ictx.bindings) |b| {
+            if (b.action != .toggle_web_face or b.keyval == 0) continue;
+            const raw = c.gtk_accelerator_get_label(b.keyval, b.mods) orelse return base;
+            defer c.g_free(raw);
+            const label = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
+            return (std.fmt.bufPrintZ(buf, "{s} ({s})", .{ base, label }) catch return base).ptr;
+        }
+        return base;
     }
 
     // ---- password fill (Secret Service) ------------------------------
@@ -8213,8 +8557,9 @@ pub const WebFace = struct {
         self.navAction(if (self.loading) .stop else .reload);
     }
 
-    fn onShowShell(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
-        const self = cast.userData(WebFace, user);
+    /// Flip the pane to its shell; `toggle_web_face` brings the page
+    /// back. Reachable from the menu and from remote control.
+    pub fn showShell(self: *WebFace) void {
         if (self.pane) |p| p.setWebVisible(false);
     }
 

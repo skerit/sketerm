@@ -23,6 +23,7 @@ const cast = @import("../util/cast.zig");
 const webstore = @import("webstore.zig");
 const webface = @import("webface.zig");
 const confirm = @import("confirm.zig");
+const webroute = @import("../web/route.zig");
 const Window = @import("window.zig").Window;
 
 /// Selectable accents: the palette minus its last entry, which is
@@ -32,20 +33,32 @@ const palette_names = [_:null]?[*:0]const u8{
     "Blue", "Green", "Amber", "Red", "Purple", "Teal", "Pink",
 };
 
-/// How a container's traffic leaves. Exactly one, which is how the
-/// egress/remote-host exclusion documented on `webface.Container` is
-/// enforced in the UI: the two can never both be set.
+/// Default route for a container's tabs. Order == the switch in
+/// `apply`. "Via server" (mux egress) and "Browser runs on"
+/// (remote-browser placement) take a host; Direct and Tor do not.
 const Routing = enum(c_uint) {
     direct = 0,
-    egress = 1,
-    remote = 2,
+    tor = 1,
+    egress = 2,
+    remote = 3,
 };
 
 const routing_names = [_:null]?[*:0]const u8{
     "Direct",
+    "Tor",
     "Via server",
     "Browser runs on",
 };
+
+/// The stored route text a dropdown selection plus host spells.
+fn routeText(buf: []u8, mode: Routing, host: []const u8) ?[]const u8 {
+    return switch (mode) {
+        .direct => "direct",
+        .tor => "tor",
+        .egress => if (host.len == 0) null else std.fmt.bufPrint(buf, "via:{s}", .{host}) catch null,
+        .remote => if (host.len == 0) null else std.fmt.bufPrint(buf, "on:{s}", .{host}) catch null,
+    };
+}
 
 const Manager = struct {
     allocator: std.mem.Allocator,
@@ -175,19 +188,23 @@ fn rebuild(self: *Manager) void {
         c.gtk_box_append(@ptrCast(row), name);
 
         const routing = c.gtk_drop_down_new_from_strings(@ptrCast(&routing_names));
-        const mode: Routing = if (ctn.remote_host.len != 0)
-            .remote
-        else if (ctn.egress_host.len != 0) .egress else .direct;
+        const spec = ctn.route();
+        const mode: Routing = switch (spec.kind) {
+            .direct => .direct,
+            .tor => .tor,
+            .mux => .egress,
+            .remote_browser => .remote,
+        };
         c.gtk_drop_down_set_selected(@ptrCast(routing), @intFromEnum(mode));
         c.gtk_box_append(@ptrCast(row), routing);
 
         const host = c.gtk_entry_new();
         c.gtk_entry_set_placeholder_text(@ptrCast(host), "host");
-        const cur_host = if (ctn.remote_host.len != 0) ctn.remote_host else ctn.egress_host;
+        const cur_host = spec.host;
         var hz: [160]u8 = undefined;
         const hb = std.fmt.bufPrintZ(&hz, "{s}", .{cur_host[0..@min(cur_host.len, 128)]}) catch "";
         c.gtk_editable_set_text(@ptrCast(host), hb.ptr);
-        c.gtk_widget_set_sensitive(host, if (mode == .direct) 0 else 1);
+        c.gtk_widget_set_sensitive(host, if (mode == .egress or mode == .remote) 1 else 0);
         c.gtk_box_append(@ptrCast(row), host);
 
         const rm = c.gtk_button_new_from_icon_name("user-trash-symbolic");
@@ -254,26 +271,22 @@ fn apply(ctx: *RowCtx) void {
         setStatus(ctx.mgr, "A container needs a name.");
         return;
     }
-    c.gtk_widget_set_sensitive(ctx.host, if (mode == .direct) 0 else 1);
-    if (mode != .direct and host.len == 0) {
-        setStatus(ctx.mgr, "That routing needs a host.");
+    c.gtk_widget_set_sensitive(ctx.host, if (mode == .egress or mode == .remote) 1 else 0);
+    var rbuf: [webroute.MAX_HOST + 8]u8 = undefined;
+    const route = routeText(&rbuf, mode, host) orelse {
+        setStatus(ctx.mgr, "That route needs a host.");
         return;
-    }
-
-    // Exactly one of the two is ever non-empty: the mode picks it, so
-    // the mutually exclusive pair cannot be expressed here at all.
-    const egress: []const u8 = if (mode == .egress) host else "";
-    const remote: []const u8 = if (mode == .remote) host else "";
+    };
 
     _ = webface.renameContainer(gpa, ctx.id, name);
     _ = webface.recolorContainer(ctx.id, rgb);
-    _ = webstore.containerUpdate(gpa, ctx.id, name, rgb, egress, remote, @ptrCast(ctx.mgr), &onMutated);
+    _ = webstore.containerUpdate(gpa, ctx.id, name, rgb, route, @ptrCast(ctx.mgr), &onMutated);
 
-    // Routing only takes effect for views created afterwards: a live
-    // browser's request context is fixed at view_create, so saying so
-    // is more honest than implying the open tab moved.
+    // A live tab keeps the route it was created with (moving it means a
+    // new helper instance); the change is the DEFAULT for new tabs, and
+    // a per-tab route is the site button's job. Say so.
     if (mode != .direct)
-        setStatus(ctx.mgr, "Saved. New tabs in this container use the new route.")
+        setStatus(ctx.mgr, "Saved. New tabs in this container use the new route; change an open tab from its site button.")
     else
         setStatus(ctx.mgr, "Saved.");
 }
@@ -313,9 +326,11 @@ fn onCreateClicked(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     }
     // The colour is assigned by creation order, exactly as the palette
     // rotation elsewhere does; the row's picker changes it afterwards.
-    const rgb = webface.container_palette[webface.containers().len %
-        (webface.container_palette.len - 1)];
-    if (!webface.createStoredContainer(self.allocator, name, rgb, "", "", @ptrCast(self), &onCreated)) {
+    const rgb = webface.container_palette[
+        webface.containers().len %
+            (webface.container_palette.len - 1)
+    ];
+    if (!webface.createStoredContainer(self.allocator, name, rgb, "direct", @ptrCast(self), &onCreated)) {
         setStatus(self, "Store unavailable — cannot create a container.");
         return;
     }

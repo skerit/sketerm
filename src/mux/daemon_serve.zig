@@ -3452,10 +3452,9 @@ pub const WebOpReq = struct {
     jar: []const u8 = "",
     /// Container accent as 0xRRGGBB; absent leaves it alone.
     color: ?u32 = null,
-    /// Container routing; absent leaves the field alone, "" clears it.
-    /// The two are mutually exclusive — see `webstore.Container`.
-    egress_host: ?[]const u8 = null,
-    remote_host: ?[]const u8 = null,
+    /// Container default route in `web/route.zig`'s text grammar;
+    /// absent leaves it alone, "" clears it to direct.
+    route: ?[]const u8 = null,
 };
 
 fn rgbFromU32(v: u32) [3]u8 {
@@ -3609,10 +3608,9 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
             r.name,
             r.jar,
             rgbFromU32(r.color orelse 0),
-            r.egress_host orelse "",
-            r.remote_host orelse "",
+            r.route orelse "",
         ) catch |err| return webReplyErr(cl, r.req, switch (err) {
-            error.BadContainer => "a container needs a name, and egress and remote host are exclusive",
+            error.BadContainer => "a container needs a name and a route of direct | tor | via:<host> | on:<host>",
             else => "container write failed",
         });
         cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .id = id });
@@ -3620,10 +3618,9 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         const found = store.containerUpdate(r.container, .{
             .name = if (r.name.len != 0) r.name else null,
             .color = if (r.color) |v| rgbFromU32(v) else null,
-            .egress_host = r.egress_host,
-            .remote_host = r.remote_host,
+            .route = r.route,
         }) catch |err| return webReplyErr(cl, r.req, switch (err) {
-            error.BadContainer => "egress and remote host are mutually exclusive",
+            error.BadContainer => "a container route is direct | tor | via:<host> | on:<host>",
             else => "container write failed",
         });
         cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .found = found });

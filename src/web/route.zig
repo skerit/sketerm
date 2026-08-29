@@ -76,6 +76,80 @@ pub const Spec = struct {
         };
     }
 
+    /// The user-facing spelling, one home for config, the CLI and the
+    /// MCP argument: `direct` | `tor` | `via:<host>` | `on:<host>`.
+    /// Tor carries no endpoint here because the endpoint is a
+    /// machine-wide setting (`mux_tor_socks_endpoint`), supplied by the
+    /// caller at parse time; a spec whose fields do not fit the grammar
+    /// formats to null.
+    pub fn format(self: Spec, buf: []u8) ?[]const u8 {
+        return switch (self.kind) {
+            .direct => std.fmt.bufPrint(buf, "direct", .{}) catch null,
+            .tor => std.fmt.bufPrint(buf, "tor", .{}) catch null,
+            .mux => if (self.host.len == 0) null else std.fmt.bufPrint(buf, "via:{s}", .{self.host}) catch null,
+            .remote_browser => if (self.host.len == 0) null else std.fmt.bufPrint(buf, "on:{s}", .{self.host}) catch null,
+        };
+    }
+
+    /// Inverse of `format`. `tor_endpoint` is the SOCKS5 `host:port` a
+    /// `tor` spec resolves to; the returned spec borrows `text` and
+    /// `tor_endpoint`. Null for anything outside the grammar, including
+    /// a `tor` whose endpoint is not a valid `host:port` and a `via:` or
+    /// `on:` without a host -- an unparseable route must never quietly
+    /// become direct.
+    pub fn parse(text: []const u8, tor_endpoint: []const u8) ?Spec {
+        const t = std.mem.trim(u8, text, " \t");
+        if (t.len == 0 or std.mem.eql(u8, t, "direct")) return .{};
+        if (std.mem.eql(u8, t, "tor")) {
+            const spec = Spec{ .kind = .tor, .endpoint = tor_endpoint };
+            return if (spec.valid()) spec else null;
+        }
+        if (std.mem.startsWith(u8, t, "via:")) return hostSpec(.mux, t["via:".len..]);
+        if (std.mem.startsWith(u8, t, "on:")) return hostSpec(.remote_browser, t["on:".len..]);
+        return null;
+    }
+
+    fn hostSpec(kind: Kind, host_raw: []const u8) ?Spec {
+        const host = std.mem.trim(u8, host_raw, " \t");
+        if (host.len == 0 or host.len > MAX_HOST) return null;
+        // A host string is a mux host spec (`user@box`, `ssh:box`, ...);
+        // whitespace or a slash is never part of one.
+        for (host) |ch| {
+            if (ch <= ' ' or ch == '/' or ch == 0x7f) return null;
+        }
+        return .{ .kind = kind, .host = host };
+    }
+
+    /// Whether `text` is in the grammar at all, independent of which
+    /// Tor endpoint is configured. What a store validates a container's
+    /// stored route with: the endpoint is not the container's to know.
+    pub fn validText(text: []const u8) bool {
+        return parse(text, SHAPE_CHECK_ENDPOINT) != null;
+    }
+
+    /// What the tab shows next to its site button: nothing for direct
+    /// (the padlock says it all), otherwise where the traffic leaves.
+    pub fn describe(self: Spec, buf: []u8) []const u8 {
+        return switch (self.kind) {
+            .direct => "",
+            .tor => "via Tor",
+            .mux => std.fmt.bufPrint(buf, "via {s}", .{self.host}) catch "via server",
+            .remote_browser => std.fmt.bufPrint(buf, "on {s}", .{self.host}) catch "on server",
+        };
+    }
+
+    /// Icon name the indicator uses; null for direct (the TLS padlock
+    /// keeps its place). Adwaita names only, so a theme that lacks them
+    /// falls back to the text of `describe` through `toolbtn`.
+    pub fn icon(self: Spec) ?[*:0]const u8 {
+        return switch (self.kind) {
+            .direct => null,
+            .tor => "network-vpn-symbolic",
+            .mux => "network-server-symbolic",
+            .remote_browser => "computer-symbolic",
+        };
+    }
+
     /// A short, stable, filesystem- and socket-safe identifier.
     ///
     /// It names this route's profile directory and helper socket, so it
@@ -97,6 +171,14 @@ pub const Spec = struct {
         }) catch null;
     }
 };
+
+/// Longest host a `via:`/`on:` route may name; matches the client's
+/// fixed host buffers.
+pub const MAX_HOST: usize = 255;
+
+/// A syntactically valid endpoint used ONLY to check a `tor` text's
+/// shape where no real endpoint applies (`validText`).
+const SHAPE_CHECK_ENDPOINT = "127.0.0.1:9050";
 
 /// `host:port` with a numeric-or-name host and a nonzero port. Bracketed
 /// IPv6 is accepted; a bare `::1:9050` is not, because its last colon is
@@ -179,4 +261,59 @@ test "slugs are stable, distinct, and short enough for a unix socket path" {
     // Long inputs must not grow the slug: it lives inside a sun_path.
     const long = Spec{ .kind = .mux, .host = "a" ** 200 };
     try t.expect(long.slug(&a).?.len <= 24);
+}
+
+test "route text round-trips through parse and format" {
+    const t = std.testing;
+    var buf: [300]u8 = undefined;
+    const ep = "127.0.0.1:9050";
+    const direct = Spec.parse("direct", ep).?;
+    try t.expect(direct.isDirect());
+    try t.expectEqualStrings("direct", direct.format(&buf).?);
+    try t.expect(Spec.parse("", ep).?.isDirect());
+
+    const tor = Spec.parse("tor", ep).?;
+    try t.expectEqual(Kind.tor, tor.kind);
+    try t.expectEqualStrings(ep, tor.endpoint);
+    try t.expectEqualStrings("tor", tor.format(&buf).?);
+
+    const via = Spec.parse("via:me@box", ep).?;
+    try t.expectEqual(Kind.mux, via.kind);
+    try t.expectEqualStrings("me@box", via.host);
+    try t.expectEqualStrings("via:me@box", via.format(&buf).?);
+
+    const on = Spec.parse(" on:udp:box ", ep).?;
+    try t.expectEqual(Kind.remote_browser, on.kind);
+    try t.expectEqualStrings("udp:box", on.host);
+    try t.expectEqualStrings("on:udp:box", on.format(&buf).?);
+}
+
+test "route text outside the grammar is refused, never downgraded" {
+    const t = std.testing;
+    const ep = "127.0.0.1:9050";
+    try t.expect(Spec.parse("via:", ep) == null);
+    try t.expect(Spec.parse("on:", ep) == null);
+    try t.expect(Spec.parse("via:a b", ep) == null);
+    try t.expect(Spec.parse("proxy:box", ep) == null);
+    try t.expect(Spec.parse("Tor", ep) == null);
+    // A tor route is only as good as its endpoint.
+    try t.expect(Spec.parse("tor", "") == null);
+    try t.expect(Spec.parse("tor", "nocolon") == null);
+    try t.expect(Spec.validText("tor"));
+    try t.expect(Spec.validText("via:box"));
+    try t.expect(!Spec.validText("bogus"));
+    // A host-kind spec with no host has no spelling.
+    var buf: [64]u8 = undefined;
+    try t.expect((Spec{ .kind = .mux }).format(&buf) == null);
+}
+
+test "the indicator names where traffic leaves" {
+    const t = std.testing;
+    var buf: [300]u8 = undefined;
+    try t.expectEqualStrings("", (Spec{}).describe(&buf));
+    try t.expectEqualStrings("via Tor", (Spec{ .kind = .tor, .endpoint = "127.0.0.1:9050" }).describe(&buf));
+    try t.expectEqualStrings("via box", (Spec{ .kind = .mux, .host = "box" }).describe(&buf));
+    try t.expectEqualStrings("on box", (Spec{ .kind = .remote_browser, .host = "box" }).describe(&buf));
+    try t.expect((Spec{}).icon() == null);
+    try t.expect((Spec{ .kind = .tor }).icon() != null);
 }

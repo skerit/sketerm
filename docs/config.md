@@ -354,6 +354,7 @@ that framebuffer and costs nothing extra.
 | `web_popup_policy` | enum | `block-gestureless` | What a browser pane does with a popup a page asks for: `block-gestureless`, `allow`, `block-all`. Anything else is a parse error. |
 | `web_download_ask` | bool | `true` | Whether a browser pane's download raises a save dialog. `false` auto-accepts into `~/Downloads` under the page's suggested name (uniquified on collision). The save dialog can also pick a `host:` location: the file downloads locally first, then hands off to that host's daemon as an ordinary transfer. |
 | `web_search_engine` | string | `https://duckduckgo.com/?q={q}` | Search-engine URL template for address-bar input that is not a URL. `{q}` is replaced by the percent-encoded query. Must be an http(s) URL containing `{q}`; anything else is a parse error. |
+| `web_route` | string | `direct` | Default network route for new browser tabs whose container has no route of its own: `direct`, `tor`, `via:<host>` (egress: traffic leaves from that mux/SSH host, DNS resolves there), or `on:<host>` (the browser process runs on that host). `tor` dials `mux_tor_socks_endpoint`. A route is realized as a separate browser process, so identity is re-shared across them by cookie sync. Validated at load; a per-tab override lives on the tab's site button. Anything else is a parse error. |
 
 `browser_max_fps` is a CEILING, not a target. A browser pane paints
 nothing at all while its page is unchanged, and a background tab's page
@@ -413,6 +414,20 @@ percent-encoded and substituted for `{q}`. Examples:
 web_search_engine = https://www.google.com/search?q={q}
 web_search_engine = https://www.startpage.com/sp/search?query={q}
 ```
+
+Each browser tab takes a **network route**: `direct`, `tor`, a mux/SSH
+host it egresses through (`via:<host>`), or a host the whole browser
+process runs on (`on:<host>`). `web_route` sets the default for new
+tabs; a container's own route (Containers dialog) overrides that for
+tabs opened in it; and a single tab's route is changed from the "Route"
+section of its site button (the padlock). A non-direct route shows
+beside that button so it is never a hidden state. Because stock Chromium
+gives one profile one proxy, a route is a whole `sketerm-webengine`
+process with its own profile; the same identity is re-shared across
+those processes by cookie synchronisation (you stay logged in), which
+is why a routing failure is loud and a sync failure is only a
+re-login. Tor and egress fail CLOSED: a route that cannot be started
+refuses the tab rather than browsing directly under a routed label.
 
 A template that lacks `{q}` or does not start with `http://`/`https://`
 is rejected as a bad line (default kept), so a typo cannot turn every
@@ -701,7 +716,7 @@ editor *font* is per-profile.
 | `app_keyboard_layout` | string | unset | xkb layout for forwarded-app session keyboards: `us`, `gb`, `fr`, `be`, `de`. Set it to YOUR physical layout -- keystrokes pass through as raw keycodes and the app decodes them with this keymap. Empty = `us`. |
 | `gpu_apps` | string | unset | Comma-separated app names always launched with GPU rendering (linux-dmabuf instead of software GL), matched case-insensitively against the .desktop `Name` or the `Exec` binary's basename: `Blender, mpv`. |
 | `mux_udp_port_range` | string | unset | `lo:hi` passed to the remote UDP bootstrap; pin it when a firewall sits in front of the host (`60000:61000`). Validated at load. Empty = ephemeral port. |
-| `mux_tor_socks_endpoint` | string | `127.0.0.1:9050` | SOCKS5 proxy a forced `tor:` mux route dials. Numeric only (IPv4, or a bracketed IPv6 literal) and validated at load, so resolving the proxy itself can never leak through local DNS. |
+| `mux_tor_socks_endpoint` | string | `127.0.0.1:9050` | SOCKS5 proxy a forced `tor:` mux route dials, AND the endpoint a browser tab's Tor route (`web_route = tor`, or the site button) uses. Numeric only (IPv4, or a bracketed IPv6 literal) and validated at load, so resolving the proxy itself can never leak through local DNS. |
 | `input_method` | enum | `auto` | `simple` = GTK's in-process compose tables (dead keys always work, no IME); `multi` = the per-display IM module (ibus/fcitx, but on Wayland that module has no compose engine); `auto` picks `multi` only where an input method is visibly configured. Under `auto` the terminal always resolves to `simple`; the editor and the app host follow the heuristic. An explicit value applies to every face. Applies to faces created after the change. |
 
 ### Background layer

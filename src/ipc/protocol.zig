@@ -57,6 +57,9 @@ pub const Request = struct {
     remote: bool = false,
     /// web-container: throwaway cache/cookies (the incognito shape).
     ephemeral: bool = false,
+    /// web-container: default route text (direct | tor | via:<host> |
+    /// on:<host>); web-open: this tab's route. Overrides host/remote.
+    route: ?[]const u8 = null,
     /// web-open: open the tab inside this identity container.
     container: ?u32 = null,
 
