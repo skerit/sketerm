@@ -168,6 +168,22 @@ sketerm_build() {
     fi
 }
 
+# Stage every bundled SVG of one icon directory. An empty or missing source
+# directory is a hard error: silently staging nothing is exactly the failure
+# this glob replaced.
+sketerm_stage_icon_dir() {
+    local source_dir=$1 dest_dir=$2 svg staged=0
+    for svg in "$source_dir"/*.svg; do
+        [ -f "$svg" ] || continue
+        install -Dm644 "$svg" "$dest_dir/${svg##*/}"
+        staged=$((staged + 1))
+    done
+    if [ "$staged" -eq 0 ]; then
+        printf '==> ERROR: no icons found in %s\n' "$source_dir" >&2
+        return 1
+    fi
+}
+
 # Stage the package-independent install tree for every Linux backend.
 sketerm_stage() {
     local root=$1 dest=$2 kind=$3 with_web=$4 tic_bin=$5 license_name=$6
@@ -198,14 +214,13 @@ sketerm_stage() {
                  dev.sker.sketerm.editor dev.sker.sketerm.web; do
             install -Dm644 "data/$i.desktop" \
                 "$dest/usr/share/applications/$i.desktop"
-            install -Dm644 "data/icons/hicolor/scalable/apps/$i.svg" \
-                "$dest/usr/share/icons/hicolor/scalable/apps/$i.svg"
         done
-        for i in sketerm-terminal-symbolic sketerm-split-left-right-symbolic \
-                 sketerm-split-top-bottom-symbolic sketerm-rendering-symbolic \
-                 sketerm-preview-pane-symbolic sketerm-reader-symbolic; do
-            install -Dm644 "data/icons/hicolor/scalable/actions/$i.svg" \
-                "$dest/usr/share/icons/hicolor/scalable/actions/$i.svg"
+        # Icons are staged by glob, never by a hand-written list: a list is how
+        # the bookmark button shipped as the text "Bookmark" for two releases.
+        # dist/test-install.sh drift-tests the result against src/'s references.
+        for i in apps actions; do
+            sketerm_stage_icon_dir "data/icons/hicolor/scalable/$i" \
+                "$dest/usr/share/icons/hicolor/scalable/$i" || return 1
         done
 
         install -Dm644 data/sketerm.portal \

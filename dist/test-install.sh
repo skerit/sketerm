@@ -902,6 +902,44 @@ cmp -s "$fixture/zig-out/bin/sketerm-webengine" \
     || fail "packaged sketerm-webengine did not come from the current build"
 
 # ------------------------------------------------------------------------
+# Bundled icons are staged by glob, never by a hand-written list, and this is
+# the drift test that keeps it that way. A list is how sketerm-starred-symbolic
+# and sketerm-non-starred-symbolic went uninstalled while src/ asked for them,
+# so the bookmark button rendered as the text "Bookmark" on installed builds.
+
+icon_src="$root/data/icons/hicolor/scalable"
+mapfile -t referenced_icons < <(
+    grep -rhoE '"sketerm-[a-z-]*-symbolic"' "$root/src" | tr -d '"' | sort -u)
+[ "${#referenced_icons[@]}" -ge 6 ] \
+    || fail "found no sketerm-*-symbolic icon references in src/"
+
+for icon in "${referenced_icons[@]}"; do
+    icon_home=
+    for icon_dir in actions apps; do
+        if [ -f "$icon_src/$icon_dir/$icon.svg" ]; then
+            icon_home=$icon_dir
+        fi
+    done
+    [ -n "$icon_home" ] \
+        || fail "src/ references $icon with no file under data/icons/hicolor/scalable"
+    icon_rel="usr/share/icons/hicolor/scalable/$icon_home/$icon.svg"
+    [ -e "${plain_stage[0]}/$icon_rel" ] \
+        || fail "plain GUI stage omitted referenced icon $icon_rel"
+    [ -e "$work/pkg/$icon_rel" ] \
+        || fail "PKGBUILD package() omitted referenced icon $icon_rel"
+done
+
+for icon_dir in actions apps; do
+    for icon_svg in "$icon_src/$icon_dir"/*.svg; do
+        icon_rel="usr/share/icons/hicolor/scalable/$icon_dir/${icon_svg##*/}"
+        [ -e "${plain_stage[0]}/$icon_rel" ] \
+            || fail "plain GUI stage omitted bundled icon $icon_rel"
+        [ -e "$work/pkg/$icon_rel" ] \
+            || fail "PKGBUILD package() omitted bundled icon $icon_rel"
+    done
+done
+
+# ------------------------------------------------------------------------
 # The version algorithm and the build recipe exist ONCE, in stage.sh, and
 # both backends reach them through it. These assertions are what stops the
 # copies growing back: they compare each caller's observable result against
