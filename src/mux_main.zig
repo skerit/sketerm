@@ -9,14 +9,6 @@ const daemon = @import("mux/daemon.zig");
 const platform = @import("util/platform.zig");
 const VERSION = @import("version.zig").string;
 
-/// SIGPIPE "ignore" via a no-op handler. The libc `SIG_IGN` macro
-/// fails translate-c (function-pointer cast) and its raw value (1)
-/// violates fn-pointer alignment on aarch64-macos. For SIGPIPE the
-/// no-op handler is equivalent: write() still returns EPIPE, the
-/// process just doesn't die.
-fn sigNoop(_: c_int) callconv(.c) void {}
-const sig_ign = &sigNoop;
-
 const HELP =
     \\sketerm-mux — sketerm session daemon (durable panes)
     \\
@@ -108,8 +100,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             // on stdin (its PTY) and exits at EOF, so the PTY machinery
             // is exactly what it is for a shell — no special case in
             // the daemon, and killing the session kills this.
-            const cc = @import("c.zig").c;
-            _ = cc.signal(cc.SIGPIPE, sig_ign);
+            platform.ignoreSigpipe();
             return @import("mux/keep.zig").serve();
         } else if (std.mem.eql(u8, a, "display")) {
             // Everything after the keyword belongs to the subcommand.
@@ -218,7 +209,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 /// the daemon when absent. Runs on the REMOTE side of an SSH pipe.
 fn runProxy(allocator: std.mem.Allocator) u8 {
     const cc = @import("c.zig").c;
-    _ = cc.signal(cc.SIGPIPE, sig_ign);
+    platform.ignoreSigpipe();
 
     const path = daemon.defaultSocketPath(allocator) catch return 1;
     defer allocator.free(path);
@@ -328,7 +319,7 @@ const cc_sockaddr_storage = @import("c.zig").c.struct_sockaddr_storage;
 /// daemon loss, NOT on network silence — that's the durability.
 fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16, sock_path: ?[]const u8) u8 {
     const cc = @import("c.zig").c;
-    _ = cc.signal(cc.SIGPIPE, sig_ign);
+    platform.ignoreSigpipe();
 
     var udp_fd = platform.socketCloexec(cc.AF_INET, cc.SOCK_DGRAM, 0);
     // Park the socket above the stdio range: when the spawner has fds
@@ -434,7 +425,7 @@ fn runUdpListen(allocator: std.mem.Allocator, port_range: ?[2]u16, sock_path: ?[
 /// socket) is what makes the remote's punch target real.
 fn runUdpConnect(allocator: std.mem.Allocator, host: []const u8, port_s: []const u8, keyhex: []const u8, fd_s: ?[]const u8) u8 {
     const cc = @import("c.zig").c;
-    _ = cc.signal(cc.SIGPIPE, sig_ign);
+    platform.ignoreSigpipe();
 
     const key = rudp.keyFromHex(keyhex) orelse return 1;
     const port = std.fmt.parseInt(u16, port_s, 10) catch return 1;
@@ -697,5 +688,5 @@ fn installSignalHandlers() void {
     _ = cc.signal(cc.SIGTERM, onTerm);
     _ = cc.signal(cc.SIGINT, onTerm);
     // Writing to a client that vanished must not kill the daemon.
-    _ = cc.signal(cc.SIGPIPE, sig_ign);
+    platform.ignoreSigpipe();
 }

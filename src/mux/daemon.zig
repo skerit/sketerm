@@ -160,6 +160,42 @@ test "a dead rename requester frees the pending worker rename slot" {
     try t.expectEqual(@as(usize, 0), d.clients.items.len);
 }
 
+test "reap drops a dead client's in-flight listing before freeing the client" {
+    const t = std.testing;
+    const a = t.allocator;
+    var empty: [0]u8 = .{};
+    var d = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    defer d.clients.deinit(a);
+    defer d.fs_listings.deinit(a);
+
+    const cl = try a.create(Client);
+    cl.* = .{ .allocator = a, .fd = -1, .id = 11 };
+    try d.clients.append(a, cl);
+
+    // A plain `fs_op list` (no view): dropFsViewAt does not cover it,
+    // so only reap's own fs_listings sweep can retire it. Without one,
+    // pumpFsListings reads listing.client.dead after the free.
+    var arena = std.heap.ArenaAllocator.init(a);
+    const names = try arena.allocator().alloc([]u8, 0);
+    const listing = try a.create(FsListing);
+    listing.* = .{
+        .allocator = a,
+        .arena = arena,
+        .client = cl,
+        .req = 1,
+        .path = try a.dupe(u8, "/tmp"),
+        .attrs = try a.dupe(u8, ""),
+        .names = names,
+        .view = null,
+    };
+    try d.fs_listings.append(a, listing);
+
+    cl.dead = true;
+    d.reap();
+    try t.expectEqual(@as(usize, 0), d.fs_listings.items.len);
+    try t.expectEqual(@as(usize, 0), d.clients.items.len);
+}
+
 pub const Session = struct {
     /// What feeds this session's parser. `.pty` is the normal child
     /// shell/app; `.cast` replays an asciicast file on a timer and
@@ -187,6 +223,9 @@ pub const Session = struct {
     /// `list` — computed daemon-side so detached sessions are observable with
     /// no client attached. Seeded at spawn (a fresh session is "active").
     last_activity_ms: i64 = 0,
+    /// Latched by the first kitty image this session dropped, so the
+    /// warning explaining a vanished image is logged once per lifetime.
+    kitty_drop_warned: bool = false,
     /// Foreground process name on the pty, for the GUI's
     /// `{{ PROGRAM }}` title placeholder. Sampled off the back of PTY
     /// output only (never on a timer), so an idle daemon stays idle;
@@ -621,6 +660,13 @@ pub const Client = struct {
     normal_bytes_written: u64 = 0,
     attached: ?*Session = null,
     dead: bool = false,
+    /// `Daemon.reap` phase 1 has run this client's one-shot detach and
+    /// committed to freeing it at the end of the CURRENT reap. Phase 2
+    /// sweeps every collection holding a raw `*Client` before phase 3
+    /// frees exactly this set, so a client that phase 2 itself kills
+    /// (a sweep can queue a frame past MAX_WBUF) is left unflagged and
+    /// waits for the next reap rather than being freed unswept.
+    reaping: bool = false,
     /// Negotiated core protocol, capped to this daemon's newest profile.
     /// Clients that never send a hello (the quick CLI send/kill paths of
     /// every released build) get the documented legacy default instead of
@@ -1481,9 +1527,10 @@ pub const Native = struct {
     /// Copy: read-ends of pipes whose write-ends went to the app
     /// via wl_data_source.send; EOF ships a clip_data unit up.
     clip_reads: std.ArrayList(ClipRead) = .empty,
-    /// pool id → mmapped mirror of the CURRENT incarnation under that
-    /// id. Mirrors outlive wl_shm_pool destructors: existing buffers
-    /// keep referencing the memory.
+    /// pool id -> daemon-owned mirror of the CURRENT incarnation under that
+    /// id (anonymous memory filled by pread at commit; the client fd is kept
+    /// only to read from). Mirrors outlive wl_shm_pool destructors: existing
+    /// buffers keep referencing the memory.
     pools: std.AutoHashMapUnmanaged(u32, PoolMirror) = .empty,
     /// Incarnation serial → mirror displaced from `pools` by id reuse
     /// while old buffers still referenced it (Vulkan WSI destroys its
@@ -1569,12 +1616,12 @@ pub const Native = struct {
         fd: c_int,
     };
 
-    const PoolMirror = struct {
+    pub const PoolMirror = struct {
         fd: c_int,
         ptr: [*]u8,
         size: usize,
-        /// Live wl_buffers created from this pool. The mmap (and the
-        /// tmpfs pages it pins via the open fd) is reclaimed only when
+        /// Live wl_buffers created from this pool. The mirror (and the
+        /// tmpfs pages the open fd pins) is reclaimed only when
         /// this hits 0 on a destroyed pool — wl_shm_pool destructor
         /// semantics keep the memory alive for existing buffers.
         buffers: u32 = 0,
@@ -4068,7 +4115,6 @@ pub const Daemon = struct {
     const flushBrain = daemon_native.flushBrain;
     const flushPendingBrains = daemon_native.flushPendingBrains;
     const POOL_CHUNK = daemon_native.POOL_CHUNK;
-    const queueDmabufProtocolError = daemon_native.queueDmabufProtocolError;
     const nativeAction = daemon_native.nativeAction;
     const queueUnits = daemon_native.queueUnits;
     const queueUnitsTo = daemon_native.queueUnitsTo;
@@ -5839,6 +5885,8 @@ pub const Daemon = struct {
             // shm APCs are dropped before they can read this host's
             // filesystem (see EventCollector.emit).
             .untrusted = s.isCast(),
+            .session_name = s.name,
+            .kitty_drop_warned = &s.kitty_drop_warned,
         };
     }
 
@@ -6055,8 +6103,74 @@ pub const Daemon = struct {
         }
     }
 
+    /// One-shot teardown of a dead client's session-scoped identity,
+    /// run by `reap` phase 1 while the client is still IN
+    /// `self.clients` and still pointed at by every dependent
+    /// collection.
+    ///
+    /// Its broadcasts can queue frames, and `Client.queueFrame` marks a
+    /// recipient past `MAX_WBUF` dead, which is exactly why phase 1
+    /// iterates to a fixpoint and the sweeps come after it. Leaving the
+    /// client in `self.clients` costs nothing: every roster helper
+    /// filters on `terminalViewer`, which excludes `dead`.
+    fn detachDeadClient(self: *Daemon, cl: *Client) void {
+        // A dying client's TCP forwards die with it (native and audio
+        // channels are session-owned and survive).
+        for (self.channels.items) |ch| {
+            if (ch.tcp and ch.client == cl) ch.dead = true;
+        }
+        const was = cl.attached;
+        if (was) |s| log.info("client gone (session '{s}')", .{s.name});
+        self.panelClientDetached(cl, "panel presenter disconnected after request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent");
+        // A pending broker rename whose requester died must free
+        // the slot, or every later rename on this worker fails
+        // "already in progress" (the 'n' reply would find no live
+        // requester to answer anyway).
+        if (self.worker_rename_request) |pending| {
+            if (pending.requester_id == cl.id) self.worker_rename_request = null;
+        }
+        // Release BEFORE the client is freed: the handover scan
+        // compares against this pointer, and s.controller would
+        // otherwise dangle.
+        const lease_moved = if (was) |s| self.releaseControl(s, cl) else false;
+        // Duplicate rosters (several deaths, one session) are
+        // harmless; correctness beats coalescing here.
+        if (was) |s| {
+            if (!s.exited) {
+                if (lease_moved) self.broadcastControlState(s);
+                self.broadcastPeerInfo(s);
+            }
+        }
+    }
+
+    /// Retire dead clients in three ordered phases; the order is the
+    /// whole point and a future edit must not collapse it.
+    ///
+    /// Phase 1 detaches every dead client (`detachDeadClient`),
+    /// repeating until no NEW client dies: its roster broadcasts queue
+    /// frames and a recipient past `MAX_WBUF` dies right there. Phase 2
+    /// sweeps EVERY collection that holds a raw `*Client` (channels,
+    /// uploads, downloads, fs views, fs listings, fs jobs) against the
+    /// full dead set. Phase 3 frees exactly the clients phase 1
+    /// flagged. Freeing a client the sweeps have not seen leaves a
+    /// dangling `*Client` that the next tick dereferences, which is
+    /// what an interleaved detach-and-free loop did.
     fn reap(self: *Daemon) void {
         self.reapLspChildren();
+
+        // -- phase 1: detach, to a fixpoint ------------------------
+        var detached_any = true;
+        while (detached_any) {
+            detached_any = false;
+            for (self.clients.items) |cl| {
+                if (!cl.dead or cl.reaping) continue;
+                cl.reaping = true;
+                detached_any = true;
+                self.detachDeadClient(cl);
+            }
+        }
+
+        // -- phase 2: sweep every holder of a raw *Client -----------
         // A dying client takes its WINSTREAM channels down. Native
         // channels are session-owned and deliberately survive client
         // death — the daemon brain keeps the app alive for the next
@@ -6100,6 +6214,23 @@ pub const Daemon = struct {
             while (i < self.fs_views.items.len) {
                 if (self.fs_views.items[i].client.dead) {
                     self.dropFsViewAt(i);
+                } else i += 1;
+            }
+        }
+        // An in-flight listing outlives the fs_reply chunk it is
+        // streaming, so a plain `fs_op list` from a client that dies
+        // mid-listing kept a raw `*Client` that pumpFsListings then
+        // dereferenced on the next tick. Runs AFTER the view sweep,
+        // which already took every listing bound to a dying view with
+        // it: what survives here is view-less, and only a view-bound
+        // listing can hold a snapshot boundary to close.
+        {
+            var i: usize = 0;
+            while (i < self.fs_listings.items.len) {
+                const listing = self.fs_listings.items[i];
+                if (listing.client.dead) {
+                    _ = self.fs_listings.swapRemove(i);
+                    listing.deinit();
                 } else i += 1;
             }
         }
@@ -6196,39 +6327,16 @@ pub const Daemon = struct {
                 } else i += 1;
             }
         }
+        // -- phase 3: free exactly what phase 1 flagged -------------
+        // `reaping` and not merely `dead`: a client one of the sweeps
+        // above just killed has references they had already walked
+        // past, so it waits for the next reap.
         var i: usize = 0;
         while (i < self.clients.items.len) {
             const cl = self.clients.items[i];
-            if (cl.dead) {
-                // A dying client's TCP forwards die with it (native
-                // and audio channels are session-owned and survive).
-                for (self.channels.items) |ch| {
-                    if (ch.tcp and ch.client == cl) ch.dead = true;
-                }
-                const was = cl.attached;
-                if (was) |s| log.info("client gone (session '{s}')", .{s.name});
-                self.panelClientDetached(cl, "panel presenter disconnected after request delivery; delivery is uncertain, the mutation may have applied, and the request was NOT resent");
-                // A pending broker rename whose requester died must free
-                // the slot, or every later rename on this worker fails
-                // "already in progress" (the 'n' reply would find no live
-                // requester to answer anyway).
-                if (self.worker_rename_request) |pending| {
-                    if (pending.requester_id == cl.id) self.worker_rename_request = null;
-                }
-                // Release BEFORE the client is freed and removed: the
-                // handover scan compares against this pointer, and
-                // s.controller would otherwise dangle.
-                const lease_moved = if (was) |s| self.releaseControl(s, cl) else false;
+            if (cl.reaping) {
                 _ = self.clients.swapRemove(i);
                 cl.deinit();
-                // Duplicate rosters (several deaths, one session) are
-                // harmless; correctness beats coalescing here.
-                if (was) |s| {
-                    if (!s.exited) {
-                        if (lease_moved) self.broadcastControlState(s);
-                        self.broadcastPeerInfo(s);
-                    }
-                }
             } else {
                 i += 1;
             }
@@ -6357,11 +6465,17 @@ pub const EventCollector = struct {
     /// Wall-clock stamp for lines committed during this drain.
     wall_ms: i64 = 0,
     /// Untrusted content (cast playback): kitty file/tempfile/shm
-    /// APCs are DROPPED before they reach the Screen or the wire —
-    /// both `kitty_inline.rewrite` here and `grid/kitty_images.zig`
-    /// on apply would otherwise open (and for t=t DELETE) daemon-host
-    /// paths named by the file.
+    /// APCs never reach `kitty_inline.rewrite`, so nothing in the
+    /// recording can make the daemon open (or for t=t DELETE) a path
+    /// of its choosing on this host. They are dropped like any other
+    /// un-inlined file-medium APC, so they do not reach the wire
+    /// either.
     untrusted: bool = false,
+    /// Session name for log lines; empty when the collector has no session.
+    session_name: []const u8 = "",
+    /// The session's once-per-lifetime "a kitty image was dropped"
+    /// warning latch; null = never warn (test collectors).
+    kitty_drop_warned: ?*bool = null,
     /// OSC 5522 markers seen this drain; drainSession pushes them to
     /// attached clients and frees the labels.
     markers: std.ArrayList(Marker) = .empty,
@@ -6423,22 +6537,45 @@ pub const EventCollector = struct {
         // host's filesystem — fetch and inline them so the client
         // (which can't read our disk) gets the data. Apply the
         // rewritten event locally too, keeping the authoritative
-        // screen identical to what clients see. UNTRUSTED input
-        // (cast playback) must not touch the filesystem at all:
-        // those media are dropped outright instead of rewritten.
+        // screen identical to what clients see. A file-medium APC
+        // that could NOT be inlined is DROPPED, never forwarded:
+        // `grid/kitty_images.zig` resolves the path on whatever host
+        // the viewer runs on and, for `t=t`, unlinks it there, so a
+        // forwarded `t=t` naming a path this host does not have (or
+        // one over `kitty_inline.MAX_RAW_BYTES`, or a chunked
+        // transmission `rewrite` refuses) is a remote file-deletion
+        // primitive aimed at every attached client. Untrusted input
+        // (cast playback) skips the fetch entirely and takes the same
+        // drop, so it never touches the filesystem at all.
         var fwd = ev;
         var owned: ?[]u8 = null;
         defer if (owned) |b| self.allocator.free(b);
-        if (ev == .apc) {
-            if (self.untrusted) {
-                if (kittyFileMedium(ev.apc.bytes)) {
+        if (ev == .apc and kittyFileMedium(ev.apc.bytes)) {
+            const kitty_inline = @import("kitty_inline.zig");
+            const result: kitty_inline.Result = if (self.untrusted)
+                .{ .refused = .{ .why = .unreadable } }
+            else
+                kitty_inline.rewrite(self.allocator, ev.apc.bytes);
+            switch (result) {
+                .inlined => |nb| {
+                    owned = nb;
+                    fwd = .{ .apc = .{ .bytes = nb } };
+                },
+                .refused => |refused| {
+                    if (!self.untrusted) {
+                        // A capability probe still gets its answer. `a=q`
+                        // returns from Screen.onApc before the medium is
+                        // looked at, so applying it opens nothing, and
+                        // mirror screens are `mute_responses`, so this
+                        // authoritative Screen is the ONLY thing that
+                        // would ever have answered the app.
+                        if (kittyQuery(ev.apc.bytes)) self.screen.apply(ev);
+                        self.noteKittyDrop(refused);
+                    }
                     var mut = ev;
                     mut.deinit(self.allocator);
                     return;
-                }
-            } else if (@import("kitty_inline.zig").rewrite(self.allocator, ev.apc.bytes)) |nb| {
-                owned = nb;
-                fwd = .{ .apc = .{ .bytes = nb } };
+                },
             }
         }
         if (self.ring) |r| switch (fwd) {
@@ -6466,14 +6603,45 @@ pub const EventCollector = struct {
         self.markers.deinit(self.allocator);
     }
 
-    /// True for a kitty graphics APC whose transmission medium reads
-    /// the daemon host's filesystem (t=f path, t=t tempfile, t=s shm).
-    fn kittyFileMedium(apc_bytes: []const u8) bool {
+    /// True for a kitty graphics APC that names a local path rather
+    /// than carrying its pixels (t=f file, t=t tempfile, t=s shm).
+    ///
+    /// `emit` uses it both to decide what to try to inline and to
+    /// decide what must never cross the wire; the set itself is
+    /// declared once, in `kitty_image.isFileMedium`.
+    pub fn kittyFileMedium(apc_bytes: []const u8) bool {
         const cmd = kitty_image.parse(apc_bytes) catch return false;
-        return switch (cmd.medium) {
-            'f', 't', 's' => true,
-            else => false,
-        };
+        return kitty_image.isFileMedium(cmd.medium);
+    }
+
+    /// Explain a dropped image where a user will find it: the FIRST
+    /// drop of a session is a warning naming the file, the reason and
+    /// the cap; later ones are debug-gated so a stream of them cannot
+    /// flood the log. `kitty_drop_warned` lives on the Session because
+    /// a collector is per drain.
+    fn noteKittyDrop(self: *EventCollector, refused: @import("kitty_inline.zig").Refused) void {
+        const first = if (self.kitty_drop_warned) |flag| !flag.* else false;
+        if (first) {
+            self.kitty_drop_warned.?.* = true;
+            log.warn(
+                "session '{s}': kitty image dropped, t={c} '{s}': {s} ({d} bytes, inline cap {d}); later drops this session are logged at debug level",
+                .{ self.session_name, refused.medium, refused.path(), refused.why.describe(), refused.size, @import("kitty_inline.zig").MAX_RAW_BYTES },
+            );
+        } else {
+            log.debug(
+                "session '{s}': kitty image dropped, t={c} '{s}': {s} ({d} bytes)",
+                .{ self.session_name, refused.medium, refused.path(), refused.why.describe(), refused.size },
+            );
+        }
+    }
+
+    /// True for a kitty graphics capability probe (`a=q`), which
+    /// `Screen.onApc` answers and returns from before it ever looks at
+    /// the transmission medium, so a probe is answerable even when
+    /// the transmission it names is refused.
+    pub fn kittyQuery(apc_bytes: []const u8) bool {
+        const cmd = kitty_image.parse(apc_bytes) catch return false;
+        return cmd.action == .query;
     }
 };
 
@@ -6722,6 +6890,110 @@ test "events payload allocation failures snapshot every client" {
     for (0..allocations) |fail_index| {
         _ = try runEventsPayloadAllocationFailure(fail_index);
     }
+}
+
+/// Emit one APC through the collector; `emit` takes ownership of the bytes.
+fn emitOwnedApc(batch: *EventCollector, apc: []const u8) !void {
+    const owned = try batch.allocator.dupe(u8, apc);
+    EventCollector.emit(@ptrCast(batch), .{ .apc = .{ .bytes = owned } });
+}
+
+test "kittyFileMedium classifies exactly the path-naming transmission media" {
+    const t = std.testing;
+    try t.expect(EventCollector.kittyFileMedium("Ga=T,f=100,t=f;L3RtcC94"));
+    try t.expect(EventCollector.kittyFileMedium("Ga=T,f=100,t=t;L3RtcC94"));
+    try t.expect(EventCollector.kittyFileMedium("Ga=T,f=100,t=s;L3RtcC94"));
+    // Chunked first chunk: still names a path, still classified.
+    try t.expect(EventCollector.kittyFileMedium("Ga=T,f=100,t=t,m=1;L3Rt"));
+    // Direct data, absent `t=` (defaults to d) and non-kitty APCs are not.
+    try t.expect(!EventCollector.kittyFileMedium("Ga=T,f=100,t=d;QUJD"));
+    try t.expect(!EventCollector.kittyFileMedium("Ga=T,f=100;QUJD"));
+    try t.expect(!EventCollector.kittyFileMedium("Xnot-kitty"));
+    try t.expect(!EventCollector.kittyFileMedium(""));
+}
+
+test "an un-inlinable file-medium kitty APC never reaches the wire" {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+
+    // The payloads are base64("/no/such/sketerm-test-file"): a path
+    // this host does not have, so kitty_inline.rewrite cannot inline
+    // it. Forwarded, the client would resolve it against ITS OWN
+    // filesystem and, for t=t, unlink it there.
+    var batch = harness.daemon.ingestBegin(&harness.session);
+    defer harness.daemon.ingestFinish(&harness.session, &batch, false);
+    try emitOwnedApc(&batch, "Ga=T,f=100,t=f;L25vL3N1Y2gvc2tldGVybS10ZXN0LWZpbGU=");
+    try emitOwnedApc(&batch, "Ga=T,f=100,t=t;L25vL3N1Y2gvc2tldGVybS10ZXN0LWZpbGU=");
+    try emitOwnedApc(&batch, "Ga=T,f=100,t=s;L25vL3N1Y2gvc2tldGVybS10ZXN0LWZpbGU=");
+    // A chunked t=t is what `rewrite` refuses outright.
+    try emitOwnedApc(&batch, "Ga=T,f=100,t=t,m=1;L25vL3N1Y2gv");
+    try t.expectEqual(@as(u32, 0), batch.count);
+    try t.expectEqual(@as(usize, 0), batch.writer.buf.items.len);
+
+    // A non-kitty APC still passes through untouched.
+    try emitOwnedApc(&batch, "Xhello");
+    try t.expectEqual(@as(u32, 1), batch.count);
+}
+
+const WritePtyProbe = struct {
+    buf: [128]u8 = undefined,
+    len: usize = 0,
+
+    fn write(ctx: ?*anyopaque, bytes: []const u8) void {
+        const self: *WritePtyProbe = @ptrCast(@alignCast(ctx.?));
+        const n = @min(bytes.len, self.buf.len - self.len);
+        @memcpy(self.buf[self.len..][0..n], bytes[0..n]);
+        self.len += n;
+    }
+};
+
+test "a refused file-medium kitty query is still answered by the daemon screen" {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+    var probe = WritePtyProbe{};
+    harness.screen.sink = .{ .ctx = &probe, .on_write_pty = WritePtyProbe.write };
+
+    var batch = harness.daemon.ingestBegin(&harness.session);
+    defer harness.daemon.ingestFinish(&harness.session, &batch, false);
+    // `a=q` probing t=f support, naming a path this host lacks. The
+    // transmission is refused for the wire, but the mirror screens are
+    // mute_responses, so dropping the answer too would hang the app.
+    try emitOwnedApc(&batch, "Ga=q,i=31,t=f,f=100;L25vL3N1Y2gvc2tldGVybS10ZXN0LWZpbGU=");
+    try t.expectEqual(@as(u32, 0), batch.count);
+    try t.expectEqualStrings("\x1b_Gi=31;OK\x1b\\", probe.buf[0..probe.len]);
+}
+
+test "untrusted ingestion drops file-medium kitty APCs without reading the file" {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+
+    // A real, readable file: an untrusted batch must neither inline it
+    // nor (for t=t) delete it.
+    // The name carries the spec marker, so a trusted read WOULD delete
+    // it: the file surviving proves the untrusted gate, not the marker.
+    var tmpl = "/tmp/sketerm-untrusted-tty-graphics-protocol-XXXXXX".*;
+    const fd = c.mkstemp(&tmpl);
+    try t.expect(fd >= 0);
+    try t.expectEqual(@as(isize, 7), c.write(fd, "PNGDATA", 7));
+    _ = c.close(fd);
+    defer _ = c.unlink(@ptrCast(&tmpl));
+    const path = std.mem.sliceTo(&tmpl, 0);
+
+    const path_b64 = try @import("../util/b64.zig").encodeAlloc(t.allocator, path);
+    defer t.allocator.free(path_b64);
+    const apc = try std.fmt.allocPrint(t.allocator, "Ga=T,f=100,t=t;{s}", .{path_b64});
+    defer t.allocator.free(apc);
+
+    var batch = harness.daemon.ingestBegin(&harness.session);
+    batch.untrusted = true;
+    defer harness.daemon.ingestFinish(&harness.session, &batch, false);
+    try emitOwnedApc(&batch, apc);
+    try t.expectEqual(@as(u32, 0), batch.count);
+    // Untrusted content never reached the filesystem: the file lives.
+    try t.expectEqual(@as(c_int, 0), c.access(@ptrCast(&tmpl), c.F_OK));
 }
 
 test "one client frame allocation failure snapshots only that client" {

@@ -163,6 +163,7 @@ comptime {
     _ = @import("mux/daemon_debug.zig");
     _ = @import("mux/daemon.zig");
     _ = @import("mux/daemon_fsjobs.zig");
+    _ = @import("mux/daemon_native.zig");
     _ = @import("mux/daemon_serve.zig");
     _ = @import("mux/daemon_sessions.zig");
     _ = @import("mux/log.zig");

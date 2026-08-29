@@ -8,6 +8,13 @@ const platform = @import("../util/platform.zig");
 pub const DEFAULT_ENDPOINT = "127.0.0.1:9050";
 const HANDSHAKE_TIMEOUT_MS: i64 = 20_000;
 
+/// Widest bound address a CONNECT reply can name, plus its 2-byte port.
+///
+/// Derived from the ATYP=domain length byte's own type rather than from any
+/// address family's width: that byte is remote input, and ReleaseFast strips
+/// the slice bounds check that would otherwise catch a short scratch buffer.
+const MAX_BOUND_ADDRESS = std.math.maxInt(u8) + 2;
+
 pub const Endpoint = union(enum) {
     ipv4: struct { addr: [4]u8, port: u16 },
     ipv6: struct { addr: [16]u8, port: u16 },
@@ -155,6 +162,9 @@ fn handshake(fd: c_int, destination: []const u8, port: u16, deadline: i64) !void
     const address_len: usize = switch (reply[3]) {
         0x01 => 4,
         0x04 => 16,
+        // RFC 1928 lets the reply name the bound address, and the proxy
+        // picks its length: up to 255 bytes, not the 16 an IPv6 address
+        // takes.
         0x03 => blk: {
             var domain_len: [1]u8 = undefined;
             try readExactFor(fd, &domain_len, deadline);
@@ -162,7 +172,7 @@ fn handshake(fd: c_int, destination: []const u8, port: u16, deadline: i64) !void
         },
         else => return error.MalformedReply,
     };
-    var discard: [16 + 2]u8 = undefined;
+    var discard: [MAX_BOUND_ADDRESS]u8 = undefined;
     try readExactFor(fd, discard[0 .. address_len + 2], deadline);
 }
 
@@ -305,6 +315,9 @@ test "SOCKS endpoint accepts numeric IPv4 and bracketed IPv6 only" {
 
 const TestServer = struct {
     listen_fd: c_int,
+    /// Length of the ATYP=domain bound address to answer with; null answers
+    /// with the 4-byte ATYP=IPv4 form instead.
+    bound_domain_len: ?u8 = null,
     ok: bool = false,
 
     fn run(self: *TestServer) void {
@@ -322,7 +335,19 @@ const TestServer = struct {
         if (!std.mem.eql(u8, request[0..5], &.{ 5, 1, 0, 3, destination.len })) return;
         if (!std.mem.eql(u8, request[5 .. 5 + destination.len], destination)) return;
         if (std.mem.readInt(u16, request[5 + destination.len ..][0..2], .big) != 22) return;
-        writeAllFor(fd, &.{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 }, deadline) catch return;
+        if (self.bound_domain_len) |domain_len| {
+            const n: usize = domain_len;
+            // The bound name is filled with a marker byte so a drain of the
+            // wrong length leaves it in the stream and corrupts the pump.
+            var bound: [4 + 1 + MAX_BOUND_ADDRESS]u8 = undefined;
+            bound[0..4].* = .{ 5, 0, 0, 3 };
+            bound[4] = domain_len;
+            @memset(bound[5 .. 5 + n], 'b');
+            std.mem.writeInt(u16, bound[5 + n ..][0..2], 22, .big);
+            writeAllFor(fd, bound[0 .. 7 + n], deadline) catch return;
+        } else {
+            writeAllFor(fd, &.{ 5, 0, 0, 1, 0, 0, 0, 0, 0, 0 }, deadline) catch return;
+        }
         var ping: [4]u8 = undefined;
         readExactFor(fd, &ping, deadline) catch return;
         if (!std.mem.eql(u8, &ping, "ping")) return;
@@ -343,7 +368,9 @@ const TestClient = struct {
     }
 };
 
-test "SOCKS helper sends domain ATYP and pumps both directions" {
+/// Run one helper round trip against the in-process SOCKS server, whose reply
+/// names its bound address per `bound_domain_len` (null = ATYP IPv4).
+fn expectRoundTrip(bound_domain_len: ?u8) !void {
     const t = std.testing;
     const listen_fd = platform.socketCloexec(c.AF_INET, c.SOCK_STREAM, 0);
     if (listen_fd < 0) return error.SkipZigTest;
@@ -360,7 +387,7 @@ test "SOCKS helper sends domain ATYP and pumps both directions" {
     var endpoint_buf: [64]u8 = undefined;
     const endpoint = try std.fmt.bufPrint(&endpoint_buf, "127.0.0.1:{d}", .{port});
 
-    var server = TestServer{ .listen_fd = listen_fd };
+    var server = TestServer{ .listen_fd = listen_fd, .bound_domain_len = bound_domain_len };
     const server_thread = try std.Thread.spawn(.{}, TestServer.run, .{&server});
     var pair: [2]c_int = undefined;
     try t.expectEqual(@as(c_int, 0), platform.socketpairCloexec(&pair));
@@ -378,4 +405,21 @@ test "SOCKS helper sends domain ATYP and pumps both directions" {
     server_thread.join();
     try t.expect(client.ok);
     try t.expect(server.ok);
+}
+
+test "SOCKS helper sends domain ATYP and pumps both directions" {
+    try expectRoundTrip(null);
+}
+
+test "SOCKS helper drains a 255-byte ATYP=domain bound address" {
+    try expectRoundTrip(255);
+}
+
+test "SOCKS reply scratch covers every address type a reply may name" {
+    // The round trip above cannot fail on a short scratch buffer: the drain
+    // reads the right NUMBER of bytes either way, so the stream stays in sync
+    // and only the stack past the buffer is smashed. This is the assertion
+    // that catches an under-sized one.
+    const widest: usize = @max(4, @max(16, std.math.maxInt(u8)));
+    try std.testing.expect(MAX_BOUND_ADDRESS >= widest + 2);
 }

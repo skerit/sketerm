@@ -1331,7 +1331,9 @@ pub fn openUploadDest(cwd: []const u8, base: []const u8, out: *[4096]u8) !struct
             std.fmt.bufPrintZ(out, "{s}/{s}", .{ cwd, base }) catch return error.NameTooLong
         else
             std.fmt.bufPrintZ(out, "{s}/{s} ({d}){s}", .{ cwd, stem, n, ext }) catch return error.NameTooLong;
-        const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o644));
+        // O_CLOEXEC: an upload fd lives across poll-loop ticks while the
+        // daemon forks and execs children (PTY spawns, display keepers).
+        const fd = c.open(path.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC, @as(c_uint, 0o644));
         if (fd >= 0) return .{ .fd = fd, .path = path };
         if (std.posix.errno(fd) != .EXIST) return error.OpenFailed;
     }
@@ -1455,6 +1457,69 @@ pub fn dropDownload(self: *Daemon, dl: *Download) void {
     dl.deinit();
 }
 
+/// What a client-named path is allowed to be.
+const OpenKind = enum {
+    file,
+    file_or_dir,
+
+    fn admits(kind: OpenKind, mode: c.mode_t) bool {
+        const fmt = mode & c.S_IFMT;
+        return switch (kind) {
+            .file => fmt == c.S_IFREG,
+            .file_or_dir => fmt == c.S_IFREG or fmt == c.S_IFDIR,
+        };
+    }
+
+    fn refusal(kind: OpenKind) []const u8 {
+        return switch (kind) {
+            .file => "path is not a regular file",
+            .file_or_dir => "path is not a regular file or directory",
+        };
+    }
+};
+
+const Opened = union(enum) {
+    fd: c_int,
+    /// Refused before or after the open; the client gets this text.
+    refused: []const u8,
+    /// open() failed; the negative return carries errno.
+    failed: c_int,
+};
+
+/// Opens a client-controlled path so that the open itself is never the
+/// hazard. The kind is checked with stat BEFORE open: a device node whose
+/// open has side effects (/dev/watchdog arms a reboot on open alone) or a
+/// FIFO with no peer is refused unopened, where a post-open check would
+/// have opened it first. O_NONBLOCK then keeps a FIFO from parking the
+/// daemon's single poll loop should one appear between the two calls,
+/// and the fstat on the opened fd refuses anything that is not the
+/// inode stat saw -- so a path swapped underneath is never used, only
+/// opened once. That one residual open needs O_PATH to close, which the
+/// portable libc set lacks; the swapper must already own the directory.
+/// A path stat cannot see (ENOENT with O_CREAT, say) goes straight to
+/// open and is held to the post-open kind check alone.
+fn openChecked(path: [*:0]const u8, oflags: c_int, mode: c.mode_t, kind: OpenKind) Opened {
+    var pre: c.struct_stat = undefined;
+    const pre_ok = c.stat(path, &pre) == 0;
+    if (pre_ok and !kind.admits(pre.st_mode)) return .{ .refused = kind.refusal() };
+    const fd = c.open(path, oflags | c.O_CLOEXEC | c.O_NONBLOCK, mode);
+    if (fd < 0) return .{ .failed = fd };
+    var st: c.struct_stat = undefined;
+    if (c.fstat(fd, &st) != 0) {
+        _ = c.close(fd);
+        return .{ .refused = "fstat failed" };
+    }
+    if (!kind.admits(st.st_mode)) {
+        _ = c.close(fd);
+        return .{ .refused = kind.refusal() };
+    }
+    if (pre_ok and (st.st_dev != pre.st_dev or st.st_ino != pre.st_ino)) {
+        _ = c.close(fd);
+        return .{ .refused = "path changed during open" };
+    }
+    return .{ .fd = fd };
+}
+
 pub fn handleFileGet(self: *Daemon, cl: *Client, payload: []const u8) void {
     const Req = struct { xfer: u32 = 0, path: []const u8 = "" };
     const parsed = std.json.parseFromSlice(Req, self.allocator, payload, .{ .ignore_unknown_fields = true }) catch {
@@ -1503,15 +1568,22 @@ pub fn handleFileGet(self: *Daemon, cl: *Client, payload: []const u8) void {
         };
     };
 
-    const fd = c.open(abs.ptr, c.O_RDONLY, @as(c_uint, 0));
-    if (fd < 0) {
-        fileReply(cl, xfer, "error", 0, "", "cannot open file");
-        return;
-    }
+    // Client-controlled path: refused by kind before it is ever opened.
+    const fd = switch (openChecked(abs.ptr, c.O_RDONLY, 0, .file)) {
+        .fd => |fd| fd,
+        .refused => |why| {
+            fileReply(cl, xfer, "error", 0, "", why);
+            return;
+        },
+        .failed => {
+            fileReply(cl, xfer, "error", 0, "", "cannot open file");
+            return;
+        },
+    };
     var st: c.struct_stat = undefined;
-    if (c.fstat(fd, &st) != 0 or (st.st_mode & c.S_IFMT) != c.S_IFREG) {
+    if (c.fstat(fd, &st) != 0) {
         _ = c.close(fd);
-        fileReply(cl, xfer, "error", 0, "", "not a regular file");
+        fileReply(cl, xfer, "error", 0, "", "fstat failed");
         return;
     }
     const size: u64 = if (st.st_size > 0) @intCast(st.st_size) else 0;
@@ -1973,6 +2045,62 @@ pub fn fsReplyErr(cl: *Client, req: u32, msg: []const u8) void {
     cl.queueJson(.fs_reply, .{ .req = req, .ok = false, .@"error" = msg, .kind = fsErrKind(msg) });
 }
 
+test "openChecked refuses a FIFO and a device node without opening them" {
+    const t = std.testing;
+    var dir_buf: [64]u8 = undefined;
+    @memcpy(dir_buf[0..27], "/tmp/sketerm-openck-XXXXXX\x00");
+    const dir = std.mem.span(@as([*:0]u8, @ptrCast(c.mkdtemp(@ptrCast(&dir_buf)) orelse return error.SkipZigTest)));
+    var fifo_z: [96]u8 = undefined;
+    const fifo = try std.fmt.bufPrintZ(&fifo_z, "{s}/fifo", .{dir});
+    var reg_z: [96]u8 = undefined;
+    const reg = try std.fmt.bufPrintZ(&reg_z, "{s}/reg", .{dir});
+    defer {
+        _ = c.unlink(fifo.ptr);
+        _ = c.unlink(reg.ptr);
+        _ = c.rmdir(dir.ptr);
+    }
+    try t.expect(c.mkfifo(fifo.ptr, 0o600) == 0);
+    // A blocking O_RDONLY open of a writer-less FIFO never returns; the
+    // refusal proves the open was never attempted.
+    switch (openChecked(fifo.ptr, c.O_RDONLY, 0, .file)) {
+        .refused => |why| try t.expectEqualStrings("path is not a regular file", why),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (openChecked(fifo.ptr, c.O_WRONLY, 0, .file)) {
+        .refused => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (openChecked("/dev/null", c.O_RDONLY, 0, .file_or_dir)) {
+        .refused => |why| try t.expectEqualStrings("path is not a regular file or directory", why),
+        else => return error.TestUnexpectedResult,
+    }
+    // A directory is admitted only where the caller allows one.
+    switch (openChecked(dir.ptr, c.O_RDONLY, 0, .file)) {
+        .refused => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (openChecked(dir.ptr, c.O_RDONLY, 0, .file_or_dir)) {
+        .fd => |fd| _ = c.close(fd),
+        else => return error.TestUnexpectedResult,
+    }
+    // A regular file that does not exist yet is created (fs_write's
+    // O_CREAT shape) and then held to the post-open check.
+    switch (openChecked(reg.ptr, c.O_WRONLY | c.O_CREAT, @as(c.mode_t, 0o644), .file)) {
+        .fd => |fd| _ = c.close(fd),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (openChecked(reg.ptr, c.O_RDONLY, 0, .file)) {
+        .fd => |fd| _ = c.close(fd),
+        else => return error.TestUnexpectedResult,
+    }
+    var missing_z: [96]u8 = undefined;
+    const missing = try std.fmt.bufPrintZ(&missing_z, "{s}/missing", .{dir});
+    switch (openChecked(missing.ptr, c.O_RDONLY, 0, .file)) {
+        .failed => |rc| try t.expect(rc < 0),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "fs_reply errors classify transient link failures as transport" {
     try std.testing.expectEqualStrings("permanent", fsErrKind("ACCES"));
     try std.testing.expectEqualStrings("permanent", fsErrKind("NOENT"));
@@ -2274,8 +2402,15 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
     } else if (std.mem.eql(u8, r.op, "fsync")) {
         var z: [4096]u8 = undefined;
         const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
-        const fd = c.open(p, c.O_RDONLY | c.O_CLOEXEC);
-        if (fd < 0) return fsReplyErr(cl, r.req, fsserve.errnoName(fd));
+        // Client-controlled path, refused by kind BEFORE open (see
+        // openChecked): a durability barrier means nothing on a device
+        // node or FIFO, and opening one is the hazard. Directories stay
+        // allowed because fsyncing one IS the barrier after a rename.
+        const fd = switch (openChecked(p, c.O_RDONLY, 0, .file_or_dir)) {
+            .fd => |fd| fd,
+            .refused => |why| return fsReplyErr(cl, r.req, why),
+            .failed => |rc| return fsReplyErr(cl, r.req, fsserve.errnoName(rc)),
+        };
         defer _ = c.close(fd);
         const rc = c.fsync(fd);
         if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
@@ -2880,15 +3015,15 @@ pub fn fsStat(self: *Daemon, cl: *Client, r: FsOpReq) void {
 pub fn fsRead(self: *Daemon, cl: *Client, r: FsOpReq) void {
     var z: [4096]u8 = undefined;
     const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
-    // The path is remote-controlled input. O_NONBLOCK prevents a FIFO from
-    // parking the daemon's single poll loop before fstat can reject it; it has
-    // no effect on ordinary regular files.
-    const fd = c.open(p, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
-    if (fd < 0) return fsReplyErr(cl, r.req, fsserve.errnoName(fd));
+    // Remote-controlled path, refused by kind before open (openChecked).
+    const fd = switch (openChecked(p, c.O_RDONLY, 0, .file)) {
+        .fd => |fd| fd,
+        .refused => |why| return fsReplyErr(cl, r.req, why),
+        .failed => |rc| return fsReplyErr(cl, r.req, fsserve.errnoName(rc)),
+    };
     defer _ = c.close(fd);
     var st: c.struct_stat = undefined;
     if (c.fstat(fd, &st) != 0) return fsReplyErr(cl, r.req, "fstat failed");
-    if ((st.st_mode & c.S_IFMT) != c.S_IFREG) return fsReplyErr(cl, r.req, "path is not a regular file");
     const size: u64 = if (st.st_size > 0) @intCast(st.st_size) else 0;
 
     const want: usize = @min(@as(usize, r.len), fsserve.MAX_READ);
@@ -3113,15 +3248,25 @@ pub fn handleFsWrite(self: *Daemon, cl: *Client, payload: []const u8) void {
     const data = payload[15 + plen ..];
     if (path.len == 0 or path[0] != '/') return fsReplyErr(cl, req, "path must be absolute");
 
-    var oflags: c_int = c.O_WRONLY | c.O_CLOEXEC;
+    // Client-controlled path, refused by kind BEFORE open (see openChecked):
+    // an existing device node or FIFO never gets the daemon's open, let
+    // alone its writes. O_CREAT makes a regular file, so a path stat
+    // cannot see is created and then held to the post-open check. The
+    // O_NONBLOCK openChecked adds cannot reach the write loop as a
+    // spurious EAGAIN: only regular files survive the kind check, and
+    // the flag has no effect on their read/write.
+    var oflags: c_int = c.O_WRONLY;
     if (flags & 1 != 0) oflags |= c.O_CREAT;
     if (flags & 2 != 0) oflags |= c.O_TRUNC;
     if (flags & 4 != 0) oflags |= c.O_APPEND;
     if (flags & 8 != 0) oflags |= c.O_EXCL;
     var z: [4096]u8 = undefined;
     const p = pathZ(&z, path) catch return fsReplyErr(cl, req, "path too long");
-    const fd = c.open(p, oflags, @as(c.mode_t, 0o644));
-    if (fd < 0) return fsReplyErr(cl, req, fsserve.errnoName(fd));
+    const fd = switch (openChecked(p, oflags, @as(c.mode_t, 0o644), .file)) {
+        .fd => |fd| fd,
+        .refused => |why| return fsReplyErr(cl, req, why),
+        .failed => |rc| return fsReplyErr(cl, req, fsserve.errnoName(rc)),
+    };
     defer _ = c.close(fd);
 
     var written: usize = 0;

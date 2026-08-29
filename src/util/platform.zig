@@ -642,6 +642,18 @@ pub fn exePathZ(buf: *[4096:0]u8) ?[:0]const u8 {
 /// Return type is `?*c.FILE`, not `[*c]c.FILE`: glibc's FILE
 /// translates as an opaque struct, and C pointers to opaque types
 /// are rejected; Darwin's sized `[*c]FILE` coerces to `?*FILE`.
+/// Neuter SIGPIPE process-wide with a no-op handler. The libc `SIG_IGN`
+/// macro fails translate-c (function-pointer cast) and its raw value (1)
+/// violates fn-pointer alignment on aarch64-macos; a no-op handler is
+/// equivalent here: write() still returns EPIPE, the process just does
+/// not die. Every entry point that writes to sockets a peer can drop
+/// (the daemon, the MCP server, rigs hosting a daemon in-process) calls
+/// this once at startup.
+fn sigpipeNoop(_: c_int) callconv(.c) void {}
+pub fn ignoreSigpipe() void {
+    _ = c.signal(c.SIGPIPE, &sigpipeNoop);
+}
+
 pub inline fn stdin() ?*c.FILE {
     return if (is_macos) c.stdin() else c.stdin;
 }

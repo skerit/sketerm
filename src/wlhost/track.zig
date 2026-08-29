@@ -140,6 +140,9 @@ pub const BufferInfo = struct {
     /// dmabuf). Refcount/mirror operations must target this
     /// incarnation, not whatever currently owns the pool id.
     serial: u64 = 0,
+    /// Daemon-side: the buffer's whole region has been copied into the
+    /// pool mirror at least once, so later commits copy damage only.
+    pulled: bool = false,
 };
 
 pub const Tracker = struct {
