@@ -20,7 +20,8 @@ pub const Request = struct {
     /// Self-pane address by STABLE session name (`$SKETERM_SESSION`),
     /// preferred over `pane` because the GUI pane id goes stale across a
     /// restart/reattach. Resolved to the pane currently rendering that
-    /// session; falls back to `pane`, then the current pane.
+    /// session; falls back to `pane`. A given address that resolves to
+    /// nothing is an error, never the current pane.
     session: ?[]const u8 = null,
     /// Tab address. null = selected tab.
     tab: ?u32 = null,

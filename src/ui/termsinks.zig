@@ -521,26 +521,33 @@ pub fn onTermNotification(ctx: ?*anyopaque, pane: *Pane, ev: Screen.Notification
 /// Activation report / focus dispatch for "app.notify-act". Fired by
 /// the desktop when the user clicks an OSC 99 notification (button 0)
 /// or one of its buttons (1-based).
-pub fn onNotifyActivate(_: *c.GSimpleAction, param: ?*c.GVariant, user: ?*anyopaque) callconv(.c) void {
-    const self = cast.userData(Window, user);
+pub fn onNotifyActivate(_: *c.GSimpleAction, param: ?*c.GVariant, _: ?*anyopaque) callconv(.c) void {
     if (param == null) return;
     var token: c_uint = 0;
     var button: c_uint = 0;
     c.g_variant_get(param, "(uu)", &token, &button);
 
-    const slot = blk: {
-        for (self.notify_slots.items) |s| {
-            if (s.token == token) break :blk s;
-        }
-        return; // pane closed, or slot evicted — nothing to do
-    };
+    // The action is app-scoped with no window behind it; the token is
+    // process-unique, so it names exactly one window's slot. The slot
+    // table holds a raw *Pane and the desktop can hold a notification
+    // for hours, so the pane is validated against that window's live
+    // list before anything dereferences it -- the fence
+    // `Tree.last_focused` gets, made the table's own business in
+    // `liveNotifySlot` rather than a rule every pane-removal path has to
+    // remember. A slot whose pane is gone is dropped there.
+    const live = remotectl.liveNotifySlotAnyWindow(@intCast(token)) orelse return;
+    const self = live.win;
+    const slot = self.notify_slots.items[live.idx];
 
     if (slot.want_focus) {
         c.gtk_window_present(@ptrCast(self.app_window));
         if (tabPageForPane(self, slot.pane)) |page| {
             c.adw_tab_view_set_selected_page(self.tab_view, page);
         }
-        _ = c.gtk_widget_grab_focus(@ptrCast(slot.pane.surface.area));
+        // Not a bare grab_focus on the GLArea: a pane wearing a
+        // browser/editor/web face keeps that area hidden, and a hidden
+        // widget cannot hold GTK focus.
+        remotectl.focusPaneFace(slot.pane);
     }
     if (slot.want_report) {
         // Spec: OSC 99 ; i=<id> ; <button-or-empty>. id was sanitized

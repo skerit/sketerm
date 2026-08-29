@@ -33,6 +33,31 @@ pub fn allocPaneId(_: *Window) u32 {
     return id;
 }
 
+/// Process-global OSC 99 slot-token counter, like `next_pane_id`. The
+/// `app.notify-act` action is one per application, so a token must be
+/// unique across windows or window B's notification activates against
+/// window A's slot of the same number.
+var next_notify_token: u32 = 1;
+
+/// Never 0: that is the "no slot" value the notification carries.
+fn mintNotifyToken() u32 {
+    const token = next_notify_token;
+    next_notify_token +%= 1;
+    if (next_notify_token == 0) next_notify_token = 1;
+    return token;
+}
+
+test "notify tokens are unique and never zero" {
+    const t = std.testing;
+    next_notify_token = std.math.maxInt(u32);
+    const a = mintNotifyToken();
+    const b = mintNotifyToken();
+    try t.expectEqual(std.math.maxInt(u32), a);
+    try t.expectEqual(@as(u32, 1), b);
+    try t.expect(a != b);
+    try t.expect(mintNotifyToken() != 0);
+}
+
 /// Park an interactive OSC 99 notification so its desktop
 /// activation can find the pane + identifier later. Bounded:
 /// the oldest slot is evicted at 32. Returns the slot token.
@@ -42,9 +67,7 @@ pub fn registerNotifySlot(self: *Window, pane: *Pane, ev: Screen.NotificationEve
         const old = self.notify_slots.orderedRemove(0);
         self.allocator.free(old.id);
     }
-    const token = self.next_notify_token;
-    self.next_notify_token +%= 1;
-    if (self.next_notify_token == 0) self.next_notify_token = 1;
+    const token = mintNotifyToken();
     self.notify_slots.append(self.allocator, .{
         .token = token,
         .pane = pane,
@@ -68,6 +91,42 @@ pub fn dropNotifySlotsForPane(self: *Window, pane: *Pane) void {
             i += 1;
         }
     }
+}
+
+/// Index of the slot for `token` whose pane this window still lists,
+/// dropping the entry instead when that pane is gone. A slot holds a
+/// raw `*Pane` and the desktop can sit on an OSC 99 notification for
+/// hours, so the fence lives here with the table rather than depending
+/// on every future pane-removal path remembering to prune it; a pane
+/// that leaves the window (closed, or adopted with its tab by another
+/// window) has already taken its slot with it via `dropPaneRefs`.
+pub fn liveNotifySlot(self: *Window, token: u32) ?usize {
+    for (self.notify_slots.items, 0..) |slot, i| {
+        if (slot.token != token) continue;
+        for (self.panes.items) |p| {
+            if (p == slot.pane) return i;
+        }
+        const dead = self.notify_slots.orderedRemove(i);
+        self.allocator.free(dead.id);
+        return null;
+    }
+    return null;
+}
+
+pub const LiveNotifySlot = struct { win: *Window, idx: usize };
+
+/// `liveNotifySlot` over every window of the default application: the
+/// action that fires is app-scoped and carries no window, and tokens
+/// are process-unique, so at most one window holds the slot.
+pub fn liveNotifySlotAnyWindow(token: u32) ?LiveNotifySlot {
+    const app = c.g_application_get_default() orelse return null;
+    var node = c.gtk_application_get_windows(@ptrCast(app));
+    while (node != null) : (node = node.*.next) {
+        const gw: ?*c.GtkWindow = @ptrCast(@alignCast(node.*.data));
+        const w = windowFromGtk(gw) orelse continue;
+        if (liveNotifySlot(w, token)) |idx| return .{ .win = w, .idx = idx };
+    }
+    return null;
 }
 
 pub fn tabPageId(page: *c.AdwTabPage) u32 {
@@ -333,25 +392,29 @@ pub fn globallyFocusedPane(self: *Window) ?*Pane {
     return self.paneById(null);
 }
 
+/// Whether the request carries a pane address at all. The one decision
+/// behind `reqPane`'s focused-pane default: an address that was GIVEN
+/// and missed is a miss, never "whatever is focused" -- `close-pane`
+/// naming a dead session used to close the focused pane and answer ok.
+pub fn reqHasAddress(req: ipc_protocol.Request) bool {
+    return req.session != null or req.pane != null;
+}
+
 /// Resolve a request's target pane for an EXPLICIT command (send-text,
-/// split, …): stable session name first, then the pane id, both across
-/// all windows. No current-pane fallback — an explicit bad id should
-/// error, not silently hit some other pane. Use `takeoverPane` for the
-/// "the pane I'm in" commands.
+/// split, close-pane, ...): `reqPaneExact` when an address was given,
+/// the focused pane only for an omitted --pane/--session. Use
+/// `takeoverPane` for the "the pane I'm in" commands, which must not
+/// fail on a stale session name.
 pub fn reqPane(self: *Window, req: ipc_protocol.Request) ?*Pane {
-    if (req.session) |s| {
-        if (self.paneBySession(s)) |p| return p;
-    }
-    if (req.pane) |id| return paneByIdGlobal(self, id);
-    // No address at all = the focused pane (default for omitted --pane).
+    if (reqHasAddress(req)) return reqPaneExact(self, req);
     return globallyFocusedPane(self);
 }
 
 /// Pane resolution for commands that must act on the named pane or
-/// nothing: an address that does not resolve is an error, where
-/// `reqPane` would quietly fall back to the focused pane. Turning
-/// a pane the caller never named into a file browser is exactly the
-/// bug `sketerm files --here` exists to avoid, and a $SKETERM_SESSION
+/// nothing: stable session name first, then the pane id, both across
+/// all windows, and null when neither resolves or neither was given.
+/// Turning a pane the caller never named into a file browser is exactly
+/// the bug `sketerm files --here` exists to avoid, and a $SKETERM_SESSION
 /// from ANOTHER sketerm instance makes that a real case.
 pub fn reqPaneExact(self: *Window, req: ipc_protocol.Request) ?*Pane {
     if (req.session) |s| {
@@ -359,6 +422,14 @@ pub fn reqPaneExact(self: *Window, req: ipc_protocol.Request) ?*Pane {
     }
     if (req.pane) |id| return paneByIdGlobal(self, id);
     return null;
+}
+
+test "reqPane falls back to the focused pane only when no address was given" {
+    const t = std.testing;
+    try t.expect(!reqHasAddress(.{ .cmd = "close-pane" }));
+    try t.expect(reqHasAddress(.{ .cmd = "close-pane", .session = "s1-1" }));
+    try t.expect(reqHasAddress(.{ .cmd = "close-pane", .pane = 7 }));
+    try t.expect(reqHasAddress(.{ .cmd = "close-pane", .session = "s1-1", .pane = 7 }));
 }
 
 /// Resolve the pane for a "take over the pane I'm in" command
@@ -764,23 +835,7 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             const win = ownerWindow(self, pane);
             if (winmod.tabPageForPane(win, pane)) |page| c.adw_tab_view_set_selected_page(win.tab_view, page);
             c.gtk_window_present(@ptrCast(win.app_window));
-            // Focusing an editor-visible pane must land on the document
-            // canvas, not on the hidden shell's GLArea. The same rule
-            // applies to web and file-browser faces: IPC focus is also
-            // the setup path for real seat-key automation.
-            if (pane.editorFaceVisible()) {
-                if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| {
-                    ev.focusFace();
-                } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
-            } else if (pane.webFaceVisible()) {
-                if (@import("webface.zig").WebFace.fromPane(pane)) |face| {
-                    face.focusFace();
-                } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
-            } else if (pane.browserFaceVisible()) {
-                if (@import("browser.zig").BrowserView.fromPane(pane)) |view| {
-                    view.focusListing();
-                } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
-            } else _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
+            focusPaneFace(pane);
             try ipc_protocol.writeOk(out, allocator, null, {});
         } else if (req.tab != null) {
             const ref = tabRefById(self, req.tab) orelse return ipc_protocol.writeErr(out, allocator, "no such tab");
@@ -875,21 +930,253 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         // equivalent of pressing its keybind ("zoom_pane",
         // "copy_mode", "split_h", …; names as in `keybind.*`).
         const name = req.data orelse return ipc_protocol.writeErr(out, allocator, "action needs data=<name>");
-        const action = @import("input.zig").actionFromName(name) orelse
+        const action = input.actionFromName(name) orelse
             return ipc_protocol.writeErr(out, allocator, "unknown action");
-        var target: *Window = activeOrSelf(self);
         if (req.pane != null or req.session != null) {
-            const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
-            target = ownerWindow(self, pane);
-            _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
+            // An address that does not resolve is an error here:
+            // `reqPane`'s focused-pane fallback would run the action on
+            // a pane the caller never named. See `runPaneAction` for
+            // how the named pane is then reached.
+            const pane = reqPaneExact(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+            if (try runPaneAction(ownerWindow(self, pane), pane, action)) |msg|
+                return ipc_protocol.writeErr(out, allocator, msg);
+        } else {
+            winmod.dispatchAction(activeOrSelf(self), action);
         }
-        winmod.dispatchAction(target, action);
         try ipc_protocol.writeOk(out, allocator, null, {});
     } else if (std.mem.startsWith(u8, req.cmd, "web-")) {
         try webCmd(self, req, out, allocator);
     } else {
         try ipc_protocol.writeErr(out, allocator, "unknown command");
     }
+}
+
+// ── Pane-addressed actions ─────────────────────────────────────────
+//
+// `{"cmd":"action","data":"<name>","pane":N}` used to `grab_focus` the
+// named pane and then dispatch, which left every action that re-derives
+// its target from `gtk_window_get_focus` pointed at whatever happened to
+// be focused: a `grab_focus` cannot move focus into a background tab,
+// into a subtree hidden by pane zoom, or onto a GLArea whose offload
+// widget is hidden because a browser/editor/web face is raised. So the
+// action landed on a different, live pane, consistently in both the
+// widget tree and the pane model, which is why `SKETERM_VERIFY_TREE`
+// never caught it. An addressed action now reaches the pane it named or
+// is refused, and the classification deciding which route it takes is
+// the one exhaustive switch below.
+
+const input = @import("input.zig");
+
+/// Put keyboard focus on `pane`, on whichever face it is actually
+/// showing: an editor/web/browser face hides the terminal GLArea, and a
+/// hidden widget cannot hold GTK focus. Shared by the `focus` command
+/// and the focus-derived action route, which is also the setup path for
+/// real seat-key automation.
+pub fn focusPaneFace(pane: *Pane) void {
+    if (pane.editorFaceVisible()) {
+        if (@import("editorview.zig").EditorView.fromPane(pane)) |ev| return ev.focusFace();
+    } else if (pane.webFaceVisible()) {
+        if (@import("webface.zig").WebFace.fromPane(pane)) |face| return face.focusFace();
+    } else if (pane.browserFaceVisible()) {
+        if (@import("browser.zig").BrowserView.fromPane(pane)) |view| return view.focusListing();
+    }
+    _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
+}
+
+/// How the `action` command reaches a NAMED pane. The payload members
+/// carry the argument their explicit-target `Window` entry point needs,
+/// so `paneRoute` stays the single exhaustive switch over `Action` and
+/// `runPaneAction` switches over routes rather than over the action a
+/// second time.
+const PaneRoute = union(enum) {
+    /// Runs on the pane's own input context: the address IS the target.
+    pane_local,
+    /// Window- or application-scoped (opening a tab, tab navigation, a
+    /// dialog, a global toggle): the address only picks which window
+    /// acts. A creating action inheriting the focused pane's cwd or
+    /// profile counts as window-scoped: it creates rather than
+    /// mutating a pane the caller named.
+    window,
+    /// Re-derives its target from keyboard focus or from the window's
+    /// selected tab, with no explicit-target entry point to call
+    /// instead: honoured only while the addressed pane really holds
+    /// focus, refused otherwise.
+    focus_derived,
+    /// `Window.splitPane`, with the orientation.
+    split: c_uint,
+    /// `Window.newWebSplitOn`, with the orientation.
+    web_split: c_uint,
+    /// `Window.closePane`.
+    close,
+    /// `Window.newBrowserTabFrom`.
+    browser_tab,
+    /// `Window.detachPaneToShell`.
+    detach_shell,
+};
+
+/// Classify `action` for an addressed pane. Exhaustive on purpose: a
+/// new action must be classified here or this file stops compiling,
+/// because the wrong default is the silent one (running on the focused
+/// pane instead of the named one).
+fn paneRoute(action: input.Action) PaneRoute {
+    return switch (action) {
+        // Explicit-target Window entry points. Each is the exact twin of
+        // the `*Focused` variant `onShortcut` runs for a keybind, with
+        // the focused pane replaced by the addressed one.
+        .split_h => .{ .split = @intCast(c.GTK_ORIENTATION_HORIZONTAL) },
+        .split_v => .{ .split = @intCast(c.GTK_ORIENTATION_VERTICAL) },
+        .new_web_split => .{ .web_split = @intCast(c.GTK_ORIENTATION_HORIZONTAL) },
+        .close_pane => .close,
+        // The browser tab is the one creating action that READS the
+        // origin pane (its host-qualified cwd becomes the start
+        // location), so it needs the explicit target; `new_web_tab` and
+        // `new_editor_tab` start empty and stay window-scoped below.
+        .new_browser_tab => .browser_tab,
+        .mux_detach => .detach_shell,
+
+        // Consumed by `input.runAction` on the pane's own context, so
+        // handing it the addressed pane's context is the whole fix.
+        .paste_clipboard,
+        .copy_selection,
+        .copy_screen,
+        .copy_scrollback,
+        .copy_command_output,
+        .select_command_output,
+        .interrupt_or_copy,
+        .clear_and_scrollback,
+        .clear_scrollback,
+        .scrollback_page_up,
+        .scrollback_page_down,
+        .scrollback_top,
+        .scrollback_bottom,
+        .select_all,
+        .context_menu,
+        .toggle_browser_face,
+        .toggle_editor_face,
+        .toggle_web_face,
+        => .pane_local,
+
+        // Window / application scoped. `copy` and `paste` are in the
+        // vocabulary but nothing implements them; they land here as the
+        // no-op they already were.
+        .new_tab,
+        .new_web_tab,
+        .new_editor_tab,
+        .new_incognito_web_tab,
+        .new_durable_tab,
+        .restore_closed_tab,
+        .next_tab,
+        .prev_tab,
+        .tab_tree_next,
+        .tab_tree_prev,
+        .goto_tab_1,
+        .goto_tab_2,
+        .goto_tab_3,
+        .goto_tab_4,
+        .goto_tab_5,
+        .goto_tab_6,
+        .goto_tab_7,
+        .goto_tab_8,
+        .goto_tab_9,
+        .toggle_tab_bar,
+        .toggle_tab_sidebar,
+        .attach_all,
+        .cross_search,
+        .app_windows,
+        .save_layout,
+        .save_layout_as,
+        .save_default_layout,
+        .load_layout,
+        .reload_config,
+        .prefs_open,
+        .welcome_open,
+        .broadcast_cycle,
+        .web_discard_background,
+        .command_palette,
+        .copy,
+        .paste,
+        => .window,
+
+        // Everything else resolves a pane or a tab from focus and has no
+        // explicit-target entry point yet. `zoom_pane`, `copy_mode`,
+        // `new_browser_split` and `new_editor_split` are the ones that
+        // would most obviously earn one (`Window.toggleZoomPaneOn`,
+        // `openCopyModeOn`, `newBrowserSplitOn`, `newEditorSplitOn`).
+        .close_tab,
+        .detach_tab,
+        .duplicate_tab,
+        .toggle_pin_tab,
+        .tab_collapse,
+        .tab_expand,
+        .font_inc,
+        .font_dec,
+        .font_reset,
+        .search_open,
+        .prompt_prev,
+        .prompt_next,
+        .pane_next,
+        .pane_prev,
+        .launch_app,
+        .configure_shader,
+        .shader_preset_pick,
+        .apply_profile,
+        .show_scrollback,
+        .new_browser_split,
+        .new_editor_split,
+        .zoom_pane,
+        .copy_mode,
+        .hints_open,
+        .web_hints,
+        .web_reader,
+        .web_devtools,
+        .web_print_pdf,
+        .web_fill_password,
+        .web_site_info,
+        .web_history,
+        .web_bookmarks,
+        .panel_open,
+        .panel_close,
+        => .focus_derived,
+    };
+}
+
+/// Run `action` on the pane the request NAMED, in `win` (that pane's own
+/// window). Returns null when it ran, else the refusal to answer with:
+/// a focus-derived action the addressed pane cannot receive is refused
+/// rather than run on whatever else holds focus.
+fn runPaneAction(win: *Window, pane: *Pane, action: input.Action) !?[]const u8 {
+    switch (paneRoute(action)) {
+        .split => |orient| try win.splitPane(pane, orient),
+        .web_split => |orient| try win.newWebSplitOn(pane, orient),
+        .close => win.closePane(pane),
+        .browser_tab => try win.newBrowserTabFrom(pane, null),
+        .detach_shell => win.detachPaneToShell(pane),
+        .pane_local => {
+            const ictx = pane.input_ctx orelse return "that pane has no input context";
+            // 0 = the pane has no face to swap to / no menu hook: the
+            // keybind path leaves such a key to the shell, and the
+            // window-level fallback would only toast.
+            if (input.runAction(ictx, action) == 0)
+                return "that pane does not handle this action";
+        },
+        .window => {
+            // The focus attempt is not what makes this route correct --
+            // it is not pane-targeted at all -- but a window action that
+            // seeds itself from the focused pane (a new tab inheriting
+            // its cwd, the palette's rows) should read the pane the
+            // caller named, exactly as the keybind path reads the pane
+            // the user is in.
+            focusPaneFace(pane);
+            winmod.dispatchAction(win, action);
+        },
+        .focus_derived => {
+            focusPaneFace(pane);
+            if (win.focusedPane() != pane)
+                return "this action acts on the focused pane and that pane cannot take focus (background tab, hidden behind a browser/editor/web face, or hidden by pane zoom); focus it first";
+            winmod.dispatchAction(win, action);
+        },
+    }
+    return null;
 }
 
 // ── web-* : the browser views the `web_*` MCP tools drive ──────────
@@ -1035,8 +1322,10 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         // its 800x600 default and could not be screenshotted at all.
         if (host.last_created_page) |page| c.adw_tab_view_set_selected_page(host.tab_view, page);
         c.gtk_window_present(@ptrCast(host.app_window));
-        _ = c.gtk_widget_grab_focus(@ptrCast(pane.surface.area));
+        // Show the face first: grabbing focus on the GLArea and then
+        // hiding it behind the web face left nothing focused.
         pane.setWebVisible(true);
+        focusPaneFace(pane);
         if (req.data) |url| {
             if (url.len > 0) face.navigate(url);
         }
@@ -1270,6 +1559,55 @@ pub fn appendTabInfos(
             .panes = pane_infos.items,
         });
     }
+}
+
+// Pins the classification the `action` command's targeting depends on.
+// `paneRoute` is exhaustive, so a NEW action cannot slip through
+// unclassified; what drifts silently instead is an existing action
+// moving between routes -- an action gaining an explicit-target entry
+// point, or `input.runAction` handing one of its local arms to the
+// window sink. Both change which pane a `--pane N` request reaches.
+test "addressed actions route by target, not by focus" {
+    const t = std.testing;
+    const Tag = std.meta.Tag(PaneRoute);
+    // The five the field report named.
+    try t.expectEqual(Tag.split, std.meta.activeTag(paneRoute(.split_h)));
+    try t.expectEqual(Tag.split, std.meta.activeTag(paneRoute(.split_v)));
+    try t.expectEqual(Tag.close, std.meta.activeTag(paneRoute(.close_pane)));
+    try t.expectEqual(Tag.focus_derived, std.meta.activeTag(paneRoute(.zoom_pane)));
+    try t.expectEqual(Tag.focus_derived, std.meta.activeTag(paneRoute(.copy_mode)));
+    // Orientation travels in the route, not in a second switch.
+    try t.expectEqual(@as(c_uint, @intCast(c.GTK_ORIENTATION_VERTICAL)), paneRoute(.split_v).split);
+    // Pane-local: run on the addressed pane's own input context.
+    try t.expectEqual(Tag.pane_local, std.meta.activeTag(paneRoute(.copy_selection)));
+    try t.expectEqual(Tag.pane_local, std.meta.activeTag(paneRoute(.paste_clipboard)));
+    try t.expectEqual(Tag.pane_local, std.meta.activeTag(paneRoute(.scrollback_top)));
+    try t.expectEqual(Tag.pane_local, std.meta.activeTag(paneRoute(.toggle_web_face)));
+    // Window-scoped: the address only picks the window.
+    try t.expectEqual(Tag.window, std.meta.activeTag(paneRoute(.next_tab)));
+    try t.expectEqual(Tag.window, std.meta.activeTag(paneRoute(.prefs_open)));
+    try t.expectEqual(Tag.window, std.meta.activeTag(paneRoute(.goto_tab_3)));
+    // The remaining explicit-target twins.
+    try t.expectEqual(Tag.web_split, std.meta.activeTag(paneRoute(.new_web_split)));
+    try t.expectEqual(Tag.browser_tab, std.meta.activeTag(paneRoute(.new_browser_tab)));
+    try t.expectEqual(Tag.detach_shell, std.meta.activeTag(paneRoute(.mux_detach)));
+    // Creating actions that read nothing from the origin pane stay
+    // window-scoped; only the browser tab seeds from it.
+    try t.expectEqual(Tag.window, std.meta.activeTag(paneRoute(.new_web_tab)));
+    try t.expectEqual(Tag.window, std.meta.activeTag(paneRoute(.new_editor_tab)));
+    try t.expectEqual(Tag.window, std.meta.activeTag(paneRoute(.new_tab)));
+    // Every explicit-target route has exactly one member: a second
+    // action joining one of these is a new `Window` twin to wire, not a
+    // drift to absorb.
+    var explicit: usize = 0;
+    inline for (@typeInfo(input.Action).@"enum".fields) |f| {
+        const route = paneRoute(@field(input.Action, f.name));
+        switch (std.meta.activeTag(route)) {
+            .pane_local, .window, .focus_derived => {},
+            else => explicit += 1,
+        }
+    }
+    try t.expectEqual(@as(usize, 6), explicit);
 }
 
 test "IPC screenshots use private complete replacement" {

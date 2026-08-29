@@ -310,7 +310,6 @@ pub const Window = struct {
     /// originating pane + sanitized id (owned). Bounded ring — oldest
     /// evicted at 32; entries for closing panes dropped in unlistPane.
     notify_slots: std.ArrayList(NotifySlot) = .empty,
-    next_notify_token: u32 = 1,
     /// Zoomed pane (tmux z): non-null while one pane fills its tab.
     /// `zoom_hidden` holds the sibling subtrees we hid, each with a
     /// strong ref so the pointers stay valid for the restore even if
@@ -926,6 +925,10 @@ pub const Window = struct {
         // App-scoped action for desktop-notification activation (GIO
         // requires "app." actions on GNotifications). Target (uu) =
         // (slot token, button number; 0 = the notification body).
+        // Registered ONCE for the application's lifetime with no window
+        // as user-data: the handler resolves the token across every
+        // window (`remotectl.liveNotifySlotAnyWindow`), so there is no
+        // owner to hand it off from when a window dies.
         if (app) |a| {
             if (c.g_action_map_lookup_action(@ptrCast(a), "notify-act") == null) {
                 const vt = c.g_variant_type_new("(uu)");
@@ -935,7 +938,7 @@ pub const Window = struct {
                     act,
                     "activate",
                     @ptrCast(&termsinks_mod.onNotifyActivate),
-                    @ptrCast(self),
+                    null,
                     null,
                     c.G_CONNECT_DEFAULT,
                 );
@@ -1190,29 +1193,6 @@ pub const Window = struct {
             null,
             @as(c.gpointer, @ptrCast(self)),
         );
-
-        // "notify-act" is registered ONCE, by whichever window found it
-        // missing, and its GSimpleAction lives as long as the
-        // application. Take the action away with the handler rather
-        // than leave an inert one behind: the next window's init sees
-        // it missing again and re-registers against itself.
-        //
-        // `gtk_window_get_application` is useless from here — GTK has
-        // already unlinked a destroyed window from its application.
-        if (c.g_application_get_default()) |gapp| {
-            if (c.g_action_map_lookup_action(@ptrCast(gapp), "notify-act")) |act| {
-                const n = c.g_signal_handlers_disconnect_matched(
-                    @as(c.gpointer, @ptrCast(act)),
-                    c.G_SIGNAL_MATCH_DATA,
-                    0,
-                    0,
-                    null,
-                    null,
-                    @as(c.gpointer, @ptrCast(self)),
-                );
-                if (n > 0) c.g_action_map_remove_action(@ptrCast(gapp), "notify-act");
-            }
-        }
     }
 
     // ── Tab chrome: split out to ui/tabchrome.zig ──
@@ -1246,6 +1226,7 @@ pub const Window = struct {
     pub const setShaderParam = winconfig.setShaderParam;
     pub const applyPaneConfigByName = winconfig.applyPaneConfigByName;
     pub const applyPaneConfig = winconfig.applyPaneConfig;
+    pub const applyPaneMouseFlags = winconfig.applyPaneMouseFlags;
     pub const openProfilePicker = winconfig.openProfilePicker;
     pub const openApplyProfilePicker = winconfig.openApplyProfilePicker;
     pub const applyProfileToPane = winconfig.applyProfileToPane;
@@ -2087,9 +2068,6 @@ pub const Window = struct {
         if (pane.input_ctx) |ictx| {
             ictx.shortcut_sink = onShortcut;
             ictx.shortcut_ctx = @ptrCast(self);
-            ictx.smart_copy = self.config.smart_copy;
-            ictx.clear_select_on_copy = self.config.clear_select_on_copy;
-            ictx.mouse_autohide = self.config.mouse_autohide;
             ictx.bindings = self.bindings.items;
         }
         pane.menu_sink = onMenuAction;
@@ -2099,15 +2077,7 @@ pub const Window = struct {
         pane.surface.image_pass.debug = self.debug_images;
         pane.terminal.screen.kitty_images.debug = self.debug_images;
         pane.terminal.screen.kitty_images.budget_bytes = @as(usize, self.config.image_memory_mb) * 1024 * 1024;
-        // Mouse / link flags from config.
-        pane.copy_on_selection = self.config.copy_on_selection;
-        pane.clear_select_on_copy = self.config.clear_select_on_copy;
-        pane.disable_mouse_paste = self.config.disable_mouse_paste;
-        pane.disable_mousewheel_zoom = self.config.disable_mousewheel_zoom;
-        pane.link_single_click = self.config.link_single_click;
-        pane.mouse_autohide = self.config.mouse_autohide;
-        pane.middle_click_action = self.config.mouse_middle_click;
-        pane.right_click_action = self.config.mouse_right_click;
+        self.applyPaneMouseFlags(pane);
         pane.surface.bg_pass.source = &self.bg_source;
         pane.surface.shader_default_source = &self.shader_source;
         pane.refreshShaderBinding();
@@ -2334,20 +2304,35 @@ pub const Window = struct {
         @import("panelhost.zig").dispatchRelay(owner, terminal, pane, request_id, request);
     }
 
-    /// Drop every window-level pointer into a pane (search / hints /
-    /// copy mode / zoom / notify slots) and unlist it + its terminal —
-    /// WITHOUT tearing the pane down. Shared by the close path
-    /// (unlistPane) and cross-window tab adoption, where the pane
-    /// lives on under another Window.
-    pub fn disownPane(self: *Window, pane: *Pane) void {
+    /// The two policy bits on which the pane-close path and the
+    /// tab-close sweep differ; everything else about dropping a pane
+    /// is identical and lives in `dropPaneRefs`.
+    const DropPaneOpts = struct {
+        /// Unzoom even when `pane` is not the zoomed one: a pane close
+        /// collapses a GtkPaned, and that surgery inside a hidden tree
+        /// leaves half-restored visibility behind (tmux semantics).
+        /// The tab-close sweep sets this false because the zoomed pane
+        /// may live in a tab that SURVIVES this close.
+        unzoom_always: bool = true,
+        /// Re-evaluate window-wide graphics offload against the panes
+        /// that remain. The tab-close sweep sets this false: it can run
+        /// from an idle whose toplevel is already destroyed, and the
+        /// sync dereferences `app_window`.
+        sync_offload: bool = true,
+    };
+
+    /// Drop every window-level pointer into `pane` and unlist it and
+    /// its terminal. The ONE home for that list -- a new `Window` field
+    /// holding a raw `*Pane` is added here, never in a second sweep.
+    /// The search bar has to close rather than just forget the pane:
+    /// applyCurrentMatch / nextMatch would deref the dead Pane, and
+    /// `search_highlights` would dangle into freed Window memory.
+    fn dropPaneRefs(self: *Window, pane: *Pane, opts: DropPaneOpts) void {
         pane.win_on_continuous_frames = null;
         if (self.search_pane == pane) self.closeSearch();
         if (self.hints_pane == pane) self.exitHints();
         if (self.copymode_pane == pane) self.exitCopyMode();
-        // ANY pane removal unzooms (tmux semantics) — the close is
-        // about to collapse a GtkPaned, and doing that surgery inside
-        // a hidden tree would leave half-restored visibility behind.
-        self.unzoomPane();
+        if (opts.unzoom_always or self.zoom_pane == pane) self.unzoomPane();
         self.dropNotifySlotsForPane(pane);
         for (self.panes.items, 0..) |p, idx| {
             if (p == pane) {
@@ -2362,7 +2347,16 @@ pub const Window = struct {
                 break;
             }
         }
-        self.syncWindowGraphicsOffload();
+        if (opts.sync_offload) self.syncWindowGraphicsOffload();
+    }
+
+    /// Drop every window-level pointer into a pane (search / hints /
+    /// copy mode / zoom / notify slots) and unlist it + its terminal —
+    /// WITHOUT tearing the pane down. Shared by the close path
+    /// (unlistPane) and cross-window tab adoption, where the pane
+    /// lives on under another Window.
+    pub fn disownPane(self: *Window, pane: *Pane) void {
+        self.dropPaneRefs(pane, .{});
     }
 
     /// Sever a pane from the window before teardown: disown it, fence
@@ -2454,7 +2448,21 @@ pub const Window = struct {
         if (pane.input_ctx) |ictx| {
             ictx.shortcut_sink = onShortcut;
             ictx.shortcut_ctx = @ptrCast(self);
+            // Same re-point makePane does. The Ctx borrows a SLICE of
+            // the owning window's `bindings` ArrayList: left alone it
+            // keeps pointing into the source window's buffer, which
+            // that window's `refreshBindings` can reallocate and its
+            // `deinit` frees -- and a source window emptied by this
+            // very drag deinits immediately. applyPaneConfigByName
+            // below does NOT cover it; only refreshBindings and
+            // applyConfigChange ever touch it.
+            ictx.bindings = self.bindings.items;
         }
+        // The mouse/copy flags on the Ctx and the Pane are plain values
+        // copied from a window's config, so they follow the window the
+        // pane now lives in -- the one list makePane and
+        // applyConfigChange apply.
+        self.applyPaneMouseFlags(pane);
         pane.menu_sink = onMenuAction;
         pane.menu_sink_ctx = @ptrCast(self);
         if (@import("browser.zig").BrowserView.fromPane(pane)) |bv| self.installBrowserHooks(bv);
@@ -2473,11 +2481,12 @@ pub const Window = struct {
                 }
             }
         }
-        // Re-point bindings, menu/shortcut sinks, bg/shader sources and
-        // push this window's config, resolving the pane's profile BY
-        // NAME so it keeps its font/colors/scrollback. The pane now
-        // renders under our atlas settings; per-pane font zoom resets,
-        // same as a config reload.
+        // Re-point bg/shader sources and push this window's config,
+        // resolving the pane's profile BY NAME so it keeps its
+        // font/colors/scrollback. This does NOT reach the input Ctx --
+        // its bindings slice and mouse/copy flags are re-pointed above.
+        // The pane now renders under our atlas settings; per-pane font
+        // zoom resets, same as a config reload.
         self.applyPaneConfigByName(pane);
     }
 
@@ -3572,37 +3581,36 @@ pub const Window = struct {
         }
     }
 
-    /// Close the focused pane. If it's the only pane in its tab,
-    /// closes the tab. Otherwise the pane is removed from its
-    /// parent GtkPaned and the sibling takes its place.
-    /// Close a specific pane (used by exit_action=close). If the
-    /// pane is the only one in its tab, closes the whole tab.
+    /// Close a SPECIFIC pane (exit_action=close, `cli close-pane`, the
+    /// MCP close_pane tool, a detached panel tab). Callers that already
+    /// know which pane they mean must use this rather than focusing the
+    /// pane and calling closeFocusedPane: a `grab_focus` does not move
+    /// focus onto a widget in a background tab, behind a browser/editor
+    /// face, or inside a subtree hidden by zoom, so that route closed
+    /// whatever happened to be focused instead, or nothing at all.
     pub fn closePane(self: *Window, target: *Pane) void {
-        const w = target.widget();
-        const parent = c.gtk_widget_get_parent(w) orelse return;
-        const is_paned = c.g_type_check_instance_is_a(
-            @ptrCast(@alignCast(parent)),
-            c.gtk_paned_get_type(),
-        ) != 0;
-        if (!is_paned) {
-            // Last pane in its tab — close the tab.
-            const page = tabPageForPane(self, target) orelse return;
-            _ = c.adw_tab_view_close_page(self.tab_view, page);
-            return;
-        }
-        // Re-use closeFocusedPane's path by temporarily focusing the
-        // target then calling it. Simpler than duplicating.
-        _ = c.gtk_widget_grab_focus(@ptrCast(target.surface.area));
-        self.closeFocusedPane();
+        self.closePaneImpl(target);
     }
 
+    /// Close whichever pane holds keyboard focus; a no-op when focus is
+    /// not on a pane.
     pub fn closeFocusedPane(self: *Window) void {
         const focus = c.gtk_window_get_focus(@ptrCast(self.app_window)) orelse return;
         const pane = self.paneForWidget(focus) orelse return;
+        self.closePaneImpl(pane);
+    }
+
+    /// Remove `pane` from its tab: the sibling subtree takes the
+    /// collapsing GtkPaned's place, or the whole tab closes when the
+    /// pane was the last one in it. The one body both entry points run,
+    /// because the widget surgery and the tree model's `removeLeaf`
+    /// must stay in the same function.
+    fn closePaneImpl(self: *Window, pane: *Pane) void {
         const w = pane.widget();
         const parent = c.gtk_widget_get_parent(w) orelse return;
         // Resolve the page BEFORE the widget surgery below detaches
-        // the pane from it — needed for the tree-model update.
+        // the pane from it — needed for the tree-model update and for
+        // the last-pane-in-tab close below.
         const tree_page = tabPageForPane(self, pane);
 
         const is_paned = c.g_type_check_instance_is_a(
@@ -3611,8 +3619,10 @@ pub const Window = struct {
         ) != 0;
 
         if (!is_paned) {
-            // Last pane in tab — close the whole tab.
-            self.closeCurrentTab();
+            // Last pane in tab: close the whole tab. Its OWN page, not
+            // the selected one -- the pane may sit in a background tab.
+            const page = tree_page orelse return;
+            _ = c.adw_tab_view_close_page(self.tab_view, page);
             return;
         }
 
@@ -5200,23 +5210,15 @@ fn collectAndFreePanes(self: *Window, root: *c.GtkWidget) void {
     while (i < self.panes.items.len) {
         const pane = self.panes.items[i];
         if (widgetIsAncestor(root, pane.widget())) {
-            // If the search bar is currently targeting this pane,
-            // close it before tearing the pane down — otherwise
-            // applyCurrentMatch / nextMatch would deref a dead Pane
-            // and the search_highlights slice would become a
-            // dangling pointer into freed Window memory.
-            if (self.search_pane == pane) self.closeSearch();
-            if (self.hints_pane == pane) self.exitHints();
-            if (self.copymode_pane == pane) self.exitCopyMode();
-            if (self.zoom_pane == pane) self.unzoomPane();
             const term = pane.terminal;
-            _ = self.panes.orderedRemove(i);
-            for (self.terminals.items, 0..) |t, ti| {
-                if (t == term) {
-                    _ = self.terminals.orderedRemove(ti);
-                    break;
-                }
-            }
+            // Every window-level pointer into the pane is dropped in
+            // ONE place. This used to be a hand-copied subset that
+            // missed the notify slots, so an OSC 99 notification whose
+            // tab had been closed dereferenced a freed Pane when the
+            // desktop activated it. `DropPaneOpts` documents why the
+            // tab-close sweep opts out of the unconditional unzoom and
+            // the graphics-offload re-sync.
+            self.dropPaneRefs(pane, .{ .unzoom_always = false, .sync_offload = false });
             // Pane.terminal sinks reach into Terminal/Pane state that
             // we're about to free — null them now so any callback
             // already queued on the main loop that fires before the

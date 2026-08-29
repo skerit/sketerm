@@ -22,6 +22,7 @@ const browser_open = @import("browser/open.zig");
 const format = @import("../filebrowser/format.zig");
 const appmenu = @import("appmenu.zig");
 const remotestream = @import("remotestream.zig");
+const crashlog = @import("../util/crashlog.zig");
 
 pub const Variant = enum { preview, original, external_copy, head };
 const PREVIEW_BYTES_MAX: usize = 2 << 20;
@@ -899,12 +900,7 @@ pub const ViewerWindow = struct {
         // severed the timers/sinks when the window started dying).
         switch (self.content) {
             .cast => |box| box.destroy(),
-            .video => |stream| {
-                _ = c.g_signal_handlers_disconnect_matched(@ptrCast(stream), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @ptrCast(self));
-                c.g_object_unref(@ptrCast(stream));
-                if (self.video_input) |vin| c.g_object_unref(@ptrCast(vin));
-                self.video_input = null;
-            },
+            .video => |stream| self.retireStream(stream),
             else => {},
         }
         if (self.video_tick != 0) _ = c.g_source_remove(self.video_tick);
@@ -995,15 +991,35 @@ pub const ViewerWindow = struct {
             .video => |st| st,
             else => return,
         };
+        // Dropping the last reference finalizes the GStreamer pipeline
+        // from inside this call, so a fatal fault here would otherwise
+        // be recorded as an idle process with no operation in flight.
+        crashlog.set("viewer video teardown remote={} policy={s}", .{ self.video_input != null, @tagName(self.video_policy) });
+        defer crashlog.clear();
         if (self.video_tick != 0) _ = c.g_source_remove(self.video_tick);
         self.video_tick = 0;
+        c.gtk_picture_set_paintable(@ptrCast(self.video_picture), null);
+        self.retireStream(stream);
+        self.content = .image;
+    }
+
+    /// Disconnect, stop and finalize one media stream and its input.
+    /// Separate from `releaseVideoStream` because window finalize must
+    /// do the same WITHOUT touching the already-dead picture widget.
+    /// `gtk_media_file_clear` retires the backend's pipeline through the
+    /// documented API while the object is still fully referenced; without
+    /// it the last unref finalizes a live GStreamer pipeline (GTK 4.22
+    /// drives one through GstPlay and GL) from inside whatever callback
+    /// navigated away, which is where the 2026-08-29 smoke-e2e SIGSEGV
+    /// landed. Every stream here is a GtkMediaFile, from either
+    /// constructor.
+    fn retireStream(self: *ViewerWindow, stream: *c.GtkMediaStream) void {
         _ = c.g_signal_handlers_disconnect_matched(@ptrCast(stream), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @ptrCast(self));
         c.gtk_media_stream_pause(stream);
-        c.gtk_picture_set_paintable(@ptrCast(self.video_picture), null);
+        c.gtk_media_file_clear(@ptrCast(stream));
         c.g_object_unref(@ptrCast(stream));
         if (self.video_input) |vin| c.g_object_unref(@ptrCast(vin));
         self.video_input = null;
-        self.content = .image;
     }
 
     /// The policy a remote item opens with: audio always streams as-is
@@ -1044,6 +1060,10 @@ pub const ViewerWindow = struct {
     /// honours a nonzero start; the others start at 0 and seek natively.
     fn startVideoStream(self: *ViewerWindow, resource: model.Resource, policy: remotestream.Policy, start_ms: u64) void {
         self.releaseVideoStream();
+        // Opening a stream runs decoder discovery and GL setup inside
+        // this call; name it so a fatal fault there is attributable.
+        crashlog.set("viewer video open '{s}' policy={s} start={d}ms", .{ resource.name(), @tagName(policy), start_ms });
+        defer crashlog.clear();
         self.video_offset_ms = start_ms;
         self.video_policy = policy;
         const stream: *c.GtkMediaStream = blk: {
@@ -1228,6 +1248,8 @@ pub const ViewerWindow = struct {
     }
 
     fn showCurrent(self: *ViewerWindow) void {
+        crashlog.set("viewer show item {d}/{d}", .{ self.index + 1, self.batch.specs.len });
+        defer crashlog.clear();
         self.closeCast();
         self.closeVideo();
         self.content = .image;

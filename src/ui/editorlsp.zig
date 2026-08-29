@@ -1102,6 +1102,11 @@ pub const Manager = struct {
     /// Byte offset the last dwell request was made for — a pointer
     /// wandering within one word must not re-ask.
     dwell_offset: usize = std.math.maxInt(usize),
+    /// Why the last motion did or did not arm the dwell timer. Only ever
+    /// read to keep `SKETERM_LSP_DEBUG` down to one line per CHANGE:
+    /// motion arrives hundreds of times a second, and a trace that logs
+    /// every one of them is unreadable exactly when it is needed.
+    dwell_gate: DwellGate = .initial,
     /// `TextEdit[]`s from a `WorkspaceEdit` whose file was still
     /// loading. They apply when that load settles, and are reported
     /// when it cannot deliver them. See `applyWorkspaceEdit`.
@@ -2213,7 +2218,10 @@ pub const Manager = struct {
     fn onHover(self: *Manager, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
         const tab = maybe_tab orelse return;
         const dwell = req.aux == HOVER_DWELL_AUX;
-        if (env.has_error or tab.doc.revision != req.revision) return;
+        if (env.has_error or tab.doc.revision != req.revision) {
+            if (dwell) dbg("dwell: hover answer dropped (error={} rev {d} vs {d})", .{ env.has_error, req.revision, tab.doc.revision });
+            return;
+        }
         const text = hoverText(self.alloc, env.result) catch return;
         defer self.alloc.free(text);
         var combined: std.ArrayList(u8) = .empty;
@@ -2233,10 +2241,12 @@ pub const Manager = struct {
         if (combined.items.len == 0) {
             // A dwell that found nothing must say nothing at all: the
             // user did not ask, they just moved the mouse.
+            if (dwell) dbg("dwell: hover answer is empty", .{});
             if (!dwell) self.view.setStatusText("Nothing to show here.");
             return;
         }
         if (!dwell) self.hover.at = null;
+        if (dwell) dbg("dwell: hover popup, {d} bytes", .{combined.items.len});
         self.showHover(combined.items);
     }
 
@@ -3700,21 +3710,30 @@ pub const Manager = struct {
         self.dwell_y = y;
         if (self.hover.open and self.hover.at != null) self.closeHover();
         const ms = self.dwellMs();
-        if (ms == 0) return;
+        if (ms == 0) return self.noteDwellGate(.disabled);
         if (self.dwell_timer != 0) {
             _ = c.g_source_remove(self.dwell_timer);
             self.dwell_timer = 0;
         }
         // A dwell is only interesting where a server could answer.
-        const tab = self.view.activeTab() orelse return;
-        const st = tab.lsp orelse return;
-        const cn = st.conn orelse return;
-        if (cn.sess.state != .ready) return;
+        const tab = self.view.activeTab() orelse return self.noteDwellGate(.no_tab);
+        const st = tab.lsp orelse return self.noteDwellGate(.no_server);
+        const cn = st.conn orelse return self.noteDwellGate(.no_server);
+        if (cn.sess.state != .ready) return self.noteDwellGate(.not_ready);
         // Hover is the usual answer, but a dwell can also land on an
         // inlay hint's tooltip, so a server with hints and no hover
         // still gets a timer.
-        if (!cn.sess.caps.hover and !(cn.sess.caps.inlay_hint and self.hintsEnabled())) return;
+        if (!cn.sess.caps.hover and !(cn.sess.caps.inlay_hint and self.hintsEnabled()))
+            return self.noteDwellGate(.no_capability);
+        self.noteDwellGate(.armed);
         self.dwell_timer = c.g_timeout_add(ms, @ptrCast(&onDwellTimer), @ptrCast(self));
+    }
+
+    /// One trace line per CHANGE of the arm decision — see `dwell_gate`.
+    fn noteDwellGate(self: *Manager, gate: DwellGate) void {
+        if (self.dwell_gate == gate) return;
+        self.dwell_gate = gate;
+        dbg("dwell: motion gate -> {s}", .{@tagName(gate)});
     }
 
     fn dwellMs(self: *Manager) c_uint {
@@ -3739,11 +3758,23 @@ pub const Manager = struct {
         if (self.view.widgets_dead) return 0;
         // Not while a list is up: the popup would be under the pointer
         // and the two would fight for the same screen corner.
-        if (self.list.open) return 0;
+        if (self.list.open) {
+            dbg("dwell: fired, but a list popup is open", .{});
+            return 0;
+        }
         const tab = self.view.activeTab() orelse return 0;
-        const r = self.quietReady() orelse return 0;
-        const off = self.view.offsetAtPointPublic(tab, self.dwell_x, self.dwell_y) orelse return 0;
-        if (off == self.dwell_offset) return 0;
+        const r = self.quietReady() orelse {
+            dbg("dwell: fired, but no ready server", .{});
+            return 0;
+        };
+        const off = self.view.offsetAtPointPublic(tab, self.dwell_x, self.dwell_y) orelse {
+            dbg("dwell: fired at ({d:.0},{d:.0}), which is not over the document", .{ self.dwell_x, self.dwell_y });
+            return 0;
+        };
+        if (off == self.dwell_offset) {
+            dbg("dwell: fired again on offset {d}", .{off});
+            return 0;
+        }
         self.dwell_offset = off;
 
         // An inlay hint anchored exactly here wins the dwell. A hint has
@@ -3762,6 +3793,7 @@ pub const Manager = struct {
         if (!r.cn.sess.caps.hover) return 0;
         const params = self.docPosParams(r, off, "") orelse return 0;
         self.hover.at = self.view.pointRectPx(self.dwell_x, self.dwell_y);
+        dbg("dwell: hover at offset {d} from ({d:.0},{d:.0})", .{ off, self.dwell_x, self.dwell_y });
         self.issue(r, .hover, "textDocument/hover", params, HOVER_DWELL_AUX);
         return 0;
     }
@@ -3770,6 +3802,9 @@ pub const Manager = struct {
     /// than from Ctrl+I — it is anchored at the pointer, and it stays
     /// silent when there is nothing to say.
     pub const HOVER_DWELL_AUX: u64 = 1;
+
+    /// Every reason a pointer motion has for not arming the dwell timer.
+    const DwellGate = enum { initial, armed, disabled, no_tab, no_server, not_ready, no_capability };
 
     // ---- diagnostics navigation ----------------------------------------------
 

@@ -135,6 +135,9 @@ fn lessMatch(_: void, a: Match, b: Match) bool {
 
 // ---------------------------------------------------------------- dbus
 
+/// The session bus, as a REF the caller owns: the connection is a
+/// process-wide singleton, but `g_bus_get_sync` is transfer-full, so every
+/// call must be balanced with `g_object_unref`.
 fn bus() Error!*c.GDBusConnection {
     var err: [*c]c.GError = null;
     const conn = c.g_bus_get_sync(c.G_BUS_TYPE_SESSION, null, &err) orelse {
@@ -221,6 +224,7 @@ fn allItems(conn: *c.GDBusConnection) Error!*c.GVariant {
 pub fn findForHost(allocator: std.mem.Allocator, host: []const u8) Error!Matches {
     if (host.len == 0) return .{ .allocator = allocator, .items = &.{} };
     const conn = try bus();
+    defer c.g_object_unref(conn);
     const reply = try allItems(conn);
     defer c.g_variant_unref(reply);
 
@@ -322,6 +326,8 @@ fn tryUnlock(conn: *c.GDBusConnection, path: [*:0]const u8) bool {
 /// adding a crypto path to get wrong.
 pub fn fetchSecret(allocator: std.mem.Allocator, item_path: [:0]const u8, locked: bool) Error![]u8 {
     const conn = try bus();
+    // Registered first, so it runs after the session Close below.
+    defer c.g_object_unref(conn);
     if (locked and !tryUnlock(conn, item_path.ptr)) return Error.Locked;
 
     const opened = call(

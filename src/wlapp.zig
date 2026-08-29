@@ -27,7 +27,6 @@ const wlpipe = @import("wlhost/pipe.zig");
 const imhost = @import("ui/imhost.zig");
 const clipmod = @import("ui/clipboard.zig");
 
-
 /// A window named across app connections: the connection's session id
 /// plus a surface id in THAT connection's space. Neither half is
 /// unique on its own.
@@ -323,6 +322,23 @@ pub const AppHost = struct {
         /// merely routed/unrouted (see applyImRouting).
         im: ?*imhost.ImHost = null,
 
+        /// Retire the host IM, if one was ever attached. Idempotent,
+        /// and the ONE place either teardown path does this.
+        ///
+        /// Mandatory before the Win is freed: the ImHost carries this
+        /// Win as its commit context and its GtkIMContext outlives the
+        /// widget tree (fcitx5/ibus commit asynchronously over D-Bus),
+        /// so a skipped deinit leaves a live signal handler pointing at
+        /// freed memory. WHERE it runs is free -- imhost owns a
+        /// reference to its client widget precisely so detach is safe
+        /// from any teardown path -- but the field must be nulled
+        /// first, since detach can re-enter through that widget.
+        fn severIm(self: *Win) void {
+            const im = self.im orelse return;
+            self.im = null;
+            im.deinit();
+        }
+
         /// Store the icon texture and apply it (needs the surface;
         /// onWinRealize re-applies). Takes ownership of one ref.
         fn setIconTexture(self: *Win, tex: *c.GdkTexture) void {
@@ -597,6 +613,13 @@ pub const AppHost = struct {
 
     pub fn destroy(self: *AppHost) void {
         self.dead = true;
+        // Overlay children go FIRST, so that no Win is ever freed while
+        // a popup or subsurface still names it: their teardown reaches
+        // into `win.overlay`, and nothing below may be reordered ahead
+        // of this without reintroducing that dangling `.win`.
+        self.releaseOverlays(null);
+        self.popups.deinit(self.allocator);
+        self.subsurfaces.deinit(self.allocator);
         var it = self.windows.valueIterator();
         while (it.next()) |w| {
             // Belt-and-braces: a still-embedded overlay lives in the
@@ -610,26 +633,12 @@ pub const AppHost = struct {
             w.*.opaque_resize.cancel();
             if (w.*.app_id) |aid| self.allocator.free(aid);
             if (w.*.icon_tex) |tex| c.g_object_unref(tex);
-            // Before gtk_window_destroy below: severing the IM
-            // reaches into the client widget's settings.
-            if (w.*.im) |im| im.deinit();
+            w.*.severIm();
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-wlapp", null);
             c.gtk_window_destroy(w.*.window);
             self.allocator.destroy(w.*);
         }
         self.windows.deinit(self.allocator);
-        var pit = self.popups.valueIterator();
-        while (pit.next()) |p| {
-            p.*.tex.deinit(self.allocator);
-            self.allocator.destroy(p.*);
-        }
-        self.popups.deinit(self.allocator);
-        var sit = self.subsurfaces.valueIterator();
-        while (sit.next()) |s| {
-            s.*.tex.deinit(self.allocator);
-            self.allocator.destroy(s.*);
-        }
-        self.subsurfaces.deinit(self.allocator);
         var ppit = self.pending_popups.valueIterator();
         while (ppit.next()) |p| p.deinit(self.allocator);
         self.pending_popups.deinit(self.allocator);
@@ -1236,20 +1245,28 @@ pub const AppHost = struct {
         self.updateShadowLayout(sub.win);
     }
 
+    /// Retire one materialized subsurface, returning the window it was
+    /// drawn into so the caller can relayout it; unparenting reaches
+    /// into `win.overlay`, so the Win must still be alive.
+    fn dropSubsurface(self: *AppHost, surface: u32) ?*Win {
+        const kv = self.subsurfaces.fetchRemove(surface) orelse return null;
+        const sub = kv.value;
+        const win = sub.win;
+        c.gtk_overlay_remove_overlay(@ptrCast(win.overlay), sub.area);
+        sub.tex.deinit(self.allocator);
+        self.allocator.destroy(sub);
+        return win;
+    }
+
     fn onSubsurfaceGone(ctx: ?*anyopaque, surface: u32) void {
         const self = cast.userData(AppHost, ctx);
+        self.purgePendingUnder(surface);
         if (self.pending_subsurfaces.fetchRemove(surface)) |kv| {
             var pending = kv.value;
             pending.deinit(self.allocator);
             return;
         }
-        const sub = self.subsurfaces.get(surface) orelse return;
-        _ = self.subsurfaces.remove(surface);
-        const win = sub.win;
-        c.gtk_overlay_remove_overlay(@ptrCast(win.overlay), sub.area);
-        sub.tex.deinit(self.allocator);
-        self.allocator.destroy(sub);
-        self.updateShadowLayout(win);
+        if (self.dropSubsurface(surface)) |win| self.updateShadowLayout(win);
     }
 
     fn onPopupNew(ctx: ?*anyopaque, surface: u32, parent: u32, x: i32, y: i32) void {
@@ -1263,18 +1280,110 @@ pub const AppHost = struct {
         self.resolvePendingOverlays();
     }
 
+    /// Retire one materialized popup; unparenting reaches into
+    /// `win.overlay`, so the Win must still be alive.
+    fn dropPopup(self: *AppHost, surface: u32) void {
+        const kv = self.popups.fetchRemove(surface) orelse return;
+        const popup = kv.value;
+        c.gtk_overlay_remove_overlay(@ptrCast(popup.win.overlay), popup.area);
+        popup.tex.deinit(self.allocator);
+        self.allocator.destroy(popup);
+    }
+
+    /// Drop the popups and subsurfaces drawn into `win`, or all of them
+    /// when `win` is null. Each holds a raw `*Win` that would dangle
+    /// once the Win is freed, and their teardown unparents from
+    /// `win.overlay`, so this runs while the windows' widgets are still
+    /// alive. Removing invalidates the hash map's iterator, hence the
+    /// restart after each hit; the windows are going away, so no shadow
+    /// relayout follows.
+    fn releaseOverlays(self: *AppHost, win: ?*Win) void {
+        pops: while (true) {
+            var it = self.popups.iterator();
+            while (it.next()) |e| {
+                if (win) |w| if (e.value_ptr.*.win != w) continue;
+                self.dropPopup(e.key_ptr.*);
+                continue :pops;
+            }
+            break;
+        }
+        subs: while (true) {
+            var it = self.subsurfaces.iterator();
+            while (it.next()) |e| {
+                if (win) |w| if (e.value_ptr.*.win != w) continue;
+                _ = self.dropSubsurface(e.key_ptr.*);
+                continue :subs;
+            }
+            break;
+        }
+    }
+
+    /// Remove and free the first pending overlay in `map` latched onto
+    /// `parent`, returning its surface id.
+    ///
+    /// The match is on the PARENT link, never on the entry's own id:
+    /// clients recycle surface ids, so an entry left latched onto a
+    /// dead parent materializes into whichever surface inherits that id
+    /// next. A pending entry owns only a texture -- no widget exists
+    /// for it yet -- so this is pure map surgery.
+    fn takePendingUnder(
+        map: *std.AutoHashMapUnmanaged(u32, PendingOverlay),
+        alloc: std.mem.Allocator,
+        parent: u32,
+    ) ?u32 {
+        var it = map.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.parent != parent) continue;
+            const id = e.key_ptr.*;
+            var pending = e.value_ptr.*;
+            _ = map.remove(id);
+            pending.deinit(alloc);
+            return id;
+        }
+        return null;
+    }
+
+    /// Drop every pending overlay latched onto `surface`, then whatever
+    /// was latched onto those, to the end of the chain -- a popup and a
+    /// subsurface can each parent the other, so both maps are swept at
+    /// every level. Each entry is removed BEFORE the descent, so a
+    /// parent cycle terminates instead of spinning.
+    ///
+    /// The chain's depth is the client's to choose, so the descent is a
+    /// worklist and not recursion: a hundred thousand pending overlays
+    /// chained parent-to-child is a stack overflow otherwise. Capacity
+    /// is reserved up front and cannot be exceeded, because every id
+    /// pushed has already been removed from one of the two maps.
+    ///
+    /// EVERY surface-gone handler calls this first: nothing latched
+    /// onto a surface that is going away can ever place, and an orphan
+    /// left behind binds to whichever surface inherits the id next.
+    fn purgePendingUnder(self: *AppHost, surface: u32) void {
+        var work: std.ArrayList(u32) = .empty;
+        defer work.deinit(self.allocator);
+        work.ensureTotalCapacity(
+            self.allocator,
+            self.pending_popups.count() + self.pending_subsurfaces.count(),
+        ) catch {};
+        var cur = surface;
+        while (true) {
+            while (takePendingUnder(&self.pending_popups, self.allocator, cur)) |id|
+                work.append(self.allocator, id) catch {};
+            while (takePendingUnder(&self.pending_subsurfaces, self.allocator, cur)) |id|
+                work.append(self.allocator, id) catch {};
+            cur = work.pop() orelse break;
+        }
+    }
+
     fn onPopupGone(ctx: ?*anyopaque, surface: u32) void {
         const self = cast.userData(AppHost, ctx);
+        self.purgePendingUnder(surface);
         if (self.pending_popups.fetchRemove(surface)) |kv| {
             var pending = kv.value;
             pending.deinit(self.allocator);
             return;
         }
-        const popup = self.popups.get(surface) orelse return;
-        _ = self.popups.remove(surface);
-        c.gtk_overlay_remove_overlay(@ptrCast(popup.win.overlay), popup.area);
-        popup.tex.deinit(self.allocator);
-        self.allocator.destroy(popup);
+        self.dropPopup(surface);
     }
 
     fn onPopupPtrEnter(_: ?*c.GtkEventControllerMotion, x: f64, y: f64, user: ?*anyopaque) callconv(.c) void {
@@ -1385,6 +1494,14 @@ pub const AppHost = struct {
         }
         _ = self.foreign_parents.remove(surface);
         _ = self.pending_modals.remove(surface);
+        // Same recycling hazard, one map further on: a window-geometry
+        // rect left keyed to a dead surface would offset the popups of
+        // whichever window inherits the id, and a child role still
+        // latched onto it would materialize into that window. Both are
+        // purged here, ABOVE the window lookup, because a toplevel that
+        // died before its first frame has no Win and still left these.
+        _ = self.geos.remove(surface);
+        self.purgePendingUnder(surface);
         // Release every child of this window before it is destroyed —
         // a dead GtkWindow must not stay anyone's transient parent,
         // here or in another connection's host.
@@ -1393,6 +1510,11 @@ pub const AppHost = struct {
         if (self.foreign_changed) |f| f(self.foreign_ctx, ref.conn, ref.surface, true);
         const win = self.windows.get(surface) orelse return;
         _ = self.windows.remove(surface);
+        // Overlay children outlive their host window otherwise: their
+        // `.win` back-pointer would dangle and the next popup or
+        // subsurface callback would read a freed Win. Sweep them while
+        // the overlay they are parented to is still alive.
+        self.releaseOverlays(win);
         if (win.embedded) {
             // Pull the overlay out of the pane's box before the
             // (childless) window teardown, and tell the pane its
@@ -1406,6 +1528,7 @@ pub const AppHost = struct {
         if (win.app_id) |aid| self.allocator.free(aid);
         if (win.icon_tex) |tex| c.g_object_unref(tex);
         win.opaque_resize.cancel();
+        win.severIm();
         _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
         c.gtk_window_destroy(win.window);
         self.allocator.destroy(win);
@@ -2450,3 +2573,69 @@ pub const AppHost = struct {
         return 1; // handled; wait for the app
     }
 };
+
+// Surface-id recycling is the case a reader gets wrong here, so the
+// parent-link match is pinned: a pending overlay belongs to the surface
+// it is LATCHED ONTO, never to the one whose id it happens to carry.
+test "takePendingUnder matches the parent link, not the entry's own id" {
+    const gpa = std.testing.allocator;
+    var map: std.AutoHashMapUnmanaged(u32, AppHost.PendingOverlay) = .empty;
+    defer map.deinit(gpa);
+    try map.put(gpa, 10, .{ .parent = 7, .x = 0, .y = 0 });
+    try map.put(gpa, 11, .{ .parent = 8, .x = 0, .y = 0 });
+    try map.put(gpa, 12, .{ .parent = 7, .x = 0, .y = 0 });
+    // A latched texture: the testing allocator reports a leak if the
+    // sweep drops an entry without freeing what it owns.
+    map.getPtr(10).?.tex.set(gpa, 1, 1, 0, &[_]u8{ 0, 0, 0, 0 });
+
+    var taken: u32 = 0;
+    while (AppHost.takePendingUnder(&map, gpa, 7)) |id| {
+        try std.testing.expect(id == 10 or id == 12);
+        taken += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 2), taken);
+    try std.testing.expect(map.count() == 1);
+    try std.testing.expect(map.get(11) != null);
+
+    // Id 10 has been recycled as some unrelated surface: sweeping for
+    // it must not take the entry that merely sits next to it.
+    try std.testing.expect(AppHost.takePendingUnder(&map, gpa, 10) == null);
+    try std.testing.expect(map.count() == 1);
+}
+
+// The parent chain is client-controlled, so its depth is an attack
+// surface and the descent must not be recursion. Ten thousand links is
+// what the sweep can walk in well under a second here; the bound the
+// fix removes is the stack, which no depth this test can afford would
+// prove on its own.
+test "purgePendingUnder walks an arbitrarily deep chain without recursing" {
+    const gpa = std.testing.allocator;
+    // purgePendingUnder reads exactly three fields; the rest of an
+    // AppHost is GTK state a unit test has no way to build, and the
+    // shell is heap-allocated rather than a stack local because an
+    // AppHost carries a whole Compositor.
+    const host = try gpa.create(AppHost);
+    defer gpa.destroy(host);
+    host.allocator = gpa;
+    host.pending_popups = .empty;
+    host.pending_subsurfaces = .empty;
+    defer host.pending_popups.deinit(gpa);
+    defer host.pending_subsurfaces.deinit(gpa);
+
+    const depth: u32 = 10_000;
+    var i: u32 = 0;
+    while (i < depth) : (i += 1) {
+        // Alternate the maps, so the sweep of each level has to look in
+        // both -- a popup and a subsurface can each parent the other.
+        const map = if (i % 2 == 0) &host.pending_popups else &host.pending_subsurfaces;
+        try map.put(gpa, i + 1, .{ .parent = i, .x = 0, .y = 0 });
+    }
+    // One entry latched onto a surface that is NOT in the chain must
+    // survive; the sweep follows parent links, it does not clear.
+    try host.pending_popups.put(gpa, depth + 2, .{ .parent = depth + 1000, .x = 0, .y = 0 });
+
+    host.purgePendingUnder(0);
+    try std.testing.expectEqual(@as(usize, 1), host.pending_popups.count());
+    try std.testing.expectEqual(@as(usize, 0), host.pending_subsurfaces.count());
+    try std.testing.expect(host.pending_popups.get(depth + 2) != null);
+}

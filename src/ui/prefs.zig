@@ -28,6 +28,112 @@ const lsp_proc = @import("../lsp/proc.zig");
 const WindowOpaque = anyopaque;
 const PREFS_QDATA = "sketerm-preferences-context";
 
+// ── Pango markup ───────────────────────────────────────────────
+//
+// libadwaita's own templates set `use-markup=True` on the group title
+// and description labels (adw-preferences-group.ui, hardcoded) and bind
+// it to AdwPreferencesRow:use-markup, default TRUE, on the row title and
+// subtitle labels (adw-action-row.ui, which AdwExpanderRow's header
+// inherits). So every one of those setters PARSES its string: a value
+// carrying `<` or `&` fails the parse and GTK leaves the whole label
+// unset -- the label does not degrade, it disappears. Anything
+// config-derived reaching one of them goes through `markupEscape`.
+//
+// Entry-row text (`gtk_editable_set_text`) is NOT markup and must never
+// be escaped: the user would see `&amp;` and it would be saved back.
+
+/// Shown in place of a label whose escaped form does not fit its
+/// buffer. Escaping expands by up to 5x (`&quot;`), so a caller cannot
+/// size a buffer from the source length alone.
+const MARKUP_TOO_LONG: [:0]const u8 = "(too long to display)";
+
+/// Escape `s` for a Pango-markup label into `buf`, NUL-terminated.
+///
+/// Overflow is `error.TooLong` rather than truncation: half an entity
+/// or a split codepoint fails the parse and blanks the label, which is
+/// the failure this exists to prevent, and every caller has a visible
+/// placeholder to fall back to. A byte that cannot start a valid UTF-8
+/// sequence becomes U+FFFD, because passing it through fails the parse
+/// just as surely.
+fn markupEscape(buf: []u8, s: []const u8) error{TooLong}![:0]const u8 {
+    const replacement = "\u{FFFD}";
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const entity: ?[]const u8 = switch (s[i]) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            else => null,
+        };
+        var advance: usize = 1;
+        const chunk = entity orelse blk: {
+            const len = std.unicode.utf8ByteSequenceLength(s[i]) catch break :blk replacement;
+            if (i + len > s.len) break :blk replacement;
+            const seq = s[i..][0..len];
+            if (!std.unicode.utf8ValidateSlice(seq)) break :blk replacement;
+            advance = len;
+            break :blk seq;
+        };
+        if (n + chunk.len + 1 > buf.len) return error.TooLong;
+        @memcpy(buf[n..][0..chunk.len], chunk);
+        n += chunk.len;
+        i += advance;
+    }
+    if (n + 1 > buf.len) return error.TooLong;
+    buf[n] = 0;
+    return buf[0..n :0];
+}
+
+test "markupEscape escapes only what a markup label needs" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("a &amp; b", try markupEscape(&buf, "a & b"));
+    try std.testing.expectEqualStrings("&lt;[a-z]+&gt;", try markupEscape(&buf, "<[a-z]+>"));
+    try std.testing.expectEqualStrings("&quot;q&quot;", try markupEscape(&buf, "\"q\""));
+    try std.testing.expectEqualStrings("it&#39;s", try markupEscape(&buf, "it's"));
+    // The common case must come back byte for byte, or a label that
+    // never had an ampersand starts reading `&amp;`.
+    try std.testing.expectEqualStrings("Nerd Font Mono", try markupEscape(&buf, "Nerd Font Mono"));
+    try std.testing.expectEqualStrings("", try markupEscape(&buf, ""));
+    try std.testing.expectError(error.TooLong, markupEscape(buf[0..0], ""));
+}
+
+// A label that does not fit must FAIL, never come back short: the
+// buffers here are sized for ordinary text while escaping expands by
+// up to 5x, and a caller that treated a truncated label as good would
+// silently show a profile name that is not the profile's name.
+test "markupEscape refuses to truncate" {
+    // Every source byte becomes six, so eight bytes of buffer cannot
+    // hold even one entity plus its NUL.
+    var eight: [8]u8 = undefined;
+    try std.testing.expectError(error.TooLong, markupEscape(&eight, "ab\u{2192}&x"));
+    // ...and a multi-byte codepoint is never split across the end.
+    var five: [5]u8 = undefined;
+    try std.testing.expectError(error.TooLong, markupEscape(&five, "ab\u{2192}c"));
+    // Exactly filling the buffer, NUL included, still succeeds.
+    var six: [6]u8 = undefined;
+    try std.testing.expectEqualStrings("ab\u{2192}", try markupEscape(&six, "ab\u{2192}"));
+}
+
+// Invalid UTF-8 fails the Pango parse exactly like an unescaped `&`
+// does, so it is substituted rather than passed through: a config file
+// is bytes and nothing guarantees a profile name is valid UTF-8.
+test "markupEscape substitutes invalid UTF-8" {
+    var buf: [64]u8 = undefined;
+    // A lone continuation byte has no valid length at all.
+    try std.testing.expectEqualStrings("a\u{FFFD}b", try markupEscape(&buf, "a\x80b"));
+    // A valid lead byte with a bad continuation: only the lead is
+    // replaced, so the following ASCII is still seen.
+    try std.testing.expectEqualStrings("\u{FFFD}(b", try markupEscape(&buf, "\xE2(b"));
+    // A sequence truncated by the end of the string: one substitution
+    // per byte, since each is separately unusable.
+    try std.testing.expectEqualStrings("a\u{FFFD}\u{FFFD}", try markupEscape(&buf, "a\xE2\x82"));
+    // Valid UTF-8 still passes through byte for byte.
+    try std.testing.expectEqualStrings("\u{2192}\u{1F600}", try markupEscape(&buf, "\u{2192}\u{1F600}"));
+}
+
 /// Apply callback: invoked whenever a row mutates. Receives the
 /// Window pointer the dialog was opened against and a snapshot of the
 /// new Config. The Window is responsible for pushing values into its
@@ -422,7 +528,10 @@ fn addDeleteProfileRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_action_row_new();
     var title_buf: [160:0]u8 = undefined;
     const t = std.fmt.bufPrintZ(&title_buf, "Delete profile “{s}”", .{ctx.edit_name}) catch "Delete this profile";
-    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), t.ptr);
+    // A profile name is the user's, and `addNewProfileRow` rejects only
+    // the section-header characters -- `&` and `<` get through.
+    var t_z: [512]u8 = undefined;
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), (markupEscape(&t_z, t) catch MARKUP_TOO_LONG).ptr);
     c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), "Panes using it fall back to the Default settings.");
     const btn = c.gtk_button_new_with_label("Delete");
     c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
@@ -872,8 +981,9 @@ fn addFontPathRow(group: *c.AdwPreferencesGroup, ctx: *Ctx) void {
     const row = c.adw_action_row_new();
     c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), "Font file");
     const sub = if (ctx.edit.font_path) |fp| fp else "(default search path)";
-    var z = cast.sliceToZ(512, sub);
-    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), &z);
+    // A filesystem path is the user's, and `&` is legal in one.
+    var z: [1024]u8 = undefined;
+    c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), (markupEscape(&z, sub) catch MARKUP_TOO_LONG).ptr);
     const btn = c.gtk_button_new_with_label("Choose…");
     c.gtk_widget_set_valign(btn, c.GTK_ALIGN_CENTER);
     c.adw_action_row_add_suffix(@ptrCast(@alignCast(row)), btn);
@@ -1835,15 +1945,18 @@ fn buildLspGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     for (list) |srv| {
         const name = ctx.dupe(srv.name) catch continue;
         const sub = c.adw_preferences_group_new();
-        var title_z = cast.sliceToZ(64, name);
-        c.adw_preferences_group_set_title(@ptrCast(@alignCast(sub)), &title_z);
+        // Both halves are config-derived: the name is the `[lsp.<name>]`
+        // section, the description quotes the server's language list.
+        var title_z: [256]u8 = undefined;
+        c.adw_preferences_group_set_title(@ptrCast(@alignCast(sub)), (markupEscape(&title_z, name) catch MARKUP_TOO_LONG).ptr);
         var desc: [256:0]u8 = undefined;
         const installed = lsp_proc.onPath(ctx.allocator, srv.command);
         const d = std.fmt.bufPrintZ(&desc, "{s}  —  {s}", .{
             if (srv.languages.len > 0) srv.languages else "no languages",
             if (installed) "installed" else "not found on PATH",
         }) catch "";
-        c.adw_preferences_group_set_description(@ptrCast(@alignCast(sub)), d.ptr);
+        var desc_z: [512]u8 = undefined;
+        c.adw_preferences_group_set_description(@ptrCast(@alignCast(sub)), (markupEscape(&desc_z, d) catch MARKUP_TOO_LONG).ptr);
         addLspEnableRow(@ptrCast(@alignCast(sub)), ctx, name, srv.enabled);
         addLspEntryRow(@ptrCast(@alignCast(sub)), ctx, name, .command, "Command", srv.command);
         addLspEntryRow(@ptrCast(@alignCast(sub)), ctx, name, .args, "Arguments", srv.args);
@@ -2242,7 +2355,9 @@ fn keybindsPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     const ed_group = c.adw_preferences_group_new();
     c.adw_preferences_group_set_title(@ptrCast(@alignCast(ed_group)), "Editor Commands");
     c.adw_preferences_group_set_description(@ptrCast(@alignCast(ed_group)), "Chords active only while the editor canvas has focus. " ++
-        "Stored as editor_keybind.<command> lines; they never shadow a terminal key.");
+        // The description is Pango markup: a bare <command> is an unclosed
+        // tag, and a parse failure drops the WHOLE description silently.
+        "Stored as editor_keybind.&lt;command&gt; lines; they never shadow a terminal key.");
     c.adw_preferences_page_add(page, @ptrCast(@alignCast(ed_group)));
 
     inline for (@typeInfo(ecmd.Command).@"enum".fields) |field| {
@@ -2253,15 +2368,15 @@ fn keybindsPage(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
 
 fn addKeybindRow(group: *c.AdwPreferencesGroup, ctx: *Ctx, which: @FieldType(KeybindRowCtx, "which")) void {
     const row = c.adw_action_row_new();
-    var label_buf: [80:0]u8 = undefined;
     const lbl = switch (which) {
         .act => |a| input_mod.actionLabel(a),
         .ed => |cmd| ecmd.label(cmd),
     };
-    const lbl_len = @min(lbl.len, label_buf.len - 1);
-    @memcpy(label_buf[0..lbl_len], lbl[0..lbl_len]);
-    label_buf[lbl_len] = 0;
-    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), &label_buf);
+    // No label carries a markup character today, but the two tables are
+    // extended by hand and the row title is a markup label: an added
+    // "Find & replace" would silently render as nothing at all.
+    var label_buf: [256]u8 = undefined;
+    c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), (markupEscape(&label_buf, lbl) catch MARKUP_TOO_LONG).ptr);
 
     const button = c.gtk_button_new();
     c.gtk_widget_set_valign(button, c.GTK_ALIGN_CENTER);
@@ -2657,8 +2772,9 @@ fn buildSymbolMapGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     for (ctx.cfg.symbol_maps.items) |sm| {
         const name = ctx.dupe(sm.name) catch continue;
         const exp = c.adw_expander_row_new();
-        var title_z = cast.sliceToZ(96, name);
-        c.adw_preferences_row_set_title(@ptrCast(@alignCast(exp)), &title_z);
+        // The map name and the font family are both the user's text.
+        var title_z: [384]u8 = undefined;
+        c.adw_preferences_row_set_title(@ptrCast(@alignCast(exp)), (markupEscape(&title_z, name) catch MARKUP_TOO_LONG).ptr);
         var range_buf: [32]u8 = undefined;
         const range = config_mod.formatCodepointRange(&range_buf, sm.lo, sm.hi);
         var sub_buf: [192:0]u8 = undefined;
@@ -2666,7 +2782,8 @@ fn buildSymbolMapGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
             range,
             if (sm.family.len > 0) sm.family else "(no family \xe2\x80\x94 not saved)",
         }) catch "";
-        c.adw_expander_row_set_subtitle(@ptrCast(@alignCast(exp)), sub.ptr);
+        var sub_z: [512]u8 = undefined;
+        c.adw_expander_row_set_subtitle(@ptrCast(@alignCast(exp)), (markupEscape(&sub_z, sub) catch MARKUP_TOO_LONG).ptr);
 
         addSymbolFieldRow(@ptrCast(@alignCast(exp)), ctx, name, .range, "Range", range);
         addSymbolFieldRow(@ptrCast(@alignCast(exp)), ctx, name, .family, "Font family", sm.family);
@@ -2792,14 +2909,17 @@ fn buildHintGroup(page: *c.AdwPreferencesPage, ctx: *Ctx) void {
     for (ctx.cfg.hint_rules.items) |hr| {
         const name = ctx.dupe(hr.name) catch continue;
         const exp = c.adw_expander_row_new();
-        var title_z = cast.sliceToZ(96, name);
-        c.adw_preferences_row_set_title(@ptrCast(@alignCast(exp)), &title_z);
+        var title_z: [384]u8 = undefined;
+        c.adw_preferences_row_set_title(@ptrCast(@alignCast(exp)), (markupEscape(&title_z, name) catch MARKUP_TOO_LONG).ptr);
         var sub_buf: [256:0]u8 = undefined;
         const sub = std.fmt.bufPrintZ(&sub_buf, "{s}  \xe2\x86\x92  {s}", .{
             if (hr.pattern.len > 0) hr.pattern else "(no pattern \xe2\x80\x94 matches nothing)",
             @tagName(hr.action),
         }) catch "";
-        c.adw_expander_row_set_subtitle(@ptrCast(@alignCast(exp)), sub.ptr);
+        // The subtitle quotes a POSIX extended regex, which is exactly
+        // where a user writes `<`, `>` and `&`.
+        var sub_z: [512]u8 = undefined;
+        c.adw_expander_row_set_subtitle(@ptrCast(@alignCast(exp)), (markupEscape(&sub_z, sub) catch MARKUP_TOO_LONG).ptr);
 
         addHintFieldRow(@ptrCast(@alignCast(exp)), ctx, name, .regex, "Pattern (POSIX extended regex)", hr.pattern);
         addHintActionRow(@ptrCast(@alignCast(exp)), ctx, name, hr.action);

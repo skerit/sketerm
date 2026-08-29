@@ -81,6 +81,26 @@ pub fn clearDrag() void {
     clearDragged();
 }
 
+/// Our own ref on the in-flight `gdk_drag_begin` result (GDK keeps a
+/// separate one for the duration of the operation). Released by whichever
+/// of ::cancel / ::dnd-finished runs; both can fire for a single drag, so
+/// the release matches on identity and nulls the slot, making any later
+/// callback a no-op instead of a second unref.
+var gdk_drag: ?*c.GdkDrag = null;
+
+fn clearGdkDrag() void {
+    if (gdk_drag) |d| {
+        gdk_drag = null;
+        c.g_object_unref(d);
+    }
+}
+
+fn releaseGdkDrag(drag: ?*anyopaque) void {
+    const held = gdk_drag orelse return;
+    if (@as(?*anyopaque, @ptrCast(held)) != drag) return;
+    clearGdkDrag();
+}
+
 /// A GDK drag carrying a page ended without a drop target: hand the page
 /// to the detach callback (drag-out spawns a window for it). Answers
 /// whether the cancel was consumed.
@@ -1185,11 +1205,16 @@ fn beginExternalDrag(self: *TabBar, controller: *c.GtkEventController, tab: *Tab
     const surface = c.gtk_native_get_surface(native) orelse return;
     const device = c.gtk_event_controller_get_current_event_device(controller) orelse return;
     publishDrag(self.view, tab.page, self.detach_ctx, self.on_detach);
+    clearGdkDrag();
+    // gdk_drag_begin takes the provider as transfer-none (it refs its own),
+    // so the constructor's ref is ours to drop on every path out of here.
     const content = c.gdk_content_provider_new_typed(c.G_TYPE_INT, @as(c_int, 1));
+    defer if (content) |p| c.g_object_unref(p);
     const drag = c.gdk_drag_begin(surface, device, content, c.GDK_ACTION_MOVE, -hot_x, -hot_y) orelse {
         clearDragged();
         return;
     };
+    gdk_drag = drag;
     const icon = c.gtk_drag_icon_get_for_drag(drag);
     const paintable = c.gtk_widget_paintable_new(tab.tab_box);
     const img = c.gtk_image_new_from_paintable(paintable);
@@ -1201,11 +1226,18 @@ fn beginExternalDrag(self: *TabBar, controller: *c.GtkEventController, tab: *Tab
 
 /// GDK drag ended with no drop target: spawn a new window for the tab
 /// (drag-out), the create-window half of libadwaita's behaviour.
-fn onGdkDragCancel(_: ?*anyopaque, reason: c_int, _: ?*anyopaque) callconv(.c) c.gboolean {
-    return @intFromBool(dragCancelled(reason));
+///
+/// `GdkDrag::cancel` is a VOID signal, so `dragCancelled`'s "consumed"
+/// answer has nowhere to go here and the detach it performs is the whole
+/// effect. Only `GtkDragSource::drag-cancel` -- the sidebar's gesture --
+/// declares a gboolean return, and that one still uses it.
+fn onGdkDragCancel(drag: ?*anyopaque, reason: c_int, _: ?*anyopaque) callconv(.c) void {
+    _ = dragCancelled(reason);
+    releaseGdkDrag(drag);
 }
 
-fn onGdkDragFinished(_: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+fn onGdkDragFinished(drag: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+    releaseGdkDrag(drag);
     clearDragged();
 }
 

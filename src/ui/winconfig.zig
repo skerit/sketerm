@@ -785,6 +785,26 @@ pub fn openPrefs(self: *Window) void {
 }
 
 /// How an apply treats the file on disk.
+/// The one list of mouse/copy/link flags a pane copies from ITS window's
+/// config, on the input Ctx and on the Pane. Applied when a pane is
+/// made, when the config changes, and when a tab drag moves the pane to
+/// another window (whose config can differ).
+pub fn applyPaneMouseFlags(self: *Window, p: *Pane) void {
+    if (p.input_ctx) |ictx| {
+        ictx.smart_copy = self.config.smart_copy;
+        ictx.clear_select_on_copy = self.config.clear_select_on_copy;
+        ictx.mouse_autohide = self.config.mouse_autohide;
+    }
+    p.copy_on_selection = self.config.copy_on_selection;
+    p.clear_select_on_copy = self.config.clear_select_on_copy;
+    p.disable_mouse_paste = self.config.disable_mouse_paste;
+    p.disable_mousewheel_zoom = self.config.disable_mousewheel_zoom;
+    p.link_single_click = self.config.link_single_click;
+    p.mouse_autohide = self.config.mouse_autohide;
+    p.middle_click_action = self.config.mouse_middle_click;
+    p.right_click_action = self.config.mouse_right_click;
+}
+
 pub const ApplyOpts = struct {
     /// Write the resulting config back to config.conf. True for edits
     /// made IN the app (prefs, shader sliders) — they have nowhere
@@ -922,11 +942,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         applyScrollbackCapacity(screen, s.scrollback);
         screen.scroll_on_output = self.config.scroll_on_output;
         screen.word_chars = self.config.word_chars;
-        if (p.input_ctx) |ictx| {
-            ictx.smart_copy = self.config.smart_copy;
-            ictx.clear_select_on_copy = self.config.clear_select_on_copy;
-            ictx.mouse_autohide = self.config.mouse_autohide;
-        }
+        applyPaneMouseFlags(self, p);
         // These slices pointed into the old config arena (freed
         // when this function returns) — re-point them at the new
         // config's copies.
@@ -959,15 +975,6 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         }
         p.refreshShaderBinding();
         p.updateShaderTick();
-        // Mouse / link / autohide flags on the Pane itself.
-        p.copy_on_selection = self.config.copy_on_selection;
-        p.clear_select_on_copy = self.config.clear_select_on_copy;
-        p.disable_mouse_paste = self.config.disable_mouse_paste;
-        p.disable_mousewheel_zoom = self.config.disable_mousewheel_zoom;
-        p.link_single_click = self.config.link_single_click;
-        p.mouse_autohide = self.config.mouse_autohide;
-        p.middle_click_action = self.config.mouse_middle_click;
-        p.right_click_action = self.config.mouse_right_click;
         // Per-pane titlebar visibility (never in the files or web
         // identities -- their faces' own bars already name the pane).
         p.setTitlebarVisible(self.config.show_titlebar and !Window.filesIdentity() and !Window.webIdentity());
