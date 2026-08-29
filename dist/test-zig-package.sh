@@ -38,6 +38,7 @@ vendor_entries=(
     cimport_core.h
     cimport_root.h
     msf_gif.h
+    pkgconfig
     stb_image_impl.c
     stb_image_write.h
     stb_image.h

@@ -1,6 +1,9 @@
 zig-out/
 zig-cache/
 .zig-cache/
+# dist/test-zig-package.sh's working dir; that script also asserts the
+# fetched archive never contains it
+zig-pkg/
 *.o
 *.so
 *.a

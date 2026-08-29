@@ -18,6 +18,7 @@
         "vendor/cimport_core.h",
         "vendor/cimport_root.h",
         "vendor/msf_gif.h",
+        "vendor/pkgconfig",
         "vendor/stb_image_impl.c",
         "vendor/stb_image_write.h",
         "vendor/stb_image.h",
