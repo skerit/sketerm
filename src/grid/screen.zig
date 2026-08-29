@@ -1001,7 +1001,17 @@ pub const Screen = struct {
         }
     }
 
-    /// Append an extending codepoint to the cluster at (row, col).
+    /// Ceiling on the codepoints one cell's grapheme cluster may hold.
+    /// Unicode's Stream-Safe Text Format (UAX #15) caps a combining
+    /// sequence at 30 non-starters, so no legitimate text reaches this;
+    /// unbounded, `printf 'a'; while :; do printf '\xcc\x81'; done`
+    /// grows one cell's list until the daemon that owns every session
+    /// is out of memory. It also keeps the length inside the `u16` the
+    /// mux snapshot encodes it as.
+    pub const CLUSTER_CP_MAX: usize = 32;
+
+    /// Append an extending codepoint to the cluster at (row, col),
+    /// dropping it once the cluster is `CLUSTER_CP_MAX` long.
     /// Caller has already verified it's an extending codepoint and
     /// that a base glyph exists at that cell.
     fn appendCluster(self: *Screen, row: u16, col: u16, cp: u32) void {
@@ -1011,6 +1021,7 @@ pub const Screen = struct {
             return;
         };
         if (!gop.found_existing) gop.value_ptr.* = .empty;
+        if (gop.value_ptr.items.len >= CLUSTER_CP_MAX) return;
         gop.value_ptr.append(self.allocator, cp) catch |err| {
             std.debug.print("sketerm: appendCluster append OOM: {s}\n", .{@errorName(err)});
         };
@@ -1369,6 +1380,20 @@ pub const Screen = struct {
 
         // ── Commit ───────────────────────────────────────────────
         self.viewport_epoch +%= 1;
+        // Re-width the existing ring FIRST: the rows the main-buffer
+        // commit below pushes onto it are already at `new_cols`, and
+        // this paired loop demands the exact ring length it staged
+        // against. `restage_scrollback` implies `use_alt`, which implies
+        // `!reflow_main`, so nothing below this can still fail.
+        if (staged_sb.len > 0) {
+            for (self.scrollback.items, staged_sb) |*ln, cells| {
+                if (ln.cells.len > 0) self.allocator.free(ln.cells);
+                ln.cells = cells;
+                ln.dirty = true;
+            }
+            self.allocator.free(staged_sb);
+            staged_sb = &.{};
+        }
         if (reflow_main) {
             self.reflowMain(new_cols, new_rows) catch |err| {
                 self.viewport_epoch -%= 1;
@@ -1392,7 +1417,15 @@ pub const Screen = struct {
                 self.row -|= drop;
                 self.saved_row -|= drop;
             }
-            staged_active.?.commit(self, &self.active, !self.use_alt);
+            // `self.active` is ALWAYS the main buffer: `toggleAltScreen`
+            // flips `use_alt` and reads through `buf()`, it never swaps
+            // this slot. So rows shifted off its top belong in scrollback
+            // whether or not an alt-screen app happens to be up. Gating
+            // the push on `!use_alt` freed the user's shell output every
+            // time a resize landed while less/vim/htop was running. The
+            // alt commit below still passes false: the alt screen has no
+            // scrollback.
+            staged_active.?.commit(self, &self.active, true);
             staged_active = null;
         }
         if (staged_alt) |*staged| {
@@ -1400,15 +1433,6 @@ pub const Screen = struct {
             staged.commit(self, &alt_mut, false);
             self.alt = alt_mut;
             staged_alt = null;
-        }
-        if (staged_sb.len > 0) {
-            for (self.scrollback.items, staged_sb) |*ln, cells| {
-                if (ln.cells.len > 0) self.allocator.free(ln.cells);
-                ln.cells = cells;
-                ln.dirty = true;
-            }
-            self.allocator.free(staged_sb);
-            staged_sb = &.{};
         }
 
         self.resizeTabStops(new_cols);
@@ -2370,9 +2394,25 @@ pub const Screen = struct {
                             if (i + cp_len <= run.len) {
                                 // All bytes present — validate and
                                 // decode in one shot, no decoder state.
-                                const cp = decodeUtf8Lookahead(run.bytes[i .. i + cp_len], cp_len);
-                                if (cp) |c| self.printCp(c);
-                                i += cp_len;
+                                if (decodeUtf8Lookahead(run.bytes[i .. i + cp_len], cp_len)) |c| {
+                                    self.printCp(c);
+                                    i += cp_len;
+                                } else {
+                                    // Malformed continuation: resync on
+                                    // the NEXT byte (Unicode's maximal
+                                    // subpart rule), never past the whole
+                                    // would-be sequence. `Decoder.feed`
+                                    // resets and re-feeds the offending
+                                    // byte as a leading one, and this path
+                                    // has to agree with it: skipping
+                                    // `cp_len` here made latin-1 bytes
+                                    // ("\xE9abc") eat the two bytes after
+                                    // them, so the same input rendered
+                                    // differently depending on where the
+                                    // 64-byte run boundary happened to
+                                    // fall.
+                                    i += 1;
+                                }
                             } else {
                                 // Incomplete at run end — let the
                                 // stateful decoder hold the partial
@@ -2490,12 +2530,23 @@ pub const Screen = struct {
         return .{ .state = state, .percent = percent };
     }
 
+    /// Ceiling on the `;`-separated items one OSC 4 / OSC 21 payload may
+    /// act on. The OSC body is bounded only by the parser's 16 MiB
+    /// `osc_max`, and every `?` item answers, so an unbounded loop is a
+    /// ~7x write amplification into the daemon's poll loop. A client can
+    /// address the 256 palette slots plus the handful of named colours
+    /// and has nothing left to say, so anything past this is redundant.
+    const OSC_COLOR_MAX_ITEMS: usize = 264;
+
     fn handleOsc4(self: *Screen, rest: []const u8) void {
         // xterm form allows MULTIPLE `idx;spec` pairs in one OSC 4
         // (pywal & friends set all 16 ANSI colors in one sequence).
+        var pairs: usize = 0;
         var it = std.mem.splitScalar(u8, rest, ';');
         while (it.next()) |idx_str| {
             const data = it.next() orelse return;
+            if (pairs >= OSC_COLOR_MAX_ITEMS) return;
+            pairs += 1;
             const idx = std.fmt.parseInt(u8, idx_str, 10) catch return;
             if (data.len == 1 and data[0] == '?') {
                 const rgb = self.palette[idx];
@@ -3053,14 +3104,19 @@ pub const Screen = struct {
 
     /// OSC 21 — kitty's unified color query/set. Payload is a
     /// `;`-separated list of `key=spec` (set) or `key=?` (query)
-    /// items. Queries are answered in a single `OSC 21 ; … ST` reply
-    /// echoing each queried key with its current rgb value.
+    /// items, capped at `OSC_COLOR_MAX_ITEMS`. Queries are answered in
+    /// a single `OSC 21 ; … ST` reply echoing each queried key with its
+    /// current rgb value, so an uncapped payload grows one heap buffer
+    /// to several times the 16 MiB body rather than flooding the PTY.
     fn handleOsc21(self: *Screen, rest: []const u8) void {
         var resp: std.ArrayList(u8) = .empty;
         defer resp.deinit(self.allocator);
         var it = std.mem.splitScalar(u8, rest, ';');
         var dirty_set = false;
+        var items: usize = 0;
         while (it.next()) |item| {
+            if (items >= OSC_COLOR_MAX_ITEMS) break;
+            items += 1;
             const eq = std.mem.indexOfScalar(u8, item, '=') orelse continue;
             const name = item[0..eq];
             const spec = item[eq + 1 ..];
@@ -3354,13 +3410,28 @@ pub const Screen = struct {
         }
     }
 
+    /// Ceiling on the capabilities answered from one XTGETTCAP. The
+    /// DCS body is bounded only by the parser's 16 MiB `osc_max`, so an
+    /// unbounded loop turns `DCS + q` plus 16 MiB of `;` into ~16.7M
+    /// replies and allocations inside the daemon's single-threaded poll
+    /// loop. Real clients (tmux, neovim, ncurses) query a handful, so
+    /// this is an order of magnitude above anything legitimate.
+    const XTGETTCAP_MAX_CAPS: usize = 64;
+
     /// XTGETTCAP — answer terminfo capability queries. The body is a
     /// `;`-separated list of hex-encoded capability names. We reply
     /// per-cap: `DCS 1 + r <hex_cap>=<hex_value> ST` for known caps,
-    /// `DCS 0 + r <hex_cap> ST` for unknown.
+    /// `DCS 0 + r <hex_cap> ST` for unknown. Empty fields (a stray or
+    /// trailing `;`) name no capability and are skipped rather than
+    /// answered; replying to them is the amplification the cap exists
+    /// to bound.
     fn handleXtgettcap(self: *Screen, body: []const u8) void {
+        var answered: usize = 0;
         var it = std.mem.splitScalar(u8, body, ';');
         while (it.next()) |hex_cap| {
+            if (hex_cap.len == 0) continue;
+            if (answered >= XTGETTCAP_MAX_CAPS) return;
+            answered += 1;
             self.handleXtgettcapOne(hex_cap);
         }
     }
@@ -4781,13 +4852,17 @@ fn expectSuccessfulReflow(screen: *Screen, scenario: ReflowFailureScenario, old_
             // clusters describe, so they go wholesale.
             try std.testing.expectEqual(@as(usize, 0), screen.clusters.count());
             try std.testing.expectEqual(old_next_line_id, screen.next_line_id);
-            // Main buffer: top row dropped (no scrollback push while the
-            // alt screen is up), survivors truncated to 3 columns.
+            // Main buffer: top row shifted off, survivors truncated to 3
+            // columns. The alt screen being up does not make the main
+            // buffer's rows disposable, so "ABCDEF" lands in scrollback
+            // (evicting the oldest entry) instead of being freed.
             try std.testing.expectEqual(@as(u32, 'G'), screen.active[0].cells[0].rune);
             try std.testing.expectEqual(@as(u32, 'I'), screen.active[0].cells[2].rune);
             try std.testing.expectEqual(@as(u32, 'M'), screen.active[1].cells[0].rune);
-            // Scrollback followed the new width.
-            try expectScrollbackRunes(screen, "bc");
+            // Scrollback followed the new width, then took the dropped row.
+            try expectScrollbackRunes(screen, "cA");
+            try std.testing.expectEqual(@as(u32, 'C'), screen.scrollbackLine(1).cells[2].rune);
+            for (screen.scrollback.items) |ln| try std.testing.expectEqual(@as(usize, 3), ln.cells.len);
             // Alt buffer: same truncate/pad, top row dropped.
             const alt = screen.alt.?;
             try std.testing.expectEqual(@as(usize, 2), alt.len);
@@ -5494,6 +5569,28 @@ test "alt-screen rows shrink keeps cursor on its content line" {
     try s.resize(4, 4);
     try std.testing.expectEqual(@as(u16, 2), s.row);
     try std.testing.expectEqual(@as(u32, 'x'), s.cellAt(2, 0).rune);
+}
+
+test "alt-screen rows shrink scrolls main rows into scrollback, never frees them" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 4, 6);
+    defer s.deinit();
+    try s.setScrollbackCapacity(16);
+    // Six rows of shell output on the main screen.
+    for ("uvwxyz", 0..) |rune, i| s.active[i].cells[0].rune = rune;
+
+    // less/vim/htop takes over, then the window loses two rows. The main
+    // buffer's top rows are the user's history, not scratch the alt app
+    // owns: freeing them here lost output that the same resize without
+    // an alt app would have kept.
+    s.toggleAltScreen(true);
+    try s.resize(4, 4);
+    s.toggleAltScreen(false);
+
+    try expectScrollbackRunes(s, "uv");
+    try std.testing.expectEqual(@as(u32, 'w'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'z'), s.cellAt(3, 0).rune);
 }
 
 test "SGR colon-separated parses (NF spec)" {
@@ -7491,6 +7588,102 @@ test "XTGETTCAP: unknown cap replies with 0+r" {
     try std.testing.expectEqualStrings("\x1bP0+r5A5A5A\x1b\\", resp);
 }
 
+/// Counts replies instead of keeping them: the amplification cases below
+/// are about how MANY writes reach the PTY, not what they say.
+const ReplyCounter = struct {
+    var replies: usize = 0;
+    var bytes: usize = 0;
+    fn write(_: ?*anyopaque, out: []const u8) void {
+        replies += 1;
+        bytes += out.len;
+    }
+    fn reset() void {
+        replies = 0;
+        bytes = 0;
+    }
+};
+
+fn sendXtgettcap(s: *Screen, body: []u8) void {
+    s.onDcs(.{
+        .proto = .{
+            .params = [_]u16{0} ** 4,
+            .n_params = 0,
+            .intermediates = [_]u8{'+'} ++ [_]u8{0} ** 3,
+            .n_intermediates = 1,
+            .final = 'q',
+        },
+        .body = body,
+    });
+}
+
+test "XTGETTCAP answers at most the cap and never answers an empty field" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    s.sink.on_write_pty = ReplyCounter.write;
+
+    // `DCS + q` plus nothing but separators. The DCS body is bounded
+    // only by the parser's 16 MiB osc_max, so answering empty fields
+    // turned one sequence into millions of writes and allocations inside
+    // the daemon's single-threaded poll loop.
+    var empties: [4096]u8 = undefined;
+    @memset(&empties, ';');
+    ReplyCounter.reset();
+    sendXtgettcap(s, &empties);
+    try std.testing.expectEqual(@as(usize, 0), ReplyCounter.replies);
+
+    // Well-formed caps past the cap go unanswered. "5A5A" = "ZZ".
+    var many: [5 * 512]u8 = undefined;
+    var w: usize = 0;
+    while (w < many.len) : (w += 5) @memcpy(many[w..][0..5], "5A5A;");
+    ReplyCounter.reset();
+    sendXtgettcap(s, many[0 .. many.len - 1]); // trim the trailing ';'
+    try std.testing.expectEqual(Screen.XTGETTCAP_MAX_CAPS, ReplyCounter.replies);
+
+    // Empty fields are skipped, not counted against the cap. "544E" = "TN".
+    var padded = ";;;544E;;;".*;
+    ReplyCounter.reset();
+    sendXtgettcap(s, &padded);
+    try std.testing.expectEqual(@as(usize, 1), ReplyCounter.replies);
+}
+
+test "OSC 4 and OSC 21 bound the replies one payload can amplify into" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    s.sink.on_write_pty = ReplyCounter.write;
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(std.testing.allocator);
+
+    // OSC 4 answers one reply per queried pair.
+    try body.appendSlice(std.testing.allocator, "4");
+    var i: usize = 0;
+    while (i < Screen.OSC_COLOR_MAX_ITEMS * 4) : (i += 1) {
+        try body.appendSlice(std.testing.allocator, ";7;?");
+    }
+    ReplyCounter.reset();
+    s.onOsc(body.items);
+    try std.testing.expectEqual(Screen.OSC_COLOR_MAX_ITEMS, ReplyCounter.replies);
+
+    // OSC 21 accumulates one reply instead, so the cap bounds the buffer
+    // it grows rather than the write count.
+    body.clearRetainingCapacity();
+    try body.appendSlice(std.testing.allocator, "21;fg=?");
+    i = 0;
+    while (i < Screen.OSC_COLOR_MAX_ITEMS * 4) : (i += 1) {
+        try body.appendSlice(std.testing.allocator, ";fg=?");
+    }
+    ReplyCounter.reset();
+    s.onOsc(body.items);
+    // Header + payload + ST.
+    try std.testing.expectEqual(@as(usize, 3), ReplyCounter.replies);
+    // Each item is "fg=rgb:RRRR/GGGG/BBBB" (21 bytes) plus a separator.
+    try std.testing.expect(ReplyCounter.bytes <= 5 + 22 * Screen.OSC_COLOR_MAX_ITEMS + 2);
+}
+
 test "visualToLogicalCol on pure-ASCII line is identity" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
@@ -8160,6 +8353,30 @@ test "alt-screen toggle drops clusters keyed to the old buffer" {
     try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
 }
 
+test "grapheme cluster growth stops at CLUSTER_CP_MAX" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 4, 1);
+    defer s.deinit();
+
+    // `printf 'a'; while :; do printf '\xcc\x81'; done`: combining
+    // marks never advance the cursor, so without a cap one cell's list
+    // grows until the daemon that owns every session is out of memory.
+    s.printCp('a');
+    var i: usize = 0;
+    while (i < Screen.CLUSTER_CP_MAX * 4) : (i += 1) s.printCp(0x0301);
+
+    try std.testing.expectEqual(Screen.CLUSTER_CP_MAX, s.clusterAt(0, 0).len);
+    for (s.clusterAt(0, 0)) |cp| try std.testing.expectEqual(@as(u32, 0x0301), cp);
+    // The base still renders and the cursor is where it always was.
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u16, 1), s.col);
+    // A new base opens a fresh cluster rather than inheriting the full one.
+    s.printCp('b');
+    s.printCp(0x0301);
+    try std.testing.expectEqual(@as(usize, 1), s.clusterAt(0, 1).len);
+}
+
 test "narrow overwrite of wide-left blanks the continuation cell" {
     var pool = try Pool.init(std.testing.allocator);
     defer pool.deinit();
@@ -8205,6 +8422,41 @@ test "fast ASCII path splits a straddled wide pair" {
     try std.testing.expectEqual(@as(u32, 'x'), s.cellAt(0, 1).rune);
     try std.testing.expectEqual(@as(u32, 'y'), s.cellAt(0, 2).rune);
     try std.testing.expectEqual(@as(u8, 0), s.cellAt(0, 3).flags); // old continuation blanked
+}
+
+test "print run resyncs one byte past a malformed UTF-8 lead" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+
+    // Latin-1 0xE9 classifies as a 3-byte lead, but 'a' is not a
+    // continuation byte. The maximal-subpart rule consumes the lead
+    // alone; skipping all three bytes ate 'a' and 'b' and rendered only
+    // 'c'.
+    const bytes = "\xE9abc";
+    var run = Event.PrintRun{};
+    @memcpy(run.bytes[0..bytes.len], bytes);
+    run.len = bytes.len;
+    s.apply(.{ .print_run = run });
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'b'), s.cellAt(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'c'), s.cellAt(0, 2).rune);
+
+    // The stateful decoder is the other half of this path (it takes over
+    // whenever a codepoint straddles the 64-byte run boundary), so the
+    // two must agree or the same bytes render differently depending on
+    // where the parser happened to cut the run.
+    var dec = utf8.Decoder{};
+    var seen: [8]u32 = undefined;
+    var n: usize = 0;
+    for (bytes) |b| {
+        if (dec.feed(b)) |cp| {
+            seen[n] = cp;
+            n += 1;
+        }
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 'a', 'b', 'c' }, seen[0..n]);
 }
 
 test "ECH with huge parameter does not overflow column math" {
