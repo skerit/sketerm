@@ -719,7 +719,7 @@ pub fn applyThumbResult(self: *BrowserView, res: *ThumbResult) void {
         // Swap the texture into the live rows directly; a full
         // rebuild only when no row was waiting for it (rare: the
         // listing was rebuilt without the pending-thumb marker).
-        if (!self.applyThumbTexture(res.key, tex)) self.scheduleThumbRender();
+        if (!self.applyThumbTexture(res.key, tex)) self.scheduleCoalescedRender();
     } else {
         if (self.thumb_failed.count() >= THUMB_CACHE_CAP) {
             var it = self.thumb_failed.iterator();
@@ -748,19 +748,6 @@ pub fn clearFailureCaches(self: *BrowserView) void {
     var it = self.thumb_failed.iterator();
     while (it.next()) |kv| self.allocator.free(kv.key_ptr.*);
     self.thumb_failed.clearRetainingCapacity();
-}
-
-/// Coalesced re-render ~8x/s while thumbnails trickle in.
-pub fn scheduleThumbRender(self: *BrowserView) void {
-    if (self.thumb_render_src != 0) return;
-    self.thumb_render_src = c.g_timeout_add(120, @ptrCast(&onThumbRenderTick), @ptrCast(self));
-}
-
-pub fn onThumbRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const self = cast.userData(BrowserView, user);
-    self.thumb_render_src = 0;
-    self.renderCurrent();
-    return 0; // one-shot
 }
 
 /// The render-time lookup: cached texture, or a queued async

@@ -1209,13 +1209,15 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
 
         // open_view (navigation, new tab, subdir expansion): STREAM.
         // Rows land on screen as each chunk arrives instead of the
-        // tab sitting at "Listing..." until the run ends.
+        // tab sitting at "Listing..." until the run ends. The fence
+        // comes FIRST: appending a chunk can move the entry array a
+        // bound row points into, exactly as the sort below reorders it.
+        colview.invalidateBackingRefs(p.tab);
         for (rep.entries) |we| {
             if (p.dir.own(we)) |e| p.dir.entries.append(self.allocator, e) catch {};
         }
         p.dir.streaming = rep.more;
         if (!rep.more) p.dir.loaded = true;
-        colview.invalidateBackingRefs(p.tab);
         p.dir.sort();
         if (rep.truncated and !rep.more) self.setStatus("listing truncated (very large directory)");
         var rendered = false;
@@ -1580,25 +1582,40 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
         // change ran, entry pointers may have moved, so the fast path
         // is off for the rest of the batch.
         var structural = false;
+        var recount = false;
         for (d.changes) |ch| {
             if (std.mem.eql(u8, ch.op, "upsert")) {
                 const we = ch.entry orelse continue;
                 if (!structural) {
                     if (dir.countOnlyIndex(we)) |idx| {
-                        dir.entries.items[idx].children = we.children;
-                        colview.refreshEntryRow(self, tab, dir, &dir.entries.items[idx]);
+                        const e = &dir.entries.items[idx];
+                        e.children = we.children;
+                        switch (colview.rowRefreshFor(self, tab, e)) {
+                            .resplices => |pos| colview.refreshEntryRowAt(self, tab, pos, dir, e),
+                            // The model keeps this row and its identity
+                            // did not move, so the next splice would
+                            // REUSE it with its stale "N items" unless
+                            // the count is named as changed.
+                            .stale => {
+                                tab.noteChanged(dir, we.name);
+                                recount = true;
+                            },
+                            // No row to keep fresh; whatever renders
+                            // next builds one from the new count.
+                            .absent => recount = true,
+                        }
                         continue;
                     }
                     structural = true;
-                    colview.invalidateBackingRefs(tab);
                 }
+                // Self-latching (BTab.backing_fence), so no local
+                // once-per-batch flag of its own.
+                colview.invalidateBackingRefs(tab);
                 tab.noteChanged(dir, we.name);
                 dir.upsert(we);
             } else if (std.mem.eql(u8, ch.op, "del")) {
-                if (!structural) {
-                    structural = true;
-                    colview.invalidateBackingRefs(tab);
-                }
+                structural = true;
+                colview.invalidateBackingRefs(tab);
                 tab.noteChanged(dir, ch.name);
                 dir.del(ch.name);
             }
@@ -1610,7 +1627,7 @@ pub fn onDelta(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             // debounced git job per burst, never a poll.
             self.scheduleGitRefresh();
         }
-        return structural;
+        return structural or recount;
     }
     return false;
 }

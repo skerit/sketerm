@@ -656,6 +656,51 @@ pub const Dir = struct {
     }
 };
 
+/// Whether every row of a tab's listing model has already had its
+/// borrowed Dir/Entry pointers nulled since the last time a render
+/// bound live ones.
+///
+/// The sweep that nulls them is O(model) in GObject ref traffic, and a
+/// streamed listing mutates once per event, so an unlatched fence is
+/// quadratic on the main thread for the length of the stream. The
+/// latch is safe only because exactly two places put live pointers
+/// back into the model (renderList's splice plus rebindReused, and
+/// refreshEntryRow's single-row resplice) and both report `rebound`.
+pub const BackingFence = struct {
+    fenced: bool = false,
+
+    /// Claim the sweep, or decline it because the rows are already inert.
+    pub fn needsSweep(self: *BackingFence) bool {
+        if (self.fenced) return false;
+        self.fenced = true;
+        return true;
+    }
+
+    /// Rows carry live borrowed pointers again, so the next mutation
+    /// of their backing storage has to sweep once more.
+    pub fn rebound(self: *BackingFence) void {
+        self.fenced = false;
+    }
+};
+
+test "the backing fence sweeps once per render cycle" {
+    var f: BackingFence = .{};
+    try std.testing.expect(f.needsSweep());
+    // Every further mutation before a render finds the rows inert.
+    try std.testing.expect(!f.needsSweep());
+    try std.testing.expect(!f.needsSweep());
+    // A render re-aimed the borrowed pointers: fence again.
+    f.rebound();
+    try std.testing.expect(f.needsSweep());
+    try std.testing.expect(!f.needsSweep());
+}
+
+test "a render with no mutation before it leaves the fence unclaimed" {
+    var f: BackingFence = .{};
+    f.rebound();
+    try std.testing.expect(f.needsSweep());
+}
+
 /// One internal browser tab.
 pub const BTab = struct {
     view: *BrowserView,
@@ -799,6 +844,10 @@ pub const BTab = struct {
     /// Overflow trades precision for correctness via `changed_all`.
     changed_paths: std.ArrayList([]u8) = .empty,
     changed_all: bool = false,
+    /// One home for "are this tab's rows already fenced off their
+    /// borrowed storage": every caller of `colview.invalidateBackingRefs`
+    /// goes through it instead of its own once-per-batch bool.
+    backing_fence: BackingFence = .{},
 
     pub fn subdirByPath(self: *BTab, path: []const u8) ?*Dir {
         for (self.subdirs.items) |d| {

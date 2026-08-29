@@ -81,7 +81,9 @@ pub fn renderCurrent(self: *BrowserView) void {
 /// chunks, watch-delta storms): render immediately when the last one
 /// is old enough, otherwise coalesce into ONE deferred render when
 /// the window reopens. Interaction-driven renders stay direct — a
-/// click's feedback must never wait on this.
+/// click's feedback must never wait on this. Also the window of the
+/// always-deferred `scheduleCoalescedRender` below: one coalescing
+/// interval for socket-driven renders, not two.
 const LISTING_RENDER_THROTTLE_MS: i64 = 120;
 
 pub fn scheduleListingRender(self: *BrowserView) void {
@@ -98,6 +100,29 @@ pub fn scheduleListingRender(self: *BrowserView) void {
 fn onListingRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(BrowserView, user);
     self.listing_render_src = 0;
+    self.renderCurrent();
+    return 0; // one-shot
+}
+
+/// The ALWAYS-deferred coalescer (~8x/s): one re-render of the current
+/// tab for a burst of trickling results -- thumbnails landing, streamed
+/// query matches, streamed archive members, a query's terminal event.
+///
+/// Deliberately not `scheduleListingRender`: a leading-edge render here
+/// would paint before the jobs panel writes its own status line over
+/// ours, and would render once per event at the head of every burst.
+pub fn scheduleCoalescedRender(self: *BrowserView) void {
+    if (self.coalesced_render_src != 0) return;
+    self.coalesced_render_src = c.g_timeout_add(
+        @intCast(LISTING_RENDER_THROTTLE_MS),
+        @ptrCast(&onCoalescedRenderTick),
+        @ptrCast(self),
+    );
+}
+
+fn onCoalescedRenderTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const self = cast.userData(BrowserView, user);
+    self.coalesced_render_src = 0;
     self.renderCurrent();
     return 0; // one-shot
 }

@@ -647,6 +647,12 @@ pub fn registerTab(self: *BrowserView, name: []const u8) ?*BTab {
 }
 
 fn fillRegisterTab(self: *BrowserView, tab: *BTab, name: []const u8) void {
+    // Bound rows borrow pointers INTO these entries, and the refill
+    // frees every one of them before re-appending into (possibly moved)
+    // storage. Fence ONCE for the whole rebuild, above the frees: the
+    // label change below can relayout and rebind cells, so the rows must
+    // already be inert by then.
+    colview.invalidateBackingRefs(tab);
     for (tab.root.entries.items) |*e| e.deinit(self.allocator);
     tab.root.entries.clearRetainingCapacity();
     var lbl: [96:0]u8 = undefined;
@@ -668,6 +674,8 @@ fn refreshRegisterTab(self: *BrowserView, name: []const u8) void {
     if (self.currentTab() == tab) self.renderTab(tab);
 }
 
+/// Append one mark row; the caller owns the `colview.invalidateBackingRefs`
+/// fence, since the append can move the entry storage bound rows point into.
 pub fn appendRegisterRow(self: *BrowserView, tab: *BTab, spec: []const u8, is_dir: bool) void {
     const a = self.allocator;
     if (tab.root.find(spec) != null) return;

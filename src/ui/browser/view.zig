@@ -234,8 +234,9 @@ pub const BrowserView = struct {
     /// the pipeline is busy (preview.zig), so an unanswered reply
     /// frees its slot instead of wedging it forever.
     remote_thumb_watch: c.guint = 0,
-    /// Coalesced re-render after thumbnails land.
-    thumb_render_src: c.guint = 0,
+    /// Pending always-deferred coalesced re-render (render.zig): a
+    /// thumbnail landing, a streamed query match, an archive member.
+    coalesced_render_src: c.guint = 0,
     /// Leading-edge throttle for socket-driven listing renders
     /// (streaming chunks, watch deltas): pending one-shot source and
     /// the stamp of the last listing render (render.zig).
@@ -545,6 +546,7 @@ pub const BrowserView = struct {
     // render.zig -- listing rendering, columns, rows, emblems
     pub const renderCurrent = @import("render.zig").renderCurrent;
     pub const scheduleListingRender = @import("render.zig").scheduleListingRender;
+    pub const scheduleCoalescedRender = @import("render.zig").scheduleCoalescedRender;
     pub const renderTab = @import("render.zig").renderTab;
     pub const applyViewChrome = @import("render.zig").applyViewChrome;
     pub const headerButton = @import("render.zig").headerButton;
@@ -786,9 +788,7 @@ pub const BrowserView = struct {
     pub const saveLocalThumbRecoverable = @import("preview.zig").saveLocalThumbRecoverable;
     pub const onThumbIdle = @import("preview.zig").onThumbIdle;
     pub const applyThumbResult = @import("preview.zig").applyThumbResult;
-    pub const scheduleThumbRender = @import("preview.zig").scheduleThumbRender;
     pub const applyThumbTexture = @import("render.zig").applyThumbTexture;
-    pub const onThumbRenderTick = @import("preview.zig").onThumbRenderTick;
     pub const thumbLookup = @import("preview.zig").thumbLookup;
     pub const enqueueRemoteThumb = @import("preview.zig").enqueueRemoteThumb;
     pub const pumpRemoteThumbs = @import("preview.zig").pumpRemoteThumbs;
@@ -1448,7 +1448,7 @@ pub const BrowserView = struct {
         if (self.restore_read) |rr| rr.destroy(self.allocator);
         if (self.dup) |d| d.destroy(self.allocator);
         if (self.editor_rename) |er| er.destroy(self.allocator);
-        if (self.thumb_render_src != 0) _ = c.g_source_remove(self.thumb_render_src);
+        if (self.coalesced_render_src != 0) _ = c.g_source_remove(self.coalesced_render_src);
         if (self.listing_render_src != 0) _ = c.g_source_remove(self.listing_render_src);
         if (self.git_delta_src != 0) _ = c.g_source_remove(self.git_delta_src);
         if (self.git_poll_src != 0) _ = c.g_source_remove(self.git_poll_src);
@@ -1505,6 +1505,10 @@ pub const BrowserView = struct {
         var fit = self.thumb_failed.iterator();
         while (fit.next()) |kv| self.allocator.free(kv.key_ptr.*);
         self.thumb_failed.deinit();
+        // The show-hidden anchor is the one widget with no parent to free
+        // it: buildUi sank its floating ref, so this view holds the only
+        // one. Last, because everything above may still read the toggle.
+        c.g_object_unref(@ptrCast(self.hidden_toggle));
         self.allocator.destroy(self);
     }
 

@@ -141,12 +141,20 @@ pub fn itemDataAt(tab: *BTab, pos: c.guint) ?*ItemData {
     return itemPayload(obj);
 }
 
-/// Fence recycled cells off before their borrowed Dir/Entry storage changes.
+/// Fence recycled cells off before their borrowed Dir/Entry storage
+/// changes.
+///
+/// Idempotent between renders: the sweep is O(model) in GObject ref
+/// traffic and a streamed listing calls this once per event, so
+/// `BTab.backing_fence` collapses a whole stream into one sweep. Every
+/// caller relies on that latch rather than a local flag of its own.
 pub fn invalidateBackingRefs(tab: *BTab) void {
-    if (tab.view.widgets_dead) {
-        tab.name_cells.clearRetainingCapacity();
-        return;
-    }
+    // Cheap, and a cell may outlive the item that named it, so this
+    // half stays outside the latch.
+    tab.name_cells.clearRetainingCapacity();
+    // The model must not be read past the widget teardown fence.
+    if (tab.view.widgets_dead) return;
+    if (!tab.backing_fence.needsSweep()) return;
     const n = itemCount(tab);
     var i: c.guint = 0;
     while (i < n) : (i += 1) {
@@ -154,7 +162,6 @@ pub fn invalidateBackingRefs(tab: *BTab) void {
         d.dir = null;
         d.entry = null;
     }
-    tab.name_cells.clearRetainingCapacity();
 }
 
 /// Position of the entry item whose path equals `path`.
@@ -169,21 +176,61 @@ pub fn positionForPath(tab: *BTab, path: []const u8) ?c.guint {
     return null;
 }
 
+/// What `refreshEntryRow` does for one entry: resplice its row (the
+/// payload is that row's position), decline a row the model still
+/// holds, or find no row for it at all.
+pub const RowRefresh = union(enum) {
+    resplices: c.guint,
+    stale,
+    absent,
+};
+
+/// The single home of `refreshEntryRow`'s guards, exported because the
+/// caller has to compensate for a declined refresh: a `stale` row keeps
+/// its old cells through the next renderList (identity did not move, so
+/// the windowed splice REUSES it) unless the caller names the value as
+/// changed, while `absent` needs nothing. Mirroring these three
+/// conditions at a call site is how the fourth one gets missed.
+/// The two cheap guards answer first: the scan below is O(model) and
+/// must not run for a decision that does not depend on it.
+pub fn rowRefreshFor(self: *BrowserView, tab: *BTab, e: *Entry) RowRefresh {
+    // Nothing renders again, and the model must not be read past the
+    // widget teardown fence.
+    if (self.widgets_dead) return .absent;
+    // The icons view renders from the entries, not from this model, and
+    // a full rebuild is already on its way: both leave a held row
+    // exactly as it is. Reported as `stale` without looking for the row
+    // -- naming an absent path as changed costs a lookup miss at the
+    // next splice, while missing a held one shows a stale cell.
+    if (tab.view_mode == .icons or self.listing_render_src != 0) return .stale;
+    const n = itemCount(tab);
+    var pos: c.guint = 0;
+    while (pos < n) : (pos += 1) {
+        const d = itemDataAt(tab, pos) orelse continue;
+        if (d.kind == .entry and d.entry == e) return .{ .resplices = pos };
+    }
+    return .absent;
+}
+
 /// Rebind ONE live row after an in-place entry update (the async
 /// child count): a fresh item is spliced over the old position, so
 /// only that row's cells rebind — the rest of the view keeps its
 /// hover, selection and scroll untouched, which a full renderList
 /// cannot promise. No-op when the row is not in the model (filtered
-/// out, icons view, or a render already pending).
+/// out, icons view, or a render already pending); a caller that must
+/// know which of those happened asks `rowRefreshFor` instead.
 pub fn refreshEntryRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: *Entry) void {
-    if (self.widgets_dead or tab.view_mode == .icons) return;
-    if (self.listing_render_src != 0) return; // a full rebuild is coming anyway
-    const n = itemCount(tab);
-    var pos: c.guint = 0;
-    const old: *ItemData = blk: while (pos < n) : (pos += 1) {
-        const d = itemDataAt(tab, pos) orelse continue;
-        if (d.kind == .entry and d.entry == e) break :blk d;
-    } else return;
+    const pos = switch (rowRefreshFor(self, tab, e)) {
+        .resplices => |p| p,
+        .stale, .absent => return,
+    };
+    refreshEntryRowAt(self, tab, pos, dir, e);
+}
+
+/// `refreshEntryRow` for a caller that already asked `rowRefreshFor`
+/// and holds its `resplices` position; the scan must not run twice.
+pub fn refreshEntryRowAt(self: *BrowserView, tab: *BTab, pos: c.guint, dir: *Dir, e: *Entry) void {
+    const old = itemDataAt(tab, pos) orelse return;
     const d = self.allocator.create(ItemData) catch return;
     d.* = .{
         .allocator = self.allocator,
@@ -212,6 +259,9 @@ pub fn refreshEntryRow(self: *BrowserView, tab: *BTab, dir: *Dir, e: *Entry) voi
     var items = [_]?*anyopaque{@ptrCast(obj)};
     c.g_list_store_splice(tab.store, pos, 1, &items, 1);
     c.g_object_unref(@as(?*anyopaque, @ptrCast(obj)));
+    // This row now borrows live storage again, so the fence has to be
+    // re-armed even though no full render ran.
+    tab.backing_fence.rebound();
     if (was_selected) _ = c.gtk_selection_model_select_item(selModel(tab), pos, 0);
 }
 
@@ -1381,6 +1431,10 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
         if (it) |o| c.g_object_unref(@as(?*anyopaque, o));
     }
     tab.clearChanged();
+    // Every row is freshly bound now -- the spliced window carries new
+    // items, and `rebindReused` re-aimed the ones that were kept -- so
+    // the next mutation of the entry storage owes another sweep.
+    tab.backing_fence.rebound();
 
     // Restore the path selection onto the new items.
     const want = c.gtk_bitset_new_empty() orelse return;

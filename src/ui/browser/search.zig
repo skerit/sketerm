@@ -22,10 +22,12 @@
 
 const std = @import("std");
 const c = @import("../../c.zig").c;
+const colview = @import("colview.zig");
 const query = @import("../../filebrowser/query.zig");
 
 const BTab = @import("types.zig").BTab;
 const BrowserView = @import("view.zig").BrowserView;
+const Entry = @import("types.zig").Entry;
 const HostConn = @import("types.zig").HostConn;
 const OwnedSearch = @import("types.zig").OwnedSearch;
 const WireJobEv = @import("types.zig").WireJobEv;
@@ -240,12 +242,12 @@ pub fn queryConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
     // that is not on screen is rebuilt when it is switched to.
     if (std.mem.eql(u8, e.ev, "match")) {
         upsertFlatMatch(self, tab, e);
-        self.scheduleThumbRender();
+        self.scheduleCoalescedRender();
         return true;
     }
     if (std.mem.eql(u8, e.ev, "unmatch")) {
         removeFlatMatch(self, tab, e.path);
-        self.scheduleThumbRender();
+        self.scheduleCoalescedRender();
         return true;
     }
     if (std.mem.eql(u8, e.ev, "ready")) {
@@ -254,7 +256,7 @@ pub fn queryConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
         tq.watches = e.watches;
         tq.truncated = e.truncated;
         tq.watch_limit = e.watch_limit;
-        self.scheduleThumbRender();
+        self.scheduleCoalescedRender();
         return true;
     }
     if (std.mem.eql(u8, e.ev, "reject")) {
@@ -263,7 +265,7 @@ pub fn queryConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
             tq.reject_len = @min(e.text.len, tq.reject.len);
             @memcpy(tq.reject[0..tq.reject_len], e.text[0..tq.reject_len]);
         }
-        self.scheduleThumbRender();
+        self.scheduleCoalescedRender();
         return true;
     }
     if (std.mem.eql(u8, e.ev, "resync")) {
@@ -286,7 +288,7 @@ pub fn queryConsumeEvent(self: *BrowserView, hc: *HostConn, e: WireJobEv) bool {
         // Deliberately the COALESCED render: this event falls through
         // to the jobs panel, whose own "done: ..." status would erase
         // an immediate one. The timer fires after that and wins.
-        self.scheduleThumbRender();
+        self.scheduleCoalescedRender();
         // Falls through so the jobs panel finishes its row.
     }
     return false;
@@ -455,6 +457,32 @@ pub fn onPresetPicked(btn: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     self.setStatus("edit the command if you like, then press Enter to browse its output");
 }
 
+/// Whether a repeated match reports listing values the row does not
+/// already show. A row is only named as changed when this says so:
+/// naming one per repeat would push the tab past its changed-path cap
+/// and widen the next splice to the whole listing.
+fn matchMetaChanged(existing: Entry, e: WireJobEv) bool {
+    return existing.size != e.size or existing.mtime_ms != e.mtime_ms;
+}
+
+test "a repeated match only counts as changed when size or mtime moved" {
+    var name = "a.txt".*;
+    var kind = "file".*;
+    var target = "/tmp/a.txt".*;
+    const row = Entry{
+        .name = &name,
+        .kind = &kind,
+        .size = 10,
+        .mode = 0,
+        .mtime_ms = 5,
+        .target = &target,
+        .tdir = false,
+    };
+    try std.testing.expect(!matchMetaChanged(row, .{ .size = 10, .mtime_ms = 5 }));
+    try std.testing.expect(matchMetaChanged(row, .{ .size = 11, .mtime_ms = 5 }));
+    try std.testing.expect(matchMetaChanged(row, .{ .size = 10, .mtime_ms = 6 }));
+}
+
 /// Add (or refresh) one streamed job match as a flat row of `tab`.
 /// Shared by the search results tab and the flat/branch view: both
 /// are a host-side job filling a flat Dir whose display name is the
@@ -477,8 +505,17 @@ pub fn upsertFlatMatch(self: *BrowserView, tab: *BTab, e: WireJobEv) void {
     for (dir.entries.items) |*existing| {
         if (existing.target) |target| {
             if (std.mem.eql(u8, target, e.path) and e.line == 0) {
+                // Row identity does not move when a live query restates
+                // a match, so the windowed splice reuses the row and it
+                // keeps its old Size and Modified cells unless the new
+                // values are named here.
+                const changed = matchMetaChanged(existing.*, e);
                 existing.size = e.size;
                 existing.mtime_ms = e.mtime_ms;
+                if (changed) {
+                    var path_buf: [4096]u8 = undefined;
+                    if (dir.fullPath(existing.*, &path_buf)) |full| tab.noteChangedFull(full);
+                }
                 return;
             }
         }
@@ -494,6 +531,12 @@ pub fn upsertFlatMatch(self: *BrowserView, tab: *BTab, e: WireJobEv) void {
         a.free(kind);
         return;
     };
+    // Bound rows borrow pointers INTO `dir.entries` and the append can
+    // move that array, so fence the recycled cells off first -- the
+    // same ordering the structural delta path uses before an upsert.
+    // A live query streams one match per event: the fence latches, so
+    // the whole stream between two renders costs ONE model sweep.
+    colview.invalidateBackingRefs(tab);
     dir.entries.append(a, .{
         .name = name,
         .kind = kind,
@@ -522,6 +565,11 @@ pub fn removeFlatMatch(self: *BrowserView, tab: *BTab, path: []const u8) void {
             i += 1;
             continue;
         }
+        // The removal frees one entry and shifts every later one, so
+        // every bound row is about to describe the wrong entry. Only
+        // the first call since the last render sweeps, so an unmatch
+        // that names no row costs nothing.
+        colview.invalidateBackingRefs(tab);
         var entry = tab.root.entries.orderedRemove(i);
         entry.deinit(self.allocator);
     }
@@ -666,6 +714,10 @@ pub fn dupMaybeFinish(self: *BrowserView) void {
     rtab.root.flat = true;
     rtab.root.loaded = true;
     rtab.root.view_id = 0;
+    // Same fence as the streamed matches, before the group appends move
+    // the entry array. A tab this new has rendered nothing but an empty
+    // listing, so the sweep is normally a no-op.
+    colview.invalidateBackingRefs(rtab);
 
     var i: usize = 0;
     while (i < d.hashes.items.len) {

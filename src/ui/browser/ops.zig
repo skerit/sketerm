@@ -2146,6 +2146,13 @@ pub fn onArchiveMember(self: *BrowserView, e: WireJobEv) void {
         a.free(kind);
         return;
     };
+    // Members stream in one event at a time with a render BETWEEN them,
+    // so bound rows really are pointing into `dir.entries` when the next
+    // append moves it: fence first, the same ordering the streaming
+    // listing chunk uses. The fence latches per render cycle, so the
+    // thousands of members of a big archive cost one sweep per render
+    // rather than one per event.
+    colview.invalidateBackingRefs(rtab);
     dir.entries.append(a, .{
         .name = name,
         .kind = kind,
@@ -2160,7 +2167,12 @@ pub fn onArchiveMember(self: *BrowserView, e: WireJobEv) void {
         a.free(tgt);
         return;
     };
-    if (self.currentTab() == rtab) self.renderTab(rtab);
+    // Coalesced, never per event: a large archive streams thousands of
+    // members, and a render each would be the full-rebuild storm the
+    // subsystem doc warns about. The 120ms one-shot renders the current
+    // tab, which this branch has already established is `rtab`; the
+    // search stream collapses its own match events the same way.
+    if (self.currentTab() == rtab) self.scheduleCoalescedRender();
 }
 
 /// Extract one member on the archive's host, then open it.
