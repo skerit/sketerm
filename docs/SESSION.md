@@ -1,5 +1,160 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-29: codebase review, fix pass, and the audit of that fix pass
+
+A full review of the tree (all gates green, three rigs red, one
+reproduced use-after-free) was followed by a sixteen-agent fix pass,
+and that fix pass was then audited by six independent reviewers before
+anything was committed. Every diagnosis held; several fixes did not,
+and the second pass repaired those. What landed, by subsystem.
+
+**Daemon.** `socks5_client.zig` drained a SOCKS5 `ATYP=domain` reply
+into an 18-byte stack buffer with a remote-supplied length (a 239-byte
+smash in ReleaseFast); the buffer is `MAX_BOUND_ADDRESS` now. shm pools
+are no longer mapped at all: `PoolMirror` is daemon-owned anonymous
+memory filled by `pread` at commit (`daemon_native.pullPoolRows`), so
+a client that `ftruncate`s its pool after `create_pool` costs itself
+`wl_shm.invalid_fd` instead of a SIGBUS that killed every session on
+the host; `fdBacksBytes` stays as the fast refusal. Every viewer unit
+is classified once in `viewerUnitKind` (exhaustive over the named
+`wlpipe.Tag`s, unnamed wire values fail closed), and the fd-pairing
+invariant plus `MAX_PENDING_FDS` are tested. Client-named paths the
+daemon opens go through `daemon_serve.openChecked`: kind refused by
+`stat` BEFORE the open (a peerless FIFO used to park the poll loop in
+`open()` forever; a device node's open is the side effect), then an
+`fstat` identity check. `fs_listings` bound to no view were never swept
+when their client died (reachable from MCP `file_list`; the daemon
+spins at `poll_timeout = 0` straight into the freed pointer) and the
+client reap is three-phased now, which also removed a second
+use-after-free between `panelClientDetached` calls in one loop.
+
+**Kitty file media, twice.** A `t=f`/`t=t`/`t=s` APC used to be
+forwarded over the wire whenever the daemon could not inline it, and
+`grid/kitty_images.zig` resolves that path on the VIEWER's disk and
+unlinks it for `t=t` -- `EventCollector.untrusted` gated the inline
+fetch, and it is true only for casts, so every PTY and `sketerm ssh`
+session was a remote file-deletion primitive. Now a file-medium APC
+never crosses the wire: inlined to `t=d` or dropped. The first fix of
+that regressed two things the audit caught: an over-cap tempfile was
+unlinked by nobody (the daemon returned before its own cleanup and the
+client never saw the APC), and a full-window `kitten icat` (raw RGBA,
+~14 MB) silently rendered nothing. `rewrite` now unlinks on refusal
+too, the cap is 10 MiB derived from `wire.MAX_FRAME` with a `comptime`
+check, the first drop per session is a `log.warn` naming file, reason
+and cap, and `t=t` deletion on both sides honors the spec's
+`tty-graphics-protocol` marker. The set {f,t,s} has one home
+(`parser/kitty_image.isFileMedium`; the client reader had listed only
+two of them), and the client refuses file media outright unless
+`Manager.file_media` is opted in, which only `replay` does.
+
+**CEF helper.** `applyProxy` stored `cef_value_t`/`cef_dictionary_value_t`
+pointers it had already handed to `set_dictionary`/`set_preference`
+and released them again at context destroy: a use-after-free that
+`smoke-web` reproduced as a helper SIGSEGV and that the rig's own
+"tolerant" reap had been excusing as a shutdown artifact for nine
+days. Settled from upstream `libcef_dll` sources (quoted in
+`src/web/CLAUDE.md`): every ref-counted struct crossing the C boundary
+carries one reference the RECEIVER owns. So the 96 arguments libcef
+passes into our 50 callbacks were leaking a wrapper and a reference
+each (measured 15.6 kB per navigation request, linear); `releaseArg`
+returns every one on every exit, and a callback that keeps an object
+keeps the received reference instead of add-ref'ing. `axDump` no
+longer donates its caller's only reference to `cef_write_json`, a
+background page replacing its document drops its ports, and
+`axtree.applyTree` now actually rolls back on a decode error, as its
+docblock had claimed.
+
+**GUI.** `closePane` grabbed focus and closed "the focused pane", which
+was the wrong pane for a background tab or a zoom-hidden subtree;
+`reqPane` fell back to the focused pane when a GIVEN session name did
+not resolve (its docblock said the opposite), so `sketerm cli
+close-pane --session <stale>` closed whatever was focused and answered
+ok -- the most plausible cause of the e2e red below. Both resolve
+exactly now. OSC 99 activation was per-window slots behind ONE global
+`app.notify-act` action, so a second window's notification activated
+against the first window's slots; tokens are process-wide and resolved
+across every window. Cross-window tab adoption re-points the input
+context's config slices (a use-after-free on the next keypress once
+the source window emptied) and the pane-level mouse flags through one
+shared `applyPaneMouseFlags`. Leaked refs on every tab drag-out
+(`GdkDrag`, its content provider), a leaked `GtkToggleButton` per
+browser view, two leaked `GDBusConnection`s in `secrets.zig`, an
+`ImHost` freed without `deinit` on `wlapp` surface death, nine Pango
+markup sites in prefs that blanked a whole label on `<` or `&` (one of
+them the sentence documenting `editor_keybind.<command>`), and the
+atlas shape cache freeing a result while `flushHints` was still
+walking it -- the last replaced by a deferred-free list released at
+each top-level pass rather than a recency ring.
+
+**File browser.** `invalidateBackingRefs` (an O(model) walk with a
+GObject ref/unref per row) was being called once per streamed search
+match; it is latched per tab (`BTab.backing_fence`) and cleared only
+where live pointers are bound back, and the archive listing renders
+through the coalescer instead of per member.
+
+**Editor.** Project-wide replace indexed document offsets (CR
+stripped) into raw CRLF bytes, drifting one byte per line; `RawMap`
+translates, and inserted text is materialized in the file's line
+ending through `Document.writeInStyle`, the one converter `materialize`
+also uses.
+
+**MCP.** `all:ro` silently granted every mutating tool (`all` matched
+unconditionally); it narrows now and is documented where the error
+message points. `web_act` parsed accessible names across
+`value="..."`; `web_expand` on an unknown id returned empty success
+(and its marker is one constant shared with `semantic.zig`); every
+client integer narrowed to `u32` goes through `boundedU32`. A wait
+step clipped by the batch budget says so (`wait_clipped`) instead of
+reading as a frozen app. `sketerm portal --help` hung forever (no argv
+reached it); `app`/`mount --help` exit 0 on stdout from inside their
+own runners.
+
+**Terminal core.** Cluster codepoints are capped at 32 (the snapshot
+`@intCast`s the count into a `u16`), OSC 4/21 and XTGETTCAP replies
+are bounded against 16 MiB amplification, the UTF-8 resync agrees
+between the two render paths, and an alt-screen resize no longer
+drops the main screen's scrollback.
+
+**Rigs that could not fail.** `smoke_web`'s tolerant reap is gone (all
+twelve remaining sites strict, exit CODES checked too); `smoke_broker`
+inspects the forked broker's status (10 s budget); `smoke_mcp`'s
+session listing has a positive control before its negative assertion;
+`smoke_atspi` reads the saved file back; `smoke_lsp_gui`'s F8 stage
+asserts the caret landed on a diagnostic row and mouse-dwell no
+longer SKIPs on a server that just answered a hover; `smoke_e2e`
+prints the classified panel-attach error and one message per
+capability fact. Two of the three red rigs were not what they seemed:
+`smoke-lsp-gui` was a load flake from running three rigs concurrently
+(green alone), and the `zig fetch` package had omitted
+`vendor/pkgconfig` for nine days. The `smoke-e2e` red, once the
+classified error named it, was the `reqPane` fallback above: the relay
+stage closed a pane by a session name it had just invalidated, the
+fallback closed the GUI's own focused pane instead, and the next stage
+could not attach to it. With that stage passing, six stages that had
+not run since the 2026-08-21 structured-results migration ran for the
+first time, and every one still pinned the pre-migration escaped text
+lane (`\"panel_id\":`) or matched a field name instead of its value;
+`mcpHas`/`mcpNum`/`mcpCount` look for a fragment raw in
+`structuredContent` and quote-escaped in a text lane, and 94 reply
+checks go through them. The new oracles then earned their keep twice
+more: the forked broker in `smoke-broker` died of SIGPIPE at shutdown
+(every real daemon entry point neuters it; `platform.ignoreSigpipe` is
+now the one home the daemon, the MCP server and the rigs call), and
+fixing the CEF leak let `web_profile_reset` rmtree a profile that
+Chromium was still writing its teardown files into, which the leaked
+references had masked by keeping every profile loaded forever
+(`Store.retire` waits for the jar to go quiet first). Two more stages
+that had never run: the viewer's video-to-image navigation SIGSEGV'd
+the GUI by finalizing a live GStreamer pipeline from inside the
+navigation callback (`gtk_media_file_clear` now retires it through the
+API first, and the viewer drops `crashlog` breadcrumbs around open,
+teardown and show), and `smoke-lsp-gui`'s mouse-dwell "SKIP: nothing
+under the pointer" was literally true -- the probes landed on `int`,
+`(` and `{`, which clangd correctly declines to hover; the stage now
+rests the pointer on the caret the Ctrl+I stage just proved hoverable,
+and `editorlsp.zig` traces every dwell decision under
+`SKETERM_LSP_DEBUG` so the next such red is a one-run diagnosis.
+
 ## 2026-08-28: the web tools on a router's admin UI
 
 A session that set two DHCP reservations on a FRITZ!Box with the
