@@ -982,6 +982,88 @@ in jar size per pass, so a client that subscribes and never unsubscribes
 pays it forever. smoke-web stage 42 is the proof, across two real
 helpers with separate `--cache-dir`s.
 
+## The presenter: watch-along pixels for a session-mode helper (capability "presenter")
+
+`webdrive.zig` starts the MCP's helper as a Wayland CLIENT of a mux
+app session so a human can attach to it, but an OSR browser creates no
+toplevel, and until 2026-08-29 an attached viewer saw audio and
+liveness and no pixels. `src/web/presenter.zig` closes that: it is a
+hand-rolled Wayland client (raw `wlhost/wire.zig` framing, no
+libwayland -- the helper links libc and CEF only) that mirrors every
+PRESENTABLE view (`Host.presentable`: pages, never background pages,
+action popups or inspectors) as one `xdg_toplevel` on the hub, app_id
+`dev.sker.sketerm.web`, title following the page title. From there the
+whole existing app-session machinery applies with no new GUI protocol:
+Session Overview lists it, Watch attaches read-only, the pane's
+"AI attached" chip and driven accent light up, Take Control hands the
+seat over, and remote forwarding carries it like any app.
+
+Rules, each of which was a bug in waiting:
+
+- **Armed by `SKETERM_WEB_PRESENTER=1` and NOTHING else.** A
+  `WAYLAND_DISPLAY` is not consent: a helper the GUI spawned inherits
+  the user's real compositor, and presenting its hidden panes there
+  would put a browser window on the desktop per tab. Only a launcher
+  that started the helper as a hub's client sets the flag (webdrive's
+  session-mode fork), and smoke-web stage mc1 asserts a helper without
+  it never advertises `presenter`. The capability is a REPORTED fact:
+  `hello_ack` carries it only after the handshake with the hub
+  succeeded, and `capabilities` reports it as `web_watch` from there,
+  never from "session mode is on".
+- **Startup order.** The presenter arms in `Server.run` right after
+  `Host.install`, before the first client is accepted: the first paint
+  of the first view must already have a toplevel to land in. Its
+  registry/bind roundtrips are bounded (3s) and any failure disarms it
+  with one log line; the helper serves exactly as before. The
+  `LD_PRELOAD` re-exec preserves the environment, so the flag and
+  `WAYLAND_DISPLAY` survive it, and the ozone choice is unaffected: the
+  presenter is a second, independent client of the same display that
+  CEF's ozone layer talks to.
+- **One loop.** The display fd joins `server.step`'s poll set
+  (POLLOUT when the outbox backed up) and `Host.presenterPump` runs
+  between `watchdog` and `webextPump`. No thread, no blocking read: a
+  presenter that cannot write its pool descriptor within 500ms disarms
+  rather than stall CEF's message loop.
+- **Frame pacing is the hub's.** A paint copies its dirty rects into a
+  free buffer of a two-buffer wl_shm pool, damages, requests a frame
+  callback and commits; while that callback is outstanding or both
+  buffers are held, later paints only widen the pending damage rect
+  (`FrameGate`, pure and unit-tested). The next flush copies the union
+  from the helper's LIVE frame buffer (`View.map`, the same memory the
+  wire client reads), so the newest pixels win and a slow viewer never
+  accumulates a queue. The toplevel is pinned to the view's physical
+  size with `set_min_size`/`set_max_size`; a viewer cannot resize the
+  assistant's viewport, only look at it. A view resize retires the pool
+  and the next paint mints a new one; `dropBrowser` (destroy and
+  discard alike) takes the toplevel down, and a revived view repaints
+  into a fresh one.
+- **Input maps onto the wire's own input frames.** Seat events on a
+  presenter surface become `Host.pointer`/`scroll`/`key` calls with the
+  protocol's vocabulary: surface coordinates divided by the view's
+  scale, evdev buttons to the protocol's 0/1/2, xkb modifier masks to
+  `mod_*` bits (the presenter mirrors those constants and cefhost
+  asserts they match), and keycodes to XKB keysyms through the hub's
+  own compiled keymap (received over SCM_RIGHTS, inverted with
+  `ipc/xkblayout.zig`) plus a fixed table for the keys no character map
+  names. The daemon already drops input from non-controllers, so the
+  helper applies whatever reaches it: a viewer with the lease drives the
+  assistant's page exactly as the assistant's own trusted input does,
+  and the assistant's semantic tools keep working underneath.
+- **Why a presenter surface and not a windowed browser.** A windowed
+  CEF browser would move the frame source out of `on_paint`, breaking
+  the shm/inline frame paths, the MCP screenshots and every rig that
+  reads `View.map`; and CEF 151 cannot promote a windowless browser
+  anyway (the DevTools section above measured that). Mirroring the
+  buffer the helper already owns costs one memcpy of the damaged rows
+  per presented frame and changes nothing about how the engine renders.
+
+smoke-mcp's presenter stage is the end-to-end proof against the REAL
+helper: `web_open` on a solid-colour loopback page, a viewer attached
+to the web session through the mux client with a replica compositor
+(`wlhost/compositor.zig` view callbacks), a toplevel whose title is the
+page title and whose frame carries the page colour, then a seat click
+injected through the viewer that the page answers by changing its title.
+
 ## Build and packaging
 
 `zig build web` needs CEF: either `zig build fetch-cef` (the pinned

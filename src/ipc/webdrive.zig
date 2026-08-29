@@ -20,12 +20,15 @@
 //! a human attaches to (`Session Overview`, or `sketerm mux
 //! sock:<dir>/mux.sock attach <name>`): the assistant's browsing is a
 //! session on a daemon instead of an invisible private process. What
-//! that buys TODAY: page audio reaches the session's Pulse server (an
-//! attached viewer hears it), the session is enumerable/attachable,
-//! and its lifetime tracks the helper's. What it does NOT yet buy:
-//! OSR browsers create no Wayland toplevels, so the session shows no
-//! windows — window-level watch-along needs windowed browsers or a
-//! presenter surface in the helper, on top of this seam.
+//! that buys: the helper PRESENTS every page view as a real Wayland
+//! toplevel on that hub (`src/web/presenter.zig`, armed through
+//! `SKETERM_WEB_PRESENTER=1` in the helper's environment, advertised
+//! back as the `presenter` capability), so an attached viewer sees the
+//! assistant's pages as windows, page audio reaches the session's
+//! Pulse server, and a viewer holding the controller lease drives the
+//! page with its own pointer and keyboard. The session is enumerable,
+//! attachable, and its lifetime tracks the helper's. `presenterActive`
+//! is the fact `capabilities` reports as `web_watch`.
 //!
 //! Session setup is best-effort with an automatic fallback: any
 //! failure — no daemon, an old daemon, a helper that cannot even start
@@ -35,21 +38,36 @@
 //! `SKETERM_WEB_SESSION=0` opts out entirely. A leaked session (MCP
 //! SIGKILL) is reaped by its own 60s no-client TTL.
 //!
+//! ## One engine per ROUTE
+//!
+//! A browser route (`src/web/route.zig`) is realized as a whole helper
+//! INSTANCE, never as a proxy inside one: CEF cannot give two
+//! storage-sharing contexts two egress routes. An Engine therefore
+//! carries a `route` and everything an instance owns is derived from
+//! its `Spec.slug`: the helper socket, the spawn lock, the presence
+//! file, the profile store root and the `--proxy` the helper is started
+//! with. The DIRECT route keeps the pre-route names byte for byte
+//! (`web.sock`, `web.json`, the plain instance store), so an upgrade
+//! strands no existing profile; every other route gets `web-<slug>.*`
+//! and a store root of its own. `capabilities` reports which route
+//! kinds this backend can realize as `web_routes`.
+//!
 //! ## Discoverability
 //!
 //! The helper socket lives at the WELL-KNOWN name `web.sock` inside the
 //! MCP instance directory (`$XDG_RUNTIME_DIR/sketerm/mcp-tmp-<pid>/` or
-//! `mcp-<name>/`), next to a presence file `web.json`:
+//! `mcp-<name>/`), next to a presence file `web.json` (a routed engine
+//! writes its own `web-<slug>.json` beside it, so two engines of one
+//! instance never clobber each other's record):
 //!   {"mcp_pid":N,"helper_pid":N,"client":"sketerm-mcp[:name]","started_at_ms":N,
 //!    "session":"web-...","mux_socket":"..."}
 //! (the last two only in session mode) written when the helper comes up
 //! and unlinked with it, so a GUI can enumerate assistant browser
-//! sessions by scanning the instance dirs. NOTE for a frame-level "view
-//! along": src/web/server.zig serves exactly ONE client and exits when
-//! it disconnects — a second (viewer) client needs multi-client support
-//! there first. This driver deliberately assumes nothing beyond "I
-//! created my views": view ids are engine scoped, not connection
-//! scoped.
+//! sessions by scanning the instance dirs. Watching is done through
+//! the SESSION (attach a viewer; the presenter's toplevels are there),
+//! never through a second client on `web.sock`: the helper serves
+//! several clients, but every view is scoped to the connection that
+//! created it and no client can address another's.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -69,6 +87,7 @@ const clock = @import("../util/clock.zig");
 const webprofiles = @import("webprofiles.zig");
 const webremote = @import("webprofilesremote.zig");
 const netpolicy = @import("../web/netpolicy.zig");
+const webroute = @import("../web/route.zig");
 
 /// Default logical size a headless view is created at. There is no
 /// allocation to inherit one from, and pages lay out sanely at a
@@ -280,7 +299,6 @@ pub const View = struct {
 };
 
 pub const ConsoleLine = struct { id: u32, level: u8, text: []u8 };
-
 
 /// Console mirror bounds: entries kept per view, bytes kept per line.
 pub const CONSOLE_CAP = 200;
@@ -496,17 +514,16 @@ const LiveCtx = struct {
     views: u32 = 0,
 };
 
-/// Serializes one instance dir's [probe -> spawn -> bind -> greet]
-/// window across sibling MCP clients, via an flock on `<dir>/web.lock`.
+/// Serializes one ENGINE's [probe -> spawn -> bind -> greet] window
+/// across sibling MCP clients, via an flock on its own lock file
+/// (`<dir>/web.lock` direct, `<dir>/web-<slug>.lock` per route).
 /// Best-effort by design: failure to take it reverts to the old racy
 /// behavior (worst case: a doubled spawn), never to a refusal.
 const SpawnLock = struct {
     fd: c_int = -1,
 
-    fn take(dir: []const u8) SpawnLock {
-        var z: [4096:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&z, "{s}/web.lock", .{dir}) catch return .{};
-        const fd = c.open(p.ptr, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c_uint, 0o600));
+    fn take(path: [:0]const u8) SpawnLock {
+        const fd = c.open(path.ptr, c.O_RDWR | c.O_CREAT | c.O_CLOEXEC, @as(c_uint, 0o600));
         if (fd < 0) return .{};
         const deadline = clock.nowMs() + SPAWN_LOCK_WAIT_MS;
         while (c.flock(fd, c.LOCK_EX | c.LOCK_NB) != 0) {
@@ -527,6 +544,19 @@ const SpawnLock = struct {
     }
 };
 
+/// View ids are minted PROCESS-WIDE, not per engine: one route is one
+/// engine, and the handle the `web_*` tools hand back must name exactly
+/// one view across all of them. (`webface.zig` mints its ids the same
+/// way, for the same reason.)
+var g_next_view: u32 = 1;
+
+fn nextViewId() u32 {
+    const id = g_next_view;
+    g_next_view +%= 1;
+    if (g_next_view == 0) g_next_view = 1;
+    return id;
+}
+
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     /// Directory holding the helper socket and its cache; owned.
@@ -541,6 +571,13 @@ pub const Engine = struct {
     /// Mux daemon socket for the watchable web session; null disables
     /// session hosting outright. Owned.
     mux_sock: ?[]u8 = null,
+    /// This engine's network route: `.direct` is the plain unproxied
+    /// helper whose paths are the historical ones. The two string halves
+    /// are owned copies, because a `webroute.Spec` borrows them and this
+    /// struct is returned by value from `init`.
+    route_kind: webroute.Kind = .direct,
+    route_host: []u8 = &.{},
+    route_endpoint: []u8 = &.{},
     session: ?WebSession = null,
     /// Latched when a helper failed to START with the session
     /// environment: later spawns go plain headless instead of paying a
@@ -559,7 +596,6 @@ pub const Engine = struct {
     /// Descriptors received through SCM_RIGHTS, in arrival order; a
     /// `frame_buffer` frame pops the front one.
     rx_fds: std.ArrayList(c_int) = .empty,
-    next_view: u32 = 1,
     views: std.ArrayList(*View) = .empty,
     /// The view a handle-less tool call means. Headless has no window
     /// manager to own focus, so "current" is last-touched: opening or
@@ -590,6 +626,10 @@ pub const Engine = struct {
     /// grace deadline is serving someone else (or mid-flush) and must
     /// be ABANDONED, never signalled.
     cap_multi_client: bool = false,
+    /// The helper presents its views as toplevels on the web session
+    /// (`presenter` in hello_ack). Reported, never inferred: a helper
+    /// in session mode whose presenter failed to arm still says no.
+    cap_presenter: bool = false,
     next_sem_request: u32 = 1,
     /// Stamps every `net_policy_set`; `ev_net_policy` echoes it so a
     /// stale event for a replaced policy is ignorable.
@@ -626,7 +666,17 @@ pub const Engine = struct {
     /// published to the helper that is running NOW" is derivable.
     helper_gen: u32 = 0,
 
-    pub fn init(gpa: std.mem.Allocator, dir: []const u8, instance: ?[]const u8, mux_sock: ?[]const u8) !Engine {
+    /// `route` selects the instance this engine IS; an invalid spec is
+    /// refused rather than downgraded, because a route whose proxy is
+    /// missing configures no proxy at all (see `webroute.Spec.valid`).
+    pub fn init(
+        gpa: std.mem.Allocator,
+        dir: []const u8,
+        instance: ?[]const u8,
+        mux_sock: ?[]const u8,
+        route: webroute.Spec,
+    ) !Engine {
+        if (!route.valid()) return error.InvalidRoute;
         const owned_dir = try gpa.dupe(u8, dir);
         errdefer gpa.free(owned_dir);
         const name = if (instance) |n|
@@ -637,13 +687,43 @@ pub const Engine = struct {
         const owned_instance: ?[]u8 = if (instance) |n| try gpa.dupe(u8, n) else null;
         errdefer if (owned_instance) |n| gpa.free(n);
         const owned_sock: ?[]u8 = if (mux_sock) |sck| try gpa.dupe(u8, sck) else null;
+        errdefer if (owned_sock) |sck| gpa.free(sck);
+        const owned_host = try gpa.dupe(u8, route.host);
+        errdefer gpa.free(owned_host);
+        const owned_endpoint = try gpa.dupe(u8, route.endpoint);
         return .{
             .gpa = gpa,
             .dir = owned_dir,
             .instance = owned_instance,
             .client_name = name,
             .mux_sock = owned_sock,
+            .route_kind = route.kind,
+            .route_host = owned_host,
+            .route_endpoint = owned_endpoint,
         };
+    }
+
+    /// This engine's route as the shared value type.
+    pub fn routeSpec(self: *const Engine) webroute.Spec {
+        return .{ .kind = self.route_kind, .host = self.route_host, .endpoint = self.route_endpoint };
+    }
+
+    /// The route's user-facing text (`direct` | `tor` | `via:<host>` |
+    /// `on:<host>`), rendered into `buf`.
+    pub fn routeText(self: *const Engine, buf: []u8) []const u8 {
+        return self.routeSpec().format(buf) orelse "direct";
+    }
+
+    /// `<dir>/web<ext>` for the direct route, `<dir>/web-<slug><ext>`
+    /// for any other. The direct spelling is the historical one byte for
+    /// byte: a changed socket or store path strands the profiles behind
+    /// it (the rule `webface.clientForRoute` follows).
+    fn routePathZ(self: *const Engine, buf: []u8, ext: []const u8) ?[:0]u8 {
+        if (self.route_kind == .direct)
+            return std.fmt.bufPrintZ(buf, "{s}/web{s}", .{ self.dir, ext }) catch null;
+        var slug_buf: [64]u8 = undefined;
+        const slug = self.routeSpec().slug(&slug_buf) orelse return null;
+        return std.fmt.bufPrintZ(buf, "{s}/web-{s}{s}", .{ self.dir, slug, ext }) catch null;
     }
 
     /// Kill and reap the helper; safe to call from a signal-driven
@@ -745,6 +825,10 @@ pub const Engine = struct {
         self.clearStoreReason();
         if (self.instance) |n| self.gpa.free(n);
         self.instance = null;
+        self.gpa.free(self.route_host);
+        self.route_host = &.{};
+        self.gpa.free(self.route_endpoint);
+        self.route_endpoint = &.{};
         self.gpa.free(self.dir);
         self.gpa.free(self.client_name);
         self.state = .idle;
@@ -776,6 +860,23 @@ pub const Engine = struct {
     fn openStore(self: *Engine) void {
         if (self.store_tried) return;
         self.store_tried = true;
+        // A ROUTED engine keeps a store of its own, keyed by the route's
+        // slug: the root IS its `--cache-dir`, and no other CEF process
+        // may share that. The broker's store is the instance's DIRECT
+        // root, so a routed engine never takes the broker lane either.
+        if (self.route_kind != .direct) {
+            var key_buf: [96]u8 = undefined;
+            var slug_buf: [64]u8 = undefined;
+            const slug = self.routeSpec().slug(&slug_buf) orelse {
+                self.setStoreReason("this route has no stable storage key, so it has no profile store", false);
+                return;
+            };
+            // Slug FIRST: `webprofiles` truncates a long key, and two
+            // routes sharing a store root would share their cookies.
+            const key = std.fmt.bufPrint(&key_buf, "{s}-{s}", .{ slug, self.instance orelse "anon" }) catch slug;
+            self.openLocalStore(key);
+            return;
+        }
         // Broker-owned store first, NAMED instances only: the named
         // instance's daemon is durable, so it is the one process that
         // can hold the flock across every client's lifetime — which is
@@ -800,8 +901,15 @@ pub const Engine = struct {
                 error.Unsupported, error.Refused, error.Io, error.OutOfMemory => {},
             }
         }
+        self.openLocalStore(self.instance);
+    }
+
+    /// The local (flock'd) profile store under `key`'s root. Failure is
+    /// not fatal: the engine keeps a volatile cache dir and every
+    /// profile request is refused with `store_reason`.
+    fn openLocalStore(self: *Engine, key: ?[]const u8) void {
         var holder: c.pid_t = 0;
-        self.store = webprofiles.Store.open(self.gpa, self.instance, &holder) catch |err| {
+        self.store = webprofiles.Store.open(self.gpa, key, &holder) catch |err| {
             switch (err) {
                 error.Locked => {
                     const msg = std.fmt.allocPrint(
@@ -853,6 +961,12 @@ pub const Engine = struct {
     pub fn sessionName(self: *const Engine) ?[]const u8 {
         if (self.session) |*s| return s.created.name;
         return null;
+    }
+
+    /// Whether an attached viewer sees PIXELS: the helper is a session
+    /// client AND advertised the presenter in its handshake.
+    pub fn presenterActive(self: *const Engine) bool {
+        return self.session != null and self.state == .ready and self.cap_presenter;
     }
 
     fn sessionWanted(self: *const Engine) bool {
@@ -932,7 +1046,7 @@ pub const Engine = struct {
     /// effort: enumeration metadata, never load-bearing.
     fn writePresence(self: *Engine) void {
         var path_z: [4096:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&path_z, "{s}/web.json", .{self.dir}) catch return;
+        const p = self.routePathZ(&path_z, ".json") orelse return;
         const f = c.fopen(p.ptr, "w") orelse return;
         defer _ = c.fclose(f);
         var line: [8704]u8 = undefined;
@@ -953,7 +1067,7 @@ pub const Engine = struct {
 
     fn removePresence(self: *Engine) void {
         var path_z: [4096:0]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&path_z, "{s}/web.json", .{self.dir}) catch return;
+        const p = self.routePathZ(&path_z, ".json") orelse return;
         _ = c.unlink(p.ptr);
     }
 
@@ -1033,7 +1147,7 @@ pub const Engine = struct {
         const dz = std.fmt.bufPrintZ(&dir_z, "{s}", .{self.dir}) catch return self.failStart("helper directory path too long");
         _ = c.mkdir(dz.ptr, 0o700);
         var sock_z: [108:0]u8 = undefined;
-        const sock = std.fmt.bufPrintZ(&sock_z, "{s}/web.sock", .{self.dir}) catch
+        const sock = self.routePathZ(&sock_z, ".sock") orelse
             return self.failStart("helper socket path exceeds the unix socket limit (use a shorter runtime dir)");
 
         // Serialize [probe -> spawn -> bind] against SIBLING clients of
@@ -1041,7 +1155,8 @@ pub const Engine = struct {
         // both spawn, and the second's unlink() yanks the socket from
         // under the first's bind. Best-effort — an unobtainable lock
         // degrades to the old racy behavior, never to a refusal.
-        var spawn_lock = SpawnLock.take(self.dir);
+        var lock_z: [4096:0]u8 = undefined;
+        var spawn_lock = if (self.routePathZ(&lock_z, ".lock")) |lp| SpawnLock.take(lp) else SpawnLock{};
         defer spawn_lock.release();
 
         // Adopt a live helper before spawning one: with the broker
@@ -1066,7 +1181,10 @@ pub const Engine = struct {
         // session env was minted per client); SKETERM_WEB_BROKER_ENGINE=0
         // is the escape hatch back to the client-spawn lane, session
         // included — the SKETERM_NO_BROKER precedent.
-        if (self.remote != null and brokerEngineWanted()) {
+        // A routed engine never takes this lane: the broker's engine is
+        // the instance's DIRECT one (its own socket, no `--proxy`), so
+        // adopting it for a route would browse direct under a route.
+        if (self.remote != null and self.route_kind == .direct and brokerEngineWanted()) {
             if (self.brokerEngine(sock)) return true;
             if (self.state == .unavailable and self.retryable) self.state = .idle;
         }
@@ -1082,11 +1200,14 @@ pub const Engine = struct {
         // demands every persistent context's jar be a child of it — so
         // the durable profile store root has to BE that dir. Without a
         // store the old volatile dir stays, and profiles stay refused.
+        // A routed engine has a store root of its own (see `openStore`),
+        // so this is a per-instance path either way: two CEF processes
+        // sharing a root_cache_path is measured-fatal.
         var cache_z: [4096:0]u8 = undefined;
         if (self.storeRoot()) |root| {
             _ = std.fmt.bufPrintZ(&cache_z, "{s}", .{root}) catch return self.failStart("helper cache path too long");
-        } else {
-            _ = std.fmt.bufPrintZ(&cache_z, "{s}/web-cache", .{self.dir}) catch return self.failStart("helper cache path too long");
+        } else if (self.routePathZ(&cache_z, "-cache") == null) {
+            return self.failStart("helper cache path too long");
         }
 
         // Watchable session first (best effort); the helper is then
@@ -1142,6 +1263,7 @@ pub const Engine = struct {
     /// not set). Answers `capabilities` before any view exists; once an
     /// engine is up, `owner` is the fact.
     pub fn brokerLaneAvailable(self: *Engine) bool {
+        if (self.route_kind != .direct) return false;
         if (!brokerEngineWanted()) return false;
         self.openStore();
         if (self.remote) |*r| return r.engineSupported();
@@ -1155,6 +1277,18 @@ pub const Engine = struct {
         // succeed against nothing.
         _ = c.unlink(sock.ptr);
         const env = self.sessionEnv();
+
+        // The route's proxy, prepared BEFORE the fork (nothing may
+        // allocate between fork and exec). `.mux` names none here: its
+        // bridge port is not known until the bridge binds, so an
+        // unproxiable route must never reach this function.
+        var proxy_z: [512:0]u8 = undefined;
+        var proxy_buf: [512]u8 = undefined;
+        const proxy: ?[*:0]const u8 = if (self.routeSpec().proxyUrl(&proxy_buf)) |url|
+            (std.fmt.bufPrintZ(&proxy_z, "{s}", .{url}) catch
+                return self.failStart("the route's proxy url is too long")).ptr
+        else
+            null;
 
         const pid = c.fork();
         if (pid == 0) {
@@ -1177,11 +1311,19 @@ pub const Engine = struct {
                 _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
                 _ = c.setenv("SKETERM_WEB_OZONE", "wayland", 1);
                 _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
+                // Arm the presenter: THIS helper is a client of a hub
+                // nobody else renders into, so its toplevels are the
+                // watch-along surface and not a stray desktop window.
+                _ = c.setenv(proto.CAP_PRESENTER_ENV, "1", 1);
                 _ = c.unsetenv("WAYLAND_SOCKET");
                 _ = c.unsetenv("DISPLAY");
                 _ = c.unsetenv("XAUTHORITY");
             }
-            var argv: [6:null]?[*:0]const u8 = .{ bin, "--socket", sock_z, "--cache-dir", cache_z, null };
+            var argv: [8:null]?[*:0]const u8 = .{ bin, "--socket", sock_z, "--cache-dir", cache_z, null, null, null };
+            if (proxy) |p| {
+                argv[5] = "--proxy";
+                argv[6] = p;
+            }
             _ = c.execv(bin, @ptrCast(@constCast(&argv)));
             c._exit(127);
         }
@@ -1348,13 +1490,14 @@ pub const Engine = struct {
         // never arrives.
         var owned_pol: ?NetPolicy = if (policy) |p| try dupePolicy(self.gpa, p.*) else null;
         errdefer if (owned_pol) |*p| freePolicy(self.gpa, p);
+        const new_id = nextViewId();
         var pol_serial: u32 = 0;
         if (policy) |p| {
             pol_serial = self.next_policy_serial;
             self.next_policy_serial += 1;
-            self.send(policyFrame(self.next_view, pol_serial, p)) catch return error.Unavailable;
+            self.send(policyFrame(new_id, pol_serial, p)) catch return error.Unavailable;
             if (p.block_ads) |on| {
-                self.send(proto.InterceptSet{ .view = self.next_view, .enabled = if (on) 1 else 0 }) catch return error.Unavailable;
+                self.send(proto.InterceptSet{ .view = new_id, .enabled = if (on) 1 else 0 }) catch return error.Unavailable;
             }
         }
 
@@ -1365,7 +1508,7 @@ pub const Engine = struct {
         errdefer self.abandonView(v);
         const owned_profile: ?[]u8 = if (profile_name.len > 0) try self.gpa.dupe(u8, profile_name) else null;
         v.* = .{
-            .id = self.next_view,
+            .id = new_id,
             .w = w,
             .h = h,
             .context = ctx_id,
@@ -1378,7 +1521,6 @@ pub const Engine = struct {
         // Ownership moved into the view; the errdefer above must not
         // double-free through the local.
         owned_pol = null;
-        self.next_view += 1;
         try self.views.append(self.gpa, v);
         if (url.len > 0 and self.cap_view_url) {
             self.send(proto.ViewCreateUrl{
@@ -2377,6 +2519,7 @@ pub const Engine = struct {
                 self.cap_contexts = false;
                 self.cap_contexts_fail_closed = false;
                 self.cap_net_policy = false;
+                self.cap_presenter = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.cap_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.cap_semantic = true;
@@ -2388,6 +2531,7 @@ pub const Engine = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.cap_contexts_fail_closed = true;
                     if (std.mem.eql(u8, cap, proto.CAP_NET_POLICY)) self.cap_net_policy = true;
                     if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.cap_multi_client = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_PRESENTER)) self.cap_presenter = true;
                 }
             },
             .frame_buffer => {
@@ -2626,7 +2770,7 @@ pub const Engine = struct {
 
 test "console mirror: bounded, drop-oldest, paged by id" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null, .{});
     defer {
         eng.state = .idle;
         eng.deinit();
@@ -2657,7 +2801,7 @@ test "console mirror: bounded, drop-oldest, paged by id" {
 
 test "a snapshot reply is exactly the helper's coalesced answer; strays are dropped" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null, .{});
     defer {
         eng.state = .idle; // no child to reap
         eng.deinit();
@@ -2689,7 +2833,7 @@ test "a snapshot reply is exactly the helper's coalesced answer; strays are drop
 
 test "a full-mode wait is not satisfied by a spontaneous delta" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null, .{});
     defer {
         eng.state = .idle;
         eng.deinit();
@@ -2710,7 +2854,7 @@ test "a full-mode wait is not satisfied by a spontaneous delta" {
 
 test "correlated replies ignore old request ids and preserve reader provenance" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null, .{});
     defer {
         eng.state = .idle;
         eng.deinit();
@@ -2746,7 +2890,7 @@ test "legacy timeout quarantine consumes exactly one late reply" {
 
 test "wait cleanup tolerates a view destroyed while the operation ran" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null, .{});
     defer {
         eng.state = .idle;
         eng.deinit();
@@ -2791,7 +2935,7 @@ const Pair = struct {
 
         var fds: [2]c_int = undefined;
         if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
-        self.eng = try Engine.init(gpa, "/tmp/webdrive-test", "unit", null);
+        self.eng = try Engine.init(gpa, "/tmp/webdrive-test", "unit", null, .{});
         self.eng.fd = fds[0];
         // Exactly what startHelper does to the real socket: `ensure`
         // drains the fd on every call, and a blocking one would park
@@ -3185,7 +3329,7 @@ test "profile listing reports store and live state without spawning a helper" {
 
 test "the current view is the last one touched, not the oldest" {
     const gpa = std.testing.allocator;
-    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null);
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null, .{});
     defer {
         eng.state = .idle; // no child to reap
         eng.deinit();

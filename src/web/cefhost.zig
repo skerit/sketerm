@@ -45,6 +45,7 @@ const proto = @import("protocol.zig");
 // helper's module root is src/web/.
 const zpool = @import("zpool");
 const keymap = @import("keymap.zig");
+const presenter = @import("presenter.zig");
 const platform = @import("../util/platform.zig");
 const semantic = @import("semantic.zig");
 const semnav = @import("semnav.zig");
@@ -140,6 +141,14 @@ comptime {
     std.debug.assert(keymap.flag_num_lock == cef.EVENTFLAG_NUM_LOCK_ON);
     std.debug.assert(keymap.flag_is_key_pad == cef.EVENTFLAG_IS_KEY_PAD);
     std.debug.assert(keymap.flag_left_mouse == cef.EVENTFLAG_LEFT_MOUSE_BUTTON);
+    // The presenter mirrors the protocol's modifier vocabulary so it can
+    // stay protocol-free; the two must never drift.
+    std.debug.assert(presenter.mod_shift == proto.mod_shift);
+    std.debug.assert(presenter.mod_ctrl == proto.mod_ctrl);
+    std.debug.assert(presenter.mod_alt == proto.mod_alt);
+    std.debug.assert(presenter.mod_super == proto.mod_super);
+    std.debug.assert(presenter.mod_capslock == proto.mod_capslock);
+    std.debug.assert(presenter.mod_numlock == proto.mod_numlock);
 }
 
 /// memfd_create hides behind _GNU_SOURCE, which translate-c does not
@@ -926,6 +935,15 @@ pub const Host = struct {
     /// Root cache directory (the `--cache-dir`), under which a persistent
     /// context's own cache dir is minted. Set by the server before `run`.
     profile_dir: []const u8 = "",
+    /// This instance's route proxy url ("" = direct), from `--proxy`.
+    /// Applied to the global context at `install` and to every container
+    /// context at create, so a routed instance has no direct path at
+    /// all — the route is the process, never a per-view setting.
+    instance_proxy: []const u8 = "",
+    /// The Wayland presenter (capability "presenter"): every presentable
+    /// view is mirrored as a toplevel on the session hub. Null when the
+    /// helper was not started as a session client, or once it disarmed.
+    presenter: ?*presenter.Presenter = null,
 
     /// User content (capability "userscripts"): the enabled userscript
     /// and userstyle sets, replaced whole by `us_script_set` /
@@ -1104,6 +1122,10 @@ pub const Host = struct {
 
     pub fn deinit(self: *Host) void {
         self.destroyAll();
+        if (self.presenter) |p| {
+            p.deinit();
+            self.presenter = null;
+        }
         self.views.deinit(self.gpa);
         self.webext.deinit();
         for (self.webext_replies.items) |r| self.gpa.free(r.ext);
@@ -1221,7 +1243,10 @@ pub const Host = struct {
 
         // A proxied context is all-or-nothing. Registering an rc whose
         // preference was refused would make its views use direct traffic.
-        if (req.proxy.len != 0 and !applyProxy(rc, req.proxy)) {
+        // The proxy is the INSTANCE's route (per-context proxies were
+        // removed with per-tab routing); a direct instance leaves it
+        // empty and every context is direct.
+        if (self.instance_proxy.len != 0 and !applyProxy(rc, self.instance_proxy)) {
             release(&rc.base.base);
             return;
         }
@@ -1291,6 +1316,82 @@ pub const Host = struct {
     pub fn install(self: *Host) void {
         g_host = self;
         installHandlers();
+        // The global context serves context-0 (default-jar) views; a
+        // routed instance must proxy it too, or an un-containered tab
+        // would leak direct. A refusal here is fatal to the route's
+        // promise, so log loudly — the instance still runs (its
+        // container views are proxied at create), matching how a failed
+        // container proxy refuses just that context.
+        if (self.instance_proxy.len != 0) {
+            const global_c: ?*cef.cef_request_context_t = cef.cef_request_context_get_global_context();
+            const global = global_c orelse return;
+            defer release(&global.base.base);
+            if (!applyProxy(global, self.instance_proxy))
+                std.debug.print("sketerm-web: could not apply route proxy to the global context\n", .{});
+        }
+    }
+
+    // -- presenter -----------------------------------------------------
+
+    /// Arm the Wayland presenter when the environment asks for it.
+    /// Called once by the server after `install`; a helper that is not
+    /// a session client gets null and never presents.
+    pub fn presenterStart(self: *Host) void {
+        self.presenter = presenter.Presenter.start(self.gpa, .{
+            .ctx = self,
+            .pointer = presenterPointer,
+            .scroll = presenterScroll,
+            .key = presenterKey,
+        });
+    }
+
+    /// Whether the presenter came up, for `hello_ack` (a reported fact,
+    /// never inferred from the environment by a client).
+    pub fn presenterActive(self: *const Host) bool {
+        const p = self.presenter orelse return false;
+        return p.active;
+    }
+
+    /// The display fd for the server's poll set; -1 when none.
+    pub fn presenterFd(self: *const Host) c_int {
+        const p = self.presenter orelse return -1;
+        return p.pollFd();
+    }
+
+    pub fn presenterWantsWrite(self: *const Host) bool {
+        const p = self.presenter orelse return false;
+        return p.wantsWrite();
+    }
+
+    /// One poll turn of display service; a disarmed presenter is freed
+    /// here so its fd leaves the poll set.
+    pub fn presenterPump(self: *Host) void {
+        const p = self.presenter orelse return;
+        p.pump();
+        if (!p.active) {
+            p.deinit();
+            self.presenter = null;
+        }
+    }
+
+    /// Views a human may watch: pages, never engine chrome. Background
+    /// pages and action popups belong to extensions, inspectors are
+    /// engine UI, and a windowed inspector has no frames at all.
+    fn presentable(v: *const View) bool {
+        return !v.webext_bg and !v.webext_popup and v.devtools_of == 0 and !v.windowed;
+    }
+
+    /// New pixels landed in `v.map`: mirror them to the toplevel.
+    fn presentPaint(self: *Host, v: *View, rects: []const proto.Rect) void {
+        const p = self.presenter orelse return;
+        if (!presentable(v)) return;
+        p.paint(v.id, v.pw, v.ph, v.scale_x1000, v.map, rects);
+    }
+
+    fn presentTitle(self: *Host, v: *View, title: []const u8) void {
+        const p = self.presenter orelse return;
+        if (!presentable(v)) return;
+        p.setTitle(v.id, title);
     }
 
     /// View lookup, and the multi-client ownership chokepoint: while a
@@ -2592,6 +2693,9 @@ pub const Host = struct {
     /// closed the browser itself (`popupClosedByEngine`), where asking
     /// it to close again would re-enter a teardown in progress.
     fn dropBrowser(self: *Host, v: *View, close: bool) void {
+        // The toplevel mirrors THIS browser's frame buffer, which goes
+        // away below; a revived view paints again and gets a new one.
+        if (self.presenter) |p| p.dropView(v.id);
         // Held requests belong to a browser that is going away:
         // answering them now is what stops the engine waiting on a
         // decision the client can no longer make. Cancel, never
@@ -7883,11 +7987,14 @@ test "a context whose proxy is refused registers nothing and releases once" {
     var context_ops = ContextCreateTest.ops();
     _ = c.setenv("SKETERM_WEB_FAIL_PROXY", "1", 1);
     defer _ = c.unsetenv("SKETERM_WEB_FAIL_PROXY");
+    // The proxy is the INSTANCE's route; a per-context `proxy` on the
+    // wire is ignored, so the refusal under test is the instance one.
+    host.instance_proxy = "socks5://127.0.0.1:9";
     host.contextCreateWith(.{
         .id = 5,
         .ephemeral = 1,
         .name = "proxy-refused",
-        .proxy = "socks5://127.0.0.1:9",
+        .proxy = "",
     }, &context_ops);
 
     try std.testing.expectEqual(@as(usize, 1), ContextCreateTest.released);
@@ -12286,6 +12393,48 @@ fn onProcessMessage(
 /// in-flight view answers instead — and likewise for the inspector
 /// browser CEF builds asynchronously, whose `get_view_rect` is asked
 /// before `on_after_created` ever runs.
+/// Presenter seat input -> the same engine input the wire carries. The
+/// presenter calls these between poll iterations, outside any client
+/// dispatch, so `find` applies no ownership check and the view resolves
+/// whichever connection created it.
+fn presenterPointer(ctx: ?*anyopaque, view: u32, kind: presenter.PointerKind, x: i32, y: i32, button: u8, clicks: u8, mods: u32) void {
+    const host: *Host = @ptrCast(@alignCast(ctx orelse return));
+    // A press from the viewer's seat is also focus: the assistant's
+    // client never sends `input_focus` for a page it did not click.
+    if (kind == .down) host.focus(.{ .view = view, .focused = 1 });
+    host.pointer(.{
+        .view = view,
+        .kind = @intFromEnum(@as(proto.PointerKind, switch (kind) {
+            .move => .move,
+            .down => .down,
+            .up => .up,
+            .leave => .leave,
+        })),
+        .x = x,
+        .y = y,
+        .button = button,
+        .clicks = clicks,
+        .mods = mods,
+    });
+}
+
+fn presenterScroll(ctx: ?*anyopaque, view: u32, x: i32, y: i32, dx: i32, dy: i32, mods: u32) void {
+    const host: *Host = @ptrCast(@alignCast(ctx orelse return));
+    host.scroll(.{ .view = view, .x = x, .y = y, .dx = dx, .dy = dy, .mods = mods });
+}
+
+fn presenterKey(ctx: ?*anyopaque, view: u32, keysym: u32, keycode: u32, mods: u32, pressed: bool) void {
+    const host: *Host = @ptrCast(@alignCast(ctx orelse return));
+    host.key(.{
+        .view = view,
+        .kind = @intFromEnum(@as(proto.KeyKind, if (pressed) .down else .up)),
+        .keyval = keysym,
+        .keycode = keycode,
+        .mods = mods,
+        .text = "",
+    });
+}
+
 fn viewOf(browser: [*c]cef.cef_browser_t) ?*View {
     const host = g_host orelse return null;
     if (browser != null) {
@@ -13201,6 +13350,7 @@ fn onPaint(
     v.buf_unpainted = false;
     latStamp("paint");
     v.gen +%= 1;
+    host.presentPaint(v, list[0..n]);
     if (host.viewInline(v)) {
         // Union rather than queue: a slow bridge coalesces bursts into
         // one damage rect instead of growing the outbox without bound.
@@ -13374,6 +13524,7 @@ fn onTitleChange(
     var s = Utf8.init(title);
     defer s.free();
     if (v.webext_bg or v.webext_popup) return;
+    host.presentTitle(v, s.slice());
     host.post(proto.EvTitle{ .view = v.id, .title = s.slice() });
 }
 

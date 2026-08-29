@@ -20,6 +20,8 @@ const webproto = @import("web/protocol.zig");
 const netpolicy = @import("web/netpolicy.zig");
 const version = @import("version.zig");
 const smoke_tls = @import("smoke_tls.zig");
+const wlcomp = @import("wlhost/compositor.zig");
+const wlpipe = @import("wlhost/pipe.zig");
 
 fn say(msg: []const u8) void {
     _ = c.write(2, msg.ptr, msg.len);
@@ -632,6 +634,18 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         defer _ = c.unsetenv("SKETERM_WEB_BIN");
         webSharedProfileStage(allocator, exe, rt);
         say("smoke-mcp: focused shared-profile stage ok");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBPRESENTER_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse {
+            say("smoke-mcp: SKIP focused presenter stage (sketerm-webengine not built)");
+            return 0;
+        };
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        webPresenterStage(allocator, exe, rt);
+        say("smoke-mcp: focused watch-along presenter stage ok");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_MCP_WEBENGINE_ONLY") != null) {
@@ -2086,6 +2100,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             say("smoke-mcp: broker-owned shared profiles (real CEF) ok");
             webEngineLifecycleStage(allocator, exe, rt);
             say("smoke-mcp: broker-owned engine lifecycle (real CEF) ok");
+            webPresenterStage(allocator, exe, rt);
+            say("smoke-mcp: watch-along presenter (real CEF) ok");
         }
     }
 
@@ -2151,6 +2167,9 @@ const TinyHttp = struct {
     fd: c_int = -1,
     port: u16 = 0,
     thread: ?std.Thread = null,
+    /// The one document served, whatever the path; a stage that needs
+    /// its own page sets it before `spawn`.
+    body: []const u8 = BODY,
 
     const BODY =
         "<html><head><title>Profile Origin</title></head><body>" ++
@@ -2198,14 +2217,14 @@ const TinyHttp = struct {
             const hdr = std.fmt.bufPrint(
                 &head,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-                .{BODY.len},
+                .{self.body.len},
             ) catch return;
             // MSG_NOSIGNAL, never write(2): the browser closes a
             // connection it already has the bytes for (favicon probes
             // especially), and the SIGPIPE that follows would kill the
             // smoke process rather than this one request.
             _ = c.send(cfd, hdr.ptr, hdr.len, c.MSG_NOSIGNAL);
-            _ = c.send(cfd, BODY.ptr, BODY.len, c.MSG_NOSIGNAL);
+            _ = c.send(cfd, self.body.ptr, self.body.len, c.MSG_NOSIGNAL);
             _ = c.close(cfd);
         }
     }
@@ -3098,6 +3117,257 @@ fn webSharedProfileStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [
         _ = c.usleep(50_000);
     }
     if (tries >= 400) fail("the lingering engine never reaped itself after its TTL");
+}
+
+/// The page the presenter stage serves: a solid colour a frame can be
+/// checked against, and a title that answers a click and a key, so
+/// seat input injected by a VIEWER is proven to reach the page.
+const PRESENTER_BODY =
+    "<html><head><title>PRESENTER-PAGE</title>" ++
+    "<style>html,body{margin:0;height:100%;background:#3060c0}</style></head>" ++
+    "<body onclick=\"document.title='PRESENTER-CLICKED'\">" ++
+    "<script>document.addEventListener('keydown',function(e){document.title='PRESENTER-KEY-'+e.key});</script>" ++
+    "</body></html>";
+
+/// The page colour above, in wl_shm byte order (B, G, R).
+const PRESENTER_BGR = [3]u8{ 0xc0, 0x60, 0x30 };
+
+/// A viewer of the MCP's web session: a replica compositor fed from
+/// the attach's `wayland_native` channel, recording what the presenter
+/// showed. The same shape the GUI's app host and appdrive use.
+const PresenterWatch = struct {
+    allocator: std.mem.Allocator,
+    replica: wlcomp.Compositor,
+    chan: u32 = 0,
+    sid: u32 = 0,
+    frames: usize = 0,
+    w: i32 = 0,
+    h: i32 = 0,
+    center: [4]u8 = .{ 0, 0, 0, 0 },
+    title: [128]u8 = undefined,
+    title_len: usize = 0,
+
+    fn init(allocator: std.mem.Allocator) PresenterWatch {
+        var replica = wlcomp.Compositor.init(allocator, .{}) catch fail("presenter watch: replica init");
+        replica.lenient = true;
+        return .{ .allocator = allocator, .replica = replica };
+    }
+
+    /// Register the callbacks once the struct sits at its final address.
+    fn bind(self: *PresenterWatch) void {
+        self.replica.view = .{ .ctx = self, .toplevel_frame = onFrame, .toplevel_title = onTitle };
+    }
+
+    fn deinit(self: *PresenterWatch) void {
+        self.replica.deinit();
+    }
+
+    fn onFrame(ctx: ?*anyopaque, surface: u32, w: i32, h: i32, _: i32, _: i32, _: i32, _: u32, pixels: []const u8) void {
+        const self: *PresenterWatch = @ptrCast(@alignCast(ctx.?));
+        self.sid = surface;
+        self.frames += 1;
+        self.w = w;
+        self.h = h;
+        if (w <= 0 or h <= 0) return;
+        const cx: usize = @intCast(@divTrunc(w, 2));
+        const cy: usize = @intCast(@divTrunc(h, 2));
+        const off = (cy * @as(usize, @intCast(w)) + cx) * 4;
+        if (off + 4 <= pixels.len) @memcpy(&self.center, pixels[off..][0..4]);
+    }
+
+    fn onTitle(ctx: ?*anyopaque, _: u32, title: []const u8) void {
+        const self: *PresenterWatch = @ptrCast(@alignCast(ctx.?));
+        self.title_len = @min(title.len, self.title.len);
+        @memcpy(self.title[0..self.title_len], title[0..self.title_len]);
+    }
+
+    fn titleSlice(self: *const PresenterWatch) []const u8 {
+        return self.title[0..self.title_len];
+    }
+
+    /// One mux frame from the viewer connection.
+    fn feed(self: *PresenterWatch, f: muxclient.Conn.OwnedFrame) void {
+        switch (f.ftype) {
+            .chan_open => {
+                const open = wire.decodeChanOpen(f.payload) orelse return;
+                if (open.kind != .wayland_native) return;
+                self.chan = open.id;
+                self.replica.conn_id = open.id;
+            },
+            .chan_data => {
+                if (self.chan == 0 or f.payload.len < 4) return;
+                if ((wire.decodeChanId(f.payload) orelse return) != self.chan) return;
+                self.replica.feed(f.payload[4..]) catch fail("presenter watch: the replica refused a unit");
+                self.replica.clearOut();
+            },
+            else => {},
+        }
+    }
+
+    /// Ship seat intents toward the session's brain.
+    fn intents(self: *PresenterWatch, conn: *muxclient.Conn, units: []const u8) void {
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(self.allocator);
+        var idb: [4]u8 = undefined;
+        std.mem.writeInt(u32, &idb, self.chan, .little);
+        payload.appendSlice(self.allocator, &idb) catch fail("oom");
+        payload.appendSlice(self.allocator, units) catch fail("oom");
+        conn.sendFrame(.chan_data, payload.items) catch fail("presenter watch: could not send seat intents");
+    }
+};
+
+fn presenterCenterMatches(px: [4]u8) bool {
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const d = @as(i32, px[i]) - @as(i32, PRESENTER_BGR[i]);
+        if (d > 8 or d < -8) return false;
+    }
+    return true;
+}
+
+/// Pump the viewer until `cond` holds or the deadline passes.
+fn presenterPumpUntil(
+    conn: *muxclient.Conn,
+    watch: *PresenterWatch,
+    allocator: std.mem.Allocator,
+    deadline_ms: i64,
+    comptime cond: fn (*const PresenterWatch) bool,
+) bool {
+    while (nowMs() < deadline_ms) {
+        if (cond(watch)) return true;
+        const f = conn.recvFrameFor(200) catch continue;
+        defer f.deinit(allocator);
+        watch.feed(f);
+    }
+    return cond(watch);
+}
+
+fn presenterHasChan(w: *const PresenterWatch) bool {
+    return w.chan != 0;
+}
+
+fn presenterPainted(w: *const PresenterWatch) bool {
+    return w.frames > 0 and presenterCenterMatches(w.center) and std.mem.eql(u8, w.titleSlice(), "PRESENTER-PAGE");
+}
+
+fn presenterClicked(w: *const PresenterWatch) bool {
+    return std.mem.eql(u8, w.titleSlice(), "PRESENTER-CLICKED");
+}
+
+fn presenterKeyed(w: *const PresenterWatch) bool {
+    return std.mem.eql(u8, w.titleSlice(), "PRESENTER-KEY-a");
+}
+
+/// A JSON string field's value out of `web.json` (no escapes in the
+/// values written there: a daemon-validated name and a path we minted).
+fn presenceField(json: []const u8, key: []const u8, buf: []u8) ?[]const u8 {
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\":\"", .{key}) catch return null;
+    const at = std.mem.indexOf(u8, json, needle) orelse return null;
+    const start = at + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, json, start, '"') orelse return null;
+    const v = json[start..end];
+    if (v.len > buf.len) return null;
+    @memcpy(buf[0..v.len], v);
+    return buf[0..v.len];
+}
+
+/// Watch-along, end to end against the REAL helper: the MCP opens a
+/// solid-colour page; a viewer attached to the web session sees a
+/// toplevel titled after the page and painted in its colour; a click
+/// and a key injected through the viewer's seat reach the page (its
+/// title answers), and the assistant's own tools still work after.
+fn webPresenterStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
+    var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the presenter stage");
+    defer http.deinit();
+    http.body = PRESENTER_BODY;
+    http.spawn();
+    var url_buf: [96]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/presenter", .{http.port}) catch unreachable;
+
+    var m = Mcp.spawn(allocator, exe, &.{});
+    m.initialize();
+    var args_buf: [512]u8 = undefined;
+    m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\"}}", .{url}) catch unreachable);
+    if (std.mem.indexOf(u8, m.recvLine(60_000), "isError") != null)
+        fail("presenter: web_open failed against the session-mode helper");
+
+    // The facts a human needs come from `capabilities`, reported, not
+    // inferred: session backend, the presenter armed, the socket.
+    const caps = m.callTool("capabilities", "{}");
+    if (std.mem.indexOf(u8, caps, "\"web_backend\":\"session\"") == null)
+        fail("presenter: the helper did not run in session mode (web_backend is not \"session\")");
+    if (std.mem.indexOf(u8, caps, "\"web_watch\":true") == null)
+        fail("presenter: capabilities did not report web_watch:true (the helper did not advertise the presenter)");
+    if (std.mem.indexOf(u8, caps, "\"mux_socket\":\"") == null)
+        fail("presenter: capabilities did not report the private mux socket");
+
+    var wj_path: [512]u8 = undefined;
+    const wj = std.fmt.bufPrint(&wj_path, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable;
+    var wj_buf: [8192]u8 = undefined;
+    const presence = readSmall(wj, &wj_buf);
+    var session_buf: [64]u8 = undefined;
+    const session = presenceField(presence, "session", &session_buf) orelse fail("presenter: web.json names no session");
+    var sock_buf: [512]u8 = undefined;
+    const mux_sock = presenceField(presence, "mux_socket", &sock_buf) orelse fail("presenter: web.json names no mux_socket");
+
+    // A viewer, the way the GUI's Watch button attaches: hello, attach
+    // with the controller lease (kind mcp, control) so its seat intents
+    // are applied rather than dropped.
+    var conn = muxclient.Conn.connectProbed(allocator, mux_sock) catch fail("presenter: could not connect a viewer to the private daemon");
+    defer conn.deinit();
+    conn.setNonBlocking();
+    conn.sendJson(.hello, .{ .proto = wire.PROTO_VERSION }) catch fail("presenter: viewer hello");
+    (conn.recvExpectFor(&.{.welcome}, 15_000) catch fail("presenter: viewer got no welcome")).deinit(allocator);
+    conn.sendAttach(session, .{ .kind = "mcp", .control = true }) catch fail("presenter: viewer attach");
+    (conn.recvExpectFor(&.{.snapshot}, 15_000) catch fail("presenter: viewer attach got no snapshot")).deinit(allocator);
+
+    var watch = PresenterWatch.init(allocator);
+    defer watch.deinit();
+    watch.bind();
+    if (!presenterPumpUntil(&conn, &watch, allocator, nowMs() + 20_000, presenterHasChan))
+        fail("presenter: the web session announced no wayland_native channel to the viewer");
+    if (!presenterPumpUntil(&conn, &watch, allocator, nowMs() + 30_000, presenterPainted)) {
+        std.debug.print("smoke-mcp: presenter watch: frames={d} size={d}x{d} center=({d},{d},{d}) title=\"{s}\"\n", .{
+            watch.frames, watch.w, watch.h, watch.center[2], watch.center[1], watch.center[0], watch.titleSlice(),
+        });
+        fail("presenter: no toplevel titled PRESENTER-PAGE painted in the page colour reached the viewer");
+    }
+
+    // Click the page through the viewer's seat: enter + motion at the
+    // centre, press and release the left button.
+    {
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(allocator);
+        const cx: f64 = @floatFromInt(@divTrunc(watch.w, 2));
+        const cy: f64 = @floatFromInt(@divTrunc(watch.h, 2));
+        wlpipe.appendSeatEnter(&units, allocator, watch.sid, cx, cy) catch fail("oom");
+        wlpipe.appendSeatMotion(&units, allocator, cx, cy) catch fail("oom");
+        wlpipe.appendSeatButton(&units, allocator, 0x110, true) catch fail("oom");
+        wlpipe.appendSeatButton(&units, allocator, 0x110, false) catch fail("oom");
+        watch.intents(&conn, units.items);
+    }
+    if (!presenterPumpUntil(&conn, &watch, allocator, nowMs() + 15_000, presenterClicked))
+        fail("presenter: a click injected through the viewer's seat never reached the page (title stayed put)");
+
+    // A key, through the hub's keymap: evdev 30 is `a` on every layout
+    // the hub ships.
+    {
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(allocator);
+        wlpipe.appendSeatKbdEnter(&units, allocator, watch.sid) catch fail("oom");
+        wlpipe.appendSeatKey(&units, allocator, 30, true) catch fail("oom");
+        wlpipe.appendSeatKey(&units, allocator, 30, false) catch fail("oom");
+        watch.intents(&conn, units.items);
+    }
+    if (!presenterPumpUntil(&conn, &watch, allocator, nowMs() + 15_000, presenterKeyed))
+        fail("presenter: a key injected through the viewer's seat never reached the page");
+
+    // The assistant's own tools keep working underneath the viewer.
+    if (std.mem.indexOf(u8, m.callTool("web_eval", "{\"code\":\"document.title\"}"), "PRESENTER-KEY-a") == null)
+        fail("presenter: web_eval does not see the title the viewer's input produced");
+
+    m.closeStdinWait();
 }
 
 /// Phase 3, the broker-owned engine LIFECYCLE across client

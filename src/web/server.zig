@@ -272,6 +272,9 @@ pub const Server = struct {
     /// Root cache dir (the `--cache-dir`), under which per-context caches
     /// are minted; handed to the host before `run`.
     profile_dir: []const u8 = "",
+    /// `--proxy`: this instance's route proxy url ("" = direct). Applied
+    /// to the global context and to every container context.
+    instance_proxy: []const u8 = "",
     /// `--frames-inline`: inline frame mode forced from spawn (the
     /// remote-helper launch shape — the daemon bridges the socket over
     /// the mux wire, where no descriptor can travel).
@@ -356,6 +359,7 @@ pub const Server = struct {
         self.last_flush_ms = clock.nowMs();
         self.host = cefhost.Host.init(self.gpa, &self.out);
         self.host.profile_dir = self.profile_dir;
+        self.host.instance_proxy = self.instance_proxy;
         self.host.router = .{
             .ctx = self,
             .route = routerRoute,
@@ -366,6 +370,10 @@ pub const Server = struct {
         if (self.force_inline) self.host.setInlineMode(true);
         defer self.host.deinit();
         self.host.install();
+        // The Wayland presenter (session-mode helpers only): armed after
+        // the handlers, before any client can create a view, so the very
+        // first paint already has a toplevel to land in.
+        self.host.presenterStart();
         // Load the seed list + config filters dir before any view
         // exists, so the very first navigation is already filtered.
         cefhost.interceptInit(self.gpa);
@@ -524,7 +532,7 @@ pub const Server = struct {
         // loading, and the decision can only be dispatched from this
         // thread — the wake byte ends the poll the instant a hold
         // appears), then one per connection.
-        var pfds: [2 + max_conns]c.struct_pollfd = undefined;
+        var pfds: [3 + max_conns]c.struct_pollfd = undefined;
         var n_pfds: usize = 0;
         const listen_idx: ?usize = if (self.listen_fd >= 0) blk: {
             pfds[n_pfds] = .{ .fd = self.listen_fd, .events = c.POLLIN, .revents = 0 };
@@ -537,6 +545,16 @@ pub const Server = struct {
             break :blk n_pfds - 1;
         } else null;
         _ = wake_idx;
+        // The presenter's display socket: seat input and frame callbacks
+        // arrive here, and a backed-up outbox asks for POLLOUT.
+        if (self.host.presenterFd() >= 0) {
+            pfds[n_pfds] = .{
+                .fd = self.host.presenterFd(),
+                .events = @as(c_short, c.POLLIN) | (if (self.host.presenterWantsWrite()) @as(c_short, c.POLLOUT) else @as(c_short, 0)),
+                .revents = 0,
+            };
+            n_pfds += 1;
+        }
         const conn_base = n_pfds;
         for (self.conns.items) |cn| {
             pfds[n_pfds] = .{
@@ -586,6 +604,10 @@ pub const Server = struct {
         // Nothing paints without a begin frame: keep a floor under every
         // visible view in case a client stopped asking for them.
         self.host.watchdog(clock.nowMs());
+        // Display service: pending seat input becomes engine input on
+        // this turn, and a frame callback that arrived lets the next
+        // paint through.
+        self.host.presenterPump();
         // An extension that asked to restart itself is restarted HERE,
         // never inside the call that asked: `runtime.reload` destroys
         // the very background page whose script is mid-call.
@@ -782,6 +804,7 @@ pub const Server = struct {
                     caps.add(cap);
                 }
                 if (cefhost.isAccelerated()) caps.add(proto.CAP_FRAMES_DMABUF);
+                if (self.host.presenterActive()) caps.add(proto.CAP_PRESENTER);
                 try cn.out.post(proto.HelloAck{
                     .proto = proto.PROTO_VERSION,
                     .engine_name = cefhost.engineName(),

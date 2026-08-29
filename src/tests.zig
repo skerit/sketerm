@@ -40,6 +40,7 @@ comptime {
     _ = @import("web/webkeys.zig");
     _ = @import("web/ozone.zig");
     _ = @import("web/keymap.zig");
+    _ = @import("web/presenter.zig");
     _ = @import("web/semantic.zig");
     _ = @import("web/reader.zig");
     _ = @import("web/hints.zig");
@@ -367,6 +368,7 @@ comptime {
     _ = @import("ui/menu.zig");
     _ = @import("ui/editormenu.zig");
     _ = @import("ui/appmenu.zig");
+    _ = @import("ui/assistants.zig");
     _ = @import("ui/palette.zig");
     _ = @import("ui/prefs.zig");
     _ = @import("ui/panel/canary.zig");

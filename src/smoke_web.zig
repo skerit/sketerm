@@ -132,6 +132,8 @@ const egress_view_b: u32 = 6;
 const egress_view_c: u32 = 7;
 const egress_unknown_view: u32 = 11;
 const egress_proxy_fail_view: u32 = 12;
+/// The negative-control view on a direct instance (stage 27).
+const egress_direct_view: u32 = 14;
 
 /// Stage-37 views. Both are pointed at the SAME loopback origin in two
 /// different containers: origin separation would explain a cookie not
@@ -757,6 +759,15 @@ const ProxyProbe = struct {
         return self.host[0..self.host_len];
     }
 
+    /// Forget the recorded CONNECT so the NEXT one is recorded. Only
+    /// meaningful between navigations from the main thread: a late
+    /// retry of the previous page can win the slot, which is why
+    /// `waitProbeHost` re-arms rather than asserting on the first host.
+    fn arm(self: *ProxyProbe) void {
+        self.host_len = 0;
+        self.got.store(false, .release);
+    }
+
     fn shutdown(self: *ProxyProbe) void {
         self.lis.deinit();
     }
@@ -1157,6 +1168,7 @@ const Client = struct {
     ack_webext_action: bool = false,
     ack_webext_transaction: bool = false,
     ack_multi_client: bool = false,
+    ack_presenter: bool = false,
     ack_flush: bool = false,
     /// Bumped per `ev_flushed`; the token it carried.
     flushed_seq: u32 = 0,
@@ -1709,6 +1721,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_ACTION)) self.ack_webext_action = true;
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TRANSACTION)) self.ack_webext_transaction = true;
                     if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.ack_multi_client = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_PRESENTER)) self.ack_presenter = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FLUSH)) self.ack_flush = true;
                 }
             },
@@ -2558,9 +2571,18 @@ fn connectWithRetry(path: [*:0]const u8, path_len: usize) c_int {
 /// fixtures lose their TLS handshake to a CONNECT the proxy cannot
 /// complete and no certificate error ever reaches the client (stage 40).
 /// It is done by environment rather than with `--no-proxy-server`
-/// because that switch also disables the PER-CONTEXT proxy stage 26
-/// configures, and this rig has to test proxying while not being
-/// proxied itself.
+/// because that switch also disables the INSTANCE proxy (`--proxy`)
+/// stage 26 configures, and this rig has to test proxying while not
+/// being proxied itself.
+/// Drop an inherited proxy environment in the forked child (see the
+/// docblock above); one home for both spawners.
+fn scrubProxyEnv() void {
+    for ([_][*:0]const u8{
+        "http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "no_proxy",
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "NO_PROXY",
+    }) |name| _ = c.unsetenv(name);
+}
+
 fn spawnHelper(
     exe: [*:0]const u8,
     sock: [*:0]const u8,
@@ -2573,10 +2595,7 @@ fn spawnHelper(
     if (pid < 0) fail("fork");
     if (pid != 0) return pid;
     if (no_gpu) _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
-    for ([_][*:0]const u8{
-        "http_proxy", "https_proxy", "all_proxy", "ftp_proxy", "no_proxy",
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "NO_PROXY",
-    }) |name| _ = c.unsetenv(name);
+    scrubProxyEnv();
     var vec: [10:null]?[*:0]const u8 = @splat(null);
     var n: usize = 0;
     for ([_]?[*:0]const u8{ exe, "--socket", sock, "--cache-dir", cache, extra, extra2 }) |a| {
@@ -2588,6 +2607,23 @@ fn spawnHelper(
     _ = c.execv(exe, @ptrCast(@constCast(&vec)));
     c._exit(127);
     unreachable;
+}
+
+/// Pump `cl` until `probe` records a CONNECT for `expected`. A probe
+/// keeps only its FIRST CONNECT, so a stale one (a retry of the page
+/// before) is discarded by re-arming until the expected host lands or
+/// the deadline passes.
+fn waitProbeHost(probe: *ProxyProbe, cl: *Client, expected: []const u8, timeout_ms: i64) bool {
+    const deadline = nowMs() + timeout_ms;
+    while (nowMs() < deadline) {
+        if (probe.seenHost()) |h| {
+            if (std.mem.eql(u8, h, expected)) return true;
+            std.debug.print("smoke-web: proxy saw \"{s}\" while waiting for \"{s}\"; re-arming\n", .{ h, expected });
+            probe.arm();
+        }
+        cl.pump(100);
+    }
+    return false;
 }
 
 /// Bring a helper down by EXACT pid after its client disconnected.
@@ -5167,6 +5203,12 @@ fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
     }
     if (a.ack_proto != proto.PROTO_VERSION) fail("stage mc1: client A got no hello_ack");
     if (!a.ack_multi_client) fail("stage mc1: hello_ack lacks the multi-client capability");
+    // Negative control: a helper nobody started as a session client
+    // must not present. This rig's helpers inherit the rig's own
+    // WAYLAND_DISPLAY when there is one, and toplevels on the user's
+    // desktop for every hidden view would be the bug the env flag exists
+    // to prevent.
+    if (a.ack_presenter) fail("stage mc1: a helper started without SKETERM_WEB_PRESENTER advertised the presenter");
     var b = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
     b.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-mc-b" });
     {
@@ -5323,6 +5365,7 @@ fn spawnHelperArgs(exe: [*:0]const u8, sock: [*:0]const u8, cache: [*:0]const u8
     if (pid < 0) fail("fork");
     if (pid != 0) return pid;
     _ = c.setenv("SKETERM_WEB_GPU", "0", 1);
+    scrubProxyEnv();
     var vec: [12:null]?[*:0]const u8 = @splat(null);
     var n: usize = 0;
     for ([_][*:0]const u8{ exe, "--socket", sock, "--cache-dir", cache }) |a| {
@@ -8281,19 +8324,31 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         reapHelper(sw_pid, "stage 25 forced software");
     }
 
-    // ── Stages 26/27: per-context egress + isolation ──────────────
+    // ── Stages 26/27: route instances ────────────────────────────
     //
-    // On their OWN helper, AFTER the main teardown, because a request
-    // context pointed at a proxy leaves Chromium network state that
-    // makes cef_shutdown slower than the 10s the teardown stage allows
-    // — isolating it here keeps stage 23 pristine and the egress helper
-    // gets a longer, tolerant reap of its own.
+    // A network route is a whole helper INSTANCE started with `--proxy`
+    // (src/web/route.zig): every view in it — the context-0 default jar
+    // AND every container context — leaves through that proxy, and a
+    // context-level `proxy` on the wire is ignored. On their OWN helpers,
+    // AFTER the main teardown, because a proxied request context leaves
+    // Chromium network state that makes cef_shutdown slower than the 10s
+    // the teardown stage allows.
     {
+        var probe_a = ProxyProbe{};
+        var probe_b = ProxyProbe{};
+        if (!probe_a.start() or !probe_b.start()) fail("stage 26 route: could not start the SOCKS5 probes");
+        defer probe_a.shutdown();
+        defer probe_b.shutdown();
+        var url_a_z: [64:0]u8 = undefined;
+        var url_b_z: [64:0]u8 = undefined;
+        const url_a = std.fmt.bufPrintZ(&url_a_z, "socks5://127.0.0.1:{d}", .{probe_a.lis.port}) catch unreachable;
+        const url_b = std.fmt.bufPrintZ(&url_b_z, "socks5://127.0.0.1:{d}", .{probe_b.lis.port}) catch unreachable;
+
         var sock4_buf: [96]u8 = undefined;
         const sock4 = std.fmt.bufPrintZ(&sock4_buf, "{s}/x.sock", .{dir}) catch fail("socket path");
         var cache4_buf: [128]u8 = undefined;
         const cache4 = std.fmt.bufPrintZ(&cache4_buf, "{s}/cache-egress", .{dir}) catch fail("cache path");
-        const eg_pid = spawnHelper(exe, sock4.ptr, cache4.ptr, "--ozone-platform=headless", null, false);
+        const eg_pid = spawnHelperArgs(exe, sock4.ptr, cache4.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", url_a.ptr });
         g_pid = eg_pid;
         var ec = Client{ .gpa = gpa, .fd = connectWithRetry(sock4.ptr, sock4.len) };
         ec.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-egress" });
@@ -8301,13 +8356,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             const deadline = nowMs() + 20_000;
             while (ec.ack_proto == 0 and nowMs() < deadline) ec.pump(100);
         }
-        if (ec.ack_proto != proto.PROTO_VERSION) fail("stage 26 egress: no hello_ack from the egress helper");
-        if (!ec.ack_contexts) fail("stage 26 egress: hello_ack lacks the contexts capability");
-        if (!ec.ack_contexts_fail_closed) fail("stage 26 egress: hello_ack lacks the contexts-fail-closed capability");
+        if (ec.ack_proto != proto.PROTO_VERSION) fail("stage 26 route: no hello_ack from the routed helper");
+        if (!ec.ack_contexts) fail("stage 26 route: hello_ack lacks the contexts capability");
+        if (!ec.ack_contexts_fail_closed) fail("stage 26 route: hello_ack lacks the contexts-fail-closed capability");
 
         // A nonzero context that was never created must not resolve to the
-        // global direct context. The helper reports only this view's failure
-        // and stays alive for the valid egress stages below.
+        // global context. The helper reports only this view's failure and
+        // stays alive for the route stages below.
         {
             const seq = ec.view_create_fail_seq;
             ec.send(proto.ViewCreate{
@@ -8326,65 +8381,58 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             pass("stage 26 fail-closed unknown context (no global direct fallback)");
         }
 
-        // Stage 26: a dedicated identity context pointed at a SOCKS5
-        // proxy. Its navigation must reach the proxy with the hostname
-        // UNRESOLVED (atyp=domain) — DNS resolves at the proxy end, the
-        // "browse via server X" property.
-        {
-            var probe = ProxyProbe{};
-            if (!probe.start()) fail("stage 26 egress: could not start the in-process SOCKS5 probe");
-            defer probe.shutdown();
-            var proxy_buf: [64]u8 = undefined;
-            const proxy_url = std.fmt.bufPrint(&proxy_buf, "socks5://127.0.0.1:{d}", .{probe.lis.port}) catch unreachable;
-            ec.send(proto.ContextCreate{ .id = 10, .ephemeral = 1, .name = "egress-a", .proxy = proxy_url });
-            ec.send(proto.ViewCreate{ .view = egress_view_a, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 10 });
-            ec.send(proto.Navigate{ .view = egress_view_a, .url = "http://cookie-a.example/" });
-            const deadline = nowMs() + 20_000;
-            while (probe.seenHost() == null and nowMs() < deadline) ec.pump(100);
-            const host = probe.seenHost() orelse
-                fail("stage 26 egress: the proxied context never reached the SOCKS5 probe");
-            if (!probe.atyp_domain) fail("stage 26 egress: the CONNECT did not arrive as atyp=domain (remote DNS lost)");
-            if (!std.mem.eql(u8, host, "cookie-a.example")) {
-                std.debug.print("smoke-web: proxy saw host \"{s}\"\n", .{host});
-                fail("stage 26 egress: the proxy saw the wrong host");
-            }
-            pass("stage 26 egress (per-context SOCKS5 proxy, atyp=domain, remote DNS)");
-        }
+        // Stage 26a: a CONTEXT-0 view of the routed instance. Its
+        // navigation must reach the instance's proxy with the hostname
+        // UNRESOLVED (atyp=domain): DNS resolves at the proxy end, the
+        // "browse via server X" property, and the default jar is not a
+        // way around the route.
+        ec.send(proto.ViewCreate{ .view = egress_view_a, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+        ec.send(proto.Navigate{ .view = egress_view_a, .url = "http://cookie-a.example/" });
+        if (!waitProbeHost(&probe_a, &ec, "cookie-a.example", 20_000))
+            fail("stage 26 route: a context-0 view of a routed instance never reached the SOCKS5 probe");
+        if (!probe_a.atyp_domain) fail("stage 26 route: the CONNECT did not arrive as atyp=domain (remote DNS lost)");
+        pass("stage 26 route (context-0 view egresses through the instance proxy, atyp=domain, remote DNS)");
 
-        // Stage 27: two contexts pointed at two DIFFERENT proxies; each
-        // view's traffic leaves through ITS OWN context's proxy and no
-        // other — the per-tab identity property proven directly.
+        // Stage 26b: a CONTAINER view of the same instance, whose
+        // context_create names a different, dead proxy. The field is
+        // ignored — the route is the instance — so the view still
+        // reaches the instance's probe, never port 9 and never direct.
+        ec.send(proto.ContextCreate{ .id = 10, .ephemeral = 1, .name = "egress-a", .proxy = "socks5://127.0.0.1:9" });
+        ec.send(proto.ViewCreate{ .view = egress_view_b, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 10 });
+        ec.send(proto.Navigate{ .view = egress_view_b, .url = "http://cookie-b.example/" });
+        if (!waitProbeHost(&probe_a, &ec, "cookie-b.example", 20_000))
+            fail("stage 26 route: a container view of a routed instance never reached the instance proxy");
+        pass("stage 26 route (container view egresses through the instance proxy; a context-level proxy never overrides the route)");
+
+        // Stage 27: a SECOND routed instance on another proxy, with the
+        // SAME container id: each instance's view leaves through its own
+        // proxy and no other — isolation is per instance, which is what
+        // makes a route correct by construction.
+        var sock5_buf: [96]u8 = undefined;
+        const sock5 = std.fmt.bufPrintZ(&sock5_buf, "{s}/y.sock", .{dir}) catch fail("socket path");
+        var cache5_buf: [128]u8 = undefined;
+        const cache5 = std.fmt.bufPrintZ(&cache5_buf, "{s}/cache-egress-b", .{dir}) catch fail("cache path");
+        const eg_b_pid = spawnHelperArgs(exe, sock5.ptr, cache5.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", url_b.ptr });
+        var eb = Client{ .gpa = gpa, .fd = connectWithRetry(sock5.ptr, sock5.len) };
+        eb.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-egress-b" });
         {
-            var probe_a = ProxyProbe{};
-            var probe_b = ProxyProbe{};
-            if (!probe_a.start() or !probe_b.start()) fail("stage 27 isolation: could not start the SOCKS5 probes");
-            defer probe_a.shutdown();
-            defer probe_b.shutdown();
-            var buf_a: [64]u8 = undefined;
-            var buf_b: [64]u8 = undefined;
-            const url_a = std.fmt.bufPrint(&buf_a, "socks5://127.0.0.1:{d}", .{probe_a.lis.port}) catch unreachable;
-            const url_b = std.fmt.bufPrint(&buf_b, "socks5://127.0.0.1:{d}", .{probe_b.lis.port}) catch unreachable;
-            ec.send(proto.ContextCreate{ .id = 11, .ephemeral = 1, .name = "iso-a", .proxy = url_a });
-            ec.send(proto.ContextCreate{ .id = 12, .ephemeral = 1, .name = "iso-b", .proxy = url_b });
-            ec.send(proto.ViewCreate{ .view = egress_view_b, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 11 });
-            ec.send(proto.ViewCreate{ .view = egress_view_c, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 12 });
-            ec.send(proto.Navigate{ .view = egress_view_b, .url = "http://only-in-a.example/" });
-            ec.send(proto.Navigate{ .view = egress_view_c, .url = "http://only-in-b.example/" });
             const deadline = nowMs() + 20_000;
-            while ((probe_a.seenHost() == null or probe_b.seenHost() == null) and nowMs() < deadline) ec.pump(100);
-            const ha = probe_a.seenHost() orelse fail("stage 27 isolation: context A never reached its proxy");
-            const hb = probe_b.seenHost() orelse fail("stage 27 isolation: context B never reached its proxy");
-            if (!std.mem.eql(u8, ha, "only-in-a.example")) {
-                std.debug.print("smoke-web: proxy A saw \"{s}\", proxy B saw \"{s}\"\n", .{ ha, hb });
-                fail("stage 27 isolation: proxy A saw the wrong host");
+            while (eb.ack_proto == 0 and nowMs() < deadline) {
+                eb.pump(50);
+                ec.pump(50);
             }
-            if (!std.mem.eql(u8, hb, "only-in-b.example")) {
-                std.debug.print("smoke-web: proxy A saw \"{s}\", proxy B saw \"{s}\"\n", .{ ha, hb });
-                fail("stage 27 isolation: proxy B saw the wrong host");
-            }
-            if (std.mem.eql(u8, ha, hb)) fail("stage 27 isolation: both proxies saw the same host (contexts not isolated)");
-            pass("stage 27 isolation (two contexts, two proxies, independent egress)");
         }
+        if (eb.ack_proto != proto.PROTO_VERSION) fail("stage 27 isolation: no hello_ack from the second routed helper");
+        probe_a.arm();
+        eb.send(proto.ContextCreate{ .id = 10, .ephemeral = 1, .name = "egress-a", .proxy = "" });
+        eb.send(proto.ViewCreate{ .view = egress_view_c, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 10 });
+        eb.send(proto.Navigate{ .view = egress_view_c, .url = "http://only-in-b.example/" });
+        if (!waitProbeHost(&probe_b, &eb, "only-in-b.example", 20_000))
+            fail("stage 27 isolation: the second instance's view never reached its own proxy");
+        if (probe_a.seenHost()) |h| {
+            if (std.mem.eql(u8, h, "only-in-b.example")) fail("stage 27 isolation: instance B's traffic reached instance A's proxy");
+        }
+        pass("stage 27 isolation (two route instances, two proxies; the same container id egresses per instance)");
 
         // Destroy the browsers FIRST and pump so their async close
         // finishes, THEN destroy the contexts (also exercising
@@ -8392,36 +8440,96 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // then pump again: a proxied browser still half-closed when the
         // last client goes away is the shape this stage has to unwind
         // cleanly, and the strict reap below is what proves it did.
+        eb.send(proto.ViewDestroy{ .view = egress_view_c });
+        eb.have_view = false;
+        eb.teardown_allow_close = true;
         ec.send(proto.ViewDestroy{ .view = egress_view_a });
         ec.send(proto.ViewDestroy{ .view = egress_view_b });
-        ec.send(proto.ViewDestroy{ .view = egress_view_c });
         ec.have_view = false;
         ec.teardown_allow_close = true;
         {
             const d = nowMs() + 4000;
-            while (nowMs() < d) ec.pump(50);
+            while (nowMs() < d) {
+                ec.pump(50);
+                eb.pump(50);
+            }
         }
         if (ec.fd >= 0) {
             ec.send(proto.ContextDestroy{ .id = 10 });
-            ec.send(proto.ContextDestroy{ .id = 11 });
-            ec.send(proto.ContextDestroy{ .id = 12 });
             const d = nowMs() + 2000;
             while (nowMs() < d and ec.fd >= 0) ec.pump(50);
         }
+        if (eb.fd >= 0) {
+            eb.send(proto.ContextDestroy{ .id = 10 });
+            const d = nowMs() + 2000;
+            while (nowMs() < d and eb.fd >= 0) eb.pump(50);
+        }
+        eb.deinit();
+        reapHelperTimeout(eg_b_pid, "stage 27 second route instance", 30_000);
+        g_pid = eg_pid;
         ec.deinit();
-        reapHelperTimeout(eg_pid, "stages 26/27 egress", 30_000);
+        reapHelperTimeout(eg_pid, "stages 26/27 route instance", 30_000);
     }
 
-    // A context whose proxy preference is refused is rolled back before it
-    // enters the helper registry. The immediately following view therefore
-    // fails exactly like any other missing context and never gets a buffer.
+    // Negative control: on a DIRECT instance a context-level `proxy`
+    // alone routes nothing. The field is still on the wire (older
+    // clients send it); if it ever came back as a per-context override,
+    // a container would follow it OUT of a Tor instance, so this stage
+    // pins it inert.
+    {
+        var probe_c = ProxyProbe{};
+        if (!probe_c.start()) fail("stage 27 negative control: could not start the SOCKS5 probe");
+        defer probe_c.shutdown();
+        var url_c_buf: [64]u8 = undefined;
+        const url_c = std.fmt.bufPrint(&url_c_buf, "socks5://127.0.0.1:{d}", .{probe_c.lis.port}) catch unreachable;
+        var sock_d_buf: [96]u8 = undefined;
+        const sock_d = std.fmt.bufPrintZ(&sock_d_buf, "{s}/xd.sock", .{dir}) catch fail("socket path");
+        var cache_d_buf: [128]u8 = undefined;
+        const cache_d = std.fmt.bufPrintZ(&cache_d_buf, "{s}/cache-direct-ctx", .{dir}) catch fail("cache path");
+        const d_pid = spawnHelper(exe, sock_d.ptr, cache_d.ptr, "--ozone-platform=headless", null, false);
+        g_pid = d_pid;
+        var dc = Client{ .gpa = gpa, .fd = connectWithRetry(sock_d.ptr, sock_d.len) };
+        dc.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-direct-ctx" });
+        {
+            const deadline = nowMs() + 20_000;
+            while (dc.ack_proto == 0 and nowMs() < deadline) dc.pump(100);
+        }
+        if (dc.ack_proto != proto.PROTO_VERSION) fail("stage 27 negative control: no hello_ack");
+        dc.send(proto.ContextCreate{ .id = 14, .ephemeral = 1, .name = "ctx-proxy-only", .proxy = url_c });
+        dc.send(proto.ViewCreate{ .view = egress_direct_view, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 14 });
+        dc.have_view = true;
+        // The host does not resolve, so a direct navigation ends in a
+        // load error; that (or a load, or 6s) is the bound the probe is
+        // held against.
+        const load0 = dc.load_seq;
+        const err0 = dc.load_err_seq;
+        dc.send(proto.Navigate{ .view = egress_direct_view, .url = "http://never-proxied.example/" });
+        {
+            const deadline = nowMs() + 6000;
+            while (nowMs() < deadline and dc.load_seq == load0 and dc.load_err_seq == err0) dc.pump(100);
+        }
+        if (probe_c.seenHost()) |h| {
+            std.debug.print("smoke-web: the context-only proxy saw \"{s}\"\n", .{h});
+            fail("stage 27 negative control: a context-level proxy routed traffic on a direct instance");
+        }
+        pass("stage 27 negative control (a context-level proxy alone routes nothing: the route is the instance)");
+        dc.have_view = false;
+        dc.send(proto.ViewDestroy{ .view = egress_direct_view });
+        dc.deinit();
+        reapHelper(d_pid, "stage 27 negative control");
+    }
+
+    // An instance whose route proxy is refused on a container context
+    // rolls that context back before it enters the registry. The
+    // immediately following view therefore fails exactly like any other
+    // missing context and never gets a buffer.
     {
         var sock_fail_buf: [96]u8 = undefined;
         const sock_fail = std.fmt.bufPrintZ(&sock_fail_buf, "{s}/xf.sock", .{dir}) catch fail("socket path");
         var cache_fail_buf: [128]u8 = undefined;
         const cache_fail = std.fmt.bufPrintZ(&cache_fail_buf, "{s}/cache-egress-fail", .{dir}) catch fail("cache path");
         _ = c.setenv("SKETERM_WEB_FAIL_PROXY", "1", 1);
-        const fail_pid = spawnHelper(exe, sock_fail.ptr, cache_fail.ptr, "--ozone-platform=headless", null, false);
+        const fail_pid = spawnHelperArgs(exe, sock_fail.ptr, cache_fail.ptr, &[_][*:0]const u8{ "--ozone-platform=headless", "--proxy", "socks5://127.0.0.1:9" });
         _ = c.unsetenv("SKETERM_WEB_FAIL_PROXY");
         g_pid = fail_pid;
         var fc = Client{ .gpa = gpa, .fd = connectWithRetry(sock_fail.ptr, sock_fail.len) };
@@ -8436,7 +8544,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             .id = 13,
             .ephemeral = 1,
             .name = "proxy-refused",
-            .proxy = "socks5://127.0.0.1:9",
+            .proxy = "",
         });
         fc.send(proto.ViewCreate{
             .view = egress_proxy_fail_view,
@@ -8451,7 +8559,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 26 proxy refusal: the failure named the wrong view or context");
         if (fc.fb_seq != 0 or fc.dma_seq != 0 or fc.inline_seq != 0)
             fail("stage 26 proxy refusal: a failed egress view still received a frame buffer");
-        pass("stage 26 proxy refusal (context rollback, view creation fails closed)");
+        pass("stage 26 proxy refusal (instance proxy refused on a container context: rollback, view creation fails closed)");
         fc.deinit();
         reapHelper(fail_pid, "stage 26 proxy refusal");
     }

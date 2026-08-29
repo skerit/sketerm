@@ -196,6 +196,15 @@ pub const CAP_WEBEXT_TRANSACTION = "webext-transaction";
 /// Without this capability the helper serves exactly one client and
 /// exits when it disconnects.
 pub const CAP_MULTI_CLIENT = "multi-client";
+/// The helper presents every OSR view as a Wayland toplevel on the
+/// session hub it was started against (`src/web/presenter.zig`), so an
+/// attached viewer sees the assistant's pages and can drive them.
+/// Advertised only when the presenter actually came up; a client never
+/// infers it from `WAYLAND_DISPLAY` or session mode.
+pub const CAP_PRESENTER = "presenter";
+/// The environment variable that arms the presenter in a helper; only
+/// a launcher that started the helper as a hub's client may set it.
+pub const CAP_PRESENTER_ENV = "SKETERM_WEB_PRESENTER";
 
 /// Cross-instance cookie SYNCHRONISATION (0xE0 block).
 ///
@@ -2541,10 +2550,12 @@ pub const UsStyleSet = struct {
 /// shape. `ephemeral = 0` persists under the profile dir keyed by `name`,
 /// so a named container's cookies survive a helper restart.
 ///
-/// `proxy` is empty for a direct connection, or a fixed-server proxy url
-/// the engine understands ("socks5://127.0.0.1:19180", "http://host:port").
-/// A socks5 url makes the engine resolve DNS at the proxy end, which is
-/// what "browse via server X" needs.
+/// `proxy` is IGNORED by the helper since routes became whole helper
+/// instances (`src/web/route.zig`): a route's proxy arrives as the
+/// instance's `--proxy` argument and applies to every context, so a
+/// per-context proxy could only re-route a container out of its
+/// instance. The field stays on the wire for frame compatibility and
+/// is always sent empty.
 pub const ContextCreate = struct {
     pub const tag: Tag = .context_create;
     id: u32,

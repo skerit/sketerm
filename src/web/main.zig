@@ -32,7 +32,7 @@ const server = @import("server.zig");
 const pathz = @import("../util/pathz.zig");
 
 const USAGE =
-    \\sketerm-web --socket PATH [--cache-dir PATH] [--linger-ms N]
+    \\sketerm-web --socket PATH [--cache-dir PATH] [--proxy URL] [--linger-ms N]
     \\           (--socket-fd N and --frames-inline are the daemon's
     \\            remote-helper launch shape)
     \\
@@ -90,6 +90,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var socket_path: ?[]const u8 = null;
     var cache_dir: ?[]const u8 = null;
     var socket_fd: c_int = -1;
+    var proxy_buf: [96]u8 = undefined;
+    var instance_proxy: []const u8 = "";
     var frames_inline = false;
     var linger_ms: i64 = 0;
     var i: usize = 1;
@@ -116,6 +118,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, a, "--cache-dir") and i + 1 < argv.len) {
             i += 1;
             cache_dir = copyArg(&cache_buf, std.mem.span(argv[i]));
+        } else if (std.mem.eql(u8, a, "--proxy") and i + 1 < argv.len) {
+            // This whole helper instance's route (tor / mux egress): the
+            // proxy is applied to the GLOBAL context and to every
+            // container context, so no view here has a direct path.
+            i += 1;
+            instance_proxy = copyArg(&proxy_buf, std.mem.span(argv[i])) orelse {
+                std.debug.print("sketerm-web: --proxy value is too long\n", .{});
+                return 2;
+            };
         } else if (std.mem.eql(u8, a, "--linger-ms") and i + 1 < argv.len) {
             // Broker-owned lifecycle: survive the LAST client's exit
             // and keep listening this long for the next one, then run
@@ -204,6 +215,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
         var srv = server.Server.init(gpa, sock);
         srv.profile_dir = cache;
+        srv.instance_proxy = instance_proxy;
         srv.force_inline = frames_inline;
         srv.linger_ms = linger_ms;
         defer srv.deinit();
