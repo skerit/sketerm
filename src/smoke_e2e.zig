@@ -36,6 +36,7 @@ const editor_pass = @import("render/editor_pass.zig");
 const atlas_mod = @import("render/atlas.zig");
 const wlcomp = @import("wlhost/compositor.zig");
 const clock = @import("util/clock.zig");
+const crashlog = @import("util/crashlog.zig");
 
 const MARKER = "sketerm-e2e-marker-7423";
 /// Typed on a real seat (not over IPC) — a distinct marker so the two
@@ -390,6 +391,23 @@ fn failMsg(msg: []const u8) u8 {
     _ = c.fprintf(platform.stderr(), "smoke-e2e: FAIL: %.*s\n", @as(c_int, @intCast(msg.len)), msg.ptr);
     teardown();
     return 1;
+}
+
+/// Scratch for `whyf`.
+var why_buf: [1024]u8 = undefined;
+
+/// Format a stage failure reason; valid until the next call, which is
+/// enough because a stage returns its reason straight to `failMsg` and the
+/// rig exits (a stack buffer would dangle).
+fn whyf(comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.bufPrint(&why_buf, fmt, args) catch "stage failure reason did not fit its buffer";
+}
+
+/// The stretch of an MCP reply starting at `key`, for quoting daemon-side
+/// state into a failure message; the whole reply would bury it.
+fn capsExcerpt(caps: []const u8, key: []const u8) []const u8 {
+    const start = std.mem.indexOf(u8, caps, key) orelse 0;
+    return caps[start..@min(caps.len, start + 600)];
 }
 
 /// Progress line (the stages are slow; a silent run is unreadable).
@@ -786,7 +804,7 @@ pub fn main() u8 {
         const closed = roundtrip(allocator, sock_path, close_req) orelse
             return fail("focused editor atlas close failed");
         defer allocator.free(closed);
-        if (std.mem.indexOf(u8, closed, "\"ok\":true") == null)
+        if (!mcpHas(closed, "\"ok\":true"))
             return fail("focused editor atlas close was refused");
         if (!waitPaneGone(allocator, sock_path, pane, 15_000))
             return fail("focused editor atlas pane did not finish teardown");
@@ -1223,7 +1241,7 @@ pub fn main() u8 {
     // "no such pane".
     const stale = roundtrip(allocator, sock_path, "{\"cmd\":\"attach-session\",\"pane\":99999,\"data\":\"no-such-sess-e2e\"}\n") orelse return fail("stale-pane roundtrip");
     defer allocator.free(stale);
-    if (std.mem.indexOf(u8, stale, "no such pane") != null) return fail("stale SKETERM_PANE_ID regressed to 'no such pane'");
+    if (mcpHas(stale, "no such pane")) return fail("stale SKETERM_PANE_ID regressed to 'no such pane'");
 
     // 7b. An attach that cannot proceed must DEGRADE, never abort the
     // process: a crash here takes every attached durable session's viewer
@@ -1253,7 +1271,7 @@ pub fn main() u8 {
     // 8. unknown command must error.
     const bad = roundtrip(allocator, sock_path, "{\"cmd\":\"nope\"}\n") orelse return fail("bad-cmd roundtrip");
     defer allocator.free(bad);
-    if (std.mem.indexOf(u8, bad, "\"ok\":false") == null) return fail("unknown cmd not rejected");
+    if (!mcpHas(bad, "\"ok\":false")) return fail("unknown cmd not rejected");
 
     // Leave one relayed panel tab mounted and a second target:tab setup in
     // the deliberate worker delay. SIGTERM must synchronously sever the first
@@ -4196,6 +4214,45 @@ fn waitOcrWordCenter(
     return null;
 }
 
+/// Non-blocking post-mortem on the `sketerm view` child, consumed once.
+/// A crashed viewer makes every check below tell the WRONG story: a
+/// window that no longer exists yields no pixels and no OCR text, so a
+/// "the frame cleared" wait even PASSES and the next content wait
+/// blames OCR. Reaping here also stops teardown signalling a pid the
+/// kernel may have handed to somebody else.
+fn viewerDied() ?[]const u8 {
+    if (vcast_pid <= 0) return null;
+    var status: c_int = 0;
+    if (c.waitpid(vcast_pid, &status, c.WNOHANG) != vcast_pid) return null;
+    const pid = vcast_pid;
+    vcast_pid = -1;
+    if (c.WIFSIGNALED(status)) {
+        const sig: c_int = c.WTERMSIG(status);
+        return whyf("the viewer (pid {d}) died on {s} (signal {d}) - a product crash, not a content miss; its own record is on stderr above and in crash.log under the rig's XDG_STATE_HOME", .{
+            pid, crashlog.signalName(sig), sig,
+        });
+    }
+    return whyf("the viewer (pid {d}) exited early with code {d}", .{ pid, c.WEXITSTATUS(status) });
+}
+
+/// The verdict for one failed expectation: a dead viewer outranks it,
+/// because a crashed process explains every symptom the wait saw.
+fn viewerWhy(expected: []const u8) []const u8 {
+    return viewerDied() orelse expected;
+}
+
+/// Keep what the viewer window actually showed when a content
+/// assertion failed on a LIVE window (`viewerWaitOcr`'s own dump only
+/// covers the frames it managed to grab).
+fn viewerShot(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, tag: [*:0]const u8) void {
+    var path_buf: [256:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/sketerm-e2e-viewer-{s}.png", .{std.mem.span(tag)}) catch return;
+    const shot = app.screenshotPng(win_id, 1024, null, 0) catch return;
+    defer allocator.free(shot.png);
+    writePng(path, shot.png);
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: viewer failure screenshot: %s\n", path.ptr);
+}
+
 /// Cast playback INSIDE the Sketerm Viewer: `sketerm view` on a mixed
 /// batch (image + cast + text + binary), navigated both directions on
 /// a real seat. What only a live run can prove: the shared
@@ -4340,9 +4397,9 @@ fn viewerCastStage(
     // Right -> the cast item: playback renders in place.
     app.pressKey(vwin, "Right") catch return "injecting Right failed";
     if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, true, 20_000))
-        return "the red block never rendered inside the viewer";
+        return viewerWhy("the red block never rendered inside the viewer");
     if (!castWaitRgb(allocator, app, vwin, .{ 0, 255, 0 }, 40, true, 20_000))
-        return "the green block never rendered inside the viewer";
+        return viewerWhy("the green block never rendered inside the viewer");
 
     // The GUI-minted ephemeral session (name prefix "cast").
     var name_buf: [64]u8 = undefined;
@@ -4375,21 +4432,24 @@ fn viewerCastStage(
         var st: CastObserved = .{};
         app.pressKey(vwin, "space") catch return "injecting space failed";
         if (!castWaitState(allocator, &side, "paused", 8_000, &st))
-            return "space did not pause the cast inside the viewer";
+            return viewerWhy("space did not pause the cast inside the viewer");
         // Resume so the teardown below kills a RUNNING playback. This
         // second press deliberately lands the instant the daemon
         // reports "paused" — before the GUI has necessarily read that
         // push — so it also covers the toggle's stale-state race.
         app.pressKey(vwin, "space") catch return "injecting space failed";
         if (!castWaitState(allocator, &side, "playing", 8_000, &st))
-            return "space did not resume the cast inside the viewer";
+            return viewerWhy("space did not resume the cast inside the viewer");
     }
 
     // Left -> back to the image: the outgoing controller must kill
     // its ephemeral session (this is the no-leak invariant).
     app.pressKey(vwin, "Left") catch return "injecting Left failed";
     if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, false, 15_000))
-        return "navigating back to the image did not clear the cast frame";
+        return viewerWhy("navigating back to the image did not clear the cast frame");
+    // An absence wait is satisfied by a window that no longer exists,
+    // so it proves nothing until the viewer is known to be alive.
+    if (viewerDied()) |why| return why;
     {
         var gone = false;
         var t: u32 = 0;
@@ -4408,14 +4468,15 @@ fn viewerCastStage(
     // Right again -> a FRESH controller and session (rebuild path).
     app.pressKey(vwin, "Right") catch return "injecting Right failed";
     if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, true, 20_000))
-        return "re-navigating to the cast never rendered again";
+        return viewerWhy("re-navigating to the cast never rendered again");
 
     // Right -> the TEXT item: the universal fallback renders the
     // file's bytes, and the outgoing controller dies here too (the
     // cast -> text teardown direction).
     app.pressKey(vwin, "Right") catch return "injecting Right failed";
     if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, false, 15_000))
-        return "navigating to the text item did not clear the cast frame";
+        return viewerWhy("navigating to the text item did not clear the cast frame");
+    if (viewerDied()) |why| return why;
     {
         var gone = false;
         var t: u32 = 0;
@@ -4430,41 +4491,60 @@ fn viewerCastStage(
         }
         if (!gone) return "navigating cast -> text leaked the ephemeral cast session";
     }
-    if (!viewerWaitOcr(allocator, app, vwin, "QUILL", 25_000))
+    if (!viewerWaitOcr(allocator, app, vwin, "QUILL", 25_000)) {
+        if (viewerDied()) |why| return why;
+        viewerShot(allocator, app, vwin, "text-quill");
         return "the text item's content never rendered (no QUILL in the OCR text)";
+    }
 
     // Right -> the BINARY item: classic hexdump, ASCII gutter included.
     app.pressKey(vwin, "Right") catch return "injecting Right failed";
-    if (!viewerWaitOcr(allocator, app, vwin, "HEXPROOF", 25_000))
+    if (!viewerWaitOcr(allocator, app, vwin, "HEXPROOF", 25_000)) {
+        if (viewerDied()) |why| return why;
+        viewerShot(allocator, app, vwin, "binary-hexproof");
         return "the binary item's hex dump never rendered (no HEXPROOF in the OCR text)";
+    }
 
     if (have_video) {
         // Right -> the VIDEO item: the player (or, without decoders,
         // the daemon poster) paints the clip's orange; Left tears the
-        // media stream down and restores the hex dump.
+        // media stream down and restores the hex dump. This is the
+        // stage's only media teardown, so it is the only place a fault
+        // in it can show up.
         app.pressKey(vwin, "Right") catch return "injecting Right failed";
         if (!castWaitRgb(allocator, app, vwin, .{ 0xFF, 0x80, 0x00 }, 400, true, 30_000))
-            return "the video item never painted its clip (neither playback nor the poster fallback)";
+            return viewerWhy("the video item never painted its clip (neither playback nor the poster fallback)");
         app.pressKey(vwin, "Left") catch return "injecting Left failed";
         if (!castWaitRgb(allocator, app, vwin, .{ 0xFF, 0x80, 0x00 }, 400, false, 15_000))
-            return "navigating away from the video did not clear its frame";
-        if (!viewerWaitOcr(allocator, app, vwin, "HEXPROOF", 25_000))
+            return viewerWhy("navigating away from the video did not clear its frame");
+        if (viewerDied()) |why| return why;
+        if (!viewerWaitOcr(allocator, app, vwin, "HEXPROOF", 25_000)) {
+            if (viewerDied()) |why| return why;
+            viewerShot(allocator, app, vwin, "video-back-hexproof");
             return "navigating back from the video did not restore the hex dump";
+        }
     }
 
     // Left -> text again (the backwards direction into text).
     app.pressKey(vwin, "Left") catch return "injecting Left failed";
-    if (!viewerWaitOcr(allocator, app, vwin, "QUILL", 25_000))
+    if (!viewerWaitOcr(allocator, app, vwin, "QUILL", 25_000)) {
+        if (viewerDied()) |why| return why;
+        viewerShot(allocator, app, vwin, "back-to-text-quill");
         return "navigating back to the text item did not restore its content";
+    }
 
     // Left -> the cast: a fresh controller in the backwards direction.
     app.pressKey(vwin, "Left") catch return "injecting Left failed";
     if (!castWaitRgb(allocator, app, vwin, .{ 255, 0, 0 }, 40, true, 20_000))
-        return "navigating text -> cast never rendered the recording";
+        return viewerWhy("navigating text -> cast never rendered the recording");
 
     // WM close -> clean exit, and the second session dies too.
     app.closeWindow(vwin) catch return "closing the viewer window failed";
     {
+        // `viewerDied` reaps and clears the pid, so a cleared one here
+        // means the child is already gone; never hand -1 to waitpid,
+        // which would reap an unrelated child of the rig.
+        if (vcast_pid <= 0) return "the viewer was already gone before the window was closed";
         var status: c_int = 0;
         var reaped = false;
         var t: u32 = 0;
@@ -4769,7 +4849,7 @@ fn inlineRenameLifetimeStage(
     const closed = roundtrip(allocator, sock, close_req) orelse
         return "inline rename close-pane did not reply";
     defer allocator.free(closed);
-    if (std.mem.indexOf(u8, closed, "\"ok\":true") == null)
+    if (!mcpHas(closed, "\"ok\":true"))
         return "inline rename close-pane was rejected";
     _ = app.pumpOnce(800);
     const healthy = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse
@@ -5159,13 +5239,34 @@ fn attachDuplicateGuiPane(
     return null;
 }
 
+/// Close `pane` if the GUI still lists it; a pane that already went away
+/// (its session's exit action closed it) counts as closed. Callers that
+/// KNOW the pane exists use `closeGuiPaneAndWait`, where "no such pane"
+/// is the failure it looks like.
+fn closeGuiPaneIfPresent(allocator: std.mem.Allocator, gui_sock: [:0]const u8, pane: u32) bool {
+    if (waitPaneGone(allocator, gui_sock, pane, 0)) return true;
+    return closeGuiPaneAndWait(allocator, gui_sock, pane);
+}
+
 fn closeGuiPaneAndWait(allocator: std.mem.Allocator, gui_sock: [:0]const u8, pane: u32) bool {
     var request_buf: [128]u8 = undefined;
     const request = std.fmt.bufPrint(&request_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{pane}) catch return false;
     const closed = roundtrip(allocator, gui_sock, request) orelse return false;
     defer allocator.free(closed);
-    return std.mem.indexOf(u8, closed, "\"ok\":true") != null and
-        waitPaneGone(allocator, gui_sock, pane, 10_000);
+    if (!mcpHas(closed, "\"ok\":true")) {
+        std.debug.print("smoke-e2e: close-pane {d} answered: {s}\n", .{ pane, closed });
+        return false;
+    }
+    if (waitPaneGone(allocator, gui_sock, pane, 10_000)) return true;
+    // Name what is still there: the reply the roster gives for that
+    // pane, so a veto (confirm gate, missing page) reads as itself.
+    var info_buf: [128]u8 = undefined;
+    const info_req = std.fmt.bufPrint(&info_buf, "{{\"cmd\":\"screen-info\",\"pane\":{d}}}\n", .{pane}) catch return false;
+    if (roundtrip(allocator, gui_sock, info_req)) |info| {
+        defer allocator.free(info);
+        std.debug.print("smoke-e2e: pane {d} still answers screen-info after close-pane: {s}\n", .{ pane, info });
+    }
+    return false;
 }
 
 /// Real daemon -> real GUI Terminal -> native panelhost -> correlated daemon
@@ -5190,7 +5291,7 @@ fn panelRelayGuiStage(
             "\\\"components\\\":{\\\"r\\\":{\\\"type\\\":\\\"heading\\\",\\\"text\\\":\\\"Relayed\\\",\\\"level\\\":1}}}\"}",
     ) orelse return "the GUI did not return the correlated panel-show reply";
     defer allocator.free(shown);
-    if (std.mem.indexOf(u8, shown, "\"ok\":true") == null)
+    if (!mcpHas(shown, "\"ok\":true"))
         return "the GUI rejected a valid relayed panel document";
     const panel_id = parseNumAfter(shown, "\"panel_id\":") orelse
         return "the relayed panel-show reply had no panel_id";
@@ -5472,7 +5573,7 @@ fn panelRelayGuiStage(
     const patched = panelRelayCall(allocator, &requester, 0x502, patch) orelse
         return "the GUI did not return the correlated panel-patch reply";
     defer allocator.free(patched);
-    if (std.mem.indexOf(u8, patched, "\"ok\":true") == null)
+    if (!mcpHas(patched, "\"ok\":true"))
         return "relayed panel-patch failed";
 
     var events_buf: [160]u8 = undefined;
@@ -5495,7 +5596,7 @@ fn panelRelayGuiStage(
     const closed = panelRelayCall(allocator, &requester, 0x503, close) orelse
         return "the GUI did not return the correlated panel-close reply";
     defer allocator.free(closed);
-    if (std.mem.indexOf(u8, closed, "\"ok\":true") == null)
+    if (!mcpHas(closed, "\"ok\":true"))
         return "relayed panel-close failed";
 
     const recreated = panelRelayCall(
@@ -5715,17 +5816,13 @@ fn panelRelayGuiStage(
         .ttl_secs = @as(u32, 120),
     }) catch return "could not spawn reconnect identity fixture";
     (admin.recvExpectFor(&.{.ok}, 10_000) catch return "reconnect identity fixture spawn was not acknowledged").deinit(allocator);
-    var attach_buf: [1024]u8 = undefined;
-    const attach_req = std.fmt.bufPrint(
-        &attach_buf,
-        "{{\"cmd\":\"attach-session\",\"data\":\"{s}\",\"host\":\"sock:{s}\"}}\n",
-        .{ reuse_session, mux_sock },
-    ) catch return "formatting reconnect identity attach failed";
-    const attached = roundtrip(allocator, gui_sock, attach_req) orelse
-        return "reconnect identity GUI attach timed out";
-    defer allocator.free(attached);
-    if (std.mem.indexOf(u8, attached, "\"ok\":true") == null)
+    // Attach through the helper that reports the NEW pane id: this stage
+    // later closes that pane while a same-name replacement session exists,
+    // and a close addressed by session name would resolve to whichever
+    // pane the name maps to then.
+    const reuse_pane = attachDuplicateGuiPane(allocator, gui_sock, mux_sock, reuse_session) orelse
         return "GUI refused the reconnect identity fixture";
+    std.debug.print("smoke-e2e: reconnect fixture attached as pane {d}\n", .{reuse_pane});
     _ = c.usleep(250_000);
 
     var old_lifetime = muxclient.connectPanelRequester(allocator, mux_sock, reuse_session, 10_000) catch
@@ -5790,14 +5887,16 @@ fn panelRelayGuiStage(
         }
     }
 
-    var close_reuse_buf: [128]u8 = undefined;
-    const close_reuse_req = std.fmt.bufPrint(&close_reuse_buf, "{{\"cmd\":\"close-pane\",\"session\":\"{s}\"}}\n", .{reuse_session}) catch
-        return "formatting reconnect fixture pane close failed";
-    const reuse_closed = roundtrip(allocator, gui_sock, close_reuse_req) orelse
-        return "closing reconnect fixture pane timed out";
-    defer allocator.free(reuse_closed);
-    if (std.mem.indexOf(u8, reuse_closed, "\"ok\":true") == null)
-        return "closing the unavailable reconnect fixture pane failed";
+    // A killed lifetime reaches the GUI one of two ways, and both are
+    // legitimate: an explicit `.gone` frame fires the pane's exit action
+    // and closes it, while a bare worker EOF leaves the pane in its
+    // reconnect-by-name cycle, where it refuses the different-origin
+    // replacement (asserted above). Clean up whichever remains, BY PANE
+    // ID: a close addressed by the stale session NAME used to fall back
+    // to the focused pane and close the GUI's own session, which the
+    // next stage then failed to find.
+    if (!closeGuiPaneIfPresent(allocator, gui_sock, reuse_pane))
+        return whyf("reconnect fixture pane {d} could not be closed", .{reuse_pane});
     admin.sendJson(.kill, .{ .name = reuse_session }) catch return "could not clean up reconnect replacement";
     (admin.recvExpectFor(&.{.ok}, 10_000) catch return "reconnect replacement cleanup was not acknowledged").deinit(allocator);
 
@@ -6059,9 +6158,9 @@ fn panelStage(
         "\\\"action\\\":\\\"approve\\\",\\\"class\\\":[\\\"expand\\\"]}}}\"}\n";
     const show = roundtrip(allocator, sock_path, show_req) orelse return "panel-show roundtrip";
     defer allocator.free(show);
-    if (std.mem.indexOf(u8, show, "\"ok\":true") == null) return "panel-show not ok";
+    if (!mcpHas(show, "\"ok\":true")) return "panel-show not ok";
     const panel_id = parseNumAfter(show, "\"panel_id\":") orelse return "panel-show reply has no panel_id";
-    if (std.mem.indexOf(u8, show, "\"session\":\"e2e-scope\"") == null)
+    if (!mcpHas(show, "\"session\":\"e2e-scope\""))
         return "panel-show did not echo the session it scoped the panel to";
     var guessed_buf: [160]u8 = undefined;
     const guessed_req = std.fmt.bufPrint(
@@ -6084,8 +6183,8 @@ fn panelStage(
             "\"document\":\"{\\\"root\\\":\\\"r\\\",\\\"components\\\":{\\\"r\\\":{\\\"type\\\":\\\"webview\\\"}}}\"}\n",
     ) orelse return "panel-show(bad) roundtrip";
     defer allocator.free(bad);
-    if (std.mem.indexOf(u8, bad, "\"ok\":false") == null) return "a webview component was accepted";
-    if (std.mem.indexOf(u8, bad, "webview") == null)
+    if (!mcpHas(bad, "\"ok\":false")) return "a webview component was accepted";
+    if (!mcpHas(bad, "webview"))
         return "the rejection did not name the offending component type";
 
     var waited: u32 = 0;
@@ -6132,7 +6231,7 @@ fn panelStage(
     ) catch return "panel-patch fmt";
     const patched = roundtrip(allocator, sock_path, patch_req) orelse return "panel-patch roundtrip";
     defer allocator.free(patched);
-    if (std.mem.indexOf(u8, patched, "\"ok\":true") == null) return "panel-patch not ok";
+    if (!mcpHas(patched, "\"ok\":true")) return "panel-patch not ok";
 
     // A patch naming a component that does not exist must fail with the
     // parser's message and leave the panel alone.
@@ -6149,10 +6248,10 @@ fn panelStage(
     const listed = roundtrip(allocator, sock_path, "{\"cmd\":\"panel-list\",\"session\":\"e2e-scope\"}\n") orelse
         return "panel-list roundtrip";
     defer allocator.free(listed);
-    if (std.mem.indexOf(u8, listed, "\"name\":\"e2e\"") == null) return "panel-list does not report the panel";
-    if (std.mem.indexOf(u8, listed, "\"title\":\"Epoch 42\"") == null)
+    if (!mcpHas(listed, "\"name\":\"e2e\"")) return "panel-list does not report the panel";
+    if (!mcpHas(listed, "\"title\":\"Epoch 42\""))
         return "the patched title never reached the live document";
-    if (std.mem.indexOf(u8, listed, "\"target\":\"window\"") == null) return "panel-list lost the target";
+    if (!mcpHas(listed, "\"target\":\"window\"")) return "panel-list lost the target";
 
     // Session scoping: another assistant's session must not see it.
     const other = roundtrip(allocator, sock_path, "{\"cmd\":\"panel-list\",\"session\":\"e2e-other\"}\n") orelse
@@ -6288,7 +6387,7 @@ fn panelStage(
         "\\\"query\\\":{\\\"type\\\":\\\"text_input\\\",\\\"value\\\":\\\"patched\\\",\\\"placeholder\\\":\\\"Updated\\\",\\\"clear_on_submit\\\":false}}}\"}\n";
     const reshown = roundtrip(allocator, sock_path, reshow_req) orelse return "panel-show(full replacement) roundtrip";
     defer allocator.free(reshown);
-    if (std.mem.indexOf(u8, reshown, "\"ok\":true") == null) return "panel-show(full replacement) not ok";
+    if (!mcpHas(reshown, "\"ok\":true")) return "panel-show(full replacement) not ok";
     _ = app.waitVisualSettle(win_id, 400, 10_000, 0.002, null);
     app.typeText(win_id, "-kept") catch return "typing after the full replacement failed";
     app.pressKey(win_id, "Return") catch return "submitting the full-replacement draft failed";
@@ -6443,19 +6542,19 @@ fn panelStage(
         return "panel-close fmt";
     const closed = roundtrip(allocator, sock_path, close_req) orelse return "panel-close roundtrip";
     defer allocator.free(closed);
-    if (std.mem.indexOf(u8, closed, "\"ok\":true") == null) return "panel-close not ok";
+    if (!mcpHas(closed, "\"ok\":true")) return "panel-close not ok";
     _ = app.pumpOnce(500);
 
     const gone = roundtrip(allocator, sock_path, "{\"cmd\":\"panel-list\",\"session\":\"e2e-scope\"}\n") orelse
         return "panel-list(after close) roundtrip";
     defer allocator.free(gone);
-    if (std.mem.indexOf(u8, gone, "\"name\":\"e2e\"") != null) return "a closed panel is still listed";
-    if (std.mem.indexOf(u8, gone, "\"name\":\"e2e-cmp\"") != null) return "a closed pane panel is still listed";
+    if (mcpHas(gone, "\"name\":\"e2e\"")) return "a closed panel is still listed";
+    if (mcpHas(gone, "\"name\":\"e2e-cmp\"")) return "a closed pane panel is still listed";
 
     // Addressing a dead panel must be a plain refusal, not a crash.
     const stale = roundtrip(allocator, sock_path, close_req) orelse return "stale panel-close roundtrip";
     defer allocator.free(stale);
-    if (std.mem.indexOf(u8, stale, "\"ok\":false") == null) return "closing a dead panel reported success";
+    if (!mcpHas(stale, "\"ok\":false")) return "closing a dead panel reported success";
 
     // The pane the compare panel rode on is still a working terminal.
     const alive = roundtrip(allocator, sock_path, "{\"cmd\":\"screen-info\",\"pane\":1}\n") orelse
@@ -6621,6 +6720,9 @@ fn panelStage(
     return null;
 }
 
+/// Scratch for `McpChild.spawnMuxPanel`'s failure reason.
+var panel_spawn_why: [512]u8 = undefined;
+
 /// A real `sketerm mcp` server on its own stdio pipes.
 ///
 /// Reads PUMP the display session while they wait: this process is the
@@ -6638,22 +6740,64 @@ const McpChild = struct {
     line: [1 << 16]u8 = undefined,
 
     fn spawn(allocator: std.mem.Allocator, sock_path: [:0]const u8) ?McpChild {
-        return spawnForPanelOrigin(allocator, sock_path, null, null, null);
+        var ignored: ?[]const u8 = null;
+        return spawnForPanelOrigin(allocator, sock_path, null, null, null, &ignored);
     }
 
     /// Spawn as though it runs inside a daemon-owned terminal.
+    ///
+    /// `why` names WHICH failure happened when this returns
+    /// null. They used to collapse into one `return null`, so the stage
+    /// could only say "could not spawn" — and `mux/client.zig` had
+    /// already classified the attach error (`PanelSessionNotFound` /
+    /// `SessionOriginMismatch` / anything else) before the rig threw it
+    /// away. Valid until the next call (one static buffer, single
+    /// threaded rig — the caller prints it and exits).
     fn spawnMuxPanel(
         allocator: std.mem.Allocator,
         mux_sock: [:0]const u8,
         session: [:0]const u8,
         remote_home: ?[:0]const u8,
+        why: *?[]const u8,
     ) ?McpChild {
-        var identity = muxclient.connectPanelRequester(allocator, mux_sock, session, 5_000) catch return null;
+        why.* = null;
+        // Deliberately the rig's shortest panel-requester deadline (the
+        // three other attaches allow 10s); it is named in the message so
+        // an `error.Timeout` here is read as the budget, not as a mystery.
+        const attach_ms: i64 = 5_000;
+        var identity = muxclient.connectPanelRequester(allocator, mux_sock, session, attach_ms) catch |err| {
+            why.* = std.fmt.bufPrint(
+                &panel_spawn_why,
+                "panel-requester attach to session \"{s}\" on {s} failed after {d}ms: {s}{s}",
+                .{
+                    session,
+                    mux_sock,
+                    attach_ms,
+                    @errorName(err),
+                    if (muxclient.panelRequesterKnownAbsent(err))
+                        " (that lifetime is not on this daemon)"
+                    else
+                        "",
+                },
+            ) catch "panel-requester attach failed";
+            return null;
+        };
         defer identity.deinit();
-        const origin_id = allocator.dupeZ(u8, identity.panelOriginId()) catch return null;
+        const origin_id = allocator.dupeZ(u8, identity.panelOriginId()) catch {
+            why.* = "out of memory duplicating the panel origin id";
+            return null;
+        };
         defer allocator.free(origin_id);
-        if (origin_id.len != 32) return null;
-        return spawnForPanelOrigin(allocator, mux_sock, session, origin_id, remote_home);
+        if (origin_id.len != 32) {
+            why.* = std.fmt.bufPrint(
+                &panel_spawn_why,
+                "the panel attach returned a {d}-char origin id, not 32: \"{s}\"",
+                .{ origin_id.len, origin_id },
+            ) catch "the panel attach returned a malformed origin id";
+            return null;
+        }
+        const child = spawnForPanelOrigin(allocator, mux_sock, session, origin_id, remote_home, why);
+        return child;
     }
 
     fn spawnForPanelOrigin(
@@ -6662,12 +6806,30 @@ const McpChild = struct {
         session: ?[:0]const u8,
         origin_id: ?[:0]const u8,
         remote_home: ?[:0]const u8,
+        why: *?[]const u8,
     ) ?McpChild {
         var in_pipe: [2]c_int = undefined;
         var out_pipe: [2]c_int = undefined;
-        if (c.pipe(&in_pipe) != 0 or c.pipe(&out_pipe) != 0) return null;
+        // Only the parent-side failures can be reported here; a failing
+        // execv exits the child 127 and surfaces as an unanswered
+        // initialize, which is why neither message claims to cover both.
+        if (c.pipe(&in_pipe) != 0 or c.pipe(&out_pipe) != 0) {
+            why.* = std.fmt.bufPrint(
+                &panel_spawn_why,
+                "pipe() for the MCP child failed: {s}",
+                .{@tagName(std.posix.errno(@as(c_int, -1)))},
+            ) catch "pipe() for the MCP child failed";
+            return null;
+        }
         const pid = c.fork();
-        if (pid < 0) return null;
+        if (pid < 0) {
+            why.* = std.fmt.bufPrint(
+                &panel_spawn_why,
+                "fork() for the MCP child failed: {s}",
+                .{@tagName(std.posix.errno(@as(c_int, -1)))},
+            ) catch "fork() for the MCP child failed";
+            return null;
+        }
         if (pid == 0) {
             platform.dieWithParent();
             _ = c.dup2(in_pipe[0], 0);
@@ -6781,12 +6943,16 @@ const McpChild = struct {
     }
 };
 
+/// The `id` of the reader entity whose line carries `needle`: the last
+/// `"id":` before it, in whichever lane the reply put the model (see
+/// `mcpHas`).
 fn readerEntityId(text: []const u8, needle: []const u8) ?u32 {
     const at = std.mem.lastIndexOf(u8, text, needle) orelse return null;
     const before = text[0..at];
-    const key = "\\\"id\\\":";
-    const id_at = std.mem.lastIndexOf(u8, before, key) orelse return null;
-    return parseNumAfter(text[id_at..], key);
+    inline for (.{ "\"id\":", "\\\"id\\\":" }) |key| {
+        if (std.mem.lastIndexOf(u8, before, key)) |id_at| return parseNumAfter(text[id_at..], key);
+    }
+    return null;
 }
 
 /// Real MCP GUI adapter: control socket -> WebFace token polling -> helper.
@@ -6820,15 +6986,15 @@ fn mcpWebReaderStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
     const open_args = std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"timeout_ms\":30000}}", .{page}) catch
         return "GUI reader web_open arguments did not fit";
     const opened = m.call("web_open", open_args, 60_000) orelse return "GUI reader web_open timed out";
-    if (std.mem.indexOf(u8, opened, "isError") != null or std.mem.indexOf(u8, opened, "GUI Reader Target") == null)
+    if (mcpHas(opened, "isError") or !mcpHas(opened, "GUI Reader Target"))
         return "GUI reader web_open did not settle on the real page";
-    const pane = parseNumAfter(opened, "\\\"pane\\\":") orelse return "GUI reader web_open returned no pane handle";
+    const pane = mcpNum(opened, "pane") orelse return "GUI reader web_open returned no pane handle";
 
     const read_args = std.fmt.bufPrint(&args, "{{\"pane\":{d},\"timeout_ms\":30000}}", .{pane}) catch
         return "GUI reader web_read arguments did not fit";
     const read = m.call("web_read", read_args, 60_000) orelse return "GUI reader web_read timed out";
-    if (std.mem.indexOf(u8, read, "GUI-READER-MARKER") == null or
-        std.mem.indexOf(u8, read, "\\\"entities\\\"") == null)
+    if (!mcpHas(read, "GUI-READER-MARKER") or
+        !mcpHas(read, "\"entities\""))
         return "GUI reader web_read did not return its rich entity model";
     const id = readerEntityId(read, "Activate GUI Reader Target") orelse
         return "GUI reader web_read did not expose the target entity id";
@@ -6836,12 +7002,12 @@ fn mcpWebReaderStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
     const act_args = std.fmt.bufPrint(&args, "{{\"pane\":{d},\"id\":{d},\"action\":\"click\"}}", .{ pane, id }) catch
         return "GUI reader web_act arguments did not fit";
     const acted = m.call("web_act", act_args, 60_000) orelse return "GUI reader web_act timed out";
-    if (std.mem.indexOf(u8, acted, "\\\"acted\\\":true") == null)
+    if (!mcpHas(acted, "\"acted\":true"))
         return "GUI reader fresh entity id did not act";
     const title_args = std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"document.title\"}}", .{pane}) catch
         return "GUI reader title eval arguments did not fit";
     const title = m.call("web_eval", title_args, 30_000) orelse return "GUI reader title eval timed out";
-    if (std.mem.indexOf(u8, title, "gui:mcp:true") == null)
+    if (!mcpHas(title, "gui:mcp:true"))
         return "GUI reader entity id did not activate its exact trusted link";
 
     var reread_buf: [128]u8 = undefined;
@@ -6855,13 +7021,13 @@ fn mcpWebReaderStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
     const mutate_args = std.fmt.bufPrint(&args, "{{\"pane\":{d},\"code\":\"document.getElementById('target').href='#stale';'retargeted'\"}}", .{pane}) catch
         return "GUI reader mutation eval arguments did not fit";
     const mutated = m.call("web_eval", mutate_args, 30_000) orelse return "GUI reader mutation eval timed out";
-    if (std.mem.indexOf(u8, mutated, "retargeted") == null)
+    if (!mcpHas(mutated, "retargeted"))
         return "GUI reader target could not be retargeted";
     const stale_args = std.fmt.bufPrint(&args, "{{\"pane\":{d},\"id\":{d},\"action\":\"click\"}}", .{ pane, stale_id }) catch
         return "GUI stale reader web_act arguments did not fit";
     const stale = m.call("web_act", stale_args, 60_000) orelse return "GUI stale reader action timed out";
-    if (std.mem.indexOf(u8, stale, "stale reader id") == null or
-        std.mem.indexOf(u8, stale, "isError") == null)
+    if (!mcpHas(stale, "stale reader id") or
+        !mcpHas(stale, "isError"))
         return "GUI MCP adapter did not refuse the stale reader entity";
     return null;
 }
@@ -6917,22 +7083,42 @@ fn mcpMuxPanelStage(
     }
     if (term_win == 0) return "no terminal window for the mux-native MCP panel";
 
-    var m = McpChild.spawnMuxPanel(allocator, mux_sock, session, null) orelse
-        return "could not spawn default MCP with the local pane origin";
+    // The whole stage is about the GUI session's own origin, so a session
+    // that vanished must be reported as that rather than as a panel or
+    // capability failure downstream of it.
+    if (muxHasSession(allocator, mux_sock, session)) |present| {
+        if (!present)
+            return whyf("the GUI session \"{s}\" is gone from {s} before the panel-origin MCP spawn", .{ session, mux_sock });
+    } else return "could not list daemon sessions before the panel-origin MCP spawn";
+
+    var spawn_why: ?[]const u8 = null;
+    var m = McpChild.spawnMuxPanel(allocator, mux_sock, session, null, &spawn_why) orelse
+        return spawn_why orelse "could not spawn default MCP with the local pane origin";
     defer m.close();
-    if (!m.initialize()) return "the local-origin MCP server never answered initialize";
+    if (!m.initialize())
+        return "the local-origin MCP server never answered initialize (a failed execv exits that child 127)";
 
     const caps = m.call("capabilities", "{}", 20_000) orelse
         return "local-origin MCP capabilities timed out";
-    if (std.mem.indexOf(u8, caps, "\\\"mode\\\":\\\"isolated\\\"") == null or
-        std.mem.indexOf(u8, caps, "\\\"panels\\\":true") == null or
-        std.mem.indexOf(u8, caps, "\\\"gui_socket\\\":false") == null or
-        std.mem.indexOf(u8, caps, "\\\"selected\\\":\\\"mux_relay\\\"") == null)
-        return "local-origin capabilities did not report isolated mux panels without a GUI socket";
+    // One fact per message: these used to share a sentence, so a panel
+    // transport that reported exactly why it was unavailable
+    // (origin_unreachable, no_compatible_gui, viewer_timeout,
+    // session_unavailable) was indistinguishable from a wrong mode.
+    // Facts live UNESCAPED in structuredContent since the structured
+    // results migration (docs/mcp-structured-results.md); the escaped
+    // text-lane form these once matched no longer exists.
+    if (!mcpHas(caps, "\"mode\":\"isolated\""))
+        return whyf("local-origin capabilities did not report isolated mode: {s}", .{capsExcerpt(caps, "\"mode\"")});
+    if (!mcpHas(caps, "\"panels\":true"))
+        return whyf("local-origin capabilities report no live panel transport: {s}", .{capsExcerpt(caps, "panel_transport")});
+    if (!mcpHas(caps, "\"gui_socket\":false"))
+        return whyf("local-origin capabilities claim a direct GUI socket: {s}", .{capsExcerpt(caps, "\"gui_socket\"")});
+    if (!mcpHas(caps, "\"selected\":\"mux_relay\""))
+        return whyf("local-origin capabilities did not select the mux relay: {s}", .{capsExcerpt(caps, "panel_transport")});
 
     const gui_terms = m.call("list_terminals", "{}", 20_000) orelse
         return "isolated list_terminals timed out";
-    if (std.mem.indexOf(u8, gui_terms, "isError") == null or
+    if (!mcpHas(gui_terms, "isError") or
         std.mem.indexOf(u8, gui_terms, session) != null)
         return "the panel origin exposed its live pane through GUI terminal tools";
     const private_terms = m.call("term_list", "{}", 20_000) orelse
@@ -6946,8 +7132,8 @@ fn mcpMuxPanelStage(
     const shown = m.call("ui_show",
         \\{"name":"origin-pane","target":"pane","document":{"title":"Origin pane","root":"approve","components":{"approve":{"type":"button","text":"Approve local","action":"local-approve","class":["expand"]}}}}
     , 30_000) orelse return "local-origin ui_show timed out";
-    if (std.mem.indexOf(u8, shown, "isError") != null) return "local-origin ui_show returned an error";
-    const panel_id = parseNumAfter(shown, "\\\"panel_id\\\":") orelse
+    if (mcpHas(shown, "isError")) return "local-origin ui_show returned an error";
+    const panel_id = mcpNum(shown, "panel_id") orelse
         return "local-origin ui_show returned no panel_id";
     if (!app.waitChangeSince(term_win, &baseline, 10_000, 0.02, null))
         return "the mux-relayed panel did not visibly replace its exact origin pane";
@@ -6986,9 +7172,9 @@ fn mcpMuxPanelStage(
         }
     }
     const event = m.recv(30_000) orelse return "local-origin ui_wait_event never answered";
-    if (std.mem.indexOf(u8, event, "isError") != null or
-        std.mem.indexOf(u8, event, "local-approve") == null or
-        std.mem.indexOf(u8, event, "\\\"kind\\\":\\\"click\\\"") == null)
+    if (mcpHas(event, "isError") or
+        !mcpHas(event, "local-approve") or
+        !mcpHas(event, "\"kind\":\"click\""))
     {
         _ = c.fprintf(platform.stderr(), "smoke-e2e: local-origin event reply: %.*s\n", @as(c_int, @intCast(event.len)), event.ptr);
         return "local-origin ui_wait_event did not return the real button click";
@@ -6999,13 +7185,13 @@ fn mcpMuxPanelStage(
         "{\"name\":\"origin-pane\",\"patch\":[{\"op\":\"title\",\"value\":\"Origin patched\"}]}",
         20_000,
     ) orelse return "local-origin ui_patch timed out";
-    if (std.mem.indexOf(u8, patched, "isError") != null) return "local-origin ui_patch failed";
+    if (mcpHas(patched, "isError")) return "local-origin ui_patch failed";
     const listed = m.call("ui_panels", "{}", 20_000) orelse return "local-origin ui_panels timed out";
-    if (std.mem.indexOf(u8, listed, "Origin patched") == null)
+    if (!mcpHas(listed, "Origin patched"))
         return "local-origin ui_panels did not report the patched live document";
     const saved = m.call("ui_save", "{\"name\":\"origin-pane\"}", 20_000) orelse
         return "local-origin ui_save timed out";
-    if (std.mem.indexOf(u8, saved, "isError") != null) return "local-origin ui_save failed";
+    if (mcpHas(saved, "isError")) return "local-origin ui_save failed";
     if (savedRelayPanelMatchesLive(allocator, mux_sock, session, "origin-pane", panel_id)) |why| return why;
 
     const app_result = m.call(
@@ -7013,9 +7199,9 @@ fn mcpMuxPanelStage(
         "{\"command\":[\"/bin/sh\",\"-c\",\"sleep 30\"],\"wait_for\":\"exit\",\"wait_ms\":100,\"stable_ms\":0}",
         20_000,
     ) orelse return "private launch_app timed out in the local-origin stage";
-    const private_app_id = parseNumAfter(app_result, "\\\"app\\\":") orelse
+    const private_app_id = mcpNum(app_result, "app") orelse
         return "private launch_app returned no app id in the local-origin stage";
-    if (std.mem.indexOf(u8, app_result, "\\\"exited\\\":true") != null)
+    if (mcpHas(app_result, "\"exited\":true"))
         return "private launch_app was not alive during the local-origin isolation check";
     var private_name_buf: [96]u8 = undefined;
     const private_name = std.fmt.bufPrint(&private_name_buf, "mcpapp-{d}-1", .{m.pid}) catch
@@ -7035,17 +7221,17 @@ fn mcpMuxPanelStage(
         return "private close_app arguments did not fit";
     const close_result = m.call("close_app", close_args, 20_000) orelse
         return "closing the live private app timed out";
-    if (std.mem.indexOf(u8, close_result, "isError") != null)
+    if (mcpHas(close_result, "isError"))
         return "closing the live private app failed";
     if (!waitMuxSessionGone(allocator, private_sock, private_name))
         return "close_app did not remove the exact private app session";
 
     const closed = m.call("ui_close", "{\"name\":\"origin-pane\"}", 20_000) orelse
         return "local-origin ui_close timed out";
-    if (std.mem.indexOf(u8, closed, "isError") != null) return "local-origin ui_close failed";
+    if (mcpHas(closed, "isError")) return "local-origin ui_close failed";
     const deleted = m.call("ui_delete", "{\"name\":\"origin-pane\"}", 20_000) orelse
         return "local-origin ui_delete timed out";
-    if (std.mem.indexOf(u8, deleted, "isError") != null) {
+    if (mcpHas(deleted, "isError")) {
         _ = c.fprintf(platform.stderr(), "smoke-e2e: local-origin delete reply: %.*s\n", @as(c_int, @intCast(deleted.len)), deleted.ptr);
         return "local-origin ui_delete failed";
     }
@@ -7083,7 +7269,7 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     // The GUI socket is attached, so panels are available — and the
     // preflight must say so.
     const caps = m.call("capabilities", "{}", 20_000) orelse return "capabilities timed out";
-    if (std.mem.indexOf(u8, caps, "\\\"panels\\\":true") == null)
+    if (!mcpHas(caps, "\"panels\":true"))
         return "capabilities does not report panels as available with a GUI socket";
 
     // 1. ui_show, with the document as a JSON OBJECT (the natural shape
@@ -7091,15 +7277,15 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     const show = m.call("ui_show",
         \\{"name":"mcp-e2e","session":"","target":"window","document":{"title":"Epoch 41","root":"ok","components":{"ok":{"type":"button","text":"Approve","action":"approve","class":["expand"]}}}}
     , 30_000) orelse return "ui_show timed out";
-    if (std.mem.indexOf(u8, show, "isError") != null) return "ui_show returned an error";
-    const panel_id = parseNumAfter(show, "\\\"panel_id\\\":") orelse return "ui_show returned no panel_id";
+    if (mcpHas(show, "isError")) return "ui_show returned an error";
+    const panel_id = mcpNum(show, "panel_id") orelse return "ui_show returned no panel_id";
 
     // A malformed document must come back with the parser's own text.
     const bad = m.call("ui_show",
         \\{"name":"mcp-bad","session":"","document":{"root":"r","components":{"r":{"type":"webview"}}}}
     , 20_000) orelse return "ui_show(bad) timed out";
-    if (std.mem.indexOf(u8, bad, "isError") == null) return "a webview component was accepted through MCP";
-    if (std.mem.indexOf(u8, bad, "webview") == null) return "the MCP rejection did not name the offending component";
+    if (!mcpHas(bad, "isError")) return "a webview component was accepted through MCP";
+    if (!mcpHas(bad, "webview")) return "the MCP rejection did not name the offending component";
 
     var waited: u32 = 0;
     const win_id = while (waited < 25_000) : (waited += 200) {
@@ -7118,23 +7304,34 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     // the compositor side keeps running.
     var settle: u32 = 0;
     while (settle < 5) : (settle += 1) _ = app.pumpOnce(100);
-    app.clickEx(win_id, @as(f64, @floatFromInt(pw.w)) / 2, @as(f64, @floatFromInt(pw.h)) / 2, 1, 100, 1) catch
+    // Aim at the button's own text, as the pane-origin stage does; the
+    // window centre is only a fallback for a host without OCR.
+    const click = waitOcrWordCenter(allocator, app, win_id, "Approve", 10_000) orelse
+        OcrPoint{ .x = @as(f64, @floatFromInt(pw.w)) / 2, .y = @as(f64, @floatFromInt(pw.h)) / 2 };
+    app.clickEx(win_id, click.x, click.y, 1, 100, 1) catch
         return "clicking the MCP panel button failed";
     const ev = m.recv(30_000) orelse return "ui_wait_event never answered";
-    if (std.mem.indexOf(u8, ev, "isError") != null) return "ui_wait_event returned an error";
-    if (std.mem.indexOf(u8, ev, "timed_out") != null) return "ui_wait_event timed out on a real click";
-    if (std.mem.indexOf(u8, ev, "approve") == null) return "ui_wait_event did not return the button's action";
-    if (std.mem.indexOf(u8, ev, "\\\"kind\\\":\\\"click\\\"") == null) return "the MCP event was not a click";
+    if (mcpHas(ev, "isError")) return "ui_wait_event returned an error";
+    if (mcpHas(ev, "\"timed_out\":true")) {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-mcp-panel-noclick.png", shot.png);
+        } else |_| {}
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: MCP panel window %u is %ux%u, clicked (%.0f,%.0f), reply: %.*s\n", win_id, pw.w, pw.h, click.x, click.y, @as(c_int, @intCast(@min(ev.len, 600))), ev.ptr);
+        return "ui_wait_event timed out on a real click (see zig-out/smoke-e2e-mcp-panel-noclick.png)";
+    }
+    if (!mcpHas(ev, "approve")) return "ui_wait_event did not return the button's action";
+    if (!mcpHas(ev, "\"kind\":\"click\"")) return "the MCP event was not a click";
 
     // 3. ui_patch updates the live document, ui_panels sees the new
     // title, and the panel is listed as live rather than saved.
     const patched = m.call("ui_patch",
         \\{"name":"mcp-e2e","session":"","patch":[{"op":"title","value":"Epoch 42"}]}
     , 20_000) orelse return "ui_patch timed out";
-    if (std.mem.indexOf(u8, patched, "isError") != null) return "ui_patch returned an error";
+    if (mcpHas(patched, "isError")) return "ui_patch returned an error";
     const listed = m.call("ui_panels", "{\"session\":\"\"}", 20_000) orelse return "ui_panels timed out";
-    if (std.mem.indexOf(u8, listed, "Epoch 42") == null) return "ui_panels does not show the patched title";
-    if (std.mem.indexOf(u8, listed, "\\\"saved\\\":[]") == null) return "ui_panels claims a saved document that was never saved";
+    if (!mcpHas(listed, "Epoch 42")) return "ui_panels does not show the patched title";
+    if (!mcpHas(listed, "\"saved\":[]")) return "ui_panels claims a saved document that was never saved";
 
     // 4. ui_save with no document persists what is on screen, patch
     // included. The server keeps NO copy of what it showed: it reads
@@ -7142,7 +7339,7 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     // the live document byte for byte (both are doc.toJson canonical).
     const saved = m.call("ui_save", "{\"name\":\"mcp-e2e\",\"session\":\"\"}", 20_000) orelse
         return "ui_save timed out";
-    if (std.mem.indexOf(u8, saved, "isError") != null) return "ui_save (from the live document) returned an error";
+    if (mcpHas(saved, "isError")) return "ui_save (from the live document) returned an error";
     if (savedPanelMatchesLive(allocator, sock_path, "", "mcp-e2e", panel_id)) |why| return why;
 
     // 4b. The hole a server-side mirror could never cover: a panel THIS
@@ -7159,7 +7356,7 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     _ = app.pumpOnce(300);
     const foreign_saved = m.call("ui_save", "{\"name\":\"foreign\",\"session\":\"\"}", 20_000) orelse
         return "ui_save(foreign) timed out";
-    if (std.mem.indexOf(u8, foreign_saved, "isError") != null)
+    if (mcpHas(foreign_saved, "isError"))
         return "ui_save could not persist a panel shown by another process";
     if (savedPanelMatchesLive(allocator, sock_path, "", "foreign", foreign_id)) |why| return why;
     {
@@ -7172,40 +7369,40 @@ fn mcpPanelStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:
     }
     const dropped = m.call("ui_delete", "{\"name\":\"foreign\",\"session\":\"\"}", 20_000) orelse
         return "ui_delete(foreign) timed out";
-    if (std.mem.indexOf(u8, dropped, "isError") != null) return "ui_delete(foreign) returned an error";
+    if (mcpHas(dropped, "isError")) return "ui_delete(foreign) returned an error";
     _ = app.pumpOnce(300);
 
     // ui_save cannot invent a document for a panel that is not on
     // screen: that is a refusal, never a stale save.
     const ghost = m.call("ui_save", "{\"name\":\"never-shown\",\"session\":\"\"}", 20_000) orelse
         return "ui_save(ghost) timed out";
-    if (std.mem.indexOf(u8, ghost, "isError") == null)
+    if (!mcpHas(ghost, "isError"))
         return "ui_save claimed to save a panel that was never shown";
     const closed = m.call("ui_close", "{\"name\":\"mcp-e2e\",\"session\":\"\"}", 20_000) orelse
         return "ui_close timed out";
-    if (std.mem.indexOf(u8, closed, "isError") != null) return "ui_close returned an error";
+    if (mcpHas(closed, "isError")) return "ui_close returned an error";
     _ = app.pumpOnce(500);
     const after_close = m.call("ui_panels", "{\"session\":\"\"}", 20_000) orelse return "ui_panels timed out";
-    if (std.mem.indexOf(u8, after_close, "\\\"live\\\":[]") == null) return "a closed panel is still listed as live";
-    if (std.mem.indexOf(u8, after_close, "Epoch 42") == null) return "ui_close destroyed the saved document";
+    if (!mcpHas(after_close, "\"live\":[]")) return "a closed panel is still listed as live";
+    if (!mcpHas(after_close, "Epoch 42")) return "ui_close destroyed the saved document";
 
     // 5. The saved document renders again, and ui_delete removes only
     // the stored copy.
     const reshown = m.call("ui_show",
         \\{"name":"mcp-e2e","session":"","target":"window","load":"mcp-e2e"}
     , 30_000) orelse return "ui_show(load) timed out";
-    if (std.mem.indexOf(u8, reshown, "isError") != null) return "ui_show could not re-open the saved panel";
+    if (mcpHas(reshown, "isError")) return "ui_show could not re-open the saved panel";
     _ = app.pumpOnce(500);
     const deleted = m.call("ui_delete", "{\"name\":\"mcp-e2e\",\"session\":\"\"}", 20_000) orelse
         return "ui_delete timed out";
-    if (std.mem.indexOf(u8, deleted, "isError") != null) return "ui_delete returned an error";
+    if (mcpHas(deleted, "isError")) return "ui_delete returned an error";
     const final = m.call("ui_panels", "{\"session\":\"\"}", 20_000) orelse return "ui_panels timed out";
-    if (std.mem.indexOf(u8, final, "\\\"saved\\\":[]") == null) return "ui_delete left the saved document behind";
-    if (std.mem.indexOf(u8, final, "\\\"live\\\":[]") != null) return "ui_delete closed the live panel too";
+    if (!mcpHas(final, "\"saved\":[]")) return "ui_delete left the saved document behind";
+    if (mcpHas(final, "\"live\":[]")) return "ui_delete closed the live panel too";
 
     const gone = m.call("ui_close", "{\"name\":\"mcp-e2e\",\"session\":\"\"}", 20_000) orelse
         return "final ui_close timed out";
-    if (std.mem.indexOf(u8, gone, "isError") != null) return "the re-opened panel could not be closed";
+    if (mcpHas(gone, "isError")) return "the re-opened panel could not be closed";
     _ = app.pumpOnce(500);
     return null;
 }
@@ -7281,21 +7478,25 @@ fn remotePanelAssetStage(
     const session_z = std.fmt.bufPrintZ(&session_buf, "{s}", .{session}) catch
         return "formatting the remote MCP session failed";
 
-    var m = McpChild.spawnMuxPanel(allocator, remote_sock, session_z, remote_home) orelse
-        return "could not spawn a remote-origin `sketerm mcp`";
+    var spawn_why: ?[]const u8 = null;
+    var m = McpChild.spawnMuxPanel(allocator, remote_sock, session_z, remote_home, &spawn_why) orelse
+        return spawn_why orelse "could not spawn a remote-origin `sketerm mcp`";
     defer m.close();
     if (!m.initialize()) return "the remote-origin MCP server never answered initialize";
 
     const caps = m.call("capabilities", "{}", 20_000) orelse
         return "remote-origin MCP capabilities timed out";
-    if (std.mem.indexOf(u8, caps, "\\\"mode\\\":\\\"isolated\\\"") == null or
-        std.mem.indexOf(u8, caps, "\\\"panels\\\":true") == null or
-        std.mem.indexOf(u8, caps, "\\\"gui_socket\\\":false") == null or
-        std.mem.indexOf(u8, caps, "\\\"selected\\\":\\\"mux_relay\\\"") == null)
-        return "remote-origin capabilities did not report isolated mux panels";
+    if (!mcpHas(caps, "\"mode\":\"isolated\""))
+        return whyf("remote-origin capabilities did not report isolated mode: {s}", .{capsExcerpt(caps, "\"mode\"")});
+    if (!mcpHas(caps, "\"panels\":true"))
+        return whyf("remote-origin capabilities report no live panel transport: {s}", .{capsExcerpt(caps, "panel_transport")});
+    if (!mcpHas(caps, "\"gui_socket\":false"))
+        return whyf("remote-origin capabilities claim a direct GUI socket: {s}", .{capsExcerpt(caps, "\"gui_socket\"")});
+    if (!mcpHas(caps, "\"selected\":\"mux_relay\""))
+        return whyf("remote-origin capabilities did not select the mux relay: {s}", .{capsExcerpt(caps, "panel_transport")});
     const gui_terms = m.call("list_terminals", "{}", 20_000) orelse
         return "remote-origin list_terminals timed out";
-    if (std.mem.indexOf(u8, gui_terms, "isError") == null or
+    if (!mcpHas(gui_terms, "isError") or
         std.mem.indexOf(u8, gui_terms, session) != null)
         return "the remote panel origin exposed its live pane through GUI terminal tools";
     const private_terms = m.call("term_list", "{}", 20_000) orelse
@@ -7308,9 +7509,9 @@ fn remotePanelAssetStage(
         "{\"command\":[\"/bin/sh\",\"-c\",\"sleep 30\"],\"wait_for\":\"exit\",\"wait_ms\":100,\"stable_ms\":0}",
         20_000,
     ) orelse return "private remote-side launch_app timed out";
-    const private_app_id = parseNumAfter(app_result, "\\\"app\\\":") orelse
+    const private_app_id = mcpNum(app_result, "app") orelse
         return "private remote-side launch_app returned no app id";
-    if (std.mem.indexOf(u8, app_result, "\\\"exited\\\":true") != null)
+    if (mcpHas(app_result, "\"exited\":true"))
         return "private remote-side app was not alive during isolation proof";
     var private_name_buf: [96]u8 = undefined;
     const private_name = std.fmt.bufPrint(&private_name_buf, "mcpapp-{d}-1", .{m.pid}) catch
@@ -7330,7 +7531,7 @@ fn remotePanelAssetStage(
         return "remote close_app arguments did not fit";
     const close_result = m.call("close_app", close_args, 20_000) orelse
         return "closing the live remote-side private app timed out";
-    if (std.mem.indexOf(u8, close_result, "isError") != null)
+    if (mcpHas(close_result, "isError"))
         return "closing the live remote-side private app failed";
     if (!waitMuxSessionGone(allocator, private_sock, private_name))
         return "close_app did not remove the exact remote-side private app session";
@@ -7340,7 +7541,7 @@ fn remotePanelAssetStage(
     const control_show = m.call("ui_show",
         \\{"name":"remote-control","session":"remote-panel-assets","target":"window","document":{"title":"Remote controls","root":"approve","components":{"approve":{"type":"button","text":"Approve remote","action":"remote-approve","class":["expand"]}}}}
     , 30_000) orelse return "remote control ui_show timed out";
-    if (std.mem.indexOf(u8, control_show, "isError") != null)
+    if (mcpHas(control_show, "isError"))
         return "remote control ui_show returned an error";
     var waited: u32 = 0;
     const control_win = while (waited < 25_000) : (waited += 200) {
@@ -7380,16 +7581,16 @@ fn remotePanelAssetStage(
         1,
     ) catch return "clicking the remote native control failed";
     const control_event = m.recv(30_000) orelse return "remote ui_wait_event never answered";
-    if (std.mem.indexOf(u8, control_event, "isError") != null or
-        std.mem.indexOf(u8, control_event, "remote-approve") == null or
-        std.mem.indexOf(u8, control_event, "\\\"kind\\\":\\\"click\\\"") == null)
+    if (mcpHas(control_event, "isError") or
+        !mcpHas(control_event, "remote-approve") or
+        !mcpHas(control_event, "\"kind\":\"click\""))
         return "the real remote control interaction did not return to MCP";
     const control_closed = m.call(
         "ui_close",
         "{\"name\":\"remote-control\",\"session\":\"remote-panel-assets\"}",
         20_000,
     ) orelse return "closing the remote control panel timed out";
-    if (std.mem.indexOf(u8, control_closed, "isError") != null)
+    if (mcpHas(control_closed, "isError"))
         return "closing the remote control panel failed";
     if (!waitWindowGone(app, control_win, 15_000))
         return "the remote control panel window did not close";
@@ -7419,9 +7620,9 @@ fn remotePanelAssetStage(
     ) catch return "formatting remote selective show failed";
     const selective_show = m.call("ui_show", selective_show_args, 45_000) orelse
         return "remote selective ui_show timed out";
-    if (std.mem.indexOf(u8, selective_show, "isError") != null or
-        std.mem.indexOf(u8, selective_show, "\\\"asset_failures\\\":0") == null or
-        std.mem.count(u8, selective_show, "\\\"sha256\\\"") != 2)
+    if (mcpHas(selective_show, "isError") or
+        !mcpHas(selective_show, "\"asset_failures\":0") or
+        mcpCount(selective_show, "\"sha256\"") != 2)
         return "remote selective ui_show did not hydrate both images";
     waited = 0;
     const selective_win = while (waited < 25_000) : (waited += 200) {
@@ -7437,9 +7638,9 @@ fn remotePanelAssetStage(
         "{\"name\":\"remote-selective\",\"session\":\"remote-panel-assets\",\"patch\":[{\"op\":\"title\",\"value\":\"Still selective\"}]}",
         20_000,
     ) orelse return "title-only remote patch timed out";
-    if (std.mem.indexOf(u8, title_only, "isError") != null or
-        std.mem.indexOf(u8, title_only, "\\\"assets\\\":[]") == null or
-        std.mem.indexOf(u8, title_only, "\\\"asset_failures\\\":0") == null)
+    if (mcpHas(title_only, "isError") or
+        !mcpHas(title_only, "\"assets\":[]") or
+        !mcpHas(title_only, "\"asset_failures\":0"))
         return "title-only remote patch rehydrated or replaced an untouched image";
     if (!waitForPanelColor(allocator, app, selective_win, .{ 0x20, 0x80, 0xff }, 5_000))
         return "title-only patch lost the prepared image whose source disappeared";
@@ -7454,9 +7655,9 @@ fn remotePanelAssetStage(
     ) catch return "formatting selective image patch failed";
     const selective_patch = m.call("ui_patch", selective_patch_args, 45_000) orelse
         return "selective image patch timed out";
-    if (std.mem.indexOf(u8, selective_patch, "isError") != null or
-        std.mem.indexOf(u8, selective_patch, "\\\"asset_failures\\\":0") == null or
-        std.mem.count(u8, selective_patch, "\\\"sha256\\\"") != 1 or
+    if (mcpHas(selective_patch, "isError") or
+        !mcpHas(selective_patch, "\"asset_failures\":0") or
+        mcpCount(selective_patch, "\"sha256\"") != 1 or
         std.mem.indexOf(u8, selective_patch, selective_b) == null or
         std.mem.indexOf(u8, selective_patch, selective_a) != null)
         return "selective image patch hydrated more than the reset path";
@@ -7469,8 +7670,8 @@ fn remotePanelAssetStage(
         "{\"name\":\"remote-selective\",\"session\":\"remote-panel-assets\",\"patch\":[{\"op\":\"set\",\"id\":\"b\",\"component\":{\"type\":\"text\",\"text\":\"removed\"}}]}",
         20_000,
     ) orelse return "selective image removal timed out";
-    if (std.mem.indexOf(u8, selective_remove, "isError") != null or
-        std.mem.indexOf(u8, selective_remove, "\\\"assets\\\":[]") == null or
+    if (mcpHas(selective_remove, "isError") or
+        !mcpHas(selective_remove, "\"assets\":[]") or
         !waitForPanelColor(allocator, app, selective_win, .{ 0x20, 0x80, 0xff }, 5_000))
         return "removing B disturbed untouched image A";
     const selective_closed = m.call(
@@ -7478,7 +7679,7 @@ fn remotePanelAssetStage(
         "{\"name\":\"remote-selective\",\"session\":\"remote-panel-assets\"}",
         20_000,
     ) orelse return "closing the remote selective panel timed out";
-    if (std.mem.indexOf(u8, selective_closed, "isError") != null or
+    if (mcpHas(selective_closed, "isError") or
         !waitWindowGone(app, selective_win, 15_000))
         return "closing the remote selective panel failed";
 
@@ -7493,16 +7694,16 @@ fn remotePanelAssetStage(
     if (std.mem.indexOf(u8, responsive, "\"ok\":true") == null or clock.nowMs() - probe_started > 600)
         return "remote image decode blocked the GTK main thread";
     const show = m.recv(45_000) orelse return "remote asset ui_show timed out";
-    if (std.mem.indexOf(u8, show, "isError") != null) return "remote asset ui_show returned an error";
-    if (std.mem.indexOf(u8, show, "\\\"asset_failures\\\":0") == null or
+    if (mcpHas(show, "isError")) return "remote asset ui_show returned an error";
+    if (!mcpHas(show, "\"asset_failures\":0") or
         std.mem.indexOf(u8, show, REMOTE_PANEL_ASSET_PATH) == null or
-        std.mem.indexOf(u8, show, "\\\"sha256\\\"") == null)
+        !mcpHas(show, "\"sha256\""))
         return "remote asset ui_show did not report a successful hydrated logical path";
     const first_sha_slice = escapedAssetSha(show) orelse
         return "remote asset ui_show returned no complete SHA-256 identity";
     var first_sha: [64]u8 = undefined;
     @memcpy(&first_sha, first_sha_slice);
-    const panel_id = parseNumAfter(show, "\\\"panel_id\\\":") orelse
+    const panel_id = mcpNum(show, "panel_id") orelse
         return "remote asset ui_show returned no panel_id";
     var cache_root_buf: [512]u8 = undefined;
     const cache_root = std.fmt.bufPrintZ(
@@ -7534,10 +7735,10 @@ fn remotePanelAssetStage(
     const patched = m.call("ui_patch",
         \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"img","component":{"type":"image","src":"/proc/self/fd/900","caption":"remote red"}}]}
     , 45_000) orelse return "same-path remote asset ui_patch timed out";
-    if (std.mem.indexOf(u8, patched, "isError") != null) return "same-path remote asset ui_patch returned an error";
-    if (std.mem.indexOf(u8, patched, "\\\"asset_failures\\\":0") == null or
+    if (mcpHas(patched, "isError")) return "same-path remote asset ui_patch returned an error";
+    if (!mcpHas(patched, "\"asset_failures\":0") or
         std.mem.indexOf(u8, patched, REMOTE_PANEL_ASSET_PATH) == null or
-        std.mem.indexOf(u8, patched, "\\\"sha256\\\"") == null)
+        !mcpHas(patched, "\"sha256\""))
         return "same-path remote asset ui_patch did not report successful rehydration";
     const second_sha = escapedAssetSha(patched) orelse
         return "same-path remote asset ui_patch returned no complete SHA-256 identity";
@@ -7562,14 +7763,14 @@ fn remotePanelAssetStage(
 
     const saved = m.call("ui_save", "{\"name\":\"remote-asset\",\"session\":\"remote-panel-assets\"}", 45_000) orelse
         return "saving the hydrated remote panel timed out";
-    if (std.mem.indexOf(u8, saved, "isError") != null) return "saving the hydrated remote panel failed";
+    if (mcpHas(saved, "isError")) return "saving the hydrated remote panel failed";
     const loaded = m.call("ui_show",
         \\{"name":"remote-asset","session":"remote-panel-assets","target":"window","load":"remote-asset"}
     , 45_000) orelse return "loading the saved remote panel timed out";
-    if (std.mem.indexOf(u8, loaded, "isError") != null) return "loading the saved remote panel failed";
-    if (std.mem.indexOf(u8, loaded, "\\\"asset_failures\\\":0") == null)
+    if (mcpHas(loaded, "isError")) return "loading the saved remote panel failed";
+    if (!mcpHas(loaded, "\"asset_failures\":0"))
         return "the saved remote panel no longer hydrated its image";
-    const loaded_id = parseNumAfter(loaded, "\\\"panel_id\\\":") orelse
+    const loaded_id = mcpNum(loaded, "panel_id") orelse
         return "loading the saved remote panel returned no panel_id";
     const get_loaded_req = std.fmt.bufPrint(&get_buf, "{{\"cmd\":\"panel-get\",\"panel_id\":{d}}}", .{loaded_id}) catch
         return "formatting loaded remote panel-get failed";
@@ -7587,9 +7788,9 @@ fn remotePanelAssetStage(
     const five = m.call("ui_show",
         \\{"name":"remote-asset","session":"remote-panel-assets","target":"window","document":{"title":"Five tiny","root":"root","components":{"root":{"type":"column","children":["i0","i1","i2","i3","i4"]},"i0":{"type":"image","src":"/proc/self/fd/900"},"i1":{"type":"image","src":"/proc/self/fd/901"},"i2":{"type":"image","src":"/proc/self/fd/902"},"i3":{"type":"image","src":"/proc/self/fd/903"},"i4":{"type":"image","src":"/proc/self/fd/904"}}}}
     , 45_000) orelse return "five-tiny remote asset ui_show timed out";
-    if (std.mem.indexOf(u8, five, "isError") != null or
-        std.mem.indexOf(u8, five, "\\\"asset_failures\\\":0") == null or
-        std.mem.count(u8, five, "\\\"sha256\\\"") < 5)
+    if (mcpHas(five, "isError") or
+        !mcpHas(five, "\"asset_failures\":0") or
+        mcpCount(five, "\"sha256\"") < 5)
         return "five tiny remote images did not all hydrate under the 64 MiB total cap";
 
     // Patch every image away in one transaction. The explicit empty resolver
@@ -7598,9 +7799,9 @@ fn remotePanelAssetStage(
     const zero = m.call("ui_patch",
         \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"i0","component":{"type":"text","text":"zero"}},{"op":"set","id":"i1","component":{"type":"text","text":"zero"}},{"op":"set","id":"i2","component":{"type":"text","text":"zero"}},{"op":"set","id":"i3","component":{"type":"text","text":"zero"}},{"op":"set","id":"i4","component":{"type":"text","text":"zero"}}]}
     , 45_000) orelse return "zero-image remote patch timed out";
-    if (std.mem.indexOf(u8, zero, "isError") != null or
-        std.mem.indexOf(u8, zero, "\\\"assets\\\":[]") == null or
-        std.mem.indexOf(u8, zero, "\\\"asset_failures\\\":0") == null)
+    if (mcpHas(zero, "isError") or
+        !mcpHas(zero, "\"assets\":[]") or
+        !mcpHas(zero, "\"asset_failures\":0"))
         return "zero-image patch did not commit an explicit empty asset resolver";
     const zero_live = panelRelayCall(allocator, &requester, 0x703, get_loaded_req) orelse
         return "panel-get after zero-image patch timed out";
@@ -7611,8 +7812,8 @@ fn remotePanelAssetStage(
     const restored = m.call("ui_show",
         \\{"name":"remote-asset","session":"remote-panel-assets","target":"window","document":{"title":"Remote asset","root":"img","components":{"img":{"type":"image","src":"/proc/self/fd/900","caption":"restored red"}}}}
     , 45_000) orelse return "restoring the remote image after zero-image patch timed out";
-    if (std.mem.indexOf(u8, restored, "isError") != null or
-        std.mem.indexOf(u8, restored, "\\\"asset_failures\\\":0") == null)
+    if (mcpHas(restored, "isError") or
+        !mcpHas(restored, "\"asset_failures\":0"))
         return "remote image did not rehydrate after the zero-image transaction";
     if (!waitForPanelColor(allocator, app, win_id, .{ 0xf0, 0x30, 0x60 }, 12_000))
         return "restored remote image did not repaint after the zero-image transaction";
@@ -7621,8 +7822,8 @@ fn remotePanelAssetStage(
     const failed_patch = m.call("ui_patch",
         \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"remove","id":"ghost"}]}
     , 20_000) orelse return "failed remote transaction patch timed out";
-    if (std.mem.indexOf(u8, failed_patch, "isError") == null or
-        std.mem.indexOf(u8, failed_patch, "ghost") == null)
+    if (!mcpHas(failed_patch, "isError") or
+        !mcpHas(failed_patch, "ghost"))
         return "invalid remote patch was not rejected transactionally";
     const after_failed = panelRelayCall(allocator, &requester, 0x704, get_loaded_req) orelse
         return "panel-get after failed remote patch timed out";
@@ -7641,12 +7842,15 @@ fn remotePanelAssetStage(
     , 45_000) orelse return "oversized remote asset ui_patch timed out";
     if (clock.nowMs() - oversized_started > 15_000)
         return "oversized remote asset refusal exceeded its bounded fast path";
-    if (std.mem.indexOf(u8, oversized, "isError") != null or
-        std.mem.indexOf(u8, oversized, "\\\"asset_failures\\\":1") == null or
-        std.mem.indexOf(u8, oversized, "asset_warning") == null or
-        std.mem.indexOf(u8, oversized, "per-file byte limit") == null or
+    if (mcpHas(oversized, "isError") or
+        !mcpHas(oversized, "\"asset_failures\":1") or
+        !mcpHas(oversized, "\"ok\":false") or
+        !mcpHas(oversized, "per-file byte limit") or
         std.mem.indexOf(u8, oversized, REMOTE_PANEL_ASSET_PATH) == null)
+    {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: oversized reply: %.*s\n", @as(c_int, @intCast(@min(oversized.len, 1200))), oversized.ptr);
         return "oversized remote asset did not return an explicit per-path warning";
+    }
 
     const missing_path = "/proc/self/fd/901";
     const missing_started = clock.nowMs();
@@ -7655,22 +7859,25 @@ fn remotePanelAssetStage(
     , 45_000) orelse return "missing remote asset ui_patch timed out";
     if (clock.nowMs() - missing_started > 10_000)
         return "missing remote asset warning exceeded its bounded fast path";
-    if (std.mem.indexOf(u8, missing, "isError") != null or
-        std.mem.indexOf(u8, missing, "\\\"asset_failures\\\":1") == null or
-        std.mem.indexOf(u8, missing, "asset_warning") == null or
+    if (mcpHas(missing, "isError") or
+        !mcpHas(missing, "\"asset_failures\":1") or
+        !mcpHas(missing, "\"ok\":false") or
         std.mem.indexOf(u8, missing, missing_path) == null or
-        std.mem.indexOf(u8, missing, "\\\"error\\\":") == null)
+        !mcpHas(missing, "\"error\":"))
+    {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: missing reply: %.*s\n", @as(c_int, @intCast(@min(missing.len, 1200))), missing.ptr);
         return "remote asset read failure did not return an explicit per-path warning";
+    }
 
     // Both sides fail independently. Their logical paths and reasons must be
     // painted in their own halves rather than collapsed to one generic error.
     const compare_failed = m.call("ui_show",
         \\{"name":"remote-asset","session":"remote-panel-assets","target":"window","document":{"title":"Both failed","root":"cmp","components":{"cmp":{"type":"image_compare","left":{"src":"/LEFTFAILURE"},"right":{"src":"/RIGHTFAILURE"}}}}}
     , 45_000) orelse return "both-failed image compare timed out";
-    if (std.mem.indexOf(u8, compare_failed, "isError") != null or
-        std.mem.indexOf(u8, compare_failed, "\\\"asset_failures\\\":2") == null or
-        std.mem.indexOf(u8, compare_failed, "/LEFTFAILURE") == null or
-        std.mem.indexOf(u8, compare_failed, "/RIGHTFAILURE") == null)
+    if (mcpHas(compare_failed, "isError") or
+        !mcpHas(compare_failed, "\"asset_failures\":2") or
+        !mcpHas(compare_failed, "/LEFTFAILURE") or
+        !mcpHas(compare_failed, "/RIGHTFAILURE"))
         return "both-failed image compare did not retain two path-specific errors";
     if (!viewerWaitOcr(allocator, app, win_id, "LEFTFAILURE", 10_000) or
         !viewerWaitOcr(allocator, app, win_id, "RIGHTFAILURE", 10_000))
@@ -7678,7 +7885,7 @@ fn remotePanelAssetStage(
 
     const deleted = m.call("ui_delete", "{\"name\":\"remote-asset\",\"session\":\"remote-panel-assets\"}", 20_000) orelse
         return "deleting the saved remote asset panel timed out";
-    if (std.mem.indexOf(u8, deleted, "isError") != null) return "deleting the saved remote asset panel failed";
+    if (mcpHas(deleted, "isError")) return "deleting the saved remote asset panel failed";
 
     // Hydrate one more valid image, then retire the Terminal origin. Its
     // panels go with it, later calls into the dead origin are refused, and the
@@ -7688,7 +7895,7 @@ fn remotePanelAssetStage(
     const repatched = m.call("ui_patch",
         \\{"name":"remote-asset","session":"remote-panel-assets","patch":[{"op":"set","id":"cmp","component":{"type":"image","src":"/proc/self/fd/900","caption":"before teardown"}}]}
     , 30_000) orelse return "the pre-teardown patch timed out";
-    if (std.mem.indexOf(u8, repatched, "isError") != null)
+    if (mcpHas(repatched, "isError"))
         return "the pre-teardown patch failed";
     const origin_closed = roundtrip(
         allocator,
@@ -7708,9 +7915,9 @@ fn remotePanelAssetStage(
     // Any isError would also accept a document validation error, which would
     // say nothing about the dead origin. With no panel-capable attachment of
     // the session left, the route fails pre-delivery as `no compatible GUI`.
-    if (std.mem.indexOf(u8, after_teardown_patch, "isError") == null)
+    if (!mcpHas(after_teardown_patch, "isError"))
         return "a patch into a torn-down panel origin reported success";
-    if (std.mem.indexOf(u8, after_teardown_patch, "no compatible GUI is attached") == null)
+    if (!mcpHas(after_teardown_patch, "no compatible GUI is attached"))
         return "a patch into a torn-down panel origin failed for the wrong reason";
     const after_decode_teardown = roundtrip(allocator, gui_sock, "{\"cmd\":\"list\"}\n") orelse
         return "the GUI stopped serving after origin teardown";
@@ -8319,7 +8526,7 @@ fn panePanelLifetimeStage(
         const shown = roundtrip(allocator, sock_path, show_req) orelse
             return "panel-show(pane face) roundtrip";
         defer allocator.free(shown);
-        if (std.mem.indexOf(u8, shown, "\"ok\":true") == null) return "panel-show(pane face) not ok";
+        if (!mcpHas(shown, "\"ok\":true")) return "panel-show(pane face) not ok";
         const id = parseNumAfter(shown, "\"panel_id\":") orelse
             return "panel-show(pane face) reply has no panel_id";
 
@@ -8351,7 +8558,7 @@ fn panePanelLifetimeStage(
         const closed = roundtrip(allocator, sock_path, close_req) orelse
             return "panel-close(pane face) roundtrip";
         defer allocator.free(closed);
-        if (std.mem.indexOf(u8, closed, "\"ok\":true") == null) return "panel-close(pane face) not ok";
+        if (!mcpHas(closed, "\"ok\":true")) return "panel-close(pane face) not ok";
 
         // The fuse. Keep the display session pumping and keep asking:
         // a GUI that faulted on the deferred destroy stops answering,
@@ -8372,7 +8579,7 @@ fn panePanelLifetimeStage(
         const listed = roundtrip(allocator, sock_path, "{\"cmd\":\"panel-list\",\"session\":\"e2e-scope\"}\n") orelse
             return "panel-list(after the pane face closed) roundtrip";
         defer allocator.free(listed);
-        if (std.mem.indexOf(u8, listed, "\"name\":\"e2e-life\"") != null)
+        if (mcpHas(listed, "\"name\":\"e2e-life\""))
             return "a closed pane panel is still listed";
     }
     return null;
@@ -8486,7 +8693,7 @@ fn themeSingletonStage(
     const opened = roundtrip(allocator, sock, "{\"cmd\":\"new-tab\"}\n") orelse
         return "new-tab(for detach) roundtrip";
     defer allocator.free(opened);
-    if (std.mem.indexOf(u8, opened, "\"ok\":true") == null) return "new-tab(for detach) not ok";
+    if (!mcpHas(opened, "\"ok\":true")) return "new-tab(for detach) not ok";
     const pane = parseNumAfter(opened, "\"pane\":") orelse
         return "new-tab(for detach) reply has no pane id";
 
@@ -8683,9 +8890,9 @@ fn themeSingletonStage(
     if (!app.windowGone(prefs_id)) return "Preferences outlived its destroyed secondary parent";
     const saved = readFileAlloc(allocator, cfg_path) orelse return "closing the secondary lost its pending sidebar config write";
     defer allocator.free(saved);
-    if (std.mem.indexOf(u8, saved, "tab_sidebar_width = ") == null)
+    if (!mcpHas(saved, "tab_sidebar_width = "))
         return "closing the secondary dropped the sidebar width it had persisted";
-    if (std.mem.indexOf(u8, saved, "show_tab_sidebar") != null)
+    if (mcpHas(saved, "show_tab_sidebar"))
         return "the close-time config flush persisted a per-window sidebar toggle";
 
     // The fuse. `deferredWindowFree` runs on an idle after the destroy
@@ -8789,16 +8996,21 @@ fn resizeRemotePanelAsset(size: usize) bool {
     return c.ftruncate(fd, @intCast(size)) == 0 and c.fsync(fd) == 0;
 }
 
+/// The first asset's 64-hex SHA-256 in an MCP reply, either lane (see
+/// `mcpHas`).
 fn escapedAssetSha(reply: []const u8) ?[]const u8 {
-    const key = "\\\"sha256\\\":\\\"";
-    const at = std.mem.indexOf(u8, reply, key) orelse return null;
-    const rest = reply[at + key.len ..];
-    if (rest.len < 64) return null;
-    for (rest[0..64]) |ch| switch (ch) {
-        '0'...'9', 'a'...'f' => {},
-        else => return null,
-    };
-    return rest[0..64];
+    inline for (.{ "\"sha256\":\"", "\\\"sha256\\\":\\\"" }) |key| {
+        if (std.mem.indexOf(u8, reply, key)) |at| {
+            const rest = reply[at + key.len ..];
+            if (rest.len < 64) return null;
+            for (rest[0..64]) |ch| switch (ch) {
+                '0'...'9', 'a'...'f' => {},
+                else => return null,
+            };
+            return rest[0..64];
+        }
+    }
+    return null;
 }
 
 fn panelColorPixels(rgba: []const u8, want: [3]u8) usize {
@@ -9817,7 +10029,7 @@ fn editorAtlasLifecycleStage(
     const shown = roundtrip(allocator, sock_path, toggle_req) orelse
         return "showing the editor after its profile switch failed";
     defer allocator.free(shown);
-    if (std.mem.indexOf(u8, shown, "\"ok\":true") == null)
+    if (!mcpHas(shown, "\"ok\":true"))
         return "showing the editor after its profile switch was refused";
 
     _ = c.unlink(cfg_path.ptr);
@@ -9860,7 +10072,7 @@ fn editorAtlasLifecycleStage(
         return "formatting editor re-realize collapse failed";
     const closed = roundtrip(allocator, sock_path, close_req) orelse return "editor re-realize collapse failed";
     defer allocator.free(closed);
-    if (std.mem.indexOf(u8, closed, "\"ok\":true") == null) return "editor re-realize collapse was refused";
+    if (!mcpHas(closed, "\"ok\":true")) return "editor re-realize collapse was refused";
     _ = waitEditorAtlasRecreated(allocator, app, sock_path, pane, stats) orelse
         return "collapsing the split did not release and recreate the editor atlas texture";
     return null;
@@ -10292,6 +10504,40 @@ fn waitPaneText(
 }
 
 /// First unsigned integer following `key` in `text` (JSON scraping).
+/// Whether an MCP reply carries `fragment` in EITHER lane: raw in
+/// structuredContent, or quote-escaped inside a text lane that embeds
+/// JSON as a string. Tools differ on which lane carries a fact and have
+/// migrated between them (docs/mcp-structured-results.md), so a rig
+/// that pins one lane goes red for a reason that is not a bug.
+fn mcpHas(reply: []const u8, comptime fragment: []const u8) bool {
+    return std.mem.indexOf(u8, reply, fragment) != null or
+        std.mem.indexOf(u8, reply, comptime escapeQuotes(fragment)) != null;
+}
+
+/// The integer after `"name":` in an MCP reply, either lane.
+fn mcpNum(reply: []const u8, comptime name: []const u8) ?u32 {
+    return parseNumAfter(reply, "\"" ++ name ++ "\":") orelse
+        parseNumAfter(reply, "\\\"" ++ name ++ "\\\":");
+}
+
+/// How many times an MCP reply carries `fragment`, counted in whichever
+/// lane holds it (the two spellings never overlap, so the larger count
+/// is the lane that carries the fact).
+fn mcpCount(reply: []const u8, comptime fragment: []const u8) usize {
+    return @max(
+        std.mem.count(u8, reply, fragment),
+        std.mem.count(u8, reply, comptime escapeQuotes(fragment)),
+    );
+}
+
+fn escapeQuotes(comptime s: []const u8) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (s) |ch| out = out ++ (if (ch == '"') "\\\"" else &[_]u8{ch});
+        return out;
+    }
+}
+
 fn parseNumAfter(text: []const u8, key: []const u8) ?u32 {
     const at = std.mem.indexOf(u8, text, key) orelse return null;
     var i = at + key.len;

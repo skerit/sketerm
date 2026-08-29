@@ -38,6 +38,7 @@ const builtin = @import("builtin");
 const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
 const appdrive = @import("ipc/appdrive.zig");
+const clock = @import("util/clock.zig");
 const proc = @import("lsp/proc.zig");
 
 const TTL = "240";
@@ -110,7 +111,6 @@ fn fail(comptime fmt: []const u8, args: anytype) u8 {
     return 1;
 }
 
-
 const smokecli = @import("smoke/displaycli.zig");
 const CliResult = smokecli.CliResult;
 const CreateReply = smokecli.CreateReply;
@@ -169,6 +169,18 @@ const Plan = struct {
     /// for the accept-during-the-debounce race. It must keep the word
     /// being completed a word (the list is NOT filtered locally).
     race_extra: []const u8 = "x",
+    /// Typed at the end of the document BEFORE the race stage retypes
+    /// `completion_prefix`. Stage 4 accepts a completion into the
+    /// fixture's one open expression site, so retyping the prefix there
+    /// appends a second expression to it (`return add_two add_t`) — a
+    /// syntax error, on which clangd 22.1.8 correctly offers zero items
+    /// and the stage failed for a reason that had nothing to do with the
+    /// client. The prelude closes that statement and opens an IDENTICAL
+    /// fresh site, so the stage never rides a particular server version's
+    /// error recovery. Same trick `signature_call` already uses with its
+    /// leading `; `. Empty = the site is still open (the stub, which
+    /// answers regardless of context).
+    race_prelude: []const u8 = "",
     /// Text to type after Ctrl+Space is pressed at the end of the file.
     real_server: bool,
 };
@@ -290,6 +302,9 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             .marker_body = "{\"compilerOptions\":{\"strict\":true,\"target\":\"ES2020\"},\"include\":[\"*.ts\"]}\n",
             .body = TS_BODY,
             .completion_prefix = "gre",
+            // Close the expression statement stage 4 accepted into and
+            // start a fresh one on the next line.
+            .race_prelude = ";\n",
             .signature_call = " pair(",
             .real_server = true,
         };
@@ -310,6 +325,9 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             // Typed at Ctrl+End — inside `use()`'s unterminated body, an
             // expression position where clangd offers both `add_` fns.
             .completion_prefix = " add_t",
+            // Terminate the return stage 4 completed and open a second
+            // one, still inside `use()`'s unterminated body.
+            .race_prelude = ";\n    return",
             .signature_call = "; add_pair(",
             .real_server = true,
         };
@@ -327,6 +345,9 @@ fn pickPlan(allocator: std.mem.Allocator, stub_path: []const u8) Plan {
             .body = ZLS_BODY,
             // After the trailing `std.` — member completion.
             .completion_prefix = "deb",
+            // Close the const stage 4 completed and open an identical
+            // member-completion site on a fresh declaration.
+            .race_prelude = ";\nconst probe2 = std.",
             .signature_call = " pair(",
             .real_server = true,
         };
@@ -413,6 +434,110 @@ fn colorPixels(rgba: []const u8, img_w: u32, img_h: u32, want: [3]u8, tol: i32, 
         }
     }
     return hits;
+}
+
+/// `editor_pass.Colors.caret` as bytes. Nothing else in the editor is
+/// painted this colour, so its rows ARE the caret's rows.
+const CARET_RGB = [3]u8{ 242, 89, 64 };
+
+/// Bounding box {x0, y0, x1, y1} of every pixel matching `want`, or
+/// null when it is absent.
+fn colorBox(rgba: []const u8, img_w: u32, img_h: u32, want: [3]u8, tol: i32) ?[4]u32 {
+    var x0: u32 = std.math.maxInt(u32);
+    var y0: u32 = std.math.maxInt(u32);
+    var x1: u32 = 0;
+    var y1: u32 = 0;
+    var found = false;
+    var y: u32 = 0;
+    while (y < img_h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < img_w) : (x += 1) {
+            const i = (y * img_w + x) * 4;
+            if (i + 3 >= rgba.len) continue;
+            var ok = true;
+            inline for (0..3) |ch| {
+                const d = @as(i32, rgba[i + ch]) - @as(i32, want[ch]);
+                if (d > tol or d < -tol) ok = false;
+            }
+            if (!ok) continue;
+            found = true;
+            x0 = @min(x0, x);
+            y0 = @min(y0, y);
+            x1 = @max(x1, x);
+            y1 = @max(y1, y);
+        }
+    }
+    return if (found) .{ x0, y0, x1, y1 } else null;
+}
+
+/// First and last scanline carrying `want`, or null when it is absent.
+fn colorRowSpan(rgba: []const u8, img_w: u32, img_h: u32, want: [3]u8, tol: i32) ?[2]u32 {
+    const box = colorBox(rgba, img_w, img_h, want, tol) orelse return null;
+    return .{ box[1], box[3] };
+}
+
+/// Diagnostic-coloured pixels in the gutter band, counted only on the
+/// scanlines `span` covers.
+fn diagPixelsInRows(rgba: []const u8, img_w: u32, img_h: u32, span: [2]u32) usize {
+    const wants = [_][3]u8{
+        .{ 230, 77, 71 }, // diag_error
+        .{ 235, 179, 51 }, // diag_warning
+    };
+    const band: u32 = @min(img_w, 220);
+    var hits: usize = 0;
+    var y: u32 = span[0];
+    while (y <= span[1] and y < img_h) : (y += 1) {
+        var x: u32 = 0;
+        while (x < band) : (x += 1) {
+            const i = (y * img_w + x) * 4;
+            if (i + 3 >= rgba.len) continue;
+            for (wants) |want| {
+                var ok = true;
+                inline for (0..3) |ch| {
+                    const d = @as(i32, rgba[i + ch]) - @as(i32, want[ch]);
+                    if (d > 8 or d < -8) ok = false;
+                }
+                if (ok) hits += 1;
+            }
+        }
+    }
+    return hits;
+}
+
+/// The caret's row span, polled past the 530ms blink-off phases.
+fn waitCaretSpan(app: *appdrive.App, win_id: u32, budget_ms: i64) ?[2]u32 {
+    const box = waitCaretBox(app, win_id, budget_ms) orelse return null;
+    return .{ box[1], box[3] };
+}
+
+/// The caret's bounding box {x0, y0, x1, y1} in window coordinates,
+/// polled past the 530ms blink-off phases.
+///
+/// It is what the dwell stage aims at: the caret is the ONE point on
+/// screen the server has already answered a hover for, so a probe there
+/// tests the dwell path rather than clangd's opinion of punctuation.
+fn waitCaretBox(app: *appdrive.App, win_id: u32, budget_ms: i64) ?[4]u32 {
+    var spent: i64 = 0;
+    while (spent < budget_ms) : (spent += 100) {
+        pumpFor(app, 100);
+        const snap = app.snapshotRgba(win_id, null) catch continue;
+        defer g_alloc.free(snap.px);
+        if (colorBox(snap.px, snap.w, snap.h, CARET_RGB, 8)) |box| return box;
+    }
+    return null;
+}
+
+/// Rest the pointer and watch for a new popup for `budget_ms` of REAL
+/// time. `pumpFor` counts frames, not milliseconds — it returns early
+/// on every frame that is already buffered — and the editor's dwell
+/// timer is wall-clock, so the rest has to be measured on a clock.
+fn waitPopupFor(app: *appdrive.App, base: usize, budget_ms: i64) bool {
+    const t0 = clock.nowMs();
+    while (clock.nowMs() - t0 < budget_ms) {
+        pumpFor(app, 100);
+        if (popupCount(app) > base) return true;
+    }
+    return false;
 }
 
 /// Poll the window until `want` shows up in at least `need` pixels.
@@ -804,10 +929,41 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     pumpFor(app, 400);
 
     // ── 2. next diagnostic (F8) ───────────────────────────────────
+    //
+    // Asserted on the caret's own scanlines: after F8 they must overlap
+    // the gutter stripe of a diagnostic, which is what "the caret moved
+    // onto the problem" looks like. The status line says the same thing
+    // as "Ln N, Col M", but reading text back needs an accessibility bus
+    // and this rig deliberately runs the GUI with GTK_A11Y=none.
+    const caret_before = waitCaretSpan(app, win_id, 3_000);
     app.pressKey(win_id, "F8") catch {};
     pumpFor(app, 1200);
+    var caret_after: ?[2]u32 = null;
+    var f8_spent: i64 = 0;
+    while (f8_spent < 10_000) : (f8_spent += 200) {
+        const snap = app.snapshotRgba(win_id, null) catch {
+            pumpFor(app, 200);
+            continue;
+        };
+        defer allocator.free(snap.px);
+        if (colorRowSpan(snap.px, snap.w, snap.h, CARET_RGB, 8)) |span| {
+            caret_after = span;
+            // One stripe is 3px wide over a whole text line, so an
+            // overlapping caret sees dozens of them; a caret merely
+            // adjacent to one sees none.
+            if (diagPixelsInRows(snap.px, snap.w, snap.h, span) >= 10) break;
+            caret_after = null;
+        }
+        pumpFor(app, 200);
+    }
+    if (caret_after == null) {
+        savePng(app, win_id, shot("nodiagnav.png"));
+        if (caret_before) |b|
+            return fail("F8 left the caret off every diagnostic line (it was on rows {d}-{d}; see zig-out/smoke-lsp-gui{s}-nodiagnav.png)", .{ b[0], b[1], g_leg });
+        return fail("F8 put no caret on a diagnostic line, and none was visible before it either (see zig-out/smoke-lsp-gui{s}-nodiagnav.png)", .{g_leg});
+    }
     savePng(app, win_id, shot("diagnostic-nav.png"));
-    say("PASS F8 diagnostic navigation -> zig-out/smoke-lsp-gui{s}-diagnostic-nav.png", .{g_leg});
+    say("PASS F8 put the caret on a diagnostic line (rows {d}-{d}) -> zig-out/smoke-lsp-gui{s}-diagnostic-nav.png", .{ caret_after.?[0], caret_after.?[1], g_leg });
 
     // ── 3. hover (Ctrl+I) ─────────────────────────────────────────
     const popups_before_hover = popupCount(app);
@@ -829,6 +985,48 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     savePng(app, win_id, shot("hover.png"));
     savePopupPng(app, shot("hover-popup.png"));
     say("PASS hover popup -> zig-out/smoke-lsp-gui{s}-hover.png", .{g_leg});
+
+    // ── 3a. mouse-dwell hover ─────────────────────────────────────
+    //
+    // Resting the pointer over a symbol must pop a hover WITHOUT any
+    // key being pressed. It runs HERE, and aims at the caret, because
+    // Ctrl+I has just proved this server has something to say about
+    // this exact byte: a pointer parked on "some painted glyph"
+    // measures the server's opinion of `int`, `(` and `return` (all
+    // empty from clangd) rather than the dwell path.
+    app.pressKey(win_id, "Escape") catch {};
+    pumpFor(app, 500);
+    {
+        const popups_before_dwell = popupCount(app);
+        const box = waitCaretBox(app, win_id, 5_000) orelse
+            return fail("the caret never showed, so the dwell had nothing to aim at", .{});
+        // A few pixels INTO the caret's cell: the caret is drawn on the
+        // cell's left edge, and a pointer on that edge hits the
+        // character before it.
+        const hx = @as(f64, @floatFromInt(box[0])) + 4;
+        const hy = @as(f64, @floatFromInt((box[1] + box[3]) / 2));
+        // A dwell arms on MOTION, so the pointer has to arrive and then
+        // move once more inside the canvas; both moves must land, hence
+        // no silent `catch {}` here.
+        _ = app.moveMouse(win_id, hx, hy) catch return fail("injecting pointer motion failed", .{});
+        pumpFor(app, 60);
+        _ = app.moveMouse(win_id, hx + 2, hy) catch return fail("injecting pointer motion failed", .{});
+        // Comfortably past editor_lsp_hover_delay_ms (500) plus one
+        // server round trip.
+        if (!waitPopupFor(app, popups_before_dwell, 4_000)) {
+            savePng(app, win_id, shot("nodwell.png"));
+            return fail("resting the pointer on the caret ({d},{d}) opened no hover popup, though Ctrl+I hover works there against {s} (see zig-out/smoke-lsp-gui{s}-nodwell.png)", .{ box[0], box[1], plan.name, g_leg });
+        }
+        // Capture the popup FIRST: the screenshot path wants a surface
+        // that has committed recently, and nothing re-commits a hover
+        // popover once it is up.
+        savePopupPng(app, shot("dwell-hover-popup.png"));
+        pumpFor(app, 400);
+        savePng(app, win_id, shot("dwell-hover.png"));
+        say("PASS mouse-dwell hover -> zig-out/smoke-lsp-gui{s}-dwell-hover.png", .{g_leg});
+    }
+    app.pressKey(win_id, "Escape") catch {};
+    pumpFor(app, 300);
 
     // ── 3b. the outline panel, fed by the SERVER ───────────────────
     //
@@ -933,6 +1131,13 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
     {
         app.pressKey(win_id, "ctrl+End") catch {};
         pumpFor(app, 300);
+        // Stage 4 consumed the fixture's open expression site by
+        // ACCEPTING into it; re-open an equivalent one rather than typing
+        // a second expression onto the first (see Plan.race_prelude).
+        if (plan.race_prelude.len > 0) {
+            app.typeText(win_id, plan.race_prelude) catch {};
+            pumpFor(app, 500);
+        }
         app.typeText(win_id, plan.completion_prefix) catch {};
         pumpFor(app, 600);
         const popups_before_race = popupCount(app);
@@ -1086,58 +1291,6 @@ fn runLeg(allocator: std.mem.Allocator, remote: bool) u8 {
         savePng(app, win_id, shot("code-action-applied.png"));
         say("PASS code action applied ({d} pixels changed)", .{moved});
     }
-
-    // ── 4d. mouse-dwell hover ─────────────────────────────────────
-    //
-    // Resting the pointer over a symbol must pop a hover WITHOUT any
-    // key being pressed.
-    app.pressKey(win_id, "Escape") catch {};
-    pumpFor(app, 400);
-    const popups_before_dwell = popupCount(app);
-    var dwell_ok = false;
-    {
-        const w2 = app.winById(win_id).?;
-        // Sweep a few points along the first text lines until one lands
-        // on a symbol: WHERE a symbol is depends on the plan's document
-        // and on the edits the earlier stages made, and a dwell over
-        // whitespace correctly produces nothing at all.
-        const xs = [_]f64{ 0.14, 0.20, 0.26, 0.32, 0.40 };
-        const ys = [_]f64{ 0.13, 0.16, 0.19 };
-        outer: for (ys) |yr| {
-            for (xs) |xr| {
-                const hx = @as(f64, @floatFromInt(w2.w)) * xr;
-                const hy = @as(f64, @floatFromInt(w2.h)) * yr;
-                _ = app.moveMouse(win_id, hx, hy) catch {};
-                pumpFor(app, 60);
-                _ = app.moveMouse(win_id, hx + 2, hy) catch {};
-                var waited_ms: i64 = 0;
-                while (waited_ms < 2_500) : (waited_ms += 200) {
-                    pumpFor(app, 200);
-                    if (popupCount(app) > popups_before_dwell) {
-                        dwell_ok = true;
-                        break :outer;
-                    }
-                }
-            }
-        }
-    }
-    if (dwell_ok) {
-        // Capture the popup FIRST: the screenshot path wants a surface
-        // that has committed recently, and nothing re-commits a hover
-        // popover once it is up.
-        savePopupPng(app, shot("dwell-hover-popup.png"));
-        pumpFor(app, 400);
-        savePng(app, win_id, shot("dwell-hover.png"));
-        say("PASS mouse-dwell hover -> zig-out/smoke-lsp-gui{s}-dwell-hover.png", .{g_leg});
-    } else if (!plan.real_server) {
-        savePng(app, win_id, shot("nodwell.png"));
-        return fail("resting the pointer opened no hover popup", .{});
-    } else {
-        // A real server may have nothing to say at that exact point.
-        say("SKIP mouse-dwell hover: nothing under the pointer", .{});
-    }
-    app.pressKey(win_id, "Escape") catch {};
-    pumpFor(app, 300);
 
     // ── 5. go to definition (F12) ─────────────────────────────────
     //

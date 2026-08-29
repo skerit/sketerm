@@ -699,7 +699,7 @@ fn hamburgerStage(allocator: std.mem.Allocator) ?[]const u8 {
     if (findMenuRow(allocator, "Session", 5_000)) |n| {
         allocator.free(n.id);
     } else return "the window hamburger has no Session submenu row";
-    dismissPopup(app);
+    if (dismissPopup(app)) |m| return m;
     _ = waitTabPopup(app, false, 5_000);
     say("window hamburger: opened over AT-SPI, every spec row and the shared Help tail present");
     return null;
@@ -919,18 +919,29 @@ fn locateTabStrip(allocator: std.mem.Allocator, names: []const []const u8, tab_w
 }
 
 /// Close whatever menu is open (Escape, then an inside-the-content
-/// click — never near the window edge, which is a resize band).
-fn dismissPopup(app: *appdrive.App) void {
+/// click — never near the window edge, which is a resize band). Returns
+/// an error message when the popup is still up.
+///
+/// This used to swallow both injection errors: a popup left standing
+/// then made the NEXT stage fail somewhere else, with a message about
+/// whatever that stage was doing. The failure belongs here.
+fn dismissPopup(app: *appdrive.App) ?[]const u8 {
     var i: u32 = 0;
     while (i < 3) : (i += 1) {
-        if (tabPopup(app) == null) return;
-        app.pressKey(null, "Escape") catch {};
-        if (waitTabPopup(app, false, 1_500) != null) return;
-        if (app.windows.items.len == 0) return;
+        if (tabPopup(app) == null) return null;
+        app.pressKey(null, "Escape") catch return "injecting Escape to dismiss a popup failed";
+        if (waitTabPopup(app, false, 1_500) != null) return null;
+        if (app.windows.items.len == 0) return null;
         const win = app.windows.items[0];
-        app.clickEx(win.id, @as(f64, @floatFromInt(win.w)) / 2, @as(f64, @floatFromInt(win.h)) - 60, 1, 60, 1) catch {};
-        if (waitTabPopup(app, false, 1_500) != null) return;
+        app.clickEx(win.id, @as(f64, @floatFromInt(win.w)) / 2, @as(f64, @floatFromInt(win.h)) - 60, 1, 60, 1) catch
+            return "clicking the content to dismiss a popup failed";
+        if (waitTabPopup(app, false, 1_500) != null) return null;
     }
+    if (tabPopup(app)) |id| {
+        _ = c.fprintf(platform.stderr(), "smoke-atspi: popup %u survived three dismissals\n", id);
+        return "a popup stayed open through three dismissal attempts";
+    }
+    return null;
 }
 
 /// The per-tab context menu shared by the editor and the file browser
@@ -1064,7 +1075,7 @@ fn tabMenuStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]con
     } else return "Close Other Tabs left the other documents open";
     if (!hasTabNamed(allocator, names[0])) return "Close Other Tabs closed the tab it was invoked on";
     say("editor tab menu: Close Other Tabs closed the other two documents and kept its own");
-    dismissPopup(app);
+    if (dismissPopup(app)) |m| return m;
 
     // ── the same mechanism on the file browser's tabs ───────────
     if (browserTabMenuStage(allocator, rt, sock_path)) |why| return why;
@@ -1167,7 +1178,7 @@ fn browserTabMenuStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: 
     } else return "Close Other Tabs left the other browser tabs open";
     if (!hasTabNamed(allocator, names[0])) return "Close Other Tabs closed the browser tab it was invoked on";
     say("browser tab menu: Close Other Tabs closed the other browser tabs and kept its own");
-    dismissPopup(app);
+    if (dismissPopup(app)) |m| return m;
     return null;
 }
 
@@ -1291,23 +1302,47 @@ fn editorStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:0]cons
     say("editor selection readable over Text.GetSelection");
 
     // Save, so the GUI's SIGTERM is not met by a dirty-buffer prompt.
+    if (saveEditorPane(allocator, sock_path, epane, efile, ED_HEAD ++ ED_TAIL, true)) |m| return m;
+    return null;
+}
+
+/// Ctrl+S a focused editor pane and wait for the bytes to reach disk.
+///
+/// Sending the chord is not the assertion: a buffer that stays dirty
+/// meets the GUI's SIGTERM with an unsaved-changes prompt and blocks
+/// shutdown, which is a failure the rig has to see here rather than as a
+/// hang somewhere later. `expect` is matched against the file contents
+/// exactly when `exact`, else as a substring — a stage that edited a
+/// document it did not author cannot spell the whole file back.
+fn saveEditorPane(
+    allocator: std.mem.Allocator,
+    sock_path: [:0]const u8,
+    pane: u64,
+    path: [:0]const u8,
+    expect: []const u8,
+    exact: bool,
+) ?[]const u8 {
+    var req_buf: [700]u8 = undefined;
     {
-        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"ctrl+s\"}}\n", .{epane}) catch return "fmt";
+        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"ctrl+s\"}}\n", .{pane}) catch return "fmt";
         const rp = roundtrip(allocator, sock_path, rq) orelse return "editor ctrl+s roundtrip";
         defer allocator.free(rp);
         if (std.mem.indexOf(u8, rp, "\"ok\":true") == null) return "editor ctrl+s not ok";
     }
-    tries = 0;
+    var content: [8192]u8 = undefined;
+    var tries: u32 = 0;
     while (tries < 50) : (tries += 1) {
         if (drive) |app| app.drain();
         _ = c.usleep(200_000);
-        const f = c.fopen(efile.ptr, "rb") orelse continue;
-        var content: [64]u8 = undefined;
+        const f = c.fopen(path.ptr, "rb") orelse continue;
         const n = c.fread(&content, 1, content.len, f);
         _ = c.fclose(f);
-        if (std.mem.eql(u8, content[0..n], ED_HEAD ++ ED_TAIL)) break;
-    } else return "the editor buffer never saved (a dirty prompt would block shutdown)";
-    return null;
+        const got = content[0..n];
+        if (exact) {
+            if (std.mem.eql(u8, got, expect)) return null;
+        } else if (std.mem.indexOf(u8, got, expect) != null) return null;
+    }
+    return "the editor buffer never saved (a dirty prompt would block shutdown)";
 }
 
 /// Type `text` into the focused pane (the editor tab just opened).
@@ -1441,15 +1476,26 @@ fn menuHasRow(allocator: std.mem.Allocator, label: []const u8) bool {
 /// constraint for the tab strip). The marker row is what confirms the
 /// hit, so a near-miss that opens the canvas menu is a retry, not a
 /// pass.
-fn probeMenuAt(allocator: std.mem.Allocator, points: []const Point, marker: []const u8) ?u32 {
-    const app = drive orelse return null;
+///
+/// `err` carries the reason when the probe could not even clear the
+/// screen between attempts, so the caller reports that instead of its
+/// own "the menu never opened" guess.
+fn probeMenuAt(allocator: std.mem.Allocator, points: []const Point, marker: []const u8, err: *?[]const u8) ?u32 {
+    err.* = null;
+    const app = drive orelse {
+        err.* = "the display session has no driver";
+        return null;
+    };
     for (points) |p| {
-        dismissPopup(app);
+        if (dismissPopup(app)) |m| {
+            err.* = m;
+            return null;
+        }
         _ = waitTabPopup(app, false, 2_000);
         const id = rightClickAt(p.x, p.y, 6_000) orelse continue;
         if (menuHasRow(allocator, marker)) return id;
     }
-    dismissPopup(app);
+    if (dismissPopup(app)) |m| err.* = m;
     _ = waitTabPopup(app, false, 2_000);
     return null;
 }
@@ -1500,10 +1546,11 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     const margin: f64 = @max(0.0, (w - frame_w) / 2);
 
     // ── the GUTTER menu ────────────────────────────────────────────
+    var probe_err: ?[]const u8 = null;
     var pts: [6]Point = undefined;
     for ([_]f64{ 4, 8, 12, 16, 22, 30 }, 0..) |dx, i| pts[i] = .{ .x = margin + dx, .y = h * 0.5 };
-    const gutter_id = probeMenuAt(allocator, &pts, "Select This Line") orelse
-        return "right-clicking the editor gutter never opened the line menu";
+    const gutter_id = probeMenuAt(allocator, &pts, "Select This Line", &probe_err) orelse
+        return probe_err orelse "right-clicking the editor gutter never opened the line menu";
     _ = app.waitVisualSettle(gutter_id, 300, 5_000, 0.002, null);
     shotPopup(allocator, gutter_id, "/tmp/sketerm-atspi-editor-gutter-menu.png");
 
@@ -1621,8 +1668,8 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     var canvas_has_lsp = false;
     {
         var cpts: [1]Point = .{.{ .x = margin + w * 0.4, .y = h * 0.5 }};
-        const id = probeMenuAt(allocator, &cpts, "Toggle Line Comment") orelse
-            return "right-clicking the editor TEXT no longer opens the canvas menu";
+        const id = probeMenuAt(allocator, &cpts, "Toggle Line Comment", &probe_err) orelse
+            return probe_err orelse "right-clicking the editor TEXT no longer opens the canvas menu";
         _ = id;
         if (menuHasRow(allocator, "Select This Line"))
             return "the canvas menu grew the gutter's Select This Line row";
@@ -1630,7 +1677,7 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
         // what is installed on the host, so it is not asserted either
         // way — it is CARRIED, and the status menu must agree with it.
         canvas_has_lsp = menuHasRow(allocator, "Go to Definition");
-        dismissPopup(app);
+        if (dismissPopup(app)) |m| return m;
         _ = waitTabPopup(app, false, 3_000);
     }
     say("editor chrome: the text still opens the canvas menu, and only that one");
@@ -1639,8 +1686,8 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     var spts: [6]Point = undefined;
     for ([_]f64{ 4, 8, 12, 18, 26, 34 }, 0..) |dy, i|
         spts[i] = .{ .x = margin + 40, .y = h - margin - dy };
-    const status_id = probeMenuAt(allocator, &spts, "Soft Wrap") orelse
-        return "right-clicking the editor status line never opened its menu";
+    const status_id = probeMenuAt(allocator, &spts, "Soft Wrap", &probe_err) orelse
+        return probe_err orelse "right-clicking the editor status line never opened its menu";
     _ = app.waitVisualSettle(status_id, 300, 5_000, 0.002, null);
     shotPopup(allocator, status_id, "/tmp/sketerm-atspi-editor-status-menu.png");
     if (menuHasRow(allocator, "Toggle Line Comment"))
@@ -1670,7 +1717,7 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     if (!awaitStatusContains(allocator, "Wrap", 10_000))
         return "Soft Wrap did not turn wrapping on (the status line never said Wrap)";
     say("editor chrome: Soft Wrap really wrapped, and the status line says so");
-    dismissPopup(app);
+    if (dismissPopup(app)) |m| return m;
 
     // ── IME preedit stays OUT of the accessible text ───────────────
     //
@@ -1729,17 +1776,11 @@ fn editorChromeStage(allocator: std.mem.Allocator, rt: []const u8, sock_path: [:
     say("editor chrome: a composing string never enters the accessible text (announcement itself is not bus-observable)");
 
     // Leave nothing dirty behind: the GUI's SIGTERM must not meet an
-    // unsaved-buffer prompt.
-    {
-        const rq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"ctrl+s\"}}\n", .{epane}) catch return "fmt";
-        const rp = roundtrip(allocator, sock_path, rq) orelse return "ctrl+s roundtrip";
-        allocator.free(rp);
-    }
-    var saved: u32 = 0;
-    while (saved < 40) : (saved += 1) {
-        app.drain();
-        _ = c.usleep(200_000);
-    }
+    // unsaved-buffer prompt. Asserted, not assumed — the six characters
+    // typed above are the only edit this stage makes, so their presence
+    // on disk is what proves the save landed (the composition test then
+    // asserted the document was left untouched).
+    if (saveEditorPane(allocator, sock_path, epane, efile, "abcdef", false)) |m| return m;
     return null;
 }
 

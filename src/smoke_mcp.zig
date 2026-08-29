@@ -2958,17 +2958,48 @@ fn readSmall(path: []const u8, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
-/// `.list` a daemon's sessions as the raw welcome JSON; empty when the
-/// daemon is unreachable.
-fn listSessionsRaw(allocator: std.mem.Allocator, sock: []const u8, buf: []u8) []const u8 {
-    var conn = muxclient.Conn.connect(allocator, sock) catch return "";
+/// Why a `.list` produced no welcome. Distinguishing these from an
+/// empty-but-valid listing is load-bearing: a caller asserting that
+/// something is ABSENT from the listing passes vacuously when the daemon
+/// was simply unreachable.
+const ListFailure = error{
+    ListConnect,
+    ListSend,
+    ListReply,
+    ListTruncated,
+};
+
+/// `.list` a daemon's sessions as the raw welcome JSON.
+fn listSessionsRaw(allocator: std.mem.Allocator, sock: []const u8, buf: []u8) ListFailure![]const u8 {
+    var conn = muxclient.Conn.connect(allocator, sock) catch return error.ListConnect;
     defer conn.deinit();
-    conn.sendFrame(.list, "") catch return "";
-    const frame = conn.recvExpectFor(&.{.welcome}, 15_000) catch return "";
+    conn.sendFrame(.list, "") catch return error.ListSend;
+    const frame = conn.recvExpectFor(&.{.welcome}, 15_000) catch return error.ListReply;
     defer frame.deinit(allocator);
-    const n = @min(frame.payload.len, buf.len);
-    @memcpy(buf[0..n], frame.payload[0..n]);
-    return buf[0..n];
+    // A clipped welcome is the same vacuity hazard as no welcome at all.
+    if (frame.payload.len > buf.len) return error.ListTruncated;
+    @memcpy(buf[0..frame.payload.len], frame.payload);
+    return buf[0..frame.payload.len];
+}
+
+/// `listSessionsRaw` plus the well-formedness control every assertion
+/// over the listing depends on: this really is a daemon's welcome, so
+/// "X is not in it" means X is absent rather than that nothing was read.
+fn listSessionsChecked(allocator: std.mem.Allocator, sock: []const u8, buf: []u8, what: []const u8) []const u8 {
+    const listing = listSessionsRaw(allocator, sock, buf) catch |e| {
+        say(what);
+        say(sock);
+        say(@errorName(e));
+        fail("the daemon could not be listed, so nothing may be concluded from its listing");
+    };
+    if (std.mem.indexOf(u8, listing, "\"daemon_pid\":") == null or
+        std.mem.indexOf(u8, listing, "\"sessions\":") == null)
+    {
+        say(what);
+        say(listing);
+        fail("the list reply is not a daemon welcome");
+    }
+    return listing;
 }
 
 /// Append one line to `$SKETERM_FAKE_WEB_FRAMES`, the fake helper's
@@ -3451,7 +3482,7 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
 
         // The instance daemon really hosts it, as a display session.
         const priv = std.fmt.bufPrint(&args_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ rt, m.pid }) catch unreachable;
-        const listing = listSessionsRaw(allocator, priv, &list_buf);
+        const listing = listSessionsChecked(allocator, priv, &list_buf, "web session listing");
         if (std.mem.indexOf(u8, listing, "web-") == null or
             std.mem.indexOf(u8, listing, "\"display\":true") == null)
             fail("the instance daemon does not list the web session as a display session");
@@ -3487,7 +3518,10 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
             std.mem.indexOf(u8, failed, "exited during startup") == null)
             fail("a startup-dead helper did not surface as the described startup error");
         const priv = std.fmt.bufPrint(&args_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ rt, m.pid }) catch unreachable;
-        const listing = listSessionsRaw(allocator, priv, &list_buf);
+        // The POSITIVE control is inside listSessionsChecked: an
+        // unreachable daemon used to pass this leak check vacuously,
+        // since an empty listing contains no "web-" either.
+        const listing = listSessionsChecked(allocator, priv, &list_buf, "startup-dead helper leak check");
         if (std.mem.indexOf(u8, listing, "web-") != null)
             fail("the fallback leaked the web session on the instance daemon");
         m.closeStdinWait();
@@ -3507,6 +3541,10 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
         if (std.mem.indexOf(u8, caps, "\"web_backend\":\"headless\"") == null)
             fail("opt-out did not fall back to the plain headless backend");
         const pj = readSmall(std.fmt.bufPrint(&probe_buf, "{s}/sketerm/mcp-tmp-{d}/web.json", .{ rt, m.pid }) catch unreachable, &file_buf);
+        // POSITIVE control first: `readSmall` answers "" for a missing
+        // file, and a missing presence file names no session either.
+        if (std.mem.indexOf(u8, pj, "\"mcp_pid\":") == null)
+            fail("no presence file was written for the opted-out helper");
         if (std.mem.indexOf(u8, pj, "\"session\"") != null)
             fail("opt-out still advertised a session in web.json");
         m.closeStdinWait();

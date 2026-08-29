@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const c = @import("c.zig").c;
+const platform = @import("util/platform.zig");
 const daemon_mod = @import("mux/daemon.zig");
 const lifetime = @import("util/lifetime.zig");
 const client_mod = @import("mux/client.zig");
@@ -234,11 +235,22 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // No exec, so it inherited the fence's WRITE end too: drop it, or
         // this child would keep its own fence alive.
         lifetime.dropWriteEnd();
+        // Every real daemon entry point neuters SIGPIPE; a forked broker
+        // that skips it dies of signal 13 the first time a worker or a
+        // client drops its socket mid-write, which the shutdown stage
+        // now reports instead of excusing.
+        platform.ignoreSigpipe();
         const child_alloc = std.heap.page_allocator;
         const d = daemon_mod.Daemon.init(child_alloc, sock_path) catch c._exit(3);
         d.is_broker = true;
         d.lifetime_fd = lifetime.inherited() catch c._exit(3);
-        d.run() catch {};
+        // A `run()` that RETURNED AN ERROR is a broker failure and must be
+        // distinguishable from the clean shutdown the last stage asserts;
+        // exiting 0 here made the two identical.
+        d.run() catch |err| {
+            std.debug.print("smoke-broker: broker run error: {s}\n", .{@errorName(err)});
+            c._exit(4);
+        };
         c._exit(0);
     }
 
@@ -447,20 +459,43 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     std.debug.print("smoke-broker: post-mortem log outlives worker teardown ok\n", .{});
 
     // ── clean shutdown ──
+    //
+    // The shutdown FRAME must be what retires the broker, and it must
+    // retire cleanly: no signal, exit code 0. The SIGKILL below stays as
+    // a backstop so a wedged broker cannot hang the rig, but reaching it
+    // is itself a failure — this stage used to kill unconditionally and
+    // never look at `status`, so it could not fail at all. Now that it
+    // fails, the budget is 10s rather than 2s: retiring means reaping
+    // every worker, and on a loaded CI host that is slow, not wedged.
     {
         var conn = client_mod.Conn.connect(allocator, sock_path) catch fail("shutdown connect");
         defer conn.deinit();
-        conn.sendFrame(.shutdown, "") catch {};
+        conn.sendFrame(.shutdown, "") catch fail("shutdown: the shutdown frame could not be sent");
     }
     var status: c_int = 0;
+    var exited = false;
     var waited: usize = 0;
-    while (waited < 100) : (waited += 1) {
-        if (c.waitpid(bpid, &status, c.WNOHANG) == bpid) break;
+    while (waited < 500) : (waited += 1) {
+        if (c.waitpid(bpid, &status, c.WNOHANG) == bpid) {
+            exited = true;
+            break;
+        }
         _ = c.usleep(20_000);
     }
-    // Best-effort: make sure the broker is gone.
-    _ = c.kill(bpid, c.SIGKILL);
-    _ = c.waitpid(bpid, &status, 0);
+    if (!exited) {
+        _ = c.kill(bpid, c.SIGKILL);
+        var killed: c_int = 0;
+        _ = c.waitpid(bpid, &killed, 0);
+        fail("shutdown: broker still alive 10s after the shutdown frame (the SIGKILL backstop was needed)");
+    }
+    if (status & 0x7f != 0) {
+        std.debug.print("smoke-broker: broker died on signal {d}\n", .{status & 0x7f});
+        fail("shutdown: broker died on a signal instead of shutting down");
+    }
+    if ((status >> 8) & 0xff != 0) {
+        std.debug.print("smoke-broker: broker exit code {d}\n", .{(status >> 8) & 0xff});
+        fail("shutdown: broker exited nonzero (3 = init/lifetime, 4 = run() returned an error)");
+    }
 
     std.debug.print("smoke-broker: PASS\n", .{});
     return 0;

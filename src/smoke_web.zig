@@ -1777,7 +1777,16 @@ const Client = struct {
                     self.ax_mirror = axtree.Tree.init(self.gpa);
                     self.ax_mirror_live = true;
                 }
-                self.ax_mirror.applyTree(ev) catch {};
+                // A dropped tree leaves the mirror STALE, and stages 22k
+                // and 36 then assert against the previous snapshot and
+                // pass for the wrong reason.
+                self.ax_mirror.applyTree(ev) catch |e| {
+                    std.debug.print(
+                        "smoke-web: ev_a11y_tree #{d} (view {d}, root {d}, {d} node bytes) rejected: {s}\n",
+                        .{ self.ax_seq, ev.view, ev.root_id, ev.nodes.s.len, @errorName(e) },
+                    );
+                    fail("ev_a11y_tree could not be applied to the mirror");
+                };
             },
             .ev_cookies => {
                 const ev = proto.EvCookies.decodeAlloc(frame.payload, self.gpa) catch fail("ev_cookies decode");
@@ -2586,26 +2595,15 @@ fn reapHelper(pid: c.pid_t, what: []const u8) void {
     reapHelperTimeout(pid, what, 10_000);
 }
 
-/// Like `reapHelperTimeout` but a SIGNAL exit is reported, not failed —
-/// for a helper whose CEF shutdown is a known-noisy path. A hang still
-/// fails.
-fn reapHelperTolerant(pid: c.pid_t, what: []const u8, timeout_ms: i64) void {
-    const deadline = nowMs() + timeout_ms;
-    var status: c_int = 0;
-    while (nowMs() < deadline) {
-        if (c.waitpid(pid, &status, c.WNOHANG) == pid) {
-            g_pid = -1;
-            if (status & 0x7f != 0) {
-                std.debug.print("smoke-web: NOTE {s}: helper exited on signal {d} (CEF shutdown artifact)\n", .{ what, status & 0x7f });
-            }
-            return;
-        }
-        _ = c.usleep(50_000);
-    }
-    say(what);
-    fail("helper did not exit within its budget of the disconnect");
-}
-
+/// Reap by exact pid and demand a CLEAN death: neither a signal nor a
+/// nonzero exit code, within `timeout_ms` of the client disconnect.
+///
+/// There is deliberately no signal-tolerating variant: a helper dying on
+/// a signal is never expected, because `cef_shutdown` (a `defer` around
+/// `srv.run()` in `src/web/main.zig`) cannot run after a crash. The
+/// tolerant reap that used to stand here read a use-after-free in our own
+/// helper as a CEF shutdown artifact and printed PASS over SIGSEGV on
+/// nine separate days.
 fn reapHelperTimeout(pid: c.pid_t, what: []const u8, timeout_ms: i64) void {
     const deadline = nowMs() + timeout_ms;
     var status: c_int = 0;
@@ -2613,15 +2611,21 @@ fn reapHelperTimeout(pid: c.pid_t, what: []const u8, timeout_ms: i64) void {
         if (c.waitpid(pid, &status, c.WNOHANG) == pid) {
             g_pid = -1;
             if (status & 0x7f != 0) {
+                std.debug.print("smoke-web: {s}: helper signal {d}\n", .{ what, status & 0x7f });
                 say(what);
                 fail("helper died on a signal");
+            }
+            if ((status >> 8) & 0xff != 0) {
+                std.debug.print("smoke-web: {s}: helper exit code {d}\n", .{ what, (status >> 8) & 0xff });
+                say(what);
+                fail("helper exited nonzero");
             }
             return;
         }
         _ = c.usleep(50_000);
     }
     say(what);
-    fail("helper did not exit within 10s of the disconnect");
+    fail("helper did not exit within its budget of the disconnect");
 }
 
 /// Asks for geolocation the moment it loads (no user gesture is
@@ -3345,7 +3349,7 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
             while (nowMs() < d) cl.pump(50);
         }
         cl.deinit();
-        reapHelperTolerant(pid, "stage 34 helper 1", 30_000);
+        reapHelperTimeout(pid, "stage 34 helper 1", 30_000);
     }
 
     // ── Helper 2: a SHORT fail-open deadline, so the timeout itself is
@@ -3405,7 +3409,7 @@ fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
             while (nowMs() < d) cl.pump(50);
         }
         cl.deinit();
-        reapHelperTolerant(pid, "stage 34 helper 2", 30_000);
+        reapHelperTimeout(pid, "stage 34 helper 2", 30_000);
     }
     _ = c.unsetenv("SKETERM_WEB_WREQ_TIMEOUT_MS");
 }
@@ -3528,7 +3532,7 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
             while (nowMs() < d) cl.pump(50);
         }
         cl.deinit(); // close the socket so the helper disconnects and exits
-        reapHelperTolerant(pid, "stage 33 webext run 1", 30_000);
+        reapHelperTimeout(pid, "stage 33 webext run 1", 30_000);
     }
 
     // ── Run 2: storage.local persisted across the restart ─────────
@@ -3570,7 +3574,7 @@ fn runWebextStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) v
             while (nowMs() < d) cl.pump(50);
         }
         cl.deinit(); // close the socket so the helper disconnects and exits
-        reapHelperTolerant(pid, "stage 33 webext run 2", 30_000);
+        reapHelperTimeout(pid, "stage 33 webext run 2", 30_000);
     }
 }
 
@@ -4601,7 +4605,7 @@ fn runShapeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) vo
         while (nowMs() < d) cl.pump(50);
     }
     cl.deinit();
-    reapHelperTolerant(pid, "stage 35a", 30_000);
+    reapHelperTimeout(pid, "stage 35a", 30_000);
 }
 
 fn uboPage(buf: []u8, port: u16) []const u8 {
@@ -4836,7 +4840,7 @@ fn runUboStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8, pinn
         while (nowMs() < d) cl.pump(50);
     }
     cl.deinit();
-    reapHelperTolerant(pid, "stage 35b", 60_000);
+    reapHelperTimeout(pid, "stage 35b", 60_000);
 }
 
 /// Unpack an XPI into `dest`, refusing any entry that escapes it.
@@ -5307,7 +5311,7 @@ fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
     if (!b.waitTitle("mc:beta", 20_000)) fail("stage mc5: client B lost service when client A died");
     b.have_view = false;
     b.deinit();
-    reapHelperTolerant(pid, "stage mc5 last-client exit", 30_000);
+    reapHelperTimeout(pid, "stage mc5 last-client exit", 30_000);
     pass("stage mc5 engine survived one client's death and exited with the last");
 }
 
@@ -5442,7 +5446,7 @@ fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
         }
         b.have_view = false;
         b.deinit();
-        reapHelperTolerant(pid, "stage fl2 teardown", 30_000);
+        reapHelperTimeout(pid, "stage fl2 teardown", 30_000);
     }
     pass("stage fl2 the flushed cookie survived kill -9");
 
@@ -5531,7 +5535,7 @@ fn runFlushLingerStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
             fail("stage fl4: the TTL reap lost the jar (the reap was not the graceful path)");
         d2.have_view = false;
         d2.deinit();
-        reapHelperTolerant(pid, "stage fl4 teardown", 30_000);
+        reapHelperTimeout(pid, "stage fl4 teardown", 30_000);
     }
     pass("stage fl4 the TTL reap was graceful: the jar survived with no explicit flush");
 }
@@ -6010,9 +6014,9 @@ fn runCookieSyncStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u
     }
     a.deinit();
     b.deinit();
-    reapHelperTolerant(pid_a, "stage 42 teardown A", 30_000);
+    reapHelperTimeout(pid_a, "stage 42 teardown A", 30_000);
     g_pid = -1;
-    reapHelperTolerant(pid_b, "stage 42 teardown B", 30_000);
+    reapHelperTimeout(pid_b, "stage 42 teardown B", 30_000);
     g_pid_b = -1;
 }
 
@@ -8169,20 +8173,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     cl.send(proto.ViewDestroy{ .view = view_id });
     cl.deinit();
     {
-        const deadline = nowMs() + 10_000;
-        var status: c_int = 0;
-        var gone = false;
-        while (nowMs() < deadline) {
-            if (c.waitpid(pid, &status, c.WNOHANG) == pid) {
-                gone = true;
-                break;
-            }
-            _ = c.usleep(50_000);
-        }
-        if (!gone) fail("stage 23 teardown: helper did not exit within 10s of the disconnect");
-        g_pid = -1;
-        if (status & 0x7f != 0) fail("stage 23 teardown: helper died on a signal");
-        if ((status >> 8) & 0xff != 0) fail("stage 23 teardown: helper exited nonzero");
+        // The hand-rolled copy this used to be was the ONLY reap that
+        // looked at the exit code; `reapHelperTimeout` now checks both,
+        // so there is no second implementation to keep in step.
+        reapHelperTimeout(pid, "stage 23 teardown", 10_000);
         pass("stage 23 teardown (helper exited 0 on disconnect)");
     }
 
@@ -8395,8 +8389,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         // Destroy the browsers FIRST and pump so their async close
         // finishes, THEN destroy the contexts (also exercising
         // context_destroy and freeing the ephemeral in-memory stores),
-        // then pump again — a proxied browser still half-closed at
-        // cef_shutdown is what makes CEF exit on a signal.
+        // then pump again: a proxied browser still half-closed when the
+        // last client goes away is the shape this stage has to unwind
+        // cleanly, and the strict reap below is what proves it did.
         ec.send(proto.ViewDestroy{ .view = egress_view_a });
         ec.send(proto.ViewDestroy{ .view = egress_view_b });
         ec.send(proto.ViewDestroy{ .view = egress_view_c });
@@ -8414,13 +8409,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             while (nowMs() < d and ec.fd >= 0) ec.pump(50);
         }
         ec.deinit();
-        // Reap TOLERANTLY: CEF's cef_shutdown raises a signal whenever
-        // the process ever created a proxied request context, even after
-        // every view and context is destroyed and drained — a known
-        // shutdown-path artifact of the engine, not a functional defect
-        // (the whole feature was just proven above). What still MUST hold
-        // is that the process terminates rather than hangs.
-        reapHelperTolerant(eg_pid, "stages 26/27 egress", 30_000);
+        reapHelperTimeout(eg_pid, "stages 26/27 egress", 30_000);
     }
 
     // A context whose proxy preference is refused is rolled back before it
@@ -8589,7 +8578,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             while (nowMs() < d and jc.fd >= 0) jc.pump(50);
         }
         jc.deinit();
-        reapHelperTolerant(jar_pid, "stage 37 jars", 30_000);
+        reapHelperTimeout(jar_pid, "stage 37 jars", 30_000);
         pass("stage 37 jars (same origin in two containers, cookie confined to the one that wrote it)");
     }
 
