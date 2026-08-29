@@ -514,12 +514,14 @@ pub const Watchdog = struct {
         }
         for (forward_state.forwards.values()) |f| addFd(f.term.conn.fd);
         {
-            // The headless web helper's socket, when one is up — and
-            // the broker-profile connection beside it.
-            const wfd = @import("mcp_web.zig").watchdogFd();
-            if (wfd >= 0) addFd(wfd);
-            const pfd = @import("mcp_web.zig").watchdogMuxFd();
-            if (pfd >= 0) addFd(pfd);
+            // EVERY headless web helper's socket (one helper instance
+            // per browser route), and the broker-profile connection
+            // beside each. A wedged helper on any route must be
+            // abortable, or the route it serves outlives the hard cap.
+            var web_fds: [16]c_int = undefined;
+            for (@import("mcp_web.zig").watchdogFds(&web_fds)) |fd| addFd(fd);
+            var web_mux_fds: [16]c_int = undefined;
+            for (@import("mcp_web.zig").watchdogMuxFds(&web_mux_fds)) |fd| addFd(fd);
         }
         fired.store(false, .release);
         started_ms = clock.nowMs();
@@ -3045,7 +3047,6 @@ pub fn numArray(v: std.json.Value, comptime n: usize) ?[n]f64 {
     return out;
 }
 
-
 /// One app_actions screenshot: draws (and consumes) the pending step
 /// marks, stores the PNG, writes the report line. Returns false when
 /// the capture failed (the caller decides whether that is fatal).
@@ -3711,6 +3712,29 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     try res.fact("web", web_ok);
     try res.fact("web_backend", web_backend);
     if (@import("mcp_web.zig").sessionInfo()) |ws| try res.fact("web_session", ws);
+    // Watch-along: the private daemon socket and whether the web session
+    // shows pixels. Both are facts a human needs to find the assistant's
+    // browser from their own GUI; the text lane says where to look.
+    const web_watch = @import("mcp_web.zig").presenterActive();
+    try res.fact("web_watch", web_watch);
+    if (app_state.mux_sock) |ms| try res.fact("mux_socket", ms) else try res.raw("mux_socket", "null");
+    if (@import("mcp_web.zig").sessionInfo()) |ws| {
+        if (app_state.mux_sock) |ms| {
+            try res.textf("the user can watch this browser: session {s} on {s}{s}", .{
+                ws,
+                ms,
+                if (web_watch) " (pages are presented as windows; a viewer holding the controller lease can drive them)" else " (audio and lifetime only: the helper did not arm its presenter)",
+            });
+        }
+    }
+    // Per-tab network routes: which kinds `web_open route:` can honour
+    // here. A refused route must be explicable from a preflight, never
+    // discovered by trying it.
+    {
+        const routes = @import("mcp_web.zig").routeCapability(web_ok);
+        try res.fact("web_routes", routes.name());
+        try res.text(routes.describe());
+    }
     // The discoverability half of fail-closed: without this, a
     // web_open that refuses a profile reads as a bug rather than as a
     // capability this server does not have.

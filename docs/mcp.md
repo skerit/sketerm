@@ -136,6 +136,32 @@ CDP: input is delivered as real engine events, so a page sees
 `web_open`, `web_navigate`, `web_tabs`, `web_wait`, `web_scroll`,
 `web_screenshot` do the obvious things. The rest are the semantic layer:
 
+- `web_open route:` picks the tab's network route. The grammar is one
+  string: `direct` (the default), `tor` (through the SOCKS5 endpoint
+  `mux_tor_socks_endpoint` names in config.conf), `via:<host>` (egress
+  through that mux/SSH host) or `on:<host>` (the browser process itself
+  runs on that host). Anything else is refused as `invalid_args`; an
+  unparseable route never falls back to direct.
+
+  A route is realized as a whole browser INSTANCE: its own
+  `sketerm-webengine` process, its own profile directory and its own
+  proxy, because one Chromium profile is one network context and
+  cannot route two tabs differently. Two consequences worth planning
+  for: a route sticks to the tab for its lifetime, across navigations;
+  and each route has its own cookie jar, so a login on one route is not
+  a login on another.
+
+  Every web result carries the tab's actual `route`, and `web_tabs`
+  lists it per tab. Read it rather than assuming the requested route
+  was applied.
+
+  Which kinds work depends on the backend, and `capabilities` reports
+  that as `web_routes`: `gui` serves all four kinds; `headless` (the
+  default isolated MCP mode) serves `direct` and `tor`, each as its own
+  helper instance, and REFUSES `via:`/`on:`, because `via:` needs the GUI's
+  local SOCKS5 bridge and `on:` a helper on the far host. A refusal
+  opens nothing: a routed tab must never silently browse direct.
+
 - `web_snapshot` returns the page as roles, names and stable ids. The
   FIRST snapshot of a document is complete; every later one is a
   **delta** against what was already sent, so an unchanged page answers
