@@ -701,6 +701,7 @@ editor *font* is per-profile.
 | `app_keyboard_layout` | string | unset | xkb layout for forwarded-app session keyboards: `us`, `gb`, `fr`, `be`, `de`. Set it to YOUR physical layout -- keystrokes pass through as raw keycodes and the app decodes them with this keymap. Empty = `us`. |
 | `gpu_apps` | string | unset | Comma-separated app names always launched with GPU rendering (linux-dmabuf instead of software GL), matched case-insensitively against the .desktop `Name` or the `Exec` binary's basename: `Blender, mpv`. |
 | `mux_udp_port_range` | string | unset | `lo:hi` passed to the remote UDP bootstrap; pin it when a firewall sits in front of the host (`60000:61000`). Validated at load. Empty = ephemeral port. |
+| `mux_tor_socks_endpoint` | string | `127.0.0.1:9050` | SOCKS5 proxy a forced `tor:` mux route dials. Numeric only (IPv4, or a bracketed IPv6 literal) and validated at load, so resolving the proxy itself can never leak through local DNS. |
 | `input_method` | enum | `auto` | `simple` = GTK's in-process compose tables (dead keys always work, no IME); `multi` = the per-display IM module (ibus/fcitx, but on Wayland that module has no compose engine); `auto` picks `multi` only where an input method is visibly configured. Under `auto` the terminal always resolves to `simple`; the editor and the app host follow the heuristic. An explicit value applies to every face. Applies to faces created after the change. |
 
 ### Background layer

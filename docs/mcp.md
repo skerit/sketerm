@@ -28,10 +28,14 @@ Comma- or space-separated terms:
 | Term | Meaning |
 | --- | --- |
 | `all` | every tool |
+| `all:ro` | every non-mutating tool, in every group |
 | `<group>` | every tool in the group |
 | `<group>:ro` | that group's non-mutating tools only |
 | `<tool>` | one tool by name |
-| `-<group>`, `-<group>:ro`, `-<tool>` | deny |
+| `-<group>`, `-<group>:ro`, `-<tool>`, `-all:ro` | deny |
+
+`all` is group-shaped, so `:ro` narrows it exactly as it narrows a named
+group.
 
 Groups: `panes` (a running GUI's tabs/panes), `app` (forwarded Wayland
 apps), `term` (headless daemon terminals), `files`, `net` (port
@@ -47,6 +51,7 @@ forwards), `browser` (the `web_*` tools driving the GUI's own browser views), `u
   is a category error rather than a no-op.
 
 ```
+--tools "all:ro"                   # observe everything, mutate nothing
 --tools "app, files:ro"            # drive apps, read files, nothing else
 --tools "app:ro, browser"          # look at apps, drive a browser
 --tools "-run_command, -file_delete_tree"   # everything but these two

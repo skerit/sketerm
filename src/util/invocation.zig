@@ -70,3 +70,30 @@ test "start matches every shipped identity and refuses the others" {
     // No subcommands at all is legal.
     try t.expectEqual(@as(?usize, null), start(&.{ "sketerm", "web" }, "sketerm-web", &.{}));
 }
+
+/// True when the argument list explicitly asks for help. Callers pair it
+/// with the subcommand's own "this was the usage path" predicate: an
+/// explicit --help is a successful request (exit 0), a missing operand
+/// that printed the same usage is not.
+pub fn helpRequested(args: []const []const u8) bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return true;
+    }
+    return false;
+}
+
+test "helpRequested accepts both spellings anywhere in the list" {
+    try t.expect(helpRequested(&.{"--help"}));
+    try t.expect(helpRequested(&.{"-h"}));
+    try t.expect(helpRequested(&.{ "host", "--help" }));
+    try t.expect(helpRequested(&.{ "-h", "host" }));
+}
+
+test "helpRequested refuses near misses and an empty list" {
+    try t.expect(!helpRequested(&.{}));
+    try t.expect(!helpRequested(&.{ "host", "ls" }));
+    try t.expect(!helpRequested(&.{"--help-me"}));
+    try t.expect(!helpRequested(&.{"-help"}));
+    try t.expect(!helpRequested(&.{"help"}));
+    try t.expect(!helpRequested(&.{"-hx"}));
+}

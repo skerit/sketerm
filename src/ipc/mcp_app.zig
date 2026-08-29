@@ -6,6 +6,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const atomicwrite = @import("../util/atomicwrite.zig");
 const appdrive = @import("appdrive.zig");
+const ocr = @import("../util/ocr.zig");
 const mcp = @import("mcp.zig");
 const Res = mcp.Res;
 const errRes = mcp.errRes;
@@ -70,6 +71,64 @@ fn saveRecording(path: []const u8, bytes: []const u8) atomicwrite.Error!void {
 fn ocrErr(arena: std.mem.Allocator, msg: []const u8) ![]const u8 {
     if (std.mem.startsWith(u8, msg, "no rendered")) return errRes(arena, .not_found, msg);
     return errRes(arena, .unavailable, msg);
+}
+
+/// What one waiting step of an `app_actions` batch may spend, and whether
+/// the budget shortened the request.
+const StepWait = struct {
+    ms: i64,
+    /// The wait was cut short, so its timeout is a budget fact and must
+    /// never be reported as an observation about the app.
+    clipped: bool,
+    requested: i64,
+};
+
+/// What one waiting step of an `app_actions` batch may still spend: its
+/// own request, clamped to the per-wait cap AND to what is left of the
+/// batch's SINGLE budget. Per-step clamping alone is not enough: N
+/// steps each just under `WAIT_CAP_MS` sail past the 150s central
+/// watchdog, which then shuts the connection down instead of letting
+/// the call answer. Yields 0ms once the budget is spent.
+fn stepBudget(requested: i64, batch_deadline: i64) StepWait {
+    const left = batch_deadline - nowMs();
+    if (left <= 0) return .{ .ms = 0, .clipped = requested > 0, .requested = requested };
+    const ms = std.math.clamp(requested, 0, @min(left, mcp.WAIT_CAP_MS));
+    return .{ .ms = ms, .clipped = ms < requested, .requested = requested };
+}
+
+/// How long a screenshot_app burst may keep capturing, clamped like every
+/// other app-side wait: past `WAIT_CAP_MS` the 150s central watchdog would
+/// shut the connection down instead of the call answering.
+fn burstMs(requested: ?i64) i64 {
+    return std.math.clamp(requested orelse 5_000, 0, mcp.WAIT_CAP_MS);
+}
+
+/// The clause a clipped wait appends to its transcript line, so a timeout
+/// at a shortened deadline cannot read as an app verdict.
+fn clipNote(arena: std.mem.Allocator, b: StepWait) ![]const u8 {
+    if (!b.clipped) return "";
+    return std.fmt.allocPrint(
+        arena,
+        " [wait clipped to {d}ms of the {d}ms asked, by the batch budget; not an app verdict]",
+        .{ b.ms, b.requested },
+    );
+}
+
+/// Copy one OCR pass out of a poll's scratch arena into `arena`.
+///
+/// Only the pass that MATCHED is worth keeping; every other pass dies
+/// with the next scratch reset, which is what stops a polling wait from
+/// growing by one pass's arena charge per iteration for the whole tool
+/// call (`ocrWindow` frees the RGBA capture itself, but its recognized
+/// text and word boxes and, for small fonts, the upscaled copy of the
+/// capture are the caller's arena).
+fn dupeOcrOut(arena: std.mem.Allocator, o: OcrOut) !OcrOut {
+    const words = try arena.alloc(ocr.Word, o.words.len);
+    for (o.words, words) |src, *dst| {
+        dst.* = src;
+        dst.text = try arena.dupe(u8, src.text);
+    }
+    return .{ .text = try arena.dupe(u8, o.text), .words = words, .scale = o.scale };
 }
 
 /// The word boxes of an OCR pass, as verbatim JSON (each with the
@@ -973,7 +1032,7 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             // a minimum pixel change vs the PREVIOUS shot — one call
             // instead of a screenshot-poll loop across a transition.
             const count: usize = @intCast(@min(bn, 8));
-            const burst_ms: i64 = argInt(args, "burst_ms") orelse 5_000;
+            const burst_ms: i64 = burstMs(argInt(args, "burst_ms"));
             const min_pct: f64 = argFloat(args, "min_change_pct") orelse 1.0;
             var pngs: std.ArrayList([]const u8) = .empty;
             defer {
@@ -1317,6 +1376,9 @@ const StepOutcome = struct {
     ok: bool,
     /// The step's own transcript line, without its "step N: " prefix.
     note: []const u8,
+    /// The batch budget shortened this step's wait, so a timeout here is
+    /// the budget running out and not the app failing to settle.
+    wait_clipped: bool = false,
 };
 
 /// Execute an ordered batch of action steps against `app` — the
@@ -1336,6 +1398,11 @@ pub fn runActionSteps(
     macro: ?[]const u8,
 ) ![]const u8 {
     const MAX_SHOTS = 8;
+    // ONE budget for the whole batch. Every waiting step spends out of
+    // it (`stepBudget`) and the loop stops once it is gone, so a batch
+    // answers within the same bound a single app tool does instead of
+    // being cut off by the central watchdog mid-transcript.
+    const batch_deadline = nowMs() + mcp.WAIT_CAP_MS;
 
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
@@ -1345,6 +1412,9 @@ pub fn runActionSteps(
     // outcome's note is the exact text that step produced.
     var cur_step: usize = 0;
     var cur_start: usize = 0;
+    // Whether the CURRENT step's wait was shortened by the batch budget;
+    // reported as a fact so a clipped timeout is never read as a verdict.
+    var step_clipped = false;
     var pngs: std.ArrayList([]const u8) = .empty;
     defer {
         for (pngs.items) |p| mcp.app_state.allocator.free(p);
@@ -1366,6 +1436,15 @@ pub fn runActionSteps(
         const n = idx + 1;
         cur_step = n;
         cur_start = aw.written().len;
+        step_clipped = false;
+        if (nowMs() >= batch_deadline) {
+            try w.print(
+                "step {d}: ERROR — the batch spent its whole {d}ms budget; remaining steps skipped (split it, or lower the per-step timeouts)\n",
+                .{ n, mcp.WAIT_CAP_MS },
+            );
+            stopped = true;
+            break;
+        }
         if (probeAppStop(app, 1_000)) |stop| {
             try reportActionStop(arena, w, n, "the batch", stop);
             app_stop = stop;
@@ -1382,9 +1461,10 @@ pub fn runActionSteps(
         const button: u32 = @intCast(argInt(st, "button") orelse 1);
 
         if (st.object.get("wait")) |wv| {
-            const ms: i64 = std.math.clamp(if (wv == .integer) wv.integer else 0, 0, 30_000);
-            _ = app.waitIdle(std.math.maxInt(i32), ms); // pure pumped sleep
-            try w.print("step {d}: waited {d}ms\n", .{ n, ms });
+            const b = stepBudget(std.math.clamp(if (wv == .integer) wv.integer else 0, 0, 30_000), batch_deadline);
+            step_clipped = b.clipped;
+            _ = app.waitIdle(std.math.maxInt(i32), b.ms); // pure pumped sleep
+            try w.print("step {d}: waited {d}ms{s}\n", .{ n, b.ms, try clipNote(arena, b) });
         } else if (st.object.get("move")) |mv| {
             const xy = numArray(mv, 2) orelse {
                 try w.print("step {d}: ERROR — \"move\" wants [x,y]\n", .{n});
@@ -1562,6 +1642,9 @@ pub fn runActionSteps(
                 if (argInt(wv, "timeout_ms")) |t| timeout_ms = t;
                 change_pct = argFloat(wv, "change_pct");
             }
+            const budget = stepBudget(timeout_ms, batch_deadline);
+            step_clipped = budget.clipped;
+            timeout_ms = budget.ms;
             var settled: bool = undefined;
             if (change_pct) |pct| {
                 const wid = win_step orelse firstToplevelId(app);
@@ -1577,11 +1660,18 @@ pub fn runActionSteps(
                 break;
             }
             if (!settled and (argBool(st, "required") or (wv == .object and argBool(wv, "required")))) {
-                try w.print("step {d}: ERROR — wait_idle did not settle before timeout (required); remaining steps skipped\n", .{n});
+                try w.print(
+                    "step {d}: ERROR — wait_idle did not settle before timeout (required); remaining steps skipped{s}\n",
+                    .{ n, try clipNote(arena, budget) },
+                );
                 stopped = true;
                 break;
             }
-            try w.print("step {d}: wait_idle — {s}\n", .{ n, if (settled) "settled" else "TIMED OUT (still rendering)" });
+            try w.print("step {d}: wait_idle — {s}{s}\n", .{
+                n,
+                if (settled) "settled" else "TIMED OUT (still rendering)",
+                try clipNote(arena, budget),
+            });
         } else if (st.object.get("wait_change")) |wv| {
             var timeout_ms: i64 = 10_000;
             var min_pct: f64 = 0;
@@ -1591,6 +1681,9 @@ pub fn runActionSteps(
                 if (argInt(wv, "timeout_ms")) |t| timeout_ms = t;
                 if (argFloat(wv, "min_change_pct")) |p| min_pct = p;
             }
+            const budget = stepBudget(timeout_ms, batch_deadline);
+            step_clipped = budget.clipped;
+            timeout_ms = budget.ms;
             const wid = win_step orelse firstToplevelId(app);
             const changed = if (wid == 0) false else app.waitWindowChange(wid, timeout_ms, min_pct, if (wv == .object and min_pct > 0) regionFrom(wv) else null);
             if (probeAppStop(app, 1_000)) |stop| {
@@ -1601,11 +1694,18 @@ pub fn runActionSteps(
                 break;
             }
             if (!changed and (argBool(st, "required") or (wv == .object and argBool(wv, "required")))) {
-                try w.print("step {d}: ERROR — wait_change saw no change before timeout (required); remaining steps skipped\n", .{n});
+                try w.print(
+                    "step {d}: ERROR — wait_change saw no change before timeout (required); remaining steps skipped{s}\n",
+                    .{ n, try clipNote(arena, budget) },
+                );
                 stopped = true;
                 break;
             }
-            try w.print("step {d}: wait_change — {s}\n", .{ n, if (changed) "content changed" else "TIMED OUT (no change)" });
+            try w.print("step {d}: wait_change — {s}{s}\n", .{
+                n,
+                if (changed) "content changed" else "TIMED OUT (no change)",
+                try clipNote(arena, budget),
+            });
         } else if (st.object.get("screenshot")) |sv| {
             const wid = win_step orelse firstToplevelId(app);
             if (wid == 0) {
@@ -1615,7 +1715,7 @@ pub fn runActionSteps(
             }
             if (pngs.items.len >= MAX_SHOTS) {
                 try w.print("step {d}: screenshot SKIPPED (max {d} per call)\n", .{ n, MAX_SHOTS });
-                try outcomes.append(arena, stepOutcome(cur_step, true, aw.written()[cur_start..]));
+                try outcomes.append(arena, stepOutcome(cur_step, true, aw.written()[cur_start..], step_clipped));
                 continue;
             }
             var max_px: u32 = 1568;
@@ -1639,7 +1739,7 @@ pub fn runActionSteps(
                 stopped = true;
                 break;
             }
-            try outcomes.append(arena, stepOutcome(cur_step, true, aw.written()[cur_start..]));
+            try outcomes.append(arena, stepOutcome(cur_step, true, aw.written()[cur_start..], step_clipped));
             continue;
         } else if (st.object.get("wait_image") != null or st.object.get("click_image") != null) {
             const is_wait = st.object.get("wait_image") != null;
@@ -1658,7 +1758,12 @@ pub fn runActionSteps(
                 },
             };
             const min_score = argFloat(wv, "min_score") orelse 0.9;
-            const timeout_ms: i64 = if (is_wait) (argInt(wv, "timeout_ms") orelse 10_000) else 0;
+            const budget: StepWait = if (is_wait)
+                stepBudget(argInt(wv, "timeout_ms") orelse 10_000, batch_deadline)
+            else
+                .{ .ms = 0, .clipped = false, .requested = 0 };
+            step_clipped = budget.clipped;
+            const timeout_ms: i64 = budget.ms;
             // click_image clicks by definition; wait_image opts in.
             const do_click = if (is_wait) argBool(wv, "click") else true;
             const btn: u32 = @intCast(argInt(wv, "button") orelse 1);
@@ -1684,7 +1789,12 @@ pub fn runActionSteps(
                 break;
             }
             const m = found orelse {
-                try w.print("step {d}: ERROR — template \"{s}\" not found{s}\n", .{ n, needle.name, if (is_wait) " before timeout" else "" });
+                try w.print("step {d}: ERROR — template \"{s}\" not found{s}{s}\n", .{
+                    n,
+                    needle.name,
+                    if (is_wait) " before timeout" else "",
+                    try clipNote(arena, budget),
+                });
                 stopped = true;
                 break;
             };
@@ -1717,7 +1827,9 @@ pub fn runActionSteps(
                 stopped = true;
                 break;
             };
-            const timeout_ms: i64 = argInt(wv, "timeout_ms") orelse 15_000;
+            const budget = stepBudget(argInt(wv, "timeout_ms") orelse 15_000, batch_deadline);
+            step_clipped = budget.clipped;
+            const timeout_ms: i64 = budget.ms;
             const do_click = argBool(wv, "click");
             const region = regionFrom(wv);
             const scale: u32 = @intCast(std.math.clamp(argInt(wv, "scale") orelse 0, 0, 8));
@@ -1727,15 +1839,23 @@ pub fn runActionSteps(
             const deadline = nowMs() + timeout_ms;
             var seen: ?OcrOut = null;
             var fatal: ?[]const u8 = null;
+            // One arena per OCR pass, released between polls: a pass
+            // charges its caller for the recognized text and word boxes
+            // and, for small fonts, an upscaled copy of the capture
+            // (`ocrWindow` frees the capture itself). Charged to the call
+            // arena those would only be freed when the whole batch ends.
+            var ocr_scratch = std.heap.ArenaAllocator.init(mcp.app_state.allocator);
+            defer ocr_scratch.deinit();
             while (true) {
-                switch (try ocrWindow(arena, app, wid, region, scale, psm, lang)) {
+                _ = ocr_scratch.reset(.free_all);
+                switch (try ocrWindow(ocr_scratch.allocator(), app, wid, region, scale, psm, lang)) {
                     .out => |o| {
-                        if (std.ascii.indexOfIgnoreCase(o.text, query) != null) seen = o;
+                        if (std.ascii.indexOfIgnoreCase(o.text, query) != null) seen = try dupeOcrOut(arena, o);
                     },
                     .err => |e| {
                         // "not rendered yet" is transient; a missing
                         // OCR engine never resolves — stop now.
-                        if (!std.mem.startsWith(u8, e, "no rendered")) fatal = e;
+                        if (!std.mem.startsWith(u8, e, "no rendered")) fatal = try arena.dupe(u8, e);
                     },
                 }
                 if (seen != null or fatal != null or app.exited or app.presentationGone() or nowMs() >= deadline) break;
@@ -1754,7 +1874,7 @@ pub fn runActionSteps(
                 break;
             }
             const o = seen orelse {
-                try w.print("step {d}: ERROR — text \"{s}\" not visible before timeout\n", .{ n, query });
+                try w.print("step {d}: ERROR — text \"{s}\" not visible before timeout{s}\n", .{ n, query, try clipNote(arena, budget) });
                 stopped = true;
                 break;
             };
@@ -1817,7 +1937,7 @@ pub fn runActionSteps(
                 }
             }
         }
-        try outcomes.append(arena, stepOutcome(cur_step, true, aw.written()[cur_start..]));
+        try outcomes.append(arena, stepOutcome(cur_step, true, aw.written()[cur_start..], step_clipped));
         // Journal the step VERBATIM once it succeeded (pure
         // screenshot steps `continue`d above and are not steps a
         // macro needs to repeat).
@@ -1830,7 +1950,7 @@ pub fn runActionSteps(
     // The step that stopped the batch produced the last transcript
     // line; record it as the failing outcome.
     if (stopped and cur_step != 0)
-        try outcomes.append(arena, stepOutcome(cur_step, false, aw.written()[cur_start..]));
+        try outcomes.append(arena, stepOutcome(cur_step, false, aw.written()[cur_start..], step_clipped));
     // `mark` without any screenshot still yields an image: capture
     // the final state with the leftover marks drawn in.
     if (!stopped and pending_marks.items.len > 0 and pngs.items.len < MAX_SHOTS) {
@@ -1873,7 +1993,7 @@ pub fn runActionSteps(
 
 /// One outcome from a step's transcript slice: the "step N: " prefix
 /// and the trailing newline belong to the transcript, not to the fact.
-fn stepOutcome(step: usize, ok: bool, line: []const u8) StepOutcome {
+fn stepOutcome(step: usize, ok: bool, line: []const u8, wait_clipped: bool) StepOutcome {
     var note = std.mem.trimEnd(u8, line, "\n");
     if (std.mem.indexOf(u8, note, ": ")) |at| {
         if (std.mem.startsWith(u8, note, "step ")) note = note[at + 2 ..];
@@ -1882,7 +2002,7 @@ fn stepOutcome(step: usize, ok: bool, line: []const u8) StepOutcome {
     for ([_][]const u8{ "ERROR — ", "ERROR - " }) |prefix| {
         if (std.mem.startsWith(u8, note, prefix)) note = note[prefix.len ..];
     }
-    return .{ .step = step, .ok = ok, .note = note };
+    return .{ .step = step, .ok = ok, .note = note, .wait_clipped = wait_clipped };
 }
 
 /// Continuation of appTool (split around the step engine so
@@ -2297,12 +2417,25 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         const do_click = argBool(args, "click");
         const deadline = nowMs() + timeout_ms;
         var seen: ?OcrOut = null;
-        var last_text: []const u8 = "";
+        // One arena per OCR pass, released between polls. Each pass
+        // charges its caller for the recognized text and word boxes and,
+        // for small fonts, an upscaled copy of the capture (`ocrWindow`
+        // frees the capture itself); charged to the call arena a long
+        // wait grew linearly with the poll count and freed nothing until
+        // the tool returned. The timeout message keeps the last read in a
+        // fixed buffer for the same reason.
+        var ocr_scratch = std.heap.ArenaAllocator.init(mcp.app_state.allocator);
+        defer ocr_scratch.deinit();
+        var last_tail: [500]u8 = undefined;
+        var last_tail_len: usize = 0;
         while (true) {
-            switch (try ocrWindow(arena, app, wid, region, scale, psm, lang)) {
+            _ = ocr_scratch.reset(.free_all);
+            switch (try ocrWindow(ocr_scratch.allocator(), app, wid, region, scale, psm, lang)) {
                 .out => |o| {
-                    last_text = o.text;
-                    if (std.ascii.indexOfIgnoreCase(o.text, query) != null) seen = o;
+                    const tail = if (o.text.len > last_tail.len) o.text[o.text.len - last_tail.len ..] else o.text;
+                    @memcpy(last_tail[0..tail.len], tail);
+                    last_tail_len = tail.len;
+                    if (std.ascii.indexOfIgnoreCase(o.text, query) != null) seen = try dupeOcrOut(arena, o);
                 },
                 .err => |e| {
                     if (!std.mem.startsWith(u8, e, "no rendered")) return ocrErr(arena, e);
@@ -2312,11 +2445,10 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             _ = app.waitIdle(std.math.maxInt(i32), 300); // pumped sleep between OCR passes
         }
         const o = seen orelse {
-            const tail = if (last_text.len > 500) last_text[last_text.len - 500 ..] else last_text;
             return errRes(arena, .timeout, try std.fmt.allocPrint(
                 arena,
                 "text \"{s}\" not visible before timeout; last OCR read:\n--- last ocr read ---\n{s}",
-                .{ query, tail },
+                .{ query, last_tail[0..last_tail_len] },
             ));
         };
         var res = Res.init(arena);
@@ -2905,4 +3037,58 @@ test "app recordings use private complete replacement" {
     var st: c.struct_stat = undefined;
     try t.expect(c.stat(path_z.ptr, &st) == 0);
     try t.expectEqual(@as(c_uint, 0o600), @as(c_uint, @intCast(st.st_mode & 0o777)));
+}
+
+test "stepBudget reports whether the batch budget shortened the wait" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Budget wide open: the request is honoured and nothing is clipped,
+    // so a timeout there IS an observation about the app.
+    const roomy = stepBudget(5_000, nowMs() + mcp.WAIT_CAP_MS);
+    try t.expectEqual(@as(i64, 5_000), roomy.ms);
+    try t.expect(!roomy.clipped);
+    try t.expectEqualStrings("", try clipNote(arena, roomy));
+
+    // Nearly spent: the wait is cut short and must say so.
+    const tight = stepBudget(30_000, nowMs() + 400);
+    try t.expect(tight.ms <= 400);
+    try t.expect(tight.clipped);
+    try t.expectEqual(@as(i64, 30_000), tight.requested);
+    const note = try clipNote(arena, tight);
+    try t.expect(std.mem.indexOf(u8, note, "clipped") != null);
+    try t.expect(std.mem.indexOf(u8, note, "not an app verdict") != null);
+
+    // Spent: zero left, and a request for any wait at all is clipped.
+    const spent = stepBudget(1_000, nowMs() - 1);
+    try t.expectEqual(@as(i64, 0), spent.ms);
+    try t.expect(spent.clipped);
+    // Asking for nothing is not a clip.
+    try t.expect(!stepBudget(0, nowMs() - 1).clipped);
+
+    // The per-wait cap is a clip too: an over-cap request is shortened.
+    const over = stepBudget(mcp.WAIT_CAP_MS + 1, nowMs() + 10 * mcp.WAIT_CAP_MS);
+    try t.expectEqual(mcp.WAIT_CAP_MS, over.ms);
+    try t.expect(over.clipped);
+}
+
+test "a clipped step reports wait_clipped as a fact, not as prose only" {
+    const t = std.testing;
+    const clipped = stepOutcome(3, false, "step 3: ERROR - wait_idle did not settle before timeout (required)\n", true);
+    try t.expect(clipped.wait_clipped);
+    try t.expect(!clipped.ok);
+    try t.expectEqual(@as(usize, 3), clipped.step);
+    const plain = stepOutcome(1, true, "step 1: wait_idle settled\n", false);
+    try t.expect(!plain.wait_clipped);
+}
+
+test "burstMs defaults and clamps to the per-wait cap" {
+    const t = std.testing;
+    try t.expectEqual(@as(i64, 5_000), burstMs(null));
+    try t.expectEqual(@as(i64, 250), burstMs(250));
+    try t.expectEqual(mcp.WAIT_CAP_MS, burstMs(mcp.WAIT_CAP_MS + 1));
+    try t.expectEqual(mcp.WAIT_CAP_MS, burstMs(std.math.maxInt(i64)));
+    try t.expectEqual(@as(i64, 0), burstMs(-1));
 }

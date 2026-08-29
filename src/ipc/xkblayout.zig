@@ -156,15 +156,30 @@ const named_syms = [_]struct { n: []const u8, cp: u21 }{
     .{ .n = "EuroSign", .cp = 0x20AC },
 };
 
+/// Vacuously true on an empty slice: length is the caller's own guard
+/// (`symToCp` requires 4-6 digits before it asks).
+fn allHex(s: []const u8) bool {
+    for (s) |ch| {
+        if (!std.ascii.isHex(ch)) return false;
+    }
+    return true;
+}
+
 fn symToCp(sym: []const u8) ?u21 {
     if (sym.len == 1) {
         const ch = sym[0];
         if (ch >= 0x21 and ch < 0x7F) return ch;
         return null;
     }
-    // Uxxxx / 0x... unicode forms.
-    if (sym.len >= 2 and sym[0] == 'U' and std.ascii.isHex(sym[1])) {
-        return std.fmt.parseInt(u21, sym[1..], 16) catch null;
+    // Uxxxx unicode escape: the WHOLE remainder must be hex and 4-6
+    // digits long. "starts with U and the next char is hex" also
+    // matches the named keysyms `Uacute`, `Ucircumflex`, `Udiaeresis`
+    // (real letters on European layouts), which were parsed as hex,
+    // failed, and returned nothing instead of reaching named_syms. A
+    // failed parse (six digits past U+10FFFF) falls through for the
+    // same reason.
+    if (sym.len >= 5 and sym.len <= 7 and sym[0] == 'U' and allHex(sym[1..])) {
+        if (std.fmt.parseInt(u21, sym[1..], 16)) |cp| return cp else |_| {}
     }
     if (std.mem.startsWith(u8, sym, "0x")) {
         const v = std.fmt.parseInt(u32, sym[2..], 16) catch return null;
@@ -276,6 +291,30 @@ pub fn parse(allocator: std.mem.Allocator, keymap: []const u8) !Layout {
 const t = std.testing;
 const keymaps = @import("../wlhost/keymaps.zig");
 
+test "symToCp: a named keysym beginning with U is not eaten by the hex branch" {
+    // Every one of these starts with 'U' followed by a hex digit, which
+    // used to route them into parseInt and lose them entirely.
+    try t.expectEqual(@as(?u21, 0xDB), symToCp("Ucircumflex"));
+    try t.expectEqual(@as(?u21, 0xDC), symToCp("Udiaeresis"));
+    try t.expectEqual(@as(?u21, 0xDA), symToCp("Uacute"));
+    // 'g' is not hex, so this one always worked; it still does.
+    try t.expectEqual(@as(?u21, 0xD9), symToCp("Ugrave"));
+
+    // The escape form itself keeps working, in the 4-, 5- and
+    // 6-digit forms.
+    try t.expectEqual(@as(?u21, 0xEA), symToCp("U00EA"));
+    try t.expectEqual(@as(?u21, 0x20AC), symToCp("U20ac"));
+    try t.expectEqual(@as(?u21, 0x1F600), symToCp("U1F600"));
+    try t.expectEqual(@as(?u21, 0x1F600), symToCp("U01F600"));
+    try t.expectEqual(@as(?u21, 0x10FFFF), symToCp("U10FFFF"));
+
+    // Out of range: falls through instead of returning a parse error.
+    try t.expectEqual(@as(?u21, null), symToCp("UFFFFFF"));
+    // Neither an escape nor a name.
+    try t.expectEqual(@as(?u21, null), symToCp("Unothing"));
+    try t.expectEqual(@as(?u21, null), symToCp("U00"));
+}
+
 test "us layout maps letters, digits and shifted symbols" {
     var l = try parse(t.allocator, keymaps.us);
     defer l.deinit(t.allocator);
@@ -311,6 +350,11 @@ test "german qwertz: z and y swapped, umlauts direct" {
     try t.expectEqual(@as(u32, 44), l.lookup('y').?.code);
     try t.expectEqual(@as(u32, 21), l.lookup('z').?.code);
     try t.expect(l.lookup(0xFC) != null); // u umlaut
+    // Capital U-umlaut is spelled `Udiaeresis` in this very keymap, and
+    // the old Uxxxx branch swallowed it: shift+ue was untypable.
+    const uuml = l.lookup(0xDC) orelse return error.NoCapitalUUmlaut;
+    try t.expect(uuml.shift);
+    try t.expectEqual(l.lookup(0xFC).?.code, uuml.code);
     // Euro exists (via the dedicated <I443> key at level 1, which
     // the lowest-cost rule correctly prefers over AltGr+E).
     try t.expect(l.lookup(0x20AC) != null);

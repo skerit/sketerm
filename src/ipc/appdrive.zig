@@ -1977,9 +1977,18 @@ pub const App = struct {
     /// @param count packs presses ~80ms apart — inside any double-click
     ///        threshold, which two separate tool calls can never be.
     pub fn clickEx(self: *App, win_id: u32, x: f64, y: f64, button: u32, hold_ms: i64, count: u32) Error!void {
+        // Everything this gesture needs from the window is read BEFORE
+        // the first pump: pumping frees Window objects (a resync's
+        // native_sync prunes what the replay never re-announced,
+        // chan_close/toplevel_gone drop the rest), so a `*Window` held
+        // across pumpFor is a use-after-free. The channel id is stable
+        // and the release must go out on it even if the window vanished
+        // mid-hold: a seat button left logically down outlives the
+        // window it was pressed on.
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
-        const a = self.allocator;
+        const chan = win.chan;
         const hit = self.ptrTarget(win, x, y);
+        const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
         wlpipe.appendSeatEnter(&units, a, hit.sid, hit.x, hit.y) catch return Error.OutOfMemory;
@@ -1989,19 +1998,23 @@ pub const App = struct {
         while (i < reps) : (i += 1) {
             wlpipe.appendSeatButton(&units, a, evdevButton(button), true) catch return Error.OutOfMemory;
             if (hold_ms > 0) {
-                try self.sendIntents(win.chan, units.items);
+                try self.sendIntents(chan, units.items);
                 units.clearRetainingCapacity();
                 self.pumpFor(hold_ms);
             }
             wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
             if (i + 1 < reps) {
-                try self.sendIntents(win.chan, units.items);
+                try self.sendIntents(chan, units.items);
                 units.clearRetainingCapacity();
                 self.pumpFor(80);
+                // A window pruned between presses ends the burst rather
+                // than pressing into nothing; the release above already
+                // went out, so the seat is left clean either way.
+                if (self.winById(win_id) == null) break;
             }
         }
-        if (units.items.len > 0) try self.sendIntents(win.chan, units.items);
-        self.rememberPtr(win.id, x, y);
+        if (units.items.len > 0) try self.sendIntents(chan, units.items);
+        self.rememberPtr(win_id, x, y);
     }
 
     /// Bounded wall-clock delay that keeps pumping frames (a blind
@@ -2052,19 +2065,25 @@ pub const App = struct {
     }
 
     fn dragInner(self: *App, win_id: u32, x1: f64, y1: f64, x2: f64, y2: f64, button: u32, expect_dnd: bool) Error!void {
+        // `chan` is captured here and the `*Window` is never touched
+        // again: every pump below can free it (native_sync prunes what
+        // a resync replay did not re-announce, chan_close/toplevel_gone
+        // drop the rest). Where live window state IS needed after a
+        // pump the loops re-resolve by id.
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
-        const a = self.allocator;
-        var units: std.ArrayList(u8) = .empty;
-        defer units.deinit(a);
+        const chan = win.chan;
         // The press resolves the target surface; the drag then stays
         // on it (pointer grab), so every motion uses the same offset.
         const hit = self.ptrTarget(win, x1, y1);
+        const a = self.allocator;
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(a);
         const off_x = x1 - hit.x;
         const off_y = y1 - hit.y;
         wlpipe.appendSeatEnter(&units, a, hit.sid, hit.x, hit.y) catch return Error.OutOfMemory;
         wlpipe.appendSeatMotion(&units, a, hit.x, hit.y) catch return Error.OutOfMemory;
         wlpipe.appendSeatButton(&units, a, evdevButton(button), true) catch return Error.OutOfMemory;
-        try self.sendIntents(win.chan, units.items);
+        try self.sendIntents(chan, units.items);
         // Real time between the steps, not just a pump. A toolkit
         // DRAG-AND-DROP (as opposed to a pointer-grab drag like a
         // paned divider) is a conversation: the source asks the
@@ -2081,7 +2100,7 @@ pub const App = struct {
             const t = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
             units.clearRetainingCapacity();
             wlpipe.appendSeatMotion(&units, a, x1 + (x2 - x1) * t - off_x, y1 + (y2 - y1) * t - off_y) catch return Error.OutOfMemory;
-            try self.sendIntents(win.chan, units.items);
+            try self.sendIntents(chan, units.items);
             self.pumpFor(12);
         }
         // Settle jiggle: GTK's own drag threshold eats the first ~8px
@@ -2100,7 +2119,7 @@ pub const App = struct {
             const dy: f64 = if (j % 2 == 0) 1.0 else 0.0;
             units.clearRetainingCapacity();
             wlpipe.appendSeatMotion(&units, a, x2 - off_x, y2 + dy - off_y) catch return Error.OutOfMemory;
-            try self.sendIntents(win.chan, units.items);
+            try self.sendIntents(chan, units.items);
             self.pumpFor(30);
         }
         self.pumpFor(150);
@@ -2109,8 +2128,9 @@ pub const App = struct {
         // out, and a release it has not caught up to CANCELS the drag.
         // A frame committed after the jiggle proves its main loop ran
         // past the motions; bounded so a target that repaints nothing
-        // costs 2s, never a hang. The window is re-resolved because
-        // pumping can grow the windows list and move it.
+        // costs 2s, never a hang. The window is re-resolved every
+        // iteration because pumping can FREE it (a pruned resync, a
+        // closed channel), not merely move the list.
         const release_deadline = nowMs() + 2_000;
         while (nowMs() < release_deadline and !self.exited) {
             const w = self.winById(win_id) orelse break;
@@ -2133,8 +2153,12 @@ pub const App = struct {
         }
         units.clearRetainingCapacity();
         wlpipe.appendSeatButton(&units, a, evdevButton(button), false) catch return Error.OutOfMemory;
-        try self.sendIntents(win.chan, units.items);
-        self.rememberPtr(win.id, x2, y2);
+        // Unconditional, on the captured channel: a button left
+        // logically down on the seat outlives the window it was
+        // pressed on, so the release goes out even when the window
+        // disappeared mid-gesture.
+        try self.sendIntents(chan, units.items);
+        self.rememberPtr(win_id, x2, y2);
     }
 
     /// Fetch the app's AT-SPI accessibility tree as JSON (the daemon
@@ -2381,7 +2405,11 @@ pub const App = struct {
                 chord.mods.altgr = e.altgr;
             }
         }
-        const win = try self.resolveKbd(win_id);
+        // Capture the channel before the hold pump: pumping can free
+        // the resolved `*Window`, and the key release (plus the mod
+        // reset) must still go out: a key left logically down on the
+        // seat outlives the window it was pressed on.
+        const chan = (try self.resolveKbd(win_id)).chan;
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
@@ -2389,14 +2417,14 @@ pub const App = struct {
             wlpipe.appendSeatMods(&units, a, chord.mods.bits(), 0, 0, 0) catch return Error.OutOfMemory;
         wlpipe.appendSeatKey(&units, a, chord.key.code, true) catch return Error.OutOfMemory;
         if (hold_ms > 0) {
-            try self.sendIntents(win.chan, units.items);
+            try self.sendIntents(chan, units.items);
             units.clearRetainingCapacity();
             self.pumpFor(hold_ms);
         }
         wlpipe.appendSeatKey(&units, a, chord.key.code, false) catch return Error.OutOfMemory;
         if (chord.mods.any())
             wlpipe.appendSeatMods(&units, a, 0, 0, 0, 0) catch return Error.OutOfMemory;
-        try self.sendIntents(win.chan, units.items);
+        try self.sendIntents(chan, units.items);
     }
 
     pub fn resizeWindow(self: *App, win_id: u32, w: i32, h: i32) Error!void {
@@ -3118,6 +3146,67 @@ test "resync replay: chan_open replace keeps window identity, native_sync prunes
     try t.expect(!ch2.resyncing);
     try t.expectEqual(@as(usize, 1), app.windows.items.len);
     try t.expectEqual(win1, app.windows.items[0]);
+}
+
+test "clickEx: a frame that frees the window mid-hold cannot dangle" {
+    const t = std.testing;
+    const a = t.allocator;
+    var fds: [2]c_int = undefined;
+    try t.expect(c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) == 0);
+    var app = App{
+        .allocator = a,
+        .conn = .{ .allocator = a, .fd = fds[0] },
+        .name = @constCast("test"),
+    };
+    defer {
+        app.conn.rbuf.deinit(a);
+        app.conn.wbuf.deinit(a);
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+        testTeardown(&app);
+    }
+
+    var pl: [5]u8 = undefined;
+    app.handleFrame(.chan_open, testChanOpenPayload(&pl, 7));
+    const ch = app.chans.get(7).?;
+    const px = [_]u8{ 1, 2, 3, 4 };
+    App.onFrame(ch, 1, 1, 1, 1, 1, 1, 0, &px);
+    const win_id = app.winBySurface(7, 1).?.id;
+
+    // Queue the frame that destroys the window. Nothing consumes it
+    // until clickEx's hold pump does: the exact window in which the
+    // old code held a `*Window` it had resolved before the pump.
+    var stream: std.ArrayList(u8) = .empty;
+    defer stream.deinit(a);
+    var idb: [4]u8 = undefined;
+    std.mem.writeInt(u32, &idb, 7, .little);
+    try wire.appendFrame(&stream, a, .chan_close, &idb);
+    try t.expect(c.write(fds[1], stream.items.ptr, stream.items.len) == stream.items.len);
+
+    try app.clickEx(win_id, 4, 4, 1, 40, 1);
+    try t.expectEqual(@as(usize, 0), app.windows.items.len);
+    try t.expectEqual(@as(usize, 0), app.chans.count());
+    try t.expectEqual(win_id, app.ptr_win);
+
+    // Two chan_data frames went out: the press flushed for the hold,
+    // and the release AFTER the window was freed. A seat button left
+    // logically down outlives the window it was pressed on.
+    var got: [512]u8 = undefined;
+    var have: usize = 0;
+    while (have < got.len and App.pollIn(fds[1], 50)) {
+        const n = c.read(fds[1], got[have..].ptr, got.len - have);
+        if (n <= 0) break;
+        have += @intCast(n);
+    }
+    var sent: usize = 0;
+    var off: usize = 0;
+    while (off + 5 <= have) {
+        const len = std.mem.readInt(u32, got[off..][0..4], .little);
+        if (len == 0 or off + 4 + len > have) break;
+        if (got[off + 4] == @intFromEnum(wire.FrameType.chan_data)) sent += 1;
+        off += 4 + len;
+    }
+    try t.expectEqual(@as(usize, 2), sent);
 }
 
 test "Firefox pattern: subsurface repaints composite into the window image" {

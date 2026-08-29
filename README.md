@@ -94,7 +94,7 @@ and a built-in ad filter. Every one of these also works as a *face* on
 a pane inside a terminal window (`--here`/`--tab`).
 
 **MCP server.** `sketerm mcp` is a Model Context Protocol server on stdio
-with 118 tools in eight groups (`panes app term files net browser ui
+with 120 tools in eight groups (`panes app term files net browser ui
 core`): read and type into terminals, run commands and wait for them,
 launch and drive GUI apps headlessly with screenshots, pixel diffs,
 hover maps and backtraces, transfer files and forward ports over SSH,

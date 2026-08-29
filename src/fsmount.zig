@@ -1249,9 +1249,12 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         return 1;
     }
     if (args.len < 2) {
-        _ = c.fprintf(platform.stderr(), "usage: sketerm mount <host>[:/path] <mountpoint>\n" ++
+        // An explicit --help is a successful request and prints on
+        // stdout; a missing operand is an error and stays on stderr.
+        const help = @import("util/invocation.zig").helpRequested(args);
+        _ = c.fprintf(if (help) platform.stdout() else platform.stderr(), "usage: sketerm mount <host>[:/path] <mountpoint>\n" ++
             "       host 'local' mounts the local daemon's view (testing)\n");
-        return 2;
+        return if (help) 0 else 2;
     }
     const spec = args[0];
     var host: ?[]const u8 = null;

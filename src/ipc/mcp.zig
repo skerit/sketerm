@@ -114,6 +114,7 @@ const MCP_HELP =
     \\one machine with different subsets).
     \\  --tools SPEC   comma/space separated terms:
     \\                   all            every tool
+    \\                   all:ro         every non-mutating tool
     \\                   GROUP          a whole group
     \\                   GROUP:ro       that group's read-only tools
     \\                   TOOL           one tool by name
@@ -572,11 +573,6 @@ fn onQuitSignal(_: c_int) callconv(.c) void {
     quit_flag = true;
 }
 
-/// No-op SIGPIPE handler (same rationale as mux_main.zig: the SIG_IGN
-/// macro fails translate-c). Equivalent to ignoring: write() returns
-/// EPIPE, the process doesn't die.
-fn sigNoop(_: c_int) callconv(.c) void {}
-
 /// SIGTERM/SIGINT must interrupt the blocking getline (no SA_RESTART)
 /// so an ephemeral run still tears its private daemon down when the
 /// MCP client kills us instead of closing stdin.
@@ -592,9 +588,7 @@ fn installQuitSignals() void {
     sa.sa_flags = 0;
     _ = c.sigaction(c.SIGTERM, &sa, null);
     _ = c.sigaction(c.SIGINT, &sa, null);
-    var sp: c.struct_sigaction = std.mem.zeroes(c.struct_sigaction);
-    platform.setSigHandler(&sp, sigNoop);
-    _ = c.sigaction(c.SIGPIPE, &sp, null);
+    platform.ignoreSigpipe();
 }
 
 /// Owned strings backing the process-wide `policy` (its spec is
@@ -647,7 +641,7 @@ fn resolveToolPolicy(allocator: std.mem.Allocator, opts: Opts) error{BadPolicy}!
             if (i > 0) gw.writeAll(", ") catch {};
             gw.writeAll(g.name()) catch {};
         }
-        const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: bad tool policy term '{s}' (from {s})\n  spec: {s}\n  groups: {s}\n  terms: all | GROUP | GROUP:ro | TOOL | -GROUP | -TOOL\n", .{ bad, source, spec, gw.buffered() }) catch "sketerm mcp: bad tool policy\n";
+        const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: bad tool policy term '{s}' (from {s})\n  spec: {s}\n  groups: {s}\n  terms: all | all:ro | GROUP | GROUP:ro | TOOL | -GROUP | -TOOL\n", .{ bad, source, spec, gw.buffered() }) catch "sketerm mcp: bad tool policy\n";
         _ = c.fputs(msg.ptr, platform.stderr());
         return error.BadPolicy;
     };

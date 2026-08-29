@@ -79,6 +79,107 @@ else
     \\
 ;
 
+/// The `sketerm files` block of the global help. It is a named const
+/// because `sketerm files --help` prints it on its own (see
+/// FILES_USAGE); the one text keeps the two answers from drifting.
+const FILES_HELP =
+    \\  sketerm files [spec]   File browser as its OWN application
+    \\                         ("Sketerm Files", own icon and taskbar
+    \\                         entry, id dev.sker.sketerm.files): each
+    \\                         invocation opens a browser window there,
+    \\                         never touching a running terminal.
+    \\                         spec = /path, host:/path, udp:host:/path,
+    \\                         local:/path or a file:// URI (a file
+    \\                         opens its parent directory).
+    \\  sketerm files --here [spec]
+    \\                         Turn the pane you typed this in INTO a
+    \\                         browser (its shell stays underneath, one
+    \\                         toolbar click away). Talks to the running
+    \\                         terminal over its socket; needs to be run
+    \\                         from inside a sketerm pane.
+    \\  sketerm files --tab [spec]
+    \\                         Browser tab in the WINDOW that owns the
+    \\                         pane you typed this in. Same requirement.
+    \\                         Both default to the pane's own directory,
+    \\                         on the pane's own host. Both need a LOCAL
+    \\                         pane: inside a durable REMOTE shell the
+    \\                         window's socket is on the other machine,
+    \\                         and they say so instead of guessing.
+    \\
+;
+
+/// The `sketerm edit` block of the global help; see FILES_HELP.
+const EDIT_HELP =
+    \\  sketerm edit [files...] Text editor as its OWN application
+    \\                         ("Sketerm Editor", own icon and taskbar
+    \\                         entry, id dev.sker.sketerm.editor): each
+    \\                         invocation opens an editor window with
+    \\                         those documents. Files may be /path,
+    \\                         host:/path or file:// URIs; remote files
+    \\                         load and save through the daemon.
+    \\                         --line N[:col] places the caret.
+    \\  sketerm edit --here|--tab [files...]
+    \\                         Editor face in the pane you typed this
+    \\                         in (--here) or a new tab of that pane's
+    \\                         window (--tab), like `sketerm files`.
+    \\                         Needs to be run from inside a pane.
+    \\
+;
+
+/// The `sketerm web` block of the global help; see FILES_HELP.
+const WEB_HELP =
+    \\  sketerm web [urls...]  Web browser as its OWN application
+    \\                         ("Sketerm Web", own icon and taskbar
+    \\                         entry, id dev.sker.sketerm.web): opens a
+    \\                         window of web tabs, one per address, and
+    \\                         a blank tab with the address bar focused
+    \\                         when no address is given. Needs the
+    \\                         opt-in browser helper (zig build
+    \\                         fetch-cef && zig build web); without it
+    \\                         the window still opens and says so.
+    \\
+;
+
+/// `sketerm files --help`: the global help's files block plus the flags
+/// only this subcommand takes.
+const FILES_USAGE =
+    \\Usage: sketerm files [--window | --here | --tab] [--select=<file>] [spec]
+    \\
+    \\
+++ FILES_HELP ++
+    \\
+    \\  --window               Dedicated file-manager window (the default)
+    \\  --select=<file>        Select <file> once its parent directory has
+    \\                         streamed in (dedicated windows only)
+    \\  --help, -h             Show this message
+    \\
+;
+
+/// `sketerm edit --help`; see FILES_USAGE.
+const EDIT_USAGE =
+    \\Usage: sketerm edit [--window | --here | --tab] [--line N[:col]] [files...]
+    \\
+    \\
+++ EDIT_HELP ++
+    \\
+    \\  --window               Dedicated editor window (the default)
+    \\  --line N[:col]         Place the caret in the FIRST document
+    \\  --                     Treat every later argument as a file name
+    \\  --help, -h             Show this message
+    \\
+;
+
+/// `sketerm web --help`; see FILES_USAGE.
+const WEB_USAGE =
+    \\Usage: sketerm web [urls...]
+    \\
+    \\
+++ WEB_HELP ++
+    \\
+    \\  --help, -h             Show this message
+    \\
+;
+
 const HELP_TEXT =
     \\sketerm — native GTK4 terminal emulator
     \\
@@ -133,50 +234,8 @@ const HELP_TEXT =
     \\                         remote.
     \\                         -u: force encrypted roaming UDP instead
     \\                         of automatic UDP/SSH selection.
-    \\  sketerm files [spec]   File browser as its OWN application
-    \\                         ("Sketerm Files", own icon and taskbar
-    \\                         entry, id dev.sker.sketerm.files): each
-    \\                         invocation opens a browser window there,
-    \\                         never touching a running terminal.
-    \\                         spec = /path, host:/path, udp:host:/path,
-    \\                         local:/path or a file:// URI (a file
-    \\                         opens its parent directory).
-    \\  sketerm files --here [spec]
-    \\                         Turn the pane you typed this in INTO a
-    \\                         browser (its shell stays underneath, one
-    \\                         toolbar click away). Talks to the running
-    \\                         terminal over its socket; needs to be run
-    \\                         from inside a sketerm pane.
-    \\  sketerm files --tab [spec]
-    \\                         Browser tab in the WINDOW that owns the
-    \\                         pane you typed this in. Same requirement.
-    \\                         Both default to the pane's own directory,
-    \\                         on the pane's own host. Both need a LOCAL
-    \\                         pane: inside a durable REMOTE shell the
-    \\                         window's socket is on the other machine,
-    \\                         and they say so instead of guessing.
-    \\  sketerm edit [files...] Text editor as its OWN application
-    \\                         ("Sketerm Editor", own icon and taskbar
-    \\                         entry, id dev.sker.sketerm.editor): each
-    \\                         invocation opens an editor window with
-    \\                         those documents. Files may be /path,
-    \\                         host:/path or file:// URIs; remote files
-    \\                         load and save through the daemon.
-    \\                         --line N[:col] places the caret.
-    \\  sketerm edit --here|--tab [files...]
-    \\                         Editor face in the pane you typed this
-    \\                         in (--here) or a new tab of that pane's
-    \\                         window (--tab), like `sketerm files`.
-    \\                         Needs to be run from inside a pane.
-    \\  sketerm web [urls...]  Web browser as its OWN application
-    \\                         ("Sketerm Web", own icon and taskbar
-    \\                         entry, id dev.sker.sketerm.web): opens a
-    \\                         window of web tabs, one per address, and
-    \\                         a blank tab with the address bar focused
-    \\                         when no address is given. Needs the
-    \\                         opt-in browser helper (zig build
-    \\                         fetch-cef && zig build web); without it
-    \\                         the window still opens and says so.
+    \\
+++ FILES_HELP ++ EDIT_HELP ++ WEB_HELP ++
     \\  sketerm play <file.cast> Play back an asciicast v2/v3 recording
     \\                         in a terminal-rendered window with a
     \\                         transport bar (pause/seek/speed).
@@ -368,7 +427,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const app_args = allocator.alloc([]const u8, argv.len - 2) catch return 1;
         defer allocator.free(app_args);
         for (argv[2..], 0..) |a, n| app_args[n] = std.mem.span(a);
-        return @import("remoteapp.zig").run(allocator, app_args);
+        const remoteapp = @import("remoteapp.zig");
+        // `run` answers --help itself (usage on stdout, exit 0).
+        return remoteapp.run(allocator, app_args);
     }
 
     // `sketerm mux ...` — durable-session manager (TUI picker with
@@ -387,6 +448,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         const m_args = allocator.alloc([]const u8, argv.len - 2) catch return 1;
         defer allocator.free(m_args);
         for (argv[2..], 0..) |a, n| m_args[n] = std.mem.span(a);
+        // `run` answers --help itself (usage on stdout, exit 0).
         return @import("fsmount.zig").run(allocator, m_args);
     }
 
@@ -417,6 +479,22 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // serving the native picker to sandboxed/portal-using apps. Never
     // selected unless the user lists it in portals.conf (docs/portal.md).
     if (argv.len >= 2 and std.mem.eql(u8, std.mem.span(argv[1]), "portal")) {
+        // `run` takes no argv, so nothing below it can answer a flag:
+        // without this, `sketerm portal --help` silently started the
+        // D-Bus service and blocked forever with no output.
+        for (argv[2..]) |raw| {
+            const a = std.mem.span(raw);
+            if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+                _ = c.fputs(HELP_TEXT, platform.stdout());
+                return 0;
+            }
+        }
+        if (argv.len > 2) {
+            const a = std.mem.span(argv[2]);
+            _ = c.fprintf(platform.stderr(), "sketerm portal: unrecognised argument '%.*s'\n", @as(c_int, @intCast(a.len)), a.ptr);
+            _ = c.fputs("usage: sketerm portal   (takes no arguments; see docs/portal.md)\n", platform.stderr());
+            return 2;
+        }
         return @import("ui/portal.zig").run(allocator);
     }
 
@@ -465,6 +543,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     while (i < argv.len) : (i += 1) {
         const a = std.mem.span(argv[i]);
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            // A --help that FOLLOWS `files` / `edit` / `web` belongs to
+            // that subcommand, which answers it with its own usage
+            // below; anything else (`sketerm --help`, `sketerm --help
+            // files`) is ours, and --version always is.
+            if (subcommandOwnsHelp(allocator, argv)) continue;
             _ = c.fputs(HELP_TEXT, platform.stdout());
             return 0;
         } else if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "-V")) {
@@ -476,7 +559,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // `sketerm files ...`: three different programs behind one word.
     if (filesRequest(allocator, argv)) |req| {
         if (req.help) {
-            _ = c.fputs(HELP_TEXT, platform.stdout());
+            _ = c.fputs(FILES_USAGE, platform.stdout());
             return 0;
         }
         switch (req.mode) {
@@ -513,7 +596,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var req = parsed;
         defer req.deinit();
         if (req.help) {
-            _ = c.fputs(HELP_TEXT, platform.stdout());
+            _ = c.fputs(EDIT_USAGE, platform.stdout());
             return 0;
         }
         switch (req.mode) {
@@ -549,7 +632,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         var req = parsed;
         if (req.help) {
             req.deinit();
-            _ = c.fputs(HELP_TEXT, platform.stdout());
+            _ = c.fputs(WEB_USAGE, platform.stdout());
             return 0;
         }
         g_app.mode = .web;
@@ -712,6 +795,29 @@ fn webRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) ?web_ap
     defer allocator.free(args);
     for (argv, 0..) |a, n| args[n] = std.mem.span(a);
     return (web_app.collect(allocator, args) catch null) orelse null;
+}
+
+/// True when a `--help` in this argv belongs to the `files` / `edit` /
+/// `web` subcommand rather than to sketerm itself, so the generic scan
+/// in `main` leaves it for the focused usage those blocks print. Asking
+/// the three parsers is what keeps the answer right: each sets `help`
+/// only for a flag that FOLLOWS its own word, so `sketerm --help files`
+/// stays a request for the global text.
+fn subcommandOwnsHelp(allocator: std.mem.Allocator, argv: []const [*:0]const u8) bool {
+    if (filesRequest(allocator, argv)) |req| {
+        if (req.help) return true;
+    }
+    if (editorRequest(allocator, argv)) |parsed| {
+        var req = parsed;
+        defer req.deinit();
+        if (req.help) return true;
+    }
+    if (webRequest(allocator, argv)) |parsed| {
+        var req = parsed;
+        defer req.deinit();
+        if (req.help) return true;
+    }
+    return false;
 }
 
 fn viewerRequest(allocator: std.mem.Allocator, argv: []const [*:0]const u8) bool {

@@ -1,7 +1,7 @@
 # MCP structured results — design (2026-08-21)
 
 Status: BINDING for the structured-results migration. Waves 1-3 are
-SHIPPED (2026-08-21): all 112 tools speak both lanes and declare an
+SHIPPED (2026-08-21): every tool speaks both lanes and declares an
 `output_schema`. Read fully before touching `src/ipc/mcp*.zig` — this
 is the contract a NEW tool has to meet, not a plan.
 

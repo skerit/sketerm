@@ -41,6 +41,7 @@ const urlhost = @import("../web/urlhost.zig");
 const webprofiles = @import("webprofiles.zig");
 const reader_model = @import("../web/reader.zig");
 const webkeys = @import("../web/webkeys.zig");
+const semantic = @import("../web/semantic.zig");
 const clock = @import("../util/clock.zig");
 
 /// Default budget for one semantic round trip. Clamped to
@@ -370,6 +371,29 @@ fn failRes(arena: std.mem.Allocator, f: Fail) ![]const u8 {
     return mcp.errRes(arena, f.code, f.text);
 }
 
+/// The ONE home for the bound on an integer that becomes a `u32` wire
+/// field: `@intCast` of an out-of-range `i64` is illegal behaviour in a
+/// ReleaseFast build, and every one of these values is whatever a JSON
+/// client (or a page, through the helper) put in the argument.
+fn boundedU32(v: i64) ?u32 {
+    if (v < 0 or v > std.math.maxInt(u32)) return null;
+    return @intCast(v);
+}
+
+/// `boundedU32` as a tool argument: an absent key stays absent, and out
+/// of range becomes the refusal naming the argument and the range.
+const U32Arg = union(enum) { absent, value: u32, err: Fail };
+
+fn argU32(arena: std.mem.Allocator, args: std.json.Value, name: []const u8) !U32Arg {
+    const v = mcp.argInt(args, name) orelse return .absent;
+    const n = boundedU32(v) orelse return .{ .err = fail(.invalid_args, try std.fmt.allocPrint(
+        arena,
+        "'{s}' must be a whole number from 0 to {d} ({d} is out of range)",
+        .{ name, @as(u32, std.math.maxInt(u32)), v },
+    )) };
+    return .{ .value = n };
+}
+
 /// A GUI control-socket round trip that did not happen at all.
 fn guiUnreachable(arena: std.mem.Allocator, e: anyerror) !Fail {
     return fail(.unavailable, try std.fmt.allocPrint(arena, "the sketerm GUI did not answer ({s})", .{@errorName(e)}));
@@ -665,7 +689,8 @@ fn runOpGui(backend: mcp.Backend, arena: std.mem.Allocator, pane: u32, op: Op, b
     if (!started.ok) return .{ .err = fail(.failed, started.err) };
     const tok_v = started.value.object.get("token") orelse return .{ .err = fail(.io_failed, "the GUI returned no token") };
     if (tok_v != .integer) return .{ .err = fail(.io_failed, "the GUI returned a malformed token") };
-    const token: u32 = @intCast(tok_v.integer);
+    const token: u32 = boundedU32(tok_v.integer) orelse
+        return .{ .err = fail(.io_failed, "the GUI returned a malformed token") };
 
     const deadline = backend.nowMs(backend.ctx) + budget;
     while (true) {
@@ -750,7 +775,9 @@ fn openView(drv: Driver, arena: std.mem.Allocator, url: ?[]const u8, where: []co
             )) };
             if (!opened.ok) return .{ .err = fail(.failed, opened.err) };
             const pv = opened.value.object.get("pane") orelse return .{ .err = fail(.io_failed, "the GUI returned no pane id") };
-            return .{ .opened = @intCast(if (pv == .integer) pv.integer else 0) };
+            const pane_id = boundedU32(if (pv == .integer) pv.integer else -1) orelse
+                return .{ .err = fail(.io_failed, "the GUI returned a malformed pane id") };
+            return .{ .opened = pane_id };
         },
         .headless => |e| {
             const v = e.openViewIn(url orelse "", w, h, spec, policy) catch |err| {
@@ -1293,8 +1320,8 @@ const ActAfter = struct {
 
 /// `scope` on web_act/web_key: bound the follow-up tree to one subtree.
 fn scopeArg(args: std.json.Value) ?u32 {
-    const s = mcp.argInt(args, "scope") orelse return null;
-    return if (s > 0) @intCast(s) else null;
+    const s = boundedU32(mcp.argInt(args, "scope") orelse return null) orelse return null;
+    return if (s > 0) s else null;
 }
 
 /// What CHANGED after an input: give the caller the delta rather than
@@ -1430,6 +1457,50 @@ fn renderAfter(res: *mcp.Res, arena: std.mem.Allocator, after: ActAfter) !void {
         if (after.scope) |sc| try res.fact("scope", sc);
         try treeSection(res, arena, "delta", d);
         try res.text(TRUST_LINE);
+    }
+}
+
+/// Did a `query subtree` answer that its root id is not in the tree?
+/// Anchored on the WHOLE header `semantic.zig` writes (which repeats the
+/// id), so a page whose own text says "unknown id" cannot forge it, and
+/// the one place that knows that header's shape.
+fn subtreeUnknownId(arena: std.mem.Allocator, payload: []const u8, id: i64) !bool {
+    const marker = try std.fmt.allocPrint(arena, semantic.QUERY_UNKNOWN_ID_FMT, .{ "subtree", id });
+    return std.mem.startsWith(u8, payload, marker);
+}
+
+/// Why an EMPTY expansion was empty, when the answer is "there is no
+/// such node": the sentence to report, or null when the node is really
+/// there (or the probe could not tell, in which case an existing node is
+/// the safe reading and the empty text is reported as text).
+///
+/// The expand wire has no failure channel — `SemExpandResult` carries no
+/// ok flag and an unknown id is answered with an empty body — so the
+/// distinction has to be bought with a second, id-addressed query. It
+/// costs a round trip only on the empty answer.
+fn expandIdMissing(
+    drv: Driver,
+    arena: std.mem.Allocator,
+    view: View,
+    id: i64,
+    args: std.json.Value,
+) !?[]const u8 {
+    if (id <= 0) return null;
+    switch (try runOp(drv, arena, view.pane, .{
+        .op = "query",
+        .action = "subtree",
+        .data = try std.fmt.allocPrint(arena, "{d}", .{id}),
+    }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
+        .err => return null,
+        .done => |sub| {
+            if (sub.timed_out) return null;
+            if (!try subtreeUnknownId(arena, sub.payload, id)) return null;
+            return try std.fmt.allocPrint(
+                arena,
+                "no node [{d}] is in this view's tree, so there is nothing to expand (it was never issued for this view, or the page re-rendered and dropped it). Take a web_snapshot and expand the fresh id.",
+                .{id},
+            );
+        },
     }
 }
 
@@ -1587,15 +1658,16 @@ fn pickNamedMatch(payload: []const u8, role: ?[]const u8, wanted: []const u8, nt
             if (!std.ascii.eqlIgnoreCase(line_role, r)) continue;
         }
         rest = rest[role_end..];
-        var cand_name: []const u8 = "";
-        if (std.mem.indexOfScalar(u8, rest, '"')) |q0| {
-            if (std.mem.lastIndexOfScalar(u8, rest, '"')) |q1| {
-                if (q1 > q0) cand_name = rest[q0 + 1 .. q1];
-            }
-        }
-        if (cand_name.len == 0) continue;
-        if (std.ascii.indexOfIgnoreCase(cand_name, wanted) == null) continue;
-        const exact = std.ascii.eqlIgnoreCase(cand_name, wanted);
+        const f = nodeLineFields(rest);
+        if (f.name.len == 0 and f.value.len == 0) continue;
+        // Name OR value, which is exactly what `semantic.zig`'s find_text
+        // matched on to put the line in this pool; a value match never
+        // counts as an exact NAME match on its own.
+        const name_hit = f.name.len > 0 and std.ascii.indexOfIgnoreCase(f.name, wanted) != null;
+        const value_hit = f.value.len > 0 and std.ascii.indexOfIgnoreCase(f.value, wanted) != null;
+        if (!name_hit and !value_hit) continue;
+        const exact = (f.name.len > 0 and std.ascii.eqlIgnoreCase(f.name, wanted)) or
+            (f.value.len > 0 and std.ascii.eqlIgnoreCase(f.value, wanted));
         if (exact) any_exact = true;
         if (n_cands == cands.len) break;
         cands[n_cands] = .{ .id = id, .exact = exact, .interactive = interactiveRole(line_role) };
@@ -1614,6 +1686,48 @@ fn pickNamedMatch(payload: []const u8, role: ?[]const u8, wanted: []const u8, nt
         if (role == null and any_interactive and !c.interactive) continue;
         if (seen == nth) return c.id;
         seen += 1;
+    }
+    return null;
+}
+
+/// The quoted name and value of a `semantic.zig writeNodeLine` tail
+/// (everything after the role). A line carries up to TWO quoted runs —
+/// `[5] textbox "Owner" value="jelle"` — and reading the name from the
+/// first quote to the LAST one on the line made it `Owner" value="jelle`,
+/// so an exact name lost to any plain label of the same name and web_act
+/// resolved to the wrong node. Names are not escaped, so a name that
+/// itself contains a quote is only recoverable from what may FOLLOW the
+/// run; `quotedRunEnd` is that test.
+fn nodeLineFields(tail: []const u8) struct { name: []const u8, value: []const u8 } {
+    var name: []const u8 = "";
+    var value: []const u8 = "";
+    const after_role = std.mem.trimStart(u8, tail, " ");
+    if (after_role.len > 0 and after_role[0] == '"') {
+        if (quotedRunEnd(after_role[1..])) |q| name = after_role[1 .. 1 + q];
+    }
+    // The value is the LAST `value="..."` on the line: only `{N children}`
+    // can follow it, and that field carries no quotes.
+    const marker = " value=\"";
+    if (std.mem.lastIndexOf(u8, tail, marker)) |vi| {
+        const start = vi + marker.len;
+        if (quotedRunEnd(tail[start..])) |q| value = tail[start .. start + q];
+    }
+    return .{ .name = name, .value = value };
+}
+
+/// Offset of the quote that closes a `writeNodeLine` quoted run: the
+/// first one followed by end of line or by one of the fields that may
+/// come next (` (states)`, ` (+N chars, expand [id])`, ` value="`,
+/// ` {N children}`).
+fn quotedRunEnd(s: []const u8) ?usize {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, s, i, '"')) |q| {
+        const after = s[q + 1 ..];
+        if (after.len == 0 or
+            std.mem.startsWith(u8, after, " (") or
+            std.mem.startsWith(u8, after, " value=\"") or
+            std.mem.startsWith(u8, after, " {")) return q;
+        i = q + 1;
     }
     return null;
 }
@@ -1655,6 +1769,112 @@ fn withinFilter(arena: std.mem.Allocator, matches: []const u8, subtree: []const 
     return out.written();
 }
 
+/// How a `within_text` query answered.
+///
+/// Classified from the FIRST line of `semantic.zig queryWithinText`'s
+/// reply, anchored on the text the call asked about. Substring-testing
+/// the WHOLE payload read the successful header `query within "X" 10
+/// matches` as `0 matches` and refused an act that was perfectly
+/// resolvable; a candidate line quoting either phrase did the same.
+const WithinOutcome = enum {
+    /// An anchor was picked; the lines after the header are candidates.
+    matched,
+    /// The text is nowhere on the page.
+    none,
+    /// The text sits in two containers of the same size.
+    ambiguous,
+    /// The anchor is there, nothing named `name` is under it.
+    no_candidate,
+    /// The helper could not parse the JSON argument.
+    bad_args,
+    /// This view has no walked tree yet.
+    no_snapshot,
+    /// An older helper answered an unknown kind from its find_text arm.
+    unsupported,
+    /// The helper said something else entirely (a navigating view, a
+    /// discarded one): report ITS sentence, never a guess about its age.
+    other,
+    /// A within_text answer whose tail this build does not know.
+    unrecognized,
+};
+
+/// The first line of a helper reply, capped, for quoting inside an error
+/// sentence.
+fn firstLine(payload: []const u8, cap: usize) []const u8 {
+    const line = payload[0 .. std.mem.indexOfScalar(u8, payload, '\n') orelse payload.len];
+    return line[0..@min(line.len, cap)];
+}
+
+fn classifyWithin(payload: []const u8, text: []const u8) WithinOutcome {
+    if (std.mem.startsWith(u8, payload, "query no snapshot yet")) return .no_snapshot;
+    if (std.mem.startsWith(u8, payload, "query within: bad arguments")) return .bad_args;
+    if (std.mem.startsWith(u8, payload, "query find \"")) return .unsupported;
+    const lead = "query within \"";
+    if (!std.mem.startsWith(u8, payload, lead)) return .other;
+    // The helper echoes the text VERBATIM and does not escape it, so the
+    // tail is located by the length that was SENT rather than by scanning
+    // for a closing quote: a text carrying a quote or a newline would
+    // otherwise land the classifier in the middle of its own argument.
+    var rest = payload[lead.len..];
+    if (rest.len < text.len + 2 or !std.mem.eql(u8, rest[0..text.len], text)) return .unrecognized;
+    rest = rest[text.len..];
+    if (!std.mem.startsWith(u8, rest, "\" ")) return .unrecognized;
+    rest = rest[2..];
+    const tail = rest[0 .. std.mem.indexOfScalar(u8, rest, '\n') orelse rest.len];
+    if (std.mem.startsWith(u8, tail, "0 matches")) return .none;
+    if (std.mem.startsWith(u8, tail, "ambiguous:")) return .ambiguous;
+    if (std.mem.startsWith(u8, tail, "no candidate named \"")) return .no_candidate;
+    if (std.mem.startsWith(u8, tail, "anchor [")) return .matched;
+    return .unrecognized;
+}
+
+test "classifyWithin reads the header, not the whole payload" {
+    const t = std.testing;
+    // The regression: "10 matches" contains "0 matches".
+    try t.expectEqual(WithinOutcome.matched, classifyWithin(
+        "query within \"LAN 5\" anchor [21] row \"PC-5\" 10 matches\n[23] button \"Edit\"\n",
+        "LAN 5",
+    ));
+    try t.expectEqual(WithinOutcome.matched, classifyWithin(
+        "query within \"LAN 5\" anchor [21] row \"PC-5\" 1 matches\n[23] button \"Edit\"\n",
+        "LAN 5",
+    ));
+    // A candidate line that merely QUOTES a refusal phrase is body text.
+    try t.expectEqual(WithinOutcome.matched, classifyWithin(
+        "query within \"x\" anchor [2] row \"r\" 2 matches\n[3] cell \"0 matches\"\n[4] cell \"ambiguous: nope\"\n",
+        "x",
+    ));
+    try t.expectEqual(WithinOutcome.none, classifyWithin(
+        "query within \"nope\" 0 matches: that text is nowhere on the page\n",
+        "nope",
+    ));
+    try t.expectEqual(WithinOutcome.ambiguous, classifyWithin(
+        "query within \"10.47.1.3\" ambiguous: the text sits in more than one place at the same depth\n  in [7] row \"a\"\n",
+        "10.47.1.3",
+    ));
+    try t.expectEqual(WithinOutcome.no_candidate, classifyWithin(
+        "query within \"LAN 5\" no candidate named \"Delete\"\n",
+        "LAN 5",
+    ));
+    try t.expectEqual(WithinOutcome.bad_args, classifyWithin("query within: bad arguments\n", "x"));
+    try t.expectEqual(WithinOutcome.no_snapshot, classifyWithin("query no snapshot yet\n", "x"));
+    // An older helper answers an unknown kind from its find_text arm.
+    try t.expectEqual(WithinOutcome.unsupported, classifyWithin(
+        "query find \"{\\\"text\\\":\\\"x\\\"}\" 0 matches\n",
+        "x",
+    ));
+    // Anything else is the helper's own sentence, not an age verdict.
+    try t.expectEqual(WithinOutcome.other, classifyWithin(
+        "semantic query unavailable while the page is navigating\n",
+        "x",
+    ));
+    // Text carrying a quote is still located by its length, not by a scan.
+    try t.expectEqual(WithinOutcome.matched, classifyWithin(
+        "query within \"say \"hi\"\" anchor [2] row \"r\" 1 matches\n[3] button \"Edit\"\n",
+        "say \"hi\"",
+    ));
+}
+
 /// The `[id]` a tree line starts with, if it is a node line.
 fn lineId(raw: []const u8) ?i64 {
     const line = std.mem.trimStart(u8, raw, " ");
@@ -1692,6 +1912,49 @@ test "pickNamedMatch prefers a control over a container of the same name" {
     // nth indexes the controls, and an explicit role still wins.
     try std.testing.expectEqual(@as(?i64, null), pickNamedMatch(payload, null, "Delete", 1));
     try std.testing.expectEqual(@as(?i64, 33), pickNamedMatch(payload, "cell", "Delete", 1));
+}
+
+test "pickNamedMatch reads the name across a value= field" {
+    // `[5] textbox "Owner" value="jelle"`: parsing to the LAST quote made
+    // the name `Owner" value="jelle`, which is not an exact match, so the
+    // plain label [4] won and web_act acted on the wrong node.
+    const payload =
+        "query find \"Owner\" 2 matches\n" ++
+        "[4] text \"Owner\"\n" ++
+        "[5] textbox \"Owner\" value=\"jelle\"\n";
+    try std.testing.expectEqual(@as(?i64, 5), pickNamedMatch(payload, null, "Owner", 0));
+    try std.testing.expectEqual(@as(?i64, 5), pickNamedMatch(payload, "textbox", "Owner", 0));
+    try std.testing.expectEqual(@as(?i64, 4), pickNamedMatch(payload, "text", "Owner", 0));
+    // The value still selects, the way find_text selected the line.
+    try std.testing.expectEqual(@as(?i64, 5), pickNamedMatch(payload, null, "jelle", 0));
+    // The value is not part of the NAME, so it cannot be matched across.
+    try std.testing.expectEqual(@as(?i64, null), pickNamedMatch(payload, null, "Owner\" value", 0));
+}
+
+test "nodeLineFields splits name from value, states and children" {
+    const t = std.testing;
+    var f = nodeLineFields(" \"Owner\" value=\"jelle\"");
+    try t.expectEqualStrings("Owner", f.name);
+    try t.expectEqualStrings("jelle", f.value);
+
+    f = nodeLineFields(" \"Delete\" (disabled) {2 children}");
+    try t.expectEqualStrings("Delete", f.name);
+    try t.expectEqualStrings("", f.value);
+
+    // A value-only control (no accessible name at all).
+    f = nodeLineFields(" value=\"7\" {1 children}");
+    try t.expectEqualStrings("", f.name);
+    try t.expectEqualStrings("7", f.value);
+
+    // The snapshot's truncation marker keeps its trailing dots.
+    f = nodeLineFields(" \"Long text...\" (+40 chars, expand [9])");
+    try t.expectEqualStrings("Long text...", f.name);
+
+    // A quote INSIDE a name is unescaped on this line; the run still ends
+    // where a later field (or the line) begins.
+    f = nodeLineFields(" \"say \"hi\"\" value=\"x\"");
+    try t.expectEqualStrings("say \"hi\"", f.name);
+    try t.expectEqualStrings("x", f.value);
 }
 
 test "pickNamedMatch prefers exact names and honors role and nth" {
@@ -1887,8 +2150,12 @@ pub fn webTool(
     const eql = std.mem.eql;
     // `pane` stays the argument name in both modes (headless it selects
     // the helper view id); `view` is accepted as a synonym.
-    const handle_arg = mcp.argInt(args, "pane") orelse mcp.argInt(args, "view");
-    const handle_u: ?u32 = if (handle_arg) |p| (if (p >= 0) @intCast(p) else null) else null;
+    const handle_key: []const u8 = if (mcp.argInt(args, "pane") != null) "pane" else "view";
+    const handle_u: ?u32 = switch (try argU32(arena, args, handle_key)) {
+        .absent => null,
+        .err => |f| return failRes(arena, f),
+        .value => |v| v,
+    };
 
     const drv = pick(backend);
     const views = try listViews(drv, arena);
@@ -2171,7 +2438,11 @@ pub fn webTool(
         else
             mcp.argStr(args, "mode") orelse "auto";
         const detail: u32 = detailFor(args);
-        const scope: ?u32 = scopeArg(args);
+        const scope: ?u32 = switch (try argU32(arena, args, "scope")) {
+            .absent => null,
+            .err => |f| return failRes(arena, f),
+            .value => |v| if (v > 0) v else null,
+        };
         switch (try runOp(drv, arena, view.pane, .{
             .op = "snapshot",
             .mode = mode,
@@ -2201,7 +2472,11 @@ pub fn webTool(
 
     if (eql(u8, name, "web_act")) {
         if (try policyGate(arena, view)) |f| return failRes(arena, f);
-        var id = mcp.argInt(args, "id");
+        var id: ?i64 = switch (try argU32(arena, args, "id")) {
+            .absent => null,
+            .err => |f| return failRes(arena, f),
+            .value => |v| @as(i64, v),
+        };
         // Act by accessible name: the find_text -> act two-step folded
         // into one call, which also sidesteps acting on a stale id.
         if (id == null) {
@@ -2244,24 +2519,49 @@ pub fn webTool(
                     .err => |e| return failRes(arena, e),
                     .done => |r| {
                         if (r.timed_out) return mcp.errRes(arena, .timeout, "the page did not answer the name lookup in time");
-                        const nth: usize = @intCast(@max(mcp.argInt(args, "nth") orelse 0, 0));
+                        const nth: usize = switch (try argU32(arena, args, "nth")) {
+                            .absent => 0,
+                            .err => |f| return failRes(arena, f),
+                            .value => |v| v,
+                        };
                         var pool: []const u8 = r.payload;
                         if (within_text) |wt| {
-                            if (!std.mem.startsWith(u8, r.payload, "query within"))
-                                return mcp.errRes(arena, .unavailable, "the browser helper predates within_text; pass within:<row id> from web_snapshot instead");
-                            if (std.mem.indexOf(u8, r.payload, "ambiguous") != null)
-                                return mcp.errRes(arena, .conflict, try std.fmt.allocPrint(
+                            // Anchored on the header line only: a
+                            // successful "10 matches" CONTAINS the
+                            // substring "0 matches", and so can any
+                            // candidate line the page names.
+                            switch (classifyWithin(r.payload, wt)) {
+                                .unsupported => return mcp.errRes(arena, .unavailable, "the browser helper predates within_text; pass within:<row id> from web_snapshot instead"),
+                                .other => return mcp.errRes(arena, .unavailable, try std.fmt.allocPrint(
+                                    arena,
+                                    "the browser helper did not answer the within_text lookup: {s}",
+                                    .{firstLine(r.payload, 300)},
+                                )),
+                                .bad_args => return mcp.errRes(arena, .invalid_args, "the browser helper could not parse the within_text query"),
+                                .no_snapshot => {
+                                    // The retry walks the tree first, so
+                                    // a never-snapshotted view resolves
+                                    // on the second pass.
+                                    if (attempt == 0) continue;
+                                    return mcp.errRes(arena, .not_found, "this view has no semantic tree yet; take a web_snapshot and retry");
+                                },
+                                .ambiguous => return mcp.errRes(arena, .conflict, try std.fmt.allocPrint(
                                     arena,
                                     "within_text \"{s}\" is in more than one place on the page; refusing to guess. Add more of that row's text (or use within:<id> with the row's id from web_snapshot). The places:\n{s}",
                                     .{ wt, r.payload[0..@min(r.payload.len, 1500)] },
-                                ));
-                            if (std.mem.indexOf(u8, r.payload, "0 matches") != null or std.mem.indexOf(u8, r.payload, "no candidate") != null) {
-                                if (attempt == 0) continue;
-                                return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(
-                                    arena,
-                                    "nothing to act on for within_text \"{s}\" (looked twice, the second time after a fresh walk): {s}",
-                                    .{ wt, std.mem.trimEnd(u8, r.payload[0..@min(r.payload.len, 600)], "\n") },
-                                ));
+                                )),
+                                .none, .no_candidate => {
+                                    if (attempt == 0) continue;
+                                    return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(
+                                        arena,
+                                        "nothing to act on for within_text \"{s}\" (looked twice, the second time after a fresh walk): {s}",
+                                        .{ wt, std.mem.trimEnd(u8, r.payload[0..@min(r.payload.len, 600)], "\n") },
+                                    ));
+                                },
+                                // A header shape this build does not know
+                                // falls through to the name match, which
+                                // echoes what it saw when it finds none.
+                                .matched, .unrecognized => {},
                             }
                         } else if (mcp.argInt(args, "within")) |w| {
                             // `within`: only matches inside that subtree count,
@@ -2276,7 +2576,7 @@ pub fn webTool(
                                 .err => |e| return failRes(arena, e),
                                 .done => |sub| {
                                     if (sub.timed_out) return mcp.errRes(arena, .timeout, "the page did not answer the subtree lookup in time");
-                                    if (std.mem.indexOf(u8, sub.payload, "unknown id") != null)
+                                    if (try subtreeUnknownId(arena, sub.payload, w))
                                         return mcp.errRes(arena, .not_found, try std.fmt.allocPrint(arena, "'within' names no node on the page: [{d}]", .{w}));
                                     pool = try withinFilter(arena, r.payload, sub.payload);
                                 },
@@ -2302,12 +2602,16 @@ pub fn webTool(
             }
         }
         const id_v: i64 = id.?;
+        // The argument was bounded above, so this can only trip on an id
+        // the name lookup read back out of the helper's own reply.
+        const node = boundedU32(id_v) orelse
+            return mcp.errRes(arena, .io_failed, "the name lookup named a node id outside the protocol's range");
         const action = mcp.argStr(args, "action") orelse "click";
         const value = mcp.argStr(args, "value");
         switch (try runOp(drv, arena, view.pane, .{
             .op = "act",
             .action = action,
-            .node = @intCast(@max(id_v, 0)),
+            .node = node,
             .data = value,
         }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
             .err => |e| return failRes(arena, e),
@@ -2329,9 +2633,19 @@ pub fn webTool(
     }
 
     if (eql(u8, name, "web_expand")) {
-        const id = mcp.argInt(args, "id") orelse
-            return mcp.errRes(arena, .invalid_args, "web_expand needs 'id' (a node id, or 0 for the last web_eval result)");
-        const offset: u32 = @intCast(@max(mcp.argInt(args, "offset") orelse 0, 0));
+        // No node id is negative and none exceeds the unsigned wire
+        // field: outside that range the cast would otherwise wrap the
+        // request into some other node's id.
+        const id: u32 = switch (try argU32(arena, args, "id")) {
+            .absent => return mcp.errRes(arena, .invalid_args, "web_expand needs 'id' (a node id, or 0 for the last web_eval result)"),
+            .err => |f| return failRes(arena, f),
+            .value => |v| v,
+        };
+        const offset: u32 = switch (try argU32(arena, args, "offset")) {
+            .absent => 0,
+            .err => |f| return failRes(arena, f),
+            .value => |v| v,
+        };
         const len: u32 = @intCast(std.math.clamp(mcp.argInt(args, "len") orelse 8000, 1, 60_000));
         if (id == 0) {
             switch (try evalText(drv, arena, view.pane, offset, len)) {
@@ -2341,13 +2655,23 @@ pub fn webTool(
         }
         switch (try runOp(drv, arena, view.pane, .{
             .op = "expand",
-            .node = @intCast(id),
+            .node = id,
             .offset = offset,
             .length = len,
         }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
             .err => |e| return failRes(arena, e),
             .done => |r| {
                 if (r.timed_out) return mcp.errRes(arena, .timeout, "the page did not answer the expansion in time");
+                // `sem_expand_result` carries no ok flag, so an id that
+                // was never issued, one the page has since dropped and a
+                // node that genuinely holds no text ALL arrive as zero
+                // bytes — web_expand was the one op that reported an
+                // unknown id as a success. Ask the tree which it was,
+                // and only on the empty answer.
+                if (r.payload.len == 0) {
+                    if (try expandIdMissing(drv, arena, view, id, args)) |why|
+                        return mcp.errRes(arena, .not_found, why);
+                }
                 return expandResult(arena, drv.mode(), view, id, offset, null, r.payload);
             },
         }
@@ -2881,13 +3205,20 @@ fn scrollTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
     var how: []const u8 = "wheel";
 
     const to = if (args == .object) args.object.get("to") else null;
-    if (to != null and to.? == .integer) {
-        // A node id: the semantic scroll-into-view, not a guess at
-        // how many pixels away it is.
+    // A numeric `to` is a node id; anything else falls through to the
+    // string keywords below.
+    const to_node: ?u32 = switch (try argU32(arena, args, "to")) {
+        .absent => null,
+        .err => |f| return failRes(arena, f),
+        .value => |v| v,
+    };
+    if (to_node) |node| {
+        // The semantic scroll-into-view, not a guess at how many pixels
+        // away the node is.
         switch (try runOp(drv, arena, view.pane, .{
             .op = "act",
             .action = "scroll_into_view",
-            .node = @intCast(@max(to.?.integer, 0)),
+            .node = node,
         }, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
             .err => |e| return failRes(arena, e),
             .done => |r| {
@@ -3032,7 +3363,11 @@ fn consoleTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view
         .gui => return mcp.errRes(arena, .unavailable, GUI_ONLY_HEADLESS),
         .headless => |e| e,
     };
-    const since: u32 = @intCast(@max(mcp.argInt(args, "since") orelse 0, 0));
+    const since: u32 = switch (try argU32(arena, args, "since")) {
+        .absent => 0,
+        .err => |f| return failRes(arena, f),
+        .value => |v| v,
+    };
     const max: usize = @intCast(std.math.clamp(mcp.argInt(args, "max") orelse 100, 1, webdrive.CONSOLE_CAP));
     // Pump briefly so a line the page just logged is in the mirror.
     drv.sleep(50);
@@ -3125,7 +3460,8 @@ fn netLog(drv: Driver, arena: std.mem.Allocator, handle: u32, since: u32, max: u
             if (!started.ok) return .{ .err = fail(.failed, started.err) };
             const tok_v = started.value.object.get("token") orelse return .{ .err = fail(.io_failed, "the GUI returned no token for the network log") };
             if (tok_v != .integer) return .{ .err = fail(.io_failed, "the GUI returned a malformed token") };
-            const token: u32 = @intCast(tok_v.integer);
+            const token: u32 = boundedU32(tok_v.integer) orelse
+                return .{ .err = fail(.io_failed, "the GUI returned a malformed token") };
             const deadline = backend.nowMs(backend.ctx) + budget;
             while (true) {
                 const r = mcp.ipcParsed(arena, backend, .{ .cmd = "web-result", .pane = handle, .token = token }) catch |e|
@@ -3167,7 +3503,11 @@ fn networkTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view
         .err => |e| return failRes(arena, e),
         .done => |st| st,
     };
-    const since: u32 = @intCast(@max(mcp.argInt(args, "since") orelse 0, 0));
+    const since: u32 = switch (try argU32(arena, args, "since")) {
+        .absent => 0,
+        .err => |f| return failRes(arena, f),
+        .value => |v| v,
+    };
     const max: u16 = @intCast(std.math.clamp(mcp.argInt(args, "max") orelse 50, 1, 128));
     switch (try netLog(drv, arena, view.pane, since, max, timeoutOf(args, DEFAULT_TIMEOUT_MS))) {
         .err => |e| return failRes(arena, e),
@@ -3858,6 +4198,140 @@ fn unusedBackend() mcp.Backend {
     };
 }
 
+/// A GUI backend that answers a scripted list of response lines in
+/// order and records what was asked; running past the script is an
+/// error rather than a hang, so a test that adds a round trip fails
+/// instead of blocking.
+const ScriptedBackend = struct {
+    responses: []const []const u8,
+    requests: std.ArrayList([]const u8) = .empty,
+    idx: usize = 0,
+    allocator: std.mem.Allocator,
+
+    fn talk(ctx: *anyopaque, allocator: std.mem.Allocator, line: []const u8) anyerror![]u8 {
+        const self: *ScriptedBackend = @ptrCast(@alignCast(ctx));
+        try self.requests.append(self.allocator, try self.allocator.dupe(u8, line));
+        if (self.idx >= self.responses.len) return error.NoResponse;
+        defer self.idx += 1;
+        return allocator.dupe(u8, self.responses[self.idx]);
+    }
+
+    fn talkFor(ctx: *anyopaque, allocator: std.mem.Allocator, line: []const u8, _: i64) mcp.DirectTalkResult {
+        const owned = talk(ctx, allocator, line) catch |e|
+            return .{ .failure = .{ .err = e, .delivery = .pre_delivery } };
+        return .{ .reply = owned };
+    }
+
+    fn sleepMs(_: *anyopaque, _: u32) void {}
+
+    fn nowMs(_: *anyopaque) i64 {
+        return 0;
+    }
+
+    fn backend(self: *ScriptedBackend) mcp.Backend {
+        return .{ .ctx = @ptrCast(self), .talk = talk, .talkFor = talkFor, .sleepMs = sleepMs, .nowMs = nowMs };
+    }
+
+    fn deinit(self: *ScriptedBackend) void {
+        for (self.requests.items) |r| self.allocator.free(r);
+        self.requests.deinit(self.allocator);
+    }
+};
+
+const ONE_VIEW = "{\"ok\":true,\"views\":[{\"pane\":7,\"view\":7,\"url\":\"https://example.com/\",\"focused\":true,\"load_seq\":1}]}";
+
+fn jsonArgs(arena: std.mem.Allocator, text: []const u8) !std.json.Value {
+    return std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+}
+
+test "web_expand reports an unknown node id instead of an empty success" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var fake = ScriptedBackend{
+        .allocator = t.allocator,
+        .responses = &.{
+            ONE_VIEW,
+            // The expansion itself: a node the page no longer has
+            // answers with zero bytes and no failure flag.
+            "{\"ok\":true,\"token\":1}",
+            "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"\"}",
+            // The subtree query that decides which of the three
+            // zero-byte cases this was.
+            "{\"ok\":true,\"token\":2}",
+            "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"query subtree [42] unknown id\\n\"}",
+        },
+    };
+    defer fake.deinit();
+
+    const out = try webTool(arena, fake.backend(), "web_expand", try jsonArgs(arena, "{\"pane\":7,\"id\":42}"));
+    try t.expect(std.mem.indexOf(u8, out, "\"isError\":true") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"code\":\"not_found\"") != null);
+    try t.expect(std.mem.indexOf(u8, out, "no node [42] is in this view's tree") != null);
+
+    // A node that IS in the tree and simply holds no text stays a
+    // success: the query answers with the subtree, not the marker.
+    var known = ScriptedBackend{
+        .allocator = t.allocator,
+        .responses = &.{
+            ONE_VIEW,
+            "{\"ok\":true,\"token\":1}",
+            "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"\"}",
+            "{\"ok\":true,\"token\":2}",
+            "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"query subtree [42]\\n[42] group\\n\"}",
+        },
+    };
+    defer known.deinit();
+    const ok = try webTool(arena, known.backend(), "web_expand", try jsonArgs(arena, "{\"pane\":7,\"id\":42}"));
+    try t.expect(std.mem.indexOf(u8, ok, "\"isError\":true") == null);
+}
+
+test "a client integer outside the u32 wire range is refused, not cast" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    // Every one of these is an argument that becomes an unsigned wire
+    // field; the refusal must name the argument and the range.
+    const cases = [_]struct { tool: []const u8, args: []const u8, arg: []const u8 }{
+        .{ .tool = "web_expand", .args = "{\"pane\":7,\"id\":-1}", .arg = "id" },
+        .{ .tool = "web_expand", .args = "{\"pane\":7,\"id\":4294967296}", .arg = "id" },
+        .{ .tool = "web_expand", .args = "{\"pane\":7,\"id\":1,\"offset\":9999999999}", .arg = "offset" },
+        .{ .tool = "web_act", .args = "{\"pane\":7,\"id\":4294967296}", .arg = "id" },
+        .{ .tool = "web_scroll", .args = "{\"pane\":7,\"to\":4294967296}", .arg = "to" },
+        .{ .tool = "web_snapshot", .args = "{\"pane\":7,\"scope\":4294967296}", .arg = "scope" },
+        .{ .tool = "web_expand", .args = "{\"pane\":4294967296,\"id\":1}", .arg = "pane" },
+        .{ .tool = "web_expand", .args = "{\"view\":-3,\"id\":1}", .arg = "view" },
+    };
+    for (cases) |c| {
+        var fake = ScriptedBackend{ .allocator = t.allocator, .responses = &.{ONE_VIEW} };
+        defer fake.deinit();
+        const out = try webTool(arena, fake.backend(), c.tool, try jsonArgs(arena, c.args));
+        try t.expect(std.mem.indexOf(u8, out, "\"code\":\"invalid_args\"") != null);
+        try t.expect(std.mem.indexOf(u8, out, c.arg) != null);
+        try t.expect(std.mem.indexOf(u8, out, "0 to 4294967295") != null);
+    }
+
+    // The valid end of the same range goes through to the helper.
+    var okb = ScriptedBackend{
+        .allocator = t.allocator,
+        .responses = &.{
+            ONE_VIEW,
+            "{\"ok\":true,\"token\":1}",
+            "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"the tail\"}",
+        },
+    };
+    defer okb.deinit();
+    const out = try webTool(arena, okb.backend(), "web_expand", try jsonArgs(arena, "{\"pane\":7,\"id\":4294967295}"));
+    try t.expect(std.mem.indexOf(u8, out, "\"isError\":true") == null);
+    try t.expect(std.mem.indexOf(u8, out, "the tail") != null);
+    // The id reached the wire whole rather than wrapping.
+    try t.expect(std.mem.indexOf(u8, okb.requests.items[1], "\"node\":4294967295") != null);
+}
+
 test "a GUI-attached server refuses profiles before it opens anything" {
     var arena_state = testArena();
     defer arena_state.deinit();
@@ -4182,6 +4656,36 @@ test "GUI mode refuses a policy outright: the tabs are the user's" {
     const out = try openView(drv, arena, "https://site.example/", "tab", 800, 600, .default, &pol);
     try t.expectEqual(mcp.ErrCode.unavailable, out.err.code);
     try t.expect(std.mem.indexOf(u8, out.err.text, "headless-only") != null);
+}
+
+test "web_query schemas: the kind enum is web_proto.SemQuery, drift-tested" {
+    // The declaring home of the query vocabulary is `SemQuery`, and
+    // `fromName` is what says which members a client may name. BOTH of
+    // web_query's schemas copy that list; `form` and `within_text`
+    // shipped without the output copy, so a consumer validating against
+    // the advertised schema rejected a valid reply.
+    const t = std.testing;
+    const mcp_tools = @import("mcp_tools.zig");
+    const tool = for (mcp_tools.TOOLS) |tool| {
+        if (std.mem.eql(u8, tool.name, "web_query")) break tool;
+    } else return error.MissingWebQueryTool;
+    const out_schema = tool.output_schema orelse return error.MissingOutputSchema;
+    for ([_][]const u8{ tool.input_schema, out_schema }) |schema| {
+        const key = "\"kind\":{\"type\":\"string\",\"enum\":[";
+        const start = (std.mem.indexOf(u8, schema, key) orelse return error.MissingKindEnum) + key.len;
+        const end = std.mem.indexOfPos(u8, schema, start, "]") orelse return error.MissingKindEnum;
+        const listed = schema[start..end];
+        var n: usize = 0;
+        inline for (@typeInfo(web_proto.SemQuery).@"enum".fields) |f| {
+            if (web_proto.SemQuery.fromName(f.name) != null) {
+                try t.expect(std.mem.indexOf(u8, listed, "\"" ++ f.name ++ "\"") != null);
+                n += 1;
+            }
+        }
+        // No extra member either: a kind the helper would refuse must
+        // not be advertised as valid.
+        try t.expectEqual(n, std.mem.count(u8, listed, "\"") / 2);
+    }
 }
 
 test "capabilities schema: web_engine_owner enum is webdrive.Owner, drift-tested" {

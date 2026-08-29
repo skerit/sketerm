@@ -1,5 +1,5 @@
-//! Tool exposure policy for the MCP server: which of the ~100 tools a
-//! given assistant sees and may call.
+//! Tool exposure policy for the MCP server: which of `mcp_tools.TOOLS`
+//! a given assistant sees and may call.
 //!
 //! Group and read-only classification are FACTS ON THE TABLE
 //! (`mcp_tools.TOOLS`), not a second list: `TOOL_META` below is
@@ -50,12 +50,17 @@ pub const ParseError = error{
 ///
 /// Grammar: comma- or space-separated terms.
 ///   all              every tool (the default)
+///   all:ro           every non-mutating tool, in every group
 ///   <group>          every tool in the group
 ///   <group>:ro       the group's non-mutating tools only
 ///   <tool>           that one tool
 ///   -<group>         deny the group
 ///   -<group>:ro      deny the group's non-mutating tools
 ///   -<tool>          deny that one tool
+///
+/// `all` is group-shaped, so `:ro` applies to it exactly as it does to a
+/// named group: `all:ro` grants the non-mutating tools and nothing else.
+/// `<tool>:ro` stays a category error: a tool's mutability is fixed.
 ///
 /// Deny always wins. If the spec contains no allow term the baseline is
 /// "everything", so `-run_command,-file_delete` is a pure blocklist; as
@@ -139,7 +144,10 @@ const Term = struct {
     ro: bool,
 
     fn matches(self: Term, m: Meta) bool {
-        if (std.mem.eql(u8, self.body, "all")) return true;
+        // `all` is group-shaped, so `:ro` narrows it the same way it
+        // narrows a named group. Dropping the suffix here would turn
+        // `all:ro` into a silent grant of every mutating tool.
+        if (std.mem.eql(u8, self.body, "all")) return !self.ro or !m.mutates;
         if (groupOf(self.body)) |g| {
             if (g != m.group) return false;
             return !self.ro or !m.mutates;
@@ -261,6 +269,57 @@ test "the ro suffix drops a group's mutating tools" {
     try testing.expect(!p.allows("app_click"));
     try testing.expect(!p.allows("app_type"));
     try testing.expect(!p.allows("launch_app"));
+}
+
+test "all:ro grants every non-mutating tool and nothing else" {
+    const p: Policy = .{ .spec = "all:ro" };
+    // Read-only reach across every group, not just one.
+    try testing.expect(p.allows("screenshot_app"));
+    try testing.expect(p.allows("list_terminals"));
+    try testing.expect(p.allows("term_list"));
+    try testing.expect(p.allows("file_read"));
+    try testing.expect(p.allows("web_read"));
+    try testing.expect(p.allows("ui_panels"));
+    try testing.expect(p.allows("port_forward_list"));
+    // The whole point: mutating tools stay withheld.
+    try testing.expect(!p.allows("run_command"));
+    try testing.expect(!p.allows("file_delete"));
+    try testing.expect(!p.allows("app_click"));
+    try testing.expect(!p.allows("term_run"));
+    try testing.expect(!p.allows("web_act"));
+    try testing.expect(!p.allows("ui_show"));
+    try testing.expect(p.allows("capabilities"));
+
+    // Every group keeps a read-only half, so none is suppressed.
+    var buf: [8]Group = undefined;
+    try testing.expectEqual(@as(usize, 0), suppressedGroups(p, &buf).len);
+
+    // The spec is valid, and tools/list agrees with tools/call.
+    var bad: []const u8 = "";
+    try Policy.validate("all:ro", &bad);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const out = try filterToolsJson(arena, p);
+    const parsed = try std.json.parseFromSlice(std.json.Value, arena, out, .{});
+    try testing.expect(parsed.value.array.items.len < tools.TOOLS.len);
+    for (parsed.value.array.items) |item| {
+        const nm = item.object.get("name").?.string;
+        try testing.expect(p.allows(nm));
+        const m = lookup(nm).?;
+        if (m.mutates and m.group != .core) return error.MutatingToolLeaked;
+    }
+}
+
+test "-all:ro denies the read-only half and leaves the rest" {
+    const p: Policy = .{ .spec = "-all:ro" };
+    // A pure blocklist, so the mutating tools survive.
+    try testing.expect(p.allows("run_command"));
+    try testing.expect(p.allows("app_click"));
+    try testing.expect(!p.allows("screenshot_app"));
+    try testing.expect(!p.allows("file_read"));
+    try testing.expect(p.allows("capabilities"));
 }
 
 test "deny wins over an allow in either order" {

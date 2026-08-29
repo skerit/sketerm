@@ -100,6 +100,13 @@ pub fn parseArgs(args_in: []const []const u8) ?Parsed {
 
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     const parsed = parseArgs(args) orelse {
+        // An explicit --help is a successful request, so its usage goes
+        // to stdout like every other exit-0 usage; a missing operand is
+        // an error and stays on stderr.
+        if (@import("util/invocation.zig").helpRequested(args)) {
+            _ = c.fputs(USAGE, @import("util/platform.zig").stdout());
+            return 0;
+        }
         std.debug.print("{s}", .{USAGE});
         return 2;
     };
