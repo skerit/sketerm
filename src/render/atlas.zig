@@ -23,6 +23,15 @@ const glyph_glossary = @import("../grid/glyph_glossary.zig");
 pub const PAGE_SIZE: u32 = 2048;
 /// Number of array-texture layers. RGBA8: 4 × 16 MB = 64 MB GPU budget.
 pub const PAGE_COUNT: u32 = 4;
+/// Entries the shape cache holds before evicting on insert. 4096 x
+/// ~64 B = ~256 KB worst case, so a generative stream cannot grow it
+/// without bound.
+pub const SHAPE_CACHE_MAX: usize = 4096;
+/// Evicted shape results kept alive until the next release point. Once
+/// full, eviction stops and the cache overshoots its cap for the rest
+/// of the pass instead; `releaseRetiredShapes` trims it back. See
+/// `Atlas.shape_retired`.
+pub const SHAPE_RETIRED_MAX: usize = 1024;
 
 pub const Glyph = struct {
     /// Pixel size of the rasterized bitmap.
@@ -199,6 +208,20 @@ pub const Atlas = struct {
     /// only depends on the font + text (we don't change OpenType
     /// features at runtime), so the key is just the bytes.
     shape_cache: std.AutoHashMap(u64, []ShapedGlyph),
+    /// Shape results evicted or overwritten since the last release
+    /// point, still allocated.
+    ///
+    /// A shape result is atlas-owned, so a caller walking one is
+    /// walking cache memory, and a NESTED shape call can trip the cap
+    /// underneath it: the editor shapes an inlay hint in the middle of
+    /// a code run's glyph loop. Nothing is freed on eviction; the slice
+    /// parks here until `releaseRetiredShapes`, which every top-level
+    /// pass calls on entry (`CellPass.rebuildAndUpload`, `Layout.line`)
+    /// when it holds no result yet. The contract is therefore
+    /// structural: ANY number of results borrowed within one pass stay
+    /// valid for the whole pass, and the only thing a caller may not do
+    /// is keep one across a release point.
+    shape_retired: std.ArrayList([]ShapedGlyph) = .empty,
 
     /// OpenType features applied to every hb_shape call. Parsed once
     /// by setFontFeatures; rare enough that a fixed array suffices.
@@ -597,6 +620,8 @@ pub const Atlas = struct {
         var sc_it = self.shape_cache.iterator();
         while (sc_it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.shape_cache.deinit();
+        for (self.shape_retired.items) |s| self.allocator.free(s);
+        self.shape_retired.deinit(self.allocator);
         for (&self.pages) |*p| p.deinit(self.allocator);
         if (self.hb_buf) |b| c.hb_buffer_destroy(b);
         if (self.hb_font) |f| c.hb_font_destroy(f);
@@ -653,6 +678,9 @@ pub const Atlas = struct {
     /// Shape a UTF-8 run with HarfBuzz. Result is cached by content
     /// hash; the returned slice is OWNED BY THE ATLAS — callers must
     /// NOT free it. The atlas frees all cached results on deinit.
+    ///
+    /// Valid across any further shape calls until the next
+    /// `releaseRetiredShapes` (see `shape_retired`).
     pub fn shapeRun(self: *Atlas, _: std.mem.Allocator, text: []const u8, bold: bool, italic: bool) ![]ShapedGlyph {
         // A styled run shapes with the matching HarfBuzz font so its
         // glyph ids land in that face's namespace. With no real styled
@@ -681,9 +709,6 @@ pub const Atlas = struct {
         var glyph_count: c_uint = 0;
         const infos = c.hb_buffer_get_glyph_infos(buf, &glyph_count);
         const positions = c.hb_buffer_get_glyph_positions(buf, &glyph_count);
-        // Cap cache so generative streams don't grow it without
-        // bound. 4096 entries × ~64 B = ~256 KB worst case.
-        if (self.shape_cache.count() >= 4096) self.shapeCacheEvictOne();
         const out = try self.allocator.alloc(ShapedGlyph, glyph_count);
         var i: c_uint = 0;
         while (i < glyph_count) : (i += 1) {
@@ -696,10 +721,7 @@ pub const Atlas = struct {
                 .cluster = infos[i].cluster,
             };
         }
-        self.shape_cache.put(key, out) catch {
-            self.allocator.free(out);
-            return error.OutOfMemory;
-        };
+        try self.shapeCacheInsert(key, out);
         return out;
     }
 
@@ -722,20 +744,80 @@ pub const Atlas = struct {
         self.clearShapeCache();
     }
 
+    /// Frees everything at once, retired results included, so a caller
+    /// holding a result across a font-feature change is a bug here as
+    /// it always was.
     fn clearShapeCache(self: *Atlas) void {
         var it = self.shape_cache.iterator();
         while (it.next()) |entry| self.allocator.free(entry.value_ptr.*);
         self.shape_cache.clearRetainingCapacity();
+        for (self.shape_retired.items) |s| self.allocator.free(s);
+        self.shape_retired.clearRetainingCapacity();
     }
 
+    /// The one insert path for both shapers: makes room, then stores
+    /// `out`, retiring (never freeing) whatever it displaces. A key
+    /// collision on the content hash overwrites the old result, which
+    /// used to leak it; it is retired like an eviction now. Takes
+    /// ownership of `out` on failure too.
+    fn shapeCacheInsert(self: *Atlas, key: u64, out: []ShapedGlyph) error{OutOfMemory}!void {
+        if (self.shape_cache.count() >= SHAPE_CACHE_MAX) self.shapeCacheEvictOne();
+        const gop = self.shape_cache.getOrPut(key) catch {
+            self.allocator.free(out);
+            return error.OutOfMemory;
+        };
+        if (gop.found_existing) {
+            const old = gop.value_ptr.*;
+            gop.value_ptr.* = out;
+            self.retireShaped(old);
+            return;
+        }
+        gop.value_ptr.* = out;
+    }
+
+    /// Park a displaced result until the next release point. A full
+    /// retired list means the pass has already displaced
+    /// SHAPE_RETIRED_MAX results, and a slice that cannot be parked is
+    /// one that might still be borrowed, so it goes back to being a
+    /// cache entry rather than being freed: the cache simply grows past
+    /// its cap until `releaseRetiredShapes` trims it.
+    fn retireShaped(self: *Atlas, slice: []ShapedGlyph) void {
+        self.shape_retired.append(self.allocator, slice) catch {
+            // No room to record it; re-home it under a key nothing
+            // shapes to so it is at least freed at the next release.
+            self.shape_cache.put(@intFromPtr(slice.ptr), slice) catch {
+                // Both allocations failed. Leaking one shape result is
+                // the only option that cannot be a use-after-free.
+            };
+        };
+    }
+
+    /// Evict the first entry into `shape_retired`; no LRU because the
+    /// cache is generous and the policy barely matters. Once the
+    /// retired list is full the cache is allowed to overshoot instead,
+    /// bounded by the distinct runs one pass can shape.
     fn shapeCacheEvictOne(self: *Atlas) void {
-        // First entry — cheap, no LRU. Cache is generous (4096); the
-        // policy barely matters in practice.
+        if (self.shape_retired.items.len >= SHAPE_RETIRED_MAX) return;
         var it = self.shape_cache.iterator();
         if (it.next()) |entry| {
             const key = entry.key_ptr.*;
             const slice = entry.value_ptr.*;
-            self.allocator.free(slice);
+            _ = self.shape_cache.remove(key);
+            self.retireShaped(slice);
+        }
+    }
+
+    /// The release point: frees every retired result and trims an
+    /// overshot cache back to `SHAPE_CACHE_MAX`. Call it only where no
+    /// shape result is borrowed, i.e. on entry to a top-level pass.
+    pub fn releaseRetiredShapes(self: *Atlas) void {
+        for (self.shape_retired.items) |s| self.allocator.free(s);
+        self.shape_retired.clearRetainingCapacity();
+        while (self.shape_cache.count() > SHAPE_CACHE_MAX) {
+            var it = self.shape_cache.iterator();
+            const entry = it.next() orelse break;
+            const key = entry.key_ptr.*;
+            self.allocator.free(entry.value_ptr.*);
             _ = self.shape_cache.remove(key);
         }
     }
@@ -1824,8 +1906,9 @@ pub const Atlas = struct {
     /// Shape a UTF-8 run with an EXPLICIT hb_font and direction (the
     /// editor's itemization path — the run's face was chosen per
     /// script/coverage before shaping). Script/language are guessed
-    /// from the content, direction is forced. Cached like shapeRun;
-    /// the returned slice is OWNED BY THE ATLAS.
+    /// from the content, direction is forced. Cached like shapeRun,
+    /// with the same lifetime contract; the returned slice is OWNED BY
+    /// THE ATLAS.
     pub fn shapeWithFont(self: *Atlas, font: *c.hb_font_t, text: []const u8, rtl: bool) ![]ShapedGlyph {
         const buf = self.hb_buf orelse return error.NoHarfBuzzFont;
         var key = std.hash.Wyhash.hash(0x51ED_1704, text);
@@ -1841,7 +1924,6 @@ pub const Atlas = struct {
         var glyph_count: c_uint = 0;
         const infos = c.hb_buffer_get_glyph_infos(buf, &glyph_count);
         const positions = c.hb_buffer_get_glyph_positions(buf, &glyph_count);
-        if (self.shape_cache.count() >= 4096) self.shapeCacheEvictOne();
         const out = try self.allocator.alloc(ShapedGlyph, glyph_count);
         var i: c_uint = 0;
         while (i < glyph_count) : (i += 1) {
@@ -1854,10 +1936,7 @@ pub const Atlas = struct {
                 .cluster = infos[i].cluster,
             };
         }
-        self.shape_cache.put(key, out) catch {
-            self.allocator.free(out);
-            return error.OutOfMemory;
-        };
+        try self.shapeCacheInsert(key, out);
         return out;
     }
 
@@ -2266,4 +2345,116 @@ test "atlas page eviction recycles space" {
     try p.glyphs_on_page.append(std.testing.allocator, .{ .key = 'A', .kind = .codepoint });
     try p.glyphs_on_page.append(std.testing.allocator, .{ .key = 'B', .kind = .codepoint });
     try std.testing.expectEqual(@as(usize, 2), p.glyphs_on_page.items.len);
+}
+
+/// A cache-only Atlas: a real one needs FreeType plus a GL context,
+/// and the shape-cache mechanism touches nothing else.
+fn cacheOnlyAtlas(a: std.mem.Allocator) Atlas {
+    var at: Atlas = undefined;
+    at.allocator = a;
+    at.shape_cache = std.AutoHashMap(u64, []Atlas.ShapedGlyph).init(a);
+    at.shape_retired = .empty;
+    return at;
+}
+
+fn cacheOnlyDeinit(at: *Atlas) void {
+    var it = at.shape_cache.iterator();
+    while (it.next()) |e| at.allocator.free(e.value_ptr.*);
+    at.shape_cache.deinit();
+    for (at.shape_retired.items) |s| at.allocator.free(s);
+    at.shape_retired.deinit(at.allocator);
+}
+
+fn oneGlyph(a: std.mem.Allocator, id: u32) ![]Atlas.ShapedGlyph {
+    const slot = try a.alloc(Atlas.ShapedGlyph, 1);
+    slot[0] = .{
+        .glyph_id = id,
+        .x_advance = 0,
+        .y_advance = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+        .cluster = 0,
+    };
+    return slot;
+}
+
+test "atlas shape cache: a borrowed result survives eviction until release" {
+    const a = std.testing.allocator;
+    var at = cacheOnlyAtlas(a);
+    defer cacheOnlyDeinit(&at);
+
+    // The nested-shape hazard: an outer run is borrowed while inner
+    // shaping fills the cache past its cap, evicting the outer entry.
+    try at.shapeCacheInsert(1, try oneGlyph(a, 1));
+    const held = at.shape_cache.get(1).?;
+    var key: u64 = 2;
+    while (at.shape_cache.count() < SHAPE_CACHE_MAX) : (key += 1) {
+        try at.shapeCacheInsert(key, try oneGlyph(a, @intCast(key)));
+    }
+    // The next insert must evict something. Which entry is not
+    // specified (hash-map order, not insertion order); what matters is
+    // that nothing is freed: the outer result is readable and intact
+    // and still owned by the atlas, either as the cache entry it was
+    // or as the one retired slice.
+    try at.shapeCacheInsert(key, try oneGlyph(a, 999));
+    try std.testing.expectEqual(@as(usize, 1), at.shape_retired.items.len);
+    try std.testing.expectEqual(@as(u32, 1), held[0].glyph_id);
+    const still_cached = if (at.shape_cache.get(1)) |s| s.ptr == held.ptr else false;
+    const retired = at.shape_retired.items[0].ptr == held.ptr;
+    try std.testing.expect(still_cached != retired);
+    try std.testing.expectEqual(@as(usize, SHAPE_CACHE_MAX), at.shape_cache.count());
+
+    // The release point frees it (testing.allocator reports a leak
+    // if it does not) and leaves the cache at its cap.
+    at.releaseRetiredShapes();
+    try std.testing.expectEqual(@as(usize, 0), at.shape_retired.items.len);
+    try std.testing.expectEqual(@as(usize, SHAPE_CACHE_MAX), at.shape_cache.count());
+}
+
+test "atlas shape cache: overwriting a key retires the old result instead of leaking it" {
+    const a = std.testing.allocator;
+    var at = cacheOnlyAtlas(a);
+    defer cacheOnlyDeinit(&at);
+
+    try at.shapeCacheInsert(7, try oneGlyph(a, 1));
+    const old = at.shape_cache.get(7).?;
+    try at.shapeCacheInsert(7, try oneGlyph(a, 2));
+    try std.testing.expectEqual(@as(usize, 1), at.shape_cache.count());
+    try std.testing.expectEqual(@as(u32, 2), at.shape_cache.get(7).?[0].glyph_id);
+    // Still readable until release: a caller may be walking it.
+    try std.testing.expectEqual(@as(usize, 1), at.shape_retired.items.len);
+    try std.testing.expectEqual(old.ptr, at.shape_retired.items[0].ptr);
+    try std.testing.expectEqual(@as(u32, 1), old[0].glyph_id);
+    at.releaseRetiredShapes();
+    try std.testing.expectEqual(@as(usize, 0), at.shape_retired.items.len);
+}
+
+test "atlas shape cache: a full retired list stops eviction and release trims the overshoot" {
+    const a = std.testing.allocator;
+    var at = cacheOnlyAtlas(a);
+    defer cacheOnlyDeinit(&at);
+
+    var key: u64 = 0;
+    const inserts = SHAPE_CACHE_MAX + SHAPE_RETIRED_MAX + 16;
+    while (key < inserts) : (key += 1) {
+        try at.shapeCacheInsert(key, try oneGlyph(a, @intCast(key)));
+    }
+    // Every retire slot is taken; the last 16 inserts grew the cache.
+    try std.testing.expectEqual(@as(usize, SHAPE_RETIRED_MAX), at.shape_retired.items.len);
+    try std.testing.expectEqual(@as(usize, SHAPE_CACHE_MAX + 16), at.shape_cache.count());
+    at.releaseRetiredShapes();
+    try std.testing.expectEqual(@as(usize, 0), at.shape_retired.items.len);
+    try std.testing.expectEqual(@as(usize, SHAPE_CACHE_MAX), at.shape_cache.count());
+}
+
+test "atlas shape cache: clearing frees retired results too" {
+    const a = std.testing.allocator;
+    var at = cacheOnlyAtlas(a);
+    defer cacheOnlyDeinit(&at);
+    try at.shapeCacheInsert(1, try oneGlyph(a, 1));
+    try at.shapeCacheInsert(1, try oneGlyph(a, 2));
+    try std.testing.expectEqual(@as(usize, 1), at.shape_retired.items.len);
+    at.clearShapeCache();
+    try std.testing.expectEqual(@as(usize, 0), at.shape_retired.items.len);
+    try std.testing.expectEqual(@as(usize, 0), at.shape_cache.count());
 }

@@ -240,6 +240,11 @@ pub const Layout = struct {
     }
 
     pub fn line(self: *Layout, doc: *const Document, idx: usize) !*const LaidLine {
+        // Top-level pass entry: no shape result is borrowed yet (a
+        // LaidLine copies glyphs, it never keeps an atlas slice), so
+        // this is the release point for results the previous pass
+        // displaced.
+        self.book.atlas.releaseRetiredShapes();
         const gens = self.atlasGens();
         const hl_gen = self.liveHlGen(doc);
         const sem_gen = if (self.sem.len > 0) self.sem_gen else 0;
@@ -720,6 +725,11 @@ pub const Layout = struct {
         while (k < runs.len) : (k += 1) {
             const run = if (rtl) runs[runs.len - 1 - k] else runs[k];
             const slice = piece[run.start..run.end];
+            // Atlas-owned, and held across `flushHints` below, which
+            // shapes again and can trip the shape cache's eviction.
+            // Evicted results are only retired, never freed, until
+            // `line` starts the next pass, so this stays valid for as
+            // many hint runs as flushHints shapes.
             const shaped = try self.book.shape(run, slice);
             var i: usize = 0;
             while (i < shaped.len) {

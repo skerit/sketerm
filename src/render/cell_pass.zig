@@ -449,6 +449,9 @@ pub const CellPass = struct {
     ) !void {
         const profile_mod = @import("../util/profile.zig");
         const t_loop_start = if (profile_mod.enabled) profile_mod.nanoTimestamp() else 0;
+        // Top-level pass entry, nothing borrowed from the shape cache
+        // yet: free what the previous pass displaced.
+        atlas.releaseRetiredShapes();
         // Reset the per-frame "rebuilt" mask so callers reading after
         // this returns see only rows we actually touched this frame.
         for (self.rebuilt_rows.items) |*r| r.* = false;
