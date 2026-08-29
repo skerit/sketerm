@@ -275,20 +275,33 @@ pub const Document = struct {
                 errdefer alloc.free(out);
                 var w: usize = 0;
                 var it = self.rope.iterateRange(0, n);
-                while (it.next()) |chunk| {
-                    for (chunk) |b| {
-                        if (b == '\n') {
-                            out[w] = '\r';
-                            w += 1;
-                        }
-                        out[w] = b;
-                        w += 1;
-                    }
-                }
+                while (it.next()) |chunk| w += writeInStyle(out[w..], chunk, .crlf);
                 std.debug.assert(w == out.len);
                 return out;
             },
         }
+    }
+
+    /// Write `bytes` (document form, so LF) into `dest` in `style`,
+    /// returning the byte count; `dest` must hold `bytes.len` plus one
+    /// byte per newline. The one home for that conversion, so a writer
+    /// that splices into raw file bytes (`editor/psearch.zig`) cannot
+    /// drift from what saving the buffer would have produced.
+    pub fn writeInStyle(dest: []u8, bytes: []const u8, style: LineEnding) usize {
+        if (style == .lf) {
+            @memcpy(dest[0..bytes.len], bytes);
+            return bytes.len;
+        }
+        var w: usize = 0;
+        for (bytes) |b| {
+            if (b == '\n') {
+                dest[w] = '\r';
+                w += 1;
+            }
+            dest[w] = b;
+            w += 1;
+        }
+        return w;
     }
 
     /// Convenience: whole LF-normalized text, caller-owned.

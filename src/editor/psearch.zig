@@ -36,9 +36,31 @@
 //! log (one undo step), and a file that is not open is written
 //! directly — reopening it and pressing undo cannot resurrect content
 //! the editor never had, which is why the preview exists.
+//!
+//! ## Line endings
+//!
+//! Every offset the search engine reports is a DOCUMENT offset, and a
+//! CRLF file's document is LF-normalized (`Document.initFromBytes`
+//! strips the CR of every CRLF pair). Raw file bytes must therefore
+//! never be indexed with one: a `\r` per preceding line of drift
+//! silently shifts previews and, before this was fixed, spliced
+//! replacements into the middle of words. `RawMap` translates, and is
+//! the only thing allowed to turn a reported offset into an index into
+//! the file's own bytes.
+//!
+//! Replace splices the RAW bytes at translated offsets rather than
+//! rewriting a normalized copy, so a file keeps every byte it had
+//! outside the matches: a CRLF file stays CRLF, and a mixed-ending
+//! file is not quietly converted the way opening and saving it would.
+//! The replacement text and its `$1` expansions are the exception --
+//! those are document bytes, so their LFs are materialized as the
+//! file's own line ending on the way in, exactly as saving the open
+//! buffer would have written them.
 
 const std = @import("std");
-const Document = @import("document.zig").Document;
+const doc_mod = @import("document.zig");
+const Document = doc_mod.Document;
+const LineEnding = doc_mod.LineEnding;
 const search = @import("search.zig");
 const paths = @import("../filebrowser/paths.zig");
 
@@ -54,10 +76,13 @@ pub const MAX_HITS: usize = 20_000;
 pub const Hit = struct {
     /// Index into `Results.files`.
     file: u32,
-    /// 0-based line and BYTE column of the match start.
+    /// 0-based line and BYTE column of the match start. Both are the
+    /// same in document and raw-file space (normalization only ever
+    /// drops the CR that ends a line).
     line: u32,
     col: u32,
-    /// Byte offsets in the file content.
+    /// DOCUMENT byte offsets, not file offsets; see the header. They
+    /// differ for a CRLF file.
     start: u64,
     end: u64,
     text_off: u32,
@@ -249,6 +274,7 @@ pub const Results = struct {
             return 0;
         };
         defer doc.deinit();
+        var map = RawMap.init(content, doc.line_ending);
         const matches = search.findAll(self.allocator, &doc, self.needle, self.opts) catch {
             try self.setNote(file, "bad pattern", .failed);
             return 0;
@@ -264,8 +290,11 @@ pub const Results = struct {
             }
             const lc = doc.rope.offsetToLineCol(m.start);
             const line_start = doc.rope.lineToOffset(lc.line);
-            const line_end = lineEndOf(content, line_start);
-            const text = trimPreview(content[line_start..line_end]);
+            // The preview is raw file text, so the line start has to
+            // be translated; `trimPreview` drops the trailing CR.
+            const raw_start = map.at(line_start);
+            const line_end = lineEndOf(content, raw_start);
+            const text = trimPreview(content[raw_start..line_end]);
             const s = try self.intern(text);
             try self.hits.append(self.allocator, .{
                 .file = file,
@@ -305,6 +334,44 @@ pub const Results = struct {
     }
 };
 
+/// Document offset -> index into the raw file bytes, for a document
+/// whose CRLF pairs were normalized away on load.
+///
+/// `at(off)` is the index the first `off` document bytes end at, which
+/// deliberately does NOT step over a `\r` waiting to be consumed: a
+/// match ending at the newline has to swallow the whole `\r\n`, or a
+/// replace leaves an orphan CR behind. Allocation-free, and a cursor
+/// rather than a table, so it wants non-decreasing offsets; a
+/// backwards one is answered correctly by rewinding, at the cost of
+/// re-walking the file.
+const RawMap = struct {
+    content: []const u8,
+    raw: usize = 0,
+    doc: usize = 0,
+    /// LF documents load byte for byte, so the map is the identity.
+    identity: bool,
+
+    fn init(content: []const u8, style: LineEnding) RawMap {
+        return .{ .content = content, .identity = style == .lf };
+    }
+
+    fn at(self: *RawMap, off: usize) usize {
+        if (self.identity) return @min(off, self.content.len);
+        if (off < self.doc) {
+            self.raw = 0;
+            self.doc = 0;
+        }
+        while (self.doc < off and self.raw < self.content.len) {
+            const stripped = self.content[self.raw] == '\r' and
+                self.raw + 1 < self.content.len and
+                self.content[self.raw + 1] == '\n';
+            self.raw += 1;
+            if (!stripped) self.doc += 1;
+        }
+        return self.raw;
+    }
+};
+
 fn lineEndOf(content: []const u8, from: usize) usize {
     const nl = std.mem.indexOfScalarPos(u8, content, @min(from, content.len), '\n') orelse content.len;
     return nl;
@@ -315,8 +382,35 @@ fn trimPreview(line: []const u8) []const u8 {
     return trimmed[0..@min(trimmed.len, MAX_PREVIEW)];
 }
 
+/// Append `text` -- document bytes, so LF-terminated lines -- to `out`
+/// in `style`, the way `Document.materialize` re-applies CRLF on the
+/// way out.
+///
+/// Inserted text is the ONE part of a raw-bytes replace that is not
+/// copied from the file, so it is the one part that has to be
+/// converted: without this a multi-line replacement (or a capture
+/// spanning a newline) leaves lone LFs in a CRLF file, which the
+/// in-editor path would never produce.
+fn appendInStyle(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+    style: LineEnding,
+) !void {
+    if (style == .lf) return out.appendSlice(alloc, text);
+    try out.ensureUnusedCapacity(alloc, text.len + std.mem.count(u8, text, "\n"));
+    out.items.len += Document.writeInStyle(out.unusedCapacitySlice(), text, style);
+}
+
 /// Apply every match in `content`, expanding `$1`..`$9` in regex mode
 /// exactly as the find bar's Replace All does. Caller frees.
+///
+/// Matches are found in document space and spliced into the RAW bytes
+/// at translated offsets (see the header), so every byte outside a
+/// match survives verbatim and a CRLF file stays CRLF. Bytes that come
+/// from the replacement rather than from the file are document bytes,
+/// so they go through `appendInStyle` and pick up the file's own line
+/// ending -- the same text the in-editor path would have written.
 pub fn replaceAll(
     alloc: std.mem.Allocator,
     content: []const u8,
@@ -326,6 +420,8 @@ pub fn replaceAll(
 ) ![]u8 {
     var doc = try Document.initFromBytes(alloc, content);
     defer doc.deinit();
+    const doc_len = doc.rope.len();
+    var map = RawMap.init(content, doc.line_ending);
     const matches = try search.findAll(alloc, &doc, needle, opts);
     defer alloc.free(matches);
 
@@ -333,28 +429,40 @@ pub fn replaceAll(
     errdefer out.deinit(alloc);
     var re: ?search.Regex = if (opts.regex) try search.Regex.init(alloc, needle, opts) else null;
     defer if (re) |*r| r.deinit();
+    // `expand` writes document bytes; the conversion to the file's own
+    // line ending happens once, on the whole expansion.
+    var expanded: std.ArrayList(u8) = .empty;
+    defer expanded.deinit(alloc);
 
     var cursor: usize = 0;
+    var cursor_raw: usize = 0;
     for (matches) |m| {
         if (m.start < cursor) continue;
-        try out.appendSlice(alloc, content[cursor..m.start]);
+        const start_raw = map.at(m.start);
+        try out.appendSlice(alloc, content[cursor_raw..start_raw]);
         if (re) |*r| {
             if (try r.capturesAt(&doc, m.start)) |caps| {
-                try r.expand(&doc, caps, replacement, &out);
+                expanded.clearRetainingCapacity();
+                try r.expand(&doc, caps, replacement, &expanded);
+                try appendInStyle(alloc, &out, expanded.items, doc.line_ending);
             } else {
-                try out.appendSlice(alloc, replacement);
+                try appendInStyle(alloc, &out, replacement, doc.line_ending);
             }
         } else {
-            try out.appendSlice(alloc, replacement);
+            try appendInStyle(alloc, &out, replacement, doc.line_ending);
         }
         cursor = m.end;
+        cursor_raw = map.at(m.end);
         // A zero-width match must still advance, or the loop stalls.
-        if (m.end == m.start and cursor < content.len) {
-            try out.append(alloc, content[cursor]);
+        // The one document byte stepped over can be two raw ones.
+        if (m.end == m.start and cursor < doc_len) {
             cursor += 1;
+            const next_raw = map.at(cursor);
+            try out.appendSlice(alloc, content[cursor_raw..next_raw]);
+            cursor_raw = next_raw;
         }
     }
-    try out.appendSlice(alloc, content[@min(cursor, content.len)..]);
+    try out.appendSlice(alloc, content[@min(cursor_raw, content.len)..]);
     return out.toOwnedSlice(alloc);
 }
 
@@ -528,6 +636,153 @@ test "psearch: replaceAll matches the find bar, including captures" {
     );
     defer testing.allocator.free(re);
     try testing.expectEqualStrings("1:a\n22:b\n", re);
+}
+
+test "psearch: raw offsets swallow the CR that ends a line" {
+    const content = "aaa\r\nfoo\r\nbbb\r\n";
+    var map = RawMap.init(content, .crlf);
+    // Before the newline the CR is still the next line's business...
+    try testing.expectEqual(@as(usize, 3), map.at(3));
+    // ...and consuming the newline consumes it.
+    try testing.expectEqual(@as(usize, 5), map.at(4));
+    try testing.expectEqual(@as(usize, 8), map.at(7));
+    try testing.expectEqual(@as(usize, 15), map.at(12));
+    // A backwards query rewinds instead of answering nonsense.
+    try testing.expectEqual(@as(usize, 5), map.at(4));
+
+    var lf = RawMap.init(content, .lf);
+    try testing.expectEqual(@as(usize, 4), lf.at(4));
+}
+
+test "psearch: replaceAll keeps a CRLF file's line endings" {
+    const out = try replaceAll(
+        testing.allocator,
+        "aaa\r\nfoo\r\nbbb\r\n",
+        "foo",
+        "bar",
+        .{},
+    );
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("aaa\r\nbar\r\nbbb\r\n", out);
+
+    // A match on the first line (offset 0, nothing to translate) and
+    // one on the last, so the tail splice is covered too.
+    const edges = try replaceAll(
+        testing.allocator,
+        "x\r\nmid\r\nx\r\n",
+        "x",
+        "yy",
+        .{},
+    );
+    defer testing.allocator.free(edges);
+    try testing.expectEqualStrings("yy\r\nmid\r\nyy\r\n", edges);
+}
+
+test "psearch: replacing across a CRLF newline takes the CR with it" {
+    // The document has no CR, so `\s+` matches just "\n" -- the raw
+    // splice must not leave the stripped CR behind as a stray byte.
+    const out = try replaceAll(
+        testing.allocator,
+        "aaa\r\nfoo\r\n",
+        "\\s+",
+        " ",
+        .{ .regex = true },
+    );
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("aaa foo ", out);
+}
+
+test "psearch: replaceAll expands captures in a CRLF file" {
+    const out = try replaceAll(
+        testing.allocator,
+        "a=1\r\nb=22\r\n",
+        "([a-z])=([0-9]+)",
+        "$2:$1",
+        .{ .regex = true },
+    );
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("1:a\r\n22:b\r\n", out);
+}
+
+// Inserted text is the one part of the output that is not copied from
+// the file, so it is the one part that can carry the wrong line
+// ending; saving the same replace from an open buffer writes CRLF.
+test "psearch: a multi-line replacement into a CRLF file stays CRLF" {
+    const out = try replaceAll(
+        testing.allocator,
+        "aaa\r\nfoo\r\nbbb\r\n",
+        "foo",
+        "one\ntwo",
+        .{},
+    );
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("aaa\r\none\r\ntwo\r\nbbb\r\n", out);
+
+    // An LF file is untouched by the conversion.
+    const lf = try replaceAll(testing.allocator, "aaa\nfoo\n", "foo", "one\ntwo", .{});
+    defer testing.allocator.free(lf);
+    try testing.expectEqualStrings("aaa\none\ntwo\n", lf);
+}
+
+test "psearch: a capture spanning a newline comes back CRLF" {
+    // The capture is document text, so it holds a lone LF; splicing it
+    // back verbatim would leave that LF in a CRLF file.
+    const out = try replaceAll(
+        testing.allocator,
+        "one\r\ntwo\r\ntail\r\n",
+        "(one\ntwo)",
+        "[$1]",
+        .{ .regex = true },
+    );
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("[one\r\ntwo]\r\ntail\r\n", out);
+}
+
+test "psearch: an LF file keeps every byte it had, strays included" {
+    // Majority LF, so the document is loaded byte for byte and the
+    // lone CRLF must survive the rewrite untouched.
+    const out = try replaceAll(
+        testing.allocator,
+        "one\nold\r\ntwo\nold\n",
+        "old",
+        "new",
+        .{},
+    );
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("one\nnew\r\ntwo\nnew\n", out);
+}
+
+test "psearch: CRLF previews and columns are the line's own text" {
+    var r = Results.init(testing.allocator);
+    defer r.deinit();
+    try r.reset("/p", "needle", .{});
+    const f = try r.addFile("/p/dos.txt");
+    const content = "first\r\n  a needle here\r\nlast needle\r\n";
+    try testing.expectEqual(@as(usize, 2), try r.scanContent(f, content));
+    try testing.expectEqual(@as(u32, 1), r.hits.items[0].line);
+    try testing.expectEqual(@as(u32, 4), r.hits.items[0].col);
+    try testing.expectEqualStrings("a needle here", r.preview(r.hits.items[0]));
+    try testing.expectEqual(@as(u32, 2), r.hits.items[1].line);
+    try testing.expectEqual(@as(u32, 5), r.hits.items[1].col);
+    try testing.expectEqualStrings("last needle", r.preview(r.hits.items[1]));
+}
+
+test "psearch: a zero-width match steps over a whole CRLF pair" {
+    const out = try replaceAll(testing.allocator, "a\r\nb\r\n", "x*", "-", .{ .regex = true });
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("-a-\r\n-b-\r\n-", out);
+}
+
+test "psearch: a CRLF plan rewrites the file, not its line endings" {
+    var r = Results.init(testing.allocator);
+    defer r.deinit();
+    try r.reset("/p", "old", .{});
+    try r.setReplacement("new");
+    const f = try r.addFile("/p/dos.txt");
+    const content = "old thing\r\nkeep\r\nold again\r\n";
+    _ = try r.scanContent(f, content);
+    const plan = (try r.planReplace(f, content, 7)).?;
+    try testing.expectEqualStrings("new thing\r\nkeep\r\nnew again\r\n", plan);
 }
 
 test "psearch: a zero-width regex replacement still terminates" {
