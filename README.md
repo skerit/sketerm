@@ -89,9 +89,11 @@ daemon) that can also be the default `inode/directory` handler.
 `sketerm edit` is a text editor with Tree-sitter highlighting, multiple
 carets, a project layer and a Language Server Protocol client.
 `sketerm view` shows images, `sketerm play` plays asciicast recordings,
-`sketerm web` is a Chromium-based browser (via CEF) with a reader mode
-and a built-in ad filter. Every one of these also works as a *face* on
-a pane inside a terminal window (`--here`/`--tab`).
+`sketerm web` is a Chromium-based browser (via CEF) with a reader mode,
+a built-in ad filter, identity containers, and a network route per tab
+(direct, Tor, via one of your SSH hosts, or the browser running on that
+host) with cookies shared across routes. Every one of these also works
+as a *face* on a pane inside a terminal window (`--here`/`--tab`).
 
 **MCP server.** `sketerm mcp` is a Model Context Protocol server on stdio
 with 120 tools in eight groups (`panes app term files net browser ui
@@ -100,7 +102,10 @@ launch and drive GUI apps headlessly with screenshots, pixel diffs,
 hover maps and backtraces, transfer files and forward ports over SSH,
 browse the web headlessly in named cookie-jar profiles under an
 enforced network policy, and render native panels from a declarative
-document. A per-connection tool policy narrows what each assistant gets;
+document. Whatever an assistant does is watchable from your own window
+by default: a chip in the tab bar lists live assistants and their
+browsers, terminals and apps, one click watches, another takes control.
+A per-connection tool policy narrows what each assistant gets;
 `capabilities` is the preflight that names every capability the server
 has. See `docs/mcp.md`.
 

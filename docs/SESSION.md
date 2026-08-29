@@ -1,5 +1,65 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-29: per-tab routes reach the user; assistants become watchable
+
+Two features Jelle had been told were done turned out to be engine
+layers with no surface, and both got their surface today.
+
+**Per-tab routes.** `src/web/route.zig` (2026-08-23) already realized a
+route as one `sketerm-webengine` instance with its own profile and
+proxy, re-sharing identity through cookie sync; nothing let a user or
+an assistant pick one, and `.tor` was reachable only from unit tests.
+Now: the site button's popover has a Route section (Direct / Tor / Via
+server / Browser runs on) that moves the tab onto `clientForRoute` via
+`WebFace.setRoute` (view re-created in the target instance, url
+re-navigated, identity untouched) and the site button shows the route
+whenever it is not direct; a container's routing choice is its DEFAULT
+route (the old `egress_host`/`remote_host` pair is one `route` field
+now, migrated on load, Tor added as a fourth option); `web_route` in
+config is the default for tabs whose container has none, in the one
+grammar `direct | tor | via:<host> | on:<host>` (`Spec.parse`/`format`,
+shared by config, the CLI and MCP); `mux_tor_socks_endpoint` is the
+browser's Tor endpoint too. The helper takes `--proxy` per instance and
+applies it to every context, so no view of a routed instance has a
+direct path (a per-context proxy could only re-route a container out
+of its instance; `ContextCreate.proxy` stays on the wire, ignored). The
+GUI finally consumes the cookie-sync block: every local instance is
+subscribed, changes fan out, a fresh instance is seeded by
+`cookie_dump_req`. MCP: `web_open route:`, `route` as a fact on every
+web result and per tab in `web_tabs`, `web_routes` in `capabilities`;
+headless answers `direct` and `tor` with one engine per route slug and
+still refuses `via:`/`on:` naming `web_backend`.
+
+**Watch-along.** The 2026-08-15 work put the assistant's browser into a
+Wayland app session on the MCP's private daemon, but an OSR browser
+creates no toplevel, so attaching showed nothing, and the Session
+Overview only saw the daemon the GUI was on. The helper now carries a
+presenter (`src/web/presenter.zig`, a raw-protocol Wayland client on the
+helper's single poll loop, no libwayland): one xdg_toplevel per
+presentable view, created on its first paint, titled by the page,
+pinned to the viewport, two-buffer wl_shm, frame-callback paced with a
+damage union; seat input on it is translated to the same CEF OSR calls
+the MCP input path uses, so a viewer holding the controller lease
+drives the assistant's page and the assistant's semantic tools keep
+working. Armed only by `SKETERM_WEB_PRESENTER=1`, which `webdrive` sets
+in session mode; the hello_ack reports `presenter` and `capabilities`
+reports `web_watch` and `mux_socket`, so an assistant can tell the user
+where to look. On the GUI side `src/ui/assistants.zig` watches the MCP
+registry (`mcp-servers/`, flock liveness) and polls each live
+assistant's daemon: a chip at the end of the tab bar ("AI: 1 browser,
+2 terminals") opens a popover with Watch (read-only lease) and Take
+Control per session through the existing `sock:` attach path, the
+per-pane "AI attached" chip is clickable and opens the same popover,
+and the Session Overview reads the same roster instead of its own
+directory scan. No flag, no --shared.
+
+**Also.** The bookmark star was rendering as the text "Bookmark" on
+installed builds because `dist/stage.sh` installed a hand-written list
+of six action icons and the starred pair was not in it; icons are
+staged by glob and `dist/test-install.sh` drift-tests both directions.
+The star lives in the address entry now and the Shell button moved to
+the burger menu with its chord.
+
 ## 2026-08-29: codebase review, fix pass, and the audit of that fix pass
 
 A full review of the tree (all gates green, three rigs red, one
