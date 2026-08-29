@@ -784,6 +784,29 @@ over, and both are measured, not assumed:
   quietly ran with no profile of its own. Nothing above the log said
   so; it was found by writing a cookie in a container and looking for
   it afterwards.
+- **Reference ownership across the C API, in BOTH directions: every
+  ref-counted struct that crosses the boundary carries exactly one
+  reference owned by the RECEIVER.** This is what CEF's translator
+  generates, not a convention: `libcef_dll/cpptoc/cpptoc_ref_counted.h`
+  `Wrap()` adds "a reference to our wrapper object that will be released
+  once our structure arrives on the other side", and its `Unwrap()`
+  "Release[s] the reference to our wrapper object that was added before
+  the structure was passed back to us"; `tools/make_ctocpp_impl.py`
+  emits `CppToC_Wrap(arg)` for every `refptr_diff` argument of a client
+  callback (and per ELEMENT of a `refptr_vec_diff_byref_const` such as a
+  V8 handler's `arguments`, with no restore), `tools/make_cpptoc_impl.py`
+  emits `CppToC_Unwrap(arg)` for every `refptr_same` argument we pass
+  and `CppToC_Wrap(_retval)` for every struct we get back. So: an
+  argument libcef hands one of our `callconv(.c)` callbacks is OURS to
+  release (`releaseArg`, a `defer` per argument at the top of every
+  callback; a callback that KEEPS the object, such as a held
+  `cef_callback_t` or `on_after_created`'s adopted browser, keeps that
+  very reference and adds none), a struct we pass into libcef is
+  consumed (add_ref first if we still need it), and a struct returned
+  to us is released when we are done. Before 2026-08-29 the callbacks
+  released nothing, which measured as ~9 kB of browser-process RSS per
+  HTTP request with no plateau, and `wreqConsider`/`adoptBrowser`
+  add-ref'd on top of references they already owned.
 - **`contextForSpawn` hands out an ADD-REF'd reference.**
   `create_browser_sync` wraps the `cef_request_context_t*` with
   `CefRequestContextCToCpp::Wrap`, which TAKES ownership (CToCpp

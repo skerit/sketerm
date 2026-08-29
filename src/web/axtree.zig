@@ -104,12 +104,18 @@ pub const Tree = struct {
         return self.nodes.count();
     }
 
-    /// Apply one `ev_a11y_tree` frame. A decode error drops the frame
-    /// and leaves the store at its previous consistent state.
+    /// Apply one `ev_a11y_tree` frame atomically: every node is decoded
+    /// into a staging list before anything in the store changes, so a
+    /// truncated or malformed payload leaves the store exactly as it was.
     pub fn applyTree(self: *Tree, ev: proto.EvA11yTree) !void {
-        if (ev.node_id_to_clear != 0) self.dropDescendants(ev.node_id_to_clear);
+        var staged: std.ArrayList(Node) = .empty;
+        defer staged.deinit(self.gpa);
+        errdefer for (staged.items) |*s| s.free(self.gpa);
         var it = proto.A11yNodeIter.init(ev.nodes.s);
         while (try it.next()) |wire| {
+            // Reserved up front so the append below cannot fail once the
+            // node owns its allocations.
+            try staged.ensureUnusedCapacity(self.gpa, 1);
             var n = Node{ .id = wire.id };
             n.state = wire.state;
             n.x = wire.x;
@@ -144,11 +150,17 @@ pub const Tree = struct {
                 try attrs.append(self.gpa, .{ .key = k, .value = v });
             }
             n.attrs = try attrs.toOwnedSlice(self.gpa);
-
-            const slot = try self.nodes.getOrPut(self.gpa, wire.id);
+            staged.appendAssumeCapacity(n);
+        }
+        // Commit. The map is grown first so the loop cannot fail halfway.
+        try self.nodes.ensureUnusedCapacity(self.gpa, @intCast(staged.items.len));
+        if (ev.node_id_to_clear != 0) self.dropDescendants(ev.node_id_to_clear);
+        for (staged.items) |n| {
+            const slot = self.nodes.getOrPutAssumeCapacity(n.id);
             if (slot.found_existing) slot.value_ptr.free(self.gpa);
             slot.value_ptr.* = n;
         }
+        staged.clearRetainingCapacity();
         if (ev.root_id != 0) self.root_id = ev.root_id;
         self.focus_id = ev.focus_id;
         self.prune();
@@ -461,23 +473,35 @@ test "an empty editable still offers text; an empty static does not" {
     try t.expect(!tree.get(3).?.hasText());
 }
 
-test "a truncated node payload leaves the store consistent" {
+test "a truncated node payload leaves the store exactly as it was" {
     const gpa = t.allocator;
     var tree = Tree.init(gpa);
     defer tree.deinit();
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
     try encodeNodes(gpa, &buf, &.{
-        .{ .id = 1, .role = "document", .children = &.{} },
+        .{ .id = 1, .role = "document", .children = &.{2} },
+        .{ .id = 2, .role = "button", .name = "Go" },
     });
     try tree.applyTree(.{ .view = 1, .root_id = 1, .node_id_to_clear = 0, .focus_id = 0, .nodes = .{ .s = buf.items } });
+
+    // A frame that renames node 2 and adds node 3, cut short: the
+    // rename decoded fine, the addition did not, and neither may land.
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(gpa);
+    try encodeNodes(gpa, &bad, &.{
+        .{ .id = 2, .role = "button", .name = "Changed" },
+        .{ .id = 3, .role = "generic" },
+    });
     const err = tree.applyTree(.{
         .view = 1,
         .root_id = 1,
-        .node_id_to_clear = 0,
+        .node_id_to_clear = 2,
         .focus_id = 0,
-        .nodes = .{ .s = buf.items[0 .. buf.items.len - 2] },
+        .nodes = .{ .s = bad.items[0 .. bad.items.len - 2] },
     });
     try t.expectError(error.Truncated, err);
-    try t.expectEqual(@as(usize, 1), tree.count());
+    try t.expectEqual(@as(usize, 2), tree.count());
+    try t.expectEqualStrings("Go", tree.get(2).?.name);
+    try t.expect(tree.get(3) == null);
 }

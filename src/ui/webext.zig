@@ -826,6 +826,9 @@ fn onLoadUnpacked(_: ?*c.GtkWidget, _: ?*anyopaque) callconv(.c) void {
 }
 
 fn onFolderChosen(source: ?*c.GObject, res: ?*c.GAsyncResult, _: ?*anyopaque) callconv(.c) void {
+    // The async call does not consume the dialog, so its constructor ref
+    // is ours to drop here -- on the cancel path too, which returns below.
+    defer if (source) |dialog| c.g_object_unref(dialog);
     const m = g_manager orelse return;
     const file = c.gtk_file_dialog_select_folder_finish(@ptrCast(source), res, null) orelse return;
     defer c.g_object_unref(file);
@@ -842,6 +845,8 @@ fn onLoadArchive(_: ?*c.GtkWidget, _: ?*anyopaque) callconv(.c) void {
 }
 
 fn onArchiveChosen(source: ?*c.GObject, res: ?*c.GAsyncResult, _: ?*anyopaque) callconv(.c) void {
+    // See onFolderChosen: the dialog ref ends here, cancels included.
+    defer if (source) |dialog| c.g_object_unref(dialog);
     const m = g_manager orelse return;
     const file = c.gtk_file_dialog_open_finish(@ptrCast(source), res, null) orelse return;
     defer c.g_object_unref(file);

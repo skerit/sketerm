@@ -169,6 +169,16 @@ const BrowserSpawnOps = struct {
 
 const system_browser_spawn_ops: BrowserSpawnOps = .{ .create_retries = 5 };
 
+/// Wraps the one engine call `contextCreate` makes, so CEF-gated tests can
+/// drive its refusal and rollback paths without starting the engine.
+const ContextCreateOps = struct {
+    ctx: ?*anyopaque = null,
+    create: *const fn (?*anyopaque, *const cef.cef_request_context_settings_t) ?*cef.cef_request_context_t =
+        Host.createRequestContextSystem,
+};
+
+const system_context_create_ops: ContextCreateOps = .{};
+
 /// Cap on damage rects forwarded per paint; beyond it a single
 /// full-view rect is cheaper than the bookkeeping.
 ///
@@ -771,21 +781,6 @@ fn semanticResult(comptime T: type) bool {
 // Host
 // ---------------------------------------------------------------------
 
-const ProxyPref = struct {
-    /// The request context this preference was set on. The entry dies
-    /// with that context; an unkeyed entry could not be pruned even in
-    /// principle, so a helper churning ephemeral proxied containers
-    /// grew its retention list forever.
-    context: u32,
-    dict: *cef.cef_dictionary_value_t,
-    value: *cef.cef_value_t,
-
-    fn releaseAll(self: ProxyPref) void {
-        release(&self.value.base);
-        release(&self.dict.base);
-    }
-};
-
 /// The browser fleet plus its outbound protocol queue.
 ///
 /// A single instance per process, reachable from the C callbacks
@@ -880,12 +875,6 @@ pub const Host = struct {
     /// flushes: tracked so their completions cannot release a client's
     /// pending answer early, but answered to nobody.
     pending_flushes: std.ArrayList(PendingFlush) = .empty,
-    /// CEF's preference manager can keep the supplied value graph beyond
-    /// `set_preference` (nothing in `cef_preference_capi.h` promises a
-    /// copy), so the graph is retained. It is keyed by context id and
-    /// released in `contextDestroy` -- the retention lasts as long as
-    /// the context that could still be reading it, not the process.
-    proxy_prefs: std.ArrayList(ProxyPref) = .empty,
 
     // -- cross-instance cookie sync (capability "cookie-sync") --------
     //
@@ -1137,8 +1126,6 @@ pub const Host = struct {
         for (self.cookie_shadow.items) |*sh| sh.free(self.gpa);
         self.cookie_shadow.deinit(self.gpa);
         self.cookie_shadow_seeded.deinit(self.gpa);
-        for (self.proxy_prefs.items) |pref| pref.releaseAll();
-        self.proxy_prefs.deinit(self.gpa);
         self.us_scripts.deinit(self.gpa);
         if (self.us_script_arena) |*a| a.deinit();
         self.us_styles.deinit(self.gpa);
@@ -1177,11 +1164,22 @@ pub const Host = struct {
     /// the FIRST browser and the second view in the same container
     /// crashed the helper on a freed vtable. Callers pass the result
     /// straight to a create_browser call and must not release it.
+    ///
+    /// Call it ONLY where the reference is about to be handed to such a
+    /// call; a pre-flight refusal wants `requireContext`, which answers
+    /// the same question without minting a reference nobody consumes.
     fn contextForSpawn(self: *Host, v: *const View) error{ContextGone}!?*cef.cef_request_context_t {
         if (v.context == 0) return null;
         const rc = self.lookupContext(v.context) orelse return error.ContextGone;
         if (rc.base.base.add_ref) |add| add(&rc.base.base);
         return rc;
+    }
+
+    /// `contextForSpawn`'s refusal without its reference: the container a
+    /// view names still exists (or it never named one).
+    fn requireContext(self: *Host, v: *const View) error{ContextGone}!void {
+        if (v.context == 0) return;
+        if (self.lookupContext(v.context) == null) return error.ContextGone;
     }
 
     /// Mint a per-tab identity context (its own cookie jar / cache),
@@ -1191,6 +1189,10 @@ pub const Host = struct {
     /// gets an EMPTY cache path — CEF's in-memory incognito store, wiped
     /// with the context, so nothing has to be scrubbed off disk.
     pub fn contextCreate(self: *Host, req: proto.ContextCreate) void {
+        return self.contextCreateWith(req, &system_context_create_ops);
+    }
+
+    fn contextCreateWith(self: *Host, req: proto.ContextCreate, ops: *const ContextCreateOps) void {
         if (req.id == 0 or self.lookupContext(req.id) != null) return;
 
         var settings = std.mem.zeroes(cef.cef_request_context_settings_t);
@@ -1215,20 +1217,14 @@ pub const Host = struct {
         }
         defer cef.cef_string_utf16_clear(&settings.cache_path);
 
-        const rc: *cef.cef_request_context_t = cef.cef_request_context_create_context(&settings, null) orelse return;
+        const rc: *cef.cef_request_context_t = ops.create(ops.ctx, &settings) orelse return;
 
         // A proxied context is all-or-nothing. Registering an rc whose
         // preference was refused would make its views use direct traffic.
-        var pref: ?ProxyPref = if (req.proxy.len != 0) applyProxy(rc, req.proxy) orelse {
+        if (req.proxy.len != 0 and !applyProxy(rc, req.proxy)) {
             release(&rc.base.base);
             return;
-        } else null;
-        if (pref) |*p| p.context = req.id;
-        if (pref) |p| self.proxy_prefs.append(self.gpa, p) catch {
-            p.releaseAll();
-            release(&rc.base.base);
-            return;
-        };
+        }
 
         // The global registration does not reach this context.
         registerExtSchemeOn(rc);
@@ -1247,10 +1243,16 @@ pub const Host = struct {
             else
                 self.dispatch_conn,
         }) catch {
-            if (pref != null) self.proxy_prefs.pop().?.releaseAll();
             release(&rc.base.base);
             return;
         };
+    }
+
+    fn createRequestContextSystem(
+        _: ?*anyopaque,
+        settings: *const cef.cef_request_context_settings_t,
+    ) ?*cef.cef_request_context_t {
+        return cef.cef_request_context_create_context(settings, null);
     }
 
     /// The id the OWNING CLIENT minted for an engine-global context id.
@@ -1277,22 +1279,11 @@ pub const Host = struct {
             if (ctx.id != id) continue;
             release(&ctx.rc.base.base);
             _ = self.contexts.swapRemove(i);
-            self.releaseProxyPrefs(id);
             // Its jar died with it: keeping shadow entries would make
             // the next reconcile of a REUSED id emit deletions for
             // cookies nothing ever had.
             self.cookieSyncForgetContext(id);
             return;
-        }
-    }
-
-    /// Drop the retained proxy value graph of a context that is gone.
-    fn releaseProxyPrefs(self: *Host, id: u32) void {
-        var i = self.proxy_prefs.items.len;
-        while (i > 0) {
-            i -= 1;
-            if (self.proxy_prefs.items[i].context != id) continue;
-            self.proxy_prefs.swapRemove(i).releaseAll();
         }
     }
 
@@ -1472,8 +1463,11 @@ pub const Host = struct {
         // Refuse BEFORE the engine is asked: a vanished container must
         // never resolve to the global context. This covers the revival
         // of a discarded view, whose container can be destroyed while it
-        // holds no browser at all.
-        _ = try self.contextForSpawn(v);
+        // holds no browser at all. The reference the engine consumes is
+        // minted by `createBrowserSystem`; taking one here as well leaked
+        // it per spawn, and an ephemeral context that never reaches zero
+        // never wipes its in-memory jar.
+        try self.requireContext(v);
         const browser = ops.create_browser(ops.ctx, self, v, initial_url) orelse return error.BrowserCreateFailed;
         v.browser = browser;
         v.cef_id = browserInt(browser, "get_identifier");
@@ -1851,10 +1845,11 @@ pub const Host = struct {
     /// `on_after_created` for a browser no view claims.
     fn adoptBrowser(self: *Host, v: *View, browser: *cef.cef_browser_t) void {
         self.adopting = null;
-        // `on_after_created`'s browser is BORROWED; every other browser
-        // pointer this file keeps comes from create_browser_sync with a
-        // reference held, and `freeView` releases one either way.
-        if (browser.base.add_ref) |ar| ar(&browser.base);
+        // `on_after_created`'s browser arrives with a reference the
+        // callback OWNS (libcef wraps every argument with a reference for
+        // the receiver); adopting keeps that reference as `v.browser`, the
+        // same one `create_browser_sync` returns on the other path, and
+        // `freeView` releases it either way.
         v.browser = browser;
         v.cef_id = browserInt(browser, "get_identifier");
         // DID THE ENGINE HONOUR THE WINDOWLESS REQUEST?
@@ -5438,8 +5433,11 @@ pub const Host = struct {
     }
 
     /// Every port either end of which was `view` is closed, and the
-    /// surviving end told. Called when a view goes away — a Port whose
-    /// peer is gone must disconnect, never wait forever.
+    /// surviving end told. Called when a view goes away, and when its
+    /// main document is replaced: a Port whose peer is gone (or whose
+    /// peer's `Port` object died with its document) must disconnect,
+    /// never wait forever. Idempotent, so the paths that do both in
+    /// sequence cost only a scan.
     pub fn portsAbandonView(self: *Host, view: u32) void {
         var i: usize = 0;
         while (i < self.webext_ports.items.len) {
@@ -6134,10 +6132,20 @@ pub const Host = struct {
     /// Navigation invalidates every command sent to the old V8 context.
     /// Reads and snapshots are safe to reissue against the new page;
     /// actions are not and are answered explicitly instead of hanging.
+    ///
+    /// This is the ONE place a main-frame document replacement passes
+    /// through: the client-driven paths (`navigate`, `navAction`) call it
+    /// before asking the engine, and `onLoadStart` calls it for every load
+    /// they did not arm. So it is also where a content script's
+    /// `runtime.connect` Ports die: their JS `Port` objects go with the
+    /// document, and a Port nobody can reach again would otherwise sit in
+    /// the table for the life of the helper, still messageable by its
+    /// background page.
     fn semanticNavigationStarted(self: *Host, v: *View) void {
         v.sem_nav.start(false);
         v.sem_context_doc = 0;
         v.sem_observing = false;
+        self.portsAbandonView(v.id);
         for (v.pending.items) |*p| {
             switch (p.kind) {
                 .snapshot, .hints, .query, .read, .read_ids => {
@@ -7700,52 +7708,211 @@ test "a revival whose container vanished is refused, not put on the global conte
     try std.testing.expect(v.discarded);
 }
 
-test "a destroyed context releases the proxy value graph it retained" {
-    // The retention entry used to carry no context id, so it could not
-    // be pruned even in principle: a helper churning ephemeral proxied
-    // egress containers grew `proxy_prefs` for its whole lifetime.
+test "the spawn's container check mints no reference the engine will not consume" {
+    // `contextForSpawn` ADD-REFs for a create_browser call to CONSUME.
+    // The spawn used it for its pre-flight refusal too and dropped that
+    // reference on the floor, so an ephemeral container never reached
+    // zero and its in-memory jar was never wiped.
     const Fake = struct {
+        var added: usize = 0;
         var released: usize = 0;
+        fn add(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) void {
+            added += 1;
+        }
         fn rel(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
             released += 1;
             return 1;
         }
     };
+    Fake.added = 0;
     Fake.released = 0;
-
     var rc = std.mem.zeroes(cef.cef_request_context_t);
+    rc.base.base.add_ref = Fake.add;
     rc.base.base.release = Fake.rel;
-    var dict = std.mem.zeroes(cef.cef_dictionary_value_t);
-    dict.base.release = Fake.rel;
-    var value = std.mem.zeroes(cef.cef_value_t);
-    value.base.release = Fake.rel;
-    var other_rc = std.mem.zeroes(cef.cef_request_context_t);
-    other_rc.base.base.release = Fake.rel;
-    var other_dict = std.mem.zeroes(cef.cef_dictionary_value_t);
-    other_dict.base.release = Fake.rel;
-    var other_value = std.mem.zeroes(cef.cef_value_t);
-    other_value.base.release = Fake.rel;
 
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    defer ViewConstructionTest.closeOutboxFds(&out);
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+    try host.contexts.append(host.gpa, .{ .id = 7, .rc = &rc, .ephemeral = true });
+
+    var injected: ViewConstructionTest = .{};
+    var spawn_ops = injected.ops();
+    try host.createViewAtWith(ViewConstructionTest.req(91, 7), "", &spawn_ops);
+    try std.testing.expectEqual(@as(usize, 1), injected.browser_calls);
+    try std.testing.expectEqual(@as(usize, 0), Fake.added);
+
+    host.contextDestroy(7);
+    try std.testing.expectEqual(@as(usize, 1), Fake.released);
+}
+
+test "a document replacement disconnects the ports bound to that view" {
+    // A content script's `runtime.connect` Port dies with its document.
+    // The table kept it, so ports accumulated for the life of the helper
+    // and a background page could still message a page that was gone.
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    defer ViewConstructionTest.closeOutboxFds(&out);
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+
+    const page = try host.registerView(ViewConstructionTest.req(11, 0));
+    const bg = try host.registerView(ViewConstructionTest.req(12, 0));
+    const other = try host.registerView(ViewConstructionTest.req(13, 0));
+    try host.webext_ports.append(host.gpa, .{
+        .gid = 1,
+        .ext = try host.gpa.dupe(u8, "ext@example"),
+        .a_view = page.id,
+        .b_view = bg.id,
+    });
+    // A port between two OTHER views must survive this navigation.
+    try host.webext_ports.append(host.gpa, .{
+        .gid = 2,
+        .ext = try host.gpa.dupe(u8, "ext@example"),
+        .a_view = other.id,
+        .b_view = bg.id,
+    });
+
+    host.semanticNavigationStarted(page);
+    try std.testing.expectEqual(@as(usize, 1), host.webext_ports.items.len);
+    try std.testing.expectEqual(@as(u32, 2), host.webext_ports.items[0].gid);
+}
+
+/// Fake engine objects for driving a callback directly: the only live
+/// vtable slots count releases and answer the identity lookups.
+const CallbackArgTest = struct {
+    const cef_id: c_int = 4242;
+    var browser: cef.cef_browser_t = undefined;
+    var frame: cef.cef_frame_t = undefined;
+    var released: usize = 0;
+
+    fn rel(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+        released += 1;
+        return 1;
+    }
+
+    fn ident(_: [*c]cef.cef_browser_t) callconv(.c) c_int {
+        return cef_id;
+    }
+
+    fn mainFrame(_: [*c]cef.cef_frame_t) callconv(.c) c_int {
+        return 1;
+    }
+
+    fn reset() void {
+        released = 0;
+        browser = std.mem.zeroes(cef.cef_browser_t);
+        browser.base.release = rel;
+        browser.get_identifier = ident;
+        frame = std.mem.zeroes(cef.cef_frame_t);
+        frame.base.release = rel;
+        frame.is_main = mainFrame;
+    }
+};
+
+test "releaseArg returns exactly one reference and tolerates null" {
+    CallbackArgTest.reset();
+    releaseArg(@as([*c]cef.cef_browser_t, &CallbackArgTest.browser));
+    releaseArg(@as([*c]cef.cef_browser_t, null));
+    try std.testing.expectEqual(@as(usize, 1), CallbackArgTest.released);
+}
+
+test "a background page replacing its document drops its ports and returns every argument" {
+    // `on_load_start` used to leave a background page before the Port
+    // sweep, so a `location.href` replacement kept its ports alive; and
+    // every callback used to keep the reference libcef wraps each
+    // argument with, which is the per-request leak the helper carried.
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    defer ViewConstructionTest.closeOutboxFds(&out);
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+    g_host = &host;
+    defer g_host = null;
+
+    const page = try host.registerView(ViewConstructionTest.req(21, 0));
+    const bg = try host.registerView(ViewConstructionTest.req(22, 0));
+    bg.webext_bg = true;
+    bg.cef_id = CallbackArgTest.cef_id;
+    try host.webext_ports.append(host.gpa, .{
+        .gid = 1,
+        .ext = try host.gpa.dupe(u8, "ext@example"),
+        .a_view = page.id,
+        .b_view = bg.id,
+    });
+
+    CallbackArgTest.reset();
+    onLoadStart(null, &CallbackArgTest.browser, &CallbackArgTest.frame, 0);
+    try std.testing.expectEqual(@as(usize, 0), host.webext_ports.items.len);
+    try std.testing.expectEqual(@as(usize, 2), CallbackArgTest.released);
+}
+
+/// A `cef_request_context_t` whose only live vtable slot counts releases.
+const ContextCreateTest = struct {
+    var rc: cef.cef_request_context_t = undefined;
+    var released: usize = 0;
+
+    fn rel(_: [*c]cef.cef_base_ref_counted_t) callconv(.c) c_int {
+        released += 1;
+        return 1;
+    }
+
+    fn create(_: ?*anyopaque, _: *const cef.cef_request_context_settings_t) ?*cef.cef_request_context_t {
+        rc = std.mem.zeroes(cef.cef_request_context_t);
+        rc.base.base.release = rel;
+        return &rc;
+    }
+
+    fn ops() ContextCreateOps {
+        released = 0;
+        return .{ .create = create };
+    }
+};
+
+test "a context whose proxy is refused registers nothing and releases once" {
+    // The rollback used to release a value graph `set_preference` had
+    // already consumed. Nothing but the request context is ours to drop
+    // here, and it is dropped exactly once. The create path retains no
+    // CEF object at all any more, so this is the whole contract.
     var out = proto.Outbox.init(std.testing.allocator);
     defer out.deinit();
     var host = Host.init(std.testing.allocator, &out);
     defer host.deinit();
-    try host.contexts.append(host.gpa, .{ .id = 5, .rc = &rc, .ephemeral = true });
-    try host.contexts.append(host.gpa, .{ .id = 6, .rc = &other_rc, .ephemeral = true });
-    try host.proxy_prefs.append(host.gpa, .{ .context = 5, .dict = &dict, .value = &value });
-    try host.proxy_prefs.append(host.gpa, .{ .context = 6, .dict = &other_dict, .value = &other_value });
+
+    var context_ops = ContextCreateTest.ops();
+    _ = c.setenv("SKETERM_WEB_FAIL_PROXY", "1", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_FAIL_PROXY");
+    host.contextCreateWith(.{
+        .id = 5,
+        .ephemeral = 1,
+        .name = "proxy-refused",
+        .proxy = "socks5://127.0.0.1:9",
+    }, &context_ops);
+
+    try std.testing.expectEqual(@as(usize, 1), ContextCreateTest.released);
+    try std.testing.expectEqual(@as(usize, 0), host.contexts.items.len);
+    try std.testing.expect(host.lookupContext(5) == null);
+}
+
+test "an accepted context is released exactly once, by its destroy" {
+    // The counterpart: a registration that survived holds ONE reference,
+    // and `contextDestroy` is the only thing that drops it. A retained
+    // proxy value graph would show up here as extra releases.
+    var out = proto.Outbox.init(std.testing.allocator);
+    defer out.deinit();
+    var host = Host.init(std.testing.allocator, &out);
+    defer host.deinit();
+
+    var context_ops = ContextCreateTest.ops();
+    host.contextCreateWith(.{ .id = 5, .ephemeral = 1, .name = "kept", .proxy = "" }, &context_ops);
+    try std.testing.expectEqual(@as(usize, 0), ContextCreateTest.released);
+    try std.testing.expectEqual(@as(usize, 1), host.contexts.items.len);
+    try std.testing.expect(host.lookupContext(5) != null);
 
     host.contextDestroy(5);
-
-    // The context reference plus both halves of its value graph.
-    try std.testing.expectEqual(@as(usize, 3), Fake.released);
-    try std.testing.expectEqual(@as(usize, 1), host.proxy_prefs.items.len);
-    try std.testing.expectEqual(@as(u32, 6), host.proxy_prefs.items[0].context);
-
-    // A surviving container keeps its own graph until it is destroyed.
-    host.contextDestroy(6);
-    try std.testing.expectEqual(@as(usize, 6), Fake.released);
-    try std.testing.expectEqual(@as(usize, 0), host.proxy_prefs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ContextCreateTest.released);
+    try std.testing.expectEqual(@as(usize, 0), host.contexts.items.len);
 }
 
 test "a persistent jar directory is named by the id its OWNER minted" {
@@ -8306,11 +8473,14 @@ var cookie_access_filter: cef.cef_cookie_access_filter_t = undefined;
 /// CEF version away from a surprise.
 fn onCanSendCookie(
     _: [*c]cef.cef_cookie_access_filter_t,
-    _: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
-    _: [*c]cef.cef_request_t,
+    browser: [*c]cef.cef_browser_t,
+    frame: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
     _: [*c]const cef.cef_cookie_t,
 ) callconv(.c) c_int {
+    releaseArg(browser);
+    releaseArg(frame);
+    releaseArg(request);
     return 1;
 }
 
@@ -8318,11 +8488,15 @@ fn onCanSendCookie(
 fn onCanSaveCookie(
     _: [*c]cef.cef_cookie_access_filter_t,
     browser: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
+    frame: [*c]cef.cef_frame_t,
     request: [*c]cef.cef_request_t,
-    _: [*c]cef.cef_response_t,
+    response: [*c]cef.cef_response_t,
     cookie: [*c]const cef.cef_cookie_t,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(request);
+    defer releaseArg(response);
     if (!g_cksync.on.load(.acquire)) return 1;
     const ck: *const cef.cef_cookie_t = cookie orelse return 1;
 
@@ -8390,10 +8564,13 @@ fn copyInto(buf: []u8, len: *usize, src: []const u8) bool {
 /// helper never even constructs the filter path.
 fn onGetCookieAccessFilter(
     _: [*c]cef.cef_resource_request_handler_t,
-    _: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
-    _: [*c]cef.cef_request_t,
+    browser: [*c]cef.cef_browser_t,
+    frame: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
 ) callconv(.c) [*c]cef.cef_cookie_access_filter_t {
+    releaseArg(browser);
+    releaseArg(frame);
+    releaseArg(request);
     if (!g_cksync.on.load(.acquire)) return null;
     return &cookie_access_filter;
 }
@@ -9023,6 +9200,7 @@ fn subOnDownloadData(
     data: ?*const anyopaque,
     len: usize,
 ) callconv(.c) void {
+    defer releaseArg(request);
     const f: *FilterFetch = SubRef.owner(@ptrCast(self_));
     if (f.lost or len == 0) return;
     // A list that grows past this is not a list we want to load either;
@@ -9044,6 +9222,7 @@ fn subOnComplete(
     self_: [*c]cef.cef_urlrequest_client_t,
     request: [*c]cef.cef_urlrequest_t,
 ) callconv(.c) void {
+    defer releaseArg(request);
     const f: *FilterFetch = SubRef.owner(@ptrCast(self_));
     f.status_ok = false;
     f.response_ok = false;
@@ -9063,13 +9242,16 @@ fn subOnComplete(
     f.completed = true;
 }
 
-fn subOnUploadProgress(_: [*c]cef.cef_urlrequest_client_t, _: [*c]cef.cef_urlrequest_t, _: i64, _: i64) callconv(.c) void {}
+fn subOnUploadProgress(_: [*c]cef.cef_urlrequest_client_t, request: [*c]cef.cef_urlrequest_t, _: i64, _: i64) callconv(.c) void {
+    releaseArg(request);
+}
 fn subOnDownloadProgress(
     self_: [*c]cef.cef_urlrequest_client_t,
     request: [*c]cef.cef_urlrequest_t,
     _: i64,
     total: i64,
 ) callconv(.c) void {
+    defer releaseArg(request);
     if (total <= filter_list_max) return;
     const f: *FilterFetch = SubRef.owner(@ptrCast(self_));
     f.lost = true;
@@ -9084,10 +9266,11 @@ fn subGetAuthCredentials(
     _: c_int,
     _: [*c]const cef.cef_string_t,
     _: [*c]const cef.cef_string_t,
-    _: [*c]cef.cef_auth_callback_t,
+    callback: [*c]cef.cef_auth_callback_t,
 ) callconv(.c) c_int {
     // Never authenticate to a filter-list host: a subscription is a
     // public url, and a prompt here has no user to answer it.
+    releaseArg(callback);
     return 0;
 }
 
@@ -9900,10 +10083,19 @@ fn userfreeInto(raw: cef.cef_string_userfree_t, buf: []u8) []const u8 {
 fn onBeforeResourceLoad(
     _: [*c]cef.cef_resource_request_handler_t,
     browser: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
+    frame: [*c]cef.cef_frame_t,
     request: [*c]cef.cef_request_t,
     callback: [*c]cef.cef_callback_t,
 ) callconv(.c) cef.cef_return_value_t {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    // A hold KEEPS `request` and `callback` (the answer path releases
+    // them); every other exit gives their references back here.
+    var held = false;
+    defer if (!held) {
+        releaseArg(request);
+        releaseArg(callback);
+    };
     const req: *cef.cef_request_t = request orelse return cef.RV_CONTINUE;
     // Service-worker / urlrequest traffic has no browser and thus no
     // view to attribute it to; it passes unfiltered (matching without
@@ -10049,10 +10241,10 @@ fn onBeforeResourceLoad(
     if (verdict) return cef.RV_CANCEL;
     if (!shield_on) return cef.RV_CONTINUE;
 
-    if (wreqConsider(req, callback, url_unf, method, wreqTypeOf(
+    held = wreqConsider(req, callback, url_unf, method, wreqTypeOf(
         if (req.get_resource_type) |grt| grt(req) else cef.RT_SUB_RESOURCE,
-    ), view_id)) return cef.RV_CONTINUE_ASYNC;
-    return cef.RV_CONTINUE;
+    ), view_id);
+    return if (held) cef.RV_CONTINUE_ASYNC else cef.RV_CONTINUE;
 }
 
 /// IO THREAD. `onHeadersReceived`, observationally.
@@ -10072,12 +10264,15 @@ fn onBeforeResourceLoad(
 fn onResourceResponse(
     _: [*c]cef.cef_resource_request_handler_t,
     browser: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
+    frame: [*c]cef.cef_frame_t,
     request: [*c]cef.cef_request_t,
     response: [*c]cef.cef_response_t,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(request);
+    defer releaseArg(response);
     const req: *cef.cef_request_t = request orelse return 0;
-    _ = browser;
     if (!webrequest.any_listeners.load(.acquire)) return 0;
 
     var url_raw: [2048]u8 = undefined;
@@ -10189,12 +10384,16 @@ fn wreqResponseHeadersJson(resp: *cef.cef_response_t, out: []u8) u16 {
 fn onResourceLoadComplete(
     _: [*c]cef.cef_resource_request_handler_t,
     browser: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
+    frame: [*c]cef.cef_frame_t,
     request: [*c]cef.cef_request_t,
     response: [*c]cef.cef_response_t,
     _: cef.cef_urlrequest_status_t,
     received: i64,
 ) callconv(.c) void {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(request);
+    defer releaseArg(response);
     const req: *cef.cef_request_t = request orelse return;
     const b: *cef.cef_browser_t = browser orelse return;
     const gi = b.get_identifier orelse return;
@@ -10680,10 +10879,11 @@ fn wreqConsider(
     setHoldLids(h, .before_send_headers, &need_send);
 
     if (blocking) {
+        // The hold KEEPS the references the callback received with
+        // `cb` and `req` (the caller releases them only when this
+        // returns false), so no add_ref: one would never be paid back.
         h.cb = cb;
         h.req = req;
-        if (cb) |x| if (x.base.add_ref) |ar| ar(&x.base);
-        if (req.base.add_ref) |ar| ar(&req.base);
         if (st) |s| s.held +%= 1;
     }
     _ = g_wreq.outstanding.fetchAdd(1, .release);
@@ -10820,14 +11020,17 @@ pub fn webrequestDeinit() void {
 
 fn onGetResourceRequestHandler(
     _: [*c]cef.cef_request_handler_t,
-    _: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
-    _: [*c]cef.cef_request_t,
+    browser: [*c]cef.cef_browser_t,
+    frame: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
     _: c_int,
     _: c_int,
     _: [*c]const cef.cef_string_t,
     _: [*c]c_int,
 ) callconv(.c) [*c]cef.cef_resource_request_handler_t {
+    releaseArg(browser);
+    releaseArg(frame);
+    releaseArg(request);
     return &resource_request_handler;
 }
 
@@ -10910,6 +11113,14 @@ fn release(base: *cef.cef_base_ref_counted_t) void {
     if (base.release) |r| _ = r(base);
 }
 
+/// Release the reference libcef hands over with every ref-counted
+/// argument of a callback (see "Reference ownership" in CLAUDE.md).
+/// Null-tolerant, so an optional `[*c]` parameter goes in as is.
+fn releaseArg(arg: anytype) void {
+    if (arg == null) return;
+    release(&arg.*.base);
+}
+
 fn setStr(utf8: []const u8, out: *cef.cef_string_t) void {
     _ = cef.cef_string_utf8_to_utf16(utf8.ptr, utf8.len, out);
 }
@@ -10937,22 +11148,31 @@ fn sanitizeContextName(name: []const u8, id: u32, buf: *[256]u8) []const u8 {
 /// browser spike proved: `set_preference("proxy", {mode:"fixed_servers",
 /// server:<url>})` on the context's base preference manager. A socks5
 /// url makes the engine resolve DNS at the proxy end — the "browse via
-/// server X" property. Null leaves the caller responsible for dropping the
+/// server X" property. False leaves the caller responsible for dropping the
 /// request context before any view can use it.
-fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) ?ProxyPref {
+///
+/// Nothing built here outlives the call. A `cef_*_t*` handed to a CEF
+/// function as a NON-SELF argument is a `refptr_same` transfer: the
+/// receiving side releases one reference at parameter-unwrap time, BEFORE
+/// the method body runs and whether it then succeeds or fails. So each
+/// transfer latch below is set BEFORE its consuming call, and the pointer
+/// is dangling from that point on: storing it, reading it or releasing it
+/// afterwards is a use-after-free. Retaining this value graph past
+/// `set_preference` is not merely unnecessary, it is unexpressible.
+fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) bool {
     // Deterministic smoke seam for the otherwise engine-controlled refusal.
-    if (c.getenv("SKETERM_WEB_FAIL_PROXY") != null) return null;
+    if (c.getenv("SKETERM_WEB_FAIL_PROXY") != null) return false;
 
-    const dict: *cef.cef_dictionary_value_t = cef.cef_dictionary_value_create() orelse return null;
-    var keep_dict = false;
-    defer if (!keep_dict) release(&dict.base);
+    const dict: *cef.cef_dictionary_value_t = cef.cef_dictionary_value_create() orelse return false;
+    var dict_transferred = false;
+    defer if (!dict_transferred) release(&dict.base);
     var mode_key = std.mem.zeroes(cef.cef_string_t);
     defer cef.cef_string_utf16_clear(&mode_key);
     var mode_value = std.mem.zeroes(cef.cef_string_t);
     defer cef.cef_string_utf16_clear(&mode_value);
     setStr("mode", &mode_key);
     setStr("fixed_servers", &mode_value);
-    if ((dict.set_string orelse return null)(dict, &mode_key, &mode_value) == 0) return null;
+    if ((dict.set_string orelse return false)(dict, &mode_key, &mode_value) == 0) return false;
 
     var server_key = std.mem.zeroes(cef.cef_string_t);
     defer cef.cef_string_utf16_clear(&server_key);
@@ -10960,7 +11180,7 @@ fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) ?ProxyPref 
     defer cef.cef_string_utf16_clear(&server_value);
     setStr("server", &server_key);
     setStr(proxy_url, &server_value);
-    if ((dict.set_string orelse return null)(dict, &server_key, &server_value) == 0) return null;
+    if ((dict.set_string orelse return false)(dict, &server_key, &server_value) == 0) return false;
 
     // Chromium otherwise bypasses localhost implicitly. Tor/egress routing is
     // fail-closed only when loopback destinations traverse the fixed proxy too.
@@ -10970,24 +11190,27 @@ fn applyProxy(rc: *cef.cef_request_context_t, proxy_url: []const u8) ?ProxyPref 
     defer cef.cef_string_utf16_clear(&bypass_value);
     setStr("bypass_list", &bypass_key);
     setStr("<-loopback>", &bypass_value);
-    if ((dict.set_string orelse return null)(dict, &bypass_key, &bypass_value) == 0) return null;
+    if ((dict.set_string orelse return false)(dict, &bypass_key, &bypass_value) == 0) return false;
 
-    const val: *cef.cef_value_t = cef.cef_value_create() orelse return null;
-    var keep_value = false;
-    defer if (!keep_value) release(&val.base);
-    if ((val.set_dictionary orelse return null)(val, dict) == 0) return null;
+    const val: *cef.cef_value_t = cef.cef_value_create() orelse return false;
+    var value_transferred = false;
+    defer if (!value_transferred) release(&val.base);
+    // `dict` is consumed on receipt here, pass or fail: latch first.
+    const set_dict = val.set_dictionary orelse return false;
+    dict_transferred = true;
+    if (set_dict(val, dict) == 0) return false;
 
     var pref_key = std.mem.zeroes(cef.cef_string_t);
     defer cef.cef_string_utf16_clear(&pref_key);
     setStr("proxy", &pref_key);
     var err = std.mem.zeroes(cef.cef_string_t);
     defer cef.cef_string_utf16_clear(&err);
+    // The preference manager is the SELF argument (retrieved with `Get()`,
+    // no refcounting); `val` is not, and is consumed on receipt.
     const base: *cef.cef_preference_manager_t = &rc.base;
-    if ((base.set_preference orelse return null)(base, &pref_key, val, &err) == 0) return null;
-    keep_dict = true;
-    keep_value = true;
-    // `context` is stamped by the caller, which owns the registration.
-    return .{ .context = 0, .dict = dict, .value = val };
+    const set_pref = base.set_preference orelse return false;
+    value_transferred = true;
+    return set_pref(base, &pref_key, val, &err) != 0;
 }
 
 /// Borrowed UTF-8 view of a CEF string; `free` releases it.
@@ -11237,11 +11460,14 @@ var g_ext_refusal_logged = false;
 
 fn extSchemeCreate(
     _: [*c]cef.cef_scheme_handler_factory_t,
-    _: [*c]cef.cef_browser_t,
+    browser: [*c]cef.cef_browser_t,
     frame: [*c]cef.cef_frame_t,
     _: [*c]const cef.cef_string_t,
     request: [*c]cef.cef_request_t,
 ) callconv(.c) [*c]cef.cef_resource_handler_t {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(request);
     const req: *cef.cef_request_t = request orelse return null;
     const gu = req.get_url orelse return null;
     var url_buf: [2048]u8 = undefined;
@@ -11576,10 +11802,12 @@ fn extResourceOwned(data: []u8, mime: []const u8, status: c_int) [*c]cef.cef_res
 
 fn extResOpen(
     self: [*c]cef.cef_resource_handler_t,
-    _: [*c]cef.cef_request_t,
+    request: [*c]cef.cef_request_t,
     handle_request: [*c]c_int,
-    _: [*c]cef.cef_callback_t,
+    callback: [*c]cef.cef_callback_t,
 ) callconv(.c) c_int {
+    releaseArg(request);
+    releaseArg(callback);
     _ = ExtResource.fromSelf(self) orelse return 0;
     // The bytes are already in hand, so this is the synchronous form:
     // handled immediately, no callback, no second thread.
@@ -11593,6 +11821,7 @@ fn extResHeaders(
     response_length: [*c]i64,
     _: [*c]cef.cef_string_t,
 ) callconv(.c) void {
+    defer releaseArg(response);
     const r = ExtResource.fromSelf(self) orelse return;
     const resp: *cef.cef_response_t = response orelse return;
     if (resp.set_status) |ss| ss(resp, r.status);
@@ -11630,8 +11859,9 @@ fn extResRead(
     data_out: ?*anyopaque,
     bytes_to_read: c_int,
     bytes_read: [*c]c_int,
-    _: [*c]cef.cef_resource_read_callback_t,
+    callback: [*c]cef.cef_resource_read_callback_t,
 ) callconv(.c) c_int {
+    releaseArg(callback);
     const r = ExtResource.fromSelf(self) orelse return 0;
     if (bytes_read) |br| br.* = 0;
     if (r.offset >= r.data.len) return 0;
@@ -11847,6 +12077,7 @@ fn onBeforeChildProcessLaunch(
     _: [*c]cef.cef_browser_process_handler_t,
     command_line: [*c]cef.cef_command_line_t,
 ) callconv(.c) void {
+    defer releaseArg(command_line);
     if (!sem_secret.ok) return;
     const cl: *cef.cef_command_line_t = command_line orelse return;
     const add = cl.append_switch_with_value orelse return;
@@ -12024,6 +12255,9 @@ fn onProcessMessage(
     _: cef.cef_process_id_t,
     message: [*c]cef.cef_process_message_t,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(message);
     const host = g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     var payload = semPayload(message) orelse return 0;
@@ -12072,6 +12306,7 @@ fn onGetViewRect(
     browser: [*c]cef.cef_browser_t,
     rect: [*c]cef.cef_rect_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     const v = viewOf(browser) orelse {
         rect.* = .{ .x = 0, .y = 0, .width = 1, .height = 1 };
         return;
@@ -12095,6 +12330,7 @@ fn onGetScreenInfo(
     browser: [*c]cef.cef_browser_t,
     info: [*c]cef.cef_screen_info_t,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
     const v = viewOf(browser) orelse return 0;
     info.* = std.mem.zeroes(cef.cef_screen_info_t);
     info.*.size = @sizeOf(cef.cef_screen_info_t);
@@ -12459,7 +12695,18 @@ fn axDebug() bool {
     return g_ax_debug == .on;
 }
 
-fn axDump(label: []const u8, value: [*c]cef.cef_value_t) void {
+/// Print one serialized accessibility payload as JSON.
+///
+/// `value` is a NON-SELF argument of `cef_write_json`, so the wrapper
+/// releases one reference on receipt, before writing anything. The caller
+/// holds the only reference to the callback parameter it passes here and
+/// keeps reading it afterwards, so the debug dump pays for its own
+/// consumption with an add_ref rather than donating the caller's.
+fn axDump(label: []const u8, value: *cef.cef_value_t) void {
+    // `cef_write_json` consumes one reference; without a way to pay for
+    // it the caller's only reference would be donated, so dump nothing.
+    const add = value.base.add_ref orelse return;
+    add(&value.base);
     const raw = cef.cef_write_json(value, cef.JSON_WRITER_DEFAULT);
     if (raw == null) return;
     defer cef.cef_string_userfree_utf16_free(raw);
@@ -12655,6 +12902,7 @@ fn onAxTreeChange(
     _: [*c]cef.cef_accessibility_handler_t,
     value: [*c]cef.cef_value_t,
 ) callconv(.c) void {
+    defer releaseArg(value);
     const host = g_host orelse return;
     const val: *cef.cef_value_t = value orelse return;
     if (axDebug()) axDump("tree", val);
@@ -12708,6 +12956,7 @@ fn onAxLocationChange(
     _: [*c]cef.cef_accessibility_handler_t,
     value: [*c]cef.cef_value_t,
 ) callconv(.c) void {
+    defer releaseArg(value);
     const host = g_host orelse return;
     const val: *cef.cef_value_t = value orelse return;
     if (axDebug()) axDump("loc", val);
@@ -12768,6 +13017,7 @@ fn onFindResult(
     active_match_ordinal: c_int,
     final_update: c_int,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     host.post(proto.EvFindResult{
@@ -12787,11 +13037,16 @@ fn onFindResult(
 fn onRunContextMenu(
     _: [*c]cef.cef_context_menu_handler_t,
     browser: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
+    frame: [*c]cef.cef_frame_t,
     params: [*c]cef.cef_context_menu_params_t,
-    _: [*c]cef.cef_menu_model_t,
+    model: [*c]cef.cef_menu_model_t,
     callback: [*c]cef.cef_run_context_menu_callback_t,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(params);
+    defer releaseArg(model);
+    defer releaseArg(callback);
     if (callback) |cb| {
         if (cb.*.cancel) |cancel| cancel(cb);
     }
@@ -12881,6 +13136,7 @@ fn onScrollOffsetChanged(
     x: f64,
     y: f64,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     v.scroll_x = @intFromFloat(@max(-2_000_000.0, @min(2_000_000.0, x)));
@@ -12903,6 +13159,7 @@ fn onPaint(
     width: c_int,
     height: c_int,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     if (ptype != cef.PET_VIEW) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
@@ -12997,6 +13254,7 @@ fn onAcceleratedPaint(
     _: [*c]const cef.cef_rect_t,
     info: [*c]const cef.cef_accelerated_paint_info_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     // macOS hands this callback an IOSurface, not dma-buf planes:
     // `cef_accelerated_paint_info_t` there is
     // {shared_texture_io_surface, format, extra} with no `planes` array
@@ -13091,9 +13349,11 @@ fn copyRect(v: *View, src: [*]const u8, stride: usize, x: u16, y: u16, w: u16, h
 fn onAddressChange(
     _: [*c]cef.cef_display_handler_t,
     browser: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
+    frame: [*c]cef.cef_frame_t,
     url: [*c]const cef.cef_string_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     var s = Utf8.init(url);
@@ -13108,6 +13368,7 @@ fn onTitleChange(
     browser: [*c]cef.cef_browser_t,
     title: [*c]const cef.cef_string_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     var s = Utf8.init(title);
@@ -13121,6 +13382,7 @@ fn onFaviconChange(
     browser: [*c]cef.cef_browser_t,
     icon_urls: cef.cef_string_list_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     if (v.webext_bg) return;
@@ -13141,6 +13403,7 @@ fn onConsoleMessage(
     _: [*c]const cef.cef_string_t,
     _: c_int,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
     const host = g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     var s = Utf8.init(message);
@@ -13160,6 +13423,7 @@ fn onCursorChange(
     ctype: cef.cef_cursor_type_t,
     _: [*c]const cef.cef_cursor_info_t,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
     const host = g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     const mapped: proto.Cursor = switch (ctype) {
@@ -13183,7 +13447,7 @@ fn onCursorChange(
 fn onBeforePopup(
     _: [*c]cef.cef_life_span_handler_t,
     browser: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
+    frame: [*c]cef.cef_frame_t,
     _: c_int,
     target_url: [*c]const cef.cef_string_t,
     _: [*c]const cef.cef_string_t,
@@ -13196,6 +13460,8 @@ fn onBeforePopup(
     _: [*c][*c]cef.cef_dictionary_value_t,
     _: [*c]c_int,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
     const host = g_host orelse return 1;
     const v = viewOf(browser) orelse return 1;
     var s = Utf8.init(target_url);
@@ -13235,6 +13501,7 @@ fn onBeforeClose(
     _: [*c]cef.cef_life_span_handler_t,
     browser: [*c]cef.cef_browser_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     if (open_browsers > 0) open_browsers -= 1;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
@@ -13245,6 +13512,10 @@ fn onAfterCreated(
     _: [*c]cef.cef_life_span_handler_t,
     browser: [*c]cef.cef_browser_t,
 ) callconv(.c) void {
+    // Adoption keeps the reference this callback received as
+    // `v.browser`; every other exit returns it.
+    var adopted = false;
+    defer if (!adopted) releaseArg(browser);
     open_browsers += 1;
     const host = g_host orelse return;
     const b: *cef.cef_browser_t = browser orelse return;
@@ -13267,6 +13538,7 @@ fn onAfterCreated(
     const v = host.adopting orelse return;
     if (v.browser != null) return;
     host.adoptBrowser(v, b);
+    adopted = true;
 }
 
 fn onPdfPrintFinished(
@@ -13287,6 +13559,7 @@ fn onLoadingStateChange(
     can_back: c_int,
     can_fwd: c_int,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     if (v.webext_bg) return;
@@ -13315,14 +13588,20 @@ fn onLoadStart(
     frame: [*c]cef.cef_frame_t,
     _: cef.cef_transition_type_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
+    const main = isMainFrame(frame);
     // A hidden background page never faces the client: no zoom, no load
     // events. Its scripts arrive at load end (or, on the origin path,
-    // from the document itself).
-    if (v.webext_bg or v.webext_popup) return;
+    // from the document itself). Its Ports still die with its document,
+    // exactly as a page's do below.
+    if (v.webext_bg or v.webext_popup) {
+        if (main) host.portsAbandonView(v.id);
+        return;
+    }
     const f = frame orelse return;
-    const main = isMainFrame(frame);
     // A SUBFRAME reaches this hook too, and only for the extension
     // injection: `all_frames` content scripts belong in it. Everything
     // else below is per-DOCUMENT and stays main-frame-only.
@@ -13351,6 +13630,8 @@ fn onLoadEnd(
     frame: [*c]cef.cef_frame_t,
     _: c_int,
 ) callconv(.c) void {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     if (v.webext_bg) {
@@ -13389,6 +13670,8 @@ fn onLoadError(
     text: [*c]const cef.cef_string_t,
     failed_url: [*c]const cef.cef_string_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
     if (!isMainFrame(frame)) return;
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
@@ -13452,6 +13735,7 @@ fn onRenderProcessTerminated(
     _: c_int,
     _: [*c]const cef.cef_string_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     const host = g_host orelse return;
     const v = viewOf(browser) orelse return;
     while (v.pending.items.len > 0) {
@@ -13540,6 +13824,12 @@ fn onCertificateError(
     ssl_info: [*c]cef.cef_sslinfo_t,
     callback: [*c]cef.cef_callback_t,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
+    defer releaseArg(ssl_info);
+    // A held interstitial keeps the callback's reference; `cert_cb`'s
+    // answer path releases it.
+    var kept = false;
+    defer if (!kept) releaseArg(callback);
     const host = g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     const cb: *cef.cef_callback_t = callback orelse return 0;
@@ -13556,6 +13846,7 @@ fn onCertificateError(
     const cert = certDetails(ssl_info, &subject, &issuer, &fingerprint);
 
     v.cert_cb = cb;
+    kept = true;
     host.post(proto.EvCertError{
         .view = v.id,
         .code = @intCast(cert_error),
@@ -13718,6 +14009,9 @@ fn onShowPermissionPrompt(
     requested_permissions: u32,
     callback: [*c]cef.cef_permission_prompt_callback_t,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
+    var kept = false;
+    defer if (!kept) releaseArg(callback);
     const host = g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     const cb: *cef.cef_permission_prompt_callback_t = callback orelse return 0;
@@ -13729,6 +14023,7 @@ fn onShowPermissionPrompt(
     var origin = Utf8.init(requesting_origin);
     defer origin.free();
     slot.* = .{ .id = prompt_id, .prompt_cb = cb };
+    kept = true;
     host.post(proto.EvPermission{
         .view = v.id,
         .prompt = prompt_id,
@@ -13743,11 +14038,15 @@ fn onShowPermissionPrompt(
 fn onRequestMediaAccess(
     _: [*c]cef.cef_permission_handler_t,
     browser: [*c]cef.cef_browser_t,
-    _: [*c]cef.cef_frame_t,
+    frame: [*c]cef.cef_frame_t,
     requesting_origin: [*c]const cef.cef_string_t,
     requested_permissions: u32,
     callback: [*c]cef.cef_media_access_callback_t,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    var kept = false;
+    defer if (!kept) releaseArg(callback);
     const host = g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     const cb: *cef.cef_media_access_callback_t = callback orelse return 0;
@@ -13765,6 +14064,7 @@ fn onRequestMediaAccess(
     var origin = Utf8.init(requesting_origin);
     defer origin.free();
     slot.* = .{ .id = id, .media_cb = cb, .media_bits = requested_permissions };
+    kept = true;
     host.post(proto.EvPermission{
         .view = v.id,
         .prompt = id,
@@ -13784,6 +14084,7 @@ fn onDismissPermissionPrompt(
     prompt_id: u64,
     _: cef.cef_permission_request_result_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
     const v = viewOf(browser) orelse return;
     for (&v.perms) |*p| {
         if (p.busy() and p.id == prompt_id) {
@@ -13803,10 +14104,11 @@ fn onDismissPermissionPrompt(
 /// would cancel silently, and the policy question belongs to the GUI.
 fn onCanDownload(
     _: [*c]cef.cef_download_handler_t,
-    _: [*c]cef.cef_browser_t,
+    browser: [*c]cef.cef_browser_t,
     _: [*c]const cef.cef_string_t,
     _: [*c]const cef.cef_string_t,
 ) callconv(.c) c_int {
+    releaseArg(browser);
     return 1;
 }
 
@@ -13826,6 +14128,10 @@ fn onBeforeDownload(
     suggested_name: [*c]const cef.cef_string_t,
     callback: [*c]cef.cef_before_download_callback_t,
 ) callconv(.c) c_int {
+    defer releaseArg(browser);
+    defer releaseArg(download_item);
+    var kept = false;
+    defer if (!kept) releaseArg(callback);
     const host = g_host orelse return 0;
     const v = viewOf(browser) orelse return 0;
     const item: *cef.cef_download_item_t = download_item orelse return 0;
@@ -13839,6 +14145,7 @@ fn onBeforeDownload(
         if (t > 0) d.total = @intCast(t);
     }
     d.before_cb = cb;
+    kept = true;
     d.offered = true;
 
     var name = Utf8.init(suggested_name);
@@ -13868,6 +14175,12 @@ fn onDownloadUpdated(
     download_item: [*c]cef.cef_download_item_t,
     callback: [*c]cef.cef_download_item_callback_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
+    defer releaseArg(download_item);
+    // The entry keeps the callback's reference as its cancel handle;
+    // every other exit returns it.
+    var kept = false;
+    defer if (!kept) releaseArg(callback);
     const host = g_host orelse return;
     const item: *cef.cef_download_item_t = download_item orelse return;
     const id: u32 = if (item.get_id) |gid| gid(item) else return;
@@ -13880,10 +14193,7 @@ fn onDownloadUpdated(
     }
     const view_id: u32 = if (viewOf(browser)) |v| v.id else 0;
     const cb_arg: ?*cef.cef_download_item_callback_t = callback;
-    const d = (found orelse dlSlot(host, view_id, id)) orelse {
-        if (cb_arg) |cb| release(&cb.base);
-        return;
-    };
+    const d = (found orelse dlSlot(host, view_id, id)) orelse return;
 
     if (item.get_received_bytes) |gr| {
         const r = gr(item);
@@ -13908,12 +14218,12 @@ fn onDownloadUpdated(
     }
     if (cb_arg) |cb| {
         if (d.terminal()) {
-            release(&cb.base);
+            // Spent: the deferred release returns it.
         } else if (d.cancel_requested) {
             if (cb.cancel) |f| f(cb);
-            release(&cb.base);
         } else {
             d.item_cb = cb;
+            kept = true;
         }
     }
 }
@@ -13996,10 +14306,13 @@ fn onWebKitInitialized(_: [*c]cef.cef_render_process_handler_t) callconv(.c) voi
 /// `cef_v8_context_t::eval` is the one thing that works here.
 fn onContextCreated(
     _: [*c]cef.cef_render_process_handler_t,
-    _: [*c]cef.cef_browser_t,
+    browser: [*c]cef.cef_browser_t,
     frame: [*c]cef.cef_frame_t,
     context: [*c]cef.cef_v8_context_t,
 ) callconv(.c) void {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(context);
     const ctx: *cef.cef_v8_context_t = context orelse return;
     if (!sem_secret.ok) {
         // Without the secrets there is no authenticated channel, so the
@@ -14021,7 +14334,6 @@ fn onContextCreated(
     // That is what a browser with extensions does, and the alternative
     // (a second, smaller subframe script) is a copy that would have to
     // stay in sync with this one.
-    _ = frame;
     evalJs(ctx, injectSource() orelse return);
 }
 
@@ -14074,12 +14386,20 @@ fn runJs(frame: *cef.cef_frame_t, code: []const u8) void {
 fn onSemPost(
     _: [*c]cef.cef_v8_handler_t,
     _: [*c]const cef.cef_string_t,
-    _: [*c]cef.cef_v8_value_t,
+    object: [*c]cef.cef_v8_value_t,
     argc: usize,
     argv: [*c]const [*c]cef.cef_v8_value_t,
     _: [*c][*c]cef.cef_v8_value_t,
     _: [*c]cef.cef_string_t,
 ) callconv(.c) c_int {
+    defer releaseArg(object);
+    // Every element of `arguments` is wrapped with its own reference
+    // (refptr_vec_diff_byref_const); only the array itself is freed by
+    // the caller.
+    defer if (argv != null) {
+        var i: usize = 0;
+        while (i < argc) : (i += 1) releaseArg(argv[i]);
+    };
     if (argc < 1 or argv == null) return 0;
     const arg: *cef.cef_v8_value_t = argv[0] orelse return 0;
     const gs = arg.get_string_value orelse return 0;

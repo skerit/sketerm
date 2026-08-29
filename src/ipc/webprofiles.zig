@@ -339,7 +339,8 @@ pub const Store = struct {
 
     /// Erase a profile: drop the entry (so the next use mints a FRESH
     /// id, hence a fresh directory — a half-failed rmtree can never
-    /// resurface as "that profile's cookies") and remove its jar.
+    /// resurface as "that profile's cookies") and remove its jar, once
+    /// the engine has stopped writing to it (`awaitJarSettled`).
     /// @return false when the name was not known.
     pub fn retire(self: *Store, name: []const u8) Error!bool {
         if (self.degraded) return error.Io;
@@ -352,7 +353,10 @@ pub const Store = struct {
             // orphan dir, which sweepOrphans collects. The reverse order
             // would leave an entry pointing at nothing.
             const saved = self.save();
-            if (jar.len > 0) pathz.removeTree(jar);
+            if (jar.len > 0) {
+                awaitJarSettled(jar);
+                pathz.removeTree(jar);
+            }
             self.gpa.free(e.name);
             try saved;
             return true;
@@ -362,6 +366,72 @@ pub const Store = struct {
 
     pub fn list(self: *const Store) []const Entry {
         return self.entries.items;
+    }
+
+    /// How long a jar must stay untouched before it is removed, and the
+    /// bound on waiting for that.
+    ///
+    /// Releasing a request context's last reference tears the profile
+    /// down ASYNCHRONOUSLY, and that teardown WRITES: the prefs commit
+    /// and the cache index land a few milliseconds after the release,
+    /// recreating directories as they go. CEF's C API has no completion
+    /// signal for it, so the only observable is the jar itself going
+    /// quiet. (Before the helper released its callback arguments this
+    /// never showed: the leaked browser references kept every profile
+    /// loaded, so a reset rmtree'd under a live profile that happened
+    /// not to write.)
+    pub const JAR_SETTLE_MS: i64 = 250;
+    pub const JAR_SETTLE_DEADLINE_MS: i64 = 3_000;
+
+    /// Block until `jar` has shown no metadata change for JAR_SETTLE_MS,
+    /// or JAR_SETTLE_DEADLINE_MS has passed. A missing jar is settled.
+    fn awaitJarSettled(jar: []const u8) void {
+        const deadline = clock.nowMs() + JAR_SETTLE_DEADLINE_MS;
+        var last = treeSignature(jar);
+        if (last == 0) return;
+        var quiet_since = clock.nowMs();
+        while (clock.nowMs() < deadline) {
+            _ = c.usleep(25_000);
+            const sig = treeSignature(jar);
+            if (sig == 0) return;
+            const now = clock.nowMs();
+            if (sig != last) {
+                last = sig;
+                quiet_since = now;
+            } else if (now - quiet_since >= JAR_SETTLE_MS) return;
+        }
+    }
+
+    /// A hash of every entry's name, size and mtime under `path`
+    /// (bounded depth). 0 when `path` does not exist, never 0 otherwise.
+    fn treeSignature(path: []const u8) u64 {
+        var h = std.hash.Wyhash.init(0x6a61725f73657474);
+        if (!hashTree(&h, path, 0)) return 0;
+        const v = h.final();
+        return if (v == 0) 1 else v;
+    }
+
+    fn hashTree(h: *std.hash.Wyhash, path: []const u8, depth: u32) bool {
+        var z_buf: [4096]u8 = undefined;
+        const zpath = pathz.pathZ(&z_buf, path) catch return false;
+        var st: c.struct_stat = undefined;
+        if (c.lstat(zpath, &st) != 0) return false;
+        h.update(path);
+        h.update(std.mem.asBytes(&st.st_size));
+        const ts = if (@hasField(c.struct_stat, "st_mtim")) st.st_mtim else st.st_mtimespec;
+        h.update(std.mem.asBytes(&ts.tv_sec));
+        h.update(std.mem.asBytes(&ts.tv_nsec));
+        if ((st.st_mode & c.S_IFMT) != c.S_IFDIR or depth >= 8) return true;
+        const dir = c.opendir(zpath) orelse return true;
+        defer _ = c.closedir(dir);
+        while (c.readdir(dir)) |ent| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            var child_buf: [4096]u8 = undefined;
+            const child = std.fmt.bufPrint(&child_buf, "{s}/{s}", .{ path, name }) catch continue;
+            _ = hashTree(h, child, depth + 1);
+        }
+        return true;
     }
 
     /// Delete `profile-*` directories no entry claims — the SIGKILL
@@ -681,6 +751,70 @@ test "retire erases the jar and the next use gets a brand-new one" {
     // half-failed rmtree can never resurface as this profile's cookies.
     const again = try store.ensure("work");
     try std.testing.expect(again != id);
+}
+
+/// Stands in for the engine's asynchronous profile teardown: keeps
+/// writing into the jar (recreating its directories, as Chromium's
+/// cache index does) for a while after the reset was asked for.
+const LateWriter = struct {
+    jar: []const u8,
+    fn run(self: *const LateWriter) void {
+        var i: u32 = 0;
+        while (i < 8) : (i += 1) {
+            var buf: [4096]u8 = undefined;
+            const dir = std.fmt.bufPrint(&buf, "{s}/Cache/Cache_Data", .{self.jar}) catch return;
+            pathz.makeDirs(dir, 0o700) catch {};
+            var fbuf: [4096]u8 = undefined;
+            const file = std.fmt.bufPrint(&fbuf, "{s}/index-{d}", .{ dir, i }) catch return;
+            var z: [4096]u8 = undefined;
+            const zf = pathz.pathZ(&z, file) catch return;
+            if (c.fopen(zf, "w")) |f| _ = c.fclose(f);
+            _ = c.usleep(30_000);
+        }
+    }
+};
+
+test "retire waits for a jar the engine is still tearing down" {
+    const gpa = std.testing.allocator;
+    var scratch = ScratchState{};
+    scratch.init() catch return error.SkipZigTest;
+    defer scratch.deinit();
+
+    var store = try Store.open(gpa, "unit", null);
+    defer store.deinit();
+    const id = try store.ensure("late");
+    try makeJar(&store, "late", id);
+    var buf: [4096]u8 = undefined;
+    const jar = try gpa.dupe(u8, try store.jarPath(&buf, store.find("late").?));
+    defer gpa.free(jar);
+
+    const writer = LateWriter{ .jar = jar };
+    const th = try std.Thread.spawn(.{}, LateWriter.run, .{&writer});
+    const started = clock.nowMs();
+    try std.testing.expect(try store.retire("late"));
+    const took = clock.nowMs() - started;
+    th.join();
+    // Removed AFTER the writer went quiet: an immediate rmtree would
+    // have been recreated by the writes still landing.
+    try std.testing.expect(!dirExists(jar));
+    try std.testing.expect(took >= Store.JAR_SETTLE_MS);
+}
+
+test "treeSignature follows writes and reads a missing jar as settled" {
+    var scratch = ScratchState{};
+    scratch.init() catch return error.SkipZigTest;
+    defer scratch.deinit();
+    var buf: [4096]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&buf, "{s}/sig", .{scratch.dir});
+    try std.testing.expectEqual(@as(u64, 0), Store.treeSignature(dir));
+    try pathz.makeDirs(dir, 0o700);
+    const a = Store.treeSignature(dir);
+    try std.testing.expect(a != 0);
+    var fbuf: [4096]u8 = undefined;
+    var z: [4096]u8 = undefined;
+    const zf = try pathz.pathZ(&z, try std.fmt.bufPrint(&fbuf, "{s}/f", .{dir}));
+    if (c.fopen(zf, "w")) |f| _ = c.fclose(f);
+    try std.testing.expect(Store.treeSignature(dir) != a);
 }
 
 test "orphan jars left by a crash are swept at open" {

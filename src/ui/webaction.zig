@@ -41,6 +41,12 @@ pub const Toolbar = struct {
     actions: std.ArrayList(Action) = .empty,
     popup: ?*Popup = null,
     severed: bool = false,
+    /// The popup close, indirected because the re-entrancy it can cause
+    /// IS the invariant: `Popup.destroy` posts a ViewDestroy, and a post
+    /// that loses the connection re-enters `refresh` through
+    /// `helperGone` and frees every Action. Tests script it to prove
+    /// nothing holds an `*Action` or an index across the call.
+    close_popup: *const fn (*Toolbar) bool = realClosePopup,
 
     pub fn create(allocator: std.mem.Allocator, box: *c.GtkWidget) ?*Toolbar {
         const self = allocator.create(Toolbar) catch return null;
@@ -57,6 +63,18 @@ pub const Toolbar = struct {
         if (self.severed) return;
         var parsed = std.json.parseFromSlice([]Incoming, self.allocator, json, .{ .ignore_unknown_fields = true }) catch return;
         defer parsed.deinit();
+        // First pass: retire the open popup. Closing it posts a
+        // ViewDestroy, and a post that loses the connection re-enters
+        // here (helperGone -> refresh -> clearActions) and frees every
+        // Action, so this happens before anything holds an `*Action` or
+        // an index into the list.
+        if (self.popup) |p| {
+            if (self.popupRetired(p, parsed.value)) {
+                if (!self.close_popup(self)) return;
+            }
+        }
+        // Second pass: whether the list can be reused in place is
+        // decided AFTER that close, against whatever list survived it.
         var count: usize = 0;
         var same_actions = true;
         for (parsed.value) |in| {
@@ -70,17 +88,15 @@ pub const Toolbar = struct {
             var idx: usize = 0;
             for (parsed.value) |in| {
                 if (!validId(in.id)) continue;
-                const a = &self.actions.items[idx];
-                if (self.popup) |p| {
-                    if (c.gtk_widget_get_parent(p.widget) == a.button and (!in.enabled or !in.popup)) p.destroy(true);
-                }
-                self.configureButton(a, in);
+                // configureButton only touches GTK, never the client,
+                // so this borrow cannot outlive the list.
+                self.configureButton(&self.actions.items[idx], in);
                 idx += 1;
             }
             c.gtk_widget_set_visible(self.box, @intFromBool(self.actions.items.len != 0));
             return;
         }
-        if (self.popup) |p| p.destroy(true);
+        if (!self.close_popup(self)) return;
         self.clearActions(true);
         for (parsed.value) |in| {
             if (!validId(in.id)) continue;
@@ -103,6 +119,33 @@ pub const Toolbar = struct {
             _ = c.g_signal_connect_data(btn, "clicked", @ptrCast(&onClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         }
         c.gtk_widget_set_visible(self.box, @intFromBool(self.actions.items.len != 0));
+    }
+
+    /// Does the open popup's action lose its popup in this update? The
+    /// popover is matched to its anchor button and then compared by
+    /// ID, never by list position: an action that vanished entirely
+    /// counts as retired too.
+    fn popupRetired(self: *Toolbar, p: *Popup, incoming: []const Incoming) bool {
+        for (self.actions.items) |a| {
+            if (a.button != p.anchor) continue;
+            for (incoming) |in| {
+                if (!validId(in.id) or !std.mem.eql(u8, in.id, a.id)) continue;
+                return !in.enabled or !in.popup;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /// The live action carrying `id`. The ID is the only stable handle:
+    /// a refresh reallocates the list AND every button in it, so an
+    /// `*Action` or an index re-resolved this way is the only one safe
+    /// to use after anything that could have posted to the client.
+    fn actionById(self: *Toolbar, id: []const u8) ?*Action {
+        for (self.actions.items) |*a| {
+            if (std.mem.eql(u8, a.id, id)) return a;
+        }
+        return null;
     }
 
     pub fn setPresented(self: *Toolbar, presented: bool) void {
@@ -150,7 +193,9 @@ pub const Toolbar = struct {
         };
         c.gtk_css_provider_load_from_string(provider, text.ptr);
         c.gtk_style_context_add_provider(
-            c.gtk_widget_get_style_context(badge), @ptrCast(@alignCast(provider)), c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
+            c.gtk_widget_get_style_context(badge),
+            @ptrCast(@alignCast(provider)),
+            c.GTK_STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
         c.g_object_unref(provider);
     }
@@ -167,11 +212,9 @@ pub const Toolbar = struct {
 
     pub fn openPopup(self: *Toolbar, id: []const u8) bool {
         if (self.severed) return false;
-        for (self.actions.items) |*a| {
-            if (!std.mem.eql(u8, a.id, id) or !a.enabled or !a.popup) continue;
-            return self.activate(a);
-        }
-        return false;
+        const a = self.actionById(id) orelse return false;
+        if (!a.enabled or !a.popup) return false;
+        return self.activate(a);
     }
 
     pub fn adoptBuffer(self: *Toolbar, fb: proto.FrameBuffer, fd: c_int) bool {
@@ -203,7 +246,13 @@ pub const Toolbar = struct {
         if (!widgets_dead) {
             for (self.actions.items) |a| {
                 _ = c.g_signal_handlers_disconnect_matched(
-                    @ptrCast(a.button), c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @ptrCast(self),
+                    @ptrCast(a.button),
+                    c.G_SIGNAL_MATCH_DATA,
+                    0,
+                    0,
+                    null,
+                    null,
+                    @ptrCast(self),
                 );
             }
         }
@@ -255,7 +304,11 @@ pub const Toolbar = struct {
         const idx = @intFromPtr(raw) - 1;
         if (idx >= self.actions.items.len) return;
         const a = &self.actions.items[idx];
-        if (!a.enabled) return;
+        // The index is qdata from when the list was built, so it is
+        // verified against the button that actually fired rather than
+        // trusted; the alternative, an owned id per button, would buy
+        // the same guarantee for an allocation and a lifetime.
+        if (a.button != btn or !a.enabled) return;
         _ = self.activate(a);
     }
 
@@ -266,16 +319,34 @@ pub const Toolbar = struct {
         // forced off, so this is also what keeps extension actions from
         // being driven across the mux wire.
         if (!cl.cap_webext_action or cl.state != .ready) return false;
-        if (self.popup) |old| old.destroy(true);
-        self.popup = null;
-        const popup = if (a.popup) Popup.create(self, a.button) else null;
-        if (a.popup and popup == null) return false;
+        // Closing the previous popup posts a ViewDestroy, and a post
+        // that loses the connection frees every Action (helperGone ->
+        // refresh -> clearActions) and destroys their buttons with the
+        // box. So the only thing carried across the close is an OWNED
+        // copy of the ID, and the action is re-resolved from it after.
+        // With no popup open nothing can re-enter, so that copy is paid
+        // for only when there is something to close.
+        var live = a;
+        if (self.popup != null) {
+            const id = self.allocator.dupe(u8, a.id) catch return false;
+            defer self.allocator.free(id);
+            if (!self.close_popup(self)) return false;
+            self.popup = null;
+            live = self.actionById(id) orelse return false;
+        }
+        if (!live.enabled) return false;
+        // Capabilities belong to the CONNECTION and are cleared when it
+        // is lost, so the client is re-read rather than reused.
+        const conn = self.cl orelse return false;
+        if (!conn.cap_webext_action or conn.state != .ready) return false;
+        const popup = if (live.popup) Popup.create(self, live.button) else null;
+        if (live.popup and popup == null) return false;
         self.popup = popup;
         const popup_view = if (popup) |p| p.view else 0;
-        const scale = if (webface.faceByViewOn(cl, self.face_view)) |face| face.popupScale() else 1000;
-        cl.post(proto.WebextActionActivate{
+        const scale = if (webface.faceByViewOn(conn, self.face_view)) |face| face.popupScale() else 1000;
+        conn.post(proto.WebextActionActivate{
             .view = self.face_view,
-            .id = a.id,
+            .id = live.id,
             .popup_view = popup_view,
             .w = POPUP_W,
             .h = POPUP_H,
@@ -308,10 +379,193 @@ test "utf8Prefix never splits a codepoint" {
     try std.testing.expect(std.unicode.utf8ValidateSlice("A€B"[0..utf8Prefix("A€B", 3)]));
 }
 
+// `actionById` is the re-validation every post-crossing caller uses,
+// so it is pinned here; the fake widget pointers are never touched.
+test "actionById resolves by id rather than by position" {
+    const gpa = std.testing.allocator;
+    var tb = Toolbar{ .allocator = gpa, .box = @ptrFromInt(0x1000) };
+    defer tb.actions.deinit(gpa);
+    defer for (tb.actions.items) |*a| a.deinit(gpa);
+    for ([_][]const u8{ "aaaa", "bbbb", "cccc" }, 0..) |name, i| {
+        try tb.actions.append(gpa, .{
+            .id = try gpa.dupe(u8, name),
+            .enabled = true,
+            .popup = false,
+            .button = @ptrFromInt(0x1000 * (i + 2)),
+        });
+    }
+    try std.testing.expectEqual(&tb.actions.items[2], tb.actionById("cccc").?);
+    try std.testing.expectEqual(&tb.actions.items[0], tb.actionById("aaaa").?);
+    try std.testing.expect(tb.actionById("dddd") == null);
+}
+
+/// Close the open popup, if any. False once its ViewDestroy post lost
+/// the connection: helperGone has then already cleared the toolbar from
+/// under the caller, whose snapshot now describes a helper that is gone,
+/// so the caller must stop rather than rebuild. At file scope because it
+/// is the default of `Toolbar.close_popup`.
+fn realClosePopup(self: *Toolbar) bool {
+    const p = self.popup orelse return true;
+    p.destroy(true);
+    if (self.severed) return false;
+    if (self.cl) |cl| if (cl.state != .ready) return false;
+    return true;
+}
+
+/// Drives the one ordering rule of `refresh`/`activate`: the popup is
+/// closed BEFORE anything holds an `*Action` or an index, because the
+/// close can re-enter and free the whole list. The scripted close stands
+/// in for `Popup.destroy` -> post -> helperGone -> refresh("[]").
+const CloseProbe = struct {
+    var closes: usize = 0;
+    var actions_at_close: usize = 0;
+
+    fn reset() void {
+        closes = 0;
+        actions_at_close = 0;
+    }
+
+    /// The connection died in the close: every Action is freed and the
+    /// caller must stop.
+    fn losing(tb: *Toolbar) bool {
+        closes += 1;
+        actions_at_close = tb.actions.items.len;
+        tb.popup = null;
+        for (tb.actions.items) |*a| a.deinit(tb.allocator);
+        tb.actions.clearRetainingCapacity();
+        return false;
+    }
+
+    /// The connection survived, but the helper replaced the list during
+    /// the close: the old storage is gone, so any surviving `*Action`
+    /// is stale and the re-resolve must find the NEW, disabled entry.
+    fn replacing(tb: *Toolbar) bool {
+        closes += 1;
+        actions_at_close = tb.actions.items.len;
+        tb.popup = null;
+        for (tb.actions.items) |*a| a.deinit(tb.allocator);
+        tb.actions.deinit(tb.allocator);
+        tb.actions = .empty;
+        tb.actions.append(tb.allocator, .{
+            .id = tb.allocator.dupe(u8, "aaaa") catch unreachable,
+            .enabled = false,
+            .popup = false,
+            .button = @ptrFromInt(0x9000),
+        }) catch unreachable;
+        return true;
+    }
+};
+
+fn fakePopup(tb: *Toolbar, anchor: *c.GtkWidget) Popup {
+    return .{
+        .owner = tb,
+        .view = 1,
+        .widget = @ptrFromInt(0x3000),
+        .anchor = anchor,
+        .picture = @ptrFromInt(0x4000),
+        .status = @ptrFromInt(0x5000),
+        .motion = undefined,
+        .click = undefined,
+        .scroll = undefined,
+        .key = undefined,
+        .focus = undefined,
+    };
+}
+
+fn probeToolbar(gpa: std.mem.Allocator, close: *const fn (*Toolbar) bool) Toolbar {
+    return .{ .allocator = gpa, .box = @ptrFromInt(0x1000), .close_popup = close };
+}
+
+fn addAction(tb: *Toolbar, id: []const u8, button: usize) !void {
+    try tb.actions.append(tb.allocator, .{
+        .id = try tb.allocator.dupe(u8, id),
+        .enabled = true,
+        .popup = true,
+        .button = @ptrFromInt(button),
+    });
+}
+
+fn dropActions(tb: *Toolbar) void {
+    for (tb.actions.items) |*a| a.deinit(tb.allocator);
+    tb.actions.deinit(tb.allocator);
+}
+
+test "refresh closes the popup before it borrows the action list" {
+    const gpa = std.testing.allocator;
+    CloseProbe.reset();
+    var tb = probeToolbar(gpa, CloseProbe.losing);
+    defer dropActions(&tb);
+    try addAction(&tb, "aaaa", 0x2000);
+    var pop = fakePopup(&tb, tb.actions.items[0].button);
+    tb.popup = &pop;
+
+    // The SAME action, only without its popup: the list is reusable in
+    // place, which is exactly the path that used to take `&items[idx]`
+    // and only then close the popover out from under it.
+    tb.refresh("[{\"id\":\"aaaa\",\"enabled\":true,\"popup\":false}]");
+
+    try std.testing.expectEqual(@as(usize, 1), CloseProbe.closes);
+    // The close ran while the list was still the one refresh was given.
+    try std.testing.expectEqual(@as(usize, 1), CloseProbe.actions_at_close);
+    // And it took the list with it, so refresh stopped instead of
+    // configuring a button through a freed Action.
+    try std.testing.expectEqual(@as(usize, 0), tb.actions.items.len);
+    try std.testing.expect(tb.popup == null);
+}
+
+test "activate re-resolves its action after the close instead of reusing it" {
+    const gpa = std.testing.allocator;
+    var cl = webface.Client{ .state = .ready, .cap_webext_action = true };
+
+    // A close that loses the connection: the caller's `*Action` is
+    // freed, and activate must stop rather than post with it.
+    CloseProbe.reset();
+    var lost = probeToolbar(gpa, CloseProbe.losing);
+    defer dropActions(&lost);
+    lost.cl = &cl;
+    try addAction(&lost, "aaaa", 0x2000);
+    var lost_pop = fakePopup(&lost, lost.actions.items[0].button);
+    lost.popup = &lost_pop;
+    try std.testing.expect(!lost.activate(&lost.actions.items[0]));
+    try std.testing.expectEqual(@as(usize, 1), CloseProbe.closes);
+    try std.testing.expectEqual(@as(usize, 0), lost.actions.items.len);
+
+    // A close the connection survived, but which replaced the list:
+    // the re-resolved action is disabled, so the activation stops
+    // there. Reusing the pre-close pointer would read the old, enabled
+    // copy out of freed storage and open a popup for it.
+    CloseProbe.reset();
+    var moved = probeToolbar(gpa, CloseProbe.replacing);
+    defer dropActions(&moved);
+    moved.cl = &cl;
+    try addAction(&moved, "aaaa", 0x2000);
+    var moved_pop = fakePopup(&moved, moved.actions.items[0].button);
+    moved.popup = &moved_pop;
+    try std.testing.expect(!moved.activate(&moved.actions.items[0]));
+    try std.testing.expectEqual(@as(usize, 1), CloseProbe.closes);
+    try std.testing.expectEqual(@as(usize, 1), moved.actions.items.len);
+    try std.testing.expect(!moved.actions.items[0].enabled);
+
+    // With no popup open nothing can re-enter, so the activation takes
+    // no copy of the id and no close is attempted.
+    CloseProbe.reset();
+    var plain = probeToolbar(gpa, CloseProbe.losing);
+    defer dropActions(&plain);
+    plain.cl = &cl;
+    try addAction(&plain, "aaaa", 0x2000);
+    plain.actions.items[0].enabled = false;
+    try std.testing.expect(!plain.activate(&plain.actions.items[0]));
+    try std.testing.expectEqual(@as(usize, 0), CloseProbe.closes);
+}
+
 const Popup = struct {
     owner: *Toolbar,
     view: u32,
     widget: *c.GtkWidget,
+    /// The button the popover is parented to, kept rather than read back
+    /// with `gtk_widget_get_parent` so matching a popup to its action is
+    /// a pointer compare and nothing else.
+    anchor: *c.GtkWidget,
     picture: *c.GtkWidget,
     status: *c.GtkWidget,
     map: ?*webframe.Map = null,
@@ -356,6 +610,7 @@ const Popup = struct {
             .owner = owner,
             .view = webface.nextAuxView(),
             .widget = pop,
+            .anchor = anchor,
             .picture = picture,
             .status = status,
             .motion = undefined,
@@ -386,11 +641,17 @@ const Popup = struct {
         self.closing = true;
         const objects = [_]?*anyopaque{
             @ptrCast(self.widget), @ptrCast(self.motion), @ptrCast(self.click),
-            @ptrCast(self.scroll), @ptrCast(self.key), @ptrCast(self.focus),
+            @ptrCast(self.scroll), @ptrCast(self.key),    @ptrCast(self.focus),
         };
         for (objects) |object| {
             _ = c.g_signal_handlers_disconnect_matched(
-                object, c.G_SIGNAL_MATCH_DATA, 0, 0, null, null, @ptrCast(self),
+                object,
+                c.G_SIGNAL_MATCH_DATA,
+                0,
+                0,
+                null,
+                null,
+                @ptrCast(self),
             );
         }
         if (notify_helper and self.view != 0) self.owner.post(proto.ViewDestroy{ .view = self.view });

@@ -188,6 +188,11 @@ pub fn parseTree(gpa: std.mem.Allocator, json: []const u8) !std.json.Parsed(InTr
 }
 
 /// The shadow tree of one protocol view.
+/// The exact header a query answers with when its root id is not in the
+/// live tree; `mcp_web.zig` anchors its unknown-id detection on it, so
+/// the two must never drift.
+pub const QUERY_UNKNOWN_ID_FMT = "query {s} [{d}] unknown id";
+
 pub const View = struct {
     gpa: std.mem.Allocator,
     nodes: std.ArrayList(Node) = .empty,
@@ -1176,7 +1181,7 @@ pub const View = struct {
             1 => {
                 const root_sid = std.fmt.parseInt(u32, std.mem.trim(u8, arg, " \t"), 10) catch 0;
                 const root = self.findSid(root_sid) orelse {
-                    try w.print("query subtree [{d}] unknown id\n", .{root_sid});
+                    try w.print(QUERY_UNKNOWN_ID_FMT ++ "\n", .{ "subtree", root_sid });
                     return self.gpa.dupe(u8, out.written());
                 };
                 try w.print("query subtree [{d}]\n", .{root_sid});
@@ -1338,7 +1343,7 @@ pub const View = struct {
     fn queryForm(self: *const View, w: *std.Io.Writer, arg: []const u8) !void {
         const root_sid = std.fmt.parseInt(u32, std.mem.trim(u8, arg, " \t"), 10) catch 0;
         if (root_sid != 0 and self.findSid(root_sid) == null) {
-            try w.print("query form [{d}] unknown id\n", .{root_sid});
+            try w.print(QUERY_UNKNOWN_ID_FMT ++ "\n", .{ "form", root_sid });
             return;
         }
         var body: std.Io.Writer.Allocating = .init(self.gpa);
