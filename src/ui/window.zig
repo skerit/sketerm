@@ -188,6 +188,13 @@ fn onManualPopoverClosed(_: *c.GtkPopover, user: ?*anyopaque) callconv(.c) void 
     }
 }
 
+/// The pane's "AI attached" chip was clicked: open the assistant
+/// surface scoped to that session's assistant.
+fn onPaneChipClicked(ctx: ?*anyopaque, pane: *Pane) void {
+    const self = cast.userData(Window, ctx);
+    @import("assistants.zig").openForPane(self, pane);
+}
+
 fn onPaneContinuousFrames(ctx: ?*anyopaque, _: *Pane) void {
     const self = cast.userData(Window, ctx);
     self.syncWindowGraphicsOffload();
@@ -375,6 +382,10 @@ pub const Window = struct {
     /// GFileMonitor on config.conf (`config_auto_reload`). Null when
     /// the key is off or no monitor could be created.
     config_watch: ?*@import("configwatch.zig").Watcher = null,
+    /// Running-assistant registry watcher + the tab-bar chip it drives
+    /// (`assistants.zig`). Null when the registry directory cannot be
+    /// watched; the Session Overview then lists no assistant daemons.
+    assistants: ?*@import("assistants.zig").Watcher = null,
     /// Scrollback search (Ctrl+F).
     search_bar: ?*c.GtkWidget = null,
     search_entry: ?*c.GtkWidget = null,
@@ -679,6 +690,7 @@ pub const Window = struct {
         // Browser frame cap: app-level like the IM strategy below, and
         // module-level in webface, which owns the one helper client.
         @import("webface.zig").setMaxFps(self.config.browser_max_fps);
+        @import("webface.zig").setRouteDefaults(self.config.web_route, self.config.mux_tor_socks_endpoint);
         @import("webface.zig").setDiscardMinutes(self.config.web_discard_minutes);
         @import("webface.zig").setDownloadAsk(self.config.web_download_ask);
         @import("webface.zig").setPopupPolicy(switch (self.config.web_popup_policy) {
@@ -1007,6 +1019,10 @@ pub const Window = struct {
         // Live config reload: watch the file this process reads.
         @import("configwatch.zig").install(self);
 
+        // Ambient assistant activity: the chip at the end of the tab
+        // bar and the registry watch behind it.
+        self.assistants = @import("assistants.zig").Watcher.start(self);
+
         // Remote-control socket (sketerm cli). Failure is non-fatal:
         // the terminal works fine without scripting. Primary only —
         // the socket path is keyed on the pid, so a secondary window
@@ -1072,6 +1088,10 @@ pub const Window = struct {
         // Before anything else: a pending debounce timer would fire
         // into a half-torn-down window.
         @import("configwatch.zig").uninstall(self);
+        if (self.assistants) |watcher| {
+            watcher.stop();
+            self.assistants = null;
+        }
         // Relay-origin cleanup may close panel tabs and therefore mutate the
         // pane/terminal arrays. Finish it before iterating those arrays for
         // terminal teardown.
@@ -2265,6 +2285,8 @@ pub const Window = struct {
         pane.win_on_cmd_status = termsinks_mod.onTermCmdStatus;
         pane.win_bell_ctx = @ptrCast(self);
         pane.win_on_bell = termsinks_mod.onTermBell;
+        pane.win_chip_ctx = @ptrCast(self);
+        pane.win_on_chip = onPaneChipClicked;
         pane.win_child_ctx = @ptrCast(self);
         pane.win_on_child_exit = termsinks_mod.onTermChildExit;
         pane.win_on_continuous_frames = onPaneContinuousFrames;

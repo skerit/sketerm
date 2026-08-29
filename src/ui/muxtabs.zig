@@ -1036,3 +1036,154 @@ test "pane registration publishes neither pointer when terminal reserve fails" {
     try std.testing.expectEqual(@as(usize, 0), window.panes.items.len);
     try std.testing.expectEqual(@as(usize, 0), window.terminals.items.len);
 }
+
+// ── Off-thread session attach ────────────────────────────────
+
+/// One session attach whose transport dial and snapshot handshake run
+/// off the main loop, finishing on an idle with `attachMuxPrepared`.
+///
+/// The one home for "attach a session I only know by host + name"
+/// from a click: the Session Overview and the assistant activity chip
+/// both go through it, so a wedged daemon costs a bounded, described
+/// failure rather than a frozen GUI. `on_ready` fires exactly once on
+/// the main thread with the job still alive: the caller checks its own
+/// liveness fence and calls `finish` (the attach itself) only while its
+/// window still exists; the job is freed when the callback returns.
+pub const AttachJob = struct {
+    win: *Window,
+    host: ?[]u8,
+    session: []u8,
+    lease: Lease,
+    /// Idle connection to the daemon taken at submit time; a fresh dial
+    /// follows when it is absent or has died between polls.
+    reuse: ?mux_client.Conn = null,
+    conn: ?mux_client.Conn = null,
+    snapshot: ?mux_client.Conn.OwnedFrame = null,
+    identity: mux_client.AttachIdentity = .{},
+    on_ready: *const fn (ctx: ?*anyopaque, job: *AttachJob) void,
+    ctx: ?*anyopaque,
+
+    const mux_client = @import("../mux/client.zig");
+    const mux_cli = @import("../ipc/mux_cli.zig");
+
+    /// Spawn the job. Returns false (nothing scheduled, `on_ready`
+    /// never called) when the worker could not be created.
+    pub fn start(
+        win: *Window,
+        host: ?[]const u8,
+        session: []const u8,
+        lease: Lease,
+        reuse: ?mux_client.Conn,
+        on_ready: *const fn (ctx: ?*anyopaque, job: *AttachJob) void,
+        ctx: ?*anyopaque,
+    ) bool {
+        const allocator = std.heap.c_allocator;
+        const job = allocator.create(AttachJob) catch return false;
+        job.* = .{
+            .win = win,
+            .host = null,
+            .session = allocator.dupe(u8, session) catch {
+                allocator.destroy(job);
+                return false;
+            },
+            .lease = lease,
+            .reuse = reuse,
+            .on_ready = on_ready,
+            .ctx = ctx,
+        };
+        if (host) |h| {
+            job.host = allocator.dupe(u8, h) catch {
+                job.destroy();
+                return false;
+            };
+        }
+        const thread = std.Thread.spawn(.{}, threadMain, .{job}) catch {
+            job.destroy();
+            return false;
+        };
+        thread.detach();
+        return true;
+    }
+
+    fn destroy(self: *AttachJob) void {
+        const allocator = std.heap.c_allocator;
+        if (self.reuse) |*conn| conn.deinit();
+        if (self.conn) |*conn| conn.deinit();
+        if (self.snapshot) |snapshot| snapshot.deinit(allocator);
+        if (self.host) |host| allocator.free(host);
+        allocator.free(self.session);
+        allocator.destroy(self);
+    }
+
+    fn attachOn(self: *AttachJob, conn: *mux_client.Conn) bool {
+        conn.sendAttach(self.session, .{
+            .kind = "gui",
+            .read_only = self.lease == .read_only,
+            .control = self.lease == .control,
+            .panel_rpc = conn.panel_rpc,
+        }) catch return false;
+        const attached = conn.recvGuiAttachFor(20_000) catch return false;
+        self.snapshot = attached.snapshot;
+        self.identity = attached.identity;
+        return true;
+    }
+
+    fn threadMain(self: *AttachJob) void {
+        const host: ?[]const u8 = if (self.host) |value| value else null;
+        if (self.reuse) |value| {
+            var conn = value;
+            self.reuse = null;
+            if (self.attachOn(&conn)) {
+                self.conn = conn;
+                _ = c.g_idle_add(@ptrCast(&onIdle), @ptrCast(self));
+                return;
+            }
+            // The idle connection may have died between polls; one
+            // fresh dial before reporting failure.
+            conn.deinit();
+        }
+        if (mux_cli.muxConnect(std.heap.c_allocator, host)) |fresh| {
+            var conn = fresh;
+            if (self.attachOn(&conn)) {
+                self.conn = conn;
+            } else {
+                conn.deinit();
+            }
+        }
+        _ = c.g_idle_add(@ptrCast(&onIdle), @ptrCast(self));
+    }
+
+    /// Whether the handshake produced something to attach; false is
+    /// the daemon or session being gone.
+    pub fn ready(self: *const AttachJob) bool {
+        return self.conn != null and self.snapshot != null;
+    }
+
+    /// Attach the prepared session into the window (main thread, from
+    /// `on_ready` only). Consumes the connection either way.
+    pub fn finish(self: *AttachJob) bool {
+        if (!self.ready()) return false;
+        const conn = self.conn.?;
+        self.conn = null;
+        const snapshot = self.snapshot.?;
+        attachMuxPrepared(
+            self.win,
+            conn,
+            self.session,
+            if (self.host) |host| host else null,
+            snapshot.payload,
+            self.identity,
+            null,
+            null,
+            self.lease,
+        ) catch return false;
+        return true;
+    }
+
+    fn onIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self = cast.userData(AttachJob, user);
+        self.on_ready(self.ctx, self);
+        self.destroy();
+        return 0;
+    }
+};

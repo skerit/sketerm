@@ -813,6 +813,13 @@ pub const TabBar = struct {
     }
 
     /// Fence every callback carrying this controller or one of its Tab records while widgets are valid.
+    /// Append a widget after the tab scroller, at the END of the strip
+    /// (the scroller expands, so it sits flush right). The strip stays
+    /// agnostic about what it is; the caller owns its lifetime rules.
+    pub fn appendEnd(self: *TabBar, widget: *c.GtkWidget) void {
+        c.gtk_box_append(@ptrCast(self.root), widget);
+    }
+
     pub fn sever(self: *TabBar) void {
         if (self.callbacks_severed) return;
         self.callbacks_severed = true;

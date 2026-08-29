@@ -882,6 +882,9 @@ pub fn main() u8 {
         if (watchAlongStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("watch-along: driver attach raised the accent indicator, detach retired it, and a read-only watch pane showed the view-only chip");
 
+        if (assistantChipStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("assistant chip: an isolated MCP's terminal raised the tab-bar chip unprompted, Watch opened it as a tab showing its output, and the chip retired with the assistant");
+
         if (have_web_action) {
             if (webActionGuiStage(allocator, app, sock_path)) |why| return failMsg(why);
             say("browser action: WebGroup switching refreshed per-tab icons; a trusted click opened, drove, closed and tore down a real extension popup");
@@ -2913,6 +2916,194 @@ fn watchAlongStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: 
     _ = app.waitIdle(200, 4_000);
     if (!waitAccent(app, win_id, false, 10_000))
         return "the view-only chip survived closing the watch pane";
+    return null;
+}
+
+/// Spawn a plain isolated `sketerm mcp` (no --shared, no --socket): its
+/// registry record lands in this run's runtime dir, the one the GUI
+/// under test watches, exactly as a user's assistant would.
+fn spawnIsolatedMcp(allocator: std.mem.Allocator) ?McpChild {
+    var in_pipe: [2]c_int = undefined;
+    var out_pipe: [2]c_int = undefined;
+    if (c.pipe(&in_pipe) != 0) return null;
+    if (c.pipe(&out_pipe) != 0) {
+        _ = c.close(in_pipe[0]);
+        _ = c.close(in_pipe[1]);
+        return null;
+    }
+    const pid = c.fork();
+    if (pid < 0) return null;
+    if (pid == 0) {
+        platform.dieWithParent();
+        _ = c.dup2(in_pipe[0], 0);
+        _ = c.dup2(out_pipe[1], 1);
+        _ = c.close(in_pipe[0]);
+        _ = c.close(in_pipe[1]);
+        _ = c.close(out_pipe[0]);
+        _ = c.close(out_pipe[1]);
+        // The harness may run inside a sketerm pane; this child is an
+        // assistant of its own, not that pane's.
+        _ = c.unsetenv("SKETERM_SESSION");
+        _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "mcp", "--no-record", null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    _ = c.close(in_pipe[0]);
+    _ = c.close(out_pipe[1]);
+    return .{ .pid = pid, .to_child = in_pipe[1], .from_child = out_pipe[0], .allocator = allocator };
+}
+
+/// Bounding box of the accent-coloured assistant chip in the window's
+/// top band (the tab bar), or null when fewer than `MIN_CHIP_PX`
+/// accent pixels are there. The chip's 11px white-on-orange label is
+/// below what OCR reads reliably; its colour is unique in the band.
+const ChipBox = struct { x: f64, y: f64, w: f64, h: f64 };
+const MIN_CHIP_PX: usize = 200;
+const CHIP_BAND_PX: usize = 120;
+
+fn assistantChipBox(app: *appdrive.App, win_id: u32) ?ChipBox {
+    for (app.windows.items) |w| {
+        if (w.id != win_id or w.w <= 0 or w.h <= 0) continue;
+        const width: usize = @intCast(w.w);
+        const height: usize = @intCast(w.h);
+        const px = w.pixels.items;
+        if (px.len < width * height * 4) return null;
+        var n: usize = 0;
+        var min_x: usize = width;
+        var min_y: usize = height;
+        var max_x: usize = 0;
+        var max_y: usize = 0;
+        const rows = @min(height, CHIP_BAND_PX);
+        var y: usize = 0;
+        while (y < rows) : (y += 1) {
+            var x: usize = 0;
+            while (x < width) : (x += 1) {
+                const i = (y * width + x) * 4;
+                const b: i32 = px[i];
+                const g: i32 = px[i + 1];
+                const r: i32 = px[i + 2];
+                if (r > 220 and g > 85 and g < 160 and b < 90) {
+                    n += 1;
+                    min_x = @min(min_x, x);
+                    min_y = @min(min_y, y);
+                    max_x = @max(max_x, x);
+                    max_y = @max(max_y, y);
+                }
+            }
+        }
+        if (n < MIN_CHIP_PX) return null;
+        return .{
+            .x = @floatFromInt(min_x),
+            .y = @floatFromInt(min_y),
+            .w = @floatFromInt(max_x - min_x + 1),
+            .h = @floatFromInt(max_y - min_y + 1),
+        };
+    }
+    return null;
+}
+
+fn waitAssistantChip(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u32) ?ChipBox {
+    var waited: u32 = 0;
+    while (waited <= timeout_ms) : (waited += 200) {
+        const box = assistantChipBox(app, win_id);
+        if (want and box != null) return box;
+        if (!want and box == null) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        _ = app.pumpOnce(200);
+    }
+    return null;
+}
+
+/// Ambient assistant surface end to end: an isolated `sketerm mcp`
+/// with one headless terminal must raise the tab-bar chip with no
+/// configuration and no --shared, its popover's Watch must open that
+/// terminal as a tab of this window showing the assistant's output,
+/// and the chip must retire when the assistant exits.
+fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
+    if (!@import("util/ocr.zig").available()) {
+        say("SKIP assistant chip: tesseract unavailable; the chip and popover are driven by OCR");
+        return null;
+    }
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = app.windows.items[0].id;
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed before the assistant chip stage";
+        defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
+    }
+    const tabs_before = tabCount(allocator, sock_path) orelse return "tab count unavailable before the assistant chip stage";
+
+    if (assistantChipBox(app, win_id) != null)
+        return "an assistant chip was already showing before the isolated MCP registered";
+    var m = spawnIsolatedMcp(allocator) orelse return "could not spawn an isolated `sketerm mcp`";
+    var m_open = true;
+    defer if (m_open) m.close();
+    if (!m.initialize()) return "the isolated MCP server never answered initialize";
+    const opened = m.call("term_open", "{}", 30_000) orelse return "term_open on the isolated MCP timed out";
+    const term_id = mcpNum(opened, "id") orelse
+        return whyf("term_open named no terminal id: {s}", .{opened[0..@min(opened.len, 300)]});
+    var run_buf: [128]u8 = undefined;
+    const run_args = std.fmt.bufPrint(&run_buf, "{{\"id\":{d},\"command\":\"echo SK_CHIP_OK\"}}", .{term_id}) catch
+        return "term_run arguments did not fit";
+    const ran = m.call("term_run", run_args, 30_000) orelse return "term_run on the isolated MCP timed out";
+    if (mcpHas(ran, "isError")) return whyf("term_run failed: {s}", .{ran[0..@min(ran.len, 300)]});
+
+    // The registry watch (GFileMonitor + 3s tick) and the roster poll
+    // must surface the chip on their own. The previous stage proved the
+    // driven accent retired, so accent pixels in the tab-bar band are
+    // the chip and nothing else.
+    const chip = waitAssistantChip(app, win_id, true, 30_000) orelse {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-assistant-nochip.png", shot.png);
+        } else |_| {}
+        return "no assistant chip appeared on the tab bar (see zig-out/smoke-e2e-assistant-nochip.png)";
+    };
+    if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("zig-out/smoke-e2e-assistant-chip.png", shot.png);
+    } else |_| {}
+    if (openPopup(app) != null) return "a popup surface was already open before the chip was clicked";
+    app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
+    // The popover is its own xdg_popup surface (see openPopup): read
+    // and click it by its own window id, never through the toplevel.
+    const pop_id = waitPopup(app, true, 10_000) orelse
+        return "the assistant chip opened no popover surface";
+    const watch = waitOcrWordCenter(allocator, app, pop_id, "Watch", 10_000) orelse {
+        if (app.screenshotPng(pop_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-assistant-nopopover.png", shot.png);
+        } else |_| {}
+        return "the assistant popover showed no Watch button (see zig-out/smoke-e2e-assistant-nopopover.png)";
+    };
+    if (app.screenshotPng(pop_id, 0, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("zig-out/smoke-e2e-assistant-popover.png", shot.png);
+    } else |_| {}
+    app.click(pop_id, watch.x, watch.y, 1) catch return "clicking Watch failed";
+    var waited: u32 = 0;
+    var tabs_now: usize = tabs_before;
+    while (waited < 15_000) : (waited += 250) {
+        _ = app.pumpOnce(250);
+        tabs_now = tabCount(allocator, sock_path) orelse tabs_before;
+        if (tabs_now > tabs_before) break;
+    }
+    if (tabs_now <= tabs_before) return "Watch opened no new tab for the assistant's terminal";
+    if (!viewerWaitOcr(allocator, app, win_id, "SK_CHIP_OK", 20_000))
+        return "the watched tab never showed the assistant terminal's output";
+
+    // The assistant exits: its lease drops, the chip must retire.
+    m.close();
+    m_open = false;
+    const retired = waitAssistantChip(app, win_id, false, 30_000) != null;
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    if (!retired) return "the assistant chip survived the assistant exiting";
     return null;
 }
 

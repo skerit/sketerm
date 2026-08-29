@@ -3,7 +3,6 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
-const profile = @import("../util/profile.zig");
 const pulse = @import("../mux/pulse.zig");
 const Window = @import("window.zig").Window;
 const Pane = @import("pane.zig").Pane;
@@ -14,6 +13,7 @@ const mux_client = @import("../mux/client.zig");
 const mux_wire = @import("../mux/wire.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const muxtabs = @import("muxtabs.zig");
+const assistants = @import("assistants.zig");
 
 const Section = enum(u8) { audio, applications, attached, available };
 
@@ -747,27 +747,41 @@ fn setSessionTarget(
     c.gtk_box_insert_child_after(@ptrCast(body), button, c.gtk_widget_get_prev_sibling(c.gtk_widget_get_last_child(body)));
 }
 
-/// Add the read-only Watch action to an attachable row. A watch
-/// attach mirrors the session without taking the controller lease,
-/// so it never steals input from whoever is driving (an assistant
-/// included); the pane's titlebar chip offers Take Control later.
+/// Add the Watch (read-only) and Take Control actions to an
+/// attachable row. A watch attach mirrors the session without taking
+/// the controller lease, so it never steals input from whoever is
+/// driving (an assistant included); Take Control is the deliberate
+/// escalation, the same lease the pane chip's button asks for. Both
+/// icons and tooltips come from `assistants.attachVerb`, the one home
+/// for that vocabulary.
 fn addWatchButton(self: *Switcher, entry: *Entry) void {
     const body = c.gtk_list_box_row_get_child(@ptrCast(entry.row)) orelse return;
-    const button = c.gtk_button_new_from_icon_name("view-reveal-symbolic").?;
-    c.gtk_widget_set_valign(button, c.GTK_ALIGN_CENTER);
-    c.gtk_widget_add_css_class(button, "flat");
-    c.gtk_widget_set_tooltip_text(button, "Watch read-only - view the session without taking control of it");
-    c.g_object_set_data(@ptrCast(button), "sketerm-overview-entry", @ptrCast(entry));
-    _ = c.g_signal_connect_data(button, "clicked", @ptrCast(&onWatchClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
-    c.gtk_box_insert_child_after(@ptrCast(body), button, c.gtk_widget_get_prev_sibling(c.gtk_widget_get_last_child(body)));
+    inline for (.{ muxtabs.Lease.control, muxtabs.Lease.read_only }) |lease| {
+        const verb = assistants.attachVerb(lease);
+        const button = c.gtk_button_new_from_icon_name(verb.icon).?;
+        c.gtk_widget_set_valign(button, c.GTK_ALIGN_CENTER);
+        c.gtk_widget_add_css_class(button, "flat");
+        c.gtk_widget_set_tooltip_text(button, verb.tip);
+        c.g_object_set_data(@ptrCast(button), "sketerm-overview-entry", @ptrCast(entry));
+        _ = c.g_signal_connect_data(button, "clicked", @ptrCast(if (lease == .control) &onTakeControlClicked else &onWatchClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_box_insert_child_after(@ptrCast(body), button, c.gtk_widget_get_prev_sibling(c.gtk_widget_get_last_child(body)));
+    }
 }
 
 fn onWatchClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    attachClicked(button, user, .read_only);
+}
+
+fn onTakeControlClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    attachClicked(button, user, .control);
+}
+
+fn attachClicked(button: *c.GtkButton, user: ?*anyopaque, lease: muxtabs.Lease) void {
     const self = cast.userData(Switcher, user);
     const data = c.g_object_get_data(@ptrCast(button), "sketerm-overview-entry") orelse return;
     const entry: *Entry = @ptrCast(@alignCast(data));
     const target = entry.target orelse return;
-    startAttach(self, target, .read_only);
+    startAttach(self, target, lease);
 }
 
 fn applySearch(self: *Switcher, preferred: ?[]const u8) void {
@@ -1090,19 +1104,13 @@ fn discoverDaemons(self: *Switcher) void {
         if (remote.host) |host| addDaemon(self, host, host);
     }
 
-    const runtime = profile.getenv("XDG_RUNTIME_DIR") orelse return;
-    var base_buf: [512:0]u8 = undefined;
-    const base = std.fmt.bufPrintZ(&base_buf, "{s}/sketerm", .{runtime}) catch return;
-    const dir = c.opendir(base.ptr) orelse return;
-    defer _ = c.closedir(dir);
-    while (c.readdir(dir)) |ent| {
-        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
-        if (!std.mem.startsWith(u8, name, "mcp-")) continue;
-        var host_buf: [1200:0]u8 = undefined;
-        const host = std.fmt.bufPrintZ(&host_buf, "sock:{s}/{s}/mux.sock", .{ base, name }) catch continue;
-        var origin_buf: [256:0]u8 = undefined;
-        const origin = std.fmt.bufPrintZ(&origin_buf, "assistant daemon {s}", .{name}) catch continue;
-        addDaemon(self, host, origin);
+    // Assistant daemons come from the window's registry watcher, the
+    // one place that knows which `sketerm mcp` instances are live.
+    const watcher = self.win.assistants orelse return;
+    for (watcher.roster.items) |assistant| {
+        var origin_buf: [320:0]u8 = undefined;
+        const origin = std.fmt.bufPrintZ(&origin_buf, "assistant {s}", .{assistant.label()}) catch continue;
+        addDaemon(self, assistant.host, origin);
     }
 }
 
@@ -1401,67 +1409,28 @@ fn onOpIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
     return 0;
 }
 
-const Attach = struct {
-    sw: *Switcher,
-    host: ?[]u8,
-    session: []u8,
-    /// Idle daemon connection taken at submit time (main thread).
-    reuse: ?mux_client.Conn = null,
-    conn: ?mux_client.Conn = null,
-    snapshot: ?mux_client.Conn.OwnedFrame = null,
-    identity: mux_client.AttachIdentity = .{},
-    /// Controller-lease intent: Watch attaches read-only and never
-    /// takes the lease; the default attach takes it when free.
-    lease: muxtabs.Lease = .default,
-
-    fn destroy(self: *Attach) void {
-        const allocator = std.heap.c_allocator;
-        if (self.reuse) |*conn| conn.deinit();
-        if (self.conn) |*conn| conn.deinit();
-        if (self.snapshot) |snapshot| snapshot.deinit(allocator);
-        if (self.host) |host| allocator.free(host);
-        allocator.free(self.session);
-        allocator.destroy(self);
-    }
-};
-
+/// Submit a Watch (read-only) or Take Control attach for a row. The
+/// dial + handshake run on `muxtabs.AttachJob`; this side only owns the
+/// dialog state around it (one attach at a time, sensitivity, note).
 fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease) void {
     if (self.attaching) return;
-    const allocator = std.heap.c_allocator;
-    const ctx = allocator.create(Attach) catch return;
-    ctx.* = .{
-        .sw = self,
-        .host = null,
-        .session = allocator.dupe(u8, target.session) catch {
-            allocator.destroy(ctx);
-            return;
-        },
-        .lease = lease,
-    };
-    if (target.host) |host| {
-        ctx.host = allocator.dupe(u8, host) catch {
-            allocator.free(ctx.session);
-            allocator.destroy(ctx);
-            return;
-        };
-    }
     // The attach becomes the session's event stream, so it consumes a
-    // whole connection — take the daemon's idle one instead of dialing
+    // whole connection -- take the daemon's idle one instead of dialing
     // (on a remote host a fresh dial is an ssh spawn).
+    var reuse: ?mux_client.Conn = null;
     const target_host: ?[]const u8 = if (target.host) |value| value else null;
     if (findDaemon(self, target_host)) |daemon| {
         if (!daemon.busy) {
             if (daemon.conn) |conn| {
-                ctx.reuse = conn;
+                reuse = conn;
                 daemon.conn = null;
             }
         }
     }
-    const thread = std.Thread.spawn(.{}, attachThreadMain, .{ctx}) catch {
-        ctx.destroy();
+    if (!muxtabs.AttachJob.start(self.win, target_host, target.session, lease, reuse, onAttachReady, @ptrCast(self))) {
+        if (reuse) |*conn| conn.deinit();
         return;
-    };
-    thread.detach();
+    }
     self.attaching = true;
     self.pending_ops += 1;
     self.note = "";
@@ -1470,76 +1439,12 @@ fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease) voi
     self.updateStatus();
 }
 
-fn attachOnConn(ctx: *Attach, conn: *mux_client.Conn) bool {
-    conn.sendAttach(ctx.session, .{
-        .kind = "gui",
-        .read_only = ctx.lease == .read_only,
-        .control = ctx.lease == .control,
-        .panel_rpc = conn.panel_rpc,
-    }) catch return false;
-    const attached = conn.recvGuiAttachFor(20_000) catch return false;
-    ctx.snapshot = attached.snapshot;
-    ctx.identity = attached.identity;
-    return true;
-}
-
-fn attachThreadMain(ctx: *Attach) void {
-    const allocator = std.heap.c_allocator;
-    const host: ?[]const u8 = if (ctx.host) |value| value else null;
-    var conn: mux_client.Conn = undefined;
-    var have = false;
-    if (ctx.reuse) |value| {
-        conn = value;
-        ctx.reuse = null;
-        if (attachOnConn(ctx, &conn)) {
-            ctx.conn = conn;
-            _ = c.g_idle_add(@ptrCast(&onAttachIdle), @ptrCast(ctx));
-            return;
-        }
-        // The idle connection may have died between polls; one fresh
-        // dial before reporting failure.
-        conn.deinit();
-    }
-    if (mux_cli.muxConnect(allocator, host)) |fresh| {
-        conn = fresh;
-        have = true;
-    }
-    if (have) {
-        if (attachOnConn(ctx, &conn)) {
-            ctx.conn = conn;
-        } else {
-            conn.deinit();
-        }
-    }
-    _ = c.g_idle_add(@ptrCast(&onAttachIdle), @ptrCast(ctx));
-}
-
-fn onAttachIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const ctx = cast.userData(Attach, user);
-    const self = ctx.sw;
+fn onAttachReady(user: ?*anyopaque, job: *muxtabs.AttachJob) void {
+    const self = cast.userData(Switcher, user);
     const alive = !self.dead;
-    var ok = false;
-    if (alive and ctx.conn != null and ctx.snapshot != null) {
-        const conn = ctx.conn.?;
-        ctx.conn = null;
-        const snapshot = ctx.snapshot.?;
-        if (muxtabs.attachMuxPrepared(
-            self.win,
-            conn,
-            ctx.session,
-            if (ctx.host) |host| host else null,
-            snapshot.payload,
-            ctx.identity,
-            null,
-            null,
-            ctx.lease,
-        )) |_| {
-            ok = true;
-        } else |_| {}
-    }
-    ctx.destroy();
+    const ok = alive and job.finish();
     self.attaching = false;
-    if (!self.opDone()) return 0;
+    if (!self.opDone()) return;
     if (alive) {
         if (ok) {
             c.gtk_window_close(@ptrCast(self.window));
@@ -1550,7 +1455,6 @@ fn onAttachIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
             self.updateStatus();
         }
     }
-    return 0;
 }
 
 fn onKillClicked(button: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

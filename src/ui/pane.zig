@@ -111,6 +111,10 @@ pub const Pane = struct {
     win_on_set_profile: ?*const fn (ctx: ?*anyopaque, pane: *Pane, name: []const u8) void = null,
     /// Forward BEL events for tab-bar attention.
     win_bell_ctx: ?*anyopaque = null,
+    /// The titlebar lease chip was clicked (Window opens the assistant
+    /// surface for this pane's session).
+    win_chip_ctx: ?*anyopaque = null,
+    win_on_chip: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
     win_child_ctx: ?*anyopaque = null,
     win_on_bell: ?*const fn (ctx: ?*anyopaque, pane: *Pane) void = null,
     /// Fired when this pane gains keyboard focus, so the Window can
@@ -408,6 +412,13 @@ pub const Pane = struct {
         c.gtk_widget_set_visible(tb_take, 0);
         _ = c.g_signal_connect_data(tb_take, "clicked", @ptrCast(&onTakeControlClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         c.gtk_box_append(@ptrCast(tb_chip), tb_take);
+        c.gtk_widget_set_tooltip_text(tb_chip, "Click to see what the assistant is doing");
+        // The chip itself is the way to the assistant surface; the Take
+        // control button inside it keeps its own click.
+        const chip_click = c.gtk_gesture_click_new();
+        c.gtk_gesture_single_set_button(@ptrCast(chip_click), 1);
+        _ = c.g_signal_connect_data(chip_click, "released", @ptrCast(&onChipClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        c.gtk_widget_add_controller(tb_chip, @ptrCast(chip_click));
         c.gtk_box_append(@ptrCast(tb_box), tb_chip);
 
         // Click on the titlebar to focus the underlying GLArea so
@@ -2147,6 +2158,16 @@ fn updateControlChip(self: *Pane) bool {
     if (self.titlebar_take_btn) |btn| c.gtk_widget_set_visible(btn, @intFromBool(view_only));
     c.gtk_widget_set_visible(chip, 1);
     return view_only;
+}
+
+/// Titlebar lease chip clicked: hand the pane to the window's assistant
+/// surface. The gesture claims the release so the titlebar's own
+/// focus click does not also fire.
+fn onChipClicked(gesture: ?*c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
+    const self = cast.userData(Pane, user);
+    if (self.widgets_dead) return;
+    if (gesture) |g| _ = c.gtk_gesture_set_state(@ptrCast(g), c.GTK_EVENT_SEQUENCE_CLAIMED);
+    if (self.win_on_chip) |f| f(self.win_chip_ctx, self);
 }
 
 /// Titlebar "Take control": acquire the lease if free, evict the

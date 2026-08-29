@@ -80,7 +80,7 @@ pub const Lease = struct {
 
     /// Publish this MCP server and hold its ownership lock until deinit/process exit.
     pub fn acquire(allocator: std.mem.Allocator, registration: Registration) !Lease {
-        const dir = try ensureRegistryDir();
+        const dir = try ensureDir();
         const pid = c.getpid();
         const record_path = try std.fmt.allocPrint(allocator, "{s}/{d}.json", .{ dir, pid });
         errdefer allocator.free(record_path);
@@ -157,7 +157,9 @@ pub fn list(allocator: std.mem.Allocator, include_legacy: bool) ![]Entry {
     return out.toOwnedSlice(allocator);
 }
 
-fn ensureRegistryDir() ![]const u8 {
+/// The registry directory, created on first use so a GUI can watch it
+/// before any server has registered. Process-lifetime storage.
+pub fn ensureDir() ![]const u8 {
     const rt = platform.runtimeDir();
     var z: [4096]u8 = undefined;
     const base = std.fmt.bufPrintZ(&z, "{s}/sketerm", .{rt}) catch return error.PathTooLong;

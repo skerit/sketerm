@@ -844,6 +844,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     self.config = cloned;
     rebuildSymbolSpecs(self);
     @import("webface.zig").setMaxFps(self.config.browser_max_fps);
+    @import("webface.zig").setRouteDefaults(self.config.web_route, self.config.mux_tor_socks_endpoint);
     @import("webface.zig").setDiscardMinutes(self.config.web_discard_minutes);
     @import("webface.zig").setPopupPolicy(switch (self.config.web_popup_policy) {
         .block_gestureless => .block_gestureless,
@@ -1269,6 +1270,20 @@ pub fn refreshTitlebarCss(self: *Window) void {
         \\    border-radius: 7px;
         \\    margin: 1px 2px;
         \\}}
+        \\
+        \\/* Ambient assistant chip at the end of the tab bar: same
+        \\   accent family, clickable (it opens the watch popover). */
+        \\.sketerm-assistant-chip {{
+        \\    background-color: rgba(255, 120, 40, 0.92);
+        \\    color: white;
+        \\    font-weight: bold;
+        \\    font-size: 11px;
+        \\    padding: 0px 8px;
+        \\    border-radius: 8px;
+        \\    margin: 2px 6px;
+        \\    min-height: 18px;
+        \\}}
+        \\.sketerm-assistant-chip:hover {{ background-color: rgba(255, 140, 70, 1.0); }}
         \\
         \\/* Assistant-is-driving indicator: accent border on the
         \\   pane whose session has a headless MCP client attached,
