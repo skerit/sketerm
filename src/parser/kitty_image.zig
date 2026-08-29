@@ -20,6 +20,38 @@ pub const Action = enum {
     unknown,
 };
 
+/// True for the transmission media that name a PATH instead of
+/// carrying pixels: `t=f` file, `t=t` tempfile, `t=s` POSIX shm.
+///
+/// The one declaring home for that set. Everything that decides
+/// "this APC resolves against whatever host applies it" (the daemon's
+/// inline-or-drop gate, the client-side refusal, the file reader)
+/// consumes this rather than spelling the letters again; the client
+/// reader once listed only two of the three.
+pub fn isFileMedium(medium: u8) bool {
+    return switch (medium) {
+        'f', 't', 's' => true,
+        else => false,
+    };
+}
+
+/// The spec's safety rule for `t=t`: a terminal deletes the tempfile
+/// after reading it ONLY when its path contains this marker, so a
+/// client cannot aim the terminal's unlink at an arbitrary file.
+pub const TEMPFILE_MARKER = "tty-graphics-protocol";
+
+/// @return whether a `t=t` path may be unlinked after reading.
+pub fn tempfileDeletable(path: []const u8) bool {
+    return std.mem.indexOf(u8, path, TEMPFILE_MARKER) != null;
+}
+
+/// The path a `t=s` transmission names, as the daemon or client opens
+/// it: POSIX shm objects live under /dev/shm on Linux.
+pub fn shmPath(buf: []u8, name: []const u8) ?[]const u8 {
+    const bare = std.mem.trimStart(u8, name, "/");
+    return std.fmt.bufPrint(buf, "/dev/shm/{s}", .{bare}) catch null;
+}
+
 pub const Command = struct {
     action: Action = .unknown,
     /// Image id (`i=`).
@@ -251,4 +283,33 @@ test "unicode placement flag + grid size" {
     try std.testing.expectEqual(@as(u8, 1), cmd.unicode_placement);
     try std.testing.expectEqual(@as(u32, 4), cmd.cells_wide); // c=
     try std.testing.expectEqual(@as(u32, 2), cmd.cells_high); // r=
+}
+
+test "isFileMedium is the one home for the path-naming media" {
+    const t = std.testing;
+    // Every letter the parser can produce, classified against the
+    // three the protocol defines as path-naming.
+    var m: u16 = 0;
+    while (m < 256) : (m += 1) {
+        const medium: u8 = @intCast(m);
+        const expect = medium == 'f' or medium == 't' or medium == 's';
+        try t.expectEqual(expect, isFileMedium(medium));
+    }
+    // The parsed command's default medium is direct, never a file.
+    const cmd = try parse("Ga=T,f=100;QUJD");
+    try t.expect(!isFileMedium(cmd.medium));
+    try t.expect(isFileMedium((try parse("Ga=T,t=s;QUJD")).medium));
+}
+
+test "tempfileDeletable follows the spec's marker rule" {
+    const t = std.testing;
+    try t.expect(tempfileDeletable("/tmp/tty-graphics-protocol-abc"));
+    try t.expect(tempfileDeletable("/dev/shm/x/tty-graphics-protocol"));
+    try t.expect(!tempfileDeletable("/home/me/.ssh/id_rsa"));
+    try t.expect(!tempfileDeletable(""));
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("/dev/shm/obj", shmPath(&buf, "/obj").?);
+    try t.expectEqualStrings("/dev/shm/obj", shmPath(&buf, "obj").?);
+    var tiny: [4]u8 = undefined;
+    try t.expect(shmPath(&tiny, "obj") == null);
 }

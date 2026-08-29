@@ -19,6 +19,7 @@ const std = @import("std");
 const c = @import("../c.zig").c;
 const kitty = @import("../parser/kitty_image.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
+const unlinkPath = @import("../util/pathz.zig").unlinkPath;
 const image_size = @import("image_size.zig");
 
 pub const Frame = struct {
@@ -158,6 +159,13 @@ pub const Manager = struct {
     /// When true, finalize errors print to stderr (PNG decode fail,
     /// bad base64, RGB undersize, etc.). Wired by `--debug-images`.
     debug: bool = false,
+    /// Opt-in for the path-naming media (`kitty_image.isFileMedium`):
+    /// only a Screen fed by a LOCAL byte stream (the `replay` tool)
+    /// may open, and for `t=t` unlink, a path an APC names. Default
+    /// off, because every GUI Screen is fed from the mux wire, where
+    /// the daemon has already inlined or dropped these; a file-medium
+    /// APC arriving here can only be aimed at this host's disk.
+    file_media: bool = false,
     /// Cap on retained decoded-source bytes (0 = unlimited). Set from
     /// `config.image_memory_mb`. Past it, the OLDEST stored images are
     /// evicted FIFO — it is a retention target, never a per-image size
@@ -521,6 +529,8 @@ pub const Manager = struct {
             return self.reject(image_id, "poisoned chunk stream (OOM during append)", .{});
         }
 
+        if (kitty.isFileMedium(acc.medium) and !self.file_media)
+            return self.reject(image_id, "t={c} refused: this screen is fed from a transport, not a local terminal", .{acc.medium});
         if (acc.compression > 1)
             return self.reject(image_id, "unsupported compression o={d}", .{acc.compression});
         const raw_layout: ?RawLayout = switch (acc.format) {
@@ -567,23 +577,23 @@ pub const Manager = struct {
         var raw_bytes: []const u8 = decoded;
         var owned_file_data: ?[]u8 = null;
         defer if (owned_file_data) |b| self.allocator.free(b);
-        if (acc.medium == 't' or acc.medium == 'f') {
-            const path = std.mem.trimEnd(u8, decoded, "\x00 \r\n\t");
+        if (kitty.isFileMedium(acc.medium)) {
+            const named = std.mem.trimEnd(u8, decoded, "\x00 \r\n\t");
+            var shm_buf: [4096]u8 = undefined;
+            const path = if (acc.medium == 's')
+                kitty.shmPath(&shm_buf, named) orelse
+                    return self.reject(image_id, "t=s name too long", .{})
+            else
+                named;
+            // The spec's cleanup duty, with its safety rule: a tempfile
+            // is deleted only when its name carries the marker, an shm
+            // object always. Deferred so it runs after the read.
+            const cleanup = acc.medium == 's' or (acc.medium == 't' and kitty.tempfileDeletable(path));
+            defer if (cleanup) unlinkPath(path);
             const data = self.readFile(path) catch
-                return self.reject(image_id, "cannot read t=/f= file '{s}'", .{path});
+                return self.reject(image_id, "cannot read t={c} file '{s}'", .{ acc.medium, path });
             owned_file_data = data;
             raw_bytes = data;
-            if (acc.medium == 't') {
-                // Zig 0.16's std.fs.deleteFileAbsolute is gone — use libc.
-                var del_z: [4096]u8 = undefined;
-                if (path.len < del_z.len) {
-                    @memcpy(del_z[0..path.len], path);
-                    del_z[path.len] = 0;
-                    if (c.unlink(@ptrCast(&del_z)) != 0) {
-                        std.debug.print("sketerm: failed to delete kitty tempfile {s}\n", .{path});
-                    }
-                }
-            }
         }
 
         // Optional zlib decompression (`o=z`). Raw formats have an exact
@@ -1446,4 +1456,87 @@ test "unterminated chunked transmission is capped, not unbounded" {
     // Well under the cap: nothing poisoned, nothing dropped.
     try std.testing.expect(!acc.poisoned);
     try std.testing.expectEqual(@as(usize, 100 * chunk.len), acc.payload.items.len);
+}
+
+/// A tempfile carrying the spec marker, written with `contents`; the
+/// caller owns the returned path.
+fn testMarkedTempfile(contents: []const u8) ![]u8 {
+    var tmpl = "/tmp/sketerm-grid-tty-graphics-protocol-XXXXXX".*;
+    const fd = c.mkstemp(&tmpl);
+    if (fd < 0) return error.TempFailed;
+    defer _ = c.close(fd);
+    if (c.write(fd, contents.ptr, contents.len) != @as(isize, @intCast(contents.len))) return error.TempFailed;
+    return std.testing.allocator.dupe(u8, std.mem.sliceTo(&tmpl, 0));
+}
+
+fn testExists(path: []const u8) bool {
+    var z: [4096]u8 = undefined;
+    return c.access(pathZ(&z, path) catch return false, c.F_OK) == 0;
+}
+
+test "manager refuses file-medium transmissions unless the screen opts in" {
+    const a = std.testing.allocator;
+    // 1x1 RGBA in a marked tempfile: a t=t the daemon would inline.
+    const path = try testMarkedTempfile(&[_]u8{ 1, 2, 3, 4 });
+    defer {
+        unlinkPath(path);
+        a.free(path);
+    }
+    const path_b64 = try testBase64(a, path);
+    defer a.free(path_b64);
+    const cmd = kitty.Command{
+        .action = .transmit,
+        .image_id = 90,
+        .format = 32,
+        .width = 1,
+        .height = 1,
+        .medium = 't',
+        .payload = path_b64,
+    };
+
+    // Default (every GUI Screen): refused, and the file is NOT opened
+    // or unlinked -- the APC could only have been aimed at this disk.
+    var mgr = Manager.init(a);
+    defer mgr.deinit();
+    _ = mgr.ingest(cmd);
+    try std.testing.expect(mgr.get(90) == null);
+    try std.testing.expect(testExists(path));
+
+    // Opted in (the replay tool): read, stored, and the marked
+    // tempfile deleted per the spec.
+    var local = Manager.init(a);
+    defer local.deinit();
+    local.file_media = true;
+    _ = local.ingest(cmd);
+    const stored = local.get(90) orelse return error.NotStored;
+    try std.testing.expectEqual(@as(usize, 4), stored.rgba.len);
+    try std.testing.expect(!testExists(path));
+}
+
+test "manager keeps an unmarked t=t file even when opted in" {
+    const a = std.testing.allocator;
+    var tmpl = "/tmp/sketerm-grid-plain-XXXXXX".*;
+    const fd = c.mkstemp(&tmpl);
+    try std.testing.expect(fd >= 0);
+    try std.testing.expectEqual(@as(isize, 4), c.write(fd, "\x01\x02\x03\x04", 4));
+    _ = c.close(fd);
+    defer _ = c.unlink(@ptrCast(&tmpl));
+    const path = std.mem.sliceTo(&tmpl, 0);
+    const path_b64 = try testBase64(a, path);
+    defer a.free(path_b64);
+
+    var local = Manager.init(a);
+    defer local.deinit();
+    local.file_media = true;
+    _ = local.ingest(.{
+        .action = .transmit,
+        .image_id = 91,
+        .format = 32,
+        .width = 1,
+        .height = 1,
+        .medium = 't',
+        .payload = path_b64,
+    });
+    try std.testing.expect(local.get(91) != null);
+    try std.testing.expect(testExists(path));
 }

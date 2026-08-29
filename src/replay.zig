@@ -79,6 +79,9 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
     defer pool.deinit();
     const screen = try Screen.init(allocator, &pool, cols, rows);
     defer screen.deinit();
+    // The one local byte-stream consumer: a capture replayed here names
+    // files on THIS host on purpose, so file-medium kitty APCs are allowed.
+    screen.kitty_images.file_media = true;
 
     screen.sink = .{ .ctx = null, .on_image = onImage };
 
