@@ -1947,6 +1947,10 @@ fn sidebarChipRight(app: *appdrive.App, win_id: u32) usize {
 fn waitSidebarVisible(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u32) bool {
     var waited: u32 = 0;
     while (true) {
+        // Live head, not the last replica frame: a full-window commit
+        // of a 1250x950 window is over the harness's 1 MB backlog cap
+        // (see `viewerWaitOcr`), so frames arrive by resync only.
+        _ = app.drainLive(500);
         if ((sidebarChipRight(app, win_id) != 0) == want) return true;
         if (waited >= timeout_ms) return false;
         _ = app.pumpOnce(100);
@@ -5255,8 +5259,25 @@ fn viewerWaitOcr(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, 
         return true;
     }
     const deadline = clock.nowMs() + timeout_ms;
+    // The harness is an `mcp`-kind viewer, so the daemon PAUSES app
+    // frames toward it past MCP_NATIVE_BACKLOG (one full frame of a
+    // 1150x810 window is over 3 MB against a 1 MB cap) and only
+    // re-delivers them by a resync once the socket drains. A plain
+    // pump therefore hands back a frame that can be seconds old, and
+    // tesseract then spends the budget reading the OLD screen: the
+    // viewer stage's "first Left was lost" was exactly that, with the
+    // daemon log showing a 13s pause across the key. Drain to the live
+    // head before every capture, and OCR a frame only once.
+    var last_frame: u64 = 0;
     while (clock.nowMs() < deadline) {
-        _ = app.pumpOnce(250);
+        _ = app.drainLive(2_000);
+        if (app.winById(win_id)) |w| {
+            if (w.frames == last_frame) {
+                _ = app.pumpOnce(200);
+                continue;
+            }
+            last_frame = w.frames;
+        }
         const shot = app.snapshotRgba(win_id, null) catch continue;
         defer allocator.free(shot.px);
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -5348,6 +5369,81 @@ fn waitOcrWordCenter(
 /// "the frame cleared" wait even PASSES and the next content wait
 /// blames OCR. Reaping here also stops teardown signalling a pid the
 /// kernel may have handed to somebody else.
+/// One line of /proc state for a rig process (scheduler state, CPU
+/// time, wait channel) plus the host load, sampled twice 2s apart so
+/// a spinning or blocked process is told apart from an idle one.
+fn procDiag(pid: c.pid_t, label: [*:0]const u8) void {
+    if (pid <= 0) return;
+    var path_buf: [64:0]u8 = undefined;
+    var i: u32 = 0;
+    while (i < 2) : (i += 1) {
+        const stat_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/stat", .{pid}) catch return;
+        var buf: [1024]u8 = undefined;
+        var n: usize = 0;
+        if (c.fopen(stat_path.ptr, "rb")) |f| {
+            n = c.fread(&buf, 1, buf.len - 1, f);
+            _ = c.fclose(f);
+        }
+        var wbuf: [128]u8 = undefined;
+        var wn: usize = 0;
+        const wchan_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/wchan", .{pid}) catch return;
+        if (c.fopen(wchan_path.ptr, "rb")) |f| {
+            wn = c.fread(&wbuf, 1, wbuf.len - 1, f);
+            _ = c.fclose(f);
+        }
+        var lbuf: [128]u8 = undefined;
+        var ln: usize = 0;
+        if (c.fopen("/proc/loadavg", "rb")) |f| {
+            ln = c.fread(&lbuf, 1, lbuf.len - 1, f);
+            _ = c.fclose(f);
+        }
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: diag %s pid %d stat=[%.*s] wchan=[%.*s] load=[%.*s]\n", label, pid, @as(c_int, @intCast(n)), &buf, @as(c_int, @intCast(wn)), &wbuf, @as(c_int, @intCast(ln)), &lbuf);
+        if (i == 0) _ = c.usleep(2_000_000);
+    }
+}
+
+/// Where the seat's keyboard sits, hub side and harness side, for a
+/// window whose keys went missing.
+fn focusDiag(app: *appdrive.App, win_id: u32, label: [*:0]const u8) void {
+    const w = app.winById(win_id) orelse {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: diag focus %s: window %u is gone\n", label, win_id);
+        return;
+    };
+    const ch = app.chans.get(w.chan) orelse {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: diag focus %s: window %u chan %u unknown\n", label, win_id, w.chan);
+        return;
+    };
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: diag focus %s: win=%u chan=%u sid=%u hub_kbd_focus=%u sid_known=%d surfaces=%u harness_kbd_focus=%u\n", label, win_id, w.chan, w.sid, ch.comp.keyboard_focus, @as(c_int, @intFromBool(ch.comp.surfaces.contains(w.sid))), @as(c_uint, @intCast(ch.comp.surfaces.count())), app.kbd_focus);
+}
+
+/// Copy the rig daemon's log out of the runtime dir (deleted at exit)
+/// so a failure can be read against what the hub saw.
+fn keepMuxLog(rt: []const u8) void {
+    var src_buf: [512:0]u8 = undefined;
+    const src = std.fmt.bufPrintZ(&src_buf, "{s}/sketerm/mux.log", .{rt}) catch return;
+    const in = c.fopen(src.ptr, "rb") orelse return;
+    defer _ = c.fclose(in);
+    const out = c.fopen("/tmp/sketerm-e2e-mux-fail.log", "wb") orelse return;
+    defer _ = c.fclose(out);
+    var buf: [65536]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, in);
+        if (n == 0) break;
+        _ = c.fwrite(&buf, 1, n, out);
+    }
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: daemon log kept at /tmp/sketerm-e2e-mux-fail.log\n");
+}
+
+/// Every toplevel the display session shows, for a failure report.
+fn windowsDiag(app: *appdrive.App) void {
+    _ = app.pumpOnce(120);
+    for (app.windows.items) |w| {
+        const title: []const u8 = w.title orelse "";
+        const app_id: []const u8 = w.app_id orelse "";
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: diag window id=%u popup=%d frames=%llu %dx%d app_id=[%.*s] title=[%.*s]\n", w.id, @as(c_int, @intFromBool(w.popup)), @as(c_ulonglong, w.frames), w.w, w.h, @as(c_int, @intCast(app_id.len)), app_id.ptr, @as(c_int, @intCast(title.len)), title.ptr);
+    }
+}
+
 fn viewerDied() ?[]const u8 {
     if (vcast_pid <= 0) return null;
     var status: c_int = 0;
@@ -5654,10 +5750,24 @@ fn viewerCastStage(
     }
 
     // Left -> text again (the backwards direction into text).
+    focusDiag(app, vwin, "before-left-to-text");
     app.pressKey(vwin, "Left") catch return "injecting Left failed";
     if (!viewerWaitOcr(allocator, app, vwin, "QUILL", 25_000)) {
         if (viewerDied()) |why| return why;
         viewerShot(allocator, app, vwin, "back-to-text-quill");
+        focusDiag(app, vwin, "after-lost-left");
+        keepMuxLog(rt);
+        procDiag(vcast_pid, "viewer");
+        procDiag(child_pid, "gui");
+        procDiag(web_helper_pid, "webengine");
+        windowsDiag(app);
+        // Lost key or wedged viewer: a second Left that works means the
+        // first was never delivered; one that does not means the
+        // viewer stopped answering.
+        app.pressKey(vwin, "Left") catch {};
+        if (viewerWaitOcr(allocator, app, vwin, "QUILL", 25_000))
+            return "navigating back to the text item took a SECOND Left (the first key was lost)";
+        procDiag(vcast_pid, "viewer-after-retry");
         return "navigating back to the text item did not restore its content";
     }
 
