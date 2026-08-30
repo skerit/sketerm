@@ -1199,7 +1199,35 @@ const Client = struct {
     ack_webext_transaction: bool = false,
     ack_multi_client: bool = false,
     ack_presenter: bool = false,
+    ack_observe: bool = false,
     ack_flush: bool = false,
+
+    /// Observe family (stage ob). Last `ev_observe_view` and its
+    /// counters per state, last `ev_observe_state`.
+    obs_seq: u32 = 0,
+    obs_present_seq: u32 = 0,
+    obs_gone_seq: u32 = 0,
+    obs_target: u32 = 0,
+    obs_owner: u32 = 0,
+    obs_state: u8 = 0xff,
+    obs_opener: u32 = 0,
+    obs_w: u16 = 0,
+    obs_h: u16 = 0,
+    obs_url: [1024]u8 = @splat(0),
+    obs_url_len: usize = 0,
+    obs_title: [256]u8 = @splat(0),
+    obs_title_len: usize = 0,
+    ost_seq: u32 = 0,
+    ost_view: u32 = 0,
+    ost_target: u32 = 0,
+    ost_state: u8 = 0xff,
+    ost_control: u8 = 0xff,
+    ost_w: u16 = 0,
+    ost_h: u16 = 0,
+    ost_reason: [256]u8 = @splat(0),
+    ost_reason_len: usize = 0,
+    /// View id the last `frame_inline` named.
+    inline_view: u32 = 0,
     /// Bumped per `ev_flushed`; the token it carried.
     flushed_seq: u32 = 0,
     last_flush_token: u32 = 0,
@@ -1768,8 +1796,37 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_WEBEXT_TRANSACTION)) self.ack_webext_transaction = true;
                     if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.ack_multi_client = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRESENTER)) self.ack_presenter = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_OBSERVE)) self.ack_observe = true;
                     if (std.mem.eql(u8, cap, proto.CAP_FLUSH)) self.ack_flush = true;
                 }
+            },
+            .ev_observe_view => {
+                const ev = proto.decode(proto.EvObserveView, frame.payload) catch fail("ev_observe_view decode");
+                self.obs_seq += 1;
+                if (ev.state == proto.observe_view_present) self.obs_present_seq += 1;
+                if (ev.state == proto.observe_view_gone) self.obs_gone_seq += 1;
+                self.obs_target = ev.target;
+                self.obs_owner = ev.owner;
+                self.obs_state = ev.state;
+                self.obs_opener = ev.opener;
+                self.obs_w = ev.w;
+                self.obs_h = ev.h;
+                self.obs_url_len = @min(ev.url.len, self.obs_url.len);
+                @memcpy(self.obs_url[0..self.obs_url_len], ev.url[0..self.obs_url_len]);
+                self.obs_title_len = @min(ev.title.len, self.obs_title.len);
+                @memcpy(self.obs_title[0..self.obs_title_len], ev.title[0..self.obs_title_len]);
+            },
+            .ev_observe_state => {
+                const ev = proto.decode(proto.EvObserveState, frame.payload) catch fail("ev_observe_state decode");
+                self.ost_seq += 1;
+                self.ost_view = ev.view;
+                self.ost_target = ev.target;
+                self.ost_state = ev.state;
+                self.ost_control = ev.control;
+                self.ost_w = ev.w;
+                self.ost_h = ev.h;
+                self.ost_reason_len = @min(ev.reason.len, self.ost_reason.len);
+                @memcpy(self.ost_reason[0..self.ost_reason_len], ev.reason[0..self.ost_reason_len]);
             },
             .ev_flushed => {
                 const f = proto.decode(proto.EvFlushed, frame.payload) catch fail("ev_flushed decode");
@@ -1818,6 +1875,7 @@ const Client = struct {
                     area += @as(u32, r.w) * @as(u32, r.h);
                 }
                 self.inline_last_area = area;
+                self.inline_view = fi.view;
                 self.inline_seq += 1;
             },
             .ev_a11y_tree => {
@@ -5437,6 +5495,230 @@ fn runMultiClientStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const 
     pass("stage mc5 engine survived one client's death and exited with the last");
 }
 
+/// Cross-connection observation (capability "observe"): client B
+/// watches and then drives client A's page as a second client of the
+/// same helper. Every claim the GUI's Watch / Take control makes rides
+/// on this: enumeration with url and title, seeded title and pixels,
+/// a read-only observer's input dropped, a controlling observer's click
+/// changing the page for both, new pages announced, a destroyed page
+/// ending the subscription, and an observer leaving without touching
+/// the owner's views.
+fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/ob.sock", .{dir}) catch fail("ob sock path");
+    var cache_buf: [96]u8 = undefined;
+    const cache = std.fmt.bufPrintZ(&cache_buf, "{s}/ob-cache", .{dir}) catch fail("ob cache path");
+    const pid = spawnHelper(exe, sock.ptr, cache.ptr, "--ozone-platform=headless", null, false);
+    g_pid = pid;
+
+    // A red page that turns green and renames itself on a TRUSTED
+    // click; a read-only observer's click must leave both unchanged.
+    const alpha_page = "data:text/html,<html><head><title>ob:alpha</title><style>html,body{margin:0;min-height:100vh;background:red}</style></head><body onclick=\"document.body.style.background='lime';document.title='ob:clicked'\">alpha</body></html>";
+    const beta_page = "data:text/html,<html><head><title>ob:beta</title></head><body>beta</body></html>";
+    const gamma_page = "data:text/html,<html><head><title>ob:gamma</title></head><body>gamma</body></html>";
+
+    var a = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    a.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-ob-a" });
+    {
+        const d = nowMs() + 15_000;
+        while (a.ack_proto == 0 and nowMs() < d) a.pump(100);
+    }
+    if (a.ack_proto != proto.PROTO_VERSION) fail("stage ob1: client A got no hello_ack");
+    if (!a.ack_observe) fail("stage ob1: hello_ack lacks the observe capability");
+    a.send(proto.ViewCreate{ .view = 1, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+    a.have_view = true;
+    a.send(proto.Navigate{ .view = 1, .url = alpha_page });
+    if (!a.waitTitle("ob:alpha", 30_000)) fail("stage ob1: client A never saw its page title");
+
+    var b = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    b.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web-ob-b" });
+    {
+        const d = nowMs() + 15_000;
+        while (b.ack_proto == 0 and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (b.ack_proto != proto.PROTO_VERSION) fail("stage ob1: client B got no hello_ack");
+    // A is connection 1: its view 1 is engine-global 1 * WINDOW + 1.
+    const a_view1: u32 = proto.CONN_ID_WINDOW + 1;
+    const a_view2: u32 = proto.CONN_ID_WINDOW + 2;
+    b.send(proto.ObserveEnable{ .enable = 1 });
+    {
+        const d = nowMs() + 10_000;
+        while (b.obs_present_seq == 0 and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (b.obs_present_seq == 0) fail("stage ob1: observe_enable announced no page");
+    if (b.obs_target != a_view1) fail("stage ob1: the announced target is not A's view 1 in the engine namespace");
+    if (b.obs_owner != 1) fail("stage ob1: the announced owner is not connection 1");
+    if (!std.mem.startsWith(u8, b.obs_url[0..b.obs_url_len], "data:")) fail("stage ob1: the announcement carries no url");
+    if (!std.mem.startsWith(u8, b.obs_title[0..b.obs_title_len], "ob:alpha")) fail("stage ob1: the announcement carries no title");
+    if (b.obs_w != 320 or b.obs_h != 240) fail("stage ob1: the announcement carries the wrong geometry");
+    pass("stage ob1 an observer enumerates another client's page with url, title, owner and geometry");
+
+    // ── ob2: subscribe read-only: seeded title + pixels under B's id ──
+    b.send(proto.ObserveSubscribe{ .view = 1, .target = a_view1, .control = 0 });
+    b.have_view = true;
+    {
+        const d = nowMs() + 10_000;
+        while (b.ost_seq == 0 and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (b.ost_seq == 0) fail("stage ob2: observe_subscribe was not answered");
+    if (b.ost_state != proto.observe_subscribed) fail("stage ob2: the subscription was refused");
+    if (b.ost_view != 1 or b.ost_target != a_view1) fail("stage ob2: ev_observe_state names the wrong alias or target");
+    if (b.ost_control != 0) fail("stage ob2: a read-only subscription reports control");
+    if (b.ost_w != 320 or b.ost_h != 240) fail("stage ob2: ev_observe_state carries the wrong geometry");
+    {
+        const d = nowMs() + 15_000;
+        while (nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+            if (std.mem.startsWith(u8, b.titleSlice(), "ob:alpha") and b.inline_seq > 0) break;
+        }
+    }
+    if (!std.mem.startsWith(u8, b.titleSlice(), "ob:alpha")) fail("stage ob2: the observer was not seeded with the page title");
+    if (b.title_view != 1) fail("stage ob2: the seeded title is not under the observer's alias id");
+    if (b.inline_seq == 0) fail("stage ob2: the observer received no inline frame");
+    if (b.inline_view != 1) fail("stage ob2: the observer's frame is not under its alias id");
+    if (!b.waitInlineCenter(.{ 0x00, 0x00, 0xff }, 15_000)) {
+        const px = b.inlinePixel(b.iw / 2, b.ih / 2);
+        std.debug.print("smoke-web: ob2 centre pixel BGRA {d},{d},{d},{d} surface {d}x{d} frames {d} area {d}\n", .{ px[0], px[1], px[2], px[3], b.iw, b.ih, b.inline_seq, b.inline_last_area });
+        fail("stage ob2: the observer's frame does not show the red page");
+    }
+    if (b.fb != null) fail("stage ob2: an observer was announced a memfd buffer (frames must be inline)");
+    pass("stage ob2 a subscriber is seeded with the title and inline pixels under its own alias id");
+
+    // ── ob3: a read-only observer's input is dropped ───────────────
+    const cx: i32 = @intCast(b.iw / 2);
+    const cy: i32 = @intCast(b.ih / 2);
+    b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.move), .x = cx, .y = cy, .button = 0, .clicks = 0, .mods = 0 });
+    b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.down), .x = cx, .y = cy, .button = 0, .clicks = 1, .mods = 0 });
+    b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.up), .x = cx, .y = cy, .button = 0, .clicks = 1, .mods = 0 });
+    {
+        const d = nowMs() + 2_000;
+        while (nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (std.mem.startsWith(u8, a.titleSlice(), "ob:clicked")) fail("stage ob3: a read-only observer's click reached the page (owner saw the change)");
+    if (std.mem.startsWith(u8, b.titleSlice(), "ob:clicked")) fail("stage ob3: a read-only observer's click reached the page (observer saw the change)");
+    {
+        const px = b.inlinePixel(b.iw / 2, b.ih / 2);
+        if (!(px[0] == 0 and px[1] == 0 and px[2] == 0xff)) fail("stage ob3: the page changed under a read-only observer's click");
+    }
+    // The connection must SURVIVE the refusal: a dropped frame is not
+    // a protocol violation.
+    if (b.fd < 0) fail("stage ob3: the helper cut the observer for a refused input");
+    pass("stage ob3 a read-only observer's input is refused helper-side and changes nothing");
+
+    // ── ob4: take control: the click lands, both sides see it ──────
+    const ost_before = b.ost_seq;
+    b.send(proto.ObserveControl{ .view = 1, .control = 1 });
+    {
+        const d = nowMs() + 10_000;
+        while (b.ost_seq == ost_before and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (b.ost_seq == ost_before or b.ost_state != proto.observe_subscribed or b.ost_control != 1) fail("stage ob4: observe_control did not grant control");
+    b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.move), .x = cx, .y = cy, .button = 0, .clicks = 0, .mods = 0 });
+    b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.down), .x = cx, .y = cy, .button = 0, .clicks = 1, .mods = 0 });
+    b.send(proto.InputPointer{ .view = 1, .kind = @intFromEnum(proto.PointerKind.up), .x = cx, .y = cy, .button = 0, .clicks = 1, .mods = 0 });
+    {
+        const d = nowMs() + 20_000;
+        while (nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+            if (std.mem.startsWith(u8, a.titleSlice(), "ob:clicked") and std.mem.startsWith(u8, b.titleSlice(), "ob:clicked")) break;
+        }
+    }
+    if (!std.mem.startsWith(u8, a.titleSlice(), "ob:clicked")) fail("stage ob4: the owner did not see the controlling observer's click");
+    if (!std.mem.startsWith(u8, b.titleSlice(), "ob:clicked")) fail("stage ob4: the observer did not see its own click's title change");
+    if (a.title_view != 1) fail("stage ob4: the owner's title event left its namespace");
+    if (!b.waitInlineCenter(.{ 0x00, 0xff, 0x00 }, 15_000)) fail("stage ob4: the observer's frame did not turn green after its click");
+    pass("stage ob4 a controlling observer's click changes the page for owner and observer alike");
+
+    // ── ob5: a new page of A is announced to B ────────────────────
+    const present_before = b.obs_present_seq;
+    a.send(proto.ViewCreate{ .view = 2, .w = 300, .h = 200, .scale_x1000 = 1000, .context = 0 });
+    a.send(proto.Navigate{ .view = 2, .url = beta_page });
+    {
+        const d = nowMs() + 15_000;
+        while (b.obs_present_seq == present_before and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (b.obs_present_seq == present_before) fail("stage ob5: A's second view was not announced");
+    if (b.obs_target != a_view2 or b.obs_owner != 1) fail("stage ob5: the announcement names the wrong view or owner");
+    if (b.obs_w != 300 or b.obs_h != 200) fail("stage ob5: the announcement carries the wrong geometry");
+    pass("stage ob5 a page the owner opens while watched is announced to the observer");
+
+    // ── ob6: the owner destroys a subscribed page: the alias ends ──
+    const ost_sub2 = b.ost_seq;
+    b.send(proto.ObserveSubscribe{ .view = 2, .target = a_view2, .control = 0 });
+    {
+        const d = nowMs() + 10_000;
+        while (b.ost_seq == ost_sub2 and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (b.ost_seq == ost_sub2 or b.ost_view != 2 or b.ost_state != proto.observe_subscribed) fail("stage ob6: the second subscription was not acknowledged");
+    const ost_end = b.ost_seq;
+    const gone_before = b.obs_gone_seq;
+    a.send(proto.ViewDestroy{ .view = 2 });
+    {
+        const d = nowMs() + 10_000;
+        while (nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+            if (b.ost_seq != ost_end and b.obs_gone_seq != gone_before) break;
+        }
+    }
+    if (b.ost_seq == ost_end or b.ost_view != 2 or b.ost_state != proto.observe_ended) fail("stage ob6: destroying the target did not end the subscription");
+    if (b.obs_gone_seq == gone_before or b.obs_target != a_view2) fail("stage ob6: the destroyed page was not announced gone");
+    // Alias 1 (the surviving page) is untouched: a navigation by the
+    // owner still reaches the observer under it.
+    a.send(proto.Navigate{ .view = 1, .url = beta_page });
+    {
+        const d = nowMs() + 20_000;
+        while (nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+            if (std.mem.startsWith(u8, b.titleSlice(), "ob:beta")) break;
+        }
+    }
+    if (!std.mem.startsWith(u8, b.titleSlice(), "ob:beta") or b.title_view != 1) fail("stage ob6: the surviving alias stopped receiving the owner's navigation");
+    pass("stage ob6 the owner destroying a view ends the observer's subscription and only that one");
+
+    // ── ob7: the observer leaves; the owner's view is intact ──────
+    b.have_view = false;
+    b.deinit();
+    _ = c.usleep(300_000);
+    {
+        var status: c_int = 0;
+        if (c.waitpid(pid, &status, c.WNOHANG) == pid) {
+            g_pid = -1;
+            fail("stage ob7: the engine exited when the observer left");
+        }
+    }
+    a.send(proto.Navigate{ .view = 1, .url = gamma_page });
+    if (!a.waitTitle("ob:gamma", 20_000)) fail("stage ob7: the owner's view did not survive the observer disconnecting");
+    a.have_view = false;
+    a.deinit();
+    reapHelperTimeout(pid, "stage ob7 last-client exit", 30_000);
+    pass("stage ob7 an observer disconnecting leaves the owner's views intact");
+}
+
 /// Spawn a helper with an explicit argv tail — the flush/linger stages
 /// need three extra tokens (`--ozone-platform=headless --linger-ms N`),
 /// which outgrows spawnHelper's two optional slots.
@@ -6192,6 +6474,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         }
         say("smoke-web: PASS (cookie sync only)");
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_WEB_OBSERVE_ONLY") != null) {
+        runObserveStage(gpa, exe, dir);
+        cleanup();
+        if (gpa_state.deinit() == .leak) {
+            say("smoke-web: FAIL leaked memory (see GPA report above)");
+            return 1;
+        }
+        say("smoke-web: PASS (observe only)");
         return 0;
     }
 
@@ -9103,6 +9395,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     runUboStage(gpa, exe, dir, ubo_xpi);
     // ── Stage mc: multi-client serving ────────────────────────────
     runMultiClientStage(gpa, exe, dir);
+    runObserveStage(gpa, exe, dir);
     // ── Stage fl: flush + linger (broker-owned lifecycle) ─────────
     runFlushLingerStage(gpa, exe, dir);
     // ── Stage 42: cross-instance cookie sync (two real helpers) ───

@@ -103,6 +103,12 @@ var web_helper_pid: c.pid_t = -1;
 /// `main` has built it.
 var g_rt_buf: [256]u8 = undefined;
 var g_rt: []const u8 = "";
+/// The GUI under test's GApplication id, PER RUN: two rigs on one
+/// session bus (parallel agents, a user's run beside an agent's) would
+/// otherwise share one id, and the second GUI silently activates the
+/// first instance and exits, which reads as "socket never appeared".
+var g_app_id_buf: [64:0]u8 = undefined;
+var g_app_id: [:0]const u8 = "dev.sker.sketerm.e2e";
 
 /// The prefix every run's isolated runtime dir is built from; the
 /// harness pid follows. Unique enough that a process whose environment
@@ -464,6 +470,7 @@ pub fn main() u8 {
     // and shut it down.
     const rt = std.fmt.bufPrintZ(&g_rt_buf, RT_PREFIX ++ "{d}", .{c.getpid()}) catch return fail("runtime path");
     g_rt = rt;
+    g_app_id = std.fmt.bufPrintZ(&g_app_id_buf, "dev.sker.sketerm.e2e.p{d}", .{c.getpid()}) catch return fail("app id");
     _ = c.mkdir(rt.ptr, 0o700);
     _ = c.setenv("XDG_RUNTIME_DIR", rt.ptr, 1);
     _ = c.setenv("XDG_CONFIG_HOME", rt.ptr, 1);
@@ -624,13 +631,26 @@ pub fn main() u8 {
         _ = c.setenv("SKETERM_SSH", ssh_path.ptr, 1);
     }
 
+    // The app-view policy is written, not defaulted: the assistant
+    // chip stage proves an explicit Watch forces a TAB (with the app
+    // EMBEDDED) against `app_view = window`, and a default that
+    // happened to match would prove nothing.
+    {
+        var cfg_dir_buf: [300:0]u8 = undefined;
+        const cfg_dir = std.fmt.bufPrintZ(&cfg_dir_buf, "{s}/sketerm", .{rt}) catch return fail("config dir path");
+        _ = c.mkdir(cfg_dir.ptr, 0o700);
+        var cfg_buf: [320:0]u8 = undefined;
+        const cfg = std.fmt.bufPrintZ(&cfg_buf, "{s}/config.conf", .{cfg_dir}) catch return fail("config path");
+        if (!writeFile(cfg, "# smoke-e2e\napp_view = window\n")) return fail("could not write the isolated config.conf");
+    }
+
     // Spawn the freshly-built binary with its own app id so it
     // doesn't join a running user instance via GApplication.
     const pid = c.fork();
     if (pid < 0) return fail("fork");
     if (pid == 0) {
         platform.dieWithParent();
-        _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2e", 1);
+        _ = c.setenv("SKETERM_APP_ID", g_app_id.ptr, 1);
         if (have_wl) {
             // The ONLY display this child can reach is sketerm's own
             // hub. X11 is unreachable on purpose: GtkIMMulticontext
@@ -705,6 +725,19 @@ pub fn main() u8 {
     if (c.getenv("SKETERM_SMOKE_E2E_WEB_ONLY") != null) {
         if (mcpWebReaderStage(allocator, sock_path, rt)) |why| return failMsg(why);
         say("mcp GUI web adapter: focused reader-ID stage passed");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_WATCH_ONLY") != null) {
+        const app = drive orelse return fail("focused assistant-watch smoke has no display driver");
+        if (assistantChipStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("assistant chip: focused embedded-app watch stage passed");
+        if (have_web_action) {
+            if (assistantWebWatchStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+            say("assistant web watch: focused browser watch stage passed");
+        } else {
+            say("SKIP assistant web watch stage (sketerm-webengine is not built)");
+        }
         teardown();
         return 0;
     }
@@ -902,7 +935,14 @@ pub fn main() u8 {
         say("watch-along: driver attach raised the accent indicator, detach retired it, and a read-only watch pane showed the view-only chip");
 
         if (assistantChipStage(allocator, app, sock_path)) |why| return failMsg(why);
-        say("assistant chip: an isolated MCP app raised the tab-bar chip, Watch forced a closable view-only tab under app_view=window, and closing it left the app alive");
+        say("assistant chip: an isolated MCP app raised the tab-bar chip, Watch forced a closable view-only tab under app_view=window with the app EMBEDDED, and closing it left the app alive");
+
+        if (have_web_action) {
+            if (assistantWebWatchStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+            say("assistant web watch: Watch opened the assistant's page as a web tab, read-only input was refused, Take control drove it, and closing the tab left the page alive");
+        } else {
+            say("SKIP assistant web watch stage (sketerm-webengine is not built; run `zig build web` first)");
+        }
 
         if (have_web_action) {
             if (webActionGuiStage(allocator, app, sock_path)) |why| return failMsg(why);
@@ -3046,11 +3086,49 @@ fn waitAssistantChip(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u3
     return null;
 }
 
+/// Magenta pixels in the window: the solid image the chip stage's
+/// fixture app (`sketerm view`) shows, so its presence in the MAIN
+/// window is the proof that the forwarded app is EMBEDDED in the tab
+/// rather than floating in a window of its own.
+fn magentaPixels(app: *appdrive.App, win_id: u32) usize {
+    for (app.windows.items) |w| {
+        if (w.id != win_id or w.w <= 0 or w.h <= 0) continue;
+        const width: usize = @intCast(w.w);
+        const height: usize = @intCast(w.h);
+        const px = w.pixels.items;
+        if (px.len < width * height * 4) return 0;
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i + 3 < px.len) : (i += 4) {
+            const b: i32 = px[i];
+            const g: i32 = px[i + 1];
+            const r: i32 = px[i + 2];
+            if (r > 200 and g < 60 and b > 200) n += 1;
+        }
+        return n;
+    }
+    return 0;
+}
+
+/// Non-popup toplevels currently mapped on the display session.
+fn toplevelCount(app: *appdrive.App) usize {
+    _ = app.pumpOnce(120);
+    var n: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or w.frames == 0) continue;
+        n += 1;
+    }
+    return n;
+}
+
 /// Ambient assistant surface end to end: an isolated `sketerm mcp`
 /// with one app=true session must raise the tab-bar chip with no
-/// configuration and no --shared. With the default app_view=window,
-/// its popover's explicit Watch must still force a closable tab, expose
-/// Take control there, and leave the assistant's app alive after close.
+/// configuration and no --shared. The fixture is a REAL app with a
+/// toplevel (`sketerm view` on a solid magenta image). Against the
+/// config's explicit app_view=window, the popover's Watch must force a
+/// closable tab whose pane EMBEDS that toplevel (magenta in the main
+/// window, no new toplevel on the display), expose Take control there,
+/// and leave the assistant's app alive after close.
 fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
     if (!@import("util/ocr.zig").available()) {
         say("SKIP assistant chip: tesseract unavailable; the chip and popover are driven by OCR");
@@ -3074,13 +3152,29 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     var m_open = true;
     defer if (m_open) m.close();
     if (!m.initialize()) return "the isolated MCP server never answered initialize";
-    const opened = m.call(
-        "launch_app",
-        "{\"command\":[\"/bin/sh\",\"-c\",\"printf 'SK_CHIP_OK\\n'; sleep 300\"],\"wait_for\":\"exit\",\"wait_ms\":100,\"stable_ms\":0}",
-        30_000,
-    ) orelse return "launch_app on the isolated MCP timed out";
-    const app_id = mcpNum(opened, "app") orelse
-        return whyf("launch_app named no app id: {s}", .{opened[0..@min(opened.len, 300)]});
+    // The fixture: the image viewer on a solid magenta picture, its own
+    // app identity so it cannot join the GUI under test.
+    var img_buf: [512:0]u8 = undefined;
+    const img_path = std.fmt.bufPrintZ(&img_buf, "{s}/chip-fixture.png", .{g_rt}) catch return "fixture image path";
+    if (!writeSolidPng(allocator, img_path.ptr, 0xff, 0x00, 0xff)) return "could not write the fixture image";
+    var bin_buf: [4096]u8 = undefined;
+    const bin = c.realpath("zig-out/bin/sketerm", &bin_buf) orelse return "could not resolve zig-out/bin/sketerm";
+    var launch_buf: [8192]u8 = undefined;
+    const launch = std.fmt.bufPrint(
+        &launch_buf,
+        "{{\"command\":[\"{s}\",\"view\",\"{s}\"],\"env\":{{\"SKETERM_APP_ID\":\"dev.sker.sketerm.e2echip\",\"GTK_A11Y\":\"none\"}},\"wait_for\":\"window\",\"wait_ms\":30000,\"stable_ms\":0}}",
+        .{ std.mem.span(bin), img_path },
+    ) catch return "launch_app arguments did not fit";
+    const toplevels_before = toplevelCount(app);
+    const opened = m.call("launch_app", launch, 60_000) orelse return "launch_app on the isolated MCP timed out";
+    // The reply carries the window's inline screenshot, which can push
+    // the structured lane past McpChild's line buffer; the text lane
+    // opens with "app N", which is the same fact.
+    const app_id = mcpNum(opened, "app") orelse parseNumAfter(opened, "\"text\":\"app ") orelse {
+        var f_buf: [128:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&f_buf, "zig-out/smoke-e2e-launch-reply.txt", .{}) catch null) |fp| _ = writeFile(fp, opened);
+        return whyf("launch_app named no app id (reply in zig-out/smoke-e2e-launch-reply.txt): {s}", .{opened[0..@min(opened.len, 300)]});
+    };
     if (mcpHas(opened, "isError"))
         return whyf("launch_app failed: {s}", .{opened[0..@min(opened.len, 300)]});
 
@@ -3126,17 +3220,34 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
         if (tabs_now > tabs_before) break;
     }
     if (tabs_now <= tabs_before) return "Watch obeyed app_view=window instead of opening the assistant app in a tab";
-    const watched_pane: u32 = blk: {
+    {
         const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
             return "listing panes after Watch failed";
         defer allocator.free(r);
         var now: [64]u32 = undefined;
         const n = listPaneIds(r, &now);
-        for (now[0..n]) |id| if (!contains(keep_ids[0..keep_n], id)) break :blk id;
-        return "Watch added a tab but no pane";
-    };
-    if (!waitPaneText(allocator, sock_path, watched_pane, "SK_CHIP_OK", 20_000))
-        return "the watched app pane never received the assistant session's output";
+        var added = false;
+        for (now[0..n]) |id| if (!contains(keep_ids[0..keep_n], id)) {
+            added = true;
+        };
+        if (!added) return "Watch added a tab but no pane";
+    }
+    // EMBEDDED, not floating: the app's magenta canvas paints inside
+    // the main window, and no toplevel of its own appeared on the
+    // display. Before the ordering fix in attachMuxPreparedMode this
+    // produced the placeholder terminal plus a chrome-less window.
+    var embed_waited: u32 = 0;
+    while (embed_waited < 20_000 and magentaPixels(app, win_id) < 5_000) : (embed_waited += 250)
+        _ = app.pumpOnce(250);
+    if (magentaPixels(app, win_id) < 5_000) {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-assistant-noembed.png", shot.png);
+        } else |_| {}
+        return "the watched app was not embedded in the tab (no magenta canvas in the main window; see zig-out/smoke-e2e-assistant-noembed.png)";
+    }
+    if (toplevelCount(app) != toplevels_before)
+        return "a free-floating app window survived the Watch tab (the app must be embedded, not floated)";
     var chip_waited: u32 = 0;
     while (chip_waited < 10_000 and accentPixels(app, win_id) < accent_before_watch + 150) : (chip_waited += 200)
         _ = app.pumpOnce(200);
@@ -3161,6 +3272,303 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);
     if (!retired) return "the assistant chip survived the assistant exiting";
+    return null;
+}
+
+/// Lease chip pixels for a Take control button: the pane titlebar's
+/// button carries the accent; OCR finds its word.
+fn colorBox(app: *appdrive.App, win_id: u32, comptime pred: fn (r: i32, g: i32, b: i32) bool) ?ChipBox {
+    for (app.windows.items) |w| {
+        if (w.id != win_id or w.w <= 0 or w.h <= 0) continue;
+        const width: usize = @intCast(w.w);
+        const height: usize = @intCast(w.h);
+        const px = w.pixels.items;
+        if (px.len < width * height * 4) return null;
+        var n: usize = 0;
+        var min_x: usize = width;
+        var min_y: usize = height;
+        var max_x: usize = 0;
+        var max_y: usize = 0;
+        var y: usize = 0;
+        while (y < height) : (y += 1) {
+            var x: usize = 0;
+            while (x < width) : (x += 1) {
+                const i = (y * width + x) * 4;
+                if (pred(px[i + 2], px[i + 1], px[i])) {
+                    n += 1;
+                    min_x = @min(min_x, x);
+                    min_y = @min(min_y, y);
+                    max_x = @max(max_x, x);
+                    max_y = @max(max_y, y);
+                }
+            }
+        }
+        if (n < 2_000) return null;
+        return .{
+            .x = @floatFromInt(min_x),
+            .y = @floatFromInt(min_y),
+            .w = @floatFromInt(max_x - min_x + 1),
+            .h = @floatFromInt(max_y - min_y + 1),
+        };
+    }
+    return null;
+}
+
+/// The pane titlebar's accent lease chip (below the tab-bar band).
+fn paneChipBox(app: *appdrive.App, win_id: u32) ?ChipBox {
+    for (app.windows.items) |w| {
+        if (w.id != win_id or w.w <= 0 or w.h <= 0) continue;
+        const width: usize = @intCast(w.w);
+        const height: usize = @intCast(w.h);
+        const px = w.pixels.items;
+        if (px.len < width * height * 4) return null;
+        var n: usize = 0;
+        var min_x: usize = width;
+        var min_y: usize = height;
+        var max_x: usize = 0;
+        var max_y: usize = 0;
+        var y: usize = CHIP_BAND_PX;
+        while (y < height) : (y += 1) {
+            var x: usize = 0;
+            while (x < width) : (x += 1) {
+                const i = (y * width + x) * 4;
+                const b: i32 = px[i];
+                const g: i32 = px[i + 1];
+                const r: i32 = px[i + 2];
+                if (r > 220 and g > 85 and g < 160 and b < 90) {
+                    n += 1;
+                    min_x = @min(min_x, x);
+                    min_y = @min(min_y, y);
+                    max_x = @max(max_x, x);
+                    max_y = @max(max_y, y);
+                }
+            }
+        }
+        if (n < MIN_CHIP_PX) return null;
+        return .{
+            .x = @floatFromInt(min_x),
+            .y = @floatFromInt(min_y),
+            .w = @floatFromInt(max_x - min_x + 1),
+            .h = @floatFromInt(max_y - min_y + 1),
+        };
+    }
+    return null;
+}
+
+fn waitPaneChip(app: *appdrive.App, win_id: u32, timeout_ms: u32) ?ChipBox {
+    var waited: u32 = 0;
+    while (waited <= timeout_ms) : (waited += 200) {
+        if (paneChipBox(app, win_id)) |box| return box;
+        _ = app.pumpOnce(200);
+    }
+    return null;
+}
+
+fn isRed(r: i32, g: i32, b: i32) bool {
+    return r > 200 and g < 60 and b < 60;
+}
+
+fn isLime(r: i32, g: i32, b: i32) bool {
+    return r < 60 and g > 200 and b < 60;
+}
+
+fn waitColorBox(app: *appdrive.App, win_id: u32, comptime pred: fn (r: i32, g: i32, b: i32) bool, timeout_ms: u32) ?ChipBox {
+    var waited: u32 = 0;
+    while (waited <= timeout_ms) : (waited += 200) {
+        if (colorBox(app, win_id, pred)) |box| return box;
+        _ = app.pumpOnce(200);
+    }
+    return null;
+}
+
+/// An assistant's BROWSER, watched as a browser: an isolated `sketerm
+/// mcp` opens a page, the chip's Watch opens that page as an ordinary
+/// web tab (a WebFace with the page's url in its address bar), never a
+/// forwarded-app window or a placeholder terminal; a read-only watch's
+/// click changes nothing; the pane's Take control makes the next click
+/// change the page; closing the tab leaves the assistant's page alive
+/// and changed (its own `web_eval` reads the new title).
+fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
+    if (!@import("util/ocr.zig").available()) {
+        say("SKIP assistant web watch: tesseract unavailable; the chip and popover are driven by OCR");
+        return null;
+    }
+    if (app.windows.items.len == 0) return "the display session lost its window";
+    const win_id = app.windows.items[0].id;
+    var keep_ids: [64]u32 = undefined;
+    var keep_n: usize = 0;
+    {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "list roundtrip failed before the web watch stage";
+        defer allocator.free(r);
+        keep_n = listPaneIds(r, &keep_ids);
+    }
+    const tabs_before = tabCount(allocator, sock_path) orelse return "tab count unavailable before the web watch stage";
+    const toplevels_before = toplevelCount(app);
+
+    // The page: red, and a trusted click turns it lime and renames it.
+    var page_buf: [512:0]u8 = undefined;
+    const page = std.fmt.bufPrintZ(&page_buf, "{s}/watch-page.html", .{rt}) catch return "watch page path";
+    if (!writeFile(page,
+        "<html><head><title>watch:red</title><style>html,body{margin:0;min-height:100vh;background:red}</style></head>" ++
+        "<body onclick=\"document.body.style.background='lime';document.title='watch:clicked'\">watch</body></html>"))
+        return "could not write the watch page";
+
+    var web_bin_buf: [4096]u8 = undefined;
+    const web_bin = c.realpath("zig-out/bin/sketerm-webengine", &web_bin_buf) orelse
+        return "could not resolve sketerm-webengine for the web watch stage";
+    _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    if (assistantChipBox(app, win_id) != null)
+        return "an assistant chip was already showing before the web watch MCP registered";
+    var m = spawnIsolatedMcp(allocator) orelse return "could not spawn an isolated `sketerm mcp`";
+    var m_open = true;
+    defer if (m_open) m.close();
+    if (!m.initialize()) return "the web watch MCP server never answered initialize";
+    var args: [1024]u8 = undefined;
+    const open_args = std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"timeout_ms\":45000,\"snapshot\":\"none\"}}", .{page}) catch
+        return "web_open arguments did not fit";
+    const opened = m.call("web_open", open_args, 90_000) orelse return "web_open on the isolated MCP timed out";
+    if (mcpHas(opened, "isError"))
+        return whyf("web_open failed: {s}", .{opened[0..@min(opened.len, 400)]});
+    const caps = m.call("capabilities", "{}", 30_000) orelse return "capabilities timed out";
+    if (!mcpHas(caps, "\"web_observe\":true"))
+        return whyf("capabilities does not report web_observe:true: {s}", .{capsExcerpt(caps, "web_observe")});
+
+    // The chip, its popover, its Watch.
+    const chip = waitAssistantChip(app, win_id, true, 30_000) orelse
+        return "no assistant chip appeared for the browsing MCP";
+    if (openPopup(app) != null) return "a popup surface was already open before the chip was clicked";
+    app.click(win_id, chip.x + chip.w / 2, chip.y + chip.h / 2, 1) catch return "clicking the assistant chip failed";
+    const pop_id = waitPopup(app, true, 10_000) orelse return "the assistant chip opened no popover surface";
+    const watch = waitOcrWordCenter(allocator, app, pop_id, "Watch", 10_000) orelse {
+        if (app.screenshotPng(pop_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-webwatch-nopopover.png", shot.png);
+        } else |_| {}
+        return "the assistant popover showed no Watch button (see zig-out/smoke-e2e-webwatch-nopopover.png)";
+    };
+    app.click(pop_id, watch.x, watch.y, 1) catch return "clicking Watch failed";
+
+    // A WEB tab: a face whose address bar carries the page's url.
+    var waited: u32 = 0;
+    var web_pane: u32 = 0;
+    while (waited < 30_000) : (waited += 250) {
+        _ = app.pumpOnce(250);
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse continue;
+        defer allocator.free(r);
+        if (std.mem.indexOf(u8, r, "watch-page.html")) |at| {
+            // The view record: `"pane":N` precedes the url in each entry.
+            const head = r[0..at];
+            const pane_at = std.mem.lastIndexOf(u8, head, "\"pane\":") orelse continue;
+            web_pane = parseNumAfter(head[pane_at..], "\"pane\":") orelse continue;
+            break;
+        }
+    }
+    if (web_pane == 0) {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-webwatch-notab.png", shot.png);
+        } else |_| {}
+        return "Watch opened no web tab showing the assistant's page url (see zig-out/smoke-e2e-webwatch-notab.png)";
+    }
+    if (contains(keep_ids[0..keep_n], web_pane)) return "the watched page landed in a pre-existing pane";
+    const tabs_now = tabCount(allocator, sock_path) orelse tabs_before;
+    if (tabs_now != tabs_before + 1) return "Watch opened something other than exactly one new tab";
+    if (toplevelCount(app) != toplevels_before) return "Watch raised a toplevel of its own (a forwarded-app window)";
+    {
+        // The new pane is the web pane and nothing else: no placeholder
+        // terminal for the app session.
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "listing panes after Watch failed";
+        defer allocator.free(r);
+        var now: [64]u32 = undefined;
+        const n = listPaneIds(r, &now);
+        for (now[0..n]) |id| {
+            if (contains(keep_ids[0..keep_n], id)) continue;
+            if (id != web_pane) return "Watch added a pane besides the web page (an app-session placeholder)";
+        }
+    }
+    // The page's red surface painted in the main window.
+    const red = waitColorBox(app, win_id, isRed, 30_000) orelse {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-webwatch-noframe.png", shot.png);
+        } else |_| {}
+        return "the watched page never painted its red surface into the web tab (see zig-out/smoke-e2e-webwatch-noframe.png)";
+    };
+    if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("zig-out/smoke-e2e-webwatch-tab.png", shot.png);
+    } else |_| {}
+
+    // Read-only: a real click on the page changes nothing.
+    app.click(win_id, red.x + red.w / 2, red.y + red.h / 2, 1) catch return "clicking the watched page failed";
+    if (waitColorBox(app, win_id, isLime, 2_500) != null) return "a read-only watch's click changed the assistant's page";
+    {
+        const title = m.call("web_eval", "{\"code\":\"document.title\"}", 30_000) orelse return "web_eval timed out";
+        if (mcpHas(title, "isError") or !mcpHas(title, "watch:red"))
+            return whyf("web_eval could not read the page title during the read-only check: {s}", .{title[0..@min(title.len, 300)]});
+        if (mcpHas(title, "watch:clicked")) return "a read-only watch's click reached the assistant's page";
+    }
+
+    // Take control from the pane's own lease chip: the accent-coloured
+    // chip in the pane titlebar, BELOW the tab bar's own assistant chip;
+    // its right end is the button (OCR cannot read its 11px label).
+    const take = waitPaneChip(app, win_id, 10_000) orelse {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-webwatch-notake.png", shot.png);
+        } else |_| {}
+        return "the watched web pane offered no Take control (see zig-out/smoke-e2e-webwatch-notake.png)";
+    };
+    if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("zig-out/smoke-e2e-webwatch-viewonly.png", shot.png);
+    } else |_| {}
+    app.clickEx(win_id, take.x + take.w - 12, take.y + take.h / 2, 1, 100, 1) catch return "clicking Take control failed";
+    // Control granted: the chip loses its button (the box narrows).
+    var chip_waited: u32 = 0;
+    var narrowed = false;
+    while (chip_waited < 8_000 and !narrowed) : (chip_waited += 200) {
+        _ = app.pumpOnce(200);
+        if (paneChipBox(app, win_id)) |now| narrowed = now.w + 20 < take.w else narrowed = true;
+    }
+    if (!narrowed) {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-webwatch-notaken.png", shot.png);
+        } else |_| {}
+        return whyf("clicking Take control at {d},{d} (chip {d},{d} {d}x{d}) did not flip the pane's lease chip (see zig-out/smoke-e2e-webwatch-notaken.png)", .{ take.x + take.w - 12, take.y + take.h / 2, take.x, take.y, take.w, take.h });
+    }
+    _ = app.waitIdle(300, 5_000);
+    var control_waited: u32 = 0;
+    var lime: ?ChipBox = null;
+    while (control_waited < 15_000 and lime == null) : (control_waited += 500) {
+        app.click(win_id, red.x + red.w / 2, red.y + red.h / 2, 1) catch return "clicking the controlled page failed";
+        lime = waitColorBox(app, win_id, isLime, 500);
+    }
+    if (lime == null) {
+        if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("zig-out/smoke-e2e-webwatch-nocontrol.png", shot.png);
+        } else |_| {}
+        return "a click after Take control did not change the assistant's page (see zig-out/smoke-e2e-webwatch-nocontrol.png)";
+    }
+
+    // Close the tab: the assistant's page lives on, changed by our click.
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    _ = app.waitIdle(300, 5_000);
+    {
+        const title = m.call("web_eval", "{\"code\":\"document.title\"}", 30_000) orelse return "web_eval after closing the watch timed out";
+        if (mcpHas(title, "isError") or !mcpHas(title, "watch:clicked"))
+            return whyf("closing the watch tab did not leave the assistant's clicked page alive: {s}", .{title[0..@min(title.len, 300)]});
+    }
+    m.close();
+    m_open = false;
+    const retired = waitAssistantChip(app, win_id, false, 30_000) != null;
+    if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
+    _ = app.waitIdle(200, 4_000);
+    if (!retired) return "the assistant chip survived the browsing assistant exiting";
     return null;
 }
 
@@ -9775,7 +10183,7 @@ fn themeSingletonStage(
     for (app.windows.items) |w| {
         if (w.popup) continue;
         const id = w.app_id orelse continue;
-        if (!std.mem.eql(u8, id, "dev.sker.sketerm.e2e")) continue;
+        if (!std.mem.eql(u8, id, g_app_id)) continue;
         app.pressKey(w.id, "escape") catch return "restoring main GUI keyboard focus failed";
         _ = app.waitIdle(200, 2_000);
         break;
