@@ -1,5 +1,62 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-30: the web_gui grant -- the user's own browser for web_* only
+
+**The assistant was logged in nowhere.** Isolated `sketerm mcp` (the
+default) drove the user's real browser tabs only with a GUI control
+socket, and isolated mode honoured only an explicit `--socket`;
+otherwise the web tools ran a private `sketerm-webengine` with its own
+empty cookie jar under `web-profiles/<instance>/`. The one way to the
+user's logins was `--shared`, which is vetoed for a reason: it pierces
+isolation for every tool, not just the browser.
+
+**One setting, three sources, web tools only.** `web_gui` is the name
+everywhere: `web_gui = true` in config.conf's bare `[mcp]` section
+(new; the defaults every run reads, `tools` included) or in the
+`[mcp.<name>]` that `--profile` selects (a profile that omits the key
+inherits `[mcp]`), then `SKETERM_MCP_WEB_GUI=1|0` (a non-boolean value
+exits 2, like a bad tool policy), then `--web-gui`. The grant lives in
+`src/ipc/mcp_webgui.zig` as the web tools' OWN socket state; it never
+flips `mcp.guiSocketAttached()`, so terminal, app, file and panel tools
+stay on the private daemon. `mcp_web.guiDrivesWeb()` is the one
+"GUI-backed?" predicate the web code reads (profile/route/engine
+preflights, `pick`, `capabilities`).
+
+**Lazy, re-checked, fail closed.** Nothing is touched until the first
+`web_*` call (`capabilities` never connects). Then: `$SKETERM_SOCKET`
+if the server runs inside a pane, else ANY live GUI socket
+(`client.discoverGuiSocket(.any)`, the `.single` rule stays scripting's
+-- any window can host a web tab), else `sketerm web` spawned DETACHED
+(double fork, own session, stdio on /dev/null because the MCP's stdio
+IS the JSON-RPC stream, `SKETERM_MUX_IDLE_EXIT` unset so the user's
+real daemon never inherits the private-instance retirement;
+`SKETERM_GUI_BIN` names another executable, started as `<bin> web`)
+and waited for, 15s bounded. Every later web call re-probes the held
+socket and re-discovers or re-spawns when the GUI went away. With no
+GUI reachable the call answers `unavailable` with the reason -- never
+the headless jar, since a quietly not-logged-in browser is exactly the
+bug. `capabilities` reports `web_gui`, `web_gui_source`
+(`none|config|env|flag`) and `web_gui_transport`
+(`none|discovered|spawned|explicit`), schema enums drift-tested against
+the Zig enums, `web_backend: gui` while granted, and one text-lane line
+in both states; the GUI-mode refusals (profiles, policy, accept_cert,
+web_key/resize) name the grant beside `--shared/--socket`.
+
+Proof: unit tests for the precedence and the fail-closed state machine
+(scripted Ops, no sockets), a `pick` test that a granted-but-unreachable
+GUI is `unavailable` with zero backend requests, config round-trip for
+`[mcp]`; smoke-mcp `webGuiGrantStage` runs a fake `sketerm web` (the
+smoke binary itself under `SKETERM_SMOKE_FAKE_GUI`, binding
+`<rt>/sketerm/<pid>.sock` and journaling requests) and proves: no grant
+= the old facts and no connection; each source = facts, lazy
+transport, `web_open` landing on the GUI journal, `term_open` and
+`launch_app` still on the private daemon; env 0 over config, flag over
+env 0, profile inheritance, bad env exits 2; no GUI = spawn (detached,
+stdout not inherited, idle-exit not leaked), kill it = re-spawn; and
+`SKETERM_GUI_BIN=/bin/true` = the described `unavailable` after 15s
+with no headless helper socket. `zig build test`, `test-core`,
+`smoke-mcp` and `mux-portable -Dportable-target=aarch64-macos` green.
+
 ## 2026-08-30: the browser gets a clipboard, and real popups
 
 **Paste did not work anywhere in the browser, and the paste chord was
