@@ -1,5 +1,38 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-30: what the operation-root and watch-tab pass left behind
+
+An audit of the two fixes below found both real but neither finished.
+
+**The watch dead end survived.** Forcing Watch into a tab fixed the two
+popover buttons, but activating the same session's ROW in the Session
+Overview still followed `app_view` policy and produced a tabless
+`AppSession` — no pane, so no titlebar chip, and `requestControl` has
+exactly one GUI call site, on a pane that does not exist. `sessionShown`
+then greyed out both popover buttons and filtered the row away.
+`sessionPlacement` now distinguishes pane-backed from tabless and
+`escalateTablessSession` materializes the existing viewer instead of
+attaching a second one. A forced tab also survives a preference save:
+both config reapply sites re-derived `app_view_tab` over it.
+
+**Operation roots missed several verbs.** Registers kept the bug the
+clipboard lost — marking a directory and something beneath it made
+`deleteRegister` delete the tree and then fail on the child with NOENT —
+so the store now keeps a register in operation-root form in either
+marking order. Batch rename needs the opposite rule, since both paths
+must be renamed: `deepestFirst` schedules children ahead of the parent
+that would move them. `collect` also stopped duplicating
+`nav.entryForPath` and dropped a scan measured at 2.0s for a 50k-row
+selection on the GTK main thread, and its tests now drive `collect`
+rather than the private `collapse`.
+
+**A committed mutation is never reported as a failure.** Post-commit
+directory fsync failures replied `ok=false` for rename, mkdir and
+delete, so the client discarded its undo record and said "operation
+failed" for something that had already landed. `renameNoReplace` also
+grew the `unsupported` answer `renameExchange` always had; without it a
+filesystem lacking RENAME_NOREPLACE failed every browser rename.
+
 ## 2026-08-30: file operation roots and explicit assistant watch tabs
 
 **File operations.** A tree selection can contain both a real directory and
