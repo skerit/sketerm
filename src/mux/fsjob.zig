@@ -5225,10 +5225,6 @@ fn runCopyRootLink(spec: Spec) u8 {
                 _ = c.unlink(temp_z);
                 return emitError("install symlink crossed filesystems");
             },
-            .unsupported => {
-                _ = c.unlink(temp_z);
-                return emitError("this filesystem cannot install a link without risking an overwrite");
-            },
             .failed => {
                 _ = c.unlink(temp_z);
                 return emitError("install symlink failed");
@@ -5375,10 +5371,6 @@ fn copyOneFile(src: []const u8, dst: []const u8, src_st: c.struct_stat, allow_re
             .cross_device => {
                 _ = c.unlink(pp);
                 return .{ .err = "install destination crossed filesystems" };
-            },
-            .unsupported => {
-                _ = c.unlink(pp);
-                return .{ .err = "this filesystem cannot install a file without risking an overwrite" };
             },
             .failed => {
                 _ = c.unlink(pp);

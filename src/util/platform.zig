@@ -42,9 +42,6 @@ pub const RenameNoReplaceResult = union(enum) {
     ok,
     exists,
     cross_device,
-    /// The filesystem has no no-replace rename at all, so the caller
-    /// cannot get atomic no-clobber semantics here by any means.
-    unsupported,
     failed: std.posix.E,
 };
 pub const RenameExchangeResult = enum { ok, unsupported, cross_device, failed };
@@ -67,17 +64,18 @@ fn movesIntoOwnSubtree(old_path: [*:0]const u8, new_path: [*:0]const u8) bool {
 /// one case that is genuinely EINVAL is separated out first.
 fn noReplaceUnsupported(old_path: [*:0]const u8, new_path: [*:0]const u8, err: std.posix.E) RenameNoReplaceResult {
     if (movesIntoOwnSubtree(old_path, new_path)) return .{ .failed = err };
-    return .unsupported;
+    return renameNoReplaceCompat(old_path, new_path);
 }
 
-/// Atomically install `old_path` at a destination that must not exist.
+/// Install `old_path` at a destination that must not exist.
 ///
-/// `unsupported` is its own answer, not a failure: NFS, CIFS and a
-/// pre-4.x overlayfs upper have no RENAME_NOREPLACE (and a pre-3.15
-/// kernel has no renameat2 at all), which `renameExchange` already
-/// learned — src/web/webext/install.zig records what collapsing that
-/// into a permanent failure cost there. Callers must NOT paper over it
-/// with a plain `rename`: that is a non-atomic clobber, not a fallback.
+/// Flagged rename first: RENAME_NOREPLACE on Linux, RENAME_EXCL on
+/// Darwin. A filesystem without it is ordinary, not exotic: NFS, CIFS,
+/// a pre-4.x overlayfs upper, ZFS before 2.2 (EINVAL, which is what a
+/// Proxmox host answers) and a pre-3.15 kernel (no renameat2 at all).
+/// Those get `renameNoReplaceCompat`, the closest no-clobber the
+/// filesystem offers; refusing them outright meant no file could ever
+/// be moved on such a host.
 pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameNoReplaceResult {
     if (is_linux) {
         const linux = std.os.linux;
@@ -85,7 +83,7 @@ pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameN
             .SUCCESS => .ok,
             .EXIST => .exists,
             .XDEV => .cross_device,
-            .NOSYS, .OPNOTSUPP => .unsupported,
+            .NOSYS, .OPNOTSUPP => renameNoReplaceCompat(old_path, new_path),
             .INVAL => noReplaceUnsupported(old_path, new_path, .INVAL),
             else => |err| .{ .failed = err },
         };
@@ -95,10 +93,106 @@ pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameN
     return switch (std.posix.errno(rc)) {
         .EXIST => .exists,
         .XDEV => .cross_device,
-        .NOSYS, .OPNOTSUPP => .unsupported,
+        .NOSYS, .OPNOTSUPP => renameNoReplaceCompat(old_path, new_path),
         .INVAL => noReplaceUnsupported(old_path, new_path, .INVAL),
         else => |err| .{ .failed = err },
     };
+}
+
+/// No-clobber rename for a filesystem without a flagged rename.
+///
+/// A non-directory goes `link` then `unlink`: `link` refuses an existing
+/// target atomically, so this is exactly RENAME_NOREPLACE spelled out
+/// (the source briefly has two names; a crash there leaves both, never
+/// neither). Directories cannot be hard-linked, and some filesystems
+/// (CIFS, FAT) refuse `link` for files too; both fall to `lstat` then
+/// plain `rename`, whose window between the two calls is the same one
+/// every other file manager accepts on such a filesystem.
+pub fn renameNoReplaceCompat(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameNoReplaceResult {
+    var st: c.struct_stat = undefined;
+    if (c.lstat(old_path, &st) != 0) return .{ .failed = std.posix.errno(@as(c_int, -1)) };
+    if ((st.st_mode & c.S_IFMT) != c.S_IFDIR) {
+        const lrc = c.link(old_path, new_path);
+        if (lrc == 0) {
+            // The new name exists; losing the old one now is the only
+            // failure that leaves work behind, and it is a duplicate,
+            // not a loss.
+            if (c.unlink(old_path) != 0) return .{ .failed = std.posix.errno(@as(c_int, -1)) };
+            return .ok;
+        }
+        switch (std.posix.errno(lrc)) {
+            .EXIST => return .exists,
+            .XDEV => return .cross_device,
+            // No hard links here (CIFS, FAT, some FUSE): stat-then-rename.
+            .PERM, .OPNOTSUPP, .NOSYS, .ACCES, .MLINK => {},
+            else => |err| return .{ .failed = err },
+        }
+    }
+    var target: c.struct_stat = undefined;
+    if (c.lstat(new_path, &target) == 0) return .exists;
+    const rc = c.rename(old_path, new_path);
+    if (rc == 0) return .ok;
+    return switch (std.posix.errno(rc)) {
+        .EXIST, .NOTEMPTY => .exists,
+        .XDEV => .cross_device,
+        else => |err| .{ .failed = err },
+    };
+}
+
+test "renameNoReplaceCompat moves files and directories and refuses an existing target" {
+    const t = std.testing;
+    var dir_buf: [64]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "/tmp/sk-noreplace-{d}", .{c.getpid()}) catch unreachable;
+    _ = c.mkdir(dir, 0o700);
+    defer {
+        var p: [96]u8 = undefined;
+        for ([_][]const u8{ "b", "c/f", "c", "d", "e" }) |n| {
+            const z = std.fmt.bufPrintZ(&p, "{s}/{s}", .{ dir, n }) catch unreachable;
+            _ = c.unlink(z);
+            _ = c.rmdir(z);
+        }
+        _ = c.rmdir(dir);
+    }
+    var pa: [96]u8 = undefined;
+    var pb: [96]u8 = undefined;
+    var pc: [96]u8 = undefined;
+    var pd: [96]u8 = undefined;
+    var pe: [96]u8 = undefined;
+    const a = std.fmt.bufPrintZ(&pa, "{s}/a", .{dir}) catch unreachable;
+    const b = std.fmt.bufPrintZ(&pb, "{s}/b", .{dir}) catch unreachable;
+    const cdir = std.fmt.bufPrintZ(&pc, "{s}/c", .{dir}) catch unreachable;
+    const d = std.fmt.bufPrintZ(&pd, "{s}/d", .{dir}) catch unreachable;
+    const e = std.fmt.bufPrintZ(&pe, "{s}/e", .{dir}) catch unreachable;
+
+    // File: link+unlink path.
+    const fd = c.open(a, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
+    try t.expect(fd >= 0);
+    _ = c.close(fd);
+    try t.expect(renameNoReplaceCompat(a, b) == .ok);
+    var st: c.struct_stat = undefined;
+    try t.expect(c.lstat(a, &st) != 0);
+    try t.expect(c.lstat(b, &st) == 0);
+    // An existing target is refused, and the source is untouched.
+    try t.expect(renameNoReplaceCompat(b, b) == .exists);
+    try t.expect(c.lstat(b, &st) == 0);
+    // A missing source is a plain errno.
+    try t.expect(renameNoReplaceCompat(a, e) == .failed);
+
+    // Directory: lstat+rename path, with a file inside surviving.
+    try t.expect(c.mkdir(cdir, 0o700) == 0);
+    var pf: [96]u8 = undefined;
+    const f = std.fmt.bufPrintZ(&pf, "{s}/f", .{cdir}) catch unreachable;
+    const ffd = c.open(f, c.O_WRONLY | c.O_CREAT | c.O_EXCL, @as(c_uint, 0o600));
+    try t.expect(ffd >= 0);
+    _ = c.close(ffd);
+    try t.expect(c.mkdir(e, 0o700) == 0);
+    try t.expect(renameNoReplaceCompat(cdir, e) == .exists);
+    try t.expect(c.lstat(f, &st) == 0);
+    try t.expect(renameNoReplaceCompat(cdir, d) == .ok);
+    var pg: [96]u8 = undefined;
+    const g = std.fmt.bufPrintZ(&pg, "{s}/f", .{d}) catch unreachable;
+    try t.expect(c.lstat(g, &st) == 0);
+    _ = c.unlink(g);
 }
 
 test "a no-replace rename into its own subtree is EINVAL, not an unsupported filesystem" {

@@ -2106,9 +2106,6 @@ test "fs_reply errors classify transient link failures as transport" {
     try std.testing.expectEqualStrings("permanent", fsErrKind("NOENT"));
     try std.testing.expectEqualStrings("permanent", fsErrKind("NOSPC"));
     try std.testing.expectEqualStrings("permanent", fsErrKind("cannot fsync directory parent"));
-    // A filesystem without RENAME_NOREPLACE never grows one: retrying
-    // this is pure waste, so it must not classify as transport.
-    try std.testing.expectEqualStrings("permanent", fsErrKind("NOREPLACE"));
     try std.testing.expectEqualStrings("transport", fsErrKind("TIMEDOUT"));
     try std.testing.expectEqualStrings("transport", fsErrKind("read failed: CONNRESET"));
     // Tag must stand alone, never match inside a longer word.
@@ -2254,10 +2251,6 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
                 .ok => {},
                 .exists => return fsReplyErr(cl, r.req, "EXIST"),
                 .cross_device => return fsReplyErr(cl, r.req, "XDEV"),
-                // Its own token, not an errno: the filesystem has no
-                // no-replace rename at all, so retrying never helps and
-                // a plain rename would be a silent clobber.
-                .unsupported => return fsReplyErr(cl, r.req, "NOREPLACE"),
                 .failed => |err| return fsReplyErr(cl, r.req, @tagName(err)),
             }
         } else {
