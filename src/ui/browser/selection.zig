@@ -528,10 +528,15 @@ pub fn markPaths(self: *BrowserView, tab: *BTab, name: []const u8, paths: []cons
     var full = false;
     const store = regStore(self);
     for (paths) |p| {
+        const entry = entryForPath(tab, p);
         switch (store.add(name, .{
             .host = tab.hc.host orelse "",
             .path = p,
-            .dir = if (entryForPath(tab, p)) |e| e.tdir else false,
+            .dir = if (entry) |e| e.tdir else false,
+            // Only a REAL directory carries what is beneath it, which is
+            // what lets the store keep the register in operation-root
+            // form; a symlinked directory must stay independent.
+            .real_dir = if (entry) |e| std.mem.eql(u8, e.kind, "dir") else false,
         })) {
             .added => added += 1,
             .full => full = true,
@@ -1023,10 +1028,12 @@ fn markResults(self: *BrowserView, tab: *BTab, name: []const u8) void {
         const target = e.target orelse continue;
         // A collection row's target is already a host-qualified spec;
         // a query row's is a plain path on the tab's own host.
-        const item = if (tab.root.collection)
+        const real_dir = std.mem.eql(u8, e.kind, "dir");
+        var item = if (tab.root.collection)
             registers.entryFromSpec(target, e.tdir)
         else
             registers.Entry{ .host = host, .path = target, .dir = e.tdir };
+        item.real_dir = real_dir;
         items.append(self.allocator, item) catch break;
     }
     markEntries(self, name, items.items);

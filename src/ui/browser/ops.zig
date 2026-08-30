@@ -1155,7 +1155,16 @@ pub fn onEditorRenameDone(
         return;
     }
     var renamed: usize = 0;
-    for (er.paths.items, names.items) |old, new_name| {
+    // Deepest first, for the same reason as the popover batch: a parent
+    // renamed ahead of its child invalidates the child's queued path.
+    const order = oproots.deepestFirst(self.allocator, er.paths.items) catch {
+        self.setStatus("editor rename not started: out of memory");
+        return;
+    };
+    defer self.allocator.free(order);
+    for (order) |i| {
+        const old = er.paths.items[i];
+        const new_name = names.items[i];
         const base = std.fs.path.basename(old);
         if (std.mem.eql(u8, base, new_name)) continue;
         if (std.mem.indexOfScalar(u8, new_name, '/') != null) continue;
@@ -1225,8 +1234,16 @@ pub fn onBatchRenameApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     }
     var renamed: usize = 0;
     // The path mirror IS the selection (synced from the model on
-    // every change), so the batch reads it directly.
-    for (tab.selected.items) |sel_path| {
+    // every change), so the batch reads it directly. Deepest first:
+    // renaming a selected parent before its selected child would leave
+    // the child's queued path pointing at a directory that moved.
+    const order = oproots.deepestFirst(self.allocator, tab.selected.items) catch {
+        self.setStatus("batch rename not started: out of memory");
+        return menuDone(ctx);
+    };
+    defer self.allocator.free(order);
+    for (order) |sel_index| {
+        const sel_path = tab.selected.items[sel_index];
         const base = std.fs.path.basename(sel_path);
         const parent = std.fs.path.dirname(sel_path) orelse continue;
         // Replace ALL occurrences of `find` in the basename.

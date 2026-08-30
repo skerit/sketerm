@@ -1451,14 +1451,26 @@ test "JobRow keeps the identifying TAIL of an over-long current file" {
 /// A listing entry owned by `a`, for the Dir tests below and for
 /// nav.zig's entryForPath test.
 pub fn testEntry(a: std.mem.Allocator, name: []const u8, target: ?[]const u8) !Entry {
+    return testEntryKind(a, name, "file", target, false);
+}
+
+/// `testEntry` with the daemon's `kind` string and the browsable-directory
+/// flag spelled out, for tests that turn on the real-dir-vs-symlink rule.
+pub fn testEntryKind(
+    a: std.mem.Allocator,
+    name: []const u8,
+    kind: []const u8,
+    target: ?[]const u8,
+    tdir: bool,
+) !Entry {
     return .{
         .name = try a.dupe(u8, name),
-        .kind = try a.dupe(u8, "file"),
+        .kind = try a.dupe(u8, kind),
         .size = 0,
         .mode = 0,
         .mtime_ms = 0,
         .target = if (target) |t| try a.dupe(u8, t) else null,
-        .tdir = false,
+        .tdir = tdir,
     };
 }
 

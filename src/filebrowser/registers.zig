@@ -50,7 +50,13 @@ pub const Entry = struct {
     /// Empty = the local daemon (same convention as model.FileRef).
     host: []const u8 = "",
     path: []const u8 = "",
+    /// Browsable as a directory — a real directory OR a symlink to one.
+    /// Chooses the delete verb (`delete_tree` vs `delete`).
     dir: bool = false,
+    /// A REAL directory, so an operation on it carries everything
+    /// beneath it. A symlinked directory is `dir` but not `real_dir`:
+    /// moving the link leaves the target's children where they are.
+    real_dir: bool = false,
 
     pub fn ref(self: Entry) model.FileRef {
         return .{ .host = self.host, .path = self.path };
@@ -181,22 +187,61 @@ pub const Store = struct {
         return &self.regs.items[self.regs.items.len - 1];
     }
 
+    /// True when `path` names something strictly beneath `dir`, on a
+    /// path-component boundary so `/dir` never covers `/directory`.
+    fn beneath(path: []const u8, dir: []const u8) bool {
+        if (path.len <= dir.len or !std.mem.startsWith(u8, path, dir)) return false;
+        return (dir.len == 1 and dir[0] == '/') or path[dir.len] == '/';
+    }
+
     /// Mark (host, path) in `name`, creating the register if needed.
+    ///
+    /// A register is kept in OPERATION-ROOT form: a real directory and
+    /// something beneath it can never both be members, in either order.
+    /// Without that, `deleteRegister` deletes the parent tree and then
+    /// fails on the child with NOENT, and `copyRegisterHere` copies the
+    /// child twice. The rule lives here because marks arrive one at a
+    /// time from several places, so collapsing at any single call site
+    /// would only hold for that call.
     pub fn add(self: *Store, name: []const u8, entry: Entry) Change {
         if (entry.path.len == 0) return .full;
         if (self.contains(name, entry.host, entry.path)) return .already;
         const reg = self.ensureReg(name) orelse return .full;
+        // Already carried by a marked real directory: nothing to add.
+        for (reg.entries.items) |e| {
+            if (!e.real_dir or !std.mem.eql(u8, e.host, entry.host)) continue;
+            if (beneath(entry.path, e.path)) return .already;
+        }
         if (reg.entries.items.len >= MAX_ENTRIES) return .full;
         const host = self.allocator.dupe(u8, entry.host) catch return .full;
         const path = self.allocator.dupe(u8, entry.path) catch {
             self.allocator.free(host);
             return .full;
         };
-        reg.entries.append(self.allocator, .{ .host = host, .path = path, .dir = entry.dir }) catch {
+        reg.entries.append(self.allocator, .{
+            .host = host,
+            .path = path,
+            .dir = entry.dir,
+            .real_dir = entry.real_dir,
+        }) catch {
             self.allocator.free(host);
             self.allocator.free(path);
             return .full;
         };
+        // A real directory subsumes members marked earlier.
+        if (entry.real_dir) {
+            var j: usize = 0;
+            while (j < reg.entries.items.len) {
+                const e = reg.entries.items[j];
+                if (std.mem.eql(u8, e.host, entry.host) and beneath(e.path, entry.path)) {
+                    self.allocator.free(e.host);
+                    self.allocator.free(e.path);
+                    _ = reg.entries.orderedRemove(j);
+                    continue;
+                }
+                j += 1;
+            }
+        }
         return .added;
     }
 
@@ -320,6 +365,36 @@ pub fn filePath(allocator: std.mem.Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "{s}/.local/state/sketerm/registers.json", .{home});
     }
     return std.fmt.allocPrint(allocator, "/tmp/sketerm-registers.json", .{});
+}
+
+test "a register keeps operation-root form in either marking order" {
+    const t = std.testing;
+    var store = Store.init(t.allocator);
+    defer store.deinit();
+
+    // Child first, then its real directory: the parent evicts it.
+    try t.expectEqual(Change.added, store.add("r", .{ .path = "/srv/dir/child.txt" }));
+    try t.expectEqual(Change.added, store.add("r", .{ .path = "/srv/dir", .dir = true, .real_dir = true }));
+    try t.expectEqual(@as(usize, 1), store.entriesOf("r").len);
+    try t.expectEqualStrings("/srv/dir", store.entriesOf("r")[0].path);
+
+    // Directory first, then a child: the child is already carried.
+    try t.expectEqual(Change.already, store.add("r", .{ .path = "/srv/dir/other.txt" }));
+    try t.expectEqual(@as(usize, 1), store.entriesOf("r").len);
+
+    // A byte prefix is not a path prefix.
+    try t.expectEqual(Change.added, store.add("r", .{ .path = "/srv/dir2" }));
+    try t.expectEqual(@as(usize, 2), store.entriesOf("r").len);
+
+    // A different host is a different tree.
+    try t.expectEqual(Change.added, store.add("r", .{ .host = "box", .path = "/srv/dir/child.txt" }));
+    try t.expectEqual(@as(usize, 3), store.entriesOf("r").len);
+
+    // A SYMLINKED directory carries nothing: moving the link leaves the
+    // target's children where they are, so they stay independent marks.
+    try t.expectEqual(Change.added, store.add("r", .{ .path = "/srv/link", .dir = true, .real_dir = false }));
+    try t.expectEqual(Change.added, store.add("r", .{ .path = "/srv/link/child.txt" }));
+    try t.expectEqual(@as(usize, 5), store.entriesOf("r").len);
 }
 
 test "a register spans hosts and survives an encode/decode round trip" {
