@@ -42,11 +42,42 @@ pub const RenameNoReplaceResult = union(enum) {
     ok,
     exists,
     cross_device,
+    /// The filesystem has no no-replace rename at all, so the caller
+    /// cannot get atomic no-clobber semantics here by any means.
+    unsupported,
     failed: std.posix.E,
 };
 pub const RenameExchangeResult = enum { ok, unsupported, cross_device, failed };
 
+/// True when `new_path` names `old_path` itself or something beneath
+/// it — the one ordinary mistake that also answers EINVAL, and the
+/// reason `renameNoReplace` cannot map EINVAL to `unsupported` blindly
+/// the way `renameExchange` does.
+fn movesIntoOwnSubtree(old_path: [*:0]const u8, new_path: [*:0]const u8) bool {
+    const old = std.mem.span(old_path);
+    const new = std.mem.span(new_path);
+    if (std.mem.eql(u8, old, new)) return true;
+    if (new.len <= old.len or !std.mem.startsWith(u8, new, old)) return false;
+    return (old.len == 1 and old[0] == '/') or new[old.len] == '/';
+}
+
+/// Classify the answer shared by "this filesystem has no such flag" and
+/// "these arguments are wrong". `renameExchange` below collapses both
+/// into `unsupported`; here the caller acts on the difference, so the
+/// one case that is genuinely EINVAL is separated out first.
+fn noReplaceUnsupported(old_path: [*:0]const u8, new_path: [*:0]const u8, err: std.posix.E) RenameNoReplaceResult {
+    if (movesIntoOwnSubtree(old_path, new_path)) return .{ .failed = err };
+    return .unsupported;
+}
+
 /// Atomically install `old_path` at a destination that must not exist.
+///
+/// `unsupported` is its own answer, not a failure: NFS, CIFS and a
+/// pre-4.x overlayfs upper have no RENAME_NOREPLACE (and a pre-3.15
+/// kernel has no renameat2 at all), which `renameExchange` already
+/// learned — src/web/webext/install.zig records what collapsing that
+/// into a permanent failure cost there. Callers must NOT paper over it
+/// with a plain `rename`: that is a non-atomic clobber, not a fallback.
 pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameNoReplaceResult {
     if (is_linux) {
         const linux = std.os.linux;
@@ -54,6 +85,8 @@ pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameN
             .SUCCESS => .ok,
             .EXIST => .exists,
             .XDEV => .cross_device,
+            .NOSYS, .OPNOTSUPP => .unsupported,
+            .INVAL => noReplaceUnsupported(old_path, new_path, .INVAL),
             else => |err| .{ .failed = err },
         };
     }
@@ -62,8 +95,21 @@ pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameN
     return switch (std.posix.errno(rc)) {
         .EXIST => .exists,
         .XDEV => .cross_device,
+        .NOSYS, .OPNOTSUPP => .unsupported,
+        .INVAL => noReplaceUnsupported(old_path, new_path, .INVAL),
         else => |err| .{ .failed = err },
     };
+}
+
+test "a no-replace rename into its own subtree is EINVAL, not an unsupported filesystem" {
+    const t = std.testing;
+    try t.expect(movesIntoOwnSubtree("/srv/dir", "/srv/dir/inner"));
+    try t.expect(movesIntoOwnSubtree("/srv/dir", "/srv/dir"));
+    try t.expect(movesIntoOwnSubtree("/", "/anything"));
+    // A byte prefix is not a path prefix.
+    try t.expect(!movesIntoOwnSubtree("/srv/dir", "/srv/dir2"));
+    try t.expect(!movesIntoOwnSubtree("/srv/dir", "/srv/other"));
+    try t.expect(!movesIntoOwnSubtree("/srv/dir/inner", "/srv/dir"));
 }
 
 /// Atomically exchange two existing paths on the same filesystem.

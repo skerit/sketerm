@@ -2106,10 +2106,38 @@ test "fs_reply errors classify transient link failures as transport" {
     try std.testing.expectEqualStrings("permanent", fsErrKind("NOENT"));
     try std.testing.expectEqualStrings("permanent", fsErrKind("NOSPC"));
     try std.testing.expectEqualStrings("permanent", fsErrKind("cannot fsync directory parent"));
+    // A filesystem without RENAME_NOREPLACE never grows one: retrying
+    // this is pure waste, so it must not classify as transport.
+    try std.testing.expectEqualStrings("permanent", fsErrKind("NOREPLACE"));
     try std.testing.expectEqualStrings("transport", fsErrKind("TIMEDOUT"));
     try std.testing.expectEqualStrings("transport", fsErrKind("read failed: CONNRESET"));
     // Tag must stand alone, never match inside a longer word.
     try std.testing.expectEqualStrings("permanent", fsErrKind("file PIPELINE.md is missing"));
+}
+
+/// fsync the directory a just-committed mutation changed, so it
+/// survives a crash.
+///
+/// Best-effort BY DESIGN, and the one home for that decision: by the
+/// time this runs the rename/mkdir/unlink has already landed and is
+/// irrevocable. A filesystem that refuses a directory fsync (FUSE, NFS
+/// and CIFS answer EROFS or EINVAL) used to make the reply `ok=false`,
+/// which told the client nothing had happened while the operation had
+/// in fact succeeded — the client then discarded its undo record and
+/// showed "operation failed". `webext/install.zig`'s `syncBase` reached
+/// the same conclusion for the same reason.
+fn syncParentDir(path: []const u8, what: []const u8) void {
+    const parent = std.fs.path.dirname(path) orelse return;
+    var dz: [4096]u8 = undefined;
+    const dir_z = pathZ(&dz, parent) catch return;
+    const dfd = c.open(dir_z, c.O_RDONLY | c.O_DIRECTORY);
+    if (dfd < 0) {
+        log.info("fs {s}: cannot open '{s}' to fsync it; the change stands but is not yet durable", .{ what, parent });
+        return;
+    }
+    defer _ = c.close(dfd);
+    if (c.fsync(dfd) != 0)
+        log.info("fs {s}: fsync of '{s}' refused ({s}); the change stands but is not yet durable", .{ what, parent, fsserve.errnoName(@as(c_int, -1)) });
 }
 
 pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
@@ -2213,12 +2241,7 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
         const rc = c.mkdir(p, 0o755);
         if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
-        const parent = std.fs.path.dirname(r.path) orelse return fsReplyErr(cl, r.req, "directory has no parent");
-        var dz: [4096]u8 = undefined;
-        const dfd = c.open(pathZ(&dz, parent) catch return fsReplyErr(cl, r.req, "parent path too long"), c.O_RDONLY | c.O_DIRECTORY);
-        if (dfd < 0) return fsReplyErr(cl, r.req, "cannot open directory parent");
-        defer _ = c.close(dfd);
-        if (c.fsync(dfd) != 0) return fsReplyErr(cl, r.req, "cannot fsync directory parent");
+        syncParentDir(r.path, "mkdir");
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "rename")) {
         if (r.to.len == 0 or r.to[0] != '/') return fsReplyErr(cl, r.req, "to must be absolute");
@@ -2231,30 +2254,18 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
                 .ok => {},
                 .exists => return fsReplyErr(cl, r.req, "EXIST"),
                 .cross_device => return fsReplyErr(cl, r.req, "XDEV"),
+                // Its own token, not an errno: the filesystem has no
+                // no-replace rename at all, so retrying never helps and
+                // a plain rename would be a silent clobber.
+                .unsupported => return fsReplyErr(cl, r.req, "NOREPLACE"),
                 .failed => |err| return fsReplyErr(cl, r.req, @tagName(err)),
             }
         } else {
             const rc = c.rename(from, to);
             if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
         }
-        if (std.fs.path.dirname(r.path)) |parent| {
-            var dz: [4096]u8 = undefined;
-            if (pathZ(&dz, parent)) |dir_z| {
-                const dfd = c.open(dir_z, c.O_RDONLY | c.O_DIRECTORY);
-                if (dfd < 0) return fsReplyErr(cl, r.req, "cannot open source parent");
-                defer _ = c.close(dfd);
-                if (c.fsync(dfd) != 0) return fsReplyErr(cl, r.req, "cannot fsync source parent");
-            } else |_| return fsReplyErr(cl, r.req, "source parent path too long");
-        } else return fsReplyErr(cl, r.req, "source has no parent");
-        if (std.fs.path.dirname(r.to)) |parent| {
-            var dz: [4096]u8 = undefined;
-            if (pathZ(&dz, parent)) |dir_z| {
-                const dfd = c.open(dir_z, c.O_RDONLY | c.O_DIRECTORY);
-                if (dfd < 0) return fsReplyErr(cl, r.req, "cannot open destination parent");
-                defer _ = c.close(dfd);
-                if (c.fsync(dfd) != 0) return fsReplyErr(cl, r.req, "cannot fsync destination parent");
-            } else |_| return fsReplyErr(cl, r.req, "destination parent path too long");
-        } else return fsReplyErr(cl, r.req, "destination has no parent");
+        syncParentDir(r.path, "rename source");
+        syncParentDir(r.to, "rename destination");
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "delete")) {
         // Single entry only: files/links unlink, EMPTY dirs rmdir.
@@ -2266,12 +2277,7 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
         if (c.lstat(p, &st) != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(@as(c_int, -1)));
         const rc = if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) c.rmdir(p) else c.unlink(p);
         if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
-        const parent = std.fs.path.dirname(r.path) orelse return fsReplyErr(cl, r.req, "path has no parent");
-        var dz: [4096]u8 = undefined;
-        const dfd = c.open(pathZ(&dz, parent) catch return fsReplyErr(cl, r.req, "parent path too long"), c.O_RDONLY | c.O_DIRECTORY);
-        if (dfd < 0) return fsReplyErr(cl, r.req, "cannot open directory parent");
-        defer _ = c.close(dfd);
-        if (c.fsync(dfd) != 0) return fsReplyErr(cl, r.req, "cannot fsync directory parent");
+        syncParentDir(r.path, "delete");
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "unlink") or std.mem.eql(u8, r.op, "rmdir")) {
         var z: [4096]u8 = undefined;

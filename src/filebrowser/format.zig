@@ -71,6 +71,7 @@ pub fn errorPhrase(daemon_error: []const u8) []const u8 {
         .{ .tag = "NOSPC", .phrase = "no space left on device" },
         .{ .tag = "ROFS", .phrase = "read-only filesystem" },
         .{ .tag = "XDEV", .phrase = "different filesystem" },
+        .{ .tag = "NOREPLACE", .phrase = "this filesystem cannot rename safely without risking an overwrite" },
         .{ .tag = "IO", .phrase = "I/O error" },
         .{ .tag = "NFILE", .phrase = "too many open files" },
         .{ .tag = "MFILE", .phrase = "too many open files" },
@@ -198,6 +199,9 @@ test "errorPhrase reads out errno tags and passes anything else through" {
     try t.expectEqualStrings("no such file or directory", errorPhrase("NOENT"));
     try t.expectEqualStrings("permission denied", errorPhrase("ACCES"));
     try t.expectEqualStrings("not a directory", errorPhrase("NOTDIR"));
+    // Not an errno: the daemon's own token for a filesystem with no
+    // RENAME_NOREPLACE, which must read as a reason and not as a tag.
+    try t.expectEqualStrings("this filesystem cannot rename safely without risking an overwrite", errorPhrase("NOREPLACE"));
     // The daemon also sends prose for its own refusals; it must
     // survive verbatim rather than be replaced by a guess.
     try t.expectEqualStrings("path must be absolute", errorPhrase("path must be absolute"));
