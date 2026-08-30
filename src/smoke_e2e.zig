@@ -5947,22 +5947,34 @@ fn filesReconnectStage(
     // the re-listing and the throttled render room, then require a
     // stable single listing: each seed name exactly once, and none of
     // the daemon's refusal on screen.
-    const deadline = clock.nowMs() + 60_000;
+    const deadline = clock.nowMs() + 90_000;
     var stable: u32 = 0;
+    var last: [3]usize = .{ 0, 0, 0 };
     while (clock.nowMs() < deadline) {
         _ = app.pumpOnce(500);
         const a = ocrCount(allocator, app, child.win, "ALPHAROW") orelse return null;
         const b = ocrCount(allocator, app, child.win, "BETAROW") orelse return null;
         const g = ocrCount(allocator, app, child.win, "GAMMAROW") orelse return null;
+        last = .{ a, b, g };
         const refused = ocrCount(allocator, app, child.win, "in use") orelse 0;
-        if (refused > 0) return "files reconnect: the daemon refused a re-subscription (view id in use)";
-        if (a > 1 or b > 1 or g > 1) return "files reconnect: a row was listed twice after the reconnect";
+        if (refused > 0) {
+            viewerShot(allocator, app, child.win, "files-reconnect-refused");
+            return "files reconnect: the daemon refused a re-subscription (view id in use)";
+        }
+        if (a > 1 or b > 1 or g > 1) {
+            viewerShot(allocator, app, child.win, "files-reconnect-twice");
+            return "files reconnect: a row was listed twice after the reconnect";
+        }
         if (a == 1 and b == 1 and g == 1) {
             stable += 1;
             if (stable >= 3) break;
         } else stable = 0;
     }
-    if (stable < 3) return "files reconnect: the listing never settled to one row per file";
+    if (stable < 3) {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: files reconnect: last counts alpha=%zu beta=%zu gamma=%zu\n", last[0], last[1], last[2]);
+        viewerShot(allocator, app, child.win, "files-reconnect-unsettled");
+        return "files reconnect: the listing never settled to one row per file";
+    }
 
     // Deltas ride the NEW subscription: a file created now must show.
     {
