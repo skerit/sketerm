@@ -399,6 +399,9 @@ pub const Window = struct {
     /// (`assistants.zig`). Null when the registry directory cannot be
     /// watched; the Session Overview then lists no assistant daemons.
     assistants: ?*@import("assistants.zig").Watcher = null,
+    /// Live watches on assistants' browsers (`webwatch.zig`), one per
+    /// assistant browser; each frees itself with its last page.
+    web_watches: std.ArrayList(*@import("webwatch.zig").Watch) = .empty,
     /// Scrollback search (Ctrl+F).
     search_bar: ?*c.GtkWidget = null,
     search_entry: ?*c.GtkWidget = null,
@@ -4271,6 +4274,23 @@ pub const Window = struct {
         self.forest_pending_parent = opener;
         defer self.forest_pending_parent = null;
         try self.newWebTabAt(url);
+    }
+
+    /// Web tab PRESENTING an assistant's page (`webwatch.zig`): the
+    /// first page of a watch, its face observing alias `view` on the
+    /// watch's client. Returns the pane the tab was built around.
+    pub fn newWebTabObserving(self: *Window, watch: *@import("webwatch.zig").Watch, view: u32) !*Pane {
+        const before = self.panes.items.len;
+        try self.newShellTab("Web");
+        if (self.panes.items.len <= before) return error.TabSpawnFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        _ = @import("webface.zig").WebFace.attachObserved(self.allocator, pane, view, watch.cl, @ptrCast(watch)) catch |err| {
+            logActionError("watch attach", err);
+            return err;
+        };
+        if (@import("webgroup.zig").Group.fromPane(pane)) |g| g.watch = @ptrCast(watch);
+        pane.refreshLeaseChip();
+        return pane;
     }
 
     /// Web tab PRESENTING a view the helper already created -- a real

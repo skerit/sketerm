@@ -14,6 +14,17 @@ const mux_wire = @import("../mux/wire.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const muxtabs = @import("muxtabs.zig");
 const assistants = @import("assistants.zig");
+const webwatch = @import("webwatch.zig");
+
+/// The assistant label behind a `sock:` daemon host, from the window's
+/// registry watcher; the host spec itself when it is unknown.
+fn labelForHost(self: *Switcher, host: []const u8) []const u8 {
+    const watcher = self.win.assistants orelse return host;
+    for (watcher.roster.items) |a| {
+        if (std.mem.eql(u8, a.host, host)) return a.label();
+    }
+    return host;
+}
 
 const Section = enum(u8) { audio, applications, attached, available };
 
@@ -1419,6 +1430,23 @@ fn onOpIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
 fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease, placement: muxtabs.AttachJob.Placement) void {
     if (self.attaching) return;
     const target_host: ?[]const u8 = if (target.host) |value| value else null;
+    // An assistant's web session is a BROWSER: watched through its own
+    // helper (webwatch.zig), locally by socket, remotely through the
+    // host's daemon. The app session is never attached for it.
+    if (assistants.kindOf(target.session, true) == .web) {
+        const ok = if (target_host) |h| blk: {
+            if (std.mem.startsWith(u8, h, "sock:"))
+                break :blk webwatch.openLocal(self.win, labelForHost(self, h), h["sock:".len..], target.session, lease);
+            break :blk webwatch.openRemote(self.win, h, h, target.session, lease);
+        } else webwatch.openLocal(self.win, "assistant", "", target.session, lease);
+        if (ok) {
+            c.gtk_window_close(@ptrCast(self.window));
+        } else {
+            self.note = "the assistant's browser could not be watched";
+            self.updateStatus();
+        }
+        return;
+    }
     // Already here as a tabless app session: that attachment has no
     // pane chip to escalate from, so materialize it instead of dialing
     // a second viewer onto the same session.

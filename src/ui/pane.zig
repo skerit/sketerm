@@ -849,6 +849,11 @@ pub const Pane = struct {
     /// added later — was never added to any of them, so it was severed
     /// only from the deferred `Pane.deinit`, i.e. against widgets GTK
     /// had already finalized.
+    /// Re-read the lease chip (a watch's lease changed, a page ended).
+    pub fn refreshLeaseChip(self: *Pane) void {
+        updateTitlebarActivity(self);
+    }
+
     pub fn severFaces(self: *Pane) void {
         const was_severing = self.severing_faces;
         self.severing_faces = true;
@@ -2140,6 +2145,20 @@ fn rebuildTitlebarApps(self: *Pane) void {
 /// when this client is a view-only attach (lease not held).
 fn updateControlChip(self: *Pane) bool {
     const chip = self.titlebar_chip orelse return false;
+    // A browser watching an assistant: the chip is the watch's lease
+    // (`webwatch.zig`), and Take control escalates it there.
+    if (@import("webgroup.zig").Group.fromPane(self)) |g| {
+        var wbuf: [192]u8 = undefined;
+        if (@import("webwatch.zig").chipText(g, &wbuf)) |ct| {
+            var z: [200:0]u8 = undefined;
+            const tz = std.fmt.bufPrintZ(&z, "{s}", .{ct.text}) catch "View only";
+            if (self.titlebar_chip_label) |lbl| c.gtk_label_set_text(lbl, tz.ptr);
+            c.gtk_widget_set_tooltip_text(chip, "This browser shows an assistant's pages");
+            if (self.titlebar_take_btn) |btn| c.gtk_widget_set_visible(btn, @intFromBool(ct.view_only));
+            c.gtk_widget_set_visible(chip, 1);
+            return true;
+        }
+    }
     const term = self.terminal;
     const view_only = if (term.remote) |r| r.control_known and !term.has_control else false;
     const driven = term.peer_drivers > 0;
@@ -2180,6 +2199,9 @@ fn onChipClicked(gesture: ?*c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?
 /// either way, which refreshes the chip).
 fn onTakeControlClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
+    if (@import("webgroup.zig").Group.fromPane(self)) |g| {
+        if (@import("webwatch.zig").takeControl(g)) return;
+    }
     self.terminal.requestControl(self.terminal.control_holder_len != 0);
 }
 

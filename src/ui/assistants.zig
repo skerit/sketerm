@@ -28,6 +28,7 @@ const mcp_registry = @import("../ipc/mcp_registry.zig");
 const mux_client = @import("../mux/client.zig");
 const mux_cli = @import("../ipc/mux_cli.zig");
 const muxtabs = @import("muxtabs.zig");
+const webwatch = @import("webwatch.zig");
 const Window = @import("window.zig").Window;
 const Pane = @import("pane.zig").Pane;
 
@@ -518,6 +519,12 @@ pub const Watcher = struct {
         const tip = std.fmt.bufPrintZ(&tip_buf, "{s} ({s}), {d} viewer(s)", .{ s.name, @tagName(s.kind), s.viewers }) catch null;
         if (tip) |tz| c.gtk_widget_set_tooltip_text(label, tz.ptr);
         c.gtk_box_append(@ptrCast(row), label);
+        // A web session is shown as a BROWSER (webwatch), never as a
+        // forwarded app: its placement is the watch's lease.
+        const web_placement: ?webwatch.Placement = if (s.kind == .web)
+            webwatch.placementLocal(self.win, a.host["sock:".len..], s.name)
+        else
+            null;
         const placement = self.win.sessionPlacement(s.name, a.host);
         for ([_]muxtabs.Lease{ .read_only, .control }) |lease| {
             const verb = attachVerb(lease);
@@ -530,7 +537,10 @@ pub const Watcher = struct {
             // from here. With a pane, its own chip escalates the lease;
             // a TABLESS app session has no chip, so Take control stays
             // live and materializes it as a tab instead of dead-ending.
-            const sensitive = switch (placement) {
+            const sensitive = if (web_placement) |wp| switch (wp) {
+                .none => true,
+                .watching => |held| lease == .control and held != .control,
+            } else switch (placement) {
                 .none => true,
                 .tabless => lease == .control,
                 .pane => false,
@@ -558,6 +568,14 @@ pub const Watcher = struct {
     fn startAttach(self: *Watcher, pid: c.pid_t, session: []const u8, lease: muxtabs.Lease) void {
         if (self.dead) return;
         const a = self.findByPid(pid) orelse return;
+        // The assistant's browser opens as a browser: a second client
+        // of its own helper, its pages as web pages (webwatch.zig).
+        // The mux app session behind it is never attached from here.
+        if (kindOf(session, true) == .web) {
+            if (webwatch.openLocal(self.win, a.label(), a.host["sock:".len..], session, lease))
+                c.gtk_popover_popdown(@ptrCast(self.popover));
+            return;
+        }
         // Already here as a tabless app session: escalate that viewer
         // rather than dialing a second attach onto the same session.
         if (self.win.sessionPlacement(session, a.host) == .tabless) {

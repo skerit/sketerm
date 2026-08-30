@@ -44,6 +44,14 @@ pub const Bridge = struct {
     conn: mux_client.Conn = undefined,
     conn_ok: bool = false,
     cancel: FdCancel = .{},
+    /// Non-empty: CONNECT to the helper serving this web session on
+    /// the remote host (`web_helper_connect`) instead of spawning one
+    /// (`web_helper_open`) — the remote-assistant watch.
+    connect_session: [64]u8 = undefined,
+    connect_session_len: usize = 0,
+    /// Set with `connect_session`: the connect form was asked for, so
+    /// an empty session means the direct route's helper.
+    connect_mode: bool = false,
     /// How the worker reaches the host's daemon. A field so a test can
     /// hold the connect open and prove `stop` does not wait for it.
     connectFn: *const fn (allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn = mux_cli.muxConnect,
@@ -91,6 +99,15 @@ pub const Bridge = struct {
         self.gui_fd = pair[0];
         self.wakeup = wakeup;
         return self;
+    }
+
+    /// Use the connect form for `session` (see `connect_session`).
+    /// Call before `spawn`.
+    pub fn setConnectSession(self: *Bridge, session: []const u8) void {
+        const n = @min(session.len, self.connect_session.len);
+        @memcpy(self.connect_session[0..n], session[0..n]);
+        self.connect_session_len = n;
+        self.connect_mode = true;
     }
 
     /// The GUI end, exactly once (the Client owns and closes it).
@@ -187,7 +204,12 @@ pub const Bridge = struct {
             return;
         })) return;
         defer self.cancel.release();
-        if (!self.conn.web_helper) {
+        if (self.connect_mode) {
+            if (!self.conn.web_helper_connect) {
+                self.failWith("The daemon on that host is too old to watch an assistant's browser (no web_helper_connect capability).");
+                return;
+            }
+        } else if (!self.conn.web_helper) {
             self.failWith("The daemon on that host is too old for remote browsing (no web_helper capability).");
             return;
         }
@@ -201,7 +223,11 @@ pub const Bridge = struct {
     const OpenState = union(enum) { pending, opened: u32, failed };
 
     fn openHelper(self: *Bridge) ?u32 {
-        self.conn.queueJson(.web_helper_open, .{ .req = @as(u32, 1) }) catch {
+        const queued = if (self.connect_mode)
+            self.conn.queueJson(.web_helper_connect, .{ .req = @as(u32, 1), .session = self.connect_session[0..self.connect_session_len] })
+        else
+            self.conn.queueJson(.web_helper_open, .{ .req = @as(u32, 1) });
+        queued catch {
             self.failWith("Could not ask the remote daemon for a browser helper.");
             return null;
         };

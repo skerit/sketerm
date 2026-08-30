@@ -947,10 +947,24 @@ fn attachMuxPreparedMode(self: *Window, conn_in: @import("../mux/client.zig").Co
     crashlog.set("mux attach '{s}' @ {s} takeover={} - building pane", .{ name, host orelse "local", takeover != null });
     const pane = try makeRemotePaneFromSnap(self, conn, name, host, snapshot_payload, identity, null, lease == .read_only, lease == .control, false);
     pane.active_profile = if (profile) |p| p.name else null;
-    self.applyPaneConfig(pane, .{ .profile = profile });
+    // BEFORE the config push and before any app channel can open:
+    // `onAppViewEvent` installs the embed box only when the flag is
+    // already set at channel open, and `applyPaneConfig` re-derives
+    // the flag from `app_view` unless it is marked forced. Set after
+    // either, a Watch under app_view=window gave a placeholder tab
+    // plus a free-floating chrome-less window.
     if (force_tab) {
         pane.app_view_tab = true;
         pane.app_view_tab_forced = true;
+    }
+    self.applyPaneConfig(pane, .{ .profile = profile });
+    // A host that opened during the snapshot replay (before the sinks
+    // were wired) is adopted the way "Show in Tab" adopts one: embed
+    // box installed, primary window popped in.
+    if (force_tab) {
+        if (pane.terminal.remote) |remote| {
+            if (remote.napps.items.len > 0) pane.adoptAppHost(@ptrCast(remote.napps.items[0].host));
+        }
     }
 
     var title_buf: [160:0]u8 = undefined;

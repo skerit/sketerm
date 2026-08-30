@@ -79,6 +79,10 @@ pub const Group = struct {
     /// True while `deinit` is unwinding, so a page closing itself
     /// during teardown does not re-enter the list.
     tearing_down: bool = false,
+    /// The `webwatch.Watch` whose pages this group shows, if this
+    /// browser is a watch on an assistant's browser. Opaque here: the
+    /// pane's lease chip resolves it through `webwatch.chipText`.
+    watch: ?*anyopaque = null,
     /// The face the notebook is switching to (or settled on). Tracked
     /// here because GtkNotebook emits "switch-page" BEFORE updating its
     /// current-page property, so anything reading `active()` from that

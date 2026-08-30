@@ -635,7 +635,7 @@ pub const AppHost = struct {
             if (w.*.icon_tex) |tex| c.g_object_unref(tex);
             w.*.severIm();
             _ = c.g_object_set_data(@ptrCast(w.*.window), "sketerm-wlapp", null);
-            c.gtk_window_destroy(w.*.window);
+            destroyAppWindow(w.*.window);
             self.allocator.destroy(w.*);
         }
         self.windows.deinit(self.allocator);
@@ -1530,7 +1530,7 @@ pub const AppHost = struct {
         win.opaque_resize.cancel();
         win.severIm();
         _ = c.g_object_set_data(@ptrCast(win.window), "sketerm-wlapp", null);
-        c.gtk_window_destroy(win.window);
+        destroyAppWindow(win.window);
         self.allocator.destroy(win);
         if (self.on_windows_changed) |f| f(self.embed_ctx, self.windows.count());
     }
@@ -1653,6 +1653,20 @@ pub const AppHost = struct {
         if (!win.embedded) c.gtk_window_present(window);
         if (self.on_windows_changed) |f| f(self.embed_ctx, self.windows.count());
         return win;
+    }
+
+    /// Destroy an app window. A window born EMBEDDED was never realized
+    /// (it was hidden before its first present), and GTK's Wayland
+    /// application backend dereferences the window's GdkSurface when
+    /// the window leaves the GtkApplication: MEASURED (GTK 4, closing
+    /// a watched app's tab) as a Gdk-CRITICAL on a NULL surface and
+    /// then a segfault at offset 0x278, from `gtk_window_set_application`
+    /// and `gtk_window_destroy` alike. Realizing first gives it the
+    /// surface it assumes; nothing is mapped by that.
+    fn destroyAppWindow(window: *c.GtkWindow) void {
+        if (c.gtk_widget_get_realized(@ptrCast(window)) == 0)
+            c.gtk_widget_realize(@ptrCast(window));
+        c.gtk_window_destroy(window);
     }
 
     /// Connect the floating-window signal set (idempotent — windows

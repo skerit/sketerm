@@ -238,6 +238,8 @@ const webproj = @import("../a11y/webproj.zig");
 const a11ydetect = @import("../a11y/detect.zig");
 const webremote = @import("webremote.zig");
 const webroute = @import("../web/route.zig");
+const watchgeom = @import("../web/watchgeom.zig");
+const webwatch = @import("webwatch.zig");
 const webgroup = @import("webgroup.zig");
 const Pane = @import("pane.zig").Pane;
 const Window = @import("window.zig").Window;
@@ -260,6 +262,7 @@ const DEVTOOLS_GONE_MSG =
     "This DevTools view is gone (the browser helper restarted). " ++
     "Open it again from the page you want to inspect.";
 const CRASH_MSG = "This page's renderer crashed. Reload to bring it back.";
+const OBSERVED_GONE_MSG = "The assistant's browser is gone.";
 
 // ---------------------------------------------------------------------
 // Optional frame statistics (`SKETERM_WEB_STATS=1`)
@@ -753,6 +756,32 @@ pub const Client = struct {
     /// `cookie_sync_enable` was posted on the CURRENT connection.
     sync_enabled: bool = false,
 
+    /// An OBSERVER client (`webwatch.zig`): a second connection to an
+    /// ASSISTANT's helper that only watches (and, with control,
+    /// drives) that helper's views through the "observe" capability.
+    /// It mints no views of its own and publishes NOTHING into the
+    /// helper: no extensions, no user content, no containers, no
+    /// filter lists, and above all no cookie sync, which would pour
+    /// this user's jars into the assistant's. Every "on hello_ack"
+    /// hook below is gated on it.
+    observer: bool = false,
+    /// Local helper socket to connect to (observer, non-remote).
+    obs_local: [108]u8 = undefined,
+    obs_local_len: usize = 0,
+    /// The assistant's web session on a REMOTE host (observer + host):
+    /// what `web_helper_connect` names to the remote daemon.
+    obs_session: [64]u8 = undefined,
+    obs_session_len: usize = 0,
+    /// Identity an observer client was minted for; an idle one with the
+    /// same key is reused by the next watch on that assistant.
+    obs_key: [384]u8 = undefined,
+    obs_key_len: usize = 0,
+    /// The helper advertised "observe".
+    cap_observe: bool = false,
+    /// The `webwatch.Watch` this observer client serves, nulled by the
+    /// watch before it frees itself (the back-pointer fence).
+    watch: ?*anyopaque = null,
+
     /// The proxy this instance's helper is spawned with, or null for a
     /// direct instance. A `.mux` route binds its bridge here, so the
     /// port is known before the helper's argv is built; a bridge that
@@ -809,6 +838,10 @@ pub const Client = struct {
         }
         if (self.isRemote()) {
             self.ensureRemote();
+            return;
+        }
+        if (self.observer) {
+            self.ensureObserverLocal();
             return;
         }
 
@@ -907,6 +940,9 @@ pub const Client = struct {
             self.fail("Could not create the remote browser bridge.");
             return;
         };
+        // An observer joins the helper serving the assistant's session
+        // on that host instead of having one spawned.
+        if (self.observer) br.setConnectSession(self.obs_session[0..self.obs_session_len]);
         const fd = br.guiFd();
         if (fd < 0) {
             br.stop();
@@ -928,8 +964,35 @@ pub const Client = struct {
         // Before any view exists (the frame-mode contract): everything
         // this helper ever paints must arrive in-band.
         self.post(proto.FrameMode{ .mode = proto.frame_mode_inline });
-        publishContexts(self);
+        if (!self.observer) publishContexts(self);
         for (self.faces.items) |f| f.onClientReady();
+    }
+
+    /// Observer of a LOCAL assistant: connect to its helper socket
+    /// directly (no spawn, no retry loop: the helper is either serving
+    /// or the assistant is gone).
+    fn ensureObserverLocal(self: *Client) void {
+        const path = self.obs_local[0..self.obs_local_len];
+        if (path.len == 0 or path.len + 1 > self.sock_path.len) {
+            self.failWith("The assistant's browser helper socket path is unusable.", false);
+            return;
+        }
+        @memcpy(self.sock_path[0..path.len], path);
+        self.sock_len = path.len;
+        if (!self.tryConnect())
+            self.failWith("The assistant's browser is not running (its helper socket does not answer).", false);
+    }
+
+    /// End an observer connection deliberately (the watch closed):
+    /// the helper drops every subscription on EOF and its owner never
+    /// notices. The client goes back to idle so the next watch on the
+    /// same assistant can reuse it.
+    pub fn stopObserving(self: *Client) void {
+        if (!self.observer) return;
+        self.watch = null;
+        self.teardownConnection();
+        self.state = .idle;
+        self.reason = "";
     }
 
     /// Drop everything and allow a later `ensure` to start over. The
@@ -951,12 +1014,13 @@ pub const Client = struct {
     }
 
     fn failWith(self: *Client, reason: []const u8, retryable: bool) void {
-        if (!self.isRemote()) webext.onHelperUnavailable();
+        if (!self.isRemote() and !self.observer) webext.onHelperUnavailable();
         self.teardownConnection();
         self.state = .unavailable;
         self.reason = reason;
         self.reason_retryable = retryable;
         for (self.faces.items) |f| f.onHelperUnavailable(reason, retryable);
+        if (self.observer) webwatch.onClientLost(self);
     }
 
     fn teardownConnection(self: *Client) void {
@@ -992,6 +1056,7 @@ pub const Client = struct {
         self.cap_webext_tabs = false;
         self.cap_webext_action = false;
         self.cap_webext_transaction = false;
+        self.cap_observe = false;
         if (self.bridge) |br| {
             self.bridge = null;
             br.stop();
@@ -1118,7 +1183,11 @@ pub const Client = struct {
             @ptrCast(&onReadable),
             self,
         );
-        self.post(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "sketerm-gui" });
+        self.post(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = if (self.observer) "sketerm-gui-watch" else "sketerm-gui" });
+        if (self.observer) {
+            for (self.faces.items) |f| f.onClientReady();
+            return true;
+        }
         // Re-publish every container BEFORE the faces mint their views:
         // a fresh helper knows no contexts, and a view_create naming one
         // must be preceded by its context_create. Sent optimistically
@@ -1425,6 +1494,20 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_COOKIE_SYNC)) self.cap_cookie_sync = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_OBSERVE)) self.cap_observe = true;
+                }
+                if (self.observer) {
+                    // Nothing of this GUI's is published into an
+                    // assistant's helper (see `observer`); the one
+                    // thing sent is the request to be told its pages.
+                    if (!self.cap_observe) {
+                        self.failWith("The assistant's browser helper is too old to be watched (no observe capability).", false);
+                        return;
+                    }
+                    self.hello_done = true;
+                    self.post(proto.ObserveEnable{ .enable = 1 });
+                    for (self.faces.items) |face| face.ensureView();
+                    return;
                 }
                 // A remote helper without inline frames would keep
                 // posting memfd frames whose descriptors the bridge
@@ -1540,6 +1623,14 @@ pub const Client = struct {
             .ev_title => {
                 const ev = proto.decode(proto.EvTitle, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onTitle(ev.title);
+            },
+            .ev_observe_view => {
+                const ev = proto.decode(proto.EvObserveView, frame.payload) catch return;
+                if (self.observer) webwatch.onObserveView(self, ev);
+            },
+            .ev_observe_state => {
+                const ev = proto.decode(proto.EvObserveState, frame.payload) catch return;
+                if (self.observer) webwatch.onObserveState(self, ev);
             },
             .ev_nav_state => {
                 const ev = proto.decode(proto.EvNavState, frame.payload) catch return;
@@ -1833,7 +1924,77 @@ fn findFaceGlobal(view: u32) ?*WebFace {
     for (g_aux_clients.items) |cl| {
         if (cl.findFace(view)) |f| return f;
     }
+    for (g_observer_clients.items) |cl| {
+        if (cl.findFace(view)) |f| return f;
+    }
     return null;
+}
+
+/// Observer clients (`webwatch.zig`), kept APART from `g_aux_clients`:
+/// every fan-out over the aux list (cookie sync, containers, filter
+/// lists, extensions, tabs) would otherwise reach an assistant's
+/// helper. Immortal like every client; an idle one is reused by the
+/// next watch with the same key.
+var g_observer_clients: std.ArrayList(*Client) = .empty;
+
+pub const ObserverSpec = union(enum) {
+    /// Helper socket path of a local assistant.
+    local: []const u8,
+    /// A remote assistant: mux host spec + its web session name.
+    remote: struct { host: []const u8, session: []const u8 },
+};
+
+/// An idle or fresh observer client for `spec`. Null when the spec
+/// does not fit the client's fixed buffers or memory is out.
+pub fn observerClient(gpa: std.mem.Allocator, spec: ObserverSpec) ?*Client {
+    var key_buf: [384]u8 = undefined;
+    const key = switch (spec) {
+        .local => |path| std.fmt.bufPrint(&key_buf, "sock:{s}", .{path}) catch return null,
+        .remote => |r| std.fmt.bufPrint(&key_buf, "host:{s}|{s}", .{ r.host, r.session }) catch return null,
+    };
+    for (g_observer_clients.items) |cl| {
+        if (cl.watch == null and cl.state == .idle and std.mem.eql(u8, cl.obs_key[0..cl.obs_key_len], key)) return cl;
+    }
+    const cl = gpa.create(Client) catch return null;
+    cl.* = .{ .observer = true };
+    @memcpy(cl.obs_key[0..key.len], key);
+    cl.obs_key_len = key.len;
+    switch (spec) {
+        .local => |path| {
+            if (path.len > cl.obs_local.len) {
+                gpa.destroy(cl);
+                return null;
+            }
+            @memcpy(cl.obs_local[0..path.len], path);
+            cl.obs_local_len = path.len;
+        },
+        .remote => |r| {
+            if (r.host.len > cl.host.len or r.session.len > cl.obs_session.len) {
+                gpa.destroy(cl);
+                return null;
+            }
+            @memcpy(cl.host[0..r.host.len], r.host);
+            cl.host_len = r.host.len;
+            cl.route_kind = .remote_browser;
+            @memcpy(cl.route_host[0..r.host.len], r.host);
+            cl.route_host_len = r.host.len;
+            @memcpy(cl.obs_session[0..r.session.len], r.session);
+            cl.obs_session_len = r.session.len;
+        },
+    }
+    g_observer_clients.append(gpa, cl) catch {
+        gpa.destroy(cl);
+        return null;
+    };
+    return cl;
+}
+
+/// A fresh view id from the process-wide mint, for a face that
+/// presents somebody else's view (an observed page).
+pub fn mintViewId() u32 {
+    const id = g_next_view;
+    g_next_view += 1;
+    return id;
 }
 
 /// Process-wide view-id mint (see `findFaceGlobal`).
@@ -3114,6 +3275,21 @@ pub const WebFace = struct {
     /// page the user opened never carries it, so a script can never
     /// close the user's tab.
     popup_owned: bool = false,
+    /// An OBSERVED page (`webwatch.zig`): `attached`, and additionally
+    /// the view's geometry is the ASSISTANT's, so frames are fitted
+    /// into the area (`obs_fit`, never a `view_resize`) and pointer
+    /// input maps through that fit back into the owner's coordinates.
+    observed: bool = false,
+    /// The observed view's logical size and DPR, from the helper.
+    obs_w: u16 = 0,
+    obs_h: u16 = 0,
+    obs_scale: u16 = 1000,
+    /// Whether this GUI holds control of the observed page (the
+    /// helper's answer, not the request).
+    obs_control: bool = false,
+    obs_fit: watchgeom.Fit = .{ .x = 0, .y = 0, .w = 0, .h = 0, .scale = 1 },
+    /// The `webwatch.Watch` this page belongs to; told on deinit.
+    watch: ?*anyopaque = null,
 
     root_box: *c.GtkWidget = undefined,
     /// The navigation bar. An attached view has no address of its own
@@ -3490,7 +3666,33 @@ pub const WebFace = struct {
         /// The address entry shows the origin but cannot be typed
         /// into: a popup window's only chrome is that bar.
         address_readonly: bool = false,
+        /// The existing view is an OBSERVED page of `watch`.
+        watch: ?*anyopaque = null,
     };
+
+    /// First page of a watch: the face presenting the assistant's view
+    /// `view` (an alias this GUI minted) on a fresh pane. Full chrome:
+    /// the user must see where the assistant is and may steer it once
+    /// in control.
+    pub fn attachObserved(allocator: std.mem.Allocator, pane: *Pane, view: u32, on: *Client, watch: *anyopaque) !*WebFace {
+        return attachOpts(allocator, pane, .{
+            .existing_view = view,
+            .on_client = on,
+            .keep_address_bar = true,
+            .watch = watch,
+        });
+    }
+
+    /// A further page of a watch, in the tab's existing group.
+    pub fn attachObservedPage(allocator: std.mem.Allocator, g: *webgroup.Group, view: u32, on: *Client, watch: *anyopaque) !*WebFace {
+        return attachOpts(allocator, g.pane, .{
+            .existing_view = view,
+            .on_client = on,
+            .as_page = true,
+            .keep_address_bar = true,
+            .watch = watch,
+        });
+    }
 
     /// Add a page to an existing group — the in-pane equivalent of
     /// opening a new tab. `opener` nests it under the page that asked.
@@ -3656,9 +3858,16 @@ pub const WebFace = struct {
             // arrives from the sensor's allocation like any other.
             self.attached = true;
             self.view = opts.existing_view;
+            if (opts.watch) |w| {
+                self.observed = true;
+                self.watch = w;
+                // The frame keeps the OWNER's size: fitted, never
+                // stretched (see `layoutObserved`).
+                c.gtk_picture_set_content_fit(@ptrCast(self.picture), c.GTK_CONTENT_FIT_CONTAIN);
+            }
             self.view_live = cl.state == .ready;
             cl.register(self);
-            if (cl.state != .ready) self.onDevToolsLost();
+            if (cl.state != .ready) self.onAttachedLost();
             return self;
         }
         self.view = g_next_view;
@@ -3814,8 +4023,14 @@ pub const WebFace = struct {
 
     pub fn deinit(self: *WebFace) void {
         const cl = self.cl;
+        // For an observed page this is the UNSUBSCRIBE: the helper
+        // keeps the assistant's view.
         if (self.view_live) cl.post(proto.ViewDestroy{ .view = self.view });
         cl.unregister(self);
+        if (self.watch) |w| {
+            self.watch = null;
+            webwatch.Watch.onFaceGone(@ptrCast(@alignCast(w)), self);
+        }
         // Web-store replies resolve through this face: the deinit
         // choke point drops every pending callback (CLAUDE.md rule 2).
         webstore.cancelFor(@ptrCast(self));
@@ -4832,7 +5047,7 @@ pub const WebFace = struct {
     /// configured. Idempotent; a face that is already discarded, has no
     /// view, or sits on a helper without the capability arms nothing.
     fn armDiscardTimer(self: *WebFace) void {
-        if (self.discard_timer != 0 or self.discarded) return;
+        if (self.discard_timer != 0 or self.discarded or self.observed) return;
         if (g_discard_minutes == 0 or self.on_screen) return;
         if (!self.view_live or !self.cl.cap_discard) return;
         const ms: u64 = @as(u64, g_discard_minutes) * 60 * 1000;
@@ -5713,7 +5928,7 @@ pub const WebFace = struct {
         // means nothing to this one and there is nothing to re-create,
         // since only the source page can ask for an inspector.
         if (self.attached) {
-            self.onDevToolsLost();
+            self.onAttachedLost();
             return;
         }
         self.ensureView();
@@ -5734,10 +5949,86 @@ pub const WebFace = struct {
         self.dropMap();
         if (self.actions) |a| a.helperGone();
         if (self.attached) {
-            self.onDevToolsLost();
+            self.onAttachedLost();
             return;
         }
         self.setStatus(reason, retryable);
+    }
+
+    /// The helper behind an attached view is gone: say which kind.
+    fn onAttachedLost(self: *WebFace) void {
+        if (self.observed) {
+            self.setStatus(OBSERVED_GONE_MSG, false);
+            return;
+        }
+        self.onDevToolsLost();
+    }
+
+    // ---- observed pages (webwatch.zig) --------------------------------
+
+    /// What the announcement carried, before the subscription answers:
+    /// the owner's geometry and the page identity, so the chrome reads
+    /// right from the first frame.
+    pub fn seedObserved(self: *WebFace, w: u16, h: u16, scale_x1000: u16, url: []const u8, title: []const u8) void {
+        self.obs_w = w;
+        self.obs_h = h;
+        self.obs_scale = if (scale_x1000 == 0) 1000 else scale_x1000;
+        if (url.len != 0) {
+            self.setUrl(url);
+            // The bar may already hold focus (a page attaches with no
+            // address, and focus follows the new page); nobody has
+            // typed into it yet, so the seed is written regardless.
+            if (!self.widgets_dead) {
+                if (self.allocator.dupeZ(u8, url) catch null) |z| {
+                    defer self.allocator.free(z);
+                    c.gtk_editable_set_text(@ptrCast(self.entry), z.ptr);
+                }
+            }
+        }
+        if (title.len != 0) self.onTitle(title);
+        self.layoutObserved();
+    }
+
+    /// `ev_observe_state{subscribed}`: the owner's geometry (it may
+    /// have resized) and whether this GUI holds control.
+    pub fn onObserved(self: *WebFace, w: u16, h: u16, scale_x1000: u16, control: bool) void {
+        self.obs_w = w;
+        self.obs_h = h;
+        self.obs_scale = if (scale_x1000 == 0) 1000 else scale_x1000;
+        self.obs_control = control;
+        self.clearStatus();
+        self.layoutObserved();
+        self.promote();
+    }
+
+    /// `ev_observe_state{refused}`: this page will never show.
+    pub fn observeRefused(self: *WebFace, reason: []const u8) void {
+        var buf: [320]u8 = undefined;
+        self.setStatus(std.fmt.bufPrint(&buf, "The assistant's page cannot be watched: {s}", .{reason}) catch "The assistant's page cannot be watched.", false);
+    }
+
+    /// Ask for (or give up) control of the observed page; the helper
+    /// answers with `ev_observe_state`.
+    pub fn postObserveControl(self: *WebFace, control: bool) void {
+        if (!self.observed or !self.view_live) return;
+        self.cl.post(proto.ObserveControl{ .view = self.view, .control = if (control) 1 else 0 });
+    }
+
+    /// Place the fitted frame: the picture is sized to the fit and
+    /// offset by its margins, and input subtracts the same offsets
+    /// (`snap_dx/dy`) before dividing by the fit's scale.
+    fn layoutObserved(self: *WebFace) void {
+        if (!self.observed or self.widgets_dead) return;
+        const alloc = self.allocationSize();
+        const lw = if (self.frame_lw != 0) self.frame_lw else self.obs_w;
+        const lh = if (self.frame_lh != 0) self.frame_lh else self.obs_h;
+        const f = watchgeom.fit(alloc.w, alloc.h, lw, lh);
+        self.obs_fit = f;
+        self.snap_dx = f.x;
+        self.snap_dy = f.y;
+        c.gtk_widget_set_margin_start(self.picture, f.x);
+        c.gtk_widget_set_margin_top(self.picture, f.y);
+        c.gtk_widget_set_size_request(self.picture, f.w, f.h);
     }
 
     /// The helper this attached view lived in is gone. Say so, and
@@ -5904,7 +6195,7 @@ pub const WebFace = struct {
         if (lw != self.frame_lw or lh != self.frame_lh) {
             self.frame_lw = lw;
             self.frame_lh = lh;
-            c.gtk_widget_set_size_request(self.picture, lw, lh);
+            if (self.observed) self.layoutObserved() else c.gtk_widget_set_size_request(self.picture, lw, lh);
         }
         c.gtk_picture_set_paintable(@ptrCast(self.picture), @ptrCast(tex));
         if (self.tex_prev) |old| c.g_object_unref(@ptrCast(old));
@@ -5927,6 +6218,9 @@ pub const WebFace = struct {
     /// at 1.25 up to 3. Input coordinates subtract `snap_dx/dy`.
     fn snapAlignment(self: *WebFace) void {
         if (self.widgets_dead) return;
+        // An observed frame is fitted, not pixel-snapped: its margins
+        // are the letterbox offsets (`layoutObserved`).
+        if (self.observed) return;
         const native = c.gtk_widget_get_native(self.view_area) orelse return;
         const surface = c.gtk_native_get_surface(native) orelse return;
         const scale = c.gdk_surface_get_scale(surface);
@@ -6163,7 +6457,8 @@ pub const WebFace = struct {
             uploaded = m.len;
         }
         const tex = webframe.buildBgraTexture(m, self.buf_w, self.buf_h, self.buf_stride, update_tex, region) orelse return;
-        self.presentTexture(tex, logicalOf(self.buf_w, self.sent_scale), logicalOf(self.buf_h, self.sent_scale), true);
+        const frame_scale = if (self.observed) self.obs_scale else self.sent_scale;
+        self.presentTexture(tex, logicalOf(self.buf_w, frame_scale), logicalOf(self.buf_h, frame_scale), true);
 
         // Measurement harness: `SKETERM_WEB_DUMP=<path>` keeps writing
         // the engine's raw BGRA buffer (the pre-presentation ground
@@ -7374,8 +7669,10 @@ pub const WebFace = struct {
         if (self.widgets_dead) return;
         // Not on an inspector pane: our menu's verbs (Back, Reload,
         // Copy Page URL) would act on the DEVTOOLS browser, which is
-        // never what a right-click inside the inspector means.
-        if (self.attached) return;
+        // never what a right-click inside the inspector means. An
+        // observed page under control is the assistant's page driven
+        // by this user, and those verbs mean exactly that.
+        if (self.attached and !self.observed) return;
         const root = classicmenu.Root.create(self.allocator) orelse return;
         const ctx = self.allocator.create(MenuCtx) catch {
             root.destroy();
@@ -8933,6 +9230,9 @@ pub const WebFace = struct {
     fn onEntryMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(WebFace, user);
         if (self.widgets_dead) return;
+        // An observed page has an address (seeded right after
+        // attach); a focused bar would then refuse to show it.
+        if (self.observed) return;
         if (self.url != null or self.pending_url != null) return;
         _ = c.gtk_widget_grab_focus(self.entry);
     }
@@ -9114,6 +9414,12 @@ pub const WebFace = struct {
         self.sent_w = nw;
         self.sent_h = nh;
         self.sent_scale = scale;
+        // An observed view is the assistant's size, never this pane's:
+        // only the letterbox moves.
+        if (self.observed) {
+            self.layoutObserved();
+            return;
+        }
         if (!self.view_live) {
             self.ensureView();
             return;
@@ -9221,11 +9527,21 @@ pub const WebFace = struct {
     fn sendPointer(self: *WebFace, kind: proto.PointerKind, x: f64, y: f64, button: u8, clicks: u8, mods: u32) void {
         if (!self.view_live) return;
         if (kind != .leave) {
-            // Controller coordinates are view-area space; the page is
-            // drawn `snap_dx/dy` further in (the pixel-grid nudge), so
-            // page space subtracts it.
-            self.last_x = @max(0, @as(i32, @intFromFloat(@round(x))) - @as(i32, self.snap_dx));
-            self.last_y = @max(0, @as(i32, @intFromFloat(@round(y))) - @as(i32, self.snap_dy));
+            if (self.observed) {
+                // The frame is letterboxed at the owner's size: map
+                // through the fit into the owner's logical space.
+                const fw = if (self.frame_lw != 0) self.frame_lw else self.obs_w;
+                const fh = if (self.frame_lh != 0) self.frame_lh else self.obs_h;
+                const pt = self.obs_fit.toFrame(x, y, fw, fh);
+                self.last_x = pt.x;
+                self.last_y = pt.y;
+            } else {
+                // Controller coordinates are view-area space; the page is
+                // drawn `snap_dx/dy` further in (the pixel-grid nudge), so
+                // page space subtracts it.
+                self.last_x = @max(0, @as(i32, @intFromFloat(@round(x))) - @as(i32, self.snap_dx));
+                self.last_y = @max(0, @as(i32, @intFromFloat(@round(y))) - @as(i32, self.snap_dy));
+            }
         }
         self.cl.post(proto.InputPointer{
             .view = self.view,
