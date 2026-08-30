@@ -46,6 +46,21 @@ pub const CAP_DEVTOOLS = "devtools";
 /// The helper accepts `print_pdf`: render a view to a PDF file at a
 /// path IT can write (helper and client are the same machine in v1).
 pub const CAP_PRINT_PDF = "print-pdf";
+/// The helper accepts `input_paste` and `clipboard_read`, and answers
+/// the latter with `ev_clipboard_text`.
+///
+/// The client owns the system clipboard and the helper owns insertion,
+/// because a windowless browser's own `ui::Clipboard` is not backed by
+/// the session selection in any configuration this product reaches, and
+/// CEF's C API exposes no clipboard read or write to prime it with.
+/// Without this the engine runs a real Paste against an empty clipboard
+/// — which not only inserts nothing but REPLACES the selection, so
+/// select-all then paste wipes the field.
+///
+/// Note what it puts on the wire: a `route on:<host>` connection carries
+/// clipboard text to a REMOTE helper, the same reach the cookie-sync
+/// block below documents for cookies.
+pub const CAP_CLIPBOARD = "clipboard";
 /// The helper accepts `find`/`find_stop` and answers with
 /// `ev_find_result`.
 pub const CAP_FIND = "find";
@@ -274,6 +289,9 @@ pub const Tag = enum(u8) {
     input_key = 0x22,
     input_ime = 0x23,
     input_focus = 0x24,
+    input_paste = 0x25,
+    clipboard_read = 0x26,
+    ev_clipboard_text = 0x27,
     frame_buffer = 0x30,
     frame_damage = 0x31,
     frame_release = 0x32,
@@ -712,6 +730,45 @@ pub const InputFocus = struct {
     pub const tag: Tag = .input_focus;
     view: u32,
     focused: u8,
+};
+
+/// `clipboard_read` mode byte (append-only values).
+pub const ClipboardMode = enum(u8) { copy = 0, cut = 1, _ };
+
+/// Insert clipboard text at the caret of `view`'s focused editable.
+///
+/// The CLIENT reads its own system clipboard and pushes the text; the
+/// HELPER owns how it is inserted. That split is forced twice over: a
+/// windowless browser's `ui::Clipboard` is not backed by the session
+/// selection in any configuration this product can reach, and CEF's C
+/// API exposes no clipboard read or write at all (`cef_frame_t`'s
+/// cut/copy/paste are editor COMMANDS over that same empty clipboard).
+/// `Text`, not `str`: `putStr` caps at 65535 and the client's `post`
+/// swallows the overflow silently, so a large paste would vanish.
+pub const InputPaste = struct {
+    pub const tag: Tag = .input_paste;
+    view: u32,
+    text: Text,
+};
+
+/// Ask for `view`'s current selection text; answered by
+/// `ev_clipboard_text` carrying the same `seq`. `mode = cut` also
+/// deletes the selection helper-side, AFTER the answer is posted, so
+/// copy-then-delete ordering cannot race a client round trip.
+pub const ClipboardRead = struct {
+    pub const tag: Tag = .clipboard_read;
+    view: u32,
+    seq: u32,
+    mode: u8,
+};
+
+/// The answer to `clipboard_read`. `seq` echoes the request so a reply
+/// that arrives after the user moved on is discardable.
+pub const EvClipboardText = struct {
+    pub const tag: Tag = .ev_clipboard_text;
+    view: u32,
+    seq: u32,
+    text: Text,
 };
 
 pub const FrameBuffer = struct {
@@ -3611,6 +3668,11 @@ test "round-trip: scalar and string frames" {
         .text = "",
     });
     try roundTrip(InputIme, .{ .view = 7, .kind = 1, .text = "ê", .cursor = 1 });
+    // `Text`, not `str`: a paste is document-sized, and a `str`
+    // overflow is swallowed silently by the client's `post`.
+    try roundTrip(InputPaste, .{ .view = 7, .text = .{ .s = "hello\nworld" } });
+    try roundTrip(ClipboardRead, .{ .view = 7, .seq = 3, .mode = 1 });
+    try roundTrip(EvClipboardText, .{ .view = 7, .seq = 3, .text = .{ .s = "selected ê" } });
     try roundTrip(InputFocus, .{ .view = 7, .focused = 1 });
     try roundTrip(FrameBuffer, .{ .view = 7, .buf_id = 3, .w = 800, .h = 600, .stride = 3200 });
     try roundTrip(FrameRelease, .{ .view = 7, .buf_id = 2 });

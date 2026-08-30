@@ -120,6 +120,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_SCROLL,
     proto.CAP_DEVTOOLS,
     proto.CAP_PRINT_PDF,
+    proto.CAP_CLIPBOARD,
     proto.CAP_DOWNLOADS,
     proto.CAP_A11Y,
     proto.CAP_A11Y_CARET,
@@ -834,6 +835,8 @@ pub const Server = struct {
             .input_scroll => self.host.scroll(try dec(cn, proto.InputScroll, frame.payload)),
             .input_key => self.host.key(try dec(cn, proto.InputKey, frame.payload)),
             .input_ime => self.host.ime(try dec(cn, proto.InputIme, frame.payload)),
+            .input_paste => self.host.paste(try dec(cn, proto.InputPaste, frame.payload)),
+            .clipboard_read => self.host.clipboardRead(try dec(cn, proto.ClipboardRead, frame.payload)),
             .input_focus => self.host.focus(try dec(cn, proto.InputFocus, frame.payload)),
             // v1 accepts the release for symmetry but keeps no per-buffer
             // state: one memfd per view, replaced on resize.

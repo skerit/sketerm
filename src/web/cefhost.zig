@@ -579,6 +579,12 @@ pub const View = struct {
     /// posts nothing for it.
     webext_bg: bool = false,
 
+    /// The page's current selection, UTF-8, gpa-owned. Kept because
+    /// the client cannot ask the engine for it on demand: CEF's C API
+    /// has no clipboard or selection getter, only the
+    /// `on_text_selection_changed` push.
+    sel_text: []u8 = &.{},
+
     /// A browser-action popup: real extension document and ordinary
     /// frame/input path, but no tab/navigation chrome on the client.
     webext_popup: bool = false,
@@ -2757,6 +2763,7 @@ pub const Host = struct {
         interceptUnregister(self.gpa, v.id);
         self.dropBrowser(v, close);
         if (v.url.len != 0) self.gpa.free(v.url);
+        if (v.sel_text.len != 0) self.gpa.free(v.sel_text);
         v.pending.deinit(self.gpa);
         v.forgetFrames(self.gpa);
         v.sem.deinit();
@@ -3947,10 +3954,56 @@ pub const Host = struct {
                 const sel = cef.cef_range_t{ .from = pos, .to = pos };
                 withHostArgs(v, imeCompose, .{ &text, &sel });
             },
-            .commit => withHostArgs(v, imeCommit, .{ &text, req.cursor }),
+            .commit => commitText(v, req.text, req.cursor),
             .cancel => withHostArgs(v, imeCancel, .{}),
             _ => {},
         }
+    }
+
+    /// Commit `text` into `v`'s focused editable, replacing any
+    /// selection — the ONE home for that call, shared by the IME commit
+    /// and by `paste`, so the two cannot drift.
+    ///
+    /// `ime_commit_text` is documented windowless-only, which every
+    /// frame-producing view here is (`windowlessInfo`); it is a silent
+    /// no-op for the windowed DevTools inspector.
+    fn commitText(v: *View, text: []const u8, cursor: i32) void {
+        var s = std.mem.zeroes(cef.cef_string_t);
+        setStr(text, &s);
+        defer cef.cef_string_utf16_clear(&s);
+        withHostArgs(v, imeCommit, .{ &s, cursor });
+    }
+
+    /// Insert the client's clipboard text at the caret.
+    ///
+    /// The client pushes the TEXT, not a "paste" command, because the
+    /// engine's own clipboard is empty here: `cef_frame_t::paste` would
+    /// run a real Paste against nothing, replacing the selection with
+    /// nothing. Committing the text is what makes select-all + paste do
+    /// what the user meant.
+    pub fn paste(self: *Host, req: proto.InputPaste) void {
+        const v = self.findWake(req.view) orelse return;
+        commitText(v, req.text.s, @intCast(req.text.s.len));
+    }
+
+    /// Answer the client's `clipboard_read` from the selection CEF
+    /// reports through `on_text_selection_changed`. A `cut` deletes the
+    /// selection only AFTER the answer is posted, so the text can never
+    /// be lost to a delete that raced its own reply.
+    pub fn clipboardRead(self: *Host, req: proto.ClipboardRead) void {
+        const v = self.findWake(req.view) orelse return;
+        self.post(proto.EvClipboardText{
+            .view = v.id,
+            .seq = req.seq,
+            .text = .{ .s = v.sel_text },
+        });
+        if (@as(proto.ClipboardMode, @enumFromInt(req.mode)) != .cut) return;
+        if (v.sel_text.len == 0) return;
+        const b = v.browser orelse return;
+        const get_frame = b.get_main_frame orelse return;
+        const frame: *cef.cef_frame_t = get_frame(b) orelse return;
+        defer release(&frame.base);
+        if (frame.del) |del| del(frame);
     }
 
     pub fn focus(self: *Host, req: proto.InputFocus) void {
@@ -12261,6 +12314,7 @@ fn installHandlers() void {
     // client handles both frame families for the same reason.
     render_handler.on_accelerated_paint = onAcceleratedPaint;
     render_handler.on_scroll_offset_changed = onScrollOffsetChanged;
+    render_handler.on_text_selection_changed = onTextSelectionChanged;
     render_handler.get_accessibility_handler = getAccessibilityHandler;
 
     accessibility_handler = std.mem.zeroes(cef.cef_accessibility_handler_t);
@@ -13278,6 +13332,31 @@ fn onRunContextMenu(
 /// leaves the stashed value differing from the posted one and the next
 /// tick sends it.
 const SCROLL_POST_MS: i64 = 150;
+
+/// The engine's selection push. This is the ONLY way to learn the
+/// page's selected text through CEF's C API — there is no getter, and
+/// no clipboard call to read it back out of — so the copy verbs are
+/// answered from what this last stored. Injecting JS to read the
+/// selection would be the alternative and it fails on cross-origin
+/// frames and on password-ish inputs; this does not.
+fn onTextSelectionChanged(
+    _: [*c]cef.cef_render_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    selected_text: [*c]const cef.cef_string_t,
+    _: [*c]const cef.cef_range_t,
+) callconv(.c) void {
+    defer releaseArg(browser);
+    const host = g_host orelse return;
+    const v = viewOf(browser) orelse return;
+    var s = Utf8.init(selected_text);
+    defer s.free();
+    const text = s.slice();
+    // Keep the old selection on an allocation failure rather than
+    // silently reporting an empty one to the next copy.
+    const dup = host.gpa.dupe(u8, text) catch return;
+    if (v.sel_text.len != 0) host.gpa.free(v.sel_text);
+    v.sel_text = dup;
+}
 
 fn onScrollOffsetChanged(
     _: [*c]cef.cef_render_handler_t,

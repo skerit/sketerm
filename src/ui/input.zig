@@ -35,6 +35,23 @@ pub const Ctx = struct {
     /// fn is stateless (it resolves the face from the Pane), so a
     /// detached face just answers false and nothing dangles.
     web_hints: ?*const fn (ctx: ?*anyopaque) bool = null,
+    /// Paste into the pane's VISIBLE non-terminal face. @return false
+    /// when no face owns the clipboard right now, so the terminal path
+    /// runs unchanged.
+    ///
+    /// This exists because `Ctx.terminal` is bound once at `attach` and
+    /// never re-aimed: a pane showing a web page still has a LIVE shell
+    /// behind it (every web tab is built on one), so an unrouted
+    /// `paste_clipboard` wrote the clipboard straight into that hidden
+    /// shell — and with bracketed paste off, a pasted newline EXECUTED.
+    /// Stateless like `web_hints`: it resolves the face from the Pane,
+    /// so a detached face answers false and nothing dangles.
+    face_paste: ?*const fn (ctx: ?*anyopaque) bool = null,
+    /// Copy from the pane's VISIBLE non-terminal face; same contract
+    /// and same reason as `face_paste`. Guards `interrupt_or_copy` too,
+    /// whose smart-copy branch otherwise sends SIGINT to that hidden
+    /// shell whenever the copy chord is pressed over a web page.
+    face_copy: ?*const fn (ctx: ?*anyopaque, cut: bool) bool = null,
     /// Pop the pane's context menu at the text cursor (keyboard path:
     /// Menu / Shift+F10). @return false when the pane has no menu
     /// attached yet, so the key falls through to the child.
@@ -1033,10 +1050,16 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             return 1;
         },
         .paste_clipboard => {
+            if (ctx.face_paste) |paste| {
+                if (paste(ctx.pane_ctx)) return 1;
+            }
             clipboard.pasteFromClipboard(ctx.widget, ctx.terminal);
             return 1;
         },
         .copy_selection => {
+            if (ctx.face_copy) |copy| {
+                if (copy(ctx.pane_ctx, false)) return 1;
+            }
             copySelection(ctx);
             return 1;
         },
@@ -1062,6 +1085,13 @@ pub fn runAction(ctx: *Ctx, action: Action) c.gboolean {
             return 1;
         },
         .interrupt_or_copy => {
+            // A visible face owns this chord outright: the smart-copy
+            // branch below writes 0x03 to the pane's terminal, which
+            // over a web page is a SIGINT to a shell the user cannot
+            // see. The guard must precede that branch, not follow it.
+            if (ctx.face_copy) |copy| {
+                if (copy(ctx.pane_ctx, false)) return 1;
+            }
             // smart_copy: no selection AND smart_copy on → forward
             // Ctrl+C (interrupt). Off → noop. Selection present →
             // copy. Matches the previous Ctrl+Shift+C behaviour.

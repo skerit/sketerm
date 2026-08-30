@@ -673,6 +673,10 @@ pub const Client = struct {
     /// hidden, so the verb is still discoverable.
     cap_devtools: bool = false,
     cap_print_pdf: bool = false,
+    /// The helper accepts `input_paste`/`clipboard_read`. Without it
+    /// the browser has NO working clipboard at all, so the face must
+    /// not claim Ctrl+V/C/X and leave the user with nothing.
+    cap_clipboard: bool = false,
     cap_downloads: bool = false,
     /// The helper accepts `a11y_enable` and streams the AX tree. An
     /// older helper simply skips the unknown frame, so this flag only
@@ -1364,6 +1368,7 @@ pub const Client = struct {
                 self.has_permissions = false;
                 self.cap_devtools = false;
                 self.cap_print_pdf = false;
+                self.cap_clipboard = false;
                 self.cap_downloads = false;
                 self.cap_a11y = false;
                 self.cap_a11y_caret = false;
@@ -1388,6 +1393,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_PERMISSIONS)) self.has_permissions = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.cap_devtools = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.cap_print_pdf = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_CLIPBOARD)) self.cap_clipboard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.cap_a11y_caret = true;
@@ -1536,6 +1542,12 @@ pub const Client = struct {
             .ev_view_create_failed => {
                 const ev = proto.decode(proto.EvViewCreateFailed, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onViewCreateFailed(ev);
+            },
+            .ev_clipboard_text => {
+                const ev = proto.decode(proto.EvClipboardText, frame.payload) catch return;
+                if (self.findFace(ev.view)) |face| {
+                    if (ev.seq == face.clip_seq and ev.text.s.len > 0) face.copyText(ev.text.s);
+                }
             },
             .ev_cursor => {
                 const ev = proto.decode(proto.EvCursor, frame.payload) catch return;
@@ -3313,6 +3325,9 @@ pub const WebFace = struct {
     hints_typed_len: usize = 0,
     hints_token: u32 = 0,
     hints_active: bool = false,
+    /// Correlates `clipboard_read` with its `ev_clipboard_text`, so a
+    /// reply that lands after the user moved on is discarded.
+    clip_seq: u32 = 0,
     /// Request interception (capability "intercept"): per-view counters,
     /// freshened by the helper's coalesced `intercept_status` pushes.
     /// The blocked count drives the toolbar badge; the log is PULLED on
@@ -3488,7 +3503,15 @@ pub const WebFace = struct {
         // Link hints dispatch (input.zig `web_hints` / `hints_open`).
         // The fn is stateless — it resolves this face from the Pane on
         // every call — so no teardown path has to clear it.
-        if (pane.input_ctx) |ictx| ictx.web_hints = webHintsSink;
+        if (pane.input_ctx) |ictx| {
+            ictx.web_hints = webHintsSink;
+            // The pane's clipboard bindings (Ctrl+Shift+V, Cmd+V, and
+            // the palette / remote-control routes into the same
+            // actions) must reach the PAGE, not the live shell still
+            // sitting behind this face.
+            ictx.face_paste = webPasteSink;
+            ictx.face_copy = webCopySink;
+        }
 
         // Suggestion dropdown under the address bar. An attached view
         // hides the whole nav bar, so it gets none; a face without one
@@ -7103,8 +7126,16 @@ pub const WebFace = struct {
     }
 
     /// Face-local chords, tried after the window bindings and before
-    /// the page: Ctrl+F (find), Ctrl+=/-/0 (zoom). A page never sees
-    /// these — the same trade every browser makes.
+    /// the page: Ctrl+F (find), Ctrl+=/-/0 (zoom), Ctrl+V/C/X.
+    ///
+    /// A page never sees these — the same trade every browser makes.
+    /// The clipboard three MUST be claimed rather than forwarded: the
+    /// engine's own clipboard is empty here, so letting Ctrl+V reach
+    /// the page runs a real Paste of nothing, which REPLACES the
+    /// selection — select-all then paste would wipe the field. They
+    /// fall through when the helper is too old to answer, so an
+    /// unsupported helper degrades to the old behaviour instead of
+    /// silently eating the chord.
     fn faceChord(self: *WebFace, keyval: c.guint, state: c.GdkModifierType) bool {
         const s: c_int = @intCast(state);
         if (s & c.GDK_CONTROL_MASK == 0 or s & c.GDK_ALT_MASK != 0) return false;
@@ -7113,6 +7144,9 @@ pub const WebFace = struct {
             c.GDK_KEY_equal, c.GDK_KEY_plus, c.GDK_KEY_KP_Add => self.zoomStep(1),
             c.GDK_KEY_minus, c.GDK_KEY_KP_Subtract => self.zoomStep(-1),
             c.GDK_KEY_0, c.GDK_KEY_KP_0 => self.zoomReset(),
+            c.GDK_KEY_v => return self.pasteFromClipboard(),
+            c.GDK_KEY_c => return self.copyToClipboard(false),
+            c.GDK_KEY_x => return self.copyToClipboard(true),
             else => return false,
         }
         return true;
@@ -7356,6 +7390,49 @@ pub const WebFace = struct {
     fn copyText(self: *WebFace, text: []const u8) void {
         if (self.widgets_dead) return;
         clipboard.copyText(self.allocator, self.root_box, text);
+    }
+
+    /// Read the system clipboard and push the TEXT to the helper.
+    ///
+    /// The engine cannot read the session selection itself (see
+    /// `CAP_CLIPBOARD`), so the client is the only one who can. The
+    /// read is async, and this face may be gone a main-loop turn later:
+    /// the context therefore carries `(*Client, view id)` and NEVER a
+    /// `*WebFace`, resolved through `faceByViewOn` when the text lands.
+    /// The client is the fence — it is never freed.
+    /// @return false when no helper can take it, so the pane binding
+    /// falls through to the terminal exactly as before.
+    fn pasteFromClipboard(self: *WebFace) bool {
+        if (!self.view_live or !self.cl.cap_clipboard) return false;
+        const ctx = self.allocator.create(PasteCtx) catch return false;
+        ctx.* = .{ .allocator = self.allocator, .cl = self.cl, .view = self.view };
+        if (!clipboard.readFrom(
+            self.allocator,
+            clipboard.clipboardFor(self.root_box, .clipboard),
+            onWebPasteRead,
+            @ptrCast(ctx),
+        )) {
+            // readFrom's contract: a false return means the callback
+            // never runs, so the context is ours to undo.
+            self.allocator.destroy(ctx);
+            return false;
+        }
+        return true;
+    }
+
+    /// Ask the helper for the page selection; the answer arrives as
+    /// `ev_clipboard_text` and is written to the system clipboard there.
+    /// `cut` also deletes the selection, helper-side and after the
+    /// answer, so the text cannot be lost to a racing delete.
+    fn copyToClipboard(self: *WebFace, cut: bool) bool {
+        if (!self.view_live or !self.cl.cap_clipboard) return false;
+        self.clip_seq +%= 1;
+        self.cl.post(proto.ClipboardRead{
+            .view = self.view,
+            .seq = self.clip_seq,
+            .mode = @intFromEnum(@as(proto.ClipboardMode, if (cut) .cut else .copy)),
+        });
+        return true;
     }
 
     /// Firefox's icon-only Back / Forward / Reload strip: the plain
@@ -9009,6 +9086,26 @@ fn webHintsSink(pane_ctx: ?*anyopaque) bool {
     return face.startHints();
 }
 
+/// input.zig `face_paste` sink; same stateless shape as `webHintsSink`.
+/// False means the pane is not showing a web page (or the helper cannot
+/// take the text), so the terminal path runs unchanged.
+fn webPasteSink(pane_ctx: ?*anyopaque) bool {
+    const pane: *Pane = @ptrCast(@alignCast(pane_ctx orelse return false));
+    if (!pane.webFaceVisible()) return false;
+    const face = WebFace.fromPane(pane) orelse return false;
+    return face.pasteFromClipboard();
+}
+
+/// input.zig `face_copy` sink. Answering true is what keeps
+/// `interrupt_or_copy`'s smart-copy branch from sending SIGINT to the
+/// shell hidden behind a web page.
+fn webCopySink(pane_ctx: ?*anyopaque, cut: bool) bool {
+    const pane: *Pane = @ptrCast(@alignCast(pane_ctx orelse return false));
+    if (!pane.webFaceVisible()) return false;
+    const face = WebFace.fromPane(pane) orelse return false;
+    return face.copyToClipboard(cut);
+}
+
 /// The refresh rate of the output this frame clock drives, or `fallback`
 /// when GDK does not know one yet (an unmapped or just-realized
 /// surface). `gdk_frame_clock_get_refresh_info` reports the interval in
@@ -9067,6 +9164,28 @@ fn permissionLabel(types: u32) []const u8 {
         proto.perm_vr => "immersive VR/AR",
         else => "a device permission",
     };
+}
+
+/// Pending system-clipboard read, for the same reason as `PopupCtx`:
+/// the async read outlives the face, so it carries the client (which is
+/// never freed) plus a view id, never a face pointer.
+const PasteCtx = struct {
+    allocator: std.mem.Allocator,
+    cl: *Client,
+    view: u32,
+};
+
+fn onWebPasteRead(user: ?*anyopaque, text: ?[]const u8) void {
+    const ctx = cast.userData(PasteCtx, user);
+    const cl = ctx.cl;
+    const view = ctx.view;
+    ctx.allocator.destroy(ctx);
+    const body = text orelse return;
+    if (body.len == 0) return;
+    // Resolve AFTER the read: the pane may have closed in between.
+    const face = faceByViewOn(cl, view) orelse return;
+    if (!face.view_live) return;
+    cl.post(proto.InputPaste{ .view = view, .text = .{ .s = body } });
 }
 
 /// Blocked-popup toast context. It carries a VIEW ID, not a face
