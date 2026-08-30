@@ -748,6 +748,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_RECONNECT_ONLY") != null) {
+        const app = drive orelse return fail("focused files-reconnect smoke has no display driver");
+        if (!have_wl) return fail("focused files-reconnect smoke is GTK/Wayland-only");
+        if (filesReconnectStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("files reconnect: the remote daemon died and came back; every row listed exactly once, no view id collision, and live deltas resumed");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_INLINE_RENAME_ONLY") != null) {
         const app = drive orelse return fail("focused inline-rename smoke has no display driver");
         if (!have_wl) return fail("focused inline-rename smoke is GTK/Wayland-only");
@@ -1238,6 +1246,15 @@ pub fn main() u8 {
             // listing batch, Space closes it again.
             if (quickLookStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
             say("quick look: Space in a Files window opened the shared viewer on the focused file, Right stepped to the next entry, Space closed it, and the browser stayed healthy");
+
+            // 6c-11. A remote Files tab whose daemon died: the
+            // reconnect re-subscribes every directory under a FRESH
+            // view id and from an EMPTY listing. Last stage that uses
+            // the fake-SSH daemon, since it replaces that daemon.
+            if (!platform.is_macos) {
+                if (filesReconnectStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+                say("files reconnect: the remote daemon died and came back; every row listed exactly once, no view id collision, and live deltas resumed");
+            }
         }
     }
 
@@ -5425,6 +5442,132 @@ fn findRenameControlSocket(
         defer allocator.free(probe);
         if (std.mem.indexOf(u8, probe, "\"ok\":true") != null) return candidate;
     }
+    return null;
+}
+
+/// Occurrences of `needle` in one OCR pass over the window, the most
+/// any of the recognizer's modes finds. Null when tesseract is absent.
+fn ocrCount(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8) ?usize {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) return null;
+    _ = app.pumpOnce(100);
+    const shot = app.snapshotRgba(win_id, null) catch return 0;
+    defer allocator.free(shot.px);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var best: usize = 0;
+    for ([_]i32{ 6, 11 }) |psm| {
+        const res = ocr.recognize(arena.allocator(), shot.px, shot.w, shot.h, .{ .psm = psm }) catch continue;
+        best = @max(best, std.mem.count(u8, res.text, needle));
+    }
+    return best;
+}
+
+/// Restart the harness's fake-SSH daemon after a deliberate kill: the
+/// same private dirs, so the reconnecting tab lands on the same paths.
+fn respawnRemoteMux(rt: []const u8) bool {
+    var rrt_buf: [256]u8 = undefined;
+    const rrt = std.fmt.bufPrintZ(&rrt_buf, "{s}/r", .{rt}) catch return false;
+    const pid = c.fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        platform.dieWithParent();
+        _ = c.setenv("XDG_RUNTIME_DIR", rrt.ptr, 1);
+        _ = c.setenv("XDG_STATE_HOME", rrt.ptr, 1);
+        _ = c.setenv("XDG_CONFIG_HOME", rrt.ptr, 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm-mux", null };
+        _ = c.execv("zig-out/bin/sketerm-mux", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    remote_mux_pid = pid;
+    var rsock_buf: [512]u8 = undefined;
+    const rsock = std.fmt.bufPrintZ(&rsock_buf, "{s}/sketerm/mux.sock", .{rrt}) catch return false;
+    var waited: u32 = 0;
+    while (c.access(rsock.ptr, c.F_OK) != 0) {
+        _ = c.usleep(50_000);
+        waited += 1;
+        if (waited > 100) return false;
+    }
+    return true;
+}
+
+/// A Files window on a fake-SSH directory survives its daemon dying:
+/// after the reconnect every row is listed ONCE (the re-open used to
+/// stream onto the rows the tab still held), no re-subscription is
+/// refused ("view id in use": every re-opened directory asked for view
+/// 0), and a file created afterwards arrives as a live delta, which
+/// proves the fresh subscription is real.
+fn filesReconnectStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("files reconnect: tesseract unavailable; skipping");
+        return null;
+    }
+    if (remote_mux_pid <= 0) return "files reconnect: the fake-SSH daemon is not running";
+
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/reconn", .{rt}) catch return "files reconnect: dir path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    for ([_][]const u8{ "ALPHAROW", "BETAROW", "GAMMAROW" }) |name| {
+        var p: [560:0]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&p, "{s}/{s}", .{ dir, name }) catch return "files reconnect: seed path";
+        const fd = c.open(z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+        if (fd < 0) return "files reconnect: seed create";
+        _ = c.close(fd);
+    }
+    var spec_buf: [560:0]u8 = undefined;
+    const spec = std.fmt.bufPrintZ(&spec_buf, "localhost:{s}", .{dir}) catch return "files reconnect: spec";
+    const child = launchRenameFiles(app, spec, "reconn", "", wl) orelse
+        return "files reconnect: the remote Files window never appeared";
+    defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
+
+    if (!viewerWaitOcr(allocator, app, child.win, "ALPHAROW", 40_000))
+        return "files reconnect: the remote listing never rendered";
+
+    // The daemon dies under the tab; the proxy's next dial lands on a
+    // fresh one at the same socket.
+    reap(remote_mux_pid, c.SIGTERM, 2000);
+    remote_mux_pid = 0;
+    if (!respawnRemoteMux(rt)) return "files reconnect: the fake-SSH daemon did not come back";
+
+    // The reconnect timer's first attempt is 5s out; give the dial,
+    // the re-listing and the throttled render room, then require a
+    // stable single listing: each seed name exactly once, and none of
+    // the daemon's refusal on screen.
+    const deadline = clock.nowMs() + 60_000;
+    var stable: u32 = 0;
+    while (clock.nowMs() < deadline) {
+        _ = app.pumpOnce(500);
+        const a = ocrCount(allocator, app, child.win, "ALPHAROW") orelse return null;
+        const b = ocrCount(allocator, app, child.win, "BETAROW") orelse return null;
+        const g = ocrCount(allocator, app, child.win, "GAMMAROW") orelse return null;
+        const refused = ocrCount(allocator, app, child.win, "in use") orelse 0;
+        if (refused > 0) return "files reconnect: the daemon refused a re-subscription (view id in use)";
+        if (a > 1 or b > 1 or g > 1) return "files reconnect: a row was listed twice after the reconnect";
+        if (a == 1 and b == 1 and g == 1) {
+            stable += 1;
+            if (stable >= 3) break;
+        } else stable = 0;
+    }
+    if (stable < 3) return "files reconnect: the listing never settled to one row per file";
+
+    // Deltas ride the NEW subscription: a file created now must show.
+    {
+        var p: [560:0]u8 = undefined;
+        const z = std.fmt.bufPrintZ(&p, "{s}/DELTAROW", .{dir}) catch return "files reconnect: delta path";
+        const fd = c.open(z.ptr, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+        if (fd < 0) return "files reconnect: delta create";
+        _ = c.close(fd);
+    }
+    if (!viewerWaitOcr(allocator, app, child.win, "DELTAROW", 30_000))
+        return "files reconnect: a file created after the reconnect never appeared (the re-subscription is not live)";
+
+    if (!closeRenameFiles(app, child)) return "files reconnect: the Files window did not close cleanly";
     return null;
 }
 
