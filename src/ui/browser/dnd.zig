@@ -7,6 +7,7 @@ const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const BTab = @import("types.zig").BTab;
 const cast = @import("../../util/cast.zig");
+const oproots = @import("oproots.zig");
 
 const Origin = struct {
     active: bool = false,
@@ -147,11 +148,14 @@ pub fn provider(tab: *BTab, dragged: []const u8) ?*c.GdkContentProvider {
     // through here for its content).
     if (tab.view.picker) |pk| if (pk.suppress_ops) return null;
     const allocator = tab.view.allocator;
-    const paths = if (useSelection(tab.drag_selected.items, dragged))
+    const raw_paths = if (useSelection(tab.drag_selected.items, dragged))
         tab.drag_selected.items
     else
         tab.selected.items;
-    const selected = useSelection(paths, dragged);
+    const selected = useSelection(raw_paths, dragged);
+    const roots = if (selected) oproots.collect(allocator, tab, raw_paths) catch return null else null;
+    defer if (roots) |owned| allocator.free(owned);
+    const paths: []const []u8 = if (roots) |owned| owned else raw_paths;
     const count: usize = if (selected) paths.len else 1;
     const specs = allocator.alloc([:0]u8, count) catch return null;
     defer allocator.free(specs);

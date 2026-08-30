@@ -38,7 +38,12 @@ pub fn currentErrno() c_int {
     return if (is_linux) c.__errno_location().* else c.__error().*;
 }
 
-pub const RenameNoReplaceResult = enum { ok, exists, cross_device, failed };
+pub const RenameNoReplaceResult = union(enum) {
+    ok,
+    exists,
+    cross_device,
+    failed: std.posix.E,
+};
 pub const RenameExchangeResult = enum { ok, unsupported, cross_device, failed };
 
 /// Atomically install `old_path` at a destination that must not exist.
@@ -49,7 +54,7 @@ pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameN
             .SUCCESS => .ok,
             .EXIST => .exists,
             .XDEV => .cross_device,
-            else => .failed,
+            else => |err| .{ .failed = err },
         };
     }
     const rc = c.renamex_np(old_path, new_path, @intCast(c.RENAME_EXCL));
@@ -57,7 +62,7 @@ pub fn renameNoReplace(old_path: [*:0]const u8, new_path: [*:0]const u8) RenameN
     return switch (std.posix.errno(rc)) {
         .EXIST => .exists,
         .XDEV => .cross_device,
-        else => .failed,
+        else => |err| .{ .failed = err },
     };
 }
 

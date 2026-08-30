@@ -2231,7 +2231,7 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
                 .ok => {},
                 .exists => return fsReplyErr(cl, r.req, "EXIST"),
                 .cross_device => return fsReplyErr(cl, r.req, "XDEV"),
-                .failed => return fsReplyErr(cl, r.req, "rename failed"),
+                .failed => |err| return fsReplyErr(cl, r.req, @tagName(err)),
             }
         } else {
             const rc = c.rename(from, to);

@@ -175,6 +175,7 @@ comptime {
     _ = @import("ui/browser/menu.zig");
     _ = @import("ui/browser/classicmenu.zig");
     _ = @import("ui/browser/ops.zig");
+    _ = @import("ui/browser/oproots.zig");
     _ = @import("ui/browser/jobs.zig");
     _ = @import("ui/browser/jobpanel.zig");
     _ = @import("ui/browser/open.zig");

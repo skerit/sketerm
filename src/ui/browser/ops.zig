@@ -23,6 +23,7 @@ const clipboard = @import("../../filebrowser/clipboard.zig");
 const confirm = @import("../confirm.zig");
 const conflict = @import("conflict.zig");
 const dnd = @import("dnd.zig");
+const oproots = @import("oproots.zig");
 const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparent;
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const menuDone = @import("menu.zig").menuDone;
@@ -158,10 +159,15 @@ pub fn clipSelection(self: *BrowserView, cut: bool) void {
 }
 
 fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void {
+    const roots = oproots.collect(self.allocator, tab, srcs) catch {
+        self.setStatus("file operation not started: out of memory");
+        return;
+    };
+    defer self.allocator.free(roots);
     // The source directory's filesystem rides along: it decides later
     // whether a hard link into another directory could work at all.
     const board = self.clipboard();
-    board.set(tab.hc.host, srcs, cut, tab.root.dev);
+    board.set(tab.hc.host, roots, cut, tab.root.dev);
     exportClipToGdk(self, tab, cut);
     const verb: []const u8 = if (cut) "cut" else "copied";
     if (board.items().len > 1) {
@@ -1323,12 +1329,14 @@ pub fn onMenuTrash(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     var one: [1][]u8 = undefined;
     const targets = menuTargets(ctx, &one);
     if (targets.len == 0) return menuDone(ctx);
+    const roots = oproots.collect(self.allocator, ctx.tab, targets) catch return menuDone(ctx);
+    defer self.allocator.free(roots);
     const hc = ctx.tab.hc;
     if (hc.state != .ready) {
         self.setStatusFmt("not connected to {s}", .{hc.label()});
         return menuDone(ctx);
     }
-    trashPaths(self, hc, targets);
+    trashPaths(self, hc, roots);
     menuDone(ctx);
 }
 
@@ -1343,7 +1351,12 @@ pub fn trashSelection(self: *BrowserView) void {
         self.setStatusFmt("not connected to {s}", .{tab.hc.label()});
         return;
     }
-    trashPaths(self, tab.hc, tab.selected.items);
+    const roots = oproots.collect(self.allocator, tab, tab.selected.items) catch {
+        self.setStatus("trash not started: out of memory");
+        return;
+    };
+    defer self.allocator.free(roots);
+    trashPaths(self, tab.hc, roots);
 }
 
 fn trashPaths(self: *BrowserView, hc: *HostConn, targets: []const []u8) void {
@@ -1374,7 +1387,9 @@ pub fn onMenuDelete(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(MenuCtx, user);
     var one: [1][]u8 = undefined;
     const targets = menuTargets(ctx, &one);
-    confirmDeletePaths(ctx.view, ctx.tab, targets);
+    const roots = oproots.collect(ctx.view.allocator, ctx.tab, targets) catch return menuDone(ctx);
+    defer ctx.view.allocator.free(roots);
+    confirmDeletePaths(ctx.view, ctx.tab, roots);
     menuDone(ctx);
 }
 
@@ -1382,7 +1397,9 @@ pub fn onMenuSecureDelete(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     const ctx = cast.userData(MenuCtx, user);
     var one: [1][]u8 = undefined;
     const targets = menuTargets(ctx, &one);
-    confirmDeletePathsMode(ctx.view, ctx.tab, targets, true);
+    const roots = oproots.collect(ctx.view.allocator, ctx.tab, targets) catch return menuDone(ctx);
+    defer ctx.view.allocator.free(roots);
+    confirmDeletePathsMode(ctx.view, ctx.tab, roots, true);
     menuDone(ctx);
 }
 
@@ -1393,7 +1410,12 @@ pub fn deleteSelection(self: *BrowserView) void {
         self.setStatus("nothing selected");
         return;
     }
-    confirmDeletePaths(self, tab, tab.selected.items);
+    const roots = oproots.collect(self.allocator, tab, tab.selected.items) catch {
+        self.setStatus("delete not started: out of memory");
+        return;
+    };
+    defer self.allocator.free(roots);
+    confirmDeletePaths(self, tab, roots);
 }
 
 /// Modal confirmation, Nemo's shape: names one item, counts many.
@@ -2508,15 +2530,20 @@ pub fn sendToPeer(self: *BrowserView, move: bool, clicked: ?[]const u8) void {
         self.setStatus("select something to send to the other pane");
         return;
     }
+    const roots = oproots.collect(self.allocator, tab, sources) catch {
+        self.setStatus("file operation not started: out of memory");
+        return;
+    };
+    defer self.allocator.free(roots);
     if (hostEq(tab.hc.host, peer_tab.hc.host) and std.mem.eql(u8, tab.root.path, peer_tab.root.path)) {
         self.setStatus("both panes show the same directory");
         return;
     }
-    peer.beginPaste(peer_tab, tab.hc.host, sources, move, false);
+    peer.beginPaste(peer_tab, tab.hc.host, roots, move, false);
     var buf: [4300]u8 = undefined;
     self.setStatusFmt("{s} {d} item(s) to {s}", .{
         if (move) "moving" else "copying",
-        sources.len,
+        roots.len,
         peer_tab.spec(&buf),
     });
 }
