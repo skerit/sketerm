@@ -1,5 +1,55 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-30: the browser gets a clipboard, and real popups
+
+**Paste did not work anywhere in the browser, and the paste chord was
+dangerous.** A pane showing a web page still has a LIVE shell behind it
+(every web tab is built on one) and `input.Ctx.terminal` is bound once
+at attach, so Ctrl+Shift+V pasted the system clipboard straight into
+that hidden shell — raw, because bracketed paste is off there, so a
+clipboard string containing a newline was EXECUTED unseen. Ctrl+Shift+C
+sent SIGINT to it. `face_paste`/`face_copy` sinks in the `web_hints`
+shape give the visible face those verbs; the chord table, the command
+palette and remote control all funnel through `runAction`, so one seam
+covers all three.
+
+Paste into the page then had nowhere to go: a windowless browser's own
+`ui::Clipboard` is not backed by the session selection in any
+configuration this product reaches, and CEF's C API exposes no clipboard
+read or write to prime it with, so `cef_frame_t::paste` would run a real
+Paste against nothing — which REPLACES the selection, so select-all then
+paste wiped the field. `input_paste` / `clipboard_read` /
+`ev_clipboard_text` (capability `clipboard`) put the system clipboard on
+the client side and insertion on the helper side. Copy-out is answered
+from `on_text_selection_changed`, which was implemented nowhere.
+
+**Popups were cancelled unconditionally, which broke federated
+sign-in.** `onBeforePopup` returned 1 always and the GUI opened an
+unrelated tab at the same url, severing `window.opener` both ways. Google
+Sign-In delivers its result with `window.opener.postMessage`, so the flow
+appeared to work and then threw on null at the last step; `window.open`
+returning null also made GIS take its popup-blocked fallback and open a
+SECOND window, which is where the two tabs came from, and the picker's
+`channel_id` handshake had no opener to complete against so it rendered
+empty. All three symptoms, one cause.
+
+Measured on CEF 151: a windowless `cef_window_info_t` plus `return 0`
+yields a real popup with `is_window_rendering_disabled()==1` whose opener
+round-trips postMessage both ways — the DevTools windowless refusal does
+NOT generalize. Blocking became state the client pushes ahead of the
+decision (`popup_policy_set`), because `on_before_popup` must answer
+synchronously; default block, so an old client is unchanged, and headless
+allows them because an agent driving a sign-in needs that window.
+`DEVTOOLS_VIEW_BASE` became `ENGINE_VIEW_BASE`: the engine can now mint a
+view the client never asked for, and what consumers depend on is that the
+helper minted it, not which feature did.
+
+Two things only the pinned-CEF rig could catch: `get_host`'s return
+translates as `[*c]` upstream and `?*` on the distro headers, so
+`test-web` compiled what `smoke-web` could not; and CEF reports the
+DevTools window as a popup too, so the new `is_popup` branch swallowed it
+and `devtools_show` waited forever (stage 22i).
+
 ## 2026-08-30: what the operation-root and watch-tab pass left behind
 
 An audit of the two fixes below found both real but neither finished.
