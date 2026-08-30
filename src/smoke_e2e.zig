@@ -3392,6 +3392,22 @@ fn waitColorBox(app: *appdrive.App, win_id: u32, comptime pred: fn (r: i32, g: i
 /// click changes nothing; the pane's Take control makes the next click
 /// change the page; closing the tab leaves the assistant's page alive
 /// and changed (its own `web_eval` reads the new title).
+const ClickReport = struct { x: i32, y: i32, vw: u32, vh: u32 };
+
+/// `watch:clicked:<x>:<y>:<vw>:<vh>` out of a web_eval reply.
+fn parseClickTitle(reply: []const u8) ?ClickReport {
+    const key = "watch:clicked:";
+    const at = std.mem.indexOf(u8, reply, key) orelse return null;
+    var it = std.mem.splitScalar(u8, reply[at + key.len ..], ':');
+    const x = std.fmt.parseInt(i32, it.next() orelse return null, 10) catch return null;
+    const y = std.fmt.parseInt(i32, it.next() orelse return null, 10) catch return null;
+    const vw = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const vh_raw = it.next() orelse return null;
+    const vh_end = std.mem.indexOfAny(u8, vh_raw, "\"\\") orelse vh_raw.len;
+    const vh = std.fmt.parseInt(u32, vh_raw[0..vh_end], 10) catch return null;
+    return .{ .x = x, .y = y, .vw = vw, .vh = vh };
+}
+
 fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, rt: []const u8) ?[]const u8 {
     if (!@import("util/ocr.zig").available()) {
         say("SKIP assistant web watch: tesseract unavailable; the chip and popover are driven by OCR");
@@ -3415,7 +3431,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     const page = std.fmt.bufPrintZ(&page_buf, "{s}/watch-page.html", .{rt}) catch return "watch page path";
     if (!writeFile(page,
         "<html><head><title>watch:red</title><style>html,body{margin:0;min-height:100vh;background:red}</style></head>" ++
-        "<body onclick=\"document.body.style.background='lime';document.title='watch:clicked'\">watch</body></html>"))
+        "<body onclick=\"document.body.style.background='lime';document.title='watch:clicked:'+event.clientX+':'+event.clientY+':'+innerWidth+':'+innerHeight\">watch</body></html>"))
         return "could not write the watch page";
 
     var web_bin_buf: [4096]u8 = undefined;
@@ -3545,10 +3561,16 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
         return whyf("clicking Take control at {d},{d} (chip {d},{d} {d}x{d}) did not flip the pane's lease chip (see zig-out/smoke-e2e-webwatch-notaken.png)", .{ take.x + take.w - 12, take.y + take.h / 2, take.x, take.y, take.w, take.h });
     }
     _ = app.waitIdle(300, 5_000);
+    // OFF-CENTRE on purpose: the frame is letterboxed at the assistant's
+    // size, and a mapping that is merely centred right (the bug: the
+    // picture allocated larger than the fit and CONTAIN re-centring the
+    // frame inside it) is exact at the middle and wrong everywhere else.
+    const cx = red.x + red.w * 0.10;
+    const cy = red.y + red.h * 0.15;
     var control_waited: u32 = 0;
     var lime: ?ChipBox = null;
     while (control_waited < 15_000 and lime == null) : (control_waited += 500) {
-        app.click(win_id, red.x + red.w / 2, red.y + red.h / 2, 1) catch return "clicking the controlled page failed";
+        app.click(win_id, cx, cy, 1) catch return "clicking the controlled page failed";
         lime = waitColorBox(app, win_id, isLime, 500);
     }
     if (lime == null) {
@@ -3557,6 +3579,21 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
             writePng("zig-out/smoke-e2e-webwatch-nocontrol.png", shot.png);
         } else |_| {}
         return "a click after Take control did not change the assistant's page (see zig-out/smoke-e2e-webwatch-nocontrol.png)";
+    }
+    {
+        // The page saw the click where the letterbox says it was: the
+        // red box on screen IS the fitted frame, so the page coordinate
+        // is the click's fraction of that box times the page viewport.
+        const title = m.call("web_eval", "{\"code\":\"document.title\"}", 30_000) orelse return "web_eval after the controlled click timed out";
+        const got = parseClickTitle(title) orelse return whyf("the controlled click did not report its coordinates: {s}", .{title[0..@min(title.len, 300)]});
+        const ex = (cx - red.x) / red.w * @as(f64, @floatFromInt(got.vw));
+        const ey = (cy - red.y) / red.h * @as(f64, @floatFromInt(got.vh));
+        const dx = @abs(@as(f64, @floatFromInt(got.x)) - ex);
+        const dy = @abs(@as(f64, @floatFromInt(got.y)) - ey);
+        // The red box is found on a pixel grid and the fit rounds once;
+        // a centring error on a letterboxed 1280x800 page is tens of px.
+        if (dx > 6 or dy > 6)
+            return whyf("the watched page's pointer mapping is off: clicked {d:.0},{d:.0} in a {d:.0}x{d:.0} box, page saw {d},{d} of {d}x{d}, expected {d:.0},{d:.0}", .{ cx - red.x, cy - red.y, red.w, red.h, got.x, got.y, got.vw, got.vh, ex, ey });
     }
 
     // Close the tab: the assistant's page lives on, changed by our click.

@@ -1495,7 +1495,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_COOKIE_SYNC)) self.cap_cookie_sync = true;
                     if (std.mem.eql(u8, cap, proto.CAP_OBSERVE)) self.cap_observe = true;
-                }
+}
                 if (self.observer) {
                     // Nothing of this GUI's is published into an
                     // assistant's helper (see `observer`); the one
@@ -6026,8 +6026,19 @@ pub const WebFace = struct {
         self.obs_fit = f;
         self.snap_dx = f.x;
         self.snap_dy = f.y;
+        // All FOUR margins: a size request is only a minimum, and a
+        // GtkPicture's natural size is its paintable's, so with just
+        // start/top margins the picture was allocated wider or taller
+        // than the fit and CONTAIN re-centred the frame inside that,
+        // moving the drawn pixels away from where `obs_fit` (and so the
+        // pointer mapping) says they are. Pinning every side makes the
+        // allocation exactly the fit.
+        const end_x: c_int = @max(0, @as(c_int, alloc.w) - @as(c_int, f.x) - @as(c_int, f.w));
+        const end_y: c_int = @max(0, @as(c_int, alloc.h) - @as(c_int, f.y) - @as(c_int, f.h));
         c.gtk_widget_set_margin_start(self.picture, f.x);
         c.gtk_widget_set_margin_top(self.picture, f.y);
+        c.gtk_widget_set_margin_end(self.picture, end_x);
+        c.gtk_widget_set_margin_bottom(self.picture, end_y);
         c.gtk_widget_set_size_request(self.picture, f.w, f.h);
     }
 
