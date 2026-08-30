@@ -7769,7 +7769,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             if (!cl.waitDamageAfter(dmg, 20_000)) fail("stage 22i devtools: the inspected view stopped painting");
             pass("stage 22i devtools (engine window fallback, answered and non-destructive)");
         } else {
-            if (cl.dev_view < proto.DEVTOOLS_VIEW_BASE)
+            if (cl.dev_view < proto.ENGINE_VIEW_BASE)
                 fail("stage 22i devtools: the inspector id is inside the client-allocated range");
 
             // It paints. The id must arrive BEFORE the buffer (a client

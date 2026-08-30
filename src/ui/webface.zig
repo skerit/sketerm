@@ -512,6 +512,9 @@ var g_popup_policy: PopupPolicy = .block_gestureless;
 /// the same reason as the frame cap: one helper client, one policy.
 pub fn setPopupPolicy(policy: PopupPolicy) void {
     g_popup_policy = policy;
+    // The helper cannot ask at decision time, so every live face
+    // restates its own effective policy.
+    for (g_client.faces.items) |f| f.pushPopupPolicy();
 }
 
 /// `web_download_ask` from the config: true = a save dialog per
@@ -677,6 +680,10 @@ pub const Client = struct {
     /// the browser has NO working clipboard at all, so the face must
     /// not claim Ctrl+V/C/X and leave the user with nothing.
     cap_clipboard: bool = false,
+    /// The helper can really open a popup, keeping window.opener.
+    /// Without it every popup is cancelled and reported, which is the
+    /// old behaviour.
+    cap_popup_open: bool = false,
     cap_downloads: bool = false,
     /// The helper accepts `a11y_enable` and streams the AX tree. An
     /// older helper simply skips the unknown frame, so this flag only
@@ -1369,6 +1376,7 @@ pub const Client = struct {
                 self.cap_devtools = false;
                 self.cap_print_pdf = false;
                 self.cap_clipboard = false;
+                self.cap_popup_open = false;
                 self.cap_downloads = false;
                 self.cap_a11y = false;
                 self.cap_a11y_caret = false;
@@ -1394,6 +1402,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.cap_devtools = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.cap_print_pdf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CLIPBOARD)) self.cap_clipboard = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_POPUP_OPEN)) self.cap_popup_open = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.cap_a11y_caret = true;
@@ -1556,6 +1565,22 @@ pub const Client = struct {
             .ev_popup_request => {
                 const ev = proto.decode(proto.EvPopupRequest, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onPopup(ev.url, ev.user_gesture != 0);
+            },
+            .ev_page_popup => {
+                const ev = proto.decode(proto.EvPagePopup, frame.payload) catch return;
+                if (ev.state == proto.page_popup_opened) {
+                    if (self.findFace(ev.owner_view)) |face| {
+                        face.onPagePopup(ev);
+                    } else {
+                        // Nobody to present it: the helper must not be
+                        // left holding a browser nothing will close.
+                        self.post(proto.ViewDestroy{ .view = ev.popup_view });
+                    }
+                } else if (self.findFace(ev.popup_view)) |face| {
+                    // The popup closed itself, which is how every OAuth
+                    // flow ends. Retire its tab.
+                    face.closeSelf();
+                }
             },
             .ev_cert_error => {
                 const ev = proto.decode(proto.EvCertError, frame.payload) catch return;
@@ -3409,6 +3434,17 @@ pub const WebFace = struct {
         return attachOpts(allocator, pane, .{ .existing_view = view, .on_client = on });
     }
 
+    /// `attachView` for a real page POPUP: same adoption, but the
+    /// address bar stays, because the user must be able to read the
+    /// origin of a page that is about to ask for their password.
+    pub fn attachPopupView(allocator: std.mem.Allocator, pane: *Pane, view: u32, on: *Client) !*WebFace {
+        return attachOpts(allocator, pane, .{
+            .existing_view = view,
+            .on_client = on,
+            .keep_address_bar = true,
+        });
+    }
+
     const Opts = struct {
         url: ?[]const u8 = null,
         /// Non-zero: present this helper-side view rather than mint one.
@@ -3424,6 +3460,9 @@ pub const WebFace = struct {
         as_page: bool = false,
         /// Page this one was opened from, for the group's tree nesting.
         opener: ?*WebFace = null,
+        /// Keep the address bar on an `existing_view` face. Set for a
+        /// page popup, whose origin the user MUST be able to read.
+        keep_address_bar: bool = false,
     };
 
     /// Add a page to an existing group — the in-pane equivalent of
@@ -3467,6 +3506,37 @@ pub const WebFace = struct {
         });
     }
 
+    /// A page in `g` PRESENTING an existing helper-side view: the
+    /// sidebar equivalent of `Window.newWebTabForView`.
+    pub fn attachPageExisting(
+        allocator: std.mem.Allocator,
+        g: *webgroup.Group,
+        view: u32,
+        opener: *WebFace,
+    ) !*WebFace {
+        return attachOpts(allocator, g.pane, .{
+            .existing_view = view,
+            .on_client = opener.cl,
+            .as_page = true,
+            .opener = opener,
+            .keep_address_bar = true,
+        });
+    }
+
+    /// Retire this face's own page/tab, for a view the ENGINE closed
+    /// (`window.close()` from a popup, which is how an OAuth flow
+    /// ends). The helper already freed the view, so nothing is posted
+    /// back to it.
+    pub fn closeSelf(self: *WebFace) void {
+        self.view_live = false;
+        if (self.group()) |g| {
+            g.closePage(self, .promote);
+            return;
+        }
+        const win = self.ownerWindow() orelse return;
+        if (self.ownerPage()) |page| _ = c.adw_tab_view_close_page(win.tab_view, page);
+    }
+
     fn attachOpts(allocator: std.mem.Allocator, pane: *Pane, opts: Opts) !*WebFace {
         if (!opts.as_page) {
             if (fromPane(pane)) |existing| {
@@ -3486,7 +3556,12 @@ pub const WebFace = struct {
         if (opts.url) |u| self.pending_url = allocator.dupe(u8, u) catch null;
 
         self.buildUi();
-        if (opts.existing_view != 0) c.gtk_widget_set_visible(self.bar, 0);
+        // An inspector has no address of its own, so it hides the bar.
+        // A POPUP does: it routinely shows a password field, and a
+        // credential prompt whose origin the user cannot see is exactly
+        // what the security-surfaces section above exists to prevent.
+        if (opts.existing_view != 0 and !opts.keep_address_bar)
+            c.gtk_widget_set_visible(self.bar, 0);
         c.gtk_widget_set_vexpand(self.root_box, 1);
         c.gtk_widget_set_hexpand(self.root_box, 1);
         grp.adopt(self, opts.opener, grp.childInsertPos()) catch {
@@ -5674,6 +5749,9 @@ pub const WebFace = struct {
         // A fresh helper connection knows no cap; force the send.
         self.sent_max_fps = 0xffff;
         self.syncMaxFps();
+        // And it knows no popup policy. It must, BEFORE the first page
+        // can call window.open: the decision is synchronous helper-side.
+        self.pushPopupPolicy();
         // A fresh helper knows no user zoom either.
         if (self.zoom_x100 != 0)
             cl.post(proto.SetZoom{ .view = self.view, .level_x100 = self.zoom_x100 });
@@ -6206,6 +6284,12 @@ pub const WebFace = struct {
         // A certificate the user accepted was accepted for the origin
         // they were looking at, not for the next one.
         self.cert_exception = false;
+        // Same reasoning for a per-site popup rule: it was allowed for
+        // THAT site. It used to be reset only inside onSiteReply, so
+        // one site's "allow popups" survived into the next for the
+        // length of a store round trip.
+        self.site_popup = .inherit;
+        self.pushPopupPolicy();
         self.nav_origin = self.allocator.dupe(u8, origin) catch null;
         _ = webstore.siteGet(self.allocator, origin, @ptrCast(self), &onSiteReply);
     }
@@ -6253,6 +6337,9 @@ pub const WebFace = struct {
         // netStoreApply is the named hook; it no-ops when the live
         // state already matches.
         self.netStoreApply(want_block);
+        // The helper decides popups synchronously, so its copy of the
+        // policy has to be current BEFORE the page asks.
+        self.pushPopupPolicy();
         // A prompt that arrived before this reply is answered now
         // rather than left on screen asking a question the store has
         // already answered.
@@ -6664,8 +6751,11 @@ pub const WebFace = struct {
     /// A per-site override stored for this origin wins over the
     /// app-level policy in both directions — that is the point of
     /// "allow popups on this site".
-    pub fn onPopup(self: *WebFace, url: []const u8, user_gesture: bool) void {
-        const open = switch (self.site_popup) {
+    /// The effective popup policy for this face. One home: the helper's
+    /// pushed copy, the blocked-popup path and the adopt-or-refuse check
+    /// all read it, so they cannot disagree about what the user chose.
+    fn popupAllowed(self: *WebFace, user_gesture: bool) bool {
+        return switch (self.site_popup) {
             .allow => true,
             .block => false,
             .inherit => switch (g_popup_policy) {
@@ -6674,6 +6764,54 @@ pub const WebFace = struct {
                 .block_gestureless => user_gesture,
             },
         };
+    }
+
+    /// Keep the helper's copy of this view's popup policy current.
+    ///
+    /// `on_before_popup` must answer synchronously, so the decision
+    /// cannot be a round trip; the client instead pushes the answer
+    /// ahead of the question. A gestureless-blocking policy pushes
+    /// ALLOW, because only the engine knows whether a real gesture is
+    /// in progress — the client re-checks the gesture bit when the
+    /// popup is announced.
+    fn pushPopupPolicy(self: *WebFace) void {
+        if (!self.cl.cap_popup_open) return;
+        const allow = self.popupAllowed(true);
+        self.cl.post(proto.PopupPolicySet{
+            .view = self.view,
+            .mode = if (allow) proto.popup_mode_allow else proto.popup_mode_block,
+        });
+    }
+
+    /// A popup the helper REALLY opened, opener intact. Present it;
+    /// the page is already loading in it, so it must not be navigated.
+    pub fn onPagePopup(self: *WebFace, ev: proto.EvPagePopup) void {
+        const win = self.ownerWindow() orelse {
+            self.cl.post(proto.ViewDestroy{ .view = ev.popup_view });
+            return;
+        };
+        // Belt: the helper's copy of the policy can be one store round
+        // trip stale, and only the engine knew about the gesture.
+        if (!self.popupAllowed(ev.user_gesture != 0)) {
+            self.cl.post(proto.ViewDestroy{ .view = ev.popup_view });
+            self.toastBlockedPopup(ev.url);
+            return;
+        }
+        if (win.browserPagesInSidebar()) {
+            if (self.group()) |g| {
+                _ = attachPageExisting(self.allocator, g, ev.popup_view, self) catch {
+                    self.cl.post(proto.ViewDestroy{ .view = ev.popup_view });
+                };
+                return;
+            }
+        }
+        win.newWebTabForView(ev.popup_view, self.cl, self.ownerPage()) catch {
+            self.cl.post(proto.ViewDestroy{ .view = ev.popup_view });
+        };
+    }
+
+    pub fn onPopup(self: *WebFace, url: []const u8, user_gesture: bool) void {
+        const open = self.popupAllowed(user_gesture);
         if (open) {
             // Tree-style tabs: the popup nests under whatever opened it
             // (opener -> child, the TST relationship) — a page of this

@@ -83,6 +83,21 @@ pub const CAP_INTERCEPT = "intercept";
 /// helper without this capability REFUSES a policied open rather than
 /// opening an unpoliced view.
 pub const CAP_NET_POLICY = "net-policy";
+/// The helper can REALLY open a popup — a child browser that keeps its
+/// `window.opener` relationship — instead of cancelling it and asking
+/// the client to open an unrelated tab.
+///
+/// It exists because an opener is not cosmetic: OAuth and federated
+/// sign-in deliver their result with `window.opener.postMessage`, so a
+/// cancelled popup makes the whole flow throw at the last step. And the
+/// cancel is visible earlier too — `window.open` evaluating to null is
+/// what makes a page take its popup-blocked fallback and ask twice.
+///
+/// Blocking therefore has to become state the client PUSHES ahead of
+/// time (`popup_policy_set`), never a round trip: `on_before_popup` is
+/// synchronous and cannot wait for an answer. The default is BLOCK, so
+/// a client that never pushes gets the old behaviour byte for byte.
+pub const CAP_POPUP_OPEN = "popup-open";
 /// The helper reports certificate errors as `ev_cert_error` and waits
 /// for a `cert_decision` instead of failing the load. A client without
 /// it sees only the generic `ev_load_error` an older helper produced,
@@ -247,7 +262,7 @@ pub const CAP_COOKIE_SYNC = "cookie-sync";
 /// client-minted view ids translated into globals by adding
 /// `k * CONN_ID_WINDOW`, so two clients both minting id 1 never
 /// collide. Client-minted ids must stay below the window; ids at or
-/// above `DEVTOOLS_VIEW_BASE` are engine-minted and pass through
+/// above `ENGINE_VIEW_BASE` are engine-minted and pass through
 /// untranslated. Wire-adjacent for the same reason MAX_POLICY_VIEWS
 /// is: both sides size their refusals from it.
 pub const CONN_ID_WINDOW: u32 = 0x0010_0000;
@@ -306,6 +321,8 @@ pub const Tag = enum(u8) {
     ev_cursor = 0x46,
     ev_console = 0x47,
     ev_crashed = 0x48,
+    popup_policy_set = 0x49,
+    ev_page_popup = 0x4A,
     find = 0x50,
     find_stop = 0x51,
     set_zoom = 0x52,
@@ -1115,6 +1132,52 @@ pub const EvPopupRequest = struct {
         };
     }
 };
+
+/// Popup blocking, pushed AHEAD of the decision.
+///
+/// `on_before_popup` must answer synchronously, so the helper cannot
+/// ask the client at decision time; the client instead keeps the
+/// helper's copy of the policy current. `view == 0` sets the
+/// connection default; any other value is that view's override, which
+/// is how a per-site "allow popups here" reaches the engine.
+/// Unset = BLOCK, so a client that never sends this is unchanged.
+pub const PopupPolicySet = struct {
+    pub const tag: Tag = .popup_policy_set;
+    view: u32,
+    mode: u8,
+};
+
+pub const popup_mode_block: u8 = 0;
+pub const popup_mode_allow: u8 = 1;
+
+pub const page_popup_opened: u8 = 1;
+pub const page_popup_closed: u8 = 2;
+
+/// A popup the engine really opened, keeping its opener relationship.
+///
+/// Deliberately has NO field named `view`: the id translation layer
+/// keys on that name, and an engine-minted `view` would make it treat
+/// the whole frame as untranslatable and skip `owner_view` — which IS
+/// a client id and must be translated. `EvWebextPopup` is the shape
+/// this copies.
+///
+/// `chromeless` reports that the page asked for a popup-shaped window
+/// (`cef_popup_features_t.isPopup`), so the client can present it as
+/// one instead of as a full-size tab.
+pub const EvPagePopup = struct {
+    pub const tag: Tag = .ev_page_popup;
+    owner_view: u32,
+    popup_view: u32,
+    state: u8,
+    disposition: u8,
+    user_gesture: u8,
+    chromeless: u8,
+    w: u16,
+    h: u16,
+    url: []const u8,
+    frame_name: []const u8,
+};
+
 
 pub const EvCursor = struct {
     pub const tag: Tag = .ev_cursor;
@@ -2412,7 +2475,7 @@ pub const DevToolsShow = struct {
 ///
 /// The id is allocated by the HELPER, not by the client, so it comes
 /// from a range client-allocated ids never reach (see
-/// `DEVTOOLS_VIEW_BASE`). A client must treat it as an ordinary view
+/// `ENGINE_VIEW_BASE`). A client must treat it as an ordinary view
 /// id from then on: resize it, show/hide it, and `view_destroy` it
 /// when the surface presenting it goes away.
 ///
@@ -2431,10 +2494,15 @@ pub const EvDevToolsView = struct {
     reason: []const u8,
 };
 
-/// First view id a helper may mint for an inspector. Client ids are
-/// allocated from 1 upwards, so the two ranges cannot collide without
-/// a client opening two billion views first.
-pub const DEVTOOLS_VIEW_BASE: u32 = 0x4000_0000;
+/// First view id a helper may mint ITSELF, for a view the client did
+/// not ask for: an inspector, or a page popup the engine opened. Client
+/// ids are allocated from 1 upwards, so the two ranges cannot collide
+/// without a client opening two billion views first.
+///
+/// One range and one counter for both, because the property every
+/// consumer actually depends on is "the helper minted this id, so do
+/// not translate it" — not which feature minted it.
+pub const ENGINE_VIEW_BASE: u32 = 0x4000_0000;
 
 // -- print to PDF (0xA4 block, capability "print-pdf") ----------------
 
@@ -3673,6 +3741,19 @@ test "round-trip: scalar and string frames" {
     try roundTrip(InputPaste, .{ .view = 7, .text = .{ .s = "hello\nworld" } });
     try roundTrip(ClipboardRead, .{ .view = 7, .seq = 3, .mode = 1 });
     try roundTrip(EvClipboardText, .{ .view = 7, .seq = 3, .text = .{ .s = "selected ê" } });
+    try roundTrip(PopupPolicySet, .{ .view = 0, .mode = popup_mode_allow });
+    try roundTrip(EvPagePopup, .{
+        .owner_view = 7,
+        .popup_view = ENGINE_VIEW_BASE + 2,
+        .state = page_popup_opened,
+        .disposition = 2,
+        .user_gesture = 1,
+        .chromeless = 1,
+        .w = 400,
+        .h = 500,
+        .url = "https://accounts.example/oauth",
+        .frame_name = "gischan1",
+    });
     try roundTrip(InputFocus, .{ .view = 7, .focused = 1 });
     try roundTrip(FrameBuffer, .{ .view = 7, .buf_id = 3, .w = 800, .h = 600, .stride = 3200 });
     try roundTrip(FrameRelease, .{ .view = 7, .buf_id = 2 });
@@ -4535,7 +4616,7 @@ test "round-trip: net_log carries the reason the old frame cannot" {
 test "round-trip: devtools and print-to-pdf frames" {
     try roundTrip(DevToolsShow, .{ .view = 7, .x = 0, .y = 0 });
     try roundTrip(DevToolsShow, .{ .view = 7, .x = 120, .y = -4 });
-    try roundTrip(EvDevToolsView, .{ .view = 7, .devtools = DEVTOOLS_VIEW_BASE + 1, .reason = "" });
+    try roundTrip(EvDevToolsView, .{ .view = 7, .devtools = ENGINE_VIEW_BASE + 1, .reason = "" });
     try roundTrip(EvDevToolsView, .{ .view = 7, .devtools = 0, .reason = "windowed" });
     try roundTrip(PrintPdf, .{
         .view = 7,
@@ -4550,7 +4631,7 @@ test "round-trip: devtools and print-to-pdf frames" {
 test "a helper-minted devtools id cannot collide with a client-minted one" {
     // Clients allocate from 1 upwards; the helper's range starts far
     // above anything a session reaches.
-    try std.testing.expect(DEVTOOLS_VIEW_BASE > 1_000_000);
+    try std.testing.expect(ENGINE_VIEW_BASE > 1_000_000);
     try std.testing.expectEqual(@as(?PaperSize, null), paperInches(@intFromEnum(Paper.default)));
     try std.testing.expectEqual(@as(f64, 8.27), paperInches(@intFromEnum(Paper.a4)).?.w);
     // An unknown preset from a newer client is the engine default, not

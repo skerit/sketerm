@@ -197,7 +197,7 @@ const system_context_create_ops: ContextCreateOps = .{};
 const max_rects = 32;
 
 /// First helper-minted view id for a WebExtensions background page.
-/// Above `DEVTOOLS_VIEW_BASE` (0x4000_0000) so the three id ranges
+/// Above `ENGINE_VIEW_BASE` (0x4000_0000) so the three id ranges
 /// (client, inspector, background) never collide.
 const webext_bg_view_base: u32 = 0x5000_0000;
 
@@ -585,6 +585,25 @@ pub const View = struct {
     /// `on_text_selection_changed` push.
     sel_text: []u8 = &.{},
 
+    /// A popup the ENGINE opened for `opener_view`, keeping the
+    /// `window.opener` relationship the client could never recreate by
+    /// opening a tab at the same url.
+    page_popup: bool = false,
+    opener_view: u32 = 0,
+    /// Per-view popup policy override (`popup_policy_set`), or null to
+    /// follow the connection default.
+    popup_allow: ?bool = null,
+    popup_disposition: u8 = 0,
+    /// The page asked for a popup-SHAPED window, so the client can
+    /// present it as one rather than as a full-size tab.
+    popup_chromeless: bool = false,
+    /// A client frame has named this popup, so it is presented
+    /// somewhere. Until then the watchdog owns it — a browser nobody
+    /// closes HANGS `cef_shutdown`.
+    popup_answered: bool = false,
+    /// When the popup's browser was claimed, for that watchdog.
+    popup_opened_ms: i64 = 0,
+
     /// A browser-action popup: real extension document and ordinary
     /// frame/input path, but no tab/navigation chrome on the client.
     webext_popup: bool = false,
@@ -821,6 +840,20 @@ pub const Router = struct {
     mapView: *const fn (ctx: *anyopaque, conn_id: u32, id: u32) u32,
 };
 
+/// One popup allowed in `on_before_popup` and awaiting its browser.
+///
+/// Keyed rather than a single slot because several popups can be in
+/// flight at once, and matched on the OPENER's cef id: `popup_id`
+/// appears on `on_before_popup`/`on_before_popup_aborted` only, never
+/// on `on_after_created`, so within one opener the match is FIFO.
+const PendingPopup = struct {
+    popup_id: c_int = 0,
+    opener_cef_id: c_int = 0,
+    view: ?*View = null,
+    armed_ms: i64 = 0,
+};
+
+
 /// A resolved outbound target: where to post, and the id-window base
 /// to subtract so the frame carries the CLIENT's namespace again.
 const RouteTo = struct { out: *proto.Outbox, base: u32 };
@@ -856,9 +889,20 @@ pub const Host = struct {
     /// `show_dev_tools` with no browser at all would otherwise leave a
     /// client waiting for a reply that never comes — see `watchdog`.
     adopting_ms: i64 = 0,
-    /// Next helper-minted view id (inspectors). Client ids come from
-    /// the client and start at 1; see `proto.DEVTOOLS_VIEW_BASE`.
-    next_devtools: u32 = proto.DEVTOOLS_VIEW_BASE,
+    /// Connection-default popup policy, pushed by the client with
+    /// `popup_policy_set{view=0}`. BLOCK unless told otherwise, so a
+    /// client that never pushes keeps the old cancel-everything
+    /// behaviour exactly.
+    popup_default: bool = false,
+    /// Popups allowed in `on_before_popup` and not yet claimed in
+    /// `on_after_created`, keyed by the engine's own popup id and the
+    /// opener's cef id. NOT `adopting`, whose docblock explains it
+    /// cannot be scoped to one call — several popups can be in flight.
+    pending_popups: [8]PendingPopup = @splat(.{}),
+    /// Next helper-minted view id (inspectors and page popups). Client
+    /// ids come from the client and start at 1; see
+    /// `proto.ENGINE_VIEW_BASE`.
+    next_engine_view: u32 = proto.ENGINE_VIEW_BASE,
     /// Prints the engine has not finished yet. `path` is owned and is
     /// also the correlation key: CEF's callback hands back the path,
     /// not a request id.
@@ -926,7 +970,7 @@ pub const Host = struct {
     /// hosting are driven from here through the existing semantic bridge.
     webext: webexthost.Host = undefined,
     /// Next helper-minted view id for a background page. Kept far above
-    /// both client ids (from 1) and inspector ids (DEVTOOLS_VIEW_BASE).
+    /// both client ids (from 1) and inspector ids (ENGINE_VIEW_BASE).
     next_bg_view: u32 = webext_bg_view_base,
     /// Cross-frame runtime.sendMessage routing: a content script's
     /// message gets a process-global id here so the background's reply
@@ -1404,11 +1448,16 @@ pub const Host = struct {
     /// connection's frame is being dispatched, another connection's
     /// view does not exist. Regular ids cannot cross namespaces (the
     /// server's window arithmetic keeps them apart); this check is the
-    /// belt for engine-minted ids (inspectors), which pass the edge
-    /// untranslated.
+    /// belt for engine-minted ids (inspectors and page popups), which
+    /// pass the edge untranslated.
+    ///
+    /// A client frame naming a page popup is also what marks it
+    /// ANSWERED: the popup is now presented somewhere, so the watchdog
+    /// stops owning it and it may outlive its opener.
     pub fn find(self: *Host, id: u32) ?*View {
         const v = self.findAny(id) orelse return null;
         if (self.dispatch_conn != 0 and v.owner != 0 and v.owner != self.dispatch_conn) return null;
+        if (self.dispatch_conn != 0 and v.page_popup) v.popup_answered = true;
         return v;
     }
 
@@ -1528,6 +1577,112 @@ pub const Host = struct {
         return v;
     }
 
+    /// Mint the next helper-owned view id. One counter for inspectors
+    /// and popups alike, so the two can never collide.
+    fn nextEngineView(self: *Host) u32 {
+        self.next_engine_view +%= 1;
+        if (self.next_engine_view < proto.ENGINE_VIEW_BASE) self.next_engine_view = proto.ENGINE_VIEW_BASE + 1;
+        return self.next_engine_view;
+    }
+
+    /// Prepare a REAL popup for the engine to create.
+    ///
+    /// Runs inside `on_before_popup`, which must answer synchronously,
+    /// so everything here is bookkeeping plus writing the window info;
+    /// the browser itself arrives later in `on_after_created`.
+    /// @return false when the popup could not be prepared, leaving the
+    /// caller to fall back to cancelling and telling the client.
+    fn openPopupFor(
+        self: *Host,
+        opener: *View,
+        popup_id: c_int,
+        window_info: [*c]cef.cef_window_info_t,
+        features: [*c]const cef.cef_popup_features_t,
+        d: proto.Disposition,
+        user_gesture: c_int,
+        url: []const u8,
+        frame_name: []const u8,
+    ) bool {
+        const slot = self.freePopupSlot() orelse return false;
+        var w = opener.w;
+        var h = opener.h;
+        var chromeless = false;
+        if (features != null) {
+            if (features.*.widthSet != 0 and features.*.width > 0) w = @intCast(@min(features.*.width, 32767));
+            if (features.*.heightSet != 0 and features.*.height > 0) h = @intCast(@min(features.*.height, 32767));
+            chromeless = features.*.isPopup != 0;
+        }
+        const pv = self.registerView(.{
+            .view = self.nextEngineView(),
+            .w = w,
+            .h = h,
+            .scale_x1000 = opener.scale_x1000,
+            // Bookkeeping only: CEF gives a popup its opener's request
+            // context itself, and `on_before_popup` has no out-param
+            // for one.
+            .context = opener.context,
+        }) catch return false;
+        // `registerView` derives these from dispatch state, which is
+        // zero inside a CEF callback. An owner of 0 also disables the
+        // cross-client ownership guard in `find`, so a popup must
+        // inherit the opener's.
+        pv.owner = opener.owner;
+        pv.inline_view = opener.inline_view;
+        pv.page_popup = true;
+        pv.opener_view = opener.id;
+        pv.popup_disposition = @intFromEnum(d);
+        pv.popup_chromeless = chromeless;
+        pv.popup_allow = opener.popup_allow;
+        _ = user_gesture;
+        _ = url;
+        _ = frame_name;
+        // Inherit the opener's shield and enforced policy: without a
+        // slot of its own the popup's requests FAIL OPEN, because the
+        // whole policy block sits behind `if (slot)`.
+        if (interceptSlotFor(self.gpa, pv.id)) |ps| {
+            if (interceptSlotFor(self.gpa, opener.id)) |os| {
+                g_int.acquire();
+                defer g_int.release();
+                ps.enabled = os.enabled;
+                ps.pol = os.pol;
+            }
+        }
+        // MUTATES its argument, so it must be handed the POPUP.
+        window_info.* = windowlessInfo(pv);
+        slot.* = .{
+            .popup_id = popup_id,
+            .opener_cef_id = opener.cef_id,
+            .view = pv,
+            .armed_ms = nowMs(),
+        };
+        return true;
+    }
+
+    fn freePopupSlot(self: *Host) ?*PendingPopup {
+        for (&self.pending_popups) |*p| {
+            if (p.view == null) return p;
+        }
+        return null;
+    }
+
+    /// Claim the pending record for a popup that has arrived or been
+    /// aborted. `popup_id` is not passed to `on_after_created`, so a
+    /// zero id matches the oldest pending popup of that opener.
+    fn takePendingPopup(self: *Host, popup_id: c_int, opener_cef_id: c_int) ?*View {
+        var best: ?*PendingPopup = null;
+        for (&self.pending_popups) |*p| {
+            const v = p.view orelse continue;
+            if (p.opener_cef_id != opener_cef_id) continue;
+            if (popup_id != 0 and p.popup_id != popup_id) continue;
+            _ = v;
+            if (best == null or p.armed_ms < best.?.armed_ms) best = p;
+        }
+        const hit = best orelse return null;
+        const v = hit.view.?;
+        hit.* = .{};
+        return v;
+    }
+
     /// Register the inspector view for `src`.
     ///
     /// Through `registerView`/`destroyView` like every other view, so
@@ -1536,10 +1691,8 @@ pub const Host = struct {
     /// `swapRemove` moved into the last slot rather than the view it
     /// meant.
     fn registerDevtoolsView(self: *Host, src: *View) !*View {
-        self.next_devtools +%= 1;
-        if (self.next_devtools < proto.DEVTOOLS_VIEW_BASE) self.next_devtools = proto.DEVTOOLS_VIEW_BASE + 1;
         const v = try self.registerView(.{
-            .view = self.next_devtools,
+            .view = self.nextEngineView(),
             // The client resizes it the moment its surface is laid out;
             // this is only what the first layout happens at.
             .w = src.w,
@@ -1671,6 +1824,17 @@ pub const Host = struct {
         // A page owns every browser-action popup it opened. Close those
         // first so no floating extension page survives its toolbar.
         while (self.popupForOwner(id)) |popup| self.destroyView(popup.id);
+        // A page popup the client never claimed belongs to nobody once
+        // its opener goes, and a browser nobody closes hangs
+        // `cef_shutdown`. An ANSWERED popup is the user's own tab and
+        // outlives its opener, as it does in every browser.
+        while (self.unansweredPopupOf(id)) |popup| self.destroyView(popup.id);
+        // Drop any record still armed for a popup of this view: the
+        // browser will never arrive to claim it.
+        for (&self.pending_popups) |*p| {
+            const pv = p.view orelse continue;
+            if (pv.opener_view == id) p.* = .{};
+        }
         for (self.views.items, 0..) |v, i| {
             if (v.id != id) continue;
             _ = self.views.swapRemove(i);
@@ -1682,6 +1846,18 @@ pub const Host = struct {
                 if (self.find(v.devtools_of)) |src| src.devtools_view = 0;
             }
             if (self.adopting == v) self.adopting = null;
+            if (v.page_popup) self.post(proto.EvPagePopup{
+                .owner_view = v.opener_view,
+                .popup_view = v.id,
+                .state = proto.page_popup_closed,
+                .disposition = v.popup_disposition,
+                .user_gesture = 0,
+                .chromeless = if (v.popup_chromeless) 1 else 0,
+                .w = v.w,
+                .h = v.h,
+                .url = "",
+                .frame_name = "",
+            });
             if (v.webext_popup) self.post(proto.EvWebextPopup{
                 .owner_view = v.popup_owner,
                 .popup_view = v.id,
@@ -1692,6 +1868,14 @@ pub const Host = struct {
             if (inspector != 0) self.destroyView(inspector);
             return;
         }
+    }
+
+    /// A page popup of `owner` that no client frame has named yet.
+    fn unansweredPopupOf(self: *Host, owner: u32) ?*View {
+        for (self.views.items) |v| {
+            if (v.page_popup and !v.popup_answered and v.opener_view == owner) return v;
+        }
+        return null;
     }
 
     fn popupForOwner(self: *Host, owner: u32) ?*View {
@@ -1711,6 +1895,80 @@ pub const Host = struct {
                 .popup_view = v.id,
                 .state = proto.webext_popup_closed,
                 .detail = "",
+            });
+            self.freeViewOpts(v, false);
+            return;
+        }
+    }
+
+    /// Bind a popup browser CEF just created to the View armed for it
+    /// in `on_before_popup`.
+    ///
+    /// Runs the SPAWN sequence rather than `adoptBrowser`: that one
+    /// registers no intercept slot, re-applies no a11y state, and
+    /// hardwires an `ev_devtools_view` answer.
+    /// @return true when the callback's browser reference was kept.
+    fn claimPopupBrowser(self: *Host, b: *cef.cef_browser_t) bool {
+        const opener_cef = browserHostInt(b, "get_opener_identifier");
+        const v = self.takePendingPopup(0, opener_cef) orelse return false;
+        v.browser = b;
+        v.cef_id = browserInt(b, "get_identifier");
+        // The engine may refuse windowless rendering, as it does for
+        // DevTools. A windowed popup has no frames to present, so close
+        // it and let the client open its own openerless tab instead of
+        // showing a blank pane.
+        if (!isWindowless(v)) {
+            self.post(proto.EvPopupRequest{
+                .view = v.opener_view,
+                .url = "",
+                .disposition = v.popup_disposition,
+                .user_gesture = 1,
+            });
+            self.destroyView(v.id);
+            return true;
+        }
+        v.popup_opened_ms = nowMs();
+        interceptRegister(self.gpa, v.id, v.cef_id);
+        applyZoom(v);
+        applyA11yState(v);
+        // THE ID GOES OUT FIRST, before the frame buffer: a client
+        // drops a `frame_buffer` for a view it has never heard of and
+        // then waits for a repaint only a geometry change produces.
+        self.post(proto.EvPagePopup{
+            .owner_view = v.opener_view,
+            .popup_view = v.id,
+            .state = proto.page_popup_opened,
+            .disposition = v.popup_disposition,
+            .user_gesture = 1,
+            .chromeless = if (v.popup_chromeless) 1 else 0,
+            .w = v.w,
+            .h = v.h,
+            .url = if (v.url.len != 0) v.url else "",
+            .frame_name = "",
+        });
+        self.allocBuffer(v) catch {};
+        return true;
+    }
+
+    /// The popup closed itself (`window.close()`, which every OAuth
+    /// flow ends with). Tell the client so it can retire the tab, then
+    /// free the record WITHOUT asking the engine to close again.
+    fn pagePopupClosedByEngine(self: *Host, v: *View) void {
+        for (self.views.items, 0..) |it, i| {
+            if (it != v) continue;
+            self.abandonViewWaiters(v.id);
+            _ = self.views.swapRemove(i);
+            self.post(proto.EvPagePopup{
+                .owner_view = v.opener_view,
+                .popup_view = v.id,
+                .state = proto.page_popup_closed,
+                .disposition = v.popup_disposition,
+                .user_gesture = 0,
+                .chromeless = if (v.popup_chromeless) 1 else 0,
+                .w = v.w,
+                .h = v.h,
+                .url = "",
+                .frame_name = "",
             });
             self.freeViewOpts(v, false);
             return;
@@ -1797,6 +2055,10 @@ pub const Host = struct {
     pub fn discardView(self: *Host, id: u32) void {
         const v = self.find(id) orelse return;
         if (v.discarded) return;
+        // A revival goes through `create_browser_sync`, which makes a
+        // fresh TOP-LEVEL browser — silently re-breaking the opener
+        // relationship this popup exists for.
+        if (v.page_popup) return;
         self.dropBrowser(v, true);
         v.discarded = true;
         // The engine is gone, so nothing may be asked of it: hidden is
@@ -2951,6 +3213,18 @@ pub const Host = struct {
                 self.post(proto.EvDevToolsView{ .view = src_id, .devtools = 0, .reason = "timeout" });
             }
         }
+        // A popup the client never claimed: it has no surface, nobody
+        // will ever close it, and an open browser hangs `cef_shutdown`.
+        var pi: usize = 0;
+        while (pi < self.views.items.len) {
+            const v = self.views.items[pi];
+            pi += 1;
+            if (!v.page_popup or v.popup_answered) continue;
+            if (v.browser == null) continue;
+            if (now_ms - v.popup_opened_ms <= adopt_timeout_ms) continue;
+            self.destroyView(v.id);
+            pi = 0;
+        }
         for (self.views.items) |v| {
             if (v.hidden or v.windowed) continue;
             if (now_ms - v.last_begin_ms < watchdog_ms) continue;
@@ -3981,6 +4255,19 @@ pub const Host = struct {
     /// run a real Paste against nothing, replacing the selection with
     /// nothing. Committing the text is what makes select-all + paste do
     /// what the user meant.
+    /// Install the client's popup policy AHEAD of any decision.
+    /// `view == 0` is the connection default; anything else is that
+    /// view's override, which is how a per-site allow reaches here.
+    pub fn popupPolicySet(self: *Host, req: proto.PopupPolicySet) void {
+        const allow = req.mode == proto.popup_mode_allow;
+        if (req.view == 0) {
+            self.popup_default = allow;
+            return;
+        }
+        const v = self.find(req.view) orelse return;
+        v.popup_allow = allow;
+    }
+
     pub fn paste(self: *Host, req: proto.InputPaste) void {
         const v = self.findWake(req.view) orelse return;
         commitText(v, req.text.s, @intCast(req.text.s.len));
@@ -7388,14 +7675,14 @@ pub const Host = struct {
         }
         // Engine-minted ids (inspectors) carry no window; the owner is
         // on the view record. Client-minted ids encode it.
-        const owner = if (view_id >= proto.DEVTOOLS_VIEW_BASE)
+        const owner = if (view_id >= proto.ENGINE_VIEW_BASE)
             (self.findAny(view_id) orelse return null).owner
         else
             view_id / proto.CONN_ID_WINDOW;
         const out = rt.route(rt.ctx, owner) orelse return null;
         return .{
             .out = out,
-            .base = if (view_id >= proto.DEVTOOLS_VIEW_BASE) 0 else owner * proto.CONN_ID_WINDOW,
+            .base = if (view_id >= proto.ENGINE_VIEW_BASE) 0 else owner * proto.CONN_ID_WINDOW,
         };
     }
 
@@ -7413,7 +7700,7 @@ pub const Host = struct {
         inline for (.{ "view", "owner_view", "popup_view" }) |f| {
             if (@hasField(@TypeOf(value), f)) {
                 const id = @field(v2, f);
-                if (id != 0 and id < proto.DEVTOOLS_VIEW_BASE) @field(v2, f) = id - base;
+                if (id != 0 and id < proto.ENGINE_VIEW_BASE) @field(v2, f) = id - base;
             }
         }
         if (@hasField(@TypeOf(value), "context")) {
@@ -7802,7 +8089,7 @@ test "the inspector view is owned and unwound by the view list" {
     // A view appended AFTER the inspector is what `pop()` would take.
     const later = try host.registerView(ViewConstructionTest.req(23, 0));
 
-    try std.testing.expect(dev.id > proto.DEVTOOLS_VIEW_BASE);
+    try std.testing.expect(dev.id > proto.ENGINE_VIEW_BASE);
     try std.testing.expectEqual(src.id, dev.devtools_of);
     try std.testing.expectEqual(dev.id, src.devtools_view);
     try std.testing.expect(host.find(dev.id) == dev);
@@ -11269,6 +11556,17 @@ fn browserInt(b: ?*cef.cef_browser_t, comptime name: []const u8) c_int {
     return f(br);
 }
 
+/// `browserInt` for the fields that live on the browser HOST, which is
+/// where CEF puts the opener identifier.
+fn browserHostInt(b: ?*cef.cef_browser_t, comptime name: []const u8) c_int {
+    const br = b orelse return 0;
+    const get_host = br.get_host orelse return 0;
+    const host = get_host(br) orelse return 0;
+    defer release(&host.base);
+    const f = @field(host, name) orelse return 0;
+    return f(host);
+}
+
 fn release(base: *cef.cef_base_ref_counted_t) void {
     if (base.release) |r| _ = r(base);
 }
@@ -12333,6 +12631,7 @@ fn installHandlers() void {
     life_span_handler = std.mem.zeroes(cef.cef_life_span_handler_t);
     life_span_handler.base = staticBase(cef.cef_life_span_handler_t);
     life_span_handler.on_before_popup = onBeforePopup;
+    life_span_handler.on_before_popup_aborted = onBeforePopupAborted;
     life_span_handler.on_after_created = onAfterCreated;
     life_span_handler.on_before_close = onBeforeClose;
 
@@ -13678,16 +13977,22 @@ fn onBeforePopup(
     _: [*c]cef.cef_life_span_handler_t,
     browser: [*c]cef.cef_browser_t,
     frame: [*c]cef.cef_frame_t,
-    _: c_int,
+    popup_id: c_int,
     target_url: [*c]const cef.cef_string_t,
-    _: [*c]const cef.cef_string_t,
+    target_frame_name: [*c]const cef.cef_string_t,
     disposition: cef.cef_window_open_disposition_t,
     user_gesture: c_int,
-    _: [*c]const cef.cef_popup_features_t,
-    _: [*c]cef.cef_window_info_t,
+    popup_features: [*c]const cef.cef_popup_features_t,
+    window_info: [*c]cef.cef_window_info_t,
     _: [*c][*c]cef.cef_client_t,
+    // Left untouched on purpose: the header defaults `settings` to the
+    // SOURCE browser's, which already carries the opaque background
+    // colour and the frame-rate cap `windowlessSettings` set. Writing
+    // the whole struct would clobber both and leak its cef_string_t.
     _: [*c]cef.cef_browser_settings_t,
     _: [*c][*c]cef.cef_dictionary_value_t,
+    // `no_javascript_access` stays as the engine set it: forcing it
+    // would sever the very opener relationship this exists to keep.
     _: [*c]c_int,
 ) callconv(.c) c_int {
     defer releaseArg(browser);
@@ -13696,11 +14001,23 @@ fn onBeforePopup(
     const v = viewOf(browser) orelse return 1;
     var s = Utf8.init(target_url);
     defer s.free();
+    var fname = Utf8.init(target_frame_name);
+    defer fname.free();
+    // "Special case error condition from the renderer" — there is no
+    // popup to open and nothing to tell the client about.
+    if (disposition == cef.CEF_WOD_IGNORE_ACTION) return 1;
     const d: proto.Disposition = switch (disposition) {
         cef.CEF_WOD_NEW_WINDOW => .new_window,
         cef.CEF_WOD_NEW_POPUP, cef.CEF_WOD_NEW_PICTURE_IN_PICTURE => .popup,
         else => .new_tab,
     };
+    const allow = v.popup_allow orelse host.popup_default;
+    if (allow) {
+        if (host.openPopupFor(v, popup_id, window_info, popup_features, d, user_gesture, s.slice(), fname.slice()))
+            return 0;
+        // Falling through means the popup could not be prepared; the
+        // block path below still gives the client a usable answer.
+    }
     host.post(proto.EvPopupRequest{
         .view = v.id,
         .url = s.slice(),
@@ -13711,6 +14028,21 @@ fn onBeforePopup(
         .user_gesture = if (user_gesture != 0) 1 else 0,
     });
     return 1;
+}
+
+/// A popup CEF allowed and never created. The header names this as one
+/// of the three places pending-popup state must be cleared; without it
+/// a failed creation leaks a View and its frame buffer forever.
+fn onBeforePopupAborted(
+    _: [*c]cef.cef_life_span_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    popup_id: c_int,
+) callconv(.c) void {
+    defer releaseArg(browser);
+    const host = g_host orelse return;
+    const opener = viewOf(browser);
+    const opener_cef = if (opener) |o| o.cef_id else 0;
+    if (host.takePendingPopup(popup_id, opener_cef)) |pv| host.destroyView(pv.id);
 }
 
 /// Browsers CEF has created and not yet destroyed, counted by
@@ -13734,8 +14066,14 @@ fn onBeforeClose(
     defer releaseArg(browser);
     if (open_browsers > 0) open_browsers -= 1;
     const host = g_host orelse return;
-    const v = viewOf(browser) orelse return;
+    // `findCef`, NOT `viewOf`: `destroyView` swapRemoves the record
+    // before `dropBrowser` closes the browser, and close is
+    // asynchronous, so on the client-initiated path `viewOf`'s
+    // `pending orelse adopting` fallback would hand back a LIVE
+    // unrelated view and we would close the wrong tab.
+    const v = host.findCef(browserInt(browser, "get_identifier")) orelse return;
     if (v.webext_popup and v.browser != null) host.popupClosedByEngine(v.id);
+    if (v.page_popup and v.browser != null) host.pagePopupClosedByEngine(v);
 }
 
 fn onAfterCreated(
@@ -13749,6 +14087,15 @@ fn onAfterCreated(
     open_browsers += 1;
     const host = g_host orelse return;
     const b: *cef.cef_browser_t = browser orelse return;
+    // BEFORE the `pending` branch: `pending` stays live for the whole
+    // of `create_browser_sync`, which pumps CEF inside its retry loop,
+    // so a popup arriving then would be claimed by the pending view,
+    // stamp the wrong cef id and orphan a browser — and an orphan
+    // browser hangs `cef_shutdown`.
+    if (browserInt(b, "is_popup") != 0) {
+        if (host.claimPopupBrowser(b)) adopted = true;
+        return;
+    }
     if (host.pending) |v| {
         if (v.cef_id == 0) {
             if (b.get_identifier) |gi| {
@@ -13762,9 +14109,8 @@ fn onAfterCreated(
         return;
     }
     // Nothing is being created synchronously, so this is a browser CEF
-    // made on its own schedule: the inspector `devtools_show` asked
-    // for. It is the only such browser this helper can produce —
-    // popups are cancelled in `on_before_popup`.
+    // made on its own schedule: a page popup we allowed, or the
+    // inspector `devtools_show` asked for.
     const v = host.adopting orelse return;
     if (v.browser != null) return;
     host.adoptBrowser(v, b);

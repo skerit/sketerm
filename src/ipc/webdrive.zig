@@ -630,6 +630,11 @@ pub const Engine = struct {
     /// (`presenter` in hello_ack). Reported, never inferred: a helper
     /// in session mode whose presenter failed to arm still says no.
     cap_presenter: bool = false,
+    /// The helper can really open popups (`popup-open`). Headless
+    /// clients ALLOW them: an agent driving a sign-in flow needs the
+    /// window the provider posts its result back through, and there is
+    /// no user here for a popup to annoy.
+    cap_popup_open: bool = false,
     next_sem_request: u32 = 1,
     /// Stamps every `net_policy_set`; `ev_net_policy` echoes it so a
     /// stale event for a replaced policy is ignorable.
@@ -1551,6 +1556,32 @@ pub const Engine = struct {
     }
 
     /// Drop a half-built view, whether or not it reached `views`.
+    /// Adopt a popup the helper created, so `web_tabs` lists it and
+    /// every `web_*` tool can address it. Nothing is navigated: the
+    /// engine already loaded it, and re-navigating would discard the
+    /// opener relationship the popup exists for.
+    fn adoptPopupView(self: *Engine, ev: proto.EvPagePopup) !void {
+        if (self.findView(ev.popup_view) != null) return;
+        const opener = self.findView(ev.owner_view);
+        const v = try self.gpa.create(View);
+        errdefer self.gpa.destroy(v);
+        v.* = .{
+            .id = ev.popup_view,
+            .w = if (ev.w == 0) 1024 else ev.w,
+            .h = if (ev.h == 0) 768 else ev.h,
+            // The engine gives a popup its OPENER's request context, so
+            // the record must say so or a later lookup would disagree
+            // with where the cookies actually are.
+            .context = if (opener) |o| o.context else 0,
+        };
+        errdefer v.deinit(self.gpa);
+        if (opener) |o| {
+            if (o.profile) |pf| v.profile = try self.gpa.dupe(u8, pf);
+        }
+        if (ev.url.len > 0) v.url = try self.gpa.dupe(u8, ev.url);
+        try self.views.append(self.gpa, v);
+    }
+
     fn abandonView(self: *Engine, v: *View) void {
         for (self.views.items, 0..) |item, i| {
             if (item != v) continue;
@@ -2532,6 +2563,17 @@ pub const Engine = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_NET_POLICY)) self.cap_net_policy = true;
                     if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.cap_multi_client = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRESENTER)) self.cap_presenter = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_POPUP_OPEN)) self.cap_popup_open = true;
+                }
+                // Headless: allow real popups for the whole connection.
+                // A cancelled popup makes window.open return null, which
+                // is what breaks every federated sign-in at its last
+                // step; there is no user here to protect from one.
+                if (self.cap_popup_open) {
+                    self.send(proto.PopupPolicySet{
+                        .view = 0,
+                        .mode = proto.popup_mode_allow,
+                    }) catch {};
                 }
             },
             .frame_buffer => {
@@ -2567,6 +2609,20 @@ pub const Engine = struct {
             .ev_title => {
                 const ev = proto.decode(proto.EvTitle, frame.payload) catch return;
                 if (self.findView(ev.view)) |v| self.setOwned(&v.title, ev.title);
+            },
+            .ev_page_popup => {
+                const ev = proto.decode(proto.EvPagePopup, frame.payload) catch return;
+                if (ev.state == proto.page_popup_opened) {
+                    // A popup the helper really opened, opener intact.
+                    // Adopting it is what makes an OAuth flow work
+                    // headlessly at all: it is the window the identity
+                    // provider posts its result back through.
+                    self.adoptPopupView(ev) catch {
+                        self.send(proto.ViewDestroy{ .view = ev.popup_view }) catch {};
+                    };
+                } else if (self.findView(ev.popup_view)) |v| {
+                    self.abandonView(v);
+                }
             },
             .ev_nav_state => {
                 const ev = proto.decode(proto.EvNavState, frame.payload) catch return;

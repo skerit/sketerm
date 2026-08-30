@@ -91,11 +91,11 @@ const max_conns = 32;
 const max_conn_backlog_bytes: usize = 64 * 1024 * 1024;
 
 /// Highest connection id the window arithmetic can namespace:
-/// `id * CONN_ID_WINDOW` must stay below `DEVTOOLS_VIEW_BASE`. Ids are
+/// `id * CONN_ID_WINDOW` must stay below `ENGINE_VIEW_BASE`. Ids are
 /// never reused, so this is a lifetime budget per engine, not a
 /// concurrency limit; an engine that served this many connections
 /// refuses further ones.
-const max_conn_id: u32 = proto.DEVTOOLS_VIEW_BASE / proto.CONN_ID_WINDOW - 1;
+const max_conn_id: u32 = proto.ENGINE_VIEW_BASE / proto.CONN_ID_WINDOW - 1;
 
 /// Capabilities this helper normally advertises. `frames-shm` is here
 /// even in GPU mode: the engine drops back to software compositing on
@@ -121,6 +121,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_DEVTOOLS,
     proto.CAP_PRINT_PDF,
     proto.CAP_CLIPBOARD,
+    proto.CAP_POPUP_OPEN,
     proto.CAP_DOWNLOADS,
     proto.CAP_A11Y,
     proto.CAP_A11Y_CARET,
@@ -227,7 +228,7 @@ const Conn = struct {
     /// a client-minted id past the window is a protocol violation.
     fn mapView(self: *const Conn, id: u32) !u32 {
         if (id == 0) return 0;
-        if (id >= proto.DEVTOOLS_VIEW_BASE) return id;
+        if (id >= proto.ENGINE_VIEW_BASE) return id;
         if (id >= proto.CONN_ID_WINDOW) return error.ViewIdPastWindow;
         return self.base() + id;
     }
@@ -836,6 +837,7 @@ pub const Server = struct {
             .input_key => self.host.key(try dec(cn, proto.InputKey, frame.payload)),
             .input_ime => self.host.ime(try dec(cn, proto.InputIme, frame.payload)),
             .input_paste => self.host.paste(try dec(cn, proto.InputPaste, frame.payload)),
+            .popup_policy_set => self.host.popupPolicySet(try dec(cn, proto.PopupPolicySet, frame.payload)),
             .clipboard_read => self.host.clipboardRead(try dec(cn, proto.ClipboardRead, frame.payload)),
             .input_focus => self.host.focus(try dec(cn, proto.InputFocus, frame.payload)),
             // v1 accepts the release for symmetry but keeps no per-buffer

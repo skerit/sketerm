@@ -4160,6 +4160,23 @@ pub const Window = struct {
         defer self.forest_pending_parent = null;
         try self.newWebTabAt(url);
     }
+
+    /// Web tab PRESENTING a view the helper already created -- a real
+    /// popup, whose page is already loading with its opener intact.
+    /// Nothing is navigated here: navigating would replace the document
+    /// the engine opened and, with it, the relationship it exists for.
+    pub fn newWebTabForView(self: *Window, view: u32, on: *@import("webface.zig").Client, opener: ?*c.AdwTabPage) !void {
+        self.forest_pending_parent = opener;
+        defer self.forest_pending_parent = null;
+        const before = self.panes.items.len;
+        try self.newShellTab("Web");
+        if (self.panes.items.len <= before) return error.TabSpawnFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        _ = @import("webface.zig").WebFace.attachPopupView(self.allocator, pane, view, on) catch |err| {
+            logActionError("popup attach", err);
+            return err;
+        };
+    }
 };
 
 fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
