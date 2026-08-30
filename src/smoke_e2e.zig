@@ -883,7 +883,7 @@ pub fn main() u8 {
         say("watch-along: driver attach raised the accent indicator, detach retired it, and a read-only watch pane showed the view-only chip");
 
         if (assistantChipStage(allocator, app, sock_path)) |why| return failMsg(why);
-        say("assistant chip: an isolated MCP's terminal raised the tab-bar chip unprompted, Watch opened it as a tab showing its output, and the chip retired with the assistant");
+        say("assistant chip: an isolated MCP app raised the tab-bar chip, Watch forced a closable view-only tab under app_view=window, and closing it left the app alive");
 
         if (have_web_action) {
             if (webActionGuiStage(allocator, app, sock_path)) |why| return failMsg(why);
@@ -3016,10 +3016,10 @@ fn waitAssistantChip(app: *appdrive.App, win_id: u32, want: bool, timeout_ms: u3
 }
 
 /// Ambient assistant surface end to end: an isolated `sketerm mcp`
-/// with one headless terminal must raise the tab-bar chip with no
-/// configuration and no --shared, its popover's Watch must open that
-/// terminal as a tab of this window showing the assistant's output,
-/// and the chip must retire when the assistant exits.
+/// with one app=true session must raise the tab-bar chip with no
+/// configuration and no --shared. With the default app_view=window,
+/// its popover's explicit Watch must still force a closable tab, expose
+/// Take control there, and leave the assistant's app alive after close.
 fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8) ?[]const u8 {
     if (!@import("util/ocr.zig").available()) {
         say("SKIP assistant chip: tesseract unavailable; the chip and popover are driven by OCR");
@@ -3043,14 +3043,15 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
     var m_open = true;
     defer if (m_open) m.close();
     if (!m.initialize()) return "the isolated MCP server never answered initialize";
-    const opened = m.call("term_open", "{}", 30_000) orelse return "term_open on the isolated MCP timed out";
-    const term_id = mcpNum(opened, "id") orelse
-        return whyf("term_open named no terminal id: {s}", .{opened[0..@min(opened.len, 300)]});
-    var run_buf: [128]u8 = undefined;
-    const run_args = std.fmt.bufPrint(&run_buf, "{{\"id\":{d},\"command\":\"echo SK_CHIP_OK\"}}", .{term_id}) catch
-        return "term_run arguments did not fit";
-    const ran = m.call("term_run", run_args, 30_000) orelse return "term_run on the isolated MCP timed out";
-    if (mcpHas(ran, "isError")) return whyf("term_run failed: {s}", .{ran[0..@min(ran.len, 300)]});
+    const opened = m.call(
+        "launch_app",
+        "{\"command\":[\"/bin/sh\",\"-c\",\"printf 'SK_CHIP_OK\\n'; sleep 300\"],\"wait_for\":\"exit\",\"wait_ms\":100,\"stable_ms\":0}",
+        30_000,
+    ) orelse return "launch_app on the isolated MCP timed out";
+    const app_id = mcpNum(opened, "app") orelse
+        return whyf("launch_app named no app id: {s}", .{opened[0..@min(opened.len, 300)]});
+    if (mcpHas(opened, "isError"))
+        return whyf("launch_app failed: {s}", .{opened[0..@min(opened.len, 300)]});
 
     // The registry watch (GFileMonitor + 3s tick) and the roster poll
     // must surface the chip on their own. The previous stage proved the
@@ -3063,6 +3064,7 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
         } else |_| {}
         return "no assistant chip appeared on the tab bar (see zig-out/smoke-e2e-assistant-nochip.png)";
     };
+    const accent_before_watch = accentPixels(app, win_id);
     if (app.screenshotPng(win_id, 0, null, 0)) |shot| {
         defer allocator.free(shot.png);
         writePng("zig-out/smoke-e2e-assistant-chip.png", shot.png);
@@ -3092,15 +3094,39 @@ fn assistantChipStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_pat
         tabs_now = tabCount(allocator, sock_path) orelse tabs_before;
         if (tabs_now > tabs_before) break;
     }
-    if (tabs_now <= tabs_before) return "Watch opened no new tab for the assistant's terminal";
-    if (!viewerWaitOcr(allocator, app, win_id, "SK_CHIP_OK", 20_000))
-        return "the watched tab never showed the assistant terminal's output";
+    if (tabs_now <= tabs_before) return "Watch obeyed app_view=window instead of opening the assistant app in a tab";
+    const watched_pane: u32 = blk: {
+        const r = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse
+            return "listing panes after Watch failed";
+        defer allocator.free(r);
+        var now: [64]u32 = undefined;
+        const n = listPaneIds(r, &now);
+        for (now[0..n]) |id| if (!contains(keep_ids[0..keep_n], id)) break :blk id;
+        return "Watch added a tab but no pane";
+    };
+    if (!waitPaneText(allocator, sock_path, watched_pane, "SK_CHIP_OK", 20_000))
+        return "the watched app pane never received the assistant session's output";
+    var chip_waited: u32 = 0;
+    while (chip_waited < 10_000 and accentPixels(app, win_id) < accent_before_watch + 150) : (chip_waited += 200)
+        _ = app.pumpOnce(200);
+    if (accentPixels(app, win_id) < accent_before_watch + 150)
+        return "the read-only watched app tab exposed no pane-level lease controls";
+
+    // Closing Watch detaches this GUI viewer; it must not kill the app
+    // session still owned and driven by the assistant.
+    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
+    const listed = m.call("list_apps", "{}", 15_000) orelse
+        return "list_apps timed out after closing the watched app tab";
+    var app_needle_buf: [48]u8 = undefined;
+    const app_needle = std.fmt.bufPrint(&app_needle_buf, "\"app\":{d}", .{app_id}) catch
+        return "formatting the watched app id failed";
+    if (std.mem.indexOf(u8, listed, app_needle) == null or !mcpHas(listed, "\"exited\":false"))
+        return "closing the watched app tab killed or lost the assistant's app session";
 
     // The assistant exits: its lease drops, the chip must retire.
     m.close();
     m_open = false;
     const retired = waitAssistantChip(app, win_id, false, 30_000) != null;
-    closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);
     if (!retired) return "the assistant chip survived the assistant exiting";

@@ -551,6 +551,7 @@ pub const Watcher = struct {
     fn startAttach(self: *Watcher, pid: c.pid_t, session: []const u8, lease: muxtabs.Lease) void {
         if (self.dead) return;
         const a = self.findByPid(pid) orelse return;
+        const target = a.findSession(session) orelse return;
         var reuse: ?mux_client.Conn = null;
         if (!a.busy) {
             if (a.conn) |conn| {
@@ -558,7 +559,7 @@ pub const Watcher = struct {
                 a.conn = null;
             }
         }
-        if (!muxtabs.AttachJob.start(self.win, a.host, session, lease, reuse, onAttachReady, @ptrCast(self))) {
+        if (!muxtabs.AttachJob.start(self.win, a.host, session, target.origin_id, lease, .tab, reuse, onAttachReady, @ptrCast(self))) {
             if (reuse) |*conn| conn.deinit();
             return;
         }

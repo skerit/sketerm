@@ -781,7 +781,7 @@ fn attachClicked(button: *c.GtkButton, user: ?*anyopaque, lease: muxtabs.Lease) 
     const data = c.g_object_get_data(@ptrCast(button), "sketerm-overview-entry") orelse return;
     const entry: *Entry = @ptrCast(@alignCast(data));
     const target = entry.target orelse return;
-    startAttach(self, target, lease);
+    startAttach(self, target, lease, .tab);
 }
 
 fn applySearch(self: *Switcher, preferred: ?[]const u8) void {
@@ -974,7 +974,7 @@ fn activateEntry(self: *Switcher, entry: *Entry) void {
         },
         .attach => {
             const target = entry.target orelse return;
-            startAttach(self, target, .default);
+            startAttach(self, target, .default, .policy);
             return;
         },
     }
@@ -1412,7 +1412,7 @@ fn onOpIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
 /// Submit a Watch (read-only) or Take Control attach for a row. The
 /// dial + handshake run on `muxtabs.AttachJob`; this side only owns the
 /// dialog state around it (one attach at a time, sensitivity, note).
-fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease) void {
+fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease, placement: muxtabs.AttachJob.Placement) void {
     if (self.attaching) return;
     // The attach becomes the session's event stream, so it consumes a
     // whole connection -- take the daemon's idle one instead of dialing
@@ -1427,7 +1427,7 @@ fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease) voi
             }
         }
     }
-    if (!muxtabs.AttachJob.start(self.win, target_host, target.session, lease, reuse, onAttachReady, @ptrCast(self))) {
+    if (!muxtabs.AttachJob.start(self.win, target_host, target.session, target.origin_id orelse "", lease, placement, reuse, onAttachReady, @ptrCast(self))) {
         if (reuse) |*conn| conn.deinit();
         return;
     }

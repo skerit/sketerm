@@ -1053,7 +1053,9 @@ pub const AttachJob = struct {
     win: *Window,
     host: ?[]u8,
     session: []u8,
+    origin_id: []u8,
     lease: Lease,
+    placement: Placement,
     /// Idle connection to the daemon taken at submit time; a fresh dial
     /// follows when it is absent or has died between polls.
     reuse: ?mux_client.Conn = null,
@@ -1066,27 +1068,39 @@ pub const AttachJob = struct {
     const mux_client = @import("../mux/client.zig");
     const mux_cli = @import("../ipc/mux_cli.zig");
 
+    pub const Placement = enum { policy, tab };
+
     /// Spawn the job. Returns false (nothing scheduled, `on_ready`
     /// never called) when the worker could not be created.
     pub fn start(
         win: *Window,
         host: ?[]const u8,
         session: []const u8,
+        origin_id: []const u8,
         lease: Lease,
+        placement: Placement,
         reuse: ?mux_client.Conn,
         on_ready: *const fn (ctx: ?*anyopaque, job: *AttachJob) void,
         ctx: ?*anyopaque,
     ) bool {
         const allocator = std.heap.c_allocator;
         const job = allocator.create(AttachJob) catch return false;
+        const session_owned = allocator.dupe(u8, session) catch {
+            allocator.destroy(job);
+            return false;
+        };
+        const origin_owned = allocator.dupe(u8, origin_id) catch {
+            allocator.free(session_owned);
+            allocator.destroy(job);
+            return false;
+        };
         job.* = .{
             .win = win,
             .host = null,
-            .session = allocator.dupe(u8, session) catch {
-                allocator.destroy(job);
-                return false;
-            },
+            .session = session_owned,
+            .origin_id = origin_owned,
             .lease = lease,
+            .placement = placement,
             .reuse = reuse,
             .on_ready = on_ready,
             .ctx = ctx,
@@ -1112,12 +1126,14 @@ pub const AttachJob = struct {
         if (self.snapshot) |snapshot| snapshot.deinit(allocator);
         if (self.host) |host| allocator.free(host);
         allocator.free(self.session);
+        allocator.free(self.origin_id);
         allocator.destroy(self);
     }
 
     fn attachOn(self: *AttachJob, conn: *mux_client.Conn) bool {
         conn.sendAttach(self.session, .{
             .kind = "gui",
+            .origin_id = self.origin_id,
             .read_only = self.lease == .read_only,
             .control = self.lease == .control,
             .panel_rpc = conn.panel_rpc,
@@ -1166,17 +1182,28 @@ pub const AttachJob = struct {
         const conn = self.conn.?;
         self.conn = null;
         const snapshot = self.snapshot.?;
-        attachMuxPrepared(
-            self.win,
-            conn,
-            self.session,
-            if (self.host) |host| host else null,
-            snapshot.payload,
-            self.identity,
-            null,
-            null,
-            self.lease,
-        ) catch return false;
+        switch (self.placement) {
+            .policy => attachMuxPrepared(
+                self.win,
+                conn,
+                self.session,
+                if (self.host) |host| host else null,
+                snapshot.payload,
+                self.identity,
+                null,
+                null,
+                self.lease,
+            ) catch return false,
+            .tab => _ = attachMuxPreparedTab(
+                self.win,
+                conn,
+                self.session,
+                if (self.host) |host| host else null,
+                snapshot.payload,
+                self.identity,
+                self.lease,
+            ) catch return false,
+        }
         return true;
     }
 
