@@ -982,7 +982,86 @@ in jar size per pass, so a client that subscribes and never unsubscribes
 pays it forever. smoke-web stage 42 is the proof, across two real
 helpers with separate `--cache-dir`s.
 
+## Observers: one client watching another's views (capability "observe", 0xF0 block)
+
+Under `multi-client` a view is OWNER-SCOPED: `find` refuses it to any
+other dispatching connection and every view-carrying event routes to
+the owner alone. The 0xF0 block is the deliberate hole in that wall,
+and it is how the GUI's Watch / Take control on an assistant's browser
+works: the GUI connects to the ASSISTANT's helper socket as a second
+client and observes the assistant's views, so the assistant's pages
+are ordinary `WebFace` pages in a web tab (address bar, page sidebar,
+find, everything) rather than a mirror of pixels in a forwarded
+window. `src/ui/webwatch.zig` is the GUI side; `webpresence.zig`
+resolves the helper socket from the MCP instance layout for both the
+GUI and the daemon's `web_helper_connect` (the remote-assistant form).
+
+The shape, and why each part is what it is:
+
+- **Announcements are opt-in** (`observe_enable`): one
+  `ev_observe_view{present}` per observable page of every OTHER
+  connection (url, title, geometry, owner conn id, opener), then one
+  per page spawned (`createViewAt` after a successful spawn, and a
+  page popup once its browser is adopted) or destroyed. Observable is
+  `Host.observable`: `presentable` (pages, never extension chrome or
+  inspectors) AND owned by a real connection.
+- **An observer names the target under an ALIAS it minted**
+  (`observe_subscribe{view, target}`): `view` is windowed at the edge
+  like `view_create`'s id, `target` is the engine-global id from the
+  announcement and crosses untranslated. From then on the observer's
+  own frames for the alias are re-addressed at the server edge
+  (`xlateIn`): `Host.aliasOf` says it is an alias, `protocol.observerAllows`
+  gates the tag on the lease, `dispatch_alias` is set and `view` becomes
+  the target. `find` admits the foreign view only under `dispatch_alias`,
+  and `routeFor` answers the dispatching observer under its alias, so a
+  synchronous reply to an observer's request never reaches the owner.
+  `view_destroy`/`view_show`/`view_hide` on an alias are served at the
+  edge as unsubscribe/resume/pause and never reach the engine.
+- **Observers ALWAYS get `frame_inline`**, whatever their own views
+  use: no memfd to dup, no dma-buf to share, identical over a bridged
+  remote helper. `shipInline` is the one band encoder for the owner's
+  inline path and the observer path; each subscription keeps a
+  union-and-flush `dirty` rect with the same `max_frame_backlog`
+  backpressure, refilled per paint in `observeDamage` and drained per
+  poll in `flushObservers`. A subscribe (and a resume) seeds the alias
+  with the stored nav state, title (`View.title`/`nav_*` exist for
+  this) and the whole live surface.
+- **Which events fan out is `observedEvent`**: page state (title, nav
+  state, load, load error, cursor, favicon, scroll, crash) to every
+  subscriber; input answers (context menu, find results) to
+  controlling ones; everything else (cert and permission holds,
+  downloads, popups, semantic and a11y streams, engine chrome) stays
+  the owner's. A controlling observer's own request is still answered
+  through `routeFor` whatever the kind.
+- **Geometry and identity are the owner's.** `view_resize`, discard,
+  zoom, contexts, semantic, a11y and devtools are refused for an alias
+  regardless of lease (dropped, the connection kept: `error.ObserveDropped`
+  is not a protocol violation). The GUI letterboxes the owner-sized
+  frame (`src/web/watchgeom.zig`) and maps input back through the fit.
+  A target resize re-posts `ev_observe_state` so the fit follows.
+- **Ends are announced, never inferred**: a destroyed target posts
+  `ev_observe_state{ended}` per subscription and `ev_observe_view{gone}`
+  to every announcing connection; an observer's disconnect drops only
+  its subscriptions (`observeDropConn`); an owner's disconnect destroys
+  its views through the ordinary sweep, which ends every subscription
+  on them. smoke-web stages ob1-ob7 pin all of it, and smoke-e2e's
+  assistant web watch stage drives the real GUI through the chip.
+
 ## The presenter: watch-along pixels for a session-mode helper (capability "presenter")
+
+**What it is for now (2026-08-30).** Watch / Take control from the
+assistant chip and the Session Overview no longer attach the web
+session's app session; they open the pages as browser pages through
+the observe block above. The presenter's toplevels are therefore NOT
+the GUI's watch surface any more. What still rides on the web session
+and its presenter: page AUDIO (the helper's `PULSE_SERVER` is the
+session's hub, so a viewer hears the assistant's page), the session's
+LIFETIME as the assistant's browsing (enumerable, `web_session` in
+`capabilities`, the 60s no-client TTL reaping a leaked helper), a
+`sketerm mux attach` or `sketerm app` viewer on a host with no GUI
+observe path, and smoke-mcp's presenter stage, which is the end-to-end
+proof that a session-mode helper renders. Do not delete it on the
+strength of the GUI not using it; do not route the GUI back onto it.
 
 `webdrive.zig` starts the MCP's helper as a Wayland CLIENT of a mux
 app session so a human can attach to it, but an OSR browser creates no
@@ -994,7 +1073,7 @@ PRESENTABLE view (`Host.presentable`: pages, never background pages,
 action popups or inspectors) as one `xdg_toplevel` on the hub, app_id
 `dev.sker.sketerm.web`, title following the page title. From there the
 whole existing app-session machinery applies with no new GUI protocol:
-Session Overview lists it, Watch attaches read-only, the pane's
+Session Overview lists it, a mux viewer attaches read-only, the pane's
 "AI attached" chip and driven accent light up, Take Control hands the
 seat over, and remote forwarding carries it like any app.
 

@@ -105,6 +105,66 @@ the opener page; a featureless open is one tab in the opener window
 that closes itself completely; and a user-opened page's `window.close()`
 changes nothing.
 
+## 2026-08-30: an assistant's browser is watched AS a browser
+
+**Watch / Take control on a web session gave a placeholder terminal
+and a chrome-less floating window.** The web session behind `sketerm
+mcp`'s browser is a mux app session whose only Wayland client is the
+helper's presenter, so attaching it through `muxtabs.AttachJob`
+produced the keeper banner in a tab plus the presenter's toplevel
+floating beside it (and, with `app_view = window`, the tab never
+embedded it: `attachMuxPreparedMode` set `app_view_tab` AFTER
+`makeRemotePaneFromSnap`, and `onAppViewEvent` installs the embed box
+only when the flag is already set at channel open). The user rejected
+the whole shape: the pages have to be real browser pages.
+
+They are now. The helper grew an OBSERVE family (`src/web/protocol.zig`
+0xF0 block, capability `observe`): a second client of the SAME helper
+enables announcements, learns every page of every other connection with
+url, title, geometry and owner, subscribes to one under an alias id it
+minted, and from then on receives that page's frames (always
+`frame_inline`) and page events under its own id, exactly as if it
+were its own view. A read-only subscriber's input is dropped at the
+server edge (`protocol.observerAllows` is the one gate); a controlling
+one drives the page through the same trusted input path the assistant
+uses; geometry, discard, zoom, identity and the semantic/a11y streams
+stay the owner's regardless; a destroyed target ends the subscription
+(`ev_observe_state{ended}`), an observer leaving touches nothing of the
+owner's. The GUI side is `src/ui/webwatch.zig`: the assistant chip and
+the Session Overview open a web session by minting an observer
+`webface.Client` on `<instance dir>/web.sock` (resolved from the
+instance's presence files by `src/web/webpresence.zig`), and every
+announced page becomes a `WebFace` in a new web tab, full chrome, with
+the frame letterboxed at the assistant's size (`src/web/watchgeom.zig`)
+and pointer input mapped back through the fit. The pane's lease chip
+reads the watch's lease and its Take control flips it with
+`observe_control`. A remote assistant is watched the same way through
+its host's daemon: `web_helper_connect` is the connect-to-existing
+sibling of `web_helper_open`, resolving the helper socket beside the
+daemon's own with the same resolver.
+
+The ordering bug is fixed for real app sessions too (flag set before
+the config push, an already-open host adopted the way "Show in Tab"
+adopts one), and the e2e chip stage now launches a fixture WITH a
+toplevel (`sketerm view` on a magenta image) under an explicit
+`app_view = window` and asserts the toplevel is EMBEDDED: magenta in
+the main window, no new toplevel on the display.
+
+The presenter is not deleted: page audio, the session's lifetime and
+enumeration, mux viewers on GUI-less hosts and smoke-mcp's presenter
+proof still ride on it (documented in `src/web/CLAUDE.md`). The GUI no
+longer routes Watch onto it.
+
+`capabilities` reports `web_observe` and `web_socket`; smoke-web stages
+ob1-ob7 prove the wire (enumeration, seeded title and pixels, refused
+read-only input, a controlling click seen by both sides, a new page
+announced, a destroyed page ending its subscription, an observer leaving
+with the owner intact); smoke-e2e's assistant web watch stage drives the
+real GUI: chip, Watch, a web tab with the page's url, a red page that a
+read-only click leaves red, Take control from the pane, a click that
+turns it lime, and the assistant's own `web_eval` reading the clicked
+title after the tab closed.
+
 ## 2026-08-30: the browser gets a clipboard, and real popups
 
 **Paste did not work anywhere in the browser, and the paste chord was
