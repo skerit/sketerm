@@ -42,11 +42,13 @@
 //!
 //! Headless by construction: the helper runs CEF with
 //! `--ozone-platform=headless`, so no display is needed. Almost no
-//! network is touched — every page is a data: URL and the one popup
-//! target is `example.invalid`, which the helper cancels before any
-//! load. The exception is the certificate stage, which talks to an
-//! openssl server this rig started on LOOPBACK; nothing leaves the
-//! machine there either.
+//! network is touched — every page is a data: URL and the blocked
+//! popup target is `example.invalid`, which the helper cancels before
+//! any load. The exceptions are the certificate stage, which talks to
+//! an openssl server this rig started on LOOPBACK, and the pages that
+//! need a real origin (a REAL popup and its opener, stage 6c; cookies),
+//! served by loopback HTTP fixtures; nothing leaves the machine there
+//! either.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -209,6 +211,34 @@ const popup_page =
     "data:text/html,<body%20style=%22margin:0%22>" ++
     "<div%20style=%22width:100vw;height:100vh%22%20" ++
     "onclick=%22window.open('https://example.invalid/x')%22></div></body>";
+
+/// Stage 6c's OPENER, served from a loopback origin because a popup
+/// needs a real one (`window.opener`/`postMessage` across two data:
+/// documents have nothing to relate). `{s}` is the popup's url. The
+/// title is an append-only log joined with `|`, so an earlier state
+/// stays a PREFIX of every later one and no transition can be missed
+/// between two pumps.
+const popup_opener_fmt =
+    "<html><head><title>opener:ready</title></head><body style=\"margin:0\">" ++
+    "<div id=t style=\"width:100vw;height:100vh;background:#8ff\"></div><script>" ++
+    "var log=[];function T(x){{log.push(x);document.title=log.join('|');}}" ++
+    "var mode='popup';var url='{s}';" ++
+    "document.getElementById('t').onclick=function(){{" ++
+    "var p=(mode==='popup')?window.open(url,'sk_pp','popup,width=500,height=600'):window.open(url);" ++
+    "T('opened:'+(p?'handle':'null')+':'+mode);}};" ++
+    "window.addEventListener('message',function(e){{" ++
+    "if(e.data==='hello-from-popup'){{e.source.postMessage('hello-from-opener','*');T('got:popup');}}}});" ++
+    "</script></body></html>";
+
+/// Stage 6c's POPUP document: reports its opener, messages it, and
+/// logs the reply. It closes only when the stage tells it to.
+const popup_child_page =
+    "<html><head><title>pp:load</title></head><body style=\"margin:0;background:#f8f\"><script>" ++
+    "var log=[];function T(x){log.push(x);document.title=log.join('|');}" ++
+    "T('opener:'+(window.opener?'yes':'no'));" ++
+    "window.addEventListener('message',function(e){if(e.data==='hello-from-opener')T('roundtrip:ok');});" ++
+    "if(window.opener){window.opener.postMessage('hello-from-popup','*');}" ++
+    "</script></body></html>";
 
 /// No background, no script, no styling: what a page looks like when it
 /// says nothing about its canvas. The engine's own default has to be
@@ -1386,6 +1416,21 @@ const Client = struct {
     dev_fb_seq: u32 = 0,
     dev_dmg_seq: u32 = 0,
 
+    /// A REAL page popup (`ev_page_popup`, stage 6c): the engine-minted
+    /// view keeps its opener, and its frames must not clobber the main
+    /// view's buffer, so they are routed like the inspector's.
+    pp_opened_seq: u32 = 0,
+    pp_closed_seq: u32 = 0,
+    pp_owner: u32 = 0,
+    pp_view: u32 = 0,
+    pp_chromeless: u8 = 0xff,
+    pp_w: u16 = 0,
+    pp_h: u16 = 0,
+    pp_fb_fd: c_int = -1,
+    /// Title of the popup's OWN document (`ev_title` for `pp_view`).
+    pp_title: [256]u8 = @splat(0),
+    pp_title_len: usize = 0,
+
     print_ok: u8 = 0,
     print_seq: u32 = 0,
     print_path: [1024]u8 = @splat(0),
@@ -1485,6 +1530,7 @@ const Client = struct {
         if (self.fb_fd >= 0) _ = c.close(self.fb_fd);
         if (self.dev_fb_fd >= 0) _ = c.close(self.dev_fb_fd);
         if (self.ext_popup_fb_fd >= 0) _ = c.close(self.ext_popup_fb_fd);
+        if (self.pp_fb_fd >= 0) _ = c.close(self.pp_fb_fd);
         for (self.fds[0..self.nfds]) |fd| _ = c.close(fd);
         self.in.deinit(self.gpa);
         if (self.fd >= 0) _ = c.close(self.fd);
@@ -1919,6 +1965,11 @@ const Client = struct {
                     self.ext_popup_fb_seq += 1;
                     return;
                 }
+                if (self.pp_view != 0 and fb.view == self.pp_view) {
+                    if (self.pp_fb_fd >= 0) _ = c.close(self.pp_fb_fd);
+                    self.pp_fb_fd = fd;
+                    return;
+                }
                 self.unmap();
                 if (self.fb_fd >= 0) _ = c.close(self.fb_fd);
                 self.fb_fd = fd;
@@ -2060,8 +2111,27 @@ const Client = struct {
                     std.debug.print("  [console v{d} l{d}] {s}\n", .{ m.view, m.level, m.msg });
                 }
             },
+            .ev_page_popup => {
+                const p = proto.decode(proto.EvPagePopup, frame.payload) catch fail("ev_page_popup decode");
+                self.pp_owner = p.owner_view;
+                self.pp_view = p.popup_view;
+                self.pp_chromeless = p.chromeless;
+                self.pp_w = p.w;
+                self.pp_h = p.h;
+                if (p.state == proto.page_popup_opened) {
+                    self.pp_opened_seq += 1;
+                    self.pp_title_len = 0;
+                } else if (p.state == proto.page_popup_closed) {
+                    self.pp_closed_seq += 1;
+                }
+            },
             .ev_title => {
                 const t = proto.decode(proto.EvTitle, frame.payload) catch fail("ev_title decode");
+                if (self.pp_view != 0 and t.view == self.pp_view) {
+                    self.pp_title_len = @min(t.title.len, self.pp_title.len);
+                    @memcpy(self.pp_title[0..self.pp_title_len], t.title[0..self.pp_title_len]);
+                    return;
+                }
                 self.title_view = t.view;
                 self.title_len = @min(t.title.len, self.title.len);
                 @memcpy(self.title[0..self.title_len], t.title[0..self.title_len]);
@@ -2300,6 +2370,16 @@ const Client = struct {
         const deadline = nowMs() + timeout_ms;
         while (true) {
             if (std.mem.startsWith(u8, self.titleSlice(), prefix)) return true;
+            if (nowMs() > deadline) return false;
+            self.pump(50);
+        }
+    }
+
+    /// Wait until the page popup's own title starts with `prefix`.
+    fn waitPopupTitle(self: *Client, prefix: []const u8, timeout_ms: i64) bool {
+        const deadline = nowMs() + timeout_ms;
+        while (true) {
+            if (std.mem.startsWith(u8, self.pp_title[0..self.pp_title_len], prefix)) return true;
             if (nowMs() > deadline) return false;
             self.pump(50);
         }
@@ -6334,6 +6414,133 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     _ = cl.drive(3000, 120);
     if (cl.sawPopup("auto.invalid")) fail("stage 6b popup: the engine forwarded a gestureless window.open");
     pass("stage 6b gestureless popup (never reaches the client)");
+
+    // ── Stage 6c: a REAL popup, opener intact, shape reported ──────
+    // With the policy pushed as ALLOW the engine really opens the
+    // popup: `window.open` answers a handle, the helper announces ONE
+    // engine-minted view whose `chromeless`/`w`/`h` carry the
+    // requested shape, `window.opener` works inside it, messages cross
+    // in both directions, and `window.close()` from the popup comes
+    // back as `page_popup_closed`. A featureless open reports
+    // `chromeless = 0`, and BLOCK mode still cancels and reports the
+    // request. Two loopback origins, because a popup relationship
+    // between two data: documents has nothing to relate.
+    {
+        var child = HttpProbe{ .body = popup_child_page };
+        if (!child.start()) fail("stage 6c popup: popup HTTP fixture did not start");
+        var child_url_buf: [128]u8 = undefined;
+        const child_url = std.fmt.bufPrint(&child_url_buf, "http://127.0.0.1:{d}/pp", .{child.lis.port}) catch fail("stage 6c popup url");
+        var opener_html: [2048]u8 = undefined;
+        const opener_body = std.fmt.bufPrint(&opener_html, popup_opener_fmt, .{child_url}) catch fail("stage 6c opener html");
+        var opener = HttpProbe{ .body = opener_body };
+        if (!opener.start()) fail("stage 6c popup: opener HTTP fixture did not start");
+        var opener_url_buf: [128]u8 = undefined;
+        const opener_url = std.fmt.bufPrint(&opener_url_buf, "http://127.0.0.1:{d}/", .{opener.lis.port}) catch fail("stage 6c opener url");
+
+        cl.send(proto.PopupPolicySet{ .view = view_id, .mode = proto.popup_mode_allow });
+        cl.popup_len = 0;
+        cl.pp_opened_seq = 0;
+        cl.pp_closed_seq = 0;
+        cl.navigate(opener_url);
+        if (!cl.waitTitle("opener:ready", 20_000)) fail("stage 6c popup: the opener page never loaded");
+        cl.send(proto.InputFocus{ .view = view_id, .focused = 1 });
+        {
+            var tries: u8 = 0;
+            while (tries < 5 and !std.mem.startsWith(u8, cl.titleSlice(), "opened:")) : (tries += 1) {
+                cl.clickCenter();
+                _ = cl.drive(400, 120);
+            }
+        }
+        if (!cl.waitTitle("opened:handle:popup", 15_000)) {
+            std.debug.print("smoke-web: opener title was \"{s}\"\n", .{cl.titleSlice()});
+            fail("stage 6c popup: a clicked window.open under ALLOW did not answer a handle");
+        }
+        {
+            const deadline = nowMs() + 15_000;
+            while (cl.pp_opened_seq == 0 and nowMs() < deadline) cl.pump(50);
+        }
+        if (cl.pp_opened_seq != 1) fail("stage 6c popup: no ev_page_popup{opened} for the real popup");
+        if (cl.pp_owner != view_id) fail("stage 6c popup: ev_page_popup named the wrong opener view");
+        if (cl.pp_view < proto.ENGINE_VIEW_BASE) fail("stage 6c popup: the popup view id is not engine-minted");
+        if (cl.pp_chromeless != 1) fail("stage 6c popup: a 'popup,width,height' open was not reported chromeless");
+        if (cl.pp_w != 500 or cl.pp_h != 600) {
+            std.debug.print("smoke-web: popup shape was {d}x{d}\n", .{ cl.pp_w, cl.pp_h });
+            fail("stage 6c popup: the requested 500x600 shape did not reach the client");
+        }
+        if (cl.sawPopup("127.0.0.1")) fail("stage 6c popup: an ALLOWED popup was also reported as a blocked request");
+        // Opener relationship and the two message directions.
+        if (!cl.waitPopupTitle("opener:yes", 20_000)) {
+            std.debug.print("smoke-web: popup title was \"{s}\"\n", .{cl.pp_title[0..cl.pp_title_len]});
+            fail("stage 6c popup: window.opener was null inside the popup");
+        }
+        if (!cl.waitTitle("opened:handle:popup|got:popup", 15_000))
+            fail("stage 6c popup: the popup's postMessage never reached the opener");
+        if (!cl.waitPopupTitle("opener:yes|roundtrip:ok", 15_000))
+            fail("stage 6c popup: the opener's postMessage reply never reached the popup");
+        const popup_view_1 = cl.pp_view;
+        // The popup closes ITSELF (an OAuth flow's last act).
+        _ = cl.evalWaitView(popup_view_1, "setTimeout(function(){window.close();},50);1", false, 15_000);
+        {
+            const deadline = nowMs() + 15_000;
+            while (cl.pp_closed_seq == 0 and nowMs() < deadline) cl.pump(50);
+        }
+        if (cl.pp_closed_seq != 1) fail("stage 6c popup: no ev_page_popup{closed} after the popup called window.close()");
+        if (cl.pp_view != popup_view_1) fail("stage 6c popup: the closed event named a different view");
+        if (cl.pp_opened_seq != 1) fail("stage 6c popup: more than one popup was opened for one click");
+        pass("stage 6c real popup (handle, one chromeless 500x600 view, opener + postMessage both ways, self-close reported)");
+
+        // ── Stage 6d: a featureless open is a plain (chromed) popup ──
+        _ = cl.evalWait("mode='plain';1", false, 15_000);
+        cl.resetTitle();
+        _ = cl.evalWait("log=[];document.title='plain:ready';1", false, 15_000);
+        if (!cl.waitTitle("plain:ready", 15_000)) fail("stage 6d popup: the opener did not switch modes");
+        {
+            var tries: u8 = 0;
+            while (tries < 5 and !std.mem.startsWith(u8, cl.titleSlice(), "opened:")) : (tries += 1) {
+                cl.clickCenter();
+                _ = cl.drive(400, 120);
+            }
+        }
+        if (!cl.waitTitle("opened:handle:plain", 15_000)) fail("stage 6d popup: a featureless window.open did not answer a handle");
+        {
+            const deadline = nowMs() + 15_000;
+            while (cl.pp_opened_seq < 2 and nowMs() < deadline) cl.pump(50);
+        }
+        if (cl.pp_opened_seq != 2) fail("stage 6d popup: no ev_page_popup{opened} for the featureless popup");
+        if (cl.pp_chromeless != 0) fail("stage 6d popup: a featureless window.open was reported chromeless");
+        if (cl.pp_view == popup_view_1) fail("stage 6d popup: the second popup reused the first popup's view id");
+        // The client retires it, the way a user closing the tab does.
+        cl.send(proto.ViewDestroy{ .view = cl.pp_view });
+        _ = cl.drive(500, 120);
+        pass("stage 6d featureless popup (chromeless = 0)");
+
+        // ── Stage 6e: BLOCK mode cancels and reports the request ─────
+        cl.send(proto.PopupPolicySet{ .view = view_id, .mode = proto.popup_mode_block });
+        cl.popup_len = 0;
+        cl.popup_gesture = 0xff;
+        cl.resetTitle();
+        _ = cl.evalWait("log=[];document.title='block:ready';1", false, 15_000);
+        if (!cl.waitTitle("block:ready", 15_000)) fail("stage 6e popup: the opener did not reset");
+        {
+            var tries: u8 = 0;
+            while (tries < 5 and !cl.sawPopup("127.0.0.1")) : (tries += 1) {
+                cl.clickCenter();
+                _ = cl.drive(400, 120);
+            }
+        }
+        if (!cl.waitPopup("127.0.0.1", 15_000)) fail("stage 6e popup: BLOCK mode posted no ev_popup_request");
+        if (cl.popup_view != view_id) fail("stage 6e popup: ev_popup_request named the wrong opener");
+        if (cl.popup_gesture != 1) fail("stage 6e popup: the blocked request lost its user gesture");
+        _ = cl.drive(1000, 120);
+        if (cl.pp_opened_seq != 2) fail("stage 6e popup: BLOCK mode still opened a real popup");
+        pass("stage 6e block mode (cancelled, reported as ev_popup_request)");
+
+        opener.shutdown();
+        child.shutdown();
+        cl.pp_view = 0;
+        if (cl.pp_fb_fd >= 0) _ = c.close(cl.pp_fb_fd);
+        cl.pp_fb_fd = -1;
+    }
 
     // ── Stage 7: history navigation ───────────────────────────────
     cl.navigate(red_page);

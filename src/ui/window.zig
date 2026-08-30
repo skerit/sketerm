@@ -249,6 +249,10 @@ pub const Window = struct {
     /// Custom tab strip controller (owns rendering; bound to tab_view).
     /// `tab_bar` is its root widget, used for show/hide + toolbar moves.
     tabbar: *tabbar_mod.TabBar,
+    /// The AdwHeaderBar and its "+" button. Held so a web popup window
+    /// can measure its chrome and drop the new-tab affordance.
+    header_bar: *c.GtkWidget,
+    new_tab_btn: *c.GtkWidget,
     toolbar_view: *c.GtkWidget,
     /// Floats transient notices (upload finished/failed) over the grid.
     toast_overlay: *c.AdwToastOverlay,
@@ -335,6 +339,15 @@ pub const Window = struct {
     /// drag-out, a repeat launch) close when their last tab leaves;
     /// closing the primary quits the app.
     is_primary: bool = false,
+    /// A web POPUP window (`openWebPopupWindow`): a secondary window
+    /// presenting one engine-opened page, transient for its opener,
+    /// with no tab bar, no sidebar and no confirm-close prompts. It
+    /// closes whole when its page closes itself.
+    popup_window: bool = false,
+    /// A tab close the close-page gate must accept without asking:
+    /// set by `closePaneUnprompted` right before the close it requests,
+    /// consumed by `onClosePage` on that very page.
+    unprompted_close: ?*c.AdwTabPage = null,
     /// Window title before the broadcast suffix. The file-manager
     /// identity titles its windows "Sketerm Files"; a terminal window
     /// is never relabelled, whatever faces its panes wear.
@@ -672,6 +685,8 @@ pub const Window = struct {
             .tab_view = @ptrCast(tab_view_w),
             .tab_bar = @ptrCast(@alignCast(tab_bar_w)),
             .tabbar = tabbar,
+            .header_bar = header_bar,
+            .new_tab_btn = new_tab_btn,
             .toolbar_view = @ptrCast(@alignCast(toolbar_view)),
             .toast_overlay = @ptrCast(@alignCast(toast_overlay)),
             .tab_forest = TabForest.init(allocator),
@@ -2402,6 +2417,15 @@ pub const Window = struct {
     /// Used by tab drag-out (AdwTabView "create-window") and the
     /// detach_tab action.
     pub fn spawnSecondaryWindow(self: *Window) ?*Window {
+        const win = self.spawnSecondaryWindowHidden() orelse return null;
+        c.gtk_window_present(@ptrCast(win.app_window));
+        return win;
+    }
+
+    /// `spawnSecondaryWindow` without the present, for a caller that
+    /// must shape the window (size, transient parent, chrome) before
+    /// the compositor sees it.
+    fn spawnSecondaryWindowHidden(self: *Window) ?*Window {
         const app = c.gtk_window_get_application(@ptrCast(self.app_window));
         const cfg = self.config.clone(self.allocator) catch null;
         const win = Window.initWithConfig(self.allocator, @ptrCast(app), cfg, false) catch |err| {
@@ -2411,8 +2435,93 @@ pub const Window = struct {
         win.debug_events = self.debug_events;
         win.hold_override = self.hold_override;
         win.save_on_close = self.save_on_close;
+        return win;
+    }
+
+    /// A real popup WINDOW for an engine-opened page (`window.open`
+    /// with popup features): a secondary window transient for this
+    /// one, sized to the page's requested `w` x `h` viewport plus the
+    /// chrome above it, clamped to this window's monitor, showing no
+    /// tab bar or sidebar. The page's address bar stays (read-only) so
+    /// the origin of a login prompt is visible.
+    ///
+    /// Built on the ordinary secondary-window path, so closing it by
+    /// hand tears the page down exactly like closing any tab does
+    /// (`ViewDestroy` from the face's deinit), and the tab tree model,
+    /// drag-out and every other window rule keep applying.
+    pub fn openWebPopupWindow(self: *Window, view: u32, on: *@import("webface.zig").Client, w: u16, h: u16) !*Window {
+        const win = self.spawnSecondaryWindowHidden() orelse return error.WindowSpawnFailed;
+        win.popup_window = true;
+        c.gtk_window_set_transient_for(@ptrCast(win.app_window), @ptrCast(self.app_window));
+        c.gtk_widget_set_visible(win.tab_bar, 0);
+        c.gtk_widget_set_visible(win.new_tab_btn, 0);
+        if (win.tab_sidebar) |sb| c.gtk_widget_set_visible(sb.root, 0);
+        win.newWebTabForView(view, on, null, .window) catch |err| {
+            win.destroyToplevel();
+            return err;
+        };
+        // Viewport + chrome, then the monitor cap. The face's bar is in
+        // the tree already, so both heights are measurable.
+        var want_w: c_int = @max(@as(c_int, w), 200);
+        var want_h: c_int = @max(@as(c_int, h), 100) + win.popupChromeHeight();
+        if (self.monitorGeometry()) |geo| {
+            want_w = @min(want_w, geo.width);
+            want_h = @min(want_h, geo.height);
+        }
+        c.gtk_window_set_default_size(@ptrCast(win.app_window), want_w, want_h);
         c.gtk_window_present(@ptrCast(win.app_window));
         return win;
+    }
+
+    /// Natural height of everything a popup window stacks above its
+    /// page: the header bar and the page's own address bar.
+    fn popupChromeHeight(self: *Window) c_int {
+        var total: c_int = 0;
+        var min: c_int = 0;
+        var nat: c_int = 0;
+        c.gtk_widget_measure(self.header_bar, c.GTK_ORIENTATION_VERTICAL, -1, &min, &nat, null, null);
+        total += @max(min, nat);
+        if (self.panes.items.len > 0) {
+            if (@import("webface.zig").WebFace.fromPane(self.panes.items[self.panes.items.len - 1])) |face| {
+                c.gtk_widget_measure(face.bar, c.GTK_ORIENTATION_VERTICAL, -1, &min, &nat, null, null);
+                total += @max(min, nat);
+            }
+        }
+        return total;
+    }
+
+    /// Logical geometry of the monitor this window is on, once it has
+    /// a surface; null before that or on a display without monitors.
+    fn monitorGeometry(self: *Window) ?c.GdkRectangle {
+        const surface = c.gtk_native_get_surface(@ptrCast(self.app_window)) orelse return null;
+        const display = c.gtk_widget_get_display(self.app_window) orelse return null;
+        const mon = c.gdk_display_get_monitor_at_surface(display, surface) orelse return null;
+        var geo: c.GdkRectangle = .{ .x = 0, .y = 0, .width = 0, .height = 0 };
+        c.gdk_monitor_get_geometry(mon, &geo);
+        if (geo.width <= 0 or geo.height <= 0) return null;
+        return geo;
+    }
+
+    /// Close `pane` the way an engine-closed popup needs: its whole
+    /// window when this is a popup window, its tab WITHOUT the
+    /// confirm-close prompt when it is the only pane of that tab, and
+    /// the ordinary split collapse otherwise (a user who split the
+    /// popup's tab keeps the sibling).
+    pub fn closePaneUnprompted(self: *Window, pane: *Pane) void {
+        if (self.popup_window) {
+            self.destroyToplevel();
+            return;
+        }
+        const parent = c.gtk_widget_get_parent(pane.widget()) orelse return;
+        const in_split = c.g_type_check_instance_is_a(@ptrCast(@alignCast(parent)), c.gtk_paned_get_type()) != 0;
+        if (!in_split) {
+            if (tabPageForPane(self, pane)) |page| {
+                self.unprompted_close = page;
+                _ = c.adw_tab_view_close_page(self.tab_view, page);
+                return;
+            }
+        }
+        self.closePaneImpl(pane);
     }
 
     /// A repeat launch of this identity (`sketerm` again, no args):
@@ -4021,6 +4130,9 @@ pub const Window = struct {
     /// pages of a browser are listed there, and "new tab" inside a
     /// browser means a new page rather than a new window tab.
     pub fn browserPagesInSidebar(self: *Window) bool {
+        // A popup window has no tab surface at all: its one page is
+        // the whole window.
+        if (self.popup_window) return false;
         const sb = self.tab_sidebar orelse return false;
         return c.gtk_widget_get_visible(sb.root) != 0;
     }
@@ -4165,14 +4277,20 @@ pub const Window = struct {
     /// popup, whose page is already loading with its opener intact.
     /// Nothing is navigated here: navigating would replace the document
     /// the engine opened and, with it, the relationship it exists for.
-    pub fn newWebTabForView(self: *Window, view: u32, on: *@import("webface.zig").Client, opener: ?*c.AdwTabPage) !void {
+    pub fn newWebTabForView(
+        self: *Window,
+        view: u32,
+        on: *@import("webface.zig").Client,
+        opener: ?*c.AdwTabPage,
+        how: @import("webface.zig").WebFace.PopupPresentation,
+    ) !void {
         self.forest_pending_parent = opener;
         defer self.forest_pending_parent = null;
         const before = self.panes.items.len;
         try self.newShellTab("Web");
         if (self.panes.items.len <= before) return error.TabSpawnFailed;
         const pane = self.panes.items[self.panes.items.len - 1];
-        _ = @import("webface.zig").WebFace.attachPopupView(self.allocator, pane, view, on) catch |err| {
+        _ = @import("webface.zig").WebFace.attachPopupView(self.allocator, pane, view, on, how) catch |err| {
             logActionError("popup attach", err);
             return err;
         };
@@ -4764,6 +4882,14 @@ fn acceptTabClose(self: *Window, view: *c.AdwTabView, page: *c.AdwTabPage) void 
 fn onClosePage(view: *c.AdwTabView, page: *c.AdwTabPage, user: ?*anyopaque) callconv(.c) c.gboolean {
     const self = cast.userData(Window, user);
 
+    // An engine-closed popup's tab, or any tab of a popup window: the
+    // page is already gone, so there is nothing to confirm.
+    if (self.unprompted_close == page or self.popup_window) {
+        self.unprompted_close = null;
+        acceptTabClose(self, view, page);
+        return 1;
+    }
+
     // Unsaved editor buffers in this tab veto the close until the
     // user confirms discarding them (saving happens inside the
     // editor face; this gate only prevents silent loss).
@@ -4863,6 +4989,13 @@ fn onWindowCloseRequest(_: *c.GtkWindow, user: ?*anyopaque) callconv(.c) c.gbool
     if (self.save_on_close and self.is_primary) {
         self.saveLayoutQuietly();
         self.layout_saved_final = true;
+    }
+
+    // A web popup window holds one engine-opened page and no shell
+    // worth a prompt: it closes like the browser popup it is.
+    if (self.popup_window) {
+        self.beginDestroy();
+        return 0;
     }
 
     // Unsaved editor buffers veto the close regardless of the

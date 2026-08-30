@@ -28,6 +28,7 @@ const protocol = @import("ipc/protocol.zig");
 const version = @import("version.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const ctlsock = @import("smoke/ctlsock.zig");
+const tcpserver = @import("smoke/tcpserver.zig");
 const muxclient = @import("mux/client.zig");
 const muxwire = @import("mux/wire.zig");
 const panel_assets = @import("ui/panel/assets.zig");
@@ -781,6 +782,16 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_WEB_POPUP_ONLY") != null) {
+        const app = drive orelse return fail("focused web popup smoke has no display driver");
+        if (!have_web_action) return fail("focused web popup smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
+        if (app.windows.items.len == 0) return fail("focused web popup smoke lost its window");
+        app.focusWindow(app.windows.items[0].id) catch return fail("focused web popup smoke could not focus the window");
+        if (webPopupStage(allocator, app, sock_path)) |why| return failMsg(why);
+        say("web popups: focused popup-window, self-close, tab popup and user-tab stage passed");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_EDITOR_ATLAS_ONLY") != null) {
         const app = drive orelse return fail("focused editor atlas smoke has no display driver");
         const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"new-editor-tab\"}\n") orelse
@@ -888,6 +899,9 @@ pub fn main() u8 {
         if (have_web_action) {
             if (webActionGuiStage(allocator, app, sock_path)) |why| return failMsg(why);
             say("browser action: WebGroup switching refreshed per-tab icons; a trusted click opened, drove, closed and tore down a real extension popup");
+
+            if (webPopupStage(allocator, app, sock_path)) |why| return failMsg(why);
+            say("web popups: a popup-shaped open became a ~500x600 toplevel and no tab, its window.close() took the toplevel down with no shell left, a featureless open became a tab that closed itself, and a user-opened page could not close its own tab");
         } else {
             say("SKIP browser-action GUI stage (sketerm-webengine is not built; run `zig build web` first)");
         }
@@ -3843,6 +3857,478 @@ const MENU_MARKER = "CTXMENU_OK";
 /// and a toplevel pixel-diff "proving" a menu opened is really just
 /// the cursor blinking. So the menu is counted as a popup surface
 /// with committed frames.
+/// One loopback HTTP document, for the pages a browser popup needs a
+/// real origin for (`window.opener`/`postMessage` between two data:
+/// documents have nothing to relate).
+const HttpDoc = struct {
+    lis: tcpserver.Listener = .{ .backlog = 16, .poll_ms = 200 },
+    body: []const u8,
+
+    fn start(self: *HttpDoc) bool {
+        return self.lis.start(self, &onConn);
+    }
+
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *HttpDoc = @ptrCast(@alignCast(ctx.?));
+        var buf: [4096]u8 = undefined;
+        _ = tcpserver.readRequest(afd, &buf, 2000);
+        tcpserver.respondOk(afd, "text/html", self.body, "");
+        return false;
+    }
+
+    fn stop(self: *HttpDoc) void {
+        self.lis.deinit();
+    }
+};
+
+/// The popup stage's OPENER: two full-height halves, magenta opens a
+/// popup-SHAPED window (`popup,width=500,height=600`), cyan opens a
+/// featureless one. `{s}` is the popup document's url. The popup name
+/// is fixed so a retried click re-targets the same popup instead of
+/// opening a second one.
+const e2e_popup_opener_fmt =
+    "<html><head><title>e2e-opener</title></head><body style=\"margin:0;display:flex\">" ++
+    "<div id=a style=\"width:50vw;height:100vh;background:#c020e0\"></div>" ++
+    "<div id=b style=\"width:50vw;height:100vh;background:#20d0e0\"></div>" ++
+    "<script>var url='{s}';" ++
+    "document.getElementById('a').onclick=function(){{window.open(url,'sk_e2e_pp','popup,width=500,height=600');}};" ++
+    "document.getElementById('b').onclick=function(){{window.open(url,'sk_e2e_tab');}};" ++
+    "window.addEventListener('message',function(e){{if(e.data==='hello-from-popup'){{document.title='e2e-got-popup';}}}});" ++
+    "</script></body></html>";
+
+const e2e_popup_child_page =
+    "<html><head><title>e2e-popup</title></head><body style=\"margin:0;background:#f0f000\"><script>" ++
+    "if(window.opener){window.opener.postMessage('hello-from-popup','*');}" ++
+    "</script></body></html>";
+
+const PageColor = enum { magenta, cyan, yellow };
+
+fn pageColorMatches(pixel: []const u8, color: PageColor) bool {
+    const b = pixel[0];
+    const g = pixel[1];
+    const r = pixel[2];
+    return switch (color) {
+        .magenta => r > 160 and g < 80 and b > 180,
+        .cyan => r < 80 and g > 170 and b > 180,
+        .yellow => r > 200 and g > 200 and b < 80,
+    };
+}
+
+const Bounds = struct { w: usize, h: usize };
+
+/// Size of the bounding box of every pixel of `color` in the window's
+/// last frame: the page VIEWPORT when the page paints one solid
+/// colour. The toplevel's own size is not that (a CSD window's buffer
+/// carries its shadow margins), which is why the popup size is
+/// asserted on the page and not on the surface.
+fn colorBounds(app: *appdrive.App, win_id: u32, color: PageColor) ?Bounds {
+    const win = app.winById(win_id) orelse return null;
+    if (win.w <= 0 or win.h <= 0) return null;
+    const w: usize = @intCast(win.w);
+    const h: usize = @intCast(win.h);
+    var x0: usize = w;
+    var y0: usize = h;
+    var x1: usize = 0;
+    var y1: usize = 0;
+    var any = false;
+    var y: usize = 0;
+    while (y < h) : (y += 1) {
+        var x: usize = 0;
+        while (x < w) : (x += 1) {
+            const i = (y * w + x) * 4;
+            if (i + 3 >= win.pixels.items.len) break;
+            if (!pageColorMatches(win.pixels.items[i..][0..4], color)) continue;
+            any = true;
+            if (x < x0) x0 = x;
+            if (y < y0) y0 = y;
+            if (x > x1) x1 = x;
+            if (y > y1) y1 = y;
+        }
+    }
+    if (!any) return null;
+    return .{ .w = x1 - x0 + 1, .h = y1 - y0 + 1 };
+}
+
+/// Centroid of every pixel of `color` in the window's last frame, or
+/// null when fewer than 2000 match (a page that has not painted yet).
+fn findPageColor(app: *appdrive.App, win_id: u32, color: PageColor) ?Point {
+    const win = app.winById(win_id) orelse return null;
+    if (win.w <= 0 or win.h <= 0) return null;
+    const w: usize = @intCast(win.w);
+    const h: usize = @intCast(win.h);
+    var n: usize = 0;
+    var sx: usize = 0;
+    var sy: usize = 0;
+    var y: usize = 0;
+    while (y < h) : (y += 2) {
+        var x: usize = 0;
+        while (x < w) : (x += 2) {
+            const i = (y * w + x) * 4;
+            if (i + 3 >= win.pixels.items.len) break;
+            if (pageColorMatches(win.pixels.items[i..][0..4], color)) {
+                n += 1;
+                sx += x;
+                sy += y;
+            }
+        }
+    }
+    if (n < 500) return null;
+    return .{ .x = @floatFromInt(sx / n), .y = @floatFromInt(sy / n) };
+}
+
+fn waitPageColor(app: *appdrive.App, win_id: u32, color: PageColor, ms: u32) ?Point {
+    var waited: u32 = 0;
+    while (true) {
+        if (findPageColor(app, win_id, color)) |p| return p;
+        if (waited >= ms) return null;
+        _ = app.pumpOnce(200);
+        waited += 200;
+    }
+}
+
+/// Number of tabs `list` reports in IPC window `win`.
+fn tabsInWindow(resp: []const u8, win: u32) usize {
+    var needle_buf: [32]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "\"window\":{d}", .{win}) catch return 0;
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, resp, from, needle)) |at| {
+        from = at + needle.len;
+        // `"window":1` must not count `"window":10`.
+        if (from < resp.len and resp[from] >= '0' and resp[from] <= '9') continue;
+        n += 1;
+    }
+    return n;
+}
+
+/// The IPC window id of the tab holding `pane`, from a `list` reply.
+/// A tab record is `{"id":T,"window":W,...,"panes":[{"id":P,...}]}`,
+/// so the pane is searched only after its tab's `panes` marker.
+fn windowOfPane(resp: []const u8, pane: u32) ?u32 {
+    var pane_buf: [32]u8 = undefined;
+    const pane_needle = std.fmt.bufPrint(&pane_buf, "\"id\":{d},", .{pane}) catch return null;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, resp, from, "\"window\":")) |at| {
+        const win = parseNumAfter(resp[at..], "\"window\":") orelse return null;
+        const next = std.mem.indexOfPos(u8, resp, at + 9, "\"window\":") orelse resp.len;
+        const span = resp[at..next];
+        const panes_at = std.mem.indexOf(u8, span, "\"panes\":[") orelse {
+            from = next;
+            continue;
+        };
+        if (std.mem.indexOf(u8, span[panes_at..], pane_needle) != null) return win;
+        from = next;
+    }
+    return null;
+}
+
+/// The pane ids `web-list` names that are not in `known`. Returns the
+/// first such pane, or null.
+fn newWebPane(resp: []const u8, known: []const u32) ?u32 {
+    var from: usize = 0;
+    outer: while (std.mem.indexOfPos(u8, resp, from, "{\"pane\":")) |at| {
+        from = at + 8;
+        const id = parseNumAfter(resp[at..], "{\"pane\":") orelse continue;
+        for (known) |k| {
+            if (k == id) continue :outer;
+        }
+        return id;
+    }
+    return null;
+}
+
+/// Run `code` in `pane`'s page through the asynchronous eval lane
+/// (`web-request` op=eval, then `web-result` polls). Returns the
+/// result payload, or null when nothing came back within `ms` (a page
+/// that closed itself mid-eval legitimately never answers).
+fn webEval(allocator: std.mem.Allocator, sock: [:0]const u8, pane: u32, code: []const u8, ms: u32) ?[]u8 {
+    var req_buf: [1024]u8 = undefined;
+    const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-request\",\"pane\":{d},\"op\":\"eval\",\"data\":\"{s}\"}}\n", .{ pane, code }) catch return null;
+    const started = roundtrip(allocator, sock, req) orelse return null;
+    defer allocator.free(started);
+    const token = parseNumAfter(started, "\"token\":") orelse return null;
+    var waited: u32 = 0;
+    while (waited < ms) : (waited += 100) {
+        const poll = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-result\",\"pane\":{d},\"token\":{d}}}\n", .{ pane, token }) catch return null;
+        const r = roundtrip(allocator, sock, poll) orelse return null;
+        if (std.mem.indexOf(u8, r, "\"done\":true") != null) return r;
+        allocator.free(r);
+        if (drive) |app| _ = app.pumpOnce(100) else _ = c.usleep(100_000);
+    }
+    return null;
+}
+
+/// A title `web-list` reports for `pane`'s visible page contains
+/// `needle`.
+fn webPaneTitled(allocator: std.mem.Allocator, sock: [:0]const u8, pane: u32, needle: []const u8) bool {
+    const list = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return false;
+    defer allocator.free(list);
+    var needle_buf: [32]u8 = undefined;
+    const row_start = std.fmt.bufPrint(&needle_buf, "{{\"pane\":{d},", .{pane}) catch return false;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, list, from, row_start)) |at| {
+        from = at + row_start.len;
+        const next = std.mem.indexOfPos(u8, list, from, "{\"pane\":") orelse list.len;
+        if (std.mem.indexOf(u8, list[at..next], needle) != null) return true;
+    }
+    return false;
+}
+
+fn waitWebPaneTitled(allocator: std.mem.Allocator, sock: [:0]const u8, app: *appdrive.App, pane: u32, needle: []const u8, ms: u32) bool {
+    var waited: u32 = 0;
+    while (true) {
+        if (webPaneTitled(allocator, sock, pane, needle)) return true;
+        if (waited >= ms) return false;
+        _ = app.pumpOnce(200);
+        waited += 200;
+    }
+}
+
+/// A toplevel (not a popup surface, painted at least once) whose id is
+/// in none of `known`.
+fn waitNewToplevel(app: *appdrive.App, known: []const u32, ms: u32) ?u32 {
+    var waited: u32 = 0;
+    while (true) {
+        if (hasToplevelOtherThan(app, known)) |id| return id;
+        if (waited >= ms) return null;
+        _ = app.pumpOnce(200);
+        waited += 200;
+    }
+}
+
+fn waitToplevelGone(app: *appdrive.App, id: u32, ms: u32) bool {
+    var waited: u32 = 0;
+    while (true) {
+        _ = app.pumpOnce(120);
+        if (app.winById(id) == null or app.windowGone(id)) return true;
+        if (waited >= ms) return false;
+        _ = app.pumpOnce(200);
+        waited += 200;
+    }
+}
+
+/// Every toplevel id the display session currently shows.
+fn knownToplevels(app: *appdrive.App, out: []u32) usize {
+    _ = app.pumpOnce(120);
+    var n: usize = 0;
+    for (app.windows.items) |w| {
+        if (n >= out.len) break;
+        out[n] = w.id;
+        n += 1;
+    }
+    return n;
+}
+
+/// Popups the way a browser does them, on the real GUI: a page's
+/// `window.open` with popup features becomes a SECOND GTK toplevel of
+/// the requested size (no tab is added), the popup closing itself
+/// takes that toplevel down without leaving a terminal tab behind, a
+/// featureless `window.open` is a tab that likewise closes itself
+/// completely, and a page the USER opened cannot close its own tab.
+/// Two loopback documents, real seat clicks (the engine's own popup
+/// blocker eats a gestureless open).
+fn webPopupStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8) ?[]const u8 {
+    _ = app.drainLive(1_000);
+    if (app.windows.items.len == 0) return "the display session lost its window before the popup stage";
+    var known_buf: [16]u32 = undefined;
+    const known = known_buf[0..knownToplevels(app, &known_buf)];
+
+    var child = HttpDoc{ .body = e2e_popup_child_page };
+    if (!child.start()) return "the popup document server did not start";
+    defer child.stop();
+    var child_url_buf: [128]u8 = undefined;
+    const child_url = std.fmt.bufPrint(&child_url_buf, "http://127.0.0.1:{d}/pp", .{child.lis.port}) catch return "popup url";
+    var opener_html: [2048]u8 = undefined;
+    const opener_body = std.fmt.bufPrint(&opener_html, e2e_popup_opener_fmt, .{child_url}) catch return "opener html";
+    var opener = HttpDoc{ .body = opener_body };
+    if (!opener.start()) return "the opener document server did not start";
+    defer opener.stop();
+
+    var req_buf: [512]u8 = undefined;
+    const open_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"http://127.0.0.1:{d}/\"}}\n", .{opener.lis.port}) catch return "web-open request";
+    const opened = roundtrip(allocator, sock, open_req) orelse return "opening the opener page failed";
+    defer allocator.free(opened);
+    if (std.mem.indexOf(u8, opened, "\"ok\":true") == null) return "the opener page was rejected";
+    const opener_pane = parseNumAfter(opened, "\"pane\":") orelse return "the opener reply named no pane";
+    if (!waitWebPaneTitled(allocator, sock, app, opener_pane, "e2e-opener", 30_000))
+        return "the opener page never loaded in the GUI";
+
+    // Which GTK toplevel and which IPC window hold the opener.
+    const list0 = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse return "list failed before the popup";
+    defer allocator.free(list0);
+    const opener_win = windowOfPane(list0, opener_pane) orelse return "the opener pane is in no listed window";
+    const tabs_before = tabsInWindow(list0, opener_win);
+    const total_before = countTabs(list0);
+    var pane_ids: [64]u32 = undefined;
+    const web_before_n = blk: {
+        const wl = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "web-list failed before the popup";
+        defer allocator.free(wl);
+        var n: usize = 0;
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, wl, from, "{\"pane\":")) |at| {
+            from = at + 8;
+            if (n >= pane_ids.len) break;
+            pane_ids[n] = parseNumAfter(wl[at..], "{\"pane\":") orelse continue;
+            n += 1;
+        }
+        break :blk n;
+    };
+    const web_before = pane_ids[0..web_before_n];
+    // The toplevel showing magenta is the one the opener tab is in.
+    var gui_win: u32 = 0;
+    var magenta: ?Point = null;
+    {
+        var waited: u32 = 0;
+        while (magenta == null and waited < 20_000) : (waited += 200) {
+            for (known) |id| {
+                if (findPageColor(app, id, .magenta)) |p| {
+                    magenta = p;
+                    gui_win = id;
+                    break;
+                }
+            }
+            if (magenta == null) _ = app.pumpOnce(200);
+        }
+    }
+    const magenta_pt = magenta orelse return "the opener page never painted its magenta half in any toplevel";
+    app.focusWindow(gui_win) catch return "focusing the opener window failed";
+
+    // 1. A popup-shaped open is a second toplevel of the requested size.
+    var popup_win: ?u32 = null;
+    {
+        var attempt: u32 = 0;
+        while (attempt < 5 and popup_win == null) : (attempt += 1) {
+            app.clickEx(gui_win, magenta_pt.x, magenta_pt.y, 1, 100, 1) catch return "clicking the popup half failed";
+            popup_win = waitNewToplevel(app, known, 6_000);
+        }
+    }
+    const pw = popup_win orelse {
+        if (app.screenshotPng(gui_win, 1024, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("/tmp/sketerm-e2e-webpopup-fail.png", shot.png);
+        } else |_| {}
+        return "a popup-shaped window.open opened no second toplevel";
+    };
+    // The popup document paints solid yellow, so its bounding box in
+    // the new toplevel IS the viewport the page asked for. The surface
+    // itself is bigger (CSD shadow margins plus the header and address
+    // bars above the page), so only a loose cap applies to it.
+    {
+        var waited: u32 = 0;
+        var sized = false;
+        var last: ?Bounds = null;
+        while (waited < 20_000) : (waited += 200) {
+            if (colorBounds(app, pw, .yellow)) |b| {
+                last = b;
+                if (b.w >= 496 and b.w <= 504 and b.h >= 596 and b.h <= 604) {
+                    sized = true;
+                    break;
+                }
+            }
+            _ = app.pumpOnce(200);
+        }
+        if (!sized) {
+            if (last) |b| _ = c.fprintf(platform.stderr(), "smoke-e2e: popup viewport painted %zux%zu\n", b.w, b.h);
+            if (app.winById(pw)) |w| _ = c.fprintf(platform.stderr(), "smoke-e2e: popup toplevel is %dx%d\n", w.w, w.h);
+            return "the popup window's page viewport is not the requested 500x600";
+        }
+        const w = app.winById(pw) orelse return "the popup toplevel vanished while being measured";
+        if (w.w > 640 or w.h > 900) return "the popup toplevel is far larger than its 500x600 page";
+    }
+    {
+        const list1 = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse return "list failed after the popup opened";
+        defer allocator.free(list1);
+        if (tabsInWindow(list1, opener_win) != tabs_before) return "a popup-shaped open added a tab to the opener window";
+    }
+    var popup_pane: u32 = 0;
+    {
+        var waited: u32 = 0;
+        while (popup_pane == 0 and waited < 10_000) : (waited += 200) {
+            const wl = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "web-list failed after the popup opened";
+            defer allocator.free(wl);
+            popup_pane = newWebPane(wl, web_before) orelse 0;
+            if (popup_pane == 0) _ = app.pumpOnce(200);
+        }
+    }
+    if (popup_pane == 0) return "the popup window presents no web view";
+    if (!waitWebPaneTitled(allocator, sock, app, popup_pane, "e2e-popup", 20_000)) return "the popup window is not showing the popup document";
+    if (!waitWebPaneTitled(allocator, sock, app, opener_pane, "e2e-got-popup", 20_000)) return "the popup's postMessage never reached its opener in the GUI";
+    {
+        const list1 = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse return "list failed after the popup loaded";
+        defer allocator.free(list1);
+        const pop_ipc_win = windowOfPane(list1, popup_pane) orelse return "the popup pane is in no listed window";
+        if (pop_ipc_win == opener_win) return "the popup page landed in the opener window instead of its own";
+    }
+
+    // 2. The popup closes itself: the toplevel goes, no tab is left.
+    if (webEval(allocator, sock, popup_pane, "setTimeout(function(){window.close();},100);1", 5_000)) |r| allocator.free(r);
+    if (!waitToplevelGone(app, pw, 15_000)) return "the popup toplevel survived the popup's window.close()";
+    if (!waitPaneGone(allocator, sock, popup_pane, 15_000)) return "the popup's pane survived its window.close()";
+    {
+        const list2 = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse return "list failed after the popup closed";
+        defer allocator.free(list2);
+        if (countTabs(list2) != total_before) return "the popup left a tab (a shell) behind after closing itself";
+        if (tabsInWindow(list2, opener_win) != tabs_before) return "the opener window's tab count changed across the popup";
+        if (windowOfPane(list2, opener_pane) == null) return "the opener pane disappeared with the popup";
+    }
+    if (!webPaneTitled(allocator, sock, opener_pane, "e2e-got-popup")) return "the opener page is no longer the page it was";
+    if (hasToplevelOtherThan(app, known) != null) return "a toplevel remained after the popup closed";
+
+    // 3. A featureless open is a tab in the opener window.
+    app.focusWindow(gui_win) catch return "re-focusing the opener window failed";
+    const cyan = waitPageColor(app, gui_win, .cyan, 10_000) orelse return "the opener page's cyan half is not visible";
+    var tab_pane: u32 = 0;
+    {
+        var attempt: u32 = 0;
+        while (attempt < 5 and tab_pane == 0) : (attempt += 1) {
+            app.clickEx(gui_win, cyan.x, cyan.y, 1, 100, 1) catch return "clicking the tab half failed";
+            var waited: u32 = 0;
+            while (tab_pane == 0 and waited < 6_000) : (waited += 200) {
+                const wl = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "web-list failed after the tab open";
+                defer allocator.free(wl);
+                tab_pane = newWebPane(wl, web_before) orelse 0;
+                if (tab_pane == 0) _ = app.pumpOnce(200);
+            }
+        }
+    }
+    if (tab_pane == 0) return "a featureless window.open opened no new web view";
+    if (!waitWebPaneTitled(allocator, sock, app, tab_pane, "e2e-popup", 20_000)) return "the featureless popup's tab is not showing the popup document";
+    {
+        const list3 = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse return "list failed after the tab popup";
+        defer allocator.free(list3);
+        if (tabsInWindow(list3, opener_win) != tabs_before + 1) return "a featureless open did not add exactly one tab to the opener window";
+        if (windowOfPane(list3, tab_pane) != opener_win) return "the featureless popup did not land in the opener window";
+    }
+    if (hasToplevelOtherThan(app, known) != null) return "a featureless open produced a toplevel";
+    if (webEval(allocator, sock, tab_pane, "setTimeout(function(){window.close();},100);1", 5_000)) |r| allocator.free(r);
+    if (!waitPaneGone(allocator, sock, tab_pane, 15_000)) return "the popup tab survived its window.close()";
+    {
+        const list4 = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse return "list failed after the tab popup closed";
+        defer allocator.free(list4);
+        if (countTabs(list4) != total_before) return "the popup tab left a shell tab behind after closing itself";
+        if (windowOfPane(list4, opener_pane) == null) return "the opener pane disappeared with the popup tab";
+    }
+
+    // 4. A user-opened page cannot close its own tab.
+    if (webEval(allocator, sock, opener_pane, "setTimeout(function(){window.close();},100);1", 5_000)) |r| allocator.free(r);
+    _ = app.waitIdle(300, 3_000);
+    _ = c.usleep(1_500_000);
+    _ = app.pumpOnce(200);
+    {
+        const list5 = roundtrip(allocator, sock, "{\"cmd\":\"list\"}\n") orelse return "list failed after the self-close attempt";
+        defer allocator.free(list5);
+        if (windowOfPane(list5, opener_pane) == null) return "a user-opened tab was closed by its own page's window.close()";
+        if (countTabs(list5) != total_before) return "the tab count changed after a user-opened page called window.close()";
+    }
+    if (!webPaneTitled(allocator, sock, opener_pane, "e2e-got-popup")) return "the user-opened page is gone after its window.close()";
+
+    var close_buf: [96]u8 = undefined;
+    const close_req = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{opener_pane}) catch return "close-pane request";
+    if (roundtrip(allocator, sock, close_req)) |r| allocator.free(r);
+    _ = waitPaneGone(allocator, sock, opener_pane, 10_000);
+    return null;
+}
+
 fn openPopup(app: *appdrive.App) ?u32 {
     _ = app.pumpOnce(120);
     for (app.windows.items) |w| {

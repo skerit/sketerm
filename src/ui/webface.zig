@@ -498,8 +498,13 @@ pub fn faceByViewOn(cl: *Client, view: u32) ?*WebFace {
 
 /// What happens to a page's `window.open` / `target=_blank`.
 ///
-/// The helper never opens a popup itself: it cancels and reports, so
-/// this is purely the GUI's decision. `block_gestureless` is the
+/// The helper opens a popup only under the policy the GUI pushed
+/// ahead of time (`pushPopupPolicy`) and the GUI re-checks the gesture
+/// bit when one is announced, so this is the GUI's decision either
+/// way. A popup that opens is presented by `onPagePopup`: a popup
+/// WINDOW when the page asked for a popup shape, a tab otherwise, and
+/// only such an engine-opened page may close itself.
+/// `block_gestureless` is the
 /// default because the flag it keys on is what separates "the user
 /// clicked a link that opens a tab" from "the page opened one on its
 /// own" — the second is the advertising pop-under, and it is the only
@@ -1578,7 +1583,8 @@ pub const Client = struct {
                     }
                 } else if (self.findFace(ev.popup_view)) |face| {
                     // The popup closed itself, which is how every OAuth
-                    // flow ends. Retire its tab.
+                    // flow ends. Retire its tab or popup window whole;
+                    // `closeSelf` ignores a face the engine did not open.
                     face.closeSelf();
                 }
             },
@@ -3101,6 +3107,13 @@ pub const WebFace = struct {
     /// cannot be rebuilt on a fresh helper connection, because the id
     /// it holds means nothing to a helper that just started.
     attached: bool = false,
+    /// The ENGINE opened this page (a real `window.open` popup the
+    /// helper announced with `ev_page_popup`), so the engine may also
+    /// close it: `page_popup_closed` retires the tab or popup window
+    /// it lives in. Set only by the popup-presentation attach paths; a
+    /// page the user opened never carries it, so a script can never
+    /// close the user's tab.
+    popup_owned: bool = false,
 
     root_box: *c.GtkWidget = undefined,
     /// The navigation bar. An attached view has no address of its own
@@ -3434,14 +3447,23 @@ pub const WebFace = struct {
         return attachOpts(allocator, pane, .{ .existing_view = view, .on_client = on });
     }
 
+    /// How an engine-opened popup is presented: as an ordinary tab
+    /// (`chromeless == 0`, navigable like any tab) or as a popup
+    /// WINDOW, whose address bar is read-only because the window has
+    /// no other chrome and the page will routinely ask for a password.
+    pub const PopupPresentation = enum { tab, window };
+
     /// `attachView` for a real page POPUP: same adoption, but the
     /// address bar stays, because the user must be able to read the
-    /// origin of a page that is about to ask for their password.
-    pub fn attachPopupView(allocator: std.mem.Allocator, pane: *Pane, view: u32, on: *Client) !*WebFace {
+    /// origin of a page that is about to ask for their password, and
+    /// the face is marked engine-owned so `window.close()` retires it.
+    pub fn attachPopupView(allocator: std.mem.Allocator, pane: *Pane, view: u32, on: *Client, how: PopupPresentation) !*WebFace {
         return attachOpts(allocator, pane, .{
             .existing_view = view,
             .on_client = on,
             .keep_address_bar = true,
+            .popup_owned = true,
+            .address_readonly = how == .window,
         });
     }
 
@@ -3463,6 +3485,11 @@ pub const WebFace = struct {
         /// Keep the address bar on an `existing_view` face. Set for a
         /// page popup, whose origin the user MUST be able to read.
         keep_address_bar: bool = false,
+        /// The engine opened this page (see `WebFace.popup_owned`).
+        popup_owned: bool = false,
+        /// The address entry shows the origin but cannot be typed
+        /// into: a popup window's only chrome is that bar.
+        address_readonly: bool = false,
     };
 
     /// Add a page to an existing group — the in-pane equivalent of
@@ -3520,21 +3547,32 @@ pub const WebFace = struct {
             .as_page = true,
             .opener = opener,
             .keep_address_bar = true,
+            .popup_owned = true,
         });
     }
 
-    /// Retire this face's own page/tab, for a view the ENGINE closed
+    /// Retire this face COMPLETELY, for a view the ENGINE closed
     /// (`window.close()` from a popup, which is how an OAuth flow
-    /// ends). The helper already freed the view, so nothing is posted
-    /// back to it.
+    /// ends): its page in a group, else its whole tab, else its popup
+    /// window. Never the hidden shell the tab was built on: a popup
+    /// closing itself must not leave a terminal behind.
+    ///
+    /// Only an engine-opened face (`popup_owned`) is closed; the
+    /// helper emits the event only for its own popups and this is the
+    /// belt, so a script can never close a tab the user opened. The
+    /// helper already freed the view, so nothing is posted back to it.
     pub fn closeSelf(self: *WebFace) void {
+        if (!self.popup_owned) return;
         self.view_live = false;
         if (self.group()) |g| {
-            g.closePage(self, .promote);
-            return;
+            if (g.pages.items.len > 1) {
+                g.closePage(self, .promote);
+                return;
+            }
         }
         const win = self.ownerWindow() orelse return;
-        if (self.ownerPage()) |page| _ = c.adw_tab_view_close_page(win.tab_view, page);
+        const pane = self.pane orelse return;
+        win.closePaneUnprompted(pane);
     }
 
     fn attachOpts(allocator: std.mem.Allocator, pane: *Pane, opts: Opts) !*WebFace {
@@ -3562,6 +3600,11 @@ pub const WebFace = struct {
         // what the security-surfaces section above exists to prevent.
         if (opts.existing_view != 0 and !opts.keep_address_bar)
             c.gtk_widget_set_visible(self.bar, 0);
+        self.popup_owned = opts.popup_owned;
+        // Read-only, not hidden: the origin stays visible, and Enter
+        // on a non-editable entry never reaches `onEntryActivate`.
+        if (opts.address_readonly)
+            c.gtk_editable_set_editable(@ptrCast(self.entry), 0);
         c.gtk_widget_set_vexpand(self.root_box, 1);
         c.gtk_widget_set_hexpand(self.root_box, 1);
         grp.adopt(self, opts.opener, grp.childInsertPos()) catch {
@@ -6797,6 +6840,16 @@ pub const WebFace = struct {
             self.toastBlockedPopup(ev.url);
             return;
         }
+        // The page asked for a popup-SHAPED window (`window.open` with
+        // `popup`/width/height features): a real secondary toplevel of
+        // the requested size, the way every browser presents a login
+        // popup. A featureless open is a tab, as it always was.
+        if (ev.chromeless != 0) {
+            _ = win.openWebPopupWindow(ev.popup_view, self.cl, ev.w, ev.h) catch {
+                self.cl.post(proto.ViewDestroy{ .view = ev.popup_view });
+            };
+            return;
+        }
         if (win.browserPagesInSidebar()) {
             if (self.group()) |g| {
                 _ = attachPageExisting(self.allocator, g, ev.popup_view, self) catch {
@@ -6805,7 +6858,7 @@ pub const WebFace = struct {
                 return;
             }
         }
-        win.newWebTabForView(ev.popup_view, self.cl, self.ownerPage()) catch {
+        win.newWebTabForView(ev.popup_view, self.cl, self.ownerPage(), .tab) catch {
             self.cl.post(proto.ViewDestroy{ .view = ev.popup_view });
         };
     }
