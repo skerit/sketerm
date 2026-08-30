@@ -5877,6 +5877,9 @@ fn launchRenameFiles(
         _ = c.unsetenv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
+        // A rig must never meet the first-run tour: it covers the
+        // listing and eats the clicks meant for it (welcome.zig).
+        _ = c.setenv("SKETERM_WELCOME", "0", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "files", dir.ptr, null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -5968,7 +5971,9 @@ fn findRenameControlSocket(
 fn ocrCount(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8) ?usize {
     const ocr = @import("util/ocr.zig");
     if (!ocr.available()) return null;
-    _ = app.pumpOnce(100);
+    // The live head, not a stale replica: an mcp-kind viewer's frame
+    // backlog pauses frames on a big window (see viewerWaitOcr).
+    _ = app.drainLive(2_000);
     const shot = app.snapshotRgba(win_id, null) catch return 0;
     defer allocator.free(shot.px);
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -6292,6 +6297,9 @@ fn quickLookStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const 
         _ = c.unsetenv("DISPLAY");
         _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
         _ = c.setenv("GTK_A11Y", "none", 1);
+        // A rig must never meet the first-run tour: it covers the
+        // listing and eats the clicks meant for it (welcome.zig).
+        _ = c.setenv("SKETERM_WELCOME", "0", 1);
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "files", dir.ptr, null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
