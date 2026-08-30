@@ -225,7 +225,7 @@ pub fn profileCapability(arena: std.mem.Allocator) struct {
     store: []const u8,
     reason: []const u8,
 } {
-    if (mcp.guiSocketAttached())
+    if (guiDrivesWeb())
         return .{ .available = false, .store = "", .reason = GUI_PROFILE_REFUSAL };
     const e = headlessEngine() orelse
         return .{ .available = false, .store = "", .reason = "this server has no headless browser backend configured" };
@@ -274,14 +274,14 @@ pub const RouteSupport = enum {
 /// cannot serve.
 pub fn routeCapability(web_ok: bool) RouteSupport {
     if (!web_ok) return .none;
-    return if (mcp.guiSocketAttached()) .gui else .headless;
+    return if (guiDrivesWeb()) .gui else .headless;
 }
 
 /// The engine-lifecycle half of the preflight: whether the broker lane
 /// is available (the daemon would spawn and keep the engine), and who
 /// owns the engine this server is connected to right now.
 pub fn engineCapability() struct { broker_lane: bool, owner: webdrive.Owner } {
-    if (mcp.guiSocketAttached()) return .{ .broker_lane = false, .owner = .none };
+    if (guiDrivesWeb()) return .{ .broker_lane = false, .owner = .none };
     const e = headlessEngine() orelse return .{ .broker_lane = false, .owner = .none };
     return .{ .broker_lane = e.brokerLaneAvailable(), .owner = e.owner };
 }
@@ -614,15 +614,32 @@ const Driver = union(enum) {
     }
 };
 
-/// Pick the backend: the GUI when a control socket is attached (drive
-/// the user's real tabs), the owned headless helper otherwise.
+/// Whether the web tools drive the user's GUI: a server-wide control
+/// socket (--shared / --socket), or the web_gui grant (the web tools'
+/// own). Every "GUI-backed" decision reads this, never one half of it.
+pub fn guiDrivesWeb() bool {
+    return mcp.guiSocketAttached() or mcp.mcp_webgui.granted();
+}
+
+/// Pick the backend: the GUI when a server-wide control socket is
+/// attached (drive the user's real tabs), the web_gui grant's own GUI
+/// socket when the user granted that (found or spawned lazily HERE,
+/// on the first web call), the owned headless helper otherwise.
+///
+/// A granted GUI that cannot be reached is an error, never a fall-back
+/// to the headless helper: a private not-logged-in browser answering
+/// under the grant is exactly what the grant exists to prevent.
 ///
 /// Headless, `handle` decides WHICH helper instance: one per route, and
 /// a view id names exactly one of them (ids are minted process-wide).
 /// A handle-less call goes to the current engine: the one whose view a
 /// handle-less call already meant.
-fn pick(backend: mcp.Backend, handle: ?u32) Driver {
+fn pick(backend: mcp.Backend, handle: ?u32) error{WebGuiUnavailable}!Driver {
     if (mcp.guiSocketAttached()) return .{ .gui = backend };
+    if (mcp.mcp_webgui.granted()) {
+        const gui = mcp.mcp_webgui.ensureBackend() catch return error.WebGuiUnavailable;
+        return .{ .gui = gui };
+    }
     if (handle) |h| {
         if (engineForView(h)) |e| return .{ .headless = e };
     }
@@ -938,8 +955,13 @@ const OpenOutcome = union(enum) { opened: u32, err: Fail };
 /// named things in the browser UI. Minting one from an MCP call would
 /// surprise the person looking at the window, so profiles stay a
 /// headless-only feature and say so.
+/// The three GUI-mode refusals name every way the GUI gets attached
+/// (the server-wide --shared/--socket and the web-only web_gui grant),
+/// so the sentence stays true under the grant.
+const GUI_ATTACH_WAYS = "--shared/--socket or the web_gui grant (--web-gui, SKETERM_MCP_WEB_GUI, web_gui in config.conf's [mcp] section)";
+
 const GUI_PROFILE_REFUSAL =
-    "a sketerm GUI is attached, so web_open drives the user's real tabs; named profiles are a headless-only feature (the GUI has its own identity containers, which the user owns). Run this MCP server without --shared/--socket to get profiles.";
+    "a sketerm GUI is attached, so web_open drives the user's real tabs; named profiles are a headless-only feature (the GUI has its own identity containers, which the user owns). Run this MCP server without " ++ GUI_ATTACH_WAYS ++ " to get profiles.";
 
 /// THE profile-error vocabulary: every `webdrive.ProfileError` with the
 /// sentence a caller reads and the typed code the result carries.
@@ -2442,10 +2464,17 @@ fn helperErr(drv: Driver, arena: std.mem.Allocator, views: ?Views) ![]const u8 {
     }
     return mcp.errRes(arena, .unavailable, switch (drv) {
         .gui =>
-        \\the web backends are unavailable: no sketerm GUI control socket is attached and this server has no headless browser configured. In the DEFAULT isolated mode web tools run headlessly without any GUI; under --shared they need the GUI running (or pass --socket).
+        \\the web backends are unavailable: no sketerm GUI control socket is attached and this server has no headless browser configured. In the DEFAULT isolated mode web tools run headlessly without any GUI; under --shared they need the GUI running (or pass --socket), and under the web_gui grant they find or start one.
         ,
         .headless => "the headless browser backend failed to initialize",
     });
+}
+
+/// The fail-closed answer under the web_gui grant: the reason the
+/// transport left, as `unavailable`. Nothing headless was touched.
+fn webGuiUnavailable(arena: std.mem.Allocator) ![]const u8 {
+    const why = mcp.mcp_webgui.reason();
+    return mcp.errRes(arena, .unavailable, if (why.len > 0) why else "the web_gui grant is active but no sketerm GUI could be reached; nothing was opened headlessly");
 }
 
 pub fn webTool(
@@ -2464,7 +2493,7 @@ pub fn webTool(
         .value => |v| v,
     };
 
-    var drv = pick(backend, handle_u);
+    var drv = pick(backend, handle_u) catch return webGuiUnavailable(arena);
     const views = try listViews(drv, arena);
 
     if (eql(u8, name, "web_tabs")) {
@@ -2545,7 +2574,7 @@ pub fn webTool(
         // A routed open lands in that route's OWN helper instance, so
         // the rest of this call must address that engine, not the one
         // the call was picked with.
-        drv = pick(backend, new_handle);
+        drv = pick(backend, new_handle) catch return webGuiUnavailable(arena);
         // Before the first pump: the hold this navigation raises must
         // be answered against it.
         if (accept_cert) |fp| drv.headless.setAcceptCert(new_handle, fp) catch |e| switch (e) {
@@ -2697,7 +2726,7 @@ pub fn webTool(
     // which one this call talks to: a handle-less call that fell
     // through to another route's tab would otherwise drive the wrong
     // helper and read as "no view with that id".
-    drv = pick(backend, view.pane);
+    drv = pick(backend, view.pane) catch return webGuiUnavailable(arena);
     // Whatever a call addresses becomes what the NEXT handle-less call
     // means. GUI mode takes focus from the GUI, which owns it.
     if (drv == .headless) drv.headless.setCurrent(view.pane);
@@ -3215,7 +3244,7 @@ fn profileResetTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value)
 /// browsing from an MCP call would be wrong (`web_network` is the GUI
 /// equivalent for the shield toggle).
 const GUI_POLICY_REFUSAL =
-    "a sketerm GUI is attached, so web tools drive the user's real tabs; enforced network policy is a headless-only feature (web_network toggles the GUI's content blocking). Run this MCP server without --shared/--socket for policies.";
+    "a sketerm GUI is attached, so web tools drive the user's real tabs; enforced network policy is a headless-only feature (web_network toggles the GUI's content blocking). Run this MCP server without " ++ GUI_ATTACH_WAYS ++ " for policies.";
 
 const PolicyParse = union(enum) { none, policy: webdrive.NetPolicyPatch, err: Fail };
 
@@ -3595,7 +3624,7 @@ fn scrollTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view:
 }
 
 const GUI_ONLY_HEADLESS =
-    "this tool drives the server's own headless browser engine; a GUI is attached, so the view is the user's real pane (keyboard and size belong to the GUI there). Run this MCP server without --shared/--socket for a headless view";
+    "this tool drives the server's own headless browser engine; a GUI is attached, so the view is the user's real pane (keyboard and size belong to the GUI there). Run this MCP server without " ++ GUI_ATTACH_WAYS ++ " for a headless view";
 
 /// Named trusted key input: the same `input_key` frames a GUI
 /// keystroke rides, so Tab order, Escape and Enter are testable.
@@ -4826,6 +4855,57 @@ test "a headless tor route resolves to the tor engine, via: does not resolve at 
     try t.expect(!headlessRouteSupported(.remote_browser));
     try t.expect(headlessRouteSupported(.direct));
     try t.expect(headlessRouteSupported(.tor));
+}
+
+/// Scripted web_gui side effects for the fail-closed test: no GUI
+/// runs, none can be started, and a spawn attempt is counted.
+const NoGuiOps = struct {
+    var spawns: u32 = 0;
+    fn alive(_: *anyopaque, _: [:0]const u8) bool {
+        return false;
+    }
+    fn discover(_: *anyopaque, _: std.mem.Allocator) ?[:0]u8 {
+        return null;
+    }
+    fn spawn(_: *anyopaque) bool {
+        spawns += 1;
+        return false;
+    }
+    fn sleepMs(_: *anyopaque, _: u32) void {}
+    fn nowMs(_: *anyopaque) i64 {
+        return 0;
+    }
+    var ctx: u8 = 0;
+    const ops = mcp.mcp_webgui.Ops{ .ctx = @ptrCast(&ctx), .alive = alive, .discover = discover, .spawn = spawn, .sleepMs = sleepMs, .nowMs = nowMs };
+};
+
+test "web_gui grant fails CLOSED: an unreachable GUI is unavailable, never a headless view" {
+    const t = std.testing;
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var fake = ScriptedBackend{ .responses = &.{}, .allocator = t.allocator };
+    defer fake.deinit();
+
+    mcp.mcp_webgui.configure(t.allocator, .{ .granted = true, .source = .flag }, NoGuiOps.ops);
+    defer mcp.mcp_webgui.shutdown();
+    try t.expect(guiDrivesWeb());
+    try t.expect(!mcp.guiSocketAttached());
+    try t.expectError(error.WebGuiUnavailable, pick(fake.backend(), null));
+    try t.expectEqual(@as(u32, 1), NoGuiOps.spawns);
+
+    // Through the tool itself: a typed refusal with the reason, and no
+    // request reached any backend.
+    const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"url\":\"https://example.com/\"}", .{});
+    const out = try webTool(arena, fake.backend(), "web_open", args);
+    try t.expect(std.mem.indexOf(u8, out, "\"isError\":true") != null);
+    try t.expect(std.mem.indexOf(u8, out, "\"code\":\"unavailable\"") != null);
+    try t.expect(std.mem.indexOf(u8, out, "nothing was opened headlessly") != null);
+    try t.expectEqual(@as(usize, 0), fake.requests.items.len);
+    // The GUI-mode preflights read the grant too.
+    try t.expectEqual(RouteSupport.gui, routeCapability(true));
+    try t.expect(!profileCapability(arena).available);
+    try t.expect(std.mem.indexOf(u8, profileCapability(arena).reason, "web_gui") != null);
 }
 
 test "capabilities schema: web_routes enum is RouteSupport, drift-tested" {

@@ -186,6 +186,53 @@ but a page owns its own DOM and can label a "Confirm payment" button
 "Cancel". No server can adjudicate that, which is why `web_act` reports
 what it clicked instead of refusing on content grounds.
 
+### Your own browser: the `web_gui` grant
+
+In the default isolated mode the web tools run a PRIVATE
+`sketerm-webengine` with its own cookie jar under
+`$XDG_STATE_HOME/sketerm/web-profiles/<instance>/`, so the assistant is
+logged in nowhere the user is. `--shared` is not the answer to that: it
+hands every tool the user's daemon and GUI. The `web_gui` grant scopes
+the user's own browser to the `web_*` tools alone; terminal, app, file
+and panel tools keep the private daemon.
+
+The setting has one name in three places, lowest precedence first:
+
+| Source | Form | `web_gui_source` |
+| --- | --- | --- |
+| config.conf | `web_gui = true` in `[mcp]` (every run) or in the `[mcp.<name>]` that `--profile <name>` selects (a profile that omits the key inherits `[mcp]`) | `config` |
+| environment | `SKETERM_MCP_WEB_GUI=1` (or `0` to override a config grant; anything else refuses to start, exit 2) | `env` |
+| flag | `sketerm mcp --web-gui` | `flag` |
+
+What it does, and the three rules a consumer can rely on:
+
+- **Lazy.** Nothing is discovered or spawned until the first `web_*`
+  call; `capabilities` never touches the GUI. A session that never
+  browses never starts a browser.
+- **Discover, else spawn.** The first web call looks for a running
+  sketerm GUI's control socket (`$SKETERM_SOCKET` when the server runs
+  inside a pane, else any live `$XDG_RUNTIME_DIR/sketerm/<pid>.sock`;
+  any window can host a web tab, so two GUIs are not "ambiguous" here).
+  With none running it starts `sketerm web` DETACHED (double-forked,
+  its own session, stdio on /dev/null -- the MCP's stdio is the
+  JSON-RPC stream) and waits up to 15s for its socket. The executable
+  is this sketerm binary; `SKETERM_GUI_BIN=<path>` names another,
+  started as `<path> web` (the smoke rig's fake GUI uses it). A GUI that
+  disappears mid-session is found or started again on the next call.
+- **Fails closed.** When no GUI can be reached the call answers
+  `unavailable` with the reason; it never falls back to the private
+  headless jar, because a quietly not-logged-in browser is exactly the
+  bug the grant exists to fix.
+
+`capabilities` reports `web_gui` (bool), `web_gui_source`
+(`none|config|env|flag`) and `web_gui_transport`
+(`none|discovered|spawned|explicit` -- `explicit` when a server-wide
+`--socket`/`--shared` socket serves the web tools as before), with
+`web_backend: gui` while granted. Under the grant the GUI-mode rules
+apply: `profile:`/`ephemeral`, `policy`, `accept_cert`, `web_key`,
+`web_resize` are refused as headless-only features, and the refusal
+names the grant.
+
 ## Panels (`ui_*`)
 
 `ui_show` renders a declarative document as native GTK widgets inside

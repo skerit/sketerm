@@ -211,6 +211,7 @@ comptime {
     _ = @import("ipc/mcp_app.zig");
     _ = @import("ipc/mcp_term.zig");
     _ = @import("ipc/mcp_web.zig");
+    _ = @import("ipc/mcp_webgui.zig");
     _ = @import("ipc/paneldrive.zig");
     _ = @import("ipc/evkeys.zig");
     _ = @import("ipc/xkblayout.zig");

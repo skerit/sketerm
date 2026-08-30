@@ -129,7 +129,8 @@ first, and that is also the order rules are scanned in).
 | `[platform.<name>]` | anything the top level accepts, applied only on `<name>` (`linux`, `macos`) |
 | `[domain.<name>]` | `host`, `transport` |
 | `[lsp.<name>]` | `command`, `args`, `languages`, `root_files`, `init_options`, `enabled` |
-| `[mcp.<name>]` | `tools` (an MCP tool-exposure policy; a different namespace from `[profile.<name>]`) |
+| `[mcp]` | `tools`, `web_gui` (defaults for every `sketerm mcp` run) |
+| `[mcp.<name>]` | `tools`, `web_gui` (an MCP profile selected with `--profile`; a different namespace from `[profile.<name>]`) |
 
 A section header with an unrecognised prefix warns and leaves the
 following lines in the no-section (top level) state, so an unknown
@@ -920,24 +921,34 @@ built-in: a section that silently inherited half its fields from a
 built-in that later changed would quietly change behaviour on
 upgrade. See `docs/lsp.md` for the client itself.
 
-## `[mcp.<name>]` -- named MCP tool-exposure policies
+## `[mcp]` and `[mcp.<name>]` -- MCP server defaults and named profiles
 
-A reusable tool subset for `sketerm mcp --profile <name>`, so several
-assistants can share one machine with different reach. The section
-namespace is `mcp.`, not `profile.`: `[profile.<name>]` is a pane
-settings bundle and the two have nothing in common.
+`[mcp]` holds defaults every `sketerm mcp` run reads. `[mcp.<name>]`
+is a reusable profile for `sketerm mcp --profile <name>`, so several
+assistants can share one machine with different reach; a key a profile
+states overrides the `[mcp]` value, a key it omits inherits it. The
+section namespace is `mcp.`, not `profile.`: `[profile.<name>]` is a
+pane settings bundle and the two have nothing in common.
 
 | Key | Type | Notes |
 | --- | --- | --- |
 | `tools` | string | Tool-exposure spec. Grammar and group names in `docs/mcp.md`. Empty = every tool. |
+| `web_gui` | bool | Let the `web_*` tools (and ONLY those) use your own browser and logins: a running sketerm GUI, or `sketerm web` started for them. Default false = a private headless browser with its own empty cookie jar. See "Your own browser" in `docs/mcp.md`. |
 
 ```
+[mcp]
+web_gui = true
+
 [mcp.wayland]
 tools = app, files:ro
 
 [mcp.safe]
 tools = -run_command, -file_delete_tree
+web_gui = false
 ```
+
+Both keys are overridden by the environment (`SKETERM_MCP_TOOLS`,
+`SKETERM_MCP_WEB_GUI`) and those by the flags (`--tools`, `--web-gui`).
 
 The spec is NOT validated at config-parse time -- `src/config.zig` is
 compiled into `sketerm-mux` and must not depend on the MCP tool table.

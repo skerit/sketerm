@@ -558,6 +558,14 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 return fakeWebengine(allocator, std.mem.span(init.args.vector[i + 1]));
         }
     }
+    // The web_gui stage points SKETERM_GUI_BIN at THIS binary: invoked
+    // as `<bin> web` (the browser identity `sketerm mcp` spawns) it
+    // stands in for a GUI's control socket, so the spawn path is
+    // provable with no display.
+    if (c.getenv(FAKE_GUI_ENV)) |rt_dir| {
+        if (init.args.vector.len >= 2 and std.mem.eql(u8, std.mem.span(init.args.vector[1]), "web"))
+            return fakeGui(std.mem.span(rt_dir));
+    }
 
     // `--web-bin <path>`: the helper THIS build produced, handed over by
     // build.zig. Without it the stages fall back to the installed
@@ -589,6 +597,13 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const home = std.fmt.bufPrintZ(&home_buf, "{s}/home", .{rt}) catch return 1;
     _ = c.mkdir(home.ptr, 0o700);
     _ = c.setenv("HOME", home.ptr, 1);
+    // `sketerm mcp` reads config.conf on every start (tool policy and
+    // the web_gui grant); the developer's real one must not decide a
+    // smoke's verdicts.
+    var cfg_home_buf: [280]u8 = undefined;
+    const cfg_home = std.fmt.bufPrintZ(&cfg_home_buf, "{s}/config", .{rt}) catch return 1;
+    _ = c.mkdir(cfg_home.ptr, 0o700);
+    _ = c.setenv("XDG_CONFIG_HOME", cfg_home.ptr, 1);
     clearInheritedOrigin();
     g_rt = rt;
     defer killDaemonsUnderRt(rt, allocator);
@@ -2075,6 +2090,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     webPolicyFakeStage(allocator, exe, rt);
     say("smoke-mcp: enforced network policy (fake helper) ok");
 
+    // -- the web_gui grant: the user's OWN browser for web_* only --
+    webGuiGrantStage(allocator, exe, rt);
+    say("smoke-mcp: web_gui grant (discover, spawn, fail closed) ok");
+
     // ── web_* headless: isolated mode, NO GUI, no --shared ─────────
     //
     // The regression this guards: the web tools once hard-failed with
@@ -2114,6 +2133,441 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     say("smoke-mcp: PASS");
     return 0;
+}
+
+// -- the web_gui grant ------------------------------------------------
+
+/// Env that turns this binary, run as `<bin> web`, into a fake GUI
+/// control socket under the named runtime dir.
+const FAKE_GUI_ENV = "SKETERM_SMOKE_FAKE_GUI";
+
+/// A stand-in `sketerm web`: binds `<rt>/sketerm/<pid>.sock` (exactly
+/// where a GUI publishes its control socket), records its pid and
+/// every request line it answers, and serves `web-list`/`web-open`
+/// for a while. It also writes to ITS stdout at start and notes
+/// whether the daemon idle-exit hint reached it, so the stage can
+/// prove the spawn neither inherited the MCP's JSON-RPC stream nor
+/// leaked the private-daemon setting toward the user's real one.
+fn fakeGui(rt: []const u8) u8 {
+    _ = c.write(1, "FAKE-GUI-STDOUT-LEAK\n", 21);
+    var dir_buf: [300]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return 1;
+    _ = c.mkdir(dir.ptr, 0o700);
+    var sock_buf: [340]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/{d}.sock", .{ dir, c.getpid() }) catch return 1;
+    var log_buf: [340]u8 = undefined;
+    const log_path = std.fmt.bufPrintZ(&log_buf, "{s}/fakegui-{d}.log", .{ rt, c.getpid() }) catch return 1;
+    const log = c.fopen(log_path.ptr, "w") orelse return 1;
+    defer _ = c.fclose(log);
+    {
+        var line: [200]u8 = undefined;
+        const s = std.fmt.bufPrint(&line, "idle_exit={s}\n", .{if (c.getenv(muxclient.Conn.IDLE_EXIT_ENV)) |v| std.mem.span(@as([*:0]const u8, v)) else "<absent>"}) catch return 1;
+        _ = c.fwrite(s.ptr, 1, s.len, log);
+        _ = c.fflush(log);
+    }
+    var pids_buf: [340]u8 = undefined;
+    const pids_path = std.fmt.bufPrintZ(&pids_buf, "{s}/fakegui.pids", .{rt}) catch return 1;
+    if (c.fopen(pids_path.ptr, "a")) |pf| {
+        var line: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&line, "{d}\n", .{c.getpid()}) catch return 1;
+        _ = c.fwrite(s.ptr, 1, s.len, pf);
+        _ = c.fclose(pf);
+    }
+
+    var addr = std.mem.zeroes(c.struct_sockaddr_un);
+    if (sock.len + 1 > addr.sun_path.len) return 1;
+    addr.sun_family = c.AF_UNIX;
+    @memcpy(addr.sun_path[0..sock.len], sock);
+    const lfd = c.socket(c.AF_UNIX, c.SOCK_STREAM, 0);
+    if (lfd < 0) return 1;
+    if (c.bind(lfd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) return 1;
+    if (c.listen(lfd, 8) != 0) return 1;
+    defer _ = c.unlink(sock.ptr);
+
+    var next_pane: u32 = 41;
+    var open_urls: [8][512]u8 = undefined;
+    var open_lens: [8]usize = @splat(0);
+    var open_n: usize = 0;
+    const deadline = nowMs() + 90_000;
+    while (nowMs() < deadline) {
+        var pfd = c.struct_pollfd{ .fd = lfd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, 200) <= 0) continue;
+        const fd = c.accept(lfd, null, null);
+        if (fd < 0) continue;
+        defer _ = c.close(fd);
+        var req: [8192]u8 = undefined;
+        var req_len: usize = 0;
+        const line_deadline = nowMs() + 2_000;
+        while (std.mem.indexOfScalar(u8, req[0..req_len], '\n') == null and nowMs() < line_deadline) {
+            var cp = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&cp, 1, 100) <= 0) continue;
+            const n = c.read(fd, req[req_len..].ptr, req.len - req_len);
+            if (n <= 0) break;
+            req_len += @intCast(n);
+        }
+        // A liveness probe connects and sends nothing: not a request.
+        if (req_len == 0) continue;
+        const line = req[0..req_len];
+        _ = c.fwrite(line.ptr, 1, line.len, log);
+        if (line[line.len - 1] != '\n') _ = c.fwrite("\n", 1, 1, log);
+        _ = c.fflush(log);
+        var out: [8192]u8 = undefined;
+        var w = std.Io.Writer.fixed(&out);
+        if (std.mem.indexOf(u8, line, "\"cmd\":\"web-list\"") != null) {
+            w.writeAll("{\"ok\":true,\"helper\":\"ready\",\"views\":[") catch return 1;
+            for (0..open_n) |i| {
+                if (i > 0) w.writeAll(",") catch return 1;
+                w.print("{{\"pane\":{d},\"view\":{d},\"url\":\"{s}\",\"title\":\"fake gui\",\"loading\":false,\"load_seq\":1,\"visible\":true,\"focused\":true}}", .{ 41 + i, 41 + i, open_urls[i][0..open_lens[i]] }) catch return 1;
+            }
+            w.writeAll("]}") catch return 1;
+        } else if (std.mem.indexOf(u8, line, "\"cmd\":\"web-open\"") != null) {
+            const key = "\"data\":\"";
+            var url: []const u8 = "about:blank";
+            if (std.mem.indexOf(u8, line, key)) |at| {
+                const rest = line[at + key.len ..];
+                if (std.mem.indexOfScalar(u8, rest, '"')) |end| url = rest[0..end];
+            }
+            if (open_n < open_urls.len) {
+                const n = @min(url.len, 512);
+                @memcpy(open_urls[open_n][0..n], url[0..n]);
+                open_lens[open_n] = n;
+                open_n += 1;
+            }
+            w.print("{{\"ok\":true,\"pane\":{d}}}", .{next_pane}) catch return 1;
+            next_pane += 1;
+        } else {
+            w.writeAll("{\"ok\":false,\"error\":\"fake gui: unsupported command\"}") catch return 1;
+        }
+        w.writeAll("\n") catch return 1;
+        _ = c.write(fd, w.buffered().ptr, w.buffered().len);
+    }
+    return 0;
+}
+
+/// Start a fake GUI as our own child (the "already running" case) and
+/// wait for its control socket. Returns its pid.
+fn startFakeGui(self_exe: [*:0]const u8, rt: [:0]const u8) c.pid_t {
+    const pid = c.fork();
+    if (pid < 0) fail("fake gui fork");
+    if (pid == 0) {
+        _ = c.setenv(FAKE_GUI_ENV, rt.ptr, 1);
+        const devnull = c.open("/dev/null", c.O_RDWR);
+        if (devnull >= 0) {
+            _ = c.dup2(devnull, 1);
+            _ = c.close(devnull);
+        }
+        var argv: [3:null]?[*:0]const u8 = .{ self_exe, "web", null };
+        _ = c.execv(self_exe, @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    var sock_buf: [340]u8 = undefined;
+    const sock = std.fmt.bufPrint(&sock_buf, "{s}/sketerm/{d}.sock", .{ rt, pid }) catch unreachable;
+    const deadline = nowMs() + 10_000;
+    while (!fileExists(sock)) {
+        if (nowMs() > deadline) fail("fake gui never published its control socket");
+        _ = c.usleep(50_000);
+    }
+    return pid;
+}
+
+/// Read `<rt>/fakegui-<pid>.log` (the fake GUI's request journal).
+fn fakeGuiLog(rt: []const u8, pid: c.pid_t, buf: []u8) []const u8 {
+    var p_buf: [340]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&p_buf, "{s}/fakegui-{d}.log", .{ rt, pid }) catch return "";
+    const f = c.fopen(p.ptr, "rb") orelse return "";
+    defer _ = c.fclose(f);
+    const n = c.fread(buf.ptr, 1, buf.len, f);
+    return buf[0..n];
+}
+
+/// Pids the fake GUIs appended to `<rt>/fakegui.pids`, newest last.
+fn fakeGuiPids(rt: []const u8, out: []c.pid_t) []const c.pid_t {
+    var p_buf: [340]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&p_buf, "{s}/fakegui.pids", .{rt}) catch return out[0..0];
+    const f = c.fopen(p.ptr, "rb") orelse return out[0..0];
+    defer _ = c.fclose(f);
+    var buf: [4096]u8 = undefined;
+    const n = c.fread(&buf, 1, buf.len, f);
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, buf[0..n], '\n');
+    while (it.next()) |line| {
+        if (line.len == 0 or count >= out.len) continue;
+        out[count] = std.fmt.parseInt(c.pid_t, line, 10) catch continue;
+        count += 1;
+    }
+    return out[0..count];
+}
+
+/// Kill one fake GUI by its exact pid (our own child or a detached
+/// descendant; never by name) and remove its socket.
+fn stopFakeGui(rt: []const u8, pid: c.pid_t) void {
+    _ = c.kill(pid, c.SIGKILL);
+    _ = c.waitpid(pid, null, 0);
+    var sock_buf: [340]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/sketerm/{d}.sock", .{ rt, pid }) catch return;
+    _ = c.unlink(sock.ptr);
+}
+
+/// Write `<rt>/config/sketerm/config.conf`.
+fn writeSmokeConfig(rt: []const u8, body: []const u8) void {
+    var dir_buf: [340]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/config/sketerm", .{rt}) catch fail("config path");
+    _ = c.mkdir(dir.ptr, 0o700);
+    var p_buf: [360]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&p_buf, "{s}/config.conf", .{dir}) catch fail("config path");
+    const f = c.fopen(p.ptr, "w") orelse fail("cannot write smoke config.conf");
+    _ = c.fwrite(body.ptr, 1, body.len, f);
+    _ = c.fclose(f);
+}
+
+fn removeSmokeConfig(rt: []const u8) void {
+    var p_buf: [360]u8 = undefined;
+    const p = std.fmt.bufPrintZ(&p_buf, "{s}/config/sketerm/config.conf", .{rt}) catch return;
+    _ = c.unlink(p.ptr);
+}
+
+/// The three web_gui facts, exactly as `capabilities` writes them.
+fn expectWebGuiFacts(caps: []const u8, granted: bool, source: []const u8, transport: []const u8, comptime what: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buf, "\"web_gui\":{s},\"web_gui_source\":\"{s}\",\"web_gui_transport\":\"{s}\"", .{ if (granted) "true" else "false", source, transport }) catch unreachable;
+    if (std.mem.indexOf(u8, caps, needle) == null) {
+        std.debug.print("smoke-mcp: capabilities: {s}\n", .{caps});
+        fail("capabilities web_gui facts wrong: " ++ what);
+    }
+}
+
+/// One granted server against a RUNNING fake GUI: capabilities carries
+/// the grant lazily (transport none, no connection yet), then web_open
+/// lands on the GUI socket and the transport reads discovered.
+fn webGuiOpenThroughGui(m: *Mcp, rt: []const u8, gui_pid: c.pid_t, source: []const u8, comptime what: []const u8) void {
+    // The GUI journal is cumulative across the servers of this stage,
+    // so every assertion is on what THIS server added to it.
+    var log_buf: [16384]u8 = undefined;
+    const journal_before = fakeGuiLog(rt, gui_pid, &log_buf).len;
+    m.initialize();
+    const before = m.callTool("capabilities", "{}");
+    expectWebGuiFacts(before, true, source, "none", what ++ " (before any web call)");
+    if (std.mem.indexOf(u8, before, "\"web_backend\":\"gui\"") == null)
+        fail("granted server did not report web_backend gui: " ++ what);
+    if (fakeGuiLog(rt, gui_pid, &log_buf).len != journal_before)
+        fail("capabilities touched the GUI socket (the transport must be lazy): " ++ what);
+
+    const url = "http://grant.example/" ++ what;
+    const opened = m.callTool("web_open", "{\"url\":\"" ++ url ++ "\",\"snapshot\":\"none\"}");
+    if (std.mem.indexOf(u8, opened, "isError") != null or
+        std.mem.indexOf(u8, opened, "\"pane\":") == null or
+        std.mem.indexOf(u8, opened, "\"backend\":\"gui\"") == null)
+    {
+        std.debug.print("smoke-mcp: web_open: {s}\n", .{opened});
+        fail("web_open under the grant did not open a GUI pane: " ++ what);
+    }
+    const log = fakeGuiLog(rt, gui_pid, &log_buf)[journal_before..];
+    if (std.mem.indexOf(u8, log, "\"cmd\":\"web-open\"") == null or
+        std.mem.indexOf(u8, log, url) == null)
+        fail("the fake GUI never received web-open: " ++ what);
+    const after = m.callTool("capabilities", "{}");
+    expectWebGuiFacts(after, true, source, "discovered", what ++ " (after web_open)");
+}
+
+fn webGuiGrantStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) void {
+    var self_buf: [4096]u8 = undefined;
+    const self_n = c.readlink("/proc/self/exe", &self_buf, self_buf.len - 1);
+    if (self_n <= 0) fail("readlink /proc/self/exe");
+    self_buf[@intCast(self_n)] = 0;
+    const self_exe: [*:0]const u8 = @ptrCast(&self_buf);
+    // The web tools need a helper PATH to report a backend at all;
+    // nothing here runs it (the GUI is what would), so any executable
+    // stands in and no CEF is needed.
+    _ = c.setenv("SKETERM_WEB_BIN", "/bin/true", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_BIN");
+    defer _ = c.unsetenv(mcpWebGuiEnv());
+    defer _ = c.unsetenv("SKETERM_GUI_BIN");
+    defer removeSmokeConfig(rt);
+
+    var log_buf: [16384]u8 = undefined;
+
+    // A: no grant, GUI running -> nothing changes: the facts are the
+    // pre-grant ones and the GUI socket is never approached.
+    const running = startFakeGui(self_exe, rt);
+    {
+        var m = Mcp.spawn(allocator, exe, &.{});
+        m.initialize();
+        const caps = m.callTool("capabilities", "{}");
+        expectWebGuiFacts(caps, false, "none", "none", "no grant");
+        if (std.mem.indexOf(u8, caps, "\"web_backend\":\"gui\"") != null)
+            fail("without the grant the web backend must not be the user's GUI");
+        if (std.mem.indexOf(u8, caps, "web_gui: not granted") == null)
+            fail("capabilities text lane did not say how to grant web_gui");
+        m.closeStdinWait();
+        if (std.mem.indexOf(u8, fakeGuiLog(rt, running, &log_buf), "\"cmd\"") != null)
+            fail("an ungranted server connected to the user's GUI");
+    }
+
+    // B: granted via each source, GUI running.
+    {
+        var m = Mcp.spawn(allocator, exe, &.{"--web-gui"});
+        webGuiOpenThroughGui(&m, rt, running, "flag", "--web-gui");
+        // The OTHER tools stay on the private daemon: a terminal and an
+        // app land there, and the GUI journal gains nothing.
+        var before_buf: [16384]u8 = undefined;
+        const gui_before = fakeGuiLog(rt, running, &before_buf);
+        const term = m.callTool("term_open", "{\"command\":[\"/bin/sh\"],\"cols\":80,\"rows\":24}");
+        if (std.mem.indexOf(u8, term, "opened headless terminal") == null) fail("term_open under the grant did not open a headless terminal");
+        const app = m.callTool("launch_app", "{\"command\":[\"/bin/sh\",\"-c\",\"sleep 30\"],\"wait_for\":\"exit\",\"wait_ms\":100,\"stable_ms\":0}");
+        if (std.mem.indexOf(u8, app, "\"app\":1") == null or std.mem.indexOf(u8, app, "\"exited\":false") == null)
+            fail("launch_app under the grant did not run on the private daemon");
+        var private_buf: [512]u8 = undefined;
+        const private_sock = std.fmt.bufPrint(&private_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ rt, m.pid }) catch unreachable;
+        if (!fileExists(private_sock)) fail("the grant made the terminal/app tools leave the private daemon");
+        const gui_after = fakeGuiLog(rt, running, &log_buf);
+        if (gui_after.len != gui_before.len)
+            fail("a terminal or app tool reached the user's GUI under the web-only grant");
+        if (std.mem.indexOf(u8, gui_after, "term") != null or std.mem.indexOf(u8, gui_after, "launch") != null)
+            fail("the GUI journal shows a non-web command");
+        // Profiles are refused in GUI mode, and the refusal names the
+        // grant rather than only --shared.
+        const prof = m.callTool("web_open", "{\"url\":\"http://grant.example/p2\",\"profile\":\"work\"}");
+        if (std.mem.indexOf(u8, prof, "isError") == null or std.mem.indexOf(u8, prof, "web_gui grant") == null)
+            fail("the GUI-mode profile refusal did not name the web_gui grant");
+        _ = m.callTool("close_app", "{\"app\":1}");
+        m.closeStdinWait();
+    }
+    {
+        _ = c.setenv(mcpWebGuiEnv(), "1", 1);
+        var m = Mcp.spawn(allocator, exe, &.{});
+        webGuiOpenThroughGui(&m, rt, running, "env", "SKETERM_MCP_WEB_GUI=1");
+        m.closeStdinWait();
+        // env=0 beats a config grant.
+        writeSmokeConfig(rt, "[mcp]\nweb_gui = true\n");
+        _ = c.setenv(mcpWebGuiEnv(), "0", 1);
+        var off = Mcp.spawn(allocator, exe, &.{});
+        off.initialize();
+        expectWebGuiFacts(off.callTool("capabilities", "{}"), false, "env", "none", "env 0 over config true");
+        off.closeStdinWait();
+        _ = c.unsetenv(mcpWebGuiEnv());
+        // and the flag beats env=0.
+        _ = c.setenv(mcpWebGuiEnv(), "0", 1);
+        var flag = Mcp.spawn(allocator, exe, &.{"--web-gui"});
+        flag.initialize();
+        expectWebGuiFacts(flag.callTool("capabilities", "{}"), true, "flag", "none", "flag over env 0");
+        flag.closeStdinWait();
+        _ = c.unsetenv(mcpWebGuiEnv());
+    }
+    {
+        writeSmokeConfig(rt, "[mcp]\nweb_gui = true\n");
+        var m = Mcp.spawn(allocator, exe, &.{});
+        webGuiOpenThroughGui(&m, rt, running, "config", "config [mcp] without --profile");
+        m.closeStdinWait();
+    }
+    {
+        writeSmokeConfig(rt, "[mcp]\nweb_gui = false\n\n[mcp.assistant]\ntools = all\nweb_gui = true\n\n[mcp.quiet]\ntools = all\n");
+        var m = Mcp.spawn(allocator, exe, &.{ "--profile", "assistant" });
+        webGuiOpenThroughGui(&m, rt, running, "config", "config [mcp.assistant] via --profile");
+        m.closeStdinWait();
+        // A profile that does not state web_gui inherits the bare value.
+        var quiet = Mcp.spawn(allocator, exe, &.{ "--profile", "quiet" });
+        quiet.initialize();
+        expectWebGuiFacts(quiet.callTool("capabilities", "{}"), false, "config", "none", "[mcp.quiet] inherits [mcp] false");
+        quiet.closeStdinWait();
+        removeSmokeConfig(rt);
+    }
+    // A bad env value is a startup error, like a bad tool policy.
+    {
+        _ = c.setenv(mcpWebGuiEnv(), "maybe", 1);
+        var bad = Mcp.spawn(allocator, exe, &.{});
+        _ = c.unsetenv(mcpWebGuiEnv());
+        var st: c_int = 0;
+        const deadline = nowMs() + 10_000;
+        while (c.waitpid(bad.pid, &st, 1) != bad.pid) {
+            if (nowMs() > deadline) fail("mcp with a bad SKETERM_MCP_WEB_GUI value did not exit");
+            _ = c.usleep(50_000);
+        }
+        if (!(st & 0x7f == 0 and (st >> 8) & 0xff == 2)) fail("a bad SKETERM_MCP_WEB_GUI value must exit 2");
+        _ = c.close(bad.to_child);
+        _ = c.close(bad.from_child);
+        bad.rbuf.deinit(allocator);
+    }
+
+    // C: no GUI running -> the first web call SPAWNS `sketerm web`
+    // (detached, stdio not inherited), and a GUI that vanishes is
+    // spawned again on the next call.
+    stopFakeGui(rt, running);
+    _ = c.setenv("SKETERM_GUI_BIN", self_exe, 1);
+    _ = c.setenv(FAKE_GUI_ENV, rt.ptr, 1);
+    defer _ = c.unsetenv(FAKE_GUI_ENV);
+    {
+        var pid_buf: [32]c.pid_t = undefined;
+        const pids_before = fakeGuiPids(rt, &pid_buf).len;
+        var m = Mcp.spawn(allocator, exe, &.{"--web-gui"});
+        m.initialize();
+        expectWebGuiFacts(m.callTool("capabilities", "{}"), true, "flag", "none", "spawn path, before any web call");
+        if (fakeGuiPids(rt, &pid_buf).len != pids_before) fail("capabilities spawned a GUI (the transport must be lazy)");
+        const opened = m.callTool("web_open", "{\"url\":\"http://grant.example/spawned\",\"snapshot\":\"none\"}");
+        if (std.mem.indexOf(u8, opened, "\"jsonrpc\"") == null)
+            fail("the spawned GUI's stdout leaked into the MCP JSON-RPC stream");
+        if (std.mem.indexOf(u8, opened, "isError") != null or std.mem.indexOf(u8, opened, "\"pane\":") == null) {
+            std.debug.print("smoke-mcp: web_open (spawn): {s}\n", .{opened});
+            fail("web_open did not spawn a GUI and open through it");
+        }
+        const pids = fakeGuiPids(rt, &pid_buf);
+        if (pids.len != pids_before + 1) fail("web_open did not spawn exactly one GUI");
+        const spawned = pids[pids.len - 1];
+        expectWebGuiFacts(m.callTool("capabilities", "{}"), true, "flag", "spawned", "after the spawn");
+        const jl = fakeGuiLog(rt, spawned, &log_buf);
+        if (std.mem.indexOf(u8, jl, "idle_exit=<absent>") == null)
+            fail("the spawned GUI inherited the private-daemon idle-exit setting");
+        if (std.mem.indexOf(u8, jl, "grant.example/spawned") == null)
+            fail("the spawned GUI never received web-open");
+        // Reparented away from the MCP server: not our child either.
+        if (c.waitpid(spawned, null, 1) == spawned) fail("the spawned GUI was not detached");
+
+        // The GUI goes away mid-session: the next web call re-spawns.
+        stopFakeGui(rt, spawned);
+        const again = m.callTool("web_open", "{\"url\":\"http://grant.example/respawn\",\"snapshot\":\"none\"}");
+        if (std.mem.indexOf(u8, again, "isError") != null or std.mem.indexOf(u8, again, "\"pane\":") == null) {
+            std.debug.print("smoke-mcp: web_open (respawn): {s}\n", .{again});
+            fail("web_open after the GUI vanished did not re-spawn one");
+        }
+        const pids2 = fakeGuiPids(rt, &pid_buf);
+        if (pids2.len != pids_before + 2) fail("the vanished GUI was not replaced by exactly one spawn");
+        expectWebGuiFacts(m.callTool("capabilities", "{}"), true, "flag", "spawned", "after the re-spawn");
+        m.closeStdinWait();
+        stopFakeGui(rt, pids2[pids2.len - 1]);
+    }
+
+    // D: granted, no GUI, and none can be started -> the call fails
+    // CLOSED with the described 'unavailable' error; no headless view.
+    {
+        _ = c.setenv("SKETERM_GUI_BIN", "/bin/true", 1);
+        var m = Mcp.spawn(allocator, exe, &.{"--web-gui"});
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"http://grant.example/never\",\"snapshot\":\"none\"}");
+        const refused = m.recvLine(40_000);
+        if (std.mem.indexOf(u8, refused, "\"isError\":true") == null or
+            std.mem.indexOf(u8, refused, "\"code\":\"unavailable\"") == null or
+            std.mem.indexOf(u8, refused, "within 15s") == null or
+            std.mem.indexOf(u8, refused, "nothing was opened headlessly") == null or
+            std.mem.indexOf(u8, refused, "\"pane\":") != null or
+            std.mem.indexOf(u8, refused, "\"view\":") != null)
+        {
+            std.debug.print("smoke-mcp: web_open (no GUI): {s}\n", .{refused});
+            fail("a granted server with no reachable GUI did not fail closed");
+        }
+        expectWebGuiFacts(m.callTool("capabilities", "{}"), true, "flag", "none", "after the failed spawn");
+        // The private instance dir holds no helper socket: no headless
+        // engine was started as a fallback.
+        var web_sock_buf: [512]u8 = undefined;
+        const web_sock = std.fmt.bufPrint(&web_sock_buf, "{s}/sketerm/mcp-tmp-{d}/web.sock", .{ rt, m.pid }) catch unreachable;
+        if (fileExists(web_sock)) fail("a headless helper was started despite the grant");
+        m.closeStdinWait();
+    }
+}
+
+/// The env switch `sketerm mcp` reads (`mcp_webgui.ENV`); a literal
+/// because this GTK-free binary cannot import that module. The stage
+/// proves the name by behaviour: a wrong one fails the env cases.
+fn mcpWebGuiEnv() [*:0]const u8 {
+    return "SKETERM_MCP_WEB_GUI";
 }
 
 /// The `[id]` immediately preceding `needle` on its snapshot line —

@@ -31,6 +31,8 @@ pub const panelstore = @import("panelstore.zig");
 const paneldrive = @import("paneldrive.zig");
 const panelrpc = @import("../mux/panelrpc.zig");
 const mcp_registry = @import("mcp_registry.zig");
+pub const mcp_webgui = @import("mcp_webgui.zig");
+const Config = @import("../config.zig").Config;
 const paneldoc = @import("../ui/panel/doc.zig");
 pub const shellquote = @import("../util/shellquote.zig");
 pub const pattern = @import("../util/pattern.zig");
@@ -38,7 +40,7 @@ const wire = @import("../mux/wire.zig");
 
 const MCP_HELP =
     \\Usage: sketerm mcp [--shared | --durable | --name NAME] [--socket PATH]
-    \\                   [--log DIR] [--tools SPEC | --profile NAME]
+    \\                   [--log DIR] [--tools SPEC | --profile NAME] [--web-gui]
     \\
     \\Runs a Model Context Protocol server on stdio. Register it in an
     \\MCP client (Claude Code, etc.) as command "sketerm" with args
@@ -132,6 +134,24 @@ const MCP_HELP =
     \\Withheld tools are absent from tools/list AND refused by
     \\tools/call, with an error naming the term that would enable them.
     \\
+    \\Your own browser for the web_* tools: by default (isolated) they
+    \\run a PRIVATE sketerm-webengine with its own empty cookie jar, so
+    \\the assistant is logged in nowhere. Grant it your real browser --
+    \\ONLY the web_* tools; terminal/app/file/panel tools stay on the
+    \\private daemon (this is not --shared):
+    \\  --web-gui      highest precedence
+    \\  $SKETERM_MCP_WEB_GUI=1|0  overrides config, overridden by the flag
+    \\  web_gui = true in config.conf's [mcp] section (every run) or in
+    \\                 the [mcp.NAME] section --profile NAME selects
+    \\At the FIRST web call a running sketerm GUI is found (any live
+    \\window can host a tab), or `sketerm web` is started detached and
+    \\waited for; a GUI that disappears is found or started again on
+    \\the next call. With no GUI reachable the call fails with
+    \\'unavailable' -- never a private headless view. capabilities
+    \\reports web_gui / web_gui_source / web_gui_transport.
+    \\  $SKETERM_GUI_BIN  executable started as `<bin> web` when none
+    \\                 is running (default: this sketerm binary)
+    \\
 ;
 
 /// Both live in `src/version.zig`: our own version so a release bump
@@ -177,6 +197,9 @@ pub const Opts = struct {
     tools: ?[]const u8 = null,
     /// `--profile <name>`: a `[mcp.<name>]` section in config.conf.
     profile: ?[]const u8 = null,
+    /// `--web-gui`: the web_* tools may use the user's own browser
+    /// (see mcp_webgui.zig); highest-precedence source of that grant.
+    web_gui: bool = false,
 
     pub const ParseError = error{ UnknownFlag, MissingValue, BadName, SharedConflict };
 
@@ -214,6 +237,8 @@ pub const Opts = struct {
                 o.profile = args[i];
             } else if (std.mem.eql(u8, a, "--no-record")) {
                 o.no_record = true;
+            } else if (std.mem.eql(u8, a, mcp_webgui.FLAG)) {
+                o.web_gui = true;
             } else if (std.mem.eql(u8, a, "--help")) {
                 o.help = true;
             } else {
@@ -598,32 +623,42 @@ fn installQuitSignals() void {
 /// that is freed right after parsing).
 const OwnedPolicy = struct { spec: []u8, source: []u8 };
 
-/// Resolve the tool exposure policy, lowest precedence first:
-/// `[mcp.<name>]` from config.conf, then $SKETERM_MCP_TOOLS, then
-/// `--tools`. Sets `policy`/`policy_source`; returns the owned strings
-/// (null when nothing narrowed the tool set). Every failure prints a
-/// complete diagnostic and returns an error — a bad spec must never
-/// degrade into "everything" or into a silently missing group.
-fn resolveToolPolicy(allocator: std.mem.Allocator, opts: Opts) error{BadPolicy}!?OwnedPolicy {
+/// The `[mcp.<name>]` record `--profile` names, or a printed
+/// diagnostic and an error: silently running unrestricted would be the
+/// worst outcome.
+fn mcpProfileRecord(cfg: *const Config, name: []const u8) error{BadPolicy}!*const @import("../config.zig").McpProfile {
+    return cfg.mcpProfile(name) orelse {
+        var msg_buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: --profile {s}: no [mcp.{s}] section in config.conf\n  add one, e.g.:\n    [mcp.{s}]\n    tools = app, files:ro\n", .{ name, name, name }) catch "sketerm mcp: unknown --profile\n";
+        _ = c.fputs(msg.ptr, platform.stderr());
+        return error.BadPolicy;
+    };
+}
+
+/// Resolve the tool exposure policy, lowest precedence first: the
+/// bare `[mcp]` section, `[mcp.<name>]` from config.conf, then
+/// $SKETERM_MCP_TOOLS, then `--tools`. Sets `policy`/`policy_source`;
+/// returns the owned strings (null when nothing narrowed the tool
+/// set). Every failure prints a complete diagnostic and returns an
+/// error — a bad spec must never degrade into "everything" or into a
+/// silently missing group.
+fn resolveToolPolicy(allocator: std.mem.Allocator, opts: Opts, cfg: *const Config) error{BadPolicy}!?OwnedPolicy {
     var spec: []const u8 = "";
     var source: []const u8 = "none";
     var name_buf: [96]u8 = undefined;
-    var cfg_spec: []u8 = &.{};
-    defer allocator.free(cfg_spec);
 
+    // The config records live as long as `cfg`, which outlives this
+    // resolution; the survivors are duped below.
+    if (cfg.mcp.tools.len > 0) {
+        spec = cfg.mcp.tools;
+        source = "config [mcp]";
+    }
     if (opts.profile) |name| {
-        var cfg = @import("../config.zig").Config.load(allocator);
-        defer cfg.deinit();
-        const prof = cfg.mcpProfile(name) orelse {
-            var msg_buf: [512]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: --profile {s}: no [mcp.{s}] section in config.conf\n  add one, e.g.:\n    [mcp.{s}]\n    tools = app, files:ro\n", .{ name, name, name }) catch "sketerm mcp: unknown --profile\n";
-            _ = c.fputs(msg.ptr, platform.stderr());
-            return error.BadPolicy;
-        };
-        // The record dies with the config arena below.
-        cfg_spec = allocator.dupe(u8, prof.tools) catch return error.BadPolicy;
-        spec = cfg_spec;
-        source = std.fmt.bufPrint(&name_buf, "config [mcp.{s}]", .{name}) catch "config [mcp.*]";
+        const prof = try mcpProfileRecord(cfg, name);
+        if (prof.tools.len > 0) {
+            spec = prof.tools;
+            source = std.fmt.bufPrint(&name_buf, "config [mcp.{s}]", .{name}) catch "config [mcp.*]";
+        }
     }
     if (c.getenv("SKETERM_MCP_TOOLS")) |v| {
         spec = std.mem.span(@as([*:0]const u8, @ptrCast(v)));
@@ -660,6 +695,26 @@ fn resolveToolPolicy(allocator: std.mem.Allocator, opts: Opts) error{BadPolicy}!
     return .{ .spec = owned_spec, .source = owned_source };
 }
 
+/// The web_gui grant from its sources (`mcp_webgui.resolveGrant`),
+/// with the `[mcp.<name>]` half read from the same record the tool
+/// policy uses. A bad env value prints and errors, like a bad spec.
+fn resolveWebGuiGrant(opts: Opts, cfg: *const Config) error{BadPolicy}!mcp_webgui.Grant {
+    var prof_value: ?bool = null;
+    var prof_name: []const u8 = "";
+    if (opts.profile) |name| {
+        const prof = try mcpProfileRecord(cfg, name);
+        prof_value = prof.web_gui;
+        prof_name = name;
+    }
+    const env: ?[]const u8 = if (c.getenv(mcp_webgui.ENV)) |v| std.mem.span(@as([*:0]const u8, @ptrCast(v))) else null;
+    return mcp_webgui.resolveGrant(cfg.mcp.web_gui, prof_value, prof_name, env, opts.web_gui) catch {
+        var msg_buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrintZ(&msg_buf, "sketerm mcp: bad {s} value '{s}' (use 1/true/yes/on or 0/false/no/off)\n", .{ mcp_webgui.ENV, env orelse "" }) catch "sketerm mcp: bad SKETERM_MCP_WEB_GUI value\n";
+        _ = c.fputs(msg.ptr, platform.stderr());
+        return error.BadPolicy;
+    };
+}
+
 pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     const opts = Opts.parse(args) catch |err| {
         const msg = switch (err) {
@@ -676,16 +731,20 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         return 0;
     }
 
-    // Tool exposure policy, resolved BEFORE any daemon or socket work:
-    // a typo must cost one clear line on stderr, never a silently
-    // half-equipped server.
-    const policy_owned = resolveToolPolicy(allocator, opts) catch return 2;
+    // Tool exposure policy and the web_gui grant, resolved BEFORE any
+    // daemon or socket work: a typo must cost one clear line on
+    // stderr, never a silently half-equipped server. One config load
+    // serves both.
+    var cfg = Config.load(allocator);
+    defer cfg.deinit();
+    const policy_owned = resolveToolPolicy(allocator, opts, &cfg) catch return 2;
     defer if (policy_owned) |p| {
         allocator.free(p.spec);
         allocator.free(p.source);
         policy = .unrestricted;
         policy_source = "none";
     };
+    const web_gui_grant = resolveWebGuiGrant(opts, &cfg) catch return 2;
 
     if (opts.log_dir) |ld| {
         mcp_log = McpLog.open(allocator, ld) orelse {
@@ -765,13 +824,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     defer if (sock_path) |p| allocator.free(p);
     var real = RealBackend{ .sock_path = sock_path orelse "" };
     var stub = StubBackend{};
-    const backend = if (sock_path != null) Backend{
-        .ctx = @ptrCast(&real),
-        .talk = RealBackend.talk,
-        .talkFor = RealBackend.talkFor,
-        .sleepMs = RealBackend.sleepMs,
-        .nowMs = RealBackend.nowMs,
-    } else Backend{
+    const backend = if (sock_path != null) real.asBackend() else Backend{
         .ctx = @ptrCast(&stub),
         .talk = StubBackend.talk,
         .talkFor = StubBackend.talkFor,
@@ -830,6 +883,14 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
         @import("mcp_web.zig").configureHeadless(allocator, i.dir, opts.name, i.sock);
     }
     defer @import("mcp_web.zig").shutdownHeadless();
+    // The web_gui grant: the web_* tools alone may use the user's own
+    // browser. With a server-wide GUI socket already attached (--shared
+    // / --socket) they use it as they always did; otherwise the grant
+    // arms its own lazy discover-or-spawn transport.
+    srv_web_gui = web_gui_grant;
+    if (web_gui_grant.granted and sock_path == null)
+        mcp_webgui.configure(allocator, web_gui_grant, mcp_webgui.REAL_OPS);
+    defer mcp_webgui.shutdown();
 
     installQuitSignals();
 
@@ -865,11 +926,13 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             l.logNote(note);
         }
         var nbuf: [512]u8 = undefined;
-        const note = std.fmt.bufPrint(&nbuf, "mcp server started: pid={d} mode={s} name={s} gui_socket={s}", .{
+        const note = std.fmt.bufPrint(&nbuf, "mcp server started: pid={d} mode={s} name={s} gui_socket={s} web_gui={s} (from {s})", .{
             c.getpid(),
             if (opts.shared) "shared" else "isolated",
             opts.name orelse "-",
             sock_path orelse "-",
+            yesNo(web_gui_grant.granted),
+            web_gui_grant.source.name(),
         }) catch "mcp server started";
         l.logNote(note);
     }
@@ -936,8 +999,19 @@ const StubBackend = struct {
     }
 };
 
-const RealBackend = struct {
+pub const RealBackend = struct {
     sock_path: [:0]const u8,
+
+    /// The dispatch table over this socket. `self` must outlive it.
+    pub fn asBackend(self: *RealBackend) Backend {
+        return .{
+            .ctx = @ptrCast(self),
+            .talk = talk,
+            .talkFor = talkFor,
+            .sleepMs = sleepMs,
+            .nowMs = nowMs,
+        };
+    }
 
     fn talk(ctx: *anyopaque, allocator: std.mem.Allocator, line: []const u8) anyerror![]u8 {
         const self: *RealBackend = @ptrCast(@alignCast(ctx));
@@ -1802,13 +1876,27 @@ test "watchdog fs cancellation follows a replacement connection during one call"
 var srv_mode: []const u8 = "isolated";
 var srv_gui_socket: bool = false;
 
-/// Whether a direct GUI control socket is attached — the web tools'
-/// backend selector (GUI views vs the owned headless helper).
+/// Whether a SERVER-WIDE direct GUI control socket is attached
+/// (--shared / --socket): every GUI-backed tool uses it. The web tools
+/// additionally consult `mcp_webgui` (their own, grant-scoped socket).
 pub fn guiSocketAttached() bool {
     return srv_gui_socket;
 }
 const GuiSocketSource = enum { none, explicit, discovered };
 var srv_gui_socket_source: GuiSocketSource = .none;
+/// The resolved web_gui grant, granted or not, for `capabilities`.
+var srv_web_gui: mcp_webgui.Grant = .{};
+
+/// The web tools' GUI transport as `capabilities` reports it: the
+/// server-wide socket when one is attached, else the grant's own.
+fn webGuiTransport() mcp_webgui.Transport {
+    if (srv_gui_socket) return switch (srv_gui_socket_source) {
+        .explicit => .explicit,
+        .discovered => .discovered,
+        .none => .none,
+    };
+    return mcp_webgui.transport();
+}
 /// Independent from app_state: live panels follow their owning mux session,
 /// while app tools keep using the MCP instance's private daemon.
 var panel_pool: ?*paneldrive.Pool = null;
@@ -3697,9 +3785,12 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
         try res.text("app_read_text/app_wait_text need libtesseract — install tesseract + tesseract-data-eng on THIS machine");
 
     const helper = webHelperPath(arena);
+    // The web tools drive the user's GUI on a server-wide socket OR on
+    // the web_gui grant's own; both are "gui" to a consumer.
+    const gui_web = @import("mcp_web.zig").guiDrivesWeb();
     const web_backend: []const u8 = if (helper == null)
         "none"
-    else if (srv_gui_socket)
+    else if (gui_web)
         "gui"
     else if (std.mem.eql(u8, srv_mode, "shared"))
         "none"
@@ -3711,6 +3802,30 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     if (helper) |wp| try res.fact("web_helper", wp) else try res.raw("web_helper", "null");
     try res.fact("web", web_ok);
     try res.fact("web_backend", web_backend);
+    // The web_gui grant: permission, its source, and the socket state
+    // it holds NOW (lazy: none until the first web call, and never
+    // touched by this preflight).
+    try res.fact("web_gui", srv_web_gui.granted);
+    try res.fact("web_gui_source", srv_web_gui.source.name());
+    try res.fact("web_gui_transport", webGuiTransport().name());
+    if (srv_web_gui.granted) {
+        const via: []const u8 = switch (srv_web_gui.source) {
+            .config => if (srv_web_gui.profile.len > 0)
+                try std.fmt.allocPrint(arena, "config [mcp.{s}]", .{srv_web_gui.profile})
+            else
+                "config [mcp]",
+            .env => mcp_webgui.ENV,
+            .flag => mcp_webgui.FLAG,
+            .none => "none",
+        };
+        const sock_note: []const u8 = if (mcp_webgui.socketPath()) |p|
+            try std.fmt.allocPrint(arena, " ({s})", .{p})
+        else if (srv_gui_socket)
+            " (the server-wide GUI socket)"
+        else
+            "";
+        try res.textf("web_gui: the web_* tools may use the user's OWN browser and logins (granted via {s}); transport now {s}{s} -- a GUI is found or `sketerm web` started lazily at the first web call, found again if it goes away, and a web call with no reachable GUI fails 'unavailable' rather than opening a private headless view. Terminal/app/file/panel tools stay on the private daemon", .{ via, webGuiTransport().name(), sock_note });
+    } else try res.textf("web_gui: not granted -- the web_* tools use a private browser with its own cookie jar (the assistant is logged in nowhere); the user grants their own browser with {s}, {s}=1 or web_gui = true in config.conf's [mcp] section", .{ mcp_webgui.FLAG, mcp_webgui.ENV });
     if (@import("mcp_web.zig").sessionInfo()) |ws| try res.fact("web_session", ws);
     // Watch-along: the private daemon socket and whether the web session
     // shows pixels. Both are facts a human needs to find the assistant's
@@ -3745,8 +3860,8 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
         // headless view answers them itself (fail closed, fingerprint
         // opt-in). A consumer must not have to hang once to learn that.
         try res.fact("web_cert_facts", true);
-        try res.fact("web_accept_cert", !srv_gui_socket);
-        try res.text(if (srv_gui_socket)
+        try res.fact("web_accept_cert", !gui_web);
+        try res.text(if (gui_web)
             "certificate errors: the user's interstitial decides; results carry cert facts while a load is held"
         else
             "certificate errors fail closed in headless views and are reported as cert facts; web_open accept_cert trusts one fingerprint for one view");
@@ -3759,7 +3874,7 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     // Engine lifecycle, as a FACT: a consumer once had to infer "is the
     // engine broker-owned" from profile side effects. Every capability
     // the server gains is reported here from day one.
-    if (web_ok and !srv_gui_socket) {
+    if (web_ok and !gui_web) {
         const eng = @import("mcp_web.zig").engineCapability();
         try res.fact("web_engine_broker", eng.broker_lane);
         try res.fact("web_engine_owner", eng.owner.name());
@@ -8337,6 +8452,10 @@ test "mcp flag parsing: isolation modes" {
     const logged = try Opts.parse(&.{ "--log", "/tmp/trace", "--durable" });
     try t.expectEqualStrings("/tmp/trace", logged.log_dir.?);
     try t.expect(logged.durable);
+    // --web-gui composes with every mode and defaults off.
+    try t.expect(!def.web_gui);
+    try t.expect((try Opts.parse(&.{ "--web-gui", "--name", "w" })).web_gui);
+    try t.expect((try Opts.parse(&.{ "--shared", "--web-gui" })).web_gui);
     // --no-record composes with every mode.
     try t.expect(!(try Opts.parse(&.{"--shared"})).no_record);
     try t.expect((try Opts.parse(&.{ "--no-record", "--durable" })).no_record);

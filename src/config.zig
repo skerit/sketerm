@@ -696,6 +696,17 @@ pub const McpProfile = struct {
     /// is compiled into sketerm-mux and must not depend on the MCP
     /// tool table; `sketerm mcp` validates at startup).
     tools: []const u8 = "",
+    /// Permission for the `web_*` tools to use the user's OWN browser
+    /// (a running sketerm GUI, or `sketerm web` spawned for it) instead
+    /// of the server's private headless engine. Null = not stated, so
+    /// a `[mcp.<name>]` section only overrides the bare `[mcp]` value
+    /// when it says so explicitly. Nothing else is granted by it.
+    web_gui: ?bool = null,
+
+    /// Whether serializing this record writes anything.
+    pub fn isEmpty(self: *const McpProfile) bool {
+        return self.tools.len == 0 and self.web_gui == null;
+    }
 };
 
 /// The operating systems a `[platform.<name>]` section can name.
@@ -1303,6 +1314,11 @@ pub const Config = struct {
     /// selected with `sketerm mcp --profile <name>`. Order preserved
     /// for round-trip serialisation.
     mcp_profiles: std.ArrayList(McpProfile) = .empty,
+
+    /// The bare `[mcp]` section: defaults every `sketerm mcp` run
+    /// reads, whether or not `--profile` names a `[mcp.<name>]` record
+    /// on top of it.
+    mcp: McpProfile = .{ .name = "" },
 
     /// `[platform.<name>]` sections, in file order, with their lines
     /// verbatim. The section for THIS platform has already been
@@ -2103,9 +2119,13 @@ pub const Config = struct {
             if (!srv.enabled) try w.writeAll("enabled = false\n");
         }
 
+        if (!self.mcp.isEmpty()) {
+            try w.writeAll("\n[mcp]\n");
+            try serialiseMcpKeys(&self.mcp, w);
+        }
         for (self.mcp_profiles.items) |prof| {
             try w.print("\n[mcp.{s}]\n", .{prof.name});
-            if (prof.tools.len > 0) try w.print("tools = {s}\n", .{prof.tools});
+            try serialiseMcpKeys(&prof, w);
         }
     }
 
@@ -2485,6 +2505,10 @@ fn parseInto(cfg: *Config, body: []const u8) !void {
                 };
                 continue;
             }
+            if (std.mem.eql(u8, inside, "mcp")) {
+                current_mcp = &cfg.mcp;
+                continue;
+            }
             if (std.mem.startsWith(u8, inside, "mcp.")) {
                 const name = inside["mcp.".len..];
                 if (name.len == 0) {
@@ -2652,7 +2676,16 @@ fn findOrCreateMcpProfile(cfg: *Config, arena: std.mem.Allocator, name: []const 
 fn applyMcpKv(prof: *McpProfile, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
     if (std.mem.eql(u8, key, "tools")) {
         prof.tools = try arena.dupe(u8, value);
+    } else if (std.mem.eql(u8, key, "web_gui")) {
+        prof.web_gui = try parseBool(value);
     } else return error.UnknownKey;
+}
+
+/// The keys of one `[mcp]`/`[mcp.<name>]` record; the one writer for
+/// both so the bare section cannot drift from the named ones.
+fn serialiseMcpKeys(prof: *const McpProfile, w: *std.Io.Writer) !void {
+    if (prof.tools.len > 0) try w.print("tools = {s}\n", .{prof.tools});
+    if (prof.web_gui) |v| try w.print("web_gui = {s}\n", .{if (v) "true" else "false"});
 }
 
 fn applyDomainKv(dom: *Domain, arena: std.mem.Allocator, key: []const u8, value: []const u8) !void {
@@ -3353,7 +3386,9 @@ fn parseFloat(s: []const u8) !f32 {
     return std.fmt.parseFloat(f32, s);
 }
 
-fn parseBool(s: []const u8) !bool {
+/// The one boolean vocabulary (true/1/yes/on, false/0/no/off, case
+/// insensitive); `sketerm mcp` reads its env switches through it too.
+pub fn parseBool(s: []const u8) !bool {
     if (std.ascii.eqlIgnoreCase(s, "true") or std.mem.eql(u8, s, "1") or std.ascii.eqlIgnoreCase(s, "yes") or std.ascii.eqlIgnoreCase(s, "on"))
         return true;
     if (std.ascii.eqlIgnoreCase(s, "false") or std.mem.eql(u8, s, "0") or std.ascii.eqlIgnoreCase(s, "no") or std.ascii.eqlIgnoreCase(s, "off"))
@@ -4415,6 +4450,43 @@ test "config: [mcp.name] sections parse and round-trip" {
     defer cfg2.deinit();
     try std.testing.expectEqual(@as(usize, 2), cfg2.mcp_profiles.items.len);
     try std.testing.expectEqualStrings("app, files:ro", cfg2.mcpProfile("wayland").?.tools);
+    // No bare [mcp] section was given, so none is written back.
+    try std.testing.expect(cfg2.mcp.isEmpty());
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[mcp]\n") == null);
+}
+
+test "config: bare [mcp] defaults and web_gui parse and round-trip" {
+    const body =
+        \\[mcp]
+        \\web_gui = true
+        \\
+        \\[mcp.locked]
+        \\tools = files:ro
+        \\web_gui = off
+        \\
+        \\[mcp.quiet]
+        \\tools = app
+        \\
+    ;
+    var cfg = try Config.loadFromBytes(std.testing.allocator, body);
+    defer cfg.deinit();
+    try std.testing.expectEqual(true, cfg.mcp.web_gui.?);
+    try std.testing.expectEqualStrings("", cfg.mcp.tools);
+    try std.testing.expectEqual(false, cfg.mcpProfile("locked").?.web_gui.?);
+    // A section that does not mention the key leaves it unstated (null),
+    // so the resolver can tell "not overridden" from "set to false".
+    try std.testing.expect(cfg.mcpProfile("quiet").?.web_gui == null);
+
+    var buf: [1024]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try cfg.serialise(&w);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[mcp]\nweb_gui = true\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[mcp.locked]\ntools = files:ro\nweb_gui = false\n") != null);
+    var cfg2 = try Config.loadFromBytes(std.testing.allocator, w.buffered());
+    defer cfg2.deinit();
+    try std.testing.expectEqual(true, cfg2.mcp.web_gui.?);
+    try std.testing.expectEqual(false, cfg2.mcpProfile("locked").?.web_gui.?);
+    try std.testing.expect(cfg2.mcpProfile("quiet").?.web_gui == null);
 }
 
 test "config: [lsp.name] sections parse, seed from builtins and round-trip" {

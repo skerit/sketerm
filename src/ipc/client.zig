@@ -535,6 +535,19 @@ pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
         return allocator.dupeZ(u8, std.mem.span(env)) catch null;
     }
     // Exactly one running instance → unambiguous.
+    return discoverGuiSocket(allocator, .single);
+}
+
+/// How many live GUI sockets `discoverGuiSocket` may find: `single`
+/// is scripting's rule (two instances = "which one did you mean?");
+/// `any` is for a caller to whom every GUI is equivalent (the MCP web
+/// tools: any live sketerm window can host a web tab).
+pub const Discover = enum { single, any };
+
+/// Scan `$XDG_RUNTIME_DIR/sketerm/` for a live GUI control socket,
+/// skipping the mux daemon's, the file manager's and the browser
+/// helper's, and reaping stale files on the way. Caller frees.
+pub fn discoverGuiSocket(allocator: std.mem.Allocator, how: Discover) ?[:0]u8 {
     const rt = @import("../util/platform.zig").runtimeDir();
     const dir_z = std.fmt.allocPrintSentinel(allocator, "{s}/sketerm", .{rt}, 0) catch return null;
     defer allocator.free(dir_z);
@@ -566,6 +579,7 @@ pub fn resolveSocket(allocator: std.mem.Allocator, arg: ?[]const u8) ?[:0]u8 {
             allocator.free(path);
             continue;
         }
+        if (how == .any) return path;
         if (found != null) {
             allocator.free(found.?);
             allocator.free(path);
