@@ -623,6 +623,9 @@ pub const Client = struct {
     reason_retryable: bool = true,
     fd: c_int = -1,
     pid: c.pid_t = -1,
+    /// This client JOINED a helper another sketerm process started
+    /// (`adoptRunningHelper`): it owns no child and no socket file.
+    adopted: bool = false,
     sock_path: [108]u8 = undefined,
     sock_len: usize = 0,
     /// Remote helper host ("" = the local helper this GUI spawns). A
@@ -778,6 +781,7 @@ pub const Client = struct {
     obs_key_len: usize = 0,
     /// The helper advertised "observe".
     cap_observe: bool = false,
+    cap_multi_client: bool = false,
     /// The `webwatch.Watch` this observer client serves, nulled by the
     /// watch before it frees itself (the back-pointer fence).
     watch: ?*anyopaque = null,
@@ -844,6 +848,11 @@ pub const Client = struct {
             self.ensureObserverLocal();
             return;
         }
+
+        // One CEF process per profile: join the helper another sketerm
+        // window is already running rather than forking a rival that
+        // cannot initialize (`adoptRunningHelper`).
+        if (self.adoptRunningHelper()) return;
 
         var bin_buf: [4096:0]u8 = undefined;
         const bin = findbin.find(&bin_buf) orelse {
@@ -1057,6 +1066,8 @@ pub const Client = struct {
         self.cap_webext_action = false;
         self.cap_webext_transaction = false;
         self.cap_observe = false;
+        self.cap_multi_client = false;
+        self.adopted = false;
         if (self.bridge) |br| {
             self.bridge = null;
             br.stop();
@@ -1135,6 +1146,86 @@ pub const Client = struct {
         return p;
     }
 
+    /// A helper that died before binding: the CEF deployment is broken,
+    /// or another sketerm process owns the profile and this one raced
+    /// in after the socket scan (`adoptRunningHelper` answers that case
+    /// first, so reaching this text means neither retry found a helper).
+    const HELPER_EXIT_MSG = "The browser helper exited during startup (see its stderr).";
+
+    /// Does `name` name a helper socket of this route that ANOTHER
+    /// process owns? `web-<pid>.sock` on the direct route,
+    /// `web-<pid>-<slug>.sock` on a routed instance -- so a routed
+    /// socket never matches the direct route and vice versa.
+    fn helperSocketOfRoute(name: []const u8, slug: ?[]const u8, self_pid: i32) bool {
+        const prefix = @import("../ipc/server.zig").WEB_SOCKET_PREFIX;
+        const suffix = ".sock";
+        if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return false;
+        const mid = name[prefix.len .. name.len - suffix.len];
+        const pid_part = if (slug) |s| blk: {
+            if (mid.len <= s.len + 1) return false;
+            if (!std.mem.endsWith(u8, mid, s)) return false;
+            const cut = mid.len - s.len - 1;
+            if (mid[cut] != '-') return false;
+            break :blk mid[0..cut];
+        } else mid;
+        if (pid_part.len == 0) return false;
+        for (pid_part) |ch| if (ch < '0' or ch > '9') return false;
+        const pid = std.fmt.parseInt(i32, pid_part, 10) catch return false;
+        return pid != self_pid;
+    }
+
+    /// Join the helper another sketerm process of this route already
+    /// runs, instead of forking a second one.
+    ///
+    /// A second CEF process on the same `root_cache_path` dies at
+    /// startup with `cef_initialize failed` / "Opening in existing
+    /// browser session" (MEASURED, and the reason `makeCacheDir` gives
+    /// every non-direct route its own directory). The default route
+    /// deliberately shares ONE profile so the user's logins are the
+    /// same in every window, so a second window could never browse:
+    /// its tab said "the browser helper exited during startup" for as
+    /// long as another window held a browser page open. The helper
+    /// serves several clients (`multi-client`, per-connection view-id
+    /// windows), so the fix is to share it.
+    ///
+    /// The socket file belongs to the process that spawned the helper:
+    /// an adopted client reaps no child and unlinks nothing. A socket
+    /// whose helper is gone is unlinked here, so the directory heals.
+    fn adoptRunningHelper(self: *Client) bool {
+        const rt = platform.runtimeDir();
+        var dir_buf: [96:0]u8 = undefined;
+        const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return false;
+        var slug_buf: [64]u8 = undefined;
+        const slug: ?[]const u8 = if (self.routeSpec().isDirect())
+            null
+        else
+            (self.routeSpec().slug(&slug_buf) orelse return false);
+        const d = c.g_dir_open(dir.ptr, 0, null) orelse return false;
+        defer c.g_dir_close(d);
+        const self_pid: i32 = @intCast(c.getpid());
+        while (c.g_dir_read_name(d)) |name_c| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(name_c)));
+            if (!helperSocketOfRoute(name, slug, self_pid)) continue;
+            var path_buf: [108]u8 = undefined;
+            const p = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch continue;
+            if (p.len + 1 > self.sock_path.len) continue;
+            @memcpy(self.sock_path[0..p.len], p);
+            self.sock_len = p.len;
+            if (self.tryConnect()) {
+                self.adopted = true;
+                return true;
+            }
+            // Nothing listening: the helper is gone and only its socket
+            // file survived it.
+            var z: [108:0]u8 = undefined;
+            @memcpy(z[0..p.len], p);
+            z[p.len] = 0;
+            _ = c.unlink(&z);
+        }
+        self.sock_len = 0;
+        return false;
+    }
+
     fn onConnectTick(user: ?*anyopaque) callconv(.c) c.gboolean {
         const self = cast.userData(Client, user);
         self.connect_tries += 1;
@@ -1146,7 +1237,12 @@ pub const Client = struct {
             if (c.waitpid(self.pid, &status, c.WNOHANG) == self.pid) {
                 self.pid = -1;
                 self.connect_timer = 0;
-                self.fail("The browser helper exited during startup (see its stderr).");
+                // Two windows raced for the profile: both found no
+                // helper and forked one, and the loser's CEF refused
+                // the locked `root_cache_path`. The winner is serving
+                // now, so join it instead of reporting a failure.
+                if (self.adoptRunningHelper()) return 0;
+                self.fail(HELPER_EXIT_MSG);
                 return 0;
             }
         }
@@ -1495,7 +1591,15 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_COOKIE_SYNC)) self.cap_cookie_sync = true;
                     if (std.mem.eql(u8, cap, proto.CAP_OBSERVE)) self.cap_observe = true;
-}
+                    if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.cap_multi_client = true;
+                }
+                // Joined another window's helper: it must be able to
+                // serve two clients, or our views would fight for its
+                // one id space.
+                if (self.adopted and !self.cap_multi_client) {
+                    self.failWith("Another sketerm window owns the browser and its helper cannot be shared (no multi-client capability). Close that window's browser pages, or restart it on this build.", false);
+                    return;
+                }
                 if (self.observer) {
                     // Nothing of this GUI's is published into an
                     // assistant's helper (see `observer`); the one
@@ -2442,6 +2546,24 @@ pub fn hostOfUrl(url: []const u8) ?[]const u8 {
         if (std.mem.indexOfScalar(u8, rest, ']') == null) rest = rest[0..colon];
     }
     return if (rest.len == 0) null else rest;
+}
+
+test "a helper socket is adopted only from this route and another process" {
+    const t = std.testing;
+    // Direct route: `web-<pid>.sock`, someone else's pid.
+    try t.expect(Client.helperSocketOfRoute("web-1234.sock", null, 99));
+    try t.expect(!Client.helperSocketOfRoute("web-1234.sock", null, 1234)); // our own
+    // A routed instance's socket is a DIFFERENT profile: never direct's.
+    try t.expect(!Client.helperSocketOfRoute("web-1234-tor.sock", null, 99));
+    try t.expect(Client.helperSocketOfRoute("web-1234-tor.sock", "tor", 99));
+    try t.expect(!Client.helperSocketOfRoute("web-1234-tor.sock", "via-box", 99));
+    try t.expect(!Client.helperSocketOfRoute("web-1234.sock", "tor", 99));
+    // Neighbours in the same directory that are not helper sockets.
+    try t.expect(!Client.helperSocketOfRoute("mux.sock", null, 99));
+    try t.expect(!Client.helperSocketOfRoute("1234.sock", null, 99));
+    try t.expect(!Client.helperSocketOfRoute("web-.sock", null, 99));
+    try t.expect(!Client.helperSocketOfRoute("web-12ab.sock", null, 99));
+    try t.expect(!Client.helperSocketOfRoute("web-1234.sock.tmp", null, 99));
 }
 
 test "hostOfUrl keys a site rule on the host alone" {

@@ -91,6 +91,8 @@ var vcast_pid: c.pid_t = -1;
 var qlfiles_pid: c.pid_t = -1;
 /// Focused inline-rename lifetime child, always reaped by exact pid.
 var renamefiles_pid: c.pid_t = -1;
+/// Second browser-identity GUI (the shared-helper stage), by exact pid.
+var web2_pid: c.pid_t = -1;
 var dk_drive: ?*appdrive.App = null;
 var dk_ready = false;
 var g_alloc: std.mem.Allocator = undefined;
@@ -188,6 +190,10 @@ fn teardown() void {
     if (child_pid > 0) {
         reap(child_pid, c.SIGKILL, 0);
         child_pid = 0;
+    }
+    if (web2_pid > 0) {
+        reap(web2_pid, c.SIGTERM, 2000);
+        web2_pid = -1;
     }
     if (remote_mux_pid > 0) {
         reap(remote_mux_pid, c.SIGTERM, 2000);
@@ -781,6 +787,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_TWO_GUIS_ONLY") != null) {
+        const app = drive orelse return fail("focused two-GUI smoke has no display driver");
+        if (!have_wl) return fail("focused two-GUI smoke is GTK/Wayland-only");
+        if (secondGuiBrowserStage(allocator, app, rt, sock_path, &wl_z)) |why| return failMsg(why);
+        say("two GUIs: a second sketerm window browsed the same profile while the first held a page");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_FILES_RECONNECT_ONLY") != null) {
         const app = drive orelse return fail("focused files-reconnect smoke has no display driver");
         if (!have_wl) return fail("focused files-reconnect smoke is GTK/Wayland-only");
@@ -1251,6 +1265,9 @@ pub fn main() u8 {
 
         if (mcpWebReaderStage(allocator, sock_path, rt)) |why| return failMsg(why);
         say("mcp GUI web adapter: web_read IDs acted through the visible browser and a retargeted entity was refused stale");
+
+        if (secondGuiBrowserStage(allocator, app, rt, sock_path, &wl_z)) |why| return failMsg(why);
+        say("two GUIs: a second sketerm window browsed the same profile while the first held a page");
 
         if (remotePanelAssetStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
         say("remote panel asset: fake-SSH panel images hydrated into the GUI cache, repainted after a same-path rewrite, and kept their logical path through panel-get/save/load");
@@ -5999,6 +6016,121 @@ fn findRenameControlSocket(
         const probe = roundtrip(allocator, candidate, "{\"cmd\":\"list\"}\n") orelse continue;
         defer allocator.free(probe);
         if (std.mem.indexOf(u8, probe, "\"ok\":true") != null) return candidate;
+    }
+    return null;
+}
+
+/// Two sketerm windows browse at once.
+///
+/// One CEF process per profile: a second helper on the same
+/// `root_cache_path` dies with `cef_initialize failed` (MEASURED), so
+/// before `Client.adoptRunningHelper` the SECOND window's every web tab
+/// read "The browser helper exited during startup" for as long as the
+/// first had a page open — with three sketerm windows on a desktop,
+/// browsing worked in exactly one of them.
+fn secondGuiBrowserStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    sock_path: [:0]const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    var doc = HttpDoc{ .body = "<html><head><title>e2e-two-guis</title></head><body style=\"margin:0;background:#20c020\">two</body></html>" };
+    if (!doc.start()) return "the two-GUI document server did not start";
+    defer doc.stop();
+    var url_buf: [128:0]u8 = undefined;
+    const url = std.fmt.bufPrintZ(&url_buf, "http://127.0.0.1:{d}/", .{doc.lis.port}) catch return "two-GUI url";
+
+    // The FIRST window browses, so its helper owns the profile.
+    var req_buf: [512]u8 = undefined;
+    const open_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"{s}\"}}\n", .{url}) catch return "two-GUI web-open request";
+    const opened = roundtrip(allocator, sock_path, open_req) orelse return "the first window's web-open failed";
+    defer allocator.free(opened);
+    const first_pane = parseNumAfter(opened, "\"pane\":") orelse return "the first window's web-open named no pane";
+    if (!waitWebPaneTitled(allocator, sock_path, app, first_pane, "e2e-two-guis", 40_000))
+        return "the first window never loaded the page";
+
+    // A SECOND GUI process, the browser identity, on the same profile.
+    _ = app.drainLive(2_000);
+    var known: [32]u32 = undefined;
+    var n_known: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_known >= known.len) continue;
+        known[n_known] = w.id;
+        n_known += 1;
+    }
+    const pid = c.fork();
+    if (pid < 0) return "two-GUI fork";
+    if (pid == 0) {
+        platform.dieWithParent();
+        _ = c.setenv("SKETERM_APP_ID", "dev.sker.sketerm.e2eweb2", 1);
+        _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = c.unsetenv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        _ = c.setenv("GTK_A11Y", "none", 1);
+        _ = c.setenv("SKETERM_WELCOME", "0", 1);
+        const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "web", url.ptr, null };
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    web2_pid = pid;
+    defer {
+        if (web2_pid > 0) reap(web2_pid, c.SIGTERM, 5000);
+        web2_pid = -1;
+    }
+    {
+        const d = clock.nowMs() + 30_000;
+        var seen = false;
+        while (clock.nowMs() < d and !seen) {
+            if (hasToplevelOtherThan(app, known[0..n_known]) != null) seen = true;
+        }
+        if (!seen) return "the second browser window never appeared";
+    }
+
+    // Its OWN control socket says whether its page loaded: the helper
+    // it shares must serve it exactly as it serves the first window.
+    var sock2_buf: [512:0]u8 = undefined;
+    var sock2: ?[:0]u8 = null;
+    {
+        const d = clock.nowMs() + 20_000;
+        while (clock.nowMs() < d and sock2 == null) {
+            _ = app.pumpOnce(200);
+            sock2 = findRenameControlSocket(allocator, rt, sock_path, &sock2_buf);
+        }
+    }
+    const s2 = sock2 orelse return "the second browser window never served a control socket";
+    {
+        const d = clock.nowMs() + 45_000;
+        var loaded = false;
+        while (clock.nowMs() < d and !loaded) {
+            _ = app.pumpOnce(250);
+            const list = roundtrip(allocator, s2, "{\"cmd\":\"web-list\"}\n") orelse continue;
+            defer allocator.free(list);
+            loaded = std.mem.indexOf(u8, list, "e2e-two-guis") != null;
+        }
+        if (!loaded) {
+            if (app.screenshotPng(app.windows.items[0].id, 0, null, 0)) |shot| {
+                defer allocator.free(shot.png);
+                writePng("zig-out/smoke-e2e-two-guis.png", shot.png);
+            } else |_| {}
+            return "the second sketerm window could not browse while the first one was (its helper never served it)";
+        }
+    }
+
+    // The first window keeps browsing after the second one goes.
+    reap(web2_pid, c.SIGTERM, 5000);
+    web2_pid = -1;
+    _ = app.waitIdle(300, 5_000);
+    const again = roundtrip(allocator, sock_path, open_req) orelse return "the first window's second web-open failed";
+    defer allocator.free(again);
+    const again_pane = parseNumAfter(again, "\"pane\":") orelse return "the first window's second web-open named no pane";
+    if (!waitWebPaneTitled(allocator, sock_path, app, again_pane, "e2e-two-guis", 40_000))
+        return "the first window stopped browsing after the second window closed";
+    for ([_]u32{ again_pane, first_pane }) |p| {
+        var cbuf: [128]u8 = undefined;
+        const creq = std.fmt.bufPrint(&cbuf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{p}) catch continue;
+        if (roundtrip(allocator, sock_path, creq)) |r| allocator.free(r);
     }
     return null;
 }
