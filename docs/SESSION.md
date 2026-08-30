@@ -1,5 +1,39 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-30: moving files on a host without RENAME_NOREPLACE, and the reconnect that doubled every row
+
+**"the filesystem cannot rename safely without risking an overwrite".**
+Every move, copy-into-place and symlink install on the user's remote
+host failed with that sentence, because the daemon answered a flagged
+`renameat2(RENAME_NOREPLACE)` refusal by refusing too. The refusal is
+ordinary, not exotic: ZFS before 2.2 (what a Proxmox host runs) answers
+EINVAL, NFS/CIFS and pre-3.15 kernels answer ENOSYS/EOPNOTSUPP. The
+earlier "NFS/FUSE fallback" had been rejected for being a plain
+`rename`, i.e. a clobber; what shipped instead was no fallback at all,
+so nothing could be moved there, ever. `platform.renameNoReplaceCompat`
+is the no-clobber those filesystems DO offer: `link` then `unlink` for a
+non-directory (link refuses an existing target atomically), `lstat`
+then `rename` for directories and link-less filesystems (the window
+every other file manager accepts there). The `NOREPLACE` token, its
+phrase and its two fsjob arms are gone; the unit test exercises both
+paths on a real directory.
+
+**"view id in use", and every file listed twice.** After the remote
+daemon was killed and came back, the Files tab's reconnect
+(`conn.zig wireReady`) zeroed each directory's `view_id` and re-opened,
+so every re-subscribed directory asked the new daemon for view 0 (the
+second was refused) and `open_view`'s streaming chunks were appended
+onto the rows the tab still held. `resubscribeDir` is the one path:
+drop the stale rows (backing refs fenced, rows noted changed), mint a
+fresh id through `mintViewId` (now the single home for view ids), open
+from empty. smoke-e2e's `filesReconnectStage` kills the fake-SSH daemon
+under a listed remote directory, respawns it, and requires each seed
+row exactly once, no refusal on screen, and a file created afterwards
+arriving as a delta through the fresh subscription. Two rig fixes on
+the way: rig-spawned Files windows set `SKETERM_WELCOME=0` (the
+first-run tour covered the listing), and `ocrCount` samples the live
+head like `viewerWaitOcr` now does.
+
 ## 2026-08-30: the web_gui grant -- the user's own browser for web_* only
 
 **The assistant was logged in nowhere.** Isolated `sketerm mcp` (the
