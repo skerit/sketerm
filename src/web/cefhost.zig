@@ -11558,10 +11558,14 @@ fn browserInt(b: ?*cef.cef_browser_t, comptime name: []const u8) c_int {
 
 /// `browserInt` for the fields that live on the browser HOST, which is
 /// where CEF puts the opener identifier.
+///
+/// The explicit type on `host` is load-bearing: the upstream and distro
+/// CEF header sets translate `get_host`'s return differently ([*c] vs
+/// ?*), and only the coerced form supports field access in both.
 fn browserHostInt(b: ?*cef.cef_browser_t, comptime name: []const u8) c_int {
     const br = b orelse return 0;
     const get_host = br.get_host orelse return 0;
-    const host = get_host(br) orelse return 0;
+    const host: *cef.cef_browser_host_t = get_host(br) orelse return 0;
     defer release(&host.base);
     const f = @field(host, name) orelse return 0;
     return f(host);
