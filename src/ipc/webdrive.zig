@@ -630,6 +630,10 @@ pub const Engine = struct {
     /// (`presenter` in hello_ack). Reported, never inferred: a helper
     /// in session mode whose presenter failed to arm still says no.
     cap_presenter: bool = false,
+    /// The helper lets a second client OBSERVE this one's views
+    /// (`observe`): what the GUI's Watch / Take control on this
+    /// assistant's browser rides on. Reported, never inferred.
+    cap_observe: bool = false,
     /// The helper can really open popups (`popup-open`). Headless
     /// clients ALLOW them: an agent driving a sign-in flow needs the
     /// window the provider posts its result back through, and there is
@@ -972,6 +976,19 @@ pub const Engine = struct {
     /// client AND advertised the presenter in its handshake.
     pub fn presenterActive(self: *const Engine) bool {
         return self.session != null and self.state == .ready and self.cap_presenter;
+    }
+
+    /// Whether a GUI can watch this engine's pages as browser pages:
+    /// the live helper advertised `observe`.
+    pub fn observeActive(self: *const Engine) bool {
+        return self.state == .ready and self.cap_observe;
+    }
+
+    /// The helper socket a second client connects to, once the helper
+    /// is serving; null before that.
+    pub fn helperSocketPath(self: *const Engine, buf: []u8) ?[]const u8 {
+        if (self.state != .ready) return null;
+        return self.routePathZ(buf, ".sock");
     }
 
     fn sessionWanted(self: *const Engine) bool {
@@ -2551,6 +2568,7 @@ pub const Engine = struct {
                 self.cap_contexts_fail_closed = false;
                 self.cap_net_policy = false;
                 self.cap_presenter = false;
+                self.cap_observe = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.cap_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.cap_semantic = true;
@@ -2563,6 +2581,7 @@ pub const Engine = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_NET_POLICY)) self.cap_net_policy = true;
                     if (std.mem.eql(u8, cap, proto.CAP_MULTI_CLIENT)) self.cap_multi_client = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRESENTER)) self.cap_presenter = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_OBSERVE)) self.cap_observe = true;
                     if (std.mem.eql(u8, cap, proto.CAP_POPUP_OPEN)) self.cap_popup_open = true;
                 }
                 // Headless: allow real popups for the whole connection.

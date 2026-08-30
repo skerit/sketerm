@@ -217,6 +217,24 @@ pub fn presenterActive() bool {
     return false;
 }
 
+/// Whether a GUI can watch this server's pages as ordinary browser
+/// pages (the helper advertised `observe`); the direct route's
+/// engine answers, since that is the one a watch opens first.
+pub fn observeActive() bool {
+    for (g_engines.items) |re| {
+        if (re.engine.observeActive()) return true;
+    }
+    return false;
+}
+
+/// The direct route's helper socket, once its helper serves.
+pub fn helperSocket(buf: []u8) ?[]const u8 {
+    for (g_engines.items) |re| {
+        if (re.engine.routeSpec().isDirect()) return re.engine.helperSocketPath(buf);
+    }
+    return null;
+}
+
 /// What `capabilities` reports about named browsing profiles. Never
 /// spawns the helper: the store alone answers before one exists, and a
 /// helper without the context caps answers for itself once it does.

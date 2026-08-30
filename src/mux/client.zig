@@ -340,6 +340,10 @@ pub const Conn = struct {
     /// the protocol socket as a byte channel. Absent = remote browsing
     /// on this host gets a described "daemon too old" error.
     web_helper: bool = false,
+    /// Daemon answers `web_helper_connect` (welcome capability): it
+    /// bridges a helper already serving beside its socket, which is
+    /// how a remote assistant's browser is watched.
+    web_helper_connect: bool = false,
     /// Independent panel relay capability advertised by the daemon.
     panel_rpc: u8 = 0,
     /// The daemon can put immutable session identity before the initial GUI
@@ -530,6 +534,7 @@ pub const Conn = struct {
         self.web_engine = false;
         self.stream_open = false;
         self.web_helper = false;
+        self.web_helper_connect = false;
         self.panel_rpc = 0;
         self.attach_identity = false;
         self.attach_identity_pending = false;
@@ -553,6 +558,7 @@ pub const Conn = struct {
             web_engine: bool = false,
             stream_open: bool = false,
             web_helper: bool = false,
+            web_helper_connect: bool = false,
             panel_rpc: u8 = 0,
             attach_identity: bool = false,
             build: []const u8 = "",
@@ -581,6 +587,7 @@ pub const Conn = struct {
             self.web_engine = parsed.value.web_engine;
             self.stream_open = parsed.value.stream_open;
             self.web_helper = parsed.value.web_helper;
+            self.web_helper_connect = parsed.value.web_helper_connect;
             self.panel_rpc = @min(parsed.value.panel_rpc, wire.PANEL_RPC_VERSION);
             self.attach_identity = parsed.value.attach_identity;
             self.server_build_len = @min(parsed.value.build.len, self.server_build.len);

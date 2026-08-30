@@ -140,6 +140,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_SEMANTIC_REQUEST_IDS,
     proto.CAP_MULTI_CLIENT,
     proto.CAP_COOKIE_SYNC,
+    proto.CAP_OBSERVE,
 };
 
 /// Test-only negotiation seam for exercising an older helper client path.
@@ -739,7 +740,11 @@ pub const Server = struct {
                 connNote("malformed frame", cn.id);
                 return false;
             }) orelse break;
-            self.dispatch(cn, frame) catch {
+            self.dispatch(cn, frame) catch |err| {
+                // An observer's frame the lease gate refused, or an
+                // alias verb served at the edge: not a violation, the
+                // connection stays.
+                if (err == error.ObserveDropped) continue;
                 if (debug_conns)
                     std.debug.print("sketerm-web: conn {d} dispatch error on tag 0x{x}\n", .{ cn.id, @intFromEnum(frame.tag) });
                 return false;
@@ -757,9 +762,9 @@ pub const Server = struct {
     /// Decode `T` and translate its client-namespace ids into the
     /// engine's global namespace — the socket-edge half of
     /// multi-client, so `cefhost` keeps thinking in one id space.
-    fn dec(cn: *Conn, comptime T: type, payload: []const u8) !T {
+    fn dec(self: *Server, cn: *Conn, comptime T: type, payload: []const u8) !T {
         var req = try proto.decode(T, payload);
-        try xlateIn(cn, T, &req);
+        try self.xlateIn(cn, T, &req);
         return req;
     }
 
@@ -769,7 +774,7 @@ pub const Server = struct {
     /// or context under a FIFTH field name must be added here or its
     /// ids arrive untranslated (and, for a view, then fail `find`'s
     /// ownership check rather than touch a foreign view).
-    fn xlateIn(cn: *Conn, comptime T: type, req: *T) !void {
+    fn xlateIn(self: *Server, cn: *Conn, comptime T: type, req: *T) !void {
         if (T == proto.ContextCreate or T == proto.ContextDestroy) {
             req.id = try cn.mapCtx(req.id);
             return;
@@ -778,6 +783,33 @@ pub const Server = struct {
             if (@hasField(T, f)) @field(req, f) = try cn.mapView(@field(req, f));
         }
         if (@hasField(T, "context")) req.context = try cn.mapCtx(req.context);
+        // An OBSERVER ALIAS (capability "observe"): the id names a
+        // subscription of this connection, not a view of its own. The
+        // alias-only verbs are served here; everything else passes the
+        // lease gate and is re-addressed to the target, with
+        // `dispatch_alias` telling the host why a foreign view is fair.
+        if (@hasField(T, "view")) {
+            if (self.host.aliasOf(cn.id, req.view)) |sub| {
+                switch (T.tag) {
+                    .view_destroy => {
+                        self.host.observeUnsubscribe(cn.id, req.view);
+                        return error.ObserveDropped;
+                    },
+                    .view_show => {
+                        self.host.observePause(cn.id, req.view, false);
+                        return error.ObserveDropped;
+                    },
+                    .view_hide => {
+                        self.host.observePause(cn.id, req.view, true);
+                        return error.ObserveDropped;
+                    },
+                    else => {},
+                }
+                if (!proto.observerAllows(T.tag, sub.control)) return error.ObserveDropped;
+                self.host.dispatch_alias = req.view;
+                req.view = sub.target;
+            }
+        }
     }
 
     fn dispatch(self: *Server, cn: *Conn, frame: proto.Frame) !void {
@@ -793,6 +825,7 @@ pub const Server = struct {
         defer {
             self.host.dispatch_conn = 0;
             self.host.dispatch_inline = false;
+            self.host.dispatch_alias = 0;
         }
         switch (frame.tag) {
             .hello => {
@@ -815,35 +848,35 @@ pub const Server = struct {
                 }, null);
                 cn.greeted = true;
             },
-            .context_create => self.host.contextCreate(try dec(cn, proto.ContextCreate, frame.payload)),
-            .context_destroy => self.host.contextDestroy((try dec(cn, proto.ContextDestroy, frame.payload)).id),
-            .view_create => try self.host.createView(try dec(cn, proto.ViewCreate, frame.payload)),
-            .view_create_url => try self.host.createViewUrl(try dec(cn, proto.ViewCreateUrl, frame.payload)),
-            .view_destroy => self.host.destroyView((try dec(cn, proto.ViewDestroy, frame.payload)).view),
-            .view_discard => self.host.discardView((try dec(cn, proto.ViewDiscard, frame.payload)).view),
-            .view_resize => try self.host.resizeView(try dec(cn, proto.ViewResize, frame.payload)),
-            .view_show => self.host.showView((try dec(cn, proto.ViewShow, frame.payload)).view, true),
-            .view_hide => self.host.showView((try dec(cn, proto.ViewHide, frame.payload)).view, false),
-            .view_max_fps => self.host.setMaxFps(try dec(cn, proto.ViewMaxFps, frame.payload)),
-            .cert_decision => self.host.certDecision(try dec(cn, proto.CertDecision, frame.payload)),
-            .permission_decision => self.host.permissionDecision(try dec(cn, proto.PermissionDecision, frame.payload)),
-            .navigate => self.host.navigate(try dec(cn, proto.Navigate, frame.payload)),
-            .nav_action => self.host.navAction(try dec(cn, proto.NavAction, frame.payload)),
-            .find => self.host.findInPage(try dec(cn, proto.Find, frame.payload)),
-            .find_stop => self.host.findStop(try dec(cn, proto.FindStop, frame.payload)),
-            .set_zoom => self.host.setZoom(try dec(cn, proto.SetZoom, frame.payload)),
-            .input_pointer => self.host.pointer(try dec(cn, proto.InputPointer, frame.payload)),
-            .input_scroll => self.host.scroll(try dec(cn, proto.InputScroll, frame.payload)),
-            .input_key => self.host.key(try dec(cn, proto.InputKey, frame.payload)),
-            .input_ime => self.host.ime(try dec(cn, proto.InputIme, frame.payload)),
-            .input_paste => self.host.paste(try dec(cn, proto.InputPaste, frame.payload)),
-            .popup_policy_set => self.host.popupPolicySet(try dec(cn, proto.PopupPolicySet, frame.payload)),
-            .clipboard_read => self.host.clipboardRead(try dec(cn, proto.ClipboardRead, frame.payload)),
-            .input_focus => self.host.focus(try dec(cn, proto.InputFocus, frame.payload)),
+            .context_create => self.host.contextCreate(try self.dec(cn, proto.ContextCreate, frame.payload)),
+            .context_destroy => self.host.contextDestroy((try self.dec(cn, proto.ContextDestroy, frame.payload)).id),
+            .view_create => try self.host.createView(try self.dec(cn, proto.ViewCreate, frame.payload)),
+            .view_create_url => try self.host.createViewUrl(try self.dec(cn, proto.ViewCreateUrl, frame.payload)),
+            .view_destroy => self.host.destroyView((try self.dec(cn, proto.ViewDestroy, frame.payload)).view),
+            .view_discard => self.host.discardView((try self.dec(cn, proto.ViewDiscard, frame.payload)).view),
+            .view_resize => try self.host.resizeView(try self.dec(cn, proto.ViewResize, frame.payload)),
+            .view_show => self.host.showView((try self.dec(cn, proto.ViewShow, frame.payload)).view, true),
+            .view_hide => self.host.showView((try self.dec(cn, proto.ViewHide, frame.payload)).view, false),
+            .view_max_fps => self.host.setMaxFps(try self.dec(cn, proto.ViewMaxFps, frame.payload)),
+            .cert_decision => self.host.certDecision(try self.dec(cn, proto.CertDecision, frame.payload)),
+            .permission_decision => self.host.permissionDecision(try self.dec(cn, proto.PermissionDecision, frame.payload)),
+            .navigate => self.host.navigate(try self.dec(cn, proto.Navigate, frame.payload)),
+            .nav_action => self.host.navAction(try self.dec(cn, proto.NavAction, frame.payload)),
+            .find => self.host.findInPage(try self.dec(cn, proto.Find, frame.payload)),
+            .find_stop => self.host.findStop(try self.dec(cn, proto.FindStop, frame.payload)),
+            .set_zoom => self.host.setZoom(try self.dec(cn, proto.SetZoom, frame.payload)),
+            .input_pointer => self.host.pointer(try self.dec(cn, proto.InputPointer, frame.payload)),
+            .input_scroll => self.host.scroll(try self.dec(cn, proto.InputScroll, frame.payload)),
+            .input_key => self.host.key(try self.dec(cn, proto.InputKey, frame.payload)),
+            .input_ime => self.host.ime(try self.dec(cn, proto.InputIme, frame.payload)),
+            .input_paste => self.host.paste(try self.dec(cn, proto.InputPaste, frame.payload)),
+            .popup_policy_set => self.host.popupPolicySet(try self.dec(cn, proto.PopupPolicySet, frame.payload)),
+            .clipboard_read => self.host.clipboardRead(try self.dec(cn, proto.ClipboardRead, frame.payload)),
+            .input_focus => self.host.focus(try self.dec(cn, proto.InputFocus, frame.payload)),
             // v1 accepts the release for symmetry but keeps no per-buffer
             // state: one memfd per view, replaced on resize.
-            .frame_release => _ = try dec(cn, proto.FrameRelease, frame.payload),
-            .frame_request => self.host.beginFrame(try dec(cn, proto.FrameRequest, frame.payload)),
+            .frame_release => _ = try self.dec(cn, proto.FrameRelease, frame.payload),
+            .frame_request => self.host.beginFrame(try self.dec(cn, proto.FrameRequest, frame.payload)),
             .frame_mode => {
                 const req = try proto.decode(proto.FrameMode, frame.payload);
                 // Per-connection, latching (an anonymous buffer is
@@ -854,16 +887,16 @@ pub const Server = struct {
                     self.host.latchInlineForConn(cn.id);
                 }
             },
-            .sem_snapshot_req => try self.host.semSnapshot(try dec(cn, proto.SemSnapshotReq, frame.payload)),
-            .sem_act => try self.host.semAct(try dec(cn, proto.SemAction, frame.payload)),
-            .sem_expand => try self.host.semExpand(try dec(cn, proto.SemExpand, frame.payload)),
-            .sem_query => try self.host.semQuery(try dec(cn, proto.SemQueryReq, frame.payload)),
-            .sem_read => try self.host.semRead(try dec(cn, proto.SemRead, frame.payload)),
-            .sem_read_ids => try self.host.semReadIds(try dec(cn, proto.SemReadIds, frame.payload)),
-            .sem_act_guarded => try self.host.semActGuarded(try dec(cn, proto.SemActGuarded, frame.payload)),
-            .sem_request => try self.host.semRequest(try dec(cn, proto.SemRequest, frame.payload)),
-            .sem_eval => try self.host.semEval(try dec(cn, proto.SemEval, frame.payload)),
-            .intercept_set => self.host.interceptSet(try dec(cn, proto.InterceptSet, frame.payload)),
+            .sem_snapshot_req => try self.host.semSnapshot(try self.dec(cn, proto.SemSnapshotReq, frame.payload)),
+            .sem_act => try self.host.semAct(try self.dec(cn, proto.SemAction, frame.payload)),
+            .sem_expand => try self.host.semExpand(try self.dec(cn, proto.SemExpand, frame.payload)),
+            .sem_query => try self.host.semQuery(try self.dec(cn, proto.SemQueryReq, frame.payload)),
+            .sem_read => try self.host.semRead(try self.dec(cn, proto.SemRead, frame.payload)),
+            .sem_read_ids => try self.host.semReadIds(try self.dec(cn, proto.SemReadIds, frame.payload)),
+            .sem_act_guarded => try self.host.semActGuarded(try self.dec(cn, proto.SemActGuarded, frame.payload)),
+            .sem_request => try self.host.semRequest(try self.dec(cn, proto.SemRequest, frame.payload)),
+            .sem_eval => try self.host.semEval(try self.dec(cn, proto.SemEval, frame.payload)),
+            .intercept_set => self.host.interceptSet(try self.dec(cn, proto.InterceptSet, frame.payload)),
             .intercept_lists => {
                 // Process-global filter lists: deliberately UNTRANSLATED
                 // and last-writer-wins across connections in Phase 1,
@@ -877,23 +910,23 @@ pub const Server = struct {
             .intercept_subscribe => {
                 var req = try proto.InterceptSubscribe.decodeAlloc(frame.payload, self.gpa);
                 defer self.gpa.free(req.urls);
-                try xlateIn(cn, proto.InterceptSubscribe, &req);
+                try self.xlateIn(cn, proto.InterceptSubscribe, &req);
                 self.host.interceptSubscribe(req);
             },
-            .intercept_status_req => self.host.interceptStatus(try dec(cn, proto.InterceptStatusReq, frame.payload)),
-            .intercept_log_req => self.host.interceptLog(try dec(cn, proto.InterceptLogReq, frame.payload)),
+            .intercept_status_req => self.host.interceptStatus(try self.dec(cn, proto.InterceptStatusReq, frame.payload)),
+            .intercept_log_req => self.host.interceptLog(try self.dec(cn, proto.InterceptLogReq, frame.payload)),
             .net_policy_set => {
                 var req = try proto.NetPolicySet.decodeAlloc(frame.payload, self.gpa);
                 defer self.gpa.free(req.allow_top);
                 defer self.gpa.free(req.allow_sub);
-                try xlateIn(cn, proto.NetPolicySet, &req);
+                try self.xlateIn(cn, proto.NetPolicySet, &req);
                 self.host.netPolicySet(req);
             },
-            .net_policy_req => self.host.netPolicyStatus(try dec(cn, proto.NetPolicyReq, frame.payload)),
-            .net_log_req => self.host.netLog(try dec(cn, proto.NetLogReq, frame.payload)),
-            .download_decide => self.host.downloadDecide(try dec(cn, proto.DownloadDecide, frame.payload)),
-            .download_cancel => self.host.downloadCancel(try dec(cn, proto.DownloadCancel, frame.payload)),
-            .a11y_enable => self.host.a11yEnable(try dec(cn, proto.A11yEnable, frame.payload)),
+            .net_policy_req => self.host.netPolicyStatus(try self.dec(cn, proto.NetPolicyReq, frame.payload)),
+            .net_log_req => self.host.netLog(try self.dec(cn, proto.NetLogReq, frame.payload)),
+            .download_decide => self.host.downloadDecide(try self.dec(cn, proto.DownloadDecide, frame.payload)),
+            .download_cancel => self.host.downloadCancel(try self.dec(cn, proto.DownloadCancel, frame.payload)),
+            .a11y_enable => self.host.a11yEnable(try self.dec(cn, proto.A11yEnable, frame.payload)),
             .us_script_set => {
                 // Process-global, last-writer-wins: see .intercept_lists.
                 const req = try proto.UsScriptSet.decodeAlloc(frame.payload, self.gpa);
@@ -906,9 +939,9 @@ pub const Server = struct {
                 defer self.gpa.free(req.styles);
                 self.host.usStyleSet(req);
             },
-            .scroll_to => self.host.scrollTo(try dec(cn, proto.ScrollTo, frame.payload)),
-            .devtools_show => try self.host.devtoolsShow(try dec(cn, proto.DevToolsShow, frame.payload)),
-            .print_pdf => self.host.printPdf(try dec(cn, proto.PrintPdf, frame.payload)),
+            .scroll_to => self.host.scrollTo(try self.dec(cn, proto.ScrollTo, frame.payload)),
+            .devtools_show => try self.host.devtoolsShow(try self.dec(cn, proto.DevToolsShow, frame.payload)),
+            .print_pdf => self.host.printPdf(try self.dec(cn, proto.PrintPdf, frame.payload)),
             .flush_req => {
                 const f = try proto.decode(proto.FlushReq, frame.payload);
                 self.host.flushProfileStores(f.token, cn.id);
@@ -923,26 +956,44 @@ pub const Server = struct {
                 const req = try proto.decode(proto.CookieSyncEnable, frame.payload);
                 self.host.cookieSyncEnable(cn.id, req.enable != 0);
             },
-            .cookie_apply => self.host.cookieApply(try dec(cn, proto.CookieApply, frame.payload)),
-            .cookie_dump_req => self.host.cookieDump(try dec(cn, proto.CookieDumpReq, frame.payload)),
-            .cookies_req => self.host.cookiesReq(try dec(cn, proto.CookiesReq, frame.payload)),
-            .cookie_delete => self.host.cookieDelete(try dec(cn, proto.CookieDelete, frame.payload)),
-            .cookies_clear => self.host.cookiesClear(try dec(cn, proto.CookiesClear, frame.payload)),
-            .sitedata_clear => self.host.sitedataClear(try dec(cn, proto.SitedataClear, frame.payload)),
+            // Observation (0xF0). Per-connection like cookie sync. The
+            // alias in `observe_subscribe`/`observe_control` is minted
+            // by the observer in ITS window (mapView), while `target`
+            // is an engine-global id it learnt from an announcement
+            // and crosses untranslated. Frames naming a live alias are
+            // re-addressed in `xlateIn`.
+            .observe_enable => {
+                const req = try proto.decode(proto.ObserveEnable, frame.payload);
+                self.host.observeEnable(cn.id, req.enable != 0);
+            },
+            .observe_subscribe => {
+                const req = try proto.decode(proto.ObserveSubscribe, frame.payload);
+                self.host.observeSubscribe(cn.id, try cn.mapView(req.view), req.target, req.control != 0);
+            },
+            .observe_control => {
+                const req = try proto.decode(proto.ObserveControl, frame.payload);
+                self.host.observeControl(cn.id, try cn.mapView(req.view), req.control != 0);
+            },
+            .cookie_apply => self.host.cookieApply(try self.dec(cn, proto.CookieApply, frame.payload)),
+            .cookie_dump_req => self.host.cookieDump(try self.dec(cn, proto.CookieDumpReq, frame.payload)),
+            .cookies_req => self.host.cookiesReq(try self.dec(cn, proto.CookiesReq, frame.payload)),
+            .cookie_delete => self.host.cookieDelete(try self.dec(cn, proto.CookieDelete, frame.payload)),
+            .cookies_clear => self.host.cookiesClear(try self.dec(cn, proto.CookiesClear, frame.payload)),
+            .sitedata_clear => self.host.sitedataClear(try self.dec(cn, proto.SitedataClear, frame.payload)),
             // The webext family is process-global (one extension
             // registry, one action set), last-writer-wins: see
             // .intercept_lists. webext_tabs embeds view ids inside its
             // JSON, which the edge cannot reach — the host translates
             // them at parse time via Router.mapView instead.
-            .webext_set => self.host.webextSet(try dec(cn, proto.WebextSet, frame.payload)),
-            .webext_install_prepare => self.host.webextInstallPrepare(try dec(cn, proto.WebextInstallPrepare, frame.payload)),
-            .webext_install_commit => self.host.webextInstallCommit(try dec(cn, proto.WebextInstallCommit, frame.payload)),
-            .webext_remove => self.host.webextRemove((try dec(cn, proto.WebextRemove, frame.payload)).id),
+            .webext_set => self.host.webextSet(try self.dec(cn, proto.WebextSet, frame.payload)),
+            .webext_install_prepare => self.host.webextInstallPrepare(try self.dec(cn, proto.WebextInstallPrepare, frame.payload)),
+            .webext_install_commit => self.host.webextInstallCommit(try self.dec(cn, proto.WebextInstallCommit, frame.payload)),
+            .webext_remove => self.host.webextRemove((try self.dec(cn, proto.WebextRemove, frame.payload)).id),
             .webext_list_req => self.host.webextList(),
             .webext_wreq_stats_req => self.host.webrequestStats(),
             .webext_tabs => self.host.webextTabs((try proto.decode(proto.WebextTabs, frame.payload)).tabs_json),
-            .webext_action_activate => self.host.webextActionActivate(try dec(cn, proto.WebextActionActivate, frame.payload)),
-            .webext_open_popup_result => self.host.webextOpenPopupResult(try dec(cn, proto.WebextOpenPopupResult, frame.payload)),
+            .webext_action_activate => self.host.webextActionActivate(try self.dec(cn, proto.WebextActionActivate, frame.payload)),
+            .webext_open_popup_result => self.host.webextOpenPopupResult(try self.dec(cn, proto.WebextOpenPopupResult, frame.payload)),
             // Helper-to-client frames arriving from the client, and any
             // tag this build does not act on, are ignored by design.
             else => {},

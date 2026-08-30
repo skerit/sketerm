@@ -481,6 +481,17 @@ pub const View = struct {
     /// and — after a `view_discard` — the address the browser comes
     /// back at.
     url: []u8 = &.{},
+    /// Last title CEF reported, owned. Kept for the observe family: a
+    /// subscriber arriving mid-life is seeded with it, and the
+    /// announcement carries it, where the owner already learnt it from
+    /// the `ev_title` that stored it.
+    title: []u8 = &.{},
+    /// Last navigation state posted (`ev_nav_state`), for the same
+    /// seeding; `postNavState` reads the engine, this is what a
+    /// subscriber is told between two of its calls.
+    nav_back: bool = false,
+    nav_fwd: bool = false,
+    nav_loading: bool = false,
     /// `view_discard` destroyed this view's browser; the record (id,
     /// geometry, scale, address, fps cap) is all that is left. Any
     /// frame that must show, navigate or reach the page revives it
@@ -856,7 +867,30 @@ const PendingPopup = struct {
 
 /// A resolved outbound target: where to post, and the id-window base
 /// to subtract so the frame carries the CLIENT's namespace again.
-const RouteTo = struct { out: *proto.Outbox, base: u32 };
+const RouteTo = struct {
+    out: *proto.Outbox,
+    base: u32,
+    /// Non-zero: the receiver is an OBSERVER and knows the view under
+    /// this alias id (its own namespace); `view` is replaced with it
+    /// instead of window-shifted.
+    alias_view: u32 = 0,
+};
+
+/// One observer subscription (capability "observe"): connection `conn`
+/// sees the view `target` under the engine-global alias id `alias`
+/// (in `conn`'s own id window). Frames toward the observer are ALWAYS
+/// inline; `dirty` is the union of damage not yet shipped, the same
+/// union-and-flush backpressure the owner's inline path uses.
+const Sub = struct {
+    conn: u32,
+    alias: u32,
+    target: u32,
+    control: bool,
+    /// `view_hide` from the observer: nothing is shipped until its
+    /// `view_show`, which re-seeds the whole surface.
+    paused: bool = false,
+    dirty: ?proto.Rect = null,
+};
 
 pub const Host = struct {
     gpa: std.mem.Allocator,
@@ -871,6 +905,16 @@ pub const Host = struct {
     /// The dispatching connection's inline-frame latch, stamped onto
     /// views it creates.
     dispatch_inline: bool = false,
+    /// Non-zero while the frame being dispatched named an observer
+    /// ALIAS (capability "observe"): the engine-global alias id. `find`
+    /// then admits the foreign target and `routeFor` answers the
+    /// dispatching observer under that id, so a synchronous reply to
+    /// an observer's own request never reaches the owner.
+    dispatch_alias: u32 = 0,
+    /// Observer subscriptions, and the connections that asked for
+    /// page announcements (`observe_enable`).
+    subs: std.ArrayList(Sub) = .empty,
+    observers: std.ArrayList(u32) = .empty,
     views: std.ArrayList(*View) = .empty,
     /// The view a create_browser_sync call is currently building, for
     /// the callbacks CEF fires BEFORE it returns the browser pointer.
@@ -1177,6 +1221,8 @@ pub const Host = struct {
             self.presenter = null;
         }
         self.views.deinit(self.gpa);
+        self.subs.deinit(self.gpa);
+        self.observers.deinit(self.gpa);
         self.webext.deinit();
         for (self.webext_replies.items) |r| self.gpa.free(r.ext);
         self.webext_replies.deinit(self.gpa);
@@ -1431,6 +1477,289 @@ pub const Host = struct {
         return !v.webext_bg and !v.webext_popup and v.devtools_of == 0 and !v.windowed;
     }
 
+    // -- observers (capability "observe") ------------------------------
+    //
+    // A second connection watching, and optionally driving, a view it
+    // does not own. The owner's paths are untouched: every hook below
+    // is a side channel off the existing event, and the observer's own
+    // frames reach the target through `dispatch_alias` (see `find`).
+
+    /// The subscription `conn` holds under the engine-global alias id,
+    /// if any.
+    pub fn aliasOf(self: *Host, conn: u32, alias: u32) ?*Sub {
+        if (conn == 0 or alias == 0) return null;
+        for (self.subs.items) |*s| {
+            if (s.conn == conn and s.alias == alias) return s;
+        }
+        return null;
+    }
+
+    fn isObserver(self: *const Host, conn: u32) bool {
+        for (self.observers.items) |o| {
+            if (o == conn) return true;
+        }
+        return false;
+    }
+
+    /// Whether `v` is a page another connection may observe: a
+    /// presentable view with an owner (owner 0 is the routerless
+    /// single-client shape, where nobody else exists to observe it).
+    fn observable(v: *const View) bool {
+        return v.owner != 0 and presentable(v);
+    }
+
+    /// The alias id in the observer's OWN namespace, what its frames
+    /// carry.
+    fn aliasWire(sub: *const Sub) u32 {
+        return sub.alias - sub.conn * proto.CONN_ID_WINDOW;
+    }
+
+    fn observerOut(self: *Host, conn: u32) ?*proto.Outbox {
+        const rt = self.router orelse return null;
+        return rt.route(rt.ctx, conn);
+    }
+
+    fn announceTo(self: *Host, conn: u32, v: *const View, state: u8) void {
+        const out = self.observerOut(conn) orelse return;
+        out.post(proto.EvObserveView{
+            .target = v.id,
+            .owner = v.owner,
+            .state = state,
+            .opener = if (v.page_popup) v.opener_view else 0,
+            .w = v.w,
+            .h = v.h,
+            .scale_x1000 = v.scale_x1000,
+            .url = v.url,
+            .title = v.title,
+        }, null) catch {};
+    }
+
+    /// `observe_enable` from `conn`: start or stop the announcements.
+    /// Starting replays every observable page of every OTHER
+    /// connection, in table order.
+    pub fn observeEnable(self: *Host, conn: u32, enable: bool) void {
+        if (conn == 0) return;
+        const was = self.isObserver(conn);
+        if (!enable) {
+            if (!was) return;
+            for (self.observers.items, 0..) |o, i| {
+                if (o == conn) {
+                    _ = self.observers.swapRemove(i);
+                    break;
+                }
+            }
+            return;
+        }
+        if (!was) self.observers.append(self.gpa, conn) catch return;
+        for (self.views.items) |v| {
+            if (!observable(v) or v.owner == conn) continue;
+            self.announceTo(conn, v, proto.observe_view_present);
+        }
+    }
+
+    /// A page came into existence (browser spawned): tell every
+    /// announcing connection but its owner.
+    fn observeViewPresent(self: *Host, v: *const View) void {
+        if (!observable(v)) return;
+        for (self.observers.items) |o| {
+            if (o == v.owner) continue;
+            self.announceTo(o, v, proto.observe_view_present);
+        }
+    }
+
+    /// A page is leaving the table: end every subscription on it and
+    /// announce it gone. Runs BEFORE `freeView`, while `v` is intact.
+    fn observeViewGone(self: *Host, v: *const View, reason: []const u8) void {
+        var i: usize = 0;
+        while (i < self.subs.items.len) {
+            const s = self.subs.items[i];
+            if (s.target != v.id) {
+                i += 1;
+                continue;
+            }
+            self.postObserveState(&s, v, proto.observe_ended, reason);
+            _ = self.subs.orderedRemove(i);
+        }
+        if (!observable(v)) return;
+        for (self.observers.items) |o| {
+            if (o == v.owner) continue;
+            self.announceTo(o, v, proto.observe_view_gone);
+        }
+    }
+
+    fn postObserveState(self: *Host, sub: *const Sub, v: ?*const View, state: u8, reason: []const u8) void {
+        const out = self.observerOut(sub.conn) orelse return;
+        out.post(proto.EvObserveState{
+            .view = aliasWire(sub),
+            .target = sub.target,
+            .state = state,
+            .control = if (sub.control) 1 else 0,
+            .w = if (v) |vv| vv.w else 0,
+            .h = if (v) |vv| vv.h else 0,
+            .scale_x1000 = if (v) |vv| vv.scale_x1000 else 0,
+            .reason = reason,
+        }, null) catch {};
+    }
+
+    /// `observe_subscribe` from `conn`: `alias` is already engine-global
+    /// (the edge windowed it). Refusals are answered, never silent.
+    pub fn observeSubscribe(self: *Host, conn: u32, alias: u32, target: u32, control: bool) void {
+        if (conn == 0 or alias == 0) return;
+        const probe = Sub{ .conn = conn, .alias = alias, .target = target, .control = control };
+        if (self.findAny(alias) != null or self.aliasOf(conn, alias) != null) {
+            self.postObserveState(&probe, null, proto.observe_refused, "the alias id is already in use");
+            return;
+        }
+        const v = self.findAny(target) orelse {
+            self.postObserveState(&probe, null, proto.observe_refused, "no such view");
+            return;
+        };
+        if (!observable(v) or v.owner == conn) {
+            self.postObserveState(&probe, null, proto.observe_refused, "that view cannot be observed");
+            return;
+        }
+        self.subs.append(self.gpa, probe) catch {
+            self.postObserveState(&probe, null, proto.observe_refused, "out of memory");
+            return;
+        };
+        const sub = &self.subs.items[self.subs.items.len - 1];
+        self.postObserveState(sub, v, proto.observe_subscribed, "");
+        self.seedObserver(sub, v);
+    }
+
+    /// What a subscriber needs to draw the page as it is right now:
+    /// its navigation state, its title, and the whole surface.
+    fn seedObserver(self: *Host, sub: *Sub, v: *View) void {
+        const out = self.observerOut(sub.conn) orelse return;
+        out.post(proto.EvNavState{
+            .view = aliasWire(sub),
+            .can_back = if (v.nav_back) 1 else 0,
+            .can_fwd = if (v.nav_fwd) 1 else 0,
+            .loading = if (v.nav_loading) 1 else 0,
+            .url = v.url,
+        }, null) catch {};
+        if (v.title.len != 0) out.post(proto.EvTitle{ .view = aliasWire(sub), .title = v.title }, null) catch {};
+        if (v.map.len != 0 and !v.buf_unpainted) {
+            sub.dirty = .{ .x = 0, .y = 0, .w = v.pw, .h = v.ph };
+            self.flushSub(sub, v);
+        }
+    }
+
+    /// `observe_control`: flip the lease of a live alias.
+    pub fn observeControl(self: *Host, conn: u32, alias: u32, control: bool) void {
+        const sub = self.aliasOf(conn, alias) orelse {
+            const probe = Sub{ .conn = conn, .alias = alias, .target = 0, .control = control };
+            self.postObserveState(&probe, null, proto.observe_refused, "no such alias");
+            return;
+        };
+        sub.control = control;
+        self.postObserveState(sub, self.findAny(sub.target), proto.observe_subscribed, "");
+    }
+
+    /// `view_destroy` on an alias: drop the subscription only. The
+    /// target is the owner's and keeps living.
+    pub fn observeUnsubscribe(self: *Host, conn: u32, alias: u32) void {
+        for (self.subs.items, 0..) |s, i| {
+            if (s.conn == conn and s.alias == alias) {
+                _ = self.subs.orderedRemove(i);
+                return;
+            }
+        }
+    }
+
+    /// `view_hide` / `view_show` on an alias: the observer's own pause.
+    /// Resuming re-seeds the whole surface, since paints were skipped.
+    pub fn observePause(self: *Host, conn: u32, alias: u32, paused: bool) void {
+        const sub = self.aliasOf(conn, alias) orelse return;
+        sub.paused = paused;
+        if (paused) {
+            sub.dirty = null;
+            return;
+        }
+        const v = self.findAny(sub.target) orelse return;
+        if (v.map.len != 0 and !v.buf_unpainted) {
+            sub.dirty = .{ .x = 0, .y = 0, .w = v.pw, .h = v.ph };
+            self.flushSub(sub, v);
+        }
+    }
+
+    /// The target's logical geometry changed: every subscriber is told,
+    /// so its letterbox and input mapping follow.
+    fn observeGeometry(self: *Host, v: *const View) void {
+        for (self.subs.items) |*s| {
+            if (s.target == v.id) self.postObserveState(s, v, proto.observe_subscribed, "");
+        }
+    }
+
+    /// A connection left: its subscriptions and its announcement flag
+    /// go with it. Its OWN views are destroyed by `dropConn`'s sweep,
+    /// which ends every subscription on them.
+    fn observeDropConn(self: *Host, conn: u32) void {
+        var i: usize = 0;
+        while (i < self.subs.items.len) {
+            if (self.subs.items[i].conn == conn) {
+                _ = self.subs.orderedRemove(i);
+            } else i += 1;
+        }
+        for (self.observers.items, 0..) |o, k| {
+            if (o == conn) {
+                _ = self.observers.swapRemove(k);
+                break;
+            }
+        }
+    }
+
+    /// New pixels landed in `v.map`: widen every subscriber's pending
+    /// damage and ship what the backpressure allows. Union rather than
+    /// queue, exactly like the owner's inline path.
+    fn observeDamage(self: *Host, v: *View, rects: []const proto.Rect) void {
+        if (self.subs.items.len == 0) return;
+        for (self.subs.items) |*s| {
+            if (s.target != v.id or s.paused) continue;
+            for (rects) |r| unionSubDirty(s, r);
+            self.flushSub(s, v);
+        }
+    }
+
+    fn unionSubDirty(s: *Sub, r: proto.Rect) void {
+        const d = s.dirty orelse {
+            s.dirty = r;
+            return;
+        };
+        const x0 = @min(d.x, r.x);
+        const y0 = @min(d.y, r.y);
+        const x1 = @max(@as(u32, d.x) + d.w, @as(u32, r.x) + r.w);
+        const y1 = @max(@as(u32, d.y) + d.h, @as(u32, r.y) + r.h);
+        s.dirty = .{ .x = x0, .y = y0, .w = @intCast(x1 - x0), .h = @intCast(y1 - y0) };
+    }
+
+    /// Ship a subscriber's pending damage as inline bands, unless its
+    /// outbox is backed up (then the union waits for the next flush).
+    fn flushSub(self: *Host, s: *Sub, v: *View) void {
+        const d = s.dirty orelse return;
+        if (v.map.len == 0) {
+            s.dirty = null;
+            return;
+        }
+        const out = self.observerOut(s.conn) orelse {
+            s.dirty = null;
+            return;
+        };
+        if (out.pending() >= max_frame_backlog) return;
+        s.dirty = null;
+        self.shipInline(v, d, out, aliasWire(s));
+    }
+
+    /// The drain-side half for observers: called once per poll beside
+    /// `flushInline`, so damage held back by backpressure goes out.
+    fn flushObservers(self: *Host) void {
+        for (self.subs.items) |*s| {
+            if (s.dirty == null or s.paused) continue;
+            const v = self.findAny(s.target) orelse continue;
+            self.flushSub(s, v);
+        }
+    }
+
     /// New pixels landed in `v.map`: mirror them to the toplevel.
     fn presentPaint(self: *Host, v: *View, rects: []const proto.Rect) void {
         const p = self.presenter orelse return;
@@ -1456,6 +1785,16 @@ pub const Host = struct {
     /// stops owning it and it may outlive its opener.
     pub fn find(self: *Host, id: u32) ?*View {
         const v = self.findAny(id) orelse return null;
+        // An observer's frame arrives with its alias already resolved
+        // to the target by the server edge, which also applied the
+        // lease gate; `dispatch_alias` is the proof that this foreign
+        // view is the one it subscribed to.
+        if (self.dispatch_alias != 0) {
+            if (self.aliasOf(self.dispatch_conn, self.dispatch_alias)) |sub| {
+                if (sub.target == v.id) return v;
+            }
+            return null;
+        }
         if (self.dispatch_conn != 0 and v.owner != 0 and v.owner != self.dispatch_conn) return null;
         if (self.dispatch_conn != 0 and v.page_popup) v.popup_answered = true;
         return v;
@@ -1534,7 +1873,10 @@ pub const Host = struct {
                 error.BrowserCreateFailed => false,
                 else => return err,
             };
-            if (spawned) return;
+            if (spawned) {
+                self.observeViewPresent(v);
+                return;
+            }
             if (attempt >= ops.create_retries) break;
             var pumps: u32 = 0;
             while (pumps < 10) : (pumps += 1) {
@@ -1838,6 +2180,7 @@ pub const Host = struct {
         for (self.views.items, 0..) |v, i| {
             if (v.id != id) continue;
             _ = self.views.swapRemove(i);
+            self.observeViewGone(v, "the owner destroyed the view");
             // An inspector outliving its target inspects nothing and
             // has no client surface left to close it, so it goes too;
             // an inspector being closed simply frees its target's slot.
@@ -1947,6 +2290,7 @@ pub const Host = struct {
             .frame_name = "",
         });
         self.allocBuffer(v) catch {};
+        self.observeViewPresent(v);
         return true;
     }
 
@@ -1958,6 +2302,7 @@ pub const Host = struct {
             if (it != v) continue;
             self.abandonViewWaiters(v.id);
             _ = self.views.swapRemove(i);
+            self.observeViewGone(v, "the page closed itself");
             self.post(proto.EvPagePopup{
                 .owner_view = v.opener_view,
                 .popup_view = v.id,
@@ -1989,6 +2334,7 @@ pub const Host = struct {
     pub fn dropConn(self: *Host, conn_id: u32) void {
         if (conn_id == 0) return;
         self.cookieSyncDropConn(conn_id);
+        self.observeDropConn(conn_id);
         // destroyView mutates the list (and closes popup/inspector
         // dependents itself), so collect ids first and re-check each.
         while (true) {
@@ -3025,6 +3371,7 @@ pub const Host = struct {
         interceptUnregister(self.gpa, v.id);
         self.dropBrowser(v, close);
         if (v.url.len != 0) self.gpa.free(v.url);
+        if (v.title.len != 0) self.gpa.free(v.title);
         if (v.sel_text.len != 0) self.gpa.free(v.sel_text);
         v.pending.deinit(self.gpa);
         v.forgetFrames(self.gpa);
@@ -3141,6 +3488,7 @@ pub const Host = struct {
         // waits for the client's next one shows a stale/black buffer in
         // the meantime.
         if (!v.hidden) issueBeginFrame(v);
+        self.observeGeometry(v);
     }
 
     /// `view_show` / `view_hide`. A SHOW revives a discarded view — it
@@ -3846,6 +4194,7 @@ pub const Host = struct {
         for (self.views.items) |v| {
             if (self.viewInline(v)) self.flushInlineView(v);
         }
+        self.flushObservers();
     }
 
     /// Encode `v.inline_dirty` (if any) into banded `frame_inline`
@@ -3862,6 +4211,16 @@ pub const Host = struct {
             return;
         };
         if (route.out.pending() >= max_frame_backlog) return;
+        v.inline_dirty = null;
+        const wire_view = if (route.alias_view != 0) route.alias_view else v.id - route.base;
+        self.shipInline(v, d, route.out, wire_view);
+    }
+
+    /// Encode `d` of `v`'s live buffer into banded `frame_inline`
+    /// messages on `out`, carrying `wire_view` (the RECEIVER's id for
+    /// the view). Shared by the owner's inline path and the observer
+    /// path, so both ship byte-identical frames.
+    fn shipInline(self: *Host, v: *View, d: proto.Rect, out: *proto.Outbox, wire_view: u32) void {
         const stride: usize = v.stride();
         // Clamp against the live buffer: a dirty rect can predate a
         // resize by one poll iteration.
@@ -3869,7 +4228,6 @@ pub const Host = struct {
         const y0: u16 = @min(d.y, v.ph -| 1);
         const w: u16 = @min(d.w, v.pw - x);
         const total_h: u16 = @min(d.h, v.ph - y0);
-        v.inline_dirty = null;
         if (w == 0 or total_h == 0) return;
         const row_bytes: usize = @as(usize, w) * 4;
         const band_rows_max: u16 = @intCast(@min(
@@ -3903,13 +4261,13 @@ pub const Host = struct {
                 rect.enc = proto.inline_enc_deflate;
                 rect.data = z;
             }
-            self.post(proto.FrameInline{
-                .view = v.id,
+            out.post(proto.FrameInline{
+                .view = wire_view,
                 .gen = v.gen,
                 .w = v.pw,
                 .h = v.ph,
                 .rects = &.{rect},
-            });
+            }, null) catch {};
             y = @intCast(@min(y_end, @as(u32, y) + rows));
         }
     }
@@ -7664,6 +8022,16 @@ pub const Host = struct {
     /// a dead socket would have.
     fn routeFor(self: *Host, view_id: u32) ?RouteTo {
         const rt = self.router orelse return .{ .out = self.out, .base = 0 };
+        // A synchronous answer to an observer's own request goes back
+        // to that observer, under its alias: the owner never asked.
+        if (self.dispatch_alias != 0 and view_id != 0) {
+            if (self.aliasOf(self.dispatch_conn, self.dispatch_alias)) |sub| {
+                if (sub.target == view_id) {
+                    const out = rt.route(rt.ctx, sub.conn) orelse return null;
+                    return .{ .out = out, .base = 0, .alias_view = aliasWire(sub) };
+                }
+            }
+        }
         if (view_id == 0) {
             // A view-0 (engine-global) event answers the dispatching
             // connection when there is one.
@@ -7721,13 +8089,75 @@ pub const Host = struct {
         return null;
     }
 
+    /// `view` replaced by `id`: how a frame is re-addressed to an
+    /// observer's alias.
+    fn withView(value: anytype, id: u32) @TypeOf(value) {
+        var v2 = value;
+        if (@hasField(@TypeOf(value), "view")) v2.view = id;
+        return v2;
+    }
+
+    /// Which view-keyed events an observer receives beside the owner
+    /// (capability "observe"). `all`: the page's own state, what any
+    /// watcher sees. `control`: answers to input, meaningful only for
+    /// a driving observer. Everything else is the owner's business
+    /// (decisions such as cert, permission, download and popup, the
+    /// semantic and a11y streams, engine chrome) and never fans out; a
+    /// controlling observer's OWN request is still answered through
+    /// `routeFor`.
+    fn observedEvent(comptime T: type) enum { no, all, control } {
+        return switch (T) {
+            proto.EvTitle,
+            proto.EvNavState,
+            proto.EvLoad,
+            proto.EvLoadError,
+            proto.EvCursor,
+            proto.EvFavicon,
+            proto.EvScroll,
+            proto.EvCrashed,
+            => .all,
+            proto.EvContextMenu, proto.EvFindResult => .control,
+            else => .no,
+        };
+    }
+
+    /// Deliver `value` about the view `key` to its subscribers. The
+    /// dispatching observer always gets what its own request produced
+    /// (the reply shape), paused or not; everyone else by
+    /// `observedEvent` and their lease.
+    fn fanout(self: *Host, target: u32, value: anytype) void {
+        const T = @TypeOf(value);
+        if (self.subs.items.len == 0 or target == 0) return;
+        if (!@hasField(T, "view")) return;
+        const kind = comptime observedEvent(T);
+        for (self.subs.items) |*s| {
+            if (s.target != target) continue;
+            const mine = self.dispatch_alias != 0 and s.conn == self.dispatch_conn and s.alias == self.dispatch_alias;
+            if (!mine) {
+                if (s.paused) continue;
+                switch (kind) {
+                    .no => continue,
+                    .all => {},
+                    .control => if (!s.control) continue,
+                }
+            }
+            const out = self.observerOut(s.conn) orelse continue;
+            out.post(withView(value, aliasWire(s)), null) catch {};
+        }
+    }
+
     /// Post an event, dropping it if the outbox is out of memory: a
     /// missed event must never take the helper down.
     fn post(self: *Host, value: anytype) void {
         const T = @TypeOf(value);
         if (comptime (@hasField(T, "view") or @hasField(T, "owner_view"))) {
-            const r = self.routeFor(routeKeyOf(value).?) orelse return;
-            const v2 = toClientIds(value, r.base);
+            const route_key = routeKeyOf(value).?;
+            // Observers first: the owner's route below may be gone
+            // (its socket died) while subscribers still read.
+            self.fanout(route_key, value);
+            const r = self.routeFor(route_key) orelse return;
+            var v2 = toClientIds(value, r.base);
+            if (r.alias_view != 0) v2 = withView(v2, r.alias_view);
             if (self.active_sem_request != 0 and semanticResult(T)) {
                 var payload: std.ArrayList(u8) = .empty;
                 defer payload.deinit(self.gpa);
@@ -7791,11 +8221,20 @@ pub const Host = struct {
         v.url = dup;
     }
 
+    fn setTitle(self: *Host, v: *View, title: []const u8) void {
+        const dup = self.gpa.dupe(u8, title) catch return;
+        if (v.title.len != 0) self.gpa.free(v.title);
+        v.title = dup;
+    }
+
     fn postNavState(self: *Host, v: *View) void {
         const b = v.browser;
         const can_back: u8 = if (b != null and browserInt(b, "can_go_back") != 0) 1 else 0;
         const can_fwd: u8 = if (b != null and browserInt(b, "can_go_forward") != 0) 1 else 0;
         const loading: u8 = if (b != null and browserInt(b, "is_loading") != 0) 1 else 0;
+        v.nav_back = can_back != 0;
+        v.nav_fwd = can_fwd != 0;
+        v.nav_loading = loading != 0;
         self.post(proto.EvNavState{
             .view = v.id,
             .can_back = can_back,
@@ -13733,6 +14172,7 @@ fn onPaint(
     latStamp("paint");
     v.gen +%= 1;
     host.presentPaint(v, list[0..n]);
+    host.observeDamage(v, list[0..n]);
     if (host.viewInline(v)) {
         // Union rather than queue: a slow bridge coalesces bursts into
         // one damage rect instead of growing the outbox without bound.
@@ -13906,6 +14346,7 @@ fn onTitleChange(
     var s = Utf8.init(title);
     defer s.free();
     if (v.webext_bg or v.webext_popup) return;
+    host.setTitle(v, s.slice());
     host.presentTitle(v, s.slice());
     host.post(proto.EvTitle{ .view = v.id, .title = s.slice() });
 }
@@ -14150,6 +14591,9 @@ fn onLoadingStateChange(
         applyZoom(v);
         return;
     }
+    v.nav_back = can_back != 0;
+    v.nav_fwd = can_fwd != 0;
+    v.nav_loading = is_loading != 0;
     host.post(proto.EvNavState{
         .view = v.id,
         .can_back = if (can_back != 0) 1 else 0,

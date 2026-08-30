@@ -251,6 +251,20 @@ pub const FrameType = enum(u8) {
     /// `web_helper:true` — an old daemon would answer `.err`,
     /// misattributable on a multiplexed connection.
     web_helper_open = 34,
+    /// CONNECT to a browser helper already serving on THIS host and
+    /// bridge it exactly as `web_helper_open` bridges a spawned one:
+    /// how a GUI observes a REMOTE assistant's browser (capability
+    /// "observe" on the helper wire) through the assistant's daemon.
+    /// JSON { req, session }: `session` names the assistant's web
+    /// session, resolved to the helper socket through the `web*.json`
+    /// presence files beside the daemon's own socket (the MCP
+    /// instance layout, `src/ipc/webdrive.zig`); an empty session
+    /// means the direct route's `web.sock`. Answered with
+    /// `web_helper_reply` + `chan_open` like the spawn form; the
+    /// channel closes when either side does and kills no process.
+    /// Only sent to daemons whose welcome advertises
+    /// `web_helper_connect:true`.
+    web_helper_connect = 35,
     // daemon → client
     welcome = 64,
     snapshot = 65,
@@ -1086,6 +1100,7 @@ test "wire: append-only frame and event values include panel RPC" {
     try std.testing.expectEqual(@as(u8, 31), @intFromEnum(FrameType.panel_request));
     try std.testing.expectEqual(@as(u8, 32), @intFromEnum(FrameType.web_op));
     try std.testing.expectEqual(@as(u8, 34), @intFromEnum(FrameType.web_helper_open));
+    try std.testing.expectEqual(@as(u8, 35), @intFromEnum(FrameType.web_helper_connect));
     try std.testing.expectEqual(@as(u8, 98), @intFromEnum(FrameType.web_helper_reply));
     try std.testing.expectEqual(@as(u8, 7), @intFromEnum(ChannelKind.web_helper));
     try std.testing.expectEqual(@as(u8, 64), @intFromEnum(FrameType.welcome));

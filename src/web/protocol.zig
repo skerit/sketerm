@@ -258,6 +258,41 @@ pub const CAP_PRESENTER_ENV = "SKETERM_WEB_PRESENTER";
 /// one (`cookie_dump_req` -> paged `ev_cookie_dump`).
 pub const CAP_COOKIE_SYNC = "cookie-sync";
 
+/// Cross-connection view OBSERVATION (0xF0 block).
+///
+/// Under `multi-client` a view is owner-scoped: its events reach the
+/// connection that created it and nobody else. This block lets another
+/// connection of the SAME helper watch, and optionally drive, a view it
+/// does not own — how a GUI shows an assistant's pages as ordinary
+/// browser pages, as a second client of the assistant's own helper.
+///
+/// `observe_enable` turns on announcements: one `ev_observe_view` per
+/// presentable page of every OTHER connection (url, title, geometry,
+/// owner), then one per page created or destroyed from there on.
+/// `observe_subscribe` names one announced view by its `target` (the
+/// engine-global id the announcement carried) and an observer-minted
+/// `view` id in the observer's own namespace; from the acknowledging
+/// `ev_observe_state` onward the observer receives that view's frames
+/// and events under ITS id, exactly as if it were the observer's own
+/// view. Frames for an observed view are ALWAYS `frame_inline`, whatever
+/// frame family the observer's own views use: nothing to share a memfd
+/// or dma-buf with, and identical over a bridged remote helper.
+///
+/// An observer may send `frame_request`, `view_show`/`view_hide` (its
+/// own pause; the owner's view keeps painting) and `view_destroy` (an
+/// UNSUBSCRIBE, never a destroy) for its alias. Input, navigation, find
+/// and scrolling need `control = 1`, asked at subscribe time or flipped
+/// with `observe_control`; a read-only observer's input is DROPPED
+/// helper-side. Everything else (resize, discard, zoom, contexts,
+/// semantic, a11y, devtools, ...) is refused for an alias regardless:
+/// geometry and identity belong to the owner. `observerAllows` is the
+/// one home for that gate.
+///
+/// The owner never learns of observers. A view the owner destroys ends
+/// every subscription with `ev_observe_state{state = ended}`; an
+/// observer disconnecting leaves the owner's views untouched.
+pub const CAP_OBSERVE = "observe";
+
 /// Per-connection id window under `multi-client`: connection k owns
 /// client-minted view ids translated into globals by adding
 /// `k * CONN_ID_WINDOW`, so two clients both minting id 1 never
@@ -436,6 +471,13 @@ pub const Tag = enum(u8) {
     ev_cookie_apply_done = 0xE3,
     cookie_dump_req = 0xE4,
     ev_cookie_dump = 0xE5,
+    // 0xF0-0xF7: cross-connection view observation, capability
+    // "observe" (see CAP_OBSERVE).
+    observe_enable = 0xF0,
+    ev_observe_view = 0xF1,
+    observe_subscribe = 0xF2,
+    ev_observe_state = 0xF3,
+    observe_control = 0xF4,
     _,
 
     /// Whether this build knows the frame; unknown tags are skipped.
@@ -446,6 +488,54 @@ pub const Tag = enum(u8) {
         };
     }
 };
+
+/// The observer gate (capability "observe"): which client frames a
+/// connection may send for a view it only OBSERVES. `control` is the
+/// subscription's lease. Frames absent here are dropped for an alias,
+/// whatever the lease — geometry, identity, discard, the semantic and
+/// a11y families and the engine chrome all belong to the owner. The
+/// observe family's own frames are not listed: `observe_subscribe`
+/// mints the alias and `observe_control` addresses it directly.
+pub fn observerAllows(tag: Tag, control: bool) bool {
+    return switch (tag) {
+        // Any observer: its own pacing, pause and unsubscribe.
+        .frame_request, .frame_release, .view_show, .view_hide, .view_destroy => true,
+        // A controlling observer drives the page as the owner would.
+        .input_pointer,
+        .input_scroll,
+        .input_key,
+        .input_ime,
+        .input_paste,
+        .input_focus,
+        .clipboard_read,
+        .navigate,
+        .nav_action,
+        .find,
+        .find_stop,
+        .scroll_to,
+        => control,
+        else => false,
+    };
+}
+
+test "observerAllows: read-only observers pace and pause, control drives, geometry stays the owner's" {
+    try std.testing.expect(observerAllows(.frame_request, false));
+    try std.testing.expect(observerAllows(.view_destroy, false));
+    try std.testing.expect(!observerAllows(.input_pointer, false));
+    try std.testing.expect(!observerAllows(.navigate, false));
+    try std.testing.expect(observerAllows(.input_pointer, true));
+    try std.testing.expect(observerAllows(.input_key, true));
+    try std.testing.expect(observerAllows(.navigate, true));
+    try std.testing.expect(observerAllows(.find, true));
+    // Never, whatever the lease.
+    try std.testing.expect(!observerAllows(.view_resize, true));
+    try std.testing.expect(!observerAllows(.view_discard, true));
+    try std.testing.expect(!observerAllows(.set_zoom, true));
+    try std.testing.expect(!observerAllows(.sem_snapshot_req, true));
+    try std.testing.expect(!observerAllows(.a11y_enable, true));
+    try std.testing.expect(!observerAllows(.devtools_show, true));
+    try std.testing.expect(!observerAllows(.cert_decision, true));
+}
 
 /// `nav_action` action byte.
 pub const NavAct = enum(u8) {
@@ -3156,6 +3246,129 @@ pub const EvCookieDump = struct {
         };
     }
 };
+
+// -- cross-connection observation (0xF0 block, capability "observe") --
+//
+// See CAP_OBSERVE for the model. `target` fields carry ENGINE-GLOBAL
+// view ids verbatim (they name another connection's view, which no
+// window arithmetic of the observer's could express); `view` fields
+// are the observer's own alias ids and translate like every other
+// view-naming field.
+
+/// Client -> helper: start (1) or stop (0) announcing other
+/// connections' pages. Starting replays every current one as
+/// `ev_observe_view{state = present}`; stopping ends the announcements
+/// only — live subscriptions are unaffected.
+pub const ObserveEnable = struct {
+    pub const tag: Tag = .observe_enable;
+    enable: u8,
+};
+
+/// `ObserveView.state` values.
+pub const observe_view_gone: u8 = 0;
+pub const observe_view_present: u8 = 1;
+
+/// Helper -> client: a page of another connection exists (`present`)
+/// or was destroyed (`gone`). `owner` is the owning connection's id
+/// (stable for its life, never reused), `opener` the target id of the
+/// page that opened this one as a popup (0 otherwise), `w`/`h` the
+/// LOGICAL size and `scale_x1000` the DPR the page is laid out at.
+/// `url`/`title` are what the helper knows at that moment; a subscriber
+/// receives every later change as `ev_nav_state`/`ev_title`.
+pub const EvObserveView = struct {
+    pub const tag: Tag = .ev_observe_view;
+    target: u32,
+    owner: u32,
+    state: u8,
+    opener: u32,
+    w: u16,
+    h: u16,
+    scale_x1000: u16,
+    url: []const u8,
+    title: []const u8,
+};
+
+/// Client -> helper: observe `target` under the observer-minted alias
+/// `view` (client namespace, like `view_create`'s id; it must not name
+/// a view of the observer's own). `control = 1` asks to drive it.
+/// Answered by exactly one `ev_observe_state`.
+pub const ObserveSubscribe = struct {
+    pub const tag: Tag = .observe_subscribe;
+    view: u32,
+    target: u32,
+    control: u8,
+};
+
+/// Client -> helper: change the lease of an existing alias. Answered
+/// by one `ev_observe_state` (`state = subscribed` with the new lease,
+/// or `refused` for an unknown alias).
+pub const ObserveControl = struct {
+    pub const tag: Tag = .observe_control;
+    view: u32,
+    control: u8,
+};
+
+/// `EvObserveState.state` values.
+pub const observe_refused: u8 = 0;
+pub const observe_subscribed: u8 = 1;
+/// The target was destroyed (or its owner left): the alias is gone
+/// and nothing further arrives under it.
+pub const observe_ended: u8 = 2;
+
+/// Helper -> client: the alias `view`'s subscription state. Sent once
+/// per `observe_subscribe`/`observe_control`, again whenever the
+/// target's geometry changes (so the observer can keep its
+/// letterbox right), and finally as `ended`. `w`/`h`/`scale_x1000`
+/// describe the TARGET's logical size and DPR; `reason` explains a
+/// refusal or an ending in words.
+pub const EvObserveState = struct {
+    pub const tag: Tag = .ev_observe_state;
+    view: u32,
+    target: u32,
+    state: u8,
+    control: u8,
+    w: u16,
+    h: u16,
+    scale_x1000: u16,
+    reason: []const u8,
+};
+
+test "round-trip: observe frames" {
+    try roundTrip(ObserveEnable, .{ .enable = 1 });
+    try roundTrip(EvObserveView, .{
+        .target = 0x0010_0003,
+        .owner = 1,
+        .state = observe_view_present,
+        .opener = 0x0010_0001,
+        .w = 1024,
+        .h = 768,
+        .scale_x1000 = 1500,
+        .url = "https://example.com/",
+        .title = "Example",
+    });
+    try roundTrip(ObserveSubscribe, .{ .view = 9, .target = 0x0010_0003, .control = 1 });
+    try roundTrip(ObserveControl, .{ .view = 9, .control = 0 });
+    try roundTrip(EvObserveState, .{
+        .view = 9,
+        .target = 0x0010_0003,
+        .state = observe_ended,
+        .control = 0,
+        .w = 1024,
+        .h = 768,
+        .scale_x1000 = 1000,
+        .reason = "the owner destroyed the view",
+    });
+}
+
+test "observe tags occupy the 0xF0 block and leave 0xE6-0xEF free" {
+    try std.testing.expectEqual(@as(u8, 0xF0), @intFromEnum(Tag.observe_enable));
+    try std.testing.expectEqual(@as(u8, 0xF1), @intFromEnum(Tag.ev_observe_view));
+    try std.testing.expectEqual(@as(u8, 0xF2), @intFromEnum(Tag.observe_subscribe));
+    try std.testing.expectEqual(@as(u8, 0xF3), @intFromEnum(Tag.ev_observe_state));
+    try std.testing.expectEqual(@as(u8, 0xF4), @intFromEnum(Tag.observe_control));
+    try std.testing.expect(!@as(Tag, @enumFromInt(0xE6)).known());
+    try std.testing.expect(!@as(Tag, @enumFromInt(0xEF)).known());
+}
 
 // -- WebExtensions (0xB0 block, capability "webext") ------------------
 //

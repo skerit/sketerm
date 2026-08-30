@@ -3832,6 +3832,14 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     // browser from their own GUI; the text lane says where to look.
     const web_watch = @import("mcp_web.zig").presenterActive();
     try res.fact("web_watch", web_watch);
+    // The browser-page watch: the GUI joins this server's helper as a
+    // second client and shows its pages as web pages (helper
+    // capability "observe"). `web_socket` is the socket it joins.
+    const web_observe = @import("mcp_web.zig").observeActive();
+    try res.fact("web_observe", web_observe);
+    var web_sock_buf: [4096]u8 = undefined;
+    if (@import("mcp_web.zig").helperSocket(&web_sock_buf)) |ws| try res.fact("web_socket", ws) else try res.raw("web_socket", "null");
+    if (web_observe) try res.text("the user can watch this browser's pages as browser pages from their sketerm GUI (assistant chip / Session Overview: Watch or Take control)");
     if (app_state.mux_sock) |ms| try res.fact("mux_socket", ms) else try res.raw("mux_socket", "null");
     if (@import("mcp_web.zig").sessionInfo()) |ws| {
         if (app_state.mux_sock) |ms| {

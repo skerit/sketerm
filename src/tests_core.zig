@@ -229,6 +229,8 @@ comptime {
     _ = @import("web/axtree.zig");
     _ = @import("web/semnav.zig");
     _ = @import("web/navfault.zig");
+    _ = @import("web/watchgeom.zig");
+    _ = @import("web/webpresence.zig");
     _ = @import("web/reader_guards.zig");
     _ = @import("web/quarantine.zig");
     // WebExtensions foundation: match patterns, MV2 manifest parse,

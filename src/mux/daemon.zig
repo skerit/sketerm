@@ -49,6 +49,7 @@ const snapshot = @import("snapshot.zig");
 const lsp_proc = @import("../lsp/proc.zig");
 const lsp_servers = @import("../lsp/servers.zig");
 const webfindbin = @import("../web/findbin.zig");
+const webpresence = @import("../web/webpresence.zig");
 const shell_util = @import("shell.zig");
 const platform = @import("../util/platform.zig");
 const lifetime = @import("../util/lifetime.zig");
@@ -1492,6 +1493,104 @@ test "web_helper_open: missing helper is a described refusal, a spawn bridges a 
     }
     try t.expectEqual(@as(usize, 0), d.channels.items.len);
     try t.expectEqual(@as(usize, 0), d.lsp_reaps.items.len);
+}
+
+test "web_helper_connect: bridges a helper serving beside the daemon socket, describes an absent one" {
+    const t = std.testing;
+    const muxclient = @import("client.zig");
+    var dir_buf: [128:0]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/sk-webc-{d}", .{c.getpid()});
+    _ = c.mkdir(dir.ptr, 0o700);
+    var path_buf: [160:0]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buf, "{s}/mux.sock", .{dir});
+    var lock_buf: [180:0]u8 = undefined;
+    const lock_path = try std.fmt.bufPrintZ(&lock_buf, "{s}.lock", .{path});
+    var helper_buf: [160:0]u8 = undefined;
+    const helper_path = try std.fmt.bufPrintZ(&helper_buf, "{s}/web.sock", .{dir});
+    _ = c.unlink(path.ptr);
+    _ = c.unlink(lock_path.ptr);
+    _ = c.unlink(helper_path.ptr);
+    defer {
+        _ = c.unlink(path.ptr);
+        _ = c.unlink(lock_path.ptr);
+        _ = c.unlink(helper_path.ptr);
+        _ = c.rmdir(dir.ptr);
+    }
+    // A stand-in helper: a listener at the direct route's socket.
+    const lfd = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+    try t.expect(lfd >= 0);
+    defer _ = c.close(lfd);
+    {
+        var addr = std.mem.zeroes(c.struct_sockaddr_un);
+        addr.sun_family = c.AF_UNIX;
+        @memcpy(addr.sun_path[0..helper_path.len], helper_path);
+        try t.expect(c.bind(lfd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) == 0);
+        try t.expect(c.listen(lfd, 4) == 0);
+        _ = c.fcntl(lfd, c.F_SETFL, c.O_NONBLOCK);
+    }
+    var d = try Daemon.init(t.allocator, path);
+    defer d.deinit();
+    var conn = try muxclient.Conn.connect(t.allocator, path);
+    defer conn.deinit();
+    const Pump = struct {
+        fn next(dm: *Daemon, cn: *muxclient.Conn) !muxclient.Conn.OwnedFrame {
+            var spins: usize = 0;
+            while (spins < 4000) : (spins += 1) {
+                try dm.tick(0);
+                if (!cn.fillAvailable()) return error.Disconnected;
+                if (try cn.takeFrame()) |f| return f;
+                _ = c.usleep(1000);
+            }
+            return error.Timeout;
+        }
+    };
+    const Reply = struct { req: u32 = 0, ok: bool = false, chan: u32 = 0, @"error": []const u8 = "" };
+
+    // 1. The helper answers: chan_open (kind web_helper) then ok, and the
+    // stand-in sees the daemon's connection arrive.
+    try conn.sendJson(.web_helper_connect, .{ .req = @as(u32, 7), .session = "" });
+    var chan_id: u32 = 0;
+    {
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        try t.expectEqual(wire.FrameType.chan_open, f.ftype);
+        const co = wire.decodeChanOpen(f.payload).?;
+        try t.expectEqual(wire.ChannelKind.web_helper, co.kind);
+        chan_id = co.id;
+    }
+    {
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        try t.expectEqual(wire.FrameType.web_helper_reply, f.ftype);
+        var parsed = try std.json.parseFromSlice(Reply, t.allocator, f.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try t.expect(parsed.value.ok);
+        try t.expectEqual(@as(u32, 7), parsed.value.req);
+        try t.expectEqual(chan_id, parsed.value.chan);
+    }
+    const afd = c.accept(lfd, null, null);
+    try t.expect(afd >= 0);
+    defer _ = c.close(afd);
+    try t.expectEqual(@as(usize, 1), d.channels.items.len);
+    // A bridged channel owns no process: nothing to kill on close.
+    try t.expectEqual(@as(c.pid_t, -1), d.channels.items[0].child_pid);
+
+    // 2. No helper: a described refusal, no channel.
+    _ = c.close(afd);
+    _ = c.unlink(helper_path.ptr);
+    try conn.sendJson(.web_helper_connect, .{ .req = @as(u32, 8), .session = "web-1-nope" });
+    while (true) {
+        const f = try Pump.next(d, &conn);
+        defer f.deinit(t.allocator);
+        if (f.ftype == .chan_close) continue;
+        try t.expectEqual(wire.FrameType.web_helper_reply, f.ftype);
+        var parsed = try std.json.parseFromSlice(Reply, t.allocator, f.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try t.expectEqual(@as(u32, 8), parsed.value.req);
+        try t.expect(!parsed.value.ok);
+        try t.expect(std.mem.indexOf(u8, parsed.value.@"error", "not running") != null);
+        break;
+    }
 }
 
 pub const Native = struct {
@@ -5607,6 +5706,74 @@ pub const Daemon = struct {
             return;
         };
         log.debug("web_helper_open: pid {d} -> channel {d}", .{ pid, ch.id });
+        var ob: [5]u8 = undefined;
+        cl.queueFrame(.chan_open, wire.encodeChanOpen(&ob, ch.id, .web_helper));
+        cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = true, .chan = ch.id });
+    }
+
+    const WebHelperConnectReq = struct { req: u32 = 0, session: []const u8 = "" };
+
+    /// Bridge a browser helper ALREADY serving beside this daemon's
+    /// socket (`web_helper_connect`): the assistant's helper of the MCP
+    /// instance this daemon belongs to, resolved through the presence
+    /// files exactly as the local GUI resolves it (`webpresence.zig`).
+    /// The channel owns no process: closing it closes a client of the
+    /// helper and nothing more, so the assistant's browser is never
+    /// killed by a viewer leaving.
+    pub fn handleWebHelperConnect(self: *Daemon, cl: *Client, payload: []const u8) void {
+        var parsed = std.json.parseFromSlice(WebHelperConnectReq, self.allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch {
+            cl.queueErr("bad web_helper_connect request");
+            return;
+        };
+        defer parsed.deinit();
+        const req = parsed.value;
+        var sock_buf: [webpresence.MAX_PATH]u8 = undefined;
+        const sock = webpresence.helperSocketFor(&sock_buf, self.sock_path, req.session) orelse {
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "no browser helper socket beside this daemon" });
+            return;
+        };
+        var addr = std.mem.zeroes(c.struct_sockaddr_un);
+        if (sock.len + 1 > addr.sun_path.len) {
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "helper socket path too long" });
+            return;
+        }
+        addr.sun_family = c.AF_UNIX;
+        @memcpy(addr.sun_path[0..sock.len], sock);
+        const fd = platform.socketCloexec(c.AF_UNIX, c.SOCK_STREAM, 0);
+        if (fd < 0) {
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "socket failed" });
+            return;
+        }
+        if (c.connect(fd, @ptrCast(&addr), @sizeOf(c.struct_sockaddr_un)) != 0) {
+            _ = c.close(fd);
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "the assistant's browser helper is not running (its socket does not answer)" });
+            return;
+        }
+        const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+        _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+        const ch = self.allocator.create(Channel) catch {
+            _ = c.close(fd);
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "oom" });
+            return;
+        };
+        ch.* = .{
+            .allocator = self.allocator,
+            .id = self.next_chan_id,
+            .fd = fd,
+            .session = null,
+            .client = cl,
+            .tcp = true,
+        };
+        self.next_chan_id += 1;
+        self.channels.append(self.allocator, ch) catch {
+            ch.dead = true;
+            ch.deinit();
+            cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = false, .@"error" = "oom" });
+            return;
+        };
+        log.debug("web_helper_connect: {s} -> channel {d}", .{ sock, ch.id });
         var ob: [5]u8 = undefined;
         cl.queueFrame(.chan_open, wire.encodeChanOpen(&ob, ch.id, .web_helper));
         cl.queueJson(.web_helper_reply, .{ .req = req.req, .ok = true, .chan = ch.id });

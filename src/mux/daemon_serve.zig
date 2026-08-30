@@ -952,6 +952,10 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 // the "daemon too old for remote browsing" described
                 // error the GUI shows instead of hanging.
                 .web_helper = true,
+                // Connect-to-existing counterpart (web_helper_connect):
+                // the remote-assistant watch. Capability for the same
+                // reason as web_helper.
+                .web_helper_connect = true,
             });
         },
         .spawn => self.handleSpawn(cl, frame.payload),
@@ -1044,6 +1048,7 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
         // NOT attach-scoped either: the helper renders on the daemon's
         // host and belongs to the client connection, not to a session.
         .web_helper_open => self.handleWebHelperOpen(cl, frame.payload),
+        .web_helper_connect => self.handleWebHelperConnect(cl, frame.payload),
         .rec_stop => {
             const s = cl.attached orelse {
                 cl.queueErr("not attached");
