@@ -1321,6 +1321,14 @@ const Client = struct {
     /// arrive in the CLIENT's namespace, so the stage asserts on it.
     title_view: u32 = 0,
 
+    /// The last `ev_clipboard_text`: the answer to `clipboard_read`,
+    /// which must reach whoever ASKED (an observer under its alias).
+    clip: [1024]u8 = @splat(0),
+    clip_len: usize = 0,
+    clip_seq: u32 = 0,
+    clip_view: u32 = 0,
+    clip_echo: u32 = 0,
+
     popup_view: u32 = 0,
     /// Gesture flag of the LAST popup request seen; the whole point of
     /// the GUI's popup policy, so the rig has to observe both values.
@@ -2193,6 +2201,14 @@ const Client = struct {
                 self.title_view = t.view;
                 self.title_len = @min(t.title.len, self.title.len);
                 @memcpy(self.title[0..self.title_len], t.title[0..self.title_len]);
+            },
+            .ev_clipboard_text => {
+                const t = proto.decode(proto.EvClipboardText, frame.payload) catch fail("ev_clipboard_text decode");
+                self.clip_seq += 1;
+                self.clip_view = t.view;
+                self.clip_echo = t.seq;
+                self.clip_len = @min(t.text.s.len, self.clip.len);
+                @memcpy(self.clip[0..self.clip_len], t.text.s[0..self.clip_len]);
             },
             .ev_net_policy => {
                 const p = proto.decode(proto.EvNetPolicy, frame.payload) catch fail("ev_net_policy decode");
@@ -5645,6 +5661,112 @@ fn runObserveStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) 
     if (a.title_view != 1) fail("stage ob4: the owner's title event left its namespace");
     if (!b.waitInlineCenter(.{ 0x00, 0xff, 0x00 }, 15_000)) fail("stage ob4: the observer's frame did not turn green after its click");
     pass("stage ob4 a controlling observer's click changes the page for owner and observer alike");
+
+    // ── ob4b: a controlling observer pastes into, and copies from, the
+    // watched page ───────────────────────────────────────────────────
+    //
+    // The clipboard bridge belongs to the CLIENT (a windowless CEF's own
+    // clipboard is empty in every configuration this product can reach,
+    // `CAP_CLIPBOARD`), so a watched page can only be pasted into if the
+    // WATCHER's text reaches it and its `clipboard_read` is answered to
+    // the WATCHER. Without this stage the whole Take-control path could
+    // not fill in a login form, which is what it exists for.
+    const clip_page = "data:text/html,<title>ob:clip</title>" ++
+        "<body style='margin:0;background:%23000044'>" ++
+        "<input id=i style='width:300px;height:60px;font-size:28px' oninput=\"document.title='ob:val:'+this.value\">" ++
+        "<div id=s onclick=\"getSelection().selectAllChildren(this)\" " ++
+        "style='position:absolute;bottom:0;left:0;width:100%25;height:80px;font-size:28px;background:%2300aa00'>OBSELECTED</div>" ++
+        "<script>onload=()=>i.focus()</script></body>";
+    const present_before_clip = b.obs_present_seq;
+    a.send(proto.ViewCreate{ .view = 3, .w = 320, .h = 240, .scale_x1000 = 1000, .context = 0 });
+    a.send(proto.Navigate{ .view = 3, .url = clip_page });
+    {
+        const d = nowMs() + 20_000;
+        while (b.obs_present_seq == present_before_clip and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (b.obs_present_seq == present_before_clip) fail("stage ob4b: A's clipboard page was not announced");
+    // The announcement fires at CREATE; the input does not exist until
+    // the document has run. Wait for the page, or the paste lands in a
+    // blank document and the stage measures its own race.
+    if (!a.waitTitle("ob:clip", 30_000)) fail("stage ob4b: the clipboard page never loaded for its owner");
+    const a_view3 = b.obs_target;
+    const ost_clip = b.ost_seq;
+    b.send(proto.ObserveSubscribe{ .view = 3, .target = a_view3, .control = 1 });
+    {
+        const d = nowMs() + 15_000;
+        while (b.ost_seq == ost_clip and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (b.ost_seq == ost_clip or b.ost_state != proto.observe_subscribed or b.ost_control != 1)
+        fail("stage ob4b: the controlling subscription to the clipboard page was refused");
+
+    // The OWNER's own paste first: the clipboard bridge itself shipped
+    // without an end-to-end proof, so a failure here is the base path,
+    // not the observer's.
+    a.send(proto.InputFocus{ .view = 3, .focused = 1 });
+    a.send(proto.InputPaste{ .view = 3, .text = .{ .s = "AOWN" } });
+    {
+        const d = nowMs() + 20_000;
+        while (nowMs() < d) {
+            a.pump(50);
+            b.pump(0);
+            if (std.mem.indexOf(u8, a.titleSlice(), "ob:val:AOWN") != null) break;
+        }
+    }
+    if (std.mem.indexOf(u8, a.titleSlice(), "ob:val:AOWN") == null)
+        fail("stage ob4b: the OWNER's own paste never reached its input field (the clipboard bridge itself is broken)");
+
+    // Paste: focus as the GUI does, then push the text. The page
+    // reports what its input actually received.
+    b.send(proto.InputFocus{ .view = 3, .focused = 1 });
+    b.send(proto.InputPaste{ .view = 3, .text = .{ .s = "OBPASTED" } });
+    {
+        const d = nowMs() + 20_000;
+        while (nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+            if (std.mem.indexOf(u8, a.titleSlice(), "OBPASTED") != null) break;
+        }
+    }
+    if (std.mem.indexOf(u8, a.titleSlice(), "OBPASTED") == null)
+        fail("stage ob4b: a controlling observer's paste never reached the watched page's input field");
+
+    // Copy: the observer clicks the block that selects itself, then
+    // asks for the selection. The answer must arrive under ITS alias.
+    b.send(proto.InputPointer{ .view = 3, .kind = @intFromEnum(proto.PointerKind.move), .x = 160, .y = 200, .button = 0, .clicks = 0, .mods = 0 });
+    b.send(proto.InputPointer{ .view = 3, .kind = @intFromEnum(proto.PointerKind.down), .x = 160, .y = 200, .button = 0, .clicks = 1, .mods = 0 });
+    b.send(proto.InputPointer{ .view = 3, .kind = @intFromEnum(proto.PointerKind.up), .x = 160, .y = 200, .button = 0, .clicks = 1, .mods = 0 });
+    {
+        const d = nowMs() + 3_000;
+        while (nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    const clip_before = b.clip_seq;
+    b.send(proto.ClipboardRead{ .view = 3, .seq = 77, .mode = @intFromEnum(proto.ClipboardMode.copy) });
+    {
+        const d = nowMs() + 15_000;
+        while (b.clip_seq == clip_before and nowMs() < d) {
+            b.pump(50);
+            a.pump(0);
+        }
+    }
+    if (b.clip_seq == clip_before) fail("stage ob4b: a controlling observer's clipboard_read was never answered");
+    if (b.clip_view != 3) fail("stage ob4b: the clipboard answer did not arrive under the observer's alias id");
+    if (b.clip_echo != 77) fail("stage ob4b: the clipboard answer did not echo the request seq");
+    if (std.mem.indexOf(u8, b.clip[0..b.clip_len], "OBSELECTED") == null)
+        fail("stage ob4b: the clipboard answer did not carry the watched page's selection");
+    // The owner is not disturbed by the observer's clipboard traffic.
+    if (a.clip_seq != 0) fail("stage ob4b: the observer's clipboard answer was delivered to the owner as well");
+    b.send(proto.ViewDestroy{ .view = 3 });
+    a.send(proto.ViewDestroy{ .view = 3 });
+    pass("stage ob4b a controlling observer pastes into the watched page and reads its selection back");
 
     // ── ob5: a new page of A is announced to B ────────────────────
     const present_before = b.obs_present_seq;

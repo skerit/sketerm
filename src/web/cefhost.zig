@@ -4626,9 +4626,20 @@ pub const Host = struct {
         v.popup_allow = allow;
     }
 
+    /// Insert the client's clipboard text at the caret, as CHAR events.
+    ///
+    /// NOT `ime_commit_text`: MEASURED (smoke-web stage ob4b, which
+    /// failed on exactly this) a standalone commit with no active
+    /// composition inserts NOTHING in a windowless browser — the
+    /// commit path at `Host.ime` works only because a composition is
+    /// live there. `typeText` is the same trusted char-event path
+    /// `set_value` and `input_key` use, so a page cannot tell a paste
+    /// from a human typing, and it is the one already proven end to
+    /// end. Newlines ride through as their own char events, which is
+    /// what a real paste into a textarea does.
     pub fn paste(self: *Host, req: proto.InputPaste) void {
         const v = self.findWake(req.view) orelse return;
-        commitText(v, req.text.s, @intCast(req.text.s.len));
+        typeText(v, req.text.s);
     }
 
     /// Answer the client's `clipboard_read` from the selection CEF
