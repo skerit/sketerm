@@ -343,7 +343,7 @@ pub fn applyPaneConfig(self: *Window, pane: *Pane, opts: Window.PaneConfigOpts) 
     pane.surface.cursor_blink_us = @as(i64, @intCast(self.config.cursor_blink_ms)) * 1000;
     pane.restartBlinkTimer();
     pane.applyTrailConfig(self.config.cursor_trail, self.config.cursor_trail_ms);
-    pane.app_view_tab = self.config.app_view == .tab;
+    if (!pane.app_view_tab_forced) pane.app_view_tab = self.config.app_view == .tab;
     pane.surface.line_pad_px = s.line_pad_px;
     pane.surface.grid_pass.pad = s.padding;
     pane.surface.cell_pass.pad = s.padding;
@@ -926,7 +926,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
         // Rendering.
         // Affects the next app launch; live views keep their mode
         // (pop in/out via the window's host menu).
-        p.app_view_tab = self.config.app_view == .tab;
+        if (!p.app_view_tab_forced) p.app_view_tab = self.config.app_view == .tab;
         p.surface.grid_pass.enable_ligatures = self.config.ligatures;
         p.surface.grid_pass.enable_bidi = self.config.bidi;
         p.surface.grid_pass.enable_url_underline = self.config.auto_url_detect;

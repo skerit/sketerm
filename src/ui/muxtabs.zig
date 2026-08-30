@@ -152,20 +152,53 @@ pub fn attachMuxTab(self: *Window, conn_in: @import("../mux/client.zig").Conn, n
     try self.attachMux(conn_in, name, host, null);
 }
 
-/// True when a pane or tabless app session in this window already
-/// renders mux session `name` on `host` (null = local daemon).
-pub fn sessionShown(self: *Window, name: []const u8, host: ?[]const u8) bool {
+/// How a mux session is rendered in this window. The distinction is
+/// load-bearing: a `.tabless` app session satisfies "already shown"
+/// while having no Pane, and so no titlebar chip to escalate its lease
+/// from — every UI that greys an action out on "shown" must ask which.
+pub const SessionPlacement = enum { none, tabless, pane };
+
+pub fn sessionPlacement(self: *Window, name: []const u8, host: ?[]const u8) SessionPlacement {
     for (self.panes.items) |p| {
         const r = p.terminal.remote orelse continue;
         if (!hostEql(r.host, host)) continue;
-        if (std.mem.eql(u8, r.session, name)) return true;
+        if (std.mem.eql(u8, r.session, name)) return .pane;
     }
     for (self.app_sessions.items) |as| {
         const r = as.terminal.remote orelse continue;
         if (!hostEql(r.host, host)) continue;
-        if (std.mem.eql(u8, r.session, name)) return true;
+        if (std.mem.eql(u8, r.session, name)) return .tabless;
     }
-    return false;
+    return .none;
+}
+
+/// True when a pane or tabless app session in this window already
+/// renders mux session `name` on `host` (null = local daemon).
+pub fn sessionShown(self: *Window, name: []const u8, host: ?[]const u8) bool {
+    return self.sessionPlacement(name, host) != .none;
+}
+
+/// The tabless app session rendering `name` on `host`, if any.
+fn appSessionFor(self: *Window, name: []const u8, host: ?[]const u8) ?*Window.AppSession {
+    for (self.app_sessions.items) |as| {
+        const r = as.terminal.remote orelse continue;
+        if (!hostEql(r.host, host)) continue;
+        if (std.mem.eql(u8, r.session, name)) return as;
+    }
+    return null;
+}
+
+/// The route back to the controller lease from a TABLESS attachment,
+/// which has no pane titlebar chip to escalate from: materialize it as
+/// a tab, then ask for the lease. Attaching a SECOND viewer instead
+/// would put two views of one session in one window, which is why
+/// every "already shown" caller comes here rather than dialing again.
+/// @return false when no tabless session of that name is shown here.
+pub fn escalateTablessSession(self: *Window, name: []const u8, host: ?[]const u8, control: bool) bool {
+    const as = appSessionFor(self, name, host) orelse return false;
+    const pane = materializeAppSession(self, as) orelse return false;
+    if (control) pane.terminal.requestControl(pane.terminal.control_holder_len != 0);
+    return true;
 }
 
 pub const hostEql = strz.eqOpt;
@@ -915,7 +948,10 @@ fn attachMuxPreparedMode(self: *Window, conn_in: @import("../mux/client.zig").Co
     const pane = try makeRemotePaneFromSnap(self, conn, name, host, snapshot_payload, identity, null, lease == .read_only, lease == .control, false);
     pane.active_profile = if (profile) |p| p.name else null;
     self.applyPaneConfig(pane, .{ .profile = profile });
-    if (force_tab) pane.app_view_tab = true;
+    if (force_tab) {
+        pane.app_view_tab = true;
+        pane.app_view_tab_forced = true;
+    }
 
     var title_buf: [160:0]u8 = undefined;
     const title_z = if (host) |h|
@@ -1009,14 +1045,25 @@ pub fn appSessionAppView(ctx: ?*anyopaque, host_opaque: ?*anyopaque) void {
     }
 }
 
-pub fn appSessionRequestEmbed(ctx: ?*anyopaque) void {
-    const as = cast.userData(Window.AppSession, ctx);
-    const win = as.window;
+/// Turn a tabless app session into a tab and re-embed its first
+/// forwarded window. The ONE place that materializes an AppSession, so
+/// "Show in Tab" and the lease escalation cannot drift apart.
+fn materializeAppSession(win: *Window, as: *Window.AppSession) ?*Pane {
     const term = as.terminal;
-    const pane = adoptAppSessionIntoTab(win, as) orelse return;
-    const remote = term.remote orelse return;
+    const pane = adoptAppSessionIntoTab(win, as) orelse return null;
+    // The user asked for this tab explicitly; app_view policy must not
+    // pop it back out on the next config reapply.
+    pane.app_view_tab = true;
+    pane.app_view_tab_forced = true;
+    const remote = term.remote orelse return pane;
     if (remote.napps.items.len > 0)
         pane.adoptAppHost(@ptrCast(remote.napps.items[0].host));
+    return pane;
+}
+
+pub fn appSessionRequestEmbed(ctx: ?*anyopaque) void {
+    const as = cast.userData(Window.AppSession, ctx);
+    _ = materializeAppSession(as.window, as);
 }
 
 test "pane registration publishes neither pointer when terminal reserve fails" {
@@ -1105,13 +1152,19 @@ pub const AttachJob = struct {
             .on_ready = on_ready,
             .ctx = ctx,
         };
+        // A failed start leaves `reuse` with the CALLER, which deinits it
+        // on the false return. Clearing it first is what keeps
+        // `job.destroy()` from closing the same fd and freeing the same
+        // buffers a second time: `Conn.deinit` nulls only this copy's fd.
         if (host) |h| {
             job.host = allocator.dupe(u8, h) catch {
+                job.reuse = null;
                 job.destroy();
                 return false;
             };
         }
         const thread = std.Thread.spawn(.{}, threadMain, .{job}) catch {
+            job.reuse = null;
             job.destroy();
             return false;
         };

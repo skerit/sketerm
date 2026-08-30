@@ -561,7 +561,11 @@ fn populateFetched(self: *Switcher) void {
         for (listing.value.sessions) |*session| {
             if (session.exited) continue;
             const host: ?[]const u8 = if (daemon.host) |value| value else null;
-            if (self.win.sessionShown(session.name, host)) continue;
+            // A pane already renders it and its own chip owns the lease.
+            // A TABLESS app session keeps its row: without it there is no
+            // route left to Take control (its floating window carries an
+            // unclickable badge, not a button).
+            if (self.win.sessionPlacement(session.name, host) == .pane) continue;
             var running_apps: usize = 0;
             for (session.audio_streams, 0..) |info, index| {
                 if (!info.running) continue;
@@ -1414,11 +1418,20 @@ fn onOpIdle(user: ?*anyopaque) callconv(.c) c.gboolean {
 /// dialog state around it (one attach at a time, sensitivity, note).
 fn startAttach(self: *Switcher, target: SessionTarget, lease: muxtabs.Lease, placement: muxtabs.AttachJob.Placement) void {
     if (self.attaching) return;
+    const target_host: ?[]const u8 = if (target.host) |value| value else null;
+    // Already here as a tabless app session: that attachment has no
+    // pane chip to escalate from, so materialize it instead of dialing
+    // a second viewer onto the same session.
+    if (self.win.sessionPlacement(target.session, target_host) == .tabless) {
+        if (muxtabs.escalateTablessSession(self.win, target.session, target_host, lease == .control)) {
+            c.gtk_window_close(@ptrCast(self.window));
+            return;
+        }
+    }
     // The attach becomes the session's event stream, so it consumes a
     // whole connection -- take the daemon's idle one instead of dialing
     // (on a remote host a fresh dial is an ssh spawn).
     var reuse: ?mux_client.Conn = null;
-    const target_host: ?[]const u8 = if (target.host) |value| value else null;
     if (findDaemon(self, target_host)) |daemon| {
         if (!daemon.busy) {
             if (daemon.conn) |conn| {

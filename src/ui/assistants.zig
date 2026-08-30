@@ -518,7 +518,7 @@ pub const Watcher = struct {
         const tip = std.fmt.bufPrintZ(&tip_buf, "{s} ({s}), {d} viewer(s)", .{ s.name, @tagName(s.kind), s.viewers }) catch null;
         if (tip) |tz| c.gtk_widget_set_tooltip_text(label, tz.ptr);
         c.gtk_box_append(@ptrCast(row), label);
-        const shown = self.win.sessionShown(s.name, a.host);
+        const placement = self.win.sessionPlacement(s.name, a.host);
         for ([_]muxtabs.Lease{ .read_only, .control }) |lease| {
             const verb = attachVerb(lease);
             // Labelled, not icon-only: the popover is the one place a
@@ -527,8 +527,15 @@ pub const Watcher = struct {
             c.gtk_widget_add_css_class(btn, "flat");
             c.gtk_widget_set_tooltip_text(btn, verb.tip);
             // A session already in this window is not attached twice
-            // from here; the pane's own chip escalates the lease.
-            c.gtk_widget_set_sensitive(btn, @intFromBool(!shown));
+            // from here. With a pane, its own chip escalates the lease;
+            // a TABLESS app session has no chip, so Take control stays
+            // live and materializes it as a tab instead of dead-ending.
+            const sensitive = switch (placement) {
+                .none => true,
+                .tabless => lease == .control,
+                .pane => false,
+            };
+            c.gtk_widget_set_sensitive(btn, @intFromBool(sensitive));
             const ctx = self.allocator.create(RowCtx) catch continue;
             ctx.* = .{
                 .allocator = self.allocator,
@@ -551,6 +558,14 @@ pub const Watcher = struct {
     fn startAttach(self: *Watcher, pid: c.pid_t, session: []const u8, lease: muxtabs.Lease) void {
         if (self.dead) return;
         const a = self.findByPid(pid) orelse return;
+        // Already here as a tabless app session: escalate that viewer
+        // rather than dialing a second attach onto the same session.
+        if (self.win.sessionPlacement(session, a.host) == .tabless) {
+            if (muxtabs.escalateTablessSession(self.win, session, a.host, lease == .control)) {
+                c.gtk_popover_popdown(@ptrCast(self.popover));
+                return;
+            }
+        }
         const target = a.findSession(session) orelse return;
         var reuse: ?mux_client.Conn = null;
         if (!a.busy) {

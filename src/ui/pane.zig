@@ -272,6 +272,11 @@ pub const Pane = struct {
     /// Config app_view pushed by the Window: embed apps in the tab
     /// (true) or float them with a banner tab (false, default).
     app_view_tab: bool = false,
+    /// This pane was placed in a tab by an EXPLICIT request (assistant
+    /// Watch / Take control, "Show in Tab"), not by app_view policy.
+    /// Config reapply must not re-derive `app_view_tab` over it, or a
+    /// preference save silently pops the watched view back out.
+    app_view_tab_forced: bool = false,
     titlebar_box: ?*c.GtkWidget = null,
     titlebar_label: ?*c.GtkLabel = null,
     titlebar_visible: bool = false,
