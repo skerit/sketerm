@@ -1,5 +1,24 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-30: file operation roots and explicit assistant watch tabs
+
+**File operations.** A tree selection can contain both a real directory and
+rows displayed beneath it. Cut/paste submitted every selected row in order, so
+moving the directory first made the queued descendant paths fail with NOENT.
+`ui/browser/oproots.zig` now reduces clipboard, drag, peer-send, trash and
+delete selections to operation roots: descendants of a selected real directory
+are omitted, while symlinked directories remain independent. The rule is
+selection-order independent and path-component aware. Failed no-replace
+renames also carry their actual errno through the daemon instead of collapsing
+every permanent failure to `rename failed`.
+
+**Assistant Watch.** Explicit Watch and Take Control actions now force a tab
+even when `app_view=window`; ordinary session activation still follows that
+policy. Attach jobs preserve the assistant session's origin id, so the watched
+pane exposes the lease controls, and closing the read-only tab only detaches
+that viewer instead of killing the assistant-owned app. The end-to-end stage
+launches a real `app=true` assistant session and pins all three behaviors.
+
 ## 2026-08-29: per-tab routes reach the user; assistants become watchable
 
 Two features Jelle had been told were done turned out to be engine
