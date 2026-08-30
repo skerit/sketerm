@@ -1,5 +1,49 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-30: paste never worked, and only one window could browse
+
+Three browser bugs the user hit within minutes of the watch work
+landing, each of which existed because the feature that introduced it
+was proven by unit tests rather than by a rig.
+
+**Paste inserted nothing, anywhere.** The clipboard bridge pushed the
+text as `ime_commit_text`, and a standalone commit with NO live
+composition is a no-op in a windowless browser — the IME path at
+`Host.ime` works only because a composition is open. So the fix that
+"gave the browser a clipboard" shipped with protocol round-trip tests
+and no end-to-end proof, and pasting into any page did nothing at all;
+watching an assistant's page made it visible, but it was never the
+observer's fault. Paste now goes through `typeText`, the trusted
+char-event path `set_value` and `input_key` already use. smoke-web
+stage ob4b pins BOTH directions and both roles: the owner's own paste,
+a controlling observer's paste, and `clipboard_read` answered under the
+observer's alias with the owner undisturbed.
+
+**A watched page's pointer was off until a resize.** `layoutObserved`
+pinned only the start/top margins of the letterboxed picture, so
+GtkPicture kept its paintable's natural size, was allocated larger than
+the fit, and `CONTAIN` re-centred the frame inside that allocation —
+hover and clicks landed off by the difference, and a resize happened to
+recompute both. All four margins are pinned now. The watch e2e stage
+clicks OFF-CENTRE (10%/15% in) and compares the page's own
+`event.clientX/Y` against the fit; it fails on the old code.
+
+**Only one sketerm window could browse.** A second `sketerm-webengine`
+on the same `root_cache_path` dies at startup with `cef_initialize
+failed / Opening in existing browser session` (measured in 30 seconds
+against the installed binary), and the default route deliberately
+shares ONE profile so logins are the same everywhere. So the second
+window's every web tab said "the browser helper exited during startup"
+for as long as the first had a page open — with three windows open, two
+of them could not browse, and the `web_gui` grant walked straight into
+it by picking whichever GUI it found. `Client.adoptRunningHelper` joins
+the live helper of the same route instead of forking a rival (the
+helper has served several clients since `multi-client`; the socket file
+and the child belong to the process that spawned it, an adopted client
+reaps and unlinks nothing), a lost startup race retries adoption rather
+than reporting failure, and a helper too old to share is named as such.
+smoke-e2e's two-GUI stage fails without it and passes with it.
+
 ## 2026-08-30: moving files on a host without RENAME_NOREPLACE, and the reconnect that doubled every row
 
 **"the filesystem cannot rename safely without risking an overwrite".**
