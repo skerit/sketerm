@@ -14096,8 +14096,11 @@ fn onAfterCreated(
     // so a popup arriving then would be claimed by the pending view,
     // stamp the wrong cef id and orphan a browser — and an orphan
     // browser hangs `cef_shutdown`.
-    if (browserInt(b, "is_popup") != 0) {
-        if (host.claimPopupBrowser(b)) adopted = true;
+    // Only a browser we ARMED is ours: CEF reports the DevTools window
+    // as a popup as well, and swallowing that one left `devtools_show`
+    // waiting for an inspector that was already open.
+    if (browserInt(b, "is_popup") != 0 and host.claimPopupBrowser(b)) {
+        adopted = true;
         return;
     }
     if (host.pending) |v| {
