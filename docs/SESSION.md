@@ -57,6 +57,54 @@ stdout not inherited, idle-exit not leaked), kill it = re-spawn; and
 with no headless helper socket. `zig build test`, `test-core`,
 `smoke-mcp` and `mux-portable -Dportable-target=aarch64-macos` green.
 
+## 2026-08-30: popups behave like a browser's
+
+**A real popup was presented as a tab, and closing itself turned it
+into a terminal.** The engine now opens `window.open` for real
+(`ev_page_popup`, below), and it reports the shape the page asked for
+(`chromeless` = `cef_popup_features_t.isPopup`, plus the requested
+`w`/`h`), but `WebFace.onPagePopup` ignored all three and always minted
+a window tab. Worse, every web tab is built on a hidden shell, so when
+the Google login popup called `window.close()` the `page_popup_closed`
+handler ran `closeSelf` -> `Group.closePage` -> `detachAll`, which
+returns the pane to that shell: the popup became a terminal.
+
+Now `chromeless == 1` is a real POPUP WINDOW: `Window.openWebPopupWindow`
+builds it on the ordinary secondary-window path (`spawnSecondaryWindow`
+split into a hidden spawn plus present), transient for the opener,
+sized to the requested viewport plus its measured chrome and clamped to
+the opener's monitor, tab bar / sidebar / new-tab button hidden, and the
+page's address bar kept but READ-ONLY (`gtk_editable_set_editable`),
+because a popup routinely shows a password field and its origin must
+stay visible. `chromeless == 0` stays a tab (sidebar mode included).
+Both presentation paths, and only they, mark the face `popup_owned`;
+`closeSelf` ignores any other face, so a script can never close a tab
+the user opened (the helper only emits the event for its own popups;
+this is the belt). An owned face closes COMPLETELY: its page when the
+group has more, else `Window.closePaneUnprompted`, which destroys a
+popup window whole and closes a sole-pane tab past the confirm-close
+gate (`unprompted_close`), never leaving the shell behind. A user
+closing the popup window or tab tears the face down like any tab, so
+`ViewDestroy` reaches the engine and the opener sees a normal close.
+
+Proof, both new: smoke-web stage 6c/6d/6e run against two loopback
+origins with the policy pushed as ALLOW: a clicked
+`window.open(url, name, 'popup,width=500,height=600')` answers a
+handle, exactly one `ev_page_popup{opened}` carries `chromeless=1,
+500x600`, `window.opener` is non-null inside the popup, `postMessage`
+crosses both ways, and the popup's `window.close()` comes back as
+`page_popup_closed`; a featureless open reports `chromeless=0`; BLOCK
+mode still cancels and posts `ev_popup_request` with its gesture. The
+smoke-e2e `webPopupStage` (also `SKETERM_SMOKE_E2E_WEB_POPUP_ONLY=1`)
+drives the real GUI with seat clicks: a popup-shaped open produces a
+second toplevel whose page viewport measures exactly 500x600 (asserted
+on the page's solid colour, since a CSD surface carries its shadow
+margins) and adds no tab to the opener window; the popup's
+`window.close()` removes the toplevel, leaves no tab anywhere and keeps
+the opener page; a featureless open is one tab in the opener window
+that closes itself completely; and a user-opened page's `window.close()`
+changes nothing.
+
 ## 2026-08-30: the browser gets a clipboard, and real popups
 
 **Paste did not work anywhere in the browser, and the paste chord was
