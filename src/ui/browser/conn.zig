@@ -348,12 +348,8 @@ pub fn wireReady(self: *BrowserView, hc: *HostConn) void {
         tab.free_req = 0;
         tab.free_dirty = false;
         tab.free_bytes = null;
-        tab.root.view_id = 0;
-        self.openDir(tab, tab.root);
-        for (tab.subdirs.items) |d| {
-            d.view_id = 0;
-            self.openDir(tab, d);
-        }
+        self.resubscribeDir(tab, tab.root);
+        for (tab.subdirs.items) |d| self.resubscribeDir(tab, d);
     }
     self.clearReconnect(hc.host);
     // The overlay for the visible tab was skipped while this host was
@@ -1671,9 +1667,58 @@ pub fn makeDir(self: *BrowserView, path: []const u8) ?*Dir {
         self.allocator.destroy(d);
         return null;
     };
-    d.* = .{ .allocator = self.allocator, .path = owned, .view_id = self.next_view };
-    self.next_view += 1;
+    d.* = .{ .allocator = self.allocator, .path = owned, .view_id = self.mintViewId() };
     return d;
+}
+
+/// The one place a view id comes from: ids are per connection and
+/// must never repeat within one, so every subscription mints a new one.
+pub fn mintViewId(self: *BrowserView) u32 {
+    const v = self.next_view;
+    self.next_view += 1;
+    return v;
+}
+
+/// Re-subscribe a directory on a fresh connection to its host: the
+/// old view died with the old socket. The id is minted anew (zeroing
+/// it made every re-opened directory ask the daemon for view 0, and
+/// the second was refused with "view id in use") and the rows the tab
+/// still holds are dropped first, because `open_view` STREAMS its
+/// chunks onto `entries` and re-opening a loaded directory listed
+/// every file twice.
+pub fn resubscribeDir(self: *BrowserView, tab: *BTab, dir: *Dir) void {
+    colview.invalidateBackingRefs(tab);
+    var full_buf: [4096]u8 = undefined;
+    for (dir.entries.items) |*e| {
+        if (std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir.path, e.name })) |full| tab.noteChangedFull(full) else |_| {}
+    }
+    resetForResubscribe(dir, self.allocator, self.mintViewId());
+    self.openDir(tab, dir);
+}
+
+/// The pure half of `resubscribeDir`: forget the stale listing and
+/// take a fresh view id, leaving the directory exactly as a never
+/// listed one so the streaming open fills it from empty.
+fn resetForResubscribe(dir: *Dir, allocator: std.mem.Allocator, fresh_view: u32) void {
+    for (dir.entries.items) |*e| e.deinit(allocator);
+    dir.entries.clearRetainingCapacity();
+    dir.loaded = false;
+    dir.streaming = false;
+    dir.view_id = fresh_view;
+}
+
+test "a re-subscribed directory starts empty under a fresh, non-zero view id" {
+    const t = std.testing;
+    const a = t.allocator;
+    var dir = Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 7 };
+    defer dir.entries.deinit(a);
+    try dir.entries.append(a, try types.testEntry(a, "one.txt", null));
+    try dir.entries.append(a, try types.testEntry(a, "two.txt", null));
+    dir.loaded = true;
+    resetForResubscribe(&dir, a, 8);
+    try t.expectEqual(@as(usize, 0), dir.entries.items.len);
+    try t.expect(!dir.loaded and !dir.streaming);
+    try t.expectEqual(@as(u32, 8), dir.view_id);
 }
 
 test "statfs coalescing discards stale and overflowing replies" {

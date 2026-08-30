@@ -467,6 +467,8 @@ pub const BrowserView = struct {
     pub const cancelPendingDir = @import("conn.zig").cancelPendingDir;
     pub const onDelta = @import("conn.zig").onDelta;
     pub const makeDir = @import("conn.zig").makeDir;
+    pub const mintViewId = @import("conn.zig").mintViewId;
+    pub const resubscribeDir = @import("conn.zig").resubscribeDir;
 
     // nav.zig -- tabs, navigation, path bar, type-ahead
     pub const newTabSpec = @import("nav.zig").newTabSpec;
