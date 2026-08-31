@@ -3214,6 +3214,102 @@ pub const Engine = struct {
 // Tests (pure bookkeeping; no helper is spawned)
 // ---------------------------------------------------------------------
 
+test "an offer for an asked-for download is DECIDED into the caller's path" {
+    const gpa = std.testing.allocator;
+    var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null, .{});
+    defer {
+        eng.state = .idle;
+        eng.fd = -1;
+        eng.deinit();
+    }
+    const v = try gpa.create(View);
+    v.* = .{ .id = 1, .w = 100, .h = 100 };
+    try eng.views.append(gpa, v);
+
+    // A pipe stands in for the helper socket: the DECIDE frame is the
+    // thing under test, and dropping it is the bug (the engine then
+    // holds the download forever and nothing lands on disk).
+    var fds: [2]c_int = undefined;
+    if (c.pipe(&fds) != 0) return error.SkipZigTest;
+    defer _ = c.close(fds[0]);
+    eng.fd = fds[1];
+    eng.state = .ready;
+
+    try eng.downloads.append(gpa, .{
+        .req = 5,
+        .view = 1,
+        .url = try gpa.dupe(u8, "https://x.test/f.bin"),
+        .path = try gpa.dupe(u8, "/tmp/webdrive-test/asked.bin"),
+    });
+    eng.onDownloadOffer(.{
+        .view = 1,
+        .id = 9,
+        .total = 10,
+        .url = "https://x.test/f.bin",
+        .name = "f.bin",
+        .mime = "application/octet-stream",
+        .req = 5,
+    });
+    const d = eng.download(5).?;
+    try std.testing.expect(d.decided);
+    try std.testing.expectEqual(@as(u32, 9), d.id);
+    try std.testing.expectEqualStrings("f.bin", d.name);
+
+    var buf: [512]u8 = undefined;
+    const n = c.read(fds[0], &buf, buf.len);
+    try std.testing.expect(n > 0);
+    var reader = proto.Reader.init(buf[0..@intCast(n)]);
+    const frame = (try reader.next()).?;
+    try std.testing.expectEqual(proto.Tag.download_decide, frame.tag);
+    const decide = try proto.decode(proto.DownloadDecide, frame.payload);
+    try std.testing.expectEqualStrings("/tmp/webdrive-test/asked.bin", decide.path);
+
+    // Progress, then a terminal frame: the state a poller reads.
+    eng.onDownloadProgress(.{ .view = 1, .id = 9, .received = 4, .total = 10, .done = 0, .failed = 0, .req = 5 });
+    try std.testing.expectEqual(@as(u64, 4), eng.download(5).?.received);
+    eng.onDownloadProgress(.{ .view = 1, .id = 9, .received = 10, .total = 10, .done = 1, .failed = 0, .req = 5 });
+    try std.testing.expect(eng.download(5).?.done);
+
+    // A start the helper refused outright: id 0 answers the REQUEST,
+    // so a caller waiting on the file is never waiting on silence.
+    try eng.downloads.append(gpa, .{ .req = 6, .view = 1, .url = try gpa.dupe(u8, "https://x.test/g.bin") });
+    eng.onDownloadProgress(.{ .view = 1, .id = 0, .received = 0, .total = 0, .done = 0, .failed = 1, .req = 6 });
+    const refused = eng.download(6).?;
+    try std.testing.expect(refused.failed);
+    try std.testing.expect(refused.fail_reason.len > 0);
+
+    // A helper that dies mid-transfer fails what is in flight rather
+    // than leaving it running forever.
+    try eng.downloads.append(gpa, .{ .req = 7, .view = 1, .url = try gpa.dupe(u8, "https://x.test/h.bin") });
+    eng.failDownloads("gone");
+    try std.testing.expect(eng.download(7).?.failed);
+    try std.testing.expect(eng.download(5).?.done); // a finished one is untouched
+}
+
+test "a suggested download name is a leaf, and an existing file is never overwritten" {
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings("f.bin", Engine.safeLeaf("f.bin"));
+    // A path in the engine's suggested name must never escape the
+    // download directory.
+    try std.testing.expectEqualStrings("passwd", Engine.safeLeaf("../../etc/passwd"));
+    try std.testing.expectEqualStrings("download", Engine.safeLeaf(".."));
+    try std.testing.expectEqualStrings("download", Engine.safeLeaf(""));
+
+    const dir = "/tmp/webdrive-uniq-test";
+    var z: [256:0]u8 = undefined;
+    const zp = std.fmt.bufPrintZ(&z, "{s}", .{dir}) catch unreachable;
+    _ = c.mkdir(zp.ptr, 0o700);
+    defer pathz.removeTree(dir);
+    const first = Engine.uniqueDownloadPath(&buf, dir, "f.bin").?;
+    try std.testing.expectEqualStrings("/tmp/webdrive-uniq-test/f.bin", first);
+    var fz: [512:0]u8 = undefined;
+    const fzp = std.fmt.bufPrintZ(&fz, "{s}", .{first}) catch unreachable;
+    const f = c.fopen(fzp.ptr, "wb") orelse return error.SkipZigTest;
+    _ = c.fclose(f);
+    const second = Engine.uniqueDownloadPath(&buf, dir, "f.bin").?;
+    try std.testing.expectEqualStrings("/tmp/webdrive-uniq-test/f (1).bin", second);
+}
+
 test "console mirror: bounded, drop-oldest, paged by id" {
     const gpa = std.testing.allocator;
     var eng = try Engine.init(gpa, "/tmp/webdrive-test", null, null, .{});
