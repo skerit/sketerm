@@ -1336,6 +1336,11 @@
   // become a described placeholder, because a caller debugging a page
   // needs an answer far more than it needs a clean type.
 
+  // Per-string budget when the command names none (an older browser
+  // process). A cut is always MARKED: this used to slice silently, so a
+  // 40KB string came back as 4046 bytes of perfectly valid JSON and
+  // every consumer downstream - total_chars, strict, web_expand -
+  // reported the cut length as the whole length.
   var EVAL_MAXSTR = 4000;
   var EVAL_MAXITEMS = 200;
   var EVAL_MAXDEPTH = 6;
@@ -1349,13 +1354,16 @@
     return { __kind: "node", eid: known, role: role, name: String(nameOf(el, role) || "").slice(0, 200) };
   }
 
-  function encodeVal(v, depth, seen) {
+  function encodeVal(v, depth, seen, max) {
     var t = typeof v;
     if (v === undefined) return { __kind: "undefined" };
     if (v === null) return null;
     if (t === "boolean") return v;
     if (t === "number") return isFinite(v) ? v : { __kind: "number", text: String(v) };
-    if (t === "string") return v.length > EVAL_MAXSTR ? v.slice(0, EVAL_MAXSTR) : v;
+    if (t === "string")
+      return v.length > max
+        ? { __kind: "string", text: v.slice(0, max), total_chars: v.length, truncated: true }
+        : v;
     if (t === "bigint") return { __kind: "bigint", text: String(v) };
     if (t === "symbol") return { __kind: "symbol", text: String(v) };
     if (t === "function") return { __kind: "function", name: String(v.name || "(anonymous)") };
@@ -1381,7 +1389,7 @@
         var n = Math.min(v.length, EVAL_MAXITEMS);
         for (var i = 0; i < n; i++) {
           try {
-            arr.push(encodeVal(v[i], depth + 1, seen));
+            arr.push(encodeVal(v[i], depth + 1, seen, max));
           } catch (e2) {
             arr.push({ __kind: "throwing", text: String(e2) });
           }
@@ -1399,7 +1407,7 @@
       var kn = Math.min(keys.length, EVAL_MAXITEMS);
       for (var k = 0; k < kn; k++) {
         try {
-          obj[keys[k]] = encodeVal(v[keys[k]], depth + 1, seen);
+          obj[keys[k]] = encodeVal(v[keys[k]], depth + 1, seen, max);
         } catch (e4) {
           obj[keys[k]] = { __kind: "throwing", text: String(e4) };
         }
@@ -1423,10 +1431,10 @@
     }
   }
 
-  function sendEvalOk(req, v) {
+  function sendEvalOk(req, v, max) {
     var body;
     try {
-      body = { value: encodeVal(v, 0, []) };
+      body = { value: encodeVal(v, 0, [], max > 0 ? max : EVAL_MAXSTR) };
     } catch (e) {
       body = { value: { __kind: "unserializable", text: String(e) } };
     }
@@ -1457,7 +1465,7 @@
   var evalSeen = {};
   var evalSeenCount = 0;
 
-  function evaluate(req, code, wantAwait, timeout, fn) {
+  function evaluate(req, code, wantAwait, timeout, fn, max) {
     evalSeen[req] = 1;
     if (++evalSeenCount > 256) {
       evalSeen = {};
@@ -1501,7 +1509,7 @@
         return sendEvalErr(req, e, "thrown while evaluating");
       }
     }
-    if (!wantAwait || !v || typeof v.then !== "function") return sendEvalOk(req, v);
+    if (!wantAwait || !v || typeof v.then !== "function") return sendEvalOk(req, v, max);
     var done = false;
     var timer = setTimeout(function () {
       if (done) return;
@@ -1514,7 +1522,7 @@
           if (done) return;
           done = true;
           clearTimeout(timer);
-          sendEvalOk(req, r);
+          sendEvalOk(req, r, max);
         },
         function (e) {
           if (done) return;
@@ -2535,7 +2543,7 @@
         controlState(m.req, m.eid);
         break;
       case "eval":
-        evaluate(m.req, String(m.code || ""), !!m.await, m.timeout || 10000, m.fn);
+        evaluate(m.req, String(m.code || ""), !!m.await, m.timeout || 10000, m.fn, m.maxstr || 0);
         break;
       case "evalprobe":
         // Sent right after a CSP-spliced eval: scripts run in order, so

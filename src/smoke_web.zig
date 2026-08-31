@@ -1190,6 +1190,7 @@ const Client = struct {
     ack_devtools: bool = false,
     ack_print_pdf: bool = false,
     ack_downloads: bool = false,
+    ack_download_start: bool = false,
     ack_contexts: bool = false,
     ack_contexts_fail_closed: bool = false,
     ack_webext: bool = false,
@@ -1481,6 +1482,10 @@ const Client = struct {
     dl_name_len: usize = 0,
     dl_url: [1024]u8 = @splat(0),
     dl_url_len: usize = 0,
+    /// The client request id an offer/progress frame echoes: 0 for a
+    /// download the page started, the `download_start.req` otherwise.
+    dl_req: u32 = 0,
+    dl_prog_req: u32 = 0,
     dl_prog_seq: u32 = 0,
     dl_prog_id: u32 = 0,
     dl_received: u64 = 0,
@@ -1789,6 +1794,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.ack_devtools = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.ack_print_pdf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.ack_downloads = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOAD_START)) self.ack_download_start = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.ack_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.ack_a11y_caret = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.ack_contexts = true;
@@ -2095,6 +2101,7 @@ const Client = struct {
                 @memcpy(self.dl_name[0..self.dl_name_len], o.name[0..self.dl_name_len]);
                 self.dl_url_len = @min(o.url.len, self.dl_url.len);
                 @memcpy(self.dl_url[0..self.dl_url_len], o.url[0..self.dl_url_len]);
+                self.dl_req = o.req;
                 self.dl_offer_seq += 1;
             },
             .ev_download_progress => {
@@ -2104,6 +2111,7 @@ const Client = struct {
                 self.dl_prog_total = p.total;
                 self.dl_done = p.done;
                 self.dl_failed = p.failed;
+                self.dl_prog_req = p.req;
                 self.dl_prog_seq += 1;
             },
             .ev_print_pdf_done => {
@@ -8530,6 +8538,56 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 22j downloads: the helper stopped serving after unknown-id download frames");
     }
     pass("stage 22j downloads (offer held, decided path lands bytes, cancel answered)");
+    // ── Stage 22j2: download_start ─────────────────────────────────
+    //
+    // The client asks for a URL to be downloaded THROUGH the view's own
+    // browser (its cookies, its session), and the offer that comes back
+    // ECHOES the request id — the only join CEF leaves between a
+    // `start_download` call and the DownloadItem it produces. A start
+    // that cannot happen must be answered too, never left to a caller's
+    // deadline: that silence is exactly how "download this" reported
+    // success and wrote nothing.
+    {
+        if (!cl.ack_download_start) fail("stage 22j2: hello_ack lacks the download-start capability");
+        cl.navigate(blue_page);
+        const offer0 = cl.dl_offer_seq;
+        const ASKED_REQ: u32 = 4242;
+        cl.send(proto.DownloadStart{
+            .view = view_id,
+            .req = ASKED_REQ,
+            .url = "data:application/octet-stream," ++ download_bytes,
+        });
+        if (!cl.waitSeq(&cl.dl_offer_seq, offer0, 20_000))
+            fail("stage 22j2: download_start produced no ev_download_offer");
+        if (cl.dl_req != ASKED_REQ)
+            fail("stage 22j2: the offer did not echo the request id that asked for it");
+        var dl_buf: [128]u8 = undefined;
+        const asked_path = std.fmt.bufPrintZ(&dl_buf, "{s}/asked.bin", .{dir}) catch fail("dl path");
+        const asked_id = cl.dl_id;
+        cl.send(proto.DownloadDecide{ .view = view_id, .id = asked_id, .path = asked_path });
+        if (!cl.waitDlTerminal(asked_id, 30_000))
+            fail("stage 22j2: the asked-for download never reached a terminal frame");
+        if (cl.dl_done != 1) fail("stage 22j2: the asked-for download ended failed");
+        if (cl.dl_prog_req != ASKED_REQ)
+            fail("stage 22j2: the progress frame did not carry the request id");
+        const af = c.fopen(asked_path.ptr, "rb") orelse fail("stage 22j2: no file at the decided path");
+        var agot: [64]u8 = @splat(0);
+        const an = c.fread(&agot, 1, agot.len, af);
+        _ = c.fclose(af);
+        if (an != download_bytes.len or !std.mem.eql(u8, agot[0..an], download_bytes))
+            fail("stage 22j2: the asked-for download's bytes are not the payload");
+
+        // A start naming a view this client does not have is ANSWERED
+        // as a failure carrying the request id, immediately — a caller
+        // waiting on a file must never be left waiting on silence.
+        const prog0 = cl.dl_prog_seq;
+        cl.send(proto.DownloadStart{ .view = view_id + 1, .req = 77, .url = "data:," });
+        if (!cl.waitSeq(&cl.dl_prog_seq, prog0, 10_000))
+            fail("stage 22j2: a download_start for an unknown view was never answered");
+        if (cl.dl_prog_req != 77 or cl.dl_prog_id != 0 or cl.dl_failed != 1)
+            fail("stage 22j2: the unknown-view answer is not a failed frame naming the request");
+    }
+    pass("stage 22j2 download_start (asked-for download tagged, delivered, and refusals answered)");
     // ── Stage 22j: the accessibility tree, only on demand ──────────
     {
         if (!cl.ack_a11y) fail("stage 22k a11y: hello_ack lacks the a11y capability");

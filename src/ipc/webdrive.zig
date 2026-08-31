@@ -75,6 +75,7 @@ const platform = @import("../util/platform.zig");
 const pathz = @import("../util/pathz.zig");
 const strz = @import("../util/strz.zig");
 const muxclient = @import("../mux/client.zig");
+const fsserve = @import("../mux/fsserve.zig");
 const display = @import("../mux/display.zig");
 const proto = @import("../web/protocol.zig");
 const navfault = @import("../web/navfault.zig");
@@ -139,6 +140,10 @@ pub const OpReq = struct {
     len: u32 = 4096,
     flags: u8 = 0,
     timeout_ms: u32 = 10_000,
+    /// Eval only: how many characters of a STRING inside the result the
+    /// page-side serializer may emit before it marks a cut (0 = its own
+    /// default). The caller's inline budget, not a wire constant.
+    max_str: u32 = 0,
 };
 
 /// One finished round trip; `text` is arena-owned by the caller.
@@ -296,6 +301,63 @@ pub const View = struct {
             slot.* = null;
         }
     }
+};
+
+/// One download this engine is tracking — a page-initiated one, or one
+/// `startDownload` asked for.
+///
+/// The client, not the engine, decides where bytes land: an offer is
+/// HELD helper-side until a `download_decide` names a path, so this
+/// record exists from the moment the offer arrives. A headless client
+/// that ignored those frames is exactly how a download silently went
+/// nowhere — the engine held the target decision forever, the page saw
+/// a perfectly successful `a.click()`, and no file was ever written.
+pub const Download = struct {
+    /// Client-minted request id; `startDownload` returns it and every
+    /// status lookup takes it. A page-initiated download gets one too,
+    /// so both kinds are addressable the same way.
+    req: u32,
+    /// Engine download id, once the offer arrived; 0 before that.
+    id: u32 = 0,
+    view: u32,
+    /// Requested source url (`startDownload`), or the offer's url.
+    /// Owned.
+    url: []u8,
+    /// Suggested file name from the offer; owned, empty until then.
+    name: []u8 = &.{},
+    /// Where the bytes are being written; owned.
+    path: []u8 = &.{},
+    mime: []u8 = &.{},
+    received: u64 = 0,
+    total: u64 = 0,
+    started_ms: i64 = 0,
+    /// Set once a terminal frame arrived. `done` and `failed` are
+    /// exclusive; both false = still running (or still held).
+    done: bool = false,
+    failed: bool = false,
+    /// Why it failed, for the caller's sentence. Static strings.
+    fail_reason: []const u8 = "",
+    /// The offer arrived and a path was sent back.
+    decided: bool = false,
+
+    pub fn terminal(self: *const Download) bool {
+        return self.done or self.failed;
+    }
+
+    fn deinit(self: *Download, gpa: std.mem.Allocator) void {
+        gpa.free(self.url);
+        if (self.name.len != 0) gpa.free(self.name);
+        if (self.path.len != 0) gpa.free(self.path);
+        if (self.mime.len != 0) gpa.free(self.mime);
+    }
+};
+
+pub const DownloadError = error{
+    Unavailable,
+    NoView,
+    Unsupported,
+    OutOfMemory,
+    BadPath,
 };
 
 pub const ConsoleLine = struct { id: u32, level: u8, text: []u8 };
@@ -639,6 +701,17 @@ pub const Engine = struct {
     /// window the provider posts its result back through, and there is
     /// no user here for a popup to annoy.
     cap_popup_open: bool = false,
+    /// The helper reports downloads (`ev_download_offer` and the rest
+    /// of the 0x78 block). Without it a download this client cannot
+    /// answer is held helper-side and nothing lands anywhere.
+    cap_downloads: bool = false,
+    /// The helper accepts `download_start`: a url can be fetched
+    /// through the view's own browser, with its cookies and session.
+    cap_download_start: bool = false,
+    /// Downloads this engine has seen, page-initiated ones included.
+    /// Bounded by `DOWNLOAD_CAP`, drop-oldest-finished.
+    downloads: std.ArrayList(Download) = .empty,
+    next_download_req: u32 = 1,
     next_sem_request: u32 = 1,
     /// Stamps every `net_policy_set`; `ev_net_policy` echoes it so a
     /// stale event for a replaced policy is ignorable.
@@ -808,6 +881,8 @@ pub const Engine = struct {
         }
         self.clearViews();
         self.views.deinit(self.gpa);
+        self.clearDownloads();
+        self.downloads.deinit(self.gpa);
         self.in.deinit(self.gpa);
         self.rx_fds.deinit(self.gpa);
         // Persistent contexts are deliberately NEVER destroyed at
@@ -1140,6 +1215,12 @@ pub const Engine = struct {
         self.cap_contexts_fail_closed = false;
         self.cap_net_policy = false;
         self.cap_multi_client = false;
+        self.cap_downloads = false;
+        self.cap_download_start = false;
+        // A download in flight died with the helper. Failing it here is
+        // what turns a lost helper into an ANSWER for whoever is
+        // waiting on the file, instead of a wait that runs out.
+        self.failDownloads(LOST_MSG);
         self.removePresence();
         self.state = .unavailable;
         self.owner = .none;
@@ -2169,6 +2250,278 @@ pub const Engine = struct {
         return v.last_eval;
     }
 
+    // ---- downloads ---------------------------------------------------
+    //
+    // The helper HOLDS every download's target decision until a client
+    // answers it. This client answers: an asked-for download
+    // (`startDownload`) into the caller's path, a page-initiated one
+    // into the user's download directory. Ignoring the frames — which
+    // is what this driver did before — means the engine holds the
+    // decision, the page's `a.click()` reports success and no file is
+    // ever written anywhere, with no error on any side.
+
+    /// Downloads remembered per engine. Finished ones are dropped
+    /// oldest-first past this; a running one is never dropped.
+    pub const DOWNLOAD_CAP: usize = 64;
+
+    fn clearDownloads(self: *Engine) void {
+        for (self.downloads.items) |*d| d.deinit(self.gpa);
+        self.downloads.clearRetainingCapacity();
+    }
+
+    fn failDownloads(self: *Engine, reason: []const u8) void {
+        for (self.downloads.items) |*d| {
+            if (d.terminal()) continue;
+            d.failed = true;
+            d.fail_reason = reason;
+        }
+    }
+
+    /// The download record for a client request id.
+    pub fn download(self: *Engine, req: u32) ?*Download {
+        for (self.downloads.items) |*d| {
+            if (d.req == req) return d;
+        }
+        return null;
+    }
+
+    /// Every download this engine knows about, oldest first.
+    pub fn downloadList(self: *Engine) []const Download {
+        return self.downloads.items;
+    }
+
+    fn downloadById(self: *Engine, view: u32, id: u32) ?*Download {
+        for (self.downloads.items) |*d| {
+            if (d.id == id and d.view == view) return d;
+        }
+        return null;
+    }
+
+    /// Room for one more record: drop the oldest FINISHED one.
+    fn trimDownloads(self: *Engine) void {
+        while (self.downloads.items.len >= DOWNLOAD_CAP) {
+            var idx: ?usize = null;
+            for (self.downloads.items, 0..) |*d, i| {
+                if (d.terminal()) {
+                    idx = i;
+                    break;
+                }
+            }
+            const at = idx orelse return;
+            var gone = self.downloads.orderedRemove(at);
+            gone.deinit(self.gpa);
+        }
+    }
+
+    fn nextDownloadReq(self: *Engine) u32 {
+        const r = self.next_download_req;
+        self.next_download_req +%= 1;
+        if (self.next_download_req == 0) self.next_download_req = 1;
+        return r;
+    }
+
+    /// Ask `view`'s browser to download `url` ITSELF, so the request
+    /// carries that browser's cookies, session and route — the whole
+    /// point of downloading through a signed-in page rather than
+    /// re-fetching the url from outside it.
+    ///
+    /// `path` is where the bytes land (absolute); null means the user's
+    /// download directory under the engine-suggested name. Returns the
+    /// request id to poll with `download`.
+    pub fn startDownload(self: *Engine, view_id: u32, url: []const u8, path: ?[]const u8) DownloadError!u32 {
+        if (!self.ensure()) return error.Unavailable;
+        if (!self.cap_downloads or !self.cap_download_start) return error.Unsupported;
+        if (self.findView(view_id) == null) return error.NoView;
+        if (path) |p| {
+            if (p.len == 0 or p[0] != '/') return error.BadPath;
+        }
+        self.trimDownloads();
+        const req = self.nextDownloadReq();
+        const url_owned = try self.gpa.dupe(u8, url);
+        errdefer self.gpa.free(url_owned);
+        const path_owned: []u8 = if (path) |p| try self.gpa.dupe(u8, p) else &.{};
+        errdefer if (path_owned.len != 0) self.gpa.free(path_owned);
+        try self.downloads.append(self.gpa, .{
+            .req = req,
+            .view = view_id,
+            .url = url_owned,
+            .path = path_owned,
+            .started_ms = clock.nowMs(),
+        });
+        self.send(proto.DownloadStart{ .view = view_id, .req = req, .url = url }) catch {
+            // Drop the record only; the two errdefers above own those
+            // slices until this function returns successfully, and
+            // freeing them here as well would be a double free.
+            _ = self.downloads.pop();
+            return error.Unavailable;
+        };
+        return req;
+    }
+
+    /// Cancel a running download; a finished one is left alone.
+    pub fn cancelDownload(self: *Engine, req: u32) void {
+        const d = self.download(req) orelse return;
+        if (d.terminal()) return;
+        if (d.id != 0) self.send(proto.DownloadCancel{ .view = d.view, .id = d.id }) catch {};
+        d.failed = true;
+        d.fail_reason = "canceled";
+    }
+
+    /// Where a download with no caller-chosen path lands. The user's
+    /// XDG download directory (`fsserve.downloadDir`), created if it is
+    /// missing.
+    fn downloadDirZ(buf: []u8) ?[]const u8 {
+        const home_c = c.getenv("HOME") orelse return null;
+        const home = std.mem.span(@as([*:0]const u8, @ptrCast(home_c)));
+        if (home.len == 0) return null;
+        var cfg_buf: [4096]u8 = undefined;
+        const config_home: []const u8 = blk: {
+            if (c.getenv("XDG_CONFIG_HOME")) |x| {
+                const s = std.mem.span(@as([*:0]const u8, @ptrCast(x)));
+                if (s.len != 0) break :blk s;
+            }
+            break :blk std.fmt.bufPrint(&cfg_buf, "{s}/.config", .{home}) catch return null;
+        };
+        const dir = fsserve.downloadDir(home, config_home, buf);
+        if (dir.len == 0) return null;
+        var z: [4096:0]u8 = undefined;
+        const zp = pathz.pathZ(&z, dir) catch return null;
+        _ = c.mkdir(zp, 0o755);
+        return dir;
+    }
+
+    /// `<dir>/<name>`, with " (n)" before the extension while the plain
+    /// name is taken — a download must never silently overwrite a file
+    /// the user already has.
+    fn uniqueDownloadPath(buf: []u8, dir: []const u8, name: []const u8) ?[]const u8 {
+        const dot = blk: {
+            const at = std.mem.lastIndexOfScalar(u8, name, '.') orelse break :blk name.len;
+            break :blk if (at == 0) name.len else at;
+        };
+        var n: u32 = 0;
+        while (n < 1000) : (n += 1) {
+            const candidate = if (n == 0)
+                std.fmt.bufPrint(buf, "{s}/{s}", .{ dir, name }) catch return null
+            else
+                std.fmt.bufPrint(buf, "{s}/{s} ({d}){s}", .{ dir, name[0..dot], n, name[dot..] }) catch return null;
+            var z: [4096:0]u8 = undefined;
+            const zp = pathz.pathZ(&z, candidate) catch return null;
+            if (c.access(zp, c.F_OK) != 0) return candidate;
+        }
+        return null;
+    }
+
+    /// A suggested file name reduced to a leaf that is safe to join
+    /// onto a directory: no separators, no `..`, never empty.
+    fn safeLeaf(name: []const u8) []const u8 {
+        const leaf = std.fs.path.basename(name);
+        if (leaf.len == 0 or std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, "..")) return "download";
+        return leaf[0..@min(leaf.len, 200)];
+    }
+
+    fn setDownloadStr(self: *Engine, slot: *[]u8, text: []const u8) void {
+        const owned = self.gpa.dupe(u8, text) catch return;
+        if (slot.len != 0) self.gpa.free(slot.*);
+        slot.* = owned;
+    }
+
+    /// Answer a held download offer. The path decision is THIS side's,
+    /// always: the helper only writes where it is told, and an offer
+    /// nobody answers is a file that never appears.
+    fn onDownloadOffer(self: *Engine, ev: proto.EvDownloadOffer) void {
+        var d: *Download = blk: {
+            if (ev.req != 0) {
+                if (self.download(ev.req)) |existing| break :blk existing;
+            }
+            // Page-initiated (or an echo this client no longer knows):
+            // it still gets a record, so it is reportable and lands on
+            // disk rather than being held forever.
+            self.trimDownloads();
+            const url_owned = self.gpa.dupe(u8, ev.url) catch {
+                self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" }) catch {};
+                return;
+            };
+            self.downloads.append(self.gpa, .{
+                .req = self.nextDownloadReq(),
+                .view = ev.view,
+                .url = url_owned,
+                .started_ms = clock.nowMs(),
+            }) catch {
+                self.gpa.free(url_owned);
+                self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" }) catch {};
+                return;
+            };
+            break :blk &self.downloads.items[self.downloads.items.len - 1];
+        };
+        d.id = ev.id;
+        d.view = ev.view;
+        d.total = ev.total;
+        if (ev.name.len != 0) self.setDownloadStr(&d.name, ev.name);
+        if (ev.mime.len != 0) self.setDownloadStr(&d.mime, ev.mime);
+        if (d.terminal()) {
+            self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" }) catch {};
+            return;
+        }
+        if (d.path.len == 0) {
+            var dir_buf: [4096]u8 = undefined;
+            const dir = downloadDirZ(&dir_buf) orelse {
+                self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" }) catch {};
+                d.failed = true;
+                d.fail_reason = "no download directory could be resolved (is HOME set?)";
+                return;
+            };
+            var path_buf: [4608]u8 = undefined;
+            const chosen = uniqueDownloadPath(&path_buf, dir, safeLeaf(if (ev.name.len != 0) ev.name else "download")) orelse {
+                self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" }) catch {};
+                d.failed = true;
+                d.fail_reason = "no free file name in the download directory";
+                return;
+            };
+            self.setDownloadStr(&d.path, chosen);
+            if (d.path.len == 0) {
+                self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = "" }) catch {};
+                d.failed = true;
+                d.fail_reason = "out of memory";
+                return;
+            }
+        } else {
+            // A caller-chosen path: its directory must exist before the
+            // engine writes into it, or the download fails with an
+            // engine error nobody can act on.
+            pathz.makeParentDirs(d.path) catch {};
+        }
+        self.send(proto.DownloadDecide{ .view = ev.view, .id = ev.id, .path = d.path }) catch {
+            d.failed = true;
+            d.fail_reason = "the browser helper stopped before the download could start";
+            return;
+        };
+        d.decided = true;
+    }
+
+    fn onDownloadProgress(self: *Engine, ev: proto.EvDownloadProgress) void {
+        const d = blk: {
+            if (ev.id != 0) {
+                if (self.downloadById(ev.view, ev.id)) |found| break :blk found;
+            }
+            // id 0 = the helper refused a `download_start` outright.
+            if (ev.req != 0) {
+                if (self.download(ev.req)) |found| break :blk found;
+            }
+            return;
+        };
+        if (ev.received > d.received) d.received = ev.received;
+        if (ev.total > 0) d.total = ev.total;
+        if (ev.failed != 0 and !d.done) {
+            d.failed = true;
+            if (d.fail_reason.len == 0) d.fail_reason = if (ev.id == 0)
+                "the browser did not start a download for that url (it may have navigated to it, or refused the scheme)"
+            else
+                "the browser engine canceled or interrupted the transfer";
+        } else if (ev.done != 0) {
+            d.done = true;
+        }
+    }
+
     // ---- request interception ---------------------------------------
 
     /// Enable/disable blocking; `id` 0 is the process-wide default.
@@ -2310,7 +2663,13 @@ pub const Engine = struct {
                 self.sendSemantic(request, proto.SemReadIds{ .view = view_id })
             else
                 self.sendSemantic(request, proto.SemRead{ .view = view_id }),
-            .eval => self.sendSemantic(request, proto.SemEval{ .view = view_id, .flags = req.flags, .timeout_ms = req.timeout_ms, .code = .{ .s = req.arg } }),
+            .eval => self.sendSemantic(request, proto.SemEval{
+                .view = view_id,
+                .flags = req.flags,
+                .timeout_ms = req.timeout_ms,
+                .code = .{ .s = req.arg },
+                .max_str = req.max_str,
+            }),
         };
         sent catch return error.Unavailable;
 
@@ -2569,6 +2928,8 @@ pub const Engine = struct {
                 self.cap_net_policy = false;
                 self.cap_presenter = false;
                 self.cap_observe = false;
+                self.cap_downloads = false;
+                self.cap_download_start = false;
                 for (ack.caps) |cap| {
                     if (std.mem.eql(u8, cap, proto.CAP_FRAMES_SHM)) self.cap_shm = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC)) self.cap_semantic = true;
@@ -2583,6 +2944,8 @@ pub const Engine = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_PRESENTER)) self.cap_presenter = true;
                     if (std.mem.eql(u8, cap, proto.CAP_OBSERVE)) self.cap_observe = true;
                     if (std.mem.eql(u8, cap, proto.CAP_POPUP_OPEN)) self.cap_popup_open = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOAD_START)) self.cap_download_start = true;
                 }
                 // Headless: allow real popups for the whole connection.
                 // A cancelled popup makes window.open return null, which
@@ -2701,6 +3064,14 @@ pub const Engine = struct {
                     ev.reason
                 else
                     "the browser helper refused the view's identity context");
+            },
+            .ev_download_offer => {
+                const ev = proto.decode(proto.EvDownloadOffer, frame.payload) catch return;
+                self.onDownloadOffer(ev);
+            },
+            .ev_download_progress => {
+                const ev = proto.decode(proto.EvDownloadProgress, frame.payload) catch return;
+                self.onDownloadProgress(ev);
             },
             .ev_console => {
                 const ev = proto.decode(proto.EvConsole, frame.payload) catch return;

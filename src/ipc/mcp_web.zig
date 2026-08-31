@@ -48,6 +48,8 @@ const webkeys = @import("../web/webkeys.zig");
 const semantic = @import("../web/semantic.zig");
 const webroute = @import("../web/route.zig");
 const clock = @import("../util/clock.zig");
+const atomicwrite = @import("../util/atomicwrite.zig");
+const mcp_term = @import("mcp_term.zig");
 
 /// Default budget for one semantic round trip. Clamped to
 /// `mcp.WAIT_CAP_MS` like every other MCP wait, so one blocked page
@@ -67,6 +69,21 @@ const POLL_MS: u32 = 40;
 /// movable by the caller.
 const EVAL_INLINE_CHARS: usize = 6000;
 const EVAL_INLINE_MAX: usize = 60_000;
+
+/// How much of a STRING inside the result the page may serialize before
+/// it marks a cut — the budget that travels to the page, distinct from
+/// the INLINE limit above, which is how much of the reply is written
+/// into this call's answer.
+///
+/// They are separate because the page-side cut is the one that cannot
+/// be undone: it used to be a silent 4000-character slice, so a 40KB
+/// string came back as 4046 bytes of valid JSON, `total_chars` reported
+/// the cut length as the whole length, `strict:true` never fired, and
+/// `web_expand id=0` paged the CAPTURE — the remaining 36KB was
+/// unreachable by any route. The page budget is therefore generous:
+/// the rest of the result really is behind `web_expand` now, and
+/// `out_file` lifts it again for a result that belongs on disk.
+const EVAL_PAGE_CHARS: u32 = 256_000;
 
 /// The one page-authored-data warning, on results that carry page
 /// CONTENT. The bridge is authenticated (a page cannot forge a reply),
@@ -295,6 +312,31 @@ pub fn routeCapability(web_ok: bool) RouteSupport {
     return if (guiDrivesWeb()) .gui else .headless;
 }
 
+/// Whether a browser engine EXISTS yet — the fact that decides whether
+/// the rest of the browser preflight is a measurement or a prediction.
+///
+/// The headless engine is spawned lazily at the first web call, and
+/// until then `web_backend`, `web_watch` and `web_session` can only say
+/// what this server INTENDS. Reporting the intent as fact cost a
+/// session an entire panel-mirroring workaround built on a "watch-along
+/// is off" that flipped to on the moment a view opened.
+pub fn engineStarted() bool {
+    for (g_engines.items) |re| {
+        if (re.engine.state == .ready) return true;
+    }
+    return false;
+}
+
+/// What `capabilities` reports about downloading through a view. Never
+/// spawns the helper: before one exists this is what the CODE supports,
+/// which is exactly what a preflight can honestly promise.
+pub fn downloadCapability() struct { supported: bool, started: bool } {
+    if (guiDrivesWeb()) return .{ .supported = true, .started = true };
+    const e = headlessEngine() orelse return .{ .supported = false, .started = false };
+    if (e.state != .ready) return .{ .supported = true, .started = false };
+    return .{ .supported = e.cap_downloads and e.cap_download_start, .started = true };
+}
+
 /// The engine-lifecycle half of the preflight: whether the broker lane
 /// is available (the daemon would spawn and keep the engine), and who
 /// owns the engine this server is connected to right now.
@@ -521,6 +563,8 @@ const Op = struct {
     length: u32 = 4096,
     await_promise: bool = false,
     timeout_ms: ?i64 = null,
+    /// Eval only: the page-side per-string budget (`EVAL_PAGE_CHARS`).
+    max_chars: u32 = 0,
 };
 
 const OpReply = struct {
@@ -893,6 +937,7 @@ fn runOp(drv: Driver, arena: std.mem.Allocator, handle: u32, op: Op, timeout_ms:
                 req.arg = op.data orelse "";
                 req.flags = if (op.await_promise) web_proto.eval_flag_await else 0;
                 req.timeout_ms = @intCast(@min(@max(op.timeout_ms orelse 10_000, 100), mcp.WAIT_CAP_MS));
+                req.max_str = op.max_chars;
             } else return .{ .err = fail(.invalid_args, "unknown web-request op") };
 
             const out = e.runOp(arena, handle, req, budget) catch |err|
@@ -927,6 +972,7 @@ fn runOpGui(backend: mcp.Backend, arena: std.mem.Allocator, pane: u32, op: Op, b
         .length = if (op.length != 4096) op.length else null,
         .await_promise = op.await_promise,
         .timeout_ms = if (op.timeout_ms) |t| @intCast(t) else null,
+        .max_chars = if (op.max_chars != 0) op.max_chars else null,
     }) catch |e|
         return .{ .err = try guiUnreachable(arena, e) };
     if (!started.ok) return .{ .err = fail(.failed, started.err) };
@@ -1961,6 +2007,96 @@ fn evalResult(
     }
     try res.text(TRUST_LINE);
     return res.finish();
+}
+
+/// `web_eval out_file:`: the whole result to disk, and only its
+/// identity in the answer.
+///
+/// This is the generic escape from every bulk-data case — API
+/// pagination, a table scrape, a list of urls — because the bytes go
+/// from the page to a file without ever passing through the caller's
+/// context. What the file holds is stated as a FACT (`format`), never
+/// guessed at by the reader: a string value is written as ITSELF (a CSV
+/// stays a CSV), anything else as its JSON.
+fn evalToFile(
+    arena: std.mem.Allocator,
+    mode: Mode,
+    v: View,
+    payload: []const u8,
+    path: []const u8,
+) ![]const u8 {
+    // The payload is `{"value": X}`; X decides the file's shape.
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, payload, .{}) catch null;
+    var format: []const u8 = "json";
+    var truncated = false;
+    var total_chars: ?i64 = null;
+    var bytes: []const u8 = payload;
+    if (parsed) |p| {
+        defer p.deinit();
+        const value = if (p.value == .object) p.value.object.get("value") else null;
+        if (value) |val| {
+            switch (val) {
+                .string => |s| {
+                    format = "text";
+                    bytes = try arena.dupe(u8, s);
+                },
+                .object => |o| {
+                    // The marked page-side cut: write the prefix that
+                    // DID arrive and say how much there was.
+                    const kind = o.get("__kind");
+                    const is_cut_string = kind != null and kind.? == .string and
+                        std.mem.eql(u8, kind.?.string, "string");
+                    if (is_cut_string) {
+                        if (o.get("text")) |t| {
+                            if (t == .string) {
+                                format = "text";
+                                bytes = try arena.dupe(u8, t.string);
+                            }
+                        }
+                        truncated = true;
+                        if (o.get("total_chars")) |n| {
+                            if (n == .integer) total_chars = n.integer;
+                        }
+                    } else {
+                        bytes = try stringifyValue(arena, val);
+                    }
+                },
+                else => bytes = try stringifyValue(arena, val),
+            }
+        }
+    }
+    atomicwrite.writeFileExact(path, bytes, 0o600) catch |e| return mcp.errRes(
+        arena,
+        .io_failed,
+        try std.fmt.allocPrint(arena, "could not write the result to {s} ({s})", .{ path, @errorName(e) }),
+    );
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, mode, v);
+    try res.fact("evaluated", true);
+    try res.fact("out_file", path);
+    try res.fact("bytes", bytes.len);
+    try res.fact("format", format);
+    if (mcp_term.sha256File(path)) |hex| try res.fact("sha256", hex[0..]);
+    try res.fact("truncated", truncated);
+    if (total_chars) |n| try res.fact("total_chars", n);
+    if (truncated) {
+        try res.textf("wrote {d} bytes ({s}) to {s} — TRUNCATED: the page serialized {d} of {d} characters. Return the value in slices to get the rest", .{
+            bytes.len,
+            format,
+            path,
+            bytes.len,
+            total_chars orelse @as(i64, @intCast(bytes.len)),
+        });
+    } else {
+        try res.textf("wrote {d} bytes ({s}) to {s}; the result is not in this reply", .{ bytes.len, format, path });
+    }
+    return res.finish();
+}
+
+fn stringifyValue(arena: std.mem.Allocator, value: std.json.Value) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return out.written();
 }
 
 /// Where the page is scrolled to, as the probe reports it.
@@ -3110,13 +3246,22 @@ pub fn webTool(
         // a string and the bridge compiles a single EXPRESSION, so the
         // wrapper that makes statements an expression lives here rather
         // than in every caller's head.
-        const code: []const u8 = if (mcp.argStr(args, "body")) |body| blk: {
+        // `body` is wrapped in an ASYNC arrow function: the tool
+        // advertises `await`, so top-level `await` inside a body has to
+        // work. Wrapped in a plain function it failed with "await is
+        // only valid in async functions" and every caller paid a wasted
+        // call learning to write its own async IIFE. The wrapper's
+        // promise is then always awaited, whatever `await` says — the
+        // alternative is handing back a Promise placeholder as the
+        // "result", which is never what the caller meant.
+        const body_arg = mcp.argStr(args, "body");
+        const code: []const u8 = if (body_arg) |body| blk: {
             if (mcp.argStr(args, "code") != null)
                 return mcp.errRes(arena, .invalid_args, "web_eval takes 'code' (an expression) or 'body' (statements), not both");
-            break :blk try std.fmt.allocPrint(arena, "(() => {{\n{s}\n}})()", .{body});
+            break :blk try std.fmt.allocPrint(arena, "(async () => {{\n{s}\n}})()", .{body});
         } else mcp.argStr(args, "code") orelse
-            return mcp.errRes(arena, .invalid_args, "web_eval needs 'code' (an expression) or 'body' (statements, wrapped in a function for you)");
-        const want_await = mcp.argBool(args, "await");
+            return mcp.errRes(arena, .invalid_args, "web_eval needs 'code' (an expression) or 'body' (statements, wrapped in an async function for you)");
+        const want_await = mcp.argBool(args, "await") or body_arg != null;
         const budget = timeoutOf(args, 10_000);
         const inline_limit: usize = @intCast(std.math.clamp(
             mcp.argInt(args, "max_chars") orelse @as(i64, EVAL_INLINE_CHARS),
@@ -3124,11 +3269,32 @@ pub fn webTool(
             @as(i64, EVAL_INLINE_MAX),
         ));
         const strict = mcp.argBool(args, "strict");
+        const out_file = mcp.argStr(args, "out_file");
+        if (out_file) |p| {
+            if (p.len == 0 or p[0] != '/') return mcp.errRes(
+                arena,
+                .invalid_args,
+                "out_file must be an ABSOLUTE path on the machine running this MCP server",
+            );
+            if (strict) return mcp.errRes(
+                arena,
+                .invalid_args,
+                "web_eval takes out_file or strict, not both: out_file writes the whole result to disk, which is what strict exists to refuse a substitute for",
+            );
+        }
+        // The page-side budget, distinct from the inline limit: what
+        // does not fit inline is paged with web_expand, and out_file
+        // wants the whole thing.
+        const page_budget: u32 = if (out_file != null)
+            web_proto.MAX_EVAL_STR
+        else
+            @max(EVAL_PAGE_CHARS, @as(u32, @intCast(inline_limit)));
         switch (try runOp(drv, arena, view.pane, .{
             .op = "eval",
             .data = code,
             .await_promise = want_await,
             .timeout_ms = budget,
+            .max_chars = page_budget,
             // The page-side budget is the caller's; this side allows a
             // little more so a helper-side timeout REPORT still lands.
         }, budget + 3000)) {
@@ -3153,8 +3319,9 @@ pub fn webTool(
                 if (strict and r.payload.len > inline_limit) return mcp.errRes(
                     arena,
                     .invalid_args,
-                    try std.fmt.allocPrint(arena, "result too large for strict inline return: {d} chars, limit {d} (max_chars raises it up to {d}; or drop strict:true to page it with web_expand id=0; or return less from the code)", .{ r.payload.len, inline_limit, EVAL_INLINE_MAX }),
+                    try std.fmt.allocPrint(arena, "result too large for strict inline return: {d} chars, limit {d} (max_chars raises it up to {d}; out_file writes it to disk whole; or drop strict:true to page it with web_expand id=0; or return less from the code)", .{ r.payload.len, inline_limit, EVAL_INLINE_MAX }),
                 );
+                if (out_file) |path| return evalToFile(arena, drv.mode(), view, r.payload, path);
                 return evalResult(arena, drv.mode(), view, r.payload, inline_limit);
             },
         }
@@ -3166,6 +3333,7 @@ pub fn webTool(
     if (eql(u8, name, "web_console")) return consoleTool(drv, arena, args, view);
     if (eql(u8, name, "web_wait")) return waitTool(drv, arena, args, view);
     if (eql(u8, name, "web_network")) return networkTool(drv, arena, args, view);
+    if (eql(u8, name, "web_download")) return downloadTool(drv, arena, args, view);
 
     if (eql(u8, name, "web_screenshot")) {
         const png: []const u8 = switch (drv) {
@@ -3890,6 +4058,371 @@ fn networkTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view
     }
 }
 
+// ---------------------------------------------------------------------
+// web_download: bytes from the page's own session, straight to disk
+// ---------------------------------------------------------------------
+//
+// The whole point is that the FETCH happens inside the view's browser:
+// its cookies, its session, its route. A file behind a login is then
+// one call, instead of reconstructing signed urls outside the browser
+// and discovering that the site's CSP, its session cookie or a
+// per-file token makes that impossible.
+//
+// The bytes never pass through this process's answer either: the helper
+// writes the file and the reply carries its identity (path, size,
+// sha256), which is what makes a 348-file job cost no context at all.
+
+/// One download's state, as either backend reports it.
+const DlState = struct {
+    state: []const u8 = "pending",
+    path: []const u8 = "",
+    received: u64 = 0,
+    total: u64 = 0,
+    reason: []const u8 = "",
+
+    fn terminal(self: DlState) bool {
+        return std.mem.eql(u8, self.state, "done") or std.mem.eql(u8, self.state, "failed");
+    }
+};
+
+const DlStart = union(enum) { req: u32, err: Fail };
+const DlPoll = union(enum) { state: DlState, err: Fail };
+
+fn dlStart(drv: Driver, arena: std.mem.Allocator, handle: u32, url: []const u8, path: []const u8) !DlStart {
+    switch (drv) {
+        .gui => |backend| {
+            const r = mcp.ipcParsed(arena, backend, .{
+                .cmd = "web-download",
+                .pane = handle,
+                .data = url,
+                .path = path,
+            }) catch |e| return .{ .err = try guiUnreachable(arena, e) };
+            if (!r.ok) return .{ .err = fail(.unavailable, r.err) };
+            const v = r.value.object.get("req") orelse
+                return .{ .err = fail(.io_failed, "the GUI returned no download request id") };
+            if (v != .integer) return .{ .err = fail(.io_failed, "the GUI returned a malformed download request id") };
+            const req = boundedU32(v.integer) orelse
+                return .{ .err = fail(.io_failed, "the GUI returned a malformed download request id") };
+            return .{ .req = req };
+        },
+        .headless => |e| {
+            const req = e.startDownload(handle, url, path) catch |err| return .{ .err = switch (err) {
+                error.Unsupported => fail(
+                    .unavailable,
+                    "this browser helper cannot download a url through a view (capabilities 'downloads' + 'download-start')",
+                ),
+                error.NoView => fail(.not_found, "that web view is gone"),
+                error.BadPath => fail(.invalid_args, "the download path must be absolute"),
+                else => try headlessFail(arena, e, err),
+            } };
+            return .{ .req = req };
+        },
+    }
+}
+
+fn dlPoll(drv: Driver, arena: std.mem.Allocator, handle: u32, req: u32) !DlPoll {
+    switch (drv) {
+        .gui => |backend| {
+            const r = mcp.ipcParsed(arena, backend, .{
+                .cmd = "web-downloads",
+                .pane = handle,
+            }) catch |e| return .{ .err = try guiUnreachable(arena, e) };
+            if (!r.ok) return .{ .err = fail(.unavailable, r.err) };
+            const list = r.value.object.get("downloads") orelse
+                return .{ .err = fail(.io_failed, "the GUI returned no download list") };
+            if (list != .array) return .{ .err = fail(.io_failed, "the GUI returned a malformed download list") };
+            for (list.array.items) |item| {
+                if (item != .object) continue;
+                const idv = item.object.get("req") orelse continue;
+                if (idv != .integer or idv.integer != @as(i64, req)) continue;
+                return .{ .state = .{
+                    .state = jsonStrOf(item.object, "state", "pending"),
+                    .path = jsonStrOf(item.object, "path", ""),
+                    .received = jsonU64Of(item.object, "received"),
+                    .total = jsonU64Of(item.object, "total"),
+                    .reason = jsonStrOf(item.object, "reason", ""),
+                } };
+            }
+            // A row the user dismissed, or a face that was replaced.
+            return .{ .state = .{ .state = "failed", .reason = "the download is no longer tracked by that web view" } };
+        },
+        .headless => |e| {
+            const d = e.download(req) orelse
+                return .{ .state = .{ .state = "failed", .reason = "the download is no longer tracked" } };
+            return .{ .state = .{
+                .state = if (d.done) "done" else if (d.failed) "failed" else if (d.decided) "running" else "pending",
+                .path = try arena.dupe(u8, d.path),
+                .received = d.received,
+                .total = d.total,
+                .reason = d.fail_reason,
+            } };
+        },
+    }
+}
+
+fn jsonStrOf(o: std.json.ObjectMap, key: []const u8, dflt: []const u8) []const u8 {
+    const v = o.get(key) orelse return dflt;
+    return if (v == .string) v.string else dflt;
+}
+
+fn jsonU64Of(o: std.json.ObjectMap, key: []const u8) u64 {
+    const v = o.get(key) orelse return 0;
+    if (v != .integer or v.integer < 0) return 0;
+    return @intCast(v.integer);
+}
+
+/// The file name a url suggests: its last path segment, query and
+/// fragment stripped, never a path and never empty.
+fn nameFromUrl(url: []const u8) []const u8 {
+    var s = url;
+    if (std.mem.indexOfScalar(u8, s, '#')) |i| s = s[0..i];
+    if (std.mem.indexOfScalar(u8, s, '?')) |i| s = s[0..i];
+    // Skip the scheme so the AUTHORITY is never mistaken for a file
+    // name: `https://x.test/` has no path segment at all, and calling
+    // the host "x.test" would write the site's home page to a file
+    // named after the site.
+    if (std.mem.indexOf(u8, s, "://")) |i| {
+        const rest = s[i + 3 ..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return "download";
+        s = rest[slash..];
+    }
+    while (s.len > 0 and s[s.len - 1] == '/') s = s[0 .. s.len - 1];
+    const slash = std.mem.lastIndexOfScalar(u8, s, '/');
+    const leaf = if (slash) |i| s[i + 1 ..] else s;
+    if (leaf.len == 0 or std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, "..")) return "download";
+    return leaf[0..@min(leaf.len, 200)];
+}
+
+test "nameFromUrl strips the query and never returns a path" {
+    try std.testing.expectEqualStrings("file.zip", nameFromUrl("https://x.test/a/b/file.zip?sig=abc#frag"));
+    try std.testing.expectEqualStrings("download", nameFromUrl("https://x.test/"));
+    try std.testing.expectEqualStrings("download", nameFromUrl("https://x.test/a/.."));
+    try std.testing.expectEqualStrings("b", nameFromUrl("https://x.test/a/b/"));
+}
+
+/// One download, run to completion (or to the caller's deadline).
+const DlOutcome = struct {
+    url: []const u8,
+    path: []const u8,
+    state: []const u8,
+    bytes: u64 = 0,
+    sha256: []const u8 = "",
+    reason: []const u8 = "",
+};
+
+fn runOneDownload(
+    drv: Driver,
+    arena: std.mem.Allocator,
+    handle: u32,
+    url: []const u8,
+    path: []const u8,
+    deadline: i64,
+) !union(enum) { out: DlOutcome, err: Fail } {
+    const started = switch (try dlStart(drv, arena, handle, url, path)) {
+        .err => |e| return .{ .err = e },
+        .req => |r| r,
+    };
+    var last: DlState = .{};
+    while (true) {
+        switch (try dlPoll(drv, arena, handle, started)) {
+            .err => |e| return .{ .err = e },
+            .state => |st| {
+                last = st;
+                if (st.terminal()) break;
+            },
+        }
+        if (drv.now() >= deadline) {
+            return .{ .out = .{
+                .url = url,
+                .path = path,
+                .state = "timed_out",
+                .bytes = last.received,
+                .reason = "the download had not finished when the call's budget ran out; it may still be running",
+            } };
+        }
+        drv.sleep(POLL_MS);
+    }
+    const final_path = if (last.path.len != 0) last.path else path;
+    if (std.mem.eql(u8, last.state, "done")) {
+        return .{ .out = .{
+            .url = url,
+            .path = final_path,
+            .state = "done",
+            .bytes = mcp_term.fileSize(final_path) orelse last.received,
+            .sha256 = if (mcp_term.sha256File(final_path)) |hex| try arena.dupe(u8, hex[0..]) else "",
+        } };
+    }
+    return .{ .out = .{
+        .url = url,
+        .path = final_path,
+        .state = "failed",
+        .bytes = last.received,
+        .reason = if (last.reason.len != 0) last.reason else "the browser engine did not complete the transfer",
+    } };
+}
+
+fn downloadTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
+    const single = mcp.argStr(args, "url");
+    const many: ?[]const std.json.Value = blk: {
+        const v = mcp.argValue(args, "urls") orelse break :blk null;
+        if (v != .array) return mcp.errRes(arena, .invalid_args, "'urls' must be an array of url strings");
+        break :blk v.array.items;
+    };
+    if (single != null and many != null)
+        return mcp.errRes(arena, .invalid_args, "web_download takes 'url' or 'urls', not both");
+
+    // No url at all: report what this view has downloaded. A listing,
+    // not an error — it is how a page-initiated download (a click, a
+    // blob the page saved) is found afterwards.
+    if (single == null and many == null) return downloadListResult(drv, arena, view);
+
+    const dir = mcp.argStr(args, "dir");
+    const path_arg = mcp.argStr(args, "path");
+    if (dir) |d| {
+        if (d.len == 0 or d[0] != '/')
+            return mcp.errRes(arena, .invalid_args, "'dir' must be an absolute directory path");
+    }
+    if (path_arg) |p| {
+        if (p.len == 0 or p[0] != '/')
+            return mcp.errRes(arena, .invalid_args, "'path' must be an absolute file path");
+        if (many != null)
+            return mcp.errRes(arena, .invalid_args, "'path' names ONE file; with 'urls' pass 'dir' instead");
+    }
+    if (many != null and dir == null)
+        return mcp.errRes(arena, .invalid_args, "'urls' needs 'dir': the directory the files land in");
+    if (single != null and path_arg == null and dir == null)
+        return mcp.errRes(arena, .invalid_args, "web_download needs 'path' (the exact file) or 'dir' (the directory to name it in)");
+
+    const budget = timeoutOf(args, 120_000);
+    const deadline = drv.now() + budget;
+
+    var outcomes: std.ArrayList(DlOutcome) = .empty;
+    if (single) |url| {
+        const path = path_arg orelse try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir.?, nameFromUrl(url) });
+        switch (try runOneDownload(drv, arena, view.pane, url, path, deadline)) {
+            .err => |e| return failRes(arena, e),
+            .out => |o| try outcomes.append(arena, o),
+        }
+    } else {
+        const items = many.?;
+        if (items.len > MAX_DOWNLOAD_BATCH) return mcp.errRes(arena, .invalid_args, try std.fmt.allocPrint(
+            arena,
+            "'urls' holds {d} entries; the cap is {d} per call (they are downloaded one at a time, so a bigger batch could not finish inside one call's budget)",
+            .{ items.len, MAX_DOWNLOAD_BATCH },
+        ));
+        for (items) |item| {
+            if (item != .string)
+                return mcp.errRes(arena, .invalid_args, "'urls' must be an array of url STRINGS");
+        }
+        for (items) |item| {
+            const url = item.string;
+            const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir.?, nameFromUrl(url) });
+            if (drv.now() >= deadline) {
+                try outcomes.append(arena, .{
+                    .url = url,
+                    .path = path,
+                    .state = "not_started",
+                    .reason = "the call's budget ran out before this url was reached; call again with the urls that are left",
+                });
+                continue;
+            }
+            switch (try runOneDownload(drv, arena, view.pane, url, path, deadline)) {
+                // A failure to START is per-url: one bad url must not
+                // discard the files that already landed.
+                .err => |e| try outcomes.append(arena, .{
+                    .url = url,
+                    .path = path,
+                    .state = "failed",
+                    .reason = e.text,
+                }),
+                .out => |o| try outcomes.append(arena, o),
+            }
+        }
+    }
+    return downloadResult(arena, drv.mode(), view, outcomes.items);
+}
+
+/// Cap on one `web_download` batch. They run one at a time (the engine
+/// offers downloads in its own order, and FIFO is the only join between
+/// a request and its offer), so a batch has to fit inside one call's
+/// budget to mean anything.
+const MAX_DOWNLOAD_BATCH: usize = 64;
+
+fn downloadResult(arena: std.mem.Allocator, mode: Mode, v: View, outs: []const DlOutcome) ![]const u8 {
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, mode, v);
+    var done: usize = 0;
+    var failed: usize = 0;
+    var pending: usize = 0;
+    for (outs) |o| {
+        if (std.mem.eql(u8, o.state, "done")) done += 1 else if (std.mem.eql(u8, o.state, "failed")) failed += 1 else pending += 1;
+    }
+    try res.fact("downloads", outs);
+    try res.fact("completed", done);
+    try res.fact("failed", failed);
+    try res.fact("unfinished", pending);
+    if (outs.len == 1) {
+        const o = outs[0];
+        // The single-file shape a caller reads without indexing.
+        try res.fact("path", o.path);
+        try res.fact("state", o.state);
+        try res.fact("bytes", o.bytes);
+        if (o.sha256.len != 0) try res.fact("sha256", o.sha256);
+        if (std.mem.eql(u8, o.state, "done"))
+            try res.textf("downloaded {d} bytes to {s}", .{ o.bytes, o.path })
+        else
+            try res.textf("{s}: {s}", .{ o.state, if (o.reason.len != 0) o.reason else "no reason given" });
+    } else {
+        try res.textf("{d} of {d} downloaded into place, {d} failed, {d} unfinished", .{ done, outs.len, failed, pending });
+    }
+    return res.finish();
+}
+
+fn downloadListResult(drv: Driver, arena: std.mem.Allocator, view: View) ![]const u8 {
+    var rows: std.ArrayList(DlOutcome) = .empty;
+    switch (drv) {
+        .gui => |backend| {
+            const r = mcp.ipcParsed(arena, backend, .{
+                .cmd = "web-downloads",
+                .pane = view.pane,
+            }) catch |e| return failRes(arena, try guiUnreachable(arena, e));
+            if (!r.ok) return mcp.errRes(arena, .unavailable, r.err);
+            const list = r.value.object.get("downloads") orelse
+                return mcp.errRes(arena, .io_failed, "the GUI returned no download list");
+            if (list != .array) return mcp.errRes(arena, .io_failed, "the GUI returned a malformed download list");
+            for (list.array.items) |item| {
+                if (item != .object) continue;
+                const path = jsonStrOf(item.object, "path", "");
+                try rows.append(arena, .{
+                    .url = "",
+                    .path = path,
+                    .state = jsonStrOf(item.object, "state", "pending"),
+                    .bytes = jsonU64Of(item.object, "received"),
+                    .reason = jsonStrOf(item.object, "reason", ""),
+                });
+            }
+        },
+        .headless => |e| {
+            e.pumpOnce(0);
+            for (e.downloadList()) |d| {
+                try rows.append(arena, .{
+                    .url = try arena.dupe(u8, d.url),
+                    .path = try arena.dupe(u8, d.path),
+                    .state = if (d.done) "done" else if (d.failed) "failed" else if (d.decided) "running" else "pending",
+                    .bytes = d.received,
+                    .reason = d.fail_reason,
+                });
+            }
+        },
+    }
+    var res = mcp.Res.init(arena);
+    try head(&res, arena, drv.mode(), view);
+    try res.fact("downloads", rows.items);
+    try res.fact("listing", true);
+    try res.textf("{d} download(s) known to this view; pass 'url' or 'urls' to fetch one", .{rows.items.len});
+    return res.finish();
+}
+
 fn waitTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, view: View) ![]const u8 {
     const what = mcp.argStr(args, "for") orelse "load";
     const arg = mcp.argStr(args, "arg") orelse "";
@@ -4367,6 +4900,186 @@ test "web_eval: a JSON value stays JSON in structuredContent, a long one is page
     try t.expect(wsc.get("value_text") == null);
     try t.expectEqual(@as(usize, EVAL_INLINE_CHARS + 100), wsc.get("value").?.string.len);
     try t.expectEqual(@as(i64, EVAL_INLINE_CHARS + 200), wsc.get("inline_limit").?.integer);
+}
+
+test "web_eval body is wrapped in an ASYNC function and asks for a real page budget" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var fake = ScriptedBackend{
+        .allocator = t.allocator,
+        .responses = &.{
+            ONE_VIEW,
+            "{\"ok\":true,\"token\":1}",
+            "{\"ok\":true,\"done\":true,\"result_ok\":true,\"payload\":\"{\\\"value\\\":7}\"}",
+        },
+    };
+    defer fake.deinit();
+    const out = try webTool(arena, fake.backend(), "web_eval", try jsonArgs(arena,
+        "{\"pane\":7,\"body\":\"const r = await fetch('/x'); return 7;\"}"));
+    try t.expect(std.mem.indexOf(u8, out, "\"isError\":true") == null);
+    // The request line the GUI would have received: the wrapper, the
+    // implied await, and a page-side string budget far above the old
+    // silent 4000-character cut.
+    const req = fake.requests.items[1];
+    try t.expect(std.mem.indexOf(u8, req, "(async () =>") != null);
+    try t.expect(std.mem.indexOf(u8, req, "\"await_promise\":true") != null);
+    try t.expect(std.mem.indexOf(u8, req, "\"max_chars\":256000") != null);
+}
+
+test "web_eval out_file writes the whole result and keeps it out of the reply" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "/tmp/sketerm-evalfile-{d}", .{std.c.getpid()}) catch unreachable;
+    try @import("../util/pathz.zig").makeDirs(dir, 0o700);
+    defer @import("../util/pathz.zig").removeTree(dir);
+    const path = try std.fmt.allocPrint(arena, "{s}/out.csv", .{dir});
+
+    // A STRING value lands as itself: a CSV stays a CSV, not a
+    // JSON-quoted copy of one.
+    const text = try evalToFile(arena, .headless, EXAMPLE, "{\"value\":\"a,b\\nc,d\\n\"}", path);
+    const tp = try mcp.expectToolResultShape(arena, "web_eval", text);
+    const tsc = tp.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("text", tsc.get("format").?.string);
+    try t.expectEqual(@as(i64, 8), tsc.get("bytes").?.integer);
+    try t.expectEqualStrings(path, tsc.get("out_file").?.string);
+    try t.expect(tsc.get("value") == null);
+    try t.expectEqual(@as(usize, 64), tsc.get("sha256").?.string.len);
+    var read_buf: [64]u8 = undefined;
+    try t.expectEqualStrings("a,b\nc,d\n", readBackForTest(path, &read_buf));
+
+    // Anything else lands as JSON.
+    const json = try evalToFile(arena, .headless, EXAMPLE, "{\"value\":[1,2,3]}", path);
+    const jsc = (try mcp.expectToolResultShape(arena, "web_eval", json)).object.get("structuredContent").?.object;
+    try t.expectEqualStrings("json", jsc.get("format").?.string);
+    try t.expectEqualStrings("[1,2,3]", readBackForTest(path, &read_buf));
+
+    // A page-side cut is reported, not hidden: the prefix is written
+    // and the true length rides the facts.
+    const marked = try evalToFile(
+        arena,
+        .headless,
+        EXAMPLE,
+        "{\"value\":{\"__kind\":\"string\",\"text\":\"abc\",\"total_chars\":9000,\"truncated\":true}}",
+        path,
+    );
+    const msc = (try mcp.expectToolResultShape(arena, "web_eval", marked)).object.get("structuredContent").?.object;
+    try t.expect(msc.get("truncated").?.bool);
+    try t.expectEqual(@as(i64, 9000), msc.get("total_chars").?.integer);
+    try t.expectEqualStrings("abc", readBackForTest(path, &read_buf));
+}
+
+fn readBackForTest(path: []const u8, buf: []u8) []const u8 {
+    var z: [4096:0]u8 = undefined;
+    const zp = std.fmt.bufPrintZ(&z, "{s}", .{path}) catch return "";
+    const f = @import("../c.zig").c.fopen(zp.ptr, "rb") orelse return "";
+    defer _ = @import("../c.zig").c.fclose(f);
+    const n = @import("../c.zig").c.fread(buf.ptr, 1, buf.len, f);
+    return buf[0..n];
+}
+
+test "web_download: one url, started and polled to completion" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var dir_buf: [128]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "/tmp/sketerm-webdl-{d}", .{std.c.getpid()}) catch unreachable;
+    try @import("../util/pathz.zig").makeDirs(dir, 0o700);
+    defer @import("../util/pathz.zig").removeTree(dir);
+    const path = try std.fmt.allocPrint(arena, "{s}/f.bin", .{dir});
+    // The "downloaded" file: the GUI would have written it, so the tool
+    // hashes what is on disk rather than trusting the reply.
+    try atomicwrite.writeFileExact(path, "0123456789", 0o600);
+
+    const running = try std.fmt.allocPrint(
+        arena,
+        "{{\"ok\":true,\"downloads\":[{{\"req\":3,\"id\":9,\"name\":\"f.bin\",\"path\":\"{s}\",\"received\":4,\"total\":10,\"state\":\"running\",\"reason\":\"\"}}]}}",
+        .{path},
+    );
+    const done = try std.fmt.allocPrint(
+        arena,
+        "{{\"ok\":true,\"downloads\":[{{\"req\":3,\"id\":9,\"name\":\"f.bin\",\"path\":\"{s}\",\"received\":10,\"total\":10,\"state\":\"done\",\"reason\":\"\"}}]}}",
+        .{path},
+    );
+    var fake = ScriptedBackend{
+        .allocator = t.allocator,
+        .responses = &.{ ONE_VIEW, "{\"ok\":true,\"req\":3}", running, done },
+    };
+    defer fake.deinit();
+
+    const args = try std.fmt.allocPrint(arena, "{{\"pane\":7,\"url\":\"https://x.test/f.bin\",\"path\":\"{s}\"}}", .{path});
+    const out = try webTool(arena, fake.backend(), "web_download", try jsonArgs(arena, args));
+    try t.expect(std.mem.indexOf(u8, out, "\"isError\":true") == null);
+    const parsed = try mcp.expectToolResultShape(arena, "web_download", out);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings("done", sc.get("state").?.string);
+    try t.expectEqual(@as(i64, 10), sc.get("bytes").?.integer);
+    try t.expectEqual(@as(i64, 1), sc.get("completed").?.integer);
+    try t.expectEqual(@as(usize, 64), sc.get("sha256").?.string.len);
+    // The request that reached the GUI carried the url AND the path:
+    // where the bytes land is never the browser's choice here.
+    try t.expect(std.mem.indexOf(u8, fake.requests.items[1], "\"cmd\":\"web-download\"") != null);
+    try t.expect(std.mem.indexOf(u8, fake.requests.items[1], "https://x.test/f.bin") != null);
+    try t.expect(std.mem.indexOf(u8, fake.requests.items[1], path) != null);
+}
+
+test "web_download: a failed transfer reports the engine's reason, not a timeout" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var fake = ScriptedBackend{
+        .allocator = t.allocator,
+        .responses = &.{
+            ONE_VIEW,
+            "{\"ok\":true,\"req\":1}",
+            "{\"ok\":true,\"downloads\":[{\"req\":1,\"id\":0,\"name\":\"\",\"path\":\"/tmp/x/f.bin\",\"received\":0,\"total\":0,\"state\":\"failed\",\"reason\":\"the browser did not start a download for that url\"}]}",
+        },
+    };
+    defer fake.deinit();
+    const out = try webTool(arena, fake.backend(), "web_download", try jsonArgs(
+        arena,
+        "{\"pane\":7,\"url\":\"https://x.test/f.bin\",\"path\":\"/tmp/x/f.bin\"}",
+    ));
+    const sc = (try mcp.expectToolResultShape(arena, "web_download", out)).object.get("structuredContent").?.object;
+    try t.expectEqualStrings("failed", sc.get("state").?.string);
+    try t.expectEqual(@as(i64, 1), sc.get("failed").?.integer);
+    try t.expect(std.mem.indexOf(u8, out, "did not start a download") != null);
+}
+
+test "web_download argument shapes are refused before anything is fetched" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    const cases = [_]struct { args: []const u8, needle: []const u8 }{
+        .{ .args = "{\"pane\":7,\"url\":\"https://x/f\"}", .needle = "'path'" },
+        .{ .args = "{\"pane\":7,\"url\":\"https://x/f\",\"path\":\"rel/f\"}", .needle = "absolute" },
+        .{ .args = "{\"pane\":7,\"urls\":[\"https://x/f\"]}", .needle = "'urls' needs 'dir'" },
+        .{ .args = "{\"pane\":7,\"urls\":[\"https://x/f\"],\"path\":\"/tmp/f\"}", .needle = "names ONE file" },
+        .{ .args = "{\"pane\":7,\"url\":\"https://x/f\",\"urls\":[\"https://x/g\"],\"dir\":\"/tmp\"}", .needle = "not both" },
+        .{ .args = "{\"pane\":7,\"urls\":[7],\"dir\":\"/tmp\"}", .needle = "url STRINGS" },
+    };
+    for (cases) |case| {
+        var fake = ScriptedBackend{ .allocator = t.allocator, .responses = &.{ONE_VIEW} };
+        defer fake.deinit();
+        const out = try webTool(arena, fake.backend(), "web_download", try jsonArgs(arena, case.args));
+        try t.expect(std.mem.indexOf(u8, out, "\"isError\":true") != null);
+        if (std.mem.indexOf(u8, out, case.needle) == null) {
+            std.debug.print("web_download {s}: {s}\n", .{ case.args, out });
+            return error.WrongRefusal;
+        }
+    }
 }
 
 test "web_scroll: before/after are structured positions and 'moved' is derived" {
@@ -5158,7 +5871,7 @@ test "every tool this module serves declares an output schema" {
             return error.MissingOutputSchema;
         }
     }
-    try std.testing.expectEqual(@as(usize, 21), seen);
+    try std.testing.expectEqual(@as(usize, 22), seen);
 }
 
 test "parsePolicy fails closed on every unknown name, wildcard and port" {

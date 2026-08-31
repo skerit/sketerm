@@ -116,6 +116,17 @@ pub const Request = struct {
     /// web-eval: resolve a returned promise, bounded by timeout_ms.
     await_promise: bool = false,
     timeout_ms: ?u32 = null,
+    /// web-request op=eval: how many characters of a STRING inside the
+    /// result the page-side serializer may emit before it MARKS a cut.
+    /// The caller's inline budget: without it the page cut every string
+    /// at 4000 characters and said nothing, so the reply was valid JSON
+    /// of the wrong length and no route reached the rest.
+    max_chars: ?u32 = null,
+    /// web-download: absolute local path the downloaded bytes go to.
+    path: ?[]const u8 = null,
+    /// web-download: the request id a status or cancel addresses (the
+    /// id `web-download` returned).
+    req: ?u32 = null,
     /// web-scroll wheel deltas, logical pixels, positive = right/down.
     dx: ?i32 = null,
     dy: ?i32 = null,

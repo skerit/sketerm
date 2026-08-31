@@ -767,6 +767,11 @@ const Pending = struct {
     eval_await: bool = false,
     eval_timeout_ms: u32 = 0,
     eval_retried: bool = false,
+    /// Eval-only: the caller's per-string serialization budget
+    /// (`SemEval.max_str`, 0 = the page-side default). It travels with
+    /// the code for the same reason the two above do — the CSP re-send
+    /// must be byte-equivalent, budget included.
+    eval_max_str: u32 = 0,
 
     const Kind = enum {
         snapshot,
@@ -800,6 +805,24 @@ const Pending = struct {
 };
 
 const semantic_request_timeout_ms: i64 = 120_000;
+
+/// How long a download's target decision is HELD for the client before
+/// the helper cancels it itself. Generous, because the GUI's answer can
+/// be a human in a save dialog; bounded at all, because a client that
+/// does not understand the download frames (every client before this
+/// wire grew them) otherwise leaves the engine's target determiner
+/// waiting forever — the page's download then never lands anywhere and
+/// nothing anywhere says so. That was the field failure: a clicked
+/// download reported success, a temp file appeared and was reaped, and
+/// no error existed on any side.
+const download_hold_ms: i64 = 300_000;
+
+/// How long a `download_start` waits for the engine to offer ITS
+/// download before the request is answered as failed. A url the engine
+/// declines to download at all (it navigates instead, or refuses the
+/// scheme) produces no callback whatsoever, so silence is the only
+/// signal there is.
+const dl_start_wait_ms: i64 = 15_000;
 /// How long a routed runtime/tabs.sendMessage may wait for `ext-reply`
 /// before the sender's Promise is settled with an error. Same expiry
 /// tick as the semantic Pending deadlines (`semanticPump`); shorter,
@@ -957,6 +980,10 @@ pub const Host = struct {
     /// names the view it came from, and `dropBrowser` cancels that
     /// view's entries when the browser goes.
     downloads: std.ArrayList(Dl) = .empty,
+    /// `download_start` requests whose engine download has not been
+    /// offered yet, oldest first — the only join CEF leaves between a
+    /// `start_download` call and the item it produces (`dlPendingReq`).
+    dl_pending: std.ArrayList(DlPending) = .empty,
 
     /// Inline frame mode (capability "frames-inline"): paint pixels ride
     /// the protocol socket as `frame_inline` payloads and NO memfd or
@@ -1157,6 +1184,13 @@ pub const Host = struct {
     const Dl = struct {
         id: u32,
         view: u32,
+        /// The `download_start.req` this download answers; 0 when the
+        /// page started it by itself.
+        req: u32 = 0,
+        /// When the offer was posted, so an offer nobody ever answers
+        /// is cancelled rather than held for the life of the helper
+        /// (`download_hold_ms`).
+        offered_ms: i64 = 0,
         before_cb: ?*cef.cef_before_download_callback_t = null,
         item_cb: ?*cef.cef_download_item_callback_t = null,
         /// The offer was posted (an entry can exist earlier: the engine
@@ -1210,6 +1244,9 @@ pub const Host = struct {
 
     const PendingFlush = struct { token: u32, conn: u32, outstanding: u32 };
 
+    /// One asked-for download waiting for the engine to offer it.
+    const DlPending = struct { view: u32, req: u32, at_ms: i64 };
+
     pub fn init(gpa: std.mem.Allocator, out: *proto.Outbox) Host {
         return .{ .gpa = gpa, .out = out, .webext = webexthost.Host.init(gpa) };
     }
@@ -1237,6 +1274,7 @@ pub const Host = struct {
         // per-view entries; whatever is left never named a live view.
         for (self.downloads.items) |*d| d.releaseCbs();
         self.downloads.deinit(self.gpa);
+        self.dl_pending.deinit(self.gpa);
         for (self.contexts.items) |ctx| release(&ctx.rc.base.base);
         self.contexts.deinit(self.gpa);
         self.pending_flushes.deinit(self.gpa);
@@ -4157,6 +4195,104 @@ pub const Host = struct {
         self.cancelDl(d);
     }
 
+    /// `download_start`: the client wants `url` fetched THROUGH this
+    /// view's browser, so the request carries that browser's cookies,
+    /// session and route. The engine mints an ordinary download, whose
+    /// offer is then tagged with the client's `req` (`dlPendingReq`) —
+    /// the target path stays the client's decision, exactly as for a
+    /// download a page started.
+    ///
+    /// A start that cannot happen is ANSWERED (`id = 0`, `failed`),
+    /// never left to the caller's deadline.
+    pub fn downloadStart(self: *Host, req: proto.DownloadStart) void {
+        const fail = proto.EvDownloadProgress{
+            .view = req.view,
+            .id = 0,
+            .received = 0,
+            .total = 0,
+            .done = 0,
+            .failed = 1,
+            .req = req.req,
+        };
+        const v = self.find(req.view) orelse {
+            self.post(fail);
+            return;
+        };
+        const b = v.browser orelse {
+            // A discarded view has no browser to download through, and
+            // reviving one here would load a page nobody asked for.
+            self.post(fail);
+            return;
+        };
+        const gh = b.get_host orelse {
+            self.post(fail);
+            return;
+        };
+        const host: *cef.cef_browser_host_t = gh(b) orelse {
+            self.post(fail);
+            return;
+        };
+        defer release(&host.base);
+        const start = host.start_download orelse {
+            self.post(fail);
+            return;
+        };
+        self.dl_pending.append(self.gpa, .{ .view = v.id, .req = req.req, .at_ms = nowMs() }) catch {
+            self.post(fail);
+            return;
+        };
+        var url = std.mem.zeroes(cef.cef_string_t);
+        setStr(req.url, &url);
+        defer cef.cef_string_utf16_clear(&url);
+        start(host, &url);
+    }
+
+    /// The `download_start` request an offer on `view` answers, taken
+    /// FIFO. CEF gives no way to correlate `start_download` with the
+    /// `DownloadItem` it produces — not even by url, which redirects
+    /// rewrite — so the order the engine offers them in is the only
+    /// join there is, and it is exact for the one case that matters
+    /// (a client asks, the very next offer on that view is the answer).
+    /// A page-initiated download racing an asked-for one can take the
+    /// tag; the cost is a mislabelled row, never a lost file.
+    fn dlPendingReq(self: *Host, view: u32) u32 {
+        var i: usize = 0;
+        while (i < self.dl_pending.items.len) {
+            const p = self.dl_pending.items[i];
+            if (p.view != view) {
+                i += 1;
+                continue;
+            }
+            _ = self.dl_pending.orderedRemove(i);
+            return p.req;
+        }
+        return 0;
+    }
+
+    /// Answer every `download_start` whose offer never arrived (a url
+    /// the engine refused outright, a navigation instead of a
+    /// download): the caller asked a question and must get an answer.
+    fn expireDlPending(self: *Host, now: i64) void {
+        var i: usize = 0;
+        while (i < self.dl_pending.items.len) {
+            const p = self.dl_pending.items[i];
+            if (now - p.at_ms < dl_start_wait_ms) {
+                i += 1;
+                continue;
+            }
+            _ = self.dl_pending.orderedRemove(i);
+            self.post(proto.EvDownloadProgress{
+                .view = p.view,
+                .id = 0,
+                .received = 0,
+                .total = 0,
+                .done = 0,
+                .failed = 1,
+                .req = p.req,
+            });
+        }
+    }
+
     /// Largest RAW band one `frame_inline` rect may describe. Bands keep
     /// every message far under proto.MAX_FRAME (a 4K full frame is 33MB
     /// raw) and bound the compressor's working set; a paint larger than
@@ -4276,9 +4412,21 @@ pub const Host = struct {
     /// counters moved, and retire terminal entries. Called once per
     /// poll iteration, like `flushInterceptStatus`.
     pub fn flushDownloadProgress(self: *Host) void {
+        const now = nowMs();
+        self.expireDlPending(now);
         var i: usize = 0;
         while (i < self.downloads.items.len) {
             const d = &self.downloads.items[i];
+            // An offer nobody answered: cancel it ourselves rather than
+            // hold the engine's target determiner for the life of the
+            // helper (`download_hold_ms`).
+            if (d.offered and !d.decided and !d.cancel_requested and !d.terminal() and
+                d.offered_ms != 0 and now - d.offered_ms > download_hold_ms)
+            {
+                self.cancelDl(d);
+                d.failed = true;
+                d.dirty = true;
+            }
             if (d.dirty) {
                 d.dirty = false;
                 // Progress is only worth a frame once the client has a
@@ -4292,6 +4440,7 @@ pub const Host = struct {
                     .total = d.total,
                     .done = if (d.done) 1 else 0,
                     .failed = if (d.failed) 1 else 0,
+                    .req = d.req,
                 });
             }
             if (d.terminal()) {
@@ -4308,6 +4457,26 @@ pub const Host = struct {
     /// frame ourselves — the flush would otherwise never see entries
     /// removed here. Called from `dropBrowser`.
     fn dropDownloadsOf(self: *Host, view: u32) void {
+        // Asked-for downloads whose offer will now never arrive: the
+        // caller is waiting on an answer, so give it one.
+        var pi: usize = 0;
+        while (pi < self.dl_pending.items.len) {
+            const p = self.dl_pending.items[pi];
+            if (p.view != view) {
+                pi += 1;
+                continue;
+            }
+            _ = self.dl_pending.orderedRemove(pi);
+            self.post(proto.EvDownloadProgress{
+                .view = view,
+                .id = 0,
+                .received = 0,
+                .total = 0,
+                .done = 0,
+                .failed = 1,
+                .req = p.req,
+            });
+        }
         var i: usize = 0;
         while (i < self.downloads.items.len) {
             const d = &self.downloads.items[i];
@@ -4329,6 +4498,7 @@ pub const Host = struct {
                 .total = gone.total,
                 .done = 0,
                 .failed = 1,
+                .req = gone.req,
             });
         }
     }
@@ -6938,7 +7108,23 @@ pub const Host = struct {
                 .markdown = .{ .s = msg },
                 .entities = &.{},
             }),
-            .eval => self.post(proto.SemEvalResult{ .view = v.id, .ok = 0, .json = .{ .s = "{\"error\":\"semantic request expired\"}" } }),
+            // The eval lane answers in JSON, so the reason has to be
+            // encoded rather than passed through — but it IS the same
+            // reason every other kind reports. A bare "semantic request
+            // expired" for a renderer crash, a stopped load and a
+            // 120s-silent page alike told a caller nothing about which
+            // of the three had happened, or whether retrying helps.
+            .eval => {
+                var buf: [512]u8 = undefined;
+                var w = std.Io.Writer.fixed(&buf);
+                const text: []const u8 = blk: {
+                    w.writeAll("{\"error\":") catch break :blk "{\"error\":\"semantic request expired\"}";
+                    jsonStr(&w, msg) catch break :blk "{\"error\":\"semantic request expired\"}";
+                    w.writeByte('}') catch break :blk "{\"error\":\"semantic request expired\"}";
+                    break :blk w.buffered();
+                };
+                self.post(proto.SemEvalResult{ .view = v.id, .ok = 0, .json = .{ .s = text } });
+            },
         }
     }
 
@@ -6992,7 +7178,12 @@ pub const Host = struct {
                     continue;
                 }
                 const p = v.pending.orderedRemove(i);
-                self.failPending(v, p, "semantic request expired before the page replied");
+                var buf: [160]u8 = undefined;
+                self.failPending(v, p, std.fmt.bufPrint(
+                    &buf,
+                    "the page did not answer this request within {d}s (a blocked main thread, or script that never settled)",
+                    .{@divTrunc(semantic_request_timeout_ms, 1000)},
+                ) catch "semantic request expired before the page replied");
             }
         }
         // Same rule for every parked extension Promise: a recipient
@@ -7361,6 +7552,14 @@ pub const Host = struct {
         self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = text } });
     }
 
+    /// The per-string serialization budget to send the page, clamped.
+    /// 0 stays 0: it means "the serializer's own default", which is
+    /// what a client too old to ask for a budget gets.
+    fn evalMaxStr(asked: u32) u32 {
+        if (asked == 0) return 0;
+        return @min(asked, proto.MAX_EVAL_STR);
+    }
+
     /// Evaluate script in the page's main world and answer with the
     /// serialized result. The REPLY rides the authenticated bridge, so
     /// a page cannot forge it; the code itself runs where page script
@@ -7385,22 +7584,25 @@ pub const Host = struct {
         const code_copy = self.gpa.dupe(u8, req.code.s) catch return;
         const want_await = req.flags & proto.eval_flag_await != 0;
         const timeout: u32 = @min(req.timeout_ms, 120_000);
+        const max_str = evalMaxStr(req.max_str);
         const rid = self.pushPending(v, .{
             .req = nextReq(v),
             .kind = .eval,
             .arg = code_copy,
             .eval_await = want_await,
             .eval_timeout_ms = timeout,
+            .eval_max_str = max_str,
         }) catch {
             self.gpa.free(code_copy);
             return;
         };
         var cmd: std.Io.Writer.Allocating = .init(self.gpa);
         defer cmd.deinit();
-        cmd.writer.print("{{\"op\":\"eval\",\"req\":{d},\"await\":{s},\"timeout\":{d},\"code\":", .{
+        cmd.writer.print("{{\"op\":\"eval\",\"req\":{d},\"await\":{s},\"timeout\":{d},\"maxstr\":{d},\"code\":", .{
             rid,
             if (want_await) "true" else "false",
             timeout,
+            max_str,
         }) catch return;
         jsonStr(&cmd.writer, req.code.s) catch return;
         cmd.writer.writeByte('}') catch return;
@@ -7414,7 +7616,7 @@ pub const Host = struct {
     /// `evalprobe` sent right behind it turns a parse failure (the
     /// whole script dies, nothing replies) into a clear answer instead
     /// of a 120s timeout.
-    fn sendEvalSpliced(self: *Host, v: *View, rid: u32, code: []const u8, want_await: bool, timeout: u32) void {
+    fn sendEvalSpliced(self: *Host, v: *View, rid: u32, code: []const u8, want_await: bool, timeout: u32, max_str: u32) void {
         if (!sem_secret.ok) return;
         const b = v.browser orelse return;
         const gf = b.get_main_frame orelse return;
@@ -7424,8 +7626,8 @@ pub const Host = struct {
         var script: std.Io.Writer.Allocating = .init(self.gpa);
         defer script.deinit();
         script.writer.print(
-            "window[\"{s}\"]&&window[\"{s}\"](({{\"op\":\"eval\",\"req\":{d},\"await\":{s},\"timeout\":{d},\"fn\":function(){{return(\n",
-            .{ slot, slot, rid, if (want_await) "true" else "false", timeout },
+            "window[\"{s}\"]&&window[\"{s}\"](({{\"op\":\"eval\",\"req\":{d},\"await\":{s},\"timeout\":{d},\"maxstr\":{d},\"fn\":function(){{return(\n",
+            .{ slot, slot, rid, if (want_await) "true" else "false", timeout, max_str },
         ) catch return;
         script.writer.writeAll(code) catch return;
         script.writer.print("\n)}}}}),{d})", .{v.sem_nav.generation}) catch return;
@@ -7594,16 +7796,30 @@ pub const Host = struct {
                 const code = again.arg;
                 if (self.pushPending(v, again)) |_| {
                     p.arg = &.{}; // the re-queued copy owns the code now
-                    self.sendEvalSpliced(v, again.req, code, again.eval_await, again.eval_timeout_ms);
+                    self.sendEvalSpliced(v, again.req, code, again.eval_await, again.eval_timeout_ms, again.eval_max_str);
                     return;
                 } else |_| {}
             }
             const rewritten = self.rewriteNodeRefs(v, e.value.json) catch null;
             defer if (rewritten) |r| self.gpa.free(r);
+            const body = rewritten orelse e.value.json;
+            // An unframeable reply must not be DROPPED: `post` swallows
+            // the encode error and the caller then waits out its whole
+            // deadline for a result that was already computed.
+            if (body.len > proto.MAX_EVAL_JSON) {
+                var msg: [256]u8 = undefined;
+                const text = std.fmt.bufPrint(
+                    &msg,
+                    "{{\"error\":\"the evaluation's result serialized to {d} bytes, past the {d}-byte frame limit; return less (slice it, or read it in pages)\"}}",
+                    .{ body.len, proto.MAX_EVAL_JSON },
+                ) catch "{\"error\":\"the evaluation's result is too large to return\"}";
+                self.post(proto.SemEvalResult{ .view = v.id, .ok = 0, .json = .{ .s = text } });
+                return;
+            }
             self.post(proto.SemEvalResult{
                 .view = v.id,
                 .ok = e.value.ok,
-                .json = .{ .s = rewritten orelse e.value.json },
+                .json = .{ .s = body },
             });
         } else if (std.mem.eql(u8, op, "setvalue")) {
             self.onSetValue(v, &p, json);
@@ -15185,6 +15401,8 @@ fn onBeforeDownload(
     d.before_cb = cb;
     kept = true;
     d.offered = true;
+    d.offered_ms = nowMs();
+    if (d.req == 0) d.req = host.dlPendingReq(v.id);
 
     var name = Utf8.init(suggested_name);
     defer name.free();
@@ -15199,6 +15417,7 @@ fn onBeforeDownload(
         .url = url,
         .name = name.slice(),
         .mime = mime,
+        .req = d.req,
     });
     return 1;
 }

@@ -563,6 +563,31 @@ fn fallbackTemplates(home: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}/Templates", .{home}) catch "";
 }
 
+/// This host's download directory: `XDG_DOWNLOAD_DIR` when
+/// user-dirs.dirs sets it, else `$HOME/Downloads`. THE home for that
+/// answer — the browser's auto-accepted downloads and the headless
+/// engine's both resolve it here, because a hard-coded `$HOME/Downloads`
+/// silently wrote into a directory the user does not have (their
+/// xdg-user-dirs said `$HOME/downloads`, and files went somewhere they
+/// never looked). Existence is the caller's check; it creates nothing.
+pub fn downloadDir(home: []const u8, config_home: []const u8, buf: []u8) []const u8 {
+    var body: [8192]u8 = undefined;
+    return parseUserDir(readUserDirsFile(config_home, &body), "XDG_DOWNLOAD_DIR", home, buf) orelse
+        (std.fmt.bufPrint(buf, "{s}/Downloads", .{home}) catch "");
+}
+
+test "downloadDir reads user-dirs.dirs and falls back to $HOME/Downloads" {
+    var buf: [512]u8 = undefined;
+    const body = "XDG_DOWNLOAD_DIR=\"$HOME/downloads\"\n";
+    try std.testing.expectEqualStrings(
+        "/home/u/downloads",
+        parseUserDir(body, "XDG_DOWNLOAD_DIR", "/home/u", &buf).?,
+    );
+    // No config dir at all: the freedesktop default, never an empty
+    // string a caller might then join onto.
+    try std.testing.expectEqualStrings("/home/u/Downloads", downloadDir("/home/u", "/nonexistent-config", &buf));
+}
+
 // ── inotify watcher (Linux; inert elsewhere) ────────────────────
 
 /// Whether the watcher reports a CHILD's content change — inotify's

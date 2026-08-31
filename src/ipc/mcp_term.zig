@@ -1010,8 +1010,8 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
     if (mcp.term_state.mux_sock == null)
         return mcp.errRes(arena, .unavailable, "file transfer / port forward tools need isolated mode (they run over private headless terminals)");
 
-    if (eql(u8, name, "upload_file") or eql(u8, name, "download_file")) {
-        const upload = eql(u8, name, "upload_file");
+    if (eql(u8, name, "scp_put") or eql(u8, name, "scp_get")) {
+        const upload = eql(u8, name, "scp_put");
         const local = argStr(args, "local_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'local_path'");
         const remote = argStr(args, "remote_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'remote_path'");
         const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 120_000;
@@ -1379,7 +1379,7 @@ test "term_exec result: output_file writes the full output and reports it" {
     ) != null);
 }
 
-test "upload_file result: transfer facts structured, one prose line" {
+test "scp_put result: transfer facts structured, one prose line" {
     const t = std.testing;
     var arena_state = std.heap.ArenaAllocator.init(t.allocator);
     defer arena_state.deinit();
@@ -1387,7 +1387,7 @@ test "upload_file result: transfer facts structured, one prose line" {
 
     const sha = "a" ** 64;
     const up = try xferOk(arena, "upload", "/srv/app.service", 16, sha);
-    const parsed = try mcp.expectToolResultShape(arena, "upload_file", up);
+    const parsed = try mcp.expectToolResultShape(arena, "scp_put", up);
     const sc = parsed.object.get("structuredContent").?.object;
     try t.expectEqualStrings("upload", sc.get("direction").?.string);
     try t.expectEqualStrings("/srv/app.service", sc.get("path").?.string);
@@ -1402,7 +1402,7 @@ test "upload_file result: transfer facts structured, one prose line" {
 
     // Unknown size still satisfies the schema (bytes is nullable).
     const down = try xferOk(arena, "download", "/tmp/x.bin", null, sha);
-    const dparsed = try mcp.expectToolResultShape(arena, "download_file", down);
+    const dparsed = try mcp.expectToolResultShape(arena, "scp_get", down);
     try t.expectEqual(std.json.Value{ .null = {} }, dparsed.object.get("structuredContent").?.object.get("bytes").?);
 }
 
@@ -1415,8 +1415,8 @@ test "every tool this module serves declares an output schema" {
     for (mcp_tools.TOOLS) |tool| {
         const mine = std.mem.startsWith(u8, tool.name, "term_") or
             std.mem.startsWith(u8, tool.name, "port_forward_") or
-            std.mem.eql(u8, tool.name, "upload_file") or
-            std.mem.eql(u8, tool.name, "download_file");
+            std.mem.eql(u8, tool.name, "scp_put") or
+            std.mem.eql(u8, tool.name, "scp_get");
         if (!mine) continue;
         if (tool.output_schema == null) {
             std.debug.print("{s} has no output schema\n", .{tool.name});

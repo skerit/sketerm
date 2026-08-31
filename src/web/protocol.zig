@@ -114,6 +114,12 @@ pub const CAP_PERMISSIONS = "permissions";
 /// sees a download at all (the engine cancels them without a handler),
 /// which is the pre-downloads behaviour.
 pub const CAP_DOWNLOADS = "downloads";
+/// The helper accepts `download_start`: the client asks for a URL to be
+/// downloaded THROUGH the view's own browser (its cookies, its session,
+/// its route), and the resulting `ev_download_offer` carries the
+/// client's `req` back so the answer can be routed to the caller that
+/// asked. Without it a client can only observe downloads a page starts.
+pub const CAP_DOWNLOAD_START = "download-start";
 /// The helper accepts `a11y_enable` and, for a view it was enabled on,
 /// streams the engine's accessibility tree as `ev_a11y_tree` /
 /// `ev_a11y_loc` / `ev_a11y_event` frames (the 0x70 block). Nothing is
@@ -318,6 +324,18 @@ pub const EPHEMERAL_CTX_BASE: u32 = 0x4000_0000;
 /// desynchronised, not ambitious.
 pub const MAX_FRAME: u32 = 16 * 1024 * 1024;
 
+/// Largest `sem_eval_result` JSON a helper will frame — `MAX_FRAME`
+/// with room for the payload wrapper and the `sem_result` envelope. A
+/// result past it is answered as an ERROR naming its size, never
+/// dropped: an unframeable reply that is silently discarded costs the
+/// caller its whole 120s deadline and reports nothing.
+pub const MAX_EVAL_JSON: usize = MAX_FRAME - (1 << 20);
+
+/// Ceiling on `SemEval.max_str`, the per-string serialization budget.
+/// Well under `MAX_EVAL_JSON` so a single maximal string still frames
+/// after JSON escaping.
+pub const MAX_EVAL_STR: u32 = 4 * 1024 * 1024;
+
 /// Frame tags, allocated in per-family blocks (see the spec's reserved
 /// ranges). Non-exhaustive because an unknown tag must be a value, not
 /// a decode failure.
@@ -394,6 +412,7 @@ pub const Tag = enum(u8) {
     download_decide = 0x79,
     ev_download_progress = 0x7A,
     download_cancel = 0x7B,
+    download_start = 0x7C,
     intercept_set = 0x80,
     intercept_lists = 0x81,
     intercept_status_req = 0x82,
@@ -1487,6 +1506,12 @@ pub const PermissionDecision = struct {
 /// view helper-side, so a client that never answers leaks nothing.
 ///
 /// `total` is 0 when the server sent no length. `mime` may be empty.
+///
+/// `req` is the OPTIONAL TRAILING field (the `ev_popup_request` shape):
+/// it echoes the `download_start.req` of the client request that asked
+/// for this download, and is 0 for one the page started by itself. A
+/// short payload from an older helper decodes as 0, which is exactly
+/// "the page started it" — the only behaviour that helper had.
 pub const EvDownloadOffer = struct {
     pub const tag: Tag = .ev_download_offer;
     view: u32,
@@ -1496,6 +1521,35 @@ pub const EvDownloadOffer = struct {
     /// Engine-suggested file name, never a path.
     name: []const u8,
     mime: []const u8,
+    req: u32 = 0,
+
+    pub fn decodeFrom(payload: []const u8) !EvDownloadOffer {
+        var cur = Cur{ .buf = payload };
+        var out: EvDownloadOffer = .{
+            .view = try cur.readU32(),
+            .id = try cur.readU32(),
+            .total = try cur.readU64(),
+            .url = try cur.readStr(),
+            .name = try cur.readStr(),
+            .mime = try cur.readStr(),
+        };
+        out.req = cur.readU32() catch 0;
+        return out;
+    }
+};
+
+/// Ask the view's browser to download `url` itself, so the fetch
+/// carries that browser's cookies, session and route. The download then
+/// follows the ordinary path — an `ev_download_offer` echoing `req`,
+/// answered by a `download_decide` naming the target path — because the
+/// client, not the engine, decides where bytes land.
+///
+/// `req` is client-minted and non-zero; the helper only echoes it.
+pub const DownloadStart = struct {
+    pub const tag: Tag = .download_start;
+    view: u32,
+    req: u32,
+    url: []const u8,
 };
 
 /// Answer to `ev_download_offer`. A non-empty `path` continues the
@@ -1515,6 +1569,13 @@ pub const DownloadDecide = struct {
 /// Exactly one terminal frame (`done` or `failed`) ends every decided
 /// download — including one the client cancelled, and one whose view
 /// went away mid-flight.
+/// `req` is the OPTIONAL TRAILING field: the `download_start.req` this
+/// download answers, 0 for a page-initiated one. It also carries the
+/// ONE shape a start can fail in before any download exists — `id = 0`,
+/// `failed = 1`, `req` naming the request — so a client that asked for
+/// a url gets an answer even when the view was gone by the time the
+/// frame arrived, instead of waiting out its deadline for an offer that
+/// can never come.
 pub const EvDownloadProgress = struct {
     pub const tag: Tag = .ev_download_progress;
     view: u32,
@@ -1525,6 +1586,21 @@ pub const EvDownloadProgress = struct {
     done: u8,
     /// Canceled or interrupted. `done` and `failed` are exclusive.
     failed: u8,
+    req: u32 = 0,
+
+    pub fn decodeFrom(payload: []const u8) !EvDownloadProgress {
+        var cur = Cur{ .buf = payload };
+        var out: EvDownloadProgress = .{
+            .view = try cur.readU32(),
+            .id = try cur.readU32(),
+            .received = try cur.readU64(),
+            .total = try cur.readU64(),
+            .done = try cur.readU8(),
+            .failed = try cur.readU8(),
+        };
+        out.req = cur.readU32() catch 0;
+        return out;
+    }
 };
 
 /// Abort a running download. Unknown ids are ignored (the download may
@@ -2040,12 +2116,35 @@ pub fn semResultUnwrap(result: SemResult) Frame {
 /// Evaluate `code` in the view's main frame. `flags` bit 0 = resolve a
 /// returned promise before answering; `timeout_ms` bounds that wait
 /// helper-side so a never-settling promise still produces one reply.
+///
+/// `max_str` is the OPTIONAL TRAILING field: how many characters of a
+/// STRING inside the result the page-side serializer may emit before it
+/// cuts (0 = the serializer's own default). It exists because that cut
+/// used to be a silent 4000-character slice — a 40KB string came back
+/// as 4046 bytes of perfectly valid JSON, so `total_chars`, `strict`
+/// and `web_expand` all reported the CUT length as the whole length and
+/// the rest was unreachable by any route. A cut is now MARKED
+/// (`__kind:"string"` with `total_chars`) and its budget is the
+/// caller's. A short payload from an older helper reads as 0.
 pub const SemEval = struct {
     pub const tag: Tag = .sem_eval;
     view: u32,
     flags: u8,
     timeout_ms: u32,
     code: Text,
+    max_str: u32 = 0,
+
+    pub fn decodeFrom(payload: []const u8) !SemEval {
+        var cur = Cur{ .buf = payload };
+        var out: SemEval = .{
+            .view = try cur.readU32(),
+            .flags = try cur.readU8(),
+            .timeout_ms = try cur.readU32(),
+            .code = try cur.readText(),
+        };
+        out.max_str = cur.readU32() catch 0;
+        return out;
+    }
 };
 
 /// `flags` bit of `SemEval`: await a thenable result.
@@ -4068,6 +4167,50 @@ test "round-trip: download frames" {
     try roundTrip(EvDownloadProgress, .{ .view = 7, .id = 41, .received = 10, .total = 10, .done = 1, .failed = 0 });
     try roundTrip(EvDownloadProgress, .{ .view = 7, .id = 41, .received = 3, .total = 0, .done = 0, .failed = 1 });
     try roundTrip(DownloadCancel, .{ .view = 7, .id = 41 });
+    try roundTrip(DownloadStart, .{ .view = 7, .req = 9, .url = "https://example.com/big.iso" });
+    try roundTrip(EvDownloadOffer, .{
+        .view = 7,
+        .id = 43,
+        .total = 12,
+        .url = "https://example.com/asked-for.bin",
+        .name = "asked-for.bin",
+        .mime = "",
+        .req = 9,
+    });
+}
+
+// The download offer grows the same way `ev_popup_request` does: a
+// helper that predates `download_start` sends six fields, and a client
+// built with seven must read that as "the page started this one"
+// (req = 0) rather than as a truncated frame it drops — dropping it is
+// how a download ends up held forever with nothing on disk.
+test "an ev_download_offer without the trailing req still decodes" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const gpa = std.testing.allocator;
+    try putU32(gpa, &out, 7);
+    try putU32(gpa, &out, 41);
+    try putU64(gpa, &out, 0);
+    try putStr(gpa, &out, "https://example.com/x.bin");
+    try putStr(gpa, &out, "x.bin");
+    try putStr(gpa, &out, "");
+    const ev = try EvDownloadOffer.decodeFrom(out.items);
+    try std.testing.expectEqual(@as(u32, 0), ev.req);
+    try std.testing.expectEqualStrings("x.bin", ev.name);
+}
+
+test "a sem_eval without the trailing max_str decodes as the serializer default" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    const gpa = std.testing.allocator;
+    try putU32(gpa, &out, 7);
+    try putU8(gpa, &out, eval_flag_await);
+    try putU32(gpa, &out, 5000);
+    try putText(gpa, &out, .{ .s = "1+1" });
+    const ev = try SemEval.decodeFrom(out.items);
+    try std.testing.expectEqual(@as(u32, 0), ev.max_str);
+    try std.testing.expectEqualStrings("1+1", ev.code.s);
+    try roundTrip(SemEval, .{ .view = 7, .flags = 0, .timeout_ms = 5000, .code = .{ .s = "1+1" }, .max_str = 60_000 });
 }
 
 // The one growable frame on this wire: a helper that predates the

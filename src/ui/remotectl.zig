@@ -1385,6 +1385,35 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         return ipc_protocol.writeOkFlat(out, allocator, .{});
     }
 
+    // Downloads. The fetch happens INSIDE this tab's browser, so it
+    // carries the user's session for that site; the row appears in the
+    // pane's download strip like any other, so a download an assistant
+    // started is visible (and cancellable) to the person watching.
+    if (eql(u8, req.cmd, "web-download")) {
+        const url = req.data orelse
+            return ipc_protocol.writeErr(out, allocator, "web-download needs data=<url>");
+        const path = req.path orelse
+            return ipc_protocol.writeErr(out, allocator, "web-download needs path=<absolute local path>");
+        if (url.len == 0) return ipc_protocol.writeErr(out, allocator, "web-download needs a non-empty url");
+        if (path.len == 0 or path[0] != '/')
+            return ipc_protocol.writeErr(out, allocator, "web-download needs an ABSOLUTE local path");
+        const id = face.webDownloadStart(url, path) orelse
+            return ipc_protocol.writeErr(out, allocator, face.webDownloadRefusal());
+        return ipc_protocol.writeOkFlat(out, allocator, .{ .req = id });
+    }
+
+    if (eql(u8, req.cmd, "web-download-cancel")) {
+        const id = req.req orelse
+            return ipc_protocol.writeErr(out, allocator, "web-download-cancel needs req");
+        if (!face.webDownloadCancel(id))
+            return ipc_protocol.writeErr(out, allocator, "no running download with that request id");
+        return ipc_protocol.writeOkFlat(out, allocator, .{});
+    }
+
+    if (eql(u8, req.cmd, "web-downloads")) {
+        return ipc_protocol.writeOk(out, allocator, "downloads", face.webDownloadList(allocator));
+    }
+
     // A truncated eval result is paged from the GUI's copy: re-running
     // the code to see the rest would run it twice.
     if (eql(u8, req.cmd, "web-eval-text")) {
@@ -1504,7 +1533,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         if (eql(u8, op, "eval")) {
             const code = req.data orelse
                 return ipc_protocol.writeErr(out, allocator, "eval needs data=<javascript>");
-            break :blk face.autoEval(code, req.await_promise, req.timeout_ms orelse 10_000);
+            break :blk face.autoEval(code, req.await_promise, req.timeout_ms orelse 10_000, req.max_chars orelse 0);
         }
         return ipc_protocol.writeErr(out, allocator, "unknown web-request op");
     };

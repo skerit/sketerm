@@ -213,6 +213,7 @@ const findbin = @import("../web/findbin.zig");
 const pace = @import("../web/pace.zig");
 const web_model = @import("../web/model.zig");
 const clock = @import("../util/clock.zig");
+const fsserve = @import("../mux/fsserve.zig");
 const classicmenu = @import("browser/classicmenu.zig");
 const appmenu = @import("appmenu.zig");
 const webhistory = @import("webhistory.zig");
@@ -696,6 +697,9 @@ pub const Client = struct {
     /// old behaviour.
     cap_popup_open: bool = false,
     cap_downloads: bool = false,
+    /// The helper accepts `download_start`: a url can be downloaded
+    /// through a view's own browser, with that browser's session.
+    cap_download_start: bool = false,
     /// The helper accepts `a11y_enable` and streams the AX tree. An
     /// older helper simply skips the unknown frame, so this flag only
     /// records what the face may expect back.
@@ -1548,6 +1552,7 @@ pub const Client = struct {
                 self.cap_clipboard = false;
                 self.cap_popup_open = false;
                 self.cap_downloads = false;
+                self.cap_download_start = false;
                 self.cap_a11y = false;
                 self.cap_a11y_caret = false;
                 self.cap_contexts = false;
@@ -1574,6 +1579,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_CLIPBOARD)) self.cap_clipboard = true;
                     if (std.mem.eql(u8, cap, proto.CAP_POPUP_OPEN)) self.cap_popup_open = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOAD_START)) self.cap_download_start = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.cap_a11y_caret = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
@@ -3265,6 +3271,14 @@ const DmabufFds = struct {
 const Download = struct {
     /// The helper's download id (engine-minted, process-unique).
     id: u32,
+    /// Automation request id (`web-download`), 0 for a download the
+    /// page or the user started. Non-zero rows carry their own target
+    /// path from the request and never raise a save dialog.
+    req: u32 = 0,
+    /// The request failed before any transfer existed (no view, the
+    /// engine never offered a download). Reported as a failed row so
+    /// the caller waiting on the file gets an answer.
+    fail_reason: []const u8 = "",
     name: []u8,
     /// LOCAL path being written: the user's pick for a local save, the
     /// staging file for a redirected (host:) save.
@@ -3297,6 +3311,25 @@ const Download = struct {
         if (self.upload_token) |t| a.free(t);
         a.destroy(self);
     }
+};
+
+/// How long a `web-download` request waits for the engine to offer its
+/// download before the request is reported failed. The helper answers
+/// sooner in the ordinary case; this is the backstop for a helper that
+/// answers nothing at all.
+const ASKED_DOWNLOAD_WAIT_MS: i64 = 30_000;
+
+/// One `web-download` request waiting for its engine offer. The path
+/// is the caller's and travels with the request, so the offer is
+/// answered straight away — an automation download must not sit behind
+/// a save dialog nobody is looking at.
+const AskedDownload = struct {
+    req: u32,
+    /// Absolute target path; owned.
+    path: []u8,
+    /// When the request was sent, so one the engine never offers is
+    /// answered rather than left pending forever.
+    at_ms: i64,
 };
 
 /// User-data for a download row's buttons: ids only, resolved through
@@ -3683,6 +3716,12 @@ pub const WebFace = struct {
     /// of the pane, hidden while empty).
     downloads: std.ArrayList(*Download) = .empty,
     dl_strip: *c.GtkWidget = undefined,
+    /// Automation download requests (`web-download`) whose offer has
+    /// not arrived yet: the target path travelled with the request, so
+    /// the offer is answered without a save dialog. Owned paths.
+    dl_asked: std.ArrayList(AskedDownload) = .empty,
+    /// Next `web-download` request id for this face.
+    dl_next_req: u32 = 1,
     /// 2Hz poll while any download is in its send-to-host phase: the
     /// transfer service has no per-intent callback, and the strip only
     /// needs coarse progress. Mechanism 2, severed at the choke point
@@ -4186,6 +4225,8 @@ pub const WebFace = struct {
         // transfer service's and deliberately survives the pane.
         for (self.downloads.items) |d| d.free(self.allocator);
         self.downloads.deinit(self.allocator);
+        for (self.dl_asked.items) |a| self.allocator.free(a.path);
+        self.dl_asked.deinit(self.allocator);
         self.dropMap();
         self.cancelHints();
         self.hints_items.deinit(self.allocator);
@@ -4401,13 +4442,16 @@ pub const WebFace = struct {
         self.completeOp(.read, request, true, json, .{ .doc_gen = ev.doc_gen, .rev = ev.rev, .reader_ids = true });
     }
 
-    pub fn autoEval(self: *WebFace, code: []const u8, want_await: bool, timeout_ms: u32) ?u32 {
+    /// `max_str` is the caller's per-string serialization budget (0 =
+    /// the page-side default); see `proto.SemEval`.
+    pub fn autoEval(self: *WebFace, code: []const u8, want_await: bool, timeout_ms: u32, max_str: u32) ?u32 {
         const token = self.autoBegin(.eval, false) orelse return null;
         self.postSemantic(token, proto.SemEval{
             .view = self.view,
             .flags = if (want_await) proto.eval_flag_await else 0,
             .timeout_ms = timeout_ms,
             .code = .{ .s = code },
+            .max_str = max_str,
         });
         return token;
     }
@@ -8749,6 +8793,167 @@ pub const WebFace = struct {
     // deliberately routes origin -> local -> server, never
     // fetch-on-server.
 
+    /// Ask the helper to download `url` through THIS view's browser
+    /// (its cookies, its session, its route) into `path`. Returns the
+    /// request id `webDownloadList` reports on, or null when the
+    /// helper cannot serve it — never a request that can never answer.
+    ///
+    /// The row appears in the pane's download strip like any other, so
+    /// the user can see (and cancel) what an assistant is fetching.
+    pub fn webDownloadStart(self: *WebFace, url: []const u8, path: []const u8) ?u32 {
+        if (self.widgets_dead) return null;
+        if (!self.cl.cap_downloads or !self.cl.cap_download_start) return null;
+        if (self.cl.isRemote()) return null;
+        if (path.len == 0 or path[0] != '/') return null;
+        const owned = self.allocator.dupe(u8, path) catch return null;
+        const req = self.dl_next_req;
+        self.dl_next_req +%= 1;
+        if (self.dl_next_req == 0) self.dl_next_req = 1;
+        self.dl_asked.append(self.allocator, .{
+            .req = req,
+            .path = owned,
+            .at_ms = clock.nowMs(),
+        }) catch {
+            self.allocator.free(owned);
+            return null;
+        };
+        self.cl.post(proto.DownloadStart{ .view = self.view, .req = req, .url = url });
+        return req;
+    }
+
+    /// Whether a remote-browser container is what refused a download
+    /// request, so the caller can say WHY rather than "unavailable".
+    pub fn webDownloadRefusal(self: *WebFace) []const u8 {
+        if (self.cl.isRemote()) return "downloads are not supported in a remote-browser container (the file would land on that host)";
+        if (!self.cl.cap_downloads) return "this browser helper does not report downloads";
+        if (!self.cl.cap_download_start) return "this browser helper cannot start a download for a url (capability 'download-start')";
+        return "the web view cannot take a download request now";
+    }
+
+    /// One tracked download's state, for the control socket.
+    pub const DownloadInfo = struct {
+        req: u32,
+        id: u32,
+        name: []const u8,
+        path: []const u8,
+        received: u64,
+        total: u64,
+        state: []const u8,
+        reason: []const u8,
+    };
+
+    /// Every download this face is tracking, plus the requests still
+    /// waiting for their offer (reported as `pending`, so a caller
+    /// polling one never sees it vanish between calls).
+    pub fn webDownloadList(self: *WebFace, arena: std.mem.Allocator) []const DownloadInfo {
+        // Polling IS the sweep: a request the engine never offered
+        // becomes a failed row here rather than staying `pending`
+        // forever for a caller that keeps asking.
+        self.expireAsked();
+        var out: std.ArrayList(DownloadInfo) = .empty;
+        for (self.downloads.items) |d| {
+            out.append(arena, .{
+                .req = d.req,
+                .id = d.id,
+                .name = d.name,
+                .path = d.path,
+                .received = d.received,
+                .total = d.total,
+                .state = switch (d.state) {
+                    .downloading => "running",
+                    .uploading => "sending",
+                    .done => "done",
+                    .failed => "failed",
+                },
+                .reason = d.fail_reason,
+            }) catch break;
+        }
+        for (self.dl_asked.items) |a| {
+            out.append(arena, .{
+                .req = a.req,
+                .id = 0,
+                .name = "",
+                .path = a.path,
+                .received = 0,
+                .total = 0,
+                .state = "pending",
+                .reason = "",
+            }) catch break;
+        }
+        return out.items;
+    }
+
+    /// Cancel one tracked download by request id.
+    pub fn webDownloadCancel(self: *WebFace, req: u32) bool {
+        for (self.downloads.items) |d| {
+            if (d.req != req or d.req == 0) continue;
+            if (d.state == .downloading) {
+                d.canceled = true;
+                self.cl.post(proto.DownloadCancel{ .view = self.view, .id = d.id });
+                return true;
+            }
+            return false;
+        }
+        if (self.takeAsked(req)) |asked| {
+            self.allocator.free(asked.path);
+            return true;
+        }
+        return false;
+    }
+
+    fn takeAsked(self: *WebFace, req: u32) ?AskedDownload {
+        for (self.dl_asked.items, 0..) |a, i| {
+            if (a.req != req) continue;
+            return self.dl_asked.orderedRemove(i);
+        }
+        return null;
+    }
+
+    /// Fail every asked-for download the helper never offered: the
+    /// engine answers a url it will not download with silence, and a
+    /// caller must not wait on silence.
+    fn expireAsked(self: *WebFace) void {
+        const now = clock.nowMs();
+        var i: usize = 0;
+        while (i < self.dl_asked.items.len) {
+            if (now - self.dl_asked.items[i].at_ms < ASKED_DOWNLOAD_WAIT_MS) {
+                i += 1;
+                continue;
+            }
+            const a = self.dl_asked.orderedRemove(i);
+            defer self.allocator.free(a.path);
+            self.recordFailedRequest(a.req, a.path, "the browser did not start a download for that url (it may have navigated to it, or refused the scheme)");
+        }
+    }
+
+    /// A download request that produced no transfer at all, kept as a
+    /// failed row so the answer is a fact rather than a timeout.
+    fn recordFailedRequest(self: *WebFace, req: u32, path: []const u8, reason: []const u8) void {
+        const d = self.allocator.create(Download) catch return;
+        d.* = .{
+            .id = 0,
+            .req = req,
+            .fail_reason = reason,
+            .name = self.allocator.dupe(u8, std.fs.path.basename(path)) catch &.{},
+            .path = self.allocator.dupe(u8, path) catch &.{},
+            .remote_host = &.{},
+            .remote_path = &.{},
+            .state = .failed,
+            .row = undefined,
+            .label = undefined,
+            .bar = undefined,
+            .status = undefined,
+            .cancel_btn = undefined,
+            .open_btn = undefined,
+            .reveal_btn = undefined,
+        };
+        self.downloads.append(self.allocator, d) catch {
+            d.free(self.allocator);
+            return;
+        };
+        self.buildDlRow(d);
+    }
+
     fn findDownload(self: *WebFace, id: u32) ?*Download {
         for (self.downloads.items) |d| {
             if (d.id == id) return d;
@@ -8780,6 +8985,16 @@ pub const WebFace = struct {
             return;
         }
         const name = if (ev.name.len != 0) ev.name else "download";
+        // An automation request named its own path: answer it with
+        // that, dialog policy or not. The caller is waiting on a file
+        // at a path it chose, and there is nobody at a save dialog.
+        if (ev.req != 0) {
+            if (self.takeAsked(ev.req)) |asked| {
+                defer self.allocator.free(asked.path);
+                self.startDownloadReq(ev.id, ev.req, name, asked.path, "", "");
+                return;
+            }
+        }
         if (!g_download_ask) {
             self.autoAcceptDownload(ev.id, name);
             return;
@@ -8817,16 +9032,40 @@ pub const WebFace = struct {
     /// `web_download_ask = false`: straight into ~/Downloads under the
     /// suggested name, uniquified rather than overwritten.
     fn autoAcceptDownload(self: *WebFace, id: u32, name: []const u8) void {
-        const home = c.getenv("HOME") orelse {
+        const home_c = c.getenv("HOME") orelse {
             declineDownload(self.view, id);
             return;
         };
-        var dir_buf: [4096:0]u8 = undefined;
-        const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/Downloads", .{std.mem.span(@as([*:0]const u8, @ptrCast(home)))}) catch {
+        const home = std.mem.span(@as([*:0]const u8, @ptrCast(home_c)));
+        var cfg_buf: [4096]u8 = undefined;
+        const config_home: []const u8 = blk: {
+            if (c.getenv("XDG_CONFIG_HOME")) |x| {
+                const s2 = std.mem.span(@as([*:0]const u8, @ptrCast(x)));
+                if (s2.len != 0) break :blk s2;
+            }
+            break :blk std.fmt.bufPrint(&cfg_buf, "{s}/.config", .{home}) catch {
+                declineDownload(self.view, id);
+                return;
+            };
+        };
+        // The user's XDG download directory, NOT a hard-coded
+        // `$HOME/Downloads`: a machine whose user-dirs.dirs says
+        // `$HOME/downloads` had its auto-accepted downloads written to
+        // a directory it does not otherwise use, which reads exactly
+        // like the download never happening.
+        var dir_stack: [4096]u8 = undefined;
+        const dir = fsserve.downloadDir(home, config_home, &dir_stack);
+        if (dir.len == 0) {
             declineDownload(self.view, id);
             return;
-        };
-        _ = c.mkdir(dir.ptr, 0o755);
+        }
+        var dir_z: [4096:0]u8 = undefined;
+        if (std.fmt.bufPrintZ(&dir_z, "{s}", .{dir})) |z| {
+            _ = c.mkdir(z.ptr, 0o755);
+        } else |_| {
+            declineDownload(self.view, id);
+            return;
+        }
         var path_buf: [4608]u8 = undefined;
         const path = uniquePath(&path_buf, dir, name) orelse {
             declineDownload(self.view, id);
@@ -8906,6 +9145,12 @@ pub const WebFace = struct {
     /// Create the tracking entry + strip row and answer the held offer
     /// with `path`.
     fn startDownload(self: *WebFace, id: u32, name: []const u8, path: []const u8, remote_host: []const u8, remote_path: []const u8) void {
+        self.startDownloadReq(id, 0, name, path, remote_host, remote_path);
+    }
+
+    /// `startDownload`, carrying the automation request id that asked
+    /// for it (0 = page- or user-initiated).
+    fn startDownloadReq(self: *WebFace, id: u32, req: u32, name: []const u8, path: []const u8, remote_host: []const u8, remote_path: []const u8) void {
         if (self.findDownload(id) != null) return;
         const d = self.allocator.create(Download) catch {
             declineDownload(self.view, id);
@@ -8913,6 +9158,7 @@ pub const WebFace = struct {
         };
         d.* = .{
             .id = id,
+            .req = req,
             .name = self.allocator.dupe(u8, name) catch &.{},
             .path = self.allocator.dupe(u8, path) catch &.{},
             .remote_host = self.allocator.dupe(u8, remote_host) catch &.{},
@@ -9030,7 +9276,14 @@ pub const WebFace = struct {
                 c.gtk_widget_set_tooltip_text(d.cancel_btn, "Dismiss");
             },
             .failed => {
-                c.gtk_label_set_text(@ptrCast(d.status), "Failed");
+                var fail_z: [160:0]u8 = undefined;
+                const failed_text: [*:0]const u8 = if (d.fail_reason.len != 0) blk: {
+                    const t = std.fmt.bufPrintZ(&fail_z, "Failed: {s}", .{
+                        d.fail_reason[0..@min(d.fail_reason.len, 140)],
+                    }) catch break :blk "Failed";
+                    break :blk t.ptr;
+                } else "Failed";
+                c.gtk_label_set_text(@ptrCast(d.status), failed_text);
                 c.gtk_button_set_icon_name(@ptrCast(d.cancel_btn), "window-close-symbolic");
                 c.gtk_widget_set_tooltip_text(d.cancel_btn, "Dismiss");
             },
@@ -9038,6 +9291,15 @@ pub const WebFace = struct {
     }
 
     fn onDownloadProgress(self: *WebFace, ev: proto.EvDownloadProgress) void {
+        // id 0 = the helper refused a `download_start` outright: there
+        // is no transfer to update, only a request to answer.
+        if (ev.id == 0) {
+            if (ev.req == 0) return;
+            const asked = self.takeAsked(ev.req) orelse return;
+            defer self.allocator.free(asked.path);
+            self.recordFailedRequest(ev.req, asked.path, "the browser did not start a download for that url (it may have navigated to it, or refused the scheme)");
+            return;
+        }
         const d = self.findDownload(ev.id) orelse return;
         d.received = ev.received;
         if (ev.total > 0) d.total = ev.total;

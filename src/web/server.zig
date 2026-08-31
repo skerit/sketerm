@@ -123,6 +123,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_CLIPBOARD,
     proto.CAP_POPUP_OPEN,
     proto.CAP_DOWNLOADS,
+    proto.CAP_DOWNLOAD_START,
     proto.CAP_A11Y,
     proto.CAP_A11Y_CARET,
     proto.CAP_CONTEXTS,
@@ -926,6 +927,7 @@ pub const Server = struct {
             .net_log_req => self.host.netLog(try self.dec(cn, proto.NetLogReq, frame.payload)),
             .download_decide => self.host.downloadDecide(try self.dec(cn, proto.DownloadDecide, frame.payload)),
             .download_cancel => self.host.downloadCancel(try self.dec(cn, proto.DownloadCancel, frame.payload)),
+            .download_start => self.host.downloadStart(try self.dec(cn, proto.DownloadStart, frame.payload)),
             .a11y_enable => self.host.a11yEnable(try self.dec(cn, proto.A11yEnable, frame.payload)),
             .us_script_set => {
                 // Process-global, last-writer-wins: see .intercept_lists.

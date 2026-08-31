@@ -1154,6 +1154,60 @@ against it, which is what the user actually runs — **verify smoke-web
 against both**, since upstream ships WITHOUT proprietary codecs (no
 H.264/AAC) while the distro build enables them.
 
+## Downloads (0x78 block, capabilities "downloads" + "download-start")
+
+Every download's TARGET decision is held for the client: `can_download`
+returns 1, `on_before_download` keeps the callback and posts
+`ev_download_offer`, and only a `download_decide` naming a path lets the
+engine write anything. The client, never the engine, decides where bytes
+land — including for a download the client itself asked for.
+
+- **A held offer is now BOUNDED** (`download_hold_ms`, 5 minutes). It
+  has to be long enough for a human at a save dialog and finite because
+  a client that does not understand these frames leaves Chromium's
+  target determiner waiting forever: the page's `a.click()` reports
+  success, a temp file appears and is reaped, and no error exists on any
+  side. That was the field failure, and the client-side fix (answering
+  the frames) does not remove the need for the helper to be safe against
+  a client that does not.
+- **`download_start` (0x7C) downloads a url through the view's own
+  browser**, so the request carries that browser's cookies, session and
+  route. CEF gives no way to correlate `start_download` with the
+  `DownloadItem` it produces — not even by url, which redirects rewrite
+  — so the join is FIFO per view (`Host.dl_pending` / `dlPendingReq`)
+  and the offer carries the client's `req` back in an optional trailing
+  field. A page-initiated download racing an asked-for one can take the
+  tag; the cost is a mislabelled row, never a lost file.
+- **Every start is ANSWERED.** No view, no browser (a discarded view),
+  no `start_download` in this build, an allocation failure, a url the
+  engine declines to download at all (it navigates instead, or refuses
+  the scheme — no callback ever fires, so `dl_start_wait_ms` is the only
+  signal there is), and a view destroyed mid-flight all post
+  `ev_download_progress{id = 0, failed = 1, req}`. The one shape that
+  cannot be routed is a view id belonging to no connection, because this
+  wire routes replies BY view; a client only asks for views it holds.
+- smoke-web stage 22j covers the held offer, the decided path and the
+  cancel; stage 22j2 covers `download_start`, the echoed request id and
+  the immediate refusal. smoke-mcp's download stage is the end-to-end
+  half (a url fetched to a caller's path, and a page-initiated download
+  landing in the XDG download directory).
+
+## Eval result size: the cut must be visible
+
+`semantic.js`'s serializer cut every STRING at `EVAL_MAXSTR` (4000)
+without a marker, so a 40KB string arrived as ~4046 bytes of perfectly
+valid JSON and every consumer downstream believed that was the whole
+value. The budget now travels with the request (`SemEval.max_str`,
+optional trailing field; `Host.evalMaxStr` clamps it to
+`proto.MAX_EVAL_STR`) and a cut is a described placeholder —
+`{__kind:"string", text, total_chars, truncated}` — like every other
+degradation this serializer performs. Two consequences worth keeping:
+the CSP-spliced retry must carry the SAME budget (it is part of
+`Pending`, exactly like the await flag and the timeout), and a result
+whose JSON exceeds `proto.MAX_EVAL_JSON` is answered as an error naming
+its size rather than dropped by `post`'s `catch {}` — a dropped reply
+costs the caller its entire 120s deadline and explains nothing.
+
 ## Rules that outlive any one change
 
 - The wire protocol is **append-only**: new frame tags and capabilities,

@@ -8582,6 +8582,41 @@ fn mcpWebReaderStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
     if (!mcpHas(stale, "stale reader id") or
         !mcpHas(stale, "isError"))
         return "GUI MCP adapter did not refuse the stale reader entity";
+
+    // web_download through the USER'S OWN browser: the request goes
+    // MCP -> control socket -> WebFace -> helper, the row appears on
+    // the pane's download strip like any other, and the bytes land at
+    // the path the caller named. Nothing about this path worked
+    // before: a download an assistant started had no way to name a
+    // destination at all.
+    const DL_BYTES = "GUI-DOWNLOAD-BYTES";
+    var dl_path_buf: [512]u8 = undefined;
+    const dl_path = std.fmt.bufPrint(&dl_path_buf, "{s}/gui-download.bin", .{rt}) catch
+        return "GUI download path did not fit";
+    const dl_args = std.fmt.bufPrint(
+        &args,
+        "{{\"pane\":{d},\"url\":\"data:application/octet-stream,{s}\",\"path\":\"{s}\",\"timeout_ms\":40000}}",
+        .{ pane, DL_BYTES, dl_path },
+    ) catch return "GUI web_download arguments did not fit";
+    const dl = m.call("web_download", dl_args, 60_000) orelse return "GUI web_download timed out";
+    if (mcpHas(dl, "isError") or !mcpHas(dl, "\"state\":\"done\""))
+        return "GUI web_download did not complete through the user's browser";
+    if (!mcpHas(dl, "\"sha256\"")) return "GUI web_download reported no digest";
+    var got_buf: [64]u8 = undefined;
+    var dl_z: [512:0]u8 = undefined;
+    const dl_zp = std.fmt.bufPrintZ(&dl_z, "{s}", .{dl_path}) catch return "GUI download path did not fit";
+    const df = c.fopen(dl_zp.ptr, "rb") orelse return "GUI web_download reported success with no file on disk";
+    const dn = c.fread(&got_buf, 1, got_buf.len, df);
+    _ = c.fclose(df);
+    if (dn != DL_BYTES.len or !std.mem.eql(u8, got_buf[0..dn], DL_BYTES))
+        return "the GUI download's bytes are not the payload";
+    // And it is reportable afterwards, which is how a download the USER
+    // started is found too.
+    const list_args = std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{pane}) catch
+        return "GUI web_download listing arguments did not fit";
+    const listed = m.call("web_download", list_args, 30_000) orelse return "GUI web_download listing timed out";
+    if (!mcpHas(listed, "\"listing\":true") or std.mem.indexOf(u8, listed, dl_path) == null)
+        return "the GUI download listing does not name the file it just wrote";
     return null;
 }
 

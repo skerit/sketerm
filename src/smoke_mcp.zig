@@ -953,7 +953,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         if (std.mem.indexOf(u8, post_read, "process exited with status 7") == null)
             fail("term_read on an exited terminal lacks the exit banner");
 
-        // ── upload_file (local): checksum + atomic rename ─────────
+        // ── scp_put (local): checksum + atomic rename ────────────
         var src_buf: [512]u8 = undefined;
         var dst_buf: [512]u8 = undefined;
         const xsrc = std.fmt.bufPrintZ(&src_buf, "{s}/xfer-src.bin", .{rt}) catch unreachable;
@@ -963,12 +963,12 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         _ = c.fclose(xf);
         var xargs_buf: [1200]u8 = undefined;
         const xargs = std.fmt.bufPrint(&xargs_buf, "{{\"local_path\":\"{s}\",\"remote_path\":\"{s}\"}}", .{ xsrc, xdst }) catch unreachable;
-        const up = m.callTool("upload_file", xargs);
+        const up = m.callTool("scp_put", xargs);
         if (std.mem.indexOf(u8, up, "\"direction\":\"upload\"") == null or
             std.mem.indexOf(u8, up, "\"verified\":true") == null or
             std.mem.indexOf(u8, up, "\"atomic\":true") == null)
-            fail("local upload_file did not verify");
-        if (!fileExists(xdst)) fail("upload_file destination missing");
+            fail("local scp_put did not verify");
+        if (!fileExists(xdst)) fail("scp_put destination missing");
 
         // ── automatic asciicast recording of terminal 1 ───────────
         {
@@ -2624,6 +2624,12 @@ const TinyHttp = struct {
     /// The one document served, whatever the path; a stage that needs
     /// its own page sets it before `spawn`.
     body: []const u8 = BODY,
+    /// One path served as a DOWNLOADABLE attachment (octet-stream +
+    /// Content-Disposition) instead of a document; empty = none. The
+    /// download stage needs a url the engine downloads rather than
+    /// renders, which is a property of the response, not of the url.
+    dl_path: []const u8 = "",
+    dl_body: []const u8 = "",
 
     const BODY =
         "<html><head><title>Profile Origin</title></head><body>" ++
@@ -2666,19 +2672,29 @@ const TinyHttp = struct {
             const cfd = c.accept(self.fd, null, null);
             if (cfd < 0) return;
             var req: [4096]u8 = undefined;
-            _ = c.read(cfd, &req, req.len);
-            var head: [256]u8 = undefined;
-            const hdr = std.fmt.bufPrint(
-                &head,
-                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-                .{self.body.len},
-            ) catch return;
+            const got = c.read(cfd, &req, req.len);
+            const line = if (got > 0) req[0..@intCast(got)] else "";
+            const want_dl = self.dl_path.len != 0 and std.mem.indexOf(u8, line, self.dl_path) != null;
+            const payload = if (want_dl) self.dl_body else self.body;
+            var head: [320]u8 = undefined;
+            const hdr = if (want_dl)
+                std.fmt.bufPrint(
+                    &head,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"served.bin\"\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                    .{payload.len},
+                ) catch return
+            else
+                std.fmt.bufPrint(
+                    &head,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {d}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                    .{payload.len},
+                ) catch return;
             // MSG_NOSIGNAL, never write(2): the browser closes a
             // connection it already has the bytes for (favicon probes
             // especially), and the SIGPIPE that follows would kill the
             // smoke process rather than this one request.
             _ = c.send(cfd, hdr.ptr, hdr.len, c.MSG_NOSIGNAL);
-            _ = c.send(cfd, self.body.ptr, self.body.len, c.MSG_NOSIGNAL);
+            _ = c.send(cfd, payload.ptr, payload.len, c.MSG_NOSIGNAL);
             _ = c.close(cfd);
         }
     }
@@ -2853,6 +2869,206 @@ fn viewHandleOf(reply: []const u8) u32 {
     return v;
 }
 
+/// The payload the loopback server hands out at `/served.bin`. Short,
+/// distinctive, and asserted byte for byte: "the download reported
+/// success" is exactly the claim that used to be false.
+const DOWNLOAD_PAYLOAD = "SKETERM-DOWNLOAD-PAYLOAD-0123456789";
+
+/// Downloads, end to end against REAL CEF. This is the stage that
+/// exists because the whole thing silently did nothing: a headless
+/// client ignored the download frames, the engine held every target
+/// decision forever, a page's `a.click()` reported success, and no file
+/// was written anywhere with no error on any side.
+///
+/// Three claims, each of which was false before:
+///   1. `web_download` fetches a url through the view's own browser and
+///      the bytes are on disk at the path the caller named.
+///   2. A download the PAGE starts lands in the user's XDG download
+///      directory — the one user-dirs.dirs names, not a hard-coded
+///      `$HOME/Downloads` the user does not have.
+///   3. Either one is REPORTABLE afterwards (`web_download` with no url).
+fn webDownloadStage(m: *Mcp, rt: []const u8, port: u16) void {
+    var args_buf: [1024]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+
+    // The user's own download directory, exactly the shape that broke:
+    // xdg-user-dirs pointing at a LOWERCASE `downloads`.
+    const dl_dir = std.fmt.bufPrint(&path_buf, "{s}/home/downloads", .{rt}) catch unreachable;
+    {
+        var z: [512:0]u8 = undefined;
+        const zp = std.fmt.bufPrintZ(&z, "{s}", .{dl_dir}) catch unreachable;
+        _ = c.mkdir(zp.ptr, 0o700);
+        var cfg_buf: [512:0]u8 = undefined;
+        const cfg = std.fmt.bufPrintZ(&cfg_buf, "{s}/config/user-dirs.dirs", .{rt}) catch unreachable;
+        const f = c.fopen(cfg.ptr, "wb") orelse fail("cannot write user-dirs.dirs");
+        var body_buf: [640]u8 = undefined;
+        const body = std.fmt.bufPrint(&body_buf, "XDG_DOWNLOAD_DIR=\"{s}\"\n", .{dl_dir}) catch unreachable;
+        _ = c.fwrite(body.ptr, 1, body.len, f);
+        _ = c.fclose(f);
+    }
+
+    var origin_buf: [64]u8 = undefined;
+    const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{port}) catch unreachable;
+    m.sendTool("web_open", std.fmt.bufPrint(&args_buf, "{{\"url\":\"{s}\",\"snapshot\":\"none\"}}", .{origin}) catch unreachable);
+    const opened = m.recvLine(60_000);
+    if (std.mem.indexOf(u8, opened, "isError") != null) fail("download stage: could not open the loopback origin");
+
+    // capabilities must PREFLIGHT this, not leave it to be discovered.
+    const caps = m.callTool("capabilities", "{}");
+    if (std.mem.indexOf(u8, caps, "\"web_downloads\":true") == null)
+        fail("capabilities does not report that web_download works here");
+
+    // (1) A url downloaded through the view, to the caller's path.
+    var got_buf: [512]u8 = undefined;
+    const got = std.fmt.bufPrint(&got_buf, "{s}/home/got.bin", .{rt}) catch unreachable;
+    const dl = m.callTool("web_download", std.fmt.bufPrint(
+        &args_buf,
+        "{{\"url\":\"http://127.0.0.1:{d}/served.bin\",\"path\":\"{s}\",\"timeout_ms\":30000}}",
+        .{ port, got },
+    ) catch unreachable);
+    if (std.mem.indexOf(u8, dl, "isError") != null) {
+        std.debug.print("smoke-mcp: web_download: {s}\n", .{dl});
+        fail("web_download failed against the loopback server");
+    }
+    if (std.mem.indexOf(u8, dl, "\"state\":\"done\"") == null)
+        fail("web_download did not report the transfer as done");
+    if (std.mem.indexOf(u8, dl, "\"sha256\":\"") == null)
+        fail("web_download did not report the file's digest");
+    var read_buf: [256]u8 = undefined;
+    const on_disk = readSmall(got, &read_buf);
+    if (!std.mem.eql(u8, on_disk, DOWNLOAD_PAYLOAD)) {
+        std.debug.print("smoke-mcp: on disk: '{s}'\n", .{on_disk});
+        fail("web_download reported success but the file's bytes are not the payload");
+    }
+
+    // (2) A download the PAGE starts: the exact field repro, an anchor
+    // clicked from script. It must land in the XDG download directory.
+    const clicked = m.callTool("web_eval", std.fmt.bufPrint(
+        &args_buf,
+        "{{\"body\":\"const a=document.createElement('a');a.href='http://127.0.0.1:{d}/served.bin';a.download='page.bin';document.body.appendChild(a);a.click();return 'clicked';\"}}",
+        .{port},
+    ) catch unreachable);
+    if (std.mem.indexOf(u8, clicked, "clicked") == null)
+        fail("the page-initiated download click did not run");
+    var landed: []const u8 = "";
+    var page_path_buf: [512]u8 = undefined;
+    // The engine names the file, and a `Content-Disposition` filename
+    // outranks the anchor's `download` attribute — so the assertion is
+    // "the payload is in the XDG download directory", not "under the
+    // name the page asked for".
+    const page_path = std.fmt.bufPrint(&page_path_buf, "{s}/served.bin", .{dl_dir}) catch unreachable;
+    const deadline = nowMs() + 30_000;
+    while (nowMs() < deadline) {
+        const listed = m.callTool("web_download", "{}");
+        if (std.mem.indexOf(u8, listed, "isError") != null) fail("web_download listing failed");
+        if (fileExists(page_path)) {
+            landed = readSmall(page_path, &read_buf);
+            if (std.mem.eql(u8, landed, DOWNLOAD_PAYLOAD)) break;
+        }
+        _ = c.usleep(200_000);
+    }
+    if (!std.mem.eql(u8, landed, DOWNLOAD_PAYLOAD)) {
+        std.debug.print("smoke-mcp: expected {s}, got '{s}'\n", .{ page_path, landed });
+        fail("a page-initiated download did not land in the XDG download directory (the silent-discard bug)");
+    }
+
+    // (3) Both are reportable afterwards, with their paths.
+    const listing = m.callTool("web_download", "{}");
+    if (std.mem.indexOf(u8, listing, "\"listing\":true") == null)
+        fail("web_download with no url did not report a listing");
+    if (std.mem.indexOf(u8, listing, page_path) == null)
+        fail("web_download's listing does not name the page-initiated download's path");
+
+    _ = m.callTool("web_close", "{}");
+}
+
+/// The eval result-size contract. A 40000-character string used to come
+/// back as 4046 bytes of perfectly valid JSON — cut in the PAGE, so
+/// total_chars reported the cut length, strict:true never fired, and
+/// web_expand paged the capture rather than the value. Every one of
+/// those is asserted here against a real engine.
+fn webEvalSizeStage(m: *Mcp, rt: []const u8) void {
+    var args_buf: [1024]u8 = undefined;
+    const BIG = 40_000;
+    var code_buf: [256]u8 = undefined;
+    const code = std.fmt.bufPrint(&code_buf, "'x'.repeat({d})", .{BIG}) catch unreachable;
+
+    m.sendTool("web_open", "{\"url\":\"data:text/html,<h1>size</h1>\",\"snapshot\":\"none\"}");
+    if (std.mem.indexOf(u8, m.recvLine(60_000), "isError") != null)
+        fail("eval-size stage: could not open a view");
+
+    // The whole string, inline, when the caller asks for the room.
+    const whole = m.callTool("web_eval", std.fmt.bufPrint(
+        &args_buf,
+        "{{\"code\":\"{s}\",\"max_chars\":60000}}",
+        .{code},
+    ) catch unreachable);
+    if (std.mem.indexOf(u8, whole, "isError") != null) fail("web_eval of a 40000-char string failed");
+    if (std.mem.indexOf(u8, whole, "\"truncated\":true") != null)
+        fail("web_eval truncated a result that fits inside the max_chars it was given");
+    if (std.mem.indexOf(u8, whole, "\"__kind\":\"string\"") != null)
+        fail("the page cut the string even though the caller's budget covered it (the 4000-char slice is back)");
+
+    // The default inline limit: TRUNCATED, and the length it reports is
+    // the WHOLE length, not the length of what the page happened to
+    // serialize.
+    const cut = m.callTool("web_eval", std.fmt.bufPrint(&args_buf, "{{\"code\":\"{s}\"}}", .{code}) catch unreachable);
+    if (std.mem.indexOf(u8, cut, "\"truncated\":true") == null)
+        fail("a 40000-char result was not reported as truncated at the default inline limit");
+    var want_total: [64]u8 = undefined;
+    // 40002 = the string plus its JSON quotes, inside {"value":...}.
+    if (std.mem.indexOf(u8, cut, std.fmt.bufPrint(&want_total, "\"total_chars\":{d}", .{BIG + 12}) catch unreachable) == null) {
+        std.debug.print("smoke-mcp: web_eval cut reply: {s}\n", .{cut[0..@min(cut.len, 600)]});
+        fail("web_eval's total_chars is not the whole result's length (the page-side cut is being reported as the total)");
+    }
+
+    // strict:true refuses instead of handing back a prefix.
+    const strict = m.callTool("web_eval", std.fmt.bufPrint(&args_buf, "{{\"code\":\"{s}\",\"strict\":true}}", .{code}) catch unreachable);
+    if (std.mem.indexOf(u8, strict, "\"isError\":true") == null)
+        fail("strict:true truncated instead of erroring");
+    if (std.mem.indexOf(u8, strict, "too large for strict inline return") == null)
+        fail("the strict refusal does not say why");
+
+    // out_file: the whole thing on disk, nothing in the reply.
+    var out_buf: [512]u8 = undefined;
+    const out_path = std.fmt.bufPrint(&out_buf, "{s}/home/eval.txt", .{rt}) catch unreachable;
+    const to_file = m.callTool("web_eval", std.fmt.bufPrint(
+        &args_buf,
+        "{{\"code\":\"{s}\",\"out_file\":\"{s}\"}}",
+        .{ code, out_path },
+    ) catch unreachable);
+    if (std.mem.indexOf(u8, to_file, "isError") != null) fail("web_eval out_file failed");
+    if (std.mem.indexOf(u8, to_file, "\"format\":\"text\"") == null)
+        fail("web_eval out_file did not write a string value as text");
+    var size_buf: [64]u8 = undefined;
+    if (std.mem.indexOf(u8, to_file, std.fmt.bufPrint(&size_buf, "\"bytes\":{d}", .{BIG}) catch unreachable) == null) {
+        std.debug.print("smoke-mcp: out_file reply: {s}\n", .{to_file[0..@min(to_file.len, 600)]});
+        fail("web_eval out_file did not write the whole 40000-character string");
+    }
+    if (std.mem.indexOf(u8, to_file, "\"truncated\":true") != null)
+        fail("web_eval out_file reported a truncation for a result it wrote whole");
+
+    // web_expand pages the REAL value, not the capture: the tail of the
+    // string is reachable.
+    const tail = m.callTool("web_expand", "{\"id\":0,\"offset\":39000,\"len\":2000}");
+    if (std.mem.indexOf(u8, tail, "isError") != null) fail("web_expand id=0 failed after a truncated eval");
+    if (std.mem.indexOf(u8, tail, std.fmt.bufPrint(&want_total, "\"total_chars\":{d}", .{BIG + 12}) catch unreachable) == null)
+        fail("web_expand pages something shorter than the whole result (the page-side capture, not the value)");
+    // Offset 39000 is far past the old 4046-byte capture: an empty
+    // page here IS the bug this stage exists for.
+    if (std.mem.indexOf(u8, tail, "\"text\":\"xxx") == null)
+        fail("web_expand returned nothing at offset 39000 - the tail of the result is unreachable");
+
+    // A `body` with top-level await runs (the wrapper is async).
+    const awaited = m.callTool("web_eval", "{\"body\":\"const v = await Promise.resolve(7); return v + 1;\"}");
+    if (std.mem.indexOf(u8, awaited, "\"value\":8") == null) {
+        std.debug.print("smoke-mcp: async body reply: {s}\n", .{awaited[0..@min(awaited.len, 400)]});
+        fail("a body with top-level await did not run (the wrapper is not async)");
+    }
+
+    _ = m.callTool("web_close", "{}");
+}
+
 /// A self-signed loopback server: the open that used to HANG. The
 /// headless client dropped `ev_cert_error`, so the helper held the
 /// request forever and web_open sat on `loading:true` for its whole
@@ -2944,10 +3160,18 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
 
     // capabilities must say the tools work HERE, headlessly — the old
     // report steered assistants to --shared / launch_app instead.
+    // Before any web call there is no engine, so the backend is NOT
+    // yet decided: session-vs-headless depends on a helper that has
+    // not started. Reporting the guess as fact once sent a session
+    // down a whole mirroring workaround built on a web_watch:false
+    // that flipped to true the moment a view opened.
     const caps = m.callTool("capabilities", "{}");
-    if (std.mem.indexOf(u8, caps, "\"web\":true") == null or
-        std.mem.indexOf(u8, caps, "\"web_backend\":\"headless\"") == null)
-        fail("capabilities does not report the headless web backend");
+    if (std.mem.indexOf(u8, caps, "\"web\":true") == null)
+        fail("capabilities does not report that the web tools work here");
+    if (std.mem.indexOf(u8, caps, "\"web_backend\":\"not_yet_determined\"") == null or
+        std.mem.indexOf(u8, caps, "\"web_engine_started\":false") == null or
+        std.mem.indexOf(u8, caps, "\"web_watch\":null") == null)
+        fail("capabilities reports a browser backend as fact before any engine exists");
 
     // web_open: spawns the helper lazily, loads the page, returns a
     // first snapshot with stable node ids.
@@ -2976,6 +3200,10 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // reporting must name it.
     {
         const caps_open = m.callTool("capabilities", "{}");
+        if (std.mem.indexOf(u8, caps_open, "\"web_engine_started\":true") == null)
+            fail("capabilities still says no engine has started after a view was opened");
+        if (std.mem.indexOf(u8, caps_open, "\"web_backend\":\"not_yet_determined\"") != null)
+            fail("capabilities left the backend undetermined after the engine started");
         if (std.mem.indexOf(u8, caps_open, "\"web_backend\":\"session\"") != null) {
             if (std.mem.indexOf(u8, caps_open, "\"web_session\":\"web-") == null)
                 fail("session web backend reported without a session name");
@@ -3116,6 +3344,8 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     // isolates nothing.
     var http = TinyHttp.start() orelse fail("could not bind a loopback HTTP server for the profile checks");
     defer http.deinit();
+    http.dl_path = "/served.bin";
+    http.dl_body = DOWNLOAD_PAYLOAD;
     http.spawn();
     var origin_buf: [64]u8 = undefined;
     const origin = std.fmt.bufPrint(&origin_buf, "http://127.0.0.1:{d}/", .{http.port}) catch unreachable;
@@ -3192,6 +3422,9 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
                 fail("web_profile_reset erased a profile that was in use");
         }
     }
+
+    webDownloadStage(&m, rt, http.port);
+    webEvalSizeStage(&m, rt);
 
     certStage(&m, rt);
 

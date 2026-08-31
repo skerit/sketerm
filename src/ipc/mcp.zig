@@ -1577,6 +1577,13 @@ pub fn argStr(args: std.json.Value, key: []const u8) ?[]const u8 {
     };
 }
 
+/// One argument as its raw JSON value, for the few arguments whose type
+/// is not a scalar (an array of urls).
+pub fn argValue(args: std.json.Value, key: []const u8) ?std.json.Value {
+    if (args != .object) return null;
+    return args.object.get(key);
+}
+
 pub fn argBool(args: std.json.Value, key: []const u8) bool {
     if (args != .object) return false;
     const v = args.object.get(key) orelse return false;
@@ -3788,6 +3795,13 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     // The web tools drive the user's GUI on a server-wide socket OR on
     // the web_gui grant's own; both are "gui" to a consumer.
     const gui_web = @import("mcp_web.zig").guiDrivesWeb();
+    // Which backend will answer, and — for the headless case — whether
+    // that is a MEASUREMENT or a prediction. The engine starts lazily
+    // at the first web call, so before one exists "headless" vs
+    // "session" is not yet decided: reporting the guess as a fact once
+    // sent a session down an entire mirroring workaround built on a
+    // `web_watch:false` that flipped to true the moment a view opened.
+    const engine_started = @import("mcp_web.zig").engineStarted();
     const web_backend: []const u8 = if (helper == null)
         "none"
     else if (gui_web)
@@ -3796,6 +3810,8 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
         "none"
     else if (@import("mcp_web.zig").sessionInfo() != null)
         "session"
+    else if (!engine_started)
+        "not_yet_determined"
     else
         "headless";
     const web_ok = helper != null and !std.mem.eql(u8, web_backend, "none");
@@ -3831,7 +3847,15 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     // shows pixels. Both are facts a human needs to find the assistant's
     // browser from their own GUI; the text lane says where to look.
     const web_watch = @import("mcp_web.zig").presenterActive();
-    try res.fact("web_watch", web_watch);
+    // Undetermined until an engine exists: `null`, never `false`. An
+    // authoritative-looking wrong value is worse than no value.
+    if (web_ok and !gui_web and !engine_started)
+        try res.raw("web_watch", "null")
+    else
+        try res.fact("web_watch", web_watch);
+    try res.fact("web_engine_started", engine_started);
+    if (web_ok and !gui_web and !engine_started)
+        try res.text("the browser engine has not started yet (it spawns at the first web_* call), so web_backend/web_watch/web_session are not yet determined -- open a view and read them again rather than treating this reply as their final value");
     // The browser-page watch: the GUI joins this server's helper as a
     // second client and shows its pages as web pages (helper
     // capability "observe"). `web_socket` is the socket it joins.
@@ -3868,6 +3892,18 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
         // headless view answers them itself (fail closed, fingerprint
         // opt-in). A consumer must not have to hang once to learn that.
         try res.fact("web_cert_facts", true);
+        // Downloading through a view: the only path that carries the
+        // page's own session, so a consumer must be able to preflight
+        // it rather than discover it by trying.
+        const dl = @import("mcp_web.zig").downloadCapability();
+        try res.fact("web_downloads", dl.supported);
+        if (dl.supported)
+            try res.text(if (dl.started)
+                "web_download fetches a url INSIDE a view's browser (its cookies and session) straight to a file; a download a page starts lands in the user's XDG download directory and web_download with no url lists them"
+            else
+                "web_download is available once the browser engine starts; it fetches a url INSIDE a view's browser (its cookies and session) straight to a file")
+        else
+            try res.text("this browser helper cannot download through a view (capabilities 'downloads' + 'download-start')");
         try res.fact("web_accept_cert", !gui_web);
         try res.text(if (gui_web)
             "certificate errors: the user's interstitial decides; results carry cert facts while a load is held"
@@ -3987,6 +4023,21 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     try res.textf("open: {d} terminal(s), {d} app(s), {d} forward(s)", .{
         term_state.terms.count(), app_state.apps.count(), forward_state.forwards.count(),
     });
+
+    // A capability-shaped index of a ~100-tool surface. A large surface
+    // invites "there must be a tool for this" searching over "what is
+    // the simplest path" — two sessions once burned a dozen calls
+    // hunting for a transport that did not exist. These are the
+    // answers to the questions that were actually asked.
+    try res.text(
+        "WHERE TO START (by task, not by tool name): " ++
+            "move bytes OUT of a page -> web_download (url -> file, with the page's own session) or web_eval out_file: (a computed result -> file); " ++
+            "read a page -> web_read (article text) or web_snapshot (things to act on); act on it -> web_act; " ++
+            "run something -> term_run in a live shell, term_exec for an isolated one-shot; " ++
+            "files on THIS machine -> file_read / file_write / file_list; files over SSH -> scp_get / scp_put; " ++
+            "drive a GUI app -> launch_app then app_click / app_type / screenshot_app; " ++
+            "show the user something -> ui_show. Nothing here streams data through the conversation that a file could carry.",
+    );
     return res.finish();
 }
 
@@ -5714,7 +5765,7 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
     if (std.mem.startsWith(u8, name, "term_")) {
         return @import("mcp_term.zig").termTool(arena, name, args);
     }
-    if (eql(u8, name, "upload_file") or eql(u8, name, "download_file") or
+    if (eql(u8, name, "scp_put") or eql(u8, name, "scp_get") or
         std.mem.startsWith(u8, name, "port_forward_"))
     {
         return @import("mcp_term.zig").xferTool(arena, name, args);
