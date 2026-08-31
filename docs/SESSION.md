@@ -1,5 +1,90 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-08-31: downloading from a signed-in browser did not work at all
+
+A field report, from a session that had a signed-in browser, full
+control of it, and 348 small files it could plainly see. That should be
+two tool calls; it took ~30 and ~45KB of relayed URL data, because
+there was no working way to move bytes out of a page. Three independent
+routes were tried and all three failed.
+
+**A download the page starts was silently discarded.** The helper HOLDS
+every download's target decision until a client answers it
+(`ev_download_offer` / `download_decide`). `webdrive.zig` — the headless
+client every isolated `sketerm mcp` uses — did not handle those frames
+at all, so the engine held the decision forever: `a.click()` returned
+`{clicked:true}` with a valid blob url, a Chromium temp file appeared
+and was reaped, and no error existed on any side. Nothing above the
+socket could even tell that a download had been offered. Headless now
+answers the offer and the file lands in the user's XDG download
+directory; the GUI's auto-accept had the same class of bug in a
+different place, writing to a hard-coded `$HOME/Downloads` on a machine
+whose `user-dirs.dirs` says `$HOME/downloads` — the files were on disk
+somewhere the user never looks. `fsserve.downloadDir` is now the one
+home for that answer. Helper-side, an offer nobody answers is cancelled
+after 5 minutes instead of being held for the life of the process: a
+client that does not understand these frames must not wedge the
+download manager.
+
+**There was no way to ask for a url either.** `web_download` fetches a
+url INSIDE the view's browser — its cookies, its session, its route —
+and the helper writes the file; the reply carries `path`, `bytes` and
+`sha256` and none of the content, so a 348-file job costs no context at
+all. `urls`+`dir` does up to 64 in one call, one at a time (CEF leaves
+FIFO as the only join between `start_download` and the item it
+produces, so the new `download_start` frame's request id is echoed back
+on the offer). Every start is ANSWERED, including the ones that cannot
+happen: a caller waiting on a file must never be waiting on silence.
+The name `download_file` was the trap that sent the reporting session
+looking in the wrong place — it is scp, and it is now `scp_get` /
+`scp_put`.
+
+**And the fallback — relaying data out through `web_eval` — was capped
+by a silent 4000-character slice in the page.** A 40511-char string came
+back as 4046 bytes of perfectly valid JSON, so `total_chars` reported
+the CUT length as the whole length, `strict:true` never fired (the
+payload was under the limit), and `web_expand id=0` paged the capture
+rather than the value: the remaining 36KB was unreachable by any route,
+and the three tools disagreed with each other and with their own
+descriptions. The budget now travels with the request
+(`SemEval.max_str`), a cut is MARKED as
+`{__kind:"string", text, total_chars, truncated}`, the MCP layer asks
+for 256000 characters so `web_expand` really does have the rest, and
+`out_file:"/abs/path"` writes the whole result to disk (a string value
+as itself, anything else as JSON) with `bytes`/`sha256`/`format` in the
+reply. A result too large to frame is now an error naming its size
+rather than a frame `post` drops, which used to cost the caller its
+whole 120s deadline.
+
+Four smaller things from the same report, each of which cost real
+calls: `body` is wrapped in an ASYNC IIFE (the tool advertises `await`,
+and top-level await in a body failed with "await is only valid in async
+functions"); `capabilities` reports `web_backend:"not_yet_determined"`
+and `web_watch:null` while no engine has started, because an earlier
+session built an entire panel-mirroring workaround on a `web_watch:false`
+that flipped to true the moment a view opened; `web_policy` /
+`web_policy_set` / `web_profiles` lead with HEADLESS ONLY instead of
+burying it in a final sentence; and `sketerm mux attach` grew
+`--new-tab` plus a warning, after the documented command consumed the
+user's own pane when a tool ran it in their shell. `capabilities`'
+text lane also ends with a short capability index (move bytes / read a
+page / run something / files here / files over SSH): a ~100-tool
+surface invites "there must be a tool for this" searching over "what is
+the simplest path", and two sessions burned calls hunting for a
+transport that did not exist.
+
+Proof, since every one of these was a green-looking feature that did
+nothing: smoke-web stage 22j2 (`download_start`, the echoed request id,
+the immediate refusal), smoke-mcp's download stage (a url fetched to a
+caller's path against real CEF, byte for byte, AND a page-initiated
+`a.click()` landing in the XDG download directory — the exact field
+repro) and its eval-size stage (40000 chars whole under `max_chars`,
+truthful `total_chars` at the default, `strict` refusing, `out_file`
+writing 40000 bytes, `web_expand` paging at offset 39000, and a body
+with top-level await), and smoke-e2e's GUI stage (`web_download`
+through the user's own browser, MCP -> control socket -> WebFace ->
+helper -> file on disk).
+
 ## 2026-08-30: paste never worked, and only one window could browse
 
 Three browser bugs the user hit within minutes of the watch work
