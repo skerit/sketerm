@@ -341,8 +341,11 @@ fn sendBytes(fd: c_int, bytes: []const u8, deadline: i64) bool {
 fn runSshCommand(_: ?*anyopaque, plan: *const sshroute.Plan, ssh_bin: [*:0]const u8, command: [:0]const u8, input_path: ?[]const u8) u8 {
     var host_buf: [256:0]u8 = undefined;
     const host_z = std.fmt.bufPrintZ(&host_buf, "{s}", .{plan.destination}) catch return 255;
-    const custom = c.getenv("SKETERM_SSH") != null;
-    var route_args = plan.args(!custom and canMultiplex()) catch return 255;
+    // OpenSSH 10.5 can detach a new ControlPersist master while this
+    // process is still feeding the upload on stdin. The mux channel then
+    // stops draining after its window fills, poisoning later proxy dials.
+    // Deployment is infrequent and correctness matters more than reuse.
+    var route_args = plan.args(false) catch return 255;
     var pair: [2]c_int = undefined;
     if (platform.socketpairCloexec(&pair) != 0) return 255;
     const devnull = c.open("/dev/null", c.O_WRONLY | c.O_CLOEXEC);
@@ -542,7 +545,9 @@ test "check and upload run through a real sh with the payload on stdin" {
     var script_buf: [320:0]u8 = undefined;
     const script = std.fmt.bufPrintZ(
         &script_buf,
-        "#!/bin/sh\nHOME={s}; export HOME\nfor a in \"$@\"; do cmd=\"$a\"; done\nexec sh -c \"$cmd\"\n",
+        "#!/bin/sh\nHOME={s}; export HOME\n" ++
+            "for a in \"$@\"; do case \"$a\" in ControlMaster=*|ControlPath=*|ControlPersist=*) exit 78;; esac; cmd=\"$a\"; done\n" ++
+            "exec sh -c \"$cmd\"\n",
         .{home},
     ) catch unreachable;
     {

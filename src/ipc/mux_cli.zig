@@ -889,8 +889,9 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
         var cfg = @import("../config.zig").Config.load(allocator);
         defer cfg.deinit();
         const remote = mux_client.RemoteSpec.parse(h);
-        const conn = mux_client.Conn.connectRemote(allocator, h, cfg.muxConnectOptions()) catch {
+        const conn = mux_client.Conn.connectRemote(allocator, h, cfg.muxConnectOptions()) catch |err| {
             const mode_name = @tagName(remote.mode);
+            const err_name = @errorName(err);
             // No portable artifact = this install cannot deploy the daemon
             // for the user (a Linux architecture the packaging has no musl
             // target for), so "not installed there" is the whole story.
@@ -902,18 +903,33 @@ pub fn muxConnect(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.C
             _ = c.fprintf(
                 platform.stderr(),
                 "sketerm mux: cannot reach %.*s using %.*s transport policy\n" ++
-                    "  see the real error:  ssh %.*s sketerm-mux --proxy\n" ++
-                    "  common causes: sketerm-mux not installed there; binary built\n" ++
-                    "  for a newer CPU (deploy `zig build mux-portable` instead);\n" ++
-                    "  key/agent auth not set up; or UDP filtered when forced\n%s",
+                    "  connection error: %.*s\n",
                 @as(c_int, @intCast(remote.host.len)),
                 remote.host.ptr,
                 @as(c_int, @intCast(mode_name.len)),
                 mode_name.ptr,
-                @as(c_int, @intCast(remote.host.len)),
-                remote.host.ptr,
-                deploy_note,
+                @as(c_int, @intCast(err_name.len)),
+                err_name.ptr,
             );
+            if (remote.mode == .tor) {
+                _ = c.fprintf(
+                    platform.stderr(),
+                    "  Tor policy was preserved; no direct SSH probe or fallback was attempted\n" ++
+                        "  retry for the full transport error: sketerm mux tor:%.*s list\n",
+                    @as(c_int, @intCast(remote.host.len)),
+                    remote.host.ptr,
+                );
+            } else {
+                _ = c.fprintf(
+                    platform.stderr(),
+                    "  safe SSH probe: ssh -T -x -o BatchMode=yes -o ControlMaster=no\n" ++
+                        "                  -o ClearAllForwardings=yes %.*s sketerm-mux --help\n" ++
+                        "  this checks host/auth/binary reachability without touching sessions\n",
+                    @as(c_int, @intCast(remote.host.len)),
+                    remote.host.ptr,
+                );
+            }
+            _ = c.fputs(deploy_note, platform.stderr());
             return null;
         };
         if (remote.mode == .auto and conn.transport == .ssh) {

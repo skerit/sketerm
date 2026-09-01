@@ -118,6 +118,10 @@ pub const Args = struct {
         }
         put(out, &n, "-o");
         put(out, &n, "BatchMode=yes");
+        // A dedicated mux/deployment connection must not recreate unrelated
+        // LocalForward/RemoteForward/DynamicForward entries from ssh_config.
+        put(out, &n, "-o");
+        put(out, &n, "ClearAllForwardings=yes");
         switch (self.route) {
             .direct => if (self.multiplex) {
                 // `%C` is a fixed-length hash, so the socket path stays
@@ -211,6 +215,7 @@ test "Tor route forces the internal proxy and disables direct multiplexing" {
     try t.expect(std.mem.indexOf(u8, joined.items, "CanonicalizeHostname=no") != null);
     try t.expect(std.mem.indexOf(u8, joined.items, "VerifyHostKeyDNS=no") != null);
     try t.expect(std.mem.indexOf(u8, joined.items, "ProxyUseFdpass=no") != null);
+    try t.expect(std.mem.indexOf(u8, joined.items, "ClearAllForwardings=yes") != null);
 }
 
 test "a destination that could break out of the ProxyCommand is refused" {
