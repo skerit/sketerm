@@ -1998,8 +1998,14 @@ fn evalResult(
     } else {
         // Machine data: verbatim JSON where it IS JSON, a plain string
         // otherwise (an old helper, or a non-JSON placeholder).
-        if (std.json.parseFromSliceLeaky(std.json.Value, arena, payload, .{})) |_| {
+        if (std.json.parseFromSliceLeaky(std.json.Value, arena, payload, .{})) |parsed| {
             try res.raw("value", payload);
+            // The page-side serializer cut strings INSIDE the value: the
+            // markers are in `value`, but a caller reading a field out
+            // of an object would take the placeholder for the data.
+            const cuts = countCutStrings(parsed);
+            try res.fact("cut_strings", cuts);
+            if (cuts != 0) try res.textf("{d} string(s) inside the result were cut by the page serializer and arrive as __kind:string markers carrying text, total_chars and truncated; re-run with a larger max_chars or out_file, or return the value in slices", .{cuts});
         } else |_| {
             try res.fact("value_text", payload);
         }
@@ -2059,7 +2065,12 @@ fn evalToFile(
                         }
                     } else {
                         bytes = try stringifyValue(arena, val);
+                        truncated = countCutStrings(val) != 0;
                     }
+                },
+                .array => {
+                    bytes = try stringifyValue(arena, val);
+                    truncated = countCutStrings(val) != 0;
                 },
                 else => bytes = try stringifyValue(arena, val),
             }
@@ -2091,6 +2102,46 @@ fn evalToFile(
         try res.textf("wrote {d} bytes ({s}) to {s}; the result is not in this reply", .{ bytes.len, format, path });
     }
     return res.finish();
+}
+
+/// Whether `o` is the page serializer's marked string cut.
+fn isCutString(o: std.json.ObjectMap) bool {
+    const kind = o.get("__kind") orelse return false;
+    if (kind != .string or !std.mem.eql(u8, kind.string, "string")) return false;
+    const t = o.get("truncated") orelse return false;
+    return t == .bool and t.bool;
+}
+
+/// How many marked string cuts `v` holds, at any depth.
+fn countCutStrings(v: std.json.Value) usize {
+    return switch (v) {
+        .object => |o| blk: {
+            if (isCutString(o)) break :blk 1;
+            var n: usize = 0;
+            var it = o.iterator();
+            while (it.next()) |e| n += countCutStrings(e.value_ptr.*);
+            break :blk n;
+        },
+        .array => |a| blk: {
+            var n: usize = 0;
+            for (a.items) |e| n += countCutStrings(e);
+            break :blk n;
+        },
+        else => 0,
+    };
+}
+
+test "countCutStrings finds markers at any depth and ignores whole strings" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const p = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"rows":[{"body":{"__kind":"string","text":"ab","total_chars":9000,"truncated":true}},
+        \\ {"body":"whole"},{"body":{"__kind":"string","text":"whole","total_chars":5,"truncated":false}}],
+        \\ "nested":{"deep":[[{"__kind":"string","text":"x","total_chars":70,"truncated":true}]]}}
+    , .{});
+    try std.testing.expectEqual(@as(usize, 2), countCutStrings(p));
+    try std.testing.expectEqual(@as(usize, 0), countCutStrings(.{ .string = "plain" }));
 }
 
 fn stringifyValue(arena: std.mem.Allocator, value: std.json.Value) ![]const u8 {
@@ -4172,8 +4223,13 @@ fn jsonU64Of(o: std.json.ObjectMap, key: []const u8) u64 {
 }
 
 /// The file name a url suggests: its last path segment, query and
-/// fragment stripped, never a path and never empty.
-fn nameFromUrl(url: []const u8) []const u8 {
+/// fragment stripped, percent-escapes decoded, never a path and never
+/// empty.
+///
+/// Decoding is what makes `report%20Q1.pdf` land as `report Q1.pdf`;
+/// a decoded `/`, NUL or control byte becomes `_` so the name stays a
+/// single leaf whatever the url encoded.
+fn nameFromUrl(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     var s = url;
     if (std.mem.indexOfScalar(u8, s, '#')) |i| s = s[0..i];
     if (std.mem.indexOfScalar(u8, s, '?')) |i| s = s[0..i];
@@ -4188,16 +4244,72 @@ fn nameFromUrl(url: []const u8) []const u8 {
     }
     while (s.len > 0 and s[s.len - 1] == '/') s = s[0 .. s.len - 1];
     const slash = std.mem.lastIndexOfScalar(u8, s, '/');
-    const leaf = if (slash) |i| s[i + 1 ..] else s;
+    const raw = if (slash) |i| s[i + 1 ..] else s;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < raw.len) : (i += 1) {
+        var ch = raw[i];
+        if (ch == '%' and i + 2 < raw.len) {
+            if (std.fmt.parseInt(u8, raw[i + 1 .. i + 3], 16)) |b| {
+                ch = b;
+                i += 2;
+            } else |_| {}
+        }
+        if (ch == '/' or ch < 0x20 or ch == 0x7f) ch = '_';
+        try out.append(arena, ch);
+    }
+    const leaf = out.items;
     if (leaf.len == 0 or std.mem.eql(u8, leaf, ".") or std.mem.eql(u8, leaf, "..")) return "download";
     return leaf[0..@min(leaf.len, 200)];
 }
 
-test "nameFromUrl strips the query and never returns a path" {
-    try std.testing.expectEqualStrings("file.zip", nameFromUrl("https://x.test/a/b/file.zip?sig=abc#frag"));
-    try std.testing.expectEqualStrings("download", nameFromUrl("https://x.test/"));
-    try std.testing.expectEqualStrings("download", nameFromUrl("https://x.test/a/.."));
-    try std.testing.expectEqualStrings("b", nameFromUrl("https://x.test/a/b/"));
+test "nameFromUrl strips the query, decodes escapes and never returns a path" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("file.zip", try nameFromUrl(arena, "https://x.test/a/b/file.zip?sig=abc#frag"));
+    try std.testing.expectEqualStrings("download", try nameFromUrl(arena, "https://x.test/"));
+    try std.testing.expectEqualStrings("download", try nameFromUrl(arena, "https://x.test/a/.."));
+    try std.testing.expectEqualStrings("b", try nameFromUrl(arena, "https://x.test/a/b/"));
+    try std.testing.expectEqualStrings("report Q1.pdf", try nameFromUrl(arena, "https://x.test/d/report%20Q1.pdf"));
+    // A decoded slash or NUL cannot escape the leaf; a dangling or
+    // malformed escape is kept literally.
+    try std.testing.expectEqualStrings("a_b", try nameFromUrl(arena, "https://x.test/a%2Fb"));
+    try std.testing.expectEqualStrings("a_b", try nameFromUrl(arena, "https://x.test/a%00b"));
+    try std.testing.expectEqualStrings("a%zzb%2", try nameFromUrl(arena, "https://x.test/a%zzb%2"));
+    try std.testing.expectEqualStrings("download", try nameFromUrl(arena, "https://x.test/%2E%2E"));
+}
+
+/// `<dir>/<name>`, made unique among the paths `used` so far by a
+/// ` (n)` suffix before the extension. A batch of urls that share a
+/// leaf (`/a/report.pdf`, `/b/report.pdf`) would otherwise write one
+/// over the other while the reply reported both as done.
+fn batchPath(arena: std.mem.Allocator, used: *std.StringHashMapUnmanaged(void), dir: []const u8, name: []const u8) ![]const u8 {
+    const dot = blk: {
+        const at = std.mem.lastIndexOfScalar(u8, name, '.') orelse break :blk name.len;
+        break :blk if (at == 0) name.len else at;
+    };
+    var n: u32 = 0;
+    while (true) : (n += 1) {
+        const path = if (n == 0)
+            try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name })
+        else
+            try std.fmt.allocPrint(arena, "{s}/{s} ({d}){s}", .{ dir, name[0..dot], n + 1, name[dot..] });
+        const gop = try used.getOrPut(arena, path);
+        if (!gop.found_existing) return path;
+    }
+}
+
+test "batchPath keeps same-named urls apart" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var used: std.StringHashMapUnmanaged(void) = .empty;
+    try std.testing.expectEqualStrings("/d/report.pdf", try batchPath(arena, &used, "/d", "report.pdf"));
+    try std.testing.expectEqualStrings("/d/report (2).pdf", try batchPath(arena, &used, "/d", "report.pdf"));
+    try std.testing.expectEqualStrings("/d/report (3).pdf", try batchPath(arena, &used, "/d", "report.pdf"));
+    try std.testing.expectEqualStrings("/d/.bashrc", try batchPath(arena, &used, "/d", ".bashrc"));
+    try std.testing.expectEqualStrings("/d/.bashrc (2)", try batchPath(arena, &used, "/d", ".bashrc"));
 }
 
 /// One download, run to completion (or to the caller's deadline).
@@ -4298,7 +4410,7 @@ fn downloadTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vie
 
     var outcomes: std.ArrayList(DlOutcome) = .empty;
     if (single) |url| {
-        const path = path_arg orelse try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir.?, nameFromUrl(url) });
+        const path = path_arg orelse try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir.?, try nameFromUrl(arena, url) });
         switch (try runOneDownload(drv, arena, view.pane, url, path, deadline)) {
             .err => |e| return failRes(arena, e),
             .out => |o| try outcomes.append(arena, o),
@@ -4314,9 +4426,10 @@ fn downloadTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vie
             if (item != .string)
                 return mcp.errRes(arena, .invalid_args, "'urls' must be an array of url STRINGS");
         }
+        var used: std.StringHashMapUnmanaged(void) = .empty;
         for (items) |item| {
             const url = item.string;
-            const path = try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir.?, nameFromUrl(url) });
+            const path = try batchPath(arena, &used, dir.?, try nameFromUrl(arena, url));
             if (drv.now() >= deadline) {
                 try outcomes.append(arena, .{
                     .url = url,
@@ -4900,6 +5013,23 @@ test "web_eval: a JSON value stays JSON in structuredContent, a long one is page
     try t.expect(wsc.get("value_text") == null);
     try t.expectEqual(@as(usize, EVAL_INLINE_CHARS + 100), wsc.get("value").?.string.len);
     try t.expectEqual(@as(i64, EVAL_INLINE_CHARS + 200), wsc.get("inline_limit").?.integer);
+    try t.expectEqual(@as(i64, 0), wsc.get("cut_strings").?.integer);
+
+    // A cut NESTED in the value is a fact and a sentence, not a
+    // placeholder object the caller mistakes for the field's data.
+    const nested = try evalResult(
+        arena,
+        .headless,
+        EXAMPLE,
+        "{\"rows\":[{\"body\":{\"__kind\":\"string\",\"text\":\"ab\",\"total_chars\":9000,\"truncated\":true}}]}",
+        EVAL_INLINE_CHARS,
+    );
+    const xp = try mcp.expectToolResultShape(arena, "web_eval", nested);
+    const xsc = xp.object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 1), xsc.get("cut_strings").?.integer);
+    try t.expect(xsc.get("truncated") == null);
+    const xtext = xp.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, xtext, "1 string(s) inside the result were cut") != null);
 }
 
 test "web_eval body is wrapped in an ASYNC function and asks for a real page budget" {
@@ -4973,6 +5103,19 @@ test "web_eval out_file writes the whole result and keeps it out of the reply" {
     try t.expect(msc.get("truncated").?.bool);
     try t.expectEqual(@as(i64, 9000), msc.get("total_chars").?.integer);
     try t.expectEqualStrings("abc", readBackForTest(path, &read_buf));
+
+    // A cut nested inside a structured value marks the file truncated
+    // too; the JSON is written as-is, markers included.
+    const deep = try evalToFile(
+        arena,
+        .headless,
+        EXAMPLE,
+        "{\"value\":[{\"__kind\":\"string\",\"text\":\"ab\",\"total_chars\":9000,\"truncated\":true}]}",
+        path,
+    );
+    const dsc = (try mcp.expectToolResultShape(arena, "web_eval", deep)).object.get("structuredContent").?.object;
+    try t.expect(dsc.get("truncated").?.bool);
+    try t.expectEqualStrings("json", dsc.get("format").?.string);
 }
 
 fn readBackForTest(path: []const u8, buf: []u8) []const u8 {

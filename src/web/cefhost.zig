@@ -4419,13 +4419,17 @@ pub const Host = struct {
             const d = &self.downloads.items[i];
             // An offer nobody answered: cancel it ourselves rather than
             // hold the engine's target determiner for the life of the
-            // helper (`download_hold_ms`).
+            // helper (`download_hold_ms`). Exactly `download_cancel`'s
+            // path: the entry stays until the ENGINE reports terminal,
+            // because `cancelDl` continued the held callback into a
+            // throwaway file the engine has yet to create, and retiring
+            // the entry here would unlink that path before it exists
+            // and drop the cancel request with it — the download then
+            // ran to completion into /tmp under a fresh entry.
             if (d.offered and !d.decided and !d.cancel_requested and !d.terminal() and
                 d.offered_ms != 0 and now - d.offered_ms > download_hold_ms)
             {
                 self.cancelDl(d);
-                d.failed = true;
-                d.dirty = true;
             }
             if (d.dirty) {
                 d.dirty = false;

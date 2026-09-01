@@ -1169,7 +1169,12 @@ land — including for a download the client itself asked for.
   success, a temp file appears and is reaped, and no error exists on any
   side. That was the field failure, and the client-side fix (answering
   the frames) does not remove the need for the helper to be safe against
-  a client that does not.
+  a client that does not. The expiry takes `download_cancel`'s exact
+  path and leaves the entry for the ENGINE's terminal update to retire:
+  `cancelDl` continues the held callback into a throwaway `/tmp` path
+  the engine has yet to create, so marking the entry failed in the same
+  flush unlinked that path before it existed and dropped the cancel
+  request with the entry — the download then completed into `/tmp`.
 - **`download_start` (0x7C) downloads a url through the view's own
   browser**, so the request carries that browser's cookies, session and
   route. CEF gives no way to correlate `start_download` with the

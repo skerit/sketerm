@@ -3332,13 +3332,16 @@ const AskedDownload = struct {
     at_ms: i64,
 };
 
-/// User-data for a download row's buttons: ids only, resolved through
-/// the client registry at click time (the PrintCtx liveness fence).
+/// User-data for a download row's buttons, resolved through the client
+/// registry at click time (the PrintCtx liveness fence) and then by
+/// MEMBERSHIP of the face's download list — never by engine id, which
+/// is 0 for every request that failed before a transfer existed, so
+/// two such rows would answer each other's Dismiss.
 /// Owned by the button via `cast.destroyCtx` (mechanism 1).
 const DlBtnCtx = struct {
     allocator: std.mem.Allocator,
     view: u32,
-    id: u32,
+    dl: *Download,
 };
 
 /// User-data for a download's save dialog; the dialog outlives a pane
@@ -8804,6 +8807,11 @@ pub const WebFace = struct {
         if (self.widgets_dead) return null;
         if (!self.cl.cap_downloads or !self.cl.cap_download_start) return null;
         if (self.cl.isRemote()) return null;
+        // A watched page is another client's view: the helper drops
+        // `download_start` for an alias at its edge (`observerAllows`)
+        // with no reply, so the request would sit `pending` until the
+        // sweep failed it with a reason naming the wrong cause.
+        if (self.cl.observer) return null;
         if (path.len == 0 or path[0] != '/') return null;
         const owned = self.allocator.dupe(u8, path) catch return null;
         const req = self.dl_next_req;
@@ -8825,6 +8833,7 @@ pub const WebFace = struct {
     /// request, so the caller can say WHY rather than "unavailable".
     pub fn webDownloadRefusal(self: *WebFace) []const u8 {
         if (self.cl.isRemote()) return "downloads are not supported in a remote-browser container (the file would land on that host)";
+        if (self.cl.observer) return "this pane watches another client's page; downloads belong to the page's owner";
         if (!self.cl.cap_downloads) return "this browser helper does not report downloads";
         if (!self.cl.cap_download_start) return "this browser helper cannot start a download for a url (capability 'download-start')";
         return "the web view cannot take a download request now";
@@ -8894,9 +8903,24 @@ pub const WebFace = struct {
             }
             return false;
         }
+        // Not offered yet: keep a failed record, so the offer that may
+        // still arrive for this request is DECLINED (`onDownloadOffer`)
+        // instead of falling through to a save dialog for a download
+        // the caller already gave up on.
         if (self.takeAsked(req)) |asked| {
-            self.allocator.free(asked.path);
+            defer self.allocator.free(asked.path);
+            self.recordFailedRequest(req, asked.path, "canceled before the browser offered the download");
             return true;
+        }
+        return false;
+    }
+
+    /// A request already answered as failed (canceled, or expired by
+    /// the sweep) whose offer arrives late anyway.
+    fn failedRequest(self: *WebFace, req: u32) bool {
+        if (req == 0) return false;
+        for (self.downloads.items) |d| {
+            if (d.req == req and d.id == 0 and d.state == .failed) return true;
         }
         return false;
     }
@@ -8992,6 +9016,14 @@ pub const WebFace = struct {
             if (self.takeAsked(ev.req)) |asked| {
                 defer self.allocator.free(asked.path);
                 self.startDownloadReq(ev.id, ev.req, name, asked.path, "", "");
+                return;
+            }
+            // The caller was already told this request failed (it
+            // canceled, or the offer outlived the wait): a late offer
+            // is answered with a decline, never with a dialog nobody
+            // asked for.
+            if (self.failedRequest(ev.req)) {
+                declineDownload(ev.view, ev.id);
                 return;
             }
         }
@@ -9225,7 +9257,7 @@ pub const WebFace = struct {
         c.gtk_widget_add_css_class(btn, "flat");
         c.gtk_widget_set_tooltip_text(btn, tip);
         if (self.allocator.create(DlBtnCtx) catch null) |ctx| {
-            ctx.* = .{ .allocator = self.allocator, .view = self.view, .id = d.id };
+            ctx.* = .{ .allocator = self.allocator, .view = self.view, .dl = d };
             _ = c.g_signal_connect_data(
                 @ptrCast(btn),
                 "clicked",
@@ -9435,14 +9467,22 @@ pub const WebFace = struct {
         d.free(self.allocator);
     }
 
+    /// The row a button belongs to, if the face still tracks it.
+    fn rowDownload(self: *WebFace, d: *Download) ?*Download {
+        for (self.downloads.items) |it| {
+            if (it == d) return it;
+        }
+        return null;
+    }
+
     fn onDlCancelClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(DlBtnCtx, user);
         const self = findFaceGlobal(ctx.view) orelse return;
-        const d = self.findDownload(ctx.id) orelse return;
+        const d = self.rowDownload(ctx.dl) orelse return;
         switch (d.state) {
             .downloading => {
                 d.canceled = true;
-                self.cl.post(proto.DownloadCancel{ .view = ctx.view, .id = ctx.id });
+                self.cl.post(proto.DownloadCancel{ .view = ctx.view, .id = d.id });
             },
             .uploading => {
                 d.canceled = true;
@@ -9461,7 +9501,7 @@ pub const WebFace = struct {
     fn onDlOpenClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(DlBtnCtx, user);
         const self = findFaceGlobal(ctx.view) orelse return;
-        const d = self.findDownload(ctx.id) orelse return;
+        const d = self.rowDownload(ctx.dl) orelse return;
         if (d.remote_host.len != 0) return;
         var uri: [4700:0]u8 = undefined;
         const u = std.fmt.bufPrintZ(&uri, "file://{s}", .{d.path}) catch return;
@@ -9471,7 +9511,7 @@ pub const WebFace = struct {
     fn onDlRevealClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(DlBtnCtx, user);
         const self = findFaceGlobal(ctx.view) orelse return;
-        const d = self.findDownload(ctx.id) orelse return;
+        const d = self.rowDownload(ctx.dl) orelse return;
         var spec: [4700]u8 = undefined;
         const s = if (d.remote_host.len != 0)
             std.fmt.bufPrint(&spec, "{s}:{s}", .{ d.remote_host, d.remote_path }) catch return

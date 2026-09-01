@@ -54,8 +54,12 @@ of its own. Both halves are fixed and both are rig-proven.
   offers downloads in its own order and FIFO is the only join CEF leaves
   between `start_download` and the item it produces. The reply carries
   `path`/`bytes`/`sha256` per file and NOTHING of the content, which is
-  what makes a 348-file job cost no context. With no url it LISTS the
-  view's downloads — the page-initiated ones included.
+  what makes a 348-file job cost no context. A `dir` name comes from the
+  url's last segment, percent-decoded (`nameFromUrl`), and is made
+  unique WITHIN the batch (`batchPath`, ` (n)` before the extension) —
+  two urls ending in `report.pdf` used to write one file and report two.
+  With no url it LISTS the view's downloads — the page-initiated ones
+  included.
 - **A download the PAGE starts is answered too, in both backends.** The
   helper HOLDS every download's target decision until a client answers
   it; `webdrive.zig` ignored those frames entirely, so the engine held
@@ -89,7 +93,10 @@ of its own. Both halves are fixed and both are rig-proven.
   now carries the caller's budget, a cut is MARKED
   (`{__kind:"string", text, total_chars, truncated}`), and the MCP layer
   asks for `EVAL_PAGE_CHARS` (256000) so what does not fit inline really
-  is behind `web_expand`. `out_file:"/abs/path"` writes the whole result
+  is behind `web_expand`. Markers can sit at ANY depth of the value, so
+  every reply counts them (`cut_strings`, `countCutStrings`) — a cut
+  field inside an object is otherwise a placeholder the caller reads as
+  the field's data. `out_file:"/abs/path"` writes the whole result
   to disk (a string value as ITSELF, anything else as JSON) and answers
   with `path`/`bytes`/`sha256`/`format` — the generic escape for every
   bulk-data case. A result too large to FRAME is answered as an error
