@@ -1,5 +1,44 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-01: review of the download work, six edges closed
+
+A read of the previous day's commits found nothing that needed
+reverting and six edges that did not hold, all fixed in one pass:
+
+- **The helper's 5-minute hold expiry retired the entry itself.** It
+  called `cancelDl` (which continues the held target callback into a
+  throwaway `/tmp` path) and then marked the download failed in the
+  same flush, so the entry — and the trash path — were dropped before
+  the engine had created the file. With no cancel handle yet, the
+  cancel request died with the entry too and the download ran to
+  completion into `/tmp` under a fresh, trash-less entry. The expiry
+  now does exactly what `download_cancel` does and lets the ENGINE's
+  terminal update retire the entry.
+- **Every failed-request row in the GUI strip had id 0**, and the row
+  buttons resolved by id, so Dismiss on the second such row removed the
+  first. `DlBtnCtx` now carries the row's `*Download` and resolves by
+  membership of the face's list.
+- **Cancelling a not-yet-offered `web-download` freed its record**, so
+  when the offer arrived the face fell through to a save dialog for a
+  download the caller had given up on. A cancel now leaves a failed
+  record, and a late offer for a request already answered as failed
+  (cancelled, or expired by the sweep) is declined.
+- **A `web-download` on a WATCHED page was dropped at the helper's
+  observer gate with no reply**, surfacing 30s later as "the browser
+  did not start a download". The face refuses it up front with the
+  real reason, exactly as it does for a remote container.
+- **Batch `web_download` names collided.** `/a/report.pdf` and
+  `/b/report.pdf` mapped to one path and the second overwrote the first
+  while both reported `done`; `%20` stayed literal. Names are now
+  percent-decoded (a decoded `/` or control byte becomes `_`) and made
+  unique within the batch with ` (n)` before the extension.
+- **A page-side string cut NESTED in an eval result was invisible.**
+  Only a top-level marker was recognised, so a cut field inside an
+  object reached the caller as a placeholder object with no flag. Every
+  `web_eval` reply now carries `cut_strings` (markers at any depth) and
+  says so in the prose; `out_file` marks the file truncated for a
+  nested cut as well.
+
 ## 2026-08-31: downloading from a signed-in browser did not work at all
 
 A field report, from a session that had a signed-in browser, full
