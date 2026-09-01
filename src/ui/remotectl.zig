@@ -199,6 +199,18 @@ pub fn windowForPane(app: ?*c.GtkApplication, pane_id: u32) ?PaneRef {
 
 pub const PaneRef = struct { win: *Window, pane: *Pane };
 
+/// The live Window with process-global `id`, if it has not been destroyed.
+pub fn windowById(app: ?*c.GtkApplication, id: u32) ?*Window {
+    const a = app orelse return null;
+    var node = c.gtk_application_get_windows(a);
+    while (node != null) : (node = node.*.next) {
+        const gw: ?*c.GtkWindow = @ptrCast(@alignCast(node.*.data));
+        const w = windowFromGtk(gw) orelse continue;
+        if (w.id == id) return w;
+    }
+    return null;
+}
+
 /// The window a request that names no pane acts on: the one the user
 /// is actually looking at, else `self` (the socket owner).
 pub fn activeOrSelf(self: *Window) *Window {
@@ -885,10 +897,28 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         else
             null;
         const win = if (takeover) |p| ownerWindow(self, p) else self;
+        const lease: Window.Lease = if (req.read_only) .read_only else if (req.control) .control else .default;
+        // Remote dials can spend seconds in SSH or transport fallback. The
+        // IPC callback itself runs on GTK's main loop, so doing that work
+        // inline freezes every pane while the picker waits for this reply.
+        // sock: is a local Unix connection and keeps the historical
+        // synchronous result/error contract.
+        if (req.background) {
+            if (req.host) |host| {
+                if (!std.mem.startsWith(u8, host, "sock:")) {
+                    const placement: muxtabs.AttachJob.Placement = if (takeover) |pane|
+                        .{ .takeover = pane.id }
+                    else
+                        .policy;
+                    if (!muxtabs.AttachJob.start(win, host, name, "", lease, placement, null, onIpcAttachReady, null))
+                        return ipc_protocol.writeErr(out, allocator, "could not start the background mux attach");
+                    return ipc_protocol.writeOkFlat(out, allocator, .{ .queued = true, .session = name });
+                }
+            }
+        }
         const conn = muxtabs.muxConnect(win, req.host) catch {
             return ipc_protocol.writeErr(out, allocator, "mux daemon unreachable");
         };
-        const lease: Window.Lease = if (req.read_only) .read_only else if (req.control) .control else .default;
         muxtabs.attachMuxLease(win, conn, name, req.host, takeover, null, lease) catch |err| {
             // Prefer the daemon's own reason ("no such session", …)
             // over the bare error name.
@@ -948,6 +978,20 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
         try webCmd(self, req, out, allocator);
     } else {
         try ipc_protocol.writeErr(out, allocator, "unknown command");
+    }
+}
+
+fn onIpcAttachReady(_: ?*anyopaque, job: *muxtabs.AttachJob) void {
+    const win = job.targetWindow();
+    if (job.finish()) return;
+    if (win) |target| {
+        var msg_buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(
+            &msg_buf,
+            "Could not attach '{s}' @ {s}; the session or daemon may be gone",
+            .{ job.session, job.host orelse "local" },
+        ) catch "Could not attach the mux session";
+        winmod.showToast(target, msg);
     }
 }
 

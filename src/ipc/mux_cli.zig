@@ -990,6 +990,14 @@ pub fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const 
 }
 
 pub fn guiCommandLease(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, host: ?[]const u8, use_pane: bool, lease: Lease) bool {
+    return guiCommandLeaseMode(allocator, cmd, data, host, use_pane, lease, false);
+}
+
+fn guiCommandBackground(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, host: ?[]const u8, use_pane: bool) bool {
+    return guiCommandLeaseMode(allocator, cmd, data, host, use_pane, .default, true);
+}
+
+fn guiCommandLeaseMode(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, host: ?[]const u8, use_pane: bool, lease: Lease, background: bool) bool {
     const sock = ipc_client.resolveSocket(allocator, null) orelse {
         _ = c.fprintf(platform.stderr(), "sketerm mux: no running sketerm window found\n");
         return false;
@@ -1023,6 +1031,7 @@ pub fn guiCommandLease(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]c
         .session = self_session,
         .read_only = lease == .read_only,
         .control = lease == .control,
+        .background = background,
     }, .{}, &aw.writer) catch return false;
     aw.writer.writeAll("\n") catch return false;
 
@@ -1115,8 +1124,9 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
                 return if (guiCommand(allocator, "new-durable-tab", null, host, true)) 0 else 1;
             }
             const name = sessions[selected].name;
-            if (guiCommand(allocator, "attach-session", name, host, true)) {
-                _ = c.printf("attached '%.*s'\n", @as(c_int, @intCast(name.len)), name.ptr);
+            if (guiCommandBackground(allocator, "attach-session", name, host, true)) {
+                const verb = if (host) |h| (if (std.mem.startsWith(u8, h, "sock:")) "attached" else "connecting to") else "attached";
+                _ = c.printf("%.*s '%.*s'\n", @as(c_int, @intCast(verb.len)), verb.ptr, @as(c_int, @intCast(name.len)), name.ptr);
                 return 0;
             }
             return 1;

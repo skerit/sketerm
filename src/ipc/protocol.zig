@@ -51,6 +51,9 @@ pub const Request = struct {
     /// without ever driving; `control` = force a takeover.
     read_only: bool = false,
     control: bool = false,
+    /// attach-session: acknowledge a remote attach after queueing it instead
+    /// of blocking the GUI socket through the transport handshake.
+    background: bool = false,
     /// web-container: the container's views RUN on `host` (a remote
     /// helper spawned by that host's daemon) instead of `host` being an
     /// egress proxy.
@@ -273,6 +276,10 @@ test "parseRequest: minimal + addressed" {
     try std.testing.expectEqual(@as(?u32, 7), p2.value.pane);
     try std.testing.expectEqualStrings("ls\n", p2.value.data.?);
     try std.testing.expect(p2.value.paste);
+
+    var p3 = try parseRequest(a, "{\"cmd\":\"attach-session\",\"host\":\"box\",\"background\":true}");
+    defer p3.deinit();
+    try std.testing.expect(p3.value.background);
 }
 
 test "parseRequest: panel-* fields" {

@@ -622,13 +622,14 @@ pub fn main() u8 {
         const body = std.fmt.bufPrint(&script_buf,
             \\#!/bin/sh
             \\if [ "$1" = "-G" ]; then printf 'hostname 127.0.0.1\n'; exit 0; fi
+            \\if [ -e '{s}/ssh-delay' ]; then sleep 2; fi
             \\export XDG_RUNTIME_DIR='{s}'
             \\export XDG_STATE_HOME='{s}'
             \\export XDG_CONFIG_HOME='{s}'
             \\export SKETERM_MUX_BIN='{s}'
             \\exec '{s}' --proxy
             \\
-        , .{ rrt, rrt, rrt, mux_abs, mux_abs }) catch return fail("fake ssh body");
+        , .{ rt, rrt, rrt, rrt, mux_abs, mux_abs }) catch return fail("fake ssh body");
         const fp = c.fopen(ssh_path.ptr, "wb") orelse return fail("fake ssh open");
         const wrote = c.fwrite(body.ptr, 1, body.len, fp) == body.len;
         _ = c.fclose(fp);
@@ -800,6 +801,14 @@ pub fn main() u8 {
         if (!have_wl) return fail("focused files-reconnect smoke is GTK/Wayland-only");
         if (filesReconnectStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
         say("files reconnect: the remote daemon died and came back; every row listed exactly once, no view id collision, and live deltas resumed");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_REMOTE_ATTACH_ONLY") != null) {
+        const app = drive orelse return fail("focused remote-attach smoke has no display driver");
+        if (!have_wl) return fail("focused remote-attach smoke is GTK/Wayland-only");
+        if (remotePanelAssetStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("remote attach: GUI IPC stayed responsive through a delayed SSH handshake and the pane landed afterwards");
         teardown();
         return 0;
     }
@@ -9017,7 +9026,7 @@ fn remotePanelAssetStage(
     defer owner.deinit();
     owner.sendJson(.spawn, .{
         .name = session,
-        .argv = [_][]const u8{ "sh", "-c", "while :; do sleep 30; done" },
+        .argv = [_][]const u8{ "sh", "-c", "printf 'REMOTE_ATTACH_READY\\n'; while :; do sleep 30; done" },
         .rows = @as(u16, 24),
         .cols = @as(u16, 80),
     }) catch return "could not send the remote panel session spawn";
@@ -9025,27 +9034,49 @@ fn remotePanelAssetStage(
         return "the fake-SSH daemon did not spawn the remote panel session";
     spawned.deinit(allocator);
 
-    // Neither `attach-session` nor `close-pane` answers with a pane id, and
-    // the `list` reply carries no session field, so the origin pane's id can
-    // only be learned by diffing the pane roster across the attach. The
-    // teardown assertion at the end of this stage fences on it.
-    const panes_before_attach = listedPaneIds(allocator, gui_sock) orelse
-        return "could not list panes before the remote panel attach";
-    defer allocator.free(panes_before_attach);
+    // Match `sketerm mux` inside a pane: its request addresses that pane, which
+    // must remain live while the off-thread handshake prepares its replacement.
+    const opened = roundtrip(allocator, gui_sock, "{\"cmd\":\"new-tab\"}\n") orelse
+        return "opening the remote attach origin pane timed out";
+    defer allocator.free(opened);
+    const takeover_pane = parseNumAfter(opened, "\"pane\":") orelse
+        return "opening the remote attach origin returned no pane id";
+    const panes_before_takeover = listedPaneIds(allocator, gui_sock) orelse
+        return "listing panes before the remote takeover failed";
+    defer allocator.free(panes_before_takeover);
 
     var attach_buf: [192]u8 = undefined;
     const attach_req = std.fmt.bufPrint(
         &attach_buf,
-        "{{\"cmd\":\"attach-session\",\"data\":\"{s}\",\"host\":\"localhost\"}}\n",
-        .{session},
+        "{{\"cmd\":\"attach-session\",\"data\":\"{s}\",\"host\":\"localhost\",\"pane\":{d},\"background\":true}}\n",
+        .{ session, takeover_pane },
     ) catch return "formatting the remote panel attach failed";
+    var delay_buf: [512:0]u8 = undefined;
+    const delay_path = std.fmt.bufPrintZ(&delay_buf, "{s}/ssh-delay", .{rt}) catch
+        return "formatting the delayed-SSH marker failed";
+    const delay_file = c.fopen(delay_path.ptr, "wb") orelse
+        return "creating the delayed-SSH marker failed";
+    _ = c.fclose(delay_file);
+    defer _ = c.unlink(delay_path.ptr);
+    const attach_started = clock.nowMs();
     const attached = roundtrip(allocator, gui_sock, attach_req) orelse
         return "the GUI did not answer the remote panel attach";
+    const attach_reply_ms = clock.nowMs() - attach_started;
     defer allocator.free(attached);
     if (std.mem.indexOf(u8, attached, "\"ok\":true") == null)
         return "the GUI refused the fake-SSH remote panel session";
-    const origin_pane = newPaneId(allocator, gui_sock, panes_before_attach, 10_000) orelse
-        return "the remote panel attach never produced a new pane";
+    if (std.mem.indexOf(u8, attached, "\"queued\":true") == null)
+        return "the GUI did not acknowledge the remote attach as queued";
+    if (attach_reply_ms >= 1_000)
+        return "the remote attach blocked GUI IPC instead of queueing its SSH handshake";
+    const origin_pane = newPaneId(allocator, gui_sock, panes_before_takeover, 10_000) orelse
+        return "the delayed remote session did not replace its addressed pane";
+    if (clock.nowMs() - attach_started >= 5_000)
+        return "the background attach re-ran the slow automatic transport probe instead of dialing SSH directly";
+    if (!waitPaneGone(allocator, gui_sock, takeover_pane, 2_000))
+        return "the delayed remote attach opened elsewhere instead of replacing its addressed pane";
+    if (!waitPaneText(allocator, gui_sock, origin_pane, "REMOTE_ATTACH_READY", 10_000))
+        return "the replacement pane did not render the delayed remote session";
 
     _ = app.drainLive(2_000);
     var known: [24]u32 = undefined;

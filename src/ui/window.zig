@@ -3311,6 +3311,7 @@ pub const Window = struct {
     pub const paneById = remotectl.paneById;
     pub const liveWindows = remotectl.liveWindows;
     pub const windowForPane = remotectl.windowForPane;
+    pub const windowById = remotectl.windowById;
     pub const PaneRef = remotectl.PaneRef;
     pub const detachWindowSignals = remotectl.detachWindowSignals;
     pub const findPaneAcrossWindows = remotectl.findPaneAcrossWindows;

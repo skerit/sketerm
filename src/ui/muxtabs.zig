@@ -1100,18 +1100,11 @@ test "pane registration publishes neither pointer when terminal reserve fails" {
 
 // ── Off-thread session attach ────────────────────────────────
 
-/// One session attach whose transport dial and snapshot handshake run
-/// off the main loop, finishing on an idle with `attachMuxPrepared`.
-///
-/// The one home for "attach a session I only know by host + name"
-/// from a click: the Session Overview and the assistant activity chip
-/// both go through it, so a wedged daemon costs a bounded, described
-/// failure rather than a frozen GUI. `on_ready` fires exactly once on
-/// the main thread with the job still alive: the caller checks its own
-/// liveness fence and calls `finish` (the attach itself) only while its
-/// window still exists; the job is freed when the callback returns.
+/// Runs a session attach's transport handshake off the main loop and resolves its target IDs again at handback.
 pub const AttachJob = struct {
-    win: *Window,
+    /// Process-global identity, resolved on the main thread at handback so a
+    /// window closed while SSH was connecting never leaves a dangling pointer.
+    win_id: u32,
     host: ?[]u8,
     session: []u8,
     origin_id: []u8,
@@ -1129,7 +1122,12 @@ pub const AttachJob = struct {
     const mux_client = @import("../mux/client.zig");
     const mux_cli = @import("../ipc/mux_cli.zig");
 
-    pub const Placement = enum { policy, tab };
+    pub const Placement = union(enum) {
+        policy,
+        tab,
+        /// Replace this process-global pane id when it still exists.
+        takeover: u32,
+    };
 
     /// Spawn the job. Returns false (nothing scheduled, `on_ready`
     /// never called) when the worker could not be created.
@@ -1156,7 +1154,7 @@ pub const AttachJob = struct {
             return false;
         };
         job.* = .{
-            .win = win,
+            .win_id = win.id,
             .host = null,
             .session = session_owned,
             .origin_id = origin_owned,
@@ -1211,6 +1209,19 @@ pub const AttachJob = struct {
         return true;
     }
 
+    // Match Window.muxConnect: attach over SSH first, then let Terminal upgrade
+    // the live connection to UDP in the background.
+    fn connectFresh(host: ?[]const u8) ?mux_client.Conn {
+        if (host) |value| {
+            if (!std.mem.startsWith(u8, value, "sock:")) {
+                const remote = mux_client.RemoteSpec.parse(value);
+                if (remote.mode == .auto)
+                    return mux_client.Conn.connectSsh(std.heap.c_allocator, remote.host) catch null;
+            }
+        }
+        return mux_cli.muxConnect(std.heap.c_allocator, host);
+    }
+
     fn threadMain(self: *AttachJob) void {
         const host: ?[]const u8 = if (self.host) |value| value else null;
         if (self.reuse) |value| {
@@ -1225,7 +1236,7 @@ pub const AttachJob = struct {
             // fresh dial before reporting failure.
             conn.deinit();
         }
-        if (mux_cli.muxConnect(std.heap.c_allocator, host)) |fresh| {
+        if (connectFresh(host)) |fresh| {
             var conn = fresh;
             if (self.attachOn(&conn)) {
                 self.conn = conn;
@@ -1242,34 +1253,72 @@ pub const AttachJob = struct {
         return self.conn != null and self.snapshot != null;
     }
 
+    fn application() ?*c.GtkApplication {
+        const app = c.g_application_get_default() orelse return null;
+        return @ptrCast(@alignCast(app));
+    }
+
+    /// Resolve the intended live window without retaining a raw Window pointer.
+    pub fn targetWindow(self: *const AttachJob) ?*Window {
+        const app = application();
+        return switch (self.placement) {
+            .takeover => |pane_id| if (Window.windowForPane(app, pane_id)) |ref| ref.win else Window.windowById(app, self.win_id),
+            .policy, .tab => Window.windowById(app, self.win_id),
+        };
+    }
+
     /// Attach the prepared session into the window (main thread, from
     /// `on_ready` only). Consumes the connection either way.
     pub fn finish(self: *AttachJob) bool {
         if (!self.ready()) return false;
-        const conn = self.conn.?;
-        self.conn = null;
         const snapshot = self.snapshot.?;
         switch (self.placement) {
-            .policy => attachMuxPrepared(
-                self.win,
-                conn,
-                self.session,
-                if (self.host) |host| host else null,
-                snapshot.payload,
-                self.identity,
-                null,
-                null,
-                self.lease,
-            ) catch return false,
-            .tab => _ = attachMuxPreparedTab(
-                self.win,
-                conn,
-                self.session,
-                if (self.host) |host| host else null,
-                snapshot.payload,
-                self.identity,
-                self.lease,
-            ) catch return false,
+            .policy => {
+                const win = self.targetWindow() orelse return false;
+                const conn = self.conn.?;
+                self.conn = null;
+                attachMuxPrepared(
+                    win,
+                    conn,
+                    self.session,
+                    if (self.host) |host| host else null,
+                    snapshot.payload,
+                    self.identity,
+                    null,
+                    null,
+                    self.lease,
+                ) catch return false;
+            },
+            .tab => {
+                const win = self.targetWindow() orelse return false;
+                const conn = self.conn.?;
+                self.conn = null;
+                _ = attachMuxPreparedTab(
+                    win,
+                    conn,
+                    self.session,
+                    if (self.host) |host| host else null,
+                    snapshot.payload,
+                    self.identity,
+                    self.lease,
+                ) catch return false;
+            },
+            .takeover => |pane_id| {
+                const ref = Window.windowForPane(application(), pane_id) orelse return false;
+                const conn = self.conn.?;
+                self.conn = null;
+                attachMuxPrepared(
+                    ref.win,
+                    conn,
+                    self.session,
+                    if (self.host) |host| host else null,
+                    snapshot.payload,
+                    self.identity,
+                    ref.pane,
+                    null,
+                    self.lease,
+                ) catch return false;
+            },
         }
         return true;
     }
