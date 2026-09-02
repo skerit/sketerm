@@ -1213,6 +1213,52 @@ land — including for a download the client itself asked for.
   half (a url fetched to a caller's path, and a page-initiated download
   landing in the XDG download directory).
 
+## ERR_NETWORK_CHANGED: retried once, reported as a retry (capability "load-retry")
+
+Chromium's Linux network-change notifier watches netlink and counts ANY
+interface coming or going as an IP change; a Docker container starting
+adds a `veth` pair and touches a bridge, which is enough. It then
+deliberately aborts every in-flight connection with
+`ERR_NETWORK_CHANGED` (-21), main-frame navigations included. Measured
+2026-09-02 on a host running Testcontainers: a page that had just
+passed a Cloudflare challenge died with "Your connection was
+interrupted", and in-page `fetch` calls rejected at the same moment.
+CEF exposes no way to widen the notifier's hard-coded ignore list, so
+the helper heals the one case whose meaning is "nothing about the
+request was wrong":
+
+- **`onLoadError` re-issues the main-frame load ONCE on exactly that
+  code** and posts `ev_load_retry{view, code, url, msg}` (0x4B) instead
+  of `ev_load_error`; the retried load then reports through `ev_load`
+  like any other. The retried load failing again, with any code, is
+  the ordinary `ev_load_error`. `web/loadretry.zig` is the rule and the
+  budget (std-only, both test roots): reset by a client navigation,
+  spent by the retry, settled by the retried document's commit. CEF
+  fires `on_load_start` only for a COMMITTED document (an error page is
+  `on_load_error` and never starts a load), which is what makes "the
+  next start is a new document with its own budget" sound.
+- **Only the document is healed.** A rejected in-page `fetch` is the
+  page's own script failing, and only the caller knows whether running
+  it again is safe. Background pages and action popups are not retried
+  either; they have no client waiting on a document.
+- **Client side, headless only.** `webdrive.View.load_retry` keeps the
+  record until THIS client's next navigation request
+  (`navfault.navigationRequested`), not the next started load, because
+  the retried load's own start is the first thing to follow it. The
+  MCP results carry it as `load_retry` beside `load_error` and say so
+  in the text lane; it never blocks a settle. The GUI face shows
+  nothing: an overlay would flash for the milliseconds the reload
+  takes.
+- **The proof is stage nc, and it injects the fault.** A real
+  interface change needs root, so `SKETERM_WEB_FAULT_NET_CHANGED=<n>`
+  arms `onGetResourceHandler` to answer the next `n` main-frame http(s)
+  requests with a resource handler whose response is that net error
+  (`cef_response_t.set_error`), which fails the navigation through the
+  same path a real one takes. One blink: one retry, no error, the
+  server sees exactly the retried page request. Two blinks: one retry,
+  then the -21 error, nothing reached the server, and the next client
+  navigation loads.
+
 ## Eval result size: the cut must be visible
 
 `semantic.js`'s serializer cut every STRING at `EVAL_MAXSTR` (4000)

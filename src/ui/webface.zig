@@ -1796,6 +1796,13 @@ pub const Client = struct {
                 const ev = proto.decode(proto.EvLoadError, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onLoadError(ev);
             },
+            .ev_load_retry => {
+                // The helper is already reloading the page on its own
+                // (a local interface came or went under the engine);
+                // the retried load reports through `ev_load` like any
+                // other. Nothing to show: an overlay would flash for
+                // the milliseconds the reload takes.
+            },
             .ev_view_create_failed => {
                 const ev = proto.decode(proto.EvViewCreateFailed, frame.payload) catch return;
                 if (self.findFace(ev.view)) |face| face.onViewCreateFailed(ev);

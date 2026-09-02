@@ -276,6 +276,11 @@ pub const View = struct {
     /// the next started load. A refused certificate produces one too,
     /// so `cert` explains it.
     load_error: ?navfault.LoadErrRec = null,
+    /// The helper's own one-shot reload after `ERR_NETWORK_CHANGED`
+    /// (`ev_load_retry`), kept until THIS client's next navigation
+    /// request (`navfault.navigationRequested`), so the caller who asked
+    /// for the page learns its load was interrupted and healed.
+    load_retry: ?navfault.LoadErrRec = null,
     /// SHA-256 (lowercase hex) of the ONE certificate this view may
     /// proceed on. Every other certificate error is refused; nothing is
     /// remembered engine-side either (`proto.CertDecision`). Owned.
@@ -286,6 +291,7 @@ pub const View = struct {
         self.console.deinit(gpa);
         if (self.cert) |*rec| rec.free(gpa);
         if (self.load_error) |*rec| rec.free(gpa);
+        if (self.load_retry) |*rec| rec.free(gpa);
         if (self.accept_fingerprint) |f| gpa.free(f);
         if (self.url) |u| gpa.free(u);
         if (self.title) |t| gpa.free(t);
@@ -2130,7 +2136,8 @@ pub const Engine = struct {
 
     pub fn navigate(self: *Engine, id: u32, url: []const u8) !void {
         if (!self.ensure()) return error.Unavailable;
-        if (self.findView(id) == null) return error.NoView;
+        const v = self.findView(id) orelse return error.NoView;
+        navfault.navigationRequested(self.gpa, &v.load_retry);
         self.send(proto.Navigate{ .view = id, .url = url }) catch return error.Unavailable;
     }
 
@@ -2155,6 +2162,7 @@ pub const Engine = struct {
     pub fn navAction(self: *Engine, id: u32, action: proto.NavAct) !void {
         if (!self.ensure()) return error.Unavailable;
         const v = self.findView(id) orelse return error.NoView;
+        if (action != .stop) navfault.navigationRequested(self.gpa, &v.load_retry);
         self.send(proto.NavAction{ .view = id, .action = @intFromEnum(action) }) catch return error.Unavailable;
         if (action == .stop) v.reader_guards.invalidate();
     }
@@ -3040,6 +3048,13 @@ pub const Engine = struct {
                     v.load_error = navfault.LoadErrRec.init(self.gpa, ev) catch null;
                 }
             },
+            .ev_load_retry => {
+                const ev = proto.decode(proto.EvLoadRetry, frame.payload) catch return;
+                if (self.findView(ev.view)) |v| {
+                    if (v.load_retry) |*old| old.free(self.gpa);
+                    v.load_retry = navfault.LoadErrRec.initRetry(self.gpa, ev) catch null;
+                }
+            },
             .ev_cert_error => {
                 // The helper HOLDS the request until this is answered
                 // and nobody else is here to answer it: a headless
@@ -3713,6 +3728,59 @@ fn frameOf(comptime T: type, bytes: []const u8) ?T {
         if (frame.tag == T.tag) return proto.decode(T, frame.payload) catch null;
     }
     return null;
+}
+
+test "ev_load_retry is kept through the retried load's start and cleared by the next navigation request" {
+    const gpa = std.testing.allocator;
+    var p = try Pair.init(gpa);
+    defer p.deinit();
+    var buf: [8192]u8 = undefined;
+
+    const v = try p.eng.openViewIn("https://a.test/", 800, 600, .default, null);
+    _ = p.drain(&buf);
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+    try proto.encodePayload(gpa, &payload, proto.EvLoadRetry{
+        .view = v.id,
+        .code = -21,
+        .url = "https://a.test/",
+        .msg = "ERR_NETWORK_CHANGED",
+    });
+    p.eng.dispatch(.{ .tag = .ev_load_retry, .payload = payload.items });
+    try std.testing.expectEqual(@as(i32, -21), v.load_retry.?.code);
+    try std.testing.expectEqualStrings("ERR_NETWORK_CHANGED", v.load_retry.?.msg);
+    // No failure was reported: the helper healed it.
+    try std.testing.expect(v.load_error == null);
+
+    // The retried load starts and finishes; the record stays, because
+    // this is the load the caller is still waiting on.
+    payload.clearRetainingCapacity();
+    try proto.encodePayload(gpa, &payload, proto.EvLoad{
+        .view = v.id,
+        .state = @intFromEnum(proto.LoadState.started),
+        .url = "https://a.test/",
+    });
+    p.eng.dispatch(.{ .tag = .ev_load, .payload = payload.items });
+    try std.testing.expect(v.load_retry != null);
+
+    // A second retry event replaces the first rather than leaking it.
+    payload.clearRetainingCapacity();
+    try proto.encodePayload(gpa, &payload, proto.EvLoadRetry{
+        .view = v.id,
+        .code = -21,
+        .url = "https://a.test/next",
+        .msg = "ERR_NETWORK_CHANGED",
+    });
+    p.eng.dispatch(.{ .tag = .ev_load_retry, .payload = payload.items });
+    try std.testing.expectEqualStrings("https://a.test/next", v.load_retry.?.url);
+
+    // The client's own navigation is what retires it; a stop is not a
+    // navigation.
+    try p.eng.navAction(v.id, .stop);
+    try std.testing.expect(v.load_retry != null);
+    try p.eng.navigate(v.id, "https://b.test/");
+    try std.testing.expect(v.load_retry == null);
+    _ = p.drain(&buf);
 }
 
 test "ev_cert_error is answered: refused by default, accepted only for the named fingerprint" {

@@ -49,7 +49,13 @@ const presenter = @import("presenter.zig");
 const platform = @import("../util/platform.zig");
 const semantic = @import("semantic.zig");
 const semnav = @import("semnav.zig");
+const loadretry = @import("loadretry.zig");
 const filter = @import("filter.zig");
+
+comptime {
+    // The std-only rule names the code by value; the binding is the truth.
+    std.debug.assert(loadretry.ERR_NETWORK_CHANGED == cef.ERR_NETWORK_CHANGED);
+}
 const filtersub = @import("filtersub.zig");
 const netpolicy = @import("netpolicy.zig");
 const pathz = @import("../util/pathz.zig");
@@ -500,6 +506,10 @@ pub const View = struct {
     /// forward are empty — the memory is the whole point, and keeping
     /// the history would mean keeping the browser.
     discarded: bool = false,
+    /// The one-shot `ERR_NETWORK_CHANGED` reload budget (see
+    /// `loadretry.zig`): reset by a client navigation, spent by the
+    /// retry, settled by the retried document's commit.
+    load_retry: loadretry.State = .idle,
     /// USER zoom (`set_zoom`), as the engine's log-scale level x100.
     /// Added on top of the DPR zoom in `applyZoom`, and re-applied on
     /// every load start because Chromium resets zoom per navigation.
@@ -4532,15 +4542,25 @@ pub const Host = struct {
         // first and navigating after would mint a document nobody asked
         // for, which is the two-document trap `view_create_url` exists
         // to avoid.
+        v.load_retry.reset();
         self.semanticNavigationStarted(v);
         v.sem_nav.waiting_load_start = true;
         if (v.discarded) return self.reviveAt(v, req.url);
+        self.loadUrl(v, req.url);
+    }
+
+    /// Load `url` in the view's main frame. The semantic side must
+    /// already have been told a navigation started; the network-change
+    /// retry and `navigate` share this and differ only in what they
+    /// do to the retry budget.
+    fn loadUrl(self: *Host, v: *View, url_text: []const u8) void {
+        _ = self;
         const b = v.browser orelse return;
         const get_frame = b.get_main_frame orelse return;
         const frame: *cef.cef_frame_t = get_frame(b) orelse return;
         defer release(&frame.base);
         var url = std.mem.zeroes(cef.cef_string_t);
-        setStr(req.url, &url);
+        setStr(url_text, &url);
         defer cef.cef_string_utf16_clear(&url);
         if (frame.load_url) |lu| lu(frame, &url);
     }
@@ -4553,16 +4573,19 @@ pub const Host = struct {
         const b = v.browser orelse return;
         switch (@as(proto.NavAct, @enumFromInt(req.action))) {
             .back => if (browserInt(b, "can_go_back") != 0) {
+                v.load_retry.reset();
                 self.semanticNavigationStarted(v);
                 v.sem_nav.waiting_load_start = true;
                 if (b.go_back) |f| f(b);
             },
             .forward => if (browserInt(b, "can_go_forward") != 0) {
+                v.load_retry.reset();
                 self.semanticNavigationStarted(v);
                 v.sem_nav.waiting_load_start = true;
                 if (b.go_forward) |f| f(b);
             },
             .reload => {
+                v.load_retry.reset();
                 self.semanticNavigationStarted(v);
                 v.sem_nav.waiting_load_start = true;
                 if (b.reload) |f| f(b);
@@ -8372,6 +8395,7 @@ pub const Host = struct {
             proto.EvNavState,
             proto.EvLoad,
             proto.EvLoadError,
+            proto.EvLoadRetry,
             proto.EvCursor,
             proto.EvFavicon,
             proto.EvScroll,
@@ -12602,6 +12626,9 @@ const ExtResource = struct {
     offset: usize = 0,
     status: c_int = 200,
     mime: []const u8 = "text/plain",
+    /// Non-zero: the response is a NET ERROR of this code and nothing
+    /// else (`cef_response_t.set_error`); the rig's fault injector.
+    err: c_int = 0,
 
     fn fromSelf(self: [*c]cef.cef_resource_handler_t) ?*ExtResource {
         if (self == null) return null;
@@ -12987,6 +13014,13 @@ fn extResHeaders(
     defer releaseArg(response);
     const r = ExtResource.fromSelf(self) orelse return;
     const resp: *cef.cef_response_t = response orelse return;
+    if (r.err != 0) {
+        // A net error at header time fails the load with exactly that
+        // code, through the same navigation path a real one takes.
+        if (resp.set_error) |se| se(resp, r.err);
+        if (response_length) |rl| rl.* = 0;
+        return;
+    }
     if (resp.set_status) |ss| ss(resp, r.status);
     var mime = std.mem.zeroes(cef.cef_string_t);
     setStr(r.mime, &mime);
@@ -13039,6 +13073,53 @@ fn extResRead(
 }
 
 fn extResCancel(_: [*c]cef.cef_resource_handler_t) callconv(.c) void {}
+
+// ---------------------------------------------------------------------
+// Net-error fault injection (rig only)
+// ---------------------------------------------------------------------
+
+/// `SKETERM_WEB_FAULT_NET_CHANGED=<n>`: fail the next `n` main-frame
+/// http(s) requests with `ERR_NETWORK_CHANGED` before they touch the
+/// network. smoke-web proves the one-shot retry with it, because a real
+/// interface change needs root and a change the test does not control
+/// could land anywhere. Read on CEF's IO thread; parsed once at install.
+var g_fault_net_changed: std.atomic.Value(u32) = .init(0);
+
+fn readFaultEnv() void {
+    const v = c.getenv("SKETERM_WEB_FAULT_NET_CHANGED") orelse return;
+    const n = std.fmt.parseInt(u32, std.mem.span(v), 10) catch return;
+    g_fault_net_changed.store(n, .release);
+}
+
+/// IO THREAD. Hand the engine our own handler for a request only while
+/// a fault is armed; NULL is the default network loader.
+fn onGetResourceHandler(
+    _: [*c]cef.cef_resource_request_handler_t,
+    browser: [*c]cef.cef_browser_t,
+    frame: [*c]cef.cef_frame_t,
+    request: [*c]cef.cef_request_t,
+) callconv(.c) [*c]cef.cef_resource_handler_t {
+    defer releaseArg(browser);
+    defer releaseArg(frame);
+    defer releaseArg(request);
+    if (g_fault_net_changed.load(.acquire) == 0) return null;
+    const req: *cef.cef_request_t = request orelse return null;
+    const grt = req.get_resource_type orelse return null;
+    if (grt(req) != cef.RT_MAIN_FRAME) return null;
+    const gu = req.get_url orelse return null;
+    var url_buf: [2048]u8 = undefined;
+    const url = userfreeInto(gu(req), &url_buf);
+    if (!std.mem.startsWith(u8, url, "http://") and !std.mem.startsWith(u8, url, "https://")) return null;
+    // Claim one fault; a concurrent request past the count loads normally.
+    while (true) {
+        const left = g_fault_net_changed.load(.acquire);
+        if (left == 0) return null;
+        if (g_fault_net_changed.cmpxchgWeak(left, left - 1, .acq_rel, .acquire) == null) break;
+    }
+    const h = extResourceOwned(&.{}, "text/html", 0) orelse return null;
+    if (ExtResource.fromSelf(h)) |r| r.err = cef.ERR_NETWORK_CHANGED;
+    return h;
+}
 
 /// Register the scheme. Called from the APP, in every process — the
 /// browser, the renderer and the network service must all agree that
@@ -13361,6 +13442,9 @@ fn installHandlers() void {
     // subscribed (see onGetCookieAccessFilter).
     resource_request_handler.get_cookie_access_filter = onGetCookieAccessFilter;
     resource_request_handler.on_before_resource_load = onBeforeResourceLoad;
+    // Rig-only net-error injection; answers NULL unless a fault is armed.
+    resource_request_handler.get_resource_handler = onGetResourceHandler;
+    readFaultEnv();
     resource_request_handler.on_resource_response = onResourceResponse;
     resource_request_handler.on_resource_load_complete = onResourceLoadComplete;
     request_handler.on_certificate_error = onCertificateError;
@@ -14896,6 +14980,7 @@ fn onLoadStart(
     // else below is per-DOCUMENT and stays main-frame-only.
     host.injectMatchingExtensions(v, f, .document_start);
     if (!main) return;
+    v.load_retry.loadStarted();
     if (!v.sem_nav.takeExpectedLoadStart()) {
         host.semanticNavigationStarted(v);
     }
@@ -14998,6 +15083,24 @@ fn onLoadError(
         if (v.sem_nav.takeStopRequest()) {
             host.semanticStopped(v);
         }
+        return;
+    }
+    // The local network stack blinked (an interface came or went) and
+    // Chromium abandoned the navigation: nothing about the request or
+    // the site was wrong, so load it again, once. The client hears the
+    // retry, never a failure it would have to retry itself. Calling
+    // `load_url` from inside this callback is the documented CEF shape
+    // (its own error-page sample does exactly that).
+    if (loadretry.retryable(@intCast(code)) and v.load_retry.arm()) {
+        host.post(proto.EvLoadRetry{
+            .view = v.id,
+            .code = @intCast(code),
+            .url = url.slice(),
+            .msg = msg.slice(),
+        });
+        host.semanticNavigationStarted(v);
+        v.sem_nav.waiting_load_start = true;
+        host.loadUrl(v, url.slice());
         return;
     }
     host.post(proto.EvLoadError{

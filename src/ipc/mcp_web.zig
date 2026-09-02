@@ -512,6 +512,10 @@ const View = struct {
     /// The last main-frame load failure, cleared by the next started
     /// load. A refused certificate produces one too.
     load_error: ?LoadErrState = null,
+    /// The helper reloaded the main frame once after
+    /// `ERR_NETWORK_CHANGED` during the navigation this client last
+    /// asked for (headless only; the GUI's faces keep no such record).
+    load_retry: ?LoadErrState = null,
 
     /// The requested navigation cannot arrive: a certificate the
     /// caller did not accept, or a load that already failed. Polling
@@ -814,6 +818,7 @@ fn appendEngineViews(
             .policy_ms_left = v.pol_ms_left,
             .cert = if (v.cert) |*rec| try dupeCert(arena, rec.wire()) else null,
             .load_error = if (v.load_error) |*rec| try dupeLoadErr(arena, rec.wire()) else null,
+            .load_retry = if (v.load_retry) |*rec| try dupeLoadErr(arena, rec.wire()) else null,
         });
     }
 }
@@ -1366,6 +1371,13 @@ fn head(res: *mcp.Res, arena: std.mem.Allocator, mode: Mode, v: View) !void {
         try res.raw("load_error", try loadErrJson(arena, le));
         try res.textf("load failed: {s} ({d}) for {s}", .{ le.msg, le.code, if (le.url.len > 0) le.url else v.url });
     }
+    // Healed, not failed, but stated: a caller timing a load, or one
+    // that saw a fetch reject at the same moment, needs to know the
+    // local network blinked underneath the page.
+    if (v.load_retry) |lr| {
+        try res.raw("load_retry", try loadErrJson(arena, lr));
+        try res.textf("the browser reloaded {s} once after {s} ({d}): a local network interface came or went (a container starting, a VPN) and the engine abandoned the in-flight load; in-page fetches at that moment failed too", .{ if (lr.url.len > 0) lr.url else v.url, lr.msg, lr.code });
+    }
 }
 
 fn certJson(arena: std.mem.Allocator, ce: CertState) ![]const u8 {
@@ -1418,6 +1430,10 @@ fn tabsResult(arena: std.mem.Allocator, mode: Mode, vs: Views) ![]const u8 {
         if (v.load_error) |le| {
             try w.writeAll(",\"load_error\":");
             try w.writeAll(try loadErrJson(arena, le));
+        }
+        if (v.load_retry) |lr| {
+            try w.writeAll(",\"load_retry\":");
+            try w.writeAll(try loadErrJson(arena, lr));
         }
         if (mode == .gui) try w.print(",\"focused\":{},\"visible\":{}", .{ v.focused, v.visible });
         // GUI mode omits both: its containers are the user's own, and
@@ -4832,6 +4848,36 @@ test "a refused certificate is a fact and a sentence on every result, and web_op
     const ok = try navigateResult(arena, .headless, v, null, "", null);
     const otext = (try mcp.expectToolResultShape(arena, "web_navigate", ok)).object.get("content").?.array.items[0].object.get("text").?.string;
     try t.expect(std.mem.indexOf(u8, otext, "accepted by fingerprint") != null);
+}
+
+test "a network-change retry is a fact and a sentence, and does not block the load" {
+    var arena_state = testArena();
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const t = std.testing;
+
+    var v = EXAMPLE;
+    v.url = "https://planet.test/";
+    v.load_retry = .{ .code = -21, .url = "https://planet.test/", .msg = "ERR_NETWORK_CHANGED" };
+    try t.expect(!v.loadBlocked());
+
+    const opened = try openResult(arena, .headless, v, true, false, null, "", null, "none", 1);
+    const parsed = try mcp.expectToolResultShape(arena, "web_open", opened);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expect(sc.get("settled").?.bool);
+    try t.expect(sc.get("load_error") == null);
+    const retry = sc.get("load_retry").?.object;
+    try t.expectEqual(@as(i64, -21), retry.get("code").?.integer);
+    try t.expectEqualStrings("ERR_NETWORK_CHANGED", retry.get("msg").?.string);
+    const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+    try t.expect(std.mem.indexOf(u8, text, "reloaded https://planet.test/ once after ERR_NETWORK_CHANGED (-21)") != null);
+    try t.expect(std.mem.indexOf(u8, text, "load failed") == null);
+
+    const tabs = try tabsResult(arena, .headless, .{ .views = &.{v}, .helper = "ready" });
+    const tp = try mcp.expectToolResultShape(arena, "web_tabs", tabs);
+    const row = tp.object.get("structuredContent").?.object.get("views").?.array.items[0].object;
+    try t.expectEqual(@as(i64, -21), row.get("load_retry").?.object.get("code").?.integer);
+    try t.expect(row.get("load_error") == null);
 }
 
 test "web_open: the snapshot rides both lanes, situational notes only in text" {

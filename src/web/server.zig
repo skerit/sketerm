@@ -142,6 +142,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_MULTI_CLIENT,
     proto.CAP_COOKIE_SYNC,
     proto.CAP_OBSERVE,
+    proto.CAP_LOAD_RETRY,
 };
 
 /// Test-only negotiation seam for exercising an older helper client path.

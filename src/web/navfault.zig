@@ -84,18 +84,30 @@ pub const CertRec = struct {
     }
 };
 
-/// One `ev_load_error`, owned strings.
+/// One `ev_load_error`, owned strings. The same shape records an
+/// `ev_load_retry` (`initRetry`): the failure the helper healed on its
+/// own, kept until the client's NEXT navigation request rather than
+/// the next started load, because the retry's own start would erase it
+/// before anyone could read it (`navigationRequested`).
 pub const LoadErrRec = struct {
     code: i32,
     url: []u8,
     msg: []u8,
 
     pub fn init(gpa: std.mem.Allocator, ev: proto.EvLoadError) !LoadErrRec {
-        const url = try gpa.dupe(u8, ev.url);
+        return initParts(gpa, ev.code, ev.url, ev.msg);
+    }
+
+    pub fn initRetry(gpa: std.mem.Allocator, ev: proto.EvLoadRetry) !LoadErrRec {
+        return initParts(gpa, ev.code, ev.url, ev.msg);
+    }
+
+    fn initParts(gpa: std.mem.Allocator, code: i32, url_text: []const u8, msg_text: []const u8) !LoadErrRec {
+        const url = try gpa.dupe(u8, url_text);
         errdefer gpa.free(url);
-        const msg = try gpa.dupe(u8, ev.msg);
+        const msg = try gpa.dupe(u8, msg_text);
         errdefer gpa.free(msg);
-        return .{ .code = ev.code, .url = url, .msg = msg };
+        return .{ .code = code, .url = url, .msg = msg };
     }
 
     pub fn free(self: *LoadErrRec, gpa: std.mem.Allocator) void {
@@ -152,6 +164,18 @@ pub fn loadStarted(gpa: std.mem.Allocator, cert: *?CertRec, load_error: *?LoadEr
     }
 }
 
+/// The client asked for a navigation (navigate, reload, back, forward):
+/// a retry recorded for the previous request no longer describes what
+/// the client is waiting on. Only this clears it; a started load does
+/// not, since the retried load's own start is the first thing to follow
+/// the record.
+pub fn navigationRequested(gpa: std.mem.Allocator, retry: *?LoadErrRec) void {
+    if (retry.*) |*old| {
+        old.free(gpa);
+        retry.* = null;
+    }
+}
+
 /// A SHA-256 fingerprint as the helper reports it: 64 hex digits, any
 /// case. Anything else cannot match a certificate and is refused at the
 /// call rather than silently never matching.
@@ -202,4 +226,17 @@ test "loadStarted drops failures and non-accepted verdicts, keeps an accepted on
     cert = try CertRec.init(gpa, ev, .pending);
     loadStarted(gpa, &cert, &load_error, "https://10.0.0.1/");
     try std.testing.expect(cert == null);
+}
+
+test "a retry record survives started loads and clears on the next navigation request" {
+    const gpa = std.testing.allocator;
+    var retry: ?LoadErrRec = try LoadErrRec.initRetry(gpa, .{ .view = 1, .code = -21, .url = "https://a.test/", .msg = "ERR_NETWORK_CHANGED" });
+    var cert: ?CertRec = null;
+    var load_error: ?LoadErrRec = null;
+    loadStarted(gpa, &cert, &load_error, "https://a.test/");
+    try std.testing.expect(retry != null);
+    try std.testing.expectEqual(@as(i32, -21), retry.?.wire().code);
+    navigationRequested(gpa, &retry);
+    try std.testing.expect(retry == null);
+    navigationRequested(gpa, &retry);
 }

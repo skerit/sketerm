@@ -824,6 +824,10 @@ const HttpProbe = struct {
     body: []const u8 = page,
     /// Extra response headers ("Name: v\r\n" each), e.g. a CSP.
     extra_headers: []const u8 = "",
+    /// When set, requests whose first line names this path are counted
+    /// in `path_hits` as well: `served` also sees favicon probes.
+    hit_path: []const u8 = "",
+    path_hits: std.atomic.Value(u32) = .init(0),
     /// Stage 39 turns the otherwise one-document probe into a tiny
     /// filter-list/resource router.
     filter_router: bool = false,
@@ -937,6 +941,8 @@ const HttpProbe = struct {
         }
         tcpserver.respondOk(afd, "text/html", self.body, self.extra_headers);
         _ = self.served.fetchAdd(1, .release);
+        if (self.hit_path.len != 0 and std.mem.indexOf(u8, raw, self.hit_path) != null)
+            _ = self.path_hits.fetchAdd(1, .release);
     }
 
     fn handleFilter(self: *HttpProbe, afd: c_int, raw: []const u8) void {
@@ -1190,6 +1196,7 @@ const Client = struct {
     ack_devtools: bool = false,
     ack_print_pdf: bool = false,
     ack_downloads: bool = false,
+    ack_load_retry: bool = false,
     ack_download_start: bool = false,
     ack_contexts: bool = false,
     ack_contexts_fail_closed: bool = false,
@@ -1349,6 +1356,11 @@ const Client = struct {
     /// Failed main-frame loads (`ev_load_error`), which is what a
     /// cancelled certificate decision produces.
     load_err_seq: u32 = 0,
+    load_err_code: i32 = 0,
+    /// The helper's own one-shot reload after ERR_NETWORK_CHANGED
+    /// (`ev_load_retry`); `load_retry_code` describes the last.
+    load_retry_seq: u32 = 0,
+    load_retry_code: i32 = 0,
     view_create_fail_seq: u32 = 0,
     view_create_fail_view: u32 = 0,
     view_create_fail_context: u32 = 0,
@@ -1794,6 +1806,7 @@ const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_DEVTOOLS)) self.ack_devtools = true;
                     if (std.mem.eql(u8, cap, proto.CAP_PRINT_PDF)) self.ack_print_pdf = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.ack_downloads = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_LOAD_RETRY)) self.ack_load_retry = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOAD_START)) self.ack_download_start = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.ack_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.ack_a11y_caret = true;
@@ -2315,8 +2328,17 @@ const Client = struct {
             .ev_load_error => {
                 const e = proto.decode(proto.EvLoadError, frame.payload) catch fail("ev_load_error decode");
                 self.load_err_seq += 1;
+                self.load_err_code = e.code;
                 if (g_echo_console) {
                     std.debug.print("  [load-error v{d} code {d}] {s}: {s}\n", .{ e.view, e.code, e.url, e.msg });
+                }
+            },
+            .ev_load_retry => {
+                const e = proto.decode(proto.EvLoadRetry, frame.payload) catch fail("ev_load_retry decode");
+                self.load_retry_seq += 1;
+                self.load_retry_code = e.code;
+                if (g_echo_console) {
+                    std.debug.print("  [load-retry v{d} code {d}] {s}: {s}\n", .{ e.view, e.code, e.url, e.msg });
                 }
             },
             .ev_view_create_failed => {
@@ -3409,6 +3431,111 @@ fn wqPageHang(buf: []u8, port: u16, path: []const u8, tag: []const u8) []const u
 ///   34d  the measured `onHeadersReceived` ceiling: the listener runs
 ///        and sees real response headers, and the helper reports the
 ///        decision it could not apply
+/// Stage nc: a main-frame load that fails with ERR_NETWORK_CHANGED is
+/// reloaded ONCE by the helper (`ev_load_retry`, capability
+/// `load-retry`), never reported as `ev_load_error`; the retried load's
+/// own failure IS reported, and a client navigation restores the
+/// budget. The fault is injected by `SKETERM_WEB_FAULT_NET_CHANGED=<n>`
+/// (a resource handler answering the next n main-frame requests with
+/// that net error, through the engine's own navigation-failure path),
+/// because a real interface change needs root. Two private helpers:
+/// the count is read at helper start.
+fn runNetChangeStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    var srv = HttpProbe{ .body = "<!doctype html><title>nc:page</title><body>after the blink</body>", .hit_path = "GET /nc " };
+    if (!srv.start()) fail("stage nc: loopback HTTP server would not start");
+    defer srv.shutdown();
+    var page_buf: [96]u8 = undefined;
+    const page_url = std.fmt.bufPrint(&page_buf, "http://127.0.0.1:{d}/nc", .{srv.lis.port}) catch fail("stage nc page url");
+
+    // -- one blink: healed ---------------------------------------------
+    {
+        _ = c.setenv("SKETERM_WEB_FAULT_NET_CHANGED", "1", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_FAULT_NET_CHANGED");
+        var cache_buf: [4096]u8 = undefined;
+        const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/nc1-cache", .{dir}) catch fail("stage nc cache path");
+        mkdirZ(cache_dir);
+        var sock_buf: [96]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/nc1.sock", .{dir}) catch fail("stage nc sock");
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
+        var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+        {
+            const d = nowMs() + 15_000;
+            while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+        }
+        if (!cl.ack_load_retry) fail("stage nc: hello_ack lacks the load-retry capability");
+        cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+        cl.have_view = true;
+        if (!cl.waitBufferAfter(0, 20_000)) fail("stage nc: no frame_buffer for the view");
+
+        const errs0 = cl.load_err_seq;
+        const retry0 = cl.load_retry_seq;
+        cl.resetTitle();
+        cl.send(proto.Navigate{ .view = view_id, .url = page_url });
+        if (!cl.waitTitle("nc:page", 20_000)) fail("stage nc: the page never loaded after the injected network change");
+        if (cl.load_retry_seq != retry0 + 1) fail("stage nc: the healed load did not report exactly one ev_load_retry");
+        if (cl.load_retry_code != -21) fail("stage nc: ev_load_retry did not carry ERR_NETWORK_CHANGED");
+        if (cl.load_err_seq != errs0) fail("stage nc: a healed network change was ALSO reported as ev_load_error");
+        // The faulted attempt never reached the server: only the retry did.
+        if (srv.path_hits.load(.acquire) != 1) fail("stage nc: the loopback server did not see exactly the retried page request");
+        // The injector is spent: a further navigation is plain.
+        cl.resetTitle();
+        cl.send(proto.Navigate{ .view = view_id, .url = page_url });
+        if (!cl.waitTitle("nc:page", 20_000)) fail("stage nc: the page did not load a second time");
+        if (cl.load_retry_seq != retry0 + 1) fail("stage nc: a plain load reported a retry");
+        pass("stage nc a network change under a main-frame load is retried once and reported as a retry, not a failure");
+
+        cl.send(proto.ViewDestroy{ .view = view_id });
+        cl.have_view = false;
+        cl.pump(500);
+        cl.deinit();
+        reapHelper(pid, "stage nc (one blink)");
+    }
+
+    // -- two blinks: the retry fails too, and that IS reported ----------
+    {
+        _ = c.setenv("SKETERM_WEB_FAULT_NET_CHANGED", "2", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_FAULT_NET_CHANGED");
+        var cache_buf: [4096]u8 = undefined;
+        const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/nc2-cache", .{dir}) catch fail("stage nc cache path");
+        mkdirZ(cache_dir);
+        var sock_buf: [96]u8 = undefined;
+        const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/nc2.sock", .{dir}) catch fail("stage nc sock");
+        const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
+        var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+        cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+        {
+            const d = nowMs() + 15_000;
+            while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+        }
+        cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+        cl.have_view = true;
+        if (!cl.waitBufferAfter(0, 20_000)) fail("stage nc: no frame_buffer for the second view");
+
+        const served0 = srv.path_hits.load(.acquire);
+        const errs0 = cl.load_err_seq;
+        const retry0 = cl.load_retry_seq;
+        cl.resetTitle();
+        cl.send(proto.Navigate{ .view = view_id, .url = page_url });
+        if (!cl.waitSeq(&cl.load_err_seq, errs0, 20_000)) fail("stage nc: a second network change was not reported as ev_load_error (retried without bound?)");
+        if (cl.load_err_code != -21) fail("stage nc: the reported failure was not ERR_NETWORK_CHANGED");
+        if (cl.load_retry_seq != retry0 + 1) fail("stage nc: the bounded case did not report exactly one retry before failing");
+        if (srv.path_hits.load(.acquire) != served0) fail("stage nc: a page request reached the server while both attempts were faulted");
+        // A client navigation is a fresh budget, and no fault is left.
+        cl.resetTitle();
+        cl.send(proto.Navigate{ .view = view_id, .url = page_url });
+        if (!cl.waitTitle("nc:page", 20_000)) fail("stage nc: the page did not load once the faults were spent");
+        if (cl.load_retry_seq != retry0 + 1 or cl.load_err_seq != errs0 + 1) fail("stage nc: the recovering load reported a spurious retry or error");
+        pass("stage nc the retry is bounded: a second network change is reported as the failure it is");
+
+        cl.send(proto.ViewDestroy{ .view = view_id });
+        cl.have_view = false;
+        cl.pump(500);
+        cl.deinit();
+        reapHelper(pid, "stage nc (two blinks)");
+    }
+}
+
 /// Stage 22j3: an offer nobody answers expires (`download_hold_ms`,
 /// shortened through `SKETERM_WEB_DOWNLOAD_HOLD_MS`) into a terminal
 /// `failed` frame — not silence, not `done` — and leaves no throwaway
@@ -9648,6 +9775,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     runActionStage(gpa, exe, dir);
     runWebrequestStage(gpa, exe, dir);
     runDownloadHoldStage(gpa, exe, dir);
+    runNetChangeStage(gpa, exe, dir);
     // ── Stage 35: real MV2 extensions ─────────────────────────────
     runShapeStage(gpa, exe, dir);
     runUboStage(gpa, exe, dir, ubo_xpi);

@@ -298,6 +298,14 @@ pub const CAP_COOKIE_SYNC = "cookie-sync";
 /// every subscription with `ev_observe_state{state = ended}`; an
 /// observer disconnecting leaves the owner's views untouched.
 pub const CAP_OBSERVE = "observe";
+/// The helper re-issues a main-frame load ONCE when it fails with
+/// `ERR_NETWORK_CHANGED` (the local interface list changed under the
+/// engine: a container starting, a VPN coming up) and reports that as
+/// `ev_load_retry` instead of `ev_load_error`; the retried load's own
+/// failure is reported as the ordinary error. Without this capability
+/// every such blink is an `ev_load_error` the client has to retry
+/// itself. `web/loadretry.zig` is the rule.
+pub const CAP_LOAD_RETRY = "load-retry";
 
 /// Per-connection id window under `multi-client`: connection k owns
 /// client-minted view ids translated into globals by adding
@@ -376,6 +384,7 @@ pub const Tag = enum(u8) {
     ev_crashed = 0x48,
     popup_policy_set = 0x49,
     ev_page_popup = 0x4A,
+    ev_load_retry = 0x4B,
     find = 0x50,
     find_stop = 0x51,
     set_zoom = 0x52,
@@ -1177,6 +1186,18 @@ pub const EvLoad = struct {
 
 pub const EvLoadError = struct {
     pub const tag: Tag = .ev_load_error;
+    view: u32,
+    code: i32,
+    url: []const u8,
+    msg: []const u8,
+};
+
+/// Helper -> client, capability `load-retry`: the main-frame load of
+/// `url` failed with `code` (`msg` its symbolic name) and the helper is
+/// loading it again on its own. No `ev_load_error` is posted for the
+/// failed attempt; the retried load then reports as any load does.
+pub const EvLoadRetry = struct {
+    pub const tag: Tag = .ev_load_retry;
     view: u32,
     code: i32,
     url: []const u8,
@@ -4073,6 +4094,7 @@ test "round-trip: scalar and string frames" {
     try roundTrip(ViewMaxFps, .{ .view = 7, .fps = 144 });
     try roundTrip(EvLoad, .{ .view = 7, .state = 2, .url = "about:blank" });
     try roundTrip(EvLoadError, .{ .view = 7, .code = -105, .url = "http://x/", .msg = "NAME_NOT_RESOLVED" });
+    try roundTrip(EvLoadRetry, .{ .view = 7, .code = -21, .url = "http://x/", .msg = "ERR_NETWORK_CHANGED" });
     try roundTrip(EvTitle, .{ .view = 7, .title = "hello" });
     try roundTrip(EvFavicon, .{ .view = 7, .url = "http://x/favicon.ico" });
     try roundTrip(EvScroll, .{ .view = 3, .x = 0, .y = 1840 });
