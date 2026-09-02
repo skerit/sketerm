@@ -1454,6 +1454,16 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
         return ipc_protocol.writeOkFlat(out, allocator, .{});
     }
 
+    // The row button by request id: cancel while running, dismiss the
+    // row once it is done or failed.
+    if (eql(u8, req.cmd, "web-download-dismiss")) {
+        const id = req.req orelse
+            return ipc_protocol.writeErr(out, allocator, "web-download-dismiss needs req");
+        if (!face.webDownloadDismiss(id))
+            return ipc_protocol.writeErr(out, allocator, "no download row with that request id");
+        return ipc_protocol.writeOkFlat(out, allocator, .{});
+    }
+
     if (eql(u8, req.cmd, "web-downloads")) {
         return ipc_protocol.writeOk(out, allocator, "downloads", face.webDownloadList(allocator));
     }

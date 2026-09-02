@@ -202,37 +202,16 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
         return 0;
     }
     if (std.mem.eql(u8, cmd, "attach") and args.len >= 2) {
-        // The session name is the first NON-flag argument, so
-        // `attach --read-only foo` and `attach foo --control` both work.
-        var lease: Lease = .default;
-        var target: ?[]const u8 = null;
-        // Run from inside a pane, attach TAKES OVER that pane (the
-        // tmux shape). That is right for a person typing it and wrong
-        // for a command a tool ran in someone's shell — which is how a
-        // documented attach consumed the user's own pane mid-session.
-        // `--new-tab` opts out; the help says so, and so does the
-        // warning printed when a pane is about to be taken over.
-        var new_tab = false;
-        for (args[1..]) |a| {
-            if (std.mem.eql(u8, a, "--read-only")) {
-                lease = .read_only;
-            } else if (std.mem.eql(u8, a, "--control")) {
-                lease = .control;
-            } else if (std.mem.eql(u8, a, "--new-tab")) {
-                new_tab = true;
-            } else if (target == null) {
-                target = a;
-            }
-        }
-        const name = target orelse {
+        const opts = AttachArgs.parse(args[1..]);
+        const name = opts.target orelse {
             _ = c.fprintf(platform.stderr(), "sketerm mux: attach needs a session name\n");
             return 1;
         };
-        if (!new_tab and c.getenv("SKETERM_PANE_ID") != null) {
+        if (opts.takesOverPane(c.getenv("SKETERM_PANE_ID") != null)) {
             const note = "sketerm mux: attaching INTO this pane (its shell is replaced); use --new-tab to open a tab instead\n";
             _ = c.fprintf(platform.stderr(), note);
         }
-        return if (guiCommandLease(allocator, "attach-session", name, host, !new_tab, lease)) 0 else 1;
+        return if (guiCommandLease(allocator, "attach-session", name, host, !opts.new_tab, opts.lease)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "attach-all")) {
         return if (guiCommand(allocator, "attach-all", null, host, false)) 0 else 1;
@@ -984,6 +963,63 @@ pub fn fetchSessions(allocator: std.mem.Allocator, host: ?[]const u8) ?std.json.
 /// ($SKETERM_SOCKET inside a pane, auto-discovery otherwise).
 /// Controller-lease intent for an attach that goes through the GUI.
 pub const Lease = enum { default, read_only, control };
+
+/// `sketerm mux attach` arguments. The session name is the first
+/// NON-flag argument, so `attach --read-only foo` and `attach foo
+/// --control` both work.
+///
+/// Run from inside a pane, attach TAKES OVER that pane (the tmux
+/// shape). That is right for a person typing it and wrong for a
+/// command a tool ran in someone's shell — which is how a documented
+/// attach consumed the user's own pane mid-session. `--new-tab` opts
+/// out; the help says so, and so does the warning printed when a pane
+/// is about to be taken over.
+pub const AttachArgs = struct {
+    lease: Lease = .default,
+    target: ?[]const u8 = null,
+    new_tab: bool = false,
+
+    pub fn parse(args: []const []const u8) AttachArgs {
+        var out: AttachArgs = .{};
+        for (args) |a| {
+            if (std.mem.eql(u8, a, "--read-only")) {
+                out.lease = .read_only;
+            } else if (std.mem.eql(u8, a, "--control")) {
+                out.lease = .control;
+            } else if (std.mem.eql(u8, a, "--new-tab")) {
+                out.new_tab = true;
+            } else if (out.target == null) {
+                out.target = a;
+            }
+        }
+        return out;
+    }
+
+    /// Whether this attach replaces the shell of the pane it runs in.
+    pub fn takesOverPane(self: AttachArgs, inside_pane: bool) bool {
+        return inside_pane and !self.new_tab;
+    }
+};
+
+test "AttachArgs: flags in any order, --new-tab opts out of the takeover" {
+    const t = std.testing;
+    const a = AttachArgs.parse(&.{ "--read-only", "work" });
+    try t.expectEqualStrings("work", a.target.?);
+    try t.expectEqual(Lease.read_only, a.lease);
+    try t.expect(a.takesOverPane(true));
+    try t.expect(!a.takesOverPane(false));
+
+    const b = AttachArgs.parse(&.{ "work", "--control", "--new-tab" });
+    try t.expectEqualStrings("work", b.target.?);
+    try t.expectEqual(Lease.control, b.lease);
+    try t.expect(b.new_tab);
+    try t.expect(!b.takesOverPane(true));
+
+    // The first non-flag wins; a later one is not a second target.
+    const c2 = AttachArgs.parse(&.{ "one", "two" });
+    try t.expectEqualStrings("one", c2.target.?);
+    try t.expect(AttachArgs.parse(&.{"--new-tab"}).target == null);
+}
 
 pub fn guiCommand(allocator: std.mem.Allocator, cmd: []const u8, data: ?[]const u8, host: ?[]const u8, use_pane: bool) bool {
     return guiCommandLease(allocator, cmd, data, host, use_pane, .default);

@@ -3409,6 +3409,83 @@ fn wqPageHang(buf: []u8, port: u16, path: []const u8, tag: []const u8) []const u
 ///   34d  the measured `onHeadersReceived` ceiling: the listener runs
 ///        and sees real response headers, and the helper reports the
 ///        decision it could not apply
+/// Stage 22j3: an offer nobody answers expires (`download_hold_ms`,
+/// shortened through `SKETERM_WEB_DOWNLOAD_HOLD_MS`) into a terminal
+/// `failed` frame — not silence, not `done` — and leaves no throwaway
+/// file behind: the expiry takes `download_cancel`'s path, which
+/// continues the held target callback into a `/tmp` path the engine
+/// must be allowed to finish with before it is unlinked.
+///
+/// Its own helper, because the hold is process-wide and the main
+/// helper's stages decide their offers well inside five minutes.
+fn runDownloadHoldStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
+    const HOLD_MS: i64 = 1_500;
+    _ = c.setenv("SKETERM_WEB_DOWNLOAD_HOLD_MS", "1500", 1);
+    defer _ = c.unsetenv("SKETERM_WEB_DOWNLOAD_HOLD_MS");
+    var cache_buf: [4096]u8 = undefined;
+    const cache_dir = std.fmt.bufPrintZ(&cache_buf, "{s}/dlhold-cache", .{dir}) catch fail("stage 22j3 cache path");
+    mkdirZ(cache_dir);
+    var sock_buf: [96]u8 = undefined;
+    const sock = std.fmt.bufPrintZ(&sock_buf, "{s}/dlhold.sock", .{dir}) catch fail("stage 22j3 sock");
+    const pid = spawnHelper(exe, sock.ptr, cache_dir.ptr, "--ozone-platform=headless", null, false);
+    var cl = Client{ .gpa = gpa, .fd = connectWithRetry(sock.ptr, sock.len) };
+    cl.send(proto.Hello{ .proto = proto.PROTO_VERSION, .client_name = "smoke-web" });
+    {
+        const d = nowMs() + 15_000;
+        while (cl.ack_proto == 0 and nowMs() < d) cl.pump(100);
+    }
+    if (!cl.ack_downloads) fail("stage 22j3: hello_ack lacks the downloads capability");
+    cl.send(proto.ViewCreate{ .view = view_id, .w = 640, .h = 480, .scale_x1000 = 1000, .context = 0 });
+    cl.have_view = true;
+    if (!cl.waitBufferAfter(0, 20_000)) fail("stage 22j3: no frame_buffer for the view");
+
+    cl.navigate(download_page);
+    const offer0 = cl.dl_offer_seq;
+    {
+        var tries: u8 = 0;
+        while (tries < 5 and cl.dl_offer_seq == offer0) : (tries += 1) {
+            cl.clickCenter();
+            _ = cl.drive(400, 120);
+        }
+    }
+    if (!cl.waitSeq(&cl.dl_offer_seq, offer0, 20_000))
+        fail("stage 22j3: a clicked download anchor produced no ev_download_offer");
+    const id = cl.dl_id;
+    const offered_at = nowMs();
+    // Deliberately no decide: the helper has to answer on its own.
+    if (!cl.waitDlTerminal(id, HOLD_MS + 20_000))
+        fail("stage 22j3: an unanswered offer never reached a terminal progress frame (the hold did not expire)");
+    if (cl.dl_failed != 1 or cl.dl_done != 0)
+        fail("stage 22j3: the expired offer was reported done, not failed");
+    if (nowMs() - offered_at < HOLD_MS / 2)
+        fail("stage 22j3: the offer failed at once instead of being HELD for the configured time");
+    // The engine has finished with the throwaway target by the time
+    // it reports terminal; the entry's drop unlinks it. Give the
+    // filesystem a moment and then insist nothing is left.
+    cl.pump(1_000);
+    var trash_buf: [128:0]u8 = undefined;
+    const trash = std.fmt.bufPrintZ(&trash_buf, "/tmp/sketerm-webdl-cancel-{d}-{d}.part", .{ pid, id }) catch fail("stage 22j3 path");
+    if (c.access(trash.ptr, c.F_OK) == 0) {
+        _ = c.unlink(trash.ptr);
+        fail("stage 22j3: the expiry left its throwaway download file in /tmp");
+    }
+    // Still serving afterwards: the expiry retired one entry, not the
+    // helper.
+    const dmg = cl.dmg_seq;
+    cl.navigate(blue_page);
+    if (!cl.waitDamageAfter(dmg, 20_000)) fail("stage 22j3: the helper stopped serving after the hold expiry");
+    pass("stage 22j3 an unanswered download offer expires into a failed frame and leaves no file behind");
+
+    cl.send(proto.ViewDestroy{ .view = view_id });
+    cl.have_view = false;
+    {
+        const d = nowMs() + 1_500;
+        while (nowMs() < d) cl.pump(50);
+    }
+    cl.deinit();
+    reapHelperTimeout(pid, "stage 22j3 helper", 30_000);
+}
+
 fn runWebrequestStage(gpa: std.mem.Allocator, exe: [*:0]const u8, dir: []const u8) void {
     var data_buf: [4096]u8 = undefined;
     const data_dir = std.fmt.bufPrintZ(&data_buf, "{s}/wqdata", .{dir}) catch fail("stage 34 data path");
@@ -9570,6 +9647,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     runWebextStage(gpa, exe, dir);
     runActionStage(gpa, exe, dir);
     runWebrequestStage(gpa, exe, dir);
+    runDownloadHoldStage(gpa, exe, dir);
     // ── Stage 35: real MV2 extensions ─────────────────────────────
     runShapeStage(gpa, exe, dir);
     runUboStage(gpa, exe, dir, ubo_xpi);

@@ -38,6 +38,10 @@ pub fn u32Of(v: std.json.Value) ?u32 {
 /// duration of a `replace` call; the table copies what it keeps.
 pub const Incoming = struct {
     id: u32,
+    /// The connection that reported this tab. A helper serving two
+    /// GUIs holds both windows' tabs in ONE table; a replace-all from
+    /// one of them must not read the other's tabs as removed.
+    owner: u32 = 0,
     /// The helper view rendering this tab, 0 when the tab shows no web
     /// view at all (a terminal tab, a file-browser tab).
     view: u32 = 0,
@@ -54,6 +58,7 @@ pub const Incoming = struct {
 
 pub const Tab = struct {
     id: u32,
+    owner: u32,
     view: u32,
     window_id: u32,
     index: u32,
@@ -142,6 +147,13 @@ pub const Table = struct {
     /// Replace the whole table and report what changed. The returned
     /// diff owns its slices.
     pub fn replace(self: *Table, gpa: std.mem.Allocator, incoming: []const Incoming) !Diff {
+        return self.replaceOwner(gpa, 0, incoming);
+    }
+
+    /// Replace ONE connection's tabs (`owner`) and report what changed
+    /// about them; every other connection's tabs stay as they were.
+    /// Every entry of `incoming` is stamped with `owner`.
+    pub fn replaceOwner(self: *Table, gpa: std.mem.Allocator, owner: u32, incoming: []const Incoming) !Diff {
         var created: std.ArrayList(u32) = .empty;
         errdefer created.deinit(gpa);
         var removed: std.ArrayList(u32) = .empty;
@@ -173,7 +185,12 @@ pub const Table = struct {
                 }
             }
         }
+        var kept: usize = 0;
         for (self.tabs.items) |*old| {
+            if (old.owner != owner) {
+                kept += 1;
+                continue;
+            }
             var still = false;
             for (incoming) |in| {
                 if (in.id == old.id) {
@@ -191,10 +208,26 @@ pub const Table = struct {
             for (fresh.items) |*t_| t_.deinit(gpa);
             fresh.deinit(gpa);
         }
-        try fresh.ensureTotalCapacity(gpa, incoming.len);
+        try fresh.ensureTotalCapacity(gpa, incoming.len + kept);
+        for (self.tabs.items) |*old| {
+            if (old.owner == owner) continue;
+            fresh.appendAssumeCapacity(.{
+                .id = old.id,
+                .owner = old.owner,
+                .view = old.view,
+                .window_id = old.window_id,
+                .index = old.index,
+                .active = old.active,
+                .focused_window = old.focused_window,
+                .url = try gpa.dupe(u8, old.url),
+                .title = try gpa.dupe(u8, old.title),
+                .loading = old.loading,
+            });
+        }
         for (incoming) |in| {
             fresh.appendAssumeCapacity(.{
                 .id = in.id,
+                .owner = owner,
                 .view = in.view,
                 .window_id = in.window_id,
                 .index = in.index,
@@ -216,6 +249,24 @@ pub const Table = struct {
             .activated = activated,
             .activated_window = activated_window,
         };
+    }
+
+    /// A connection went away: its tabs are gone with it. Returns the
+    /// removed ids (caller-owned) so the events can be posted.
+    pub fn dropOwner(self: *Table, gpa: std.mem.Allocator, owner: u32) ![]u32 {
+        var removed: std.ArrayList(u32) = .empty;
+        errdefer removed.deinit(gpa);
+        var i: usize = 0;
+        while (i < self.tabs.items.len) {
+            if (self.tabs.items[i].owner != owner) {
+                i += 1;
+                continue;
+            }
+            try removed.append(gpa, self.tabs.items[i].id);
+            var gone = self.tabs.orderedRemove(i);
+            gone.deinit(gpa);
+        }
+        return removed.toOwnedSlice(gpa);
     }
 
     /// MV2 `tabs.query`. Writes matching tab ids into `out` in table
@@ -312,6 +363,35 @@ const t = std.testing;
 
 fn tab(id: u32, url: []const u8, active: bool) Incoming {
     return .{ .id = id, .view = id * 10, .url = url, .title = "T", .active = active, .focused_window = true };
+}
+
+test "replaceOwner: one connection's replace-all leaves the other's tabs alone" {
+    const gpa = t.allocator;
+    var tb = Table{};
+    defer tb.deinit(gpa);
+    var d0 = try tb.replaceOwner(gpa, 1, &[_]Incoming{ tab(1, "https://a.test/", true), tab(2, "https://b.test/", false) });
+    d0.deinit(gpa);
+    var d1 = try tb.replaceOwner(gpa, 2, &[_]Incoming{tab(9, "https://c.test/", true)});
+    defer d1.deinit(gpa);
+    // The second window's first post creates ITS tab and removes none
+    // of the first window's.
+    try t.expectEqual(@as(usize, 1), d1.created.len);
+    try t.expectEqual(@as(usize, 0), d1.removed.len);
+    try t.expectEqual(@as(usize, 3), tb.tabs.items.len);
+    // The first window closing a tab is one removal, and window 2's
+    // tab survives it.
+    var d2 = try tb.replaceOwner(gpa, 1, &[_]Incoming{tab(1, "https://a.test/", true)});
+    defer d2.deinit(gpa);
+    try t.expectEqual(@as(usize, 1), d2.removed.len);
+    try t.expectEqual(@as(u32, 2), d2.removed[0]);
+    try t.expect(tb.find(9) != null);
+    try t.expectEqual(@as(u32, 2), tb.find(9).?.owner);
+    // A connection dropping takes exactly its tabs.
+    const gone = try tb.dropOwner(gpa, 1);
+    defer gpa.free(gone);
+    try t.expectEqual(@as(usize, 1), gone.len);
+    try t.expectEqual(@as(usize, 1), tb.tabs.items.len);
+    try t.expect(tb.find(9) != null);
 }
 
 test "replace: first fill reports creations and the initial activation" {

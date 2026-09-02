@@ -3012,6 +3012,46 @@ fn watchAlongStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: 
     if (!waitAccent(app, win_id, true, 10_000))
         return "a read-only watch pane showed no view-only chip";
 
+    // 4. `sketerm mux attach` run INSIDE a pane: `--new-tab` opens a tab
+    //    and leaves that pane alone; without it the pane is taken over
+    //    (the tmux shape). Both go through the real CLI entry point with
+    //    the pane's environment.
+    {
+        const mux_cli = @import("ipc/mux_cli.zig");
+        _ = c.setenv("SKETERM_SOCKET", sock_path.ptr, 1);
+        defer _ = c.unsetenv("SKETERM_SOCKET");
+        defer _ = c.unsetenv("SKETERM_PANE_ID");
+        defer _ = c.unsetenv("SKETERM_SESSION");
+        _ = c.unsetenv("SKETERM_SESSION");
+
+        const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"new-tab\"}\n") orelse
+            return "opening the attach origin pane timed out";
+        defer allocator.free(opened);
+        const origin = parseNumAfter(opened, "\"pane\":") orelse return "the attach origin pane has no id";
+        var pane_env: [16:0]u8 = undefined;
+        _ = std.fmt.bufPrintZ(&pane_env, "{d}", .{origin}) catch return "pane env";
+        _ = c.setenv("SKETERM_PANE_ID", &pane_env, 1);
+
+        const before = listedPaneIds(allocator, sock_path) orelse return "listing panes before mux attach failed";
+        defer allocator.free(before);
+        if (mux_cli.run(allocator, &.{ "attach", "--new-tab", session_name }) != 0)
+            return "sketerm mux attach --new-tab failed";
+        if (newPaneId(allocator, sock_path, before, 10_000) == null)
+            return "mux attach --new-tab opened no new pane";
+        if (waitPaneGone(allocator, sock_path, origin, 1_000))
+            return "mux attach --new-tab took over the pane it ran in";
+
+        const before2 = listedPaneIds(allocator, sock_path) orelse return "listing panes before the takeover failed";
+        defer allocator.free(before2);
+        if (mux_cli.run(allocator, &.{ "attach", session_name }) != 0)
+            return "sketerm mux attach (takeover) failed";
+        if (!waitPaneGone(allocator, sock_path, origin, 10_000))
+            return "mux attach without --new-tab left the pane it ran in untouched";
+        if (newPaneId(allocator, sock_path, before2, 10_000) == null)
+            return "the takeover attach produced no replacement pane";
+        _ = app.waitIdle(300, 6_000);
+    }
+
     closeAddedPanes(allocator, sock_path, app, keep_ids[0..keep_n]);
     if (roundtrip(allocator, sock_path, "{\"cmd\":\"focus\",\"pane\":1}\n")) |r| allocator.free(r);
     _ = app.waitIdle(200, 4_000);
@@ -4355,6 +4395,14 @@ const MENU_MARKER = "CTXMENU_OK";
 const HttpDoc = struct {
     lis: tcpserver.Listener = .{ .backlog = 16, .poll_ms = 200 },
     body: []const u8,
+    ctype: []const u8 = "text/html",
+    /// Extra header lines (`Content-Disposition: attachment` makes the
+    /// document a download).
+    extra: []const u8 = "",
+    /// Hold the response this long: the window a client has to change
+    /// its mind before the browser offers the download.
+    delay_ms: u32 = 0,
+    hits: std.atomic.Value(u32) = .init(0),
 
     fn start(self: *HttpDoc) bool {
         return self.lis.start(self, &onConn);
@@ -4364,7 +4412,9 @@ const HttpDoc = struct {
         const self: *HttpDoc = @ptrCast(@alignCast(ctx.?));
         var buf: [4096]u8 = undefined;
         _ = tcpserver.readRequest(afd, &buf, 2000);
-        tcpserver.respondOk(afd, "text/html", self.body, "");
+        _ = self.hits.fetchAdd(1, .acq_rel);
+        if (self.delay_ms != 0) _ = c.usleep(self.delay_ms * 1000);
+        tcpserver.respondOk(afd, self.ctype, self.body, self.extra);
         return false;
     }
 
@@ -8626,7 +8676,114 @@ fn mcpWebReaderStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: 
     const listed = m.call("web_download", list_args, 30_000) orelse return "GUI web_download listing timed out";
     if (!mcpHas(listed, "\"listing\":true") or std.mem.indexOf(u8, listed, dl_path) == null)
         return "the GUI download listing does not name the file it just wrote";
+    return guiDownloadStripStage(allocator, sock_path, rt, pane);
+}
+
+/// The download strip's two cheap failure shapes, driven through the
+/// control socket. A request cancelled BEFORE the browser offered it
+/// used to fall through to a save dialog when the offer finally came
+/// (the record had been freed with the cancel), and every failed-request
+/// row carried id 0, so dismissing one dismissed another.
+fn guiDownloadStripStage(allocator: std.mem.Allocator, sock_path: [:0]const u8, rt: []const u8, pane: u32) ?[]const u8 {
+    var slow = HttpDoc{
+        .body = "SLOW-DOWNLOAD-BYTES",
+        .ctype = "application/octet-stream",
+        .extra = "Content-Disposition: attachment; filename=\"slow.bin\"\r\n",
+        .delay_ms = 4_000,
+    };
+    if (!slow.start()) return "the slow download server did not start";
+    defer slow.stop();
+
+    var req_buf: [768]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    var reqs: [2]u32 = undefined;
+    for (&reqs, 0..) |*req, i| {
+        const path = std.fmt.bufPrint(&path_buf, "{s}/slow-{d}.bin", .{ rt, i }) catch return "slow download path";
+        const start = std.fmt.bufPrint(
+            &req_buf,
+            "{{\"cmd\":\"web-download\",\"pane\":{d},\"data\":\"http://127.0.0.1:{d}/slow-{d}.bin\",\"path\":\"{s}\"}}\n",
+            .{ pane, slow.lis.port, i, path },
+        ) catch return "slow web-download request";
+        const started = roundtrip(allocator, sock_path, start) orelse return "web-download roundtrip timed out";
+        defer allocator.free(started);
+        req.* = parseNumAfter(started, "\"req\":") orelse return "web-download returned no request id";
+        // Cancel while the server still holds the response: the offer
+        // has not been made yet.
+        const cancel = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-download-cancel\",\"pane\":{d},\"req\":{d}}}\n", .{ pane, req.* }) catch
+            return "web-download-cancel request";
+        const cancelled = roundtrip(allocator, sock_path, cancel) orelse return "web-download-cancel roundtrip timed out";
+        defer allocator.free(cancelled);
+        if (!mcpHas(cancelled, "\"ok\":true")) return "cancelling a not-yet-offered download was refused";
+    }
+    // Both requests must have reached the server, or nothing was ever
+    // going to be offered and the stage proves nothing.
+    {
+        const deadline = clock.nowMs() + 10_000;
+        while (slow.hits.load(.acquire) < 2 and clock.nowMs() < deadline) _ = c.usleep(50_000);
+        if (slow.hits.load(.acquire) < 2) return "the browser never requested the slow downloads";
+    }
+    // Let the delayed responses arrive and the offers be answered.
+    _ = c.usleep(6_000 * 1000);
+
+    // Its own buffer: it is sent again after the dismiss requests below
+    // are formatted, and a slice of a reused buffer would send a
+    // newline-less prefix of the dismiss line and hang both ends.
+    var list_buf: [96]u8 = undefined;
+    const list_cmd = std.fmt.bufPrint(&list_buf, "{{\"cmd\":\"web-downloads\",\"pane\":{d}}}\n", .{pane}) catch return "web-downloads request";
+    {
+        const listed = roundtrip(allocator, sock_path, list_cmd) orelse return "web-downloads roundtrip timed out";
+        defer allocator.free(listed);
+        for (reqs) |req| {
+            if (countDownloadRows(listed, req) != 1) return "a cancelled request has other than one row";
+        }
+        if (std.mem.indexOf(u8, listed, "canceled before the browser offered") == null)
+            return "the cancelled request's row does not say it was cancelled before the offer";
+        // An accepted late offer would be a SECOND row for the request
+        // (counted above) or, through the dialog/auto-accept path, a
+        // row named by the server's Content-Disposition.
+        if (std.mem.indexOf(u8, listed, "\"name\":\"slow.bin\"") != null)
+            return "a cancelled request's late offer was accepted instead of declined";
+    }
+    for (0..2) |i| {
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/slow-{d}.bin", .{ rt, i }) catch return "slow download path";
+        if (c.access(path.ptr, c.F_OK) == 0) return "a cancelled request's late offer still wrote its file";
+    }
+
+    // Two failed rows, both id 0: dismissing the SECOND must leave the
+    // first (they used to be told apart by id).
+    {
+        const dismiss = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-download-dismiss\",\"pane\":{d},\"req\":{d}}}\n", .{ pane, reqs[1] }) catch
+            return "web-download-dismiss request";
+        const r = roundtrip(allocator, sock_path, dismiss) orelse return "web-download-dismiss roundtrip timed out";
+        defer allocator.free(r);
+        if (!mcpHas(r, "\"ok\":true")) return "dismissing a failed row was refused";
+    }
+    {
+        const listed = roundtrip(allocator, sock_path, list_cmd) orelse return "web-downloads roundtrip timed out";
+        defer allocator.free(listed);
+        if (countDownloadRows(listed, reqs[1]) != 0) return "the dismissed row is still listed";
+        if (countDownloadRows(listed, reqs[0]) != 1) return "dismissing the second failed row removed the first";
+    }
+    {
+        const dismiss = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-download-dismiss\",\"pane\":{d},\"req\":{d}}}\n", .{ pane, reqs[0] }) catch
+            return "web-download-dismiss request";
+        const r = roundtrip(allocator, sock_path, dismiss) orelse return "web-download-dismiss roundtrip timed out";
+        allocator.free(r);
+        const listed = roundtrip(allocator, sock_path, list_cmd) orelse return "web-downloads roundtrip timed out";
+        defer allocator.free(listed);
+        if (countDownloadRows(listed, reqs[0]) != 0) return "the first failed row survived its own dismiss";
+    }
     return null;
+}
+
+/// How many rows of a `web-downloads` reply carry request id `req`.
+fn countDownloadRows(listed: []const u8, req: u32) usize {
+    var key_buf: [32]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "\"req\":{d},", .{req}) catch return 0;
+    var n: usize = 0;
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, listed, at, key)) |i| : (at = i + key.len) n += 1;
+    return n;
 }
 
 fn muxHasSession(allocator: std.mem.Allocator, sock_path: []const u8, name: []const u8) ?bool {

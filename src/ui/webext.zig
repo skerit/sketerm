@@ -202,10 +202,19 @@ fn saveRemoval(id: []const u8) InstallError!void {
 
 /// Push every installed extension to a (possibly fresh) helper on
 /// connect, then ask it to report state back.
+///
+/// A helper ADOPTED from another sketerm window already runs this
+/// same on-disk registry, and a `webext_set` for a live extension is
+/// a reinstall there (the instance is quiesced and its capability
+/// rotated), so a joining window re-posting the set restarted every
+/// extension in the window that had it working. The join asks for
+/// state only; toggles and installs still post as they always did.
 pub fn publish(cl: *webface.Client) void {
     if (cl.state != .ready or cl.isRemote() or !cl.cap_webext) return;
-    for (g_exts.items) |*e| {
-        cl.post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (e.enabled) 1 else 0 });
+    if (!cl.adopted) {
+        for (g_exts.items) |*e| {
+            cl.post(proto.WebextSet{ .id = e.id, .dir = e.dir, .enabled = if (e.enabled) 1 else 0 });
+        }
     }
     cl.post(proto.WebextListReq{});
 }

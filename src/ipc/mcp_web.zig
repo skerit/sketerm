@@ -4280,10 +4280,13 @@ test "nameFromUrl strips the query, decodes escapes and never returns a path" {
     try std.testing.expectEqualStrings("download", try nameFromUrl(arena, "https://x.test/%2E%2E"));
 }
 
-/// `<dir>/<name>`, made unique among the paths `used` so far by a
-/// ` (n)` suffix before the extension. A batch of urls that share a
-/// leaf (`/a/report.pdf`, `/b/report.pdf`) would otherwise write one
-/// over the other while the reply reported both as done.
+/// `<dir>/<name>`, made unique among the paths `used` so far AND the
+/// files already on disk by a ` (n)` suffix before the extension (the
+/// GUI's `uniquePath` shape). A batch of urls that share a leaf
+/// (`/a/report.pdf`, `/b/report.pdf`) would otherwise write one over
+/// the other while the reply reported both as done, and a second call
+/// into the same `dir` would overwrite the first call's files. A
+/// caller that wants an exact, overwriting destination passes `path`.
 fn batchPath(arena: std.mem.Allocator, used: *std.StringHashMapUnmanaged(void), dir: []const u8, name: []const u8) ![]const u8 {
     const dot = blk: {
         const at = std.mem.lastIndexOfScalar(u8, name, '.') orelse break :blk name.len;
@@ -4296,20 +4299,30 @@ fn batchPath(arena: std.mem.Allocator, used: *std.StringHashMapUnmanaged(void), 
         else
             try std.fmt.allocPrint(arena, "{s}/{s} ({d}){s}", .{ dir, name[0..dot], n + 1, name[dot..] });
         const gop = try used.getOrPut(arena, path);
-        if (!gop.found_existing) return path;
+        if (gop.found_existing) continue;
+        if (mcp_term.fileSize(path) == null) return path;
     }
 }
 
-test "batchPath keeps same-named urls apart" {
+test "batchPath keeps same-named urls apart, in the batch and on disk" {
     var arena_state = testArena();
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var used: std.StringHashMapUnmanaged(void) = .empty;
-    try std.testing.expectEqualStrings("/d/report.pdf", try batchPath(arena, &used, "/d", "report.pdf"));
-    try std.testing.expectEqualStrings("/d/report (2).pdf", try batchPath(arena, &used, "/d", "report.pdf"));
-    try std.testing.expectEqualStrings("/d/report (3).pdf", try batchPath(arena, &used, "/d", "report.pdf"));
-    try std.testing.expectEqualStrings("/d/.bashrc", try batchPath(arena, &used, "/d", ".bashrc"));
-    try std.testing.expectEqualStrings("/d/.bashrc (2)", try batchPath(arena, &used, "/d", ".bashrc"));
+    var dir_buf: [128]u8 = undefined;
+    const dir = std.fmt.bufPrint(&dir_buf, "/tmp/sketerm-batchpath-{d}", .{std.c.getpid()}) catch unreachable;
+    try @import("../util/pathz.zig").makeDirs(dir, 0o700);
+    defer @import("../util/pathz.zig").removeTree(dir);
+    const first = try batchPath(arena, &used, dir, "report.pdf");
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s}/report.pdf", .{dir}), first);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s}/report (2).pdf", .{dir}), try batchPath(arena, &used, dir, "report.pdf"));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s}/report (3).pdf", .{dir}), try batchPath(arena, &used, dir, "report.pdf"));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s}/.bashrc", .{dir}), try batchPath(arena, &used, dir, ".bashrc"));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s}/.bashrc (2)", .{dir}), try batchPath(arena, &used, dir, ".bashrc"));
+    // A later call (fresh `used`) steps over what an earlier one wrote.
+    try atomicwrite.writeFileExact(first, "x", 0o600);
+    var used2: std.StringHashMapUnmanaged(void) = .empty;
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{s}/report (2).pdf", .{dir}), try batchPath(arena, &used2, dir, "report.pdf"));
 }
 
 /// One download, run to completion (or to the caller's deadline).
@@ -4410,7 +4423,8 @@ fn downloadTool(drv: Driver, arena: std.mem.Allocator, args: std.json.Value, vie
 
     var outcomes: std.ArrayList(DlOutcome) = .empty;
     if (single) |url| {
-        const path = path_arg orelse try std.fmt.allocPrint(arena, "{s}/{s}", .{ dir.?, try nameFromUrl(arena, url) });
+        var used: std.StringHashMapUnmanaged(void) = .empty;
+        const path = path_arg orelse try batchPath(arena, &used, dir.?, try nameFromUrl(arena, url));
         switch (try runOneDownload(drv, arena, view.pane, url, path, deadline)) {
             .err => |e| return failRes(arena, e),
             .out => |o| try outcomes.append(arena, o),

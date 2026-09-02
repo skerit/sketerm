@@ -815,7 +815,16 @@ const semantic_request_timeout_ms: i64 = 120_000;
 /// nothing anywhere says so. That was the field failure: a clicked
 /// download reported success, a temp file appeared and was reaped, and
 /// no error existed on any side.
-const download_hold_ms: i64 = 300_000;
+var download_hold_ms: i64 = 300_000;
+
+/// `SKETERM_WEB_DOWNLOAD_HOLD_MS=<n>` shortens the hold so the smoke
+/// rig can watch it expire; the operator-facing shape of
+/// `wreqReadTimeoutEnv`.
+fn dlReadHoldEnv() void {
+    const v = c.getenv("SKETERM_WEB_DOWNLOAD_HOLD_MS") orelse return;
+    const n = std.fmt.parseInt(i64, std.mem.span(v), 10) catch return;
+    if (n > 0) download_hold_ms = n;
+}
 
 /// How long a `download_start` waits for the engine to offer ITS
 /// download before the request is answered as failed. A url the engine
@@ -2373,6 +2382,15 @@ pub const Host = struct {
         if (conn_id == 0) return;
         self.cookieSyncDropConn(conn_id);
         self.observeDropConn(conn_id);
+        // Its tabs leave with it, as onRemoved, or an extension keeps
+        // per-tab state for a window that no longer exists.
+        if (self.webext.tabs.dropOwner(self.gpa, conn_id)) |gone| {
+            defer self.gpa.free(gone);
+            for (gone) |id| {
+                self.postTabRemoved(id);
+                for (self.webext.exts.items) |*e| e.action.removeTab(self.gpa, id);
+            }
+        } else |_| {}
         // destroyView mutates the list (and closes popup/inspector
         // dependents itself), so collect ids first and re-check each.
         while (true) {
@@ -4856,6 +4874,11 @@ pub const Host = struct {
             });
             return;
         }
+        // A `webext_set` for a LIVE extension is a reinstall: the running
+        // instance is quiesced, its capability rotated (smoke-web stage
+        // 40 pins that). A client that only wants to learn state sends
+        // `webext_list_req`; a GUI joining another window's helper does
+        // exactly that (`webext.publish`), never a re-post.
         var prepared = self.webext.prepareSet(req.id, req.dir, req.enabled != 0) catch {
             if (self.webext.find(req.id)) |old| {
                 self.postWebextState(old);
@@ -5043,7 +5066,10 @@ pub const Host = struct {
             if (item != .object) continue;
             const o = item.object;
             incoming.append(self.gpa, .{
-                .id = jsonU32(o, "id"),
+                // A tab id is the GUI's view id, so two GUIs on one
+                // helper mint the same numbers: window it exactly as
+                // the view id is, so `tabId` stays unique per browser.
+                .id = self.mapDispatchView(jsonU32(o, "id")),
                 // The tabs JSON names views in the SENDER's namespace;
                 // the edge cannot see into it, so translate at parse.
                 .view = self.mapDispatchView(jsonU32(o, "view")),
@@ -5057,7 +5083,11 @@ pub const Host = struct {
             }) catch return;
         }
 
-        var diff = self.webext.tabs.replace(self.gpa, incoming.items) catch return;
+        // Scoped to the SENDER's tabs: with two GUIs on one helper, one
+        // window's replace-all used to read the other window's tabs as
+        // removed and the next post re-created them, so extensions saw
+        // every tab churn on every change.
+        var diff = self.webext.tabs.replaceOwner(self.gpa, self.dispatch_conn, incoming.items) catch return;
         defer diff.deinit(self.gpa);
 
         for (diff.created) |id| {
@@ -11080,6 +11110,7 @@ pub fn interceptInit(gpa: std.mem.Allocator) void {
     _ = interceptReload(gpa, &.{});
     wreqInitPipe();
     wreqReadTimeoutEnv();
+    dlReadHoldEnv();
 }
 
 /// Free the engine and any leftover rings (client gone, views already

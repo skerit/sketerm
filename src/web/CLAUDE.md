@@ -397,6 +397,22 @@ dispatch, and the blocking half is documented in its own section below).
   a sequence a dropped frame could break. The payload is a JSON array
   because this wire has no repeated-field encoding and a tab list
   changes a few times a minute.
+  - **The table is ONE table for every connection, scoped per sender.**
+    Two GUIs share one helper (`multi-client`), and each posts only its
+    own windows' tabs; `Table.replaceOwner` diffs a post against the
+    SENDER's tabs alone and `dropOwner` retires them with the
+    connection. Before that, every post from one window read the other
+    window's tabs as removed and the next post re-created them, so
+    extensions saw every tab churn on every change. A tab id is the
+    GUI's view id, so it is windowed through `mapDispatchView` exactly
+    as the view id is, or two windows would mint the same `tabId`.
+  - **A `webext_set` for a live extension is a REINSTALL, so a joining
+    GUI must not re-post.** The re-post quiesced the running instance
+    (background page torn down, capability revoked, content scripts
+    re-injected) in the window that had it working. The helper keeps
+    that contract — stage 40 pins the capability rotation — and the
+    GUI side (`webext.publish`) sends only `webext_list_req` for an
+    adopted client; toggles and installs post as before.
   - **`tabId` is load-bearing, not decoration.** MV2 defines -1 as "not
     associated with a tab", and uBO's `onBeforeRequest` reads exactly
     that: `if (tabId < 0)` it takes its behind-the-scene path. With the

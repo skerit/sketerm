@@ -56,8 +56,11 @@ of its own. Both halves are fixed and both are rig-proven.
   `path`/`bytes`/`sha256` per file and NOTHING of the content, which is
   what makes a 348-file job cost no context. A `dir` name comes from the
   url's last segment, percent-decoded (`nameFromUrl`), and is made
-  unique WITHIN the batch (`batchPath`, ` (n)` before the extension) —
-  two urls ending in `report.pdf` used to write one file and report two.
+  unique against the batch AND the files already in `dir` (`batchPath`,
+  ` (n)` before the extension, the GUI's `uniquePath` shape) — two urls
+  ending in `report.pdf` used to write one file and report two, and a
+  second call into the same `dir` overwrote the first's. Only an
+  explicit `path` overwrites.
   With no url it LISTS the view's downloads — the page-initiated ones
   included.
 - **A download the PAGE starts is answered too, in both backends.** The

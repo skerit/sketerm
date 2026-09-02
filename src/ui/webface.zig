@@ -627,6 +627,9 @@ pub const Client = struct {
     /// This client JOINED a helper another sketerm process started
     /// (`adoptRunningHelper`): it owns no child and no socket file.
     adopted: bool = false,
+    /// Our own helper lost the startup race; the connect ticks are now
+    /// looking for the winner's socket instead of ours.
+    adopt_retry: bool = false,
     sock_path: [108]u8 = undefined,
     sock_len: usize = 0,
     /// Remote helper host ("" = the local helper this GUI spawns). A
@@ -1160,22 +1163,25 @@ pub const Client = struct {
     /// process owns? `web-<pid>.sock` on the direct route,
     /// `web-<pid>-<slug>.sock` on a routed instance -- so a routed
     /// socket never matches the direct route and vice versa.
-    fn helperSocketOfRoute(name: []const u8, slug: ?[]const u8, self_pid: i32) bool {
+    /// The pid of the sketerm process that owns helper socket `name`
+    /// on this route, or null when the name is not such a socket (or
+    /// is our own).
+    fn helperSocketOfRoute(name: []const u8, slug: ?[]const u8, self_pid: i32) ?i32 {
         const prefix = @import("../ipc/server.zig").WEB_SOCKET_PREFIX;
         const suffix = ".sock";
-        if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return false;
+        if (!std.mem.startsWith(u8, name, prefix) or !std.mem.endsWith(u8, name, suffix)) return null;
         const mid = name[prefix.len .. name.len - suffix.len];
         const pid_part = if (slug) |s| blk: {
-            if (mid.len <= s.len + 1) return false;
-            if (!std.mem.endsWith(u8, mid, s)) return false;
+            if (mid.len <= s.len + 1) return null;
+            if (!std.mem.endsWith(u8, mid, s)) return null;
             const cut = mid.len - s.len - 1;
-            if (mid[cut] != '-') return false;
+            if (mid[cut] != '-') return null;
             break :blk mid[0..cut];
         } else mid;
-        if (pid_part.len == 0) return false;
-        for (pid_part) |ch| if (ch < '0' or ch > '9') return false;
-        const pid = std.fmt.parseInt(i32, pid_part, 10) catch return false;
-        return pid != self_pid;
+        if (pid_part.len == 0) return null;
+        for (pid_part) |ch| if (ch < '0' or ch > '9') return null;
+        const pid = std.fmt.parseInt(i32, pid_part, 10) catch return null;
+        return if (pid != self_pid) pid else null;
     }
 
     /// Join the helper another sketerm process of this route already
@@ -1209,22 +1215,29 @@ pub const Client = struct {
         const self_pid: i32 = @intCast(c.getpid());
         while (c.g_dir_read_name(d)) |name_c| {
             const name = std.mem.span(@as([*:0]const u8, @ptrCast(name_c)));
-            if (!helperSocketOfRoute(name, slug, self_pid)) continue;
+            const owner_pid = helperSocketOfRoute(name, slug, self_pid) orelse continue;
             var path_buf: [108]u8 = undefined;
             const p = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, name }) catch continue;
             if (p.len + 1 > self.sock_path.len) continue;
             @memcpy(self.sock_path[0..p.len], p);
             self.sock_len = p.len;
-            if (self.tryConnect()) {
-                self.adopted = true;
-                return true;
+            // Set BEFORE the connect: `tryConnect` defers an adopted
+            // client's publishing until the helper has confirmed it
+            // can serve two clients (`hello_ack`).
+            self.adopted = true;
+            if (self.tryConnect()) return true;
+            self.adopted = false;
+            // Nothing listening. Unlink the file only when the sketerm
+            // that spawned the helper is GONE: a helper that has bound
+            // but not yet listened refuses connections for a moment,
+            // and unlinking then would strand a live helper on a
+            // nameless socket.
+            if (c.kill(owner_pid, 0) != 0 and std.posix.errno(@as(c_int, -1)) == .SRCH) {
+                var z: [108:0]u8 = undefined;
+                @memcpy(z[0..p.len], p);
+                z[p.len] = 0;
+                _ = c.unlink(&z);
             }
-            // Nothing listening: the helper is gone and only its socket
-            // file survived it.
-            var z: [108:0]u8 = undefined;
-            @memcpy(z[0..p.len], p);
-            z[p.len] = 0;
-            _ = c.unlink(&z);
         }
         self.sock_len = 0;
         return false;
@@ -1240,15 +1253,30 @@ pub const Client = struct {
             var status: c_int = 0;
             if (c.waitpid(self.pid, &status, c.WNOHANG) == self.pid) {
                 self.pid = -1;
-                self.connect_timer = 0;
                 // Two windows raced for the profile: both found no
                 // helper and forked one, and the loser's CEF refused
                 // the locked `root_cache_path`. The winner is serving
                 // now, so join it instead of reporting a failure.
-                if (self.adoptRunningHelper()) return 0;
+                self.adopt_retry = true;
+            }
+        }
+        if (self.adopt_retry) {
+            // The loser fails INSIDE cef_initialize, while the winner is
+            // still initialising and has not bound its socket yet: one
+            // immediate look often finds nothing. Keep looking for the
+            // rest of the connect budget before calling it an exit.
+            if (self.adoptRunningHelper()) {
+                self.adopt_retry = false;
+                self.connect_timer = 0;
+                return 0;
+            }
+            if (self.connect_tries >= CONNECT_MAX_TRIES) {
+                self.adopt_retry = false;
+                self.connect_timer = 0;
                 self.fail(HELPER_EXIT_MSG);
                 return 0;
             }
+            return 1;
         }
 
         if (self.tryConnect()) {
@@ -1288,6 +1316,17 @@ pub const Client = struct {
             for (self.faces.items) |f| f.onClientReady();
             return true;
         }
+        // Another window's helper: nothing is published and no view is
+        // minted until `hello_ack` says it serves several clients, or
+        // the views would already be sitting in its one id space when
+        // the refusal arrives.
+        if (self.adopted) return true;
+        self.publishAfterConnect();
+        return true;
+    }
+
+    /// What a fresh connection needs before its faces mint views.
+    fn publishAfterConnect(self: *Client) void {
         // Re-publish every container BEFORE the faces mint their views:
         // a fresh helper knows no contexts, and a view_create naming one
         // must be preceded by its context_create. Sent optimistically
@@ -1302,7 +1341,6 @@ pub const Client = struct {
         // above will ask for one on their first request.
         tabsChanged();
         for (self.faces.items) |f| f.onClientReady();
-        return true;
     }
 
     /// The connection died (helper crash, protocol error). Faces show
@@ -1606,6 +1644,10 @@ pub const Client = struct {
                     self.failWith("Another sketerm window owns the browser and its helper cannot be shared (no multi-client capability). Close that window's browser pages, or restart it on this build.", false);
                     return;
                 }
+                // Confirmed shareable: publish what `tryConnect`
+                // deferred, so the views below are minted into a helper
+                // that has a window for them.
+                if (self.adopted) self.publishAfterConnect();
                 if (self.observer) {
                     // Nothing of this GUI's is published into an
                     // assistant's helper (see `observer`); the one
@@ -2557,19 +2599,19 @@ pub fn hostOfUrl(url: []const u8) ?[]const u8 {
 test "a helper socket is adopted only from this route and another process" {
     const t = std.testing;
     // Direct route: `web-<pid>.sock`, someone else's pid.
-    try t.expect(Client.helperSocketOfRoute("web-1234.sock", null, 99));
-    try t.expect(!Client.helperSocketOfRoute("web-1234.sock", null, 1234)); // our own
+    try t.expectEqual(@as(?i32, 1234), Client.helperSocketOfRoute("web-1234.sock", null, 99));
+    try t.expect(Client.helperSocketOfRoute("web-1234.sock", null, 1234) == null); // our own
     // A routed instance's socket is a DIFFERENT profile: never direct's.
-    try t.expect(!Client.helperSocketOfRoute("web-1234-tor.sock", null, 99));
-    try t.expect(Client.helperSocketOfRoute("web-1234-tor.sock", "tor", 99));
-    try t.expect(!Client.helperSocketOfRoute("web-1234-tor.sock", "via-box", 99));
-    try t.expect(!Client.helperSocketOfRoute("web-1234.sock", "tor", 99));
+    try t.expect(Client.helperSocketOfRoute("web-1234-tor.sock", null, 99) == null);
+    try t.expectEqual(@as(?i32, 1234), Client.helperSocketOfRoute("web-1234-tor.sock", "tor", 99));
+    try t.expect(Client.helperSocketOfRoute("web-1234-tor.sock", "via-box", 99) == null);
+    try t.expect(Client.helperSocketOfRoute("web-1234.sock", "tor", 99) == null);
     // Neighbours in the same directory that are not helper sockets.
-    try t.expect(!Client.helperSocketOfRoute("mux.sock", null, 99));
-    try t.expect(!Client.helperSocketOfRoute("1234.sock", null, 99));
-    try t.expect(!Client.helperSocketOfRoute("web-.sock", null, 99));
-    try t.expect(!Client.helperSocketOfRoute("web-12ab.sock", null, 99));
-    try t.expect(!Client.helperSocketOfRoute("web-1234.sock.tmp", null, 99));
+    try t.expect(Client.helperSocketOfRoute("mux.sock", null, 99) == null);
+    try t.expect(Client.helperSocketOfRoute("1234.sock", null, 99) == null);
+    try t.expect(Client.helperSocketOfRoute("web-.sock", null, 99) == null);
+    try t.expect(Client.helperSocketOfRoute("web-12ab.sock", null, 99) == null);
+    try t.expect(Client.helperSocketOfRoute("web-1234.sock.tmp", null, 99) == null);
 }
 
 test "hostOfUrl keys a site rule on the host alone" {
@@ -9475,14 +9517,33 @@ pub const WebFace = struct {
         return null;
     }
 
+    /// The row's cancel/dismiss button by request id, for the control
+    /// socket (`web-download-dismiss`): the same act as the click, so a
+    /// rig can drive the strip without a pointer.
+    pub fn webDownloadDismiss(self: *WebFace, req: u32) bool {
+        if (req == 0) return false;
+        for (self.downloads.items) |d| {
+            if (d.req != req) continue;
+            self.actOnRow(d);
+            return true;
+        }
+        return false;
+    }
+
     fn onDlCancelClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const ctx = cast.userData(DlBtnCtx, user);
         const self = findFaceGlobal(ctx.view) orelse return;
         const d = self.rowDownload(ctx.dl) orelse return;
+        self.actOnRow(d);
+    }
+
+    /// What the row's one button does: cancel a running transfer,
+    /// dismiss a finished one.
+    fn actOnRow(self: *WebFace, d: *Download) void {
         switch (d.state) {
             .downloading => {
                 d.canceled = true;
-                self.cl.post(proto.DownloadCancel{ .view = ctx.view, .id = d.id });
+                self.cl.post(proto.DownloadCancel{ .view = self.view, .id = d.id });
             },
             .uploading => {
                 d.canceled = true;
