@@ -1,5 +1,51 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-02: rig coverage for the review fixes, and the shared helper's seams
+
+The six fixes below each got a proof, and reviewing the commits under
+them (the shared browser helper, the watched page's pointer, paste)
+turned up five more edges in the helper-sharing commit:
+
+- **smoke-web stage 22j3** shortens the download hold through
+  `SKETERM_WEB_DOWNLOAD_HOLD_MS` and watches an unanswered offer
+  expire: a terminal `failed` frame after the hold, never at once, and
+  no `/tmp/sketerm-webdl-cancel-*` file left behind.
+- **smoke-e2e's GUI download stage** now cancels two requests while a
+  loopback server still holds their responses, sees the late offers
+  declined (one failed row each, no `slow.bin` row, no file), and
+  dismisses the second failed row through the new
+  `web-download-dismiss` control verb without losing the first — the
+  id-0 collision, driven without a pointer.
+- **smoke-e2e's watch-along stage** runs the real `sketerm mux attach`
+  entry point from inside a pane: `--new-tab` opens a tab and leaves
+  the pane; without it the pane is taken over. `AttachArgs` is the
+  parser, unit-tested.
+- **Batch `web_download` names are unique on disk too**, not only within
+  one call (`batchPath` steps over existing files like the GUI's
+  `uniquePath`); only an explicit `path` overwrites.
+- **Shared helper: one tab table, scoped per connection.** Each GUI
+  posts its own tabs, and a replace-all from one window read the other
+  window's tabs as removed, then re-created them on the next post —
+  extensions saw every tab churn on every change, and `sender.tab`
+  flipped between posts. `Table.replaceOwner`/`dropOwner`; tab ids are
+  windowed like view ids so two windows cannot mint the same `tabId`.
+- **Shared helper: joining no longer restarts every extension.** The
+  joining window's `webext_set` re-post IS a reinstall helper-side (it
+  quiesces the instance and rotates its capability; stage 40 pins it),
+  so it restarted every extension (uBO: ~2.4s re-parse) in the window
+  that had it working. An adopted client now asks for state
+  (`webext_list_req`) instead of re-posting. A first attempt made the
+  helper ignore a matching re-post; stage 40 caught that as a broken
+  reinstall.
+- **Shared helper: adoption after a lost startup race is bounded, not
+  one-shot.** The loser dies inside `cef_initialize` while the winner
+  has not bound its socket yet; the connect ticks now keep looking for
+  the rest of their budget. A stale socket is unlinked only when the
+  sketerm that spawned it is gone (`kill(pid, 0)` on the pid in the
+  socket name), never on a bare refused connect. And an adopted client
+  publishes nothing and mints no view until `hello_ack` confirms
+  `multi-client`.
+
 ## 2026-09-01: review of the download work, six edges closed
 
 A read of the previous day's commits found nothing that needed
