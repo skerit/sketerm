@@ -1,5 +1,26 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-02: a network blink under a page load is healed, not failed
+
+A browser-lane scraper on a host running Testcontainers kept dying
+mid-load with `ERR_NETWORK_CHANGED`: every container start or stop
+adds or removes a `veth`, Chromium's netlink notifier counts that as
+an IP change, and the engine abandons the in-flight navigation. CEF
+cannot be told to ignore the interface, so the helper now re-issues a
+main-frame load ONCE on exactly that code and reports it as
+`ev_load_retry` (0x4B, capability `load-retry`) instead of
+`ev_load_error`; the retry failing too is the ordinary error. The rule
+and its one-per-navigation budget are `src/web/loadretry.zig`
+(std-only, unit-tested). Headless clients keep the record until their
+next navigation request and the MCP results carry it as `load_retry`
+beside `load_error`, in both lanes, so a caller can tell a healed
+blink from a site refusal. In-page `fetch` rejections stay the
+caller's problem: only the caller knows whether re-running a script is
+safe. smoke-web stage nc proves both halves against a real helper by
+injecting the net error through a resource handler
+(`SKETERM_WEB_FAULT_NET_CHANGED=<n>`), since a real interface change
+needs root.
+
 ## 2026-09-02: rig coverage for the review fixes, and the shared helper's seams
 
 The six fixes below each got a proof, and reviewing the commits under
