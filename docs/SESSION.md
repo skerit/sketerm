@@ -1,5 +1,61 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-03: six file-manager reports from a remote session
+
+All six came from one sitting on a laptop browsing `archdev:` over ssh.
+Each is a small fix; what took the time is that every one is only
+provable on a live GUI, so a new smoke-e2e stage (`filesMutationSelect`,
+focused run `SKETERM_SMOKE_E2E_FILES_SELECT_ONLY=1`) drives them all.
+
+- Ctrl+C on a remote row put NOTHING on the system clipboard (the
+  export skipped remote entries wholesale, so a paste into an editor
+  produced whatever was there before). Remote entries now export their
+  text form (the path on that host); only the `file://` list stays
+  local-only, since a local file manager would resolve it here.
+- "Edit in a Sketerm Editor Window" on `session-*.md` refused with
+  "binary file (NUL bytes)". The file genuinely holds NULs (an
+  environment dump 26 KB in), so the whole-file scan was right and
+  useless. `document.looksBinary` is git's rule — a NUL within the
+  first 8000 bytes — and both the open path and the project search
+  read it; a NUL past that is just a byte in the buffer.
+- A second "Edit in a Sketerm Editor Window" opened a second window.
+  GApplication already forwarded the launch; the activate handler just
+  always built a window. `EditorWindow.find` now picks the front editor
+  window and `openMore` adds the documents as tabs; a bare launch and
+  `--new-window` (which the editor's own "Open in New Window" passes
+  through `siblingapp.openInEditor`) still open a window.
+- A created folder, a renamed entry and a pasted copy were not
+  selected. `BTab.pending_select` + `BrowserView.queueSelectOnHost`:
+  the reply that names the entry (the undo record for mkdir/rename/
+  link/new file, the job `done` for copies and moves — a cross-host
+  row resolves its destination host through its retry record, never
+  `row.hc`) queues the path for every tab of that host showing its
+  folder, `render.applyPendingSelect` moves it into the selection the
+  moment the listing carries it (now, or on the render the watch delta
+  triggers), and a 15s grace drops a path whose delta never comes. A
+  batch id groups the members of one paste so they accumulate; a new
+  batch replaces the selection. `colview.syncSelectionFromPaths` is the
+  push of the mirror onto the GTK selection (the inverse of
+  `syncSelectedMirror`), extracted from `renderList`.
+- An .html row now offers "Open in Sketerm Browser": a web tab of the
+  Files window on `file://<path>`. On a remote tab the face is routed
+  `on:<host>` first, so the helper the remote daemon spawns serves the
+  page and every relative asset from that disk — no mount, no download
+  copy. The rig proves both, the remote one through the fake-SSH
+  daemon (`route:"on:localhost"` in `web-list`) — and that remote
+  case found a latent crash: `WebFace.setRoute` registers the face on
+  the routed `Client` BEFORE `ensure` hands it its allocator, so the
+  first routed tab of a process appended to `faces` through an
+  undefined vtable (SIGSEGV at 0). `clientForRoute` now sets `gpa` at
+  mint time; every `web_open route:` into a fresh GUI had the same
+  hole.
+
+Rig lessons: a GtkPopover is its own popup surface and the seat
+keyboard must ENTER it (`typeText(popup_id, …)`), the location bar
+keeps focus after Enter so a paste chord needs a click on the listing
+first, and a window with two tabs turns close-request into a
+confirmation (close the extra pane over the control socket first).
+
 ## 2026-09-02: a network blink under a page load is healed, not failed
 
 A browser-lane scraper on a host running Testcontainers kept dying
