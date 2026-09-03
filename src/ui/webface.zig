@@ -2025,6 +2025,11 @@ pub fn clientForRoute(gpa: std.mem.Allocator, spec: webroute.Spec) ?*Client {
     }
     const cl = gpa.create(Client) catch return null;
     cl.* = .{};
+    // The allocator from birth, not from `ensure`: `setRoute` registers
+    // a face on the client BEFORE ensuring it, and `register` appends
+    // to `faces` with `self.gpa` -- an undefined vtable was a SIGSEGV
+    // on the first routed tab of a process.
+    cl.gpa = gpa;
     if (spec.host.len > cl.route_host.len or spec.endpoint.len > cl.route_endpoint.len) {
         gpa.destroy(cl);
         return null;
