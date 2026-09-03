@@ -470,6 +470,10 @@ fn buildOpenWith(self: *BrowserView, ctx: *MenuCtx, m: classicmenu.Menu) void {
         m.itemIcon("Open in Sketerm Viewer", .{ .name = "image-x-generic-symbolic" }, &onMenuViewer, ctx);
     if (isCastName(path))
         m.itemIcon("Play in Sketerm", .{ .name = "media-playback-start-symbolic" }, &onMenuCastPlay, ctx);
+    // A page renders in a web tab of this window; the picker embed has
+    // no window to put one in.
+    if (!ctx.is_dir and self.ownerWindow() != null and @import("../../filebrowser/paths.zig").isWebName(path))
+        m.itemIcon("Open in Sketerm Browser", .{ .name = "web-browser-symbolic" }, &onMenuWebBrowser, ctx);
     if (!ctx.is_dir) {
         // Three destinations, one more than the Viewer has: in the pane
         // you are looking at (which converts it, so the browser goes
@@ -1050,6 +1054,54 @@ pub fn onMenuEditorWindow(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     menuDone(ctx);
     if (!@import("../siblingapp.zig").openInEditor(copied, null, .{}))
         self.setStatus("could not launch Sketerm Editor");
+}
+
+/// "Open in Sketerm Browser": a web tab of this window on the file.
+/// A remote file is served by a browser helper placed ON its host
+/// (the `on:<host>` route), so the page and every asset it references
+/// load from that host's disk over the daemon's own transport: no
+/// mount, no download copy, relative links intact.
+pub fn onMenuWebBrowser(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+    const ctx = cast.userData(MenuCtx, user);
+    const self = ctx.view;
+    const path = ctx.path orelse return menuDone(ctx);
+    const tab = ctx.tab;
+    // Copy everything out BEFORE menuDone frees the ctx storage.
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return menuDone(ctx);
+    @memcpy(path_buf[0..path.len], path);
+    const copied = path_buf[0..path.len];
+    var host_buf: [512]u8 = undefined;
+    const host: ?[]const u8 = if (@import("../../filebrowser/paths.zig").browserHost(tab.hc.host)) |h| blk: {
+        if (h.len > host_buf.len) return menuDone(ctx);
+        @memcpy(host_buf[0..h.len], h);
+        break :blk host_buf[0..h.len];
+    } else null;
+    menuDone(ctx);
+    const win = self.ownerWindow() orelse return;
+    const webface = @import("../webface.zig");
+    const before = win.panes.items.len;
+    win.newWebTabAt(null) catch |err| {
+        self.setStatusFmt("could not open a web tab: {s}", .{@errorName(err)});
+        return;
+    };
+    if (win.panes.items.len <= before) return;
+    const pane = win.panes.items[win.panes.items.len - 1];
+    const face = webface.WebFace.fromPane(pane) orelse return;
+    // Route first: the page must load on the instance that can see it.
+    if (host) |h| face.setRoute(.{ .kind = .remote_browser, .host = h }) catch |err| {
+        self.setStatus(switch (err) {
+            error.RouteUnavailable => "no browser could be started on that host",
+            error.InvalidRoute => "that host cannot place a browser",
+            error.AttachedView => "the new tab cannot be routed",
+        });
+        return;
+    };
+    const pz = self.allocator.dupeZ(u8, copied) catch return;
+    defer self.allocator.free(pz);
+    const uri = c.g_filename_to_uri(pz.ptr, null, null) orelse return;
+    defer c.g_free(uri);
+    face.navigate(std.mem.span(@as([*:0]const u8, @ptrCast(uri))));
 }
 
 pub fn onMenuViewer(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {

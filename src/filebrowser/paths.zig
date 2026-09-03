@@ -162,6 +162,22 @@ pub fn isCastName(name: []const u8) bool {
     return std.ascii.endsWithIgnoreCase(name, ".cast");
 }
 
+/// Documents the Sketerm Browser renders as a page from disk.
+pub fn isWebName(name: []const u8) bool {
+    const exts = [_][]const u8{ ".html", ".htm", ".xhtml", ".mhtml" };
+    for (exts) |ext| if (std.ascii.endsWithIgnoreCase(name, ext)) return true;
+    return false;
+}
+
+test "isWebName: html family only" {
+    const t = std.testing;
+    try t.expect(isWebName("index.html"));
+    try t.expect(isWebName("PAGE.HTM"));
+    try t.expect(isWebName("/srv/site/a.xhtml"));
+    try t.expect(!isWebName("style.css"));
+    try t.expect(!isWebName("notes.txt"));
+}
+
 /// Resources the Sketerm Viewer can show in a navigable batch: images,
 /// video/audio it plays with a GtkMediaStream, plus terminal recordings,
 /// which it plays in place. Declared BELOW `isPlayableName` in reading
