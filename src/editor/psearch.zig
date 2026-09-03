@@ -260,12 +260,11 @@ pub const Results = struct {
     /// Scan ONE candidate's content with the editor's own engine and
     /// record its hits. `content` is the file's real bytes.
     ///
-    /// Returns the number of hits recorded. A file whose content
-    /// contains a NUL is treated as binary and skipped, matching what
-    /// the editor refuses to open.
+    /// Returns the number of hits recorded. A file `looksBinary` is
+    /// skipped, matching exactly what the editor refuses to open.
     pub fn scanContent(self: *Results, file: u32, content: []const u8) !usize {
         self.scanned += 1;
-        if (std.mem.indexOfScalar(u8, content, 0) != null) {
+        if (doc_mod.looksBinary(content)) {
             try self.setNote(file, "binary", .failed);
             return 0;
         }

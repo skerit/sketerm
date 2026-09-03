@@ -377,10 +377,10 @@ fn ioThread(job: *IoJob) void {
                     }
                     break :run;
                 };
-                if (std.mem.indexOfScalar(u8, out.items, 0) != null) {
+                if (@import("../editor/document.zig").looksBinary(out.items)) {
                     out.deinit(allocator);
                     job.binary = true;
-                    job.setErr("binary file (NUL bytes) — refusing to edit");
+                    job.setErr("binary file (NUL bytes near the start) — refusing to edit");
                     break :run;
                 }
                 job.bytes = out.toOwnedSlice(allocator) catch {

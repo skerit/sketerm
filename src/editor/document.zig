@@ -95,6 +95,32 @@ pub const EditObserver = struct {
     before_apply: *const fn (ctx: *anyopaque, doc: *const Document, edits: []const tr.Edit) void,
 };
 
+/// How far into a file the binary check looks, git's own rule: a NUL
+/// within the first 8000 bytes makes a file binary, a NUL past that
+/// does not. A text log with one embedded environment dump deep inside
+/// was refused as binary under a whole-file scan.
+pub const BINARY_PROBE_BYTES: usize = 8000;
+
+/// Is this content something the editor should refuse to open? The
+/// one predicate shared by the open path and the project search.
+pub fn looksBinary(bytes: []const u8) bool {
+    const probe = bytes[0..@min(bytes.len, BINARY_PROBE_BYTES)];
+    return std.mem.indexOfScalar(u8, probe, 0) != null;
+}
+
+test "looksBinary: NUL in the probe window is binary, past it is text" {
+    try std.testing.expect(!looksBinary("plain text\n"));
+    try std.testing.expect(looksBinary("ab\x00cd"));
+    const alloc = std.testing.allocator;
+    const late = try alloc.alloc(u8, BINARY_PROBE_BYTES + 10);
+    defer alloc.free(late);
+    @memset(late, 'x');
+    late[BINARY_PROBE_BYTES + 5] = 0;
+    try std.testing.expect(!looksBinary(late));
+    late[BINARY_PROBE_BYTES - 1] = 0;
+    try std.testing.expect(looksBinary(late));
+}
+
 pub const Document = struct {
     alloc: Allocator,
     rope: Rope,
