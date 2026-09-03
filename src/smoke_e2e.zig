@@ -812,6 +812,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_SELECT_ONLY") != null) {
+        const app = drive orelse return fail("focused files-select smoke has no display driver");
+        if (!have_wl) return fail("focused files-select smoke is GTK/Wayland-only");
+        if (filesMutationSelectStage(allocator, app, rt, sock_path, &wl_z, have_web_action)) |why| return failMsg(why);
+        say("files select: created/renamed/pasted entries were selected, a remote Ctrl+C exported the path, a late NUL stayed text, a repeat edit joined the editor window, and an html row opened in a web tab");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_INLINE_RENAME_ONLY") != null) {
         const app = drive orelse return fail("focused inline-rename smoke has no display driver");
         if (!have_wl) return fail("focused inline-rename smoke is GTK/Wayland-only");
@@ -1312,6 +1320,12 @@ pub fn main() u8 {
             // listing batch, Space closes it again.
             if (quickLookStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
             say("quick look: Space in a Files window opened the shared viewer on the focused file, Right stepped to the next entry, Space closed it, and the browser stayed healthy");
+
+            // 6c-10b. What a mutation leaves selected, the remote
+            // clipboard export, the binary probe, editor-window
+            // reuse and the html row's browser item.
+            if (filesMutationSelectStage(allocator, app, rt, sock_path, &wl_z, have_web_action)) |why| return failMsg(why);
+            say("files select: created/renamed/pasted entries were selected, a remote Ctrl+C exported the path, a late NUL stayed text, a repeat edit joined the editor window, and an html row opened in a web tab");
 
             // 6c-11. A remote Files tab whose daemon died: the
             // reconnect re-subscribes every directory under a FRESH
@@ -6043,10 +6057,17 @@ fn armInlineRename(
 }
 
 fn closeRenameFiles(app: *appdrive.App, child: RenameFilesChild) bool {
+    return closeRenameFilesWithin(app, child, 15_000);
+}
+
+/// `closeRenameFiles` with an explicit exit budget: a window that
+/// hosted a browser tab also shuts its CEF helper down (gracefully,
+/// so the profile flushes), which can outlast the default.
+fn closeRenameFilesWithin(app: *appdrive.App, child: RenameFilesChild, exit_ms: i64) bool {
     app.closeWindow(child.win) catch return false;
     if (!waitWindowGone(app, child.win, 15_000)) return false;
     var status: c_int = 0;
-    const deadline = clock.nowMs() + 15_000;
+    const deadline = clock.nowMs() + exit_ms;
     while (clock.nowMs() < deadline) {
         if (c.waitpid(child.pid, &status, c.WNOHANG) == child.pid) {
             renamefiles_pid = -1;
@@ -6331,6 +6352,475 @@ fn filesReconnectStage(
         return "files reconnect: a file created after the reconnect never appeared (the re-subscription is not live)";
 
     if (!closeRenameFiles(app, child)) return "files reconnect: the Files window did not close cleanly";
+    return null;
+}
+
+/// Centre of the first OCR word on `win_id` containing `needle`, in
+/// that surface's own coordinates. Sparse-text segmentation, the mode
+/// for scattered UI labels; null when nothing on the surface reads so.
+fn ocrWordCenter(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8) ?Point {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) return null;
+    _ = app.drainLive(2_000);
+    const shot = app.snapshotRgba(win_id, null) catch return null;
+    defer allocator.free(shot.px);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    for ([_]i32{ 11, 6 }) |psm| {
+        const res = ocr.recognize(arena.allocator(), shot.px, shot.w, shot.h, .{ .psm = psm }) catch continue;
+        for (res.words) |w| {
+            if (std.mem.indexOf(u8, w.text, needle) == null) continue;
+            return .{
+                .x = @as(f64, @floatFromInt(w.x)) + @as(f64, @floatFromInt(w.w)) / 2,
+                .y = @as(f64, @floatFromInt(w.y)) + @as(f64, @floatFromInt(w.h)) / 2,
+            };
+        }
+    }
+    return null;
+}
+
+/// Click (with `button`) the word `needle` on `win_id`, retrying the
+/// OCR for up to `timeout_ms` because a freshly mapped popup paints
+/// its labels a frame or two after its first commit.
+fn clickOcrWord(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8, button: u32, timeout_ms: i64) bool {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        if (ocrWordCenter(allocator, app, win_id, needle)) |p| {
+            app.clickEx(win_id, p.x, p.y, button, 80, 1) catch return false;
+            return true;
+        }
+        _ = app.pumpOnce(300);
+    }
+    return false;
+}
+
+fn waitPathState(path: [:0]const u8, exists: bool, timeout_ms: i64, app: *appdrive.App) bool {
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        if ((c.access(path.ptr, c.F_OK) == 0) == exists) return true;
+        _ = app.pumpOnce(150);
+    }
+    return false;
+}
+
+/// Fork+exec `zig-out/bin/sketerm <args...>` as one of the suite's
+/// identities on the rig display, under `app_id`. Returns the pid; the
+/// caller kills it by exact pid.
+fn spawnSketermChild(app_id: [*:0]const u8, wl: [*:0]const u8, args: []const [*:0]const u8) c.pid_t {
+    const pid = c.fork();
+    if (pid <= 0) {
+        if (pid < 0) return pid;
+        platform.dieWithParent();
+        _ = c.setenv("SKETERM_APP_ID", app_id, 1);
+        _ = c.setenv("WAYLAND_DISPLAY", wl, 1);
+        _ = c.setenv("GDK_BACKEND", "wayland", 1);
+        _ = c.unsetenv("DISPLAY");
+        _ = c.setenv("LIBGL_ALWAYS_SOFTWARE", "1", 1);
+        _ = c.setenv("GTK_A11Y", "none", 1);
+        _ = c.setenv("SKETERM_WELCOME", "0", 1);
+        var argv: [12]?[*:0]const u8 = @splat(null);
+        argv[0] = "zig-out/bin/sketerm";
+        for (args, 0..) |a, i| {
+            if (i + 1 >= argv.len - 1) break;
+            argv[i + 1] = a;
+        }
+        _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
+        c._exit(127);
+    }
+    return pid;
+}
+
+/// Wait for `pid` to exit on its own; false when it is still running
+/// at the deadline.
+fn waitExit(pid: c.pid_t, timeout_ms: i64) bool {
+    var status: c_int = 0;
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        if (c.waitpid(pid, &status, c.WNOHANG) == pid) return true;
+        _ = c.usleep(100_000);
+    }
+    return false;
+}
+
+/// The things a file manager does AFTER a mutation, and the editor
+/// entry points the browser hands files to. Each was reported broken
+/// from a real remote session and each is only provable on a live GUI:
+///
+/// 1. A folder created from the context menu is SELECTED (F2 then
+///    renames it without any click); the renamed folder stays
+///    selected; a pasted copy is selected once its job lands (F2
+///    renames the copy in the destination folder).
+/// 2. Ctrl+C on a REMOTE tab exports the file's path as clipboard
+///    text (it used to export nothing for remote entries, so a paste
+///    into an editor produced the previous clipboard).
+/// 3. A text file with a NUL beyond git's 8000-byte probe opens in the
+///    editor instead of being refused as binary.
+/// 4. A second `sketerm edit <file>` lands as a TAB of the open editor
+///    window, and `--new-window` still opens another window.
+/// 5. An .html row offers "Open in Sketerm Browser", which loads the
+///    file in a web tab of the Files window (helper permitting).
+fn filesMutationSelectStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    main_sock: [:0]const u8,
+    wl: [*:0]const u8,
+    have_web: bool,
+) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("files select: tesseract unavailable; skipping");
+        return null;
+    }
+
+    // ── 1. created / renamed / pasted entries are selected ─────────
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/selmut", .{rt}) catch return "files select: dir path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    var p_buf: [600:0]u8 = undefined;
+    const aaa = std.fmt.bufPrintZ(&p_buf, "{s}/AAAROW.txt", .{dir}) catch return "files select: seed path";
+    if (!writeFile(aaa, "aaa\n")) return "files select: seed create";
+    var sub_buf: [600:0]u8 = undefined;
+    const sub = std.fmt.bufPrintZ(&sub_buf, "{s}/SUBROW", .{dir}) catch return "files select: sub path";
+    _ = c.mkdir(sub.ptr, 0o700);
+    var newdir_buf: [600:0]u8 = undefined;
+    const newdir = std.fmt.bufPrintZ(&newdir_buf, "{s}/NEWDIR", .{dir}) catch return "files select: newdir path";
+    var renamed_buf: [600:0]u8 = undefined;
+    const renamed = std.fmt.bufPrintZ(&renamed_buf, "{s}/RENAMED", .{dir}) catch return "files select: renamed path";
+    var pasted_buf: [600:0]u8 = undefined;
+    const pasted = std.fmt.bufPrintZ(&pasted_buf, "{s}/SUBROW/RENAMED", .{dir}) catch return "files select: pasted path";
+    var moved_buf: [600:0]u8 = undefined;
+    const moved = std.fmt.bufPrintZ(&moved_buf, "{s}/SUBROW/MOVED", .{dir}) catch return "files select: moved path";
+
+    const child = launchRenameFiles(app, dir, "selmut", "", wl) orelse
+        return "files select: the Files window never appeared";
+    defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
+    if (!viewerWaitOcr(allocator, app, child.win, "AAAROW", 40_000))
+        return "files select: the listing never rendered";
+    _ = app.waitVisualSettle(child.win, 400, 10_000, 0.002, null);
+
+    // The background context menu (empty space under the two rows)
+    // carries "Create New Folder…" at its top level.
+    {
+        const win = app.winById(child.win) orelse return "files select: window vanished";
+        const x = @as(f64, @floatFromInt(win.w)) * 0.58;
+        const y = @as(f64, @floatFromInt(win.h)) * 0.88;
+        if (openPopup(app) != null) return "files select: a popup was already open";
+        app.clickEx(child.win, x, y, 3, 100, 1) catch return "files select: right-click failed";
+    }
+    const bg_menu = waitPopup(app, true, 15_000) orelse
+        return "files select: right-clicking the listing background opened no menu";
+    _ = app.waitVisualSettle(bg_menu, 300, 5_000, 0.002, null);
+    if (!clickOcrWord(allocator, app, bg_menu, "Create", 1, 8_000)) {
+        viewerShot(allocator, app, bg_menu, "files-select-bgmenu");
+        return "files select: the background menu shows no Create New Folder item";
+    }
+    // The menu pops down and the name popover (its own popup surface)
+    // takes the keyboard; type into whatever has it.
+    if (waitPopup(app, false, 10_000) == null) return "files select: the background menu never closed";
+    const name_pop = waitPopup(app, true, 10_000) orelse {
+        viewerShot(allocator, app, child.win, "files-select-nopopover");
+        return "files select: the folder-name popover never opened";
+    };
+    _ = app.waitVisualSettle(name_pop, 200, 3_000, 0.002, null);
+    // A popup is its own surface: the seat keyboard has to ENTER it,
+    // as a compositor does for a grabbing popover.
+    app.typeText(name_pop, "NEWDIR") catch return "files select: typing the folder name failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(name_pop, "Enter") catch return "files select: confirming the folder name failed";
+    if (!waitPathState(newdir, true, 10_000, app)) {
+        viewerShot(allocator, app, child.win, "files-select-nomkdir");
+        return "files select: the folder was never created";
+    }
+    // Delta, throttled render, selection. Then F2 acts on the
+    // selection alone — nothing has been clicked since.
+    pumpRenameFor(app, 1_500);
+    app.pressKey(child.win, "F2") catch return "files select: F2 failed";
+    pumpRenameFor(app, 400);
+    app.typeText(child.win, "RENAMED") catch return "files select: typing the new name failed";
+    pumpRenameFor(app, 200);
+    app.pressKey(child.win, "Enter") catch return "files select: Enter failed";
+    if (!waitPathState(renamed, true, 10_000, app) or c.access(newdir.ptr, c.F_OK) == 0) {
+        viewerShot(allocator, app, child.win, "files-select-mkdir");
+        return "files select: the created folder was not selected (F2 renamed nothing)";
+    }
+    say("files select: the created folder was selected and F2 renamed it");
+
+    // The rename keeps the row selected: copy it, go into SUBROW,
+    // paste. The copy job's completion selects the pasted copy.
+    pumpRenameFor(app, 1_200);
+    app.pressKey(child.win, "ctrl+c") catch return "files select: ctrl+c failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(child.win, "ctrl+l") catch return "files select: ctrl+l failed";
+    pumpRenameFor(app, 500);
+    app.pressKey(null, "ctrl+a") catch return "files select: select-all in the location bar failed";
+    app.typeText(null, sub) catch return "files select: typing the destination failed";
+    pumpRenameFor(app, 200);
+    app.pressKey(null, "Enter") catch return "files select: navigating failed";
+    pumpRenameFor(app, 2_500);
+    // The location entry keeps the focus after Enter; the paste chord
+    // belongs to the listing, so put the focus there the way a user
+    // does, with a click on the empty folder.
+    {
+        const win = app.winById(child.win) orelse return "files select: window vanished";
+        app.clickEx(child.win, @as(f64, @floatFromInt(win.w)) * 0.58, @as(f64, @floatFromInt(win.h)) * 0.6, 1, 60, 1) catch
+            return "files select: focusing the destination listing failed";
+    }
+    pumpRenameFor(app, 400);
+    app.pressKey(child.win, "ctrl+v") catch return "files select: ctrl+v failed";
+    if (!waitPathState(pasted, true, 20_000, app)) {
+        viewerShot(allocator, app, child.win, "files-select-paste");
+        return "files select: the paste never produced SUBROW/RENAMED";
+    }
+    pumpRenameFor(app, 2_000);
+    app.pressKey(child.win, "F2") catch return "files select: F2 after paste failed";
+    pumpRenameFor(app, 400);
+    app.typeText(child.win, "MOVED") catch return "files select: typing after paste failed";
+    pumpRenameFor(app, 200);
+    app.pressKey(child.win, "Enter") catch return "files select: Enter after paste failed";
+    if (!waitPathState(moved, true, 10_000, app)) {
+        viewerShot(allocator, app, child.win, "files-select-pasted");
+        return "files select: the pasted copy was not selected (F2 renamed nothing)";
+    }
+    say("files select: the pasted copy was selected once its job landed");
+    if (!closeRenameFiles(app, child)) return "files select: the Files window did not close cleanly";
+
+    // ── 2. Ctrl+C on a remote tab exports the path as text ─────────
+    if (remote_mux_pid > 0) {
+        var rdir_buf: [512:0]u8 = undefined;
+        const rdir = std.fmt.bufPrintZ(&rdir_buf, "{s}/selclip", .{rt}) catch return "files select: remote dir path";
+        _ = c.mkdir(rdir.ptr, 0o700);
+        var rfile_buf: [600:0]u8 = undefined;
+        const rfile = std.fmt.bufPrintZ(&rfile_buf, "{s}/CLIPROW.txt", .{rdir}) catch return "files select: remote seed path";
+        if (!writeFile(rfile, "clip\n")) return "files select: remote seed create";
+        var spec_buf: [600:0]u8 = undefined;
+        const spec = std.fmt.bufPrintZ(&spec_buf, "localhost:{s}", .{rdir}) catch return "files select: remote spec";
+        const rchild = launchRenameFiles(app, spec, "selclip", "", wl) orelse
+            return "files select: the remote Files window never appeared";
+        if (!viewerWaitOcr(allocator, app, rchild.win, "CLIPROW", 40_000))
+            return "files select: the remote listing never rendered";
+        _ = app.waitVisualSettle(rchild.win, 400, 10_000, 0.002, null);
+        // Focus the listing, type-ahead to the row, copy.
+        {
+            const win = app.winById(rchild.win) orelse return "files select: remote window vanished";
+            app.clickEx(rchild.win, @as(f64, @floatFromInt(win.w)) * 0.58, @as(f64, @floatFromInt(win.h)) * 0.65, 1, 60, 1) catch
+                return "files select: focusing the remote listing failed";
+        }
+        pumpRenameFor(app, 300);
+        app.pressKey(rchild.win, "c") catch return "files select: type-ahead failed";
+        pumpRenameFor(app, 400);
+        app.pressKey(rchild.win, "ctrl+c") catch return "files select: remote ctrl+c failed";
+        pumpRenameFor(app, 800);
+        const clip = app.getClipboard(8_000) catch |err| {
+            var m: [160]u8 = undefined;
+            return std.fmt.bufPrint(&m, "files select: no clipboard text after Ctrl+C on a remote row ({s})", .{@errorName(err)}) catch "files select: no clipboard";
+        };
+        defer allocator.free(clip);
+        if (std.mem.indexOf(u8, clip, rfile) == null) {
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: remote copy clipboard was '%.*s'\n", @as(c_int, @intCast(clip.len)), clip.ptr);
+            return "files select: Ctrl+C on a remote row did not put the file's path on the clipboard";
+        }
+        say("files select: Ctrl+C on a remote row exported the path as clipboard text");
+        if (!closeRenameFiles(app, rchild)) return "files select: the remote Files window did not close cleanly";
+    } else {
+        say("files select: no fake-SSH daemon; the remote clipboard check is skipped");
+    }
+
+    // ── 3. a NUL past the probe window is still a text file ────────
+    {
+        var nul_buf: [600:0]u8 = undefined;
+        const nul_path = std.fmt.bufPrintZ(&nul_buf, "{s}/latenul.txt", .{rt}) catch return "files select: nul path";
+        var body: std.ArrayList(u8) = .empty;
+        defer body.deinit(allocator);
+        body.appendSlice(allocator, "LATENUL-MARK\n") catch return "files select: oom";
+        var i: usize = 0;
+        while (i < 4500) : (i += 1) body.appendSlice(allocator, "y\n") catch return "files select: oom";
+        body.appendSlice(allocator, "env\x00dump\n") catch return "files select: oom";
+        if (!writeFile(nul_path, body.items)) return "files select: nul file create";
+        var req_buf: [900]u8 = undefined;
+        const oreq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"new-editor-tab\",\"data\":\"{s}\"}}\n", .{nul_path}) catch return "fmt";
+        const oresp = roundtrip(allocator, main_sock, oreq) orelse return "files select: new-editor-tab roundtrip";
+        defer allocator.free(oresp);
+        if (!mcpHas(oresp, "\"ok\":true")) return "files select: new-editor-tab not ok";
+        const pane = parseNumAfter(oresp, "\"pane\":") orelse return "files select: editor tab has no pane id";
+        var loaded = false;
+        var t: u32 = 0;
+        while (t < 60 and !loaded) : (t += 1) {
+            _ = app.pumpOnce(250);
+            const greq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"get-text\",\"pane\":{d}}}\n", .{pane}) catch return "fmt";
+            const gresp = roundtrip(allocator, main_sock, greq) orelse continue;
+            defer allocator.free(gresp);
+            if (std.mem.indexOf(u8, gresp, "LATENUL-MARK") != null) loaded = true;
+        }
+        const creq = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{pane}) catch return "fmt";
+        if (roundtrip(allocator, main_sock, creq)) |r| allocator.free(r);
+        if (!loaded) return "files select: a text file with a NUL past 8000 bytes was refused by the editor";
+        say("files select: a NUL past the 8000-byte probe did not make the file binary");
+    }
+
+    // ── 4. a repeat `sketerm edit` joins the open editor window ────
+    {
+        var f1_buf: [600:0]u8 = undefined;
+        var f2_buf: [600:0]u8 = undefined;
+        var f3_buf: [600:0]u8 = undefined;
+        const f1 = std.fmt.bufPrintZ(&f1_buf, "{s}/reuse1.txt", .{rt}) catch return "files select: reuse path";
+        const f2 = std.fmt.bufPrintZ(&f2_buf, "{s}/reuse2.txt", .{rt}) catch return "files select: reuse path";
+        const f3 = std.fmt.bufPrintZ(&f3_buf, "{s}/reuse3.txt", .{rt}) catch return "files select: reuse path";
+        if (!writeFile(f1, "REUSEONE\n") or !writeFile(f2, "REUSETWO\n") or !writeFile(f3, "REUSETHREE\n"))
+            return "files select: reuse seed";
+        _ = app.drainLive(2_000);
+        var known_buf: [32]u32 = undefined;
+        const known = known_buf[0..knownToplevels(app, &known_buf)];
+        const app_id: [*:0]const u8 = "dev.sker.sketerm.e2eeditreuse";
+        const ed_pid = spawnSketermChild(app_id, wl, &.{ "edit", f1.ptr });
+        if (ed_pid <= 0) return "files select: spawning the editor failed";
+        defer reap(ed_pid, c.SIGTERM, 3000);
+        var first: ?u32 = null;
+        const deadline = clock.nowMs() + 25_000;
+        while (clock.nowMs() < deadline and first == null) first = hasToplevelOtherThan(app, known);
+        const w1 = first orelse return "files select: the editor window never appeared";
+        if (!viewerWaitOcr(allocator, app, w1, "REUSEONE", 30_000))
+            return "files select: the first document never rendered";
+        _ = app.drainLive(2_000);
+        var known2_buf: [32]u32 = undefined;
+        const known2 = known2_buf[0..knownToplevels(app, &known2_buf)];
+
+        // The forwarded launch: GApplication hands it to the running
+        // instance and the process exits.
+        const fwd = spawnSketermChild(app_id, wl, &.{ "edit", f2.ptr });
+        if (fwd <= 0) return "files select: spawning the second edit failed";
+        if (!waitExit(fwd, 20_000)) {
+            reap(fwd, c.SIGTERM, 2000);
+            return "files select: the second `sketerm edit` did not hand off to the running editor";
+        }
+        if (!viewerWaitOcr(allocator, app, w1, "REUSETWO", 20_000)) {
+            viewerShot(allocator, app, w1, "files-select-reuse");
+            return "files select: the second file did not open as a tab of the existing editor window";
+        }
+        if (hasToplevelOtherThan(app, known2) != null)
+            return "files select: the second `sketerm edit` opened a window of its own instead of a tab";
+        say("files select: a second `sketerm edit` landed as a tab of the open editor window");
+
+        const fwd2 = spawnSketermChild(app_id, wl, &.{ "edit", "--new-window", f3.ptr });
+        if (fwd2 <= 0) return "files select: spawning --new-window failed";
+        if (!waitExit(fwd2, 20_000)) {
+            reap(fwd2, c.SIGTERM, 2000);
+            return "files select: `sketerm edit --new-window` did not hand off";
+        }
+        var second: ?u32 = null;
+        const deadline2 = clock.nowMs() + 25_000;
+        while (clock.nowMs() < deadline2 and second == null) second = hasToplevelOtherThan(app, known2);
+        const w2 = second orelse return "files select: --new-window opened no second editor window";
+        if (!viewerWaitOcr(allocator, app, w2, "REUSETHREE", 20_000))
+            return "files select: the --new-window document never rendered";
+        say("files select: --new-window still opens a window of its own");
+        reap(ed_pid, c.SIGTERM, 5000);
+        if (!waitWindowGone(app, w1, 15_000) or !waitWindowGone(app, w2, 15_000))
+            return "files select: the editor windows did not go away with the process";
+    }
+
+    // ── 5. an .html row opens in a web tab of the Files window ─────
+    if (have_web) {
+        if (filesHtmlOpenCheck(allocator, app, rt, main_sock, wl, false)) |why| return why;
+        if (remote_mux_pid > 0) {
+            if (filesHtmlOpenCheck(allocator, app, rt, main_sock, wl, true)) |why| return why;
+        } else {
+            say("files select: no fake-SSH daemon; the remote html check is skipped");
+        }
+    } else {
+        say("files select: no sketerm-webengine; the html check is skipped");
+    }
+
+    _ = app.drainLive(2_000);
+    return null;
+}
+
+/// "Open in Sketerm Browser" on an .html row of a Files window: the
+/// page must land in a web tab of that window, and for a REMOTE tab
+/// the view must be routed `on:` the file's host (a helper the remote
+/// daemon spawned), which is what lets file:// resolve there.
+fn filesHtmlOpenCheck(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    main_sock: [:0]const u8,
+    wl: [*:0]const u8,
+    remote: bool,
+) ?[]const u8 {
+    const label: []const u8 = if (remote) "remote html" else "html";
+    const row_name: []const u8 = if (remote) "PAGEREM" else "PAGEROW";
+    var hdir_buf: [512:0]u8 = undefined;
+    const hdir = std.fmt.bufPrintZ(&hdir_buf, "{s}/sel{s}", .{ rt, if (remote) "htmlr" else "html" }) catch return "files select: html dir";
+    _ = c.mkdir(hdir.ptr, 0o700);
+    var html_buf: [600:0]u8 = undefined;
+    const html = std.fmt.bufPrintZ(&html_buf, "{s}/{s}.html", .{ hdir, row_name }) catch return "files select: html path";
+    if (!writeFile(html, "<html><head><title>e2e-files-page</title></head><body style=\"background:#c02020\">page</body></html>"))
+        return "files select: html seed";
+    var spec_buf: [600:0]u8 = undefined;
+    const spec = std.fmt.bufPrintZ(&spec_buf, "{s}{s}", .{ if (remote) "localhost:" else "", hdir }) catch return "files select: html spec";
+    const hchild = launchRenameFiles(app, spec, if (remote) "selhtmlr" else "selhtml", "", wl) orelse
+        return if (remote) "files select: the remote html Files window never appeared" else "files select: the html Files window never appeared";
+    if (!viewerWaitOcr(allocator, app, hchild.win, row_name, 40_000))
+        return if (remote) "files select: the remote html listing never rendered" else "files select: the html listing never rendered";
+    _ = app.waitVisualSettle(hchild.win, 400, 10_000, 0.002, null);
+    // The control socket is found BEFORE the browser starts: a remote
+    // route's bootstrap keeps the GUI busy enough that a probe during
+    // it can miss its reply window.
+    var sock_buf: [512:0]u8 = undefined;
+    var waited: u32 = 0;
+    const hsock = while (waited < 30_000) : (waited += 100) {
+        if (findRenameControlSocket(allocator, rt, main_sock, &sock_buf)) |found| break found;
+        _ = app.pumpOnce(100);
+    } else return "files select: the html Files window's control socket never appeared";
+    if (openPopup(app) != null) return "files select: a popup was already open before the row menu";
+    if (!clickOcrWord(allocator, app, hchild.win, row_name, 3, 8_000))
+        return "files select: the html row could not be right-clicked";
+    const row_menu = waitPopup(app, true, 15_000) orelse
+        return "files select: right-clicking the html row opened no menu";
+    _ = app.waitVisualSettle(row_menu, 300, 5_000, 0.002, null);
+    if (!clickOcrWord(allocator, app, row_menu, "Browser", 1, 8_000)) {
+        viewerShot(allocator, app, row_menu, "files-select-rowmenu");
+        return "files select: the html row's menu offers no Open in Sketerm Browser";
+    }
+    var seen = false;
+    var t: u32 = 0;
+    var last_list: ?[]u8 = null;
+    defer if (last_list) |l| allocator.free(l);
+    var needle_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&needle_buf, "{s}.html", .{row_name}) catch return "fmt";
+    // A cold CEF start under load can take most of a minute; a remote
+    // helper adds the fake-SSH bootstrap on top.
+    while (t < 360 and !seen) : (t += 1) {
+        _ = app.pumpOnce(250);
+        const resp = roundtrip(allocator, hsock, "{\"cmd\":\"web-list\"}\n") orelse continue;
+        if (last_list) |l| allocator.free(l);
+        last_list = resp;
+        if (std.mem.indexOf(u8, resp, needle) != null) seen = true;
+    }
+    if (!seen) {
+        if (last_list) |l|
+            _ = c.fprintf(platform.stderr(), "smoke-e2e: last web-list: %.*s\n", @as(c_int, @intCast(l.len)), l.ptr);
+        viewerShot(allocator, app, hchild.win, if (remote) "files-select-html-remote" else "files-select-html");
+        return if (remote) "files select: no web view loaded the REMOTE html file" else "files select: no web view loaded the html file";
+    }
+    if (remote and std.mem.indexOf(u8, last_list.?, "\"route\":\"on:localhost\"") == null) {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: last web-list: %.*s\n", @as(c_int, @intCast(last_list.?.len)), last_list.?.ptr);
+        return "files select: the remote html view is not routed on: its host";
+    }
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: files select: Open in Sketerm Browser loaded the %.*s file in a web tab\n", @as(c_int, @intCast(label.len)), label.ptr);
+    // Two tabs make the window's close-request a confirmation; close
+    // the web pane first so the window closes plainly.
+    {
+        const web_pane = parseNumAfter(last_list.?, "\"pane\":") orelse
+            return "files select: web-list names no pane for the html view";
+        var close_buf: [128]u8 = undefined;
+        const close_req = std.fmt.bufPrint(&close_buf, "{{\"cmd\":\"close-pane\",\"pane\":{d}}}\n", .{web_pane}) catch return "fmt";
+        const closed = roundtrip(allocator, hsock, close_req) orelse return "files select: close-pane did not reply";
+        defer allocator.free(closed);
+        if (!mcpHas(closed, "\"ok\":true")) return "files select: closing the web pane was refused";
+        _ = app.pumpOnce(1_500);
+    }
+    if (!closeRenameFilesWithin(app, hchild, 45_000)) return "files select: the html Files window did not close cleanly";
     return null;
 }
 
