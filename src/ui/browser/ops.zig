@@ -184,12 +184,14 @@ fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void
 /// file managers paste the files themselves.
 ///
 /// Paste-into-self never reads GDK — it uses the internal board —
-/// so this is purely an export. Remote entries are skipped: their
-/// paths mean nothing to other local applications.
+/// so this is purely an export. Remote entries export their TEXT
+/// form only (the path on that host, which is what a paste into a
+/// terminal or editor wants); the file:// list is skipped for them
+/// because a local file manager would resolve it against this disk.
 fn exportClipToGdk(self: *BrowserView, tab: *BTab, cut: bool) void {
     const board = self.clipboard();
-    if (board.host != null) return;
     if (board.isEmpty()) return;
+    const local = board.host == null;
     const a = self.allocator;
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(a);
@@ -199,6 +201,7 @@ fn exportClipToGdk(self: *BrowserView, tab: *BTab, cut: bool) void {
     for (board.items(), 0..) |p, i| {
         if (i > 0) text.append(a, '\n') catch return;
         text.appendSlice(a, p) catch return;
+        if (!local) continue;
         const pz = a.dupeZ(u8, p) catch return;
         defer a.free(pz);
         const uri = c.g_filename_to_uri(pz.ptr, null, null) orelse continue;
@@ -211,12 +214,17 @@ fn exportClipToGdk(self: *BrowserView, tab: *BTab, cut: bool) void {
     // takes ownership of both providers; set_content refs the union,
     // so our own ref is dropped afterwards.
     const text_provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, text.items.ptr);
+    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.colview)));
+    if (!local) {
+        _ = c.gdk_clipboard_set_content(clip, text_provider);
+        c.g_object_unref(@as(?*anyopaque, @ptrCast(text_provider)));
+        return;
+    }
     const bytes = c.g_bytes_new(gnome.items.ptr, gnome.items.len);
     defer c.g_bytes_unref(bytes);
     const gnome_provider = c.gdk_content_provider_new_for_bytes("x-special/gnome-copied-files", bytes);
     var providers = [_]?*c.GdkContentProvider{ gnome_provider, text_provider };
     const both = c.gdk_content_provider_new_union(&providers, providers.len);
-    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.colview)));
     _ = c.gdk_clipboard_set_content(clip, both);
     c.g_object_unref(@as(?*anyopaque, @ptrCast(both)));
 }
