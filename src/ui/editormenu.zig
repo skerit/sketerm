@@ -615,7 +615,7 @@ fn menuNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) void {
     const view = cast.userData(EditorView, ctx);
     const tab = tabForPage(view, page) orelse return;
     const spec = tab.spec orelse return;
-    _ = siblingapp.openInEditor(spec, null);
+    _ = siblingapp.openInEditor(spec, null, .{ .new_window = true });
 }
 
 fn menuCanNewWindow(ctx: ?*anyopaque, page: *c.GtkWidget) bool {

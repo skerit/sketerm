@@ -129,6 +129,32 @@ pub const EditorWindow = struct {
         return self;
     }
 
+    /// The editor window a repeat launch should add its documents to:
+    /// the one in front (GTK keeps `gtk_application_get_windows` most
+    /// recently focused first), skipping windows already on their way
+    /// out. Null when the application has no live editor window.
+    pub fn find(app: ?*c.GtkApplication) ?*EditorWindow {
+        var it = c.gtk_application_get_windows(app);
+        while (it != null) : (it = it.*.next) {
+            const window: *c.GtkWidget = @ptrCast(@alignCast(it.*.data orelse continue));
+            const data = c.g_object_get_data(@ptrCast(window), EDITOR_QDATA) orelse continue;
+            const self: *EditorWindow = @ptrCast(@alignCast(data));
+            if (self.destroyed or self.closing) continue;
+            return self;
+        }
+        return null;
+    }
+
+    /// Open `req`'s documents as tabs of this window and bring it to
+    /// the front. `req` is borrowed, exactly as in `open`.
+    pub fn openMore(self: *EditorWindow, req: model.Request) void {
+        for (req.specs) |spec| self.view.openSpec(spec, null);
+        if (req.position) |pos| self.armGoto(pos);
+        self.syncTitle();
+        c.gtk_window_present(@ptrCast(self.window));
+        _ = c.gtk_widget_grab_focus(@ptrCast(self.view.area));
+    }
+
     // ---- chrome ------------------------------------------------------
 
     fn buildChrome(self: *EditorWindow) void {

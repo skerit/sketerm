@@ -117,7 +117,9 @@ const EDIT_HELP =
     \\                         those documents. Files may be /path,
     \\                         host:/path or file:// URIs; remote files
     \\                         load and save through the daemon.
-    \\                         --line N[:col] places the caret.
+    \\                         --line N[:col] places the caret. While an
+    \\                         editor window is open the files become
+    \\                         tabs of it; --new-window opens another.
     \\  sketerm edit --here|--tab [files...]
     \\                         Editor face in the pane you typed this
     \\                         in (--here) or a new tab of that pane's
@@ -1031,7 +1033,17 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     if (g_app.mode == .editor) {
         var req = takeEditorRequest();
         defer req.deinit();
-        _ = @import("ui/editorwin.zig").EditorWindow.open(g_app.allocator, app, req, g_app.config_path) catch |err|
+        const EditorWindow = @import("ui/editorwin.zig").EditorWindow;
+        // Documents named on a repeat launch join the window that is
+        // already open, the way one editor behaves; only a bare launch
+        // or an explicit --new-window makes another.
+        if (req.specs.len > 0 and !req.new_window) {
+            if (EditorWindow.find(app)) |existing| {
+                existing.openMore(req);
+                return;
+            }
+        }
+        _ = EditorWindow.open(g_app.allocator, app, req, g_app.config_path) catch |err|
             std.debug.print("sketerm: editor window failed: {s}\n", .{@errorName(err)});
         return;
     }

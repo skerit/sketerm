@@ -1048,7 +1048,7 @@ pub fn onMenuEditorWindow(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void 
     @memcpy(copy_buf[0..spec.len], spec);
     const copied = copy_buf[0..spec.len];
     menuDone(ctx);
-    if (!@import("../siblingapp.zig").openInEditor(copied, null))
+    if (!@import("../siblingapp.zig").openInEditor(copied, null, .{}))
         self.setStatus("could not launch Sketerm Editor");
 }
 

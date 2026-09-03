@@ -45,6 +45,9 @@ pub const Request = struct {
     position: ?Position = null,
     /// `--help` / `-h`: print usage and do nothing else.
     help: bool = false,
+    /// `--new-window`: a window of its own even while an editor window
+    /// is already open (the default puts the documents in that one).
+    new_window: bool = false,
 
     pub fn empty(allocator: std.mem.Allocator) Request {
         return .{ .allocator = allocator };
@@ -111,6 +114,10 @@ pub fn collect(allocator: std.mem.Allocator, args: []const []const u8, cwd: ?[]c
             }
             if (std.mem.eql(u8, arg, "--window")) {
                 req.mode = .window;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--new-window")) {
+                req.new_window = true;
                 continue;
             }
             if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {

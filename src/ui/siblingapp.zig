@@ -51,18 +51,34 @@ fn spawnSibling(binary: []const u8, subcommand: [*:0]const u8, args: []const [*:
     return true;
 }
 
-/// Open `spec` in a standalone Sketerm Editor window, optionally with
-/// the caret at 1-based `line`.
-pub fn openInEditor(spec: []const u8, line: ?usize) bool {
+pub const EditorOpen = struct {
+    /// Insist on a window of its own. Without it the running Sketerm
+    /// Editor instance adds the document as a tab of its window.
+    new_window: bool = false,
+};
+
+/// Open `spec` in the Sketerm Editor application, optionally with the
+/// caret at 1-based `line`: a tab of the running instance's window,
+/// or a fresh window when there is none or `opts.new_window` asks.
+pub fn openInEditor(spec: []const u8, line: ?usize, opts: EditorOpen) bool {
     if (spec.len >= 4096) return false;
     var spec_buf: [4096:0]u8 = undefined;
     const spec_z = std.fmt.bufPrintZ(&spec_buf, "{s}", .{spec}) catch return false;
     var line_buf: [32:0]u8 = undefined;
-    if (line) |n| {
-        const line_z = std.fmt.bufPrintZ(&line_buf, "--line={d}", .{n}) catch return false;
-        return spawnSibling("sketerm-editor", "edit", &.{ line_z.ptr, spec_z.ptr });
+    var args: [4][*:0]const u8 = undefined;
+    var n: usize = 0;
+    if (opts.new_window) {
+        args[n] = "--new-window";
+        n += 1;
     }
-    return spawnSibling("sketerm-editor", "edit", &.{spec_z.ptr});
+    if (line) |l| {
+        const line_z = std.fmt.bufPrintZ(&line_buf, "--line={d}", .{l}) catch return false;
+        args[n] = line_z.ptr;
+        n += 1;
+    }
+    args[n] = spec_z.ptr;
+    n += 1;
+    return spawnSibling("sketerm-editor", "edit", args[0..n]);
 }
 
 /// Show `spec` (a file) selected inside a Sketerm Files window.
