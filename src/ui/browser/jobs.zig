@@ -501,6 +501,7 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
         .batch_total = retry.batch_total,
         .dest_key = retry.dest_key,
         .retry = retry,
+        .select_dst = true,
     };
     pj.paths.set(retry.src_path, retry.dst_path);
     self.pending_jobs.append(self.allocator, pj) catch {
@@ -1785,6 +1786,21 @@ pub fn anyRunning(self: *BrowserView) bool {
     return false;
 }
 
+/// A copy/move job landed: its destination becomes the selection of
+/// the tabs showing that folder. A cross-host copy's row belongs to
+/// the COORDINATOR, so the destination host comes from its retry
+/// record, never from `row.hc`. The batch id groups the members of
+/// one paste so they accumulate instead of replacing each other.
+fn selectJobDestination(self: *BrowserView, row: *JobRow) void {
+    const batch = if (row.batch_id != 0) row.batch_id else row.job;
+    if (row.retry) |retry| {
+        self.queueSelectOnHost(retry.dst_hc, retry.dst_path, batch);
+        return;
+    }
+    const dst = row.paths.dstFull() orelse return;
+    self.queueSelectOnHost(row.hc, dst, batch);
+}
+
 /// Job progress / completion → jobs panel + status bar (deltas
 /// already update the listing itself when the result lands).
 pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
@@ -1883,6 +1899,7 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
             self.setStatus("copy completed, but its durable acknowledgment could not be saved");
         refreshJobFreeSpace(self, row);
         self.setStatusFmt("done: {s}", .{row.label});
+        if (row.select_dst) selectJobDestination(self, row);
         if (row.undo_op) |u| {
             row.undo_op = null;
             self.pushUndo(u);
@@ -2063,6 +2080,7 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
         .batch_id = mode.batch_id,
         .batch_total = mode.batch_total,
         .undo_op = undo,
+        .select_dst = true,
     };
     pj.paths.set(path, to);
     self.pending_jobs.append(self.allocator, pj) catch {

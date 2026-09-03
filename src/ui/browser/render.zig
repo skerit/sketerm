@@ -227,6 +227,7 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     // the summary yields while one runs instead of the two alternating.
     if (!@import("jobs.zig").anyRunning(self)) self.setStatus(cmsg);
     applyPendingReveal(self, tab);
+    applyPendingSelect(self, tab);
 
     // Fetching runs LAST: the rows it measures against are the ones
     // just built, and the request itself is coalesced behind a timer.
@@ -269,6 +270,98 @@ fn applyPendingReveal(self: *BrowserView, tab: *BTab) void {
     tab.pending_reveal = null;
     if (tab.pending_reveal_host) |host| self.allocator.free(host);
     tab.pending_reveal_host = null;
+}
+
+/// Move every queued path the listing now carries into the selection
+/// and push it to the widgets (`BrowserView.queueSelectOnHost`). Paths
+/// still missing wait for the next render until the grace runs out;
+/// a path whose folder is no longer this tab's root is dropped.
+pub fn applyPendingSelect(self: *BrowserView, tab: *BTab) void {
+    if (tab.pending_select.items.len == 0) return;
+    const a = self.allocator;
+    const expired = clock.nowMs() > tab.pending_select_until_ms;
+    var first_landed: ?[]const u8 = null;
+    var i: usize = 0;
+    while (i < tab.pending_select.items.len) {
+        const path = tab.pending_select.items[i];
+        const parent = std.fs.path.dirname(path) orelse "/";
+        const present = std.mem.eql(u8, parent, tab.root.path) and listingHasPath(tab, path);
+        if (!present) {
+            if (expired or !std.mem.eql(u8, parent, tab.root.path)) {
+                a.free(tab.pending_select.orderedRemove(i));
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        const landed = tab.pending_select.orderedRemove(i);
+        const already = for (tab.selected.items) |sp| {
+            if (std.mem.eql(u8, sp, landed)) break true;
+        } else false;
+        if (already) {
+            a.free(landed);
+            continue;
+        }
+        tab.selected.append(a, landed) catch {
+            a.free(landed);
+            continue;
+        };
+        if (first_landed == null) first_landed = tab.selected.items[tab.selected.items.len - 1];
+    }
+    // Pushing the selection re-syncs the mirror (selection-changed ->
+    // syncSelectedMirror rebuilds `tab.selected`), so the landed path
+    // is copied out before the widgets hear about it.
+    var first_buf: [4096]u8 = undefined;
+    const first_src = first_landed orelse return;
+    if (first_src.len > first_buf.len) return;
+    @memcpy(first_buf[0..first_src.len], first_src);
+    const first = first_buf[0..first_src.len];
+    switch (tab.view_mode) {
+        .details, .compact, .miller => {
+            const colview = @import("colview.zig");
+            colview.syncSelectionFromPaths(tab);
+            if (colview.positionForPath(tab, first)) |pos|
+                c.gtk_column_view_scroll_to(tab.colview, pos, null, c.GTK_LIST_SCROLL_FOCUS, null);
+        },
+        .icons => {
+            const flowbox = tab.flowbox orelse return;
+            var index: c_int = 0;
+            while (c.gtk_flow_box_get_child_at_index(flowbox, index)) |child| : (index += 1) {
+                const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse continue;
+                const row: *RowCtx = @ptrCast(@alignCast(data));
+                const wanted = for (tab.selected.items) |sp| {
+                    if (std.mem.eql(u8, sp, row.path)) break true;
+                } else false;
+                if (wanted) {
+                    c.gtk_flow_box_select_child(flowbox, child);
+                } else {
+                    c.gtk_flow_box_unselect_child(flowbox, child);
+                }
+            }
+        },
+    }
+    if (tab.selected.items.len == 1) {
+        self.setStatusFmt("selected {s}", .{std.fs.path.basename(first)});
+    } else {
+        self.setStatusFmt("selected {d} items", .{tab.selected.items.len});
+    }
+}
+
+/// Does the rendered listing (any view mode) carry an entry at `path`?
+fn listingHasPath(tab: *BTab, path: []const u8) bool {
+    switch (tab.view_mode) {
+        .details, .compact, .miller => return @import("colview.zig").positionForPath(tab, path) != null,
+        .icons => {
+            const flowbox = tab.flowbox orelse return false;
+            var index: c_int = 0;
+            while (c.gtk_flow_box_get_child_at_index(flowbox, index)) |child| : (index += 1) {
+                const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse continue;
+                const row: *RowCtx = @ptrCast(@alignCast(data));
+                if (std.mem.eql(u8, row.path, path)) return true;
+            }
+            return false;
+        },
+    }
 }
 
 fn revealMissing(self: *BrowserView, tab: *BTab, path: []u8) void {

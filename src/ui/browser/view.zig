@@ -1111,6 +1111,41 @@ pub const BrowserView = struct {
         self.focusListing();
     }
 
+    /// Select `path` (a full path on `hc`) in every tab of this view
+    /// showing its parent folder, now if the listing already carries
+    /// it, otherwise as soon as it does (bounded by
+    /// `SELECT_GRACE_MS`). `batch` groups paths that belong to one
+    /// gesture: a different batch replaces the selection, the same one
+    /// adds to it.
+    pub fn queueSelectOnHost(self: *BrowserView, hc: *HostConn, path: []const u8, batch: u64) void {
+        const parent = std.fs.path.dirname(path) orelse return;
+        for (self.tabs.items) |tab| {
+            if (tab.hc != hc) continue;
+            if (!std.mem.eql(u8, tab.root.path, parent)) continue;
+            if (tab.pending_select_batch != batch) {
+                tab.pending_select_batch = batch;
+                for (tab.pending_select.items) |p| self.allocator.free(p);
+                tab.pending_select.clearRetainingCapacity();
+                for (tab.selected.items) |p| self.allocator.free(p);
+                tab.selected.clearRetainingCapacity();
+            }
+            const owned = self.allocator.dupe(u8, path) catch continue;
+            tab.pending_select.append(self.allocator, owned) catch {
+                self.allocator.free(owned);
+                continue;
+            };
+            tab.pending_select_until_ms = @import("../../util/clock.zig").nowMs() + SELECT_GRACE_MS;
+            @import("render.zig").applyPendingSelect(self, tab);
+        }
+    }
+
+    /// How long a queued selection waits for its entry's listing
+    /// delta. A watch delta follows the mutation within milliseconds
+    /// locally and within a round trip remotely; a folder whose watch
+    /// is dead never delivers one, and the grace keeps that from
+    /// pinning a stale path forever.
+    pub const SELECT_GRACE_MS: i64 = 15_000;
+
     /// Select a host-qualified file once the current streamed listing contains it.
     pub fn queueReveal(self: *BrowserView, spec: []const u8) void {
         const tab = self.currentTab() orelse return;

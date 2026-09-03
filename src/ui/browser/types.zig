@@ -719,6 +719,19 @@ pub const BTab = struct {
     /// Full path selected once it appears in a streamed listing.
     pending_reveal: ?[]u8 = null,
     pending_reveal_host: ?[]u8 = null,
+    /// Entries this tab's own mutations just produced (a created
+    /// folder, pasted files), selected as each one lands in the
+    /// listing; owned full paths on this tab's host. The watch delta
+    /// that carries the entry may arrive before or after the reply
+    /// that names it, so the list is applied on every render until
+    /// `pending_select_until_ms` passes.
+    pending_select: std.ArrayList([]u8) = .empty,
+    pending_select_until_ms: i64 = 0,
+    /// The batch the pending list belongs to: a new batch REPLACES the
+    /// selection, a member of the same batch accumulates into it, so a
+    /// five-file paste ends with all five selected rather than the
+    /// last one.
+    pending_select_batch: u64 = 0,
     /// Selection captured on button-down before GTK collapses it while
     /// deciding whether the gesture becomes a click or a drag.
     drag_selected: std.ArrayList([]u8) = .empty,
@@ -1029,6 +1042,8 @@ pub const BTab = struct {
         self.selected.deinit(a);
         if (self.pending_reveal) |path| a.free(path);
         if (self.pending_reveal_host) |host| a.free(host);
+        for (self.pending_select.items) |p| a.free(p);
+        self.pending_select.deinit(a);
         for (self.drag_selected.items) |p| a.free(p);
         self.drag_selected.deinit(a);
         for (self.attr_columns.items) |name| a.free(name);
@@ -1169,10 +1184,14 @@ pub const JobPaths = struct {
     src_len: u16 = 0,
     dst: [512]u8 = undefined,
     dst_len: u16 = 0,
+    /// The destination did not fit and `dst` holds its "..."-prefixed
+    /// tail: fine for a panel label, useless as a path.
+    dst_truncated: bool = false,
 
     pub fn set(self: *JobPaths, src: []const u8, dst: []const u8) void {
         self.src_len = copyTail(&self.src, src);
         self.dst_len = copyTail(&self.dst, dst);
+        self.dst_truncated = dst.len > self.dst.len;
     }
 
     pub fn srcPath(self: *const JobPaths) []const u8 {
@@ -1181,6 +1200,12 @@ pub const JobPaths = struct {
 
     pub fn dstPath(self: *const JobPaths) []const u8 {
         return self.dst[0..self.dst_len];
+    }
+
+    /// The destination as a usable path, or null when it was truncated.
+    pub fn dstFull(self: *const JobPaths) ?[]const u8 {
+        if (self.dst_truncated or self.dst_len == 0) return null;
+        return self.dstPath();
     }
 
     pub fn copyTail(buf: *[512]u8, text: []const u8) u16 {
@@ -1225,6 +1250,10 @@ pub const JobRow = struct {
     history_direction: ?HistoryDirection = null,
     /// Source and destination, for the panel's expanded detail.
     paths: JobPaths = .{},
+    /// The destination is an entry the user just put somewhere (a
+    /// paste, a drop): select it in the tabs showing its folder when
+    /// the job lands.
+    select_dst: bool = false,
     /// Destination identity for cross-host copies started by the
     /// transfer queue (0 = this job does not hold a destination slot).
     dest_key: u64 = 0,
@@ -1288,6 +1317,7 @@ pub const PendingJob = struct {
     history_direction: ?HistoryDirection = null,
     /// Carried onto the JobRow when the daemon answers with the id.
     paths: JobPaths = .{},
+    select_dst: bool = false,
     dest_key: u64 = 0,
     /// Cross-host copies only; moves onto the JobRow with the id.
     retry: ?*CopyRetry = null,

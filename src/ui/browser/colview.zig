@@ -1437,6 +1437,15 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
     tab.backing_fence.rebound();
 
     // Restore the path selection onto the new items.
+    syncSelectionFromPaths(tab);
+
+    if (keep_scroll) |value| restoreScroll(tab, value);
+}
+
+/// Push `tab.selected` (the path mirror) onto the GTK selection:
+/// exactly the rows whose path is in the mirror end up selected. The
+/// inverse of `syncSelectedMirror`.
+pub fn syncSelectionFromPaths(tab: *BTab) void {
     const want = c.gtk_bitset_new_empty() orelse return;
     defer c.gtk_bitset_unref(want);
     const n = itemCount(tab);
@@ -1452,8 +1461,6 @@ pub fn renderList(self: *BrowserView, tab: *BTab) void {
         }
     }
     setSelection(tab, want);
-
-    if (keep_scroll) |value| restoreScroll(tab, value);
 }
 
 /// May the row at this store position keep its GObject for this new

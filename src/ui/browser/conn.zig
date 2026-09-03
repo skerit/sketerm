@@ -1329,6 +1329,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 .history_op = pj.history_op,
                 .history_direction = pj.history_direction,
                 .paths = pj.paths,
+                .select_dst = pj.select_dst,
                 .dest_key = pj.dest_key,
                 .retry = pj.retry,
             };
@@ -1398,6 +1399,17 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     for (self.pending_undo.items, 0..) |pu, i| {
         if (pu.req != rep.req) continue;
         if (rep.ok) {
+            // The entry this mutation produced (`a` for every kind
+            // that creates or renames one) becomes the selection of
+            // the tabs showing its folder, so a new folder is where
+            // the next keystroke acts and a rename keeps its row.
+            switch (pu.op.kind) {
+                .rmdir_created, .delete_created, .link_created, .rename_back => {
+                    if (self.hostConnFor(if (pu.op.host) |h| @as(?[]const u8, h) else null)) |op_hc|
+                        self.queueSelectOnHost(op_hc, pu.op.a, rep.req);
+                },
+                .trash_restore => {},
+            }
             self.pushUndo(pu.op);
         } else if (std.mem.eql(u8, rep.@"error", "XDEV") and pu.op.kind == .rename_back) {
             const move_hc = self.hostConnFor(if (pu.op.host) |host| @as(?[]const u8, host) else null);
