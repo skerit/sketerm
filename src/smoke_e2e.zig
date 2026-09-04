@@ -648,7 +648,11 @@ pub fn main() u8 {
         _ = c.mkdir(cfg_dir.ptr, 0o700);
         var cfg_buf: [320:0]u8 = undefined;
         const cfg = std.fmt.bufPrintZ(&cfg_buf, "{s}/config.conf", .{cfg_dir}) catch return fail("config path");
-        if (!writeFile(cfg, "# smoke-e2e\napp_view = window\n")) return fail("could not write the isolated config.conf");
+        const config_text = if (c.getenv("SKETERM_SMOKE_E2E_FILES_ICONS") != null)
+            "# smoke-e2e\napp_view = window\nfiles_default_view = icons\n"
+        else
+            "# smoke-e2e\napp_view = window\n";
+        if (!writeFile(cfg, config_text)) return fail("could not write the isolated config.conf");
     }
 
     // Spawn the freshly-built binary with its own app id so it
@@ -839,8 +843,7 @@ pub fn main() u8 {
         // the helper the same way before the stage proper.
         if (app.windows.items.len == 0) return fail("focused browser-action smoke lost its window");
         app.focusWindow(app.windows.items[0].id) catch return fail("focused browser-action smoke could not focus the window");
-        if (roundtrip(allocator, sock_path, "{\"cmd\":\"web-open\",\"target\":\"tab\"}\n")) |r| allocator.free(r) else
-            return fail("focused browser-action smoke could not warm the browser helper");
+        if (roundtrip(allocator, sock_path, "{\"cmd\":\"web-open\",\"target\":\"tab\"}\n")) |r| allocator.free(r) else return fail("focused browser-action smoke could not warm the browser helper");
         var warm_tries: u32 = 0;
         while (warm_tries < 600) : (warm_tries += 1) {
             const list = roundtrip(allocator, sock_path, "{\"cmd\":\"web-list\"}\n") orelse continue;
@@ -3509,8 +3512,7 @@ fn assistantWebWatchStage(allocator: std.mem.Allocator, app: *appdrive.App, sock
     // The page: red, and a trusted click turns it lime and renames it.
     var page_buf: [512:0]u8 = undefined;
     const page = std.fmt.bufPrintZ(&page_buf, "{s}/watch-page.html", .{rt}) catch return "watch page path";
-    if (!writeFile(page,
-        "<html><head><title>watch:red</title><style>html,body{margin:0;min-height:100vh;background:red}</style></head>" ++
+    if (!writeFile(page, "<html><head><title>watch:red</title><style>html,body{margin:0;min-height:100vh;background:red}</style></head>" ++
         "<body onclick=\"document.body.style.background='lime';document.title='watch:clicked:'+event.clientX+':'+event.clientY+':'+innerWidth+':'+innerHeight\">watch</body></html>"))
         return "could not write the watch page";
 
@@ -5684,8 +5686,8 @@ fn viewerCastStage(
         if (fpid < 0) break :blk false;
         if (fpid == 0) {
             const argv = [_:null]?[*:0]const u8{
-                "ffmpeg", "-nostdin", "-y",       "-v",          "error", "-f",         "lavfi",  "-i",       "color=c=0xFF8000:s=320x240:d=3:r=15",
-                "-c:v",   "libx264",  "-preset",  "ultrafast",   "-pix_fmt", "yuv420p", vid_path.ptr, null,
+                "ffmpeg", "-nostdin", "-y",      "-v",        "error",    "-f",      "lavfi",      "-i", "color=c=0xFF8000:s=320x240:d=3:r=15",
+                "-c:v",   "libx264",  "-preset", "ultrafast", "-pix_fmt", "yuv420p", vid_path.ptr, null,
             };
             _ = c.execvp("ffmpeg", @ptrCast(@constCast(&argv)));
             c._exit(127);
@@ -6065,16 +6067,22 @@ fn closeRenameFiles(app: *appdrive.App, child: RenameFilesChild) bool {
 /// so the profile flushes), which can outlast the default.
 fn closeRenameFilesWithin(app: *appdrive.App, child: RenameFilesChild, exit_ms: i64) bool {
     app.closeWindow(child.win) catch return false;
-    if (!waitWindowGone(app, child.win, 15_000)) return false;
+    if (!waitWindowGone(app, child.win, 15_000)) {
+        _ = c.fprintf(platform.stderr(), "smoke-e2e: Files window %u stayed visible after close\n", child.win);
+        return false;
+    }
     var status: c_int = 0;
     const deadline = clock.nowMs() + exit_ms;
     while (clock.nowMs() < deadline) {
         if (c.waitpid(child.pid, &status, c.WNOHANG) == child.pid) {
             renamefiles_pid = -1;
+            if (!c.WIFEXITED(status) or c.WEXITSTATUS(status) != 0)
+                _ = c.fprintf(platform.stderr(), "smoke-e2e: Files process %d exited with wait status %d\n", child.pid, status);
             return c.WIFEXITED(status) and c.WEXITSTATUS(status) == 0;
         }
         _ = c.usleep(100_000);
     }
+    _ = c.fprintf(platform.stderr(), "smoke-e2e: Files process %d did not exit after its window closed\n", child.pid);
     return false;
 }
 
@@ -6535,6 +6543,12 @@ fn filesMutationSelectStage(
     // Delta, throttled render, selection. Then F2 acts on the
     // selection alone — nothing has been clicked since.
     pumpRenameFor(app, 1_500);
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_ICONS") != null) {
+        var update_buf: [600:0]u8 = undefined;
+        const update = std.fmt.bufPrintZ(&update_buf, "{s}/ZZZUPDATE.txt", .{dir}) catch return "icon update path";
+        if (!writeFile(update, "unrelated listing update\n")) return "icon update write";
+        pumpRenameFor(app, 1_000);
+    }
     app.pressKey(child.win, "F2") catch return "files select: F2 failed";
     pumpRenameFor(app, 400);
     app.typeText(child.win, "RENAMED") catch return "files select: typing the new name failed";
@@ -6806,6 +6820,40 @@ fn filesHtmlOpenCheck(
     if (remote and std.mem.indexOf(u8, last_list.?, "\"route\":\"on:localhost\"") == null) {
         _ = c.fprintf(platform.stderr(), "smoke-e2e: last web-list: %.*s\n", @as(c_int, @intCast(last_list.?.len)), last_list.?.ptr);
         return "files select: the remote html view is not routed on: its host";
+    }
+    if (remote) {
+        const web_pane = parseNumAfter(last_list.?, "\"pane\":") orelse return "remote download: no pane";
+        var dst_buf: [640:0]u8 = undefined;
+        const dst = std.fmt.bufPrintZ(&dst_buf, "{s}/remote-download#1.bin", .{rt}) catch return "remote download path";
+        var req_buf: [1024]u8 = undefined;
+        const request = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-download\",\"pane\":{d},\"data\":\"data:application/octet-stream,REMOTE-DOWNLOAD\",\"path\":\"{s}\"}}\n", .{ web_pane, dst }) catch return "remote download request";
+        const started = roundtrip(allocator, hsock, request) orelse return "remote download start timed out";
+        defer allocator.free(started);
+        if (parseNumAfter(started, "\"req\":") == null) return "remote browser refused download delivery";
+        var list_buf: [128]u8 = undefined;
+        const list = std.fmt.bufPrint(&list_buf, "{{\"cmd\":\"web-downloads\",\"pane\":{d}}}\n", .{web_pane}) catch return "remote download list";
+        const deadline = clock.nowMs() + 60_000;
+        var done = false;
+        while (clock.nowMs() < deadline) {
+            _ = app.pumpOnce(100);
+            const progress = roundtrip(allocator, hsock, list) orelse continue;
+            defer allocator.free(progress);
+            if (mcpHas(progress, "\"state\":\"done\"")) {
+                done = true;
+                break;
+            }
+            if (mcpHas(progress, "\"state\":\"failed\"")) {
+                _ = c.fprintf(platform.stderr(), "remote download failure: %.*s\n", @as(c_int, @intCast(progress.len)), progress.ptr);
+                return "remote download delivery failed";
+            }
+        }
+        if (!done) return "remote download delivery did not finish";
+        const file = c.fopen(dst.ptr, "rb") orelse return "remote download reported success without a local file";
+        var bytes: [64]u8 = undefined;
+        const count = c.fread(&bytes, 1, bytes.len, file);
+        _ = c.fclose(file);
+        if (!std.mem.eql(u8, bytes[0..count], "REMOTE-DOWNLOAD")) return "remote download bytes differ";
+        say("remote browser download staged on its host and delivered to the selected local path");
     }
     _ = c.fprintf(platform.stderr(), "smoke-e2e: files select: Open in Sketerm Browser loaded the %.*s file in a web tab\n", @as(c_int, @intCast(label.len)), label.ptr);
     // Two tabs make the window's close-request a confirmation; close

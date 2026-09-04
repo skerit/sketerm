@@ -970,25 +970,114 @@ pub fn renderGrid(self: *BrowserView, tab: *BTab) void {
     c.gtk_widget_set_visible(tab.flow_scroller.?, 1);
     tab.rendering = true;
     defer tab.rendering = false;
-    while (c.gtk_flow_box_get_child_at_index(fb, 0)) |child| {
-        c.gtk_flow_box_remove(fb, @ptrCast(child));
+    // Keep tile identity through streamed updates. Paths and presentation
+    // stamps are owned by RowCtx, never borrowed from the mutable listing.
+    var retained: std.StringHashMap(*c.GtkFlowBoxChild) = .init(self.allocator);
+    defer retained.deinit();
+    var desired: std.StringHashMap(u64) = .init(self.allocator);
+    defer {
+        var keys = desired.keyIterator();
+        while (keys.next()) |key| self.allocator.free(key.*);
+        desired.deinit();
     }
     for (tab.root.entries.items) |e| {
         if (!views.entryVisible(tab, e)) continue;
-        self.appendTile(tab, fb, e);
+        var full_buf: [4096]u8 = undefined;
+        const full = tab.root.fullPath(e, &full_buf) orelse continue;
+        const owned = self.allocator.dupe(u8, full) catch return;
+        desired.put(owned, tileStamp(self, tab, e)) catch {
+            self.allocator.free(owned);
+            return;
+        };
+    }
+    var child_widget = c.gtk_widget_get_first_child(@ptrCast(@alignCast(fb)));
+    while (child_widget) |widget| {
+        child_widget = c.gtk_widget_get_next_sibling(widget);
+        const data = c.g_object_get_data(@ptrCast(widget), "sketerm-row");
+        const ctx: ?*RowCtx = if (data) |ptr| @ptrCast(@alignCast(ptr)) else null;
+        if (ctx) |row| {
+            if (desired.get(row.path)) |stamp| {
+                if (stamp == row.tile_stamp) {
+                    retained.put(row.path, @ptrCast(widget)) catch return;
+                    continue;
+                }
+            }
+        }
+        c.gtk_flow_box_remove(fb, widget);
+    }
+    var position: c_int = 0;
+    for (tab.root.entries.items) |e| {
+        if (!views.entryVisible(tab, e)) continue;
+        var full_buf: [4096]u8 = undefined;
+        const full = tab.root.fullPath(e, &full_buf) orelse continue;
+        if (retained.get(full)) |child| {
+            if (c.gtk_flow_box_child_get_index(child) != position) {
+                _ = c.g_object_ref(child);
+                c.gtk_flow_box_remove(fb, @ptrCast(@alignCast(child)));
+                c.gtk_flow_box_insert(fb, @ptrCast(@alignCast(child)), position);
+                c.g_object_unref(child);
+            }
+        } else {
+            insertTile(self, tab, fb, e, position);
+        }
+        position += 1;
     }
     // Restore selection.
     var i: c_int = 0;
     while (c.gtk_flow_box_get_child_at_index(fb, i)) |child| : (i += 1) {
         const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse continue;
         const ctx: *RowCtx = @ptrCast(@alignCast(data));
+        var selected = false;
         for (tab.selected.items) |path| {
             if (std.mem.eql(u8, path, ctx.path)) {
-                c.gtk_flow_box_select_child(fb, child);
+                selected = true;
                 break;
             }
         }
+        if (selected) c.gtk_flow_box_select_child(fb, child) else c.gtk_flow_box_unselect_child(fb, child);
     }
+}
+
+fn tileStamp(self: *BrowserView, tab: *BTab, e: Entry) u64 {
+    var hash = std.hash.Wyhash.init(0);
+    hash.update(tab.hc.host orelse "");
+    hash.update(e.name);
+    hash.update(e.kind);
+    std.hash.autoHash(&hash, e.tdir);
+    std.hash.autoHash(&hash, tab.vs.step().tile_px);
+    std.hash.autoHash(&hash, tab.vs.step().tile_icon_px);
+    // Content changes must invalidate an already-decoded thumbnail too.
+    std.hash.autoHash(&hash, e.size);
+    std.hash.autoHash(&hash, e.mtime_ms);
+    if (self.gitBadgeFor(tab, tab.root, e)) |badge| {
+        hash.update(badge.text());
+        hash.update(badge.css);
+        std.hash.autoHash(&hash, badge.dim_name);
+    }
+    return hash.final();
+}
+
+test "icon presentation ignores count updates but invalidates changed content, zoom and host" {
+    const types = @import("types.zig");
+    const gitstatus = @import("../../filebrowser/gitstatus.zig");
+    var view: BrowserView = .{ .allocator = std.testing.allocator };
+    view.git = gitstatus.Overlay.init(std.testing.allocator);
+    defer view.git.deinit();
+    var host: types.HostConn = .{ .view = &view, .host = null };
+    var dir: types.Dir = undefined; // an empty git overlay never consults it
+    var tab: BTab = .{ .view = &view, .hc = &host, .root = &dir, .page = undefined, .listing_box = undefined, .colview = undefined, .tab_label = undefined };
+    var entry: Entry = .{ .name = @constCast("photo.png"), .kind = @constCast("file"), .size = 10, .mode = 0, .mtime_ms = 1, .target = null, .tdir = false };
+    const initial = tileStamp(&view, &tab, entry);
+    entry.children = 100;
+    try std.testing.expectEqual(initial, tileStamp(&view, &tab, entry));
+    entry.mtime_ms += 1;
+    try std.testing.expect(initial != tileStamp(&view, &tab, entry));
+    entry.mtime_ms -= 1;
+    tab.vs.zoom += 1;
+    try std.testing.expect(initial != tileStamp(&view, &tab, entry));
+    tab.vs.zoom -= 1;
+    host.host = @constCast("server");
+    try std.testing.expect(initial != tileStamp(&view, &tab, entry));
 }
 
 /// Make an entry widget (list row or grid tile) a drag source
@@ -1025,8 +1114,23 @@ fn onGridDrop(target: *c.GtkDropTarget, value: *c.GValue, x: f64, y: f64, user: 
 }
 
 pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) void {
+    insertTile(self, tab, fb, e, -1);
+}
+
+fn insertTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry, position: c_int) void {
     var full_buf: [4096]u8 = undefined;
     const full = tab.root.fullPath(e, &full_buf) orelse return;
+    const ctx = self.allocator.create(RowCtx) catch return;
+    ctx.* = .{
+        .allocator = self.allocator,
+        .tab = tab,
+        .path = self.allocator.dupe(u8, full) catch {
+            self.allocator.destroy(ctx);
+            return;
+        },
+        .is_dir = e.tdir,
+        .tile_stamp = tileStamp(self, tab, e),
+    };
 
     const step = tab.vs.step();
     const tile = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 4);
@@ -1085,23 +1189,13 @@ pub fn appendTile(self: *BrowserView, tab: *BTab, fb: *c.GtkFlowBox, e: Entry) v
 
     const child = c.gtk_flow_box_child_new();
     c.gtk_flow_box_child_set_child(@ptrCast(child), tile);
-    const ctx = self.allocator.create(RowCtx) catch return;
-    ctx.* = .{
-        .allocator = self.allocator,
-        .tab = tab,
-        .path = self.allocator.dupe(u8, full) catch {
-            self.allocator.destroy(ctx);
-            return;
-        },
-        .is_dir = e.tdir,
-    };
     c.g_object_set_data_full(@ptrCast(child), "sketerm-row", @ptrCast(ctx), @ptrCast(&freeRowCtx));
     if (thumb_pending) if (icon_img) |ic| {
         c.g_object_set_data(@ptrCast(child), "sketerm-thumb-img", @ptrCast(ic));
         c.g_object_set_data(@ptrCast(child), "sketerm-thumb-px", @ptrFromInt(@as(usize, @intCast(step.tile_icon_px))));
     };
     addEntryDragSource(tab, child);
-    c.gtk_flow_box_append(fb, child);
+    c.gtk_flow_box_insert(fb, child, position);
 }
 
 pub fn onGridChildActivated(_: *c.GtkFlowBox, child: *c.GtkFlowBoxChild, user: ?*anyopaque) callconv(.c) void {
@@ -1346,6 +1440,7 @@ pub const RowCtx = struct {
     /// Full path of the entry.
     path: []u8,
     is_dir: bool,
+    tile_stamp: u64 = 0,
 };
 
 pub fn freeRowCtx(user: ?*anyopaque) callconv(.c) void {

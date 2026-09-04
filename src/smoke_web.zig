@@ -1498,6 +1498,8 @@ const Client = struct {
     /// download the page started, the `download_start.req` otherwise.
     dl_req: u32 = 0,
     dl_prog_req: u32 = 0,
+    dl_staging: [4096:0]u8 = @splat(0),
+    dl_staging_len: usize = 0,
     dl_prog_seq: u32 = 0,
     dl_prog_id: u32 = 0,
     dl_received: u64 = 0,
@@ -2125,6 +2127,9 @@ const Client = struct {
                 self.dl_done = p.done;
                 self.dl_failed = p.failed;
                 self.dl_prog_req = p.req;
+                self.dl_staging_len = @min(p.path.len, self.dl_staging.len);
+                @memcpy(self.dl_staging[0..self.dl_staging_len], p.path[0..self.dl_staging_len]);
+                self.dl_staging[self.dl_staging_len] = 0;
                 self.dl_prog_seq += 1;
             },
             .ev_print_pdf_done => {
@@ -8792,6 +8797,24 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             fail("stage 22j2: the unknown-view answer is not a failed frame naming the request");
     }
     pass("stage 22j2 download_start (asked-for download tagged, delivered, and refusals answered)");
+    {
+        const offer0 = cl.dl_offer_seq;
+        cl.send(proto.DownloadStart{ .view = view_id, .req = 4243, .url = "data:application/octet-stream," ++ download_bytes });
+        if (!cl.waitSeq(&cl.dl_offer_seq, offer0, 10_000)) fail("staged download: no offer");
+        const id = cl.dl_id;
+        // This deliberately is NOT an absolute path on the helper. Staging
+        // must allocate its own private file and report that location.
+        cl.send(proto.DownloadDecide{ .view = view_id, .id = id, .path = "report#1.bin", .stage = 1 });
+        if (!cl.waitDlTerminal(id, 30_000) or cl.dl_done != 1) fail("staged download: not completed");
+        if (!std.mem.startsWith(u8, cl.dl_staging[0..cl.dl_staging_len], "/tmp/sketerm-webdl-")) fail("staged download: missing helper path");
+        const file = c.fopen(&cl.dl_staging, "rb") orelse fail("staged download: reported file missing");
+        defer _ = c.unlink(&cl.dl_staging);
+        var bytes: [64]u8 = undefined;
+        const n = c.fread(&bytes, 1, bytes.len, file);
+        _ = c.fclose(file);
+        if (!std.mem.eql(u8, bytes[0..n], download_bytes)) fail("staged download: wrong bytes");
+    }
+    pass("stage 22j3 staged download reports a private helper path and delivers exact bytes");
     // ── Stage 22j: the accessibility tree, only on demand ──────────
     {
         if (!cl.ack_a11y) fail("stage 22k a11y: hello_ack lacks the a11y capability");

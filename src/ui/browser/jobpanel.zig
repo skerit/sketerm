@@ -343,7 +343,7 @@ fn durableRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList
             .failed => .failed,
             .canceled => .canceled,
         };
-        const verb = if (d.kind == .upload) "sync back" else "download";
+        const verb = if (d.kind == .upload) (if (d.delete_src_after) "save download" else "sync back") else "download";
         out.append(arena, .{
             .key = .{ .kind = .durable, .token = d.token },
             .label = std.fmt.allocPrint(arena, "{s} {s}", .{ verb, d.label }) catch d.label,
@@ -371,7 +371,7 @@ fn durableRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList
                 // moveQueued only reorders queued intents.
                 .reorder = d.state == .queued,
                 .dismiss = terminal,
-                .retry = d.mediated and d.state == .failed,
+                .retry = d.state == .failed,
             },
         }) catch return;
     }
@@ -1201,7 +1201,7 @@ pub fn jobsButton(self: *BrowserView, row: *c.GtkWidget, icon: [*:0]const u8, ct
         .move_up => "Move up in the queue",
         .move_down => "Move down in the queue",
         .expand => "Show details",
-        .retry => "Retry",
+        .retry => "Retry this transfer using its saved progress; completed items stay completed",
         .center => "Transfer details (Ctrl+Shift+J)",
         .clear_done => "Clear finished",
     };
@@ -1596,7 +1596,7 @@ fn applyRow(row: Row, meter: *Meter) void {
             if (row.dest_host.len > 0) {
                 w.print("→ {s}:{s}", .{ displayHost(row.dest_host), row.dest_dir }) catch {};
             } else {
-                w.print("→ {s}", .{row.dest_dir}) catch {};
+                w.print("→ This computer:{s}", .{row.dest_dir}) catch {};
             }
         }
         c.gtk_label_set_text(label, copyZ(&z, w.buffered()));

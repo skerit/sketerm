@@ -906,7 +906,6 @@ const PendingPopup = struct {
     armed_ms: i64 = 0,
 };
 
-
 /// A resolved outbound target: where to post, and the id-window base
 /// to subtract so the frame carries the CLIENT's namespace again.
 const RouteTo = struct {
@@ -1222,6 +1221,9 @@ pub const Host = struct {
         total: u64 = 0,
         done: bool = false,
         failed: bool = false,
+        interrupt_reason: i32 = 0,
+        staging: [128:0]u8 = @splat(0),
+        staging_len: usize = 0,
         /// Counters moved since the last flush (the intercept_status
         /// coalescing pattern: one frame per poll iteration at most).
         dirty: bool = false,
@@ -1237,6 +1239,10 @@ pub const Host = struct {
         }
 
         fn dropTrash(self: *Dl) void {
+            if (self.staging_len != 0 and (!self.done or self.cancel_requested)) {
+                _ = c.unlink(&self.staging);
+                self.staging_len = 0;
+            }
             if (self.trash_len == 0) return;
             self.trash[self.trash_len] = 0;
             _ = c.unlink(@ptrCast(&self.trash));
@@ -4171,12 +4177,27 @@ pub const Host = struct {
             return;
         }
         if (d.decided) return;
+        var target = req.path;
+        if (req.stage != 0) {
+            const template = "/tmp/sketerm-webdl-XXXXXX";
+            @memcpy(d.staging[0..template.len], template);
+            d.staging[template.len] = 0;
+            const fd = c.mkstemp(&d.staging);
+            if (fd < 0) {
+                d.interrupt_reason = 1;
+                self.cancelDl(d);
+                return;
+            }
+            _ = c.close(fd);
+            d.staging_len = template.len;
+            target = d.staging[0..d.staging_len];
+        }
         d.decided = true;
         d.dirty = true;
         if (d.before_cb) |cb| {
             d.before_cb = null;
             var path = std.mem.zeroes(cef.cef_string_t);
-            setStr(req.path, &path);
+            setStr(target, &path);
             defer cef.cef_string_utf16_clear(&path);
             if (cb.cont) |f| f(cb, &path, 0);
             release(&cb.base);
@@ -4473,6 +4494,8 @@ pub const Host = struct {
                     .done = if (d.done) 1 else 0,
                     .failed = if (d.failed) 1 else 0,
                     .req = d.req,
+                    .path = d.staging[0..d.staging_len],
+                    .interrupt_reason = d.interrupt_reason,
                 });
             }
             if (d.terminal()) {
@@ -15604,6 +15627,9 @@ fn onDownloadUpdated(
     const canceled = if (item.is_canceled) |f| f(item) != 0 else false;
     const interrupted = if (item.is_interrupted) |f| f(item) != 0 else false;
     if ((canceled or interrupted) and !d.done) d.failed = true;
+    if (interrupted) if (item.get_interrupt_reason) |f| {
+        d.interrupt_reason = @intCast(f(item));
+    };
     d.dirty = true;
 
     // One held cancel handle at a time; a terminal download needs none.

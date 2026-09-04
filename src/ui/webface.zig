@@ -205,6 +205,7 @@ const input = @import("input.zig");
 const toolbtn = @import("toolbtn.zig");
 const cssutil = @import("cssutil.zig");
 const proto = @import("../web/protocol.zig");
+const download_policy = @import("../web/download.zig");
 const quarantine = @import("../web/quarantine.zig");
 const reader_model = @import("../web/reader.zig");
 const reader_guards = @import("../web/reader_guards.zig");
@@ -703,6 +704,7 @@ pub const Client = struct {
     /// The helper accepts `download_start`: a url can be downloaded
     /// through a view's own browser, with that browser's session.
     cap_download_start: bool = false,
+    cap_download_staging: bool = false,
     /// The helper accepts `a11y_enable` and streams the AX tree. An
     /// older helper simply skips the unknown frame, so this flag only
     /// records what the face may expect back.
@@ -1591,6 +1593,7 @@ pub const Client = struct {
                 self.cap_popup_open = false;
                 self.cap_downloads = false;
                 self.cap_download_start = false;
+                self.cap_download_staging = false;
                 self.cap_a11y = false;
                 self.cap_a11y_caret = false;
                 self.cap_contexts = false;
@@ -1618,6 +1621,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_POPUP_OPEN)) self.cap_popup_open = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOADS)) self.cap_downloads = true;
                     if (std.mem.eql(u8, cap, proto.CAP_DOWNLOAD_START)) self.cap_download_start = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_DOWNLOAD_STAGING)) self.cap_download_staging = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y)) self.cap_a11y = true;
                     if (std.mem.eql(u8, cap, proto.CAP_A11Y_CARET)) self.cap_a11y_caret = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
@@ -3333,6 +3337,14 @@ const Download = struct {
     /// engine never offered a download). Reported as a failed row so
     /// the caller waiting on the file gets an answer.
     fail_reason: []const u8 = "",
+    failure_buf: [512]u8 = undefined,
+    url: []u8 = &.{},
+    source_host: []u8 = &.{},
+    staged: bool = false,
+    downloaded: bool = false,
+    retry_req: u32 = 0,
+    retry_at_ms: i64 = 0,
+    retry_btn: ?*c.GtkWidget = null,
     name: []u8,
     /// LOCAL path being written: the user's pick for a local save, the
     /// staging file for a redirected (host:) save.
@@ -3362,6 +3374,8 @@ const Download = struct {
         a.free(self.path);
         a.free(self.remote_host);
         a.free(self.remote_path);
+        a.free(self.url);
+        a.free(self.source_host);
         if (self.upload_token) |t| a.free(t);
         a.destroy(self);
     }
@@ -3381,6 +3395,7 @@ const AskedDownload = struct {
     req: u32,
     /// Absolute target path; owned.
     path: []u8,
+    url: []u8,
     /// When the request was sent, so one the engine never offers is
     /// answered rather than left pending forever.
     at_ms: i64,
@@ -3406,9 +3421,11 @@ const DlPickCtx = struct {
     id: u32,
     /// Suggested name (owned), the fallback when a pick has no leaf.
     name: []u8,
+    url: []u8,
 
     fn free(self: *DlPickCtx) void {
         self.allocator.free(self.name);
+        self.allocator.free(self.url);
         self.allocator.destroy(self);
     }
 };
@@ -4282,7 +4299,10 @@ pub const WebFace = struct {
         // transfer service's and deliberately survives the pane.
         for (self.downloads.items) |d| d.free(self.allocator);
         self.downloads.deinit(self.allocator);
-        for (self.dl_asked.items) |a| self.allocator.free(a.path);
+        for (self.dl_asked.items) |a| {
+            self.allocator.free(a.path);
+            self.allocator.free(a.url);
+        }
         self.dl_asked.deinit(self.allocator);
         self.dropMap();
         self.cancelHints();
@@ -6158,6 +6178,15 @@ pub const WebFace = struct {
     }
 
     pub fn onHelperUnavailable(self: *WebFace, reason: []const u8, retryable: bool) void {
+        for (self.downloads.items) |d| {
+            // Engine ids can be reused after restart; keep completed rows
+            // from capturing a new download's progress.
+            d.id = 0;
+            if (d.state == .downloading) {
+                d.retry_req = 0;
+                self.failDownload(d, "The browser connection was lost. Reload the page, then retry the download.");
+            }
+        }
         self.cancelHints();
         self.abandonAutoOps(true);
         self.reader_guards.resetEpoch();
@@ -8835,9 +8864,15 @@ pub const WebFace = struct {
     /// Hand the finished PDF to whatever the desktop opens PDFs with.
     fn onToastOpen(_: ?*c.AdwToast, user: ?*anyopaque) callconv(.c) void {
         const path: [*:0]const u8 = @ptrCast(user orelse return);
-        var uri: [4096:0]u8 = undefined;
-        const u = std.fmt.bufPrintZ(&uri, "file://{s}", .{std.mem.span(path)}) catch return;
-        _ = c.g_app_info_launch_default_for_uri(u.ptr, null, null);
+        _ = openLocalFile(path);
+    }
+
+    fn openLocalFile(path: [*:0]const u8) bool {
+        const file = c.g_file_new_for_path(path) orelse return false;
+        defer c.g_object_unref(file);
+        const uri = c.g_file_get_uri(file) orelse return false;
+        defer c.g_free(uri);
+        return c.g_app_info_launch_default_for_uri(uri, null, null) != 0;
     }
 
     // ---- downloads --------------------------------------------------
@@ -8860,7 +8895,7 @@ pub const WebFace = struct {
     pub fn webDownloadStart(self: *WebFace, url: []const u8, path: []const u8) ?u32 {
         if (self.widgets_dead) return null;
         if (!self.cl.cap_downloads or !self.cl.cap_download_start) return null;
-        if (self.cl.isRemote()) return null;
+        if (self.cl.isRemote() and !self.cl.cap_download_staging) return null;
         // A watched page is another client's view: the helper drops
         // `download_start` for an alias at its edge (`observerAllows`)
         // with no reply, so the request would sit `pending` until the
@@ -8868,15 +8903,21 @@ pub const WebFace = struct {
         if (self.cl.observer) return null;
         if (path.len == 0 or path[0] != '/') return null;
         const owned = self.allocator.dupe(u8, path) catch return null;
+        const owned_url = self.allocator.dupe(u8, url) catch {
+            self.allocator.free(owned);
+            return null;
+        };
         const req = self.dl_next_req;
         self.dl_next_req +%= 1;
         if (self.dl_next_req == 0) self.dl_next_req = 1;
         self.dl_asked.append(self.allocator, .{
             .req = req,
             .path = owned,
+            .url = owned_url,
             .at_ms = clock.nowMs(),
         }) catch {
             self.allocator.free(owned);
+            self.allocator.free(owned_url);
             return null;
         };
         self.cl.post(proto.DownloadStart{ .view = self.view, .req = req, .url = url });
@@ -8886,7 +8927,7 @@ pub const WebFace = struct {
     /// Whether a remote-browser container is what refused a download
     /// request, so the caller can say WHY rather than "unavailable".
     pub fn webDownloadRefusal(self: *WebFace) []const u8 {
-        if (self.cl.isRemote()) return "downloads are not supported in a remote-browser container (the file would land on that host)";
+        if (self.cl.isRemote() and !self.cl.cap_download_staging) return "update the remote browser helper to support download delivery";
         if (self.cl.observer) return "this pane watches another client's page; downloads belong to the page's owner";
         if (!self.cl.cap_downloads) return "this browser helper does not report downloads";
         if (!self.cl.cap_download_start) return "this browser helper cannot start a download for a url (capability 'download-start')";
@@ -8919,7 +8960,7 @@ pub const WebFace = struct {
                 .req = d.req,
                 .id = d.id,
                 .name = d.name,
-                .path = d.path,
+                .path = if (d.staged) d.remote_path else d.path,
                 .received = d.received,
                 .total = d.total,
                 .state = switch (d.state) {
@@ -8963,7 +9004,8 @@ pub const WebFace = struct {
         // the caller already gave up on.
         if (self.takeAsked(req)) |asked| {
             defer self.allocator.free(asked.path);
-            self.recordFailedRequest(req, asked.path, "canceled before the browser offered the download");
+            defer self.allocator.free(asked.url);
+            self.recordFailedRequest(req, asked.path, asked.url, "canceled before the browser offered the download");
             return true;
         }
         return false;
@@ -9000,22 +9042,26 @@ pub const WebFace = struct {
             }
             const a = self.dl_asked.orderedRemove(i);
             defer self.allocator.free(a.path);
-            self.recordFailedRequest(a.req, a.path, "the browser did not start a download for that url (it may have navigated to it, or refused the scheme)");
+            defer self.allocator.free(a.url);
+            self.recordFailedRequest(a.req, a.path, a.url, "the browser did not start a download for that url (it may have navigated to it, or refused the scheme)");
         }
     }
 
     /// A download request that produced no transfer at all, kept as a
     /// failed row so the answer is a fact rather than a timeout.
-    fn recordFailedRequest(self: *WebFace, req: u32, path: []const u8, reason: []const u8) void {
+    fn recordFailedRequest(self: *WebFace, req: u32, path: []const u8, url: []const u8, reason: []const u8) void {
         const d = self.allocator.create(Download) catch return;
         d.* = .{
             .id = 0,
             .req = req,
             .fail_reason = reason,
+            .url = self.allocator.dupe(u8, url) catch &.{},
+            .source_host = self.allocator.dupe(u8, self.cl.hostSlice()) catch &.{},
+            .staged = self.cl.isRemote(),
             .name = self.allocator.dupe(u8, std.fs.path.basename(path)) catch &.{},
             .path = self.allocator.dupe(u8, path) catch &.{},
             .remote_host = &.{},
-            .remote_path = &.{},
+            .remote_path = if (self.cl.isRemote()) self.allocator.dupe(u8, path) catch &.{} else &.{},
             .state = .failed,
             .row = undefined,
             .label = undefined,
@@ -9025,6 +9071,10 @@ pub const WebFace = struct {
             .open_btn = undefined,
             .reveal_btn = undefined,
         };
+        if (d.source_host.len != self.cl.hostSlice().len or (d.staged and d.remote_path.len == 0)) {
+            d.free(self.allocator);
+            return;
+        }
         self.downloads.append(self.allocator, d) catch {
             d.free(self.allocator);
             return;
@@ -9057,9 +9107,20 @@ pub const WebFace = struct {
         // with a visible reason until the remote download path (helper
         // staging dir -> daemon file_get -> local pick) is designed;
         // this branch is the seam it plugs into.
-        if (self.cl.isRemote()) {
+        if (self.cl.isRemote() and !self.cl.cap_download_staging) {
             declineDownload(ev.view, ev.id);
-            self.toast("Downloads are not yet supported in a remote-browser container");
+            self.toast("Update the remote browser helper to save downloads on this or another machine.");
+            return;
+        }
+        for (self.downloads.items) |d| {
+            if (ev.req == 0 or d.retry_req != ev.req) continue;
+            d.retry_req = 0;
+            if (d.canceled or d.state != .downloading) {
+                declineDownload(ev.view, ev.id);
+                return;
+            }
+            d.id = ev.id;
+            self.cl.post(proto.DownloadDecide{ .view = self.view, .id = d.id, .path = d.path, .stage = @intFromBool(d.source_host.len != 0) });
             return;
         }
         const name = if (ev.name.len != 0) ev.name else "download";
@@ -9069,20 +9130,19 @@ pub const WebFace = struct {
         if (ev.req != 0) {
             if (self.takeAsked(ev.req)) |asked| {
                 defer self.allocator.free(asked.path);
-                self.startDownloadReq(ev.id, ev.req, name, asked.path, "", "");
+                defer self.allocator.free(asked.url);
+                self.startDownloadReq(ev.id, ev.req, name, asked.path, "", "", ev.url);
                 return;
             }
             // The caller was already told this request failed (it
             // canceled, or the offer outlived the wait): a late offer
             // is answered with a decline, never with a dialog nobody
             // asked for.
-            if (self.failedRequest(ev.req)) {
-                declineDownload(ev.view, ev.id);
-                return;
-            }
+            declineDownload(ev.view, ev.id);
+            return;
         }
         if (!g_download_ask) {
-            self.autoAcceptDownload(ev.id, name);
+            self.autoAcceptDownload(ev.id, name, ev.url);
             return;
         }
         const pickwin = @import("picker.zig");
@@ -9090,11 +9150,18 @@ pub const WebFace = struct {
             declineDownload(ev.view, ev.id);
             return;
         };
+        const owned_url = self.allocator.dupe(u8, ev.url) catch {
+            self.allocator.destroy(ctx);
+            declineDownload(ev.view, ev.id);
+            return;
+        };
         ctx.* = .{
             .allocator = self.allocator,
             .view = self.view,
             .id = ev.id,
+            .url = owned_url,
             .name = self.allocator.dupe(u8, name) catch {
+                self.allocator.free(owned_url);
                 self.allocator.destroy(ctx);
                 declineDownload(ev.view, ev.id);
                 return;
@@ -9117,7 +9184,7 @@ pub const WebFace = struct {
 
     /// `web_download_ask = false`: straight into ~/Downloads under the
     /// suggested name, uniquified rather than overwritten.
-    fn autoAcceptDownload(self: *WebFace, id: u32, name: []const u8) void {
+    fn autoAcceptDownload(self: *WebFace, id: u32, name: []const u8, url: []const u8) void {
         const home_c = c.getenv("HOME") orelse {
             declineDownload(self.view, id);
             return;
@@ -9157,7 +9224,7 @@ pub const WebFace = struct {
             declineDownload(self.view, id);
             return;
         };
-        self.startDownload(id, name, path, "", "");
+        self.startDownload(id, name, path, "", "", url);
     }
 
     fn onDlPathPicked(user: ?*anyopaque, result: ?fpicker.Result) void {
@@ -9182,6 +9249,10 @@ pub const WebFace = struct {
         const loc = @import("../filebrowser/paths.zig").parseSpec(spec);
         const leaf = std.fs.path.basename(loc.path);
         const name = if (leaf.len != 0) leaf else ctx.name;
+        if (self.cl.isRemote()) {
+            self.startDownload(ctx.id, name, loc.path, loc.host orelse "", loc.path, ctx.url);
+            return;
+        }
         if (loc.host) |host| {
             // Remote target: stage locally, hand off on completion.
             var stage_buf: [4608]u8 = undefined;
@@ -9190,17 +9261,18 @@ pub const WebFace = struct {
                 self.toast("No writable cache directory to stage the download in.");
                 return;
             };
-            self.startDownload(ctx.id, name, staging, host, loc.path);
+            self.startDownload(ctx.id, name, staging, host, loc.path, ctx.url);
             return;
         }
-        self.startDownload(ctx.id, name, loc.path, "", "");
+        self.startDownload(ctx.id, name, loc.path, "", "", ctx.url);
     }
 
-    /// `$XDG_CACHE_HOME/sketerm/webdl/<id>-<name>`: where a redirected
-    /// download lands before its daemon handoff. Unlinked when the
-    /// handoff finishes (or its row is dismissed).
+    /// A private file in `$XDG_CACHE_HOME/sketerm/webdl`: where a
+    /// redirected download lands before its daemon handoff. The daemon
+    /// consumes it only after delivery succeeds, retaining failed sends.
     fn stagingPath(self: *WebFace, buf: []u8, id: u32, name: []const u8) ?[]const u8 {
         _ = self;
+        _ = name;
         var root_buf: [4096]u8 = undefined;
         const cache: []const u8 = blk: {
             if (c.getenv("XDG_CACHE_HOME")) |x| {
@@ -9215,7 +9287,11 @@ pub const WebFace = struct {
         _ = c.mkdir(d1.ptr, 0o700);
         const d2 = std.fmt.bufPrintZ(&z, "{s}/sketerm/webdl", .{cache}) catch return null;
         _ = c.mkdir(d2.ptr, 0o700);
-        return std.fmt.bufPrint(buf, "{s}/sketerm/webdl/{d}-{s}", .{ cache, id, name }) catch null;
+        const path = std.fmt.bufPrintZ(buf, "{s}/sketerm/webdl/{d}-XXXXXX", .{ cache, id }) catch return null;
+        const fd = c.mkstemp(path.ptr);
+        if (fd < 0) return null;
+        _ = c.close(fd);
+        return path;
     }
 
     fn rememberDownloadDir(self: *WebFace, spec: []const u8) void {
@@ -9230,13 +9306,13 @@ pub const WebFace = struct {
 
     /// Create the tracking entry + strip row and answer the held offer
     /// with `path`.
-    fn startDownload(self: *WebFace, id: u32, name: []const u8, path: []const u8, remote_host: []const u8, remote_path: []const u8) void {
-        self.startDownloadReq(id, 0, name, path, remote_host, remote_path);
+    fn startDownload(self: *WebFace, id: u32, name: []const u8, path: []const u8, remote_host: []const u8, remote_path: []const u8, url: []const u8) void {
+        self.startDownloadReq(id, 0, name, path, remote_host, remote_path, url);
     }
 
     /// `startDownload`, carrying the automation request id that asked
     /// for it (0 = page- or user-initiated).
-    fn startDownloadReq(self: *WebFace, id: u32, req: u32, name: []const u8, path: []const u8, remote_host: []const u8, remote_path: []const u8) void {
+    fn startDownloadReq(self: *WebFace, id: u32, req: u32, name: []const u8, path: []const u8, remote_host: []const u8, remote_path: []const u8, url: []const u8) void {
         if (self.findDownload(id) != null) return;
         const d = self.allocator.create(Download) catch {
             declineDownload(self.view, id);
@@ -9248,7 +9324,10 @@ pub const WebFace = struct {
             .name = self.allocator.dupe(u8, name) catch &.{},
             .path = self.allocator.dupe(u8, path) catch &.{},
             .remote_host = self.allocator.dupe(u8, remote_host) catch &.{},
-            .remote_path = self.allocator.dupe(u8, remote_path) catch &.{},
+            .remote_path = self.allocator.dupe(u8, if (self.cl.isRemote() and remote_host.len == 0) path else remote_path) catch &.{},
+            .source_host = self.allocator.dupe(u8, self.cl.hostSlice()) catch &.{},
+            .staged = self.cl.isRemote() or remote_host.len != 0,
+            .url = self.allocator.dupe(u8, url) catch &.{},
             .row = undefined,
             .label = undefined,
             .bar = undefined,
@@ -9257,7 +9336,7 @@ pub const WebFace = struct {
             .open_btn = undefined,
             .reveal_btn = undefined,
         };
-        if (d.path.len == 0) {
+        if (d.path.len == 0 or (d.staged and d.remote_path.len == 0) or d.source_host.len != self.cl.hostSlice().len or d.remote_host.len != remote_host.len) {
             d.free(self.allocator);
             declineDownload(self.view, id);
             return;
@@ -9268,7 +9347,7 @@ pub const WebFace = struct {
             return;
         };
         self.buildDlRow(d);
-        self.cl.post(proto.DownloadDecide{ .view = self.view, .id = id, .path = d.path });
+        self.cl.post(proto.DownloadDecide{ .view = self.view, .id = id, .path = d.path, .stage = @intFromBool(self.cl.isRemote()) });
     }
 
     fn buildDlRow(self: *WebFace, d: *Download) void {
@@ -9297,6 +9376,7 @@ pub const WebFace = struct {
         d.reveal_btn = self.dlButton(d, "folder-open-symbolic", "Show in Files", &onDlRevealClicked);
         c.gtk_widget_set_visible(d.reveal_btn, 0);
         d.cancel_btn = self.dlButton(d, "process-stop-symbolic", "Cancel", &onDlCancelClicked);
+        d.retry_btn = self.dlButton(d, "view-refresh-symbolic", "Retry download from the beginning", &onDlRetryClicked);
 
         c.gtk_box_append(@ptrCast(self.dl_strip), d.row);
         c.gtk_widget_set_visible(self.dl_strip, 1);
@@ -9327,6 +9407,22 @@ pub const WebFace = struct {
 
     fn updateDlRow(self: *WebFace, d: *Download) void {
         if (self.widgets_dead) return;
+        if (d.retry_btn) |button| {
+            c.gtk_widget_set_visible(button, @intFromBool(d.state == .failed and download_policy.retryAction(d.downloaded, d.url.len != 0, self.cl.cap_download_start) != .unavailable));
+            c.gtk_widget_set_tooltip_text(button, if (d.downloaded) "Retry delivery of the completed download" else "Retry download from the beginning");
+        }
+        c.gtk_widget_set_visible(d.open_btn, @intFromBool(d.state == .done and d.remote_host.len == 0));
+        c.gtk_widget_set_visible(d.reveal_btn, @intFromBool(d.state == .done));
+        if (d.state == .downloading or d.state == .uploading) {
+            c.gtk_button_set_icon_name(@ptrCast(d.cancel_btn), "process-stop-symbolic");
+            c.gtk_widget_set_tooltip_text(d.cancel_btn, "Cancel");
+        }
+        var destination: [4700:0]u8 = undefined;
+        const dest = std.fmt.bufPrintZ(&destination, "Save to {s}:{s}", .{
+            if (d.remote_host.len == 0) "This computer" else d.remote_host,
+            if (d.staged) d.remote_path else d.path,
+        }) catch "Download destination";
+        c.gtk_widget_set_tooltip_text(d.label, dest.ptr);
         const format = @import("../filebrowser/format.zig");
         var size_buf: [48:0]u8 = undefined;
         var text: [128:0]u8 = undefined;
@@ -9343,7 +9439,7 @@ pub const WebFace = struct {
             .uploading => {
                 var host_z: [128:0]u8 = undefined;
                 const t = std.fmt.bufPrintZ(&text, "Sending to {s}…", .{
-                    std.fmt.bufPrintZ(&host_z, "{s}", .{d.remote_host}) catch "host",
+                    std.fmt.bufPrintZ(&host_z, "{s}", .{if (d.remote_host.len == 0) "this computer" else d.remote_host}) catch "host",
                 }) catch "Sending…";
                 c.gtk_label_set_text(@ptrCast(d.status), t.ptr);
                 if (d.total > 0) c.gtk_progress_bar_set_fraction(@ptrCast(d.bar), @as(f64, @floatFromInt(d.received)) / @as(f64, @floatFromInt(d.total)));
@@ -9368,8 +9464,12 @@ pub const WebFace = struct {
                         d.fail_reason[0..@min(d.fail_reason.len, 140)],
                     }) catch break :blk "Failed";
                     break :blk t.ptr;
-                } else "Failed";
+                } else "Download interrupted. Retry to start again.";
                 c.gtk_label_set_text(@ptrCast(d.status), failed_text);
+                if (self.allocator.dupeZ(u8, d.fail_reason)) |why| {
+                    defer self.allocator.free(why);
+                    c.gtk_widget_set_tooltip_text(d.status, why);
+                } else |_| {}
                 c.gtk_button_set_icon_name(@ptrCast(d.cancel_btn), "window-close-symbolic");
                 c.gtk_widget_set_tooltip_text(d.cancel_btn, "Dismiss");
             },
@@ -9381,12 +9481,29 @@ pub const WebFace = struct {
         // is no transfer to update, only a request to answer.
         if (ev.id == 0) {
             if (ev.req == 0) return;
+            for (self.downloads.items) |d| {
+                if (d.retry_req == ev.req) {
+                    d.retry_req = 0;
+                    self.failDownload(d, "The browser could not restart this download. Open the page and try its download link again.");
+                    return;
+                }
+            }
             const asked = self.takeAsked(ev.req) orelse return;
             defer self.allocator.free(asked.path);
-            self.recordFailedRequest(ev.req, asked.path, "the browser did not start a download for that url (it may have navigated to it, or refused the scheme)");
+            defer self.allocator.free(asked.url);
+            self.recordFailedRequest(ev.req, asked.path, asked.url, "the browser did not start a download for that url (it may have navigated to it, or refused the scheme)");
             return;
         }
         const d = self.findDownload(ev.id) orelse return;
+        if (d.source_host.len != 0 and ev.path.len != 0 and !std.mem.eql(u8, d.path, ev.path)) {
+            const owned = self.allocator.dupe(u8, ev.path) catch {
+                self.cl.post(proto.DownloadCancel{ .view = self.view, .id = d.id });
+                self.failDownload(d, "Could not remember the remote download location.");
+                return;
+            };
+            self.allocator.free(d.path);
+            d.path = owned;
+        }
         d.received = ev.received;
         if (ev.total > 0) d.total = ev.total;
         if (ev.failed != 0) {
@@ -9394,12 +9511,21 @@ pub const WebFace = struct {
                 self.removeDownload(d);
                 return;
             }
-            d.state = .failed;
-            self.updateDlRow(d);
+            self.failDownload(d, download_policy.failureReason(ev.interrupt_reason));
             return;
         }
         if (ev.done != 0) {
-            if (d.remote_host.len != 0) {
+            if (d.canceled) {
+                self.dropStaging(d);
+                self.removeDownload(d);
+                return;
+            }
+            if (d.source_host.len != 0 and ev.path.len == 0) {
+                self.failDownload(d, "The remote helper did not report the saved file's location.");
+                return;
+            }
+            d.downloaded = true;
+            if (d.staged) {
                 self.beginHandoff(d);
             } else {
                 d.state = .done;
@@ -9415,25 +9541,26 @@ pub const WebFace = struct {
     /// crash mid-send resumes like any other transfer.
     fn beginHandoff(self: *WebFace, d: *Download) void {
         const win = self.ownerWindow() orelse {
-            d.state = .failed;
-            self.updateDlRow(d);
+            self.failDownload(d, "The download is complete, but its destination window is unavailable.");
             return;
         };
         const svc = win.transferService() orelse {
-            d.state = .failed;
-            self.updateDlRow(d);
-            self.toast("Downloaded locally, but the transfer service is unavailable to send it on.");
+            self.failDownload(d, "The download is complete. Retry delivery when the transfer service is available.");
             return;
         };
-        d.upload_token = svc.submitUpload(self.allocator, d.path, d.remote_host, d.remote_path, null);
+        if (d.upload_token) |token| {
+            svc.retryMediated(token);
+        } else {
+            d.upload_token = svc.submitDelivery(self.allocator, d.source_host, d.path, d.remote_host, d.remote_path, true, null);
+        }
         if (d.upload_token == null) {
-            d.state = .failed;
-            self.updateDlRow(d);
-            self.toast("Downloaded locally, but the send to the server could not be recorded.");
+            self.failDownload(d, "The download is complete, but delivery could not be recorded. Retry will send the saved copy.");
             return;
         }
         // Second phase: the bar restarts for the upload leg.
         d.state = .uploading;
+        d.fail_reason = "";
+        d.canceled = false;
         d.received = 0;
         self.updateDlRow(d);
         self.ensureDlTimer();
@@ -9459,17 +9586,30 @@ pub const WebFace = struct {
         while (i < self.downloads.items.len) {
             const d = self.downloads.items[i];
             i += 1;
+            if (d.retry_req != 0) {
+                if (clock.nowMs() - d.retry_at_ms > ASKED_DOWNLOAD_WAIT_MS) {
+                    d.retry_req = 0;
+                    self.failDownload(d, "The browser did not restart the download. Try the page's download link again.");
+                } else uploading = true;
+            }
             if (d.state != .uploading) continue;
             const token = d.upload_token orelse continue;
-            const service = svc orelse continue;
+            const service = svc orelse {
+                uploading = true;
+                continue;
+            };
             const progress = service.intentProgress(token) orelse {
                 // Gone from the ledger = finished and acknowledged.
-                self.finishHandoff(d, true);
+                if (d.canceled) {
+                    self.dropStaging(d);
+                    self.removeDownload(d);
+                    i -|= 1;
+                } else self.finishHandoff(d, true);
                 continue;
             };
             switch (progress.state) {
                 .done => self.finishHandoff(d, true),
-                .failed => self.finishHandoff(d, false),
+                .failed => self.failDownload(d, if (progress.message.len != 0) progress.message else "Delivery failed. Retry sends the completed download again."),
                 .canceled => {
                     self.dropStaging(d);
                     self.removeDownload(d);
@@ -9500,7 +9640,7 @@ pub const WebFace = struct {
     /// Unlink the local staging copy of a redirected download.
     fn dropStaging(self: *WebFace, d: *Download) void {
         _ = self;
-        if (d.remote_host.len == 0) return;
+        if (!d.staged or d.source_host.len != 0) return;
         var z: [4608:0]u8 = undefined;
         if (d.path.len + 1 > z.len) return;
         @memcpy(z[0..d.path.len], d.path);
@@ -9509,6 +9649,7 @@ pub const WebFace = struct {
     }
 
     fn removeDownload(self: *WebFace, d: *Download) void {
+        if (!d.downloaded and d.state != .downloading) self.dropStaging(d);
         for (self.downloads.items, 0..) |it, idx| {
             if (it != d) continue;
             _ = self.downloads.orderedRemove(idx);
@@ -9549,12 +9690,52 @@ pub const WebFace = struct {
         self.actOnRow(d);
     }
 
+    fn failDownload(self: *WebFace, d: *Download, reason: []const u8) void {
+        var n = @min(reason.len, d.failure_buf.len);
+        while (n < reason.len and n > 0 and reason[n] & 0xc0 == 0x80) n -= 1;
+        @memcpy(d.failure_buf[0..n], reason[0..n]);
+        d.fail_reason = d.failure_buf[0..n];
+        d.state = .failed;
+        self.updateDlRow(d);
+    }
+
+    fn onDlRetryClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(DlBtnCtx, user);
+        const self = findFaceGlobal(ctx.view) orelse return;
+        const d = self.rowDownload(ctx.dl) orelse return;
+        if (d.state != .failed) return;
+        if (d.downloaded) {
+            self.beginHandoff(d);
+            return;
+        }
+        if (!self.view_live or !self.cl.cap_download_start or d.url.len == 0) {
+            self.toast("Reload the page before retrying this download.");
+            return;
+        }
+        d.retry_req = self.dl_next_req;
+        self.dl_next_req +%= 1;
+        if (self.dl_next_req == 0) self.dl_next_req = 1;
+        d.retry_at_ms = clock.nowMs();
+        d.received = 0;
+        d.total = 0;
+        d.canceled = false;
+        d.fail_reason = "";
+        d.state = .downloading;
+        self.cl.post(proto.DownloadStart{ .view = self.view, .req = d.retry_req, .url = d.url });
+        self.updateDlRow(d);
+        self.ensureDlTimer();
+    }
+
     /// What the row's one button does: cancel a running transfer,
     /// dismiss a finished one.
     fn actOnRow(self: *WebFace, d: *Download) void {
         switch (d.state) {
             .downloading => {
                 d.canceled = true;
+                if (d.retry_req != 0) {
+                    self.removeDownload(d);
+                    return;
+                }
                 self.cl.post(proto.DownloadCancel{ .view = self.view, .id = d.id });
             },
             .uploading => {
@@ -9576,9 +9757,9 @@ pub const WebFace = struct {
         const self = findFaceGlobal(ctx.view) orelse return;
         const d = self.rowDownload(ctx.dl) orelse return;
         if (d.remote_host.len != 0) return;
-        var uri: [4700:0]u8 = undefined;
-        const u = std.fmt.bufPrintZ(&uri, "file://{s}", .{d.path}) catch return;
-        _ = c.g_app_info_launch_default_for_uri(u.ptr, null, null);
+        const path = self.allocator.dupeZ(u8, if (d.staged) d.remote_path else d.path) catch return;
+        defer self.allocator.free(path);
+        if (!openLocalFile(path)) self.toast("Could not open the downloaded file. Check that it still exists and an application is installed for it.");
     }
 
     fn onDlRevealClicked(_: ?*c.GtkButton, user: ?*anyopaque) callconv(.c) void {
@@ -9588,8 +9769,7 @@ pub const WebFace = struct {
         var spec: [4700]u8 = undefined;
         const s = if (d.remote_host.len != 0)
             std.fmt.bufPrint(&spec, "{s}:{s}", .{ d.remote_host, d.remote_path }) catch return
-        else
-            d.path;
+        else if (d.staged) d.remote_path else d.path;
         _ = @import("siblingapp.zig").showInFiles(s);
     }
 
@@ -10239,6 +10419,20 @@ test "normalizeUrl keeps explicit schemes and promotes hosts" {
     try std.testing.expect(std.mem.startsWith(u8, normalizeUrl(&buf, "two words").?, "https://duckduckgo.com/"));
 }
 
+test "download and PDF file URIs preserve reserved filename characters" {
+    const path = "/tmp/report#1? 100%.pdf";
+    const file = c.g_file_new_for_path(path) orelse return error.OutOfMemory;
+    defer c.g_object_unref(file);
+    const uri = c.g_file_get_uri(file) orelse return error.OutOfMemory;
+    defer c.g_free(uri);
+    try std.testing.expectEqualStrings("file:///tmp/report%231%3F%20100%25.pdf", std.mem.span(uri));
+    const reopened = c.g_file_new_for_uri(uri) orelse return error.OutOfMemory;
+    defer c.g_object_unref(reopened);
+    const decoded = c.g_file_get_path(reopened) orelse return error.OutOfMemory;
+    defer c.g_free(decoded);
+    try std.testing.expectEqualStrings(path, std.mem.span(decoded));
+}
+
 test "normalizeUrl percent-encodes searches on the configured engine" {
     var buf: [256]u8 = undefined;
     setSearchEngine("https://www.google.com/search?q={q}");
@@ -10254,7 +10448,6 @@ test "normalizeUrl percent-encodes searches on the configured engine" {
         normalizeUrl(&buf, "two words").?,
     );
 }
-
 
 test "one helper instance per route, keyed on the whole spec" {
     const t = std.testing;

@@ -391,17 +391,43 @@ pub const SpecClass = enum { url, host, search };
 
 pub const default_search_template = "https://duckduckgo.com/?q={q}";
 
-/// An explicit scheme wins, a token with a dot and no space is a
-/// host, anything else is a web search.
+/// Explicit schemes win. Hostnames, loopback addresses and host:port
+/// pairs navigate; prose goes to the search engine.
 pub fn classify(spec: []const u8) SpecClass {
-    if (std.mem.indexOf(u8, spec, "://") != null) return .url;
+    if (std.mem.indexOf(u8, spec, "://")) |colon| {
+        if (colon > 0 and std.ascii.isAlphabetic(spec[0])) {
+            const valid = for (spec[0..colon]) |ch| {
+                if (!std.ascii.isAlphanumeric(ch) and ch != '+' and ch != '-' and ch != '.') break false;
+            } else true;
+            if (valid) return .url;
+        }
+    }
     if (std.mem.startsWith(u8, spec, "about:") or
         std.mem.startsWith(u8, spec, "data:") or
         std.mem.startsWith(u8, spec, "file:") or
         std.mem.startsWith(u8, spec, "chrome:")) return .url;
-    const looks_like_host = std.mem.indexOfScalar(u8, spec, ' ') == null and
-        std.mem.indexOfScalar(u8, spec, '.') != null;
+    if (std.mem.indexOfAny(u8, spec, " \t\r\n") != null) return .search;
+    const authority = spec[0 .. std.mem.indexOfAny(u8, spec, "/?#") orelse spec.len];
+    const looks_like_host = loopbackAuthority(authority) or
+        std.mem.indexOfScalar(u8, authority, '.') != null or
+        hasNumericPort(authority);
     return if (looks_like_host) .host else .search;
+}
+
+fn hasNumericPort(authority: []const u8) bool {
+    const colon = std.mem.lastIndexOfScalar(u8, authority, ':') orelse return false;
+    if (colon == 0 or colon + 1 == authority.len) return false;
+    const port = std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch return false;
+    return port != 0;
+}
+
+fn loopbackAuthority(authority: []const u8) bool {
+    if (std.mem.eql(u8, authority, "[::1]")) return true;
+    if (std.mem.startsWith(u8, authority, "[::1]:")) return hasNumericPort(authority);
+    const host = authority[0 .. std.mem.indexOfScalar(u8, authority, ':') orelse authority.len];
+    return std.ascii.eqlIgnoreCase(host, "localhost") or
+        std.ascii.endsWithIgnoreCase(host, ".localhost") or
+        std.mem.eql(u8, host, "127.0.0.1");
 }
 
 /// Instantiate a `{q}` search-engine template with the percent-encoded
@@ -425,12 +451,30 @@ pub fn searchUrl(buf: []u8, template: []const u8, q: []const u8) ?[]const u8 {
 /// a search on `template` (falling back to the default engine when the
 /// template is unusable).
 pub fn normalizeUrl(buf: []u8, spec: []const u8, template: []const u8) ?[]const u8 {
-    switch (classify(spec)) {
-        .url => return spec,
-        .host => return std.fmt.bufPrint(buf, "https://{s}", .{spec}) catch null,
-        .search => return searchUrl(buf, template, spec) orelse
-            searchUrl(buf, default_search_template, spec),
+    const text = std.mem.trim(u8, spec, " \t\r\n");
+    switch (classify(text)) {
+        .url => return text,
+        .host => {
+            const authority = text[0 .. std.mem.indexOfAny(u8, text, "/?#") orelse text.len];
+            return std.fmt.bufPrint(buf, "{s}://{s}", .{ if (loopbackAuthority(authority)) "http" else "https", text }) catch null;
+        },
+        .search => return searchUrl(buf, template, text) orelse
+            searchUrl(buf, default_search_template, text),
     }
+}
+
+test "address bar recognizes development servers and trims pasted addresses" {
+    var buf: [512]u8 = undefined;
+    for ([_][]const u8{ "localhost", "localhost:3000", "localhost:3000/path?q=x", "app.localhost:8080", "127.0.0.1:8000", "[::1]:3000" }) |address| {
+        const url = normalizeUrl(&buf, address, "").?;
+        try std.testing.expect(std.mem.startsWith(u8, url, "http://"));
+        try std.testing.expectEqualStrings(address, url[7..]);
+    }
+    try std.testing.expectEqualStrings("https://localhost:3000", normalizeUrl(&buf, "  https://localhost:3000\n", "").?);
+    try std.testing.expectEqualStrings("https://server:8080", normalizeUrl(&buf, "server:8080", "").?);
+    try std.testing.expectEqual(SpecClass.search, classify("meeting at 12:30"));
+    try std.testing.expectEqual(SpecClass.search, classify("example.com\tquery"));
+    try std.testing.expectEqual(SpecClass.search, classify("how to use https://example.com"));
 }
 
 // ── tests ────────────────────────────────────────────────────────
@@ -469,11 +513,13 @@ test "merge normalizes, weights, interleaves and caps" {
         .{ .title = "h2", .kind = .history, .score = 50 },
     } };
     // Unit-scale source at weight 1.0: 0.9 and 0.5.
-    var cmd = TestEmit{ .cands = &.{
-        .{ .title = "c1", .kind = .command, .score = 0.9 },
-        .{ .title = "c2", .kind = .command, .score = 0.5 },
-        .{ .title = "c3", .kind = .command, .score = 0.0 }, // dropped
-    } };
+    var cmd = TestEmit{
+        .cands = &.{
+            .{ .title = "c1", .kind = .command, .score = 0.9 },
+            .{ .title = "c2", .kind = .command, .score = 0.5 },
+            .{ .title = "c3", .kind = .command, .score = 0.0 }, // dropped
+        },
+    };
     const sources = [_]Source{
         .{ .ctx = &hist, .normalize = true, .weight = 0.8, .query = TestEmit.query },
         .{ .ctx = &cmd, .query = TestEmit.query },

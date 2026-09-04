@@ -1504,7 +1504,7 @@ pub fn confirmDeletePathsMode(self: *BrowserView, tab: *BTab, targets: []const [
     if (confirm.present(@ptrCast(@alignCast(root)), .{
         .heading = txt.ptr,
         .body = if (secure)
-            "Contents are overwritten before deletion; recovery tools will not get them back. Folders are skipped."
+            "Overwrites file contents once before deletion. This cannot guarantee removal from SSDs, snapshots, backups, or copy-on-write filesystems. Folders are skipped."
         else
             "If you delete an item, it will be permanently lost.",
         .responses = &.{

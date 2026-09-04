@@ -41,6 +41,8 @@ pub const HistorySide = enum { back, forward };
 
 /// All navigation-chrome state, so BrowserView keeps one field.
 pub const State = struct {
+    /// Outside the scrolling breadcrumb so the host stays visible on deep paths.
+    host_label: ?*c.GtkWidget = null,
     /// Horizontal scroller around `box`: a deep path scrolls instead
     /// of widening the toolbar.
     scroller: ?*c.GtkWidget = null,
@@ -143,6 +145,14 @@ pub fn installLocationFace(self: *BrowserView, bar: *c.GtkWidget, entry: *c.GtkW
     // The whole holder reads as ONE bordered control (a path bar),
     // not as a row of loose flat buttons; see view.zig installCss.
     c.gtk_widget_add_css_class(holder, "sketerm-fb-path");
+    const host = c.gtk_label_new("This computer");
+    c.gtk_label_set_max_width_chars(@ptrCast(host), 18);
+    c.gtk_label_set_ellipsize(@ptrCast(host), c.PANGO_ELLIPSIZE_MIDDLE);
+    c.gtk_widget_set_margin_start(host, 6);
+    c.gtk_widget_set_margin_end(host, 6);
+    c.gtk_widget_add_css_class(host, "dim-label");
+    c.gtk_box_append(@ptrCast(holder), host);
+    self.locbar.host_label = host;
 
     const sw = c.gtk_scrolled_window_new();
     // EXTERNAL keeps the content scrollable without a scrollbar
@@ -236,6 +246,12 @@ fn onHistoryGesture(gesture: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user:
 /// syncPathEntry, so every committed navigation refreshes it.
 pub fn rebuildCrumbs(self: *BrowserView, tab: *BTab) void {
     const box = self.locbar.box orelse return;
+    if (self.locbar.host_label) |label| {
+        var host_z: [512:0]u8 = undefined;
+        const host = std.fmt.bufPrintZ(&host_z, "{s}", .{tab.hc.host orelse "This computer"}) catch "Remote host";
+        c.gtk_label_set_text(@ptrCast(label), host.ptr);
+        c.gtk_widget_set_tooltip_text(label, host.ptr);
+    }
     // The pending dropdown belongs to buttons that are about to be
     // destroyed.
     self.cancelSiblings();

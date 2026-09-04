@@ -124,6 +124,8 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_POPUP_OPEN,
     proto.CAP_DOWNLOADS,
     proto.CAP_DOWNLOAD_START,
+    proto.CAP_DOWNLOAD_STAGING,
+    proto.CAP_DOWNLOAD_ERRORS,
     proto.CAP_A11Y,
     proto.CAP_A11Y_CARET,
     proto.CAP_CONTEXTS,

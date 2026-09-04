@@ -120,6 +120,9 @@ pub const CAP_DOWNLOADS = "downloads";
 /// client's `req` back so the answer can be routed to the caller that
 /// asked. Without it a client can only observe downloads a page starts.
 pub const CAP_DOWNLOAD_START = "download-start";
+/// Helper-owned staging for downloads whose destination is on another host.
+pub const CAP_DOWNLOAD_STAGING = "download-staging";
+pub const CAP_DOWNLOAD_ERRORS = "download-errors";
 /// The helper accepts `a11y_enable` and, for a view it was enabled on,
 /// streams the engine's accessibility tree as `ev_a11y_tree` /
 /// `ev_a11y_loc` / `ev_a11y_event` frames (the 0x70 block). Nothing is
@@ -1308,7 +1311,6 @@ pub const EvPagePopup = struct {
     frame_name: []const u8,
 };
 
-
 pub const EvCursor = struct {
     pub const tag: Tag = .ev_cursor;
     view: u32,
@@ -1583,6 +1585,15 @@ pub const DownloadDecide = struct {
     view: u32,
     id: u32,
     path: []const u8,
+    /// Allocate a private helper-side staging file; progress reports its path.
+    stage: u8 = 0,
+
+    pub fn decodeFrom(payload: []const u8) !DownloadDecide {
+        var cur = Cur{ .buf = payload };
+        var out: DownloadDecide = .{ .view = try cur.readU32(), .id = try cur.readU32(), .path = try cur.readStr() };
+        out.stage = cur.readU8() catch 0;
+        return out;
+    }
 };
 
 /// Coalesced progress for a decided download: at most one frame per
@@ -1608,6 +1619,8 @@ pub const EvDownloadProgress = struct {
     /// Canceled or interrupted. `done` and `failed` are exclusive.
     failed: u8,
     req: u32 = 0,
+    path: []const u8 = "",
+    interrupt_reason: i32 = 0,
 
     pub fn decodeFrom(payload: []const u8) !EvDownloadProgress {
         var cur = Cur{ .buf = payload };
@@ -1620,6 +1633,8 @@ pub const EvDownloadProgress = struct {
             .failed = try cur.readU8(),
         };
         out.req = cur.readU32() catch 0;
+        out.path = cur.readStr() catch "";
+        out.interrupt_reason = cur.readI32() catch 0;
         return out;
     }
 };
@@ -4167,6 +4182,8 @@ test "round-trip: tls and permission frames" {
 }
 
 test "round-trip: download frames" {
+    try roundTrip(DownloadDecide, .{ .view = 7, .id = 41, .path = "report.pdf", .stage = 1 });
+    try roundTrip(EvDownloadProgress, .{ .view = 7, .id = 41, .received = 3, .total = 0, .done = 0, .failed = 1, .path = "/tmp/sketerm-webdl-test", .interrupt_reason = 3 });
     try roundTrip(EvDownloadOffer, .{
         .view = 7,
         .id = 41,
@@ -4219,6 +4236,28 @@ test "an ev_download_offer without the trailing req still decodes" {
     const ev = try EvDownloadOffer.decodeFrom(out.items);
     try std.testing.expectEqual(@as(u32, 0), ev.req);
     try std.testing.expectEqualStrings("x.bin", ev.name);
+}
+
+test "legacy download decisions and progress default staging and errors" {
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try putU32(a, &bytes, 7);
+    try putU32(a, &bytes, 41);
+    try putStr(a, &bytes, "/tmp/file.bin");
+    const decision = try DownloadDecide.decodeFrom(bytes.items);
+    try std.testing.expectEqual(@as(u8, 0), decision.stage);
+    bytes.clearRetainingCapacity();
+    try putU32(a, &bytes, 7);
+    try putU32(a, &bytes, 41);
+    try putU64(a, &bytes, 10);
+    try putU64(a, &bytes, 10);
+    try putU8(a, &bytes, 1);
+    try putU8(a, &bytes, 0);
+    const progress = try EvDownloadProgress.decodeFrom(bytes.items);
+    try std.testing.expectEqual(@as(u32, 0), progress.req);
+    try std.testing.expectEqualStrings("", progress.path);
+    try std.testing.expectEqual(@as(i32, 0), progress.interrupt_reason);
 }
 
 test "a sem_eval without the trailing max_str decodes as the serializer default" {

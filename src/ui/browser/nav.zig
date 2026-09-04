@@ -945,8 +945,8 @@ pub fn quickLookKey(self: *BrowserView) bool {
 /// pointer so the table itself stays untouched.
 fn chordIsFileOp(run: *const fn (*BrowserView) bool) bool {
     const blocked = [_]*const fn (*BrowserView) bool{
-        &chordUndo,     &chordRedo,   &chordCut,      &chordPaste,
-        &chordTrash,    &chordDelete, &chordRename,   &chordCopyPeer,
+        &chordUndo,     &chordRedo,   &chordCut,    &chordPaste,
+        &chordTrash,    &chordDelete, &chordRename, &chordCopyPeer,
         &chordMovePeer,
     };
     for (blocked) |b| if (run == b) return true;
@@ -1469,8 +1469,7 @@ pub fn typeahead(self: *BrowserView, keyval: c_uint) bool {
     const uni = c.gdk_keyval_to_unicode(keyval);
     // Space is excluded: it is a selection key.
     if (!printableAscii(uni)) return false;
-    const tab = self.currentTab() orelse return false;
-    if (tab.view_mode == .icons) return false;
+    _ = self.currentTab() orelse return false;
     const now = c.g_get_monotonic_time();
     if (now - self.ta_last_us > TYPEAHEAD_RESET_US) self.ta_len = 0;
     self.ta_last_us = now;
@@ -1488,19 +1487,37 @@ pub fn typeahead(self: *BrowserView, keyval: c_uint) bool {
 pub fn typeaheadJump(self: *BrowserView) bool {
     const tab = self.currentTab() orelse return false;
     const prefix = self.ta_buf[0..self.ta_len];
+    if (tab.view_mode == .icons) {
+        const fb = tab.flowbox orelse return false;
+        var index: c_int = 0;
+        while (c.gtk_flow_box_get_child_at_index(fb, index)) |child| : (index += 1) {
+            const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse continue;
+            const row: *@import("render.zig").RowCtx = @ptrCast(@alignCast(data));
+            if (!typeaheadMatches(row.path, prefix)) continue;
+            c.gtk_flow_box_unselect_all(fb);
+            c.gtk_flow_box_select_child(fb, child);
+            _ = c.gtk_widget_grab_focus(@ptrCast(@alignCast(child)));
+            self.setStatusFmt("jump: {s}", .{prefix});
+            return true;
+        }
+        return false;
+    }
     const n = colview.itemCount(tab);
     var idx: c.guint = 0;
     while (idx < n) : (idx += 1) {
         const d = colview.itemDataAt(tab, idx) orelse continue;
         if (d.kind != .entry) continue;
-        const name = std.fs.path.basename(d.path);
-        if (name.len < prefix.len) continue;
-        if (!std.ascii.eqlIgnoreCase(name[0..prefix.len], prefix)) continue;
+        if (!typeaheadMatches(d.path, prefix)) continue;
         colview.focusRow(tab, idx, true);
         self.setStatusFmt("jump: {s}", .{prefix});
         return true;
     }
     return false;
+}
+
+fn typeaheadMatches(path: []const u8, prefix: []const u8) bool {
+    const name = std.fs.path.basename(path);
+    return name.len >= prefix.len and std.ascii.eqlIgnoreCase(name[0..prefix.len], prefix);
 }
 
 pub fn onPathActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {

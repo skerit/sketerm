@@ -1172,6 +1172,19 @@ H.264/AAC) while the distro build enables them.
 
 ## Downloads (0x78 block, capabilities "downloads" + "download-start")
 
+`download-staging` adds the optional trailing `DownloadDecide.stage` byte:
+with a non-empty path and `stage=1`, the helper allocates a private file
+and reports its absolute path in the optional `EvDownloadProgress.path`.
+Failed staging files are removed; completed ones belong to the client's
+delivery workflow. The GUI submits a durable daemon transfer from the
+helper's host to the chosen destination, consuming staging only after a
+verified delivery. Old helpers are never asked to stage. `download-errors`
+adds `EvDownloadProgress.interrupt_reason` after that path; it is CEF's
+integer interrupt reason, translated by `web/download.zig` without CEF deps.
+Legacy frames default both new fields to empty/zero. A download retry starts
+the web request over, while a delivery retry reuses the completed file and
+the transfer ledger token. Late offers for expired/canceled requests are declined.
+
 Every download's TARGET decision is held for the client: `can_download`
 returns 1, `on_before_download` keeps the callback and posts
 `ev_download_offer`, and only a `download_decide` naming a path lets the

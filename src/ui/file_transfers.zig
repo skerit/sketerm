@@ -1531,22 +1531,33 @@ pub const Service = struct {
     /// submitter can poll `intentProgress`, or null when the record
     /// could not be created.
     pub fn submitUpload(self: *Service, allocator: std.mem.Allocator, local_path: []const u8, host: []const u8, remote_path: []const u8, origin: ?*anyopaque) ?[]u8 {
+        return self.submitDelivery(allocator, "", local_path, host, remote_path, false, origin);
+    }
+
+    /// One-way delivery without an editor watch, from either host.
+    pub fn submitDelivery(self: *Service, allocator: std.mem.Allocator, src_host: []const u8, src_path: []const u8, dst_host: []const u8, dst_path: []const u8, consume_source: bool, origin: ?*anyopaque) ?[]u8 {
         if (self.durability_error) {
             self.notify("transfer not started because recovery state is unavailable", .{});
             return null;
         }
-        const it = self.createIntent(.upload, "", local_path, host, remote_path, "", "", 0) catch return null;
-        it.origin = origin;
-        self.intents.append(self.allocator, it) catch {
+        const it = self.createIntent(.upload, src_host, src_path, dst_host, dst_path, "", "", 0) catch return null;
+        const token = allocator.dupe(u8, it.token) catch {
             _ = it.handle.destroyRecord();
             it.destroy(self.allocator);
             return null;
         };
-        const token = allocator.dupe(u8, it.token) catch null;
+        it.delete_src_after = consume_source;
+        it.origin = origin;
+        self.intents.append(self.allocator, it) catch {
+            allocator.free(token);
+            _ = it.handle.destroyRecord();
+            it.destroy(self.allocator);
+            return null;
+        };
         self.writeIntent(it);
         if (self.durability_error) {
             self.removeIntent(it);
-            if (token) |t| allocator.free(t);
+            allocator.free(token);
             return null;
         }
         self.pump();
@@ -1554,7 +1565,7 @@ pub const Service = struct {
         return token;
     }
 
-    pub const IntentProgress = struct { state: store.State, done: u64, total: u64 };
+    pub const IntentProgress = struct { state: store.State, done: u64, total: u64, message: []const u8 };
 
     /// Live progress for one owned intent, or null when the record is
     /// gone — which, for a token this process submitted and has been
@@ -1562,7 +1573,7 @@ pub const Service = struct {
     pub fn intentProgress(self: *Service, token: []const u8) ?IntentProgress {
         for (self.intents.items) |it| {
             if (!std.mem.eql(u8, it.token, token)) continue;
-            return .{ .state = it.state, .done = it.done, .total = it.total };
+            return .{ .state = it.state, .done = it.done, .total = it.total, .message = it.message };
         }
         return null;
     }
@@ -1593,7 +1604,7 @@ pub const Service = struct {
         defer self.allocator.free(token);
         var handle = (try store.open(self.allocator, .intent, token)) orelse return error.LedgerBusy;
         errdefer handle.release();
-        const submitted = if (kind == .upload) fingerprint(src_path) else null;
+        const submitted = if (kind == .upload and src_host.len == 0) fingerprint(src_path) else null;
         return self.dupIntent(handle, .{
             .token = token,
             .kind = kind,
@@ -1719,6 +1730,8 @@ pub const Service = struct {
             // Stable across attempts: a capable daemon restarts the
             // failed job (and its staged data) instead of duplicating.
             .transfer_token = it.token,
+            .delete_src = it.delete_src_after,
+            .no_replace = it.no_replace,
         }) catch |err| {
             _ = self.pending.pop();
             if (err == error.WriteFailed) {
@@ -2874,8 +2887,10 @@ pub const Service = struct {
         it.submission_uncertain = false;
         it.retired = false;
         it.claimed = false;
+        it.job = 0;
+        it.cancel_requested = false;
         if (!self.writeIntentOk(it)) return;
-        self.handToDriver(it);
+        if (it.mediated) self.handToDriver(it) else self.pump();
         self.refreshViews();
     }
 
