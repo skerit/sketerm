@@ -70,6 +70,7 @@
 //! created it and no client can address another's.
 
 const std = @import("std");
+const diagnostic = @import("../web/diagnostic.zig");
 const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const pathz = @import("../util/pathz.zig");
@@ -753,6 +754,27 @@ pub const Engine = struct {
     /// Bumped by every successful helper start, so "was this context
     /// published to the helper that is running NOW" is derivable.
     helper_gen: u32 = 0,
+    cap_review: bool = false,
+    diagnostic: diagnostic.Capture = .{},
+    broker_diagnostics: bool = false,
+
+    pub fn diagnosticReport(self: *Engine, arena: std.mem.Allocator) diagnostic.Report {
+        if (self.diagnostic.id[0] == 0) {
+            const stage = self.diagnostic.stage;
+            self.diagnostic = diagnostic.Capture.record() catch return self.diagnostic.report();
+            self.diagnostic.stage = stage;
+        }
+        if (self.broker_diagnostics) {
+            if (self.remote) |*remote| {
+                const stage = self.diagnostic.stage;
+                if (remote.engineDiagnostic(arena)) |report| {
+                    self.diagnostic.adoptReport(report);
+                    if (self.helper_gen > 0) self.diagnostic.stage = stage;
+                } else |_| {}
+            }
+        }
+        return self.diagnostic.report();
+    }
 
     /// `route` selects the instance this engine IS; an invalid spec is
     /// refused rather than downgraded, because a route whose proxy is
@@ -818,6 +840,7 @@ pub const Engine = struct {
     /// teardown path (the helper also exits on its own when this
     /// process's socket closes).
     pub fn deinit(self: *Engine) void {
+        defer self.diagnostic.deinit();
         self.dropConnection();
         if (self.pid > 0 and self.cap_multi_client and self.remote != null) {
             // Broker-owned store + multi-client helper: the helper
@@ -1203,7 +1226,7 @@ pub const Engine = struct {
         self.dropConnection();
         if (self.pid > 0) {
             var status: c_int = 0;
-            _ = c.waitpid(self.pid, &status, c.WNOHANG);
+            if (c.waitpid(self.pid, &status, c.WNOHANG) == self.pid) self.diagnostic.exited(status);
             self.pid = -1;
         }
         self.clearViews();
@@ -1214,6 +1237,7 @@ pub const Engine = struct {
         self.cap_shm = false;
         self.cap_semantic = false;
         self.cap_reader_ids = false;
+        self.cap_review = false;
         self.cap_semantic_request_ids = false;
         self.cap_view_url = false;
         self.cap_intercept = false;
@@ -1295,6 +1319,11 @@ pub const Engine = struct {
         // adopting it for a route would browse direct under a route.
         if (self.remote != null and self.route_kind == .direct and brokerEngineWanted()) {
             if (self.brokerEngine(sock)) return true;
+            // A diagnostic-capable broker accepted ownership of the launch.
+            // Preserve its failure, and never race a second CEF process on its
+            // profile root after a bind timeout. Unsupported brokers still fall
+            // through to the compatibility lane below.
+            if (self.broker_diagnostics and self.state == .unavailable) return false;
             if (self.state == .unavailable and self.retryable) self.state = .idle;
         }
 
@@ -1353,6 +1382,7 @@ pub const Engine = struct {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const info = self.remote.?.engineOpen(arena_state.allocator()) catch return false;
+        self.broker_diagnostics = info.diagnostics;
         // The broker's engine listens where every sibling expects it
         // (this instance dir); a different path would mean a confused
         // daemon and adopting it would bind views to the wrong root.
@@ -1360,6 +1390,13 @@ pub const Engine = struct {
         const deadline = clock.nowMs() + SPAWN_WAIT_MS;
         const fd: c_int = while (true) {
             if (self.tryConnect(sock)) |fd| break fd;
+            if (info.diagnostics) {
+                if (self.remote.?.engineDiagnostic(arena_state.allocator())) |report| {
+                    self.diagnostic.adoptReport(report);
+                    if (report.exit_code != null or report.signal != null)
+                        return self.failStart("the broker's browser helper exited before establishing its connection");
+                } else |_| {}
+            }
             if (clock.nowMs() >= deadline)
                 return self.failStart("the broker's browser engine did not bind its socket in time");
             _ = c.usleep(100_000);
@@ -1382,6 +1419,7 @@ pub const Engine = struct {
     /// One spawn + connect + handshake attempt. On success the engine
     /// is `.ready` with the presence file written.
     fn startHelper(self: *Engine, bin: [*:0]const u8, sock: [:0]const u8, sock_z: *[108:0]u8, cache_z: *[4096:0]u8) bool {
+        self.broker_diagnostics = false;
         // A stale socket from a crashed helper would make the connect
         // succeed against nothing.
         _ = c.unlink(sock.ptr);
@@ -1399,10 +1437,13 @@ pub const Engine = struct {
         else
             null;
 
+        self.diagnostic.deinit();
+        self.diagnostic = diagnostic.Capture.init() catch
+            return self.failStart("could not create the browser helper's diagnostic capture");
         const pid = c.fork();
         if (pid == 0) {
-            // stdin/stdout to /dev/null; stderr stays (CEF refusals
-            // land there, next to the MCP server's own log).
+            self.diagnostic.child();
+            // stdin/stdout must not corrupt the MCP stream.
             const devnull = c.open("/dev/null", c.O_RDWR);
             if (devnull >= 0) {
                 _ = c.dup2(devnull, 0);
@@ -1434,19 +1475,26 @@ pub const Engine = struct {
                 argv[6] = p;
             }
             _ = c.execv(bin, @ptrCast(@constCast(&argv)));
+            diagnostic.Capture.execFailed();
             c._exit(127);
         }
-        if (pid < 0) return self.failStart("could not start the browser helper (fork failed)");
+        if (pid < 0) {
+            self.diagnostic.deinit();
+            return self.failStart("could not start the browser helper (fork failed)");
+        }
+        self.diagnostic.parent();
         self.pid = pid;
 
         // Connect loop, watching for a helper that dies on startup
         // (missing libcef, bad CEF deployment) — that never binds.
         const deadline = clock.nowMs() + SPAWN_WAIT_MS;
         const fd: c_int = while (true) {
+            self.diagnostic.drain();
             var status: c_int = 0;
             if (c.waitpid(self.pid, &status, c.WNOHANG) == self.pid) {
+                self.diagnostic.exited(status);
                 self.pid = -1;
-                return self.failStart("the browser helper exited during startup (see its stderr; usually a broken CEF install)");
+                return self.failStart("the browser helper exited before establishing its connection");
             }
             if (self.tryConnect(sock)) |fd| break fd;
             if (clock.nowMs() >= deadline) {
@@ -1565,6 +1613,7 @@ pub const Engine = struct {
     /// shared jar, and never loads it UNPOLICED.
     pub fn openViewIn(self: *Engine, url: []const u8, w: u16, h: u16, spec: ProfileSpec, policy_arg: ?*const NetPolicy) !*View {
         if (!self.ensure()) return error.Unavailable;
+        self.diagnostic.stage = .creating_browser;
 
         // The effective policy: the explicit one, else the profile's
         // session default when the open names a profile.
@@ -2136,6 +2185,7 @@ pub const Engine = struct {
 
     pub fn navigate(self: *Engine, id: u32, url: []const u8) !void {
         if (!self.ensure()) return error.Unavailable;
+        self.diagnostic.stage = .navigating;
         const v = self.findView(id) orelse return error.NoView;
         navfault.navigationRequested(self.gpa, &v.load_retry);
         self.send(proto.Navigate{ .view = id, .url = url }) catch return error.Unavailable;
@@ -2805,6 +2855,7 @@ pub const Engine = struct {
     /// Wait up to `slice_ms` for helper bytes and dispatch what
     /// arrived. Callers loop this under their own deadline.
     pub fn pumpOnce(self: *Engine, slice_ms: i32) void {
+        self.diagnostic.drain();
         if (self.fd < 0) return;
         var pfd = c.struct_pollfd{ .fd = self.fd, .events = c.POLLIN, .revents = 0 };
         const r = c.poll(&pfd, 1, slice_ms);
@@ -2928,6 +2979,7 @@ pub const Engine = struct {
                 self.cap_shm = false;
                 self.cap_semantic = false;
                 self.cap_reader_ids = false;
+                self.cap_review = false;
                 self.cap_semantic_request_ids = false;
                 self.cap_view_url = false;
                 self.cap_intercept = false;
@@ -2944,6 +2996,7 @@ pub const Engine = struct {
                     if (std.mem.eql(u8, cap, proto.CAP_VIEW_CREATE_URL)) self.cap_view_url = true;
                     if (std.mem.eql(u8, cap, proto.CAP_INTERCEPT)) self.cap_intercept = true;
                     if (std.mem.eql(u8, cap, proto.CAP_READER_IDS)) self.cap_reader_ids = true;
+                    if (std.mem.eql(u8, cap, proto.CAP_REVIEW)) self.cap_review = true;
                     if (std.mem.eql(u8, cap, proto.CAP_SEMANTIC_REQUEST_IDS)) self.cap_semantic_request_ids = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS)) self.cap_contexts = true;
                     if (std.mem.eql(u8, cap, proto.CAP_CONTEXTS_FAIL_CLOSED)) self.cap_contexts_fail_closed = true;

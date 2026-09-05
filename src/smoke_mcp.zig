@@ -3137,6 +3137,65 @@ fn certStage(m: *Mcp, rt: []const u8) void {
     say("smoke-mcp: refused-certificate stage ok");
 }
 
+fn webReviewStage(m: *Mcp, rt: []const u8) void {
+    var path_buf: [512:0]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, "{s}/review.html", .{rt}) catch unreachable;
+    const html =
+        "<!doctype html><title>Review fixture</title><div role=main id=outer><main id=inner>" ++
+        "<pl-button id=wrapper aria-expanded=false aria-controls=menu></pl-button>" ++
+        "<div id=wide style='width:200px;overflow:auto'><div style='width:400px'>Overflow</div></div>" ++
+        "<div id=menu>Menu</div></main></div><script>" ++
+        "const host=document.querySelector('pl-button');const root=host.attachShadow({mode:'open'});" ++
+        "root.innerHTML='<button id=actual>Toggle menu</button>';const b=root.querySelector('button');b.focus();" ++
+        "b.onclick=()=>{history.pushState({},'', '#spa');console.error('review-console-error');" ++
+        "setTimeout(()=>{document.body.dataset.done='yes';throw new Error('review-uncaught-error')},20)};" ++
+        "</script>";
+    @import("util/atomicwrite.zig").writeFileExact(path, html, 0o600) catch fail("cannot write review fixture");
+    var args: [2048]u8 = undefined;
+    m.sendTool("web_open", std.fmt.bufPrint(&args, "{{\"url\":\"file://{s}\",\"ephemeral\":true}}", .{path}) catch unreachable);
+    const opened = m.recvLine(60_000);
+    if (std.mem.indexOf(u8, opened, "isError") != null) fail("review fixture failed to open");
+    const view = viewHandleOf(opened);
+    const inspected = m.callTool("web_inspect", "{}");
+    for ([_][]const u8{ "nested_main", "disclosure_on_wrapper", "horizontal_overflow", "actual", "Toggle menu" }) |needle| {
+        if (std.mem.indexOf(u8, inspected, needle) == null) {
+            say(inspected);
+            fail("inspection missed a required defect or focused shadow control");
+        }
+    }
+    const scoped = m.callTool("web_inspect", "{\"selector\":\"#wide\"}");
+    if (std.mem.indexOf(u8, scoped, "horizontal_overflow") == null or std.mem.indexOf(u8, scoped, "nested_main") != null)
+        fail("inspection selector did not bound findings");
+    const checkpoint = m.callTool("web_checkpoint", "{}");
+    var id_buf: [64]u8 = undefined;
+    const id = presenceField(checkpoint, "checkpoint", &id_buf) orelse fail("checkpoint id missing");
+    // Trusted keyboard interaction, not a monkey-patched navigation function.
+    const key = m.callTool("web_key", "{\"keys\":\"Enter\"}");
+    if (std.mem.indexOf(u8, key, "isError") != null) fail("review fixture trusted key failed");
+    const spa = m.callTool("web_checkpoint", std.fmt.bufPrint(&args, "{{\"id\":\"{s}\",\"ready_selector\":\"body[data-done=yes]\"}}", .{id}) catch unreachable);
+    for ([_][]const u8{ "\"document_preserved\":true", "\"passed\":true", "review-console-error", "review-uncaught-error" }) |needle| {
+        if (std.mem.indexOf(u8, spa, needle) == null) {
+            say(spa);
+            fail("soft navigation checkpoint lost document identity or new errors");
+        }
+    }
+    _ = m.callTool("web_navigate", "{\"action\":\"reload\"}");
+    const reload = m.callTool("web_checkpoint", std.fmt.bufPrint(&args, "{{\"id\":\"{s}\",\"expect_preserved\":false,\"screenshot\":true,\"out_dir\":\"{s}/review-evidence\"}}", .{ id, rt }) catch unreachable);
+    if (std.mem.indexOf(u8, reload, "\"document_preserved\":false") == null or
+        std.mem.indexOf(u8, reload, "\"passed\":true") == null or std.mem.indexOf(u8, reload, "\"artifacts\":") == null)
+    {
+        say(reload);
+        fail("full reload checkpoint or evidence export failed");
+    }
+    _ = m.callTool("web_close", std.fmt.bufPrint(&args, "{{\"pane\":{d}}}", .{view}) catch unreachable);
+    var report_buf: [65536]u8 = undefined;
+    const report = readSmall(std.fmt.bufPrint(&args, "{s}/review-evidence/report.md", .{rt}) catch unreachable, &report_buf);
+    for ([_][]const u8{ "document_preserved", "captured_at_ms", "viewport", "nested_main", "screenshot.png" }) |needle|
+        if (std.mem.indexOf(u8, report, needle) == null) fail("exported evidence is not self-contained after view close");
+    if (!fileExists(std.fmt.bufPrint(&args, "{s}/review-evidence/screenshot.png", .{rt}) catch unreachable)) fail("exported screenshot missing");
+    say("smoke-mcp: review inspection, shadow controls, SPA/reload checkpoints and durable export ok");
+}
+
 fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
     // A local page with a button that mutates a paragraph: enough for
     // snapshot ids, a trusted click, the delta and reader extraction.
@@ -3330,6 +3389,8 @@ fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) vo
     if (std.mem.indexOf(u8, tabs, "\"backend\":\"headless\"") == null or
         std.mem.indexOf(u8, tabs, "\"view\":1") == null)
         fail("web_tabs does not list the headless view");
+
+    webReviewStage(&m, rt);
 
     // ── named profiles against REAL CEF ─────────────────────────────
     //
@@ -4212,7 +4273,11 @@ fn fakeWebengine(allocator: std.mem.Allocator, sock_path: []const u8) u8 {
             }
         }
     }
-    if (c.getenv("SKETERM_FAKE_WEB_EXIT") != null) return 1;
+    if (c.getenv("SKETERM_FAKE_WEB_EXIT") != null) {
+        say("Authorization: Bearer DO-NOT-EXPOSE-STARTUP-SECRET");
+        say("FATAL startup fixture: shutdown: Operation not permitted (1)");
+        return 23;
+    }
 
     var addr = std.mem.zeroes(c.struct_sockaddr_un);
     if (sock_path.len + 1 > addr.sun_path.len) return 1;
@@ -4464,17 +4529,34 @@ fn webSessionFakeStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []c
 
     // A helper that dies on startup must cost the session, not the web
     // tools' error clarity — and must not leak the session.
-    {
+    for ([_]bool{ false, true }) |broker| {
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", if (broker) "1" else "0", 1);
+        defer _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
         _ = c.setenv("SKETERM_FAKE_WEB_EXIT", "1", 1);
         defer _ = c.unsetenv("SKETERM_FAKE_WEB_EXIT");
-        var m = Mcp.spawn(allocator, exe, &.{});
+        var m = Mcp.spawn(allocator, exe, if (broker) &.{ "--name", "diagnostic-failure" } else &.{});
         m.initialize();
         m.sendTool("web_open", "{\"url\":\"https://smoke.invalid/broken\"}");
         const failed = m.recvLine(60_000);
         if (std.mem.indexOf(u8, failed, "isError") == null or
-            std.mem.indexOf(u8, failed, "exited during startup") == null)
+            std.mem.indexOf(u8, failed, "before establishing its connection") == null or
+            std.mem.indexOf(u8, failed, "\"exit_code\":23") == null or
+            std.mem.indexOf(u8, failed, "Operation not permitted") == null or
+            std.mem.indexOf(u8, failed, "DO-NOT-EXPOSE-STARTUP-SECRET") != null)
             fail("a startup-dead helper did not surface as the described startup error");
-        const priv = std.fmt.bufPrint(&args_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ rt, m.pid }) catch unreachable;
+        if (broker and std.mem.indexOf(u8, failed, "broker's browser helper") == null)
+            fail("broker startup failure was masked by a client-spawn fallback");
+        var diagnostic_id: [64]u8 = undefined;
+        const did = presenceField(failed, "id", &diagnostic_id) orelse fail("startup failure has no diagnostic id");
+        const details = m.callTool("web_diagnostic", std.fmt.bufPrint(&args_buf, "{{\"id\":\"{s}\"}}", .{did}) catch unreachable);
+        if (std.mem.indexOf(u8, details, "Operation not permitted") == null or
+            std.mem.indexOf(u8, details, "\"stage\":\"connecting\"") == null or
+            std.mem.indexOf(u8, details, "DO-NOT-EXPOSE-STARTUP-SECRET") != null)
+            fail("diagnostic follow-up lost the evidence or exposed a secret");
+        const priv = if (broker)
+            std.fmt.bufPrint(&args_buf, "{s}/sketerm/mcp-diagnostic-failure/mux.sock", .{rt}) catch unreachable
+        else
+            std.fmt.bufPrint(&args_buf, "{s}/sketerm/mcp-tmp-{d}/mux.sock", .{ rt, m.pid }) catch unreachable;
         // The POSITIVE control is inside listSessionsChecked: an
         // unreachable daemon used to pass this leak check vacuously,
         // since an empty listing contains no "web-" either.

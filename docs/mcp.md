@@ -186,6 +186,77 @@ but a page owns its own DOM and can label a "Confirm payment" button
 "Cancel". No server can adjudicate that, which is why `web_act` reports
 what it clicked instead of refusing on content grounds.
 
+### Browser review and durable evidence
+
+`web_inspect` combines a bounded live DOM review with new page errors and
+the existing console mirror. Use `selector` to narrow findings and
+`screenshot:true` to include pixels. It lists landmarks, focus, control
+names and disclosure attributes, wrapper/control mismatches, nested main
+landmarks and horizontal overflow. Elements are described once in an
+inspection-local reference table; these references are **not** `web_act`
+ids. Coverage is the main document and open shadow roots, using the same
+accname-lite naming as snapshots, not a full accessibility audit. Output
+budgets and lost-error counts are explicit. The GUI backend reports its
+missing native console mirror as unavailable; it still captures uncaught
+page errors and promise rejections.
+
+For document-preserving navigation:
+
+1. Call `web_checkpoint` and retain its `checkpoint` id.
+2. Use the ordinary `web_act`, `web_key`, etc. interaction tools.
+3. Call `web_checkpoint` with `id` and a completion condition:
+   `ready_selector` and/or `url_contains`, bounded by `timeout_ms`.
+
+The result reports `document_preserved`, `passed`, URL before/after, focus
+and errors since the checkpoint. `expect_preserved` defaults to true;
+false tests a full navigation. A false `passed` is a failed assertion.
+No navigation API is wrapped and no application window marker is planted:
+identity belongs to the injected script's document context, so semantic
+IDs carried across a reload cannot fool the assertion. BFCache restoration
+of the original context counts as preservation. The MCP process retains
+32 checkpoints for one hour; passing a checkpoint id to `web_inspect`
+also scopes its error history.
+
+Either tool accepts `out_dir:"/absolute/new-review-directory"` to export
+`report.md`, `review.json` and, when requested, `screenshot.png`. The
+parent must exist and the directory must be new: existing evidence is
+never overwritten. Directories are private (0700), files 0600, and the
+report is published last using the shared atomic writer. The report
+contains the observations, viewport and wall-clock capture time, and
+remains readable after closing the browser. Screenshot and DOM are
+sampled sequentially, not atomically; a document change during capture
+refuses the export. No cookies, storage or form values are collected;
+URL userinfo, query and fragment are omitted, sensitive diagnostic text
+is conservatively redacted. **Pixels can still show sensitive visible
+page content**, so screenshot export is always explicit. A failed export
+can leave partial files in its newly created directory, as the error says.
+
+These operations require the helper's `review` capability; update the
+helper as well as the MCP binary. `capabilities.web_review` describes
+the support and limitations. Because optional export writes files, the
+two review operations are classified as mutating in tool policy.
+
+### Browser failure diagnostics
+
+Headless browser failures include a stage, diagnostic id, exit code or
+signal when observed, and a bounded redacted helper-stderr excerpt in
+`error.details` as well as concise text. `web_diagnostic {"id":"..."}`
+retrieves retained detail without starting another helper or finding a
+log file. A cause is not guessed from helper death: an OS refusal is
+reported as an OS refusal, not a broken CEF installation.
+
+Capture is shared by direct and broker-owned launches. New brokers
+advertise it in `engine_open`; old brokers and externally adopted
+helpers may have no captured stderr. `stderr_available` and
+`best_effort` make this distinction explicit. Capture uses bounded
+nonblocking datagrams, so a noisy helper cannot block and a lingering
+helper cannot receive SIGPIPE when its diagnostic reader disappears.
+Under extreme logging, datagrams may be lost; an empty excerpt never
+proves no errors were written. Only complete sanitized lines are
+retained (8KiB; initial replies 2KiB). IDs last until the next launch
+attempt on that route or MCP shutdown. GUI-owned launch capture is not
+available through this tool; `capabilities.web_diagnostics` says so.
+
 ### Your own browser: the `web_gui` grant
 
 In the default isolated mode the web tools run a PRIVATE

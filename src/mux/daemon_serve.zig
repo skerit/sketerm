@@ -3494,6 +3494,16 @@ pub fn handleWebOp(self: *Daemon, cl: *Client, payload: []const u8) void {
     // clients that only ever do profile work.
     if (std.mem.startsWith(u8, r.op, "profile_")) return handleWebProfileOp(self, cl, r);
     if (std.mem.eql(u8, r.op, "engine_open")) return handleWebEngineOpen(self, cl, r);
+    if (std.mem.eql(u8, r.op, "engine_diagnostic")) {
+        sweepWebEngines(self);
+        for (self.web_engines.items) |*e| {
+            if (std.mem.eql(u8, e.key, r.instance)) {
+                cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .diagnostic = e.diagnostic.report() });
+                return;
+            }
+        }
+        return webReplyErr(cl, r.req, "no retained engine diagnostic for this instance");
+    }
     const store = webStore(self) orelse return webReplyErr(cl, r.req, "web store unavailable");
 
     if (std.mem.eql(u8, r.op, "history_add")) {
@@ -3781,18 +3791,15 @@ fn selfInstanceKey(self: *Daemon) ?[]const u8 {
 /// Reap engines that exited on their own (the linger TTL); called
 /// before every use so a dead entry never masks a needed spawn.
 fn sweepWebEngines(self: *Daemon) void {
-    var i: usize = 0;
-    while (i < self.web_engines.items.len) {
-        const e = self.web_engines.items[i];
+    for (self.web_engines.items) |*e| {
+        e.diagnostic.drain();
         var status: c_int = 0;
-        if (c.waitpid(e.pid, &status, c.WNOHANG) == e.pid) {
+        if (e.pid > 0 and c.waitpid(e.pid, &status, c.WNOHANG) == e.pid) {
+            e.diagnostic.exited(status);
+            e.diagnostic.deinit();
+            e.pid = -1;
             removePresenceAt(e.sock);
-            self.allocator.free(e.key);
-            self.allocator.free(e.sock);
-            _ = self.web_engines.swapRemove(i);
-            continue;
         }
-        i += 1;
     }
 }
 
@@ -3832,8 +3839,8 @@ fn handleWebEngineOpen(self: *Daemon, cl: *Client, r: WebOpReq) void {
         return webReplyErr(cl, r.req, "engine socket path too long");
 
     for (self.web_engines.items) |e| {
-        if (std.mem.eql(u8, e.key, key)) {
-            cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .sock = e.sock, .pid = e.pid, .spawned = false });
+        if (e.pid > 0 and std.mem.eql(u8, e.key, key)) {
+            cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .sock = e.sock, .pid = e.pid, .spawned = false, .diagnostics = true });
             return;
         }
     }
@@ -3872,9 +3879,36 @@ fn handleWebEngineOpen(self: *Daemon, cl: *Client, r: WebOpReq) void {
     // against every sibling engine_open.
     _ = c.unlink(sock_arg.ptr);
 
+    // Reserve every fallible allocation BEFORE spawning: an OOM must not
+    // leave an untracked engine holding the profile store's CEF files.
+    var slot: ?*Daemon.WebEngine = null;
+    for (self.web_engines.items) |*e| {
+        if (std.mem.eql(u8, e.key, key)) slot = e;
+    }
+    if (slot == null) {
+        const owned_key = self.allocator.dupe(u8, key) catch return webReplyErr(cl, r.req, "oom");
+        const owned_sock = self.allocator.dupe(u8, sock) catch {
+            self.allocator.free(owned_key);
+            return webReplyErr(cl, r.req, "oom");
+        };
+        self.web_engines.append(self.allocator, .{ .key = owned_key, .pid = -1, .sock = owned_sock }) catch {
+            self.allocator.free(owned_key);
+            self.allocator.free(owned_sock);
+            return webReplyErr(cl, r.req, "oom");
+        };
+        slot = &self.web_engines.items[self.web_engines.items.len - 1];
+    }
+    const entry = slot.?;
+    entry.diagnostic.deinit();
+    entry.diagnostic = @import("../web/diagnostic.zig").Capture.init() catch
+        return webReplyErr(cl, r.req, "could not create helper diagnostic capture");
     const pid = c.fork();
-    if (pid < 0) return webReplyErr(cl, r.req, "fork failed");
+    if (pid < 0) {
+        entry.diagnostic.deinit();
+        return webReplyErr(cl, r.req, "fork failed");
+    }
     if (pid == 0) {
+        entry.diagnostic.child();
         // Own process group so a future teardown can take CEF's whole
         // subprocess tree; stdio to /dev/null (CEF noise), like the
         // remote-helper spawn above.
@@ -3883,29 +3917,20 @@ fn handleWebEngineOpen(self: *Daemon, cl: *Client, r: WebOpReq) void {
         if (devnull >= 0) {
             _ = c.dup2(devnull, 0);
             _ = c.dup2(devnull, 1);
-            _ = c.dup2(devnull, 2);
             if (devnull > 2) _ = c.close(devnull);
         }
         var argv: [8:null]?[*:0]const u8 = .{ bin, "--socket", sock_arg.ptr, "--cache-dir", cache_arg.ptr, "--linger-ms", linger_z[0..linger_arg.len :0].ptr, null };
         _ = c.execv(bin, @ptrCast(@constCast(&argv)));
+        @import("../web/diagnostic.zig").Capture.execFailed();
         c._exit(127);
     }
-
-    const owned_key = self.allocator.dupe(u8, key) catch return webReplyErr(cl, r.req, "oom");
-    const owned_sock = self.allocator.dupe(u8, sock) catch {
-        self.allocator.free(owned_key);
-        return webReplyErr(cl, r.req, "oom");
-    };
-    self.web_engines.append(self.allocator, .{ .key = owned_key, .pid = pid, .sock = owned_sock }) catch {
-        self.allocator.free(owned_key);
-        self.allocator.free(owned_sock);
-        return webReplyErr(cl, r.req, "oom");
-    };
+    entry.diagnostic.parent();
+    entry.pid = pid;
     writeEnginePresence(self, sock, pid, key);
     log.debug("engine_open: spawned sketerm-webengine pid {d} for instance {s}", .{ pid, key });
     // The client owns the bind wait: replying now keeps the daemon's
     // loop free while CEF pays its multi-second startup.
-    cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .sock = owned_sock, .pid = pid, .spawned = true });
+    cl.queueJson(.web_reply, .{ .req = r.req, .ok = true, .sock = entry.sock, .pid = pid, .spawned = true, .diagnostics = true });
 }
 
 /// The presence file `web.json` (see webdrive's header), now written by

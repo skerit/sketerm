@@ -14,6 +14,7 @@
 const std = @import("std");
 
 comptime {
+    _ = @import("web/diagnostic.zig");
     _ = @import("web/download.zig");
     _ = @import("config.zig");
     _ = @import("editor/linebreak.zig");

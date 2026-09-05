@@ -1,5 +1,29 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-05: browser diagnostics and review evidence
+
+Browser MCP review is now a live semantic query (`review` capability),
+not a second accessible-name implementation or a client-authored DOM
+script. `mcp_web_review.zig` composes that query with the existing driver,
+console mirror, screenshot capture and atomic writer. Document checkpoints
+use a context-owned random identity: semantic IDs intentionally survive
+reloads and cannot prove soft navigation. See `docs/mcp.md` for the API,
+budgets, explicit backend limitations and export privacy contract.
+
+`web/diagnostic.zig` is the shared direct/broker helper-stderr capture.
+Nonblocking datagrams preserve the existing lingering-helper lifecycle:
+closing a reader cannot SIGPIPE a helper still serving another client.
+Broker records retain an exited child's last sanitized diagnostic until
+the next launch, with pre-fork allocations so an OOM cannot orphan a
+new engine. `web_diagnostic` reads evidence without respawning it.
+
+The smoke-MCP acceptance stages exercise deliberate startup failure and
+credential redaction, nested mains, disclosure attributes on a custom
+wrapper rather than its shadow button, horizontal overflow, trusted-key
+SPA navigation versus visually identical reload, and exported evidence
+read after closing the view. The datagram teardown invariant and bounded
+split-line redaction also have GTK-free unit tests.
+
 ## 2026-09-03: six file-manager reports from a remote session
 
 All six came from one sitting on a laptop browsing `archdev:` over ssh.

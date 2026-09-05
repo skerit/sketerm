@@ -914,7 +914,6 @@ test "hello-less clients default to the protocol-4 envelope with the legacy snap
 const pathz = @import("../util/pathz.zig");
 const pathZ = pathz.pathZ;
 
-
 /// One tunneled byte stream, bridged to clients as chan_* frames:
 /// a Wayland app connection (`native` set) or a window-stream session
 /// (`native` null, fd -1, frames produced in the daemon).
@@ -2630,6 +2629,7 @@ pub const Daemon = struct {
     };
 
     pub const WebEngine = struct {
+        diagnostic: @import("../web/diagnostic.zig").Capture = .{},
         /// Owned instance key.
         key: []u8,
         pid: c.pid_t,
@@ -2857,9 +2857,10 @@ pub const Daemon = struct {
         // without the broker and self-reaps on its TTL (init adopts and
         // reaps the pid once this process is gone). Only collect the
         // already-exited.
-        for (self.web_engines.items) |e| {
+        for (self.web_engines.items) |*e| {
+            e.diagnostic.deinit();
             var st: c_int = 0;
-            _ = c.waitpid(e.pid, &st, c.WNOHANG);
+            if (e.pid > 0) _ = c.waitpid(e.pid, &st, c.WNOHANG);
             self.allocator.free(e.key);
             self.allocator.free(e.sock);
         }

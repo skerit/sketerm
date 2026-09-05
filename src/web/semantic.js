@@ -56,10 +56,33 @@
   // patches JSON.stringify must not get to rewrite our replies.
   var stringify = JSON.stringify;
   var parseJson = JSON.parse;
+  var ownDescriptor = Object.getOwnPropertyDescriptor;
 
   // Per-context token: a fresh document means a fresh script instance,
   // which is exactly how the helper detects a navigation.
   var DOC = ((Math.random() * 0x7ffffffe) | 0) + 1;
+  // Context-owned identity, not an application window marker and not semantic
+  // ids (which deliberately carry across documents). BFCache restores retain it.
+  var reviewNonce = new Uint32Array(4);
+  crypto.getRandomValues(reviewNonce);
+  var reviewDocument = Array.prototype.map.call(reviewNonce, function (n) {
+    return ("00000000" + n.toString(16)).slice(-8);
+  }).join("");
+  var reviewErrors = [], reviewErrorId = 0;
+  function reviewError(kind, message) {
+    reviewErrors.push({ id: ++reviewErrorId, kind: kind, message: String(message || "").slice(0, 400) });
+    if (reviewErrors.length > 32) reviewErrors.shift();
+  }
+  window.addEventListener("error", function (e) {
+    // Resource-error events have no message; don't mislabel them JS exceptions.
+    if (e.message) reviewError("uncaught_exception", e.message);
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    // Don't enumerate arbitrary rejection objects or storage-bearing properties.
+    var reason = e.reason, desc = reason && typeof reason === "object" ? ownDescriptor(reason, "message") : null;
+    reviewError("unhandled_rejection", typeof reason === "string" ? reason :
+      (desc && typeof desc.value === "string" ? desc.value : "unhandled promise rejection"));
+  });
   var NAVGEN = 0;
   var QUIESCE_MS = 120;
   var CLAMP = [40, 160, 4000];
@@ -716,6 +739,103 @@
   function deepAll(sel) {
     var out = [];
     collectDeep(document, sel, out);
+    return out;
+  }
+
+  // Compact review shares the snapshot's name/role/visibility semantics, but
+  // does not consume its delta base. References below are report-local, NOT
+  // web_act ids. Values, hrefs, cookies and storage are never collected.
+  function review(options) {
+    var opt = options ? parseJson(options) : {};
+    var selector = opt.selector || "";
+    if (selector) document.querySelector(selector); // reject invalid CSS early
+    var nodes = [], refs = new Map(), landmarks = [], controls = [], issues = [];
+    var visited = 0, truncated = false, scopeFound = !selector, mains = [];
+    var focus = document.activeElement;
+    while (focus && focus.shadowRoot && focus.shadowRoot.activeElement) focus = focus.shadowRoot.activeElement;
+    var attrs = ["aria-label", "aria-labelledby", "aria-expanded", "aria-controls", "aria-haspopup"];
+    function attributes(el) {
+      var out = {};
+      attrs.forEach(function (a) { if (el.hasAttribute(a)) out[a] = el.getAttribute(a).slice(0, 160); });
+      return out;
+    }
+    function focusable(el) {
+      return !el.disabled && (el.tabIndex >= 0 || el.matches("button,input:not([type=hidden]),select,textarea,a[href],[tabindex],[contenteditable=true]"));
+    }
+    function ref(el) {
+      if (refs.has(el)) return refs.get(el);
+      if (nodes.length >= 120) { truncated = true; return null; }
+      var id = nodes.length + 1, role = roleOf(el);
+      var item = { ref: id, tag: el.tagName.toLowerCase(), role: role, name: nameOf(el, role).slice(0, 160) };
+      if (el.id) item.dom_id = el.id.slice(0, 160);
+      item.attributes = attributes(el);
+      item.focusable = focusable(el);
+      nodes.push(item); refs.set(el, id); return id;
+    }
+    function issue(kind, el, related, extra) {
+      if (issues.length >= 50) { truncated = true; return; }
+      var id = ref(el);
+      if (!id) return;
+      var item = { kind: kind, element: id };
+      if (related) item.related = ref(related);
+      if (extra) item.detail = extra;
+      issues.push(item);
+    }
+    var focusRef = focus ? ref(focus) : null;
+    function walk(el, inScope, main, disclosure, depth) {
+      if (++visited > 5000 || depth > 80) { truncated = true; return; }
+      if (SKIP_TAG[el.tagName] || hidden(el)) return;
+      inScope = inScope || !!(selector && el.matches(selector));
+      if (inScope) scopeFound = true;
+      var role = roleOf(el), isMain = role === "main";
+      var hasDisclosure = el.hasAttribute("aria-expanded") || el.hasAttribute("aria-controls");
+      if (inScope) {
+        if (/^(main|navigation|banner|contentinfo|complementary|search)$/.test(role) ||
+            (/^(region|form)$/.test(role) && nameOf(el, role))) {
+          var lr = ref(el); if (lr) landmarks.push(lr);
+        }
+        if (isMain) {
+          mains.push(el);
+          if (main) issue("nested_main", el, main);
+        }
+        var canFocus = focusable(el);
+        if (canFocus || hasDisclosure) {
+          var cr = ref(el); if (cr) controls.push(cr);
+        }
+        if (canFocus && disclosure) {
+          var missing = ["aria-expanded", "aria-controls"].filter(function (a) {
+            return disclosure.hasAttribute(a) && !el.hasAttribute(a);
+          });
+          if (missing.length) issue("disclosure_on_wrapper", el, disclosure, missing.join(", ") + " absent on focusable control");
+        }
+        if (el.clientWidth > 0 && el.scrollWidth > el.clientWidth + 1)
+          issue("horizontal_overflow", el, null, "scrollWidth=" + el.scrollWidth + ", clientWidth=" + el.clientWidth);
+      }
+      var nextMain = isMain ? el : main, nextDisclosure = hasDisclosure ? el : disclosure;
+      if (el.shadowRoot) children(el.shadowRoot, inScope, nextMain, nextDisclosure, depth + 1);
+      children(el, inScope, nextMain, nextDisclosure, depth + 1);
+    }
+    function children(root, scoped, main, disclosure, depth) {
+      for (var i = 0; i < root.children.length && visited <= 5000; i++) walk(root.children[i], scoped, main, disclosure, depth);
+    }
+    if (!opt.identity_only && document.documentElement) walk(document.documentElement, !selector, null, null, 0);
+    if (mains.length > 1) issue("multiple_main", mains[0], mains[1], mains.length + " main landmarks in scope");
+    var url = new URL(location.href); url.username = ""; url.password = ""; url.search = ""; url.hash = "";
+    var since = opt.errors_document && opt.errors_document !== reviewDocument ? 0 : Math.max(0, Number(opt.errors_since) || 0);
+    var out = {
+      version: 1, document_id: reviewDocument, url: (/^(https?|file|about):$/.test(url.protocol) ? url.href : url.protocol).slice(0, 2048),
+      condition_met: (!opt.ready_selector || !!document.querySelector(opt.ready_selector)) &&
+        (!opt.url_contains || location.href.indexOf(opt.url_contains) >= 0),
+      viewport: { width: innerWidth, height: innerHeight },
+      scope_found: scopeFound, elements: nodes, focus: focusRef,
+      landmarks: landmarks, controls: controls, issues: issues,
+      document_overflow: Math.max(0, (document.documentElement ? document.documentElement.scrollWidth : 0) - innerWidth),
+      truncated: truncated, visited: visited,
+      page_errors: reviewErrors.filter(function (e) { return e.id > since; }),
+      error_cursor: reviewErrorId,
+      errors_dropped: Math.max(0, reviewErrorId - reviewErrors.length - since),
+      coverage: "main document and open shadow roots; accname-lite (same as snapshots), not a full accessibility audit; URL query/userinfo/fragment omitted"
+    };
     return out;
   }
 
@@ -2535,6 +2655,10 @@
         break;
       case "read":
         read(m.req, !!m.ids);
+        break;
+      case "review":
+        try { send({ op: "review", req: m.req, result: review(m.options) }); }
+        catch (e) { send({ op: "review", req: m.req, error: String(e.message || e).slice(0, 240) }); }
         break;
       case "pickoption":
         pickOption(m.req, m.arg || "", m.timeout || 4000);

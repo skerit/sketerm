@@ -140,6 +140,7 @@ const unconditional_caps = [_][]const u8{
     proto.CAP_WEBEXT_TRANSACTION,
     proto.CAP_FILTER_SUBSCRIBE,
     proto.CAP_READER_IDS,
+    proto.CAP_REVIEW,
     proto.CAP_SEMANTIC_REQUEST_IDS,
     proto.CAP_MULTI_CLIENT,
     proto.CAP_COOKIE_SYNC,

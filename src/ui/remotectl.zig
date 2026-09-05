@@ -1579,7 +1579,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
             break :blk face.autoExpand(id, req.offset orelse 0, req.length orelse 4096);
         }
         if (eql(u8, op, "query")) {
-            const qk = web_proto.SemQuery.fromName(req.action orelse "find_text") orelse
+            const qk = web_proto.SemQuery.fromOperationName(req.action orelse "find_text") orelse
                 return ipc_protocol.writeErr(out, allocator, "unknown query kind");
             break :blk face.autoQuery(@intFromEnum(qk), req.data orelse "");
         }

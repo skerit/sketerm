@@ -200,6 +200,7 @@ pub const Remote = struct {
         /// True when this call caused the spawn — the caller owns the
         /// bind wait (CEF startup is seconds).
         spawned: bool,
+        diagnostics: bool = false,
     };
 
     /// Ask the daemon for its broker-owned engine (spawn-if-absent,
@@ -220,6 +221,7 @@ pub const Remote = struct {
             sock: []const u8 = "",
             pid: c.pid_t = 0,
             spawned: bool = false,
+            diagnostics: bool = false,
             @"error": []const u8 = "",
         };
         const reply = self.opWithRetry(Reply, arena, .{
@@ -227,7 +229,20 @@ pub const Remote = struct {
             .instance = self.instance,
         }) catch return error.Io;
         if (!reply.ok or reply.sock.len == 0) return error.Io;
-        return .{ .sock = reply.sock, .pid = reply.pid, .spawned = reply.spawned };
+        return .{ .sock = reply.sock, .pid = reply.pid, .spawned = reply.spawned, .diagnostics = reply.diagnostics };
+    }
+
+    /// Call only after engine_open explicitly advertised diagnostics. Older
+    /// brokers never receive an unknown verb. Does not spawn or restart anything.
+    pub fn engineDiagnostic(self: *Remote, arena: std.mem.Allocator) !@import("../web/diagnostic.zig").Report {
+        const Reply = struct {
+            req: u32 = 0,
+            ok: bool = false,
+            diagnostic: @import("../web/diagnostic.zig").Report = .{},
+        };
+        const reply = try self.opWithRetry(Reply, arena, .{ .op = "engine_diagnostic", .instance = self.instance });
+        if (!reply.ok) return error.Io;
+        return reply.diagnostic;
     }
 
     /// Daemon advertises `web_engine` (it will answer engine_open).

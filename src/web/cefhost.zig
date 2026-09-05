@@ -795,6 +795,7 @@ const Pending = struct {
         /// solicits one walk and answers from the live tree, without
         /// consuming the base. `mode` is the query kind.
         query,
+        review,
         click,
         hover,
         act,
@@ -7178,6 +7179,7 @@ pub const Host = struct {
                 .payload = .{ .s = msg },
             }),
             .hints, .query => self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = msg } }),
+            .review => self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "{\"pending\":true}" } }),
             .click, .hover, .act, .set_value, .commit, .guarded_act, .choose_pick, .choose_done => self.post(proto.SemActResult{ .view = v.id, .id = p.sid, .ok = 0, .msg = msg }),
             .expand => self.post(proto.SemExpandResult{ .view = v.id, .id = p.sid, .off = p.off, .text = msg }),
             .read => self.post(proto.SemReadResult{ .view = v.id, .markdown = .{ .s = msg } }),
@@ -7592,8 +7594,22 @@ pub const Host = struct {
             self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = discarded_msg } });
             return;
         }
+        if (v.sem_nav.loading and req.kind == @intFromEnum(proto.SemQuery.review)) {
+            self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "{\"pending\":true}" } });
+            return;
+        }
         if (v.sem_nav.loading and req.kind != @intFromEnum(proto.SemQuery.visible)) {
             self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "semantic query unavailable while the page is navigating (web_navigate action:stop clears a stuck one)" } });
+            return;
+        }
+        if (req.kind == @intFromEnum(proto.SemQuery.review)) {
+            const rid = try self.pushPending(v, .{ .req = nextReq(v), .kind = .review });
+            var out: std.Io.Writer.Allocating = .init(self.gpa);
+            defer out.deinit();
+            try out.writer.print("{{\"op\":\"review\",\"req\":{d},\"options\":", .{rid});
+            try jsonStr(&out.writer, req.arg);
+            try out.writer.writeByte('}');
+            self.sendScript(v, out.written());
             return;
         }
         if (req.kind == @intFromEnum(proto.SemQuery.visible)) {
@@ -7901,6 +7917,12 @@ pub const Host = struct {
                 .ok = e.value.ok,
                 .json = .{ .s = body },
             });
+        } else if (std.mem.eql(u8, op, "review") and p.kind == .review) {
+            if (json.len > 131072) {
+                self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = "review exceeded its 128KiB response budget" } });
+                return;
+            }
+            self.post(proto.SemQueryResult{ .view = v.id, .payload = .{ .s = json } });
         } else if (std.mem.eql(u8, op, "setvalue")) {
             self.onSetValue(v, &p, json);
         } else if (std.mem.eql(u8, op, "ack")) {

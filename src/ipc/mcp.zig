@@ -1299,6 +1299,12 @@ pub const ErrCode = enum {
 /// The uniform error result: message in the text lane, machine shape
 /// in structuredContent, isError set.
 pub fn errRes(arena: std.mem.Allocator, code: ErrCode, msg: []const u8) ![]const u8 {
+    return errResDetails(arena, code, msg, @as(?u8, null));
+}
+
+/// Optional typed evidence belongs to the error, not a second error-shaped
+/// result builder in each tool family. The ordinary error contract is unchanged.
+pub fn errResDetails(arena: std.mem.Allocator, code: ErrCode, msg: []const u8, details: anytype) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
@@ -1309,6 +1315,10 @@ pub fn errRes(arena: std.mem.Allocator, code: ErrCode, msg: []const u8) ![]const
     try std.json.Stringify.value(msg, .{}, w);
     try w.writeAll(",\"retryable\":");
     try w.writeAll(if (code.retryable()) "true" else "false");
+    if (details != null) {
+        try w.writeAll(",\"details\":");
+        try std.json.Stringify.value(details, .{ .emit_null_optional_fields = false }, w);
+    }
     try w.writeAll("}},\"isError\":true}");
     return aw.written();
 }
@@ -3854,6 +3864,8 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     else
         try res.fact("web_watch", web_watch);
     try res.fact("web_engine_started", engine_started);
+    try res.fact("web_review", .{ .inspection = true, .checkpoints = true, .evidence_export = true, .requires_helper_capability = "review", .gui_console = false });
+    try res.fact("web_diagnostics", .{ .direct_capture = true, .broker_capture = "requires engine_open diagnostics capability", .gui_capture = false, .retention = "last attempt per route until next attempt or MCP shutdown" });
     if (web_ok and !gui_web and !engine_started)
         try res.text("the browser engine has not started yet (it spawns at the first web_* call), so web_backend/web_watch/web_session are not yet determined -- open a view and read them again rather than treating this reply as their final value");
     // The browser-page watch: the GUI joins this server's helper as a

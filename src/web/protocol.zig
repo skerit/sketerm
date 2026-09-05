@@ -217,6 +217,7 @@ pub const CAP_WEBEXT_TABS = "webext-tabs";
 /// of being resolved against a later page. A client without this
 /// capability keeps using the legacy `sem_read` / `sem_read_result` pair.
 pub const CAP_READER_IDS = "reader-ids";
+pub const CAP_REVIEW = "review";
 /// The helper accepts `sem_request`, which wraps one existing semantic
 /// request with a client-minted id, and answers with a correlated
 /// `sem_result`. Existing semantic frame layouts remain unchanged.
@@ -678,12 +679,21 @@ pub const SemQuery = enum(u8) {
     /// id in the argument) with its value and states: what Apply would
     /// submit, without a DOM script.
     form = 5,
+    /// Bounded live DOM review; JSON options and JSON result, no snapshot base consumed.
+    review = 6,
     _,
 
     /// The kinds a client may name in a request, read off this enum so
     /// a new kind is one edit here. `visible` is the hints walk and
     /// stays behind its own tool.
     pub fn fromName(name: []const u8) ?SemQuery {
+        const qk = fromOperationName(name) orelse return null;
+        return if (qk == .review) null else qk;
+    }
+
+    /// Internal review orchestration uses the query transport, not the public
+    /// web_query vocabulary (whose results describe the cached semantic tree).
+    pub fn fromOperationName(name: []const u8) ?SemQuery {
         const qk = std.meta.stringToEnum(SemQuery, name) orelse return null;
         return if (qk == .visible) null else qk;
     }
