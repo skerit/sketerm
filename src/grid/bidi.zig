@@ -16,6 +16,16 @@ pub const Direction = enum { auto, ltr, rtl };
 ///
 /// Returns the resolved paragraph direction. `dir == .auto` lets
 /// fribidi sniff it from the contents.
+/// One fribidi level as the renderer's unsigned level. `FriBidiLevel` is
+/// a signed char and the resolver leaves its output buffer untouched when
+/// it fails, so a negative value is possible and `@intCast` on it would be
+/// illegal behaviour — and a level of 128+ then drives `levelsToVisualOrder`
+/// through 255 reversal passes over garbage.
+fn levelByte(l: c.FriBidiLevel) u8 {
+    if (l <= 0) return 0;
+    return @intCast(l);
+}
+
 pub fn lineLevels(cps: []const u32, levels: []u8, dir: Direction) Direction {
     if (cps.len == 0) return .ltr;
     std.debug.assert(levels.len >= cps.len);
@@ -43,17 +53,23 @@ pub fn lineLevels(cps: []const u32, levels: []u8, dir: Direction) Direction {
     const out_levels = std.heap.c_allocator.alloc(c.FriBidiLevel, cps.len) catch return .ltr;
     defer std.heap.c_allocator.free(out_levels);
 
-    _ = c.fribidi_get_par_embedding_levels_ex(
+    // Returns 0 on failure, having written nothing — `out_levels` is
+    // then still the uninitialised heap it was allocated as.
+    const ok = c.fribidi_get_par_embedding_levels_ex(
         types.ptr,
         brackets.ptr,
         n,
         &pbase,
         out_levels.ptr,
     );
+    if (ok == 0) {
+        @memset(levels[0..cps.len], 0);
+        return .ltr;
+    }
 
     var i: usize = 0;
     while (i < cps.len) : (i += 1) {
-        levels[i] = @intCast(out_levels[i]);
+        levels[i] = levelByte(out_levels[i]);
     }
 
     // Resolved paragraph direction: even = LTR, odd = RTL.
@@ -103,6 +119,14 @@ pub fn levelsToVisualOrder(levels: []u8, indices: []usize) void {
         }
         if (lvl == 1) break;
     }
+}
+
+test "a negative embedding level resolves to 0 instead of wrapping" {
+    // FriBidiLevel is a signed char and the resolver leaves the buffer
+    // untouched when it fails, so the values reaching us can be negative.
+    try std.testing.expectEqual(@as(u8, 0), levelByte(-3));
+    try std.testing.expectEqual(@as(u8, 0), levelByte(0));
+    try std.testing.expectEqual(@as(u8, 2), levelByte(2));
 }
 
 test "all-LTR levels are 0" {
