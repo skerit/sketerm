@@ -109,6 +109,9 @@ comptime {
     _ = @import("ipc/mcp_tools.zig");
     _ = @import("ipc/mcp_registry.zig");
     _ = @import("ipc/mux_cli.zig");
+    _ = @import("ipc/mux_tty.zig");
+    _ = @import("mux/ttyrender.zig");
+    _ = @import("pty.zig");
     _ = @import("ipc/panelstore.zig");
     _ = @import("ipc/paneldrive.zig");
     _ = @import("ipc/protocol.zig");

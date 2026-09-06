@@ -2439,6 +2439,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Quick CLI connections send no hello and must still be served.
     noHelloStage(allocator, sock_path);
 
+    // `sketerm mux` on a non-sketerm terminal: the in-terminal viewer.
+    @import("smoke_tty.zig").run(allocator, sock_path);
+
     // External display sessions + the controller lease (shared stage,
     // also run against a real broker by smoke-broker).
     @import("smoke_display.zig").run(allocator, sock_path);

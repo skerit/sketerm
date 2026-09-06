@@ -1,9 +1,16 @@
 //! `sketerm mux` — session management CLI + TUI picker.
 //!
 //! `sketerm mux` with no arguments opens a raw-mode TUI listing the
-//! daemon's sessions: ↑/↓/j/k select, Enter attaches the session as
-//! a tab in the running sketerm window, n spawns a new durable tab,
-//! x kills the selected session, q/Esc quits.
+//! daemon's sessions: ↑/↓/j/k select, Enter attaches the session, n
+//! spawns a new durable session, x kills the selected session, q/Esc
+//! quits.
+//!
+//! WHERE an attach shows up depends on where the command runs. Inside
+//! a sketerm pane (SKETERM_PANE_ID set) the running GUI takes over
+//! that pane or opens a tab, as before. On any OTHER terminal — a
+//! VT, kitty, an ssh client — the session is shown right here,
+//! tmux-style, through `mux_tty.zig`; `--alternate` forces that even
+//! inside sketerm, `--new-tab` forces the GUI even outside it.
 //!
 //! Subcommands for scripting: list, attach <name>, kill <name>, new.
 
@@ -18,26 +25,37 @@ const mux_daemon = @import("../mux/daemon.zig");
 const mux_wire = @import("../mux/wire.zig");
 const pulse = @import("../mux/pulse.zig");
 const ipc_client = @import("client.zig");
+const mux_tty = @import("mux_tty.zig");
 
 const MUX_HELP =
-    \\Usage: sketerm mux [host] [command]
+    \\Usage: sketerm mux [host] [--alternate] [command]
     \\
     \\No command: interactive session picker (TUI) — local daemon,
     \\or <host>'s daemon (UDP when reachable, SSH fallback).
-    \\  Up/Down or j/k  select        Enter  attach as tab
-    \\  n  new durable tab            x      kill selected session
+    \\  Up/Down or j/k  select        Enter  attach
+    \\  n  new durable session        x      kill selected session
     \\  r  rename selected session    q / Esc  quit
+    \\
+    \\Where a session shows up: inside a sketerm pane the GUI takes
+    \\that pane over (or opens a tab); on any OTHER terminal the
+    \\session is shown right here, tmux-style. In that mode
+    \\  Ctrl-\ Ctrl-\  (or Ctrl-\ d)  detach -- the session keeps running
+    \\  Ctrl-\ [       scroll back (PgUp/PgDn/j/k/g/G; q returns)
+    \\  Ctrl-\ \       send a literal Ctrl-\
+    \\Only the shell exiting ends a session; detaching never does.
+    \\  --alternate    show it here even inside a sketerm pane
+    \\  --new-tab      open a GUI tab even from another terminal
     \\
     \\Commands (each accepts an optional leading host):
     \\  list                  print sessions
-    \\  attach <name>         attach a session as a GUI tab
-    \\      --new-tab    always a NEW tab; without it, running this
+    \\  attach <name>         attach a session (here, or as a GUI tab)
+    \\      --new-tab    always a NEW GUI tab; without it, running this
     \\                   INSIDE a pane takes over that pane (tmux-style)
     \\      --read-only  view a forwarded app without driving it
     \\      --control    take the app's controller lease by force
     \\  attach-all            attach EVERY session not already shown
-    \\                        (bulk handoff after a move/crash)
-    \\  new                   spawn a durable tab in the GUI
+    \\                        (bulk handoff after a move/crash; GUI only)
+    \\  new                   spawn a durable session and attach it
     \\  kill <name>           kill a session
     \\  rename <old> <new>    rename a session
     \\
@@ -146,11 +164,71 @@ fn isSubcommand(s2: []const u8) bool {
     return false;
 }
 
+/// Where an attach/new should land, decided once per invocation.
+pub const Placement = struct {
+    /// `--alternate`: in-terminal even inside a sketerm pane.
+    alternate: bool = false,
+
+    /// In-terminal viewing wins on a real tty outside any sketerm pane;
+    /// `--new-tab` asks for the GUI explicitly and always gets it.
+    pub fn inTerminal(self: Placement, new_tab: bool, inside_pane: bool, is_tty: bool) bool {
+        if (new_tab) return false;
+        if (self.alternate) return true;
+        return !inside_pane and is_tty;
+    }
+
+    fn inTerminalHere(self: Placement, new_tab: bool) bool {
+        const is_tty = c.isatty(0) != 0 and c.isatty(1) != 0;
+        return self.inTerminal(new_tab, c.getenv("SKETERM_PANE_ID") != null, is_tty);
+    }
+};
+
+test "Placement: outside sketerm a tty attaches here, inside it the GUI does, flags override" {
+    const t = std.testing;
+    const plain: Placement = .{};
+    try t.expect(plain.inTerminal(false, false, true));
+    try t.expect(!plain.inTerminal(false, true, true));
+    try t.expect(!plain.inTerminal(false, false, false)); // piped: scripts keep the GUI contract
+    try t.expect(!plain.inTerminal(true, false, true)); // --new-tab
+    const alt: Placement = .{ .alternate = true };
+    try t.expect(alt.inTerminal(false, true, true));
+    try t.expect(!alt.inTerminal(true, true, true));
+}
+
+/// Drop every `--alternate` from `args` (it may sit anywhere: before
+/// the host, before or after the subcommand). Caller frees.
+fn stripAlternate(allocator: std.mem.Allocator, args: []const []const u8, placement: *Placement) ![]const []const u8 {
+    var kept: std.ArrayList([]const u8) = .empty;
+    errdefer kept.deinit(allocator);
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--alternate") or std.mem.eql(u8, a, "-A")) {
+            placement.alternate = true;
+        } else {
+            try kept.append(allocator, a);
+        }
+    }
+    return kept.toOwnedSlice(allocator);
+}
+
+test "stripAlternate: removes the flag wherever it sits" {
+    const t = std.testing;
+    var p: Placement = .{};
+    const out = try stripAlternate(t.allocator, &.{ "--alternate", "box", "attach", "--alternate", "work" }, &p);
+    defer t.allocator.free(out);
+    try t.expect(p.alternate);
+    try t.expectEqual(@as(usize, 3), out.len);
+    try t.expectEqualStrings("box", out[0]);
+    try t.expectEqualStrings("work", out[2]);
+}
+
 pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
+    var placement: Placement = .{};
+    const stripped = stripAlternate(allocator, args_in, &placement) catch return 1;
+    defer allocator.free(stripped);
     // Optional leading host: anything that isn't a known subcommand
     // or flag ("sketerm mux user@box [cmd]").
     var host: ?[]const u8 = null;
-    var args = args_in;
+    var args = stripped;
     var domain_spec: ?[]u8 = null;
     defer if (domain_spec) |s| allocator.free(s);
     if (args.len > 0 and !isSubcommand(args[0]) and !std.mem.startsWith(u8, args[0], "-")) {
@@ -165,7 +243,7 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
             host = spec;
         }
     }
-    if (args.len == 0) return tui(allocator, host);
+    if (args.len == 0) return tui(allocator, host, placement);
     const cmd = args[0];
     if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         _ = c.fputs(MUX_HELP, platform.stdout());
@@ -207,6 +285,12 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
             _ = c.fprintf(platform.stderr(), "sketerm mux: attach needs a session name\n");
             return 1;
         };
+        if (placement.inTerminalHere(opts.new_tab)) {
+            return switch (ttyAttach(allocator, host, name, opts.lease)) {
+                .detached, .exited => 0,
+                .lost, .failed => 1,
+            };
+        }
         if (opts.takesOverPane(c.getenv("SKETERM_PANE_ID") != null)) {
             const note = "sketerm mux: attaching INTO this pane (its shell is replaced); use --new-tab to open a tab instead\n";
             _ = c.fprintf(platform.stderr(), note);
@@ -217,6 +301,12 @@ pub fn run(allocator: std.mem.Allocator, args_in: []const []const u8) u8 {
         return if (guiCommand(allocator, "attach-all", null, host, false)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "new")) {
+        if (placement.inTerminalHere(false)) {
+            return switch (ttyNew(allocator, host)) {
+                .detached, .exited => 0,
+                .lost, .failed => 1,
+            };
+        }
         return if (guiCommand(allocator, "new-durable-tab", null, host, true)) 0 else 1;
     }
     if (std.mem.eql(u8, cmd, "kill") and args.len >= 2) {
@@ -291,19 +381,41 @@ fn muxSpawn(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, r
         }
     }
 
-    var conn = blk: {
-        if (host != null) break :blk muxConnect(allocator, host) orelse return 1;
-        break :blk mux_client.Conn.connectLocalAutostart(allocator) catch {
-            _ = c.fprintf(platform.stderr(), "sketerm mux: cannot start the local daemon\n");
-            return 1;
-        };
-    };
+    var conn = connectForSpawn(allocator, host) orelse return 1;
     defer conn.deinit();
+    if (!spawnOn(allocator, &conn, host, name, cwd, rows, cols, argv.items)) return 1;
+    _ = c.printf("%.*s\n", @as(c_int, @intCast(name.len)), name.ptr);
+    return 0;
+}
+
+/// A connection that can create sessions: the local daemon is
+/// auto-started, a remote one is reached through its proxy bootstrap.
+fn connectForSpawn(allocator: std.mem.Allocator, host: ?[]const u8) ?mux_client.Conn {
+    if (host != null) return muxConnect(allocator, host);
+    return mux_client.Conn.connectLocalAutostart(allocator) catch {
+        _ = c.fprintf(platform.stderr(), "sketerm mux: cannot start the local daemon\n");
+        return null;
+    };
+}
+
+/// Spawn `name` on `conn` with the configured shell (or `argv`), and
+/// wait for the daemon's answer. Shared by `spawn` and the in-terminal
+/// `new`.
+fn spawnOn(
+    allocator: std.mem.Allocator,
+    conn: *mux_client.Conn,
+    host: ?[]const u8,
+    name: []const u8,
+    cwd: ?[]const u8,
+    rows: u16,
+    cols: u16,
+    argv: []const []const u8,
+) bool {
     var cfg = @import("../config.zig").Config.load(allocator);
     defer cfg.deinit();
     const settings = cfg.profileSettings(cfg.default_profile);
-    const spawn_argv: []const []const u8 = if (argv.items.len > 0)
-        argv.items
+    const spawn_argv: []const []const u8 = if (argv.len > 0)
+        argv
     else if (host != null)
         &@import("../mux/shell.zig").remote_login_argv
     else if (settings.shell) |shell|
@@ -313,9 +425,9 @@ fn muxSpawn(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, r
     var remote_shell_buf: [512]u8 = undefined;
     var remote_env_items: [2][]const u8 = undefined;
     var remote_env_len: usize = 0;
-    if (argv.items.len == 0 and host != null) {
+    if (argv.len == 0 and host != null) {
         if (settings.shell) |shell| {
-            remote_env_items[remote_env_len] = std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{shell}) catch return 1;
+            remote_env_items[remote_env_len] = std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{shell}) catch return false;
             remote_env_len += 1;
         }
         remote_env_items[remote_env_len] = if (settings.login_shell) "SKETERM_REMOTE_LOGIN=1" else "SKETERM_REMOTE_LOGIN=0";
@@ -330,15 +442,54 @@ fn muxSpawn(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, r
         .cols = cols,
         .term = settings.term_env,
         .color_term = settings.color_term_env,
-        .login_shell = argv.items.len == 0 and host == null and settings.login_shell,
-    }) catch return 1;
-    const f = conn.recvExpect(&.{.ok}) catch {
-        _ = c.fprintf(platform.stderr(), "sketerm mux: spawn failed (name taken?)\n");
-        return 1;
+        .login_shell = argv.len == 0 and host == null and settings.login_shell,
+    }) catch return false;
+    const f = conn.recvExpectFor(&.{.ok}, 30_000) catch {
+        const why = conn.lastErr();
+        if (why.len > 0) {
+            _ = c.fprintf(platform.stderr(), "sketerm mux: spawn failed: %.*s\n", @as(c_int, @intCast(why.len)), why.ptr);
+        } else {
+            _ = c.fprintf(platform.stderr(), "sketerm mux: spawn failed (name taken?)\n");
+        }
+        return false;
     };
     f.deinit(allocator);
-    _ = c.printf("%.*s\n", @as(c_int, @intCast(name.len)), name.ptr);
-    return 0;
+    return true;
+}
+
+// ── in-terminal viewing ─────────────────────────────────────────
+
+fn ttyOptions(lease: Lease) mux_tty.Options {
+    return .{ .read_only = lease == .read_only, .control = lease == .control };
+}
+
+/// Show `name` in this terminal until detached or ended.
+fn ttyAttach(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, lease: Lease) mux_tty.Outcome {
+    var conn = muxConnect(allocator, host) orelse return .failed;
+    defer conn.deinit();
+    return mux_tty.attach(allocator, &conn, name, ttyOptions(lease));
+}
+
+/// Per-process counter behind the `s<pid>-N` names, the same shape
+/// the GUI mints for its sessions.
+var tty_session_seq: u32 = 0;
+
+/// Spawn a fresh durable session sized to this terminal and show it.
+fn ttyNew(allocator: std.mem.Allocator, host: ?[]const u8) mux_tty.Outcome {
+    var conn = connectForSpawn(allocator, host) orelse return .failed;
+    defer conn.deinit();
+    var ws: c.struct_winsize = undefined;
+    var rows: u16 = 24;
+    var cols: u16 = 80;
+    if (c.ioctl(1, c.TIOCGWINSZ, &ws) == 0 and ws.ws_row > 0 and ws.ws_col > 0) {
+        rows = ws.ws_row;
+        cols = ws.ws_col;
+    }
+    var name_buf: [32]u8 = undefined;
+    tty_session_seq += 1;
+    const name = std.fmt.bufPrint(&name_buf, "s{d}-{d}", .{ c.getpid(), tty_session_seq }) catch return .failed;
+    if (!spawnOn(allocator, &conn, host, name, null, rows, cols, &.{})) return .failed;
+    return mux_tty.attach(allocator, &conn, name, ttyOptions(.default));
 }
 
 /// Attach just long enough to feed input — the daemon requires an
@@ -1123,12 +1274,16 @@ const RawMode = struct {
     }
 };
 
-fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
+fn tui(allocator: std.mem.Allocator, host: ?[]const u8, placement: Placement) u8 {
     var parsed = fetchSessions(allocator, host) orelse return 1;
     defer parsed.deinit();
 
     var raw = RawMode.enter() orelse return 1;
     defer raw.leave();
+    // Outside a sketerm pane, Enter/n show the session in THIS terminal
+    // and the picker comes back afterwards (detach or exit), so one
+    // `sketerm mux` is a whole session-hopping loop.
+    const here = placement.inTerminalHere(false);
 
     var selected: usize = 0;
     var drawn_lines: usize = 0;
@@ -1136,7 +1291,7 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
         const sessions = parsed.value.sessions;
         // The list has one virtual trailing row: "create new session".
         const n_rows = sessions.len + 1;
-        drawTui(sessions, selected, &drawn_lines);
+        drawTui(sessions, selected, &drawn_lines, here);
 
         var buf: [8]u8 = undefined;
         const n = c.read(0, &buf, buf.len);
@@ -1152,7 +1307,27 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
         if (is_up and selected > 0) selected -= 1;
         if (is_down and selected < n_rows - 1) selected += 1;
 
-        if (key.len == 1 and (key[0] == '\r' or key[0] == '\n')) {
+        const is_enter = key.len == 1 and (key[0] == '\r' or key[0] == '\n');
+        const is_new = key.len == 1 and key[0] == 'n';
+        if (here and (is_enter or is_new)) {
+            eraseTui(&drawn_lines);
+            raw.leave();
+            const outcome = if (is_new or selected >= sessions.len)
+                ttyNew(allocator, host)
+            else
+                ttyAttach(allocator, host, sessions[selected].name, .default);
+            if (outcome == .failed or outcome == .lost) {
+                // The reason is already on stderr; a blocked picker would
+                // hide it behind the next redraw.
+                msleep(800);
+            }
+            parsed.deinit();
+            parsed = fetchSessions(allocator, host) orelse return 1;
+            raw = RawMode.enter() orelse return 1;
+            if (selected >= parsed.value.sessions.len + 1) selected = parsed.value.sessions.len;
+            continue;
+        }
+        if (is_enter) {
             eraseTui(&drawn_lines);
             raw.leave();
             if (selected >= sessions.len) {
@@ -1167,7 +1342,7 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
             }
             return 1;
         }
-        if (key.len == 1 and key[0] == 'n') {
+        if (is_new) {
             eraseTui(&drawn_lines);
             raw.leave();
             return if (guiCommand(allocator, "new-durable-tab", null, host, true)) 0 else 1;
@@ -1221,10 +1396,14 @@ fn tui(allocator: std.mem.Allocator, host: ?[]const u8) u8 {
     }
 }
 
-fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize) void {
+fn drawTui(sessions: []const SessionInfo, selected: usize, drawn_lines: *usize, here: bool) void {
     eraseTui(drawn_lines);
     _ = c.printf("\x1b[1msketerm sessions\x1b[0m  (Enter attach · n new · r rename · x kill · q quit)\r\n");
     var lines: usize = 1;
+    if (here) {
+        _ = c.printf("\x1b[2mshown in this terminal; Ctrl-\\ Ctrl-\\ detaches and returns here\x1b[0m\r\n");
+        lines += 1;
+    }
     for (sessions, 0..) |s, i| {
         const marker: [*:0]const u8 = if (i == selected) "\x1b[7m \xe2\x96\xb8 " else "   ";
         var idle_buf: [32]u8 = undefined;

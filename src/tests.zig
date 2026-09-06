@@ -205,6 +205,9 @@ comptime {
     _ = @import("ipc/protocol.zig");
     _ = @import("mux/channel_pump.zig");
     _ = @import("ipc/mux_cli.zig");
+    _ = @import("ipc/mux_tty.zig");
+    _ = @import("mux/ttyrender.zig");
+    _ = @import("pty.zig");
     _ = @import("ipc/keys.zig");
     _ = @import("ipc/socks5.zig");
     _ = @import("ipc/socksbridge.zig");
