@@ -420,9 +420,16 @@ Each browser tab takes a **network route**: `direct`, `tor`, a mux/SSH
 host it egresses through (`via:<host>`), or a host the whole browser
 process runs on (`on:<host>`). `web_route` sets the default for new
 tabs; a container's own route (Containers dialog) overrides that for
-tabs opened in it; and a single tab's route is changed from the "Route"
-section of its site button (the padlock). A non-direct route shows
-beside that button so it is never a hidden state. Because stock Chromium
+tabs opened in it; and a single tab's route is changed from the
+**route button** in the browser toolbar, right of the padlock, which
+always reads the current route ("Direct", "Tor", "via host", "on
+host") and opens a one-click menu of the four choices (the host-bound
+two open the site popover for the host). The same rows are under the
+toolbar's burger menu ("Route: ..."), the palette has `New Tor Web Tab`,
+`Route Web Tab Through Tor`, `Route Web Tab Directly` and `Route (Web
+Tab)...`, a routed tab's title is badged (`[Tor] Example`), and
+`sketerm web --route tor <url>` opens tabs born on a route so the
+address is never loaded directly first. Because stock Chromium
 gives one profile one proxy, a route is a whole `sketerm-webengine`
 process with its own profile; the same identity is re-shared across
 those processes by cookie synchronisation (you stay logged in), which

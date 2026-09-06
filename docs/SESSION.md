@@ -1,5 +1,58 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-06: the browser's route is a button, not a popover section
+
+"I still don't see an easy UI way to switch to a Tor route." The
+2026-08-29 route work was real (`WebFace.setRoute`, one helper
+instance per route) but its only surface was a "Route" section inside
+the padlock's site-info popover, plus a dim label that appeared only
+once the route was non-direct. Verified first on the real GUI through
+the headless rig: the popover path worked, the label was correct, and
+nothing in the toolbar, the burger menu, the palette or the CLI said a
+route existed.
+
+Now there is one grammar and four surfaces. `web/route.zig` gained
+`Choice` (direct / tor / via / on: the ONE row order every picker
+shares, with `label`/`icon`/`needsHost`/`spec`), `Spec.shortLabel`
+("Direct", "Tor", "via host", "on host") and `Spec.badgedTitle`
+(`[Tor] Example`); `Spec.valid` now applies the same host character
+rule as `Spec.parse`, so a picker cannot mint a host the grammar would
+refuse. The browser toolbar has a route BUTTON right of the padlock,
+visible on every tab, reading the current route and opening a
+one-click menu of the four choices (Direct and Tor apply at once; the
+host-bound two open the site popover with that route pre-selected and
+the caret in the host entry, `SiteInfo.preset`), plus "New Tor Web
+Tab" and "Route Settings...". The burger menu lists "New Tor Web Tab"
+and a "Route: <current>" submenu of the same rows. The palette /
+`sketerm cli action` have `new_tor_web_tab`, `web_route_menu`,
+`web_route_tor` and `web_route_direct`. A routed tab's window-tab
+title carries the badge. `sketerm web --route tor <url>` (also
+`--route=via:host`) opens tabs BORN on the route through
+`WebFace.attachRouted`: the first view is created in the route's
+instance, so the address is never handed to the direct instance first
+(the old open-then-move shape would have leaked it); text outside the
+grammar exits 2 with the grammar, in both the first and a forwarded
+invocation. The four route icons are sketerm's own
+(`sketerm-route-{direct,tor,via,on}-symbolic`, staged by the icon
+glob): the first GUI run showed the broken-image glyph because the
+Adwaita `network-*-symbolic` names resolve on no other theme chain,
+which is also why the padlock no longer repeats the route beside the
+new button.
+
+Proof: smoke-e2e's `webRouteStage` (also
+`SKETERM_SMOKE_E2E_WEB_ROUTE_ONLY=1`). The rig starts a loopback SOCKS5
+stub (`TorStub`, on the new shared `smoke/socks5relay.zig` that
+smoke-web's `ProxyProbe` now uses too) and writes its port as
+`mux_tor_socks_endpoint` in the isolated config. A fresh tab loads a
+document directly (stub untouched, "Direct" on the button), a seat
+click found by OCR opens the route menu, a click on its "Tor" row moves
+the tab: `web-list` reports `route:tor`, the page reloads THROUGH the
+stub (a tunnel to the document server's port is recorded), the routed
+helper socket `web-<pid>-tor-<hash>.sock` exists, and the button reads
+"Tor". The palette actions move it back and forth over IPC, and
+`new_tor_web_tab` opens a tab that reports Tor from birth. Screenshots
+land in `/tmp/sketerm-e2e-route-{1-direct,2-menu,3-tor}.png`.
+
 ## 2026-09-06: `sketerm mux` on a non-sketerm terminal
 
 `sketerm mux`, `sketerm mux attach <name>` and `sketerm mux new` now
