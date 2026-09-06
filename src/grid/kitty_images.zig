@@ -195,10 +195,10 @@ pub const Manager = struct {
         self.accums.deinit();
     }
 
-    fn freeStoredImage(self: *Manager, img: *StoredImage) void {
-        // All removal paths funnel here, so the budget accounting lives here.
-        const b = img.storedBytes();
-        self.store_bytes -= @min(self.store_bytes, b);
+    /// Release an image's pixel allocations WITHOUT touching
+    /// `store_bytes` — for an image whose bytes were never accounted
+    /// (an insert that failed before it reached the store).
+    fn destroyStoredImage(self: *Manager, img: *StoredImage) void {
         if (img.frames.items.len == 0) {
             // Static: rgba is the standalone allocation.
             self.allocator.free(img.rgba);
@@ -209,6 +209,13 @@ pub const Manager = struct {
         img.frames.deinit(self.allocator);
     }
 
+    fn freeStoredImage(self: *Manager, img: *StoredImage) void {
+        // All removal paths funnel here, so the budget accounting lives here.
+        const b = img.storedBytes();
+        self.store_bytes -= @min(self.store_bytes, b);
+        self.destroyStoredImage(img);
+    }
+
     /// Insert a freshly-decoded static image, accounting its bytes and
     /// stamping its insertion order, then evict oldest entries if the
     /// store is over budget.
@@ -216,6 +223,10 @@ pub const Manager = struct {
         var v = img;
         v.seq = self.seq_counter;
         self.seq_counter += 1;
+        // The caller of `finalize` swallows errors, so a failed `put`
+        // would strand the decoded pixels with nobody left holding a
+        // pointer to them.
+        errdefer self.destroyStoredImage(&v);
         try self.store.put(image_id, v);
         self.store_bytes += v.storedBytes();
         self.evictStoreForBudget(image_id);
@@ -1456,6 +1467,24 @@ test "store budget evicts oldest images and bounds store_bytes" {
     // Newest survives; oldest evicted.
     try std.testing.expect(mgr.store.contains(10));
     try std.testing.expect(!mgr.store.contains(1));
+}
+
+test "a store insert that OOMs frees the decoded pixels" {
+    // `ingest` swallows finalize's error, so a failed `put` is the one
+    // path where nothing downstream can free the decoded buffer.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const a = failing.allocator();
+    var mgr = Manager.init(a);
+    defer mgr.deinit();
+    const rgba = try a.alloc(u8, 64); // allocation 0 — succeeds
+    @memset(rgba, 0);
+    // Allocation 1 is the hash map's first table: made to fail.
+    try std.testing.expectError(
+        error.OutOfMemory,
+        mgr.insertStored(1, .{ .rgba = rgba, .width = 4, .height = 4 }),
+    );
+    try std.testing.expect(mgr.get(1) == null);
+    try std.testing.expectEqual(@as(usize, 0), mgr.store_bytes);
 }
 
 test "unterminated chunked transmission is capped, not unbounded" {
