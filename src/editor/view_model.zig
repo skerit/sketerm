@@ -64,7 +64,11 @@ pub fn nextPos(alloc: Allocator, doc: *const Document, offset: usize, word: bool
 
 /// Previous caret position: grapheme (or word) within the line; a
 /// caret at a line's start steps back over the newline.
-pub fn prevPos(alloc: Allocator, doc: *const Document, offset: usize, word: bool) usize {
+pub fn prevPos(alloc: Allocator, doc: *const Document, raw_offset: usize, word: bool) usize {
+    // Clamp like `nextPos` does: an offset past the end resolves to the
+    // last (possibly empty) line, and stepping back inside a zero-length
+    // slice used to index before its start.
+    const offset = @min(raw_offset, doc.rope.len());
     if (offset == 0) return 0;
     const lb = lineBoundsAt(doc, offset);
     if (offset <= lb.start) return lb.start -| 1;
@@ -554,6 +558,19 @@ test "view_model word and line ranges" {
     const l2 = lineRangeAt(&doc, 10);
     try testing.expectEqual(@as(usize, 8), l2.start());
     try testing.expectEqual(@as(usize, 12), l2.end());
+}
+
+test "view_model prevPos clamps an offset past the end" {
+    // `nextPos` clamps, `prevPos` did not: on a document ending in a
+    // newline the last line is empty, so a stale offset stepped back
+    // inside a zero-length slice and read before its start.
+    const a = testing.allocator;
+    var doc = try docOf("a\n");
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, 1), prevPos(a, &doc, 5, false));
+    try testing.expectEqual(@as(usize, 1), prevPos(a, &doc, 2, false));
+    try testing.expectEqual(@as(usize, 1), prevPos(a, &doc, 5, true));
+    try testing.expectEqual(@as(usize, 2), nextPos(a, &doc, 5, false));
 }
 
 test "view_model undo restores the pre-edit selection, redo maps forward" {

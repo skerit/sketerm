@@ -346,6 +346,10 @@ pub fn nextGrapheme(text: []const u8, i: usize) usize {
 pub fn prevGrapheme(text: []const u8, i: usize) usize {
     if (i == 0) return 0;
     var j = @min(i, text.len);
+    // Clamping `i` can land on 0 even though `i` was not: an offset past
+    // the end of an EMPTY slice. `decodeBefore` would then run
+    // `prevCpStart(text, 0)`, whose `i - 1` reads text[SIZE_MAX].
+    if (j == 0) return 0;
     j = decodeBefore(text, j).start;
     while (j > 0 and !isGraphemeBoundary(text, j)) {
         j = decodeBefore(text, j).start;
@@ -517,6 +521,15 @@ test "grapheme non-boundary offsets inside UTF-8 sequences" {
     try testing.expect(!isGraphemeBoundary(s, 2));
     try testing.expect(!isGraphemeBoundary(s, 3));
     try testing.expect(isGraphemeBoundary(s, 4));
+}
+
+test "grapheme stepping back from past the end of an empty slice" {
+    // An empty line with a stale offset: clamping lands on 0 while `i`
+    // is not 0, and the unguarded `i - 1` read text[SIZE_MAX].
+    try testing.expectEqual(@as(usize, 0), prevGrapheme("", 3));
+    try testing.expectEqual(@as(usize, 0), prevGrapheme("", 1));
+    try testing.expectEqual(@as(usize, 0), prevWordBoundary("", 3));
+    try testing.expectEqual(@as(usize, 1), prevGrapheme("ab", 9));
 }
 
 test "word boundaries simple" {
