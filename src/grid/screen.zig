@@ -8936,3 +8936,33 @@ test "OSC 133 C/D fire cmd start/end sinks with exit code" {
     try std.testing.expectEqual(@as(u32, 2), TestSink.ends);
     try std.testing.expectEqual(@as(i32, 0), TestSink.last_exit);
 }
+
+test "line feed on a one-row screen recycles the row into scrollback" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 1);
+    defer s.deinit();
+    s.printCp('a');
+    s.lineFeed();
+    // A one-row region is still a region: the row scrolls away.
+    try std.testing.expectEqual(@as(u32, 1), s.scrollbackCount());
+    try std.testing.expectEqual(@as(u32, 'a'), s.scrollbackLine(0).cells[0].rune);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(0, 0).rune);
+}
+
+test "DL and IL on the bottom margin row erase it" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 3);
+    defer s.deinit();
+    s.row = 2;
+    s.printCp('x');
+    s.col = 0;
+    s.deleteLines(1);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(2, 0).rune);
+
+    s.printCp('y');
+    s.col = 0;
+    s.insertLines(1);
+    try std.testing.expectEqual(@as(u32, 0), s.cellAt(2, 0).rune);
+}

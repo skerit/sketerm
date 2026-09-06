@@ -817,7 +817,11 @@ pub fn eraseLine(self: *Screen, mode: u32) void {
 // ── Scroll ───────────────────────────────────────────────────
 
 pub fn scrollUp(self: *Screen, n: u32) void {
-    if (self.scroll_top >= self.scroll_bot) return;
+    // A region of exactly one row is a region: a one-row terminal must
+    // still recycle its row on LF (and push it to scrollback), and
+    // `deleteLines` on the bottom margin narrows the region to one row
+    // and expects that row erased. Only an inverted region is a no-op.
+    if (self.rows == 0 or self.scroll_top > self.scroll_bot) return;
     const region: u16 = self.scroll_bot - self.scroll_top + 1;
     const move: u16 = @intCast(@min(n, @as(u32, region)));
     const lines = self.buf();
@@ -915,7 +919,9 @@ pub fn scrollUp(self: *Screen, n: u32) void {
 
 pub fn scrollDown(self: *Screen, n: u32) void {
     self.clearAllClusters();
-    if (self.scroll_top >= self.scroll_bot) return;
+    // See scrollUp: a one-row region still scrolls (`insertLines` on the
+    // bottom margin row is exactly that case).
+    if (self.rows == 0 or self.scroll_top > self.scroll_bot) return;
     const region: u16 = self.scroll_bot - self.scroll_top + 1;
     const move: u16 = @intCast(@min(n, @as(u32, region)));
     const lines = self.buf();
