@@ -62,6 +62,7 @@ const mux_wire = @import("mux/wire.zig");
 const webhints = @import("web/hints.zig");
 const axtree = @import("web/axtree.zig");
 const socks5 = @import("ipc/socks5.zig");
+const socks5relay = @import("smoke/socks5relay.zig");
 const zip = @import("web/webext/zip.zig");
 const filtersub = @import("web/filtersub.zig");
 const extmanifest = @import("web/webext/manifest.zig");
@@ -630,17 +631,15 @@ const ProxyProbe = struct {
             _ = c.write(afd, &mr0, mr0.len);
             return;
         }
-        var acc: [1024]u8 = undefined;
-        var acc_len: usize = 0;
+        var acc: socks5relay.Acc = .{};
         // Greeting.
-        const g = readGreeting(afd, &acc, &acc_len) orelse return;
+        const g = socks5relay.readGreeting(afd, &acc, 10_000) orelse return;
         const mr = socks5.methodReply(g.offers_no_auth);
         _ = c.write(afd, &mr, mr.len);
         if (!g.offers_no_auth) return;
-        std.mem.copyForwards(u8, acc[0 .. acc_len - g.consumed], acc[g.consumed..acc_len]);
-        acc_len -= g.consumed;
+        acc.drop(g.consumed);
         // Request.
-        const r = readRequest(afd, &acc, &acc_len) orelse return;
+        const r = socks5relay.readRequest(afd, &acc, 10_000) orelse return;
         if (r.cmd != .connect) return;
         if (self.tunnel_port != 0 and r.port != self.tunnel_port) return;
         switch (r.addr) {
@@ -666,45 +665,24 @@ const ProxyProbe = struct {
         self.port = r.port;
         self.got.store(true, .release);
         if (self.tunnel_port != 0) {
-            const upstream = connectLoopback(self.tunnel_port) orelse {
+            const upstream = socks5relay.connectLoopback(self.tunnel_port) orelse {
                 const failed = socks5.connectReply(.host_unreachable);
                 _ = c.write(afd, &failed, failed.len);
                 return;
             };
             defer _ = c.close(upstream);
             const rep = socks5.connectReply(.ok);
-            if (!writeAll(afd, &rep)) return;
-            const initial = acc[r.consumed..acc_len];
-            self.relay(afd, upstream, initial);
+            if (!socks5relay.writeAll(afd, &rep)) return;
+            socks5relay.relay(afd, upstream, acc.bytes()[r.consumed..], &noteRequestCb, @ptrCast(self), 15_000);
             return;
         }
         const rep = socks5.connectReply(.ok);
         _ = c.write(afd, &rep, rep.len);
     }
 
-    fn connectLoopback(port: u16) ?c_int {
-        const fd = c.socket(c.AF_INET, c.SOCK_STREAM, 0);
-        if (fd < 0) return null;
-        var sa = std.mem.zeroes(c.struct_sockaddr_in);
-        sa.sin_family = c.AF_INET;
-        sa.sin_port = std.mem.nativeToBig(u16, port);
-        sa.sin_addr.s_addr = std.mem.nativeToBig(u32, c.INADDR_LOOPBACK);
-        if (c.connect(fd, @ptrCast(&sa), @sizeOf(c.struct_sockaddr_in)) != 0) {
-            _ = c.close(fd);
-            return null;
-        }
-        return fd;
-    }
-
-    fn writeAll(fd: c_int, bytes: []const u8) bool {
-        var off: usize = 0;
-        while (off < bytes.len) {
-            const n = c.write(fd, bytes.ptr + off, bytes.len - off);
-            if (n < 0 and std.c._errno().* == c.EINTR) continue;
-            if (n <= 0) return false;
-            off += @intCast(n);
-        }
-        return true;
+    fn noteRequestCb(ctx: ?*anyopaque, bytes: []const u8) void {
+        const self: *ProxyProbe = @ptrCast(@alignCast(ctx.?));
+        self.noteRequest(bytes);
     }
 
     fn noteRequest(self: *ProxyProbe, bytes: []const u8) void {
@@ -716,72 +694,6 @@ const ProxyProbe = struct {
         const seen = self.request_probe[0..self.request_probe_len];
         if (std.mem.indexOf(u8, seen, "route-a") != null) self.route_a.store(true, .release);
         if (std.mem.indexOf(u8, seen, "route-b") != null) self.route_b.store(true, .release);
-    }
-
-    fn relay(self: *ProxyProbe, client: c_int, upstream: c_int, initial: []const u8) void {
-        if (initial.len != 0) {
-            self.noteRequest(initial);
-            if (!writeAll(upstream, initial)) return;
-        }
-        var client_open = true;
-        var upstream_open = true;
-        const deadline = nowMs() + 15_000;
-        var buf: [16 * 1024]u8 = undefined;
-        while ((client_open or upstream_open) and nowMs() < deadline) {
-            var pfds = [_]c.struct_pollfd{
-                .{ .fd = client, .events = if (client_open) c.POLLIN else 0, .revents = 0 },
-                .{ .fd = upstream, .events = if (upstream_open) c.POLLIN else 0, .revents = 0 },
-            };
-            if (c.poll(@ptrCast(&pfds), pfds.len, 200) <= 0) continue;
-            if (client_open and pfds[0].revents != 0) {
-                const n = c.read(client, &buf, buf.len);
-                if (n <= 0) {
-                    client_open = false;
-                    _ = c.shutdown(upstream, c.SHUT_WR);
-                } else {
-                    const bytes = buf[0..@intCast(n)];
-                    self.noteRequest(bytes);
-                    if (!writeAll(upstream, bytes)) client_open = false;
-                }
-            }
-            if (upstream_open and pfds[1].revents != 0) {
-                const n = c.read(upstream, &buf, buf.len);
-                if (n <= 0) {
-                    upstream_open = false;
-                    _ = c.shutdown(client, c.SHUT_WR);
-                } else if (!writeAll(client, buf[0..@intCast(n)])) {
-                    upstream_open = false;
-                }
-            }
-        }
-    }
-
-    fn fill(afd: c_int, acc: *[1024]u8, acc_len: *usize) bool {
-        var pfd = c.struct_pollfd{ .fd = afd, .events = c.POLLIN, .revents = 0 };
-        if (c.poll(@ptrCast(&pfd), 1, 500) <= 0) return true;
-        if (acc_len.* >= acc.len) return false;
-        const n = c.read(afd, acc.ptr + acc_len.*, acc.len - acc_len.*);
-        if (n <= 0) return false;
-        acc_len.* += @intCast(n);
-        return true;
-    }
-
-    fn readGreeting(afd: c_int, acc: *[1024]u8, acc_len: *usize) ?socks5.Greeting {
-        const deadline = nowMs() + 10_000;
-        while (nowMs() < deadline) {
-            if (socks5.parseGreeting(acc[0..acc_len.*]) catch return null) |g| return g;
-            if (!fill(afd, acc, acc_len)) return null;
-        }
-        return null;
-    }
-
-    fn readRequest(afd: c_int, acc: *[1024]u8, acc_len: *usize) ?socks5.Request {
-        const deadline = nowMs() + 10_000;
-        while (nowMs() < deadline) {
-            if (socks5.parseRequest(acc[0..acc_len.*]) catch return null) |r| return r;
-            if (!fill(afd, acc, acc_len)) return null;
-        }
-        return null;
     }
 
     fn seenHost(self: *ProxyProbe) ?[]const u8 {
