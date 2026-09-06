@@ -28,6 +28,7 @@ const connectPopoverAutoUnparent = @import("menu.zig").connectPopoverAutoUnparen
 const hostEq = @import("../../filebrowser/paths.zig").hostEq;
 const menuDone = @import("menu.zig").menuDone;
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
+const dirWithin = @import("../../filebrowser/paths.zig").dirWithin;
 const uniqueName = @import("../../filebrowser/paths.zig").uniqueName;
 const urlUnescape = @import("../../filebrowser/paths.zig").urlUnescape;
 const cast = @import("../../util/cast.zig");
@@ -382,6 +383,7 @@ pub fn beginPaste(
     for (tab.root.entries.items) |entry|
         existing.put(self.allocator, entry.name, entry.tdir) catch {};
     var duplicated: usize = 0;
+    var refused_self: usize = 0;
     for (srcs) |src| {
         const base = std.fs.path.basename(src);
         var dst_buf: [4096]u8 = undefined;
@@ -397,6 +399,14 @@ pub fn beginPaste(
                 duplicateEntry(self, tab, src);
                 duplicated += 1;
             }
+            continue;
+        }
+        // Copy a folder, walk into it, paste: the names differ, so the
+        // equality above admits it and the copy job recurses into the
+        // copy it is making. Same rule as the drop path.
+        if (hostEq(src_host, tab.hc.host) and dirWithin(dst_dir, src)) {
+            refused_self += 1;
+            self.setStatusFmt("paste refused: {s} cannot go inside itself", .{base});
             continue;
         }
         const src_owned = self.allocator.dupe(u8, src) catch continue;
@@ -415,7 +425,11 @@ pub fn beginPaste(
     }
     if (run.items.items.len == 0) {
         run.destroy(self.allocator);
-        if (duplicated > 0)
+        // The refusal has to survive: "nothing to paste here" reads as
+        // an empty clipboard, which is the one thing it is not.
+        if (refused_self > 0)
+            self.setStatus("paste refused: a folder cannot go inside itself")
+        else if (duplicated > 0)
             self.setStatusFmt("duplicating {d} item(s) in place", .{duplicated})
         else
             self.setStatus("nothing to paste here");
@@ -2357,6 +2371,17 @@ pub fn dropValueIntoAction(self: *BrowserView, tab: *BTab, value: *c.GValue, dst
             std.fs.path.basename(loc.path),
         }) catch return false;
         if (hostEq(src_host, tab.hc.host) and std.mem.eql(u8, loc.path, dst)) continue;
+        // A folder dropped into itself or into one of its own
+        // descendants. The paths differ (/a/b -> /a/b/b), so equality
+        // admitted it: as a move that is a raw EINVAL, and as a copy
+        // the daemon mkdirs the destination before it lists the
+        // source, so the fresh copy joins the walk and the job
+        // recurses until the path overflows -- with the disk filling
+        // the whole way.
+        if (hostEq(src_host, tab.hc.host) and dirWithin(dst_dir, loc.path)) {
+            self.setStatusFmt("drop refused: {s} cannot go inside itself", .{std.fs.path.basename(loc.path)});
+            return false;
+        }
         const dst_owned = self.allocator.dupe(u8, dst) catch return false;
         manifest_specs.append(self.allocator, .{
             .src_path = loc.path,
@@ -2426,6 +2451,12 @@ fn dropSpecIntoActionBatch(self: *BrowserView, tab: *BTab, spec: []const u8, dst
 
     const same_host = hostEq(src_host, tab.hc.host);
     if (same_host and std.mem.eql(u8, src, dst)) return false;
+    // See dropValueIntoAction: equality alone admits a folder dropped
+    // into its own descendant, which copies until the path overflows.
+    if (same_host and dirWithin(dst_dir, src)) {
+        self.setStatusFmt("drop refused: {s} cannot go inside itself", .{base});
+        return false;
+    }
     if (tab.hc.state != .ready) {
         self.setStatusFmt("drop not queued: not connected to {s}", .{tab.hc.label()});
         return false;

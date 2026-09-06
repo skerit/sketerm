@@ -334,6 +334,20 @@ pub fn isTrashPath(path: []const u8) bool {
     return false;
 }
 
+/// True when directory `dir` IS `path` or lies inside it.
+///
+/// The "a folder cannot be dropped into itself" rule. Both are
+/// absolute; comparing prefixes alone would call "/a/bc" a child of
+/// "/a/b", so the byte after the prefix has to be the separator.
+pub fn dirWithin(dir: []const u8, path: []const u8) bool {
+    if (path.len == 0 or dir.len < path.len) return false;
+    if (!std.mem.startsWith(u8, dir, path)) return false;
+    if (dir.len == path.len) return true;
+    // Root is the prefix of everything, and carries its own separator.
+    if (path.len == 1 and path[0] == '/') return true;
+    return dir[path.len] == '/';
+}
+
 /// The child name inside `ancestor` on the way toward `root`, or
 /// null when root is not under ancestor.
 pub fn millerNextSegment(ancestor: []const u8, root: []const u8) ?[]const u8 {
@@ -670,4 +684,20 @@ test "a kept-both copy keeps its extension" {
     try t.expectEqualStrings("v1.0 (copy)", uniqueName("v1.0", true, &buf, none).?);
     try t.expectEqualStrings("", copyNameParts("v1.0", true).ext);
     try t.expectEqualStrings(".tar.gz", copyNameParts("site.tar.gz", false).ext);
+}
+
+test "dirWithin is the drop-into-itself rule, not a prefix test" {
+    const t = std.testing;
+    // Itself and any descendant.
+    try t.expect(dirWithin("/a/b", "/a/b"));
+    try t.expect(dirWithin("/a/b/sub", "/a/b"));
+    try t.expect(dirWithin("/a/b/sub/deeper", "/a/b"));
+    // A sibling whose name merely starts the same is NOT inside.
+    try t.expect(!dirWithin("/a/bc", "/a/b"));
+    try t.expect(!dirWithin("/a", "/a/b"));
+    try t.expect(!dirWithin("/x/y", "/a/b"));
+    // Root is everyone's ancestor and carries its own separator.
+    try t.expect(dirWithin("/a", "/"));
+    try t.expect(dirWithin("/", "/"));
+    try t.expect(!dirWithin("/a", ""));
 }
