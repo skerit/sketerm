@@ -48,6 +48,7 @@ const HostConn = @import("types.zig").HostConn;
 const WireJobEv = @import("types.zig").WireJobEv;
 const WireReply = @import("types.zig").WireReply;
 const entryForPath = @import("nav.zig").entryForPath;
+const errorPhrase = @import("../../filebrowser/format.zig").errorPhrase;
 const fmtModeZ = @import("../../filebrowser/format.zig").fmtModeZ;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
 const fmtTimeZ = @import("../../filebrowser/format.zig").fmtTimeZ;
@@ -2332,8 +2333,13 @@ fn feedReadSlot(
                         },
                         .finish => {},
                     };
-                    if (!rep.ok or pr.buf.items.len == 0) {
-                        failRead(self, pr, if (rep.@"error".len > 0) rep.@"error" else "the preview is empty");
+                    if (!rep.ok) {
+                        // The daemon answers with the errno TAG, so an
+                        // unreadable file used to preview as the word
+                        // "ACCES".
+                        failRead(self, pr, errorPhrase(rep.@"error"));
+                    } else if (pr.buf.items.len == 0 and pr.output == .image) {
+                        failRead(self, pr, "the preview is empty");
                     } else if (pr.output == .image and !pr.animate and (!rep.eof or rep.size > PREVIEW_IMAGE_CAP)) {
                         failRead(self, pr, "preview output exceeds the 2 MiB transfer limit");
                     } else {
