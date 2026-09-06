@@ -183,6 +183,20 @@ pub const Placement = struct {
     }
 };
 
+// Forces semantic analysis of the entry points no test calls. Zig analyses a
+// private function only where something references it, so a type error inside
+// one of these is invisible to `zig build test` (which imports this module for
+// its test blocks alone) and surfaces only when the GUI executable is linked.
+// That gap shipped a master that passed the whole suite and did not build.
+// `run` itself is deliberately absent: it reaches the GLib-only GUI-socket
+// discovery, which the core root cannot compile.
+test "mux_cli entry points compile" {
+    _ = &spawnOn;
+    _ = &ttyNew;
+    _ = &ttyAttach;
+    _ = &connectForSpawn;
+}
+
 test "Placement: outside sketerm a tty attaches here, inside it the GUI does, flags override" {
     const t = std.testing;
     const plain: Placement = .{};
