@@ -5388,8 +5388,12 @@ pub const Daemon = struct {
                 } else |_| {}
             }
             const audio_streams = self.sessionAudioInfos(s, self.allocator);
+            // Both appends answer instead of returning: the client is
+            // blocked in recvExpect(.welcome), so a dropped reply is a
+            // hang on its side. `.err` resolves that wait.
             audio_sets.append(self.allocator, audio_streams) catch {
                 self.allocator.free(audio_streams);
+                cl.queueErr("list failed: out of memory");
                 return;
             };
             infos.append(self.allocator, .{
@@ -5420,7 +5424,10 @@ pub const Daemon = struct {
                 .ttl_secs = @intCast(@divTrunc(s.ttl_ms, 1000)),
                 .viewers = self.viewerCount(s),
                 .controller = controller,
-            }) catch return;
+            }) catch {
+                cl.queueErr("list failed: out of memory");
+                return;
+            };
         }
         cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
     }
@@ -7150,6 +7157,35 @@ test "events payload allocation failures snapshot every client" {
     for (0..allocations) |fail_index| {
         _ = try runEventsPayloadAllocationFailure(fail_index);
     }
+}
+
+test "list answers every allocation failure instead of dropping the welcome" {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+    defer harness.daemon.sessions.deinit(t.allocator);
+    try harness.daemon.sessions.append(t.allocator, &harness.session);
+    const cl = &harness.clients[0];
+
+    // The client is blocked in recvExpect(.welcome), so a reply the
+    // daemon never queues is a hang on its side: every allocation the
+    // reply path can make must still end in a frame it can read.
+    for (0..8) |fail_index| {
+        cl.wbuf.clearRetainingCapacity();
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        harness.daemon.allocator = failing.allocator();
+        harness.daemon.handleList(cl);
+        harness.daemon.allocator = t.allocator;
+        const reply = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+        try t.expect(reply.frame.ftype == .welcome or reply.frame.ftype == .err);
+        try t.expect(!cl.dead);
+    }
+
+    cl.wbuf.clearRetainingCapacity();
+    harness.daemon.handleList(cl);
+    const ok = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.welcome, ok.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, ok.frame.payload, "event-ingest-test") != null);
 }
 
 /// Emit one APC through the collector; `emit` takes ownership of the bytes.

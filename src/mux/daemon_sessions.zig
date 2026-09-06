@@ -945,9 +945,57 @@ pub fn brokerList(self: *Daemon, cl: *Client) void {
             .ttl_secs = w.ttl_secs,
             .viewers = w.viewers,
             .controller = if (w.controller) |p| p else "",
-        }) catch return;
+            // A dropped reply is a hang on the far side: the client is
+            // blocked in recvExpect(.welcome). `.err` is an answer there.
+        }) catch {
+            cl.queueErr("list failed: out of memory");
+            return;
+        };
     }
     cl.queueJson(.welcome, .{ .proto = cl.proto, .daemon_pid = c.getpid(), .server_proto = wire.PROTO_VERSION, .min_proto = wire.MIN_SERVER_PROTO, .negotiation = @as(u8, 1), .version = version.string, .audio_opus = opuscodec.available(), .video = build_options.video, .sessions = infos.items });
+}
+
+test "broker list answers an allocation failure instead of dropping the reply" {
+    const t = std.testing;
+    const a = t.allocator;
+    var empty: [0]u8 = .{};
+    // The daemon allocator fails; the client's does not, so the answer
+    // this test is about can still be queued.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var broker = Daemon{
+        .allocator = failing.allocator(),
+        .listen_fd = -1,
+        .sock_path = empty[0..],
+        .is_broker = true,
+    };
+    defer broker.workers.deinit(a);
+    var requester = Client{ .allocator = a, .fd = -1 };
+    defer requester.rbuf.deinit(a);
+    defer requester.wbuf.deinit(a);
+    defer requester.audio_wbuf.deinit(a);
+    var worker = Worker{
+        .allocator = a,
+        .name = @constCast("listed"),
+        .origin_name = @constCast("listed"),
+        .origin_id = "30000000000000000000000000000003".*,
+        .pid = 123,
+        .control_fd = -1,
+    };
+    try broker.workers.append(a, &worker);
+
+    brokerList(&broker, &requester);
+    const reply = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.err, reply.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, reply.frame.payload, "out of memory") != null);
+    try t.expect(!requester.dead);
+
+    // Same call with a working allocator still lists the worker.
+    requester.wbuf.clearRetainingCapacity();
+    broker.allocator = a;
+    brokerList(&broker, &requester);
+    const ok = (try wire.peelFrame(requester.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.welcome, ok.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, ok.frame.payload, "listed") != null);
 }
 
 /// Broker side of kill: send the worker a graceful 'K', stop routing its name,
