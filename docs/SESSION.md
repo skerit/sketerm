@@ -1,5 +1,61 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-07: what a selection means, and eleven more file-manager bugs
+
+The second pass over `sketerm files`, continuing the afternoon of
+hand-driving that produced the twelve fixes before it. Same method --
+the real GUI on its own compositor through `smoke_e2e` -- aimed at
+what the first pass never reached: multi-select and the danger verbs,
+type-ahead, the preview pane, drag and drop, Properties, the places
+sidebar, sorting by every column, an unreadable directory.
+
+The worst of it was one class with three faces: **a verb acting on
+rows that are not on screen.** `tab.selected` is the path mirror every
+verb reads, `syncSelectionFromPaths` pushes it onto the rows and never
+walks back, and the render that rebuilds the store suppresses GTK's
+selection-changed -- so a row the hidden-files toggle or the live
+filter took off screen stayed armed, invisible and undeselectable, as
+a trash target. `views.pruneSelectionToVisible` runs before every
+render. `selectPatternDirs` (Ctrl+A, Select by pattern, invert) had
+hand-rolled half of `views.entryVisible`: it honored the hidden toggle
+and ignored the filter and the picker's rule, so Select All behind a
+filter armed the whole folder while highlighting three rows. And
+Properties on a symbolic link opened with every permission box ticked
+-- a listing's mode comes from lstat, so it was the LINK's 0777 --
+and Apply's chmod FOLLOWED the link and set the target
+world-writable, while the chown beside it (an lchown) acted on the
+link. The daemon refuses that chmod now and the dialog offers
+ownership only.
+
+The rest: a dragged path is shell-quoted whatever the count (a lone
+row travelled bare and a terminal pane pastes that flavor verbatim, so
+a name with a newline submitted its tail as a command line); a folder
+cannot be dropped or pasted inside itself (equality alone admitted
+/a/b -> /a/b/b, which the daemon then answered as a failed transfer);
+an empty file previews as "(empty file)" rather than as a cached
+failure, and an unreadable one as "permission denied" rather than as
+the word `ACCES`; type-ahead takes spaces and non-ASCII and expires
+honestly (Space fell through to GtkColumnView, whose plain-Space
+binding collapsed a multi-selection; a non-ASCII key was dropped
+mid-word without resetting the prefix, so "B", u-umlaut, "c" jumped to
+whatever "Bc" matched); sorting and grouping by Type use the type the
+column SHOWS, not the daemon's four-word dir/file/link/other
+vocabulary that made every regular file compare equal; a folder with
+no remembered columns gets the default set instead of the previous
+folder's; and a widget section the user named "Work Places" is its own
+section, not the remote one.
+
+Daemon-side, `deleteTreeDir` re-ran a too-wide directory level by
+RECURSING on itself, 64 KiB of frame per batch -- and on a directory
+that is readable but not searchable (mode 0444: readdir lists every
+name, every lstat is EACCES) no pass removes anything, so it recursed
+until the job helper died on the stack mid-delete. Pinned by a test
+that SIGSEGVs without the fix.
+
+`SKETERM_SMOKE_E2E_FILES_SELECTION_ONLY=1` is the focused stage: each
+of its four checks asserts which files are still on disk afterwards,
+because that is the only honest question to ask of this bug class.
+
 ## 2026-09-06: a codebase-wide review pass, in parallel
 
 Eight review streams over the daemon, the MCP server and its drivers,
