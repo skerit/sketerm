@@ -196,7 +196,7 @@ pub const TOOLS = [_]ToolDef{
         \\Type a shell command, press Enter, wait until OUTPUT settles, and return the resulting screen text. Output idle does not imply that a silent foreground command exited. Pass output_only=true to get ONLY a completed OSC 133 command zone when one is already available. For reliable headless completion use term_run with wait_for=command; for interactive programs prefer send_text/send_keys + read_screen.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max output-idle wait (default 15000)"},"quiet_ms":{"type":"integer","description":"No-output window that counts as idle (default 400)"},"output_only":{"type":"boolean","description":"Return just a completed command zone and exit code instead of the whole screen"}},"required":["command"]}
+        \\{"type":"object","properties":{"pane":{"type":"integer"},"command":{"type":"string"},"timeout_ms":{"type":"integer","description":"Max output-idle wait (default 15000, max 120000 - larger values are clamped)"},"quiet_ms":{"type":"integer","description":"No-output window that counts as idle (default 400)"},"output_only":{"type":"boolean","description":"Return just a completed command zone and exit code instead of the whole screen"}},"required":["command"]}
         ,
         .output_schema = "{\"type\":\"object\",\"properties\":{" ++ SCREEN_PROPS ++ "," ++ "\"pane\":{\"type\":\"integer\"},\"command\":{\"type\":\"string\"},\"source\":{\"type\":\"string\"},\"settled\":{\"type\":\"boolean\"},\"timed_out\":{\"type\":\"boolean\"},\"exit_status\":{\"type\":\"integer\"},\"output\":{\"type\":\"string\"}" ++ "},\"required\":[\"command\",\"source\",\"settled\",\"timed_out\",\"output\"]}",
     },
@@ -208,7 +208,7 @@ pub const TOOLS = [_]ToolDef{
         \\Wait until a pane produced no output for quiet_ms (or timeout_ms elapsed). Output idle does NOT imply that the foreground command exited.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"pane":{"type":"integer"},"timeout_ms":{"type":"integer"},"quiet_ms":{"type":"integer"}}}
+        \\{"type":"object","properties":{"pane":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Max wait (default 15000, max 120000 - larger values are clamped)"},"quiet_ms":{"type":"integer"}}}
         ,
         .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"pane\":{\"type\":\"integer\"},\"settled\":{\"type\":\"boolean\"},\"timed_out\":{\"type\":\"boolean\"},\"timeout_ms\":{\"type\":\"integer\"},\"quiet_ms\":{\"type\":\"integer\"}" ++ "},\"required\":[\"settled\",\"timed_out\"]}",
     },
@@ -474,7 +474,7 @@ pub const TOOLS = [_]ToolDef{
         \\Read what the app last copied to the clipboard (requires the app to have copied something).
         ,
         .input_schema =
-        \\{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}
+        \\{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Max wait (max 120000 - larger values are clamped)"}}}
         ,
         .output_schema = "{\"type\":\"object\",\"properties\":{" ++ "\"bytes\":{\"type\":\"integer\"},\"text\":{\"type\":\"string\"}" ++ "},\"required\":[\"bytes\",\"text\"]}",
     },
@@ -584,7 +584,7 @@ pub const TOOLS = [_]ToolDef{
         \\Read the app's accessibility (AT-SPI) tree as JSON: every widget's role, name, AT-SPI accessible identifier when exposed, description, states and screen rectangle. Desktop app identities come from the rendered windows' Wayland app_id instead. Target elements by name/role instead of pixel-hunting a screenshot. Works for GTK/Qt apps. When NOTHING published a tree (raw SDL/OpenGL/framebuffer apps and games have no toolkit to do so) the reply says exactly that, so an empty tree is never confused with having asked too early — in that case drive the app with screenshot_app + app_click coordinates and app_template_save/app_find_image, and do not expect app_perform_action/app_set_value to work.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer"}}}
+        \\{"type":"object","properties":{"app":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Max wait (max 120000 - larger values are clamped)"}}}
         ,
         .output_schema = "{\"type\":\"object\",\"properties\":{\"bare\":{\"type\":\"boolean\"},\"tree\":{\"type\":\"object\"}},\"required\":[\"bare\",\"tree\"]}",
     },
@@ -938,7 +938,7 @@ pub const TOOLS = [_]ToolDef{
         \\Copy a LOCAL file to an SSH host (scp), with integrity + atomicity built in: scp to a staged temp file, remote SHA-256 verify against the local hash, then an atomic mv into place (a corrupt transfer is discarded, never half-written). The staged name PRESERVES the extension (x.service → x.sketerm-part.service) so suffix-sensitive validators accept it, and 'verify_command' runs a remote check against the staged file BEFORE the move ({} = the staged path, appended if absent; nonzero exit = upload discarded, destination untouched — e.g. "systemd-analyze verify {}"). Omit 'host' for a checksummed atomic local copy. Requires key/agent SSH auth (BatchMode).
         ,
         .input_schema =
-        \\{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box); omit = local copy"},"local_path":{"type":"string"},"remote_path":{"type":"string","description":"Destination path (on the host, or locally when host is omitted)"},"verify_command":{"type":"string","description":"Remote validation run against the staged file before the atomic move; {} substitutes the staged path"},"timeout_ms":{"type":"integer","description":"scp budget, default 120000"}},"required":["local_path","remote_path"]}
+        \\{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box); omit = local copy"},"local_path":{"type":"string"},"remote_path":{"type":"string","description":"Destination path (on the host, or locally when host is omitted)"},"verify_command":{"type":"string","description":"Remote validation run against the staged file before the atomic move; {} substitutes the staged path"},"timeout_ms":{"type":"integer","description":"Transfer budget, default and max 120000 (larger values are clamped). Covers both legs: the scp and the remote checksum/verify/move."}},"required":["local_path","remote_path"]}
         ,
         .output_schema =
         \\{"type":"object","properties":{"direction":{"type":"string","enum":["upload","download"]},"path":{"type":"string","description":"Final destination path"},"bytes":{"type":["integer","null"]},"sha256":{"type":"string"},"verified":{"type":"boolean","description":"Always true: an unverified transfer is an error result"},"atomic":{"type":"boolean"}},"required":["direction","path","bytes","sha256","verified","atomic"]}
@@ -969,7 +969,7 @@ pub const TOOLS = [_]ToolDef{
         \\Open a STRUCTURED SSH port forward (ssh -N -L with keepalives + ExitOnForwardFailure): picks a free local port when none is given, verifies the listener actually accepts before replying, and returns a forward id. Health-check/reconnect with port_forward_check. Requires key/agent auth (BatchMode).
         ,
         .input_schema =
-        \\{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box)"},"remote_port":{"type":"integer","description":"Port on the remote side"},"remote_host":{"type":"string","description":"Remote-side connect address (default 127.0.0.1)"},"local_port":{"type":"integer","description":"Local listen port (omit = auto-pick a free one; the reply tells you which)"},"timeout_ms":{"type":"integer","description":"Readiness budget, default 20000"}},"required":["host","remote_port"]}
+        \\{"type":"object","properties":{"host":{"type":"string","description":"SSH destination (user@box)"},"remote_port":{"type":"integer","description":"Port on the remote side"},"remote_host":{"type":"string","description":"Remote-side connect address (default 127.0.0.1)"},"local_port":{"type":"integer","description":"Local listen port (omit = auto-pick a free one; the reply tells you which)"},"timeout_ms":{"type":"integer","description":"Readiness budget, default 20000, max 120000 (larger values are clamped)"}},"required":["host","remote_port"]}
         ,
         .output_schema =
         \\{"type":"object","properties":{"forward":{"type":"integer"},"local_port":{"type":"integer"},"host":{"type":"string"},"remote_host":{"type":"string"},"remote_port":{"type":"integer"},"listening":{"type":"boolean"}},"required":["forward","local_port","host","remote_host","remote_port","listening"]}
@@ -997,7 +997,7 @@ pub const TOOLS = [_]ToolDef{
         \\Health-check one forward: verifies the ssh process AND that the local port accepts connections; if the ssh died (network blip, sshd restart) it RECONNECTS by respawning the same spec on the same local port.
         ,
         .input_schema =
-        \\{"type":"object","properties":{"forward":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Reconnect readiness budget, default 20000"}}}
+        \\{"type":"object","properties":{"forward":{"type":"integer"},"timeout_ms":{"type":"integer","description":"Reconnect readiness budget, default 20000, max 120000 (larger values are clamped)"}}}
         ,
         .output_schema =
         \\{"type":"object","properties":{"forward":{"type":"integer"},"alive":{"type":"boolean"},"listening":{"type":"boolean"},"reconnected":{"type":"boolean","description":"The ssh had died and was respawned on the same local port"},"local_port":{"type":"integer"}},"required":["forward","alive","listening","reconnected","local_port"]}

@@ -1478,6 +1478,14 @@ pub const CATCHUP_MS: i64 = 2_500;
 /// app tool clamps to this and the schemas say so.
 pub const WAIT_CAP_MS: i64 = 120_000;
 
+/// The one clamp for a caller-supplied `timeout_ms`. Every wait goes
+/// through it: a tool that took the value verbatim promised a wait the
+/// watchdog cancels, and on the pane tools it also blocked the
+/// single-threaded loop for the whole of it.
+pub fn waitCap(requested: ?i64, default_ms: i64) i64 {
+    return std.math.clamp(requested orelse default_ms, 0, WAIT_CAP_MS);
+}
+
 pub const Tuning = struct {
     const Item = struct {
         name: []const u8,
@@ -5900,7 +5908,7 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
     if (eql(u8, name, "run_command")) {
         const command = argStr(args, "command") orelse
             return errRes(arena, .invalid_args, "run_command requires 'command'");
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 15_000;
+        const timeout_ms: i64 = waitCap(argInt(args, "timeout_ms"), 15_000);
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
         const data = try std.fmt.allocPrint(arena, "{s}\r", .{command});
         const send = try ipcParsed(arena, backend, .{ .cmd = "send-text", .pane = pane, .data = data });
@@ -5953,7 +5961,7 @@ fn callTool(arena: std.mem.Allocator, backend: Backend, name: []const u8, args: 
         return res.finish();
     }
     if (eql(u8, name, "wait_idle")) {
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 15_000;
+        const timeout_ms: i64 = waitCap(argInt(args, "timeout_ms"), 15_000);
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
         const settled = waitIdle(arena, backend, pane, timeout_ms, quiet_ms) catch |err| switch (err) {
             error.NoSuchPane => return errRes(arena, .not_found, "no such pane"),
@@ -6945,6 +6953,29 @@ test "a policy filters tools/list and refuses tools/call" {
     try std.testing.expectEqual(@as(usize, 0), fake.requests.items.len);
     // (capabilities' policy block needs the process-wide rec/app state
     // a real server sets up — smoke-mcp asserts it end to end.)
+}
+
+test "wait_idle clamps its budget to the app-side wait cap" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const info = "{\"ok\":true,\"screen\":{\"seq\":1}}";
+    var fake = FakeBackend{
+        .responses = &.{ info, info, info },
+        .allocator = std.testing.allocator,
+    };
+    defer fake.deinit();
+
+    // The MCP loop is single-threaded and the central watchdog cannot
+    // reach the GUI control socket (RealBackend opens one per request),
+    // so an unclamped wait here blocks every other tool for its whole
+    // duration and the watchdog only tears down unrelated sessions.
+    const resp = handleMessage(arena, fake.backend(),
+        \\{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"wait_idle","arguments":{"pane":1,"timeout_ms":600000,"quiet_ms":10}}}
+    ).?;
+    const parsed = try expectToolResultShape(arena, "wait_idle", try rpcToolResult(arena, resp));
+    const sc = parsed.object.get("structuredContent").?.object;
+    try std.testing.expectEqual(WAIT_CAP_MS, sc.get("timeout_ms").?.integer);
 }
 
 test "mcp Opts parses --tools and --profile" {

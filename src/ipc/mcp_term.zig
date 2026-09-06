@@ -964,6 +964,13 @@ pub fn remoteShLine(arena: std.mem.Allocator, script: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "echo {s} | base64 -d | sh", .{b64});
 }
 
+/// The follow-up leg's budget: what is left of the transfer's deadline,
+/// capped at `cap` and floored at 5s so the checksum is always attempted.
+/// The floor keeps the worst case (120s + 5s) under the 150s watchdog.
+fn legBudget(deadline_ms: i64, cap: i64) i64 {
+    return @max(5_000, @min(cap, deadline_ms - nowMs()));
+}
+
 /// One `port_forward_list` element.
 ///
 /// `host`/`remote_host` are CALLER-supplied and must go through the JSON
@@ -1054,7 +1061,13 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         const upload = eql(u8, name, "scp_put");
         const local = argStr(args, "local_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'local_path'");
         const remote = argStr(args, "remote_path") orelse return mcp.errRes(arena, .invalid_args, "requires 'remote_path'");
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 120_000;
+        const timeout_ms: i64 = mcp.waitCap(argInt(args, "timeout_ms"), 120_000);
+        // A transfer is TWO ssh legs, and their budgets used to add up
+        // (120s + 60s) past the 150s watchdog, which aborts the call and
+        // leaves the sessions reading as exited. `timeout_ms` bounds the
+        // scp; the checksum leg gets what is left of it, floored so it
+        // is always attempted.
+        const xfer_deadline = nowMs() + timeout_ms;
         const host = argStr(args, "host");
 
         if (host == null) {
@@ -1110,7 +1123,7 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             );
             const move_argv = remoteShArgv(arena, h, script) catch
                 return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-            switch (try runArgvTerm(arena, move_argv, 60_000)) {
+            switch (try runArgvTerm(arena, move_argv, legBudget(xfer_deadline, 60_000))) {
                 .err => |e| return mcp.errRes(arena, .unavailable, e),
                 .run => |r| {
                     if (std.mem.indexOf(u8, r.output, "SK_MOVED") != null)
@@ -1148,7 +1161,7 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         const script = try std.fmt.allocPrint(arena, "sha256sum {s} 2>/dev/null | cut -c1-64\n", .{try quoted(arena, remote)});
         const verify_argv = remoteShArgv(arena, h, script) catch
             return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-        switch (try runArgvTerm(arena, verify_argv, 30_000)) {
+        switch (try runArgvTerm(arena, verify_argv, legBudget(xfer_deadline, 30_000))) {
             .err => |e| return mcp.errRes(arena, .unavailable, e),
             .run => |r| {
                 const remote_sha = findHex64(r.output) orelse
@@ -1179,7 +1192,7 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             if (v < 1 or v > 65535) return mcp.errRes(arena, .invalid_args, "local_port out of range");
             break :blk @intCast(v);
         } else pickFreePort() orelse return mcp.errRes(arena, .unavailable, "could not pick a free local port");
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 20_000;
+        const timeout_ms: i64 = mcp.waitCap(argInt(args, "timeout_ms"), 20_000);
 
         const t = spawnForwardTerm(arena, h, lp, rh, rp) catch
             return mcp.errRes(arena, .unavailable, "spawn failed (mux daemon unreachable?)");
@@ -1247,7 +1260,7 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
             // respawn the same spec — this IS the reconnect behavior.
             const nt = spawnForwardTerm(arena, f.host, f.local_port, f.remote_host, f.remote_port) catch
                 return mcp.errRes(arena, .unavailable, "forward is dead and respawn failed (mux daemon unreachable?)");
-            switch (try waitForwardReady(arena, nt, f.local_port, argInt(args, "timeout_ms") orelse 20_000)) {
+            switch (try waitForwardReady(arena, nt, f.local_port, mcp.waitCap(argInt(args, "timeout_ms"), 20_000))) {
                 .ready => {
                     f.term.deinit();
                     f.term = nt;

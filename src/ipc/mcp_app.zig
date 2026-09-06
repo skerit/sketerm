@@ -1126,7 +1126,7 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         return inputResult(arena, app, args, win_id, &piw, desc, &res);
     }
     if (eql(u8, name, "app_clipboard_get")) {
-        const timeout_ms: i64 = argInt(args, "timeout_ms") orelse 3_000;
+        const timeout_ms: i64 = mcp.waitCap(argInt(args, "timeout_ms"), 3_000);
         const bytes = app.getClipboard(timeout_ms) catch |err| switch (err) {
             appdrive.Error.NoClipboard => return errRes(arena, .not_found, "the app has not announced a clipboard selection (copy something in it first)"),
             appdrive.Error.Timeout => return errRes(arena, .timeout, "app did not deliver clipboard data in time"),
@@ -2063,7 +2063,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             std.json.fmt(elem_id, .{}),
             index,
         });
-        const reply = app.a11yOp(payload, argInt(args, "timeout_ms") orelse 5_000) catch
+        const reply = app.a11yOp(payload, mcp.waitCap(argInt(args, "timeout_ms"), 5_000)) catch
             return errRes(arena, .unavailable, "a11y action failed (daemon unreachable?)");
         defer mcp.app_state.allocator.free(reply);
         if (std.mem.indexOf(u8, reply, "\"ok\"") == null)
@@ -2099,7 +2099,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
                 num,
             });
         } else return errRes(arena, .invalid_args, "app_set_value requires 'text' (text fields) or 'value' (sliders/spinners)");
-        const reply = app.a11yOp(payload, argInt(args, "timeout_ms") orelse 5_000) catch
+        const reply = app.a11yOp(payload, mcp.waitCap(argInt(args, "timeout_ms"), 5_000)) catch
             return errRes(arena, .unavailable, "a11y set failed (daemon unreachable?)");
         defer mcp.app_state.allocator.free(reply);
         if (std.mem.indexOf(u8, reply, "\"ok\"") == null)
