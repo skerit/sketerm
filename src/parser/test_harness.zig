@@ -175,6 +175,33 @@ pub const Harness = struct {
         try std.testing.expectEqual(col, self.screen.col);
     }
 
+    /// Assert the wide-pair invariant over every cell of the screen:
+    /// a FLAG_WIDE_LEFT cell always has a FLAG_WIDE_CONT neighbour to
+    /// its right and vice versa. A half-pair is a ghost cell to the
+    /// renderer and reflows wrong; a 1-column screen used to mint one
+    /// on every wide glyph.
+    pub fn expectWidePairsWellFormed(self: *Harness) !void {
+        const cols = self.screen.cols;
+        var row: u16 = 0;
+        while (row < self.screen.rows) : (row += 1) {
+            const cells = self.screen.line(row).cells;
+            var col: u16 = 0;
+            while (col < cols) : (col += 1) {
+                const f = cells[col].flags;
+                if (f & cell_mod.FLAG_WIDE_LEFT != 0) {
+                    if (col + 1 >= cols) return error.WideLeftWithoutContinuation;
+                    if (cells[col + 1].flags & cell_mod.FLAG_WIDE_CONT == 0)
+                        return error.WideLeftWithoutContinuation;
+                }
+                if (f & cell_mod.FLAG_WIDE_CONT != 0) {
+                    if (col == 0) return error.WideContWithoutLead;
+                    if (cells[col - 1].flags & cell_mod.FLAG_WIDE_LEFT == 0)
+                        return error.WideContWithoutLead;
+                }
+            }
+        }
+    }
+
     /// UTF-8 encoded row contents, with trailing blanks trimmed.
     /// Caller frees.
     pub fn line(self: *Harness, allocator: std.mem.Allocator, row: u16) ![]u8 {

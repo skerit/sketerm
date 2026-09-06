@@ -3968,15 +3968,22 @@ pub const Screen = struct {
         self.splitWidePair(ln, self.col);
         if (width == 2) self.splitWidePair(ln, self.col + 1);
 
+        // A wide glyph only carries FLAG_WIDE_LEFT when its continuation
+        // cell exists. On a 1-column screen it never does, and a
+        // wide-left without a wide-cont neighbour is a malformed pair
+        // every consumer (renderer, reflow, selection) has to special-case
+        // — `reflow.rechunk` already degrades such a pair to a narrow
+        // cell at width 1, so this is the same rule applied at print.
+        const has_cont = width == 2 and self.col + 1 < self.cols;
         var flags: u8 = if (self.current_link_id != 0) cell_mod.FLAG_HAS_LINK else 0;
-        if (width == 2) flags |= cell_mod.FLAG_WIDE_LEFT; // is_wide_left
+        if (has_cont) flags |= cell_mod.FLAG_WIDE_LEFT; // is_wide_left
         ln.cells[self.col] = .{
             .rune = cp,
             .style_ref = self.cur_style,
             .flags = flags,
             .reserved = self.current_link_id,
         };
-        if (width == 2 and self.col + 1 < self.cols) {
+        if (has_cont) {
             // Continuation cell: empty rune, is_wide_cont flag.
             ln.cells[self.col + 1] = .{
                 .rune = 0,

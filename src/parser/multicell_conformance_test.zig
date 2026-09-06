@@ -135,3 +135,26 @@ test "screen.py: combining diacritic attaches" {
     h.feed("a\xcc\x81");
     try std.testing.expectEqual(@as(u16, 1), h.screen.col);
 }
+
+test "a wide glyph never leaves a wide-left without its continuation" {
+    // A 1-column screen has nowhere to put the continuation cell, so
+    // the glyph is stored as a narrow cell rather than a half-pair
+    // (xterm prints nothing there and advances as it would on a wrap;
+    // `reflow.rechunk` already degrades such a pair at width 1).
+    var one = try Harness.init(std.testing.allocator, 1, 3);
+    defer one.deinit();
+    one.arm();
+    one.feed("\xe4\xb8\xad\xe4\xb8\xad"); // 中中
+    try one.expectWidePairsWellFormed();
+    try std.testing.expect(one.screen.cellAt(0, 0).flags & cell_mod.FLAG_WIDE_LEFT == 0);
+
+    // Two columns: the pair fits, so it IS flagged, and wrapping,
+    // overwriting one half and mixing narrow text keep it well formed.
+    var two = try Harness.init(std.testing.allocator, 2, 3);
+    defer two.deinit();
+    two.arm();
+    two.feed("\xe4\xb8\xad\xe4\xb8\xadx\xe4\xb8\xad");
+    try two.expectWidePairsWellFormed();
+    try std.testing.expect(two.screen.cellAt(0, 0).flags & cell_mod.FLAG_WIDE_LEFT != 0);
+    try std.testing.expect(two.screen.cellAt(0, 1).flags & cell_mod.FLAG_WIDE_CONT != 0);
+}
