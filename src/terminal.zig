@@ -1167,6 +1167,14 @@ pub const Terminal = struct {
             _ = c.g_source_remove(remote.watch_id);
             remote.watch_id = 0;
         }
+        // The write watch polls the OLD fd, which `conn.deinit` below
+        // closes. Left armed it spins on POLLNVAL and — because
+        // `armRemoteWriteWatch` refuses to arm while the id is non-zero
+        // — the new transport never gets a write watch of its own.
+        if (remote.write_watch_id != 0) {
+            _ = c.g_source_remove(remote.write_watch_id);
+            remote.write_watch_id = 0;
+        }
         if (remote.idle_kick_id != 0) {
             _ = c.g_source_remove(remote.idle_kick_id);
             remote.idle_kick_id = 0;
