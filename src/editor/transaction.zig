@@ -68,8 +68,12 @@ pub const Transaction = struct {
 pub fn validateEdits(edits: []const Edit, doc_len: usize) Error!void {
     var prev_end: usize = 0;
     for (edits, 0..) |e, i| {
+        // Subtract rather than add: `offset + deleted_len` overflows for
+        // a hostile pair and wraps to a small number in ReleaseFast, so
+        // the bound check would PASS and `Rope.delete` would then run
+        // with an out-of-range end (its own guard is a debug assert).
+        if (e.offset > doc_len or e.deleted_len > doc_len - e.offset) return Error.InvalidEdits;
         const end = e.offset + e.deleted_len;
-        if (end > doc_len) return Error.InvalidEdits;
         if (i > 0 and e.offset < prev_end) return Error.InvalidEdits;
         prev_end = end;
     }
@@ -138,6 +142,20 @@ test "transaction validate rejects overlap and out-of-bounds" {
     try tx3.addReplace(testing.allocator, 0, 2, "xy");
     try tx3.addInsert(testing.allocator, 2, "z");
     try tx3.validate(10);
+}
+
+test "transaction validate rejects a length that would overflow the end" {
+    // offset + deleted_len wraps to 4 here; an additive bound check
+    // accepts it and Rope.delete then runs unguarded (ReleaseFast has
+    // no debug asserts).
+    const edits = [_]Edit{.{ .offset = 10, .deleted_len = std.math.maxInt(usize) - 5, .inserted = "" }};
+    try testing.expectError(Error.InvalidEdits, validateEdits(&edits, 100));
+    // An offset past the end alone is still refused.
+    const past = [_]Edit{.{ .offset = 101, .deleted_len = 0, .inserted = "" }};
+    try testing.expectError(Error.InvalidEdits, validateEdits(&past, 100));
+    // …and the exact end is still accepted.
+    const at_end = [_]Edit{.{ .offset = 100, .deleted_len = 0, .inserted = "x" }};
+    try validateEdits(&at_end, 100);
 }
 
 test "mapOffset before, inside, after an edit" {

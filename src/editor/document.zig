@@ -374,6 +374,7 @@ pub const Document = struct {
         self.clearRedo();
         self.revision += 1;
 
+        var next_typing: ?Typing = null;
         if (typing_cp) |cp| {
             const edit = tx.edits.items[0];
             const new_end = edit.offset + edit.inserted.len;
@@ -389,18 +390,26 @@ pub const Document = struct {
                     return self.revision;
                 }
             }
-            self.typing = .{ .end = new_end, .last_cp = cp };
+            next_typing = .{ .end = new_end, .last_cp = cp };
         }
 
         const kept: ?[]Selection = if (before) |b|
             self.alloc.dupe(Selection, b.sels) catch null
         else
             null;
+        errdefer if (kept) |k| self.alloc.free(k);
+        // A typing group names the entry on TOP of the undo stack, so it
+        // may only be published once that entry is actually there: an
+        // append that fails would otherwise leave `typing` pointing at
+        // the previous, unrelated group and the next keystroke would
+        // extend ITS inverse delete.
+        errdefer self.typing = null;
         try self.undo_stack.append(self.alloc, .{
             .edits = inverse,
             .before = kept,
             .before_primary = if (before) |b| b.primary else 0,
         });
+        self.typing = next_typing;
         return self.revision;
     }
 
@@ -833,6 +842,28 @@ test "document markSaved clears dirty" {
     try testing.expect(doc.isDirty());
     doc.markSaved();
     try testing.expect(!doc.isDirty());
+}
+
+test "document a history append that fails frees the kept selection and drops the typing group" {
+    // The pre-edit selection is duped BEFORE the undo entry is pushed,
+    // and a typing group names the entry on top of the stack: a failed
+    // push must not leak the one or leave the other aimed at a
+    // previous, unrelated group.
+    var idx: usize = 0;
+    while (idx < 60) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = idx });
+        const a = failing.allocator();
+        var doc = Document.initFromBytes(a, "ab") catch continue;
+        defer doc.deinit();
+        const sels = [_]Selection{.{ .anchor = 2, .head = 2 }};
+        var tx = tr.Transaction.init(doc.revision);
+        defer tx.deinit(a);
+        tx.addInsert(a, 2, "c") catch continue;
+        _ = doc.applyTransactionSel(&tx, .{ .sels = &sels, .primary = 0 }) catch {
+            try testing.expect(doc.typing == null);
+            continue;
+        };
+    }
 }
 
 const CountingObserver = struct {
