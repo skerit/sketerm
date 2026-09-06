@@ -1408,6 +1408,8 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
         errors: u64 = 0,
         skipped: u64 = 0,
         mtime_ms: i64 = 0,
+        /// Permission bits of a find/live/panelize match.
+        mode: u32 = 0,
         matches: u64 = 0,
         truncated: bool = false,
         /// Live-query status detail (ev == "ready").
@@ -1527,6 +1529,7 @@ pub fn fsJobLine(self: *Daemon, job: *FsJob, line: []const u8) void {
                 .kind = e.kind,
                 .size = e.size,
                 .mtime_ms = e.mtime_ms,
+                .mode = e.mode,
                 .meta = e.meta,
                 .cached = e.cached,
                 .matches = e.matches,
