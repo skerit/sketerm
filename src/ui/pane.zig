@@ -1524,6 +1524,7 @@ pub const Pane = struct {
         }
         self.face_title = self.allocator.dupe(u8, text) catch null;
         self.refreshTitlebarLabel();
+        self.notifyTitleFact();
     }
 
     /// Drop the face-provided title; the OSC/manual title returns.
@@ -1532,6 +1533,26 @@ pub const Pane = struct {
         self.allocator.free(old);
         self.face_title = null;
         self.refreshTitlebarLabel();
+        self.notifyTitleFact();
+    }
+
+    /// The face title the pane currently shows in place of the
+    /// terminal's, or null while the terminal (or a manual lock) owns
+    /// the title. The window's tab label reads this too: a Files
+    /// window whose every tab read the hidden shell's cwd ("/tmp")
+    /// was this fact missing from the tab-title facts.
+    pub fn shownFaceTitle(self: *Pane) ?[]const u8 {
+        if (self.title_locked) return null;
+        const ft = self.face_title orelse return null;
+        return if (self.faceCoversTerminal()) ft else null;
+    }
+
+    /// The `{{ TITLE }}` fact moved (face raised, lowered or retitled):
+    /// the window re-renders the tab label from its facts, exactly as
+    /// it does for an OSC title, whose text it likewise ignores.
+    fn notifyTitleFact(self: *Pane) void {
+        if (self.widgets_dead) return;
+        if (self.win_on_title) |f| f(self.win_title_ctx, self, self.face_title orelse "");
     }
 
     /// True while a non-terminal face covers the terminal face.

@@ -285,8 +285,11 @@ pub fn abbreviateHome(cwd: []const u8, buf: []u8) []const u8 {
 pub fn paneFacts(self: *Window, pane: *Pane, rel_buf: []u8) titlefmt.Facts {
     const term = pane.terminal;
     const cwd: []const u8 = if (term.cwd) |p| p else "";
+    // A face covering the terminal (the file browser's folder, an
+    // editor's document, a web page) titles the tab; the shell behind
+    // it has nothing to say about what the user is looking at.
     var facts = titlefmt.Facts{
-        .title = if (term.screen.last_title) |t| t else "",
+        .title = if (pane.shownFaceTitle()) |ft| ft else if (term.screen.last_title) |t| t else "",
         .program = term.program(),
         .absolute_path = cwd,
         .relative_path = if (cwd.len > 0) abbreviateHome(cwd, rel_buf) else "",
