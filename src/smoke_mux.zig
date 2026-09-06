@@ -2436,6 +2436,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     // Isolated session: private runtime dir + dropped D-Bus + cleanup.
     isolatedStage(allocator, sock_path);
 
+    // 512 KiB of client input into a child that is not reading: held
+    // by the daemon, delivered in order once the child wakes (shared
+    // stage, also run against a real broker by smoke-broker).
+    @import("smoke_input_backlog.zig").run(allocator, sock_path);
+
     // Quick CLI connections send no hello and must still be served.
     noHelloStage(allocator, sock_path);
 

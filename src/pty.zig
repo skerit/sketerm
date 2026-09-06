@@ -105,24 +105,55 @@ pub const ShellIntegration = struct {
 /// when the child is hung (not draining the slave) and the user
 /// keeps typing / pasting / broadcasting. 1 MiB ≈ 30 minutes of
 /// typing at 60 wpm; in practice the queue empties within ms.
-const WRITE_QUEUE_CAP: usize = 1024 * 1024;
+pub const WRITE_QUEUE_CAP: usize = 1024 * 1024;
 
 pub const Pty = struct {
     master_fd: c_int,
     child_pid: c.pid_t,
     /// Bytes that wouldn't fit a non-blocking `write` because the
-    /// slave's input queue (TIOCINQ, typically 4 KiB) was full. We
-    /// hold them in user-space and drain via a `g_unix_fd_add`
-    /// G_IO_OUT watch when the kernel signals writability. The
-    /// queue uses `std.heap.c_allocator` so its lifetime is
+    /// slave's input queue (TIOCINQ, typically 4 KiB, plus ~64 KiB of
+    /// kernel flip buffers) was full. Held in user-space and drained
+    /// by `flushQueue` when the master is writable. Who notices
+    /// writability differs per build: the daemon ORs POLLOUT into its
+    /// poll set (`Daemon.tick`), the GUI arms a `g_unix_fd_add`
+    /// G_IO_OUT watch — the queue and the drain are the same code.
+    /// The queue uses `std.heap.c_allocator` so its lifetime is
     /// independent of any caller's allocator (the GLib watch can
     /// outlive a tab tear-down by exactly one event-loop iteration).
     write_queue: std.ArrayList(u8) = .empty,
     /// GLib source id for the POLLOUT watch, or 0 when no watch is
     /// active. `g_source_remove` ignores 0, so we don't gate the
     /// removal on this — but the field is the canonical "is the
-    /// watch live" signal for adders.
+    /// watch live" signal for adders. Always 0 without GLib.
     write_watch_id: c_uint = 0,
+    /// Bytes refused at `WRITE_QUEUE_CAP` since the queue last ran
+    /// empty. The owner reports the first refusal of an episode
+    /// (`WriteResult.first_drop`) and the total when the queue drains
+    /// (`flushQueue` returns it in `.drained`), so a hung child costs
+    /// two log lines rather than one per keystroke — and never silence.
+    dropped_since_full: usize = 0,
+
+    pub const WriteResult = struct {
+        /// Bytes the kernel accepted during this call.
+        delivered: usize,
+        /// Bytes parked in `write_queue` by this call.
+        queued: usize,
+        /// Bytes refused because the queue is at `WRITE_QUEUE_CAP`.
+        dropped: usize,
+        /// `dropped > 0` and nothing had been dropped since the queue
+        /// last drained: the caller's cue to log the refusal.
+        first_drop: bool,
+    };
+
+    pub const Flush = union(enum) {
+        /// Queue empty; payload = bytes dropped while it was full.
+        drained: usize,
+        /// Kernel took some or none; wait for the next POLLOUT.
+        blocked,
+        /// Write failed (EIO/EBADF...); queue discarded. Payload =
+        /// bytes thrown away, drops included.
+        failed: usize,
+    };
 
     pub fn spawn(opts: SpawnOpts) SpawnError!Pty {
         var master: c_int = undefined;
@@ -522,18 +553,14 @@ pub const Pty = struct {
     /// Try a non-blocking write. Bytes that don't fit (EAGAIN) get
     /// queued and the kernel signals us via POLLOUT when it can take
     /// more. Caller-visible behaviour: writes never block, queue
-    /// preserves order across calls. Return value is the number of
-    /// bytes that have been *delivered to the kernel* — anything
-    /// that ended up queued counts as 0 because it hasn't reached
-    /// the slave yet.
-    pub fn writeAll(self: *Pty, bytes: []const u8) usize {
+    /// preserves order across calls. Never blocks and never spins:
+    /// what the kernel refuses is queued for `flushQueue`, and only
+    /// bytes past `WRITE_QUEUE_CAP` are refused (reported, not silent).
+    pub fn writeAll(self: *Pty, bytes: []const u8) WriteResult {
         // Preserve ordering: if there's already queued data, append
-        // and let the POLLOUT watch flush it. A direct write here
-        // would race ahead of the queued bytes.
-        if (self.write_queue.items.len > 0) {
-            self.queueBytes(bytes);
-            return 0;
-        }
+        // and let the drain flush it. A direct write here would race
+        // ahead of the queued bytes.
+        if (self.write_queue.items.len > 0) return self.queueBytes(bytes, 0);
 
         var written: usize = 0;
         while (written < bytes.len) {
@@ -543,9 +570,8 @@ pub const Pty = struct {
                 if (errn == .INTR) continue; // signal interrupted — retry
                 if (errn == .AGAIN) {
                     // Slave's input queue full. Hand the rest to the
-                    // POLLOUT watch.
-                    self.queueBytes(bytes[written..]);
-                    return written;
+                    // POLLOUT drain.
+                    return self.queueBytes(bytes[written..], written);
                 }
                 // Real error (EBADF, EIO, EPIPE, ...) — return what
                 // we managed; caller can't do much about it.
@@ -554,60 +580,50 @@ pub const Pty = struct {
             if (n == 0) break;
             written += @intCast(n);
         }
-        return written;
+        return .{ .delivered = written, .queued = 0, .dropped = 0, .first_drop = false };
+    }
+
+    /// Bytes waiting for the master to become writable. Non-zero is
+    /// the daemon's cue to poll the master for POLLOUT.
+    pub fn queuedBytes(self: *const Pty) usize {
+        return self.write_queue.items.len;
     }
 
     /// Append to the user-space queue (capped to `WRITE_QUEUE_CAP` —
-    /// further bytes are dropped to bound memory in the hung-child
-    /// case) and arm the POLLOUT watch if it isn't already running.
-    fn queueBytes(self: *Pty, bytes: []const u8) void {
-        // No GLib main loop (sketerm-mux): drain with a bounded
-        // blocking poll loop instead of a POLLOUT watch. The daemon
-        // writes keystrokes, not bulk data; a full PTY input queue
-        // means a wedged child — give up after ~1 s rather than hang.
-        if (comptime !build_options.glib) {
-            var rest = bytes;
-            var spins: u32 = 0;
-            while (rest.len > 0 and spins < 100) : (spins += 1) {
-                var pfd = [_]c.struct_pollfd{.{ .fd = self.master_fd, .events = c.POLLOUT, .revents = 0 }};
-                _ = c.poll(&pfd, 1, 10);
-                const n = c.write(self.master_fd, rest.ptr, rest.len);
-                if (n > 0) {
-                    rest = rest[@intCast(n)..];
-                } else if (n < 0 and std.posix.errno(n) != .AGAIN and std.posix.errno(n) != .INTR) {
-                    break;
-                }
-            }
-            return;
-        }
+    /// further bytes are refused to bound memory in the hung-child
+    /// case) and, with GLib, arm the POLLOUT watch if it isn't
+    /// already running. Without GLib the owner's poll loop is the
+    /// wakeup (`queuedBytes` > 0 → POLLOUT → `flushQueue`).
+    fn queueBytes(self: *Pty, bytes: []const u8, delivered: usize) WriteResult {
         const cap_left = WRITE_QUEUE_CAP -| self.write_queue.items.len;
-        const take = @min(bytes.len, cap_left);
+        var take = @min(bytes.len, cap_left);
         if (take > 0) {
-            self.write_queue.appendSlice(std.heap.c_allocator, bytes[0..take]) catch {};
+            // An allocation failure is a refusal like any other, not
+            // a silent loss: count it against the same cap.
+            self.write_queue.appendSlice(std.heap.c_allocator, bytes[0..take]) catch {
+                take = 0;
+            };
         }
-        if (self.write_watch_id == 0 and self.write_queue.items.len > 0) {
-            self.write_watch_id = c.g_unix_fd_add(
-                self.master_fd,
-                c.G_IO_OUT | c.G_IO_HUP | c.G_IO_ERR,
-                @ptrCast(&drainWatchCb),
-                @ptrCast(self),
-            );
+        const dropped = bytes.len - take;
+        const first_drop = dropped > 0 and self.dropped_since_full == 0;
+        self.dropped_since_full += dropped;
+        if (comptime build_options.glib) {
+            if (self.write_watch_id == 0 and self.write_queue.items.len > 0) {
+                self.write_watch_id = c.g_unix_fd_add(
+                    self.master_fd,
+                    c.G_IO_OUT | c.G_IO_HUP | c.G_IO_ERR,
+                    @ptrCast(&drainWatchCb),
+                    @ptrCast(self),
+                );
+            }
         }
+        return .{ .delivered = delivered, .queued = take, .dropped = dropped, .first_drop = first_drop };
     }
 
-    /// POLLOUT-handler entry point. GLib calls us with `condition`
-    /// containing the events that fired. We drain as much as the
-    /// kernel will take; on empty queue or fatal condition we
-    /// remove the watch by returning false.
-    fn drainWatchCb(_: c_int, condition: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Pty = @ptrCast(@alignCast(user.?));
-        // HUP / ERR: child died or pipe broke. Drop everything.
-        if ((condition & (c.G_IO_HUP | c.G_IO_ERR)) != 0) {
-            self.write_queue.clearRetainingCapacity();
-            self.write_watch_id = 0;
-            return 0;
-        }
-        // Drain as much as the kernel will take.
+    /// Write as much of the queue as the kernel will take right now.
+    /// Called on POLLOUT by whichever loop watches the master; safe to
+    /// call with an empty queue (returns `.drained`).
+    pub fn flushQueue(self: *Pty) Flush {
         while (self.write_queue.items.len > 0) {
             const n = c.write(
                 self.master_fd,
@@ -617,13 +633,11 @@ pub const Pty = struct {
             if (n < 0) {
                 const errn = std.posix.errno(n);
                 if (errn == .INTR) continue;
-                if (errn == .AGAIN) break; // wait for next POLLOUT
+                if (errn == .AGAIN) return .blocked; // wait for next POLLOUT
                 // Other errors — abandon the queue.
-                self.write_queue.clearRetainingCapacity();
-                self.write_watch_id = 0;
-                return 0;
+                return .{ .failed = self.discardQueue() };
             }
-            if (n == 0) break;
+            if (n == 0) return .blocked;
             const consumed: usize = @intCast(n);
             // Shift remaining bytes down. Cheaper than a ring buffer
             // for the typical "small queue, occasional spike" pattern.
@@ -635,11 +649,40 @@ pub const Pty = struct {
             );
             self.write_queue.shrinkRetainingCapacity(remaining);
         }
-        if (self.write_queue.items.len == 0) {
+        // Don't let one big paste pin its high-water capacity.
+        if (self.write_queue.capacity > (256 << 10)) self.write_queue.clearAndFree(std.heap.c_allocator);
+        const dropped = self.dropped_since_full;
+        self.dropped_since_full = 0;
+        return .{ .drained = dropped };
+    }
+
+    /// Throw the queue away (child gone / master broken). Returns the
+    /// bytes lost, queued plus refused, and resets the drop episode.
+    fn discardQueue(self: *Pty) usize {
+        const lost = self.write_queue.items.len + self.dropped_since_full;
+        self.write_queue.clearRetainingCapacity();
+        self.dropped_since_full = 0;
+        return lost;
+    }
+
+    /// GLib POLLOUT-handler entry point: `flushQueue` behind a
+    /// `g_unix_fd_add` watch; removes the watch (returns false) once
+    /// the queue is empty or the master is dead.
+    fn drainWatchCb(_: c_int, condition: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
+        const self: *Pty = @ptrCast(@alignCast(user.?));
+        // HUP / ERR: child died or pipe broke. Drop everything.
+        if ((condition & (c.G_IO_HUP | c.G_IO_ERR)) != 0) {
+            _ = self.discardQueue();
             self.write_watch_id = 0;
             return 0;
         }
-        return 1;
+        switch (self.flushQueue()) {
+            .blocked => return 1,
+            .drained, .failed => {
+                self.write_watch_id = 0;
+                return 0;
+            },
+        }
     }
 };
 
@@ -694,6 +737,92 @@ fn reapStep(user: ?*anyopaque) callconv(.c) c.gboolean {
         else => {},
     }
     return 1; // G_SOURCE_CONTINUE
+}
+
+test "writeAll: input past a sleeping child is queued, never spun on or lost" {
+    const clock = @import("util/clock.zig");
+    var pty = try Pty.spawn(.{
+        .argv = &.{ "/bin/sh", "-c", "stty -echo; echo READY; sleep 1; md5sum" },
+    });
+    defer _ = pty.closeAndReap();
+
+    var out: [512]u8 = undefined;
+    var len: usize = 0;
+    var tries: u32 = 0;
+    while (tries < 200 and std.mem.indexOf(u8, out[0..len], "READY") == null) : (tries += 1) {
+        var pfd = c.struct_pollfd{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, 50) <= 0) continue;
+        const n = c.read(pty.master_fd, out[len..].ptr, out.len - len);
+        if (n <= 0) break;
+        len += @intCast(n);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out[0..len], "READY") != null);
+
+    // 256 KiB of 64-byte lines: far past the kernel's ~68 KiB, under the cap.
+    const payload = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(payload);
+    for (payload, 0..) |*b, i| b.* = if (i % 64 == 63) '\n' else 'a' + @as(u8, @intCast((i * 7 + i / 64) % 26));
+    var digest: [16]u8 = undefined;
+    std.crypto.hash.Md5.hash(payload, &digest, .{});
+    var hex_buf: [32]u8 = undefined;
+    const hex = try std.fmt.bufPrint(&hex_buf, "{x}", .{&digest});
+
+    const t0 = clock.nowMs();
+    const r1 = pty.writeAll(payload);
+    const r2 = pty.writeAll("\x04");
+    // The child is asleep: the kernel took part, the rest is queued —
+    // immediately, with no drop and no blocking poll loop in between.
+    try std.testing.expect(clock.nowMs() - t0 < 200);
+    try std.testing.expect(r1.delivered < payload.len);
+    try std.testing.expectEqual(payload.len, r1.delivered + r1.queued);
+    try std.testing.expectEqual(@as(usize, 0), r1.dropped);
+    try std.testing.expectEqual(@as(usize, 1), r2.queued);
+    try std.testing.expectEqual(r1.queued + 1, pty.queuedBytes());
+
+    // Owner loop: POLLOUT drains, POLLIN collects md5sum's verdict.
+    len = 0;
+    tries = 0;
+    while (tries < 400 and std.mem.indexOf(u8, out[0..len], hex) == null) : (tries += 1) {
+        var ev: c_short = c.POLLIN;
+        if (pty.queuedBytes() > 0) ev |= c.POLLOUT;
+        var pfd = c.struct_pollfd{ .fd = pty.master_fd, .events = ev, .revents = 0 };
+        if (c.poll(&pfd, 1, 50) <= 0) continue;
+        if (pfd.revents & c.POLLOUT != 0) {
+            switch (pty.flushQueue()) {
+                .drained => |dropped| try std.testing.expectEqual(@as(usize, 0), dropped),
+                .blocked => {},
+                .failed => return error.WriteFailed,
+            }
+        }
+        if (pfd.revents & (c.POLLIN | c.POLLHUP) != 0) {
+            const n = c.read(pty.master_fd, out[len..].ptr, out.len - len);
+            if (n <= 0) break;
+            len += @intCast(n);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), pty.queuedBytes());
+    try std.testing.expect(std.mem.indexOf(u8, out[0..len], hex) != null);
+}
+
+test "writeAll: refusal past WRITE_QUEUE_CAP is bounded and reported once per episode" {
+    // A child that never reads: everything queues, and the cap holds.
+    var pty = try Pty.spawn(.{ .argv = &.{ "/bin/sh", "-c", "stty -echo; sleep 30" } });
+    defer _ = pty.closeAndReap();
+    const chunk = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(chunk);
+    @memset(chunk, 'x');
+    var total_dropped: usize = 0;
+    var first_drops: usize = 0;
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        const r = pty.writeAll(chunk);
+        total_dropped += r.dropped;
+        if (r.first_drop) first_drops += 1;
+    }
+    try std.testing.expectEqual(WRITE_QUEUE_CAP, pty.queuedBytes());
+    try std.testing.expect(total_dropped > 0);
+    try std.testing.expectEqual(@as(usize, 1), first_drops);
+    try std.testing.expectEqual(total_dropped, pty.dropped_since_full);
 }
 
 test "spawn: pane identity not exported is ABSENT in the child, never inherited" {

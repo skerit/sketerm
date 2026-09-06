@@ -359,9 +359,20 @@ pub const Session = struct {
     /// A cast session has no child — replies are safely discarded.
     pub fn sinkWritePty(ctx: ?*anyopaque, bytes: []const u8) void {
         const self: *Session = @ptrCast(@alignCast(ctx.?));
-        switch (self.source) {
-            .pty => |*p| _ = p.writeAll(bytes),
-            .cast => {},
+        self.writeToChild(bytes);
+    }
+
+    /// Hand bytes to the child's PTY: delivered now, or queued for the
+    /// poll loop's POLLOUT drain (`Daemon.flushSessionInput`). The only
+    /// refusal is the queue cap, and it is logged once per episode
+    /// rather than swallowed. Cast sessions have no child: dropped.
+    pub fn writeToChild(self: *Session, bytes: []const u8) void {
+        const pty = self.ptyPtr() orelse return;
+        const r = pty.writeAll(bytes);
+        if (r.first_drop) {
+            log.warn("session '{s}': child is not reading its terminal and {d} KiB of input are already waiting; refusing further input until it drains ({d} B dropped)", .{
+                self.name, pty.queuedBytes() / 1024, r.dropped,
+            });
         }
     }
 
@@ -3038,9 +3049,15 @@ pub const Daemon = struct {
         const session_base = fds.items.len;
         const n_sessions_built = self.sessions.items.len;
         for (self.sessions.items) |s| {
+            // Client input the slave could not take yet waits in the
+            // Pty's queue; the master's POLLOUT is what drains it.
+            var ev: c_short = c.POLLIN;
+            if (s.ptyPtr()) |p| {
+                if (p.queuedBytes() > 0) ev |= c.POLLOUT;
+            }
             try fds.append(self.allocator, .{
                 .fd = if (s.exited) -1 else s.masterFd(),
-                .events = c.POLLIN,
+                .events = ev,
                 .revents = 0,
             });
         }
@@ -3217,6 +3234,9 @@ pub const Daemon = struct {
             const s = self.sessions.items[i];
             const re = fds.items[session_base + i].revents;
             if (re & (c.POLLIN | c.POLLHUP | c.POLLERR) != 0) self.drainSession(s);
+            // After the read: a dead child raises HUP alongside OUT, and
+            // drainSession marks the exit that makes the flush moot.
+            if (!s.exited and re & c.POLLOUT != 0) self.flushSessionInput(s);
         }
 
         i = 0;
@@ -6118,6 +6138,21 @@ pub const Daemon = struct {
     /// Read whatever the PTY has, parse, apply to the authoritative
     /// Screen, and broadcast the serialized events to attached
     /// clients in one EVENTS frame.
+    /// POLLOUT on a session's master: push queued client input into
+    /// the slave. Closes the drop episode `Session.writeToChild` opened
+    /// with the total, so a refusal is bracketed in the log, not lost.
+    fn flushSessionInput(self: *Daemon, s: *Session) void {
+        _ = self;
+        const pty = s.ptyPtr() orelse return;
+        switch (pty.flushQueue()) {
+            .blocked => {},
+            .drained => |dropped| if (dropped > 0) {
+                log.warn("session '{s}': child is reading again; {d} B of input were dropped while its queue was full", .{ s.name, dropped });
+            },
+            .failed => |lost| log.warn("session '{s}': terminal write failed; {d} B of queued input discarded", .{ s.name, lost }),
+        }
+    }
+
     fn drainSession(self: *Daemon, s: *Session) void {
         const pty = s.ptyPtr() orelse return;
         var chunk: [32768]u8 = undefined;

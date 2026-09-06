@@ -20376,3 +20376,27 @@ The three "missing tools" from the same feedback round, all client-side
 All three are headless-backend-only and their descriptions say so (a
 GUI view's keyboard and size belong to the pane); the GUI backend
 answers with a described refusal, never a guess.
+
+## 2026-09-06: daemon-side PTY input never truncates on a slow child
+
+`Pty.queueBytes` had two implementations behind `build_options.glib`:
+the GUI queued and drained on a GLib POLLOUT watch; the daemon (which
+now owns every PTY) spun up to a second on a full slave input queue
+and then DROPPED the remainder of the write. A paste or `sketerm mux
+send` of more than ~68 KiB (4 KiB line discipline + 64 KiB flip
+buffers) into a child that was busy was silently truncated.
+
+Now one queue, two wakeups: `writeAll` parks what EAGAIN refuses in
+the per-Pty queue (cap `WRITE_QUEUE_CAP`, 1 MiB) and returns a
+`WriteResult`; `flushQueue` is the shared drain. GLib arms its watch
+as before; `Daemon.tick` ORs POLLOUT into a session's poll entry
+whenever `queuedBytes() > 0` and calls `flushSessionInput` when it
+fires. The only refusal is the cap, and it is described: the first
+byte dropped in an episode logs a warn naming the session and the
+pending KiB, the drain that ends the episode logs the total dropped.
+
+Covered by `src/smoke_input_backlog.zig` (512 KiB into `sleep 3;
+md5sum`, digest compared; runs in smoke-mux AND smoke-broker) and two
+unit tests in `pty.zig` (queue-then-drain in order, cap + once-per-
+episode reporting). The smoke stage failed with a wrong digest before
+the fix.

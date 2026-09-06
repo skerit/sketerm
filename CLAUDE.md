@@ -57,7 +57,7 @@ There's no `--test-filter` wired through `build.zig`; to run a single test, eith
 
 ### The `glib` build option
 
-`build.zig` defines a bool `build_options.glib`. GUI targets get `true`; `sketerm-mux` and `smoke-mux` get `false` plus the lean `configureCoreDeps` dependency set (libc only). `src/pty.zig` gates its GLib write-queue watch and async child reaper on this option, falling back to blocking writes and `waitpid`. Anything imported by the mux side (`src/mux/*`, parser, grid) must stay free of GTK/GLib references.
+`build.zig` defines a bool `build_options.glib`. GUI targets get `true`; `sketerm-mux` and `smoke-mux` get `false` plus the lean `configureCoreDeps` dependency set (libc only). `src/pty.zig` gates only the WAKEUP on this option: the per-Pty write queue (`WRITE_QUEUE_CAP`, 1 MiB) and `flushQueue` are shared, GLib arms a `g_unix_fd_add` POLLOUT watch, and the daemon ORs POLLOUT into its session poll entry (`Daemon.tick` -> `flushSessionInput`). `writeAll` never blocks or spins in either build; the only refusal is the cap, reported through `WriteResult.first_drop` / `Flush.drained` so the daemon logs it (a spin-then-drop fallback silently truncated pastes into a slow child once). The async child reaper is still GLib-only, with `waitpid` as the fallback. Anything imported by the mux side (`src/mux/*`, parser, grid) must stay free of GTK/GLib references.
 
 ## Architecture (read `docs/architecture.md` for full detail)
 

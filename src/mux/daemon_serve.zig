@@ -971,9 +971,8 @@ pub fn handleFrame(self: *Daemon, cl: *Client, frame: wire.Frame) void {
                 cl.queueErr("not attached");
                 return;
             };
-            // Cast playback has no child to type at: drop silently.
-            const pty = s.ptyPtr() orelse return;
-            _ = pty.writeAll(frame.payload);
+            // Cast playback has no child to type at: dropped inside.
+            s.writeToChild(frame.payload);
         },
         .resize => {
             if (cl.panel_only) return;

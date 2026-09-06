@@ -390,6 +390,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     @import("smoke_backlog.zig").run(allocator, sock_path);
     std.debug.print("smoke-broker: mcp backlog gap + resync via worker ok\n", .{});
 
+    // ── client input past a sleeping child THROUGH THE BROKER: the
+    // worker's poll loop owns the PTY write queue there. ──
+    @import("smoke_input_backlog.zig").run(allocator, sock_path);
+    std.debug.print("smoke-broker: input backlog drained in order via worker ok\n", .{});
+
     // ── external display sessions + the controller lease THROUGH THE
     // BROKER. The hub paths ride the worker's 'Y' datagram and the
     // lease intent rides the 'A' handoff; either omitted and this is
