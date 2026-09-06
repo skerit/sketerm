@@ -3904,7 +3904,13 @@ pub const Screen = struct {
         if (self.last_print_cp != 0 and isExtendingCp(cp)) {
             const row: u16 = @intCast(self.last_print_key >> 16);
             const col: u16 = @intCast(self.last_print_key & 0xFFFF);
-            self.appendCluster(row, col, cp);
+            // The cell that base was printed into can have scrolled away
+            // or been resized out from under the key. Attaching anyway
+            // hangs the mark on a blank cell, where it is invisible but
+            // still comes out of extractSelection.
+            if (row < self.rows and col < self.cols and
+                self.line(row).cells[col].rune != 0)
+                self.appendCluster(row, col, cp);
             return;
         }
 
@@ -9019,5 +9025,17 @@ test "splitting a wide pair drops the cluster on the half it blanks" {
     try std.testing.expectEqual(@as(usize, 1), s.clusters.count());
     s.col = 1;
     s.printCp('x'); // blanks both halves of the pair
+    try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
+}
+
+test "a combining mark after a scroll does not attach to the blanked row" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    s.row = 1;
+    s.printCp('a');
+    s.lineFeed(); // 'a' scrolls up; row 1 is blank again
+    s.printCp(0x0301);
     try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
 }
