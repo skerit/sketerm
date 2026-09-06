@@ -355,6 +355,15 @@ pub const Renderer = struct {
             while (col < self.cols) {
                 var d = cellFor(screen, cells, on_active, logical, col, overlay, ind_start);
                 const idx = @as(usize, r) * self.cols + col;
+                if (d.wide and col + 1 >= self.cols) {
+                    // A 2-column glyph straddling the host's right edge:
+                    // its left half is a blank of the same style (and
+                    // takes the erase path below when that style is
+                    // default, so the host cell reads as empty).
+                    d.wide = false;
+                    d.rune = 0;
+                    d.cluster = 0;
+                }
                 if (isDefaultBlank(d)) {
                     // A run of default blanks is one ECH: the host's cells
                     // end up erased (rune 0), exactly like the mirror's, so
@@ -387,13 +396,6 @@ pub const Renderer = struct {
                     }
                     col += 2;
                     continue;
-                }
-                if (d.wide) {
-                    // A 2-column glyph straddling the host's right edge:
-                    // paint its left half as a blank of the same style.
-                    d.wide = false;
-                    d.rune = 0;
-                    d.cluster = 0;
                 }
                 if (!self.valid or !self.shadow[idx].eql(d)) {
                     try self.paint(out, screen, r, col, d, logical, on_active);
@@ -718,4 +720,119 @@ test "ttyrender: title and bell are forwarded once per change" {
     const second = try rig.frame();
     try testing.expect(std.mem.indexOfScalar(u8, second, 0x07) != null);
     try testing.expect(std.mem.indexOf(u8, second, "my title") == null);
+}
+
+test "ttyrender: a wide glyph clipped at the host's right edge becomes a blank, not a stray half" {
+    var rig = try Rig.init(5, 1);
+    rig.fix();
+    defer rig.deinit();
+    var pool = try Pool.init(testing.allocator);
+    defer pool.deinit();
+    const wide = try Screen.init(testing.allocator, &pool, 6, 1);
+    defer wide.deinit();
+    feed(wide, "abcd\xe4\xb8\xad");
+    rig.out.clearRetainingCapacity();
+    try rig.renderer.render(&rig.out, wide);
+    feed(rig.host, rig.out.items);
+    const text = try rig.host.extractScreen(testing.allocator);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings("abcd\n", text);
+    // The host never received the wide glyph.
+    try testing.expect(std.mem.indexOf(u8, rig.out.items, "\xe4\xb8\xad") == null);
+}
+
+test "ttyrender: a mirror taller than the host keeps the cursor hidden instead of wrapping it" {
+    var rig = try Rig.init(20, 3);
+    rig.fix();
+    defer rig.deinit();
+    var pool = try Pool.init(testing.allocator);
+    defer pool.deinit();
+    const tall = try Screen.init(testing.allocator, &pool, 20, 10);
+    defer tall.deinit();
+    feed(tall, "\x1b[8;1Hdeep");
+    try testing.expectEqual(@as(u16, 7), tall.row);
+    rig.out.clearRetainingCapacity();
+    try rig.renderer.render(&rig.out, tall);
+    feed(rig.host, rig.out.items);
+    try testing.expect(std.mem.indexOf(u8, rig.out.items, "\x1b[?25h") == null);
+    try testing.expect(std.mem.indexOf(u8, rig.out.items, "deep") == null);
+    try testing.expect(rig.host.row < 3);
+}
+
+test "ttyrender: pending-wrap cursor lands on the last column" {
+    var rig = try Rig.init(4, 2);
+    rig.fix();
+    defer rig.deinit();
+    feed(rig.screen, "abcd");
+    try testing.expect(rig.screen.pending_wrap);
+    _ = try rig.frame();
+    try rig.expectHostMatches();
+    try testing.expectEqual(@as(u16, 3), rig.host.col);
+}
+
+test "ttyrender: a host narrower than the scroll indicator still renders" {
+    var rig = try Rig.init(8, 2);
+    rig.fix();
+    defer rig.deinit();
+    feed(rig.screen, "a\r\nb\r\nc");
+    rig.renderer.view_offset = 1;
+    const bytes = try rig.frame();
+    try testing.expect(bytes.len > 0);
+    const text = try rig.host.extractScreen(testing.allocator);
+    defer testing.allocator.free(text);
+    // Row 0 is entirely indicator (truncated to 8 cells), row 1 is "b".
+    try testing.expect(std.mem.indexOf(u8, text, "\nb") != null);
+}
+
+test "ttyrender: reverse video, curly underline and underline colour round-trip" {
+    var rig = try Rig.init(12, 2);
+    rig.fix();
+    defer rig.deinit();
+    feed(rig.screen, "\x1b[?5h\x1b[4:3;58;2;1;2;3mwavy\x1b[0m");
+    const bytes = try rig.frame();
+    try testing.expect(std.mem.indexOf(u8, bytes, "\x1b[?5h") != null);
+    try testing.expect(rig.host.reverse_screen);
+    const e = rig.host.pool.get(rig.host.cellAt(0, 0).style_ref);
+    try testing.expect(e.attrs.curly_underline);
+    try testing.expect(Color.equal(e.underline_color, .{ .rgb = .{ .r = 1, .g = 2, .b = 3 } }));
+    try rig.expectHostMatches();
+    rig.out.clearRetainingCapacity();
+    try rig.renderer.leave(&rig.out);
+    feed(rig.host, rig.out.items);
+    try testing.expect(!rig.host.reverse_screen);
+}
+
+test "ttyrender: default colours after palette colours really reset on the host" {
+    var rig = try Rig.init(12, 1);
+    rig.fix();
+    defer rig.deinit();
+    feed(rig.screen, "\x1b[31;44mab\x1b[39mcd\x1b[49mef");
+    _ = try rig.frame();
+    try rig.expectHostMatches();
+    const c_style = rig.host.pool.get(rig.host.cellAt(0, 2).style_ref);
+    try testing.expect(c_style.fg == .default);
+    try testing.expect(Color.equal(c_style.bg, .{ .palette = 4 }));
+    const e_style = rig.host.pool.get(rig.host.cellAt(0, 4).style_ref);
+    try testing.expect(e_style.fg == .default and e_style.bg == .default);
+}
+
+test "ttyrender: a snapshot swap with a different pool repaints by value, not by index" {
+    var rig = try Rig.init(6, 1);
+    rig.fix();
+    defer rig.deinit();
+    feed(rig.screen, "\x1b[31mred\x1b[0m");
+    _ = try rig.frame();
+    // A "new snapshot": same text, but the pool interned styles in a
+    // different order (blue first), so index 1 now means blue.
+    var pool2 = try Pool.init(testing.allocator);
+    defer pool2.deinit();
+    const fresh = try Screen.init(testing.allocator, &pool2, 6, 1);
+    defer fresh.deinit();
+    feed(fresh, "\x1b[34m\x1b[0m\x1b[31mred\x1b[0m");
+    rig.renderer.invalidate();
+    rig.out.clearRetainingCapacity();
+    try rig.renderer.render(&rig.out, fresh);
+    feed(rig.host, rig.out.items);
+    const e = rig.host.pool.get(rig.host.cellAt(0, 0).style_ref);
+    try testing.expect(Color.equal(e.fg, .{ .palette = 1 }));
 }

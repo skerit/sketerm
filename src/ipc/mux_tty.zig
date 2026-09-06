@@ -75,8 +75,15 @@ pub const Command = union(enum) {
 pub const Filter = struct {
     prefix: bool = false,
     scrolling: bool = false,
+    /// Inside a bracketed paste (the host sends the markers only when
+    /// the session asked for mode 2004): every byte is data, a 0x1c in
+    /// pasted text must reach the session and never read as the prefix.
+    in_paste: bool = false,
     cmds: [16]Command = undefined,
     n: usize = 0,
+
+    const PASTE_START = "\x1b[200~";
+    const PASTE_END = "\x1b[201~";
 
     fn push(self: *Filter, cmd: Command) void {
         if (self.n < self.cmds.len) {
@@ -90,6 +97,17 @@ pub const Filter = struct {
         var i: usize = 0;
         while (i < bytes.len) {
             const b = bytes[i];
+            if (self.in_paste) {
+                if (std.mem.indexOfPos(u8, bytes, i, PASTE_END)) |k| {
+                    try pass.appendSlice(allocator, bytes[i .. k + PASTE_END.len]);
+                    i = k + PASTE_END.len;
+                    self.in_paste = false;
+                } else {
+                    try pass.appendSlice(allocator, bytes[i..]);
+                    i = bytes.len;
+                }
+                continue;
+            }
             if (self.prefix) {
                 self.prefix = false;
                 switch (b) {
@@ -127,9 +145,16 @@ pub const Filter = struct {
                 i += self.scrollKey(bytes[i..]);
                 continue;
             }
-            const end = std.mem.indexOfScalarPos(u8, bytes, i, PREFIX) orelse bytes.len;
-            try pass.appendSlice(allocator, bytes[i..end]);
-            i = end;
+            const next_prefix = std.mem.indexOfScalarPos(u8, bytes, i, PREFIX) orelse bytes.len;
+            const next_paste = std.mem.indexOfPos(u8, bytes, i, PASTE_START) orelse bytes.len;
+            if (next_paste < next_prefix) {
+                try pass.appendSlice(allocator, bytes[i .. next_paste + PASTE_START.len]);
+                i = next_paste + PASTE_START.len;
+                self.in_paste = true;
+                continue;
+            }
+            try pass.appendSlice(allocator, bytes[i..next_prefix]);
+            i = next_prefix;
         }
         return self.cmds[0..self.n];
     }
@@ -679,4 +704,27 @@ test "Filter: PageUp right after the prefix opens scrollback; detach works while
     try testing.expectEqual(@as(i32, 3), cmds[0].scroll_lines);
     try testing.expect(cmds[1] == .detach);
     try testing.expectEqualStrings("", pass.items);
+}
+
+test "Filter: a bracketed paste carrying the prefix byte passes through untouched" {
+    var f: Filter = .{};
+    var pass: std.ArrayList(u8) = .empty;
+    defer pass.deinit(testing.allocator);
+    const cmds = try feedFilter(&f, "\x1b[200~a\x1cb\x1c\x1cc\x1b[201~", &pass);
+    try testing.expectEqual(@as(usize, 0), cmds.len);
+    try testing.expectEqualStrings("\x1b[200~a\x1cb\x1c\x1cc\x1b[201~", pass.items);
+    try testing.expect(!f.prefix);
+}
+
+test "Filter: a paste split across reads stays a paste until its end marker" {
+    var f: Filter = .{};
+    var pass: std.ArrayList(u8) = .empty;
+    defer pass.deinit(testing.allocator);
+    _ = try feedFilter(&f, "\x1b[200~one\x1c", &pass);
+    var cmds = try feedFilter(&f, "\x1ctwo", &pass);
+    try testing.expectEqual(@as(usize, 0), cmds.len);
+    cmds = try feedFilter(&f, "\x1b[201~\x1c\x1c", &pass);
+    try testing.expectEqual(@as(usize, 1), cmds.len);
+    try testing.expect(cmds[0] == .detach);
+    try testing.expectEqualStrings("\x1b[200~one\x1c\x1ctwo\x1b[201~", pass.items);
 }

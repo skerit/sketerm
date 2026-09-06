@@ -383,7 +383,14 @@ fn muxSpawn(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8, r
 
     var conn = connectForSpawn(allocator, host) orelse return 1;
     defer conn.deinit();
-    if (!spawnOn(allocator, &conn, host, name, cwd, rows, cols, argv.items)) return 1;
+    switch (spawnOn(allocator, &conn, host, name, cwd, rows, cols, argv.items)) {
+        .ok => {},
+        .name_taken => {
+            _ = c.fprintf(platform.stderr(), "sketerm mux: session '%.*s' already exists\n", @as(c_int, @intCast(name.len)), name.ptr);
+            return 1;
+        },
+        .failed => return 1,
+    }
     _ = c.printf("%.*s\n", @as(c_int, @intCast(name.len)), name.ptr);
     return 0;
 }
@@ -410,7 +417,7 @@ fn spawnOn(
     rows: u16,
     cols: u16,
     argv: []const []const u8,
-) bool {
+) SpawnResult {
     var cfg = @import("../config.zig").Config.load(allocator);
     defer cfg.deinit();
     const settings = cfg.profileSettings(cfg.default_profile);
@@ -446,16 +453,19 @@ fn spawnOn(
     }) catch return false;
     const f = conn.recvExpectFor(&.{.ok}, 30_000) catch {
         const why = conn.lastErr();
+        if (std.mem.indexOf(u8, why, "already exists") != null) return .name_taken;
         if (why.len > 0) {
             _ = c.fprintf(platform.stderr(), "sketerm mux: spawn failed: %.*s\n", @as(c_int, @intCast(why.len)), why.ptr);
         } else {
-            _ = c.fprintf(platform.stderr(), "sketerm mux: spawn failed (name taken?)\n");
+            _ = c.fprintf(platform.stderr(), "sketerm mux: spawn failed\n");
         }
-        return false;
+        return .failed;
     };
     f.deinit(allocator);
-    return true;
+    return .ok;
 }
+
+const SpawnResult = enum { ok, name_taken, failed };
 
 // ── in-terminal viewing ─────────────────────────────────────────
 
@@ -485,11 +495,22 @@ fn ttyNew(allocator: std.mem.Allocator, host: ?[]const u8) mux_tty.Outcome {
         rows = ws.ws_row;
         cols = ws.ws_col;
     }
+    // A durable session outlives the process that named it, so a later
+    // process reusing this pid can collide with `s<pid>-1`: walk the
+    // counter past whatever exists instead of giving up.
     var name_buf: [32]u8 = undefined;
-    tty_session_seq += 1;
-    const name = std.fmt.bufPrint(&name_buf, "s{d}-{d}", .{ c.getpid(), tty_session_seq }) catch return .failed;
-    if (!spawnOn(allocator, &conn, host, name, null, rows, cols, &.{})) return .failed;
-    return mux_tty.attach(allocator, &conn, name, ttyOptions(.default));
+    var attempts: u8 = 0;
+    while (attempts < 16) : (attempts += 1) {
+        tty_session_seq += 1;
+        const name = std.fmt.bufPrint(&name_buf, "s{d}-{d}", .{ c.getpid(), tty_session_seq }) catch return .failed;
+        switch (spawnOn(allocator, &conn, host, name, null, rows, cols, &.{})) {
+            .ok => return mux_tty.attach(allocator, &conn, name, ttyOptions(.default)),
+            .name_taken => continue,
+            .failed => return .failed,
+        }
+    }
+    _ = c.fprintf(platform.stderr(), "sketerm mux: could not find a free session name\n");
+    return .failed;
 }
 
 /// Attach just long enough to feed input — the daemon requires an
