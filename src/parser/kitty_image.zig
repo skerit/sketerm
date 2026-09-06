@@ -86,7 +86,9 @@ pub const Command = struct {
     src_h: u32 = 0,
     /// Destination size in cells (`c=`,`r=`). When >0 the image is
     /// scaled to fit exactly this many cells; otherwise it renders at
-    /// native pixel size (1 image-pixel per terminal-pixel).
+    /// native pixel size (1 image-pixel per terminal-pixel). For `a=f`
+    /// the same two keys mean the 1-based base frame to compose onto
+    /// (`c=`) and the 1-based frame being edited (`r=`, 0 = append).
     cells_wide: u32 = 0,
     cells_high: u32 = 0,
     /// `C=1`: don't move the cursor after placement (the app draws on
@@ -105,7 +107,9 @@ pub const Command = struct {
     data_offset: u32 = 0,
     /// Pixel offset within the starting cell (`X=`, `Y=`), so an image
     /// can be positioned off the cell grid. For `a=f` these two mean
-    /// the frame composition mode and background colour instead.
+    /// the frame composition mode (`X=0` alpha-blend over the base
+    /// frame, `X=1` overwrite) and the background colour instead —
+    /// `C=` plays no part in frame transmission.
     cell_x_offset: u32 = 0,
     cell_y_offset: u32 = 0,
     /// Relative placement (`P=` parent image, `Q=` parent placement)

@@ -95,8 +95,11 @@ pub const Accum = struct {
     /// Frame metadata captured from the first chunk (only used when
     /// `action == .transmit_frame`).
     frame_delay_ms: u32 = 100,
-    frame_target: u32 = 0, // 0 = append at end
+    /// `r=`: 1-based frame being edited. 0 = append at end.
+    frame_target: u32 = 0,
+    /// `c=`: 1-based frame whose pixels are the composition base.
     frame_compose_from: u32 = 0,
+    /// `X=`: 0 = alpha-blend over the base frame, 1 = overwrite.
     frame_compose_mode: u8 = 0,
     /// The client's image NUMBER (`I=`) from the first chunk, carried
     /// to the stored image so `d=n/N` can find it.
@@ -381,14 +384,16 @@ pub const Manager = struct {
                         .compression = cmd.compression,
                         .data_size = cmd.data_size,
                         .action = cmd.action,
-                        // Frame-only metadata (z=delay, c=target frame,
-                        // r=compose source, C=compose mode). Stored
+                        // Frame-only metadata, spelled as the spec's
+                        // animation section names it: z=delay,
+                        // r=frame being edited, c=base frame to compose
+                        // onto, X=composition mode. Stored
                         // unconditionally — finalize ignores when
                         // action != .transmit_frame.
                         .frame_delay_ms = if (cmd.z >= 0) @intCast(cmd.z) else 0,
-                        .frame_target = cmd.cells_wide,
-                        .frame_compose_from = cmd.cells_high,
-                        .frame_compose_mode = cmd.no_cursor_move,
+                        .frame_target = cmd.cells_high,
+                        .frame_compose_from = cmd.cells_wide,
+                        .frame_compose_mode = if (cmd.cell_x_offset == 0) 0 else 1,
                         .number = cmd.image_number,
                     }) catch return default;
                     self.active_transmit_id = effective_id;
@@ -758,9 +763,9 @@ pub const Manager = struct {
             // existing.rgba now aliases frames[0].rgba (don't double-free).
         }
 
-        // Composition: per kitty spec, when `C=0` (default) the new
+        // Composition: per kitty spec, when `X=0` (default) the new
         // frame is alpha-blended over the base frame (referenced by
-        // `r=` or the previous frame); `C=1` overwrites.
+        // `c=`, else the previous frame); `X=1` overwrites.
         const compose_alpha = acc.frame_compose_mode == 0;
         const have_base = existing.frames.items.len > 0;
         if (compose_alpha and have_base) {
@@ -1362,7 +1367,7 @@ test "animation: advanceAnimations cycles current_frame" {
     try std.testing.expectEqual(@as(u32, 0), mgr.store.getPtr(7).?.current_frame);
 }
 
-test "animation: a=f with C=0 alpha-blends transparent over base" {
+test "animation: a=f with X=0 alpha-blends transparent over base" {
     var mgr = Manager.init(std.testing.allocator);
     defer mgr.deinit();
 
@@ -1381,8 +1386,8 @@ test "animation: a=f with C=0 alpha-blends transparent over base" {
         .payload = bA,
     });
 
-    // Add frame with full transparency (alpha=0). C=0 (alpha-blend)
-    // should keep base pixel; C=1 (overwrite) would replace.
+    // Add frame with full transparency (alpha=0). X=0 (alpha-blend)
+    // should keep base pixel; X=1 (overwrite) would replace.
     const transparent = [_]u8{ 0x00, 0xFF, 0x00, 0x00 };
     var b64b: [8]u8 = undefined;
     const bB = enc.encode(&b64b, &transparent);
@@ -1394,7 +1399,8 @@ test "animation: a=f with C=0 alpha-blends transparent over base" {
         .height = 1,
         .more = 0,
         .payload = bB,
-        .no_cursor_move = 0, // C=0 → alpha blend
+        .cell_x_offset = 0, // X=0 → alpha blend
+        .no_cursor_move = 1, // C= plays no part in frame transmission
     });
 
     const stored = mgr.store.getPtr(11).?;
@@ -1403,6 +1409,44 @@ test "animation: a=f with C=0 alpha-blends transparent over base" {
     // transparent and we composed alpha=0 over the base.
     try std.testing.expectEqual(@as(u8, 0xFF), stored.frames.items[1].rgba[0]);
     try std.testing.expectEqual(@as(u8, 0x00), stored.frames.items[1].rgba[1]);
+}
+
+test "animation: a=f with X=1 overwrites the base frame" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    // Base frame: solid red 1x1 RGBA.
+    const base = [_]u8{ 0xFF, 0x00, 0x00, 0xFF };
+    var b64a: [8]u8 = undefined;
+    const enc = std.base64.standard.Encoder;
+    const bA = enc.encode(&b64a, &base);
+    _ = mgr.ingest(.{
+        .action = .transmit,
+        .image_id = 12,
+        .format = 32,
+        .width = 1,
+        .height = 1,
+        .payload = bA,
+    });
+
+    // Fully transparent green frame. X=1 means overwrite, so the
+    // stored frame must be the transparent green, NOT the red base.
+    const transparent = [_]u8{ 0x00, 0xFF, 0x00, 0x00 };
+    var b64b: [8]u8 = undefined;
+    const bB = enc.encode(&b64b, &transparent);
+    _ = mgr.ingest(.{
+        .action = .transmit_frame,
+        .image_id = 12,
+        .format = 32,
+        .width = 1,
+        .height = 1,
+        .payload = bB,
+        .cell_x_offset = 1, // X=1 → overwrite
+    });
+
+    const stored = mgr.store.getPtr(12).?;
+    try std.testing.expectEqual(@as(usize, 2), stored.frames.items.len);
+    try std.testing.expectEqualSlices(u8, &transparent, stored.frames.items[1].rgba);
 }
 
 test "animation: a=a stop pauses playback" {
