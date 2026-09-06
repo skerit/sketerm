@@ -1068,18 +1068,25 @@ pub const Screen = struct {
     /// other half behind: an orphaned wide-left keeps drawing the old
     /// glyph, an orphaned continuation renders as a permanently blank
     /// cell (ghost cells after CJK is overwritten by narrow text).
+    /// `ln` is always the cursor row's line (every call site takes it
+    /// from `self.line(self.row)`), which is what lets the cluster keys
+    /// of the blanked halves be dropped here: callers only ever clear the
+    /// cluster range from the cursor rightwards, so the left half of a
+    /// pair straddling that boundary kept a cluster on a now-blank cell.
     pub fn splitWidePair(self: *Screen, ln: *Line, col: u16) void {
         if (col >= self.cols) return;
         const f = ln.cells[col].flags;
-        if (f & cell_mod.FLAG_WIDE_LEFT != 0) { // wide-left
-            ln.cells[col] = .{};
-            if (col + 1 < self.cols and (ln.cells[col + 1].flags & cell_mod.FLAG_WIDE_CONT) != 0)
-                ln.cells[col + 1] = .{};
-        } else if (f & cell_mod.FLAG_WIDE_CONT != 0) { // wide continuation
-            ln.cells[col] = .{};
-            if (col > 0 and (ln.cells[col - 1].flags & cell_mod.FLAG_WIDE_LEFT) != 0)
-                ln.cells[col - 1] = .{};
-        }
+        const other: ?u16 = if (f & cell_mod.FLAG_WIDE_LEFT != 0)
+            (if (col + 1 < self.cols and (ln.cells[col + 1].flags & cell_mod.FLAG_WIDE_CONT) != 0) col + 1 else null)
+        else if (f & cell_mod.FLAG_WIDE_CONT != 0)
+            (if (col > 0 and (ln.cells[col - 1].flags & cell_mod.FLAG_WIDE_LEFT) != 0) col - 1 else null)
+        else
+            return;
+        ln.cells[col] = .{};
+        if (other) |o| ln.cells[o] = .{};
+        if (self.clusters.count() == 0) return;
+        self.clearClusterAt(self.row, col);
+        if (other) |o| self.clearClusterAt(self.row, o);
     }
 
     /// Word-class membership for double-click word selection.
@@ -9000,4 +9007,17 @@ test "autowrap off overwrites the last column for the rest of a print run" {
     try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
     try std.testing.expectEqual(@as(u32, 'f'), s.cellAt(0, 3).rune);
     try std.testing.expectEqual(@as(u16, 3), s.col);
+}
+
+test "splitting a wide pair drops the cluster on the half it blanks" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 2);
+    defer s.deinit();
+    s.printCp(0x754C); // wide pair at columns 0-1
+    s.printCp(0x0301); // cluster keyed at (0, 0)
+    try std.testing.expectEqual(@as(usize, 1), s.clusters.count());
+    s.col = 1;
+    s.printCp('x'); // blanks both halves of the pair
+    try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
 }
