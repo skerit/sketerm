@@ -1,5 +1,38 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-06: `sketerm mux` on a non-sketerm terminal
+
+`sketerm mux`, `sketerm mux attach <name>` and `sketerm mux new` now
+work tmux-style from any terminal: outside a sketerm pane (no
+SKETERM_PANE_ID, real tty) the session is shown in THAT terminal
+instead of being handed to a GUI window that may not exist.
+`--alternate` forces this even inside sketerm; `--new-tab` still asks
+for a GUI tab; piped/scripted invocations keep the old GUI contract.
+
+Two GTK-free modules carry it, both in BOTH test roots.
+`mux/ttyrender.zig` diffs the mirror `Screen` onto the host through a
+shadow grid (styles compared by value, so snapshot pool swaps are
+safe), erases default-blank runs with ECH so the host's cells match
+the mirror's exactly, and mirrors the session's DEC modes (app cursor
+keys, mouse + encoding, bracketed paste, focus, cursor shape, kitty
+keyboard flags, modifyOtherKeys, reverse video) plus title stack and
+bell. Frames are bracketed in DECSET 2026. `ipc/mux_tty.zig` is the
+loop: raw tty, prefix chord `Ctrl-\` (double tap or `d` detaches,
+`[` scrolls back with PgUp/PgDn/j/k/g/G, `\` sends it literally),
+SIGWINCH resize forwarded to the daemon, event-desync resync by
+detach+attach, and an `in_fd`/`out_fd` shape so `smoke_tty.zig`
+runs the real loop over a socketpair inside smoke-mux and checks the
+host grid against the daemon's own snapshot. Detaching never ends a
+session; only the shell exiting does, and the picker returns after
+either. Images, forwarded apps and audio are GUI-only by design.
+
+Found and fixed on the way: `pty.zig` only SET the pane identity
+variables and never unset inherited ones, so every daemon-spawned
+shell carried whatever pane the daemon itself had been started from
+(an MCP private daemon autostarted from a pane, say). Running
+`sketerm mux attach` in such a shell took over the user's live pane.
+Not-exported now means absent, with a spawn test.
+
 ## 2026-09-05: browser diagnostics and review evidence
 
 Browser MCP review is now a live semantic query (`review` capability),
