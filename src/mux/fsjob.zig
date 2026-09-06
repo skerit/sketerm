@@ -5485,9 +5485,9 @@ fn sizeTree(allocator: std.mem.Allocator, dir_path: []const u8, total: *u64, fil
     return true;
 }
 
-/// A destination name that is free in `dir`, "name-copy" first —
+/// A destination name that is free in `dir`, "name (copy).ext" first —
 /// the same scheme the browser's own Keep Both uses.
-fn uniqueInDir(dir: []const u8, base: []const u8, buf: []u8) ?[]const u8 {
+fn uniqueInDir(dir: []const u8, base: []const u8, is_dir: bool, buf: []u8) ?[]const u8 {
     const OnDisk = struct {
         dir: []const u8,
         pub fn contains(self: @This(), name: []const u8) bool {
@@ -5498,7 +5498,7 @@ fn uniqueInDir(dir: []const u8, base: []const u8, buf: []u8) ?[]const u8 {
             return c.lstat(pathz.pathZ(&z, p) catch return true, &st) == 0;
         }
     };
-    return uniqueName(base, buf, OnDisk{ .dir = dir });
+    return uniqueName(base, is_dir, buf, OnDisk{ .dir = dir });
 }
 
 fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8, opts: CopyOpts, progress: *Progress, root: bool) CopyResult {
@@ -5547,7 +5547,7 @@ fn copyTreeDir(allocator: std.mem.Allocator, src_dir: []const u8, dst_dir: []con
                     if (!progress.entryDone()) return .{ .err = "file-count overflow" };
                     continue;
                 }
-                const name = uniqueInDir(dst_dir, e.name, &unique_buf) orelse
+                const name = uniqueInDir(dst_dir, e.name, std.mem.eql(u8, e.kind, "dir"), &unique_buf) orelse
                     return .{ .err = "no free destination name" };
                 var rw = std.Io.Writer.fixed(&dbuf);
                 rw.print("{s}/{s}", .{ dst_dir, name }) catch return .{ .err = "path too long" };
@@ -6423,15 +6423,17 @@ test "uniqueInDir walks past every name already on disk" {
     const dir = td.path();
     var buf: [512]u8 = undefined;
     // Nothing taken yet.
-    try t.expectEqualStrings("a.txt-copy", uniqueInDir(dir, "a.txt", &buf).?);
-    for ([_][]const u8{ "a.txt-copy", "a.txt-copy2" }) |name| {
+    try t.expectEqualStrings("a (copy).txt", uniqueInDir(dir, "a.txt", false, &buf).?);
+    for ([_][]const u8{ "a (copy).txt", "a (copy 2).txt" }) |name| {
         var z: [4096]u8 = undefined;
         var pb: [4096]u8 = undefined;
         const p = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ dir, name });
         const f = c.fopen(try pathz.pathZ(&z, p), "wb") orelse return error.SkipZigTest;
         _ = c.fclose(f);
     }
-    try t.expectEqualStrings("a.txt-copy3", uniqueInDir(dir, "a.txt", &buf).?);
+    try t.expectEqualStrings("a (copy 3).txt", uniqueInDir(dir, "a.txt", false, &buf).?);
+    // A directory keeps every dot of its name.
+    try t.expectEqualStrings("v1.0 (copy)", uniqueInDir(dir, "v1.0", true, &buf).?);
 }
 
 test "copyOneFile resumes only on matching prefix hash" {

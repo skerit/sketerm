@@ -345,17 +345,35 @@ pub fn millerNextSegment(ancestor: []const u8, root: []const u8) ?[]const u8 {
     return rest[0..end];
 }
 
-/// Pick a name that collides with nothing in `taken`: "base-copy",
-/// then "base-copy2"... `taken` is anything with a
-/// `contains([]const u8) bool` method (the live target listing, in
-/// the browser's case).
+pub const NameParts = struct { stem: []const u8, ext: []const u8 };
+
+/// Split a name so a copy marker can go BEFORE its extension: "a.txt"
+/// is ("a", ".txt"), "a.tar.gz" keeps both parts as the extension, a
+/// leading or trailing dot is no extension at all, and a directory is
+/// never split (its dots are part of the name, "v1.0").
+pub fn copyNameParts(base: []const u8, is_dir: bool) NameParts {
+    if (is_dir) return .{ .stem = base, .ext = "" };
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return .{ .stem = base, .ext = "" };
+    if (dot == 0 or dot == base.len - 1) return .{ .stem = base, .ext = "" };
+    var split = dot;
+    const before = base[0..dot];
+    if (std.ascii.endsWithIgnoreCase(before, ".tar") and before.len > 4) split = dot - 4;
+    return .{ .stem = base[0..split], .ext = base[split..] };
+}
+
+/// Pick a name that collides with nothing in `taken`: "base (copy)",
+/// then "base (copy 2)"..., the marker placed before the extension so
+/// the copy keeps its type ("a (copy).txt", never "a.txt-copy").
+/// `taken` is anything with a `contains([]const u8) bool` method (the
+/// live target listing, in the browser's case).
 /// @return null when `buf` is too small or 999 names are all taken.
-pub fn uniqueName(base: []const u8, buf: []u8, taken: anytype) ?[]const u8 {
-    var candidate = std.fmt.bufPrint(buf, "{s}-copy", .{base}) catch return null;
+pub fn uniqueName(base: []const u8, is_dir: bool, buf: []u8, taken: anytype) ?[]const u8 {
+    const parts = copyNameParts(base, is_dir);
+    var candidate = std.fmt.bufPrint(buf, "{s} (copy){s}", .{ parts.stem, parts.ext }) catch return null;
     var n: u32 = 2;
     while (taken.contains(candidate)) : (n += 1) {
         if (n > 999) return null;
-        candidate = std.fmt.bufPrint(buf, "{s}-copy{d}", .{ base, n }) catch return null;
+        candidate = std.fmt.bufPrint(buf, "{s} (copy {d}){s}", .{ parts.stem, n, parts.ext }) catch return null;
     }
     return candidate;
 }
@@ -616,12 +634,40 @@ test "uniqueName suffixes until the target listing has room" {
         }
     };
     var buf: [64]u8 = undefined;
-    try t.expectEqualStrings("a-copy", uniqueName("a", &buf, Taken{ .names = &.{} }).?);
-    try t.expectEqualStrings("a-copy2", uniqueName("a", &buf, Taken{ .names = &.{"a-copy"} }).?);
-    try t.expectEqualStrings("a-copy4", uniqueName("a", &buf, Taken{
-        .names = &.{ "a-copy", "a-copy2", "a-copy3" },
+    try t.expectEqualStrings("a (copy)", uniqueName("a", false, &buf, Taken{ .names = &.{} }).?);
+    try t.expectEqualStrings("a (copy 2)", uniqueName("a", false, &buf, Taken{ .names = &.{"a (copy)"} }).?);
+    try t.expectEqualStrings("a (copy 4)", uniqueName("a", false, &buf, Taken{
+        .names = &.{ "a (copy)", "a (copy 2)", "a (copy 3)" },
     }).?);
     // Too small a buffer is a refusal, never a truncated name.
     var small: [4]u8 = undefined;
-    try t.expect(uniqueName("abc", &small, Taken{ .names = &.{} }) == null);
+    try t.expect(uniqueName("abc", false, &small, Taken{ .names = &.{} }) == null);
+}
+
+test "a kept-both copy keeps its extension" {
+    const t = std.testing;
+    const Taken = struct {
+        names: []const []const u8,
+        fn contains(self: @This(), name: []const u8) bool {
+            for (self.names) |n| if (std.mem.eql(u8, n, name)) return true;
+            return false;
+        }
+    };
+    var buf: [64]u8 = undefined;
+    const none = Taken{ .names = &.{} };
+    // The marker goes before the extension: "file1.txt-copy" turned a
+    // text file into a "-copy" file.
+    try t.expectEqualStrings("file1 (copy).txt", uniqueName("file1.txt", false, &buf, none).?);
+    try t.expectEqualStrings("file1 (copy 2).txt", uniqueName("file1.txt", false, &buf, Taken{
+        .names = &.{"file1 (copy).txt"},
+    }).?);
+    // Compound archive extensions stay whole.
+    try t.expectEqualStrings("site (copy).tar.gz", uniqueName("site.tar.gz", false, &buf, none).?);
+    // A leading dot is a hidden name, a trailing dot is no extension.
+    try t.expectEqualStrings(".bashrc (copy)", uniqueName(".bashrc", false, &buf, none).?);
+    try t.expectEqualStrings("odd. (copy)", uniqueName("odd.", false, &buf, none).?);
+    // Directories are never split on their dots.
+    try t.expectEqualStrings("v1.0 (copy)", uniqueName("v1.0", true, &buf, none).?);
+    try t.expectEqualStrings("", copyNameParts("v1.0", true).ext);
+    try t.expectEqualStrings(".tar.gz", copyNameParts("site.tar.gz", false).ext);
 }

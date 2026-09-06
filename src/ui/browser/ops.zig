@@ -276,12 +276,15 @@ pub fn cancelDropStateForTab(self: *BrowserView, tab: *BTab) void {
 }
 
 /// Pick a destination name that does not collide with the live
-/// target listing: "name-copy", then "name-copy2"…
+/// target listing: "name (copy).ext", then "name (copy 2).ext"… The
+/// entry's own row (when the listing has it) says whether it is a
+/// directory, whose dots are never mistaken for an extension.
 pub fn uniqueDstName(tab: *BTab, base: []const u8, buf: []u8) ?[]const u8 {
-    return uniqueDstNameIn(tab, tab.root.path, base, buf);
+    const is_dir = if (tab.root.find(base)) |i| tab.root.entries.items[i].tdir else false;
+    return uniqueDstNameIn(tab, tab.root.path, base, is_dir, buf);
 }
 
-pub fn uniqueDstNameIn(tab: *BTab, dir_path: []const u8, base: []const u8, buf: []u8) ?[]const u8 {
+pub fn uniqueDstNameIn(tab: *BTab, dir_path: []const u8, base: []const u8, is_dir: bool, buf: []u8) ?[]const u8 {
     const dir = if (std.mem.eql(u8, dir_path, tab.root.path)) tab.root else tab.subdirByPath(dir_path) orelse return null;
     const Listing = struct {
         dir: *Dir,
@@ -289,7 +292,7 @@ pub fn uniqueDstNameIn(tab: *BTab, dir_path: []const u8, base: []const u8, buf: 
             return self.dir.find(name) != null;
         }
     };
-    return uniqueName(base, buf, Listing{ .dir = dir });
+    return uniqueName(base, is_dir, buf, Listing{ .dir = dir });
 }
 
 /// Per-item paste modifiers. `dir_mode` reaches the daemon copy verb
@@ -849,7 +852,7 @@ fn pasteOneAdmittedOn(
     return admitted;
 }
 
-/// Copy an entry beside itself under a free name ("x" -> "x-copy").
+/// Copy an entry beside itself under a free name ("x.txt" -> "x (copy).txt").
 /// Undoable like any other copy: the created path is what undo drops.
 pub fn duplicateEntry(self: *BrowserView, tab: *BTab, path: []const u8) void {
     const base = std.fs.path.basename(path);

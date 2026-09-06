@@ -1865,7 +1865,7 @@ fn policyStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag
     const dst_shared = std.fmt.bufPrint(&scratch[0], "{s}/shared.txt", .{dst}) catch unreachable;
     const dst_only = std.fmt.bufPrint(&scratch[1], "{s}/only-here.txt", .{dst}) catch unreachable;
     const dst_leaf = std.fmt.bufPrint(&scratch[2], "{s}/sub/leaf.txt", .{dst}) catch unreachable;
-    const dst_kept = std.fmt.bufPrint(&scratch[3], "{s}/shared.txt-copy", .{dst}) catch unreachable;
+    const dst_kept = std.fmt.bufPrint(&scratch[3], "{s}/shared (copy).txt", .{dst}) catch unreachable;
 
     // A destination observed absent must still be absent at the actual
     // install. Files, links, and directory roots all fail closed.

@@ -610,7 +610,12 @@ fn applyOne(self: *BrowserView, item: *Item, choice_in: Choice) void {
         .keep_both => {
             var name_buf: [512]u8 = undefined;
             const dir = std.fs.path.dirname(item.dst) orelse return;
-            const unique = uniqueDstNameIn(item.tab, dir, item.name(), &name_buf) orelse {
+            // The pasted item's own kind decides whether its name has an
+            // extension; the stat may still be in flight, and then the
+            // colliding row (same name, almost always the same kind) is
+            // the best answer available.
+            const src_dir = if (item.src_known) item.src_is_dir else item.is_dir;
+            const unique = uniqueDstNameIn(item.tab, dir, item.name(), src_dir, &name_buf) orelse {
                 self.setStatusFmt("no free name for {s}", .{item.name()});
                 return;
             };
