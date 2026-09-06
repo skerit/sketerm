@@ -85,6 +85,25 @@ const PALETTE_SIZE = 256;
 /// u32 painting math safe: 10000*10000*4 ≈ 4e8 < 2^32.
 const MAX_DIM: u32 = 10000;
 
+/// Hard cap on the decoded canvas in PIXELS. `MAX_DIM` alone is a
+/// per-axis bound, and the raster attribute states a size the body need
+/// not back with any pixel data: `"5;1;10000;10000#0~` is 19 bytes that
+/// ask for a 400 MB buffer, memset it, and then (with a non-1:1 aspect)
+/// allocate a second one the same size — all inside the daemon's single
+/// poll loop, on behalf of anything holding a PTY. 4096x4096 is past any
+/// real terminal graphic; beyond it the canvas is truncated, not
+/// rejected, so a merely-large sixel still draws.
+const MAX_PIXELS: u32 = 4096 * 4096;
+
+/// Clamp a canvas to `MAX_DIM` per axis and `MAX_PIXELS` in total,
+/// keeping the width and truncating the height.
+fn clampCanvas(w_in: u32, h_in: u32) [2]u32 {
+    const w: u32 = @min(w_in, MAX_DIM);
+    var h: u32 = @min(h_in, MAX_DIM);
+    if (w > 0 and @as(u64, w) * @as(u64, h) > MAX_PIXELS) h = MAX_PIXELS / w;
+    return .{ w, h };
+}
+
 pub fn decode(allocator: std.mem.Allocator, body: []const u8, opts: Options) Error!Decoded {
     // Pass 1: scan dimensions, clamped to MAX_DIM before any sizing/painting.
     const dims = scanDimensions(body);
@@ -201,8 +220,9 @@ fn applyAspect(
     const sx = ratioScale(den, num);
     if (sx == 1 and sy == 1) return .{ .rgba = rgba, .width = width, .height = height };
 
-    const out_w = @min(width *| sx, MAX_DIM);
-    const out_h = @min(height *| sy, MAX_DIM);
+    const scaled = clampCanvas(width *| sx, height *| sy);
+    const out_w = scaled[0];
+    const out_h = scaled[1];
     const out = allocator.alloc(u8, @as(usize, out_w) * @as(usize, out_h) * 4) catch {
         allocator.free(rgba);
         return Error.OutOfMemory;
@@ -413,11 +433,13 @@ fn scanDimensions(body: []const u8) Dims {
 
     const w = if (raster_w > 0) raster_w else max_x;
     const h = if (raster_h > 0) raster_h else band *| 6;
-    // Clamp to MAX_DIM so the allocation and paintSixel offset math
-    // (computed in u32) cannot overflow on attacker-controlled input.
+    // Clamp so the allocation and paintSixel offset math (computed in
+    // u32) cannot overflow on attacker-controlled input, and so a raster
+    // attribute cannot name a canvas no body could ever fill.
+    const canvas = clampCanvas(w, h);
     return .{
-        .width = @min(w, MAX_DIM),
-        .height = @min(h, MAX_DIM),
+        .width = canvas[0],
+        .height = canvas[1],
         .aspect_num = raster_num,
         .aspect_den = raster_den,
     };
@@ -586,6 +608,24 @@ test "no background select leaves untouched pixels transparent" {
     defer std.testing.allocator.free(out.rgba);
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255 }, out.rgba[0..4]);
     try std.testing.expectEqual(@as(u8, 0), out.rgba[7]); // alpha
+}
+
+test "a raster attribute alone cannot demand an unbounded canvas" {
+    // 19 bytes of DCS body asking for 10000x10000 RGBA = 400 MB, painted
+    // and (with a non-1:1 ratio) copied into a second buffer the same
+    // size — inside the daemon's single-threaded poll loop.
+    const d = scanDimensions("\"5;1;10000;10000#0~");
+    try std.testing.expect(@as(u64, d.width) * @as(u64, d.height) <= MAX_PIXELS);
+    // Ordinary sixels are untouched by the cap.
+    const small = scanDimensions("\"1;1;640;480#0~");
+    try std.testing.expectEqual(@as(u32, 640), small.width);
+    try std.testing.expectEqual(@as(u32, 480), small.height);
+}
+
+test "aspect scaling stays inside the pixel budget" {
+    const out = clampCanvas(MAX_DIM, MAX_DIM);
+    try std.testing.expect(@as(u64, out[0]) * @as(u64, out[1]) <= MAX_PIXELS);
+    try std.testing.expectEqual(MAX_DIM, out[0]);
 }
 
 test "background fill survives aspect scaling" {
