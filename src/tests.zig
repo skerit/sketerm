@@ -100,6 +100,7 @@ comptime {
     _ = @import("parser/event.zig");
     _ = @import("parser/vt.zig");
     _ = @import("parser/conformance_test.zig");
+    _ = @import("parser/fuzz_test.zig");
     _ = @import("parser/screen_conformance_test.zig");
     _ = @import("parser/wezterm_conformance_test.zig");
     _ = @import("grid/cell.zig");

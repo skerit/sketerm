@@ -192,6 +192,7 @@ comptime {
     _ = @import("parser/clipboard_conformance_test.zig");
     _ = @import("parser/conformance_test.zig");
     _ = @import("parser/event.zig");
+    _ = @import("parser/fuzz_test.zig");
     _ = @import("parser/graphics_conformance_test.zig");
     _ = @import("parser/iterm_image.zig");
     _ = @import("parser/kitty_image.zig");
