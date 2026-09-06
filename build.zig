@@ -1124,6 +1124,17 @@ const CEF_VERSION = "151.3.16+gbe1e15d+chromium-151.0.7922.109";
 const CEF_SHA256_LINUX64 = "eaeb313e6039de464855893d287c4d5eb4ec7126978ea83c6164bf4a23dc017a";
 const CEF_SHA256_MACOSARM64 = "80e6d586fc683a13002d49b913f7b71d01866b7619bec759e5b302b9d53e6995";
 
+/// The distro-packaged CEF, probed when no cached distribution and no
+/// explicit `-Dcef-include`/`-Dcef-lib` is available.
+///
+/// These are the SAME two paths (and the same "usable" test: a
+/// `<include>/include/capi/cef_app_capi.h` plus a `<lib>/libcef.so`)
+/// that `dist/install.sh`'s `probe_web` defaults to and that
+/// `dist/PKGBUILD` passes as literals, so build.zig, the installer and
+/// the package all agree on what "the system CEF" means.
+const SYSTEM_CEF_INCLUDE = "/usr/include/cef";
+const SYSTEM_CEF_LIB = "/usr/lib/cef";
+
 /// The CDN platform slug and the checksum for a build target.
 ///
 /// macOS is arm64-only here deliberately: `macosx64` exists on the CDN
@@ -1156,7 +1167,7 @@ const UBO_SHA256 = "bccc51a773150af4af6e1fd62c7bfdeb7238b79ff2381b998fa9f2e38f64
 ///
 /// Two hard rules shape this function. (1) A plain `zig build` must
 /// never touch the network nor translate a CEF header, so the only
-/// unconditional work here is a directory `access()` — the download
+/// unconditional work here is one or two `access()` calls — the download
 /// lives behind `fetch-cef`, and the TranslateC step + executable are
 /// only CONFIGURED when the distribution is already unpacked. (2) When
 /// it is absent, `zig build web` must still exist and say what to run,
@@ -1184,27 +1195,28 @@ fn addCef(
         b.fmt("{s}/.cache/sketerm/cef/{s}", .{ home, CEF_VERSION })
     else
         b.fmt("{s}/.zig-cache/cef/{s}", .{ b.build_root.path orelse ".", CEF_VERSION });
-    const cef_root = b.option(
+    const root_opt = b.option(
         []const u8,
         "cef-root",
         "unpacked CEF binary distribution to build sketerm-webengine against (default: $XDG_CACHE_HOME/sketerm/cef/<pinned version>)",
-    ) orelse default_root;
+    );
+    const cef_root = root_opt orelse default_root;
     // A downloaded distribution keeps headers and libraries in one
     // tree (<root>/include, <root>/Release); a DISTRO-PACKAGED CEF
     // splits them (/usr/include/cef, /usr/lib/cef). Both are supported
     // by overriding the two halves independently — which is how the
     // Arch package builds against `cef` instead of shipping 300MB of
     // its own Chromium.
-    const include_root = b.option(
+    const include_opt = b.option(
         []const u8,
         "cef-include",
-        "directory whose include/capi/*.h are the CEF headers (default: <cef-root>)",
-    ) orelse cef_root;
-    const release_dir = b.option(
+        "directory whose include/capi/*.h are the CEF headers (default: <cef-root>, then the system install)",
+    );
+    const lib_opt = b.option(
         []const u8,
         "cef-lib",
-        "directory holding libcef.so and its .pak/icudtl.dat siblings (default: <cef-root>/Release)",
-    ) orelse b.fmt("{s}/Release", .{cef_root});
+        "directory holding libcef.so and its .pak/icudtl.dat siblings (default: <cef-root>/Release, then the system install)",
+    );
 
     // `+` is not URL-safe in a path segment; the CDN serves the encoded
     // form. Everything else in a CEF version string already is.
@@ -1354,22 +1366,70 @@ fn addCef(
     else
         "libcef.so";
 
+    // Where the cached distribution WOULD be, before any fallback: the
+    // two halves are overridable independently because a downloaded
+    // distribution keeps them in one tree while a distro package splits
+    // them.
+    const cache_include = include_opt orelse cef_root;
+    const cache_lib = lib_opt orelse b.fmt("{s}/Release", .{cef_root});
+    // An explicit path is the answer, right or wrong: a caller that
+    // named a CEF gets a hard error about THAT CEF rather than a silent
+    // redirection to some other one. Packaging depends on this —
+    // `dist/PKGBUILD` pins the distro locations as literals precisely so
+    // the build cannot be pointed elsewhere.
+    const cef_explicit = root_opt != null or include_opt != null or lib_opt != null;
+
     // Probe the two halves separately: a split system install has no
     // Release dir at all, and a header-only hit would fail at link.
+    const Probe = struct {
+        fn usable(bb: *std.Build, inc: []const u8, lib: []const u8, bin_rel: []const u8) bool {
+            std.Io.Dir.accessAbsolute(bb.graph.io, bb.fmt("{s}/{s}", .{ lib, bin_rel }), .{}) catch return false;
+            std.Io.Dir.accessAbsolute(bb.graph.io, bb.fmt("{s}/include/capi/cef_app_capi.h", .{inc}), .{}) catch return false;
+            return true;
+        }
+    };
+
+    // Selection order: explicit options / cached distribution first, then
+    // the SYSTEM install the installer already probes. Without the
+    // fallback an isolated or empty XDG_CACHE_HOME made every CEF-gated
+    // step fail on a host that has a perfectly good `/usr/lib/cef` — the
+    // one the Arch package links against.
+    var include_root = cache_include;
+    var release_dir = cache_lib;
+    var used_system = false;
     const have_cef = blk: {
         if (cef_plat == null) break :blk false;
-        std.Io.Dir.accessAbsolute(b.graph.io, b.fmt("{s}/{s}", .{ release_dir, cef_binary_rel }), .{}) catch break :blk false;
-        std.Io.Dir.accessAbsolute(b.graph.io, b.fmt("{s}/include/capi/cef_app_capi.h", .{include_root}), .{}) catch break :blk false;
+        if (Probe.usable(b, cache_include, cache_lib, cef_binary_rel)) break :blk true;
+        if (cef_explicit or is_mac_cef) break :blk false;
+        if (!Probe.usable(b, SYSTEM_CEF_INCLUDE, SYSTEM_CEF_LIB, cef_binary_rel)) break :blk false;
+        include_root = SYSTEM_CEF_INCLUDE;
+        release_dir = SYSTEM_CEF_LIB;
+        used_system = true;
         break :blk true;
     };
+    // Only the fallback is announced: the cached distribution is the
+    // documented default and a line on every plain `zig build` would be
+    // noise, while linking against a CEF the caller never named is worth
+    // exactly one line.
+    if (used_system) {
+        std.debug.print("cef: using system install {s} (headers) + {s} (libcef.so); no cached distribution at {s}\n", .{
+            include_root, release_dir, cache_lib,
+        });
+    }
     if (!have_cef) {
         const missing = if (cef_plat == null) b.addFail(b.fmt(
             "no pinned CEF distribution for {s}-{s} — the browser helper is Linux x86_64 and macOS arm64 only",
             .{ @tagName(target.result.cpu.arch), @tagName(target.result.os.tag) },
         )) else b.addFail(b.fmt(
-            "no usable CEF at {s} ({s}) + {s} (headers) — run `zig build fetch-cef`, " ++
-                "or point -Dcef-include=/-Dcef-lib= at a system install (e.g. /usr/include/cef and /usr/lib/cef)",
-            .{ release_dir, cef_binary_rel, include_root },
+            "no usable CEF at {s} ({s}) + {s} (headers){s} — run `zig build fetch-cef`, " ++
+                "or point -Dcef-include=/-Dcef-lib= at a system install (e.g. " ++
+                SYSTEM_CEF_INCLUDE ++ " and " ++ SYSTEM_CEF_LIB ++ ")",
+            .{
+                release_dir,
+                cef_binary_rel,
+                include_root,
+                if (cef_explicit or is_mac_cef) "" else " and none at " ++ SYSTEM_CEF_INCLUDE ++ " + " ++ SYSTEM_CEF_LIB,
+            },
         ));
         web_step.dependOn(&missing.step);
         test_web_step.dependOn(&missing.step);
