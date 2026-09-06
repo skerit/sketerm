@@ -8604,6 +8604,38 @@ const ViewConstructionTest = struct {
         return @ptrCast(@alignCast(ctx.?));
     }
 
+    /// fd 2 pointed at `/dev/null` while a test drives an engine path
+    /// that deliberately prints a diagnostic.
+    ///
+    /// The Zig build runner re-prints ANY stderr a test binary produced
+    /// under a red `failed command:` header, even for a step that
+    /// SUCCEEDED, so an expected diagnostic reads as a failing test to
+    /// everyone running `zig build test-web`. Silence is scoped to the
+    /// one call that provokes it; a real assertion failure still prints,
+    /// because the runner reports those over its own pipe.
+    const StderrHush = struct {
+        saved: c_int = -1,
+
+        fn begin() StderrHush {
+            const saved = c.dup(2);
+            if (saved < 0) return .{};
+            const devnull = c.open("/dev/null", c.O_WRONLY);
+            if (devnull < 0) {
+                _ = c.close(saved);
+                return .{};
+            }
+            _ = c.dup2(devnull, 2);
+            _ = c.close(devnull);
+            return .{ .saved = saved };
+        }
+
+        fn end(self: StderrHush) void {
+            if (self.saved < 0) return;
+            _ = c.dup2(self.saved, 2);
+            _ = c.close(self.saved);
+        }
+    };
+
     fn browserId(_: [*c]cef.cef_browser_t) callconv(.c) c_int {
         return 0;
     }
@@ -8750,7 +8782,13 @@ test "a refused browser create is a DESCRIBED failure, never an error or a kept 
     const prior = try host.registerView(ViewConstructionTest.req(51, 0));
     var injected = ViewConstructionTest{ .failure = .browser, .seed_semantic = true };
     var spawn_ops = injected.ops();
-    try host.createViewAtWith(ViewConstructionTest.req(52, 0), "", &spawn_ops);
+    // Exhausting the retry budget is the point of this test, and the
+    // engine prints a diagnostic when it happens — see StderrHush.
+    {
+        const hush = ViewConstructionTest.StderrHush.begin();
+        defer hush.end();
+        try host.createViewAtWith(ViewConstructionTest.req(52, 0), "", &spawn_ops);
+    }
 
     try std.testing.expectEqual(@as(usize, 1), host.viewCount());
     try std.testing.expect(host.find(51) == prior);
