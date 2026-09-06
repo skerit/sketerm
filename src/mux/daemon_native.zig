@@ -1072,6 +1072,85 @@ pub fn nativeClientData(self: *Daemon, cl: *Client, ch: *Channel, bytes: []const
     if (!ch.dead) self.channelWritable(ch);
 }
 
+/// Total bytes the daemon will hold for apps that are not draining
+/// their paste pipes. Past it a transfer is dropped (the app sees a
+/// short paste) rather than growing the daemon without bound.
+const CLIP_WRITE_BACKLOG: usize = 64 << 20;
+
+/// One nonblocking write pass toward an APP-SUPPLIED fd.
+///
+/// The fd arrived over SCM_RIGHTS, so its blocking mode is the app's
+/// choice, and a pipe holds 64 KiB: a plain write loop of a
+/// clipboard-sized payload parks the daemon's single-threaded poll
+/// loop until the app reads, which is a whole-host outage caused by
+/// one client. Switching it to O_NONBLOCK is safe — nobody else owns
+/// this description; the app only ever reads the other end.
+/// @return bytes the kernel accepted, or null when the fd is dead.
+pub fn pasteWriteOnce(fd: c_int, bytes: []const u8) ?usize {
+    const fl = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+    if (fl >= 0 and fl & c.O_NONBLOCK == 0) _ = c.fcntl(fd, c.F_SETFL, fl | c.O_NONBLOCK);
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const w = c.write(fd, bytes.ptr + written, bytes.len - written);
+        if (w > 0) {
+            written += @intCast(w);
+            continue;
+        }
+        if (w < 0) {
+            const e = std.posix.errno(w);
+            if (e == .INTR) continue;
+            if (e == .AGAIN) return written;
+        }
+        return if (written > 0) written else null;
+    }
+    return written;
+}
+
+/// Hand a paste payload to an app-supplied fd, parking whatever the
+/// app has not read yet on `nv.clip_writes`. Takes ownership of `fd`.
+pub fn pasteWrite(nv: *Native, fd: c_int, bytes: []const u8) void {
+    const written = pasteWriteOnce(fd, bytes) orelse {
+        _ = c.close(fd);
+        return;
+    };
+    if (written >= bytes.len) {
+        _ = c.close(fd);
+        return;
+    }
+    var queued: usize = 0;
+    for (nv.clip_writes.items) |*cw| queued += cw.buf.items.len - cw.off;
+    const rest = bytes[written..];
+    if (queued + rest.len > CLIP_WRITE_BACKLOG) {
+        log.warn("paste backlog full; dropping {d} unread bytes for an app that is not reading", .{rest.len});
+        _ = c.close(fd);
+        return;
+    }
+    var entry = Native.ClipWrite{ .fd = fd };
+    entry.buf.appendSlice(nv.allocator, rest) catch {
+        entry.buf.deinit(nv.allocator);
+        _ = c.close(fd);
+        return;
+    };
+    nv.clip_writes.append(nv.allocator, entry) catch {
+        entry.buf.deinit(nv.allocator);
+        _ = c.close(fd);
+    };
+}
+
+/// One paste pipe became writable: push what fits. Returns true when
+/// the entry was finished (or failed) and removed.
+pub fn clipWritable(nv: *Native, idx: usize) bool {
+    const cw = &nv.clip_writes.items[idx];
+    const rest = cw.buf.items[cw.off..];
+    const written = pasteWriteOnce(cw.fd, rest) orelse rest.len; // dead fd: drop it
+    cw.off += @min(written, rest.len);
+    if (cw.off < cw.buf.items.len) return false;
+    _ = c.close(cw.fd);
+    cw.buf.deinit(nv.allocator);
+    _ = nv.clip_writes.orderedRemove(idx);
+    return true;
+}
+
 /// Take the held paste-fd for `offer` (falls back to the oldest
 /// entry — pre-tagging senders). Caller owns the fd.
 pub fn takePasteFd(nv: *Native, offer: u32) ?c_int {
@@ -1227,14 +1306,7 @@ pub fn applyAppUnit(self: *Daemon, ch: *Channel, tag: wlpipe.Tag, payload: []con
         .clip_data => {
             // Paste bytes for the oldest held receive-fd.
             if (nv.clip_paste_fds.items.len == 0) return;
-            const fd = nv.clip_paste_fds.orderedRemove(0).fd;
-            var written: usize = 0;
-            while (written < payload.len) {
-                const w = c.write(fd, payload.ptr + written, payload.len - written);
-                if (w <= 0) break;
-                written += @intCast(w);
-            }
-            _ = c.close(fd);
+            pasteWrite(nv, nv.clip_paste_fds.orderedRemove(0).fd, payload);
         },
         .drop_data => {
             // Host-drop transfer: write the payload into the
@@ -1243,26 +1315,12 @@ pub fn applyAppUnit(self: *Daemon, ch: *Channel, tag: wlpipe.Tag, payload: []con
             if (pl.len < 4) return;
             const offer = std.mem.readInt(u32, pl[0..4], .little);
             const data = pl[4..];
-            const fd = takePasteFd(nv, offer) orelse return;
-            var written: usize = 0;
-            while (written < data.len) {
-                const w = c.write(fd, data.ptr + written, data.len - written);
-                if (w <= 0) break;
-                written += @intCast(w);
-            }
-            _ = c.close(fd);
+            pasteWrite(nv, takePasteFd(nv, offer) orelse return, data);
         },
         .primary_data => {
             // Primary-paste bytes for the oldest PRIMARY fd.
             if (nv.primary_paste_fds.items.len == 0) return;
-            const fd = nv.primary_paste_fds.orderedRemove(0);
-            var written: usize = 0;
-            while (written < payload.len) {
-                const w = c.write(fd, payload.ptr + written, payload.len - written);
-                if (w <= 0) break;
-                written += @intCast(w);
-            }
-            _ = c.close(fd);
+            pasteWrite(nv, nv.primary_paste_fds.orderedRemove(0), payload);
         },
         .dnd_send => {
             // Within-app dnd transfer: the drop target's
@@ -1334,6 +1392,37 @@ test "every viewer unit tag is classified, and the gate reads the classification
         try t.expectEqual(expected, kind);
         try t.expectEqual(kind == .intent, isSeatIntent(tag));
     }
+}
+
+test "a paste toward an unread app fd returns instead of parking the poll loop" {
+    const t = std.testing;
+    var fds: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), c.pipe(&fds));
+    defer _ = c.close(fds[0]);
+    defer _ = c.close(fds[1]);
+
+    // 4 MiB is past any pipe capacity, and nobody reads fds[0]: the
+    // blocking write loop this replaced never returned, freezing every
+    // session the daemon owns.
+    const payload = try t.allocator.alloc(u8, 4 << 20);
+    defer t.allocator.free(payload);
+    @memset(payload, 'x');
+
+    const written = pasteWriteOnce(fds[1], payload).?;
+    try t.expect(written > 0);
+    try t.expect(written < payload.len);
+    try t.expect(c.fcntl(fds[1], c.F_GETFL, @as(c_int, 0)) & c.O_NONBLOCK != 0);
+
+    // Draining the reader lets the rest through on the next pass.
+    const rfl = c.fcntl(fds[0], c.F_GETFL, @as(c_int, 0));
+    _ = c.fcntl(fds[0], c.F_SETFL, rfl | c.O_NONBLOCK);
+    var sink: [65536]u8 = undefined;
+    while (c.read(fds[0], &sink, sink.len) > 0) {}
+    const more = pasteWriteOnce(fds[1], payload[written..]).?;
+    try t.expect(more > 0);
+
+    // A dead descriptor is reported, never retried forever.
+    try t.expectEqual(@as(?usize, null), pasteWriteOnce(-1, "tail"));
 }
 
 test "a shm fd is refused for a pool larger than its backing file" {

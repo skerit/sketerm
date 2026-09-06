@@ -1625,6 +1625,12 @@ pub const Native = struct {
     /// Copy: read-ends of pipes whose write-ends went to the app
     /// via wl_data_source.send; EOF ships a clip_data unit up.
     clip_reads: std.ArrayList(ClipRead) = .empty,
+    /// Paste bytes accepted for an app-supplied fd that the app has
+    /// not read yet. The fd belongs to the APP, so its pipe fills at
+    /// the app's pace: writing the rest inline would park the whole
+    /// single-threaded poll loop — every session on this host — on one
+    /// unresponsive client. The remainder drains on POLLOUT instead.
+    clip_writes: std.ArrayList(ClipWrite) = .empty,
     /// pool id -> daemon-owned mirror of the CURRENT incarnation under that
     /// id (anonymous memory filled by pread at commit; the client fd is kept
     /// only to read from). Mirrors outlive wl_shm_pool destructors: existing
@@ -1707,6 +1713,12 @@ pub const Native = struct {
     const ClipRead = struct {
         fd: c_int,
         buf: std.ArrayList(u8) = .empty,
+    };
+
+    pub const ClipWrite = struct {
+        fd: c_int,
+        buf: std.ArrayList(u8) = .empty,
+        off: usize = 0,
     };
 
     const PasteFd = struct {
@@ -1861,6 +1873,11 @@ pub const Native = struct {
             cr.buf.deinit(self.allocator);
         }
         self.clip_reads.deinit(self.allocator);
+        for (self.clip_writes.items) |*cw| {
+            _ = c.close(cw.fd);
+            cw.buf.deinit(self.allocator);
+        }
+        self.clip_writes.deinit(self.allocator);
         self.inbuf.deinit(self.allocator);
         self.unitbuf.deinit(self.allocator);
         var vit = self.vstate.valueIterator();
@@ -3104,6 +3121,19 @@ pub const Daemon = struct {
                 }
             }
         }
+        // Paste pipes with bytes the app has not read yet.
+        const clipw_base = fds.items.len;
+        for (self.channels.items) |ch| {
+            if (ch.native) |nv| {
+                for (nv.clip_writes.items) |cw| {
+                    try fds.append(self.allocator, .{
+                        .fd = if (ch.dead) -1 else cw.fd,
+                        .events = c.POLLOUT,
+                        .revents = 0,
+                    });
+                }
+            }
+        }
         // Broker: each worker's control channel — readable = a metadata push
         // ('M'); HUP/error = the worker process exited (reap removes it).
         const worker_base = fds.items.len;
@@ -3222,11 +3252,29 @@ pub const Daemon = struct {
             const ch = self.channels.items[i];
             const nv = ch.native orelse continue;
             var j: usize = 0;
-            while (j < nv.clip_reads.items.len and clip_base + clip_idx < fds.items.len) {
+            while (j < nv.clip_reads.items.len and clip_base + clip_idx < clipw_base) {
                 const re = fds.items[clip_base + clip_idx].revents;
                 clip_idx += 1;
                 if (re & (c.POLLIN | c.POLLHUP) != 0 and !ch.dead) {
                     if (self.clipReadable(ch, j)) continue; // removed; j stays
+                }
+                j += 1;
+            }
+        }
+
+        // Paste pipes (same shape as the clipboard reads above: the
+        // entry list only shrinks while we drain).
+        var clipw_idx: usize = 0;
+        i = 0;
+        while (i < n_channels) : (i += 1) {
+            const ch = self.channels.items[i];
+            const nv = ch.native orelse continue;
+            var j: usize = 0;
+            while (j < nv.clip_writes.items.len and clipw_base + clipw_idx < worker_base) {
+                const re = fds.items[clipw_base + clipw_idx].revents;
+                clipw_idx += 1;
+                if (re & (c.POLLOUT | c.POLLERR | c.POLLHUP) != 0 and !ch.dead) {
+                    if (daemon_native.clipWritable(nv, j)) continue; // removed; j stays
                 }
                 j += 1;
             }
