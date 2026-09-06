@@ -127,6 +127,17 @@ pub const Action = enum {
     /// Open a web tab in a fresh throwaway incognito container (a
     /// private, ephemeral cookie jar / cache).
     new_incognito_web_tab,
+    /// Open a web tab born on the Tor route (src/web/route.zig): its
+    /// first view is created in the Tor helper instance, so no address
+    /// is ever loaded directly first.
+    new_tor_web_tab,
+    /// Open the focused web pane's one-click route menu (the toolbar's
+    /// route button): Direct / Tor / Via server / Browser runs on.
+    web_route_menu,
+    /// Move the focused web pane's tab onto the direct route.
+    web_route_direct,
+    /// Move the focused web pane's tab onto the Tor route.
+    web_route_tor,
     /// Link hints on the focused pane's web face (Vimium-style): label
     /// every visible interactive element of the page, type a label to
     /// click it through the trusted-input path (Shift/Ctrl on the last

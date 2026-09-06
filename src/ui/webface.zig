@@ -3485,11 +3485,16 @@ pub const WebFace = struct {
     /// The user (or an MCP caller) chose this tab's route; the
     /// container's default no longer applies to it.
     route_explicit: bool = false,
-    /// Dim "via Tor" / "via box" text beside the site button; hidden on
-    /// a direct route. The padlock alone cannot say where traffic
-    /// leaves, and a silently wrong route is the failure routes exist
-    /// to prevent.
-    route_label: *c.GtkWidget = undefined,
+    /// The ALWAYS-visible route button beside the padlock ("Direct",
+    /// "Tor", "via box"), whose click opens the one-click route menu
+    /// (`showRouteMenu`). It is never hidden: a route indicator that
+    /// appeared only once the route was non-direct was a switch nobody
+    /// found, and the padlock alone cannot say where traffic leaves.
+    /// `route_icon` / `route_text` are its two children, updated in
+    /// place by `updateSiteButton`.
+    route_btn: *c.GtkWidget = undefined,
+    route_icon: *c.GtkWidget = undefined,
+    route_text: *c.GtkWidget = undefined,
     /// True once `view_create` was sent on the CURRENT connection.
     view_live: bool = false,
     /// This face PRESENTS a view somebody else created (the inspector
@@ -3845,6 +3850,16 @@ pub const WebFace = struct {
         return attachOpts(allocator, pane, .{ .url = url, .container = container });
     }
 
+    /// Web face born ON `route`: its very first view is created in
+    /// that route's helper instance, so `url` is never handed to the
+    /// direct instance first (opening direct and then moving would
+    /// leak the address over the direct path). What "New Tor Tab" and
+    /// `sketerm web --route` use. An invalid spec is refused.
+    pub fn attachRouted(allocator: std.mem.Allocator, pane: *Pane, url: ?[]const u8, route: webroute.Spec) !*WebFace {
+        if (!route.valid()) return error.InvalidRoute;
+        return attachOpts(allocator, pane, .{ .url = url, .route = route });
+    }
+
     /// Put a face on `pane` that PRESENTS an existing helper-side view
     /// instead of creating one — how the inspector `devtools_show`
     /// minted becomes a pane (`Window.openDevToolsSplit`).
@@ -3903,6 +3918,10 @@ pub const WebFace = struct {
         address_readonly: bool = false,
         /// The existing view is an OBSERVED page of `watch`.
         watch: ?*anyopaque = null,
+        /// Route the FIRST view is created on, outranking the
+        /// container's default. Marks the route explicit, like
+        /// `setRoute` does.
+        route: ?webroute.Spec = null,
     };
 
     /// First page of a watch: the face presenting the assistant's view
@@ -4078,9 +4097,20 @@ pub const WebFace = struct {
         // realized by one helper instance per route. A route the client
         // registry cannot mint (out of memory, an over-long host) falls
         // back to the direct instance and SAYS so.
-        const spec = routeForContainer(opts.container);
+        const spec = opts.route orelse routeForContainer(opts.container);
         _ = self.storeRoute(spec);
+        self.route_explicit = opts.route != null;
         const cl = opts.on_client orelse (clientForRoute(allocator, spec) orelse blk: {
+            // A route the user ASKED for must not quietly become
+            // direct: the address is dropped so the direct instance
+            // never sees it, and the blank tab says why.
+            if (opts.route != null) {
+                if (self.pending_url) |u| allocator.free(u);
+                self.pending_url = null;
+                _ = self.storeRoute(.{});
+                self.setStatus("This tab's route could not be started, so its address was not loaded. Pick a route from the toolbar's route button.", false);
+                break :blk &g_client;
+            }
             _ = self.storeRoute(.{});
             self.setStatus("This tab's route could not be started; browsing directly instead.", false);
             break :blk &g_client;
@@ -4636,6 +4666,121 @@ pub const WebFace = struct {
         self.requestCookies();
     }
 
+    fn onRouteButton(btn: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(WebFace, user).showRouteMenu(btn);
+    }
+
+    /// Per-row context of the route menu: the face and the choice the
+    /// row stands for. Owned by the menu root (`root.own`), freed when
+    /// the popover dies.
+    const RouteRowCtx = struct {
+        allocator: std.mem.Allocator,
+        face: *WebFace,
+        choice: webroute.Choice,
+    };
+
+    fn freeRouteRowCtx(user: ?*anyopaque) callconv(.c) void {
+        const ctx = cast.userData(RouteRowCtx, user);
+        ctx.allocator.destroy(ctx);
+    }
+
+    /// The one-click route menu under the toolbar's route button: one
+    /// checked row per `webroute.Choice` (Direct and Tor apply at
+    /// once; the host-bound two open the site popover with that route
+    /// pre-selected, since their one missing piece is a host), then
+    /// "New Tor Tab" and the full route settings. Same rows, same
+    /// order, as the site popover's dropdown and the palette.
+    pub fn showRouteMenu(self: *WebFace, anchor: *c.GtkWidget) void {
+        if (self.widgets_dead) return;
+        const root = classicmenu.Root.create(self.allocator) orelse return;
+        const current = webroute.Choice.fromKind(self.routeSpec().kind);
+        const m = root.top();
+        self.appendRouteRows(root, m, current);
+        const more = m.section();
+        const ctx = self.allocator.create(MenuCtx) catch {
+            root.destroy();
+            return;
+        };
+        ctx.* = .{ .allocator = self.allocator, .face = self };
+        root.own(freeMenuCtx, ctx);
+        more.itemIcon("New Tor Web Tab", .{ .name = webroute.Choice.tor.icon() }, &onMenuTorTab, ctx);
+        more.itemIcon("Route Settings...", .{ .name = "channel-secure-symbolic" }, &onMenuSiteInfo, ctx);
+        _ = root.popup(
+            anchor,
+            @floatFromInt(@divTrunc(c.gtk_widget_get_width(anchor), 2)),
+            @floatFromInt(c.gtk_widget_get_height(anchor)),
+        );
+    }
+
+    /// One checked row per `webroute.Choice` into `menu`, the current
+    /// one ticked; the host-bound choices get an ellipsis because they
+    /// open the site popover for a host rather than applying at once.
+    /// Rows are disabled on an attached view, which cannot move.
+    fn appendRouteRows(self: *WebFace, root: *classicmenu.Root, menu: classicmenu.Menu, current: webroute.Choice) void {
+        for (webroute.Choice.all) |choice| {
+            const rc = self.allocator.create(RouteRowCtx) catch continue;
+            rc.* = .{ .allocator = self.allocator, .face = self, .choice = choice };
+            root.own(freeRouteRowCtx, rc);
+            var lbuf: [64]u8 = undefined;
+            const label: [*:0]const u8 = if (choice.needsHost()) blk: {
+                const z = std.fmt.bufPrintZ(&lbuf, "{s}...", .{choice.label()}) catch break :blk choice.label();
+                break :blk z.ptr;
+            } else choice.label();
+            menu.checkEnabled(label, choice == current, !self.attached, &onRouteRow, rc);
+        }
+    }
+
+    fn onRouteRow(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const rc = cast.userData(RouteRowCtx, user);
+        rc.face.chooseRoute(rc.choice);
+    }
+
+    fn onMenuSiteInfo(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        cast.userData(MenuCtx, user).face.showSiteInfo();
+    }
+
+    fn onMenuTorTab(_: ?*anyopaque, user: ?*anyopaque) callconv(.c) void {
+        const win = cast.userData(MenuCtx, user).face.ownerWindow() orelse return;
+        win.newTorWebTab() catch {};
+    }
+
+    /// Act on a route choice the user made from a one-click surface
+    /// (toolbar menu, palette): the host-less choices move the tab at
+    /// once; the host-bound ones open the site popover on that choice
+    /// so the host can be typed. Every refusal is said in a toast, so
+    /// a click can never silently do nothing.
+    pub fn chooseRoute(self: *WebFace, choice: webroute.Choice) void {
+        if (choice.needsHost()) {
+            self.showSiteInfo();
+            if (self.site_info) |si| si.preset(choice);
+            return;
+        }
+        const spec = choice.spec("", torEndpoint()) orelse {
+            self.routeToast("Tor is not configured: mux_tor_socks_endpoint must be a host:port.");
+            return;
+        };
+        self.setRoute(spec) catch |err| {
+            self.routeToast(switch (err) {
+                error.InvalidRoute => "That route is not valid.",
+                error.AttachedView => "This kind of tab cannot change its route.",
+                error.RouteUnavailable => "That route could not be started.",
+            });
+            return;
+        };
+        var msg: [96]u8 = undefined;
+        var dbuf: [webroute.MAX_HOST + 16]u8 = undefined;
+        const desc = spec.describe(&dbuf);
+        self.routeToast(if (desc.len != 0)
+            std.fmt.bufPrint(&msg, "This tab now browses {s}.", .{desc}) catch "Route changed."
+        else
+            "This tab now browses directly.");
+    }
+
+    fn routeToast(self: *WebFace, text: []const u8) void {
+        const win = self.ownerWindow() orelse return;
+        @import("window.zig").showToast(win, text);
+    }
+
     /// Push the current state into an existing popover. `open` also
     /// pops it up.
     fn refreshSiteInfo(self: *WebFace, open: bool) void {
@@ -4691,22 +4836,36 @@ pub const WebFace = struct {
             .secure => "channel-secure-symbolic",
             .exception => "dialog-warning-symbolic",
         };
-        // A routed tab shows WHERE its traffic leaves before it shows
-        // how the connection reads: the route is the fact a user must
-        // not have to open anything to learn.
+        // The padlock says how the CONNECTION reads; where the traffic
+        // leaves is the route button's job next to it (it used to be
+        // shown here too, and the two read as one duplicated fact).
+        toolbtn.setIcon(self.site_btn, self.bar, tls_icon, "Site");
         const route = self.routeSpec();
         var dbuf: [webroute.MAX_HOST + 16]u8 = undefined;
         const desc = route.describe(&dbuf);
-        if (route.icon()) |ri| {
-            var tz: [webroute.MAX_HOST + 16]u8 = undefined;
-            toolbtn.setIcon(self.site_btn, self.bar, ri, (std.fmt.bufPrintZ(&tz, "{s}", .{desc}) catch @as([:0]const u8, "Route")).ptr);
-        } else {
-            toolbtn.setIcon(self.site_btn, self.bar, tls_icon, "Site");
-        }
-        var lz: [webroute.MAX_HOST + 16]u8 = undefined;
-        const label = std.fmt.bufPrintZ(&lz, "{s}", .{desc}) catch "";
-        c.gtk_label_set_text(@ptrCast(self.route_label), label.ptr);
-        c.gtk_widget_set_visible(self.route_label, if (desc.len != 0) 1 else 0);
+        // The route button: icon + short word for EVERY route, and a
+        // tooltip that spells the route out in full. An attached view
+        // (inspector, observed page) cannot move, so its button says
+        // so rather than opening a menu that could do nothing. The
+        // icons are sketerm's own, so they resolve; the guard keeps a
+        // theme that somehow lacks them from drawing a broken glyph
+        // beside a word that already carries the meaning.
+        const choice = webroute.Choice.fromKind(route.kind);
+        const have_icon = toolbtn.iconAvailable(choice.icon());
+        c.gtk_widget_set_visible(self.route_icon, if (have_icon) 1 else 0);
+        if (have_icon) c.gtk_image_set_from_icon_name(@ptrCast(self.route_icon), choice.icon());
+        var sz: [webroute.HOST_LABEL_MAX + 16:0]u8 = undefined;
+        var sbuf: [webroute.HOST_LABEL_MAX + 8]u8 = undefined;
+        const short = std.fmt.bufPrintZ(&sz, "{s}", .{route.shortLabel(&sbuf)}) catch "Route";
+        c.gtk_label_set_text(@ptrCast(self.route_text), short.ptr);
+        var rtip: [webroute.MAX_HOST + 128]u8 = undefined;
+        const rt = if (self.attached)
+            std.fmt.bufPrintZ(&rtip, "Route: this view presents another page's browser and cannot change route.", .{}) catch "Route"
+        else if (desc.len != 0)
+            std.fmt.bufPrintZ(&rtip, "Route: this tab browses {s}. Click to change it.", .{desc}) catch "Route"
+        else
+            std.fmt.bufPrintZ(&rtip, "Route: direct, this machine's own network. Click to switch to Tor or a server.", .{}) catch "Route";
+        c.gtk_widget_set_tooltip_text(self.route_btn, rt.ptr);
         var tip: [webroute.MAX_HOST + 96]u8 = undefined;
         const t = if (desc.len != 0)
             std.fmt.bufPrintZ(&tip, "Site information, permissions and stored data. This tab browses {s}.", .{desc}) catch "Site information"
@@ -5498,14 +5657,24 @@ pub const WebFace = struct {
             self,
         );
         self.track(self.site_btn);
-        // Where this tab's traffic leaves, spelled out beside the
-        // padlock and hidden on a direct route (`updateSiteButton`).
-        self.route_label = c.gtk_label_new("").?;
-        c.gtk_widget_add_css_class(self.route_label, "dim-label");
-        c.gtk_widget_set_margin_end(self.route_label, 4);
-        c.gtk_widget_set_visible(self.route_label, 0);
-        self.track(self.route_label);
-        c.gtk_box_append(@ptrCast(bar), self.route_label);
+        // Where this tab's traffic leaves, as a button that is ALWAYS
+        // there (`updateSiteButton` keeps its text current). Icon plus
+        // text, like the shield: the word is what makes "Direct" and
+        // "Tor" readable at a glance, and the click is the one-click
+        // route menu.
+        self.route_btn = c.gtk_button_new().?;
+        const route_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 4);
+        self.route_icon = c.gtk_image_new_from_icon_name(webroute.Choice.direct.icon()).?;
+        c.gtk_box_append(@ptrCast(route_row), self.route_icon);
+        self.route_text = c.gtk_label_new("Direct").?;
+        c.gtk_box_append(@ptrCast(route_row), self.route_text);
+        c.gtk_button_set_child(@ptrCast(self.route_btn), route_row);
+        c.gtk_widget_set_tooltip_text(self.route_btn, "Route: where this tab's traffic leaves. Click to change it.");
+        c.gtk_widget_add_css_class(self.route_btn, "sketerm-web-route");
+        toolbtn.flatten(self.route_btn);
+        _ = c.g_signal_connect_data(@ptrCast(self.route_btn), "clicked", @ptrCast(&onRouteButton), self, null, 0);
+        self.track(self.route_btn);
+        c.gtk_box_append(@ptrCast(bar), self.route_btn);
 
         self.entry = c.gtk_entry_new();
         c.gtk_widget_set_hexpand(self.entry, 1);
@@ -6111,6 +6280,9 @@ pub const WebFace = struct {
         if (!self.storeRoute(spec)) return error.InvalidRoute;
         self.route_explicit = true;
         self.updateSiteButton();
+        // The tab strip wears the route badge (`applyTabTitle`), so a
+        // moved tab is renamed even when its page title does not change.
+        self.applyTabTitle();
         if (same_client) return;
         // Leave the old instance: the view there is torn down like a
         // closed tab, and the new instance mints a fresh id so nothing
@@ -6804,7 +6976,11 @@ pub const WebFace = struct {
         // sidebar, so one page is not called two different things —
         // notably a blank page, which reports "about:blank" as its
         // title and reads as "New Tab" everywhere else.
-        const title = webgroup.Group.pageTitle(self);
+        // A routed tab is badged (`[Tor] Example`) so the strip and the
+        // tree sidebar say where its traffic leaves without the pane
+        // being looked at.
+        var bbuf: [512]u8 = undefined;
+        const title = self.routeSpec().badgedTitle(&bbuf, webgroup.Group.pageTitle(self));
         @import("termsinks.zig").setTabPageTitleFromUtf8(self.allocator, page, title);
     }
 
@@ -8437,6 +8613,17 @@ pub const WebFace = struct {
 
         const tabs = m.section();
         tabs.itemIcon("New Incognito Web Tab", .{ .name = "view-private-symbolic" }, &onMenuIncognito, ctx);
+        tabs.itemIcon("New Tor Web Tab", .{ .name = webroute.Choice.tor.icon() }, &onMenuTorTab, ctx);
+        // The current tab's route, as a submenu of the same rows the
+        // toolbar's route button offers.
+        {
+            const current = webroute.Choice.fromKind(self.routeSpec().kind);
+            var rbuf: [64]u8 = undefined;
+            var sbuf: [webroute.HOST_LABEL_MAX + 8]u8 = undefined;
+            const rlabel = std.fmt.bufPrintZ(&rbuf, "Route: {s}", .{self.routeSpec().shortLabel(&sbuf)}) catch "Route";
+            const rm = tabs.submenuIcon(rlabel.ptr, .{ .name = current.icon() });
+            self.appendRouteRows(root, rm, current);
+        }
         if (containers().len != 0) {
             const cont = tabs.submenu("New Tab in Container");
             for (containers()) |*ctn| {

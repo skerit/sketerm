@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- Direct route: a plain wired link, two endpoints on one line.
+       Shipped ourselves because `network-wired-symbolic` is absent from
+       every non-GNOME theme chain (and from the rig's), and an
+       unresolvable name renders the broken-image glyph on a button
+       that must always be visible. Monochrome symbolic icon. -->
+  <g fill="#2e3436">
+    <path d="M1 7h14v2H1z"/>
+    <path fill-rule="evenodd" d="M2 4h4a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm0 1v6h4V5zM10 4h4a1 1 0 0 1 1 1v6a1 1 0 0 1-1 1h-4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zm0 1v6h4V5z"/>
+  </g>
+</svg>

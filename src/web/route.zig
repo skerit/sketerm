@@ -59,7 +59,7 @@ pub const Spec = struct {
         return switch (self.kind) {
             .direct => self.host.len == 0 and self.endpoint.len == 0,
             .tor => self.host.len == 0 and validEndpoint(self.endpoint),
-            .mux, .remote_browser => self.host.len != 0 and self.endpoint.len == 0,
+            .mux, .remote_browser => validHost(self.host) and self.endpoint.len == 0,
         };
     }
 
@@ -111,12 +111,7 @@ pub const Spec = struct {
 
     fn hostSpec(kind: Kind, host_raw: []const u8) ?Spec {
         const host = std.mem.trim(u8, host_raw, " \t");
-        if (host.len == 0 or host.len > MAX_HOST) return null;
-        // A host string is a mux host spec (`user@box`, `ssh:box`, ...);
-        // whitespace or a slash is never part of one.
-        for (host) |ch| {
-            if (ch <= ' ' or ch == '/' or ch == 0x7f) return null;
-        }
+        if (!validHost(host)) return null;
         return .{ .kind = kind, .host = host };
     }
 
@@ -138,16 +133,43 @@ pub const Spec = struct {
         };
     }
 
-    /// Icon name the indicator uses; null for direct (the TLS padlock
-    /// keeps its place). Adwaita names only, so a theme that lacks them
-    /// falls back to the text of `describe` through `toolbtn`.
+    /// Icon name of a NON-direct route, null for direct: for a surface
+    /// that marks routed tabs only. The always-visible route button
+    /// uses `Choice.icon`, which names every route.
     pub fn icon(self: Spec) ?[*:0]const u8 {
+        if (self.kind == .direct) return null;
+        return Choice.fromKind(self.kind).icon();
+    }
+
+    /// What the toolbar's ALWAYS-visible route button says, direct
+    /// included: a route is a fact the user must be able to read and
+    /// change without opening anything, and a button that appears only
+    /// once the route is non-direct is exactly the hidden switch nobody
+    /// found. A host is elided to `HOST_LABEL_MAX` so the address entry
+    /// keeps its width.
+    pub fn shortLabel(self: Spec, buf: []u8) []const u8 {
         return switch (self.kind) {
-            .direct => null,
-            .tor => "network-vpn-symbolic",
-            .mux => "network-server-symbolic",
-            .remote_browser => "computer-symbolic",
+            .direct => "Direct",
+            .tor => "Tor",
+            .mux => hostLabel(buf, "via ", self.host),
+            .remote_browser => hostLabel(buf, "on ", self.host),
         };
+    }
+
+    /// The tab title with the route in front of it when the route is
+    /// not direct (`[Tor] Example`), so the tab strip and the tree
+    /// sidebar both say where a tab's traffic leaves. A title that does
+    /// not fit `buf` is truncated, never dropped: the badge is the
+    /// point, the tail of a long title is not.
+    pub fn badgedTitle(self: Spec, buf: []u8, title: []const u8) []const u8 {
+        if (self.kind == .direct) return title;
+        var lbuf: [HOST_LABEL_MAX + 8]u8 = undefined;
+        const label = self.shortLabel(&lbuf);
+        var w = std.Io.Writer.fixed(buf);
+        w.print("[{s}] ", .{label}) catch return title;
+        const room = buf.len - w.buffered().len;
+        w.writeAll(title[0..utf8Fit(title, room)]) catch {};
+        return w.buffered();
     }
 
     /// A short, stable, filesystem- and socket-safe identifier.
@@ -176,9 +198,143 @@ pub const Spec = struct {
 /// fixed host buffers.
 pub const MAX_HOST: usize = 255;
 
+/// Longest host `shortLabel` shows before eliding; the toolbar button
+/// sits between the padlock and the address entry.
+pub const HOST_LABEL_MAX: usize = 24;
+
+/// `prefix` + host, the host elided from the middle past
+/// `HOST_LABEL_MAX` (`me@very-long...box`), so both the user part and
+/// the tail of the name stay readable.
+fn hostLabel(buf: []u8, prefix: []const u8, host: []const u8) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    w.writeAll(prefix) catch return prefix;
+    if (host.len <= HOST_LABEL_MAX) {
+        w.writeAll(host) catch {};
+    } else {
+        const head = HOST_LABEL_MAX / 2;
+        const tail = HOST_LABEL_MAX - head - 3;
+        w.writeAll(host[0..utf8Fit(host, head)]) catch {};
+        w.writeAll("...") catch {};
+        w.writeAll(host[host.len - utf8FitTail(host, tail) ..]) catch {};
+    }
+    return w.buffered();
+}
+
+/// Largest byte count `<= max` that ends on a codepoint boundary.
+fn utf8Fit(s: []const u8, max: usize) usize {
+    var n = @min(s.len, max);
+    while (n > 0 and n < s.len and (s[n] & 0xC0) == 0x80) n -= 1;
+    return n;
+}
+
+/// Largest byte count `<= max` from the END that starts on a boundary.
+fn utf8FitTail(s: []const u8, max: usize) usize {
+    var n = @min(s.len, max);
+    while (n > 0 and (s[s.len - n] & 0xC0) == 0x80) n -= 1;
+    return n;
+}
+
+/// The four choices every route picker offers, in the ONE order the
+/// site-info dropdown, the toolbar route menu and the palette agree
+/// on. A choice is a kind plus whether it needs a host typed; the
+/// `Spec` it becomes is minted by `spec`, so no picker carries its own
+/// kind table.
+pub const Choice = enum(u8) {
+    direct = 0,
+    tor = 1,
+    via = 2,
+    on = 3,
+
+    pub const all = [_]Choice{ .direct, .tor, .via, .on };
+
+    pub fn fromKind(k: Kind) Choice {
+        return switch (k) {
+            .direct => .direct,
+            .tor => .tor,
+            .mux => .via,
+            .remote_browser => .on,
+        };
+    }
+
+    pub fn kind(self: Choice) Kind {
+        return switch (self) {
+            .direct => .direct,
+            .tor => .tor,
+            .via => .mux,
+            .on => .remote_browser,
+        };
+    }
+
+    /// The row / dropdown text.
+    pub fn label(self: Choice) [*:0]const u8 {
+        return switch (self) {
+            .direct => "Direct",
+            .tor => "Tor",
+            .via => "Via server",
+            .on => "Browser runs on",
+        };
+    }
+
+    /// One line under the row text saying what the choice means.
+    pub fn detail(self: Choice) [*:0]const u8 {
+        return switch (self) {
+            .direct => "This machine's own network",
+            .tor => "Anonymised through the Tor network",
+            .via => "Traffic leaves from a mux/SSH host",
+            .on => "The whole browser runs on a host",
+        };
+    }
+
+    /// Icon for the row and for the toolbar button when this is the
+    /// current choice; never null, unlike `Spec.icon`, because the
+    /// button is always there. Names sketerm SHIPS (`data/icons`):
+    /// the Adwaita `network-*-symbolic` names resolve on no other
+    /// theme chain, and the first GUI run of the route button showed
+    /// the broken-image glyph for exactly that reason.
+    pub fn icon(self: Choice) [*:0]const u8 {
+        return switch (self) {
+            .direct => "sketerm-route-direct-symbolic",
+            .tor => "sketerm-route-tor-symbolic",
+            .via => "sketerm-route-via-symbolic",
+            .on => "sketerm-route-on-symbolic",
+        };
+    }
+
+    /// The two host-bound choices cannot be applied from a one-click
+    /// row: they need a host typed first.
+    pub fn needsHost(self: Choice) bool {
+        return self == .via or self == .on;
+    }
+
+    /// The spec this choice realizes. `host` is read only by the
+    /// host-bound choices and `tor_endpoint` only by `.tor`; the result
+    /// borrows both. Null when the choice needs a host and none was
+    /// given, or the Tor endpoint is not a valid `host:port` -- the
+    /// same refusals `Spec.parse` makes.
+    pub fn spec(self: Choice, host: []const u8, tor_endpoint: []const u8) ?Spec {
+        const s: Spec = switch (self) {
+            .direct => .{},
+            .tor => .{ .kind = .tor, .endpoint = tor_endpoint },
+            .via => .{ .kind = .mux, .host = host },
+            .on => .{ .kind = .remote_browser, .host = host },
+        };
+        return if (s.valid()) s else null;
+    }
+};
+
 /// A syntactically valid endpoint used ONLY to check a `tor` text's
 /// shape where no real endpoint applies (`validText`).
 const SHAPE_CHECK_ENDPOINT = "127.0.0.1:9050";
+
+/// A mux host spec (`user@box`, `ssh:box`, ...): non-empty, bounded,
+/// and never containing whitespace, a slash or a control byte.
+fn validHost(host: []const u8) bool {
+    if (host.len == 0 or host.len > MAX_HOST) return false;
+    for (host) |ch| {
+        if (ch <= ' ' or ch == '/' or ch == 0x7f) return false;
+    }
+    return true;
+}
 
 /// `host:port` with a numeric-or-name host and a nonzero port. Bracketed
 /// IPv6 is accepted; a bare `::1:9050` is not, because its last colon is
@@ -316,4 +472,60 @@ test "the indicator names where traffic leaves" {
     try t.expectEqualStrings("on box", (Spec{ .kind = .remote_browser, .host = "box" }).describe(&buf));
     try t.expect((Spec{}).icon() == null);
     try t.expect((Spec{ .kind = .tor }).icon() != null);
+}
+
+test "the toolbar button names every route, direct included" {
+    const t = std.testing;
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("Direct", (Spec{}).shortLabel(&buf));
+    try t.expectEqualStrings("Tor", (Spec{ .kind = .tor, .endpoint = "127.0.0.1:9050" }).shortLabel(&buf));
+    try t.expectEqualStrings("via me@box", (Spec{ .kind = .mux, .host = "me@box" }).shortLabel(&buf));
+    try t.expectEqualStrings("on box", (Spec{ .kind = .remote_browser, .host = "box" }).shortLabel(&buf));
+    // A long host is elided from the middle, never truncated to nothing.
+    const long = Spec{ .kind = .mux, .host = "someone@a-very-long-hostname.internal.example" };
+    const l = long.shortLabel(&buf);
+    try t.expect(l.len <= "via ".len + HOST_LABEL_MAX);
+    try t.expect(std.mem.startsWith(u8, l, "via someone@"));
+    try t.expect(std.mem.endsWith(u8, l, "example"));
+    try t.expect(std.mem.indexOf(u8, l, "...") != null);
+}
+
+test "a routed tab's title carries a badge, a direct one is untouched" {
+    const t = std.testing;
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("Example", (Spec{}).badgedTitle(&buf, "Example"));
+    try t.expectEqualStrings("[Tor] Example", (Spec{ .kind = .tor, .endpoint = "127.0.0.1:9050" }).badgedTitle(&buf, "Example"));
+    try t.expectEqualStrings("[via box] Example", (Spec{ .kind = .mux, .host = "box" }).badgedTitle(&buf, "Example"));
+    try t.expectEqualStrings("[on box] Example", (Spec{ .kind = .remote_browser, .host = "box" }).badgedTitle(&buf, "Example"));
+    // Truncation lands on a codepoint boundary.
+    var tiny: [12]u8 = undefined;
+    const cut = (Spec{ .kind = .tor, .endpoint = "127.0.0.1:9050" }).badgedTitle(&tiny, "caf\xc3\xa9\xc3\xa9\xc3\xa9");
+    try t.expect(std.unicode.utf8ValidateSlice(cut));
+    try t.expect(std.mem.startsWith(u8, cut, "[Tor] caf"));
+}
+
+test "Choice is the one order every picker shares and mints valid specs" {
+    const t = std.testing;
+    const ep = "127.0.0.1:9050";
+    try t.expectEqual(Choice.direct, Choice.fromKind(.direct));
+    try t.expectEqual(Choice.via, Choice.fromKind(.mux));
+    try t.expectEqual(Choice.on, Choice.fromKind(.remote_browser));
+    inline for (Choice.all) |ch| try t.expectEqual(ch, Choice.fromKind(ch.kind()));
+    try t.expect(!Choice.direct.needsHost());
+    try t.expect(!Choice.tor.needsHost());
+    try t.expect(Choice.via.needsHost());
+    try t.expect(Choice.on.needsHost());
+
+    try t.expect(Choice.direct.spec("", ep).?.isDirect());
+    try t.expectEqualStrings(ep, Choice.tor.spec("", ep).?.endpoint);
+    try t.expectEqualStrings("box", Choice.via.spec("box", ep).?.host);
+    try t.expectEqual(Kind.remote_browser, Choice.on.spec("box", ep).?.kind);
+    // The same refusals the text grammar makes.
+    try t.expect(Choice.via.spec("", ep) == null);
+    try t.expect(Choice.on.spec("a b", ep) == null);
+    try t.expect(Choice.tor.spec("", "") == null);
+    // What a choice mints round-trips through the text grammar.
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("via:box", Choice.via.spec("box", ep).?.format(&buf).?);
+    try t.expect(Spec.parse("on:box", ep).?.eql(Choice.on.spec("box", ep).?));
 }

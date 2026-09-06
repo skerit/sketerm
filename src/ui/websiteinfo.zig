@@ -354,17 +354,12 @@ pub const SiteInfo = struct {
         c.gtk_label_set_text(@ptrCast(self.tls_label), st.tls.text());
 
         self.route_syncing = true;
-        const sel: c_uint = switch (st.route.kind) {
-            .direct => 0,
-            .tor => 1,
-            .mux => 2,
-            .remote_browser => 3,
-        };
-        c.gtk_drop_down_set_selected(@ptrCast(self.route_drop), sel);
+        const choice = webroute.Choice.fromKind(st.route.kind);
+        c.gtk_drop_down_set_selected(@ptrCast(self.route_drop), @intFromEnum(choice));
         var hz: [webroute.MAX_HOST + 1:0]u8 = undefined;
         const hb = std.fmt.bufPrintZ(&hz, "{s}", .{st.route.host[0..@min(st.route.host.len, webroute.MAX_HOST)]}) catch "";
         c.gtk_editable_set_text(@ptrCast(self.route_host), hb.ptr);
-        c.gtk_widget_set_sensitive(self.route_host, if (sel == 2 or sel == 3) 1 else 0);
+        c.gtk_widget_set_sensitive(self.route_host, if (choice.needsHost()) 1 else 0);
         c.gtk_widget_set_sensitive(self.route_row, if (st.route_movable) 1 else 0);
         self.route_syncing = false;
 
@@ -385,6 +380,20 @@ pub const SiteInfo = struct {
         }
 
         if (open) c.gtk_popover_popup(@ptrCast(self.popover));
+    }
+
+    /// Pre-select a host-bound route and put the caret in the host
+    /// entry: what the toolbar's route menu does for "Via server..." and
+    /// "Browser runs on...", whose one missing piece is the host. Must
+    /// follow a `refresh(.., true)` so the popover is up and the entry
+    /// can take focus.
+    pub fn preset(self: *SiteInfo, choice: webroute.Choice) void {
+        if (!self.parented) return;
+        self.route_syncing = true;
+        c.gtk_drop_down_set_selected(@ptrCast(self.route_drop), @intFromEnum(choice));
+        self.route_syncing = false;
+        c.gtk_widget_set_sensitive(self.route_host, if (choice.needsHost()) 1 else 0);
+        if (choice.needsHost()) _ = c.gtk_widget_grab_focus(self.route_host);
     }
 
     fn fillPerms(self: *SiteInfo, st: State) void {
@@ -508,24 +517,30 @@ pub const SiteInfo = struct {
     }
 };
 
-/// Route dropdown order == the switch in `refresh` / `onRouteApply`.
-const route_names = [_:null]?[*:0]const u8{
-    "Direct",
-    "Tor",
-    "Via server",
-    "Browser runs on",
+/// Route dropdown rows, in `webroute.Choice` order: the dropdown index
+/// IS the choice's integer value, so `refresh`, `preset` and
+/// `applyRoute` never carry a table of their own.
+const route_names = blk: {
+    var names: [webroute.Choice.all.len:null]?[*:0]const u8 = undefined;
+    for (webroute.Choice.all, 0..) |ch, i| names[i] = ch.label();
+    break :blk names;
 };
+
+fn selectedChoice(self: *SiteInfo) webroute.Choice {
+    const sel = c.gtk_drop_down_get_selected(@ptrCast(self.route_drop));
+    return std.enums.fromInt(webroute.Choice, sel) orelse .direct;
+}
 
 // ── row / button handlers ───────────────────────────────────────────
 
 fn onRouteChanged(_: *c.GtkWidget, _: *c.GParamSpec, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(SiteInfo, user);
     if (self.route_syncing) return;
-    const sel = c.gtk_drop_down_get_selected(@ptrCast(self.route_drop));
-    c.gtk_widget_set_sensitive(self.route_host, if (sel == 2 or sel == 3) 1 else 0);
+    const choice = selectedChoice(self);
+    c.gtk_widget_set_sensitive(self.route_host, if (choice.needsHost()) 1 else 0);
     // Direct and Tor need no host, so choosing them applies at once;
     // the host-bound ones wait for Apply (or Enter in the entry).
-    if (sel == 0 or sel == 1) applyRoute(self);
+    if (!choice.needsHost()) applyRoute(self);
 }
 
 fn onRouteApply(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
@@ -534,17 +549,18 @@ fn onRouteApply(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
 
 fn applyRoute(self: *SiteInfo) void {
     const face = webface.faceByView(self.view) orelse return;
-    const sel = c.gtk_drop_down_get_selected(@ptrCast(self.route_drop));
+    const choice = selectedChoice(self);
     const host = std.mem.span(c.gtk_editable_get_text(@ptrCast(self.route_host)));
-    const spec: webroute.Spec = switch (sel) {
-        0 => .{},
-        1 => .{ .kind = .tor, .endpoint = webface.torEndpoint() },
-        2 => .{ .kind = .mux, .host = host },
-        else => .{ .kind = .remote_browser, .host = host },
+    const spec = choice.spec(std.mem.trim(u8, host, " \t"), webface.torEndpoint()) orelse {
+        c.gtk_label_set_text(
+            @ptrCast(self.cookie_status),
+            if (choice.needsHost()) "That route needs a host (no spaces or slashes)." else "That route is not valid.",
+        );
+        return;
     };
     face.setRoute(spec) catch |err| {
         const msg: [*:0]const u8 = switch (err) {
-            error.InvalidRoute => if (sel == 2 or sel == 3) "That route needs a host." else "That route is not valid.",
+            error.InvalidRoute => "That route is not valid.",
             error.AttachedView => "This kind of tab cannot change its route.",
             error.RouteUnavailable => "That route could not be started.",
         };

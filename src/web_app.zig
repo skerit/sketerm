@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const invocation = @import("util/invocation.zig");
+const webroute = @import("web/route.zig");
 
 pub const ID_SUFFIX = ".web";
 /// The identity hardlink's name, like `sketerm-files`. The CEF helper
@@ -27,6 +28,15 @@ pub const Request = struct {
     urls: [][]u8 = &.{},
     /// `--help` / `-h`: print usage and do nothing else.
     help: bool = false,
+    /// `--route <text>`: the route every tab of this invocation is
+    /// born on, in the one grammar of `web/route.zig` (`direct` |
+    /// `tor` | `via:<host>` | `on:<host>`), owned. Null = the
+    /// configured default (`web_route`, or the container's).
+    route: ?[]u8 = null,
+    /// `--route` was given text outside the grammar (or no text at
+    /// all): the invocation must be refused with a message, never run
+    /// on the default route. Owned; the offending text.
+    bad_route: ?[]u8 = null,
 
     pub fn empty(allocator: std.mem.Allocator) Request {
         return .{ .allocator = allocator };
@@ -36,8 +46,15 @@ pub const Request = struct {
         for (self.urls) |u| self.allocator.free(u);
         if (self.urls.len > 0) self.allocator.free(self.urls);
         self.urls = &.{};
+        if (self.route) |r| self.allocator.free(r);
+        self.route = null;
+        if (self.bad_route) |r| self.allocator.free(r);
+        self.bad_route = null;
     }
 };
+
+/// What `--route` accepts, for the usage text and the refusal message.
+pub const ROUTE_GRAMMAR = "direct | tor | via:<host> | on:<host>";
 
 /// Index of the first `sketerm web` argument, or null for another
 /// entry point. Both spellings count, exactly like the file manager:
@@ -62,9 +79,35 @@ pub fn collect(allocator: std.mem.Allocator, args: []const []const u8) !?Request
         for (urls.items) |u| allocator.free(u);
         urls.deinit(allocator);
     }
-    for (args[start..]) |a| {
+    var i: usize = start;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
         if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             req.help = true;
+            continue;
+        }
+        // `--route tor` and `--route=tor`. The text is only shape-checked
+        // here (`validText`): whether `tor` can actually be dialed is
+        // the window's question, since the endpoint lives in config.
+        const route_text: ?[]const u8 = if (std.mem.eql(u8, a, "--route")) blk: {
+            i += 1;
+            break :blk if (i < args.len) args[i] else "";
+        } else if (std.mem.startsWith(u8, a, "--route="))
+            a["--route=".len..]
+        else
+            null;
+        if (route_text) |text| {
+            const owned = try allocator.dupe(u8, text);
+            // `validText` accepts "" as direct (the config default's
+            // spelling); a bare `--route` on the command line is a
+            // mistake, not a request for direct.
+            if (text.len != 0 and webroute.Spec.validText(text)) {
+                if (req.route) |old| allocator.free(old);
+                req.route = owned;
+            } else {
+                if (req.bad_route) |old| allocator.free(old);
+                req.bad_route = owned;
+            }
             continue;
         }
         if (a.len == 0 or a[0] == '-') continue;
@@ -102,4 +145,28 @@ test "collect keeps positional urls in order and skips flags" {
     try std.testing.expectEqualStrings("b.example", req.urls[1]);
 
     try std.testing.expect((try collect(alloc, &.{ "sketerm", "--version" })) == null);
+}
+
+test "collect takes --route in the one route grammar and refuses the rest" {
+    const alloc = std.testing.allocator;
+    var req = (try collect(alloc, &.{ "sketerm", "web", "--route", "tor", "https://example.com" })).?;
+    defer req.deinit();
+    try std.testing.expectEqualStrings("tor", req.route.?);
+    try std.testing.expect(req.bad_route == null);
+    try std.testing.expectEqual(@as(usize, 1), req.urls.len);
+    // The route value is never mistaken for an address.
+    try std.testing.expectEqualStrings("https://example.com", req.urls[0]);
+
+    var eq = (try collect(alloc, &.{ "sketerm-web", "--route=via:me@box", "a.example" })).?;
+    defer eq.deinit();
+    try std.testing.expectEqualStrings("via:me@box", eq.route.?);
+
+    // Outside the grammar: refused, not silently direct.
+    var bad = (try collect(alloc, &.{ "sketerm", "web", "--route", "proxy:box" })).?;
+    defer bad.deinit();
+    try std.testing.expect(bad.route == null);
+    try std.testing.expectEqualStrings("proxy:box", bad.bad_route.?);
+    var missing = (try collect(alloc, &.{ "sketerm", "web", "--route" })).?;
+    defer missing.deinit();
+    try std.testing.expectEqualStrings("", missing.bad_route.?);
 }

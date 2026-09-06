@@ -1572,19 +1572,62 @@ pub const Window = struct {
         try self.newWebTabInContainer(id, null);
     }
 
+    /// Web tab born on `route` (src/web/route.zig), `url` loaded in
+    /// that route's instance from the first request on. Unlike opening
+    /// a tab and then moving it, no request ever takes the direct path.
+    pub fn newWebTabRouted(self: *Window, url: ?[]const u8, route: @import("../web/route.zig").Spec) !void {
+        const before = self.panes.items.len;
+        try self.newShellTab("Web");
+        if (self.panes.items.len <= before) return error.TabSpawnFailed;
+        const pane = self.panes.items[self.panes.items.len - 1];
+        _ = @import("webface.zig").WebFace.attachRouted(self.allocator, pane, url, route) catch |err| {
+            logActionError("new_web_tab_routed attach", err);
+            return err;
+        };
+    }
+
+    /// `new_tor_web_tab`: a blank tab on the Tor route. A missing or
+    /// malformed `mux_tor_socks_endpoint` is said in a toast rather
+    /// than becoming a direct tab.
+    pub fn newTorWebTab(self: *Window) !void {
+        const webface = @import("webface.zig");
+        const spec = @import("../web/route.zig").Choice.tor.spec("", webface.torEndpoint()) orelse {
+            showToast(self, "Tor is not configured: mux_tor_socks_endpoint must be a host:port.");
+            return error.InvalidRoute;
+        };
+        try self.newWebTabRouted(null, spec);
+    }
+
     /// Fill this window with the web tabs a `sketerm web [urls...]`
     /// invocation asked for: one tab per address, or a single blank tab
-    /// (address entry focused) when none were given.
-    pub fn openWebTabs(self: *Window, urls: []const []u8) !void {
-        if (urls.len == 0) return self.newWebTabAt(null);
-        for (urls) |url| try self.newWebTabAt(url);
+    /// (address entry focused) when none were given. `route` is the
+    /// `--route` text every tab is born on; null = the configured
+    /// default. Text outside the grammar was refused by the CLI parser,
+    /// so a null here after a non-null text can only be a Tor endpoint
+    /// that stopped being valid, and that is refused too.
+    pub fn openWebTabs(self: *Window, urls: []const []u8, route: ?[]const u8) !void {
+        const webroute = @import("../web/route.zig");
+        const spec: ?webroute.Spec = if (route) |r|
+            webroute.Spec.parse(r, @import("webface.zig").torEndpoint()) orelse {
+                showToast(self, "That --route cannot be started: check mux_tor_socks_endpoint.");
+                return error.InvalidRoute;
+            }
+        else
+            null;
+        if (urls.len == 0) {
+            if (spec) |s| return self.newWebTabRouted(null, s);
+            return self.newWebTabAt(null);
+        }
+        for (urls) |url| {
+            if (spec) |s| try self.newWebTabRouted(url, s) else try self.newWebTabAt(url);
+        }
     }
 
     /// A repeat launch of the browser identity (`sketerm web` again):
     /// another web window, the way a browser behaves.
-    pub fn openWebWindow(self: *Window, urls: []const []u8) !*Window {
+    pub fn openWebWindow(self: *Window, urls: []const []u8, route: ?[]const u8) !*Window {
         const win = self.spawnSecondaryWindow() orelse return error.WindowSpawnFailed;
-        try win.openWebTabs(urls);
+        try win.openWebTabs(urls, route);
         return win;
     }
 
@@ -1634,7 +1677,7 @@ pub const Window = struct {
     /// A palette verb that only means something on a pane wearing the
     /// WEB face. A pane without one is told so, rather than left
     /// wondering why the action did nothing.
-    pub fn webFaceAction(self: *Window, what: enum { devtools, print_pdf, fill_password, site_info }) void {
+    pub fn webFaceAction(self: *Window, what: enum { devtools, print_pdf, fill_password, site_info, route_menu, route_direct, route_tor }) void {
         const pane = self.focusedPane() orelse return;
         const face = @import("webface.zig").WebFace.fromPane(pane) orelse {
             showToast(self, "This pane has no web page. Use New Web Tab.");
@@ -1645,6 +1688,9 @@ pub const Window = struct {
             .print_pdf => face.printToPdf(),
             .fill_password => face.fillPassword(),
             .site_info => face.showSiteInfo(),
+            .route_menu => face.showRouteMenu(face.route_btn),
+            .route_direct => face.chooseRoute(.direct),
+            .route_tor => face.chooseRoute(.tor),
         }
     }
 
@@ -4395,6 +4441,10 @@ fn onShortcut(ctx: ?*anyopaque, action: @import("input.zig").Action) void {
             self.newWebTab() catch |err| logActionError("new_web_tab", err),
         .new_web_split => self.newWebSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch |err| logActionError("new_web_split", err),
         .new_incognito_web_tab => self.newIncognitoWebTab() catch |err| logActionError("new_incognito_web_tab", err),
+        .new_tor_web_tab => self.newTorWebTab() catch |err| logActionError("new_tor_web_tab", err),
+        .web_route_menu => self.webFaceAction(.route_menu),
+        .web_route_direct => self.webFaceAction(.route_direct),
+        .web_route_tor => self.webFaceAction(.route_tor),
         // Only reached when the focused pane shows NO web face (the
         // pane-local dispatch consumes it otherwise).
         .web_hints => showToast(self, "This pane shows no web page. Use New Web Tab."),

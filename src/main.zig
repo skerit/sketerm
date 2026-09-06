@@ -139,6 +139,9 @@ const WEB_HELP =
     \\                         opt-in browser helper (zig build
     \\                         fetch-cef && zig build web); without it
     \\                         the window still opens and says so.
+    \\                         --route tor|direct|via:<host>|on:<host>
+    \\                         picks the tabs' network route (see
+    \\                         `sketerm web --help`).
     \\
 ;
 
@@ -173,11 +176,21 @@ const EDIT_USAGE =
 
 /// `sketerm web --help`; see FILES_USAGE.
 const WEB_USAGE =
-    \\Usage: sketerm web [urls...]
+    \\Usage: sketerm web [--route <route>] [urls...]
     \\
     \\
 ++ WEB_HELP ++
     \\
+    \\  --route <route>        Network route every tab of this invocation
+    \\                         is born on: direct | tor | via:<host> |
+    \\                         on:<host>. `tor` dials mux_tor_socks_endpoint
+    \\                         (127.0.0.1:9050 by default); via:<host>
+    \\                         egresses through that mux/SSH host; on:<host>
+    \\                         runs the browser there. The page is never
+    \\                         loaded directly first. Default: web_route
+    \\                         from config, or the container's route. The
+    \\                         same choices are on the toolbar's route
+    \\                         button once the tab is open.
     \\  --help, -h             Show this message
     \\
 ;
@@ -637,6 +650,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             _ = c.fputs(WEB_USAGE, platform.stdout());
             return 0;
         }
+        // A route outside the grammar must not run on the default one:
+        // the whole point of `--route tor` is that nothing goes direct.
+        if (req.bad_route) |bad| {
+            var msg: [512]u8 = undefined;
+            const line = std.fmt.bufPrintZ(&msg, "sketerm web: --route {s}: expected {s}\n", .{ bad, web_app.ROUTE_GRAMMAR }) catch "sketerm web: bad --route\n";
+            _ = c.fputs(line.ptr, platform.stderr());
+            req.deinit();
+            return 2;
+        }
         g_app.mode = .web;
         g_app.web_request = req;
         Window.setWebIdentity();
@@ -940,8 +962,18 @@ fn onCommandLine(app: ?*c.GApplication, cmdline: ?*c.GApplicationCommandLine, _:
             args[index] = std.mem.span(@as([*:0]const u8, @ptrCast(raw)));
         }
         if (web_app.collect(g_app.allocator, args) catch null) |parsed| {
+            var req = parsed;
+            // Same refusal as the first instance's: a route outside
+            // the grammar opens nothing, on the invoker's stderr.
+            if (req.bad_route) |bad| {
+                var msg: [512]u8 = undefined;
+                const line = std.fmt.bufPrintZ(&msg, "sketerm web: --route {s}: expected {s}\n", .{ bad, web_app.ROUTE_GRAMMAR }) catch "sketerm web: bad --route\n";
+                c.g_application_command_line_printerr(cmdline, "%s", line.ptr);
+                req.deinit();
+                return 2;
+            }
             if (g_app.web_request) |*old| old.deinit();
-            g_app.web_request = parsed;
+            g_app.web_request = req;
         }
     } else if (g_app.mode == .viewer) {
         const args = g_app.allocator.alloc([]const u8, @intCast(argc)) catch return 1;
@@ -1089,7 +1121,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         } else if (g_app.mode == .web) {
             var req = takeWebRequest();
             defer req.deinit();
-            _ = primary.openWebWindow(req.urls) catch |err|
+            _ = primary.openWebWindow(req.urls, req.route) catch |err|
                 std.debug.print("sketerm: web window failed: {s}\n", .{@errorName(err)});
         } else {
             _ = primary.openShellWindow() catch |err|
@@ -1147,7 +1179,7 @@ fn onActivate(app: ?*c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         // The web tabs ARE the window's content: no stray shell tab.
         var req = takeWebRequest();
         defer req.deinit();
-        window.openWebTabs(req.urls) catch |err| {
+        window.openWebTabs(req.urls, req.route) catch |err| {
             std.debug.print("sketerm: web tab failed: {s}\n", .{@errorName(err)});
             return;
         };

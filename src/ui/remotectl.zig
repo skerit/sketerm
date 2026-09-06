@@ -1107,6 +1107,7 @@ fn paneRoute(action: input.Action) PaneRoute {
         .new_web_tab,
         .new_editor_tab,
         .new_incognito_web_tab,
+        .new_tor_web_tab,
         .new_durable_tab,
         .restore_closed_tab,
         .next_tab,
@@ -1176,6 +1177,9 @@ fn paneRoute(action: input.Action) PaneRoute {
         .web_print_pdf,
         .web_fill_password,
         .web_site_info,
+        .web_route_menu,
+        .web_route_direct,
+        .web_route_tor,
         .web_history,
         .web_bookmarks,
         .panel_open,
@@ -1364,7 +1368,7 @@ fn webCmd(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList(u8), all
                 return ipc_protocol.writeErr(out, allocator, "no pane to split");
             try win.newWebSplitOn(source, c.GTK_ORIENTATION_HORIZONTAL);
         } else if (eql(u8, where, "window")) {
-            host = try win.openWebWindow(&.{});
+            host = try win.openWebWindow(&.{}, null);
         } else {
             try win.newWebTabAt(null);
         }
