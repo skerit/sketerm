@@ -452,17 +452,22 @@ pub fn applyFolderMemory(self: *BrowserView, tab: *BTab) void {
     tab.vs.grouped = rec.grouped;
     tab.vs.zoom = @min(rec.zoom, ZOOM_STEPS.len - 1);
     tab.name_width = rec.name_width;
-    if (rec.columns.len > 0) {
-        tab.columns = .initEmpty();
-        for (rec.columns) |col| tab.columns.insert(col);
-        // Widths are positional against rec.columns; a navigation
-        // reuses the tab, so widths from the previous folder must not
-        // bleed into this one.
-        tab.col_widths = .initFill(0);
-        for (rec.columns, 0..) |col, i| {
-            if (i >= rec.col_widths.len) break;
-            if (rec.col_widths[i] > 0) tab.col_widths.set(col, rec.col_widths[i]);
-        }
+    // Widths are positional against rec.columns; a navigation reuses
+    // the tab, so widths from the previous folder must not bleed into
+    // this one. Neither may its column SET: an empty record means the
+    // built-in default set (the record's own contract), and skipping
+    // the whole block for it left the previous folder's columns on
+    // screen under the new folder's rows.
+    tab.col_widths = .initFill(0);
+    if (rec.columns.len == 0) {
+        tab.columns = .initMany(&browser_model.default_columns);
+        return;
+    }
+    tab.columns = .initEmpty();
+    for (rec.columns) |col| tab.columns.insert(col);
+    for (rec.columns, 0..) |col, i| {
+        if (i >= rec.col_widths.len) break;
+        if (rec.col_widths[i] > 0) tab.col_widths.set(col, rec.col_widths[i]);
     }
 }
 
