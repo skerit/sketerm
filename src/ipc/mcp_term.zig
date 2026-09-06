@@ -964,6 +964,22 @@ pub fn remoteShLine(arena: std.mem.Allocator, script: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "echo {s} | base64 -d | sh", .{b64});
 }
 
+/// Full ssh argv running `script` on `host`, honouring the host's
+/// forced route.
+///
+/// The one builder for every one-shot remote script leg of the transfer
+/// tools: hand-assembling the argv is how `scp_get`'s checksum leg came
+/// to pass a `tor:` alias straight to ssh as a hostname, so a Tor
+/// download could never verify and always kept its partial.
+pub fn remoteShArgv(arena: std.mem.Allocator, host: []const u8, script: []const u8) ![]const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    errdefer argv.deinit(arena);
+    try argv.appendSlice(arena, &.{ "ssh", "-o", "BatchMode=yes" });
+    const dest = try appendRoute(arena, &argv, host, false);
+    try argv.appendSlice(arena, &.{ dest, try remoteShLine(arena, script) });
+    return argv.toOwnedSlice(arena);
+}
+
 /// Find a 64-char lowercase-hex token in text (remote sha output).
 pub fn findHex64(text: []const u8) ?[]const u8 {
     var i: usize = 0;
@@ -1068,13 +1084,9 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
                 "SK_TMP={s}\nSK_DST={s}\nsha=$(sha256sum \"$SK_TMP\" 2>/dev/null | cut -c1-64) || sha=fail\nif [ \"$sha\" = \"{s}\" ]; then {s}; else echo \"SK_SHA:$sha\"; rm -f \"$SK_TMP\"; fi\n",
                 .{ try quoted(arena, tmp), try quoted(arena, remote), local_sha, verify_layer },
             );
-            var move_argv: std.ArrayList([]const u8) = .empty;
-            defer move_argv.deinit(arena);
-            try move_argv.appendSlice(arena, &.{ "ssh", "-o", "BatchMode=yes" });
-            const move_dest = appendRoute(arena, &move_argv, h, false) catch
+            const move_argv = remoteShArgv(arena, h, script) catch
                 return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
-            try move_argv.appendSlice(arena, &.{ move_dest, try remoteShLine(arena, script) });
-            switch (try runArgvTerm(arena, move_argv.items, 60_000)) {
+            switch (try runArgvTerm(arena, move_argv, 60_000)) {
                 .err => |e| return mcp.errRes(arena, .unavailable, e),
                 .run => |r| {
                     if (std.mem.indexOf(u8, r.output, "SK_MOVED") != null)
@@ -1110,7 +1122,9 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         const part_sha = sha256File(part) orelse return mcp.errRes(arena, .io_failed, "downloaded file vanished before hashing");
         const bytes = fileSize(part);
         const script = try std.fmt.allocPrint(arena, "sha256sum {s} 2>/dev/null | cut -c1-64\n", .{try quoted(arena, remote)});
-        switch (try runArgvTerm(arena, &.{ "ssh", "-o", "BatchMode=yes", h, try remoteShLine(arena, script) }, 30_000)) {
+        const verify_argv = remoteShArgv(arena, h, script) catch
+            return mcp.errRes(arena, .refused, "cannot build the forced route for this host");
+        switch (try runArgvTerm(arena, verify_argv, 30_000)) {
             .err => |e| return mcp.errRes(arena, .unavailable, e),
             .run => |r| {
                 const remote_sha = findHex64(r.output) orelse
@@ -1404,6 +1418,30 @@ test "scp_put result: transfer facts structured, one prose line" {
     const down = try xferOk(arena, "download", "/tmp/x.bin", null, sha);
     const dparsed = try mcp.expectToolResultShape(arena, "scp_get", down);
     try t.expectEqual(std.json.Value{ .null = {} }, dparsed.object.get("structuredContent").?.object.get("bytes").?);
+}
+
+test "remoteShArgv keeps a forced route off the ssh destination" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // A plain host is its own destination, second-to-last in the argv.
+    const plain = try remoteShArgv(arena, "box", "true\n");
+    try t.expectEqualStrings("box", plain[plain.len - 2]);
+
+    // A `tor:` alias is NOT a hostname: it must be resolved to the bare
+    // host with the route's options in front of it. scp_get's checksum
+    // leg used to hand ssh the literal alias, so every Tor download
+    // failed to verify and kept its partial.
+    const routed = try remoteShArgv(arena, "tor:box", "true\n");
+    try t.expectEqualStrings("box", routed[routed.len - 2]);
+    for (routed) |a| try t.expect(std.mem.indexOf(u8, a, "tor:") == null);
+    var proxied = false;
+    for (routed) |a| {
+        if (std.mem.indexOf(u8, a, "ProxyCommand") != null) proxied = true;
+    }
+    try t.expect(proxied);
 }
 
 test "every tool this module serves declares an output schema" {
