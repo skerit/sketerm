@@ -381,14 +381,24 @@ pub fn beginPaste(
     defer existing.deinit(self.allocator);
     for (tab.root.entries.items) |entry|
         existing.put(self.allocator, entry.name, entry.tdir) catch {};
+    var duplicated: usize = 0;
     for (srcs) |src| {
         const base = std.fs.path.basename(src);
         var dst_buf: [4096]u8 = undefined;
         const dst = std.fmt.bufPrint(&dst_buf, "{s}/{s}", .{
             if (dst_dir.len == 1) "" else dst_dir, base,
         }) catch continue;
-        // Pasting onto itself is a no-op, not a copy/move.
-        if (hostEq(src_host, tab.hc.host) and std.mem.eql(u8, src, dst)) continue;
+        // Pasting an entry into its own folder: a move is a no-op, a
+        // copy lands beside the original under a free name ("x (copy)"),
+        // the way every file manager answers Ctrl+C, Ctrl+V in place.
+        // It used to be a silent "nothing to paste here" for both.
+        if (hostEq(src_host, tab.hc.host) and std.mem.eql(u8, src, dst)) {
+            if (!cut) {
+                duplicateEntry(self, tab, src);
+                duplicated += 1;
+            }
+            continue;
+        }
         const src_owned = self.allocator.dupe(u8, src) catch continue;
         const dst_owned = self.allocator.dupe(u8, dst) catch {
             self.allocator.free(src_owned);
@@ -405,7 +415,10 @@ pub fn beginPaste(
     }
     if (run.items.items.len == 0) {
         run.destroy(self.allocator);
-        self.setStatus("nothing to paste here");
+        if (duplicated > 0)
+            self.setStatusFmt("duplicating {d} item(s) in place", .{duplicated})
+        else
+            self.setStatus("nothing to paste here");
         return;
     }
     run.total = run.items.items.len;
