@@ -293,6 +293,24 @@ pub fn findAll(
         }
     }
 
+    // Overlapping hits are not distinct results. `scanWindow` steps one
+    // byte at a time (it has to: the window retains only needle.len-1
+    // bytes across a leaf seam), so "aa" in "aaaa" comes out three
+    // times. Regex mode already advances to `m.end`, and every consumer
+    // downstream skips the overlaps — which is how the find bar came to
+    // say "3 matches" and Replace All then "replaced 2".
+    {
+        var w: usize = 0;
+        var prev_end: usize = 0;
+        for (out.items) |m| {
+            if (w > 0 and m.start < prev_end) continue;
+            out.items[w] = m;
+            prev_end = m.end;
+            w += 1;
+        }
+        out.shrinkRetainingCapacity(w);
+    }
+
     if (opts.whole_word) {
         var w: usize = 0;
         for (out.items) |m| {
@@ -401,6 +419,26 @@ test "search: whole word filters substrings" {
     try testing.expectEqual(@as(usize, 2), ww.len);
     try testing.expectEqual(@as(usize, 0), ww[0].start);
     try testing.expectEqual(@as(usize, 13), ww[1].start);
+}
+
+test "search: a literal needle does not report overlapping matches" {
+    // Regex mode advances to the match end, and every consumer skips
+    // overlaps, so a literal that overlapped itself made the find bar's
+    // count disagree with what Replace All actually rewrote.
+    const a = testing.allocator;
+    var doc = try docOf("aaaa");
+    defer doc.deinit();
+    const m = try findAll(a, &doc, "aa", .{});
+    defer a.free(m);
+    try testing.expectEqual(@as(usize, 2), m.len);
+    try testing.expectEqual(@as(usize, 0), m[0].start);
+    try testing.expectEqual(@as(usize, 2), m[1].start);
+
+    var rx = try Regex.init(a, "aa", .{ .regex = true });
+    defer rx.deinit();
+    const rm = try rx.findAll(&doc);
+    defer a.free(rm);
+    try testing.expectEqual(m.len, rm.len);
 }
 
 test "search: whole word looks at the codepoint BEFORE a near-start match" {
