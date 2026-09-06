@@ -1193,6 +1193,17 @@ pub const BrowserView = struct {
     /// phase, which is the normal path. Only focus sitting in ANOTHER
     /// pane is pulled over, and the location face that pane was
     /// editing folds back so exactly one address bar is ever open.
+    /// The face just mapped: give the listing the keyboard when the
+    /// window has no focus widget at all (a fresh window). A re-map on
+    /// a tab switch or un-zoom leaves a focus held elsewhere alone.
+    fn onRootMapped(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(BrowserView, user);
+        if (self.widgets_dead) return;
+        const root = c.gtk_widget_get_root(self.root_box) orelse return;
+        if (c.gtk_root_get_focus(root) != null) return;
+        self.focusListing();
+    }
+
     fn onFaceClicked(_: *c.GtkGestureClick, _: c_int, _: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(BrowserView, user);
         if (self.widgets_dead) return;
@@ -1851,6 +1862,11 @@ pub const BrowserView = struct {
         // The fence for every deferred callback below: see
         // `widgets_dead`.
         _ = c.g_signal_connect_data(vbox, "destroy", @ptrCast(&onRootDestroy), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        // The first navigation commits before the face is mapped, and an
+        // unmapped listing cannot take focus, so a fresh Files window
+        // opened with nothing focused: Ctrl+L, type-ahead and every
+        // chord went nowhere until a click. Focus once the face maps.
+        _ = c.g_signal_connect_data(vbox, "map", @ptrCast(&onRootMapped), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
 
         self.root_box = vbox;
         self.notebook = self.tabhost.notebook;

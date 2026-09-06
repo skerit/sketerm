@@ -7155,13 +7155,12 @@ fn filesBrowserBugsStage(
     say("files bugs: the status count named the hidden entry instead of counting it");
 
     // -- 2. a trash is reported as a trash, not as a copy of N bytes --
-    // Focus the listing with a click on empty space, type-ahead to the
-    // row, Delete.
+    // No click first: a fresh Files window must already hold the
+    // keyboard on its listing (it used to open with nothing focused, so
+    // type-ahead and every chord went nowhere until a click).
     const win = app.winById(child.win) orelse return "files bugs: window vanished";
     const w = @as(f64, @floatFromInt(win.w));
     const h = @as(f64, @floatFromInt(win.h));
-    app.clickEx(child.win, w * 0.58, h * 0.8, 1, 60, 1) catch return "files bugs: focusing the listing failed";
-    pumpRenameFor(app, 300);
     app.pressKey(child.win, "a") catch return "files bugs: type-ahead failed";
     pumpRenameFor(app, 300);
     app.pressKey(child.win, "Delete") catch return "files bugs: Delete failed";
