@@ -1008,6 +1008,7 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             // diff_pct is computed inside that rect only.
             const st = app.diffStats(win_id, region) catch
                 return errRes(arena, .not_found, "no such window / no pixels yet");
+            if (eql(u8, name, "get_app_state")) try addAppSummary(&res, arena, app);
             try res.fact("window", win_id);
             try res.fact("changed", st.changed);
             try res.fact("diff_pct", st.diff_pct);

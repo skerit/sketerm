@@ -6704,6 +6704,39 @@ test "app tools speak both lanes: windows, wait, pointer and the roster" {
     try t.expectEqualStrings("not_found", mparsed.object.get("structuredContent").?.object.get("error").?.object.get("code").?.string);
 }
 
+test "get_app_state stats_only still reports the app it describes" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    app_state.ready = true;
+    try app_state.apps.put(t.allocator, 1, fixture.app);
+    defer {
+        Journal.deinitAll();
+        LogDelta.deinitAll();
+        MacroNudge.deinitAll();
+        _ = app_state.apps.fetchSwapRemove(1);
+        app_state.apps.deinit(t.allocator);
+        app_state.apps = .empty;
+        app_state.ready = false;
+    }
+
+    // stats_only is a documented get_app_state option, and this tool's
+    // schema requires `app`: the cheap-probe exit skipped the app
+    // summary that the image and burst exits both emit.
+    const args = try parseTestValue(arena, "{\"app\":1,\"window\":1,\"stats_only\":true}");
+    const result = try @import("mcp_app.zig").appTool(arena, "get_app_state", args);
+    const parsed = try expectToolResultShape(arena, "get_app_state", result);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 1), sc.get("app").?.integer);
+    try t.expectEqual(@as(i64, 1), sc.get("window").?.integer);
+    try t.expect(!sc.get("exited").?.bool);
+    try t.expect(sc.get("diff_scope") != null);
+}
+
 test "the no-JSON text rule is scoped to a result's own prose" {
     const t = std.testing;
     // Prose only: the whole lane is checked.
