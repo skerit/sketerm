@@ -341,6 +341,14 @@ pub const PickerWindow = struct {
         var h: c_int = 700;
         if (parent) |p| {
             c.gtk_window_set_transient_for(self.window, p);
+            // Transient alone does NOT make GTK4 destroy us with the
+            // parent — it only clears the link. Without this the picker
+            // outlives the window that owns `cb_ctx` (the prefs dialog
+            // frees its Ctx at finalize, a Pane is torn down), and the
+            // next pick delivers a result into freed memory. With it,
+            // `onWindowDestroy` fires inside the parent's own destroy
+            // and hands every caller the null it already handles.
+            c.gtk_window_set_destroy_with_parent(self.window, 1);
             const pw = c.gtk_widget_get_width(@ptrCast(@alignCast(p)));
             const ph = c.gtk_widget_get_height(@ptrCast(@alignCast(p)));
             if (pw > 300) w = @divTrunc(pw * 8, 10);
