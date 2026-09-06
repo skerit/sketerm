@@ -5654,51 +5654,64 @@ fn runDeleteTree(spec: Spec) u8 {
 
 /// Post-order removal. Progress counts ENTRIES (files + dirs), since
 /// byte totals mean nothing for deletion. Stack-recursive over path
-/// depth (bounded by PATH_MAX/2 components).
+/// depth; the wide-directory retry is a LOOP, because as recursion it
+/// grew the stack per batch and, on a directory that cannot drain, per
+/// batch for ever. A directory that is readable but not SEARCHABLE
+/// (mode 0444) is exactly that: readdir lists its 2500+ names, every
+/// lstat fails with EACCES, nothing is removed, and the old
+/// `if (overflow) return deleteTreeDir(...)` re-ran the identical pass
+/// until the 64 KiB-per-frame buffer overflowed the stack and took the
+/// job helper down mid-delete. No progress in a pass is a failure.
 fn deleteTreeDir(dir_path: []const u8, progress: *Progress) bool {
     var z: [4096]u8 = undefined;
     const dz = pathz.pathZ(&z, dir_path) catch return false;
-    const dir = c.opendir(dz) orelse return false;
-    // Collect names first: unlink-during-readdir is UB on some libcs.
-    var names_buf: [64 * 1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&names_buf);
-    var names: std.ArrayList([]u8) = .empty;
-    var overflow = false;
-    while (c.readdir(dir)) |de| {
-        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
-        if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-        const owned = fba.allocator().dupe(u8, name) catch {
-            overflow = true;
-            break;
-        };
-        names.append(fba.allocator(), owned) catch {
-            overflow = true;
-            break;
-        };
-    }
-    _ = c.closedir(dir);
-
-    for (names.items) |name| {
-        var fbuf: [4096]u8 = undefined;
-        var w = std.Io.Writer.fixed(&fbuf);
-        w.print("{s}/{s}", .{ dir_path, name }) catch return false;
-        const full = w.buffered();
-        var zf: [4096]u8 = undefined;
-        const fz = pathz.pathZ(&zf, full) catch return false;
-        var st: c.struct_stat = undefined;
-        if (c.lstat(fz, &st) != 0) continue;
-        if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
-            if (!deleteTreeDir(full, progress)) return false;
-        } else {
-            progress.setFile(full);
-            if (c.unlink(fz) != 0) return false;
-            progress.done += 1;
-            if (!progress.entryDone()) return false;
+    while (true) {
+        const dir = c.opendir(dz) orelse return false;
+        // Collect names first: unlink-during-readdir is UB on some libcs.
+        var names_buf: [64 * 1024]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&names_buf);
+        var names: std.ArrayList([]u8) = .empty;
+        var overflow = false;
+        while (c.readdir(dir)) |de| {
+            const name = std.mem.span(@as([*:0]const u8, @ptrCast(&de.*.d_name)));
+            if (name.len == 0 or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
+            const owned = fba.allocator().dupe(u8, name) catch {
+                overflow = true;
+                break;
+            };
+            names.append(fba.allocator(), owned) catch {
+                overflow = true;
+                break;
+            };
         }
+        _ = c.closedir(dir);
+
+        var removed: usize = 0;
+        for (names.items) |name| {
+            var fbuf: [4096]u8 = undefined;
+            var w = std.Io.Writer.fixed(&fbuf);
+            w.print("{s}/{s}", .{ dir_path, name }) catch return false;
+            const full = w.buffered();
+            var zf: [4096]u8 = undefined;
+            const fz = pathz.pathZ(&zf, full) catch return false;
+            var st: c.struct_stat = undefined;
+            if (c.lstat(fz, &st) != 0) continue;
+            if ((st.st_mode & c.S_IFMT) == c.S_IFDIR) {
+                if (!deleteTreeDir(full, progress)) return false;
+            } else {
+                progress.setFile(full);
+                if (c.unlink(fz) != 0) return false;
+                progress.done += 1;
+                if (!progress.entryDone()) return false;
+            }
+            removed += 1;
+        }
+        // A directory too wide for the name buffer: re-read this level
+        // until it drains, batches of ~what fits. A pass that removed
+        // nothing never will, so it stops rather than spins.
+        if (!overflow) break;
+        if (removed == 0) return false;
     }
-    // A directory too wide for the name buffer: re-run this level
-    // until it drains (batches of ~what fits).
-    if (overflow) return deleteTreeDir(dir_path, progress);
     progress.setFile(dir_path);
     if (c.rmdir(dz) != 0) return false;
     progress.done += 1;
@@ -6817,4 +6830,43 @@ test "digest cache survives our own rename but drops foreign changes" {
         .ctime_ns = 11,
     });
     try t.expectEqual(@as(usize, 0), list.items.len);
+}
+
+test "a wide directory that cannot drain fails instead of spinning" {
+    const t = std.testing;
+    if (c.geteuid() == 0) return error.SkipZigTest; // root ignores the mode
+    const td = pathz.TempDir.make("fsjob-wide") orelse return error.SkipZigTest;
+    defer td.remove();
+
+    var z: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&z);
+    try w.print("{s}/wide", .{td.path()});
+    const wide = w.buffered();
+    var wz: [4096:0]u8 = undefined;
+    const widez = try pathz.pathZ(&wz, wide);
+    if (c.mkdir(widez, 0o755) != 0) return error.SkipZigTest;
+
+    // More names than the 64 KiB batch buffer holds, so the drain
+    // loop runs at all.
+    var i: usize = 0;
+    while (i < 3000) : (i += 1) {
+        var nb: [4096]u8 = undefined;
+        var nw = std.Io.Writer.fixed(&nb);
+        try nw.print("{s}/f{d:0>6}.dat", .{ wide, i });
+        var nz: [4096:0]u8 = undefined;
+        const namez = try pathz.pathZ(&nz, nw.buffered());
+        const fd = c.open(namez, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+        if (fd < 0) return error.SkipZigTest;
+        _ = c.close(fd);
+    }
+    // Readable but NOT searchable: readdir lists every name, every
+    // lstat fails, nothing can be removed. The retry used to recurse
+    // on the identical pass with a 64 KiB frame each time, until the
+    // job helper died on the stack.
+    if (c.chmod(widez, 0o444) != 0) return error.SkipZigTest;
+    var progress = Progress{};
+    const ok = deleteTreeDir(wide, &progress);
+    _ = c.chmod(widez, 0o755);
+    try t.expect(!ok);
+    try t.expectEqual(@as(u64, 0), progress.entries_done);
 }
