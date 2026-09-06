@@ -4026,13 +4026,24 @@ pub const Screen = struct {
     /// the image-cell row/column from its diacritics, applying the
     /// auto-increment rule (a diacritic-less cell continues the previous
     /// tile to its right), then emits a one-cell crop of the image.
+    /// Compose a placeholder's image id: the foreground supplies the low
+    /// three bytes and the optional third diacritic the high one. That
+    /// diacritic is an INDEX into a 297-entry table, so a malformed cell
+    /// can name an index above 255 — shifting it would push bits out of
+    /// the u32 and select a different image. Ignore it instead.
+    fn placeholderImageId(fg_id: u32, diac_hi: ?u32) u32 {
+        const hi = diac_hi orelse return fg_id;
+        if (hi > 0xFF) return fg_id;
+        return fg_id | (hi << 24);
+    }
+
     fn flushPlaceholder(self: *Screen) void {
         const pp = self.ph_pending orelse return;
         self.ph_pending = null;
 
         var image_id = pp.image_id;
         // 3rd diacritic carries the most-significant byte of the id.
-        if (pp.n_diac >= 3) image_id |= pp.diac[2] << 24;
+        if (pp.n_diac >= 3) image_id = placeholderImageId(image_id, pp.diac[2]);
         if (image_id == 0) {
             self.ph_last = null;
             return;
@@ -9047,6 +9058,15 @@ test "a combining mark after a scroll does not attach to the blanked row" {
     s.lineFeed(); // 'a' scrolls up; row 1 is blank again
     s.printCp(0x0301);
     try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
+}
+
+test "an out-of-range placeholder diacritic does not corrupt the image id" {
+    // The third diacritic is the id's most significant BYTE; the
+    // diacritic table runs to 296, so shifting the raw index moves bits
+    // out of the u32 and names a different image.
+    try std.testing.expectEqual(@as(u32, 5), Screen.placeholderImageId(5, 296));
+    try std.testing.expectEqual(@as(u32, 5 | (2 << 24)), Screen.placeholderImageId(5, 2));
+    try std.testing.expectEqual(@as(u32, 5), Screen.placeholderImageId(5, null));
 }
 
 test "a kitty cell extent past i32 max stays a positive rectangle" {
