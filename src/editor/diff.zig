@@ -165,12 +165,18 @@ fn lineMyers(
             }
             v[@intCast(k + off)] = x;
             if (x >= @as(isize, @intCast(n)) and y >= @as(isize, @intCast(m))) {
-                try trace.append(alloc, try alloc.dupe(isize, v));
+                // The snapshot is only owned once the append takes it;
+                // a failing append would otherwise drop it on the floor.
+                const snap = try alloc.dupe(isize, v);
+                errdefer alloc.free(snap);
+                try trace.append(alloc, snap);
                 found_d = d;
                 break :outer;
             }
         }
-        try trace.append(alloc, try alloc.dupe(isize, v));
+        const snap = try alloc.dupe(isize, v);
+        errdefer alloc.free(snap);
+        try trace.append(alloc, snap);
     }
     const final_d = found_d orelse return false;
 
@@ -293,10 +299,10 @@ pub fn reloadFromBytes(
     const old = try doc.textAlloc(alloc);
     defer alloc.free(old);
 
-    doc.line_ending = style;
     const edits = try diff(alloc, old, norm);
     defer if (edits.len > 0) alloc.free(edits);
     if (edits.len == 0) {
+        doc.line_ending = style;
         doc.markSaved();
         return false;
     }
@@ -312,6 +318,10 @@ pub fn reloadFromBytes(
     else
         null;
     _ = try doc.applyTransactionSel(&tx, snap);
+    // Only now: a failure above leaves the OLD content, and switching
+    // the style anyway would have made the next save rewrite every line
+    // ending of a file the user never edited.
+    doc.line_ending = style;
     if (sels) |set| set.mapThrough(edits, .other);
     doc.markSaved();
     return true;
@@ -527,6 +537,41 @@ test "reloadFromBytes: selections map through, style re-detected" {
     const out = try doc.materialize(a);
     defer a.free(out);
     try testing.expectEqualStrings("aaa\r\nNEW\r\nbbb\r\nccc\r\n", out);
+}
+
+test "reloadFromBytes: a failed reload keeps the old style with the old text" {
+    // The style was assigned before the fallible diff+apply, so a
+    // failure left LF content declared CRLF and the next save rewrote
+    // every line ending of a file the user never edited.
+    // Backed by an arena, not the testing allocator: `Rope.insert` and
+    // `Rope.delete` null the root before their fallible split/join and
+    // are therefore NOT allocation-atomic, which is a separate defect
+    // this test is not about. The arena keeps that from masquerading as
+    // a leak here.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var idx: usize = 0;
+    var saw_failure = false;
+    while (idx < 60) : (idx += 1) {
+        var failing = std.testing.FailingAllocator.init(arena.allocator(), .{ .fail_index = idx });
+        const a = failing.allocator();
+        var doc = Document.initFromBytes(a, "alpha\nbeta\ngamma\n") catch continue;
+        defer doc.deinit();
+        const before = doc.textAlloc(testing.allocator) catch continue;
+        defer testing.allocator.free(before);
+
+        _ = reloadFromBytes(a, &doc, "alpha\r\nBETA\r\ngamma\r\n", null) catch {
+            saw_failure = true;
+            const after = doc.textAlloc(testing.allocator) catch continue;
+            defer testing.allocator.free(after);
+            // Whatever failed, style and content must still agree.
+            if (std.mem.eql(u8, before, after))
+                try testing.expectEqual(doc_mod.LineEnding.lf, doc.line_ending);
+            continue;
+        };
+        try testing.expectEqual(doc_mod.LineEnding.crlf, doc.line_ending);
+    }
+    try testing.expect(saw_failure);
 }
 
 test "reloadFromBytes: identical content is a no-op that re-baselines" {
