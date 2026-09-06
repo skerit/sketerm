@@ -206,17 +206,24 @@ pub const Pty = struct {
         // terminfo `Sixel` flag (when set via `term = ` in config).
         _ = c.setenv("KITTY_WINDOW_ID", "1", 1);
         // Remote control: lets `sketerm cli` inside the terminal find
-        // the socket and self-address its own pane.
+        // the socket and self-address its own pane. "Not exported" must
+        // mean ABSENT, not inherited: the daemon itself is often started
+        // from inside a pane (an MCP server's private daemon, an
+        // autostart from a shell), and a child that inherits THAT pane's
+        // identity makes `sketerm mux attach` in a headless terminal take
+        // over the user's live pane.
         if (opts.pane_id != 0) {
             var id_buf: [16]u8 = undefined;
             if (std.fmt.bufPrintZ(&id_buf, "{d}", .{opts.pane_id})) |s| {
                 _ = c.setenv("SKETERM_PANE_ID", s.ptr, 1);
             } else |_| {}
+        } else {
+            _ = c.unsetenv("SKETERM_PANE_ID");
         }
-        if (opts.session_name) |sn| _ = c.setenv("SKETERM_SESSION", sn, 1);
-        if (opts.session_origin_id) |id| _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", id, 1);
-        if (opts.mux_socket_path) |sp| _ = c.setenv("SKETERM_MUX_SOCKET", sp, 1);
-        if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1);
+        if (opts.session_name) |sn| _ = c.setenv("SKETERM_SESSION", sn, 1) else _ = c.unsetenv("SKETERM_SESSION");
+        if (opts.session_origin_id) |id| _ = c.setenv("SKETERM_SESSION_ORIGIN_ID", id, 1) else _ = c.unsetenv("SKETERM_SESSION_ORIGIN_ID");
+        if (opts.mux_socket_path) |sp| _ = c.setenv("SKETERM_MUX_SOCKET", sp, 1) else _ = c.unsetenv("SKETERM_MUX_SOCKET");
+        if (opts.socket_path) |sp| _ = c.setenv("SKETERM_SOCKET", sp, 1) else _ = c.unsetenv("SKETERM_SOCKET");
         if (opts.wayland_display) |wd| {
             _ = c.setenv("WAYLAND_DISPLAY", wd, 1);
             // Software GL by default: without a GPU device the EGL
@@ -687,4 +694,34 @@ fn reapStep(user: ?*anyopaque) callconv(.c) c.gboolean {
         else => {},
     }
     return 1; // G_SOURCE_CONTINUE
+}
+
+test "spawn: pane identity not exported is ABSENT in the child, never inherited" {
+    // The spawning process stands in for a daemon started from inside a
+    // pane: it carries a pane identity the child must not see.
+    _ = c.setenv("SKETERM_PANE_ID", "10", 1);
+    _ = c.setenv("SKETERM_SESSION", "s1-10", 1);
+    _ = c.setenv("SKETERM_SOCKET", "/nonexistent/gui.sock", 1);
+    defer _ = c.unsetenv("SKETERM_PANE_ID");
+    defer _ = c.unsetenv("SKETERM_SESSION");
+    defer _ = c.unsetenv("SKETERM_SOCKET");
+    var pty = try Pty.spawn(.{
+        .argv = &.{ "/bin/sh", "-c", "echo P=${SKETERM_PANE_ID-unset} S=${SKETERM_SESSION-unset} K=${SKETERM_SOCKET-unset}" },
+        .session_name = "durable-1",
+    });
+    var out: [256]u8 = undefined;
+    var len: usize = 0;
+    var tries: u32 = 0;
+    while (tries < 200 and std.mem.indexOf(u8, out[0..len], "K=") == null) : (tries += 1) {
+        var pfd = c.struct_pollfd{ .fd = pty.master_fd, .events = c.POLLIN, .revents = 0 };
+        if (c.poll(&pfd, 1, 50) <= 0) continue;
+        const n = c.read(pty.master_fd, out[len..].ptr, out.len - len);
+        if (n <= 0) break;
+        len += @intCast(n);
+    }
+    _ = pty.closeAndReap();
+    const text = out[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, text, "P=unset") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "S=durable-1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "K=unset") != null);
 }
