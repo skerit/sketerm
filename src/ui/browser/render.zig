@@ -168,6 +168,7 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     // Its own buffer: a note printed into count_buf would be
     // overwritten by the print that reads it.
     var note_buf: [96]u8 = undefined;
+    var phrase_buf: [64]u8 = undefined;
     const note = mediaSortNote(tab, &note_buf);
     // The query note rides every render on purpose: a truncated result
     // or a panel line that was not a path has to stay visible, not be
@@ -195,9 +196,13 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
         std.fmt.bufPrint(&count_buf, "{s}{s}{s}{s}", .{ format.listingStatus(state), note, qnote, fnote }) catch ""
     else if (tab.root.streaming)
         // Rows are landing chunk by chunk; the count is a floor.
-        std.fmt.bufPrint(&count_buf, "listing… {d} items so far{s}{s}{s}", .{ tab.vs.total, note, qnote, fnote }) catch ""
+        std.fmt.bufPrint(&count_buf, "listing… {s} so far{s}{s}{s}", .{
+            format.countPhrase(&phrase_buf, tab.vs.shown, tab.vs.total), note, qnote, fnote,
+        }) catch ""
     else
-        std.fmt.bufPrint(&count_buf, "{d} items{s}{s}{s}", .{ tab.vs.total, note, qnote, fnote }) catch "";
+        std.fmt.bufPrint(&count_buf, "{s}{s}{s}{s}", .{
+            format.countPhrase(&phrase_buf, tab.vs.shown, tab.vs.total), note, qnote, fnote,
+        }) catch "";
     // Repository awareness, unobtrusively: the browsed root's branch,
     // its ahead/behind and its change summary ride the count phrase.
     // A clean repository says so; a directory outside one says

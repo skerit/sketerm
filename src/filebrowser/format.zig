@@ -125,6 +125,25 @@ pub fn listingHeadline(state: ListingState) []const u8 {
     };
 }
 
+/// The status-bar count of a listing: the rows on screen, then how
+/// many entries the hidden-files toggle keeps off it. Counting every
+/// entry read "13 items" over twelve rows, and "1 items" over one.
+pub fn countPhrase(buf: []u8, shown: usize, total: usize) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    w.print("{d} item{s}", .{ shown, if (shown == 1) "" else "s" }) catch return "";
+    const hidden = total -| shown;
+    if (hidden > 0) w.print(" ({d} hidden)", .{hidden}) catch {};
+    return w.buffered();
+}
+
+test "countPhrase counts the visible rows and names the hidden rest" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("12 items (1 hidden)", countPhrase(&buf, 12, 13));
+    try std.testing.expectEqualStrings("1 item", countPhrase(&buf, 1, 1));
+    try std.testing.expectEqualStrings("0 items (2 hidden)", countPhrase(&buf, 0, 2));
+    try std.testing.expectEqualStrings("13 items", countPhrase(&buf, 13, 13));
+}
+
 /// The status-bar phrase for a listing with no rows, in the SAME
 /// words as the placeholder so the two can never disagree.
 pub fn listingStatus(state: ListingState) []const u8 {
