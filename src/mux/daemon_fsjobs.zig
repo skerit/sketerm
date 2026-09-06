@@ -540,6 +540,19 @@ fn moveHelperOwnsJournal(job: *const FsJob) bool {
     return !job.finished() and c.kill(job.pid, 0) == 0;
 }
 
+/// Whether `kill(-job.pid, …)` addresses this job's helper GROUP.
+///
+/// `job.pid` is not always a live child: a journal record restored at
+/// startup defaults to -1 and a detached helper is reset to -1, and
+/// `kill(-pid)` reads those as process-group selectors — `-0` is the
+/// DAEMON'S OWN group (a self-inflicted SIGSTOP that freezes every
+/// session on the host) and `-(-1)` is pid 1. Every other signalling
+/// site in this file already guards on `pid > 0`; this is that guard
+/// with a name.
+fn liveJobGroup(job: *const FsJob) bool {
+    return job.pid > 0;
+}
+
 fn cancelNeedsDurableFence(op: FsJob.Op, delete_src: bool, no_replace: bool) bool {
     return op == .cross_copy and (delete_src or no_replace);
 }
@@ -1202,6 +1215,7 @@ pub fn fsJobOp(self: *Daemon, cl: *Client, r: FsOpReq) void {
     } else if (std.mem.eql(u8, r.op, "job_pause")) {
         if (job.finished()) return fsReplyErr(cl, r.req, "job already finished");
         if (job.cancel_pending) return fsReplyErr(cl, r.req, "job cancellation is pending");
+        if (!liveJobGroup(job)) return fsReplyErr(cl, r.req, "job has no running helper");
         _ = c.kill(-job.pid, c.SIGSTOP);
         job.state = .paused;
         journalFsJob(self, job);
@@ -1209,6 +1223,7 @@ pub fn fsJobOp(self: *Daemon, cl: *Client, r: FsOpReq) void {
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
     } else if (std.mem.eql(u8, r.op, "job_resume")) {
         if (job.finished()) return fsReplyErr(cl, r.req, "job already finished");
+        if (!liveJobGroup(job)) return fsReplyErr(cl, r.req, "job has no running helper");
         _ = c.kill(-job.pid, c.SIGCONT);
         job.state = .running;
         journalFsJob(self, job);
@@ -1764,6 +1779,53 @@ test "a restore that runs out of memory duplicates no string it cannot free" {
     for (0..allocations) |index| {
         var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = index });
         try t.expectError(error.OutOfMemory, dupeRestoredStrings(failing.allocator(), rec));
+    }
+}
+
+test "pause and resume refuse a job whose helper pid is not a group" {
+    const t = std.testing;
+    const a = t.allocator;
+    var empty: [0]u8 = .{};
+    var d = Daemon{ .allocator = a, .listen_fd = -1, .sock_path = empty[0..] };
+    defer d.fs_jobs.deinit(a);
+    var cl = Client{ .allocator = a, .fd = -1, .id = 1 };
+    defer cl.rbuf.deinit(a);
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+
+    var none = [_]u8{};
+    var job = FsJob{
+        .allocator = a,
+        .id = 3,
+        .op = .copy,
+        .owner = null,
+        .pid = 0,
+        .out_fd = -1,
+        .state = .running,
+        .src = &none,
+        .dst = &none,
+        .pattern = &none,
+        .src_host = &none,
+        .dst_host = &none,
+        .client_token = &none,
+        .transfer_token = &none,
+        .conflict = &none,
+    };
+    try d.fs_jobs.append(a, &job);
+
+    // 0 is the daemon's OWN process group and -1 negates to pid 1:
+    // signalling either is a self-inflicted freeze, not a paused helper.
+    for ([_]c.pid_t{ 0, -1 }) |pid| {
+        for ([_][]const u8{ "job_pause", "job_resume" }) |op| {
+            job.pid = pid;
+            job.state = .running;
+            cl.wbuf.clearRetainingCapacity();
+            fsJobOp(&d, &cl, .{ .req = 5, .op = op, .job = job.id });
+            const peeled = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+            try t.expectEqual(wire.FrameType.fs_reply, peeled.frame.ftype);
+            try t.expect(std.mem.indexOf(u8, peeled.frame.payload, "\"ok\":false") != null);
+            try t.expectEqual(FsJob.State.running, job.state);
+        }
     }
 }
 
