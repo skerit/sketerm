@@ -130,29 +130,30 @@ pub fn parse(body: []const u8) Error!Command {
     var cmd = Command{};
     var i: usize = 1;
 
-    // Parse key=value pairs separated by commas, until we hit ';' or end.
-    while (i < body.len and body[i] != ';') {
+    // The control section ends at the first ';'. Every scan below is
+    // bounded by it: base64 payloads carry '=' padding, and searching
+    // past the separator for the next key's '=' used to land `i` beyond
+    // the payload marker, silently dropping the whole transmission.
+    const ctrl_end = std.mem.indexOfScalarPos(u8, body, 1, ';') orelse body.len;
+    const ctrl = body[0..ctrl_end];
+
+    // Parse key=value pairs separated by commas.
+    while (i < ctrl.len) {
         // Skip leading commas.
-        if (body[i] == ',') {
+        if (ctrl[i] == ',') {
             i += 1;
             continue;
         }
-        const eq = std.mem.indexOfScalarPos(u8, body, i, '=') orelse break;
-        const next_sep = blk: {
-            var j: usize = eq + 1;
-            while (j < body.len) : (j += 1) {
-                if (body[j] == ',' or body[j] == ';') break;
-            }
-            break :blk j;
-        };
-        const key = body[i..eq];
-        const val = body[eq + 1 .. next_sep];
+        const eq = std.mem.indexOfScalarPos(u8, ctrl, i, '=') orelse break;
+        const next_sep = std.mem.indexOfScalarPos(u8, ctrl, eq + 1, ',') orelse ctrl.len;
+        const key = ctrl[i..eq];
+        const val = ctrl[eq + 1 .. next_sep];
         applyKv(&cmd, key, val);
         i = next_sep;
     }
 
-    if (i < body.len and body[i] == ';') {
-        cmd.payload = body[i + 1 ..];
+    if (ctrl_end < body.len) {
+        cmd.payload = body[ctrl_end + 1 ..];
     }
     return cmd;
 }
@@ -299,6 +300,18 @@ test "isFileMedium is the one home for the path-naming media" {
     const cmd = try parse("Ga=T,f=100;QUJD");
     try t.expect(!isFileMedium(cmd.medium));
     try t.expect(isFileMedium((try parse("Ga=T,t=s;QUJD")).medium));
+}
+
+test "a control key without '=' does not swallow the payload" {
+    // The '=' search used to run past the ';' into the base64 body, so
+    // the whole transmission was silently dropped.
+    const cmd = try parse("Ga=T,f=100,q;QUJD");
+    try std.testing.expectEqualStrings("QUJD", cmd.payload);
+    try std.testing.expectEqual(Action.transmit_and_place, cmd.action);
+    try std.testing.expectEqual(@as(u32, 100), cmd.format);
+    // Base64 padding is an '=' too, and must not be read as a key.
+    const padded = try parse("Ga=T,q;QQ==");
+    try std.testing.expectEqualStrings("QQ==", padded.payload);
 }
 
 test "tempfileDeletable follows the spec's marker rule" {
