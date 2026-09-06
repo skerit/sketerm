@@ -146,6 +146,9 @@ pub fn renderTab(self: *BrowserView, tab: *BTab) void {
     self.applyViewChrome(tab);
     // The filter is per tab; the shared entry follows the visible one.
     views.syncFilterEntry(self, tab);
+    // Before anything reads the mirror: what is selected is what is on
+    // screen, so narrowing the listing disarms the rows it hides.
+    views.pruneSelectionToVisible(tab);
     tab.vs.total = tab.root.entries.items.len;
     tab.vs.shown = 0;
     for (tab.root.entries.items) |e| {

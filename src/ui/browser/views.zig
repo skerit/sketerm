@@ -113,6 +113,42 @@ pub fn entryVisible(tab: *BTab, e: Entry) bool {
     return std.ascii.indexOfIgnoreCase(e.name, tab.filter) != null;
 }
 
+/// Drop selection-mirror paths this tab HIDES.
+///
+/// `tab.selected` is what every verb reads -- trash, delete, the
+/// clipboard, the drag payload -- while the GTK selection only ever
+/// carries rows that exist, and `syncSelectionFromPaths` pushes the
+/// mirror onto the rows without ever walking back. So a row the
+/// hidden-files toggle or the live filter took off screen stayed armed
+/// as a target the user could neither see nor deselect. Only entries
+/// this tab KNOWS and hides are dropped: a path no listing carries (a
+/// queued mutation, an unloaded miller column) is left alone.
+pub fn pruneSelectionToVisible(tab: *BTab) void {
+    if (tab.selected.items.len == 0) return;
+    const a = tab.view.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var hidden = std.StringHashMap(void).init(arena.allocator());
+    var buf: [4200]u8 = undefined;
+    var i: usize = 0;
+    while (i <= tab.subdirs.items.len) : (i += 1) {
+        const dir = if (i == 0) tab.root else tab.subdirs.items[i - 1];
+        for (dir.entries.items) |e| {
+            if (entryVisible(tab, e)) continue;
+            const p = dir.fullPath(e, &buf) orelse continue;
+            const owned = arena.allocator().dupe(u8, p) catch continue;
+            hidden.put(owned, {}) catch {};
+        }
+    }
+    if (hidden.count() == 0) return;
+    i = 0;
+    while (i < tab.selected.items.len) {
+        if (hidden.contains(tab.selected.items[i])) {
+            a.free(tab.selected.orderedRemove(i));
+        } else i += 1;
+    }
+}
+
 /// Toggle the filter bar (Ctrl+I). Hiding it clears the filter: a
 /// narrowed listing with no visible filter box is a trap.
 pub fn toggleFilter(self: *BrowserView) void {
