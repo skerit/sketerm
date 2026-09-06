@@ -155,6 +155,10 @@ fn reap(pid: c.pid_t, sig: c_int, grace_ms: u32) void {
 fn teardown() void {
     dkTeardown();
     themeTeardown();
+    if (tor_stub_up) {
+        tor_stub_up = false;
+        tor_stub.stop();
+    }
     if (viewer_pid > 0) {
         _ = c.kill(viewer_pid, c.SIGKILL);
         var vst: c_int = 0;
@@ -648,10 +652,22 @@ pub fn main() u8 {
         _ = c.mkdir(cfg_dir.ptr, 0o700);
         var cfg_buf: [320:0]u8 = undefined;
         const cfg = std.fmt.bufPrintZ(&cfg_buf, "{s}/config.conf", .{cfg_dir}) catch return fail("config path");
-        const config_text = if (c.getenv("SKETERM_SMOKE_E2E_FILES_ICONS") != null)
-            "# smoke-e2e\napp_view = window\nfiles_default_view = icons\n"
-        else
-            "# smoke-e2e\napp_view = window\n";
+        // The browser's Tor route dials `mux_tor_socks_endpoint`; this
+        // run's stands in for Tor, so the route stage can prove a Tor
+        // tab's bytes go through it. Started here because the config
+        // names its port.
+        var tor_line_buf: [64]u8 = undefined;
+        var tor_line: []const u8 = "";
+        if (have_web_action) {
+            if (!tor_stub.start()) return fail("the Tor stub did not start");
+            tor_stub_up = true;
+            tor_line = std.fmt.bufPrint(&tor_line_buf, "mux_tor_socks_endpoint = 127.0.0.1:{d}\n", .{tor_stub.lis.port}) catch return fail("tor line");
+        }
+        var config_buf: [256]u8 = undefined;
+        const config_text = std.fmt.bufPrint(&config_buf, "# smoke-e2e\napp_view = window\n{s}{s}", .{
+            if (c.getenv("SKETERM_SMOKE_E2E_FILES_ICONS") != null) "files_default_view = icons\n" else "",
+            tor_line,
+        }) catch return fail("config text");
         if (!writeFile(cfg, config_text)) return fail("could not write the isolated config.conf");
     }
 
@@ -857,6 +873,16 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_WEB_ROUTE_ONLY") != null) {
+        const app = drive orelse return fail("focused web route smoke has no display driver");
+        if (!have_web_action) return fail("focused web route smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
+        if (app.windows.items.len == 0) return fail("focused web route smoke lost its window");
+        app.focusWindow(app.windows.items[0].id) catch return fail("focused web route smoke could not focus the window");
+        if (webRouteStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("web route: focused route-button, menu, Tor switch through the SOCKS5 stub, palette actions and Tor-born tab stage passed");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_WEB_POPUP_ONLY") != null) {
         const app = drive orelse return fail("focused web popup smoke has no display driver");
         if (!have_web_action) return fail("focused web popup smoke needs zig-out/bin/sketerm-webengine (run `zig build web` first)");
@@ -984,6 +1010,9 @@ pub fn main() u8 {
 
             if (webPopupStage(allocator, app, sock_path)) |why| return failMsg(why);
             say("web popups: a popup-shaped open became a ~500x600 toplevel and no tab, its window.close() took the toplevel down with no shell left, a featureless open became a tab that closed itself, and a user-opened page could not close its own tab");
+
+            if (webRouteStage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+            say("web route: the toolbar route button opened its menu, Tor moved the tab through the SOCKS5 stub into its own helper instance, the palette actions moved it back and forth, and new_tor_web_tab opened a Tor-born tab");
         } else {
             say("SKIP browser-action GUI stage (sketerm-webengine is not built; run `zig build web` first)");
         }
@@ -4438,6 +4467,278 @@ const HttpDoc = struct {
         self.lis.deinit();
     }
 };
+
+/// A loopback SOCKS5 proxy standing in for Tor: `mux_tor_socks_endpoint`
+/// in the isolated config points at it, so a tab on the Tor route can
+/// only reach the rig's document server THROUGH it. It relays a
+/// CONNECT to a loopback target verbatim (so the page really loads)
+/// and records the first target it was asked for plus how many tunnels
+/// it opened, which is what proves the route: a direct tab never
+/// touches it, a Tor tab cannot avoid it.
+const TorStub = struct {
+    lis: tcpserver.Listener = .{ .backlog = 16, .poll_ms = 200 },
+    tunnels: std.atomic.Value(u32) = .init(0),
+    refused: std.atomic.Value(u32) = .init(0),
+    /// The first CONNECT's target port (loopback only), 0 until one.
+    first_port: std.atomic.Value(u16) = .init(0),
+
+    fn start(self: *TorStub) bool {
+        return self.lis.start(self, &onConn);
+    }
+
+    fn stop(self: *TorStub) void {
+        self.lis.deinit();
+    }
+
+    fn onConn(ctx: ?*anyopaque, afd: c_int) bool {
+        const self: *TorStub = @ptrCast(@alignCast(ctx.?));
+        // Each tunnel lives on its own thread: a page load opens the
+        // document connection and a favicon probe in parallel, and a
+        // serial accept loop would hold the second behind the first.
+        const t = std.Thread.spawn(.{}, tunnelThread, .{ self, afd }) catch return false;
+        t.detach();
+        return true;
+    }
+
+    fn tunnelThread(self: *TorStub, afd: c_int) void {
+        defer _ = c.close(afd);
+        self.handle(afd);
+    }
+
+    fn handle(self: *TorStub, afd: c_int) void {
+        const socks5 = @import("ipc/socks5.zig");
+        const relay = @import("smoke/socks5relay.zig");
+        var acc: relay.Acc = .{};
+        const g = relay.readGreeting(afd, &acc, 10_000) orelse return;
+        const mr = socks5.methodReply(g.offers_no_auth);
+        _ = c.write(afd, &mr, mr.len);
+        if (!g.offers_no_auth) return;
+        acc.drop(g.consumed);
+        const r = relay.readRequest(afd, &acc, 10_000) orelse return;
+        if (r.cmd != .connect) return;
+        // Only the rig's own loopback servers are reachable through
+        // this "Tor": anything else (Chromium phoning home through the
+        // fresh profile) is refused, counted, and never dialed.
+        const loopback = switch (r.addr) {
+            .ipv4 => |ip| ip[0] == 127,
+            .domain => |d| std.mem.eql(u8, d, "localhost") or std.mem.eql(u8, d, "127.0.0.1"),
+            .ipv6 => false,
+        };
+        if (!loopback) {
+            _ = self.refused.fetchAdd(1, .acq_rel);
+            const no = socks5.connectReply(.not_allowed);
+            _ = c.write(afd, &no, no.len);
+            return;
+        }
+        const upstream = relay.connectLoopback(r.port) orelse {
+            const failed = socks5.connectReply(.host_unreachable);
+            _ = c.write(afd, &failed, failed.len);
+            return;
+        };
+        defer _ = c.close(upstream);
+        _ = self.first_port.cmpxchgStrong(0, r.port, .acq_rel, .acquire);
+        _ = self.tunnels.fetchAdd(1, .acq_rel);
+        const ok = socks5.connectReply(.ok);
+        if (!relay.writeAll(afd, &ok)) return;
+        relay.relay(afd, upstream, acc.bytes()[r.consumed..], null, null, 30_000);
+    }
+};
+
+/// The Tor stub of this run; started before the GUI's config is
+/// written (the config names its port) and stopped in `teardown`.
+var tor_stub: TorStub = .{};
+var tor_stub_up = false;
+
+const e2e_route_page =
+    "<html><head><title>e2e-route</title></head><body style=\"margin:0;background:#c020e0\">" ++
+    "<p style=\"color:#c020e0\">route page</p></body></html>";
+
+/// Where a tab's traffic leaves, on the real GUI and end to end:
+/// the toolbar's route button reads "Direct" on a fresh tab whose page
+/// arrived without touching the Tor stub; a seat click on it opens the
+/// one-click route menu (screenshotted), a click on its "Tor" row moves
+/// the tab -- `web-list` reports `route:tor`, the page reloads THROUGH
+/// the SOCKS5 stub (a tunnel to the document server's port is
+/// recorded), the Tor helper instance owns a socket under the routed
+/// name, and the button now reads "Tor". The palette actions then move
+/// it back and forth over IPC, and `new_tor_web_tab` opens a tab that
+/// is born on Tor. The seat half needs tesseract to find the button
+/// and the row; without it the IPC half still runs and says so.
+fn webRouteStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8, rt: [:0]const u8) ?[]const u8 {
+    if (!tor_stub_up) return "the Tor stub is not running";
+    _ = app.drainLive(1_000);
+    if (app.windows.items.len == 0) return "the display session lost its window before the route stage";
+    var known_buf: [16]u32 = undefined;
+    const known = known_buf[0..knownToplevels(app, &known_buf)];
+
+    var doc = HttpDoc{ .body = e2e_route_page };
+    if (!doc.start()) return "the route document server did not start";
+    defer doc.stop();
+
+    const tunnels_at_start = tor_stub.tunnels.load(.acquire);
+    var req_buf: [256]u8 = undefined;
+    const open_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"web-open\",\"target\":\"tab\",\"data\":\"http://127.0.0.1:{d}/\"}}\n", .{doc.lis.port}) catch return "web-open request";
+    const opened = roundtrip(allocator, sock, open_req) orelse return "opening the route page failed";
+    defer allocator.free(opened);
+    if (std.mem.indexOf(u8, opened, "\"ok\":true") == null) return "the route page was rejected";
+    const pane = parseNumAfter(opened, "\"pane\":") orelse return "the route reply named no pane";
+    if (!waitWebPaneTitled(allocator, sock, app, pane, "e2e-route", 30_000)) return "the route page never loaded in the GUI";
+    if (!webPaneTitled(allocator, sock, pane, "\"route\":\"direct\"")) return "a fresh tab did not report route:direct";
+    if (tor_stub.tunnels.load(.acquire) != tunnels_at_start) return "a DIRECT tab's page load went through the Tor stub";
+    const direct_hits = doc.hits.load(.acquire);
+    if (direct_hits == 0) return "the direct page load never reached the document server";
+
+    // The toplevel showing magenta holds the tab.
+    var gui_win: u32 = 0;
+    {
+        var waited: u32 = 0;
+        while (gui_win == 0 and waited < 20_000) : (waited += 200) {
+            for (known) |id| {
+                if (findPageColor(app, id, .magenta) != null) {
+                    gui_win = id;
+                    break;
+                }
+            }
+            if (gui_win == 0) _ = app.pumpOnce(200);
+        }
+    }
+    if (gui_win == 0) {
+        for (known, 0..) |id, i| {
+            const shot = app.screenshotPng(id, 1400, null, 0) catch continue;
+            defer allocator.free(shot.png);
+            var pbuf: [96:0]u8 = undefined;
+            const p = std.fmt.bufPrintZ(&pbuf, "/tmp/sketerm-e2e-route-fail-{d}.png", .{i}) catch continue;
+            writePng(p.ptr, shot.png);
+        }
+        return "the route page never painted its magenta body in any toplevel";
+    }
+    app.focusWindow(gui_win) catch return "focusing the route window failed";
+    _ = app.waitIdle(300, 5_000);
+    if (app.screenshotPng(gui_win, 1400, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("/tmp/sketerm-e2e-route-1-direct.png", shot.png);
+    } else |_| return "screenshotting the direct tab failed";
+
+    const ocr = @import("util/ocr.zig");
+    var seat_switched = false;
+    if (ocr.available()) {
+        // The button says "Direct" and sits in the toolbar band; the
+        // page body deliberately contains neither word.
+        const btn = waitOcrWordCenter(allocator, app, gui_win, "Direct", 15_000) orelse
+            return "the toolbar's route button (\"Direct\") was not found by OCR";
+        app.clickEx(gui_win, btn.x, btn.y, 1, 100, 1) catch return "clicking the route button failed";
+        const menu = waitPopup(app, true, 10_000) orelse return "the route button opened no menu";
+        _ = app.waitIdle(200, 3_000);
+        if (app.screenshotPng(menu, 1024, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng("/tmp/sketerm-e2e-route-2-menu.png", shot.png);
+        } else |_| return "screenshotting the route menu failed";
+        const tor_row = waitOcrWordCenter(allocator, app, menu, "Tor", 15_000) orelse
+            return "the route menu shows no \"Tor\" row";
+        app.clickEx(menu, tor_row.x, tor_row.y, 1, 100, 1) catch return "clicking the Tor row failed";
+        if (waitPopup(app, false, 10_000) == null) return "the route menu stayed open after choosing Tor";
+        seat_switched = true;
+    } else {
+        say("route: tesseract unavailable; switching over IPC instead of the seat");
+        const r = roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"web_route_tor\"}\n") orelse return "web_route_tor roundtrip failed";
+        allocator.free(r);
+    }
+
+    // The tab moved: route reported, page reloaded THROUGH the stub.
+    {
+        var waited: u32 = 0;
+        while (waited < 30_000) : (waited += 200) {
+            if (webPaneTitled(allocator, sock, pane, "\"route\":\"tor\"")) break;
+            _ = app.pumpOnce(200);
+        } else return "the tab never reported route:tor after choosing Tor";
+    }
+    {
+        var waited: u32 = 0;
+        while (waited < 60_000) : (waited += 200) {
+            if (tor_stub.tunnels.load(.acquire) > tunnels_at_start and doc.hits.load(.acquire) > direct_hits) break;
+            _ = app.pumpOnce(200);
+        } else return "the Tor tab's reload never came through the SOCKS5 stub";
+    }
+    if (tor_stub.first_port.load(.acquire) != doc.lis.port) return "the Tor stub's first tunnel was not to the document server";
+    if (!waitWebPaneTitled(allocator, sock, app, pane, "e2e-route", 30_000)) return "the page did not finish loading through Tor";
+    // The Tor route runs as its OWN helper instance under a routed
+    // socket name: web-<gui pid>-tor-<hash>.sock beside the direct one.
+    if (!routedHelperSocketExists(rt, child_pid, "tor-")) return "no helper socket for the tor route slug exists";
+    _ = app.waitIdle(300, 5_000);
+    if (app.screenshotPng(gui_win, 1400, null, 0)) |shot| {
+        defer allocator.free(shot.png);
+        writePng("/tmp/sketerm-e2e-route-3-tor.png", shot.png);
+    } else |_| return "screenshotting the Tor tab failed";
+    if (ocr.available()) {
+        if (waitOcrWordCenter(allocator, app, gui_win, "Tor", 15_000) == null) return "the toolbar's route button does not read \"Tor\" after the switch";
+    }
+
+    // Palette actions move it back and forth over IPC.
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"web_route_direct\"}\n")) |r| allocator.free(r) else return "web_route_direct roundtrip failed";
+    {
+        var waited: u32 = 0;
+        while (waited < 30_000) : (waited += 200) {
+            if (webPaneTitled(allocator, sock, pane, "\"route\":\"direct\"")) break;
+            _ = app.pumpOnce(200);
+        } else return "web_route_direct did not move the tab back to direct";
+    }
+    const tunnels_before_tor2 = tor_stub.tunnels.load(.acquire);
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"web_route_tor\"}\n")) |r| allocator.free(r) else return "web_route_tor roundtrip failed";
+    {
+        var waited: u32 = 0;
+        while (waited < 60_000) : (waited += 200) {
+            if (webPaneTitled(allocator, sock, pane, "\"route\":\"tor\"") and tor_stub.tunnels.load(.acquire) > tunnels_before_tor2) break;
+            _ = app.pumpOnce(200);
+        } else return "web_route_tor did not move the tab back onto the stub";
+    }
+
+    // A tab BORN on Tor: blank, routed from its first view.
+    const before = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse return "web-list before new_tor_web_tab failed";
+    defer allocator.free(before);
+    if (roundtrip(allocator, sock, "{\"cmd\":\"action\",\"data\":\"new_tor_web_tab\"}\n")) |r| allocator.free(r) else return "new_tor_web_tab roundtrip failed";
+    var tor_pane: u32 = 0;
+    {
+        var waited: u32 = 0;
+        while (waited < 30_000 and tor_pane == 0) : (waited += 200) {
+            const list = roundtrip(allocator, sock, "{\"cmd\":\"web-list\"}\n") orelse continue;
+            defer allocator.free(list);
+            var from: usize = 0;
+            while (std.mem.indexOfPos(u8, list, from, "{\"pane\":")) |at| {
+                from = at + 8;
+                const p = parseNumAfter(list[at..], "{\"pane\":") orelse continue;
+                if (p == pane) continue;
+                var nb: [32]u8 = undefined;
+                const row = std.fmt.bufPrint(&nb, "{{\"pane\":{d},", .{p}) catch continue;
+                if (std.mem.indexOf(u8, before, row) != null) continue;
+                if (webPaneTitled(allocator, sock, p, "\"route\":\"tor\"")) tor_pane = p;
+            }
+            _ = app.pumpOnce(200);
+        }
+    }
+    if (tor_pane == 0) return "new_tor_web_tab opened no tab on route:tor";
+
+    say(if (seat_switched)
+        "route: the seat opened the route menu and chose Tor"
+    else
+        "route: Tor chosen over IPC (no tesseract for the seat half)");
+    return null;
+}
+
+/// Does `$rt/sketerm/web-<pid>-<slug prefix>*.sock` exist? The routed
+/// helper socket naming of `webface.zig`'s `Client.socketPath`.
+fn routedHelperSocketExists(rt: [:0]const u8, pid: c.pid_t, slug_prefix: []const u8) bool {
+    var dir_buf: [300:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/sketerm", .{rt}) catch return false;
+    const d = c.opendir(dir.ptr) orelse return false;
+    defer _ = c.closedir(d);
+    var want_buf: [64]u8 = undefined;
+    const want = std.fmt.bufPrint(&want_buf, "web-{d}-{s}", .{ pid, slug_prefix }) catch return false;
+    while (c.readdir(d)) |ent| {
+        const name = std.mem.span(@as([*:0]const u8, @ptrCast(&ent.*.d_name)));
+        if (std.mem.startsWith(u8, name, want) and std.mem.endsWith(u8, name, ".sock")) return true;
+    }
+    return false;
+}
 
 /// The popup stage's OPENER: two full-height halves, magenta opens a
 /// popup-SHAPED window (`popup,width=500,height=600`), cyan opens a
