@@ -2957,7 +2957,11 @@ pub const EditorView = struct {
     pub fn openSpecAtLineCol(self: *EditorView, spec: []const u8, line: u32, col: u32) void {
         for (self.tabs.items) |t| {
             const ts = t.spec orelse continue;
-            if (!std.mem.eql(u8, ts, spec)) continue;
+            // specEql, not an exact compare: `local:/x` and `/x` name
+            // one document, and answering a mismatch here would open a
+            // SECOND tab for it — two Documents and two DocSyncs issuing
+            // didOpen/didChange for one URI, which desyncs the server.
+            if (!specEql(ts, spec)) continue;
             self.tabhost.setCurrentPage(t.page);
             self.active = t;
             self.applyWantPos(t, .{ .line = line, .character = col });

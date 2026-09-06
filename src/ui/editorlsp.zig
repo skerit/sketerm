@@ -1765,13 +1765,12 @@ pub const Manager = struct {
         if (!st.sync.hasPendingChanges()) return;
         if (st.change_timer != 0) return;
         const ms: c_uint = if (self.cfg()) |conf| @max(10, conf.editor_lsp_debounce_ms) else 250;
-        const ctx = TabCtx.create(self, tab) orelse return;
-        st.change_timer = c.g_timeout_add(ms, @ptrCast(&onChangeTimer), @ptrCast(ctx));
+        st.change_timer = TabCtx.arm(self, tab, ms, @ptrCast(&onChangeTimer));
     }
 
     fn onChangeTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        // No `defer ctx.destroy()`: the source's GDestroyNotify owns it.
         const ctx = cast.userData(TabCtx, user);
-        defer ctx.destroy();
         const r = ctx.resolve() orelse return 0;
         const st = r.tab.lsp orelse return 0;
         st.change_timer = 0;
@@ -1964,9 +1963,18 @@ pub const Manager = struct {
             self.reportNoServer(what);
             return null;
         };
-        const cn = st.conn orelse {
-            self.reportNoServer(what);
-            return null;
+        const cn = st.conn orelse blk: {
+            // A crashed server leaves `st.conn` null forever: attachTab
+            // is reached only from a new tab or a document replacement,
+            // so the tabs that were using it stayed serverless while the
+            // NEXT tab opened in the same project spawned a fresh one
+            // and worked. Re-attaching here costs a `findConn`, which
+            // already skips dead conns.
+            self.attachTab(tab);
+            break :blk st.conn orelse {
+                self.reportNoServer(what);
+                return null;
+            };
         };
         if (cn.sess.state != .ready) {
             self.view.setStatusText("Language server is still starting…");
@@ -3400,13 +3408,12 @@ pub const Manager = struct {
         const st = tab.lsp orelse return;
         if (st.conn == null) return;
         if (st.decor_timer != 0) return;
-        const ctx = TabCtx.create(self, tab) orelse return;
-        st.decor_timer = c.g_timeout_add(DECOR_DEBOUNCE_MS, @ptrCast(&onDecorTimer), @ptrCast(ctx));
+        st.decor_timer = TabCtx.arm(self, tab, DECOR_DEBOUNCE_MS, @ptrCast(&onDecorTimer));
     }
 
     fn onDecorTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        // No `defer ctx.destroy()`: the source's GDestroyNotify owns it.
         const ctx = cast.userData(TabCtx, user);
-        defer ctx.destroy();
         const r = ctx.resolve() orelse return 0;
         const st = r.tab.lsp orelse return 0;
         st.decor_timer = 0;
@@ -4355,13 +4362,12 @@ pub const Manager = struct {
         // Re-request against the new prefix, debounced.
         const st = tab.lsp orelse return;
         if (st.completion_timer != 0) return;
-        const ctx = TabCtx.create(self, tab) orelse return;
-        st.completion_timer = c.g_timeout_add(COMPLETION_DEBOUNCE_MS, @ptrCast(&onCompletionTimer), @ptrCast(ctx));
+        st.completion_timer = TabCtx.arm(self, tab, COMPLETION_DEBOUNCE_MS, @ptrCast(&onCompletionTimer));
     }
 
     fn onCompletionTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        // No `defer ctx.destroy()`: the source's GDestroyNotify owns it.
         const ctx = cast.userData(TabCtx, user);
-        defer ctx.destroy();
         const r = ctx.resolve() orelse return 0;
         const st = r.tab.lsp orelse return 0;
         st.completion_timer = 0;
@@ -4385,13 +4391,12 @@ pub const Manager = struct {
         const st = tab.lsp orelse return self.closeSignature();
         if (tab.sels.primary().head < self.sig.anchor -| 1) return self.closeSignature();
         if (st.signature_timer != 0) return;
-        const ctx = TabCtx.create(self, tab) orelse return;
-        st.signature_timer = c.g_timeout_add(SIGNATURE_DEBOUNCE_MS, @ptrCast(&onSignatureTimer), @ptrCast(ctx));
+        st.signature_timer = TabCtx.arm(self, tab, SIGNATURE_DEBOUNCE_MS, @ptrCast(&onSignatureTimer));
     }
 
     fn onSignatureTimer(user: ?*anyopaque) callconv(.c) c.gboolean {
+        // No `defer ctx.destroy()`: the source's GDestroyNotify owns it.
         const ctx = cast.userData(TabCtx, user);
-        defer ctx.destroy();
         const r = ctx.resolve() orelse return 0;
         const st = r.tab.lsp orelse return 0;
         st.signature_timer = 0;
@@ -4442,6 +4447,27 @@ const TabCtx = struct {
 
     fn destroy(self: *TabCtx) void {
         self.mgr.alloc.destroy(self);
+    }
+
+    /// GDestroyNotify for `arm`. The SOURCE owns the context (mechanism
+    /// 1 in the root CLAUDE.md), so it is freed both when the callback
+    /// returns 0 and when `stopTimers` removes a still-pending source —
+    /// which is the case a `defer ctx.destroy()` in the callback could
+    /// not cover, and the one a tab close always hits.
+    fn destroyNotify(user: ?*anyopaque) callconv(.c) void {
+        cast.userData(TabCtx, user).destroy();
+    }
+
+    /// One debounce timer, owning its context.
+    fn arm(mgr: *Manager, tab: *ETab, ms: c_uint, cb: c.GSourceFunc) c_uint {
+        const ctx = TabCtx.create(mgr, tab) orelse return 0;
+        return c.g_timeout_add_full(
+            c.G_PRIORITY_DEFAULT,
+            ms,
+            cb,
+            @ptrCast(ctx),
+            @ptrCast(&TabCtx.destroyNotify),
+        );
     }
 
     fn resolve(self: *TabCtx) ?struct { mgr: *Manager, tab: *ETab } {
