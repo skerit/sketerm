@@ -228,6 +228,12 @@ pub const PropsCtx = struct {
     uid_entry: *c.GtkWidget = undefined,
     gid_entry: *c.GtkWidget = undefined,
     recursive: ?*c.GtkWidget = null,
+    /// Whether the permission widgets above were built at all. They
+    /// are not for a symbolic link: the mode a listing reports for one
+    /// is the LINK's (0777 on Linux), and applying it would chmod the
+    /// target, which is a different file than the one the rest of this
+    /// dialog describes.
+    has_perms: bool = false,
     size_label: *c.GtkWidget = undefined,
     hash_label: *c.GtkWidget = undefined,
     media_label: ?*c.GtkWidget = null,
@@ -603,6 +609,65 @@ pub fn showProperties(self: *BrowserView, tab: *BTab, path: []const u8, e: *cons
 
     c.gtk_box_append(@ptrCast(box), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
 
+    // Permissions, unless this row is a symbolic link. A listing's
+    // `mode` comes from lstat, so for a link it is the LINK's own
+    // 0777 -- every box came up ticked -- and Apply's chmod FOLLOWS
+    // the link, so pressing it set the target world-writable (and for
+    // a link to a directory, "Apply to enclosed" walked the target
+    // tree). The daemon refuses that chmod now; the dialog must not
+    // promise it either. Ownership stays: chown is an lchown and
+    // really does act on the link.
+    const is_link = std.mem.eql(u8, e.kind, "link");
+    if (is_link) {
+        const note = c.gtk_label_new("A symbolic link has no permissions of its own.");
+        c.gtk_label_set_xalign(@ptrCast(note), 0);
+        c.gtk_widget_add_css_class(note, "dim-label");
+        c.gtk_box_append(@ptrCast(box), note);
+    } else buildPermissionRows(ctx, box, e);
+
+    const own_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
+    c.gtk_box_append(@ptrCast(own_row), c.gtk_label_new("uid"));
+    const uid_entry = c.gtk_entry_new();
+    c.gtk_widget_set_size_request(uid_entry, 80, -1);
+    var idbuf: [16:0]u8 = undefined;
+    if (std.fmt.bufPrintZ(&idbuf, "{d}", .{e.uid})) |v| c.gtk_editable_set_text(@ptrCast(uid_entry), v.ptr) else |_| {}
+    ctx.uid_entry = uid_entry;
+    c.gtk_box_append(@ptrCast(own_row), uid_entry);
+    c.gtk_box_append(@ptrCast(own_row), c.gtk_label_new("gid"));
+    const gid_entry = c.gtk_entry_new();
+    c.gtk_widget_set_size_request(gid_entry, 80, -1);
+    if (std.fmt.bufPrintZ(&idbuf, "{d}", .{e.gid})) |v| c.gtk_editable_set_text(@ptrCast(gid_entry), v.ptr) else |_| {}
+    ctx.gid_entry = gid_entry;
+    c.gtk_box_append(@ptrCast(own_row), gid_entry);
+    c.gtk_box_append(@ptrCast(box), own_row);
+
+    if (e.tdir and !is_link) {
+        const rec = c.gtk_check_button_new_with_label("Apply to enclosed files and folders");
+        ctx.recursive = rec;
+        c.gtk_box_append(@ptrCast(box), rec);
+    }
+
+    const apply = c.gtk_button_new_with_label("Apply");
+    c.gtk_widget_add_css_class(apply, "suggested-action");
+    _ = c.g_signal_connect_data(apply, "clicked", @ptrCast(&onPropsApply), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
+    c.gtk_box_append(@ptrCast(box), apply);
+
+    const scroll = c.gtk_scrolled_window_new();
+    c.gtk_widget_set_vexpand(scroll, 1);
+    // Long names/values ellipsize instead of widening the window: a
+    // horizontal scrollbar on a properties dialog is never right.
+    c.gtk_scrolled_window_set_policy(@ptrCast(scroll), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+    c.gtk_scrolled_window_set_child(@ptrCast(scroll), box);
+    const toolbar = c.adw_toolbar_view_new();
+    c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar), c.adw_header_bar_new());
+    c.adw_toolbar_view_set_content(@ptrCast(toolbar), scroll);
+    c.adw_window_set_content(@ptrCast(window), toolbar);
+    c.gtk_window_present(@ptrCast(window));
+}
+
+/// The u/g/o x r/w/x grid, the special-bit row and the octal entry.
+fn buildPermissionRows(ctx: *PropsCtx, box: *c.GtkWidget, e: *const Entry) void {
+    ctx.has_perms = true;
     const grid = c.gtk_grid_new();
     c.gtk_grid_set_row_spacing(@ptrCast(grid), 2);
     c.gtk_grid_set_column_spacing(@ptrCast(grid), 8);
@@ -641,45 +706,6 @@ pub fn showProperties(self: *BrowserView, tab: *BTab, path: []const u8, e: *cons
     c.gtk_box_append(@ptrCast(box), octal_row);
     ctx.applyChecks(e.mode);
     ctx.setOctal(e.mode);
-
-    const own_row = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 6);
-    c.gtk_box_append(@ptrCast(own_row), c.gtk_label_new("uid"));
-    const uid_entry = c.gtk_entry_new();
-    c.gtk_widget_set_size_request(uid_entry, 80, -1);
-    var idbuf: [16:0]u8 = undefined;
-    if (std.fmt.bufPrintZ(&idbuf, "{d}", .{e.uid})) |v| c.gtk_editable_set_text(@ptrCast(uid_entry), v.ptr) else |_| {}
-    ctx.uid_entry = uid_entry;
-    c.gtk_box_append(@ptrCast(own_row), uid_entry);
-    c.gtk_box_append(@ptrCast(own_row), c.gtk_label_new("gid"));
-    const gid_entry = c.gtk_entry_new();
-    c.gtk_widget_set_size_request(gid_entry, 80, -1);
-    if (std.fmt.bufPrintZ(&idbuf, "{d}", .{e.gid})) |v| c.gtk_editable_set_text(@ptrCast(gid_entry), v.ptr) else |_| {}
-    ctx.gid_entry = gid_entry;
-    c.gtk_box_append(@ptrCast(own_row), gid_entry);
-    c.gtk_box_append(@ptrCast(box), own_row);
-
-    if (e.tdir) {
-        const rec = c.gtk_check_button_new_with_label("Apply to enclosed files and folders");
-        ctx.recursive = rec;
-        c.gtk_box_append(@ptrCast(box), rec);
-    }
-
-    const apply = c.gtk_button_new_with_label("Apply");
-    c.gtk_widget_add_css_class(apply, "suggested-action");
-    _ = c.g_signal_connect_data(apply, "clicked", @ptrCast(&onPropsApply), @ptrCast(ctx), null, c.G_CONNECT_DEFAULT);
-    c.gtk_box_append(@ptrCast(box), apply);
-
-    const scroll = c.gtk_scrolled_window_new();
-    c.gtk_widget_set_vexpand(scroll, 1);
-    // Long names/values ellipsize instead of widening the window: a
-    // horizontal scrollbar on a properties dialog is never right.
-    c.gtk_scrolled_window_set_policy(@ptrCast(scroll), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroll), box);
-    const toolbar = c.adw_toolbar_view_new();
-    c.adw_toolbar_view_add_top_bar(@ptrCast(toolbar), c.adw_header_bar_new());
-    c.adw_toolbar_view_set_content(@ptrCast(toolbar), scroll);
-    c.adw_window_set_content(@ptrCast(window), toolbar);
-    c.gtk_window_present(@ptrCast(window));
 }
 
 /// Escape closes the dialog.
@@ -886,9 +912,17 @@ pub fn onPropsApply(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         self.setStatusFmt("not connected to {s}", .{hc.label()});
         return;
     }
-    const mode = ctx.modeFromChecks();
     const uid = parseId(ctx.uid_entry);
     const gid = parseId(ctx.gid_entry);
+    if (!ctx.has_perms) {
+        // A symbolic link: ownership only, and chown really is an
+        // lchown. Nothing here may reach the target.
+        if (uid == null and gid == null) return;
+        self.sendOp(hc, .{ .req = self.nextReq(), .op = "chown", .path = ctx.path, .uid = uid, .gid = gid });
+        self.setStatusFmt("applied ownership to {s}", .{std.fs.path.basename(ctx.path)});
+        return;
+    }
+    const mode = ctx.modeFromChecks();
     const recursive = if (ctx.recursive) |r| c.gtk_check_button_get_active(@ptrCast(r)) != 0 else false;
     if (recursive) {
         var lbl: [128]u8 = undefined;

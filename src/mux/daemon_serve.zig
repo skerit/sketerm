@@ -2405,6 +2405,14 @@ pub fn handleFsOp(self: *Daemon, cl: *Client, payload: []const u8) void {
     } else if (std.mem.eql(u8, r.op, "chmod")) {
         var z: [4096]u8 = undefined;
         const p = pathZ(&z, r.path) catch return fsReplyErr(cl, r.req, "path too long");
+        // chmod FOLLOWS a symlink while the chown beside it uses
+        // lchown, so one Apply used to act on two different files --
+        // and since a link's own mode is 0777, the client's checkboxes
+        // came up fully ticked and set the TARGET world-writable. A
+        // link has no permissions of its own to change: refuse.
+        var lst: c.struct_stat = undefined;
+        if (c.lstat(p, &lst) == 0 and (lst.st_mode & c.S_IFMT) == c.S_IFLNK)
+            return fsReplyErr(cl, r.req, "a symbolic link has no permissions of its own");
         const rc = c.chmod(p, @intCast(r.mode & 0o7777));
         if (rc != 0) return fsReplyErr(cl, r.req, fsserve.errnoName(rc));
         cl.queueJson(.fs_reply, .{ .req = r.req, .ok = true });
