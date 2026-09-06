@@ -252,12 +252,25 @@ pub const Document = struct {
     /// be a programming error, and losing highlighting is preferable
     /// to aborting the editor.
     pub fn addObserver(self: *Document, ob: EditObserver) void {
+        // Replace BEFORE filling: a slot freed by an earlier
+        // `removeObserver` sits before a still-registered `ctx`, and a
+        // single pass would take that free slot and leave the context
+        // installed twice — every edit then reaches it twice, which for
+        // the LSP capture means a doubled `didChange` and a desynced
+        // server for the rest of the session.
         for (&self.observers) |*slot| {
             if (slot.*) |cur| {
-                if (cur.ctx != ob.ctx) continue;
+                if (cur.ctx == ob.ctx) {
+                    slot.* = ob;
+                    return;
+                }
             }
-            slot.* = ob;
-            return;
+        }
+        for (&self.observers) |*slot| {
+            if (slot.* == null) {
+                slot.* = ob;
+                return;
+            }
         }
     }
 
@@ -820,6 +833,42 @@ test "document markSaved clears dirty" {
     try testing.expect(doc.isDirty());
     doc.markSaved();
     try testing.expect(!doc.isDirty());
+}
+
+const CountingObserver = struct {
+    calls: usize = 0,
+
+    fn onEdits(ctx: *anyopaque, _: *const Document, _: []const tr.Edit) void {
+        const self: *CountingObserver = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+    }
+
+    fn observer(self: *CountingObserver) EditObserver {
+        return .{ .ctx = @ptrCast(self), .before_apply = onEdits };
+    }
+};
+
+test "document re-registering an observer replaces it instead of duplicating" {
+    // A slot freed by removeObserver sits BEFORE a still-registered
+    // context; taking it on re-registration would leave that context in
+    // two slots and deliver every edit to it twice.
+    var doc = try Document.initFromBytes(testing.allocator, "abc");
+    defer doc.deinit();
+    var first = CountingObserver{};
+    var second = CountingObserver{};
+    doc.addObserver(first.observer());
+    doc.addObserver(second.observer());
+    doc.removeObserver(@ptrCast(&first));
+    doc.addObserver(second.observer());
+
+    var occupied: usize = 0;
+    for (doc.observers) |slot| {
+        if (slot != null) occupied += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), occupied);
+
+    try typeChar(&doc, doc.revision, "z");
+    try testing.expectEqual(@as(usize, 1), second.calls);
 }
 
 test "document markUnsaved makes a freshly built buffer dirty" {
