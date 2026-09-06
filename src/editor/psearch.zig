@@ -482,6 +482,10 @@ pub fn literalSeed(pattern: []const u8, opts: Options) []const u8 {
     var run_len: usize = 0;
     var depth: usize = 0;
     var in_class = false;
+    // A `{n,m}` body is syntax, not text. Without this its digits, comma
+    // and `}` scored as a literal run and the seed became a string no
+    // matching file can contain — every candidate filtered out.
+    var in_brace = false;
     var i: usize = 0;
     // A run is only scored when it ENDS: the character before a
     // quantifier leaves the run, so scoring as we go would keep an
@@ -501,6 +505,10 @@ pub fn literalSeed(pattern: []const u8, opts: Options) []const u8 {
             if (ch == ']') in_class = false;
             continue;
         }
+        if (in_brace) {
+            if (ch == '}') in_brace = false;
+            continue;
+        }
         switch (ch) {
             '[', '(', ')' => {
                 if (ch == '[') in_class = true;
@@ -511,6 +519,7 @@ pub fn literalSeed(pattern: []const u8, opts: Options) []const u8 {
             },
             '?', '*', '{' => {
                 // The preceding character is optional or repeated.
+                if (ch == '{') in_brace = true;
                 endRun(run_start, run_len -| 1, &best_start, &best_len);
                 run_len = 0;
             },
@@ -561,6 +570,33 @@ test "psearch: literal seeds for the daemon prefilter" {
     try testing.expectEqualStrings("", literalSeed("cat|dog", .{ .regex = true }));
     // The longest sound run wins.
     try testing.expectEqualStrings("_value", literalSeed("x.*_value.*y", .{ .regex = true }));
+}
+
+test "psearch: a repetition bound is not a literal run" {
+    // `{n}`/`{n,m}` bodies are syntax, not text: counting their digits,
+    // comma and closing brace as a literal made every seed a string no
+    // matching file contains, and the grep prefilter then dropped every
+    // candidate — a silent zero-hit project search.
+    try testing.expectEqualStrings("a", literalSeed("ab{10}", .{ .regex = true }));
+    try testing.expectEqualStrings("", literalSeed("a{2,5}", .{ .regex = true }));
+    try testing.expectEqualStrings("x", literalSeed("xy{2}", .{ .regex = true }));
+    // Literal text AFTER the bound is still a sound seed.
+    try testing.expectEqualStrings("Bar", literalSeed("Foo{2}Bar", .{ .regex = true }));
+    try testing.expectEqualStrings("bar", literalSeed("foo{1,3}bar", .{ .regex = true }));
+
+    // Soundness is the actual contract: every seed must appear in text
+    // the pattern really matches, or grep drops the file.
+    const cases = [_][2][]const u8{
+        .{ "ab{10}", "abbbbbbbbbb" },
+        .{ "a{2,5}", "aaa" },
+        .{ "xy{2}", "xyy" },
+        .{ "Foo{2}Bar", "FoooBar" },
+        .{ "foo{1,3}bar", "foobar" },
+    };
+    for (cases) |case| {
+        const seed = literalSeed(case[0], .{ .regex = true });
+        try testing.expect(seed.len == 0 or std.mem.indexOf(u8, case[1], seed) != null);
+    }
 }
 
 test "psearch: scanning content records line, column and preview" {
