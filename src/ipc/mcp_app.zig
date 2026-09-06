@@ -546,7 +546,15 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             try res.field("macro", nm);
             if (macroSteps(arena, bytes)) |sv| {
                 try res.field("steps", sv.len);
-                try res.raw("actions", bytes);
+                // Re-serialized from the parse, never the stored bytes:
+                // the macro store is an ordinary shared directory, so a
+                // document may be pretty-printed and a raw newline in
+                // structuredContent splits the NDJSON response line.
+                var aw: std.Io.Writer.Allocating = .init(arena);
+                try aw.writer.writeAll("{\"actions\":");
+                try std.json.Stringify.value(sv, .{}, &aw.writer);
+                try aw.writer.writeAll("}");
+                try res.raw("actions", aw.written());
                 try res.text("--- steps ---");
                 for (sv, 0..) |st, i| {
                     var jw: std.Io.Writer.Allocating = .init(arena);
@@ -3083,6 +3091,46 @@ test "a clipped step reports wait_clipped as a fact, not as prose only" {
     try t.expectEqual(@as(usize, 3), clipped.step);
     const plain = stepOutcome(1, true, "step 1: wait_idle settled\n", false);
     try t.expect(!plain.wait_clipped);
+}
+
+test "app_macros show re-serializes the stored macro, never echoes it" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var dirbuf = "/tmp/sketerm-macroshow-XXXXXX".*;
+    const dir_z = c.mkdtemp(&dirbuf) orelse return error.SkipZigTest;
+    const dir = std.mem.span(@as([*:0]u8, @ptrCast(dir_z)));
+    var envbuf: [160]u8 = undefined;
+    const env = try std.fmt.bufPrintZ(&envbuf, "{s}", .{dir});
+    _ = c.setenv("XDG_STATE_HOME", env, 1);
+    var zbuf: [4096]u8 = undefined;
+    defer {
+        _ = c.unsetenv("XDG_STATE_HOME");
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros/pretty.json", .{dir})) |f| {
+            _ = c.unlink(f.ptr);
+        } else |_| {}
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm/macros", .{dir})) |d| _ = c.rmdir(d.ptr) else |_| {}
+        if (std.fmt.bufPrintZ(&zbuf, "{s}/sketerm", .{dir})) |d| _ = c.rmdir(d.ptr) else |_| {}
+        _ = c.rmdir(dir_z);
+    }
+
+    // The macro store is an ordinary directory shared across instances,
+    // so a stored document may be pretty-printed. Echoing its bytes put
+    // raw newlines into structuredContent and split the NDJSON line.
+    try mcpassets.save(t.allocator, .macro, "pretty", "{\n  \"actions\": [\n    {\"wait\": 100}\n  ]\n}\n");
+
+    mcp.app_state.ready = true;
+    defer mcp.app_state.ready = false;
+    const args = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"show\":\"pretty\"}", .{});
+    const result = try appTool(arena, "app_macros", args);
+    const parsed = try mcp.expectToolResultShape(arena, "app_macros", result);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqual(@as(i64, 1), sc.get("steps").?.integer);
+    const actions = sc.get("actions").?.object.get("actions").?.array;
+    try t.expectEqual(@as(usize, 1), actions.items.len);
+    try t.expectEqual(@as(i64, 100), actions.items[0].object.get("wait").?.integer);
 }
 
 test "burstMs defaults and clamps to the per-wait cap" {
