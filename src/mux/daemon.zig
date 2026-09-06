@@ -5125,15 +5125,38 @@ pub const Daemon = struct {
 
         var aw: std.Io.Writer.Allocating = .init(self.allocator);
         defer aw.deinit();
-        const w = &aw.writer;
-        // nonce stays BEFORE "lines": clients scan only the header for
-        // it (line text is arbitrary app output and could contain it).
-        w.print("{{\"next_id\":{d},\"dropped\":{d},\"markers_dropped\":{d},\"nonce\":{d},\"lines\":[", .{
-            ring.next_id, ring.dropped, ring.markers_dropped, req.nonce,
-        }) catch return;
+        if (writeLogData(&aw.writer, ring, items[start..end], max_chars, req.nonce)) {
+            cl.queueFrame(.log_data, aw.written());
+        } else |_| {
+            // The client waits for `.log_data` and ignores `.err`, so a
+            // dropped reply costs it its whole timeout. Answer with an
+            // empty, nonce-stamped body instead.
+            var buf: [256]u8 = undefined;
+            const body = std.fmt.bufPrint(
+                &buf,
+                "{{\"next_id\":{d},\"dropped\":{d},\"markers_dropped\":{d},\"nonce\":{d},\"lines\":[],\"error\":\"out of memory\"}}",
+                .{ ring.next_id, ring.dropped, ring.markers_dropped, req.nonce },
+            ) catch "{\"lines\":[],\"error\":\"out of memory\"}";
+            cl.queueFrame(.log_data, body);
+        }
+    }
+
+    /// Serialize one `log_data` body. The nonce stays BEFORE "lines":
+    /// clients scan only the header for it (line text is arbitrary app
+    /// output and could contain it).
+    fn writeLogData(
+        w: *std.Io.Writer,
+        ring: *const logring.LogRing,
+        lines: []const logring.LogRing.Line,
+        max_chars: usize,
+        nonce: u64,
+    ) !void {
+        try w.print("{{\"next_id\":{d},\"dropped\":{d},\"markers_dropped\":{d},\"nonce\":{d},\"lines\":[", .{
+            ring.next_id, ring.dropped, ring.markers_dropped, nonce,
+        });
         var first = true;
-        for (items[start..end]) |l| {
-            if (!first) w.writeAll(",") catch return;
+        for (lines) |l| {
+            if (!first) try w.writeAll(",");
             first = false;
             var text = l.bytes;
             var cut = false;
@@ -5144,15 +5167,14 @@ pub const Daemon = struct {
                 text = text[0..n];
                 cut = true;
             }
-            w.print("{{\"id\":{d},\"t\":{d},\"text\":", .{ l.id, l.t_ms }) catch return;
-            std.json.Stringify.value(text, .{}, w) catch return;
-            if (l.truncated) w.writeAll(",\"truncated\":true") catch return;
-            if (cut) w.writeAll(",\"cut\":true") catch return;
-            if (l.marker) w.writeAll(",\"marker\":true") catch return;
-            w.writeAll("}") catch return;
+            try w.print("{{\"id\":{d},\"t\":{d},\"text\":", .{ l.id, l.t_ms });
+            try std.json.Stringify.value(text, .{}, w);
+            if (l.truncated) try w.writeAll(",\"truncated\":true");
+            if (cut) try w.writeAll(",\"cut\":true");
+            if (l.marker) try w.writeAll(",\"marker\":true");
+            try w.writeAll("}");
         }
-        w.writeAll("]}") catch return;
-        cl.queueFrame(.log_data, aw.written());
+        try w.writeAll("]}");
     }
 
     pub fn handleLogGet(self: *Daemon, cl: *Client, payload: []const u8) void {
@@ -7157,6 +7179,36 @@ test "events payload allocation failures snapshot every client" {
     for (0..allocations) |fail_index| {
         _ = try runEventsPayloadAllocationFailure(fail_index);
     }
+}
+
+test "a log_data body that cannot be built is still a nonce-stamped log_data" {
+    const t = std.testing;
+    const harness = try EventIngestTestHarness.init(t.allocator);
+    defer harness.deinit();
+    const cl = &harness.clients[0];
+    harness.session.log.feedBytes("hello");
+    harness.session.log.flush(1);
+
+    for (0..6) |fail_index| {
+        cl.wbuf.clearRetainingCapacity();
+        var failing = t.FailingAllocator.init(t.allocator, .{ .fail_index = fail_index });
+        harness.daemon.allocator = failing.allocator();
+        harness.daemon.queueLogData(cl, &harness.session, .{ .nonce = 42 });
+        harness.daemon.allocator = t.allocator;
+        const reply = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+        // Always the frame type the client is waiting for, always
+        // carrying the nonce it matches replies by.
+        try t.expectEqual(wire.FrameType.log_data, reply.frame.ftype);
+        try t.expect(std.mem.indexOf(u8, reply.frame.payload, "\"nonce\":42") != null);
+        try t.expect(!cl.dead);
+    }
+
+    cl.wbuf.clearRetainingCapacity();
+    harness.daemon.queueLogData(cl, &harness.session, .{ .nonce = 42 });
+    const ok = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.log_data, ok.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, ok.frame.payload, "hello") != null);
+    try t.expect(std.mem.indexOf(u8, ok.frame.payload, "error") == null);
 }
 
 test "list answers every allocation failure instead of dropping the welcome" {
