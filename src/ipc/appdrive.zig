@@ -2092,7 +2092,16 @@ pub const App = struct {
         // drop. Firing press → motions → release inside one millisecond
         // leaves the client no room to answer, so the release always
         // cancelled instead.
-        self.pumpFor(40);
+        //
+        // The gap must exceed GtkDragSource's MIN_TIME_TO_DND (100 ms,
+        // gtkdragsource.c): a source refuses to begin a drag while that
+        // press timer runs, and a list with rubberband selection has a
+        // competing drag gesture WITHOUT such a timer, which claims the
+        // sequence on the first motion past the threshold and cancels
+        // the source underneath. Motion at 40 ms therefore turned every
+        // file-row drag into a rubber-band selection, which read as a
+        // broken file manager until GTK's own source was consulted.
+        self.pumpFor(if (expect_dnd) 160 else 40);
         const dist = @max(@abs(x2 - x1), @abs(y2 - y1));
         const steps: u32 = @intFromFloat(std.math.clamp(dist / 16.0, 8.0, 40.0));
         var i: u32 = 1;
