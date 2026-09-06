@@ -80,7 +80,7 @@ pub const Store = struct {
     /// Toggled by `--debug-images` CLI flag.
     debug: bool = false,
     /// Live bytes held in `pending` buffers across all images. Tracked so
-    /// the FIFO eviction in `addFull` can keep retained image memory under
+    /// the FIFO eviction in `addFull`/`replacePending` keeps retained memory under
     /// `budget_bytes` instead of growing until the kernel OOM-kills us.
     live_bytes: usize = 0,
     /// Cap on `live_bytes` (0 = unlimited). Set from `config.image_memory_mb`.
@@ -110,11 +110,19 @@ pub const Store = struct {
     /// is a retention budget, not a per-image size limit (the hard limit is
     /// `image_size.max_decoded_bytes`).
     fn evictForBudget(self: *Store, incoming: usize) void {
+        self.evictForBudgetProtecting(incoming, null);
+    }
+
+    /// `evictForBudget`, but never evicting `protect` — the image whose
+    /// pixels are about to be refilled (`replacePending`), which would
+    /// otherwise be dropped and immediately re-allocated.
+    fn evictForBudgetProtecting(self: *Store, incoming: usize, protect: ?*const Image) void {
         if (self.budget_bytes == 0) return;
         var i: usize = 0;
         while (self.live_bytes + incoming > self.budget_bytes and i < self.images.items.len) : (i += 1) {
             const img = &self.images.items[i];
             if (img.deleting or img.pending == null) continue;
+            if (protect != null and img == protect.?) continue;
             self.freePending(img);
             img.deleting = true;
         }
@@ -314,10 +322,18 @@ pub const Store = struct {
     pub fn replacePending(self: *Store, image_id: u32, rgba: []const u8, generation: u32) !void {
         for (self.images.items) |*img| {
             if (img.image_id != image_id) continue;
+            // A placement on its way out (replaced, deleted, or evicted
+            // for the budget) is dropped by the next flush — refilling
+            // its pixels only buys back the bytes eviction just freed.
+            if (img.deleting) continue;
             if (img.last_seen_generation == generation) continue;
             const need = image_size.byteLen(img.width, img.height, 4) catch continue;
             if (rgba.len != need) continue;
             self.freePending(img);
+            // An animation with many placements refills each of them
+            // here; without this the budget only held across `addFull`
+            // and a frame swap could push `live_bytes` past it.
+            self.evictForBudgetProtecting(need, img);
             const dup = try self.allocator.dupe(u8, rgba[0..need]);
             self.live_bytes += dup.len;
             img.pending = dup;
@@ -786,6 +802,33 @@ test "budget evicts oldest images FIFO and bounds live_bytes" {
     try std.testing.expect(s.images.items[s.images.items.len - 1].pending != null);
     try std.testing.expect(s.images.items[0].pending == null);
     try std.testing.expect(s.images.items[0].deleting);
+}
+
+test "replacePending stays under the budget when a frame grows" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const px = [_]u8{0} ** (4 * 4 * 4); // 64 bytes per placement
+    s.budget_bytes = 64 * 2; // room for two of the three placements
+    var p: u32 = 1;
+    while (p <= 3) : (p += 1) {
+        try s.addFull(.{
+            .rgba = &px,
+            .width = 4,
+            .height = 4,
+            .row = 0,
+            .col = 0,
+            .image_id = 9,
+            .placement_id = p,
+        });
+    }
+    try std.testing.expect(s.live_bytes <= s.budget_bytes);
+    // An animation frame refills every placement of image 9. The one
+    // the budget evicted must not silently buy its bytes back.
+    const frame = [_]u8{0xAB} ** (4 * 4 * 4);
+    try s.replacePending(9, &frame, 1);
+    try std.testing.expect(s.live_bytes <= s.budget_bytes);
+    try std.testing.expectEqual(@as(usize, 64 * 2), s.live_bytes);
 }
 
 test "budget = 0 means unlimited (no eviction)" {
