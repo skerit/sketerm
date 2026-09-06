@@ -509,9 +509,10 @@ pub fn upsertFlatMatch(self: *BrowserView, tab: *BTab, e: WireJobEv) void {
                 // a match, so the windowed splice reuses the row and it
                 // keeps its old Size and Modified cells unless the new
                 // values are named here.
-                const changed = matchMetaChanged(existing.*, e);
+                const changed = matchMetaChanged(existing.*, e) or existing.mode != e.mode;
                 existing.size = e.size;
                 existing.mtime_ms = e.mtime_ms;
+                existing.mode = e.mode;
                 if (changed) {
                     var path_buf: [4096]u8 = undefined;
                     if (dir.fullPath(existing.*, &path_buf)) |full| tab.noteChangedFull(full);
@@ -541,7 +542,7 @@ pub fn upsertFlatMatch(self: *BrowserView, tab: *BTab, e: WireJobEv) void {
         .name = name,
         .kind = kind,
         .size = e.size,
-        .mode = 0,
+        .mode = e.mode,
         .mtime_ms = e.mtime_ms,
         .target = tgt,
         .tdir = std.mem.eql(u8, kind, "dir"),

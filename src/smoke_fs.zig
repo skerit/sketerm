@@ -1485,6 +1485,9 @@ fn jobStage(allocator: std.mem.Allocator, sock_path: []const u8, comptime tag: [
                 if (e.job != fjob) continue;
                 if (std.mem.eql(u8, e.ev, "match")) {
                     if (std.mem.endsWith(u8, e.path, "needle-alpha.txt")) found_path = true;
+                    // A result row shows permissions like a listing row:
+                    // a match without its mode drew "----------".
+                    if (e.mode & 0o400 == 0) fail("find match carried no mode");
                 } else if (e.terminal()) {
                     if (!std.mem.eql(u8, e.ev, "done")) fail("find job failed");
                     if (e.matches != 1) fail("find match count");

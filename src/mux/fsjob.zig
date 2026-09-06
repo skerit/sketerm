@@ -4598,7 +4598,7 @@ fn searchDir(allocator: std.mem.Allocator, dir_path: []const u8, pattern: []cons
             const fresh = state.min_mtime_ms == 0 or e.mtime_ms >= state.min_mtime_ms;
             if (fresh and nameMatches(pattern, e.name)) {
                 state.matches += 1;
-                emit(.{ .ev = "match", .path = full, .kind = e.kind, .size = e.size, .mtime_ms = e.mtime_ms });
+                emit(.{ .ev = "match", .path = full, .kind = e.kind, .size = e.size, .mtime_ms = e.mtime_ms, .mode = e.mode });
             }
         } else if (std.mem.eql(u8, e.kind, "file") and e.size <= MAX_GREP_FILE) {
             grepFile(full, state);
@@ -4738,6 +4738,7 @@ fn panelizeOne(root: []const u8, value: []const u8) bool {
         .kind = fsserve.kindOf(st.st_mode),
         .size = if (st.st_size > 0) @as(u64, @intCast(st.st_size)) else 0,
         .mtime_ms = fsserve.mtimeMs(&st),
+        .mode = @as(u32, @intCast(st.st_mode & 0o7777)),
     });
     return true;
 }
@@ -4813,7 +4814,7 @@ const LiveState = struct {
     /// Stream one match, or refresh a row already on screen. Repeating
     /// a match is deliberate: the client upserts by path, so a write
     /// that changed size or mtime updates the row in place.
-    fn add(self: *LiveState, path: []const u8, kind: []const u8, size: u64, mtime_ms: i64) void {
+    fn add(self: *LiveState, path: []const u8, kind: []const u8, size: u64, mtime_ms: i64, mode: u32) void {
         const expiry = self.expiryOf(mtime_ms);
         if (self.matched.getPtr(path)) |slot| {
             slot.* = expiry;
@@ -4831,7 +4832,7 @@ const LiveState = struct {
                 return;
             };
         }
-        emit(.{ .ev = "match", .path = path, .kind = kind, .size = size, .mtime_ms = mtime_ms });
+        emit(.{ .ev = "match", .path = path, .kind = kind, .size = size, .mtime_ms = mtime_ms, .mode = mode });
     }
 
     /// Drop exactly `path`. Silent when it was not a match: an unmatch
@@ -4962,7 +4963,7 @@ fn liveScanDir(st: *LiveState, path: []const u8) void {
         var full_buf: [4096]u8 = undefined;
         const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ if (path.len == 1) "" else path, e.name }) catch continue;
         if (nameMatches(st.pattern, e.name) and st.fresh(e.mtime_ms, now))
-            st.add(full, e.kind, e.size, e.mtime_ms);
+            st.add(full, e.kind, e.size, e.mtime_ms, e.mode);
         if (std.mem.eql(u8, e.kind, "dir")) liveScanDir(st, full);
     }
 }
@@ -5038,7 +5039,7 @@ fn liveEvent(st: *LiveState, ev: fsserve.InoEvent) void {
     const kind = fsserve.kindOf(stt.st_mode);
     const mtime_ms = fsserve.mtimeMs(&stt);
     if (nameMatches(st.pattern, ev.name) and st.fresh(mtime_ms, wallMs())) {
-        st.add(full, kind, if (stt.st_size > 0) @as(u64, @intCast(stt.st_size)) else 0, mtime_ms);
+        st.add(full, kind, if (stt.st_size > 0) @as(u64, @intCast(stt.st_size)) else 0, mtime_ms, @as(u32, @intCast(stt.st_mode & 0o7777)));
     } else {
         // Only this entry stopped matching. Its children (a directory
         // that never matched the pattern still holds matching files)

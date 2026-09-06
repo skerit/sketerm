@@ -221,6 +221,9 @@ pub const WireJobEv = struct {
     errors: u64 = 0,
     skipped: u64 = 0,
     mtime_ms: i64 = 0,
+    /// Permission bits of a match (find/live/panelize rows), so a
+    /// result row shows them like a listing row does.
+    mode: u32 = 0,
     matches: u64 = 0,
     truncated: bool = false,
     /// done: `path` is a persistent host-side cache file — the

@@ -274,6 +274,8 @@ pub const JobEvent = struct {
     errors: u64 = 0,
     skipped: u64 = 0,
     mtime_ms: i64 = 0,
+    /// Permission bits of a find/live/panelize match.
+    mode: u32 = 0,
     matches: u64 = 0,
     truncated: bool = false,
     /// Live-query status detail (ev == "ready"): how many directories
@@ -486,6 +488,7 @@ pub const Fs = struct {
             errors: u64 = 0,
             skipped: u64 = 0,
             mtime_ms: i64 = 0,
+            mode: u32 = 0,
             matches: u64 = 0,
             truncated: bool = false,
             watches: u64 = 0,
@@ -540,6 +543,7 @@ pub const Fs = struct {
             .errors = parsed.errors,
             .skipped = parsed.skipped,
             .mtime_ms = parsed.mtime_ms,
+            .mode = parsed.mode,
             .matches = parsed.matches,
             .truncated = parsed.truncated,
             .watches = parsed.watches,
