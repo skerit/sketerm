@@ -9220,11 +9220,14 @@ pub const WebFace = struct {
             return;
         }
         var path_buf: [4608]u8 = undefined;
-        const path = uniquePath(&path_buf, dir, name) orelse {
+        // The suggestion is page-controlled: joining it to `dir` with a
+        // separator still in it would let a page pick the destination.
+        const leaf = download_policy.safeName(name);
+        const path = uniquePath(&path_buf, dir, leaf) orelse {
             declineDownload(self.view, id);
             return;
         };
-        self.startDownload(id, name, path, "", "", url);
+        self.startDownload(id, leaf, path, "", "", url);
     }
 
     fn onDlPathPicked(user: ?*anyopaque, result: ?fpicker.Result) void {

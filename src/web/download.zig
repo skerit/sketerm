@@ -25,11 +25,46 @@ pub fn failureReason(code: i32) []const u8 {
     };
 }
 
+/// The leaf a page-suggested download name may become.
+///
+/// The suggestion reaching a client is engine-derived, hence
+/// page-controlled, and the auto-accept path JOINS it to a directory —
+/// so a separator in it picks the destination instead of the user.
+/// Both separators are stripped: a name is never a path here, whichever
+/// platform's shape it arrived in. "download" when nothing is left.
+pub fn safeName(name: []const u8) []const u8 {
+    var s = name;
+    while (s.len != 0 and (s[s.len - 1] == '/' or s[s.len - 1] == '\\')) s = s[0 .. s.len - 1];
+    if (std.mem.lastIndexOfAny(u8, s, "/\\")) |i| s = s[i + 1 ..];
+    if (s.len == 0 or std.mem.eql(u8, s, ".") or std.mem.eql(u8, s, "..")) return "download";
+    return s;
+}
+
 pub const Retry = enum { unavailable, download, delivery };
 
 pub fn retryAction(downloaded: bool, has_url: bool, can_start: bool) Retry {
     if (downloaded) return .delivery;
     return if (has_url and can_start) .download else .unavailable;
+}
+
+test "a suggested download name cannot escape the directory it is joined to" {
+    const t = std.testing;
+    // The engine's suggested name is derived from page-controlled data
+    // (Content-Disposition, the url tail). Auto-accept joins it to the
+    // XDG download directory, so a separator in it would write anywhere
+    // the user can write.
+    try t.expectEqualStrings("passwd", safeName("../../../etc/passwd"));
+    try t.expectEqualStrings("x", safeName("/tmp/x"));
+    try t.expectEqualStrings("evil.desktop", safeName("..\\..\\evil.desktop"));
+    // Nothing usable is left: the caller still needs a name.
+    try t.expectEqualStrings("download", safeName(""));
+    try t.expectEqualStrings("download", safeName(".."));
+    try t.expectEqualStrings("download", safeName("."));
+    try t.expectEqualStrings("download", safeName("/"));
+    try t.expectEqualStrings("download", safeName("../"));
+    // An ordinary name is handed back untouched, dots and all.
+    try t.expectEqualStrings("report.final.pdf", safeName("report.final.pdf"));
+    try t.expectEqualStrings(".bashrc", safeName(".bashrc"));
 }
 
 test "completed downloads retry delivery without reissuing the web request" {
