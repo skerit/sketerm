@@ -515,6 +515,7 @@ pub const BrowserView = struct {
     pub const selectPatternDirs = @import("nav.zig").selectPatternDirs;
     pub const typeaheadReset = @import("nav.zig").typeaheadReset;
     pub const typeaheadBackspace = @import("nav.zig").typeaheadBackspace;
+    pub const typeaheadLive = @import("nav.zig").typeaheadLive;
     pub const typeahead = @import("nav.zig").typeahead;
     pub const typeaheadJump = @import("nav.zig").typeaheadJump;
     pub const onPathActivate = @import("nav.zig").onPathActivate;

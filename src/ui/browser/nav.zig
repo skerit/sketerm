@@ -755,12 +755,22 @@ pub fn hasBubbleChord(keyval: c_uint, state: c.GdkModifierType) bool {
 /// Return whether this key must reach browser type-ahead before global bindings.
 pub fn isTypeaheadKey(keyval: c_uint, state: c.GdkModifierType) bool {
     const mods = state & input.SIGNIFICANT_MODS;
-    return (mods == 0 or mods == c.GDK_SHIFT_MASK) and printableAscii(c.gdk_keyval_to_unicode(keyval));
+    return (mods == 0 or mods == c.GDK_SHIFT_MASK) and printableKey(c.gdk_keyval_to_unicode(keyval));
 }
 
-/// Type-ahead's raw material: printable ASCII, byte-comparable to file names.
-fn printableAscii(uni: u32) bool {
-    return uni >= 0x21 and uni <= 0x7e;
+/// Type-ahead's raw material: any printable codepoint, encoded UTF-8
+/// into the prefix so it is byte-comparable to a file name.
+///
+/// It was printable ASCII only, which did not merely make `ü` unusable
+/// as a first letter -- mid-word the key was dropped WITHOUT resetting
+/// the prefix or its idle stamp, so typing "B", "ü", "c" left "Bc" and
+/// jumped to a wrong, plausible-looking row. Control characters and
+/// the deletes stay out; space is handled by the caller, since it
+/// starts nothing but continues a live prefix.
+fn printableKey(uni: u32) bool {
+    if (uni < 0x21) return false;
+    if (uni == 0x7f) return false;
+    return uni <= 0x10ffff and !(uni >= 0xd800 and uni <= 0xdfff);
 }
 
 fn chordUndo(self: *BrowserView) bool {
@@ -921,7 +931,7 @@ fn chordTypeaheadBackspace(self: *BrowserView) bool {
 
 fn chordTypeaheadReset(self: *BrowserView) bool {
     if (self.currentTab()) |tab| if (@import("diskusage.zig").leave(tab)) return true;
-    if (self.ta_len == 0) return false;
+    if (!self.typeaheadLive()) return false;
     self.typeaheadReset();
     return true;
 }
@@ -936,9 +946,14 @@ fn chordQuickLook(self: *BrowserView) bool {
 /// Capture- and bubble-phase entry point for Space. A stale type-ahead
 /// prefix must not suppress preview forever after its timeout elapsed.
 pub fn quickLookKey(self: *BrowserView) bool {
-    if (self.ta_len != 0) {
-        if (c.g_get_monotonic_time() - self.ta_last_us <= TYPEAHEAD_RESET_US) return false;
-        self.typeaheadReset();
+    if (self.typeaheadLive()) {
+        // Mid-word the space belongs to the prefix -- and it must be
+        // CONSUMED either way. Returning false handed it to
+        // GtkColumnView, whose plain-Space binding selects the focused
+        // row ALONE, so a ten-row selection vanished the moment the
+        // user started typing a name with a space in it.
+        _ = self.typeahead(c.GDK_KEY_space);
+        return true;
     }
     return self.quickLookToggle();
 }
@@ -1457,9 +1472,25 @@ pub fn typeaheadReset(self: *BrowserView) void {
     self.setStatus("");
 }
 
-pub fn typeaheadBackspace(self: *BrowserView) bool {
+/// Is there a prefix the user is still typing?
+///
+/// The one answer everything consults, because a prefix past its idle
+/// gap is logically GONE: it must not swallow Escape (which then never
+/// reaches the search row or the pane), and Backspace must not edit
+/// and re-jump a word finished seconds ago. Expiring here is silent --
+/// blanking the status would erase the count line nobody asked about.
+pub fn typeaheadLive(self: *BrowserView) bool {
     if (self.ta_len == 0) return false;
+    if (c.g_get_monotonic_time() - self.ta_last_us <= TYPEAHEAD_RESET_US) return true;
+    self.ta_len = 0;
+    return false;
+}
+
+pub fn typeaheadBackspace(self: *BrowserView) bool {
+    if (!self.typeaheadLive()) return false;
+    // A whole codepoint, not a byte: the prefix is UTF-8.
     self.ta_len -= 1;
+    while (self.ta_len > 0 and self.ta_buf[self.ta_len] & 0xc0 == 0x80) self.ta_len -= 1;
     if (self.ta_len == 0) {
         self.typeaheadReset();
         return true;
@@ -1473,15 +1504,20 @@ pub fn typeaheadBackspace(self: *BrowserView) bool {
 /// keep dispatching them.
 pub fn typeahead(self: *BrowserView, keyval: c_uint) bool {
     const uni = c.gdk_keyval_to_unicode(keyval);
-    // Space is excluded: it is a selection key.
-    if (!printableAscii(uni)) return false;
+    // Space starts nothing (it is the selection/preview key) but
+    // CONTINUES a live prefix, so "my f" reaches "my file.txt".
+    const is_space = uni == ' ';
+    if (!printableKey(uni) and !is_space) return false;
     _ = self.currentTab() orelse return false;
     const now = c.g_get_monotonic_time();
     if (now - self.ta_last_us > TYPEAHEAD_RESET_US) self.ta_len = 0;
+    if (is_space and self.ta_len == 0) return false;
     self.ta_last_us = now;
-    if (self.ta_len >= self.ta_buf.len) return true;
-    self.ta_buf[self.ta_len] = @intCast(uni);
-    self.ta_len += 1;
+    var enc: [4]u8 = undefined;
+    const n = std.unicode.utf8Encode(@intCast(uni), &enc) catch return false;
+    if (self.ta_len + n > self.ta_buf.len) return true;
+    @memcpy(self.ta_buf[self.ta_len..][0..n], enc[0..n]);
+    self.ta_len += n;
     if (!self.typeaheadJump()) {
         // Keep the prefix: the user is mid-word and the next
         // keystroke may still match once the listing settles.
@@ -1688,7 +1724,7 @@ fn expectTypeaheadDoesNotShadow(bindings: []const input.Binding) !void {
     for (bindings) |b| {
         const mods = b.mods & input.SIGNIFICANT_MODS;
         if (mods != 0 and mods != c.GDK_SHIFT_MASK) continue;
-        if (printableAscii(c.gdk_keyval_to_unicode(b.keyval))) {
+        if (printableKey(c.gdk_keyval_to_unicode(b.keyval))) {
             std.debug.print("global binding {s} uses a bare printable key type-ahead eats first\n", .{
                 input.actionName(b.action),
             });
@@ -1700,6 +1736,26 @@ fn expectTypeaheadDoesNotShadow(bindings: []const input.Binding) !void {
 test "type-ahead cannot swallow an unmodified platform global binding" {
     try expectTypeaheadDoesNotShadow(&input.linux_default_bindings);
     try expectTypeaheadDoesNotShadow(&input.macos_default_bindings);
+}
+
+test "type-ahead takes any printable codepoint, not just ASCII" {
+    const t = std.testing;
+    try t.expect(printableKey('a'));
+    try t.expect(printableKey('~'));
+    // The reason this matters: a non-ASCII key used to be dropped
+    // mid-word WITHOUT resetting the prefix, so "B", "u-umlaut", "c"
+    // jumped to whatever "Bc" matched.
+    try t.expect(printableKey(0xfc)); // u with diaeresis
+    try t.expect(printableKey(0x4e2d)); // a CJK ideograph
+    try t.expect(printableKey(0x1f600)); // outside the BMP
+    // Space is the caller's business (it continues a prefix, never
+    // starts one); controls, DEL and lone surrogates are nobody's.
+    try t.expect(!printableKey(' '));
+    try t.expect(!printableKey(0));
+    try t.expect(!printableKey(0x1b));
+    try t.expect(!printableKey(0x7f));
+    try t.expect(!printableKey(0xd800));
+    try t.expect(!printableKey(0x110000));
 }
 
 test "capture forwarding leaves bubble browser chords to the browser" {
