@@ -370,31 +370,41 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
     // Broker parent.
     _ = c.close(sp[1]);
     _ = c.fcntl(sp[0], c.F_SETFD, c.FD_CLOEXEC);
-    const name_owned = self.allocator.dupe(u8, req.name) catch {
-        _ = c.close(sp[0]);
-        cl.queueErr("oom");
+    const w = brokerAdoptWorker(self, cl, pid, sp[0], origin_id, req) catch {
+        discardForkedWorker(cl, pid, sp[0]);
         return;
     };
-    const origin_owned = self.allocator.dupe(u8, req.name) catch {
-        self.allocator.free(name_owned);
-        _ = c.close(sp[0]);
-        cl.queueErr("oom");
-        return;
-    };
-    const w = self.allocator.create(Worker) catch {
-        self.allocator.free(name_owned);
-        self.allocator.free(origin_owned);
-        _ = c.close(sp[0]);
-        cl.queueErr("oom");
-        return;
-    };
+    log.info("worker forked pid={d} session='{s}' kind={s}", .{ pid, w.name, if (req.app) "app" else "shell" });
+    // Reply is deferred: `brokerOnWorkerControl` sends `.ok` when the
+    // worker reports 'Y' (session up), or `.err` if the worker dies first
+    // (spawnSession failed). The client is blocked in recvExpect(.ok).
+}
+
+/// Build and list the broker's record for a just-forked worker.
+///
+/// The control fd is NOT closed on failure: the caller owns the fork
+/// until this returns, and the disposal it needs is `discardForkedWorker`.
+fn brokerAdoptWorker(
+    self: *Daemon,
+    cl: *Client,
+    pid: c.pid_t,
+    control_fd: c_int,
+    origin_id: SessionOriginId,
+    req: SpawnReq,
+) !*Worker {
+    const name_owned = try self.allocator.dupe(u8, req.name);
+    errdefer self.allocator.free(name_owned);
+    const origin_owned = try self.allocator.dupe(u8, req.name);
+    errdefer self.allocator.free(origin_owned);
+    const w = try self.allocator.create(Worker);
+    errdefer self.allocator.destroy(w);
     w.* = .{
         .allocator = self.allocator,
         .name = name_owned,
         .origin_name = origin_owned,
         .origin_id = origin_id,
         .pid = pid,
-        .control_fd = sp[0],
+        .control_fd = control_fd,
         .app = req.app,
         // Seeded from the request so `list` is right before the
         // worker's first 'M' push lands.
@@ -405,15 +415,72 @@ pub fn brokerSpawn(self: *Daemon, cl: *Client, payload: []const u8) void {
         .ttl_secs = req.ttl_secs,
         .pending_client = cl,
     };
-    self.workers.append(self.allocator, w) catch {
-        w.deinit();
-        cl.queueErr("oom");
-        return;
+    try self.workers.append(self.allocator, w);
+    return w;
+}
+
+/// Dispose of a forked worker no record will own, and answer the client
+/// whose spawn reply that record was going to carry.
+///
+/// The kill is by EXACT pid, never the group: the child may not have
+/// reached its `setsid` yet, so `-pid` could signal the broker's own
+/// group. Reaping here is the only chance — the zombie sweep walks
+/// `workers`, and this worker never made it in.
+fn discardForkedWorker(cl: *Client, pid: c.pid_t, control_fd: c_int) void {
+    if (control_fd >= 0) _ = c.close(control_fd);
+    if (pid > 0) {
+        _ = c.kill(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = c.waitpid(pid, &status, 0);
+    }
+    // The spawn reply is normally deferred to the worker's 'Y'; there
+    // is no worker now, so nothing else would ever unblock the client.
+    cl.queueErr("spawn failed: out of memory registering the session worker");
+}
+
+test "a worker the broker cannot record is killed, reaped and answered" {
+    const t = std.testing;
+    const a = t.allocator;
+    var empty: [0]u8 = .{};
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var broker = Daemon{
+        .allocator = failing.allocator(),
+        .listen_fd = -1,
+        .sock_path = empty[0..],
+        .is_broker = true,
     };
-    log.info("worker forked pid={d} session='{s}' kind={s}", .{ pid, w.name, if (req.app) "app" else "shell" });
-    // Reply is deferred: `brokerOnWorkerControl` sends `.ok` when the
-    // worker reports 'Y' (session up), or `.err` if the worker dies first
-    // (spawnSession failed). The client is blocked in recvExpect(.ok).
+    defer broker.workers.deinit(a);
+    var cl = Client{ .allocator = a, .fd = -1 };
+    defer cl.rbuf.deinit(a);
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+
+    var sp: [2]c_int = undefined;
+    try t.expectEqual(@as(c_int, 0), platform.controlSocketpair(&sp, 4096));
+    const pid = c.fork();
+    try t.expect(pid >= 0);
+    if (pid == 0) {
+        // Stand-in worker: parks on its control channel like the real
+        // one, so it is alive when the adoption fails.
+        _ = c.close(sp[0]);
+        var byte: u8 = 0;
+        _ = c.recv(sp[1], &byte, 1, 0);
+        c._exit(0);
+    }
+    _ = c.close(sp[1]);
+
+    try t.expectError(error.OutOfMemory, brokerAdoptWorker(&broker, &cl, pid, sp[0], "40000000000000000000000000000004".*, .{ .name = "orphan" }));
+    try t.expectEqual(@as(usize, 0), broker.workers.items.len);
+
+    discardForkedWorker(&cl, pid, sp[0]);
+    // Already reaped: a second wait finds no such child, so nothing
+    // was left as a zombie for a sweep that never walks this pid.
+    var status: c_int = 0;
+    try t.expectEqual(@as(c.pid_t, -1), c.waitpid(pid, &status, 0));
+
+    const reply = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.err, reply.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, reply.frame.payload, "out of memory") != null);
 }
 
 fn testAccountLoginShell() []const u8 {
