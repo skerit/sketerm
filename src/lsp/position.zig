@@ -106,18 +106,25 @@ pub fn positionToOffset(rope: *const Rope, pos: Position, enc: Encoding) usize {
     var off = line_start;
     var units: u32 = 0;
     var it = rope.iterateRange(line_start, line_end);
+    // Byte-wise, because a rope chunk boundary can fall INSIDE a
+    // multi-byte sequence: a per-chunk sequence walk would credit the
+    // whole sequence's units for its leading bytes and then count each
+    // orphaned continuation byte as a character of its own.
     outer: while (it.next()) |chunk| {
-        var i: usize = 0;
-        while (i < chunk.len) {
-            const lead = chunk[i];
-            const seq_len = std.unicode.utf8ByteSequenceLength(lead) catch 1;
-            const step = @min(seq_len, chunk.len - i);
-            const add = unitsOfSequence(lead, seq_len, enc);
+        for (chunk) |b| {
+            // Continuation byte: part of the sequence already counted.
+            if (b & 0xC0 == 0x80) {
+                off += 1;
+                continue;
+            }
+            if (units >= pos.character) break :outer;
+            const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 1;
+            const add = unitsOfSequence(b, seq_len, enc);
+            // Landing inside a surrogate pair: the sequence start is the
+            // only offset that exists.
             if (units + add > pos.character) break :outer;
             units += add;
-            off += step;
-            i += step;
-            if (units == pos.character) break :outer;
+            off += 1;
         }
     }
     return @min(off, line_end);
@@ -262,6 +269,70 @@ test "lsp position: every offset round-trips in every encoding" {
                 try testing.expectEqual(off, positionToOffset(&rope, p, enc));
             }
             off += 1;
+        }
+    }
+}
+
+test "lsp position: a codepoint straddling a rope leaf boundary round-trips" {
+    // The rope is byte-oriented: a leaf boundary can fall inside a
+    // multi-byte sequence. 4097 bytes builds three leaves with the first
+    // seam at byte 1365, one byte into the emoji at 1364.
+    const a = testing.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    try buf.appendNTimes(a, 'a', 1364);
+    try buf.appendSlice(a, "\u{1F600}");
+    try buf.appendNTimes(a, 'b', 4097 - 1368);
+    var rope = try Rope.initFromBytes(a, buf.items);
+    defer rope.deinit();
+
+    // Assert the premise: some chunk ends mid-sequence.
+    {
+        var it = rope.iterateRange(0, rope.len());
+        var off: usize = 0;
+        var straddles = false;
+        while (it.next()) |chunk| {
+            off += chunk.len;
+            if (off > 1364 and off < 1368) straddles = true;
+        }
+        try testing.expect(straddles);
+    }
+
+    for ([_]Encoding{ .utf8, .utf16, .utf32 }) |enc| {
+        for ([_]usize{ 1364, 1368, 1369, 2000, 4097 }) |off| {
+            const p = offsetToPosition(&rope, off, enc);
+            try testing.expectEqual(off, positionToOffset(&rope, p, enc));
+        }
+    }
+}
+
+test "lsp position: random utf-8 round-trips at every codepoint boundary" {
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5e7e12);
+    const rnd = prng.random();
+    const alphabet = [_][]const u8{
+        "a", "\n", " ", "\u{e9}", "\u{4e16}", "\u{1F600}", "\t", "z",
+    };
+    var round: usize = 0;
+    while (round < 40) : (round += 1) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(a);
+        // Long enough to force multiple leaves on most rounds.
+        const n = rnd.intRangeAtMost(usize, 0, 1500);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            try buf.appendSlice(a, alphabet[rnd.uintLessThan(usize, alphabet.len)]);
+        }
+        var rope = try Rope.initFromBytes(a, buf.items);
+        defer rope.deinit();
+
+        for ([_]Encoding{ .utf8, .utf16, .utf32 }) |enc| {
+            var off: usize = 0;
+            while (off <= buf.items.len) : (off += 1) {
+                if (off < buf.items.len and buf.items[off] & 0xC0 == 0x80) continue;
+                const p = offsetToPosition(&rope, off, enc);
+                try testing.expectEqual(off, positionToOffset(&rope, p, enc));
+            }
         }
     }
 }
