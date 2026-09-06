@@ -848,6 +848,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_SELECTION_ONLY") != null) {
+        const app = drive orelse return fail("focused files-selection smoke has no display driver");
+        if (!have_wl) return fail("focused files-selection smoke is GTK/Wayland-only");
+        if (filesSelectionBugsStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("files selection: Select All, the narrowed mirror, a link's permissions and a folder dropped into itself all held");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_INLINE_RENAME_ONLY") != null) {
         const app = drive orelse return fail("focused inline-rename smoke has no display driver");
         if (!have_wl) return fail("focused inline-rename smoke is GTK/Wayland-only");
@@ -1372,6 +1380,12 @@ pub fn main() u8 {
             // row drag onto a folder row.
             if (filesBrowserBugsStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
             say("files bugs: hidden count, trash strip, Keep Both naming, location-entry focus, panel after Up and row drag all held");
+
+            // 6c-10d. What the selection MEANS: Select All under a
+            // filter, a mirror the filter narrowed, a symlink's
+            // permissions and a folder dropped into itself.
+            if (filesSelectionBugsStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+            say("files selection: Select All, the narrowed mirror, a link's permissions and a folder dropped into itself all held");
 
             // 6c-11. A remote Files tab whose daemon died: the
             // reconnect re-subscribes every directory under a FRESH
@@ -7318,6 +7332,229 @@ fn filesBrowserBugsStage(
     say("files bugs: a row dragged onto a folder row moved into it");
 
     if (!closeRenameFiles(app, child)) return "files bugs: the Files window did not close cleanly";
+    return null;
+}
+
+/// What a SELECTION means, driven on the live GUI because only the
+/// GUI has one: Select All under a filter, a mirror the filter
+/// narrowed after the fact, a symbolic link's permissions, and a
+/// folder dropped into itself.
+///
+/// Every check is destructive on purpose -- the whole class is "a verb
+/// acted on rows that were not on screen", so the assertion is which
+/// files are still there afterwards.
+fn filesSelectionBugsStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("files selection: tesseract unavailable; skipping");
+        return null;
+    }
+
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/fsel", .{rt}) catch return "files selection: dir path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    var p: [8][600:0]u8 = undefined;
+    const zaa = std.fmt.bufPrintZ(&p[0], "{s}/ZAAROW.txt", .{dir}) catch return "files selection: path";
+    const zab = std.fmt.bufPrintZ(&p[1], "{s}/ZABROW.txt", .{dir}) catch return "files selection: path";
+    const keep = std.fmt.bufPrintZ(&p[2], "{s}/KEEPME.txt", .{dir}) catch return "files selection: path";
+    const sub = std.fmt.bufPrintZ(&p[3], "{s}/DEEPER", .{dir}) catch return "files selection: path";
+    const nested_twin = std.fmt.bufPrintZ(&p[4], "{s}/DEEPER/DEEPER", .{dir}) catch return "files selection: path";
+    const targ = std.fmt.bufPrintZ(&p[5], "{s}/TARGET.txt", .{dir}) catch return "files selection: path";
+    const lnk = std.fmt.bufPrintZ(&p[6], "{s}/AAAROW", .{dir}) catch return "files selection: path";
+    if (!writeFile(zaa, "a\n") or !writeFile(zab, "b\n") or !writeFile(keep, "k\n") or !writeFile(targ, "t\n"))
+        return "files selection: seed";
+    _ = c.mkdir(sub.ptr, 0o700);
+    if (c.chmod(targ.ptr, 0o600) != 0) return "files selection: seed mode";
+    if (c.symlink(targ.ptr, lnk.ptr) != 0) return "files selection: seed link";
+
+    const child = launchRenameFiles(app, dir, "fsel", "", wl) orelse
+        return "files selection: the Files window never appeared";
+    defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
+    if (!viewerWaitOcr(allocator, app, child.win, "KEEPME", 40_000))
+        return "files selection: the listing never rendered";
+    _ = app.waitVisualSettle(child.win, 400, 10_000, 0.002, null);
+
+    // -- 1. Select All selects what is on screen --
+    // Narrow to the two ZA rows, click one (the filter entry holds the
+    // keyboard after typing), Ctrl+A, Delete. Select All used to reach
+    // past the filter and trash KEEPME, NESTED and the link with it.
+    app.pressKey(child.win, "ctrl+i") catch return "files selection: ctrl+i failed";
+    pumpRenameFor(app, 500);
+    app.typeText(null, "ZA") catch return "files selection: typing the filter failed";
+    pumpRenameFor(app, 1_200);
+    const zaa_row = ocrRowCenter(allocator, app, child.win, "ZAAROW", 10_000) orelse {
+        viewerShot(allocator, app, child.win, "files-sel-nofilter");
+        return "files selection: the filtered listing shows no ZAAROW row";
+    };
+    app.clickEx(child.win, zaa_row.x, zaa_row.y, 1, 60, 1) catch return "files selection: focusing the listing failed";
+    pumpRenameFor(app, 400);
+    app.pressKey(child.win, "ctrl+a") catch return "files selection: ctrl+a failed";
+    pumpRenameFor(app, 400);
+    app.pressKey(child.win, "Delete") catch return "files selection: Delete failed";
+    if (!waitPathState(zab, false, 15_000, app)) {
+        viewerShot(allocator, app, child.win, "files-sel-selectall");
+        return "files selection: Select All + Delete did not trash the filtered rows";
+    }
+    _ = waitPathState(zaa, false, 5_000, app);
+    pumpRenameFor(app, 1_500);
+    if (c.access(keep.ptr, c.F_OK) != 0 or c.access(sub.ptr, c.F_OK) != 0 or c.access(lnk.ptr, c.F_OK) != 0) {
+        viewerShot(allocator, app, child.win, "files-sel-overreach");
+        return "files selection: Select All under a filter reached rows that were not on screen";
+    }
+    say("files selection: Select All under a filter took only the rows on screen");
+
+    // -- 2. narrowing the listing disarms the rows it hides --
+    // Clear the filter, select everything, THEN narrow: the mirror
+    // every verb reads used to keep the rows the filter removed, and
+    // no selection-changed fires during a render to prune them. The
+    // right-click keeps the selection (the clicked row is in it), so
+    // Move to Trash acts on whatever the mirror still holds.
+    // Ctrl+I, not Escape: the click above put the keyboard on the
+    // listing, where Escape is the type-ahead reset. Toggling the
+    // filter bar off is what clears the filter.
+    app.pressKey(child.win, "ctrl+i") catch return "files selection: clearing the filter failed";
+    pumpRenameFor(app, 800);
+    if (!viewerWaitOcr(allocator, app, child.win, "KEEPME", 15_000))
+        return "files selection: the unfiltered listing never came back";
+    const keep_row = ocrRowCenter(allocator, app, child.win, "KEEPME", 10_000) orelse
+        return "files selection: KEEPME row not found";
+    app.clickEx(child.win, keep_row.x, keep_row.y, 1, 60, 1) catch return "files selection: click failed";
+    pumpRenameFor(app, 400);
+    app.pressKey(child.win, "ctrl+a") catch return "files selection: ctrl+a failed";
+    pumpRenameFor(app, 600);
+    app.pressKey(child.win, "ctrl+i") catch return "files selection: ctrl+i failed";
+    pumpRenameFor(app, 500);
+    app.typeText(null, "KEEPME") catch return "files selection: typing the second filter failed";
+    pumpRenameFor(app, 1_500);
+    const keep_only = ocrRowCenter(allocator, app, child.win, "KEEPME", 10_000) orelse {
+        viewerShot(allocator, app, child.win, "files-sel-nokeep");
+        return "files selection: the narrowed listing shows no KEEPME row";
+    };
+    app.clickEx(child.win, keep_only.x, keep_only.y, 3, 80, 1) catch return "files selection: right-click failed";
+    const menu = waitPopup(app, true, 15_000) orelse {
+        viewerShot(allocator, app, child.win, "files-sel-nomenu");
+        return "files selection: the entry menu never opened";
+    };
+    _ = app.waitVisualSettle(menu, 500, 8_000, 0.002, null);
+    if (!clickOcrWord(allocator, app, menu, "Trash", 1, 10_000)) {
+        viewerShot(allocator, app, menu, "files-sel-menu");
+        return "files selection: the entry menu has no Move to Trash";
+    }
+    if (!waitPathState(keep, false, 15_000, app)) {
+        viewerShot(allocator, app, child.win, "files-sel-trash");
+        return "files selection: Move to Trash did not take the row it was clicked on";
+    }
+    pumpRenameFor(app, 2_000);
+    if (c.access(sub.ptr, c.F_OK) != 0 or c.access(lnk.ptr, c.F_OK) != 0 or c.access(targ.ptr, c.F_OK) != 0) {
+        viewerShot(allocator, app, child.win, "files-sel-stale");
+        return "files selection: a filter applied after Select All left the hidden rows armed";
+    }
+    say("files selection: narrowing the listing disarmed the rows it hid");
+
+    // -- 3. a symbolic link has no permissions of its own --
+    // A listing's mode is the LINK's 0777, and Apply's chmod followed
+    // the link, so the dialog used to offer -- and grant -- rwxrwxrwx
+    // on the target.
+    app.pressKey(child.win, "ctrl+i") catch return "files selection: clearing the filter failed";
+    pumpRenameFor(app, 800);
+    // One OCR pass over this listing costs seconds, so a mid-repaint
+    // frame can eat a short budget whole: settle first, then allow
+    // several frames' worth of attempts.
+    _ = app.waitVisualSettle(child.win, 500, 10_000, 0.002, null);
+    // The link row sits between the two rows tesseract does read
+    // (directories first, then AAAROW, then TARGET.txt). Its own label
+    // is one tesseract reliably misses at this size, and a row's y is
+    // an interpolation the layout guarantees -- rows are evenly
+    // spaced -- rather than another OCR attempt.
+    const deep_row = ocrRowCenter(allocator, app, child.win, "DEEPER", 40_000) orelse {
+        viewerShot(allocator, app, child.win, "files-sel-nolink");
+        return "files selection: DEEPER row not found";
+    };
+    const targ_row = ocrRowCenter(allocator, app, child.win, "TARGET", 40_000) orelse {
+        viewerShot(allocator, app, child.win, "files-sel-nolink");
+        return "files selection: TARGET row not found";
+    };
+    const link_row: Point = .{ .x = deep_row.x, .y = (deep_row.y + targ_row.y) / 2 };
+    // Every toplevel that exists BEFORE Properties opens, the
+    // harness's own GUI included: "some other window" resolves to it
+    // otherwise, and the stage reads a terminal for a dialog.
+    var seen: [32]u32 = undefined;
+    var n_seen: usize = 0;
+    for (app.windows.items) |w| {
+        if (w.popup or n_seen >= seen.len) continue;
+        seen[n_seen] = w.id;
+        n_seen += 1;
+    }
+    app.clickEx(child.win, link_row.x, link_row.y, 3, 80, 1) catch return "files selection: right-click on the link failed";
+    const link_menu = waitPopup(app, true, 15_000) orelse
+        return "files selection: the link's menu never opened";
+    _ = app.waitVisualSettle(link_menu, 500, 8_000, 0.002, null);
+    if (!clickOcrWord(allocator, app, link_menu, "Properties", 1, 10_000)) {
+        viewerShot(allocator, app, link_menu, "files-sel-linkmenu");
+        return "files selection: the link's menu has no Properties";
+    }
+    pumpRenameFor(app, 2_500);
+    const props_win = blk: {
+        const deadline = clock.nowMs() + 15_000;
+        while (clock.nowMs() < deadline) {
+            if (hasToplevelOtherThan(app, seen[0..n_seen])) |w| break :blk w;
+        }
+        viewerShot(allocator, app, child.win, "files-sel-noprops");
+        return "files selection: the Properties window never appeared";
+    };
+    _ = app.waitVisualSettle(props_win, 600, 10_000, 0.002, null);
+    if (!viewerWaitOcr(allocator, app, props_win, "no permissions", 20_000)) {
+        viewerShot(allocator, app, props_win, "files-sel-props");
+        return "files selection: Properties on a symbolic link still offers permissions";
+    }
+    var tst: c.struct_stat = undefined;
+    if (c.stat(targ.ptr, &tst) != 0) return "files selection: the link target vanished";
+    if (tst.st_mode & 0o7777 != 0o600) return "files selection: the link's target changed mode";
+    app.closeWindow(props_win) catch return "files selection: closing Properties failed";
+    _ = waitWindowGone(app, props_win, 10_000);
+    pumpRenameFor(app, 800);
+    say("files selection: Properties on a link left the target's mode alone");
+
+    // -- 4. a folder cannot be pasted inside itself --
+    // Copy DEEPER, walk into it, paste. The names differ (/x/DEEPER ->
+    // /x/DEEPER/DEEPER) so the destination-equality test admitted it,
+    // and the copy job the GUI then submitted came back as a FAILED
+    // transfer row saying "dst is inside src". The same guard covers
+    // the drop path.
+    const nested_row = ocrRowCenter(allocator, app, child.win, "DEEPER", 40_000) orelse {
+        viewerShot(allocator, app, child.win, "files-sel-nonested");
+        return "files selection: DEEPER row not found";
+    };
+    app.clickEx(child.win, nested_row.x, nested_row.y, 1, 60, 1) catch return "files selection: selecting DEEPER failed";
+    pumpRenameFor(app, 400);
+    app.pressKey(child.win, "ctrl+c") catch return "files selection: ctrl+c failed";
+    pumpRenameFor(app, 400);
+    app.clickEx(child.win, nested_row.x, nested_row.y, 1, 60, 2) catch return "files selection: opening DEEPER failed";
+    pumpRenameFor(app, 2_500);
+    app.pressKey(child.win, "ctrl+v") catch return "files selection: ctrl+v failed";
+    pumpRenameFor(app, 4_000);
+    if (c.access(nested_twin.ptr, c.F_OK) == 0) {
+        viewerShot(allocator, app, child.win, "files-sel-selfpaste");
+        return "files selection: a folder pasted into itself copied into itself";
+    }
+    // Refused UP FRONT, so no job ran: before the guard the GUI
+    // submitted a copy the daemon then rejected, and the transfers
+    // strip reported a failed operation. (The refusal sentence itself
+    // is on the dim status line, which tesseract does not read at this
+    // size -- the strip's own text is the legible half.)
+    pumpRenameFor(app, 3_000);
+    if ((ocrCount(allocator, app, child.win, "failed") orelse 0) != 0) {
+        viewerShot(allocator, app, child.win, "files-sel-selfpaste-msg");
+        return "files selection: pasting a folder into itself still submitted a job that failed";
+    }
+    say("files selection: a folder pasted into itself was refused up front");
+
+    if (!closeRenameFiles(app, child)) return "files selection: the Files window did not close cleanly";
     return null;
 }
 
