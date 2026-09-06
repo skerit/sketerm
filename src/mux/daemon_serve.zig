@@ -1694,15 +1694,51 @@ pub fn handleAppA11y(self: *Daemon, cl: *Client, payload: []const u8) void {
         return;
     };
     defer self.allocator.free(tree);
+    queueA11yTree(self, cl, tree);
+}
+
+/// Wrap a bare a11y tree object as `{"tree":...}` and queue it.
+///
+/// Every exit answers on `.app_a11y_tree`, allocation failure included:
+/// the client waits for THAT frame type and ignores `.err`, so a
+/// dropped reply is a hang until its timeout.
+fn queueA11yTree(self: *Daemon, cl: *Client, tree: []const u8) void {
     var reply: std.ArrayList(u8) = .empty;
     defer reply.deinit(self.allocator);
-    reply.appendSlice(self.allocator, "{\"tree\":") catch {
-        cl.queueErr("oom");
+    reply.ensureTotalCapacity(self.allocator, tree.len + 9) catch {
+        cl.queueJson(.app_a11y_tree, .{ .@"error" = "out of memory serializing the accessibility tree" });
         return;
     };
-    reply.appendSlice(self.allocator, tree) catch return;
-    reply.appendSlice(self.allocator, "}") catch return;
+    reply.appendSliceAssumeCapacity("{\"tree\":");
+    reply.appendSliceAssumeCapacity(tree);
+    reply.appendSliceAssumeCapacity("}");
     cl.queueFrame(.app_a11y_tree, reply.items);
+}
+
+test "an a11y tree reply that cannot be built is still an app_a11y_tree frame" {
+    const t = std.testing;
+    const a = t.allocator;
+    var empty: [0]u8 = .{};
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var d = Daemon{ .allocator = failing.allocator(), .listen_fd = -1, .sock_path = empty[0..] };
+    var cl = Client{ .allocator = a, .fd = -1 };
+    defer cl.rbuf.deinit(a);
+    defer cl.wbuf.deinit(a);
+    defer cl.audio_wbuf.deinit(a);
+
+    queueA11yTree(&d, &cl, "{\"role\":\"application\"}");
+    try t.expect(failing.has_induced_failure);
+    const failed = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.app_a11y_tree, failed.frame.ftype);
+    try t.expect(std.mem.indexOf(u8, failed.frame.payload, "out of memory") != null);
+    try t.expect(!cl.dead);
+
+    cl.wbuf.clearRetainingCapacity();
+    d.allocator = a;
+    queueA11yTree(&d, &cl, "{\"role\":\"application\"}");
+    const ok = (try wire.peelFrame(cl.wbuf.items)) orelse return error.TestUnexpectedResult;
+    try t.expectEqual(wire.FrameType.app_a11y_tree, ok.frame.ftype);
+    try t.expectEqualStrings("{\"tree\":{\"role\":\"application\"}}", ok.frame.payload);
 }
 
 /// Start an asciicast v2 recording of the attached session. The
