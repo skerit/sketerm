@@ -23,6 +23,7 @@
 //! the socket buffer stalls the transfer.
 
 const std = @import("std");
+const c = @import("../c.zig").c;
 const client = @import("../mux/client.zig");
 const wire = @import("../mux/wire.zig");
 const fsserve = @import("../mux/fsserve.zig");
@@ -562,6 +563,9 @@ pub const Xfer = struct {
     listing_rel: ?[]u8 = null,
     setup_req: u32 = 0,
     setup_idx: usize = 0,
+    /// Whether the current symlink's destination name has been cleared
+    /// (the unlink half of the replace).
+    link_cleared: bool = false,
     cur: ?*Transfer = null,
     cur_idx: usize = 0,
     total_bytes: u64 = 0,
@@ -846,16 +850,31 @@ pub const Xfer = struct {
                 self.listing_rel = null;
                 self.listNext();
             },
-            .mkdirs, .symlinks => {
+            .mkdirs => {
+                // An existing directory is the whole point of a merge
+                // copy; every other error is fatal.
                 if (!rep.ok) {
-                    const root = switch (self.state) {
-                        .mkdirs => self.dirs.items[self.setup_idx].len == 0,
-                        .symlinks => self.links.items[self.setup_idx].rel.len == 0,
-                        else => false,
-                    };
+                    const root = self.dirs.items[self.setup_idx].len == 0;
                     if ((self.no_replace and root) or std.mem.indexOf(u8, rep.@"error", "EXIST") == null)
                         return self.failFmt("destination setup: {s}", .{errorPhrase(rep.@"error")});
                 }
+                self.setup_idx += 1;
+                self.setupNext();
+            },
+            .symlinks => {
+                if (!self.link_cleared and !(self.no_replace and self.links.items[self.setup_idx].rel.len == 0)) {
+                    // The clearing unlink: nothing there (NOENT) is the
+                    // normal case, and anything it could not remove
+                    // surfaces on the symlink itself.
+                    self.link_cleared = true;
+                    return self.setupNext();
+                }
+                // EXIST is NOT tolerable here — it was, because this
+                // branch was shared with mkdir, so a stale link kept its
+                // old target while the transfer reported itself done.
+                if (!rep.ok)
+                    return self.failFmt("destination setup: {s}", .{errorPhrase(rep.@"error")});
+                self.link_cleared = false;
                 self.setup_idx += 1;
                 self.setupNext();
             },
@@ -905,6 +924,7 @@ pub const Xfer = struct {
             },
             .symlinks => {
                 if (self.setup_idx >= self.links.items.len) {
+                    self.link_cleared = false;
                     self.state = .copying;
                     self.cur_idx = 0;
                     return self.startNextFile();
@@ -913,6 +933,19 @@ pub const Xfer = struct {
                 var buf: [4096]u8 = undefined;
                 const abs = self.dstAbs(&buf, l.rel) orelse return self.fail("path too long");
                 self.setup_req = self.nr();
+                // `symlink(2)` has no replace mode, so a stale link is
+                // removed first — regular files are staged and renamed
+                // over, and a tree copied twice must not keep pointing
+                // at the old target. The root under `no_replace` is
+                // exempt: it must be created as ABSENT.
+                if (!self.link_cleared and !(self.no_replace and l.rel.len == 0)) {
+                    self.dst.queueJson(.fs_op, .{
+                        .req = self.setup_req,
+                        .op = "unlink",
+                        .path = abs,
+                    }) catch |err| failQueue(self, .dst, err);
+                    return;
+                }
                 self.dst.queueJson(.fs_op, .{
                     .req = self.setup_req,
                     .op = "symlink",
@@ -973,6 +1006,71 @@ pub const Xfer = struct {
         self.startNextFile();
     }
 };
+
+test "a symlink the destination already holds is replaced, never skipped" {
+    const t = std.testing;
+    const a = t.allocator;
+    var req: u32 = 1;
+    var fds: [2]c_int = undefined;
+    if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) != 0) return error.SkipZigTest;
+    defer _ = c.close(fds[1]);
+    var conn: client.Conn = .{ .allocator = a, .fd = fds[0], .proto = 1 };
+    defer conn.deinit();
+
+    const Peer = struct {
+        fn sent(fd: c_int, buf: []u8) []u8 {
+            const n = c.recv(fd, buf.ptr, buf.len, c.MSG_DONTWAIT);
+            return if (n > 0) buf[0..@intCast(n)] else buf[0..0];
+        }
+    };
+    var pbuf: [4096]u8 = undefined;
+
+    var xfer = Xfer{
+        .allocator = a,
+        .src = &conn,
+        .dst = &conn,
+        .next_req = &req,
+        .src_root = try a.dupe(u8, "/src"),
+        .dst_root = try a.dupe(u8, "/dst"),
+        .resumable = false,
+    };
+    defer {
+        a.free(xfer.src_root);
+        a.free(xfer.dst_root);
+        for (xfer.links.items) |l| {
+            a.free(l.rel);
+            a.free(l.target);
+        }
+        xfer.links.deinit(a);
+        xfer.dirs.deinit(a);
+        xfer.files.deinit(a);
+        xfer.walk_queue.deinit(a);
+    }
+    try xfer.links.append(a, .{
+        .rel = try a.dupe(u8, "current"),
+        .target = try a.dupe(u8, "v2"),
+    });
+
+    // Re-copying a tree onto an older copy is the ordinary case: the
+    // stale link must be removed first, exactly as a regular file is
+    // staged and renamed over.
+    xfer.state = .symlinks;
+    xfer.setup_idx = 0;
+    xfer.setupNext();
+    try t.expect(std.mem.indexOf(u8, Peer.sent(fds[1], &pbuf), "\"op\":\"unlink\"") != null);
+
+    // Nothing was there: ENOENT is normal, and the link still goes down.
+    xfer.onReply(.dst, .{ .req = xfer.setup_req, .ok = false, .@"error" = "NOENT" });
+    try t.expect(std.mem.indexOf(u8, Peer.sent(fds[1], &pbuf), "\"op\":\"symlink\"") != null);
+    try t.expectEqual(@as(usize, 0), xfer.setup_idx);
+
+    // An EXIST the unlink could not clear (a directory sits there) is a
+    // FAILURE. It used to be swallowed by the branch mkdir shares, so
+    // the destination kept pointing at the old target and the transfer
+    // reported itself complete.
+    xfer.onReply(.dst, .{ .req = xfer.setup_req, .ok = false, .@"error" = "EXIST" });
+    try t.expectEqual(Xfer.State.failed, xfer.state);
+}
 
 test "client-mediated retries only connection failures" {
     const empty: []u8 = @constCast(&[_]u8{});
