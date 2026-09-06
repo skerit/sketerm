@@ -434,7 +434,7 @@ fn spawnOn(
     var remote_env_len: usize = 0;
     if (argv.len == 0 and host != null) {
         if (settings.shell) |shell| {
-            remote_env_items[remote_env_len] = std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{shell}) catch return false;
+            remote_env_items[remote_env_len] = std.fmt.bufPrint(&remote_shell_buf, "SKETERM_REMOTE_SHELL={s}", .{shell}) catch return .failed;
             remote_env_len += 1;
         }
         remote_env_items[remote_env_len] = if (settings.login_shell) "SKETERM_REMOTE_LOGIN=1" else "SKETERM_REMOTE_LOGIN=0";
@@ -450,7 +450,7 @@ fn spawnOn(
         .term = settings.term_env,
         .color_term = settings.color_term_env,
         .login_shell = argv.len == 0 and host == null and settings.login_shell,
-    }) catch return false;
+    }) catch return .failed;
     const f = conn.recvExpectFor(&.{.ok}, 30_000) catch {
         const why = conn.lastErr();
         if (std.mem.indexOf(u8, why, "already exists") != null) return .name_taken;
