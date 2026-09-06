@@ -1,5 +1,69 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-06: a codebase-wide review pass, in parallel
+
+Eight review streams over the daemon, the MCP server and its drivers,
+the parser and grid, the GUI core, the editor and its LSP client, the
+browser stack, the file manager and the new tty viewer. Each stream
+wrote the failing test before the fix, so every entry below is pinned.
+
+**Things that were silently wrong for real users.** `scp_get` over a
+`tor:` host could never succeed: one ssh leg (the remote `sha256sum`)
+skipped `appendRoute` and handed `tor:box` to ssh as a hostname, so
+every download failed at verification and kept its partial. A page's
+suggested download filename went into a path join unsanitised, so
+`../` in it named the destination directory. A paste larger than the
+child's input queue was silently TRUNCATED daemon-side after a
+one-second spin; input is now queued (1 MiB per PTY) and drained on
+POLLOUT, with the cap reported rather than dropped. A user keybinding
+that collided with another action's default was dead, and the warning
+named the wrong side of the collision.
+
+**Things one client could do to everyone else.** A `clip_data` write
+into a Wayland app's paste pipe was blocking, so an app that stopped
+reading parked the daemon's single poll loop and froze every session
+on the host. `job_pause`/`job_resume` called `kill(-pid)` with no
+`pid > 0` guard, and a restored job's pid is `-1` — a plain client
+request could SIGSTOP the daemon's own process group. A snapshot body
+was queued with no size check, so a wide screen with a full
+scrollback produced a frame no peer can parse and the session became
+permanently unattachable. A 19-byte sixel could demand 800 MB.
+
+**Illegal behaviour that ReleaseFast turns into wrong answers.** An
+unclamped kitty `c=`/`r=` cast `u32` to `i32` and made positional
+deletes never match; `regionOf` truncated an out-of-range rect instead
+of refusing it, so repaint verdicts were measured over a rectangle
+nobody asked for; fribidi's failure return left a level buffer
+uninitialised. LSP positions resolved INSIDE a codepoint whenever a
+rope leaf seam split a multi-byte sequence, so every range past such a
+character sliced the rope wrong.
+
+**Crashes.** A pasted regex with deep `(?:` nesting overflowed the
+parser's stack. Turning the editor's LSP off nulled each tab's client
+without tearing it down, leaving four live timers and a document
+observer pointed at freed memory. A transport upgrade left a write
+watch armed on the closed SSH fd (a spin at 100% CPU, and the new
+transport never got a watch). Crash recovery deleted journal records
+it merely could not OPEN, so fd exhaustion at startup destroyed every
+unsaved buffer.
+
+**Also.** Twelve file-manager fixes from driving the real GUI (Keep
+Both losing the extension, a tab not titled by its folder, Ctrl+V in
+the source folder duplicating the entry, search rows drawing
+`----------` for permissions, a fresh window not giving its listing
+the keyboard, and more). A parser fuzz harness feeding random
+escape-weighted streams through `Parser` into `Screen`. `build.zig`
+falls back to the system CEF when the cache is empty. `test-web`
+looked like it failed for months: the build runner re-prints a passing
+step's stderr under a red "failed command:" header, and one test
+deliberately provokes a diagnostic.
+
+Two findings are left as decisions rather than patched: `Rope.insert`
+/`delete` null the root before the fallible split, so an OOM empties
+the buffer (a correct fix is a pre-reserved node pool, not a patch),
+and the find bar's regex matcher runs unbounded on the GTK main
+thread, where a typeable pattern costs 100 seconds.
+
 ## 2026-09-06: the browser's route is a button, not a popover section
 
 "I still don't see an easy UI way to switch to a Tor route." The
