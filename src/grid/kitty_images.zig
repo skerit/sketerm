@@ -842,7 +842,9 @@ pub const Manager = struct {
             2 => img.playing = true,
             else => {},
         }
-        if (loop_count > 0) img.loops_remaining = @intCast(loop_count);
+        // `r=` saturates at u32 max; a raw cast leaves the counter
+        // negative, and the loop test then never fires.
+        if (loop_count > 0) img.loops_remaining = @intCast(@min(loop_count, @as(u32, std.math.maxInt(i32))));
         if (set_frame > 0 and img.frames.items.len > 0) {
             const idx = @min(set_frame - 1, img.frames.items.len - 1);
             img.current_frame = @intCast(idx);
@@ -1419,6 +1421,23 @@ test "animation: a=a stop pauses playback" {
     const run_outcome = mgr.ingest(run_cmd);
     try std.testing.expect(run_outcome.animation_changed);
     try std.testing.expect(mgr.store.getPtr(8).?.playing);
+}
+
+test "animation: a huge loop count stays positive" {
+    var mgr = Manager.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const a0 = try std.testing.allocator.dupe(u8, "AAAAAAAAAAAAAAAA");
+    const a1 = try std.testing.allocator.dupe(u8, "BBBBBBBBBBBBBBBB");
+    var img: StoredImage = .{ .rgba = a0, .width = 2, .height = 2 };
+    try img.frames.append(std.testing.allocator, .{ .rgba = a0, .delay_ms = 50 });
+    try img.frames.append(std.testing.allocator, .{ .rgba = a1, .delay_ms = 50 });
+    try mgr.store.put(9, img);
+
+    // r= saturates at u32 max; casting it to the i32 counter made the
+    // remaining-loop count negative, so the loop test never fired.
+    _ = mgr.ingest(.{ .action = .animate, .image_id = 9, .cells_high = 3_000_000_000 });
+    try std.testing.expect(mgr.store.getPtr(9).?.loops_remaining > 0);
 }
 
 test "store budget evicts oldest images and bounds store_bytes" {

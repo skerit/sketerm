@@ -717,6 +717,15 @@ pub const Screen = struct {
         }
     };
 
+    /// A placement's cell extent as the signed count `ImageDeleteEvent.selects`
+    /// wants. `c=`/`r=` are parsed straight off the escape sequence and
+    /// saturate at u32 max, so a plain `@intCast` to i32 is illegal
+    /// behaviour on input nothing bounds; 0 means "one cell".
+    pub fn cellExtent(v: u32) i32 {
+        if (v == 0) return 1;
+        return @intCast(@min(v, @as(u32, std.math.maxInt(i32))));
+    }
+
     pub const ImageEvent = struct {
         width: u32,
         height: u32,
@@ -804,8 +813,8 @@ pub const Screen = struct {
             // positional selector can be answered here. Cell extent is
             // whatever the placement asked for; a native-size image
             // (cells 0) still occupies its top-left cell.
-            const cols: i32 = if (ri.cells_wide > 0) @intCast(ri.cells_wide) else 1;
-            const rows: i32 = if (ri.cells_high > 0) @intCast(ri.cells_high) else 1;
+            const cols: i32 = cellExtent(ri.cells_wide);
+            const rows: i32 = cellExtent(ri.cells_high);
             const hit = if (ev.what == 'a' or ev.what == 'A')
                 (ev.image_id == 0 or ri.image_id == ev.image_id)
             else
@@ -9038,4 +9047,10 @@ test "a combining mark after a scroll does not attach to the blanked row" {
     s.lineFeed(); // 'a' scrolls up; row 1 is blank again
     s.printCp(0x0301);
     try std.testing.expectEqual(@as(usize, 0), s.clusters.count());
+}
+
+test "a kitty cell extent past i32 max stays a positive rectangle" {
+    try std.testing.expectEqual(@as(i32, 1), Screen.cellExtent(0));
+    try std.testing.expectEqual(@as(i32, 3), Screen.cellExtent(3));
+    try std.testing.expectEqual(std.math.maxInt(i32), Screen.cellExtent(3_000_000_000));
 }

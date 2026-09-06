@@ -281,8 +281,8 @@ pub const Store = struct {
         ctx: ?*anyopaque,
     ) void {
         for (self.images.items) |*img| {
-            const cols: i32 = if (img.cells_wide > 0) @intCast(img.cells_wide) else 1;
-            const rows: i32 = if (img.cells_high > 0) @intCast(img.cells_high) else 1;
+            const cols: i32 = @import("screen.zig").Screen.cellExtent(img.cells_wide);
+            const rows: i32 = @import("screen.zig").Screen.cellExtent(img.cells_high);
             if (ev.selects(
                 img.image_id,
                 img.placement_id,
@@ -716,6 +716,34 @@ test "markByPlacementForDelete: placement_id=0 matches all placements of image" 
     s.flushDeletesNoGL();
     try std.testing.expectEqual(@as(usize, 1), s.count());
     try std.testing.expectEqual(@as(u32, 2), s.images.items[0].image_id);
+}
+
+test "a cell extent past i32 max still covers its own cell" {
+    var s = Store.init(std.testing.allocator);
+    defer s.images.deinit(std.testing.allocator);
+    defer s.freeAllNoGL();
+    const rgba = [_]u8{0} ** 16;
+    // `c=`/`r=` come straight off an escape sequence and saturate at u32
+    // max; casting one to i32 turned the rectangle negative, so a
+    // positional delete matched nothing and the placement stayed live.
+    try s.addFull(.{
+        .rgba = &rgba,
+        .width = 2,
+        .height = 2,
+        .row = 0,
+        .col = 0,
+        .image_id = 1,
+        .placement_id = 1,
+        .cells_wide = 3_000_000_000,
+        .cells_high = 3_000_000_000,
+    });
+    const numberOf = struct {
+        fn f(_: ?*anyopaque, _: u32) u32 {
+            return 0;
+        }
+    }.f;
+    s.markSelectedForDelete(.{ .what = 'p', .image_id = 1, .x = 1, .y = 1 }, numberOf, null);
+    try std.testing.expect(s.images.items[0].deleting);
 }
 
 test "forgetGL keeps all images, drops their GL handles" {
