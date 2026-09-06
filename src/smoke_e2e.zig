@@ -840,6 +840,14 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_FILES_BUGS_ONLY") != null) {
+        const app = drive orelse return fail("focused files-bugs smoke has no display driver");
+        if (!have_wl) return fail("focused files-bugs smoke is GTK/Wayland-only");
+        if (filesBrowserBugsStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+        say("files bugs: hidden count, trash strip, Keep Both naming, location-entry focus, panel after Up and row drag all held");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_INLINE_RENAME_ONLY") != null) {
         const app = drive orelse return fail("focused inline-rename smoke has no display driver");
         if (!have_wl) return fail("focused inline-rename smoke is GTK/Wayland-only");
@@ -1358,6 +1366,12 @@ pub fn main() u8 {
             // reuse and the html row's browser item.
             if (filesMutationSelectStage(allocator, app, rt, sock_path, &wl_z, have_web_action)) |why| return failMsg(why);
             say("files select: created/renamed/pasted entries were selected, a remote Ctrl+C exported the path, a late NUL stayed text, a repeat edit joined the editor window, and an html row opened in a web tab");
+
+            // 6c-10c. The hand-driving bugs: status count, trash strip,
+            // Keep Both naming, location-entry focus, panel after Up,
+            // row drag onto a folder row.
+            if (filesBrowserBugsStage(allocator, app, rt, &wl_z)) |why| return failMsg(why);
+            say("files bugs: hidden count, trash strip, Keep Both naming, location-entry focus, panel after Up and row drag all held");
 
             // 6c-11. A remote Files tab whose daemon died: the
             // reconnect re-subscribes every directory under a FRESH
@@ -7047,6 +7061,264 @@ fn filesMutationSelectStage(
     }
 
     _ = app.drainLive(2_000);
+    return null;
+}
+
+/// Centre of the listing ROW word `needle`, in window coordinates.
+/// Row names are set in the list's small font, which tesseract reads
+/// at native scale only sometimes; like viewerWaitOcr this retries the
+/// frame at 2x and maps the box back.
+fn ocrRowCenter(allocator: std.mem.Allocator, app: *appdrive.App, win_id: u32, needle: []const u8, timeout_ms: i64) ?Point {
+    const ocr = @import("util/ocr.zig");
+    const png_util = @import("util/png.zig");
+    if (!ocr.available()) return null;
+    const deadline = clock.nowMs() + timeout_ms;
+    while (clock.nowMs() < deadline) {
+        _ = app.drainLive(2_000);
+        const shot = app.snapshotRgba(win_id, null) catch {
+            _ = app.pumpOnce(300);
+            continue;
+        };
+        defer allocator.free(shot.px);
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        for ([_]u32{ 1, 2 }) |scale| {
+            const px = if (scale == 1)
+                shot.px
+            else
+                png_util.upscaleRgba(arena.allocator(), shot.px, shot.w, shot.h, scale) catch continue;
+            for ([_]i32{ 11, 6 }) |psm| {
+                const res = ocr.recognize(arena.allocator(), px, shot.w * scale, shot.h * scale, .{ .psm = psm }) catch continue;
+                for (res.words) |w| {
+                    if (std.mem.indexOf(u8, w.text, needle) == null) continue;
+                    const s = @as(f64, @floatFromInt(scale));
+                    const x = (@as(f64, @floatFromInt(w.x)) + @as(f64, @floatFromInt(w.w)) / 2) / s;
+                    const y = (@as(f64, @floatFromInt(w.y)) + @as(f64, @floatFromInt(w.h)) / 2) / s;
+                    // Rows only: the places sidebar's Recent entries end
+                    // in the same folder names ("…g/DEEPER"), and the
+                    // information panel names the selected one.
+                    if (x < 215 or x > 700 or y < 230) continue;
+                    return .{ .x = x, .y = y };
+                }
+            }
+        }
+        _ = app.pumpOnce(300);
+    }
+    return null;
+}
+
+/// The bugs an afternoon of driving `sketerm files` by hand turned up,
+/// each pinned on the live GUI because only the GUI shows it: the
+/// status count over hidden rows, the transfers strip on a trash, Keep
+/// Both's naming, the focus after a typed location, the information
+/// panel after Up, and a row dragged onto a folder row.
+fn filesBrowserBugsStage(
+    allocator: std.mem.Allocator,
+    app: *appdrive.App,
+    rt: []const u8,
+    wl: [*:0]const u8,
+) ?[]const u8 {
+    const ocr = @import("util/ocr.zig");
+    if (!ocr.available()) {
+        say("files bugs: tesseract unavailable; skipping");
+        return null;
+    }
+
+    var dir_buf: [512:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "{s}/fbug", .{rt}) catch return "files bugs: dir path";
+    _ = c.mkdir(dir.ptr, 0o700);
+    var p: [6][600:0]u8 = undefined;
+    const aaa = std.fmt.bufPrintZ(&p[0], "{s}/AAAROW.txt", .{dir}) catch return "files bugs: path";
+    const hidden = std.fmt.bufPrintZ(&p[1], "{s}/.HIDDENROW.txt", .{dir}) catch return "files bugs: path";
+    const sub = std.fmt.bufPrintZ(&p[2], "{s}/DEEPER", .{dir}) catch return "files bugs: path";
+    const dragme = std.fmt.bufPrintZ(&p[3], "{s}/DRAGME.txt", .{dir}) catch return "files bugs: path";
+    const pasted = std.fmt.bufPrintZ(&p[4], "{s}/DEEPER/AAAROW.txt", .{dir}) catch return "files bugs: path";
+    const kept = std.fmt.bufPrintZ(&p[5], "{s}/DEEPER/AAAROW (copy).txt", .{dir}) catch return "files bugs: path";
+    if (!writeFile(aaa, "aaa\n") or !writeFile(hidden, "hidden\n") or !writeFile(dragme, "drag\n"))
+        return "files bugs: seed";
+    _ = c.mkdir(sub.ptr, 0o700);
+
+    const child = launchRenameFiles(app, dir, "fbug", "", wl) orelse
+        return "files bugs: the Files window never appeared";
+    defer if (renamefiles_pid > 0) reap(renamefiles_pid, c.SIGTERM, 3000);
+    if (!viewerWaitOcr(allocator, app, child.win, "AAAROW", 40_000))
+        return "files bugs: the listing never rendered";
+    _ = app.waitVisualSettle(child.win, 400, 10_000, 0.002, null);
+
+    // -- 1. the status count is the rows on screen, hidden ones named --
+    // Three rows are visible, one entry is hidden: "3 items (1 hidden)",
+    // not the "4 items" that counted what the toggle keeps off screen.
+    if (!viewerWaitOcr(allocator, app, child.win, "1 hidden", 15_000)) {
+        viewerShot(allocator, app, child.win, "files-bugs-count");
+        return "files bugs: the status line did not say how many rows are hidden";
+    }
+    say("files bugs: the status count named the hidden entry instead of counting it");
+
+    // -- 2. a trash is reported as a trash, not as a copy of N bytes --
+    // Focus the listing with a click on empty space, type-ahead to the
+    // row, Delete.
+    const win = app.winById(child.win) orelse return "files bugs: window vanished";
+    const w = @as(f64, @floatFromInt(win.w));
+    const h = @as(f64, @floatFromInt(win.h));
+    app.clickEx(child.win, w * 0.58, h * 0.8, 1, 60, 1) catch return "files bugs: focusing the listing failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(child.win, "a") catch return "files bugs: type-ahead failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(child.win, "Delete") catch return "files bugs: Delete failed";
+    if (!waitPathState(aaa, false, 15_000, app)) {
+        viewerShot(allocator, app, child.win, "files-bugs-trash");
+        return "files bugs: Delete did not trash the type-ahead row";
+    }
+    if (!viewerWaitOcr(allocator, app, child.win, "Trashed 1 item", 15_000)) {
+        viewerShot(allocator, app, child.win, "files-bugs-trash-strip");
+        return "files bugs: the transfers strip did not report the trash as a trash";
+    }
+    say("files bugs: the strip read \"Trashed 1 item\" for a trash");
+    // Undo brings it back; the two finished jobs are different kinds.
+    app.pressKey(child.win, "ctrl+z") catch return "files bugs: ctrl+z failed";
+    if (!waitPathState(aaa, true, 15_000, app)) return "files bugs: undo did not restore the trashed file";
+    if (!viewerWaitOcr(allocator, app, child.win, "2 operations finished", 15_000)) {
+        viewerShot(allocator, app, child.win, "files-bugs-restore-strip");
+        return "files bugs: trash + restore did not read as two finished operations";
+    }
+    pumpRenameFor(app, 1_200);
+
+    // -- 3. Keep Both keeps the extension --
+    // The restored row is selected: copy it, paste it into DEEPER twice;
+    // the second paste conflicts and Keep Both must make "AAAROW (copy).txt".
+    app.pressKey(child.win, "ctrl+c") catch return "files bugs: ctrl+c failed";
+    pumpRenameFor(app, 300);
+    // Ctrl+V in the same folder duplicates beside the original (it
+    // used to say "nothing to paste here").
+    var dup_buf: [600:0]u8 = undefined;
+    const dup = std.fmt.bufPrintZ(&dup_buf, "{s}/AAAROW (copy).txt", .{dir}) catch return "files bugs: path";
+    app.pressKey(child.win, "ctrl+v") catch return "files bugs: in-place paste failed";
+    if (!waitPathState(dup, true, 20_000, app)) {
+        viewerShot(allocator, app, child.win, "files-bugs-inplace");
+        return "files bugs: Ctrl+V in the source folder did not duplicate the entry";
+    }
+    say("files bugs: Ctrl+V in the source folder duplicated the entry");
+    pumpRenameFor(app, 1_200);
+    const deeper_row = ocrRowCenter(allocator, app, child.win, "DEEPER", 10_000) orelse {
+        viewerShot(allocator, app, child.win, "files-bugs-norow");
+        return "files bugs: DEEPER row not found";
+    };
+    app.clickEx(child.win, deeper_row.x, deeper_row.y, 1, 60, 2) catch return "files bugs: opening DEEPER failed";
+    pumpRenameFor(app, 1_500);
+    app.clickEx(child.win, w * 0.58, h * 0.8, 1, 60, 1) catch return "files bugs: focusing DEEPER failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(child.win, "ctrl+v") catch return "files bugs: first paste failed";
+    if (!waitPathState(pasted, true, 20_000, app)) {
+        viewerShot(allocator, app, child.win, "files-bugs-paste");
+        return "files bugs: the paste into DEEPER never landed";
+    }
+    pumpRenameFor(app, 1_500);
+    if (openPopup(app) != null) return "files bugs: a popup was open before the conflicting paste";
+    app.pressKey(child.win, "ctrl+v") catch return "files bugs: second paste failed";
+    const conflict_pop = waitPopup(app, true, 15_000) orelse {
+        viewerShot(allocator, app, child.win, "files-bugs-noconflict");
+        return "files bugs: pasting over an existing name opened no conflict popover";
+    };
+    // The popover grows when the two stat replies fill its detail rows,
+    // which moves the buttons: settle on it, and re-aim the click when
+    // the first one landed on the old layout.
+    _ = app.waitVisualSettle(conflict_pop, 800, 8_000, 0.002, null);
+    var attempt: u32 = 0;
+    while (attempt < 3 and c.access(kept.ptr, c.F_OK) != 0) : (attempt += 1) {
+        const pop = openPopup(app) orelse break;
+        if (!clickOcrWord(allocator, app, pop, "Keep", 1, 8_000)) {
+            viewerShot(allocator, app, pop, "files-bugs-conflict");
+            return "files bugs: the conflict popover shows no Keep Both";
+        }
+        _ = waitPathState(kept, true, 6_000, app);
+    }
+    if (!waitPathState(kept, true, 10_000, app)) {
+        viewerShot(allocator, app, child.win, "files-bugs-keepboth");
+        return "files bugs: Keep Both did not name the copy \"AAAROW (copy).txt\"";
+    }
+    say("files bugs: Keep Both kept the extension");
+    pumpRenameFor(app, 1_000);
+
+    // -- 4. Enter in the location entry hands the keyboard to the listing --
+    // Type the parent folder, Enter, then type-ahead + Delete with no
+    // click in between: the trash proves the keys reached the rows.
+    app.pressKey(child.win, "ctrl+l") catch return "files bugs: ctrl+l failed";
+    pumpRenameFor(app, 500);
+    app.pressKey(null, "ctrl+a") catch return "files bugs: select-all in the location bar failed";
+    app.typeText(null, dir) catch return "files bugs: typing the folder failed";
+    pumpRenameFor(app, 200);
+    app.pressKey(null, "Enter") catch return "files bugs: navigating failed";
+    if (!viewerWaitOcr(allocator, app, child.win, "DRAGME", 20_000))
+        return "files bugs: the parent folder never rendered";
+    pumpRenameFor(app, 800);
+    // "dr", not "d": directories sort first, so a lone "d" lands on
+    // DEEPER.
+    app.typeText(child.win, "dr") catch return "files bugs: type-ahead after Enter failed";
+    pumpRenameFor(app, 300);
+    app.pressKey(child.win, "Delete") catch return "files bugs: Delete after Enter failed";
+    if (!waitPathState(dragme, false, 15_000, app)) {
+        viewerShot(allocator, app, child.win, "files-bugs-focus");
+        return "files bugs: after Enter in the location entry the listing did not take the keys";
+    }
+    say("files bugs: Enter in the location entry left the keyboard on the listing");
+    // The file is gone before the job's done reply pushes the undo
+    // record; an immediate Ctrl+Z would pop the operation before it.
+    pumpRenameFor(app, 1_500);
+    app.pressKey(child.win, "ctrl+z") catch return "files bugs: ctrl+z failed";
+    if (!waitPathState(dragme, true, 15_000, app)) {
+        viewerShot(allocator, app, child.win, "files-bugs-undo");
+        return "files bugs: undo did not restore DRAGME";
+    }
+    pumpRenameFor(app, 1_200);
+
+    // -- 5. the information panel follows a navigation --
+    // The toolbar's Information toggle (three buttons left of the
+    // hamburger in the right-hand cluster), select AAAROW, Alt+Up: the
+    // panel must describe the parent, not the entry selected below.
+    app.clickEx(child.win, w - 37 - 120, 138, 1, 80, 1) catch return "files bugs: info toggle click failed";
+    // The panel carries its own "Permissions" row under the column
+    // header of the same name: two reads once it is up.
+    pumpRenameFor(app, 1_000);
+    if ((ocrCount(allocator, app, child.win, "Permissions") orelse 0) < 2) {
+        viewerShot(allocator, app, child.win, "files-bugs-infotoggle");
+        return "files bugs: the Information toggle opened no panel";
+    }
+    const aaa_row = ocrRowCenter(allocator, app, child.win, "AAAROW", 10_000) orelse return "files bugs: AAAROW row not found";
+    app.clickEx(child.win, aaa_row.x, aaa_row.y, 1, 60, 1) catch return "files bugs: selecting AAAROW failed";
+    pumpRenameFor(app, 1_000);
+    // The panel names the selected entry: AAAROW now reads three
+    // times (the two rows + the panel head).
+    const before = ocrCount(allocator, app, child.win, "AAAROW") orelse 0;
+    if (before < 3) {
+        viewerShot(allocator, app, child.win, "files-bugs-panel");
+        return "files bugs: the information panel did not show the selected entry";
+    }
+    app.pressKey(child.win, "alt+Up") catch return "files bugs: alt+Up failed";
+    if (!viewerWaitOcr(allocator, app, child.win, "fbug", 20_000)) return "files bugs: the parent never rendered";
+    pumpRenameFor(app, 1_500);
+    const after = ocrCount(allocator, app, child.win, "AAAROW") orelse 0;
+    if (after != 0) {
+        viewerShot(allocator, app, child.win, "files-bugs-panel-stale");
+        return "files bugs: the information panel kept the entry selected in the folder just left";
+    }
+    say("files bugs: the information panel followed Alt+Up");
+    app.pressKey(child.win, "alt+Left") catch return "files bugs: alt+Left failed";
+    if (!viewerWaitOcr(allocator, app, child.win, "DRAGME", 20_000)) return "files bugs: back never rendered";
+    pumpRenameFor(app, 1_000);
+
+    // -- 6. a row dragged onto a folder row moves into it --
+    var moved_buf: [600:0]u8 = undefined;
+    const moved = std.fmt.bufPrintZ(&moved_buf, "{s}/DEEPER/DRAGME.txt", .{dir}) catch return "files bugs: path";
+    const from = ocrRowCenter(allocator, app, child.win, "DRAGME", 10_000) orelse return "files bugs: DRAGME row not found";
+    const onto = ocrRowCenter(allocator, app, child.win, "DEEPER", 10_000) orelse return "files bugs: DEEPER row not found";
+    app.dragDnd(child.win, from.x, from.y, onto.x, onto.y, 1) catch return "files bugs: the drag failed";
+    if (!waitPathState(moved, true, 20_000, app)) {
+        viewerShot(allocator, app, child.win, "files-bugs-dnd");
+        return "files bugs: dragging a row onto a folder row did not move it there";
+    }
+    say("files bugs: a row dragged onto a folder row moved into it");
+
+    if (!closeRenameFiles(app, child)) return "files bugs: the Files window did not close cleanly";
     return null;
 }
 
