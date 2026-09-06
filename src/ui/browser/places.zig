@@ -708,11 +708,16 @@ fn sectionKeyForTitle(self: *BrowserView, title: []const u8, buf: []u8) ?[]const
     for (places_mod.builtin_sections) |def| {
         if (std.mem.eql(u8, def.title, title)) return def.key;
     }
+    // A user's own widget section wins over the host-section SUFFIX
+    // rule below, which is a guess about a name the user did not
+    // choose: a section named "Work Places" used to answer "remote",
+    // so its menu reordered and hid the Remote Places section instead
+    // and its own widget rows never appeared.
+    if (self.widgets.sectionByName(title) != null)
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ places_mod.WIDGET_KEY_PREFIX, title }) catch null;
     // Host sections ("Archdev Places") all belong to the one
     // "remote" slot.
     if (std.mem.endsWith(u8, title, " Places")) return "remote";
-    if (self.widgets.sectionByName(title) != null)
-        return std.fmt.bufPrint(buf, "{s}{s}", .{ places_mod.WIDGET_KEY_PREFIX, title }) catch null;
     return null;
 }
 
