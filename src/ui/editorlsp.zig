@@ -1560,6 +1560,13 @@ pub const Manager = struct {
         }
         if (local) cn.refs = 0;
         if (self.list.open and self.list.mode != .none) self.closePopup();
+        // Session.markDead drops the pending table WITHOUT calling back,
+        // so an in-flight completion that never got a popup would keep
+        // `completion_request_conn` pointing at the Conn the idle
+        // remover is about to free — and the next session's ids restart
+        // at 1, so a same-address replacement could compare equal.
+        self.invalidateCompletion();
+        if (self.hover.open) self.closeHover();
         self.closeSignature();
         cn.dropWatches();
         // Session callbacks are reached from fd and child-watch
@@ -1727,6 +1734,11 @@ pub const Manager = struct {
         tab.layout.hints = &.{};
         tab.layout.hints_gen = 0;
         if (st.conn) |cn| self.detachFromConn(tab, st, cn);
+        // The state is about to be freed; it is registered as the
+        // document's observer slot 2. Only tab destruction happening to
+        // follow on the next line kept this from being a use-after-free
+        // on the next keystroke.
+        tab.doc.removeObserver(@ptrCast(st));
         st.destroy();
         tab.lsp = null;
     }
@@ -2304,9 +2316,16 @@ pub const Manager = struct {
 
     fn onLocations(self: *Manager, cn: *Conn, req: session.Request, env: rpc.Envelope, maybe_tab: ?*ETab) void {
         const tab = maybe_tab orelse return;
-        _ = tab;
         if (env.has_error) {
             self.view.setStatusText("The server could not answer that.");
+            return;
+        }
+        // Staleness, same discipline as every other offset-bearing
+        // answer: the line/character pairs are measured against text
+        // that no longer exists, and a same-file jump would land the
+        // caret on whatever now occupies that line.
+        if (tab.doc.revision != req.revision) {
+            dbg("locations dropped: stale (req {d}, doc {d})", .{ req.revision, tab.doc.revision });
             return;
         }
         self.list.clearItems();
@@ -2316,7 +2335,10 @@ pub const Manager = struct {
         self.list.filter.clearRetainingCapacity();
         self.collectLocations(cn, env.result);
         if (self.list.items.items.len == 0) {
-            self.list.mode = .none;
+            // closePopup, not `mode = .none`: leaving `open` set kept an
+            // already-mapped popover on screen swallowing Return, Tab
+            // and the arrows through `handleKey`.
+            self.closePopup();
             self.view.setStatusText("No results.");
             return;
         }
@@ -2325,8 +2347,7 @@ pub const Manager = struct {
             // every editor does.
             const it = self.list.items.items[0];
             self.openLocation(it.payload, it.line, it.col);
-            self.list.clearItems();
-            self.list.mode = .none;
+            self.closePopup();
             return;
         }
         self.applyFilter();
@@ -2480,6 +2501,16 @@ pub const Manager = struct {
             self.view.setStatusText("The server could not answer that.");
             return;
         }
+        // A DOCUMENT symbol answer is measured against this tab's text;
+        // a workspace one is not tab-scoped and has nothing to go stale
+        // against.
+        if (req.kind == .document_symbol) {
+            const tab = maybe_tab orelse return;
+            if (tab.doc.revision != req.revision) {
+                dbg("symbols dropped: stale (req {d}, doc {d})", .{ req.revision, tab.doc.revision });
+                return;
+            }
+        }
         self.list.clearItems();
         self.list.mode = .symbols;
         self.list.tab_id = req.tab_id;
@@ -2491,7 +2522,7 @@ pub const Manager = struct {
         };
         self.collectSymbols(cn, env.result, own_spec, 0);
         if (self.list.items.items.len == 0) {
-            self.list.mode = .none;
+            self.closePopup();
             self.view.setStatusText("No symbols.");
             return;
         }
@@ -2649,22 +2680,28 @@ pub const Manager = struct {
         var out = EditOutcome{};
         // `documentChanges` (ordered, versioned) wins over `changes`
         // when both are present, per the spec.
-        if (obj.get("documentChanges")) |dc| {
-            if (dc == .array) {
-                if (!self.documentChangesCurrent(cn, dc.array.items)) return .{ .stale = true };
-                for (dc.array.items) |entry| {
-                    if (entry != .object) continue;
-                    // create/rename/delete file operations carry a
-                    // `kind` instead of edits.
-                    if (entry.object.get("kind") != null) {
-                        out.file_ops += 1;
-                        continue;
-                    }
-                    const td = entry.object.get("textDocument") orelse continue;
-                    const uri = strOf(if (td == .object) td.object.get("uri") else null) orelse continue;
-                    const edits = entry.object.get("edits") orelse continue;
-                    self.applyEditsToUri(cn, uri, edits, &out);
+        // A serializer that emits nulls for absent optionals sends
+        // `"documentChanges": null` alongside a real `changes` map;
+        // matching on presence alone dropped the whole edit and then
+        // reported "Renamed in 0 file(s)."
+        const doc_changes: ?std.json.Value = switch (obj.get("documentChanges") orelse std.json.Value.null) {
+            .array => obj.get("documentChanges"),
+            else => null,
+        };
+        if (doc_changes) |dc| {
+            if (!self.documentChangesCurrent(cn, dc.array.items)) return .{ .stale = true };
+            for (dc.array.items) |entry| {
+                if (entry != .object) continue;
+                // create/rename/delete file operations carry a `kind`
+                // instead of edits.
+                if (entry.object.get("kind") != null) {
+                    out.file_ops += 1;
+                    continue;
                 }
+                const td = entry.object.get("textDocument") orelse continue;
+                const uri = strOf(if (td == .object) td.object.get("uri") else null) orelse continue;
+                const edits = entry.object.get("edits") orelse continue;
+                self.applyEditsToUri(cn, uri, edits, &out);
             }
         } else if (obj.get("changes")) |ch| {
             if (ch == .object) {
@@ -3150,7 +3187,7 @@ pub const Manager = struct {
             };
         }
         if (self.list.items.items.len == 0) {
-            self.list.mode = .none;
+            self.closePopup();
             self.view.setStatusText("No code actions here.");
             return;
         }

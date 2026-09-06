@@ -1208,9 +1208,14 @@ pub const EditorView = struct {
         // a config change lands without restarting the editor.
         if (!cfg.editor_lsp) {
             if (self.lsp) |m| {
+                // Each tab's TabState owns four GLib timers and a
+                // document observer. Dropping the pointer left both
+                // live against a Manager that `destroy` had freed: the
+                // next debounce tick resolved through it, and every
+                // keystroke ran `observeEdits` against a freed `Conn`.
+                for (self.tabs.items) |t| m.detachTab(t);
                 m.destroy();
                 self.lsp = null;
-                for (self.tabs.items) |t| t.lsp = null;
             }
         } else {
             for (self.tabs.items) |t| self.attachLsp(t);
@@ -4618,6 +4623,12 @@ pub const EditorView = struct {
         } else {
             self.scheduleParse(tab);
         }
+        // The LSP observer captured the diff as ordinary edits, but this
+        // path does not go through `afterDocEdit` — the only other
+        // caller of `onEdited` — so nothing armed the didChange
+        // debounce and the server kept the pre-reload text (and its
+        // diagnostics) until the user happened to type.
+        if (self.lsp) |m| m.onEdited(tab);
         self.clampAnchor(tab, self.viewportHeightPx());
         editorproj.refreshGit(self, tab);
         editoroutline.refresh(self, tab, true);
