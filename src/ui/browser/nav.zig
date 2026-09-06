@@ -1435,7 +1435,10 @@ pub fn selectPattern(self: *BrowserView, pattern: []const u8, invert: bool) void
 
 pub fn selectPatternDirs(self: *BrowserView, tab: *BTab, dirs: []const *Dir, pattern: []const u8, invert: bool, existing: *std.StringHashMap(void)) void {
     for (dirs) |dir| for (dir.entries.items) |entry| {
-        if (!tab.show_hidden and entry.name.len > 0 and entry.name[0] == '.') continue;
+        // The one visibility predicate, not a hand-rolled half of it:
+        // a pattern select that reached past the live filter or the
+        // picker's rule armed rows the user could not see.
+        if (!@import("views.zig").entryVisible(tab, entry)) continue;
         var path_buf: [4200]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ if (dir.path.len == 1) "" else dir.path, entry.name }) catch continue;
         const matched = fsjob.nameMatches(pattern, entry.name);
