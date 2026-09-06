@@ -58,6 +58,12 @@ pub const MAX_GROUPS: usize = 10;
 pub const MAX_PROGRAM: usize = 20000;
 /// Largest accepted repetition bound.
 pub const MAX_REPEAT: u32 = 1000;
+/// Deepest accepted group nesting. The parser and the compiler both
+/// recurse once per level, and NON-capturing groups are not counted by
+/// `MAX_GROUPS`, so without this a pasted `(?:(?:(?:...x...)))` of a few
+/// hundred thousand levels overflowed the stack and killed the process
+/// instead of being refused. No real pattern comes near 200.
+pub const MAX_DEPTH: u16 = 200;
 
 pub const Error = error{
     InvalidPattern,
@@ -268,6 +274,8 @@ const Parser = struct {
     classes: *std.ArrayList(Class),
     class_alloc: Allocator,
     n_groups: u16 = 1,
+    /// Current group nesting; see `MAX_DEPTH`.
+    depth: u16 = 0,
 
     fn node(self: *Parser, v: Node) Error!*Node {
         const n = try self.arena.create(Node);
@@ -299,6 +307,12 @@ const Parser = struct {
     }
 
     fn parseAlt(self: *Parser) Error!*Node {
+        // The one recursion cycle in the grammar passes through here
+        // (parseAlt -> parseCat -> parseRepeat -> parseAtom -> parseAlt),
+        // so this is the only place that has to count.
+        if (self.depth >= MAX_DEPTH) return Error.PatternTooComplex;
+        self.depth += 1;
+        defer self.depth -= 1;
         var branches: std.ArrayList(*Node) = .empty;
         defer branches.deinit(self.arena);
         try branches.append(self.arena, try self.parseCat());
@@ -1115,6 +1129,35 @@ test "regex: invalid and unsupported patterns are refused" {
     try testing.expectError(Error.UnsupportedPattern, compile(a, "(?i)a", .{}));
     try testing.expectError(Error.PatternTooComplex, compile(a, "a{2000}", .{}));
     try testing.expectError(Error.UnsupportedPattern, compile(a, "(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)", .{}));
+}
+
+test "regex: a deeply nested pattern is refused, not a stack overflow" {
+    // MAX_GROUPS only counts CAPTURING groups, so `(?:` nests without
+    // limit; the parser and compiler each recurse once per level and a
+    // pasted pattern of a few hundred thousand levels killed the
+    // process.
+    const a = testing.allocator;
+    const n = MAX_DEPTH * 4;
+    var pat: std.ArrayList(u8) = .empty;
+    defer pat.deinit(a);
+    var i: usize = 0;
+    while (i < n) : (i += 1) try pat.appendSlice(a, "(?:");
+    try pat.append(a, 'x');
+    i = 0;
+    while (i < n) : (i += 1) try pat.append(a, ')');
+    try testing.expectError(Error.PatternTooComplex, compile(a, pat.items, .{}));
+
+    // Nesting that stays inside the limit still compiles and matches.
+    var ok: std.ArrayList(u8) = .empty;
+    defer ok.deinit(a);
+    i = 0;
+    while (i < 20) : (i += 1) try ok.appendSlice(a, "(?:");
+    try ok.append(a, 'x');
+    i = 0;
+    while (i < 20) : (i += 1) try ok.append(a, ')');
+    const got = try findAllSlice(a, ok.items, "axb", .{});
+    defer a.free(got);
+    try testing.expectEqual(@as(usize, 1), got.len);
 }
 
 test "regex: catastrophic backtracking patterns still complete quickly" {
