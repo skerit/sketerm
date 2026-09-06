@@ -964,6 +964,30 @@ pub fn remoteShLine(arena: std.mem.Allocator, script: []const u8) ![]const u8 {
     return std.fmt.allocPrint(arena, "echo {s} | base64 -d | sh", .{b64});
 }
 
+/// One `port_forward_list` element.
+///
+/// `host`/`remote_host` are CALLER-supplied and must go through the JSON
+/// encoder: ssh resolves a `-L` spec's remote host only when a connection
+/// arrives, so it binds the local port for one holding a quote or a
+/// newline, the forward registers, and a hand-written object then emitted
+/// that byte raw — invalid JSON, and a newline splits the NDJSON line.
+fn forwardElemJson(
+    w: *std.Io.Writer,
+    id: u32,
+    host: []const u8,
+    local_port: u16,
+    remote_host: []const u8,
+    remote_port: u16,
+    alive: bool,
+    reconnects: u32,
+) !void {
+    try w.print("{{\"forward\":{d},\"host\":", .{id});
+    try std.json.Stringify.value(host, .{}, w);
+    try w.print(",\"local_port\":{d},\"remote_host\":", .{local_port});
+    try std.json.Stringify.value(remote_host, .{}, w);
+    try w.print(",\"remote_port\":{d},\"alive\":{},\"reconnects\":{d}}}", .{ remote_port, alive, reconnects });
+}
+
 /// Full ssh argv running `script` on `host`, honouring the host's
 /// forced route.
 ///
@@ -1202,7 +1226,7 @@ pub fn xferTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value
         for (mcp.forward_state.forwards.values(), 0..) |f, i| {
             if (i > 0) try w.writeAll(",");
             f.term.drain();
-            try w.print("{{\"forward\":{d},\"host\":\"{s}\",\"local_port\":{d},\"remote_host\":\"{s}\",\"remote_port\":{d},\"alive\":{},\"reconnects\":{d}}}", .{ f.id, f.host, f.local_port, f.remote_host, f.remote_port, !f.term.exited, f.reconnects });
+            try forwardElemJson(w, f.id, f.host, f.local_port, f.remote_host, f.remote_port, !f.term.exited, f.reconnects);
             try res.textf("forward {d}: 127.0.0.1:{d} -> {s} ({s}:{d}), alive: {}, reconnects: {d}", .{ f.id, f.local_port, f.host, f.remote_host, f.remote_port, !f.term.exited, f.reconnects });
         }
         try w.writeAll("]");
@@ -1418,6 +1442,24 @@ test "scp_put result: transfer facts structured, one prose line" {
     const down = try xferOk(arena, "download", "/tmp/x.bin", null, sha);
     const dparsed = try mcp.expectToolResultShape(arena, "scp_get", down);
     try t.expectEqual(std.json.Value{ .null = {} }, dparsed.object.get("structuredContent").?.object.get("bytes").?);
+}
+
+test "port_forward_list elements survive a hostile remote_host" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    // ssh listens for a -L spec it cannot resolve until a connection
+    // arrives, so this forward really does register and get listed.
+    try forwardElemJson(&aw.writer, 3, "box", 9000, "a\"b\nc", 22, true, 0);
+    const line = aw.written();
+    try t.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{});
+    try t.expectEqualStrings("a\"b\nc", parsed.object.get("remote_host").?.string);
+    try t.expectEqual(@as(i64, 3), parsed.object.get("forward").?.integer);
+    try t.expect(parsed.object.get("alive").?.bool);
 }
 
 test "remoteShArgv keeps a forced route off the ssh destination" {
