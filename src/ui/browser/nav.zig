@@ -1534,8 +1534,12 @@ pub fn onPathActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) void {
     }
     self.navigateSpec(tab, spec);
     // The typed location is committed: hand the toolbar back to the
-    // breadcrumb face.
+    // breadcrumb face. The navigation's own refocus ran while this
+    // entry was still visible and focused, so it left the focus here;
+    // folding the face would then park it on a hidden widget, where
+    // End, type-ahead and every listing chord go nowhere until a click.
     _ = self.showCrumbFace();
+    self.focusListing();
 }
 
 pub fn onSwitchPage(_: *c.GtkNotebook, _: *c.GtkWidget, _: c.guint, user: ?*anyopaque) callconv(.c) void {
