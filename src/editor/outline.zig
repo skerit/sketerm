@@ -228,11 +228,23 @@ pub const Outline = struct {
     /// Deepest symbol containing `offset` — the row a panel highlights
     /// as the caret moves. Nodes are in document order with parents
     /// first, so the LAST container wins.
+    ///
+    /// Deliberately NOT stopping at the first node past `offset`: a flat
+    /// `SymbolInformation[]` reply is under no obligation to be in
+    /// document order (several servers sort by name), and `fromLsp`
+    /// pushes symbols in reply order. An early exit made the panel
+    /// highlight nothing at all for those servers. `MAX_NODES` bounds
+    /// the walk.
     pub fn indexAt(self: *const Outline, offset: usize) ?usize {
         var best: ?usize = null;
         for (self.nodes.items, 0..) |n, i| {
-            if (n.start > offset) break;
-            if (offset <= n.end) best = i;
+            if (n.start > offset or offset > n.end) continue;
+            if (best) |b| {
+                // Later wins at equal depth (parents come first), but a
+                // node that starts later is the tighter container.
+                if (n.start < self.nodes.items[b].start) continue;
+            }
+            best = i;
         }
         return best;
     }
@@ -537,6 +549,19 @@ test "outline: push, read back and caret tracking" {
     try testing.expectEqual(@as(usize, 0), o.indexAt(80).?);
     try testing.expectEqual(@as(usize, 2), o.indexAt(150).?);
     try testing.expect(o.indexAt(110) == null);
+}
+
+test "outline: indexAt works on symbols that are not in document order" {
+    // A flat SymbolInformation[] reply may be sorted by name; fromLsp
+    // pushes in reply order, and stopping at the first node past the
+    // offset then highlighted nothing at all.
+    var o = Outline.init(testing.allocator);
+    defer o.deinit();
+    try o.push(.{ .kind = .function, .depth = 0, .start = 100, .end = 200, .sel = 100, .name = "zeta" });
+    try o.push(.{ .kind = .function, .depth = 0, .start = 0, .end = 50, .sel = 0, .name = "alpha" });
+    try testing.expectEqual(@as(usize, 1), o.indexAt(10).?);
+    try testing.expectEqual(@as(usize, 0), o.indexAt(150).?);
+    try testing.expect(o.indexAt(75) == null);
 }
 
 test "outline: an over-long name is truncated on a codepoint boundary" {
