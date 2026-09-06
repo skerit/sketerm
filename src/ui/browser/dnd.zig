@@ -179,22 +179,21 @@ pub fn provider(tab: *BTab, dragged: []const u8) ?*c.GdkContentProvider {
 
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(allocator);
-    if (count == 1) {
-        text.appendSlice(allocator, specs[0]) catch {
+    // Quoted whatever the count. A lone spec used to travel bare, and
+    // a terminal pane pastes this flavor VERBATIM -- so a name with a
+    // space landed as two arguments and a name with a newline
+    // submitted its tail as a command line, while the same drag of two
+    // rows was quoted. `ValueIter` decodes both spellings, so the one
+    // rule is the safe one.
+    for (specs, 0..) |spec, i| {
+        if (i > 0) text.append(allocator, ' ') catch {
             c.g_object_unref(vector_provider);
             return null;
         };
-    } else {
-        for (specs, 0..) |spec, i| {
-            if (i > 0) text.append(allocator, ' ') catch {
-                c.g_object_unref(vector_provider);
-                return null;
-            };
-            appendQuoted(&text, allocator, spec) catch {
-                c.g_object_unref(vector_provider);
-                return null;
-            };
-        }
+        appendQuoted(&text, allocator, spec) catch {
+            c.g_object_unref(vector_provider);
+            return null;
+        };
     }
     text.append(allocator, 0) catch {
         c.g_object_unref(vector_provider);
@@ -291,6 +290,27 @@ test "quoted fallback preserves multiple specs and apostrophes" {
     defer it.deinit();
     try t.expectEqualStrings("/a one", it.next().?);
     try t.expectEqualStrings("box:/b'two", it.next().?);
+    try t.expect(it.next() == null);
+}
+
+test "a lone spec is quoted too, and decodes back to itself" {
+    const t = std.testing;
+    // What `provider` now writes for ONE row whose name has a space
+    // and a newline. A terminal pane pastes this text verbatim, so an
+    // unquoted spelling submitted everything past the newline.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(t.allocator);
+    try appendQuoted(&text, t.allocator, "/tmp/od d\nrm -rf x");
+    try text.append(t.allocator, 0);
+    try t.expectEqualStrings("'/tmp/od d\nrm -rf x'", text.items[0 .. text.items.len - 1]);
+
+    var value: c.GValue = std.mem.zeroes(c.GValue);
+    _ = c.g_value_init(&value, c.G_TYPE_STRING);
+    defer c.g_value_unset(&value);
+    c.g_value_set_string(&value, text.items.ptr);
+    var it = ValueIter.init(t.allocator, &value);
+    defer it.deinit();
+    try t.expectEqualStrings("/tmp/od d\nrm -rf x", it.next().?);
     try t.expect(it.next() == null);
 }
 
