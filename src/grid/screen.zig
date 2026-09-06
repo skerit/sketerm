@@ -3796,7 +3796,16 @@ pub const Screen = struct {
         while (i < total) {
             const remaining: u16 = if (self.col >= self.cols) 0 else self.cols - self.col;
             if (remaining == 0) {
-                if (!self.autowrap) break;
+                if (self.cols == 0) break;
+                if (!self.autowrap) {
+                    // DECAWM off: the rest of the run keeps overwriting
+                    // the last column, which is what `printCp` does. This
+                    // used to drop the tail instead, so the same bytes
+                    // rendered differently depending on where the
+                    // parser's 64-byte run boundary happened to fall.
+                    self.col = self.cols - 1;
+                    continue;
+                }
                 self.lineFeed();
                 self.col = 0;
                 self.line(self.row).continues_above = true;
@@ -8976,4 +8985,19 @@ test "resize to one column keeps a wide glyph instead of failing" {
     try s.resize(1, 2);
     try std.testing.expectEqual(@as(u16, 1), s.cols);
     for (s.active) |ln| try std.testing.expectEqual(@as(usize, 1), ln.cells.len);
+}
+
+test "autowrap off overwrites the last column for the rest of a print run" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 4, 2);
+    defer s.deinit();
+    s.autowrap = false;
+    var run: Event.PrintRun = .{};
+    @memcpy(run.bytes[0..6], "abcdef");
+    run.len = 6;
+    s.apply(.{ .print_run = run });
+    try std.testing.expectEqual(@as(u32, 'a'), s.cellAt(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'f'), s.cellAt(0, 3).rune);
+    try std.testing.expectEqual(@as(u16, 3), s.col);
 }
