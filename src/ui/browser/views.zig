@@ -293,9 +293,18 @@ pub fn installViewGestures(self: *BrowserView, tab: *BTab, page: *c.GtkWidget) v
 /// bucket never appears twice in one listing.
 pub fn groupFor(tab: *BTab, e: Entry, now_ms: i64) grouping.Group {
     if (tab.dirs_first and e.tdir) return grouping.folders();
+    // The same label the Type column shows and the Type sort orders
+    // by: `e.kind` is the daemon's four-word vocabulary, so grouping
+    // by Type used to print headers reading literally "file" over
+    // rows whose Type cell said "Image".
+    var type_buf: [256:0]u8 = undefined;
+    const kind: []const u8 = if (tab.sort_key == .kind)
+        std.mem.span(@import("render.zig").coarseTypeZ(e, &type_buf))
+    else
+        e.kind;
     return grouping.groupOf(tab.sort_key, .{
         .name = e.name,
-        .kind = e.kind,
+        .kind = kind,
         .size = e.size,
         .mtime_ms = e.mtime_ms,
         .ctime_ms = e.ctime_ms,

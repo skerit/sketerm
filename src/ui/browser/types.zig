@@ -600,7 +600,53 @@ pub const Dir = struct {
         }
     }
 
+    /// Longest coarse type label kept for ordering. Longer glib
+    /// descriptions tie on their first 47 bytes and fall to the name.
+    const TYPE_LABEL_MAX = 47;
+
+    /// Sorting by Type means the label the Type COLUMN shows.
+    ///
+    /// The comparator compared `Entry.kind`, which the daemon fills
+    /// with one of four words (dir/file/link/other) while the column
+    /// displays a coarse type ("Image", "PDF document", "Program"):
+    /// every regular file compared EQUAL, so the sort collapsed to the
+    /// name tie-break and clicking Type to gather your images did
+    /// nothing. A label costs a mime lookup, so it is computed ONCE
+    /// per entry here instead of inside the comparator.
+    /// @return false when the scratch allocation fails, so the caller
+    /// can fall back to the plain comparator.
+    fn sortByTypeLabel(self: *Dir) bool {
+        const n = self.entries.items.len;
+        if (n < 2) return true;
+        const Row = struct { label: [TYPE_LABEL_MAX:0]u8, e: Entry };
+        const rows = self.allocator.alloc(Row, n) catch return false;
+        defer self.allocator.free(rows);
+        var buf: [256:0]u8 = undefined;
+        for (self.entries.items, 0..) |e, i| {
+            rows[i].e = e;
+            const label = std.mem.span(@import("render.zig").coarseTypeZ(e, &buf));
+            const m = @min(label.len, TYPE_LABEL_MAX);
+            @memcpy(rows[i].label[0..m], label[0..m]);
+            rows[i].label[m] = 0;
+        }
+        const Ctx = struct { desc: bool, dirs_first: bool };
+        std.mem.sort(Row, rows, Ctx{ .desc = self.descending, .dirs_first = self.dirs_first }, struct {
+            fn lt(ctx: Ctx, a_in: Row, b_in: Row) bool {
+                if (ctx.dirs_first and a_in.e.tdir != b_in.e.tdir) return a_in.e.tdir;
+                const a = if (ctx.desc) &b_in else &a_in;
+                const b = if (ctx.desc) &a_in else &b_in;
+                const la = std.mem.sliceTo(&a.label, 0);
+                const lb = std.mem.sliceTo(&b.label, 0);
+                if (!std.ascii.eqlIgnoreCase(la, lb)) return std.ascii.lessThanIgnoreCase(la, lb);
+                return naturalLess(a.e.name, b.e.name);
+            }
+        }.lt);
+        for (rows, 0..) |r, i| self.entries.items[i] = r.e;
+        return true;
+    }
+
     pub fn sort(self: *Dir) void {
+        if (self.attr_sort == null and self.sort_key == .kind and self.sortByTypeLabel()) return;
         const Ctx = struct { key: browser_model.SortKey, desc: bool, dirs_first: bool, attr: ?ColumnSort };
         std.mem.sort(Entry, self.entries.items, Ctx{
             .key = self.sort_key,
@@ -1546,6 +1592,32 @@ test "Dir keeps the reason a listing failed, and frees it exactly once" {
     try t.expect(poor.load_error.?.ptr == LOAD_ERROR_OOM.ptr);
     poor.clearLoadError();
     try t.expect(poor.load_error == null);
+}
+
+test "sorting by Type orders by the label the Type column shows" {
+    const t = std.testing;
+    const a = t.allocator;
+    var dir = Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 1 };
+    defer freeTestDir(&dir);
+    // Every one of these is `kind = "file"` to the daemon, which is
+    // exactly why comparing that field left them in name order.
+    try dir.entries.append(a, try testEntry(a, "z.png", null));
+    try dir.entries.append(a, try testEntry(a, "a.txt", null));
+    try dir.entries.append(a, try testEntry(a, "m.png", null));
+    dir.sort_key = .kind;
+    dir.dirs_first = false;
+    dir.sort();
+    // "Image" before "Text", and the two images in name order.
+    try t.expectEqualStrings("m.png", dir.entries.items[0].name);
+    try t.expectEqualStrings("z.png", dir.entries.items[1].name);
+    try t.expectEqualStrings("a.txt", dir.entries.items[2].name);
+    // Descending reverses the whole ordering, tie-break included --
+    // the same shape every other column has.
+    dir.descending = true;
+    dir.sort();
+    try t.expectEqualStrings("a.txt", dir.entries.items[0].name);
+    try t.expectEqualStrings("z.png", dir.entries.items[1].name);
+    try t.expectEqualStrings("m.png", dir.entries.items[2].name);
 }
 
 test "findPath resolves an ordinary child, and rejects a foreign parent" {
