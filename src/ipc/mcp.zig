@@ -3319,6 +3319,12 @@ pub fn regionOf(r: std.json.Value) ?appdrive.App.Region {
         },
         .array => {
             const q = numArray(r, 4) orelse return null;
+            // @intFromFloat outside the destination's range is illegal
+            // behaviour, and this build has no safety checks — so the
+            // NaN/huge cases are refused BEFORE the conversion, not by
+            // the sign check below.
+            const lim: f64 = @floatFromInt(std.math.maxInt(u32));
+            for (q[0..4]) |n| if (!(n >= 0 and n <= lim)) return null;
             x = @intFromFloat(q[0]);
             y = @intFromFloat(q[1]);
             w = @intFromFloat(q[2]);
@@ -3327,6 +3333,11 @@ pub fn regionOf(r: std.json.Value) ?appdrive.App.Region {
         else => return null,
     }
     if (x < 0 or y < 0 or w <= 0 or h <= 0) return null;
+    // Out of u32 range is a refusal, never a truncating cast: a
+    // silently wrapped rect diffs as a legitimate one and changes the
+    // repaint verdict.
+    const max: i64 = std.math.maxInt(u32);
+    if (x > max or y > max or w > max or h > max) return null;
     return .{ .x = @intCast(x), .y = @intCast(y), .w = @intCast(w), .h = @intCast(h) };
 }
 
@@ -6399,6 +6410,16 @@ test "regionOf accepts the object shape and the array shorthand" {
     // Degenerate rects are rejected, not silently clamped.
     try t.expect(regionOf(try parseTestValue(arena, "{\"x\":1,\"y\":1,\"w\":0,\"h\":5}")) == null);
     try t.expect(regionOf(try parseTestValue(arena, "\"0,330,145,150\"")) == null);
+    // Out of u32 range is rejected too. This build has no safety
+    // checks, so a truncating @intCast turned 4294967300 into 4 and the
+    // change percentages were then measured over a rect nobody asked
+    // for — a wrong repaint verdict rather than a refusal.
+    try t.expect(regionOf(try parseTestValue(arena, "{\"x\":4294967300,\"y\":0,\"w\":10,\"h\":10}")) == null);
+    try t.expect(regionOf(try parseTestValue(arena, "{\"x\":0,\"y\":0,\"w\":9999999999,\"h\":10}")) == null);
+    // An f64 outside i64 range is illegal to @intFromFloat, so the
+    // array shorthand has to refuse before it converts.
+    try t.expect(regionOf(try parseTestValue(arena, "[1e20,0,10,10]")) == null);
+    try t.expect(regionOf(try parseTestValue(arena, "[0,0,1e20,10]")) == null);
 }
 
 test "debuggerSignal parses gdb and valgrind crash headlines" {
