@@ -479,10 +479,13 @@ pub fn commitNavigation(self: *BrowserView, tab: *BTab, hc: *HostConn, candidate
     self.refreshGitOverlay(tab);
     var recent_buf: [4300]u8 = undefined;
     self.recordRecentSpec(tab.spec(&recent_buf));
-    // The picker hook covers LOCATION changes as well as selection
-    // ones: its name entry holds a name that only meant something in
-    // the directory just left.
-    if (self.picker) |pk| pk.on_selection_changed(pk.ctx);
+    // The information panel and the picker hook follow LOCATION changes
+    // as well as selection ones: the selection was just emptied without
+    // a selection-changed signal (the model is rebuilt, not deselected),
+    // so without this the panel keeps describing the entry that was
+    // selected in the folder just left, and the picker's name entry a
+    // name that only meant something there.
+    self.updatePreview();
     // The row (or breadcrumb button) that was clicked to get here has
     // just been destroyed with its widget; GTK then moves focus to
     // whatever visible widget it finds -- outside the browser -- and
