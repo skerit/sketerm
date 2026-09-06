@@ -601,6 +601,57 @@ test "matchBinding: ignores Lock + Group bits via SIGNIFICANT_MODS filter" {
     try std.testing.expectEqual(@as(?input.Action, .new_tab), got);
 }
 
+// ── rebuildBindings: config overrides vs the default table ────────
+
+const TestKeybind = struct { name: []const u8, accel: []const u8 };
+
+fn rebuiltWith(list: *std.ArrayList(input.Binding), keybinds: []const TestKeybind) void {
+    input.rebuildBindings(list, std.testing.allocator, keybinds);
+}
+
+test "rebuildBindings: a config override outranks another action's default" {
+    // Ctrl+Shift+T is `new_tab` by default on Linux. Binding it to a
+    // DIFFERENT action must actually take effect: the override used to
+    // be appended, and since matchBinding returns the FIRST match the
+    // surviving `new_tab` default won while the warning claimed the
+    // override had.
+    var list: std.ArrayList(input.Binding) = .empty;
+    defer list.deinit(std.testing.allocator);
+    rebuiltWith(&list, &.{.{ .name = "copy_screen", .accel = "<Control><Shift>t" }});
+
+    const ctrl_shift = c.GDK_CONTROL_MASK | c.GDK_SHIFT_MASK;
+    try std.testing.expectEqual(
+        @as(?input.Action, .copy_screen),
+        input.matchBinding(list.items, c.GDK_KEY_t, ctrl_shift),
+    );
+    try std.testing.expectEqual(
+        @as(?input.Action, .copy_screen),
+        input.matchWithDefaults(list.items, c.GDK_KEY_T, ctrl_shift),
+    );
+}
+
+test "rebuildBindings: an override replaces every default for its action" {
+    var list: std.ArrayList(input.Binding) = .empty;
+    defer list.deinit(std.testing.allocator);
+    rebuiltWith(&list, &.{.{ .name = "new_tab", .accel = "<Control><Alt>n" }});
+
+    try std.testing.expectEqual(
+        @as(?input.Action, .new_tab),
+        input.matchBinding(list.items, c.GDK_KEY_n, c.GDK_CONTROL_MASK | c.GDK_ALT_MASK),
+    );
+    for (list.items) |b| {
+        if (b.action == .new_tab) try std.testing.expectEqual(@as(c_uint, c.GDK_KEY_n), b.keyval);
+    }
+}
+
+test "rebuildBindings: an empty accel unbinds the action outright" {
+    var list: std.ArrayList(input.Binding) = .empty;
+    defer list.deinit(std.testing.allocator);
+    rebuiltWith(&list, &.{.{ .name = "new_tab", .accel = "" }});
+
+    for (list.items) |b| try std.testing.expect(b.action != .new_tab);
+}
+
 test "matchBinding: unmatched key returns null" {
     const bindings = input.default_bindings[0..];
     // No default binding for plain F12.

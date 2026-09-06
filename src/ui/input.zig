@@ -10,6 +10,7 @@ const cast = @import("../util/cast.zig");
 const Terminal = @import("../terminal.zig").Terminal;
 const clipboard = @import("clipboard.zig");
 const imhost = @import("imhost.zig");
+const diag = @import("../util/diag.zig");
 
 pub const Ctx = struct {
     widget: *c.GtkWidget,
@@ -363,8 +364,14 @@ pub fn matchWithDefaults(bindings: []const Binding, keyval: c_uint, state: c.Gdk
 
 /// Rebuild `list` as `default_bindings` overlaid with config
 /// (action-name, accel) overrides. An override replaces EVERY default
-/// entry for its action; an empty accel unbinds the action. Duplicate
-/// accelerators warn on stderr but stand. `keybinds` is any slice
+/// entry for its action; an empty accel unbinds the action.
+///
+/// Overrides are prepended, not appended: `matchBinding` returns the
+/// FIRST entry, so an override whose accelerator is still held by some
+/// other action's default would otherwise never fire — silently, while
+/// the warning below claimed it had won. Prepending also makes the last
+/// config entry win among colliding overrides, which is what the
+/// "shadows" wording says. `keybinds` is any slice
 /// whose elements expose `.name`/`.accel` byte slices, so callers
 /// without a Window (the viewer) can feed `Config.keybinds` directly
 /// without input.zig importing config.zig.
@@ -373,7 +380,7 @@ pub fn rebuildBindings(list: *std.ArrayList(Binding), ally: std.mem.Allocator, k
     for (default_bindings) |b| list.append(ally, b) catch return;
     for (keybinds) |kb| {
         const action = actionFromName(kb.name) orelse {
-            std.debug.print("sketerm: keybind: unknown action '{s}'\n", .{kb.name});
+            diag.print("sketerm: keybind: unknown action '{s}'\n", .{kb.name});
             continue;
         };
         var i: usize = 0;
@@ -384,19 +391,19 @@ pub fn rebuildBindings(list: *std.ArrayList(Binding), ally: std.mem.Allocator, k
         }
         if (kb.accel.len == 0) continue; // unbound
         const parsed = parseAccel(kb.accel) orelse {
-            std.debug.print("sketerm: keybind: bad accelerator '{s}' for '{s}'\n", .{ kb.accel, kb.name });
+            diag.print("sketerm: keybind: bad accelerator '{s}' for '{s}'\n", .{ kb.accel, kb.name });
             continue;
         };
         for (list.items) |existing| {
             if (existing.keyval == parsed.keyval and (existing.mods & SIGNIFICANT_MODS) == (parsed.mods & SIGNIFICANT_MODS)) {
-                std.debug.print(
+                diag.print(
                     "sketerm: keybind: '{s}' shadows '{s}' (same accelerator)\n",
                     .{ actionName(action), actionName(existing.action) },
                 );
                 break;
             }
         }
-        list.append(ally, .{
+        list.insert(ally, 0, .{
             .keyval = parsed.keyval,
             .mods = parsed.mods,
             .action = action,
