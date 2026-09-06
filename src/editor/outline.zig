@@ -186,8 +186,8 @@ pub const Outline = struct {
             self.truncated = true;
             return;
         }
-        const nm = item.name[0..@min(item.name.len, MAX_NAME)];
-        const det = item.detail[0..@min(item.detail.len, MAX_NAME)];
+        const nm = truncUtf8(item.name, MAX_NAME);
+        const det = truncUtf8(item.detail, MAX_NAME);
         const name_off: u32 = @intCast(self.strings.items.len);
         try self.strings.appendSlice(self.allocator, nm);
         const detail_off: u32 = @intCast(self.strings.items.len);
@@ -470,6 +470,29 @@ fn nameOf(doc: *const Document, node: syntax.TreeNode, buf: []u8) []const u8 {
     return std.mem.trim(u8, raw[0..line_end], " \t#=");
 }
 
+/// Drop a trailing INCOMPLETE UTF-8 sequence. Outline names reach
+/// `gtk_label_set_text`, which requires valid UTF-8, and every limit
+/// here is a byte count: `MAX_NAME` is 160, a multiple of neither 3 nor
+/// 4, so a CJK heading or a long non-ASCII symbol name is cut inside a
+/// codepoint.
+fn trimPartialTail(s: []const u8) []const u8 {
+    var n = s.len;
+    var back: usize = 0;
+    while (n > 0 and back < 4) : (back += 1) {
+        n -= 1;
+        if (s[n] & 0xC0 == 0x80) continue;
+        const need = std.unicode.utf8ByteSequenceLength(s[n]) catch return s[0..n];
+        return if (n + need <= s.len) s else s[0..n];
+    }
+    return s;
+}
+
+/// `s` cut to at most `limit` bytes, never inside a codepoint.
+fn truncUtf8(s: []const u8, limit: usize) []const u8 {
+    if (s.len <= limit) return s;
+    return trimPartialTail(s[0..limit]);
+}
+
 fn sliceInto(doc: *const Document, start: usize, end: usize, buf: []u8) []const u8 {
     const hi = @min(end, doc.rope.len());
     const lo = @min(start, hi);
@@ -482,6 +505,10 @@ fn sliceInto(doc: *const Document, start: usize, end: usize, buf: []u8) []const 
         w += take;
         if (w == buf.len) break;
     }
+    // Only when the buffer actually cut the range short: a document
+    // whose own bytes end mid-sequence is the caller's problem, not
+    // something to silently shorten.
+    if (w < hi - lo) return trimPartialTail(buf[0..w]);
     return buf[0..w];
 }
 
@@ -510,6 +537,36 @@ test "outline: push, read back and caret tracking" {
     try testing.expectEqual(@as(usize, 0), o.indexAt(80).?);
     try testing.expectEqual(@as(usize, 2), o.indexAt(150).?);
     try testing.expect(o.indexAt(110) == null);
+}
+
+test "outline: an over-long name is truncated on a codepoint boundary" {
+    // MAX_NAME is 160, a multiple of neither 3 nor 4, so a byte cut
+    // splits any CJK or emoji name — and the label goes straight to
+    // gtk_label_set_text, which requires valid UTF-8.
+    const a = testing.allocator;
+    var o = Outline.init(a);
+    defer o.deinit();
+
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(a);
+    var i: usize = 0;
+    while (i < 100) : (i += 1) try long.appendSlice(a, "\u{4e16}"); // 3 bytes
+    var wide: std.ArrayList(u8) = .empty;
+    defer wide.deinit(a);
+    i = 0;
+    while (i < 80) : (i += 1) try wide.appendSlice(a, "\u{1F600}"); // 4 bytes
+
+    try o.push(.{ .kind = .function, .depth = 0, .start = 0, .end = 1, .sel = 0, .name = long.items, .detail = wide.items });
+    try testing.expect(std.unicode.utf8ValidateSlice(o.name(0)));
+    try testing.expect(std.unicode.utf8ValidateSlice(o.detail(0)));
+    try testing.expect(o.name(0).len <= MAX_NAME);
+    try testing.expect(o.name(0).len > MAX_NAME - 3);
+    try testing.expect(o.detail(0).len <= MAX_NAME);
+    try testing.expect(o.detail(0).len > MAX_NAME - 4);
+
+    // A short name is untouched, and an exact fit is not shortened.
+    try o.push(.{ .kind = .function, .depth = 0, .start = 2, .end = 3, .sel = 2, .name = "plain" });
+    try testing.expectEqualStrings("plain", o.name(1));
 }
 
 test "outline: ranges survive an edit above them" {
