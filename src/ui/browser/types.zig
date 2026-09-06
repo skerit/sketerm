@@ -19,6 +19,7 @@ const TabView = @import("views.zig").TabView;
 const DiskUsageState = @import("diskusage.zig").State;
 const formatSpec = @import("../../filebrowser/paths.zig").formatSpec;
 const naturalLess = @import("../../filebrowser/format.zig").naturalLess;
+pub const JobOp = @import("../../filebrowser/jobop.zig").JobOp;
 
 /// One owned directory entry (strings owned by the Dir's allocator).
 pub const Entry = struct {
@@ -1226,6 +1227,9 @@ pub const JobRow = struct {
     hc: *HostConn,
     job: u64,
     label: []u8,
+    /// What the job does, from the verb that started it: the strip's
+    /// wording and whether `done`/`total` are bytes or entries.
+    op: JobOp = .other,
     /// Nonzero when this job is one item in a user paste/drop batch.
     batch_id: u64 = 0,
     batch_total: usize = 0,
@@ -1301,6 +1305,8 @@ pub const PendingJob = struct {
     req: u32,
     hc: *HostConn,
     label: []u8,
+    /// Carried onto the JobRow; see `JobRow.op`.
+    op: JobOp = .other,
     batch_id: u64 = 0,
     batch_total: usize = 0,
     kind: enum { normal, query, compare_left, compare_right, calc_size, dup_scan, archive_list, disk_usage } = .normal,

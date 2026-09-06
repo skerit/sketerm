@@ -255,6 +255,7 @@ comptime {
     _ = @import("filebrowser/thumbs.zig");
     _ = @import("filebrowser/transfers.zig");
     _ = @import("filebrowser/paths.zig");
+    _ = @import("filebrowser/jobop.zig");
     _ = @import("filebrowser/entry.zig");
     _ = @import("filebrowser/incomplete.zig");
     _ = @import("filebrowser/crumbs.zig");

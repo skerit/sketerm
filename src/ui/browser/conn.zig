@@ -1316,6 +1316,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
                 .hc = hc,
                 .job = rep.job,
                 .label = pj.label,
+                .op = pj.op,
                 .batch_id = pj.batch_id,
                 .batch_total = pj.batch_total,
                 .done = rep.done,

@@ -24,6 +24,7 @@ const HistoryDirection = @import("types.zig").HistoryDirection;
 const HostConn = @import("types.zig").HostConn;
 const JobRow = @import("types.zig").JobRow;
 const PendingJob = @import("types.zig").PendingJob;
+const JobOp = @import("types.zig").JobOp;
 const UndoOp = @import("types.zig").UndoOp;
 const WireJobEv = @import("types.zig").WireJobEv;
 const fmtSize = @import("../../filebrowser/format.zig").fmtSize;
@@ -497,6 +498,7 @@ fn submitRetry(self: *BrowserView, retry: *CopyRetry) bool {
             retry.destroy(self.allocator);
             return false;
         },
+        .op = if (retry.move) .move else .copy,
         .batch_id = retry.batch_id,
         .batch_total = retry.batch_total,
         .dest_key = retry.dest_key,
@@ -1722,6 +1724,7 @@ pub fn startDaemonJobResumable(self: *BrowserView, hc: *HostConn, comptime op: [
             self.allocator.destroy(pj);
             return;
         },
+        .op = JobOp.fromWire(op, false),
     };
     pj.paths.set(path, to);
     self.pending_jobs.append(self.allocator, pj) catch {
@@ -1755,6 +1758,7 @@ pub fn startDaemonJobKind(
             self.allocator.destroy(pj);
             return;
         },
+        .op = JobOp.fromWire(op, false),
         .kind = bind.kind,
         .tab = bind.tab,
     };
@@ -1782,7 +1786,10 @@ pub fn startDaemonJobKind(
 
 /// Whether a job is still running, i.e. the status line carries live progress.
 pub fn anyRunning(self: *BrowserView) bool {
-    for (self.jobs.items) |row| if (row.state == .running) return true;
+    // A query streams into its tab and writes no progress line; letting
+    // it hold the status line kept a live search's tab at "No matches -
+    // 0 items" for as long as the query stayed open.
+    for (self.jobs.items) |row| if (row.state == .running and row.op != .query) return true;
     return false;
 }
 
@@ -1884,9 +1891,14 @@ pub fn onJobEvent(self: *BrowserView, hc: *HostConn, payload: []const u8) void {
     if (std.mem.eql(u8, e.ev, "progress")) {
         row.done = e.done;
         row.total = e.total;
-        if (row.state == .running) self.setStatusFmt("{s}: {d} / {d} MB", .{
-            row.label, e.done >> 20, e.total >> 20,
-        });
+        if (row.state == .running) {
+            if (row.op.countsBytes()) {
+                self.setStatusFmt("{s}: {d} / {d} MB", .{ row.label, e.done >> 20, e.total >> 20 });
+            } else {
+                // Trash, delete and restore count entries handled.
+                self.setStatusFmt("{s}: {d} / {d} items", .{ row.label, e.done, e.total });
+            }
+        }
     } else if (std.mem.eql(u8, e.ev, "paused") or std.mem.eql(u8, e.ev, "resumed")) {
         // The daemon is the authority: another client may have paused
         // this job, and our own optimistic mark can be wrong.
@@ -2077,6 +2089,7 @@ pub fn startDaemonJobUndo(self: *BrowserView, hc: *HostConn, comptime op: []cons
             if (undo) |u| u.destroy(self.allocator);
             return false;
         },
+        .op = JobOp.fromWire(op, false),
         .batch_id = mode.batch_id,
         .batch_total = mode.batch_total,
         .undo_op = undo,
@@ -2129,6 +2142,7 @@ pub fn startHistoryJob(self: *BrowserView, hc: *HostConn, op_name: []const u8, p
             self.allocator.destroy(pj);
             return self.restoreHistory(op, direction);
         },
+        .op = JobOp.fromWire(op_name, false),
         .history_op = op,
         .history_direction = direction,
     };
@@ -2156,6 +2170,7 @@ pub fn startDaemonJobTo(self: *BrowserView, hc: *HostConn, comptime op: []const 
             self.allocator.destroy(pj);
             return;
         },
+        .op = JobOp.fromWire(op, false),
     };
     pj.paths.set(path, to);
     self.pending_jobs.append(self.allocator, pj) catch {

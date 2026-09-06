@@ -1340,6 +1340,7 @@ fn trashOne(self: *BrowserView, hc: *HostConn, path: []const u8) void {
             self.allocator.destroy(pj);
             return;
         },
+        .op = .trash,
         .undo_trash_orig = self.allocator.dupe(u8, path) catch null,
     };
     self.pending_jobs.append(self.allocator, pj) catch {
@@ -2245,6 +2246,7 @@ pub fn extractAndOpenMember(self: *BrowserView, tab: *BTab, member: []const u8) 
             self.allocator.destroy(pj);
             return;
         },
+        .op = .other,
         .open_on_done = true,
     };
     self.pending_jobs.append(self.allocator, pj) catch {

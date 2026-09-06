@@ -22,6 +22,7 @@ const progress = @import("../../filebrowser/progress.zig");
 const ActiveTransfer = @import("types.zig").ActiveTransfer;
 const BrowserView = @import("view.zig").BrowserView;
 const HostConn = @import("types.zig").HostConn;
+const JobOp = @import("types.zig").JobOp;
 const classicmenu = @import("classicmenu.zig");
 const cssutil = @import("../cssutil.zig");
 const copyZ = @import("../../filebrowser/format.zig").copyZN;
@@ -126,6 +127,10 @@ const Row = struct {
     /// rows while an automatic retry changes queue representation.
     batch_item: []const u8 = "",
     move: bool = false,
+    /// What the job does. Transfer rows (downloads, queued copies,
+    /// mediated transfers) are copies unless `move` says otherwise;
+    /// daemon rows carry the verb that started them.
+    op: JobOp = .copy,
     /// Expanded batch members are indented under their synthetic row.
     batch_child: bool = false,
     /// Daemon-job rows carry their HostConn, transfer rows their
@@ -138,6 +143,35 @@ const Row = struct {
 
     fn active(self: Row) bool {
         return self.state == .queued or self.state == .waiting_retry or self.state == .running or self.state == .paused;
+    }
+
+    /// The operation this row performs; a transfer row's `move` flag
+    /// turns its default copy into a move.
+    fn kind(self: Row) JobOp {
+        return if (self.op == .copy and self.move) .move else self.op;
+    }
+};
+
+/// The verbs of one set of rows: a single kind speaks for itself, a
+/// mixture falls back to the neutral phrasing.
+const OpMix = struct {
+    first: ?JobOp = null,
+    mixed: bool = false,
+
+    fn add(self: *OpMix, op: JobOp) void {
+        if (self.first) |f| {
+            if (f != op) self.mixed = true;
+        } else self.first = op;
+    }
+
+    fn activeVerb(self: OpMix) []const u8 {
+        if (self.mixed) return "Working on";
+        return (self.first orelse JobOp.other).activeVerb();
+    }
+
+    fn doneVerb(self: OpMix) []const u8 {
+        if (self.mixed) return "Finished";
+        return (self.first orelse JobOp.other).doneVerb();
     }
 };
 
@@ -471,6 +505,7 @@ fn daemonRows(self: *BrowserView, arena: std.mem.Allocator, out: *std.ArrayList(
             .batch_total = j.batch_total,
             .batch_item = if (j.retry) |retry| retry.token else "",
             .move = if (j.retry) |retry| retry.move else false,
+            .op = j.op,
             .controls = daemonControls(j, successor_active),
             .hc = j.hc,
         }) catch return;
@@ -1015,28 +1050,38 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
     var failed: usize = 0;
     var finished: usize = 0;
     var stalled = false;
-    var items: usize = 0;
-    var moves: usize = 0;
-    var copies: usize = 0;
+    // The active sentence counts what is still being worked on; the
+    // finished one what landed. Rows that finished earlier must not
+    // inflate "Copying N items" for the one job that is running now.
+    var active_items: usize = 0;
+    var done_items: usize = 0;
+    var active_ops: OpMix = .{};
+    var done_ops: OpMix = .{};
     var rate: u64 = 0;
     var remaining: u64 = 0;
     var remaining_known = true;
     var frac_sum: f64 = 0;
     var frac_n: usize = 0;
     var done_bytes: u64 = 0;
+    var done_bytes_all = true;
     var first_name: []const u8 = "";
     var first_host: []const u8 = "";
     var fail_msg: []const u8 = "";
     for (rows) |r| {
         if (r.batch_child) continue;
+        const op = r.kind();
+        // A query streams into its own tab, whose status line already
+        // describes it; in the strip it only ever read as a stalled copy.
+        if (!op.inStrip()) continue;
         const meter = panel.find(r.key);
-        items += if (r.key.kind == .batch) @max(r.files_total, 1) else 1;
-        if (r.move) moves += 1 else copies += 1;
+        const n: usize = if (r.key.kind == .batch) @max(r.files_total, 1) else 1;
         frac_sum += fraction(r);
         frac_n += 1;
         switch (r.state) {
             .running, .paused => {
                 running += 1;
+                active_items += n;
+                active_ops.add(op);
                 if (first_name.len == 0) {
                     first_name = if (r.current_file) |f| std.fs.path.basename(f) else r.name;
                     first_host = r.dest_host;
@@ -1045,9 +1090,16 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
                     if (m.status.stalled) stalled = true;
                     if (m.status.rate_bps) |bps| rate += bps;
                 }
-                if (r.total > 0) remaining += r.total -| r.done else remaining_known = false;
+                // Entry counters (a trash of 3 items) are not bytes left.
+                if (!op.countsBytes()) {
+                    remaining_known = false;
+                } else if (r.total > 0) remaining += r.total -| r.done else remaining_known = false;
             },
-            .queued, .waiting_retry => waiting += 1,
+            .queued, .waiting_retry => {
+                waiting += 1;
+                active_items += n;
+                active_ops.add(op);
+            },
             .failed => {
                 failed += 1;
                 // A batch row's message is member-count bookkeeping
@@ -1057,7 +1109,12 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
             },
             .finished => {
                 finished += 1;
-                done_bytes +|= if (r.total > 0) r.total else r.done;
+                done_items += n;
+                done_ops.add(op);
+                if (op.countsBytes())
+                    done_bytes +|= if (r.total > 0) r.total else r.done
+                else
+                    done_bytes_all = false;
             },
             .canceled => {},
         }
@@ -1066,7 +1123,8 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
     info.fraction = frac_sum / @as(f64, @floatFromInt(frac_n));
     var w = std.Io.Writer.fixed(&info.text_buf);
     var nw = std.Io.Writer.fixed(&info.nums_buf);
-    const verb: []const u8 = if (moves > 0 and copies == 0) "Moving" else if (moves == 0) "Copying" else "Working on";
+    const verb = active_ops.activeVerb();
+    const items = active_items;
     if (running > 0) {
         info.mode = .active;
         info.kind = if (stalled) .warn else .accent;
@@ -1109,13 +1167,18 @@ fn stripInfo(rows: []const Row, panel: *Panel) StripInfo {
         info.kind = .ok;
         info.fraction = 1;
         var size_buf: [48:0]u8 = undefined;
-        const done_verb: []const u8 = if (moves > 0 and copies == 0) "Moved" else "Copied";
-        if (done_bytes > 0) {
+        const plural: []const u8 = if (done_items == 1) "" else "s";
+        if (done_ops.mixed) {
+            w.print("{d} operation{s} finished", .{ done_items, plural }) catch {};
+        } else if (done_bytes > 0 and done_bytes_all) {
+            // A byte total only when every finished job counted bytes:
+            // a trash reports entries handled, and "Trashed 1 item — 1 B"
+            // was that count wearing a unit.
             w.print("{s} {d} item{s} — {s}", .{
-                done_verb, items, if (items == 1) "" else "s", fmtSize(&size_buf, done_bytes),
+                done_ops.doneVerb(), done_items, plural, fmtSize(&size_buf, done_bytes),
             }) catch {};
         } else {
-            w.print("{d} operation{s} finished", .{ items, if (items == 1) "" else "s" }) catch {};
+            w.print("{s} {d} item{s}", .{ done_ops.doneVerb(), done_items, plural }) catch {};
         }
     } else {
         info.mode = .queued_only;
@@ -2322,6 +2385,62 @@ test "strip failure and completion lines" {
     const done_info = stripInfo(&done, &panel);
     try std.testing.expectEqual(StripMode.done, done_info.mode);
     try std.testing.expectEqualStrings("Copied 1 item — 1.0 GB", done_info.text());
+}
+
+test "the strip names trash, restore and delete jobs, and counts only what is active" {
+    var panel = Panel{};
+    // A trash job's done/total are ENTRIES, not bytes: it once read
+    // "Copied 1 item — 1 B".
+    const trashed = [_]Row{.{
+        .key = .{ .kind = .daemon, .ptr = 1, .job = 6 },
+        .label = "move to trash",
+        .name = "move to trash",
+        .state = .finished,
+        .done = 1,
+        .total = 1,
+        .op = .trash,
+    }};
+    try std.testing.expectEqualStrings("Trashed 1 item", stripInfo(&trashed, &panel).text());
+    // Trash then restore: two kinds, no byte total, neutral verb.
+    const mixed = [_]Row{ trashed[0], .{
+        .key = .{ .kind = .daemon, .ptr = 1, .job = 7 },
+        .label = "restore from trash",
+        .name = "restore from trash",
+        .state = .finished,
+        .done = 1,
+        .total = 1,
+        .op = .restore,
+    } };
+    try std.testing.expectEqualStrings("2 operations finished", stripInfo(&mixed, &panel).text());
+    // A finished copy beside a running delete: the active sentence
+    // counts the delete alone and phrases it as one.
+    const rows = [_]Row{ .{
+        .key = .{ .kind = .daemon, .ptr = 1, .job = 8 },
+        .label = "big.bin",
+        .name = "big.bin",
+        .state = .finished,
+        .total = 1 << 20,
+    }, .{
+        .key = .{ .kind = .daemon, .ptr = 1, .job = 9 },
+        .label = "delete old",
+        .name = "old",
+        .state = .running,
+        .done = 3,
+        .total = 10,
+        .op = .delete,
+    } };
+    const info = stripInfo(&rows, &panel);
+    try std.testing.expectEqual(StripMode.active, info.mode);
+    try std.testing.expectEqualStrings("Deleting old", info.text());
+    // A live query belongs to its tab, never to the strip.
+    const query = [_]Row{.{
+        .key = .{ .kind = .daemon, .ptr = 1, .job = 10 },
+        .label = "live \"copy\"",
+        .name = "live \"copy\"",
+        .state = .running,
+        .op = .query,
+    }};
+    try std.testing.expectEqual(StripMode.hidden, stripInfo(&query, &panel).mode);
 }
 
 test "batch fraction moves with the running member's bytes" {
