@@ -78,7 +78,11 @@ fn cpBefore(doc: *const Document, off: usize) ?u21 {
     if (off == 0) return null;
     var buf: [4]u8 = undefined;
     const start = off -| 4;
-    const s = readAt(doc, start, &buf);
+    // Only [start, off): `readAt` fills the whole buffer, so within the
+    // document's first four bytes a full-width read would reach FORWARD
+    // past `off` and the walk-back would find a codepoint that comes
+    // AFTER the offset we were asked about.
+    const s = readAt(doc, start, buf[0 .. off - start]);
     if (s.len == 0) return null;
     // Walk back to the last lead byte.
     var i: usize = s.len;
@@ -397,6 +401,27 @@ test "search: whole word filters substrings" {
     try testing.expectEqual(@as(usize, 2), ww.len);
     try testing.expectEqual(@as(usize, 0), ww[0].start);
     try testing.expectEqual(@as(usize, 13), ww[1].start);
+}
+
+test "search: whole word looks at the codepoint BEFORE a near-start match" {
+    // The preceding-codepoint window is read backwards from the match,
+    // so within the first four bytes of the document it must not be
+    // allowed to reach FORWARD past the match start: "a-bc d" would
+    // then test 'c' (a word byte) instead of '-' and reject the match.
+    const a = testing.allocator;
+    var doc = try docOf("a-bc d");
+    defer doc.deinit();
+    const ww = try findAll(a, &doc, "bc", .{ .whole_word = true });
+    defer a.free(ww);
+    try testing.expectEqual(@as(usize, 1), ww.len);
+    try testing.expectEqual(@as(usize, 2), ww[0].start);
+
+    // …and the genuine rejection still happens.
+    var doc2 = try docOf("abc d");
+    defer doc2.deinit();
+    const none = try findAll(a, &doc2, "bc", .{ .whole_word = true });
+    defer a.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
 }
 
 test "search: matches spanning rope leaf boundaries are found once" {
