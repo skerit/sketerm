@@ -8966,3 +8966,14 @@ test "DL and IL on the bottom margin row erase it" {
     s.insertLines(1);
     try std.testing.expectEqual(@as(u32, 0), s.cellAt(2, 0).rune);
 }
+
+test "resize to one column keeps a wide glyph instead of failing" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 4, 2);
+    defer s.deinit();
+    s.printCp(0x754C); // wide
+    try s.resize(1, 2);
+    try std.testing.expectEqual(@as(u16, 1), s.cols);
+    for (s.active) |ln| try std.testing.expectEqual(@as(usize, 1), ln.cells.len);
+}

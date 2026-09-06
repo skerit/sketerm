@@ -187,10 +187,18 @@ pub fn rechunk(
             var col: usize = 0;
             while (i < ll.cells.items.len and col < width) {
                 if (isValidWidePair(ll.cells.items, i)) {
-                    if (width - col < 2) {
-                        if (col == 0) return error.WideGlyphTooWide;
-                        break;
+                    if (width < 2) {
+                        // A one-column grid cannot hold the pair. Failing
+                        // here fails the whole resize, leaving a screen
+                        // whose width no longer matches its window, so
+                        // keep the codepoint as a narrow cell instead.
+                        cells[col] = ll.cells.items[i];
+                        cells[col].flags &= ~(wide_left | wide_cont);
+                        i += 2;
+                        col += 1;
+                        continue;
                     }
+                    if (width - col < 2) break;
                     cells[col] = ll.cells.items[i];
                     cells[col + 1] = ll.cells.items[i + 1];
                     i += 2;
@@ -275,6 +283,21 @@ pub fn positionAfterRechunk(
     var col: usize = 0;
     while (source < cells.len) {
         if (isValidWidePair(cells, source)) {
+            // Mirror `rechunk`: at width 1 the pair collapses into one
+            // narrow cell. Walking it as two would push `col` past
+            // `width`, and `width - col` then underflows.
+            if (width < 2) {
+                if (target_col == @as(u32, @intCast(source)) or
+                    target_col == @as(u32, @intCast(source + 1)))
+                    return .{ .row = row, .col = 0 };
+                source += 2;
+                col += 1;
+                if (col == width and source < cells.len) {
+                    row += 1;
+                    col = 0;
+                }
+                continue;
+            }
             if (width - col < 2) {
                 row += 1;
                 col = 0;
@@ -468,7 +491,47 @@ test "rechunk repairs malformed wide halves and rejects an impossible width" {
         for (valid.items) |*ll| ll.cells.deinit(a);
         valid.deinit(a);
     }
-    try testing.expectError(error.WideGlyphTooWide, rechunk(a, valid.items, 1));
+    // A one-column grid cannot hold a wide glyph, but failing the
+    // rechunk fails the whole resize: the caller is left with a screen
+    // whose width no longer matches its window. Degrade to a narrow
+    // cell instead.
+    const narrow = try rechunk(a, valid.items, 1);
+    defer {
+        for (narrow) |*line| line.deinit(a);
+        a.free(narrow);
+    }
+    try testing.expectEqual(@as(usize, 1), narrow.len);
+    try testing.expectEqual(@as(u32, 0x754C), narrow[0].cells[0].rune);
+    try testing.expectEqual(@as(u8, 0), narrow[0].cells[0].flags);
+}
+
+test "positionAfterRechunk stays in range on a one-column grid" {
+    const a = testing.allocator;
+    var row = try makeRow(a, "", 4, false);
+    defer row.deinit(a);
+    putWide(row.cells, 0, 0x754C);
+    putWide(row.cells, 2, 0x754D);
+
+    var logicals = try build(a, &.{row}, false);
+    defer {
+        for (logicals.items) |*ll| ll.cells.deinit(a);
+        logicals.deinit(a);
+    }
+    trim(&logicals, a);
+    const rows = try rechunk(a, logicals.items, 1);
+    defer {
+        for (rows) |*line| line.deinit(a);
+        a.free(rows);
+    }
+    // Every logical column must map inside the one-column grid; the
+    // second pair used to walk `col` past `width` and then underflow
+    // `width - col`.
+    var col: u32 = 0;
+    while (col < 4) : (col += 1) {
+        const p = positionAfterRechunk(logicals.items, rows, 0, col, 1);
+        try testing.expectEqual(@as(u16, 0), p.col);
+        try testing.expect(p.row < rows.len);
+    }
 }
 
 test "rechunk widens — 'hellowor' in 5-col rows becomes 1 row at 10 cols" {
