@@ -3752,7 +3752,17 @@ pub const Manager = struct {
     pub fn onPointerMoved(self: *Manager, x: f64, y: f64) void {
         self.dwell_x = x;
         self.dwell_y = y;
-        if (self.hover.open and self.hover.at != null) self.closeHover();
+        if (self.hover.open and self.hover.at != null) {
+            self.closeHover();
+            // The popup this offset produced is GONE, so the guard below
+            // must stop suppressing it: motion closes every dwell hover,
+            // so keeping the offset meant one stray pixel inside a word
+            // dismissed its hover and no amount of resting there could
+            // bring it back. Cleared only when a popup was actually
+            // taken down — an offset the server answered emptily still
+            // suppresses a re-ask.
+            self.dwell_offset = std.math.maxInt(usize);
+        }
         const ms = self.dwellMs();
         if (ms == 0) return self.noteDwellGate(.disabled);
         if (self.dwell_timer != 0) {
