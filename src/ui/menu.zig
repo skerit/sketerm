@@ -398,6 +398,10 @@ pub fn attachWithPrePopup(
     // (resolved through the group inserted above) and pops down on click.
     const popover = c.gtk_popover_new();
     c.gtk_widget_set_parent(popover, widget);
+    // Until `destroyMenuCtx` is installed below, nothing else unparents
+    // this: an OOM on the way there would leave `widget` finalizing with
+    // a child still attached, the exact case that notify exists for.
+    errdefer c.gtk_widget_unparent(popover);
     c.gtk_popover_set_has_arrow(@ptrCast(popover), 0);
 
     // The shared context is filled while rows are built (submenu /
