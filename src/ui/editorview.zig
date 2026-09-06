@@ -5100,11 +5100,15 @@ pub const EditorView = struct {
         defer journal.freeEntries(self.allocator, entries);
         var opened: usize = 0;
         for (entries) |e| {
-            if (self.recoverOne(e)) opened += 1;
-            // Consumed either way: a record we could not read is
-            // corrupt, and one we opened now lives in a tab with its
-            // own (fresh) slot.
-            journal.remove(self.allocator, e.key) catch {};
+            if (self.recoverOne(e)) {
+                opened += 1;
+                // Its content now lives in a tab with its own fresh slot.
+                journal.remove(self.allocator, e.key) catch {};
+            }
+            // A record we FAILED to open stays on disk: the failure may
+            // be a transient one (fd exhaustion, a permission blip) and
+            // deleting it would throw the work away for good. `prune`
+            // ages genuinely abandoned records out.
         }
         self.updateRecoverBanner();
         var buf: [80:0]u8 = undefined;
@@ -5139,10 +5143,15 @@ pub const EditorView = struct {
                 tab.spec = s;
             } else |_| {}
         }
-        var new_doc = Document.initFromBytes(self.allocator, rec.content) catch return false;
-        // The snapshot is LF-normalized in-memory text, so the style
-        // comes from the header, not from sniffing the content.
-        new_doc.line_ending = if (rec.header.crlf) .crlf else .lf;
+        // The snapshot is in-memory text and the header already carries
+        // its style: sniffing it again would classify an LF buffer that
+        // holds pasted CRLF lines as CRLF and strip every one of those
+        // CRs out of the work being recovered.
+        const new_doc = Document.initVerbatim(
+            self.allocator,
+            rec.content,
+            if (rec.header.crlf) .crlf else .lf,
+        ) catch return false;
         tab.doc.deinit();
         tab.doc = new_doc;
         tab.doc.markUnsaved();

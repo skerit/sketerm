@@ -66,9 +66,12 @@
 //!   * at startup, before restoring the layout: `journal.list(alloc)` →
 //!     offer each `Entry` (`header.spec`, `header.updated_ms`), then
 //!     `journal.read(alloc, key)` for the ones the user takes, build the
-//!     tab with `Document.initFromBytes(rec.content)` + the caret at
-//!     `header.cursor` + `line_ending` from `header.crlf`, mark it dirty
-//!     (it IS unsaved work), and `journal.remove(alloc, key)`. Compare
+//!     tab with `Document.initVerbatim(rec.content, style)` — NOT
+//!     `initFromBytes`, which re-sniffs the style and would strip the
+//!     CRs out of an LF buffer holding pasted CRLF lines — plus the
+//!     caret at `header.cursor` and the style from `header.crlf`, mark
+//!     it dirty (it IS unsaved work), and `journal.remove(alloc, key)`
+//!     ONLY once it opened. Compare
 //!     `rec.baseline()` against a fresh stat with `reload.compare` and
 //!     show the verdict rather than saving anything automatically.
 //!   * a periodic `journal.prune(alloc, ...)` (a week, say) keeps
@@ -101,6 +104,15 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const Error = error{
     BufferTooLarge,
     RecordCorrupt,
+    /// The file could not be OPENED or read (fd exhaustion, a transient
+    /// permission error). Distinct from `RecordCorrupt` because it says
+    /// nothing about the bytes: only a record we can prove is debris may
+    /// be deleted, and conflating the two threw away every unreadable
+    /// record on a startup that happened to run out of descriptors.
+    RecordUnreadable,
+    /// The header did not parse, but its `version` field says a NEWER
+    /// sketerm wrote it. Never debris.
+    RecordNewer,
     RecordTooOld,
     WriteFailed,
     PathTooLong,
@@ -413,10 +425,25 @@ fn parseHeaderLine(alloc: Allocator, line: []const u8) !std.json.Parsed(Header) 
     }) catch return Error.RecordCorrupt;
 }
 
+/// The `version` field alone, out of a header line this binary cannot
+/// otherwise parse. A future record whose schema changed incompatibly
+/// (a field that stopped being a number, say) must still be identified
+/// as newer, or an older binary deletes a newer one's unsaved work.
+fn probeVersion(alloc: Allocator, line: []const u8) ?u32 {
+    var p = std.json.parseFromSlice(
+        struct { version: u32 = 0 },
+        alloc,
+        line,
+        .{ .ignore_unknown_fields = true },
+    ) catch return null;
+    defer p.deinit();
+    return p.value.version;
+}
+
 /// Read just the header line of one record file.
 fn readHeader(alloc: Allocator, rec_path: []const u8) !Entry {
     var z: [4096]u8 = undefined;
-    const fp = c.fopen(try pathz.pathZ(&z, rec_path), "rb") orelse return Error.RecordCorrupt;
+    const fp = c.fopen(try pathz.pathZ(&z, rec_path), "rb") orelse return Error.RecordUnreadable;
     defer _ = c.fclose(fp);
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(alloc);
@@ -426,7 +453,12 @@ fn readHeader(alloc: Allocator, rec_path: []const u8) !Entry {
         if (ch == '\n') break;
         try line.append(alloc, @intCast(ch));
     }
-    const parsed = try parseHeaderLine(alloc, line.items);
+    const parsed = parseHeaderLine(alloc, line.items) catch |err| {
+        if (probeVersion(alloc, line.items)) |v| {
+            if (v > VERSION) return Error.RecordNewer;
+        }
+        return err;
+    };
     return .{
         .key = &[_]u8{},
         .header = parsed.value,
@@ -463,9 +495,13 @@ pub fn list(alloc: Allocator) ![]Entry {
         defer alloc.free(lock_path);
         if (!ownerIsGone(lock_path)) continue;
 
-        var entry = readHeader(alloc, rec_path) catch {
-            // Unparseable debris from an interrupted first write.
-            removePaths(rec_path, lock_path);
+        var entry = readHeader(alloc, rec_path) catch |err| {
+            // ONLY unparseable debris from an interrupted first write is
+            // deleted. A record we merely could not open, and one a
+            // NEWER sketerm wrote in a schema this binary cannot parse,
+            // are both left exactly where they are: deleting either
+            // throws away work.
+            if (err == Error.RecordCorrupt) removePaths(rec_path, lock_path);
             continue;
         };
         errdefer entry.deinit(alloc);
@@ -924,6 +960,55 @@ test "journal: a record from a NEWER sketerm is left alone" {
     var z: [4096]u8 = undefined;
     var st: c.struct_stat = undefined;
     try testing.expectEqual(@as(c_int, 0), c.stat(try pathz.pathZ(&z, rec_path), &st));
+}
+
+test "journal: a NEWER record whose header does not even parse is left alone" {
+    // The guard used to run AFTER the delete-on-parse-failure, so any
+    // future schema change that is not merely additive made an older
+    // binary destroy a newer one's unsaved work.
+    const alloc = testing.allocator;
+    var scope = try ScopedDir.init(alloc, "future2");
+    defer scope.deinit();
+
+    const dir = try dirPath(alloc);
+    defer alloc.free(dir);
+    try ensureDir(dir);
+    const rec_path = try std.fmt.allocPrint(alloc, "{s}/eeeeeeeeeeeeeeee-1.rec", .{dir});
+    defer alloc.free(rec_path);
+    // `cursor` became an object in this imaginary future version.
+    try writeFileAtomic(
+        rec_path,
+        "{\"version\":999,\"spec\":\"/tmp/x\",\"cursor\":{\"line\":1,\"col\":2}}\nbody",
+    );
+
+    const entries = try list(alloc);
+    defer freeEntries(alloc, entries);
+    try testing.expectEqual(@as(usize, 0), entries.len);
+
+    var z: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    try testing.expectEqual(@as(c_int, 0), c.stat(try pathz.pathZ(&z, rec_path), &st));
+}
+
+test "journal: genuine debris is still swept" {
+    const alloc = testing.allocator;
+    var scope = try ScopedDir.init(alloc, "debris");
+    defer scope.deinit();
+
+    const dir = try dirPath(alloc);
+    defer alloc.free(dir);
+    try ensureDir(dir);
+    const rec_path = try std.fmt.allocPrint(alloc, "{s}/dddddddddddddddd-1.rec", .{dir});
+    defer alloc.free(rec_path);
+    try writeFileAtomic(rec_path, "not json at all\nbody");
+
+    const entries = try list(alloc);
+    defer freeEntries(alloc, entries);
+    try testing.expectEqual(@as(usize, 0), entries.len);
+
+    var z: [4096]u8 = undefined;
+    var st: c.struct_stat = undefined;
+    try testing.expect(c.stat(try pathz.pathZ(&z, rec_path), &st) != 0);
 }
 
 test "journal: buffers over the size cap are refused" {

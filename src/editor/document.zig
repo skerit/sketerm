@@ -230,6 +230,23 @@ pub const Document = struct {
         return doc;
     }
 
+    /// Document over bytes that are ALREADY in in-memory form, with the
+    /// style supplied rather than sniffed.
+    ///
+    /// For the crash journal, which stores the live buffer verbatim and
+    /// its style in the record header. Re-sniffing such a snapshot is
+    /// silent data loss: an LF buffer holding a few pasted CRLF lines
+    /// classifies as `.crlf`, every one of those CRs is stripped, and
+    /// `materialize` never puts them back — the recovery deletes part
+    /// of the work it exists to restore.
+    pub fn initVerbatim(alloc: Allocator, bytes: []const u8, style: LineEnding) !Document {
+        var doc = initEmpty(alloc);
+        errdefer doc.deinit();
+        doc.line_ending = style;
+        doc.rope = try Rope.initFromBytes(alloc, bytes);
+        return doc;
+    }
+
     pub fn deinit(self: *Document) void {
         self.rope.deinit();
         for (self.undo_stack.items) |*e| e.deinitFree(self.alloc);
@@ -842,6 +859,33 @@ test "document markSaved clears dirty" {
     try testing.expect(doc.isDirty());
     doc.markSaved();
     try testing.expect(!doc.isDirty());
+}
+
+test "document initVerbatim keeps every byte of a crash snapshot" {
+    // An LF buffer into which CRLF text was pasted: detectStyle counts
+    // 3 CRLF against 2 lone LF and answers .crlf, so initFromBytes
+    // strips those CRs — recovery silently deleting unsaved work.
+    const snapshot = "a\nb\nx\r\ny\r\nz\r\n";
+    var sniffed = try Document.initFromBytes(testing.allocator, snapshot);
+    defer sniffed.deinit();
+    const lost = try sniffed.textAlloc(testing.allocator);
+    defer testing.allocator.free(lost);
+    try testing.expectEqualStrings("a\nb\nx\ny\nz\n", lost);
+
+    var kept = try Document.initVerbatim(testing.allocator, snapshot, .lf);
+    defer kept.deinit();
+    const text = try kept.textAlloc(testing.allocator);
+    defer testing.allocator.free(text);
+    try testing.expectEqualStrings(snapshot, text);
+    try testing.expectEqual(LineEnding.lf, kept.line_ending);
+
+    // The style comes from the caller; a CRLF document's snapshot is
+    // already LF-normalized and materializes back to CRLF.
+    var crlf = try Document.initVerbatim(testing.allocator, "p\nq\n", .crlf);
+    defer crlf.deinit();
+    const out = try crlf.materialize(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("p\r\nq\r\n", out);
 }
 
 test "document a history append that fails frees the kept selection and drops the typing group" {
