@@ -5158,6 +5158,15 @@ pub const Daemon = struct {
             self.noteResyncFailure(cl, s, "snapshot serialization failed");
             return;
         };
+        // A body past MAX_FRAME is not a big snapshot: it is a frame no
+        // peer can peel, so queueing it would hand the client a fatal
+        // protocol error instead of a screen. snapshot.zig budgets the
+        // unbounded sections; this is the backstop for a grid whose
+        // MANDATORY part alone cannot fit.
+        if (buf.items.len + wire.header_size > wire.MAX_FRAME) {
+            self.noteResyncFailure(cl, s, "snapshot exceeds the wire frame limit");
+            return;
+        }
         if (!cl.tryQueueFrameIn(&cl.wbuf, .snapshot, buf.items)) {
             self.noteResyncFailure(cl, s, "snapshot frame allocation failed");
             return;

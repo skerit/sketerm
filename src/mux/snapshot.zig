@@ -269,6 +269,35 @@ comptime {
 /// slots x 64 KiB = 64 MiB, which no attach frame should carry.
 pub const GLYPH_SNAPSHOT_BUDGET: usize = 8 * 1024 * 1024;
 
+/// Ceiling on a serialized snapshot BODY.
+///
+/// The daemon ships a body inside one `snapshot` frame, and every
+/// client peels frames through `wire.MAX_FRAME`: a body past that bound
+/// is not a big snapshot, it is a frame no peer can decode, so the
+/// attach fails and the session stays unattachable for as long as the
+/// screen keeps its size. Nothing upstream bounded it — a 220-column
+/// grid with a full 10k-line scrollback already clears 16 MiB — so the
+/// variable-size sections below are budgeted against this instead.
+/// The margin covers the daemon's 9-byte envelope, the 5-byte frame
+/// header, and the fixed fields.
+pub const BODY_BUDGET: usize = wire.MAX_FRAME - 4096;
+
+/// Room held back for the sections written AFTER the scrollback whose
+/// own size is not budgeted (palette, title, links, clusters, prompt
+/// marks and the fixed tails). Images and glyphs budget themselves
+/// against whatever is left when they are reached.
+const SCROLLBACK_TAIL_RESERVE: usize = 1024 * 1024;
+
+/// Serialized size of one line, so the budget passes agree with `Sink.line`.
+fn lineBytes(ln: *const Line) usize {
+    return 8 + 1 + 1 + 2 + ln.cells.len * @sizeOf(Cell);
+}
+
+/// Bytes still available to `out` before the body budget is spent.
+fn budgetLeft(out: *const std.ArrayList(u8)) usize {
+    return BODY_BUDGET -| out.items.len;
+}
+
 /// Select a snapshot body for a negotiated or historical core profile.
 pub fn negotiateVersion(proto: u32, advertised_max: u8, negotiated: bool) u8 {
     if (proto == 0) return 0;
@@ -361,9 +390,23 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
     try s.boolean(screen.alt != null);
     if (screen.alt) |alt| for (alt) |*ln| try s.line(ln);
     try s.boolean(screen.use_alt);
+    // Scrollback is the section that grows without bound, so it is the
+    // one budgeted newest-first: the visible history a reattaching
+    // client cares about survives, the oldest lines are dropped, and
+    // the body stays inside one wire frame.
     const sb_count = screen.scrollbackCount();
-    try s.int(u32, sb_count);
-    var i: u32 = 0;
+    var first_sb: u32 = sb_count;
+    {
+        var budget = budgetLeft(out) -| SCROLLBACK_TAIL_RESERVE;
+        while (first_sb > 0) {
+            const need = lineBytes(screen.scrollbackLine(first_sb - 1));
+            if (need > budget) break;
+            budget -= need;
+            first_sb -= 1;
+        }
+    }
+    try s.int(u32, sb_count - first_sb);
+    var i: u32 = first_sb;
     while (i < sb_count) : (i += 1) try s.line(screen.scrollbackLine(i));
 
     // Cursor + per-screen state.
@@ -433,7 +476,7 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
     // order so z-equal stacking stays stable.
     if (version >= 2) {
         const items = screen.retained_images.items;
-        var budget: usize = Screen.RETAIN_IMAGE_BUDGET;
+        var budget: usize = @min(Screen.RETAIN_IMAGE_BUDGET, budgetLeft(out));
         var first_kept: usize = items.len;
         while (first_kept > 0) {
             const need = items[first_kept - 1].owned.len;
@@ -497,7 +540,7 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
                 return a.e.insertion < b.e.insertion;
             }
         }.lt);
-        var budget: usize = GLYPH_SNAPSHOT_BUDGET;
+        var budget: usize = @min(GLYPH_SNAPSHOT_BUDGET, budgetLeft(out));
         var first_kept: usize = entries.items.len;
         while (first_kept > 0) {
             const need = entries.items[first_kept - 1].e.payload.len;
@@ -1920,6 +1963,46 @@ test "snapshot: v3 payload (no command tail) restores with defaults" {
     var pool3 = try Pool.init(a);
     defer pool3.deinit();
     try testing.expectError(error.Truncated, restore(a, &pool3, buf.items[0 .. buf.items.len - tail]));
+}
+
+test "snapshot: a wide screen's scrollback is budgeted to the wire frame" {
+    const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+    const screen = try Screen.init(a, &pool, 4096, 2);
+    defer screen.deinit();
+
+    // 700 full-width lines is ~23 MB of scrollback alone: past
+    // wire.MAX_FRAME, so an unbudgeted body produces a snapshot frame
+    // no client can peel and the session becomes unattachable.
+    var pushed: u64 = 0;
+    while (pushed < 700) : (pushed += 1) {
+        try screen.reserveScrollbackPushes(1);
+        const cells = try a.alloc(Cell, screen.cols);
+        @memset(cells, .{});
+        switch (screen.pushScrollbackTakeOld(cells, 1000 + pushed, false)) {
+            .retained => {},
+            .caller_owned => |old| a.free(old),
+        }
+    }
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(screen, &body, a);
+    // The daemon prefixes a 9-byte envelope and a 5-byte frame header.
+    try testing.expect(body.items.len + 9 + wire.header_size <= wire.MAX_FRAME);
+
+    var restore_pool = try Pool.init(a);
+    defer restore_pool.deinit();
+    const restored = try restore(a, &restore_pool, body.items);
+    defer restored.deinit();
+    // Something survived, and it is the NEWEST end of the scrollback.
+    try testing.expect(restored.scrollbackCount() > 0);
+    try testing.expect(restored.scrollbackCount() < screen.scrollbackCount());
+    try testing.expectEqual(
+        screen.scrollbackLine(screen.scrollbackCount() - 1).id,
+        restored.scrollbackLine(restored.scrollbackCount() - 1).id,
+    );
 }
 
 test "snapshot: serializer targets v3 for legacy peers" {
