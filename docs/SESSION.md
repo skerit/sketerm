@@ -1,5 +1,46 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-07: a libdecor shadow ate the pointer; five MCP app-tool gaps
+
+A report from driving the Minecraft 26.2 client headlessly. The real
+defect: every pointer event went to libdecor's shadow subsurface,
+coordinates shifted by its margin, and the app (GLFW ignores surfaces
+it did not create) had keyboard input and no pointer at all. Reproduced
+with a 100-line libdecor client under `launch_app`: the shadow is a
+subsurface ABOVE the toplevel, 688x552 at (-24,-48) around a 640x480
+window, and its input region is add(whole) + subtract(interior) --
+which `wl_region.subtract` ignored ("over-approximates, fails safe"),
+so the shadow claimed the whole window. Two more things had to be true
+for a click to land: libdecor sets that region only in the redraw its
+OWN pointer-enter triggers, so the brain now re-runs the hit test when
+an input-region commit changes what accepts the point it is on
+(`refocusPointer`, never mid-press), and appdrive places the pointer
+and pumps up to 100ms before pressing on a subsurface it was not
+already on (`enterSettled`) -- a human moves before clicking, and the
+one-batch enter+press never gave the app the chance. Verified on the
+probe: first click enters the shadow, leaves, enters the app surface
+at (320,240), presses there; a click on the resize edge still goes to
+the shadow. `wl_pointer.frame` was checked and already sent after
+every enter/leave/motion/button/axis on v5+ pointers.
+
+The rest, each proven through the MCP server on the rebuilt binaries:
+`app_wait` with no window yet blocks on the first toplevel frame in
+every mode (`window_appeared`, mode `first_window` when none comes)
+instead of erroring or returning "settled" at once; `screenshot_app
+path:` writes the capture at full resolution to a file (`inline:false`
+skips the image); `close_app` takes its kill ACK over a fresh side
+connection -- the primary one queued it behind seconds of WAYLAND_DEBUG
+frame backlog, which is what the reporter's "did not acknowledge within
+5s" was -- and when the ACK is still late asks the daemon whether the
+session exists (`process_state` gone/running/unknown); `launch_app
+xwayland:true` attaches the rootless Xwayland + xwayland-satellite
+pair to an APP session (it was display-session-only), exports
+DISPLAY/XAUTHORITY to the child, reports `x_display`, fails the launch
+when the runtime is missing, and `capabilities.app_xwayland` preflights
+it. Only the refusal path of that last one could run here: this host
+has no xwayland-satellite, so an X11 app surfacing as an app window
+is plumbed and documented but not exercised end to end.
+
 ## 2026-09-07: what a selection means, and eleven more file-manager bugs
 
 The second pass over `sketerm files`, continuing the afternoon of
