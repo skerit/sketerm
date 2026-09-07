@@ -306,9 +306,12 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             .env = env_list.items,
             .output_width = out_w,
             .output_height = out_h,
+            .xwayland = argBool(args, "xwayland"),
         }) catch |err| switch (err) {
             appdrive.Error.SpawnFailed => {
                 const why = appdrive.lastLaunchErr();
+                if (std.mem.indexOf(u8, why, "XwaylandUnavailable") != null)
+                    return errRes(arena, .unavailable, "xwayland:true needs Xwayland AND xwayland-satellite on the daemon host's PATH (capabilities.app_xwayland reports this for the local daemon); install them or drop xwayland — nothing was launched");
                 return errRes(arena, .unavailable, if (why.len > 0)
                     try std.fmt.allocPrint(arena, "spawn failed — {s}", .{why})
                 else
@@ -317,6 +320,14 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             appdrive.Error.BadLayout => return errRes(arena, .invalid_args, "unknown keyboard layout (available: us, gb, fr, be, de)"),
             else => return appErr(arena, "launch failed"),
         };
+        // Requested X11 but the daemon answered without a display: an
+        // older daemon ignored the field. Refuse rather than hand back
+        // a session whose X clients can never surface.
+        if (argBool(args, "xwayland") and app.x_display == null) {
+            _ = app.killAndWait(5_000);
+            app.deinit();
+            return errRes(arena, .unavailable, "xwayland:true was requested but the daemon attached no X11 display (an older sketerm-mux that predates rootless X11 for app sessions); upgrade the daemon or drop xwayland");
+        }
         const id = mcp.app_state.next_id;
         mcp.app_state.next_id += 1;
         mcp.app_state.apps.put(mcp.app_state.allocator, id, app) catch {
@@ -357,6 +368,12 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         }
         if (browser_note.len > 0) try res.text(browser_note);
         if (debug_note.len > 0) try res.text(std.mem.trimStart(u8, debug_note, "\n"));
+        try res.fact("xwayland", app.x_display != null);
+        if (app.x_display) |xd| {
+            try res.fact("x_display", xd);
+            try res.fact("xauthority", app.xauthority orelse "");
+            try res.textf("rootless X11: DISPLAY={s} XAUTHORITY={s} (exported to the app; X toplevels surface as app windows)", .{ xd, app.xauthority orelse "" });
+        }
         if (audio_path) |ap| {
             const stem = if (std.mem.endsWith(u8, ap, ".wav")) ap[0 .. ap.len - 4] else ap;
             try res.fact("audio_capture", try std.fmt.allocPrint(arena, "{s}.wav", .{stem}));
@@ -1026,10 +1043,10 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
             try res.fact("frames", st.frames);
             try res.fact("diff_scope", if (region != null) "region" else "window");
             try res.textf("window {d}: {s} {d:.2}% of the {s} since your last look ({d}x{d}, frame {d}){s}", .{
-                win_id,                          if (st.changed) "changed" else "unchanged,",
-                st.diff_pct,                     if (region != null) "region" else "window",
-                st.w,                            st.h,
-                st.frames,                       if (st.resized) ", window RESIZED" else "",
+                win_id,      if (st.changed) "changed" else "unchanged,",
+                st.diff_pct, if (region != null) "region" else "window",
+                st.w,        st.h,
+                st.frames,   if (st.resized) ", window RESIZED" else "",
             });
             return res.finish();
         }
@@ -1096,6 +1113,34 @@ pub fn appTool(arena: std.mem.Allocator, name: []const u8, args: std.json.Value)
         if (eql(u8, name, "get_app_state")) try addAppSummary(&res, arena, app);
         try res.fact("window", win_id);
         try addShotFacts(&res, arena, app, win_id, shot);
+        // Durable evidence: `path` writes the SAME capture (same region
+        // and zoom) to a file on this host at FULL resolution — the
+        // inline image is downscaled to max_px, the file is not. Before
+        // this, the only file a screenshot could leave behind was the
+        // app's own (a game's F2 key).
+        if (argStr(args, "path")) |path| {
+            if (path.len == 0 or path[0] != '/')
+                return errRes(arena, .invalid_args, "'path' must be an absolute path on the MCP server's host");
+            const full = if (max_px == 0)
+                shot
+            else
+                app.screenshotPng(win_id, 0, region, zoom) catch
+                    return errRes(arena, .not_found, "no such window / no pixels yet (a region must lie inside the window)");
+            defer if (max_px != 0) mcp.app_state.allocator.free(full.png);
+            atomicwrite.writeFile(path, full.png, 0o600) catch |err| return errRes(
+                arena,
+                .io_failed,
+                try std.fmt.allocPrint(arena, "cannot write the screenshot to {s}: {s}", .{ path, @errorName(err) }),
+            );
+            try res.fact("path", path);
+            try res.fact("file_bytes", full.png.len);
+            try res.fact("file_w", full.img_w);
+            try res.fact("file_h", full.img_h);
+            try res.textf("saved {d}x{d} PNG ({d} KiB) to {s}", .{ full.img_w, full.img_h, full.png.len / 1024, path });
+        }
+        // inline:false skips the image block (a file-only capture costs
+        // no image tokens); the facts still describe the frame.
+        if (args == .object) if (args.object.get("inline")) |v| if (v == .bool and !v.bool) return res.finish();
         return res.finishWithImages(&.{shot.png}, null);
     }
     if (eql(u8, name, "app_drag")) {
@@ -2009,7 +2054,7 @@ fn stepOutcome(step: usize, ok: bool, line: []const u8, wait_clipped: bool) Step
     }
     // "ERROR" is what the transcript shouts; `ok` already carries it.
     for ([_][]const u8{ "ERROR — ", "ERROR - " }) |prefix| {
-        if (std.mem.startsWith(u8, note, prefix)) note = note[prefix.len ..];
+        if (std.mem.startsWith(u8, note, prefix)) note = note[prefix.len..];
     }
     return .{ .step = step, .ok = ok, .note = note, .wait_clipped = wait_clipped };
 }
@@ -2231,7 +2276,42 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         const quiet_ms: i64 = argInt(args, "quiet_ms") orelse 400;
         const timeout_ms: i64 = std.math.clamp(argInt(args, "timeout_ms") orelse 10_000, 0, mcp.WAIT_CAP_MS);
         const was_exited = app.exited;
-        const wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+        var wid: u32 = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+        const t_start = nowMs();
+        // No window yet is not an error, it is the thing to wait for:
+        // before this, app_wait errored (with change_pct/min_frames) or
+        // returned "settled, 0 frames" at once (idle mode) on a
+        // slow-starting app, and nothing but launch_app's own wait_ms
+        // could block on the first window.
+        var window_appeared = false;
+        var window_wait_ms: i64 = 0;
+        if (wid == 0 and !app.exited) {
+            window_appeared = app.waitFirstWindow(timeout_ms);
+            window_wait_ms = nowMs() - t_start;
+            wid = if (argInt(args, "window")) |v| @intCast(v) else firstToplevelId(app);
+            if (!app.exited and window_appeared and wid != 0) {
+                // fall through: the requested wait runs on it below
+            } else {
+                var res = Res.init(arena);
+                try res.fact("window", 0);
+                try res.fact("mode", "first_window");
+                try res.fact("settled", false);
+                try res.fact("window_appeared", window_appeared);
+                try res.fact("frames_before", 0);
+                try res.fact("frames_committed", 0);
+                try res.fact("frame_now", 0);
+                try res.fact("waited_ms", window_wait_ms);
+                if (app.exited)
+                    try res.textf("app EXITED before rendering a window (status {d}{s}) — backtrace/report in app_log", .{ app.exit_status, try exitSuffix(arena, app.exit_status) })
+                else if (window_appeared)
+                    try res.textf("a window rendered, but not the requested window id {d}", .{argInt(args, "window") orelse 0})
+                else
+                    try res.textf("NO WINDOW rendered within {d}ms: the app is running but has not committed a toplevel frame yet (still starting, or it may never open one — check app_log / app_output). Call app_wait again to keep waiting", .{timeout_ms});
+                try addAppSummary(&res, arena, app);
+                return res.finish();
+            }
+        }
+        const remaining_ms: i64 = @max(timeout_ms - window_wait_ms, 0);
         // Every verdict carries the frame delta actually observed. Both
         // failure modes reported from the field were unreadable without
         // it: a still splash screen "settles" instantly (0 frames, no
@@ -2250,8 +2330,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             // honest opposite of settling on a static frame.
             mode = "min_frames";
             const want: u64 = @intCast(@max(mf, 1));
-            if (wid == 0) return errRes(arena, .not_found, "no rendered window yet (min_frames needs one)");
-            if (app.waitFrameAfter(wid, frames_before + want - 1, timeout_ms)) {
+            if (app.waitFrameAfter(wid, frames_before + want - 1, remaining_ms)) {
                 settled_ok = true;
                 outcome = try std.fmt.allocPrint(arena, "committed {d} new frame(s) within {d}ms", .{ want, nowMs() - t0 });
             } else {
@@ -2263,23 +2342,22 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
                 // worst possible reflex, because the same message is
                 // how a real freeze announces itself. Only ZERO frames
                 // is a liveness claim now.
-                outcome = try shortFramesVerdict(arena, wid, app.frameCount(wid) - frames_before, want, nowMs() - t0, timeout_ms);
+                outcome = try shortFramesVerdict(arena, wid, app.frameCount(wid) - frames_before, want, nowMs() - t0, remaining_ms);
             }
         } else if (argFloat(args, "change_pct")) |pct| {
             // Visual quiescence: frames may keep committing (a game
             // always renders) — settle when they stop CHANGING much.
             // A region scopes the percentage to that rect.
             mode = "visual_settle";
-            if (wid == 0) return errRes(arena, .not_found, "no rendered window yet (change_pct needs one)");
-            settled_ok = app.waitVisualSettle(wid, quiet_ms, timeout_ms, pct, regionFrom(args));
+            settled_ok = app.waitVisualSettle(wid, quiet_ms, remaining_ms, pct, regionFrom(args));
             outcome = if (settled_ok)
                 try std.fmt.allocPrint(arena, "settled (frames changed <{d:.1}% of pixels for {d}ms)", .{ pct, quiet_ms })
             else
                 // NOT an error: for a game or a video this is the
                 // expected steady state, so it must not read as failure.
-                try std.fmt.allocPrint(arena, "ALIVE AND ANIMATING, never quiesced: frames kept changing >{d:.1}% of pixels for the whole {d}ms. This is the normal state for a game/video and is not a failure — to synchronise on something real, wait on the app's own log (app_wait_log) or on a frame count (min_frames)", .{ pct, timeout_ms });
+                try std.fmt.allocPrint(arena, "ALIVE AND ANIMATING, never quiesced: frames kept changing >{d:.1}% of pixels for the whole {d}ms. This is the normal state for a game/video and is not a failure — to synchronise on something real, wait on the app's own log (app_wait_log) or on a frame count (min_frames)", .{ pct, remaining_ms });
         } else {
-            settled_ok = app.waitIdle(quiet_ms, timeout_ms);
+            settled_ok = app.waitIdle(quiet_ms, remaining_ms);
             outcome = if (settled_ok)
                 try std.fmt.allocPrint(arena, "settled (no new frames for {d}ms). NOTE: no commits is not the same as no work — an app busy inside its draw path, or one showing a static splash, settles here instantly; use min_frames for liveness", .{quiet_ms})
             else
@@ -2301,7 +2379,9 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         try res.fact("frames_before", frames_before);
         try res.fact("frames_committed", delta);
         try res.fact("frame_now", app.frameCount(wid));
-        try res.fact("waited_ms", nowMs() - t0);
+        try res.fact("waited_ms", nowMs() - t_start);
+        try res.fact("window_appeared", window_appeared);
+        if (window_appeared) try res.textf("window {d} rendered after {d}ms; the {s} wait then ran with the remaining {d}ms", .{ wid, window_wait_ms, mode, remaining_ms });
         try res.text(outcome);
         try res.textf("observed: window {d} committed {d} frame(s) during the {d}ms wait (now at frame {d})", .{
             wid, delta, nowMs() - t0, app.frameCount(wid),
@@ -2495,7 +2575,7 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         } else {
             try res.fact("clicked", false);
             try res.textf("\"{s}\" is visible in window {d}{s}", .{
-                query, wid,
+                query,                                                               wid,
                 if (do_click) ", but OCR gave no clickable word box for it" else "",
             });
         }
@@ -2627,6 +2707,16 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
         // frame and closing the socket (the old behaviour) reported
         // "killed" whether or not anything died.
         const outcome = app.killAndWait(5_000);
+        // An unacknowledged kill is NOT left ambiguous: ask the daemon
+        // whether the session still exists. "gone" is a late ACK, a
+        // stated success; "running" is the real failure; only "unknown"
+        // (the daemon could not be asked) keeps the old hedge.
+        const process_state: []const u8 = if (outcome != .unconfirmed)
+            "gone"
+        else if (app.sessionListed(5_000)) |listed|
+            (if (listed) "running" else "gone")
+        else
+            "unknown";
         app.deinit();
         const msg: []const u8 = switch (outcome) {
             .already_exited => if (was_exited)
@@ -2634,14 +2724,18 @@ pub fn appToolTail(arena: std.mem.Allocator, name: []const u8, args: std.json.Va
             else
                 "app session closed (it was already gone on the daemon)",
             .acknowledged => "app session killed — the daemon signalled the child's whole process group and reaped it; no descendant processes remain",
-            .unconfirmed => "app session closed locally, but the daemon did not acknowledge the kill within 5s — the process MAY still be running; check with list_apps or on the daemon host",
+            .unconfirmed => if (eql(u8, process_state, "gone"))
+                "app session killed: the daemon's acknowledgement did not arrive within 5s, but a follow-up listing confirms the session is gone"
+            else if (eql(u8, process_state, "running"))
+                "KILL NOT CONFIRMED: the daemon did not acknowledge within 5s and a follow-up listing still shows the session ALIVE — the process is still running; retry close_app, or kill it on the daemon host"
+            else
+                "app session closed locally, but the daemon did not acknowledge the kill within 5s and could not be asked whether the session survived — the process MAY still be running; check with list_apps or on the daemon host",
         };
-        // An unacknowledged kill is a real failure: the process may
-        // still be running, so it stays an error result.
-        if (outcome == .unconfirmed) return errRes(arena, .timeout, msg);
+        if (outcome == .unconfirmed and !eql(u8, process_state, "gone")) return errRes(arena, .timeout, msg);
         var res = Res.init(arena);
         try res.fact("app", id);
         try res.fact("outcome", @tagName(outcome));
+        try res.fact("process_state", process_state);
         try res.fact("was_exited", was_exited);
         if (was_exited) try res.fact("exit_status", status);
         try res.text(msg);

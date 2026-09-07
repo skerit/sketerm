@@ -24,6 +24,14 @@ pub const SpawnMeta = struct {
     pid: i32 = 0,
     output_width: u32 = 0,
     output_height: u32 = 0,
+    /// Rootless X11 display (":N") and authority path the daemon
+    /// attached to the session; lengths 0 = none. Fixed buffers keep
+    /// this allocation-free; a path too long for the buffer is
+    /// reported as absent rather than truncated.
+    x_display: [32]u8 = undefined,
+    x_display_len: u8 = 0,
+    xauthority: [1024]u8 = undefined,
+    xauthority_len: u16 = 0,
 };
 
 /// Parse the allocation-independent identity needed before any fallible construction.
@@ -33,6 +41,8 @@ pub fn parseSpawnMeta(payload: []const u8) !SpawnMeta {
         pid: i32 = 0,
         output_width: u32 = 0,
         output_height: u32 = 0,
+        x_display: []const u8 = "",
+        xauthority: []const u8 = "",
     };
     var storage: [4096]u8 = undefined;
     var fixed = std.heap.FixedBufferAllocator.init(&storage);
@@ -49,7 +59,26 @@ pub fn parseSpawnMeta(payload: []const u8) !SpawnMeta {
         .output_height = parsed.value.output_height,
     };
     @memcpy(&meta.origin_id, parsed.value.origin_id);
+    const xd = parsed.value.x_display;
+    const xa = parsed.value.xauthority;
+    if (xd.len > 0 and xd.len <= meta.x_display.len and xa.len <= meta.xauthority.len) {
+        @memcpy(meta.x_display[0..xd.len], xd);
+        meta.x_display_len = @intCast(xd.len);
+        @memcpy(meta.xauthority[0..xa.len], xa);
+        meta.xauthority_len = @intCast(xa.len);
+    }
     return meta;
+}
+
+test "parseSpawnMeta carries the rootless X11 identity when present" {
+    const t = std.testing;
+    const id = "0123456789abcdef0123456789abcdef";
+    const with = try parseSpawnMeta("{\"origin_id\":\"" ++ id ++ "\",\"pid\":7,\"x_display\":\":101\",\"xauthority\":\"/tmp/x/auth\"}");
+    try t.expectEqualStrings(":101", with.x_display[0..with.x_display_len]);
+    try t.expectEqualStrings("/tmp/x/auth", with.xauthority[0..with.xauthority_len]);
+    const without = try parseSpawnMeta("{\"origin_id\":\"" ++ id ++ "\",\"pid\":7}");
+    try t.expectEqual(@as(u8, 0), without.x_display_len);
+    try t.expectEqual(@as(u16, 0), without.xauthority_len);
 }
 
 pub const Guard = struct {

@@ -476,6 +476,12 @@ pub const App = struct {
     /// the screen, distinct from any window's size.
     output_width: u32 = 0,
     output_height: u32 = 0,
+    /// Rootless X11 display the daemon attached to this session
+    /// (`launch_app xwayland:true`), as ":N" plus its authority file on
+    /// the daemon host. Null = none (not requested, or an older daemon
+    /// that ignored the request).
+    x_display: ?[]u8 = null,
+    xauthority: ?[]u8 = null,
     /// Toplevel the keyboard was last aimed at (0 = none yet).
     kbd_focus: u32 = 0, // public window id
     /// Tracked pointer: last surface-local position injected on the
@@ -485,6 +491,9 @@ pub const App = struct {
     ptr_win: u32 = 0,
     ptr_x: f64 = 0,
     ptr_y: f64 = 0,
+    /// Surface the pointer was last entered on (0 = none): a press on
+    /// a surface the pointer has just arrived at gets `enterSettled`.
+    ptr_sid: u32 = 0,
     /// Latest clipboard selection the app announced (copy source).
     clip_offer: ?ClipOffer = null,
     /// Fetched app-clipboard bytes (answer to a clip_send).
@@ -580,6 +589,12 @@ pub const App = struct {
         /// the field (compare App.output_width after launch).
         output_width: u32 = 0,
         output_height: u32 = 0,
+        /// Rootless X11 for this session (Xwayland + xwayland-satellite
+        /// on the daemon host): X11-only clients become ordinary app
+        /// windows. REQUIRED when set — a missing runtime fails the
+        /// spawn rather than silently yielding a Wayland-only session
+        /// whose X windows never appear.
+        xwayland: bool = false,
         /// Per-step handshake deadline; a stalled daemon surfaces as a
         /// described SpawnFailed instead of a hung tool call.
         step_timeout_ms: i64 = 15_000,
@@ -654,6 +669,8 @@ pub const App = struct {
             // mode (an explicit 0 is rejected), so resolve it here.
             .output_width = if (opts.output_width != 0) opts.output_width else wlcomp.DEFAULT_OUTPUT_WIDTH,
             .output_height = if (opts.output_height != 0) opts.output_height else wlcomp.DEFAULT_OUTPUT_HEIGHT,
+            .xwayland = opts.xwayland,
+            .require_xwayland = opts.xwayland,
         }) catch return Error.SpawnFailed;
         const ok = conn.recvExpectFor(&.{.ok}, opts.step_timeout_ms) catch |err| {
             setStepErr("spawn", &conn, err);
@@ -715,6 +732,16 @@ pub const App = struct {
         else
             null;
         errdefer if (ssh_host) |host| allocator.free(host);
+        const x_display: ?[]u8 = if (meta.x_display_len > 0)
+            allocator.dupe(u8, meta.x_display[0..meta.x_display_len]) catch return Error.OutOfMemory
+        else
+            null;
+        errdefer if (x_display) |p| allocator.free(p);
+        const xauthority: ?[]u8 = if (meta.xauthority_len > 0)
+            allocator.dupe(u8, meta.xauthority[0..meta.xauthority_len]) catch return Error.OutOfMemory
+        else
+            null;
+        errdefer if (xauthority) |p| allocator.free(p);
         const self = allocator.create(App) catch return Error.OutOfMemory;
         self.* = .{
             .allocator = allocator,
@@ -731,6 +758,8 @@ pub const App = struct {
             .term_seq = if (restored) |r| r.seq else 0,
             .local_sock = local_sock,
             .ssh_host = ssh_host,
+            .x_display = x_display,
+            .xauthority = xauthority,
         };
         layout.* = null;
         cleanup.disarm();
@@ -827,18 +856,105 @@ pub const App = struct {
     /// must go through here.
     pub fn killAndWait(self: *App, timeout_ms: i64) KillOutcome {
         if (self.exited) return .already_exited;
-        self.conn.sendKill(.{
+        const deadline = nowMs() + timeout_ms;
+        // The ACK goes over a FRESH connection: on the primary one it
+        // queues behind every frame the app committed since the last
+        // tool call, and a busy app (or one flooding its PTY under
+        // WAYLAND_DEBUG) buried a prompt kill behind seconds of
+        // backlog, which then read as "the daemon did not acknowledge".
+        // Same shape as logGetFresh.
+        const outcome = self.killFresh(deadline) orelse blk: {
+            self.conn.sendKill(.{
+                .name = self.name,
+                .origin_id = if (self.origin_id_valid) &self.origin_id else "",
+            }) catch break :blk KillOutcome.unconfirmed;
+            const f = self.conn.recvExpectFor(&.{ .ok, .gone }, @max(deadline - nowMs(), 1)) catch |err| {
+                // DaemonError = "no such session": already gone daemon-side.
+                break :blk if (err == error.DaemonError) KillOutcome.already_exited else KillOutcome.unconfirmed;
+            };
+            f.deinit(self.allocator);
+            break :blk KillOutcome.acknowledged;
+        };
+        // Suppress deinit's second, unacknowledged kill frame.
+        if (outcome != .unconfirmed) self.exited = true;
+        return outcome;
+    }
+
+    /// Open a side connection to the session's daemon (hello only, no
+    /// attach): an empty daemon-side queue, so a reply lands at once.
+    fn sideConn(self: *App, deadline: i64) ?muxclient.Conn {
+        const a = self.allocator;
+        var conn = blk: {
+            if (self.ssh_host) |h| break :blk muxconnect.connectSsh(a, h) catch return null;
+            break :blk muxclient.Conn.connectLocalAutostartAt(a, self.local_sock) catch return null;
+        };
+        conn.setNonBlocking();
+        conn.sendJson(.hello, .{
+            .proto = wire.PROTO_VERSION,
+            .min_proto = @as(u32, 1),
+            .negotiation = @as(u8, 1),
+            .snapshot_max = snapshot.SNAPSHOT_VERSION,
+            .native_state_max = @as(u8, 0),
+            .audio = false,
+            .winstream = false,
+            .video = false,
+        }) catch {
+            conn.deinit();
+            return null;
+        };
+        const w = conn.recvExpectFor(&.{.welcome}, @max(deadline - nowMs(), 1)) catch {
+            conn.deinit();
+            return null;
+        };
+        w.deinit(a);
+        return conn;
+    }
+
+    /// Kill over a side connection. Null = the side connection could
+    /// not be made (the caller falls back to the primary one).
+    fn killFresh(self: *App, deadline: i64) ?KillOutcome {
+        var conn = self.sideConn(deadline) orelse return null;
+        defer conn.deinit();
+        conn.sendKill(.{
             .name = self.name,
             .origin_id = if (self.origin_id_valid) &self.origin_id else "",
-        }) catch return .unconfirmed;
-        const f = self.conn.recvExpectFor(&.{ .ok, .gone }, timeout_ms) catch |err| {
-            // DaemonError = "no such session": already gone daemon-side.
+        }) catch return null;
+        const f = conn.recvExpectFor(&.{.ok}, @max(deadline - nowMs(), 1)) catch |err| {
             return if (err == error.DaemonError) .already_exited else .unconfirmed;
         };
         f.deinit(self.allocator);
-        // Suppress deinit's second, unacknowledged kill frame.
-        self.exited = true;
         return .acknowledged;
+    }
+
+    /// Whether the daemon still LISTS this session (by name/origin and,
+    /// when known, lifetime id) as a live, non-exited one. Null when
+    /// the daemon could not be asked. This is what turns an
+    /// unacknowledged kill into a stated outcome.
+    pub fn sessionListed(self: *App, timeout_ms: i64) ?bool {
+        const a = self.allocator;
+        const deadline = nowMs() + timeout_ms;
+        var conn = self.sideConn(deadline) orelse return null;
+        defer conn.deinit();
+        conn.sendFrame(.list, "") catch return null;
+        const f = conn.recvExpectFor(&.{.welcome}, @max(deadline - nowMs(), 1)) catch return null;
+        defer f.deinit(a);
+        const Listing = struct {
+            sessions: []const struct {
+                name: []const u8 = "",
+                origin_name: []const u8 = "",
+                origin_id: []const u8 = "",
+                exited: bool = false,
+            } = &.{},
+        };
+        var parsed = std.json.parseFromSlice(Listing, a, f.payload, .{ .ignore_unknown_fields = true }) catch return null;
+        defer parsed.deinit();
+        for (parsed.value.sessions) |s| {
+            if (!std.mem.eql(u8, s.name, self.name) and !std.mem.eql(u8, s.origin_name, self.name)) continue;
+            if (self.origin_id_valid and wire.validSessionOriginId(s.origin_id) and
+                !std.mem.eql(u8, s.origin_id, &self.origin_id)) continue;
+            return !s.exited;
+        }
+        return false;
     }
 
     /// Free the client-side state WITHOUT killing the session — a
@@ -890,6 +1006,8 @@ pub const App = struct {
         }
         if (self.local_sock) |p| a.free(p);
         if (self.ssh_host) |h| a.free(h);
+        if (self.x_display) |p| a.free(p);
+        if (self.xauthority) |p| a.free(p);
         a.free(self.name);
         a.destroy(self);
     }
@@ -1916,14 +2034,55 @@ pub const App = struct {
 
     /// Inject enter+motion to (x,y) and move the tracked position.
     fn sendPointer(self: *App, win: *Window, x: f64, y: f64) Error!void {
-        const a = self.allocator;
         const hit = self.ptrTarget(win, x, y);
+        try self.sendEnterMotion(win.chan, hit);
+        self.rememberPtr(win.id, x, y);
+    }
+
+    fn sendEnterMotion(self: *App, chan: u32, hit: wlcomp.Compositor.Hit) Error!void {
+        const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
         wlpipe.appendSeatEnter(&units, a, hit.sid, hit.x, hit.y) catch return Error.OutOfMemory;
         wlpipe.appendSeatMotion(&units, a, hit.x, hit.y) catch return Error.OutOfMemory;
-        try self.sendIntents(win.chan, units.items);
-        self.rememberPtr(win.id, x, y);
+        try self.sendIntents(chan, units.items);
+        self.ptr_sid = hit.sid;
+    }
+
+    /// How long a press waits for the app to react to a fresh enter on
+    /// a SUBSURFACE before the button goes down.
+    const ENTER_SETTLE_MS: i64 = 100;
+
+    /// Place the pointer on `win` at (x, y) and let the app react
+    /// before anything is pressed. Entering a surface can change what
+    /// accepts input there: libdecor restricts its shadow subsurface's
+    /// input region only in the redraw its own pointer-enter triggers,
+    /// so a press bundled into the same batch as that first enter lands
+    /// on a surface that has just stopped accepting the point (and that
+    /// the app never listens on). A human always moves before clicking;
+    /// this is that move. Costs `ENTER_SETTLE_MS` only when the target
+    /// is a subsurface the pointer was not already on.
+    /// @return the hit the press should use
+    fn enterSettled(self: *App, win_id: u32, x: f64, y: f64) Error!wlcomp.Compositor.Hit {
+        var win = self.winById(win_id) orelse return Error.NoSuchWindow;
+        const chan = win.chan;
+        const root = win.sid;
+        var hit = self.ptrTarget(win, x, y);
+        if (self.ptr_win == win_id and self.ptr_sid == hit.sid) return hit;
+        try self.sendEnterMotion(chan, hit);
+        if (hit.sid == root) return hit;
+        const deadline = nowMs() + ENTER_SETTLE_MS;
+        while (nowMs() < deadline and !self.exited) {
+            _ = self.pumpOnce(20);
+            win = self.winById(win_id) orelse return Error.NoSuchWindow;
+            const again = self.ptrTarget(win, x, y);
+            if (again.sid != hit.sid) {
+                hit = again;
+                try self.sendEnterMotion(chan, hit);
+                break;
+            }
+        }
+        return hit;
     }
 
     fn rememberPtr(self: *App, win_id: u32, x: f64, y: f64) void {
@@ -1987,7 +2146,7 @@ pub const App = struct {
         // window it was pressed on.
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
         const chan = win.chan;
-        const hit = self.ptrTarget(win, x, y);
+        const hit = try self.enterSettled(win_id, x, y);
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
@@ -2074,7 +2233,7 @@ pub const App = struct {
         const chan = win.chan;
         // The press resolves the target surface; the drag then stays
         // on it (pointer grab), so every motion uses the same offset.
-        const hit = self.ptrTarget(win, x1, y1);
+        const hit = try self.enterSettled(win_id, x1, y1);
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
@@ -3197,9 +3356,10 @@ test "clickEx: a frame that frees the window mid-hold cannot dangle" {
     try t.expectEqual(@as(usize, 0), app.chans.count());
     try t.expectEqual(win_id, app.ptr_win);
 
-    // Two chan_data frames went out: the press flushed for the hold,
-    // and the release AFTER the window was freed. A seat button left
-    // logically down outlives the window it was pressed on.
+    // Three chan_data frames went out: the first-contact enter+motion
+    // (enterSettled), the press flushed for the hold, and the release
+    // AFTER the window was freed. A seat button left logically down
+    // outlives the window it was pressed on.
     var got: [512]u8 = undefined;
     var have: usize = 0;
     while (have < got.len and App.pollIn(fds[1], 50)) {
@@ -3215,7 +3375,7 @@ test "clickEx: a frame that frees the window mid-hold cannot dangle" {
         if (got[off + 4] == @intFromEnum(wire.FrameType.chan_data)) sent += 1;
         off += 4 + len;
     }
-    try t.expectEqual(@as(usize, 2), sent);
+    try t.expectEqual(@as(usize, 3), sent);
 }
 
 test "Firefox pattern: subsurface repaints composite into the window image" {

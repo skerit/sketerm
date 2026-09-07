@@ -1292,7 +1292,9 @@ pub const SpawnReq = struct {
     /// daemon host's binary path, and a version mismatch would be a
     /// silent instant exit. Any argv the client sent is ignored.
     display: bool = false,
-    /// Rootless X11 compatibility for an external display session.
+    /// Rootless X11 compatibility for an external display session or a
+    /// headless app session (`app` set): the child gets DISPLAY and
+    /// XAUTHORITY, and X toplevels surface as ordinary app windows.
     xwayland: bool = false,
     /// Fail session creation instead of degrading to Wayland-only when the
     /// optional Xwayland runtime is unavailable or cannot start.

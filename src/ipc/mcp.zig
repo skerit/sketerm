@@ -3819,6 +3819,13 @@ fn capabilitiesTool(arena: std.mem.Allocator, backend: Backend) ![]const u8 {
     try res.fact("ocr", ocr_ok);
     if (!ocr_ok)
         try res.text("app_read_text/app_wait_text need libtesseract — install tesseract + tesseract-data-eng on THIS machine");
+    // Rootless X11 for app sessions is a daemon-host fact; the private
+    // daemon runs on this host, so PATH here is the answer for it.
+    const pathz = @import("../util/pathz.zig");
+    const xwl_ok = pathz.executableOnPath("Xwayland") and pathz.executableOnPath("xwayland-satellite");
+    try res.fact("app_xwayland", xwl_ok);
+    if (!xwl_ok)
+        try res.text("launch_app xwayland:true (X11-only apps) needs Xwayland AND xwayland-satellite on THIS machine's PATH; a launch asking for it fails until they are installed");
 
     const helper = webHelperPath(arena);
     // The web tools drive the user's GUI on a server-wide socket OR on
@@ -6731,6 +6738,81 @@ test "app tools speak both lanes: windows, wait, pointer and the roster" {
     const mparsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, missing, .{});
     try t.expect(mparsed.object.get("isError").?.bool);
     try t.expectEqualStrings("not_found", mparsed.object.get("structuredContent").?.object.get("error").?.object.get("code").?.string);
+}
+
+test "app_wait with no window WAITS for one and reports first_window instead of erroring" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, false);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    app_state.ready = true;
+    try app_state.apps.put(t.allocator, 1, fixture.app);
+    defer {
+        MacroNudge.deinitAll();
+        _ = app_state.apps.fetchSwapRemove(1);
+        app_state.apps.deinit(t.allocator);
+        app_state.apps = .empty;
+        app_state.ready = false;
+    }
+    const app_tools = @import("mcp_app.zig");
+    // Every mode used to answer "no rendered window yet" (an error) or
+    // "settled, 0 frames" at once; all three now block on the window.
+    for ([_][]const u8{ "{\"app\":1,\"timeout_ms\":150}", "{\"app\":1,\"timeout_ms\":150,\"change_pct\":2}", "{\"app\":1,\"timeout_ms\":150,\"min_frames\":1}" }) |json| {
+        const t0 = clock.nowMs();
+        const waited = try app_tools.appTool(arena, "app_wait", try parseTestValue(arena, json));
+        const parsed = try expectToolResultShape(arena, "app_wait", waited);
+        const sc = parsed.object.get("structuredContent").?.object;
+        try t.expectEqualStrings("first_window", sc.get("mode").?.string);
+        try t.expect(!sc.get("settled").?.bool);
+        try t.expect(!sc.get("window_appeared").?.bool);
+        try t.expectEqual(@as(i64, 0), sc.get("window").?.integer);
+        try t.expect(clock.nowMs() - t0 >= 140);
+        const text = parsed.object.get("content").?.array.items[0].object.get("text").?.string;
+        try t.expect(std.mem.indexOf(u8, text, "NO WINDOW rendered within 150ms") != null);
+    }
+}
+
+test "screenshot_app path writes a full-resolution PNG and inline:false skips the image" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = try testActionApp(t.allocator, true);
+    defer _ = c.close(fixture.peer);
+    defer fixture.app.deinit();
+    app_state.ready = true;
+    try app_state.apps.put(t.allocator, 1, fixture.app);
+    defer {
+        MacroNudge.deinitAll();
+        _ = app_state.apps.fetchSwapRemove(1);
+        app_state.apps.deinit(t.allocator);
+        app_state.apps = .empty;
+        app_state.ready = false;
+    }
+    const app_tools = @import("mcp_app.zig");
+    const path = try std.fmt.allocPrint(arena, "/tmp/sketerm-mcp-shot-test-{d}.png", .{c.getpid()});
+    defer _ = c.unlink(path.ptr);
+    const pathz_ = try arena.dupeZ(u8, path);
+    _ = c.unlink(pathz_.ptr);
+    const args = try std.fmt.allocPrint(arena, "{{\"app\":1,\"window\":1,\"path\":\"{s}\",\"inline\":false}}", .{path});
+    const result = try app_tools.appTool(arena, "screenshot_app", try parseTestValue(arena, args));
+    const parsed = try expectToolResultShape(arena, "screenshot_app", result);
+    const sc = parsed.object.get("structuredContent").?.object;
+    try t.expectEqualStrings(path, sc.get("path").?.string);
+    try t.expectEqual(@as(i64, 1), sc.get("file_w").?.integer);
+    try t.expectEqual(@as(i64, 1), sc.get("file_h").?.integer);
+    // No image block inline, and the file holds exactly the reported bytes.
+    for (parsed.object.get("content").?.array.items) |blk| try t.expectEqualStrings("text", blk.object.get("type").?.string);
+    var st: c.struct_stat = undefined;
+    try t.expectEqual(@as(c_int, 0), c.stat(pathz_.ptr, &st));
+    try t.expectEqual(sc.get("file_bytes").?.integer, @as(i64, @intCast(st.st_size)));
+    // A relative path is refused before anything is captured.
+    const bad = try app_tools.appTool(arena, "screenshot_app", try parseTestValue(arena, "{\"app\":1,\"window\":1,\"path\":\"shot.png\"}"));
+    const bparsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, bad, .{});
+    try t.expect(bparsed.object.get("isError").?.bool);
 }
 
 test "get_app_state stats_only still reports the app it describes" {

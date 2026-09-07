@@ -1567,7 +1567,11 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
 
     var xwl: ?xwayland.Instance = null;
     errdefer if (xwl) |*instance| instance.deinit();
-    if (req.display and req.xwayland and hub != null) {
+    // Display sessions AND headless app sessions (`launch_app
+    // xwayland:true`): an X11-only app on a Wayland-only session
+    // maps its window in an Xwayland nobody manages, and it never
+    // surfaces as an app window.
+    if ((req.display or req.app) and req.xwayland and hub != null) {
         const base = runtimeBaseDir(self) orelse platform.runtimeDir();
         const runtime = if (rt_dir_owned) |p| p else platform.runtimeDir();
         xwl = xwayland.Instance.setup(allocator, base, hub.?.display_path, runtime, req.gpu) catch |err| blk: {
@@ -1650,6 +1654,17 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
         const z = try allocator.dupeZ(u8, kv);
         try env_z.append(allocator, z);
         try env_ptrs.append(allocator, z.ptr);
+    }
+    // An app session with rootless X11 must find it: the display
+    // CLI hands DISPLAY/XAUTHORITY to an OUTSIDE process, but here
+    // the child IS the client.
+    if (xwl) |*instance| {
+        const dz = try std.fmt.allocPrintSentinel(allocator, "DISPLAY={s}", .{instance.display_name}, 0);
+        try env_z.append(allocator, dz);
+        try env_ptrs.append(allocator, dz.ptr);
+        const az = try std.fmt.allocPrintSentinel(allocator, "XAUTHORITY={s}", .{instance.auth_path}, 0);
+        try env_z.append(allocator, az);
+        try env_ptrs.append(allocator, az.ptr);
     }
 
     var pty = try Pty.spawn(.{
