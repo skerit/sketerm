@@ -213,7 +213,20 @@ pub fn request(self: *Compositor, hdr: wire.Header, body: []const u8) Error!void
             const rh = (try it.next()).?.int;
             try slot.value_ptr.append(self.allocator, .{ .x = x, .y = y, .w = rw, .h = rh });
         },
-        2 => {}, // subtract — v1 over-approximates (fails safe)
+        2 => { // subtract(x, y, w, h)
+            // Must be exact: libdecor builds its shadow input region as
+            // add(whole) + subtract(interior). Treating subtract as a
+            // no-op left the shadow claiming the whole window, so every
+            // pointer event landed on a surface the app never listens
+            // on (GLFW ignores foreign surfaces: keyboard alive,
+            // pointer dead).
+            const x = (try it.next()).?.int;
+            const y = (try it.next()).?.int;
+            const rw = (try it.next()).?.int;
+            const rh = (try it.next()).?.int;
+            if (self.regions.getPtr(hdr.object)) |rects|
+                try cmod.subtractRect(self.allocator, rects, .{ .x = x, .y = y, .w = rw, .h = rh });
+        },
         else => return Error.Protocol,
     } else if (iface == &protocol.wl_shm) switch (hdr.opcode) {
         0 => { // create_pool(id, fd, size) — bytes via side-band
@@ -1409,6 +1422,12 @@ pub fn commit(self: *Compositor, sid: u32, surf: *Surface) Error!void {
         if (self.view.input_region) |cb| {
             cb(self.view.ctx, sid, if (surf.input_whole) null else surf.input_rects.items);
         }
+        // A region change under the pointer moves focus, as on any
+        // real compositor: libdecor's shadow only restricts its input
+        // region in the redraw its own pointer-enter triggers, so the
+        // very surface the pointer landed on is the one that just
+        // stopped accepting the point.
+        try self.refocusPointer(sid);
     }
 
     if (surf.xdg_surface != 0 and !surf.configured) {

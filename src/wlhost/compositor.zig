@@ -56,6 +56,57 @@ pub const Error = error{
 
 pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
 
+/// `wl_region.subtract`: remove `cut` from a rect list, splitting every
+/// overlapped rect into up to four remainders. Exact, not approximate.
+pub fn subtractRect(a: std.mem.Allocator, rects: *std.ArrayList(Rect), cut: Rect) Error!void {
+    if (cut.w <= 0 or cut.h <= 0) return;
+    const cx1 = cut.x +| cut.w;
+    const cy1 = cut.y +| cut.h;
+    var out: std.ArrayList(Rect) = .empty;
+    errdefer out.deinit(a);
+    for (rects.items) |r| {
+        const rx1 = r.x +| r.w;
+        const ry1 = r.y +| r.h;
+        if (r.w <= 0 or r.h <= 0) continue;
+        if (cut.x >= rx1 or cx1 <= r.x or cut.y >= ry1 or cy1 <= r.y) {
+            out.append(a, r) catch return Error.OutOfMemory;
+            continue;
+        }
+        // Top band, bottom band (full width), then left/right bands
+        // of the overlapped rows only.
+        const ix0 = @max(r.x, cut.x);
+        const ix1 = @min(rx1, cx1);
+        const iy0 = @max(r.y, cut.y);
+        const iy1 = @min(ry1, cy1);
+        if (iy0 > r.y) out.append(a, .{ .x = r.x, .y = r.y, .w = r.w, .h = iy0 - r.y }) catch return Error.OutOfMemory;
+        if (iy1 < ry1) out.append(a, .{ .x = r.x, .y = iy1, .w = r.w, .h = ry1 - iy1 }) catch return Error.OutOfMemory;
+        if (ix0 > r.x) out.append(a, .{ .x = r.x, .y = iy0, .w = ix0 - r.x, .h = iy1 - iy0 }) catch return Error.OutOfMemory;
+        if (ix1 < rx1) out.append(a, .{ .x = ix1, .y = iy0, .w = rx1 - ix1, .h = iy1 - iy0 }) catch return Error.OutOfMemory;
+    }
+    rects.deinit(a);
+    rects.* = out;
+}
+
+test "subtractRect: interior cut leaves a frame, disjoint cut leaves the rect" {
+    var rects: std.ArrayList(Rect) = .empty;
+    defer rects.deinit(t.allocator);
+    try rects.append(t.allocator, .{ .x = 0, .y = 0, .w = 688, .h = 552 });
+    try subtractRect(t.allocator, &rects, .{ .x = 24, .y = 48, .w = 640, .h = 480 });
+    try t.expectEqual(@as(usize, 4), rects.items.len);
+    var area: i64 = 0;
+    for (rects.items) |r| {
+        area += @as(i64, r.w) * r.h;
+        // No remainder may cover the cut.
+        try t.expect(r.x + r.w <= 24 or r.x >= 664 or r.y + r.h <= 48 or r.y >= 528);
+    }
+    try t.expectEqual(@as(i64, 688 * 552 - 640 * 480), area);
+    try subtractRect(t.allocator, &rects, .{ .x = 1000, .y = 1000, .w = 5, .h = 5 });
+    try t.expectEqual(@as(usize, 4), rects.items.len);
+    // Cutting everything empties the region.
+    try subtractRect(t.allocator, &rects, .{ .x = -10, .y = -10, .w = 2000, .h = 2000 });
+    try t.expectEqual(@as(usize, 0), rects.items.len);
+}
+
 /// Renderer-facing callbacks. Slices are valid only for the call.
 pub const View = struct {
     ctx: ?*anyopaque = null,
@@ -1923,6 +1974,40 @@ pub const Compositor = struct {
             if (self.acceptsInput(l.sid, lx, ly)) return .{ .sid = l.sid, .x = lx, .y = ly };
         }
         return fallback;
+    }
+
+    /// Offset of `sid` from the root of its surface tree (the sum of
+    /// subsurface positions up the chain).
+    fn rootOffset(self: *const Compositor, sid: u32) struct { x: i32, y: i32 } {
+        var x: i32 = 0;
+        var y: i32 = 0;
+        var cur = sid;
+        var depth: u32 = 0;
+        while (depth < max_sub_depth) : (depth += 1) {
+            const s = self.surfaces.getPtr(cur) orelse break;
+            if (s.subparent == 0 or s.subparent == cur) break;
+            x += s.sub_x;
+            y += s.sub_y;
+            cur = s.subparent;
+        }
+        return .{ .x = x, .y = y };
+    }
+
+    /// Re-run the hit test at the pointer's current position after
+    /// `changed` (a surface in the focused tree) altered what accepts
+    /// input, and move focus if another surface now claims the point.
+    /// Never during a button hold or a drag: an implicit grab keeps
+    /// focus on the pressed surface, as on every real compositor.
+    pub fn refocusPointer(self: *Compositor, changed: u32) Error!void {
+        if (self.pointer_focus == 0 or self.pressed_button != 0 or self.drag.active) return;
+        const root = self.rootSurface(self.pointer_focus);
+        if (self.rootSurface(changed) != root) return;
+        const off = self.rootOffset(self.pointer_focus);
+        const rx = self.last_px + @as(f64, @floatFromInt(off.x));
+        const ry = self.last_py + @as(f64, @floatFromInt(off.y));
+        const hit = self.hitTest(self.allocator, root, rx, ry);
+        if (hit.sid == self.pointer_focus) return;
+        try self.pointerEnter(hit.sid, hit.x, hit.y);
     }
 
     /// The effective display scale × 120 (fractional-scale wire unit).
@@ -5152,6 +5237,173 @@ test "Firefox: content subsurface layers above the CSD root and takes input" {
     try t.expectEqual(@as(u32, 15), through.sid);
 }
 
+test "libdecor shadow: add+subtract input region moves pointer focus back to the app surface" {
+    // libdecor-cairo's shadow is a subsurface ABOVE the toplevel,
+    // 24/48 px larger on every side, whose input region (whole minus
+    // the interior) is only set in the redraw its own pointer-enter
+    // triggers. The point the pointer landed on therefore stops being
+    // accepted by the focused surface; focus must move to the app's
+    // surface without waiting for the viewer's next motion.
+    var tv = TestView{};
+    var comp = try Compositor.init(t.allocator, tv.view());
+    defer comp.deinit();
+    var buf: [96]u8 = undefined;
+
+    try getRegistry(&comp);
+    try bindGlobal(&comp, 1, "wl_compositor", 6, 3);
+    try bindGlobal(&comp, 2, "wl_shm", 1, 4);
+    try bindGlobal(&comp, 5, "xdg_wm_base", 6, 5);
+    try bindGlobal(&comp, 11, "wl_subcompositor", 1, 6);
+    try bindGlobal(&comp, 3, "wl_seat", 5, 20);
+    { // get_pointer(21)
+        var b = wire.Builder.init(&buf, 20, 0);
+        b.putNewId(21);
+        try req(&comp, try b.finish());
+    }
+    { // root surface 7 + xdg toplevel
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(7);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 5, 2);
+        b2.putNewId(8);
+        b2.putObject(7);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 8, 1);
+        b3.putNewId(9);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 7, 6);
+        try req(&comp, try b4.finish());
+    }
+    { // shadow surface 10, subsurface of 7 at (-24, -48), never place_below
+        var b = wire.Builder.init(&buf, 3, 0);
+        b.putNewId(10);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 6, 1);
+        b2.putNewId(11);
+        b2.putObject(10);
+        b2.putObject(7);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 11, 1);
+        b3.putInt(-24);
+        b3.putInt(-48);
+        try req(&comp, try b3.finish());
+    }
+    { // pool 12: 640x480 root + 688x552 shadow (4 bytes/px)
+        const root_bytes: i32 = 640 * 480 * 4;
+        const total: i32 = root_bytes + 688 * 552 * 4;
+        var b = wire.Builder.init(&buf, 4, 0);
+        b.putNewId(12);
+        b.putInt(total);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 12, 0); // create_buffer(13) root
+        b1.putNewId(13);
+        b1.putInt(0);
+        b1.putInt(640);
+        b1.putInt(480);
+        b1.putInt(640 * 4);
+        b1.putUint(0);
+        try req(&comp, try b1.finish());
+        var b2 = wire.Builder.init(&buf, 12, 0); // create_buffer(14) shadow
+        b2.putNewId(14);
+        b2.putInt(root_bytes);
+        b2.putInt(688);
+        b2.putInt(552);
+        b2.putInt(688 * 4);
+        b2.putUint(0);
+        try req(&comp, try b2.finish());
+    }
+    { // attach + commit both
+        var b = wire.Builder.init(&buf, 7, 1);
+        b.putObject(13);
+        b.putInt(0);
+        b.putInt(0);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 7, 6);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 10, 1);
+        b3.putObject(14);
+        b3.putInt(0);
+        b3.putInt(0);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 10, 6);
+        try req(&comp, try b4.finish());
+    }
+    // Before any input region the shadow (above, whole input) wins the
+    // window centre — what the viewer's hit test sends.
+    const first = comp.hitTest(t.allocator, 7, 320, 240);
+    try t.expectEqual(@as(u32, 10), first.sid);
+    try t.expectEqual(@as(f64, 344), first.x);
+    try t.expectEqual(@as(f64, 288), first.y);
+    try comp.pointerEnter(first.sid, first.x, first.y);
+    try t.expectEqual(@as(u32, 10), comp.pointer_focus);
+    comp.clearOut();
+
+    { // region 15: add(0,0,688,552) subtract(24,48,640,480) -> shadow, commit
+        var b = wire.Builder.init(&buf, 3, 1);
+        b.putNewId(15);
+        try req(&comp, try b.finish());
+        var b1 = wire.Builder.init(&buf, 15, 1);
+        b1.putInt(0);
+        b1.putInt(0);
+        b1.putInt(688);
+        b1.putInt(552);
+        try req(&comp, try b1.finish());
+        var b2 = wire.Builder.init(&buf, 15, 2);
+        b2.putInt(24);
+        b2.putInt(48);
+        b2.putInt(640);
+        b2.putInt(480);
+        try req(&comp, try b2.finish());
+        var b3 = wire.Builder.init(&buf, 10, 5);
+        b3.putObject(15);
+        try req(&comp, try b3.finish());
+        var b4 = wire.Builder.init(&buf, 10, 6);
+        try req(&comp, try b4.finish());
+    }
+    // The centre now belongs to the app surface, in ITS coordinates,
+    // and focus moved there on the commit itself: leave(10), enter(7).
+    const after = comp.hitTest(t.allocator, 7, 320, 240);
+    try t.expectEqual(@as(u32, 7), after.sid);
+    try t.expectEqual(@as(u32, 7), comp.pointer_focus);
+    var evs: std.ArrayList([2]u32) = .empty;
+    defer evs.deinit(t.allocator);
+    const out = comp.takeOut();
+    var pos: usize = 0;
+    var saw_leave = false;
+    var saw_enter = false;
+    while (try pipe.peelUnit(out[pos..])) |p| {
+        if (p.unit.tag == .wl_msg) {
+            const hdr = (try wire.parseHeader(p.unit.payload)).?;
+            if (hdr.object == 21 and hdr.opcode == 1) saw_leave = true;
+            if (hdr.object == 21 and hdr.opcode == 0) {
+                saw_enter = true;
+                const body = p.unit.payload[wire.header_size..hdr.size];
+                try t.expectEqual(@as(u32, 7), std.mem.readInt(u32, body[4..8], native_endian));
+                try t.expectEqual(@as(u32, 320 * 256), std.mem.readInt(u32, body[8..12], native_endian));
+                try t.expectEqual(@as(u32, 240 * 256), std.mem.readInt(u32, body[12..16], native_endian));
+            }
+        }
+        pos += p.consumed;
+    }
+    try t.expect(saw_leave);
+    try t.expect(saw_enter);
+    // The shadow's resize edge still takes input.
+    const edge = comp.hitTest(t.allocator, 7, -10, 100);
+    try t.expectEqual(@as(u32, 10), edge.sid);
+    // A held button pins focus: no refocus mid-click.
+    try comp.pointerEnter(10, 300, 300);
+    try comp.pointerButton(0x110, true);
+    {
+        var b = wire.Builder.init(&buf, 10, 5); // set_input_region(null)
+        b.putObject(0);
+        try req(&comp, try b.finish());
+        var b2 = wire.Builder.init(&buf, 10, 6);
+        try req(&comp, try b2.finish());
+    }
+    try t.expectEqual(@as(u32, 10), comp.pointer_focus);
+    try comp.pointerButton(0x110, false);
+}
+
 test "v6 compositor / v6 wm_base / v4 output obligations" {
     var tv = TestView{};
     var comp = try Compositor.init(t.allocator, tv.view());
@@ -7885,7 +8137,6 @@ test "xdg-dialog: modality survives a state_sync into a fresh replica" {
     try t.expectEqual(@as(?bool, false), rtv.modal);
     try t.expect(!replica.dead);
 }
-
 
 test "state-sync: a v10 replica gets no modality field and no dialog table" {
     // Downgrade must be lossless for the OLD reader: it never sees a
