@@ -791,10 +791,37 @@ pub const Screen = struct {
         const owned = self.allocator.dupe(u8, ev.rgba) catch return;
         var copy = ev;
         copy.rgba = owned;
-        self.retained_images.append(self.allocator, .{ .ev = copy, .owned = owned }) catch {
+        // Reserve BEFORE evicting the superseded entries, so a failed
+        // allocation leaves the retained set exactly as it was.
+        self.retained_images.ensureUnusedCapacity(self.allocator, 1) catch {
             self.allocator.free(owned);
             return;
         };
+        // A placement REPLACES the one it shares an (image_id, placement_id)
+        // with — `image_store.addWithPlacement` marks that one deleting, so
+        // replaying both yields exactly what replaying the newest yields.
+        // Retaining both is therefore pure waste, and unbounded waste: an
+        // app that re-places every frame (a spinner on a status line) fills
+        // the whole byte budget with copies of the same cell. One real
+        // session held 4,679 placements that collapsed to 243 — 12.00 MiB
+        // spent to say 0.63 MiB, which pushed its snapshot past the wire
+        // frame limit and made the session unattachable. The `image_id != 0`
+        // guard and the placement_id rule mirror that function exactly;
+        // anonymous placements (sixel, iTerm2) legitimately stack.
+        if (ev.image_id != 0) {
+            var i: usize = 0;
+            while (i < self.retained_images.items.len) {
+                const old = self.retained_images.items[i];
+                const same_pid = (ev.placement_id == 0 and old.ev.placement_id == 0) or
+                    old.ev.placement_id == ev.placement_id;
+                if (old.ev.image_id == ev.image_id and same_pid) {
+                    self.retained_image_bytes -= old.owned.len;
+                    self.allocator.free(old.owned);
+                    _ = self.retained_images.orderedRemove(i);
+                } else i += 1;
+            }
+        }
+        self.retained_images.appendAssumeCapacity(.{ .ev = copy, .owned = owned });
         self.retained_image_bytes += owned.len;
         while (self.retained_image_bytes > RETAIN_IMAGE_BUDGET and self.retained_images.items.len > 0) {
             const old = self.retained_images.orderedRemove(0);
@@ -8846,6 +8873,35 @@ test "emitImage stamps an anchor id from the placement row" {
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 3, .col = 0 });
     try std.testing.expect(Sink.fired);
     try std.testing.expectEqual(s.buf()[3].id, Sink.anchor);
+}
+
+test "emitImage retains one placement per (image_id, placement_id), not one per redraw" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 8, 5);
+    defer s.deinit();
+    s.retain_images = true;
+
+    // A spinner: two cells, re-placed 50 times each, exactly what a TUI
+    // status line does. Only the newest of each may be retained.
+    const px = [_]u8{ 0, 0, 0, 0 };
+    var frame: u32 = 0;
+    while (frame < 50) : (frame += 1) {
+        s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 4, .col = 0, .image_id = 7, .placement_id = 100 });
+        s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 4, .col = 1, .image_id = 7, .placement_id = 101 });
+    }
+    try std.testing.expectEqual(@as(usize, 2), s.retained_images.items.len);
+    try std.testing.expectEqual(@as(usize, 2 * px.len), s.retained_image_bytes);
+
+    // A second image_id is a different placement, not a replacement.
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 4, .col = 0, .image_id = 8, .placement_id = 100 });
+    try std.testing.expectEqual(@as(usize, 3), s.retained_images.items.len);
+
+    // Anonymous placements (sixel/iTerm2, image_id 0) legitimately stack:
+    // the store does not replace them either.
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 0 });
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 0 });
+    try std.testing.expectEqual(@as(usize, 5), s.retained_images.items.len);
 }
 
 test "contentHash detects visible change, ignores identical repaint" {

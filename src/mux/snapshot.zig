@@ -293,6 +293,21 @@ fn lineBytes(ln: *const Line) usize {
     return 8 + 1 + 1 + 2 + ln.cells.len * @sizeOf(Cell);
 }
 
+/// Serialized size of one retained image placement: the thirteen fixed
+/// geometry fields, plus `Sink.bytes`'s own u32 length prefix, plus the
+/// pixels. Budgeting the PIXELS alone undercounts by 52 bytes each, and a
+/// screen that has hit `RETAIN_IMAGE_BUDGET` holds thousands of small
+/// placements — 1324 of them put a real session 64 KiB past MAX_FRAME with
+/// every individual section believing it had stayed inside its budget.
+fn retainedImageBytes(owned_len: usize) usize {
+    return (4 + 4 + 2 + 2 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4) + 4 + owned_len;
+}
+
+/// Serialized size of one glyph glossary entry, for the same reason.
+fn glyphEntryBytes(payload_len: usize, version: u32) usize {
+    return 4 + 2 + 1 + (if (version >= 6) @as(usize, 1) else 0) + 8 + 4 + payload_len;
+}
+
 /// Bytes still available to `out` before the body budget is spent.
 fn budgetLeft(out: *const std.ArrayList(u8)) usize {
     return BODY_BUDGET -| out.items.len;
@@ -479,7 +494,7 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
         var budget: usize = @min(Screen.RETAIN_IMAGE_BUDGET, budgetLeft(out));
         var first_kept: usize = items.len;
         while (first_kept > 0) {
-            const need = items[first_kept - 1].owned.len;
+            const need = retainedImageBytes(items[first_kept - 1].owned.len);
             if (need > budget) break;
             budget -= need;
             first_kept -= 1;
@@ -543,7 +558,7 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
         var budget: usize = @min(GLYPH_SNAPSHOT_BUDGET, budgetLeft(out));
         var first_kept: usize = entries.items.len;
         while (first_kept > 0) {
-            const need = entries.items[first_kept - 1].e.payload.len;
+            const need = glyphEntryBytes(entries.items[first_kept - 1].e.payload.len, version);
             if (need > budget) break;
             budget -= need;
             first_kept -= 1;
@@ -2003,6 +2018,56 @@ test "snapshot: a wide screen's scrollback is budgeted to the wire frame" {
         screen.scrollbackLine(screen.scrollbackCount() - 1).id,
         restored.scrollbackLine(restored.scrollbackCount() - 1).id,
     );
+}
+
+test "snapshot: retained image RECORDS are budgeted, not just their pixels" {
+    const a = testing.allocator;
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+    const screen = try Screen.init(a, &pool, 512, 2);
+    defer screen.deinit();
+
+    // Scrollback first, sized to leave the image pass roughly the
+    // SCROLLBACK_TAIL_RESERVE window — the shape a long-lived session
+    // reaches, and the one where the image pass has little room.
+    var pushed: u64 = 0;
+    while (pushed < 4000) : (pushed += 1) {
+        try screen.reserveScrollbackPushes(1);
+        const cells = try a.alloc(Cell, screen.cols);
+        @memset(cells, .{});
+        switch (screen.pushScrollbackTakeOld(cells, 1000 + pushed, false)) {
+            .retained => {},
+            .caller_owned => |old| a.free(old),
+        }
+    }
+
+    // Many TINY placements: their pixels are negligible, so a budget
+    // that counts only `owned.len` admits every one of them and then
+    // writes 52 bytes of geometry per placement that nothing reserved.
+    var n: usize = 0;
+    while (n < 40_000) : (n += 1) {
+        const owned = try a.alloc(u8, 1);
+        owned[0] = 0;
+        try screen.retained_images.append(a, .{
+            .ev = .{ .width = 1, .height = 1, .rgba = owned, .row = 0, .col = 0 },
+            .owned = owned,
+        });
+        screen.retained_image_bytes += owned.len;
+    }
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serialize(screen, &body, a);
+    // The daemon prefixes a 9-byte envelope and a 5-byte frame header.
+    try testing.expect(body.items.len + 9 + wire.header_size <= wire.MAX_FRAME);
+
+    var restore_pool = try Pool.init(a);
+    defer restore_pool.deinit();
+    const restored = try restore(a, &restore_pool, body.items);
+    defer restored.deinit();
+    // Some placements survived, but not all of them: the pass trimmed.
+    try testing.expect(restored.retained_images.items.len > 0);
+    try testing.expect(restored.retained_images.items.len < screen.retained_images.items.len);
 }
 
 test "snapshot: serializer targets v3 for legacy peers" {
