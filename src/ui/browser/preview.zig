@@ -2881,8 +2881,12 @@ pub fn quickLookOpen(self: *BrowserView, path: []const u8) bool {
     else
         null;
     const app = if (root) |r| c.gtk_window_get_application(r) else null;
+    _ = &root;
+    // Deliberately NOT transient for the browser window: GTK's window
+    // controls hide the maximize (and minimize) button on a transient
+    // toplevel, and a preview that cannot be maximized is the first
+    // thing anyone reaching for a bigger look at a file runs into.
     const viewer = viewer_ui.ViewerWindow.open(allocator, app, batch, .{
-        .transient_for = root,
         .close_on_space = true,
         .show_in_files_action = false,
         .on_activate = &onQuickLookActivate,
