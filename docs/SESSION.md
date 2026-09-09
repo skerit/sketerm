@@ -20561,3 +20561,37 @@ md5sum`, digest compared; runs in smoke-mux AND smoke-broker) and two
 unit tests in `pty.zig` (queue-then-drain in order, cap + once-per-
 episode reporting). The smoke stage failed with a wrong digest before
 the fix.
+
+## 2026-09-10: file browser and previewer fixes
+
+- Space on a FOLDER opened the Viewer on a directory `read`, which the
+  daemon refuses, and the status showed the bare Zig error name
+  "FsOpFailed". The `.head` load now stats first (`statFollow`): a
+  directory renders as a sorted text table (`viewer.renderDirectoryListing`,
+  folders first, size + local mtime); an archive by `paths.isArchivePath`
+  is listed on its host through the existing `archive_list` job
+  (`fsdrive.startArchiveList`, one `match` event per member) instead of a
+  hex dump of its head, with the byte head as the fallback when bsdtar is
+  missing. Refused operations now carry the daemon's own reason
+  (`fs.lastErr()`), with the error name only as the fallback.
+- The quick-look window was `transient_for` the browser window; GTK's
+  window controls hide maximize/minimize on transient toplevels, so it
+  could not be maximized. It is an ordinary toplevel now. (Maximize itself
+  cannot be observed in the headless rig, whose compositor ignores
+  `set_maximized`; the controls are visible there.)
+- Hamburger + File menu: "Split Left / Right" and "Split Top / Bottom"
+  with the terminal window's `sketerm-split-*` icons, "Close Pane" with
+  `window-close-symbolic`; the top/bottom split is new for the browser
+  (`BrowserView.onSplitVerticalClicked`).
+- Details-list expander chevron never rotated: the parent row's identity
+  is unchanged by expanding, so the windowed splice reused its GObject and
+  the bind-time icon never updated. `toggleExpand` now `noteChangedFull`s
+  the row.
+- Drag-and-drop highlights the folder row/tile a drop would land in
+  (`dnd.newTarget(tab, hover)` + `sketerm-fb-drop` CSS class, moved on
+  motion/leave, cleared on drop and tab teardown; the tab holds a ref on
+  the highlighted widget so a mid-drag re-render cannot dangle).
+- A tab waiting on a remote host showed "Listing..." with nothing else.
+  The placeholder now has a spinner and, while `hc.state == .connecting`,
+  "Connecting to <host>..." naming the transport (from `RemoteSpec.mode`)
+  and the elapsed seconds (1s tick, stops at any settled state).
