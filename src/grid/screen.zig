@@ -1650,6 +1650,7 @@ pub const Screen = struct {
         self.row = replacement_row;
         self.col = replacement_col;
         self.next_line_id = next_line_id;
+        self.reanchorRetainedImages(combined.items, logicals.items, all_rows, sb_rows, new_rows, new_cols);
 
         if (cluster_moves.items.len > 0) {
             self.clusters.clearRetainingCapacity();
@@ -1666,6 +1667,55 @@ pub const Screen = struct {
         self.allocator.free(old_active);
         for (old_scrollback.items) |*ln| ln.deinit(self.allocator);
         old_scrollback.deinit(self.allocator);
+    }
+
+    /// Every reflowed row carries a FRESH line id, so a retained
+    /// placement's anchor would name a line that no longer exists and
+    /// the next attach would evict every image the session had. Map
+    /// each anchor through the same logical-line bookkeeping the
+    /// cursor and clusters use: the old line's index in `combined`, its
+    /// logical position, its row after rechunking, that row's new id.
+    /// An anchor absent from `combined` had already left the ring.
+    /// Cannot fail: removal only frees.
+    fn reanchorRetainedImages(
+        self: *Screen,
+        combined: []const Line,
+        logicals: []const @import("reflow.zig").Logical,
+        all_rows: []const Line,
+        sb_rows: usize,
+        new_rows: u16,
+        new_cols: u16,
+    ) void {
+        const reflow = @import("reflow.zig");
+        var i: usize = 0;
+        while (i < self.retained_images.items.len) {
+            const ri = &self.retained_images.items[i];
+            var found: ?usize = null;
+            if (ri.ev.anchor_id != 0) {
+                for (combined, 0..) |ln, idx| {
+                    if (ln.id == ri.ev.anchor_id) {
+                        found = idx;
+                        break;
+                    }
+                }
+            }
+            const old_idx = found orelse {
+                self.retained_image_bytes -= ri.owned.len;
+                self.allocator.free(ri.owned);
+                _ = self.retained_images.orderedRemove(i);
+                continue;
+            };
+            const source = reflow.positionInLogicals(combined, old_idx, ri.ev.col);
+            const dest = reflow.positionAfterRechunk(logicals, all_rows, source.idx, source.col, new_cols);
+            if (dest.row < all_rows.len) ri.ev.anchor_id = all_rows[dest.row].id;
+            ri.ev.col = dest.col;
+            if (dest.row >= sb_rows and dest.row - sb_rows < new_rows) {
+                ri.ev.row = @intCast(dest.row - sb_rows);
+            } else {
+                ri.ev.row = 0;
+            }
+            i += 1;
+        }
     }
 
     /// A row's cells re-laid at `new_cols`, truncating or blank-padding.
@@ -8902,6 +8952,43 @@ test "emitImage retains one placement per (image_id, placement_id), not one per 
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 0 });
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 0 });
     try std.testing.expectEqual(@as(usize, 5), s.retained_images.items.len);
+}
+
+test "reflow re-anchors retained placements onto the rewrapped lines" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 10, 4);
+    defer s.deinit();
+    s.retain_images = true;
+
+    // Text on every row (reflow trims trailing blank lines away), one
+    // placement on row 2, one on row 3, then a width change that rewraps
+    // nothing but restamps every line id.
+    for (s.active) |*ln| ln.cells[0].rune = 'x';
+    const px = [_]u8{ 0, 0, 0, 0 };
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 2, .col = 1, .image_id = 1 });
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 3, .col = 0, .image_id = 2 });
+    const before_a = s.retained_images.items[0].ev.anchor_id;
+    try std.testing.expect(before_a != 0);
+
+    try s.resize(12, 4);
+    try std.testing.expectEqual(@as(usize, 2), s.retained_images.items.len);
+    const a = s.retained_images.items[0].ev;
+    const b = s.retained_images.items[1].ev;
+    // Fresh ids, but each anchor names the line its content moved to.
+    try std.testing.expect(a.anchor_id != before_a);
+    try std.testing.expectEqual(s.buf()[2].id, a.anchor_id);
+    try std.testing.expectEqual(s.buf()[3].id, b.anchor_id);
+    try std.testing.expectEqual(@as(u16, 2), a.row);
+    try std.testing.expectEqual(@as(u16, 1), a.col);
+    try std.testing.expect(s.imageRowForAnchor(a.anchor_id) == .visible);
+
+    // An anchor whose line already left the ring is dropped, not kept
+    // pinned to a row it has nothing to do with.
+    s.retained_images.items[1].ev.anchor_id = 1; // older than anything alive
+    try s.resize(14, 4);
+    try std.testing.expectEqual(@as(usize, 1), s.retained_images.items.len);
+    try std.testing.expectEqual(@as(u32, 1), s.retained_images.items[0].ev.image_id);
 }
 
 test "contentHash detects visible change, ignores identical repaint" {

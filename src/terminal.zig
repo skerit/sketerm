@@ -2964,14 +2964,24 @@ pub const Terminal = struct {
     /// when attaching a mux tab; the snapshot branch of
     /// handleRemoteFrame calls it directly since the pane exists.
     pub fn replayRetainedImages(self: *Terminal) void {
-        if (self.screen.retained_images.items.len == 0) return;
         // The snapshot replaced the whole grid; placements from the
-        // previous attach are stale. Flush before replaying.
+        // previous attach are stale. Flush before replaying -- ALSO when
+        // this snapshot carries none, or the previous attach's images
+        // outlive the grid they were placed on.
         if (self.screen.sink.on_image_delete_full) |f| {
             f(self.screen.sink.ctx, .{ .what = 'A' });
         }
+        if (self.screen.retained_images.items.len == 0) return;
+        const lines = self.screen.buf();
         for (self.screen.retained_images.items) |ri| {
-            if (self.screen.sink.on_image) |f| f(self.screen.sink.ctx, ri.ev);
+            var ev = ri.ev;
+            // A pre-v10 daemon ships no anchor. Anchor by the recorded
+            // row rather than replaying pinned: a pinned placement never
+            // scrolls, is never culled and cannot be evicted, so it sat
+            // at its placement-time row (bottom-left, for icat output)
+            // for the rest of the pane's life.
+            if (ev.anchor_id == 0 and ev.row < lines.len) ev.anchor_id = lines[ev.row].id;
+            if (self.screen.sink.on_image) |f| f(self.screen.sink.ctx, ev);
         }
         self.screen.clearRetainedImages();
         self.screen.dirty = true;

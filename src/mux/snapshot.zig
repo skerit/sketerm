@@ -40,7 +40,7 @@ const style_pool = @import("../grid/style_pool.zig");
 const wire = @import("wire.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION = 9;
+pub const SNAPSHOT_VERSION = 10;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
 
 /// What a `Screen` field means to a snapshot.
@@ -301,8 +301,11 @@ fn lineBytes(ln: *const Line) usize {
 /// screen that has hit `RETAIN_IMAGE_BUDGET` holds thousands of small
 /// placements — 1324 of them put a real session 64 KiB past MAX_FRAME with
 /// every individual section believing it had stayed inside its budget.
-fn retainedImageBytes(owned_len: usize) usize {
-    return (4 + 4 + 2 + 2 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4) + 4 + owned_len;
+fn retainedImageBytes(owned_len: usize, version: u32) usize {
+    const fixed: usize = 4 + 4 + 2 + 2 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4;
+    // v10: the anchor line id and the in-cell pixel offsets.
+    const anchored: usize = if (version >= 10) 8 + 4 + 4 else 0;
+    return fixed + anchored + 4 + owned_len;
 }
 
 /// Serialized size of one glyph glossary entry, for the same reason.
@@ -496,7 +499,7 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
         var budget: usize = @min(Screen.RETAIN_IMAGE_BUDGET, budgetLeft(out));
         var first_kept: usize = items.len;
         while (first_kept > 0) {
-            const need = retainedImageBytes(items[first_kept - 1].owned.len);
+            const need = retainedImageBytes(items[first_kept - 1].owned.len, version);
             if (need > budget) break;
             budget -= need;
             first_kept -= 1;
@@ -517,6 +520,16 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
             try s.int(u32, ev.src_y);
             try s.int(u32, ev.src_w);
             try s.int(u32, ev.src_h);
+            // v10: the stable line id the placement scrolls with, and the
+            // kitty X=/Y= offsets. Without the anchor a restored placement
+            // is PINNED at its placement-time row (the renderer treats 0
+            // as "never scrolls"), which is how a snapshot after a resize
+            // left images glued to the bottom-left of a pane forever.
+            if (version >= 10) {
+                try s.int(u64, ev.anchor_id);
+                try s.int(u32, ev.cell_x_offset);
+                try s.int(u32, ev.cell_y_offset);
+            }
             try s.bytes(ri.owned);
         }
     }
@@ -1046,6 +1059,11 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
             .src_w = try src.int(u32),
             .src_h = try src.int(u32),
         };
+        if (version >= 10) {
+            ev.anchor_id = try src.int(u64);
+            ev.cell_x_offset = try src.int(u32);
+            ev.cell_y_offset = try src.int(u32);
+        }
         const data_len = try src.int(u32);
         const data = try src.take(data_len);
         const owned = try allocator.dupe(u8, data);
@@ -2308,8 +2326,11 @@ test "snapshot: retained image placements round-trip" {
 
     // 1x1 RGBA kitty transmit+place (t=d, base64 of 4 bytes).
     h.feed("\x1b[3;4H"); // place at row 2, col 3 (0-based)
-    h.feed("\x1b_Gf=32,s=1,v=1,t=d,a=T,i=9,p=2,z=5;/wAA/w==\x1b\\");
+    h.feed("\x1b_Gf=32,s=1,v=1,t=d,a=T,i=9,p=2,z=5,X=3,Y=4;/wAA/w==\x1b\\");
     try testing.expectEqual(@as(usize, 1), h.screen.retained_images.items.len);
+    const anchor = h.screen.buf()[2].id;
+    try testing.expect(anchor != 0);
+    try testing.expectEqual(anchor, h.screen.retained_images.items[0].ev.anchor_id);
 
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(a);
@@ -2327,7 +2348,24 @@ test "snapshot: retained image placements round-trip" {
     try testing.expectEqual(@as(i32, 5), ri.ev.z_index);
     try testing.expectEqual(@as(u16, 2), ri.ev.row);
     try testing.expectEqual(@as(u16, 3), ri.ev.col);
+    // The anchor and the in-cell offsets ride v10; a restored placement
+    // must scroll with its line exactly like a live one.
+    try testing.expectEqual(anchor, ri.ev.anchor_id);
+    try testing.expectEqual(anchor, back.buf()[2].id);
+    try testing.expectEqual(@as(u32, 3), ri.ev.cell_x_offset);
+    try testing.expectEqual(@as(u32, 4), ri.ev.cell_y_offset);
     try testing.expectEqualSlices(u8, &[_]u8{ 0xff, 0, 0, 0xff }, ri.owned);
+
+    // A v9 payload carries no anchor: it restores as 0, which the
+    // replay re-anchors by row (terminal.replayRetainedImages).
+    var legacy: std.ArrayList(u8) = .empty;
+    defer legacy.deinit(a);
+    try serializeVersion(h.screen, &legacy, a, 9);
+    var pool3 = try Pool.init(a);
+    defer pool3.deinit();
+    const old = try restore(a, &pool3, legacy.items);
+    defer old.deinit();
+    try testing.expectEqual(@as(u64, 0), old.retained_images.items[0].ev.anchor_id);
 
     // Delete prunes the retained copy too.
     h.feed("\x1b_Ga=d,d=I,i=9\x1b\\");
