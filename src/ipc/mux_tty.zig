@@ -531,13 +531,8 @@ const Viewer = struct {
 /// connected (the caller closes it).
 pub fn attach(allocator: std.mem.Allocator, conn: *mux_client.Conn, name: []const u8, opts: Options) Outcome {
     conn.sendAttach(name, .{ .kind = "cli", .read_only = opts.read_only, .control = opts.control }) catch return .failed;
-    const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch {
-        const why = conn.lastErr();
-        if (why.len > 0) {
-            msg("sketerm mux: cannot attach '{s}': {s}\n", .{ name, why });
-        } else {
-            msg("sketerm mux: no such session '{s}'\n", .{name});
-        }
+    const snap = conn.recvExpectFor(&.{.snapshot}, 15_000) catch |err| {
+        msg("sketerm mux: cannot attach '{s}': {s}\n", .{ name, conn.attachFailure(err) });
         return .failed;
     };
     defer snap.deinit(allocator);

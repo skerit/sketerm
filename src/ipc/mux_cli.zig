@@ -538,12 +538,15 @@ fn attachForIo(allocator: std.mem.Allocator, host: ?[]const u8, name: []const u8
         conn.deinit();
         return null;
     };
-    const snap = conn.recvExpect(&.{.snapshot}) catch {
+    const snap = conn.recvExpect(&.{.snapshot}) catch |err| {
+        const why = conn.attachFailure(err);
         _ = c.fprintf(
             platform.stderr(),
-            "sketerm mux: no such session '%.*s'\n",
+            "sketerm mux: cannot attach '%.*s': %.*s\n",
             @as(c_int, @intCast(name.len)),
             name.ptr,
+            @as(c_int, @intCast(why.len)),
+            why.ptr,
         );
         conn.deinit();
         return null;

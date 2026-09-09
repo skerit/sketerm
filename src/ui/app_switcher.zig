@@ -109,9 +109,13 @@ const Switcher = struct {
     /// Sessions with a stop in flight; every matching stop button
     /// renders insensitive until the kill resolves.
     kills: std.ArrayList(SessionTarget) = .empty,
-    /// Static failure note appended to the status line until the next
-    /// user-initiated operation.
+    /// Failure note appended to the status line until the next
+    /// user-initiated operation. Usually a static string; an attach
+    /// failure formats the daemon's own reason into `note_buf` instead,
+    /// because "the session or daemon may be gone" is a guess and the
+    /// daemon almost always knows better.
     note: []const u8 = "",
+    note_buf: [256]u8 = undefined,
     pending_ops: usize = 0,
     attaching: bool = false,
     dead: bool = false,
@@ -1492,7 +1496,12 @@ fn onAttachReady(user: ?*anyopaque, job: *muxtabs.AttachJob) void {
         } else {
             c.gtk_widget_set_sensitive(self.groups_box, 1);
             c.gtk_widget_set_sensitive(self.search, 1);
-            self.note = "attach failed: the session or daemon may be gone";
+            const why = job.failureReason();
+            self.note = if (why.len > 0)
+                std.fmt.bufPrint(&self.note_buf, "attach failed: {s}", .{why}) catch
+                    "attach failed: the session or daemon may be gone"
+            else
+                "attach failed: the session or daemon may be gone";
             self.updateStatus();
         }
     }

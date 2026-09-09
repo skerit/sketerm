@@ -1116,6 +1116,11 @@ pub const AttachJob = struct {
     conn: ?mux_client.Conn = null,
     snapshot: ?mux_client.Conn.OwnedFrame = null,
     identity: mux_client.AttachIdentity = .{},
+    /// Why the handshake failed, copied out WHILE the connection is still
+    /// alive: `threadMain` deinits it before the `g_idle_add` handback, so
+    /// by the time `on_ready` runs there is no `conn.lastErr()` left to ask.
+    fail_reason: [192]u8 = undefined,
+    fail_reason_len: usize = 0,
     on_ready: *const fn (ctx: ?*anyopaque, job: *AttachJob) void,
     ctx: ?*anyopaque,
 
@@ -1202,11 +1207,27 @@ pub const AttachJob = struct {
             .read_only = self.lease == .read_only,
             .control = self.lease == .control,
             .panel_rpc = conn.panel_rpc,
-        }) catch return false;
-        const attached = conn.recvGuiAttachFor(20_000) catch return false;
+        }) catch |err| return self.noteFailure(conn, err);
+        const attached = conn.recvGuiAttachFor(20_000) catch |err| return self.noteFailure(conn, err);
         self.snapshot = attached.snapshot;
         self.identity = attached.identity;
         return true;
+    }
+
+    /// Record why this attempt failed and report it as one. Always false,
+    /// so a caller reads `return self.noteFailure(...)`.
+    fn noteFailure(self: *AttachJob, conn: *const mux_client.Conn, err: anyerror) bool {
+        const why = conn.attachFailure(err);
+        const n = @min(why.len, self.fail_reason.len);
+        @memcpy(self.fail_reason[0..n], why[0..n]);
+        self.fail_reason_len = n;
+        return false;
+    }
+
+    /// The daemon's or transport's reason for the failed handshake; empty
+    /// when the job never got far enough to have one (no dial at all).
+    pub fn failureReason(self: *const AttachJob) []const u8 {
+        return self.fail_reason[0..self.fail_reason_len];
     }
 
     // Match Window.muxConnect: attach over SSH first, then let Terminal upgrade

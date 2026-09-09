@@ -1848,6 +1848,26 @@ pub const Conn = struct {
     pub fn lastErr(self: *const Conn) []const u8 {
         return self.last_err[0..self.last_err_len];
     }
+
+    /// Why an attach handshake failed, in words a caller can print.
+    ///
+    /// The daemon's own `.err` text wins when it sent one; otherwise the
+    /// transport error is named. Callers used to guess here, and every one
+    /// of them guessed "no such session" — which is the single reason the
+    /// daemon logs explicitly and so the one it CANNOT be, leaving an
+    /// oversized snapshot (`error.TooLong`, refused at the frame header
+    /// before a byte of payload is read) reported as a missing session.
+    pub fn attachFailure(self: *const Conn, err: anyerror) []const u8 {
+        const why = self.lastErr();
+        if (why.len > 0) return why;
+        return switch (err) {
+            error.TooLong => "the daemon's screen snapshot for this session is bigger than one wire frame, so no client can decode it (the daemon needs a build that budgets the snapshot body)",
+            error.Timeout => "the daemon accepted the attach but never sent a screen snapshot",
+            error.Disconnected => "the daemon closed the connection during the attach handshake",
+            error.Malformed => "the daemon sent a malformed frame during the attach handshake",
+            else => @errorName(err),
+        };
+    }
 };
 
 /// Connect to one exact daemon and complete the panel-only handshake against
