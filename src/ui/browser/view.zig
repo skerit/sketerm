@@ -1647,6 +1647,14 @@ pub const BrowserView = struct {
         _ = input.runAction(ictx, .new_browser_split);
     }
 
+    /// The top/bottom split (the only global action splits left/right).
+    pub fn onSplitVerticalClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(BrowserView, user);
+        const win = self.ownerWindow() orelse return;
+        self.focusOwnPane();
+        win.newBrowserSplit(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {};
+    }
+
     /// Point the window's focus at THIS pane, so pane-scoped window
     /// actions (split, close) act on the pane whose control was
     /// clicked rather than wherever focus happened to sit.

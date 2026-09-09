@@ -344,9 +344,12 @@ pub fn showHamburgerMenu(self: *BrowserView, anchor: *c.GtkWidget) void {
         const analysis = m.section();
         analysis.itemIcon("Analyze Disk Usage", .{ .name = "drive-harddisk-symbolic" }, &onMenuAnalyzeUsage, ctx);
         const panes = m.section();
+        // Same labels and icons as the terminal window's hamburger, so
+        // the two menus read as one application.
         panes.itemIcon("New Tab", .{ .name = "tab-new-symbolic" }, &BrowserView.onNewTabClicked, @ptrCast(self));
-        panes.item("Split Pane", &BrowserView.onSplitClicked, @ptrCast(self));
-        panes.item("Close Pane", &onMenuClosePane, ctx);
+        panes.itemIcon("Split Left / Right", .{ .name = "sketerm-split-left-right-symbolic" }, &BrowserView.onSplitClicked, @ptrCast(self));
+        panes.itemIcon("Split Top / Bottom", .{ .name = "sketerm-split-top-bottom-symbolic" }, &BrowserView.onSplitVerticalClicked, @ptrCast(self));
+        panes.itemIcon("Close Pane", .{ .name = "window-close-symbolic" }, &onMenuClosePane, ctx);
 
         const tail = m.section();
         tail.itemIcon("Go to Shell Directory", .{ .name = "sketerm-terminal-symbolic" }, &BrowserView.onCwdSyncClicked, @ptrCast(self));

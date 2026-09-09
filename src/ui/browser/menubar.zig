@@ -133,6 +133,7 @@ const ItemCtx = struct {
         new_tab,
         new_window,
         split_pane,
+        split_pane_v,
         close_pane,
         close_window,
         cut,
@@ -320,8 +321,9 @@ fn openMenu(btn: *c.GtkButton, ctx: *BarCtx) ?*c.GtkWidget {
             addItem(root, m, a, win, target_pane, "New Tab", .{ .name = "tab-new-symbolic" }, .new_tab);
             addItem(root, m, a, win, target_pane, "New Window", .{ .name = "window-new-symbolic" }, .new_window);
             const pane = m.section();
-            addItem(root, pane, a, win, target_pane, "Split Pane", .none, .split_pane);
-            addItem(root, pane, a, win, target_pane, "Close Pane", .none, .close_pane);
+            addItem(root, pane, a, win, target_pane, "Split Left / Right", .{ .name = "sketerm-split-left-right-symbolic" }, .split_pane);
+            addItem(root, pane, a, win, target_pane, "Split Top / Bottom", .{ .name = "sketerm-split-top-bottom-symbolic" }, .split_pane_v);
+            addItem(root, pane, a, win, target_pane, "Close Pane", .{ .name = "window-close-symbolic" }, .close_pane);
             const tail = m.section();
             addItem(root, tail, a, win, target_pane, "Close Window", .{ .name = "window-close-symbolic" }, .close_window);
         },
@@ -405,6 +407,10 @@ fn onItem(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         .split_pane => if (target) |v| {
             v.focusOwnPane();
             win.newBrowserSplit(@intCast(c.GTK_ORIENTATION_HORIZONTAL)) catch {};
+        },
+        .split_pane_v => if (target) |v| {
+            v.focusOwnPane();
+            win.newBrowserSplit(@intCast(c.GTK_ORIENTATION_VERTICAL)) catch {};
         },
         .close_pane => if (bv) |v| v.closePaneDeferred(),
         .close_window => c.gtk_window_close(@ptrCast(win.app_window)),
