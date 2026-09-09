@@ -467,9 +467,25 @@ pub fn decodeChanId(payload: []const u8) ?u32 {
     return std.mem.readInt(u32, payload[0..4], .little);
 }
 
-/// Images can be chunky; bound anyway. The shared default, so the
-/// wayland pipe and the audio units cannot silently disagree with it.
-pub const MAX_FRAME = framing.max_frame;
+/// What a READER will accept. Deliberately larger than what any writer
+/// here will produce (`MAX_SEND_FRAME`), because the two bounds answer
+/// different questions and sharing one number is what made a session
+/// permanently unreachable.
+///
+/// A daemon that predates the snapshot body budget emits snapshots as
+/// large as its screen state happens to be. When the reader's bound was
+/// also 16 MiB, such a frame was refused at its header and the session
+/// could not be attached by ANY client — with no way to recover it that
+/// did not involve restarting the daemon and losing every session on the
+/// host. Accepting a frame we would not have sent costs one bounded
+/// allocation; refusing it costs the user their work.
+pub const MAX_FRAME = 64 << 20;
+
+/// What a WRITER here may produce, and the bound every producer-side
+/// check and budget is measured against. Stays at the shared default:
+/// being generous about what we accept must not make us sloppy about
+/// what we emit, or old peers start refusing OUR frames.
+pub const MAX_SEND_FRAME = framing.max_frame;
 
 /// u32 length (counting the type byte) + u8 frame type.
 pub const header_size = framing.header_size;
@@ -504,14 +520,14 @@ test "session origin id validation accepts exactly 32 lowercase hex digits" {
     try std.testing.expect(!validSessionOriginId(""));
 }
 /// Panel documents can be 1 MiB and outer JSON escaping may expand them.
-/// The envelope remains comfortably below MAX_FRAME, including its tag.
+/// The envelope remains comfortably below MAX_SEND_FRAME, including its tag.
 pub const PANEL_JSON_MAX: usize = 4 << 20;
 pub const PANEL_ENVELOPE_HEADER: usize = @sizeOf(u64);
 pub const PANEL_ENVELOPE_MAX: usize = PANEL_ENVELOPE_HEADER + PANEL_JSON_MAX;
 
 comptime {
-    if (PANEL_ENVELOPE_MAX + 1 >= MAX_FRAME)
-        @compileError("panel envelope must remain below MAX_FRAME");
+    if (PANEL_ENVELOPE_MAX + 1 >= MAX_SEND_FRAME)
+        @compileError("panel envelope must remain below MAX_SEND_FRAME");
 }
 
 pub const PanelEnvelope = struct {
@@ -1461,6 +1477,31 @@ pub const SessionInfo = struct {
     viewers: u32 = 0,
     controller: []const u8 = "",
 };
+
+test "the reader accepts frames larger than any writer here will produce" {
+    const t = std.testing;
+    // Not the same number, and in this order. Collapsing them is what
+    // made a real session permanently unattachable: a daemon predating
+    // the snapshot budget emitted 24.83 MiB, and every client refused it
+    // at the header with no recovery short of restarting that daemon and
+    // losing every session it owned.
+    try t.expect(MAX_FRAME > MAX_SEND_FRAME);
+
+    // A frame the size that daemon actually sent peels rather than
+    // erroring, once its header says so.
+    const oversized_for_a_writer = (24 << 20) + 1;
+    try t.expect(oversized_for_a_writer > MAX_SEND_FRAME);
+    var hdr: [header_size]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(oversized_for_a_writer + 1), .little);
+    hdr[4] = @intFromEnum(FrameType.snapshot);
+    // Only the header is present, so this is "need more bytes" (null),
+    // NOT error.TooLong — which is exactly the distinction that matters.
+    try t.expectEqual(@as(?@TypeOf((try peelFrame(&.{})).?), null), try peelFrame(&hdr));
+
+    // Past the reader's own bound it is still refused.
+    std.mem.writeInt(u32, hdr[0..4], @intCast(MAX_FRAME + 2), .little);
+    try t.expectError(error.TooLong, peelFrame(&hdr));
+}
 
 test "frame header bytes are the frozen 5-byte layout" {
     // Hand-written, NOT derived from the encoder: this is the wire

@@ -5253,7 +5253,7 @@ pub const Daemon = struct {
         // protocol error instead of a screen. snapshot.zig budgets the
         // unbounded sections; this is the backstop for a grid whose
         // MANDATORY part alone cannot fit.
-        if (buf.items.len + wire.header_size > wire.MAX_FRAME) {
+        if (buf.items.len + wire.header_size > wire.MAX_SEND_FRAME) {
             self.noteResyncFailure(cl, s, "snapshot exceeds the wire frame limit");
             return;
         }

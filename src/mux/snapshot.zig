@@ -271,16 +271,18 @@ pub const GLYPH_SNAPSHOT_BUDGET: usize = 8 * 1024 * 1024;
 
 /// Ceiling on a serialized snapshot BODY.
 ///
-/// The daemon ships a body inside one `snapshot` frame, and every
-/// client peels frames through `wire.MAX_FRAME`: a body past that bound
-/// is not a big snapshot, it is a frame no peer can decode, so the
-/// attach fails and the session stays unattachable for as long as the
-/// screen keeps its size. Nothing upstream bounded it — a 220-column
-/// grid with a full 10k-line scrollback already clears 16 MiB — so the
-/// variable-size sections below are budgeted against this instead.
+/// The daemon ships a body inside one `snapshot` frame, and an OLD peer
+/// peels frames through 16 MiB: a body past that bound is not a big
+/// snapshot, it is a frame that peer cannot decode, so the attach fails
+/// and the session stays unattachable for as long as the screen keeps
+/// its size. Nothing upstream bounded it — a 220-column grid with a full
+/// 10k-line scrollback already clears 16 MiB — so the variable-size
+/// sections below are budgeted against this instead. Measured against
+/// `MAX_SEND_FRAME`, NOT the larger `MAX_FRAME` this build will accept:
+/// our generosity as a reader must not leak into what we emit.
 /// The margin covers the daemon's 9-byte envelope, the 5-byte frame
 /// header, and the fixed fields.
-pub const BODY_BUDGET: usize = wire.MAX_FRAME - 4096;
+pub const BODY_BUDGET: usize = wire.MAX_SEND_FRAME - 4096;
 
 /// Room held back for the sections written AFTER the scrollback whose
 /// own size is not budgeted (palette, title, links, clusters, prompt
@@ -2005,7 +2007,7 @@ test "snapshot: a wide screen's scrollback is budgeted to the wire frame" {
     defer body.deinit(a);
     try serialize(screen, &body, a);
     // The daemon prefixes a 9-byte envelope and a 5-byte frame header.
-    try testing.expect(body.items.len + 9 + wire.header_size <= wire.MAX_FRAME);
+    try testing.expect(body.items.len + 9 + wire.header_size <= wire.MAX_SEND_FRAME);
 
     var restore_pool = try Pool.init(a);
     defer restore_pool.deinit();
@@ -2059,7 +2061,7 @@ test "snapshot: retained image RECORDS are budgeted, not just their pixels" {
     defer body.deinit(a);
     try serialize(screen, &body, a);
     // The daemon prefixes a 9-byte envelope and a 5-byte frame header.
-    try testing.expect(body.items.len + 9 + wire.header_size <= wire.MAX_FRAME);
+    try testing.expect(body.items.len + 9 + wire.header_size <= wire.MAX_SEND_FRAME);
 
     var restore_pool = try Pool.init(a);
     defer restore_pool.deinit();

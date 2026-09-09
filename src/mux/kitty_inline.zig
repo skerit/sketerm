@@ -49,7 +49,7 @@ pub const MAX_RAW_BYTES: usize = 10 * 1024 * 1024;
 comptime {
     const worst_rest_of_batch = 2 * 1024 * 1024;
     const apc_head = 4096;
-    if ((MAX_RAW_BYTES * 4 + 2) / 3 + apc_head + worst_rest_of_batch > wire.MAX_FRAME)
+    if ((MAX_RAW_BYTES * 4 + 2) / 3 + apc_head + worst_rest_of_batch > wire.MAX_SEND_FRAME)
         @compileError("MAX_RAW_BYTES no longer fits one EVENTS frame with the rest of a drain");
 }
 
