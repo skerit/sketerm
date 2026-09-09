@@ -20595,3 +20595,33 @@ the fix.
   The placeholder now has a spinner and, while `hc.state == .connecting`,
   "Connecting to <host>..." naming the transport (from `RemoteSpec.mode`)
   and the elapsed seconds (1s tick, stops at any settled state).
+
+## 2026-09-10: inline images no longer stick after a resize; headless maximize
+
+Reported as "with multiple inline images some don't render, and one
+stays partly visible in the bottom-left of a pane forever". Mechanism:
+the snapshot record for a retained placement had no `anchor_id`, so a
+GUI restoring one (every resize answers with a SNAPSHOT) got anchor 0,
+which `resolveImageRows` treats as pinned -- drawn at the placement-time
+row every frame, never scrolled, culled or evicted. The live copies had
+meanwhile been evicted by `reflowMain` restamping every line id. Fixes:
+snapshot v10 carries `anchor_id` + `cell_x/y_offset` (reader keeps v9
+compatibility, `retainedImageBytes` budgets the new bytes);
+`replayRetainedImages` flushes the store unconditionally and re-anchors
+an anchorless placement by its recorded row; `reflowMain` re-anchors
+retained placements through `positionInLogicals`/`positionAfterRechunk`
+(`reanchorRetainedImages`) and drops those whose line already left the
+ring. Proven end to end by driving a fresh `sketerm mcp` over stdio:
+place a red 24x24 kitty image, resize the window (snapshot), print 22
+lines -- the image moved up two rows; 60 more -- it left the screen.
+
+Surfaced, not changed: kitty placeholder tiles (`emitPlaceholderTile`)
+are keyed on screen row/col and never retired when the placeholder text
+is erased, and placements without `p=` collapse to one per image id in
+both `emitImage` and `image_store.addFull` (deliberate, budget-driven).
+
+`appdrive` now GRANTS an app's `set_maximized`/`set_fullscreen`
+(configure at the virtual output size with the matching xdg state,
+floating size restored on leave; `app_windows` reports `maximized` /
+`fullscreen`). Before, the request was parsed and dropped, so a
+maximize could not be tested headlessly at all.
