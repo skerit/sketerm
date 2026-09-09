@@ -1664,6 +1664,13 @@ pub const Fs = struct {
         return self.startJob("extract", .{ .path = archive, .to = destination });
     }
 
+    /// List an archive's members on its host (bsdtar). Members arrive
+    /// as job events with ev == "match" (`path`, `kind` "dir"|"file");
+    /// the done event carries `truncated` past the daemon's cap.
+    pub fn startArchiveList(self: *Fs, archive: []const u8) Error!u64 {
+        return self.startJob("archive_list", .{ .path = archive });
+    }
+
     pub fn startArchiveCreate(self: *Fs, source: []const u8, archive: []const u8) Error!u64 {
         return self.startJob("archive_create", .{ .path = source, .to = archive });
     }

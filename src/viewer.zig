@@ -6,6 +6,8 @@ const entry = @import("filebrowser/entry.zig");
 const paths = @import("filebrowser/paths.zig");
 const platform = @import("util/platform.zig");
 const invocation = @import("util/invocation.zig");
+const format = @import("filebrowser/format.zig");
+const clock = @import("util/clock.zig");
 
 pub const ID_SUFFIX = ".viewer";
 pub const APP_NAME = "Sketerm Viewer";
@@ -385,4 +387,148 @@ test "viewer treats manifest-shaped names after option terminator as resources" 
     defer batch.deinit();
     try std.testing.expectEqual(@as(usize, 1), batch.specs.len);
     try std.testing.expectEqualStrings("local:/work/--consume-batch=/tmp/not-a-manifest", batch.specs[0]);
+}
+
+// ── directory and archive listings ───────────────────────────────
+
+/// One row of a directory shown as text: the shape the UI hands over
+/// after the daemon listing, decoupled from the wire entry.
+pub const DirRow = struct {
+    name: []const u8,
+    is_dir: bool,
+    size: u64 = 0,
+    mtime_ms: i64 = 0,
+};
+
+/// One archive member as the daemon's `archive_list` job reports it.
+pub const ArchiveRow = struct {
+    path: []const u8,
+    is_dir: bool,
+};
+
+/// Column width of the name column, bounded so one long name cannot
+/// push every size off the right edge.
+const NAME_COL_MAX: usize = 48;
+
+fn rowLess(_: void, a: DirRow, b: DirRow) bool {
+    if (a.is_dir != b.is_dir) return a.is_dir;
+    return format.naturalLess(a.name, b.name);
+}
+
+fn padName(w: *std.Io.Writer, name: []const u8, is_dir: bool, width: usize) !void {
+    try w.writeAll(name);
+    if (is_dir) try w.writeByte('/');
+    const used = name.len + @intFromBool(is_dir);
+    if (used < width) try w.splatByteAll(' ', width - used);
+}
+
+/// Render a directory as an aligned text table: folders first, then
+/// files, each with size and local modification time. `rows` is
+/// sorted in place. Hidden entries are included: the viewer is a
+/// window on what is there, not on what a listing chooses to show.
+pub fn renderDirectoryListing(allocator: std.mem.Allocator, rows: []DirRow) ![]u8 {
+    std.mem.sort(DirRow, rows, {}, rowLess);
+    var width: usize = 0;
+    for (rows) |r| width = @max(width, r.name.len + @intFromBool(r.is_dir));
+    width = @min(width, NAME_COL_MAX) + 2;
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    for (rows) |r| {
+        var stamp_buf: [40]u8 = undefined;
+        const stamp: ?[]const u8 = if (r.mtime_ms != 0) clock.localStamp(&stamp_buf, r.mtime_ms) else null;
+        // A folder with nothing after its name is not padded: trailing
+        // blanks are invisible and still show up in a copy.
+        try padName(w, r.name, r.is_dir, if (r.is_dir and stamp == null) 0 else width);
+        if (r.is_dir) {
+            if (stamp != null) try w.splatByteAll(' ', 10);
+        } else {
+            var size_buf: [48:0]u8 = undefined;
+            const size = format.fmtSize(&size_buf, r.size);
+            if (size.len < 10) try w.splatByteAll(' ', 10 - size.len);
+            try w.writeAll(size);
+        }
+        if (stamp) |s| {
+            try w.writeAll("  ");
+            try w.writeAll(s);
+        }
+        try w.writeByte('\n');
+    }
+    if (rows.len == 0) try w.writeAll("(empty folder)\n");
+    return out.toOwnedSlice();
+}
+
+/// Summary line for a directory listing: "3 folders, 12 files".
+pub fn directorySummary(buf: []u8, rows: []const DirRow) []const u8 {
+    var dirs: usize = 0;
+    for (rows) |r| dirs += @intFromBool(r.is_dir);
+    const files = rows.len - dirs;
+    return std.fmt.bufPrint(buf, "{d} folder{s}, {d} file{s}", .{
+        dirs,  if (dirs == 1) "" else "s",
+        files, if (files == 1) "" else "s",
+    }) catch "";
+}
+
+/// Render an archive's member table one path per line, folders with a
+/// trailing slash, in the order bsdtar reported them (archive order is
+/// meaningful: it is how the archive was written).
+pub fn renderArchiveListing(allocator: std.mem.Allocator, rows: []const ArchiveRow, truncated: bool) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+    for (rows) |r| {
+        try w.writeAll(r.path);
+        if (r.is_dir and !std.mem.endsWith(u8, r.path, "/")) try w.writeByte('/');
+        try w.writeByte('\n');
+    }
+    if (truncated) try w.writeAll("... (member list truncated)\n");
+    if (rows.len == 0) try w.writeAll("(no members listed)\n");
+    return out.toOwnedSlice();
+}
+
+/// Summary line for an archive listing: "1 folder, 40 files".
+pub fn archiveSummary(buf: []u8, rows: []const ArchiveRow, truncated: bool) []const u8 {
+    var dirs: usize = 0;
+    for (rows) |r| dirs += @intFromBool(r.is_dir);
+    const files = rows.len - dirs;
+    return std.fmt.bufPrint(buf, "{d} folder{s}, {d} file{s}{s}", .{
+        dirs,  if (dirs == 1) "" else "s",
+        files, if (files == 1) "" else "s",
+        if (truncated) " (truncated)" else "",
+    }) catch "";
+}
+
+test "directory listing sorts folders first and aligns sizes" {
+    const a = std.testing.allocator;
+    var rows = [_]DirRow{
+        .{ .name = "zeta.txt", .is_dir = false, .size = 2048 },
+        .{ .name = "alpha", .is_dir = true },
+        .{ .name = "beta.bin", .is_dir = false, .size = 5 },
+    };
+    const text = try renderDirectoryListing(a, &rows);
+    defer a.free(text);
+    try std.testing.expectEqualStrings(
+        "alpha/\nbeta.bin         5 B\nzeta.txt      2.0 KB\n",
+        text,
+    );
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("1 folder, 2 files", directorySummary(&buf, &rows));
+    const empty = try renderDirectoryListing(a, &.{});
+    defer a.free(empty);
+    try std.testing.expectEqualStrings("(empty folder)\n", empty);
+}
+
+test "archive listing keeps archive order and marks folders" {
+    const a = std.testing.allocator;
+    const rows = [_]ArchiveRow{
+        .{ .path = "pkg", .is_dir = true },
+        .{ .path = "pkg/README", .is_dir = false },
+        .{ .path = "pkg/src/", .is_dir = true },
+    };
+    const text = try renderArchiveListing(a, &rows, true);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("pkg/\npkg/README\npkg/src/\n... (member list truncated)\n", text);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("2 folders, 1 file (truncated)", archiveSummary(&buf, &rows, true));
+    try std.testing.expectEqualStrings("0 folders, 0 files", archiveSummary(&buf, &.{}, false));
 }

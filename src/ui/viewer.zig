@@ -34,11 +34,20 @@ const ORIGINAL_PIXELS_MAX: usize = 64 * 1024 * 1024;
 const ORIGINAL_ANIMATION_BYTES_MAX: usize = 256 << 20;
 const LOAD_TIMEOUT_MS: i64 = 120_000;
 
+/// What a `.head` load's bytes ARE: file content to classify as text
+/// or hex, or a listing the loader already rendered as text (a folder's
+/// entries, an archive's member table) that must never be hex-dumped.
+pub const HeadKind = enum { bytes, directory, archive };
+
 pub const LoadResult = struct {
     variant: Variant,
     decoded: ?decoder.Decoded = null,
     /// Raw head bytes for a `.head` load (c_allocator-owned).
     head: ?[]u8 = null,
+    head_kind: HeadKind = .bytes,
+    /// One-line summary of a listing head ("3 folders, 12 files").
+    summary: [96]u8 = undefined,
+    summary_len: usize = 0,
     source_bytes: usize = 0,
     message: [160]u8 = undefined,
     message_len: usize = 0,
@@ -53,6 +62,10 @@ pub const LoadResult = struct {
 
     pub fn metadataText(self: *const LoadResult) []const u8 {
         return self.metadata[0..self.metadata_len];
+    }
+
+    pub fn summaryText(self: *const LoadResult) []const u8 {
+        return self.summary[0..self.summary_len];
     }
 
     fn setError(self: *LoadResult, err: anyerror) void {
@@ -259,7 +272,83 @@ const FetchPayload = struct {
     source_size: usize,
     metadata: [1024]u8 = undefined,
     metadata_len: usize = 0,
+    head_kind: HeadKind = .bytes,
+    summary: [96]u8 = undefined,
+    summary_len: usize = 0,
+
+    fn setSummary(self: *FetchPayload, text: []const u8) void {
+        self.summary_len = @min(text.len, self.summary.len);
+        @memcpy(self.summary[0..self.summary_len], text[0..self.summary_len]);
+    }
 };
+
+/// Timeout for the archive member listing: bsdtar reads a compressed
+/// tarball end to end to enumerate it, which on a large remote file
+/// is seconds, not milliseconds.
+const ARCHIVE_LIST_TIMEOUT_MS: i64 = 60_000;
+/// Members past this stay behind a "truncated" line.
+const ARCHIVE_ROWS_MAX: usize = 20_000;
+
+/// A folder as text: the daemon listing, sorted and tabulated by the
+/// GTK-free model renderer.
+fn fetchDirectory(fs: *fsdrive.Fs, path: []const u8, size_hint: u64) !FetchPayload {
+    const allocator = std.heap.c_allocator;
+    var listing = try fs.list(path);
+    defer listing.deinit();
+    const rows = try allocator.alloc(model.DirRow, listing.entries.len);
+    defer allocator.free(rows);
+    for (listing.entries, 0..) |e, i| {
+        rows[i] = .{
+            .name = e.name,
+            .is_dir = std.mem.eql(u8, e.kind, "dir"),
+            .size = e.size,
+            .mtime_ms = e.mtime_ms,
+        };
+    }
+    const text = try model.renderDirectoryListing(allocator, rows);
+    var payload = FetchPayload{ .source_size = @intCast(size_hint), .bytes = text, .head_kind = .directory };
+    var buf: [96]u8 = undefined;
+    payload.setSummary(model.directorySummary(&buf, rows));
+    return payload;
+}
+
+/// An archive as its member table, listed where the file lives.
+/// @return null when the host cannot list it (no bsdtar, not an
+/// archive after all), so the caller falls back to the byte head.
+fn fetchArchive(fs: *fsdrive.Fs, path: []const u8, size_hint: u64) !?FetchPayload {
+    const allocator = std.heap.c_allocator;
+    const job = fs.startArchiveList(path) catch return null;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var rows: std.ArrayList(model.ArchiveRow) = .empty;
+    var truncated = false;
+    var listed = false;
+    while (true) {
+        var event = (try fs.waitJobEvent(job, ARCHIVE_LIST_TIMEOUT_MS)) orelse return fsdrive.Error.Timeout;
+        defer event.deinit();
+        if (std.mem.eql(u8, event.ev, "match")) {
+            if (rows.items.len >= ARCHIVE_ROWS_MAX) {
+                truncated = true;
+                continue;
+            }
+            try rows.append(arena.allocator(), .{
+                .path = try arena.allocator().dupe(u8, event.path),
+                .is_dir = std.mem.eql(u8, event.kind, "dir"),
+            });
+            continue;
+        }
+        if (!event.terminal()) continue;
+        listed = std.mem.eql(u8, event.ev, "done");
+        if (event.truncated) truncated = true;
+        break;
+    }
+    if (!listed) return null;
+    const text = try model.renderArchiveListing(allocator, rows.items, truncated);
+    var payload = FetchPayload{ .source_size = @intCast(size_hint), .bytes = text, .head_kind = .archive };
+    var buf: [96]u8 = undefined;
+    payload.setSummary(model.archiveSummary(&buf, rows.items, truncated));
+    return payload;
+}
 
 fn fetchMetadata(fs: *fsdrive.Fs, resource: model.Resource, payload: *FetchPayload) void {
     var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -308,9 +397,23 @@ fn fetch(work: *LoadWork) !FetchPayload {
     defer fs.deinit();
     if (!work.target.registerFd(work.generation, fs.conn.fd)) return error.Canceled;
     defer work.target.clearFd(work.generation, fs.conn.fd);
+    if (variant == .head) {
+        // A folder or an archive is shown as a listing, never read as
+        // bytes: the daemon refuses to read a directory, and the head
+        // of a tarball is a hex dump nobody learns anything from.
+        var stat_arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+        defer stat_arena.deinit();
+        const st = fs.statFollow(stat_arena.allocator(), resource.path) catch |err| return fsError(work, &fs, err);
+        if (std.mem.eql(u8, st.kind, "dir"))
+            return fetchDirectory(&fs, resource.path, st.size) catch |err| return fsError(work, &fs, err);
+        if (paths.isArchivePath(resource.path)) {
+            const listed = fetchArchive(&fs, resource.path, st.size) catch |err| return fsError(work, &fs, err);
+            if (listed) |payload| return payload;
+        }
+    }
     var probe_bytes: std.ArrayList(u8) = .empty;
     defer probe_bytes.deinit(std.heap.c_allocator);
-    const source = try fs.read(resource.path, 0, 0, &probe_bytes);
+    const source = fs.read(resource.path, 0, 0, &probe_bytes) catch |err| return fsError(work, &fs, err);
     if (variant == .head) {
         // No size ceiling: a huge binary still gets its bounded head.
         const allocator = std.heap.c_allocator;
@@ -357,6 +460,21 @@ fn fetch(work: *LoadWork) !FetchPayload {
     return payload;
 }
 
+/// Keep the daemon's own reason for a refused operation: "FsOpFailed"
+/// tells the user nothing, "path is not a regular file" does. The
+/// error itself still propagates; `loadThread` only falls back to the
+/// error name when no reason was recorded.
+fn fsError(work: *LoadWork, fs: *fsdrive.Fs, err: anyerror) anyerror {
+    if (err == fsdrive.Error.FsOpFailed) {
+        const why = fs.lastErr();
+        if (why.len > 0) {
+            work.result.message_len = @min(why.len, work.result.message.len);
+            @memcpy(work.result.message[0..work.result.message_len], why[0..work.result.message_len]);
+        }
+    }
+    return err;
+}
+
 fn loadThread(first: *LoadWork) void {
     const allocator = std.heap.c_allocator;
     var work = first;
@@ -367,6 +485,9 @@ fn loadThread(first: *LoadWork) void {
             work.result.metadata_len = payload.metadata_len;
             @memcpy(work.result.metadata[0..payload.metadata_len], payload.metadata[0..payload.metadata_len]);
             work.result.metadata[payload.metadata_len] = 0;
+            work.result.head_kind = payload.head_kind;
+            work.result.summary_len = payload.summary_len;
+            @memcpy(work.result.summary[0..payload.summary_len], payload.summary[0..payload.summary_len]);
             if (work.variant == .head) {
                 // The head bytes move into the result whole; the UI
                 // classifies and renders them on the main thread.
@@ -377,7 +498,7 @@ fn loadThread(first: *LoadWork) void {
                     work.result.setError(error.Canceled);
                 }
             } else deliverImage(work, payload.bytes);
-        } else |err| work.result.setError(err);
+        } else |err| if (work.result.message_len == 0) work.result.setError(err);
         allocator.free(work.spec);
         work.spec = &.{};
 
@@ -1605,6 +1726,7 @@ fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
         c.gtk_label_set_text(self.status, text.ptr);
         return;
     };
+    if (result.head_kind != .bytes) return onListingLoaded(self, result, head);
     const binary = hexdump.looksBinary(head);
     if (head.len == 0) {
         // An empty slice's pointer is not safe to hand to C.
@@ -1646,6 +1768,35 @@ fn onHeadLoaded(self: *ViewerWindow, result: *LoadResult) void {
             format.fmtSize(&total_buf, result.source_bytes),
         }) catch "File loaded";
     c.gtk_label_set_text(self.status, text.ptr);
+}
+
+/// A folder's entries or an archive's members, already rendered as
+/// text by the loader: shown verbatim with a listing-shaped status.
+fn onListingLoaded(self: *ViewerWindow, result: *LoadResult, text: []const u8) void {
+    if (text.len == 0) {
+        setTextViewContent(self, "");
+    } else {
+        const valid = c.g_utf8_make_valid(text.ptr, @intCast(text.len));
+        defer c.g_free(valid);
+        setTextViewContent(self, std.mem.span(@as([*:0]const u8, @ptrCast(valid))));
+    }
+    const what: []const u8 = switch (result.head_kind) {
+        .directory => "Folder contents",
+        .archive => "Archive members (listed on the file's host)",
+        .bytes => unreachable,
+    };
+    self.setMetadata(what);
+    var status_buf: [256:0]u8 = undefined;
+    var total_buf: [48:0]u8 = undefined;
+    const status = switch (result.head_kind) {
+        .directory => std.fmt.bufPrintZ(&status_buf, "Folder  {s}", .{result.summaryText()}) catch "Folder",
+        .archive => std.fmt.bufPrintZ(&status_buf, "Archive  {s}  {s}", .{
+            result.summaryText(),
+            format.fmtSize(&total_buf, result.source_bytes),
+        }) catch "Archive",
+        .bytes => unreachable,
+    };
+    c.gtk_label_set_text(self.status, status.ptr);
 }
 
 fn onLoaded(user: ?*anyopaque, result: *LoadResult) void {
