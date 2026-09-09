@@ -38,6 +38,7 @@ const millerNextSegment = @import("../../filebrowser/paths.zig").millerNextSegme
 const parseSpec = @import("../../filebrowser/paths.zig").parseSpec;
 const tagColorHex = @import("../../filebrowser/format.zig").tagColorHex;
 const cast = @import("../../util/cast.zig");
+const muxclient = @import("../../mux/client.zig");
 
 /// Horizontal gap between two adjacent widgets of a name cell
 /// (expander, icon, label, chips). Shared with colview.zig.
@@ -444,6 +445,12 @@ pub fn applyListingState(tab: *BTab) format.ListingState {
             var detail: [400]u8 = undefined;
             const text = std.fmt.bufPrint(&detail, "{s}: {s}", .{ tab.root.path, why }) catch why;
             c.gtk_label_set_text(tab.empty_detail, copyZ(&detail_buf, text));
+        } else if (state == .listing) {
+            var wait_title: [300]u8 = undefined;
+            var wait_detail: [400]u8 = undefined;
+            const wait = waitPlaceholder(tab, &wait_title, &wait_detail);
+            c.gtk_label_set_text(tab.empty_title, copyZ(&title_buf, wait.title));
+            c.gtk_label_set_text(tab.empty_detail, copyZ(&detail_buf, wait.detail));
         } else {
             c.gtk_label_set_text(tab.empty_title, copyZ(&title_buf, format.listingHeadline(state)));
             c.gtk_label_set_text(tab.empty_detail, copyZ(&detail_buf, switch (state) {
@@ -452,10 +459,88 @@ pub fn applyListingState(tab: *BTab) format.ListingState {
                 else => "",
             }));
         }
-        c.gtk_widget_set_visible(@ptrCast(@alignCast(tab.empty_detail)), @intFromBool(state != .listing));
+        c.gtk_widget_set_visible(@ptrCast(@alignCast(tab.empty_detail)), 1);
+    }
+    // The spinner and its elapsed-time tick live exactly as long as
+    // the wait does: a settled state (rows, refusal, empty) stops both.
+    const waiting = show and state == .listing;
+    c.gtk_widget_set_visible(tab.empty_spinner, @intFromBool(waiting));
+    c.gtk_spinner_set_spinning(@ptrCast(tab.empty_spinner), @intFromBool(waiting));
+    if (waiting) {
+        if (tab.wait_tick == 0) {
+            tab.wait_started_ms = clock.nowMs();
+            tab.wait_tick = c.g_timeout_add(1000, @ptrCast(&onWaitTick), @ptrCast(tab));
+        }
+    } else if (tab.wait_tick != 0) {
+        _ = c.g_source_remove(tab.wait_tick);
+        tab.wait_tick = 0;
     }
     return state;
 }
+
+const WaitText = struct { title: []const u8, detail: []const u8 };
+
+/// The placeholder for a tab that is still WAITING: on the host's
+/// daemon to answer at all, or on the listing once it has. Names the
+/// host, the transport being tried and the seconds elapsed, so a slow
+/// first contact reads as progress rather than as a hung window.
+fn waitPlaceholder(tab: *BTab, title_buf: []u8, detail_buf: []u8) WaitText {
+    const elapsed_s = @divTrunc(clock.nowMs() - tab.wait_started_ms, 1000);
+    var elapsed_buf: [32]u8 = undefined;
+    const elapsed = elapsedPhrase(&elapsed_buf, elapsed_s);
+    const host = tab.hc.host orelse "";
+    if (tab.hc.state == .connecting and host.len > 0) {
+        const spec = muxclient.RemoteSpec.parse(host);
+        const route: []const u8 = switch (spec.mode) {
+            .auto => "over UDP, falling back to SSH",
+            .ssh => "over SSH",
+            .udp => "over UDP",
+            .tor => "over SSH through Tor",
+        };
+        return .{
+            .title = std.fmt.bufPrint(title_buf, "Connecting to {s}...", .{spec.host}) catch "Connecting...",
+            .detail = std.fmt.bufPrint(detail_buf, "Reaching the sketerm-mux daemon on {s} {s}. The first contact with a host starts that daemon and can take a few seconds.{s}", .{
+                spec.host, route, elapsed,
+            }) catch "",
+        };
+    }
+    const detail = if (host.len > 0)
+        std.fmt.bufPrint(detail_buf, "Reading {s} on {s}.{s}", .{ tab.root.path, host, elapsed }) catch ""
+    else
+        std.fmt.bufPrint(detail_buf, "Reading {s}.{s}", .{ tab.root.path, elapsed }) catch "";
+    return .{ .title = format.listingHeadline(.listing), .detail = detail };
+}
+
+/// " 12s elapsed" once a wait is long enough to be worth counting.
+fn elapsedPhrase(buf: []u8, elapsed_s: i64) []const u8 {
+    if (elapsed_s < 2) return "";
+    return std.fmt.bufPrint(buf, " {d}s elapsed", .{elapsed_s}) catch "";
+}
+
+test "elapsedPhrase counts whole seconds from two on" {
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("", elapsedPhrase(&buf, 0));
+    try std.testing.expectEqualStrings("", elapsedPhrase(&buf, 1));
+    try std.testing.expectEqualStrings(" 2s elapsed", elapsedPhrase(&buf, 2));
+    try std.testing.expectEqualStrings(" 754s elapsed", elapsedPhrase(&buf, 754));
+}
+
+fn onWaitTick(user: ?*anyopaque) callconv(.c) c.gboolean {
+    const tab = cast.userData(BTab, user);
+    if (tab.view.widgets_dead) {
+        tab.wait_tick = 0;
+        return 0;
+    }
+    // Re-deriving the whole state is what keeps this honest: a listing
+    // that landed between ticks stops the tick itself.
+    const state = applyListingState(tab);
+    if (state != .listing) {
+        tab.wait_tick = 0;
+        return 0;
+    }
+    return 1;
+}
+
 
 /// Show/hide the chrome that belongs to the tab's view mode.
 pub fn applyViewChrome(self: *BrowserView, tab: *BTab) void {
@@ -967,7 +1052,7 @@ pub fn ensureFlowbox(self: *BrowserView, tab: *BTab) *c.GtkFlowBox {
     self.installGridMiddleClick(tab, tab.flowbox.?);
     // Sticky toggling works in the grid too, same capture-phase rule.
     self.installSelectionGestures(tab, @ptrCast(fb), true);
-    const dropt = dnd.newTarget(tab);
+    const dropt = dnd.newTarget(tab, &gridDropHoverWidget);
     _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&onGridDrop), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(fb, @ptrCast(dropt));
     return tab.flowbox.?;
@@ -1105,6 +1190,16 @@ fn onGridDragPrepare(_: *c.GtkDragSource, _: f64, _: f64, user: ?*anyopaque) cal
     const data = c.g_object_get_data(@ptrCast(@alignCast(child)), "sketerm-row") orelse return null;
     const ctx: *RowCtx = @ptrCast(@alignCast(data));
     return dnd.provider(ctx.tab, ctx.path);
+}
+
+/// dnd.HoverFn for the icon grid: the folder tile under (x, y), null
+/// for a file tile or the gaps between tiles (the tab root).
+pub fn gridDropHoverWidget(tab: *BTab, x: f64, y: f64) ?*c.GtkWidget {
+    const fb = tab.flowbox orelse return null;
+    const child = c.gtk_flow_box_get_child_at_pos(fb, @intFromFloat(x), @intFromFloat(y)) orelse return null;
+    const data = c.g_object_get_data(@ptrCast(child), "sketerm-row") orelse return null;
+    const ctx: *RowCtx = @ptrCast(@alignCast(data));
+    return if (ctx.is_dir) @ptrCast(child) else null;
 }
 
 fn onGridDrop(target: *c.GtkDropTarget, value: *c.GValue, x: f64, y: f64, user: ?*anyopaque) callconv(.c) c.gboolean {

@@ -208,7 +208,7 @@ pub fn installTabConveniences(self: *BrowserView, tab: *BTab, label_box: *c.GtkW
 
     // Dropping onto a tab targets THAT tab's directory, whichever
     // tab is currently shown.
-    const dropt = dnd.newTarget(tab);
+    const dropt = dnd.newTarget(tab, null);
     _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&onTabDrop), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(label_box, @ptrCast(dropt));
 }

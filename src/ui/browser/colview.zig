@@ -318,6 +318,27 @@ fn rowWidget(cell_child: *c.GtkWidget) ?*c.GtkWidget {
     return c.gtk_widget_get_parent(cell);
 }
 
+/// The ROW widget (the listview's direct child) holding a tagged
+/// cell root or row: what a whole-row highlight class goes on.
+fn rowOf(tagged: *c.GtkWidget) ?*c.GtkWidget {
+    var w = tagged;
+    while (c.gtk_widget_get_parent(w)) |parent| : (w = parent) {
+        const tn = std.mem.span(c.g_type_name_from_instance(@ptrCast(@alignCast(parent))));
+        if (std.mem.eql(u8, tn, "GtkListView")) return w;
+    }
+    return null;
+}
+
+/// dnd.HoverFn for the column view: the folder row a drop at (x, y)
+/// would land in, null for a file row or empty space (the tab root).
+pub fn dropHoverWidget(tab: *BTab, x: f64, y: f64) ?*c.GtkWidget {
+    const hit = c.gtk_widget_pick(@ptrCast(@alignCast(tab.colview)), x, y, c.GTK_PICK_DEFAULT) orelse return null;
+    const root = findItemWidget(hit) orelse return null;
+    const data: *ItemData = @ptrCast(@alignCast(c.g_object_get_data(@ptrCast(@alignCast(root)), "sketerm-item") orelse return null));
+    if (data.kind != .entry or !data.is_dir) return null;
+    return rowOf(root);
+}
+
 pub const Picked = struct { data: *ItemData, pos: c.guint };
 
 /// The item under (x, y) in columnview coords, with its CURRENT
@@ -454,7 +475,7 @@ pub fn installColumnView(self: *BrowserView, tab: *BTab) *c.GtkWidget {
 
     // Internal DnD target: dropping an entry spec moves/copies into
     // the row's directory (or the tab's).
-    const dropt = dnd.newTarget(tab);
+    const dropt = dnd.newTarget(tab, &dropHoverWidget);
     _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&@import("ops.zig").onListDrop), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     c.gtk_widget_add_controller(cv, @ptrCast(dropt));
 
@@ -1331,6 +1352,14 @@ pub fn installCss(any_widget: *c.GtkWidget) void {
         \\flowbox.sketerm-fb-flow > flowboxchild:selected {
         \\  background-color: @theme_selected_bg_color;
         \\  color: @theme_selected_fg_color;
+        \\}
+        \\columnview.sketerm-fb-cv > listview > row.sketerm-fb-drop,
+        \\columnview.sketerm-fb-cv > listview > row.sketerm-fb-drop:hover,
+        \\flowbox.sketerm-fb-flow > flowboxchild.sketerm-fb-drop,
+        \\flowbox.sketerm-fb-flow > flowboxchild.sketerm-fb-drop:hover {
+        \\  background-color: alpha(@theme_selected_bg_color, 0.35);
+        \\  box-shadow: inset 0 0 0 2px @theme_selected_bg_color;
+        \\  border-radius: 4px;
         \\}
         \\text.sketerm-fb-rename {
         \\  padding: 0 2px;

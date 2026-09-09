@@ -105,23 +105,72 @@ fn targetAction(target: *c.GtkDropTarget, tab: *BTab) c.GdkDragAction {
     return preferredAction(origin.active, origin.active and !origin.mixed and hostEq(sourceHost(), tab.hc.host), mods);
 }
 
-fn onTargetMotion(target: *c.GtkDropTarget, _: f64, _: f64, user: ?*anyopaque) callconv(.c) c.GdkDragAction {
+fn onTargetMotion(target: *c.GtkDropTarget, x: f64, y: f64, user: ?*anyopaque) callconv(.c) c.GdkDragAction {
     const tab = cast.userData(BTab, user);
     const action = targetAction(target, tab);
     c.g_object_set_data(@ptrCast(@alignCast(target)), "sketerm-drop-action", @ptrFromInt(@as(usize, @intCast(action))));
+    if (hoverOf(target)) |hover| setHover(tab, hover(tab, x, y));
     return action;
 }
 
-pub fn newTarget(tab: *BTab) *c.GtkDropTarget {
+fn onTargetLeave(target: *c.GtkDropTarget, user: ?*anyopaque) callconv(.c) void {
+    if (hoverOf(target) == null) return;
+    clearHover(cast.userData(BTab, user));
+}
+
+/// Resolve the folder row or tile a drop at (x, y) would land IN, or
+/// null when it would land in the tab's own directory. What it returns
+/// is the widget that gets the highlight class.
+pub const HoverFn = *const fn (tab: *BTab, x: f64, y: f64) ?*c.GtkWidget;
+
+/// CSS class carried by the one folder row/tile a drag is over.
+pub const DROP_CLASS = "sketerm-fb-drop";
+
+fn hoverOf(target: *c.GtkDropTarget) ?HoverFn {
+    const raw = c.g_object_get_data(@ptrCast(@alignCast(target)), "sketerm-drop-hover") orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+/// Move the drop highlight to `widget` (null clears it). The tab owns a
+/// reference to the highlighted widget: a listing re-render during the
+/// drag can unparent the row, and the class must still come off it
+/// rather than off freed memory.
+fn setHover(tab: *BTab, widget: ?*c.GtkWidget) void {
+    if (tab.drop_hover == widget) return;
+    if (tab.drop_hover) |old| {
+        c.gtk_widget_remove_css_class(old, DROP_CLASS);
+        c.g_object_unref(@as(?*anyopaque, old));
+    }
+    tab.drop_hover = widget;
+    if (widget) |w| {
+        _ = c.g_object_ref(@as(?*anyopaque, w));
+        c.gtk_widget_add_css_class(w, DROP_CLASS);
+    }
+}
+
+/// Drop the highlight: on leave, on drop, and at tab teardown.
+pub fn clearHover(tab: *BTab) void {
+    setHover(tab, null);
+}
+
+/// A drop target for one of the browser's surfaces. `hover` names the
+/// folder under the pointer for the listing surfaces (rows, tiles), so
+/// the drag shows WHERE it will land; surfaces whose whole widget is
+/// one destination (a crumb, a tab label) pass null.
+pub fn newTarget(tab: *BTab, hover: ?HoverFn) *c.GtkDropTarget {
     const target = c.gtk_drop_target_new(c.G_TYPE_INVALID, c.GDK_ACTION_COPY | c.GDK_ACTION_MOVE);
     var types = [_]c.GType{ c.G_TYPE_STRING, strvType() };
     c.gtk_drop_target_set_gtypes(target, &types, types.len);
+    if (hover) |h| c.g_object_set_data(@ptrCast(@alignCast(target)), "sketerm-drop-hover", @ptrCast(@constCast(h)));
     _ = c.g_signal_connect_data(target, "enter", @ptrCast(&onTargetMotion), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     _ = c.g_signal_connect_data(target, "motion", @ptrCast(&onTargetMotion), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(target, "leave", @ptrCast(&onTargetLeave), @ptrCast(tab), null, c.G_CONNECT_DEFAULT);
     return target.?;
 }
 
 pub fn dropAction(target: *c.GtkDropTarget, tab: *BTab) c.GdkDragAction {
+    // The drop is landing: the highlight has said all it had to say.
+    clearHover(tab);
     if (c.gtk_drop_target_get_current_drop(target)) |drop| {
         if (c.gdk_drop_get_drag(drop)) |drag| {
             const selected = c.gdk_drag_get_selected_action(drag);

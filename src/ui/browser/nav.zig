@@ -96,6 +96,12 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
     // land inside the browser face, its chords (Ctrl+Shift+B included)
     // stop reaching it the moment a listing comes up empty.
     c.gtk_widget_set_focusable(empty_box, 1);
+    const empty_spinner = c.gtk_spinner_new();
+    c.gtk_widget_set_size_request(empty_spinner, 32, 32);
+    c.gtk_widget_set_halign(empty_spinner, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_margin_bottom(empty_spinner, 6);
+    c.gtk_widget_set_visible(empty_spinner, 0);
+    c.gtk_box_append(@ptrCast(empty_box), empty_spinner);
     const empty_title = c.gtk_label_new("");
     c.gtk_widget_add_css_class(empty_title, "title-2");
     c.gtk_label_set_wrap(@ptrCast(empty_title), 1);
@@ -136,6 +142,7 @@ pub fn newTab(self: *BrowserView, host: ?[]const u8, path: []const u8) ?*BTab {
         .empty_box = empty_box,
         .empty_title = @ptrCast(@alignCast(empty_title)),
         .empty_detail = @ptrCast(@alignCast(empty_detail)),
+        .empty_spinner = empty_spinner.?,
     };
     self.tabs.append(self.allocator, tab) catch {
         tab.root.deinit();
@@ -516,6 +523,11 @@ pub fn goUp(self: *BrowserView, tab: *BTab) void {
 }
 
 pub fn toggleExpand(self: *BrowserView, tab: *BTab, dir_path: []const u8) void {
+    // The parent row's identity (path, depth, kind) does not change
+    // when it expands or collapses, so the windowed splice would keep
+    // its GObject and never rebind it -- and the chevron it shows is
+    // set at bind time. Name it changed so the next render re-aims it.
+    tab.noteChangedFull(dir_path);
     if (tab.subdirByPath(dir_path)) |_| {
         colview.invalidateBackingRefs(tab);
         tab.dropSubdirsUnder(dir_path);

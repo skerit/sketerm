@@ -305,7 +305,7 @@ fn appendSegment(self: *BrowserView, box: *c.GtkWidget, seg: crumbs.Segment, tab
     // A segment is a drop target for the same internal DnD the
     // listing accepts: dropping here targets that directory.
     if (PathCtx.create(self, seg.path)) |dctx| {
-        const dropt = dnd.newTarget(tab);
+        const dropt = dnd.newTarget(tab, null);
         _ = c.g_signal_connect_data(dropt, "drop", @ptrCast(&onCrumbDrop), @ptrCast(dctx), @ptrCast(&PathCtx.freeClosure), c.G_CONNECT_DEFAULT);
         c.gtk_widget_add_controller(btn, @ptrCast(dropt));
     }

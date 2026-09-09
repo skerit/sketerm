@@ -785,6 +785,9 @@ pub const BTab = struct {
     /// Selection captured on button-down before GTK collapses it while
     /// deciding whether the gesture becomes a click or a drag.
     drag_selected: std.ArrayList([]u8) = .empty,
+    /// The folder row/tile a drag is currently over (dnd.zig owns a
+    /// reference and the highlight class on it); null between drags.
+    drop_hover: ?*c.GtkWidget = null,
     rendering: bool = false,
     /// Hash of the listing the last render showed; a re-render of the
     /// SAME listing keeps its scroll position (render.zig
@@ -895,6 +898,14 @@ pub const BTab = struct {
     empty_box: *c.GtkWidget = undefined,
     empty_title: *c.GtkLabel = undefined,
     empty_detail: *c.GtkLabel = undefined,
+    /// Spins while the placeholder says the tab is connecting or
+    /// listing; hidden for every settled state.
+    empty_spinner: *c.GtkWidget = undefined,
+    /// 1s tick refreshing the placeholder's elapsed-time line while
+    /// the tab waits on a connection or a listing (0 = none), and the
+    /// monotonic ms the wait began.
+    wait_tick: c.guint = 0,
+    wait_started_ms: i64 = 0,
     /// Why the last navigation from this tab was refused (owned), or
     /// null. Distinct from `root.load_error`: the tab still shows a
     /// perfectly good directory, so the listing area must NOT be
@@ -1096,12 +1107,14 @@ pub const BTab = struct {
         self.pending_select.deinit(a);
         for (self.drag_selected.items) |p| a.free(p);
         self.drag_selected.deinit(a);
+        @import("dnd.zig").clearHover(self);
         for (self.attr_columns.items) |name| a.free(name);
         self.attr_columns.deinit(a);
         self.attr_col_widths.deinit(a);
         self.name_cells.deinit(a);
         if (self.width_save_src != 0) _ = c.g_source_remove(self.width_save_src);
         if (self.width_fit_src != 0) _ = c.g_source_remove(self.width_fit_src);
+        if (self.wait_tick != 0) _ = c.g_source_remove(self.wait_tick);
         if (self.filter.len > 0) a.free(self.filter);
         if (self.virtual_spec.len > 0) a.free(self.virtual_spec);
         self.clearChanged();
