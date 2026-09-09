@@ -2632,6 +2632,8 @@ fn windowsJson(arena: std.mem.Allocator, app: *appdrive.App) ![]const u8 {
         // recently painted non-popup toplevel (see firstToplevelId).
         if (win.id == primary_id) try w.writeAll(",\"primary\":true");
         if (win.popup) try w.writeAll(",\"popup\":true");
+        if (win.maximized) try w.writeAll(",\"maximized\":true");
+        if (win.fullscreen) try w.writeAll(",\"fullscreen\":true");
         if (win.title) |t| {
             try w.writeAll(",\"title\":");
             try std.json.Stringify.value(t, .{}, w);

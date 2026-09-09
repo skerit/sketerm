@@ -209,6 +209,17 @@ pub const Window = struct {
     app_id: ?[]u8 = null,
     popup: bool = false,
     frames: u64 = 0,
+    /// Window state the app asked for (xdg_toplevel set_maximized /
+    /// set_fullscreen) and this driver granted: a real compositor
+    /// answers those with a configure at the output size, and an app
+    /// whose maximize is ignored looks broken in every test that
+    /// reaches for it (GTK's title-bar double-click, for one).
+    maximized: bool = false,
+    fullscreen: bool = false,
+    /// The size to configure back to when the app leaves that state
+    /// (the last committed floating size).
+    restore_w: i32 = 0,
+    restore_h: i32 = 0,
     /// Monotonic ms of the last committed frame — ranks the "primary
     /// content" window (a game's render surface keeps painting while
     /// its frame window sits static).
@@ -227,6 +238,17 @@ pub const Window = struct {
     /// touches the window — windows the replay never re-announces are
     /// pruned when `native_sync` closes it (they died during the gap).
     resync_seen: bool = true,
+
+    /// Note the current floating size as what unmaximize/unfullscreen
+    /// returns to. A window that has not painted yet has no size to
+    /// remember; `configureState` then leaves the app at its own
+    /// choice when it leaves the state.
+    fn rememberFloating(self: *Window) void {
+        if (self.w > 0 and self.h > 0) {
+            self.restore_w = self.w;
+            self.restore_h = self.h;
+        }
+    }
 
     fn deinit(self: *Window, a: std.mem.Allocator) void {
         self.pixels.deinit(a);
@@ -1650,6 +1672,7 @@ pub const App = struct {
             .ctx = ch,
             .toplevel_new = onNew,
             .toplevel_frame = onFrame,
+            .toplevel_state_request = onStateRequest,
             .toplevel_title = onTitle,
             .toplevel_app_id = onAppId,
             .toplevel_gone = onGone,
@@ -1853,6 +1876,50 @@ pub const App = struct {
                 if (ch.app.vrec) |*r| r.addShmFrame(wp, ww, wh, win.format, t) catch {};
             }
         }
+    }
+
+    /// The app asked to change its own window state. Granted the way
+    /// a stacking compositor would: maximize and fullscreen configure
+    /// the toplevel to the virtual output's size with the matching
+    /// xdg state, leaving either restores the last floating size.
+    /// Minimize has no meaning on a headless display and is ignored.
+    fn onStateRequest(ctx: ?*anyopaque, sid: u32, req: u8) void {
+        const ch = chanOf(ctx);
+        const app = ch.app;
+        const win = app.winBySurface(ch.id, sid) orelse return;
+        if (win.popup) return;
+        switch (req) {
+            1 => {
+                if (!win.maximized and !win.fullscreen) win.rememberFloating();
+                win.maximized = true;
+            },
+            2 => win.maximized = false,
+            3 => {
+                if (!win.maximized and !win.fullscreen) win.rememberFloating();
+                win.fullscreen = true;
+            },
+            4 => win.fullscreen = false,
+            else => return,
+        }
+        app.configureState(win) catch {};
+    }
+
+    /// Send the configure that matches `win`'s granted state.
+    fn configureState(self: *App, win: *Window) Error!void {
+        const a = self.allocator;
+        var units: std.ArrayList(u8) = .empty;
+        defer units.deinit(a);
+        var w: i32 = win.restore_w;
+        var h: i32 = win.restore_h;
+        var bits: u32 = 1; // activated
+        if (win.fullscreen or win.maximized) {
+            w = @intCast(self.output_width);
+            h = @intCast(self.output_height);
+            bits |= if (win.fullscreen) @as(u32, 4) else @as(u32, 2);
+        }
+        if (w <= 0 or h <= 0) return;
+        wlpipe.appendConfigure(&units, a, win.sid, w, h, bits) catch return Error.OutOfMemory;
+        try self.sendIntents(win.chan, units.items);
     }
 
     fn onTitle(ctx: ?*anyopaque, sid: u32, title: []const u8) void {
@@ -2597,6 +2664,12 @@ pub const App = struct {
 
     pub fn resizeWindow(self: *App, win_id: u32, w: i32, h: i32) Error!void {
         const win = self.winById(win_id) orelse return Error.NoSuchWindow;
+        // An explicit size is a floating size: it ends any granted
+        // maximize/fullscreen, as a WM-side resize would.
+        win.maximized = false;
+        win.fullscreen = false;
+        win.restore_w = w;
+        win.restore_h = h;
         const a = self.allocator;
         var units: std.ArrayList(u8) = .empty;
         defer units.deinit(a);
