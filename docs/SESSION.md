@@ -20625,3 +20625,31 @@ both `emitImage` and `image_store.addFull` (deliberate, budget-driven).
 floating size restored on leave; `app_windows` reports `maximized` /
 `fullscreen`). Before, the request was parsed and dropped, so a
 maximize could not be tested headlessly at all.
+
+## 2026-09-13: hidden terminal offloads retire before session teardown
+
+Killing an attached remote session made every local window disappear.
+The local journal recorded KWin's outgoing Wayland buffer exceeding 1 MiB,
+followed by GTK's "Error flushing display" and exit status 1, not a fatal
+signal. An isolated GTK/KWin experiment identified the hidden-surface
+condition: after hiding an already-offloaded GLArea, 1,000 sibling frames
+left 1,000 server-side callbacks outstanding. Removing that hidden surface
+released them in a burst of delete_id events. Visible-only controls drained
+normally; disabling offload on hide prevented the accumulation.
+
+Pane unmap now disables graphics offload immediately. Map requests the
+existing window-wide policy again, and that policy never enables an unmapped
+terminal surface. Visible panes retain the fast path when animation and
+dialog policy allow it. Teardown disables offload and disconnects the Pane's
+map/unmap handlers; policy scans skip severed panes during synchronous mux
+takeover, before those old panes leave the window's lists.
+
+The smoke rig checks actual offload properties across tab switches, file-face
+hide/show, sibling redraws and hidden-history closure through a test-only
+GTK observer. Real Session > Kill Session clicks cover split/tab targets
+over socket, SSH, automatic UDP upgrade and forced UDP, with fresh keyboard
+input verified in two surviving windows. These tests and the unit suite
+pass. The bounded KWin experiment reproduced callback retention and burst
+release, not the full 1 MiB disconnect; that failure is recorded in the
+user's journal. The full GUI suite remains blocked at browser-helper startup
+on this host, before these stages.

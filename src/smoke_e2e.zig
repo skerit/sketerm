@@ -488,6 +488,8 @@ pub fn main() u8 {
     _ = c.setenv("XDG_CACHE_HOME", rt.ptr, 1);
     _ = c.setenv("XDG_DATA_HOME", rt.ptr, 1);
     _ = c.unsetenv("SKETERM_SOCKET");
+    if (c.getenv("SKETERM_SMOKE_E2E_KILL_IMAGES") != null)
+        _ = c.setenv("SKETERM_MUX_LOG", "debug", 1);
     defer @import("util/pathz.zig").removeTree(rt);
 
     const have_web_action = c.access("zig-out/bin/sketerm-webengine", c.X_OK) == 0;
@@ -631,9 +633,14 @@ pub fn main() u8 {
             \\export XDG_STATE_HOME='{s}'
             \\export XDG_CONFIG_HOME='{s}'
             \\export SKETERM_MUX_BIN='{s}'
-            \\exec '{s}' --proxy
+            \\export SSH_CONNECTION='127.0.0.1 12345 127.0.0.1 22'
+            \\for arg in "$@"; do
+            \\    case "$arg" in *--udp-listen*) exec "$SKETERM_MUX_BIN" --udp-listen --socket '{s}';; esac
+            \\done
+            \\printf '%s\n' "$$" > '{s}/ssh-child-'"$SKETERM_APP_ID"
+            \\exec '{s}' --proxy --socket '{s}'
             \\
-        , .{ rt, rrt, rrt, rrt, mux_abs, mux_abs }) catch return fail("fake ssh body");
+        , .{ rt, rrt, rrt, rrt, mux_abs, rsock, rt, mux_abs, rsock }) catch return fail("fake ssh body");
         const fp = c.fopen(ssh_path.ptr, "wb") orelse return fail("fake ssh open");
         const wrote = c.fwrite(body.ptr, 1, body.len, fp) == body.len;
         _ = c.fclose(fp);
@@ -671,12 +678,24 @@ pub fn main() u8 {
         if (!writeFile(cfg, config_text)) return fail("could not write the isolated config.conf");
     }
 
+    var offload_lib_buf: [512:0]u8 = undefined;
+    const offload_lib = std.fmt.bufPrintZ(&offload_lib_buf, "{s}/offload-probe.so", .{rt}) catch return fail("offload observer path");
+    if (!platform.is_macos and !prepareOffloadProbe(rt, offload_lib)) return fail("building the private GTK offload observer failed");
+
     // Spawn the freshly-built binary with its own app id so it
     // doesn't join a running user instance via GApplication.
     const pid = c.fork();
     if (pid < 0) return fail("fork");
     if (pid == 0) {
         platform.dieWithParent();
+        if (!platform.is_macos) {
+            _ = c.setenv("SKETERM_OFFLOAD_PROBE_DIR", rt.ptr, 1);
+            const previous = c.getenv("LD_PRELOAD");
+            _ = c.setenv("SKETERM_OFFLOAD_PRIOR_PRELOAD", if (previous != null) previous else "", 1);
+            var preload_buf: [4096:0]u8 = undefined;
+            const preload = std.fmt.bufPrintZ(&preload_buf, "{s}:{s}", .{ offload_lib, if (previous != null) std.mem.span(previous) else "" }) catch c._exit(126);
+            _ = c.setenv("LD_PRELOAD", preload.ptr, 1);
+        }
         _ = c.setenv("SKETERM_APP_ID", g_app_id.ptr, 1);
         if (have_wl) {
             // The ONLY display this child can reach is sketerm's own
@@ -723,6 +742,12 @@ pub fn main() u8 {
         // if that is ever wanted it needs its own test with its own
         // private bus (src/mux/a11yhub.zig spawns one per app session).
         _ = c.setenv("GTK_A11Y", "none", 1);
+        if (c.getenv("SKETERM_SMOKE_E2E_KILL_IMAGES") != null) {
+            const trace = c.open("zig-out/smoke-e2e-kill-wayland.log", c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+            if (trace < 0 or c.dup2(trace, 2) < 0) c._exit(126);
+            if (trace != 2) _ = c.close(trace);
+            _ = c.setenv("WAYLAND_DEBUG", "client", 1);
+        }
         const argv = [_:null]?[*:0]const u8{ "zig-out/bin/sketerm", "--no-save", null };
         _ = c.execv("zig-out/bin/sketerm", @ptrCast(@constCast(&argv)));
         c._exit(127);
@@ -784,6 +809,29 @@ pub fn main() u8 {
         if (!have_wl) return fail("focused viewer smoke is GTK/Wayland-only");
         if (viewerCastStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
         say("viewer: focused image/cast/text/hex/video batch stage passed");
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_OFFLOAD_ONLY") != null) {
+        const app = drive orelse return fail("focused offload smoke needs the isolated Wayland display");
+        if (offloadPolicyStage(allocator, app, sock_path)) |why| return failMsg(why);
+        teardown();
+        return 0;
+    }
+    if (c.getenv("SKETERM_SMOKE_E2E_KILL_SESSION_ONLY") != null) {
+        const app = drive orelse return fail("focused Kill Session smoke has no display driver");
+        if (offloadPolicyStage(allocator, app, sock_path)) |why| return failMsg(why);
+        if (c.getenv("SKETERM_SMOKE_E2E_KILL_IMAGES") != null) {
+            defer keepMuxLog(rt);
+            if (killSessionMenuStage(allocator, app, sock_path, .auto)) |why| return failMsg(why);
+            say("Kill Session: bounded image-rich auto/UDP split/tab kills passed; trace in zig-out/smoke-e2e-kill-wayland.log");
+            teardown();
+            return 0;
+        }
+        for ([_]KillTransport{ .socket, .ssh, .auto, .udp }) |transport| {
+            if (killSessionMenuStage(allocator, app, sock_path, transport)) |why| return failMsg(why);
+        }
+        say("Kill Session: socket/SSH/auto/UDP split/tab sessions removed; both windows accept real input");
         teardown();
         return 0;
     }
@@ -1054,9 +1102,15 @@ pub fn main() u8 {
         if (scrollbarStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("overlay scrollbar dragged and paged on the real seat, mouse mode included");
 
+        if (offloadPolicyStage(allocator, app, sock_path)) |why| return failMsg(why);
+
         // 3c. The pane's context menu, driven by a real right-click and
         // by the keyboard. Contents and per-row sensitivity are
         // asserted in smoke_atspi (this rig runs GTK_A11Y=none).
+        for ([_]KillTransport{ .socket, .ssh, .auto, .udp }) |transport| {
+            if (killSessionMenuStage(allocator, app, sock_path, transport)) |why| return failMsg(why);
+        }
+        say("Kill Session: socket/SSH/auto/UDP split/tab sessions removed; both windows accept real input");
         if (contextMenuStage(allocator, app, sock_path)) |why| return failMsg(why);
         say("context menu: right-click and Shift+F10 both opened it, Escape closed it, focus returned to the pane");
 
@@ -5233,6 +5287,362 @@ fn waitPopup(app: *appdrive.App, want_open: bool, ms: u32) ?u32 {
         _ = app.pumpOnce(200);
         waited += 200;
     }
+}
+
+/// The preload only observes GTK properties on the main loop; it changes no widget state.
+fn prepareOffloadProbe(rt: []const u8, library: [:0]const u8) bool {
+    var source_buf: [512:0]u8 = undefined;
+    const source = std.fmt.bufPrintZ(&source_buf, "{s}/offload-probe.c", .{rt}) catch return false;
+    if (!writeFile(source,
+        \\#include <gtk/gtk.h>
+        \\#include <stdio.h>
+        \\#include <stdlib.h>
+        \\#include <unistd.h>
+        \\static char request[1024], result[1024], temporary[1024];
+        \\static unsigned mapped, enabled, hidden, bad;
+        \\static void walk(GtkWidget *w) {
+        \\    if (GTK_IS_GRAPHICS_OFFLOAD(w)) {
+        \\        GtkWidget *area = gtk_graphics_offload_get_child(GTK_GRAPHICS_OFFLOAD(w));
+        \\        if (area) {
+        \\            gboolean m = gtk_widget_get_mapped(area);
+        \\            gboolean e = gtk_graphics_offload_get_enabled(GTK_GRAPHICS_OFFLOAD(w)) == GTK_GRAPHICS_OFFLOAD_ENABLED;
+        \\            if (m) { mapped++; enabled += e; } else { hidden++; bad += e; }
+        \\        }
+        \\    }
+        \\    for (GtkWidget *p = gtk_widget_get_first_child(w); p; p = gtk_widget_get_next_sibling(p)) walk(p);
+        \\}
+        \\static gboolean sample(gpointer unused) {
+        \\    (void)unused;
+        \\    if (access(request, F_OK)) return G_SOURCE_CONTINUE;
+        \\    mapped = enabled = hidden = bad = 0;
+        \\    GListModel *windows = gtk_window_get_toplevels();
+        \\    for (guint i = 0; i < g_list_model_get_n_items(windows); i++) {
+        \\        GtkWidget *w = g_list_model_get_item(windows, i);
+        \\        walk(w);
+        \\        g_object_unref(w);
+        \\    }
+        \\    FILE *f = fopen(temporary, "w");
+        \\    if (f) { fprintf(f, "%u %u %u %u\n", mapped, enabled, hidden, bad); fclose(f); rename(temporary, result); }
+        \\    unlink(request);
+        \\    return G_SOURCE_CONTINUE;
+        \\}
+        \\__attribute__((constructor)) static void init(void) {
+        \\    const char *dir = getenv("SKETERM_OFFLOAD_PROBE_DIR");
+        \\    if (!dir) return;
+        \\    snprintf(request, sizeof request, "%s/offload-request", dir);
+        \\    snprintf(result, sizeof result, "%s/offload-result", dir);
+        \\    snprintf(temporary, sizeof temporary, "%s/offload-result.tmp", dir);
+        \\    const char *prior = getenv("SKETERM_OFFLOAD_PRIOR_PRELOAD");
+        \\    if (prior && *prior) setenv("LD_PRELOAD", prior, 1); else unsetenv("LD_PRELOAD");
+        \\    unsetenv("SKETERM_OFFLOAD_PROBE_DIR");
+        \\    g_timeout_add(10, sample, NULL);
+        \\}
+        \\
+    )) return false;
+    var command_buf: [1400:0]u8 = undefined;
+    const command = std.fmt.bufPrintZ(&command_buf, "cc -shared -fPIC -O2 '{s}' -o '{s}' $(pkg-config --cflags --libs gtk4)", .{ source, library }) catch return false;
+    return c.system(command.ptr) == 0;
+}
+
+fn expectOffload(allocator: std.mem.Allocator, app: *appdrive.App, mapped: u32, min_hidden: u32) ?[]const u8 {
+    var req_buf: [512:0]u8 = undefined;
+    var result_buf: [512:0]u8 = undefined;
+    const request = std.fmt.bufPrintZ(&req_buf, "{s}/offload-request", .{g_rt}) catch return "offload request path";
+    const result = std.fmt.bufPrintZ(&result_buf, "{s}/offload-result", .{g_rt}) catch return "offload result path";
+    _ = allocator;
+    var counts: [4]c_uint = .{0} ** 4;
+    const deadline = clock.nowMs() + 10_000;
+    while (clock.nowMs() < deadline) {
+        _ = c.unlink(result.ptr);
+        if (!writeFile(request, "sample")) return "offload request write failed";
+        const response_deadline = clock.nowMs() + 1_000;
+        while (c.access(result.ptr, c.F_OK) != 0 and clock.nowMs() < response_deadline) _ = app.pumpOnce(20);
+        const f = c.fopen(result.ptr, "r") orelse continue;
+        const n = c.fscanf(f, "%u %u %u %u", &counts[0], &counts[1], &counts[2], &counts[3]);
+        _ = c.fclose(f);
+        if (n == 4 and counts[0] == mapped and counts[1] == mapped and counts[2] >= min_hidden and counts[3] == 0) return null;
+        _ = app.pumpOnce(50);
+    }
+    return whyf("offload properties: mapped={d}, enabled={d}, hidden={d}, hidden-enabled={d}; expected mapped/enabled={d}, hidden>={d}, hidden-enabled=0", .{ counts[0], counts[1], counts[2], counts[3], mapped, min_hidden });
+}
+
+fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:0]const u8) ?[]const u8 {
+    if (platform.is_macos) return null;
+    const keep = listedPaneIds(allocator, sock) orelse return "offload initial roster failed";
+    defer allocator.free(keep);
+    defer closeAddedPanes(allocator, sock, app, keep);
+    var panes: [2]u32 = undefined;
+    for (&panes) |*pane| {
+        const opened = roundtrip(allocator, sock, "{\"cmd\":\"new-tab\"}\n") orelse return "offload tab open failed";
+        defer allocator.free(opened);
+        pane.* = parseNumAfter(opened, "\"pane\":") orelse return "offload tab missing id";
+        if (expectOffload(allocator, app, 1, 1)) |why| return why;
+    }
+    var req_buf: [512]u8 = undefined;
+    for (0..3) |_| {
+        for (panes) |pane| {
+            const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{pane}) catch return "offload focus format";
+            const focused = roundtrip(allocator, sock, req) orelse return "offload tab switch failed";
+            defer allocator.free(focused);
+            if (expectOffload(allocator, app, 1, 2)) |why| return why;
+        }
+    }
+    // A browser tab keeps a shell surface underneath its visible file face.
+    const browser = roundtrip(allocator, sock, "{\"cmd\":\"new-browser-tab\"}\n") orelse return "offload browser tab failed";
+    defer allocator.free(browser);
+    const browser_pane = parseNumAfter(browser, "\"pane\":") orelse return "offload browser pane missing";
+    if (expectOffload(allocator, app, 0, 3)) |why| return why;
+    for (0..2) |i| {
+        const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"action\",\"pane\":{d},\"data\":\"toggle_browser_face\"}}\n", .{browser_pane}) catch return "offload face format";
+        const toggled = roundtrip(allocator, sock, req) orelse return "offload face toggle failed";
+        defer allocator.free(toggled);
+        if (!mcpHas(toggled, "\"ok\":true")) return "offload face toggle refused";
+        if (expectOffload(allocator, app, if (i == 0) 1 else 0, 2)) |why| return why;
+    }
+    if (!closeGuiPaneAndWait(allocator, sock, browser_pane)) return "offload browser close failed";
+    if (expectOffload(allocator, app, 1, 2)) |why| return why;
+    const start = app.windows.items[0].frames;
+    const animate = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"sh -c 'i=0; while [ $i -lt 200 ]; do printf \\\\rFRAME-%s $i; i=$((i+1)); sleep 0.02; done'\\n\"}}\n", .{panes[1]}) catch return "offload redraw format";
+    const sent = roundtrip(allocator, sock, animate) orelse return "offload redraw command failed";
+    defer allocator.free(sent);
+    const deadline = clock.nowMs() + 15_000;
+    while (app.windows.items[0].frames - start < 120) {
+        if (clock.nowMs() >= deadline) return "offload sibling never rendered 120 frames";
+        if (expectOffload(allocator, app, 1, 2)) |why| return why;
+        _ = app.pumpOnce(20);
+    }
+    if (!closeGuiPaneAndWait(allocator, sock, panes[0])) return "offload hidden history close failed";
+    if (expectOffload(allocator, app, 1, 1)) |why| return why;
+    say("offload properties: repeated tab show/hide, file-face hide/show, 120 sibling frames and hidden-history close passed");
+    return null;
+}
+
+const KillTransport = enum { socket, ssh, auto, udp };
+
+/// Kill durable split/tab targets through the real menu without losing either window.
+fn killSessionMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, sock_path: [:0]const u8, transport: KillTransport) ?[]const u8 {
+    if (!@import("util/ocr.zig").available()) return "Kill Session menu regression requires tesseract";
+    std.debug.print("smoke-e2e: Kill Session: transport={s}\n", .{@tagName(transport)});
+    var remote_sock_buf: [512]u8 = undefined;
+    const mux_sock = if (transport != .socket) std.fmt.bufPrint(&remote_sock_buf, "{s}/r/sketerm/mux.sock", .{g_rt}) catch return "Kill Session: remote socket format" else g_mux_sock;
+    var host_buf: [520]u8 = undefined;
+    const host = switch (transport) {
+        .ssh => "ssh:kill-menu.invalid",
+        .auto => "kill-menu.invalid",
+        .udp => "udp:kill-menu.invalid",
+        .socket => std.fmt.bufPrint(&host_buf, "sock:{s}", .{mux_sock}) catch return "Kill Session: host format",
+    };
+    const images = c.getenv("SKETERM_SMOKE_E2E_KILL_IMAGES") != null;
+    var image_script_buf: [512:0]u8 = undefined;
+    const image_script = std.fmt.bufPrintZ(&image_script_buf, "{s}/kill-images.sh", .{g_rt}) catch return "Kill Session: image script path";
+    if (images) {
+        for (0..2) |phase| {
+            var stream: std.ArrayList(u8) = .empty;
+            defer stream.deinit(allocator);
+            var rgba: [16 * 16 * 4]u8 = undefined;
+            for (0..16 * 16) |pixel| {
+                const bright = (pixel / 16 + pixel % 16 + phase) % 2 == 0;
+                @memcpy(rgba[pixel * 4 ..][0..4], &[_]u8{ if (bright) 255 else 200, 0, 255, 255 });
+            }
+            var b64: [1368]u8 = undefined;
+            const encoded = std.base64.standard.Encoder.encode(&b64, &rgba);
+            for (0..48) |image| {
+                const sequence = std.fmt.allocPrint(allocator, "\x1b[{d};{d}H\x1b_Gf=32,s=16,v=16,a=T,i={d},c=4,r=2,C=1,q=2;{s}\x1b\\", .{ 2 + image / 8 * 3, 1 + image % 8 * 4, 1000 + image, encoded }) catch return "Kill Session: image sequence allocation";
+                defer allocator.free(sequence);
+                stream.appendSlice(allocator, sequence) catch return "Kill Session: image stream allocation";
+            }
+            var path_buf: [512:0]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&path_buf, "{s}/kill-images-{d}.bin", .{ g_rt, phase }) catch return "Kill Session: image stream path";
+            if (!writeFile(path, stream.items)) return "Kill Session: image stream write";
+        }
+        const script = std.fmt.allocPrint(allocator,
+            \\#!/bin/sh
+            \\i=0
+            \\while [ "$i" -lt 100 ]; do
+            \\    cat '{s}/kill-images-0.bin'
+            \\    sleep 0.1
+            \\    cat '{s}/kill-images-1.bin'
+            \\    sleep 0.1
+            \\    i=$((i + 1))
+            \\done
+            \\
+        , .{ g_rt, g_rt }) catch return "Kill Session: image script allocation";
+        defer allocator.free(script);
+        if (!writeFile(image_script, script)) return "Kill Session: image script write";
+    }
+    const keep = listedPaneIds(allocator, sock_path) orelse return "Kill Session: initial list failed";
+    defer allocator.free(keep);
+    defer closeAddedPanes(allocator, sock_path, app, keep);
+    const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"new-tab\"}\n") orelse return "Kill Session: survivor tab failed";
+    defer allocator.free(opened);
+    const survivor = parseNumAfter(opened, "\"pane\":") orelse return "Kill Session: survivor has no pane id";
+    const second = roundtrip(allocator, sock_path, "{\"cmd\":\"new-tab\"}\n") orelse return "Kill Session: second-window tab failed";
+    defer allocator.free(second);
+    const second_pane = parseNumAfter(second, "\"pane\":") orelse return "Kill Session: second-window pane id missing";
+    var detach_buf: [128]u8 = undefined;
+    const detach_req = std.fmt.bufPrint(&detach_buf, "{{\"cmd\":\"action\",\"data\":\"detach_tab\",\"pane\":{d}}}\n", .{second_pane}) catch return "Kill Session: detach format";
+    const detached = roundtrip(allocator, sock_path, detach_req) orelse return "Kill Session: detach tab failed";
+    defer allocator.free(detached);
+    if (!mcpHas(detached, "\"ok\":true")) return "Kill Session: detach tab refused";
+    var second_win: u32 = 0;
+    const window_deadline = clock.nowMs() + 10_000;
+    while (second_win == 0 and clock.nowMs() < window_deadline) {
+        _ = app.pumpOnce(200);
+        for (app.windows.items) |w| {
+            if (!w.popup and w.frames > 0 and w.id != app.windows.items[0].id) second_win = w.id;
+        }
+    }
+    if (second_win == 0) return "Kill Session: second window never rendered";
+    var focus_buf: [128]u8 = undefined;
+    const primary_focus = std.fmt.bufPrint(&focus_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{survivor}) catch return "Kill Session: primary focus format";
+    const primary = roundtrip(allocator, sock_path, primary_focus) orelse return "Kill Session: primary focus failed";
+    defer allocator.free(primary);
+    app.focusWindow(app.windows.items[0].id) catch return "Kill Session: primary seat focus failed";
+    _ = app.drainLive(1_000);
+    const survivor_ids = listedPaneIds(allocator, sock_path) orelse return "Kill Session: survivor list failed";
+    defer allocator.free(survivor_ids);
+    var admin = muxclient.Conn.connect(allocator, mux_sock) catch return "Kill Session: isolated daemon connection failed";
+    defer admin.deinit();
+    var req_buf: [1024]u8 = undefined;
+    for ([_][]const u8{ "e2e-kill-split", "e2e-kill-tab" }, 0..) |session, index| {
+        say(if (index == 0) "Kill Session: preparing durable split" else "Kill Session: preparing durable whole tab");
+        admin.sendJson(.spawn, .{
+            .name = session,
+            .argv = [_][]const u8{ "sh", "-c", "printf 'KILLTARGET\\n'; exec sh" },
+            .rows = @as(u16, 24),
+            .cols = @as(u16, 80),
+            .ttl_secs = @as(u32, 120),
+        }) catch return "Kill Session: durable spawn failed";
+        (admin.recvExpectFor(&.{.ok}, 10_000) catch return "Kill Session: durable spawn not acknowledged").deinit(allocator);
+        const target = blk: {
+            const split_req = if (index == 0) std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"split\",\"pane\":{d},\"direction\":\"h\"}}\n", .{survivor}) catch return "Kill Session: split format" else "{\"cmd\":\"new-tab\"}\n";
+            const split = roundtrip(allocator, sock_path, split_req) orelse return "Kill Session: split failed";
+            defer allocator.free(split);
+            const origin = parseNumAfter(split, "\"pane\":") orelse return "Kill Session: split has no pane id";
+            const before = listedPaneIds(allocator, sock_path) orelse return "Kill Session: pre-takeover list failed";
+            defer allocator.free(before);
+            const attach_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"attach-session\",\"pane\":{d},\"data\":\"{s}\",\"host\":\"{s}\"}}\n", .{ origin, session, host }) catch return "Kill Session: attach format";
+            const attached = roundtrip(allocator, sock_path, attach_req) orelse return "Kill Session: split attach failed";
+            defer allocator.free(attached);
+            if (!mcpHas(attached, "\"ok\":true")) return "Kill Session: split attach refused";
+            break :blk newPaneId(allocator, sock_path, before, 10_000) orelse return "Kill Session: split takeover never landed";
+        };
+        if (!waitPaneText(allocator, sock_path, target, "KILLTARGET", 10_000)) return "Kill Session: durable target never rendered";
+        var proxy_pid: c.pid_t = 0;
+        if (transport == .ssh or transport == .auto) {
+            var proxy_path_buf: [512:0]u8 = undefined;
+            const proxy_path = std.fmt.bufPrintZ(&proxy_path_buf, "{s}/ssh-child-{s}", .{ g_rt, g_app_id }) catch return "Kill Session: proxy proof path";
+            const f = c.fopen(proxy_path.ptr, "r") orelse return "Kill Session: GUI did not execute fake SSH child";
+            const scanned = c.fscanf(f, "%d", &proxy_pid);
+            _ = c.fclose(f);
+            if (scanned != 1 or proxy_pid <= 0) return "Kill Session: GUI SSH proxy PID missing";
+            if (transport == .ssh and pidGone(proxy_pid)) return "Kill Session: forced SSH proxy is not alive";
+            std.debug.print("smoke-e2e: Kill Session: GUI pid {d} launched detached SSH proxy pid {d}, target {s}\n", .{ child_pid, proxy_pid, session });
+        }
+        if (transport == .auto) {
+            const deadline = clock.nowMs() + 20_000;
+            while (!pidGone(proxy_pid) and clock.nowMs() < deadline) _ = app.pumpOnce(100);
+            if (!pidGone(proxy_pid)) return "Kill Session: automatic attachment never retired its SSH proxy for UDP";
+            const probe = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"printf '%s%s\\\\n' UPGRADED UDP\\n\"}}\n", .{target}) catch return "Kill Session: upgrade probe format";
+            const sent = roundtrip(allocator, sock_path, probe) orelse return "Kill Session: upgrade probe failed";
+            defer allocator.free(sent);
+            if (!waitPaneText(allocator, sock_path, target, "UPGRADEDUDP", 10_000)) return "Kill Session: input failed after SSH-to-UDP upgrade";
+            say("Kill Session: automatic SSH proxy retired; upgraded attachment executed UPGRADEDUDP");
+        }
+        const layout = roundtrip(allocator, sock_path, "{\"cmd\":\"list\"}\n") orelse return "Kill Session: attached layout missing";
+        defer allocator.free(layout);
+        const survivor_tab = tabOfPane(layout, survivor) orelse return "Kill Session: survivor missing before kill";
+        const target_tab = tabOfPane(layout, target) orelse return "Kill Session: target missing before kill";
+        if ((survivor_tab.id == target_tab.id) != (index == 0)) return "Kill Session: wrong split/tab placement";
+        const focus_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{target}) catch return "Kill Session: focus format";
+        const focused = roundtrip(allocator, sock_path, focus_req) orelse return "Kill Session: target focus failed";
+        defer allocator.free(focused);
+        _ = app.drainLive(2_000);
+        if (app.windows.items.len == 0) return "Kill Session: GUI window disappeared";
+        const win = app.windows.items[0].id;
+        const width: f64 = @floatFromInt(app.windows.items[0].w);
+        const height: f64 = @floatFromInt(app.windows.items[0].h);
+        if (images) {
+            const frame_before = app.windows.items[0].frames;
+            const animate = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"sh '{s}'\\n\"}}\n", .{ target, image_script }) catch return "Kill Session: animation request format";
+            const sent = roundtrip(allocator, sock_path, animate) orelse return "Kill Session: animation request failed";
+            defer allocator.free(sent);
+            const deadline = clock.nowMs() + 10_000;
+            while (clock.nowMs() < deadline) {
+                _ = app.pumpOnce(100);
+                const w = app.winById(win) orelse return "Kill Session: image animation lost GUI window";
+                if (w.frames >= frame_before + 12 and magentaPixels(app, win) >= 10_000) break;
+            } else return "Kill Session: image animation did not produce 12 frames and visible image pixels";
+            if (app.screenshotPng(win, 1600, null, 0)) |shot| {
+                defer allocator.free(shot.png);
+                writePng(if (index == 0) "zig-out/smoke-e2e-kill-images-split.png" else "zig-out/smoke-e2e-kill-images-tab.png", shot.png);
+            } else |_| return "Kill Session: image screenshot failed";
+            std.debug.print("smoke-e2e: Kill Session: 48 animated images visible; {d} frames before opening menu\n", .{app.winById(win).?.frames - frame_before});
+        }
+        app.focusWindow(win) catch return "Kill Session: seat focus failed";
+        app.clickEx(win, width * (if (index == 0) @as(f64, 0.75) else 0.5), height * 0.5, 3, 100, 1) catch return "Kill Session: right-click failed";
+        const menu = waitPopup(app, true, 10_000) orelse return "Kill Session: right-click opened no menu";
+        const session_row = waitOcrWordCenter(allocator, app, menu, "Session", 10_000) orelse return "Kill Session: menu has no Session row";
+        app.clickEx(menu, session_row.x, session_row.y, 1, 100, 1) catch return "Kill Session: Session submenu click failed";
+        const submenu = blk: {
+            const deadline = clock.nowMs() + 10_000;
+            while (clock.nowMs() < deadline) {
+                _ = app.pumpOnce(200);
+                for (app.windows.items) |w| {
+                    if (w.popup and w.id != menu and w.frames > 0) break :blk w.id;
+                }
+            }
+            return "Kill Session: Session submenu never mapped";
+        };
+        const kill_row = waitOcrWordCenter(allocator, app, submenu, "Kill", 10_000) orelse return "Kill Session: submenu has no Kill row";
+        if (app.screenshotPng(submenu, 1024, null, 0)) |shot| {
+            defer allocator.free(shot.png);
+            writePng(if (index == 0) "zig-out/smoke-e2e-kill-split.png" else "zig-out/smoke-e2e-kill-tab.png", shot.png);
+        } else |_| return "Kill Session: submenu screenshot failed";
+        say(if (index == 0) "Kill Session: clicking split target's real Kill Session row" else "Kill Session: clicking whole-tab target's real Kill Session row");
+        app.clickEx(submenu, kill_row.x, kill_row.y, 1, 100, 1) catch return "Kill Session: Kill row click failed";
+        _ = app.drainLive(1_000);
+        var status: c_int = 0;
+        if (c.waitpid(child_pid, &status, c.WNOHANG) == child_pid) {
+            const dead_pid = child_pid;
+            child_pid = 0;
+            return whyf("Kill Session: {s} GUI pid {d} exited, wait status {d}, signal {d}; crash record on stderr above", .{ session, dead_pid, status, if (c.WIFSIGNALED(status)) c.WTERMSIG(status) else @as(c_int, 0) });
+        }
+        if (!waitPaneGone(allocator, sock_path, target, 10_000)) return "Kill Session: target pane survived or GUI stopped responding";
+        if (!waitMuxSessionGone(allocator, mux_sock, session)) return "Kill Session: target durable session survived on daemon";
+        if (transport == .ssh or transport == .auto) {
+            const deadline = clock.nowMs() + 10_000;
+            while (!pidGone(proxy_pid) and clock.nowMs() < deadline) _ = app.pumpOnce(100);
+            if (!pidGone(proxy_pid)) return "Kill Session: detached SSH proxy did not exit after teardown";
+            std.debug.print("smoke-e2e: Kill Session: detached SSH proxy pid {d} is gone\n", .{proxy_pid});
+        }
+        if (waitPopup(app, false, 10_000) == null) return "Kill Session: menu remained open after target teardown";
+        const remaining = listedPaneIds(allocator, sock_path) orelse return "Kill Session: GUI stopped answering list";
+        defer allocator.free(remaining);
+        if (!samePaneIds(survivor_ids, remaining)) return "Kill Session: killing target changed survivor panes";
+        const survivor_focus = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{survivor}) catch return "Kill Session: survivor focus format";
+        const refocused = roundtrip(allocator, sock_path, survivor_focus) orelse return "Kill Session: survivor focus failed";
+        defer allocator.free(refocused);
+        _ = app.drainLive(1_000);
+        const marker = if (index == 0) "KILLSPLITSURVIVOR" else "KILLTABSURVIVOR";
+        const command = std.fmt.bufPrint(&req_buf, "printf '%s%s\\n' '{s}' 'OK'\n", .{marker}) catch return "Kill Session: marker format";
+        app.typeText(win, command) catch return "Kill Session: survivor real input failed";
+        const output = std.fmt.bufPrint(&req_buf, "{s}OK", .{marker}) catch return "Kill Session: output format";
+        if (!waitPaneText(allocator, sock_path, survivor, output, 10_000)) return "Kill Session: survivor did not execute real typed input";
+        say(if (index == 0) "Kill Session: split removed, daemon session gone, survivor executed KILLSPLITSURVIVOROK" else "Kill Session: whole tab removed, daemon session gone, survivor executed KILLTABSURVIVOROK");
+        const second_focus = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"focus\",\"pane\":{d}}}\n", .{second_pane}) catch return "Kill Session: second focus format";
+        const second_focused = roundtrip(allocator, sock_path, second_focus) orelse return "Kill Session: second window stopped responding";
+        defer allocator.free(second_focused);
+        app.focusWindow(second_win) catch return "Kill Session: second-window seat focus failed";
+        app.typeText(second_win, if (index == 0) "printf '%s%s\\n' SECOND SPLITOK\n" else "printf '%s%s\\n' SECOND TABOK\n") catch return "Kill Session: second-window input failed";
+        if (!waitPaneText(allocator, sock_path, second_pane, if (index == 0) "SECONDSPLITOK" else "SECONDTABOK", 10_000)) return "Kill Session: second window did not execute input";
+        say("Kill Session: second window executed fresh real-keyboard input after target teardown");
+        const restored = roundtrip(allocator, sock_path, primary_focus) orelse return "Kill Session: restoring primary window failed";
+        defer allocator.free(restored);
+        app.focusWindow(win) catch return "Kill Session: restoring primary seat focus failed";
+        _ = app.drainLive(1_000);
+    }
+    return null;
 }
 
 /// The pane's context menu on the REAL seat: a right-click and

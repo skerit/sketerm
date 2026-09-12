@@ -49,8 +49,8 @@ fn textBlendMode(v: @import("../config.zig").TextBlending) @import("../render/bl
 }
 
 /// A toplevel frame-clock tick invalidates every offload subsurface.
-fn graphicsOffloadEnabled(config: *const Config, continuous_frames: bool) bool {
-    return config.graphics_offload and !continuous_frames;
+fn graphicsOffloadEnabled(config: *const Config, continuous_frames: bool, mapped: bool) bool {
+    return config.graphics_offload and !continuous_frames and mapped;
 }
 
 /// The single owner of the offload decision: one frame clock drives
@@ -60,11 +60,14 @@ fn graphicsOffloadEnabled(config: *const Config, continuous_frames: bool) bool {
 /// restores (render_kick.resumeOffloads).
 pub fn syncWindowGraphicsOffload(self: *Window) void {
     const continuous = for (self.panes.items) |pane| {
+        if (pane.widgets_dead or pane.isSeveringFaces() or pane.surface.callbacks_severed) continue;
         if (pane.surface.continuousFramesActive()) break true;
     } else false;
-    const want = graphicsOffloadEnabled(&self.config, continuous);
     const dialog_active = render_kick.dialogActive(self.app_window);
     for (self.panes.items) |pane| {
+        // A takeover maps its replacement before unlisting the old pane.
+        if (pane.widgets_dead or pane.isSeveringFaces() or pane.surface.callbacks_severed) continue;
+        const want = graphicsOffloadEnabled(&self.config, continuous, c.gtk_widget_get_mapped(@ptrCast(pane.surface.area)) != 0);
         if (want and dialog_active)
             pane.deferGraphicsOffloadEnable()
         else
@@ -1067,18 +1070,21 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
 
 test "continuous shader animation suppresses graphics offload" {
     var config: Config = .{};
-    try std.testing.expect(graphicsOffloadEnabled(&config, false));
-    try std.testing.expect(!graphicsOffloadEnabled(&config, true));
+    try std.testing.expect(graphicsOffloadEnabled(&config, false, true));
+    try std.testing.expect(!graphicsOffloadEnabled(&config, true, true));
+    try std.testing.expect(!graphicsOffloadEnabled(&config, false, false));
+    try std.testing.expect(!graphicsOffloadEnabled(&config, true, false));
 
     // The reported continuous state decides, not the global animation
     // flag: named presets animate via preset.animate regardless of it.
     config.custom_shader_animation = true;
-    try std.testing.expect(graphicsOffloadEnabled(&config, false));
-    try std.testing.expect(!graphicsOffloadEnabled(&config, true));
+    try std.testing.expect(graphicsOffloadEnabled(&config, false, true));
+    try std.testing.expect(!graphicsOffloadEnabled(&config, true, true));
+    try std.testing.expect(!graphicsOffloadEnabled(&config, false, false));
 
     config.custom_shader_animation = false;
     config.graphics_offload = false;
-    try std.testing.expect(!graphicsOffloadEnabled(&config, false));
+    try std.testing.expect(!graphicsOffloadEnabled(&config, false, true));
 }
 
 /// Write the live config back to the file the process reads — the

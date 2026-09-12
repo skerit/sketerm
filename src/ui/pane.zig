@@ -858,6 +858,21 @@ pub const Pane = struct {
         const was_severing = self.severing_faces;
         self.severing_faces = true;
         defer self.severing_faces = was_severing;
+        if (!self.widgets_dead and !self.surface.callbacks_severed) {
+            self.setGraphicsOffload(false);
+            detachA11y(self);
+            inline for (.{ &onAreaMap, &onAreaUnmap }) |handler| {
+                _ = c.g_signal_handlers_disconnect_matched(
+                    @ptrCast(self.surface.area),
+                    c.G_SIGNAL_MATCH_FUNC | c.G_SIGNAL_MATCH_DATA,
+                    0,
+                    0,
+                    null,
+                    @ptrCast(@constCast(handler)),
+                    @ptrCast(self),
+                );
+            }
+        }
         self.surface.sever(self.widgets_dead);
         self.detachIm();
         self.detachBrowser();
@@ -2375,6 +2390,8 @@ test "appendShellQuoted passes safe paths bare, quotes the rest" {
 
 fn onAreaMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
+    // Re-enable only through window policy (animation/dialogs may forbid it).
+    onSurfaceContinuousFrames(user);
     // Tick/animation resume is the surface's own map handler. The
     // window's GdkMacosSurface now has its NSWindow; expose the
     // pane's text to VoiceOver. No-op on Linux.
@@ -2383,6 +2400,9 @@ fn onAreaMap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
 
 fn onAreaUnmap(_: *c.GtkWidget, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(Pane, user);
+    // GTK requests frame callbacks even for unmapped offload subsurfaces.
+    // Retire ours now, before hidden tabs accumulate a teardown-time burst.
+    self.setGraphicsOffload(false);
     // Reparent (tab move / split) unmaps before unrealizing, and a
     // closed pane unmaps too — drop the AX element from the old window's
     // content view so a later map re-attaches against the right one.
