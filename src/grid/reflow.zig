@@ -57,7 +57,7 @@ fn isValidWidePair(cells: []const Cell, left: usize) bool {
 }
 
 /// Exclude the structural blank left when a wide pair wrapped early.
-fn logicalRowLen(rows: []const Line, row: usize) usize {
+pub fn logicalRowLen(rows: []const Line, row: usize) usize {
     const cells = rows[row].cells;
     if (cells.len == 0 or row + 1 >= rows.len) return cells.len;
     const next = rows[row + 1];
@@ -247,15 +247,16 @@ pub fn positionInLogicals(rows: []const Line, row: usize, col: u16) struct { idx
     return .{ .idx = idx, .col = col_in };
 }
 
-/// Inverse: given (logical_idx, col_in_logical), find which post-
-/// rechunk row + col it lands at.
+pub const Position = struct { row: usize, col: u16 };
+
+/// Map a logical position to its rewrapped row and column.
 pub fn positionAfterRechunk(
     logicals: []const Logical,
     rechunked: []const Line,
     target_idx: usize,
     target_col: u32,
     new_cols: u16,
-) struct { row: usize, col: u16 } {
+) Position {
     if (rechunked.len == 0 or new_cols == 0) return .{ .row = 0, .col = 0 };
     if (target_idx >= logicals.len) {
         return .{ .row = rechunked.len - 1, .col = @intCast(@min(new_cols - 1, target_col)) };
@@ -276,51 +277,67 @@ pub fn positionAfterRechunk(
     }
     if (!found) return .{ .row = rechunked.len - 1, .col = new_cols - 1 };
 
-    const cells = logicals[target_idx].cells.items;
-    const width: usize = new_cols;
-    var source: usize = 0;
-    var row = start_row;
-    var col: usize = 0;
-    while (source < cells.len) {
-        if (isValidWidePair(cells, source)) {
-            // Mirror `rechunk`: at width 1 the pair collapses into one
-            // narrow cell. Walking it as two would push `col` past
-            // `width`, and `width - col` then underflows.
-            if (width < 2) {
-                if (target_col == @as(u32, @intCast(source)) or
-                    target_col == @as(u32, @intCast(source + 1)))
-                    return .{ .row = row, .col = 0 };
-                source += 2;
-                col += 1;
-                if (col == width and source < cells.len) {
+    var cursor = PositionCursor{ .row = start_row };
+    return cursor.seek(logicals[target_idx].cells.items, target_col, new_cols, rechunked.len);
+}
+
+/// Map nondecreasing source columns without rescanning a long logical line.
+pub const PositionCursor = struct {
+    source: usize = 0,
+    row: usize = 0,
+    col: usize = 0,
+
+    pub fn seek(self: *PositionCursor, cells: []const Cell, target_col: u32, new_cols: u16, row_count: usize) Position {
+        var source = self.source;
+        var row = self.row;
+        var col = self.col;
+        defer {
+            self.source = source;
+            self.row = row;
+            self.col = col;
+        }
+        const width: usize = new_cols;
+        while (source < cells.len) {
+            if (isValidWidePair(cells, source)) {
+                // Mirror `rechunk`: at width 1 the pair collapses into one
+                // narrow cell. Walking it as two would push `col` past
+                // `width`, and `width - col` then underflows.
+                if (width < 2) {
+                    if (target_col == @as(u32, @intCast(source)) or
+                        target_col == @as(u32, @intCast(source + 1)))
+                        return .{ .row = row, .col = 0 };
+                    source += 2;
+                    col += 1;
+                    if (col == width and source < cells.len) {
+                        row += 1;
+                        col = 0;
+                    }
+                    continue;
+                }
+                if (width - col < 2) {
                     row += 1;
                     col = 0;
                 }
-                continue;
+                if (target_col == @as(u32, @intCast(source))) return .{ .row = row, .col = @intCast(col) };
+                if (target_col == @as(u32, @intCast(source + 1))) return .{ .row = row, .col = @intCast(col + 1) };
+                source += 2;
+                col += 2;
+            } else {
+                if (target_col == @as(u32, @intCast(source))) return .{ .row = row, .col = @intCast(col) };
+                source += 1;
+                col += 1;
             }
-            if (width - col < 2) {
+            if (col == width and source < cells.len) {
                 row += 1;
                 col = 0;
             }
-            if (target_col == @as(u32, @intCast(source))) return .{ .row = row, .col = @intCast(col) };
-            if (target_col == @as(u32, @intCast(source + 1))) return .{ .row = row, .col = @intCast(col + 1) };
-            source += 2;
-            col += 2;
-        } else {
-            if (target_col == @as(u32, @intCast(source))) return .{ .row = row, .col = @intCast(col) };
-            source += 1;
-            col += 1;
         }
-        if (col == width and source < cells.len) {
-            row += 1;
-            col = 0;
-        }
-    }
 
-    const beyond = target_col -| @as(u32, @intCast(cells.len));
-    const end_col = if (col >= width) width - 1 else @min(width - 1, col + @as(usize, beyond));
-    return .{ .row = @min(row, rechunked.len - 1), .col = @intCast(end_col) };
-}
+        const beyond = target_col -| @as(u32, @intCast(cells.len));
+        const end_col = if (col >= width) width - 1 else @min(width - 1, col + @as(usize, beyond));
+        return .{ .row = @min(row, row_count - 1), .col = @intCast(end_col) };
+    }
+};
 
 // ── Tests ──────────────────────────────────────────────────────────
 
@@ -531,6 +548,35 @@ test "positionAfterRechunk stays in range on a one-column grid" {
         const p = positionAfterRechunk(logicals.items, rows, 0, col, 1);
         try testing.expectEqual(@as(u16, 0), p.col);
         try testing.expect(p.row < rows.len);
+    }
+}
+
+test "PositionCursor incremental seeks match independent mapping across wide pairs and padding" {
+    const a = testing.allocator;
+    var row = try makeRow(a, "abcdefghi", 9, false);
+    defer row.deinit(a);
+    putWide(row.cells, 2, 0x754C);
+    putWide(row.cells, 6, 0x754D);
+    var logicals = try build(a, &.{row}, false);
+    defer {
+        for (logicals.items) |*ll| ll.cells.deinit(a);
+        logicals.deinit(a);
+    }
+    for ([_]u16{ 1, 2, 3, 4, 10 }) |width| {
+        const rows = try rechunk(a, logicals.items, width);
+        defer {
+            for (rows) |*ln| ln.deinit(a);
+            a.free(rows);
+        }
+        var cursor = PositionCursor{};
+        for (0..15) |col| {
+            const expected = positionAfterRechunk(logicals.items, rows, 0, @intCast(col), width);
+            for (0..2) |_| {
+                const actual = cursor.seek(logicals.items[0].cells.items, @intCast(col), width, rows.len);
+                try testing.expectEqual(expected.row, actual.row);
+                try testing.expectEqual(expected.col, actual.col);
+            }
+        }
     }
 }
 

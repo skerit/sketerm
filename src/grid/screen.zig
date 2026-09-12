@@ -736,6 +736,8 @@ pub const Screen = struct {
         col: u16,
         /// Kitty graphics image_id (0 = sixel/iterm2/anonymous).
         image_id: u32 = 0,
+        /// Placement selector retained independently of evictable source pixels.
+        image_number: u32 = 0,
         /// Kitty graphics placement_id.
         placement_id: u32 = 0,
         /// Z-index for stacking.
@@ -774,10 +776,14 @@ pub const Screen = struct {
     /// oldest placements are dropped (they reappear when the app
     /// redraws). Must leave room under the 16 MB wire frame cap.
     pub const RETAIN_IMAGE_BUDGET: usize = 12 * 1024 * 1024;
+    /// Bound metadata and snapshot overhead even for empty pixel payloads.
+    pub const RETAIN_IMAGE_COUNT: usize = 4096;
 
     /// Emit an image to the sink, retaining a copy when configured.
     fn emitImage(self: *Screen, ev_in: ImageEvent) void {
         var ev = ev_in;
+        if (ev.image_number == 0 and ev.image_id != 0)
+            ev.image_number = self.kitty_images.numberOf(ev.image_id);
         // Anchor to the stable line id of the placement's top row so the
         // renderer can track it through scroll + scrollback. Guard the
         // row against the buffer bounds; 0 leaves it pinned.
@@ -809,58 +815,89 @@ pub const Screen = struct {
         // guard and the placement_id rule mirror that function exactly;
         // anonymous placements (sixel, iTerm2) legitimately stack.
         if (ev.image_id != 0) {
-            var i: usize = 0;
-            while (i < self.retained_images.items.len) {
-                const old = self.retained_images.items[i];
+            var kept: usize = 0;
+            for (self.retained_images.items) |old| {
                 const same_pid = (ev.placement_id == 0 and old.ev.placement_id == 0) or
                     old.ev.placement_id == ev.placement_id;
                 if (old.ev.image_id == ev.image_id and same_pid) {
                     self.retained_image_bytes -= old.owned.len;
                     self.allocator.free(old.owned);
-                    _ = self.retained_images.orderedRemove(i);
-                } else i += 1;
+                } else {
+                    self.retained_images.items[kept] = old;
+                    kept += 1;
+                }
             }
+            self.retained_images.items.len = kept;
         }
         self.retained_images.appendAssumeCapacity(.{ .ev = copy, .owned = owned });
         self.retained_image_bytes += owned.len;
-        while (self.retained_image_bytes > RETAIN_IMAGE_BUDGET and self.retained_images.items.len > 0) {
-            const old = self.retained_images.orderedRemove(0);
+        self.trimRetainedImages();
+    }
+
+    fn trimRetainedImages(self: *Screen) void {
+        var dropped: usize = 0;
+        while (self.retained_image_bytes > RETAIN_IMAGE_BUDGET or
+            self.retained_images.items.len - dropped > RETAIN_IMAGE_COUNT)
+        {
+            const old = self.retained_images.items[dropped];
             self.retained_image_bytes -= old.owned.len;
             self.allocator.free(old.owned);
+            dropped += 1;
+        }
+        if (dropped > 0) {
+            const items = self.retained_images.items;
+            std.mem.copyForwards(RetainedImage, items, items[dropped..]);
+            self.retained_images.items.len -= dropped;
         }
     }
 
     /// Prune retained placements to mirror a delete command.
     fn pruneRetainedImages(self: *Screen, ev: ImageDeleteEvent) void {
         if (!self.retain_images or self.retained_images.items.len == 0) return;
-        var i: usize = 0;
-        while (i < self.retained_images.items.len) {
-            const ri = self.retained_images.items[i].ev;
+        // Older snapshots may predate the placement-count cap.
+        self.trimRetainedImages();
+        var anchor_storage: [RETAIN_IMAGE_COUNT]LineIdRequest = undefined;
+        const anchors = anchor_storage[0..self.retained_images.items.len];
+        const positional = switch (ev.what) {
+            'c', 'C', 'p', 'P', 'q', 'Q', 'x', 'X', 'y', 'Y' => true,
+            else => false,
+        };
+        if (positional) {
+            for (self.retained_images.items, anchors) |ri, *request| request.* = .{ .line_id = ri.ev.anchor_id };
+            self.resolveLineIdRows(anchors);
+        }
+        var kept: usize = 0;
+        for (self.retained_images.items, 0..) |old, index| {
+            const ri = old.ev;
             // Retained images know where they were placed, so every
             // positional selector can be answered here. Cell extent is
             // whatever the placement asked for; a native-size image
             // (cells 0) still occupies its top-left cell.
             const cols: i32 = cellExtent(ri.cells_wide);
             const rows: i32 = cellExtent(ri.cells_high);
+            const row: ?i32 = if (!positional or ri.anchor_id == 0) @intCast(ri.row) else anchors[index].row;
             const hit = if (ev.what == 'a' or ev.what == 'A')
                 (ev.image_id == 0 or ri.image_id == ev.image_id)
             else
-                ev.selects(
+                row != null and ev.selects(
                     ri.image_id,
                     ri.placement_id,
-                    self.kitty_images.numberOf(ri.image_id),
+                    ri.image_number,
                     ri.z_index,
                     @intCast(ri.col),
-                    @intCast(ri.row),
+                    row orelse 0,
                     cols,
                     rows,
                 );
             if (hit) {
-                const old = self.retained_images.orderedRemove(i);
                 self.retained_image_bytes -= old.owned.len;
                 self.allocator.free(old.owned);
-            } else i += 1;
+            } else {
+                self.retained_images.items[kept] = old;
+                kept += 1;
+            }
         }
+        self.retained_images.items.len = kept;
     }
 
     pub fn clearRetainedImages(self: *Screen) void {
@@ -1231,10 +1268,7 @@ pub const Screen = struct {
         return true;
     }
 
-    /// `rowForLineId` with a binary search over scrollback (lines
-    /// land there in birth order, so IDs are sorted). Falls back to
-    /// the linear walk if the sorted assumption ever fails (reflow
-    /// edge cases) — correctness over speed.
+    /// Binary-search common ordered history, falling back for reordered IDs; use resolveLineIdRows for batches.
     pub fn rowForLineIdFast(self: *const Screen, line_id: u64) ?i32 {
         if (line_id == 0 or self.use_alt) return self.rowForLineId(line_id);
         for (self.active, 0..) |l, i| {
@@ -1255,6 +1289,52 @@ pub const Screen = struct {
             }
         }
         return self.rowForLineId(line_id);
+    }
+
+    pub const LineIdRequest = struct {
+        line_id: u64,
+        row: ?i32 = null,
+        /// Resolver-owned scratch used to restore caller order.
+        input_index: usize = 0,
+
+        fn byId(_: void, a: @This(), b: @This()) bool {
+            return a.line_id < b.line_id;
+        }
+
+        fn byInput(_: void, a: @This(), b: @This()) bool {
+            return a.input_index < b.input_index;
+        }
+    };
+
+    /// Resolve exact terminal rows in caller order without allocation or assumptions about history ID ordering.
+    pub fn resolveLineIdRows(self: *const Screen, requests: []LineIdRequest) void {
+        if (requests.len == 0) return;
+        for (requests, 0..) |*request, index| {
+            request.row = null;
+            request.input_index = index;
+        }
+        std.mem.sort(LineIdRequest, requests, {}, LineIdRequest.byId);
+        const lines = if (self.use_alt) self.alt.? else self.active;
+        const sb_count = if (self.use_alt) 0 else self.scrollbackCount();
+        // Reverse scrolling and partial-region edits can put newer IDs before
+        // older ones. Search the sorted requests, not the history, once per row.
+        for (0..lines.len + sb_count) |index| {
+            const active = index < lines.len;
+            const ln = if (active) &lines[index] else self.scrollbackLine(@intCast(index - lines.len));
+            if (ln.id == 0) continue;
+            var lo: usize = 0;
+            var hi = requests.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (requests[mid].line_id < ln.id) lo = mid + 1 else hi = mid;
+            }
+            const row: i32 = if (active) @intCast(index) else @intCast(@as(i64, @intCast(index - lines.len)) - sb_count);
+            while (lo < requests.len and requests[lo].line_id == ln.id) : (lo += 1) {
+                // Match rowForLineId's active-first semantics, including duplicates.
+                if (requests[lo].row == null) requests[lo].row = row;
+            }
+        }
+        std.mem.sort(LineIdRequest, requests, {}, LineIdRequest.byInput);
     }
 
     /// Locate the display row containing `line_id`, including
@@ -1644,13 +1724,13 @@ pub const Screen = struct {
         const old_active = self.active;
         var old_scrollback = self.scrollback;
 
+        try self.reanchorRetainedImages(combined.items, logicals.items, all_rows, sb_rows, new_rows, new_cols);
         self.active = new_active;
         self.scrollback = new_scrollback;
         self.scrollback_head = 0;
         self.row = replacement_row;
         self.col = replacement_col;
         self.next_line_id = next_line_id;
-        self.reanchorRetainedImages(combined.items, logicals.items, all_rows, sb_rows, new_rows, new_cols);
 
         if (cluster_moves.items.len > 0) {
             self.clusters.clearRetainingCapacity();
@@ -1669,14 +1749,7 @@ pub const Screen = struct {
         old_scrollback.deinit(self.allocator);
     }
 
-    /// Every reflowed row carries a FRESH line id, so a retained
-    /// placement's anchor would name a line that no longer exists and
-    /// the next attach would evict every image the session had. Map
-    /// each anchor through the same logical-line bookkeeping the
-    /// cursor and clusters use: the old line's index in `combined`, its
-    /// logical position, its row after rechunking, that row's new id.
-    /// An anchor absent from `combined` had already left the ring.
-    /// Cannot fail: removal only frees.
+    /// Stage mapping allocations before changing anchors, then compact dead placements in replay order.
     fn reanchorRetainedImages(
         self: *Screen,
         combined: []const Line,
@@ -1685,37 +1758,86 @@ pub const Screen = struct {
         sb_rows: usize,
         new_rows: u16,
         new_cols: u16,
-    ) void {
+    ) !void {
         const reflow = @import("reflow.zig");
-        var i: usize = 0;
-        while (i < self.retained_images.items.len) {
-            const ri = &self.retained_images.items[i];
-            var found: ?usize = null;
-            if (ri.ev.anchor_id != 0) {
-                for (combined, 0..) |ln, idx| {
-                    if (ln.id == ri.ev.anchor_id) {
-                        found = idx;
-                        break;
-                    }
-                }
+        if (self.retained_images.items.len == 0) return;
+        const Source = struct { idx: usize = std.math.maxInt(usize), col: u32 = 0, len: usize = 0 };
+        var anchors: std.AutoHashMapUnmanaged(u64, Source) = .empty;
+        defer anchors.deinit(self.allocator);
+        for (self.retained_images.items) |ri| {
+            if (ri.ev.anchor_id != 0) try anchors.put(self.allocator, ri.ev.anchor_id, .{});
+        }
+        var source: Source = .{ .idx = 0 };
+        for (combined, 0..) |ln, row| {
+            if (row > 0 and !ln.continues_above) {
+                source.idx += 1;
+                source.col = 0;
             }
-            const old_idx = found orelse {
-                self.retained_image_bytes -= ri.owned.len;
-                self.allocator.free(ri.owned);
-                _ = self.retained_images.orderedRemove(i);
+            source.len = reflow.logicalRowLen(combined, row);
+            if (anchors.getPtr(ln.id)) |value| value.* = source;
+            source.col += @intCast(source.len);
+        }
+        const Request = struct {
+            image: usize,
+            source: Source,
+
+            fn lessThan(_: void, a: @This(), b: @This()) bool {
+                return a.source.idx < b.source.idx or
+                    (a.source.idx == b.source.idx and a.source.col < b.source.col);
+            }
+        };
+        const requests = try self.allocator.alloc(Request, self.retained_images.items.len);
+        defer self.allocator.free(requests);
+        for (self.retained_images.items, requests, 0..) |ri, *request, image| {
+            var pos = anchors.get(ri.ev.anchor_id) orelse Source{};
+            pos.col += @intCast(@min(@as(usize, ri.ev.col), pos.len));
+            request.* = .{ .image = image, .source = pos };
+        }
+        std.mem.sort(Request, requests, {}, Request.lessThan);
+
+        // Requests are monotonic in logical position: both row discovery and
+        // cell mapping advance only once, even on a single huge wrapped line.
+        var logical_idx: usize = 0;
+        var start_row: usize = 0;
+        var cursor = reflow.PositionCursor{};
+        const first_kept = sb_rows - @min(sb_rows, self.scrollback_capacity);
+        for (requests) |request| {
+            const ri = &self.retained_images.items[request.image];
+            const pos = request.source;
+            if (pos.idx == std.math.maxInt(usize) or all_rows.len == 0) {
+                ri.ev.anchor_id = 0;
                 continue;
+            }
+            const dest: reflow.Position = if (pos.idx >= logicals.len)
+                .{ .row = all_rows.len - 1, .col = @as(u16, @intCast(@min(new_cols - 1, pos.col))) }
+            else dest: {
+                while (logical_idx < pos.idx) {
+                    start_row += 1;
+                    while (start_row < all_rows.len and all_rows[start_row].continues_above) start_row += 1;
+                    logical_idx += 1;
+                    cursor = .{ .row = start_row };
+                }
+                break :dest cursor.seek(logicals[pos.idx].cells.items, pos.col, new_cols, all_rows.len);
             };
-            const source = reflow.positionInLogicals(combined, old_idx, ri.ev.col);
-            const dest = reflow.positionAfterRechunk(logicals, all_rows, source.idx, source.col, new_cols);
-            if (dest.row < all_rows.len) ri.ev.anchor_id = all_rows[dest.row].id;
+            ri.ev.anchor_id = if (dest.row < first_kept) 0 else all_rows[dest.row].id;
             ri.ev.col = dest.col;
             if (dest.row >= sb_rows and dest.row - sb_rows < new_rows) {
                 ri.ev.row = @intCast(dest.row - sb_rows);
             } else {
                 ri.ev.row = 0;
             }
-            i += 1;
         }
+        var kept: usize = 0;
+        for (self.retained_images.items) |ri| {
+            if (ri.ev.anchor_id == 0) {
+                self.retained_image_bytes -= ri.owned.len;
+                self.allocator.free(ri.owned);
+            } else {
+                self.retained_images.items[kept] = ri;
+                kept += 1;
+            }
+        }
+        self.retained_images.items.len = kept;
     }
 
     /// A row's cells re-laid at `new_cols`, truncating or blank-padding.
@@ -3314,10 +3436,7 @@ pub const Screen = struct {
                 .id_lo = cmd.src_x,
                 .id_hi = if (cmd.src_y == 0) std.math.maxInt(u32) else cmd.src_y,
             };
-            // Placements first, source data second: the `n/N`
-            // selector resolves an image's NUMBER through
-            // `kitty_images`, so dropping the source first would make
-            // every retained placement look like number 0 and survive.
+            // Placements own their number selector even after source eviction.
             self.pruneRetainedImages(del_ev);
             if (self.sink.on_image_delete_full) |f| f(self.sink.ctx, del_ev);
             // Uppercase also frees the source data. Which images that
@@ -4498,7 +4617,6 @@ pub const Screen = struct {
     const sgr = screen_ops.sgr;
     const compactStylePool = screen_ops.compactStylePool;
 
-
     // ── Debug ────────────────────────────────────────────────────
 
     /// Dump the active screen to a writer for tests / debugging.
@@ -5078,7 +5196,7 @@ test "resize keeps tab_stops sized to cols under every allocation failure" {
         defer p2.deinit();
         var s2 = try Screen.init(t.allocator, &p2, 40, 6);
         defer s2.deinit();
-            var failing = t.FailingAllocator.init(t.allocator, config);
+        var failing = t.FailingAllocator.init(t.allocator, config);
         s2.allocator = failing.allocator();
         const result = s2.resize(400, 6);
         s2.allocator = t.allocator;
@@ -8952,6 +9070,341 @@ test "emitImage retains one placement per (image_id, placement_id), not one per 
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 0 });
     s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 0 });
     try std.testing.expectEqual(@as(usize, 5), s.retained_images.items.len);
+}
+
+test "retained image count bounds empty and tiny anonymous placements in FIFO order" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 8, 2);
+    defer s.deinit();
+    s.retain_images = true;
+    const px = [_]u8{ 1, 2, 3, 4 };
+    for (0..Screen.RETAIN_IMAGE_COUNT + 100) |i| {
+        s.emitImage(.{ .width = 1, .height = 1, .rgba = if (i % 2 == 0) &.{} else &px, .row = 0, .col = 0, .placement_id = @intCast(i) });
+    }
+    try std.testing.expectEqual(Screen.RETAIN_IMAGE_COUNT, s.retained_images.items.len);
+    try std.testing.expectEqual(Screen.RETAIN_IMAGE_COUNT / 2 * px.len, s.retained_image_bytes);
+    for (s.retained_images.items, 100..) |ri, expected| {
+        try std.testing.expectEqual(expected, ri.ev.placement_id);
+    }
+    s.pruneRetainedImages(.{ .what = 'a' });
+    try std.testing.expectEqual(@as(usize, 0), s.retained_images.items.len);
+    try std.testing.expectEqual(@as(usize, 0), s.retained_image_bytes);
+}
+
+test "retained image byte eviction compacts a prefix and delete preserves survivor order" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 8, 2);
+    defer s.deinit();
+    s.retain_images = true;
+    const px = [_]u8{ 1, 2, 3, 4 };
+    for (0..100) |i| {
+        s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 0, .placement_id = @intCast(i), .z_index = @intCast(i % 2) });
+    }
+    const large = try std.testing.allocator.alloc(u8, Screen.RETAIN_IMAGE_BUDGET - 16);
+    defer std.testing.allocator.free(large);
+    @memset(large, 0);
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = large, .row = 0, .col = 0, .placement_id = 100, .z_index = 1 });
+    try std.testing.expectEqual(@as(usize, 5), s.retained_images.items.len);
+    try std.testing.expectEqual(Screen.RETAIN_IMAGE_BUDGET, s.retained_image_bytes);
+    s.pruneRetainedImages(.{ .what = 'z', .z = 1 });
+    try std.testing.expectEqual(@as(usize, 2), s.retained_images.items.len);
+    try std.testing.expectEqual(@as(u32, 96), s.retained_images.items[0].ev.placement_id);
+    try std.testing.expectEqual(@as(u32, 98), s.retained_images.items[1].ev.placement_id);
+    try std.testing.expectEqual(@as(usize, 8), s.retained_image_bytes);
+}
+
+test "retained positional deletion follows anchors rather than stale rows or viewport" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 8, 3);
+    defer s.deinit();
+    try s.setScrollbackCapacity(8);
+    s.retain_images = true;
+    const px = [_]u8{ 1, 2, 3, 4 };
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 2, .col = 0, .image_id = 1 });
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 1, .image_id = 2, .cells_high = 2 });
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 2, .col = 2, .image_id = 3, .anchor_id = std.math.maxInt(u64) });
+    s.scrollUp(1);
+    s.view_offset = 1;
+    s.pruneRetainedImages(.{ .what = 'p', .x = 0, .y = 2 });
+    try std.testing.expectEqual(@as(usize, 3), s.retained_images.items.len);
+    s.pruneRetainedImages(.{ .what = 'p', .x = 0, .y = 1 });
+    try std.testing.expectEqual(@as(usize, 2), s.retained_images.items.len);
+    // The top anchor is in history, but its second cell row is still live.
+    s.pruneRetainedImages(.{ .what = 'p', .x = 1, .y = 0 });
+    try std.testing.expectEqual(@as(usize, 1), s.retained_images.items.len);
+    s.pruneRetainedImages(.{ .what = 'y', .y = 2 });
+    try std.testing.expectEqual(@as(u32, 3), s.retained_images.items[0].ev.image_id);
+    s.pruneRetainedImages(.{ .what = 'i', .image_id = 3 });
+    try std.testing.expectEqual(@as(usize, 0), s.retained_image_bytes);
+}
+
+test "retained positional deletion succeeds with all allocations denied" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    for ("cCpPqQxXyY") |what| {
+        var s = try Screen.init(std.testing.allocator, &pool, 8, 3);
+        defer s.deinit();
+        try s.setScrollbackCapacity(8);
+        s.retain_images = true;
+        const px = [_]u8{ 1, 2, 3, 4 };
+        s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 2, .col = 1, .z_index = 2 });
+        s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 1, .z_index = 2, .cells_high = 3 });
+        s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 1, .z_index = 2 });
+        s.retained_images.items[2].ev.anchor_id = 0; // Legacy pinned placement.
+        s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 1, .z_index = 2, .anchor_id = std.math.maxInt(u64) });
+        s.scrollUp(1);
+        s.view_offset = 1;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+        s.allocator = failing.allocator();
+        s.pruneRetainedImages(.{ .what = what, .x = 1, .y = 1, .z = 2 });
+        s.allocator = std.testing.allocator;
+        try std.testing.expect(!failing.has_induced_failure);
+        try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+        try std.testing.expectEqual(@as(usize, 1), s.retained_images.items.len);
+        try std.testing.expectEqual(@as(usize, 4), s.retained_image_bytes);
+        try std.testing.expectEqual(std.math.maxInt(u64), s.retained_images.items[0].ev.anchor_id);
+    }
+}
+
+test "batch line lookup resolves unordered large history duplicates and missing anchors without allocation" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 2, 3);
+    defer s.deinit();
+    try s.setScrollbackCapacity(70000);
+    const missing = s.nextLineId();
+    for (0..70000) |_| s.scrollUp(1);
+    const evicted = s.scrollbackLine(0).id;
+    s.scrollDown(1);
+    s.scrollUp(2);
+    try std.testing.expect(s.scrollback_head != 0);
+    // A real reverse-scroll produces nonmonotonic history, not just a fixture edit.
+    try std.testing.expect(s.scrollbackLine(69998).id > s.scrollbackLine(69999).id);
+    var requests: [Screen.RETAIN_IMAGE_COUNT]Screen.LineIdRequest = undefined;
+    var expected: [Screen.RETAIN_IMAGE_COUNT]?i32 = undefined;
+    for (&requests, &expected, 0..) |*request, *row, index| {
+        const history_row = 69999 - index * 13;
+        request.* = .{ .line_id = if (index % 2 == 0) s.scrollbackLine(@intCast(history_row)).id else missing, .row = 99 };
+        row.* = if (index % 2 == 0) @intCast(@as(i64, @intCast(history_row)) - 70000) else null;
+    }
+    requests[0].line_id = s.scrollbackLine(69998).id;
+    expected[0] = -2;
+    requests[2].line_id = s.scrollbackLine(69999).id;
+    expected[2] = -1;
+    requests[4].line_id = s.scrollbackLine(69998).id;
+    expected[4] = -2;
+    requests[6].line_id = 0;
+    expected[6] = null;
+    requests[8].line_id = evicted;
+    expected[8] = null;
+    requests[10].line_id = s.active[1].id;
+    expected[10] = 1;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    s.allocator = failing.allocator();
+    s.resolveLineIdRows(&requests);
+    s.allocator = std.testing.allocator;
+    try std.testing.expect(!failing.has_induced_failure);
+    for (requests, expected) |request, row| try std.testing.expectEqual(row, request.row);
+
+    s.toggleAltScreen(true);
+    requests[0].line_id = s.alt.?[2].id;
+    s.resolveLineIdRows(requests[0..3]);
+    try std.testing.expectEqual(@as(?i32, 2), requests[0].row);
+    try std.testing.expectEqual(@as(?i32, null), requests[1].row);
+    try std.testing.expectEqual(@as(?i32, null), requests[2].row);
+}
+
+test "retained deletion bounds oversized restored placements before using stack scratch" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 2, 2);
+    defer s.deinit();
+    s.retain_images = true;
+    // Snapshot decoding appends directly instead of passing through emitImage.
+    const count = Screen.RETAIN_IMAGE_COUNT + 8;
+    for (0..count) |index| {
+        const owned = try std.testing.allocator.dupe(u8, &.{});
+        errdefer std.testing.allocator.free(owned);
+        try s.retained_images.append(std.testing.allocator, .{
+            .owned = owned,
+            .ev = .{ .width = 1, .height = 1, .rgba = owned, .row = 0, .col = 0, .anchor_id = s.active[if (index == count - 1) 1 else 0].id, .placement_id = @intCast(index) },
+        });
+    }
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    s.allocator = failing.allocator();
+    s.pruneRetainedImages(.{ .what = 'y', .y = 1 });
+    s.allocator = std.testing.allocator;
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(Screen.RETAIN_IMAGE_COUNT - 1, s.retained_images.items.len);
+    for (s.retained_images.items, 8..) |ri, index| try std.testing.expectEqual(index, ri.ev.placement_id);
+}
+
+test "retained reanchor matches explicit wide-cell position oracle" {
+    const Position = @import("reflow.zig").Position;
+    const Case = struct { width: u16, positions: [12]Position };
+    const cases = [_]Case{
+        .{ .width = 1, .positions = .{
+            .{ .row = 0, .col = 0 }, .{ .row = 1, .col = 0 }, .{ .row = 2, .col = 0 },
+            .{ .row = 2, .col = 0 }, .{ .row = 2, .col = 0 }, .{ .row = 3, .col = 0 },
+            .{ .row = 4, .col = 0 }, .{ .row = 5, .col = 0 }, .{ .row = 5, .col = 0 },
+            .{ .row = 6, .col = 0 }, .{ .row = 6, .col = 0 }, .{ .row = 6, .col = 0 },
+        } },
+        .{ .width = 2, .positions = .{
+            .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 1 }, .{ .row = 1, .col = 0 },
+            .{ .row = 1, .col = 0 }, .{ .row = 1, .col = 1 }, .{ .row = 2, .col = 0 },
+            .{ .row = 2, .col = 1 }, .{ .row = 3, .col = 0 }, .{ .row = 3, .col = 1 },
+            .{ .row = 4, .col = 0 }, .{ .row = 4, .col = 1 }, .{ .row = 4, .col = 1 },
+        } },
+        .{ .width = 4, .positions = .{
+            .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 1 }, .{ .row = 0, .col = 2 },
+            .{ .row = 0, .col = 2 }, .{ .row = 0, .col = 3 }, .{ .row = 1, .col = 0 },
+            .{ .row = 1, .col = 1 }, .{ .row = 1, .col = 2 }, .{ .row = 1, .col = 3 },
+            .{ .row = 2, .col = 0 }, .{ .row = 2, .col = 1 }, .{ .row = 2, .col = 2 },
+        } },
+        .{ .width = 7, .positions = .{
+            .{ .row = 0, .col = 0 }, .{ .row = 0, .col = 1 }, .{ .row = 0, .col = 2 },
+            .{ .row = 0, .col = 2 }, .{ .row = 0, .col = 3 }, .{ .row = 0, .col = 4 },
+            .{ .row = 0, .col = 5 }, .{ .row = 1, .col = 0 }, .{ .row = 1, .col = 1 },
+            .{ .row = 2, .col = 0 }, .{ .row = 2, .col = 1 }, .{ .row = 2, .col = 2 },
+        } },
+    };
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    for (cases) |case| {
+        var s = try Screen.init(std.testing.allocator, &pool, 3, 4);
+        defer s.deinit();
+        try s.setScrollbackCapacity(8);
+        s.retain_images = true;
+        // Logical content is ab<W>cd<V>, then z; row 0 ends in a structural blank.
+        s.active[0].cells[0].rune = 'a';
+        s.active[0].cells[1].rune = 'b';
+        s.active[1].cells[0] = .{ .rune = 0x754C, .flags = cell_mod.FLAG_WIDE_LEFT };
+        s.active[1].cells[1] = .{ .flags = cell_mod.FLAG_WIDE_CONT };
+        s.active[1].cells[2].rune = 'c';
+        s.active[1].continues_above = true;
+        s.active[2].cells[0].rune = 'd';
+        s.active[2].cells[1] = .{ .rune = 0x754D, .flags = cell_mod.FLAG_WIDE_LEFT };
+        s.active[2].cells[2] = .{ .flags = cell_mod.FLAG_WIDE_CONT };
+        s.active[2].continues_above = true;
+        s.active[3].cells[0].rune = 'z';
+        const px = [_]u8{ 1, 2, 3, 4 };
+        for (0..12) |index| {
+            const source = 11 - index;
+            s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = @intCast(source / 3), .col = @intCast(source % 3), .placement_id = @intCast(source) });
+        }
+        try s.resize(case.width, 4);
+        try std.testing.expectEqual(@as(usize, 12), s.retained_images.items.len);
+        for (s.retained_images.items, 0..) |ri, index| {
+            const expected = case.positions[11 - index];
+            const sb_count = s.scrollbackCount();
+            const line = if (expected.row < sb_count) s.scrollbackLine(@intCast(expected.row)) else &s.active[expected.row - sb_count];
+            try std.testing.expectEqual(11 - index, ri.ev.placement_id);
+            try std.testing.expectEqual(expected.col, ri.ev.col);
+            try std.testing.expectEqual(line.id, ri.ev.anchor_id);
+            try std.testing.expectEqual(expected.row -| sb_count, ri.ev.row);
+        }
+    }
+}
+
+test "retained reanchor batches large history and long logical lines with dead anchors" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    for ([_]bool{ false, true }) |wrapped| {
+        var s = try Screen.init(std.testing.allocator, &pool, 2, 2);
+        defer s.deinit();
+        try s.setScrollbackCapacity(70000);
+        s.retain_images = true;
+        for (0..70000) |_| {
+            for (s.active) |*ln| {
+                for (ln.cells) |*cell| cell.rune = 'x';
+                ln.continues_above = wrapped;
+            }
+            s.scrollUp(1);
+        }
+        for (s.active) |*ln| {
+            for (ln.cells) |*cell| cell.rune = 'x';
+            ln.continues_above = wrapped;
+        }
+        const px = [_]u8{ 1, 2, 3, 4 };
+        for (0..2048) |i| {
+            // Reverse anchor order ensures sorting never changes replay order.
+            const row = 69999 - i * 31;
+            s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 1, .placement_id = @intCast(i), .anchor_id = s.scrollbackLine(@intCast(row)).id });
+            s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 0, .anchor_id = std.math.maxInt(u64) });
+        }
+        try s.resize(3, 2);
+        try std.testing.expectEqual(@as(usize, 2048), s.retained_images.items.len);
+        try std.testing.expectEqual(@as(usize, 2048 * px.len), s.retained_image_bytes);
+        for (s.retained_images.items, 0..) |ri, i| {
+            const old_row = 69999 - i * 31;
+            const row = if (wrapped) (old_row * 2 + 1) / 3 else old_row;
+            const col = if (wrapped) (old_row * 2 + 1) % 3 else 1;
+            try std.testing.expectEqual(i, ri.ev.placement_id);
+            try std.testing.expectEqual(col, ri.ev.col);
+            const line = if (row < s.scrollbackCount()) s.scrollbackLine(@intCast(row)) else &s.active[row - s.scrollbackCount()];
+            try std.testing.expectEqual(line.id, ri.ev.anchor_id);
+        }
+    }
+}
+
+test "retained reanchor drops destinations evicted by the new history cap" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var s = try Screen.init(std.testing.allocator, &pool, 8, 2);
+    defer s.deinit();
+    try s.setScrollbackCapacity(1);
+    s.retain_images = true;
+    for (s.active) |*ln| for (ln.cells) |*cell| {
+        cell.rune = 'x';
+    };
+    const px = [_]u8{ 1, 2, 3, 4 };
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 0 });
+    s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 7 });
+    try s.resize(2, 2);
+    try std.testing.expectEqual(@as(usize, 1), s.retained_images.items.len);
+    try std.testing.expectEqual(s.active[1].id, s.retained_images.items[0].ev.anchor_id);
+    try std.testing.expectEqual(@as(usize, 4), s.retained_image_bytes);
+}
+
+test "retained reanchor allocation failures leave pixels anchors and screen unchanged" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var s = try Screen.init(std.testing.allocator, &pool, 4, 2);
+        defer s.deinit();
+        s.retain_images = true;
+        for (s.active) |*ln| ln.cells[0].rune = 'x';
+        const px = [_]u8{ 1, 2, 3, 4 };
+        s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 1, .col = 0 });
+        s.emitImage(.{ .width = 1, .height = 1, .rgba = &px, .row = 0, .col = 0, .anchor_id = std.math.maxInt(u64) });
+        const before = ReflowState.capture(s);
+        const anchor = s.retained_images.items[0].ev.anchor_id;
+        const pixels = s.retained_images.items[0].owned.ptr;
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        s.allocator = failing.allocator();
+        const result = s.resize(6, 2);
+        s.allocator = std.testing.allocator;
+        if (!failing.has_induced_failure) {
+            try result;
+            try std.testing.expect(fail_index > 0);
+            try std.testing.expectEqual(@as(usize, 1), s.retained_images.items.len);
+            break;
+        }
+        try std.testing.expectError(error.OutOfMemory, result);
+        try before.expectUnchanged(s);
+        try std.testing.expectEqual(@as(usize, 2), s.retained_images.items.len);
+        try std.testing.expectEqual(@as(usize, 8), s.retained_image_bytes);
+        try std.testing.expectEqual(anchor, s.retained_images.items[0].ev.anchor_id);
+        try std.testing.expectEqual(pixels, s.retained_images.items[0].owned.ptr);
+        try std.testing.expectEqualSlices(u8, &px, s.retained_images.items[0].ev.rgba);
+        try std.testing.expectEqual(std.math.maxInt(u64), s.retained_images.items[1].ev.anchor_id);
+        try s.resize(6, 2);
+        try std.testing.expectEqual(@as(usize, 1), s.retained_images.items.len);
+    }
 }
 
 test "reflow re-anchors retained placements onto the rewrapped lines" {

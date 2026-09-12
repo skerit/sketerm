@@ -1157,6 +1157,7 @@ pub const TerminalSurface = struct {
             .row = img.row,
             .col = img.col,
             .image_id = img.image_id,
+            .image_number = img.image_number,
             .placement_id = img.placement_id,
             .z_index = img.z_index,
             .cells_wide = img.cells_wide,
@@ -1223,7 +1224,7 @@ pub const TerminalSurface = struct {
             },
             // Everything else goes through the protocol's own
             // selector table, including the positional ones.
-            else => self.image_store.markSelectedForDelete(ev, imageNumberOf, @ptrCast(self)),
+            else => self.image_store.markSelectedForDelete(ev, self.terminal.screen),
         }
         self.terminal.screen.dirty = true;
         c.gtk_gl_area_queue_render(@ptrCast(self.area));
@@ -1236,14 +1237,6 @@ pub const TerminalSurface = struct {
         return atlas.hasSystemGlyph(cp);
     }
 };
-
-/// The image NUMBER a stored image was transmitted with, for the
-/// `d=n/N` selector. Lives on the Screen's manager, which the store
-/// has no reference to.
-fn imageNumberOf(ctx: ?*anyopaque, image_id: u32) u32 {
-    const self = cast.userData(TerminalSurface, ctx);
-    return self.terminal.screen.kitty_images.numberOf(image_id);
-}
 
 fn onUnrealize(area: *c.GtkGLArea, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(TerminalSurface, user);
@@ -1567,7 +1560,7 @@ fn resolveImageRows(self: *TerminalSurface) void {
             .offscreen => img.on_screen = false,
             .evicted => {
                 img.on_screen = false;
-                img.deleting = true;
+                self.image_store.markForDelete(img);
             },
         }
     }

@@ -209,10 +209,8 @@ pub const PassedClient = struct {
                 0,
             .snapshot_version = if (bytes.len >= 5)
                 bytes[4]
-            else if (proto >= 6)
-                snapshot.SNAPSHOT_VERSION
             else
-                snapshot.LEGACY_SNAPSHOT_VERSION,
+                snapshot.negotiateVersion(proto, 0, false),
             .audio_channels = if (bytes.len >= 6) bytes[5] != 0 else proto >= 5,
             .winstream_channels = if (bytes.len >= 7) bytes[6] != 0 else proto >= wire.WINSTREAM_PROTO_VERSION,
             .read_only = bytes.len >= 8 and bytes[7] != 0,
@@ -259,6 +257,8 @@ test "broker attach handoff preserves panel-only capability fields" {
     try t.expect(!historical.panel_only);
     try t.expectEqual(@as(u8, 0), historical.panel_rpc);
     try t.expect(!historical.identity_first);
+    const pre_negotiation = PassedClient.decode(&.{6});
+    try t.expectEqual(@as(u8, 10), pre_negotiation.snapshot_version);
 }
 
 /// Worker side: adopt a broker-passed client fd as a client attached to

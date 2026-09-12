@@ -7,6 +7,7 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 const image_size = @import("image_size.zig");
+const Screen = @import("screen.zig").Screen;
 
 pub const Image = struct {
     width: u32,
@@ -29,11 +30,13 @@ pub const Image = struct {
     gl_tex: c_uint = 0,
     /// Owned source RGBA. Retained AFTER upload too so that GL
     /// context loss (split / pane shuffle) can re-upload from this
-    /// buffer rather than losing the image. Freed on .deleting flush
-    /// or store deinit.
+    /// buffer rather than losing the image. Freed when marked deleting
+    /// or on store deinit.
     pending: ?[]u8 = null,
     /// Kitty graphics image_id (0 = no id, sixel/iterm2).
     image_id: u32 = 0,
+    /// Placement selector survives source eviction and snapshot replay.
+    image_number: u32 = 0,
     /// Kitty placement_id (multiple placements of same image).
     placement_id: u32 = 0,
     /// Z-index for stacking. Higher = drawn on top.
@@ -88,6 +91,8 @@ pub const Store = struct {
     /// GL_MAX_TEXTURE_SIZE for the current context (0 = not queried yet).
     /// Cleared by forgetGL so a new context is asked again.
     max_texture_size: u32 = 0,
+    /// GL-free tombstones can be compacted during the next append's replacement scan.
+    reclaim_unuploaded: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) Store {
         return .{ .allocator = allocator };
@@ -100,6 +105,14 @@ pub const Store = struct {
             self.allocator.free(p);
             img.pending = null;
         }
+    }
+
+    /// Release CPU pixels immediately while deferring GL teardown to a flush.
+    pub fn markForDelete(self: *Store, img: *Image) void {
+        self.freePending(img);
+        img.pending_dirty = false;
+        img.deleting = true;
+        if (img.gl_tex == 0) self.reclaim_unuploaded = true;
     }
 
     /// Evict oldest non-deleting images (FIFO) until `incoming` more bytes
@@ -123,8 +136,7 @@ pub const Store = struct {
             const img = &self.images.items[i];
             if (img.deleting or img.pending == null) continue;
             if (protect != null and img == protect.?) continue;
-            self.freePending(img);
-            img.deleting = true;
+            self.markForDelete(img);
         }
     }
 
@@ -194,6 +206,7 @@ pub const Store = struct {
         row: u16,
         col: u16,
         image_id: u32 = 0,
+        image_number: u32 = 0,
         placement_id: u32 = 0,
         z_index: i32 = 0,
         cells_wide: u32 = 0,
@@ -228,14 +241,19 @@ pub const Store = struct {
         }
         // Same (image_id, placement_id) replaces — apps that re-place
         // every frame (emberglyph) would otherwise leak entries.
-        // Mark for delete; flushUploads/flushDeletesNoGL frees pending
-        // and the GL texture next time around.
-        if (o.image_id != 0) {
+        // Release pixels now; only GL teardown waits for a flush.
+        if (o.image_id != 0 or self.reclaim_unuploaded) {
+            var kept: usize = 0;
             for (self.images.items) |*img| {
-                const same_image = img.image_id == o.image_id;
+                const same_image = o.image_id != 0 and img.image_id == o.image_id;
                 const same_pid = (o.placement_id == 0 and img.placement_id == 0) or img.placement_id == o.placement_id;
-                if (same_image and same_pid) img.deleting = true;
+                if (same_image and same_pid) self.markForDelete(img);
+                if (img.deleting and img.gl_tex == 0) continue;
+                self.images.items[kept] = img.*;
+                kept += 1;
             }
+            self.images.items.len = kept;
+            self.reclaim_unuploaded = false;
         }
         // Keep retained image memory bounded: evict oldest before adding.
         self.evictForBudget(need);
@@ -252,6 +270,7 @@ pub const Store = struct {
             .draw_row = o.row,
             .pending = copy,
             .image_id = o.image_id,
+            .image_number = o.image_number,
             .placement_id = o.placement_id,
             .z_index = o.z_index,
             .cells_wide = o.cells_wide,
@@ -272,47 +291,65 @@ pub const Store = struct {
         for (self.images.items) |*img| {
             if (img.image_id != image_id) continue;
             if (placement_id != 0 and img.placement_id != placement_id) continue;
-            img.deleting = true;
+            self.markForDelete(img);
         }
     }
 
-    /// Mark all images for deletion. Real teardown happens in
-    /// flushUploads when the GL context is current.
-    /// Mark every placement a kitty `a=d` request selects. Positional
-    /// selectors use the placement's live cell rectangle, so an image
-    /// that has scrolled is judged where it is NOW — which is what the
-    /// application sees.
+    /// Resolve positional selectors in terminal coordinates at event time, not render time.
     pub fn markSelectedForDelete(
         self: *Store,
-        ev: @import("screen.zig").Screen.ImageDeleteEvent,
-        numberOf: *const fn (ctx: ?*anyopaque, image_id: u32) u32,
-        ctx: ?*anyopaque,
+        ev: Screen.ImageDeleteEvent,
+        screen: *Screen,
     ) void {
-        for (self.images.items) |*img| {
-            const cols: i32 = @import("screen.zig").Screen.cellExtent(img.cells_wide);
-            const rows: i32 = @import("screen.zig").Screen.cellExtent(img.cells_high);
-            if (ev.selects(
-                img.image_id,
-                img.placement_id,
-                numberOf(ctx, img.image_id),
-                img.z_index,
-                @intCast(img.cell_col),
-                img.draw_row,
-                cols,
-                rows,
-            )) img.deleting = true;
+        const positional = switch (ev.what) {
+            'c', 'C', 'p', 'P', 'q', 'Q', 'x', 'X', 'y', 'Y' => true,
+            else => false,
+        };
+        var storage: [Screen.RETAIN_IMAGE_COUNT]Screen.LineIdRequest = undefined;
+        var start: usize = 0;
+        while (start < self.images.items.len) {
+            const batch = self.images.items[start..][0..@min(storage.len, self.images.items.len - start)];
+            var requested: usize = 0;
+            if (positional) {
+                for (batch) |img| {
+                    if (img.deleting or img.anchor_id == 0) continue;
+                    storage[requested] = .{ .line_id = img.anchor_id };
+                    requested += 1;
+                }
+                screen.resolveLineIdRows(storage[0..requested]);
+            }
+            var resolved: usize = 0;
+            for (batch) |*img| {
+                if (img.deleting) continue;
+                const row: i32 = if (positional and img.anchor_id != 0) row: {
+                    const result = storage[resolved].row;
+                    resolved += 1;
+                    break :row result orelse continue;
+                } else img.cell_row;
+                if (ev.selects(
+                    img.image_id,
+                    img.placement_id,
+                    img.image_number,
+                    img.z_index,
+                    @intCast(img.cell_col),
+                    row,
+                    Screen.cellExtent(img.cells_wide),
+                    Screen.cellExtent(img.cells_high),
+                )) self.markForDelete(img);
+            }
+            start += batch.len;
         }
     }
 
     pub fn markAllForDelete(self: *Store) void {
-        for (self.images.items) |*img| img.deleting = true;
+        for (self.images.items) |*img| self.markForDelete(img);
     }
 
     /// Mark images with a matching kitty image_id for deletion.
     pub fn markByIdForDelete(self: *Store, image_id: u32) void {
         if (image_id == 0) return;
         for (self.images.items) |*img| {
-            if (img.image_id == image_id) img.deleting = true;
+            if (img.image_id == image_id) self.markForDelete(img);
         }
     }
 
@@ -359,6 +396,7 @@ pub const Store = struct {
         for (self.images.items) |*img| {
             img.gl_tex = 0;
             img.pending_dirty = true;
+            if (img.deleting) self.reclaim_unuploaded = true;
         }
     }
 
@@ -375,6 +413,7 @@ pub const Store = struct {
                 img.gl_tex = 0;
             }
             img.pending_dirty = true;
+            if (img.deleting) self.reclaim_unuploaded = true;
         }
     }
 
@@ -384,20 +423,27 @@ pub const Store = struct {
     pub fn freeAllNoGL(self: *Store) void {
         for (self.images.items) |*img| self.freePending(img);
         self.images.clearRetainingCapacity();
+        self.reclaim_unuploaded = false;
     }
 
     /// Like flushUploads but skips the GL-side work — for tests.
     pub fn flushDeletesNoGL(self: *Store) void {
-        var i: usize = 0;
-        while (i < self.images.items.len) {
-            const img = &self.images.items[i];
+        self.flushDeletes(false);
+    }
+
+    fn flushDeletes(self: *Store, comptime with_gl: bool) void {
+        var kept: usize = 0;
+        for (self.images.items) |*img| {
             if (img.deleting) {
                 self.freePending(img);
-                _ = self.images.orderedRemove(i);
-                continue;
+                if (with_gl and img.gl_tex != 0) c.glDeleteTextures(1, &img.gl_tex);
+            } else {
+                self.images.items[kept] = img.*;
+                kept += 1;
             }
-            i += 1;
         }
+        self.images.items.len = kept;
+        self.reclaim_unuploaded = false;
     }
 
     /// Largest texture axis this GL context accepts, queried once.
@@ -476,18 +522,7 @@ pub const Store = struct {
     /// retained AFTER upload so re-realize after context loss can
     /// re-upload without losing the image.
     pub fn flushUploads(self: *Store) void {
-        // Free GL textures for items marked deleting.
-        var i: usize = 0;
-        while (i < self.images.items.len) {
-            const img = &self.images.items[i];
-            if (img.deleting) {
-                self.freePending(img);
-                if (img.gl_tex != 0) c.glDeleteTextures(1, &img.gl_tex);
-                _ = self.images.orderedRemove(i);
-                continue;
-            }
-            i += 1;
-        }
+        self.flushDeletes(true);
         // Upload images that have dirty pending pixels — initial
         // upload (gl_tex == 0) creates the texture; frame advance
         // (gl_tex != 0) does a sub-image update.
@@ -675,9 +710,9 @@ test "markByIdForDelete flags only matching images" {
     try s.addWithId(&rgba, 2, 2, 0, 0, 2);
     try s.addWithId(&rgba, 2, 2, 0, 0, 1);
     s.markByIdForDelete(1);
-    try std.testing.expect(s.images.items[0].deleting);
-    try std.testing.expect(!s.images.items[1].deleting);
-    try std.testing.expect(s.images.items[2].deleting);
+    try std.testing.expectEqual(@as(usize, 2), s.count());
+    try std.testing.expect(!s.images.items[0].deleting);
+    try std.testing.expect(s.images.items[1].deleting);
     s.flushDeletesNoGL();
     try std.testing.expectEqual(@as(usize, 1), s.count());
     try std.testing.expectEqual(@as(u32, 2), s.images.items[0].image_id);
@@ -753,12 +788,11 @@ test "a cell extent past i32 max still covers its own cell" {
         .cells_wide = 3_000_000_000,
         .cells_high = 3_000_000_000,
     });
-    const numberOf = struct {
-        fn f(_: ?*anyopaque, _: u32) u32 {
-            return 0;
-        }
-    }.f;
-    s.markSelectedForDelete(.{ .what = 'p', .image_id = 1, .x = 1, .y = 1 }, numberOf, null);
+    var pool = try @import("style_pool.zig").Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(std.testing.allocator, &pool, 4, 4);
+    defer screen.deinit();
+    s.markSelectedForDelete(.{ .what = 'p', .image_id = 1, .x = 1, .y = 1 }, screen);
     try std.testing.expect(s.images.items[0].deleting);
 }
 
@@ -777,6 +811,57 @@ test "forgetGL keeps all images, drops their GL handles" {
     try std.testing.expectEqual(@as(c_uint, 0), s.images.items[1].gl_tex);
     try std.testing.expect(s.images.items[0].pending != null);
     try std.testing.expect(s.images.items[1].pending != null);
+}
+
+test "number selectors use placement metadata after source eviction and snapshot replay" {
+    const a = std.testing.allocator;
+    var h = try @import("../parser/test_harness.zig").Harness.init(a, 8, 4);
+    defer h.deinit();
+    h.screen.retain_images = true;
+    h.screen.kitty_images.budget_bytes = 4;
+    h.feed("\x1b_Gf=32,s=1,v=1,a=T,i=9,I=7,p=2;/wAA/w==\x1b\\");
+    h.feed("\x1b_Ga=p,i=9,p=3\x1b\\");
+    h.feed("\x1b_Gf=32,s=1,v=1,a=T,i=10,I=8;/wAA/w==\x1b\\");
+    try std.testing.expectEqual(@as(u32, 0), h.screen.kitty_images.numberOf(9));
+    const snapshot = @import("../mux/snapshot.zig");
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try snapshot.serialize(h.screen, &bytes, a);
+    var pool = try @import("style_pool.zig").Pool.init(a);
+    defer pool.deinit();
+    const back = try snapshot.restore(a, &pool, bytes.items);
+    defer back.deinit();
+    for ([_]*Screen{ h.screen, back }) |screen| {
+        for ("nN") |what| {
+            var s = Store.init(a);
+            defer s.deinit();
+            for (screen.retained_images.items) |ri| {
+                const ev = ri.ev;
+                try s.addFull(.{
+                    .rgba = ev.rgba,
+                    .width = ev.width,
+                    .height = ev.height,
+                    .row = ev.row,
+                    .col = ev.col,
+                    .image_id = ev.image_id,
+                    .image_number = ev.image_number,
+                    .placement_id = ev.placement_id,
+                });
+            }
+            s.markSelectedForDelete(.{ .what = what, .image_number = 0 }, screen);
+            s.markSelectedForDelete(.{ .what = what, .image_number = 99 }, screen);
+            try std.testing.expectEqual(@as(usize, 12), s.live_bytes);
+            s.markSelectedForDelete(.{ .what = what, .image_number = 7, .placement_id = 2 }, screen);
+            try std.testing.expect(s.images.items[0].deleting);
+            try std.testing.expect(!s.images.items[1].deleting);
+            try std.testing.expect(!s.images.items[2].deleting);
+            try std.testing.expectEqual(@as(usize, 8), s.live_bytes);
+            s.markSelectedForDelete(.{ .what = what, .image_number = 7 }, screen);
+            try std.testing.expect(s.images.items[1].deleting);
+            try std.testing.expect(!s.images.items[2].deleting);
+            try std.testing.expectEqual(@as(usize, 4), s.live_bytes);
+        }
+    }
 }
 
 test "budget evicts oldest images FIFO and bounds live_bytes" {
@@ -840,4 +925,197 @@ test "budget = 0 means unlimited (no eviction)" {
     while (i < 50) : (i += 1) try s.addWithId(&px, 2, 2, 0, 0, i + 1);
     for (s.images.items) |*img| try std.testing.expect(img.pending != null);
     try std.testing.expectEqual(@as(usize, 50 * 16), s.live_bytes);
+}
+
+test "repeated replacements release pixels before any render" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    const px = [_]u8{0} ** 16;
+    s.budget_bytes = px.len * 2;
+    try s.addWithId(&px, 2, 2, 0, 0, 2);
+    for (0..128) |_| {
+        try s.addWithPlacement(&px, 2, 2, 0, 0, 1, 7, 0);
+        try std.testing.expectEqual(px.len * 2, s.live_bytes);
+        try std.testing.expect(!s.images.items[0].deleting);
+        // A texture already uploaded must survive until a GL-capable flush.
+        s.images.items[s.count() - 1].gl_tex = 42;
+    }
+    for (s.images.items[1 .. s.count() - 1]) |img| {
+        try std.testing.expect(img.deleting);
+        try std.testing.expectEqual(@as(?[]u8, null), img.pending);
+        try std.testing.expectEqual(@as(c_uint, 42), img.gl_tex);
+    }
+    s.forgetGL();
+    s.flushDeletesNoGL();
+    try std.testing.expectEqual(@as(usize, 2), s.count());
+    try std.testing.expectEqual(@as(u32, 2), s.images.items[0].image_id);
+    try std.testing.expectEqual(@as(u32, 1), s.images.items[1].image_id);
+}
+
+test "delete and replay without renders does not retain deleted pixels" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    const px = [_]u8{0} ** 16;
+    s.budget_bytes = px.len;
+    for (0..128) |i| {
+        try s.addWithPlacement(&px, 2, 2, 0, 0, 1, 7, 0);
+        try std.testing.expectEqual(@as(usize, 1), s.count());
+        try std.testing.expectEqual(px.len, s.live_bytes);
+        switch (i % 3) {
+            0 => s.markAllForDelete(),
+            1 => s.markByIdForDelete(1),
+            else => s.markByPlacementForDelete(1, 7),
+        }
+        try std.testing.expectEqual(@as(usize, 0), s.live_bytes);
+        try s.replacePending(1, &px, @intCast(i + 1));
+        try std.testing.expectEqual(@as(usize, 0), s.live_bytes);
+    }
+    s.flushDeletesNoGL();
+    try std.testing.expectEqual(@as(usize, 0), s.count());
+}
+
+test "positional deletes use terminal rows after scrolling without a render" {
+    var pool = try @import("style_pool.zig").Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(std.testing.allocator, &pool, 8, 4);
+    defer screen.deinit();
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    const px = [_]u8{0} ** 16;
+    const anchor = screen.active[2].id;
+    screen.row = screen.rows - 1;
+    screen.lineFeed();
+    screen.view_offset = 1;
+    for ("cCpPqQxXyY") |what| {
+        s.freeAllNoGL();
+        try s.addFull(.{
+            .rgba = &px,
+            .width = 2,
+            .height = 2,
+            .row = 2,
+            .col = 1,
+            .image_id = 1,
+            .anchor_id = anchor,
+            .z_index = 3,
+        });
+        // The old render coordinate is 2; the application sees row 1.
+        s.images.items[0].draw_row = 2;
+        if (what != 'x' and what != 'X') {
+            s.markSelectedForDelete(.{ .what = what, .x = 1, .y = 2, .z = 3 }, screen);
+            try std.testing.expect(!s.images.items[0].deleting);
+        }
+        s.markSelectedForDelete(.{ .what = what, .x = 1, .y = 1, .z = 3 }, screen);
+        try std.testing.expect(s.images.items[0].deleting);
+        try std.testing.expectEqual(@as(usize, 0), s.live_bytes);
+    }
+
+    s.freeAllNoGL();
+    try s.addFull(.{
+        .rgba = &px,
+        .width = 2,
+        .height = 2,
+        .row = 2,
+        .col = 1,
+        .image_id = 1,
+        .anchor_id = anchor,
+        .cells_high = 2,
+    });
+    screen.lineFeed();
+    screen.lineFeed(); // Anchor is now at -1; its second row covers row 0.
+    screen.view_offset = 3;
+    s.markSelectedForDelete(.{ .what = 'p', .x = 1, .y = 1 }, screen);
+    try std.testing.expect(!s.images.items[0].deleting);
+    s.markSelectedForDelete(.{ .what = 'p', .x = 1, .y = 0 }, screen);
+    try std.testing.expect(s.images.items[0].deleting);
+
+    s.freeAllNoGL();
+    try s.addWithId(&px, 2, 2, 2, 1, 2); // Unanchored placements stay pinned.
+    s.markSelectedForDelete(.{ .what = 'y', .y = 2 }, screen);
+    try std.testing.expect(s.images.items[0].deleting);
+
+    s.freeAllNoGL();
+    try s.addFull(.{
+        .rgba = &px,
+        .width = 2,
+        .height = 2,
+        .row = 0,
+        .col = 0,
+        .image_id = 3,
+        .anchor_id = std.math.maxInt(u64),
+    });
+    s.markSelectedForDelete(.{ .what = 'p' }, screen);
+    try std.testing.expect(!s.images.items[0].deleting);
+    s.markSelectedForDelete(.{ .what = 'i', .image_id = 3 }, screen);
+    try std.testing.expect(s.images.items[0].deleting);
+}
+
+test "unuploaded replacements reclaim tombstones while preserving uploaded handles" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    const px = [_]u8{0} ** 4;
+    try s.addWithId(&px, 1, 1, 0, 0, 1);
+    s.images.items[0].gl_tex = 42;
+    for (0..10000) |_| {
+        try s.addWithId(&px, 1, 1, 0, 0, 1);
+        try std.testing.expectEqual(@as(usize, 2), s.count());
+        try std.testing.expectEqual(@as(c_uint, 42), s.images.items[0].gl_tex);
+        try std.testing.expect(s.images.items[0].deleting);
+        try std.testing.expectEqual(px.len, s.live_bytes);
+    }
+    s.forgetGL();
+    try s.add(&px, 1, 1, 0, 0);
+    try std.testing.expectEqual(@as(usize, 2), s.count());
+    try std.testing.expectEqual(@as(u32, 1), s.images.items[0].image_id);
+    try std.testing.expectEqual(@as(u32, 0), s.images.items[1].image_id);
+    s.markAllForDelete();
+    try s.add(&px, 1, 1, 0, 0);
+    try std.testing.expectEqual(@as(usize, 1), s.count());
+}
+
+test "positional deletion batches missing anchors over deep history without renders or allocation" {
+    var pool = try @import("style_pool.zig").Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(std.testing.allocator, &pool, 2, 3);
+    defer screen.deinit();
+    try screen.setScrollbackCapacity(70000);
+    screen.row = 2;
+    for (0..70000) |_| screen.lineFeed();
+    screen.view_offset = 60000;
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    const px = [_]u8{0} ** 4;
+    const count = Screen.RETAIN_IMAGE_COUNT * 2 + 7;
+    for (0..count) |i| {
+        try s.addFull(.{
+            .rgba = &px,
+            .width = 1,
+            .height = 1,
+            .row = 0,
+            .col = 0,
+            .image_number = @intCast(i + 1),
+            .anchor_id = switch (i % 5) {
+                0, 4 => std.math.maxInt(u64) - i,
+                1 => screen.scrollbackLine(@intCast(i % 35000)).id,
+                2 => screen.active[0].id,
+                else => 0,
+            },
+            .cells_high = 70001,
+        });
+    }
+    for (s.images.items, 0..) |*img, i| {
+        img.draw_row = 999;
+        if (i % 5 == 4) s.markForDelete(img);
+    }
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    s.allocator = failing.allocator();
+    screen.allocator = failing.allocator();
+    s.markSelectedForDelete(.{ .what = 'p', .x = 0, .y = 0 }, screen);
+    s.allocator = std.testing.allocator;
+    screen.allocator = std.testing.allocator;
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(count, s.count());
+    for (s.images.items, 0..) |img, i| {
+        try std.testing.expectEqual(i % 5 != 0, img.deleting);
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), img.image_number);
+    }
 }

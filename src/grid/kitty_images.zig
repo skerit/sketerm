@@ -471,37 +471,46 @@ pub const Manager = struct {
         self.active_transmit_id = 0;
     }
 
-    /// Drop every image the client tagged with this number (`d=N`).
-    /// A number can be reused across ids, so this is not a single
-    /// lookup.
+    /// Drop all stored images and pending transfers tagged with this number (`d=N`).
     pub fn dropByNumber(self: *Manager, number: u32) void {
         if (number == 0) return;
         var doomed: [32]u32 = undefined;
-        var n: usize = 0;
-        var it = self.store.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.number != number) continue;
-            if (n == doomed.len) break;
-            doomed[n] = e.key_ptr.*;
-            n += 1;
+        // Restart after each batch: removals invalidate hash-map iterators.
+        inline for (.{ &self.store, &self.accums }) |map| {
+            while (true) {
+                var n: usize = 0;
+                var it = map.iterator();
+                while (it.next()) |e| {
+                    if (e.value_ptr.number != number) continue;
+                    doomed[n] = e.key_ptr.*;
+                    n += 1;
+                    if (n == doomed.len) break;
+                }
+                for (doomed[0..n]) |id| self.drop(id);
+                if (n < doomed.len) break;
+            }
         }
-        for (doomed[0..n]) |id| self.drop(id);
     }
 
-    /// Drop every image whose id falls in an inclusive range (`d=R`).
+    /// Drop all stored images and pending transfers in an inclusive id range (`d=R`).
     pub fn dropRange(self: *Manager, lo: u32, hi: u32) void {
         if (hi < lo) return;
         var doomed: [64]u32 = undefined;
-        var n: usize = 0;
-        var it = self.store.iterator();
-        while (it.next()) |e| {
-            const id = e.key_ptr.*;
-            if (id < lo or id > hi) continue;
-            if (n == doomed.len) break;
-            doomed[n] = id;
-            n += 1;
+        inline for (.{ &self.store, &self.accums }) |map| {
+            while (true) {
+                var n: usize = 0;
+                var it = map.iterator();
+                while (it.next()) |e| {
+                    const id = e.key_ptr.*;
+                    if (id < lo or id > hi) continue;
+                    doomed[n] = id;
+                    n += 1;
+                    if (n == doomed.len) break;
+                }
+                for (doomed[0..n]) |id| self.drop(id);
+                if (n < doomed.len) break;
+            }
         }
-        for (doomed[0..n]) |id| self.drop(id);
     }
 
     /// The number a stored image was transmitted with, or 0.
@@ -1511,6 +1520,76 @@ test "store budget evicts oldest images and bounds store_bytes" {
     // Newest survives; oldest evicted.
     try std.testing.expect(mgr.store.contains(10));
     try std.testing.expect(!mgr.store.contains(1));
+}
+
+test "number and range deletion drain every batch and pending transfer without allocating" {
+    inline for (.{ true, false }) |by_number| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        var mgr = Manager.init(failing.allocator());
+        defer mgr.deinit();
+        for (0..151) |i| {
+            _ = mgr.ingest(.{
+                .action = .transmit,
+                .image_id = @intCast(i),
+                .image_number = if (i == 0) 8 else 7,
+                .format = 32,
+                .width = 1,
+                .height = 1,
+                .payload = "AAAAAA==",
+            });
+        }
+        _ = mgr.ingest(.{
+            .action = .transmit_frame,
+            .image_id = 1,
+            .format = 32,
+            .width = 1,
+            .height = 1,
+            .payload = "AAAAAA==",
+        });
+        _ = mgr.ingest(.{
+            .action = .transmit,
+            .image_id = std.math.maxInt(u32),
+            .image_number = 8,
+            .format = 32,
+            .width = 1,
+            .height = 1,
+            .payload = "AAAAAA==",
+        });
+        // Fill the pending table, including a nonmatching transfer and an
+        // in-flight replacement whose stored image has a different number.
+        for (0..MAX_ACCUMS) |i| {
+            _ = mgr.ingest(.{
+                .action = .transmit,
+                .image_id = if (i == 0) 0 else if (i == 1) 1000 else @intCast(198 + i),
+                .image_number = if (i == 1) 8 else 7,
+                .more = 1,
+                .payload = "AAAA",
+            });
+        }
+        try std.testing.expectEqual(@as(u32, 152), mgr.store.count());
+        try std.testing.expectEqual(@as(u32, MAX_ACCUMS), mgr.accums.count());
+        try std.testing.expectEqual(@as(usize, 153 * 4), mgr.store_bytes);
+        failing.fail_index = failing.alloc_index;
+        mgr.dropByNumber(0);
+        mgr.dropRange(230, 1);
+        try std.testing.expectEqual(@as(u32, 152), mgr.store.count());
+        try std.testing.expectEqual(@as(u32, MAX_ACCUMS), mgr.accums.count());
+
+        if (by_number) mgr.dropByNumber(7) else mgr.dropRange(1, 229);
+        try std.testing.expectEqual(@as(u32, if (by_number) 1 else 2), mgr.store.count());
+        try std.testing.expectEqual(@as(usize, if (by_number) 4 else 8), mgr.store_bytes);
+        try std.testing.expect(mgr.store.contains(std.math.maxInt(u32)));
+        try std.testing.expectEqual(@as(u32, if (by_number) 1 else 2), mgr.accums.count());
+        try std.testing.expect(mgr.accums.contains(1000));
+        try std.testing.expectEqual(@as(u32, 0), mgr.active_transmit_id);
+        // A second deletion is harmless; full-domain bounds include both
+        // id zero and the largest representable id without range arithmetic.
+        if (by_number) mgr.dropByNumber(7) else mgr.dropRange(1, 229);
+        mgr.dropRange(0, std.math.maxInt(u32));
+        try std.testing.expectEqual(@as(u32, 0), mgr.store.count());
+        try std.testing.expectEqual(@as(u32, 0), mgr.accums.count());
+        try std.testing.expectEqual(@as(usize, 0), mgr.store_bytes);
+    }
 }
 
 test "a store insert that OOMs frees the decoded pixels" {

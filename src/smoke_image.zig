@@ -13,6 +13,8 @@ const c = @import("c.zig").c;
 const eglboot = @import("smoke/eglboot.zig");
 const ImagePass = @import("render/image_pass.zig").ImagePass;
 const ImageStore = @import("grid/image_store.zig").Store;
+const Harness = @import("parser/test_harness.zig").Harness;
+const snapshot = @import("mux/snapshot.zig");
 
 const W: c_int = 256;
 const H: c_int = 64;
@@ -59,9 +61,11 @@ pub fn main() !u8 {
         return 1;
     };
     pass.debug = true;
+    defer pass.releaseGL();
 
     var store = ImageStore.init(allocator);
     defer store.deinit();
+    defer store.releaseGL();
     store.cell_w = 8;
     store.cell_h = 16;
     store.debug = true;
@@ -166,6 +170,106 @@ pub fn main() !u8 {
         std.debug.print("smoke-image: FAIL — second (cell-scaled) image not rendered\n", .{});
         return 3;
     }
-    std.debug.print("smoke-image: PASS\n", .{});
+    // Uploaded placements must keep their GL handles, but not CPU pixels,
+    // while deletion and snapshot replay run without a render callback.
+    std.debug.print("smoke-image: deferred deletion and snapshot replay\n", .{});
+    const old_textures = [_]c_uint{ store.images.items[0].gl_tex, store.images.items[1].gl_tex };
+    try std.testing.expectEqual(npix * 4 * 2, store.live_bytes);
+    for (store.images.items, old_textures) |img, tex| {
+        try std.testing.expect(tex != 0 and c.glIsTexture(tex) == c.GL_TRUE);
+        try std.testing.expect(img.pending != null and !img.pending_dirty);
+    }
+    store.markByIdForDelete(1);
+    try std.testing.expectEqual(npix * 4, store.live_bytes);
+    try std.testing.expect(store.images.items[0].deleting);
+    try std.testing.expect(store.images.items[0].pending == null);
+    try std.testing.expect(!store.images.items[0].pending_dirty);
+    try std.testing.expect(!store.images.items[1].deleting);
+    for (old_textures) |tex| try std.testing.expect(c.glIsTexture(tex) == c.GL_TRUE);
+
+    var h = try Harness.init(allocator, 32, 4);
+    defer h.deinit();
+    h.screen.retain_images = true;
+    h.feed("\x1b[2;21H\x1b_Gf=32,s=1,v=1,a=T,i=2,c=4,r=2,X=3,Y=2,C=1;AAD//w==\x1b\\");
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(allocator);
+    try snapshot.serialize(h.screen, &bytes, allocator);
+    const restored = try snapshot.restore(allocator, h.pool, bytes.items);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(usize, 1), restored.retained_images.items.len);
+    const ev = restored.retained_images.items[0].ev;
+    try std.testing.expectEqual(@as(u16, 1), ev.row);
+    try std.testing.expectEqual(@as(u16, 20), ev.col);
+    try std.testing.expect(ev.anchor_id != 0);
+
+    // Repeated replacements must compact unuploaded entries without losing
+    // either uploaded tombstone before the GL-capable flush.
+    for (0..64) |_| {
+        try store.addWithId(rgba, img_w, img_h, 0, 12, 2);
+        try store.addFull(.{
+            .rgba = ev.rgba,
+            .width = ev.width,
+            .height = ev.height,
+            .row = ev.row,
+            .col = ev.col,
+            .image_id = ev.image_id,
+            .image_number = ev.image_number,
+            .placement_id = ev.placement_id,
+            .z_index = ev.z_index,
+            .cells_wide = ev.cells_wide,
+            .cells_high = ev.cells_high,
+            .cell_x_offset = ev.cell_x_offset,
+            .cell_y_offset = ev.cell_y_offset,
+            .src_x = ev.src_x,
+            .src_y = ev.src_y,
+            .src_w = ev.src_w,
+            .src_h = ev.src_h,
+            .anchor_id = ev.anchor_id,
+        });
+        try std.testing.expectEqual(@as(usize, 4), store.live_bytes);
+        try std.testing.expectEqual(@as(usize, 3), store.count());
+        for (store.images.items[0..2], old_textures) |img, tex| {
+            try std.testing.expect(img.deleting and img.pending == null and !img.pending_dirty);
+            try std.testing.expectEqual(tex, img.gl_tex);
+            try std.testing.expect(c.glIsTexture(tex) == c.GL_TRUE);
+        }
+        const replacement = store.images.items[2];
+        try std.testing.expect(!replacement.deleting and replacement.pending_dirty);
+        try std.testing.expectEqual(@as(c_uint, 0), replacement.gl_tex);
+    }
+
+    // GL may immediately reuse a deleted texture name. Delay only the new
+    // upload so glIsTexture can observe deletion before that reuse occurs.
+    store.images.items[2].pending_dirty = false;
+    store.flushUploads();
+    for (old_textures) |tex| try std.testing.expect(c.glIsTexture(tex) == c.GL_FALSE);
+    try std.testing.expectEqual(@as(usize, 1), store.count());
+    try std.testing.expectEqual(@as(usize, 4), store.live_bytes);
+    try std.testing.expectEqual(@as(c_uint, 0), store.images.items[0].gl_tex);
+    store.images.items[0].pending_dirty = true;
+    store.flushUploads();
+    const replacement = store.images.items[0];
+    try std.testing.expect(replacement.gl_tex != 0 and c.glIsTexture(replacement.gl_tex) == c.GL_TRUE);
+    try std.testing.expect(replacement.pending != null and !replacement.pending_dirty);
+
+    // A normal frame clears its background before drawing images. Check the
+    // entire frame, including both old locations and the unrendered interim one.
+    c.glClear(c.GL_COLOR_BUFFER_BIT);
+    pass.draw(&store, W, H);
+    c.glFinish();
+    c.glReadPixels(0, 0, W, H, c.GL_RGBA, c.GL_UNSIGNED_BYTE, fb.ptr);
+    for (0..H) |y| {
+        for (0..W) |x| {
+            const idx = ((H - 1 - y) * W + x) * 4;
+            const blue = x >= 163 and x < 195 and y >= 18 and y < 50;
+            const expected = [_]u8{ 0, 0, if (blue) 255 else 0, 255 };
+            if (!std.mem.eql(u8, &expected, fb[idx..][0..4])) {
+                std.debug.print("smoke-image: FAIL pixel ({d},{d}): expected {any}, got {any}\n", .{ x, y, expected, fb[idx..][0..4] });
+                return 4;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(c_uint, c.GL_NO_ERROR), c.glGetError());
+    std.debug.print("smoke-image: PASS (deferred GL deletion, 64 snapshot replacements, full-frame pixels)\n", .{});
     return 0;
 }

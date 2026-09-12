@@ -203,7 +203,7 @@ pub fn spawnCastSessionWithOrigin(self: *Daemon, req: SpawnReq, origin_id: dmod.
     errdefer pool.deinit();
     const screen = try Screen.init(allocator, pool, h.cols, h.rows);
     errdefer screen.deinit();
-    screen.retain_images = true;
+    @import("daemon_sessions.zig").configureImageRetention(screen);
     screen.defer_gui_queries = true;
     // Title from the cast filename (the recording's own OSC titles
     // may overwrite it during playback, exactly like a live app).
@@ -453,7 +453,7 @@ fn startSeek(self: *Daemon, s: *Session, cp: *CastPlayback, target_ms: u64, resu
         _ = c.fclose(file);
         return;
     };
-    screen.retain_images = true;
+    @import("daemon_sessions.zig").configureImageRetention(screen);
     screen.defer_gui_queries = true;
     screen.sink = .{ .ctx = @ptrCast(s), .on_write_pty = Session.sinkWritePty };
     if (s.screen.last_title) |t| screen.last_title = allocator.dupe(u8, t) catch null;
@@ -817,6 +817,39 @@ test "cast spawn: header validated eagerly, screen sized from it, paused at 0" {
         error.CastPathNotAbsolute,
         d.spawnSession(.{ .name = "b", .cast_path = "relative.cast" }),
     );
+}
+
+test "cast creation and seek reset bound Kitty source retention" {
+    const a = testing.allocator;
+    const d = try newTestDaemon(a);
+    defer d.deinit();
+    const path = try writeTempCast(a, simple_cast);
+    defer {
+        unlinkPath(path);
+        a.free(path);
+    }
+    const s = try spawnCast(d, path, "kitty-budget");
+    const cl = try newTestClient(d, s);
+    for (0..3) |pass| {
+        if (pass > 0) {
+            playControl(d, cl, if (pass == 1) "{\"op\":\"seek\",\"ms\":100}" else "{\"op\":\"restart\"}", 10_000);
+            try seekSettle(d, s, 10_000);
+        }
+        const mgr = &s.screen.kitty_images;
+        try testing.expectEqual(@as(usize, 320 * 1024 * 1024), mgr.budget_bytes);
+        try testing.expectEqual(@as(usize, 0), mgr.store_bytes);
+        try testing.expect(s.screen.retain_images);
+        // Exercise the real daemon ingestion path at a small budget rather
+        // than allocating hundreds of MiB in a regression test.
+        mgr.budget_bytes = 4;
+        var col = d.ingestBegin(s);
+        dmod.ingestBytes(s, &col, "\x1b_Ga=t,f=32,s=1,v=1,i=1;AAAAAA==\x1b\\" ++
+            "\x1b_Ga=t,f=32,s=1,v=1,i=2;AAAAAA==\x1b\\");
+        d.ingestFinish(s, &col, false);
+        try testing.expect(mgr.get(1) == null);
+        try testing.expect(mgr.get(2) != null);
+        try testing.expectEqual(@as(usize, 4), mgr.store_bytes);
+    }
 }
 
 test "a cast cannot buy a grid no other entry point could ask for" {

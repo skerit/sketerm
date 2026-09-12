@@ -7,6 +7,7 @@
 //!
 //! v2: image placements retained by the daemon's Screen
 //! (`retain_images`) ride along, so reattach restores images.
+//! v11: placement image numbers survive source eviction and replay.
 //! v4: OSC 133 command state (open C marker, last zone, exit code,
 //! completion sequence), so command waits survive resyncs.
 //! v6: a format byte per glossary entry (glyf vs colrv0). A v5 peer
@@ -40,7 +41,7 @@ const style_pool = @import("../grid/style_pool.zig");
 const wire = @import("wire.zig");
 const Pool = style_pool.Pool;
 
-pub const SNAPSHOT_VERSION = 10;
+pub const SNAPSHOT_VERSION = 11;
 pub const LEGACY_SNAPSHOT_VERSION = 3;
 
 /// What a `Screen` field means to a snapshot.
@@ -305,7 +306,8 @@ fn retainedImageBytes(owned_len: usize, version: u32) usize {
     const fixed: usize = 4 + 4 + 2 + 2 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4 + 4;
     // v10: the anchor line id and the in-cell pixel offsets.
     const anchored: usize = if (version >= 10) 8 + 4 + 4 else 0;
-    return fixed + anchored + 4 + owned_len;
+    const numbered: usize = if (version >= 11) 4 else 0;
+    return fixed + anchored + numbered + 4 + owned_len;
 }
 
 /// Serialized size of one glyph glossary entry, for the same reason.
@@ -322,7 +324,8 @@ fn budgetLeft(out: *const std.ArrayList(u8)) usize {
 pub fn negotiateVersion(proto: u32, advertised_max: u8, negotiated: bool) u8 {
     if (proto == 0) return 0;
     if (negotiated) return @min(advertised_max, SNAPSHOT_VERSION);
-    return if (proto >= 6) SNAPSHOT_VERSION else LEGACY_SNAPSHOT_VERSION;
+    // Historical core v6 implies v10, never extensions requiring negotiation.
+    return if (proto >= 6) 10 else LEGACY_SNAPSHOT_VERSION;
 }
 
 /// Fixed-size OSC 133 state appended to every v4 snapshot.
@@ -530,6 +533,7 @@ pub fn serializeVersion(screen: *const Screen, out: *std.ArrayList(u8), allocato
                 try s.int(u32, ev.cell_x_offset);
                 try s.int(u32, ev.cell_y_offset);
             }
+            if (version >= 11) try s.int(u32, ev.image_number);
             try s.bytes(ri.owned);
         }
     }
@@ -1042,7 +1046,7 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
     // already decodes normally as zero images.
     if (version == 4 and n_images != 0 and src.bytes.len - src.pos == V4_COMMAND_TAIL_LEN)
         n_images = 0;
-    for (0..n_images) |_| {
+    for (0..n_images) |image_index| {
         var ev = Screen.ImageEvent{
             .width = try src.int(u32),
             .height = try src.int(u32),
@@ -1064,8 +1068,12 @@ pub fn restoreStaged(allocator: std.mem.Allocator, pool: *Pool, bytes: []const u
             ev.cell_x_offset = try src.int(u32);
             ev.cell_y_offset = try src.int(u32);
         }
+        if (version >= 11) ev.image_number = try src.int(u32);
         const data_len = try src.int(u32);
         const data = try src.take(data_len);
+        // Older daemons can send far more tiny placements than the current
+        // retention cap; consume their records without allocating replay work.
+        if (image_index < n_images -| Screen.RETAIN_IMAGE_COUNT) continue;
         const owned = try allocator.dupe(u8, data);
         errdefer allocator.free(owned);
         ev.rgba = owned;
@@ -2090,6 +2098,33 @@ test "snapshot: retained image RECORDS are budgeted, not just their pixels" {
     try testing.expect(restored.retained_images.items.len < screen.retained_images.items.len);
 }
 
+test "snapshot: old daemon image floods restore only the newest bounded placements" {
+    const a = testing.allocator;
+    var h = try Harness.init(a, 8, 2);
+    defer h.deinit();
+    const count = Screen.RETAIN_IMAGE_COUNT + 100;
+    for (0..count) |i| {
+        const owned = try a.dupe(u8, &.{ 0, 0, 0, 255 });
+        try h.screen.retained_images.append(a, .{
+            .ev = .{ .width = 1, .height = 1, .rgba = owned, .row = 0, .col = 0, .image_id = @intCast(i + 1) },
+            .owned = owned,
+        });
+        h.screen.retained_image_bytes += owned.len;
+    }
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    try serializeVersion(h.screen, &body, a, 10);
+    var pool = try Pool.init(a);
+    defer pool.deinit();
+    const restored = try restore(a, &pool, body.items);
+    defer restored.deinit();
+    try testing.expectEqual(Screen.RETAIN_IMAGE_COUNT, restored.retained_images.items.len);
+    try testing.expectEqual(Screen.RETAIN_IMAGE_COUNT * 4, restored.retained_image_bytes);
+    for (restored.retained_images.items, 101..) |ri, id| {
+        try testing.expectEqual(id, ri.ev.image_id);
+    }
+}
+
 test "snapshot: serializer targets v3 for legacy peers" {
     const a = testing.allocator;
     var h = try Harness.init(a, 8, 2);
@@ -2275,6 +2310,8 @@ test "snapshot: envelope detects pre-v4 and current headers" {
 test "snapshot: negotiation honors the peer maximum" {
     try testing.expectEqual(@as(u8, 3), negotiateVersion(6, 3, true));
     try testing.expectEqual(@as(u8, 4), negotiateVersion(6, 4, true));
+    try testing.expectEqual(@as(u8, 10), negotiateVersion(6, 10, true));
+    try testing.expectEqual(@as(u8, 10), negotiateVersion(6, 0, false));
     try testing.expectEqual(SNAPSHOT_VERSION, negotiateVersion(6, 255, true));
     try testing.expectEqual(@as(u8, 3), negotiateVersion(5, 0, false));
     try testing.expectEqual(@as(u8, 0), negotiateVersion(0, 4, true));
@@ -2370,6 +2407,71 @@ test "snapshot: retained image placements round-trip" {
     // Delete prunes the retained copy too.
     h.feed("\x1b_Ga=d,d=I,i=9\x1b\\");
     try testing.expectEqual(@as(usize, 0), h.screen.retained_images.items.len);
+}
+
+test "snapshot: numbered deletes survive source eviction and negotiated replay" {
+    const a = testing.allocator;
+    for ("nN") |what| {
+        var h = try Harness.init(a, 20, 6);
+        defer h.deinit();
+        h.screen.retain_images = true;
+        h.screen.kitty_images.budget_bytes = 4;
+        // The final chunk does not repeat I=: emit must use the stored number.
+        h.feed("\x1b_Gf=32,s=1,v=1,a=T,i=9,I=7,p=2,m=1;/wAA\x1b\\");
+        h.feed("\x1b_Gi=9,p=2,m=0;/w==\x1b\\");
+        h.feed("\x1b_Ga=p,i=9,p=3\x1b\\");
+        h.feed("\x1b_Gf=32,s=1,v=1,a=T,i=10,I=8;/wAA/w==\x1b\\");
+        try testing.expectEqual(@as(u32, 0), h.screen.kitty_images.numberOf(9));
+        try testing.expectEqual(@as(usize, 3), h.screen.retained_images.items.len);
+        try testing.expectEqual(@as(u32, 7), h.screen.retained_images.items[0].ev.image_number);
+        try testing.expectEqual(@as(u32, 7), h.screen.retained_images.items[1].ev.image_number);
+
+        var current: std.ArrayList(u8) = .empty;
+        defer current.deinit(a);
+        try serialize(h.screen, &current, a);
+        // Every historical layout remains readable and omits the new field.
+        for (1..11) |version| {
+            var legacy: std.ArrayList(u8) = .empty;
+            defer legacy.deinit(a);
+            try serializeVersion(h.screen, &legacy, a, @intCast(version));
+            var pool = try Pool.init(a);
+            defer pool.deinit();
+            const old = try restore(a, &pool, legacy.items);
+            defer old.deinit();
+            for (old.retained_images.items) |ri| try testing.expectEqual(@as(u32, 0), ri.ev.image_number);
+            if (version == 10) try testing.expectEqual(legacy.items.len + 3 * 4, current.items.len);
+        }
+
+        var pool = try Pool.init(a);
+        defer pool.deinit();
+        const back = try restore(a, &pool, current.items);
+        defer back.deinit();
+        back.retain_images = true;
+        try testing.expectEqual(@as(u32, 0), back.kitty_images.store.count());
+        var buf: [64]u8 = undefined;
+        const targeted = try std.fmt.bufPrint(&buf, "Ga=d,d={c},I=7,p=2", .{what});
+        for ([_]*Screen{ h.screen, back }) |screen| {
+            screen.apply(.{ .apc = .{ .bytes = targeted } });
+            try testing.expectEqual(@as(usize, 2), screen.retained_images.items.len);
+            try testing.expectEqual(@as(u32, 3), screen.retained_images.items[0].ev.placement_id);
+            try testing.expectEqual(@as(usize, 8), screen.retained_image_bytes);
+        }
+        const all_number = try std.fmt.bufPrint(&buf, "Ga=d,d={c},I=7", .{what});
+        for ([_]*Screen{ h.screen, back }) |screen| {
+            screen.apply(.{ .apc = .{ .bytes = all_number } });
+            try testing.expectEqual(@as(usize, 1), screen.retained_images.items.len);
+            try testing.expectEqual(@as(u32, 8), screen.retained_images.items[0].ev.image_number);
+            try testing.expectEqual(@as(usize, 4), screen.retained_image_bytes);
+        }
+        current.clearRetainingCapacity();
+        try serialize(h.screen, &current, a);
+        var pool_after = try Pool.init(a);
+        defer pool_after.deinit();
+        const after = try restore(a, &pool_after, current.items);
+        defer after.deinit();
+        try testing.expectEqual(@as(usize, 1), after.retained_images.items.len);
+        try testing.expectEqual(@as(u32, 10), after.retained_images.items[0].ev.image_id);
+    }
 }
 
 test "snapshot: alt screen state survives" {

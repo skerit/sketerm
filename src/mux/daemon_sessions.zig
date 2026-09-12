@@ -45,6 +45,23 @@ const Parser = @import("../parser/vt.zig").Parser;
 const build_options = @import("build_options");
 const xwayland = @import("xwayland.zig");
 
+/// Retain attach placements and bound Kitty sources using the GUI's default FIFO policy.
+pub fn configureImageRetention(screen: *Screen) void {
+    const defaults: @import("../config.zig").Config = .{};
+    screen.retain_images = true;
+    screen.kitty_images.budget_bytes = @as(usize, defaults.image_memory_mb) * 1024 * 1024;
+}
+
+test "daemon image retention uses a bounded GUI matching default" {
+    var pool = try Pool.init(std.testing.allocator);
+    defer pool.deinit();
+    const screen = try Screen.init(std.testing.allocator, &pool, 2, 2);
+    defer screen.deinit();
+    configureImageRetention(screen);
+    try std.testing.expect(screen.retain_images);
+    try std.testing.expectEqual(@as(usize, 320 * 1024 * 1024), screen.kitty_images.budget_bytes);
+}
+
 pub fn findSession(self: *Daemon, name: []const u8) ?*Session {
     for (self.sessions.items) |s| {
         if (s.matchesName(name)) return s;
@@ -1708,7 +1725,7 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     errdefer screen.deinit();
     // Keep image placements for the attach snapshot — there's no
     // per-pane ImageStore on the daemon side to remember them.
-    screen.retain_images = true;
+    configureImageRetention(screen);
     // Queries only the GUI can answer (clipboard read, color
     // scheme) are left for the attached mirror to reply to.
     screen.defer_gui_queries = true;
