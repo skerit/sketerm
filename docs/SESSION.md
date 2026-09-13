@@ -1,5 +1,38 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-13: sketerm-mux shows up in ps; `sketerm doctor` lists processes
+
+A user killed every `sketerm-mux` they could find over SSH, reconnected,
+and got the same sessions back. The daemon their SSH proxy had
+autostarted was exec'd from the literal `/proc/self/exe`, so the kernel
+named it after that string: argv[0] `/proc/self/exe`, comm `exe`.
+Neither `ps ax | grep sketerm` nor `pgrep -x sketerm-mux` could see it.
+Every self-exec (proxy and UDP autostart, file jobs, display keepers,
+UDP ticket listeners) now passes argv[0] `sketerm-mux` while still
+exec'ing `/proc/self/exe`, and `mux_main` sets the comm with
+`prctl(PR_SET_NAME)`. `src/mux/selfexec.zig` is the one home for the
+binary name and the mode flags the daemon dispatches on. mux_main, the
+spawn sites, `keep.zig`, the client and `sshroute` read the flags from
+it. `Pty.SpawnOpts.exec_path` lets the keeper's argv[0] differ from the
+file it runs.
+
+`sketerm doctor` grew a `processes` section (`src/procinv.zig`,
+Linux-only; macOS reports "not inspectable"). It lists every process of
+the current user whose executable or argv[0] is `sketerm`/`sketerm-*`,
+as a tree: broker, session workers with their session names (a
+session's child pid from `list` leads to its parent worker), monolith,
+file jobs, keepers, udp listeners, GUI subcommands, and browser helpers
+with their CEF subprocesses folded in. Each row shows its age and flags
+a binary replaced on disk. Each daemon row shows the socket it should
+serve: `--socket`, or the default derived from its OWN environment
+block. Doctor connects to that socket and compares SO_PEERCRED against
+the daemon's pid. A socket file that is gone, or answered by another
+daemon, is a WARNING, because those sessions are alive and unreachable.
+Verified live against isolated daemons: ps and pgrep name the
+self-exec'd daemon, doctor shows worker and session names and the
+keeper under its worker, and both unreachable cases warn with exit 1.
+Version 0.1.5.
+
 ## 2026-09-07: a libdecor shadow ate the pointer; five MCP app-tool gaps
 
 A report from driving the Minecraft 26.2 client headlessly. The real
