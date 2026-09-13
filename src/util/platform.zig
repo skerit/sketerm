@@ -667,9 +667,40 @@ pub fn environOfPid(pid: c.pid_t, buf: []u8) ?[]u8 {
         return buf[at..len];
     }
 
+    return readProcBlock(pid, "environ", buf);
+}
+
+/// Value of `key` in an environment block shaped like `environOfPid`'s answer.
+pub fn environBlockValue(block: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, block, 0);
+    while (it.next()) |entry| {
+        if (entry.len > key.len and entry[key.len] == '=' and std.mem.startsWith(u8, entry, key))
+            return entry[key.len + 1 ..];
+    }
+    return null;
+}
+
+test "environBlockValue matches whole keys only" {
+    const block = "A=1\x00XDG=no\x00XDG_RUNTIME_DIR=/run/user/7\x00EMPTY=\x00";
+    try std.testing.expectEqualStrings("/run/user/7", environBlockValue(block, "XDG_RUNTIME_DIR").?);
+    try std.testing.expectEqualStrings("no", environBlockValue(block, "XDG").?);
+    try std.testing.expectEqualStrings("", environBlockValue(block, "EMPTY").?);
+    try std.testing.expect(environBlockValue(block, "XDG_RUNTIME_DI") == null);
+    try std.testing.expect(environBlockValue(block, "B") == null);
+}
+
+/// Whole `/proc/<pid>/<name>` into `buf`; see `readFileBlock`.
+fn readProcBlock(pid: c.pid_t, name: []const u8, buf: []u8) ?[]u8 {
     var path_buf: [64:0]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/environ", .{pid}) catch return null;
-    const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC);
+    const path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/{s}", .{ pid, name }) catch return null;
+    return readFileBlock(path, buf);
+}
+
+/// A whole small file into `buf`; null when unreadable, empty, or larger than `buf`.
+/// A partial block is never returned: a substring search would misread it as a miss.
+fn readFileBlock(path: [*:0]const u8, buf: []u8) ?[]u8 {
+    if (buf.len == 0) return null;
+    const fd = c.open(path, c.O_RDONLY | c.O_CLOEXEC);
     if (fd < 0) return null;
     defer _ = c.close(fd);
     var used: usize = 0;
@@ -680,13 +711,152 @@ pub fn environOfPid(pid: c.pid_t, buf: []u8) ?[]u8 {
     }
     if (used == 0) return null;
     if (used == buf.len) {
-        // Full buffer: either the block ends exactly here or it does
-        // not fit. A partial block must never be returned -- a
-        // substring search would misread it as "not my process".
         var probe: [1]u8 = undefined;
         if (c.read(fd, &probe, 1) > 0) return null;
     }
     return buf[0..used];
+}
+
+/// Whether `argvOfPid`, `exeOfPid` and `infoOfPid` can describe processes here. False on
+/// macOS: libproc and KERN_PROCARGS2 carry the same facts, but nothing has verified them on
+/// hardware, and an inventory built on unverified struct offsets would be confidently wrong.
+pub const can_inspect_processes = is_linux;
+
+/// What Linux appends to a process's exe link once its file was replaced or removed on disk.
+pub const deleted_exe_suffix = " (deleted)";
+
+/// A live process's argv, NUL-separated without the final NUL; null when it cannot be read,
+/// does not fit `buf`, or belongs to a kernel thread.
+pub fn argvOfPid(pid: c.pid_t, buf: []u8) ?[]u8 {
+    if (!can_inspect_processes or pid <= 0) return null;
+    const block = readProcBlock(pid, "cmdline", buf) orelse return null;
+    return if (block[block.len - 1] == 0) block[0 .. block.len - 1] else block;
+}
+
+/// Executable path of a live process, possibly ending in `deleted_exe_suffix`; null when it
+/// cannot be read (another user's process, a kernel thread) or does not fit `buf`.
+pub fn exeOfPid(pid: c.pid_t, buf: []u8) ?[]const u8 {
+    if (!can_inspect_processes or pid <= 0) return null;
+    var path_buf: [64:0]u8 = undefined;
+    const link = std.fmt.bufPrintZ(&path_buf, "/proc/{d}/exe", .{pid}) catch return null;
+    const n = c.readlink(link.ptr, buf.ptr, buf.len);
+    if (n <= 0 or @as(usize, @intCast(n)) >= buf.len) return null;
+    return buf[0..@intCast(n)];
+}
+
+pub const ProcessInfo = struct {
+    ppid: c.pid_t,
+    /// Owner of /proc/<pid>: the effective uid, or root for a process that made itself
+    /// non-dumpable.
+    uid: c.uid_t,
+    /// Milliseconds since the process started.
+    age_ms: i64,
+};
+
+/// Parent, owner and age of a live process; null when it is gone or unreadable.
+pub fn infoOfPid(pid: c.pid_t) ?ProcessInfo {
+    if (!can_inspect_processes or pid <= 0) return null;
+    var dir_buf: [64:0]u8 = undefined;
+    const dir = std.fmt.bufPrintZ(&dir_buf, "/proc/{d}", .{pid}) catch return null;
+    var st: c.struct_stat = undefined;
+    if (c.stat(dir.ptr, &st) != 0) return null;
+    var stat_buf: [2048]u8 = undefined;
+    const fields = parseProcStat(readProcBlock(pid, "stat", &stat_buf) orelse return null) orelse return null;
+    var uptime_buf: [256]u8 = undefined;
+    const uptime_ms = parseUptimeMs(readFileBlock("/proc/uptime", &uptime_buf) orelse return null) orelse return null;
+    const hz = c.sysconf(c._SC_CLK_TCK);
+    if (hz <= 0) return null;
+    const started_ms: i64 = @intCast(fields.start_ticks * 1000 / @as(u64, @intCast(hz)));
+    return .{ .ppid = fields.ppid, .uid = st.st_uid, .age_ms = @max(0, uptime_ms - started_ms) };
+}
+
+const ProcStatFields = struct { ppid: c.pid_t, start_ticks: u64 };
+
+/// Parent pid (field 4) and start time in clock ticks (field 22) of a /proc/<pid>/stat line.
+/// The comm field may itself hold spaces and parentheses, so fields are counted from the
+/// LAST ')'.
+fn parseProcStat(text: []const u8) ?ProcStatFields {
+    const close = std.mem.lastIndexOfScalar(u8, text, ')') orelse return null;
+    var it = std.mem.tokenizeAny(u8, text[close + 1 ..], " \n");
+    var field: usize = 3;
+    var ppid: ?c.pid_t = null;
+    while (it.next()) |token| : (field += 1) {
+        if (field == 4) ppid = std.fmt.parseInt(c.pid_t, token, 10) catch return null;
+        if (field == 22) return .{
+            .ppid = ppid orelse return null,
+            .start_ticks = std.fmt.parseInt(u64, token, 10) catch return null,
+        };
+    }
+    return null;
+}
+
+/// Milliseconds of the first field of /proc/uptime ("12345.67 ...").
+fn parseUptimeMs(text: []const u8) ?i64 {
+    const end = std.mem.indexOfAny(u8, text, " \n") orelse text.len;
+    const secs = text[0..end];
+    const dot = std.mem.indexOfScalar(u8, secs, '.') orelse secs.len;
+    var ms = (std.fmt.parseInt(i64, secs[0..dot], 10) catch return null) * 1000;
+    if (dot < secs.len) {
+        const frac = secs[dot + 1 .. @min(secs.len, dot + 4)];
+        if (frac.len > 0) {
+            var scaled = std.fmt.parseInt(i64, frac, 10) catch return null;
+            for (frac.len..3) |_| scaled *= 10;
+            ms += scaled;
+        }
+    }
+    return ms;
+}
+
+test "parseProcStat counts fields from the last parenthesis" {
+    const line = "4242 (sk (odd) name) S 17 4242 4242 0 -1 4194560 1234 0 0 0 5 3 0 0 20 0 1 0 987654 12345678 900\n";
+    const fields = parseProcStat(line) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(c.pid_t, 17), fields.ppid);
+    try std.testing.expectEqual(@as(u64, 987654), fields.start_ticks);
+    try std.testing.expect(parseProcStat("4242 (short) S 17\n") == null);
+    try std.testing.expect(parseProcStat("no parenthesis") == null);
+}
+
+test "parseUptimeMs keeps millisecond precision" {
+    try std.testing.expectEqual(@as(?i64, 12345670), parseUptimeMs("12345.67 99.00\n"));
+    try std.testing.expectEqual(@as(?i64, 5000), parseUptimeMs("5\n"));
+    try std.testing.expectEqual(@as(?i64, 1234), parseUptimeMs("1.2345 0\n"));
+    try std.testing.expectEqual(@as(?i64, null), parseUptimeMs("x.5 0"));
+}
+
+test "argvOfPid, exeOfPid and infoOfPid describe this process" {
+    if (!can_inspect_processes) return error.SkipZigTest;
+    const self_pid = c.getpid();
+    const info = infoOfPid(self_pid) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(c.getppid(), info.ppid);
+    try std.testing.expectEqual(c.getuid(), info.uid);
+    try std.testing.expect(info.age_ms >= 0);
+
+    var argv_buf: [65536]u8 = undefined;
+    const argv = argvOfPid(self_pid, &argv_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(argv.len > 0 and argv[argv.len - 1] != 0);
+
+    var exe_buf: [4096]u8 = undefined;
+    var own_buf: [4096]u8 = undefined;
+    const own = exePath(&own_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(own, exeOfPid(self_pid, &exe_buf) orelse return error.TestUnexpectedResult);
+
+    try std.testing.expect(infoOfPid(-1) == null);
+    var tiny: [1]u8 = undefined;
+    try std.testing.expect(argvOfPid(self_pid, &tiny) == null);
+}
+
+test "setProcessName renames the calling process" {
+    if (!is_linux) return error.SkipZigTest;
+    var saved_buf: [64]u8 = undefined;
+    const saved = std.mem.trimEnd(u8, readProcBlock(c.getpid(), "comm", &saved_buf) orelse return error.TestUnexpectedResult, "\n");
+    var restore: [16:0]u8 = @splat(0);
+    @memcpy(restore[0..@min(saved.len, 15)], saved[0..@min(saved.len, 15)]);
+    defer setProcessName(&restore);
+
+    setProcessName("sk-name-test");
+    var now_buf: [64]u8 = undefined;
+    const now = readProcBlock(c.getpid(), "comm", &now_buf) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("sk-name-test", std.mem.trimEnd(u8, now, "\n"));
 }
 
 /// A `signal()` handler slot: what libc calls `sig_t`.
@@ -727,6 +897,19 @@ pub fn dieWithParent() void {
     if (is_linux) {
         const PR_SET_PDEATHSIG: c_long = 1;
         _ = c.syscall(@intFromEnum(std.os.linux.SYS.prctl), PR_SET_PDEATHSIG, @as(c_long, c.SIGKILL));
+    }
+}
+
+/// Rename the calling process as ps, top and pgrep show it.
+///
+/// Linux: `prctl(PR_SET_NAME)`, truncated by the kernel to 15 bytes. It names the calling
+/// THREAD, which is the process only when called from the main thread. Without it a process
+/// exec'd from the literal "/proc/self/exe" is named "exe". macOS: no-op; the name there
+/// already comes from the resolved path `selfExecPathZ` execs.
+pub fn setProcessName(name: [*:0]const u8) void {
+    if (is_linux) {
+        const PR_SET_NAME: c_long = 15;
+        _ = c.syscall(@intFromEnum(std.os.linux.SYS.prctl), PR_SET_NAME, @as(c_ulong, @intFromPtr(name)));
     }
 }
 
@@ -855,8 +1038,18 @@ pub const Wakeup = struct {
 /// XDG_RUNTIME_DIR; its per-user $TMPDIR (/var/folders/...) gives
 /// the same ownership guarantees.
 pub fn runtimeDir() []const u8 {
-    if (c.getenv("XDG_RUNTIME_DIR")) |p| {
-        const s = std.mem.span(@as([*:0]const u8, @ptrCast(p)));
+    return runtimeDirFrom(envValue("XDG_RUNTIME_DIR"), envValue("TMPDIR"));
+}
+
+fn envValue(name: [*:0]const u8) ?[]const u8 {
+    const p = c.getenv(name) orelse return null;
+    return std.mem.span(@as([*:0]const u8, @ptrCast(p)));
+}
+
+/// `runtimeDir` for an environment passed by value, so a caller can resolve ANOTHER process's
+/// socket directory from its environment block. The result may point into either argument.
+pub fn runtimeDirFrom(xdg_runtime_dir: ?[]const u8, tmpdir: ?[]const u8) []const u8 {
+    if (xdg_runtime_dir) |s| {
         if (s.len > 0) return s;
     }
     if (is_macos) {
@@ -878,13 +1071,20 @@ pub fn runtimeDir() []const u8 {
             return std.mem.trimEnd(u8, S.buf[0 .. n - 1], "/");
         }
     }
-    if (c.getenv("TMPDIR")) |p| {
-        const s = std.mem.span(@as([*:0]const u8, @ptrCast(p)));
+    if (tmpdir) |s| {
         // Unix socket sun_path is 104 bytes on Darwin — a long
         // /var/folders path still leaves room for sketerm/<pid>.sock.
         if (s.len > 0 and s.len < 70) return std.mem.trimEnd(u8, s, "/");
     }
     return "/tmp";
+}
+
+test "runtimeDirFrom prefers XDG_RUNTIME_DIR, then a short TMPDIR, then /tmp" {
+    try std.testing.expectEqualStrings("/run/user/7", runtimeDirFrom("/run/user/7", "/var/tmp/"));
+    if (!is_macos) {
+        try std.testing.expectEqualStrings("/var/tmp", runtimeDirFrom("", "/var/tmp/"));
+        try std.testing.expectEqualStrings("/tmp", runtimeDirFrom(null, null));
+    }
 }
 
 test "runtimeDir returns something usable" {

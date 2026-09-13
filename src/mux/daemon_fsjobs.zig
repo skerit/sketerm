@@ -9,6 +9,7 @@ const log = @import("log.zig");
 const wire = @import("wire.zig");
 const fsjournal = @import("fsjournal.zig");
 const fsjob = @import("fsjob.zig");
+const selfexec = @import("selfexec.zig");
 const pathZ = @import("../util/pathz.zig").pathZ;
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
@@ -451,7 +452,7 @@ pub fn spawnFsJob(self: *Daemon, owner: ?*Client, op: FsJob.Op, id: u64, args: F
         _ = c.dup2(spec_pipe[0], 0);
         _ = c.dup2(out_pipe[1], 1);
         for ([_]c_int{ spec_pipe[0], spec_pipe[1], out_pipe[0], out_pipe[1] }) |fd| _ = c.close(fd);
-        const argv = [_:null]?[*:0]const u8{ exe, "--job", null };
+        const argv = [_:null]?[*:0]const u8{ selfexec.BINARY, selfexec.Mode.job.flag().?.ptr, null };
         _ = c.execv(exe, @ptrCast(@constCast(&argv)));
         c._exit(127);
     }

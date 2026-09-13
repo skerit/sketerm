@@ -391,7 +391,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const argv = init.args.vector;
     // Internal OpenSSH ProxyCommand. It is intentionally absent from help;
     // dispatch before application initialization, then discard the environment.
-    if (argv.len == 5 and std.mem.eql(u8, std.mem.span(argv[1]), "--internal-socks5-connect")) {
+    if (argv.len == 5 and @import("mux/selfexec.zig").Mode.socks5_connect.is(std.mem.span(argv[1]))) {
         return @import("mux/socks5_client.zig").serve(
             std.mem.span(argv[2]),
             std.mem.span(argv[3]),

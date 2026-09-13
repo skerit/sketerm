@@ -5,6 +5,7 @@ const c = @import("../c.zig").c;
 const platform = @import("../util/platform.zig");
 const shellquote = @import("../util/shellquote.zig");
 const socks5_client = @import("socks5_client.zig");
+const selfexec = @import("selfexec.zig");
 
 pub const Mode = enum { auto, ssh, udp, tor };
 pub const Route = enum { direct, tor };
@@ -76,7 +77,9 @@ pub const Args = struct {
         defer command.deinit(std.heap.c_allocator);
         try command.appendSlice(std.heap.c_allocator, "ProxyCommand=exec ");
         try shellquote.appendQuoted(&command, std.heap.c_allocator, exe);
-        try command.appendSlice(std.heap.c_allocator, " --internal-socks5-connect ");
+        try command.append(std.heap.c_allocator, ' ');
+        try command.appendSlice(std.heap.c_allocator, selfexec.Mode.socks5_connect.flag().?);
+        try command.append(std.heap.c_allocator, ' ');
         try shellquote.appendQuoted(&command, std.heap.c_allocator, endpoint);
         // OpenSSH expands these after applying the original destination's
         // Host/Match config. Quoting keeps the expansions as single argv.

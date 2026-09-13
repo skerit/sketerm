@@ -10,6 +10,7 @@ const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const wire = @import("wire.zig");
 const platform = @import("../util/platform.zig");
+const selfexec = @import("selfexec.zig");
 const fsserve = @import("fsserve.zig");
 const fsjob = @import("fsjob.zig");
 const daemon_fsjobs = @import("daemon_fsjobs.zig");
@@ -1237,15 +1238,15 @@ pub fn handleUdpTicketReq(self: *Daemon, cl: *Client, payload: []const u8) void 
             _ = c.close(pipe_fds[1]);
             var argv: [8:null]?[*:0]const u8 = .{null} ** 8;
             var n: usize = 0;
-            argv[n] = bin;
-            argv[n + 1] = "--udp-listen";
+            argv[n] = selfexec.BINARY;
+            argv[n + 1] = selfexec.Mode.udp_listen.flag().?.ptr;
             n += 2;
             if (range) |r| {
                 argv[n] = "--udp-port";
                 argv[n + 1] = r.ptr;
                 n += 2;
             }
-            argv[n] = "--socket";
+            argv[n] = selfexec.SOCKET_FLAG;
             argv[n + 1] = sock_z.ptr;
             _ = c.execvp(bin, @ptrCast(@constCast(&argv)));
             c._exit(127);

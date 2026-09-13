@@ -9,6 +9,7 @@ const sockpath = @import("sockpath.zig");
 const deploy = @import("deploy.zig");
 const rudp = @import("rudp.zig");
 const sshroute = @import("sshroute.zig");
+const selfexec = @import("selfexec.zig");
 /// The one publish/stop/release mechanism for interrupting a blocking
 /// socket from another thread; re-exported so SDK consumers can declare
 /// the slot these connect helpers take.
@@ -86,7 +87,7 @@ pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
     if (platform.exePathZ(buf)) |exe_path| {
         if (std.mem.lastIndexOfScalar(u8, exe_path, '/')) |slash| {
             const dir_len = slash + 1;
-            const want = "sketerm-mux";
+            const want = selfexec.BINARY;
             if (dir_len + want.len < buf.len) {
                 @memcpy(buf[dir_len .. dir_len + want.len], want);
                 buf[dir_len + want.len] = 0;
@@ -94,7 +95,7 @@ pub fn findMuxBinary(buf: *[4096:0]u8) [*:0]const u8 {
             }
         }
     }
-    return "sketerm-mux";
+    return selfexec.BINARY;
 }
 
 /// Whether a remote spec may mint or consume a UDP ticket.
@@ -451,11 +452,11 @@ pub const Conn = struct {
             var argv: [7:null]?[*:0]const u8 = .{ bin, null, null, null, null, null, null };
             var n: usize = 1;
             if (use_broker) {
-                argv[n] = "--broker";
+                argv[n] = selfexec.BROKER_FLAG;
                 n += 1;
             }
             if (sock_z) |z| {
-                argv[n] = "--socket";
+                argv[n] = selfexec.SOCKET_FLAG;
                 argv[n + 1] = z;
                 n += 2;
             }
@@ -972,8 +973,8 @@ pub const Conn = struct {
         if (prepared_command) |command| {
             push(&argv, &argc, command.ptr);
         } else {
-            push(&argv, &argc, "sketerm-mux");
-            push(&argv, &argc, "--udp-listen");
+            push(&argv, &argc, selfexec.BINARY);
+            push(&argv, &argc, selfexec.Mode.udp_listen.flag().?.ptr);
             if (range_z) |range| {
                 push(&argv, &argc, "--udp-port");
                 push(&argv, &argc, range.ptr);
@@ -1094,7 +1095,7 @@ pub const Conn = struct {
         // own socket, and merely loses the punch — never the connect.
         var fd_z_buf: [16:0]u8 = undefined;
         var argv2 = [_:null]?[*:0]const u8{
-            mux_bin, "--udp-connect", bh_z.ptr, port_z.ptr, key_z.ptr, null, null,
+            mux_bin, selfexec.Mode.udp_connect.flag().?.ptr, bh_z.ptr, port_z.ptr, key_z.ptr, null, null,
         };
         if (punch_fd >= 0) {
             if (std.fmt.bufPrintZ(&fd_z_buf, "{d}", .{punch_fd})) |fz| {
@@ -1266,12 +1267,12 @@ pub const Conn = struct {
         n += 1;
         var command_buf: [4300:0]u8 = undefined;
         if (remote_mux) |path| {
-            const command = std.fmt.bufPrintZ(&command_buf, "exec \"{s}\" --proxy", .{path}) catch return error.BadPath;
+            const command = std.fmt.bufPrintZ(&command_buf, "exec \"{s}\" {s}", .{ path, selfexec.Mode.proxy.flag().? }) catch return error.BadPath;
             argv_buf[n] = command.ptr;
             n += 1;
         } else {
-            argv_buf[n] = "sketerm-mux";
-            argv_buf[n + 1] = "--proxy";
+            argv_buf[n] = selfexec.BINARY;
+            argv_buf[n + 1] = selfexec.Mode.proxy.flag().?.ptr;
             n += 2;
         }
         argv_buf[n] = null;

@@ -185,6 +185,8 @@ comptime {
     _ = @import("mux/client.zig");
     _ = @import("mux/punch.zig");
     _ = @import("mux/rudp.zig");
+    _ = @import("mux/selfexec.zig");
+    _ = @import("procinv.zig");
     _ = @import("mux/shell.zig");
     _ = @import("mux/snapshot.zig");
     _ = @import("mux/wavcap.zig");

@@ -9,6 +9,7 @@ const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const wire = @import("wire.zig");
 const platform = @import("../util/platform.zig");
+const selfexec = @import("selfexec.zig");
 const pathz = @import("../util/pathz.zig");
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
@@ -1486,9 +1487,10 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
     var req = req_in;
     var keep_exe: [4096:0]u8 = undefined;
     var keep_argv: [2][]const u8 = undefined;
+    var exec_path: ?[*:0]const u8 = null;
     if (req.display) {
-        const exe = platform.selfExecPathZ(&keep_exe) orelse return error.NoSelfExePath;
-        keep_argv = .{ exe, "--keep" };
+        exec_path = (platform.selfExecPathZ(&keep_exe) orelse return error.NoSelfExePath).ptr;
+        keep_argv = .{ selfexec.BINARY, selfexec.Mode.keep.flag().? };
         req.argv = &keep_argv;
     }
 
@@ -1686,6 +1688,7 @@ pub fn spawnSessionWithOrigin(self: *Daemon, req_in: SpawnReq, origin_id: Sessio
 
     var pty = try Pty.spawn(.{
         .argv = argv_ptrs.items,
+        .exec_path = exec_path,
         .cwd = req.cwd,
         .env = env_ptrs.items,
         .rows = req.rows,

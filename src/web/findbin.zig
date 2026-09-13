@@ -9,6 +9,9 @@ const platform = @import("../util/platform.zig");
 
 pub const HELPER_NAME = "sketerm-webengine";
 
+/// Switch Chromium puts on every subprocess it launches from the helper image.
+pub const SUBPROCESS_SWITCH = "--type=";
+
 /// The helper next to our own executable (installed layout and
 /// `zig build` trees both), then the dev build tree, then the cwd.
 /// `$SKETERM_WEB_BIN` pins it outright, which is what test rigs use —

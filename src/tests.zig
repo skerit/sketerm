@@ -308,6 +308,8 @@ comptime {
     _ = @import("mux/rudp.zig");
     _ = @import("mux/display.zig");
     _ = @import("mux/keep.zig");
+    _ = @import("mux/selfexec.zig");
+    _ = @import("procinv.zig");
     _ = @import("mux/xwayland.zig");
     _ = @import("render/atlas_test.zig");
     _ = @import("render/atlas.zig");

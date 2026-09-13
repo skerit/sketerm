@@ -14,12 +14,13 @@
 
 const std = @import("std");
 const c = @import("../c.zig").c;
+const selfexec = @import("selfexec.zig");
 
 /// True when `argv` asks for keeper mode. Call this FIRST in any main
 /// that may host a daemon.
 pub fn wanted(argv: []const [*:0]const u8) bool {
     for (argv[@min(argv.len, 1)..]) |a| {
-        if (std.mem.eql(u8, std.mem.span(a), "--keep")) return true;
+        if (selfexec.Mode.keep.is(std.mem.span(a))) return true;
     }
     return false;
 }

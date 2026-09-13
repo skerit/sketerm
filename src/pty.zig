@@ -20,8 +20,10 @@ pub const SpawnError = error{
 };
 
 pub const SpawnOpts = struct {
-    /// Null-terminated argv. argv[0] is the binary to exec.
+    /// Null-terminated argv. argv[0] is the binary to exec unless `exec_path` is set.
     argv: []const [*:0]const u8,
+    /// File to exec when argv[0] is only the name the child should carry. null = argv[0].
+    exec_path: ?[*:0]const u8 = null,
     /// Working directory for the child. null = inherit.
     cwd: ?[]const u8 = null,
     rows: u16 = 24,
@@ -378,7 +380,7 @@ pub const Pty = struct {
             argv_buf[0] = @ptrCast(&login_buf);
         }
 
-        _ = c.execvp(opts.argv[0], @ptrCast(&argv_buf));
+        _ = c.execvp(opts.exec_path orelse opts.argv[0], @ptrCast(&argv_buf));
         // execvp returned → failure.
         const msg = "sketerm: execvp failed\n";
         _ = c.write(2, msg.ptr, msg.len);

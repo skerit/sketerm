@@ -209,9 +209,11 @@ not automated.
   test instances by exact pid; for a daemon, list read-only with
   `pgrep -x sketerm-mux` and kill only the pid whose
   `/proc/<pid>/environ` contains your isolated `XDG_RUNTIME_DIR=`.
-- A detached daemon that re-exec'd via `/proc/self/exe` has comm
-  **"exe"**, so `pgrep -x sketerm-mux` misses it. A stale test
-  daemon can keep serving an old binary on its socket.
+- `sketerm doctor` lists every sketerm process of the current user,
+  including daemons older than 0.1.5 that re-exec'd via
+  `/proc/self/exe` with comm **"exe"** and are missed by
+  `pgrep -x sketerm-mux`. A stale test daemon can keep serving an
+  old binary on its socket.
 - Keep isolated socket paths SHORT (`sockaddr_un` caps at ~108
   bytes). A daemon under a deep scratch path fails to bind and the
   GUI silently autostarts the INSTALLED daemon instead.

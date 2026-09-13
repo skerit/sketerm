@@ -7,6 +7,7 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const daemon = @import("mux/daemon.zig");
 const platform = @import("util/platform.zig");
+const selfexec = @import("mux/selfexec.zig");
 const VERSION = @import("version.zig").string;
 
 const HELP =
@@ -61,9 +62,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var broker_mode = false;
     var idle_exit_ms: i64 = 0;
     const argv = init.args.vector;
+    // Self-spawns exec /proc/self/exe, which the kernel would name "exe".
+    platform.setProcessName(selfexec.BINARY);
     // Cross-host daemon jobs can originate Tor-routed SSH themselves, so the
     // libc-only binary must expose the same hidden ProxyCommand entry point.
-    if (argv.len == 5 and std.mem.eql(u8, std.mem.span(argv[1]), "--internal-socks5-connect")) {
+    if (argv.len == 5 and selfexec.Mode.socks5_connect.is(std.mem.span(argv[1]))) {
         return @import("mux/socks5_client.zig").serve(
             std.mem.span(argv[2]),
             std.mem.span(argv[3]),
@@ -73,10 +76,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
         const a = std.mem.span(argv[i]);
-        if (std.mem.eql(u8, a, "--socket") and i + 1 < argv.len) {
+        if (std.mem.eql(u8, a, selfexec.SOCKET_FLAG) and i + 1 < argv.len) {
             i += 1;
             sock_path = std.mem.span(argv[i]);
-        } else if (std.mem.eql(u8, a, "--broker")) {
+        } else if (std.mem.eql(u8, a, selfexec.BROKER_FLAG)) {
             // Process-isolation mode: hold no sessions; fork one worker per
             // session and hand client fds to workers (Firefox-style).
             broker_mode = true;
@@ -90,34 +93,34 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 return 2;
             };
             idle_exit_ms = @as(i64, secs) * 1000;
-        } else if (std.mem.eql(u8, a, "--job")) {
+        } else if (selfexec.Mode.job.is(a)) {
             // Internal: file-job helper (spawned by the daemon; spec on
             // stdin, JSON-lines progress on stdout). One process per
             // copy/delete_tree/hash operation — kill = cancel.
             return @import("mux/fsjob.zig").serve(allocator);
-        } else if (std.mem.eql(u8, a, "--keep")) {
+        } else if (selfexec.Mode.keep.is(a)) {
             // Internal: the keeper child of a display session. Blocks
             // on stdin (its PTY) and exits at EOF, so the PTY machinery
             // is exactly what it is for a shell — no special case in
             // the daemon, and killing the session kills this.
             platform.ignoreSigpipe();
             return @import("mux/keep.zig").serve();
-        } else if (std.mem.eql(u8, a, "display")) {
+        } else if (selfexec.Mode.display.is(a)) {
             // Everything after the keyword belongs to the subcommand.
             var rest: std.ArrayList([]const u8) = .empty;
             defer rest.deinit(allocator);
             // Preserve a global `--socket PATH` parsed before `display`.
             // A display-local option comes later and therefore wins.
             if (sock_path) |path| {
-                rest.append(allocator, "--socket") catch return 1;
+                rest.append(allocator, selfexec.SOCKET_FLAG) catch return 1;
                 rest.append(allocator, path) catch return 1;
             }
             var j: usize = i + 1;
             while (j < argv.len) : (j += 1) rest.append(allocator, std.mem.span(argv[j])) catch return 1;
             return @import("mux/display.zig").run(allocator, rest.items);
-        } else if (std.mem.eql(u8, a, "--proxy")) {
+        } else if (selfexec.Mode.proxy.is(a)) {
             return runProxy(allocator);
-        } else if (std.mem.eql(u8, a, "--udp-listen")) {
+        } else if (selfexec.Mode.udp_listen.is(a)) {
             // Optional: --udp-port 60000:61000 (firewalls usually need a
             // pinned range, like mosh's 60000-61000) and --socket PATH
             // (bridge to a specific daemon instance — the udp-ticket
@@ -133,7 +136,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                         std.debug.print("sketerm-mux: bad --udp-port (want lo:hi)\n", .{});
                         return 2;
                     };
-                } else if (std.mem.eql(u8, arg, "--socket") and j + 1 < argv.len) {
+                } else if (std.mem.eql(u8, arg, selfexec.SOCKET_FLAG) and j + 1 < argv.len) {
                     j += 1;
                     listen_sock = std.mem.span(argv[j]);
                 } else {
@@ -142,7 +145,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 }
             }
             return runUdpListen(allocator, range, listen_sock);
-        } else if (std.mem.eql(u8, a, "--udp-connect") and i + 3 < argv.len) {
+        } else if (selfexec.Mode.udp_connect.is(a) and i + 3 < argv.len) {
             // Optional 4th arg: an inherited pre-bound socket fd — the
             // port the client announced in its punch line. Old binaries
             // ignore trailing args here, so version skew degrades to a
@@ -216,22 +219,8 @@ fn runProxy(allocator: std.mem.Allocator) u8 {
 
     const client = @import("mux/client.zig");
     var conn = client.Conn.connect(allocator, path) catch blk: {
-        // No daemon yet — start one (re-exec ourselves, detached via
-        // double fork so it reparents to init and outlives the ssh).
-        const pid = cc.fork();
-        if (pid == 0) {
-            _ = cc.setsid();
-            if (cc.fork() == 0) {
-                var self_buf: [4096:0]u8 = undefined;
-                if (platform.selfExecPathZ(&self_buf)) |_| {
-                    const argv0 = [_:null]?[*:0]const u8{ &self_buf, null };
-                    _ = cc.execv(&self_buf, @ptrCast(@constCast(&argv0)));
-                }
-            }
-            cc._exit(0);
-        }
-        var st: c_int = 0;
-        _ = cc.waitpid(pid, &st, 0);
+        // No daemon yet — start one.
+        autostartDaemon();
         var tries: u32 = 0;
         while (tries < 40) : (tries += 1) {
             _ = cc.usleep(50_000);
@@ -650,20 +639,7 @@ fn connectDaemonRetry(allocator: std.mem.Allocator, sock_path: ?[]const u8) ?c_i
     } else |_| {}
     if (sock_path != null) return null;
 
-    const pid = cc.fork();
-    if (pid == 0) {
-        _ = cc.setsid();
-        if (cc.fork() == 0) {
-            var self_buf: [4096:0]u8 = undefined;
-            if (platform.selfExecPathZ(&self_buf)) |_| {
-                const argv0 = [_:null]?[*:0]const u8{ &self_buf, null };
-                _ = cc.execv(&self_buf, @ptrCast(@constCast(&argv0)));
-            }
-        }
-        cc._exit(0);
-    }
-    var st: c_int = 0;
-    _ = cc.waitpid(pid, &st, 0);
+    autostartDaemon();
     var tries: u32 = 0;
     while (tries < 40) : (tries += 1) {
         _ = cc.usleep(50_000);
@@ -675,6 +651,27 @@ fn connectDaemonRetry(allocator: std.mem.Allocator, sock_path: ?[]const u8) ?c_i
         } else |_| {}
     }
     return null;
+}
+
+/// Start the default daemon from our own image, detached by a double fork so it reparents to
+/// init and outlives the ssh session that asked for it. Returns once the middle child is reaped.
+fn autostartDaemon() void {
+    const cc = @import("c.zig").c;
+    const pid = cc.fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        _ = cc.setsid();
+        if (cc.fork() == 0) {
+            var self_buf: [4096:0]u8 = undefined;
+            if (platform.selfExecPathZ(&self_buf)) |_| {
+                const argv = [_:null]?[*:0]const u8{ selfexec.BINARY, null };
+                _ = cc.execv(&self_buf, @ptrCast(@constCast(&argv)));
+            }
+        }
+        cc._exit(0);
+    }
+    var st: c_int = 0;
+    _ = cc.waitpid(pid, &st, 0);
 }
 
 var g_daemon: ?*daemon.Daemon = null;

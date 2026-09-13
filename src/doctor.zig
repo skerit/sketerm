@@ -15,6 +15,7 @@ const mcp_registry = @import("ipc/mcp_registry.zig");
 const version = @import("version.zig");
 const build_options = @import("build_options");
 const opuscodec = @import("mux/opuscodec.zig");
+const procinv = @import("procinv.zig");
 
 /// Daemon `list` reply; pre-doctor daemons omit version/caps fields
 /// and show up as version "" (reported as "pre-0.1.0 or stale").
@@ -31,6 +32,8 @@ const Welcome = struct {
         name: []const u8 = "",
         app: bool = false,
         exited: bool = false,
+        /// The session child's pid, which is how a session is tied to its worker process.
+        pid: i64 = 0,
     };
 };
 
@@ -99,7 +102,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
             _ = c.fputs(
                 "Usage: sketerm doctor [host]\n\n" ++
                     "Checks: local daemon reachability + PID + version/proto/capability\n" ++
-                    "skew, active MCP servers, GUI sockets, and terminfo install.\n" ++
+                    "skew, active MCP servers, GUI sockets, terminfo install, and every\n" ++
+                    "running sketerm process of this user (daemons, session workers,\n" ++
+                    "helpers), warning about a daemon its own socket no longer reaches.\n" ++
                     "With a host ([domain.<name>], user@box or udp:box): probes the\n" ++
                     "remote sketerm-mux for the same skew.\n\nExit: 0 healthy, 1 warnings.\n",
                 platform.stdout(),
@@ -123,6 +128,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) u8 {
     warns += checkDaemon(allocator, null, palette);
     warns += checkMcp(allocator, palette);
     warns += checkGui(allocator, palette);
+    warns += checkProcesses(allocator, palette);
     warns += checkTerminfo(allocator, palette);
 
     if (host) |h_raw| {
@@ -406,6 +412,175 @@ fn checkGui(allocator: std.mem.Allocator, palette: Palette) u32 {
     return 0;
 }
 
+const SocketState = enum { serving, gone, taken, refused, unknown };
+
+const DaemonProbe = struct {
+    path: []const u8 = "",
+    state: SocketState = .unknown,
+    /// Process answering the socket instead, when `state` is `.taken`.
+    peer: c.pid_t = 0,
+    /// Live sessions the daemon listed; null when it could not be asked.
+    sessions: ?u32 = null,
+};
+
+/// Session names keyed by the listed process holding each session.
+const SessionNames = std.AutoHashMapUnmanaged(c.pid_t, std.ArrayList([]const u8));
+
+/// Resolve a daemon's socket, check the daemon itself answers it, and note which listed
+/// process holds each of its sessions. Reads only; a socket it cannot reach is reported.
+fn probeDaemon(a: std.mem.Allocator, inv: *const procinv.Inventory, p: *const procinv.Proc, names: *SessionNames) DaemonProbe {
+    const env_buf = a.alloc(u8, 1 << 16) catch return .{};
+    const path = (procinv.daemonSocket(a, p, platform.environOfPid(p.pid, env_buf)) catch null) orelse return .{};
+    const raw = mux_client.Conn.connect(a, path) catch
+        return .{ .path = path, .state = if (pathExists(path)) .refused else .gone };
+    const peer = platform.unixPeerPid(raw.fd) orelse p.pid;
+    if (peer != p.pid) {
+        var other = raw;
+        other.deinit();
+        return .{ .path = path, .state = .taken, .peer = peer };
+    }
+    var probe = DaemonProbe{ .path = path, .state = .serving };
+    var conn = mux_client.Conn.probe(a, raw) catch return probe;
+    defer conn.deinit();
+    conn.sendFrame(.list, "") catch return probe;
+    const frame = conn.recvExpectFor(&.{.welcome}, 3_000) catch return probe;
+    defer frame.deinit(a);
+    const welcome = std.json.parseFromSliceLeaky(Welcome, a, frame.payload, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return probe;
+    var live: u32 = 0;
+    for (welcome.sessions) |s| {
+        if (s.exited) continue;
+        live += 1;
+        const holder = inv.sessionHolder(std.math.cast(c.pid_t, s.pid) orelse continue) orelse continue;
+        const entry = names.getOrPut(a, holder.pid) catch continue;
+        if (!entry.found_existing) entry.value_ptr.* = .empty;
+        entry.value_ptr.append(a, s.name) catch {};
+    }
+    probe.sessions = live;
+    return probe;
+}
+
+/// Warnings a probe raises: a live daemon no client can reach.
+fn probeWarns(p: *const procinv.Proc, probe: DaemonProbe) u32 {
+    if (!p.isDaemon()) return 0;
+    return switch (probe.state) {
+        .gone, .taken, .refused => 1,
+        .serving, .unknown => 0,
+    };
+}
+
+fn formatAge(buf: []u8, ms: i64) []const u8 {
+    if (ms < 0) return "up ?";
+    const s: u64 = @intCast(@divTrunc(ms, 1000));
+    return (if (s < 60)
+        std.fmt.bufPrint(buf, "up {d}s", .{s})
+    else if (s < 3600)
+        std.fmt.bufPrint(buf, "up {d}m", .{s / 60})
+    else if (s < 86400)
+        std.fmt.bufPrint(buf, "up {d}h{d:0>2}m", .{ s / 3600, s / 60 % 60 })
+    else
+        std.fmt.bufPrint(buf, "up {d}d{d}h", .{ s / 86400, s / 3600 % 24 })) catch "up ?";
+}
+
+/// Most session names printed on one daemon row before the rest collapse into a count.
+const max_row_sessions = 6;
+
+fn writeProcRow(writer: *std.Io.Writer, palette: Palette, p: *const procinv.Proc, probe: DaemonProbe, sessions: []const []const u8) !void {
+    const indent = 10 + 2 * @as(usize, p.depth);
+    for (0..indent) |_| try writer.writeByte(' ');
+    var label_buf: [96]u8 = undefined;
+    var age_buf: [24]u8 = undefined;
+    // Unsigned: a signed integer given a width prints its sign ("+101").
+    try writer.print("{s}pid {d:<7}{s} {s:<18} {s}{s:<9}{s}", .{
+        zspan(palette.pid),
+        @as(u32, @intCast(@max(p.pid, 0))),
+        zspan(palette.reset),
+        p.label(&label_buf),
+        zspan(palette.dim),
+        formatAge(&age_buf, p.age_ms),
+        zspan(palette.reset),
+    });
+    if (p.isDaemon()) switch (probe.state) {
+        .serving => {
+            try writer.print(" {s}", .{probe.path});
+            if (probe.sessions) |n| try writer.print("  {d} session(s)", .{n});
+        },
+        .gone => try writer.print(" {s}socket gone: {s}{s}", .{ zspan(palette.warn), probe.path, zspan(palette.reset) }),
+        .taken => try writer.print(" {s}{s} is answered by pid {d}{s}", .{ zspan(palette.warn), probe.path, probe.peer, zspan(palette.reset) }),
+        .refused => try writer.print(" {s}{s} refuses connections{s}", .{ zspan(palette.warn), probe.path, zspan(palette.reset) }),
+        .unknown => try writer.print(" {s}socket unknown{s}", .{ zspan(palette.dim), zspan(palette.reset) }),
+    };
+    for (sessions[0..@min(sessions.len, max_row_sessions)], 0..) |name, i| {
+        try writer.print("{s}'{s}'", .{ if (i == 0) " " else ", ", name });
+    }
+    if (sessions.len > max_row_sessions) try writer.print(" +{d} more", .{sessions.len - max_row_sessions});
+    if (p.folded > 0) try writer.print(" +{d} subprocess(es)", .{p.folded});
+    if (p.replaced) try writer.print(" {s}[binary replaced since start]{s}", .{ zspan(palette.note), zspan(palette.reset) });
+    try writer.writeByte('\n');
+
+    if (probeWarns(p, probe) == 0) return;
+    for (0..indent + 2) |_| try writer.writeByte(' ');
+    const why = switch (probe.state) {
+        .gone => "its socket file was removed",
+        .taken => "another daemon now answers its socket",
+        else => "its socket refuses connections",
+    };
+    try writer.print("{s}WARN unreachable: {s}; its sessions live on with no way in (kill {d} ends them){s}\n", .{
+        zspan(palette.warn), why, p.pid, zspan(palette.reset),
+    });
+}
+
+/// List every sketerm process of this user as a tree, warning about daemons nobody can reach.
+fn checkProcesses(allocator: std.mem.Allocator, palette: Palette) u32 {
+    var inv = procinv.scan(allocator, c.getpid()) catch |err| {
+        printLabel(palette, "processes");
+        switch (err) {
+            error.Unsupported => {
+                _ = c.printf("%snot inspectable on this platform%s\n", palette.dim, palette.reset);
+                return 0;
+            },
+            error.OutOfMemory => {
+                _ = c.printf("%sout of memory while scanning%s\n", palette.warn, palette.reset);
+                return 1;
+            },
+        }
+    };
+    defer inv.deinit();
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var names: SessionNames = .empty;
+    const probes = a.alloc(DaemonProbe, inv.procs.len) catch return 1;
+    var folded: u32 = 0;
+    for (inv.procs, probes) |*p, *probe| {
+        probe.* = if (p.isDaemon()) probeDaemon(a, &inv, p, &names) else .{};
+        folded += p.folded;
+    }
+
+    printLabel(palette, "processes");
+    if (inv.procs.len == 0) {
+        _ = c.printf("%snone running%s\n", palette.dim, palette.reset);
+        return 0;
+    }
+    _ = c.printf("%u running", @as(c_uint, @intCast(inv.procs.len)));
+    if (folded > 0) _ = c.printf(", plus %u browser subprocess(es)", @as(c_uint, folded));
+    _ = c.printf("\n");
+
+    var warns: u32 = 0;
+    for (inv.procs, probes) |*p, probe| {
+        const held: []const []const u8 = if (names.get(p.pid)) |list| list.items else &.{};
+        var aw: std.Io.Writer.Allocating = .init(a);
+        writeProcRow(&aw.writer, palette, p, probe, held) catch continue;
+        const row = aw.written();
+        _ = c.fwrite(row.ptr, 1, row.len, platform.stdout());
+        warns += probeWarns(p, probe);
+    }
+    return warns;
+}
+
 /// Look for the compiled sketerm-256color terminfo entry in the
 /// usual databases. Missing is only a warning when TERM references
 /// it (the default child TERM is xterm-256color).
@@ -494,4 +669,55 @@ test "doctor MCP rows are aligned and color is optional" {
     try writeMcpRow(&colored.writer, Palette.init(true), entry, .{ .not_started = {} });
     try std.testing.expect(std.mem.indexOf(u8, colored.written(), "\x1b[1m") != null);
     try std.testing.expect(std.mem.indexOf(u8, colored.written(), "mux not started") != null);
+}
+
+test "doctor process rows nest by depth and name what a daemon serves" {
+    const allocator = std.testing.allocator;
+    const contains = struct {
+        fn f(haystack: []const u8, needle: []const u8) !void {
+            if (std.mem.indexOf(u8, haystack, needle) == null) {
+                std.debug.print("missing '{s}' in: {s}\n", .{ needle, haystack });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }.f;
+
+    const worker = procinv.Proc{ .pid = 101, .ppid = 100, .age_ms = 3_725_000, .argv = "sketerm-mux\x00--broker", .name = "sketerm-mux", .replaced = false, .role = .worker, .mode = .daemon, .depth = 1 };
+    var plain: std.Io.Writer.Allocating = .init(allocator);
+    defer plain.deinit();
+    try writeProcRow(&plain.writer, Palette.init(false), &worker, .{}, &.{"main"});
+    try std.testing.expectStringStartsWith(plain.written(), "            pid 101 ");
+    try contains(plain.written(), "session worker");
+    try contains(plain.written(), "up 1h02m");
+    try contains(plain.written(), " 'main'");
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOfScalar(u8, plain.written(), 0x1b));
+    try std.testing.expectEqual(@as(u32, 0), probeWarns(&worker, .{}));
+
+    const broker = procinv.Proc{ .pid = 100, .ppid = 1, .age_ms = 90_000_000, .argv = "sketerm-mux\x00--broker", .name = "sketerm-mux", .replaced = true, .role = .broker, .mode = .daemon };
+    const gone = DaemonProbe{ .path = "/run/user/1000/sketerm/mux.sock", .state = .gone };
+    var warned: std.Io.Writer.Allocating = .init(allocator);
+    defer warned.deinit();
+    try writeProcRow(&warned.writer, Palette.init(false), &broker, gone, &.{});
+    try contains(warned.written(), "daemon (broker)");
+    try contains(warned.written(), "up 1d1h");
+    try contains(warned.written(), "socket gone: /run/user/1000/sketerm/mux.sock");
+    try contains(warned.written(), "[binary replaced since start]");
+    try contains(warned.written(), "WARN unreachable: its socket file was removed");
+    try contains(warned.written(), "kill 100");
+    try std.testing.expectEqual(@as(u32, 1), probeWarns(&broker, gone));
+
+    var serving: std.Io.Writer.Allocating = .init(allocator);
+    defer serving.deinit();
+    try writeProcRow(&serving.writer, Palette.init(false), &broker, .{ .path = "/tmp/a/mux.sock", .state = .serving, .sessions = 2 }, &.{});
+    try contains(serving.written(), "/tmp/a/mux.sock  2 session(s)");
+    try std.testing.expectEqual(@as(?usize, null), std.mem.indexOf(u8, serving.written(), "WARN"));
+}
+
+test "doctor ages read at a glance" {
+    var buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("up ?", formatAge(&buf, -1));
+    try std.testing.expectEqualStrings("up 59s", formatAge(&buf, 59_999));
+    try std.testing.expectEqualStrings("up 12m", formatAge(&buf, 12 * 60_000));
+    try std.testing.expectEqualStrings("up 3h05m", formatAge(&buf, (3 * 3600 + 5 * 60) * 1000));
+    try std.testing.expectEqualStrings("up 2d4h", formatAge(&buf, (2 * 86400 + 4 * 3600) * 1000));
 }

@@ -15,6 +15,10 @@ pub fn fillSockaddrUn(addr: *c.struct_sockaddr_un, path: []const u8) error{BadPa
 
 /// The per-user daemon's default socket path.
 pub fn defaultSocketPath(allocator: std.mem.Allocator) ![]u8 {
-    const rt = platform.runtimeDir();
+    return socketPathIn(allocator, platform.runtimeDir());
+}
+
+/// The default socket path under runtime directory `rt`, as `platform.runtimeDirFrom` resolves it.
+pub fn socketPathIn(allocator: std.mem.Allocator, rt: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/sketerm/mux.sock", .{rt});
 }

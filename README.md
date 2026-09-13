@@ -127,7 +127,7 @@ zig build fetch-cef && zig build web   # the optional browser helper
 
 zig-out/bin/sketerm            # opens a tab in $SHELL
 zig-out/bin/sketerm --restore  # rebuild the last saved layout
-zig-out/bin/sketerm doctor     # daemon/version/socket/terminfo check
+zig-out/bin/sketerm doctor     # daemon/version/socket/terminfo check + running processes
 ```
 
 To install, `cd dist && ./install.sh`: Arch-compatible hosts go through
