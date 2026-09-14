@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Check offload surface generations rather than GTK's enabled property."""
+"""Check offload surface generations rather than GTK's enabled property.
+
+Bounds REQUESTS per generation, which is the quantity src/ui/offload.zig
+controls. It cannot observe the failure itself: a frame callback on a
+bufferless subsurface is never retired by KWin but IS retired by sketerm's
+own compositor, which is the one the smoke rig runs on, so `pending` here is
+always ~1 and never rises. dist/offload-callback-probe.c is the reproduction
+of the real behaviour, and it needs a KWin session.
+"""
 
 import argparse
 import collections

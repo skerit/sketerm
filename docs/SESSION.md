@@ -20745,3 +20745,54 @@ The original incident's exact surface was never traced. Unit tests pass
 (3,351 passed, 7 skipped), as do the focused offload and socket/SSH/auto/UDP
 Kill Session regressions. Full smoke-e2e remains blocked at browser-helper
 socket startup, not this focused stage.
+
+## 2026-09-14: the offload callback leak, traced end to end
+
+The previous entry bounded a quantity without knowing whether it was the
+right one. It is. The mechanism is now measured rather than inferred, and
+`dist/offload-callback-probe.c` reproduces every step against a KWin session.
+
+GTK requests one frame callback per subsurface per toplevel paint,
+unconditionally: `gdk_wayland_surface_request_frame` walks
+`gdk_surface_get_n_subsurfaces` and calls `gdk_wayland_subsurface_request_frame`,
+which does `wl_surface_frame` plus `wl_surface_commit` with no check that the
+subsurface holds a buffer. When GSK declines to offload a frame,
+`gdk_wayland_subsurface_detach` issues `wl_surface_attach (surface, NULL)` and
+keeps the GdkSubsurface alive, so the requests keep going out against a surface
+the compositor will never present. Both are unchanged on GTK main.
+
+Measured on KWin 6.7.5 with the probe: a subsurface holding a buffer retires
+600 of 600 callbacks; a bufferless one retires 0 of 600 and keeps growing.
+Destroying it releases exactly one twelve-byte `wl_display.delete_id` per
+accumulated callback in a single burst (604 outstanding produced 604 replies).
+KWin's outgoing buffer holds 1048576/12 = 87,381 of them, which one detached
+subsurface reaches in about 24 minutes at 60 Hz. That is the journal's
+`Data too big for buffer (1048572 + 12 > 1048576)`, followed by
+`error in client communication` and GTK's `Error flushing display`, six times
+between 2026-08-27 and 2026-09-13. It is also the 2026-08-16 core: the client
+destroys each proxy but a never-fired callback is never `delete_id`ed, so the
+id is never reclaimed, which is why that core held 15.7M object slots with an
+empty free list until `wl_surface_frame` returned NULL. Both failures are the
+same leak; only the way out differs. A tab switch destroys the subsurface,
+which is why switching tabs is what the user sees.
+
+Renewing the subsurface every 128 paints is therefore aimed correctly. The
+probe confirms the strategy at protocol level on the same compositor:
+outstanding callbacks never exceed 128 and each retirement releases about 3 KB
+instead of an unbounded burst.
+
+What the focused smoke regression does NOT prove: sketerm's own compositor
+retires frame callbacks on bufferless subsurfaces (the same probe under
+`sketerm run` reports 300 done, 0 outstanding), so the pathological state never
+arises in the rig and `test-offload-trace.py`'s pending count is always ~1. It
+bounds REQUESTS, which is a proxy. The CSS `opacity` trigger it uses is also not
+the real one: on GTK 4.22.4 with KWin, an opacity rejection drops the
+subsurface after one frame (`GskOpacityNode`, one generation, two callbacks)
+rather than leaving a detached one alive. Both traces in
+`/tmp/opencode/sketerm-renew-verify/` retired 100% of callbacks; what the fix
+measurably changed there was in-flight depth, 113 down to 20.
+
+Open and deliberately not acted on: sketerm's wlhost firing frame callbacks for
+surfaces it never presents is what makes the rig unrepresentative. Changing it
+would make the regression real but touches forwarded-app pacing, so it is a
+separate decision. The GTK bug itself is unreported upstream.
