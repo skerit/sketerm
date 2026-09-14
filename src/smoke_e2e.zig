@@ -671,11 +671,22 @@ pub fn main() u8 {
             tor_line = std.fmt.bufPrint(&tor_line_buf, "mux_tor_socks_endpoint = 127.0.0.1:{d}\n", .{tor_stub.lis.port}) catch return fail("tor line");
         }
         var config_buf: [256]u8 = undefined;
-        const config_text = std.fmt.bufPrint(&config_buf, "# smoke-e2e\napp_view = window\n{s}{s}", .{
+        const config_text = std.fmt.bufPrint(&config_buf, "# smoke-e2e\napp_view = window\ngraphics_offload = true\n{s}{s}", .{
             if (c.getenv("SKETERM_SMOKE_E2E_FILES_ICONS") != null) "files_default_view = icons\n" else "",
             tor_line,
         }) catch return fail("config text");
         if (!writeFile(cfg, config_text)) return fail("could not write the isolated config.conf");
+    }
+
+    if (c.getenv("SKETERM_SMOKE_E2E_OFFLOAD_ONLY") != null) {
+        var css_dir_buf: [320:0]u8 = undefined;
+        const css_dir = std.fmt.bufPrintZ(&css_dir_buf, "{s}/gtk-4.0", .{rt}) catch return fail("offload CSS directory");
+        _ = c.mkdir(css_dir.ptr, 0o700);
+        var css_path_buf: [350:0]u8 = undefined;
+        const css_path = std.fmt.bufPrintZ(&css_path_buf, "{s}/gtk.css", .{css_dir}) catch return fail("offload CSS path");
+        // A mapped wrapper whose content GSK rejects reproduced callback
+        // accumulation despite the old hidden-tab fix. Do not hide it.
+        if (!writeFile(css_path, "graphicsoffload { opacity: 0.5; }\n")) return fail("offload CSS write");
     }
 
     var offload_lib_buf: [512:0]u8 = undefined;
@@ -742,8 +753,9 @@ pub fn main() u8 {
         // if that is ever wanted it needs its own test with its own
         // private bus (src/mux/a11yhub.zig spawns one per app session).
         _ = c.setenv("GTK_A11Y", "none", 1);
-        if (c.getenv("SKETERM_SMOKE_E2E_KILL_IMAGES") != null) {
-            const trace = c.open("zig-out/smoke-e2e-kill-wayland.log", c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
+        if (c.getenv("SKETERM_SMOKE_E2E_KILL_IMAGES") != null or c.getenv("SKETERM_SMOKE_E2E_OFFLOAD_ONLY") != null) {
+            const path: [*:0]const u8 = if (c.getenv("SKETERM_SMOKE_E2E_OFFLOAD_ONLY") != null) "zig-out/smoke-e2e-offload-wayland.log" else "zig-out/smoke-e2e-kill-wayland.log";
+            const trace = c.open(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, 0o600));
             if (trace < 0 or c.dup2(trace, 2) < 0) c._exit(126);
             if (trace != 2) _ = c.close(trace);
             _ = c.setenv("WAYLAND_DEBUG", "client", 1);
@@ -815,7 +827,22 @@ pub fn main() u8 {
     if (c.getenv("SKETERM_SMOKE_E2E_OFFLOAD_ONLY") != null) {
         const app = drive orelse return fail("focused offload smoke needs the isolated Wayland display");
         if (offloadPolicyStage(allocator, app, sock_path)) |why| return failMsg(why);
+        // The general rig SIGKILLs its GUI. This stage must observe normal
+        // surface destruction, not mistake a truncated trace for a leak.
+        app.closeWindow(app.windows.items[0].id) catch return fail("offload final window close failed");
+        const exit_deadline = clock.nowMs() + 10_000;
+        var exit_status: c_int = 0;
+        while (clock.nowMs() < exit_deadline) {
+            if (c.waitpid(child_pid, &exit_status, c.WNOHANG) == child_pid) {
+                child_pid = 0;
+                if (exit_status != 0) return fail("offload GUI exited abnormally");
+                break;
+            }
+            _ = app.pumpOnce(20);
+        } else return fail("offload GUI did not close cleanly");
         teardown();
+        if (c.system("python3 dist/test-offload-trace.py --self-test") != 0) return fail("offload trace parser self-tests failed");
+        if (c.system("python3 dist/test-offload-trace.py zig-out/smoke-e2e-offload-wayland.log") != 0) return fail("offload callback generation bound failed");
         return 0;
     }
     if (c.getenv("SKETERM_SMOKE_E2E_KILL_SESSION_ONLY") != null) {
@@ -5402,18 +5429,61 @@ fn offloadPolicyStage(allocator: std.mem.Allocator, app: *appdrive.App, sock: [:
     if (!closeGuiPaneAndWait(allocator, sock, browser_pane)) return "offload browser close failed";
     if (expectOffload(allocator, app, 1, 2)) |why| return why;
     const start = app.windows.items[0].frames;
-    const animate = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"sh -c 'i=0; while [ $i -lt 200 ]; do printf \\\\rFRAME-%s $i; i=$((i+1)); sleep 0.02; done'\\n\"}}\n", .{panes[1]}) catch return "offload redraw format";
+    const animate = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"sh -c 'i=0; while :; do printf \\\\rFRAME-%s $i; i=$((i+1)); sleep 0.02; done'\\n\"}}\n", .{panes[1]}) catch return "offload redraw format";
     const sent = roundtrip(allocator, sock, animate) orelse return "offload redraw command failed";
     defer allocator.free(sent);
-    const deadline = clock.nowMs() + 15_000;
-    while (app.windows.items[0].frames - start < 120) {
-        if (clock.nowMs() >= deadline) return "offload sibling never rendered 120 frames";
+    const deadline = clock.nowMs() + 60_000;
+    while (app.windows.items[0].frames - start < 600) {
+        if (clock.nowMs() >= deadline) return "offload sibling never rendered 600 frames";
         if (expectOffload(allocator, app, 1, 2)) |why| return why;
         _ = app.pumpOnce(20);
     }
+    const stop_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-keys\",\"pane\":{d},\"data\":\"ctrl+c\"}}\n", .{panes[1]}) catch return "offload stop format";
+    const stopped = roundtrip(allocator, sock, stop_req) orelse return "offload redraw stop failed";
+    defer allocator.free(stopped);
+    if (!mcpHas(stopped, "\"ok\":true")) return "offload redraw stop refused";
     if (!closeGuiPaneAndWait(allocator, sock, panes[0])) return "offload hidden history close failed";
     if (expectOffload(allocator, app, 1, 1)) |why| return why;
-    say("offload properties: repeated tab show/hide, file-face hide/show, 120 sibling frames and hidden-history close passed");
+
+    // Explicit true in config must stay harmless across reload and dialog
+    // restore, not only when the pane was first constructed.
+    for ([_][]const u8{ "reload_config", "prefs_open" }) |action| {
+        const req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"action\",\"pane\":{d},\"data\":\"{s}\"}}\n", .{ panes[1], action }) catch return "offload action format";
+        const reply = roundtrip(allocator, sock, req) orelse return "offload action failed";
+        defer allocator.free(reply);
+        if (!mcpHas(reply, "\"ok\":true")) return "offload action refused";
+        if (std.mem.eql(u8, action, "reload_config")) {
+            if (expectOffload(allocator, app, 1, 1)) |why| return why;
+        }
+    }
+    const prefs = blk: {
+        const until = clock.nowMs() + 10_000;
+        while (clock.nowMs() < until) {
+            _ = app.pumpOnce(100);
+            for (app.windows.items) |w| {
+                if (!w.popup and w.frames > 0 and std.mem.eql(u8, w.title orelse "", "Preferences")) break :blk w.id;
+            }
+        }
+        return "offload Preferences never rendered";
+    };
+    app.closeWindow(prefs) catch return "offload Preferences close failed";
+    if (!waitToplevelGone(app, prefs, 10_000)) return "offload Preferences remained open";
+    if (expectOffload(allocator, app, 1, 1)) |why| return why;
+
+    const split_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"split\",\"pane\":{d},\"direction\":\"h\"}}\n", .{panes[1]}) catch return "offload split format";
+    const split = roundtrip(allocator, sock, split_req) orelse return "offload split failed";
+    defer allocator.free(split);
+    const split_pane = parseNumAfter(split, "\"pane\":") orelse return "offload split missing id";
+    if (expectOffload(allocator, app, 2, 1)) |why| return why;
+    if (!closeGuiPaneAndWait(allocator, sock, split_pane)) return "offload split close failed";
+    if (expectOffload(allocator, app, 1, 1)) |why| return why;
+
+    const text_req = std.fmt.bufPrint(&req_buf, "{{\"cmd\":\"send-text\",\"pane\":{d},\"data\":\"printf '%s%s\\\\n' OFFLOAD OK\\n\"}}\n", .{panes[1]}) catch return "offload text format";
+    const text_reply = roundtrip(allocator, sock, text_req) orelse return "offload text send failed";
+    defer allocator.free(text_reply);
+    if (!waitPaneText(allocator, sock, panes[1], "OFFLOADOK", 10_000)) return "offload survivor did not execute fresh input";
+    if (waitOcrWordCenter(allocator, app, app.windows.items[0].id, "OFFLOADOK", 10_000) == null) return "offload survivor text was not visible in rendered pixels";
+    say("offload remained enabled across renewal, tab/face switches, reload, Preferences restore and splits; fresh terminal text rendered");
     return null;
 }
 
