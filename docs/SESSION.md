@@ -20686,3 +20686,62 @@ pass. The bounded KWin experiment reproduced callback retention and burst
 release, not the full 1 MiB disconnect; that failure is recorded in the
 user's journal. The full GUI suite remains blocked at browser-helper startup
 on this host, before these stages.
+
+## 2026-09-14: bound offload surface lifetimes on stock GTK
+
+Switching to the Orcono terminal tab produced the same KWin 1 MiB outgoing
+buffer failure and GTK exit status 1. The earlier unmap fix was insufficient:
+an isolated GTK 4.22.4 probe with opacity-rejected content retained 1,320
+callbacks while the offload widget remained mapped. Disabling a surface with
+an existing backlog releases its callbacks in a burst; it does not prevent
+their accumulation. The incident's specific surface was not traced.
+
+The blanket Wayland disable was rejected and removed. There is no private
+GTK dependency, backend replacement, or change to the offload preference.
+`ui/offload.zig` instead observes existing toplevel paints and renews the
+oldest enabled offload after 128 paints. One renewal per clock/paint staggers
+retirement replies across siblings. Both property changes precede the next
+snapshot, so GTK replaces the subsurface while retaining the GLArea, its GL
+context and its rendered texture. Idle panes do not gain a periodic timer.
+Pane teardown disconnects the shared clock observer before freeing its
+embedded guard; unit coverage includes fairness with 129 sibling guards.
+
+Overview opening suspends offload while page thumbnails are captured;
+closing restores the existing policy. Cached previews must be pixel images,
+not retained raw render nodes containing live offload surfaces: retaining
+such a node indefinitely also retains its old subsurface and defeats renewal.
+The existing screenshot path releases its node within the call, and the
+inspected AdwTabPaintable caches a rendered texture. Opening/closing overview
+and Preferences, screenshots, and cross-window tab transfer were exercised
+in the stock-GTK run rather than assuming those owners release their nodes.
+
+The focused `SKETERM_SMOKE_E2E_OFFLOAD_ONLY=1 zig build smoke-e2e` regression
+uses explicit offload=true and opacity-rejected content, requires enabled
+mapped wrappers across tab/face switches, reload, Preferences closure and
+split creation/removal, and verifies fresh terminal pixels with OCR. It waits
+for 600 actual redraws, then closes normally so the protocol trace includes
+surface destruction. `dist/test-offload-trace.py` accounts for reused object
+IDs and requires every exercised offload generation to retire within the
+fixture's 160-request ceiling. Five parser self-tests include a retained
+generation that must fail even if its callbacks eventually complete.
+
+Independent stock-GTK/KWin runs on the RX 7900 XT exceeded 2,100 paints each:
+normal rendering performed 2,747 actual dma-buf offload attachments; opacity
+rejection was still enabled and renewed rather than globally prohibited.
+All 56 offload generations in each new run were destroyed, with at most 130
+requests per generation. The old binary's trace fails the same checker at
+2,596 requests. Normal throughput was 59.77 FPS before and 59.91 FPS after;
+GUI CPU/frame median was 1.314 ms before and 1.326 ms after (one traced run,
+not a statistical performance guarantee). Artifacts are under
+`/tmp/opencode/sketerm-renew-verify/`.
+
+The independent runs also exposed busy CLI PNG refusals in both old and new
+binaries; successful snapshots verified live/idle/final text, but screenshot
+reliability is not claimed fixed. Thirteen final delete_id replies were not
+observed after opacity-run shutdown, although the corresponding surface was
+destroyed. The focused smoke's own compositor retires callbacks promptly,
+so KWin's rejected-content run is the evidence for bounded pending callbacks.
+The original incident's exact surface was never traced. Unit tests pass
+(3,351 passed, 7 skipped), as do the focused offload and socket/SSH/auto/UDP
+Kill Session regressions. Full smoke-e2e remains blocked at browser-helper
+socket startup, not this focused stage.
