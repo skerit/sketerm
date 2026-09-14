@@ -620,6 +620,7 @@ pub const Window = struct {
         c.adw_tab_overview_set_child(@ptrCast(overview), toolbar_view);
         c.adw_tab_overview_set_enable_new_tab(@ptrCast(overview), 1);
         _ = c.g_signal_connect_data(overview, "create-tab", @ptrCast(&onOverviewCreateTab), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+        _ = c.g_signal_connect_data(overview, "notify::open", @ptrCast(&onOverviewOpen), null, null, c.G_CONNECT_DEFAULT);
         const tab_btn = c.adw_tab_button_new();
         c.adw_tab_button_set_view(@ptrCast(tab_btn), @ptrCast(tab_view_w));
         c.gtk_widget_set_tooltip_text(tab_btn, "Tab Overview");
@@ -3312,6 +3313,17 @@ pub const Window = struct {
         // their own selection once every tab exists.
         if (!at_end) c.adw_tab_view_set_selected_page(self.tab_view, page);
         return page;
+    }
+
+    fn onOverviewOpen(overview: *c.AdwTabOverview, _: *c.GParamSpec, _: ?*anyopaque) callconv(.c) void {
+        const root = c.gtk_widget_get_root(@ptrCast(@alignCast(overview))) orelse return;
+        const render_kick = @import("../util/render_kick.zig");
+        // Overview scales/caches page snapshots; do not let those snapshots
+        // retain live offload surfaces while sibling pages keep painting.
+        if (c.adw_tab_overview_get_open(overview) != 0)
+            render_kick.dialogPresented(@ptrCast(@alignCast(root)))
+        else
+            render_kick.onDialogClosed(null, @ptrCast(root));
     }
 
     /// AdwTabOverview "create-tab": the "+" tile in the overview.

@@ -6,6 +6,7 @@
 const std = @import("std");
 
 comptime {
+    _ = @import("ui/offload.zig");
     _ = @import("web/diagnostic.zig");
     _ = @import("web/download.zig");
     _ = @import("editor/linebreak.zig");

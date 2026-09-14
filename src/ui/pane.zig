@@ -261,6 +261,7 @@ pub const Pane = struct {
     /// The GraphicsOffload wrapping the GLArea — hidden while an app
     /// view (mirror of the session's forwarded windows) is shown.
     offload_widget: ?*c.GtkWidget = null,
+    offload_guard: @import("offload.zig").Guard = .{},
     /// Current primary AppHost of an app session (erased *AppHost;
     /// pane installs its embed box + callbacks on it).
     app_host: ?*anyopaque = null,
@@ -482,6 +483,8 @@ pub const Pane = struct {
         // is registered. Keep it disabled across construction so a new
         // pane cannot bypass an already-animating sibling or dialog.
         c.gtk_graphics_offload_set_enabled(@ptrCast(offload), c.GTK_GRAPHICS_OFFLOAD_DISABLED);
+        self.offload_guard.init(offload);
+        errdefer self.offload_guard.deinit();
         c.gtk_graphics_offload_set_black_background(@ptrCast(offload), 1);
         c.gtk_widget_set_vexpand(offload, 1);
         c.gtk_widget_set_hexpand(offload, 1);
@@ -858,6 +861,7 @@ pub const Pane = struct {
         const was_severing = self.severing_faces;
         self.severing_faces = true;
         defer self.severing_faces = was_severing;
+        self.offload_guard.deinit();
         if (!self.widgets_dead and !self.surface.callbacks_severed) {
             self.setGraphicsOffload(false);
             detachA11y(self);
