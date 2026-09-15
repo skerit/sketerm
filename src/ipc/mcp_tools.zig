@@ -55,9 +55,22 @@ pub const ToolDef = struct {
     description: []const u8,
     /// Raw JSON object text, emitted verbatim into tools/list.
     input_schema: []const u8,
-    /// Raw JSON object text; emitted only when present.
+    /// Success schema; tools/list wraps it with the shared error alternative.
     output_schema: ?[]const u8 = null,
 };
+
+/// Errors may precede any tool-specific facts. Keep evidence extensible both
+/// inside error (details/diagnostics) and beside it (cert, partial state).
+const ERROR_OUTPUT =
+    \\{"type":"object","properties":{"error":{"type":"object","properties":{"code":{"type":"string"},"message":{"type":"string"},"retryable":{"type":"boolean"}},"required":["code","message","retryable"],"additionalProperties":true}},"required":["error"],"additionalProperties":true}
+;
+
+fn resultSchema(comptime success: []const u8) []const u8 {
+    // An optional-only success schema must not also match an error, including
+    // a malformed one. isError lives outside structuredContent, not here.
+    return "{\"type\":\"object\",\"oneOf\":[" ++ success[0 .. success.len - 1] ++
+        ",\"not\":{\"required\":[\"error\"]}}," ++ ERROR_OUTPUT ++ "]}";
+}
 
 /// The app-state facts `mcp.appFacts` writes, declared ONCE: every app
 /// tool that reports on its app emits this same set, so its schema
@@ -1735,7 +1748,7 @@ fn toolJson(comptime t: ToolDef) []const u8 {
         writeRaw(&buf, &at, t.input_schema);
         if (t.output_schema) |os| {
             writeRaw(&buf, &at, ",\"outputSchema\":");
-            writeRaw(&buf, &at, os);
+            writeRaw(&buf, &at, resultSchema(os));
         }
         writeRaw(&buf, &at, "}");
         const frozen = buf;
@@ -1743,11 +1756,11 @@ fn toolJson(comptime t: ToolDef) []const u8 {
     }
 }
 
-fn toolJsonLen(t: ToolDef) usize {
+fn toolJsonLen(comptime t: ToolDef) usize {
     var n: usize = "{\"name\":\"".len + t.name.len +
         "\",\"description\":\"".len + escapedLen(t.description) +
         "\",\"inputSchema\":".len + t.input_schema.len + "}".len;
-    if (t.output_schema) |os| n += ",\"outputSchema\":".len + os.len;
+    if (t.output_schema) |os| n += ",\"outputSchema\":".len + resultSchema(os).len;
     return n;
 }
 
@@ -1829,7 +1842,19 @@ test "the generated tool list is well-formed, newline-free JSON" {
         try testing.expect(t.output_schema != null);
         const out = item.object.get("outputSchema") orelse return error.MissingOutputSchema;
         try testing.expect(out == .object);
-        try testing.expect(out.object.get("properties") != null);
+        try testing.expectEqualStrings("object", out.object.get("type").?.string);
+        const branches = out.object.get("oneOf").?.array.items;
+        try testing.expectEqual(@as(usize, 2), branches.len);
+        // Success requirements/properties survive unchanged; only the error
+        // discriminator is added, even for tools with no required fields.
+        var expected = try std.json.parseFromSliceLeaky(std.json.Value, arena, t.output_schema.?, .{});
+        const no_error = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"required\":[\"error\"]}", .{});
+        try expected.object.put(arena, "not", no_error);
+        try testing.expectEqualStrings(
+            try std.json.Stringify.valueAlloc(arena, expected, .{}),
+            try std.json.Stringify.valueAlloc(arena, branches[0], .{}),
+        );
+        try testing.expectEqualStrings(ERROR_OUTPUT, try std.json.Stringify.valueAlloc(arena, branches[1], .{}));
     }
 }
 
@@ -1888,7 +1913,7 @@ test "a declared output schema is emitted last" {
     try testing.expectEqualStrings(
         "{\"name\":\"demo\",\"description\":\"quote \\\" and backslash \\\\ survive\"," ++
             "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}," ++
-            "\"outputSchema\":{\"type\":\"object\",\"properties\":{\"ok\":{\"type\":\"boolean\"}}}}",
+            "\"outputSchema\":" ++ comptime resultSchema(t.output_schema.?) ++ "}",
         json,
     );
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);

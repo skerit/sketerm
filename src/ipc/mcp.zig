@@ -9254,9 +9254,32 @@ pub fn expectToolResultShape(arena: std.mem.Allocator, tool: []const u8, result:
     }
     const sc = (obj.get("structuredContent") orelse return error.NoStructuredContent).object;
 
-    const def = mcp_tools.find(tool) orelse return error.UnknownTool;
-    const schema_text = def.output_schema orelse return error.NoOutputSchema;
-    const schema = (try std.json.parseFromSliceLeaky(std.json.Value, arena, schema_text, .{})).object;
+    // Validate the advertised contract, not the success-only table fragment.
+    const advertised = for (mcp_tools.TOOLS, mcp_tools.TOOL_JSON) |def, json| {
+        if (std.mem.eql(u8, def.name, tool)) break try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    } else return error.UnknownTool;
+    const output_schema = advertised.object.get("outputSchema") orelse return error.NoOutputSchema;
+    const branches = output_schema.object.get("oneOf").?.array.items;
+    const is_error = if (obj.get("isError")) |flag| blk: {
+        if (flag != .bool) return error.InvalidErrorFlag;
+        break :blk flag.bool;
+    } else false;
+    if (is_error != (sc.get("error") != null)) return error.ErrorFlagMismatch;
+    if (is_error) {
+        const value = sc.get("error").?;
+        if (value != .object) return error.InvalidErrorShape;
+        const error_schema = branches[1].object.get("properties").?.object.get("error").?.object;
+        const error_props = error_schema.get("properties").?.object;
+        for (error_schema.get("required").?.array.items) |key| {
+            const field = value.object.get(key.string) orelse return error.MissingRequiredField;
+            const kind = error_props.get(key.string).?.object.get("type").?.string;
+            if (!std.mem.eql(u8, kind, @tagName(field)) and
+                !(std.mem.eql(u8, kind, "boolean") and field == .bool)) return error.InvalidErrorShape;
+        }
+        // Error evidence is intentionally open; success checks below stay strict.
+        return parsed;
+    }
+    const schema = branches[0].object;
     if (schema.get("required")) |req| {
         for (req.array.items) |key| {
             if (sc.get(key.string) == null) {
@@ -9274,6 +9297,89 @@ pub fn expectToolResultShape(arena: std.mem.Allocator, tool: []const u8, result:
         }
     }
     return parsed;
+}
+
+test "advertised tool results accept shared errors and evidence without weakening success" {
+    const t = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // 1. Every tool can fail before it has any success facts, not just web_open.
+    for (std.enums.values(ErrCode)) |code| {
+        const result = try errRes(arena, code, "operation could not start");
+        for (mcp_tools.TOOLS) |def| {
+            const parsed = try expectToolResultShape(arena, def.name, result);
+            try t.expectEqual(@as(usize, 1), parsed.object.get("structuredContent").?.object.count());
+        }
+    }
+
+    // 2. Startup diagnostics and certificate refusals retain their evidence.
+    const diagnostic = try errResDetails(arena, .unavailable, "helper failed to start", @as(?struct {
+        id: []const u8,
+        stage: []const u8,
+    }, .{ .id = "attempt-1", .stage = "hello" }));
+    const failed = try expectToolResultShape(arena, "web_open", diagnostic);
+    const details = failed.object.get("structuredContent").?.object.get("error").?.object.get("details").?.object;
+    try t.expectEqualStrings("attempt-1", details.get("id").?.string);
+    try t.expectEqualStrings("hello", details.get("stage").?.string);
+
+    var cert = Res.init(arena);
+    try cert.text("certificate refused");
+    try cert.fact("error", .{ .code = "refused", .message = "certificate refused", .retryable = false });
+    try cert.fact("cert", .{ .state = "refused", .fingerprint = "fingerprint" });
+    const cert_result = try cert.finish();
+    var cert_json = try std.json.parseFromSliceLeaky(std.json.Value, arena, cert_result, .{});
+    try cert_json.object.put(arena, "isError", .{ .bool = true });
+    const refused = try expectToolResultShape(arena, "web_open", try std.json.Stringify.valueAlloc(arena, cert_json, .{}));
+    try t.expectEqualStrings("fingerprint", refused.object.get("structuredContent").?.object.get("cert").?.object.get("fingerprint").?.string);
+
+    // 3. Missing and malformed error members cannot escape via a permissive
+    // success schema (read_screen deliberately has no required fields).
+    for ([_][]const u8{
+        "{\"code\":\"failed\",\"message\":\"failure\"}",
+        "{\"code\":\"failed\",\"retryable\":false}",
+        "{\"message\":\"failure\",\"retryable\":false}",
+    }) |error_json| {
+        const result = try std.fmt.allocPrint(arena, "{{\"content\":[{{\"type\":\"text\",\"text\":\"failure\"}}],\"structuredContent\":{{\"error\":{s}}},\"isError\":true}}", .{error_json});
+        try t.expectError(error.MissingRequiredField, expectToolResultShape(arena, "read_screen", result));
+    }
+    for ([_][]const u8{
+        "null",
+        "{\"code\":7,\"message\":\"failure\",\"retryable\":false}",
+        "{\"code\":\"failed\",\"message\":false,\"retryable\":false}",
+        "{\"code\":\"failed\",\"message\":\"failure\",\"retryable\":\"false\"}",
+    }) |error_json| {
+        const result = try std.fmt.allocPrint(arena, "{{\"content\":[{{\"type\":\"text\",\"text\":\"failure\"}}],\"structuredContent\":{{\"error\":{s}}},\"isError\":true}}", .{error_json});
+        try t.expectError(error.InvalidErrorShape, expectToolResultShape(arena, "read_screen", result));
+    }
+
+    // 4. Success still needs its declared fields and refuses undeclared ones.
+    const empty = "{\"content\":[{\"type\":\"text\",\"text\":\"opened\"}],\"structuredContent\":{}}";
+    try t.expectError(error.MissingRequiredField, expectToolResultShape(arena, "web_open", empty));
+    _ = try expectToolResultShape(arena, "read_screen", empty);
+    var success = Res.init(arena);
+    try success.fact("invented", true);
+    try t.expectError(error.UndeclaredField, expectToolResultShape(arena, "read_screen", try success.finish()));
+
+    var opened = Res.init(arena);
+    try opened.fact("backend", "headless");
+    try opened.fact("origin", "null");
+    try opened.fact("url", "about:blank");
+    try opened.fact("title", "");
+    try opened.fact("loading", false);
+    try opened.fact("settled", true);
+    try opened.fact("open_views", @as(u32, 1));
+    try opened.fact("route", "direct");
+    const opened_json = try expectToolResultShape(arena, "web_open", try opened.finish());
+    try t.expectEqualStrings("about:blank", opened_json.object.get("structuredContent").?.object.get("url").?.string);
+
+    // 5. An error-shaped success or a success-shaped error is never accepted.
+    _ = cert_json.object.swapRemove("isError");
+    try t.expectError(error.ErrorFlagMismatch, expectToolResultShape(arena, "read_screen", try std.json.Stringify.valueAlloc(arena, cert_json, .{})));
+    var empty_json = try std.json.parseFromSliceLeaky(std.json.Value, arena, empty, .{});
+    try empty_json.object.put(arena, "isError", .{ .bool = true });
+    try t.expectError(error.ErrorFlagMismatch, expectToolResultShape(arena, "read_screen", try std.json.Stringify.valueAlloc(arena, empty_json, .{})));
 }
 
 test "commandCompletionResult: facts in structuredContent, compact prose in the text lane" {
