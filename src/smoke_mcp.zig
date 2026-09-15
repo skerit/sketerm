@@ -612,6 +612,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     if (c.access(exe, c.X_OK) != 0) fail("zig-out/bin/sketerm missing (build first)");
     _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
     defer _ = c.unsetenv("SKETERM_MUX_BIN");
+    if (c.getenv("SKETERM_SMOKE_MCP_WEBSTARTUP_ONLY") != null) {
+        var bin_buf: [4096:0]u8 = undefined;
+        const web_bin = resolveWebBin(&bin_buf) orelse fail("sketerm-webengine missing for cold-start regression");
+        _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BIN");
+        _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
+        defer _ = c.unsetenv("SKETERM_WEB_BROKER_ENGINE");
+        webStartupStage(allocator, exe);
+        say("smoke-mcp: focused fresh-cache browser startup ok");
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_MCP_WEB_ONLY") != null) {
         // The client-spawn lane (sessions); see the full run's note.
         _ = c.setenv("SKETERM_WEB_BROKER_ENGINE", "0", 1);
@@ -2110,6 +2121,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else {
             _ = c.setenv("SKETERM_WEB_BIN", web_bin.?, 1);
             defer _ = c.unsetenv("SKETERM_WEB_BIN");
+            webStartupStage(allocator, exe);
             webStage(allocator, exe, rt);
             say("smoke-mcp: headless web tools ok");
             webPolicyStage(allocator, exe, rt);
@@ -3194,6 +3206,33 @@ fn webReviewStage(m: *Mcp, rt: []const u8) void {
         if (std.mem.indexOf(u8, report, needle) == null) fail("exported evidence is not self-contained after view close");
     if (!fileExists(std.fmt.bufPrint(&args, "{s}/review-evidence/screenshot.png", .{rt}) catch unreachable)) fail("exported screenshot missing");
     say("smoke-mcp: review inspection, shadow controls, SPA/reload checkpoints and durable export ok");
+}
+
+/// Fresh roots in both launch modes: a warm cache hides Chromium's first-run
+/// path, which used to hang before the helper could bind its control socket.
+fn webStartupStage(allocator: std.mem.Allocator, exe: [*:0]const u8) void {
+    defer _ = c.unsetenv("SKETERM_WEB_SESSION");
+    for ([_][*:0]const u8{ "cold-headless", "cold-session" }, 0..) |name, index| {
+        _ = c.setenv("SKETERM_WEB_SESSION", if (index == 0) "0" else "1", 1);
+        var m = Mcp.spawn(allocator, exe, &.{ "--name", name });
+        m.initialize();
+        m.sendTool("web_open", "{\"url\":\"about:blank\",\"snapshot\":\"none\"}");
+        const opened = m.recvLine(45_000);
+        if (std.mem.indexOf(u8, opened, "isError") != null or
+            std.mem.indexOf(u8, opened, "\"url\":\"about:blank\"") == null)
+        {
+            std.debug.print("smoke-mcp: cold start {s}: {s}\n", .{ name, opened });
+            fail("fresh-cache helper did not open a blank page");
+        }
+        const nav = m.callTool("web_navigate", "{\"url\":\"data:text/html,<title>Cold Start</title><h1>Fresh browser ready</h1>\",\"snapshot\":\"full\"}");
+        if (std.mem.indexOf(u8, nav, "isError") != null or std.mem.indexOf(u8, nav, "Fresh browser ready") == null)
+            fail("cold-start helper did not render the requested page");
+        const shot = m.callTool("web_screenshot", "{}");
+        if (std.mem.indexOf(u8, shot, "\"type\":\"image\"") == null)
+            fail("cold-start helper did not produce a screenshot");
+        _ = m.callTool("web_close", "{}");
+        m.closeStdinWait();
+    }
 }
 
 fn webStage(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: []const u8) void {
@@ -4993,6 +5032,7 @@ fn webOnly(allocator: std.mem.Allocator, exe: [*:0]const u8, rt: [:0]const u8) u
     _ = c.setenv("SKETERM_MUX_BIN", "zig-out/bin/sketerm-mux", 1);
     _ = c.setenv("SKETERM_WEB_BIN", web_bin, 1);
     g_rt = rt;
+    webStartupStage(allocator, exe);
     webStage(allocator, exe, rt);
     say("smoke-mcp: focused headless web tools ok");
     webPolicyStage(allocator, exe, rt);

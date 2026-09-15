@@ -38,6 +38,14 @@ skipping it produced a silent hang or an abort:
    process that keeps its GPU process paints EMPTY frames in windowless
    mode.
 
+`cefargs.withDefaults` includes `--no-first-run` before either call. On a
+fresh cache, Chromium's first-run path can hold `cef_initialize` in a
+nested message loop forever, so the helper never binds its control socket.
+Sketerm owns onboarding; the embedded engine must not open its own first-run
+UI. Reproduced on 2026-09-15: headless startup timed out with and without
+`--disable-gpu`, but bound in about 0.2s with `--no-first-run`. The concurrent
+EGL/X-display errors were not the cause of that hang.
+
 ## Ozone platform decides whether a GPU exists at all
 
 Measured, not inferred:

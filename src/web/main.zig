@@ -286,17 +286,7 @@ fn reexecPreloaded(argv: []const [*:0]const u8) void {
 /// `--disable-gpu` and an explicit `--ozone-platform=` are passed
 /// through untouched: that is how the smoke rig pins a mode.
 fn buildCefArgv(argv: []const [*:0]const u8, disable_features: [:0]u8, buf: *[64][*c]u8) [][*c]u8 {
-    var n: usize = 0;
-    for (argv) |a| {
-        if (cefargs.disableFeaturesValue(std.mem.span(a)) != null) continue;
-        // The compatibility switch is mandatory, so reserve its slot
-        // when an unusually large command line reaches this fixed list.
-        if (n + 1 >= buf.len) break;
-        buf[n] = @ptrCast(@constCast(a));
-        n += 1;
-    }
-    buf[n] = @ptrCast(disable_features.ptr);
-    n += 1;
+    var n = cefargs.withDefaults(argv, disable_features, buf).len;
     // macOS has no ozone at all — Chromium uses its own windowing
     // layer, and `--ozone-platform=` is simply not a switch there. The
     // GPU decision the rest of this function makes is likewise moot:
