@@ -1,5 +1,45 @@
 # Autonomous build session — 2026-04-25
 
+## 2026-09-22: Files clipboard interoperability and live selection fixes
+
+Files now reads external GNOME copied-files and URI-list/KDE cut offers
+asynchronously, with a byte/file cap and cancellation on clipboard changes,
+destination changes, timeout, or teardown. Only validated local file URIs
+are admitted, never clipboard text or remote URI authorities. Local exports
+also offer the URI-list/KDE forms; remote exports stay text-only. Clipboard
+allocation failures clear the entire selection rather than silently losing
+paths or turning a remote source into a local one. Paste admission now
+reports whether work was actually queued, and a failed same-folder duplicate
+keeps its failure instead of claiming success.
+
+Live listing membership/order changes commit positional visual selection
+before it can jump to another file; content-only refreshes keep it active.
+Delete deltas disarm the removed paths and descendants without treating an
+incomplete listing as deletion. Filtering repeated content-search hits keeps
+a file selected while any of its hits remains visible. Regression coverage
+includes real GTK list-store updates, async GDK providers, cancellation
+lifetimes, URI validation, and allocation-failure sweeps. Separate-application
+clipboard E2E remains blocked by appdrive's lack of file-offer relay between
+sibling Wayland connections; in-process GDK tests do not claim that coverage.
+
+The follow-up remote-workflow audit found that Refresh could not redial a
+dead host, reconnect omitted Miller ancestors, and queries opened during a
+connection attempt were discarded as empty results. Refresh now reconnects
+in place and restores all directory subscriptions; unsent queries retain
+their intent until readiness. Interrupted submitted queries settle as failed
+rather than scanning forever, and command queries are not auto-replayed.
+
+Paste distinguishes complete admission from partial admission, including
+path/allocation failures: a partly queued cut keeps its original clipboard.
+Conflict decisions are only removed and counted as applied after submission (or
+a durable Skip) succeeds; Apply to All stops on the first refusal and leaves
+the failed and remaining decisions available. Focused tests use disconnected
+hosts and socketpairs to verify the failure paths without modifying files.
+Remaining recovery gap: ordinary same-host copy jobs lack retained submission
+tokens. A disconnect around their start acknowledgment cannot be retried
+safely by endpoints alone, and their UI state still needs reconciliation
+with the daemon rather than blind resubmission.
+
 ## 2026-09-13: sketerm-mux shows up in ps; `sketerm doctor` lists processes
 
 A user killed every `sketerm-mux` they could find over SSH, reconnected,
