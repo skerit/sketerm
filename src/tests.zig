@@ -159,6 +159,10 @@ comptime {
     _ = @import("ui/editorlsp.zig");
     _ = @import("ui/editorproj.zig");
     _ = @import("ui/editoroutline.zig");
+    _ = @import("ui/clipboard.zig");
+    _ = @import("ui/modes.zig");
+    _ = @import("ui/xsearch.zig");
+    _ = @import("ui/winlayout.zig");
     // The browser facade only re-exports a few decls, which is NOT
     // enough to pull its package's tests in: a test block in one of
     // these modules silently never runs unless the file is referenced

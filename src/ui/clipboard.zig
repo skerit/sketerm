@@ -106,23 +106,28 @@ fn onPasteRead(ctx: ?*anyopaque, text: ?[]const u8) void {
 }
 
 /// Send pasted text to the PTY, honouring bracketed paste.
-/// When bracketed: scrub embedded ESC bytes so a pasted "\x1b[201~"
-/// can't break out of the wrapping early (xterm convention).
 pub fn pasteText(term: *Terminal, pasted: []const u8) void {
+    emitPaste(pasted, term.screen.bracketed_paste, term, Terminal.writeUserInput);
+}
+
+/// Hand `sink` the bytes a paste of `pasted` sends, in order; when
+/// bracketed, every ESC is dropped so a pasted "\x1b[201~" cannot end
+/// the wrapping early (xterm convention).
+pub fn emitPaste(pasted: []const u8, bracketed: bool, ctx: anytype, comptime sink: fn (@TypeOf(ctx), []const u8) void) void {
     if (pasted.len == 0) return;
-    if (term.screen.bracketed_paste) {
-        term.writeUserInput("\x1b[200~");
+    if (bracketed) {
+        sink(ctx, "\x1b[200~");
         var start: usize = 0;
         for (pasted, 0..) |b, i| {
             if (b == 0x1B) {
-                if (i > start) term.writeUserInput(pasted[start..i]);
+                if (i > start) sink(ctx, pasted[start..i]);
                 start = i + 1;
             }
         }
-        if (start < pasted.len) term.writeUserInput(pasted[start..]);
-        term.writeUserInput("\x1b[201~");
+        if (start < pasted.len) sink(ctx, pasted[start..]);
+        sink(ctx, "\x1b[201~");
     } else {
-        term.writeUserInput(pasted);
+        sink(ctx, pasted);
     }
 }
 
@@ -164,4 +169,77 @@ pub fn copyToPrimary(widget: *c.GtkWidget, text: [:0]const u8) void {
     const display = c.gtk_widget_get_display(widget);
     const clipboard = c.gdk_display_get_primary_clipboard(display);
     c.gdk_clipboard_set_text(clipboard, text.ptr);
+}
+
+// -- tests --------------------------------------------------------------
+
+/// Records what `emitPaste` would have written to the PTY.
+const PasteLog = struct {
+    bytes: std.ArrayList(u8) = .empty,
+    writes: usize = 0,
+    empty_writes: usize = 0,
+    oom: bool = false,
+
+    fn sink(self: *PasteLog, chunk: []const u8) void {
+        self.writes += 1;
+        if (chunk.len == 0) self.empty_writes += 1;
+        self.bytes.appendSlice(std.testing.allocator, chunk) catch {
+            self.oom = true;
+        };
+    }
+
+    fn deinit(self: *PasteLog) void {
+        self.bytes.deinit(std.testing.allocator);
+    }
+
+    fn run(self: *PasteLog, text: []const u8, bracketed: bool) !void {
+        emitPaste(text, bracketed, self, sink);
+        try std.testing.expect(!self.oom);
+        try std.testing.expectEqual(@as(usize, 0), self.empty_writes);
+    }
+};
+
+test "an unbracketed paste reaches the PTY byte for byte, ESC included" {
+    var log: PasteLog = .{};
+    defer log.deinit();
+    try log.run("ls\x1b[A\n", false);
+    try std.testing.expectEqualStrings("ls\x1b[A\n", log.bytes.items);
+    try std.testing.expectEqual(@as(usize, 1), log.writes);
+}
+
+test "a bracketed paste is wrapped in the 2004 markers and loses every ESC" {
+    var log: PasteLog = .{};
+    defer log.deinit();
+    try log.run("a\x1bb\nc", true);
+    try std.testing.expectEqualStrings("\x1b[200~ab\nc\x1b[201~", log.bytes.items);
+}
+
+test "a pasted end marker cannot close the bracket early" {
+    var log: PasteLog = .{};
+    defer log.deinit();
+    try log.run("x\x1b[201~rm -rf ~\n", true);
+    try std.testing.expectEqualStrings("\x1b[200~x[201~rm -rf ~\n\x1b[201~", log.bytes.items);
+    // The only end marker the shell sees is ours, at the very end.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, log.bytes.items, "\x1b[201~"));
+    try std.testing.expect(std.mem.endsWith(u8, log.bytes.items, "\x1b[201~"));
+}
+
+test "ESC at the edges and in runs never produces an empty write" {
+    var log: PasteLog = .{};
+    defer log.deinit();
+    try log.run("\x1b\x1bab\x1b", true);
+    try std.testing.expectEqualStrings("\x1b[200~ab\x1b[201~", log.bytes.items);
+
+    var only_esc: PasteLog = .{};
+    defer only_esc.deinit();
+    try only_esc.run("\x1b\x1b\x1b", true);
+    try std.testing.expectEqualStrings("\x1b[200~\x1b[201~", only_esc.bytes.items);
+}
+
+test "an empty paste sends nothing, not even the markers" {
+    var log: PasteLog = .{};
+    defer log.deinit();
+    try log.run("", true);
+    try log.run("", false);
+    try std.testing.expectEqual(@as(usize, 0), log.writes);
 }

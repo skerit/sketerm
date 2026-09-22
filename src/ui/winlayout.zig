@@ -42,6 +42,7 @@ pub const PanedRatioCtx = struct {
 /// Spawn a new tab from a layout TabSpec (used on --restore). `at_end`
 /// forces an append so a multi-tab restore keeps its saved order.
 pub fn newTabFromSpec(self: *Window, spec: @import("../layout.zig").TabSpec, at_end: bool) !void {
+    try validateTree(spec.tree);
     const wrapper = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
     c.gtk_widget_set_vexpand(wrapper, 1);
     c.gtk_widget_set_hexpand(wrapper, 1);
@@ -58,9 +59,8 @@ pub fn newTabFromSpec(self: *Window, spec: @import("../layout.zig").TabSpec, at_
     c.adw_tab_page_set_title(page, title_z.ptr);
     c.adw_tab_page_set_tooltip(page, title_z.ptr);
     // Re-arm the user-rename lock so OSC titles can't stomp a
-    // deliberately named tab. Files predating the flag (null)
-    // count as renamed — restored titles never followed OSC then.
-    if (spec.title_locked orelse true) {
+    // deliberately named tab.
+    if (restoresTitleLocked(spec.title_locked)) {
         c.g_object_set_data(@ptrCast(@alignCast(page)), "sketerm-title-locked", @ptrCast(page));
     }
     if (spec.pinned) c.adw_tab_view_set_page_pinned(self.tab_view, page, 1);
@@ -122,6 +122,7 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
                 self.findProfile(p.profile)
             else
                 null;
+            const profile_shell: ?[]const u8 = if (profile) |pr| pr.settings.shell else null;
 
             var argv_buf = try self.allocator.alloc([*:0]const u8, p.command.len);
             defer self.allocator.free(argv_buf);
@@ -131,14 +132,7 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
                 arg_owners.deinit(self.allocator);
             }
             for (p.command, 0..) |cmd, i| {
-                // The profile's shell overrides command[0] if
-                // set, so duplicating an "ssh" profile keeps
-                // using ssh even after a layout round-trip
-                // captured the current $SHELL.
-                const eff_cmd: []const u8 = if (i == 0 and profile != null and profile.?.settings.shell != null)
-                    profile.?.settings.shell.?
-                else
-                    cmd;
+                const eff_cmd = restoredArg(i, cmd, profile_shell);
                 const z = try self.allocator.allocSentinel(u8, eff_cmd.len, 0);
                 try arg_owners.append(self.allocator, z);
                 @memcpy(z, eff_cmd);
@@ -194,27 +188,11 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
                 const webface = @import("webface.zig");
                 // A browser can hold several pages; page 0 is attached
                 // the ordinary way and the group rebuilds the rest with
-                // their nesting. A layout from before pages existed has
-                // an empty list and falls back to the single address.
-                const first: ?[]const u8 = if (wstate.pages.len > 0)
-                    (if (wstate.pages[0].url.len > 0) wstate.pages[0].url else null)
-                else if (wstate.url.len > 0) wstate.url else null;
-                // Page 0's identity container, saved with the layout. A
-                // plain `attach` would put it in the default jar, so a
-                // "Work" tab came back looking right (the tab colour is
-                // restored separately) while actually browsing as
-                // nobody — the failure this restores.
-                const first_container: u32 = if (wstate.pages.len > 0)
-                    wstate.pages[0].container
-                else
-                    wstate.container;
-                if (webface.WebFace.attachContainer(self.allocator, pane, first, first_container)) |wf| {
-                    wf.applyRestoredZoom(if (wstate.pages.len > 0)
-                        wstate.pages[0].zoom_level_x100
-                    else
-                        wstate.zoom_level_x100);
-                    if (wstate.pages.len > 0)
-                        wf.applyRestoredScroll(wstate.pages[0].scroll_x, wstate.pages[0].scroll_y);
+                // their nesting.
+                const first = firstWebPage(wstate);
+                if (webface.WebFace.attachContainer(self.allocator, pane, first.url, first.container)) |wf| {
+                    wf.applyRestoredZoom(first.zoom_level_x100);
+                    if (first.scroll) |s| wf.applyRestoredScroll(s.x, s.y);
                     if (@import("webgroup.zig").Group.fromPane(pane)) |g|
                         g.restorePages(wstate);
                 } else |err| {
@@ -257,7 +235,7 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
             const split_node = try self.allocator.create(PaneTree.Split);
             split_node.* = .{
                 .orientation = if (s.orientation == .horizontal) .horizontal else .vertical,
-                .ratio = if (s.ratio > 0 and s.ratio < 1) s.ratio else 0.5,
+                .ratio = splitRatio(s.ratio),
                 .children = .{ first_node, second_node },
                 .view = paned,
             };
@@ -269,7 +247,7 @@ pub fn buildTreeWidget(self: *Window, tree: @import("../layout.zig").Tree, node_
             const ratio_holder = try self.allocator.create(PanedRatioCtx);
             ratio_holder.* = .{
                 .allocator = self.allocator,
-                .ratio = if (s.ratio > 0 and s.ratio < 1) s.ratio else 0.5,
+                .ratio = splitRatio(s.ratio),
             };
             _ = c.g_signal_connect_data(
                 paned,
@@ -325,13 +303,17 @@ pub fn captureClosedTab(self: *Window, page: *c.AdwTabPage, root: *c.GtkWidget) 
         .cwd = snap_cwd,
         .profile_name = snap_profile,
     };
+    pushClosed(&self.closed_tabs, self.allocator, entry);
+}
 
-    // Cap at 16; drop the oldest when full.
-    const max_closed: usize = 16;
-    if (self.closed_tabs.items.len >= max_closed) {
-        _ = self.closed_tabs.orderedRemove(0);
-    }
-    self.closed_tabs.append(self.allocator, entry) catch {};
+/// How many closed tabs the restore ring remembers.
+pub const MAX_CLOSED_TABS: usize = 16;
+
+/// Append to the closed-tab ring, dropping the oldest entry once it
+/// holds `MAX_CLOSED_TABS`.
+pub fn pushClosed(ring: *std.ArrayList(winmod.ClosedTab), gpa: std.mem.Allocator, entry: winmod.ClosedTab) void {
+    if (ring.items.len >= MAX_CLOSED_TABS) _ = ring.orderedRemove(0);
+    ring.append(gpa, entry) catch {};
 }
 
 /// Pop the most-recently-closed tab and respawn it with its
@@ -409,23 +391,33 @@ fn restoreTabsWithTree(self: *Window, specs: []const layout_mod.TabSpec) void {
         };
         pages.append(self.allocator, self.last_created_page) catch return;
     }
+    if (applySavedNesting(&self.tab_forest, specs, pages.items)) self.forestChanged();
+}
+
+/// Re-apply a restored batch's saved nesting and collapse state;
+/// `pages[i]` is tab i's page, or null when it failed to spawn. A
+/// parent index that is out of range, names a failed tab or would
+/// close a cycle leaves that tab a root. @return whether the forest
+/// changed.
+pub fn applySavedNesting(forest: anytype, specs: []const layout_mod.TabSpec, pages: anytype) bool {
     var changed = false;
     for (specs, 0..) |tab, i| {
-        const page = pages.items[i] orelse continue;
+        if (i >= pages.len) break;
+        const page = pages[i] orelse continue;
         if (tab.tree_parent) |pi| {
-            if (pi < pages.items.len) {
-                if (pages.items[pi]) |parent| {
-                    self.tab_forest.reparent(page, parent, .last) catch {};
+            if (pi < pages.len) {
+                if (pages[pi]) |parent| {
+                    forest.reparent(page, parent, .last) catch {};
                     changed = true;
                 }
             }
         }
         if (tab.collapsed) {
-            self.tab_forest.setCollapsed(page, true);
+            forest.setCollapsed(page, true);
             changed = true;
         }
     }
-    if (changed) self.forestChanged();
+    return changed;
 }
 
 pub fn loadLayoutSimple(self: *Window, path: []const u8) !bool {
@@ -484,10 +476,7 @@ pub fn collectLayout(self: *Window, arena: std.mem.Allocator) !layout_mod.Layout
             .title = try arena.dupe(u8, title),
             .tree = tree,
             .pinned = c.adw_tab_page_get_pinned(page) != 0,
-            .color = if (Window.tabColorOf(page.?)) |col|
-                try std.fmt.allocPrint(arena, "#{x:0>2}{x:0>2}{x:0>2}", .{ col[0], col[1], col[2] })
-            else
-                null,
+            .color = if (Window.tabColorOf(page.?)) |col| try tabColorHex(arena, col) else null,
             .title_locked = c.g_object_get_data(@ptrCast(@alignCast(page)), "sketerm-title-locked") != null,
             .show_activity = tab_effects.tabSettings(page.?).show_activity,
             .warn_inactive = tab_effects.tabSettings(page.?).warn_inactive,
@@ -537,22 +526,16 @@ pub fn collectTree(self: *Window, arena: std.mem.Allocator, w: *c.GtkWidget) !?l
         else
             c.gtk_widget_get_height(w);
         const pos = c.gtk_paned_get_position(@ptrCast(w));
-        const ratio: f32 = if (total > 0)
-            @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total))
-        else
-            0.5;
+        const ratio = positionRatio(pos, total) orelse 0.5;
         const first = try collectTree(self, arena, start);
         const second = try collectTree(self, arena, end);
-        const a = first orelse return second;
-        const b = second orelse return a;
-        const children = try arena.alloc(layout_mod.Tree, 2);
-        children[0] = a;
-        children[1] = b;
-        return .{ .split = .{
-            .orientation = if (orientation == c.GTK_ORIENTATION_HORIZONTAL) .horizontal else .vertical,
-            .ratio = ratio,
-            .children = children,
-        } };
+        return joinSplit(
+            arena,
+            if (orientation == c.GTK_ORIENTATION_HORIZONTAL) .horizontal else .vertical,
+            ratio,
+            first,
+            second,
+        );
     }
 
     // Leaf — find the Pane that owns this widget.
@@ -692,7 +675,7 @@ pub fn modelTreeToLayout(self: *Window, arena: std.mem.Allocator, node: PaneTree
             return .{ .pane = try paneSpec(self, arena, p) };
         },
         .split => |sp| {
-            var ratio: f32 = if (sp.ratio > 0 and sp.ratio < 1) sp.ratio else 0.5;
+            var ratio: f32 = splitRatio(sp.ratio);
             if (sp.view) |v| {
                 const paned: *c.GtkWidget = @ptrCast(@alignCast(v));
                 const total: c_int = if (sp.orientation == .horizontal)
@@ -700,20 +683,17 @@ pub fn modelTreeToLayout(self: *Window, arena: std.mem.Allocator, node: PaneTree
                 else
                     c.gtk_widget_get_height(paned);
                 const pos = c.gtk_paned_get_position(@ptrCast(paned));
-                if (total > 0) ratio = @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total));
+                if (positionRatio(pos, total)) |r| ratio = r;
             }
             const first = try modelTreeToLayout(self, arena, sp.children[0]);
             const second = try modelTreeToLayout(self, arena, sp.children[1]);
-            const a = first orelse return second;
-            const b = second orelse return a;
-            const children = try arena.alloc(layout_mod.Tree, 2);
-            children[0] = a;
-            children[1] = b;
-            return .{ .split = .{
-                .orientation = if (sp.orientation == .horizontal) .horizontal else .vertical,
-                .ratio = ratio,
-                .children = children,
-            } };
+            return joinSplit(
+                arena,
+                if (sp.orientation == .horizontal) .horizontal else .vertical,
+                ratio,
+                first,
+                second,
+            );
         },
     }
 }
@@ -1088,4 +1068,361 @@ pub fn applyPanedRatioImpl(paned: *c.GtkWidget, user: ?*anyopaque) void {
     ctx.setting = true;
     c.gtk_paned_set_position(@ptrCast(paned), pos);
     ctx.setting = false;
+}
+
+// -- layout <-> tree decisions, free of widgets ---------------------------
+
+const web_model = @import("../web/model.zig");
+
+/// Refuse a spec that `buildTreeWidget` would reject halfway, before
+/// any of it is built: by then the panes it had spawned for earlier
+/// subtrees were left running with no tab. A split needs two children;
+/// a pane needs a command unless it reattaches a local durable session.
+pub fn validateTree(tree: layout_mod.Tree) error{ InvalidLayout, EmptyCommand }!void {
+    switch (tree) {
+        .pane => |p| {
+            const local_reattach = p.mux_session.len > 0 and p.mux_host.len == 0;
+            if (p.command.len == 0 and !local_reattach) return error.EmptyCommand;
+        },
+        .split => |s| {
+            if (s.children.len < 2) return error.InvalidLayout;
+            try validateTree(s.children[0]);
+            try validateTree(s.children[1]);
+        },
+    }
+}
+
+/// Whether a restored tab's title stays locked against OSC updates; a
+/// file written before the flag existed counts as renamed, because
+/// restored titles never followed OSC then.
+pub fn restoresTitleLocked(saved: ?bool) bool {
+    return saved orelse true;
+}
+
+/// A saved split ratio, or an even split when it is missing or would
+/// hide one side (anything outside the open interval 0..1, NaN too).
+pub fn splitRatio(r: f32) f32 {
+    return if (r > 0 and r < 1) r else 0.5;
+}
+
+/// A divider position as a fraction of the paned's size; null before
+/// the paned has been allocated.
+pub fn positionRatio(pos: c_int, total: c_int) ?f32 {
+    if (total <= 0) return null;
+    return @as(f32, @floatFromInt(pos)) / @as(f32, @floatFromInt(total));
+}
+
+/// A saved split, collapsed onto the surviving child when the other
+/// serialized to nothing; null when neither did.
+pub fn joinSplit(
+    arena: std.mem.Allocator,
+    orientation: layout_mod.Orient,
+    ratio: f32,
+    first: ?layout_mod.Tree,
+    second: ?layout_mod.Tree,
+) !?layout_mod.Tree {
+    const a = first orelse return second;
+    const b = second orelse return a;
+    const children = try arena.alloc(layout_mod.Tree, 2);
+    children[0] = a;
+    children[1] = b;
+    return .{ .split = .{ .orientation = orientation, .ratio = ratio, .children = children } };
+}
+
+/// Argument `i` a restored pane spawns with: the profile's shell
+/// replaces command[0], so duplicating an "ssh" profile keeps using
+/// ssh even after a layout round-trip captured the current $SHELL.
+pub fn restoredArg(i: usize, cmd: []const u8, profile_shell: ?[]const u8) []const u8 {
+    if (i == 0) {
+        if (profile_shell) |sh| return sh;
+    }
+    return cmd;
+}
+
+/// A tab colour as the "#rrggbb" a layout stores.
+pub fn tabColorHex(arena: std.mem.Allocator, col: [3]u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "#{x:0>2}{x:0>2}{x:0>2}", .{ col[0], col[1], col[2] });
+}
+
+/// What page 0 of a saved web face restores as.
+pub const FirstWebPage = struct {
+    /// Null for a blank page, which comes back with its address bar
+    /// focused.
+    url: ?[]const u8,
+    /// The saved identity container. A plain attach would put the page
+    /// in the default jar, so a "Work" tab came back looking right
+    /// (the tab colour is restored separately) while browsing as nobody.
+    container: u32,
+    zoom_level_x100: i16,
+    /// Null for a layout written before pages existed, which saved no
+    /// scroll position.
+    scroll: ?struct { x: i32, y: i32 },
+};
+
+/// Page 0, not the active page: the group rebuilds the others with
+/// their nesting and re-selects the active one. A layout from before
+/// pages existed has an empty list and falls back to its single
+/// address.
+pub fn firstWebPage(w: web_model.PaneState) FirstWebPage {
+    if (w.pages.len > 0) {
+        const p = w.pages[0];
+        return .{
+            .url = if (p.url.len > 0) p.url else null,
+            .container = p.container,
+            .zoom_level_x100 = p.zoom_level_x100,
+            .scroll = .{ .x = p.scroll_x, .y = p.scroll_y },
+        };
+    }
+    return .{
+        .url = if (w.url.len > 0) w.url else null,
+        .container = w.container,
+        .zoom_level_x100 = w.zoom_level_x100,
+        .scroll = null,
+    };
+}
+
+// -- tests --------------------------------------------------------------
+
+const testing = std.testing;
+
+test "a split ratio that would hide a side restores as an even split" {
+    try testing.expectEqual(@as(f32, 0.3), splitRatio(0.3));
+    try testing.expectEqual(@as(f32, 0.5), splitRatio(0));
+    try testing.expectEqual(@as(f32, 0.5), splitRatio(1));
+    try testing.expectEqual(@as(f32, 0.5), splitRatio(-0.2));
+    try testing.expectEqual(@as(f32, 0.5), splitRatio(7.5));
+    try testing.expectEqual(@as(f32, 0.5), splitRatio(std.math.nan(f32)));
+}
+
+test "a divider position becomes a fraction only once the paned has a size" {
+    try testing.expectEqual(@as(?f32, 0.25), positionRatio(300, 1200));
+    try testing.expectEqual(@as(?f32, null), positionRatio(300, 0));
+    try testing.expectEqual(@as(?f32, null), positionRatio(0, -1));
+}
+
+test "a split whose child saved nothing collapses onto the survivor" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const left: layout_mod.Tree = .{ .pane = .{ .cwd = "/left", .command = &.{"sh"} } };
+    const right: layout_mod.Tree = .{ .pane = .{ .cwd = "/right", .command = &.{"sh"} } };
+
+    const both = (try joinSplit(a, .vertical, 0.25, left, right)).?;
+    try testing.expectEqual(layout_mod.Orient.vertical, both.split.orientation);
+    try testing.expectEqual(@as(f32, 0.25), both.split.ratio);
+    try testing.expectEqual(@as(usize, 2), both.split.children.len);
+    try testing.expectEqualStrings("/left", both.split.children[0].pane.cwd);
+    try testing.expectEqualStrings("/right", both.split.children[1].pane.cwd);
+
+    try testing.expectEqualStrings("/right", (try joinSplit(a, .horizontal, 0.5, null, right)).?.pane.cwd);
+    try testing.expectEqualStrings("/left", (try joinSplit(a, .horizontal, 0.5, left, null)).?.pane.cwd);
+    try testing.expect((try joinSplit(a, .horizontal, 0.5, null, null)) == null);
+}
+
+test "a profile's shell replaces only the first saved argument" {
+    try testing.expectEqualStrings("ssh", restoredArg(0, "/bin/zsh", "ssh"));
+    try testing.expectEqualStrings("-l", restoredArg(1, "-l", "ssh"));
+    try testing.expectEqualStrings("/bin/zsh", restoredArg(0, "/bin/zsh", null));
+}
+
+test "a title restores locked unless the file says it was not renamed" {
+    try testing.expect(restoresTitleLocked(null));
+    try testing.expect(restoresTitleLocked(true));
+    try testing.expect(!restoresTitleLocked(false));
+}
+
+test "a saved tab colour parses back to the same colour" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const parse = @import("tabchrome.zig").parseHexRGB;
+    for ([_][3]u8{ .{ 0x0a, 0x0b, 0xff }, .{ 0, 0, 0 }, .{ 255, 128, 1 } }) |col| {
+        const hex = try tabColorHex(arena.allocator(), col);
+        try testing.expectEqual(@as(usize, 7), hex.len);
+        try testing.expectEqual(col, parse(hex).?);
+    }
+    try testing.expectEqualStrings("#0a0bff", try tabColorHex(arena.allocator(), .{ 0x0a, 0x0b, 0xff }));
+}
+
+test "a web face restores page 0 of its pages, or the single address of an old file" {
+    const pages = [_]web_model.PageState{
+        .{ .url = "", .container = 7, .zoom_level_x100 = -100, .scroll_x = 4, .scroll_y = 90 },
+        .{ .url = "https://b.example", .container = 2, .parent = 0 },
+    };
+    // `url`/`container` at the top describe the ACTIVE page (page 1
+    // here); restore still starts from page 0.
+    const multi = firstWebPage(.{ .url = "https://b.example", .container = 2, .pages = &pages, .active_page = 1 });
+    try testing.expectEqual(@as(?[]const u8, null), multi.url);
+    try testing.expectEqual(@as(u32, 7), multi.container);
+    try testing.expectEqual(@as(i16, -100), multi.zoom_level_x100);
+    try testing.expectEqual(@as(i32, 4), multi.scroll.?.x);
+    try testing.expectEqual(@as(i32, 90), multi.scroll.?.y);
+
+    const old = firstWebPage(.{ .url = "https://a.example", .zoom_level_x100 = 200, .container = 3 });
+    try testing.expectEqualStrings("https://a.example", old.url.?);
+    try testing.expectEqual(@as(u32, 3), old.container);
+    try testing.expectEqual(@as(i16, 200), old.zoom_level_x100);
+    try testing.expect(old.scroll == null);
+
+    try testing.expect(firstWebPage(.{}).url == null);
+}
+
+test "the closed-tab ring keeps the newest sixteen" {
+    var ring: std.ArrayList(winmod.ClosedTab) = .empty;
+    defer ring.deinit(testing.allocator);
+    const titles = [_][]const u8{ "t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9", "t10", "t11", "t12", "t13", "t14", "t15", "t16", "t17" };
+    for (titles) |title| pushClosed(&ring, testing.allocator, .{ .title = title });
+    try testing.expectEqual(MAX_CLOSED_TABS, ring.items.len);
+    try testing.expectEqualStrings("t2", ring.items[0].title);
+    try testing.expectEqualStrings("t17", ring.items[ring.items.len - 1].title);
+}
+
+const TF = @import("tabforest.zig").Forest(u32);
+
+fn nestedSpec(parent: ?u32, collapsed: bool) layout_mod.TabSpec {
+    return .{
+        .title = "",
+        .tree = .{ .pane = .{ .cwd = "/", .command = &.{"sh"} } },
+        .tree_parent = parent,
+        .collapsed = collapsed,
+    };
+}
+
+fn flatForest(refs: []const u32) !TF {
+    var f = TF.init(testing.allocator);
+    errdefer f.deinit();
+    for (refs) |r| _ = try f.add(r);
+    return f;
+}
+
+test "saved nesting restores even when a parent comes after its child" {
+    var f = try flatForest(&.{ 1, 2, 3, 4 });
+    defer f.deinit();
+    const specs = [_]layout_mod.TabSpec{
+        nestedSpec(null, false),
+        nestedSpec(0, false),
+        // Points FORWARD: nesting is applied once every tab exists.
+        nestedSpec(3, false),
+        nestedSpec(0, true),
+    };
+    const pages = [_]?u32{ 1, 2, 3, 4 };
+    try testing.expect(applySavedNesting(&f, &specs, &pages));
+    try testing.expectEqual(@as(?u32, 1), f.parentOf(2));
+    try testing.expectEqual(@as(?u32, 4), f.parentOf(3));
+    try testing.expectEqual(@as(?u32, 1), f.parentOf(4));
+    try testing.expect(f.isCollapsed(4));
+    try testing.expect(f.isHidden(3));
+    try testing.expect(f.validate());
+}
+
+test "nesting that cannot attach leaves the tab a root" {
+    var f = try flatForest(&.{ 10, 30, 40, 50 });
+    defer f.deinit();
+    const specs = [_]layout_mod.TabSpec{
+        nestedSpec(null, false),
+        // Its own page failed to spawn: nothing to nest.
+        nestedSpec(0, true),
+        // Parent is the failed tab.
+        nestedSpec(1, false),
+        // Parent index past the end of the batch.
+        nestedSpec(9, false),
+        // Its own index: a cycle.
+        nestedSpec(4, false),
+    };
+    const pages = [_]?u32{ 10, null, 30, 40, 50 };
+    _ = applySavedNesting(&f, &specs, &pages);
+    for ([_]u32{ 10, 30, 40, 50 }) |r| try testing.expectEqual(@as(?u32, null), f.parentOf(r));
+    try testing.expect(f.validate());
+
+    // Two tabs naming each other: the second link would close a cycle
+    // and is refused, the first stands.
+    var g = try flatForest(&.{ 1, 2 });
+    defer g.deinit();
+    const loop = [_]layout_mod.TabSpec{ nestedSpec(1, false), nestedSpec(0, false) };
+    const both = [_]?u32{ 1, 2 };
+    _ = applySavedNesting(&g, &loop, &both);
+    try testing.expectEqual(@as(?u32, 2), g.parentOf(1));
+    try testing.expectEqual(@as(?u32, null), g.parentOf(2));
+    try testing.expect(g.validate());
+}
+
+test "a layout without nesting restores flat and reports no change" {
+    var f = try flatForest(&.{ 1, 2 });
+    defer f.deinit();
+    const specs = [_]layout_mod.TabSpec{ nestedSpec(null, false), nestedSpec(null, false) };
+    const pages = [_]?u32{ 1, 2 };
+    try testing.expect(!applySavedNesting(&f, &specs, &pages));
+    try testing.expectEqual(@as(?u32, null), f.parentOf(2));
+}
+
+test "nesting saved by index restores the same tree" {
+    // The live tree: 1 > (2 > 3), 4 > 5, with 4 collapsed.
+    var live = try flatForest(&.{ 1, 4 });
+    defer live.deinit();
+    _ = try live.addChild(2, 1, .last);
+    _ = try live.addChild(3, 2, .last);
+    _ = try live.addChild(5, 4, .last);
+    live.setCollapsed(4, true);
+
+    // Saved in strip order, as collectLayout does.
+    const kept = [_]u32{ 1, 2, 3, 4, 5 };
+    var parents: [kept.len]?u32 = undefined;
+    live.parentIndices(&kept, &parents);
+    var specs: [kept.len]layout_mod.TabSpec = undefined;
+    for (kept, 0..) |ref, i| specs[i] = nestedSpec(parents[i], live.isCollapsed(ref));
+
+    // Restored into a fresh, flat forest under new identities.
+    var restored = try flatForest(&.{ 101, 102, 103, 104, 105 });
+    defer restored.deinit();
+    const pages = [_]?u32{ 101, 102, 103, 104, 105 };
+    try testing.expect(applySavedNesting(&restored, &specs, &pages));
+    for (kept, 0..) |ref, i| {
+        const want: ?u32 = if (live.parentOf(ref)) |p| p + 100 else null;
+        try testing.expectEqual(want, restored.parentOf(pages[i].?));
+        try testing.expectEqual(live.isCollapsed(ref), restored.isCollapsed(pages[i].?));
+    }
+}
+
+test "a malformed tree is refused whole, before any pane of it is built" {
+    const ok_pane: layout_mod.Tree = .{ .pane = .{ .cwd = "/", .command = &.{"sh"} } };
+    try validateTree(ok_pane);
+    // A local durable session reattaches by name and needs no command...
+    try validateTree(.{ .pane = .{ .cwd = "/", .command = &.{}, .mux_session = "work" } });
+    // ...a remote one first spawns a local placeholder shell, which does.
+    try testing.expectError(error.EmptyCommand, validateTree(.{ .pane = .{
+        .cwd = "/",
+        .command = &.{},
+        .mux_session = "work",
+        .mux_host = "ssh:box",
+    } }));
+    try testing.expectError(error.EmptyCommand, validateTree(.{ .pane = .{ .cwd = "/", .command = &.{} } }));
+
+    // The fault sits in the SECOND child, after a valid first one that
+    // building would already have spawned.
+    const lonely = [_]layout_mod.Tree{ok_pane};
+    const inner: layout_mod.Tree = .{ .split = .{ .orientation = .horizontal, .ratio = 0.5, .children = &lonely } };
+    const outer_kids = [_]layout_mod.Tree{ ok_pane, inner };
+    try testing.expectError(error.InvalidLayout, validateTree(.{ .split = .{
+        .orientation = .vertical,
+        .ratio = 0.5,
+        .children = &outer_kids,
+    } }));
+    const bad_pane_kids = [_]layout_mod.Tree{ ok_pane, .{ .pane = .{ .cwd = "/", .command = &.{} } } };
+    try testing.expectError(error.EmptyCommand, validateTree(.{ .split = .{
+        .orientation = .vertical,
+        .ratio = 0.5,
+        .children = &bad_pane_kids,
+    } }));
+}
+
+test "a hand-edited layout file with a one-child split is refused" {
+    const json =
+        \\{"version":2,"tabs":[{"title":"x","tree":{"split":{"orientation":"horizontal","ratio":0.5,
+        \\"children":[{"pane":{"cwd":"/","command":["sh"]}}]}}}]}
+    ;
+    const parsed = try std.json.parseFromSlice(layout_mod.Layout, testing.allocator, json, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+    try testing.expectError(error.InvalidLayout, validateTree(parsed.value.tabs[0].tree));
 }

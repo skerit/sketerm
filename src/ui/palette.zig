@@ -41,6 +41,7 @@ const EditorView = @import("editorview.zig").EditorView;
 const remotectl = @import("remotectl.zig");
 const window_mod = @import("window.zig");
 const Window = window_mod.Window;
+const Domain = @import("../config.zig").Domain;
 
 /// A "switch to this tab" row. Kept as a resolved page pointer rather
 /// than an index because tabs can close while the dialog is up; the
@@ -238,21 +239,7 @@ pub fn open(window: *Window) !void {
     // because the arena lives until the dialog's destroy-notify.
     c.gtk_list_box_set_sort_func(@ptrCast(@alignCast(listbox)), @ptrCast(&onSortRows), null, null);
 
-    ctx.feed = .{ .rows = ctx.catalog.items, .mru = &commandcat.recent };
-    ctx.sources = .{
-        ctx.feed.source(&activateCommand, @ptrCast(ctx), 1.0),
-        // Below the catalogue on purpose: a command you named exactly
-        // must still win over a tab whose title happens to contain the
-        // same word. 0.75 keeps even a perfect tab-title hit under a
-        // command's word-boundary match (0.8).
-        .{
-            .ctx = @ptrCast(ctx),
-            .weight = 0.75,
-            .query = &tabsQuery,
-            .activate = &activateTab,
-        },
-    };
-    ctx.model = suggest.Model.init(allocator, &ctx.sources, ctx.rows.len);
+    wireRanking(ctx, &commandcat.recent);
     ctx.model.view_ctx = @ptrCast(ctx);
     ctx.model.on_changed = &onRanked;
 
@@ -309,9 +296,16 @@ fn buildCatalog(ctx: *Ctx, arena: std.mem.Allocator, window: *Window) !void {
     };
 
     var domains: std.ArrayList(commandcat.DomainRow) = .empty;
-    for (window.config.domains.items) |dom| {
+    try domainRows(arena, window.config.domains.items, &domains);
+    try commandcat.build(arena, .{ .editor = editor_here, .domains = domains.items }, &ctx.catalog);
+}
+
+/// One "New Tab on <name>" row per configured domain; a domain with
+/// no host is an ignored section and gets none.
+fn domainRows(arena: std.mem.Allocator, domains: []const Domain, out: *std.ArrayList(commandcat.DomainRow)) !void {
+    for (domains) |dom| {
         if (dom.host.len == 0) continue;
-        try domains.append(arena, .{
+        try out.append(arena, .{
             .name = dom.name,
             .host_spec = try dom.hostSpec(arena),
             .title = try std.fmt.allocPrintSentinel(arena, "New Tab on {s}", .{dom.name}, 0),
@@ -323,8 +317,6 @@ fn buildCatalog(ctx: *Ctx, arena: std.mem.Allocator, window: *Window) !void {
             ),
         });
     }
-
-    try commandcat.build(arena, .{ .editor = editor_here, .domains = domains.items }, &ctx.catalog);
 }
 
 /// Every tab of every window of this process. Failure to enumerate is
@@ -340,14 +332,10 @@ fn collectTabs(ctx: *Ctx, arena: std.mem.Allocator, window: *Window) void {
             const page = c.adw_tab_view_get_nth_page(win.tab_view, i) orelse continue;
             const title_c = c.adw_tab_page_get_title(page);
             const title = if (title_c != null) std.mem.span(title_c) else "";
-            const title_z = arena.dupeZ(u8, if (title.len > 0) title else "Untitled tab") catch continue;
-            const detail_z = if (many)
-                std.fmt.allocPrintSentinel(arena, "Window {d} · tab {d}", .{ win.id, i + 1 }, 0) catch continue
-            else
-                std.fmt.allocPrintSentinel(arena, "Tab {d}", .{i + 1}, 0) catch continue;
+            const labels = tabLabels(arena, title, many, win.id, @intCast(i)) catch continue;
             ctx.tabs.append(arena, .{
-                .title = title_z,
-                .detail = detail_z,
+                .title = labels.title,
+                .detail = labels.detail,
                 .win = win,
                 .page = page,
             }) catch return;
@@ -355,7 +343,42 @@ fn collectTabs(ctx: *Ctx, arena: std.mem.Allocator, window: *Window) void {
     }
 }
 
+const TabLabels = struct { title: [:0]const u8, detail: [:0]const u8 };
+
+/// A tab row's text: an untitled tab still gets a title, and the
+/// detail names the window only when there is more than one.
+fn tabLabels(arena: std.mem.Allocator, title: []const u8, many: bool, win_id: u32, index: usize) !TabLabels {
+    return .{
+        .title = try arena.dupeZ(u8, if (title.len > 0) title else "Untitled tab"),
+        .detail = if (many)
+            try std.fmt.allocPrintSentinel(arena, "Window {d} \u{b7} tab {d}", .{ win_id, index + 1 }, 0)
+        else
+            try std.fmt.allocPrintSentinel(arena, "Tab {d}", .{index + 1}, 0),
+    };
+}
+
 // ── sources ───────────────────────────────────────────────────────
+
+/// Point `ctx.model` at this opening's catalogue and tabs, ranking the
+/// catalogue with the recency in `mru`. `ctx` must not move afterwards:
+/// the model borrows `ctx.sources`, which borrow `ctx.feed`.
+fn wireRanking(ctx: *Ctx, mru: *commandcat.Mru) void {
+    ctx.feed = .{ .rows = ctx.catalog.items, .mru = mru };
+    ctx.sources = .{
+        ctx.feed.source(&activateCommand, @ptrCast(ctx), 1.0),
+        // Below the catalogue on purpose: a command you named exactly
+        // must still win over a tab whose title happens to contain the
+        // same word. 0.75 keeps even a perfect tab-title hit under a
+        // command's word-boundary match (0.8).
+        .{
+            .ctx = @ptrCast(ctx),
+            .weight = 0.75,
+            .query = &tabsQuery,
+            .activate = &activateTab,
+        },
+    };
+    ctx.model = suggest.Model.init(ctx.allocator, &ctx.sources, ctx.catalog.items.len + ctx.tabs.items.len);
+}
 
 /// Open tabs as suggestion rows. `payload` continues the catalogue's
 /// index space so a merged candidate maps straight back to a widget.
@@ -458,17 +481,7 @@ fn onSearchChanged(entry: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) voi
 fn onRanked(user: ?*anyopaque) void {
     const ctx = cast.userData(Ctx, user);
     const lb: *c.GtkListBox = @ptrCast(@alignCast(ctx.listbox));
-
-    for (ctx.rows) |rctx| {
-        rctx.score = 0;
-        rctx.cand = null;
-    }
-    for (ctx.model.items.items) |cand| {
-        const at: usize = @intCast(cand.payload);
-        if (at >= ctx.rows.len) continue;
-        ctx.rows[at].score = cand.score;
-        ctx.rows[at].cand = cand;
-    }
+    stampRanking(ctx.rows, ctx.model.items.items);
 
     var idx: i32 = 0;
     while (idx < @as(i32, @intCast(ctx.rows.len))) : (idx += 1) {
@@ -491,10 +504,29 @@ fn onRanked(user: ?*anyopaque) void {
     c.gtk_list_box_unselect_all(lb);
 }
 
-/// GtkListBox sort: score descending, catalogue build order on ties.
+/// Stamp a merge result onto the rows its payloads address; a row the
+/// merge left out scores 0, which is what hides it.
+fn stampRanking(rows: []const *RowCtx, items: []const suggest.Candidate) void {
+    for (rows) |rctx| {
+        rctx.score = 0;
+        rctx.cand = null;
+    }
+    for (items) |cand| {
+        const at: usize = @intCast(cand.payload);
+        if (at >= rows.len) continue;
+        rows[at].score = cand.score;
+        rows[at].cand = cand;
+    }
+}
+
 fn onSortRows(row1: ?*c.GtkListBoxRow, row2: ?*c.GtkListBoxRow, _: ?*anyopaque) callconv(.c) c_int {
     const a = rowCtxOf(row1) orelse return 0;
     const b = rowCtxOf(row2) orelse return 0;
+    return rowOrder(a, b);
+}
+
+/// GtkListBox sort: score descending, catalogue build order on ties.
+fn rowOrder(a: *const RowCtx, b: *const RowCtx) c_int {
     if (a.score > b.score) return -1;
     if (a.score < b.score) return 1;
     if (a.orig_index < b.orig_index) return -1;
@@ -673,4 +705,256 @@ fn findBindingLabel(arena: std.mem.Allocator, window: *Window, action: input.Act
         return z.ptr;
     }
     return null;
+}
+
+// -- tests --------------------------------------------------------------
+
+const t = std.testing;
+
+/// A palette with every widget left out: the real catalogue, the real
+/// ranking wiring and the list's own sort, with plain tab rows
+/// standing in for open tabs. Initialised in place, because the model
+/// borrows the context.
+const TestPalette = struct {
+    ctx: Ctx,
+    mru: commandcat.Mru,
+
+    fn init(self: *TestPalette, cat: commandcat.Context, tab_titles: []const []const u8) !void {
+        self.mru = .{};
+        self.ctx = .{
+            .allocator = t.allocator,
+            .arena = std.heap.ArenaAllocator.init(t.allocator),
+            .window = undefined,
+            .dialog = undefined,
+            .search_entry = undefined,
+            .listbox = undefined,
+            .rows = &.{},
+        };
+        errdefer self.ctx.arena.deinit();
+        const arena = self.ctx.arena.allocator();
+        try commandcat.build(arena, cat, &self.ctx.catalog);
+        for (tab_titles, 0..) |title, i| {
+            const labels = try tabLabels(arena, title, false, 1, i);
+            try self.ctx.tabs.append(arena, .{
+                .title = labels.title,
+                .detail = labels.detail,
+                .win = undefined,
+                .page = undefined,
+            });
+        }
+        const rows = try arena.alloc(*RowCtx, self.ctx.catalog.items.len + self.ctx.tabs.items.len);
+        for (rows, 0..) |*slot, i| {
+            slot.* = try arena.create(RowCtx);
+            slot.*.* = .{ .orig_index = i };
+        }
+        self.ctx.rows = rows;
+        wireRanking(&self.ctx, &self.mru);
+    }
+
+    fn deinit(self: *TestPalette) void {
+        self.ctx.model.deinit();
+        self.ctx.arena.deinit();
+    }
+
+    /// The rows the list shows for `q`, in the order it shows them.
+    fn shown(self: *TestPalette, q: []const u8) ![]const suggest.Candidate {
+        self.ctx.model.setQuery(q);
+        stampRanking(self.ctx.rows, self.ctx.model.items.items);
+        const arena = self.ctx.arena.allocator();
+        const order = try arena.dupe(*RowCtx, self.ctx.rows);
+        std.sort.insertion(*RowCtx, order, {}, sortsBefore);
+        var out: std.ArrayList(suggest.Candidate) = .empty;
+        for (order) |r| {
+            if (r.score <= 0) continue;
+            try out.append(arena, r.cand.?);
+        }
+        return out.items;
+    }
+
+    fn sortsBefore(_: void, a: *RowCtx, b: *RowCtx) bool {
+        return rowOrder(a, b) < 0;
+    }
+
+    fn catalogRow(self: *TestPalette, title: []const u8) commandcat.Row {
+        for (self.ctx.catalog.items) |row| {
+            if (std.mem.eql(u8, row.title, title)) return row;
+        }
+        @panic("no such catalogue row");
+    }
+};
+
+fn position(rows: []const suggest.Candidate, title: []const u8, kind: suggest.Kind) ?usize {
+    for (rows, 0..) |r, i| {
+        if (r.kind == kind and std.mem.eql(u8, r.title, title)) return i;
+    }
+    return null;
+}
+
+test "an empty query lists every command in catalogue order, then every tab" {
+    var p: TestPalette = undefined;
+    try p.init(.{}, &.{ "vim notes", "htop" });
+    defer p.deinit();
+    const rows = try p.shown("");
+    try t.expectEqual(commandcat.curated.len + 2, rows.len);
+    for (commandcat.curated, 0..) |row, i| try t.expectEqualStrings(row.title, rows[i].title);
+    try t.expectEqualStrings("vim notes", rows[rows.len - 2].title);
+    try t.expectEqualStrings("htop", rows[rows.len - 1].title);
+}
+
+test "title prefix beats word boundary beats description, ties keep catalogue order" {
+    var p: TestPalette = undefined;
+    try p.init(.{}, &.{});
+    defer p.deinit();
+    const rows = try p.shown("scroll");
+    const top = position(rows, "Scroll to Top", .command).?;
+    const bottom = position(rows, "Scroll to Bottom", .command).?;
+    const copy = position(rows, "Copy Scrollback", .command).?;
+    const clear = position(rows, "Clear Scrollback", .command).?;
+    // "Scroll back one screenful." is a description prefix; "...whole
+    // buffer: scrollback ring..." a description word boundary.
+    const page_up = position(rows, "Page Up", .command).?;
+    const select_all = position(rows, "Select All", .command).?;
+    try t.expectEqual(@as(usize, 0), top);
+    try t.expect(top < bottom);
+    try t.expect(bottom < copy);
+    try t.expect(copy < clear);
+    try t.expect(clear < page_up);
+    try t.expect(page_up < select_all);
+    // Nothing that does not contain the query is shown at all.
+    try t.expect(position(rows, "New Tab", .command) == null);
+
+    // A title substring (0.6) still beats a description word boundary
+    // (0.8 of 0.7).
+    const back = try p.shown("back");
+    try t.expect(position(back, "Copy Scrollback", .command).? < position(back, "Page Up", .command).?);
+}
+
+test "a tab never outranks a command, and sits above description-only hits" {
+    var p: TestPalette = undefined;
+    try p.init(.{}, &.{ "New Tab", "pane logs" });
+    defer p.deinit();
+
+    const named = try p.shown("new tab");
+    try t.expectEqual(suggest.Kind.command, named[0].kind);
+    try t.expectEqualStrings("New Tab", named[0].title);
+    try t.expect(position(named, "New Tab", .session) != null);
+
+    const pane = try p.shown("pane");
+    const tab = position(pane, "pane logs", .session).?;
+    // Below a command's word-boundary title hit...
+    try t.expect(position(pane, "Zoom Pane", .command).? < tab);
+    // ...above a command that only mentions it in its description.
+    try t.expect(tab < position(pane, "Split Horizontal", .command).?);
+}
+
+test "every catalogue row comes first when its own title is typed" {
+    const domains = [_]commandcat.DomainRow{.{
+        .name = "box",
+        .host_spec = "ssh:box",
+        .title = "New Tab on box",
+        .desc = "Durable remote shell on box (ssh).",
+    }};
+    // Editor rows and a domain row too, plus tabs whose titles collide
+    // with commands on purpose.
+    var p: TestPalette = undefined;
+    try p.init(.{ .editor = true, .domains = &domains }, &.{ "Copy", "Preferences" });
+    defer p.deinit();
+    try t.expect(p.ctx.catalog.items.len > commandcat.curated.len);
+
+    var lower: [128]u8 = undefined;
+    for (p.ctx.catalog.items) |row| {
+        const exact = try p.shown(row.title);
+        try t.expectEqual(suggest.Kind.command, exact[0].kind);
+        try t.expectEqualStrings(row.title, exact[0].title);
+        // Matching folds ASCII case, so typing it in lower case works too.
+        const folded = try p.shown(std.ascii.lowerString(&lower, row.title));
+        try t.expectEqualStrings(row.title, folded[0].title);
+    }
+}
+
+test "a recently run command floats above its equals, as the palette wires recency" {
+    var p: TestPalette = undefined;
+    try p.init(.{}, &.{});
+    defer p.deinit();
+    const before = try p.shown("pane");
+    try t.expect(position(before, "Zoom Pane", .command).? < position(before, "Close Pane", .command).?);
+    p.mru.note(commandcat.keyOf(p.catalogRow("Close Pane")));
+    const after = try p.shown("pane");
+    try t.expect(position(after, "Close Pane", .command).? < position(after, "Zoom Pane", .command).?);
+}
+
+test "tab rows continue the catalogue's index space and dispatch as tabs" {
+    var p: TestPalette = undefined;
+    try p.init(.{}, &.{ "alpha", "zeta-7" });
+    defer p.deinit();
+    _ = try p.shown("zeta-7");
+    const n = p.ctx.catalog.items.len;
+    const hit = p.ctx.rows[n + 1];
+    try t.expectEqualStrings("zeta-7", hit.cand.?.title);
+    try t.expect(hit.cand.?.activate.? == &activateTab);
+    // The other tab did not match, so its row is hidden.
+    try t.expectEqual(@as(f32, 0), p.ctx.rows[n].score);
+    try t.expect(p.ctx.rows[n].cand == null);
+
+    // Commands dispatch through the catalogue, not the tab switcher.
+    _ = try p.shown("preferences");
+    var commands: usize = 0;
+    for (p.ctx.rows[0..n]) |r| {
+        const cand = r.cand orelse continue;
+        commands += 1;
+        try t.expect(cand.activate.? == &activateCommand);
+    }
+    try t.expect(commands > 0);
+}
+
+test "a query nothing matches hides every row and clears stale candidates" {
+    var p: TestPalette = undefined;
+    try p.init(.{}, &.{"htop"});
+    defer p.deinit();
+    try t.expect((try p.shown("tab")).len > 0);
+    try t.expectEqual(@as(usize, 0), (try p.shown("qqqqzz")).len);
+    for (p.ctx.rows) |r| {
+        try t.expectEqual(@as(f32, 0), r.score);
+        try t.expect(r.cand == null);
+    }
+}
+
+test "the list sorts by score, then by build order" {
+    var a = RowCtx{ .orig_index = 4, .score = 0.8 };
+    var b = RowCtx{ .orig_index = 1, .score = 0.8 };
+    var hi = RowCtx{ .orig_index = 9, .score = 1.0 };
+    try t.expectEqual(@as(c_int, 1), rowOrder(&a, &b));
+    try t.expectEqual(@as(c_int, -1), rowOrder(&b, &a));
+    try t.expectEqual(@as(c_int, -1), rowOrder(&hi, &b));
+    try t.expectEqual(@as(c_int, 0), rowOrder(&a, &a));
+}
+
+test "tab rows name the window only when there are several" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const one = try tabLabels(arena.allocator(), "vim", false, 3, 0);
+    try t.expectEqualStrings("vim", one.title);
+    try t.expectEqualStrings("Tab 1", one.detail);
+    const many = try tabLabels(arena.allocator(), "", true, 3, 4);
+    try t.expectEqualStrings("Untitled tab", many.title);
+    try t.expectEqualStrings("Window 3 \u{b7} tab 5", many.detail);
+}
+
+test "configured domains become New Tab rows, a hostless one does not" {
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const doms = [_]Domain{
+        .{ .name = "box", .host = "user@box.example", .transport = .ssh },
+        .{ .name = "empty" },
+        .{ .name = "lab", .host = "lab.local" },
+    };
+    var out: std.ArrayList(commandcat.DomainRow) = .empty;
+    try domainRows(arena.allocator(), &doms, &out);
+    try t.expectEqual(@as(usize, 2), out.items.len);
+    try t.expectEqualStrings("New Tab on box", out.items[0].title);
+    try t.expectEqualStrings("Durable remote shell on user@box.example (ssh).", out.items[0].desc);
+    try t.expectEqualStrings("ssh:user@box.example", out.items[0].host_spec);
+    // The automatic transport keeps the host bare.
+    try t.expectEqualStrings("lab.local", out.items[1].host_spec);
+    try t.expectEqualStrings("Durable remote shell on lab.local (auto).", out.items[1].desc);
 }

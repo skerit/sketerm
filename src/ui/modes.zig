@@ -12,6 +12,8 @@ const Window = winmod.Window;
 const wm = @import("../grid/word_motion.zig");
 const bracket = @import("../grid/bracket.zig");
 const Screen = @import("../grid/screen.zig").Screen;
+const Selection = @import("../grid/selection.zig").Selection;
+const hints = @import("hints.zig");
 
 // ── Keyboard hints (quick-select) ───────────────────────────
 
@@ -96,7 +98,7 @@ pub fn refreshHintOverlay(self: *Window) void {
     self.hints_overlay_buf.clearRetainingCapacity();
     const typed = self.hints_typed[0..self.hints_typed_len];
     for (self.hint_matches) |m| {
-        if (!std.mem.startsWith(u8, m.label[0..m.label_len], typed)) continue;
+        if (!labelHasPrefix(m, typed)) continue;
         self.hints_overlay_buf.append(self.allocator, .{
             .row = m.row,
             .col_start = m.col_start,
@@ -172,23 +174,8 @@ fn copyHintText(self: *Window, pane: *Pane, text: []const u8) void {
 /// with pipes; its output goes nowhere, like any launcher.
 fn runHintCommand(self: *Window, pane: *Pane, m: @import("hints.zig").Match) void {
     if (m.command.len == 0) return;
-    const shellquote = @import("../util/shellquote.zig");
-    var line: std.ArrayList(u8) = .empty;
-    defer line.deinit(self.allocator);
-
-    var i: usize = 0;
-    while (i < m.command.len) {
-        if (std.mem.startsWith(u8, m.command[i..], "{match}")) {
-            shellquote.appendQuoted(&line, self.allocator, m.text) catch return;
-            i += "{match}".len;
-        } else {
-            line.append(self.allocator, m.command[i]) catch return;
-            i += 1;
-        }
-    }
-    const line_z = self.allocator.allocSentinel(u8, line.items.len, 0) catch return;
+    const line_z = hintCommandLine(self.allocator, m.command, m.text) catch return;
     defer self.allocator.free(line_z);
-    @memcpy(line_z, line.items);
 
     const pid = c.fork();
     if (pid != 0) {
@@ -210,6 +197,48 @@ fn runHintCommand(self: *Window, pane: *Pane, m: @import("hints.zig").Match) voi
     c._exit(127);
 }
 
+/// A rule's command with every `{match}` replaced by the shell-quoted
+/// match text, as the C string `sh -c` runs. Caller frees.
+pub fn hintCommandLine(gpa: std.mem.Allocator, command: []const u8, text: []const u8) ![:0]u8 {
+    const shellquote = @import("../util/shellquote.zig");
+    var line: std.ArrayList(u8) = .empty;
+    errdefer line.deinit(gpa);
+    var i: usize = 0;
+    while (i < command.len) {
+        if (std.mem.startsWith(u8, command[i..], "{match}")) {
+            try shellquote.appendQuoted(&line, gpa, text);
+            i += "{match}".len;
+        } else {
+            try line.append(gpa, command[i]);
+            i += 1;
+        }
+    }
+    return line.toOwnedSliceSentinel(gpa, 0);
+}
+
+/// Absolute form of a hint's path: `~/` joins `home`, anything
+/// relative joins `cwd`; null when the base it needs is unknown or
+/// the result does not fit `buf`.
+pub fn resolveHintPath(buf: []u8, path: []const u8, home: ?[]const u8, cwd: ?[]const u8) ?[]const u8 {
+    if (path.len == 0) return null;
+    if (path[0] == '/') return path;
+    if (path.len >= 2 and path[0] == '~' and path[1] == '/') {
+        const h = home orelse return null;
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ h, path[1..] }) catch null;
+    }
+    const base = cwd orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{ base, path }) catch null;
+}
+
+/// The editor a path hint opens in: the configured one, else $EDITOR,
+/// else $VISUAL, where an empty value counts as unset.
+pub fn hintEditor(configured: []const u8, editor_env: ?[]const u8, visual_env: ?[]const u8) ?[]const u8 {
+    if (configured.len > 0) return configured;
+    if (editor_env) |e| if (e.len > 0) return e;
+    if (visual_env) |v| if (v.len > 0) return v;
+    return null;
+}
+
 /// Try to open a path-hint's target in the configured editor, in
 /// a new tab whose cwd matches the originating pane (compiler
 /// output is usually cwd-relative). Returns false when the file
@@ -220,33 +249,16 @@ pub fn openPathInEditor(self: *Window, pane: *Pane, text: []const u8) bool {
     const fl = hints_mod.parseFileLine(text);
     if (fl.path.len == 0) return false;
 
-    // Resolve to an absolute path: ~ → $HOME, relative → pane cwd.
+    // Resolve to an absolute path: ~ -> $HOME, relative -> pane cwd.
+    const profile_util = @import("../util/profile.zig");
     var abs_buf: [4096]u8 = undefined;
     const cwd: ?[]const u8 = if (pane.terminal.cwd) |d| d else null;
-    const abs: []const u8 = blk: {
-        if (fl.path[0] == '/') break :blk fl.path;
-        if (fl.path.len >= 2 and fl.path[0] == '~' and fl.path[1] == '/') {
-            const home = @import("../util/profile.zig").getenv("HOME") orelse return false;
-            break :blk std.fmt.bufPrint(&abs_buf, "{s}{s}", .{ home, fl.path[1..] }) catch return false;
-        }
-        const base = cwd orelse return false;
-        break :blk std.fmt.bufPrint(&abs_buf, "{s}/{s}", .{ base, fl.path }) catch return false;
-    };
+    const abs = resolveHintPath(&abs_buf, fl.path, profile_util.getenv("HOME"), cwd) orelse return false;
     var z_buf: [4096]u8 = undefined;
     const abs_z = std.fmt.bufPrintZ(&z_buf, "{s}", .{abs}) catch return false;
     if (c.access(abs_z.ptr, c.F_OK) != 0) return false;
 
-    const editor: []const u8 = blk: {
-        if (self.config.hint_editor.len > 0) break :blk self.config.hint_editor;
-        const profile_util = @import("../util/profile.zig");
-        if (profile_util.getenv("EDITOR")) |e| {
-            if (e.len > 0) break :blk e;
-        }
-        if (profile_util.getenv("VISUAL")) |v| {
-            if (v.len > 0) break :blk v;
-        }
-        return false;
-    };
+    const editor = hintEditor(self.config.hint_editor, profile_util.getenv("EDITOR"), profile_util.getenv("VISUAL")) orelse return false;
 
     // The file path is shell-quoted by buildEditorCommand — it
     // came off the screen and may contain metacharacters.
@@ -300,21 +312,7 @@ pub fn updateSearch(self: *Window, query: []const u8) void {
     self.search_matches = .empty;
     self.search_idx = 0;
     if (query.len > 0) {
-        // Smart-case: lowercase-only needle implies CI; any
-        // uppercase letter forces CS. The explicit per-search
-        // toggle (Ctrl+I) and the config-level `search_case_sensitive`
-        // both override.
-        var ci = self.search_case_insensitive;
-        if (!ci and !self.search_force_cs) {
-            var has_upper = false;
-            for (query) |b| {
-                if (b >= 'A' and b <= 'Z') {
-                    has_upper = true;
-                    break;
-                }
-            }
-            ci = !has_upper;
-        }
+        const ci = searchIgnoresCase(query, self.search_case_insensitive, self.search_force_cs);
         const matches = if (self.search_regex)
             pane.terminal.screen.searchOptsRegex(self.allocator, query, ci) catch return
         else
@@ -343,17 +341,41 @@ pub fn updateSearch(self: *Window, query: []const u8) void {
 
 pub fn refreshSearchLabel(self: *Window) void {
     const lab = self.search_label orelse return;
-    var buf: [64:0]u8 = undefined;
-    if (self.search_matches.items.len == 0) {
-        const s = std.fmt.bufPrintZ(&buf, "0/0", .{}) catch "0/0";
-        c.gtk_label_set_text(@ptrCast(lab), s.ptr);
-    } else {
-        const s = std.fmt.bufPrintZ(&buf, "{d}/{d}", .{
-            self.search_idx + 1,
-            self.search_matches.items.len,
-        }) catch "?/?";
-        c.gtk_label_set_text(@ptrCast(lab), s.ptr);
+    var buf: [64]u8 = undefined;
+    c.gtk_label_set_text(@ptrCast(lab), matchCountLabel(&buf, self.search_idx, self.search_matches.items.len).ptr);
+}
+
+/// Smart case: a needle without an ASCII capital searches
+/// case-insensitively, unless the per-search Ctrl+I override forces
+/// that anyway or `search_case_sensitive` turns the heuristic off.
+pub fn searchIgnoresCase(query: []const u8, ci_override: bool, force_cs: bool) bool {
+    if (ci_override) return true;
+    if (force_cs) return false;
+    for (query) |b| {
+        if (b >= 'A' and b <= 'Z') return false;
     }
+    return true;
+}
+
+/// The search bar's "current/total" counter, 1-based.
+pub fn matchCountLabel(buf: []u8, idx: usize, len: usize) [:0]const u8 {
+    if (len == 0) return "0/0";
+    return std.fmt.bufPrintZ(buf, "{d}/{d}", .{ idx + 1, len }) catch "?/?";
+}
+
+/// The match after (or before) `idx` among `len`, wrapping at both
+/// ends. `len` must be non-zero.
+pub fn stepMatch(idx: usize, len: usize, forward: bool) usize {
+    if (forward) return (idx + 1) % len;
+    return if (idx == 0) len - 1 else idx - 1;
+}
+
+/// View offset that shows a match at display `row`: scrollback rows
+/// scroll back far enough to be on screen, live rows need none.
+pub fn matchViewOffset(row: i32, scrollback: u32) u32 {
+    if (row >= 0) return 0;
+    const dist: u32 = @intCast(-row);
+    return @min(scrollback, dist);
 }
 
 pub fn applyCurrentMatch(self: *Window) void {
@@ -362,13 +384,7 @@ pub fn applyCurrentMatch(self: *Window) void {
     const m = self.search_matches.items[self.search_idx];
     const screen = pane.terminal.screen;
     screen.search_active_idx = @intCast(self.search_idx);
-    // Scroll into view.
-    if (m.row < 0) {
-        const dist: u32 = @intCast(-m.row);
-        screen.view_offset = @min(screen.scrollbackCount(), dist);
-    } else {
-        screen.view_offset = 0;
-    }
+    screen.view_offset = matchViewOffset(m.row, screen.scrollbackCount());
     screen.dirty = true;
     // Search interactions happen with the search bar focused,
     // not the pane — the pane's tick may be paused (no blink /
@@ -381,17 +397,13 @@ pub fn applyCurrentMatch(self: *Window) void {
 
 pub fn nextMatch(self: *Window) void {
     if (self.search_matches.items.len == 0) return;
-    self.search_idx = (self.search_idx + 1) % self.search_matches.items.len;
+    self.search_idx = stepMatch(self.search_idx, self.search_matches.items.len, true);
     applyCurrentMatch(self);
 }
 
 pub fn prevMatch(self: *Window) void {
     if (self.search_matches.items.len == 0) return;
-    if (self.search_idx == 0) {
-        self.search_idx = self.search_matches.items.len - 1;
-    } else {
-        self.search_idx -= 1;
-    }
+    self.search_idx = stepMatch(self.search_idx, self.search_matches.items.len, false);
     applyCurrentMatch(self);
 }
 
@@ -409,6 +421,29 @@ fn imBypass(pane: *Pane, active: bool) void {
     const ictx = pane.input_ctx orelse return;
     const im = ictx.im orelse return;
     im.setEnabled(!active);
+}
+
+/// Keys that only change modifier state, which every overlay mode's
+/// key sink lets through unconsumed so chords can still assemble.
+pub fn isBareModifier(keyval: c_uint) bool {
+    return switch (keyval) {
+        c.GDK_KEY_Shift_L,
+        c.GDK_KEY_Shift_R,
+        c.GDK_KEY_Control_L,
+        c.GDK_KEY_Control_R,
+        c.GDK_KEY_Alt_L,
+        c.GDK_KEY_Alt_R,
+        c.GDK_KEY_Super_L,
+        c.GDK_KEY_Super_R,
+        c.GDK_KEY_Hyper_L,
+        c.GDK_KEY_Hyper_R,
+        c.GDK_KEY_Meta_L,
+        c.GDK_KEY_Meta_R,
+        c.GDK_KEY_Caps_Lock,
+        c.GDK_KEY_Num_Lock,
+        => true,
+        else => false,
+    };
 }
 
 // ── Copy mode (keyboard-driven selection) ─────────────────────
@@ -463,24 +498,7 @@ pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType
     const ctrl = (state & c.GDK_CONTROL_MASK) != 0;
     const row = self.copymode_row;
     const col: i32 = self.copymode_col;
-    switch (keyval) {
-        c.GDK_KEY_Shift_L,
-        c.GDK_KEY_Shift_R,
-        c.GDK_KEY_Control_L,
-        c.GDK_KEY_Control_R,
-        c.GDK_KEY_Alt_L,
-        c.GDK_KEY_Alt_R,
-        c.GDK_KEY_Super_L,
-        c.GDK_KEY_Super_R,
-        c.GDK_KEY_Hyper_L,
-        c.GDK_KEY_Hyper_R,
-        c.GDK_KEY_Meta_L,
-        c.GDK_KEY_Meta_R,
-        c.GDK_KEY_Caps_Lock,
-        c.GDK_KEY_Num_Lock,
-        => return false,
-        else => {},
-    }
+    if (isBareModifier(keyval)) return false;
 
     // f/F/t/T ate the previous key and this one names the target.
     if (self.copymode_find_pending != 0) {
@@ -508,16 +526,13 @@ pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType
         c.GDK_KEY_asciicircum, c.GDK_KEY_underscore => copyModeMoveTo(self, row, copyModeLineStart(screen, row)),
         // g / G — scrollback top / live bottom (cursor keeps its
         // column, mirroring scrollback_top/bottom actions).
-        c.GDK_KEY_g => {
-            const sb: i32 = if (screen.use_alt) 0 else @intCast(screen.scrollbackCount());
-            copyModeMoveTo(self, -sb, col);
-        },
-        c.GDK_KEY_G => copyModeMoveTo(self, @as(i32, @intCast(screen.rows)) - 1, col),
+        c.GDK_KEY_g => copyModeMoveTo(self, extentOf(screen).top, col),
+        c.GDK_KEY_G => copyModeMoveTo(self, extentOf(screen).bottom, col),
         // H / M / L — high, middle and low row of what is on screen,
         // which is not the same as the buffer once scrolled back.
-        c.GDK_KEY_H => copyModeMoveTo(self, copyModeViewTop(self), col),
-        c.GDK_KEY_M => copyModeMoveTo(self, copyModeViewTop(self) + @divTrunc(@as(i32, @intCast(screen.rows)) - 1, 2), col),
-        c.GDK_KEY_L => copyModeMoveTo(self, copyModeViewTop(self) + @as(i32, @intCast(screen.rows)) - 1, col),
+        c.GDK_KEY_H => copyModeMoveTo(self, viewTopOf(screen), col),
+        c.GDK_KEY_M => copyModeMoveTo(self, viewTopOf(screen) + @divTrunc(@as(i32, @intCast(screen.rows)) - 1, 2), col),
+        c.GDK_KEY_L => copyModeMoveTo(self, viewTopOf(screen) + @as(i32, @intCast(screen.rows)) - 1, col),
         // Page and half-page scrolling.
         c.GDK_KEY_Page_Down => copyModeMoveTo(self, row + @as(i32, @intCast(screen.rows)), col),
         c.GDK_KEY_Page_Up => copyModeMoveTo(self, row - @as(i32, @intCast(screen.rows)), col),
@@ -579,10 +594,26 @@ pub fn handleCopyModeKey(self: *Window, keyval: c_uint, state: c.GdkModifierType
 }
 
 /// Display row of the topmost line currently on screen.
-fn copyModeViewTop(self: *Window) i32 {
-    const pane = self.copymode_pane orelse return 0;
-    const screen = pane.terminal.screen;
+pub fn viewTopOf(screen: *const Screen) i32 {
     return -@as(i32, @intCast(@min(screen.view_offset, screen.scrollbackCount())));
+}
+
+/// The display rows and columns copy mode can visit.
+pub const Extent = struct {
+    /// Oldest row: the top of scrollback, or 0 on the alternate
+    /// screen, which keeps none.
+    top: i32,
+    bottom: i32,
+    last_col: i32,
+};
+
+pub fn extentOf(screen: *const Screen) Extent {
+    const sb: i32 = if (screen.use_alt) 0 else @intCast(screen.scrollbackCount());
+    return .{
+        .top = -sb,
+        .bottom = @as(i32, @intCast(screen.rows)) - 1,
+        .last_col = @as(i32, @intCast(screen.cols)) - 1,
+    };
 }
 
 fn findReverse(kind: u8) u8 {
@@ -599,34 +630,43 @@ fn findReverse(kind: u8) u8 {
 /// vim: running off the end is a no-op rather than a wrap.
 pub fn copyModeFind(self: *Window, kind: u8, ch: u32) void {
     const pane = self.copymode_pane orelse return;
-    const screen = pane.terminal.screen;
-    const cells = screen.lineCellsAtPub(self.copymode_row) orelse return;
-    const col: usize = self.copymode_col;
+    const hit = findTarget(pane.terminal.screen, self.copymode_row, self.copymode_col, kind, ch) orelse return;
+    copyModeMoveTo(self, self.copymode_row, hit);
+}
+
+/// Column an f/F/t/T motion for `ch` lands on, or null when `ch` is
+/// not on that side of `col` in `row`.
+pub fn findTarget(screen: *const Screen, row: i32, col: u16, kind: u8, ch: u32) ?u16 {
+    const cells = screen.lineCellsAtPub(row) orelse return null;
     const hit = switch (kind) {
         'f' => wm.findForward(cells, col, ch, false),
         't' => wm.findForward(cells, col, ch, true),
         'F' => wm.findBackward(cells, col, ch, false),
         'T' => wm.findBackward(cells, col, ch, true),
         else => null,
-    };
-    if (hit) |c2| copyModeMoveTo(self, self.copymode_row, @intCast(c2));
+    } orelse return null;
+    return @intCast(hit);
 }
 
 /// { / } — the next blank line in `dir`, or the buffer edge.
 pub fn copyModeParagraph(self: *Window, dir: i32) void {
     const pane = self.copymode_pane orelse return;
-    const screen = pane.terminal.screen;
-    const sb: i32 = if (screen.use_alt) 0 else @intCast(screen.scrollbackCount());
-    const max_row: i32 = @as(i32, @intCast(screen.rows)) - 1;
-    var r = self.copymode_row;
+    copyModeMoveTo(self, paragraphTarget(pane.terminal.screen, self.copymode_row, dir), 0);
+}
+
+/// Row a { / } motion from `from` lands on: the first blank row in
+/// `dir`, or the last row before the buffer edge.
+pub fn paragraphTarget(screen: *const Screen, from: i32, dir: i32) i32 {
+    const ext = extentOf(screen);
+    var r = from;
     var last = r;
     while (true) {
         r += dir;
-        if (r < -sb or r > max_row) break;
+        if (r < ext.top or r > ext.bottom) break;
         last = r;
         if (copyModeRowBlank(screen, r)) break;
     }
-    copyModeMoveTo(self, last, 0);
+    return last;
 }
 
 fn copyModeRowBlank(screen: *const Screen, row: i32) bool {
@@ -655,51 +695,58 @@ pub fn copyModeSearchStep(self: *Window, dir: i32) void {
     if (self.search_pane != pane) return;
     const matches = self.search_matches.items;
     if (matches.len == 0) return;
+    const i = nearestMatch(matches, self.copymode_row, self.copymode_col, dir > 0);
+    self.search_idx = i;
+    copyModeMoveTo(self, matches[i].row, @intCast(matches[i].col));
+}
 
-    const row = self.copymode_row;
-    const col: i32 = self.copymode_col;
-    // Nearest match strictly after (or before) the cursor, in reading
-    // order. The list is already ordered oldest row first.
-    if (dir > 0) {
+/// Index of the match strictly after (or before) the cursor in
+/// reading order, wrapping at the ends. `matches` must be non-empty
+/// and ordered oldest row first, as `Screen.searchOpts` returns them.
+pub fn nearestMatch(matches: []const Screen.SearchMatch, row: i32, col: u16, forward: bool) usize {
+    const cc: i64 = col;
+    if (forward) {
         for (matches, 0..) |m, i| {
-            if (m.row > row or (m.row == row and @as(i32, @intCast(m.col)) > col)) {
-                self.search_idx = i;
-                copyModeMoveTo(self, m.row, @intCast(m.col));
-                return;
-            }
+            if (m.row > row or (m.row == row and @as(i64, m.col) > cc)) return i;
         }
-        self.search_idx = 0;
-        copyModeMoveTo(self, matches[0].row, @intCast(matches[0].col));
-    } else {
-        var i = matches.len;
-        while (i > 0) {
-            i -= 1;
-            const m = matches[i];
-            if (m.row < row or (m.row == row and @as(i32, @intCast(m.col)) < col)) {
-                self.search_idx = i;
-                copyModeMoveTo(self, m.row, @intCast(m.col));
-                return;
-            }
-        }
-        self.search_idx = matches.len - 1;
-        const m = matches[matches.len - 1];
-        copyModeMoveTo(self, m.row, @intCast(m.col));
+        return 0;
     }
+    var i = matches.len;
+    while (i > 0) {
+        i -= 1;
+        const m = matches[i];
+        if (m.row < row or (m.row == row and @as(i64, m.col) < cc)) return i;
+    }
+    return matches.len - 1;
 }
 
 /// Toggle the selection anchor. Re-pressing the active kind drops
 /// the anchor; switching kinds keeps the existing anchor cell.
 pub fn copyModeToggleSel(self: *Window, kind: winmod.CopyModeSel) void {
-    if (self.copymode_sel == kind) {
-        self.copymode_sel = .none;
-    } else {
-        if (self.copymode_sel == .none) {
-            self.copymode_anchor_row = self.copymode_row;
-            self.copymode_anchor_col = self.copymode_col;
-        }
-        self.copymode_sel = kind;
-    }
+    const next = toggledSel(.{
+        .kind = self.copymode_sel,
+        .anchor_row = self.copymode_anchor_row,
+        .anchor_col = self.copymode_anchor_col,
+    }, kind, self.copymode_row, self.copymode_col);
+    self.copymode_sel = next.kind;
+    self.copymode_anchor_row = next.anchor_row;
+    self.copymode_anchor_col = next.anchor_col;
     copyModeRefresh(self);
+}
+
+/// Copy mode's selection kind plus the cell its anchor was dropped on.
+pub const SelState = struct {
+    kind: winmod.CopyModeSel,
+    anchor_row: i32,
+    anchor_col: u16,
+};
+
+/// State after pressing the key for `kind` with the cursor at
+/// (`row`, `col`): the anchor is dropped only when leaving `.none`.
+pub fn toggledSel(state: SelState, kind: winmod.CopyModeSel, row: i32, col: u16) SelState {
+    if (state.kind == kind) return .{ .kind = .none, .anchor_row = state.anchor_row, .anchor_col = state.anchor_col };
+    if (state.kind == .none) return .{ .kind = kind, .anchor_row = row, .anchor_col = col };
+    return .{ .kind = kind, .anchor_row = state.anchor_row, .anchor_col = state.anchor_col };
 }
 
 /// Move the copy cursor, clamping into the buffer (scrollback top
@@ -707,21 +754,37 @@ pub fn copyModeToggleSel(self: *Window, kind: winmod.CopyModeSel) void {
 pub fn copyModeMoveTo(self: *Window, row: i32, col: i32) void {
     const pane = self.copymode_pane orelse return;
     const screen = pane.terminal.screen;
-    const sb: i32 = if (screen.use_alt) 0 else @intCast(screen.scrollbackCount());
-    const max_row: i32 = @as(i32, @intCast(screen.rows)) - 1;
-    const max_col: i32 = @as(i32, @intCast(screen.cols)) - 1;
-    self.copymode_row = std.math.clamp(row, -sb, max_row);
-    self.copymode_col = @intCast(std.math.clamp(col, 0, max_col));
-    // Keep the cursor on-screen: its visible row is row +
-    // view_offset. Moving past the top scrolls back; past the
-    // bottom scrolls forward (same clamping as scrollback_page_*).
-    const view_off: i32 = @intCast(@min(screen.view_offset, screen.scrollbackCount()));
-    if (self.copymode_row + view_off < 0) {
-        screen.view_offset = @intCast(-self.copymode_row);
-    } else if (self.copymode_row + view_off > max_row) {
-        screen.view_offset = @intCast(max_row - self.copymode_row);
-    }
+    const to = clampMove(screen, row, col);
+    self.copymode_row = to.row;
+    self.copymode_col = to.col;
+    if (to.view_offset) |vo| screen.view_offset = vo;
     copyModeRefresh(self);
+}
+
+pub const Move = struct {
+    row: i32,
+    col: u16,
+    /// The view offset that keeps the cursor on screen, or null when
+    /// it already is.
+    view_offset: ?u32,
+};
+
+/// Where a copy-mode move to (`row`, `col`) lands once clamped into
+/// the buffer; moving past the top scrolls back and past the bottom
+/// scrolls forward, the same clamping as scrollback_page_*.
+pub fn clampMove(screen: *const Screen, row: i32, col: i32) Move {
+    const ext = extentOf(screen);
+    const r = std.math.clamp(row, ext.top, ext.bottom);
+    const cc: u16 = @intCast(std.math.clamp(col, 0, ext.last_col));
+    // The cursor's visible row is row + view_offset.
+    const view_off: i32 = @intCast(@min(screen.view_offset, screen.scrollbackCount()));
+    const vo: ?u32 = if (r + view_off < 0)
+        @intCast(-r)
+    else if (r + view_off > ext.bottom)
+        @intCast(ext.bottom - r)
+    else
+        null;
+    return .{ .row = r, .col = cc, .view_offset = vo };
 }
 
 pub const WordDir = enum { next, prev, next_end, prev_end };
@@ -732,38 +795,37 @@ pub const WordDir = enum { next, prev, next_end, prev_end };
 /// WORD for the upper-case motions.
 pub fn copyModeWord(self: *Window, dir: WordDir, kind: wm.Kind) void {
     const pane = self.copymode_pane orelse return;
-    const screen = pane.terminal.screen;
+    const to = wordTarget(pane.terminal.screen, self.copymode_row, self.copymode_col, dir, kind) orelse return;
+    copyModeMoveTo(self, to.row, to.col);
+}
+
+/// Cell a word motion from (`row`, `col`) lands on, or null at the
+/// buffer edge, where the cursor stays put.
+pub fn wordTarget(screen: *const Screen, row: i32, col: u16, dir: WordDir, kind: wm.Kind) ?Screen.CopyCursor {
     const chars = screen.word_chars;
-    if (screen.lineCellsAtPub(self.copymode_row)) |cells| {
+    if (screen.lineCellsAtPub(row)) |cells| {
         const hit = switch (dir) {
-            .next => wm.nextStart(cells, chars, self.copymode_col, kind),
-            .prev => wm.prevStart(cells, chars, self.copymode_col, kind),
-            .next_end => wm.nextEnd(cells, chars, self.copymode_col, kind),
-            .prev_end => wm.prevEnd(cells, chars, self.copymode_col, kind),
+            .next => wm.nextStart(cells, chars, col, kind),
+            .prev => wm.prevStart(cells, chars, col, kind),
+            .next_end => wm.nextEnd(cells, chars, col, kind),
+            .prev_end => wm.prevEnd(cells, chars, col, kind),
         };
-        if (hit) |c2| {
-            copyModeMoveTo(self, self.copymode_row, @intCast(c2));
-            return;
-        }
+        if (hit) |c2| return .{ .row = row, .col = @intCast(c2) };
     }
     const forward = dir == .next or dir == .next_end;
-    const sb: i32 = if (screen.use_alt) 0 else @intCast(screen.scrollbackCount());
-    const max_row: i32 = @as(i32, @intCast(screen.rows)) - 1;
-    var row = self.copymode_row;
+    const ext = extentOf(screen);
+    var r = row;
     while (true) {
-        row = if (forward) row + 1 else row - 1;
-        if (row < -sb or row > max_row) return; // buffer edge — stay put
-        const cells = screen.lineCellsAtPub(row) orelse continue;
+        r = if (forward) r + 1 else r - 1;
+        if (r < ext.top or r > ext.bottom) return null;
+        const cells = screen.lineCellsAtPub(r) orelse continue;
         const hit = switch (dir) {
             .next => wm.firstStart(cells, chars, kind),
             .prev => wm.lastStart(cells, chars, kind),
             .next_end => wm.firstEnd(cells, chars, kind),
             .prev_end => wm.lastEnd(cells, chars, kind),
         };
-        if (hit) |c2| {
-            copyModeMoveTo(self, row, @intCast(c2));
-            return;
-        }
+        if (hit) |c2| return .{ .row = r, .col = @intCast(c2) };
     }
 }
 
@@ -792,36 +854,46 @@ pub fn copyModeRefresh(self: *Window) void {
     const screen = pane.terminal.screen;
     const row = self.copymode_row;
     const col = self.copymode_col;
-    const a_row = self.copymode_anchor_row;
-    const a_col = self.copymode_anchor_col;
-    switch (self.copymode_sel) {
-        .none => screen.selection.clear(),
+    applyCopySelection(&screen.selection, .{
+        .kind = self.copymode_sel,
+        .anchor_row = self.copymode_anchor_row,
+        .anchor_col = self.copymode_anchor_col,
+    }, row, col, screen.cols);
+    screen.copy_cursor = .{ .row = row, .col = col };
+    screen.dirty = true;
+    c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
+}
+
+/// Re-derive `sel` from copy mode's anchor and cursor; a cell-wise
+/// selection includes both end cells although Selection's bottom
+/// column is exclusive.
+pub fn applyCopySelection(sel: *Selection, state: SelState, row: i32, col: u16, cols: u16) void {
+    const a_row = state.anchor_row;
+    const a_col = state.anchor_col;
+    switch (state.kind) {
+        .none => sel.clear(),
         .cell => {
-            // Inclusive both ways: Selection's bottom column is
-            // exclusive, so bump whichever endpoint is later.
+            // Bump whichever endpoint is later.
             if (row > a_row or (row == a_row and col >= a_col)) {
-                screen.selection.start(a_row, a_col, .normal);
-                screen.selection.extend(row, @as(i32, col) + 1);
+                sel.start(a_row, a_col, .normal);
+                sel.extend(row, @as(i32, col) + 1);
             } else {
-                screen.selection.start(a_row, @as(i32, a_col) + 1, .normal);
-                screen.selection.extend(row, col);
+                sel.start(a_row, @as(i32, a_col) + 1, .normal);
+                sel.extend(row, col);
             }
         },
         .line => {
             // Whole lines, anchor row through cursor row.
-            screen.selection.start(@min(a_row, row), 0, .normal);
-            screen.selection.extend(@max(a_row, row), @intCast(screen.cols));
+            sel.start(@min(a_row, row), 0, .normal);
+            sel.extend(@max(a_row, row), cols);
         },
         .rect => {
             const lo: i32 = @min(a_col, col);
             const hi: i32 = @as(i32, @max(a_col, col)) + 1;
-            screen.selection.start(a_row, lo, .rectangular);
-            screen.selection.extend(row, hi);
+            sel.start(a_row, lo, .rectangular);
+            sel.extend(row, hi);
         },
     }
-    screen.copy_cursor = .{ .row = row, .col = col };
-    screen.dirty = true;
-    c.gtk_gl_area_queue_render(@ptrCast(pane.surface.area));
 }
 
 /// input.Ctx copy-mode sink — forwards into the Window method.
@@ -973,66 +1045,91 @@ pub fn onHintKey(ctx: ?*anyopaque, keyval: c_uint, state: c.GdkModifierType) boo
             }
             return true;
         },
-        c.GDK_KEY_Shift_L,
-        c.GDK_KEY_Shift_R,
-        c.GDK_KEY_Control_L,
-        c.GDK_KEY_Control_R,
-        c.GDK_KEY_Alt_L,
-        c.GDK_KEY_Alt_R,
-        c.GDK_KEY_Super_L,
-        c.GDK_KEY_Super_R,
-        c.GDK_KEY_Caps_Lock,
-        c.GDK_KEY_Num_Lock,
-        => return false,
-        else => {},
+        else => if (isBareModifier(keyval)) return false,
     }
-    // Labels are matched case-insensitively so a Shift-held pick
-    // (which asks for "copy instead") still finds its label.
-    var u = c.gdk_keyval_to_unicode(keyval);
-    if (u >= 'A' and u <= 'Z') u += 0x20;
     const alphabet = hints_mod.validAlphabet(self.config.hint_alphabet) orelse hints_mod.ALPHABET;
-    if (u != 0 and u < 128 and std.mem.indexOfScalar(u8, alphabet, @intCast(u)) != null and self.hints_typed_len < 2) {
-        const candidate_len = self.hints_typed_len + 1;
-        self.hints_typed[self.hints_typed_len] = @intCast(u);
-        // Count matches under the new prefix; activate on a unique
-        // FULL match, revert the keystroke when nothing matches.
-        var matching: usize = 0;
-        var full: ?hints_mod.Match = null;
-        for (self.hint_matches) |m| {
-            if (!std.mem.startsWith(u8, m.label[0..m.label_len], self.hints_typed[0..candidate_len])) continue;
-            matching += 1;
-            if (m.label_len == candidate_len) full = m;
-        }
-        if (matching == 0) return true; // ignore stray key
-        if (full) |m| {
+    const ch = labelChar(c.gdk_keyval_to_unicode(keyval), alphabet) orelse return true;
+    if (self.hints_typed_len >= self.hints_typed.len) return true;
+    const candidate_len = self.hints_typed_len + 1;
+    self.hints_typed[self.hints_typed_len] = ch;
+    switch (pickHint(self.hint_matches, self.hints_typed[0..candidate_len])) {
+        // A stray key: the typed prefix stays what it was.
+        .none => return true,
+        .partial => {
+            self.hints_typed_len = candidate_len;
+            refreshHintOverlay(self);
+            return true;
+        },
+        .full => |m| {
             if (self.hints_multi) {
                 collectHint(self, m);
                 self.hints_typed_len = 0;
                 refreshHintOverlay(self);
                 return true;
             }
-            // Modifier overrides: Shift picks copy, Alt picks paste,
-            // whatever the rule's own action is. Both are reachable
-            // for every match, including the built-in kinds.
-            const action: hints_mod.Action = if (shift) .copy else if (alt) .paste else m.action;
-            activateHintAs(self, m, action);
+            activateHintAs(self, m, hintAction(m.action, shift, alt));
             self.exitHints();
             return true;
-        }
-        self.hints_typed_len = candidate_len;
-        refreshHintOverlay(self);
-        return true;
+        },
     }
-    // Swallow everything else — hint mode owns the keyboard.
-    return true;
+}
+
+/// Whether `m`'s label starts with what has been typed so far.
+fn labelHasPrefix(m: hints.Match, typed: []const u8) bool {
+    return std.mem.startsWith(u8, m.label[0..m.label_len], typed);
+}
+
+/// The label character a key with codepoint `u` types, folded to
+/// lower case so a Shift-held pick (which asks for "copy instead")
+/// still finds its label; null for anything outside `alphabet`.
+pub fn labelChar(u: u32, alphabet: []const u8) ?u8 {
+    const folded = if (u >= 'A' and u <= 'Z') u + 0x20 else u;
+    if (folded == 0 or folded >= 128) return null;
+    const b: u8 = @intCast(folded);
+    if (std.mem.indexOfScalar(u8, alphabet, b) == null) return null;
+    return b;
+}
+
+pub const HintPick = union(enum) {
+    /// No label starts with the typed prefix.
+    none,
+    /// Some labels start with it; keep typing.
+    partial,
+    /// A label equals it.
+    full: hints.Match,
+};
+
+pub fn pickHint(matches: []const hints.Match, typed: []const u8) HintPick {
+    var any = false;
+    var full: ?hints.Match = null;
+    for (matches) |m| {
+        if (!labelHasPrefix(m, typed)) continue;
+        any = true;
+        if (m.label_len == typed.len) full = m;
+    }
+    if (full) |m| return .{ .full = m };
+    return if (any) .partial else .none;
+}
+
+/// The action a completed label runs: Shift picks copy and Alt picks
+/// paste whatever the rule's own action is, so both are reachable for
+/// every match, the built-in kinds included.
+pub fn hintAction(rule: hints.Action, shift: bool, alt: bool) hints.Action {
+    if (shift) return .copy;
+    if (alt) return .paste;
+    return rule;
 }
 
 /// Multi-select: append a picked match to the collection instead of
 /// acting on it.
 fn collectHint(self: *Window, m: @import("hints.zig").Match) void {
-    if (self.hints_collected.items.len > 0)
-        self.hints_collected.append(self.allocator, '\n') catch return;
-    self.hints_collected.appendSlice(self.allocator, m.text) catch return;
+    appendCollected(&self.hints_collected, self.allocator, m.text) catch return;
+}
+
+/// Add one pick to the multi-select collection, newline-separated.
+pub fn appendCollected(out: *std.ArrayList(u8), gpa: std.mem.Allocator, text: []const u8) !void {
+    if (out.items.len > 0) try out.append(gpa, '\n');
+    try out.appendSlice(gpa, text);
 }
 
 /// Enter in multi-select mode: copy everything collected, as one
@@ -1041,4 +1138,381 @@ fn finishHintCollection(self: *Window) void {
     const pane = self.hints_pane orelse return;
     if (self.hints_collected.items.len == 0) return;
     copyHintText(self, pane, self.hints_collected.items);
+}
+
+// -- tests --------------------------------------------------------------
+
+const t = std.testing;
+
+test "bare modifiers pass through every overlay mode, printable keys do not" {
+    // Hyper and Meta were missing from hint mode's own copy of this list,
+    // so a bare press was swallowed there but let through in copy mode.
+    for ([_]c_uint{
+        c.GDK_KEY_Shift_L,   c.GDK_KEY_Control_R, c.GDK_KEY_Alt_L,  c.GDK_KEY_Super_R,
+        c.GDK_KEY_Hyper_L,   c.GDK_KEY_Hyper_R,   c.GDK_KEY_Meta_L, c.GDK_KEY_Meta_R,
+        c.GDK_KEY_Caps_Lock, c.GDK_KEY_Num_Lock,
+    }) |k| try t.expect(isBareModifier(k));
+    for ([_]c_uint{ c.GDK_KEY_a, c.GDK_KEY_y, c.GDK_KEY_Escape, c.GDK_KEY_Return, c.GDK_KEY_Tab }) |k|
+        try t.expect(!isBareModifier(k));
+}
+
+const Pool = @import("../grid/style_pool.zig").Pool;
+
+/// A real Screen with `lines` printed from the top; lines past the
+/// last row scroll the oldest ones into scrollback, exactly as output
+/// does. Initialised in place: the Screen keeps a pointer to `pool`.
+const TestScreen = struct {
+    pool: Pool,
+    screen: *Screen,
+
+    fn init(self: *TestScreen, cols: u16, rows: u16, lines: []const []const u8) !void {
+        self.pool = try Pool.init(t.allocator);
+        errdefer self.pool.deinit();
+        self.screen = try Screen.init(t.allocator, &self.pool, cols, rows);
+        for (lines, 0..) |line, i| {
+            if (i > 0) {
+                self.screen.apply(.{ .execute = '\r' });
+                self.screen.apply(.{ .execute = '\n' });
+            }
+            for (line) |ch| self.screen.printCp(ch);
+        }
+    }
+
+    fn deinit(self: *TestScreen) void {
+        self.screen.deinit();
+        self.pool.deinit();
+    }
+};
+
+test "smart case searches case-insensitively until the needle has a capital" {
+    try t.expect(searchIgnoresCase("foo", false, false));
+    try t.expect(!searchIgnoresCase("Foo", false, false));
+    try t.expect(!searchIgnoresCase("fOO bar", false, false));
+    // Ctrl+I forces insensitive whatever the needle; the config switch
+    // forces sensitive, but the per-search toggle still wins over it.
+    try t.expect(searchIgnoresCase("Foo", true, false));
+    try t.expect(!searchIgnoresCase("foo", false, true));
+    try t.expect(searchIgnoresCase("Foo", true, true));
+    // Only ASCII capitals count: a non-ASCII capital does not flip it.
+    try t.expect(searchIgnoresCase("\u{c9}t\u{e9}", false, false));
+}
+
+test "next and previous match wrap around both ends" {
+    try t.expectEqual(@as(usize, 1), stepMatch(0, 3, true));
+    try t.expectEqual(@as(usize, 0), stepMatch(2, 3, true));
+    try t.expectEqual(@as(usize, 2), stepMatch(0, 3, false));
+    try t.expectEqual(@as(usize, 1), stepMatch(2, 3, false));
+    // A single match is its own neighbour in both directions.
+    try t.expectEqual(@as(usize, 0), stepMatch(0, 1, true));
+    try t.expectEqual(@as(usize, 0), stepMatch(0, 1, false));
+}
+
+test "the match counter is 1-based and reads 0/0 without matches" {
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("0/0", matchCountLabel(&buf, 0, 0));
+    try t.expectEqualStrings("1/4", matchCountLabel(&buf, 0, 4));
+    try t.expectEqualStrings("4/4", matchCountLabel(&buf, 3, 4));
+}
+
+test "a scrollback match scrolls just far enough, a live one resets the view" {
+    try t.expectEqual(@as(u32, 0), matchViewOffset(3, 10));
+    try t.expectEqual(@as(u32, 0), matchViewOffset(0, 10));
+    try t.expectEqual(@as(u32, 4), matchViewOffset(-4, 10));
+    // Never past the oldest line.
+    try t.expectEqual(@as(u32, 10), matchViewOffset(-40, 10));
+}
+
+test "copy-mode n/N step to the nearest match strictly past the cursor, wrapping" {
+    const M = Screen.SearchMatch;
+    const ms = [_]M{
+        .{ .row = -3, .col = 5, .len = 1 },
+        .{ .row = 0, .col = 2, .len = 1 },
+        .{ .row = 0, .col = 9, .len = 1 },
+        .{ .row = 2, .col = 0, .len = 1 },
+    };
+    // Sitting ON a match moves off it, in both directions.
+    try t.expectEqual(@as(usize, 2), nearestMatch(&ms, 0, 2, true));
+    try t.expectEqual(@as(usize, 0), nearestMatch(&ms, 0, 2, false));
+    // Between matches, including across rows and into scrollback.
+    try t.expectEqual(@as(usize, 3), nearestMatch(&ms, 1, 40, true));
+    try t.expectEqual(@as(usize, 2), nearestMatch(&ms, 1, 0, false));
+    try t.expectEqual(@as(usize, 1), nearestMatch(&ms, -3, 6, true));
+    // Past the last / before the first wraps to the other end.
+    try t.expectEqual(@as(usize, 0), nearestMatch(&ms, 2, 0, true));
+    try t.expectEqual(@as(usize, 3), nearestMatch(&ms, -3, 5, false));
+}
+
+test "a hint key folds to lower case and must be in the label alphabet" {
+    try t.expectEqual(@as(?u8, 'a'), labelChar('a', hints.ALPHABET));
+    try t.expectEqual(@as(?u8, 'a'), labelChar('A', hints.ALPHABET));
+    try t.expectEqual(@as(?u8, null), labelChar('1', hints.ALPHABET));
+    try t.expectEqual(@as(?u8, null), labelChar(0, hints.ALPHABET));
+    try t.expectEqual(@as(?u8, null), labelChar(0xE9, hints.ALPHABET));
+    // A configured alphabet replaces the built-in one entirely.
+    try t.expectEqual(@as(?u8, '1'), labelChar('1', "123"));
+    try t.expectEqual(@as(?u8, null), labelChar('a', "123"));
+}
+
+fn hintMatch(label: []const u8, text: []u8) hints.Match {
+    var m = hints.Match{ .row = 0, .col_start = 0, .col_end = 1, .kind = .url, .text = text };
+    @memcpy(m.label[0..label.len], label);
+    m.label_len = @intCast(label.len);
+    return m;
+}
+
+test "typing a label prefix narrows, a full label picks, a stray key is ignored" {
+    var a_text = "alpha".*;
+    var b_text = "bravo".*;
+    var c_text = "charlie".*;
+    const two = [_]hints.Match{
+        hintMatch("aa", &a_text),
+        hintMatch("as", &b_text),
+        hintMatch("sa", &c_text),
+    };
+    try t.expect(pickHint(&two, "a") == .partial);
+    try t.expect(pickHint(&two, "") == .partial);
+    try t.expect(pickHint(&two, "d") == .none);
+    try t.expect(pickHint(&two, "ad") == .none);
+    const picked = pickHint(&two, "as");
+    try t.expectEqualStrings("bravo", picked.full.text);
+
+    // A batch of single-character labels completes on the first key.
+    const one = [_]hints.Match{ hintMatch("a", &a_text), hintMatch("s", &b_text) };
+    try t.expectEqualStrings("bravo", pickHint(&one, "s").full.text);
+}
+
+test "Shift copies and Alt pastes whatever the rule's own action is" {
+    try t.expectEqual(hints.Action.open, hintAction(.open, false, false));
+    try t.expectEqual(hints.Action.command, hintAction(.command, false, false));
+    try t.expectEqual(hints.Action.copy, hintAction(.open, true, false));
+    try t.expectEqual(hints.Action.paste, hintAction(.select, false, true));
+    try t.expectEqual(hints.Action.copy, hintAction(.paste, true, true));
+}
+
+test "multi-select collects picks newline-separated, without a leading newline" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(t.allocator);
+    try appendCollected(&out, t.allocator, "one");
+    try t.expectEqualStrings("one", out.items);
+    try appendCollected(&out, t.allocator, "two");
+    try appendCollected(&out, t.allocator, "three");
+    try t.expectEqualStrings("one\ntwo\nthree", out.items);
+}
+
+test "a command rule gets every {match} replaced by the shell-quoted text" {
+    const line = try hintCommandLine(t.allocator, "notify-send {match} && echo {match}", "it's a b");
+    defer t.allocator.free(line);
+    try t.expectEqualStrings("notify-send 'it'\\''s a b' && echo 'it'\\''s a b'", line);
+
+    // Safe text goes bare; near-misses of the placeholder stay literal.
+    const bare = try hintCommandLine(t.allocator, "open {match} {mat} {MATCH}", "/tmp/x.txt");
+    defer t.allocator.free(bare);
+    try t.expectEqualStrings("open /tmp/x.txt {mat} {MATCH}", bare);
+
+    // Empty text still yields an argument rather than vanishing.
+    const empty = try hintCommandLine(t.allocator, "echo {match}", "");
+    defer t.allocator.free(empty);
+    try t.expectEqualStrings("echo ''", empty);
+}
+
+test "a path hint resolves against HOME or the pane cwd, or not at all" {
+    var buf: [64]u8 = undefined;
+    try t.expectEqualStrings("/etc/hosts", resolveHintPath(&buf, "/etc/hosts", null, null).?);
+    try t.expectEqualStrings("/home/u/src/a.zig", resolveHintPath(&buf, "~/src/a.zig", "/home/u", null).?);
+    try t.expectEqualStrings("/work/src/a.zig", resolveHintPath(&buf, "src/a.zig", null, "/work").?);
+    // A tilde path needs HOME and a relative one needs a cwd.
+    try t.expect(resolveHintPath(&buf, "~/a", null, "/work") == null);
+    try t.expect(resolveHintPath(&buf, "a", "/home/u", null) == null);
+    // Only "~/" means home: "~user" is an ordinary relative name.
+    try t.expectEqualStrings("/work/~user/a", resolveHintPath(&buf, "~user/a", "/home/u", "/work").?);
+    try t.expect(resolveHintPath(&buf, "", "/home/u", "/work") == null);
+    // Too long for the buffer is a refusal, not a truncated path.
+    var tiny: [8]u8 = undefined;
+    try t.expect(resolveHintPath(&tiny, "src/a.zig", null, "/work") == null);
+}
+
+test "the hint editor is the configured one, then EDITOR, then VISUAL" {
+    try t.expectEqualStrings("hx", hintEditor("hx", "vim", "code").?);
+    try t.expectEqualStrings("vim", hintEditor("", "vim", "code").?);
+    try t.expectEqualStrings("code", hintEditor("", "", "code").?);
+    try t.expectEqualStrings("code", hintEditor("", null, "code").?);
+    try t.expect(hintEditor("", "", "") == null);
+    try t.expect(hintEditor("", null, null) == null);
+}
+
+test "comma reverses the direction of the last f/F/t/T" {
+    try t.expectEqual(@as(u8, 'F'), findReverse('f'));
+    try t.expectEqual(@as(u8, 'f'), findReverse('F'));
+    try t.expectEqual(@as(u8, 'T'), findReverse('t'));
+    try t.expectEqual(@as(u8, 't'), findReverse('T'));
+}
+
+test "v/V/r toggle the selection kind and drop the anchor only from none" {
+    const none = SelState{ .kind = .none, .anchor_row = 0, .anchor_col = 0 };
+    const cell = toggledSel(none, .cell, -2, 7);
+    try t.expectEqual(SelState{ .kind = .cell, .anchor_row = -2, .anchor_col = 7 }, cell);
+    // Switching kind keeps the anchor where it was dropped.
+    const line = toggledSel(cell, .line, 4, 1);
+    try t.expectEqual(SelState{ .kind = .line, .anchor_row = -2, .anchor_col = 7 }, line);
+    // Re-pressing the active kind clears the selection.
+    try t.expectEqual(winmod.CopyModeSel.none, toggledSel(line, .line, 4, 1).kind);
+    // A fresh selection after that anchors at the new cursor.
+    const rect = toggledSel(toggledSel(line, .line, 4, 1), .rect, 4, 1);
+    try t.expectEqual(SelState{ .kind = .rect, .anchor_row = 4, .anchor_col = 1 }, rect);
+}
+
+test "copy-mode selections cover the anchor and cursor cells inclusively" {
+    var sel: Selection = .{};
+
+    // Cell-wise, cursor after the anchor.
+    applyCopySelection(&sel, .{ .kind = .cell, .anchor_row = 0, .anchor_col = 2 }, 1, 3, 10);
+    try t.expect(sel.contains(0, 2));
+    try t.expect(!sel.contains(0, 1));
+    try t.expect(sel.contains(1, 3));
+    try t.expect(!sel.contains(1, 4));
+
+    // Cell-wise, cursor before the anchor: still both ends.
+    applyCopySelection(&sel, .{ .kind = .cell, .anchor_row = 1, .anchor_col = 3 }, 0, 2, 10);
+    try t.expect(sel.contains(1, 3));
+    try t.expect(!sel.contains(1, 4));
+    try t.expect(sel.contains(0, 2));
+    try t.expect(!sel.contains(0, 1));
+
+    // Anchor and cursor on one cell select exactly that cell.
+    applyCopySelection(&sel, .{ .kind = .cell, .anchor_row = -1, .anchor_col = 5 }, -1, 5, 10);
+    try t.expect(sel.hasContent());
+    try t.expect(sel.contains(-1, 5));
+    try t.expect(!sel.contains(-1, 4));
+    try t.expect(!sel.contains(-1, 6));
+
+    // Line-wise: whole rows between the two, whichever is higher.
+    applyCopySelection(&sel, .{ .kind = .line, .anchor_row = 2, .anchor_col = 7 }, 0, 1, 10);
+    try t.expect(sel.contains(0, 0));
+    try t.expect(sel.contains(2, 9));
+    try t.expect(!sel.contains(3, 0));
+    try t.expect(!sel.contains(-1, 9));
+
+    // Rectangular: the column span of both, inclusive, on every row.
+    applyCopySelection(&sel, .{ .kind = .rect, .anchor_row = 0, .anchor_col = 5 }, 2, 2, 10);
+    try t.expect(sel.contains(1, 2));
+    try t.expect(sel.contains(1, 5));
+    try t.expect(!sel.contains(1, 6));
+    try t.expect(!sel.contains(1, 1));
+    try t.expect(!sel.contains(3, 3));
+
+    applyCopySelection(&sel, .{ .kind = .none, .anchor_row = 0, .anchor_col = 5 }, 2, 2, 10);
+    try t.expect(!sel.isActive());
+}
+
+test "the copy cursor clamps into the buffer and drags the view along" {
+    var ts: TestScreen = undefined;
+    try ts.init(10, 3, &.{ "l1", "l2", "l3", "l4", "l5", "l6" });
+    defer ts.deinit();
+    const s = ts.screen;
+    try t.expectEqual(@as(u32, 3), s.scrollbackCount());
+    const ext = extentOf(s);
+    try t.expectEqual(Extent{ .top = -3, .bottom = 2, .last_col = 9 }, ext);
+
+    // Past the edges: clamped, never out of the buffer.
+    const below = clampMove(s, 9, 99);
+    try t.expectEqual(@as(i32, 2), below.row);
+    try t.expectEqual(@as(u16, 9), below.col);
+    try t.expectEqual(@as(?u32, null), below.view_offset);
+    const above = clampMove(s, -9, -4);
+    try t.expectEqual(@as(i32, -3), above.row);
+    try t.expectEqual(@as(u16, 0), above.col);
+    // Moving above the view scrolls back exactly to the cursor.
+    try t.expectEqual(@as(?u32, 3), above.view_offset);
+    try t.expectEqual(@as(?u32, 1), clampMove(s, -1, 0).view_offset);
+
+    // Scrolled back three rows, the live bottom row is off screen:
+    // moving there scrolls forward to the live view.
+    s.view_offset = 3;
+    try t.expectEqual(@as(i32, -3), viewTopOf(s));
+    try t.expectEqual(@as(?u32, 0), clampMove(s, 2, 0).view_offset);
+    // A row already on screen leaves the view alone.
+    try t.expectEqual(@as(?u32, null), clampMove(s, -2, 0).view_offset);
+    // The view top never reaches past the oldest line.
+    s.view_offset = 50;
+    try t.expectEqual(@as(i32, -3), viewTopOf(s));
+}
+
+test "the alternate screen has no scrollback for copy mode to enter" {
+    var ts: TestScreen = undefined;
+    try ts.init(10, 3, &.{ "l1", "l2", "l3", "l4", "l5" });
+    defer ts.deinit();
+    var csi = @import("../parser/event.zig").Event.Csi{};
+    csi.private = '?';
+    csi.params[0] = 1049;
+    csi.n_params = 1;
+    csi.final = 'h';
+    ts.screen.apply(.{ .csi = csi });
+    try t.expect(ts.screen.use_alt);
+    try t.expectEqual(@as(i32, 0), extentOf(ts.screen).top);
+    try t.expectEqual(@as(i32, 0), clampMove(ts.screen, -2, 0).row);
+}
+
+test "{ and } stop on the next blank row or at the buffer edge" {
+    var ts: TestScreen = undefined;
+    try ts.init(10, 5, &.{ "a", "b", "", "c", "d" });
+    defer ts.deinit();
+    const s = ts.screen;
+    try t.expectEqual(@as(i32, 2), paragraphTarget(s, 0, 1));
+    try t.expectEqual(@as(i32, 2), paragraphTarget(s, 4, -1));
+    // No blank row before the edge: the last row there.
+    try t.expectEqual(@as(i32, 4), paragraphTarget(s, 3, 1));
+    try t.expectEqual(@as(i32, 0), paragraphTarget(s, 1, -1));
+    // Already at the edge: stays put.
+    try t.expectEqual(@as(i32, 4), paragraphTarget(s, 4, 1));
+}
+
+test "word motions wrap to adjacent lines and stop at the buffer edge" {
+    var ts: TestScreen = undefined;
+    try ts.init(12, 3, &.{ "old line", "foo bar", "", "baz" });
+    defer ts.deinit();
+    const s = ts.screen;
+    // "old line" is in scrollback now (row -1).
+    try t.expectEqual(@as(u32, 1), s.scrollbackCount());
+    const C = Screen.CopyCursor;
+
+    try t.expectEqual(C{ .row = 0, .col = 4 }, wordTarget(s, 0, 0, .next, .word).?);
+    // Out of words on this line: the blank row is skipped.
+    try t.expectEqual(C{ .row = 2, .col = 0 }, wordTarget(s, 0, 4, .next, .word).?);
+    try t.expectEqual(C{ .row = 0, .col = 2 }, wordTarget(s, 0, 0, .next_end, .word).?);
+    try t.expectEqual(C{ .row = 0, .col = 4 }, wordTarget(s, 2, 0, .prev, .word).?);
+    // Backwards off the top of the screen, into scrollback.
+    try t.expectEqual(C{ .row = -1, .col = 4 }, wordTarget(s, 0, 0, .prev, .word).?);
+    // Nothing further in either direction.
+    try t.expect(wordTarget(s, -1, 0, .prev, .word) == null);
+    try t.expect(wordTarget(s, 2, 0, .next, .word) == null);
+}
+
+test "f/F/t/T find a character on the cursor's own line only" {
+    var ts: TestScreen = undefined;
+    try ts.init(12, 2, &.{ "a,b,c", "x,y" });
+    defer ts.deinit();
+    const s = ts.screen;
+    try t.expectEqual(@as(?u16, 1), findTarget(s, 0, 0, 'f', ','));
+    try t.expectEqual(@as(?u16, 3), findTarget(s, 0, 1, 'f', ','));
+    try t.expectEqual(@as(?u16, 2), findTarget(s, 0, 0, 't', ','));
+    try t.expectEqual(@as(?u16, 3), findTarget(s, 0, 4, 'F', ','));
+    try t.expectEqual(@as(?u16, 2), findTarget(s, 0, 4, 'T', ','));
+    // Line-local: the comma on the next row is not a target, and a
+    // miss is a no-op rather than a wrap.
+    try t.expect(findTarget(s, 0, 4, 'f', ',') == null);
+    try t.expect(findTarget(s, 0, 0, 'f', 'y') == null);
+    try t.expect(findTarget(s, 0, 0, 'x', ',') == null);
+}
+
+test "^ and $ find the first and last written cell of a row" {
+    var ts: TestScreen = undefined;
+    try ts.init(12, 3, &.{ "  hi there", "" });
+    defer ts.deinit();
+    const s = ts.screen;
+    try t.expectEqual(@as(i32, 2), copyModeLineStart(s, 0));
+    try t.expectEqual(@as(i32, 9), copyModeLineEnd(s, 0));
+    try t.expectEqual(@as(i32, 0), copyModeLineStart(s, 1));
+    try t.expectEqual(@as(i32, 0), copyModeLineEnd(s, 1));
+    // Rows outside the buffer answer column 0 rather than failing.
+    try t.expectEqual(@as(i32, 0), copyModeLineEnd(s, -5));
 }

@@ -223,8 +223,6 @@ fn tabSizeAllocate(widget: [*c]c.GtkWidget, width: c_int, height: c_int, baselin
     // No indicator button and title_inverted is false, so neither the
     // close button nor anything else reserves space: the close button is
     // placed at the end and the title may extend under it.
-    const start_width: c_int = 0;
-    const end_width: c_int = 0;
     if (t.close_btn) |cb| {
         if (c.gtk_widget_get_visible(@ptrCast(cb)) != 0) {
             const close_w = measureChildWidth(cb, height);
@@ -232,14 +230,9 @@ fn tabSizeAllocate(widget: [*c]c.GtkWidget, width: c_int, height: c_int, baselin
         }
     }
 
-    // Centre the icon+title group across the full width, clamped so it
-    // can't spill past the (here zero-width) reserved edges.
-    var center_width = @min(width - start_width - end_width, icon_w + title_w);
-    if (center_width < 0) center_width = 0;
-    const hi = width - center_width - end_width;
-    var center_x = @divTrunc(width - center_width, 2);
-    if (center_x < start_width) center_x = start_width;
-    if (center_x > hi) center_x = hi;
+    const group = centerGroup(width, icon_w + title_w);
+    var center_x = group.x;
+    var center_width = group.width;
 
     if (c.gtk_widget_get_visible(@ptrCast(t.icon)) != 0) {
         allocateChild(t.icon, center_x, icon_w, height, baseline);
@@ -250,6 +243,23 @@ fn tabSizeAllocate(widget: [*c]c.GtkWidget, width: c_int, height: c_int, baselin
         if (center_width < 0) center_width = 0;
         allocateChild(t.label, center_x, center_width, height, baseline);
     }
+}
+
+const Span = struct { x: c_int, width: c_int };
+
+/// Where the icon+title group of `content` px sits in a tab `width` px
+/// wide: centred across the full width, never wider than it and never
+/// spilling past the reserved edges (both zero-width here).
+fn centerGroup(width: c_int, content: c_int) Span {
+    const start_width: c_int = 0;
+    const end_width: c_int = 0;
+    var center_width = @min(width - start_width - end_width, content);
+    if (center_width < 0) center_width = 0;
+    const hi = width - center_width - end_width;
+    var center_x = @divTrunc(width - center_width, 2);
+    if (center_x < start_width) center_x = start_width;
+    if (center_x > hi) center_x = hi;
+    return .{ .x = center_x, .width = center_width };
 }
 
 /// Tab `snapshot`: draw the active effects BEHIND, then the tab's children
@@ -563,8 +573,7 @@ pub const TabBar = struct {
         for (self.tabs.items) |t| {
             if (!tab_effects.tabSettings(t.page).warn_inactive) continue;
             const deadline = tab_effects.warnDeadline(t.page, threshold_us) orelse continue;
-            if (deadline <= now) continue; // already past → tick is animating it
-            if (soonest == null or deadline < soonest.?) soonest = deadline;
+            soonest = soonerDeadline(soonest, deadline, now);
         }
         const d = soonest orelse {
             // Keep the one-shot source genuinely live until teardown in the
@@ -573,9 +582,7 @@ pub const TabBar = struct {
                 self.warn_arm_id = c.g_timeout_add(3_600_000, @ptrCast(&onWarnArm), self);
             return;
         };
-        // +50ms so warnEval is comfortably past the threshold when we wake.
-        const ms: c.guint = @intCast(@max(@divFloor(d - now, 1000) + 50, 1));
-        self.warn_arm_id = c.g_timeout_add(ms, @ptrCast(&onWarnArm), self);
+        self.warn_arm_id = c.g_timeout_add(wakeDelayMs(d, now), @ptrCast(&onWarnArm), self);
     }
 
     /// Mark the selected tab's `:selected` state (what libadwaita's
@@ -583,17 +590,18 @@ pub const TabBar = struct {
     pub fn refresh(self: *TabBar) void {
         if (self.callbacks_severed) return;
         const sel = c.adw_tab_view_get_selected_page(self.view);
+        var sel_idx: ?usize = null;
         for (self.tabs.items, 0..) |t, idx| {
-            const this_sel = sel == @as(?*c.AdwTabPage, t.page);
-            if (this_sel) {
+            if (sel == @as(?*c.AdwTabPage, t.page)) sel_idx = idx;
+        }
+        for (self.tabs.items, 0..) |t, idx| {
+            if (if (sel_idx) |s| s == idx else false) {
                 c.gtk_widget_set_state_flags(t.tab_box, c.GTK_STATE_FLAG_SELECTED, 0);
             } else {
                 c.gtk_widget_unset_state_flags(t.tab_box, c.GTK_STATE_FLAG_SELECTED);
             }
-            // Hide the separator that touches the selected tab (AdwTabBox).
             if (t.sep_before) |s| {
-                const prev_sel = idx > 0 and sel == @as(?*c.AdwTabPage, self.tabs.items[idx - 1].page);
-                if (this_sel or prev_sel) {
+                if (separatorHidden(idx, sel_idx)) {
                     c.gtk_widget_add_css_class(s, "hidden");
                 } else {
                     c.gtk_widget_remove_css_class(s, "hidden");
@@ -959,17 +967,7 @@ var theme_loaded = false;
 /// names a theme or the file isn't found. Loaded once per process.
 pub fn loadTheme(self: *TabBar, configured: []const u8) void {
     if (theme_loaded) return;
-    var env_buf: [256]u8 = undefined;
-    const name: []const u8 = blk: {
-        if (configured.len > 0) break :blk configured;
-        const env = profile.getenv("GTK_THEME") orelse break :blk "";
-        // GTK_THEME may be "Name:variant"; take the name part.
-        const colon = std.mem.indexOfScalar(u8, env, ':') orelse env.len;
-        const n = env[0..colon];
-        if (n.len == 0 or n.len >= env_buf.len) break :blk "";
-        @memcpy(env_buf[0..n.len], n);
-        break :blk env_buf[0..n.len];
-    };
+    const name = themeName(configured, profile.getenv("GTK_THEME"));
     if (name.len == 0) return;
     theme_loaded = true;
 
@@ -992,6 +990,18 @@ pub fn loadTheme(self: *TabBar, configured: []const u8) void {
         std.debug.print("sketerm: loaded GTK theme '{s}' from {s}\n", .{ name, path });
         return;
     }
+}
+
+/// The GTK theme to load: the configured one, else the name part of
+/// GTK_THEME ("Name:variant"); empty for none, and for a name too long
+/// to be a real theme directory.
+fn themeName(configured: []const u8, gtk_theme_env: ?[]const u8) []const u8 {
+    if (configured.len > 0) return configured;
+    const env = gtk_theme_env orelse return "";
+    const colon = std.mem.indexOfScalar(u8, env, ':') orelse env.len;
+    const n = env[0..colon];
+    if (n.len >= 256) return "";
+    return n;
 }
 
 // ── signal handlers ──────────────────────────────────────────────────
@@ -1041,13 +1051,9 @@ fn onTick(user: ?*anyopaque) callconv(.c) c.gboolean {
     var any_active = false;
     const dragging = if (self.reorder) |r| r.active else false;
     for (self.tabs.items) |t| {
-        // Ease the slide offset (ADW_EASE-ish) toward its target.
-        if (@abs(t.slide - t.slide_target) > 0.5) {
-            t.slide += (t.slide_target - t.slide) * 0.35;
-            any_active = true;
-        } else {
-            t.slide = t.slide_target;
-        }
+        const eased = easeSlide(t.slide, t.slide_target);
+        t.slide = eased.value;
+        if (eased.moving) any_active = true;
         const sel = c.adw_tab_view_get_selected_page(self.view) == @as(?*c.AdwTabPage, t.page);
         if (!sel and tabAnimating(self.config, t.page)) any_active = true;
         c.gtk_widget_queue_draw(t.tab_box);
@@ -1091,10 +1097,31 @@ const DRAG_THRESHOLD: f64 = 8;
 const DND_THRESHOLD_MULTIPLIER: f64 = 4;
 
 /// x (in `box` coords) of a tab's left edge, and its width.
-fn tabBounds(box: *c.GtkWidget, child: *c.GtkWidget) ?struct { x: f64, w: f64 } {
+const Bounds = struct { x: f64, w: f64 };
+
+fn tabBounds(box: *c.GtkWidget, child: *c.GtkWidget) ?Bounds {
     var r: c.graphene_rect_t = undefined;
     if (c.gtk_widget_compute_bounds(child, box, &r) == 0) return null;
     return .{ .x = r.origin.x, .w = r.size.width };
+}
+
+/// Spacing between neighbouring slots, measured to the next tab, or
+/// from the previous one for the last tab (`prev` is only consulted
+/// when there is no next tab), else own width plus the separator gap.
+fn slotAdvance(own: Bounds, next: ?Bounds, prev: ?Bounds) f64 {
+    if (next) |nb| return nb.x - own.x;
+    if (prev) |pb| return own.x - pb.x;
+    return own.w + 6;
+}
+
+/// How far tab `i` slides while the tab pressed at `start` hovers over
+/// slot `target`: the tabs in between shift one advance toward the
+/// vacated slot to open the gap, everyone else rests.
+fn slideOffset(i: usize, start: usize, target: usize, advance: f64) f64 {
+    if (i == start) return 0;
+    if (start < target and i > start and i <= target) return -advance;
+    if (start > target and i >= target and i < start) return advance;
+    return 0;
 }
 
 fn onReorderBegin(_: ?*anyopaque, start_x: f64, _: f64, user: ?*anyopaque) callconv(.c) void {
@@ -1106,14 +1133,10 @@ fn onReorderBegin(_: ?*anyopaque, start_x: f64, _: f64, user: ?*anyopaque) callc
         const b = tabBounds(self.box, t.child) orelse continue;
         if (start_x < b.x or start_x > b.x + b.w) continue;
         c.adw_tab_view_set_selected_page(self.view, t.page);
-        // Advance = spacing between this slot and the next (falls back to
-        // own width + a separator gap for a lone tab).
-        var advance = b.w + 6;
-        if (idx + 1 < self.tabs.items.len) {
-            if (tabBounds(self.box, self.tabs.items[idx + 1].child)) |nb| advance = nb.x - b.x;
-        } else if (idx > 0) {
-            if (tabBounds(self.box, self.tabs.items[idx - 1].child)) |pb| advance = b.x - pb.x;
-        }
+        const n = self.tabs.items.len;
+        const next: ?Bounds = if (idx + 1 < n) tabBounds(self.box, self.tabs.items[idx + 1].child) else null;
+        const prev: ?Bounds = if (idx + 1 >= n and idx > 0) tabBounds(self.box, self.tabs.items[idx - 1].child) else null;
+        const advance = slotAdvance(b, next, prev);
         self.reorder = .{
             .tab = t,
             .start_index = idx,
@@ -1187,18 +1210,7 @@ fn onReorderUpdate(gesture: ?*anyopaque, off_x: f64, off_y: f64, user: ?*anyopaq
     if (target >= self.tabs.items.len) target = self.tabs.items.len - 1;
     r.index = target;
 
-    // Neighbours between the old and new slot shift one advance to open
-    // the gap; everyone else returns to rest.
-    for (self.tabs.items, 0..) |t, i| {
-        if (i == r.start_index) {
-            t.slide_target = 0;
-            continue;
-        }
-        var off: f64 = 0;
-        if (r.start_index < target and i > r.start_index and i <= target) off = -r.advance;
-        if (r.start_index > target and i >= target and i < r.start_index) off = r.advance;
-        t.slide_target = off;
-    }
+    for (self.tabs.items, 0..) |t, i| t.slide_target = slideOffset(i, r.start_index, target, r.advance);
 
     // The offsets are applied by the tabbox snapshot, so invalidate it
     // (not just the individual tab nodes) on every motion.
@@ -1298,4 +1310,120 @@ fn onDrop(_: ?*anyopaque, _: ?*anyopaque, x: f64, _: f64, user: ?*anyopaque) cal
         }
     }
     return 1;
+}
+
+// -- strip decisions, free of widgets -------------------------------------
+
+/// Whether the separator before tab `idx` is hidden: AdwTabBox hides
+/// the one on each side of the selected tab.
+fn separatorHidden(idx: usize, selected: ?usize) bool {
+    const sel = selected orelse return false;
+    return sel == idx or sel + 1 == idx;
+}
+
+/// One reorder tick: the slide eases (ADW_EASE-ish) toward `target`
+/// and snaps onto it once within half a pixel.
+fn easeSlide(slide: f64, target: f64) struct { value: f64, moving: bool } {
+    if (@abs(slide - target) > 0.5) return .{ .value = slide + (target - slide) * 0.35, .moving = true };
+    return .{ .value = target, .moving = false };
+}
+
+/// Fold one tab's inactive-warning deadline into the soonest one still
+/// ahead; a deadline already past is the animating tick's business and
+/// needs no wake-up.
+fn soonerDeadline(soonest: ?i64, deadline: i64, now: i64) ?i64 {
+    if (deadline <= now) return soonest;
+    if (soonest) |s| return @min(s, deadline);
+    return deadline;
+}
+
+/// Milliseconds until the silence wake-up for a deadline in the
+/// future, 50ms late so warnEval is comfortably past the threshold.
+fn wakeDelayMs(deadline_us: i64, now_us: i64) c.guint {
+    return @intCast(@max(@divFloor(deadline_us - now_us, 1000) + 50, 1));
+}
+
+// -- tests --------------------------------------------------------------
+
+const testing = std.testing;
+
+test "the icon and title group is centred, never wider than the tab" {
+    try testing.expectEqual(Span{ .x = 29, .width = 60 }, centerGroup(118, 60));
+    try testing.expectEqual(Span{ .x = 0, .width = 118 }, centerGroup(118, 400));
+    // An odd leftover rounds toward the start.
+    try testing.expectEqual(Span{ .x = 2, .width = 5 }, centerGroup(10, 5));
+    try testing.expectEqual(Span{ .x = 0, .width = 0 }, centerGroup(0, 30));
+}
+
+test "the separators on both sides of the selected tab are hidden" {
+    // Separator i sits before tab i, so tab 2 selected hides 2 and 3.
+    try testing.expect(!separatorHidden(1, 2));
+    try testing.expect(separatorHidden(2, 2));
+    try testing.expect(separatorHidden(3, 2));
+    try testing.expect(!separatorHidden(4, 2));
+    try testing.expect(!separatorHidden(1, null));
+}
+
+test "a slot's advance is measured to the next tab, else from the previous" {
+    const own = Bounds{ .x = 200, .w = 180 };
+    try testing.expectEqual(@as(f64, 190), slotAdvance(own, .{ .x = 390, .w = 180 }, null));
+    try testing.expectEqual(@as(f64, 186), slotAdvance(own, null, .{ .x = 14, .w = 180 }));
+    // A lone tab: its own width plus the separator gap.
+    try testing.expectEqual(@as(f64, 186), slotAdvance(own, null, null));
+}
+
+test "only the tabs between the old and new slot slide, toward the gap" {
+    // Tab 1 dragged right over slot 3: tabs 2 and 3 shift left.
+    try testing.expectEqual(@as(f64, 0), slideOffset(0, 1, 3, 100));
+    try testing.expectEqual(@as(f64, 0), slideOffset(1, 1, 3, 100));
+    try testing.expectEqual(@as(f64, -100), slideOffset(2, 1, 3, 100));
+    try testing.expectEqual(@as(f64, -100), slideOffset(3, 1, 3, 100));
+    try testing.expectEqual(@as(f64, 0), slideOffset(4, 1, 3, 100));
+    // Tab 3 dragged left over slot 1: tabs 1 and 2 shift right.
+    try testing.expectEqual(@as(f64, 0), slideOffset(0, 3, 1, 100));
+    try testing.expectEqual(@as(f64, 100), slideOffset(1, 3, 1, 100));
+    try testing.expectEqual(@as(f64, 100), slideOffset(2, 3, 1, 100));
+    try testing.expectEqual(@as(f64, 0), slideOffset(3, 3, 1, 100));
+    // Back over its own slot: nothing moves.
+    for (0..4) |i| try testing.expectEqual(@as(f64, 0), slideOffset(i, 2, 2, 100));
+}
+
+test "a slide eases toward its target and then snaps and stops" {
+    const first = easeSlide(0, 100);
+    try testing.expect(first.moving);
+    try testing.expectApproxEqAbs(@as(f64, 35), first.value, 1e-9);
+    const settled = easeSlide(99.7, 100);
+    try testing.expect(!settled.moving);
+    try testing.expectEqual(@as(f64, 100), settled.value);
+    // It always converges.
+    var s: f64 = -180;
+    var ticks: usize = 0;
+    while (easeSlide(s, 0).moving) : (ticks += 1) s = easeSlide(s, 0).value;
+    try testing.expect(ticks < 30);
+}
+
+test "the silence wake-up targets the soonest deadline still ahead" {
+    const now: i64 = 10_000_000;
+    var soonest: ?i64 = null;
+    soonest = soonerDeadline(soonest, now + 5_000_000, now);
+    soonest = soonerDeadline(soonest, now - 1, now); // already past
+    soonest = soonerDeadline(soonest, now + 2_000_000, now);
+    soonest = soonerDeadline(soonest, now, now); // due right now: the tick has it
+    try testing.expectEqual(@as(?i64, now + 2_000_000), soonest);
+    try testing.expectEqual(@as(?i64, null), soonerDeadline(null, now - 5, now));
+
+    try testing.expectEqual(@as(c.guint, 2050), wakeDelayMs(now + 2_000_000, now));
+    // Sub-millisecond remainders still wait the margin, never zero.
+    try testing.expectEqual(@as(c.guint, 50), wakeDelayMs(now + 999, now));
+    try testing.expectEqual(@as(c.guint, 1), wakeDelayMs(now - 1_000_000, now));
+}
+
+test "the theme is the configured one, else GTK_THEME without its variant" {
+    try testing.expectEqualStrings("Nordic", themeName("Nordic", "Adwaita:dark"));
+    try testing.expectEqualStrings("Adwaita", themeName("", "Adwaita:dark"));
+    try testing.expectEqualStrings("Materia", themeName("", "Materia"));
+    try testing.expectEqualStrings("", themeName("", ":dark"));
+    try testing.expectEqualStrings("", themeName("", null));
+    const long = "x" ** 256;
+    try testing.expectEqualStrings("", themeName("", long));
 }

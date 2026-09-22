@@ -109,30 +109,67 @@ fn onActivate(_: *c.GtkSearchEntry, user: ?*anyopaque) callconv(.c) void {
     };
     defer sessions.deinit();
 
-    var any = false;
-    for (sessions.value.sessions) |s| {
+    // An allocation failure shows the rows found so far and no verdict.
+    var hits: std.ArrayList(Hit) = .empty;
+    const complete = if (collectHits(arena, ctx.allocator, sessions.value.sessions, pattern, DaemonSearch{}, &hits)) true else |_| false;
+    for (hits.items) |h| {
+        const rctx = arena.create(RowCtx) catch return;
+        rctx.* = .{ .ctx = ctx, .session = h.session };
+
+        const row = c.adw_action_row_new();
+        // Titles are pango markup by default; show hit text verbatim.
+        c.adw_preferences_row_set_use_markup(@ptrCast(@alignCast(row)), 0);
+        c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), h.title.ptr);
+        c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), h.subtitle.ptr);
+        c.gtk_list_box_row_set_activatable(@ptrCast(@alignCast(row)), 1);
+        c.g_object_set_data(@ptrCast(@alignCast(row)), "xsearch-row", @ptrCast(rctx));
+        c.gtk_list_box_append(@ptrCast(@alignCast(ctx.listbox)), row);
+    }
+    if (complete and hits.items.len == 0) addInfoRow(ctx, "no matches");
+}
+
+/// One result row, its strings in the dialog's per-query arena.
+pub const Hit = struct {
+    session: []const u8,
+    /// The matching line, verbatim.
+    title: [:0]const u8,
+    /// Which session, and how many lines back from the live bottom.
+    subtitle: [:0]const u8,
+};
+
+/// Search every live session of `sessions` and append a row per hit,
+/// in session order and then the daemon's own hit order. `searcher`
+/// answers `search(gpa, name, pattern, max)` like
+/// `mux_cli.searchSession`; a session it cannot answer for is skipped.
+pub fn collectHits(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    sessions: []const mux_cli.SessionInfo,
+    pattern: []const u8,
+    searcher: anytype,
+    out: *std.ArrayList(Hit),
+) !void {
+    for (sessions) |s| {
         if (s.exited) continue;
-        const reply = mux_cli.searchSession(ctx.allocator, null, s.name, pattern, MAX_PER_SESSION) orelse continue;
+        const reply = searcher.search(gpa, s.name, pattern, MAX_PER_SESSION) orelse continue;
         defer reply.deinit();
         for (reply.value.hits) |h| {
-            any = true;
-            const rctx = arena.create(RowCtx) catch return;
-            rctx.* = .{ .ctx = ctx, .session = arena.dupe(u8, s.name) catch return };
-
-            const row = c.adw_action_row_new();
-            // Titles are pango markup by default — show hit text verbatim.
-            c.adw_preferences_row_set_use_markup(@ptrCast(@alignCast(row)), 0);
-            const title_z = arena.dupeZ(u8, h.text) catch return;
-            const sub_z = std.fmt.allocPrintSentinel(arena, "{s}  (line -{d})", .{ s.name, h.back }, 0) catch return;
-            c.adw_preferences_row_set_title(@ptrCast(@alignCast(row)), title_z.ptr);
-            c.adw_action_row_set_subtitle(@ptrCast(@alignCast(row)), sub_z.ptr);
-            c.gtk_list_box_row_set_activatable(@ptrCast(@alignCast(row)), 1);
-            c.g_object_set_data(@ptrCast(@alignCast(row)), "xsearch-row", @ptrCast(rctx));
-            c.gtk_list_box_append(@ptrCast(@alignCast(ctx.listbox)), row);
+            const hit = Hit{
+                .session = try arena.dupe(u8, s.name),
+                .title = try arena.dupeZ(u8, h.text),
+                .subtitle = try std.fmt.allocPrintSentinel(arena, "{s}  (line -{d})", .{ s.name, h.back }, 0),
+            };
+            try out.append(arena, hit);
         }
     }
-    if (!any) addInfoRow(ctx, "no matches");
 }
+
+/// The local daemon, one session at a time.
+const DaemonSearch = struct {
+    fn search(_: DaemonSearch, gpa: std.mem.Allocator, name: []const u8, pattern: []const u8, max: u32) ?std.json.Parsed(mux_cli.SearchReply) {
+        return mux_cli.searchSession(gpa, null, name, pattern, max);
+    }
+};
 
 fn onRowActivated(_: *c.GtkListBox, row: ?*c.GtkListBoxRow, user: ?*anyopaque) callconv(.c) void {
     const ctx = cast.userData(Ctx, user);
@@ -160,4 +197,112 @@ fn freeCtx(user: ?*anyopaque) callconv(.c) void {
         ctx.arena.deinit();
         ctx.allocator.destroy(ctx);
     }
+}
+
+// -- tests --------------------------------------------------------------
+
+const testing = std.testing;
+
+/// Canned daemon: each session answers with the JSON search reply it
+/// is given, or fails when it has none. Records who was asked what.
+const FakeDaemon = struct {
+    replies: []const Reply,
+    asked: std.ArrayList([]const u8) = .empty,
+    last_pattern: []const u8 = "",
+    last_max: u32 = 0,
+
+    const Reply = struct { name: []const u8, json: []const u8 };
+
+    fn search(self: *FakeDaemon, gpa: std.mem.Allocator, name: []const u8, pattern: []const u8, max: u32) ?std.json.Parsed(mux_cli.SearchReply) {
+        self.asked.append(testing.allocator, name) catch return null;
+        self.last_pattern = pattern;
+        self.last_max = max;
+        for (self.replies) |r| {
+            if (!std.mem.eql(u8, r.name, name)) continue;
+            return std.json.parseFromSlice(mux_cli.SearchReply, gpa, r.json, .{
+                .ignore_unknown_fields = true,
+                .allocate = .alloc_always,
+            }) catch null;
+        }
+        return null;
+    }
+
+    fn deinit(self: *FakeDaemon) void {
+        self.asked.deinit(testing.allocator);
+    }
+};
+
+test "hits come in session order, then the daemon's order, and exited sessions are not asked" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const sessions = [_]mux_cli.SessionInfo{
+        .{ .name = "build" },
+        .{ .name = "gone", .exited = true },
+        .{ .name = "logs" },
+    };
+    var daemon = FakeDaemon{ .replies = &.{
+        .{ .name = "build", .json = "{\"hits\":[{\"back\":3,\"text\":\"make: *** Error 1\"},{\"back\":0,\"text\":\"error: <b>&</b>\"}],\"total\":2}" },
+        .{ .name = "gone", .json = "{\"hits\":[{\"back\":1,\"text\":\"stale error\"}]}" },
+        .{ .name = "logs", .json = "{\"hits\":[{\"back\":120,\"text\":\"ERROR disk full\"}]}" },
+    } };
+    defer daemon.deinit();
+
+    var hits: std.ArrayList(Hit) = .empty;
+    try collectHits(arena.allocator(), testing.allocator, &sessions, "error", &daemon, &hits);
+
+    try testing.expectEqual(@as(usize, 3), hits.items.len);
+    try testing.expectEqualStrings("build", hits.items[0].session);
+    try testing.expectEqualStrings("make: *** Error 1", hits.items[0].title);
+    try testing.expectEqualStrings("build  (line -3)", hits.items[0].subtitle);
+    // Hit text is shown verbatim, markup characters and all.
+    try testing.expectEqualStrings("error: <b>&</b>", hits.items[1].title);
+    try testing.expectEqualStrings("build  (line -0)", hits.items[1].subtitle);
+    try testing.expectEqualStrings("logs", hits.items[2].session);
+    try testing.expectEqualStrings("logs  (line -120)", hits.items[2].subtitle);
+
+    // The exited session was never searched; the query and the
+    // per-session cap went to the daemon untouched.
+    try testing.expectEqual(@as(usize, 2), daemon.asked.items.len);
+    try testing.expectEqualStrings("build", daemon.asked.items[0]);
+    try testing.expectEqualStrings("logs", daemon.asked.items[1]);
+    try testing.expectEqualStrings("error", daemon.last_pattern);
+    try testing.expectEqual(@as(u32, MAX_PER_SESSION), daemon.last_max);
+}
+
+test "a session that cannot be searched is skipped and the rest still answer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const sessions = [_]mux_cli.SessionInfo{ .{ .name = "detached-host" }, .{ .name = "local" } };
+    var daemon = FakeDaemon{ .replies = &.{
+        // A malformed reply is as good as no reply.
+        .{ .name = "detached-host", .json = "{\"hits\":" },
+        .{ .name = "local", .json = "{\"hits\":[{\"back\":2,\"text\":\"found\"}]}" },
+    } };
+    defer daemon.deinit();
+
+    var hits: std.ArrayList(Hit) = .empty;
+    try collectHits(arena.allocator(), testing.allocator, &sessions, "found", &daemon, &hits);
+    try testing.expectEqual(@as(usize, 1), hits.items.len);
+    try testing.expectEqualStrings("local", hits.items[0].session);
+    try testing.expectEqual(@as(usize, 2), daemon.asked.items.len);
+}
+
+test "no hits anywhere yields no rows at all" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const sessions = [_]mux_cli.SessionInfo{ .{ .name = "a" }, .{ .name = "b" } };
+    var daemon = FakeDaemon{ .replies = &.{
+        .{ .name = "a", .json = "{\"hits\":[],\"total\":0}" },
+        .{ .name = "b", .json = "{}" },
+    } };
+    defer daemon.deinit();
+
+    var hits: std.ArrayList(Hit) = .empty;
+    try collectHits(arena.allocator(), testing.allocator, &sessions, "zzz", &daemon, &hits);
+    try testing.expectEqual(@as(usize, 0), hits.items.len);
+
+    // No live session at all asks nobody.
+    const dead = [_]mux_cli.SessionInfo{.{ .name = "a", .exited = true }};
+    try collectHits(arena.allocator(), testing.allocator, &dead, "zzz", &daemon, &hits);
+    try testing.expectEqual(@as(usize, 2), daemon.asked.items.len);
 }
