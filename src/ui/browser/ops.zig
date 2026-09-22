@@ -167,9 +167,16 @@ fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void
     defer self.allocator.free(roots);
     // The source directory's filesystem rides along: it decides later
     // whether a hard link into another directory could work at all.
+    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.colview))) orelse {
+        self.setStatus("file clipboard is unavailable");
+        return;
+    };
     const board = self.clipboard();
     board.set(tab.hc.host, roots, cut, tab.root.dev);
-    exportClipToGdk(self, tab, cut);
+    if (!exportClipToGdk(board, clip)) {
+        self.setStatus("file clipboard export failed; copy/cut canceled");
+        return;
+    }
     const verb: []const u8 = if (cut) "cut" else "copied";
     if (board.items().len > 1) {
         self.setStatusFmt("{s} {d} items", .{ verb, board.items().len });
@@ -178,56 +185,95 @@ fn clipStore(self: *BrowserView, tab: *BTab, srcs: []const []u8, cut: bool) void
     }
 }
 
+// Like the board, this ownership is process-wide, not attached to a pane.
+// Own the provider reference so pointer identity cannot be recycled.
+const FileClipboardOwner = struct {
+    clip: ?*c.GdkClipboard = null,
+    provider: ?*c.GdkContentProvider = null,
+    changed: c.gulong = 0,
+
+    fn release(self: *FileClipboardOwner) void {
+        const clip = self.clip orelse return;
+        const provider = self.provider;
+        const changed = self.changed;
+        self.* = .{};
+        if (changed != 0) c.g_signal_handler_disconnect(clip, changed);
+        if (provider) |p| c.g_object_unref(p);
+        c.g_object_unref(clip);
+    }
+};
+
+var file_clipboard_owner: FileClipboardOwner = .{};
+
+fn onFileClipboardChanged(clip: *c.GdkClipboard, _: ?*anyopaque) callconv(.c) void {
+    if (file_clipboard_owner.clip != clip or c.gdk_clipboard_get_content(clip) == file_clipboard_owner.provider) return;
+    file_clipboard_owner.release();
+    clipboard.clearShared();
+}
+
 /// Mirror the internal clipboard onto the GDK clipboard so other apps
 /// can paste it: text/plain is newline-delimited absolute paths (a
 /// text-editor paste gives usable paths, Nemo-style, no file://) and
 /// x-special/gnome-copied-files carries file:// URIs so GNOME-family
 /// file managers paste the files themselves.
 ///
-/// Paste-into-self never reads GDK — it uses the internal board —
-/// so this is purely an export. Remote entries export their TEXT
-/// form only (the path on that host, which is what a paste into a
-/// terminal or editor wants); the file:// list is skipped for them
-/// because a local file manager would resolve it against this disk.
-fn exportClipToGdk(self: *BrowserView, tab: *BTab, cut: bool) void {
-    const board = self.clipboard();
-    if (board.isEmpty()) return;
+/// Paste-into-self uses the internal board only while GDK still owns
+/// this export; external clipboard contents are not imported. Remote
+/// entries export their TEXT form only (the path on that host, which
+/// is what a paste into a terminal or editor wants); the file:// list
+/// is skipped because a local file manager would use this disk.
+fn exportClipToGdk(board: *clipboard.Board, clip: *c.GdkClipboard) bool {
+    // Disconnect before replacing content: set_content emits changed
+    // synchronously, and the old owner must not clear the new board.
+    file_clipboard_owner.release();
+    var exported = false;
+    defer if (!exported) board.clear();
+    if (board.isEmpty()) return false;
     const local = board.host == null;
-    const a = self.allocator;
+    const a = board.allocator;
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(a);
     var gnome: std.ArrayList(u8) = .empty;
     defer gnome.deinit(a);
-    gnome.appendSlice(a, if (cut) "cut" else "copy") catch return;
+    gnome.appendSlice(a, if (board.cut) "cut" else "copy") catch return false;
     for (board.items(), 0..) |p, i| {
-        if (i > 0) text.append(a, '\n') catch return;
-        text.appendSlice(a, p) catch return;
+        if (i > 0) text.append(a, '\n') catch return false;
+        text.appendSlice(a, p) catch return false;
         if (!local) continue;
-        const pz = a.dupeZ(u8, p) catch return;
+        const pz = a.dupeZ(u8, p) catch return false;
         defer a.free(pz);
-        const uri = c.g_filename_to_uri(pz.ptr, null, null) orelse continue;
+        const uri = c.g_filename_to_uri(pz.ptr, null, null) orelse return false;
         defer c.g_free(uri);
-        gnome.append(a, '\n') catch return;
-        gnome.appendSlice(a, std.mem.span(@as([*:0]const u8, @ptrCast(uri)))) catch return;
+        gnome.append(a, '\n') catch return false;
+        gnome.appendSlice(a, std.mem.span(@as([*:0]const u8, @ptrCast(uri)))) catch return false;
     }
-    text.append(a, 0) catch return;
+    text.append(a, 0) catch return false;
     // The typed provider copies the string into its GValue; the union
     // takes ownership of both providers; set_content refs the union,
     // so our own ref is dropped afterwards.
     const text_provider = c.gdk_content_provider_new_typed(c.G_TYPE_STRING, text.items.ptr);
-    const clip = c.gtk_widget_get_clipboard(@ptrCast(@alignCast(tab.colview)));
-    if (!local) {
-        _ = c.gdk_clipboard_set_content(clip, text_provider);
-        c.g_object_unref(@as(?*anyopaque, @ptrCast(text_provider)));
-        return;
+    const provider = if (local) blk: {
+        const bytes = c.g_bytes_new(gnome.items.ptr, gnome.items.len);
+        defer c.g_bytes_unref(bytes);
+        const gnome_provider = c.gdk_content_provider_new_for_bytes("x-special/gnome-copied-files", bytes);
+        var providers = [_]?*c.GdkContentProvider{ gnome_provider, text_provider };
+        break :blk c.gdk_content_provider_new_union(&providers, providers.len);
+    } else text_provider;
+    defer c.g_object_unref(@as(?*anyopaque, @ptrCast(provider)));
+    if (c.gdk_clipboard_set_content(clip, provider) == 0) return false;
+    _ = c.g_object_ref(clip);
+    _ = c.g_object_ref(provider);
+    file_clipboard_owner = .{
+        .clip = clip,
+        .provider = provider,
+        .changed = c.g_signal_connect_data(clip, "changed", @ptrCast(&onFileClipboardChanged), null, null, c.G_CONNECT_DEFAULT),
+    };
+    if (file_clipboard_owner.changed == 0 or c.gdk_clipboard_get_content(clip) != provider) {
+        file_clipboard_owner.release();
+        return false;
     }
-    const bytes = c.g_bytes_new(gnome.items.ptr, gnome.items.len);
-    defer c.g_bytes_unref(bytes);
-    const gnome_provider = c.gdk_content_provider_new_for_bytes("x-special/gnome-copied-files", bytes);
-    var providers = [_]?*c.GdkContentProvider{ gnome_provider, text_provider };
-    const both = c.gdk_content_provider_new_union(&providers, providers.len);
-    _ = c.gdk_clipboard_set_content(clip, both);
-    c.g_object_unref(@as(?*anyopaque, @ptrCast(both)));
+    exported = true;
+    return true;
 }
 
 /// Chord-driven paste (Ctrl+V): the clipboard into the current tab.
@@ -2629,4 +2675,67 @@ test "paste batch status preserves failures and counts only admissions" {
     try t.expectEqual(PasteBatchAction.conflicts, pasteBatchAction(1, 2, 0, false));
     try t.expectEqual(PasteBatchAction.nothing, pasteBatchAction(0, 0, 0, false));
     try t.expectEqual(PasteBatchAction.queued, pasteBatchAction(3, 0, 0, false));
+}
+
+test "file clipboard ownership follows local and remote GDK providers" {
+    // Opt in only on an isolated display: never overwrite the user's clipboard.
+    if (c.getenv("SKETERM_TEST_FILE_CLIPBOARD") == null) return error.SkipZigTest;
+    const t = std.testing;
+    try t.expect(c.gtk_init_check() != 0);
+    const display = c.gdk_display_get_default() orelse return error.TestUnexpectedResult;
+    const clip = c.gdk_display_get_clipboard(display) orelse return error.TestUnexpectedResult;
+    var failing = t.FailingAllocator.init(t.allocator, .{});
+    const board = clipboard.shared(failing.allocator());
+    defer {
+        file_clipboard_owner.release();
+        clipboard.resetShared();
+        _ = c.gdk_clipboard_set_content(clip, null);
+    }
+    for ([_]?[]const u8{ null, "remote" }) |host| {
+        board.set(host, &.{"/first"}, true, 1);
+        try t.expect(exportClipToGdk(board, clip));
+        const formats = c.gdk_clipboard_get_formats(clip);
+        try t.expectEqual(host == null, c.gdk_content_formats_contain_mime_type(formats, "x-special/gnome-copied-files") != 0);
+        c.g_signal_emit_by_name(clip, "changed");
+        try t.expect(board.cut);
+        try t.expectEqualStrings("/first", board.first().?);
+
+        // A new Files export synchronously replaces the previous provider.
+        board.set(host, &.{"/second"}, true, 1);
+        try t.expect(exportClipToGdk(board, clip));
+        try t.expect(board.cut);
+        try t.expectEqualStrings("/second", board.first().?);
+
+        // The same clipboard API used by Files' Copy Path action.
+        @import("../clipboard.zig").copyTextTo(t.allocator, clip, "/copied/path");
+        try t.expect(board.isEmpty());
+        try t.expect(!board.cut);
+        try t.expect(file_clipboard_owner.clip == null);
+
+        board.set(host, &.{"/third"}, true, 1);
+        try t.expect(exportClipToGdk(board, clip));
+        // External ownership has no local content provider.
+        try t.expect(c.gdk_clipboard_set_content(clip, null) != 0);
+        try t.expect(board.isEmpty());
+        try t.expect(!board.cut);
+
+        board.set(host, &.{"/fourth"}, true, 1);
+        try t.expect(exportClipToGdk(board, clip));
+        board.set(host, &.{"/failed-export"}, true, 1);
+        failing.fail_index = failing.alloc_index;
+        try t.expect(!exportClipToGdk(board, clip));
+        failing.fail_index = std.math.maxInt(usize);
+        try t.expect(board.isEmpty());
+        try t.expect(!board.cut);
+        try t.expect(file_clipboard_owner.clip == null);
+    }
+    board.set(null, &.{"relative-path-cannot-be-a-file-uri"}, true, 1);
+    try t.expect(!exportClipToGdk(board, clip));
+    try t.expect(board.isEmpty());
+
+    board.set("remote", &.{"/last"}, true, 1);
+    try t.expect(exportClipToGdk(board, clip));
+    clipboard.resetShared();
+    c.gdk_clipboard_set_text(clip, "ownership changed after board teardown");
+    try t.expect(file_clipboard_owner.clip == null);
 }

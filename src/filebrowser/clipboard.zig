@@ -85,6 +85,11 @@ pub fn shared(allocator: std.mem.Allocator) *Board {
     return &g_board.?;
 }
 
+/// Ownership loss must not recreate a board that has already shut down.
+pub fn clearShared() void {
+    if (g_board) |*b| b.clear();
+}
+
 /// Release the singleton (process teardown / test isolation).
 pub fn resetShared() void {
     if (g_board) |*b| b.deinit();
@@ -130,4 +135,19 @@ test "shared() is one board for every caller" {
     try t.expectEqual(@intFromPtr(a), @intFromPtr(b));
     try t.expectEqualStrings("/home/x/f.mkv", b.first().?);
     try t.expectEqualStrings("dalaran", b.host.?);
+}
+
+test "clipboard ownership loss clears the shared cut without recreating a retired board" {
+    const t = std.testing;
+    defer resetShared();
+    const b = shared(t.allocator);
+    b.set("remote", &.{"/cut/file"}, true, 1);
+    clearShared();
+    try t.expect(b.isEmpty());
+    try t.expect(!b.cut);
+    try t.expect(b.host == null);
+
+    resetShared();
+    clearShared();
+    try t.expect(g_board == null);
 }

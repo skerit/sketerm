@@ -856,6 +856,7 @@ fn onSorterChanged(sorter: *c.GtkSorter, _: c_int, user: ?*anyopaque) callconv(.
     // column re-registers it into the DISPOSING GtkColumnViewSorter
     // (fatal g_sequence_is_empty assertion).
     if (tab.view.widgets_dead) return;
+    tab.view.commitVisual(tab);
     const cvs: *c.GtkColumnViewSorter = @ptrCast(@alignCast(sorter));
     const col = c.gtk_column_view_sorter_get_primary_sort_column(cvs);
     const order = c.gtk_column_view_sorter_get_primary_sort_order(cvs);

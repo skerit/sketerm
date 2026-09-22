@@ -1367,7 +1367,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             if (row.retry != null) self.dropSupersededRetryRows(row);
             self.renderJobs();
         } else {
-            self.setStatusFmt("operation failed: {s}", .{errorPhrase(rep.@"error")});
+            mutationFailed(self, "operation failed", rep.@"error");
             if (pj.kind == .compare_left or pj.kind == .compare_right) {
                 if (self.compare) |cmp| cmp.sideFailed(pj.kind == .compare_left);
             }
@@ -1426,7 +1426,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             pu.op.destroy(self.allocator);
         } else {
             pu.op.destroy(self.allocator);
-            self.setStatusFmt("operation failed: {s}", .{errorPhrase(rep.@"error")});
+            mutationFailed(self, "operation failed", rep.@"error");
         }
         _ = self.pending_undo.orderedRemove(i);
         return false;
@@ -1439,7 +1439,7 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
             self.finishHistory(ph.op, ph.direction);
         } else {
             self.restoreHistory(ph.op, ph.direction);
-            self.setStatusFmt("history operation failed: {s}", .{errorPhrase(rep.@"error")});
+            mutationFailed(self, "history operation failed", rep.@"error");
         }
         return false;
     }
@@ -1489,10 +1489,20 @@ pub fn onReply(self: *BrowserView, hc: *HostConn, payload: []const u8) bool {
     }
     // Plain op reply (mkdir/rename/delete fired from the UI).
     if (!rep.ok) {
-        self.setStatusFmt("operation failed: {s}", .{errorPhrase(rep.@"error")});
+        mutationFailed(self, "operation failed", rep.@"error");
         return false;
     }
     return false;
+}
+
+fn mutationFailed(self: *BrowserView, prefix: []const u8, reason: []const u8) void {
+    if (self.widgets_dead) return;
+    var buf: [512]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ prefix, errorPhrase(reason) }) catch prefix;
+    self.setStatus(msg);
+    // Live listing counts can replace the status in the same socket drain.
+    // Toasts have their own lifetime, independent of directory repaints.
+    if (self.ownerWindow()) |window| @import("../window.zig").showToast(window, msg);
 }
 
 /// A listing came back refused. Which surface has to say so depends

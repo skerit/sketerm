@@ -198,6 +198,7 @@ pub fn ensureFilterBar(self: *BrowserView) ?*c.GtkWidget {
 pub fn setFilter(self: *BrowserView, text: []const u8) void {
     const tab = self.currentTab() orelse return;
     if (std.mem.eql(u8, tab.filter, text)) return;
+    self.commitVisual(tab);
     if (tab.filter.len > 0) self.allocator.free(tab.filter);
     tab.filter = if (text.len == 0) &.{} else (self.allocator.dupe(u8, text) catch &.{});
     self.renderTab(tab);
@@ -215,10 +216,14 @@ fn setFilterText(self: *BrowserView, text: [*:0]const u8) void {
 /// The filter is TAB state, so switching tabs must not carry one
 /// tab's narrowing into another.
 pub fn syncFilterEntry(self: *BrowserView, tab: *BTab) void {
-    const entry = self.views.filter_entry orelse return;
     // A background tab can be re-rendered (a delta, a search match);
     // only the visible one owns the shared entry.
     if (self.currentTab() != tab) return;
+    if (tab.filter.len > 0) {
+        const bar = ensureFilterBar(self) orelse return;
+        c.gtk_widget_set_visible(bar, 1);
+    }
+    const entry = self.views.filter_entry orelse return;
     const current = std.mem.span(@as([*:0]const u8, @ptrCast(c.gtk_editable_get_text(@ptrCast(entry)))));
     if (std.mem.eql(u8, current, tab.filter)) return;
     var z: [512:0]u8 = undefined;
@@ -248,6 +253,68 @@ pub fn onFilterKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, _: c.
 pub fn onFilterClose(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
     const self = cast.userData(BrowserView, user);
     toggleFilter(self);
+}
+
+test "filter tab switch restores the active filter bar after another tab closes it" {
+    // Run only with an explicitly supplied isolated display.
+    const opt_in = c.getenv("SKETERM_TEST_BROWSER_UI") orelse return error.SkipZigTest;
+    if (!std.mem.eql(u8, std.mem.span(opt_in), "1")) return error.SkipZigTest;
+    const t = std.testing;
+    try t.expect(c.gtk_init_check() != 0);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var view = BrowserView{ .allocator = a, .pane = null };
+    view.root_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
+    _ = c.g_object_ref_sink(view.root_box);
+    defer c.g_object_unref(view.root_box);
+    view.search_bar = c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, 0).?;
+    c.gtk_box_append(@ptrCast(view.root_box), view.search_bar);
+    view.notebook = @ptrCast(c.gtk_notebook_new().?);
+    c.gtk_box_append(@ptrCast(view.root_box), @ptrCast(@alignCast(view.notebook)));
+    var tabs: [2]BTab = undefined;
+    for (&tabs, 0..) |*tab, i| {
+        const page = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0).?;
+        const label = c.gtk_label_new(if (i == 0) "A" else "B").?;
+        tab.* = .{
+            .view = &view,
+            .hc = undefined,
+            .root = undefined,
+            .page = page,
+            .listing_box = page,
+            .colview = undefined,
+            .tab_label = @ptrCast(label),
+            .filter = if (i == 0) try a.dupe(u8, "needle") else &.{},
+        };
+        try view.tabs.append(a, tab);
+        _ = c.gtk_notebook_append_page(view.notebook, page, label);
+    }
+
+    // Exercise the tab-switch synchronization without the full listing renderer.
+    c.gtk_notebook_set_current_page(view.notebook, 0);
+    syncFilterEntry(&view, &tabs[0]);
+    const bar = view.views.filter_bar orelse return error.TestUnexpectedResult;
+    const entry = view.views.filter_entry orelse return error.TestUnexpectedResult;
+    try t.expect(c.gtk_widget_get_visible(bar) != 0);
+    try t.expectEqualStrings("needle", std.mem.span(c.gtk_editable_get_text(@ptrCast(entry))));
+
+    c.gtk_notebook_set_current_page(view.notebook, 1);
+    syncFilterEntry(&view, &tabs[1]);
+    try t.expectEqualStrings("", std.mem.span(c.gtk_editable_get_text(@ptrCast(entry))));
+    const close = c.gtk_widget_get_last_child(bar) orelse return error.TestUnexpectedResult;
+    c.g_signal_emit_by_name(close, "clicked");
+    try t.expect(c.gtk_widget_get_visible(bar) == 0);
+    try t.expectEqualStrings("needle", tabs[0].filter);
+    try t.expectEqualStrings("", tabs[1].filter);
+
+    // A background render must not reopen A's filter while B is current.
+    syncFilterEntry(&view, &tabs[0]);
+    try t.expect(c.gtk_widget_get_visible(bar) == 0);
+    c.gtk_notebook_set_current_page(view.notebook, 0);
+    syncFilterEntry(&view, &tabs[0]);
+    try t.expect(c.gtk_widget_get_visible(bar) != 0);
+    try t.expect(c.gtk_widget_is_visible(@ptrCast(@alignCast(entry))) != 0);
+    try t.expectEqualStrings("needle", std.mem.span(c.gtk_editable_get_text(@ptrCast(entry))));
 }
 
 // -- zoom --------------------------------------------------------

@@ -1446,34 +1446,42 @@ pub fn onPatternActivate(entry: *c.GtkEntry, user: ?*anyopaque) callconv(.c) voi
 
 pub fn selectPattern(self: *BrowserView, pattern: []const u8, invert: bool) void {
     const tab = self.currentTab() orelse return;
-    var arena = std.heap.ArenaAllocator.init(self.allocator);
-    defer arena.deinit();
-    var existing = std.StringHashMap(void).init(arena.allocator());
-    for (tab.selected.items) |path| existing.put(arena.allocator().dupe(u8, path) catch continue, {}) catch {};
-    for (tab.selected.items) |path| self.allocator.free(path);
-    tab.selected.clearRetainingCapacity();
-    const dirs = [_]*Dir{tab.root};
-    self.selectPatternDirs(tab, &dirs, pattern, invert, &existing);
-    if (tab.view_mode != .icons) self.selectPatternDirs(tab, tab.subdirs.items, pattern, invert, &existing);
+    self.selectPatternDirs(tab, pattern, invert);
     self.renderTab(tab);
     self.updatePreview();
     self.setStatusFmt("selected {d} item(s)", .{tab.selected.items.len});
 }
 
-pub fn selectPatternDirs(self: *BrowserView, tab: *BTab, dirs: []const *Dir, pattern: []const u8, invert: bool, existing: *std.StringHashMap(void)) void {
-    for (dirs) |dir| for (dir.entries.items) |entry| {
-        // The one visibility predicate, not a hand-rolled half of it:
-        // a pattern select that reached past the live filter or the
-        // picker's rule armed rows the user could not see.
-        if (!@import("views.zig").entryVisible(tab, entry)) continue;
-        var path_buf: [4200]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ if (dir.path.len == 1) "" else dir.path, entry.name }) catch continue;
-        const matched = fsjob.nameMatches(pattern, entry.name);
+pub fn selectPatternDirs(self: *BrowserView, tab: *BTab, pattern: []const u8, invert: bool) void {
+    var arena = std.heap.ArenaAllocator.init(self.allocator);
+    defer arena.deinit();
+    var existing = std.StringHashMap(void).init(arena.allocator());
+    for (tab.selected.items) |path| existing.put(arena.allocator().dupe(u8, path) catch continue, {}) catch {};
+    // Several content hits can name one file. Match any visible hit,
+    // then select or invert that file once, using its real identity.
+    var matches: std.array_hash_map.String(bool) = .{};
+    const subdirs = if (tab.view_mode == .icons) 0 else tab.subdirs.items.len;
+    var i: usize = 0;
+    while (i <= subdirs) : (i += 1) {
+        const dir = if (i == 0) tab.root else tab.subdirs.items[i - 1];
+        for (dir.entries.items) |entry| {
+            if (!@import("views.zig").entryVisible(tab, entry)) continue;
+            var path_buf: [4200]u8 = undefined;
+            const path = dir.fullPath(entry, &path_buf) orelse continue;
+            const owned = arena.allocator().dupe(u8, path) catch continue;
+            const match = matches.getOrPut(arena.allocator(), owned) catch continue;
+            if (!match.found_existing) match.value_ptr.* = false;
+            match.value_ptr.* = match.value_ptr.* or fsjob.nameMatches(pattern, entry.name);
+        }
+    }
+    for (tab.selected.items) |path| self.allocator.free(path);
+    tab.selected.clearRetainingCapacity();
+    for (matches.keys(), matches.values()) |path, matched| {
         const selected = if (invert) (existing.contains(path) != matched) else matched;
         if (!selected) continue;
         const owned = self.allocator.dupe(u8, path) catch continue;
         tab.selected.append(self.allocator, owned) catch self.allocator.free(owned);
-    };
+    }
 }
 
 /// Idle gap after which the next keystroke starts a fresh prefix.
@@ -1680,6 +1688,61 @@ test "entryForPath resolves flat rows, expanded subdirs and miller ancestors" {
     tab.root = &flat;
     const hit = entryForPath(&tab, "/elsewhere/hit.txt") orelse return error.NotFound;
     try t.expectEqualStrings("hit.txt", hit.name);
+}
+
+test "pattern selection uses real paths and inverts duplicate content hits once" {
+    const t = std.testing;
+    const a = t.allocator;
+    const types = @import("types.zig");
+    var view = BrowserView{ .allocator = a, .pane = undefined };
+    var root = Dir{ .allocator = a, .path = @constCast("/data"), .view_id = 1, .flat = true };
+    defer {
+        for (root.entries.items) |*e| e.deinit(a);
+        root.entries.deinit(a);
+    }
+    try root.entries.append(a, try types.testEntry(a, "hit.txt:2: first", "/data/hit.txt"));
+    try root.entries.append(a, try types.testEntry(a, "hit.txt:7: second", "/data/hit.txt"));
+    try root.entries.append(a, try types.testEntry(a, "elsewhere.txt:3: first", "/elsewhere/other.txt"));
+    var tab = BTab{
+        .view = &view,
+        .hc = undefined,
+        .root = &root,
+        .page = undefined,
+        .listing_box = undefined,
+        .colview = undefined,
+        .tab_label = undefined,
+    };
+    defer {
+        for (tab.selected.items) |p| a.free(p);
+        tab.selected.deinit(a);
+    }
+
+    selectPatternDirs(&view, &tab, "*", false);
+    try t.expectEqual(@as(usize, 2), tab.selected.items.len);
+    try t.expectEqualStrings("/data/hit.txt", tab.selected.items[0]);
+    try t.expectEqualStrings("/elsewhere/other.txt", tab.selected.items[1]);
+
+    // Only one of the duplicate rows matches, but inversion is per file.
+    selectPatternDirs(&view, &tab, "*second*", true);
+    try t.expectEqual(@as(usize, 1), tab.selected.items.len);
+    try t.expectEqualStrings("/elsewhere/other.txt", tab.selected.items[0]);
+    selectPatternDirs(&view, &tab, "*", true);
+    try t.expectEqual(@as(usize, 1), tab.selected.items.len);
+    try t.expectEqualStrings("/data/hit.txt", tab.selected.items[0]);
+
+    // A hidden hit must neither select nor invert its file.
+    tab.filter = @constCast("first");
+    selectPatternDirs(&view, &tab, "*second*", true);
+    try t.expectEqual(@as(usize, 1), tab.selected.items.len);
+    try t.expectEqualStrings("/data/hit.txt", tab.selected.items[0]);
+
+    // Ordinary directory entries retain their own path, not a symlink target.
+    tab.filter = &.{};
+    root.flat = false;
+    try root.entries.append(a, try types.testEntry(a, "link.txt", "/elsewhere/target.txt"));
+    selectPatternDirs(&view, &tab, "link.txt", false);
+    try t.expectEqual(@as(usize, 1), tab.selected.items.len);
+    try t.expectEqualStrings("/data/link.txt", tab.selected.items[0]);
 }
 
 test "navigation preserves a live statfs request for one late refresh" {

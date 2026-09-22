@@ -1136,3 +1136,36 @@ pub fn chordMark(self: *BrowserView) bool {
     markDialog(self);
     return true;
 }
+
+test "committing visual mode preserves selected paths and releases the old anchor" {
+    const t = std.testing;
+    const a = t.allocator;
+    var view = BrowserView{ .allocator = a, .pane = undefined, .widgets_dead = true };
+    var tab = BTab{
+        .view = &view,
+        .hc = undefined,
+        .root = undefined,
+        .page = undefined,
+        .listing_box = undefined,
+        .colview = undefined,
+        .tab_label = undefined,
+    };
+    defer {
+        tab.sel.deinit(a);
+        for (tab.selected.items) |p| a.free(p);
+        tab.selected.deinit(a);
+    }
+    tab.sel.anchor = 1;
+    try tab.sel.saved.append(a, try a.dupe(u8, "/data/B"));
+    try tab.selected.append(a, try a.dupe(u8, "/data/B"));
+    try tab.selected.append(a, try a.dupe(u8, "/data/C"));
+
+    commitVisual(&view, &tab);
+    try t.expect(tab.sel.anchor == null);
+    try t.expectEqual(@as(usize, 0), tab.sel.saved.items.len);
+    try t.expectEqual(@as(usize, 2), tab.selected.items.len);
+    try t.expectEqualStrings("/data/B", tab.selected.items[0]);
+    try t.expectEqualStrings("/data/C", tab.selected.items[1]);
+    commitVisual(&view, &tab);
+    try t.expectEqual(@as(usize, 2), tab.selected.items.len);
+}

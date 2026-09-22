@@ -2289,8 +2289,17 @@ fn runTrashRestore(spec: Spec) u8 {
     pathz.makeParentDirs(spec.dst) catch return emitError("cannot create restore parent");
     var sz: [4096]u8 = undefined;
     var dz: [4096]u8 = undefined;
-    if (c.rename(pathz.pathZ(&sz, spec.src) catch return emitError("path too long"), pathz.pathZ(&dz, spec.dst) catch return emitError("path too long")) != 0)
-        return emitErrno("restore from trash");
+    const src = pathz.pathZ(&sz, spec.src) catch return emitError("path too long");
+    const dst = pathz.pathZ(&dz, spec.dst) catch return emitError("path too long");
+    switch (platform.renameNoReplace(src, dst)) {
+        .ok => {},
+        .exists => return emitErrorKind("permanent", "restore from trash: destination already exists; item remains in Trash"),
+        .cross_device => return emitError("restore from trash: XDEV"),
+        .failed => |err| {
+            var buf: [128]u8 = undefined;
+            return emitError(std.fmt.bufPrint(&buf, "restore from trash: {s}", .{@tagName(err)}) catch "restore from trash failed");
+        },
+    }
     if (spec.pattern.len > 0) {
         var iz: [4096]u8 = undefined;
         _ = c.unlink(pathz.pathZ(&iz, spec.pattern) catch return emitError("trash info path too long"));
@@ -6768,6 +6777,95 @@ test "durable cancellation wins before deleting is committed" {
     defer parsed.deinit();
     try t.expectEqualStrings("quarantined", parsed.value.phase);
     try t.expect(fsjournal.cancelRequested(dir, 74));
+}
+
+test "trash restore preserves collisions and retries without losing payload or metadata" {
+    const t = std.testing;
+    const saved_state = durable_state;
+    defer durable_state = saved_state;
+
+    const Collision = enum { file, directory, dangling_symlink };
+    for ([_]Collision{ .file, .directory, .dangling_symlink }) |collision| {
+        const td = pathz.TempDir.make("restore-collision") orelse return error.SkipZigTest;
+        defer td.remove();
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const src = try std.fmt.allocPrintSentinel(a, "{s}/trashed", .{td.path()}, 0);
+        const dst = try std.fmt.allocPrintSentinel(a, "{s}/restored", .{td.path()}, 0);
+        const info = try std.fmt.allocPrintSentinel(a, "{s}/item.trashinfo", .{td.path()}, 0);
+        const metadata = try std.fmt.allocPrint(a, "[Trash Info]\nPath={s}\n", .{dst});
+        const payload = "original trashed contents";
+        const payload_path = if (collision == .directory) blk: {
+            try t.expect(c.mkdir(src.ptr, 0o700) == 0);
+            break :blk try std.fmt.allocPrintSentinel(a, "{s}/child", .{src}, 0);
+        } else src;
+        const files = [_]struct { path: [:0]const u8, text: []const u8 }{
+            .{ .path = payload_path, .text = payload },
+            .{ .path = info, .text = metadata },
+        };
+        for (files) |file| {
+            const f = c.fopen(file.path.ptr, "wb") orelse return error.TestUnexpectedResult;
+            defer _ = c.fclose(f);
+            try t.expectEqual(file.text.len, c.fwrite(file.text.ptr, 1, file.text.len, f));
+        }
+        switch (collision) {
+            .file => {
+                const f = c.fopen(dst.ptr, "wb") orelse return error.TestUnexpectedResult;
+                defer _ = c.fclose(f);
+                const replacement = "replacement contents";
+                try t.expectEqual(replacement.len, c.fwrite(replacement.ptr, 1, replacement.len, f));
+            },
+            .directory => try t.expect(c.mkdir(dst.ptr, 0o700) == 0),
+            .dangling_symlink => try t.expect(c.symlink("missing-target", dst.ptr) == 0),
+        }
+        var before: c.struct_stat = undefined;
+        try t.expect(c.lstat(dst.ptr, &before) == 0);
+        const spec = Spec{ .src = src, .dst = dst, .pattern = info };
+        durable_state = .{ .defer_terminal = true };
+        try t.expectEqual(@as(u8, 1), runTrashRestore(spec));
+        try t.expectEqualStrings("permanent", durable_state.error_kind.slice());
+        try t.expectEqualStrings("restore from trash: destination already exists; item remains in Trash", durable_state.message.slice());
+        try t.expect(std.mem.indexOf(u8, durable_state.terminal_event.slice(), "\"ev\":\"error\"") != null);
+        var after: c.struct_stat = undefined;
+        try t.expect(c.lstat(dst.ptr, &after) == 0);
+        try t.expectEqual(before.st_ino, after.st_ino);
+        try t.expectEqual(before.st_mode, after.st_mode);
+        if (collision == .file) {
+            const f = c.fopen(dst.ptr, "rb") orelse return error.TestUnexpectedResult;
+            defer _ = c.fclose(f);
+            var buf: [128]u8 = undefined;
+            const n = c.fread(&buf, 1, buf.len, f);
+            try t.expectEqualStrings("replacement contents", buf[0..n]);
+        }
+        for (files) |file| {
+            const f = c.fopen(file.path.ptr, "rb") orelse return error.TestUnexpectedResult;
+            defer _ = c.fclose(f);
+            var buf: [512]u8 = undefined;
+            const n = c.fread(&buf, 1, buf.len, f);
+            try t.expectEqualStrings(file.text, buf[0..n]);
+        }
+
+        // Retrying after resolving the collision must still restore the
+        // original payload, and only then remove its trash metadata.
+        try t.expect((if (collision == .directory) c.rmdir(dst.ptr) else c.unlink(dst.ptr)) == 0);
+        durable_state = .{ .defer_terminal = true };
+        try t.expectEqual(@as(u8, 0), runTrashRestore(spec));
+        try t.expect(std.mem.indexOf(u8, durable_state.terminal_event.slice(), "\"ev\":\"done\"") != null);
+        try t.expect(c.lstat(src.ptr, &after) != 0);
+        try t.expectEqual(std.posix.E.NOENT, std.posix.errno(@as(c_int, -1)));
+        try t.expect(c.lstat(info.ptr, &after) != 0);
+        try t.expectEqual(std.posix.E.NOENT, std.posix.errno(@as(c_int, -1)));
+        const restored_payload = if (collision == .directory)
+            try std.fmt.allocPrintSentinel(a, "{s}/child", .{dst}, 0)
+        else
+            dst;
+        const f = c.fopen(restored_payload.ptr, "rb") orelse return error.TestUnexpectedResult;
+        defer _ = c.fclose(f);
+        var buf: [128]u8 = undefined;
+        const n = c.fread(&buf, 1, buf.len, f);
+        try t.expectEqualStrings(payload, buf[0..n]);
+    }
 }
 
 test "digest cache rejects in-place changes with restored mtime" {
