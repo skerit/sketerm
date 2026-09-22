@@ -121,9 +121,9 @@ pub fn build(b: *std.Build) void {
     noglib_opts.addOption(bool, "dmabuf_import", have_dmabuf_import);
     const noglib_opts_mod = noglib_opts.createModule();
 
-    // Vendored Tree-sitter runtime + grammars for the editor's syntax
-    // highlighting. Built once and linked into the GUI-side artifacts
-    // only — see `buildTreeSitter`/`addTreeSitter`.
+    // Vendored Tree-sitter runtime + pinned upstream grammars for the
+    // editor's syntax highlighting. Built once and linked into the
+    // GUI-side artifacts only — see `buildTreeSitter`/`addTreeSitter`.
     const tree_sitter = buildTreeSitter(b, target, optimize, use_lld);
 
     const exe_mod = b.createModule(.{
@@ -1819,8 +1819,8 @@ fn addZstd(b: *std.Build, mod: *std.Build.Module) void {
     });
 }
 
-/// Vendored Tree-sitter runtime + the generated grammars behind the
-/// editor's syntax highlighting (src/editor/syntax.zig). See
+/// Vendored Tree-sitter runtime + the pinned upstream grammars behind
+/// the editor's syntax highlighting (src/editor/syntax.zig). See
 /// vendor/tree-sitter/PROVENANCE.txt for commits and licenses.
 ///
 /// GUI-side artifacts ONLY. `configureCoreDeps` deliberately does not
@@ -1828,19 +1828,16 @@ fn addZstd(b: *std.Build, mod: *std.Build.Module) void {
 /// `mux-portable` must keep building against static musl. The one
 /// non-GUI exception is `test-core`, which exercises syntax.zig.
 ///
-/// Everything here is generated or hand-written C — no node/JS
-/// toolchain runs at build time. `lib/src/lib.c` is upstream's
-/// amalgamation (it `#include`s every other runtime .c), so exactly one
-/// translation unit compiles the runtime. Each grammar gets ITS OWN
-/// include path because its `tree_sitter/parser.h` pins the language
-/// ABI its table was generated against.
-const TS_GRAMMARS = [_]struct { dir: []const u8, scanner: bool }{
-    .{ .dir = "zig", .scanner = false },
-    .{ .dir = "c", .scanner = false },
-    .{ .dir = "json", .scanner = false },
-    .{ .dir = "markdown", .scanner = true },
-    .{ .dir = "markdown_inline", .scanner = true },
-};
+/// No grammar source is committed and no node/JS toolchain runs: each
+/// `ts_grammars.Upstream` is a GitHub archive (generated `parser.c`
+/// included) that `fetchGrammar` downloads when a step that compiles it
+/// first runs, so a `sketerm-mux` build never touches the network.
+/// `lib/src/lib.c` is upstream's amalgamation (it `#include`s every
+/// other runtime .c), so exactly one translation unit compiles the
+/// runtime. Each grammar gets ITS OWN include path because its
+/// `tree_sitter/parser.h` pins the language ABI its table was generated
+/// against.
+const ts_grammars = @import("src/editor/grammars.zig");
 
 const TS_CFLAGS = [_][]const u8{
     // gnu11, not c11: the runtime calls fdopen() and the byte-order
@@ -1861,8 +1858,47 @@ const TS_CFLAGS = [_][]const u8{
 /// one module would let whichever `-I` came first silently shadow the
 /// others.
 const TreeSitter = struct {
-    libs: [1 + TS_GRAMMARS.len]*std.Build.Step.Compile,
+    libs: [1 + ts_grammars.COUNT]*std.Build.Step.Compile,
+    /// Unpacked upstream trees, indexed by `ts_grammars.Upstream`.
+    trees: [std.enums.values(ts_grammars.Upstream).len]std.Build.LazyPath,
 };
+
+/// Downloads one pinned upstream archive and unpacks it into a cached
+/// output directory.
+///
+/// The Run step's cache key is the URL and checksum, so it downloads
+/// once per cache and again only when a pin changes. curl + tar for
+/// the same reasons as `fetch-cef`; a checksum mismatch fails the build
+/// rather than compiling unverified C.
+fn fetchGrammar(b: *std.Build, up: ts_grammars.Upstream) std.Build.LazyPath {
+    const pin = up.pin();
+    const run = b.addSystemCommand(&.{
+        "sh", "-c",
+        \\set -eu
+        \\out="$1"; url="$2"; sum="$3"
+        \\tgz="$out.tar.gz"
+        \\curl -fsSL --retry 3 -o "$tgz" "$url"
+        \\if command -v sha256sum >/dev/null 2>&1; then
+        \\  echo "$sum  $tgz" | sha256sum -c - >/dev/null || bad=1
+        \\else
+        \\  echo "$sum  $tgz" | shasum -a 256 -c - >/dev/null || bad=1
+        \\fi
+        \\if [ "${bad:-0}" = 1 ]; then
+        \\  echo "tree-sitter: SHA-256 mismatch for $url, refusing to unpack" >&2
+        \\  rm -f "$tgz"; exit 1
+        \\fi
+        \\mkdir -p "$out"
+        \\tar -xzf "$tgz" -C "$out" --strip-components=1
+        \\rm -f "$tgz"
+        ,
+        "sh",
+    });
+    run.setName(b.fmt("fetch tree-sitter-{s}", .{@tagName(up)}));
+    const out = run.addOutputDirectoryArg(@tagName(up));
+    run.addArg(b.fmt("https://github.com/{s}/archive/{s}.tar.gz", .{ pin.repo, pin.commit }));
+    run.addArg(pin.sha256);
+    return out;
+}
 
 fn buildTreeSitter(
     b: *std.Build,
@@ -1871,6 +1907,7 @@ fn buildTreeSitter(
     use_lld: bool,
 ) TreeSitter {
     var out: TreeSitter = undefined;
+    for (std.enums.values(ts_grammars.Upstream), 0..) |up, i| out.trees[i] = fetchGrammar(b, up);
 
     const rt_mod = b.createModule(.{
         .target = target,
@@ -1892,26 +1929,26 @@ fn buildTreeSitter(
         .use_lld = use_lld,
     });
 
-    for (TS_GRAMMARS, 0..) |g, i| {
-        const dir = b.fmt("vendor/tree-sitter/grammars/{s}", .{g.dir});
+    for (std.enums.values(ts_grammars.Grammar), 0..) |g, i| {
+        const dir = out.trees[@intFromEnum(g.upstream())].path(b, g.srcDir());
         const g_mod = b.createModule(.{
             .target = target,
             .optimize = optimize,
             .link_libc = true,
         });
-        g_mod.addIncludePath(b.path(dir));
+        g_mod.addIncludePath(dir);
         g_mod.addCSourceFile(.{
-            .file = b.path(b.fmt("{s}/parser.c", .{dir})),
+            .file = dir.path(b, "parser.c"),
             .flags = &TS_CFLAGS,
         });
-        if (g.scanner) {
+        if (g.hasScanner()) {
             g_mod.addCSourceFile(.{
-                .file = b.path(b.fmt("{s}/scanner.c", .{dir})),
+                .file = dir.path(b, "scanner.c"),
                 .flags = &TS_CFLAGS,
             });
         }
         out.libs[1 + i] = b.addLibrary(.{
-            .name = b.fmt("tree-sitter-{s}", .{g.dir}),
+            .name = b.fmt("tree-sitter-{s}", .{@tagName(g)}),
             .root_module = g_mod,
             .linkage = .static,
             .use_lld = use_lld,
@@ -1923,12 +1960,14 @@ fn buildTreeSitter(
 fn addTreeSitter(b: *std.Build, mod: *std.Build.Module, ts: TreeSitter) void {
     mod.addIncludePath(b.path("vendor/tree-sitter/lib/include"));
     for (ts.libs) |lib| mod.linkLibrary(lib);
-    // The highlight queries ride along as embedded assets — vendor/ is
-    // outside the source module root, so @embedFile needs an anonymous
-    // import (same trick as the CRT shaders in smoke-cell).
-    for (TS_GRAMMARS) |g| {
-        mod.addAnonymousImport(b.fmt("ts_query_{s}", .{g.dir}), .{
-            .root_source_file = b.path(b.fmt("vendor/tree-sitter/queries/{s}.scm", .{g.dir})),
+    // The highlight queries ride along as embedded assets. They live in
+    // the fetched trees, outside the source module root, so @embedFile
+    // needs an anonymous import (same trick as the CRT shaders in
+    // smoke-cell).
+    for (std.enums.values(ts_grammars.Query)) |q| {
+        const src = q.source();
+        mod.addAnonymousImport(b.fmt("ts_query_{s}", .{@tagName(q)}), .{
+            .root_source_file = ts.trees[@intFromEnum(src.upstream)].path(b, src.path),
         });
     }
 }

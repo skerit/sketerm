@@ -365,6 +365,7 @@ comptime {
     _ = @import("editor/syntax.zig");
     _ = @import("editor/outline.zig");
     _ = @import("editor/theme.zig");
+    _ = @import("editor/grammars.zig");
     _ = @import("lsp/rpc.zig");
     _ = @import("lsp/semantic.zig");
     _ = @import("lsp/inlay.zig");

@@ -221,7 +221,9 @@ Shader presets under `data/shaders/` carry per-file licenses (MIT,
 public domain, GPL; see `data/shaders/README`); all are compatible with
 the GPL-3 core.
 
-The vendored Tree-sitter runtime and grammars under `vendor/tree-sitter/`
-(editor syntax highlighting) are MIT, with an ICU-derived unicode
-subdirectory; upstream commits, licenses and the layout rationale are
-recorded in its `PROVENANCE.txt`.
+The vendored Tree-sitter runtime under `vendor/tree-sitter/` (editor
+syntax highlighting) is MIT, with an ICU-derived unicode subdirectory.
+The grammars are not in the repository: the build downloads each one
+from its upstream repository at the commit and checksum pinned in
+`src/editor/grammars.zig` (all MIT). `vendor/tree-sitter/PROVENANCE.txt`
+records the details.

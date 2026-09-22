@@ -1,39 +1,49 @@
-Vendored Tree-sitter runtime + generated grammars (syntax highlighting
-for the sketerm editor pane). All GPL-3-compatible permissive licenses.
+Vendored Tree-sitter runtime (syntax highlighting for the sketerm editor
+pane). MIT, GPL-3-compatible.
 
-Everything here is GENERATED or hand-written C — no node/JS toolchain is
-needed at build time. `zig build` compiles these sources into the GUI
-targets only (see `addTreeSitter` in build.zig). They must NEVER enter
-the `sketerm-mux` / `mux-portable` dependency graph.
+`zig build` compiles this runtime and the grammars into the GUI targets
+only (see `addTreeSitter` in build.zig). None of it may ever enter the
+`sketerm-mux` / `mux-portable` dependency graph.
 
 runtime
   github.com/tree-sitter/tree-sitter @ 97e2eeb83cdd6d78d7a614318abf9dead59acace (2026-08-04)
-  MIT (LICENSE) — lib/include/tree_sitter/api.h + lib/src/**
+  MIT (LICENSE) - lib/include/tree_sitter/api.h + lib/src/**
   lib/src/lib.c is the upstream amalgamation (#includes every other .c).
   lib/src/wasm/ was dropped: wasm_store.c compiles to stubs without
   TREE_SITTER_FEATURE_WASM, which we never define.
   lib/src/unicode/ is ICU-derived (lib/src/unicode/LICENSE, permissive).
 
-grammars/zig
-  github.com/tree-sitter-grammars/tree-sitter-zig @ 6479aa13f32f701c383083d8b28360ebd682fb7d (2025-09-10)
-  MIT — src/parser.c (LANGUAGE_VERSION 15), src/tree_sitter/*.h
-grammars/c
-  github.com/tree-sitter/tree-sitter-c @ b780e47fc780ddc8da13afa35a3f4ed5c157823d (2026-04-22)
-  MIT — src/parser.c (LANGUAGE_VERSION 15), src/tree_sitter/*.h
-grammars/json
-  github.com/tree-sitter/tree-sitter-json @ 001c28d7a29832b06b0e831ec77845553c89b56d (2025-09-14)
-  MIT — src/parser.c (LANGUAGE_VERSION 14), src/tree_sitter/*.h
-grammars/markdown, grammars/markdown_inline
-  github.com/tree-sitter-grammars/tree-sitter-markdown @ a0a00f817d02412bd92c54d316f164d827b57b5c (2026-07-19)
-  MIT — src/parser.c + src/scanner.c (LANGUAGE_VERSION 15), src/tree_sitter/*.h
+grammars
+  NOT in this repository. src/editor/grammars.zig pins each upstream
+  grammar repository by commit and by the SHA-256 of its GitHub archive
+  tarball; build.zig (`fetchGrammar`) downloads and unpacks each archive
+  into the Zig build cache the first time a step that compiles it runs,
+  and fails the build on a checksum mismatch. The archives already carry
+  the generated src/parser.c, so no node/JS toolchain is involved. They
+  are all MIT; tree-sitter-lua ships its license as LICENSE.md.
 
-Each grammar keeps ITS OWN src/tree_sitter/ headers rather than sharing
-one copy: those headers pin the language ABI the generated table was
-emitted against (json is v14, the rest v15), and the runtime accepts
-anything in [TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION 13, 15].
+  Adding a grammar is: one `Upstream` member with its pin (compute the
+  checksum with `curl -sSL <archive url> | sha256sum`), one `Grammar`
+  member, its `Query` members, and the language that uses it in
+  src/editor/languages.zig.
 
-queries/*.scm
-  Upstream `queries/highlights.scm` of the same commits, renamed per
-  language and embedded into the binary by build.zig. Capture names are
-  the nvim-flavoured convention; src/editor/syntax.zig maps them onto a
-  small fixed palette of highlight kinds.
+  Each grammar keeps ITS OWN src/tree_sitter/ headers as upstream ships
+  them rather than sharing one copy: those headers pin the language ABI
+  the generated table was emitted against (v14 or v15), and the runtime
+  accepts anything in [TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION 13, 15].
+
+queries
+  Each `Query` in src/editor/grammars.zig is an upstream highlights file
+  of the pinned commit, embedded into the binary by build.zig as
+  `ts_query_<name>`. Which queries a grammar concatenates (C++ on top of
+  C, TypeScript on top of JavaScript, as upstream's tree-sitter.json
+  does) is `Grammar.queries`. Capture names are the nvim-flavoured
+  convention; src/editor/syntax.zig maps them onto a small fixed palette
+  of highlight kinds, and a test fails on any capture a pinned query uses
+  that the palette does not place.
+
+Measured and not added: Ruby (tree-sitter/tree-sitter-ruby @
+ad907a69da0c, 15 MB parser.c, ~3 s to compile, 2 MB of binary; the cost
+table for every grammar is in docs/editor-commands.md). Ruby, like every
+language without a grammar, still gets comment toggling, string-aware
+bracket matching and folding from its row in src/editor/languages.zig.
