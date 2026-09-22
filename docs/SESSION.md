@@ -20796,3 +20796,48 @@ Open and deliberately not acted on: sketerm's wlhost firing frame callbacks for
 surfaces it never presents is what makes the rig unrepresentative. Changing it
 would make the regression real but touches forwarded-app pacing, so it is a
 separate decision. The GTK bug itself is unreported upstream.
+
+## 2026-09-21: cast player: early duration, frame stepping, skip silence
+
+The seek slider used to stay disabled until playback reached the end of the
+file, because the daemon only learned `duration_ms` at EOF. Each cast session
+now runs a background duration scan: a second reader over the same file,
+advanced 1 MB per tick in the session's own loop, which announces the duration
+in a `play_state` push. A scan tick costs exactly what a seek-replay tick
+costs (`SCAN_BATCH` is `SEEK_BATCH`); in broker mode that loop is the
+session's own worker, in monolith mode it is shared with every session. It
+uses the same `cast_play.Player`, so `idle_time_limit` clamping matches
+playback exactly. Playback or a seek reaching EOF stays authoritative and
+drops the scan. Playback, seek replay, the scan and the spawn-time header
+probe all read through one `Reader` (file + parser, `fill`/`pull`) instead of
+three copies of the read loop.
+
+Frame stepping: a frame is one screen-changing event (`o` or `r`;
+`Event.changesScreen` is the one home for that), asciinema's own unit.
+`step_forward` applies events regardless of their time until one more frame
+has landed and stops before whatever follows it; `step_back` is a seek replay
+to (not past) the previous frame, since terminal state cannot be undone.
+Seeks target either a time or a frame (`SeekTarget`), repeated presses
+accumulate onto a step or frame seek still in flight, and steps pressed during
+a TIME seek are queued (`SeekState.then_step`) and applied from where it lands
+instead of being dropped. Frames sharing one timestamp are stepped
+individually. `play_state.frame` reports the current frame, so the bar greys
+out step back at frame 0 and step forward once finished. Keys: `,`/`.` in the
+play window (mpv's frame-step keys; asciinema-player uses `.`), which leaves
+`[`/`]` free for asciinema's marker navigation. The Viewer's `,`/`.` already
+seek 5 s for casts and videos because its arrows page the batch, so there
+frame stepping is on the bar's buttons only.
+
+Skip silence (`S` in both hosts, or the bar toggle, default off): any pause
+longer than 500 ms is cut to 500 ms by moving the playback clock forward. The
+recording's timeline and duration are untouched, so the slider just jumps.
+The state rides `play_state.skip_silence`, so every viewer's toggle agrees.
+
+The `play_control` ops and the field each carries are `wire.PlayCommand`
+(`encode`/`decode`, round-trip tested over every member) and the `play_state`
+schema is `wire.PlayState` with `wire.PlayKind`; the daemon, `Terminal` and
+smoke-e2e all use those types, so the op and state names no longer live as
+string literals on each side. smoke-e2e's cast stage covers the early
+duration, `.` to the last frame and `,` back (with frame numbers), and skip
+silence finishing a 29 s pause in seconds with the duration unchanged;
+`SKETERM_SMOKE_E2E_CAST_ONLY=1` runs it and the viewer cast stage alone.
