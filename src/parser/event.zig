@@ -161,7 +161,102 @@ pub const Event = union(enum) {
             else => {},
         }
     }
+
+    /// One-line description for `--debug-events`: payloads are
+    /// escaped and cut at `payload_preview` bytes.
+    pub fn format(self: Event, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .print => |cp| try w.print("print U+{X:0>4}", .{cp}),
+            .print_byte => |b| try w.print("print_byte 0x{x:0>2}", .{b}),
+            .print_run => |r| {
+                try w.writeAll("print_run ");
+                try writeQuoted(w, r.bytes[0..r.len]);
+            },
+            .execute => |b| try w.print("execute 0x{x:0>2}", .{b}),
+            .csi => |p| {
+                try w.writeAll("csi ESC[");
+                if (p.private != 0) try w.writeByte(p.private);
+                for (p.params[0..p.n_params], 0..) |v, i| {
+                    if (i > 0) try w.writeByte(if (p.isSub(i)) ':' else ';');
+                    try w.print("{d}", .{v});
+                }
+                try w.writeAll(p.intermediates[0..p.n_intermediates]);
+                try w.writeByte(p.final);
+            },
+            .esc_final => |e| {
+                try w.writeAll("esc ESC");
+                try w.writeAll(e.intermediates[0..e.n_intermediates]);
+                try w.writeByte(e.final);
+            },
+            .osc => |o| {
+                try w.writeAll("osc ");
+                try writeQuoted(w, o.bytes);
+            },
+            .apc => |o| {
+                try w.print("apc {d}B ", .{o.bytes.len});
+                try writeQuoted(w, o.bytes);
+            },
+            .dcs => |d| {
+                try w.writeAll("dcs ");
+                for (d.proto.params[0..d.proto.n_params], 0..) |v, i| {
+                    if (i > 0) try w.writeByte(';');
+                    try w.print("{d}", .{v});
+                }
+                try w.writeAll(d.proto.intermediates[0..d.proto.n_intermediates]);
+                try w.writeByte(d.proto.final);
+                try w.print(" {d}B ", .{d.body.len});
+                try writeQuoted(w, d.body);
+            },
+            .child_eof => |status| try w.print("child_eof {d}", .{status}),
+            .parse_error => |pe| try w.print("parse_error {s}", .{@tagName(pe.kind)}),
+        }
+    }
+
+    /// Longest payload excerpt `format` prints.
+    pub const payload_preview = 96;
+
+    fn writeQuoted(w: *std.Io.Writer, bytes: []const u8) std.Io.Writer.Error!void {
+        const shown = bytes[0..@min(bytes.len, payload_preview)];
+        try w.writeByte('"');
+        for (shown) |b| switch (b) {
+            '"', '\\' => try w.print("\\{c}", .{b}),
+            0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try w.writeByte(b),
+            else => try w.print("\\x{x:0>2}", .{b}),
+        };
+        try w.writeByte('"');
+        if (bytes.len > shown.len) try w.writeAll("...");
+    }
 };
+
+test "format describes each event on one escaped line" {
+    var buf: [256]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    var csi = Event.Csi{ .private = '?', .final = 'h', .n_params = 2 };
+    csi.params[0] = 1049;
+    csi.params[1] = 7;
+    try w.print("{f}", .{Event{ .csi = csi }});
+    try std.testing.expectEqualStrings("csi ESC[?1049;7h", w.buffered());
+
+    w = std.Io.Writer.fixed(&buf);
+    var sgr = Event.Csi{ .final = 'm', .n_params = 2 };
+    sgr.params[0] = 4;
+    sgr.params[1] = 3;
+    sgr.setSub(1, true);
+    try w.print("{f}", .{Event{ .csi = sgr }});
+    try std.testing.expectEqualStrings("csi ESC[4:3m", w.buffered());
+
+    w = std.Io.Writer.fixed(&buf);
+    var run = Event.PrintRun{ .len = 4 };
+    @memcpy(run.bytes[0..4], "a\"\\\x01");
+    try w.print("{f}", .{Event{ .print_run = run }});
+    try std.testing.expectEqualStrings("print_run \"a\\\"\\\\\\x01\"", w.buffered());
+
+    w = std.Io.Writer.fixed(&buf);
+    var long: [200]u8 = @splat('x');
+    try w.print("{f}", .{Event{ .osc = .{ .bytes = &long } }});
+    try std.testing.expect(std.mem.endsWith(u8, w.buffered(), "\"..."));
+    try std.testing.expectEqual(@as(usize, "osc \"".len + Event.payload_preview + "\"...".len), w.buffered().len);
+}
 
 test "csi paramOrDefault uses default on zero" {
     var csi = Event.Csi{};

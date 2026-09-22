@@ -294,7 +294,8 @@ const HELP_TEXT =
     \\                        `sketerm --toggle`. KWin: System Settings →
     \\                        Shortcuts → Custom Shortcuts. Wayland note:
     \\                        focus-stealing prevention may delay raise.
-    \\  --debug-events        Print parser events to stderr
+    \\  --debug-events        Print each applied daemon event and snapshot
+    \\                        swap to stderr
     \\  --debug-images        Print image upload + draw diagnostics to stderr
     \\  --help                Show this message
     \\  --version             Show version

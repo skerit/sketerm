@@ -220,7 +220,8 @@ pub const Terminal = struct {
     program_buf: [32]u8 = undefined,
     program_len: u8 = 0,
 
-    /// If true, drain prints events to stderr. M1 debug aid.
+    /// Print every applied daemon event and every snapshot swap to
+    /// stderr (`--debug-events`).
     debug_to_stderr: bool = false,
 
     /// Non-null = this Terminal renders a sketerm-mux session
@@ -1685,6 +1686,12 @@ pub const Terminal = struct {
         fresh.color_scheme_dark = self.screen.color_scheme_dark;
         restored.commitReplacing(&self.screen);
         self.wireScreenSink();
+        if (self.debug_to_stderr) std.debug.print("sketerm: [{s}] snapshot {d}x{d} seq={d}\n", .{
+            if (self.remote) |r| r.session else "",
+            self.screen.cols,
+            self.screen.rows,
+            envelope.seq,
+        });
         if (self.remote) |remote| remote.event_seq = envelope.seq;
         self.hash_valid = false;
         self.activity_seq +%= 1;
@@ -1697,6 +1704,10 @@ pub const Terminal = struct {
     }
 
     fn applyRemoteEvent(self: *Terminal, ev: Event) void {
+        if (self.debug_to_stderr) std.debug.print("sketerm: [{s}] {f}\n", .{
+            if (self.remote) |r| r.session else "",
+            ev,
+        });
         self.screen.apply(ev);
     }
 

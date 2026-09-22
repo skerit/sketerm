@@ -458,7 +458,7 @@ They are still accepted and ignored, so old files do not warn; use
 | Key | Type | Default | Values |
 | --- | --- | --- | --- |
 | `tab_position` | enum | `top` | `top`, `bottom` |
-| `close_button_on_tab` | bool | `true` | |
+| `close_button_on_tab` | bool | `true` | Show a close button on each unpinned tab (pinned tabs never have one). Middle-click and the menus close tabs either way. Applies live. |
 | `show_tab_bar` | bool | `true` | Start with the AdwTabBar hidden by setting false; the `toggle_tab_bar` action flips it at runtime. |
 | `show_tab_sidebar` | bool | `false` | Whether a new window opens with the vertical tree-style tab sidebar shown. Visibility is then PER WINDOW: the `toggle_tab_sidebar` action (key, Tab menu, hamburger, palette) flips only the window it was invoked in and does not write this setting back, so a config reload never pushes one window's choice into the others. Flipping the switch in a window's Preferences hands that window back to the setting. `tab_collapse` / `tab_expand` fold a tab's children, and a row drags like a real tab: onto another row to nest under it, between rows to reorder, onto another window's sidebar or tab strip to move it there, and onto nothing to open it in a new window. While it is shown it is also the tab surface for BROWSERS: it lists the pages open inside the focused browser rather than mirroring the window's tabs, and "new tab" opens a page there. Hide it and a browser goes back to its own in-pane tab strip, with new tabs becoming window tabs again. |
 | `tab_sidebar_width` | int | `240` | Width of that sidebar in logical px, 120..800. Dragging its divider writes this back. |

@@ -1029,6 +1029,7 @@ pub fn applyConfigChangeOpts(self: *Window, new_cfg: *const Config, opts: ApplyO
     if (self.config.tab_position != old_tab_pos) {
         self.setTabPosition(self.config.tab_position);
     }
+    self.tabbar.refreshCloseButtons();
 
     // Window-level flags.
     self.search_force_cs = self.config.search_case_sensitive;

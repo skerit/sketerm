@@ -19,6 +19,20 @@ const cssutil = @import("cssutil.zig");
 
 const TAB_W: c_int = 170;
 
+/// Whether a tab shows its close button: never on a pinned tab (the
+/// pinned section is for tabs that should not close by accident), else
+/// as `close_button_on_tab` says. Middle-click and the menus still close.
+pub fn closeButtonShown(close_button_on_tab: bool, pinned: bool) bool {
+    return close_button_on_tab and !pinned;
+}
+
+test "close buttons follow close_button_on_tab and never show on pinned tabs" {
+    try std.testing.expect(closeButtonShown(true, false));
+    try std.testing.expect(!closeButtonShown(true, true));
+    try std.testing.expect(!closeButtonShown(false, false));
+    try std.testing.expect(!closeButtonShown(false, true));
+}
+
 /// Fallback config so `TabBar.config` is always valid before the owning
 /// Window points it at the real one (and in tests).
 var default_config: Config = .{};
@@ -697,6 +711,17 @@ pub const TabBar = struct {
         }
     }
 
+    /// Re-apply `close_button_on_tab` to every tab after a config
+    /// change; hiding keeps each button's height in the measure.
+    pub fn refreshCloseButtons(self: *TabBar) void {
+        if (self.callbacks_severed) return;
+        for (self.tabs.items) |t| {
+            const close = t.close_btn orelse continue;
+            const pinned = c.adw_tab_page_get_pinned(t.page) != 0;
+            c.gtk_widget_set_visible(close, @intFromBool(closeButtonShown(self.config.close_button_on_tab, pinned)));
+        }
+    }
+
     /// Apply the tree-collapse hidden state to the strip: a hidden
     /// tab's widget (and its leading separator) goes invisible. Cheap
     /// enough to run after any collapse/expand without a rebuild.
@@ -750,13 +775,13 @@ pub const TabBar = struct {
 
         // Close — flat button, revealed on hover (CSS). Always created so
         // it sets the tab height (AdwTab measures it unconditionally);
-        // hidden on pinned tabs.
+        // hidden per `closeButtonShown`.
         const close = c.gtk_button_new_from_icon_name("window-close-symbolic");
         c.gtk_button_set_has_frame(@ptrCast(close), 0);
         c.gtk_widget_add_css_class(close, "flat");
         c.gtk_widget_add_css_class(close, "tab-close-button");
         c.gtk_widget_set_valign(close, c.GTK_ALIGN_CENTER);
-        c.gtk_widget_set_visible(close, @intFromBool(!pinned));
+        c.gtk_widget_set_visible(close, @intFromBool(closeButtonShown(self.config.close_button_on_tab, pinned)));
         c.gtk_widget_set_parent(close, tab_box);
 
         t.* = .{
