@@ -60,6 +60,15 @@ pub const Event = union(enum) {
     /// User input. The data is discarded, the event is kept so callers
     /// can count or step over it.
     input,
+
+    /// Whether applying the event can change what the terminal shows;
+    /// each one is a playback frame, the unit frame stepping moves by.
+    pub fn changesScreen(self: Event) bool {
+        return switch (self) {
+            .output, .resize => true,
+            .marker, .exit, .input => false,
+        };
+    }
 };
 
 pub const TimedEvent = struct {

@@ -4,7 +4,10 @@
 //! (`castbox.zig`), which owns the Terminal, the fixed_grid
 //! TerminalSurface, the transport bar and the ephemeral-session
 //! lifecycle. This file adds only the window, its title, and the
-//! standalone key bindings (Space, Left/Right seek, R, Q/Escape).
+//! standalone key bindings (Space, Left/Right seek, `,`/`.` frame step,
+//! R, Q/Escape) on top of the box's shared ones. The seek and step keys
+//! follow mpv's layout, which this window can use because it has no
+//! batch to page through with the arrows.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
@@ -45,6 +48,8 @@ pub const CastView = struct {
         });
         self.box = box;
         c.gtk_widget_set_tooltip_text(box.playbar.scale, "Seek (Left/Right: 5s, Shift: 30s)");
+        if (box.playbar.step_back_button) |b| c.gtk_widget_set_tooltip_text(b, "Step back one frame (,)");
+        if (box.playbar.step_forward_button) |b| c.gtk_widget_set_tooltip_text(b, "Step forward one frame (.)");
 
         const toolbar = c.adw_toolbar_view_new().?;
         const header = c.adw_header_bar_new().?;
@@ -103,12 +108,15 @@ pub const CastView = struct {
     ) callconv(.c) c.gboolean {
         const self = cast.userData(CastView, user);
         if (!contentKeysApply(state)) return 0;
+        if (self.box.handleSharedKey(keyval)) return 1;
         const shift = (state & c.GDK_SHIFT_MASK) != 0;
         const step: i64 = if (shift) 30_000 else 5_000;
         switch (keyval) {
             c.GDK_KEY_space => self.box.togglePlay(),
             c.GDK_KEY_Left => self.box.seekRelative(-step),
             c.GDK_KEY_Right => self.box.seekRelative(step),
+            c.GDK_KEY_comma => self.box.stepFrame(false),
+            c.GDK_KEY_period => self.box.stepFrame(true),
             c.GDK_KEY_r, c.GDK_KEY_R => self.box.restart(),
             c.GDK_KEY_q, c.GDK_KEY_Escape => c.gtk_window_close(@ptrCast(self.window)),
             else => return 0,

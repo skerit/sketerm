@@ -257,7 +257,8 @@ const HELP_TEXT =
     \\                         host:/path plays a recording that lives
     \\                         on a remote host's daemon. Keyboard:
     \\                         Space pause, Left/Right seek 5s (Shift:
-    \\                         30s), R restart, Q close.
+    \\                         30s), ,/. step one frame back/forward,
+    \\                         S skip silence, R restart, Q close.
     \\  sketerm view [images...] Image viewer as its OWN application
     \\                         ("Sketerm Viewer", own icon and taskbar
     \\                         entry). Local, file:// and host:/path

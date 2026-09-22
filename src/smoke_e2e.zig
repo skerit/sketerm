@@ -816,6 +816,16 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_CAST_ONLY") != null) {
+        const app = drive orelse return fail("focused cast smoke has no display driver");
+        if (!have_wl) return fail("focused cast smoke is GTK/Wayland-only");
+        if (castPlaybackStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
+        say("cast playback: focused play-window stage passed");
+        if (viewerCastStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
+        say("viewer cast: focused viewer batch stage passed");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_VIEWER_ONLY") != null) {
         const app = drive orelse return fail("focused viewer smoke has no display driver");
         if (!have_wl) return fail("focused viewer smoke is GTK/Wayland-only");
@@ -1436,7 +1446,7 @@ pub fn main() u8 {
     if (drive) |app| {
         if (have_wl) {
             if (castPlaybackStage(allocator, app, rt, mux_sock, &wl_z)) |why| return failMsg(why);
-            say("cast playback: rendered, paused, seeked to EOF, restarted and closed (session died with the window)");
+            say("cast playback: rendered, duration known before EOF, paused, stepped a frame both ways, seeked to EOF, restarted, skipped silence and closed (session died with the window)");
 
             // 6c-9. The same recording INSIDE the Sketerm Viewer, in
             // a mixed image+cast batch, navigated both directions.
@@ -5904,20 +5914,13 @@ fn viewerMenuStage(allocator: std.mem.Allocator, app: *appdrive.App, rt: []const
     return null;
 }
 
-/// One play_state frame's JSON, as the daemon ships it.
-const CastMsg = struct {
-    state: []const u8 = "",
-    position_ms: u64 = 0,
-    duration_ms: ?u64 = null,
-    speed: f64 = 1,
-    markers: []const struct { u64, []const u8 } = &.{},
-};
-
 /// Scalars of the LAST play_state castWaitState saw (marker labels are
 /// frame-scoped, so only the first marker's time is kept).
 const CastObserved = struct {
     position_ms: u64 = 0,
     duration_ms: ?u64 = null,
+    skip_silence: bool = false,
+    frame: u64 = 0,
     n_markers: usize = 0,
     first_marker_ms: u64 = 0,
 };
@@ -5928,7 +5931,7 @@ const CastObserved = struct {
 fn castWaitState(
     allocator: std.mem.Allocator,
     conn: *@import("mux/client.zig").Conn,
-    want: []const u8,
+    want: muxwire.PlayKind,
     timeout_ms: i64,
     out: *CastObserved,
 ) bool {
@@ -5940,7 +5943,7 @@ fn castWaitState(
         };
         defer f.deinit(conn.allocator);
         if (f.ftype != .play_state) continue;
-        const parsed = std.json.parseFromSlice(CastMsg, allocator, f.payload, .{
+        const parsed = std.json.parseFromSlice(muxwire.PlayState, allocator, f.payload, .{
             .ignore_unknown_fields = true,
         }) catch continue;
         defer parsed.deinit();
@@ -5948,10 +5951,12 @@ fn castWaitState(
         out.* = .{
             .position_ms = m.position_ms,
             .duration_ms = m.duration_ms,
+            .skip_silence = m.skip_silence,
+            .frame = m.frame,
             .n_markers = m.markers.len,
             .first_marker_ms = if (m.markers.len > 0) m.markers[0][0] else 0,
         };
-        if (std.mem.eql(u8, m.state, want)) return true;
+        if (m.state == want) return true;
     }
     return false;
 }
@@ -6100,7 +6105,7 @@ fn castPlaybackStage(
         snap.deinit(allocator);
     }
     var st: CastObserved = .{};
-    if (!castWaitState(allocator, &side, "playing", 10_000, &st))
+    if (!castWaitState(allocator, &side, .playing, 10_000, &st))
         return "the cast never reported state playing (auto-play on first attach)";
 
     // Playback rendered through fixed_grid: the green block only
@@ -6112,20 +6117,45 @@ fn castPlaybackStage(
 
     // Space pauses (keyboard -> play_control -> daemon).
     app.pressKey(cast_win, "space") catch return "injecting space failed";
-    if (!castWaitState(allocator, &side, "paused", 8_000, &st))
+    if (!castWaitState(allocator, &side, .paused, 8_000, &st))
         return "space did not pause the cast";
     if (st.position_ms >= 30_000)
         return "playback passed the 30s guard event before the pause (host too slow for this stage's timing)";
+    // The background scan knew the length long before playback could
+    // reach the 30s event, so the slider is usable from the start.
+    if (st.duration_ms != 30_000) return "the duration was not known before playback reached EOF";
+
+    // Paused after red, the resize and green: frame 3.
+    if (st.frame != 3) return "the pause did not report frame 3";
+
+    // . steps forward one frame: the blue block, which is also the last
+    // frame, so playback reports finished at its time.
+    app.pressKey(cast_win, ".") catch return "injecting . failed";
+    if (!castWaitState(allocator, &side, .finished, 8_000, &st))
+        return ". did not step to the last frame";
+    if (st.position_ms != 30_000 or st.frame != 4) return ". landed on the wrong frame";
+    if (!castWaitRgb(allocator, app, cast_win, .{ 0, 0, 255 }, 40, true, 10_000))
+        return "the blue block never rendered after .";
+
+    // , steps back one frame: right after the green block, paused.
+    app.pressKey(cast_win, ",") catch return "injecting , failed";
+    if (!castWaitState(allocator, &side, .paused, 8_000, &st))
+        return ", did not step back";
+    if (st.position_ms != 900 or st.frame != 3) return ", landed on the wrong frame";
+    if (!castWaitRgb(allocator, app, cast_win, .{ 0, 0, 255 }, 40, false, 10_000))
+        return ", did not remove the blue block";
+    if (castCountRgb(allocator, app, cast_win, .{ 0, 255, 0 }) < 40)
+        return ", lost the green block";
 
     // Space resumes.
     app.pressKey(cast_win, "space") catch return "injecting space failed";
-    if (!castWaitState(allocator, &side, "playing", 8_000, &st))
+    if (!castWaitState(allocator, &side, .playing, 8_000, &st))
         return "space did not resume the cast";
 
     // Shift+Right seeks +30s -> past EOF -> finished, with the final
     // frame (blue block) materialized by the seek replay.
     app.pressKey(cast_win, "shift+right") catch return "injecting shift+right failed";
-    if (!castWaitState(allocator, &side, "finished", 15_000, &st))
+    if (!castWaitState(allocator, &side, .finished, 15_000, &st))
         return "the +30s seek never reported finished";
     if (st.duration_ms != 30_000) return "finished state carries the wrong duration";
     if (st.position_ms != 30_000) return "finished state carries the wrong position";
@@ -6147,10 +6177,29 @@ fn castPlaybackStage(
 
     // R restarts: back to the top (blue gone), playing again.
     app.pressKey(cast_win, "r") catch return "injecting r failed";
-    if (!castWaitState(allocator, &side, "playing", 10_000, &st))
+    if (!castWaitState(allocator, &side, .playing, 10_000, &st))
         return "restart never reported playing";
     if (!castWaitRgb(allocator, app, cast_win, .{ 0, 0, 255 }, 40, false, 10_000))
         return "restart did not reset the screen (blue block still visible)";
+
+    // S turns skip silence on: the ~29s pause before the blue block is
+    // cut short, while the duration stays the recording's own.
+    app.pressKey(cast_win, "s") catch return "injecting s failed";
+    {
+        const deadline = clock.nowMs() + 5_000;
+        while (!st.skip_silence and clock.nowMs() < deadline) {
+            _ = castWaitState(allocator, &side, .playing, 1_000, &st);
+        }
+        if (!st.skip_silence) return "s did not turn skip silence on";
+    }
+    const skip_from = clock.nowMs();
+    if (!castWaitState(allocator, &side, .finished, 10_000, &st))
+        return "skip silence did not cut the 29s pause short";
+    if (clock.nowMs() - skip_from > 8_000) return "skip silence took as long as the pause";
+    if (st.duration_ms != 30_000 or st.position_ms != 30_000)
+        return "skip silence changed the recording's duration";
+    if (!castWaitRgb(allocator, app, cast_win, .{ 0, 0, 255 }, 40, true, 10_000))
+        return "the blue block never rendered with skip silence on";
 
     // Q closes the window; the ephemeral session must die with it.
     app.pressKey(cast_win, "q") catch return "injecting q failed";
@@ -6593,14 +6642,14 @@ fn viewerCastStage(
         snap.deinit(allocator);
         var st: CastObserved = .{};
         app.pressKey(vwin, "space") catch return "injecting space failed";
-        if (!castWaitState(allocator, &side, "paused", 8_000, &st))
+        if (!castWaitState(allocator, &side, .paused, 8_000, &st))
             return viewerWhy("space did not pause the cast inside the viewer");
         // Resume so the teardown below kills a RUNNING playback. This
         // second press deliberately lands the instant the daemon
         // reports "paused" — before the GUI has necessarily read that
         // push — so it also covers the toggle's stale-state race.
         app.pressKey(vwin, "space") catch return "injecting space failed";
-        if (!castWaitState(allocator, &side, "playing", 8_000, &st))
+        if (!castWaitState(allocator, &side, .playing, 8_000, &st))
             return viewerWhy("space did not resume the cast inside the viewer");
     }
 

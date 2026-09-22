@@ -1,9 +1,9 @@
 //! Reusable media transport bar: play/pause, seekable position scale,
-//! position/duration label, optional restart button, speed dropdown and
-//! scale markers.
+//! position/duration label, optional restart button, step back/forward
+//! buttons, skip-silence toggle, speed dropdown and scale markers.
 //!
 //! The bar is presentation-only. It talks to its media through a small
-//! `Source` vtable (toggle / restart / seek / speed); the media pushes
+//! `Source` vtable (toggle / restart / seek / speed / ...); the media pushes
 //! its state back via `setState` (and `setMarkers` when its marker set
 //! changes). The seek throttle + guard machinery lives HERE because it
 //! is chrome policy, but the numbers are construction options: cast
@@ -34,6 +34,11 @@ pub const Playbar = struct {
         kind: Kind,
         position_ms: u64 = 0,
         duration_ms: ?u64 = null,
+        /// Null = the media does not report it; the toggle is left alone.
+        skip_silence: ?bool = null,
+        /// Whether a step in that direction can move anywhere.
+        can_step_back: bool = true,
+        can_step_forward: bool = true,
     };
 
     /// Transport commands, all optional: an omitted `restart`/`set_speed`
@@ -44,11 +49,16 @@ pub const Playbar = struct {
         restart: ?*const fn (?*anyopaque) void = null,
         seek_to_ms: ?*const fn (?*anyopaque, u64) void = null,
         set_speed: ?*const fn (?*anyopaque, f64) void = null,
+        /// `forward` false = one step back.
+        step: ?*const fn (?*anyopaque, bool) void = null,
+        set_skip_silence: ?*const fn (?*anyopaque, bool) void = null,
     };
 
     pub const Options = struct {
         restart_button: bool = true,
         speed_dropdown: bool = false,
+        step_buttons: bool = false,
+        skip_silence_toggle: bool = false,
         /// Minimum gap between seek sends while the slider is dragged;
         /// 0 sends every change immediately.
         seek_throttle_ms: c_uint = 0,
@@ -67,6 +77,14 @@ pub const Playbar = struct {
     scale: *c.GtkWidget,
     position_label: *c.GtkLabel,
     speed_drop: ?*c.GtkWidget,
+    /// Present with `Options.step_buttons`; a host that binds step keys
+    /// names them in these tooltips.
+    step_back_button: ?*c.GtkWidget,
+    step_forward_button: ?*c.GtkWidget,
+    skip_toggle: ?*c.GtkWidget,
+    /// Set while setState mirrors the media's skip-silence state into the
+    /// toggle, so that programmatic flip is not sent back as a command.
+    syncing_skip: bool = false,
 
     /// Latest known duration (0 = unknown, seek disabled).
     duration_ms: u64 = 0,
@@ -101,6 +119,20 @@ pub const Playbar = struct {
             c.gtk_box_append(@ptrCast(bar), restart_button);
             _ = c.g_signal_connect_data(restart_button, "clicked", @ptrCast(&onRestartClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         }
+        var step_back_button: ?*c.GtkWidget = null;
+        var step_forward_button: ?*c.GtkWidget = null;
+        if (options.step_buttons) {
+            const back = c.gtk_button_new_from_icon_name("go-previous-symbolic").?;
+            c.gtk_widget_set_tooltip_text(back, "Step back one frame");
+            c.gtk_box_append(@ptrCast(bar), back);
+            _ = c.g_signal_connect_data(back, "clicked", @ptrCast(&onStepBackClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+            const forward = c.gtk_button_new_from_icon_name("go-next-symbolic").?;
+            c.gtk_widget_set_tooltip_text(forward, "Step forward one frame");
+            c.gtk_box_append(@ptrCast(bar), forward);
+            _ = c.g_signal_connect_data(forward, "clicked", @ptrCast(&onStepForwardClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+            step_back_button = back;
+            step_forward_button = forward;
+        }
         const position_label = c.gtk_label_new("0:00 / --:--").?;
         c.gtk_widget_add_css_class(position_label, "numeric");
         const scale = c.gtk_scale_new_with_range(c.GTK_ORIENTATION_HORIZONTAL, 0, 1, 100).?;
@@ -110,6 +142,14 @@ pub const Playbar = struct {
         c.gtk_widget_set_tooltip_text(scale, "Seek");
         c.gtk_box_append(@ptrCast(bar), scale);
         c.gtk_box_append(@ptrCast(bar), @ptrCast(@alignCast(position_label)));
+        var skip_toggle: ?*c.GtkWidget = null;
+        if (options.skip_silence_toggle) {
+            const toggle = c.gtk_toggle_button_new_with_label("Skip silence").?;
+            c.gtk_widget_set_tooltip_text(toggle, "Cut long pauses short (S)");
+            c.gtk_box_append(@ptrCast(bar), toggle);
+            _ = c.g_signal_connect_data(toggle, "toggled", @ptrCast(&onSkipToggled), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
+            skip_toggle = toggle;
+        }
         var speed_drop: ?*c.GtkWidget = null;
         if (options.speed_dropdown) {
             const drop = c.gtk_drop_down_new_from_strings(@ptrCast(@constCast(&SPEED_LABELS))).?;
@@ -129,6 +169,9 @@ pub const Playbar = struct {
             .scale = scale,
             .position_label = @ptrCast(@alignCast(position_label)),
             .speed_drop = speed_drop,
+            .step_back_button = step_back_button,
+            .step_forward_button = step_forward_button,
+            .skip_toggle = skip_toggle,
         };
         _ = c.g_signal_connect_data(play_button, "clicked", @ptrCast(&onPlayClicked), @ptrCast(self), null, c.G_CONNECT_DEFAULT);
         // change-value fires on USER interaction only (set_value does
@@ -196,6 +239,23 @@ pub const Playbar = struct {
         var buf: [64:0]u8 = undefined;
         const text = formatPosition(&buf, st.kind, st.position_ms, self.duration_ms);
         c.gtk_label_set_text(self.position_label, text.ptr);
+
+        if (self.step_back_button) |b| c.gtk_widget_set_sensitive(b, @intFromBool(st.can_step_back));
+        if (self.step_forward_button) |b| c.gtk_widget_set_sensitive(b, @intFromBool(st.can_step_forward));
+
+        if (st.skip_silence) |on| if (self.skip_toggle) |t| {
+            if ((c.gtk_toggle_button_get_active(@ptrCast(t)) != 0) != on) {
+                self.syncing_skip = true;
+                c.gtk_toggle_button_set_active(@ptrCast(t), @intFromBool(on));
+                self.syncing_skip = false;
+            }
+        };
+    }
+
+    /// Flip the skip-silence toggle as if clicked (keyboard binding).
+    pub fn toggleSkipSilence(self: *Playbar) void {
+        const t = self.skip_toggle orelse return;
+        c.gtk_toggle_button_set_active(@ptrCast(t), @intFromBool(c.gtk_toggle_button_get_active(@ptrCast(t)) == 0));
     }
 
     /// Number of markers currently held (the caller's cheap "did the
@@ -247,6 +307,23 @@ pub const Playbar = struct {
     fn onRestartClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
         const self = cast.userData(Playbar, user);
         if (self.source.restart) |f| f(self.source.ctx);
+    }
+
+    fn onStepBackClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(Playbar, user);
+        if (self.source.step) |f| f(self.source.ctx, false);
+    }
+
+    fn onStepForwardClicked(_: *c.GtkButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(Playbar, user);
+        if (self.source.step) |f| f(self.source.ctx, true);
+    }
+
+    fn onSkipToggled(button: *c.GtkToggleButton, user: ?*anyopaque) callconv(.c) void {
+        const self = cast.userData(Playbar, user);
+        if (self.syncing_skip) return;
+        const f = self.source.set_skip_silence orelse return;
+        f(self.source.ctx, c.gtk_toggle_button_get_active(button) != 0);
     }
 
     fn onSpeedChanged(_: *c.GObject, _: ?*c.GParamSpec, user: ?*anyopaque) callconv(.c) void {

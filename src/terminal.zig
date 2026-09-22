@@ -273,21 +273,11 @@ pub const Terminal = struct {
         message: []const u8 = "",
     };
 
-    /// One step of a cast-playback session's transport state (a
-    /// `play_state` frame). `duration_ms` stays null until the daemon
-    /// has seen the recording's EOF once.
-    pub const PlayState = struct {
-        pub const Kind = enum { playing, paused, seeking, finished };
-        pub const Marker = struct { ms: u64, label: []const u8 };
-        kind: Kind,
-        position_ms: u64 = 0,
-        duration_ms: ?u64 = null,
-        speed: f64 = 1.0,
-        /// Valid only inside the `on_play_state` callback.
-        markers: []const Marker = &.{},
-    };
-
-    pub const PlayOp = enum { play, pause, restart, seek, speed };
+    /// A cast-playback session's transport state, the `play_state`
+    /// frame as parsed.
+    pub const PlayState = mux_wire.PlayState;
+    /// One `play_control` request.
+    pub const PlayCommand = mux_wire.PlayCommand;
 
     /// Remote (mux) attachment state.
     pub const Remote = struct {
@@ -2457,68 +2447,32 @@ pub const Terminal = struct {
         }
     }
 
-    /// JSON shape of a daemon play_state frame. Marker tuples arrive as
-    /// [[ms,"label"],...].
-    const PlayStateMsg = struct {
-        state: []const u8 = "",
-        position_ms: u64 = 0,
-        duration_ms: ?u64 = null,
-        speed: f64 = 1.0,
-        markers: []const struct { u64, []const u8 } = &.{},
-    };
-
-    fn playKindFromName(name: []const u8) ?PlayState.Kind {
-        inline for (@typeInfo(PlayState.Kind).@"enum".fields) |f| {
-            if (std.mem.eql(u8, name, f.name)) return @enumFromInt(f.value);
-        }
-        return null;
-    }
-
     fn handlePlayState(self: *Terminal, payload: []const u8) void {
-        const parsed = std.json.parseFromSlice(PlayStateMsg, self.allocator, payload, .{
+        // An unknown state name (a future daemon) fails the parse and
+        // drops the frame rather than mislabel it; the next known state
+        // resyncs everything.
+        const parsed = std.json.parseFromSlice(PlayState, self.allocator, payload, .{
             .ignore_unknown_fields = true,
         }) catch return;
         defer parsed.deinit();
-        const m = parsed.value;
-        // Unknown state names (a future daemon) drop the frame rather
-        // than mislabel it — the next known state resyncs everything.
-        const kind = playKindFromName(m.state) orelse return;
-        var st: PlayState = .{
-            .kind = kind,
-            .position_ms = m.position_ms,
-            .duration_ms = m.duration_ms,
-            .speed = m.speed,
-        };
         // Stored copy carries no markers (their strings live in the
         // parsed arena, freed on return).
-        self.last_play_state = st;
+        var stored = parsed.value;
+        stored.markers = &.{};
+        self.last_play_state = stored;
         const f = self.on_play_state orelse return;
-        var markers = self.allocator.alloc(PlayState.Marker, m.markers.len) catch return;
-        defer self.allocator.free(markers);
-        for (m.markers, 0..) |t, i| markers[i] = .{ .ms = t[0], .label = t[1] };
-        st.markers = markers;
-        f(self.user_ctx, st);
-    }
-
-    /// Render a play_control payload into `buf`. Only `.seek` reads
-    /// `ms` and only `.speed` reads `speed`.
-    fn playControlPayload(buf: []u8, op: PlayOp, ms: u64, speed: f64) ?[]const u8 {
-        return switch (op) {
-            .seek => std.fmt.bufPrint(buf, "{{\"op\":\"seek\",\"ms\":{d}}}", .{ms}) catch null,
-            .speed => std.fmt.bufPrint(buf, "{{\"op\":\"speed\",\"speed\":{d}}}", .{speed}) catch null,
-            else => std.fmt.bufPrint(buf, "{{\"op\":\"{s}\"}}", .{@tagName(op)}) catch null,
-        };
+        f(self.user_ctx, parsed.value);
     }
 
     /// Send a play_control frame to the attached cast session. No-op on
     /// daemons that don't advertise cast_playback (they would log an
     /// unknown frame) and on non-remote/closed terminals.
-    pub fn sendPlayControl(self: *Terminal, op: PlayOp, ms: u64, speed: f64) void {
+    pub fn sendPlayControl(self: *Terminal, cmd: PlayCommand) void {
         const remote = self.remote orelse return;
         if (!remote.canSend()) return;
         if (!remote.conn.cast_playback) return;
         var buf: [96]u8 = undefined;
-        const payload = playControlPayload(&buf, op, ms, speed) orelse return;
+        const payload = cmd.encode(&buf) orelse return;
         remote.conn.sendFrame(.play_control, payload) catch {
             self.transportLost("play control write failed");
         };
@@ -3543,8 +3497,8 @@ test "play_state parses state, null duration and marker tuples" {
         fn on(_: ?*anyopaque, s: Terminal.PlayState) void {
             st = s;
             if (s.markers.len == 1) {
-                marker_ms = s.markers[0].ms;
-                marker_label_ok = std.mem.eql(u8, s.markers[0].label, "half way");
+                marker_ms = s.markers[0][0];
+                marker_label_ok = std.mem.eql(u8, s.markers[0][1], "half way");
             }
         }
     };
@@ -3557,13 +3511,15 @@ test "play_state parses state, null duration and marker tuples" {
 
     term.handlePlayState(
         \\{"state":"playing","position_ms":1234,"duration_ms":null,"speed":1.5,
-        \\ "markers":[[1500,"half way"]]}
+        \\ "frame":7,"markers":[[1500,"half way"]]}
     );
     const got = Captured.st orelse return error.NoCallback;
-    try std.testing.expectEqual(Terminal.PlayState.Kind.playing, got.kind);
+    try std.testing.expectEqual(Terminal.PlayState.Kind.playing, got.state);
+    try std.testing.expectEqual(@as(u64, 7), got.frame);
     try std.testing.expectEqual(@as(u64, 1234), got.position_ms);
     try std.testing.expectEqual(@as(?u64, null), got.duration_ms);
     try std.testing.expectEqual(@as(f64, 1.5), got.speed);
+    try std.testing.expect(!got.skip_silence);
     try std.testing.expectEqual(@as(u64, 1500), Captured.marker_ms);
     try std.testing.expect(Captured.marker_label_ok);
     // Stored copy: same scalars, no markers (callback-scoped memory).
@@ -3573,8 +3529,9 @@ test "play_state parses state, null duration and marker tuples" {
 
     // A finished state with a known duration.
     Captured.st = null;
-    term.handlePlayState("{\"state\":\"finished\",\"position_ms\":2000,\"duration_ms\":2000,\"speed\":1}");
-    try std.testing.expectEqual(Terminal.PlayState.Kind.finished, Captured.st.?.kind);
+    term.handlePlayState("{\"state\":\"finished\",\"position_ms\":2000,\"duration_ms\":2000,\"speed\":1,\"skip_silence\":true}");
+    try std.testing.expectEqual(Terminal.PlayState.Kind.finished, Captured.st.?.state);
+    try std.testing.expect(Captured.st.?.skip_silence);
     try std.testing.expectEqual(@as(?u64, 2000), Captured.st.?.duration_ms);
 
     // Unknown state names and garbage drop the frame (append-only wire).
@@ -3583,21 +3540,6 @@ test "play_state parses state, null duration and marker tuples" {
     try std.testing.expect(Captured.st == null);
     term.handlePlayState("not json");
     try std.testing.expect(Captured.st == null);
-}
-
-test "play_control payloads carry op-specific fields only" {
-    var buf: [96]u8 = undefined;
-    try std.testing.expectEqualStrings(
-        "{\"op\":\"seek\",\"ms\":12500}",
-        Terminal.playControlPayload(&buf, .seek, 12500, 1.0).?,
-    );
-    try std.testing.expectEqualStrings(
-        "{\"op\":\"speed\",\"speed\":2}",
-        Terminal.playControlPayload(&buf, .speed, 0, 2.0).?,
-    );
-    try std.testing.expectEqualStrings("{\"op\":\"pause\"}", Terminal.playControlPayload(&buf, .pause, 0, 1.0).?);
-    try std.testing.expectEqualStrings("{\"op\":\"play\"}", Terminal.playControlPayload(&buf, .play, 0, 1.0).?);
-    try std.testing.expectEqualStrings("{\"op\":\"restart\"}", Terminal.playControlPayload(&buf, .restart, 0, 1.0).?);
 }
 
 test "clearSinks nulls every on_* callback (reflection drift guard)" {

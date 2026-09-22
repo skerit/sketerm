@@ -13,6 +13,7 @@ const c = @import("../c.zig").c;
 const log = @import("log.zig");
 const cast_play = @import("cast_play.zig");
 const logring = @import("logring.zig");
+const wire = @import("wire.zig");
 const dmod = @import("daemon.zig");
 const Daemon = dmod.Daemon;
 const Client = dmod.Client;
@@ -36,18 +37,71 @@ const READ_BATCH: usize = 512 * 1024;
 /// File bytes replayed per seek tick — a 1 GB cast seeks across many
 /// ticks instead of blocking the poll loop.
 const SEEK_BATCH: usize = 1024 * 1024;
+/// File bytes the background duration scan reads per tick: a seek
+/// replay's budget, so a scan tick costs the poll loop what a seek tick
+/// does (in monolith mode that loop is shared with every session).
+const SCAN_BATCH: usize = SEEK_BATCH;
+/// With `skip_silence` on, any longer pause is cut down to this.
+const SILENCE_MS: u64 = 500;
 /// Minimum gap between throttled play_state pushes while playing.
 const STATE_PUSH_MS: i64 = 500;
 /// Markers carried in a play_state payload (newest kept).
 const MAX_STATE_MARKERS: usize = 256;
+
+/// A cast file and the incremental parser reading it. Playback, seek
+/// replay, the duration scan and the spawn-time header probe all read
+/// through one of these.
+const Reader = struct {
+    file: *c.FILE,
+    player: cast_play.Player,
+
+    fn init(allocator: std.mem.Allocator, file: *c.FILE) Reader {
+        return .{ .file = file, .player = cast_play.Player.init(allocator) };
+    }
+
+    fn deinit(self: *Reader) void {
+        _ = c.fclose(self.file);
+        self.player.deinit();
+    }
+
+    /// Feed at most one chunk (and at most `budget` bytes) to the parser.
+    /// @return false when the budget is already spent.
+    fn fill(self: *Reader, budget: *usize) cast_play.Error!bool {
+        if (budget.* == 0) return false;
+        var chunk: [32768]u8 = undefined;
+        const n = c.fread(&chunk, 1, @min(chunk.len, budget.*), self.file);
+        budget.* -= n;
+        if (n == 0) self.player.feedEof() else try self.player.feed(chunk[0..n]);
+        return true;
+    }
+
+    const Pull = union(enum) {
+        /// Borrows the parser's scratch until the next pull.
+        event: cast_play.TimedEvent,
+        /// Read budget spent; pull again next tick.
+        again,
+        /// End of the recording, or (non-null) the error that ends a
+        /// corrupt tail. Every reader of one file stops at the same place.
+        end: ?cast_play.Error,
+    };
+
+    fn pull(self: *Reader, budget: *usize) Pull {
+        while (true) {
+            const got = self.player.next() catch |err| return .{ .end = err };
+            if (got) |ev| return .{ .event = ev };
+            if (self.player.finished) return .{ .end = null };
+            const more = self.fill(budget) catch |err| return .{ .end = err };
+            if (!more) return .again;
+        }
+    }
+};
 
 /// Per-session playback state, heap-owned by `Session.source.cast`.
 pub const CastPlayback = struct {
     allocator: std.mem.Allocator,
     /// Owned daemon-host path, re-opened on every seek.
     path: []u8,
-    file: ?*c.FILE,
-    player: cast_play.Player,
+    reader: Reader,
     header_cols: u16,
     header_rows: u16,
     state: State = .paused,
@@ -62,18 +116,45 @@ pub const CastPlayback = struct {
     pending: ?PendingEvent = null,
     /// Highest event time seen so far — becomes duration_ms at EOF.
     max_time_ms: u64 = 0,
+    /// Known from the background scan before playback reaches EOF;
+    /// playback's own EOF overrides it (the file may have changed).
     duration_ms: ?u64 = null,
+    /// Background duration pre-scan; null once done or abandoned.
+    scan: ?Scan = null,
     exit_code: ?i32 = null,
     markers: std.ArrayList(Mark) = .empty,
     ever_attached: bool = false,
     seek: ?SeekState = null,
+    /// Screen-changing events applied since the recording's start: the
+    /// frame that step_forward/step_back move from.
+    frame: u64 = 0,
+    /// Pending forward step: apply events regardless of their time
+    /// until `frame` reaches this.
+    step_to: ?u64 = null,
+    skip_silence: bool = false,
     last_push_ms: i64 = 0,
     /// A bounded batch stopped early; the next tick must not sleep.
     want_immediate: bool = false,
 
     pub const State = enum { paused, playing, finished };
     pub const Mark = struct { ms: u64, label: []u8 };
-    pub const SeekState = struct { target_ms: u64, resume_play: bool };
+    pub const SeekState = struct {
+        target: SeekTarget,
+        resume_play: bool,
+        /// Time of the last event the replay applied.
+        last_ms: u64 = 0,
+        /// Frame steps pressed during a time seek, whose frame is
+        /// unknown until it lands; applied from where it lands.
+        then_step: i64 = 0,
+    };
+    /// Replay up to a cast time, or up to (not past) the n-th frame.
+    pub const SeekTarget = union(enum) { ms: u64, frame: u64 };
+
+    /// A second reader over the same file that only tracks event times.
+    pub const Scan = struct {
+        reader: Reader,
+        max_ms: u64 = 0,
+    };
 
     pub const PendingEvent = struct {
         time_ms: u64,
@@ -105,16 +186,51 @@ pub const CastPlayback = struct {
                 else => {},
             }
         }
+
+        /// Borrowed view, valid while this PendingEvent lives.
+        fn view(self: *const PendingEvent) cast_play.TimedEvent {
+            return .{
+                .time_ms = self.time_ms,
+                .event = switch (self.data) {
+                    .output => |b| .{ .output = b },
+                    .resize => |r| .{ .resize = .{ .cols = r.cols, .rows = r.rows } },
+                    .marker => |b| .{ .marker = b },
+                    .exit => |code| .{ .exit = code },
+                    .input => .input,
+                },
+            };
+        }
     };
 
     fn noteTime(self: *CastPlayback, t: u64) void {
         if (t > self.max_time_ms) self.max_time_ms = t;
     }
 
+    /// Reading reached the true end: that length is authoritative, and
+    /// a still-running scan has nothing left to add.
+    fn noteEof(self: *CastPlayback) void {
+        self.duration_ms = self.max_time_ms;
+        self.dropScan();
+    }
+
+    fn dropScan(self: *CastPlayback) void {
+        if (self.scan) |*sc| sc.reader.deinit();
+        self.scan = null;
+    }
+
+    fn kind(self: *const CastPlayback) wire.PlayKind {
+        if (self.seek != null) return .seeking;
+        return switch (self.state) {
+            .paused => .paused,
+            .playing => .playing,
+            .finished => .finished,
+        };
+    }
+
     pub fn destroy(self: *CastPlayback) void {
         const allocator = self.allocator;
-        if (self.file) |f| _ = c.fclose(f);
-        self.player.deinit();
+        self.dropScan();
+        self.reader.deinit();
         if (self.pending) |*p| p.deinit(allocator);
         for (self.markers.items) |m| allocator.free(m.label);
         self.markers.deinit(allocator);
@@ -149,31 +265,27 @@ pub fn spawnCastSessionWithOrigin(self: *Daemon, req: SpawnReq, origin_id: dmod.
     var path_buf: [4096]u8 = undefined;
     const path = try resolveCastPath(&path_buf, req.cast_path);
     var z_buf: [4096]u8 = undefined;
-    const file = c.fopen(try pathZ(&z_buf, path), "rb") orelse return error.CastFileUnreadable;
-    var file_owned: ?*c.FILE = file;
-    errdefer if (file_owned) |f| {
-        _ = c.fclose(f);
-    };
+    const zpath = try pathZ(&z_buf, path);
+    const file = c.fopen(zpath, "rb") orelse return error.CastFileUnreadable;
+    var reader = Reader.init(allocator, file);
+    var reader_owned = true;
+    errdefer if (reader_owned) reader.deinit();
 
-    var player = cast_play.Player.init(allocator);
-    var player_owned = true;
-    errdefer if (player_owned) player.deinit();
-
-    // Header probe. `next` may hand back the first event; keep it.
+    // Header probe: stops as soon as the header parsed, so a huge first
+    // event is not read here. `next` may hand that event back; keep it.
     var first: ?CastPlayback.PendingEvent = null;
     errdefer if (first) |*p| p.deinit(allocator);
-    while (player.header == null) {
-        if (try player.next()) |ev| {
+    while (reader.player.header == null) {
+        if (try reader.player.next()) |ev| {
             first = try CastPlayback.PendingEvent.copy(allocator, ev);
             break;
         }
-        if (player.header != null) break;
-        if (player.eof) return error.BadCastFile;
-        var chunk: [32768]u8 = undefined;
-        const n = c.fread(&chunk, 1, chunk.len, file);
-        if (n == 0) player.feedEof() else try player.feed(chunk[0..n]);
+        if (reader.player.header != null) break;
+        if (reader.player.eof) return error.BadCastFile;
+        var unbounded: usize = std.math.maxInt(usize);
+        _ = try reader.fill(&unbounded);
     }
-    const h = player.header orelse return error.BadCastFile;
+    const h = reader.player.header orelse return error.BadCastFile;
 
     const cp = try allocator.create(CastPlayback);
     errdefer allocator.destroy(cp);
@@ -182,20 +294,19 @@ pub fn spawnCastSessionWithOrigin(self: *Daemon, req: SpawnReq, origin_id: dmod.
     cp.* = .{
         .allocator = allocator,
         .path = path_owned,
-        .file = file,
-        .player = player,
+        .reader = reader,
         .header_cols = h.cols,
         .header_rows = h.rows,
         .pending = first,
     };
     if (first) |p| cp.noteTime(p.time_ms);
-    // Ownership of file/player/first/path moved into cp; from here a
-    // failure tears down through cp.destroy via the session errdefers.
-    player_owned = false;
-    file_owned = null;
+    // Ownership of reader/first/path moved into cp; from here a failure
+    // tears down through cp.destroy via the session errdefers.
+    reader_owned = false;
     first = null;
     var cp_owned: ?*CastPlayback = cp;
     errdefer if (cp_owned) |p| p.destroy();
+    startScan(cp, zpath);
 
     const pool = try allocator.create(Pool);
     errdefer allocator.destroy(pool);
@@ -235,6 +346,34 @@ pub fn spawnCastSessionWithOrigin(self: *Daemon, req: SpawnReq, origin_id: dmod.
         req.name, h.cols, h.rows, path,
     });
     return s;
+}
+
+/// Open the scan's own handle; without one the duration simply stays
+/// unknown until playback or a seek reaches EOF.
+fn startScan(cp: *CastPlayback, zpath: [*:0]const u8) void {
+    const file = c.fopen(zpath, "rb") orelse {
+        log.warn("cast '{s}': cannot open a second handle for the duration scan", .{cp.path});
+        return;
+    };
+    cp.scan = .{ .reader = Reader.init(cp.allocator, file) };
+}
+
+/// One bounded chunk of the duration scan.
+/// @return true while more work remains.
+fn scanStep(self: *Daemon, s: *Session, cp: *CastPlayback, now: i64) bool {
+    const sc = if (cp.scan) |*sc| sc else return false;
+    var read_budget: usize = SCAN_BATCH;
+    while (true) switch (sc.reader.pull(&read_budget)) {
+        .event => |ev| sc.max_ms = @max(sc.max_ms, ev.time_ms),
+        .again => return true,
+        // A corrupt tail ends the scan where it ends playback too.
+        .end => break,
+    };
+    const d = sc.max_ms;
+    cp.dropScan();
+    cp.duration_ms = d;
+    broadcastPlayState(self, s, cp, now);
+    return false;
 }
 
 // ── playback engine ─────────────────────────────────────────────
@@ -280,10 +419,76 @@ fn relMs(gap_ms: u64, speed: f64) i64 {
 }
 
 fn finishPlayback(self: *Daemon, s: *Session, cp: *CastPlayback, now: i64) void {
-    cp.duration_ms = cp.max_time_ms;
+    cp.noteEof();
     cp.position_ms = cp.max_time_ms;
     cp.state = .finished;
+    cp.step_to = null;
     broadcastPlayState(self, s, cp, now);
+}
+
+/// Apply one event to the session. Returns the output bytes it fed.
+fn applyEvent(self: *Daemon, s: *Session, cp: *CastPlayback, col: *dmod.EventCollector, ev: cast_play.TimedEvent, now: i64) usize {
+    if (ev.event.changesScreen()) cp.frame += 1;
+    switch (ev.event) {
+        .output => |b| {
+            dmod.ingestBytes(s, col, b);
+            return b.len;
+        },
+        .resize => |r| applyResize(self, s, col, r.cols, r.rows),
+        .marker => |b| addMarker(self, s, cp, ev.time_ms, b, now),
+        .exit => |code| cp.exit_code = code,
+        .input => {},
+    }
+    return 0;
+}
+
+const Fetched = union(enum) {
+    /// Either the stashed `pending` event or a view of the reader's
+    /// scratch, which the next pull invalidates.
+    event: cast_play.TimedEvent,
+    /// Read budget spent; retry next tick.
+    again,
+    /// End of the recording, or a corrupt tail (what played is kept).
+    eof,
+};
+
+/// The next event to apply; call `dropPending` once it has been applied.
+fn fetchEvent(s: *Session, cp: *CastPlayback, read_budget: *usize) Fetched {
+    if (cp.pending) |*p| return .{ .event = p.view() };
+    return switch (cp.reader.pull(read_budget)) {
+        .event => |ev| blk: {
+            cp.noteTime(ev.time_ms);
+            break :blk .{ .event = ev };
+        },
+        .again => .again,
+        .end => |err| blk: {
+            if (err) |e| log.warn("cast '{s}': {s}; ending playback", .{ s.name, @errorName(e) });
+            break :blk .eof;
+        },
+    };
+}
+
+/// Keep a fetched-but-unapplied event for a later tick. No-op when it
+/// already is the stashed one.
+fn stash(cp: *CastPlayback, ev: cast_play.TimedEvent) !void {
+    if (cp.pending != null) return;
+    cp.pending = try CastPlayback.PendingEvent.copy(cp.allocator, ev);
+}
+
+fn dropPending(cp: *CastPlayback) void {
+    if (cp.pending) |*p| p.deinit(cp.allocator);
+    cp.pending = null;
+}
+
+/// Cut a pause longer than SILENCE_MS down to SILENCE_MS by moving the
+/// clock forward. The recording's own timeline (and so the duration)
+/// is untouched; only where playback stands on it jumps.
+fn skipSilence(cp: *CastPlayback, due_ms: u64) bool {
+    if (!cp.skip_silence) return false;
+    if (due_ms <= cp.position_ms + SILENCE_MS) return false;
+    cp.position_ms = due_ms - SILENCE_MS;
+    cp.frac_ms = 0;
+    return true;
 }
 
 /// One session's playback service. Returns the absolute wake deadline
@@ -291,10 +496,16 @@ fn finishPlayback(self: *Daemon, s: *Session, cp: *CastPlayback, now: i64) void 
 pub fn castService(self: *Daemon, s: *Session, now: i64) ?i64 {
     const cp = s.castPtr() orelse return null;
     if (s.exited) return null;
-    if (cp.seek != null) return seekStep(self, s, cp, now);
-    if (cp.state != .playing) return null;
+    const scanning = scanStep(self, s, cp, now);
+    const deadline = if (cp.seek != null) seekStep(self, s, cp, now) else playStep(self, s, cp, now);
+    if (scanning) return now;
+    return deadline;
+}
 
-    advanceClock(cp, now);
+fn playStep(self: *Daemon, s: *Session, cp: *CastPlayback, now: i64) ?i64 {
+    if (cp.state != .playing and cp.step_to == null) return null;
+    // A step places the clock itself; it restarts when the step ends.
+    if (cp.state == .playing and cp.step_to == null) advanceClock(cp, now);
 
     var deadline: ?i64 = null;
     var out_budget: usize = OUT_BATCH;
@@ -303,91 +514,61 @@ pub fn castService(self: *Daemon, s: *Session, now: i64) ?i64 {
     // Deferred so the "finished" play_state is queued AFTER the last
     // EVENTS frame — clients see the final output before the state.
     var finish = false;
+    var announce = false;
     var col = self.ingestBegin(s);
 
-    loop: while (true) {
+    while (true) {
         if (ev_budget == 0 or out_budget == 0) {
             cp.want_immediate = true;
             break;
         }
-        // A stashed future event always goes first.
-        if (cp.pending) |*p| {
-            if (p.time_ms > cp.position_ms) {
-                deadline = now + relMs(p.time_ms - cp.position_ms, cp.speed);
-                break;
-            }
-            ev_budget -= 1;
-            switch (p.data) {
-                .output => |b| {
-                    out_budget -|= b.len;
-                    dmod.ingestBytes(s, &col, b);
-                },
-                .resize => |r| applyResize(self, s, &col, r.cols, r.rows),
-                .marker => |b| addMarker(self, s, cp, p.time_ms, b, now),
-                .exit => |code| cp.exit_code = code,
-                .input => {},
-            }
-            p.deinit(self.allocator);
-            cp.pending = null;
-            continue;
-        }
-        const got = cp.player.next() catch |err| {
-            // Corrupt tail of an untrusted file: retain what played.
-            log.warn("cast '{s}': parse error {s}; ending playback", .{ s.name, @errorName(err) });
-            finish = true;
-            break;
-        };
-        const ev = got orelse {
-            if (cp.player.finished) {
-                finish = true;
-                break;
-            }
-            if (read_budget == 0) {
+        const ev = switch (fetchEvent(s, cp, &read_budget)) {
+            .event => |e| e,
+            .again => {
                 cp.want_immediate = true;
                 break;
-            }
-            const file = cp.file orelse {
+            },
+            .eof => {
                 finish = true;
                 break;
-            };
-            var chunk: [32768]u8 = undefined;
-            const want = @min(chunk.len, read_budget);
-            const n = c.fread(&chunk, 1, want, file);
-            read_budget -= n;
-            if (n == 0) {
-                cp.player.feedEof();
-            } else cp.player.feed(chunk[0..n]) catch |err| {
-                log.warn("cast '{s}': {s}; ending playback", .{ s.name, @errorName(err) });
-                finishPlayback(self, s, cp, now);
-                break;
-            };
-            continue;
+            },
         };
-        cp.noteTime(ev.time_ms);
-        if (ev.time_ms > cp.position_ms) {
-            // Not due yet: stash an owned copy (the player scratch is
-            // invalidated by the next `next` call).
-            cp.pending = CastPlayback.PendingEvent.copy(self.allocator, ev) catch {
+        if (cp.step_to) |target| {
+            if (cp.frame >= target) {
+                // Step done: stop BEFORE whatever follows that frame.
+                stash(cp, ev) catch {
+                    finish = true;
+                    break;
+                };
+                cp.step_to = null;
+                cp.frac_ms = 0;
+                cp.last_wall_ms = now;
+                announce = true;
+                if (cp.state == .playing) continue;
+                break;
+            }
+        } else if (ev.time_ms > cp.position_ms) {
+            // Not due yet: stash an owned copy (the reader scratch is
+            // invalidated by the next pull).
+            stash(cp, ev) catch {
                 finish = true;
                 break;
             };
+            if (skipSilence(cp, ev.time_ms)) announce = true;
             deadline = now + relMs(ev.time_ms - cp.position_ms, cp.speed);
-            break :loop;
+            break;
         }
         ev_budget -= 1;
-        switch (ev.event) {
-            .output => |b| {
-                out_budget -|= b.len;
-                dmod.ingestBytes(s, &col, b);
-            },
-            .resize => |r| applyResize(self, s, &col, r.cols, r.rows),
-            .marker => |b| addMarker(self, s, cp, ev.time_ms, b, now),
-            .exit => |code| cp.exit_code = code,
-            .input => {},
-        }
+        out_budget -|= applyEvent(self, s, cp, &col, ev, now);
+        if (cp.step_to != null) cp.position_ms = @max(cp.position_ms, ev.time_ms);
+        dropPending(cp);
     }
     self.ingestFinish(s, &col, true);
-    if (finish) finishPlayback(self, s, cp, now);
+    if (finish) {
+        finishPlayback(self, s, cp, now);
+    } else if (announce) {
+        broadcastPlayState(self, s, cp, now);
+    }
 
     if (cp.state == .playing) {
         if (now - cp.last_push_ms >= STATE_PUSH_MS) broadcastPlayState(self, s, cp, now);
@@ -429,7 +610,7 @@ fn addMarker(self: *Daemon, s: *Session, cp: *CastPlayback, t: u64, label: []con
 /// replay from the start, bounded per tick, silent until the final
 /// SNAPSHOT. Fails soft — an unopenable file aborts the seek and
 /// leaves current playback state untouched.
-fn startSeek(self: *Daemon, s: *Session, cp: *CastPlayback, target_ms: u64, resume_play: bool, now: i64) void {
+fn startSeek(self: *Daemon, s: *Session, cp: *CastPlayback, target: CastPlayback.SeekTarget, resume_play: bool, now: i64) void {
     const allocator = self.allocator;
     var z_buf: [4096]u8 = undefined;
     const zpath = pathZ(&z_buf, cp.path) catch return;
@@ -465,89 +646,74 @@ fn startSeek(self: *Daemon, s: *Session, cp: *CastPlayback, target_ms: u64, resu
     s.parser.deinit();
     s.parser = Parser.init(allocator);
 
-    if (cp.file) |old| _ = c.fclose(old);
-    cp.file = file;
-    cp.player.deinit();
-    cp.player = cast_play.Player.init(allocator);
-    if (cp.pending) |*p| p.deinit(allocator);
-    cp.pending = null;
+    cp.reader.deinit();
+    cp.reader = Reader.init(allocator, file);
+    dropPending(cp);
     for (cp.markers.items) |m| allocator.free(m.label);
     cp.markers.clearRetainingCapacity();
     cp.exit_code = null;
     cp.frac_ms = 0;
-    cp.position_ms = target_ms;
-    cp.seek = .{ .target_ms = target_ms, .resume_play = resume_play };
+    cp.frame = 0;
+    cp.step_to = null;
+    // A frame target's time is only known once the replay reaches it.
+    if (target == .ms) cp.position_ms = target.ms;
+    cp.seek = .{ .target = target, .resume_play = resume_play };
     broadcastPlayState(self, s, cp, now);
 }
 
 /// Bounded seek-replay work; completes with one SNAPSHOT broadcast.
 fn seekStep(self: *Daemon, s: *Session, cp: *CastPlayback, now: i64) ?i64 {
-    const sk = cp.seek.?;
+    const sk = &cp.seek.?;
     var read_budget: usize = SEEK_BATCH;
     var col = self.ingestBegin(s);
     col.ring = null; // silent: don't re-feed the log ring
     var hit_eof = false;
     while (true) {
-        const got = cp.player.next() catch |err| {
-            log.warn("cast '{s}': parse error {s} during seek", .{ s.name, @errorName(err) });
-            hit_eof = true;
-            break;
-        };
-        const ev = got orelse {
-            if (cp.player.finished) {
-                hit_eof = true;
-                break;
-            }
-            if (read_budget == 0) {
+        const ev = switch (fetchEvent(s, cp, &read_budget)) {
+            .event => |e| e,
+            .again => {
                 // More work next tick; keep the "seeking" state.
                 self.ingestFinish(s, &col, false);
                 return now;
-            }
-            const file = cp.file orelse {
+            },
+            .eof => {
                 hit_eof = true;
                 break;
-            };
-            var chunk: [32768]u8 = undefined;
-            const want = @min(chunk.len, read_budget);
-            const n = c.fread(&chunk, 1, want, file);
-            read_budget -= n;
-            if (n == 0) {
-                cp.player.feedEof();
-            } else cp.player.feed(chunk[0..n]) catch {
-                hit_eof = true;
-                break;
-            };
-            continue;
+            },
         };
-        cp.noteTime(ev.time_ms);
-        if (ev.time_ms > sk.target_ms) {
-            cp.pending = CastPlayback.PendingEvent.copy(self.allocator, ev) catch null;
+        const stop = switch (sk.target) {
+            .ms => |t| ev.time_ms > t,
+            .frame => |n| cp.frame >= n,
+        };
+        if (stop) {
+            stash(cp, ev) catch {};
             break;
         }
-        switch (ev.event) {
-            .output => |b| dmod.ingestBytes(s, &col, b),
-            .resize => |r| applyResize(self, s, &col, r.cols, r.rows),
-            .marker => |b| addMarker(self, s, cp, ev.time_ms, b, now),
-            .exit => |code| cp.exit_code = code,
-            .input => {},
-        }
+        _ = applyEvent(self, s, cp, &col, ev, now);
+        sk.last_ms = ev.time_ms;
+        dropPending(cp);
     }
     self.ingestFinish(s, &col, false);
+    const done = sk.*;
     cp.seek = null;
     cp.frac_ms = 0;
     cp.last_wall_ms = now;
     if (hit_eof) {
         // Target at/past the end of the recording.
-        cp.duration_ms = cp.max_time_ms;
+        cp.noteEof();
         cp.position_ms = cp.max_time_ms;
         cp.state = .finished;
     } else {
-        cp.position_ms = sk.target_ms;
-        cp.state = if (sk.resume_play) .playing else .paused;
+        cp.position_ms = switch (done.target) {
+            .ms => |t| t,
+            .frame => done.last_ms,
+        };
+        cp.state = if (done.resume_play) .playing else .paused;
     }
     self.broadcastSnapshot(s);
     broadcastPlayState(self, s, cp, now);
-    return if (cp.state == .playing) now else null;
+    if (done.then_step != 0) stepFrames(self, s, cp, done.then_step, now);
+    return if (cp.state == .playing or cp.seek != null or cp.step_to != null) now else null;
 }
 
 // ── controls / state ────────────────────────────────────────────
@@ -575,59 +741,92 @@ pub fn playControl(self: *Daemon, cl: *Client, payload: []const u8, now: i64) vo
         return;
     };
     const cp = s.castPtr() orelse return;
-    const Req = struct { op: []const u8 = "", ms: u64 = 0, speed: f64 = 1.0 };
-    var parsed = std.json.parseFromSlice(Req, self.allocator, payload, .{
-        .ignore_unknown_fields = true,
-    }) catch {
+    // An op this build does not know is ignored: ops are append-only.
+    const cmd = (wire.PlayCommand.decode(self.allocator, payload) catch {
         cl.queueErr("bad play_control request");
         return;
-    };
-    defer parsed.deinit();
-    const req = parsed.value;
-    if (std.mem.eql(u8, req.op, "play")) {
-        if (cp.seek != null) {
-            cp.seek.?.resume_play = true;
-        } else if (cp.state == .paused) {
-            cp.state = .playing;
-            cp.last_wall_ms = now;
-        }
-        broadcastPlayState(self, s, cp, now);
-    } else if (std.mem.eql(u8, req.op, "pause")) {
-        if (cp.seek != null) {
-            cp.seek.?.resume_play = false;
-        } else if (cp.state == .playing) {
-            advanceClock(cp, now);
-            cp.state = .paused;
-        }
-        broadcastPlayState(self, s, cp, now);
-    } else if (std.mem.eql(u8, req.op, "restart")) {
-        startSeek(self, s, cp, 0, true, now);
-    } else if (std.mem.eql(u8, req.op, "seek")) {
-        var target = req.ms;
-        if (cp.duration_ms) |d| target = @min(target, d);
-        const resume_play = if (cp.seek) |sk| sk.resume_play else cp.state == .playing;
-        startSeek(self, s, cp, target, resume_play, now);
-    } else if (std.mem.eql(u8, req.op, "speed")) {
-        const clamped = std.math.clamp(req.speed, 0.1, 10.0);
-        if (cp.state == .playing) advanceClock(cp, now);
-        cp.speed = clamped;
-        broadcastPlayState(self, s, cp, now);
+    }) orelse return;
+    switch (cmd) {
+        .play => {
+            if (cp.seek) |*sk| {
+                sk.resume_play = true;
+            } else if (cp.state == .paused) {
+                cp.state = .playing;
+                cp.last_wall_ms = now;
+            }
+            broadcastPlayState(self, s, cp, now);
+        },
+        .pause => {
+            if (cp.seek) |*sk| {
+                sk.resume_play = false;
+            } else if (cp.state == .playing) {
+                settleClock(cp, now);
+                cp.state = .paused;
+            }
+            broadcastPlayState(self, s, cp, now);
+        },
+        .restart => startSeek(self, s, cp, .{ .ms = 0 }, true, now),
+        .seek => |ms| {
+            const target = if (cp.duration_ms) |d| @min(ms, d) else ms;
+            startSeek(self, s, cp, .{ .ms = target }, resumeAfterSeek(cp), now);
+        },
+        .speed => |x| {
+            settleClock(cp, now);
+            cp.speed = std.math.clamp(x, 0.1, 10.0);
+            broadcastPlayState(self, s, cp, now);
+        },
+        .step_forward => stepFrames(self, s, cp, 1, now),
+        .step_back => stepFrames(self, s, cp, -1, now),
+        .skip_silence => |on| {
+            cp.skip_silence = on;
+            broadcastPlayState(self, s, cp, now);
+        },
     }
-    // Unknown ops are ignored (append-only).
 }
 
-fn stateName(cp: *const CastPlayback) []const u8 {
-    if (cp.seek != null) return "seeking";
-    return switch (cp.state) {
-        .paused => "paused",
-        .playing => "playing",
-        .finished => "finished",
+/// Bring the clock up to `now` before changing how it runs. A step in
+/// flight places the clock itself, so it is left alone then.
+fn settleClock(cp: *CastPlayback, now: i64) void {
+    if (cp.state == .playing and cp.step_to == null) advanceClock(cp, now);
+}
+
+/// A new seek inherits the play/pause intent of one still in flight.
+fn resumeAfterSeek(cp: *const CastPlayback) bool {
+    if (cp.seek) |sk| return sk.resume_play;
+    return cp.state == .playing;
+}
+
+/// Move `delta` frames (screen-changing events) forward or back.
+/// Counted from where a step or seek in flight is headed, so rapid
+/// presses accumulate instead of being lost. Forward applies the next
+/// events at once; back replays from the start (terminal state cannot
+/// be undone) and lands right after the earlier frame.
+fn stepFrames(self: *Daemon, s: *Session, cp: *CastPlayback, delta: i64, now: i64) void {
+    if (delta == 0) return;
+    if (cp.seek) |*sk| switch (sk.target) {
+        // The frame a time seek lands on is unknown until it lands.
+        .ms => {
+            sk.then_step += delta;
+            return;
+        },
+        .frame => |n| if (delta > 0) {
+            // The replay has not passed `n` yet, so extending is safe.
+            sk.target = .{ .frame = n + @abs(delta) };
+            return;
+        },
     };
+    const base: u64 = if (cp.seek) |sk| sk.target.frame else cp.step_to orelse cp.frame;
+    if (delta < 0) {
+        if (base == 0) return;
+        startSeek(self, s, cp, .{ .frame = base -| @abs(delta) }, resumeAfterSeek(cp), now);
+        return;
+    }
+    if (cp.state == .finished) return;
+    settleClock(cp, now);
+    cp.step_to = base + @abs(delta);
 }
 
-const MarkerTuple = struct { u64, []const u8 };
-
-fn markerTuples(cp: *const CastPlayback, buf: []MarkerTuple) []const MarkerTuple {
+fn markerTuples(cp: *const CastPlayback, buf: []wire.PlayState.Marker) []const wire.PlayState.Marker {
     const items = cp.markers.items;
     const n = @min(items.len, buf.len);
     const start = items.len - n;
@@ -637,12 +836,14 @@ fn markerTuples(cp: *const CastPlayback, buf: []MarkerTuple) []const MarkerTuple
 
 /// One client's play_state (attach path; does not reset the throttle).
 pub fn queuePlayState(cl: *Client, cp: *const CastPlayback) void {
-    var tuples: [MAX_STATE_MARKERS]MarkerTuple = undefined;
-    cl.queueJson(.play_state, .{
-        .state = stateName(cp),
+    var tuples: [MAX_STATE_MARKERS]wire.PlayState.Marker = undefined;
+    cl.queueJson(.play_state, wire.PlayState{
+        .state = cp.kind(),
         .position_ms = cp.position_ms,
         .duration_ms = cp.duration_ms,
         .speed = cp.speed,
+        .skip_silence = cp.skip_silence,
+        .frame = cp.frame,
         .markers = markerTuples(cp, &tuples),
     });
 }
@@ -659,7 +860,6 @@ pub fn broadcastPlayState(self: *Daemon, s: *Session, cp: *CastPlayback, now: i6
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
-const wire = @import("wire.zig");
 const daemon_serve = @import("daemon_serve.zig");
 
 /// A daemon shell with no sockets — the same shape a broker worker
@@ -676,6 +876,12 @@ fn newTestClient(d: *Daemon, s: *Session) !*Client {
     try d.clients.append(d.allocator, cl);
     cl.attached = s;
     return cl;
+}
+
+/// Send one play_control through the encoder every client uses.
+fn control(d: *Daemon, cl: *Client, cmd: wire.PlayCommand, now: i64) void {
+    var buf: [96]u8 = undefined;
+    playControl(d, cl, cmd.encode(&buf).?, now);
 }
 
 fn writeTempCast(a: std.mem.Allocator, contents: []const u8) ![]u8 {
@@ -832,7 +1038,7 @@ test "cast creation and seek reset bound Kitty source retention" {
     const cl = try newTestClient(d, s);
     for (0..3) |pass| {
         if (pass > 0) {
-            playControl(d, cl, if (pass == 1) "{\"op\":\"seek\",\"ms\":100}" else "{\"op\":\"restart\"}", 10_000);
+            control(d, cl, if (pass == 1) wire.PlayCommand{ .seek = 100 } else .restart, 10_000);
             try seekSettle(d, s, 10_000);
         }
         const mgr = &s.screen.kitty_images;
@@ -969,6 +1175,10 @@ test "playback: timed events reach a subscribed client in order; EOF retains scr
     const t0: i64 = 100_000;
     cp.last_wall_ms = t0;
     cp.last_push_ms = t0;
+    // The first tick finishes the duration scan and announces it.
+    _ = castServiceAll(d, t0);
+    try testing.expectEqual(@as(?u64, 300), cp.duration_ms);
+    cl.wbuf.clearRetainingCapacity();
 
     // Before the first event is due: nothing but a scheduled wake.
     const dl = castServiceAll(d, t0 + 50);
@@ -1172,7 +1382,7 @@ test "play_control: pause/play/speed clamp on a synthetic clock" {
     try testing.expectEqual(CastPlayback.State.playing, cp.state);
 
     // Pause at +500: the clock stops there.
-    playControl(d, cl, "{\"op\":\"pause\"}", t0 + 500);
+    control(d, cl, .pause, t0 + 500);
     try testing.expectEqual(CastPlayback.State.paused, cp.state);
     try testing.expectEqual(@as(u64, 500), cp.position_ms);
     _ = castServiceAll(d, t0 + 60_000);
@@ -1180,7 +1390,7 @@ test "play_control: pause/play/speed clamp on a synthetic clock" {
 
     // Resume much later: no cast time was lost while paused.
     const t1: i64 = t0 + 100_000;
-    playControl(d, cl, "{\"op\":\"play\"}", t1);
+    control(d, cl, .play, t1);
     cl.wbuf.clearRetainingCapacity();
     _ = castServiceAll(d, t1 + 600); // position 1100: "A" due, "B" not
     {
@@ -1194,7 +1404,7 @@ test "play_control: pause/play/speed clamp on a synthetic clock" {
     }
 
     // 4x speed: 250 wall ms covers the remaining 900 cast ms.
-    playControl(d, cl, "{\"op\":\"speed\",\"speed\":4.0}", t1 + 600);
+    control(d, cl, .{ .speed = 4.0 }, t1 + 600);
     _ = castServiceAll(d, t1 + 850);
     {
         var frames: std.ArrayList(TFrame) = .empty;
@@ -1207,9 +1417,9 @@ test "play_control: pause/play/speed clamp on a synthetic clock" {
     }
 
     // Speed clamps to [0.1, 10].
-    playControl(d, cl, "{\"op\":\"speed\",\"speed\":100}", t1 + 900);
+    control(d, cl, .{ .speed = 100 }, t1 + 900);
     try testing.expectEqual(@as(f64, 10.0), cp.speed);
-    playControl(d, cl, "{\"op\":\"speed\",\"speed\":0.001}", t1 + 900);
+    control(d, cl, .{ .speed = 0.001 }, t1 + 900);
     try testing.expectEqual(@as(f64, 0.1), cp.speed);
 }
 
@@ -1250,7 +1460,7 @@ test "seek replays deterministically: same grid as linear play" {
     // Seek session: jump straight to 1200.
     const s2 = try spawnCast(d, path, "seek");
     const cl2 = try newTestClient(d, s2);
-    playControl(d, cl2, "{\"op\":\"seek\",\"ms\":1200}", t0);
+    control(d, cl2, .{ .seek = 1200 }, t0);
     try seekSettle(d, s2, t0);
     {
         const cp = s2.castPtr().?;
@@ -1269,7 +1479,7 @@ test "seek replays deterministically: same grid as linear play" {
     const lin_end = try s1.screen.extractScrollback(a);
     defer a.free(lin_end);
 
-    playControl(d, cl2, "{\"op\":\"seek\",\"ms\":99999}", t0);
+    control(d, cl2, .{ .seek = 99999 }, t0);
     try seekSettle(d, s2, t0);
     {
         const cp = s2.castPtr().?;
@@ -1285,7 +1495,7 @@ test "seek replays deterministically: same grid as linear play" {
 
     // Restart = seek 0 and play from the top.
     cl2.wbuf.clearRetainingCapacity();
-    playControl(d, cl2, "{\"op\":\"restart\"}", t0);
+    control(d, cl2, .restart, t0);
     try seekSettle(d, s2, t0);
     {
         const cp = s2.castPtr().?;
@@ -1298,4 +1508,310 @@ test "seek replays deterministically: same grid as linear play" {
         try testing.expect(countFrames(frames.items, .snapshot) >= 1);
         try testing.expect(countFrames(frames.items, .play_state) >= 1);
     }
+}
+
+test "duration is known from the background scan before playback reaches EOF" {
+    const a = testing.allocator;
+    const d = try newTestDaemon(a);
+    defer d.deinit();
+    const path = try writeTempCast(a, rich_cast);
+    defer {
+        unlinkPath(path);
+        a.free(path);
+    }
+    const s = try spawnCast(d, path, "scan");
+    const cl = try newTestClient(d, s);
+    const cp = s.castPtr().?;
+    try testing.expect(cp.scan != null);
+    try testing.expectEqual(@as(?u64, null), cp.duration_ms);
+
+    // One tick, still paused at 0: the scan alone finds the length and
+    // announces it.
+    _ = castServiceAll(d, 1_000);
+    try testing.expect(cp.scan == null);
+    try testing.expectEqual(@as(?u64, 2000), cp.duration_ms);
+    try testing.expectEqual(@as(u64, 0), cp.position_ms);
+    try testing.expectEqual(CastPlayback.State.paused, cp.state);
+    var frames: std.ArrayList(TFrame) = .empty;
+    defer freeFrames(a, &frames);
+    try takeFrames(a, cl, &frames);
+    try testing.expectEqual(@as(usize, 1), countFrames(frames.items, .play_state));
+    try testing.expect(std.mem.indexOf(u8, frames.items[0].payload, "\"duration_ms\":2000") != null);
+}
+
+test "the duration scan honours idle_time_limit like playback does" {
+    const a = testing.allocator;
+    const d = try newTestDaemon(a);
+    defer d.deinit();
+    const path = try writeTempCast(a,
+        \\{"version": 2, "width": 20, "height": 5, "idle_time_limit": 1}
+        \\[0.5, "o", "a"]
+        \\[60.0, "o", "b"]
+        \\
+    );
+    defer {
+        unlinkPath(path);
+        a.free(path);
+    }
+    const s = try spawnCast(d, path, "idle");
+    _ = castServiceAll(d, 1_000);
+    castOnAttach(d, s, 1_000);
+    try testing.expectEqual(@as(?u64, 1500), s.castPtr().?.duration_ms);
+    try playToEnd(d, s, 2_000);
+    try testing.expectEqual(@as(?u64, 1500), s.castPtr().?.duration_ms);
+}
+
+test "skip silence cuts long pauses without changing the duration" {
+    const a = testing.allocator;
+    const d = try newTestDaemon(a);
+    defer d.deinit();
+    const path = try writeTempCast(a,
+        \\{"version": 2, "width": 20, "height": 5}
+        \\[0.1, "o", "A"]
+        \\[0.4, "o", "B"]
+        \\[20.0, "o", "C"]
+        \\
+    );
+    defer {
+        unlinkPath(path);
+        a.free(path);
+    }
+    const s = try spawnCast(d, path, "silence");
+    const cl = try newTestClient(d, s);
+    const cp = s.castPtr().?;
+    const t0: i64 = 10_000;
+    _ = castServiceAll(d, t0); // scan
+    try testing.expectEqual(@as(?u64, 20_000), cp.duration_ms);
+    control(d, cl, .{ .skip_silence = true }, t0);
+    try testing.expect(cp.skip_silence);
+    castOnAttach(d, s, t0);
+    cl.wbuf.clearRetainingCapacity();
+
+    // A short gap (0.1 -> 0.4) plays in real time.
+    _ = castServiceAll(d, t0 + 150);
+    try testing.expectEqual(@as(u64, 150), cp.position_ms);
+    // "B" is due; the 19.6s pause that starts right after it is cut to
+    // SILENCE_MS at once: the clock jumps to just before "C", which
+    // lands SILENCE_MS of wall time later.
+    _ = castServiceAll(d, t0 + 400);
+    try testing.expectEqual(@as(u64, 20_000 - SILENCE_MS), cp.position_ms);
+    _ = castServiceAll(d, t0 + 400 + @as(i64, SILENCE_MS));
+    try testing.expectEqual(CastPlayback.State.finished, cp.state);
+    try testing.expectEqual(@as(u64, 20_000), cp.position_ms);
+    try testing.expectEqual(@as(?u64, 20_000), cp.duration_ms);
+    var frames: std.ArrayList(TFrame) = .empty;
+    defer freeFrames(a, &frames);
+    try takeFrames(a, cl, &frames);
+    var apcs: usize = 0;
+    const text = try eventsText(a, frames.items, &apcs);
+    defer a.free(text);
+    try testing.expectEqualStrings("ABC", text);
+    // The state carries the toggle so every viewer shows it.
+    try testing.expect(std.mem.indexOf(u8, frames.items[frames.items.len - 1].payload, "\"skip_silence\":true") != null);
+
+    // Off again: a restart plays the pause at full length.
+    control(d, cl, .{ .skip_silence = false }, t0);
+    control(d, cl, .restart, t0);
+    try seekSettle(d, s, t0);
+    _ = castServiceAll(d, t0 + 1_000);
+    try testing.expectEqual(@as(u64, 1_000), cp.position_ms);
+    try testing.expectEqual(CastPlayback.State.playing, cp.state);
+}
+
+/// Linear-play reference grid at cast time `ms`.
+fn gridAt(d: *Daemon, path: []const u8, name: []const u8, ms: i64) ![]u8 {
+    const s = try spawnCast(d, path, name);
+    const cp = s.castPtr().?;
+    cp.state = .playing;
+    cp.last_wall_ms = 0;
+    _ = castServiceAll(d, ms);
+    return s.screen.extractScrollback(d.allocator);
+}
+
+test "step_forward/step_back move one screen-changing frame at a time" {
+    const a = testing.allocator;
+    const d = try newTestDaemon(a);
+    defer d.deinit();
+    const path = try writeTempCast(a, rich_cast);
+    defer {
+        unlinkPath(path);
+        a.free(path);
+    }
+    const s = try spawnCast(d, path, "step");
+    const cl = try newTestClient(d, s);
+    const cp = s.castPtr().?;
+    const t0: i64 = 10_000;
+
+    // Paused at 0: a forward step applies "one " and lands on its time.
+    control(d, cl, .step_forward, t0);
+    _ = castServiceAll(d, t0);
+    try testing.expectEqual(CastPlayback.State.paused, cp.state);
+    try testing.expectEqual(@as(u64, 1), cp.frame);
+    try testing.expectEqual(@as(u64, 100), cp.position_ms);
+    {
+        const want = try gridAt(d, path, "ref1", 100);
+        defer a.free(want);
+        const got = try s.screen.extractScrollback(a);
+        defer a.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+
+    // Two presses before the daemon services either: both count. The
+    // resize is a frame; the marker at 1.5s is not.
+    control(d, cl, .step_forward, t0);
+    control(d, cl, .step_forward, t0);
+    _ = castServiceAll(d, t0);
+    try testing.expectEqual(@as(u64, 3), cp.frame);
+    try testing.expectEqual(@as(u64, 1000), cp.position_ms);
+    try testing.expectEqual(@as(u16, 30), s.screen.cols);
+    control(d, cl, .step_forward, t0);
+    _ = castServiceAll(d, t0);
+    try testing.expectEqual(@as(u64, 4), cp.frame);
+    try testing.expectEqual(@as(u64, 2000), cp.position_ms);
+    try testing.expectEqual(@as(usize, 1), cp.markers.items.len);
+
+    // Past the last frame: finished, with the full duration.
+    control(d, cl, .step_forward, t0);
+    _ = castServiceAll(d, t0);
+    try testing.expectEqual(CastPlayback.State.finished, cp.state);
+    try testing.expectEqual(@as(u64, 2000), cp.position_ms);
+
+    // Back from the end replays to just after frame 3 ("two"), paused.
+    control(d, cl, .step_back, t0);
+    try seekSettle(d, s, t0);
+    try testing.expectEqual(CastPlayback.State.paused, cp.state);
+    try testing.expectEqual(@as(u64, 3), cp.frame);
+    try testing.expectEqual(@as(u64, 1000), cp.position_ms);
+    {
+        const want = try gridAt(d, path, "ref3", 1000);
+        defer a.free(want);
+        const got = try s.screen.extractScrollback(a);
+        defer a.free(got);
+        try testing.expectEqualStrings(want, got);
+    }
+
+    // Two back steps in flight accumulate, landing after the first frame.
+    control(d, cl, .step_back, t0);
+    control(d, cl, .step_back, t0);
+    try seekSettle(d, s, t0);
+    try testing.expectEqual(@as(u64, 1), cp.frame);
+    try testing.expectEqual(@as(u64, 100), cp.position_ms);
+    try testing.expectEqual(@as(u16, 20), s.screen.cols);
+
+    // Down to frame 0, where a back step is a no-op.
+    control(d, cl, .step_back, t0);
+    try seekSettle(d, s, t0);
+    try testing.expectEqual(@as(u64, 0), cp.frame);
+    try testing.expectEqual(@as(u64, 0), cp.position_ms);
+    control(d, cl, .step_back, t0);
+    try testing.expect(cp.seek == null);
+
+    // Play resumes normal timing from the stepped-to point.
+    control(d, cl, .step_forward, t0);
+    _ = castServiceAll(d, t0);
+    control(d, cl, .play, t0);
+    _ = castServiceAll(d, t0 + 450);
+    try testing.expectEqual(@as(u64, 2), cp.frame); // the resize at 500
+    try testing.expectEqual(@as(u64, 550), cp.position_ms);
+}
+
+test "frames sharing one timestamp are still stepped one by one" {
+    const a = testing.allocator;
+    const d = try newTestDaemon(a);
+    defer d.deinit();
+    const path = try writeTempCast(a,
+        \\{"version": 2, "width": 20, "height": 5}
+        \\[0.5, "o", "one"]
+        \\[0.5, "i", "x"]
+        \\[0.5, "o", "two"]
+        \\[0.5, "o", "three"]
+        \\
+    );
+    defer {
+        unlinkPath(path);
+        a.free(path);
+    }
+    const s = try spawnCast(d, path, "same");
+    const cl = try newTestClient(d, s);
+    const cp = s.castPtr().?;
+    control(d, cl, .step_forward, 1_000);
+    _ = castServiceAll(d, 1_000);
+    control(d, cl, .step_forward, 1_000);
+    _ = castServiceAll(d, 1_000);
+    {
+        const got = try s.screen.extractScrollback(a);
+        defer a.free(got);
+        try testing.expect(std.mem.indexOf(u8, got, "onetwo") != null);
+        try testing.expect(std.mem.indexOf(u8, got, "three") == null);
+    }
+    // Back one frame lands between two events of the SAME time.
+    control(d, cl, .step_back, 1_000);
+    try seekSettle(d, s, 1_000);
+    try testing.expectEqual(@as(u64, 1), cp.frame);
+    const got = try s.screen.extractScrollback(a);
+    defer a.free(got);
+    try testing.expect(std.mem.indexOf(u8, got, "one") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "two") == null);
+}
+
+test "frame steps pressed during a time seek apply from where it lands" {
+    const a = testing.allocator;
+    const d = try newTestDaemon(a);
+    defer d.deinit();
+    const path = try writeTempCast(a, rich_cast);
+    defer {
+        unlinkPath(path);
+        a.free(path);
+    }
+    const s = try spawnCast(d, path, "queued");
+    const cl = try newTestClient(d, s);
+    const cp = s.castPtr().?;
+    const t0: i64 = 10_000;
+
+    // Seek to 700 (after "one " and the resize: frame 2), then two
+    // forward steps before the replay has run at all.
+    control(d, cl, .{ .seek = 700 }, t0);
+    control(d, cl, .step_forward, t0);
+    control(d, cl, .step_forward, t0);
+    try seekSettle(d, s, t0);
+    _ = castServiceAll(d, t0);
+    try testing.expectEqual(@as(u64, 4), cp.frame);
+    try testing.expectEqual(@as(u64, 2000), cp.position_ms);
+
+    // A back step queued behind a time seek replays once more from where
+    // that seek landed: 1200 is frame 3, so it ends on frame 2.
+    control(d, cl, .{ .seek = 1200 }, t0);
+    control(d, cl, .step_back, t0);
+    try seekSettle(d, s, t0); // both replays: the seek, then the step's
+    try testing.expectEqual(@as(u64, 2), cp.frame);
+    try testing.expectEqual(@as(u64, 500), cp.position_ms);
+    try testing.expectEqual(CastPlayback.State.paused, cp.state);
+
+    // The frame is a play_state fact, so a client can tell frame 0.
+    cl.wbuf.clearRetainingCapacity();
+    queuePlayState(cl, cp);
+    var frames: std.ArrayList(TFrame) = .empty;
+    defer freeFrames(a, &frames);
+    try takeFrames(a, cl, &frames);
+    try testing.expect(std.mem.indexOf(u8, frames.items[0].payload, "\"frame\":2") != null);
+}
+
+test "play_control ignores unknown ops and rejects malformed payloads" {
+    const a = testing.allocator;
+    const d = try newTestDaemon(a);
+    defer d.deinit();
+    const path = try writeTempCast(a, simple_cast);
+    defer {
+        unlinkPath(path);
+        a.free(path);
+    }
+    const s = try spawnCast(d, path, "ops");
+    const cl = try newTestClient(d, s);
+    playControl(d, cl, "{\"op\":\"warp\"}", 1_000);
+    try testing.expectEqual(@as(usize, 0), cl.wbuf.items.len);
+    playControl(d, cl, "not json", 1_000);
+    var frames: std.ArrayList(TFrame) = .empty;
+    defer freeFrames(a, &frames);
+    try takeFrames(a, cl, &frames);
+    try testing.expectEqual(@as(usize, 1), countFrames(frames.items, .err));
 }

@@ -2,9 +2,10 @@
 //!
 //! A CastPlayerBox owns a Terminal attached to a daemon cast-playback
 //! session and renders it through a TerminalSurface in `fixed_grid`
-//! geometry, plus the transport bar (play/pause, restart, seek slider
-//! with markers, speed) and all play_state/seek/speed logic. The
-//! session is spawned ephemeral, so destroying the box kills playback.
+//! geometry, plus the transport bar (play/pause, restart, frame step,
+//! seek slider with markers, skip silence, speed) and all play_state/
+//! seek/speed logic. The session is spawned ephemeral, so destroying the
+//! box kills playback.
 //! Hosts: the standalone `sketerm play` window (`castview.zig`) and the
 //! Sketerm Viewer's cast content (`viewer.zig`).
 //!
@@ -149,9 +150,13 @@ pub const CastPlayerBox = struct {
             .restart = &srcRestart,
             .seek_to_ms = &srcSeekToMs,
             .set_speed = &srcSetSpeed,
+            .step = &srcStep,
+            .set_skip_silence = &srcSetSkipSilence,
         }, .{
             .restart_button = true,
             .speed_dropdown = true,
+            .step_buttons = true,
+            .skip_silence_toggle = true,
             .seek_throttle_ms = SEEK_THROTTLE_MS,
             .seek_guard_us = SEEK_GUARD_US,
         });
@@ -315,7 +320,7 @@ pub const CastPlayerBox = struct {
         // an unrelated push (a throttled position, or the state of an
         // EARLIER command) leaves the expectation standing.
         if (self.expected_kind) |k| {
-            if (st.kind == k) self.expected_kind = null;
+            if (st.state == k) self.expected_kind = null;
         }
 
         // Markers first: a state push that brings duration + markers
@@ -324,13 +329,13 @@ pub const CastPlayerBox = struct {
         if (st.markers.len != self.playbar.markerCount()) {
             if (self.allocator.alloc(u64, st.markers.len)) |ms| {
                 defer self.allocator.free(ms);
-                for (st.markers, ms) |m, *slot| slot.* = m.ms;
+                for (st.markers, ms) |m, *slot| slot.* = m[0];
                 self.playbar.setMarkers(ms);
             } else |_| {}
         }
 
         self.playbar.setState(.{
-            .kind = switch (st.kind) {
+            .kind = switch (st.state) {
                 .playing => .playing,
                 .paused => .paused,
                 .seeking => .seeking,
@@ -338,6 +343,11 @@ pub const CastPlayerBox = struct {
             },
             .position_ms = st.position_ms,
             .duration_ms = st.duration_ms,
+            .skip_silence = st.skip_silence,
+            // A seek in flight still takes steps (the daemon queues
+            // them); otherwise frame 0 and the end are the limits.
+            .can_step_back = st.state == .seeking or st.frame > 0,
+            .can_step_forward = st.state != .finished,
         });
 
         if (self.callbacks.on_state) |cb| cb(self.callbacks.ctx, st);
@@ -359,7 +369,7 @@ pub const CastPlayerBox = struct {
         // Sessions auto-play on first attach, so "no state yet" reads
         // as playing.
         const st = self.terminal.last_play_state orelse return .playing;
-        return st.kind;
+        return st.state;
     }
 
     /// Remember what the last transport command asked for, so the next
@@ -374,28 +384,46 @@ pub const CastPlayerBox = struct {
         switch (self.playKind()) {
             .playing, .seeking => {
                 self.expect(.paused);
-                self.terminal.sendPlayControl(.pause, 0, 0);
+                self.terminal.sendPlayControl(.pause);
             },
             .paused => {
                 self.expect(.playing);
-                self.terminal.sendPlayControl(.play, 0, 0);
+                self.terminal.sendPlayControl(.play);
             },
             .finished => {
                 self.expect(.playing);
-                self.terminal.sendPlayControl(.restart, 0, 0);
+                self.terminal.sendPlayControl(.restart);
             },
         }
     }
 
     pub fn restart(self: *CastPlayerBox) void {
         self.expect(.playing);
-        self.terminal.sendPlayControl(.restart, 0, 0);
+        self.terminal.sendPlayControl(.restart);
     }
 
     /// Keyboard seeks route through the playbar so its guard timestamp
     /// keeps stale throttled play_state pushes off the thumb.
     pub fn seekRelative(self: *CastPlayerBox, delta_ms: i64) void {
         self.playbar.seekRelative(delta_ms);
+    }
+
+    /// One frame (screen-changing event) forward or back.
+    pub fn stepFrame(self: *CastPlayerBox, forward: bool) void {
+        self.terminal.sendPlayControl(if (forward) .step_forward else .step_back);
+    }
+
+    /// Key bindings every cast host shares: S toggles skip silence.
+    /// Frame-step keys are per host, like the seek keys. Hosts call this
+    /// before their own bindings and stop when it returns true.
+    pub fn handleSharedKey(self: *CastPlayerBox, keyval: c.guint) bool {
+        switch (keyval) {
+            // Through the toggle, so the button shows the new state and
+            // its handler sends the one command.
+            c.GDK_KEY_s, c.GDK_KEY_S => self.playbar.toggleSkipSilence(),
+            else => return false,
+        }
+        return true;
     }
 
     // ── playbar source vtable ────────────────────────────────────
@@ -412,11 +440,21 @@ pub const CastPlayerBox = struct {
 
     fn srcSeekToMs(ctx: ?*anyopaque, target_ms: u64) void {
         const self = cast.userData(CastPlayerBox, ctx);
-        self.terminal.sendPlayControl(.seek, target_ms, 0);
+        self.terminal.sendPlayControl(.{ .seek = target_ms });
+    }
+
+    fn srcStep(ctx: ?*anyopaque, forward: bool) void {
+        const self = cast.userData(CastPlayerBox, ctx);
+        self.stepFrame(forward);
+    }
+
+    fn srcSetSkipSilence(ctx: ?*anyopaque, on: bool) void {
+        const self = cast.userData(CastPlayerBox, ctx);
+        self.terminal.sendPlayControl(.{ .skip_silence = on });
     }
 
     fn srcSetSpeed(ctx: ?*anyopaque, speed: f64) void {
         const self = cast.userData(CastPlayerBox, ctx);
-        self.terminal.sendPlayControl(.speed, 0, speed);
+        self.terminal.sendPlayControl(.{ .speed = speed });
     }
 };

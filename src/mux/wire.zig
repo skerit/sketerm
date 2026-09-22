@@ -194,8 +194,8 @@ pub const FrameType = enum(u8) {
     /// Attach-scoped: served by the worker owning the session.
     app_debug = 29,
     /// Playback control for the ATTACHED cast-playback session. JSON
-    /// { op, ms?, speed? } where op ∈ play|pause|restart|seek|speed
-    /// (seek uses `ms`, speed uses `speed`, clamped to [0.1, 10]).
+    /// { op, ms?, speed?, on? }; the ops and the field each one carries
+    /// are `PlayCommand`, the one home both ends encode and decode with.
     /// Silently ignored for PTY sessions and by older daemons — only
     /// sent when the welcome advertises `cast_playback:true`. Answered
     /// by a `play_state` broadcast, never ok/err.
@@ -377,9 +377,7 @@ pub const FrameType = enum(u8) {
     app_debug_data = 93,
     /// Playback state of a cast-playback session, pushed to every
     /// attached client on state changes and throttled (>=500ms apart)
-    /// while playing: JSON { state:"playing"|"paused"|"seeking"|
-    /// "finished", position_ms, duration_ms (null until EOF is known),
-    /// speed, markers:[[ms,"label"],...] }. Sent once per attach.
+    /// while playing. JSON schema: `PlayState`. Sent once per attach.
     play_state = 94,
     /// Correlated native-panel RPC result accepted only from the selected
     /// presenter and restored to the requester's original caller id.
@@ -1409,6 +1407,127 @@ pub const RenameReq = struct {
     name: []const u8 = "",
     new_name: []const u8 = "",
 };
+
+/// `play_state.state` of a cast-playback session.
+pub const PlayKind = enum { playing, paused, seeking, finished };
+
+/// `play_state` payload: the one schema the daemon writes and every client
+/// parses.
+pub const PlayState = struct {
+    pub const Kind = PlayKind;
+    /// `[ms, label]` on the wire.
+    pub const Marker = struct { u64, []const u8 };
+
+    state: Kind,
+    position_ms: u64 = 0,
+    /// Null until the daemon's background scan or playback reaches EOF.
+    duration_ms: ?u64 = null,
+    speed: f64 = 1.0,
+    skip_silence: bool = false,
+    /// Screen-changing events applied so far: the frame `step_forward`
+    /// and `step_back` move from.
+    frame: u64 = 0,
+    markers: []const Marker = &.{},
+};
+
+/// One `play_control` request; the tag is the JSON `op`.
+pub const PlayCommand = union(enum) {
+    play,
+    pause,
+    restart,
+    /// One frame (screen-changing event) forward.
+    step_forward,
+    step_back,
+    /// Cast time, JSON `ms`.
+    seek: u64,
+    /// JSON `speed`; the daemon clamps it to [0.1, 10].
+    speed: f64,
+    /// JSON `on`.
+    skip_silence: bool,
+
+    /// Render the payload into `buf`: the op plus its own field only.
+    pub fn encode(self: PlayCommand, buf: []u8) ?[]const u8 {
+        const op = @tagName(self);
+        return switch (self) {
+            .seek => |ms| std.fmt.bufPrint(buf, "{{\"op\":\"{s}\",\"ms\":{d}}}", .{ op, ms }),
+            .speed => |x| std.fmt.bufPrint(buf, "{{\"op\":\"{s}\",\"speed\":{d}}}", .{ op, x }),
+            .skip_silence => |on| std.fmt.bufPrint(buf, "{{\"op\":\"{s}\",\"on\":{}}}", .{ op, on }),
+            .play, .pause, .restart, .step_forward, .step_back => std.fmt.bufPrint(buf, "{{\"op\":\"{s}\"}}", .{op}),
+        } catch null;
+    }
+
+    /// Parse a payload.
+    /// @return null for an op this build does not know, which the daemon
+    /// ignores rather than answers (play_control is never answered with
+    /// ok/err, and ops are append-only).
+    pub fn decode(allocator: std.mem.Allocator, payload: []const u8) error{BadRequest}!?PlayCommand {
+        const Raw = struct { op: []const u8 = "", ms: u64 = 0, speed: f64 = 1.0, on: bool = false };
+        const parsed = std.json.parseFromSlice(Raw, allocator, payload, .{
+            .ignore_unknown_fields = true,
+        }) catch return error.BadRequest;
+        defer parsed.deinit();
+        const raw = parsed.value;
+        const tag = std.meta.stringToEnum(std.meta.Tag(PlayCommand), raw.op) orelse return null;
+        return switch (tag) {
+            .seek => .{ .seek = raw.ms },
+            .speed => .{ .speed = raw.speed },
+            .skip_silence => .{ .skip_silence = raw.on },
+            inline .play, .pause, .restart, .step_forward, .step_back => |t| @unionInit(PlayCommand, @tagName(t), {}),
+        };
+    }
+};
+
+test "every play_control op round-trips, carrying only its own field" {
+    const t = std.testing;
+    var buf: [96]u8 = undefined;
+    inline for (@typeInfo(PlayCommand).@"union".fields) |f| {
+        const cmd = @unionInit(PlayCommand, f.name, switch (f.type) {
+            void => {},
+            u64 => 12_500,
+            f64 => 2.5,
+            bool => true,
+            else => @compileError("give play_control op '" ++ f.name ++ "' a sample value"),
+        });
+        const payload = cmd.encode(&buf).?;
+        try t.expectEqual(cmd, (try PlayCommand.decode(t.allocator, payload)).?);
+    }
+    try t.expectEqualStrings("{\"op\":\"seek\",\"ms\":12500}", (PlayCommand{ .seek = 12_500 }).encode(&buf).?);
+    try t.expectEqualStrings("{\"op\":\"speed\",\"speed\":2}", (PlayCommand{ .speed = 2.0 }).encode(&buf).?);
+    try t.expectEqualStrings("{\"op\":\"skip_silence\",\"on\":true}", (PlayCommand{ .skip_silence = true }).encode(&buf).?);
+    try t.expectEqualStrings("{\"op\":\"step_back\"}", (PlayCommand{ .step_back = {} }).encode(&buf).?);
+    // Unknown ops are ignored, malformed payloads are an error.
+    try t.expectEqual(@as(?PlayCommand, null), try PlayCommand.decode(t.allocator, "{\"op\":\"warp\"}"));
+    try t.expectError(error.BadRequest, PlayCommand.decode(t.allocator, "not json"));
+}
+
+test "play_state carries the state as its name and markers as [ms, label]" {
+    const t = std.testing;
+    var aw: std.Io.Writer.Allocating = .init(t.allocator);
+    defer aw.deinit();
+    const markers = [_]PlayState.Marker{.{ 1500, "half" }};
+    try std.json.Stringify.value(PlayState{
+        .state = .seeking,
+        .position_ms = 900,
+        .duration_ms = 30_000,
+        .frame = 3,
+        .markers = &markers,
+    }, .{}, &aw.writer);
+    const json = aw.written();
+    try t.expect(std.mem.indexOf(u8, json, "\"state\":\"seeking\"") != null);
+    try t.expect(std.mem.indexOf(u8, json, "\"markers\":[[1500,\"half\"]]") != null);
+
+    const back = try std.json.parseFromSlice(PlayState, t.allocator, json, .{ .ignore_unknown_fields = true });
+    defer back.deinit();
+    try t.expectEqual(PlayKind.seeking, back.value.state);
+    try t.expectEqual(@as(?u64, 30_000), back.value.duration_ms);
+    try t.expectEqual(@as(u64, 3), back.value.frame);
+    try t.expectEqualStrings("half", back.value.markers[0][1]);
+    // A state name this build does not know fails the parse.
+    if (std.json.parseFromSlice(PlayState, t.allocator, "{\"state\":\"warping\"}", .{})) |p| {
+        p.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
 
 /// Bounded per-stream audio identity reported by a session's internal
 /// PulseAudio server (re-exported by pulse.zig, which fills it).

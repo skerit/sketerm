@@ -2109,7 +2109,7 @@ fn onCastState(user: ?*anyopaque, st: Terminal.PlayState) void {
     const self = cast.userData(ViewerWindow, user);
     const title = self.cast_title[0..self.cast_title_len];
     var buf: [700:0]u8 = undefined;
-    const suffix: []const u8 = switch (st.kind) {
+    const suffix: []const u8 = switch (st.state) {
         .paused => "  Paused",
         .finished => "  Finished",
         .seeking => "  Seeking...",
@@ -2334,9 +2334,12 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
     }
     // Cast content: Left/Right stay batch navigation (consistency in
     // mixed batches — the STANDALONE play window seeks with arrows);
-    // seeking is ,/. (5s) and </> (30s), Space toggles, R restarts.
+    // seeking is ,/. (5s) and </> (30s), Space toggles, R restarts;
+    // the box adds the bindings every cast host shares. With ,/. taken by
+    // the seeks (as for video), frame stepping stays on the bar's buttons.
     switch (self.content) {
         .cast => |box| {
+            if (box.handleSharedKey(keyval)) return 1;
             switch (keyval) {
                 c.GDK_KEY_Left => self.move(-1),
                 c.GDK_KEY_Right => self.move(1),
