@@ -4001,14 +4001,6 @@ pub const Manager = struct {
         }
     }
 
-    pub fn popupOpen(self: *const Manager) bool {
-        return self.list.open;
-    }
-
-    pub fn hoverOpen(self: *const Manager) bool {
-        return self.hover.open;
-    }
-
     /// Narrow `shown` to the labels matching the typed filter.
     ///
     /// The MATCHER is the shared `suggest.subsequenceMatch` — this file
@@ -4223,10 +4215,6 @@ pub const Manager = struct {
         if (!self.sig.open) return;
         self.sig.open = false;
         if (self.sig.popover) |p| c.gtk_popover_popdown(@ptrCast(p));
-    }
-
-    pub fn signatureOpen(self: *const Manager) bool {
-        return self.sig.open;
     }
 
     pub fn closeHover(self: *Manager) void {

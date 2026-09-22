@@ -481,21 +481,12 @@ pub const TreeNode = struct {
         return std.mem.span(p);
     }
 
-    pub fn isNamed(self: TreeNode) bool {
-        return ts.ts_node_is_named(self.raw);
-    }
-
     pub fn startByte(self: TreeNode) usize {
         return ts.ts_node_start_byte(self.raw);
     }
 
     pub fn endByte(self: TreeNode) usize {
         return ts.ts_node_end_byte(self.raw);
-    }
-
-    /// 0-based row of the node's first byte.
-    pub fn startRow(self: TreeNode) usize {
-        return ts.ts_node_start_point(self.raw).row;
     }
 
     pub fn namedChildCount(self: TreeNode) u32 {

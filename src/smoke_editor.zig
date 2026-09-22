@@ -3,7 +3,7 @@
 //! editor_layout (bidi + tabs + cluster map + cache), editor_pass
 //! (instanced GPU pass with gutter, selections, carets).
 //!
-//! EGL surfaceless context, same pattern as spike-editor-text. Exits 0
+//! EGL surfaceless context (smoke/eglboot.zig). Exits 0
 //! on PASS; writes zig-out/smoke-editor.png for visual inspection.
 
 const std = @import("std");

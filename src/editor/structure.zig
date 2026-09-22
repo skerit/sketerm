@@ -83,10 +83,6 @@ pub const FoldRegion = struct {
     pub fn hides(self: FoldRegion, line: usize) bool {
         return line > self.start_line and line <= self.end_line;
     }
-
-    pub fn hiddenCount(self: FoldRegion) usize {
-        return self.end_line - self.start_line;
-    }
 };
 
 // ======================================================================

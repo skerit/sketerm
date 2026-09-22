@@ -714,10 +714,6 @@ pub const Rope = struct {
         }
         return s;
     }
-
-    pub fn leafCount(self: *const Rope) usize {
-        return self.stats().leaves;
-    }
 };
 
 // ======================================================================

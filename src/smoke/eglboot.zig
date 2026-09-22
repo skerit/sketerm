@@ -1,10 +1,10 @@
 //! Surfaceless EGL bootstrap for the headless GL rigs.
 //!
-//! Seven rigs (smoke-cell, smoke-image, smoke-editor, smoke-
-//! transparency, smoke-gl-core, bench-cell-upload, spike-editor-text)
-//! all began with the same Mesa-surfaceless display acquisition, config
-//! choice, context creation and offscreen RGBA8 framebuffer. The block
-//! was byte-identical between them apart from two axes, both parameters
+//! Six rigs (smoke-cell, smoke-image, smoke-editor, smoke-
+//! transparency, smoke-gl-core, bench-cell-upload) all began with the
+//! same Mesa-surfaceless display acquisition, config choice, context
+//! creation and offscreen RGBA8 framebuffer. The block was
+//! byte-identical between them apart from two axes, both parameters
 //! here: which client API the context is for, and what a rig prints
 //! when a step fails.
 //!
