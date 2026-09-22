@@ -1,4 +1,5 @@
-//! PTY spawn / read / write.
+//! PTY spawn / read / write, for the daemon's sessions (the GUI owns
+//! no PTY).
 //!
 //! `spawn` opens a pseudo-tty pair and forks. Child sets up a
 //! controlling terminal, dup2's the slave over fds 0/1/2, and
@@ -8,7 +9,6 @@
 //! See `docs/lifecycle.md` for the full sequence and invariants.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const c = @import("c.zig").c;
 const platform = @import("util/platform.zig");
 const version = @import("version.zig");
@@ -115,19 +115,10 @@ pub const Pty = struct {
     /// Bytes that wouldn't fit a non-blocking `write` because the
     /// slave's input queue (TIOCINQ, typically 4 KiB, plus ~64 KiB of
     /// kernel flip buffers) was full. Held in user-space and drained
-    /// by `flushQueue` when the master is writable. Who notices
-    /// writability differs per build: the daemon ORs POLLOUT into its
-    /// poll set (`Daemon.tick`), the GUI arms a `g_unix_fd_add`
-    /// G_IO_OUT watch — the queue and the drain are the same code.
-    /// The queue uses `std.heap.c_allocator` so its lifetime is
-    /// independent of any caller's allocator (the GLib watch can
-    /// outlive a tab tear-down by exactly one event-loop iteration).
+    /// by `flushQueue` when the owner's poll loop sees the master
+    /// writable (the daemon ORs POLLOUT in while `queuedBytes` > 0).
+    /// Uses `std.heap.c_allocator`, independent of any caller's.
     write_queue: std.ArrayList(u8) = .empty,
-    /// GLib source id for the POLLOUT watch, or 0 when no watch is
-    /// active. `g_source_remove` ignores 0, so we don't gate the
-    /// removal on this — but the field is the canonical "is the
-    /// watch live" signal for adders. Always 0 without GLib.
-    write_watch_id: c_uint = 0,
     /// Bytes refused at `WRITE_QUEUE_CAP` since the queue last ran
     /// empty. The owner reports the first refusal of an episode
     /// (`WriteResult.first_drop`) and the total when the queue drains
@@ -488,67 +479,9 @@ pub const Pty = struct {
         }
     }
 
-    /// Same intent as `closeAndReap`, but moves the SIGHUP →
-    /// SIGTERM → SIGKILL escalation chain off the main thread via
-    /// `g_timeout_add`. The synchronous version blocks the GLib
-    /// main loop up to ~500 ms when the child ignores HUP/TERM —
-    /// closing a tab freezes the UI for half a second. This variant
-    /// closes the master fd and sends SIGHUP synchronously (cheap),
-    /// then if the child hasn't exited yet, hands a small Reaper
-    /// struct to a g_timeout that polls every 10 ms and escalates
-    /// signals over time. Caller returns immediately.
-    ///
-    /// The Reaper outlives the Pty by design — children that ignore
-    /// every signal would keep the Pty pinned in memory if it were
-    /// the owner. On app exit, any still-running children become
-    /// orphans (reparented to init) which the kernel handles. The
-    /// Reaper allocates from `std.heap.c_allocator` so its lifetime
-    /// is independent of any Terminal/Window allocator.
-    pub fn closeAndReapAsync(self: *Pty) void {
-        // Without a GLib main loop (sketerm-mux) there is nothing to
-        // schedule the Reaper on — block briefly instead.
-        if (comptime !build_options.glib) {
-            _ = self.closeAndReap();
-            return;
-        }
-        // Drop the POLLOUT watch + queued bytes BEFORE closing the
-        // master fd — once closed, the watch's callback could fire
-        // one more time and dereference a freed Pty otherwise. The
-        // watch's GDestroyNotify only frees its own ctx, not the
-        // queue or the Pty.
-        self.releaseWriteResources();
-        _ = c.close(self.master_fd);
-
-        // Most shells exit on master close (EIO on slave reads) so a
-        // synchronous WNOHANG poll usually catches it without ever
-        // scheduling a timeout. Send SIGHUP first to nudge any that
-        // don't get the EIO signal naturally (e.g. ssh sessions).
-        _ = c.kill(self.child_pid, c.SIGHUP);
-        var status: c_int = 0;
-        const r = c.waitpid(self.child_pid, &status, c.WNOHANG);
-        if (r == self.child_pid) return;
-
-        const reaper = std.heap.c_allocator.create(Reaper) catch {
-            // Allocation failure — fall back to the blocking path.
-            // Better to freeze the UI briefly than leak a child.
-            var sync_pty = Pty{ .master_fd = -1, .child_pid = self.child_pid };
-            _ = sync_pty.closeAndReap();
-            return;
-        };
-        reaper.* = .{ .pid = self.child_pid, .attempts = 0 };
-        _ = c.g_timeout_add(10, @ptrCast(&reapStep), @ptrCast(reaper));
-    }
-
-    /// Free queued bytes + cancel the POLLOUT watch. Idempotent;
-    /// called by both close paths so deinit-on-error of fresh spawns
-    /// doesn't trip on the queue's hot pointer.
+    /// Free queued bytes. Idempotent, so a close after a failed
+    /// spawn cannot trip on the queue.
     fn releaseWriteResources(self: *Pty) void {
-        if (comptime build_options.glib) {
-            if (self.write_watch_id != 0) {
-                _ = c.g_source_remove(self.write_watch_id);
-                self.write_watch_id = 0;
-            }
-        }
         self.write_queue.deinit(std.heap.c_allocator);
     }
 
@@ -572,7 +505,7 @@ pub const Pty = struct {
                 if (errn == .INTR) continue; // signal interrupted — retry
                 if (errn == .AGAIN) {
                     // Slave's input queue full. Hand the rest to the
-                    // POLLOUT drain.
+                    // owner's POLLOUT drain.
                     return self.queueBytes(bytes[written..], written);
                 }
                 // Real error (EBADF, EIO, EPIPE, ...) — return what
@@ -591,11 +524,10 @@ pub const Pty = struct {
         return self.write_queue.items.len;
     }
 
-    /// Append to the user-space queue (capped to `WRITE_QUEUE_CAP` —
-    /// further bytes are refused to bound memory in the hung-child
-    /// case) and, with GLib, arm the POLLOUT watch if it isn't
-    /// already running. Without GLib the owner's poll loop is the
-    /// wakeup (`queuedBytes` > 0 → POLLOUT → `flushQueue`).
+    /// Append to the user-space queue, capped to `WRITE_QUEUE_CAP`
+    /// (further bytes are refused to bound memory in the hung-child
+    /// case). The owner's poll loop is the wakeup: `queuedBytes` > 0
+    /// means poll for POLLOUT and call `flushQueue`.
     fn queueBytes(self: *Pty, bytes: []const u8, delivered: usize) WriteResult {
         const cap_left = WRITE_QUEUE_CAP -| self.write_queue.items.len;
         var take = @min(bytes.len, cap_left);
@@ -609,16 +541,6 @@ pub const Pty = struct {
         const dropped = bytes.len - take;
         const first_drop = dropped > 0 and self.dropped_since_full == 0;
         self.dropped_since_full += dropped;
-        if (comptime build_options.glib) {
-            if (self.write_watch_id == 0 and self.write_queue.items.len > 0) {
-                self.write_watch_id = c.g_unix_fd_add(
-                    self.master_fd,
-                    c.G_IO_OUT | c.G_IO_HUP | c.G_IO_ERR,
-                    @ptrCast(&drainWatchCb),
-                    @ptrCast(self),
-                );
-            }
-        }
         return .{ .delivered = delivered, .queued = take, .dropped = dropped, .first_drop = first_drop };
     }
 
@@ -667,79 +589,7 @@ pub const Pty = struct {
         return lost;
     }
 
-    /// GLib POLLOUT-handler entry point: `flushQueue` behind a
-    /// `g_unix_fd_add` watch; removes the watch (returns false) once
-    /// the queue is empty or the master is dead.
-    fn drainWatchCb(_: c_int, condition: c.GIOCondition, user: ?*anyopaque) callconv(.c) c.gboolean {
-        const self: *Pty = @ptrCast(@alignCast(user.?));
-        // HUP / ERR: child died or pipe broke. Drop everything.
-        if ((condition & (c.G_IO_HUP | c.G_IO_ERR)) != 0) {
-            _ = self.discardQueue();
-            self.write_watch_id = 0;
-            return 0;
-        }
-        switch (self.flushQueue()) {
-            .blocked => return 1,
-            .drained, .failed => {
-                self.write_watch_id = 0;
-                return 0;
-            },
-        }
-    }
 };
-
-/// Outlives the Pty that schedules it. Iterates a g_timeout polling
-/// `waitpid(WNOHANG)` and escalating signals at fixed tick counts.
-/// Allocated via `std.heap.c_allocator` so its lifetime is decoupled
-/// from any Terminal/Window allocator.
-const Reaper = struct {
-    pid: c.pid_t,
-    attempts: u32,
-};
-
-const REAP_SIGTERM_TICK: u32 = 30; // 300 ms after SIGHUP
-const REAP_SIGKILL_TICK: u32 = 50; // 500 ms after SIGHUP
-const REAP_GIVEUP_TICK: u32 = 200; // 2 s — orphan; kernel reaps at app exit
-
-fn reapStep(user: ?*anyopaque) callconv(.c) c.gboolean {
-    const r: *Reaper = @ptrCast(@alignCast(user.?));
-    var status: c_int = 0;
-    const w = c.waitpid(r.pid, &status, c.WNOHANG);
-    if (w == r.pid) {
-        // Sweep the (now leaderless but still live) process group so a
-        // forked worker cannot outlive the session — see signalTree.
-        if (r.attempts >= REAP_SIGTERM_TICK) _ = c.kill(-r.pid, c.SIGKILL);
-        std.heap.c_allocator.destroy(r);
-        return 0; // G_SOURCE_REMOVE
-    }
-    if (w < 0) {
-        const errn = std.posix.errno(w);
-        // EINTR — retry on next tick. ECHILD or anything else means
-        // the child is unreachable; give up rather than spin forever.
-        if (errn != .INTR) {
-            std.heap.c_allocator.destroy(r);
-            return 0;
-        }
-    }
-    r.attempts += 1;
-    switch (r.attempts) {
-        REAP_SIGTERM_TICK => {
-            if (c.kill(-r.pid, c.SIGTERM) < 0) _ = c.kill(r.pid, c.SIGTERM);
-        },
-        REAP_SIGKILL_TICK => {
-            if (c.kill(-r.pid, c.SIGKILL) < 0) _ = c.kill(r.pid, c.SIGKILL);
-        },
-        REAP_GIVEUP_TICK => {
-            // 2 s of failed kills — child is in an unkillable state
-            // (uninterruptible sleep, kernel D-state, or PID re-used).
-            // Orphan it; init will reap when sketerm exits.
-            std.heap.c_allocator.destroy(r);
-            return 0;
-        },
-        else => {},
-    }
-    return 1; // G_SOURCE_CONTINUE
-}
 
 test "writeAll: input past a sleeping child is queued, never spun on or lost" {
     const clock = @import("util/clock.zig");

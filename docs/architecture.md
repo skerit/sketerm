@@ -12,7 +12,7 @@ src/
 ├── c.zig                   @cImport bundle for the GUI target
 ├── config.zig              config.conf loader + ProfileSettings
 ├── pty.zig                 PTY spawn + read loop (daemon side)
-├── terminal.zig            one Screen + parser + Remote connection
+├── terminal.zig            one mirror Screen + its Remote session connection
 ├── layout.zig              tab/pane tree ↔ JSON persistence
 │
 ├── parser/                 VT state machine → Event; sixel, kitty and
@@ -31,7 +31,7 @@ src/
 │                           (see src/web/CLAUDE.md). Its own binary.
 ├── render/                 atlas, GL wrapper, grid/cell/image/bg passes,
 │                           shader passes, editor text layout.
-├── ui/                     everything GTK: app, window, tab, pane,
+├── ui/                     everything GTK: window, pane,
 │                           terminal_surface, the faces (browser/, panel/,
 │                           editor*, webface), prefs, menus, palette.
 └── util/                   platform primitives, codecs, recording,
@@ -141,16 +141,17 @@ that ends.
 
 ## Allocator strategy
 
-Zig's explicit allocation discipline, three domains:
+Zig's explicit allocation discipline, two domains:
 
 1. **App allocator** — the process `GeneralPurposeAllocator`. All
    long-lived state (windows, tab trees, screens, scrollback, image
-   textures). Main thread only in the GUI.
-2. **Parse arena** — `std.heap.ArenaAllocator` for transient event
-   payloads (CSI params, short OSC strings), reset once per drain
-   rather than per event or per connection. This lives with the
-   parser, which means the daemon.
-3. **Config arena** — `applyConfigChange` clones the config into a
+   textures). Main thread only in the GUI. A daemon session parses
+   with its own general allocator too (`daemon_sessions.zig`); there
+   is no per-drain arena. An `Event`'s variable-length payload (OSC,
+   APC and DCS bodies) is a heap slice the event owns, freed by
+   `Event.deinit` right after it is applied or put on the wire; CSI
+   parameters are fixed-size and never allocate.
+2. **Config arena** — `applyConfigChange` clones the config into a
    fresh arena and frees the old one, so anything holding
    config-arena slices must be re-pointed in that same loop.
 
@@ -208,11 +209,11 @@ Each `Cell` is:
 
 ```zig
 pub const Cell = extern struct {
-    rune_or_cluster: u32,     // scalar codepoint or ClusterId in rune_pool
-    style_ref: u16,           // index into StyleEntry pool (fg+bg+attrs)
-    flags: u8,                // bits: is_cluster | has_link | has_image |
-                              //       is_wide_left | is_wide_cont | …
-    reserved: u8,
+    rune: u32,                // Unicode codepoint (0 = blank)
+    style_ref: u16,           // index into the StylePool (fg+bg+attrs)
+    flags: u8,                // bits: wide left/continuation, has_link,
+                              //       has_image, is_cluster, ...
+    reserved: u8,             // OSC 8 link id while has_link is set
 };
 comptime {
     std.debug.assert(@sizeOf(Cell) == 8);
@@ -228,15 +229,19 @@ C ABI — `extern struct`. The comptime assert locks the size.
 **8 bytes flat.** At 200 cols × 10 000 scrollback = **16 MB** per
 screen. Tight.
 
-Side tables (all main-thread-owned, per-pane):
+Side tables (all on `Screen`, per pane, main-thread-owned in the GUI):
 
-- `rune_pool: AutoHashMap(ClusterId, []const u21)` — interned
-  grapheme clusters.
-- `style_pool: ArrayList(StyleEntry)` — interned `{fg, bg, attrs}`
-  triples; deduplicated.
-- `link_table: AutoHashMap(CellCoord, LinkId)` — sparse OSC 8 map.
-- `cell_images: AutoHashMap(CellCoord, PlacementId)` — sparse
-  image map (see `images.md`).
+- `pool` (`grid/style_pool.zig`) — interned `{fg, bg, underline
+  colour, attrs}` entries; deduplicated.
+- `links: AutoHashMap(u8, []u8)` — OSC 8 id to URI; the id rides in
+  the cell's `reserved` byte.
+- `clusters: AutoHashMap(u32, ArrayList(u32))` — the extending
+  codepoints of a multi-codepoint grapheme, keyed by `(row << 16) |
+  col`.
+- `glyphs` — the Glyph Protocol glossary (`grid/glyph_glossary.zig`).
+- Images are not in a cell side table: placements live in the pane's
+  `ImageStore` (see `images.md`), plus `virtual_placements` for kitty
+  Unicode-placeholder images.
 
 Rationale:
 - <1 % of cells carry images, OSC 8 links, or multi-codepoint
@@ -276,10 +281,12 @@ tree state on layout load. No persistence logic tangled with GTK.
 Plasma 6 Wayland is primary. GTK4 is excellent on Wayland. X11
 works via XWayland without effort. No native X11 backend.
 
-### D9 — One GtkGLArea per pane, context share group at window level
-Each pane owns its GL context; window owns the root. All contexts
-share via `gdk_gl_context_create_shared`. Atlas lives at window
-level, reachable from every pane's context.
+### D9 — One GtkGLArea per pane, nothing shared at the GL level
+Each pane owns its GL context, and each `TerminalSurface` owns its
+own `Atlas`, built in its realize handler against that context. There
+is no window-level root context and no share group: context loss on
+one pane stays local to it. See `docs/gpu.md` "Contexts and the
+atlas".
 
 Soft limit: ~32 panes per window — empirical, based on per-context
 driver overhead. Note this differs from `docs/layout.md`'s
@@ -291,9 +298,10 @@ panes) there is no issue. Above that, consolidate to one
 `docs/gpu.md` share-groups section.
 
 ### D10 — Input encoding is table-driven
-Static tables map `(keyval, modifiers, mode)` → byte sequence.
-Easy to audit against xterm's reference; easy to extend for CSI u
-(post-v1). `modifyOtherKeys=1` in v1 because emacs needs it.
+Static tables map `(keyval, modifiers, mode)` → byte sequence and
+are audited against xterm's reference; `modifyOtherKeys` and the
+kitty keyboard protocol (CSI u, every progressive-enhancement flag)
+are layered on the same `input.encode` (see `docs/protocols.md`).
 
 ### D11 — Screen buffer reflows on resize (not truncate)
 Alacritty-style reflow: lines re-wrap to new width; content
@@ -370,14 +378,28 @@ drag-and-drop onto a remote pane or "Upload File…", and download from
 "Download File…" (which opens the `src/ui/remote_browser.zig` picker); a
 tab progress ring + `AdwToastOverlay` report both.
 
-**GUI side.** `Terminal.initRemote` builds a Terminal with no PTY
-and no worker thread: the connection fd is watched via
+**Broker and workers.** The default local daemon is a BROKER plus
+one WORKER process per session (`SKETERM_NO_BROKER=1` selects the
+single-process monolith). The broker holds no session state: it
+listens, accepts, spawns, answers `list` from metadata the workers
+push, is the authority for renames, and routes attaches. A worker is
+the same `Daemon` machinery with exactly one session (its PTY,
+parser, authoritative Screen, Wayland hub and channels), forked
+without exec, and fed clients through a control socketpair
+(`platform.controlSocketpair`) instead of `accept`: on attach the
+broker passes the client's socket fd over `SCM_RIGHTS`, so the hot
+path is client to worker directly, with no relay. A worker crash, OOM
+or hang is contained to its session. `zig build smoke-broker` guards
+the split; `src/mux/CLAUDE.md` holds its invariants.
+
+**GUI side.** `Terminal.initRemote` builds a Terminal with no PTY,
+no parser and no worker thread: the connection fd is watched via
 `g_unix_fd_add` on the main loop, EVENTS frames apply directly to
 `Screen`, SNAPSHOT swaps the screen wholesale. `writeRaw` /
-`requestResize` abstract PTY-vs-socket so `src/ui` never touches
-`terminal.pty`. Remote terminals have `child_pid = -1`; exit-reaping
-guards on `child_pid <= 0` (a `waitpid(-1)` would reap arbitrary
-GUI children).
+`requestResize` send INPUT / RESIZE frames. The GUI holds no `Pty`
+at all; the daemon-side `Pty.reap` / `closeAndReap` keep their
+`child_pid <= 0` guard because a `waitpid(-1)` there would reap an
+unrelated child (another session's).
 
 **Failure boundary.** GUI crash/restart/disconnect: sessions
 survive, reattach restores screen + scrollback exactly. Daemon
@@ -432,18 +454,18 @@ taskbar application and can be set as the system default browser.
 
 ## Module ownership
 
-- `ui/app.zig` — owns `AdwApplication`, spawns windows.
-- `ui/window.zig` — owns `AdwApplicationWindow`, the root
-  `GdkGLContext`, `AdwTabView`, shared atlas.
-- `ui/tab.zig` — owns one `pane_tree` and the sticky tab title.
+- `main.zig` — owns the `AdwApplication` and spawns windows.
+- `ui/window.zig` — owns `AdwApplicationWindow`, `AdwTabView`, and
+  one `PaneTree` model per tab (`ui/tree.zig`, attached to its
+  `AdwTabPage` as qdata so it travels with a dragged tab).
 - `ui/pane.zig` — owns one `Terminal`, one `TerminalSurface` (by
   value), and the pane's faces (file browser, editor, panel,
   app embed, web).
 - `ui/terminal_surface.zig` — owns the pane's `GtkGLArea` and its
-  GL lifecycle, the render passes, one `ImageStore`, and the
-  visual timers (cursor blink, trail, bell).
-- `terminal.zig` — owns one `parser.State`, one `Screen`, and the
-  `Remote` connection to the daemon. It owns NO pty and no worker
+  GL lifecycle, its `Atlas`, the render passes, one `ImageStore`,
+  and the visual timers (cursor blink, trail, bell).
+- `terminal.zig` — owns one mirror `Screen` and the `Remote`
+  connection to the daemon. It owns NO pty, no parser and no worker
   thread: the PTY read and the parse both happen in `sketerm-mux`,
   and what arrives here is already-parsed events.
 - `grid/screen.zig` — owns active screen, alternate screen,
@@ -454,8 +476,8 @@ taskbar application and can be set as the system default browser.
 - `ui/webface.zig` — owns one browser view and the client shared by
   every web face in the process; the CEF engine itself is a
   separate process.
-- `render/atlas.zig` — owned by `ui/window.zig`; shared across all
-  of the window's panes.
+- `render/atlas.zig` — owned by `ui/terminal_surface.zig`, one per
+  pane (see D9).
 
 ## Companion documents
 

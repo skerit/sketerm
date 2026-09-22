@@ -8,7 +8,6 @@ const c = @import("../c.zig").c;
 const cast = @import("../util/cast.zig");
 const confirm = @import("confirm.zig");
 const Pane = @import("pane.zig").Pane;
-const Pty = @import("../pty.zig").Pty;
 const Terminal = @import("../terminal.zig").Terminal;
 const layout_mod = @import("../layout.zig");
 const palette_mod = @import("palette.zig");

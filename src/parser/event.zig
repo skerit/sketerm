@@ -4,9 +4,9 @@
 //! (mux/wire.zig) to attached clients, which apply them to the
 //! Screen / ImageStore / etc.
 //!
-//! Owned-payload events (`osc`, `apc`, `dcs_data`) carry heap slices
-//! whose ownership transfers to the consumer. The consumer must free
-//! them after processing.
+//! Owned-payload events (`osc`, `apc`, `dcs`) carry heap slices whose
+//! ownership transfers to the consumer, which frees them with `deinit`
+//! after processing.
 
 const std = @import("std");
 
@@ -22,8 +22,8 @@ pub const Event = union(enum) {
 
     /// Run of consecutive printable bytes (0x20..0x7E and 0x80+).
     /// Cuts the per-event overhead for the common "shell prints
-    /// long line" path. Worker still emits this event but with a
-    /// fixed-size payload (no heap), so SPSC ring stays simple.
+    /// long line" path; the payload is fixed-size, so the event never
+    /// allocates.
     print_run: PrintRun,
 
     /// C0 control byte (0x00–0x1F minus ESC, plus DEL 0x7F).
@@ -46,18 +46,13 @@ pub const Event = union(enum) {
     /// `body` is heap-owned by event; consumer frees.
     dcs: DcsFull,
 
-    /// (Legacy markers, kept so existing switch arms compile.)
-    dcs_start: Dcs,
-    dcs_data: []u8,
-    dcs_end: void,
-
     /// PTY reached EOF (child closed all references to the slave).
     child_eof: i32,
 
-    /// A recoverable parser error — e.g. a DCS/OSC/APC payload that
+    /// A recoverable parser error, e.g. a DCS/OSC/APC payload that
     /// overflowed the collection buffer and was truncated. Fixed-size
-    /// (no heap), so it rides the SPSC ring and mux wire like any other
-    /// event; the consumer decides what to do (we log it main-thread).
+    /// (no heap), so it rides the mux wire like any other event; the
+    /// consumer decides what to do with it.
     parse_error: ParseError,
 
     /// Up to 64 printable bytes accumulated by the parser. After
@@ -162,7 +157,6 @@ pub const Event = union(enum) {
     pub fn deinit(self: *Event, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .osc, .apc => |o| allocator.free(o.bytes),
-            .dcs_data => |b| allocator.free(b),
             .dcs => |d| allocator.free(d.body),
             else => {},
         }

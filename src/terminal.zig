@@ -11,9 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c.zig").c;
-const Parser = @import("parser/vt.zig").Parser;
 const Event = @import("parser/event.zig").Event;
-const Pty = @import("pty.zig").Pty;
 const Screen = @import("grid/screen.zig").Screen;
 const Pool = @import("grid/style_pool.zig").Pool;
 const percent = @import("util/percent.zig");
@@ -57,7 +55,6 @@ pub const DrainHandle = struct {
 pub const Terminal = struct {
     pub const ConnectionState = enum { lost, reconnecting, retry_wait, unavailable, connected };
 
-    parser: Parser,
     /// Heap-allocated handle that outlives the Terminal so glib
     /// callbacks queued before deinit can safely run after deinit.
     /// (Async sink replies — e.g. OSC 52 clipboard reads — check
@@ -634,7 +631,6 @@ pub const Terminal = struct {
         }
 
         self.* = .{
-            .parser = Parser.init(allocator),
             .drain = drain,
             .allocator = allocator,
             .pool = pool,
@@ -1225,7 +1221,6 @@ pub const Terminal = struct {
             .on_image = sinkImage,
             .on_image_delete_full = sinkImageDeleteFull,
             .on_image_animation = sinkImageAnimation,
-            .on_decanm = sinkDecanm,
             .on_notification = sinkNotification,
             .on_progress = sinkProgress,
             .on_pointer_shape = sinkPointerShape,
@@ -1387,7 +1382,7 @@ pub const Terminal = struct {
                     frame.payload,
                     old_seq,
                     self.allocator,
-                    self.screen,
+                    self,
                     applyRemoteEvent,
                 ) catch {
                     self.transportLost("malformed event stream");
@@ -1701,8 +1696,8 @@ pub const Terminal = struct {
         if (self.on_render_request) |f| f(self.user_ctx);
     }
 
-    fn applyRemoteEvent(screen: *Screen, ev: Event) void {
-        screen.apply(ev);
+    fn applyRemoteEvent(self: *Terminal, ev: Event) void {
+        self.screen.apply(ev);
     }
 
     /// Ask the daemon to rename this remote session. The new name is
@@ -2946,15 +2941,6 @@ pub const Terminal = struct {
         if (self.on_image) |f| f(self.user_ctx, img);
     }
 
-    fn sinkDecanm(ctx: ?*anyopaque, ansi: bool) void {
-        const self: *Terminal = @ptrCast(@alignCast(ctx.?));
-        // ansi==true → leave VT52, return to ANSI/VT100. ansi==false → VT52.
-        self.parser.vt52_mode = !ansi;
-        if (ansi) {
-            self.parser.vt52_y_state = 0;
-        }
-    }
-
     fn sinkImageDeleteFull(ctx: ?*anyopaque, ev: Screen.ImageDeleteEvent) void {
         const self: *Terminal = @ptrCast(@alignCast(ctx.?));
         if (self.on_image_delete_full) |f| f(self.user_ctx, ev);
@@ -3229,7 +3215,6 @@ pub const Terminal = struct {
             self.allocator.destroy(remote);
             self.screen.deinit();
             self.pool.deinit();
-            self.parser.deinit();
             if (self.cwd) |path| self.allocator.free(path);
             self.allocator.destroy(self);
             return;

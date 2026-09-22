@@ -183,7 +183,6 @@ zig build bench-parser        # parser microbenchmark
 zig build bench-editor        # rope / document, large files
 zig build bench-cell-upload   # cell upload, GL isolated from GTK
 zig build replay -- cap.bin [cols rows]   # PTY bytes -> Screen dump
-zig build spike-shell         # headless PTY/parser/screen smoke
 ```
 
 `SKETERM_PROFILE=1` on a real run records per-pass render timings

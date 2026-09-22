@@ -1,10 +1,8 @@
-//! Screen — active + alternate screen buffers, scrollback, cursor,
-//! and the apply functions that consume parser events.
-//!
-//! v1 cuts:
-//!   - Single (active) buffer for first cut; alternate buffer added
-//!     when DECSET 1049 is wired.
-//!   - Scrollback stub (in-place capacity, no eviction yet).
+//! Screen: active + alternate screen buffers (DECSET 47/1047/1049),
+//! the scrollback ring (capacity-bounded, oldest lines evicted), the
+//! cursor, and the apply functions that consume parser events. The
+//! daemon's session owns the authoritative Screen; each attached GUI
+//! pane holds a mirror fed the same events.
 
 const std = @import("std");
 const cell_mod = @import("cell.zig");
@@ -2650,7 +2648,6 @@ pub const Screen = struct {
             .osc => |osc| self.onOsc(osc.bytes),
             .apc => |apc| self.onApc(apc.bytes),
             .dcs => |d| self.onDcs(d),
-            .dcs_start, .dcs_data, .dcs_end => {}, // legacy stubs
             .child_eof => |status| self.onChildEof(status),
             .parse_error => |pe| onParseError(pe),
         }

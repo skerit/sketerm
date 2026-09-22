@@ -491,42 +491,6 @@ pub fn build(b: *std.Build) void {
     const smoke_broker_step = b.step("smoke-broker", "Broker process-isolation end-to-end smoke (headless)");
     smoke_broker_step.dependOn(&smoke_broker_run.step);
 
-    // M0.5 GL spike — `zig build spike-gl`.
-    const spike_mod = b.createModule(.{
-        .root_source_file = b.path("src/spike_gl.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    configureSysDeps(b, spike_mod, cbindings_mod);
-    spike_mod.addImport("build_options", glib_opts_mod);
-    const spike = b.addExecutable(.{
-        .name = "sketerm-spike-gl",
-        .root_module = spike_mod,
-        .use_lld = use_lld,
-    });
-    const spike_run = b.addRunArtifact(spike);
-    const spike_step = b.step("spike-gl", "Run the M0.5 GL share-group spike");
-    spike_step.dependOn(&spike_run.step);
-
-    // Headless shell smoke runner — `zig build spike-shell`.
-    const shell_mod = b.createModule(.{
-        .root_source_file = b.path("src/spike_shell.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    configureSysDeps(b, shell_mod, cbindings_mod);
-    shell_mod.addImport("build_options", glib_opts_mod);
-    const shell = b.addExecutable(.{
-        .name = "sketerm-spike-shell",
-        .root_module = shell_mod,
-        .use_lld = use_lld,
-    });
-    const shell_run = b.addRunArtifact(shell);
-    const shell_step = b.step("spike-shell", "Headless PTY/parser/screen smoke");
-    shell_step.dependOn(&shell_run.step);
-
     // Capture replay tool — `zig build replay -- capture.bin [cols rows]`.
     const replay_mod = b.createModule(.{
         .root_source_file = b.path("src/replay.zig"),

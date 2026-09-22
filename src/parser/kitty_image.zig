@@ -2,8 +2,9 @@
 //!
 //! Wire format: `APC G key=value,key=value,…[;<base64 payload>] ST`
 //!
-//! v1 detects the command and exposes payload + key params; full
-//! placement / image-store integration is post-checkpoint.
+//! Parses one command into its action and key params plus the payload;
+//! `grid/kitty_images.zig` runs the protocol (chunking, stored images,
+//! placements, animation) on top of it.
 
 const std = @import("std");
 

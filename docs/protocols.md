@@ -100,8 +100,8 @@ overlined (subset).
 - DA3 (`CSI = c`) - **no response at all**; the spec allows this
 - DSR (`CSI 5n` / `CSI 6n`) — device status / cursor position
 - XTVERSION (`CSI > 0 q`) — ✓
-- XTMODKEYS (`CSI > 4 ; Pp m`) - the level is recorded; key encoding
-  does not yet act on it
+- XTMODKEYS (`CSI > 4 ; Pp m`) - sets the modifyOtherKeys level the
+  key encoder uses (see the keyboard table below); `CSI > 4 m` resets it
 
 ### Window manipulation (XTWINOPS) - read-only subset
 - `CSI 14 t` — report text-area size **in pixels**: `CSI 4 ; H ; W t`
@@ -133,7 +133,8 @@ htop and btop need the report subset for accurate rendering.
 - DECDHL / DECDWL (double-height / double-width lines).
 - DECSCNM (reverse-video mode).
 - DECCOLM (80/132 column, gated behind DECSET 40).
-- VT52 mode (DECRST 2 enters VT52, DECSET 2 returns to ANSI).
+- VT52 mode (DECRST 2 enters VT52, DECSET 2 returns to ANSI). The
+  switch happens in the parser, which runs in the daemon session.
 
 ## OSC sequences
 
@@ -266,8 +267,12 @@ without effect.
   `d` (delete), `q` (query support), `f` (frame data),
   `a` (animation control).
 - Formats: `f=32` RGBA, `f=24` RGB, `f=100` PNG.
-- Media: `t=d` direct inline, `t=t` tempfile (read then unlink),
-  `t=f` file path. `t=s` (shared memory) is NOT supported.
+- Media: `t=d` direct inline, `t=t` tempfile (read, then unlinked
+  only when its path contains `tty-graphics-protocol`, per the spec's
+  safety rule), `t=f` file path, `t=s` POSIX shared memory (the named
+  object under `/dev/shm`). The three path media are resolved by the
+  host that applies the APC: the daemon inlines them for its attached
+  clients, which never open a path themselves.
 - Compression: `o=z` zlib via `std.compress.flate`.
 - Chunked transmit via `m=1` / `m=0`.
 - Placement IDs, image IDs, z-index — all per spec.
@@ -297,20 +302,20 @@ without effect.
 | Query                           | Response                                                   |
 |---------------------------------|------------------------------------------------------------|
 | DA1 (`CSI c`)                   | `CSI ? 62 ; 4 ; 22 c` - VT220 + sixel + ANSI color         |
-| DA2 (`CSI > c`)                 | `CSI > 42 ; 1 ; 0 c` - vendor id 42 = sketerm              |
+| DA2 (`CSI > c`)                 | `CSI > 42 ; V ; 0 c` - vendor id 42 = sketerm, V = major*10000 + minor*100 + patch |
 | DA3 (`CSI = c`)                 | no response                                                |
 | DSR cursor (`CSI 6 n`)          | `CSI row ; col R`                                          |
-| XTVERSION (`CSI > 0 q`)         | `DCS > \|sketerm 0.1.0 ESC \\`                             |
+| XTVERSION (`CSI > 0 q`)         | `DCS > \|sketerm <version> ESC \\` (e.g. `sketerm 0.1.5`)  |
 | Kitty query (`APC G a=q,i=1 ; ...`) | per Kitty spec: `OK` or diagnostic              |
 | CSI 14 t                        | `CSI 4 ; H ; W t` (pixels)                                 |
 | CSI 18 t                        | `CSI 8 ; rows ; cols t`                                    |
 | CSI 19 t                        | `CSI 9 ; rows ; cols t`                                    |
 | Focus in/out                    | `CSI I` / `CSI O` (when mode 1004 enabled)                 |
 
-**Version strings are hardcoded.** Both the DA2 payload and
-XTVERSION carry literal constants in `screen_ops.zig` rather than
-`version.string`, so they do not track `.version` in
-`build.zig.zon`. Anything parsing them is reading a fixed value.
+**Version strings follow the build.** The DA2 payload and XTVERSION
+are built at comptime in `screen_ops.zig` from `version.string`, so
+they track `.version` in `build.zig.zon`; nothing else needs editing
+on a version bump.
 
 ## Environment variables set for child
 

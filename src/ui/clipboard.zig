@@ -1,7 +1,10 @@
-//! Clipboard bridge: paste from GdkClipboard → PTY (with bracketed
-//! paste markers when mode 2004 enabled).
-//!
-//! Copy uses GdkClipboard.set_text. Selection model arrives later.
+//! GDK clipboard bridge for the whole GUI, not only the terminal:
+//! an async text read whose liveness stays with the caller
+//! (`readFrom`), copies to CLIPBOARD and PRIMARY, and the terminal
+//! paste path, which writes the text to the session with the
+//! bracketed-paste markers when mode 2004 is on. What gets copied
+//! comes from the caller; for a terminal that is the Screen's
+//! selection model (`grid/selection.zig`).
 
 const std = @import("std");
 const c = @import("../c.zig").c;

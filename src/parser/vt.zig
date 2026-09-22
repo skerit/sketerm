@@ -102,8 +102,7 @@ pub const Parser = struct {
         self.osc_buf.deinit(self.allocator);
     }
 
-    /// Feed bytes. `emit` is called on the worker thread for each
-    /// event produced.
+    /// Feed bytes; `emit` runs synchronously, once per event produced.
     pub fn advance(
         self: *Parser,
         bytes: []const u8,

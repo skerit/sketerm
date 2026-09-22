@@ -15,6 +15,8 @@ the skeleton, not the session.
 - Tab tree (ordered list of tabs), each with its sticky title,
   pinned flag, colour swatch, title-locked flag and the per-tab
   `show_activity` / `warn_inactive` toggles
+- Tree-style tab nesting: each tab's parent tab (`tree_parent`) and
+  whether its subtree was folded away (`collapsed`)
 - Per-tab split tree (nested horizontal/vertical splits with ratios)
 - Per-pane cwd and initial command (argv)
 - Per-pane profile name, font-size override, and shader pick
@@ -22,6 +24,9 @@ the skeleton, not the session.
 - Per-pane durable mux session name and transport host
 - Browser-face state (its internal tabs) and editor-face state
   (open file specs, active index, cursor offsets)
+- Web-face state: every page of the pane's browser group in strip
+  order, with its address, page zoom, scroll offset, identity
+  container and tree-style parent page, plus which page was showing
 - Schema version
 
 ### Not preserved
@@ -103,6 +108,8 @@ pub const TabSpec = struct {
     title_locked: ?bool = null,
     show_activity: bool = true,
     warn_inactive: bool = false,
+    tree_parent: ?u32 = null,       // index into `tabs`; null = root
+    collapsed: bool = false,        // subtree folded in tree-style tabs
 };
 
 pub const Tree = union(enum) { pane: PaneSpec, split: SplitSpec };
@@ -125,10 +132,38 @@ pub const PaneSpec = struct {
     mux_host: []const u8 = "",
     browser: ?browser_model.PaneState = null,
     editor: ?editor_model.PaneState = null,
+    web: ?web_model.PaneState = null,
     // plus `browser_tabs`, the compatibility reader for layouts
     // written by the first browser prototype.
 };
 ```
+
+### Tree-style tab nesting
+
+`tree_parent` is the index, in this file's `tabs` array, of the tab a
+tab nests under; `null` makes it a root. Indices name SAVED positions,
+which is why `collectLayout` records the pages it actually serialised
+(a tab with no restorable pane is skipped, so a view position is not an
+array index). On load a parent index that is out of range, points at
+the tab itself, or would close a cycle leaves the tab a root rather
+than failing the load. `collapsed` restores the fold. A file written
+before tree-style tabs existed has neither field, so every tab loads as
+a root, flat, exactly as it was saved.
+
+### Web-face state
+
+`web` is `src/web/model.zig`'s `PaneState`: `pages` lists every page
+of the pane's browser group in strip order, each a `PageState` with its
+`url`, `zoom_level_x100` (a CEF zoom LEVEL x100, not a percentage),
+`scroll_x`/`scroll_y` in the engine's own units, `container` (the
+identity container id the daemon's web store persists; one it no longer
+has restores in the default jar) and `parent` (index of its parent page
+for tree nesting, -1 for a root). `active_page` indexes the page that
+was showing. The top-level `url`, `zoom_level_x100` and `container`
+duplicate the active page so a build that knows only one page per pane
+still restores the right one; a layout written before pages existed has
+an empty `pages` and restores from those fields alone. Scroll offsets
+are replayed uninterpreted, so a restore lands where the save happened.
 
 ## Schema versioning
 
@@ -143,9 +178,8 @@ from the two mechanisms in the code instead:
   means "treat restored titles as renamed", which is what pre-field
   files did).
 
-`newTabFromSpec` carries a comment about v1-compat (flat
-cwd/command) specs, but `TabSpec.tree` has no default, so a literal
-v1 file would fail to parse; treat that path as vestigial.
+There is no v1 reader: v1 (a flat cwd/command per tab) was never
+released, so v2 is the oldest shape any user has on disk.
 
 A real bump would be needed if a field's SEMANTICS changed or the
 tree shape changed; adding optional fields with safe defaults, as

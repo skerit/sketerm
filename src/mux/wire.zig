@@ -614,9 +614,7 @@ pub const Writer = struct {
         try self.buf.appendSlice(self.allocator, b);
     }
 
-    /// Serialize one Event. Legacy markers (`dcs_start`, `dcs_data`,
-    /// `dcs_end`) are never produced by the current parser and are
-    /// not representable on the wire.
+    /// Serialize one Event.
     pub fn putEvent(self: *Writer, ev: Event) !void {
         const start = self.buf.items.len;
         errdefer self.buf.shrinkRetainingCapacity(start);
@@ -679,7 +677,6 @@ pub const Writer = struct {
                 try self.buf.append(self.allocator, @intFromEnum(EventTag.parse_error));
                 try self.buf.append(self.allocator, @intFromEnum(pe.kind));
             },
-            .dcs_start, .dcs_data, .dcs_end => return error.LegacyEventNotWireable,
         }
     }
 };

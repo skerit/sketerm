@@ -1,8 +1,10 @@
 //! Image store — per-pane decoded images + GL texture lifecycle.
 //!
-//! v1: simple list (not yet keyed by Kitty image_id; add() always
-//! creates a new entry). Pending RGBA bytes are uploaded to GL on
-//! the main thread inside the pane's render callback.
+//! An ordered list of placements, each carrying its kitty image_id and
+//! placement id (0 for sixel / iTerm2) and a line anchor so it scrolls
+//! with its content; retained pixels are bounded by `budget_bytes` with
+//! FIFO eviction. Pending RGBA bytes are uploaded to GL on the main
+//! thread inside the pane's render callback.
 
 const std = @import("std");
 const c = @import("../c.zig").c;
