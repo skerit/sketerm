@@ -3,10 +3,10 @@
 //!
 //! GTK-free and tree-sitter-free BY CONSTRUCTION. Everything here is
 //! either a plain data type the tree-backed producers in `syntax.zig`
-//! fill in, or a documented FALLBACK for the case where there is no
-//! parse tree at all (unknown language, `editor_syntax = false`, or a
-//! parse that has not caught up yet). `syntax.zig` imports this module;
-//! this module must never import `syntax.zig` back.
+//! and the lexical ones in `lexical.zig` fill in, or a documented
+//! FALLBACK for plain text (no parse tree and no language to lex by).
+//! `syntax.zig` and `lexical.zig` import this module; it must never
+//! import either back.
 //!
 //! ## Why fold state is anchored to a BYTE OFFSET, not a line number
 //!
@@ -135,14 +135,13 @@ pub fn byteAt(rope: *const Rope, offset: usize) ?u8 {
 /// the primary source anyway.
 pub const SCAN_LIMIT: usize = 256 * 1024;
 
-/// Depth-counting bracket scanner — the FALLBACK used only when there
-/// is no usable parse tree.
+/// Depth-counting bracket scanner for PLAIN TEXT: no syntax tree and no
+/// language row to lex by.
 ///
-/// Documented weakness, deliberately not papered over: it counts
-/// brackets inside strings, character literals and comments, because
-/// without a tree it has no way to know it is inside one. That is
-/// precisely the failure mode the tree path exists to avoid, so the
-/// scanner is never consulted when `syntax.zig` can answer.
+/// It counts brackets inside strings, character literals and comments,
+/// because with no language it cannot know what one looks like. A
+/// document whose language is known uses `lexical.matchBracket`, which
+/// skips them by the row's rules, and the tree path when it can answer.
 pub fn scanMatch(rope: *const Rope, offset: usize) ?BracketPair {
     const probe = bracketProbe(rope, offset) orelse return null;
     const kind = classifyBracket(probe.ch).?;

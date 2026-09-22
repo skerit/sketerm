@@ -25,6 +25,7 @@ const strz = @import("../util/strz.zig");
 const Selection = sel_mod.Selection;
 const SelectionSet = sel_mod.SelectionSet;
 const vm = @import("view_model.zig");
+const indentation = @import("indentation.zig");
 
 // ======================================================================
 // Command registry (names, palette labels, default accelerators)
@@ -55,6 +56,12 @@ pub const Command = enum {
     add_caret_above,
     add_caret_below,
     split_selection_lines,
+    indent_use_tabs,
+    indent_use_spaces,
+    indent_width_2,
+    indent_width_4,
+    indent_width_8,
+    indent_auto,
 };
 
 pub const COMMAND_COUNT: usize = @typeInfo(Command).@"enum".fields.len;
@@ -92,6 +99,12 @@ pub fn label(cmd: Command) [:0]const u8 {
         .add_caret_above => "Add Caret Above",
         .add_caret_below => "Add Caret Below",
         .split_selection_lines => "Split Selection into Line Carets",
+        .indent_use_tabs => "Indent Using Tabs",
+        .indent_use_spaces => "Indent Using Spaces",
+        .indent_width_2 => "Indent Width: 2",
+        .indent_width_4 => "Indent Width: 4",
+        .indent_width_8 => "Indent Width: 8",
+        .indent_auto => "Indent Automatically (Detect / .editorconfig)",
     };
 }
 
@@ -125,6 +138,8 @@ pub fn defaultAccel(cmd: Command) []const u8 {
         .add_caret_above => "<Control><Alt>Up",
         .add_caret_below => "<Control><Alt>Down",
         .split_selection_lines => "<Shift><Alt>i",
+        // Per-tab settings, reached from the palette; no chord.
+        .indent_use_tabs, .indent_use_spaces, .indent_width_2, .indent_width_4, .indent_width_8, .indent_auto => "",
     };
 }
 
@@ -151,6 +166,26 @@ pub fn describe(cmd: Command) [:0]const u8 {
         .add_caret_above => "Add a caret on the line above each caret, same column.",
         .add_caret_below => "Add a caret on the line below each caret, same column.",
         .split_selection_lines => "Replace each selection with one caret at the end of every line it covers.",
+        .indent_use_tabs => "Indent this tab's document with hard tabs, whatever the file or .editorconfig says.",
+        .indent_use_spaces => "Indent this tab's document with spaces, whatever the file or .editorconfig says.",
+        .indent_width_2 => "Use an indent (and tab) width of 2 columns in this tab.",
+        .indent_width_4 => "Use an indent (and tab) width of 4 columns in this tab.",
+        .indent_width_8 => "Use an indent (and tab) width of 8 columns in this tab.",
+        .indent_auto => "Drop this tab's indentation override and use .editorconfig, the file's content, then the defaults.",
+    };
+}
+
+/// The change an indentation command makes to the tab's override (a
+/// style or a width, merged over what is already overridden); null for
+/// every other command, `indent_auto` included, which clears instead.
+pub fn indentOverrideOf(cmd: Command) ?indentation.Override {
+    return switch (cmd) {
+        .indent_use_tabs => .{ .style = .tabs },
+        .indent_use_spaces => .{ .style = .spaces },
+        .indent_width_2 => .{ .width = 2 },
+        .indent_width_4 => .{ .width = 4 },
+        .indent_width_8 => .{ .width = 8 },
+        else => null,
     };
 }
 
@@ -467,46 +502,61 @@ pub fn sortLines(alloc: Allocator, doc: *Document, sels: *SelectionSet) !void {
 
 pub const CommentResult = enum { commented, uncommented, no_lines };
 
-/// Toggle `prefix` line comments on every line any selection covers.
-/// Blank lines are skipped. If every covered non-blank line is already
-/// commented the block uncomments; otherwise every non-blank line is
-/// commented (the usual mixed-selection rule).
-pub fn toggleComment(alloc: Allocator, doc: *Document, sels: *SelectionSet, prefix: []const u8) !CommentResult {
-    if (prefix.len == 0) return .no_lines;
+/// What toggle-comment writes around a line: a line token alone (`//`),
+/// or a block pair wrapped around each line (`/* ... */`) for languages
+/// with no line comment. The GUI takes it from the language registry.
+pub const CommentTokens = struct {
+    open: []const u8,
+    close: []const u8 = "",
+};
+
+/// Toggle comments on every line any selection covers. Blank lines are
+/// skipped. If every covered non-blank line is already commented the
+/// block uncomments (token plus one adjacent space); otherwise every
+/// non-blank line is commented (the usual mixed-selection rule).
+pub fn toggleComment(alloc: Allocator, doc: *Document, sels: *SelectionSet, tokens: CommentTokens) !CommentResult {
+    if (tokens.open.len == 0) return .no_lines;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const a = arena.allocator();
 
+    const Line = struct { start: usize, lead: usize, body: []const u8 };
     const lines = try coveredLines(a, doc, sels);
-    var any_content = false;
+    var content: std.ArrayList(Line) = .empty;
     var all_commented = true;
     for (lines) |l| {
         const start = doc.rope.lineToOffset(l);
-        const end = lineEndOf(doc, l);
-        const text = try doc.rope.sliceAlloc(a, start, end);
-        const trimmed = std.mem.trimStart(u8, text, " \t");
-        if (trimmed.len == 0) continue;
-        any_content = true;
-        if (!std.mem.startsWith(u8, trimmed, prefix)) all_commented = false;
+        const text = try doc.rope.sliceAlloc(a, start, lineEndOf(doc, l));
+        const lead = text.len - std.mem.trimStart(u8, text, " \t").len;
+        const body = std.mem.trimEnd(u8, text[lead..], " \t");
+        if (body.len == 0) continue;
+        try content.append(a, .{ .start = start, .lead = lead, .body = body });
+        const wrapped = std.mem.startsWith(u8, body, tokens.open) and
+            body.len >= tokens.open.len + tokens.close.len and
+            std.mem.endsWith(u8, body, tokens.close);
+        if (!wrapped) all_commented = false;
     }
-    if (!any_content) return .no_lines;
+    if (content.items.len == 0) return .no_lines;
 
     var tx = tr.Transaction.init(doc.revision);
     defer tx.deinit(alloc);
-    for (lines) |l| {
-        const start = doc.rope.lineToOffset(l);
-        const end = lineEndOf(doc, l);
-        const text = try doc.rope.sliceAlloc(a, start, end);
-        const ws = text.len - std.mem.trimStart(u8, text, " \t").len;
-        const trimmed = text[ws..];
-        if (trimmed.len == 0) continue;
+    const open_ins = try std.mem.concat(a, u8, &.{ tokens.open, " " });
+    const close_ins = try std.mem.concat(a, u8, &.{ " ", tokens.close });
+    for (content.items) |ln| {
+        const at = ln.start + ln.lead;
         if (all_commented) {
-            var del = prefix.len;
-            if (trimmed.len > del and trimmed[del] == ' ') del += 1;
-            try tx.addDelete(alloc, start + ws, del);
+            var del = tokens.open.len;
+            if (ln.body.len > del and ln.body[del] == ' ') del += 1;
+            try tx.addDelete(alloc, at, del);
+            if (tokens.close.len > 0) {
+                var cstart = ln.body.len - tokens.close.len;
+                if (cstart > del and ln.body[cstart - 1] == ' ') cstart -= 1;
+                cstart = @max(cstart, del);
+                if (ln.body.len > cstart) try tx.addDelete(alloc, at + cstart, ln.body.len - cstart);
+            }
         } else {
-            const ins = try std.mem.concat(a, u8, &.{ prefix, " " });
-            try tx.addInsert(alloc, start + ws, ins);
+            try tx.addInsert(alloc, at, open_ins);
+            if (tokens.close.len > 0) try tx.addInsert(alloc, at + ln.body.len, close_ins);
         }
     }
     try applyMapped(alloc, doc, sels, &tx);
@@ -569,22 +619,27 @@ pub fn dedentLines(alloc: Allocator, doc: *Document, sels: *SelectionSet, width:
 pub fn trimTrailingWhitespace(alloc: Allocator, doc: *Document, sels: *SelectionSet) !void {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    const a = arena.allocator();
     var tx = tr.Transaction.init(doc.revision);
     defer tx.deinit(alloc);
+    try appendTrimEdits(alloc, arena.allocator(), doc, &tx);
+    try applyMapped(alloc, doc, sels, &tx);
+}
 
+/// Append the edits that strip every line's trailing spaces and tabs to
+/// `tx` (ascending, so a caller may add later edits after them).
+/// `scratch` holds line copies and may be an arena.
+pub fn appendTrimEdits(alloc: Allocator, scratch: Allocator, doc: *const Document, tx: *tr.Transaction) !void {
     const n = doc.rope.lineCount();
     var l: usize = 0;
     while (l < n) : (l += 1) {
         const start = doc.rope.lineToOffset(l);
         const end = lineEndOf(doc, l);
         if (end <= start) continue;
-        const text = try doc.rope.sliceAlloc(a, start, end);
+        const text = try doc.rope.sliceAlloc(scratch, start, end);
         var keep = text.len;
         while (keep > 0 and isWs(text[keep - 1])) keep -= 1;
         if (keep < text.len) try tx.addDelete(alloc, start + keep, text.len - keep);
     }
-    try applyMapped(alloc, doc, sels, &tx);
 }
 
 pub const CaseMode = enum { upper, lower, title };
@@ -1176,10 +1231,24 @@ test "commands registry round trip" {
     inline for (@typeInfo(Command).@"enum".fields) |f| {
         const cmd: Command = @enumFromInt(f.value);
         try testing.expectEqual(cmd, fromName(name(cmd)).?);
-        try testing.expect(defaultAccel(cmd).len > 0);
         try testing.expect(label(cmd).len > 0);
+        try testing.expect(describe(cmd).len > 0);
+        // An empty default is a palette-only command; a chord, when
+        // there is one, belongs to exactly one command.
+        const accel = defaultAccel(cmd);
+        if (accel.len > 0) {
+            inline for (@typeInfo(Command).@"enum".fields) |g| {
+                const other: Command = @enumFromInt(g.value);
+                if (other != cmd) try testing.expect(!std.mem.eql(u8, accel, defaultAccel(other)));
+            }
+        }
     }
     try testing.expect(fromName("no_such_command") == null);
+    // Every indentation command either overrides or clears.
+    try testing.expect(indentOverrideOf(.indent_use_tabs).?.style.? == .tabs);
+    try testing.expect(indentOverrideOf(.indent_width_8).?.width.? == 8);
+    try testing.expect(indentOverrideOf(.indent_auto) == null);
+    try testing.expect(indentOverrideOf(.join_lines) == null);
 }
 
 test "commands duplicate line down moves caret to the copy" {
@@ -1351,9 +1420,9 @@ test "commands toggle comment comments and uncomments" {
     defer doc.deinit();
     var sels = try SelectionSet.initSingle(a, .{ .anchor = 0, .head = 14 });
     defer sels.deinit(a);
-    try testing.expectEqual(CommentResult.commented, try toggleComment(a, &doc, &sels, "//"));
+    try testing.expectEqual(CommentResult.commented, try toggleComment(a, &doc, &sels, .{ .open = "//" }));
     try expectText(&doc, "// one\n  // two\n// three");
-    try testing.expectEqual(CommentResult.uncommented, try toggleComment(a, &doc, &sels, "//"));
+    try testing.expectEqual(CommentResult.uncommented, try toggleComment(a, &doc, &sels, .{ .open = "//" }));
     try expectText(&doc, "one\n  two\nthree");
 }
 
@@ -1363,7 +1432,7 @@ test "commands toggle comment mixed selection comments everything" {
     defer doc.deinit();
     var sels = try SelectionSet.initSingle(a, .{ .anchor = 0, .head = 10 });
     defer sels.deinit(a);
-    try testing.expectEqual(CommentResult.commented, try toggleComment(a, &doc, &sels, "//"));
+    try testing.expectEqual(CommentResult.commented, try toggleComment(a, &doc, &sels, .{ .open = "//" }));
     try expectText(&doc, "// // one\n// two");
 }
 
@@ -1375,11 +1444,31 @@ test "commands toggle comment skips blank lines and multi-caret dedupes" {
     defer sels.deinit(a);
     try sels.add(a, Selection.caret(2)); // same line
     try sels.add(a, Selection.caret(6)); // "two"
-    _ = try toggleComment(a, &doc, &sels, "#");
+    _ = try toggleComment(a, &doc, &sels, .{ .open = "#" });
     try expectText(&doc, "# one\n\n# two");
     try vm.undo(a, &doc, &sels);
     try expectText(&doc, "one\n\ntwo");
     try testing.expectEqual(@as(usize, 3), sels.count());
+}
+
+test "commands toggle comment wraps each line in a block pair" {
+    const a = testing.allocator;
+    var doc = try docOf("a { x: 1; }\n  b { }\n");
+    defer doc.deinit();
+    var sels = try SelectionSet.initSingle(a, .{ .anchor = 0, .head = 17 });
+    defer sels.deinit(a);
+    const css = CommentTokens{ .open = "/*", .close = "*/" };
+    try testing.expectEqual(CommentResult.commented, try toggleComment(a, &doc, &sels, css));
+    try expectText(&doc, "/* a { x: 1; } */\n  /* b { } */\n");
+    try testing.expectEqual(CommentResult.uncommented, try toggleComment(a, &doc, &sels, css));
+    try expectText(&doc, "a { x: 1; }\n  b { }\n");
+    // A tight wrap without spaces uncomments too.
+    var tight = try docOf("<!--x-->");
+    defer tight.deinit();
+    var s2 = try SelectionSet.initSingle(a, Selection.caret(0));
+    defer s2.deinit(a);
+    try testing.expectEqual(CommentResult.uncommented, try toggleComment(a, &tight, &s2, .{ .open = "<!--", .close = "-->" }));
+    try expectText(&tight, "x");
 }
 
 test "commands toggle comment on blank-only selection reports no_lines" {
@@ -1388,7 +1477,7 @@ test "commands toggle comment on blank-only selection reports no_lines" {
     defer doc.deinit();
     var sels = try SelectionSet.initSingle(a, Selection.caret(0));
     defer sels.deinit(a);
-    try testing.expectEqual(CommentResult.no_lines, try toggleComment(a, &doc, &sels, "//"));
+    try testing.expectEqual(CommentResult.no_lines, try toggleComment(a, &doc, &sels, .{ .open = "//" }));
 }
 
 test "commands indent and dedent respect width and spaces" {

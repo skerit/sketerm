@@ -143,6 +143,8 @@ const lsp_pos = @import("../lsp/position.zig");
 const PickerWindow = @import("picker.zig").PickerWindow;
 const editorproj = @import("editorproj.zig");
 const editoroutline = @import("editoroutline.zig");
+const editorlang = @import("editorlang.zig");
+const doclang = @import("../editor/doclang.zig");
 const a11y = @import("../a11y/atspi.zig");
 const a11ydoc = @import("../a11y/docsource.zig");
 const docview = @import("../a11y/docview.zig");
@@ -158,9 +160,6 @@ pub const MAX_FILE_BYTES: usize = 64 << 20;
 /// single-threaded by design, so a timer is the only lever.
 const SYNC_PARSE_LIMIT: usize = 128 * 1024;
 const PARSE_DEBOUNCE_MS: c_uint = 40;
-/// Bytes of the first line inspected for a shebang when the filename
-/// carries no usable extension.
-const SHEBANG_PROBE: usize = 256;
 
 // ---- crash recovery ---------------------------------------------------
 //
@@ -263,6 +262,8 @@ const IoJob = struct {
     /// Reload that must land on the current cursor/scroll, not at the
     /// top of the document.
     keep_position: bool = false,
+    /// `.editorconfig` properties for the loaded path.
+    ec: @import("../editor/editorconfig.zig").Props = .{},
 
     fn setErr(self: *IoJob, text: []const u8) void {
         self.err_len = @min(text.len, self.err_buf.len);
@@ -362,6 +363,7 @@ fn ioThread(job: *IoJob) void {
         defer fs.deinit();
         switch (job.kind) {
             .load => {
+                job.ec = editorlang.readEditorconfig(&fs, loc.path);
                 var out: std.ArrayList(u8) = .empty;
                 var info: fsdrive.ReadInfo = .{ .size = 0, .eof = true };
                 readAllInto(&fs, loc.path, &out, MAX_FILE_BYTES, &info) catch |err| {
@@ -563,6 +565,9 @@ pub const ETab = struct {
     /// `editor_syntax = false`). Owned.
     hl: ?*syntax.Highlighter = null,
     hl_lang: ?syntax.Lang = null,
+    /// The document's language, indentation and grammar-less structure
+    /// fallbacks (editor/doclang.zig; wired by ui/editorlang.zig).
+    language: doclang.DocLang,
     /// Non-zero while a debounced re-parse is queued.
     parse_timer: c_uint = 0,
 
@@ -702,6 +707,7 @@ pub const ETab = struct {
             self.hl = null;
         }
         self.doc.clearObservers();
+        self.language.deinit();
         self.folds.deinit();
         self.fold_markers.deinit(a);
         self.brackets.deinit(a);
@@ -1195,7 +1201,8 @@ pub const EditorView = struct {
         if (font_changed) self.rebuildAtlas();
 
         for (self.tabs.items) |t| {
-            t.layout.tab_cols = self.tab_width;
+            t.language.setConfig(self.insert_spaces, self.tab_width);
+            t.layout.tab_cols = t.language.indent.tab_width;
             t.layout.theme = self.theme;
             // Language/on-off may have changed with the config; this
             // also re-invalidates the layout cache.
@@ -1247,25 +1254,14 @@ pub const EditorView = struct {
 
     // ---- syntax highlighting -------------------------------------------
 
-    /// Language for `tab`: filename first, then a shebang read out of
-    /// the document head. Null = plain text (also when highlighting is
-    /// switched off).
+    /// Grammar to highlight `tab` with. Re-detects the document's
+    /// language (name, extension, head) as a side effect, which is
+    /// tracked whether or not highlighting is on: comments, brackets,
+    /// folds and indentation need it regardless. Null = no highlighting.
     fn detectLang(self: *EditorView, tab: *ETab) ?syntax.Lang {
+        if (tab.language.detectLanguage(tab.spec, &tab.doc)) editorlang.syncIndent(self, tab);
         if (!self.syntax_on) return null;
-        var buf: [SHEBANG_PROBE]u8 = undefined;
-        var head: []const u8 = "";
-        const n = @min(buf.len, tab.doc.rope.len());
-        if (n > 0) {
-            var it = tab.doc.rope.iterateRange(0, n);
-            var w: usize = 0;
-            while (it.next()) |chunk| {
-                @memcpy(buf[w .. w + chunk.len], chunk);
-                w += chunk.len;
-            }
-            head = buf[0..w];
-            if (std.mem.indexOfScalar(u8, head, '\n')) |nl| head = head[0..nl];
-        }
-        return syntax.detect(tab.spec, head);
+        return tab.language.grammarLang();
     }
 
     fn dropHighlighter(self: *EditorView, tab: *ETab) void {
@@ -1408,7 +1404,7 @@ pub const EditorView = struct {
             return null;
         }
         if (!self.fold_indent_fallback) return null;
-        return structure.indentRegionAt(&tab.doc, line, self.tab_width);
+        return tab.language.foldRegionAtLine(&tab.doc, line);
     }
 
     /// The innermost region CONTAINING `offset` whose header is another
@@ -1419,15 +1415,7 @@ pub const EditorView = struct {
             return null;
         }
         if (!self.fold_indent_fallback) return null;
-        // Indentation fallback: walk up looking for a shallower header.
-        const line = tab.doc.rope.offsetToLineCol(offset).line;
-        var l = line;
-        while (l > 0) {
-            l -= 1;
-            const r = structure.indentRegionAt(&tab.doc, l, self.tab_width) orelse continue;
-            if (r.hides(line)) return r;
-        }
-        return null;
+        return tab.language.foldRegionEnclosing(&tab.doc, offset);
     }
 
     const FoldCtx = struct {
@@ -1532,7 +1520,7 @@ pub const EditorView = struct {
                 } else |_| {}
             }
         } else if (self.fold_indent_fallback) {
-            if (structure.indentRegions(self.allocator, &tab.doc, from, to, self.tab_width)) |r| {
+            if (tab.language.foldRegions(self.allocator, &tab.doc, from, to)) |r| {
                 regions = r;
                 owned = true;
             } else |_| {}
@@ -1660,7 +1648,7 @@ pub const EditorView = struct {
                 owned = true;
             } else |_| {}
         } else if (self.fold_indent_fallback) {
-            if (structure.indentRegions(self.allocator, &tab.doc, 0, n - 1, self.tab_width)) |r| {
+            if (tab.language.foldRegions(self.allocator, &tab.doc, 0, n - 1)) |r| {
                 regions = r;
                 owned = true;
             } else |_| {}
@@ -1687,14 +1675,15 @@ pub const EditorView = struct {
 
     /// The pair around/adjacent to `offset`. The TREE is the primary
     /// source and its "no pair" answer is final — that is what keeps a
-    /// bracket inside a string or a comment from matching. The scanner
-    /// runs only when there is no tree at all.
-    fn bracketPairAt(self: *EditorView, tab: *ETab, offset: usize) ?structure.BracketPair {
+    /// bracket inside a string or a comment from matching. Without a
+    /// current tree the language's lexical rules skip strings and
+    /// comments instead (editor/lexical.zig).
+    pub fn bracketPairAt(self: *EditorView, tab: *ETab, offset: usize) ?structure.BracketPair {
         _ = self;
         if (tab.hl) |hl| {
             if (!hl.isStale(&tab.doc)) return hl.bracketAt(&tab.doc, offset) catch null;
         }
-        return structure.scanMatch(&tab.doc.rope, offset);
+        return tab.language.matchBracket(&tab.doc, offset);
     }
 
     fn ensureBrackets(self: *EditorView, tab: *ETab) void {
@@ -2657,10 +2646,12 @@ pub const EditorView = struct {
             .sel_stack = structure.SelectionStack.init(self.allocator),
             .git = gitdiff.Marks.init(self.allocator),
             .outline = outline_mod.Outline.init(self.allocator),
+            .language = doclang.DocLang.init(self.allocator),
         };
         tab.doc.addObserver(.{ .ctx = tab, .before_apply = ETab.observeEdits });
         tab.doc.addObserver(self.a11y_src.editObserver());
-        tab.layout.tab_cols = self.tab_width;
+        tab.language.setConfig(self.insert_spaces, self.tab_width);
+        tab.layout.tab_cols = tab.language.indent.tab_width;
         tab.layout.wrap_words = self.wrap_words;
         self.next_tab_id += 1;
         if (spec) |s| tab.spec = self.allocator.dupe(u8, s) catch null;
@@ -3740,7 +3731,7 @@ pub const EditorView = struct {
         self.preedit_doc = doc;
         doc = undefined;
         self.preedit_layout = Layout.init(self.allocator, &self.book);
-        self.preedit_layout.?.tab_cols = self.tab_width;
+        self.preedit_layout.?.tab_cols = if (self.active) |t| t.language.indent.tab_width else self.tab_width;
         var byte: usize = 0;
         var seen: usize = 0;
         while (byte < span.len and seen < cursor_chars) : (seen += 1) {
@@ -4226,10 +4217,12 @@ pub const EditorView = struct {
         // document with no project reads exactly as it always did.
         var proj_buf: [160]u8 = undefined;
         const proj_note = editorproj.statusFragment(self, tab, &proj_buf);
+        var lang_buf: [96]u8 = undefined;
+        const lang_note = editorlang.statusFragment(tab, &lang_buf);
         const txt = if (carets > 1)
-            std.fmt.bufPrint(&buf, "Ln {d}, Col {d}  —  {d} carets{s}{s}{s}", .{ lc.line + 1, lc.col + 1, carets, wrap_note, lsp_note, proj_note }) catch return
+            std.fmt.bufPrint(&buf, "Ln {d}, Col {d}  —  {d} carets{s}{s}{s}{s}", .{ lc.line + 1, lc.col + 1, carets, lang_note, wrap_note, lsp_note, proj_note }) catch return
         else
-            std.fmt.bufPrint(&buf, "Ln {d}, Col {d}{s}{s}{s}", .{ lc.line + 1, lc.col + 1, wrap_note, lsp_note, proj_note }) catch return;
+            std.fmt.bufPrint(&buf, "Ln {d}, Col {d}{s}{s}{s}{s}", .{ lc.line + 1, lc.col + 1, lang_note, wrap_note, lsp_note, proj_note }) catch return;
         self.paintStatus(txt, note);
     }
 
@@ -4382,6 +4375,7 @@ pub const EditorView = struct {
             self.saveTabAs(tab);
             return;
         }
+        editorlang.beforeSave(self, tab);
         // The guarded save IS the before-save disk check: the daemon
         // compares the baseline against the destination inside the
         // install, which no client-side poll can do race-free.
@@ -4465,12 +4459,14 @@ pub const EditorView = struct {
                     // while `loading` is set, which it no longer is.
                     undelivered = false; // ensureOpen drains
                     if (self.lsp) |m| m.ensureOpen(tab, job.gen) else self.attachLsp(tab);
+                    editorlang.onLoaded(self, tab, job.ec);
                     self.setStatus("New file.");
                     self.refresh(tab);
                     return;
                 }
                 if (job.keep_position and tab.keep_active) {
                     self.finishReloadInPlace(tab, job);
+                    editorlang.onLoaded(self, tab, job.ec);
                     // The document object SURVIVES a reload-in-place,
                     // so no replace hook runs and this is the only
                     // place the queued edits can be delivered. True
@@ -4493,6 +4489,7 @@ pub const EditorView = struct {
                 // the language (a shebang only becomes visible now) and
                 // re-attach the observer the swap just dropped.
                 self.ensureHighlighter(tab);
+                editorlang.onLoaded(self, tab, job.ec);
                 // Folds anchor into the OLD document's byte space and
                 // the trail describes its offsets; both die with it.
                 tab.folds.clear();
@@ -5855,7 +5852,7 @@ pub const EditorView = struct {
                         return true;
                     }
                     if (self.smart_backspace and
-                        (ecmd.smartBackspace(a, &tab.doc, &tab.sels, self.tab_width) catch false))
+                        (ecmd.smartBackspace(a, &tab.doc, &tab.sels, tab.language.indent.size) catch false))
                     {
                         tab.goal_x = null;
                         self.afterDocEdit(tab);
@@ -5876,8 +5873,8 @@ pub const EditorView = struct {
             c.GDK_KEY_Return, c.GDK_KEY_KP_Enter => {
                 if (self.auto_indent) {
                     ecmd.newlineAutoIndent(a, &tab.doc, &tab.sels, .{
-                        .width = self.tab_width,
-                        .spaces = self.insert_spaces,
+                        .width = tab.language.indent.size,
+                        .spaces = tab.language.indent.useSpaces(),
                         .auto_indent = true,
                     }) catch {};
                 } else {
@@ -5890,7 +5887,7 @@ pub const EditorView = struct {
             c.GDK_KEY_Tab, c.GDK_KEY_ISO_Left_Tab => {
                 if (ctrl) return false;
                 if (shift or keyval == c.GDK_KEY_ISO_Left_Tab) {
-                    ecmd.dedentLines(a, &tab.doc, &tab.sels, self.tab_width) catch {};
+                    ecmd.dedentLines(a, &tab.doc, &tab.sels, tab.language.indent.size) catch {};
                     self.afterDocEdit(tab);
                     return true;
                 }
@@ -5902,9 +5899,9 @@ pub const EditorView = struct {
                     if (!s.isCaret()) any_range = true;
                 }
                 if (any_range) {
-                    ecmd.indentLines(a, &tab.doc, &tab.sels, self.tab_width, self.insert_spaces) catch {};
+                    ecmd.indentLines(a, &tab.doc, &tab.sels, tab.language.indent.size, tab.language.indent.useSpaces()) catch {};
                 } else {
-                    vm.insertTabStop(a, &tab.doc, &tab.sels, self.tab_width, self.insert_spaces) catch {};
+                    vm.insertTabStop(a, &tab.doc, &tab.sels, tab.language.indent.size, tab.language.indent.useSpaces()) catch {};
                 }
                 tab.goal_x = null;
                 self.afterDocEdit(tab);
@@ -5985,28 +5982,6 @@ pub const EditorView = struct {
         return null;
     }
 
-    /// Language for comment toggling: like `detectLang` but NOT gated
-    /// on `editor_syntax` — the comment prefix is a fact about the
-    /// file, not about whether highlighting is drawn.
-    fn commentLang(self: *EditorView, tab: *ETab) ?syntax.Lang {
-        _ = self;
-        if (tab.hl_lang) |l| return l;
-        var buf: [SHEBANG_PROBE]u8 = undefined;
-        var head: []const u8 = "";
-        const n = @min(buf.len, tab.doc.rope.len());
-        if (n > 0) {
-            var it = tab.doc.rope.iterateRange(0, n);
-            var w: usize = 0;
-            while (it.next()) |chunk| {
-                @memcpy(buf[w .. w + chunk.len], chunk);
-                w += chunk.len;
-            }
-            head = buf[0..w];
-            if (std.mem.indexOfScalar(u8, head, '\n')) |nl| head = head[0..nl];
-        }
-        return syntax.detect(tab.spec, head);
-    }
-
     /// Dispatch one editor command (keybinding, palette or context
     /// menu). Every mutation is one transaction = one undo step.
     pub fn runCommand(self: *EditorView, tab: *ETab, cmd: ecmd.Command) void {
@@ -6040,24 +6015,23 @@ pub const EditorView = struct {
                 self.afterDocEdit(tab);
             },
             .toggle_comment => {
-                const lang = self.commentLang(tab) orelse {
-                    self.setStatus("No known language for this file — no comment syntax.");
-                    return;
+                const tokens = switch (editorlang.commentTokens(tab)) {
+                    .tokens => |t| t,
+                    .none => |why| {
+                        self.setStatus(why);
+                        return;
+                    },
                 };
-                const prefix = lang.lineComment() orelse {
-                    self.setStatus("This language has no line-comment syntax.");
-                    return;
-                };
-                _ = ecmd.toggleComment(a, &tab.doc, &tab.sels, prefix) catch return;
+                _ = ecmd.toggleComment(a, &tab.doc, &tab.sels, tokens) catch return;
                 tab.goal_x = null;
                 self.afterDocEdit(tab);
             },
             .indent => {
-                ecmd.indentLines(a, &tab.doc, &tab.sels, self.tab_width, self.insert_spaces) catch return;
+                ecmd.indentLines(a, &tab.doc, &tab.sels, tab.language.indent.size, tab.language.indent.useSpaces()) catch return;
                 self.afterDocEdit(tab);
             },
             .dedent => {
-                ecmd.dedentLines(a, &tab.doc, &tab.sels, self.tab_width) catch return;
+                ecmd.dedentLines(a, &tab.doc, &tab.sels, tab.language.indent.size) catch return;
                 self.afterDocEdit(tab);
             },
             .trim_trailing_ws => {
@@ -6102,17 +6076,17 @@ pub const EditorView = struct {
                 ecmd.splitSelectionIntoLines(a, &tab.doc, &tab.sels) catch return;
                 self.afterMove(tab);
             },
+            .indent_use_tabs, .indent_use_spaces, .indent_width_2, .indent_width_4, .indent_width_8, .indent_auto => editorlang.runIndentCommand(self, tab, cmd),
         }
     }
 
     /// Syntax gate for quote auto-close: an offset whose token is a
-    /// string or comment is content, not code. No tree (or a stale
-    /// one) gates nothing — small documents re-parse synchronously on
-    /// every edit, so staleness is a one-keystroke window.
+    /// string or comment is content, not code. Without a current tree
+    /// the language's lexical rules answer (plain text gates nothing).
     fn gateIsCode(ctx: ?*anyopaque, offset: usize) bool {
         const tab = cast.userData(ETab, ctx);
-        const hl = tab.hl orelse return true;
-        if (hl.isStale(&tab.doc)) return true;
+        const hl = tab.hl orelse return tab.language.isCodeAt(&tab.doc, offset);
+        if (hl.isStale(&tab.doc)) return tab.language.isCodeAt(&tab.doc, offset);
         const kind = hl.kindAt(&tab.doc, offset) catch return true;
         return switch (kind) {
             .string, .comment, .escape => false,
@@ -6228,8 +6202,7 @@ pub const EditorView = struct {
             if (!s.isCaret()) has_selection = true;
         }
         const lsp_on = tab.lsp != null and self.lsp != null;
-        const lang = self.commentLang(tab);
-        const has_comment = lang != null and lang.?.lineComment() != null;
+        const has_comment = tab.language.commentTokens() != null;
         setActionEnabled(group, "cut", has_selection);
         setActionEnabled(group, "copy", has_selection);
         setActionEnabled(group, "sort", has_selection);
@@ -6611,7 +6584,7 @@ pub const EditorView = struct {
                 vm.insertNewlineIndent(self.allocator, &tab.doc, &tab.sels) catch return false;
                 self.afterDocEdit(tab);
             } else if (std.mem.eql(u8, chord, "tab")) {
-                vm.insertTabStop(self.allocator, &tab.doc, &tab.sels, self.tab_width, self.insert_spaces) catch return false;
+                vm.insertTabStop(self.allocator, &tab.doc, &tab.sels, tab.language.indent.size, tab.language.indent.useSpaces()) catch return false;
                 self.afterDocEdit(tab);
             } else if (std.mem.eql(u8, chord, "backspace")) {
                 vm.deleteBackward(self.allocator, &tab.doc, &tab.sels, false) catch return false;

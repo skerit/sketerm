@@ -787,7 +787,7 @@ pub const RemoteLink = struct {
         const conf = mgr.cfg() orelse return;
         const spec = tab.spec orelse return;
         const loc = paths.parseSpec(spec);
-        const lang = servers.languageId(loc.path);
+        const lang = tab.language.lspId();
         if (lang.len == 0) return;
         const candidates = conf.lspServerCandidates(lang, mgr.alloc) catch return;
         defer mgr.alloc.free(candidates);
@@ -1400,7 +1400,7 @@ pub const Manager = struct {
     fn bindTabToConn(self: *Manager, tab: *ETab, cn: *Conn) void {
         const spec = tab.spec orelse return;
         const loc = paths.parseSpec(spec);
-        const lang = servers.languageId(loc.path);
+        const lang = tab.language.lspId();
         if (lang.len == 0) return;
         const st = tab.lsp orelse blk: {
             const fresh = TabState.create(self.alloc, tab) orelse return;
@@ -1422,9 +1422,9 @@ pub const Manager = struct {
     /// Attach a REMOTE document: park it on (or dial) the host's link;
     /// the daemon answers which server exists there. Every failure on
     /// this path is silent, like the local one.
-    fn attachRemote(self: *Manager, tab: *ETab, host: []const u8, path: []const u8) void {
+    fn attachRemote(self: *Manager, tab: *ETab, host: []const u8) void {
         const conf = self.cfg() orelse return;
-        const lang = servers.languageId(path);
+        const lang = tab.language.lspId();
         if (lang.len == 0) return;
         // No candidate even claims the language: never dial a host
         // for a document nothing could serve.
@@ -1601,10 +1601,10 @@ pub const Manager = struct {
         // would resolve every import against the wrong filesystem).
         // Async by nature — the reply lands in `onLspReply`.
         if (loc.host) |host| {
-            self.attachRemote(tab, host, loc.path);
+            self.attachRemote(tab, host);
             return;
         }
-        const lang = servers.languageId(loc.path);
+        const lang = tab.language.lspId();
         if (lang.len == 0) return;
         // Skip servers whose binary is not present rather than
         // stopping at the first configured one: a machine with only
@@ -1650,6 +1650,10 @@ pub const Manager = struct {
             dbg("didOpen deferred for {s}: still loading", .{st.sync.uri});
             return;
         }
+        // The load can refine the language the attach saw from the path
+        // alone (a `.h` whose head reads as C++, a shebang script).
+        const refined = tab.language.lspId();
+        if (refined.len > 0) st.sync.language_id = refined;
         const text = tab.doc.textAlloc(self.alloc) catch return;
         defer self.alloc.free(text);
         st.sync.noteSent(1, tab.doc.revision, text);
@@ -2950,7 +2954,7 @@ pub const Manager = struct {
         self.scratch.print(
             self.alloc,
             ",\"options\":{{\"tabSize\":{d},\"insertSpaces\":{s}}}}}",
-            .{ self.view.tab_width, if (self.view.insert_spaces) "true" else "false" },
+            .{ r.tab.language.indent.size, if (r.tab.language.indent.useSpaces()) "true" else "false" },
         ) catch return;
         self.issue(
             r,

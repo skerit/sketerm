@@ -623,6 +623,17 @@ pub fn ipcDispatch(self: *Window, req: ipc_protocol.Request, out: *std.ArrayList
             return ipc_protocol.writeErr(out, allocator, "pane has no editor face");
         view.breakNextAtlasReleaseForTest();
         try ipc_protocol.writeOk(out, allocator, null, {});
+    } else if (eql(u8, req.cmd, "editor-lang")) {
+        // The active document's language facts (language, grammar,
+        // effective indentation and its source, comment tokens), plus
+        // the highlight kind and bracket pair at the byte offset in
+        // `data` when one is given.
+        const pane = reqPane(self, req) orelse return ipc_protocol.writeErr(out, allocator, "no such pane");
+        const view = @import("editorview.zig").EditorView.fromPane(pane) orelse
+            return ipc_protocol.writeErr(out, allocator, "pane has no editor face");
+        const info = @import("editorlang.zig").inspect(view, req.data) orelse
+            return ipc_protocol.writeErr(out, allocator, "editor has no loaded document");
+        try ipc_protocol.writeOk(out, allocator, "lang", info);
     } else if (eql(u8, req.cmd, "im-probe")) {
         // Debug hook: push hardware keycodes (GDK code = evdev + 8,
         // comma-separated in `data`) through the FOCUSED face's IM

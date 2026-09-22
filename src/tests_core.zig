@@ -41,6 +41,11 @@ comptime {
     _ = @import("editor/outline.zig");
     _ = @import("editor/theme.zig");
     _ = @import("editor/grammars.zig");
+    _ = @import("editor/languages.zig");
+    _ = @import("editor/lexical.zig");
+    _ = @import("editor/editorconfig.zig");
+    _ = @import("editor/indentation.zig");
+    _ = @import("editor/doclang.zig");
     _ = @import("lsp/rpc.zig");
     _ = @import("lsp/semantic.zig");
     _ = @import("lsp/inlay.zig");

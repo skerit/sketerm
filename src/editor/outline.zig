@@ -300,18 +300,20 @@ const zig_spec = LangSpec{
     .wrapper = &.{"variable_declaration"},
 };
 
+const c_symbols = [_]LangSpec.Entry{
+    .{ .node = "function_definition", .kind = .function },
+    .{ .node = "struct_specifier", .kind = .structure },
+    .{ .node = "union_specifier", .kind = .structure },
+    .{ .node = "enum_specifier", .kind = .enumeration },
+    .{ .node = "type_definition", .kind = .type_alias },
+    .{ .node = "preproc_def", .kind = .constant },
+    .{ .node = "preproc_function_def", .kind = .function },
+    .{ .node = "field_declaration", .kind = .field },
+    .{ .node = "enumerator", .kind = .enum_member },
+};
+
 const c_spec = LangSpec{
-    .symbols = &.{
-        .{ .node = "function_definition", .kind = .function },
-        .{ .node = "struct_specifier", .kind = .structure },
-        .{ .node = "union_specifier", .kind = .structure },
-        .{ .node = "enum_specifier", .kind = .enumeration },
-        .{ .node = "type_definition", .kind = .type_alias },
-        .{ .node = "preproc_def", .kind = .constant },
-        .{ .node = "preproc_function_def", .kind = .function },
-        .{ .node = "field_declaration", .kind = .field },
-        .{ .node = "enumerator", .kind = .enum_member },
-    },
+    .symbols = &c_symbols,
     .opaque_bodies = &.{"compound_statement"},
 };
 
@@ -328,12 +330,154 @@ const markdown_spec = LangSpec{
     .opaque_bodies = &.{},
 };
 
-fn specFor(lang: syntax.Lang) LangSpec {
-    return switch (lang) {
+const cpp_spec = LangSpec{
+    .symbols = &(c_symbols ++ [_]LangSpec.Entry{
+        .{ .node = "class_specifier", .kind = .class },
+        .{ .node = "namespace_definition", .kind = .namespace },
+        .{ .node = "alias_declaration", .kind = .type_alias },
+    }),
+    .opaque_bodies = &.{"compound_statement"},
+};
+
+const python_spec = LangSpec{
+    .symbols = &.{
+        .{ .node = "function_definition", .kind = .function },
+        .{ .node = "class_definition", .kind = .class },
+    },
+    // A class body is a `block` too, so nothing is opaque: a nested
+    // def inside a function is shown, a local assignment never is.
+    .opaque_bodies = &.{},
+};
+
+const rust_spec = LangSpec{
+    .symbols = &.{
+        .{ .node = "function_item", .kind = .function },
+        .{ .node = "function_signature_item", .kind = .method },
+        .{ .node = "struct_item", .kind = .structure },
+        .{ .node = "enum_item", .kind = .enumeration },
+        .{ .node = "union_item", .kind = .structure },
+        .{ .node = "trait_item", .kind = .interface },
+        .{ .node = "impl_item", .kind = .class },
+        .{ .node = "mod_item", .kind = .module },
+        .{ .node = "const_item", .kind = .constant },
+        .{ .node = "static_item", .kind = .constant },
+        .{ .node = "type_item", .kind = .type_alias },
+        .{ .node = "macro_definition", .kind = .function },
+        .{ .node = "field_declaration", .kind = .field },
+        .{ .node = "enum_variant", .kind = .enum_member },
+    },
+    .opaque_bodies = &.{"block"},
+};
+
+const js_spec = LangSpec{
+    .symbols = &.{
+        .{ .node = "function_declaration", .kind = .function },
+        .{ .node = "generator_function_declaration", .kind = .function },
+        .{ .node = "class_declaration", .kind = .class },
+        .{ .node = "abstract_class_declaration", .kind = .class },
+        .{ .node = "method_definition", .kind = .method },
+        .{ .node = "variable_declarator", .kind = .variable },
+        .{ .node = "interface_declaration", .kind = .interface },
+        .{ .node = "type_alias_declaration", .kind = .type_alias },
+        .{ .node = "enum_declaration", .kind = .enumeration },
+        .{ .node = "internal_module", .kind = .namespace },
+        .{ .node = "public_field_definition", .kind = .field },
+        .{ .node = "method_signature", .kind = .method },
+    },
+    .opaque_bodies = &.{"statement_block"},
+};
+
+const go_spec = LangSpec{
+    .symbols = &.{
+        .{ .node = "function_declaration", .kind = .function },
+        .{ .node = "method_declaration", .kind = .method },
+        .{ .node = "type_spec", .kind = .structure },
+        .{ .node = "const_spec", .kind = .constant },
+        .{ .node = "var_spec", .kind = .variable },
+    },
+    .opaque_bodies = &.{"block"},
+};
+
+const java_spec = LangSpec{
+    .symbols = &.{
+        .{ .node = "class_declaration", .kind = .class },
+        .{ .node = "interface_declaration", .kind = .interface },
+        .{ .node = "enum_declaration", .kind = .enumeration },
+        .{ .node = "record_declaration", .kind = .structure },
+        .{ .node = "annotation_type_declaration", .kind = .interface },
+        .{ .node = "method_declaration", .kind = .method },
+        .{ .node = "constructor_declaration", .kind = .constructor },
+        .{ .node = "enum_constant", .kind = .enum_member },
+    },
+    .opaque_bodies = &.{ "block", "constructor_body" },
+};
+
+const bash_spec = LangSpec{
+    .symbols = &.{.{ .node = "function_definition", .kind = .function }},
+    .opaque_bodies = &.{"compound_statement"},
+};
+
+const lua_spec = LangSpec{
+    .symbols = &.{.{ .node = "function_declaration", .kind = .function }},
+    .opaque_bodies = &.{"block"},
+};
+
+const make_spec = LangSpec{
+    .symbols = &.{
+        .{ .node = "rule", .kind = .function },
+        .{ .node = "variable_assignment", .kind = .variable },
+        .{ .node = "define_directive", .kind = .constant },
+    },
+    .opaque_bodies = &.{"recipe"},
+};
+
+const css_spec = LangSpec{
+    .symbols = &.{
+        .{ .node = "rule_set", .kind = .class },
+        .{ .node = "media_statement", .kind = .namespace },
+        .{ .node = "keyframes_statement", .kind = .function },
+    },
+    .opaque_bodies = &.{},
+};
+
+const yaml_spec = LangSpec{
+    .symbols = &.{.{ .node = "block_mapping_pair", .kind = .key }},
+    .opaque_bodies = &.{},
+};
+
+const toml_spec = LangSpec{
+    .symbols = &.{
+        .{ .node = "table", .kind = .namespace },
+        .{ .node = "table_array_element", .kind = .namespace },
+        .{ .node = "pair", .kind = .key },
+    },
+    .opaque_bodies = &.{},
+};
+
+const none_spec = LangSpec{ .symbols = &.{}, .opaque_bodies = &.{} };
+
+/// Outline vocabulary per grammar: node types are a fact about the
+/// grammar, so every language sharing one (C++ and CUDA, JS and JSX)
+/// shares its outline.
+fn specFor(g: syntax.Grammar) LangSpec {
+    return switch (g) {
         .zig => zig_spec,
         .c => c_spec,
+        .cpp => cpp_spec,
         .json => json_spec,
         .markdown => markdown_spec,
+        .python => python_spec,
+        .rust => rust_spec,
+        .javascript, .typescript, .tsx => js_spec,
+        .go => go_spec,
+        .java => java_spec,
+        .bash => bash_spec,
+        .lua => lua_spec,
+        .make => make_spec,
+        .css => css_spec,
+        .yaml => yaml_spec,
+        .toml => toml_spec,
+        .markdown_inline, .html, .xml, .diff, .dockerfile => none_spec,
     };
 }
 
@@ -345,6 +489,8 @@ const name_nodes = [_][]const u8{
     "field_identifier",
     "string",
     "string_literal",
+    "bare_key",
+    "word",
 };
 
 /// How deep below a symbol node the name search goes. C's
@@ -368,7 +514,9 @@ pub fn fromTree(
 ) (syntax.Error || std.mem.Allocator.Error)!void {
     const root = (try hl.rootNode(doc)) orelse return;
     out.clear();
-    const spec = specFor(lang);
+    const grammars = lang.grammars();
+    if (grammars.len == 0) return;
+    const spec = specFor(grammars[0]);
     var buf: [MAX_NAME]u8 = undefined;
     try walk(out, doc, root, spec, 0, 0, &buf);
     out.source = .tree;
@@ -772,4 +920,39 @@ test "outline: a stale highlighter refuses rather than half-answering" {
     // Never parsed: stale by definition.
     try testing.expectError(syntax.Error.Stale, fromTree(&o, &hl, &doc, .zig));
     try testing.expectEqual(Source.none, o.source);
+}
+
+/// Names of every outline row, `|`-joined, for compact assertions.
+fn outlineNames(o: *const Outline, buf: *std.ArrayList(u8)) ![]const u8 {
+    for (0..o.nodes.items.len) |i| {
+        try buf.appendSlice(testing.allocator, o.name(i));
+        try buf.append(testing.allocator, '|');
+    }
+    return buf.items;
+}
+
+test "outline: python, rust, typescript and go trees give their symbols" {
+    const Case = struct { lang: syntax.Lang, src: []const u8, want: []const []const u8, not: []const u8 };
+    const cases = [_]Case{
+        .{ .lang = .python, .src = "class Shape:\n    def area(self):\n        local = 1\n        return local\n\ndef main():\n    pass\n", .want = &.{ "Shape|", "area|", "main|" }, .not = "local|" },
+        .{ .lang = .rust, .src = "struct P { x: i32 }\nimpl P { fn len(&self) -> i32 { let t = 1; t } }\nenum E { A }\n", .want = &.{ "P|", "x|", "len|", "E|", "A|" }, .not = "t|" },
+        .{ .lang = .typescript, .src = "interface Opts { a: number }\nclass Svc { run(): void { const tmp = 1; } }\nexport function main() {}\n", .want = &.{ "Opts|", "Svc|", "run|", "main|" }, .not = "tmp|" },
+        .{ .lang = .go, .src = "package p\ntype T struct{}\nfunc (t T) M() { x := 1; _ = x }\nfunc F() {}\n", .want = &.{ "T|", "M|", "F|" }, .not = "x|" },
+    };
+    for (cases) |c| {
+        var o = Outline.init(testing.allocator);
+        defer o.deinit();
+        var doc = try buildTree(c.src, c.lang, &o);
+        defer doc.deinit();
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(testing.allocator);
+        const names = try outlineNames(&o, &buf);
+        for (c.want) |w| {
+            if (std.mem.indexOf(u8, names, w) == null) {
+                std.debug.print("{s}: outline {s} lacks {s}\n", .{ @tagName(c.lang), names, w });
+                return error.MissingSymbol;
+            }
+        }
+        try testing.expect(std.mem.indexOf(u8, names, c.not) == null);
+    }
 }

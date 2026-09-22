@@ -54,11 +54,8 @@ const ts = @cImport({
     @cInclude("tree_sitter/api.h");
 });
 
-extern fn tree_sitter_zig() ?*const ts.TSLanguage;
-extern fn tree_sitter_c() ?*const ts.TSLanguage;
-extern fn tree_sitter_json() ?*const ts.TSLanguage;
-extern fn tree_sitter_markdown() ?*const ts.TSLanguage;
-extern fn tree_sitter_markdown_inline() ?*const ts.TSLanguage;
+const languages = @import("languages.zig");
+pub const Grammar = @import("grammars.zig").Grammar;
 
 // ======================================================================
 // Highlight palette
@@ -95,6 +92,11 @@ pub const Kind = enum(u8) {
     link,
     emphasis,
     strong,
+    /// Diff lines: added, removed, changed. No other kind is a home for
+    /// them, and a patch read in one colour is unreadable.
+    inserted,
+    deleted,
+    changed,
     _,
 };
 
@@ -164,11 +166,13 @@ const capture_table = [_]CaptureMap{
     .{ .name = "string.escape", .kind = .escape },
     .{ .name = "string.special.key", .kind = .property },
     .{ .name = "character", .kind = .string },
+    .{ .name = "character.special", .kind = .escape },
     .{ .name = "escape", .kind = .escape },
     .{ .name = "number", .kind = .number },
     .{ .name = "boolean", .kind = .constant },
     .{ .name = "constant", .kind = .constant },
     .{ .name = "function", .kind = .function },
+    .{ .name = "method", .kind = .function },
     .{ .name = "constructor", .kind = .function },
     .{ .name = "keyword", .kind = .keyword },
     .{ .name = "keyword.operator", .kind = .operator },
@@ -176,8 +180,14 @@ const capture_table = [_]CaptureMap{
     .{ .name = "repeat", .kind = .keyword },
     .{ .name = "exception", .kind = .keyword },
     .{ .name = "include", .kind = .keyword },
+    .{ .name = "import", .kind = .keyword },
     .{ .name = "preproc", .kind = .keyword },
     .{ .name = "storageclass", .kind = .keyword },
+    // CSS at-rules name their own captures.
+    .{ .name = "charset", .kind = .keyword },
+    .{ .name = "keyframes", .kind = .keyword },
+    .{ .name = "media", .kind = .keyword },
+    .{ .name = "supports", .kind = .keyword },
     .{ .name = "type", .kind = .type },
     .{ .name = "attribute", .kind = .attribute },
     .{ .name = "property", .kind = .property },
@@ -193,6 +203,11 @@ const capture_table = [_]CaptureMap{
     .{ .name = "punctuation", .kind = .punctuation },
     .{ .name = "delimiter", .kind = .punctuation },
     .{ .name = "tag", .kind = .keyword },
+    .{ .name = "tag.attribute", .kind = .attribute },
+    .{ .name = "tag.delimiter", .kind = .punctuation },
+    .{ .name = "diff.plus", .kind = .inserted },
+    .{ .name = "diff.minus", .kind = .deleted },
+    .{ .name = "diff.delta", .kind = .changed },
     // Markup (markdown, doc comments).
     .{ .name = "markup", .kind = .none },
     .{ .name = "markup.heading", .kind = .heading },
@@ -218,11 +233,19 @@ const capture_table = [_]CaptureMap{
     .{ .name = "spell", .kind = .none },
     .{ .name = "nospell", .kind = .none },
     .{ .name = "conceal", .kind = .none },
+    // Another language's text inside this one (a JS template
+    // substitution, a shell command substitution): the enclosing
+    // captures already paint it.
+    .{ .name = "embedded", .kind = .none },
+    .{ .name = "error", .kind = .none },
 };
 
 /// Longest-prefix capture lookup. Null when nothing in the table
-/// matches even the leading component (an unknown vocabulary).
+/// matches even the leading component (an unknown vocabulary). A
+/// leading `_` marks a query-private capture (a predicate operand),
+/// which is never painted.
 pub fn kindForCapture(name: []const u8) ?Kind {
+    if (name.len > 0 and name[0] == '_') return .none;
     var probe = name;
     while (true) {
         for (capture_table) |m| {
@@ -234,140 +257,34 @@ pub fn kindForCapture(name: []const u8) ?Kind {
 }
 
 // ======================================================================
-// Language registry
+// Language registry (editor/languages.zig is the declaring home)
 // ======================================================================
 
-pub const Lang = enum {
-    zig,
-    c,
-    json,
-    markdown,
-
-    pub fn displayName(self: Lang) []const u8 {
-        return switch (self) {
-            .zig => "Zig",
-            .c => "C",
-            .json => "JSON",
-            .markdown => "Markdown",
-        };
-    }
-
-    /// Line-comment prefix, null for languages without one. JSON has
-    /// no comments per the spec (and Markdown only has HTML block
-    /// comments), so toggle-comment reports rather than guessing.
-    pub fn lineComment(self: Lang) ?[]const u8 {
-        return switch (self) {
-            .zig => "//",
-            .c => "//",
-            .json => null,
-            .markdown => null,
-        };
-    }
-};
-
-const ExtMap = struct { ext: []const u8, lang: Lang };
-
-const ext_table = [_]ExtMap{
-    .{ .ext = "zig", .lang = .zig },
-    .{ .ext = "zon", .lang = .zig },
-    .{ .ext = "c", .lang = .c },
-    .{ .ext = "h", .lang = .c },
-    .{ .ext = "json", .lang = .json },
-    .{ .ext = "jsonc", .lang = .json },
-    .{ .ext = "md", .lang = .markdown },
-    .{ .ext = "markdown", .lang = .markdown },
-};
-
-/// Whole-basename matches (no extension to key on).
-const name_table = [_]ExtMap{
-    .{ .ext = "build.zig.zon", .lang = .zig },
-    .{ .ext = ".babelrc", .lang = .json },
-    .{ .ext = "README", .lang = .markdown },
-};
-
-/// Language for a path (or bare filename). Case-insensitive on the
-/// extension; null means "render as plain text".
-pub fn detectFromPath(path: []const u8) ?Lang {
-    const base = basenameOf(path);
-    if (base.len == 0) return null;
-    for (name_table) |m| {
-        if (std.ascii.eqlIgnoreCase(m.ext, base)) return m.lang;
-    }
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return null;
-    const ext = base[dot + 1 ..];
-    if (ext.len == 0) return null;
-    for (ext_table) |m| {
-        if (std.ascii.eqlIgnoreCase(m.ext, ext)) return m.lang;
-    }
-    return null;
-}
-
-fn basenameOf(path: []const u8) []const u8 {
-    // Not std.fs.path.basename: a host-qualified spec ("box:/etc/x")
-    // and a Windows-ish path both reduce correctly here, and we must
-    // not depend on the host separator.
-    var start: usize = 0;
-    for (path, 0..) |ch, i| {
-        if (ch == '/' or ch == '\\' or ch == ':') start = i + 1;
-    }
-    return path[start..];
-}
-
-/// Shebang fallback for extensionless scripts. Only reports languages
-/// we actually have a grammar for, so most shebangs yield null.
-pub fn detectFromShebang(first_line: []const u8) ?Lang {
-    if (!std.mem.startsWith(u8, first_line, "#!")) return null;
-    const line = std.mem.trim(u8, first_line[2..], " \t\r\n");
-    // The interpreter is the last path component of the first word, or
-    // of the word after `env`.
-    var it = std.mem.tokenizeAny(u8, line, " \t");
-    var interp: []const u8 = "";
-    while (it.next()) |word| {
-        const b = basenameOf(word);
-        if (std.mem.eql(u8, b, "env")) continue;
-        if (b.len > 0 and b[0] == '-') continue;
-        interp = b;
-        break;
-    }
-    if (interp.len == 0) return null;
-    if (std.mem.eql(u8, interp, "zig")) return .zig;
-    return null;
-}
-
-/// Language for a document: extension first, shebang second.
-pub fn detect(path: ?[]const u8, first_line: []const u8) ?Lang {
-    if (path) |p| {
-        if (detectFromPath(p)) |l| return l;
-    }
-    return detectFromShebang(first_line);
-}
+pub const Lang = languages.Lang;
 
 // ======================================================================
 // Grammar + query layers
 // ======================================================================
 
-const query_zig = @embedFile("ts_query_zig");
-const query_c = @embedFile("ts_query_c");
-const query_json = @embedFile("ts_query_json");
-const query_markdown = @embedFile("ts_query_markdown");
-const query_markdown_inline = @embedFile("ts_query_markdown_inline");
+const LanguageFn = *const fn () callconv(.c) ?*const ts.TSLanguage;
 
 const LayerSpec = struct {
-    language: *const fn () callconv(.c) ?*const ts.TSLanguage,
+    language: LanguageFn,
     query: []const u8,
 };
 
-/// A language is one or more layers, painted in order (later wins).
-/// Markdown is two: the block grammar plus the inline grammar run over
-/// the SAME bytes — see the limitation note on `Highlighter`.
-fn layerSpecs(lang: Lang) []const LayerSpec {
-    return switch (lang) {
-        .zig => &[_]LayerSpec{.{ .language = tree_sitter_zig, .query = query_zig }},
-        .c => &[_]LayerSpec{.{ .language = tree_sitter_c, .query = query_c }},
-        .json => &[_]LayerSpec{.{ .language = tree_sitter_json, .query = query_json }},
-        .markdown => &[_]LayerSpec{
-            .{ .language = tree_sitter_markdown, .query = query_markdown },
-            .{ .language = tree_sitter_markdown_inline, .query = query_markdown_inline },
+/// The binding for one vendored grammar, derived from its tag: the C
+/// entry point `tree_sitter_<tag>` and its query stems concatenated in
+/// `Grammar.queries` order.
+fn layerSpec(g: Grammar) LayerSpec {
+    return switch (g) {
+        inline else => |cg| comptime blk: {
+            var query: []const u8 = "";
+            for (cg.queries()) |q| query = query ++ @embedFile("ts_query_" ++ @tagName(q)) ++ "\n";
+            break :blk .{
+                .language = @extern(LanguageFn, .{ .name = "tree_sitter_" ++ @tagName(cg) }),
+                .query = query,
+            };
         },
     };
 }
@@ -437,7 +354,47 @@ const Predicate = struct {
 /// (`#lua-match?`) flavours the grammars use. Both flavours only appear
 /// here with anchors, literal classes and `*`/`+`, which the two
 /// languages spell identically.
+///
+/// The one group shape the queries use, a whole-pattern word list
+/// `^(a|b|c)$`, is distributed into `^a$|^b$|^c$`: `pattern.zig` has no
+/// groups, and read literally that list would match any identifier
+/// merely CONTAINING one of the words.
 fn normalizePattern(alloc: std.mem.Allocator, src: []const u8) ![]u8 {
+    if (wordListOf(src)) |wl| {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        var it = std.mem.splitScalar(u8, wl.body, '|');
+        var first = true;
+        while (it.next()) |alt| {
+            if (!first) try out.append(alloc, '|');
+            first = false;
+            if (wl.bol) try out.append(alloc, '^');
+            const norm = try normalizeShorthands(alloc, alt);
+            defer alloc.free(norm);
+            try out.appendSlice(alloc, norm);
+            if (wl.eol) try out.append(alloc, '$');
+        }
+        return out.toOwnedSlice(alloc);
+    }
+    return normalizeShorthands(alloc, src);
+}
+
+const WordList = struct { body: []const u8, bol: bool, eol: bool };
+
+/// `^(a|b)$` (either anchor optional) with no other parentheses.
+fn wordListOf(src: []const u8) ?WordList {
+    var s = src;
+    const bol = s.len > 0 and s[0] == '^';
+    if (bol) s = s[1..];
+    const eol = s.len > 0 and s[s.len - 1] == '$';
+    if (eol) s = s[0 .. s.len - 1];
+    if (s.len < 2 or s[0] != '(' or s[s.len - 1] != ')') return null;
+    const body = s[1 .. s.len - 1];
+    if (std.mem.indexOfAny(u8, body, "()") != null) return null;
+    return .{ .body = body, .bol = bol, .eol = eol };
+}
+
+fn normalizeShorthands(alloc: std.mem.Allocator, src: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     var i: usize = 0;
@@ -597,16 +554,21 @@ pub const Highlighter = struct {
     win_gen: u64 = 0,
     win_valid: bool = false,
 
+    /// A language is one or more layers, painted in order (later wins).
+    /// Markdown is two: the block grammar plus the inline grammar run
+    /// over the SAME bytes. `LanguageUnavailable` for a language with no
+    /// grammar at all.
     pub fn init(alloc: std.mem.Allocator, lang: Lang) Error!Highlighter {
-        const specs = layerSpecs(lang);
-        var layers = try alloc.alloc(Layer, specs.len);
+        const grammars = lang.grammars();
+        if (grammars.len == 0) return Error.LanguageUnavailable;
+        var layers = try alloc.alloc(Layer, grammars.len);
         var built: usize = 0;
         errdefer {
             for (layers[0..built]) |*l| l.deinit();
             alloc.free(layers);
         }
-        for (specs, 0..) |spec, i| {
-            layers[i] = try buildLayer(alloc, spec);
+        for (grammars, 0..) |g, i| {
+            layers[i] = try buildLayer(alloc, layerSpec(g));
             built = i + 1;
         }
         return .{ .alloc = alloc, .lang = lang, .layers = layers };
@@ -1076,7 +1038,8 @@ pub const Highlighter = struct {
     //
     // These read the SAME trees the highlighting does — there is no
     // second parser and no hand-rolled brace scanner on this path (the
-    // one in structure.zig is the documented no-grammar fallback).
+    // no-tree fallbacks are lexical.zig, by the language's row, and
+    // structure.zig's plain-text scanner).
     //
     // All of them are O(tree depth) or O(nodes intersecting the byte
     // range asked for), never O(document): a per-frame call from the
@@ -1375,27 +1338,150 @@ fn advancePoint(start: ts.TSPoint, inserted: []const u8) ts.TSPoint {
 
 const testing = std.testing;
 
-test "syntax: language detection by extension, name and shebang" {
-    try testing.expectEqual(Lang.zig, detectFromPath("/home/x/src/main.zig").?);
-    try testing.expectEqual(Lang.zig, detectFromPath("build.zig.zon").?);
-    try testing.expectEqual(Lang.c, detectFromPath("box:/tmp/a.c").?);
-    try testing.expectEqual(Lang.c, detectFromPath("stdio.H").?);
-    try testing.expectEqual(Lang.json, detectFromPath("a/b/config.json").?);
-    try testing.expectEqual(Lang.markdown, detectFromPath("README.md").?);
-    try testing.expectEqual(Lang.markdown, detectFromPath("README").?);
-    try testing.expect(detectFromPath("Makefile") == null);
-    try testing.expect(detectFromPath("noext") == null);
-    try testing.expect(detectFromPath("") == null);
+test "syntax: every vendored grammar loads and every capture has a palette home" {
+    const a = testing.allocator;
+    for (std.enums.values(Grammar)) |g| {
+        const spec = layerSpec(g);
+        const language = spec.language() orelse {
+            std.debug.print("grammar {s}: no language\n", .{@tagName(g)});
+            return error.LanguageUnavailable;
+        };
+        // The runtime accepts ABI 13..15; a grammar outside it would
+        // load as null above, but say which bound it broke.
+        const abi = ts.ts_language_abi_version(language);
+        try testing.expect(abi >= ts.TREE_SITTER_MIN_COMPATIBLE_LANGUAGE_VERSION and abi <= ts.TREE_SITTER_LANGUAGE_VERSION);
+        var err_off: u32 = 0;
+        var err_type: ts.TSQueryError = ts.TSQueryErrorNone;
+        const query = ts.ts_query_new(language, spec.query.ptr, @intCast(spec.query.len), &err_off, &err_type) orelse {
+            const ctx_end = @min(spec.query.len, err_off + 60);
+            std.debug.print("grammar {s}: query error {d} at {d}: {s}\n", .{ @tagName(g), err_type, err_off, spec.query[err_off..ctx_end] });
+            return error.QueryInvalid;
+        };
+        defer ts.ts_query_delete(query);
+        const n_caps = ts.ts_query_capture_count(query);
+        for (0..n_caps) |ci| {
+            var len: u32 = 0;
+            const p = ts.ts_query_capture_name_for_id(query, @intCast(ci), &len) orelse continue;
+            const name = p[0..len];
+            if (kindForCapture(name) == null) {
+                std.debug.print("grammar {s}: capture @{s} has no palette home\n", .{ @tagName(g), name });
+                return error.UnmappedCapture;
+            }
+        }
+    }
+    // And every language with a grammar builds a working highlighter.
+    for (std.enums.values(Lang)) |l| {
+        if (!l.hasGrammar()) {
+            try testing.expectError(Error.LanguageUnavailable, Highlighter.init(a, l));
+            continue;
+        }
+        var hl = try Highlighter.init(a, l);
+        hl.deinit();
+    }
+}
 
-    try testing.expectEqual(Lang.zig, detectFromShebang("#!/usr/bin/env zig run").?);
-    try testing.expectEqual(Lang.zig, detectFromShebang("#!/usr/local/bin/zig").?);
-    try testing.expect(detectFromShebang("#!/bin/sh") == null);
-    try testing.expect(detectFromShebang("not a shebang") == null);
+/// Parse `src` as `lang` and assert the kind at the first occurrence of
+/// each needle.
+fn expectKinds(lang: Lang, src: []const u8, cases: []const struct { []const u8, Kind }) !void {
+    const a = testing.allocator;
+    var doc = try openDoc(src);
+    defer doc.deinit();
+    var hl = try Highlighter.init(a, lang);
+    defer hl.deinit();
+    try hl.parse(&doc);
+    for (cases) |c| {
+        const got = try kindOfFirst(&hl, &doc, src, c[0]);
+        if (got != c[1]) {
+            std.debug.print("{s}: '{s}' is {s}, want {s}\n", .{ @tagName(lang), c[0], @tagName(got), @tagName(c[1]) });
+            return error.WrongKind;
+        }
+    }
+}
 
-    // Extension wins over shebang; shebang is the fallback.
-    try testing.expectEqual(Lang.c, detect("x.c", "#!/usr/bin/env zig").?);
-    try testing.expectEqual(Lang.zig, detect("script", "#!/usr/bin/env zig").?);
-    try testing.expect(detect(null, "plain text") == null);
+test "syntax: new grammars paint keywords, strings, comments and functions" {
+    try expectKinds(.python,
+        \\import os
+        \\# note
+        \\def greet(name):
+        \\    return f"hi {name}"
+        \\
+    , &.{ .{ "import", .keyword }, .{ "# note", .comment }, .{ "def", .keyword }, .{ "greet", .function }, .{ "\"hi", .string } });
+    try expectKinds(.rust,
+        \\// doc
+        \\fn main() { let s = "x"; }
+        \\
+    , &.{ .{ "// doc", .comment }, .{ "fn", .keyword }, .{ "main", .function }, .{ "\"x\"", .string } });
+    try expectKinds(.cpp,
+        \\#include <vector>
+        \\namespace sk { class W { public: int f(); }; }
+        \\
+    , &.{ .{ "#include", .keyword }, .{ "namespace", .keyword }, .{ "class", .keyword }, .{ "int", .type } });
+    try expectKinds(.javascript, "const f = () => 'q'; // c\n", &.{ .{ "const", .keyword }, .{ "'q'", .string }, .{ "// c", .comment } });
+    try expectKinds(.typescript, "interface P { x: number }\nfunction g(): string { return \"s\" }\n", &.{ .{ "interface", .keyword }, .{ "number", .type }, .{ "function", .keyword }, .{ "\"s\"", .string } });
+    try expectKinds(.typescriptreact, "const el = <div className=\"a\">hi</div>;\n", &.{ .{ "const", .keyword }, .{ "\"a\"", .string } });
+    try expectKinds(.shell, "#!/bin/sh\n# c\necho \"$HOME\"\nif true; then :; fi\n", &.{ .{ "# c", .comment }, .{ "\"$HOME\"", .string }, .{ "if", .keyword } });
+    try expectKinds(.go, "package main\n// c\nfunc main() { s := \"x\" }\n", &.{ .{ "package", .keyword }, .{ "// c", .comment }, .{ "func", .keyword }, .{ "\"x\"", .string } });
+    try expectKinds(.java, "class A { int f() { return 1; } }\n", &.{ .{ "class", .keyword }, .{ "1", .number } });
+    try expectKinds(.lua, "local x = 'y' -- c\n", &.{ .{ "local", .keyword }, .{ "'y'", .string }, .{ "-- c", .comment } });
+    try expectKinds(.css, "a { color: red; } /* c */\n", &.{ .{ "color", .property }, .{ "/* c */", .comment } });
+    try expectKinds(.html, "<!-- c -->\n<p class=\"x\">t</p>\n", &.{ .{ "<!-- c -->", .comment }, .{ "p class", .keyword }, .{ "class", .attribute } });
+    try expectKinds(.toml, "# c\n[a]\nk = \"v\"\nn = 1\n", &.{ .{ "# c", .comment }, .{ "\"v\"", .string }, .{ "1", .number } });
+    try expectKinds(.yaml, "# c\nkey: \"v\"\nn: 1\n", &.{ .{ "# c", .comment }, .{ "\"v\"", .string } });
+    try expectKinds(.make, "# c\nall: x\n\tcc -o $@ $<\n", &.{.{ "# c", .comment }});
+    try expectKinds(.dockerfile, "# c\nFROM alpine\nRUN echo hi\n", &.{ .{ "# c", .comment }, .{ "FROM", .keyword }, .{ "RUN", .keyword } });
+    try expectKinds(.xml, "<?xml version=\"1.0\"?>\n<!-- c -->\n<a b=\"c\"/>\n", &.{.{ "<!-- c -->", .comment }});
+    try expectKinds(.diff, "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n", &.{ .{ "old", .deleted }, .{ "new", .inserted } });
+}
+
+test "syntax: tree bracket matching ignores string brackets in every new grammar" {
+    const a = testing.allocator;
+    const Case = struct { lang: Lang, src: []const u8 };
+    const cases = [_]Case{
+        .{ .lang = .python, .src = "f(\"(\", x)\n" },
+        .{ .lang = .rust, .src = "fn f() { g(\"(\"); }\n" },
+        .{ .lang = .cpp, .src = "int f() { return g(\"(\"); }\n" },
+        .{ .lang = .javascript, .src = "f(\"(\", x);\n" },
+        .{ .lang = .typescript, .src = "f(\"(\", x);\n" },
+        .{ .lang = .typescriptreact, .src = "f(\"(\", x);\n" },
+        .{ .lang = .shell, .src = "f() { echo \"(\"; }\n" },
+        .{ .lang = .go, .src = "package p\nfunc f() { g(\"(\") }\n" },
+        .{ .lang = .java, .src = "class A { void f() { g(\"(\"); } }\n" },
+        .{ .lang = .lua, .src = "f(\"(\", x)\n" },
+        .{ .lang = .css, .src = "a { content: \"(\"; }\n" },
+        .{ .lang = .toml, .src = "a = [\"[\", 1]\n" },
+        .{ .lang = .yaml, .src = "a: [\"[\", 1]\n" },
+    };
+    for (cases) |c| {
+        var doc = try openDoc(c.src);
+        defer doc.deinit();
+        var hl = try Highlighter.init(a, c.lang);
+        defer hl.deinit();
+        try hl.parse(&doc);
+        const in_string = std.mem.indexOf(u8, c.src, "\"") .? + 1;
+        if (try hl.bracketAt(&doc, in_string)) |p| {
+            // A pair may still be found through the byte BEFORE the
+            // caret, but never one that starts inside the literal.
+            if (p.open.start == in_string or p.close.start == in_string) {
+                std.debug.print("{s}: bracket inside a string matched\n", .{@tagName(c.lang)});
+                return error.StringBracketMatched;
+            }
+        }
+        // The first real opener in the source pairs with something.
+        var first: ?usize = null;
+        for (c.src, 0..) |ch, i| {
+            if (i >= in_string - 1 and i <= in_string + 1) continue;
+            if (ch == '(' or ch == '{' or ch == '[') {
+                first = i;
+                break;
+            }
+        }
+        const open = first orelse continue;
+        const p = (try hl.bracketAt(&doc, open)) orelse {
+            std.debug.print("{s}: no pair for the opener at {d}\n", .{ @tagName(c.lang), open });
+            return error.NoPair;
+        };
+        try testing.expectEqual(open, p.open.start);
+    }
 }
 
 test "syntax: capture names fold onto the fixed palette" {
@@ -1422,6 +1508,18 @@ test "syntax: pattern normalization expands both regex and lua classes" {
     const l = try normalizePattern(a, "^%a%w*$");
     defer a.free(l);
     try testing.expectEqualStrings("^[a-zA-Z][a-zA-Z0-9_]*$", l);
+
+    // A whole-pattern word list is distributed over its alternatives,
+    // so `install` is not a builtin because it contains `all`.
+    const w = try normalizePattern(a, "^(all|len|__import__)$");
+    defer a.free(w);
+    try testing.expectEqualStrings("^all$|^len$|^__import__$", w);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const m = try pattern.compile(arena.allocator(), w, false);
+    try testing.expect(m.matches("len"));
+    try testing.expect(!m.matches("install"));
+    try testing.expect(!m.matches("lens"));
 }
 
 fn openDoc(text: []const u8) !Document {

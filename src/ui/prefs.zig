@@ -2428,7 +2428,9 @@ fn refreshKeybindButtonLabel(rctx: *KeybindRowCtx) void {
                 }
             },
             .ed => |cmd| {
-                setButtonLabel(rctx.button, ecmd.defaultAccel(cmd));
+                // Palette-only commands ship without a chord.
+                const d = ecmd.defaultAccel(cmd);
+                setButtonLabel(rctx.button, if (d.len > 0) d else "(unbound)");
                 return;
             },
         }

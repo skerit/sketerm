@@ -10,6 +10,7 @@
 //! string matching so it can live in the GTK-free test root.
 
 const std = @import("std");
+const languages = @import("../editor/languages.zig");
 
 /// One configured (or built-in) language server.
 ///
@@ -79,73 +80,17 @@ pub fn listContains(list: []const u8, needle: []const u8) bool {
     return false;
 }
 
-const ExtLang = struct { ext: []const u8, id: []const u8 };
-
-/// Extension -> LSP `languageId`. Deliberately WIDER than the
-/// tree-sitter grammar set in editor/syntax.zig: a language server is
-/// useful for a file we cannot syntax-highlight, and the two lookups
-/// answer different questions.
-const ext_table = [_]ExtLang{
-    .{ .ext = "zig", .id = "zig" },
-    .{ .ext = "zon", .id = "zig" },
-    .{ .ext = "c", .id = "c" },
-    .{ .ext = "h", .id = "c" },
-    .{ .ext = "cc", .id = "cpp" },
-    .{ .ext = "cpp", .id = "cpp" },
-    .{ .ext = "cxx", .id = "cpp" },
-    .{ .ext = "hpp", .id = "cpp" },
-    .{ .ext = "hh", .id = "cpp" },
-    .{ .ext = "hxx", .id = "cpp" },
-    .{ .ext = "m", .id = "objective-c" },
-    .{ .ext = "mm", .id = "objective-cpp" },
-    .{ .ext = "cu", .id = "cuda" },
-    .{ .ext = "rs", .id = "rust" },
-    .{ .ext = "py", .id = "python" },
-    .{ .ext = "pyi", .id = "python" },
-    .{ .ext = "go", .id = "go" },
-    .{ .ext = "ts", .id = "typescript" },
-    .{ .ext = "tsx", .id = "typescriptreact" },
-    .{ .ext = "js", .id = "javascript" },
-    .{ .ext = "jsx", .id = "javascriptreact" },
-    .{ .ext = "lua", .id = "lua" },
-    .{ .ext = "sh", .id = "shellscript" },
-    .{ .ext = "bash", .id = "shellscript" },
-    .{ .ext = "json", .id = "json" },
-    .{ .ext = "jsonc", .id = "jsonc" },
-    .{ .ext = "md", .id = "markdown" },
-    .{ .ext = "markdown", .id = "markdown" },
-    .{ .ext = "html", .id = "html" },
-    .{ .ext = "css", .id = "css" },
-    .{ .ext = "toml", .id = "toml" },
-    .{ .ext = "yaml", .id = "yaml" },
-    .{ .ext = "yml", .id = "yaml" },
-};
-
 /// LSP `languageId` for a path (or host-qualified spec). Empty string
-/// means "no language id" — the file gets no server.
+/// means "no language id": the file gets no server. The language
+/// registry (editor/languages.zig) is the one table: it knows languages
+/// no grammar highlights, because a server is useful for those too.
 pub fn languageId(path: []const u8) []const u8 {
-    const base = basenameOf(path);
-    if (base.len == 0) return "";
-    if (std.mem.eql(u8, base, "build.zig.zon")) return "zig";
-    if (std.mem.eql(u8, base, "CMakeLists.txt")) return "cmake";
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return "";
-    const ext = base[dot + 1 ..];
-    if (ext.len == 0) return "";
-    for (ext_table) |m| {
-        if (std.ascii.eqlIgnoreCase(m.ext, ext)) return m.id;
-    }
-    return "";
+    return languages.languageIdOfPath(path);
 }
 
 /// Last component of a path, tolerating both separators and the
-/// `host:/path` spec form (same rule as editor/syntax.zig's).
-pub fn basenameOf(path: []const u8) []const u8 {
-    var start: usize = 0;
-    for (path, 0..) |ch, i| {
-        if (ch == '/' or ch == '\\' or ch == ':') start = i + 1;
-    }
-    return path[start..];
-}
+/// `host:/path` spec form.
+pub const basenameOf = languages.basenameOf;
 
 /// Directory part of an absolute path ("/" for a top-level file).
 pub fn dirnameOf(path: []const u8) []const u8 {

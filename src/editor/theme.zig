@@ -150,6 +150,9 @@ fn darkStyle(k: Kind) Style {
         .link => .{ .rgba = rgb(0x6BC2B4) },
         .emphasis => .{ .rgba = rgb(0xE6E8E3), .italic = true },
         .strong => .{ .rgba = rgb(0xE6E8E3), .bold = true },
+        .inserted => .{ .rgba = rgb(0x9BC46B) },
+        .deleted => .{ .rgba = rgb(0xE07A6F) },
+        .changed => .{ .rgba = rgb(0xE0C25A) },
         // Only ever called from kindTable, over the NAMED kinds. The
         // `_` prong is the price of the modifier band living in the same
         // byte; adding a named kind is still a compile error here.
@@ -179,6 +182,9 @@ fn lightStyle(k: Kind) Style {
         .link => .{ .rgba = rgb(0x0F6F63) },
         .emphasis => .{ .rgba = rgb(0x2B2F33), .italic = true },
         .strong => .{ .rgba = rgb(0x2B2F33), .bold = true },
+        .inserted => .{ .rgba = rgb(0x3F7A22) },
+        .deleted => .{ .rgba = rgb(0xB0302A) },
+        .changed => .{ .rgba = rgb(0x8A6A00) },
         _ => unreachable,
     };
 }
