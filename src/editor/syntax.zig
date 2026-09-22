@@ -1,6 +1,6 @@
 //! Incremental syntax highlighting over the editor Document, backed by
-//! the vendored Tree-sitter runtime + generated grammars
-//! (`vendor/tree-sitter/`, see its PROVENANCE.txt).
+//! the vendored Tree-sitter runtime (`vendor/tree-sitter/`) and the
+//! pinned upstream grammars listed in grammars.zig.
 //!
 //! GTK-free and thread-free by construction: the daemon must never link
 //! any of this (build.zig compiles the C only into the GUI/test targets),
@@ -273,9 +273,9 @@ const LayerSpec = struct {
     query: []const u8,
 };
 
-/// The binding for one vendored grammar, derived from its tag: the C
-/// entry point `tree_sitter_<tag>` and its query stems concatenated in
-/// `Grammar.queries` order.
+/// The binding for one grammar, derived from its tag: the C entry point
+/// `tree_sitter_<tag>` and its queries concatenated in `Grammar.queries`
+/// order.
 fn layerSpec(g: Grammar) LayerSpec {
     return switch (g) {
         inline else => |cg| comptime blk: {
@@ -524,7 +524,7 @@ pub const TreeNode = struct {
 const WINDOW_BYTES: usize = 16 * 1024;
 
 /// Cap on a single captured node's text used for predicate tests —
-/// every predicate in the vendored queries constrains an identifier.
+/// every predicate in the pinned queries constrains an identifier.
 const PRED_TEXT_MAX: usize = 512;
 
 pub const Highlighter = struct {
@@ -877,7 +877,7 @@ pub const Highlighter = struct {
     /// written — and therefore the winner — is the innermost node, and
     /// among equal ranges the pattern declared LATEST.
     ///
-    /// That order is not arbitrary: the vendored queries are written in
+    /// That order is not arbitrary: the pinned queries are written in
     /// the nvim convention, where a later, more specific pattern
     /// refines an earlier catch-all. tree-sitter-c opens with
     /// `(identifier) @variable` and only then adds
@@ -1338,7 +1338,7 @@ fn advancePoint(start: ts.TSPoint, inserted: []const u8) ts.TSPoint {
 
 const testing = std.testing;
 
-test "syntax: every vendored grammar loads and every capture has a palette home" {
+test "syntax: every pinned grammar loads and every capture has a palette home" {
     const a = testing.allocator;
     for (std.enums.values(Grammar)) |g| {
         const spec = layerSpec(g);

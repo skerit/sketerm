@@ -697,15 +697,15 @@ editor *font* is per-profile.
 
 | Key | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `editor_tab_width` | int | `4` | 1..16. |
-| `editor_insert_spaces` | bool | `true` | False inserts a real tab. |
+| `editor_tab_width` | int | `4` | 1..16. The fallback indent and tab width: a per-tab override, a language that requires tabs, `.editorconfig` and the file's own indentation all come first (docs/editor-commands.md, "Indentation"). |
+| `editor_insert_spaces` | bool | `true` | False inserts a real tab. The fallback style, under the same precedence. |
 | `editor_soft_wrap` | bool | `false` | Initial state for new editor tabs; per-tab from there. |
 | `editor_line_numbers` | bool | `true` | |
 | `editor_highlight_current_line` | bool | `true` | |
 | `editor_syntax` | bool | `true` | Tree-sitter highlighting. |
 | `editor_bracket_match` | bool | `true` | |
 | `editor_folding` | bool | `true` | |
-| `editor_fold_indent_fallback` | bool | `true` | Derive folds from indentation for files with no grammar. |
+| `editor_fold_indent_fallback` | bool | `true` | Folds for files with no syntax tree: bracket pairs (strings and comments skipped) for brace languages, indentation otherwise. Off means such files have no folds. |
 | `editor_theme` | string | `dark` | `dark` or `light`; anything unknown falls back to `dark`. |
 | `editor_crash_recovery` | bool | `true` | Snapshot unsaved buffers to `$XDG_STATE_HOME/sketerm/editor-recovery.d`. |
 | `editor_git_gutter` | bool | `true` | Per-line change markers against HEAD, computed on the file's own host. |

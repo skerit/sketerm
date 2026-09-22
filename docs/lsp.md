@@ -9,7 +9,8 @@ in `src/lsp/`'s module headers.
 ```
 src/lsp/rpc.zig          base protocol: Content-Length framing, JSON-RPC envelopes
 src/lsp/position.zig     UTF-8 byte offsets <-> LSP positions in utf-8/16/32
-src/lsp/servers.zig      server registry data, languageId table, root resolution, file:// URIs
+src/lsp/servers.zig      server registry data, root resolution, file:// URIs
+src/editor/languages.zig the language registry the languageId comes from
 src/lsp/session.zig      lifecycle, capabilities, document sync, request bookkeeping, cancellation
 src/lsp/docsync.zig      per-document version counter + the didChange queue
 src/lsp/diagnostics.zig  diagnostics as anchored byte ranges
@@ -173,6 +174,15 @@ it an empty file is a bad way to start. `sketerm-lsp-stub` writes the
 size of the `didOpen` payload it received to `$SKETERM_LSP_STUB_REPORT`
 and `smoke-lsp-gui` asserts it equals the document — the only place that
 number is observable at all.
+
+The `languageId` comes from the editor's language registry
+(`src/editor/languages.zig`, one row per language), never from a table
+of its own: `servers.languageId` asks the registry by path, and a tab
+asks its own resolved language (`DocLang.lspId`), which the load can
+refine from the content -- a `.h` whose head reads as C++ opens as
+`cpp`, an extensionless script is known by its shebang. The server is
+picked before the load from the path alone; `didOpen` re-reads the
+tab's language so the refinement is what the server is told.
 
 `textDocument/didOpen` on load, `didChange` incrementally when the server
 asks for it (`textDocumentSync.change == 2`), full text otherwise,

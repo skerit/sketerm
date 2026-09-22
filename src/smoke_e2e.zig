@@ -29,6 +29,7 @@ const version = @import("version.zig");
 const appdrive = @import("ipc/appdrive.zig");
 const ctlsock = @import("smoke/ctlsock.zig");
 const tcpserver = @import("smoke/tcpserver.zig");
+const editorlang_stage = @import("smoke/editorlang.zig");
 const muxclient = @import("mux/client.zig");
 const muxwire = @import("mux/wire.zig");
 const panel_assets = @import("ui/panel/assets.zig");
@@ -994,6 +995,13 @@ pub fn main() u8 {
         teardown();
         return 0;
     }
+    if (c.getenv("SKETERM_SMOKE_E2E_EDITOR_LANG_ONLY") != null) {
+        const app = drive orelse return fail("focused editor language smoke has no display driver");
+        if (editorlang_stage.stage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+        say("editor languages: Python/Makefile/TypeScript highlighted, Ctrl+/ wrote each language's comment token, string brackets refused (tree and lexical), Makefile Tab wrote a tab, .editorconfig and the palette override set the indentation");
+        teardown();
+        return 0;
+    }
     if (c.getenv("SKETERM_SMOKE_E2E_EDITOR_ATLAS_ONLY") != null) {
         const app = drive orelse return fail("focused editor atlas smoke has no display driver");
         const opened = roundtrip(allocator, sock_path, "{\"cmd\":\"new-editor-tab\"}\n") orelse
@@ -1376,6 +1384,8 @@ pub fn main() u8 {
             say("editor search bar opened by a real Ctrl+F, on the Wayland IM path");
             if (editorAtlasLifecycleStage(allocator, app, sock_path, rt, epane)) |why| return failMsg(why);
             say("editor atlas: zoom/config rebuilds and re-realize kept one live texture; teardown verifier armed");
+            if (editorlang_stage.stage(allocator, app, sock_path, rt)) |why| return failMsg(why);
+            say("editor languages: grammars, comment tokens, string-aware brackets, Makefile tabs, .editorconfig and the indentation override");
         }
 
         // 6c-2. The project layer, on a REAL git repository: root

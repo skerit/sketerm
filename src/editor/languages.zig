@@ -1038,7 +1038,7 @@ test "languages: grammar layers name real grammars and markdown has two" {
             }
         }
         if (!used) {
-            std.debug.print("grammar {s} is vendored but no language uses it\n", .{@tagName(g)});
+            std.debug.print("grammar {s} is pinned but no language uses it\n", .{@tagName(g)});
             return error.UnusedGrammar;
         }
     }
